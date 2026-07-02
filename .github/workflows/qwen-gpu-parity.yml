@@ -6,22 +6,12 @@ name: qwen GPU parity gate
 # the gate that would have caught the RDNA4 / gfx1200 native-GQA flash-broadcast
 # bug, where recognition degenerated into garbled, repeated tokens on the GPU
 # while CPU stayed correct. Runs on the self-hosted Windows HIP runner (same
-# runner as the HIP compile gate). Path-filtered so it only fires on changes to
-# the qwen decode / attention / ggml runtime that could regress GPU correctness.
+# runner as the HIP compile gate) -- GitHub-hosted runners have no AMD GPU, so
+# this stays pinned to that dedicated hardware. Maintainer AMD hardware gate,
+# dispatch manually after registering the runner.
 
 on:
   workflow_dispatch:
-  # Self-hosted GPU runner: post-merge backstop on main, not a PR gate (external
-  # PRs cannot reach the private runner, and fork code must not run on it).
-  push:
-    branches: [main]
-    paths:
-      - "crates/openasr-core/src/models/qwen/**"
-      - "crates/openasr-core/src/nn/**"
-      - "crates/openasr-core/src/ggml_runtime/**"
-      - "crates/openasr-core/third_party/**"
-      - "tooling/qwen-gpu-parity/**"
-      - ".github/workflows/qwen-gpu-parity.yml"
 
 concurrency:
   group: qwen-gpu-parity-${{ github.ref }}

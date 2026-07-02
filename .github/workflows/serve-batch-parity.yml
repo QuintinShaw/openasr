@@ -11,8 +11,7 @@ name: Serve-batch real-pack parity
 
 on:
   workflow_dispatch:
-  # Self-hosted runner: post-merge backstop on main, not a PR gate (external PRs
-  # cannot reach the private runner, and fork code must not run on it).
+  # Post-merge backstop on main, not a PR gate.
   push:
     branches: [main]
 
@@ -30,21 +29,18 @@ env:
 jobs:
   cpu-real-pack-parity:
     name: moonshine CPU real-pack parity
-    if: github.repository_owner == 'QuintinShaw'
-    runs-on: [self-hosted, Linux, ARM64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Verify Linux audio build dependencies
-        run: |
-          dpkg -s libasound2-dev >/dev/null 2>&1 || {
-            echo "::error::Missing libasound2-dev on the self-hosted runner. Preinstall it on the runner image."
-            exit 1
-          }
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake
 
       - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Cache moonshine-tiny pack
         id: cache-pack

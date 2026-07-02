@@ -19,8 +19,7 @@ concurrency:
 jobs:
   docker-smoke:
     name: Docker build and mock API smoke
-    if: github.repository_owner == 'QuintinShaw'
-    runs-on: [self-hosted, Linux, ARM64]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

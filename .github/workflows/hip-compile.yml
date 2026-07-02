@@ -1,5 +1,12 @@
 name: HIP compile gate
 
+# Maintainer AMD hardware gate: needs the AMD HIP SDK plus a real RDNA4/gfx1200
+# device (the capability-reporting and doctor-output steps below exercise the
+# HIP runtime against that hardware, not just the compiler). GitHub-hosted
+# runners have neither an official HIP SDK provisioning path nor AMD GPUs, so
+# this stays on the dedicated self-hosted Windows HIP runner (same box as the
+# qwen GPU parity gate). Dispatch manually after registering the runner.
+
 on:
   workflow_dispatch:
     inputs:
