@@ -1,0 +1,10 @@
+id = "whisper-base.en"
+default_variant = "published"
+display_name = "Whisper Base (English) (OpenASR pack)"
+languages = ["en"]
+size = "base.en"
+license = "Apache-2.0"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/whisper-base.en"
+
+[variant]
+quantization = "q8_0"

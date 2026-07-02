@@ -1,0 +1,10 @@
+id = "cohere-transcribe-03-2026"
+default_variant = "published"
+display_name = "Cohere Transcribe 03-2026 (OpenASR pack)"
+languages = ["ar", "de", "el", "en", "es", "fr", "it", "ja", "ko", "nl", "pl", "pt", "vi", "zh"]
+size = "2b"
+license = "Apache-2.0"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/cohere-transcribe-03-2026"
+
+[variant]
+quantization = "q8_0"

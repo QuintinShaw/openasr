@@ -1,0 +1,29 @@
+.git
+target
+**/target
+.DS_Store
+.env
+*.pem
+*.key
+*.sqlite
+*.db
+node_modules
+**/node_modules
+dist
+**/dist
+
+# Model weights and large native artifacts must not enter the Docker build context.
+*.ggml
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# Local editor and OS noise.
+.idea
+.vscode
+*.swp
+*.tmp

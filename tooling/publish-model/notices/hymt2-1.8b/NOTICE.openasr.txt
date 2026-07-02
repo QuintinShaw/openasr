@@ -1,0 +1,15 @@
+OpenASR modification notice for Hy-MT2 1.8B
+
+Source GGUF repository: tencent/Hy-MT2-1.8B-GGUF
+Source GGUF revision: 1cd5208700acedef4ef93019b6cfc148b8522d45
+Base model repository: tencent/Hy-MT2-1.8B
+Base model revision: 9a341cd1b679d3efd23b46e847b01745a71ed792
+License: Apache-2.0
+
+OpenASR repackaged the upstream GGUF weights as an .oasr runtime pack for local
+execution in OpenASR. This staged recipe does not modify model weights. Future
+changes to tokenizer metadata, quantization, or weight tensors must be recorded
+in this notice before publication.
+
+The upstream LICENSE.txt file and this NOTICE.openasr.txt file must be embedded
+in every distributed Hy-MT2 .oasr pack.

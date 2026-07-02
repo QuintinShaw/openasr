@@ -1,0 +1,61 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# Local environment
+.env
+.env.*
+!.env.example
+*.local
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Agent / closed-source dev tooling - must never ship in the public clean-room repo
+# (local AI tooling state).
+.claude/
+
+# Rust
+/target/
+tooling/system-audio-check/target/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Build and test artifacts
+coverage/
+*.profraw
+*.profdata
+
+.tmp/
+
+# Local agent/orchestration state - never ship
+.pi/

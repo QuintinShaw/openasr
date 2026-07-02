@@ -1,0 +1,38 @@
+# Per-model card prose for openasr/qwen3-asr-1.7b. Paraphrased from the upstream
+# Qwen/Qwen3-ASR-1.7B card (not copied verbatim). Optional file: models without
+# one get a generic intro/acknowledgement generated from the catalog.
+
+tagline = "State-of-the-art multilingual speech recognition across 52 languages & dialects"
+
+highlights = [
+  "🏆 **SOTA among open-source ASR** — competitive with the strongest proprietary commercial APIs",
+  "🌍 **52 languages & dialects** — 30 languages plus 22 Chinese dialects, with spoken-language identification",
+  "🎧 **Robust on hard audio** — clean speech, singing voice, and songs over background music",
+  "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU",
+]
+
+intro = """
+Qwen3-ASR-1.7B is a multilingual automatic speech recognition model (~2B parameters,
+~1.7B active, BF16) from Alibaba's Qwen3-ASR family that transcribes speech while
+identifying the spoken language across 30 languages, 22 Chinese dialects, and a range
+of regional English accents — and it holds up on hard audio including singing voice and
+songs over background music. A single unified checkpoint serves both offline and
+real-time streaming transcription, with word-level timestamps available via the
+companion Qwen3-ForcedAligner-0.6B; the Qwen team reports state-of-the-art quality among
+open-source ASR models and accuracy competitive with commercial APIs. This OpenASR repo
+repackages the original Qwen/Qwen3-ASR-1.7B weights as `.oasr` packs that run natively in
+the OpenASR runtime with no Python at inference time. For most users the q8_0 build is the
+recommended default — near-reference accuracy at roughly half the footprint — while q4_k
+suits tight-memory deployments and fp16 is reserved for verification or maximum fidelity.
+"""
+
+acknowledgement = """
+This pack is a redistribution of **Qwen3-ASR-1.7B**, created and open-sourced by the
+**Qwen team at Alibaba** ([Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)).
+All credit for the original architecture, training, and weights belongs to them; the
+license is inherited from and identical to the upstream model (Apache-2.0). Word-level
+timestamps additionally require the companion Qwen3-ForcedAligner-0.6B. The GGUF
+quantization recipe and bit-identity verification methodology were informed by
+[cstr/qwen3-asr-1.7b-GGUF](https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF). Thank you to
+both teams for releasing their work openly.
+"""

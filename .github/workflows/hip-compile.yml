@@ -1,0 +1,77 @@
+name: HIP compile gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu_targets:
+        description: AMDGPU targets to pass to ggml HIP, for example gfx1200 or gfx1030;gfx1100;gfx1200
+        required: false
+        default: gfx1200
+      ggml_native:
+        description: Set OPENASR_GGML_NATIVE for the build, usually 1 on the dedicated HIP runner
+        required: false
+        default: "1"
+
+concurrency:
+  group: hip-compile-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-hip:
+    name: Windows HIP SDK compile
+    if: github.repository_owner == 'QuintinShaw'
+    runs-on: [self-hosted, Windows, X64, HIP]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+
+      - name: Verify HIP SDK toolchain
+        shell: pwsh
+        run: |
+          $hipRoot = $env:HIP_PATH
+          if (-not $hipRoot) { $hipRoot = $env:ROCM_PATH }
+          if (-not $hipRoot) { $hipRoot = $env:ROCM_HOME }
+          if (-not $hipRoot) {
+            Write-Error "HIP_PATH, ROCM_PATH, or ROCM_HOME must point to the AMD HIP SDK."
+            exit 1
+          }
+
+          $hipBin = Join-Path $hipRoot "bin"
+          $env:PATH = "$hipBin;$env:PATH"
+          Write-Host "HIP SDK: $hipRoot"
+
+          where.exe cmake
+          cmake --version
+          where.exe ninja
+          ninja --version
+          where.exe hipInfo
+          hipInfo
+
+      - name: Check openasr-core HIP build
+        shell: pwsh
+        run: |
+          $env:OPENASR_HIP_GPU_TARGETS = "${{ inputs.gpu_targets }}"
+          $env:OPENASR_GGML_NATIVE = "${{ inputs.ggml_native }}"
+          cargo check -p openasr-core --features hip
+
+      - name: Test HIP capability reporting
+        shell: pwsh
+        run: |
+          $env:OPENASR_HIP_GPU_TARGETS = "${{ inputs.gpu_targets }}"
+          $env:OPENASR_GGML_NATIVE = "${{ inputs.ggml_native }}"
+          cargo test -p openasr-core capabilities --lib --features hip
+
+      - name: Smoke HIP doctor output
+        shell: pwsh
+        run: |
+          $env:OPENASR_HIP_GPU_TARGETS = "${{ inputs.gpu_targets }}"
+          $env:OPENASR_GGML_NATIVE = "${{ inputs.ggml_native }}"
+          cargo run --features openasr-core/hip -p openasr-cli -- doctor

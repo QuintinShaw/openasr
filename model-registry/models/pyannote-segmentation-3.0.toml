@@ -1,0 +1,10 @@
+id = "pyannote-segmentation-3.0"
+default_variant = "published"
+display_name = "pyannote Segmentation 3.0 (OpenASR pack)"
+languages = ["en", "zh"]
+size = "segmenter"
+license = "MIT"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/pyannote-segmentation-3.0"
+
+[variant]
+quantization = "f32"

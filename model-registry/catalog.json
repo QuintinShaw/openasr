@@ -1,0 +1,2106 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-06-26T16:51:04+00:00",
+  "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
+  "models": [
+    {
+      "id": "cohere-transcribe-03-2026",
+      "kind": "asr-model",
+      "display_name": "Cohere Transcribe 03-2026",
+      "family": "cohere",
+      "aliases": [
+        "cohere-transcribe",
+        "cohere"
+      ],
+      "pull_alias": "cohere-transcribe",
+      "size": "2b",
+      "languages": [
+        "ar",
+        "de",
+        "el",
+        "en",
+        "es",
+        "fr",
+        "it",
+        "ja",
+        "ko",
+        "nl",
+        "pl",
+        "pt",
+        "vi",
+        "zh"
+      ],
+      "vendor": "CohereLabs",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/CohereLabs/cohere-transcribe-03-2026/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/cohere-transcribe-03-2026",
+      "hf_revision": "d68f62404ea48d4606ddea1a7c4eb19ffc352bb7",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "cohere-transcribe-03-2026:q8",
+      "prose": {
+        "tagline": "Dedicated 2B ASR for 14-language transcription",
+        "overview": [
+          "Cohere Transcribe 03-2026 is Cohere and Cohere Labs' open release of a\n2B-parameter automatic speech recognition model. It is a dedicated audio-in,\ntext-out architecture with a Conformer-based acoustic encoder and a lightweight\nTransformer decoder, trained from scratch for transcription. The upstream model\ncard lists support for 14 languages across English, European, APAC, and MENA\ncoverage and reports Apache-2.0 licensing. This OpenASR repo repackages the\noriginal `CohereLabs/cohere-transcribe-03-2026` weights as `.oasr` packs that\nrun natively in the OpenASR runtime with no Python at inference time. For most\nusers the q8_0 build is the recommended default; q4_k is for tighter memory\nbudgets and fp16 is for verification or maximum fidelity."
+        ],
+        "highlights": [
+          "\ud83c\udf99\ufe0f **Dedicated ASR** \u2014 audio-in, text-out model built specifically for transcription",
+          "\ud83c\udf0d **14 languages** \u2014 covers English, major European languages, Arabic, Chinese, Japanese, Korean, and Vietnamese",
+          "\ud83e\uddf1 **Conformer encoder-decoder** \u2014 large acoustic encoder with a lightweight Transformer decoder",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "cohere-transcribe-03-2026:fp16",
+          "filename": "cohere-transcribe-03-2026-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/cohere-transcribe-03-2026/resolve/d68f62404ea48d4606ddea1a7c4eb19ffc352bb7/cohere-transcribe-03-2026-fp16.oasr",
+          "sha256": "0171306966445fe6a5a008c4d1fee6bbeca9f44530f7da86163e6a3064830823",
+          "size_bytes": 4136505984,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.2636262650909091,
+            "rtf_metal": 0.10830301136363636,
+            "peak_rss_bytes": 5124603904,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "cohere-transcribe-03-2026:q8",
+          "filename": "cohere-transcribe-03-2026-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/cohere-transcribe-03-2026/resolve/d68f62404ea48d4606ddea1a7c4eb19ffc352bb7/cohere-transcribe-03-2026-q8_0.oasr",
+          "sha256": "e2ec0cd9a9d50f398e5553ef58bda19a7d4d0075c897bf5474686d877876a05f",
+          "size_bytes": 2423804544,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.31705135227272724,
+            "rtf_metal": 0.112507125,
+            "peak_rss_bytes": 3419078656,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "cohere-transcribe-03-2026:q4",
+          "filename": "cohere-transcribe-03-2026-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/cohere-transcribe-03-2026/resolve/d68f62404ea48d4606ddea1a7c4eb19ffc352bb7/cohere-transcribe-03-2026-q4_k.oasr",
+          "sha256": "6117d1fc44afdb0e10dacd9d4cd3b90b3d4fa99751f998ef280861a3909ff0fa",
+          "size_bytes": 1510363776,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.24565492045454543,
+            "rtf_metal": 0.09525663636363636,
+            "peak_rss_bytes": 2486468608,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "hymt2-1.8b",
+      "kind": "translation-model",
+      "display_name": "Hy-MT2 1.8B",
+      "family": "hymt2",
+      "aliases": [],
+      "pull_alias": null,
+      "size": "1.8b",
+      "languages": [
+        "en",
+        "zh"
+      ],
+      "vendor": "tencent",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/blob/1cd5208700acedef4ef93019b6cfc148b8522d45/LICENSE.txt",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/hymt2-1.8b",
+      "hf_revision": "a41a9f5fe352e58159cb3b2993115f94dced9a75",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q4_k_m",
+      "pull_recommended": "hymt2-1.8b:q4km",
+      "prose": {
+        "tagline": "Hy-MT2 1.8B zh\u2192en translation for OpenASR realtime subtitles \u2014 clause-by-clause, fully on-device",
+        "overview": [
+          "Hy-MT2 1.8B is Tencent's compact many-to-many translation model from the Hunyuan-MT family.\nOpenASR packages the upstream Q4_K_M GGUF release as a local `.oasr` translation pack and uses it\nfor the experimental simultaneous-translation MVP: finalized and in-progress Chinese clauses from\nrealtime ASR are retranslated clause-by-clause into English, with provisional translations\nsuperseded as the source clause stabilizes. The MVP contract is zh\u2192en; the pack runs fully\non-device through OpenASR's pure-Rust GGML runtime with no Python at inference time."
+        ],
+        "highlights": [
+          "\ud83c\udf10 **Realtime zh\u2192en subtitle translation** \u2014 drives OpenASR's experimental clause-retranslation lane next to live Chinese ASR",
+          "\u26a1 **Hot-session clause latency in the hundreds of milliseconds** \u2014 prefix KV-cache reuse keeps warm per-clause retranslation fast on Apple Silicon CPU",
+          "\ud83d\udce6 **Byte-identical upstream weights** \u2014 the Q4_K_M GGUF tensor data is repackaged unmodified at a pinned revision; sha256 and provenance are embedded in the pack",
+          "\ud83e\uddfe **License + NOTICE embedded** \u2014 the upstream Apache-2.0 LICENSE.txt and the OpenASR modification NOTICE travel inside the pack metadata",
+          "\ud83c\udfaf **Parity-gated packaging** \u2014 greedy decode token IDs match llama.cpp on the same prompt before release"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "q4_k_m",
+          "suffix": "q4km",
+          "pull": "hymt2-1.8b:q4km",
+          "filename": "hymt2-1.8b-q4_k_m.oasr",
+          "url": "https://huggingface.co/OpenASR/hymt2-1.8b/resolve/a41a9f5fe352e58159cb3b2993115f94dced9a75/hymt2-1.8b-q4_k_m.oasr",
+          "sha256": "56eae4c672e6d0fc1cacb210719ef494025c98c03753cd6b5a77b2fefa1557f6",
+          "size_bytes": 1133093920,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": null,
+            "rtf_metal": null,
+            "peak_rss_bytes": 4518821888,
+            "jfk_wer_vs_fp16": null
+          }
+        }
+      ],
+      "experimental": true,
+      "source_langs": [
+        "zh"
+      ],
+      "target_langs": [
+        "en"
+      ],
+      "upstream_base_repo": "tencent/Hy-MT2-1.8B",
+      "upstream_base_revision": "9a341cd1b679d3efd23b46e847b01745a71ed792",
+      "upstream_gguf_repo": "tencent/Hy-MT2-1.8B-GGUF",
+      "upstream_gguf_revision": "1cd5208700acedef4ef93019b6cfc148b8522d45",
+      "license_files": [
+        "LICENSE.txt",
+        "NOTICE.openasr.txt"
+      ]
+    },
+    {
+      "id": "moonshine-tiny",
+      "kind": "asr-model",
+      "display_name": "Moonshine Tiny",
+      "family": "moonshine",
+      "aliases": [
+        "moonshine"
+      ],
+      "pull_alias": "moonshine",
+      "size": "tiny",
+      "languages": [
+        "en"
+      ],
+      "vendor": "UsefulSensors",
+      "license": "MIT",
+      "license_url": "https://huggingface.co/UsefulSensors/moonshine-tiny",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/moonshine-tiny",
+      "hf_revision": "765b763f3536cb8810ae1634b6aaa995abbb1bde",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "moonshine-tiny:q8",
+      "prose": {
+        "tagline": "Tiny 27M-parameter English ASR built for real-time, on-device transcription",
+        "overview": [
+          "Moonshine Tiny is the smallest model in Useful Sensors' **Moonshine** family \u2014 a 27M-parameter,\nsequence-to-sequence English speech-recognition model designed for **real-time, on-device\ntranscription** on hardware that is severely constrained in memory and compute. Trained on 200,000\nhours of audio, it transcribes English speech to text and, despite its size, reports greater accuracy\nthan existing ASR systems of comparable scale on standard benchmarks. It targets developers building\nlive transcription and voice-command experiences on low-cost devices. Like other autoregressive ASR\nmodels it can occasionally hallucinate or repeat on very short or clipped segments, so robust\nin-domain evaluation is recommended before deployment. This OpenASR repo repackages the original\nweights as `.oasr` packs that run natively in the OpenASR runtime \u2014 no Python at inference time. The\n**q8_0** build is the recommended default (near-reference accuracy at roughly a third of the\nfootprint); **fp16** is for verification or maximum fidelity."
+        ],
+        "highlights": [
+          "\ud83e\udeb6 **Just 27M parameters** \u2014 the smallest Moonshine, sized for memory- and compute-constrained edge hardware",
+          "\u26a1 **Real-time on-device** \u2014 engineered by Useful Sensors for live transcription and voice commands on low-cost devices",
+          "\ud83c\udfaf **Accurate for its size** \u2014 beats similarly-sized ASR systems on standard English benchmarks (per the Moonshine paper)",
+          "\ud83d\udde3\ufe0f **English speech-to-text** \u2014 sequence-to-sequence ASR trained on 200K hours of audio",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "moonshine-tiny:fp16",
+          "filename": "moonshine-tiny-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/moonshine-tiny/resolve/765b763f3536cb8810ae1634b6aaa995abbb1bde/moonshine-tiny-fp16.oasr",
+          "sha256": "2f024ab25f82fd06c6c213df0a2db6ec542e6463acd8bb5e799ed158468d6258",
+          "size_bytes": 108863040,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.036392473545454544,
+            "rtf_metal": 0.028632738636363633,
+            "peak_rss_bytes": 323026944,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "moonshine-tiny:q8",
+          "filename": "moonshine-tiny-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/moonshine-tiny/resolve/765b763f3536cb8810ae1634b6aaa995abbb1bde/moonshine-tiny-q8_0.oasr",
+          "sha256": "80ec6caed0a99abb27aa6775c9616c94a397417b6696466dfe59ae43c16f3e77",
+          "size_bytes": 34360896,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.02689490909090909,
+            "rtf_metal": 0.027663765181818185,
+            "peak_rss_bytes": 306135040,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "pyannote-segmentation-3.0",
+      "kind": "capability-pack",
+      "capability": {
+        "feature": "speaker-diarization",
+        "role": "speaker-segmenter"
+      },
+      "display_name": "pyannote Segmentation 3.0",
+      "family": "pyannote-segmentation",
+      "aliases": [],
+      "pull_alias": null,
+      "size": "segmenter",
+      "languages": [
+        "en",
+        "zh"
+      ],
+      "vendor": "onnx-community",
+      "license": "MIT",
+      "license_url": "https://huggingface.co/onnx-community/pyannote-segmentation-3.0",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/pyannote-segmentation-3.0",
+      "hf_revision": "aaae2145d5b3ac34d493c1fe0edcd2cdd9184b6a",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "f32",
+      "pull_recommended": "pyannote-segmentation-3.0:f32",
+      "prose": {
+        "tagline": "pyannote segmentation-3.0 \u2014 speaker-change and overlap aware speech segmentation for OpenASR diarization",
+        "overview": [
+          "pyannote **segmentation-3.0** is the local speech-segmentation model from the pyannote speaker\ndiarization toolkit: a PyanNet (SincNet front-end + bidirectional LSTM) classifier over a 7-class\npowerset that labels every 10 s window with which of up to three speakers are active \u2014 including\noverlapped speech. OpenASR uses it as the optional segmentation stage of its model-agnostic\ndiarization pipeline: when this pack is installed, `--diarize` splits speech at speaker changes\ninstead of relying on coarse VAD slices, then the WeSpeaker embedder pack clusters the segments into\nanonymous speaker turns. Weights are extracted from the un-gated, MIT-licensed\n**onnx-community** ONNX mirror at a pinned revision and repackaged as a raw-f32 `.oasr` pack that\nruns in pure Rust \u2014 no Python at inference time."
+        ],
+        "highlights": [
+          "\u2702\ufe0f **Speaker-change aware segmentation** \u2014 PyanNet (SincNet + BiLSTM) with a powerset head that detects up to 3 concurrent speakers, including overlapped speech",
+          "\ud83e\udd1d **Quality upgrade for `--diarize`** \u2014 installed alongside the WeSpeaker embedder pack, it replaces coarse VAD slices with fine speaker-turn boundaries",
+          "\ud83d\udd12 **Diarization, not identification** \u2014 anonymous session-relative labels; nothing leaves the machine",
+          "\ud83c\udfaf **Bit-exact packaging** \u2014 single raw-f32 build; the pure-Rust forward pass matches the upstream ONNX logits (max abs error ~7e-5)",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "f32",
+          "suffix": "f32",
+          "pull": "pyannote-segmentation-3.0:f32",
+          "filename": "pyannote-segmentation-3.0-f32.oasr",
+          "url": "https://huggingface.co/OpenASR/pyannote-segmentation-3.0/resolve/aaae2145d5b3ac34d493c1fe0edcd2cdd9184b6a/pyannote-segmentation-3.0-f32.oasr",
+          "sha256": "48151e322a0a9bb318000994e33991bdeeedb14aec5c8ea4cdb0ad2f63cb60af",
+          "size_bytes": 5975392,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.13699,
+            "rtf_metal": null,
+            "peak_rss_bytes": null,
+            "jfk_wer_vs_fp16": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "qwen3-asr-0.6b",
+      "kind": "asr-model",
+      "display_name": "Qwen3-ASR 0.6B",
+      "family": "qwen",
+      "aliases": [
+        "qwen3",
+        "qwen3-asr"
+      ],
+      "pull_alias": "qwen3",
+      "size": "0.6b",
+      "languages": [
+        "ar",
+        "cs",
+        "da",
+        "de",
+        "el",
+        "en",
+        "es",
+        "fa",
+        "fi",
+        "fil",
+        "fr",
+        "hi",
+        "hu",
+        "id",
+        "it",
+        "ja",
+        "ko",
+        "mk",
+        "ms",
+        "nl",
+        "pl",
+        "pt",
+        "ro",
+        "ru",
+        "sv",
+        "th",
+        "tr",
+        "vi",
+        "zh"
+      ],
+      "vendor": "Qwen",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/blob/main/LICENSE",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/qwen3-asr-0.6b",
+      "hf_revision": "abba9e45a52111095ebe8c57e902fc878eb8cdae",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "qwen3-asr-0.6b:q8",
+      "prose": {
+        "tagline": "Multilingual speech recognition across 52 languages & dialects \u2014 the fast, lightweight Qwen3-ASR",
+        "overview": [
+          "Qwen3-ASR-0.6B is the compact, efficiency-optimized member of Alibaba's **Qwen3-ASR** family,\nbuilt on the Qwen3-Omni audio-understanding foundation. It performs language identification and\nspeech recognition across **30 languages and 22 Chinese dialects** (52 in total), and stays robust\non challenging audio \u2014 clean speech, singing voice, and songs with background music. A single\nunified checkpoint handles both offline and real-time streaming transcription and can process long\naudio; the 0.6B size targets a strong accuracy-vs-efficiency trade-off (the Qwen team reports up to\n~2000\u00d7 throughput at high concurrency), making it the family's go-to for lightweight, high-throughput\ndeployments. This OpenASR repo repackages the original weights as `.oasr` packs that run natively in\nthe OpenASR runtime \u2014 no Python at inference time. The **q8_0** build is the recommended default\n(near-reference accuracy at roughly half the footprint); **q4_k** suits tight-memory devices and\n**fp16** is for verification or maximum fidelity. For word-level timestamps, pair it upstream with\nQwen3-ForcedAligner-0.6B."
+        ],
+        "highlights": [
+          "\ud83c\udf0d **52 languages & dialects** \u2014 30 languages plus 22 Chinese dialects, with built-in spoken-language identification",
+          "\ud83c\udfa7 **Robust on hard audio** \u2014 clean speech, singing voice, and songs over background music",
+          "\u26a1 **Fast & light** \u2014 the efficiency-tuned member of the Qwen3-ASR family; one model for both offline and streaming",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "qwen3-asr-0.6b:fp16",
+          "filename": "qwen3-asr-0.6b-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-asr-0.6b/resolve/abba9e45a52111095ebe8c57e902fc878eb8cdae/qwen3-asr-0.6b-fp16.oasr",
+          "sha256": "8232fbfbbad29e86848cad63754e3c8cc9dc1132967f5d420c3e9e80017541ae",
+          "size_bytes": 1882039200,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.5791736704545455,
+            "rtf_metal": 0.4065796818181818,
+            "peak_rss_bytes": 4512169984,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "qwen3-asr-0.6b:q8",
+          "filename": "qwen3-asr-0.6b-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-asr-0.6b/resolve/abba9e45a52111095ebe8c57e902fc878eb8cdae/qwen3-asr-0.6b-q8_0.oasr",
+          "sha256": "3a3b6625e09aad6db6bdc2f919d5b3fd790b899ee4a59950f5b8fed0d4bf6924",
+          "size_bytes": 1006811040,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.5542678636363636,
+            "rtf_metal": 0.2653013939090909,
+            "peak_rss_bytes": 2861236224,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "qwen3-asr-0.6b:q4",
+          "filename": "qwen3-asr-0.6b-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-asr-0.6b/resolve/abba9e45a52111095ebe8c57e902fc878eb8cdae/qwen3-asr-0.6b-q4_k.oasr",
+          "sha256": "367a1cdb02628f3514573a15a9f9ecc5108f0ebcd4e717a9cdfec07d4d6af62c",
+          "size_bytes": 598685600,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.5198917575454546,
+            "rtf_metal": 0.20129274618181817,
+            "peak_rss_bytes": 3503915008,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "qwen3-asr-1.7b",
+      "kind": "asr-model",
+      "display_name": "Qwen3-ASR 1.7B",
+      "family": "qwen",
+      "aliases": [
+        "qwen3",
+        "qwen3-asr"
+      ],
+      "pull_alias": "qwen3",
+      "size": "1.7b",
+      "languages": [
+        "ar",
+        "cs",
+        "da",
+        "de",
+        "el",
+        "en",
+        "es",
+        "fa",
+        "fi",
+        "fil",
+        "fr",
+        "hi",
+        "hu",
+        "id",
+        "it",
+        "ja",
+        "ko",
+        "mk",
+        "ms",
+        "nl",
+        "pl",
+        "pt",
+        "ro",
+        "ru",
+        "sv",
+        "th",
+        "tr",
+        "vi",
+        "zh"
+      ],
+      "vendor": "Qwen",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/main/LICENSE",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/qwen3-asr-1.7b",
+      "hf_revision": "1f9a6c6035c35d179067533cd1d12343c2f803c8",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "qwen3-asr-1.7b:q8",
+      "prose": {
+        "tagline": "State-of-the-art multilingual speech recognition across 52 languages & dialects",
+        "overview": [
+          "Qwen3-ASR-1.7B is a multilingual automatic speech recognition model (~2B parameters,\n~1.7B active, BF16) from Alibaba's Qwen3-ASR family that transcribes speech while\nidentifying the spoken language across 30 languages, 22 Chinese dialects, and a range\nof regional English accents \u2014 and it holds up on hard audio including singing voice and\nsongs over background music. A single unified checkpoint serves both offline and\nreal-time streaming transcription, with word-level timestamps available via the\ncompanion Qwen3-ForcedAligner-0.6B; the Qwen team reports state-of-the-art quality among\nopen-source ASR models and accuracy competitive with commercial APIs. This OpenASR repo\nrepackages the original Qwen/Qwen3-ASR-1.7B weights as `.oasr` packs that run natively in\nthe OpenASR runtime with no Python at inference time. For most users the q8_0 build is the\nrecommended default \u2014 near-reference accuracy at roughly half the footprint \u2014 while q4_k\nsuits tight-memory deployments and fp16 is reserved for verification or maximum fidelity."
+        ],
+        "highlights": [
+          "\ud83c\udfc6 **SOTA among open-source ASR** \u2014 competitive with the strongest proprietary commercial APIs",
+          "\ud83c\udf0d **52 languages & dialects** \u2014 30 languages plus 22 Chinese dialects, with spoken-language identification",
+          "\ud83c\udfa7 **Robust on hard audio** \u2014 clean speech, singing voice, and songs over background music",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "qwen3-asr-1.7b:fp16",
+          "filename": "qwen3-asr-1.7b-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/1f9a6c6035c35d179067533cd1d12343c2f803c8/qwen3-asr-1.7b-fp16.oasr",
+          "sha256": "5e776e51907269597c6a96a0621deb35bbb7a1c0b1c5e10360db2b5875b52d0a",
+          "size_bytes": 4704802112,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 2.950909212181818,
+            "rtf_metal": 1.607943712090909,
+            "peak_rss_bytes": 6470647808,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "qwen3-asr-1.7b:q8",
+          "filename": "qwen3-asr-1.7b-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/1f9a6c6035c35d179067533cd1d12343c2f803c8/qwen3-asr-1.7b-q8_0.oasr",
+          "sha256": "f09c032a3019aa47f5ebc3db88eb47505d22ad97c6a21657911cec98094481e3",
+          "size_bytes": 2506724672,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 2.8368895984545457,
+            "rtf_metal": 0.8809729772727273,
+            "peak_rss_bytes": 5050204160,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "qwen3-asr-1.7b:q4",
+          "filename": "qwen3-asr-1.7b-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/1f9a6c6035c35d179067533cd1d12343c2f803c8/qwen3-asr-1.7b-q4_k.oasr",
+          "sha256": "87ea8f6c578632205832be447d5bc749ac63416e6a9146465cb7c7a292b4eeb2",
+          "size_bytes": 1334416704,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 3.4732779053636365,
+            "rtf_metal": 0.5557503787272727,
+            "peak_rss_bytes": 4796694528,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "wespeaker-voxceleb-resnet34-lm",
+      "kind": "capability-pack",
+      "capability": {
+        "feature": "speaker-diarization",
+        "role": "speaker-embedder"
+      },
+      "display_name": "WeSpeaker ResNet34 Speaker Embedder (VoxCeleb)",
+      "family": "wespeaker",
+      "aliases": [],
+      "pull_alias": null,
+      "size": "embedder",
+      "languages": [
+        "en",
+        "zh"
+      ],
+      "vendor": "pyannote",
+      "license": "CC-BY-4.0",
+      "license_url": "https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/wespeaker-voxceleb-resnet34-lm",
+      "hf_revision": "0e81dc54b7d480eeb6d0e1fcdc4a94d863be5141",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "f32",
+      "pull_recommended": "wespeaker-voxceleb-resnet34-lm:f32",
+      "prose": {
+        "tagline": "WeSpeaker ResNet34 speaker embedder for OpenASR diarization \u2014 stronger speaker separation, fully on-device",
+        "overview": [
+          "WeSpeaker ResNet34 is the speaker-embedding model used by pyannote for VoxCeleb speaker\nrepresentations. OpenASR packages it as a local `.oasr` capability pack and uses it as the default\nspeaker-embedding stage for diarization: speech regions are embedded, clustered, and attributed\nback onto transcripts from any ASR model. The realtime speaker-change detector now uses this same\nWeSpeaker embedder, so diarization has one speaker-embedding space across batch and streaming paths."
+        ],
+        "highlights": [
+          "\ud83d\udde3\ufe0f **Default OpenASR speaker embedder** \u2014 install this pack and `--diarize` labels anonymous speakers for any ASR family",
+          "\ud83e\uddec **256-dim ResNet34 embeddings** \u2014 pyannote's WeSpeaker VoxCeleb model with temporal statistics pooling",
+          "\ud83d\udd12 **Diarization, not identification** \u2014 anonymous session-relative labels; embeddings stay local and are discarded after the request unless you explicitly enroll a local profile",
+          "\ud83c\udfaf **Parity-gated packaging** \u2014 single raw-f32 build; the Rust forward pass matches the upstream pyannote reference at cosine \u2265 0.9999",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference and share the same pull/install path as ASR models"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "f32",
+          "suffix": "f32",
+          "pull": "wespeaker-voxceleb-resnet34-lm:f32",
+          "filename": "wespeaker-voxceleb-resnet34-lm-f32.oasr",
+          "url": "https://huggingface.co/OpenASR/wespeaker-voxceleb-resnet34-lm/resolve/0e81dc54b7d480eeb6d0e1fcdc4a94d863be5141/wespeaker-voxceleb-resnet34-lm-f32.oasr",
+          "sha256": "7f09e220267f7a97cece92ed14b1aaa8b7d9b41ea8968c8aff1282d3d7e70174",
+          "size_bytes": 26583936,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.07293,
+            "rtf_metal": null,
+            "peak_rss_bytes": null,
+            "jfk_wer_vs_fp16": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "whisper-base",
+      "kind": "asr-model",
+      "display_name": "Whisper Base",
+      "family": "whisper",
+      "aliases": [],
+      "pull_alias": "whisper-base",
+      "size": "base",
+      "languages": [
+        "af",
+        "am",
+        "ar",
+        "as",
+        "az",
+        "ba",
+        "be",
+        "bg",
+        "bn",
+        "bo",
+        "br",
+        "bs",
+        "ca",
+        "cs",
+        "cy",
+        "da",
+        "de",
+        "el",
+        "en",
+        "es",
+        "et",
+        "eu",
+        "fa",
+        "fi",
+        "fo",
+        "fr",
+        "gl",
+        "gu",
+        "ha",
+        "haw",
+        "he",
+        "hi",
+        "hr",
+        "ht",
+        "hu",
+        "hy",
+        "id",
+        "is",
+        "it",
+        "ja",
+        "jv",
+        "ka",
+        "kk",
+        "km",
+        "kn",
+        "ko",
+        "la",
+        "lb",
+        "ln",
+        "lo",
+        "lt",
+        "lv",
+        "mg",
+        "mi",
+        "mk",
+        "ml",
+        "mn",
+        "mr",
+        "ms",
+        "mt",
+        "my",
+        "ne",
+        "nl",
+        "no",
+        "oc",
+        "pa",
+        "pl",
+        "ps",
+        "pt",
+        "ro",
+        "ru",
+        "sa",
+        "sd",
+        "si",
+        "sk",
+        "sl",
+        "sn",
+        "so",
+        "sq",
+        "sr",
+        "su",
+        "sv",
+        "sw",
+        "ta",
+        "te",
+        "tg",
+        "th",
+        "tk",
+        "tl",
+        "tr",
+        "tt",
+        "uk",
+        "ur",
+        "uz",
+        "vi",
+        "yi",
+        "yo",
+        "zh"
+      ],
+      "vendor": "openai",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/openai/whisper-base/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/whisper-base",
+      "hf_revision": "fdd4c60003a34168e14dd74e2f17e2adb8c70ce8",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "whisper-base:q8",
+      "prose": {
+        "tagline": "Compact multilingual Whisper, a step up from tiny",
+        "overview": [
+          "Whisper Base is OpenAI's 74M-parameter multilingual Whisper checkpoint. It uses the standard\nWhisper encoder-decoder architecture for automatic speech recognition and speech translation,\ntrained with large-scale weak supervision on 680k hours of labelled speech. Base offers a\nmeaningful accuracy gain over tiny while staying small and fast enough for low-resource\ndevices. This OpenASR repo repackages the original `openai/whisper-base` weights as `.oasr`\npacks that run natively in the OpenASR runtime with no Python at inference time. For most users\nthe q8_0 build is the recommended default; q4_k is for tighter memory budgets and fp16 is for\nverification or maximum fidelity."
+        ],
+        "highlights": [
+          "\ud83c\udfa7 **Multilingual ASR** \u2014 transcribes many languages and can translate speech to English",
+          "\ud83e\udeb6 **74M parameters** \u2014 a small footprint with noticeably better accuracy than tiny",
+          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "whisper-base:fp16",
+          "filename": "whisper-base-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-base/resolve/fdd4c60003a34168e14dd74e2f17e2adb8c70ce8/whisper-base-fp16.oasr",
+          "sha256": "bf3e42a2e866182077deca694f3f3bc935b3f892a825ad2130b7a0c167014da7",
+          "size_bytes": 149055136,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.08000256063636363,
+            "rtf_metal": 0.06499367045454546,
+            "peak_rss_bytes": 542212096,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "whisper-base:q8",
+          "filename": "whisper-base-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-base/resolve/fdd4c60003a34168e14dd74e2f17e2adb8c70ce8/whisper-base-q8_0.oasr",
+          "sha256": "86a565a224ed9111e6477590b01632caea90502b1bca5350c50d80384f31f742",
+          "size_bytes": 107767456,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.06741927272727273,
+            "rtf_metal": 0.06369526136363636,
+            "peak_rss_bytes": 404815872,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "whisper-base:q4",
+          "filename": "whisper-base-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-base/resolve/fdd4c60003a34168e14dd74e2f17e2adb8c70ce8/whisper-base-q4_k.oasr",
+          "sha256": "0a3d85f9ae6948366b053503cb164e3604a935f236846e917e553c2b17aee227",
+          "size_bytes": 85747360,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.060797,
+            "rtf_metal": 0.07161112127272727,
+            "peak_rss_bytes": 364363776,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "whisper-base.en",
+      "kind": "asr-model",
+      "display_name": "Whisper Base (English)",
+      "family": "whisper",
+      "aliases": [],
+      "pull_alias": "whisper-base.en",
+      "size": "base.en",
+      "languages": [
+        "en"
+      ],
+      "vendor": "openai",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/openai/whisper-base.en/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/whisper-base.en",
+      "hf_revision": "94494d83a727d0df93abf8a1614ff7797a714535",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "whisper-base.en:q8",
+      "prose": {
+        "tagline": "Compact English-only Whisper for fast English transcription",
+        "overview": [
+          "Whisper Base.en is OpenAI's 74M-parameter English-only Whisper checkpoint. It uses the standard\nWhisper encoder-decoder architecture for automatic speech recognition, trained with large-scale\nweak supervision on 680k hours of labelled speech. As an English-specialized model it tends to\noutperform the same-size multilingual Whisper on English audio, while staying small and fast.\nThis OpenASR repo repackages the original `openai/whisper-base.en` weights as `.oasr` packs that\nrun natively in the OpenASR runtime with no Python at inference time. For most users the q8_0\nbuild is the recommended default; q4_k is for tighter memory budgets and fp16 is for\nverification or maximum fidelity."
+        ],
+        "highlights": [
+          "\ud83c\uddec\ud83c\udde7 **English-only** \u2014 specialized for English, typically more accurate on English than the same-size multilingual model",
+          "\ud83e\udeb6 **74M parameters** \u2014 small and fast, a clear step up from tiny.en",
+          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "whisper-base.en:fp16",
+          "filename": "whisper-base.en-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-base.en/resolve/94494d83a727d0df93abf8a1614ff7797a714535/whisper-base.en-fp16.oasr",
+          "sha256": "2f6b5f45412aa7e779781e3b1174632d96190e8af8ae3014f2ebcfbad196fe1f",
+          "size_bytes": 148979040,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.060794625,
+            "rtf_metal": 0.07095218181818182,
+            "peak_rss_bytes": 542425088,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "whisper-base.en:q8",
+          "filename": "whisper-base.en-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-base.en/resolve/94494d83a727d0df93abf8a1614ff7797a714535/whisper-base.en-q8_0.oasr",
+          "sha256": "e62c3ae3478dd36c2b4c74a8d798355b1d16d5533083acd24cc90088e6525d05",
+          "size_bytes": 107691360,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.053984844727272725,
+            "rtf_metal": 0.05351854545454546,
+            "peak_rss_bytes": 401965056,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "whisper-base.en:q4",
+          "filename": "whisper-base.en-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-base.en/resolve/94494d83a727d0df93abf8a1614ff7797a714535/whisper-base.en-q4_k.oasr",
+          "sha256": "7536e3b41ade402cbe96d38596a08f0f832764459cfc6616516ca503b336ae78",
+          "size_bytes": 85671264,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.05148509845454546,
+            "rtf_metal": 0.0661346439090909,
+            "peak_rss_bytes": 369082368,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "whisper-large-v3",
+      "kind": "asr-model",
+      "display_name": "Whisper Large v3",
+      "family": "whisper",
+      "aliases": [],
+      "pull_alias": "whisper-large-v3",
+      "size": "large",
+      "languages": [
+        "af",
+        "am",
+        "ar",
+        "as",
+        "az",
+        "ba",
+        "be",
+        "bg",
+        "bn",
+        "bo",
+        "br",
+        "bs",
+        "ca",
+        "cs",
+        "cy",
+        "da",
+        "de",
+        "el",
+        "en",
+        "es",
+        "et",
+        "eu",
+        "fa",
+        "fi",
+        "fo",
+        "fr",
+        "gl",
+        "gu",
+        "ha",
+        "haw",
+        "he",
+        "hi",
+        "hr",
+        "ht",
+        "hu",
+        "hy",
+        "id",
+        "is",
+        "it",
+        "ja",
+        "jv",
+        "ka",
+        "kk",
+        "km",
+        "kn",
+        "ko",
+        "la",
+        "lb",
+        "ln",
+        "lo",
+        "lt",
+        "lv",
+        "mg",
+        "mi",
+        "mk",
+        "ml",
+        "mn",
+        "mr",
+        "ms",
+        "mt",
+        "my",
+        "ne",
+        "nl",
+        "no",
+        "oc",
+        "pa",
+        "pl",
+        "ps",
+        "pt",
+        "ro",
+        "ru",
+        "sa",
+        "sd",
+        "si",
+        "sk",
+        "sl",
+        "sn",
+        "so",
+        "sq",
+        "sr",
+        "su",
+        "sv",
+        "sw",
+        "ta",
+        "te",
+        "tg",
+        "th",
+        "tk",
+        "tl",
+        "tr",
+        "tt",
+        "uk",
+        "ur",
+        "uz",
+        "vi",
+        "yi",
+        "yo",
+        "zh"
+      ],
+      "vendor": "openai",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/openai/whisper-large-v3/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/whisper-large-v3",
+      "hf_revision": "cbe07da27065ab3ec552c4253850068bb95f83fa",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "whisper-large-v3:q8",
+      "prose": {
+        "tagline": "OpenAI's most accurate Whisper, the v3 large checkpoint",
+        "overview": [
+          "Whisper Large v3 is OpenAI's 1.55B-parameter multilingual Whisper checkpoint, the most accurate\nmember of the family. It uses the standard Whisper encoder-decoder architecture for automatic\nspeech recognition and speech translation; v3 was trained on a larger and more diverse labelled\ncorpus and uses 128 mel-frequency bins, improving robustness across languages and conditions\nover earlier large checkpoints. This OpenASR repo repackages the original\n`openai/whisper-large-v3` weights as `.oasr` packs that run natively in the OpenASR runtime with\nno Python at inference time. For most users the q8_0 build is the recommended default; q4_k is\nfor tighter memory budgets and fp16 is for verification or maximum fidelity. For a faster\nlarge-grade option, see the distilled `whisper-large-v3-turbo`."
+        ],
+        "highlights": [
+          "\ud83c\udfa7 **Multilingual ASR** \u2014 transcribes a wide range of languages and can translate speech to English",
+          "\ud83c\udfc6 **1.55B parameters** \u2014 the full-size Whisper, OpenAI's highest-accuracy checkpoint",
+          "\ud83d\udd01 **v3 improvements** \u2014 trained on a larger, more diverse corpus with 128 mel bins for better robustness",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "whisper-large-v3:fp16",
+          "filename": "whisper-large-v3-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-large-v3/resolve/cbe07da27065ab3ec552c4253850068bb95f83fa/whisper-large-v3-fp16.oasr",
+          "sha256": "8a0052daa836ecc10cd5e71f3dffce21af001b47a624501e5ef08d536a732598",
+          "size_bytes": 3088750656,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 1.1698572197272727,
+            "rtf_metal": 1.1327391893636365,
+            "peak_rss_bytes": 4703879168,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "whisper-large-v3:q8",
+          "filename": "whisper-large-v3-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-large-v3/resolve/cbe07da27065ab3ec552c4253850068bb95f83fa/whisper-large-v3-q8_0.oasr",
+          "sha256": "2ea5a9cf974b0524ee570feb50c96d2b754b1108312a880f7778bf55caf49327",
+          "size_bytes": 1712494656,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.6460862045454546,
+            "rtf_metal": 0.4570619052727274,
+            "peak_rss_bytes": 4049469440,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "whisper-large-v3:q4",
+          "filename": "whisper-large-v3-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-large-v3/resolve/cbe07da27065ab3ec552c4253850068bb95f83fa/whisper-large-v3-q4_k.oasr",
+          "sha256": "2585fb2c9f5506266a88963a80eddb07a759d334416fac851b61a40b0a18df71",
+          "size_bytes": 978491456,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.606992322,
+            "rtf_metal": 0.4851825530909091,
+            "peak_rss_bytes": 2463219712,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "whisper-large-v3-turbo",
+      "kind": "asr-model",
+      "display_name": "Whisper Large v3 Turbo",
+      "family": "whisper",
+      "aliases": [
+        "whisper-turbo",
+        "whisper-large-turbo"
+      ],
+      "pull_alias": "whisper-turbo",
+      "size": "turbo",
+      "languages": [
+        "af",
+        "am",
+        "ar",
+        "as",
+        "az",
+        "ba",
+        "be",
+        "bg",
+        "bn",
+        "bo",
+        "br",
+        "bs",
+        "ca",
+        "cs",
+        "cy",
+        "da",
+        "de",
+        "el",
+        "en",
+        "es",
+        "et",
+        "eu",
+        "fa",
+        "fi",
+        "fo",
+        "fr",
+        "gl",
+        "gu",
+        "ha",
+        "haw",
+        "he",
+        "hi",
+        "hr",
+        "ht",
+        "hu",
+        "hy",
+        "id",
+        "is",
+        "it",
+        "ja",
+        "jv",
+        "ka",
+        "kk",
+        "km",
+        "kn",
+        "ko",
+        "la",
+        "lb",
+        "ln",
+        "lo",
+        "lt",
+        "lv",
+        "mg",
+        "mi",
+        "mk",
+        "ml",
+        "mn",
+        "mr",
+        "ms",
+        "mt",
+        "my",
+        "ne",
+        "nl",
+        "no",
+        "oc",
+        "pa",
+        "pl",
+        "ps",
+        "pt",
+        "ro",
+        "ru",
+        "sa",
+        "sd",
+        "si",
+        "sk",
+        "sl",
+        "sn",
+        "so",
+        "sq",
+        "sr",
+        "su",
+        "sv",
+        "sw",
+        "ta",
+        "te",
+        "tg",
+        "th",
+        "tk",
+        "tl",
+        "tr",
+        "tt",
+        "uk",
+        "ur",
+        "uz",
+        "vi",
+        "yi",
+        "yo",
+        "zh"
+      ],
+      "vendor": "openai",
+      "license": "MIT",
+      "license_url": "https://github.com/openai/whisper/blob/main/LICENSE",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/whisper-large-v3-turbo",
+      "hf_revision": "e10bafd4c3d18d35426354d6b190b81e990e2949",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "whisper-large-v3-turbo:q8",
+      "prose": {
+        "tagline": "Fast multilingual Whisper built from pruned large-v3",
+        "overview": [
+          "Whisper Large v3 Turbo is OpenAI's faster variant of Whisper large-v3: it keeps the same\nWhisper architecture and multilingual speech-recognition/translation interface, but reduces\nthe decoder depth from 32 layers to 4. The upstream card describes the result as much faster\nwith only a minor quality trade-off, while retaining Whisper's broad zero-shot behavior from\ntraining on more than five million hours of labeled audio. This OpenASR repo repackages the\noriginal `openai/whisper-large-v3-turbo` weights as `.oasr` packs that run natively in the\nOpenASR runtime with no Python at inference time. For most users the q8_0 build is the\nrecommended default; q4_k is for tighter memory budgets and fp16 is for verification or\nmaximum fidelity."
+        ],
+        "highlights": [
+          "\u26a1 **Turbo decoder** \u2014 prunes Whisper large-v3's decoder from 32 layers to 4 for much faster generation",
+          "\ud83c\udf0d **Multilingual ASR** \u2014 transcribes many languages and can translate speech to English",
+          "\ud83c\udf99\ufe0f **Zero-shot robustness** \u2014 inherits Whisper's large-scale weak-supervision training across noisy domains",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "whisper-large-v3-turbo:fp16",
+          "filename": "whisper-large-v3-turbo-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-large-v3-turbo/resolve/e10bafd4c3d18d35426354d6b190b81e990e2949/whisper-large-v3-turbo-fp16.oasr",
+          "sha256": "efbfd00c20679b363d2a1035981943694ffe6eb12bf18d6412fc483e2bc82683",
+          "size_bytes": 1619471552,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.520788215909091,
+            "rtf_metal": 0.3860598674545454,
+            "peak_rss_bytes": 3622502400,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "whisper-large-v3-turbo:q8",
+          "filename": "whisper-large-v3-turbo-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-large-v3-turbo/resolve/e10bafd4c3d18d35426354d6b190b81e990e2949/whisper-large-v3-turbo-q8_0.oasr",
+          "sha256": "195d8c2e0f85905f32a896473b1387988d87c34f994080136f610480d1244105",
+          "size_bytes": 931343552,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.519555481,
+            "rtf_metal": 0.34829660981818183,
+            "peak_rss_bytes": 2281553920,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "whisper-large-v3-turbo:q4",
+          "filename": "whisper-large-v3-turbo-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-large-v3-turbo/resolve/e10bafd4c3d18d35426354d6b190b81e990e2949/whisper-large-v3-turbo-q4_k.oasr",
+          "sha256": "98ccfbd46be9078cd18eb54dd540aa4c19cc2a6817b585cfe55dfc81a013b33f",
+          "size_bytes": 564341952,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.5086126439090909,
+            "rtf_metal": 0.25162825,
+            "peak_rss_bytes": 1542619136,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "whisper-medium",
+      "kind": "asr-model",
+      "display_name": "Whisper Medium",
+      "family": "whisper",
+      "aliases": [],
+      "pull_alias": "whisper-medium",
+      "size": "medium",
+      "languages": [
+        "af",
+        "am",
+        "ar",
+        "as",
+        "az",
+        "ba",
+        "be",
+        "bg",
+        "bn",
+        "bo",
+        "br",
+        "bs",
+        "ca",
+        "cs",
+        "cy",
+        "da",
+        "de",
+        "el",
+        "en",
+        "es",
+        "et",
+        "eu",
+        "fa",
+        "fi",
+        "fo",
+        "fr",
+        "gl",
+        "gu",
+        "ha",
+        "haw",
+        "he",
+        "hi",
+        "hr",
+        "ht",
+        "hu",
+        "hy",
+        "id",
+        "is",
+        "it",
+        "ja",
+        "jv",
+        "ka",
+        "kk",
+        "km",
+        "kn",
+        "ko",
+        "la",
+        "lb",
+        "ln",
+        "lo",
+        "lt",
+        "lv",
+        "mg",
+        "mi",
+        "mk",
+        "ml",
+        "mn",
+        "mr",
+        "ms",
+        "mt",
+        "my",
+        "ne",
+        "nl",
+        "no",
+        "oc",
+        "pa",
+        "pl",
+        "ps",
+        "pt",
+        "ro",
+        "ru",
+        "sa",
+        "sd",
+        "si",
+        "sk",
+        "sl",
+        "sn",
+        "so",
+        "sq",
+        "sr",
+        "su",
+        "sv",
+        "sw",
+        "ta",
+        "te",
+        "tg",
+        "th",
+        "tk",
+        "tl",
+        "tr",
+        "tt",
+        "uk",
+        "ur",
+        "uz",
+        "vi",
+        "yi",
+        "yo",
+        "zh"
+      ],
+      "vendor": "openai",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/openai/whisper-medium/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/whisper-medium",
+      "hf_revision": "97d3c2087b6cfb4936b98df9144bd1cd08bb2b4f",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "whisper-medium:q8",
+      "prose": {
+        "tagline": "High-accuracy multilingual Whisper at 769M parameters",
+        "overview": [
+          "Whisper Medium is OpenAI's 769M-parameter multilingual Whisper checkpoint. It uses the standard\nWhisper encoder-decoder architecture for automatic speech recognition and speech translation,\ntrained with large-scale weak supervision on 680k hours of labelled speech. Medium delivers\nmuch of the large model's accuracy at a smaller footprint, a strong choice when quality matters\nbut the largest checkpoint is too heavy. This OpenASR repo repackages the original\n`openai/whisper-medium` weights as `.oasr` packs that run natively in the OpenASR runtime with\nno Python at inference time. For most users the q8_0 build is the recommended default; q4_k is\nfor tighter memory budgets and fp16 is for verification or maximum fidelity."
+        ],
+        "highlights": [
+          "\ud83c\udfa7 **Multilingual ASR** \u2014 transcribes many languages and can translate speech to English",
+          "\ud83c\udfaf **769M parameters** \u2014 near-large accuracy with a more manageable footprint",
+          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "whisper-medium:fp16",
+          "filename": "whisper-medium-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-medium/resolve/97d3c2087b6cfb4936b98df9144bd1cd08bb2b4f/whisper-medium-fp16.oasr",
+          "sha256": "08a80860d71f72728ad9676f3f3e7ef45d460c9d38a4eb11199607ed374da200",
+          "size_bytes": 1534887520,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.6206204697272727,
+            "rtf_metal": 0.6128596515454545,
+            "peak_rss_bytes": 4028612608,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "whisper-medium:q8",
+          "filename": "whisper-medium-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-medium/resolve/97d3c2087b6cfb4936b98df9144bd1cd08bb2b4f/whisper-medium-q8_0.oasr",
+          "sha256": "5e663d322bcaa5743c3e4b3dac680f0b6c79f87edb9d7f1b9147a09329278c37",
+          "size_bytes": 874284640,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.46194115154545456,
+            "rtf_metal": 0.4086751629090909,
+            "peak_rss_bytes": 2174222336,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "whisper-medium:q4",
+          "filename": "whisper-medium-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-medium/resolve/97d3c2087b6cfb4936b98df9144bd1cd08bb2b4f/whisper-medium-q4_k.oasr",
+          "sha256": "180a31a5e134b7d7e1cfc21c8859000f644f14e8b41d52142ff757fe72e63390",
+          "size_bytes": 521963104,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.514268697,
+            "rtf_metal": 0.38989461745454546,
+            "peak_rss_bytes": 1538801664,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "whisper-medium.en",
+      "kind": "asr-model",
+      "display_name": "Whisper Medium (English)",
+      "family": "whisper",
+      "aliases": [],
+      "pull_alias": "whisper-medium.en",
+      "size": "medium.en",
+      "languages": [
+        "en"
+      ],
+      "vendor": "openai",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/openai/whisper-medium.en/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/whisper-medium.en",
+      "hf_revision": "7e5443893c6642fff65b3346afdd8a7aa1d4dc26",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "whisper-medium.en:q8",
+      "prose": {
+        "tagline": "High-accuracy English-only Whisper at 769M parameters",
+        "overview": [
+          "Whisper Medium.en is OpenAI's 769M-parameter English-only Whisper checkpoint. It uses the standard\nWhisper encoder-decoder architecture for automatic speech recognition, trained with large-scale\nweak supervision on 680k hours of labelled speech. As an English-specialized model it tends to\noutperform the same-size multilingual Whisper on English audio, delivering high English accuracy\nwithout the footprint of the largest checkpoints. This OpenASR repo repackages the original\n`openai/whisper-medium.en` weights as `.oasr` packs that run natively in the OpenASR runtime with\nno Python at inference time. For most users the q8_0 build is the recommended default; q4_k is\nfor tighter memory budgets and fp16 is for verification or maximum fidelity."
+        ],
+        "highlights": [
+          "\ud83c\uddec\ud83c\udde7 **English-only** \u2014 specialized for English, typically more accurate on English than the same-size multilingual model",
+          "\ud83c\udfaf **769M parameters** \u2014 near-large English accuracy with a more manageable footprint",
+          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "whisper-medium.en:fp16",
+          "filename": "whisper-medium.en-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-medium.en/resolve/7e5443893c6642fff65b3346afdd8a7aa1d4dc26/whisper-medium.en-fp16.oasr",
+          "sha256": "2245b9567d5bee5d31b5dc0154cf256cadd31fd78741118a833974d05c2da982",
+          "size_bytes": 1534810368,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.42568272727272727,
+            "rtf_metal": 0.3482977424545455,
+            "peak_rss_bytes": 4422696960,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "whisper-medium.en:q8",
+          "filename": "whisper-medium.en-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-medium.en/resolve/7e5443893c6642fff65b3346afdd8a7aa1d4dc26/whisper-medium.en-q8_0.oasr",
+          "sha256": "59c3bb72a039e596cc3c83fad9961f7348ebd1225cea132258b08c98dd7f7a54",
+          "size_bytes": 874207488,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.3050919090909091,
+            "rtf_metal": 0.2552622727272727,
+            "peak_rss_bytes": 2171437056,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "whisper-medium.en:q4",
+          "filename": "whisper-medium.en-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-medium.en/resolve/7e5443893c6642fff65b3346afdd8a7aa1d4dc26/whisper-medium.en-q4_k.oasr",
+          "sha256": "65baa53ecb7231f504dac8cc06295effbca24c4a8f4fe3d07c6766e0c79baa2f",
+          "size_bytes": 521885952,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.2998734129090909,
+            "rtf_metal": 0.24698960981818183,
+            "peak_rss_bytes": 1537212416,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "whisper-small",
+      "kind": "asr-model",
+      "display_name": "Whisper Small",
+      "family": "whisper",
+      "aliases": [],
+      "pull_alias": "whisper-small",
+      "size": "small",
+      "languages": [
+        "af",
+        "am",
+        "ar",
+        "as",
+        "az",
+        "ba",
+        "be",
+        "bg",
+        "bn",
+        "bo",
+        "br",
+        "bs",
+        "ca",
+        "cs",
+        "cy",
+        "da",
+        "de",
+        "el",
+        "en",
+        "es",
+        "et",
+        "eu",
+        "fa",
+        "fi",
+        "fo",
+        "fr",
+        "gl",
+        "gu",
+        "ha",
+        "haw",
+        "he",
+        "hi",
+        "hr",
+        "ht",
+        "hu",
+        "hy",
+        "id",
+        "is",
+        "it",
+        "ja",
+        "jv",
+        "ka",
+        "kk",
+        "km",
+        "kn",
+        "ko",
+        "la",
+        "lb",
+        "ln",
+        "lo",
+        "lt",
+        "lv",
+        "mg",
+        "mi",
+        "mk",
+        "ml",
+        "mn",
+        "mr",
+        "ms",
+        "mt",
+        "my",
+        "ne",
+        "nl",
+        "no",
+        "oc",
+        "pa",
+        "pl",
+        "ps",
+        "pt",
+        "ro",
+        "ru",
+        "sa",
+        "sd",
+        "si",
+        "sk",
+        "sl",
+        "sn",
+        "so",
+        "sq",
+        "sr",
+        "su",
+        "sv",
+        "sw",
+        "ta",
+        "te",
+        "tg",
+        "th",
+        "tk",
+        "tl",
+        "tr",
+        "tt",
+        "uk",
+        "ur",
+        "uz",
+        "vi",
+        "yi",
+        "yo",
+        "zh"
+      ],
+      "vendor": "openai",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/openai/whisper-small/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/whisper-small",
+      "hf_revision": "57b39afc293a13de4732029916f5c923b5b7b85a",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "whisper-small:q8",
+      "prose": {
+        "tagline": "Compact multilingual Whisper for local transcription",
+        "overview": [
+          "Whisper Small is OpenAI's 244M-parameter multilingual Whisper checkpoint. It uses the\nstandard Whisper encoder-decoder architecture for automatic speech recognition and speech\ntranslation, trained with large-scale weak supervision on 680k hours of labelled speech.\nCompared with larger Whisper checkpoints, the small model is easier to run locally while\nretaining the broad zero-shot behavior that makes Whisper useful across noisy datasets and\ndomains. This OpenASR repo repackages the original `openai/whisper-small` weights as\n`.oasr` packs that run natively in the OpenASR runtime with no Python at inference time.\nFor most users the q8_0 build is the recommended default; q4_k is for tighter memory\nbudgets and fp16 is for verification or maximum fidelity."
+        ],
+        "highlights": [
+          "\ud83c\udfa7 **Multilingual ASR** \u2014 transcribes many languages and can translate speech to English",
+          "\ud83e\udde0 **244M parameters** \u2014 the small Whisper checkpoint balances accuracy, footprint, and speed",
+          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "whisper-small:fp16",
+          "filename": "whisper-small-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-small/resolve/57b39afc293a13de4732029916f5c923b5b7b85a/whisper-small-fp16.oasr",
+          "sha256": "ef2e8b8cbe0cc25aa5bbc61aa4e432de1d84d2e7e8c59099e2005dd815088518",
+          "size_bytes": 488712960,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.13280131445454546,
+            "rtf_metal": 0.08321396972727273,
+            "peak_rss_bytes": 1566900224,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "whisper-small:q8",
+          "filename": "whisper-small-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-small/resolve/57b39afc293a13de4732029916f5c923b5b7b85a/whisper-small-q8_0.oasr",
+          "sha256": "78392baea90cf3985845a3e0b95f5bf77c8a120c6f68a55daf9ad492e9ef9138",
+          "size_bytes": 302918400,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.11239598109090908,
+            "rtf_metal": 0.07408579545454545,
+            "peak_rss_bytes": 881344512,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "whisper-small:q4",
+          "filename": "whisper-small-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-small/resolve/57b39afc293a13de4732029916f5c923b5b7b85a/whisper-small-q4_k.oasr",
+          "sha256": "a19cedec2efbc7e03b5c3736011a75ec4d056b965ea450ecfe1d10bf32db4106",
+          "size_bytes": 203827968,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.10406204163636364,
+            "rtf_metal": 0.07346456436363637,
+            "peak_rss_bytes": 665370624,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "whisper-small.en",
+      "kind": "asr-model",
+      "display_name": "Whisper Small (English)",
+      "family": "whisper",
+      "aliases": [],
+      "pull_alias": "whisper-small.en",
+      "size": "small.en",
+      "languages": [
+        "en"
+      ],
+      "vendor": "openai",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/openai/whisper-small.en/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/whisper-small.en",
+      "hf_revision": "c9ec6a2822f49c74ae9520bb166393b138af40f6",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "whisper-small.en:q8",
+      "prose": {
+        "tagline": "Balanced English-only Whisper for accurate local transcription",
+        "overview": [
+          "Whisper Small.en is OpenAI's 244M-parameter English-only Whisper checkpoint. It uses the standard\nWhisper encoder-decoder architecture for automatic speech recognition, trained with large-scale\nweak supervision on 680k hours of labelled speech. As an English-specialized model it tends to\noutperform the same-size multilingual Whisper on English audio, making it a strong default for\nEnglish-only workloads that want accuracy without a large footprint. This OpenASR repo\nrepackages the original `openai/whisper-small.en` weights as `.oasr` packs that run natively in\nthe OpenASR runtime with no Python at inference time. For most users the q8_0 build is the\nrecommended default; q4_k is for tighter memory budgets and fp16 is for verification or maximum\nfidelity."
+        ],
+        "highlights": [
+          "\ud83c\uddec\ud83c\udde7 **English-only** \u2014 specialized for English, typically more accurate on English than the same-size multilingual model",
+          "\ud83e\udde0 **244M parameters** \u2014 the small checkpoint balances English accuracy, footprint, and speed",
+          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "whisper-small.en:fp16",
+          "filename": "whisper-small.en-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-small.en/resolve/c9ec6a2822f49c74ae9520bb166393b138af40f6/whisper-small.en-fp16.oasr",
+          "sha256": "d4678873f9e1612d692cd0ebc8d907496d96509a31e35abbc0ca3dbb72237544",
+          "size_bytes": 488635936,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.12814725381818182,
+            "rtf_metal": 0.0974782689090909,
+            "peak_rss_bytes": 1592999936,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "whisper-small.en:q8",
+          "filename": "whisper-small.en-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-small.en/resolve/c9ec6a2822f49c74ae9520bb166393b138af40f6/whisper-small.en-q8_0.oasr",
+          "sha256": "10653cc9293d6ba548dffb50b0fddb74ae437b0ed632e00c2cc3ac9d53daf416",
+          "size_bytes": 302841376,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.117534072,
+            "rtf_metal": 0.08517591672727273,
+            "peak_rss_bytes": 902479872,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "whisper-small.en:q4",
+          "filename": "whisper-small.en-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-small.en/resolve/c9ec6a2822f49c74ae9520bb166393b138af40f6/whisper-small.en-q4_k.oasr",
+          "sha256": "4ff4727b77f0468a18f78a59709da12105fde6db2b37a806eec23be0a7809a26",
+          "size_bytes": 203750944,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.11021648109090908,
+            "rtf_metal": 0.07576457954545456,
+            "peak_rss_bytes": 686587904,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "whisper-tiny",
+      "kind": "asr-model",
+      "display_name": "Whisper Tiny",
+      "family": "whisper",
+      "aliases": [],
+      "pull_alias": "whisper-tiny",
+      "size": "tiny",
+      "languages": [
+        "af",
+        "am",
+        "ar",
+        "as",
+        "az",
+        "ba",
+        "be",
+        "bg",
+        "bn",
+        "bo",
+        "br",
+        "bs",
+        "ca",
+        "cs",
+        "cy",
+        "da",
+        "de",
+        "el",
+        "en",
+        "es",
+        "et",
+        "eu",
+        "fa",
+        "fi",
+        "fo",
+        "fr",
+        "gl",
+        "gu",
+        "ha",
+        "haw",
+        "he",
+        "hi",
+        "hr",
+        "ht",
+        "hu",
+        "hy",
+        "id",
+        "is",
+        "it",
+        "ja",
+        "jv",
+        "ka",
+        "kk",
+        "km",
+        "kn",
+        "ko",
+        "la",
+        "lb",
+        "ln",
+        "lo",
+        "lt",
+        "lv",
+        "mg",
+        "mi",
+        "mk",
+        "ml",
+        "mn",
+        "mr",
+        "ms",
+        "mt",
+        "my",
+        "ne",
+        "nl",
+        "no",
+        "oc",
+        "pa",
+        "pl",
+        "ps",
+        "pt",
+        "ro",
+        "ru",
+        "sa",
+        "sd",
+        "si",
+        "sk",
+        "sl",
+        "sn",
+        "so",
+        "sq",
+        "sr",
+        "su",
+        "sv",
+        "sw",
+        "ta",
+        "te",
+        "tg",
+        "th",
+        "tk",
+        "tl",
+        "tr",
+        "tt",
+        "uk",
+        "ur",
+        "uz",
+        "vi",
+        "yi",
+        "yo",
+        "zh"
+      ],
+      "vendor": "openai",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/openai/whisper-tiny/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/whisper-tiny",
+      "hf_revision": "176446ac899cdc497b0114bad82cb6dee63e6a83",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "whisper-tiny:q8",
+      "prose": {
+        "tagline": "The smallest multilingual Whisper for fast local transcription",
+        "overview": [
+          "Whisper Tiny is OpenAI's 39M-parameter multilingual Whisper checkpoint, the smallest member of\nthe Whisper family. It uses the standard Whisper encoder-decoder architecture for automatic\nspeech recognition and speech translation, trained with large-scale weak supervision on 680k\nhours of labelled speech. The tiny model trades some accuracy for the lowest footprint and\nfastest inference, which suits low-resource devices and latency-sensitive use. This OpenASR\nrepo repackages the original `openai/whisper-tiny` weights as `.oasr` packs that run natively\nin the OpenASR runtime with no Python at inference time. For most users the q8_0 build is the\nrecommended default; q4_k is for the tightest memory budgets and fp16 is for verification or\nmaximum fidelity."
+        ],
+        "highlights": [
+          "\ud83c\udfa7 **Multilingual ASR** \u2014 transcribes many languages and can translate speech to English",
+          "\u26a1 **39M parameters** \u2014 the smallest Whisper checkpoint, the fastest and lightest to run",
+          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "whisper-tiny:fp16",
+          "filename": "whisper-tiny-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-tiny/resolve/176446ac899cdc497b0114bad82cb6dee63e6a83/whisper-tiny-fp16.oasr",
+          "sha256": "bc3f2c4c1f3e887d8e2e7f614febcdbd2bfe4acd325b104afe2d6c206f3ce60f",
+          "size_bytes": 78793088,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.03580973109090909,
+            "rtf_metal": 0.03170699236363636,
+            "peak_rss_bytes": 321486848,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "whisper-tiny:q8",
+          "filename": "whisper-tiny-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-tiny/resolve/176446ac899cdc497b0114bad82cb6dee63e6a83/whisper-tiny-q8_0.oasr",
+          "sha256": "13346d7bd47d349ae9e35be5cc8595997be0c2d2a5bbe41b4e3ef1c60a98ca17",
+          "size_bytes": 63310208,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.03501189018181818,
+            "rtf_metal": 0.031350950727272724,
+            "peak_rss_bytes": 274939904,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "whisper-tiny:q4",
+          "filename": "whisper-tiny-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-tiny/resolve/176446ac899cdc497b0114bad82cb6dee63e6a83/whisper-tiny-q4_k.oasr",
+          "sha256": "79a947c5060fa981f29e1729ff349946f06dc689bdc02a1808dc8cabe705d853",
+          "size_bytes": 60950912,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.03685976890909091,
+            "rtf_metal": 0.03213127645454545,
+            "peak_rss_bytes": 273711104,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "whisper-tiny.en",
+      "kind": "asr-model",
+      "display_name": "Whisper Tiny (English)",
+      "family": "whisper",
+      "aliases": [],
+      "pull_alias": "whisper-tiny.en",
+      "size": "tiny.en",
+      "languages": [
+        "en"
+      ],
+      "vendor": "openai",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/openai/whisper-tiny.en/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/whisper-tiny.en",
+      "hf_revision": "e48ed208316c3648de3c05315b2335e73c56852b",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "whisper-tiny.en:q8",
+      "prose": {
+        "tagline": "The smallest English-only Whisper, fastest for English speech",
+        "overview": [
+          "Whisper Tiny.en is OpenAI's 39M-parameter English-only Whisper checkpoint. It uses the standard\nWhisper encoder-decoder architecture for automatic speech recognition, trained with large-scale\nweak supervision on 680k hours of labelled speech. As an English-specialized model it tends to\noutperform the same-size multilingual Whisper on English audio, at the lowest footprint and\nfastest inference in the family. This OpenASR repo repackages the original `openai/whisper-tiny.en`\nweights as `.oasr` packs that run natively in the OpenASR runtime with no Python at inference\ntime. For most users the q8_0 build is the recommended default; q4_k is for the tightest memory\nbudgets and fp16 is for verification or maximum fidelity."
+        ],
+        "highlights": [
+          "\ud83c\uddec\ud83c\udde7 **English-only** \u2014 specialized for English, typically more accurate on English than the same-size multilingual model",
+          "\u26a1 **39M parameters** \u2014 the smallest, fastest, and lightest Whisper checkpoint",
+          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "whisper-tiny.en:fp16",
+          "filename": "whisper-tiny.en-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-tiny.en/resolve/e48ed208316c3648de3c05315b2335e73c56852b/whisper-tiny.en-fp16.oasr",
+          "sha256": "ec0f4bfd28a3edb142a763089bf02afa5292e145e4f3c675eda8662ee4e6b084",
+          "size_bytes": 78717216,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.04648526509090909,
+            "rtf_metal": 0.04501368563636364,
+            "peak_rss_bytes": 324796416,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "whisper-tiny.en:q8",
+          "filename": "whisper-tiny.en-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-tiny.en/resolve/e48ed208316c3648de3c05315b2335e73c56852b/whisper-tiny.en-q8_0.oasr",
+          "sha256": "8a95114cd2bc882aca971da6694c58d40b25f4530f81321044e4dac3aba80871",
+          "size_bytes": 63234336,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.05063912118181819,
+            "rtf_metal": 0.04301476136363636,
+            "peak_rss_bytes": 276545536,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "whisper-tiny.en:q4",
+          "filename": "whisper-tiny.en-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/whisper-tiny.en/resolve/e48ed208316c3648de3c05315b2335e73c56852b/whisper-tiny.en-q4_k.oasr",
+          "sha256": "7694f9e006c51410b20e773f45fd7372ac4747e0bb9bd026f572e7a36abba5de",
+          "size_bytes": 60875040,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.04550099245454546,
+            "rtf_metal": 0.04550890154545455,
+            "peak_rss_bytes": 271269888,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "xasr-zh-en",
+      "kind": "asr-model",
+      "display_name": "X-ASR zh-en",
+      "family": "xasr-zipformer",
+      "aliases": [
+        "xasr",
+        "x-asr"
+      ],
+      "pull_alias": "xasr",
+      "size": "0.16b",
+      "languages": [
+        "en",
+        "zh"
+      ],
+      "vendor": "GilgameshWind",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/GilgameshWind/X-ASR-zh-en/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/xasr-zh-en",
+      "hf_revision": "2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "xasr-zh-en:q8",
+      "prose": {
+        "tagline": "Bilingual Chinese + English streaming speech recognition \u2014 a compact icefall Zipformer2 transducer",
+        "overview": [
+          "X-ASR-zh-en is a compact **bilingual (Chinese + English)** streaming speech-recognition model from\n**GilgameshWind**, built with the **icefall / k2** recipe as a cache-aware **Zipformer2 RNN-T\ntransducer** (a 6-stack, 19-layer Zipformer2 encoder, a stateless RNN-T decoder, and a tanh joiner\nover a 5000-token BPE vocabulary, ~0.16B parameters). The same checkpoint serves both low-latency\n**streaming** captions and full-file **offline** transcription, making it a good fit for on-device\nChinese/English dictation and real-time subtitles. This OpenASR repo repackages the weights as\n`.oasr` packs that run natively in the OpenASR runtime \u2014 no Python at inference time, all decoding\nlocal. The **q8_0** build is the recommended default (it matched the fp16 transcript bit-for-bit in\nOpenASR's verification); **q4_k** is the smallest build for tight-memory devices and **fp16** is for\nmaximum fidelity or verification."
+        ],
+        "highlights": [
+          "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **Chinese + English** \u2014 one bilingual checkpoint for zh/en speech, including code-switched audio",
+          "\u26a1 **Streaming-first, offline-capable** \u2014 a cache-aware streaming Zipformer2 transducer for low-latency captions that also runs full-file offline transcription",
+          "\ud83e\udeb6 **Compact ~0.16B** \u2014 a 6-stack Zipformer2 encoder + stateless RNN-T decoder + tanh joiner over a 5000-token BPE vocab, light enough for on-device CPU",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "xasr-zh-en:fp16",
+          "filename": "xasr-zh-en-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5/xasr-zh-en-fp16.oasr",
+          "sha256": "89316b6e912aa474121fa6b8b7738514b64c9ba144f26702cbb36313b69a2e95",
+          "size_bytes": 314918720,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.08819234090909091,
+            "rtf_metal": 0.15154204545454544,
+            "peak_rss_bytes": 1365606400,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "xasr-zh-en:q8",
+          "filename": "xasr-zh-en-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5/xasr-zh-en-q8_0.oasr",
+          "sha256": "a0201070212ceff3a37d8dafd21455209ea48721d1b53b31e8eff328fc573fdb",
+          "size_bytes": 175711040,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.08679616281818182,
+            "rtf_metal": 0.15143581063636363,
+            "peak_rss_bytes": 1355874304,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "xasr-zh-en:q4",
+          "filename": "xasr-zh-en-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5/xasr-zh-en-q4_k.oasr",
+          "sha256": "f4bea03a10333ee2c31f797a1abbadb885a85e63327b419b83b99d8bd2823106",
+          "size_bytes": 112003904,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.08677703790909091,
+            "rtf_metal": 0.14969315154545454,
+            "peak_rss_bytes": 1355841536,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ]
+    }
+  ]
+}

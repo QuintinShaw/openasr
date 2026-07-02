@@ -1,0 +1,10 @@
+id = "whisper-medium.en"
+default_variant = "published"
+display_name = "Whisper Medium (English) (OpenASR pack)"
+languages = ["en"]
+size = "medium.en"
+license = "Apache-2.0"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/whisper-medium.en"
+
+[variant]
+quantization = "q8_0"

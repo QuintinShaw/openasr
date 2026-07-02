@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "openasr-catalog",
+  "main": "src/index.js",
+  "compatibility_date": "2026-06-06",
+  "compatibility_flags": ["nodejs_compat"],
+  // Static assets host the catalog bytes (populated at deploy from model-registry/
+  // by the `build:assets` script). `run_worker_first` makes the Worker gate every
+  // request (method/path allowlist + CORS) instead of letting assets auto-serve.
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
+  // Bind the Worker to the catalog host. `openasr.org` must already be a zone on
+  // the deploying Cloudflare account; the Custom Domain provisions TLS for the
+  // subdomain automatically. This is the value of `OPENASR_CATALOG_ENDPOINT`.
+  "routes": [{ "pattern": "catalog.openasr.org", "custom_domain": true }],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}

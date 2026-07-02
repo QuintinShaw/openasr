@@ -1,0 +1,84 @@
+name: Deploy catalog
+
+# Deploys the signed PUBLIC catalog projection to Cloudflare (catalog.openasr.org)
+# when it changes on main. Signing happens locally (the seed never enters CI); this
+# workflow only ships the already-signed, already-committed bytes with a scoped
+# CLOUDFLARE_API_TOKEN. The ed25519 signature is cryptographically verified by the
+# `rust` job's bundled-/public-projection gates on the same push; here we add cheap
+# consistency guardrails plus a post-deploy check.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "model-registry/catalog.public.json"
+      - "model-registry/catalog.public.signature.json"
+      - "cloudflare/catalog/**"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-catalog
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify committed public catalog (consistent + public-only)
+        run: |
+          python3 - <<'PY'
+          import hashlib, json
+          raw = open("model-registry/catalog.public.json", "rb").read()
+          sig = json.load(open("model-registry/catalog.public.signature.json"))
+          catalog = json.loads(raw)
+          assert hashlib.sha256(raw).hexdigest() == sig["catalog_sha256"], "catalog.public.json sha256 != signature.catalog_sha256"
+          assert sig["catalog_url"] == "https://catalog.openasr.org/v1/catalog.json", "catalog_url is not the canonical signed identity"
+          assert catalog.get("models"), "public catalog has no models"
+          assert all(m.get("public") is True for m in catalog["models"]), "public catalog must contain only public:true models"
+          print(f"OK: {len(catalog['models'])} public model(s); sha256 + canonical url consistent")
+          PY
+
+      - name: Deploy to Cloudflare
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # Pin wrangler 4.x: the action's default (3.90.0) cannot read this
+          # wrangler.jsonc (4.x `assets`/`run_worker_first` + JSONC comments) and
+          # fails with "Missing entry-point".
+          wranglerVersion: "4.98.0"
+          workingDirectory: cloudflare/catalog
+          # Stage the committed signed bytes as the served static assets, then deploy.
+          preCommands: |
+            mkdir -p public
+            cp ../../model-registry/catalog.public.json public/catalog.json
+            cp ../../model-registry/catalog.public.signature.json public/catalog.signature.json
+          command: deploy
+
+      - name: Verify live endpoint serves the committed public projection
+        run: |
+          # The edge cache and asset propagation lag the deploy by up to ~a
+          # minute: retry with a cache-busting query (distinct cache key, so
+          # the read goes to origin) instead of failing on the first stale hit.
+          base="https://catalog.openasr.org/v1"
+          for attempt in $(seq 1 12); do
+            bust="cb=${GITHUB_SHA}-${attempt}"
+            curl -fsSL "$base/catalog.json?$bust" -o /tmp/live-catalog.json
+            curl -fsSL "$base/catalog.signature.json?$bust" -o /tmp/live-catalog.sig.json
+            if cmp -s /tmp/live-catalog.json model-registry/catalog.public.json \
+              && cmp -s /tmp/live-catalog.sig.json model-registry/catalog.public.signature.json; then
+              break
+            fi
+            if [ "$attempt" = "12" ]; then
+              echo "::error::live catalog still differs from the committed public projection after $attempt attempts"
+              cmp /tmp/live-catalog.json model-registry/catalog.public.json || true
+              cmp /tmp/live-catalog.sig.json model-registry/catalog.public.signature.json || true
+              exit 1
+            fi
+            echo "live catalog not yet consistent (attempt $attempt); retrying in 10s"
+            sleep 10
+          done
+          if grep -q '"public": false' /tmp/live-catalog.json; then
+            echo "::error::live catalog exposes public:false entries"; exit 1
+          fi
+          echo "live catalog.openasr.org matches the committed public projection (public-only)"

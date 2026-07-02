@@ -1,0 +1,1359 @@
+pub(crate) mod block_stack;
+pub(crate) mod hparams;
+pub(crate) mod shape_orchestrator;
+
+use std::collections::BTreeMap;
+
+use crate::models::ggml_family_adapter::{
+    GGML_TOKENIZER_ID_KEY, GgmlExecutionCapability, GgmlFamilyAdapterDescriptor, LanguageFamilyHint,
+};
+use crate::models::oasr_metadata::{
+    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
+    OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
+    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+};
+use crate::models::qwen::QWEN3_ASR_MODEL_FAMILY;
+use block_stack::{
+    OpenAsrBlockKind, OpenAsrBlockStackDescriptor, OpenAsrOrchestrationShape,
+    OpenAsrStageDescriptor,
+};
+use hparams::{
+    COHERE_TRANSCRIBE_DECODER_LAYERS_KEY, COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY,
+    COHERE_TRANSCRIBE_HPARAM_SCHEMA, MOONSHINE_HPARAM_SCHEMA, PARAKEET_CTC_HPARAM_SCHEMA,
+    QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA, QWEN3_AUDIO_LAYERS_KEY,
+    QWEN3_LLM_LAYERS_KEY, WAV2VEC2_CTC_HPARAM_SCHEMA, WHISPER_HPARAM_SCHEMA,
+    XASR_ZIPFORMER_HPARAM_SCHEMA,
+};
+
+pub(crate) const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
+
+pub(crate) const COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID: &str =
+    "cohere-transcribe-conformer-transformer";
+pub(crate) const COHERE_TRANSCRIBE_GGML_ADAPTER_ID: &str =
+    "ggml-family-cohere-transcribe-runtime-v1";
+pub(crate) const COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID: &str =
+    "cohere-transcribe.logmel128.preemphasis.16khz.mono.v0";
+pub(crate) const COHERE_TRANSCRIBE_TOKENIZER_ID: &str = "cohere-transcribe.spm.v1";
+pub(crate) const COHERE_TRANSCRIBE_DECODE_POLICY_ID: &str = "cohere-transcribe.greedy.seq2seq.v1";
+pub(crate) const COHERE_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID: &str =
+    "cohere-transcribe.runtime-tensors.v1";
+pub(crate) const COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID: &str =
+    "cohere-transcribe.ggml-executor.v1";
+
+pub(crate) const WHISPER_GGML_ARCHITECTURE_ID: &str = "whisper-encoder-decoder";
+pub(crate) const WHISPER_GGML_ADAPTER_ID: &str = "ggml-family-whisper-runtime-v1";
+pub(crate) const WHISPER_AUDIO_FRONTEND_ID: &str = "whisper.logmel.16khz.mono.v0";
+pub(crate) const WHISPER_TOKENIZER_ID: &str = "whisper.hf-bpe.v1";
+pub(crate) const WHISPER_DECODE_POLICY_ID: &str = "whisper.greedy.seq2seq.v1";
+pub(crate) const WHISPER_RUNTIME_TENSOR_CONTRACT_ID: &str = "whisper.runtime-tensors.v1";
+pub(crate) const WHISPER_EXECUTOR_COMPONENT_ID: &str = "whisper.ggml-executor.v1";
+
+pub(crate) const QWEN3_ASR_GGML_ARCHITECTURE_ID: &str = "qwen3-asr-encoder-decoder";
+pub(crate) const QWEN3_ASR_GGML_ADAPTER_ID: &str = "ggml-family-qwen3-asr-runtime-v1";
+pub(crate) const QWEN3_ASR_AUDIO_FRONTEND_ID: &str = "qwen3-asr.fbank.16khz.mono.v0";
+pub(crate) const QWEN3_ASR_TOKENIZER_ID: &str = "qwen3-asr.spm.v1";
+pub(crate) const QWEN3_ASR_DECODE_POLICY_ID: &str = "qwen3-asr.greedy.seq2seq.v1";
+pub(crate) const QWEN3_ASR_RUNTIME_TENSOR_CONTRACT_ID: &str = "qwen3-asr.runtime-tensors.v1";
+pub(crate) const QWEN3_ASR_EXECUTOR_COMPONENT_ID: &str = "qwen3-asr.ggml-executor.v1";
+
+// parakeet-ctc (FastConformer-CTC, the goal-1 Ctc-shape onboarding).
+pub(crate) const PARAKEET_CTC_GGML_ARCHITECTURE_ID: &str = "parakeet-fastconformer-ctc";
+pub(crate) const PARAKEET_CTC_GGML_ADAPTER_ID: &str = "ggml-family-parakeet-ctc-runtime-v1";
+pub(crate) const PARAKEET_CTC_AUDIO_FRONTEND_ID: &str = "parakeet-ctc.logmel80.16khz.mono.v0";
+pub(crate) const PARAKEET_CTC_TOKENIZER_ID: &str = "parakeet-ctc.spm-bpe.v0";
+pub(crate) const PARAKEET_CTC_DECODE_POLICY_ID: &str = "parakeet-ctc.greedy.ctc.v0";
+pub(crate) const PARAKEET_CTC_RUNTIME_TENSOR_CONTRACT_ID: &str = "parakeet-ctc.runtime-tensors.v0";
+pub(crate) const PARAKEET_CTC_EXECUTOR_COMPONENT_ID: &str = "parakeet-ctc.ggml-executor.v0";
+
+// wav2vec2-ctc (facebook/wav2vec2-base-960h, raw-waveform CTC onboarding).
+pub(crate) const WAV2VEC2_CTC_GGML_ARCHITECTURE_ID: &str = "wav2vec2-ctc";
+pub(crate) const WAV2VEC2_CTC_GGML_ADAPTER_ID: &str = "ggml-family-wav2vec2-ctc-runtime-v1";
+pub(crate) const WAV2VEC2_CTC_AUDIO_FRONTEND_ID: &str = "wav2vec2-ctc.raw-waveform.16khz.mono.v0";
+pub(crate) const WAV2VEC2_CTC_TOKENIZER_ID: &str = "wav2vec2-ctc.char.v0";
+pub(crate) const WAV2VEC2_CTC_DECODE_POLICY_ID: &str = "wav2vec2-ctc.greedy.ctc.v0";
+pub(crate) const WAV2VEC2_CTC_RUNTIME_TENSOR_CONTRACT_ID: &str = "wav2vec2-ctc.runtime-tensors.v0";
+pub(crate) const WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID: &str = "wav2vec2-ctc.ggml-executor.v0";
+
+// X-ASR Zipformer (GilgameshWind/X-ASR-zh-en, streaming RNN-T transducer).
+pub(crate) const XASR_ZIPFORMER_GGML_ARCHITECTURE_ID: &str = "xasr-zipformer-transducer";
+pub(crate) const XASR_ZIPFORMER_GGML_ADAPTER_ID: &str = "ggml-family-xasr-zipformer-runtime-v1";
+pub(crate) const XASR_ZIPFORMER_MODEL_FAMILY: &str = "xasr-zipformer";
+pub(crate) const XASR_ZIPFORMER_AUDIO_FRONTEND_ID: &str = "xasr-zipformer.fbank80.16khz.mono.v0";
+pub(crate) const XASR_ZIPFORMER_TOKENIZER_ID: &str = "xasr-zipformer.bpe.v0";
+pub(crate) const XASR_ZIPFORMER_DECODE_POLICY_ID: &str = "xasr-zipformer.greedy.transducer.v0";
+pub(crate) const XASR_ZIPFORMER_RUNTIME_TENSOR_CONTRACT_ID: &str =
+    "xasr-zipformer.runtime-tensors.v0";
+pub(crate) const XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID: &str = "xasr-zipformer.ggml-executor.v0";
+pub(crate) const XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID: &str =
+    "xasr-zipformer.ggml-streaming-executor.v0";
+
+// moonshine (UsefulSensors, raw-waveform conv-stem + RoPE seq2seq encoder-decoder).
+pub(crate) const MOONSHINE_GGML_ARCHITECTURE_ID: &str = "moonshine-encoder-decoder";
+pub(crate) const MOONSHINE_GGML_ADAPTER_ID: &str = "ggml-family-moonshine-runtime-v1";
+pub(crate) const MOONSHINE_AUDIO_FRONTEND_ID: &str = "moonshine.raw-waveform.16khz.mono.v0";
+pub(crate) const MOONSHINE_TOKENIZER_ID: &str = "moonshine.spm-bpe.v0";
+pub(crate) const MOONSHINE_DECODE_POLICY_ID: &str = "moonshine.greedy.seq2seq.v1";
+pub(crate) const MOONSHINE_RUNTIME_TENSOR_CONTRACT_ID: &str = "moonshine.runtime-tensors.v0";
+pub(crate) const MOONSHINE_EXECUTOR_COMPONENT_ID: &str = "moonshine.ggml-executor.v0";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAsrComponentKind {
+    AudioFrontend,
+    DecodePolicy,
+    Executor,
+    RuntimeTensorContract,
+    Tokenizer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenAsrComponentDescriptor {
+    pub kind: OpenAsrComponentKind,
+    pub id: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenAsrArchitectureDescriptor {
+    pub runtime_architecture_aliases: &'static [&'static str],
+    pub model_family: &'static str,
+    pub model_architecture: &'static str,
+    pub adapter_id: &'static str,
+    /// How this family handles a source-language request (see `LanguageFamilyHint`).
+    pub language_family_hint: LanguageFamilyHint,
+    pub audio_frontend_id: &'static str,
+    pub runtime_tensor_contract_id: &'static str,
+    pub tokenizer_id: &'static str,
+    pub decode_policy_id: &'static str,
+    pub executor_component_id: &'static str,
+    pub execution_capability: GgmlExecutionCapability,
+    pub prefer_cpu_decoder_for_multichunk_metal: bool,
+    /// Canonical required GGUF/`.oasr` hparam keys for this architecture.
+    /// Authoritative source of truth for the hparam schema; the per-arch
+    /// runtime contract resolves aliases and optional consistency keys on top.
+    pub hparam_schema: &'static [&'static str],
+    /// Data-driven layer-stack declaration consumed by the per-shape composer
+    /// (P4 "new model = data"). `None` for architectures that stay on a
+    /// hand-written executor and are never composed (whisper, the bit-level
+    /// regression gate). See [`block_stack`].
+    pub block_stack: Option<OpenAsrBlockStackDescriptor>,
+}
+
+impl OpenAsrArchitectureDescriptor {
+    fn matches_runtime_architecture_alias(&self, alias: &str) -> bool {
+        self.runtime_architecture_aliases
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(alias))
+    }
+
+    pub(crate) fn ggml_family_adapter_descriptor(self) -> GgmlFamilyAdapterDescriptor {
+        GgmlFamilyAdapterDescriptor {
+            adapter_id: self.adapter_id,
+            language_family_hint: self.language_family_hint,
+            model_family: self.model_family,
+            model_architecture: self.model_architecture,
+            audio_frontend_id: self.audio_frontend_id,
+            tokenizer_id: self.tokenizer_id,
+            decode_policy_id: self.decode_policy_id,
+            execution_capability: self.execution_capability,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAsrArchitectureRegistryError {
+    MissingComponentReference {
+        model_architecture: &'static str,
+        kind: OpenAsrComponentKind,
+        component_id: &'static str,
+    },
+    EmptyHparamSchema {
+        model_architecture: &'static str,
+    },
+    DuplicateHparamKey {
+        model_architecture: &'static str,
+        key: &'static str,
+    },
+    /// A block-stack stage's `layer_count_hparam` is not declared in the
+    /// architecture's `hparam_schema` (the composer would have no layer count).
+    BlockStackLayerCountKeyNotInSchema {
+        model_architecture: &'static str,
+        layer_count_hparam: &'static str,
+    },
+    /// A block-stack stage declares an empty `tensor_name_scope` (the composer
+    /// could not bind per-layer weights).
+    BlockStackEmptyTensorScope {
+        model_architecture: &'static str,
+    },
+    /// The decoder stage's `block_kind` is not the kind the declared
+    /// `orchestration_shape` assembles (e.g. a `Seq2SeqDecoderLayer` under the
+    /// `LlmDecoder` shape). Would route the descriptor to the wrong composer.
+    DecoderBlockKindIncompatibleWithShape {
+        model_architecture: &'static str,
+        orchestration_shape: OpenAsrOrchestrationShape,
+        block_kind: OpenAsrBlockKind,
+    },
+    /// The encoder stage's `block_kind` is not the kind the declared
+    /// `orchestration_shape` assembles for its encoder.
+    EncoderBlockKindIncompatibleWithShape {
+        model_architecture: &'static str,
+        orchestration_shape: OpenAsrOrchestrationShape,
+        block_kind: OpenAsrBlockKind,
+    },
+    /// The `Ctc` shape is non-autoregressive (encoder + CTC head only) but the
+    /// descriptor declared a `decoder_stage`.
+    CtcShapeMustNotHaveDecoderStage {
+        model_architecture: &'static str,
+    },
+    /// An autoregressive shape (`LlmDecoder` / `Seq2SeqEncoderDecoder`) is missing
+    /// its required `decoder_stage`.
+    NonCtcShapeMustHaveDecoderStage {
+        model_architecture: &'static str,
+        orchestration_shape: OpenAsrOrchestrationShape,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OpenAsrComponentRegistry {
+    descriptors: &'static [OpenAsrComponentDescriptor],
+}
+
+impl OpenAsrComponentRegistry {
+    pub(crate) fn with_builtins() -> Self {
+        Self {
+            descriptors: BUILTIN_COMPONENT_DESCRIPTORS,
+        }
+    }
+
+    pub(crate) fn find(
+        self,
+        kind: OpenAsrComponentKind,
+        id: &str,
+    ) -> Option<OpenAsrComponentDescriptor> {
+        self.descriptors
+            .iter()
+            .copied()
+            .find(|descriptor| descriptor.kind == kind && descriptor.id == id)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OpenAsrArchitectureRegistry {
+    architectures: &'static [OpenAsrArchitectureDescriptor],
+    components: OpenAsrComponentRegistry,
+}
+
+impl OpenAsrArchitectureRegistry {
+    pub(crate) fn with_builtins() -> Self {
+        Self {
+            architectures: BUILTIN_ARCHITECTURE_DESCRIPTORS,
+            components: OpenAsrComponentRegistry::with_builtins(),
+        }
+    }
+
+    pub(crate) fn descriptors(self) -> &'static [OpenAsrArchitectureDescriptor] {
+        self.architectures
+    }
+
+    pub(crate) fn find_by_runtime_architecture_alias(
+        self,
+        alias: &str,
+    ) -> Option<OpenAsrArchitectureDescriptor> {
+        self.architectures
+            .iter()
+            .copied()
+            .find(|descriptor| descriptor.matches_runtime_architecture_alias(alias))
+    }
+
+    pub(crate) fn find_by_model_architecture(
+        self,
+        architecture_id: &str,
+    ) -> Option<OpenAsrArchitectureDescriptor> {
+        self.architectures
+            .iter()
+            .copied()
+            .find(|descriptor| descriptor.model_architecture == architecture_id)
+    }
+
+    pub(crate) fn validate_references(self) -> Result<(), OpenAsrArchitectureRegistryError> {
+        for descriptor in self.architectures {
+            self.require_component(
+                *descriptor,
+                OpenAsrComponentKind::AudioFrontend,
+                descriptor.audio_frontend_id,
+            )?;
+            self.require_component(
+                *descriptor,
+                OpenAsrComponentKind::DecodePolicy,
+                descriptor.decode_policy_id,
+            )?;
+            self.require_component(
+                *descriptor,
+                OpenAsrComponentKind::RuntimeTensorContract,
+                descriptor.runtime_tensor_contract_id,
+            )?;
+            self.require_component(
+                *descriptor,
+                OpenAsrComponentKind::Tokenizer,
+                descriptor.tokenizer_id,
+            )?;
+            self.require_component(
+                *descriptor,
+                OpenAsrComponentKind::Executor,
+                descriptor.executor_component_id,
+            )?;
+            Self::validate_hparam_schema(*descriptor)?;
+            Self::validate_block_stack(*descriptor)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn synthesize_selection_metadata_defaults(
+        self,
+        metadata: &mut BTreeMap<String, String>,
+    ) {
+        let Some(architecture_alias) = metadata
+            .get(GENERAL_ARCHITECTURE_KEY)
+            .map(String::as_str)
+            .map(str::trim)
+        else {
+            return;
+        };
+        if architecture_alias.is_empty() {
+            return;
+        }
+        let Some(descriptor) = self.find_by_runtime_architecture_alias(architecture_alias) else {
+            return;
+        };
+
+        metadata
+            .entry(OASR_METADATA_KEY_PACKAGE_VERSION.to_string())
+            .or_insert_with(|| OASR_PACKAGE_VERSION_V1.to_string());
+        metadata
+            .entry(OASR_METADATA_KEY_MODEL_FAMILY.to_string())
+            .or_insert_with(|| descriptor.model_family.to_string());
+        metadata
+            .entry(OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string())
+            .or_insert_with(|| descriptor.model_architecture.to_string());
+        metadata
+            .entry(OASR_METADATA_KEY_AUDIO_FRONTEND.to_string())
+            .or_insert_with(|| descriptor.audio_frontend_id.to_string());
+        metadata
+            .entry(OASR_METADATA_KEY_DECODE_POLICY.to_string())
+            .or_insert_with(|| descriptor.decode_policy_id.to_string());
+        metadata
+            .entry(GGML_TOKENIZER_ID_KEY.to_string())
+            .or_insert_with(|| descriptor.tokenizer_id.to_string());
+    }
+
+    fn require_component(
+        self,
+        descriptor: OpenAsrArchitectureDescriptor,
+        kind: OpenAsrComponentKind,
+        id: &'static str,
+    ) -> Result<(), OpenAsrArchitectureRegistryError> {
+        self.components.find(kind, id).map(|_| ()).ok_or(
+            OpenAsrArchitectureRegistryError::MissingComponentReference {
+                model_architecture: descriptor.model_architecture,
+                kind,
+                component_id: id,
+            },
+        )
+    }
+
+    fn validate_hparam_schema(
+        descriptor: OpenAsrArchitectureDescriptor,
+    ) -> Result<(), OpenAsrArchitectureRegistryError> {
+        if descriptor.hparam_schema.is_empty() {
+            return Err(OpenAsrArchitectureRegistryError::EmptyHparamSchema {
+                model_architecture: descriptor.model_architecture,
+            });
+        }
+        for (index, key) in descriptor.hparam_schema.iter().enumerate() {
+            if descriptor.hparam_schema[..index].contains(key) {
+                return Err(OpenAsrArchitectureRegistryError::DuplicateHparamKey {
+                    model_architecture: descriptor.model_architecture,
+                    key,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Fail-closed consistency check on the optional block-stack descriptor: each
+    /// stage's `layer_count_hparam` must be a declared hparam key, its
+    /// `tensor_name_scope` must be non-empty, AND each stage's `block_kind` must
+    /// be the kind its `orchestration_shape` assembles (so the descriptor can
+    /// never route to the wrong composer once it becomes load-bearing in S5).
+    /// Architectures with no block stack (whisper) trivially pass. Keeps the
+    /// block-stack data honest before any orchestrator reads it.
+    fn validate_block_stack(
+        descriptor: OpenAsrArchitectureDescriptor,
+    ) -> Result<(), OpenAsrArchitectureRegistryError> {
+        let Some(block_stack) = descriptor.block_stack else {
+            return Ok(());
+        };
+        for stage in block_stack.stages() {
+            if stage.tensor_name_scope.is_empty() {
+                return Err(
+                    OpenAsrArchitectureRegistryError::BlockStackEmptyTensorScope {
+                        model_architecture: descriptor.model_architecture,
+                    },
+                );
+            }
+            if !descriptor.hparam_schema.contains(&stage.layer_count_hparam) {
+                return Err(
+                    OpenAsrArchitectureRegistryError::BlockStackLayerCountKeyNotInSchema {
+                        model_architecture: descriptor.model_architecture,
+                        layer_count_hparam: stage.layer_count_hparam,
+                    },
+                );
+            }
+        }
+        // block_kind <-> orchestration_shape consistency (S5a): the shape fixes
+        // which nn/ block each stage assembles; a descriptor declaring a mismatch
+        // would silently route to the wrong composer once load-bearing. The Ctc
+        // shape (S0) is encoder-only (`decoder_stage: None`); the autoregressive
+        // shapes require a decoder stage. `expected_decoder_kind` is `None` for
+        // Ctc, `Some` otherwise.
+        // The Ctc shape accepts more than one encoder block (parakeet's
+        // FastConformer `ConformerBlock` and wav2vec2's post-norm transformer
+        // layer are both valid CTC encoders), so the expected-encoder check is a
+        // small allowed-set, not a single kind.
+        let (expected_encoder_kinds, expected_decoder_kind): (&[OpenAsrBlockKind], _) =
+            match block_stack.orchestration_shape {
+                OpenAsrOrchestrationShape::LlmDecoder => (
+                    &[OpenAsrBlockKind::TransformerEncoderLayer],
+                    Some(OpenAsrBlockKind::LlmDecoderLayer),
+                ),
+                OpenAsrOrchestrationShape::Seq2SeqEncoderDecoder => (
+                    &[OpenAsrBlockKind::ConformerBlock],
+                    Some(OpenAsrBlockKind::Seq2SeqDecoderLayer),
+                ),
+                OpenAsrOrchestrationShape::Ctc => (
+                    &[
+                        OpenAsrBlockKind::ConformerBlock,
+                        OpenAsrBlockKind::Wav2Vec2PostNormEncoderLayer,
+                    ],
+                    None,
+                ),
+            };
+        // Shape <-> decoder-stage presence (checked before any decoder deref).
+        match (expected_decoder_kind, block_stack.decoder_stage) {
+            (None, Some(_)) => {
+                return Err(
+                    OpenAsrArchitectureRegistryError::CtcShapeMustNotHaveDecoderStage {
+                        model_architecture: descriptor.model_architecture,
+                    },
+                );
+            }
+            (Some(_), None) => {
+                return Err(
+                    OpenAsrArchitectureRegistryError::NonCtcShapeMustHaveDecoderStage {
+                        model_architecture: descriptor.model_architecture,
+                        orchestration_shape: block_stack.orchestration_shape,
+                    },
+                );
+            }
+            (Some(expected_decoder_kind), Some(decoder_stage))
+                if decoder_stage.block_kind != expected_decoder_kind =>
+            {
+                return Err(
+                    OpenAsrArchitectureRegistryError::DecoderBlockKindIncompatibleWithShape {
+                        model_architecture: descriptor.model_architecture,
+                        orchestration_shape: block_stack.orchestration_shape,
+                        block_kind: decoder_stage.block_kind,
+                    },
+                );
+            }
+            _ => {}
+        }
+        if let Some(encoder_stage) = block_stack.encoder_stage
+            && !expected_encoder_kinds.contains(&encoder_stage.block_kind)
+        {
+            return Err(
+                OpenAsrArchitectureRegistryError::EncoderBlockKindIncompatibleWithShape {
+                    model_architecture: descriptor.model_architecture,
+                    orchestration_shape: block_stack.orchestration_shape,
+                    block_kind: encoder_stage.block_kind,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+const BUILTIN_COMPONENT_DESCRIPTORS: &[OpenAsrComponentDescriptor] = &[
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
+        id: COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
+        id: WHISPER_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
+        id: QWEN3_ASR_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: COHERE_TRANSCRIBE_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: WHISPER_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: QWEN3_ASR_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: WHISPER_EXECUTOR_COMPONENT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: QWEN3_ASR_EXECUTOR_COMPONENT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: COHERE_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: WHISPER_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: QWEN3_ASR_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: COHERE_TRANSCRIBE_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: WHISPER_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: QWEN3_ASR_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
+        id: PARAKEET_CTC_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: PARAKEET_CTC_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: PARAKEET_CTC_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: PARAKEET_CTC_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: PARAKEET_CTC_EXECUTOR_COMPONENT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
+        id: WAV2VEC2_CTC_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: WAV2VEC2_CTC_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: WAV2VEC2_CTC_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: WAV2VEC2_CTC_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
+        id: XASR_ZIPFORMER_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: XASR_ZIPFORMER_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: XASR_ZIPFORMER_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: XASR_ZIPFORMER_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
+        id: MOONSHINE_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: MOONSHINE_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: MOONSHINE_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: MOONSHINE_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: MOONSHINE_EXECUTOR_COMPONENT_ID,
+    },
+];
+
+const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &["cohere-transcribe"],
+        model_family: "cohere-transcribe",
+        model_architecture: COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+        adapter_id: COHERE_TRANSCRIBE_GGML_ADAPTER_ID,
+        language_family_hint: LanguageFamilyHint::SelectsViaPrompt {
+            default_language: "en",
+        },
+        audio_frontend_id: COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: COHERE_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: COHERE_TRANSCRIBE_TOKENIZER_ID,
+        decode_policy_id: COHERE_TRANSCRIBE_DECODE_POLICY_ID,
+        executor_component_id: COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID,
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: true,
+        hparam_schema: COHERE_TRANSCRIBE_HPARAM_SCHEMA,
+        block_stack: Some(OpenAsrBlockStackDescriptor {
+            orchestration_shape: OpenAsrOrchestrationShape::Seq2SeqEncoderDecoder,
+            encoder_stage: Some(OpenAsrStageDescriptor {
+                block_kind: OpenAsrBlockKind::ConformerBlock,
+                layer_count_hparam: COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY,
+                tensor_name_scope: "enc.blk",
+            }),
+            decoder_stage: Some(OpenAsrStageDescriptor {
+                block_kind: OpenAsrBlockKind::Seq2SeqDecoderLayer,
+                layer_count_hparam: COHERE_TRANSCRIBE_DECODER_LAYERS_KEY,
+                tensor_name_scope: "dec.blk",
+            }),
+        }),
+    },
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &["whisper"],
+        model_family: "whisper",
+        model_architecture: WHISPER_GGML_ARCHITECTURE_ID,
+        adapter_id: WHISPER_GGML_ADAPTER_ID,
+        language_family_hint: LanguageFamilyHint::WhisperVocabGated,
+        audio_frontend_id: WHISPER_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: WHISPER_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: WHISPER_TOKENIZER_ID,
+        decode_policy_id: WHISPER_DECODE_POLICY_ID,
+        executor_component_id: WHISPER_EXECUTOR_COMPONENT_ID,
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        hparam_schema: WHISPER_HPARAM_SCHEMA,
+        // whisper remains the hand-written bit-level regression gate and is
+        // never composed — no block-stack data until P9 sinks its optimizations
+        // into the shared blocks.
+        block_stack: None,
+    },
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &[QWEN3_ARCHITECTURE_VALUE],
+        model_family: QWEN3_ASR_MODEL_FAMILY,
+        model_architecture: QWEN3_ASR_GGML_ARCHITECTURE_ID,
+        adapter_id: QWEN3_ASR_GGML_ADAPTER_ID,
+        language_family_hint: LanguageFamilyHint::SelfDetectsRejectsHint {
+            // Qwen3-ASR conditions language via free text in the chat prompt (no
+            // language tokens in its vocab) and does not expose the language it
+            // auto-detects. Until that text conditioning is wired and verified
+            // against a real pack, an explicit hint is rejected (not faked) and
+            // the detected language is reported as null. See docs/KNOWN_LIMITATIONS.md.
+            reject_reason: "Qwen3-ASR auto-detects the source language and does not accept an explicit selection; use a multilingual Whisper pack to force or report a language.",
+        },
+        audio_frontend_id: QWEN3_ASR_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: QWEN3_ASR_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: QWEN3_ASR_TOKENIZER_ID,
+        decode_policy_id: QWEN3_ASR_DECODE_POLICY_ID,
+        executor_component_id: QWEN3_ASR_EXECUTOR_COMPONENT_ID,
+        execution_capability: GgmlExecutionCapability::NativeGraphLoweringV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        hparam_schema: QWEN3_ASR_HPARAM_SCHEMA,
+        block_stack: Some(OpenAsrBlockStackDescriptor {
+            orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
+            encoder_stage: Some(OpenAsrStageDescriptor {
+                block_kind: OpenAsrBlockKind::TransformerEncoderLayer,
+                layer_count_hparam: QWEN3_AUDIO_LAYERS_KEY,
+                tensor_name_scope: "audio.blk",
+            }),
+            decoder_stage: Some(OpenAsrStageDescriptor {
+                block_kind: OpenAsrBlockKind::LlmDecoderLayer,
+                layer_count_hparam: QWEN3_LLM_LAYERS_KEY,
+                tensor_name_scope: "blk",
+            }),
+        }),
+    },
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &["parakeet-ctc", "parakeet"],
+        model_family: "parakeet-ctc",
+        model_architecture: PARAKEET_CTC_GGML_ARCHITECTURE_ID,
+        adapter_id: PARAKEET_CTC_GGML_ADAPTER_ID,
+        language_family_hint: LanguageFamilyHint::FixedMonolingual { language: "en" },
+        audio_frontend_id: PARAKEET_CTC_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: PARAKEET_CTC_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: PARAKEET_CTC_TOKENIZER_ID,
+        decode_policy_id: PARAKEET_CTC_DECODE_POLICY_ID,
+        executor_component_id: PARAKEET_CTC_EXECUTOR_COMPONENT_ID,
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        hparam_schema: PARAKEET_CTC_HPARAM_SCHEMA,
+        // Non-autoregressive CTC: encoder + CTC head only, no decoder stage.
+        block_stack: Some(OpenAsrBlockStackDescriptor {
+            orchestration_shape: OpenAsrOrchestrationShape::Ctc,
+            encoder_stage: Some(OpenAsrStageDescriptor {
+                block_kind: OpenAsrBlockKind::ConformerBlock,
+                layer_count_hparam: "parakeet.n_layers",
+                tensor_name_scope: "enc.blk",
+            }),
+            decoder_stage: None,
+        }),
+    },
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &["wav2vec2-ctc", "wav2vec2"],
+        model_family: "wav2vec2-ctc",
+        model_architecture: WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
+        adapter_id: WAV2VEC2_CTC_GGML_ADAPTER_ID,
+        language_family_hint: LanguageFamilyHint::FixedMonolingual { language: "en" },
+        audio_frontend_id: WAV2VEC2_CTC_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: WAV2VEC2_CTC_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: WAV2VEC2_CTC_TOKENIZER_ID,
+        decode_policy_id: WAV2VEC2_CTC_DECODE_POLICY_ID,
+        executor_component_id: WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        hparam_schema: WAV2VEC2_CTC_HPARAM_SCHEMA,
+        // Non-autoregressive CTC: raw-waveform conv extractor + post-norm
+        // transformer encoder + CTC head, no decoder stage.
+        block_stack: Some(OpenAsrBlockStackDescriptor {
+            orchestration_shape: OpenAsrOrchestrationShape::Ctc,
+            encoder_stage: Some(OpenAsrStageDescriptor {
+                block_kind: OpenAsrBlockKind::Wav2Vec2PostNormEncoderLayer,
+                layer_count_hparam: "wav2vec2.n_layers",
+                tensor_name_scope: "enc.blk",
+            }),
+            decoder_stage: None,
+        }),
+    },
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &["xasr-zipformer", "xasr-zh-en"],
+        model_family: XASR_ZIPFORMER_MODEL_FAMILY,
+        model_architecture: XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+        adapter_id: XASR_ZIPFORMER_GGML_ADAPTER_ID,
+        language_family_hint: LanguageFamilyHint::FixedMultilingual {
+            languages: &["en", "zh"],
+        },
+        audio_frontend_id: XASR_ZIPFORMER_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: XASR_ZIPFORMER_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: XASR_ZIPFORMER_TOKENIZER_ID,
+        decode_policy_id: XASR_ZIPFORMER_DECODE_POLICY_ID,
+        executor_component_id: XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        hparam_schema: XASR_ZIPFORMER_HPARAM_SCHEMA,
+        // Zipformer2 uses multi-scale streaming cache topology plus RNN-T
+        // decoder/joiner, so it stays on its dedicated executor rather than the
+        // generic block-stack composer.
+        block_stack: None,
+    },
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &["moonshine", "moonshine-encoder-decoder"],
+        model_family: "moonshine",
+        model_architecture: MOONSHINE_GGML_ARCHITECTURE_ID,
+        adapter_id: MOONSHINE_GGML_ADAPTER_ID,
+        language_family_hint: LanguageFamilyHint::FixedMonolingual { language: "en" },
+        audio_frontend_id: MOONSHINE_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: MOONSHINE_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: MOONSHINE_TOKENIZER_ID,
+        decode_policy_id: MOONSHINE_DECODE_POLICY_ID,
+        executor_component_id: MOONSHINE_EXECUTOR_COMPONENT_ID,
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        hparam_schema: MOONSHINE_HPARAM_SCHEMA,
+        // Raw-waveform conv-stem + partial-RoPE seq2seq with a self-contained
+        // dedicated executor (not the data-driven block-stack composer — its
+        // RoPE conv-stem encoder + cross-attn decoder are not composer blocks).
+        block_stack: None,
+    },
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_architectures_validate_component_references() {
+        OpenAsrArchitectureRegistry::with_builtins()
+            .validate_references()
+            .expect("builtins must reference known components");
+    }
+
+    #[test]
+    fn finds_architecture_by_runtime_alias() {
+        let descriptor = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_runtime_architecture_alias("whisper")
+            .expect("whisper alias");
+
+        assert_eq!(descriptor.model_family, "whisper");
+        assert_eq!(descriptor.model_architecture, WHISPER_GGML_ARCHITECTURE_ID);
+        assert_eq!(descriptor.audio_frontend_id, WHISPER_AUDIO_FRONTEND_ID);
+        assert_eq!(
+            descriptor.runtime_tensor_contract_id,
+            WHISPER_RUNTIME_TENSOR_CONTRACT_ID
+        );
+        assert_eq!(
+            descriptor.executor_component_id,
+            WHISPER_EXECUTOR_COMPONENT_ID
+        );
+    }
+
+    #[test]
+    fn finds_xasr_zipformer_architecture_by_runtime_alias() {
+        let descriptor = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_runtime_architecture_alias("xasr-zh-en")
+            .expect("xasr alias");
+
+        assert_eq!(descriptor.model_family, XASR_ZIPFORMER_MODEL_FAMILY);
+        assert_eq!(
+            descriptor.model_architecture,
+            XASR_ZIPFORMER_GGML_ARCHITECTURE_ID
+        );
+        assert_eq!(
+            descriptor.runtime_tensor_contract_id,
+            XASR_ZIPFORMER_RUNTIME_TENSOR_CONTRACT_ID
+        );
+        assert_eq!(
+            descriptor.execution_capability,
+            GgmlExecutionCapability::DedicatedRuntimeExecutorV1
+        );
+        assert!(descriptor.block_stack.is_none());
+    }
+
+    #[test]
+    fn synthesizes_selection_defaults_from_runtime_architecture() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            GENERAL_ARCHITECTURE_KEY.to_string(),
+            "qwen3-asr".to_string(),
+        );
+
+        OpenAsrArchitectureRegistry::with_builtins()
+            .synthesize_selection_metadata_defaults(&mut metadata);
+
+        assert_eq!(
+            metadata.get(OASR_METADATA_KEY_MODEL_FAMILY),
+            Some(&"qwen3-asr".to_string())
+        );
+        assert_eq!(
+            metadata.get(OASR_METADATA_KEY_MODEL_ARCHITECTURE),
+            Some(&QWEN3_ASR_GGML_ARCHITECTURE_ID.to_string())
+        );
+        assert_eq!(
+            metadata.get(GGML_TOKENIZER_ID_KEY),
+            Some(&QWEN3_ASR_TOKENIZER_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn derives_ggml_family_adapter_descriptor() {
+        let descriptor = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID)
+            .expect("cohere architecture")
+            .ggml_family_adapter_descriptor();
+
+        assert_eq!(descriptor.adapter_id, COHERE_TRANSCRIBE_GGML_ADAPTER_ID);
+        assert_eq!(descriptor.model_family, "cohere-transcribe");
+        assert_eq!(
+            descriptor.audio_frontend_id,
+            COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID
+        );
+        assert_eq!(
+            descriptor.execution_capability,
+            GgmlExecutionCapability::DedicatedRuntimeExecutorV1
+        );
+    }
+
+    #[test]
+    fn ignores_unknown_runtime_architecture_aliases() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            GENERAL_ARCHITECTURE_KEY.to_string(),
+            "unknown-runtime".to_string(),
+        );
+
+        OpenAsrArchitectureRegistry::with_builtins()
+            .synthesize_selection_metadata_defaults(&mut metadata);
+
+        assert_eq!(metadata.len(), 1);
+    }
+
+    #[test]
+    fn builtin_architectures_have_non_empty_unique_hparam_schemas() {
+        // validate_references walks each schema; this also exercises the
+        // empty/duplicate guards that run at production dispatch build time.
+        OpenAsrArchitectureRegistry::with_builtins()
+            .validate_references()
+            .expect("builtin hparam schemas must be non-empty and duplicate-free");
+
+        for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
+            for key in descriptor.hparam_schema {
+                assert!(
+                    !key.is_empty(),
+                    "hparam key in architecture '{}' must be non-empty",
+                    descriptor.model_architecture
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_block_stacks_declare_expected_shapes() {
+        let registry = OpenAsrArchitectureRegistry::with_builtins();
+
+        let qwen = registry
+            .find_by_model_architecture(QWEN3_ASR_GGML_ARCHITECTURE_ID)
+            .expect("qwen architecture");
+        let qwen_stack = qwen.block_stack.expect("qwen has a block stack");
+        assert_eq!(
+            qwen_stack.orchestration_shape,
+            OpenAsrOrchestrationShape::LlmDecoder
+        );
+        let qwen_encoder = qwen_stack.encoder_stage.expect("qwen audio encoder stage");
+        assert_eq!(
+            qwen_encoder.block_kind,
+            OpenAsrBlockKind::TransformerEncoderLayer
+        );
+        assert_eq!(qwen_encoder.layer_count_hparam, QWEN3_AUDIO_LAYERS_KEY);
+        let qwen_decoder = qwen_stack.decoder_stage.expect("qwen llm decoder stage");
+        assert_eq!(qwen_decoder.block_kind, OpenAsrBlockKind::LlmDecoderLayer);
+        assert_eq!(qwen_decoder.layer_count_hparam, QWEN3_LLM_LAYERS_KEY);
+
+        let cohere = registry
+            .find_by_model_architecture(COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID)
+            .expect("cohere architecture");
+        let cohere_stack = cohere.block_stack.expect("cohere has a block stack");
+        assert_eq!(
+            cohere_stack.orchestration_shape,
+            OpenAsrOrchestrationShape::Seq2SeqEncoderDecoder
+        );
+        assert_eq!(
+            cohere_stack
+                .encoder_stage
+                .expect("cohere encoder")
+                .block_kind,
+            OpenAsrBlockKind::ConformerBlock
+        );
+        assert_eq!(
+            cohere_stack
+                .decoder_stage
+                .expect("cohere decoder")
+                .block_kind,
+            OpenAsrBlockKind::Seq2SeqDecoderLayer
+        );
+
+        // whisper stays the hand-written gate and is never composed.
+        let whisper = registry
+            .find_by_model_architecture(WHISPER_GGML_ARCHITECTURE_ID)
+            .expect("whisper architecture");
+        assert!(whisper.block_stack.is_none());
+    }
+
+    #[test]
+    fn block_stack_validation_rejects_layer_count_key_outside_schema() {
+        let descriptor = OpenAsrArchitectureDescriptor {
+            block_stack: Some(OpenAsrBlockStackDescriptor {
+                orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
+                encoder_stage: None,
+                decoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::LlmDecoderLayer,
+                    // Not a member of QWEN3_ASR_HPARAM_SCHEMA.
+                    layer_count_hparam: "qwen3-asr.llm.layers_typo",
+                    tensor_name_scope: "blk",
+                }),
+            }),
+            ..OpenAsrArchitectureRegistry::with_builtins()
+                .find_by_model_architecture(QWEN3_ASR_GGML_ARCHITECTURE_ID)
+                .expect("qwen architecture")
+        };
+
+        assert_eq!(
+            OpenAsrArchitectureRegistry::validate_block_stack(descriptor),
+            Err(
+                OpenAsrArchitectureRegistryError::BlockStackLayerCountKeyNotInSchema {
+                    model_architecture: QWEN3_ASR_GGML_ARCHITECTURE_ID,
+                    layer_count_hparam: "qwen3-asr.llm.layers_typo",
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn block_stack_validation_rejects_empty_tensor_scope() {
+        let descriptor = OpenAsrArchitectureDescriptor {
+            block_stack: Some(OpenAsrBlockStackDescriptor {
+                orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
+                encoder_stage: None,
+                decoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::LlmDecoderLayer,
+                    layer_count_hparam: QWEN3_LLM_LAYERS_KEY,
+                    tensor_name_scope: "",
+                }),
+            }),
+            ..OpenAsrArchitectureRegistry::with_builtins()
+                .find_by_model_architecture(QWEN3_ASR_GGML_ARCHITECTURE_ID)
+                .expect("qwen architecture")
+        };
+
+        assert_eq!(
+            OpenAsrArchitectureRegistry::validate_block_stack(descriptor),
+            Err(
+                OpenAsrArchitectureRegistryError::BlockStackEmptyTensorScope {
+                    model_architecture: QWEN3_ASR_GGML_ARCHITECTURE_ID,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn block_stack_validation_rejects_decoder_kind_incompatible_with_shape() {
+        // LlmDecoder shape with a Seq2SeqDecoderLayer decoder stage would route
+        // the descriptor to the wrong composer once load-bearing (S5).
+        let descriptor = OpenAsrArchitectureDescriptor {
+            block_stack: Some(OpenAsrBlockStackDescriptor {
+                orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
+                encoder_stage: None,
+                decoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::Seq2SeqDecoderLayer,
+                    layer_count_hparam: QWEN3_LLM_LAYERS_KEY,
+                    tensor_name_scope: "blk",
+                }),
+            }),
+            ..OpenAsrArchitectureRegistry::with_builtins()
+                .find_by_model_architecture(QWEN3_ASR_GGML_ARCHITECTURE_ID)
+                .expect("qwen architecture")
+        };
+
+        assert_eq!(
+            OpenAsrArchitectureRegistry::validate_block_stack(descriptor),
+            Err(
+                OpenAsrArchitectureRegistryError::DecoderBlockKindIncompatibleWithShape {
+                    model_architecture: QWEN3_ASR_GGML_ARCHITECTURE_ID,
+                    orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
+                    block_kind: OpenAsrBlockKind::Seq2SeqDecoderLayer,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn block_stack_validation_rejects_encoder_kind_incompatible_with_shape() {
+        // Seq2SeqEncoderDecoder shape with a TransformerEncoderLayer encoder
+        // (should be ConformerBlock) is rejected.
+        let descriptor = OpenAsrArchitectureDescriptor {
+            block_stack: Some(OpenAsrBlockStackDescriptor {
+                orchestration_shape: OpenAsrOrchestrationShape::Seq2SeqEncoderDecoder,
+                encoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::TransformerEncoderLayer,
+                    layer_count_hparam: COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY,
+                    tensor_name_scope: "enc.blk",
+                }),
+                decoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::Seq2SeqDecoderLayer,
+                    layer_count_hparam: COHERE_TRANSCRIBE_DECODER_LAYERS_KEY,
+                    tensor_name_scope: "dec.blk",
+                }),
+            }),
+            ..OpenAsrArchitectureRegistry::with_builtins()
+                .find_by_model_architecture(COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID)
+                .expect("cohere architecture")
+        };
+
+        assert_eq!(
+            OpenAsrArchitectureRegistry::validate_block_stack(descriptor),
+            Err(
+                OpenAsrArchitectureRegistryError::EncoderBlockKindIncompatibleWithShape {
+                    model_architecture: COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                    orchestration_shape: OpenAsrOrchestrationShape::Seq2SeqEncoderDecoder,
+                    block_kind: OpenAsrBlockKind::TransformerEncoderLayer,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn builtin_block_stacks_pass_kind_shape_consistency() {
+        // The two real composed builtins (qwen, cohere) must satisfy the S5a gate.
+        for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
+            OpenAsrArchitectureRegistry::validate_block_stack(*descriptor).unwrap_or_else(|err| {
+                panic!(
+                    "builtin '{}' block stack must pass kind/shape consistency: {err:?}",
+                    descriptor.model_architecture
+                )
+            });
+        }
+    }
+
+    /// S5 exit-signal acceptance test: a NEW model on an EXISTING orchestration
+    /// shape is accepted as DATA ONLY — no new `OpenAsrOrchestrationShape`, no new
+    /// `OpenAsrBlockKind`, no new error variant, no new `validate_*` code path, no
+    /// new executor/orchestrator. It passes the S5a startup gate and routes
+    /// through the same `validate_stage_against_descriptor` the real families use,
+    /// with a count mismatch failing closed.
+    #[test]
+    fn exit_signal_new_llm_decoder_model_is_data_only() {
+        use shape_orchestrator::{
+            LayerCountResolver, OpenAsrStageRole, StageBuildPlan, validate_stage_against_descriptor,
+        };
+
+        const SYNTHETIC_ARCH: &str = "synthetic-llm-decoder-asr";
+
+        // A stub resolver standing in for a new family's metadata read. Returns
+        // the count the descriptor's hparam keys would resolve to.
+        struct SyntheticResolver;
+        impl LayerCountResolver for SyntheticResolver {
+            fn resolve_layer_count(&self, hparam_key: &'static str) -> Option<usize> {
+                match hparam_key {
+                    QWEN3_AUDIO_LAYERS_KEY => Some(8),
+                    QWEN3_LLM_LAYERS_KEY => Some(28),
+                    _ => None,
+                }
+            }
+        }
+
+        // The ONLY thing that differs from a builtin is DATA: a new
+        // model_architecture + new tensor-name scopes. Same shape, same block
+        // kinds, same hparam keys (reusing qwen's schema for the test).
+        let synthetic = OpenAsrArchitectureDescriptor {
+            model_architecture: SYNTHETIC_ARCH,
+            block_stack: Some(OpenAsrBlockStackDescriptor {
+                orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
+                encoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::TransformerEncoderLayer,
+                    layer_count_hparam: QWEN3_AUDIO_LAYERS_KEY,
+                    tensor_name_scope: "synthetic.audio.blk",
+                }),
+                decoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::LlmDecoderLayer,
+                    layer_count_hparam: QWEN3_LLM_LAYERS_KEY,
+                    tensor_name_scope: "synthetic.blk",
+                }),
+            }),
+            ..OpenAsrArchitectureRegistry::with_builtins()
+                .find_by_model_architecture(QWEN3_ASR_GGML_ARCHITECTURE_ID)
+                .expect("qwen architecture")
+        };
+
+        // 1. Passes the S5a startup gate with no new shape/kind/error.
+        OpenAsrArchitectureRegistry::validate_block_stack(synthetic)
+            .expect("a new LlmDecoder-shape model is valid as pure data");
+
+        let block_stack = synthetic.block_stack.as_ref();
+        let resolver = SyntheticResolver;
+
+        // 2. Routes through the SAME load-bearing gate the real families use,
+        //    for both stages, returning the descriptor-resolved counts.
+        let decoder_count = validate_stage_against_descriptor(
+            SYNTHETIC_ARCH,
+            block_stack,
+            OpenAsrStageRole::Decoder,
+            OpenAsrOrchestrationShape::LlmDecoder,
+            StageBuildPlan {
+                block_kind: OpenAsrBlockKind::LlmDecoderLayer,
+                tensor_name_scope: "synthetic.blk",
+                family_layer_count: 28,
+            },
+            &resolver,
+        )
+        .expect("new model's decoder stack validates as data");
+        assert_eq!(decoder_count, 28);
+
+        let encoder_count = validate_stage_against_descriptor(
+            SYNTHETIC_ARCH,
+            block_stack,
+            OpenAsrStageRole::Encoder,
+            OpenAsrOrchestrationShape::LlmDecoder,
+            StageBuildPlan {
+                block_kind: OpenAsrBlockKind::TransformerEncoderLayer,
+                tensor_name_scope: "synthetic.audio.blk",
+                family_layer_count: 8,
+            },
+            &resolver,
+        )
+        .expect("new model's encoder stack validates as data");
+        assert_eq!(encoder_count, 8);
+
+        // 3. The gate still fails closed for the new model: a layer count that
+        //    disagrees with the descriptor's hparam is rejected, no special-casing.
+        let mismatch = validate_stage_against_descriptor(
+            SYNTHETIC_ARCH,
+            block_stack,
+            OpenAsrStageRole::Decoder,
+            OpenAsrOrchestrationShape::LlmDecoder,
+            StageBuildPlan {
+                block_kind: OpenAsrBlockKind::LlmDecoderLayer,
+                tensor_name_scope: "synthetic.blk",
+                family_layer_count: 27, // != the 28 the hparam resolves to
+            },
+            &resolver,
+        );
+        assert!(matches!(
+            mismatch,
+            Err(
+                shape_orchestrator::ShapeOrchestratorError::LayerCountMismatch {
+                    descriptor_count: 28,
+                    family_count: 27,
+                    ..
+                }
+            )
+        ));
+    }
+
+    /// S0 (CTC onboarding): the new `Ctc` shape is encoder-only and every
+    /// shape<->decoder-presence mismatch fails closed. Exercises the new variant
+    /// (so it is not dead) without any model code.
+    #[test]
+    fn ctc_shape_block_stack_is_encoder_only_and_fail_closed() {
+        use shape_orchestrator::{
+            LayerCountResolver, OpenAsrStageRole, ShapeOrchestratorError, StageBuildPlan,
+            validate_stage_against_descriptor,
+        };
+        const CTC_ARCH: &str = "synthetic-ctc-asr";
+        // Any key present in the reused schema satisfies the in-schema check.
+        const ENC_KEY: &str = QWEN3_AUDIO_LAYERS_KEY;
+
+        struct CtcResolver;
+        impl LayerCountResolver for CtcResolver {
+            fn resolve_layer_count(&self, hparam_key: &'static str) -> Option<usize> {
+                (hparam_key == ENC_KEY).then_some(24)
+            }
+        }
+
+        let base = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(QWEN3_ASR_GGML_ARCHITECTURE_ID)
+            .expect("qwen architecture");
+
+        // Valid: encoder-only Ctc with a ConformerBlock encoder, no decoder stage.
+        let ctc = OpenAsrArchitectureDescriptor {
+            model_architecture: CTC_ARCH,
+            block_stack: Some(OpenAsrBlockStackDescriptor {
+                orchestration_shape: OpenAsrOrchestrationShape::Ctc,
+                encoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::ConformerBlock,
+                    layer_count_hparam: ENC_KEY,
+                    tensor_name_scope: "enc.blk",
+                }),
+                decoder_stage: None,
+            }),
+            ..base
+        };
+        OpenAsrArchitectureRegistry::validate_block_stack(ctc)
+            .expect("encoder-only Ctc stack is valid");
+
+        let encoder_plan = StageBuildPlan {
+            block_kind: OpenAsrBlockKind::ConformerBlock,
+            tensor_name_scope: "enc.blk",
+            family_layer_count: 24,
+        };
+        // The encoder stage drives through the SAME shared gate as data.
+        assert_eq!(
+            validate_stage_against_descriptor(
+                CTC_ARCH,
+                ctc.block_stack.as_ref(),
+                OpenAsrStageRole::Encoder,
+                OpenAsrOrchestrationShape::Ctc,
+                encoder_plan,
+                &CtcResolver,
+            ),
+            Ok(24)
+        );
+        // Driving the Decoder role on a Ctc stack fails closed.
+        assert_eq!(
+            validate_stage_against_descriptor(
+                CTC_ARCH,
+                ctc.block_stack.as_ref(),
+                OpenAsrStageRole::Decoder,
+                OpenAsrOrchestrationShape::Ctc,
+                encoder_plan,
+                &CtcResolver,
+            ),
+            Err(ShapeOrchestratorError::DecoderRequestedForCtcShape {
+                model_architecture: CTC_ARCH,
+            })
+        );
+
+        // A Ctc stack that wrongly declares a decoder stage is rejected.
+        let ctc_with_decoder = OpenAsrArchitectureDescriptor {
+            model_architecture: CTC_ARCH,
+            block_stack: Some(OpenAsrBlockStackDescriptor {
+                orchestration_shape: OpenAsrOrchestrationShape::Ctc,
+                encoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::ConformerBlock,
+                    layer_count_hparam: ENC_KEY,
+                    tensor_name_scope: "enc.blk",
+                }),
+                decoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::LlmDecoderLayer,
+                    layer_count_hparam: QWEN3_LLM_LAYERS_KEY,
+                    tensor_name_scope: "blk",
+                }),
+            }),
+            ..base
+        };
+        assert_eq!(
+            OpenAsrArchitectureRegistry::validate_block_stack(ctc_with_decoder),
+            Err(
+                OpenAsrArchitectureRegistryError::CtcShapeMustNotHaveDecoderStage {
+                    model_architecture: CTC_ARCH,
+                }
+            )
+        );
+
+        // An autoregressive shape missing its required decoder stage is rejected.
+        let llm_without_decoder = OpenAsrArchitectureDescriptor {
+            block_stack: Some(OpenAsrBlockStackDescriptor {
+                orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
+                encoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::TransformerEncoderLayer,
+                    layer_count_hparam: QWEN3_AUDIO_LAYERS_KEY,
+                    tensor_name_scope: "audio.blk",
+                }),
+                decoder_stage: None,
+            }),
+            ..base
+        };
+        assert_eq!(
+            OpenAsrArchitectureRegistry::validate_block_stack(llm_without_decoder),
+            Err(
+                OpenAsrArchitectureRegistryError::NonCtcShapeMustHaveDecoderStage {
+                    model_architecture: QWEN3_ASR_GGML_ARCHITECTURE_ID,
+                    orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
+                }
+            )
+        );
+    }
+}

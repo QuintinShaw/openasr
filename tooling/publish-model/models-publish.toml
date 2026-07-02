@@ -1,0 +1,114 @@
+# OpenASR publish-only model pipeline data.
+#
+# These fields drive the internal build/publish lane and are intentionally kept
+# separate from consumer-facing registry/catalog fields in models-core.toml.
+
+["qwen3-asr-1.7b"]
+import_subcommand = "import qwen"
+upstream_repo = "Qwen/Qwen3-ASR-1.7B"
+source_revision = "main"
+needs_license_flags = true
+
+["qwen3-asr-0.6b"]
+import_subcommand = "import qwen"
+upstream_repo = "Qwen/Qwen3-ASR-0.6B"
+source_revision = "main"
+needs_license_flags = true
+
+["moonshine-tiny"]
+import_subcommand = "import moonshine"
+upstream_repo = "UsefulSensors/moonshine-tiny"
+source_revision = "main"
+needs_license_flags = true
+
+["cohere-transcribe-03-2026"]
+import_subcommand = "import cohere"
+upstream_repo = "CohereLabs/cohere-transcribe-03-2026"
+source_revision = "d263bc2fa85c492529a6f6c38f07ce5a79adbf31"
+needs_license_flags = true
+
+["whisper-large-v3-turbo"]
+import_subcommand = "import whisper"
+upstream_repo = "openai/whisper-large-v3-turbo"
+source_revision = "41f01f3fe87f28c78e2fbf8b568835947dd65ed9"
+needs_license_flags = true
+
+["whisper-small"]
+import_subcommand = "import whisper"
+upstream_repo = "openai/whisper-small"
+source_revision = "973afd24965f72e36ca33b3055d56a652f456b4d"
+needs_license_flags = true
+
+["xasr-zh-en"]
+import_subcommand = "import xasr-zipformer"
+upstream_repo = "GilgameshWind/X-ASR-zh-en"
+source_revision = "main"
+needs_license_flags = false
+
+["wespeaker-voxceleb-resnet34-lm"]
+import_subcommand = "import wespeaker"
+upstream_repo = "pyannote/wespeaker-voxceleb-resnet34-LM"
+source_revision = "837717ddb9ff5507820346191109dc79c958d614"
+needs_license_flags = false
+
+["pyannote-segmentation-3.0"]
+import_subcommand = "import pyannote"
+upstream_repo = "onnx-community/pyannote-segmentation-3.0"
+source_revision = "733a93b6473d019a773298e08cefa686894b1854"
+needs_license_flags = false
+
+["hymt2-1.8b"]
+# Planned PR2 importer: direct fixed-revision GGUF -> .oasr repackaging.
+import_subcommand = "import hymt2-gguf"
+upstream_repo = "tencent/Hy-MT2-1.8B-GGUF"
+source_revision = "1cd5208700acedef4ef93019b6cfc148b8522d45"
+source_filename = "Hy-MT2-1.8B-Q4_K_M.gguf"
+needs_license_flags = true
+
+["whisper-tiny"]
+import_subcommand = "import whisper"
+upstream_repo = "openai/whisper-tiny"
+source_revision = "169d4a4341b33bc18d8881c4b69c2e104e1cc0af"
+needs_license_flags = true
+
+["whisper-base"]
+import_subcommand = "import whisper"
+upstream_repo = "openai/whisper-base"
+source_revision = "e37978b90ca9030d5170a5c07aadb050351a65bb"
+needs_license_flags = true
+
+["whisper-medium"]
+import_subcommand = "import whisper"
+upstream_repo = "openai/whisper-medium"
+source_revision = "abdf7c39ab9d0397620ccaea8974cc764cd0953e"
+needs_license_flags = true
+
+["whisper-large-v3"]
+import_subcommand = "import whisper"
+upstream_repo = "openai/whisper-large-v3"
+source_revision = "06f233fe06e710322aca913c1bc4249a0d71fce1"
+needs_license_flags = true
+
+["whisper-tiny.en"]
+import_subcommand = "import whisper"
+upstream_repo = "openai/whisper-tiny.en"
+source_revision = "87c7102498dcde7456f24cfd30239ca606ed9063"
+needs_license_flags = true
+
+["whisper-base.en"]
+import_subcommand = "import whisper"
+upstream_repo = "openai/whisper-base.en"
+source_revision = "911407f4214e0e1d82085af863093ec0b66f9cd6"
+needs_license_flags = true
+
+["whisper-small.en"]
+import_subcommand = "import whisper"
+upstream_repo = "openai/whisper-small.en"
+source_revision = "e8727524f962ee844a7319d92be39ac1bd25655a"
+needs_license_flags = true
+
+["whisper-medium.en"]
+import_subcommand = "import whisper"
+upstream_repo = "openai/whisper-medium.en"
+source_revision = "2e98eb6279edf5095af0c8dedb36bdec0acd172b"
+needs_license_flags = true

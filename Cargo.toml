@@ -1,0 +1,59 @@
+[workspace]
+members = [
+    "crates/openasr-cli",
+    "crates/openasr-client",
+    "crates/openasr-core",
+    "crates/openasr-server",
+    "crates/openasr-system-audio",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/QuintinShaw/openasr"
+rust-version = "1.95"
+authors = ["OpenASR contributors"]
+
+[workspace.dependencies]
+# Inter-crate deps are version-locked in lockstep with [workspace.package].
+# A release bumps the version there and these three pins together (see RELEASING.md).
+openasr-core = { path = "crates/openasr-core", version = "0.1.0" }
+openasr-server = { path = "crates/openasr-server", version = "0.1.0" }
+openasr-system-audio = { path = "crates/openasr-system-audio", version = "0.1.0" }
+anyhow = "1.0"
+assert_cmd = "2.0"
+axum = { version = "0.8", features = ["multipart", "ws"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+indicatif = "0.17"
+cpal = { version = "0.17.3", default-features = false }
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
+futures-util = "0.3"
+libc = "0.2"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_System_ProcessStatus", "Win32_Storage_FileSystem"] }
+matrixmultiply = "0.3"
+memmap2 = "0.9"
+metal = "0.33"
+mime = "0.3"
+objc = "0.2"
+predicates = "3.1"
+rayon = "1.10"
+rcgen = "0.12"
+realfft = "3.5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rustls = "0.23"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+getrandom = "0.3"
+sha2 = "0.10"
+tempfile = "3.10"
+thiserror = "2.0"
+tokio = { version = "1.37", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+tokio-rustls = "0.26"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
+toml = "0.9"
+tower = "0.5"
+unicode-general-category = "1.1"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }

@@ -1,0 +1,72 @@
+name: qwen GPU parity gate
+
+# Catches GPU-only qwen inference regressions that the Linux/ARM CI cannot see
+# (it has no discrete GPU): asserts the qwen3-asr transcript on the auto-selected
+# GPU backend matches the CPU reference for the committed audio fixtures. This is
+# the gate that would have caught the RDNA4 / gfx1200 native-GQA flash-broadcast
+# bug, where recognition degenerated into garbled, repeated tokens on the GPU
+# while CPU stayed correct. Runs on the self-hosted Windows HIP runner (same
+# runner as the HIP compile gate). Path-filtered so it only fires on changes to
+# the qwen decode / attention / ggml runtime that could regress GPU correctness.
+
+on:
+  workflow_dispatch:
+  # Self-hosted GPU runner: post-merge backstop on main, not a PR gate (external
+  # PRs cannot reach the private runner, and fork code must not run on it).
+  push:
+    branches: [main]
+    paths:
+      - "crates/openasr-core/src/models/qwen/**"
+      - "crates/openasr-core/src/nn/**"
+      - "crates/openasr-core/src/ggml_runtime/**"
+      - "crates/openasr-core/third_party/**"
+      - "tooling/qwen-gpu-parity/**"
+      - ".github/workflows/qwen-gpu-parity.yml"
+
+concurrency:
+  group: qwen-gpu-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-hip-parity:
+    name: qwen GPU vs CPU transcript parity (HIP)
+    if: github.repository_owner == 'QuintinShaw'
+    runs-on: [self-hosted, Windows, X64, HIP]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Verify HIP SDK toolchain
+        shell: pwsh
+        run: |
+          $hipRoot = $env:HIP_PATH
+          if (-not $hipRoot) { $hipRoot = $env:ROCM_PATH }
+          if (-not $hipRoot) { $hipRoot = $env:ROCM_HOME }
+          if (-not $hipRoot) {
+            Write-Error "HIP_PATH, ROCM_PATH, or ROCM_HOME must point to the AMD HIP SDK."
+            exit 1
+          }
+          Write-Host "HIP SDK: $hipRoot"
+
+      - name: Build openasr-cli (HIP)
+        shell: pwsh
+        run: |
+          if (-not $env:OPENASR_HIP_GPU_TARGETS) { $env:OPENASR_HIP_GPU_TARGETS = "gfx1200" }
+          cargo build -p openasr-cli --release --features hip
+
+      - name: Ensure qwen3-asr-0.6b pack is available
+        shell: pwsh
+        run: |
+          .\target\release\openasr.exe pull qwen3-asr-0.6b
+
+      - name: qwen GPU vs CPU transcript parity
+        shell: pwsh
+        run: |
+          if (-not $env:OPENASR_HIP_GPU_TARGETS) { $env:OPENASR_HIP_GPU_TARGETS = "gfx1200" }
+          pwsh tooling/qwen-gpu-parity/run.ps1

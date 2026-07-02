@@ -1,0 +1,20 @@
+{
+  "name": "openasr-catalog",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Cloudflare Worker that HOSTS the OpenASR signed model catalog (catalog.json + signature) on catalog.openasr.org. Weights stay on Hugging Face.",
+  "scripts": {
+    "build:assets": "mkdir -p public && cp ../../model-registry/catalog.public.json public/catalog.json && cp ../../model-registry/catalog.public.signature.json public/catalog.signature.json",
+    "predev": "npm run build:assets",
+    "dev": "wrangler dev",
+    "predeploy": "npm run build:assets",
+    "deploy": "wrangler deploy",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.5.0",
+    "vitest": "^2.1.0",
+    "wrangler": "^4.0.0"
+  }
+}

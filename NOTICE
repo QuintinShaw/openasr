@@ -1,0 +1,77 @@
+OpenASR
+Copyright 2026 OpenASR contributors
+
+This product includes software developed as part of the OpenASR project,
+licensed under the Apache License, Version 2.0 (see the LICENSE file).
+
+===========================================================================
+Third-party components
+===========================================================================
+
+openasr-ggml
+  Path: crates/openasr-core/third_party/openasr-ggml
+  License: MIT (see that directory's LICENSE for the full text)
+
+  OpenASR's inference backend is a thin Rust layer built directly on ggml,
+  a fork maintained in the openasr-ggml repository. ggml originates from the
+  llama.cpp / whisper.cpp projects.
+
+      Copyright (c) 2023-2024 The ggml authors
+      Copyright (c) 2023-2024 Georgi Gerganov and contributors
+
+  We gratefully acknowledge Georgi Gerganov and the ggml / llama.cpp /
+  whisper.cpp communities. Their work is the computational core that makes
+  this project possible. Improvements to the fork are contributed back
+  upstream where applicable.
+
+Silero VAD
+  Path: crates/openasr-core/src/diarize/vad/assets/silero_vad_v6_16k.safetensors
+  License: MIT
+
+  The neural Voice Activity Detection model is Silero VAD v6.2 (16 kHz). The
+  vendored weights are the upstream silero_vad_16k_op15.onnx deployment tensors
+  re-serialized to safetensors; OpenASR reimplements the forward pass in pure
+  Rust. Source: https://github.com/snakers4/silero-vad (v6.2.1).
+
+      Copyright (c) 2024 Silero Team
+
+  We gratefully acknowledge the Silero Team for releasing a compact,
+  high-quality VAD under a permissive license.
+
+pyannote community-1 PLDA/LDA parameters
+  Path: crates/openasr-core/src/diarize/vbx/assets/community1_plda_f32.bin
+  License: CC-BY-4.0
+
+  The offline VBx-style diarization refinement includes PLDA/LDA numeric
+  parameters converted from the public Hugging Face bundle
+  pyannote-community/speaker-diarization-community-1 at revision
+  8a527374977391da736e0daaef26855d949d9685. Source files:
+  plda/plda.npz and plda/xvec_transform.npz. The upstream README credits the
+  PLDA model to the BUT Speech@FIT group.
+
+  OpenASR stores these arrays in a compact f32 runtime asset and implements the
+  resegmentation logic independently in Rust; no BUT VBx source code is
+  vendored or copied.
+
+Hy-MT2 1.8B translation model packs (staged metadata only)
+  Upstream GGUF repository: tencent/Hy-MT2-1.8B-GGUF
+  Upstream GGUF revision: 1cd5208700acedef4ef93019b6cfc148b8522d45
+  Base model repository: tencent/Hy-MT2-1.8B
+  Base model revision: 9a341cd1b679d3efd23b46e847b01745a71ed792
+  License: Apache-2.0
+
+  OpenASR does not vendor Hy-MT2 weights in this source tree. If OpenASR
+  distributes Hy-MT2 .oasr packs, each pack must include the upstream
+  LICENSE.txt and the OpenASR NOTICE.openasr.txt modification notice. The
+  staged PR1 recipe repackages upstream GGUF weights for local .oasr execution
+  and does not modify model weights.
+
+JFK inaugural address audio (jfk.wav)
+  Path: fixtures/jfk.wav
+  License: public domain (US Government work); distributed via the MIT-licensed
+  llama.cpp / whisper.cpp repositories
+
+  The committed test/demo audio clip is `samples/jfk.wav` from the ggml-org
+  llama.cpp / whisper.cpp projects: a public-domain excerpt of John F. Kennedy's
+  1961 inaugural address. OpenASR uses it as the single fixture for examples,
+  the benchmark clip, and the test suite.

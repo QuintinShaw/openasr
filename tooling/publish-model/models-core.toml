@@ -1,0 +1,298 @@
+# OpenASR publish/catalog core model data.
+#
+# Consumer-facing fields live here. Publish-only pipeline fields live in
+# models-publish.toml and are merged by the publishing helper catalog reader.
+
+["qwen3-asr-1.7b"]
+family = "qwen"
+hf_repo = "OpenASR/qwen3-asr-1.7b"
+release_public = true
+size = "1.7b"
+registry_id = "qwen3-asr-1.7b"
+display_name = "Qwen3-ASR 1.7B"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/main/LICENSE"
+license_class = "permissive"
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+
+["qwen3-asr-0.6b"]
+family = "qwen"
+hf_repo = "OpenASR/qwen3-asr-0.6b"
+release_public = true
+size = "0.6b"
+registry_id = "qwen3-asr-0.6b"
+display_name = "Qwen3-ASR 0.6B"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/blob/main/LICENSE"
+license_class = "permissive"
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+
+["moonshine-tiny"]
+family = "moonshine"
+hf_repo = "OpenASR/moonshine-tiny"
+release_public = true
+aliases = ["moonshine"]
+pull_alias = "moonshine"
+size = "tiny"
+registry_id = "moonshine-tiny"
+display_name = "Moonshine Tiny"
+license_name = "MIT"
+license_source = "https://huggingface.co/UsefulSensors/moonshine-tiny"
+license_class = "permissive"
+quants = ["fp16", "q8_0"]
+recommended_quant = "q8_0"
+
+["cohere-transcribe-03-2026"]
+family = "cohere"
+hf_repo = "OpenASR/cohere-transcribe-03-2026"
+release_public = true
+aliases = ["cohere-transcribe", "cohere"]
+pull_alias = "cohere-transcribe"
+size = "2b"
+registry_id = "cohere-transcribe-03-2026"
+display_name = "Cohere Transcribe 03-2026"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/CohereLabs/cohere-transcribe-03-2026/blob/main/README.md"
+license_class = "permissive"
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+
+["whisper-large-v3-turbo"]
+family = "whisper"
+hf_repo = "OpenASR/whisper-large-v3-turbo"
+release_public = true
+aliases = ["whisper-turbo", "whisper-large-turbo"]
+pull_alias = "whisper-turbo"
+size = "turbo"
+registry_id = "whisper-large-v3-turbo"
+display_name = "Whisper Large v3 Turbo"
+license_name = "MIT"
+license_source = "https://github.com/openai/whisper/blob/main/LICENSE"
+license_class = "permissive"
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+
+["whisper-small"]
+family = "whisper"
+hf_repo = "OpenASR/whisper-small"
+release_public = true
+aliases = []
+pull_alias = "whisper-small"
+size = "small"
+registry_id = "whisper-small"
+display_name = "Whisper Small"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/openai/whisper-small/blob/main/README.md"
+license_class = "permissive"
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+
+["xasr-zh-en"]
+family = "xasr-zipformer"
+hf_repo = "OpenASR/xasr-zh-en"
+release_public = true
+size = "0.16b"
+registry_id = "xasr-zh-en"
+display_name = "X-ASR zh-en"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/GilgameshWind/X-ASR-zh-en/blob/main/README.md"
+license_class = "permissive"
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+
+# Diarization support packs: not ASR models. Published support packs keep their
+# catalog-declared variants. Speaker embedding/segmentation are
+# language-agnostic; `languages` lists the product's validated domains.
+
+["wespeaker-voxceleb-resnet34-lm"]
+kind = "capability-pack"
+family = "wespeaker"
+hf_repo = "OpenASR/wespeaker-voxceleb-resnet34-lm"
+release_public = true
+size = "embedder"
+registry_id = "wespeaker-voxceleb-resnet34-lm"
+display_name = "WeSpeaker ResNet34 Speaker Embedder (VoxCeleb)"
+license_name = "CC-BY-4.0"
+license_source = "https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM"
+license_class = "permissive"
+languages = ["en", "zh"]
+quants = ["f32"]
+recommended_quant = "f32"
+
+["wespeaker-voxceleb-resnet34-lm".capability]
+feature = "speaker-diarization"
+role = "speaker-embedder"
+
+["pyannote-segmentation-3.0"]
+kind = "capability-pack"
+family = "pyannote-segmentation"
+hf_repo = "OpenASR/pyannote-segmentation-3.0"
+release_public = true
+size = "segmenter"
+registry_id = "pyannote-segmentation-3.0"
+display_name = "pyannote Segmentation 3.0"
+license_name = "MIT"
+license_source = "https://huggingface.co/onnx-community/pyannote-segmentation-3.0"
+license_class = "permissive"
+languages = ["en", "zh"]
+quants = ["f32"]
+recommended_quant = "f32"
+
+["pyannote-segmentation-3.0".capability]
+feature = "speaker-diarization"
+role = "speaker-segmenter"
+
+# Simultaneous-translation MVP model. Published as an experimental
+# translation-model pack: the importer repackages the pinned upstream GGUF
+# byte-for-byte (no weight changes) and splices license/notice/provenance
+# metadata.
+
+["hymt2-1.8b"]
+kind = "translation-model"
+family = "hymt2"
+hf_repo = "OpenASR/hymt2-1.8b"
+release_public = true
+size = "1.8b"
+registry_id = "hymt2-1.8b"
+display_name = "Hy-MT2 1.8B"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/blob/1cd5208700acedef4ef93019b6cfc148b8522d45/LICENSE.txt"
+license_class = "permissive"
+languages = ["en", "zh"]
+source_langs = ["zh"]
+target_langs = ["en"]
+experimental = true
+quants = ["q4_k_m"]
+recommended_quant = "q4_k_m"
+upstream_base_repo = "tencent/Hy-MT2-1.8B"
+upstream_base_revision = "9a341cd1b679d3efd23b46e847b01745a71ed792"
+upstream_gguf_repo = "tencent/Hy-MT2-1.8B-GGUF"
+upstream_gguf_revision = "1cd5208700acedef4ef93019b6cfc148b8522d45"
+license_files = ["LICENSE.txt", "NOTICE.openasr.txt"]
+notice_file = "tooling/publish-model/notices/hymt2-1.8b/NOTICE.openasr.txt"
+
+["whisper-tiny"]
+family = "whisper"
+hf_repo = "OpenASR/whisper-tiny"
+release_public = true
+aliases = []
+pull_alias = "whisper-tiny"
+size = "tiny"
+registry_id = "whisper-tiny"
+display_name = "Whisper Tiny"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/openai/whisper-tiny/blob/main/README.md"
+license_class = "permissive"
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+
+["whisper-base"]
+family = "whisper"
+hf_repo = "OpenASR/whisper-base"
+release_public = true
+aliases = []
+pull_alias = "whisper-base"
+size = "base"
+registry_id = "whisper-base"
+display_name = "Whisper Base"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/openai/whisper-base/blob/main/README.md"
+license_class = "permissive"
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+
+["whisper-medium"]
+family = "whisper"
+hf_repo = "OpenASR/whisper-medium"
+release_public = true
+aliases = []
+pull_alias = "whisper-medium"
+size = "medium"
+registry_id = "whisper-medium"
+display_name = "Whisper Medium"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/openai/whisper-medium/blob/main/README.md"
+license_class = "permissive"
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+
+["whisper-large-v3"]
+family = "whisper"
+hf_repo = "OpenASR/whisper-large-v3"
+release_public = true
+aliases = []
+pull_alias = "whisper-large-v3"
+size = "large"
+registry_id = "whisper-large-v3"
+display_name = "Whisper Large v3"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/openai/whisper-large-v3/blob/main/README.md"
+license_class = "permissive"
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+
+["whisper-tiny.en"]
+family = "whisper"
+hf_repo = "OpenASR/whisper-tiny.en"
+release_public = true
+aliases = []
+pull_alias = "whisper-tiny.en"
+size = "tiny.en"
+registry_id = "whisper-tiny.en"
+display_name = "Whisper Tiny (English)"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/openai/whisper-tiny.en/blob/main/README.md"
+license_class = "permissive"
+languages = ["en"]
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+
+["whisper-base.en"]
+family = "whisper"
+hf_repo = "OpenASR/whisper-base.en"
+release_public = true
+aliases = []
+pull_alias = "whisper-base.en"
+size = "base.en"
+registry_id = "whisper-base.en"
+display_name = "Whisper Base (English)"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/openai/whisper-base.en/blob/main/README.md"
+license_class = "permissive"
+languages = ["en"]
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+
+["whisper-small.en"]
+family = "whisper"
+hf_repo = "OpenASR/whisper-small.en"
+release_public = true
+aliases = []
+pull_alias = "whisper-small.en"
+size = "small.en"
+registry_id = "whisper-small.en"
+display_name = "Whisper Small (English)"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/openai/whisper-small.en/blob/main/README.md"
+license_class = "permissive"
+languages = ["en"]
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+
+["whisper-medium.en"]
+family = "whisper"
+hf_repo = "OpenASR/whisper-medium.en"
+release_public = true
+aliases = []
+pull_alias = "whisper-medium.en"
+size = "medium.en"
+registry_id = "whisper-medium.en"
+display_name = "Whisper Medium (English)"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/openai/whisper-medium.en/blob/main/README.md"
+license_class = "permissive"
+languages = ["en"]
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"

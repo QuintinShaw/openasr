@@ -1,0 +1,30 @@
+# Per-model card prose for OpenASR/wespeaker-voxceleb-resnet34-lm. Distilled
+# from the pyannote/WeSpeaker model card and implementation notes.
+
+pipeline_tag = "feature-extraction"
+
+tagline = "WeSpeaker ResNet34 speaker embedder for OpenASR diarization — stronger speaker separation, fully on-device"
+
+highlights = [
+  "🗣️ **Default OpenASR speaker embedder** — install this pack and `--diarize` labels anonymous speakers for any ASR family",
+  "🧬 **256-dim ResNet34 embeddings** — pyannote's WeSpeaker VoxCeleb model with temporal statistics pooling",
+  "🔒 **Diarization, not identification** — anonymous session-relative labels; embeddings stay local and are discarded after the request unless you explicitly enroll a local profile",
+  "🎯 **Parity-gated packaging** — single raw-f32 build; the Rust forward pass matches the upstream pyannote reference at cosine ≥ 0.9999",
+  "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference and share the same pull/install path as ASR models",
+]
+
+intro = """
+WeSpeaker ResNet34 is the speaker-embedding model used by pyannote for VoxCeleb speaker
+representations. OpenASR packages it as a local `.oasr` capability pack and uses it as the default
+speaker-embedding stage for diarization: speech regions are embedded, clustered, and attributed
+back onto transcripts from any ASR model. The realtime speaker-change detector now uses this same
+WeSpeaker embedder, so diarization has one speaker-embedding space across batch and streaming paths.
+"""
+
+acknowledgement = """
+This pack redistributes **pyannote/wespeaker-voxceleb-resnet34-LM** in OpenASR's `.oasr` runtime
+format. Credit for the model architecture, training, and original weights belongs to the upstream
+pyannote/WeSpeaker authors. The upstream model is licensed under **CC-BY-4.0**; OpenASR packaging
+retains that license and attribution, with the only modification being format conversion for local
+runtime loading.
+"""

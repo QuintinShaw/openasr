@@ -1,0 +1,90 @@
+---
+license: {{license_yaml}}
+base_model: {{upstream_repo}}
+pipeline_tag: {{pipeline_tag}}
+library_name: openasr
+tags:
+  - translation
+  - simultaneous-translation
+  - openasr
+  - oasr
+---
+
+<div align="center">
+
+# {{model_display_name}} · OpenASR
+
+**{{tagline}}**
+
+[![License](https://img.shields.io/badge/license-{{license_badge}}-2563eb.svg)]({{upstream_license_link}})
+[![Format](https://img.shields.io/badge/format-.oasr-7c3aed.svg)](https://github.com/QuintinShaw/openasr)
+[![Runtime](https://img.shields.io/badge/runtime-OpenASR-111827.svg)](https://openasr.org)
+[![Base model](https://img.shields.io/badge/base-{{upstream_badge}}-f59e0b.svg)]({{upstream_link}})
+
+Realtime translation pack for the **[OpenASR](https://github.com/QuintinShaw/openasr)** runtime —
+pure-Rust inference, **no Python at inference time**.
+
+</div>
+
+---
+
+## ✨ Highlights
+
+{{highlights_block}}
+
+## 🚀 Quickstart
+
+```bash
+# 1. Install the OpenASR CLI  ·  https://openasr.org
+# 2. Pull the pack
+{{pull_recommended}}
+```
+
+Realtime translation is an experimental capability: with this pack installed,
+realtime sessions can enable clause-by-clause zh→en translation alongside live
+Chinese ASR transcripts.
+
+## 📦 Pack
+
+| Quant | File (`.oasr`) | Size |
+|:------|:---------------|-----:|
+{{perf_table_rows}}
+
+<sub>Single **{{recommended_quant}}** build repackaged from the upstream GGUF release. The
+tensor data is preserved byte-for-byte — no requantization, no weight changes.</sub>
+
+## 🧠 About {{model_display_name}}
+
+{{intro}}
+
+## ⚙️ How this pack was made
+
+Repackaged from [{{upstream_repo}}]({{upstream_link}}) at a pinned revision with
+the OpenASR importer:
+
+```bash
+openasr model-pack {{import_subcommand}} <src>.gguf <out>.oasr \
+  --package-id {{registry_id}} \
+  --license-file LICENSE.txt --notice-file NOTICE.openasr.txt
+```
+
+The `.oasr` container is GGUF-backed. The importer verifies the pinned upstream
+sha256 and splices provenance, license, and notice metadata into the GGUF KV
+section; the model weights are byte-identical to the upstream GGUF artifact.
+
+## ⚖️ License
+
+This pack **inherits the upstream model's license: {{upstream_license_id}}**
+([source]({{upstream_license_link}})). The upstream `LICENSE.txt` and the OpenASR
+modification `NOTICE.openasr.txt` are embedded in the pack metadata; the only
+modification is packaging metadata, not weights.
+
+## 🙏 Acknowledgements
+
+{{acknowledgement_block}}
+
+## 🔗 Links
+
+- 🦀 **OpenASR** — <https://github.com/QuintinShaw/openasr>
+- 🌐 **Website** — <https://openasr.org>
+- 🤗 **Upstream model** — [{{upstream_repo}}]({{upstream_link}})

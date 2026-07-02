@@ -1,0 +1,34 @@
+# Per-model card prose for OpenASR/cohere-transcribe-03-2026. Paraphrased from
+# the upstream CohereLabs/cohere-transcribe-03-2026 card.
+
+tagline = "Dedicated 2B ASR for 14-language transcription"
+
+highlights = [
+  "🎙️ **Dedicated ASR** — audio-in, text-out model built specifically for transcription",
+  "🌍 **14 languages** — covers English, major European languages, Arabic, Chinese, Japanese, Korean, and Vietnamese",
+  "🧱 **Conformer encoder-decoder** — large acoustic encoder with a lightweight Transformer decoder",
+  "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon",
+]
+
+intro = """
+Cohere Transcribe 03-2026 is Cohere and Cohere Labs' open release of a
+2B-parameter automatic speech recognition model. It is a dedicated audio-in,
+text-out architecture with a Conformer-based acoustic encoder and a lightweight
+Transformer decoder, trained from scratch for transcription. The upstream model
+card lists support for 14 languages across English, European, APAC, and MENA
+coverage and reports Apache-2.0 licensing. This OpenASR repo repackages the
+original `CohereLabs/cohere-transcribe-03-2026` weights as `.oasr` packs that
+run natively in the OpenASR runtime with no Python at inference time. For most
+users the q8_0 build is the recommended default; q4_k is for tighter memory
+budgets and fp16 is for verification or maximum fidelity.
+"""
+
+acknowledgement = """
+This pack is a redistribution of **Cohere Transcribe 03-2026**, released by
+**Cohere** and **Cohere Labs**
+([CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026)).
+All credit for the original model, training recipe, and weights belongs to Cohere and
+Cohere Labs. The upstream Hugging Face model card declares Apache-2.0 licensing;
+OpenASR only converts the weights into `.oasr` packages and adds quantized builds
+for local runtime use.
+"""

@@ -1,0 +1,3 @@
+too-many-arguments-threshold = 16
+type-complexity-threshold = 400
+large-error-threshold = 256

@@ -1,0 +1,31 @@
+# Per-model card prose for OpenASR/hymt2-1.8b. Distilled from the upstream
+# tencent/Hy-MT2 release notes and OpenASR simultaneous-translation MVP design.
+
+pipeline_tag = "translation"
+
+tagline = "Hy-MT2 1.8B zh→en translation for OpenASR realtime subtitles — clause-by-clause, fully on-device"
+
+highlights = [
+  "🌐 **Realtime zh→en subtitle translation** — drives OpenASR's experimental clause-retranslation lane next to live Chinese ASR",
+  "⚡ **Hot-session clause latency in the hundreds of milliseconds** — prefix KV-cache reuse keeps warm per-clause retranslation fast on Apple Silicon CPU",
+  "📦 **Byte-identical upstream weights** — the Q4_K_M GGUF tensor data is repackaged unmodified at a pinned revision; sha256 and provenance are embedded in the pack",
+  "🧾 **License + NOTICE embedded** — the upstream Apache-2.0 LICENSE.txt and the OpenASR modification NOTICE travel inside the pack metadata",
+  "🎯 **Parity-gated packaging** — greedy decode token IDs match llama.cpp on the same prompt before release",
+]
+
+intro = """
+Hy-MT2 1.8B is Tencent's compact many-to-many translation model from the Hunyuan-MT family.
+OpenASR packages the upstream Q4_K_M GGUF release as a local `.oasr` translation pack and uses it
+for the experimental simultaneous-translation MVP: finalized and in-progress Chinese clauses from
+realtime ASR are retranslated clause-by-clause into English, with provisional translations
+superseded as the source clause stabilizes. The MVP contract is zh→en; the pack runs fully
+on-device through OpenASR's pure-Rust GGML runtime with no Python at inference time.
+"""
+
+acknowledgement = """
+This pack redistributes **tencent/Hy-MT2-1.8B-GGUF** in OpenASR's `.oasr` runtime format. Credit
+for the model architecture, training, and original weights belongs to the upstream Tencent Hunyuan
+authors. The upstream model is licensed under **Apache-2.0**; OpenASR packaging retains that
+license and attribution. The model weights are byte-identical to the upstream GGUF artifact —
+the only modification is packaging metadata, recorded in the embedded `NOTICE.openasr.txt`.
+"""

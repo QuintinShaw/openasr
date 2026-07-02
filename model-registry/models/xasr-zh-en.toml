@@ -1,0 +1,10 @@
+id = "xasr-zh-en"
+default_variant = "published"
+display_name = "X-ASR zh-en (OpenASR pack)"
+languages = ["en", "zh"]
+size = "0.16b"
+license = "Apache-2.0"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/xasr-zh-en"
+
+[variant]
+quantization = "q8_0"

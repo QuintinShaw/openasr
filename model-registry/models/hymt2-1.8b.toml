@@ -1,0 +1,10 @@
+id = "hymt2-1.8b"
+default_variant = "published"
+display_name = "Hy-MT2 1.8B (OpenASR pack)"
+languages = ["en", "zh"]
+size = "1.8b"
+license = "Apache-2.0"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/hymt2-1.8b"
+
+[variant]
+quantization = "q4_k_m"

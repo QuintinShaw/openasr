@@ -1,0 +1,30 @@
+# Per-model card prose for OpenASR/whisper-tiny.en. Paraphrased from the
+# upstream openai/whisper-tiny.en card and OpenAI Whisper project docs.
+
+tagline = "The smallest English-only Whisper, fastest for English speech"
+
+highlights = [
+  "🇬🇧 **English-only** — specialized for English, typically more accurate on English than the same-size multilingual model",
+  "⚡ **39M parameters** — the smallest, fastest, and lightest Whisper checkpoint",
+  "🌐 **Weak-supervision scale** — trained with Whisper's 680k-hour labelled speech corpus",
+  "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon",
+]
+
+intro = """
+Whisper Tiny.en is OpenAI's 39M-parameter English-only Whisper checkpoint. It uses the standard
+Whisper encoder-decoder architecture for automatic speech recognition, trained with large-scale
+weak supervision on 680k hours of labelled speech. As an English-specialized model it tends to
+outperform the same-size multilingual Whisper on English audio, at the lowest footprint and
+fastest inference in the family. This OpenASR repo repackages the original `openai/whisper-tiny.en`
+weights as `.oasr` packs that run natively in the OpenASR runtime with no Python at inference
+time. For most users the q8_0 build is the recommended default; q4_k is for the tightest memory
+budgets and fp16 is for verification or maximum fidelity.
+"""
+
+acknowledgement = """
+This pack is a redistribution of **Whisper Tiny.en**, released by **OpenAI**
+([openai/whisper-tiny.en](https://huggingface.co/openai/whisper-tiny.en)).
+All credit for the original model, training recipe, and weights belongs to OpenAI. The
+upstream Hugging Face model card declares Apache-2.0 licensing; OpenASR only converts the
+weights into `.oasr` packages and adds quantized builds for local runtime use.
+"""

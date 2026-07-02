@@ -1,0 +1,63 @@
+name: Model request
+description: Request a model card or future model support.
+title: "[Model]: "
+labels: ["model-registry"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        OpenASR does not currently download or bundle model weights by default. Do not upload large model files to this issue.
+  - type: input
+    id: model_name
+    attributes:
+      label: Model name
+      placeholder: "whisper-large-v3-turbo"
+    validations:
+      required: true
+  - type: input
+    id: source
+    attributes:
+      label: Source or upstream link
+      placeholder: "https://..."
+    validations:
+      required: true
+  - type: input
+    id: license
+    attributes:
+      label: License
+      placeholder: "MIT, Apache-2.0, OpenAI Whisper license, unknown"
+    validations:
+      required: true
+  - type: input
+    id: family
+    attributes:
+      label: Model family / architecture
+      placeholder: "Whisper, Qwen3-ASR, Cohere, Parakeet-CTC, wav2vec2, Moonshine, or a new architecture"
+    validations:
+      required: true
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Expected use case
+      description: What should this model be good for?
+    validations:
+      required: true
+  - type: dropdown
+    id: redistributable
+    attributes:
+      label: Are the model weights publicly redistributable?
+      options:
+        - "Yes"
+        - "No"
+        - "Unknown"
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I understand OpenASR does not currently download or bundle model weights by default.
+          required: true
+        - label: I have not uploaded large model files to this issue.
+          required: true
