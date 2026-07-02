@@ -1,0 +1,514 @@
+# OpenASR performance regression suite (committed).
+#
+# This file + perf/baselines/*.json + perf/PERFORMANCE.md are the committed
+# performance "ruler". Model packs and audio live under tmp/ (gitignored,
+# host-local) so the `pack_path`/`audio_path` values below are machine-specific
+# — update them per host. The baseline NUMBERS are committed separately.
+#
+# One fixed clip is used across all three families so RTF/memory are directly
+# comparable. Quant is per-entry: whisper/cohere at q8_0 (gating), qwen at fp16
+# (non-gating until a transcript-verified q8_0 qwen pack exists).
+#
+# Run:    cargo run --release -p openasr-cli -- bench-suite
+# Rebase: cargo run --release -p openasr-cli -- bench-suite --write-baseline perf/baselines/<host>.json
+
+schema_version = 1
+
+[default_tolerances]
+rtf_rel = 0.25         # max +25% real-time-factor regression (single-run, generous)
+peak_rss_rel = 0.20    # peak-RSS tolerance, applied to GATING entries when gate_peak_rss = true
+wer_abs = 0.02         # max +0.02 absolute WER regression (the primary, deterministic gate)
+gate_peak_rss = true   # peak-RSS now GATED on the stable gating entries (q8 whisper-tiny +
+                       # cohere), locking the zero-copy + gallocr-reuse memory wins against
+                       # silent regression. Noisy fp16 entries are gating=false -> not RSS-gated
+                       # (compare_to_baseline skips !gating). Baseline: perf/baselines/<host>.json,
+                       # refreshed 2026-05-31 to capture the SOTA packs (cohere q8 1453MB etc).
+cpp_slack = 0.05       # openasr may be at most 5% slower than whisper.cpp before the vs-cpp gate fires
+gate_vs_cpp = true     # goal-3 "beat OSS" now GATED + reconciled: matched-thread (-t 4) best-of-3
+                       # measured openasr 2790ms vs whisper.cpp 3083ms = openasr 9.5% FASTER on
+                       # whisper-large-v3-turbo q8, consistent across 3 runs (7.9% / 9.5% / 10.9%).
+                       # The gate asserts openasr stays within cpp_slack of whisper.cpp (huge
+                       # headroom since openasr leads); a regression below cpp now fails closed.
+
+[[entries]]
+id = "whisper-tiny-en-q8"
+family = "whisper"
+quant = "q8_0"
+pack_path = "tmp/models/whisper/whisper-tiny.en.q8_0.repack.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+
+[[entries]]
+id = "cohere-transcribe-q8"
+family = "cohere"
+quant = "q8_0"
+pack_path = "tmp/models/cohere-transcribe-03-2026/openasr/cohere-transcribe-03-2026-q8_0.rebuild1.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+ordering_group = "cohere-transcribe"
+
+# cohere q4_k (goals 7+8 SIZE lever): the importer's existing q4_k mode shrinks
+# the pack 2.3GB -> 1.4GB (-39%) at WER 0.00% (transcript byte-identical to q8),
+# directly cutting cohere's cold-load I/O (its load is pure mmap page-fault I/O).
+# Non-gating; the ordering-group assertion (q4_k size <= q8) is its gate.
+[[entries]]
+id = "cohere-transcribe-q4k"
+family = "cohere"
+quant = "q4_k"
+pack_path = "tmp/models/cohere-transcribe-03-2026/openasr/cohere-transcribe-03-2026-q4_k.rebuild1.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+ordering_group = "cohere-transcribe"
+
+# qwen at q8_0 (the .dimfix pack transcribes correctly — the old "q8_0 broken"
+# status is stale) and fp16, forming a quant-ordering group: q8_0 weights are
+# the real memory lever (~46% smaller weights — the dominant term — vs fp16),
+# and should not be slower. (KV-cache quantization was investigated and rejected:
+# the production KV cache grows to actual decode length, ~40 tokens for a 6s clip,
+# so quantizing it saves <1% peak; the pre-allocated arena is dead code.)
+# qwen q3_k (OAML both-backend verdict: smaller K-quant via ggml's OWN CPU+Metal
+# kernels — no GPU-specialization, no custom kernel). 571MB(q4k) -> 468MB (-18%);
+# decode is bandwidth-bound at batch=1 so fewer bytes/token speeds BOTH backends.
+# WER 0.00% on the LibriSpeech-clean clip (metal+cpu); the aggressive rung — WER
+# risk on harder audio, so non-gating + a broader eval should harden before default.
+[[entries]]
+id = "qwen3-asr-0.6b-q3k"
+family = "qwen"
+quant = "q3_k"
+pack_path = "tmp/models/qwen3-asr/openasr/qwen3-asr-0.6b-q3_k.dimfix.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+ordering_group = "qwen-0.6b"
+
+# qwen q4_k (goals 7+8 SIZE lever): importer q4_k mode shrinks the pack 960MB ->
+# 571MB (-41%) at WER 0.00%; combined with the audio-encoder + LLM zero-copy
+# binding (q4_k is native -> binds zero-copy) it is small + fast-load + low-RSS.
+[[entries]]
+id = "qwen3-asr-0.6b-q4k"
+family = "qwen"
+quant = "q4_k"
+pack_path = "tmp/models/qwen3-asr/openasr/qwen3-asr-0.6b-q4_k.dimfix.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+ordering_group = "qwen-0.6b"
+
+[[entries]]
+id = "qwen3-asr-0.6b-q8"
+family = "qwen"
+quant = "q8_0"
+pack_path = "tmp/models/qwen3-asr/openasr/qwen3-asr-0.6b-q8_0.dimfix.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+ordering_group = "qwen-0.6b"
+
+[[entries]]
+id = "qwen3-asr-0.6b-fp16"
+family = "qwen"
+quant = "fp16"
+pack_path = "tmp/models/qwen3-asr/openasr/qwen3-asr-0.6b-fp16.dimfix.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+ordering_group = "qwen-0.6b"
+
+# --- Quant-ordering group (ROADMAP P2): same model, three quants. The suite
+# asserts RTF is ordered q4_k <= q8_0 <= fp16 (more compression not slower).
+# whisper-small.en has a clean size ordering (194M < 289M < 466M); whisper-tiny
+# is deliberately NOT used here (its q4_k is larger than q8_0 due to k-quant
+# block overhead at tiny scale). These are non-gating for the baseline-regression
+# check; the ordering assertion is their gate.
+
+[[entries]]
+id = "whisper-small-en-q4k"
+family = "whisper"
+quant = "q4_k"
+pack_path = "tmp/models/whisper/whisper-small.en.q4_k.repack.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+ordering_group = "whisper-small-en"
+
+[[entries]]
+id = "whisper-small-en-q8"
+family = "whisper"
+quant = "q8_0"
+pack_path = "tmp/models/whisper/whisper-small.en.q8_0.repack.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+ordering_group = "whisper-small-en"
+
+[[entries]]
+id = "whisper-small-en-fp16"
+family = "whisper"
+quant = "fp16"
+pack_path = "tmp/models/whisper/whisper-small.en.fp16.repack.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+ordering_group = "whisper-small-en"
+
+# --- "Beat comparable open source" (goal 3): same model (whisper-large-v3-turbo
+# q8_0) timed on both openasr and whisper.cpp, best-of-N wall. gate_vs_cpp asserts
+# openasr is not slower than whisper.cpp beyond cpp_slack.
+# RECONCILED (2026-05-31): the prior contradiction (2026-05-30 baseline had
+# openasr ~8.8% SLOWER, on a warm-parent / mismatched-thread run) is resolved.
+# After the goals-7+8 memory/runtime work (zero-copy + gallocr reuse) a fresh
+# MATCHED-THREAD (-t 4, the 4 perf cores) best-of-3 measured openasr 2790ms vs
+# whisper.cpp 3083ms = openasr 9.5% FASTER — consistent across three independent
+# measurements (suite default-thread 7.9%, matched -t4 9.5%, prior g78 10.9%).
+# The thread-mismatch caveat is addressed (matched -t4 still shows openasr ahead);
+# the result is now stable + defensible, so gate_vs_cpp is ENABLED (cpp_slack 0.05
+# = ample headroom). The entry stays gating=false for the BASELINE (WER/RTF)
+# regression set — the vs-cpp gate is its binding check. Both binary + model are
+# host-local; skipped if either is missing.
+[[entries]]
+id = "whisper-turbo-q8-vs-cpp"
+family = "whisper"
+quant = "q8_0"
+pack_path = "tmp/models/whisper/whisper-large-v3-turbo.q8_0.repack.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+cpp_binary = "tmp/repos/whisper.cpp-clean/build/bin/whisper-cli"
+cpp_model = "tmp/models/whisper/ggml/ggml-large-v3-turbo-q8_0.bin"
+
+# parakeet-ctc (NVIDIA FastConformer-CTC, goal-1 family). The first q8 pack (via
+# the new `model-pack import parakeet-ctc --quantization q8-0`) shrinks the
+# fp16 pack 1.3GB -> 840MB (-35%) at WER 0.00% (depthwise convs stay f16). q8+fp16
+# form the RTF-ordering group q8 <= fp16. Non-gating; the ordering assertion is
+# their gate.
+# parakeet q4_k (the SOTA SIZE point): 1.3GB -> 588MB (-55% vs fp16, -30% vs q8) at
+# WER 0.00% on metal+cpu (depthwise convs stay f16; 2D .weight ne0%256 -> q4_k).
+# NOTE: q4_k is a SIZE win, NOT a speed win for this small (0.6b) compute-bound
+# conformer — measured ~34% SLOWER RTF than q8 (the k-quant 4-bit unpack is heavier
+# than q8's, same size<->speed tradeoff as qwen q3_k). So q4_k is deliberately NOT
+# in the RTF-ordering group (it would violate "more compression not slower"); it is
+# measured + reported, gated on WER only.
+[[entries]]
+id = "parakeet-ctc-0.6b-q4k"
+family = "parakeet-ctc"
+quant = "q4_k"
+pack_path = "tmp/models/parakeet-ctc-0.6b/openasr/parakeet-ctc-0.6b-q4_k.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+[[entries]]
+id = "parakeet-ctc-0.6b-q8"
+family = "parakeet-ctc"
+quant = "q8_0"
+pack_path = "tmp/models/parakeet-ctc-0.6b/openasr/parakeet-ctc-0.6b-q8_0.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+ordering_group = "parakeet-ctc-0.6b"
+
+[[entries]]
+id = "parakeet-ctc-0.6b-fp16"
+family = "parakeet-ctc"
+quant = "fp16"
+pack_path = "tmp/models/parakeet-ctc-0.6b/openasr/parakeet-ctc-0.6b-fp16.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+ordering_group = "parakeet-ctc-0.6b"
+
+# whisper-base.en (onboarding model #1 — data-only via the existing whisper importer,
+# downloaded from hf-mirror). q4_k pack 82MB, WER 0.00% on the clip (metal+cpu).
+[[entries]]
+id = "whisper-base-en-q4k"
+family = "whisper"
+quant = "q4_k"
+pack_path = "tmp/models/whisper/whisper-base.en.q4_k.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# distil-small.en (onboarding model #2 — data-only via the whisper importer; distil-whisper
+# is whisper-arch with 4 distilled decoder layers). q4_k 150MB, WER 0.00% (metal+cpu).
+[[entries]]
+id = "distil-small-en-q4k"
+family = "whisper"
+quant = "q4_k"
+pack_path = "tmp/models/whisper/distil-small.en.q4_k.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# wav2vec2-base-960h (onboarding model #3 — FIRST NEW-ARCHITECTURE family). New Ctc-shape
+# family: raw-waveform 7-conv feature extractor + grouped positional-conv (weight-norm) +
+# post-norm transformer encoder + char-CTC. New FFI (ggml_group_norm/concat) + nn/wav2vec2.rs.
+# q4_k 63MB, WER 0.00% (metal+cpu). Unlocks the wav2vec2/hubert/data2vec/wavLM/MMS family.
+[[entries]]
+id = "wav2vec2-base-960h-q4k"
+family = "wav2vec2-ctc"
+quant = "q4_k"
+pack_path = "tmp/models/wav2vec2-base-960h/wav2vec2-base-960h.q4_k.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# whisper-medium.en (onboarding — data-only, whisper-arch). q4_k 498MB, WER 0.00% metal.
+[[entries]]
+id = "whisper-medium-en-q4k"
+family = "whisper"
+quant = "q4_k"
+pack_path = "tmp/models/whisper/whisper-medium.en.q4_k.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# wav2vec2-ctc siblings (#5,#6 — reuse the family infra via config-flag branches:
+# feat_extract_norm=layer, do_stable_layer_norm=true, conv_bias). q4_k 188MB, WER 0.00%.
+[[entries]]
+id = "hubert-large-ls960-ft-q4k"
+family = "wav2vec2-ctc"
+quant = "q4_k"
+pack_path = "tmp/models/wav2vec2-base-960h/hubert-large-ls960-ft.q4_k.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+[[entries]]
+id = "wav2vec2-large-960h-lv60-self-q4k"
+family = "wav2vec2-ctc"
+quant = "q4_k"
+pack_path = "tmp/models/wav2vec2-base-960h/wav2vec2-large-960h-lv60-self.q4_k.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# Multilingual Whisper batch (onboarding #7-10 — data-only via the whisper
+# importer + a decode/detok fix: multilingual checkpoints (vocab > 51864) now
+# prompt sot+<|en|>+<|transcribe|>+notimestamps and drop the non-special
+# timestamp-token range at detok, so the leaked leading <|0.00|> is gone. The
+# .en gate stays byte-identical (verified pre/post on medium.en + distil-small.en,
+# metal+cpu). All four WER 0.00% metal+cpu on the clean reference clip.
+[[entries]]
+id = "whisper-large-v3-multi-q4k"
+family = "whisper"
+quant = "q4_k"
+pack_path = "tmp/models/whisper-multilingual/whisper-large-v3.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+[[entries]]
+id = "whisper-large-v2-multi-q4k"
+family = "whisper"
+quant = "q4_k"
+pack_path = "tmp/models/whisper-multilingual/whisper-large-v2.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+[[entries]]
+id = "whisper-small-multi-q4k"
+family = "whisper"
+quant = "q4_k"
+pack_path = "tmp/models/whisper-multilingual/whisper-small.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+[[entries]]
+id = "whisper-base-multi-q4k"
+family = "whisper"
+quant = "q4_k"
+pack_path = "tmp/models/whisper-multilingual/whisper-base.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# Data-only onboarding batch #11-14 (reuse existing whisper + wav2vec2-ctc
+# importers, zero code changes). All verified metal==cpu (identical transcripts
+# on both backends), q4_k. WER recorded honestly: the two non-zero entries are
+# genuine model nuances (single-word substitution), NOT bugs.
+#
+# wav2vec2-large-960h: the upstream facebook repo ships ONLY pytorch_model.bin
+# (no safetensors on the mirror) and an old transformers config without
+# pad_token_id. Onboarded by converting .bin -> model.safetensors locally and
+# adding pad_token_id: 0 (== CTC blank, matching the already-supported
+# wav2vec2-base-960h sibling's identical 32-token vocab). Input-format prep only;
+# the importer was unchanged. WER 0.00% metal+cpu.
+[[entries]]
+id = "wav2vec2-large-960h-q4k"
+family = "wav2vec2-ctc"
+quant = "q4_k"
+pack_path = "tmp/models/onboard-batch/wav2vec2-large-960h.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# wav2vec2-large-xlsr-53-english (jonatasgrosman): wav2vec2-large XLSR finetune,
+# reuses the layer-norm/stable-norm branch. WER 5.88% metal+cpu (single sub
+# "angreer"/"angrier" -- a finetune artifact, real transcript, no leaked tokens).
+[[entries]]
+id = "wav2vec2-large-xlsr-53-english-q4k"
+family = "wav2vec2-ctc"
+quant = "q4_k"
+pack_path = "tmp/models/onboard-batch/wav2vec2-large-xlsr-53-english.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# whisper-tiny (multilingual): data-only via the whisper importer + the
+# multilingual decode fix. WER 5.88% metal+cpu (homophone "Reed"/"read" -- the
+# 39M-param tiny model, real transcript).
+[[entries]]
+id = "whisper-tiny-multi-q4k"
+family = "whisper"
+quant = "q4_k"
+pack_path = "tmp/models/onboard-batch/whisper-tiny-multi.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# distil-medium.en (distil-whisper): data-only, whisper-arch with 2 distilled
+# decoder layers. WER 0.00% metal+cpu (unlike distil-large-v3 which is long-form
+# tuned and gate-rejected on short clips, distil-medium.en transcribes cleanly).
+[[entries]]
+id = "distil-medium-en-q4k"
+family = "whisper"
+quant = "q4_k"
+pack_path = "tmp/models/onboard-batch/distil-medium.en.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# parakeet-ctc-1.1b (#15 — FastConformer-XL, ~42 conformer layers vs 0.6b's 24).
+# Near-data-only: reuses the parakeet importer + conformer encoder unchanged; the
+# ONLY code change was sizing the encoder cgraph to the data-driven layer count
+# (the default 4096-node cap overflowed -> GGML n_nodes assert). Capacity-only, so
+# the 0.6b output is byte-identical (re-verified WER 0.00% both backends). 1.1b
+# WER 0.00% metal+cpu. Validates the conformer family scales to larger NeMo dims.
+[[entries]]
+id = "parakeet-ctc-1.1b-q4k"
+family = "parakeet-ctc"
+quant = "q4_k"
+pack_path = "tmp/models/onboard-batch/parakeet-ctc-1.1b.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# wav2vec2-large-robust-ft-libri-960h (#22 — facebook robust-pretrain finetune).
+# Data-only, reuses the wav2vec2-ctc family unchanged. WER 0.00% metal+cpu.
+[[entries]]
+id = "wav2vec2-large-robust-q4k"
+family = "wav2vec2-ctc"
+quant = "q4_k"
+pack_path = "tmp/models/onboard-batch/wav2vec2-large-robust.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# hubert-xlarge-ls960-ft (#23 — ~48 transformer layers, 2x large's depth). First
+# model to exercise the wav2vec2-ctc cgraph layer-count sizing (the default
+# 4096-node cap would overflow). 3.6GB source -> 543MB q4_k. WER 0.00% metal+cpu.
+[[entries]]
+id = "hubert-xlarge-ls960-ft-q4k"
+family = "wav2vec2-ctc"
+quant = "q4_k"
+pack_path = "tmp/models/onboard-batch/hubert-xlarge-ls960-ft.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# whisper-large (v1, #24 — the original openai/whisper-large, multilingual 80-mel).
+# Data-only via the whisper importer + the multilingual decode fix. WER 0.00%
+# metal+cpu, clean transcript (no <|0.00|> leak). 5.9GB source -> 940MB q4_k.
+[[entries]]
+id = "whisper-large-v1-multi-q4k"
+family = "whisper"
+quant = "q4_k"
+pack_path = "tmp/models/onboard-batch/whisper-large-v1.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# moonshine-tiny (#25 — UsefulSensors, the 6th distinct architecture family:
+# raw-waveform conv-stem frontend + partial-RoPE (GPT-J/interleaved) seq2seq,
+# tied-embedding logits, gated-SwiGLU decoder FFN). WER 11.76% metal==cpu — this
+# is the 27M tiny model's GENUINE quality, NOT an impl bug: the transcript is
+# byte-for-byte identical to HuggingFace transformers' own Moonshine reference
+# (two model quirks: greed/read, angryer/angrier). 103MB source -> 34MB (tied
+# embedding q8_0, not f32 -> -45% pack size, WER unchanged).
+# Non-gating (above the 10% short-clip bar by model design, not regression).
+[[entries]]
+id = "moonshine-tiny-q4k"
+family = "moonshine"
+quant = "q4_k"
+pack_path = "tmp/models/onboard-batch/moonshine-tiny.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# moonshine-base (#26 — same family, larger dims: more layers, bigger d_model +
+# rotary_dim). Validates the moonshine per-pack hparam schema handles base with
+# ZERO code changes (data-only relative to tiny). WER 5.88% metal==cpu (one
+# "greed"/"read" quirk; base fixes tiny's "angryer"). 246MB source -> 76MB
+# (tied embedding q8_0 -> -34% pack size, WER unchanged).
+[[entries]]
+id = "moonshine-base-q4k"
+family = "moonshine"
+quant = "q4_k"
+pack_path = "tmp/models/onboard-batch/moonshine-base.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+
+# data2vec-audio-large-960h (#27 — 7th pretraining family, rides the wav2vec2-ctc
+# architecture). Onboarded via a NEW pos-conv branch in the wav2vec2-ctc family:
+# data2vec stacks 5 plain grouped convs (kernel 19, odd, no SamePad crop, gelu
+# each, sequential + residual add) vs wav2vec2's single weight-norm conv; and uses
+# a POST-norm encoder (its config do_stable_layer_norm=true is an ignored inherited
+# field — forced post-norm at import). WER 0.00% metal==cpu (the WER gate caught the
+# initial pre-norm bug: garbage -> 0% after the fix). 1.2GB source -> q4_k.
+[[entries]]
+id = "data2vec-audio-large-960h-q4k"
+family = "wav2vec2-ctc"
+quant = "q4_k"
+pack_path = "tmp/models/onboard-batch/data2vec-audio-large-960h.q4_k.oasr"
+audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false

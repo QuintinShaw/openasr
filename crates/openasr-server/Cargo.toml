@@ -1,0 +1,42 @@
+[package]
+name = "openasr-server"
+description = "Local OpenAI-compatible HTTP API server for OpenASR, including device pairing and optional remote-compute delegation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[features]
+## Accelerator backends — forwarded 1:1 to openasr-core so `serve --backend
+## native` can run on GPU when the binary is built with the matching feature.
+cuda = ["openasr-core/cuda"]
+vulkan = ["openasr-core/vulkan"]
+hip = ["openasr-core/hip"]
+sycl = ["openasr-core/sycl"]
+openmp = ["openasr-core/openmp"]
+native = ["openasr-core/native"]
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+mime.workspace = true
+openasr-core.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+# Enable the `testing` fixtures only for this crate's tests.
+openasr-core = { workspace = true, features = ["testing"] }
+tokio-tungstenite.workspace = true
+tower.workspace = true

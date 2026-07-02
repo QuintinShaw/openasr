@@ -1,0 +1,3 @@
+model-registry/catalog.json text eol=lf
+model-registry/catalog.signature.json text eol=lf
+model-registry/catalog.epoch text eol=lf

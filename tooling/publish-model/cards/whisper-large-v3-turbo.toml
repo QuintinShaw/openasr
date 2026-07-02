@@ -1,0 +1,31 @@
+# Per-model card prose for OpenASR/whisper-large-v3-turbo. Paraphrased from the
+# upstream openai/whisper-large-v3-turbo card and OpenAI Whisper project docs.
+
+tagline = "Fast multilingual Whisper built from pruned large-v3"
+
+highlights = [
+  "⚡ **Turbo decoder** — prunes Whisper large-v3's decoder from 32 layers to 4 for much faster generation",
+  "🌍 **Multilingual ASR** — transcribes many languages and can translate speech to English",
+  "🎙️ **Zero-shot robustness** — inherits Whisper's large-scale weak-supervision training across noisy domains",
+  "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU",
+]
+
+intro = """
+Whisper Large v3 Turbo is OpenAI's faster variant of Whisper large-v3: it keeps the same
+Whisper architecture and multilingual speech-recognition/translation interface, but reduces
+the decoder depth from 32 layers to 4. The upstream card describes the result as much faster
+with only a minor quality trade-off, while retaining Whisper's broad zero-shot behavior from
+training on more than five million hours of labeled audio. This OpenASR repo repackages the
+original `openai/whisper-large-v3-turbo` weights as `.oasr` packs that run natively in the
+OpenASR runtime with no Python at inference time. For most users the q8_0 build is the
+recommended default; q4_k is for tighter memory budgets and fp16 is for verification or
+maximum fidelity.
+"""
+
+acknowledgement = """
+This pack is a redistribution of **Whisper Large v3 Turbo**, released by **OpenAI**
+([openai/whisper-large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo)).
+All credit for the original model, training recipe, and weights belongs to OpenAI. The packs
+inherit the upstream MIT license; OpenASR only converts the weights into `.oasr` packages and
+adds quantized builds for local runtime use.
+"""

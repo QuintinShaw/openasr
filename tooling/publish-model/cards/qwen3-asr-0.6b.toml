@@ -1,0 +1,63 @@
+# Per-model card prose for openasr/qwen3-asr-0.6b. Distilled (paraphrased, not
+# copied) from the upstream Qwen/Qwen3-ASR-0.6B model card.
+
+tagline = "Multilingual speech recognition across 52 languages & dialects — the fast, lightweight Qwen3-ASR"
+tagline_zh = "覆盖 52 种语言与方言的轻量级 Qwen3-ASR 语音识别模型"
+
+highlights = [
+  "🌍 **52 languages & dialects** — 30 languages plus 22 Chinese dialects, with built-in spoken-language identification",
+  "🎧 **Robust on hard audio** — clean speech, singing voice, and songs over background music",
+  "⚡ **Fast & light** — the efficiency-tuned member of the Qwen3-ASR family; one model for both offline and streaming",
+  "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU",
+]
+
+highlights_zh = [
+  "覆盖 52 种语言与方言: 30 种语言加 22 种中文方言，并内置语种识别",
+  "适合复杂音频: 支持清晰语音、歌声以及带背景音乐的歌曲",
+  "快速轻量: Qwen3-ASR 家族中更偏效率的 0.6B 版本，适合离线和实时字幕",
+  "OpenASR 原生运行: `.oasr` 包推理阶段不需要 Python，可在 CPU/GPU 上运行",
+]
+
+intro = """
+Qwen3-ASR-0.6B is the compact, efficiency-optimized member of Alibaba's **Qwen3-ASR** family,
+built on the Qwen3-Omni audio-understanding foundation. It performs language identification and
+speech recognition across **30 languages and 22 Chinese dialects** (52 in total), and stays robust
+on challenging audio — clean speech, singing voice, and songs with background music. A single
+unified checkpoint handles both offline and real-time streaming transcription and can process long
+audio; the 0.6B size targets a strong accuracy-vs-efficiency trade-off (the Qwen team reports up to
+~2000× throughput at high concurrency), making it the family's go-to for lightweight, high-throughput
+deployments. This OpenASR repo repackages the original weights as `.oasr` packs that run natively in
+the OpenASR runtime — no Python at inference time. The **q8_0** build is the recommended default
+(near-reference accuracy at roughly half the footprint); **q4_k** suits tight-memory devices and
+**fp16** is for verification or maximum fidelity. For word-level timestamps, pair it upstream with
+Qwen3-ForcedAligner-0.6B.
+"""
+
+acknowledgement = """
+This pack is a redistribution of **Qwen3-ASR-0.6B**, created and open-sourced by the **Qwen team at
+Alibaba** ([Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B)). All credit for the
+original architecture, training, and weights belongs to them; the license is inherited from and
+identical to the upstream model (Apache-2.0). The GGUF quantization recipe and bit-identity
+verification methodology were informed by the community GGUF work at
+[cstr/qwen3-asr-1.7b-GGUF](https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF). Thank you to both teams
+for releasing their work openly.
+"""
+
+intro_zh = """
+Qwen3-ASR-0.6B 是 Alibaba Qwen 团队开源的 Qwen3-ASR 家族轻量版本，基于
+Qwen3-Omni 音频理解能力构建。它支持 30 种语言和 22 种中文方言的语音识别与语种识别，
+并能处理清晰语音、歌声和带背景音乐的歌曲等复杂音频。0.6B 版本强调质量、速度和体积的
+平衡，适合本地离线转写、实时字幕和高吞吐场景。
+
+这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理，不会把
+音频上传到云端。`q8_0` 是推荐默认版本，通常能在接近 fp16 质量的同时显著降低体积；
+`q4_k` 适合内存更紧的设备；`fp16` 适合验证或最高保真。
+"""
+
+acknowledgement_zh = """
+本模型包重新分发自 Qwen 团队开源的 Qwen3-ASR-0.6B
+([Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B))。原始架构、
+训练和权重归 Qwen 团队所有，许可证继承上游 Apache-2.0。OpenASR 仅进行格式转换、
+量化、运行时校验和本地推理适配。GGUF 量化配方和位一致性验证方法参考了社区
+[cstr/qwen3-asr-1.7b-GGUF](https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF) 的工作。
+"""

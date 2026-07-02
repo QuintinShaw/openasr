@@ -1,0 +1,20 @@
+{
+  "comment": "Shared Rust<->TypeScript contract for canonical quant tags, consumed by openasr-core tests/quant_tag_contract.rs and the desktop client's quant-tag contract test. Matching is case-sensitive after trimming; unknown tags pass through unchanged.",
+  "cases": [
+    { "input": "q8", "canonical": "q8_0" },
+    { "input": "q8_0", "canonical": "q8_0" },
+    { "input": " q8 ", "canonical": "q8_0" },
+    { "input": "q4", "canonical": "q4_k" },
+    { "input": "q4_k", "canonical": "q4_k" },
+    { "input": "q4_k_m", "canonical": "q4_k" },
+    { "input": "q3", "canonical": "q3_k" },
+    { "input": "q3_k", "canonical": "q3_k" },
+    { "input": "fp16", "canonical": "fp16" },
+    { "input": " fp16 ", "canonical": "fp16" },
+    { "input": "f32", "canonical": "f32" },
+    { "input": "q5_k", "canonical": "q5_k" },
+    { "input": "Q8", "canonical": "Q8" },
+    { "input": "FP16", "canonical": "FP16" },
+    { "input": "", "canonical": "" }
+  ]
+}

@@ -1,0 +1,10 @@
+id = "qwen3-asr-0.6b"
+default_variant = "published"
+display_name = "Qwen3-ASR 0.6B (OpenASR pack)"
+languages = ["ar", "cs", "da", "de", "el", "en", "es", "fa", "fi", "fil", "fr", "hi", "hu", "id", "it", "ja", "ko", "mk", "ms", "nl", "pl", "pt", "ro", "ru", "sv", "th", "tr", "vi", "zh"]
+size = "0.6b"
+license = "Apache-2.0"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/qwen3-asr-0.6b"
+
+[variant]
+quantization = "q8_0"

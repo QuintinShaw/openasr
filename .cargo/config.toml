@@ -1,0 +1,13 @@
+# Test/dev default backend. The unit + integration test suites validate
+# correctness, not GPU kernels, so they default to the CPU ggml backend: on a
+# Metal host each nextest-isolated test process otherwise re-compiles the Metal
+# pipeline cache (~13s/process), making the suite minutes-long, while CPU is
+# ~instant and deterministic. `force = false` lets an explicit
+# `OPENASR_GGML_BACKEND=metal` override it (e.g. to validate the Metal path).
+#
+# Scope: this applies to processes CARGO spawns (cargo test / nextest / cargo
+# run). The shipped release binary (run directly, and what the bench-suite
+# times) is UNAFFECTED and still defaults to Metal-when-available. CI runs on
+# Linux ARM64 (no Metal) so it already used CPU — this just matches it locally.
+[env]
+OPENASR_GGML_BACKEND = { value = "cpu", force = false }

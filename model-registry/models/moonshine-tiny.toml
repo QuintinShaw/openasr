@@ -1,0 +1,10 @@
+id = "moonshine-tiny"
+default_variant = "published"
+display_name = "Moonshine Tiny (OpenASR pack)"
+languages = ["en"]
+size = "tiny"
+license = "MIT"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/moonshine-tiny"
+
+[variant]
+quantization = "q8_0"

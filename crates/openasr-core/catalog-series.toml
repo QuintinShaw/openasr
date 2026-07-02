@@ -1,0 +1,37 @@
+# Code-owned model series taxonomy shared by core resolution and publish tooling.
+# Resolver aliases are accepted by pull/runtime paths. Catalog aliases are the
+# legacy projection currently emitted into signed catalog artifacts; changing
+# them requires regenerating and re-signing model-registry/catalog.json.
+
+[qwen]
+aliases = ["qwen", "qwen-asr", "qwen3", "qwen3-asr"]
+member_sizes = ["0.6b", "1.7b"]
+default_size = "0.6b"
+catalog_aliases = ["qwen3", "qwen3-asr"]
+catalog_pull_alias = "qwen3"
+
+[xasr-zipformer]
+aliases = ["xasr", "x-asr", "xasr-zipformer"]
+member_sizes = ["0.16b"]
+default_size = "0.16b"
+catalog_aliases = ["xasr", "x-asr"]
+catalog_pull_alias = "xasr"
+
+[whisper]
+aliases = ["whisper"]
+member_sizes = ["tiny", "base", "small", "medium", "large", "turbo", "tiny.en", "base.en", "small.en", "medium.en"]
+default_size = "small"
+
+[cohere]
+aliases = ["cohere", "cohere-transcribe"]
+member_sizes = ["2b"]
+default_size = "2b"
+catalog_aliases = ["cohere-transcribe", "cohere"]
+catalog_pull_alias = "cohere-transcribe"
+
+[moonshine]
+aliases = ["moonshine"]
+member_sizes = ["tiny"]
+default_size = "tiny"
+catalog_aliases = ["moonshine"]
+catalog_pull_alias = "moonshine"

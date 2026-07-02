@@ -1,0 +1,63 @@
+# Per-model card prose for openasr/xasr-zh-en. Distilled (paraphrased, not
+# copied) from the upstream GilgameshWind/X-ASR-zh-en model card. Claims are kept
+# to what the upstream repo and the architecture state; re-verify against the
+# upstream card before a public release.
+
+tagline = "Bilingual Chinese + English streaming speech recognition — a compact icefall Zipformer2 transducer"
+tagline_zh = "中英双语流式语音识别 — 轻量的 icefall Zipformer2 transducer"
+
+highlights = [
+  "🇨🇳🇬🇧 **Chinese + English** — one bilingual checkpoint for zh/en speech, including code-switched audio",
+  "⚡ **Streaming-first, offline-capable** — a cache-aware streaming Zipformer2 transducer for low-latency captions that also runs full-file offline transcription",
+  "🪶 **Compact ~0.16B** — a 6-stack Zipformer2 encoder + stateless RNN-T decoder + tanh joiner over a 5000-token BPE vocab, light enough for on-device CPU",
+  "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU",
+]
+
+highlights_zh = [
+  "中英双语: 单一检查点同时支持中文与英文语音，含中英混读",
+  "流式优先、兼顾离线: cache-aware 流式 Zipformer2 transducer，低延迟字幕，也能整段离线转写",
+  "轻量 ~0.16B: 6 段 Zipformer2 编码器 + 无状态 RNN-T 解码器 + tanh joiner，5000 BPE 词表，适合端侧 CPU",
+  "OpenASR 原生运行: `.oasr` 包推理阶段不需要 Python，可在 CPU/GPU 上运行",
+]
+
+intro = """
+X-ASR-zh-en is a compact **bilingual (Chinese + English)** streaming speech-recognition model from
+**GilgameshWind**, built with the **icefall / k2** recipe as a cache-aware **Zipformer2 RNN-T
+transducer** (a 6-stack, 19-layer Zipformer2 encoder, a stateless RNN-T decoder, and a tanh joiner
+over a 5000-token BPE vocabulary, ~0.16B parameters). The same checkpoint serves both low-latency
+**streaming** captions and full-file **offline** transcription, making it a good fit for on-device
+Chinese/English dictation and real-time subtitles. This OpenASR repo repackages the weights as
+`.oasr` packs that run natively in the OpenASR runtime — no Python at inference time, all decoding
+local. The **q8_0** build is the recommended default (it matched the fp16 transcript bit-for-bit in
+OpenASR's verification); **q4_k** is the smallest build for tight-memory devices and **fp16** is for
+maximum fidelity or verification.
+"""
+
+intro_zh = """
+X-ASR-zh-en 是 **GilgameshWind** 开源的轻量**中英双语**流式语音识别模型，基于 **icefall / k2**
+配方,是一个 cache-aware 的 **Zipformer2 RNN-T transducer**(6 段、19 层 Zipformer2 编码器 +
+无状态 RNN-T 解码器 + tanh joiner,5000 BPE 词表,约 0.16B 参数)。同一个检查点既能做低延迟
+**流式**字幕,也能做整段**离线**转写,适合端侧中英文听写和实时字幕。
+
+这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理,不会把音频上传到
+云端。`q8_0` 是推荐默认版本(在 OpenASR 的校验中与 fp16 转写逐字节一致);`q4_k` 体积最小、
+适合内存更紧的设备;`fp16` 适合最高保真或验证。
+"""
+
+acknowledgement = """
+This pack is a redistribution of **X-ASR-zh-en**, created and open-sourced by **GilgameshWind**
+([GilgameshWind/X-ASR-zh-en](https://huggingface.co/GilgameshWind/X-ASR-zh-en)). All credit for the
+original architecture, training, and weights belongs to the author; the license is inherited from and
+identical to the upstream model (Apache-2.0). The model is built on the **icefall** /
+**k2 / Next-gen Kaldi** Zipformer2 transducer recipe — thank you to the icefall team and to
+GilgameshWind for releasing their work openly. OpenASR only performs format conversion, quantization,
+runtime verification, and local-inference adaptation.
+"""
+
+acknowledgement_zh = """
+本模型包重新分发自 GilgameshWind 开源的 X-ASR-zh-en
+([GilgameshWind/X-ASR-zh-en](https://huggingface.co/GilgameshWind/X-ASR-zh-en))。原始架构、
+训练和权重归作者所有,许可证继承上游 Apache-2.0。模型基于 **icefall** / **k2(新一代 Kaldi)**
+的 Zipformer2 transducer 配方,感谢 icefall 团队与 GilgameshWind 的开源工作。OpenASR 仅进行
+格式转换、量化、运行时校验和本地推理适配。
+"""

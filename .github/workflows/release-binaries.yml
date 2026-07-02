@@ -1,0 +1,119 @@
+name: Release binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target_name }}
+    runs-on: ${{ matrix.os }}
+    # Distributed binaries must be portable. build.rs auto-enables GGML_NATIVE
+    # (-march=native) when host==target on x86, which is correct for local
+    # build-and-run but would tune these released x86 binaries to the CI
+    # runner's CPU and SIGILL on older end-user CPUs. Force it off here; power
+    # users tune locally via --features native or OPENASR_GGML_NATIVE=1.
+    env:
+      OPENASR_GGML_NATIVE: "0"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target_name: linux-x86_64
+            binary_name: openasr
+            archive_ext: tar.gz
+          - os: macos-15-intel
+            target_name: macos-x86_64
+            binary_name: openasr
+            archive_ext: tar.gz
+          - os: macos-latest
+            target_name: macos-aarch64
+            binary_name: openasr
+            archive_ext: tar.gz
+          - os: windows-latest
+            target_name: windows-x86_64
+            binary_name: openasr.exe
+            archive_ext: zip
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Linux audio build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+          rustc --version
+          cargo --version
+
+      - name: Build release binary
+        run: cargo build --release -p openasr-cli
+
+      - name: Smoke release binary
+        if: runner.os != 'Windows'
+        run: |
+          ./target/release/openasr --version
+          ./target/release/openasr --help
+          ./target/release/openasr list
+
+      - name: Smoke release binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .\target\release\openasr.exe --version
+          .\target\release\openasr.exe --help
+          .\target\release\openasr.exe list
+
+      - name: Package archive
+        if: runner.os != 'Windows'
+        run: |
+          dist_dir="dist/openasr-${{ matrix.target_name }}"
+          mkdir -p "$dist_dir/docs"
+          cp "target/release/${{ matrix.binary_name }}" "$dist_dir/"
+          cp README.md LICENSE "$dist_dir/"
+          cp -R model-registry "$dist_dir/model-registry"
+          cp docs/FAQ.md docs/KNOWN_LIMITATIONS.md "$dist_dir/docs/"
+          tar -czf "dist/openasr-${{ matrix.target_name }}.${{ matrix.archive_ext }}" -C dist "openasr-${{ matrix.target_name }}"
+
+      - name: Package archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $distDir = "dist\openasr-${{ matrix.target_name }}"
+          New-Item -ItemType Directory -Force -Path "$distDir\docs"
+          Copy-Item "target\release\${{ matrix.binary_name }}" "$distDir\"
+          # The Windows build is a GGML_BACKEND_DL build (build.rs): openasr.exe
+          # dynamically loads the core (ggml-base.dll + ggml.dll) and the CPU
+          # backend plugins (ggml-cpu-<variant>.dll) at startup, so the archive
+          # must carry them or the binary cannot launch. build.rs stages them next
+          # to the binary in target/release. macOS/Linux stay statically linked
+          # (self-contained), so this is Windows-only.
+          Get-ChildItem "target\release" -Filter "ggml*.dll" | Copy-Item -Destination "$distDir\"
+          Copy-Item README.md,LICENSE "$distDir\"
+          Copy-Item model-registry "$distDir\model-registry" -Recurse
+          Copy-Item docs\FAQ.md,docs\KNOWN_LIMITATIONS.md "$distDir\docs\"
+          # Smoke the binary from the staged dist dir (NOT target/release, whose
+          # build.rs-seeded DLLs would mask a packaging gap): openasr.exe
+          # import-links ggml-base.dll/ggml.dll, so it fails to launch here if the
+          # ggml DLL copy above ever regresses. This catches a broken archive
+          # before it ships.
+          & "$distDir\${{ matrix.binary_name }}" --version
+          Compress-Archive -Path "$distDir" -DestinationPath "dist\openasr-${{ matrix.target_name }}.${{ matrix.archive_ext }}" -Force
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: openasr-${{ matrix.target_name }}
+          path: dist/openasr-${{ matrix.target_name }}.${{ matrix.archive_ext }}
+          if-no-files-found: error

@@ -1,0 +1,34 @@
+# Per-model card prose for openasr/moonshine-tiny. Distilled (paraphrased, not
+# copied) from the upstream UsefulSensors/moonshine-tiny model card.
+
+tagline = "Tiny 27M-parameter English ASR built for real-time, on-device transcription"
+
+highlights = [
+  "🪶 **Just 27M parameters** — the smallest Moonshine, sized for memory- and compute-constrained edge hardware",
+  "⚡ **Real-time on-device** — engineered by Useful Sensors for live transcription and voice commands on low-cost devices",
+  "🎯 **Accurate for its size** — beats similarly-sized ASR systems on standard English benchmarks (per the Moonshine paper)",
+  "🗣️ **English speech-to-text** — sequence-to-sequence ASR trained on 200K hours of audio",
+  "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU",
+]
+
+intro = """
+Moonshine Tiny is the smallest model in Useful Sensors' **Moonshine** family — a 27M-parameter,
+sequence-to-sequence English speech-recognition model designed for **real-time, on-device
+transcription** on hardware that is severely constrained in memory and compute. Trained on 200,000
+hours of audio, it transcribes English speech to text and, despite its size, reports greater accuracy
+than existing ASR systems of comparable scale on standard benchmarks. It targets developers building
+live transcription and voice-command experiences on low-cost devices. Like other autoregressive ASR
+models it can occasionally hallucinate or repeat on very short or clipped segments, so robust
+in-domain evaluation is recommended before deployment. This OpenASR repo repackages the original
+weights as `.oasr` packs that run natively in the OpenASR runtime — no Python at inference time. The
+**q8_0** build is the recommended default (near-reference accuracy at roughly a third of the
+footprint); **fp16** is for verification or maximum fidelity.
+"""
+
+acknowledgement = """
+This pack is a redistribution of **Moonshine Tiny**, created and open-sourced by **Useful Sensors**
+([UsefulSensors/moonshine-tiny](https://huggingface.co/UsefulSensors/moonshine-tiny)). All credit for
+the original architecture, training, and weights belongs to them; the license is inherited from and
+identical to the upstream model (MIT). Thank you to the Moonshine authors — Nat Jeffries, Evan King,
+Manjunath Kudlur, Guy Nicholson, James Wang, and Pete Warden — for releasing their work openly.
+"""

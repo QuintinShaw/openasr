@@ -1,0 +1,23 @@
+[package]
+name = "openasr-system-audio"
+description = "Cross-platform system-audio capture backends (macOS CoreAudio, Windows WASAPI, Linux ALSA/JACK) for OpenASR live transcription."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libloading = "0.8"
+objc2 = "0.6.2"
+objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware", "objc2", "objc2-core-audio-types", "objc2-foundation"] }
+objc2-core-audio-types = { version = "0.3.2", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFDictionary", "CFNumber", "CFString"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSObject", "NSString", "NSUUID", "NSValue"] }
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.23.0"

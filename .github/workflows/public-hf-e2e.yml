@@ -1,0 +1,74 @@
+name: Public HF E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Catalog pull reference"
+        required: false
+        default: "moonshine-tiny:q8"
+      catalog_url:
+        description: "Public catalog URL"
+        required: false
+        default: "https://catalog.openasr.org/v1/catalog.json"
+      audio:
+        description: "Repository audio fixture"
+        required: false
+        default: "fixtures/jfk.wav"
+      strict_evidence:
+        description: "Require final public-HF evidence semantics"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 8 * * 1"
+
+concurrency:
+  group: public-hf-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  public-hf-e2e:
+    name: Pull public pack and transcribe
+    if: github.repository_owner == 'QuintinShaw'
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+          cache-bin: false
+          cache-on-failure: true
+          cache-targets: true
+          shared-key: openasr-public-hf-e2e-arm64
+      - name: Run public-HF E2E
+        env:
+          OPENASR_PUBLIC_HF_E2E_MODEL: ${{ github.event.inputs.model || 'moonshine-tiny:q8' }}
+          OPENASR_PUBLIC_HF_E2E_CATALOG_URL: ${{ github.event.inputs.catalog_url || 'https://catalog.openasr.org/v1/catalog.json' }}
+          OPENASR_PUBLIC_HF_E2E_AUDIO: ${{ github.event.inputs.audio || 'fixtures/jfk.wav' }}
+        run: |
+          mkdir -p tmp/public-hf-e2e
+          args=(
+            --summary-json tmp/public-hf-e2e/summary.json
+            --summary-md tmp/public-hf-e2e/summary.md
+          )
+          if [[ "${{ github.event.inputs.strict_evidence || 'false' }}" == "true" ]]; then
+            args+=(--strict-evidence)
+          fi
+          tooling/public-hf-e2e/run.sh "${args[@]}"
+      - name: Upload public-HF E2E evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-hf-e2e-evidence
+          path: |
+            tmp/public-hf-e2e/summary.json
+            tmp/public-hf-e2e/summary.md
+          if-no-files-found: warn

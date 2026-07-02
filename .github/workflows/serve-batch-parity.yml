@@ -1,0 +1,85 @@
+name: Serve-batch real-pack parity
+
+# Proves the issue #35 batched-decode path against REAL model weights in CI:
+# batched logits == serial argmax (the ragged N-vs-serial correctness invariant)
+# and the owner-thread state machine (decode / refill / rebucket / shrink) on the
+# CPU backend, using the public moonshine-tiny q8_0 pack. All other batched-decode
+# tests in `cargo test` run on tiny synthetic fixtures only; this lane is the
+# real-weight correctness backstop. moonshine is a seq2seq family riding the same
+# shared nn/decoder.rs seam as whisper/cohere, so it is a strong proxy for the
+# seq2seq batched path. Runs on PRs into main (gates the merge) and on demand.
+
+on:
+  workflow_dispatch:
+  # Self-hosted runner: post-merge backstop on main, not a PR gate (external PRs
+  # cannot reach the private runner, and fork code must not run on it).
+  push:
+    branches: [main]
+
+concurrency:
+  group: serve-batch-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Public moonshine-tiny q8_0 pack pinned to its immutable HF revision so the
+  # download is reproducible.
+  MOONSHINE_PACK_URL: https://huggingface.co/OpenASR/moonshine-tiny/resolve/06c21bef0dbc2bd0474c4e32ef00bfeafd7002a6/moonshine-tiny-q8_0.oasr
+  MOONSHINE_PACK_SHA256: 5df858db11aca1aca8d4bb8ba1230e9e683da8292a46137f0993981b89c655a3
+
+jobs:
+  cpu-real-pack-parity:
+    name: moonshine CPU real-pack parity
+    if: github.repository_owner == 'QuintinShaw'
+    runs-on: [self-hosted, Linux, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify Linux audio build dependencies
+        run: |
+          dpkg -s libasound2-dev >/dev/null 2>&1 || {
+            echo "::error::Missing libasound2-dev on the self-hosted runner. Preinstall it on the runner image."
+            exit 1
+          }
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache moonshine-tiny pack
+        id: cache-pack
+        uses: actions/cache@v4
+        with:
+          path: tmp/ci-packs/moonshine-tiny-q8_0.oasr
+          key: moonshine-tiny-q8_0-${{ env.MOONSHINE_PACK_SHA256 }}
+
+      - name: Download moonshine-tiny pack
+        if: steps.cache-pack.outputs.cache-hit != 'true'
+        env:
+          # Authenticated HF requests get a higher rate limit, avoiding the 429s
+          # anonymous CI downloads hit. moonshine-tiny is public, so the token is
+          # for rate, not access; absent (e.g. fork PRs) it downloads anonymously.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          mkdir -p tmp/ci-packs
+          auth=()
+          [ -n "$HF_TOKEN" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
+          curl -fL --retry 5 --retry-delay 15 --retry-all-errors "${auth[@]}" "$MOONSHINE_PACK_URL" -o tmp/ci-packs/moonshine-tiny-q8_0.oasr
+
+      - name: Verify pack checksum
+        run: |
+          echo "$MOONSHINE_PACK_SHA256  tmp/ci-packs/moonshine-tiny-q8_0.oasr" | sha256sum -c -
+
+      - name: Run real-pack batched-vs-serial parity + owner-thread tests (CPU)
+        env:
+          OPENASR_GGML_BACKEND: cpu
+          # The batched reusable decode graph requires scheduler-off execution;
+          # force it so the CPU lane exercises the same direct path as the GPU
+          # serve-batch lane (whisper/cohere require this explicitly).
+          OPENASR_GGML_USE_SCHEDULER: "0"
+          OPENASR_MOONSHINE_BATCH_REAL_PACK: ${{ github.workspace }}/tmp/ci-packs/moonshine-tiny-q8_0.oasr
+          OPENASR_MOONSHINE_SERVE_BATCH_REAL_PACK: ${{ github.workspace }}/tmp/ci-packs/moonshine-tiny-q8_0.oasr
+        run: |
+          cargo test -p openasr-core --release --lib \
+            -- --ignored --nocapture \
+            moonshine_decoder_runtime_batched moonshine_owner_thread

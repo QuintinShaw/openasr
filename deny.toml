@@ -1,0 +1,53 @@
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # Transitive dependency of metal 0.33.0, which is currently the latest
+    # macOS-only Metal binding used by the experimental local GPU backend.
+    # Revisit when metal-rs ships a replacement dependency path.
+    "RUSTSEC-2024-0436",
+    # number_prefix (unmaintained) is a transitive dep of indicatif, used by the
+    # CLI download progress bar for human-readable byte sizes. Tiny, stable leaf
+    # crate; revisit if indicatif drops it.
+    "RUSTSEC-2025-0119",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+# Note: the pyannote PLDA speaker-diarization parameters bundled in NOTICE are
+# CC-BY-4.0 *data assets* (numeric weights, not source code). They do not appear
+# in the Cargo dependency graph and are therefore not checked by cargo-deny.
+# Future maintainers: do not add CC-BY-4.0 to the allow list below for this
+# reason -- it would open the door to CC-BY-4.0 *code* dependencies unintentionally.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,10 @@
+id = "wespeaker-voxceleb-resnet34-lm"
+default_variant = "published"
+display_name = "WeSpeaker ResNet34 Speaker Embedder (VoxCeleb) (OpenASR pack)"
+languages = ["en", "zh"]
+size = "embedder"
+license = "CC-BY-4.0"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/wespeaker-voxceleb-resnet34-lm"
+
+[variant]
+quantization = "f32"

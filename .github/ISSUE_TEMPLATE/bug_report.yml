@@ -1,0 +1,94 @@
+name: Bug report
+description: Report a first-run, CLI, API, registry, backend, or documentation issue.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue. Do not attach private audio unless it is safe to share publicly.
+  - type: input
+    id: version
+    attributes:
+      label: OpenASR version or commit SHA
+      description: Paste the version, tag, or commit SHA you tested.
+      placeholder: "commit f946d59"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "macOS 15.4, Ubuntu 24.04, Windows 11"
+    validations:
+      required: true
+  - type: input
+    id: rust
+    attributes:
+      label: Rust version
+      placeholder: "rustc 1.86.0"
+    validations:
+      required: false
+  - type: textarea
+    id: command
+    attributes:
+      label: Command run or API request
+      description: Include the exact command or curl/API request shape.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: Redact secrets, private paths, and private audio names if needed.
+      render: text
+    validations:
+      required: false
+  - type: dropdown
+    id: openasr_home
+    attributes:
+      label: Was OPENASR_HOME customized?
+      options:
+        - "No"
+        - "Yes"
+        - "Not sure"
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend used
+      options:
+        - mock
+        - native
+        - not sure
+    validations:
+      required: true
+  - type: textarea
+    id: native_pack
+    attributes:
+      label: Native .oasr pack details, if used
+      description: For the native backend, include the model family and quant of the .oasr pack. Do not paste secrets or sensitive private paths.
+      placeholder: "Family: whisper-small\nQuant: q4_k"
+    validations:
+      required: false
+  - type: checkboxes
+    id: audio_confirmation
+    attributes:
+      label: Audio sharing confirmation
+      options:
+        - label: I have not attached private audio unless it is safe to share publicly.
+          required: true

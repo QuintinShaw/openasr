@@ -1,0 +1,66 @@
+name: Docker smoke
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker-smoke:
+    name: Docker build and mock API smoke
+    if: github.repository_owner == 'QuintinShaw'
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build image
+        run: docker build -t openasr:ci .
+
+      - name: Start container
+        run: docker run --rm -d --name openasr-docker-smoke -p 18080:8080 openasr:ci
+
+      - name: Wait for server
+        run: |
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:18080/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          docker logs openasr-docker-smoke
+          exit 1
+
+      - name: Smoke endpoints
+        run: |
+          curl -fsS http://127.0.0.1:18080/health
+          curl -fsS http://127.0.0.1:18080/v1/models
+          curl -fsS http://127.0.0.1:18080/v1/audio/transcriptions \
+            -F "file=@fixtures/jfk.wav" \
+            -F "model=whisper-small" \
+            -F "response_format=json" \
+            -o /tmp/openasr-docker-transcription.json
+
+          grep -q '"text"' /tmp/openasr-docker-transcription.json
+          grep -q '"segments"' /tmp/openasr-docker-transcription.json
+
+      - name: Check Docker Compose config
+        run: docker compose -f compose.yaml config
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f openasr-docker-smoke || true

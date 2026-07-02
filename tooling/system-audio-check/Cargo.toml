@@ -1,0 +1,16 @@
+[package]
+name = "openasr-system-audio-check"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[workspace]
+
+# Standalone CI gate that compiles the real openasr-system-audio crate for the
+# host and cross-checks Windows. That crate owns the platform backends (macOS
+# CoreAudio, Windows WASAPI, Linux) and their target-gated deps, so this gate
+# just depends on the openasr-system-audio crate directly rather than
+# re-including platform source.
+[dependencies]
+openasr-system-audio = { path = "../../crates/openasr-system-audio" }

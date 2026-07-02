@@ -1,0 +1,95 @@
+---
+license: {{license_yaml}}
+base_model: {{upstream_repo}}
+pipeline_tag: automatic-speech-recognition
+library_name: openasr
+tags:
+  - automatic-speech-recognition
+  - speech-to-text
+  - openasr
+  - oasr
+  - {{pull_alias}}
+---
+
+<div align="center">
+
+# {{model_display_name}} · OpenASR
+
+**{{tagline}}**
+
+[![License](https://img.shields.io/badge/license-{{license_badge}}-2563eb.svg)]({{upstream_license_link}})
+[![Format](https://img.shields.io/badge/format-.oasr-7c3aed.svg)](https://github.com/QuintinShaw/openasr)
+[![Runtime](https://img.shields.io/badge/runtime-OpenASR-111827.svg)](https://openasr.org)
+[![Base model](https://img.shields.io/badge/base-{{upstream_badge}}-f59e0b.svg)]({{upstream_link}})
+
+Native speech-to-text in the **[OpenASR](https://github.com/QuintinShaw/openasr)** runtime —
+engineered for peak performance on CPU & GPU, **no Python at inference time**.
+
+</div>
+
+---
+
+## ✨ Highlights
+
+{{highlights_block}}
+
+## 🚀 Quickstart
+
+```bash
+# 1. Install the OpenASR CLI  ·  https://openasr.org
+# 2. Pull a build (pick a quant — see the table below)
+{{pull_recommended}}
+
+# 3. Transcribe
+openasr transcribe audio.wav --model {{registry_id}}
+```
+
+All builds for this model:
+
+```bash
+{{pull_lines}}
+```
+
+## 📦 Available builds
+
+| Quant | File (`.oasr`) | Size | RAM peak | RTF · M1 CPU | RTF · M1 GPU | JFK ΔWER vs fp16 |
+|:------|:---------------|-----:|---------:|-------------:|-------------:|-----------------:|
+{{perf_table_rows}}
+
+<sub>RTF = real-time factor on the fixed 11s JFK clip (**lower is faster**); RAM peak measured per pack
+in an isolated subprocess. JFK ΔWER compares each quantized build's JFK transcript to this model's
+fp16 JFK transcript, so it measures quantization drift rather than absolute recognition accuracy.
+**{{recommended_quant}}** is the recommended default — near-reference quality at a fraction of the
+footprint.</sub>
+
+## 🧠 About {{model_display_name}}
+
+{{intro}}
+
+## ⚙️ How these packs were made
+
+Converted from [{{upstream_repo}}]({{upstream_link}}) with the OpenASR importer:
+
+```bash
+openasr model-pack {{import_subcommand}} <src> <out>.oasr \
+  --package-id {{registry_id}} --quantization {fp16,q8-0,q4-k}
+```
+
+The `.oasr` container is GGUF-backed; packs use zero-copy mmap weight binding and graph
+buffer reuse to keep peak memory low.
+
+## ⚖️ License
+
+These packs **inherit the upstream model's license: {{upstream_license_id}}**
+([source]({{upstream_license_link}})). OpenASR packaging retains the upstream copyright and
+NOTICE; the only modifications are format conversion and quantization.
+
+## 🙏 Acknowledgements
+
+{{acknowledgement_block}}
+
+## 🔗 Links
+
+- 🦀 **OpenASR** — <https://github.com/QuintinShaw/openasr>
+- 🌐 **Website** — <https://openasr.org>
+- 🤗 **Upstream model** — [{{upstream_repo}}]({{upstream_link}})

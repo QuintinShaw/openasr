@@ -1,0 +1,15 @@
+[package]
+name = "openasr-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Client-side trust primitives for connecting to a remote OpenASR compute server: trust-on-first-use TLS certificate-fingerprint pinning."
+
+[dependencies]
+openasr-core.workspace = true
+# Mirror the desktop client's exact rustls config (ring-only, no aws-lc-rs) so
+# feature unification keeps the client dependency graph lean. Do NOT inherit the
+# workspace rustls (its default features pull aws-lc-rs).
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }

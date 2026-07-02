@@ -1,0 +1,1865 @@
+use std::{
+    cmp::Ordering,
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::{
+    atomic_file, catalog_security,
+    catalog_series::{CatalogSeriesSpec, catalog_series_spec},
+    config::DEFAULT_MODEL_ID,
+    http,
+};
+
+mod resolution;
+mod validation;
+
+const DEFAULT_CATALOG_URL: &str = "https://catalog.openasr.org/v1/catalog.json";
+const SUPPORTED_CATALOG_SCHEMA_VERSION: u32 = 1;
+// Single source of truth for the canonical Hugging Face host: the same constant
+// the transport-rewrite layer keys off (`http::HUGGING_FACE_HOST`), so the host
+// we build weight URLs against and the host the catalog endpoint rewrites away
+// from can never drift apart.
+const HUGGING_FACE_BASE_URL: &str = crate::http::HUGGING_FACE_HOST;
+const CATALOG_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const CATALOG_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+pub const CATALOG_FEATURE_SPEAKER_DIARIZATION: &str = "speaker-diarization";
+const CATALOG_SPEAKER_EMBEDDER_WESPEAKER_ID: &str = "wespeaker-voxceleb-resnet34-lm";
+// Soft-disabled for the initial public release lane. The ModelScope URL
+// validation block below stays in place so re-enabling is a one-switch decision.
+const MODELSCOPE_CATALOG_MIRRORS_ENABLED: bool = false;
+
+/// The signed **public** catalog projection compiled into the binary — the
+/// last-resort offline fallback (see [`load_embedded_signed_catalog`]) so a device
+/// that has never been online still shows the model list. This is
+/// `catalog.public.json` (the `public:true` models only — the same signed artifact
+/// served on catalog.openasr.org), NOT the full `catalog.json` (which also carries
+/// staged `public:false` entries): no unreleased model metadata ships in the
+/// binary. The path reaches the repo-root `model-registry/`: this crate is
+/// workspace-only by design (built as part of the OpenASR binary, never published
+/// standalone), so the out-of-crate `include_str!` is intentional.
+const EMBEDDED_CATALOG_JSON: &str = include_str!("../../../model-registry/catalog.public.json");
+const EMBEDDED_CATALOG_SIGNATURE_JSON: &str =
+    include_str!("../../../model-registry/catalog.public.signature.json");
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCard {
+    pub id: String,
+    #[serde(default)]
+    pub family: Option<String>,
+    #[serde(default)]
+    pub default_variant: Option<String>,
+    #[serde(default)]
+    pub variant: Option<ModelVariantMetadata>,
+    pub display_name: String,
+    #[serde(default = "default_model_backend")]
+    pub backend: String,
+    #[serde(default = "default_model_task")]
+    pub task: String,
+    pub languages: Vec<String>,
+    pub size: String,
+    #[serde(default = "default_model_recommended_hardware")]
+    pub recommended_hardware: String,
+    pub license: String,
+    #[serde(default = "default_model_features")]
+    pub features: Vec<String>,
+    #[serde(default = "default_model_quality_profile")]
+    pub quality_profile: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelVariantMetadata {
+    #[serde(default = "default_model_variant_tag")]
+    pub tag: String,
+    #[serde(default = "default_model_variant_format")]
+    pub format: String,
+    #[serde(default)]
+    pub quantization: Option<String>,
+    #[serde(default = "default_model_variant_role")]
+    pub role: Option<String>,
+}
+
+fn default_model_backend() -> String {
+    "native".to_string()
+}
+
+fn default_model_task() -> String {
+    "transcription".to_string()
+}
+
+fn default_model_recommended_hardware() -> String {
+    "CPU or Apple Silicon".to_string()
+}
+
+fn default_model_features() -> Vec<String> {
+    vec!["transcription".to_string()]
+}
+
+fn default_model_quality_profile() -> String {
+    "published-oasr".to_string()
+}
+
+fn default_model_variant_format() -> String {
+    "oasr".to_string()
+}
+
+fn default_model_variant_tag() -> String {
+    "published".to_string()
+}
+
+fn default_model_variant_role() -> Option<String> {
+    Some("default".to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRef {
+    pub family: String,
+    pub tag: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel<'a> {
+    pub card: &'a ModelCard,
+    pub requested: String,
+    pub resolved_id: String,
+    pub family: String,
+    pub tag: Option<String>,
+    pub is_default_variant: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeModelRefSource {
+    Catalog,
+    Registry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRuntimeModelRef<'a> {
+    pub card: Option<&'a ModelCard>,
+    pub requested: String,
+    pub model_id: String,
+    pub quant: Option<String>,
+    pub runtime_model_id: String,
+    pub pull: Option<String>,
+    pub source: RuntimeModelRefSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelCatalog {
+    pub schema_version: u32,
+    pub generated_at: String,
+    pub catalog_url: String,
+    pub models: Vec<CatalogModel>,
+    /// Downloadable GPU backend plugin packs (HIP / Vulkan / CUDA). A top-level
+    /// array authored from day one (design D7), distinct from `models[]`. Absent
+    /// in the catalog until the packs land (Phases 3-4); `skip_serializing_if`
+    /// keeps the signed catalog byte-identical while empty so the signature and
+    /// drift gates stay green.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<CatalogBackend>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogModel {
+    pub id: String,
+    #[serde(default)]
+    pub kind: CatalogModelKind,
+    #[serde(default)]
+    pub capability: Option<CatalogCapability>,
+    #[serde(default)]
+    pub experimental: bool,
+    pub display_name: String,
+    pub family: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub pull_alias: Option<String>,
+    pub size: String,
+    pub languages: Vec<String>,
+    #[serde(default)]
+    pub source_langs: Vec<String>,
+    #[serde(default)]
+    pub target_langs: Vec<String>,
+    #[serde(default)]
+    pub vendor: Option<String>,
+    pub license: String,
+    pub license_url: String,
+    pub license_class: LicenseClass,
+    pub hf_repo: String,
+    pub hf_revision: String,
+    #[serde(default)]
+    pub public: bool,
+    pub min_cli_version: String,
+    // Denormalized signed-catalog wire fields derived from
+    // tooling/publish-model/models-core.toml:recommended_quant. Keep all three:
+    // Rust pull defaults consume recommended_quant, web/desktop use
+    // quants[].recommended, and pull_recommended is the display/copyable token.
+    pub recommended_quant: String,
+    pub pull_recommended: String,
+    #[serde(default)]
+    pub prose: Option<CatalogProse>,
+    pub quants: Vec<CatalogQuant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CatalogModelKind {
+    #[default]
+    AsrModel,
+    CapabilityPack,
+    TranslationModel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogCapability {
+    pub feature: String,
+    pub role: CatalogCapabilityRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CatalogCapabilityRole {
+    SpeakerEmbedder,
+    SpeakerSegmenter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LicenseClass {
+    Permissive,
+    Noncommercial,
+    Gated,
+}
+
+/// Whether the running build can use a catalog model, derived from its
+/// `min_cli_version`. Models needing a newer OpenASR than the current build are
+/// surfaced in listings as [`ModelAvailability::RequiresUpdate`] (not hidden) and
+/// refused only at pull time — so an older client still *sees* newer models with a
+/// clear "update to use" signal instead of a missing entry or a failed catalog load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelAvailability {
+    /// This build satisfies the model's `min_cli_version`.
+    Available,
+    /// The model needs a newer OpenASR than the running build.
+    RequiresUpdate {
+        min_cli_version: String,
+        current_cli_version: String,
+    },
+}
+
+/// The OpenASR version of the running build (`CARGO_PKG_VERSION`), used to gate
+/// catalog models against their `min_cli_version`.
+pub fn current_cli_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+impl CatalogModel {
+    pub fn is_market_listed(&self) -> bool {
+        self.public
+            && matches!(
+                self.kind,
+                CatalogModelKind::AsrModel | CatalogModelKind::TranslationModel
+            )
+    }
+
+    /// Classify this model against the running build's version. A malformed
+    /// `min_cli_version` (already rejected at catalog-validation time) is treated
+    /// leniently here as [`ModelAvailability::Available`].
+    ///
+    /// Consumers: the pull path uses this in-repo to refuse a too-new model
+    /// (`resolve_catalog_pull_with_profile`). The *listing* consumer — the model
+    /// market that shows a too-new model with an "update to use" badge rather than
+    /// hiding it — is the desktop/web app; it reads this
+    /// classifier (or recomputes from the serialized `min_cli_version`). The
+    /// catalog itself always loads regardless, so the app receives every model.
+    pub fn availability(&self) -> ModelAvailability {
+        match (
+            parse_semver_triplet(&self.min_cli_version),
+            parse_semver_triplet(current_cli_version()),
+        ) {
+            (Some(min), Some(current)) if current < min => ModelAvailability::RequiresUpdate {
+                min_cli_version: self.min_cli_version.clone(),
+                current_cli_version: current_cli_version().to_string(),
+            },
+            _ => ModelAvailability::Available,
+        }
+    }
+}
+
+impl ModelCatalog {
+    pub fn capability_packs_for_feature(&self, feature: &str) -> Vec<&CatalogModel> {
+        self.models
+            .iter()
+            .filter(|model| model.public)
+            .filter(|model| model.kind == CatalogModelKind::CapabilityPack)
+            .filter(|model| {
+                model
+                    .capability
+                    .as_ref()
+                    .is_some_and(|capability| capability.feature == feature)
+            })
+            .collect()
+    }
+
+    pub fn speaker_diarization_required_embedder_pack(&self) -> Option<&CatalogModel> {
+        self.speaker_diarization_embedder_pack(CATALOG_SPEAKER_EMBEDDER_WESPEAKER_ID)
+    }
+
+    fn speaker_diarization_embedder_pack(&self, model_id: &str) -> Option<&CatalogModel> {
+        self.capability_packs_for_feature(CATALOG_FEATURE_SPEAKER_DIARIZATION)
+            .into_iter()
+            .find(|model| {
+                model.id == model_id
+                    && model.capability.as_ref().is_some_and(|capability| {
+                        capability.role == CatalogCapabilityRole::SpeakerEmbedder
+                    })
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogProse {
+    #[serde(default)]
+    pub tagline: Option<String>,
+    #[serde(default)]
+    pub overview: Vec<String>,
+    #[serde(default)]
+    pub highlights: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogQuant {
+    pub quant: String,
+    pub suffix: String,
+    pub pull: String,
+    pub filename: String,
+    pub url: String,
+    #[serde(default)]
+    pub mirrors: Vec<CatalogMirror>,
+    pub sha256: String,
+    pub size_bytes: u64,
+    #[serde(default)]
+    // Generated from CatalogModel::recommended_quant, not an independent
+    // authoring source.
+    pub recommended: bool,
+    #[serde(default)]
+    pub perf: Option<CatalogQuantPerf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogMirror {
+    pub source: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogQuantPerf {
+    #[serde(default)]
+    pub rtf_cpu: Option<f64>,
+    #[serde(default)]
+    pub rtf_metal: Option<f64>,
+    #[serde(default)]
+    pub peak_rss_bytes: Option<u64>,
+    #[serde(default)]
+    pub jfk_wer_vs_fp16: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogQuantRecommendationProfile {
+    pub memory_budget_bytes: Option<u64>,
+}
+
+/// A downloadable GPU backend plugin pack (design D7: top-level `backends[]`,
+/// authored from day one, no schema_version bump). Unlike a model — one `.oasr`
+/// per quant — a backend is a SET of files staged into
+/// `OPENASR_HOME/backends/<vendor>/<version>/` and registered with the ggml
+/// backend registry at startup (with automatic CPU fallback). The type, pull
+/// path, and load path are authored now so populating the catalog with real
+/// packs (Phases 3-4) is the only later change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogBackend {
+    pub id: String,
+    pub vendor: CatalogBackendVendor,
+    /// Pack version, pinned to the ggml commit the core was built from so a
+    /// plugin is never loaded against a mismatched core ABI.
+    pub version: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Device arch hints this pack targets (HIP `gfx` ids, CUDA SM numbers).
+    /// Empty for cross-vendor (Vulkan) or CPU. Drives UI device-match, not the
+    /// load decision (the ggml registry score-ranks what actually runs).
+    #[serde(default)]
+    pub targets: Vec<String>,
+    #[serde(default)]
+    pub min_driver: Option<String>,
+    pub min_cli_version: String,
+    pub files: Vec<CatalogBackendFile>,
+}
+
+/// One file in a [`CatalogBackend`] pack: the `ggml-<vendor>` plugin, a runtime
+/// satellite DLL/shared object, or an archive extracted post-verify.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogBackendFile {
+    pub filename: String,
+    pub url: String,
+    #[serde(default)]
+    pub mirrors: Vec<CatalogMirror>,
+    pub sha256: String,
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub role: CatalogBackendFileRole,
+    /// For `role = archive`: the pack-relative directory the archive extracts
+    /// into (e.g. `rocblas/library` for the rocBLAS Tensile set). Ignored for
+    /// plugin/runtime files, which stage at the pack root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract_subdir: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CatalogBackendFileRole {
+    /// A runtime DLL/shared object staged as-is next to the plugin.
+    #[default]
+    Runtime,
+    /// The `ggml-<vendor>` plugin the registry dlopens to register the backend.
+    Plugin,
+    /// An archive (zip) whose contents are extracted (post sha256 + signature
+    /// verify) into `extract_subdir` — e.g. the rocBLAS Tensile `library/` set.
+    Archive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CatalogBackendVendor {
+    Cpu,
+    Vulkan,
+    Hip,
+    Cuda,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogPullRequest {
+    pub reference: String,
+    pub quant: Option<String>,
+    pub size: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCatalogPull {
+    pub requested: String,
+    pub model_id: String,
+    pub display_name: String,
+    pub quant: String,
+    pub suffix: String,
+    pub pull: String,
+    pub filename: String,
+    pub url: String,
+    pub mirrors: Vec<CatalogMirror>,
+    pub hf_revision: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub license: String,
+    pub license_url: String,
+    pub license_class: LicenseClass,
+}
+
+/// A resolved backend-pack pull: the pack identity plus the files to download
+/// into `OPENASR_HOME/backends/<vendor>/<version>/`. The download orchestration
+/// fetches each file (sha256-verified, then [`crate::pull::preflight_backend_file`]),
+/// and archive files extract into their `extract_subdir`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedCatalogBackendPull {
+    pub backend_id: String,
+    pub vendor: CatalogBackendVendor,
+    pub version: String,
+    pub display_name: String,
+    pub files: Vec<CatalogBackendFile>,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum BackendResolutionError {
+    #[error("The catalog declares no downloadable backends.")]
+    NoBackends,
+    #[error("Unknown backend '{reference}'. Available backends: {available}.")]
+    UnknownBackend {
+        reference: String,
+        available: String,
+    },
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ModelResolutionError {
+    #[error("Invalid model reference '{0}'. Use model or model:tag.")]
+    InvalidRef(String),
+    #[error("Unknown model: {0}\nRun `openasr list` to see available models.")]
+    UnknownModel(String),
+    #[error(
+        "Model family '{family}' does not have variant tag '{tag}'. Available tags: {available_tags}."
+    )]
+    UnknownVariantTag {
+        family: String,
+        tag: String,
+        available_tags: String,
+    },
+    #[error(
+        "Model reference '{model_ref}' is ambiguous. Use an explicit tag such as one of: {available_refs}."
+    )]
+    AmbiguousModelRef {
+        model_ref: String,
+        available_refs: String,
+    },
+    #[error(
+        "Model family '{family}' has default variant '{default_variant}', but no matching registry card was found."
+    )]
+    MissingDefaultVariant {
+        family: String,
+        default_variant: String,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum RegistryError {
+    #[error("Model registry directory was not found: {0}")]
+    MissingDirectory(PathBuf),
+    #[error("Could not read model registry directory '{path}': {source}")]
+    ReadDirectory {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Could not read model card '{path}': {source}")]
+    ReadCard {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Could not parse model card '{path}': {source}")]
+    ParseCard {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("Invalid model card '{path}': {message}")]
+    ValidateCard { path: PathBuf, message: String },
+    #[error("Invalid model registry: duplicate model id '{model_id}'")]
+    DuplicateModelId { model_id: String },
+    #[error("Invalid model registry: duplicate variant '{family}:{tag}'")]
+    DuplicateVariant { family: String, tag: String },
+    #[error(
+        "Invalid model registry: family '{family}' default_variant '{default_variant}' does not match any variant tag"
+    )]
+    MissingDefaultVariant {
+        family: String,
+        default_variant: String,
+    },
+    #[error(
+        "Invalid model registry: family '{family}' has conflicting default_variant values: '{left}' and '{right}'"
+    )]
+    ConflictingDefaultVariant {
+        family: String,
+        left: String,
+        right: String,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum CatalogError {
+    #[error(
+        "Unsupported model catalog schema_version {found}; update OpenASR to read this catalog."
+    )]
+    UnsupportedSchema { found: u32 },
+    #[error("Could not read model catalog '{catalog_source}': {message}")]
+    ReadCatalog {
+        catalog_source: String,
+        message: String,
+    },
+    #[error("Could not parse model catalog '{catalog_source}': {source_error}")]
+    ParseCatalog {
+        catalog_source: String,
+        #[source]
+        source_error: serde_json::Error,
+    },
+    #[error("Could not cache model catalog at '{path}': {source}")]
+    CacheCatalog {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Could not create OpenASR home directory '{path}': {source}")]
+    CreateHome {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Model catalog security check failed for '{catalog_source}': {message}")]
+    CatalogSecurity {
+        catalog_source: String,
+        message: String,
+    },
+    #[error("Invalid model catalog: {0}")]
+    InvalidCatalog(String),
+    #[error(
+        "Invalid pull reference '{0}'. Use <id> or <id>:<quant>, for example moonshine-tiny:q8."
+    )]
+    InvalidPullReference(String),
+    #[error("Model '{reference}' was not found in the model catalog.")]
+    UnknownModel { reference: String },
+    #[error(
+        "Model '{model_id}' requires OpenASR >= {min_cli_version} (this build is {current_cli_version}). Update OpenASR to use it."
+    )]
+    ModelRequiresNewerCli {
+        model_id: String,
+        min_cli_version: String,
+        current_cli_version: String,
+    },
+    #[error("Model reference '{reference}' is ambiguous. Use one of: {available}.")]
+    AmbiguousModelRef {
+        reference: String,
+        available: String,
+    },
+    #[error("Model '{model_id}' does not provide quant '{quant}'. Available pulls: {available}.")]
+    UnknownQuant {
+        model_id: String,
+        quant: String,
+        available: String,
+    },
+    #[error(
+        "Catalog model '{model_id}' has recommended_quant '{quant}', but no matching quant entry."
+    )]
+    MissingRecommendedQuant { model_id: String, quant: String },
+    #[error(
+        "Conflicting quant selection: reference requested '{reference_quant}' but --quant requested '{option_quant}'."
+    )]
+    ConflictingQuant {
+        reference_quant: String,
+        option_quant: String,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum RuntimeModelResolutionError {
+    #[error(transparent)]
+    Registry(#[from] ModelResolutionError),
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
+}
+
+pub fn default_registry_dir() -> PathBuf {
+    let from_cwd = PathBuf::from("model-registry/models");
+    if from_cwd.exists() {
+        return from_cwd;
+    }
+
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry/models")
+}
+
+pub fn default_catalog_url() -> &'static str {
+    DEFAULT_CATALOG_URL
+}
+
+// PARITY: must match the desktop TypeScript client's `canonicalQuantTag` exactly.
+pub fn canonical_quant_tag(tag: &str) -> &str {
+    match tag.trim() {
+        "q8" | "q8_0" => "q8_0",
+        "q4" | "q4_k" | "q4_k_m" => "q4_k",
+        "q3" | "q3_k" => "q3_k",
+        "fp16" => "fp16",
+        other => other,
+    }
+}
+
+// PARITY: keep in lockstep with the desktop TypeScript client's `recommendedQuantForDevice`.
+// Same contract: pick the
+// highest-quality quant (fp16 > q8_0 > q4_k) whose peak RSS fits the budget,
+// else the catalog default.
+pub fn recommend_catalog_quant(
+    model: &CatalogModel,
+    profile: CatalogQuantRecommendationProfile,
+) -> Result<&CatalogQuant, CatalogError> {
+    let recommended = resolve_catalog_quant(model, None)?;
+    let Some(memory_budget_bytes) = profile.memory_budget_bytes.filter(|budget| *budget > 0) else {
+        return Ok(recommended);
+    };
+    let Some(recommended_peak_rss) = catalog_quant_peak_rss_bytes(recommended) else {
+        return Ok(recommended);
+    };
+    if recommended_peak_rss <= memory_budget_bytes {
+        return Ok(recommended);
+    }
+
+    Ok(model
+        .quants
+        .iter()
+        .filter(|quant| {
+            catalog_quant_peak_rss_bytes(quant)
+                .is_some_and(|peak_rss| peak_rss <= memory_budget_bytes)
+        })
+        .max_by(|left, right| {
+            catalog_quant_quality_rank(left)
+                .cmp(&catalog_quant_quality_rank(right))
+                .then_with(|| {
+                    catalog_quant_peak_rss_bytes(right).cmp(&catalog_quant_peak_rss_bytes(left))
+                })
+        })
+        .unwrap_or(recommended))
+}
+
+pub fn default_catalog_cache_path(openasr_home: impl AsRef<Path>) -> PathBuf {
+    openasr_home.as_ref().join("catalog.json")
+}
+
+pub fn load_model_catalog(
+    catalog_url: Option<&str>,
+    openasr_home: impl AsRef<Path>,
+) -> Result<ModelCatalog, CatalogError> {
+    let home = openasr_home.as_ref();
+    let cache_path = default_catalog_cache_path(home);
+    let source = catalog_url.unwrap_or(DEFAULT_CATALOG_URL);
+
+    if catalog_source_requires_signature(source) {
+        match read_catalog_source(source) {
+            Ok(contents) => match read_and_verify_catalog_manifest(source, home, &contents) {
+                Ok(verified) => {
+                    let catalog = parse_model_catalog(&contents, source)?;
+                    cache_catalog(home, &cache_path, &contents)?;
+                    cache_catalog_security(
+                        home,
+                        &verified.manifest_contents,
+                        verified.catalog_epoch,
+                    )?;
+                    Ok(catalog)
+                }
+                Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
+            },
+            Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
+        }
+    } else {
+        match read_catalog_source(source) {
+            Ok(contents) => {
+                let catalog = parse_model_catalog(&contents, source)?;
+                cache_catalog(home, &cache_path, &contents)?;
+                Ok(catalog)
+            }
+            Err(error) => load_cached_catalog(source, &cache_path, error),
+        }
+    }
+}
+
+pub fn parse_model_catalog(contents: &str, source: &str) -> Result<ModelCatalog, CatalogError> {
+    let catalog: ModelCatalog =
+        serde_json::from_str(contents).map_err(|source_error| CatalogError::ParseCatalog {
+            catalog_source: source.to_string(),
+            source_error,
+        })?;
+    validate_model_catalog(&catalog)?;
+    Ok(catalog)
+}
+
+pub fn resolve_catalog_pull(
+    catalog: &ModelCatalog,
+    request: &CatalogPullRequest,
+) -> Result<ResolvedCatalogPull, CatalogError> {
+    resolve_catalog_pull_with_profile(catalog, request, None)
+}
+
+/// Resolve a backend reference (the backend `id`) against the catalog's
+/// `backends[]` to the pack to download. Errors list the available backend ids
+/// so a typo gets an actionable message, mirroring model resolution.
+pub fn resolve_catalog_backend_pull(
+    catalog: &ModelCatalog,
+    reference: &str,
+) -> Result<ResolvedCatalogBackendPull, BackendResolutionError> {
+    if catalog.backends.is_empty() {
+        return Err(BackendResolutionError::NoBackends);
+    }
+    let reference = reference.trim();
+    let backend = catalog
+        .backends
+        .iter()
+        .find(|backend| backend.id == reference)
+        .ok_or_else(|| BackendResolutionError::UnknownBackend {
+            reference: reference.to_string(),
+            available: catalog
+                .backends
+                .iter()
+                .map(|backend| backend.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        })?;
+    Ok(ResolvedCatalogBackendPull {
+        backend_id: backend.id.clone(),
+        vendor: backend.vendor,
+        version: backend.version.clone(),
+        display_name: backend.display_name.clone(),
+        files: backend.files.clone(),
+    })
+}
+
+/// Like [`resolve_catalog_pull`], but when the request carries no explicit quant
+/// and `device_profile` is `Some`, the default quant becomes the device-recommended
+/// one (the largest quant whose peak RSS fits the budget) instead of the catalog's
+/// static `recommended_quant`. An explicit `:quant` / `--quant` always wins.
+pub fn resolve_catalog_pull_with_profile(
+    catalog: &ModelCatalog,
+    request: &CatalogPullRequest,
+    device_profile: Option<CatalogQuantRecommendationProfile>,
+) -> Result<ResolvedCatalogPull, CatalogError> {
+    let requested = request.reference.trim();
+    if requested.is_empty() {
+        return Err(CatalogError::InvalidPullReference(
+            request.reference.clone(),
+        ));
+    }
+    let (model_ref, reference_quant) = parse_catalog_pull_reference(requested)?;
+    let quant_ref = match (
+        reference_quant,
+        request
+            .quant
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        (Some(left), Some(right)) => {
+            if canonical_quant_tag(left) != canonical_quant_tag(right) {
+                return Err(CatalogError::ConflictingQuant {
+                    reference_quant: left.to_string(),
+                    option_quant: right.to_string(),
+                });
+            }
+            Some(canonical_quant_tag(left).to_string())
+        }
+        (Some(value), _) | (_, Some(value)) => Some(canonical_quant_tag(value).to_string()),
+        (None, None) => None,
+    };
+    let model = resolve_catalog_model(catalog, model_ref, request.size.as_deref())?;
+    // Forward-compat gate: the catalog lists models newer than this build can run
+    // (so the market can surface them as "update to use"), but actually pulling one
+    // is refused with a clear message rather than downloading a pack we can't load.
+    if let ModelAvailability::RequiresUpdate {
+        min_cli_version,
+        current_cli_version,
+    } = model.availability()
+    {
+        return Err(CatalogError::ModelRequiresNewerCli {
+            model_id: model.id.clone(),
+            min_cli_version,
+            current_cli_version,
+        });
+    }
+    let quant = match (quant_ref.as_deref(), device_profile) {
+        // No explicit quant + a device profile: pick the device-recommended quant.
+        (None, Some(profile)) => recommend_catalog_quant(model, profile)?,
+        // Explicit quant, or no profile: keep the static catalog default behavior.
+        (explicit, _) => resolve_catalog_quant(model, explicit)?,
+    };
+
+    Ok(ResolvedCatalogPull {
+        requested: requested.to_string(),
+        model_id: model.id.clone(),
+        display_name: model.display_name.clone(),
+        quant: quant.quant.clone(),
+        suffix: quant.suffix.clone(),
+        pull: quant.pull.clone(),
+        filename: quant.filename.clone(),
+        url: quant.url.clone(),
+        mirrors: quant.mirrors.clone(),
+        hf_revision: model.hf_revision.clone(),
+        sha256: quant.sha256.clone(),
+        size_bytes: quant.size_bytes,
+        license: model.license.clone(),
+        license_url: model.license_url.clone(),
+        license_class: model.license_class.clone(),
+    })
+}
+
+pub fn load_registry(path: impl AsRef<Path>) -> Result<Vec<ModelCard>, RegistryError> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Err(RegistryError::MissingDirectory(path.to_path_buf()));
+    }
+
+    let entries = fs::read_dir(path).map_err(|source| RegistryError::ReadDirectory {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut cards = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|source| RegistryError::ReadDirectory {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let card_path = entry.path();
+        if card_path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+            continue;
+        }
+
+        let contents =
+            fs::read_to_string(&card_path).map_err(|source| RegistryError::ReadCard {
+                path: card_path.clone(),
+                source,
+            })?;
+        let card: ModelCard =
+            toml::from_str(&contents).map_err(|source| RegistryError::ParseCard {
+                path: card_path.clone(),
+                source,
+            })?;
+        validation::validate_card(&card_path, &card)?;
+        cards.push(card);
+    }
+
+    cards.sort_by(|left: &ModelCard, right| {
+        match (
+            left.id.as_str() == DEFAULT_MODEL_ID,
+            right.id.as_str() == DEFAULT_MODEL_ID,
+        ) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => left.id.cmp(&right.id),
+        }
+    });
+    validation::validate_unique_ids(&cards)?;
+    validation::validate_variant_index(&cards)?;
+    Ok(cards)
+}
+
+fn read_catalog_source(source: &str) -> Result<String, CatalogError> {
+    if let Some(path) = source.strip_prefix("file://") {
+        return fs::read_to_string(path).map_err(|error| CatalogError::ReadCatalog {
+            catalog_source: source.to_string(),
+            message: error.to_string(),
+        });
+    }
+
+    if source.starts_with("https://") {
+        let client = http::blocking_client(CATALOG_HTTP_CONNECT_TIMEOUT, CATALOG_HTTP_TIMEOUT)
+            .map_err(|error| CatalogError::ReadCatalog {
+                catalog_source: source.to_string(),
+                message: http::error_message(&error),
+            })?;
+        // The catalog (and its sibling signature manifest, which also flows
+        // through this function) is served from the OpenASR catalog endpoint
+        // (Cloudflare), never Hugging Face. Only the transport host is rewritten:
+        // `source` stays the canonical, signed catalog_url everywhere it feeds
+        // verification (see `read_and_verify_catalog_manifest`), so a proxy cannot
+        // substitute a tampered catalog. Unlike weight downloads (pull.rs), the
+        // catalog uses a redirect-following client and the endpoint serves bytes
+        // directly, so the per-hop CDN rewrite used by weight downloads is
+        // deliberately NOT applied here.
+        let response = client
+            .get(http::apply_catalog_endpoint(source).as_str())
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| CatalogError::ReadCatalog {
+                catalog_source: source.to_string(),
+                message: http::error_message(&error),
+            })?;
+        return response.text().map_err(|error| CatalogError::ReadCatalog {
+            catalog_source: source.to_string(),
+            message: http::error_message(&error),
+        });
+    }
+
+    if source.starts_with("http://") {
+        return Err(CatalogError::ReadCatalog {
+            catalog_source: source.to_string(),
+            message: "catalog URLs must use https://; http:// is not accepted".to_string(),
+        });
+    }
+
+    fs::read_to_string(source).map_err(|error| CatalogError::ReadCatalog {
+        catalog_source: source.to_string(),
+        message: error.to_string(),
+    })
+}
+
+struct VerifiedCatalogManifestContents {
+    manifest_contents: String,
+    catalog_epoch: u64,
+}
+
+fn catalog_source_requires_signature(source: &str) -> bool {
+    source.starts_with("https://")
+}
+
+fn read_and_verify_catalog_manifest(
+    source: &str,
+    home: &Path,
+    contents: &str,
+) -> Result<VerifiedCatalogManifestContents, CatalogError> {
+    let manifest_source = catalog_security::catalog_signature_source(source);
+    let manifest_contents =
+        read_catalog_source(&manifest_source).map_err(|error| CatalogError::CatalogSecurity {
+            catalog_source: source.to_string(),
+            message: error.to_string(),
+        })?;
+    let verified = match catalog_security::verify_catalog_signature_manifest(
+        contents,
+        &manifest_contents,
+        source,
+    ) {
+        Ok(verified) => verified,
+        Err(error) => {
+            return Err(CatalogError::CatalogSecurity {
+                catalog_source: source.to_string(),
+                message: error.to_string(),
+            });
+        }
+    };
+    catalog_security::enforce_catalog_epoch(home, verified.catalog_epoch).map_err(|error| {
+        CatalogError::CatalogSecurity {
+            catalog_source: source.to_string(),
+            message: error.to_string(),
+        }
+    })?;
+    Ok(VerifiedCatalogManifestContents {
+        manifest_contents,
+        catalog_epoch: verified.catalog_epoch,
+    })
+}
+
+fn load_cached_catalog(
+    source: &str,
+    cache_path: &Path,
+    error: CatalogError,
+) -> Result<ModelCatalog, CatalogError> {
+    let cached =
+        fs::read_to_string(cache_path).map_err(|cache_error| CatalogError::ReadCatalog {
+            catalog_source: source.to_string(),
+            message: format!(
+                "{error}; no usable cache at '{}': {cache_error}",
+                cache_path.display()
+            ),
+        })?;
+    parse_model_catalog(&cached, &cache_path.display().to_string())
+}
+
+fn load_cached_signed_catalog(
+    source: &str,
+    home: &Path,
+    cache_path: &Path,
+    error: CatalogError,
+) -> Result<ModelCatalog, CatalogError> {
+    match load_signed_catalog_from_cache(source, home, cache_path, &error) {
+        Ok(catalog) => Ok(catalog),
+        Err(cache_error) => {
+            // Final tier: the signed catalog snapshot compiled into the binary, so
+            // a fresh *offline* install with no network and no on-disk cache still
+            // shows the (signature-verified) model list. Scoped to the canonical
+            // default catalog — an explicit OPENASR_CATALOG_URL override is honoured,
+            // not silently replaced with the bundled official catalog.
+            if source == DEFAULT_CATALOG_URL
+                && let Ok(catalog) = load_embedded_signed_catalog(home)
+            {
+                return Ok(catalog);
+            }
+            Err(cache_error)
+        }
+    }
+}
+
+fn load_signed_catalog_from_cache(
+    source: &str,
+    home: &Path,
+    cache_path: &Path,
+    error: &CatalogError,
+) -> Result<ModelCatalog, CatalogError> {
+    let cached =
+        fs::read_to_string(cache_path).map_err(|cache_error| CatalogError::ReadCatalog {
+            catalog_source: source.to_string(),
+            message: format!(
+                "{error}; no usable signed cache at '{}': {cache_error}",
+                cache_path.display()
+            ),
+        })?;
+    read_and_verify_cached_catalog_manifest(source, home, &cached, error)?;
+    parse_model_catalog(&cached, &cache_path.display().to_string())
+}
+
+/// Load the signed catalog snapshot embedded in the binary at build time. Used as
+/// the last-resort offline fallback (after the network source and the on-disk
+/// cache) so a device that has never been online still sees the model list. The
+/// embedded bytes are signature-verified against the canonical [`DEFAULT_CATALOG_URL`]
+/// and run through the same epoch-rollback guard as any other source, so a stale
+/// snapshot can never downgrade a newer catalog the device already cached.
+fn load_embedded_signed_catalog(home: &Path) -> Result<ModelCatalog, CatalogError> {
+    let verified = catalog_security::verify_catalog_signature_manifest(
+        EMBEDDED_CATALOG_JSON,
+        EMBEDDED_CATALOG_SIGNATURE_JSON,
+        DEFAULT_CATALOG_URL,
+    )
+    .map_err(|error| CatalogError::CatalogSecurity {
+        catalog_source: DEFAULT_CATALOG_URL.to_string(),
+        message: format!("embedded catalog rejected: {error}"),
+    })?;
+    catalog_security::enforce_catalog_epoch(home, verified.catalog_epoch).map_err(|error| {
+        CatalogError::CatalogSecurity {
+            catalog_source: DEFAULT_CATALOG_URL.to_string(),
+            message: format!("embedded catalog rejected: {error}"),
+        }
+    })?;
+    parse_model_catalog(EMBEDDED_CATALOG_JSON, "<embedded catalog>")
+}
+
+fn read_and_verify_cached_catalog_manifest(
+    source: &str,
+    home: &Path,
+    cached: &str,
+    original_error: &CatalogError,
+) -> Result<(), CatalogError> {
+    let manifest_path = catalog_security::default_catalog_signature_cache_path(home);
+    let manifest_contents =
+        fs::read_to_string(&manifest_path).map_err(|cache_error| CatalogError::ReadCatalog {
+            catalog_source: source.to_string(),
+            message: format!(
+                "{original_error}; no usable signed cache manifest at '{}': {cache_error}",
+                manifest_path.display()
+            ),
+        })?;
+    let verified =
+        catalog_security::verify_catalog_signature_manifest(cached, &manifest_contents, source)
+            .map_err(|error| CatalogError::CatalogSecurity {
+                catalog_source: source.to_string(),
+                message: format!("{original_error}; cached catalog rejected: {error}"),
+            })?;
+    catalog_security::enforce_catalog_epoch(home, verified.catalog_epoch).map_err(|error| {
+        CatalogError::CatalogSecurity {
+            catalog_source: source.to_string(),
+            message: format!("{original_error}; cached catalog rejected: {error}"),
+        }
+    })
+}
+
+fn cache_catalog(home: &Path, cache_path: &Path, contents: &str) -> Result<(), CatalogError> {
+    fs::create_dir_all(home).map_err(|source| CatalogError::CreateHome {
+        path: home.to_path_buf(),
+        source,
+    })?;
+    atomic_file::write_file_atomically(cache_path, contents.as_bytes()).map_err(|source| {
+        CatalogError::CacheCatalog {
+            path: cache_path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+fn cache_catalog_security(
+    home: &Path,
+    manifest_contents: &str,
+    catalog_epoch: u64,
+) -> Result<(), CatalogError> {
+    catalog_security::cache_catalog_manifest(home, manifest_contents).map_err(|error| {
+        CatalogError::CatalogSecurity {
+            catalog_source: catalog_security::default_catalog_signature_cache_path(home)
+                .display()
+                .to_string(),
+            message: error.to_string(),
+        }
+    })?;
+    catalog_security::record_catalog_epoch(home, catalog_epoch).map_err(|error| {
+        CatalogError::CatalogSecurity {
+            catalog_source: catalog_security::default_catalog_epoch_path(home)
+                .display()
+                .to_string(),
+            message: error.to_string(),
+        }
+    })
+}
+
+fn validate_model_catalog(catalog: &ModelCatalog) -> Result<(), CatalogError> {
+    if catalog.schema_version != SUPPORTED_CATALOG_SCHEMA_VERSION {
+        return Err(CatalogError::UnsupportedSchema {
+            found: catalog.schema_version,
+        });
+    }
+    if catalog.models.is_empty() {
+        return Err(CatalogError::InvalidCatalog(
+            "catalog must contain at least one model".to_string(),
+        ));
+    }
+    for model in &catalog.models {
+        if model.id.trim().is_empty() {
+            return Err(CatalogError::InvalidCatalog(
+                "model id must not be empty".to_string(),
+            ));
+        }
+        validate_catalog_model_kind(model)?;
+        validate_catalog_hf_repo(model)?;
+        validate_catalog_min_cli_version_format(model)?;
+        if model.hf_revision.len() != 40
+            || !model
+                .hf_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "model '{}' hf_revision must be a 40 hex character commit sha",
+                model.id
+            )));
+        }
+        if model.quants.is_empty() {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "model '{}' must contain at least one quant",
+                model.id
+            )));
+        }
+        if !model
+            .quants
+            .iter()
+            .any(|quant| quant.quant == model.recommended_quant)
+        {
+            return Err(CatalogError::MissingRecommendedQuant {
+                model_id: model.id.clone(),
+                quant: model.recommended_quant.clone(),
+            });
+        }
+        for quant in &model.quants {
+            if quant.quant.trim().is_empty()
+                || quant.suffix.trim().is_empty()
+                || quant.pull.trim().is_empty()
+            {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "model '{}' contains an empty quant selector",
+                    model.id
+                )));
+            }
+            if quant.pull != format!("{}:{}", model.id, quant.suffix) {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "model '{}' quant '{}' pull must be '<id>:<suffix>'",
+                    model.id, quant.quant
+                )));
+            }
+            if quant.filename.contains('/')
+                || quant.filename.contains('\\')
+                || !quant.filename.ends_with(".oasr")
+            {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "model '{}' quant '{}' filename must be a local .oasr basename",
+                    model.id, quant.quant
+                )));
+            }
+            if quant.size_bytes == 0 {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "model '{}' quant '{}' size_bytes must be greater than zero",
+                    model.id, quant.quant
+                )));
+            }
+            if !quant.url.starts_with("https://") {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "model '{}' quant '{}' URL must use https://",
+                    model.id, quant.quant
+                )));
+            }
+            let expected_url = format!(
+                "{HUGGING_FACE_BASE_URL}{}/resolve/{}/{}",
+                model.hf_repo, model.hf_revision, quant.filename
+            );
+            if quant.url != expected_url {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "model '{}' quant '{}' URL must be pinned to hf_repo, hf_revision, and filename",
+                    model.id, quant.quant
+                )));
+            }
+            for mirror in &quant.mirrors {
+                validate_catalog_mirror_url(model, quant, mirror)?;
+            }
+            if quant.sha256.len() != 64
+                || !quant.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "model '{}' quant '{}' sha256 must be 64 hex characters",
+                    model.id, quant.quant
+                )));
+            }
+        }
+    }
+    for backend in &catalog.backends {
+        validate_catalog_backend(backend)?;
+    }
+    Ok(())
+}
+
+/// Validate a downloadable backend pack entry: identity fields present, a
+/// MAJOR.MINOR.PATCH gate, exactly one plugin file, and per-file integrity
+/// (local basename, https URL, non-zero size, 64-hex sha256). Archive files must
+/// declare a safe relative `extract_subdir` (no absolute / `..` traversal); the
+/// other roles must not. Mirrors the model-quant checks above.
+fn validate_catalog_backend(backend: &CatalogBackend) -> Result<(), CatalogError> {
+    if backend.id.trim().is_empty() {
+        return Err(CatalogError::InvalidCatalog(
+            "backend id must not be empty".to_string(),
+        ));
+    }
+    if backend.version.trim().is_empty() {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "backend '{}' version must not be empty",
+            backend.id
+        )));
+    }
+    if backend.display_name.trim().is_empty() {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "backend '{}' display_name must not be empty",
+            backend.id
+        )));
+    }
+    if parse_semver_triplet(&backend.min_cli_version).is_none() {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "backend '{}' min_cli_version must be MAJOR.MINOR.PATCH",
+            backend.id
+        )));
+    }
+    if backend.files.is_empty() {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "backend '{}' must contain at least one file",
+            backend.id
+        )));
+    }
+    let plugin_count = backend
+        .files
+        .iter()
+        .filter(|file| file.role == CatalogBackendFileRole::Plugin)
+        .count();
+    if plugin_count != 1 {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "backend '{}' must declare exactly one plugin file (found {plugin_count})",
+            backend.id
+        )));
+    }
+    let mut seen_filenames = std::collections::BTreeSet::new();
+    for file in &backend.files {
+        if file.filename.trim().is_empty()
+            || file.filename.contains('/')
+            || file.filename.contains('\\')
+        {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "backend '{}' file name '{}' must be a non-empty local basename",
+                backend.id, file.filename
+            )));
+        }
+        if !seen_filenames.insert(file.filename.as_str()) {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "backend '{}' declares duplicate file '{}'",
+                backend.id, file.filename
+            )));
+        }
+        if !file.url.starts_with("https://") {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "backend '{}' file '{}' URL must use https://",
+                backend.id, file.filename
+            )));
+        }
+        if file.size_bytes == 0 {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "backend '{}' file '{}' size_bytes must be greater than zero",
+                backend.id, file.filename
+            )));
+        }
+        if file.sha256.len() != 64 || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "backend '{}' file '{}' sha256 must be 64 hex characters",
+                backend.id, file.filename
+            )));
+        }
+        match file.role {
+            CatalogBackendFileRole::Archive => {
+                let subdir = file.extract_subdir.as_deref().unwrap_or("").trim();
+                if subdir.is_empty() {
+                    return Err(CatalogError::InvalidCatalog(format!(
+                        "backend '{}' archive '{}' must declare extract_subdir",
+                        backend.id, file.filename
+                    )));
+                }
+                let unsafe_path = subdir.starts_with('/')
+                    || subdir.starts_with('\\')
+                    || subdir.contains(':')
+                    || subdir
+                        .split(['/', '\\'])
+                        .any(|component| component.is_empty() || component == "..");
+                if unsafe_path {
+                    return Err(CatalogError::InvalidCatalog(format!(
+                        "backend '{}' archive '{}' extract_subdir must be a safe relative path",
+                        backend.id, file.filename
+                    )));
+                }
+            }
+            CatalogBackendFileRole::Plugin | CatalogBackendFileRole::Runtime => {
+                if file.extract_subdir.is_some() {
+                    return Err(CatalogError::InvalidCatalog(format!(
+                        "backend '{}' file '{}' has extract_subdir but is not an archive",
+                        backend.id, file.filename
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_catalog_model_kind(model: &CatalogModel) -> Result<(), CatalogError> {
+    match (model.kind, model.capability.as_ref()) {
+        (CatalogModelKind::AsrModel, None) => {
+            validate_no_translation_metadata(model)?;
+            Ok(())
+        }
+        (CatalogModelKind::AsrModel, Some(_)) => Err(CatalogError::InvalidCatalog(format!(
+            "model '{}' has capability metadata but kind is asr-model",
+            model.id
+        ))),
+        (CatalogModelKind::CapabilityPack, None) => Err(CatalogError::InvalidCatalog(format!(
+            "model '{}' is kind capability-pack but has no capability metadata",
+            model.id
+        ))),
+        (CatalogModelKind::CapabilityPack, Some(capability)) => {
+            if capability.feature.trim().is_empty() {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "model '{}' capability.feature must not be empty",
+                    model.id
+                )));
+            }
+            validate_no_translation_metadata(model)?;
+            Ok(())
+        }
+        (CatalogModelKind::TranslationModel, Some(_)) => {
+            Err(CatalogError::InvalidCatalog(format!(
+                "model '{}' has capability metadata but kind is translation-model",
+                model.id
+            )))
+        }
+        (CatalogModelKind::TranslationModel, None) => validate_translation_metadata(model),
+    }
+}
+
+fn validate_no_translation_metadata(model: &CatalogModel) -> Result<(), CatalogError> {
+    if !model.source_langs.is_empty() || !model.target_langs.is_empty() {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "model '{}' has translation metadata but kind is not translation-model",
+            model.id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_translation_metadata(model: &CatalogModel) -> Result<(), CatalogError> {
+    validate_catalog_language_list(model, "source_langs", &model.source_langs)?;
+    validate_catalog_language_list(model, "target_langs", &model.target_langs)?;
+    for source in &model.source_langs {
+        if model.target_langs.iter().any(|target| target == source) {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "model '{}' translation source_langs and target_langs must not overlap",
+                model.id
+            )));
+        }
+    }
+    for lang in model.source_langs.iter().chain(model.target_langs.iter()) {
+        if !model
+            .languages
+            .iter()
+            .any(|catalog_lang| catalog_lang == lang)
+        {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "model '{}' translation language '{lang}' must also appear in languages",
+                model.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_catalog_language_list(
+    model: &CatalogModel,
+    field: &str,
+    langs: &[String],
+) -> Result<(), CatalogError> {
+    if langs.is_empty() {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "model '{}' translation {field} must not be empty",
+            model.id
+        )));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for lang in langs {
+        if !(2..=3).contains(&lang.len()) || !lang.bytes().all(|byte| byte.is_ascii_lowercase()) {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "model '{}' translation {field} contains invalid language code '{lang}'",
+                model.id
+            )));
+        }
+        if !seen.insert(lang) {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "model '{}' translation {field} contains duplicate language code '{lang}'",
+                model.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_catalog_mirror_url(
+    model: &CatalogModel,
+    quant: &CatalogQuant,
+    mirror: &CatalogMirror,
+) -> Result<(), CatalogError> {
+    if mirror.source.trim().is_empty() {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "model '{}' quant '{}' mirror source must not be empty",
+            model.id, quant.quant
+        )));
+    }
+    if !http::is_allowed_mirror_host(&mirror.url) {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "model '{}' quant '{}' mirror URL host is not allowed",
+            model.id, quant.quant
+        )));
+    }
+    let parsed = reqwest::Url::parse(&mirror.url).map_err(|source| {
+        CatalogError::InvalidCatalog(format!(
+            "model '{}' quant '{}' mirror URL is invalid: {source}",
+            model.id, quant.quant
+        ))
+    })?;
+    let host = parsed.host_str().unwrap_or_default();
+    if mirror.source == "modelscope" && !MODELSCOPE_CATALOG_MIRRORS_ENABLED {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "model '{}' quant '{}' ModelScope mirrors are disabled; use Hugging Face with the hf-mirror download source",
+            model.id, quant.quant
+        )));
+    }
+    if matches!(host, "modelscope.cn" | "www.modelscope.cn") {
+        if !MODELSCOPE_CATALOG_MIRRORS_ENABLED {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "model '{}' quant '{}' ModelScope mirrors are disabled; use Hugging Face with the hf-mirror download source",
+                model.id, quant.quant
+            )));
+        }
+        let segments = parsed
+            .path_segments()
+            .map(|segments| segments.collect::<Vec<_>>())
+            .unwrap_or_default();
+        let (hf_owner, hf_name) = model.hf_repo.split_once('/').unwrap_or_default();
+        let modelscope_owner = hf_owner.to_ascii_lowercase();
+        let revision = segments.get(4).copied().unwrap_or_default();
+        if segments.len() != 6
+            || segments[0] != "models"
+            || segments[1] != modelscope_owner
+            || segments[2] != hf_name
+            || segments[3] != "resolve"
+            || revision.len() != 40
+            || !revision.chars().all(|ch| ch.is_ascii_hexdigit())
+            || segments[5] != quant.filename
+        {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "model '{}' quant '{}' ModelScope mirror URL must use /models/{{lowercase-hf-owner}}/{{hf-repo-name}}/resolve/{{40-hex-revision}}/{{filename}}",
+                model.id, quant.quant
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_catalog_hf_repo(model: &CatalogModel) -> Result<(), CatalogError> {
+    let mut parts = model.hf_repo.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repo = parts.next().unwrap_or_default();
+    if parts.next().is_some() || !is_safe_hf_repo_segment(owner) || !is_safe_hf_repo_segment(repo) {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "model '{}' hf_repo must use owner/repo with portable characters",
+            model.id
+        )));
+    }
+    Ok(())
+}
+
+fn is_safe_hf_repo_segment(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// Validate that `min_cli_version` is well-formed (major.minor.patch). The version
+/// *comparison* is intentionally NOT enforced here: a model requiring a newer
+/// OpenASR than the running build must still load so the model market can list it
+/// as "update to use" (see [`CatalogModel::availability`]); it is refused only at
+/// pull time (`resolve_catalog_pull_with_profile`), never hidden or fail-the-catalog.
+fn validate_catalog_min_cli_version_format(model: &CatalogModel) -> Result<(), CatalogError> {
+    if parse_semver_triplet(&model.min_cli_version).is_none() {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "model '{}' min_cli_version must use major.minor.patch",
+            model.id
+        )));
+    }
+    Ok(())
+}
+
+fn parse_semver_triplet(value: &str) -> Option<(u64, u64, u64)> {
+    let core = value
+        .trim()
+        .split_once('-')
+        .map_or(value.trim(), |(core, _)| core);
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+fn parse_catalog_pull_reference(value: &str) -> Result<(&str, Option<&str>), CatalogError> {
+    let mut parts = value.split(':');
+    let model_ref = parts.next().unwrap_or_default().trim();
+    let quant = parts.next().map(str::trim);
+    if model_ref.is_empty() || quant.is_some_and(str::is_empty) || parts.next().is_some() {
+        return Err(CatalogError::InvalidPullReference(value.to_string()));
+    }
+    Ok((model_ref, quant))
+}
+
+fn resolve_catalog_model<'a>(
+    catalog: &'a ModelCatalog,
+    model_ref: &str,
+    size: Option<&str>,
+) -> Result<&'a CatalogModel, CatalogError> {
+    let normalized = model_ref.trim();
+    let size = size.map(str::trim).filter(|value| !value.is_empty());
+    let series = catalog_series_spec(normalized);
+    let effective_size = size.or_else(|| series.map(CatalogSeriesSpec::default_size));
+    let matches: Vec<&CatalogModel> = catalog
+        .models
+        .iter()
+        .filter(|model| model.public)
+        .filter(|model| effective_size.is_none_or(|requested_size| model.size == requested_size))
+        .filter(|model| {
+            if let Some(spec) = series {
+                spec.contains_family_size(&model.family, &model.size)
+            } else {
+                model.id == normalized
+                    || model.pull_alias.as_deref() == Some(normalized)
+                    || model.aliases.iter().any(|alias| alias == normalized)
+            }
+        })
+        .collect();
+
+    match matches.as_slice() {
+        [model] => Ok(model),
+        [] => Err(CatalogError::UnknownModel {
+            reference: normalized.to_string(),
+        }),
+        many => Err(CatalogError::AmbiguousModelRef {
+            reference: normalized.to_string(),
+            available: many
+                .iter()
+                .map(|model| model.pull_recommended.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        }),
+    }
+}
+
+fn resolve_catalog_quant<'a>(
+    model: &'a CatalogModel,
+    quant_ref: Option<&str>,
+) -> Result<&'a CatalogQuant, CatalogError> {
+    let selected = quant_ref.unwrap_or(model.recommended_quant.as_str());
+    let selected_canonical = canonical_quant_tag(selected);
+    model
+        .quants
+        .iter()
+        .find(|quant| {
+            canonical_quant_tag(&quant.quant) == selected_canonical
+                || canonical_quant_tag(&quant.suffix) == selected_canonical
+                || quant.pull == selected
+        })
+        .ok_or_else(|| CatalogError::UnknownQuant {
+            model_id: model.id.clone(),
+            quant: selected_canonical.to_string(),
+            available: model
+                .quants
+                .iter()
+                .map(|quant| quant.pull.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        })
+}
+
+fn catalog_quant_peak_rss_bytes(quant: &CatalogQuant) -> Option<u64> {
+    quant
+        .perf
+        .as_ref()
+        .and_then(|perf| perf.peak_rss_bytes)
+        .filter(|value| *value > 0)
+}
+
+pub(crate) fn quant_quality_rank(quant: &str) -> u8 {
+    match canonical_quant_tag(quant) {
+        "f32" => 4,
+        "fp16" => 3,
+        "q8_0" => 2,
+        "q4_k" => 1,
+        "q3_k" => 0,
+        _ => 0,
+    }
+}
+
+fn catalog_quant_quality_rank(quant: &CatalogQuant) -> u8 {
+    quant_quality_rank(&quant.quant)
+}
+
+impl ModelCard {
+    pub fn family_name(&self) -> &str {
+        self.family.as_deref().unwrap_or(&self.id)
+    }
+
+    pub fn variant_tag(&self) -> Option<&str> {
+        self.variant.as_ref().map(|variant| variant.tag.as_str())
+    }
+
+    pub fn variant_format(&self) -> Option<&str> {
+        self.variant.as_ref().map(|variant| variant.format.as_str())
+    }
+
+    pub fn variant_quantization(&self) -> Option<&str> {
+        self.variant
+            .as_ref()
+            .and_then(|variant| variant.quantization.as_deref())
+    }
+
+    pub fn is_default_variant(&self) -> bool {
+        self.default_variant
+            .as_deref()
+            .zip(self.variant_tag())
+            .is_some_and(|(default_variant, tag)| default_variant == tag)
+    }
+}
+
+pub fn parse_model_ref(value: &str) -> Result<ModelRef, ModelResolutionError> {
+    resolution::parse_model_ref(value)
+}
+
+pub fn model_refs_match_with_optional_tag_alias(requested: &ModelRef, resolved: &ModelRef) -> bool {
+    if requested.family != resolved.family {
+        return false;
+    }
+
+    match (requested.tag.as_deref(), resolved.tag.as_deref()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(requested_tag), Some(resolved_tag)) => {
+            canonical_quant_tag(requested_tag) == canonical_quant_tag(resolved_tag)
+        }
+        (Some(_), None) => false,
+    }
+}
+
+pub fn model_reference_matches_resolved_source(requested: &str, resolved_source_id: &str) -> bool {
+    let Ok(requested_ref) = parse_model_ref(requested) else {
+        return false;
+    };
+    let Ok(resolved_ref) = parse_model_ref(resolved_source_id) else {
+        return false;
+    };
+    model_refs_match_with_optional_tag_alias(&requested_ref, &resolved_ref)
+}
+
+pub fn resolve_registry_model_ref<'a>(
+    cards: &'a [ModelCard],
+    model_ref: &str,
+) -> Result<ResolvedModel<'a>, ModelResolutionError> {
+    resolution::resolve_registry_model_ref(cards, model_ref)
+}
+
+pub fn resolve_runtime_model_ref<'a>(
+    cards: &'a [ModelCard],
+    catalog: Option<&ModelCatalog>,
+    model_ref: &str,
+) -> Result<ResolvedRuntimeModelRef<'a>, RuntimeModelResolutionError> {
+    if let Some(catalog) = catalog {
+        match resolve_catalog_pull(
+            catalog,
+            &CatalogPullRequest {
+                reference: model_ref.to_string(),
+                quant: None,
+                size: None,
+            },
+        ) {
+            Ok(resolved) => {
+                let card = cards.iter().find(|card| card.id == resolved.model_id);
+                let runtime_model_id = runtime_model_id(&resolved.model_id, Some(&resolved.quant));
+                return Ok(ResolvedRuntimeModelRef {
+                    card,
+                    requested: model_ref.to_string(),
+                    model_id: resolved.model_id,
+                    quant: Some(resolved.quant),
+                    runtime_model_id,
+                    pull: Some(resolved.pull),
+                    source: RuntimeModelRefSource::Catalog,
+                });
+            }
+            Err(catalog_error) => {
+                return resolve_registry_model_ref(cards, model_ref)
+                    .map(runtime_model_ref_from_registry)
+                    .map_err(|_| RuntimeModelResolutionError::Catalog(catalog_error));
+            }
+        }
+    }
+
+    resolve_registry_model_ref(cards, model_ref)
+        .map(runtime_model_ref_from_registry)
+        .map_err(RuntimeModelResolutionError::Registry)
+}
+
+fn runtime_model_ref_from_registry<'a>(resolved: ResolvedModel<'a>) -> ResolvedRuntimeModelRef<'a> {
+    let quant = resolved
+        .card
+        .variant_quantization()
+        .map(canonical_quant_tag)
+        .map(ToOwned::to_owned);
+    let runtime_model_id = runtime_model_id(&resolved.card.id, quant.as_deref());
+    ResolvedRuntimeModelRef {
+        card: Some(resolved.card),
+        requested: resolved.requested,
+        model_id: resolved.card.id.clone(),
+        quant,
+        runtime_model_id,
+        pull: None,
+        source: RuntimeModelRefSource::Registry,
+    }
+}
+
+fn runtime_model_id(model_id: &str, quant: Option<&str>) -> String {
+    quant.map_or_else(
+        || model_id.to_string(),
+        |quant| format!("{model_id}:{quant}"),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_model_card(id: &str) -> ModelCard {
+    ModelCard {
+        id: id.to_string(),
+        family: None,
+        default_variant: None,
+        variant: None,
+        display_name: id.to_string(),
+        backend: "native".to_string(),
+        task: "transcription".to_string(),
+        languages: vec!["en".to_string()],
+        size: "tiny".to_string(),
+        recommended_hardware: "CPU".to_string(),
+        license: "MIT".to_string(),
+        features: vec!["transcription".to_string()],
+        quality_profile: "fastest".to_string(),
+        source: "Native ASR Core planning metadata".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests;

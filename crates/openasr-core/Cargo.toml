@@ -1,0 +1,67 @@
+[package]
+name = "openasr-core"
+description = "OpenASR engine: model families, ggml runtime, .oasr pack format, signed catalog, and local inference trust boundaries."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[features]
+## OpenMP CPU threading is ON by default (~2x CPU). On Windows the ggml CPU
+## sources must be MSVC-compiled for OpenMP to link (ROCm clang's __kmpc_* has no
+## libomp); build.rs pins MSVC `cl` for non-HIP Windows builds so this holds, and
+## neutralizes hip+openmp (HIP needs ROCm clang). OPENASR_GGML_OPENMP=0 or
+## --no-default-features disables it.
+default = ["openmp"]
+## GPU/accelerator backends — each maps 1:1 to a GGML cmake flag.
+cuda    = []   # GGML_CUDA    — NVIDIA CUDA (requires CUDA toolkit)
+vulkan  = []   # GGML_VULKAN  — Vulkan compute (cross-platform GPU)
+hip     = []   # GGML_HIP     — AMD ROCm/HIP (requires ROCm toolkit)
+sycl    = []   # GGML_SYCL    — Intel oneAPI SYCL (requires DPC++ compiler)
+openmp  = []   # GGML_OPENMP  — multi-core CPU via OpenMP
+## Build tuning
+native  = []   # GGML_NATIVE  — tune for the current host CPU; off for distribution
+## Test fixtures (`openasr_core::testing`). Off by default; workspace consumers
+## enable it through dev-dependencies. The module is also available under
+## `cfg(test)` for this crate's own unit tests.
+testing = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+[dependencies]
+ed25519-dalek.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+libc.workspace = true
+memmap2.workspace = true
+matrixmultiply.workspace = true
+rayon.workspace = true
+realfft.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+unicode-general-category.workspace = true
+zip.workspace = true
+
+[build-dependencies]
+# Locate the MSVC `cl` toolchain (path + vcvars env) so build.rs can pin it for
+# non-HIP Windows ggml builds instead of the ROCm clang that Ninja picks off PATH.
+cc = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal.workspace = true
+objc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Probe whether a pull-lock's owning pid is still alive (Win32 OpenProcess), so a
+# crashed/killed download's stale lock is reclaimed immediately instead of waiting
+# out the 6h mtime timeout. The unix path uses libc::kill; this is its Windows peer.
+windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
