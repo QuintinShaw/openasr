@@ -30,7 +30,10 @@ jobs:
         run: docker build -t openasr:ci .
 
       - name: Start container
-        run: docker run --rm -d --name openasr-docker-smoke -p 18080:8080 openasr:ci
+        # Mock smoke: the image default CMD is the fail-closed native server,
+        # which exits without an installed pack, so pass explicit mock args.
+        # No --rm: keep the container around so `docker logs` works on failure.
+        run: docker run -d --name openasr-docker-smoke -p 18080:8080 openasr:ci serve --addr 0.0.0.0:8080 --backend mock
 
       - name: Wait for server
         run: |
