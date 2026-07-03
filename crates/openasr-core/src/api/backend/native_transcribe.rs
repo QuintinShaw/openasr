@@ -28,8 +28,8 @@ use crate::{
 };
 
 use super::{BackendError, Transcription, TranscriptionRequest};
+use crate::Segment;
 use crate::api::backend::TranscriptionLongFormMetadata;
-use crate::{Segment, WordTimestamp};
 
 const DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS: f32 = 30.0;
 const COHERE_LONGFORM_MAX_CHUNK_SECONDS: f32 = 10.0;
@@ -225,19 +225,17 @@ pub(super) fn run_native_transcription(
     // forced-for-diarization marker below tells whisper to keep the decode
     // path identical to a non-diarized run and derive word anchors post hoc
     // from the generated tokens instead.
-    // X-ASR batch emits one monolithic segment for the whole file (it has no
-    // internal segmentation), so a transcript renders as a single paragraph / one
-    // subtitle cue. Force its word timestamps -- free post-processing of emission
-    // frames -- so the single result can be split into sentence segments below at
-    // the model's own punctuation, then strip the anchors again if the caller did
-    // not request them. Gated to X-ASR: other families either already segment
-    // (whisper longform) or would pay a real decode cost for word timestamps.
-    let split_monolithic_segments = selected_family.adapter_id
-        == crate::arch::XASR_ZIPFORMER_GGML_ADAPTER_ID
-        && !run_longform
-        && !vad_diarization;
-    let force_word_timestamps_for_segmentation =
-        split_monolithic_segments && !request.word_timestamps;
+    // Every family's transcript is re-segmented into subtitle-grade cues after
+    // decode (see `cue_segmentation`); the splitter needs word anchors to place
+    // cue boundaries. For all families except whisper these are free -- pure
+    // post-processing of decode-time emission/token times already captured
+    // during decode -- so force them on and strip them again if the caller did
+    // not ask for them. Whisper is the exception: user-requested word timestamps
+    // switch its decode path to collect cross-attention (which can perturb the
+    // transcript), so it is left alone here and its cues fall back to
+    // proportional splitting when a segment exceeds the caps.
+    let is_whisper_family = selected_family.adapter_id == crate::arch::WHISPER_GGML_ADAPTER_ID;
+    let force_word_timestamps_for_segmentation = !is_whisper_family && !request.word_timestamps;
     request_options.word_timestamps =
         request.word_timestamps || vad_diarization || force_word_timestamps_for_segmentation;
     let strip_forced_word_timestamps =
@@ -479,14 +477,11 @@ pub(super) fn run_native_transcription(
         request_options,
         backend_preference,
     )?;
-    let mut normalized = normalize_transcription_segments(
+    let normalized = normalize_transcription_segments(
         transcription.into_transcription(),
         0.0,
         audio_duration_seconds,
     );
-    if split_monolithic_segments {
-        normalized = split_monolithic_segment_into_sentences(normalized);
-    }
     Ok(with_reported_language(
         apply_speaker_turns(
             with_longform_metadata(normalized, longform_metadata),
@@ -617,10 +612,13 @@ fn compute_speaker_attribution(
     }
 }
 
-/// Attribute speaker turns onto the transcription's segments (no-op if empty),
-/// splitting segments that span multiple speakers at word-snapped turn
-/// boundaries. `strip_forced_word_timestamps` removes the word anchors that
-/// were force-enabled for the split when the caller did not request them.
+/// Finalize a transcription for output: attribute speaker turns onto its
+/// segments (no-op if empty, splitting segments that span multiple speakers at
+/// word-snapped turn boundaries), then re-segment every (single-speaker) segment
+/// into subtitle-grade cues. Re-segmentation runs after attribution so cues
+/// never straddle a speaker turn, and before the strip so it can use the word
+/// anchors. `strip_forced_word_timestamps` removes the anchors that were
+/// force-enabled for the split when the caller did not request them.
 fn apply_speaker_turns(
     mut transcription: Transcription,
     attribution: &SpeakerAttribution,
@@ -633,145 +631,11 @@ fn apply_speaker_turns(
             &attribution.identities,
         );
     }
+    transcription = super::cue_segmentation::resegment_transcription_cues(transcription);
     if strip_forced_word_timestamps {
         for segment in &mut transcription.segments {
             segment.words.clear();
         }
-    }
-    transcription
-}
-
-/// Sentence-final punctuation for the zh-en (and common multilingual) output.
-fn is_sentence_terminal_char(c: char) -> bool {
-    matches!(
-        c,
-        '.' | '!' | '?' | '\u{3002}' | '\u{ff01}' | '\u{ff1f}' | '\u{2026}'
-    )
-}
-
-/// Closing punctuation that may trail a sentence mark (quotes, brackets).
-fn is_segment_closing_punct(c: char) -> bool {
-    matches!(
-        c,
-        '"' | '\''
-            | ')'
-            | ']'
-            | '}'
-            | '\u{201d}'
-            | '\u{2019}'
-            | '\u{ff09}'
-            | '\u{3011}'
-            | '\u{300d}'
-            | '\u{300f}'
-    )
-}
-
-/// Whether a token carries any non-punctuation content (so a lone punctuation
-/// token never starts its own sentence segment).
-fn word_has_content(word: &str) -> bool {
-    word.trim().chars().any(|c| {
-        !is_sentence_terminal_char(c) && !is_segment_closing_punct(c) && !c.is_whitespace()
-    })
-}
-
-/// Whether a token ends a sentence: its last non-closing character is terminal
-/// punctuation. X-ASR emits the mark either as its own token (" . ") or glued to
-/// the last word ("country.").
-fn word_ends_sentence(word: &str) -> bool {
-    word.trim_end()
-        .trim_end_matches(is_segment_closing_punct)
-        .chars()
-        .next_back()
-        .is_some_and(is_sentence_terminal_char)
-}
-
-/// Map each word token to its `[start, end)` char span in `text` by greedy
-/// forward matching (the words are tokens of `text`, separated by whitespace).
-/// Returns `None` if a token does not align, so the caller falls back to leaving
-/// the segment whole rather than emitting mis-sliced text.
-fn word_char_spans(text: &str, words: &[WordTimestamp]) -> Option<Vec<(usize, usize)>> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut spans = Vec::with_capacity(words.len());
-    let mut idx = 0usize;
-    for word in words {
-        while idx < chars.len() && chars[idx].is_whitespace() {
-            idx += 1;
-        }
-        let token: Vec<char> = word.word.trim().chars().collect();
-        if token.is_empty() {
-            spans.push((idx, idx));
-            continue;
-        }
-        if idx + token.len() > chars.len() {
-            return None;
-        }
-        if chars[idx..idx + token.len()] != token[..] {
-            return None;
-        }
-        spans.push((idx, idx + token.len()));
-        idx += token.len();
-    }
-    Some(spans)
-}
-
-/// Split a single monolithic segment (e.g. X-ASR batch, which emits one segment
-/// for the whole file) into sentence segments at sentence-final punctuation,
-/// using word timestamps for exact boundaries and the original segment text for
-/// exact spacing. No-op unless there is exactly one segment carrying word
-/// timestamps and at least one interior sentence boundary. Pause gaps are
-/// deliberately NOT used: dramatic delivery pauses are not sentence boundaries.
-fn split_monolithic_segment_into_sentences(mut transcription: Transcription) -> Transcription {
-    if transcription.segments.len() != 1 {
-        return transcription;
-    }
-    let segment = transcription.segments[0].clone();
-    if segment.words.len() < 2 {
-        return transcription;
-    }
-    let Some(spans) = word_char_spans(&segment.text, &segment.words) else {
-        return transcription;
-    };
-    let n = segment.words.len();
-    // Word indices after which to cut: a sentence-final mark that has real
-    // content before it, never the final word (that cut just reproduces the
-    // whole segment).
-    let mut cut_after: Vec<usize> = Vec::new();
-    let mut group_has_content = false;
-    for (i, word) in segment.words.iter().enumerate() {
-        if word_has_content(&word.word) {
-            group_has_content = true;
-        }
-        if i + 1 < n && group_has_content && word_ends_sentence(&word.word) {
-            cut_after.push(i);
-            group_has_content = false;
-        }
-    }
-    if cut_after.is_empty() {
-        return transcription;
-    }
-    cut_after.push(n - 1);
-
-    let chars: Vec<char> = segment.text.chars().collect();
-    let mut out: Vec<Segment> = Vec::with_capacity(cut_after.len());
-    let mut first = 0usize;
-    for &last in &cut_after {
-        let text: String = chars[spans[first].0..spans[last].1].iter().collect();
-        let text = text.trim().to_string();
-        if !text.is_empty() {
-            out.push(Segment {
-                start: segment.words[first].start,
-                end: segment.words[last].end,
-                text,
-                speaker: segment.speaker.clone(),
-                speaker_label: segment.speaker_label.clone(),
-                speaker_profile_id: segment.speaker_profile_id.clone(),
-                words: segment.words[first..=last].to_vec(),
-            });
-        }
-        first = last + 1;
-    }
-    if out.len() > 1 {
-        transcription.segments = out;
     }
     transcription
 }
@@ -1314,137 +1178,6 @@ fn prefers_cpu_decoder_for_multichunk_metal(model_architecture: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn word(text: &str, start: f32, end: f32) -> WordTimestamp {
-        WordTimestamp {
-            word: text.to_string(),
-            start,
-            end,
-            confidence: None,
-        }
-    }
-
-    fn single_segment(text: &str, words: Vec<WordTimestamp>) -> Transcription {
-        let start = words.first().map_or(0.0, |w| w.start);
-        let end = words.last().map_or(0.0, |w| w.end);
-        Transcription {
-            text: text.to_string(),
-            segments: vec![Segment {
-                start,
-                end,
-                text: text.to_string(),
-                speaker: None,
-                speaker_label: None,
-                speaker_profile_id: None,
-                words,
-            }],
-            longform: None,
-            language: None,
-        }
-    }
-
-    #[test]
-    fn splits_monolithic_segment_at_sentence_punctuation() {
-        // Real X-ASR jfk output: one segment with a period token mid-stream. The
-        // dramatic pauses (ask/not/what) must NOT split; only the period does.
-        let text = "And so my fellow americans ask not what your country can do for you . Ask what you can do for your country";
-        let words = vec![
-            word("And", 0.96, 1.00),
-            word("so", 1.43, 1.47),
-            word("my", 1.55, 1.59),
-            word("fellow", 1.71, 1.91),
-            word("americans", 2.19, 3.19),
-            word("ask", 4.11, 4.14),
-            word("not", 4.90, 4.94),
-            word("what", 5.74, 5.78),
-            word("your", 6.22, 6.26),
-            word("country", 6.50, 6.54),
-            word("can", 6.86, 6.89),
-            word("do", 7.13, 7.17),
-            word("for", 7.49, 7.53),
-            word("you", 7.93, 7.97),
-            word(".", 8.61, 8.65),
-            word("Ask", 8.77, 9.01),
-            word("what", 9.21, 9.25),
-            word("you", 9.41, 9.45),
-            word("can", 9.61, 9.64),
-            word("do", 9.84, 9.88),
-            word("for", 10.08, 10.12),
-            word("your", 10.28, 10.32),
-            word("country", 10.80, 10.84),
-        ];
-        let split = split_monolithic_segment_into_sentences(single_segment(text, words));
-        assert_eq!(split.segments.len(), 2);
-        assert_eq!(
-            split.segments[0].text,
-            "And so my fellow americans ask not what your country can do for you ."
-        );
-        assert!((split.segments[0].start - 0.96).abs() < 1e-4);
-        assert!((split.segments[0].end - 8.65).abs() < 1e-4);
-        assert_eq!(
-            split.segments[1].text,
-            "Ask what you can do for your country"
-        );
-        assert!((split.segments[1].start - 8.77).abs() < 1e-4);
-        assert!((split.segments[1].end - 10.84).abs() < 1e-4);
-    }
-
-    #[test]
-    fn does_not_split_without_terminal_punctuation() {
-        let text = "hello world no punctuation at all here";
-        let words = vec![
-            word("hello", 0.0, 0.2),
-            word("world", 0.3, 0.5),
-            word("no", 0.6, 0.7),
-            word("punctuation", 0.8, 1.2),
-            word("at", 1.3, 1.4),
-            word("all", 1.5, 1.6),
-            word("here", 1.7, 1.9),
-        ];
-        let split = split_monolithic_segment_into_sentences(single_segment(text, words));
-        assert_eq!(split.segments.len(), 1);
-    }
-
-    #[test]
-    fn does_not_split_already_multi_segment_or_wordless() {
-        // Two segments -> untouched.
-        let mut two = single_segment("a. b.", vec![word("a.", 0.0, 0.1), word("b.", 0.2, 0.3)]);
-        two.segments.push(Segment {
-            start: 0.4,
-            end: 0.5,
-            text: "c.".to_string(),
-            speaker: None,
-            speaker_label: None,
-            speaker_profile_id: None,
-            words: vec![word("c.", 0.4, 0.5)],
-        });
-        assert_eq!(
-            split_monolithic_segment_into_sentences(two).segments.len(),
-            2
-        );
-
-        // Single segment with no word timestamps -> untouched (cannot anchor cuts).
-        let wordless = Transcription {
-            text: "One. Two.".to_string(),
-            segments: vec![Segment {
-                start: 0.0,
-                end: 1.0,
-                text: "One. Two.".to_string(),
-                speaker: None,
-                speaker_label: None,
-                speaker_profile_id: None,
-                words: Vec::new(),
-            }],
-            longform: None,
-            language: None,
-        };
-        assert_eq!(
-            split_monolithic_segment_into_sentences(wordless)
-                .segments
-                .len(),
-            1
-        );
-    }
 
     #[test]
     fn longform_progress_guard_publishes_and_clears() {

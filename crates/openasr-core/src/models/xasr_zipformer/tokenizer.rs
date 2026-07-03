@@ -219,7 +219,30 @@ fn normalize_sentencepiece_spacing(text: &str) -> String {
 }
 
 fn should_suppress_sentencepiece_space(left: char, right: char) -> bool {
-    is_cjk_text_or_punctuation(left) && is_cjk_text_or_punctuation(right)
+    if is_cjk_text_or_punctuation(left) && is_cjk_text_or_punctuation(right) {
+        return true;
+    }
+    // Latin / shared punctuation detok: never a space before a closing mark,
+    // never a space after an opening bracket. The decision depends only on the
+    // nearest visible neighbours of each space, so the streaming detokenizer
+    // (which evaluates each pending space against `last_visible`) stays
+    // append-only and byte-for-byte identical to a full batch decode.
+    is_no_space_before_punctuation(right) || is_no_space_after_punctuation(left)
+}
+
+/// Punctuation that hugs the preceding token: a space in front of it is dropped
+/// (`hello ,` -> `hello,`, `word )` -> `word)`).
+fn is_no_space_before_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\u{00bb}' | '\u{2026}'
+    )
+}
+
+/// Openers that hug the following token: a space after them is dropped
+/// (`( hello` -> `(hello`).
+fn is_no_space_after_punctuation(ch: char) -> bool {
+    matches!(ch, '(' | '[' | '{' | '\u{00ab}')
 }
 
 fn is_cjk_text_or_punctuation(ch: char) -> bool {
@@ -278,6 +301,94 @@ mod tests {
             tokenizer.decode(&[1, 2, 3, 4, 5, 6]).unwrap(),
             "二零年，美国 OpenASR"
         );
+    }
+
+    #[test]
+    fn drops_space_before_latin_closing_punctuation() {
+        // X-ASR emits Latin punctuation as its own `_,` / `_.` piece, which used
+        // to render as " , " / " . " (space on both sides). Only the space in
+        // front of a closing mark is suppressed; the following word keeps its
+        // space.
+        let tokenizer = XasrZipformerTokenizer::new(
+            vec![
+                "<blk>".to_string(),
+                "\u{2581}hello".to_string(),
+                "\u{2581},".to_string(),
+                "\u{2581}world".to_string(),
+                "\u{2581}.".to_string(),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(tokenizer.decode(&[1, 2, 3, 4]).unwrap(), "hello, world.");
+    }
+
+    #[test]
+    fn hugs_brackets_to_their_contents() {
+        let tokenizer = XasrZipformerTokenizer::new(
+            vec![
+                "<blk>".to_string(),
+                "\u{2581}(".to_string(),
+                "\u{2581}inside".to_string(),
+                "\u{2581})".to_string(),
+                "\u{2581}next".to_string(),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(tokenizer.decode(&[1, 2, 3, 4]).unwrap(), "(inside) next");
+    }
+
+    #[test]
+    fn keeps_space_between_cjk_and_latin_around_punctuation() {
+        // Latin punctuation rules must not disturb the CJK/Latin boundary space.
+        let tokenizer = XasrZipformerTokenizer::new(
+            vec![
+                "<blk>".to_string(),
+                "\u{2581}\u{7f8e}\u{56fd}".to_string(), // 美国
+                "\u{2581},".to_string(),
+                "\u{2581}OpenASR".to_string(),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            tokenizer.decode(&[1, 2, 3]).unwrap(),
+            "\u{7f8e}\u{56fd}, OpenASR"
+        );
+    }
+
+    #[test]
+    fn streaming_detokenizer_matches_batch_decode_with_latin_punctuation() {
+        // The Latin punctuation spacing rule must keep the streaming path
+        // byte-identical to batch decode at every prefix (append-only).
+        let tokenizer = XasrZipformerTokenizer::new(
+            vec![
+                "<blk>".to_string(),
+                "\u{2581}hello".to_string(),
+                "\u{2581},".to_string(),
+                "\u{2581}(".to_string(),
+                "\u{2581}world".to_string(),
+                "\u{2581})".to_string(),
+                "\u{2581}.".to_string(),
+            ],
+            0,
+        )
+        .unwrap();
+        let ids = [1u32, 2, 3, 4, 5, 6];
+        let mut streaming = XasrStreamingDetokenizer::default();
+        let mut previous = String::new();
+        for (count, &id) in ids.iter().enumerate() {
+            streaming.push_token(&tokenizer, id).unwrap();
+            let batch = tokenizer.decode(&ids[..=count]).unwrap();
+            assert_eq!(streaming.text(), batch, "prefix of {} tokens", count + 1);
+            assert!(
+                streaming.text().starts_with(&previous),
+                "streaming output must be append-only"
+            );
+            previous = streaming.text().to_string();
+        }
+        assert_eq!(streaming.text(), "hello, (world).");
     }
 
     #[test]

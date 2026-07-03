@@ -32,6 +32,8 @@ use crate::{
     GgmlAsrExecutionOptions, GgmlAsrStreamingSessionRequest,
 };
 
+#[path = "cue_segmentation.rs"]
+mod cue_segmentation;
 #[path = "native_model_id.rs"]
 mod native_model_id;
 #[path = "native_path.rs"]
