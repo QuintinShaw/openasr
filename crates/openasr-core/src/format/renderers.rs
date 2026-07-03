@@ -145,13 +145,34 @@ fn render_segments(
         .join(separator)
 }
 
+/// Render segments as prose paragraphs, coalescing consecutive same-speaker
+/// cues into a single paragraph. The cue re-segmentation pass produces many
+/// short subtitle cues per speaker turn; timed formats (SRT/VTT/JSON) want that
+/// granularity, but markdown reads as one paragraph per turn.
 fn render_segments_body(transcription: &Transcription, separator: &str) -> String {
-    transcription
-        .segments
-        .iter()
-        .map(|segment| render_segment_text(&segment.text, segment.speaker.as_deref()))
-        .collect::<Vec<_>>()
-        .join(separator)
+    let mut paragraphs: Vec<String> = Vec::new();
+    let mut group_speaker: Option<Option<&str>> = None;
+    let mut group_text = String::new();
+    for segment in &transcription.segments {
+        let speaker = segment.speaker.as_deref();
+        let text = segment.text.trim();
+        if group_speaker == Some(speaker) {
+            if !group_text.is_empty() && !text.is_empty() {
+                group_text.push(' ');
+            }
+            group_text.push_str(text);
+        } else {
+            if let Some(previous) = group_speaker {
+                paragraphs.push(render_segment_text(&group_text, previous));
+            }
+            group_speaker = Some(speaker);
+            group_text = text.to_string();
+        }
+    }
+    if let Some(previous) = group_speaker {
+        paragraphs.push(render_segment_text(&group_text, previous));
+    }
+    paragraphs.join(separator)
 }
 
 fn render_segment_text(text: &str, speaker: Option<&str>) -> String {
