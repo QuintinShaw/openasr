@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/QuintinShaw/openasr"
@@ -20,9 +20,9 @@ authors = ["OpenASR contributors"]
 # Inter-crate deps are version-locked in lockstep with [workspace.package].
 # A release bumps the version there and these three pins together; pushing
 # that bump to main publishes the release (see RELEASING.md).
-openasr-core = { path = "crates/openasr-core", version = "0.1.0" }
-openasr-server = { path = "crates/openasr-server", version = "0.1.0" }
-openasr-system-audio = { path = "crates/openasr-system-audio", version = "0.1.0" }
+openasr-core = { path = "crates/openasr-core", version = "0.1.1" }
+openasr-server = { path = "crates/openasr-server", version = "0.1.1" }
+openasr-system-audio = { path = "crates/openasr-system-audio", version = "0.1.1" }
 anyhow = "1.0"
 assert_cmd = "2.0"
 axum = { version = "0.8", features = ["multipart", "ws"] }
