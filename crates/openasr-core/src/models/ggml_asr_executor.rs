@@ -335,12 +335,29 @@ pub trait GgmlAsrStreamingExecutor: Send + Sync {
     ) -> Result<Box<dyn NativeAsrSession>, GgmlAsrExecutionError>;
 }
 
+/// Partial-result granularity of a registered streaming executor. This is a
+/// generic infrastructure property (how partials are produced), not a
+/// per-model semantic: `FrameSync` executors append fixed low-latency chunks
+/// and never revise already-emitted text; `Buffered` executors re-decode a
+/// growing/windowed audio buffer and may revise prior partials. Only the
+/// registration site (`build_builtin_ggml_streaming_execution_dispatch`)
+/// knows which family is which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingPartialGranularity {
+    FrameSync,
+    Buffered,
+}
+
 #[derive(Default)]
 pub struct GgmlAsrExecutionDispatch {
     executors_by_adapter_id: BTreeMap<&'static str, Arc<dyn GgmlAsrExecutor>>,
     executors_by_capability: BTreeMap<&'static str, Arc<dyn GgmlAsrExecutor>>,
     streaming_executors_by_adapter_id: BTreeMap<&'static str, Arc<dyn GgmlAsrStreamingExecutor>>,
     streaming_executors_by_capability: BTreeMap<&'static str, Arc<dyn GgmlAsrStreamingExecutor>>,
+    streaming_partial_granularity_by_adapter_id:
+        BTreeMap<&'static str, StreamingPartialGranularity>,
+    streaming_partial_granularity_by_capability:
+        BTreeMap<&'static str, StreamingPartialGranularity>,
 }
 
 impl GgmlAsrExecutionDispatch {
@@ -380,6 +397,34 @@ impl GgmlAsrExecutionDispatch {
     ) -> Self {
         self.streaming_executors_by_capability
             .insert(capability_label(capability), executor);
+        self
+    }
+
+    /// Declares the partial-result granularity of the streaming executor
+    /// registered for `adapter_id`. This is orthogonal to (and does not
+    /// require) registering the executor itself here -- it only records the
+    /// granularity fact so capability derivation can answer
+    /// [`Self::is_frame_sync_for`] without touching model-family code.
+    pub fn with_streaming_partial_granularity_for_adapter(
+        mut self,
+        adapter_id: &'static str,
+        granularity: StreamingPartialGranularity,
+    ) -> Self {
+        self.streaming_partial_granularity_by_adapter_id
+            .insert(adapter_id, granularity);
+        self
+    }
+
+    /// Capability-keyed counterpart of
+    /// [`Self::with_streaming_partial_granularity_for_adapter`], mirroring the
+    /// adapter-id/capability duality used by the executor maps above.
+    pub fn with_streaming_partial_granularity_for_capability(
+        mut self,
+        capability: GgmlExecutionCapability,
+        granularity: StreamingPartialGranularity,
+    ) -> Self {
+        self.streaming_partial_granularity_by_capability
+            .insert(capability_label(capability), granularity);
         self
     }
 
@@ -462,6 +507,23 @@ impl GgmlAsrExecutionDispatch {
             || self
                 .streaming_executors_by_capability
                 .contains_key(capability_label(descriptor.execution_capability))
+    }
+
+    /// True only when the streaming executor registered for `descriptor` was
+    /// declared frame-sync at registration time. Unregistered granularity
+    /// (including families with no streaming executor at all) reads as
+    /// `false` -- fail closed to the buffered/no-partial-guarantee default
+    /// rather than assume low-latency partials.
+    pub fn is_frame_sync_for(&self, descriptor: &GgmlFamilyAdapterDescriptor) -> bool {
+        matches!(
+            self.streaming_partial_granularity_by_adapter_id
+                .get(descriptor.adapter_id),
+            Some(StreamingPartialGranularity::FrameSync)
+        ) || matches!(
+            self.streaming_partial_granularity_by_capability
+                .get(capability_label(descriptor.execution_capability)),
+            Some(StreamingPartialGranularity::FrameSync)
+        )
     }
 }
 
@@ -890,6 +952,37 @@ mod tests {
                 Arc::new(StubStreamingExecutor),
             );
         assert!(capability_dispatch.has_streaming_executor_for(&qwen));
+    }
+
+    #[test]
+    fn is_frame_sync_for_reports_registered_granularity_and_defaults_closed() {
+        let whisper = whisper_runtime_descriptor_v1();
+        let qwen = qwen3_asr_runtime_descriptor_v1();
+
+        // No granularity registered at all: fails closed to "not frame-sync",
+        // matching the treatment of an unregistered streaming executor.
+        let empty_dispatch = GgmlAsrExecutionDispatch::default();
+        assert!(!empty_dispatch.is_frame_sync_for(&whisper));
+        assert!(!empty_dispatch.is_frame_sync_for(&qwen));
+
+        let mixed_dispatch = GgmlAsrExecutionDispatch::default()
+            .with_streaming_partial_granularity_for_adapter(
+                whisper.adapter_id,
+                StreamingPartialGranularity::FrameSync,
+            )
+            .with_streaming_partial_granularity_for_adapter(
+                qwen.adapter_id,
+                StreamingPartialGranularity::Buffered,
+            );
+        assert!(mixed_dispatch.is_frame_sync_for(&whisper));
+        assert!(!mixed_dispatch.is_frame_sync_for(&qwen));
+
+        let capability_dispatch = GgmlAsrExecutionDispatch::default()
+            .with_streaming_partial_granularity_for_capability(
+                qwen.execution_capability,
+                StreamingPartialGranularity::FrameSync,
+            );
+        assert!(capability_dispatch.is_frame_sync_for(&qwen));
     }
 
     #[test]

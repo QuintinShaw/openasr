@@ -52,6 +52,11 @@ pub struct NativeAsrCapabilities {
     pub class: NativeAsrCapabilityClass,
     pub supports_true_streaming: bool,
     pub supports_partials: bool,
+    /// True only when the true-streaming session uses the frame-sync
+    /// append-only partial driver (fixed low-latency chunks, never revises
+    /// already-emitted text). False for buffered/windowed re-decode
+    /// streaming, even though that also reports `supports_partials`.
+    pub supports_frame_sync_partials: bool,
     pub supports_timestamps: bool,
     pub supports_diarization: bool,
     pub supports_phrase_bias: bool,
@@ -70,6 +75,7 @@ impl NativeAsrCapabilities {
             class,
             supports_true_streaming,
             supports_partials: false,
+            supports_frame_sync_partials: false,
             supports_timestamps: false,
             supports_diarization: false,
             supports_phrase_bias: false,
@@ -113,6 +119,11 @@ impl NativeAsrCapabilities {
 
     pub const fn with_partial_results(mut self, supported: bool) -> Self {
         self.supports_partials = supported;
+        self
+    }
+
+    pub const fn with_frame_sync_partials(mut self, supported: bool) -> Self {
+        self.supports_frame_sync_partials = supported;
         self
     }
 

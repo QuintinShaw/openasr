@@ -102,7 +102,15 @@ fn native_runtime_capabilities_from_metadata(
         && shared_native_ggml_streaming_execution_dispatch()
             .is_ok_and(|dispatch| dispatch.has_streaming_executor_for(descriptor))
     {
-        return NativeAsrCapabilities::native_true_streaming().with_partial_results(true);
+        // Partial granularity is a property of the registered streaming
+        // executor, not the pack: a pack cannot self-declare frame-sync
+        // partials, so already-published packs stay accurate as the
+        // registry gains (or loses) frame-sync executors.
+        let frame_sync = shared_native_ggml_streaming_execution_dispatch()
+            .is_ok_and(|dispatch| dispatch.is_frame_sync_for(descriptor));
+        return NativeAsrCapabilities::native_true_streaming()
+            .with_partial_results(true)
+            .with_frame_sync_partials(frame_sync);
     }
     NativeAsrCapabilities::native_offline()
 }

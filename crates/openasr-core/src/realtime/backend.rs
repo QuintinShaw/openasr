@@ -27,6 +27,13 @@ pub struct RealtimeBackendCapabilities {
     pub requires_vad_utterance_boundaries: bool,
     pub is_file_per_utterance_fallback: bool,
     pub is_true_streaming: bool,
+    /// True only for the frame-sync append-only streaming driver (fixed
+    /// low-latency chunks that are appended, never revised) -- the shape a
+    /// word-by-word dictation UX needs. False for buffered/windowed
+    /// re-decode streaming, CTC-windowed streaming, file-per-utterance
+    /// fallback, and unsupported modes, even when those report
+    /// `supports_partial_results = true`.
+    pub frame_sync_partials: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -88,6 +95,7 @@ impl RealtimeBackendCapabilities {
         requires_vad_utterance_boundaries: bool,
         phrase_bias: BackendFeatureCapability,
         word_timestamps: BackendFeatureCapability,
+        frame_sync_partials: bool,
     ) -> Self {
         Self {
             mode,
@@ -108,6 +116,7 @@ impl RealtimeBackendCapabilities {
                 RealtimeBackendMode::FilePerUtteranceFallback
             ),
             is_true_streaming: matches!(mode, RealtimeBackendMode::TrueStreaming),
+            frame_sync_partials,
         }
     }
 
@@ -119,6 +128,7 @@ impl RealtimeBackendCapabilities {
             false,
             realtime_phrase_bias_unsupported(),
             realtime_word_timestamps_unsupported(),
+            false,
         )
     }
 
@@ -130,6 +140,7 @@ impl RealtimeBackendCapabilities {
             true,
             realtime_phrase_bias_unsupported(),
             BackendFeatureCapability::supported(),
+            false,
         )
     }
 
@@ -141,9 +152,15 @@ impl RealtimeBackendCapabilities {
             true,
             BackendFeatureCapability::supported(),
             BackendFeatureCapability::supported(),
+            false,
         )
     }
 
+    /// Test/CLI-summary representative of a generic true-streaming backend.
+    /// It is conservatively buffered (`frame_sync_partials = false`): most
+    /// registered families re-decode a buffer, and production capabilities
+    /// for any given family are always derived from the streaming-executor
+    /// registry via [`Self::from_native_capabilities`], not from this stub.
     pub const fn true_streaming_local() -> Self {
         Self::build(
             RealtimeBackendMode::TrueStreaming,
@@ -152,6 +169,7 @@ impl RealtimeBackendCapabilities {
             false,
             realtime_phrase_bias_unsupported(),
             BackendFeatureCapability::supported(),
+            false,
         )
     }
 
@@ -191,6 +209,7 @@ impl RealtimeBackendCapabilities {
                     } else {
                         realtime_word_timestamps_unsupported()
                     },
+                    capabilities.supports_frame_sync_partials,
                 )
             }
             NativeAsrCapabilityClass::NativeModelAdapter => Self::build(
@@ -208,6 +227,7 @@ impl RealtimeBackendCapabilities {
                 } else {
                     realtime_word_timestamps_unsupported()
                 },
+                false,
             ),
             NativeAsrCapabilityClass::FilePerUtteranceFallback => {
                 Self::file_per_utterance_fallback()
@@ -288,6 +308,7 @@ mod tests {
             assert!(capabilities.requires_vad_utterance_boundaries);
             assert!(capabilities.is_file_per_utterance_fallback);
             assert!(!capabilities.is_true_streaming);
+            assert!(!capabilities.frame_sync_partials);
             assert!(!capabilities.effective_partial_results(true));
         }
     }
@@ -370,8 +391,65 @@ mod tests {
         assert!(!capabilities.requires_vad_utterance_boundaries);
         assert!(!capabilities.is_file_per_utterance_fallback);
         assert!(capabilities.is_true_streaming);
+        // A generic true-streaming stub is conservatively buffered; only a
+        // family whose registered executor is frame-sync claims this.
+        assert!(!capabilities.frame_sync_partials);
         assert!(capabilities.effective_partial_results(true));
         assert!(!capabilities.effective_partial_results(false));
+    }
+
+    #[test]
+    fn from_native_capabilities_derives_frame_sync_partials_from_the_registry_flag() {
+        let frame_sync = RealtimeBackendCapabilities::from_native_capabilities(
+            &NativeAsrCapabilities::native_true_streaming()
+                .with_partial_results(true)
+                .with_frame_sync_partials(true),
+        );
+        assert_eq!(frame_sync.mode, RealtimeBackendMode::TrueStreaming);
+        assert!(frame_sync.supports_partial_results);
+        assert!(frame_sync.frame_sync_partials);
+
+        let buffered = RealtimeBackendCapabilities::from_native_capabilities(
+            &NativeAsrCapabilities::native_true_streaming()
+                .with_partial_results(true)
+                .with_frame_sync_partials(false),
+        );
+        assert_eq!(buffered.mode, RealtimeBackendMode::TrueStreaming);
+        assert!(buffered.supports_partial_results);
+        assert!(!buffered.frame_sync_partials);
+
+        let offline = RealtimeBackendCapabilities::from_native_capabilities(
+            &NativeAsrCapabilities::native_offline(),
+        );
+        assert_eq!(offline.mode, RealtimeBackendMode::FilePerUtteranceFallback);
+        assert!(!offline.frame_sync_partials);
+
+        let fallback = RealtimeBackendCapabilities::from_native_capabilities(
+            &NativeAsrCapabilities::file_per_utterance_fallback(),
+        );
+        assert_eq!(fallback.mode, RealtimeBackendMode::FilePerUtteranceFallback);
+        assert!(!fallback.frame_sync_partials);
+
+        let unsupported = RealtimeBackendCapabilities::from_native_capabilities(
+            &NativeAsrCapabilities::unsupported(),
+        );
+        assert_eq!(unsupported.mode, RealtimeBackendMode::Unsupported);
+        assert!(!unsupported.frame_sync_partials);
+    }
+
+    #[test]
+    fn realtime_backend_capabilities_json_pins_frame_sync_partials_field_name() {
+        let frame_sync = RealtimeBackendCapabilities::from_native_capabilities(
+            &NativeAsrCapabilities::native_true_streaming()
+                .with_partial_results(true)
+                .with_frame_sync_partials(true),
+        );
+        let json = serde_json::to_value(frame_sync).expect("serialize capabilities");
+        assert_eq!(json["frame_sync_partials"], serde_json::json!(true));
+
+        let buffered = RealtimeBackendCapabilities::for_backend_kind(BackendKind::Native);
+        let json = serde_json::to_value(buffered).expect("serialize capabilities");
+        assert_eq!(json["frame_sync_partials"], serde_json::json!(false));
     }
 
     #[test]
