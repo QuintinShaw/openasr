@@ -18,7 +18,8 @@ authors = ["OpenASR contributors"]
 
 [workspace.dependencies]
 # Inter-crate deps are version-locked in lockstep with [workspace.package].
-# A release bumps the version there and these three pins together (see RELEASING.md).
+# A release bumps the version there and these three pins together; pushing
+# that bump to main publishes the release (see RELEASING.md).
 openasr-core = { path = "crates/openasr-core", version = "0.1.0" }
 openasr-server = { path = "crates/openasr-server", version = "0.1.0" }
 openasr-system-audio = { path = "crates/openasr-system-audio", version = "0.1.0" }
