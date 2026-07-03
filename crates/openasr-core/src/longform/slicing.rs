@@ -617,7 +617,7 @@ fn plan_vad_slices_from_speech_spans(
 /// beyond `max_chunk_seconds` -- the true ceiling. When no pause exists up to the
 /// ceiling the cut is forced through voiced speech at the ceiling, and the
 /// overlap into the next slice is widened so the straddling word is re-read whole
-/// (the assembler's overlap dedup then drops the redundant copy).
+/// (the assembler's time-domain overlap trim then drops the redundant re-read).
 fn extend_vad_slices_for_span(
     slices: &mut Vec<AudioSlice>,
     samples: &[f32],

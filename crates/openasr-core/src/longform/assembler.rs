@@ -46,6 +46,12 @@ pub struct TranscriptAssembler {
     merge_policy: SegmentMergePolicy,
     segments: Vec<Segment>,
     stats: LongFormAssembleStats,
+    /// End of the audio region (original-timeline seconds) already committed by
+    /// prior slices. Consecutive slices overlap at forced/energy cuts, so the
+    /// next slice re-decodes that region; anything it emits before this point is
+    /// a redundant re-read (or a weak-model hallucination of partial audio) and
+    /// is trimmed by time before it can survive into the transcript.
+    committed_end_original: Option<f32>,
 }
 
 impl TranscriptAssembler {
@@ -55,10 +61,20 @@ impl TranscriptAssembler {
             merge_policy,
             segments: Vec::new(),
             stats: LongFormAssembleStats::default(),
+            committed_end_original: None,
         }
     }
 
     pub fn push_slice_result(&mut self, mut transcript: SliceTranscript) {
+        // The trim boundary is the region committed by *prior* slices; this
+        // slice's own span is folded into the boundary afterwards so the next
+        // slice trims against it (even if this slice is silent / emits nothing).
+        let trim_boundary = self.committed_end_original;
+        let slice_committed_end = self.slice_content_end_original(&transcript.slice);
+        self.committed_end_original = Some(match self.committed_end_original {
+            Some(previous) => previous.max(slice_committed_end),
+            None => slice_committed_end,
+        });
         transcript.text = transcript.text.trim().to_string();
         if transcript.text.is_empty()
             && transcript
@@ -89,7 +105,18 @@ impl TranscriptAssembler {
             if segment.text.is_empty() {
                 continue;
             }
-            let mapped = self.map_segment_time(&segment, &slice, time_domain);
+            let mut mapped = self.map_segment_time(&segment, &slice, time_domain);
+            // Time-domain overlap trim: drop any leading words / whole segments
+            // whose audio lies in the region a prior slice already committed.
+            // This is text-agnostic, so it catches weak-model hallucinations of
+            // the re-read overlap (e.g. "belief" mis-decoded as "If,") that the
+            // text-equality dedup below cannot see.
+            if let Some(boundary) = trim_boundary
+                && trim_committed_overlap(&mut mapped, boundary)
+            {
+                self.stats.duplicate_merge_count += 1;
+                continue;
+            }
             if self.try_drop_redundant_segment(&mapped) {
                 self.stats.duplicate_merge_count += 1;
                 continue;
@@ -180,6 +207,17 @@ impl TranscriptAssembler {
         }
     }
 
+    /// End of this slice's content span in original-timeline seconds. The
+    /// `content_end_sample` indexes the same processed/plan audio domain that
+    /// [`Self::map_segment_time`] maps from, so mapping it through the timeline
+    /// yields the original-time cut point this slice commits up to.
+    fn slice_content_end_original(&self, slice: &AudioSlice) -> f32 {
+        let sample_rate = 16_000.0_f32;
+        let processed_end = slice.content_end_sample as f32 / sample_rate;
+        self.timeline
+            .map_processed_to_original_seconds(processed_end)
+    }
+
     fn try_drop_redundant_segment(&self, current: &Segment) -> bool {
         let Some(previous) = self.segments.last() else {
             return false;
@@ -237,6 +275,89 @@ fn map_word_time_to_original(
         end: original_end,
         confidence: word.confidence,
     })
+}
+
+/// Trim the part of a mapped segment that lies in the audio region a prior slice
+/// already committed (`[.., boundary)` in original-timeline seconds). Returns
+/// `true` when the whole segment falls inside that region and should be dropped.
+///
+/// A word is assigned to whichever side of `boundary` holds the majority of it
+/// (midpoint rule), so a word straddling the cut is kept in exactly one slice.
+/// Leading committed words are dropped and the segment text is reconstructed
+/// from the surviving word span (exact substring of the original text, so CJK
+/// and glued punctuation stay intact); a segment left empty is dropped.
+fn trim_committed_overlap(segment: &mut Segment, boundary: f32) -> bool {
+    // Whole segment already behind the committed frontier: drop it outright.
+    // (This is the standalone-orphan shape, e.g. a hallucinated 1-word cue.)
+    if segment.end <= boundary {
+        return true;
+    }
+    if segment.words.is_empty() {
+        // No word anchors: fall back to the segment midpoint.
+        let midpoint = 0.5 * (segment.start + segment.end);
+        return midpoint < boundary;
+    }
+    let first_keep = segment
+        .words
+        .iter()
+        .position(|word| 0.5 * (word.start + word.end) >= boundary);
+    let Some(first_keep) = first_keep else {
+        // Every word's majority sits in the committed region.
+        return true;
+    };
+    if first_keep == 0 {
+        return false;
+    }
+    let chars: Vec<char> = segment.text.chars().collect();
+    let new_text = match leading_word_char_offset(&chars, &segment.words, first_keep) {
+        Some(offset) => chars[offset..]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string(),
+        // Words did not align to the text (unexpected): rebuild from the kept
+        // word tokens rather than mis-slice the string.
+        None => segment.words[first_keep..]
+            .iter()
+            .map(|word| word.word.trim())
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    segment.words.drain(0..first_keep);
+    if let Some(first) = segment.words.first() {
+        segment.start = first.start;
+    }
+    segment.text = new_text;
+    segment.text.trim().is_empty()
+}
+
+/// Char offset at which `words[first_keep]` begins within `chars`, found by the
+/// same greedy whitespace-delimited match the cue splitter uses. Returns `None`
+/// if a leading word does not align to the text.
+fn leading_word_char_offset(
+    chars: &[char],
+    words: &[WordTimestamp],
+    first_keep: usize,
+) -> Option<usize> {
+    let mut idx = 0usize;
+    for word in &words[..first_keep] {
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        let token: Vec<char> = word.word.trim().chars().collect();
+        if token.is_empty() {
+            continue;
+        }
+        if idx + token.len() > chars.len() || chars[idx..idx + token.len()] != token[..] {
+            return None;
+        }
+        idx += token.len();
+    }
+    while idx < chars.len() && chars[idx].is_whitespace() {
+        idx += 1;
+    }
+    Some(idx)
 }
 
 fn normalize_words(text: &str) -> Vec<String> {
@@ -464,6 +585,221 @@ mod tests {
         assert_eq!(transcription.segments[0].end, 1.0);
         assert_eq!(transcription.segments[1].start, 1.0);
         assert_eq!(transcription.segments[1].end, 2.0);
+    }
+
+    fn word(text: &str, start: f32, end: f32) -> WordTimestamp {
+        WordTimestamp {
+            word: text.to_string(),
+            start,
+            end,
+            confidence: None,
+        }
+    }
+
+    fn absolute_segment(text: &str, start: f32, end: f32, words: Vec<WordTimestamp>) -> Segment {
+        Segment {
+            start,
+            end,
+            text: text.to_string(),
+            speaker: None,
+            speaker_label: None,
+            speaker_profile_id: None,
+            words,
+        }
+    }
+
+    #[test]
+    fn assembler_time_trims_hallucinated_leading_overlap_word() {
+        // Field defect shape: a forced cut at 1.0s widens the overlap so the next
+        // slice re-reads the straddling audio. A weak model hallucinates the head
+        // of its monolithic segment ("If,") from that already-committed region;
+        // its text does not match anything in slice 1, so text-equality dedup is
+        // blind to it. The time trim drops it by timestamp and keeps the rest.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000),
+            text: "hello world".to_string(),
+            segments: vec![absolute_segment(
+                "hello world",
+                0.1,
+                0.9,
+                vec![word("hello", 0.1, 0.4), word("world", 0.5, 0.9)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(12_000, 32_000),
+            text: "If, mad indeed would".to_string(),
+            segments: vec![absolute_segment(
+                "If, mad indeed would",
+                0.80,
+                1.90,
+                vec![
+                    word("If,", 0.80, 0.95),
+                    word("mad", 1.10, 1.30),
+                    word("indeed", 1.35, 1.60),
+                    word("would", 1.65, 1.90),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[1].text, "mad indeed would");
+        assert_eq!(transcription.segments[1].words.len(), 3);
+        assert_eq!(transcription.segments[1].words[0].word, "mad");
+        assert!((transcription.segments[1].start - 1.10).abs() < 1e-4);
+        assert_eq!(transcription.text, "hello world mad indeed would");
+        // The trimmed word is not a dropped segment, so no whole-segment drop.
+        assert_eq!(stats.duplicate_merge_count, 0);
+    }
+
+    #[test]
+    fn assembler_drops_standalone_orphan_inside_committed_span() {
+        // The "If," rendered as its own leading cue: the whole segment sits behind
+        // the committed frontier and is dropped outright.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000),
+            text: "hello world".to_string(),
+            segments: vec![absolute_segment(
+                "hello world",
+                0.1,
+                0.9,
+                vec![word("hello", 0.1, 0.4), word("world", 0.5, 0.9)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(12_000, 32_000),
+            text: "If,".to_string(),
+            segments: vec![
+                absolute_segment("If,", 0.80, 0.95, vec![word("If,", 0.80, 0.95)]),
+                absolute_segment(
+                    "mad indeed",
+                    1.10,
+                    1.60,
+                    vec![word("mad", 1.10, 1.30), word("indeed", 1.35, 1.60)],
+                ),
+            ],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[0].text, "hello world");
+        assert_eq!(transcription.segments[1].text, "mad indeed");
+        assert_eq!(transcription.text, "hello world mad indeed");
+        assert_eq!(stats.duplicate_merge_count, 1);
+    }
+
+    #[test]
+    fn assembler_keeps_straddling_word_with_majority_after_boundary() {
+        // A word straddling the 1.0s cut whose midpoint (1.025s) is past the
+        // boundary belongs to the new slice and is kept whole.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000),
+            text: "hello world".to_string(),
+            segments: vec![absolute_segment(
+                "hello world",
+                0.1,
+                0.9,
+                vec![word("hello", 0.1, 0.4), word("world", 0.5, 0.9)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(12_000, 32_000),
+            text: "straddle tail".to_string(),
+            segments: vec![absolute_segment(
+                "straddle tail",
+                0.85,
+                1.60,
+                vec![word("straddle", 0.85, 1.20), word("tail", 1.30, 1.60)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[1].text, "straddle tail");
+        assert_eq!(transcription.segments[1].words.len(), 2);
+    }
+
+    #[test]
+    fn assembler_trims_straddling_word_with_majority_before_boundary() {
+        // Same cut, but the leading word's midpoint (0.925s) is before the
+        // boundary, so the word belongs to the prior slice and is trimmed.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000),
+            text: "hello world".to_string(),
+            segments: vec![absolute_segment(
+                "hello world",
+                0.1,
+                0.9,
+                vec![word("hello", 0.1, 0.4), word("world", 0.5, 0.9)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(12_000, 32_000),
+            text: "straddle tail".to_string(),
+            segments: vec![absolute_segment(
+                "straddle tail",
+                0.75,
+                1.60,
+                vec![word("straddle", 0.75, 1.10), word("tail", 1.30, 1.60)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[1].text, "tail");
+        assert_eq!(transcription.segments[1].words.len(), 1);
+        assert_eq!(transcription.segments[1].words[0].word, "tail");
+    }
+
+    #[test]
+    fn assembler_does_not_trim_without_overlap() {
+        // Abutting, non-overlapping slices: the second slice's words all sit past
+        // the committed frontier, so nothing is trimmed.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000),
+            text: "hello world".to_string(),
+            segments: vec![absolute_segment(
+                "hello world",
+                0.1,
+                0.9,
+                vec![word("hello", 0.1, 0.4), word("world", 0.5, 0.9)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000, 32_000),
+            text: "next words here".to_string(),
+            segments: vec![absolute_segment(
+                "next words here",
+                1.20,
+                1.90,
+                vec![
+                    word("next", 1.20, 1.40),
+                    word("words", 1.50, 1.70),
+                    word("here", 1.75, 1.90),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[1].text, "next words here");
+        assert_eq!(transcription.segments[1].words.len(), 3);
+        assert_eq!(stats.duplicate_merge_count, 0);
     }
 
     #[test]
