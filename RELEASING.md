@@ -3,6 +3,12 @@
 OpenASR uses a single workspace version and a commit-driven release flow: a
 version bump pushed to `main` IS the release.
 
+Feature, fix, and any other content changes go through pull requests as usual.
+The release bump itself is the exception: a maintainer pushes it directly to
+`main` as a single `chore(release)` commit. Routing the bump through a PR adds
+nothing (the release fires on the merge commit anyway) and CI runs on `main`
+push regardless.
+
 ## Versioning
 
 The version lives in one logical place, bumped in lockstep:
@@ -11,10 +17,18 @@ The version lives in one logical place, bumped in lockstep:
 - the three inter-crate pins under `[workspace.dependencies]`
   (`openasr-core`, `openasr-server`, `openasr-system-audio`)
 
+Two lockfiles pin the workspace crates and must be regenerated in the same
+commit, or CI's `--locked` builds fail:
+
+- the root `Cargo.lock`: `cargo update -w --offline`
+- `tooling/system-audio-check/Cargo.lock` (standalone CI-gate workspace):
+  `cargo update --offline -p openasr-system-audio` inside that directory
+
 ## Cutting a release
 
 1. On `main`, bump the version in the four spots above (one edit block in
-   `Cargo.toml`) and commit, e.g. `chore(release): v0.2.0`.
+   `Cargo.toml`), regenerate both lockfiles, and commit everything together,
+   e.g. `chore(release): v0.2.0`.
 2. Push to `main`. The `Release core` workflow
    (`.github/workflows/release-core.yml`) triggers on `Cargo.toml` changes:
    - reads the workspace version;
