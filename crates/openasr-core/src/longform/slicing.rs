@@ -399,12 +399,19 @@ fn plan_packed_layout_from_speech_spans(
     if speech_spans.len() < 2 {
         return None;
     }
-    let target_chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz).max(1);
+    let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz).max(1);
+    let max_chunk_samples =
+        seconds_to_samples(options.max_chunk_seconds, sample_rate_hz).max(chunk_samples);
     let min_chunk_samples = seconds_to_samples(options.min_chunk_seconds, sample_rate_hz).max(1);
     let gap_bridge_samples = seconds_to_samples(vad_coalesce_gap_seconds(options), sample_rate_hz);
+    // Only genuine long pauses (> the coalesce gap) should end a kept region and
+    // be elided. Short breath gaps are bridged up to the ceiling so a region that
+    // spans them stays intact; the silence-aware packer below then places window
+    // boundaries at true low-energy frames rather than eliding a quiet word tail
+    // that the neural VAD happened to leave in a short gap.
     let keep_spans = coalesce_vad_slices(
         speech_spans,
-        target_chunk_samples,
+        max_chunk_samples,
         min_chunk_samples,
         gap_bridge_samples,
         samples.len(),
@@ -419,8 +426,13 @@ fn plan_packed_layout_from_speech_spans(
     )?;
     let mut packed_options = options.clone();
     packed_options.padding_seconds = 0.0;
-    let packed_windows =
-        pack_processed_spans_into_windows(&packed_spans, sample_rate_hz, &packed_options);
+    let packed_windows = pack_processed_spans_into_windows(
+        &packed_spans,
+        sample_rate_hz,
+        &packed_options,
+        samples,
+        &timeline,
+    );
     let slices: Vec<AudioSlice> = packed_windows
         .into_iter()
         .enumerate()
@@ -558,10 +570,17 @@ fn plan_vad_slices_from_speech_spans(
     options: &LongFormOptions,
     vad_slices: Vec<LongFormVadSlice>,
 ) -> Vec<AudioSlice> {
-    let max_chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz);
+    let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz);
+    let max_chunk_samples =
+        seconds_to_samples(options.max_chunk_seconds, sample_rate_hz).max(chunk_samples);
     let min_chunk_samples = seconds_to_samples(options.min_chunk_seconds, sample_rate_hz);
     let gap_bridge_samples = seconds_to_samples(vad_coalesce_gap_seconds(options), sample_rate_hz);
-    let overlap_samples = seconds_to_samples(options.overlap_seconds, sample_rate_hz);
+    // Bridge short breath gaps into continuous-speech regions up to the ceiling,
+    // then let the silence-aware force-cut below place chunk boundaries at true
+    // low-energy frames. Capping coalescing at `chunk_seconds` (as before) would
+    // instead stop a region at whatever raw VAD span end happened to fit under
+    // 30s -- a boundary the neural VAD routinely draws mid-word on a quiet
+    // fricative, which is then lost between adjacent regions.
     let coalesced_slices = coalesce_vad_slices(
         vad_slices,
         max_chunk_samples.max(1),
@@ -574,28 +593,145 @@ fn plan_vad_slices_from_speech_spans(
         if vad_slice.end_sample <= vad_slice.start_sample {
             continue;
         }
-        let mut start = vad_slice.start_sample.min(samples.len());
-        let end = vad_slice.end_sample.min(samples.len());
-        while start < end {
-            let next_end = (start + max_chunk_samples).min(end);
-            slices.push(AudioSlice {
-                index: slices.len(),
-                kind: AudioSliceKind::Vad,
-                start_sample: start,
-                end_sample: next_end,
-                content_start_sample: start,
-                content_end_sample: next_end,
-            });
-            if next_end >= end {
-                break;
-            }
-            start = next_end.saturating_sub(overlap_samples);
-            if start >= next_end {
-                start = next_end;
-            }
-        }
+        let span_start = vad_slice.start_sample.min(samples.len());
+        let span_end = vad_slice.end_sample.min(samples.len());
+        extend_vad_slices_for_span(
+            &mut slices,
+            samples,
+            span_start,
+            span_end,
+            sample_rate_hz,
+            options,
+        );
     }
     slices
+}
+
+/// Force-cut a single coalesced speech region into chunk-sized VAD slices at
+/// silence-aware boundaries.
+///
+/// A region longer than `chunk_seconds` is split at the quietest frame in a
+/// search window around the target boundary rather than at the raw arithmetic
+/// `start + chunk` sample (which routinely lands mid-word on continuous speech).
+/// The region may grow past `chunk_seconds` toward a natural pause, but never
+/// beyond `max_chunk_seconds` -- the true ceiling. When no pause exists up to the
+/// ceiling the cut is forced through voiced speech at the ceiling, and the
+/// overlap into the next slice is widened so the straddling word is re-read whole
+/// (the assembler's overlap dedup then drops the redundant copy).
+fn extend_vad_slices_for_span(
+    slices: &mut Vec<AudioSlice>,
+    samples: &[f32],
+    span_start: usize,
+    span_end: usize,
+    sample_rate_hz: u32,
+    options: &LongFormOptions,
+) {
+    if span_end <= span_start {
+        return;
+    }
+    let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz).max(1);
+    let max_chunk_samples =
+        seconds_to_samples(options.max_chunk_seconds, sample_rate_hz).max(chunk_samples);
+    let min_chunk_samples = seconds_to_samples(options.min_chunk_seconds, sample_rate_hz);
+    let search_samples = seconds_to_samples(options.energy_split_search_seconds, sample_rate_hz);
+    let base_overlap_samples = seconds_to_samples(options.overlap_seconds, sample_rate_hz);
+    let forced_overlap_samples = forced_cut_overlap_samples(options, sample_rate_hz, chunk_samples);
+    let silence_threshold_linear = 10.0_f32.powf(options.energy_silence_threshold_db / 20.0);
+
+    let mut start = span_start;
+    while start < span_end {
+        let desired = (start + chunk_samples).min(span_end);
+        if desired >= span_end {
+            slices.push(vad_slice(slices.len(), start, span_end));
+            break;
+        }
+        let hard_end = (start + max_chunk_samples).min(span_end);
+        let floor = (start + min_chunk_samples).min(hard_end);
+        let (split, forced) = choose_forced_cut(
+            samples,
+            desired,
+            hard_end,
+            floor,
+            search_samples,
+            silence_threshold_linear,
+        );
+        slices.push(vad_slice(slices.len(), start, split));
+        if split >= span_end {
+            break;
+        }
+        let overlap = if forced {
+            forced_overlap_samples
+        } else {
+            base_overlap_samples
+        };
+        start = split.saturating_sub(overlap);
+        if let Some(last) = slices.last()
+            && start <= last.content_start_sample
+        {
+            start = last.content_end_sample;
+        }
+    }
+}
+
+fn vad_slice(index: usize, start_sample: usize, end_sample: usize) -> AudioSlice {
+    AudioSlice {
+        index,
+        kind: AudioSliceKind::Vad,
+        start_sample,
+        end_sample,
+        content_start_sample: start_sample,
+        content_end_sample: end_sample,
+    }
+}
+
+/// Choose a silence-aware split for a speech region that overruns one chunk.
+///
+/// Returns the split sample plus whether the cut was forced through voiced
+/// speech (no pause up to the ceiling), which the caller uses to widen the
+/// overlap. Preference order: the quietest genuine pause near the target
+/// boundary; else the nearest pause while growing toward the ceiling; else the
+/// quietest frame at the ceiling (forced).
+fn choose_forced_cut(
+    samples: &[f32],
+    desired: usize,
+    hard_end: usize,
+    floor: usize,
+    search_samples: usize,
+    silence_threshold_linear: f32,
+) -> (usize, bool) {
+    let clamp = |value: usize| value.max(floor).min(hard_end);
+    let window_lo = desired.saturating_sub(search_samples).max(floor);
+    let window_hi = (desired + search_samples).min(hard_end);
+    if let Some((split, split_rms)) = lowest_energy_split_with_rms(samples, window_lo, window_hi)
+        && split_rms <= silence_threshold_linear
+    {
+        return (clamp(split), false);
+    }
+    if window_hi < hard_end
+        && let Some(split) =
+            first_low_energy_split(samples, window_hi, hard_end, silence_threshold_linear)
+    {
+        return (clamp(split), false);
+    }
+    let ceiling_lo = hard_end.saturating_sub(search_samples).max(floor);
+    let split = find_lowest_energy_split(samples, ceiling_lo, hard_end).unwrap_or(hard_end);
+    (clamp(split), true)
+}
+
+/// Overlap applied when a cut is forced through voiced speech. Widened past the
+/// configured overlap so a word straddling the cut is re-read whole in the next
+/// slice, but bounded (>= 1s, <= 2s, and always below a full chunk) so slices
+/// still advance and the extra audio stays small.
+fn forced_cut_overlap_samples(
+    options: &LongFormOptions,
+    sample_rate_hz: u32,
+    chunk_samples: usize,
+) -> usize {
+    let base = seconds_to_samples(options.overlap_seconds, sample_rate_hz);
+    let target = seconds_to_samples(1.0, sample_rate_hz);
+    let ceiling = seconds_to_samples(2.0, sample_rate_hz);
+    let widened = base.max(target).min(ceiling.max(base));
+    widened.min(chunk_samples.saturating_sub(1).max(1))
 }
 
 fn coalesce_vad_slices(
@@ -1236,6 +1372,8 @@ fn pack_processed_spans_into_windows(
     spans: &[LongFormVadSlice],
     sample_rate_hz: u32,
     options: &LongFormOptions,
+    samples: &[f32],
+    timeline: &TimelineMap,
 ) -> Vec<LongFormVadSlice> {
     if spans.is_empty() {
         return Vec::new();
@@ -1244,10 +1382,17 @@ fn pack_processed_spans_into_windows(
     let min_chunk_samples = seconds_to_samples(options.min_chunk_seconds, sample_rate_hz).max(1);
     let overlap_samples = seconds_to_samples(options.overlap_seconds, sample_rate_hz)
         .min(target_chunk_samples.saturating_sub(1));
+    // A single processed span longer than one chunk (a continuous-speech region
+    // bridged across breath gaps) has no interior span boundary to pack against,
+    // so split it at silence-aware frames in the original audio. This keeps packed
+    // window edges off mid-word positions, honoring the same low-energy-cut and
+    // max_chunk-ceiling rules as the identity path.
+    let subdivided =
+        subdivide_processed_spans_silence_aware(spans, sample_rate_hz, options, samples, timeline);
     let mut windows = Vec::new();
-    let mut current_start = spans[0].start_sample;
-    let mut current_end = spans[0].end_sample;
-    for span in spans.iter().skip(1) {
+    let mut current_start = subdivided[0].start_sample;
+    let mut current_end = subdivided[0].end_sample;
+    for span in subdivided.iter().skip(1) {
         let prospective_end = span.end_sample;
         let prospective_len = prospective_end.saturating_sub(current_start);
         let current_len = current_end.saturating_sub(current_start);
@@ -1265,6 +1410,72 @@ fn pack_processed_spans_into_windows(
         end_sample: current_end,
     });
     windows
+}
+
+/// Split each processed span longer than one chunk into chunk-sized sub-spans at
+/// silence-aware boundaries. The split points are found in the original audio
+/// (a single processed span maps affinely back to a contiguous original region,
+/// since seams only ever sit between spans) and mapped back into processed
+/// coordinates. Sub-spans are contiguous; the packer above applies the overlap.
+fn subdivide_processed_spans_silence_aware(
+    spans: &[LongFormVadSlice],
+    sample_rate_hz: u32,
+    options: &LongFormOptions,
+    samples: &[f32],
+    timeline: &TimelineMap,
+) -> Vec<LongFormVadSlice> {
+    let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz).max(1);
+    let max_chunk_samples =
+        seconds_to_samples(options.max_chunk_seconds, sample_rate_hz).max(chunk_samples);
+    let min_chunk_samples = seconds_to_samples(options.min_chunk_seconds, sample_rate_hz);
+    let search_samples = seconds_to_samples(options.energy_split_search_seconds, sample_rate_hz);
+    let silence_threshold_linear = 10.0_f32.powf(options.energy_silence_threshold_db / 20.0);
+    let mut out = Vec::with_capacity(spans.len());
+    for span in spans {
+        if span.end_sample.saturating_sub(span.start_sample) <= chunk_samples {
+            out.push(span.clone());
+            continue;
+        }
+        let processed_start_seconds = span.start_sample as f32 / sample_rate_hz as f32;
+        let original_start = (timeline.map_processed_to_original_seconds(processed_start_seconds)
+            * sample_rate_hz as f32)
+            .round()
+            .max(0.0) as usize;
+        let processed_to_original = original_start as isize - span.start_sample as isize;
+        let to_original =
+            |processed: usize| (processed as isize + processed_to_original).max(0) as usize;
+        let to_processed = |original: usize| {
+            (original as isize - processed_to_original).max(span.start_sample as isize) as usize
+        };
+        let mut start = span.start_sample;
+        while start < span.end_sample {
+            let desired = (start + chunk_samples).min(span.end_sample);
+            if desired >= span.end_sample {
+                out.push(LongFormVadSlice {
+                    start_sample: start,
+                    end_sample: span.end_sample,
+                });
+                break;
+            }
+            let hard_end = (start + max_chunk_samples).min(span.end_sample);
+            let floor = (start + min_chunk_samples).min(hard_end);
+            let (original_split, _forced) = choose_forced_cut(
+                samples,
+                to_original(desired),
+                to_original(hard_end),
+                to_original(floor),
+                search_samples,
+                silence_threshold_linear,
+            );
+            let split = to_processed(original_split).clamp(start + 1, span.end_sample);
+            out.push(LongFormVadSlice {
+                start_sample: start,
+                end_sample: split,
+            });
+            start = split;
+        }
+    }
+    out
 }
 
 fn timeline_anchor_from_samples(
@@ -1452,11 +1663,18 @@ fn apply_padding(
 }
 
 fn find_lowest_energy_split(samples: &[f32], start: usize, end: usize) -> Option<usize> {
+    lowest_energy_split_with_rms(samples, start, end).map(|(index, _)| index)
+}
+
+/// Lowest-energy frame midpoint in `[start, end)` together with its RMS, so
+/// callers can distinguish a genuine pause (RMS at/below the silence threshold)
+/// from a cut forced through voiced speech.
+fn lowest_energy_split_with_rms(samples: &[f32], start: usize, end: usize) -> Option<(usize, f32)> {
     if start >= end {
         return None;
     }
     let frame = 1600usize;
-    let mut best_index = None;
+    let mut best = None;
     let mut best_energy = f32::INFINITY;
     let mut index = start;
     while index < end {
@@ -1467,11 +1685,39 @@ fn find_lowest_energy_split(samples: &[f32], start: usize, end: usize) -> Option
         let rms = rms(&samples[index..right]);
         if rms < best_energy {
             best_energy = rms;
-            best_index = Some(index + (right - index) / 2);
+            best = Some((index + (right - index) / 2, rms));
         }
         index = right;
     }
-    best_index
+    best
+}
+
+/// Midpoint of the first frame in `[start, end)` whose RMS is at/below the
+/// silence threshold, i.e. the nearest natural pause. Used to grow a region
+/// toward a real pause rather than jumping to the globally quietest (possibly
+/// distant) frame.
+fn first_low_energy_split(
+    samples: &[f32],
+    start: usize,
+    end: usize,
+    silence_threshold_linear: f32,
+) -> Option<usize> {
+    if start >= end {
+        return None;
+    }
+    let frame = 1600usize;
+    let mut index = start;
+    while index < end {
+        let right = (index + frame).min(samples.len()).min(end);
+        if right <= index {
+            break;
+        }
+        if rms(&samples[index..right]) <= silence_threshold_linear {
+            return Some(index + (right - index) / 2);
+        }
+        index = right;
+    }
+    None
 }
 
 fn rms(samples: &[f32]) -> f32 {
@@ -2812,7 +3058,13 @@ mod tests {
                 end_sample: 16_000 * 54,
             },
         ];
-        let windows = pack_processed_spans_into_windows(&spans, 16_000, &options);
+        let windows = pack_processed_spans_into_windows(
+            &spans,
+            16_000,
+            &options,
+            &[],
+            &TimelineMap::identity(),
+        );
         assert_eq!(windows.len(), 3, "{windows:#?}");
         assert!(
             windows[1].start_sample < windows[0].end_sample,
@@ -2924,5 +3176,115 @@ mod tests {
             identity_candidate.short_slice_penalty
         );
         assert_eq!(packed_candidate.score, identity_candidate.score);
+    }
+
+    fn single_span(samples: &[f32]) -> Vec<LongFormVadSlice> {
+        vec![LongFormVadSlice {
+            start_sample: 0,
+            end_sample: samples.len(),
+        }]
+    }
+
+    #[test]
+    fn vad_force_cut_lands_on_low_energy_dip_not_arithmetic_boundary() {
+        let mut options = options_with_mode(LongFormMode::Vad);
+        options.chunk_seconds = 30.0;
+        options.overlap_seconds = 0.5;
+        options.energy_split_search_seconds = 5.0;
+        // 45s of tone with a 1s silent dip at 27s: inside the [25s, 35s] search
+        // window but clearly off the 30s arithmetic boundary.
+        let mut samples = tone(16_000 * 45);
+        for sample in samples.iter_mut().take(16_000 * 28).skip(16_000 * 27) {
+            *sample = 0.0;
+        }
+        let slices =
+            plan_vad_slices_from_speech_spans(&samples, 16_000, &options, single_span(&samples));
+        assert!(slices.len() >= 2, "{slices:#?}");
+        let cut = slices[0].content_end_sample;
+        assert!(
+            cut > 16_000 * 27 && cut < 16_000 * 28,
+            "cut {cut} did not land on the 27s dip"
+        );
+        assert!(cut < 16_000 * 29, "cut {cut} landed near the 30s boundary");
+        // Genuine pause -> base 0.5s overlap into the next slice.
+        assert_eq!(
+            slices[1].content_start_sample,
+            cut - 16_000 / 2,
+            "{slices:#?}"
+        );
+    }
+
+    #[test]
+    fn vad_force_cut_grows_past_chunk_toward_pause_within_ceiling() {
+        let mut options = options_with_mode(LongFormMode::Vad);
+        options.chunk_seconds = 30.0;
+        options.max_chunk_seconds = 55.0;
+        options.energy_split_search_seconds = 5.0;
+        // Pauseless through the 30s target and its window; the first real pause is
+        // a 1s dip at 40s, past chunk but under the 55s ceiling.
+        let mut samples = tone(16_000 * 60);
+        for sample in samples.iter_mut().take(16_000 * 41).skip(16_000 * 40) {
+            *sample = 0.0;
+        }
+        let slices =
+            plan_vad_slices_from_speech_spans(&samples, 16_000, &options, single_span(&samples));
+        let cut = slices[0].content_end_sample;
+        assert!(
+            cut > 16_000 * 40 && cut < 16_000 * 41,
+            "expected growth to the 40s pause, got {cut}"
+        );
+        assert!(
+            cut > 16_000 * 30,
+            "region should grow past the 30s chunk target"
+        );
+        assert!(cut < 16_000 * 55, "region must stay under the 55s ceiling");
+    }
+
+    #[test]
+    fn vad_force_cut_at_ceiling_widens_overlap_when_pauseless() {
+        let mut options = options_with_mode(LongFormMode::Vad);
+        options.chunk_seconds = 30.0;
+        options.max_chunk_seconds = 40.0;
+        options.overlap_seconds = 0.5;
+        options.energy_split_search_seconds = 5.0;
+        // 90s of unbroken tone: no pause anywhere. max_chunk must still bound each
+        // slice (proving it is a real ceiling, not the dead parameter it was on
+        // this path), and the forced cut widens the overlap.
+        let samples = tone(16_000 * 90);
+        let slices =
+            plan_vad_slices_from_speech_spans(&samples, 16_000, &options, single_span(&samples));
+        assert!(
+            slices.len() >= 2,
+            "pauseless region must still be split, got {}",
+            slices.len()
+        );
+        let max_chunk_samples = 16_000 * 40;
+        for slice in &slices {
+            assert!(
+                slice.content_duration_samples() <= max_chunk_samples,
+                "slice exceeds the ceiling: {slice:?}"
+            );
+        }
+        let overlap = slices[0].content_end_sample - slices[1].content_start_sample;
+        assert_eq!(
+            overlap, 16_000,
+            "forced overlap should widen to 1s, got {overlap}"
+        );
+        assert!(
+            overlap > 16_000 / 2,
+            "widened overlap must exceed the 0.5s base"
+        );
+    }
+
+    #[test]
+    fn vad_region_shorter_than_chunk_stays_single_slice() {
+        let mut options = options_with_mode(LongFormMode::Vad);
+        options.chunk_seconds = 30.0;
+        let samples = tone(16_000 * 20);
+        let slices =
+            plan_vad_slices_from_speech_spans(&samples, 16_000, &options, single_span(&samples));
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].content_start_sample, 0);
+        assert_eq!(slices[0].content_end_sample, samples.len());
     }
 }
