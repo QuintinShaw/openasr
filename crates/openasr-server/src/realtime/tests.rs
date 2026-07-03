@@ -2105,6 +2105,9 @@ async fn websocket_session_emits_capabilities_before_start_with_monotonic_sequen
             assert!(event.capabilities.supports_realtime_sessions);
             assert!(!event.capabilities.translation.supported);
             assert!(!event.capabilities.translation.installed);
+            // Default runtime (mock backend, no model pack) is
+            // file-per-utterance fallback, never frame-sync.
+            assert!(!event.capabilities.frame_sync_partials);
             assert_eq!(
                 event.capabilities.translation.reason,
                 Some("translation_pack_missing")
@@ -2112,6 +2115,49 @@ async fn websocket_session_emits_capabilities_before_start_with_monotonic_sequen
             assert_eq!(event.frame_duration_ms, DEFAULT_FRAME_DURATION_MS);
             assert_eq!(event.frame_byte_len, 640);
             assert_eq!(event.max_message_bytes, MAX_WS_MESSAGE_BYTES);
+        }
+        other => panic!("expected session.capabilities event, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn session_capabilities_event_reports_frame_sync_only_for_xasr_zipformer() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let xasr_path = temp.path().join("xasr-zipformer-capability-test.oasr");
+    write_xasr_streaming_fixture_pack(&xasr_path, "xasr-zipformer-capability-test");
+    let xasr_runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        ffmpeg_bin: None,
+        model_pack_path: Some(xasr_path),
+    };
+    let (xasr_event_sender, mut xasr_event_receiver) = mpsc::channel(8);
+    let mut xasr_session = WsSession::new(xasr_runtime, test_distribution(), xasr_event_sender);
+    xasr_session.emit_capabilities().await.unwrap();
+    match xasr_event_receiver.recv().await.unwrap().event {
+        RealtimeEvent::Lifecycle(RealtimeLifecycleEvent::SessionCapabilities(event)) => {
+            assert!(event.capabilities.is_true_streaming);
+            assert!(event.capabilities.frame_sync_partials);
+        }
+        other => panic!("expected session.capabilities event, got {other:?}"),
+    }
+
+    let qwen_path = temp.path().join("qwen-capability-test.oasr");
+    write_qwen_streaming_fixture_pack(&qwen_path, "qwen-capability-test");
+    let qwen_runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        ffmpeg_bin: None,
+        model_pack_path: Some(qwen_path),
+    };
+    let (qwen_event_sender, mut qwen_event_receiver) = mpsc::channel(8);
+    let mut qwen_session = WsSession::new(qwen_runtime, test_distribution(), qwen_event_sender);
+    qwen_session.emit_capabilities().await.unwrap();
+    match qwen_event_receiver.recv().await.unwrap().event {
+        RealtimeEvent::Lifecycle(RealtimeLifecycleEvent::SessionCapabilities(event)) => {
+            // Qwen also runs a native true-streaming session, but through the
+            // buffered re-decode driver -- it must not claim frame-sync partials.
+            assert!(event.capabilities.is_true_streaming);
+            assert!(!event.capabilities.frame_sync_partials);
         }
         other => panic!("expected session.capabilities event, got {other:?}"),
     }

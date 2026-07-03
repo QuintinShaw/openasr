@@ -3,6 +3,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::GgmlAsrExecutionDispatch;
+use crate::StreamingPartialGranularity;
 use crate::arch::{OpenAsrArchitectureRegistry, OpenAsrArchitectureRegistryError};
 
 use super::cohere::CohereTranscribeGgmlExecutor;
@@ -92,34 +93,69 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
     // implementation. The offline executor registry is intentionally not reused
     // here, so metadata alone cannot turn an offline decoder into a claimed
     // realtime/partial runtime.
+    //
+    // Each adapter also declares its partial-result granularity here: the
+    // registration site is the only place that knows whether a family's
+    // streaming session is the frame-sync append-only driver (never revises
+    // emitted text) or a buffered/windowed re-decode driver (may revise).
+    // Only xasr-zipformer runs the frame-sync driver today; every other
+    // family re-decodes a growing or windowed buffer.
     Ok(GgmlAsrExecutionDispatch::default()
         .with_streaming_executor_for_adapter(
             crate::QWEN3_ASR_GGML_ADAPTER_ID,
             Arc::new(Qwen3AsrGgmlExecutor::default()),
         )
+        .with_streaming_partial_granularity_for_adapter(
+            crate::QWEN3_ASR_GGML_ADAPTER_ID,
+            StreamingPartialGranularity::Buffered,
+        )
         .with_streaming_executor_for_adapter(
             crate::WHISPER_GGML_ADAPTER_ID,
             Arc::new(WhisperGgmlExecutor::default()),
+        )
+        .with_streaming_partial_granularity_for_adapter(
+            crate::WHISPER_GGML_ADAPTER_ID,
+            StreamingPartialGranularity::Buffered,
         )
         .with_streaming_executor_for_adapter(
             crate::COHERE_TRANSCRIBE_GGML_ADAPTER_ID,
             Arc::new(CohereTranscribeGgmlExecutor::default()),
         )
+        .with_streaming_partial_granularity_for_adapter(
+            crate::COHERE_TRANSCRIBE_GGML_ADAPTER_ID,
+            StreamingPartialGranularity::Buffered,
+        )
         .with_streaming_executor_for_adapter(
             crate::MOONSHINE_GGML_ADAPTER_ID,
             Arc::new(MoonshineGgmlExecutor::default()),
+        )
+        .with_streaming_partial_granularity_for_adapter(
+            crate::MOONSHINE_GGML_ADAPTER_ID,
+            StreamingPartialGranularity::Buffered,
         )
         .with_streaming_executor_for_adapter(
             crate::PARAKEET_CTC_GGML_ADAPTER_ID,
             Arc::new(ParakeetCtcGgmlExecutor),
         )
+        .with_streaming_partial_granularity_for_adapter(
+            crate::PARAKEET_CTC_GGML_ADAPTER_ID,
+            StreamingPartialGranularity::Buffered,
+        )
         .with_streaming_executor_for_adapter(
             crate::WAV2VEC2_CTC_GGML_ADAPTER_ID,
             Arc::new(Wav2Vec2CtcGgmlExecutor),
         )
+        .with_streaming_partial_granularity_for_adapter(
+            crate::WAV2VEC2_CTC_GGML_ADAPTER_ID,
+            StreamingPartialGranularity::Buffered,
+        )
         .with_streaming_executor_for_adapter(
             crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
             Arc::new(XasrZipformerGgmlExecutor),
+        )
+        .with_streaming_partial_granularity_for_adapter(
+            crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
+            StreamingPartialGranularity::FrameSync,
         ))
 }
 
@@ -295,6 +331,28 @@ mod tests {
             message.contains(crate::arch::XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID),
             "{message}"
         );
+    }
+
+    #[test]
+    fn builtin_streaming_dispatch_declares_xasr_as_the_only_frame_sync_family() {
+        let dispatch =
+            build_builtin_ggml_streaming_execution_dispatch().expect("builtin streaming dispatch");
+        let buffered_descriptors = [
+            qwen3_asr_runtime_descriptor_v1(),
+            whisper_runtime_descriptor_v1(),
+            crate::cohere_transcribe_runtime_descriptor_v1(),
+            crate::moonshine_runtime_descriptor_v1(),
+            parakeet_ctc_runtime_descriptor_v1(),
+            wav2vec2_ctc_runtime_descriptor_v1(),
+        ];
+        for descriptor in &buffered_descriptors {
+            assert!(
+                !dispatch.is_frame_sync_for(descriptor),
+                "{} should be buffered, not frame-sync",
+                descriptor.adapter_id
+            );
+        }
+        assert!(dispatch.is_frame_sync_for(&xasr_zipformer_runtime_descriptor_v1()));
     }
 
     #[test]

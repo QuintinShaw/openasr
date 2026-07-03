@@ -925,6 +925,10 @@ async fn capabilities_endpoint_reflects_active_xasr_phrase_bias_capability() {
     assert_eq!(parsed["realtime"]["mode"], "true_streaming");
     assert_eq!(parsed["realtime"]["phrase_bias"]["supported"], false);
     assert_eq!(parsed["realtime"]["supports_partial_results"], true);
+    // xasr-zipformer is the only family running the frame-sync append-only
+    // streaming driver; every other true-streaming family re-decodes a
+    // buffer and must not claim this.
+    assert_eq!(parsed["realtime"]["frame_sync_partials"], true);
 }
 
 #[tokio::test]
