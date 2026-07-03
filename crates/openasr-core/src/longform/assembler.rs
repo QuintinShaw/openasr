@@ -69,7 +69,6 @@ impl TranscriptAssembler {
             self.stats.skipped_silent_chunks += 1;
             return;
         }
-        let synthesized_slice_fallback = transcript.segments.is_empty();
         if transcript.segments.is_empty() {
             let sample_rate = 16_000.0_f32;
             transcript.segments.push(Segment {
@@ -95,9 +94,11 @@ impl TranscriptAssembler {
                 self.stats.duplicate_merge_count += 1;
                 continue;
             }
-            if !synthesized_slice_fallback && self.try_merge_adjacent_segment(mapped.clone()) {
-                continue;
-            }
+            // Distinct segments are kept distinct: the post-ASR cue
+            // re-segmentation pass owns subtitle granularity, so the assembler
+            // no longer coalesces adjacent same-speaker segments into paragraph
+            // blobs. Only exact / high-overlap duplicates from slice overlap are
+            // dropped above.
             self.segments.push(mapped);
         }
     }
@@ -202,34 +203,6 @@ impl TranscriptAssembler {
         let min_len = previous_words.len().min(current_words.len());
         min_len >= self.merge_policy.redundant_min_words
             && overlap as f32 / min_len as f32 >= self.merge_policy.redundant_overlap_ratio
-    }
-
-    fn try_merge_adjacent_segment(&mut self, current: Segment) -> bool {
-        let Some(previous) = self.segments.last_mut() else {
-            return false;
-        };
-        if current.start < previous.end {
-            return false;
-        }
-        let gap = current.start - previous.end;
-        if gap > self.merge_policy.max_gap_seconds {
-            return false;
-        }
-        // Never merge across a speaker change — the merged segment would
-        // misattribute one speaker's words to the other.
-        if previous.speaker != current.speaker {
-            return false;
-        }
-        if !previous.text.ends_with(' ') {
-            previous.text.push(' ');
-        }
-        previous.text.push_str(current.text.trim());
-        previous.end = previous.end.max(current.end);
-        // The merged segment's words already carry original-timeline timestamps
-        // (mapped by map_segment_time before merge); append them so word-level
-        // timing spans the whole merged segment instead of only its first half.
-        previous.words.extend(current.words);
-        true
     }
 }
 
@@ -400,7 +373,11 @@ mod tests {
     }
 
     #[test]
-    fn assembler_merge_preserves_words_from_both_segments() {
+    fn assembler_keeps_adjacent_segments_distinct() {
+        // Adjacent, non-overlapping segments are no longer coalesced into a
+        // paragraph blob: the post-ASR cue re-segmentation pass owns subtitle
+        // granularity. Each segment survives with its own words and timing, and
+        // the joined transcript text still reads as one paragraph.
         let mut assembler =
             TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
         assembler.push_slice_result(SliceTranscript {
@@ -457,13 +434,12 @@ mod tests {
         let transcription = assembler.into_transcription();
         assert_eq!(
             transcription.segments.len(),
-            1,
-            "adjacent non-overlapping segments should merge into one"
+            2,
+            "adjacent segments must stay distinct"
         );
-        let merged = &transcription.segments[0];
-        assert_eq!(merged.text, "hello world from openasr");
-        let merged_words: Vec<&str> = merged.words.iter().map(|w| w.word.as_str()).collect();
-        assert_eq!(merged_words, ["hello", "world", "from", "openasr"]);
+        assert_eq!(transcription.segments[0].text, "hello world");
+        assert_eq!(transcription.segments[1].text, "from openasr");
+        assert_eq!(transcription.text, "hello world from openasr");
     }
 
     #[test]

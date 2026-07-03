@@ -261,3 +261,48 @@ fn renders_markdown_speaker_prefix_only_when_present() {
         "# Transcript\n\nSPEAKER_00: hello world\n\nnext line\n"
     );
 }
+
+#[test]
+fn renders_markdown_coalesces_consecutive_same_speaker_cues() {
+    // The cue re-segmentation pass emits many short cues per speaker turn.
+    // Markdown groups consecutive same-speaker cues into one paragraph while a
+    // speaker change still starts a new one.
+    let transcription = Transcription {
+        text: "one two three four".to_string(),
+        segments: vec![
+            Segment {
+                start: 0.0,
+                end: 1.0,
+                text: "one two".to_string(),
+                speaker: Some("SPEAKER_00".to_string()),
+                speaker_label: None,
+                speaker_profile_id: None,
+                words: Vec::new(),
+            },
+            Segment {
+                start: 1.0,
+                end: 2.0,
+                text: "three".to_string(),
+                speaker: Some("SPEAKER_00".to_string()),
+                speaker_label: None,
+                speaker_profile_id: None,
+                words: Vec::new(),
+            },
+            Segment {
+                start: 2.0,
+                end: 3.0,
+                text: "four".to_string(),
+                speaker: Some("SPEAKER_01".to_string()),
+                speaker_label: None,
+                speaker_profile_id: None,
+                words: Vec::new(),
+            },
+        ],
+        longform: None,
+        language: None,
+    };
+    assert_eq!(
+        render_transcription(&transcription, ResponseFormat::Markdown).unwrap(),
+        "# Transcript\n\nSPEAKER_00: one two three\n\nSPEAKER_01: four\n"
+    );
+}
