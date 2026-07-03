@@ -2,6 +2,20 @@ use thiserror::Error;
 
 use crate::models::phrase_bias_decode::{TokenPhraseBias, apply_phrase_bias_to_logits};
 
+/// Largest token n-gram the degenerate-loop guard inspects (token ids, not
+/// characters). An observed greedy loop is a very short cycle - a single
+/// stuttered token, or a 2-4 token phrase emitted back to back - so 8 covers
+/// the field failures while keeping the per-step tail scan tiny.
+const MAX_REPEAT_NGRAM: usize = 8;
+
+/// Consecutive identical cycles that mark a greedy loop as degenerate. Kept
+/// deliberately high so legitimate human repetition never trips it: Mandarin
+/// "好好好" (3 identical single-token chars) or an emphatic "no no no" is only
+/// 3 cycles, so a threshold of 4 leaves normal speech untouched while still
+/// catching the degenerate loops (a phrase repeated 5+ times). Set to 0 to
+/// disable the guard entirely (fail-safe).
+const MAX_CONSECUTIVE_NGRAM_REPEATS: usize = 4;
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Seq2SeqGreedyDecodeConfig {
     pub initial_prompt_tokens: Vec<u32>,
@@ -186,6 +200,30 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
         }
         generated.push(selection.token_id);
         generated_probabilities.push(selection.probability);
+
+        // Degenerate greedy loops (the same short phrase emitted back to back
+        // forever - "gugugu", or a phrase repeated 5+ times) are not honest
+        // transcription. When the tail turns into such a loop, keep a single
+        // occurrence of the cycle and finish here instead of letting argmax
+        // spin to the token cap. Unreachable on healthy decodes (golden_diff),
+        // so the log below fires only on a real field loop.
+        if let Some(loop_hit) = detect_degenerate_ngram_repeat(
+            &generated,
+            MAX_REPEAT_NGRAM,
+            MAX_CONSECUTIVE_NGRAM_REPEATS,
+        ) {
+            eprintln!(
+                "openasr_seq2seq_greedy_decode stage=greedy_decode event=degenerate_ngram_repeat status=tripped step_index={step_index} ngram_len={} repeats={} kept_tokens={} dropped_tokens={}",
+                loop_hit.ngram_len,
+                loop_hit.repeats,
+                loop_hit.keep_len,
+                generated.len().saturating_sub(loop_hit.keep_len),
+            );
+            generated.truncate(loop_hit.keep_len);
+            generated_probabilities.truncate(loop_hit.keep_len);
+            reached_eot = true;
+            break;
+        }
     }
 
     if !reached_eot {
@@ -308,6 +346,60 @@ fn suppress_logits(logits: &mut [f32], token_ids: &[u32]) {
             *logit = SUPPRESSED_LOGIT;
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DegenerateNgramRepeat {
+    /// Number of leading tokens to keep: the sequence truncated to a single
+    /// occurrence of the repeated n-gram (loop start + one cycle).
+    keep_len: usize,
+    ngram_len: usize,
+    repeats: usize,
+}
+
+/// Detect a degenerate consecutive-n-gram loop in the tail of `tokens`.
+///
+/// Returns `Some` when the tail ends in the SAME `n`-token group repeated at
+/// least `max_consecutive_repeats` times in a row, for some `n` in
+/// `1..=max_ngram`; the smallest such `n` wins, so a single-token stutter is
+/// reported as `n = 1` rather than a longer coincidental period. The reported
+/// `keep_len` truncates the run back to its first occurrence. Returns `None`
+/// (guard inert) when either bound is 0, so callers can disable the guard.
+///
+/// Pure over the token-id tail: no logits, no tokenizer, unit-testable in
+/// isolation and shared by every seq2seq family that routes through the loop.
+fn detect_degenerate_ngram_repeat(
+    tokens: &[u32],
+    max_ngram: usize,
+    max_consecutive_repeats: usize,
+) -> Option<DegenerateNgramRepeat> {
+    if max_ngram == 0 || max_consecutive_repeats == 0 {
+        return None;
+    }
+    let len = tokens.len();
+    for n in 1..=max_ngram {
+        // Not enough tail yet to hold the required number of cycles.
+        if len < n.saturating_mul(max_consecutive_repeats) {
+            continue;
+        }
+        let ngram = &tokens[len - n..];
+        // Walk backwards in blocks of `n`, counting trailing blocks equal to
+        // the final n-gram (the last block is the first repeat).
+        let mut repeats = 1usize;
+        while (repeats + 1).saturating_mul(n) <= len
+            && &tokens[len - (repeats + 1) * n..len - repeats * n] == ngram
+        {
+            repeats += 1;
+        }
+        if repeats >= max_consecutive_repeats {
+            return Some(DegenerateNgramRepeat {
+                keep_len: len - (repeats - 1) * n,
+                ngram_len: n,
+                repeats,
+            });
+        }
+    }
+    None
 }
 
 fn argmax_index(values: &[f32]) -> Option<usize> {
@@ -733,5 +825,162 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.generated_tokens, vec![1]);
+    }
+
+    #[test]
+    fn degenerate_repeat_guard_leaves_non_repeating_tail_untouched() {
+        assert_eq!(detect_degenerate_ngram_repeat(&[1, 2, 3, 4, 5], 8, 4), None);
+    }
+
+    #[test]
+    fn degenerate_repeat_guard_leaves_a_few_cycles_untouched() {
+        // Two or three cycles are legitimate human repetition, not a loop.
+        assert_eq!(detect_degenerate_ngram_repeat(&[7, 7], 8, 4), None);
+        assert_eq!(detect_degenerate_ngram_repeat(&[7, 7, 7], 8, 4), None);
+        // Multi-token phrase repeated three times ("好好好"-style emphasis).
+        assert_eq!(
+            detect_degenerate_ngram_repeat(&[1, 2, 1, 2, 1, 2], 8, 4),
+            None
+        );
+    }
+
+    #[test]
+    fn degenerate_repeat_guard_catches_single_token_stutter() {
+        // n = 1: "gugugu" - the same token id four times in a row.
+        assert_eq!(
+            detect_degenerate_ngram_repeat(&[5, 5, 5, 5], 8, 4),
+            Some(DegenerateNgramRepeat {
+                keep_len: 1,
+                ngram_len: 1,
+                repeats: 4,
+            })
+        );
+        // Extra copies past the threshold still truncate to one occurrence.
+        assert_eq!(
+            detect_degenerate_ngram_repeat(&[9, 5, 5, 5, 5, 5], 8, 4),
+            Some(DegenerateNgramRepeat {
+                keep_len: 2,
+                ngram_len: 1,
+                repeats: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn degenerate_repeat_guard_catches_multi_token_cycle() {
+        // n = 3: a 3-token phrase repeated five times back to back.
+        // ["感","觉","的"] x5 -> keep one occurrence (first 3 tokens).
+        let tokens = [11, 12, 13, 11, 12, 13, 11, 12, 13, 11, 12, 13, 11, 12, 13];
+        assert_eq!(
+            detect_degenerate_ngram_repeat(&tokens, 8, 4),
+            Some(DegenerateNgramRepeat {
+                keep_len: 3,
+                ngram_len: 3,
+                repeats: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn degenerate_repeat_guard_catches_field_shape_five_token_phrase() {
+        // The observed field insert: a ~5-token CJK phrase (6 chars / 18 bytes)
+        // repeated exactly 4 times back to back (72 bytes). R = 4 trips and
+        // truncates to a single occurrence; the 2x case (36 bytes) must not.
+        let phrase = [21, 22, 23, 24, 25];
+        let mut x4 = Vec::new();
+        for _ in 0..4 {
+            x4.extend_from_slice(&phrase);
+        }
+        assert_eq!(
+            detect_degenerate_ngram_repeat(&x4, 8, 4),
+            Some(DegenerateNgramRepeat {
+                keep_len: 5,
+                ngram_len: 5,
+                repeats: 4,
+            })
+        );
+        let mut x2 = Vec::new();
+        for _ in 0..2 {
+            x2.extend_from_slice(&phrase);
+        }
+        assert_eq!(detect_degenerate_ngram_repeat(&x2, 8, 4), None);
+    }
+
+    #[test]
+    fn degenerate_repeat_guard_covers_ngram_sizes_one_through_eight() {
+        for n in 1..=8usize {
+            // Build a distinct n-gram, then repeat it exactly the threshold.
+            let ngram: Vec<u32> = (0..n as u32).map(|i| i + 100).collect();
+            let mut tokens = Vec::new();
+            for _ in 0..4 {
+                tokens.extend_from_slice(&ngram);
+            }
+            assert_eq!(
+                detect_degenerate_ngram_repeat(&tokens, 8, 4),
+                Some(DegenerateNgramRepeat {
+                    keep_len: n,
+                    ngram_len: n,
+                    repeats: 4,
+                }),
+                "n-gram size {n} should trip and truncate to one cycle"
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_repeat_guard_resets_on_interleaved_tail() {
+        // A near-loop that is broken by a fresh token at the tail must not trip.
+        let tokens = [1, 2, 1, 2, 1, 2, 1, 2, 9];
+        assert_eq!(detect_degenerate_ngram_repeat(&tokens, 8, 4), None);
+    }
+
+    #[test]
+    fn degenerate_repeat_guard_is_disabled_when_threshold_is_zero() {
+        // Fail-safe: either bound at 0 disables the guard entirely.
+        assert_eq!(detect_degenerate_ngram_repeat(&[5, 5, 5, 5, 5], 8, 0), None);
+        assert_eq!(detect_degenerate_ngram_repeat(&[5, 5, 5, 5, 5], 0, 4), None);
+    }
+
+    #[test]
+    fn seq2seq_greedy_decode_guard_terminates_a_degenerate_loop() {
+        // Argmax would emit token 5 forever (EOT id 7 never appears) and today
+        // hit the token cap with EotNotReachedBeforeMaxTokens. The guard must
+        // instead finish with a single occurrence of the stuttered token.
+        let mut step_executor = SyntheticStepExecutor {
+            vocab_size: 16,
+            sequence: vec![5; 10],
+            logits_calls: 0,
+        };
+        let token_decoder = SyntheticTokenDecoder {
+            table: BTreeMap::from([(5, "gu")]),
+        };
+        let config = Seq2SeqGreedyDecodeConfig {
+            initial_prompt_tokens: vec![42],
+            eot_token_id: 7,
+            stop_token_ids: Vec::new(),
+            vocab_size: 16,
+            max_generated_tokens: 10,
+            suppress_first_step_token_ids: Vec::new(),
+            suppress_token_ids: Vec::new(),
+            phrase_biases: Vec::new(),
+        };
+        let mut no_token_trace = |_: usize, _: u32, _: bool| {};
+        let mut no_topk_trace = |_: usize, _: &[f32]| {};
+
+        let output = run_seq2seq_greedy_decode_loop_v0(
+            &config,
+            &mut step_executor,
+            &token_decoder,
+            &mut no_token_trace,
+            &mut no_topk_trace,
+        )
+        .expect("guard should finish the decode, not error out");
+
+        // Truncated to the first occurrence of the loop cycle.
+        assert_eq!(output.generated_tokens, vec![5]);
+        assert_eq!(output.generated_probabilities.len(), 1);
+        assert_eq!(output.text, "gu");
+        // Tripped at the 4th identical token (steps 0..=3), so no further steps.
+        assert_eq!(step_executor.logits_calls, 4);
     }
 }
