@@ -3,6 +3,7 @@ name = "openasr-core"
 description = "OpenASR engine: model families, ggml runtime, .oasr pack format, signed catalog, and local inference trust boundaries."
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true

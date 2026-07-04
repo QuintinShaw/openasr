@@ -114,9 +114,15 @@ fn write_valid_installed_pack_for_test(
 }
 
 fn write_mock_gguf_runtime_source(path: &std::path::Path, metadata_model_id: Option<&str>) {
+    // Use the graph-complete whisper fixture (not the bare
+    // `whisper_oasr_v1_non_streaming_cpu`, which deliberately omits the
+    // whisper runtime scalar keys): `list_installed_packs` now re-validates
+    // on-disk packs through `validate_native_runtime_model_pack_contract` on
+    // every lookup, so an "installed" test fixture must satisfy that
+    // contract or it silently stops being recognized as installed.
     let spec = metadata_model_id.map_or_else(
         || TinyGgufFixtureSpec::new(Default::default()),
-        TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu,
+        TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer,
     );
     write_tiny_gguf_runtime_source(path, &spec).expect("write mock gguf runtime source");
 }

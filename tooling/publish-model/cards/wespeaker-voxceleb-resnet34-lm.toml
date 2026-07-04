@@ -28,3 +28,16 @@ pyannote/WeSpeaker authors. The upstream model is licensed under **CC-BY-4.0**; 
 retains that license and attribution, with the only modification being format conversion for local
 runtime loading.
 """
+
+[prose_locales."zh-CN"]
+tagline = "WeSpeaker ResNet34 说话人嵌入模型，服务于 OpenASR 说话人分离 — 更强的说话人区分能力，完全本地运行"
+
+highlights = [
+  "🗣️ **OpenASR 默认说话人嵌入模型** — 安装此包后，`--diarize` 即可为任意语音识别模型标注匿名说话人",
+  "🧬 **256 维 ResNet34 说话人向量** — pyannote 的 WeSpeaker VoxCeleb 模型，采用时序统计池化",
+  "🔒 **只做说话人分离，不做身份识别** — 匿名的会话内标签；嵌入向量仅保留在本地，请求结束后即丢弃，除非你主动注册本地档案",
+  "🎯 **一致性校验后打包** — 单一 raw-f32 版本；Rust 前向计算与上游 pyannote 参考实现的余弦相似度 ≥ 0.9999",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，与语音识别模型共用同一套拉取/安装路径",
+]
+
+source_sha256 = "6d013305e9bb4cba1838d4daaaee0b656570ac041f01063b231da22a50cf41b5"

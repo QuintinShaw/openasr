@@ -28,3 +28,15 @@ All credit for the original model, training recipe, and weights belongs to OpenA
 upstream Hugging Face model card declares Apache-2.0 licensing; OpenASR only converts the
 weights into `.oasr` packages and adds quantized builds for local runtime use.
 """
+
+[prose_locales."zh-CN"]
+tagline = "高精度纯英语 Whisper 模型，769M 参数"
+
+highlights = [
+  "🇬🇧 **仅支持英语** — 专注英语场景，通常比同尺寸的多语言模型在英语上更准确",
+  "🎯 **769M 参数** — 接近 large 版本的英语准确率，体积更易掌控",
+  "🌐 **弱监督规模训练** — 使用 Whisper 680k 小时标注语音语料训练",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 Apple Silicon 优化",
+]
+
+source_sha256 = "ad7a171ef14c8347131e564c933bf221efa85d247bf04d89ebb55d79295e14e8"

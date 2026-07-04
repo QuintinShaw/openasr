@@ -3,6 +3,7 @@ name = "openasr-server"
 description = "Local OpenAI-compatible HTTP API server for OpenASR, including device pairing and optional remote-compute delegation."
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true

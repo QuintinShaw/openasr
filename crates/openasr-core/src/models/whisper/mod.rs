@@ -15,7 +15,7 @@ mod lid;
 mod local_source;
 mod mel;
 mod package_import;
-mod runtime_contract;
+pub(crate) mod runtime_contract;
 mod tokenizer;
 
 pub use frontend::whisper_log_mel_spectrogram_16khz_mono_v0;

@@ -61,3 +61,15 @@ acknowledgement_zh = """
 的 Zipformer2 transducer 配方,感谢 icefall 团队与 GilgameshWind 的开源工作。OpenASR 仅进行
 格式转换、量化、运行时校验和本地推理适配。
 """
+
+[prose_locales."zh-CN"]
+tagline = "中英双语流式语音识别 — 轻量的 icefall Zipformer2 transducer 模型"
+
+highlights = [
+  "🇨🇳🇬🇧 **中文 + 英文** — 一个模型同时支持中英文语音，包括中英混读",
+  "⚡ **流式优先，兼顾离线** — cache-aware 流式 Zipformer2 transducer，低延迟字幕之外也支持整段离线转写",
+  "🪶 **轻量 ~0.16B** — 6 段 Zipformer2 编码器 + 无状态 RNN-T 解码器 + tanh joiner，5000 词的 BPE 词表，足够轻量以支持端侧 CPU",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
+]
+
+source_sha256 = "0df2c6320ff856f46dca81caa6ac13ed47eec2d626022761d27cb4c19f8330c9"

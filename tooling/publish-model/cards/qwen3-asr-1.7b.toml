@@ -36,3 +36,15 @@ quantization recipe and bit-identity verification methodology were informed by
 [cstr/qwen3-asr-1.7b-GGUF](https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF). Thank you to
 both teams for releasing their work openly.
 """
+
+[prose_locales."zh-CN"]
+tagline = "覆盖 52 种语言与方言的顶尖多语言语音识别模型"
+
+highlights = [
+  "🏆 **开源语音识别中的 SOTA** — 可与最强的商业闭源 API 一较高下",
+  "🌍 **52 种语言与方言** — 30 种语言加 22 种中文方言，并支持语种识别",
+  "🎧 **复杂音频下依然稳健** — 清晰语音、歌声，以及带背景音乐的歌曲",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
+]
+
+source_sha256 = "acb84b6a0da4245445290a1d969541c1e9e8f4212b55083eba9fec4a6f5569d1"

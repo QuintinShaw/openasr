@@ -18,7 +18,9 @@ use crate::models::executor_component_registry::builtin_executor_supports_phrase
 use crate::models::ggml_family_adapter::GgmlFamilyAdapterDescriptor;
 use crate::models::ggml_family_registry::{
     COHERE_TRANSCRIBE_GGML_ADAPTER_ID, COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, GgmlFamilyRegistry,
-    QWEN3_ASR_GGML_ARCHITECTURE_ID,
+    MOONSHINE_GGML_ARCHITECTURE_ID, PARAKEET_CTC_GGML_ARCHITECTURE_ID,
+    QWEN3_ASR_GGML_ARCHITECTURE_ID, WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
+    WHISPER_GGML_ARCHITECTURE_ID, XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
 };
 use crate::models::oasr_metadata::{
     OASR_FEATURE_DIARIZATION_COHERE_TOKEN_STREAM_V1, OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1,
@@ -585,22 +587,98 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
     let descriptor = registry
         .select_from_gguf_metadata_v1(&selection_metadata)
         .map_err(|error| format!("runtime adapter selection failed: {error:?}"))?;
-    if !matches!(
+    if matches!(
         descriptor.model_architecture,
         QWEN3_ASR_GGML_ARCHITECTURE_ID | COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID
     ) {
-        return Ok(());
+        let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
+            .map_err(|error| format!("tensor index read failed: {error}"))?;
+        return validate_builtin_runtime_tensor_contract_for_architecture(
+            descriptor.model_architecture,
+            &metadata,
+            &tensor_index,
+        )
+        .map(|_| ())
+        .map_err(|error| format!("runtime tensor contract validation failed: {error}"));
     }
-    let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
-        .map_err(|error| format!("tensor index read failed: {error}"))?;
-    validate_builtin_runtime_tensor_contract_for_architecture(
-        descriptor.model_architecture,
-        &metadata,
-        &tensor_index,
-    )
-    .map(|_| ())
-    .map_err(|error| format!("runtime tensor contract validation failed: {error}"))
+    // Adapter selection above only checks the `openasr.*` family/architecture
+    // routing keys; it does not require the family's *runtime* scalar keys
+    // (e.g. whisper's decoder head_count). Without the check below, a pack
+    // missing those keys "installs successfully" and only fails closed the
+    // first time it is actually loaded for inference (see the turbo pack
+    // that shipped without `whisper.decoder.attention.head_count`). Dispatch
+    // to each family's existing required-metadata parser so install stays
+    // fail-closed at the same gate `openasr pull` already uses for
+    // qwen3/cohere above. Only families with such a parser are covered;
+    // families without one keep prior (adapter-selection-only) behavior and
+    // still fail closed later, at first load, via their executor.
+    match descriptor.model_architecture {
+        WHISPER_GGML_ARCHITECTURE_ID => {
+            crate::models::whisper::runtime_contract::validate_whisper_execution_metadata(
+                &metadata,
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "whisper runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
+                )
+            })
+        }
+        MOONSHINE_GGML_ARCHITECTURE_ID => {
+            crate::models::moonshine::runtime_contract::parse_moonshine_execution_metadata(
+                &metadata,
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "moonshine runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
+                )
+            })
+        }
+        PARAKEET_CTC_GGML_ARCHITECTURE_ID => {
+            crate::models::parakeet_ctc::runtime_contract::parse_parakeet_ctc_execution_metadata(
+                &metadata,
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "parakeet-ctc runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
+                )
+            })
+        }
+        WAV2VEC2_CTC_GGML_ARCHITECTURE_ID => {
+            crate::models::wav2vec2_ctc::runtime_contract::parse_wav2vec2_ctc_execution_metadata(
+                &metadata,
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "wav2vec2-ctc runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
+                )
+            })
+        }
+        XASR_ZIPFORMER_GGML_ARCHITECTURE_ID => {
+            crate::models::xasr_zipformer::runtime_contract::parse_xasr_zipformer_execution_metadata(
+                &metadata,
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "xasr-zipformer runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
+                )
+            })
+        }
+        // No dedicated required-metadata parser for this architecture (yet):
+        // stay Ok() here, same as before this check existed. The executor
+        // still fails closed at first load if the pack is incomplete.
+        _ => Ok(()),
+    }
 }
+
+/// Shared hint appended to install-time runtime-contract failures: these
+/// always mean the pack is missing keys a current conversion pipeline would
+/// have written, not that the file is corrupt.
+const RUNTIME_CONTRACT_OUTDATED_PACK_HINT: &str = "this pack was likely produced by an outdated or incompatible conversion pipeline; re-convert or re-pull the model pack";
 
 pub(crate) fn native_runtime_path_supports_diarization(path: &Path) -> bool {
     native_runtime_model_adapter_for_path(path)

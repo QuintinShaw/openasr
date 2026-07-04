@@ -15,6 +15,8 @@ license_source = "https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/main/LICENSE"
 license_class = "permissive"
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
+sort_weight = 920
+recommended = true
 
 ["qwen3-asr-0.6b"]
 family = "qwen"
@@ -28,6 +30,8 @@ license_source = "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/blob/main/LICENSE"
 license_class = "permissive"
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
+sort_weight = 900
+recommended = true
 
 ["moonshine-tiny"]
 family = "moonshine"
@@ -101,6 +105,8 @@ license_source = "https://huggingface.co/GilgameshWind/X-ASR-zh-en/blob/main/REA
 license_class = "permissive"
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
+sort_weight = 910
+recommended = true
 
 # Diarization support packs: not ASR models. Published support packs keep their
 # catalog-declared variants. Speaker embedding/segmentation are

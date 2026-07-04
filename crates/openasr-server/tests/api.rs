@@ -181,7 +181,11 @@ fn write_moonshine_pull_fixture(
     root: &std::path::Path,
 ) -> (std::path::PathBuf, openasr_server::DistributionRuntime) {
     let pack_path = root.join("moonshine-tiny-q8_0.oasr");
-    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu("moonshine-tiny");
+    // `whisper_oasr_v1_non_streaming_cpu` alone omits the whisper runtime
+    // scalar contract keys; install-time validation now enforces them (see
+    // `validate_native_runtime_model_pack_contract`), so this pull/import
+    // stand-in pack must be contract-complete to keep installing.
+    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("moonshine-tiny");
     write_tiny_gguf_runtime_source(&pack_path, &spec).expect("write pull fixture");
     let bytes = std::fs::read(&pack_path).unwrap();
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
@@ -3492,6 +3496,34 @@ async fn transcriptions_with_native_backend_reject_retired_legacy_model_alias() 
 }
 
 #[tokio::test]
+async fn transcriptions_with_native_backend_accepts_live_catalog_family_bare_metadata_id() {
+    // Regression guard: a native pack's `openasr.model.id` metadata legitimately
+    // carries the bare family id (no quant tag) per the "bare id" contract in
+    // `native_model_refs_match`. `whisper-large-v3-turbo` is a live catalog
+    // family (see model-registry/catalog.json), so it must not be treated as a
+    // retired legacy id -- that would fail closed for every pack/pull of this
+    // model. This must reach (and fail at) actual native execution, not the
+    // retired-id or model-mismatch rejections.
+    let temp = tempfile::tempdir().unwrap();
+    let pack_root = temp.path().join("whisper-large-v3-turbo-q4_k.oasr");
+    write_whisper_oasr_v1_fixture(&pack_root, "whisper-large-v3-turbo");
+    let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        ffmpeg_bin: None,
+        model_pack_path: Some(pack_root.clone()),
+    });
+    let wav_bytes = sample_wav_bytes();
+    let request = multipart_request("whisper-large-v3-turbo:q4_k", "sample.wav", &wav_bytes);
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(!body.contains("retired legacy metadata id"));
+    assert!(!body.contains("does not match server native local runtime source id"));
+}
+
+#[tokio::test]
 async fn stream_transcriptions_with_native_backend_reject_empty_model_form_value() {
     let temp = tempfile::tempdir().unwrap();
     let pack_root = temp.path().join("native-pack.oasr");
@@ -3753,9 +3785,16 @@ async fn stream_transcriptions_with_native_backend_reject_missing_model_pack_pat
         model_pack_path: None,
     });
     let wav_bytes = sample_wav_bytes();
+    // The streaming endpoint's synchronous multipart parse only runs the retired-id
+    // check (missing model_pack_path is validated deeper, inside the spawned
+    // transcribe task, so it never surfaces as a synchronous 400 here). Use a
+    // still-retired tagged id -- not a live catalog family like
+    // `whisper-large-v3-turbo`, which is no longer blacklisted -- so this keeps
+    // exercising a real synchronous rejection instead of relying on that pack
+    // path never being reached for an unrelated reason.
     let request = multipart_request_with_options(
         "/v1/audio/transcriptions?stream=true",
-        "whisper-large-v3-turbo",
+        "whisper-tiny:q4_0",
         "sample.wav",
         &wav_bytes,
         false,

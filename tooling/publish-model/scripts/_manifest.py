@@ -23,8 +23,10 @@ from _catalog import (
     CATALOG_URL,
     DEFAULT_MIN_CLI_VERSION,
     QUANT_METADATA,
+    language_mode_for_model,
     languages_for_model,
     load as load_publish_catalog,
+    validate_card_prose_locales,
 )
 from _file_loaders import atomic_write_json, load_required_json, load_toml
 from _pathlib_helpers import repo_root
@@ -97,6 +99,25 @@ def prose_block(prose: dict) -> dict:
         "tagline": prose.get("tagline", ""),
         "overview": overview,
         "highlights": prose.get("highlights", []),
+    }
+
+
+def prose_locales_block(model: str, prose: dict) -> dict | None:
+    """Build the catalog `prose_locales` field from a card's authored
+    `[prose_locales."<bcp47>"]` tables. First iteration: tagline + highlights
+    only (no overview). Validates format + staleness before emitting, so a
+    stale/malformed translation fails the regen rather than shipping silently.
+    """
+    locales = prose.get("prose_locales")
+    if not locales:
+        return None
+    validate_card_prose_locales(model, prose)
+    return {
+        locale: {
+            "tagline": block.get("tagline"),
+            "highlights": block.get("highlights", []),
+        }
+        for locale, block in sorted(locales.items())
     }
 
 
@@ -190,13 +211,14 @@ def build_catalog_model(model: str, entry: dict, args: argparse.Namespace) -> di
     }
     if "capability" in entry:
         model_entry["capability"] = dict(entry["capability"])
+    languages = languages_for_model(entry)
     model_entry.update({
         "display_name": entry["display_name"],
         "family": entry["family"],
         "aliases": entry.get("aliases", []),
         "pull_alias": entry.get("pull_alias"),
         "size": entry["size"],
-        "languages": languages_for_model(entry),
+        "languages": languages,
         "vendor": entry["upstream_repo"].split("/", 1)[0],
         "license": entry["license_name"],
         "license_url": entry["license_source"],
@@ -210,8 +232,23 @@ def build_catalog_model(model: str, entry: dict, args: argparse.Namespace) -> di
         "prose": prose_block(prose),
         "quants": quants,
     })
+    # Per-model source-language parameter policy, derived from core's
+    # LanguageMode for this family (asr-model only; see
+    # language_mode_for_model()'s docstring for why translation-model /
+    # capability-pack entries omit it).
+    model_entry.update(language_mode_for_model(entry, languages))
     if entry.get("experimental") is True:
         model_entry["experimental"] = True
+    # Explicit, author-set display hints (models-core.toml `sort_weight`/
+    # `recommended`; no threshold inference). Only serialized when set so
+    # unmarked models keep the Rust-side serde defaults (0 / false).
+    if "sort_weight" in entry:
+        model_entry["sort_weight"] = entry["sort_weight"]
+    if entry.get("recommended") is True:
+        model_entry["recommended"] = True
+    prose_locales = prose_locales_block(model, prose)
+    if prose_locales is not None:
+        model_entry["prose_locales"] = prose_locales
     for key in (
         "source_langs",
         "target_langs",
@@ -252,7 +289,10 @@ def load_catalog(path: Path) -> dict:
 def upsert_model(catalog: dict, model_entry: dict) -> dict:
     models = [model for model in catalog["models"] if model.get("id") != model_entry["id"]]
     models.append(model_entry)
-    models.sort(key=lambda item: item["id"])
+    # Catalog array order is the display order consumers inherit for free
+    # (market/desktop listings render models[] as-is). Higher sort_weight
+    # first; ties break on id for determinism.
+    models.sort(key=lambda item: (-item.get("sort_weight", 0), item["id"]))
     catalog["schema_version"] = CATALOG_SCHEMA_VERSION
     catalog["generated_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     catalog["catalog_url"] = CATALOG_URL
