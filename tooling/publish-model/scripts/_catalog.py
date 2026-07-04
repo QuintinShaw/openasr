@@ -104,6 +104,9 @@ LANG_BY_FAMILY = {
     ],
     # X-ASR-zh-en: bilingual Chinese + English.
     "xasr-zipformer": ["en", "zh"],
+    # Dolphin cn-dialect small: Mandarin + 22 Chinese dialects (Sichuan, Wu,
+    # Minnan, ...); every dialect collapses into the single language zh.
+    "dolphin": ["zh"],
     "moonshine": ["en"],
     "parakeet": ["en"],
     "wav2vec2": ["en"],
@@ -136,6 +139,10 @@ LANGUAGE_MODE_BY_FAMILY = {
     # X-ASR zh-en: FixedMultilingual -- built-in bilingual set, no per-request
     # language selection at all.
     "xasr-zipformer": "fixed_multilingual",
+    # Dolphin: SelectsViaPrompt -- the dialect/region is chosen through prompt
+    # tokens (<sos> <zh> <SICHUAN> <asr> <notimestamp>), never a decode-time
+    # auto-detect, so it conditions on its default when the request omits one.
+    "dolphin": "specify_only",
     # CTC / Moonshine: FixedMonolingual -- intrinsically a single language.
     "moonshine": "fixed_monolingual",
     "parakeet": "fixed_monolingual",
@@ -149,6 +156,7 @@ LANGUAGE_MODE_BY_FAMILY = {
 # same-source-of-truth constant instead of guessed.
 LANGUAGE_MODE_DEFAULT_BY_FAMILY = {
     "cohere": "en",
+    "dolphin": "zh",
 }
 
 

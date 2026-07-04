@@ -115,6 +115,28 @@ sort_weight = 910
 recommended = true
 upstream_release_date = "2026-05-18"
 
+# Dolphin cn-dialect small (WeNet E-Branchformer, CTC + attention rescoring).
+# STAGED / pre-upload: this entry lives in the publish source + card only and is
+# NOT yet written into the signed catalog.json (no OpenASR HF pack uploaded).
+# `hf_repo` points at the upstream repo until the .oasr pack is published to an
+# OpenASR-owned repo; `release_public` is intentionally omitted so the entry
+# cannot be flipped public before that upload. Mandarin + 22 Chinese dialects
+# (Sichuan, Wu, Minnan, ...) all collapse into the single language `zh`.
+["dolphin-cn-dialect-small"]
+family = "dolphin"
+hf_repo = "DataoceanAI1/dolphi-cn-dialect-small"
+aliases = ["dolphin", "dolphin-cn-dialect"]
+pull_alias = "dolphin"
+size = "small"
+registry_id = "dolphin-cn-dialect-small"
+display_name = "Dolphin CN-Dialect Small"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/DataoceanAI1/dolphi-cn-dialect-small/blob/main/README.md"
+license_class = "permissive"
+quants = ["fp16"]
+recommended_quant = "fp16"
+upstream_release_date = "2025-05-13"
+
 # Diarization support packs: not ASR models. Published support packs keep their
 # catalog-declared variants. Speaker embedding/segmentation are
 # language-agnostic; `languages` lists the product's validated domains.
