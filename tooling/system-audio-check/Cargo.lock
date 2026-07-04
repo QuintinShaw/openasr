@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "openasr-system-audio"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libloading",
  "objc2",
