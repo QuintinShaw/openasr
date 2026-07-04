@@ -25,6 +25,11 @@ ignore = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace crates are path-only dependencies with no version pin (the single
+# workspace version lives in [workspace.package]); cargo-deny classifies those
+# as wildcards. Allow wildcards for path dependencies only -- registry
+# wildcards stay denied.
+allow-wildcard-paths = true
 
 [licenses]
 version = 2

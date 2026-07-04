@@ -903,7 +903,10 @@ fn embedded_catalog_language_mode_matches_core_language_mode_per_family() {
 
     // Qwen3-ASR: DetectImplicit -- self-detects, no explicit selection.
     let qwen = find("qwen3-asr-1.7b");
-    assert_eq!(qwen.language_mode, Some(CatalogLanguageMode::DetectImplicit));
+    assert_eq!(
+        qwen.language_mode,
+        Some(CatalogLanguageMode::DetectImplicit)
+    );
     assert_eq!(qwen.language_default, None);
 
     // X-ASR zh-en: FixedMultilingual -- built-in bilingual set, no selection.
@@ -954,7 +957,10 @@ fn embedded_catalog_language_mode_matches_core_language_mode_per_family() {
     ] {
         let model = find(id);
         assert_eq!(model.language_mode, None, "{id} should omit language_mode");
-        assert_eq!(model.language_default, None, "{id} should omit language_default");
+        assert_eq!(
+            model.language_default, None,
+            "{id} should omit language_default"
+        );
     }
 }
 
