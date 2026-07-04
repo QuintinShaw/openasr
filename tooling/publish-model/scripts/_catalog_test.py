@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import date, timedelta
 
 from _catalog import (
     apply_catalog_series_defaults,
@@ -11,6 +12,7 @@ from _catalog import (
     validate_card_prose_locales,
     validate_display_ranking,
     validate_prose_locale_block,
+    validate_upstream_release_date,
 )
 
 
@@ -60,6 +62,43 @@ class DisplayRankingTest(unittest.TestCase):
         apply_catalog_series_defaults("m", entry, {})
         self.assertEqual(entry["sort_weight"], 10)
         self.assertFalse(entry["recommended"])
+
+
+class UpstreamReleaseDateTest(unittest.TestCase):
+    def test_absent_field_is_a_noop(self) -> None:
+        validate_upstream_release_date("m", {"family": "whisper"})  # must not raise
+
+    def test_explicit_none_is_a_noop(self) -> None:
+        validate_upstream_release_date("m", {"upstream_release_date": None})  # must not raise
+
+    def test_valid_past_date_passes(self) -> None:
+        validate_upstream_release_date("m", {"upstream_release_date": "2022-09-21"})
+
+    def test_today_passes(self) -> None:
+        validate_upstream_release_date("m", {"upstream_release_date": date.today().isoformat()})
+
+    def test_rejects_wrong_format(self) -> None:
+        with self.assertRaisesRegex(KeyError, "ISO yyyy-mm-dd"):
+            validate_upstream_release_date("m", {"upstream_release_date": "2022/09/21"})
+
+    def test_rejects_non_string(self) -> None:
+        with self.assertRaisesRegex(KeyError, "ISO yyyy-mm-dd"):
+            validate_upstream_release_date("m", {"upstream_release_date": 20220921})
+
+    def test_rejects_impossible_calendar_date(self) -> None:
+        with self.assertRaisesRegex(KeyError, "not a valid calendar date"):
+            validate_upstream_release_date("m", {"upstream_release_date": "2022-13-40"})
+
+    def test_rejects_future_date(self) -> None:
+        future = (date.today() + timedelta(days=1)).isoformat()
+        with self.assertRaisesRegex(KeyError, "in the future"):
+            validate_upstream_release_date("m", {"upstream_release_date": future})
+
+    def test_apply_catalog_series_defaults_runs_the_check(self) -> None:
+        future = (date.today() + timedelta(days=1)).isoformat()
+        entry = {"family": "whisper", "size": "tiny", "upstream_release_date": future}
+        with self.assertRaisesRegex(KeyError, "in the future"):
+            apply_catalog_series_defaults("m", entry, {})
 
 
 class ProseLocaleValidationTest(unittest.TestCase):

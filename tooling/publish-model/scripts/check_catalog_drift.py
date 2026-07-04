@@ -138,6 +138,7 @@ def check_machine_catalog_entry(model: str, entry: dict, machine_model: dict, er
         "upstream_gguf_repo",
         "upstream_gguf_revision",
         "license_files",
+        "upstream_release_date",
     ):
         if key in entry and machine_model.get(key) != entry[key]:
             errors.append(

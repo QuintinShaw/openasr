@@ -304,6 +304,7 @@ mod tests {
                 pull_recommended: "qwen3-asr-0.6b:q8".to_string(),
                 sort_weight: 0,
                 recommended: false,
+                upstream_release_date: None,
                 prose: None,
                 prose_locales: None,
                 quants: vec![

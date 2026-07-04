@@ -23,6 +23,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 from _file_loaders import load_toml
@@ -247,6 +248,7 @@ def apply_catalog_series_defaults(model: str, entry: dict, series: dict) -> None
     validate_capability(model, entry)
     validate_translation_model(model, entry)
     validate_display_ranking(model, entry)
+    validate_upstream_release_date(model, entry)
 
     spec = series.get(entry["family"])
     if spec is not None and entry["size"] not in spec["member_sizes"]:
@@ -357,6 +359,34 @@ def validate_display_ranking(model: str, entry: dict) -> None:
         value = entry["recommended"]
         if not isinstance(value, bool):
             raise KeyError(f"model '{model}' recommended must be a bool, got {value!r}")
+
+
+UPSTREAM_RELEASE_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def validate_upstream_release_date(model: str, entry: dict) -> None:
+    """`upstream_release_date` is the upstream model's original release date
+    (ISO `yyyy-mm-dd`), an explicit author-set field distinct from our repack
+    `generated_at`. Optional (nullable); when present it must be a real calendar
+    date in `yyyy-mm-dd` form and not in the future.
+    """
+    value = entry.get("upstream_release_date")
+    if value is None:
+        return
+    if not isinstance(value, str) or UPSTREAM_RELEASE_DATE_RE.fullmatch(value) is None:
+        raise KeyError(
+            f"model '{model}' upstream_release_date must be an ISO yyyy-mm-dd string, got {value!r}"
+        )
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as error:
+        raise KeyError(
+            f"model '{model}' upstream_release_date is not a valid calendar date: {value!r}"
+        ) from error
+    if parsed > date.today():
+        raise KeyError(
+            f"model '{model}' upstream_release_date {value!r} is in the future"
+        )
 
 
 def validate_lang_list(model: str, field: str, value: object) -> None:

@@ -180,6 +180,7 @@ fn alias_contract_model(
         pull_recommended: format!("{id}:q8"),
         sort_weight: 0,
         recommended: false,
+        upstream_release_date: None,
         prose: None,
         prose_locales: None,
         quants: vec![

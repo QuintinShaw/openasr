@@ -230,6 +230,15 @@ pub struct CatalogModel {
     pub sort_weight: i64,
     #[serde(default)]
     pub recommended: bool,
+    // The UPSTREAM model's original release date (ISO `yyyy-mm-dd`), authored in
+    // tooling/publish-model/models-core.toml and distinct from our repack
+    // `generated_at`. Nullable: a model opts in only via an explicit catalog
+    // value. Consumers use it as a display-sort tiebreaker (newest first within
+    // equal `sort_weight`) and to mark recently released models. Only serialized
+    // when set so unmarked models keep the Rust-side serde default (None) and the
+    // signed catalog stays byte-identical while empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_release_date: Option<String>,
     #[serde(default)]
     pub prose: Option<CatalogProse>,
     // Per-locale tagline/highlights translations of `prose` (first iteration:

@@ -293,6 +293,7 @@ fn catalog_for_resolved(resolved: &ResolvedCatalogPull) -> ModelCatalog {
             pull_recommended: resolved.pull.clone(),
             sort_weight: 0,
             recommended: false,
+            upstream_release_date: None,
             prose: None,
             prose_locales: None,
             quants: vec![CatalogQuant {
@@ -1773,6 +1774,7 @@ fn installed_pack_alias_catalog() -> ModelCatalog {
             pull_recommended: "qwen3-asr-0.6b:q8".to_string(),
             sort_weight: 0,
             recommended: false,
+            upstream_release_date: None,
             prose: None,
             prose_locales: None,
             quants: vec![CatalogQuant {
