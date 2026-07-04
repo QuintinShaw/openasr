@@ -1,23 +1,30 @@
-//! Dolphin dedicated executor skeleton (convert + load phase).
+//! Dolphin `small.cn` dedicated executor: the full end-to-end transcribe path.
 //!
-//! What is wired here: loading the E-Branchformer encoder weights **from the
-//! `.oasr` pack** and running the already parity-verified `encoder_graph::encode`
-//! on them (see `encode_dolphin_encoder_from_pack`, exercised by the from-pack
-//! parity test). The CTC-prefix-beam + attention-rescoring joint decode and the
-//! kaldi fbank frontend are NOT wired yet, so the `GgmlAsrExecutor::execute`
-//! transcription entry point validates the pack loads + binds the encoder, then
-//! fails closed with a typed error (never fabricates a transcript).
+//! Pipeline (all from the `.oasr` pack): kaldi-fbank [`frontend`] + the checkpoint's
+//! global CMVN -> the parity-verified E-Branchformer [`encoder_graph`] ->
+//! CTC/attention [`joint_decode`] (CTC prefix-beam over the CTC head, rescored by
+//! the Transformer [`decoder_graph`]) -> char detokenize. The executor fails closed
+//! with typed errors on a bad pack and never fabricates a transcript.
+//!
+//! [`frontend`]: super::frontend
+//! [`joint_decode`]: super::joint_decode
+//! [`encoder_graph`]: super::encoder_graph
+//! [`decoder_graph`]: super::decoder_graph
 
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 
-use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
+use crate::api::backend::{Segment, Transcription};
+use crate::ggml_runtime::{GgufMetadata, GgufTensorDataReadError, GgufTensorDataReader};
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
 };
 
+use super::decoder_graph::DolphinDecoderConfig;
 use super::encoder_graph::{DolphinEncoderConfig, DolphinEncoderOutput, encode};
+use super::frontend::{DolphinFbankFrontend, NUM_MEL_BINS, apply_global_cmvn};
+use super::joint_decode::{DolphinJointDecodeConfig, detokenize_char_tokens, joint_decode};
 use super::runtime_contract::parse_dolphin_execution_metadata;
 
 /// Encoder weight namespace baked into the pack under exact WeNet names.
@@ -30,10 +37,42 @@ const ENCODER_SENTINEL_TENSORS: [&str; 3] = [
     "ctc.ctc_lo.weight",
 ];
 
-/// Load every `encoder.*` tensor from the pack, dequantized to f32 and keyed by
-/// its exact WeNet state-dict name — the provider shape `encoder_graph::encode`
-/// consumes. Reading each tensor at its own stored dims makes this
-/// layout-agnostic (the encoder graph re-declares its own ggml shapes).
+/// Global CMVN vectors baked in the pack (checkpoint's own `encoder.global_cmvn`).
+const CMVN_MEAN_TENSOR: &str = "encoder.global_cmvn.mean";
+const CMVN_ISTD_TENSOR: &str = "encoder.global_cmvn.istd";
+
+/// Pack metadata keys the decode reads (mirrors the importer's writes).
+const PROMPT_PREFIX_KEY: &str = "dolphin.prompt.prefix_token_ids";
+const EOS_TOKEN_ID_KEY: &str = "dolphin.eos_token_id";
+const BLANK_TOKEN_ID_KEY: &str = "ctc.blank_token_id";
+const TOKENIZER_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
+
+/// CTC prefix-beam width used for joint decode (WeNet default).
+const DOLPHIN_BEAM_SIZE: usize = 10;
+
+/// Rescoring combination weight. The reference `attention_rescoring` decode selects
+/// purely by attention score over the CTC n-best (`ctc_weight = 0.0`); the model's
+/// `0.3` is the *training* loss weight (`model_conf.ctc_weight`), a different knob.
+/// Kept `0.0` so the runtime reproduces the golden reference decode.
+pub(crate) const DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT: f32 = 0.0;
+
+/// Load every tensor in the pack, dequantized to f32 and keyed by its exact WeNet
+/// name -- the provider shape the encoder/decoder/CTC graphs consume. Reading each
+/// tensor at its own stored dims keeps this layout-agnostic (each graph re-declares
+/// its own ggml shapes).
+pub(crate) fn load_dolphin_runtime_weights_from_pack(
+    reader: &GgufTensorDataReader,
+) -> Result<HashMap<String, Vec<f32>>, GgufTensorDataReadError> {
+    let mut weights = HashMap::new();
+    for tensor in reader.tensor_index().tensors() {
+        let values = reader.host_tensor_f32_copy_dequantized_by_name(&tensor.name, &tensor.dims)?;
+        weights.insert(tensor.name.clone(), values);
+    }
+    Ok(weights)
+}
+
+/// Load only the `encoder.*` tensors from the pack (the encoder-from-pack parity
+/// path; the full transcribe path uses [`load_dolphin_runtime_weights_from_pack`]).
 pub(crate) fn load_dolphin_encoder_weights_from_pack(
     reader: &GgufTensorDataReader,
 ) -> Result<HashMap<String, Vec<f32>>, GgufTensorDataReadError> {
@@ -62,6 +101,110 @@ pub(crate) fn encode_dolphin_encoder_from_pack(
     let config = DolphinEncoderConfig::small_cn();
     encode(&config, &weights, features, frames_in)
         .map_err(|error| format!("dolphin encoder graph failed: {error}"))
+}
+
+/// A rescored joint-decode hypothesis, detokenized for reporting.
+#[derive(Debug, Clone)]
+pub(crate) struct DolphinScoredText {
+    pub text: String,
+    pub ctc_score: f32,
+    pub attention_score: f32,
+    pub combined_score: f32,
+}
+
+/// End-to-end transcription output plus the diagnostics the harness reports.
+#[derive(Debug, Clone)]
+pub(crate) struct DolphinPipelineOutput {
+    /// Best (rescored) transcript.
+    pub text: String,
+    pub best_token_ids: Vec<u32>,
+    /// CTC greedy transcript (pre-rescoring), for comparison.
+    pub ctc_greedy_text: String,
+    /// Rescored n-best, best-first.
+    pub scored_nbest: Vec<DolphinScoredText>,
+}
+
+/// The complete Dolphin transcribe pipeline over 16 kHz mono PCM (`samples` in
+/// `[-1, 1]`): fbank + CMVN -> encoder -> CTC/attention joint decode -> detokenize.
+/// This is the shared path the executor and the end-to-end harness both drive.
+pub(crate) fn transcribe_dolphin_pcm(
+    reader: &GgufTensorDataReader,
+    metadata: &GgufMetadata,
+    samples: &[f32],
+    ctc_weight: f32,
+) -> Result<DolphinPipelineOutput, String> {
+    let tokens = metadata
+        .get_string_array(TOKENIZER_TOKENS_KEY)
+        .ok_or_else(|| format!("dolphin pack is missing the '{TOKENIZER_TOKENS_KEY}' vocab"))?;
+    let prompt_prefix = metadata
+        .get_u32_array(PROMPT_PREFIX_KEY)
+        .ok_or_else(|| format!("dolphin pack is missing the '{PROMPT_PREFIX_KEY}' decode prompt"))?
+        .to_vec();
+    let eos_token_id = metadata
+        .get_u32(EOS_TOKEN_ID_KEY)
+        .ok_or_else(|| format!("dolphin pack is missing '{EOS_TOKEN_ID_KEY}'"))?;
+    let blank_token_id = metadata
+        .get_u32(BLANK_TOKEN_ID_KEY)
+        .ok_or_else(|| format!("dolphin pack is missing '{BLANK_TOKEN_ID_KEY}'"))?;
+
+    let weights = load_dolphin_runtime_weights_from_pack(reader)
+        .map_err(|error| format!("dolphin runtime weight load failed: {error}"))?;
+
+    // Frontend: kaldi fbank -> global CMVN (the exact tensor the encoder consumes).
+    let mut features = DolphinFbankFrontend::new()
+        .compute(samples)
+        .map_err(|error| format!("dolphin fbank frontend failed: {error}"))?;
+    let cmvn_mean = weights
+        .get(CMVN_MEAN_TENSOR)
+        .ok_or_else(|| format!("dolphin pack is missing '{CMVN_MEAN_TENSOR}'"))?;
+    let cmvn_istd = weights
+        .get(CMVN_ISTD_TENSOR)
+        .ok_or_else(|| format!("dolphin pack is missing '{CMVN_ISTD_TENSOR}'"))?;
+    apply_global_cmvn(&mut features.data, NUM_MEL_BINS, cmvn_mean, cmvn_istd)
+        .map_err(|error| format!("dolphin global CMVN failed: {error}"))?;
+
+    // Encoder (parity-verified).
+    let encoder_config = DolphinEncoderConfig::small_cn();
+    let encoder = encode(&encoder_config, &weights, &features.data, features.n_frames)
+        .map_err(|error| format!("dolphin encoder graph failed: {error}"))?;
+
+    // CTC/attention joint decode.
+    let decoder_config = DolphinDecoderConfig::small_cn();
+    let decode_config = DolphinJointDecodeConfig {
+        beam_size: DOLPHIN_BEAM_SIZE,
+        ctc_weight,
+        prompt_prefix,
+        eos_token_id,
+        blank_token_id,
+    };
+    let decoded = joint_decode(
+        &decoder_config,
+        &weights,
+        &encoder.encoder_out,
+        encoder.frames,
+        &decode_config,
+    )
+    .map_err(|error| format!("dolphin joint decode failed: {error}"))?;
+
+    let text = detokenize_char_tokens(&decoded.best_token_ids, tokens);
+    let ctc_greedy_text = detokenize_char_tokens(&decoded.ctc_greedy_token_ids, tokens);
+    let scored_nbest = decoded
+        .scored_nbest
+        .iter()
+        .map(|hyp| DolphinScoredText {
+            text: detokenize_char_tokens(&hyp.token_ids, tokens),
+            ctc_score: hyp.ctc_score,
+            attention_score: hyp.attention_score,
+            combined_score: hyp.combined_score,
+        })
+        .collect();
+
+    Ok(DolphinPipelineOutput {
+        text,
+        best_token_ids: decoded.best_token_ids,
+        ctc_greedy_text,
+        scored_nbest,
+    })
 }
 
 /// Dedicated `GgmlAsrExecutor` for the Dolphin family (DedicatedRuntimeExecutorV1).
@@ -95,8 +238,7 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
         // Fail closed on an incomplete pack (missing runtime scalar keys).
         parse_dolphin_execution_metadata(&preflight.metadata)
             .map_err(|error| fail(format!("dolphin runtime metadata contract failed: {error}")))?;
-        // Confirm the encoder + CTC namespaces are actually baked before claiming
-        // anything about decode support.
+        // Confirm the encoder + CTC namespaces are actually baked before decoding.
         for sentinel in ENCODER_SENTINEL_TENSORS {
             if preflight.tensor_index.get(sentinel).is_none() {
                 return Err(fail(format!(
@@ -104,15 +246,41 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
                 )));
             }
         }
-        // Convert + load phase only: the CTC-prefix-beam + attention-rescoring
-        // joint decode and the kaldi fbank frontend are not wired yet. Fail closed
-        // rather than fabricate a transcript.
-        Err(fail(
-            "dolphin transcription is not implemented yet (convert+load phase): the CTC/attention \
-             joint decode and fbank frontend are not wired. The encoder runs from the pack via the \
-             internal encode-from-pack path; end-to-end decode lands in a later phase."
-                .to_string(),
-        ))
+
+        let reader = GgufTensorDataReader::from_runtime_source(&preflight.runtime_source)
+            .map_err(|error| fail(format!("dolphin pack tensor reader failed: {error}")))?;
+        let output = transcribe_dolphin_pcm(
+            &reader,
+            &preflight.metadata,
+            &request.prepared_audio.samples_f32,
+            DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
+        )
+        .map_err(fail)?;
+
+        let duration = request.prepared_audio.samples_f32.len() as f32
+            / request.prepared_audio.sample_rate_hz.max(1) as f32;
+        let segments = if output.text.is_empty() {
+            Vec::new()
+        } else {
+            vec![Segment {
+                start: 0.0,
+                end: duration,
+                text: output.text.clone(),
+                speaker: None,
+                speaker_label: None,
+                speaker_profile_id: None,
+                words: Vec::new(),
+            }]
+        };
+        Ok(GgmlAsrExecutionResult {
+            transcription: Transcription {
+                text: output.text,
+                segments,
+                longform: None,
+                language: None,
+            },
+            carry_context: None,
+        })
     }
 }
 
@@ -127,6 +295,16 @@ mod tests {
 
     const FIXTURE_ROOT: &str =
         "/Volumes/QuintinDocument/openasr-dev/openasr/tmp/publish/dolphin-cn-dialect-small";
+
+    /// Golden `attention_rescoring` transcript (manifest `text_nospecial`): the
+    /// model's own joint-decode output for the Sichuan clip. This is the parity
+    /// target -- the human ground-truth WSC transcript differs by one homophone
+    /// (河 vs 和), a model-accuracy gap, not an implementation gap.
+    const REFERENCE_RESCORING_TEXT: &str = "学校和底下好多那种野生枸杞";
+    /// Human ground-truth transcript (manifest `reference_transcript_wsc`).
+    const REFERENCE_WSC_TEXT: &str = "学校河底下好多那种野生枸杞";
+    /// Reference CTC greedy transcript (manifest `ctc_greedy_search.text`).
+    const REFERENCE_CTC_GREEDY_TEXT: &str = "学校火底下好多那种野生枸杞";
 
     fn root() -> PathBuf {
         PathBuf::from(FIXTURE_ROOT)
@@ -177,6 +355,53 @@ mod tests {
         let max = max_abs_diff(actual, expected);
         let scale = expected.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         if scale > 0.0 { max / scale } else { max }
+    }
+
+    /// Char-level edit distance (Levenshtein) over Unicode scalar values.
+    fn char_edit_distance(a: &str, b: &str) -> usize {
+        let a: Vec<char> = a.chars().collect();
+        let b: Vec<char> = b.chars().collect();
+        let mut prev: Vec<usize> = (0..=b.len()).collect();
+        let mut cur = vec![0usize; b.len() + 1];
+        for (i, &ca) in a.iter().enumerate() {
+            cur[0] = i + 1;
+            for (j, &cb) in b.iter().enumerate() {
+                let cost = usize::from(ca != cb);
+                cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+            }
+            std::mem::swap(&mut prev, &mut cur);
+        }
+        prev[b.len()]
+    }
+
+    fn char_error_rate(hypothesis: &str, reference: &str) -> f32 {
+        let ref_len = reference.chars().count();
+        if ref_len == 0 {
+            return if hypothesis.is_empty() { 0.0 } else { 1.0 };
+        }
+        char_edit_distance(hypothesis, reference) as f32 / ref_len as f32
+    }
+
+    fn produce_pack_if_needed(root: &Path) -> Option<PathBuf> {
+        let pack = root.join("packs/dolphin-cn-dialect-small-fp16.oasr");
+        if pack.exists() {
+            return Some(pack);
+        }
+        let safetensors = root.join("weights/full.safetensors");
+        let units = root.join("src/units.txt");
+        if !safetensors.exists() || !units.exists() {
+            return None;
+        }
+        std::fs::create_dir_all(pack.parent().unwrap()).expect("create packs dir");
+        convert_local_dolphin_wenet_source_to_runtime_pack(&DolphinImportRequest {
+            safetensors_path: safetensors,
+            units_path: units,
+            output_path: pack.clone(),
+            model_id: "dolphin-cn-dialect-small".to_string(),
+            quantization: DolphinQuantizationMode::Fp16,
+        })
+        .expect("dolphin import");
+        Some(pack)
     }
 
     /// Produce the fp16 `.oasr` pack from the local WeNet checkpoint and assert
@@ -249,6 +474,105 @@ mod tests {
         assert!(
             rel < 3.0e-3,
             "encoder-from-pack relative max diff {rel:.3e} exceeds the fp16 tolerance 3e-3"
+        );
+    }
+
+    /// Full end-to-end joint-decode harness: read the Sichuan clip, run
+    /// fbank+CMVN -> encoder -> CTC/attention rescoring from the produced `.oasr`
+    /// pack, print the transcript + CER, and assert the rescored transcript
+    /// reproduces the golden `attention_rescoring` output exactly (CER 0).
+    ///
+    /// `#[ignore]`: needs the checkpoint/golden under `tmp/publish` (not committed).
+    /// Run with:
+    /// `cargo test -p openasr-core dolphin_joint_decode_end_to_end -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires local Dolphin checkpoint + golden clip under tmp/publish (not committed)"]
+    fn dolphin_joint_decode_end_to_end() {
+        let root = root();
+        let clip = root.join("golden/clip_sichuan.wav");
+        let Some(pack) = produce_pack_if_needed(&root) else {
+            eprintln!("skip: dolphin checkpoint/units not present under {root:?}");
+            return;
+        };
+        if !clip.exists() {
+            eprintln!("skip: golden clip not present at {clip:?}");
+            return;
+        }
+
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            &clip,
+            "dolphin end-to-end harness",
+            "clip_sichuan.wav",
+        )
+        .expect("load clip");
+
+        let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
+        let metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
+
+        // Reference-faithful decode: attention-only selection over the CTC n-best
+        // (ctc_weight 0.0), the WeNet `attention_rescoring` default.
+        let output = transcribe_dolphin_pcm(
+            &reader,
+            &metadata,
+            &samples,
+            DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
+        )
+        .expect("dolphin transcribe");
+
+        let cer_vs_rescoring = char_error_rate(&output.text, REFERENCE_RESCORING_TEXT);
+        let cer_vs_wsc = char_error_rate(&output.text, REFERENCE_WSC_TEXT);
+
+        eprintln!("== Dolphin CTC/attention joint decode (end-to-end) ==");
+        eprintln!("transcript (rescored) : {}", output.text);
+        eprintln!("reference (rescoring) : {REFERENCE_RESCORING_TEXT}");
+        eprintln!("reference (human WSC) : {REFERENCE_WSC_TEXT}");
+        eprintln!("ctc greedy            : {}", output.ctc_greedy_text);
+        eprintln!("ctc greedy (reference): {REFERENCE_CTC_GREEDY_TEXT}");
+        eprintln!(
+            "CER vs rescoring ref  : {:.4}  ({} edits / {} chars)",
+            cer_vs_rescoring,
+            char_edit_distance(&output.text, REFERENCE_RESCORING_TEXT),
+            REFERENCE_RESCORING_TEXT.chars().count()
+        );
+        eprintln!(
+            "CER vs human WSC ref  : {:.4}  ({} edits / {} chars)",
+            cer_vs_wsc,
+            char_edit_distance(&output.text, REFERENCE_WSC_TEXT),
+            REFERENCE_WSC_TEXT.chars().count()
+        );
+        eprintln!("rescored n-best (best-first):");
+        for hyp in &output.scored_nbest {
+            eprintln!(
+                "  combined {:8.3}  attn {:8.3}  ctc {:8.3}  {}",
+                hyp.combined_score, hyp.attention_score, hyp.ctc_score, hyp.text
+            );
+        }
+
+        // Also report what the task-mentioned 0.3 rescoring weight would pick, to
+        // show the training-vs-decode ctc_weight distinction concretely.
+        let output_03 = transcribe_dolphin_pcm(&reader, &metadata, &samples, 0.3)
+            .expect("dolphin transcribe (ctc_weight 0.3)");
+        eprintln!(
+            "with ctc_weight 0.3   : {}  (CER vs rescoring ref {:.4})",
+            output_03.text,
+            char_error_rate(&output_03.text, REFERENCE_RESCORING_TEXT)
+        );
+
+        // Sanity: the CTC greedy path reproduces the reference greedy transcript.
+        assert_eq!(
+            output.ctc_greedy_text, REFERENCE_CTC_GREEDY_TEXT,
+            "CTC greedy transcript diverged from the reference"
+        );
+        // Parity: the rescored transcript reproduces the golden attention_rescoring
+        // output exactly (the 河/和 homophone gap to the human WSC transcript is a
+        // model-accuracy artifact the reference decode shares).
+        assert_eq!(
+            output.text, REFERENCE_RESCORING_TEXT,
+            "rescored transcript diverged from the golden attention_rescoring output"
+        );
+        assert_eq!(
+            cer_vs_rescoring, 0.0,
+            "CER against the rescoring reference must be 0"
         );
     }
 }

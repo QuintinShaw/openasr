@@ -1,15 +1,18 @@
 //! Dolphin `small.cn` dialect model family (WeNet-format E-Branchformer encoder
 //! + Transformer decoder + CTC head, char tokenizer, CTC/attention joint decode).
 //!
-//! Convert + load phase: the WeNet->GGUF importer ([`package_import`]) writes the
-//! fp16 `.oasr` runtime pack, and the dedicated executor ([`executor`]) loads the
-//! encoder weights from that pack and runs the parity-verified encoder graph. The
-//! fbank frontend and CTC-prefix-beam + attention-rescoring joint decode land in
-//! a later phase.
+//! The WeNet->GGUF importer ([`package_import`]) writes the fp16 `.oasr` runtime
+//! pack; the dedicated executor ([`executor`]) runs the full end-to-end pipeline
+//! from that pack: the kaldi-fbank [`frontend`] + global CMVN, the parity-verified
+//! E-Branchformer [`encoder_graph`], and the CTC/attention [`joint_decode`]
+//! (CTC prefix-beam over the CTC head, rescored by the Transformer
+//! [`decoder_graph`]).
 
 pub(crate) mod decoder_graph;
 pub(crate) mod encoder_graph;
 pub(crate) mod executor;
+pub(crate) mod frontend;
+pub(crate) mod joint_decode;
 pub mod package_import;
 pub(crate) mod runtime_contract;
 
