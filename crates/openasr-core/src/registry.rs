@@ -183,6 +183,24 @@ pub struct CatalogModel {
     pub pull_alias: Option<String>,
     pub size: String,
     pub languages: Vec<String>,
+    // Per-model source-language parameter policy, mirroring the resolved
+    // `LanguageMode` core dispatches on for this family (see
+    // crate::models::language::LanguageMode and
+    // crate::models::ggml_family_adapter::LanguageFamilyHint). Derived at
+    // catalog-authoring time (tooling/publish-model/scripts/_catalog.py's
+    // `language_mode_for_model`) from the model's family (Whisper: from its
+    // resolved `languages`), not guessed per release. Absent for kinds core has
+    // no source-language axis for (translation-model, capability-pack) -- old
+    // clients and packs predating this field also parse fine via the default.
+    #[serde(default)]
+    pub language_mode: Option<CatalogLanguageMode>,
+    // The language conditioned/reported when no explicit selection is made:
+    // `specify_only`'s conditioned default, or `fixed_monolingual`'s single
+    // language. Unset for `detect_and_specify` (auto stays unresolved until
+    // decode-time detection), `detect_implicit`, and `fixed_multilingual`
+    // (core exposes no per-request default for either).
+    #[serde(default)]
+    pub language_default: Option<String>,
     #[serde(default)]
     pub source_langs: Vec<String>,
     #[serde(default)]
@@ -229,6 +247,30 @@ pub enum CatalogModelKind {
     AsrModel,
     CapabilityPack,
     TranslationModel,
+}
+
+/// Wire tags for a model's source-language parameter policy, reusing verbatim
+/// the tags `LanguageCapability::mode` already serializes on
+/// `/v1/capabilities` for the loaded pack (`crate::api::backend::mod`'s
+/// `From<LanguageMode> for LanguageCapability`) -- the catalog and the
+/// running-model capability surface stay one vocabulary for this axis instead
+/// of drifting into two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogLanguageMode {
+    /// Decode-time auto-detect plus explicit selection (multilingual Whisper).
+    DetectAndSpecify,
+    /// Self-detects internally; an explicit hint is rejected (Qwen3-ASR).
+    DetectImplicit,
+    /// Explicit selection required; `language_default` is used when unset
+    /// (Cohere transcribe).
+    SpecifyOnly,
+    /// Intrinsically a single language; `language_default` names it
+    /// (Moonshine, Whisper `*.en`, CTC families).
+    FixedMonolingual,
+    /// Intrinsically a fixed multilingual set with no per-request selection
+    /// (X-ASR zh-en).
+    FixedMultilingual,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

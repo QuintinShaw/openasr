@@ -164,6 +164,8 @@ fn alias_contract_model(
         pull_alias: pull_alias.map(ToOwned::to_owned),
         size: size.to_string(),
         languages: vec!["en".to_string(), "zh".to_string()],
+        language_mode: None,
+        language_default: None,
         source_langs: Vec::new(),
         target_langs: Vec::new(),
         vendor: None,
@@ -876,6 +878,84 @@ fn embedded_catalog_snapshot_verifies_and_parses_offline() {
         .expect("embedded catalog should verify and parse offline");
     assert!(!catalog.models.is_empty());
     assert_eq!(catalog.catalog_url, super::DEFAULT_CATALOG_URL);
+}
+
+#[test]
+fn embedded_catalog_language_mode_matches_core_language_mode_per_family() {
+    // The desktop/web "recognition language" selector reads `language_mode`
+    // (+ `language_default`) straight off the catalog rather than reimplementing
+    // core's per-family LanguageMode resolution client-side. Pin the published
+    // catalog's values for one representative model per family so a future
+    // catalog regenerate (tooling/publish-model/scripts/_catalog.py's
+    // `language_mode_for_model`) that silently drifts from
+    // crate::models::language::LanguageMode / ggml_family_adapter's
+    // LanguageFamilyHint is caught here, not just in the Python drift check.
+    let home = tempfile::tempdir().unwrap();
+    let catalog = super::load_embedded_signed_catalog(home.path())
+        .expect("embedded catalog should verify and parse offline");
+    let find = |id: &str| {
+        catalog
+            .models
+            .iter()
+            .find(|model| model.id == id)
+            .unwrap_or_else(|| panic!("catalog model '{id}' missing"))
+    };
+
+    // Qwen3-ASR: DetectImplicit -- self-detects, no explicit selection.
+    let qwen = find("qwen3-asr-1.7b");
+    assert_eq!(qwen.language_mode, Some(CatalogLanguageMode::DetectImplicit));
+    assert_eq!(qwen.language_default, None);
+
+    // X-ASR zh-en: FixedMultilingual -- built-in bilingual set, no selection.
+    let xasr = find("xasr-zh-en");
+    assert_eq!(
+        xasr.language_mode,
+        Some(CatalogLanguageMode::FixedMultilingual)
+    );
+    assert_eq!(xasr.language_default, None);
+
+    // Cohere transcribe: SpecifyOnly -- always conditioned, "en" default.
+    let cohere = find("cohere-transcribe-03-2026");
+    assert_eq!(cohere.language_mode, Some(CatalogLanguageMode::SpecifyOnly));
+    assert_eq!(cohere.language_default.as_deref(), Some("en"));
+
+    // Moonshine: FixedMonolingual -- intrinsically English.
+    let moonshine = find("moonshine-tiny");
+    assert_eq!(
+        moonshine.language_mode,
+        Some(CatalogLanguageMode::FixedMonolingual)
+    );
+    assert_eq!(moonshine.language_default.as_deref(), Some("en"));
+
+    // Multilingual Whisper: DetectAndSpecify (WhisperVocabGated resolved
+    // multilingual from the pack's vocab / the catalog's multi-language list).
+    let whisper = find("whisper-base");
+    assert_eq!(
+        whisper.language_mode,
+        Some(CatalogLanguageMode::DetectAndSpecify)
+    );
+    assert_eq!(whisper.language_default, None);
+
+    // Whisper `*.en`: WhisperVocabGated resolved English-only -> FixedMonolingual.
+    let whisper_en = find("whisper-base.en");
+    assert_eq!(
+        whisper_en.language_mode,
+        Some(CatalogLanguageMode::FixedMonolingual)
+    );
+    assert_eq!(whisper_en.language_default.as_deref(), Some("en"));
+
+    // hymt2 (translation-model) and the diarization capability packs are not
+    // GgmlFamilyAdapterDescriptor ASR families -- no source-language axis, so
+    // the field is omitted rather than guessed.
+    for id in [
+        "hymt2-1.8b",
+        "pyannote-segmentation-3.0",
+        "wespeaker-voxceleb-resnet34-lm",
+    ] {
+        let model = find(id);
+        assert_eq!(model.language_mode, None, "{id} should omit language_mode");
+        assert_eq!(model.language_default, None, "{id} should omit language_default");
+    }
 }
 
 #[test]

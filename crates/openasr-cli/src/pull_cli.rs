@@ -317,6 +317,8 @@ mod tests {
             pull_alias: None,
             size: "tiny".to_string(),
             languages: vec!["en".to_string()],
+            language_mode: None,
+            language_default: None,
             source_langs: Vec::new(),
             target_langs: Vec::new(),
             vendor: None,

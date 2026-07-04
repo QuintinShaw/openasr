@@ -39,6 +39,8 @@ fn catalog_model(id: &str, family: &str, aliases: &[&str], size: &str) -> ModelC
             pull_alias: aliases.first().map(|alias| (*alias).to_string()),
             size: size.to_string(),
             languages: vec!["en".to_string(), "zh".to_string()],
+            language_mode: None,
+            language_default: None,
             source_langs: Vec::new(),
             target_langs: Vec::new(),
             vendor: None,

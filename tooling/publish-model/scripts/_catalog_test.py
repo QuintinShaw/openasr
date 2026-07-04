@@ -5,6 +5,7 @@ import unittest
 
 from _catalog import (
     apply_catalog_series_defaults,
+    language_mode_for_model,
     prose_locale_source_sha256,
     validate_all_card_prose_locales,
     validate_card_prose_locales,
@@ -138,6 +139,66 @@ class ProseLocaleValidationTest(unittest.TestCase):
                 "m",
                 {"tagline": EN_TAGLINE, "highlights": EN_HIGHLIGHTS, "prose_locales": ["not-a-table"]},
             )
+
+
+class LanguageModeForModelTest(unittest.TestCase):
+    def test_qwen_is_detect_implicit(self) -> None:
+        entry = {"kind": "asr-model", "family": "qwen"}
+        self.assertEqual(
+            language_mode_for_model(entry, ["en", "zh"]), {"language_mode": "detect_implicit"}
+        )
+
+    def test_xasr_zipformer_is_fixed_multilingual(self) -> None:
+        entry = {"kind": "asr-model", "family": "xasr-zipformer"}
+        self.assertEqual(
+            language_mode_for_model(entry, ["en", "zh"]), {"language_mode": "fixed_multilingual"}
+        )
+
+    def test_moonshine_is_fixed_monolingual_with_default(self) -> None:
+        entry = {"kind": "asr-model", "family": "moonshine"}
+        self.assertEqual(
+            language_mode_for_model(entry, ["en"]),
+            {"language_mode": "fixed_monolingual", "language_default": "en"},
+        )
+
+    def test_cohere_is_specify_only_with_en_default(self) -> None:
+        entry = {"kind": "asr-model", "family": "cohere"}
+        self.assertEqual(
+            language_mode_for_model(entry, ["ar", "en", "zh"]),
+            {"language_mode": "specify_only", "language_default": "en"},
+        )
+
+    def test_multilingual_whisper_is_detect_and_specify(self) -> None:
+        entry = {"kind": "asr-model", "family": "whisper"}
+        self.assertEqual(
+            language_mode_for_model(entry, ["en", "zh", "ja"]),
+            {"language_mode": "detect_and_specify"},
+        )
+
+    def test_english_only_whisper_is_fixed_monolingual(self) -> None:
+        entry = {"kind": "asr-model", "family": "whisper"}
+        self.assertEqual(
+            language_mode_for_model(entry, ["en"]),
+            {"language_mode": "fixed_monolingual", "language_default": "en"},
+        )
+
+    def test_translation_model_is_omitted(self) -> None:
+        entry = {"kind": "translation-model", "family": "hymt2"}
+        self.assertEqual(language_mode_for_model(entry, ["en", "zh"]), {})
+
+    def test_capability_pack_is_omitted(self) -> None:
+        entry = {"kind": "capability-pack", "family": "wespeaker"}
+        self.assertEqual(language_mode_for_model(entry, ["en", "zh"]), {})
+
+    def test_unknown_family_raises(self) -> None:
+        entry = {"kind": "asr-model", "family": "made-up-family", "id": "m"}
+        with self.assertRaisesRegex(KeyError, "no language_mode mapping"):
+            language_mode_for_model(entry, ["en"])
+
+    def test_fixed_monolingual_rejects_multiple_languages(self) -> None:
+        entry = {"kind": "asr-model", "family": "moonshine", "id": "m"}
+        with self.assertRaisesRegex(KeyError, "exactly one language"):
+            language_mode_for_model(entry, ["en", "fr"])
 
 
 class AllCardsProseLocalesTest(unittest.TestCase):

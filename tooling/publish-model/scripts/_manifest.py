@@ -23,6 +23,7 @@ from _catalog import (
     CATALOG_URL,
     DEFAULT_MIN_CLI_VERSION,
     QUANT_METADATA,
+    language_mode_for_model,
     languages_for_model,
     load as load_publish_catalog,
     validate_card_prose_locales,
@@ -210,13 +211,14 @@ def build_catalog_model(model: str, entry: dict, args: argparse.Namespace) -> di
     }
     if "capability" in entry:
         model_entry["capability"] = dict(entry["capability"])
+    languages = languages_for_model(entry)
     model_entry.update({
         "display_name": entry["display_name"],
         "family": entry["family"],
         "aliases": entry.get("aliases", []),
         "pull_alias": entry.get("pull_alias"),
         "size": entry["size"],
-        "languages": languages_for_model(entry),
+        "languages": languages,
         "vendor": entry["upstream_repo"].split("/", 1)[0],
         "license": entry["license_name"],
         "license_url": entry["license_source"],
@@ -230,6 +232,11 @@ def build_catalog_model(model: str, entry: dict, args: argparse.Namespace) -> di
         "prose": prose_block(prose),
         "quants": quants,
     })
+    # Per-model source-language parameter policy, derived from core's
+    # LanguageMode for this family (asr-model only; see
+    # language_mode_for_model()'s docstring for why translation-model /
+    # capability-pack entries omit it).
+    model_entry.update(language_mode_for_model(entry, languages))
     if entry.get("experimental") is True:
         model_entry["experimental"] = True
     # Explicit, author-set display hints (models-core.toml `sort_weight`/

@@ -18,6 +18,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from _catalog import (  # noqa: E402
     QUANT_METADATA,
+    language_mode_for_model,
     languages_for_model,
     load as load_publish_catalog,
     validate_all_card_prose_locales,
@@ -78,6 +79,7 @@ def check_registry_card(model: str, entry: dict, errors: list[str]) -> None:
 
 def check_machine_catalog_entry(model: str, entry: dict, machine_model: dict, errors: list[str]) -> None:
     registry_id = entry["registry_id"]
+    languages = languages_for_model(entry)
     expected_scalars = {
         "id": registry_id,
         "kind": entry["kind"],
@@ -85,7 +87,7 @@ def check_machine_catalog_entry(model: str, entry: dict, machine_model: dict, er
         "family": entry["family"],
         "pull_alias": entry["pull_alias"],
         "size": entry["size"],
-        "languages": languages_for_model(entry),
+        "languages": languages,
         "license": entry["license_name"],
         "license_url": entry["license_source"],
         "license_class": entry["license_class"],
@@ -93,6 +95,12 @@ def check_machine_catalog_entry(model: str, entry: dict, machine_model: dict, er
         "recommended_quant": entry["recommended_quant"],
         "pull_recommended": f"{registry_id}:{QUANT_METADATA[entry['recommended_quant']].suffix}",
     }
+    # language_mode/language_default are omitted entirely (not just falsy) for
+    # kinds language_mode_for_model() returns {} for; compare against None so a
+    # spuriously-added field on those entries is still caught as drift.
+    expected_language_mode = language_mode_for_model(entry, languages)
+    expected_scalars["language_mode"] = expected_language_mode.get("language_mode")
+    expected_scalars["language_default"] = expected_language_mode.get("language_default")
     for key, value in expected_scalars.items():
         if machine_model.get(key) != value:
             errors.append(f"{model}: catalog {key} drifted: got {machine_model.get(key)!r}, expected {value!r}")

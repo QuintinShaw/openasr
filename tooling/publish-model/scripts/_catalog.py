@@ -108,6 +108,106 @@ LANG_BY_FAMILY = {
     "wav2vec2": ["en"],
 }
 
+# Per-family source-language parameter policy for the catalog's `language_mode`
+# field, mirroring crates/openasr-core/src/models/ggml_family_adapter.rs's
+# `LanguageFamilyHint` (and the `LanguageMode` it resolves to in
+# crates/openasr-core/src/models/language.rs) 1:1. This is deliberately NOT an
+# authored per-model TOML field: whether a family accepts/requires/rejects an
+# explicit source-language selection is an architecture property owned by
+# core, not a per-release editorial choice, so it is derived here from the
+# same family the runtime dispatches on. "whisper" is intentionally absent --
+# WhisperVocabGated resolves per-PACK from the pack's own vocab (multilingual
+# vs English-only), so it is derived from the model's resolved `languages`
+# list in `language_mode_for_model()` below instead of a fixed per-family value.
+#
+# Values are the exact LanguageMode wire tags core already serializes on
+# `/v1/capabilities` (`LanguageCapability::mode` in
+# crates/openasr-core/src/api/backend/mod.rs), reused verbatim so the catalog
+# and the running-model capability surface never drift into two vocabularies
+# for the same axis.
+LANGUAGE_MODE_BY_FAMILY = {
+    # Qwen3-ASR: SelfDetectsRejectsHint -- self-detects, explicit hint rejected.
+    "qwen": "detect_implicit",
+    # Cohere transcribe: SelectsViaPrompt -- always conditions on a language
+    # token (its own default when the request omits one), never a true
+    # decode-time auto-detect.
+    "cohere": "specify_only",
+    # X-ASR zh-en: FixedMultilingual -- built-in bilingual set, no per-request
+    # language selection at all.
+    "xasr-zipformer": "fixed_multilingual",
+    # CTC / Moonshine: FixedMonolingual -- intrinsically a single language.
+    "moonshine": "fixed_monolingual",
+    "parakeet": "fixed_monolingual",
+    "wav2vec2": "fixed_monolingual",
+}
+
+# SpecifyOnly's conditioned default, mirroring the `default_language` literal
+# on each family's `LanguageFamilyHint::SelectsViaPrompt` in
+# ggml_family_adapter.rs. Not derivable from `languages` (English is not
+# `languages[0]` alphabetically for cohere), so kept as an explicit
+# same-source-of-truth constant instead of guessed.
+LANGUAGE_MODE_DEFAULT_BY_FAMILY = {
+    "cohere": "en",
+}
+
+
+def language_mode_for_model(entry: dict, languages: list[str]) -> dict:
+    """Per-model `language_mode` (+ `language_default` where applicable) for
+    the catalog, mirroring core's resolved `LanguageMode` for this model's
+    family (see module docstring on `LANGUAGE_MODE_BY_FAMILY`).
+
+    Returns {} for any kind other than asr-model: translation models (hymt2)
+    and capability packs (wespeaker/pyannote-segmentation) are not
+    GgmlFamilyAdapterDescriptor ASR families in core and have no per-request
+    source-language axis, so the field is omitted rather than guessed.
+    """
+    if entry.get("kind", DEFAULT_CATALOG_MODEL_KIND) != "asr-model":
+        return {}
+
+    family = entry["family"]
+    if family == "whisper":
+        # WhisperVocabGated resolves per-pack from the pack's own vocab; the
+        # catalog mirrors that via the model's resolved `languages` list
+        # (English-only *.en checkpoints declare a single-element override).
+        if len(languages) == 1:
+            return {"language_mode": "fixed_monolingual", "language_default": languages[0]}
+        return {"language_mode": "detect_and_specify"}
+
+    mode = LANGUAGE_MODE_BY_FAMILY.get(family)
+    if mode is None:
+        known = ", ".join(sorted({*LANGUAGE_MODE_BY_FAMILY, "whisper"}))
+        raise KeyError(
+            f"model '{entry.get('id', '?')}' family '{family}' has no language_mode mapping. "
+            f"Known families: {known}"
+        )
+
+    if mode == "fixed_monolingual":
+        if len(languages) != 1:
+            raise KeyError(
+                f"model '{entry.get('id', '?')}' language_mode fixed_monolingual requires "
+                f"exactly one language, got {languages!r}"
+            )
+        return {"language_mode": mode, "language_default": languages[0]}
+
+    if mode == "specify_only":
+        default_language = LANGUAGE_MODE_DEFAULT_BY_FAMILY.get(family)
+        if default_language is None:
+            raise KeyError(
+                f"model '{entry.get('id', '?')}' family '{family}' has no "
+                "LANGUAGE_MODE_DEFAULT_BY_FAMILY entry"
+            )
+        if default_language not in languages:
+            raise KeyError(
+                f"model '{entry.get('id', '?')}' language_mode specify_only "
+                f"default_language {default_language!r} is not in languages {languages!r}"
+            )
+        return {"language_mode": mode, "language_default": default_language}
+
+    # detect_implicit / fixed_multilingual: no default_language (core's
+    # LanguageCapability leaves it unset for both -- there is either nothing to
+    # default (self-detected, unexposed) or no per-request selection at all).
+    return {"language_mode": mode}
+
 
 def load() -> dict:
     core = load_toml(CATALOG_CORE)
