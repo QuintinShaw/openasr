@@ -793,6 +793,7 @@ pub(crate) fn encode(
     provider: &dyn DolphinWeightProvider,
     features: &[f32],
     frames_in: usize,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<DolphinEncoderOutput, DolphinEncoderError> {
     let feat = config.feature_dim;
     if features.len() != frames_in * feat {
@@ -808,9 +809,12 @@ pub(crate) fn encode(
     let graph_config = GgmlCpuGraphConfig {
         context_bytes: 64 * 1024 * 1024,
         graph_size: 16384,
-        n_threads: None,
-        backend: GgmlCpuGraphBackend::Cpu,
-        use_scheduler: false,
+        n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
+            backend,
+            crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
+        ),
+        backend,
+        use_scheduler: backend.is_gpu_class(),
     };
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
     let mut graph = runner.start_graph();

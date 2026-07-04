@@ -13,6 +13,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::ggml_runtime::GgmlCpuGraphBackend;
+
 use super::decoder_graph::{DolphinDecoderConfig, decode_prompt_logits};
 use super::encoder_graph::{DolphinEncoderConfig, encode};
 
@@ -185,7 +187,16 @@ fn dolphin_encoder_parity() {
     let config = DolphinEncoderConfig::small_cn();
     assert_eq!(feat_dim, config.feature_dim, "feature dim mismatch");
 
-    let output = encode(&config, &weights, &features, frames_in).expect("encode");
+    // Parity is CPU-locked: the golden fixtures are bit-exact against the CPU
+    // graph; the backend param exists so the runtime can pick Metal, not the gate.
+    let output = encode(
+        &config,
+        &weights,
+        &features,
+        frames_in,
+        GgmlCpuGraphBackend::Cpu,
+    )
+    .expect("encode");
 
     println!("== Dolphin E-Branchformer encoder parity ==");
     println!(
@@ -280,8 +291,15 @@ fn dolphin_decoder_parity() {
     let config = DolphinDecoderConfig::small_cn();
     assert_eq!(d_model, config.d_model, "encoder hidden mismatch");
 
-    let output = decode_prompt_logits(&config, &weights, &encoder_out, frames, &DECODER_PROMPT)
-        .expect("dolphin decoder");
+    let output = decode_prompt_logits(
+        &config,
+        &weights,
+        &encoder_out,
+        frames,
+        &DECODER_PROMPT,
+        GgmlCpuGraphBackend::Cpu,
+    )
+    .expect("dolphin decoder");
     assert_eq!(output.token_count, DECODER_PROMPT.len());
     assert_eq!(output.vocab_size, config.vocab_size);
 

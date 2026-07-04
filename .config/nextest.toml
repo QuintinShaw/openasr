@@ -1,3 +1,17 @@
 [profile.default]
 fail-fast = false
 retries = 0
+
+# The two heavy `#[ignore]` Dolphin pack tests share one `.oasr` under
+# `tmp/publish` (a producer that builds/publishes it and a consumer that reads
+# it). `ensure_dolphin_pack` already makes production atomic (temp file + rename)
+# so a reader never sees a torn/absent pack, but running them concurrently would
+# still let two fresh checkouts build the 738 MB pack twice. Serialize the pair
+# into a single-threaded group so exactly one build happens and the consumer
+# always reuses it. Only bites when the tests are opted in via `--run-ignored`.
+[test-groups]
+dolphin-pack = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(dolphin_encoder_from_pack_parity) | test(dolphin_joint_decode_end_to_end) | test(dolphin_perf_ab)'
+test-group = 'dolphin-pack'

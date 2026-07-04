@@ -478,6 +478,7 @@ pub(crate) fn decode_prompt_logits(
     encoder_out: &[f32],
     frames: usize,
     prompt_tokens: &[u32],
+    backend: GgmlCpuGraphBackend,
 ) -> Result<DolphinDecoderOutput, DolphinDecoderError> {
     let d = config.d_model;
     let tokens = prompt_tokens.len();
@@ -517,9 +518,12 @@ pub(crate) fn decode_prompt_logits(
     let graph_config = GgmlCpuGraphConfig {
         context_bytes: 128 * 1024 * 1024,
         graph_size: 16384,
-        n_threads: None,
-        backend: GgmlCpuGraphBackend::Cpu,
-        use_scheduler: false,
+        n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
+            backend,
+            crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::Decoder,
+        ),
+        backend,
+        use_scheduler: backend.is_gpu_class(),
     };
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
     let mut graph = runner.start_graph();

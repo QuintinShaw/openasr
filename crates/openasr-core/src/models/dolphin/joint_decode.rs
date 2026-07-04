@@ -92,6 +92,7 @@ pub(crate) fn joint_decode(
     encoder_out: &[f32],
     frames: usize,
     decode_config: &DolphinJointDecodeConfig,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<DolphinJointDecodeResult, DolphinJointDecodeError> {
     let vocab = decoder_config.vocab_size;
     let d_model = decoder_config.d_model;
@@ -103,7 +104,8 @@ pub(crate) fn joint_decode(
             ),
         });
     }
-    let ctc_log_probs = compute_ctc_log_probs(provider, encoder_out, frames, d_model, vocab)?;
+    let ctc_log_probs =
+        compute_ctc_log_probs(provider, encoder_out, frames, d_model, vocab, backend)?;
     let blank = decode_config.blank_token_id as usize;
     if blank >= vocab {
         return Err(DolphinJointDecodeError::Shape {
@@ -129,6 +131,7 @@ pub(crate) fn joint_decode(
         frames,
         decode_config,
         &nbest,
+        backend,
     )?;
     let best_token_ids = scored_nbest
         .first()
@@ -152,6 +155,7 @@ fn compute_ctc_log_probs(
     frames: usize,
     d_model: usize,
     vocab: usize,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<Vec<f32>, DolphinJointDecodeError> {
     let weight = fetch(provider, "ctc.ctc_lo.weight", vocab * d_model)?;
     let bias = fetch(provider, "ctc.ctc_lo.bias", vocab)?;
@@ -159,9 +163,12 @@ fn compute_ctc_log_probs(
     let graph_config = GgmlCpuGraphConfig {
         context_bytes: 256 * 1024 * 1024,
         graph_size: 2048,
-        n_threads: None,
-        backend: GgmlCpuGraphBackend::Cpu,
-        use_scheduler: false,
+        n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
+            backend,
+            crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::Default,
+        ),
+        backend,
+        use_scheduler: backend.is_gpu_class(),
     };
     let ggml = |stage: &'static str| move |source| DolphinJointDecodeError::Ggml { stage, source };
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml("runner_init"))?;
@@ -375,6 +382,7 @@ fn attention_rescore(
     frames: usize,
     decode_config: &DolphinJointDecodeConfig,
     nbest: &[(Vec<u32>, f32)],
+    backend: GgmlCpuGraphBackend,
 ) -> Result<Vec<DolphinScoredHypothesis>, DolphinJointDecodeError> {
     let prompt = &decode_config.prompt_prefix;
     let prompt_len = prompt.len();
@@ -390,8 +398,14 @@ fn attention_rescore(
     for (tokens, ctc_score) in nbest {
         let attention_score = if tokens.is_empty() {
             // Empty hypothesis: score is just log P(eos | prompt).
-            let logits =
-                decode_prompt_logits(decoder_config, provider, encoder_out, frames, prompt)?;
+            let logits = decode_prompt_logits(
+                decoder_config,
+                provider,
+                encoder_out,
+                frames,
+                prompt,
+                backend,
+            )?;
             let mut row = logits.last_token_logits().to_vec();
             log_softmax_in_place(&mut row);
             row[eos]
@@ -399,8 +413,14 @@ fn attention_rescore(
             let mut sequence = Vec::with_capacity(prompt_len + tokens.len());
             sequence.extend_from_slice(prompt);
             sequence.extend_from_slice(tokens);
-            let logits =
-                decode_prompt_logits(decoder_config, provider, encoder_out, frames, &sequence)?;
+            let logits = decode_prompt_logits(
+                decoder_config,
+                provider,
+                encoder_out,
+                frames,
+                &sequence,
+                backend,
+            )?;
             score_hypothesis(&logits.logits, vocab, prompt_len, tokens, eos)
         };
         let combined = attention_score + decode_config.ctc_weight * *ctc_score;

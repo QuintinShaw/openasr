@@ -14,9 +14,14 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::api::backend::{Segment, Transcription};
-use crate::ggml_runtime::{GgufMetadata, GgufTensorDataReadError, GgufTensorDataReader};
+use crate::ggml_runtime::{
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgufMetadata, GgufTensorDataReadError,
+    GgufTensorDataReader, RequestBackendPreference, request_backend_override,
+};
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
 };
@@ -95,11 +100,12 @@ pub(crate) fn encode_dolphin_encoder_from_pack(
     reader: &GgufTensorDataReader,
     features: &[f32],
     frames_in: usize,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<DolphinEncoderOutput, String> {
     let weights = load_dolphin_encoder_weights_from_pack(reader)
         .map_err(|error| format!("dolphin encoder weight load failed: {error}"))?;
     let config = DolphinEncoderConfig::small_cn();
-    encode(&config, &weights, features, frames_in)
+    encode(&config, &weights, features, frames_in, backend)
         .map_err(|error| format!("dolphin encoder graph failed: {error}"))
 }
 
@@ -124,14 +130,95 @@ pub(crate) struct DolphinPipelineOutput {
     pub scored_nbest: Vec<DolphinScoredText>,
 }
 
+/// Resolve the ggml backend for a Dolphin request. Fail-closed to the golden,
+/// parity-validated CPU path; a GPU backend engages only when the request
+/// explicitly asks for accelerated execution (`--execution-target accelerated`,
+/// which the bench-suite maps `OPENASR_GGML_BACKEND=metal` onto), never on the
+/// Auto default. Mirrors the xasr encoder policy so what runs is what was asked
+/// for, with no silent downgrade.
+///
+/// Perf note (AB-measured on M1, best-of-5, 2.38 s Sichuan clip; see
+/// `perf/PERFORMANCE.md`): unlike xasr's chunked encoder -- where every Metal
+/// config loses to CPU -- this 0.4B E-Branchformer is wide enough per step that
+/// Metal is ~1.45x FASTER (RTF 0.47 vs CPU 0.68, warm) at comparable peak RSS,
+/// and reproduces the golden transcript on the clip. Metal stays an opt-in rather
+/// than the default only because its fp16 numerics are not golden-validated
+/// (the parity gate is CPU bit-exact); it is the recommended accelerated path.
+fn dolphin_runtime_backend() -> GgmlCpuGraphBackend {
+    if matches!(
+        request_backend_override(),
+        Some(RequestBackendPreference::Accelerated)
+    ) {
+        GgmlCpuGraphConfig::resolve_runtime_backend()
+    } else {
+        GgmlCpuGraphBackend::Cpu
+    }
+}
+
+/// Dequantized runtime weights for one pack, shared behind an `Arc` so the
+/// process-level pool can hand the same immutable table to every call.
+pub(crate) type DolphinRuntimeWeights = HashMap<String, Vec<f32>>;
+
+/// Process-level pool of dequantized weights keyed by pack path. The fp16 pack is
+/// ~738 MB on disk and dequantizes to ~1.5 GB of host f32; doing that per request
+/// costs ~0.4 s (18% of the single-utterance wall on M1). Caching it lets warm
+/// calls skip the reload+dequant and reuse the same immutable table, mirroring the
+/// xasr process runtime pool. Keyed by path only: the dequantized weights are
+/// host-side f32 and backend-independent, so CPU and Metal runs share one entry.
+static DOLPHIN_WEIGHTS_POOL: OnceLock<Mutex<HashMap<PathBuf, Arc<DolphinRuntimeWeights>>>> =
+    OnceLock::new();
+
+/// Fetch the pack's dequantized weights from the pool, loading+dequantizing (via
+/// the already-resolved `reader`) and caching on a miss. The dequant runs outside
+/// the pool lock so concurrent first callers for distinct packs don't serialize.
+pub(crate) fn cached_dolphin_runtime_weights(
+    cache_key: &Path,
+    reader: &GgufTensorDataReader,
+) -> Result<Arc<DolphinRuntimeWeights>, String> {
+    let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(weights) = pool
+        .lock()
+        .expect("dolphin weights pool lock")
+        .get(cache_key)
+    {
+        return Ok(weights.clone());
+    }
+    let weights = Arc::new(
+        load_dolphin_runtime_weights_from_pack(reader)
+            .map_err(|error| format!("dolphin runtime weight load failed: {error}"))?,
+    );
+    pool.lock()
+        .expect("dolphin weights pool lock")
+        .insert(cache_key.to_path_buf(), weights.clone());
+    Ok(weights)
+}
+
 /// The complete Dolphin transcribe pipeline over 16 kHz mono PCM (`samples` in
 /// `[-1, 1]`): fbank + CMVN -> encoder -> CTC/attention joint decode -> detokenize.
-/// This is the shared path the executor and the end-to-end harness both drive.
+/// Loads the pack's weights from `reader` each call (the uncached path the parity
+/// harness drives); the executor uses [`cached_dolphin_runtime_weights`] +
+/// [`run_dolphin_pipeline`] to reuse weights across requests.
 pub(crate) fn transcribe_dolphin_pcm(
     reader: &GgufTensorDataReader,
     metadata: &GgufMetadata,
     samples: &[f32],
     ctc_weight: f32,
+    backend: GgmlCpuGraphBackend,
+) -> Result<DolphinPipelineOutput, String> {
+    let weights = load_dolphin_runtime_weights_from_pack(reader)
+        .map_err(|error| format!("dolphin runtime weight load failed: {error}"))?;
+    run_dolphin_pipeline(&weights, metadata, samples, ctc_weight, backend)
+}
+
+/// Run the fbank+CMVN -> encoder -> joint-decode -> detokenize pipeline over
+/// already-loaded `weights`. Split out from [`transcribe_dolphin_pcm`] so the
+/// executor can reuse pooled weights across requests without re-dequantizing.
+pub(crate) fn run_dolphin_pipeline(
+    weights: &DolphinRuntimeWeights,
+    metadata: &GgufMetadata,
+    samples: &[f32],
+    ctc_weight: f32,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<DolphinPipelineOutput, String> {
     let tokens = metadata
         .get_string_array(TOKENIZER_TOKENS_KEY)
@@ -146,9 +233,6 @@ pub(crate) fn transcribe_dolphin_pcm(
     let blank_token_id = metadata
         .get_u32(BLANK_TOKEN_ID_KEY)
         .ok_or_else(|| format!("dolphin pack is missing '{BLANK_TOKEN_ID_KEY}'"))?;
-
-    let weights = load_dolphin_runtime_weights_from_pack(reader)
-        .map_err(|error| format!("dolphin runtime weight load failed: {error}"))?;
 
     // Frontend: kaldi fbank -> global CMVN (the exact tensor the encoder consumes).
     let mut features = DolphinFbankFrontend::new()
@@ -165,8 +249,14 @@ pub(crate) fn transcribe_dolphin_pcm(
 
     // Encoder (parity-verified).
     let encoder_config = DolphinEncoderConfig::small_cn();
-    let encoder = encode(&encoder_config, &weights, &features.data, features.n_frames)
-        .map_err(|error| format!("dolphin encoder graph failed: {error}"))?;
+    let encoder = encode(
+        &encoder_config,
+        weights,
+        &features.data,
+        features.n_frames,
+        backend,
+    )
+    .map_err(|error| format!("dolphin encoder graph failed: {error}"))?;
 
     // CTC/attention joint decode.
     let decoder_config = DolphinDecoderConfig::small_cn();
@@ -179,10 +269,11 @@ pub(crate) fn transcribe_dolphin_pcm(
     };
     let decoded = joint_decode(
         &decoder_config,
-        &weights,
+        weights,
         &encoder.encoder_out,
         encoder.frames,
         &decode_config,
+        backend,
     )
     .map_err(|error| format!("dolphin joint decode failed: {error}"))?;
 
@@ -247,13 +338,19 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
             }
         }
 
+        let backend = dolphin_runtime_backend();
         let reader = GgufTensorDataReader::from_runtime_source(&preflight.runtime_source)
             .map_err(|error| fail(format!("dolphin pack tensor reader failed: {error}")))?;
-        let output = transcribe_dolphin_pcm(
-            &reader,
+        // Reuse dequantized weights across requests (pool keyed by pack path); the
+        // ~0.4 s reload+dequant is paid once, later requests are compute-only.
+        let weights =
+            cached_dolphin_runtime_weights(&request.runtime_source_path, &reader).map_err(fail)?;
+        let output = run_dolphin_pipeline(
+            &weights,
             &preflight.metadata,
             &request.prepared_audio.samples_f32,
             DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
+            backend,
         )
         .map_err(fail)?;
 
@@ -292,6 +389,7 @@ mod tests {
         convert_local_dolphin_wenet_source_to_runtime_pack,
     };
     use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
 
     const FIXTURE_ROOT: &str =
         "/Volumes/QuintinDocument/openasr-dev/openasr/tmp/publish/dolphin-cn-dialect-small";
@@ -382,7 +480,29 @@ mod tests {
         char_edit_distance(hypothesis, reference) as f32 / ref_len as f32
     }
 
-    fn produce_pack_if_needed(root: &Path) -> Option<PathBuf> {
+    /// Produce-if-absent the fp16 `.oasr` pack at its stable path, exactly once
+    /// per process, and hand every caller the same path. The two heavy `#[ignore]`
+    /// tests below (a producer + a consumer) share this so a fresh checkout runs
+    /// the convert exactly once and later callers reuse the result.
+    ///
+    /// The write is atomic: the pack is built into a uniquely-named temp file in
+    /// the packs dir and then `rename`d into place. Same-directory rename is
+    /// atomic on the local fs, so a reader that opens the stable path never
+    /// observes a half-written or missing pack -- the path always resolves to a
+    /// complete pack (the previous one, or the freshly renamed one), and a reader
+    /// holding an fd keeps reading its complete inode across the swap. This is
+    /// what removes the earlier producer/consumer race (the old producer did
+    /// `remove_file` + in-place rewrite, opening a window where the consumer read
+    /// an absent/torn pack); the `dolphin-pack` nextest test-group additionally
+    /// serializes the two so they never even overlap. Returns `None` when the
+    /// local checkpoint is absent (the tests skip).
+    fn ensure_dolphin_pack(root: &Path) -> Option<PathBuf> {
+        static PACK: OnceLock<Option<PathBuf>> = OnceLock::new();
+        PACK.get_or_init(|| produce_dolphin_pack_atomic(root))
+            .clone()
+    }
+
+    fn produce_dolphin_pack_atomic(root: &Path) -> Option<PathBuf> {
         let pack = root.join("packs/dolphin-cn-dialect-small-fp16.oasr");
         if pack.exists() {
             return Some(pack);
@@ -392,15 +512,31 @@ mod tests {
         if !safetensors.exists() || !units.exists() {
             return None;
         }
-        std::fs::create_dir_all(pack.parent().unwrap()).expect("create packs dir");
+        let packs_dir = pack.parent().expect("pack has a parent dir");
+        std::fs::create_dir_all(packs_dir).expect("create packs dir");
+        // Reserve a uniquely-named temp `.oasr` path in the same dir (the `.oasr`
+        // suffix keeps the importer's output-extension gate happy; the unique name
+        // means two concurrent producers in distinct processes never collide).
+        // The GGUF writer refuses to clobber an existing file, so drop the empty
+        // reservation file and let the writer create it fresh; `TempPath` still
+        // cleans it up on an early return, and `persist` publishes it with an
+        // atomic same-dir rename.
+        let temp_path = tempfile::Builder::new()
+            .prefix(".dolphin-pack-")
+            .suffix(".oasr")
+            .tempfile_in(packs_dir)
+            .expect("create temp pack")
+            .into_temp_path();
+        std::fs::remove_file(&temp_path).expect("clear temp reservation");
         convert_local_dolphin_wenet_source_to_runtime_pack(&DolphinImportRequest {
             safetensors_path: safetensors,
             units_path: units,
-            output_path: pack.clone(),
+            output_path: temp_path.to_path_buf(),
             model_id: "dolphin-cn-dialect-small".to_string(),
             quantization: DolphinQuantizationMode::Fp16,
         })
         .expect("dolphin import");
+        temp_path.persist(&pack).expect("publish dolphin pack");
         Some(pack)
     }
 
@@ -418,32 +554,10 @@ mod tests {
     #[ignore = "requires local Dolphin checkpoint + golden under tmp/publish (not committed)"]
     fn dolphin_encoder_from_pack_parity() {
         let root = root();
-        let safetensors = root.join("weights/full.safetensors");
-        let units = root.join("src/units.txt");
-        if !safetensors.exists() || !units.exists() {
+        let Some(pack) = ensure_dolphin_pack(&root) else {
             eprintln!("skip: dolphin checkpoint/units not present under {root:?}");
             return;
-        }
-
-        let pack = root.join("packs/dolphin-cn-dialect-small-fp16.oasr");
-        std::fs::create_dir_all(pack.parent().unwrap()).expect("create packs dir");
-        let _ = std::fs::remove_file(&pack);
-        let result = convert_local_dolphin_wenet_source_to_runtime_pack(&DolphinImportRequest {
-            safetensors_path: safetensors,
-            units_path: units,
-            output_path: pack.clone(),
-            model_id: "dolphin-cn-dialect-small".to_string(),
-            quantization: DolphinQuantizationMode::Fp16,
-        })
-        .expect("dolphin import");
-        eprintln!(
-            "wrote {} ({} tensors, vocab {}, blank {})",
-            result.output_path.display(),
-            result.tensor_count,
-            result.vocab_size,
-            result.blank_token_id
-        );
-        assert_eq!(result.vocab_size, 18173);
+        };
 
         // The produced pack must clear the fail-closed install gate (adapter
         // selection + the dolphin runtime-metadata contract) exactly as
@@ -451,13 +565,27 @@ mod tests {
         crate::validate_native_runtime_model_pack_contract(&pack)
             .expect("dolphin pack must pass the native install gate");
 
+        // Vocab is a property of the produced pack (the char tokenizer table the
+        // importer baked from `units.txt`).
+        let pack_metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("pack metadata");
+        let vocab_size = pack_metadata
+            .get_string_array(TOKENIZER_TOKENS_KEY)
+            .expect("pack carries the tokenizer vocab")
+            .len();
+        assert_eq!(vocab_size, 18173);
+
         let (in_shape, features) = load_npy_f32(&root.join("golden/logmel_feats_cmvn.npy"));
         assert_eq!(in_shape.len(), 3, "expected (1,T,80), got {in_shape:?}");
         let frames_in = in_shape[1];
 
         let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
-        let output =
-            encode_dolphin_encoder_from_pack(&reader, &features, frames_in).expect("encode");
+        let output = encode_dolphin_encoder_from_pack(
+            &reader,
+            &features,
+            frames_in,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("encode");
 
         let (_, golden_out) = load_npy_f32(&root.join("golden/encoder_out.npy"));
         let max = max_abs_diff(&output.encoder_out, &golden_out);
@@ -477,6 +605,84 @@ mod tests {
         );
     }
 
+    /// M1 CPU-vs-Metal x with/without weight-reuse AB harness. One config per
+    /// invocation (selected by env) so `peak_rss_bytes` (process-global
+    /// `ru_maxrss` high-water) is isolated per process; the driver script runs it
+    /// 4x. Prints a machine-greppable `DOLPHIN_AB ...` line with best-of-N RTF and
+    /// peak RSS. Never asserts a timing number (host-dependent); it only measures.
+    ///
+    /// Env: `OPENASR_DOLPHIN_AB_BACKEND=cpu|metal` (default cpu),
+    /// `OPENASR_DOLPHIN_AB_REUSE=0|1` (default 0 = reload+dequant each run),
+    /// `OPENASR_DOLPHIN_AB_RUNS=<n>` (default 3).
+    #[test]
+    #[ignore = "perf AB harness: requires local Dolphin checkpoint + golden clip under tmp/publish"]
+    fn dolphin_perf_ab() {
+        use std::time::{Duration, Instant};
+        let root = root();
+        let clip = root.join("golden/clip_sichuan.wav");
+        let Some(pack) = ensure_dolphin_pack(&root) else {
+            eprintln!("skip: dolphin checkpoint/units not present under {root:?}");
+            return;
+        };
+        if !clip.exists() {
+            eprintln!("skip: golden clip not present at {clip:?}");
+            return;
+        }
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            &clip,
+            "dolphin AB",
+            "clip_sichuan.wav",
+        )
+        .expect("load clip");
+        let audio_s = samples.len() as f64 / 16_000.0;
+        let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
+        let metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
+
+        let backend = match std::env::var("OPENASR_DOLPHIN_AB_BACKEND").as_deref() {
+            Ok("metal") | Ok("gpu") => GgmlCpuGraphBackend::Metal,
+            _ => GgmlCpuGraphBackend::Cpu,
+        };
+        let reuse = matches!(
+            std::env::var("OPENASR_DOLPHIN_AB_REUSE").as_deref(),
+            Ok("1")
+        );
+        let runs: usize = std::env::var("OPENASR_DOLPHIN_AB_RUNS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3)
+            .max(1);
+        let ctc_weight = DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT;
+
+        // Reuse == load+dequant the ~1.5 GB f32 weights once, reuse across runs
+        // (the pooled executor path). No-reuse == reload+dequant every run (the
+        // cold per-request cost). Best-of-N wall time isolates the reuse delta.
+        let preloaded =
+            reuse.then(|| load_dolphin_runtime_weights_from_pack(&reader).expect("weights"));
+        let mut best = Duration::MAX;
+        let mut text = String::new();
+        for _ in 0..runs {
+            let started = Instant::now();
+            let output = if let Some(weights) = preloaded.as_ref() {
+                run_dolphin_pipeline(weights, &metadata, &samples, ctc_weight, backend)
+            } else {
+                let weights =
+                    load_dolphin_runtime_weights_from_pack(&reader).expect("weights reload");
+                run_dolphin_pipeline(&weights, &metadata, &samples, ctc_weight, backend)
+            }
+            .expect("dolphin pipeline");
+            best = best.min(started.elapsed());
+            text = output.text;
+        }
+        let rtf = best.as_secs_f64() / audio_s;
+        let peak_rss_mb = crate::metrics::peak_rss_bytes()
+            .map(|bytes| bytes as f64 / 1.0e6)
+            .unwrap_or(0.0);
+        eprintln!(
+            "DOLPHIN_AB backend={backend:?} reuse={reuse} runs={runs} audio={audio_s:.2}s \
+             best={best:?} RTF={rtf:.3} peak_rss={peak_rss_mb:.0}MB text={text}"
+        );
+    }
+
     /// Full end-to-end joint-decode harness: read the Sichuan clip, run
     /// fbank+CMVN -> encoder -> CTC/attention rescoring from the produced `.oasr`
     /// pack, print the transcript + CER, and assert the rescored transcript
@@ -490,7 +696,7 @@ mod tests {
     fn dolphin_joint_decode_end_to_end() {
         let root = root();
         let clip = root.join("golden/clip_sichuan.wav");
-        let Some(pack) = produce_pack_if_needed(&root) else {
+        let Some(pack) = ensure_dolphin_pack(&root) else {
             eprintln!("skip: dolphin checkpoint/units not present under {root:?}");
             return;
         };
@@ -516,6 +722,7 @@ mod tests {
             &metadata,
             &samples,
             DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
+            GgmlCpuGraphBackend::Cpu,
         )
         .expect("dolphin transcribe");
 
@@ -550,8 +757,9 @@ mod tests {
 
         // Also report what the task-mentioned 0.3 rescoring weight would pick, to
         // show the training-vs-decode ctc_weight distinction concretely.
-        let output_03 = transcribe_dolphin_pcm(&reader, &metadata, &samples, 0.3)
-            .expect("dolphin transcribe (ctc_weight 0.3)");
+        let output_03 =
+            transcribe_dolphin_pcm(&reader, &metadata, &samples, 0.3, GgmlCpuGraphBackend::Cpu)
+                .expect("dolphin transcribe (ctc_weight 0.3)");
         eprintln!(
             "with ctc_weight 0.3   : {}  (CER vs rescoring ref {:.4})",
             output_03.text,

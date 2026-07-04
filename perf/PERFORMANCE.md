@@ -57,9 +57,49 @@ The two gating entries in the committed baseline are `whisper-tiny-en-q8` and
   The same clip is used across families so RTF/memory are directly comparable.
   See `perf/suite.toml` for the per-entry `audio_path`/`reference`.
 - **Families covered by the baseline:** whisper, cohere, qwen, parakeet-ctc,
-  wav2vec2-ctc (incl. data2vec/hubert variants), moonshine.
+  wav2vec2-ctc (incl. data2vec/hubert variants), moonshine, dolphin. The dolphin
+  entry uses its own Chinese-dialect clip (`clip_sichuan.wav`, reference the
+  model's golden `attention_rescoring` output `学校和底下好多那种野生枸杞`,
+  CER 0.0000), not the shared English clip.
 - **Quant per entry:** fp16 / q8_0 / q4_k (qwen also q3_k). The gating entries are
   at q8_0; other quants ride along as non-gating + ordering-group members.
+
+## Dolphin: CPU vs Metal (AB-measured on M1)
+
+The committed `dolphin-cn-dialect-small-fp16` baseline is the **CPU** default (the
+golden, parity-validated path). CPU-vs-Metal x with/without cross-request weight
+reuse was AB-measured on the 2.38 s Sichuan clip (M1, best-of-5); all four configs
+reproduce the golden transcript exactly (CER 0.0000):
+
+| Backend | Weight reuse | RTF | Peak RSS |
+| --- | --- | ---: | ---: |
+| CPU | cold (reload/dequant each request) | 0.89 | ~3.7 GB |
+| CPU | warm (pooled weights) | **0.72** | ~3.7 GB |
+| Metal | cold | 0.67 | ~3.4 GB |
+| Metal | warm (pooled weights) | **0.48** | ~3.4 GB |
+
+(CPU warm 0.72 / Metal warm 0.48 reproduced through the real `bench-suite`
+dispatch: CPU default RTF 0.72, `OPENASR_GGML_BACKEND=metal` RTF 0.48.)
+
+Two findings, both measured (not assumed):
+
+1. **Reuse helps.** The executor pools the ~1.5 GB dequantized f32 weights per pack
+   (`DOLPHIN_WEIGHTS_POOL`), so the ~0.6 s reload+dequant is paid once and later
+   requests are compute-only — visible as the baseline's `load_ms` vs `compute_ms`
+   split. Peak RSS is unchanged (the weights stay resident either way).
+2. **Metal WINS here — the opposite of xasr.** xasr's chunked encoder loses on
+   Metal (per-chunk graph too small to amortize GPU dispatch), so it pins CPU. This
+   0.4B E-Branchformer runs a wide full-utterance encoder + 10-way attention
+   rescoring per step, wide enough that Metal is ~1.45x faster at slightly lower
+   peak RSS.
+
+**Default = CPU** anyway: the parity gate is CPU bit-exact and Metal's fp16
+numerics are not golden-validated (identical transcript on this clip is evidence,
+not a guarantee across GPUs/audio). Metal is the recommended **opt-in** via
+`--execution-target accelerated` / `OPENASR_GGML_BACKEND=metal`; the executor
+fail-closes to CPU on the Auto default and engages Metal only on an explicit
+accelerated request (mirrors the xasr policy, opposite perf conclusion). Harness:
+the `dolphin_perf_ab` ignored test (`OPENASR_DOLPHIN_AB_BACKEND`/`_REUSE`/`_RUNS`).
 
 ## Caveats
 
