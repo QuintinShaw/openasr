@@ -284,7 +284,10 @@ fn catalog_for_resolved(resolved: &ResolvedCatalogPull) -> ModelCatalog {
             min_cli_version: "0.1.0".to_string(),
             recommended_quant: resolved.quant.clone(),
             pull_recommended: resolved.pull.clone(),
+            sort_weight: 0,
+            recommended: false,
             prose: None,
+            prose_locales: None,
             quants: vec![CatalogQuant {
                 quant: resolved.quant.clone(),
                 suffix: resolved.suffix.clone(),
@@ -1717,7 +1720,10 @@ fn installed_pack_alias_catalog() -> ModelCatalog {
             min_cli_version: "0.1.0".to_string(),
             recommended_quant: "q8_0".to_string(),
             pull_recommended: "qwen3-asr-0.6b:q8".to_string(),
+            sort_weight: 0,
+            recommended: false,
             prose: None,
+            prose_locales: None,
             quants: vec![CatalogQuant {
                 quant: "q8_0".to_string(),
                 suffix: "q8".to_string(),

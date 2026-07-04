@@ -32,3 +32,15 @@ Cohere Labs. The upstream Hugging Face model card declares Apache-2.0 licensing;
 OpenASR only converts the weights into `.oasr` packages and adds quantized builds
 for local runtime use.
 """
+
+[prose_locales."zh-CN"]
+tagline = "为转写打造的 2B 专用语音识别模型，支持 14 种语言"
+
+highlights = [
+  "🎙️ **专用语音识别** — 面向转写任务、音频输入文本输出的模型",
+  "🌍 **14 种语言** — 覆盖英语、主要欧洲语言、阿拉伯语、中文、日语、韩语和越南语",
+  "🧱 **Conformer 编码器-解码器** — 大型声学编码器搭配轻量级 Transformer 解码器",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包在推理阶段无需 Python，针对 CPU 与 Apple Silicon 优化",
+]
+
+source_sha256 = "a10fef012aa3dc47336dcab4c1ec5c2f917169fd122ab840f09c822e07b2a7ad"

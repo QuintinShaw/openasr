@@ -13,9 +13,12 @@ Usage:
   _catalog.py suffix  <quant_id>        # internal quant id -> pull-grammar suffix (fp16/q8/q4)
   _catalog.py models                    # list all model ids
   _catalog.py json    <model>           # full entry as JSON (with id injected)
+  _catalog.py prose-locale-hash <model> # compute source_sha256 for cards/<model>.toml's EN tagline+highlights
+  _catalog.py check-prose-locales       # validate every card's prose_locales block (format + staleness)
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
@@ -30,6 +33,7 @@ REPO_ROOT = repo_root(PUB)
 CATALOG_CORE = REPO_ROOT / "tooling" / "publish-model" / "models-core.toml"
 CATALOG_PUBLISH = REPO_ROOT / "tooling" / "publish-model" / "models-publish.toml"
 CATALOG_SERIES = REPO_ROOT / "crates" / "openasr-core" / "catalog-series.toml"
+CARDS_DIR = REPO_ROOT / "tooling" / "publish-model" / "cards"
 CATALOG = CATALOG_CORE
 CATALOG_URL = "https://catalog.openasr.org/v1/catalog.json"
 CATALOG_SCHEMA_VERSION = 1
@@ -142,6 +146,7 @@ def apply_catalog_series_defaults(model: str, entry: dict, series: dict) -> None
     entry["kind"] = kind
     validate_capability(model, entry)
     validate_translation_model(model, entry)
+    validate_display_ranking(model, entry)
 
     spec = series.get(entry["family"])
     if spec is not None and entry["size"] not in spec["member_sizes"]:
@@ -239,6 +244,21 @@ def validate_translation_model(model: str, entry: dict) -> None:
         )
 
 
+def validate_display_ranking(model: str, entry: dict) -> None:
+    """`sort_weight`/`recommended` are explicit, author-set display hints (no
+    threshold inference from perf/WER data). Both are optional; the catalog
+    defaults are sort_weight=0, recommended=false (see registry.rs CatalogModel).
+    """
+    if "sort_weight" in entry:
+        value = entry["sort_weight"]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise KeyError(f"model '{model}' sort_weight must be an int, got {value!r}")
+    if "recommended" in entry:
+        value = entry["recommended"]
+        if not isinstance(value, bool):
+            raise KeyError(f"model '{model}' recommended must be a bool, got {value!r}")
+
+
 def validate_lang_list(model: str, field: str, value: object) -> None:
     if not isinstance(value, list) or not value:
         raise KeyError(f"model '{model}' {field} must be a non-empty list")
@@ -280,6 +300,156 @@ def languages_for_model(entry: dict) -> list[str]:
     return languages_for_family(entry["family"])
 
 
+# --- prose_locales machine checks -------------------------------------------
+#
+# First-iteration scope is tagline + highlights only (no `overview`/intro
+# translation yet). Each locale block is authored in tooling/publish-model/
+# cards/<id>.toml under a `[prose_locales."<bcp47>"]` table (e.g.
+# `[prose_locales."zh-CN"]`) alongside the canonical English `tagline` /
+# `highlights`. These checks are deliberately mechanical (formatting +
+# staleness), not a translation-quality gate: a human still reviews the prose.
+
+BOLD_MARKER = "**"
+# Loosely "a number-shaped token": digits, then digit-ish punctuation
+# (.,/exponent/multiply/percent), then a trailing unit-ish letter run (27M,
+# 680k, 1.55B, 7e-5, ...). Good enough to catch a translator dropping or
+# changing a figure; it is a drift detector, not a strict tokenizer.
+NUMBER_TOKEN_RE = re.compile(r"[0-9][0-9.,eE×xX%]*[A-Za-z]*")
+PROSE_LOCALE_OPTIONAL_FIELDS = {"tagline", "highlights", "source_sha256"}
+
+
+def _leading_emoji(text: str) -> str:
+    stripped = text.strip()
+    return stripped[:1] if stripped else ""
+
+
+def _number_tokens(text: str) -> list[str]:
+    return NUMBER_TOKEN_RE.findall(text)
+
+
+def prose_locale_source_text(tagline: str, highlights: list[str]) -> str:
+    """Normalized English source text a locale's `source_sha256` is over."""
+    parts = [tagline.strip()] + [item.strip() for item in highlights]
+    return "\n".join(parts)
+
+
+def prose_locale_source_sha256(tagline: str, highlights: list[str]) -> str:
+    text = prose_locale_source_text(tagline, highlights)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _validate_prose_line_pair(
+    model: str,
+    locale: str,
+    label: str,
+    en_text: str,
+    translated_text: str,
+    *,
+    check_leading_emoji: bool = True,
+) -> None:
+    if en_text.count(BOLD_MARKER) != translated_text.count(BOLD_MARKER):
+        raise KeyError(
+            f"model '{model}' prose_locales.{locale} {label}: '**' bold-marker count drifted from English"
+        )
+    if en_text.count("`") != translated_text.count("`"):
+        raise KeyError(
+            f"model '{model}' prose_locales.{locale} {label}: backtick count drifted from English"
+        )
+    # Only highlight lines carry a leading emoji by convention; the tagline is
+    # plain prose, so its leading-character check is skipped.
+    if check_leading_emoji and _leading_emoji(en_text) != _leading_emoji(translated_text):
+        raise KeyError(
+            f"model '{model}' prose_locales.{locale} {label}: leading emoji drifted from English "
+            f"(expected {_leading_emoji(en_text)!r}, got {_leading_emoji(translated_text)!r})"
+        )
+    en_numbers = sorted(_number_tokens(en_text))
+    translated_numbers = sorted(_number_tokens(translated_text))
+    if en_numbers != translated_numbers:
+        raise KeyError(
+            f"model '{model}' prose_locales.{locale} {label}: numeric tokens drifted from English "
+            f"(expected {en_numbers!r}, got {translated_numbers!r})"
+        )
+
+
+def validate_prose_locale_block(
+    model: str,
+    locale: str,
+    en_tagline: str,
+    en_highlights: list[str],
+    block: dict,
+) -> None:
+    if "overview" in block:
+        raise KeyError(
+            f"model '{model}' prose_locales.{locale} must not include 'overview' "
+            "(first iteration only translates tagline + highlights)"
+        )
+    unknown = sorted(set(block) - PROSE_LOCALE_OPTIONAL_FIELDS)
+    if unknown:
+        raise KeyError(f"model '{model}' prose_locales.{locale} has unknown field(s): {', '.join(unknown)}")
+
+    translated_tagline = block.get("tagline")
+    if not isinstance(translated_tagline, str) or not translated_tagline.strip():
+        raise KeyError(f"model '{model}' prose_locales.{locale} tagline must be a non-empty string")
+    _validate_prose_line_pair(
+        model, locale, "tagline", en_tagline, translated_tagline, check_leading_emoji=False
+    )
+
+    translated_highlights = block.get("highlights")
+    if not isinstance(translated_highlights, list):
+        raise KeyError(f"model '{model}' prose_locales.{locale} highlights must be a list")
+    if len(translated_highlights) != len(en_highlights):
+        raise KeyError(
+            f"model '{model}' prose_locales.{locale} highlights count {len(translated_highlights)} "
+            f"does not match English count {len(en_highlights)}"
+        )
+    for index, (en_item, translated_item) in enumerate(zip(en_highlights, translated_highlights)):
+        if not isinstance(translated_item, str) or not translated_item.strip():
+            raise KeyError(f"model '{model}' prose_locales.{locale} highlight[{index}] must be a non-empty string")
+        _validate_prose_line_pair(model, locale, f"highlight[{index}]", en_item, translated_item)
+
+    expected_hash = prose_locale_source_sha256(en_tagline, en_highlights)
+    actual_hash = block.get("source_sha256")
+    if actual_hash != expected_hash:
+        raise KeyError(
+            f"model '{model}' prose_locales.{locale} translation stale: source_sha256 mismatch "
+            f"(expected {expected_hash}, got {actual_hash!r}); English tagline/highlights changed since "
+            "the translation was authored -- re-translate and update source_sha256 "
+            f"(see: _catalog.py prose-locale-hash {model})"
+        )
+
+
+def validate_card_prose_locales(model: str, card: dict) -> None:
+    locales = card.get("prose_locales")
+    if not locales:
+        return
+    if not isinstance(locales, dict):
+        raise KeyError(f"model '{model}' prose_locales must be a table of locale -> {{tagline, highlights}}")
+    en_tagline = card.get("tagline", "")
+    en_highlights = card.get("highlights", [])
+    for locale, block in sorted(locales.items()):
+        if not isinstance(block, dict):
+            raise KeyError(f"model '{model}' prose_locales.{locale} must be a table")
+        validate_prose_locale_block(model, locale, en_tagline, en_highlights, block)
+
+
+def read_card(model: str) -> dict:
+    path = CARDS_DIR / f"{model}.toml"
+    return load_toml(path) if path.exists() else {}
+
+
+def validate_all_card_prose_locales() -> list[str]:
+    """Validate every authored card's prose_locales block. Returns the sorted
+    list of model ids that declare at least one locale (for reporting)."""
+    translated: list[str] = []
+    for path in sorted(CARDS_DIR.glob("*.toml")):
+        model = path.stem
+        card = load_toml(path)
+        if card.get("prose_locales"):
+            translated.append(model)
+        validate_card_prose_locales(model, card)
+    return translated
+
+
 def entry(model: str) -> dict:
     data = load()
     if model not in data:
@@ -313,6 +483,12 @@ def main(argv: list[str]) -> int:
         print(QUANT_METADATA[argv[1]].suffix)
     elif cmd == "json":
         print(json.dumps(entry(argv[1]), indent=2))
+    elif cmd == "prose-locale-hash":
+        card = read_card(argv[1])
+        print(prose_locale_source_sha256(card.get("tagline", ""), card.get("highlights", [])))
+    elif cmd == "check-prose-locales":
+        translated = validate_all_card_prose_locales()
+        print(f"prose_locales check passed for {len(translated)} model(s): {', '.join(translated)}")
     else:
         sys.exit(f"unknown command '{cmd}'")
     return 0

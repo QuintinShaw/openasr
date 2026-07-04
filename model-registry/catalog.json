@@ -1,210 +1,170 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-06-26T16:51:04+00:00",
+  "generated_at": "2026-07-04T06:25:43+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
-      "id": "cohere-transcribe-03-2026",
+      "id": "qwen3-asr-1.7b",
       "kind": "asr-model",
-      "display_name": "Cohere Transcribe 03-2026",
-      "family": "cohere",
+      "display_name": "Qwen3-ASR 1.7B",
+      "family": "qwen",
       "aliases": [
-        "cohere-transcribe",
-        "cohere"
+        "qwen3",
+        "qwen3-asr"
       ],
-      "pull_alias": "cohere-transcribe",
-      "size": "2b",
+      "pull_alias": "qwen3",
+      "size": "1.7b",
       "languages": [
         "ar",
+        "cs",
+        "da",
         "de",
         "el",
         "en",
         "es",
+        "fa",
+        "fi",
+        "fil",
         "fr",
+        "hi",
+        "hu",
+        "id",
         "it",
         "ja",
         "ko",
+        "mk",
+        "ms",
         "nl",
         "pl",
         "pt",
+        "ro",
+        "ru",
+        "sv",
+        "th",
+        "tr",
         "vi",
         "zh"
       ],
-      "vendor": "CohereLabs",
+      "vendor": "Qwen",
       "license": "Apache-2.0",
-      "license_url": "https://huggingface.co/CohereLabs/cohere-transcribe-03-2026/blob/main/README.md",
+      "license_url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/main/LICENSE",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/cohere-transcribe-03-2026",
-      "hf_revision": "d68f62404ea48d4606ddea1a7c4eb19ffc352bb7",
+      "hf_repo": "OpenASR/qwen3-asr-1.7b",
+      "hf_revision": "1f9a6c6035c35d179067533cd1d12343c2f803c8",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
-      "pull_recommended": "cohere-transcribe-03-2026:q8",
+      "pull_recommended": "qwen3-asr-1.7b:q8",
       "prose": {
-        "tagline": "Dedicated 2B ASR for 14-language transcription",
+        "tagline": "State-of-the-art multilingual speech recognition across 52 languages & dialects",
         "overview": [
-          "Cohere Transcribe 03-2026 is Cohere and Cohere Labs' open release of a\n2B-parameter automatic speech recognition model. It is a dedicated audio-in,\ntext-out architecture with a Conformer-based acoustic encoder and a lightweight\nTransformer decoder, trained from scratch for transcription. The upstream model\ncard lists support for 14 languages across English, European, APAC, and MENA\ncoverage and reports Apache-2.0 licensing. This OpenASR repo repackages the\noriginal `CohereLabs/cohere-transcribe-03-2026` weights as `.oasr` packs that\nrun natively in the OpenASR runtime with no Python at inference time. For most\nusers the q8_0 build is the recommended default; q4_k is for tighter memory\nbudgets and fp16 is for verification or maximum fidelity."
+          "Qwen3-ASR-1.7B is a multilingual automatic speech recognition model (~2B parameters,\n~1.7B active, BF16) from Alibaba's Qwen3-ASR family that transcribes speech while\nidentifying the spoken language across 30 languages, 22 Chinese dialects, and a range\nof regional English accents \u2014 and it holds up on hard audio including singing voice and\nsongs over background music. A single unified checkpoint serves both offline and\nreal-time streaming transcription, with word-level timestamps available via the\ncompanion Qwen3-ForcedAligner-0.6B; the Qwen team reports state-of-the-art quality among\nopen-source ASR models and accuracy competitive with commercial APIs. This OpenASR repo\nrepackages the original Qwen/Qwen3-ASR-1.7B weights as `.oasr` packs that run natively in\nthe OpenASR runtime with no Python at inference time. For most users the q8_0 build is the\nrecommended default \u2014 near-reference accuracy at roughly half the footprint \u2014 while q4_k\nsuits tight-memory deployments and fp16 is reserved for verification or maximum fidelity."
         ],
         "highlights": [
-          "\ud83c\udf99\ufe0f **Dedicated ASR** \u2014 audio-in, text-out model built specifically for transcription",
-          "\ud83c\udf0d **14 languages** \u2014 covers English, major European languages, Arabic, Chinese, Japanese, Korean, and Vietnamese",
-          "\ud83e\uddf1 **Conformer encoder-decoder** \u2014 large acoustic encoder with a lightweight Transformer decoder",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+          "\ud83c\udfc6 **SOTA among open-source ASR** \u2014 competitive with the strongest proprietary commercial APIs",
+          "\ud83c\udf0d **52 languages & dialects** \u2014 30 languages plus 22 Chinese dialects, with spoken-language identification",
+          "\ud83c\udfa7 **Robust on hard audio** \u2014 clean speech, singing voice, and songs over background music",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
       "quants": [
         {
           "quant": "fp16",
           "suffix": "fp16",
-          "pull": "cohere-transcribe-03-2026:fp16",
-          "filename": "cohere-transcribe-03-2026-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/cohere-transcribe-03-2026/resolve/d68f62404ea48d4606ddea1a7c4eb19ffc352bb7/cohere-transcribe-03-2026-fp16.oasr",
-          "sha256": "0171306966445fe6a5a008c4d1fee6bbeca9f44530f7da86163e6a3064830823",
-          "size_bytes": 4136505984,
+          "pull": "qwen3-asr-1.7b:fp16",
+          "filename": "qwen3-asr-1.7b-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/1f9a6c6035c35d179067533cd1d12343c2f803c8/qwen3-asr-1.7b-fp16.oasr",
+          "sha256": "5e776e51907269597c6a96a0621deb35bbb7a1c0b1c5e10360db2b5875b52d0a",
+          "size_bytes": 4704802112,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.2636262650909091,
-            "rtf_metal": 0.10830301136363636,
-            "peak_rss_bytes": 5124603904,
+            "rtf_cpu": 2.950909212181818,
+            "rtf_metal": 1.607943712090909,
+            "peak_rss_bytes": 6470647808,
             "jfk_wer_vs_fp16": 0.0
           }
         },
         {
           "quant": "q8_0",
           "suffix": "q8",
-          "pull": "cohere-transcribe-03-2026:q8",
-          "filename": "cohere-transcribe-03-2026-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/cohere-transcribe-03-2026/resolve/d68f62404ea48d4606ddea1a7c4eb19ffc352bb7/cohere-transcribe-03-2026-q8_0.oasr",
-          "sha256": "e2ec0cd9a9d50f398e5553ef58bda19a7d4d0075c897bf5474686d877876a05f",
-          "size_bytes": 2423804544,
+          "pull": "qwen3-asr-1.7b:q8",
+          "filename": "qwen3-asr-1.7b-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/1f9a6c6035c35d179067533cd1d12343c2f803c8/qwen3-asr-1.7b-q8_0.oasr",
+          "sha256": "f09c032a3019aa47f5ebc3db88eb47505d22ad97c6a21657911cec98094481e3",
+          "size_bytes": 2506724672,
           "recommended": true,
           "perf": {
-            "rtf_cpu": 0.31705135227272724,
-            "rtf_metal": 0.112507125,
-            "peak_rss_bytes": 3419078656,
+            "rtf_cpu": 2.8368895984545457,
+            "rtf_metal": 0.8809729772727273,
+            "peak_rss_bytes": 5050204160,
             "jfk_wer_vs_fp16": 0.0
           }
         },
         {
           "quant": "q4_k",
           "suffix": "q4",
-          "pull": "cohere-transcribe-03-2026:q4",
-          "filename": "cohere-transcribe-03-2026-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/cohere-transcribe-03-2026/resolve/d68f62404ea48d4606ddea1a7c4eb19ffc352bb7/cohere-transcribe-03-2026-q4_k.oasr",
-          "sha256": "6117d1fc44afdb0e10dacd9d4cd3b90b3d4fa99751f998ef280861a3909ff0fa",
-          "size_bytes": 1510363776,
+          "pull": "qwen3-asr-1.7b:q4",
+          "filename": "qwen3-asr-1.7b-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/1f9a6c6035c35d179067533cd1d12343c2f803c8/qwen3-asr-1.7b-q4_k.oasr",
+          "sha256": "87ea8f6c578632205832be447d5bc749ac63416e6a9146465cb7c7a292b4eeb2",
+          "size_bytes": 1334416704,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.24565492045454543,
-            "rtf_metal": 0.09525663636363636,
-            "peak_rss_bytes": 2486468608,
+            "rtf_cpu": 3.4732779053636365,
+            "rtf_metal": 0.5557503787272727,
+            "peak_rss_bytes": 4796694528,
             "jfk_wer_vs_fp16": 0.0
           }
         }
-      ]
+      ],
+      "sort_weight": 920,
+      "recommended": true,
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u8986\u76d6 52 \u79cd\u8bed\u8a00\u4e0e\u65b9\u8a00\u7684\u9876\u5c16\u591a\u8bed\u8a00\u8bed\u97f3\u8bc6\u522b\u6a21\u578b",
+          "highlights": [
+            "\ud83c\udfc6 **\u5f00\u6e90\u8bed\u97f3\u8bc6\u522b\u4e2d\u7684 SOTA** \u2014 \u53ef\u4e0e\u6700\u5f3a\u7684\u5546\u4e1a\u95ed\u6e90 API \u4e00\u8f83\u9ad8\u4e0b",
+            "\ud83c\udf0d **52 \u79cd\u8bed\u8a00\u4e0e\u65b9\u8a00** \u2014 30 \u79cd\u8bed\u8a00\u52a0 22 \u79cd\u4e2d\u6587\u65b9\u8a00\uff0c\u5e76\u652f\u6301\u8bed\u79cd\u8bc6\u522b",
+            "\ud83c\udfa7 **\u590d\u6742\u97f3\u9891\u4e0b\u4f9d\u7136\u7a33\u5065** \u2014 \u6e05\u6670\u8bed\u97f3\u3001\u6b4c\u58f0\uff0c\u4ee5\u53ca\u5e26\u80cc\u666f\u97f3\u4e50\u7684\u6b4c\u66f2",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e GPU \u7684\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+          ]
+        }
+      }
     },
     {
-      "id": "hymt2-1.8b",
-      "kind": "translation-model",
-      "display_name": "Hy-MT2 1.8B",
-      "family": "hymt2",
-      "aliases": [],
-      "pull_alias": null,
-      "size": "1.8b",
+      "id": "xasr-zh-en",
+      "kind": "asr-model",
+      "display_name": "X-ASR zh-en",
+      "family": "xasr-zipformer",
+      "aliases": [
+        "xasr",
+        "x-asr"
+      ],
+      "pull_alias": "xasr",
+      "size": "0.16b",
       "languages": [
         "en",
         "zh"
       ],
-      "vendor": "tencent",
+      "vendor": "GilgameshWind",
       "license": "Apache-2.0",
-      "license_url": "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/blob/1cd5208700acedef4ef93019b6cfc148b8522d45/LICENSE.txt",
+      "license_url": "https://huggingface.co/GilgameshWind/X-ASR-zh-en/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/hymt2-1.8b",
-      "hf_revision": "a41a9f5fe352e58159cb3b2993115f94dced9a75",
-      "public": true,
-      "min_cli_version": "0.1.0",
-      "recommended_quant": "q4_k_m",
-      "pull_recommended": "hymt2-1.8b:q4km",
-      "prose": {
-        "tagline": "Hy-MT2 1.8B zh\u2192en translation for OpenASR realtime subtitles \u2014 clause-by-clause, fully on-device",
-        "overview": [
-          "Hy-MT2 1.8B is Tencent's compact many-to-many translation model from the Hunyuan-MT family.\nOpenASR packages the upstream Q4_K_M GGUF release as a local `.oasr` translation pack and uses it\nfor the experimental simultaneous-translation MVP: finalized and in-progress Chinese clauses from\nrealtime ASR are retranslated clause-by-clause into English, with provisional translations\nsuperseded as the source clause stabilizes. The MVP contract is zh\u2192en; the pack runs fully\non-device through OpenASR's pure-Rust GGML runtime with no Python at inference time."
-        ],
-        "highlights": [
-          "\ud83c\udf10 **Realtime zh\u2192en subtitle translation** \u2014 drives OpenASR's experimental clause-retranslation lane next to live Chinese ASR",
-          "\u26a1 **Hot-session clause latency in the hundreds of milliseconds** \u2014 prefix KV-cache reuse keeps warm per-clause retranslation fast on Apple Silicon CPU",
-          "\ud83d\udce6 **Byte-identical upstream weights** \u2014 the Q4_K_M GGUF tensor data is repackaged unmodified at a pinned revision; sha256 and provenance are embedded in the pack",
-          "\ud83e\uddfe **License + NOTICE embedded** \u2014 the upstream Apache-2.0 LICENSE.txt and the OpenASR modification NOTICE travel inside the pack metadata",
-          "\ud83c\udfaf **Parity-gated packaging** \u2014 greedy decode token IDs match llama.cpp on the same prompt before release"
-        ]
-      },
-      "quants": [
-        {
-          "quant": "q4_k_m",
-          "suffix": "q4km",
-          "pull": "hymt2-1.8b:q4km",
-          "filename": "hymt2-1.8b-q4_k_m.oasr",
-          "url": "https://huggingface.co/OpenASR/hymt2-1.8b/resolve/a41a9f5fe352e58159cb3b2993115f94dced9a75/hymt2-1.8b-q4_k_m.oasr",
-          "sha256": "56eae4c672e6d0fc1cacb210719ef494025c98c03753cd6b5a77b2fefa1557f6",
-          "size_bytes": 1133093920,
-          "recommended": true,
-          "perf": {
-            "rtf_cpu": null,
-            "rtf_metal": null,
-            "peak_rss_bytes": 4518821888,
-            "jfk_wer_vs_fp16": null
-          }
-        }
-      ],
-      "experimental": true,
-      "source_langs": [
-        "zh"
-      ],
-      "target_langs": [
-        "en"
-      ],
-      "upstream_base_repo": "tencent/Hy-MT2-1.8B",
-      "upstream_base_revision": "9a341cd1b679d3efd23b46e847b01745a71ed792",
-      "upstream_gguf_repo": "tencent/Hy-MT2-1.8B-GGUF",
-      "upstream_gguf_revision": "1cd5208700acedef4ef93019b6cfc148b8522d45",
-      "license_files": [
-        "LICENSE.txt",
-        "NOTICE.openasr.txt"
-      ]
-    },
-    {
-      "id": "moonshine-tiny",
-      "kind": "asr-model",
-      "display_name": "Moonshine Tiny",
-      "family": "moonshine",
-      "aliases": [
-        "moonshine"
-      ],
-      "pull_alias": "moonshine",
-      "size": "tiny",
-      "languages": [
-        "en"
-      ],
-      "vendor": "UsefulSensors",
-      "license": "MIT",
-      "license_url": "https://huggingface.co/UsefulSensors/moonshine-tiny",
-      "license_class": "permissive",
-      "hf_repo": "OpenASR/moonshine-tiny",
-      "hf_revision": "765b763f3536cb8810ae1634b6aaa995abbb1bde",
+      "hf_repo": "OpenASR/xasr-zh-en",
+      "hf_revision": "2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
-      "pull_recommended": "moonshine-tiny:q8",
+      "pull_recommended": "xasr-zh-en:q8",
       "prose": {
-        "tagline": "Tiny 27M-parameter English ASR built for real-time, on-device transcription",
+        "tagline": "Bilingual Chinese + English streaming speech recognition \u2014 a compact icefall Zipformer2 transducer",
         "overview": [
-          "Moonshine Tiny is the smallest model in Useful Sensors' **Moonshine** family \u2014 a 27M-parameter,\nsequence-to-sequence English speech-recognition model designed for **real-time, on-device\ntranscription** on hardware that is severely constrained in memory and compute. Trained on 200,000\nhours of audio, it transcribes English speech to text and, despite its size, reports greater accuracy\nthan existing ASR systems of comparable scale on standard benchmarks. It targets developers building\nlive transcription and voice-command experiences on low-cost devices. Like other autoregressive ASR\nmodels it can occasionally hallucinate or repeat on very short or clipped segments, so robust\nin-domain evaluation is recommended before deployment. This OpenASR repo repackages the original\nweights as `.oasr` packs that run natively in the OpenASR runtime \u2014 no Python at inference time. The\n**q8_0** build is the recommended default (near-reference accuracy at roughly a third of the\nfootprint); **fp16** is for verification or maximum fidelity."
+          "X-ASR-zh-en is a compact **bilingual (Chinese + English)** streaming speech-recognition model from\n**GilgameshWind**, built with the **icefall / k2** recipe as a cache-aware **Zipformer2 RNN-T\ntransducer** (a 6-stack, 19-layer Zipformer2 encoder, a stateless RNN-T decoder, and a tanh joiner\nover a 5000-token BPE vocabulary, ~0.16B parameters). The same checkpoint serves both low-latency\n**streaming** captions and full-file **offline** transcription, making it a good fit for on-device\nChinese/English dictation and real-time subtitles. This OpenASR repo repackages the weights as\n`.oasr` packs that run natively in the OpenASR runtime \u2014 no Python at inference time, all decoding\nlocal. The **q8_0** build is the recommended default (it matched the fp16 transcript bit-for-bit in\nOpenASR's verification); **q4_k** is the smallest build for tight-memory devices and **fp16** is for\nmaximum fidelity or verification."
         ],
         "highlights": [
-          "\ud83e\udeb6 **Just 27M parameters** \u2014 the smallest Moonshine, sized for memory- and compute-constrained edge hardware",
-          "\u26a1 **Real-time on-device** \u2014 engineered by Useful Sensors for live transcription and voice commands on low-cost devices",
-          "\ud83c\udfaf **Accurate for its size** \u2014 beats similarly-sized ASR systems on standard English benchmarks (per the Moonshine paper)",
-          "\ud83d\udde3\ufe0f **English speech-to-text** \u2014 sequence-to-sequence ASR trained on 200K hours of audio",
+          "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **Chinese + English** \u2014 one bilingual checkpoint for zh/en speech, including code-switched audio",
+          "\u26a1 **Streaming-first, offline-capable** \u2014 a cache-aware streaming Zipformer2 transducer for low-latency captions that also runs full-file offline transcription",
+          "\ud83e\udeb6 **Compact ~0.16B** \u2014 a 6-stack Zipformer2 encoder + stateless RNN-T decoder + tanh joiner over a 5000-token BPE vocab, light enough for on-device CPU",
           "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
@@ -212,94 +172,65 @@
         {
           "quant": "fp16",
           "suffix": "fp16",
-          "pull": "moonshine-tiny:fp16",
-          "filename": "moonshine-tiny-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/moonshine-tiny/resolve/765b763f3536cb8810ae1634b6aaa995abbb1bde/moonshine-tiny-fp16.oasr",
-          "sha256": "2f024ab25f82fd06c6c213df0a2db6ec542e6463acd8bb5e799ed158468d6258",
-          "size_bytes": 108863040,
+          "pull": "xasr-zh-en:fp16",
+          "filename": "xasr-zh-en-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5/xasr-zh-en-fp16.oasr",
+          "sha256": "89316b6e912aa474121fa6b8b7738514b64c9ba144f26702cbb36313b69a2e95",
+          "size_bytes": 314918720,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.036392473545454544,
-            "rtf_metal": 0.028632738636363633,
-            "peak_rss_bytes": 323026944,
+            "rtf_cpu": 0.08819234090909091,
+            "rtf_metal": 0.15154204545454544,
+            "peak_rss_bytes": 1365606400,
             "jfk_wer_vs_fp16": 0.0
           }
         },
         {
           "quant": "q8_0",
           "suffix": "q8",
-          "pull": "moonshine-tiny:q8",
-          "filename": "moonshine-tiny-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/moonshine-tiny/resolve/765b763f3536cb8810ae1634b6aaa995abbb1bde/moonshine-tiny-q8_0.oasr",
-          "sha256": "80ec6caed0a99abb27aa6775c9616c94a397417b6696466dfe59ae43c16f3e77",
-          "size_bytes": 34360896,
+          "pull": "xasr-zh-en:q8",
+          "filename": "xasr-zh-en-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5/xasr-zh-en-q8_0.oasr",
+          "sha256": "a0201070212ceff3a37d8dafd21455209ea48721d1b53b31e8eff328fc573fdb",
+          "size_bytes": 175711040,
           "recommended": true,
           "perf": {
-            "rtf_cpu": 0.02689490909090909,
-            "rtf_metal": 0.027663765181818185,
-            "peak_rss_bytes": 306135040,
+            "rtf_cpu": 0.08679616281818182,
+            "rtf_metal": 0.15143581063636363,
+            "peak_rss_bytes": 1355874304,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "xasr-zh-en:q4",
+          "filename": "xasr-zh-en-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5/xasr-zh-en-q4_k.oasr",
+          "sha256": "f4bea03a10333ee2c31f797a1abbadb885a85e63327b419b83b99d8bd2823106",
+          "size_bytes": 112003904,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.08677703790909091,
+            "rtf_metal": 0.14969315154545454,
+            "peak_rss_bytes": 1355841536,
             "jfk_wer_vs_fp16": 0.0
           }
         }
-      ]
-    },
-    {
-      "id": "pyannote-segmentation-3.0",
-      "kind": "capability-pack",
-      "capability": {
-        "feature": "speaker-diarization",
-        "role": "speaker-segmenter"
-      },
-      "display_name": "pyannote Segmentation 3.0",
-      "family": "pyannote-segmentation",
-      "aliases": [],
-      "pull_alias": null,
-      "size": "segmenter",
-      "languages": [
-        "en",
-        "zh"
       ],
-      "vendor": "onnx-community",
-      "license": "MIT",
-      "license_url": "https://huggingface.co/onnx-community/pyannote-segmentation-3.0",
-      "license_class": "permissive",
-      "hf_repo": "OpenASR/pyannote-segmentation-3.0",
-      "hf_revision": "aaae2145d5b3ac34d493c1fe0edcd2cdd9184b6a",
-      "public": true,
-      "min_cli_version": "0.1.0",
-      "recommended_quant": "f32",
-      "pull_recommended": "pyannote-segmentation-3.0:f32",
-      "prose": {
-        "tagline": "pyannote segmentation-3.0 \u2014 speaker-change and overlap aware speech segmentation for OpenASR diarization",
-        "overview": [
-          "pyannote **segmentation-3.0** is the local speech-segmentation model from the pyannote speaker\ndiarization toolkit: a PyanNet (SincNet front-end + bidirectional LSTM) classifier over a 7-class\npowerset that labels every 10 s window with which of up to three speakers are active \u2014 including\noverlapped speech. OpenASR uses it as the optional segmentation stage of its model-agnostic\ndiarization pipeline: when this pack is installed, `--diarize` splits speech at speaker changes\ninstead of relying on coarse VAD slices, then the WeSpeaker embedder pack clusters the segments into\nanonymous speaker turns. Weights are extracted from the un-gated, MIT-licensed\n**onnx-community** ONNX mirror at a pinned revision and repackaged as a raw-f32 `.oasr` pack that\nruns in pure Rust \u2014 no Python at inference time."
-        ],
-        "highlights": [
-          "\u2702\ufe0f **Speaker-change aware segmentation** \u2014 PyanNet (SincNet + BiLSTM) with a powerset head that detects up to 3 concurrent speakers, including overlapped speech",
-          "\ud83e\udd1d **Quality upgrade for `--diarize`** \u2014 installed alongside the WeSpeaker embedder pack, it replaces coarse VAD slices with fine speaker-turn boundaries",
-          "\ud83d\udd12 **Diarization, not identification** \u2014 anonymous session-relative labels; nothing leaves the machine",
-          "\ud83c\udfaf **Bit-exact packaging** \u2014 single raw-f32 build; the pure-Rust forward pass matches the upstream ONNX logits (max abs error ~7e-5)",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
-        ]
-      },
-      "quants": [
-        {
-          "quant": "f32",
-          "suffix": "f32",
-          "pull": "pyannote-segmentation-3.0:f32",
-          "filename": "pyannote-segmentation-3.0-f32.oasr",
-          "url": "https://huggingface.co/OpenASR/pyannote-segmentation-3.0/resolve/aaae2145d5b3ac34d493c1fe0edcd2cdd9184b6a/pyannote-segmentation-3.0-f32.oasr",
-          "sha256": "48151e322a0a9bb318000994e33991bdeeedb14aec5c8ea4cdb0ad2f63cb60af",
-          "size_bytes": 5975392,
-          "recommended": true,
-          "perf": {
-            "rtf_cpu": 0.13699,
-            "rtf_metal": null,
-            "peak_rss_bytes": null,
-            "jfk_wer_vs_fp16": null
-          }
+      "sort_weight": 910,
+      "recommended": true,
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u4e2d\u82f1\u53cc\u8bed\u6d41\u5f0f\u8bed\u97f3\u8bc6\u522b \u2014 \u8f7b\u91cf\u7684 icefall Zipformer2 transducer \u6a21\u578b",
+          "highlights": [
+            "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **\u4e2d\u6587 + \u82f1\u6587** \u2014 \u4e00\u4e2a\u6a21\u578b\u540c\u65f6\u652f\u6301\u4e2d\u82f1\u6587\u8bed\u97f3\uff0c\u5305\u62ec\u4e2d\u82f1\u6df7\u8bfb",
+            "\u26a1 **\u6d41\u5f0f\u4f18\u5148\uff0c\u517c\u987e\u79bb\u7ebf** \u2014 cache-aware \u6d41\u5f0f Zipformer2 transducer\uff0c\u4f4e\u5ef6\u8fdf\u5b57\u5e55\u4e4b\u5916\u4e5f\u652f\u6301\u6574\u6bb5\u79bb\u7ebf\u8f6c\u5199",
+            "\ud83e\udeb6 **\u8f7b\u91cf ~0.16B** \u2014 6 \u6bb5 Zipformer2 \u7f16\u7801\u5668 + \u65e0\u72b6\u6001 RNN-T \u89e3\u7801\u5668 + tanh joiner\uff0c5000 \u8bcd\u7684 BPE \u8bcd\u8868\uff0c\u8db3\u591f\u8f7b\u91cf\u4ee5\u652f\u6301\u7aef\u4fa7 CPU",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e GPU \u7684\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+          ]
         }
-      ]
+      }
     },
     {
       "id": "qwen3-asr-0.6b",
@@ -414,69 +345,246 @@
             "jfk_wer_vs_fp16": 0.0
           }
         }
-      ]
+      ],
+      "sort_weight": 900,
+      "recommended": true,
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u8986\u76d6 52 \u79cd\u8bed\u8a00\u4e0e\u65b9\u8a00\u7684\u591a\u8bed\u8a00\u8bed\u97f3\u8bc6\u522b \u2014 \u5feb\u901f\u8f7b\u91cf\u7248 Qwen3-ASR",
+          "highlights": [
+            "\ud83c\udf0d **52 \u79cd\u8bed\u8a00\u4e0e\u65b9\u8a00** \u2014 30 \u79cd\u8bed\u8a00\u52a0 22 \u79cd\u4e2d\u6587\u65b9\u8a00\uff0c\u5e76\u5185\u7f6e\u8bed\u79cd\u8bc6\u522b",
+            "\ud83c\udfa7 **\u590d\u6742\u97f3\u9891\u4e0b\u4f9d\u7136\u7a33\u5065** \u2014 \u6e05\u6670\u8bed\u97f3\u3001\u6b4c\u58f0\uff0c\u4ee5\u53ca\u5e26\u80cc\u666f\u97f3\u4e50\u7684\u6b4c\u66f2",
+            "\u26a1 **\u5feb\u901f\u8f7b\u91cf** \u2014 Qwen3-ASR \u5bb6\u65cf\u4e2d\u6548\u7387\u4f18\u5316\u7684\u6210\u5458\uff0c\u4e00\u4e2a\u6a21\u578b\u540c\u65f6\u652f\u6301\u79bb\u7ebf\u4e0e\u6d41\u5f0f",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e GPU \u7684\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+          ]
+        }
+      }
     },
     {
-      "id": "qwen3-asr-1.7b",
+      "id": "cohere-transcribe-03-2026",
       "kind": "asr-model",
-      "display_name": "Qwen3-ASR 1.7B",
-      "family": "qwen",
+      "display_name": "Cohere Transcribe 03-2026",
+      "family": "cohere",
       "aliases": [
-        "qwen3",
-        "qwen3-asr"
+        "cohere-transcribe",
+        "cohere"
       ],
-      "pull_alias": "qwen3",
-      "size": "1.7b",
+      "pull_alias": "cohere-transcribe",
+      "size": "2b",
       "languages": [
         "ar",
-        "cs",
-        "da",
         "de",
         "el",
         "en",
         "es",
-        "fa",
-        "fi",
-        "fil",
         "fr",
-        "hi",
-        "hu",
-        "id",
         "it",
         "ja",
         "ko",
-        "mk",
-        "ms",
         "nl",
         "pl",
         "pt",
-        "ro",
-        "ru",
-        "sv",
-        "th",
-        "tr",
         "vi",
         "zh"
       ],
-      "vendor": "Qwen",
+      "vendor": "CohereLabs",
       "license": "Apache-2.0",
-      "license_url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/main/LICENSE",
+      "license_url": "https://huggingface.co/CohereLabs/cohere-transcribe-03-2026/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/qwen3-asr-1.7b",
-      "hf_revision": "1f9a6c6035c35d179067533cd1d12343c2f803c8",
+      "hf_repo": "OpenASR/cohere-transcribe-03-2026",
+      "hf_revision": "d68f62404ea48d4606ddea1a7c4eb19ffc352bb7",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
-      "pull_recommended": "qwen3-asr-1.7b:q8",
+      "pull_recommended": "cohere-transcribe-03-2026:q8",
       "prose": {
-        "tagline": "State-of-the-art multilingual speech recognition across 52 languages & dialects",
+        "tagline": "Dedicated 2B ASR for 14-language transcription",
         "overview": [
-          "Qwen3-ASR-1.7B is a multilingual automatic speech recognition model (~2B parameters,\n~1.7B active, BF16) from Alibaba's Qwen3-ASR family that transcribes speech while\nidentifying the spoken language across 30 languages, 22 Chinese dialects, and a range\nof regional English accents \u2014 and it holds up on hard audio including singing voice and\nsongs over background music. A single unified checkpoint serves both offline and\nreal-time streaming transcription, with word-level timestamps available via the\ncompanion Qwen3-ForcedAligner-0.6B; the Qwen team reports state-of-the-art quality among\nopen-source ASR models and accuracy competitive with commercial APIs. This OpenASR repo\nrepackages the original Qwen/Qwen3-ASR-1.7B weights as `.oasr` packs that run natively in\nthe OpenASR runtime with no Python at inference time. For most users the q8_0 build is the\nrecommended default \u2014 near-reference accuracy at roughly half the footprint \u2014 while q4_k\nsuits tight-memory deployments and fp16 is reserved for verification or maximum fidelity."
+          "Cohere Transcribe 03-2026 is Cohere and Cohere Labs' open release of a\n2B-parameter automatic speech recognition model. It is a dedicated audio-in,\ntext-out architecture with a Conformer-based acoustic encoder and a lightweight\nTransformer decoder, trained from scratch for transcription. The upstream model\ncard lists support for 14 languages across English, European, APAC, and MENA\ncoverage and reports Apache-2.0 licensing. This OpenASR repo repackages the\noriginal `CohereLabs/cohere-transcribe-03-2026` weights as `.oasr` packs that\nrun natively in the OpenASR runtime with no Python at inference time. For most\nusers the q8_0 build is the recommended default; q4_k is for tighter memory\nbudgets and fp16 is for verification or maximum fidelity."
         ],
         "highlights": [
-          "\ud83c\udfc6 **SOTA among open-source ASR** \u2014 competitive with the strongest proprietary commercial APIs",
-          "\ud83c\udf0d **52 languages & dialects** \u2014 30 languages plus 22 Chinese dialects, with spoken-language identification",
-          "\ud83c\udfa7 **Robust on hard audio** \u2014 clean speech, singing voice, and songs over background music",
+          "\ud83c\udf99\ufe0f **Dedicated ASR** \u2014 audio-in, text-out model built specifically for transcription",
+          "\ud83c\udf0d **14 languages** \u2014 covers English, major European languages, Arabic, Chinese, Japanese, Korean, and Vietnamese",
+          "\ud83e\uddf1 **Conformer encoder-decoder** \u2014 large acoustic encoder with a lightweight Transformer decoder",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "cohere-transcribe-03-2026:fp16",
+          "filename": "cohere-transcribe-03-2026-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/cohere-transcribe-03-2026/resolve/d68f62404ea48d4606ddea1a7c4eb19ffc352bb7/cohere-transcribe-03-2026-fp16.oasr",
+          "sha256": "0171306966445fe6a5a008c4d1fee6bbeca9f44530f7da86163e6a3064830823",
+          "size_bytes": 4136505984,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.2636262650909091,
+            "rtf_metal": 0.10830301136363636,
+            "peak_rss_bytes": 5124603904,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "cohere-transcribe-03-2026:q8",
+          "filename": "cohere-transcribe-03-2026-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/cohere-transcribe-03-2026/resolve/d68f62404ea48d4606ddea1a7c4eb19ffc352bb7/cohere-transcribe-03-2026-q8_0.oasr",
+          "sha256": "e2ec0cd9a9d50f398e5553ef58bda19a7d4d0075c897bf5474686d877876a05f",
+          "size_bytes": 2423804544,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.31705135227272724,
+            "rtf_metal": 0.112507125,
+            "peak_rss_bytes": 3419078656,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "cohere-transcribe-03-2026:q4",
+          "filename": "cohere-transcribe-03-2026-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/cohere-transcribe-03-2026/resolve/d68f62404ea48d4606ddea1a7c4eb19ffc352bb7/cohere-transcribe-03-2026-q4_k.oasr",
+          "sha256": "6117d1fc44afdb0e10dacd9d4cd3b90b3d4fa99751f998ef280861a3909ff0fa",
+          "size_bytes": 1510363776,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.24565492045454543,
+            "rtf_metal": 0.09525663636363636,
+            "peak_rss_bytes": 2486468608,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u4e3a\u8f6c\u5199\u6253\u9020\u7684 2B \u4e13\u7528\u8bed\u97f3\u8bc6\u522b\u6a21\u578b\uff0c\u652f\u6301 14 \u79cd\u8bed\u8a00",
+          "highlights": [
+            "\ud83c\udf99\ufe0f **\u4e13\u7528\u8bed\u97f3\u8bc6\u522b** \u2014 \u9762\u5411\u8f6c\u5199\u4efb\u52a1\u3001\u97f3\u9891\u8f93\u5165\u6587\u672c\u8f93\u51fa\u7684\u6a21\u578b",
+            "\ud83c\udf0d **14 \u79cd\u8bed\u8a00** \u2014 \u8986\u76d6\u82f1\u8bed\u3001\u4e3b\u8981\u6b27\u6d32\u8bed\u8a00\u3001\u963f\u62c9\u4f2f\u8bed\u3001\u4e2d\u6587\u3001\u65e5\u8bed\u3001\u97e9\u8bed\u548c\u8d8a\u5357\u8bed",
+            "\ud83e\uddf1 **Conformer \u7f16\u7801\u5668-\u89e3\u7801\u5668** \u2014 \u5927\u578b\u58f0\u5b66\u7f16\u7801\u5668\u642d\u914d\u8f7b\u91cf\u7ea7 Transformer \u89e3\u7801\u5668",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u5728\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e Apple Silicon \u4f18\u5316"
+          ]
+        }
+      }
+    },
+    {
+      "id": "hymt2-1.8b",
+      "kind": "translation-model",
+      "display_name": "Hy-MT2 1.8B",
+      "family": "hymt2",
+      "aliases": [],
+      "pull_alias": null,
+      "size": "1.8b",
+      "languages": [
+        "en",
+        "zh"
+      ],
+      "vendor": "tencent",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/blob/1cd5208700acedef4ef93019b6cfc148b8522d45/LICENSE.txt",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/hymt2-1.8b",
+      "hf_revision": "a41a9f5fe352e58159cb3b2993115f94dced9a75",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q4_k_m",
+      "pull_recommended": "hymt2-1.8b:q4km",
+      "prose": {
+        "tagline": "Hy-MT2 1.8B zh\u2192en translation for OpenASR realtime subtitles \u2014 clause-by-clause, fully on-device",
+        "overview": [
+          "Hy-MT2 1.8B is Tencent's compact many-to-many translation model from the Hunyuan-MT family.\nOpenASR packages the upstream Q4_K_M GGUF release as a local `.oasr` translation pack and uses it\nfor the experimental simultaneous-translation MVP: finalized and in-progress Chinese clauses from\nrealtime ASR are retranslated clause-by-clause into English, with provisional translations\nsuperseded as the source clause stabilizes. The MVP contract is zh\u2192en; the pack runs fully\non-device through OpenASR's pure-Rust GGML runtime with no Python at inference time."
+        ],
+        "highlights": [
+          "\ud83c\udf10 **Realtime zh\u2192en subtitle translation** \u2014 drives OpenASR's experimental clause-retranslation lane next to live Chinese ASR",
+          "\u26a1 **Hot-session clause latency in the hundreds of milliseconds** \u2014 prefix KV-cache reuse keeps warm per-clause retranslation fast on Apple Silicon CPU",
+          "\ud83d\udce6 **Byte-identical upstream weights** \u2014 the Q4_K_M GGUF tensor data is repackaged unmodified at a pinned revision; sha256 and provenance are embedded in the pack",
+          "\ud83e\uddfe **License + NOTICE embedded** \u2014 the upstream Apache-2.0 LICENSE.txt and the OpenASR modification NOTICE travel inside the pack metadata",
+          "\ud83c\udfaf **Parity-gated packaging** \u2014 greedy decode token IDs match llama.cpp on the same prompt before release"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "q4_k_m",
+          "suffix": "q4km",
+          "pull": "hymt2-1.8b:q4km",
+          "filename": "hymt2-1.8b-q4_k_m.oasr",
+          "url": "https://huggingface.co/OpenASR/hymt2-1.8b/resolve/a41a9f5fe352e58159cb3b2993115f94dced9a75/hymt2-1.8b-q4_k_m.oasr",
+          "sha256": "56eae4c672e6d0fc1cacb210719ef494025c98c03753cd6b5a77b2fefa1557f6",
+          "size_bytes": 1133093920,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": null,
+            "rtf_metal": null,
+            "peak_rss_bytes": 4518821888,
+            "jfk_wer_vs_fp16": null
+          }
+        }
+      ],
+      "experimental": true,
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "Hy-MT2 1.8B \u4e2d\u8bd1\u82f1\u7ffb\u8bd1\u6a21\u578b \u2014 \u4e3a OpenASR \u5b9e\u65f6\u5b57\u5e55\u63d0\u4f9b\u9010\u53e5\u7ffb\u8bd1\uff0c\u5b8c\u5168\u672c\u5730\u8fd0\u884c",
+          "highlights": [
+            "\ud83c\udf10 **\u5b9e\u65f6\u4e2d\u8bd1\u82f1\u5b57\u5e55\u7ffb\u8bd1** \u2014 \u9a71\u52a8 OpenASR \u5b9e\u9a8c\u6027\u7684\u9010\u53e5\u91cd\u8bd1\u529f\u80fd\uff0c\u4e0e\u5b9e\u65f6\u4e2d\u6587\u8bed\u97f3\u8bc6\u522b\u5e76\u884c\u8fd0\u884c",
+            "\u26a1 **\u70ed\u4f1a\u8bdd\u9010\u53e5\u5ef6\u8fdf\u5728\u51e0\u767e\u6beb\u79d2\u91cf\u7ea7** \u2014 \u524d\u7f00 KV-cache \u590d\u7528\u8ba9\u9884\u70ed\u540e\u7684\u9010\u53e5\u91cd\u8bd1\u5728 Apple Silicon CPU \u4e0a\u4fdd\u6301\u5feb\u901f",
+            "\ud83d\udce6 **\u4e0e\u4e0a\u6e38\u6743\u91cd\u9010\u5b57\u8282\u4e00\u81f4** \u2014 Q4_K_M GGUF \u5f20\u91cf\u6570\u636e\u5728\u56fa\u5b9a\u7248\u672c\u4e0b\u539f\u6837\u91cd\u65b0\u6253\u5305\uff0csha256 \u4e0e\u6765\u6e90\u4fe1\u606f\u5185\u5d4c\u5728\u5305\u5185",
+            "\ud83e\uddfe **\u5185\u7f6e\u8bb8\u53ef\u8bc1\u4e0e NOTICE \u58f0\u660e** \u2014 \u4e0a\u6e38 Apache-2.0 \u7684 LICENSE.txt \u4ee5\u53ca OpenASR \u4fee\u6539\u58f0\u660e NOTICE \u90fd\u4fdd\u7559\u5728\u5305\u7684\u5143\u6570\u636e\u4e2d",
+            "\ud83c\udfaf **\u4e00\u81f4\u6027\u6821\u9a8c\u540e\u6253\u5305** \u2014 \u53d1\u5e03\u524d\u9700\u786e\u8ba4\u8d2a\u5a6a\u89e3\u7801 token ID \u4e0e llama.cpp \u5728\u540c\u4e00 prompt \u4e0b\u5b8c\u5168\u4e00\u81f4"
+          ]
+        }
+      },
+      "source_langs": [
+        "zh"
+      ],
+      "target_langs": [
+        "en"
+      ],
+      "upstream_base_repo": "tencent/Hy-MT2-1.8B",
+      "upstream_base_revision": "9a341cd1b679d3efd23b46e847b01745a71ed792",
+      "upstream_gguf_repo": "tencent/Hy-MT2-1.8B-GGUF",
+      "upstream_gguf_revision": "1cd5208700acedef4ef93019b6cfc148b8522d45",
+      "license_files": [
+        "LICENSE.txt",
+        "NOTICE.openasr.txt"
+      ]
+    },
+    {
+      "id": "moonshine-tiny",
+      "kind": "asr-model",
+      "display_name": "Moonshine Tiny",
+      "family": "moonshine",
+      "aliases": [
+        "moonshine"
+      ],
+      "pull_alias": "moonshine",
+      "size": "tiny",
+      "languages": [
+        "en"
+      ],
+      "vendor": "UsefulSensors",
+      "license": "MIT",
+      "license_url": "https://huggingface.co/UsefulSensors/moonshine-tiny",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/moonshine-tiny",
+      "hf_revision": "765b763f3536cb8810ae1634b6aaa995abbb1bde",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "moonshine-tiny:q8",
+      "prose": {
+        "tagline": "Tiny 27M-parameter English ASR built for real-time, on-device transcription",
+        "overview": [
+          "Moonshine Tiny is the smallest model in Useful Sensors' **Moonshine** family \u2014 a 27M-parameter,\nsequence-to-sequence English speech-recognition model designed for **real-time, on-device\ntranscription** on hardware that is severely constrained in memory and compute. Trained on 200,000\nhours of audio, it transcribes English speech to text and, despite its size, reports greater accuracy\nthan existing ASR systems of comparable scale on standard benchmarks. It targets developers building\nlive transcription and voice-command experiences on low-cost devices. Like other autoregressive ASR\nmodels it can occasionally hallucinate or repeat on very short or clipped segments, so robust\nin-domain evaluation is recommended before deployment. This OpenASR repo repackages the original\nweights as `.oasr` packs that run natively in the OpenASR runtime \u2014 no Python at inference time. The\n**q8_0** build is the recommended default (near-reference accuracy at roughly a third of the\nfootprint); **fp16** is for verification or maximum fidelity."
+        ],
+        "highlights": [
+          "\ud83e\udeb6 **Just 27M parameters** \u2014 the smallest Moonshine, sized for memory- and compute-constrained edge hardware",
+          "\u26a1 **Real-time on-device** \u2014 engineered by Useful Sensors for live transcription and voice commands on low-cost devices",
+          "\ud83c\udfaf **Accurate for its size** \u2014 beats similarly-sized ASR systems on standard English benchmarks (per the Moonshine paper)",
+          "\ud83d\udde3\ufe0f **English speech-to-text** \u2014 sequence-to-sequence ASR trained on 200K hours of audio",
           "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
@@ -484,52 +592,118 @@
         {
           "quant": "fp16",
           "suffix": "fp16",
-          "pull": "qwen3-asr-1.7b:fp16",
-          "filename": "qwen3-asr-1.7b-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/1f9a6c6035c35d179067533cd1d12343c2f803c8/qwen3-asr-1.7b-fp16.oasr",
-          "sha256": "5e776e51907269597c6a96a0621deb35bbb7a1c0b1c5e10360db2b5875b52d0a",
-          "size_bytes": 4704802112,
+          "pull": "moonshine-tiny:fp16",
+          "filename": "moonshine-tiny-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/moonshine-tiny/resolve/765b763f3536cb8810ae1634b6aaa995abbb1bde/moonshine-tiny-fp16.oasr",
+          "sha256": "2f024ab25f82fd06c6c213df0a2db6ec542e6463acd8bb5e799ed158468d6258",
+          "size_bytes": 108863040,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 2.950909212181818,
-            "rtf_metal": 1.607943712090909,
-            "peak_rss_bytes": 6470647808,
+            "rtf_cpu": 0.036392473545454544,
+            "rtf_metal": 0.028632738636363633,
+            "peak_rss_bytes": 323026944,
             "jfk_wer_vs_fp16": 0.0
           }
         },
         {
           "quant": "q8_0",
           "suffix": "q8",
-          "pull": "qwen3-asr-1.7b:q8",
-          "filename": "qwen3-asr-1.7b-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/1f9a6c6035c35d179067533cd1d12343c2f803c8/qwen3-asr-1.7b-q8_0.oasr",
-          "sha256": "f09c032a3019aa47f5ebc3db88eb47505d22ad97c6a21657911cec98094481e3",
-          "size_bytes": 2506724672,
+          "pull": "moonshine-tiny:q8",
+          "filename": "moonshine-tiny-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/moonshine-tiny/resolve/765b763f3536cb8810ae1634b6aaa995abbb1bde/moonshine-tiny-q8_0.oasr",
+          "sha256": "80ec6caed0a99abb27aa6775c9616c94a397417b6696466dfe59ae43c16f3e77",
+          "size_bytes": 34360896,
           "recommended": true,
           "perf": {
-            "rtf_cpu": 2.8368895984545457,
-            "rtf_metal": 0.8809729772727273,
-            "peak_rss_bytes": 5050204160,
-            "jfk_wer_vs_fp16": 0.0
-          }
-        },
-        {
-          "quant": "q4_k",
-          "suffix": "q4",
-          "pull": "qwen3-asr-1.7b:q4",
-          "filename": "qwen3-asr-1.7b-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/1f9a6c6035c35d179067533cd1d12343c2f803c8/qwen3-asr-1.7b-q4_k.oasr",
-          "sha256": "87ea8f6c578632205832be447d5bc749ac63416e6a9146465cb7c7a292b4eeb2",
-          "size_bytes": 1334416704,
-          "recommended": false,
-          "perf": {
-            "rtf_cpu": 3.4732779053636365,
-            "rtf_metal": 0.5557503787272727,
-            "peak_rss_bytes": 4796694528,
+            "rtf_cpu": 0.02689490909090909,
+            "rtf_metal": 0.027663765181818185,
+            "peak_rss_bytes": 306135040,
             "jfk_wer_vs_fp16": 0.0
           }
         }
-      ]
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u4e13\u4e3a\u5b9e\u65f6\u7aef\u4fa7\u8f6c\u5199\u6253\u9020\u7684 27M \u53c2\u6570\u8d85\u8f7b\u91cf\u82f1\u8bed\u8bed\u97f3\u8bc6\u522b\u6a21\u578b",
+          "highlights": [
+            "\ud83e\udeb6 **\u4ec5 27M \u53c2\u6570** \u2014 Moonshine \u7cfb\u5217\u4e2d\u6700\u5c0f\u7684\u6a21\u578b\uff0c\u4e13\u4e3a\u5185\u5b58\u548c\u7b97\u529b\u53d7\u9650\u7684\u8fb9\u7f18\u786c\u4ef6\u8bbe\u8ba1",
+            "\u26a1 **\u5b9e\u65f6\u7aef\u4fa7\u8fd0\u884c** \u2014 \u7531 Useful Sensors \u6253\u9020\uff0c\u9002\u7528\u4e8e\u4f4e\u6210\u672c\u8bbe\u5907\u4e0a\u7684\u5b9e\u65f6\u8f6c\u5199\u4e0e\u8bed\u97f3\u6307\u4ee4",
+            "\ud83c\udfaf **\u540c\u4f53\u79ef\u4e2d\u7684\u9ad8\u51c6\u786e\u7387** \u2014 \u5728\u6807\u51c6\u82f1\u8bed\u57fa\u51c6\u6d4b\u8bd5\u4e2d\u4f18\u4e8e\u540c\u7b49\u89c4\u6a21\u7684\u8bed\u97f3\u8bc6\u522b\u7cfb\u7edf\uff08\u636e Moonshine \u8bba\u6587\uff09",
+            "\ud83d\udde3\ufe0f **\u82f1\u8bed\u8bed\u97f3\u8f6c\u6587\u672c** \u2014 \u5e8f\u5217\u5230\u5e8f\u5217\u6a21\u578b\uff0c\u57fa\u4e8e 200K \u5c0f\u65f6\u97f3\u9891\u8bad\u7ec3",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e GPU \u7684\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+          ]
+        }
+      }
+    },
+    {
+      "id": "pyannote-segmentation-3.0",
+      "kind": "capability-pack",
+      "capability": {
+        "feature": "speaker-diarization",
+        "role": "speaker-segmenter"
+      },
+      "display_name": "pyannote Segmentation 3.0",
+      "family": "pyannote-segmentation",
+      "aliases": [],
+      "pull_alias": null,
+      "size": "segmenter",
+      "languages": [
+        "en",
+        "zh"
+      ],
+      "vendor": "onnx-community",
+      "license": "MIT",
+      "license_url": "https://huggingface.co/onnx-community/pyannote-segmentation-3.0",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/pyannote-segmentation-3.0",
+      "hf_revision": "aaae2145d5b3ac34d493c1fe0edcd2cdd9184b6a",
+      "public": true,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "f32",
+      "pull_recommended": "pyannote-segmentation-3.0:f32",
+      "prose": {
+        "tagline": "pyannote segmentation-3.0 \u2014 speaker-change and overlap aware speech segmentation for OpenASR diarization",
+        "overview": [
+          "pyannote **segmentation-3.0** is the local speech-segmentation model from the pyannote speaker\ndiarization toolkit: a PyanNet (SincNet front-end + bidirectional LSTM) classifier over a 7-class\npowerset that labels every 10 s window with which of up to three speakers are active \u2014 including\noverlapped speech. OpenASR uses it as the optional segmentation stage of its model-agnostic\ndiarization pipeline: when this pack is installed, `--diarize` splits speech at speaker changes\ninstead of relying on coarse VAD slices, then the WeSpeaker embedder pack clusters the segments into\nanonymous speaker turns. Weights are extracted from the un-gated, MIT-licensed\n**onnx-community** ONNX mirror at a pinned revision and repackaged as a raw-f32 `.oasr` pack that\nruns in pure Rust \u2014 no Python at inference time."
+        ],
+        "highlights": [
+          "\u2702\ufe0f **Speaker-change aware segmentation** \u2014 PyanNet (SincNet + BiLSTM) with a powerset head that detects up to 3 concurrent speakers, including overlapped speech",
+          "\ud83e\udd1d **Quality upgrade for `--diarize`** \u2014 installed alongside the WeSpeaker embedder pack, it replaces coarse VAD slices with fine speaker-turn boundaries",
+          "\ud83d\udd12 **Diarization, not identification** \u2014 anonymous session-relative labels; nothing leaves the machine",
+          "\ud83c\udfaf **Bit-exact packaging** \u2014 single raw-f32 build; the pure-Rust forward pass matches the upstream ONNX logits (max abs error ~7e-5)",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "f32",
+          "suffix": "f32",
+          "pull": "pyannote-segmentation-3.0:f32",
+          "filename": "pyannote-segmentation-3.0-f32.oasr",
+          "url": "https://huggingface.co/OpenASR/pyannote-segmentation-3.0/resolve/aaae2145d5b3ac34d493c1fe0edcd2cdd9184b6a/pyannote-segmentation-3.0-f32.oasr",
+          "sha256": "48151e322a0a9bb318000994e33991bdeeedb14aec5c8ea4cdb0ad2f63cb60af",
+          "size_bytes": 5975392,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.13699,
+            "rtf_metal": null,
+            "peak_rss_bytes": null,
+            "jfk_wer_vs_fp16": null
+          }
+        }
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "pyannote segmentation-3.0 \u2014 \u9762\u5411 OpenASR \u8bf4\u8bdd\u4eba\u5206\u79bb\u7684\u8bf4\u8bdd\u4eba\u5207\u6362\u4e0e\u91cd\u53e0\u611f\u77e5\u8bed\u97f3\u5206\u5272\u6a21\u578b",
+          "highlights": [
+            "\u2702\ufe0f **\u8bf4\u8bdd\u4eba\u5207\u6362\u611f\u77e5\u5206\u5272** \u2014 PyanNet\uff08SincNet + BiLSTM\uff09\u914d\u5408 powerset \u8f93\u51fa\u5934\uff0c\u6700\u591a\u53ef\u68c0\u6d4b 3 \u4f4d\u540c\u65f6\u53d1\u8a00\u7684\u8bf4\u8bdd\u4eba\uff0c\u5305\u62ec\u91cd\u53e0\u8bed\u97f3",
+            "\ud83e\udd1d **\u63d0\u5347 `--diarize` \u6548\u679c** \u2014 \u4e0e WeSpeaker \u8bf4\u8bdd\u4eba\u5d4c\u5165\u5305\u642d\u914d\u5b89\u88c5\u540e\uff0c\u7528\u7cbe\u7ec6\u7684\u8bf4\u8bdd\u4eba\u5207\u6362\u8fb9\u754c\u66ff\u4ee3\u7c97\u7c92\u5ea6\u7684 VAD \u5207\u7247",
+            "\ud83d\udd12 **\u53ea\u505a\u8bf4\u8bdd\u4eba\u5206\u79bb\uff0c\u4e0d\u505a\u8eab\u4efd\u8bc6\u522b** \u2014 \u533f\u540d\u7684\u4f1a\u8bdd\u5185\u6807\u7b7e\uff0c\u6240\u6709\u6570\u636e\u90fd\u4e0d\u79bb\u5f00\u672c\u673a",
+            "\ud83c\udfaf **\u9010\u6bd4\u7279\u4e00\u81f4\u6253\u5305** \u2014 \u5355\u4e00 raw-f32 \u7248\u672c\uff1b\u7eaf Rust \u524d\u5411\u8ba1\u7b97\u4e0e\u4e0a\u6e38 ONNX \u8f93\u51fa\u7684 logits \u4e00\u81f4\uff08\u6700\u5927\u7edd\u5bf9\u8bef\u5dee ~7e-5\uff09",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e GPU \u7684\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+          ]
+        }
+      }
     },
     {
       "id": "wespeaker-voxceleb-resnet34-lm",
@@ -587,7 +761,19 @@
             "jfk_wer_vs_fp16": null
           }
         }
-      ]
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "WeSpeaker ResNet34 \u8bf4\u8bdd\u4eba\u5d4c\u5165\u6a21\u578b\uff0c\u670d\u52a1\u4e8e OpenASR \u8bf4\u8bdd\u4eba\u5206\u79bb \u2014 \u66f4\u5f3a\u7684\u8bf4\u8bdd\u4eba\u533a\u5206\u80fd\u529b\uff0c\u5b8c\u5168\u672c\u5730\u8fd0\u884c",
+          "highlights": [
+            "\ud83d\udde3\ufe0f **OpenASR \u9ed8\u8ba4\u8bf4\u8bdd\u4eba\u5d4c\u5165\u6a21\u578b** \u2014 \u5b89\u88c5\u6b64\u5305\u540e\uff0c`--diarize` \u5373\u53ef\u4e3a\u4efb\u610f\u8bed\u97f3\u8bc6\u522b\u6a21\u578b\u6807\u6ce8\u533f\u540d\u8bf4\u8bdd\u4eba",
+            "\ud83e\uddec **256 \u7ef4 ResNet34 \u8bf4\u8bdd\u4eba\u5411\u91cf** \u2014 pyannote \u7684 WeSpeaker VoxCeleb \u6a21\u578b\uff0c\u91c7\u7528\u65f6\u5e8f\u7edf\u8ba1\u6c60\u5316",
+            "\ud83d\udd12 **\u53ea\u505a\u8bf4\u8bdd\u4eba\u5206\u79bb\uff0c\u4e0d\u505a\u8eab\u4efd\u8bc6\u522b** \u2014 \u533f\u540d\u7684\u4f1a\u8bdd\u5185\u6807\u7b7e\uff1b\u5d4c\u5165\u5411\u91cf\u4ec5\u4fdd\u7559\u5728\u672c\u5730\uff0c\u8bf7\u6c42\u7ed3\u675f\u540e\u5373\u4e22\u5f03\uff0c\u9664\u975e\u4f60\u4e3b\u52a8\u6ce8\u518c\u672c\u5730\u6863\u6848",
+            "\ud83c\udfaf **\u4e00\u81f4\u6027\u6821\u9a8c\u540e\u6253\u5305** \u2014 \u5355\u4e00 raw-f32 \u7248\u672c\uff1bRust \u524d\u5411\u8ba1\u7b97\u4e0e\u4e0a\u6e38 pyannote \u53c2\u8003\u5b9e\u73b0\u7684\u4f59\u5f26\u76f8\u4f3c\u5ea6 \u2265 0.9999",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u4e0e\u8bed\u97f3\u8bc6\u522b\u6a21\u578b\u5171\u7528\u540c\u4e00\u5957\u62c9\u53d6/\u5b89\u88c5\u8def\u5f84"
+          ]
+        }
+      }
     },
     {
       "id": "whisper-base",
@@ -768,7 +954,18 @@
             "jfk_wer_vs_fp16": 0.0
           }
         }
-      ]
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u7d27\u51d1\u7684\u591a\u8bed\u8a00 Whisper \u6a21\u578b\uff0c\u76f8\u6bd4 tiny \u66f4\u8fdb\u4e00\u6b65",
+          "highlights": [
+            "\ud83c\udfa7 **\u591a\u8bed\u8a00\u8bed\u97f3\u8bc6\u522b** \u2014 \u652f\u6301\u591a\u79cd\u8bed\u8a00\u8f6c\u5199\uff0c\u5e76\u53ef\u5c06\u8bed\u97f3\u7ffb\u8bd1\u4e3a\u82f1\u8bed",
+            "\ud83e\udeb6 **74M \u53c2\u6570** \u2014 \u4f53\u79ef\u5c0f\u5de7\uff0c\u51c6\u786e\u7387\u76f8\u6bd4 tiny \u6709\u660e\u663e\u63d0\u5347",
+            "\ud83c\udf10 **\u5f31\u76d1\u7763\u89c4\u6a21\u8bad\u7ec3** \u2014 \u4f7f\u7528 Whisper 680k \u5c0f\u65f6\u6807\u6ce8\u8bed\u97f3\u8bed\u6599\u8bad\u7ec3",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e Apple Silicon \u4f18\u5316"
+          ]
+        }
+      }
     },
     {
       "id": "whisper-base.en",
@@ -852,7 +1049,18 @@
             "jfk_wer_vs_fp16": 0.0
           }
         }
-      ]
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u7d27\u51d1\u7684\u7eaf\u82f1\u8bed Whisper \u6a21\u578b\uff0c\u5feb\u901f\u5b8c\u6210\u82f1\u8bed\u8f6c\u5199",
+          "highlights": [
+            "\ud83c\uddec\ud83c\udde7 **\u4ec5\u652f\u6301\u82f1\u8bed** \u2014 \u4e13\u6ce8\u82f1\u8bed\u573a\u666f\uff0c\u901a\u5e38\u6bd4\u540c\u5c3a\u5bf8\u7684\u591a\u8bed\u8a00\u6a21\u578b\u5728\u82f1\u8bed\u4e0a\u66f4\u51c6\u786e",
+            "\ud83e\udeb6 **74M \u53c2\u6570** \u2014 \u4f53\u79ef\u5c0f\u3001\u901f\u5ea6\u5feb\uff0c\u76f8\u6bd4 tiny.en \u6709\u660e\u663e\u63d0\u5347",
+            "\ud83c\udf10 **\u5f31\u76d1\u7763\u89c4\u6a21\u8bad\u7ec3** \u2014 \u4f7f\u7528 Whisper 680k \u5c0f\u65f6\u6807\u6ce8\u8bed\u97f3\u8bed\u6599\u8bad\u7ec3",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e Apple Silicon \u4f18\u5316"
+          ]
+        }
+      }
     },
     {
       "id": "whisper-large-v3",
@@ -1033,7 +1241,18 @@
             "jfk_wer_vs_fp16": 0.0
           }
         }
-      ]
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "OpenAI \u6700\u9ad8\u7cbe\u5ea6\u7684 Whisper \u6a21\u578b\uff0cv3 large \u7248\u672c",
+          "highlights": [
+            "\ud83c\udfa7 **\u591a\u8bed\u8a00\u8bed\u97f3\u8bc6\u522b** \u2014 \u652f\u6301\u5e7f\u6cdb\u7684\u8bed\u8a00\u8f6c\u5199\uff0c\u5e76\u53ef\u5c06\u8bed\u97f3\u7ffb\u8bd1\u4e3a\u82f1\u8bed",
+            "\ud83c\udfc6 **1.55B \u53c2\u6570** \u2014 \u5b8c\u6574\u5c3a\u5bf8\u7684 Whisper\uff0cOpenAI \u7cbe\u5ea6\u6700\u9ad8\u7684\u7248\u672c",
+            "\ud83d\udd01 **v3 \u7248\u672c\u6539\u8fdb** \u2014 \u5728\u66f4\u5927\u3001\u66f4\u591a\u6837\u7684\u8bed\u6599\u4e0a\u8bad\u7ec3\uff0c\u4f7f\u7528 128 \u7ef4\u6885\u5c14\u9891\u8c31\u4ee5\u63d0\u5347\u9c81\u68d2\u6027",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e Apple Silicon \u4f18\u5316"
+          ]
+        }
+      }
     },
     {
       "id": "whisper-large-v3-turbo",
@@ -1217,7 +1436,18 @@
             "jfk_wer_vs_fp16": 0.0
           }
         }
-      ]
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u57fa\u4e8e\u88c1\u526a\u7248 large-v3 \u6253\u9020\u7684\u5feb\u901f\u591a\u8bed\u8a00 Whisper \u6a21\u578b",
+          "highlights": [
+            "\u26a1 **Turbo \u89e3\u7801\u5668** \u2014 \u5c06 Whisper large-v3 \u7684\u89e3\u7801\u5668\u5c42\u6570\u4ece 32 \u5c42\u88c1\u526a\u5230 4 \u5c42\uff0c\u5927\u5e45\u63d0\u5347\u751f\u6210\u901f\u5ea6",
+            "\ud83c\udf0d **\u591a\u8bed\u8a00\u8bed\u97f3\u8bc6\u522b** \u2014 \u652f\u6301\u591a\u79cd\u8bed\u8a00\u8f6c\u5199\uff0c\u5e76\u53ef\u5c06\u8bed\u97f3\u7ffb\u8bd1\u4e3a\u82f1\u8bed",
+            "\ud83c\udf99\ufe0f **\u96f6\u6837\u672c\u9c81\u68d2\u6027** \u2014 \u7ee7\u627f Whisper \u5927\u89c4\u6a21\u5f31\u76d1\u7763\u8bad\u7ec3\uff0c\u5728\u5608\u6742\u573a\u666f\u4e0b\u4f9d\u7136\u7a33\u5065",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e GPU \u7684\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+          ]
+        }
+      }
     },
     {
       "id": "whisper-medium",
@@ -1398,7 +1628,18 @@
             "jfk_wer_vs_fp16": 0.0
           }
         }
-      ]
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u9ad8\u7cbe\u5ea6\u591a\u8bed\u8a00 Whisper \u6a21\u578b\uff0c769M \u53c2\u6570",
+          "highlights": [
+            "\ud83c\udfa7 **\u591a\u8bed\u8a00\u8bed\u97f3\u8bc6\u522b** \u2014 \u652f\u6301\u591a\u79cd\u8bed\u8a00\u8f6c\u5199\uff0c\u5e76\u53ef\u5c06\u8bed\u97f3\u7ffb\u8bd1\u4e3a\u82f1\u8bed",
+            "\ud83c\udfaf **769M \u53c2\u6570** \u2014 \u63a5\u8fd1 large \u7248\u672c\u7684\u51c6\u786e\u7387\uff0c\u4f53\u79ef\u66f4\u6613\u638c\u63a7",
+            "\ud83c\udf10 **\u5f31\u76d1\u7763\u89c4\u6a21\u8bad\u7ec3** \u2014 \u4f7f\u7528 Whisper 680k \u5c0f\u65f6\u6807\u6ce8\u8bed\u97f3\u8bed\u6599\u8bad\u7ec3",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e Apple Silicon \u4f18\u5316"
+          ]
+        }
+      }
     },
     {
       "id": "whisper-medium.en",
@@ -1482,7 +1723,18 @@
             "jfk_wer_vs_fp16": 0.0
           }
         }
-      ]
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u9ad8\u7cbe\u5ea6\u7eaf\u82f1\u8bed Whisper \u6a21\u578b\uff0c769M \u53c2\u6570",
+          "highlights": [
+            "\ud83c\uddec\ud83c\udde7 **\u4ec5\u652f\u6301\u82f1\u8bed** \u2014 \u4e13\u6ce8\u82f1\u8bed\u573a\u666f\uff0c\u901a\u5e38\u6bd4\u540c\u5c3a\u5bf8\u7684\u591a\u8bed\u8a00\u6a21\u578b\u5728\u82f1\u8bed\u4e0a\u66f4\u51c6\u786e",
+            "\ud83c\udfaf **769M \u53c2\u6570** \u2014 \u63a5\u8fd1 large \u7248\u672c\u7684\u82f1\u8bed\u51c6\u786e\u7387\uff0c\u4f53\u79ef\u66f4\u6613\u638c\u63a7",
+            "\ud83c\udf10 **\u5f31\u76d1\u7763\u89c4\u6a21\u8bad\u7ec3** \u2014 \u4f7f\u7528 Whisper 680k \u5c0f\u65f6\u6807\u6ce8\u8bed\u97f3\u8bed\u6599\u8bad\u7ec3",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e Apple Silicon \u4f18\u5316"
+          ]
+        }
+      }
     },
     {
       "id": "whisper-small",
@@ -1663,7 +1915,18 @@
             "jfk_wer_vs_fp16": 0.0
           }
         }
-      ]
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u7d27\u51d1\u7684\u591a\u8bed\u8a00 Whisper \u6a21\u578b\uff0c\u9002\u5408\u672c\u5730\u8f6c\u5199",
+          "highlights": [
+            "\ud83c\udfa7 **\u591a\u8bed\u8a00\u8bed\u97f3\u8bc6\u522b** \u2014 \u652f\u6301\u591a\u79cd\u8bed\u8a00\u8f6c\u5199\uff0c\u5e76\u53ef\u5c06\u8bed\u97f3\u7ffb\u8bd1\u4e3a\u82f1\u8bed",
+            "\ud83e\udde0 **244M \u53c2\u6570** \u2014 small \u7248\u672c\u5728\u51c6\u786e\u7387\u3001\u4f53\u79ef\u548c\u901f\u5ea6\u4e4b\u95f4\u53d6\u5f97\u5e73\u8861",
+            "\ud83c\udf10 **\u5f31\u76d1\u7763\u89c4\u6a21\u8bad\u7ec3** \u2014 \u4f7f\u7528 Whisper 680k \u5c0f\u65f6\u6807\u6ce8\u8bed\u97f3\u8bed\u6599\u8bad\u7ec3",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e Apple Silicon \u4f18\u5316"
+          ]
+        }
+      }
     },
     {
       "id": "whisper-small.en",
@@ -1747,7 +2010,18 @@
             "jfk_wer_vs_fp16": 0.0
           }
         }
-      ]
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u5747\u8861\u7684\u7eaf\u82f1\u8bed Whisper \u6a21\u578b\uff0c\u9002\u5408\u7cbe\u51c6\u7684\u672c\u5730\u8f6c\u5199",
+          "highlights": [
+            "\ud83c\uddec\ud83c\udde7 **\u4ec5\u652f\u6301\u82f1\u8bed** \u2014 \u4e13\u6ce8\u82f1\u8bed\u573a\u666f\uff0c\u901a\u5e38\u6bd4\u540c\u5c3a\u5bf8\u7684\u591a\u8bed\u8a00\u6a21\u578b\u5728\u82f1\u8bed\u4e0a\u66f4\u51c6\u786e",
+            "\ud83e\udde0 **244M \u53c2\u6570** \u2014 small \u7248\u672c\u5728\u82f1\u8bed\u51c6\u786e\u7387\u3001\u4f53\u79ef\u548c\u901f\u5ea6\u4e4b\u95f4\u53d6\u5f97\u5e73\u8861",
+            "\ud83c\udf10 **\u5f31\u76d1\u7763\u89c4\u6a21\u8bad\u7ec3** \u2014 \u4f7f\u7528 Whisper 680k \u5c0f\u65f6\u6807\u6ce8\u8bed\u97f3\u8bed\u6599\u8bad\u7ec3",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e Apple Silicon \u4f18\u5316"
+          ]
+        }
+      }
     },
     {
       "id": "whisper-tiny",
@@ -1928,7 +2202,18 @@
             "jfk_wer_vs_fp16": 0.0
           }
         }
-      ]
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u4f53\u79ef\u6700\u5c0f\u7684\u591a\u8bed\u8a00 Whisper \u6a21\u578b\uff0c\u672c\u5730\u8f6c\u5199\u901f\u5ea6\u5feb",
+          "highlights": [
+            "\ud83c\udfa7 **\u591a\u8bed\u8a00\u8bed\u97f3\u8bc6\u522b** \u2014 \u652f\u6301\u591a\u79cd\u8bed\u8a00\u8f6c\u5199\uff0c\u5e76\u53ef\u5c06\u8bed\u97f3\u7ffb\u8bd1\u4e3a\u82f1\u8bed",
+            "\u26a1 **39M \u53c2\u6570** \u2014 Whisper \u7cfb\u5217\u4e2d\u6700\u5c0f\u7684\u7248\u672c\uff0c\u8fd0\u884c\u901f\u5ea6\u6700\u5feb\u3001\u6700\u8f7b\u91cf",
+            "\ud83c\udf10 **\u5f31\u76d1\u7763\u89c4\u6a21\u8bad\u7ec3** \u2014 \u4f7f\u7528 Whisper 680k \u5c0f\u65f6\u6807\u6ce8\u8bed\u97f3\u8bed\u6599\u8bad\u7ec3",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e Apple Silicon \u4f18\u5316"
+          ]
+        }
+      }
     },
     {
       "id": "whisper-tiny.en",
@@ -2012,95 +2297,18 @@
             "jfk_wer_vs_fp16": 0.0
           }
         }
-      ]
-    },
-    {
-      "id": "xasr-zh-en",
-      "kind": "asr-model",
-      "display_name": "X-ASR zh-en",
-      "family": "xasr-zipformer",
-      "aliases": [
-        "xasr",
-        "x-asr"
       ],
-      "pull_alias": "xasr",
-      "size": "0.16b",
-      "languages": [
-        "en",
-        "zh"
-      ],
-      "vendor": "GilgameshWind",
-      "license": "Apache-2.0",
-      "license_url": "https://huggingface.co/GilgameshWind/X-ASR-zh-en/blob/main/README.md",
-      "license_class": "permissive",
-      "hf_repo": "OpenASR/xasr-zh-en",
-      "hf_revision": "2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5",
-      "public": true,
-      "min_cli_version": "0.1.0",
-      "recommended_quant": "q8_0",
-      "pull_recommended": "xasr-zh-en:q8",
-      "prose": {
-        "tagline": "Bilingual Chinese + English streaming speech recognition \u2014 a compact icefall Zipformer2 transducer",
-        "overview": [
-          "X-ASR-zh-en is a compact **bilingual (Chinese + English)** streaming speech-recognition model from\n**GilgameshWind**, built with the **icefall / k2** recipe as a cache-aware **Zipformer2 RNN-T\ntransducer** (a 6-stack, 19-layer Zipformer2 encoder, a stateless RNN-T decoder, and a tanh joiner\nover a 5000-token BPE vocabulary, ~0.16B parameters). The same checkpoint serves both low-latency\n**streaming** captions and full-file **offline** transcription, making it a good fit for on-device\nChinese/English dictation and real-time subtitles. This OpenASR repo repackages the weights as\n`.oasr` packs that run natively in the OpenASR runtime \u2014 no Python at inference time, all decoding\nlocal. The **q8_0** build is the recommended default (it matched the fp16 transcript bit-for-bit in\nOpenASR's verification); **q4_k** is the smallest build for tight-memory devices and **fp16** is for\nmaximum fidelity or verification."
-        ],
-        "highlights": [
-          "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **Chinese + English** \u2014 one bilingual checkpoint for zh/en speech, including code-switched audio",
-          "\u26a1 **Streaming-first, offline-capable** \u2014 a cache-aware streaming Zipformer2 transducer for low-latency captions that also runs full-file offline transcription",
-          "\ud83e\udeb6 **Compact ~0.16B** \u2014 a 6-stack Zipformer2 encoder + stateless RNN-T decoder + tanh joiner over a 5000-token BPE vocab, light enough for on-device CPU",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
-        ]
-      },
-      "quants": [
-        {
-          "quant": "fp16",
-          "suffix": "fp16",
-          "pull": "xasr-zh-en:fp16",
-          "filename": "xasr-zh-en-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5/xasr-zh-en-fp16.oasr",
-          "sha256": "89316b6e912aa474121fa6b8b7738514b64c9ba144f26702cbb36313b69a2e95",
-          "size_bytes": 314918720,
-          "recommended": false,
-          "perf": {
-            "rtf_cpu": 0.08819234090909091,
-            "rtf_metal": 0.15154204545454544,
-            "peak_rss_bytes": 1365606400,
-            "jfk_wer_vs_fp16": 0.0
-          }
-        },
-        {
-          "quant": "q8_0",
-          "suffix": "q8",
-          "pull": "xasr-zh-en:q8",
-          "filename": "xasr-zh-en-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5/xasr-zh-en-q8_0.oasr",
-          "sha256": "a0201070212ceff3a37d8dafd21455209ea48721d1b53b31e8eff328fc573fdb",
-          "size_bytes": 175711040,
-          "recommended": true,
-          "perf": {
-            "rtf_cpu": 0.08679616281818182,
-            "rtf_metal": 0.15143581063636363,
-            "peak_rss_bytes": 1355874304,
-            "jfk_wer_vs_fp16": 0.0
-          }
-        },
-        {
-          "quant": "q4_k",
-          "suffix": "q4",
-          "pull": "xasr-zh-en:q4",
-          "filename": "xasr-zh-en-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5/xasr-zh-en-q4_k.oasr",
-          "sha256": "f4bea03a10333ee2c31f797a1abbadb885a85e63327b419b83b99d8bd2823106",
-          "size_bytes": 112003904,
-          "recommended": false,
-          "perf": {
-            "rtf_cpu": 0.08677703790909091,
-            "rtf_metal": 0.14969315154545454,
-            "peak_rss_bytes": 1355841536,
-            "jfk_wer_vs_fp16": 0.0
-          }
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u4f53\u79ef\u6700\u5c0f\u7684\u7eaf\u82f1\u8bed Whisper \u6a21\u578b\uff0c\u82f1\u8bed\u8bc6\u522b\u901f\u5ea6\u6700\u5feb",
+          "highlights": [
+            "\ud83c\uddec\ud83c\udde7 **\u4ec5\u652f\u6301\u82f1\u8bed** \u2014 \u4e13\u6ce8\u82f1\u8bed\u573a\u666f\uff0c\u901a\u5e38\u6bd4\u540c\u5c3a\u5bf8\u7684\u591a\u8bed\u8a00\u6a21\u578b\u5728\u82f1\u8bed\u4e0a\u66f4\u51c6\u786e",
+            "\u26a1 **39M \u53c2\u6570** \u2014 Whisper \u7cfb\u5217\u4e2d\u6700\u5c0f\u3001\u6700\u5feb\u3001\u6700\u8f7b\u91cf\u7684\u7248\u672c",
+            "\ud83c\udf10 **\u5f31\u76d1\u7763\u89c4\u6a21\u8bad\u7ec3** \u2014 \u4f7f\u7528 Whisper 680k \u5c0f\u65f6\u6807\u6ce8\u8bed\u97f3\u8bed\u6599\u8bad\u7ec3",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e Apple Silicon \u4f18\u5316"
+          ]
         }
-      ]
+      }
     }
   ]
 }

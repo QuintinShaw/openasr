@@ -61,3 +61,15 @@ acknowledgement_zh = """
 量化、运行时校验和本地推理适配。GGUF 量化配方和位一致性验证方法参考了社区
 [cstr/qwen3-asr-1.7b-GGUF](https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF) 的工作。
 """
+
+[prose_locales."zh-CN"]
+tagline = "覆盖 52 种语言与方言的多语言语音识别 — 快速轻量版 Qwen3-ASR"
+
+highlights = [
+  "🌍 **52 种语言与方言** — 30 种语言加 22 种中文方言，并内置语种识别",
+  "🎧 **复杂音频下依然稳健** — 清晰语音、歌声，以及带背景音乐的歌曲",
+  "⚡ **快速轻量** — Qwen3-ASR 家族中效率优化的成员，一个模型同时支持离线与流式",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
+]
+
+source_sha256 = "bfd600b931698926fe62c7910e07372ffabe056fbd560392781d84ba455e99d6"

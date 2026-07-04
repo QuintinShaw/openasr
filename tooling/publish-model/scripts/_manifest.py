@@ -25,6 +25,7 @@ from _catalog import (
     QUANT_METADATA,
     languages_for_model,
     load as load_publish_catalog,
+    validate_card_prose_locales,
 )
 from _file_loaders import atomic_write_json, load_required_json, load_toml
 from _pathlib_helpers import repo_root
@@ -97,6 +98,25 @@ def prose_block(prose: dict) -> dict:
         "tagline": prose.get("tagline", ""),
         "overview": overview,
         "highlights": prose.get("highlights", []),
+    }
+
+
+def prose_locales_block(model: str, prose: dict) -> dict | None:
+    """Build the catalog `prose_locales` field from a card's authored
+    `[prose_locales."<bcp47>"]` tables. First iteration: tagline + highlights
+    only (no overview). Validates format + staleness before emitting, so a
+    stale/malformed translation fails the regen rather than shipping silently.
+    """
+    locales = prose.get("prose_locales")
+    if not locales:
+        return None
+    validate_card_prose_locales(model, prose)
+    return {
+        locale: {
+            "tagline": block.get("tagline"),
+            "highlights": block.get("highlights", []),
+        }
+        for locale, block in sorted(locales.items())
     }
 
 
@@ -212,6 +232,16 @@ def build_catalog_model(model: str, entry: dict, args: argparse.Namespace) -> di
     })
     if entry.get("experimental") is True:
         model_entry["experimental"] = True
+    # Explicit, author-set display hints (models-core.toml `sort_weight`/
+    # `recommended`; no threshold inference). Only serialized when set so
+    # unmarked models keep the Rust-side serde defaults (0 / false).
+    if "sort_weight" in entry:
+        model_entry["sort_weight"] = entry["sort_weight"]
+    if entry.get("recommended") is True:
+        model_entry["recommended"] = True
+    prose_locales = prose_locales_block(model, prose)
+    if prose_locales is not None:
+        model_entry["prose_locales"] = prose_locales
     for key in (
         "source_langs",
         "target_langs",
@@ -252,7 +282,10 @@ def load_catalog(path: Path) -> dict:
 def upsert_model(catalog: dict, model_entry: dict) -> dict:
     models = [model for model in catalog["models"] if model.get("id") != model_entry["id"]]
     models.append(model_entry)
-    models.sort(key=lambda item: item["id"])
+    # Catalog array order is the display order consumers inherit for free
+    # (market/desktop listings render models[] as-is). Higher sort_weight
+    # first; ties break on id for determinism.
+    models.sort(key=lambda item: (-item.get("sort_weight", 0), item["id"]))
     catalog["schema_version"] = CATALOG_SCHEMA_VERSION
     catalog["generated_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     catalog["catalog_url"] = CATALOG_URL

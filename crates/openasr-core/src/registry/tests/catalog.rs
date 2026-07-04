@@ -176,7 +176,10 @@ fn alias_contract_model(
         min_cli_version: "0.1.0".to_string(),
         recommended_quant: "q8_0".to_string(),
         pull_recommended: format!("{id}:q8"),
+        sort_weight: 0,
+        recommended: false,
         prose: None,
+        prose_locales: None,
         quants: vec![
             alias_contract_quant(id, "fp16", "fp16", revision),
             alias_contract_quant(id, "q8_0", "q8", revision),

@@ -300,7 +300,10 @@ mod tests {
                 min_cli_version: "0.0.0".to_string(),
                 recommended_quant: "q8_0".to_string(),
                 pull_recommended: "qwen3-asr-0.6b:q8".to_string(),
+                sort_weight: 0,
+                recommended: false,
                 prose: None,
+                prose_locales: None,
                 quants: vec![
                     quant("fp16", "fp16", 4_000),
                     quant("q8_0", "q8", 2_000),

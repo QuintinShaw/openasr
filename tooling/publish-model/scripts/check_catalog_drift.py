@@ -16,7 +16,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from _catalog import QUANT_METADATA, languages_for_model, load as load_publish_catalog  # noqa: E402
+from _catalog import (  # noqa: E402
+    QUANT_METADATA,
+    languages_for_model,
+    load as load_publish_catalog,
+    validate_all_card_prose_locales,
+)
+from _manifest import prose_locales_block, read_prose  # noqa: E402
 
 
 def load_json(path: Path) -> dict:
@@ -97,6 +103,24 @@ def check_machine_catalog_entry(model: str, entry: dict, machine_model: dict, er
             f"{model}: catalog capability drifted: got {machine_model.get('capability')!r}, "
             f"expected {entry.get('capability')!r}"
         )
+    expected_sort_weight = entry.get("sort_weight", 0)
+    if machine_model.get("sort_weight", 0) != expected_sort_weight:
+        errors.append(
+            f"{model}: catalog sort_weight drifted: got {machine_model.get('sort_weight', 0)!r}, "
+            f"expected {expected_sort_weight!r}"
+        )
+    expected_recommended = entry.get("recommended") is True
+    if (machine_model.get("recommended") is True) != expected_recommended:
+        errors.append(
+            f"{model}: catalog recommended drifted: got {machine_model.get('recommended')!r}, "
+            f"expected {expected_recommended!r}"
+        )
+    expected_prose_locales = prose_locales_block(model, read_prose(model))
+    if machine_model.get("prose_locales") != expected_prose_locales:
+        errors.append(
+            f"{model}: catalog prose_locales drifted from cards/{model}.toml "
+            "(re-run regenerate_all.sh to pick up card changes)"
+        )
     for key in (
         "experimental",
         "source_langs",
@@ -149,6 +173,12 @@ def main(argv: list[str]) -> int:
     }
     errors: list[str] = []
     skipped: list[str] = []
+
+    translated_cards: list[str] = []
+    try:
+        translated_cards = validate_all_card_prose_locales()
+    except KeyError as error:
+        errors.append(str(error))
     for model in selected:
         entry = publish_catalog[model]
         machine_model = machine_by_id.get(entry["registry_id"])
@@ -172,6 +202,7 @@ def main(argv: list[str]) -> int:
             print(error, file=sys.stderr)
         return 1
     print(f"catalog drift check passed for {len(selected)} model(s)")
+    print(f"prose_locales check passed for {len(translated_cards)} model(s): {', '.join(translated_cards)}")
     return 0
 
 

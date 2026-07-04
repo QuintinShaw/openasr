@@ -51,7 +51,10 @@ fn catalog_model(id: &str, family: &str, aliases: &[&str], size: &str) -> ModelC
             min_cli_version: "0.1.0".to_string(),
             recommended_quant: "q8_0".to_string(),
             pull_recommended: format!("{id}:q8"),
+            sort_weight: 0,
+            recommended: false,
             prose: None,
+            prose_locales: None,
             quants: vec![crate::CatalogQuant {
                 quant: "q8_0".to_string(),
                 suffix: "q8".to_string(),

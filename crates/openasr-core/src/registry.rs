@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -202,8 +203,22 @@ pub struct CatalogModel {
     // quants[].recommended, and pull_recommended is the display/copyable token.
     pub recommended_quant: String,
     pub pull_recommended: String,
+    // Explicit, author-set display-ranking hints from
+    // tooling/publish-model/models-core.toml (`sort_weight`/`recommended`). No
+    // threshold is inferred from perf/WER data here; a model opts in only via
+    // an explicit catalog value. Higher `sort_weight` sorts first in
+    // `models[]`; consumers needing "featured" models filter on `recommended`.
+    #[serde(default)]
+    pub sort_weight: i64,
+    #[serde(default)]
+    pub recommended: bool,
     #[serde(default)]
     pub prose: Option<CatalogProse>,
+    // Per-locale tagline/highlights translations of `prose` (first iteration:
+    // no `overview`). Absent for a model/locale falls back to the English
+    // `prose` fields; consumers should never require a translation to exist.
+    #[serde(default)]
+    pub prose_locales: Option<BTreeMap<String, CatalogProseLocale>>,
     pub quants: Vec<CatalogQuant>,
 }
 
@@ -329,6 +344,21 @@ pub struct CatalogProse {
     pub tagline: Option<String>,
     #[serde(default)]
     pub overview: Vec<String>,
+    #[serde(default)]
+    pub highlights: Vec<String>,
+}
+
+/// One locale's translation of [`CatalogProse`]. First iteration only covers
+/// `tagline` + `highlights` (no `overview`); the publish pipeline
+/// (`tooling/publish-model/scripts/_manifest.py`) machine-checks each
+/// translation against the English source before it lands here (highlight
+/// count, `**`/backtick/emoji parity per highlight, numeric-token parity, and
+/// a `source_sha256` staleness check), so a stale or reformatted translation
+/// fails catalog regeneration rather than shipping silently.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogProseLocale {
+    #[serde(default)]
+    pub tagline: Option<String>,
     #[serde(default)]
     pub highlights: Vec<String>,
 }
