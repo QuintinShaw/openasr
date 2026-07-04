@@ -262,7 +262,7 @@ portable distribution builds.
 - [Known Limitations](docs/KNOWN_LIMITATIONS.md)
 - [Model Catalog, Registry, and Distribution](docs/MODEL_CATALOG_ARCHITECTURE.md)
 - [Format Contract](docs/format/OASR_PACKAGE_CONTRACT_V1.md)
-- [Releasing](docs/RELEASING.md) - versioning and release process
+- [Releasing](RELEASING.md) - versioning and release process
 - [Performance](perf/PERFORMANCE.md)
 
 ## License and acknowledgments

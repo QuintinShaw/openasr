@@ -44,8 +44,7 @@ jobs:
           set -euo pipefail
           # Single source of truth: [workspace.package] version in the root
           # Cargo.toml (all crates inherit via version.workspace = true). The
-          # anchored match hits only that line, not the ".. version = .." pins
-          # inside [workspace.dependencies] (those are indented after a name).
+          # anchored match hits the only column-0 version line in the file.
           version="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
           if [ -z "${version}" ]; then
             echo "could not read workspace version from Cargo.toml" >&2
