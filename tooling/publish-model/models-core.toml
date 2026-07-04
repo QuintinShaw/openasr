@@ -17,6 +17,7 @@ quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
 sort_weight = 920
 recommended = true
+upstream_release_date = "2026-01-28"
 
 ["qwen3-asr-0.6b"]
 family = "qwen"
@@ -32,6 +33,7 @@ quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
 sort_weight = 900
 recommended = true
+upstream_release_date = "2026-01-28"
 
 ["moonshine-tiny"]
 family = "moonshine"
@@ -47,6 +49,7 @@ license_source = "https://huggingface.co/UsefulSensors/moonshine-tiny"
 license_class = "permissive"
 quants = ["fp16", "q8_0"]
 recommended_quant = "q8_0"
+upstream_release_date = "2024-10-30"
 
 ["cohere-transcribe-03-2026"]
 family = "cohere"
@@ -62,6 +65,7 @@ license_source = "https://huggingface.co/CohereLabs/cohere-transcribe-03-2026/bl
 license_class = "permissive"
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
+upstream_release_date = "2026-03-24"
 
 ["whisper-large-v3-turbo"]
 family = "whisper"
@@ -77,6 +81,7 @@ license_source = "https://github.com/openai/whisper/blob/main/LICENSE"
 license_class = "permissive"
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
+upstream_release_date = "2024-10-01"
 
 ["whisper-small"]
 family = "whisper"
@@ -92,6 +97,7 @@ license_source = "https://huggingface.co/openai/whisper-small/blob/main/README.m
 license_class = "permissive"
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
+upstream_release_date = "2022-09-21"
 
 ["xasr-zh-en"]
 family = "xasr-zipformer"
@@ -107,6 +113,7 @@ quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
 sort_weight = 910
 recommended = true
+upstream_release_date = "2026-05-18"
 
 # Diarization support packs: not ASR models. Published support packs keep their
 # catalog-declared variants. Speaker embedding/segmentation are
@@ -126,6 +133,7 @@ license_class = "permissive"
 languages = ["en", "zh"]
 quants = ["f32"]
 recommended_quant = "f32"
+upstream_release_date = "2022-07-24"
 
 ["wespeaker-voxceleb-resnet34-lm".capability]
 feature = "speaker-diarization"
@@ -145,6 +153,7 @@ license_class = "permissive"
 languages = ["en", "zh"]
 quants = ["f32"]
 recommended_quant = "f32"
+upstream_release_date = "2023-09-22"
 
 ["pyannote-segmentation-3.0".capability]
 feature = "speaker-diarization"
@@ -172,6 +181,7 @@ target_langs = ["en"]
 experimental = true
 quants = ["q4_k_m"]
 recommended_quant = "q4_k_m"
+upstream_release_date = "2026-05-11"
 upstream_base_repo = "tencent/Hy-MT2-1.8B"
 upstream_base_revision = "9a341cd1b679d3efd23b46e847b01745a71ed792"
 upstream_gguf_repo = "tencent/Hy-MT2-1.8B-GGUF"
@@ -193,6 +203,7 @@ license_source = "https://huggingface.co/openai/whisper-tiny/blob/main/README.md
 license_class = "permissive"
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
+upstream_release_date = "2022-09-21"
 
 ["whisper-base"]
 family = "whisper"
@@ -208,6 +219,7 @@ license_source = "https://huggingface.co/openai/whisper-base/blob/main/README.md
 license_class = "permissive"
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
+upstream_release_date = "2022-09-21"
 
 ["whisper-medium"]
 family = "whisper"
@@ -223,6 +235,7 @@ license_source = "https://huggingface.co/openai/whisper-medium/blob/main/README.
 license_class = "permissive"
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
+upstream_release_date = "2022-09-21"
 
 ["whisper-large-v3"]
 family = "whisper"
@@ -238,6 +251,7 @@ license_source = "https://huggingface.co/openai/whisper-large-v3/blob/main/READM
 license_class = "permissive"
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
+upstream_release_date = "2023-11-06"
 
 ["whisper-tiny.en"]
 family = "whisper"
@@ -254,6 +268,7 @@ license_class = "permissive"
 languages = ["en"]
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
+upstream_release_date = "2022-09-21"
 
 ["whisper-base.en"]
 family = "whisper"
@@ -270,6 +285,7 @@ license_class = "permissive"
 languages = ["en"]
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
+upstream_release_date = "2022-09-21"
 
 ["whisper-small.en"]
 family = "whisper"
@@ -286,6 +302,7 @@ license_class = "permissive"
 languages = ["en"]
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
+upstream_release_date = "2022-09-21"
 
 ["whisper-medium.en"]
 family = "whisper"
@@ -302,3 +319,4 @@ license_class = "permissive"
 languages = ["en"]
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
+upstream_release_date = "2022-09-21"
