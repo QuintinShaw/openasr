@@ -11,6 +11,8 @@ Local engineering scripts for validation and iteration.
 
 ## Current scripts
 
+- `bump-version.sh`
+  - Bump the workspace release version in one command (see `RELEASING.md`).
 - `generate_longform_pause_probe.py`
   - Generate a deterministic longform pause probe from a local speech WAV — a
     test-data generator for longform planner validation.

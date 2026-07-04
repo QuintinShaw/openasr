@@ -11,26 +11,39 @@ push regardless.
 
 ## Versioning
 
-The version lives in one logical place, bumped in lockstep:
+The version lives in exactly one place: `[workspace.package] version` in the
+root `Cargo.toml`. Every member crate inherits it via `version.workspace =
+true`, and the `openasr-core` / `openasr-server` / `openasr-system-audio`
+entries under `[workspace.dependencies]` are plain path dependencies with no
+version pin to keep in sync.
 
-- `[workspace.package] version` in the root `Cargo.toml` (all crates inherit it)
-- the three inter-crate pins under `[workspace.dependencies]`
-  (`openasr-core`, `openasr-server`, `openasr-system-audio`)
+Two lockfiles pin the workspace crates and must be regenerated alongside the
+bump, or CI's `--locked` builds fail:
 
-Two lockfiles pin the workspace crates and must be regenerated in the same
-commit, or CI's `--locked` builds fail:
-
-- the root `Cargo.lock`: `cargo update -w --offline`
-- `tooling/system-audio-check/Cargo.lock` (standalone CI-gate workspace):
-  `cargo update --offline -p openasr-system-audio` inside that directory
+- the root `Cargo.lock`
+- `tooling/system-audio-check/Cargo.lock` (standalone CI-gate workspace,
+  depends on `openasr-system-audio` by path)
 
 ## Cutting a release
 
-1. On `main`, bump the version in the four spots above (one edit block in
-   `Cargo.toml`), regenerate both lockfiles, and commit everything together,
-   e.g. `chore(release): v0.2.0`.
-2. Push to `main`. The `Release core` workflow
-   (`.github/workflows/release-core.yml`) triggers on `Cargo.toml` changes:
+1. On `main`, run:
+
+   ```bash
+   scripts/bump-version.sh X.Y.Z
+   ```
+
+   This bumps the version, regenerates both lockfiles, and self-checks the
+   result with `cargo metadata --locked`. It is idempotent -- rerunning it
+   with the version already at `X.Y.Z` is a no-op diff.
+2. Commit and push to `main`:
+
+   ```bash
+   git add Cargo.toml Cargo.lock tooling/system-audio-check/Cargo.lock
+   git commit -m "chore(release): vX.Y.Z"
+   git push
+   ```
+3. The `Release core` workflow (`.github/workflows/release-core.yml`)
+   triggers on `Cargo.toml` changes:
    - reads the workspace version;
    - exits cleanly if the tag `vX.Y.Z` already exists (so unrelated
      `Cargo.toml` edits and re-runs are no-ops);
