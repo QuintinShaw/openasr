@@ -114,6 +114,16 @@ fn diff(actual: &[f32], expected: &[f32]) -> (f32, f32) {
     (max, (sum / actual.len() as f64) as f32)
 }
 
+/// Scale-invariant max abs diff: `max|a-e| / max|e|`. Absolute diffs scale with
+/// each tap's magnitude (the post-subsample hidden is ~80x larger than the final
+/// output because of the `sqrt(d_model)` xscale and no output LayerNorm), so the
+/// relative error is the honest cross-tap parity metric.
+fn relative_max_diff(actual: &[f32], expected: &[f32]) -> f32 {
+    let (max, _) = diff(actual, expected);
+    let scale = expected.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    if scale > 0.0 { max / scale } else { max }
+}
+
 #[test]
 #[ignore = "requires local 866MB Dolphin weights under tmp/publish (not committed)"]
 fn dolphin_encoder_parity() {
@@ -146,14 +156,18 @@ fn dolphin_encoder_parity() {
     );
 
     let (_, golden_sub) = load_npy_f32(&root.join("golden/enc_after_subsample.npy"));
-    let (m, mean) = diff(&output.after_subsample, &golden_sub);
-    println!("after_subsample : max {m:.3e}  mean {mean:.3e}");
+    let (m_sub, mean_sub) = diff(&output.after_subsample, &golden_sub);
+    let rel_sub = relative_max_diff(&output.after_subsample, &golden_sub);
+    println!("after_subsample : max {m_sub:.3e}  mean {mean_sub:.3e}  rel {rel_sub:.3e}");
 
     let mut first_diverge: Option<String> = None;
+    let mut worst_block: f32 = 0.0;
     for (i, block) in output.blocks.iter().enumerate() {
         let (_, golden) = load_npy_f32(&root.join(format!("golden/enc_block{i}.npy")));
         let (m, mean) = diff(block, &golden);
-        println!("block{i:<2}        : max {m:.3e}  mean {mean:.3e}");
+        let rel = relative_max_diff(block, &golden);
+        println!("block{i:<2}        : max {m:.3e}  mean {mean:.3e}  rel {rel:.3e}");
+        worst_block = worst_block.max(m);
         if first_diverge.is_none() && m > 1.0e-2 {
             first_diverge = Some(format!("block{i}"));
         }
@@ -161,9 +175,9 @@ fn dolphin_encoder_parity() {
 
     let (_, golden_out) = load_npy_f32(&root.join("golden/encoder_out.npy"));
     let (m_final, mean_final) = diff(&output.encoder_out, &golden_out);
-    println!("encoder_out     : max {m_final:.3e}  mean {mean_final:.3e}");
+    let rel_final = relative_max_diff(&output.encoder_out, &golden_out);
+    println!("encoder_out     : max {m_final:.3e}  mean {mean_final:.3e}  rel {rel_final:.3e}");
 
-    let (m_sub, _) = diff(&output.after_subsample, &golden_sub);
     if first_diverge.is_none() && m_sub > 1.0e-2 {
         first_diverge = Some("after_subsample".to_string());
     }
@@ -175,11 +189,28 @@ fn dolphin_encoder_parity() {
         None => println!("first divergence (>1e-2 max abs): none - full parity within 1e-2"),
     }
 
-    // Loose gate: keep the harness green while the graph is validated. The
-    // printed per-stage diffs are the real signal; tighten this once parity is
-    // nailed.
+    // Parity gate. The E-Branchformer encoder is bit-exact with the PyTorch
+    // reference down to the f32 accumulation-order noise floor: every tap sits at
+    // ~1e-6 *relative* max diff (f32 eps is ~1.2e-7). Absolute diffs are gated at
+    // the task's cumulative 1e-3 bit-exact bound (encoder_out lands ~1e-5, ~90x of
+    // headroom for thread-order variation); after_subsample carries a larger
+    // *absolute* diff only because its values are ~80x bigger (sqrt(d_model) xscale
+    // with no output LayerNorm), so it is gated on the scale-invariant relative
+    // error instead. If any of these trip, a stage genuinely diverged.
     assert!(
-        m_final.is_finite(),
-        "encoder output diverged to non-finite values"
+        first_diverge.is_none(),
+        "encoder diverged from the reference (>1e-2 max abs) at {first_diverge:?}"
+    );
+    assert!(
+        rel_sub < 1.0e-4,
+        "after_subsample relative max diff {rel_sub:.3e} exceeds 1e-4 - algorithmic divergence, not f32 noise"
+    );
+    assert!(
+        worst_block < 1.0e-3,
+        "an encoder block max abs diff {worst_block:.3e} exceeds the 1e-3 parity bound"
+    );
+    assert!(
+        m_final < 1.0e-3,
+        "encoder_out max abs diff {m_final:.3e} exceeds the 1e-3 parity bound"
     );
 }
