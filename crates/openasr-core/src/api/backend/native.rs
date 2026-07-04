@@ -17,10 +17,11 @@ use crate::models::builtin_execution_dispatch::build_builtin_ggml_streaming_exec
 use crate::models::executor_component_registry::builtin_executor_supports_phrase_bias_for_model_architecture;
 use crate::models::ggml_family_adapter::GgmlFamilyAdapterDescriptor;
 use crate::models::ggml_family_registry::{
-    COHERE_TRANSCRIBE_GGML_ADAPTER_ID, COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, GgmlFamilyRegistry,
-    MOONSHINE_GGML_ARCHITECTURE_ID, PARAKEET_CTC_GGML_ARCHITECTURE_ID,
-    QWEN3_ASR_GGML_ARCHITECTURE_ID, WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
-    WHISPER_GGML_ARCHITECTURE_ID, XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+    COHERE_TRANSCRIBE_GGML_ADAPTER_ID, COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+    DOLPHIN_GGML_ARCHITECTURE_ID, GgmlFamilyRegistry, MOONSHINE_GGML_ARCHITECTURE_ID,
+    PARAKEET_CTC_GGML_ARCHITECTURE_ID, QWEN3_ASR_GGML_ARCHITECTURE_ID,
+    WAV2VEC2_CTC_GGML_ARCHITECTURE_ID, WHISPER_GGML_ARCHITECTURE_ID,
+    XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
 };
 use crate::models::oasr_metadata::{
     OASR_FEATURE_DIARIZATION_COHERE_TOKEN_STREAM_V1, OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1,
@@ -667,6 +668,15 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
                     "xasr-zipformer runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
                 )
             })
+        }
+        DOLPHIN_GGML_ARCHITECTURE_ID => {
+            crate::models::dolphin::runtime_contract::parse_dolphin_execution_metadata(&metadata)
+                .map(|_| ())
+                .map_err(|error| {
+                    format!(
+                        "dolphin runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
+                    )
+                })
         }
         // No dedicated required-metadata parser for this architecture (yet):
         // stay Ok() here, same as before this check existed. The executor

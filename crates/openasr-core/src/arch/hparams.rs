@@ -185,6 +185,30 @@ pub(crate) static XASR_ZIPFORMER_HPARAM_SCHEMA: &[&str] = &[
     "xasr.blank_id",
 ];
 
+// ── dolphin (WeNet E-Branchformer encoder + Transformer decoder + CTC head) ───
+// Char tokenizer, CTC/attention joint decode (WeNet attention_rescoring). The
+// keys mirror `models::dolphin::runtime_contract`, which is the required-metadata
+// parser the install gate dispatches to for this architecture.
+pub(crate) static DOLPHIN_HPARAM_SCHEMA: &[&str] = &[
+    "dolphin.encoder.n_layers",
+    "dolphin.encoder.d_model",
+    "dolphin.encoder.n_heads",
+    "dolphin.encoder.head_dim",
+    "dolphin.encoder.ffn_dim",
+    "dolphin.encoder.cgmlp_units",
+    "dolphin.encoder.cgmlp_kernel",
+    "dolphin.encoder.merge_kernel",
+    "dolphin.encoder.feature_dim",
+    "dolphin.decoder.n_layers",
+    "dolphin.decoder.n_heads",
+    "dolphin.decoder.ffn_dim",
+    "dolphin.decoder.max_ctx",
+    "dolphin.vocab_size",
+    "dolphin.sos_token_id",
+    "dolphin.eos_token_id",
+    "ctc.blank_token_id",
+];
+
 // ── moonshine (UsefulSensors, raw-waveform conv-stem + RoPE seq2seq) ──────────
 pub(crate) static MOONSHINE_HPARAM_SCHEMA: &[&str] = &[
     "moonshine.vocab_size",

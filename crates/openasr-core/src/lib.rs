@@ -139,6 +139,10 @@ pub use models::{
         CohereLocalSourceImportRuntimeResult, CohereRuntimeQuantizationMode,
         convert_local_cohere_source_to_runtime_pack,
     },
+    dolphin::{
+        DolphinImportRequest, DolphinImportResult, DolphinQuantizationMode,
+        convert_local_dolphin_wenet_source_to_runtime_pack,
+    },
     ggml_asr_executor::{
         GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
         GgmlAsrExecutionOptions, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
