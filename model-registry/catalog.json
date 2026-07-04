@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-04T08:17:54+00:00",
+  "generated_at": "2026-07-04T13:45:26+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -50,7 +50,7 @@
       "license_url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/main/LICENSE",
       "license_class": "permissive",
       "hf_repo": "OpenASR/qwen3-asr-1.7b",
-      "hf_revision": "1f9a6c6035c35d179067533cd1d12343c2f803c8",
+      "hf_revision": "c9c781300ca12246e675c64100f9fc7763bb52e0",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -73,14 +73,14 @@
           "suffix": "fp16",
           "pull": "qwen3-asr-1.7b:fp16",
           "filename": "qwen3-asr-1.7b-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/1f9a6c6035c35d179067533cd1d12343c2f803c8/qwen3-asr-1.7b-fp16.oasr",
-          "sha256": "5e776e51907269597c6a96a0621deb35bbb7a1c0b1c5e10360db2b5875b52d0a",
-          "size_bytes": 4704802112,
+          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/c9c781300ca12246e675c64100f9fc7763bb52e0/qwen3-asr-1.7b-fp16.oasr",
+          "sha256": "297ffa4dc497c5a67dee2697f186ede5373ddef4dce5236d23af016c447dee92",
+          "size_bytes": 4704801920,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 2.950909212181818,
-            "rtf_metal": 1.607943712090909,
-            "peak_rss_bytes": 6470647808,
+            "rtf_cpu": 0.8996943712727272,
+            "rtf_metal": 1.6255331515454543,
+            "peak_rss_bytes": 4429316096,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -89,14 +89,14 @@
           "suffix": "q8",
           "pull": "qwen3-asr-1.7b:q8",
           "filename": "qwen3-asr-1.7b-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/1f9a6c6035c35d179067533cd1d12343c2f803c8/qwen3-asr-1.7b-q8_0.oasr",
-          "sha256": "f09c032a3019aa47f5ebc3db88eb47505d22ad97c6a21657911cec98094481e3",
-          "size_bytes": 2506724672,
+          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/c9c781300ca12246e675c64100f9fc7763bb52e0/qwen3-asr-1.7b-q8_0.oasr",
+          "sha256": "a26d2629ba9e68fe765f9a6585f4d1df0e839d3584acef39292aa6edab01ecea",
+          "size_bytes": 2506724480,
           "recommended": true,
           "perf": {
-            "rtf_cpu": 2.8368895984545457,
-            "rtf_metal": 0.8809729772727273,
-            "peak_rss_bytes": 5050204160,
+            "rtf_cpu": 0.3547088181818182,
+            "rtf_metal": 0.6026168825454545,
+            "peak_rss_bytes": 4138139648,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -105,14 +105,14 @@
           "suffix": "q4",
           "pull": "qwen3-asr-1.7b:q4",
           "filename": "qwen3-asr-1.7b-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/1f9a6c6035c35d179067533cd1d12343c2f803c8/qwen3-asr-1.7b-q4_k.oasr",
-          "sha256": "87ea8f6c578632205832be447d5bc749ac63416e6a9146465cb7c7a292b4eeb2",
-          "size_bytes": 1334416704,
+          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/c9c781300ca12246e675c64100f9fc7763bb52e0/qwen3-asr-1.7b-q4_k.oasr",
+          "sha256": "7c290cda70a69febef1a0d3ff23f12a5718f1cf6264debb536c5d3175061942e",
+          "size_bytes": 1334416512,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 3.4732779053636365,
-            "rtf_metal": 0.5557503787272727,
-            "peak_rss_bytes": 4796694528,
+            "rtf_cpu": 0.3124024923636364,
+            "rtf_metal": 0.4009165719090909,
+            "peak_rss_bytes": 4038098944,
             "jfk_wer_vs_fp16": 0.0
           }
         }
@@ -1864,7 +1864,7 @@
       "license_url": "https://huggingface.co/openai/whisper-small/blob/main/README.md",
       "license_class": "permissive",
       "hf_repo": "OpenASR/whisper-small",
-      "hf_revision": "57b39afc293a13de4732029916f5c923b5b7b85a",
+      "hf_revision": "b4a94dbeb838b14e93601d3622a416944bb3d921",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -1887,14 +1887,14 @@
           "suffix": "fp16",
           "pull": "whisper-small:fp16",
           "filename": "whisper-small-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-small/resolve/57b39afc293a13de4732029916f5c923b5b7b85a/whisper-small-fp16.oasr",
-          "sha256": "ef2e8b8cbe0cc25aa5bbc61aa4e432de1d84d2e7e8c59099e2005dd815088518",
-          "size_bytes": 488712960,
+          "url": "https://huggingface.co/OpenASR/whisper-small/resolve/b4a94dbeb838b14e93601d3622a416944bb3d921/whisper-small-fp16.oasr",
+          "sha256": "d345cd15361bd8e8d906cdc81a1a863c66d0d9a5770521fcac7a4c9a61923208",
+          "size_bytes": 488712576,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.13280131445454546,
-            "rtf_metal": 0.08321396972727273,
-            "peak_rss_bytes": 1566900224,
+            "rtf_cpu": 0.16308912499999997,
+            "rtf_metal": 0.22864486745454543,
+            "peak_rss_bytes": 1635270656,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -1903,14 +1903,14 @@
           "suffix": "q8",
           "pull": "whisper-small:q8",
           "filename": "whisper-small-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-small/resolve/57b39afc293a13de4732029916f5c923b5b7b85a/whisper-small-q8_0.oasr",
-          "sha256": "78392baea90cf3985845a3e0b95f5bf77c8a120c6f68a55daf9ad492e9ef9138",
-          "size_bytes": 302918400,
+          "url": "https://huggingface.co/OpenASR/whisper-small/resolve/b4a94dbeb838b14e93601d3622a416944bb3d921/whisper-small-q8_0.oasr",
+          "sha256": "9116ff1cb3a2a48850ba4f557901b75f9ab9f4c6c252534d77bd9ed23e7bc008",
+          "size_bytes": 302918016,
           "recommended": true,
           "perf": {
-            "rtf_cpu": 0.11239598109090908,
-            "rtf_metal": 0.07408579545454545,
-            "peak_rss_bytes": 881344512,
+            "rtf_cpu": 0.15005570072727273,
+            "rtf_metal": 0.10239632954545456,
+            "peak_rss_bytes": 1005830144,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -1919,14 +1919,14 @@
           "suffix": "q4",
           "pull": "whisper-small:q4",
           "filename": "whisper-small-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-small/resolve/57b39afc293a13de4732029916f5c923b5b7b85a/whisper-small-q4_k.oasr",
-          "sha256": "a19cedec2efbc7e03b5c3736011a75ec4d056b965ea450ecfe1d10bf32db4106",
-          "size_bytes": 203827968,
+          "url": "https://huggingface.co/OpenASR/whisper-small/resolve/b4a94dbeb838b14e93601d3622a416944bb3d921/whisper-small-q4_k.oasr",
+          "sha256": "b972e7c288e1fb9f04b745a037376a777dcd32b1e67468f858accf93081550fc",
+          "size_bytes": 203827584,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.10406204163636364,
-            "rtf_metal": 0.07346456436363637,
-            "peak_rss_bytes": 665370624,
+            "rtf_cpu": 0.13546868554545455,
+            "rtf_metal": 0.13284174999999998,
+            "peak_rss_bytes": 795066368,
             "jfk_wer_vs_fp16": 0.0
           }
         }
