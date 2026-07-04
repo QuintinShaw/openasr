@@ -683,16 +683,19 @@ fn native_model_refs_match(requested: &str, runtime_source_id: &str) -> bool {
     }
 }
 
+// Bare ids of models that are *live* in the current catalog must never be
+// listed here: a native pack legitimately carries its bare family id as
+// metadata (packs burn no quant tag into `openasr.model.id` -- the "bare id
+// contract" enforced by `native_model_refs_match`'s `(Some(_), None) => true`
+// arm above), so blacklisting a live family's bare id makes every pack for
+// that family fail closed. Only list ids that no longer resolve to a
+// supported catalog family/tag combination at all.
 pub(crate) fn is_retired_native_model_ref(value: &str) -> bool {
     matches!(
         value,
-        "whisper-tiny"
-            | "whisper-tiny:q4_0"
-            | "whisper-base"
+        "whisper-tiny:q4_0"
             | "whisper-base:q4_0"
-            | "whisper-large-v3-turbo"
             | "whisper-large-v3-turbo:q4_0"
-            | "whisper-tiny.en"
             | "whisper-tiny.en:q5_1"
             | "sense-voice-small"
             | "sense-voice-small:onnx"
