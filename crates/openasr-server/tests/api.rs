@@ -181,7 +181,11 @@ fn write_moonshine_pull_fixture(
     root: &std::path::Path,
 ) -> (std::path::PathBuf, openasr_server::DistributionRuntime) {
     let pack_path = root.join("moonshine-tiny-q8_0.oasr");
-    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu("moonshine-tiny");
+    // `whisper_oasr_v1_non_streaming_cpu` alone omits the whisper runtime
+    // scalar contract keys; install-time validation now enforces them (see
+    // `validate_native_runtime_model_pack_contract`), so this pull/import
+    // stand-in pack must be contract-complete to keep installing.
+    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("moonshine-tiny");
     write_tiny_gguf_runtime_source(&pack_path, &spec).expect("write pull fixture");
     let bytes = std::fs::read(&pack_path).unwrap();
     let sha256 = format!("{:x}", Sha256::digest(&bytes));

@@ -216,7 +216,12 @@ impl DownloadClient for InvalidRangeThenSuccessClient {
 fn tiny_pack_bytes() -> Vec<u8> {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("tiny.oasr");
-    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu("moonshine-tiny");
+    // `whisper_oasr_v1_non_streaming_cpu` alone deliberately omits the
+    // whisper runtime scalar keys (block_count, head_count, ...) elsewhere
+    // used to test fail-closed executor preflight; install now enforces that
+    // same contract (see `validate_native_runtime_model_pack_contract`), so
+    // this generic "any installable pack" fixture must be contract-complete.
+    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("moonshine-tiny");
     write_tiny_gguf_runtime_source(&path, &spec).unwrap();
     fs::read(path).unwrap()
 }
@@ -537,6 +542,48 @@ fn install_catalog_model_pack_from_path_reuses_catalog_target_and_marks_local_so
         events
             .iter()
             .any(|event| matches!(event, PullProgress::Installed { .. }))
+    );
+}
+
+/// Fail-closed regression for the turbo-pack incident: a pack that carries a
+/// full whisper runtime graph except `whisper.decoder.attention.head_count`
+/// used to "install successfully" (catalog digest + GGUF preflight only) and
+/// only failed the first time the daemon tried to run inference against it.
+/// Install must now reject it up front, via the same runtime-contract parser
+/// the executor uses, and name the missing key in the error.
+#[test]
+fn install_catalog_model_pack_from_path_rejects_whisper_pack_missing_decoder_head_count() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("moonshine-tiny");
+    spec.metadata
+        .remove("whisper.decoder.attention.head_count")
+        .expect("fixture must set the key this test removes");
+    let broken_path = temp.path().join("broken-source.oasr");
+    write_tiny_gguf_runtime_source(&broken_path, &spec).unwrap();
+    let bytes = fs::read(&broken_path).unwrap();
+
+    let resolved = resolved_for(&bytes);
+    let catalog = catalog_for_resolved(&resolved);
+    let source_path = temp.path().join("moonshine-tiny-q8_0.oasr");
+    fs::write(&source_path, &bytes).unwrap();
+
+    let error = install_catalog_model_pack_from_path(&catalog, &source_path, temp.path(), |_| {})
+        .unwrap_err();
+
+    let message = error.to_string();
+    assert!(
+        message.contains("whisper.decoder.attention.head_count"),
+        "error must name the missing key: {message}"
+    );
+    assert!(
+        message.contains("outdated") && message.contains("re-convert"),
+        "error must explain the pack needs re-conversion: {message}"
+    );
+    assert!(matches!(error, PullError::RuntimeValidation { .. }));
+    assert!(list_installed_packs(temp.path()).unwrap().is_empty());
+    assert!(
+        !paths_for(temp.path(), &resolved).final_path.exists(),
+        "rejected pack must not be committed into the model store"
     );
 }
 
