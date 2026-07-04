@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-04T06:25:43+00:00",
+  "generated_at": "2026-07-04T07:56:49+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -1370,7 +1370,7 @@
       "license_url": "https://github.com/openai/whisper/blob/main/LICENSE",
       "license_class": "permissive",
       "hf_repo": "OpenASR/whisper-large-v3-turbo",
-      "hf_revision": "e10bafd4c3d18d35426354d6b190b81e990e2949",
+      "hf_revision": "97db66827e10e7f7190570db264e2edf4c5a9a6e",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -1393,9 +1393,9 @@
           "suffix": "fp16",
           "pull": "whisper-large-v3-turbo:fp16",
           "filename": "whisper-large-v3-turbo-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-large-v3-turbo/resolve/e10bafd4c3d18d35426354d6b190b81e990e2949/whisper-large-v3-turbo-fp16.oasr",
-          "sha256": "efbfd00c20679b363d2a1035981943694ffe6eb12bf18d6412fc483e2bc82683",
-          "size_bytes": 1619471552,
+          "url": "https://huggingface.co/OpenASR/whisper-large-v3-turbo/resolve/97db66827e10e7f7190570db264e2edf4c5a9a6e/whisper-large-v3-turbo-fp16.oasr",
+          "sha256": "c963b06ceb623f45d6661cbbe97c861764fb273a0cc0a2cbe5c44b536c42a3bf",
+          "size_bytes": 1619471168,
           "recommended": false,
           "perf": {
             "rtf_cpu": 0.520788215909091,
@@ -1409,9 +1409,9 @@
           "suffix": "q8",
           "pull": "whisper-large-v3-turbo:q8",
           "filename": "whisper-large-v3-turbo-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-large-v3-turbo/resolve/e10bafd4c3d18d35426354d6b190b81e990e2949/whisper-large-v3-turbo-q8_0.oasr",
-          "sha256": "195d8c2e0f85905f32a896473b1387988d87c34f994080136f610480d1244105",
-          "size_bytes": 931343552,
+          "url": "https://huggingface.co/OpenASR/whisper-large-v3-turbo/resolve/97db66827e10e7f7190570db264e2edf4c5a9a6e/whisper-large-v3-turbo-q8_0.oasr",
+          "sha256": "7aadbdd35ab260d127f50affaecae0a51f5793e700afe212cefb0e74a99f95da",
+          "size_bytes": 931343168,
           "recommended": true,
           "perf": {
             "rtf_cpu": 0.519555481,
@@ -1425,9 +1425,9 @@
           "suffix": "q4",
           "pull": "whisper-large-v3-turbo:q4",
           "filename": "whisper-large-v3-turbo-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-large-v3-turbo/resolve/e10bafd4c3d18d35426354d6b190b81e990e2949/whisper-large-v3-turbo-q4_k.oasr",
-          "sha256": "98ccfbd46be9078cd18eb54dd540aa4c19cc2a6817b585cfe55dfc81a013b33f",
-          "size_bytes": 564341952,
+          "url": "https://huggingface.co/OpenASR/whisper-large-v3-turbo/resolve/97db66827e10e7f7190570db264e2edf4c5a9a6e/whisper-large-v3-turbo-q4_k.oasr",
+          "sha256": "8e3844e89e4a24e94384f959cefb0c8f3e058ae38f9f8245287c101cd18f7afe",
+          "size_bytes": 564341568,
           "recommended": false,
           "perf": {
             "rtf_cpu": 0.5086126439090909,
