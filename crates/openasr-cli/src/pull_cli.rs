@@ -317,6 +317,8 @@ mod tests {
             pull_alias: None,
             size: "tiny".to_string(),
             languages: vec!["en".to_string()],
+            language_mode: None,
+            language_default: None,
             source_langs: Vec::new(),
             target_langs: Vec::new(),
             vendor: None,
@@ -329,7 +331,10 @@ mod tests {
             min_cli_version: "0.1.0".to_string(),
             recommended_quant: "q8_0".to_string(),
             pull_recommended: format!("{id}:q8"),
+            sort_weight: 0,
+            recommended: false,
             prose: None,
+            prose_locales: None,
             quants: Vec::new(),
         }
     }

@@ -16,7 +16,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from _catalog import QUANT_METADATA, languages_for_model, load as load_publish_catalog  # noqa: E402
+from _catalog import (  # noqa: E402
+    QUANT_METADATA,
+    language_mode_for_model,
+    languages_for_model,
+    load as load_publish_catalog,
+    validate_all_card_prose_locales,
+)
+from _manifest import prose_locales_block, read_prose  # noqa: E402
 
 
 def load_json(path: Path) -> dict:
@@ -72,6 +79,7 @@ def check_registry_card(model: str, entry: dict, errors: list[str]) -> None:
 
 def check_machine_catalog_entry(model: str, entry: dict, machine_model: dict, errors: list[str]) -> None:
     registry_id = entry["registry_id"]
+    languages = languages_for_model(entry)
     expected_scalars = {
         "id": registry_id,
         "kind": entry["kind"],
@@ -79,7 +87,7 @@ def check_machine_catalog_entry(model: str, entry: dict, machine_model: dict, er
         "family": entry["family"],
         "pull_alias": entry["pull_alias"],
         "size": entry["size"],
-        "languages": languages_for_model(entry),
+        "languages": languages,
         "license": entry["license_name"],
         "license_url": entry["license_source"],
         "license_class": entry["license_class"],
@@ -87,6 +95,12 @@ def check_machine_catalog_entry(model: str, entry: dict, machine_model: dict, er
         "recommended_quant": entry["recommended_quant"],
         "pull_recommended": f"{registry_id}:{QUANT_METADATA[entry['recommended_quant']].suffix}",
     }
+    # language_mode/language_default are omitted entirely (not just falsy) for
+    # kinds language_mode_for_model() returns {} for; compare against None so a
+    # spuriously-added field on those entries is still caught as drift.
+    expected_language_mode = language_mode_for_model(entry, languages)
+    expected_scalars["language_mode"] = expected_language_mode.get("language_mode")
+    expected_scalars["language_default"] = expected_language_mode.get("language_default")
     for key, value in expected_scalars.items():
         if machine_model.get(key) != value:
             errors.append(f"{model}: catalog {key} drifted: got {machine_model.get(key)!r}, expected {value!r}")
@@ -96,6 +110,24 @@ def check_machine_catalog_entry(model: str, entry: dict, machine_model: dict, er
         errors.append(
             f"{model}: catalog capability drifted: got {machine_model.get('capability')!r}, "
             f"expected {entry.get('capability')!r}"
+        )
+    expected_sort_weight = entry.get("sort_weight", 0)
+    if machine_model.get("sort_weight", 0) != expected_sort_weight:
+        errors.append(
+            f"{model}: catalog sort_weight drifted: got {machine_model.get('sort_weight', 0)!r}, "
+            f"expected {expected_sort_weight!r}"
+        )
+    expected_recommended = entry.get("recommended") is True
+    if (machine_model.get("recommended") is True) != expected_recommended:
+        errors.append(
+            f"{model}: catalog recommended drifted: got {machine_model.get('recommended')!r}, "
+            f"expected {expected_recommended!r}"
+        )
+    expected_prose_locales = prose_locales_block(model, read_prose(model))
+    if machine_model.get("prose_locales") != expected_prose_locales:
+        errors.append(
+            f"{model}: catalog prose_locales drifted from cards/{model}.toml "
+            "(re-run regenerate_all.sh to pick up card changes)"
         )
     for key in (
         "experimental",
@@ -149,6 +181,12 @@ def main(argv: list[str]) -> int:
     }
     errors: list[str] = []
     skipped: list[str] = []
+
+    translated_cards: list[str] = []
+    try:
+        translated_cards = validate_all_card_prose_locales()
+    except KeyError as error:
+        errors.append(str(error))
     for model in selected:
         entry = publish_catalog[model]
         machine_model = machine_by_id.get(entry["registry_id"])
@@ -172,6 +210,7 @@ def main(argv: list[str]) -> int:
             print(error, file=sys.stderr)
         return 1
     print(f"catalog drift check passed for {len(selected)} model(s)")
+    print(f"prose_locales check passed for {len(translated_cards)} model(s): {', '.join(translated_cards)}")
     return 0
 
 

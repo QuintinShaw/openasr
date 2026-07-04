@@ -17,7 +17,7 @@ contributors -- crate relationships, the audio-to-transcript pipeline, and the
 | [Model Catalog, Registry, and Distribution](MODEL_CATALOG_ARCHITECTURE.md) | Catalog ownership chain (human-edited publishing catalog -> generated `model-registry/catalog.json`), `openasr pull` install mechanics, the local `model-registry/models/*.toml` cards, signed catalog hosting/cache, and the no-implicit-download boundary. |
 | [Known Limitations](KNOWN_LIMITATIONS.md) | Current user-visible limits: no public binary release yet, `.oasr`-only native packs, gated streaming/diarization (declared/capability packs only), generic accelerator selection, and internal-only benchmarks. |
 | [FAQ](FAQ.md) | Current-behavior questions: what OpenASR is, which families run, which backends are active, and the conservative offline transcription lane. |
-| [Releasing](RELEASING.md) | The manual, workspace-lockstep SemVer `0.y.z` release process: where the version lives (root `Cargo.toml`), the pre-release gates, and tag/publish hygiene. |
+| [Releasing](../RELEASING.md) | The commit-driven release process: the single workspace version, `scripts/bump-version.sh`, and the version-triggered `Release core` workflow. |
 
 ## Format contracts (`docs/format/`)
 

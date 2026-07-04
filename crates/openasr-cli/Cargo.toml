@@ -4,6 +4,7 @@ description = "Command-line interface for OpenASR: transcribe, live, serve, pull
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+publish.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
