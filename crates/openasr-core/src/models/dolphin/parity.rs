@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::decoder_graph::{DolphinDecoderConfig, decode_prompt_logits};
 use super::encoder_graph::{DolphinEncoderConfig, encode};
 
 const FIXTURE_ROOT: &str =
@@ -43,6 +44,43 @@ fn load_safetensors_f32(path: &Path) -> HashMap<String, Vec<f32>> {
             dtype, "F32",
             "expected all-f32 weights, got {dtype} for {name}"
         );
+        let offsets = meta["data_offsets"].as_array().expect("data_offsets");
+        let start = offsets[0].as_u64().unwrap() as usize;
+        let end = offsets[1].as_u64().unwrap() as usize;
+        let raw = &bytes[header_end + start..header_end + end];
+        assert!(
+            raw.len().is_multiple_of(4),
+            "tensor {name} not 4-byte aligned"
+        );
+        let values: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        out.insert(name.clone(), values);
+    }
+    out
+}
+
+/// Like [`load_safetensors_f32`] but only materializes tensors whose name starts
+/// with `prefix`. `full.safetensors` carries the whole 1.7 GB state dict; the
+/// decoder harness only needs the `decoder.*` namespace, so filtering keeps the
+/// working set small.
+fn load_safetensors_f32_prefixed(path: &Path, prefix: &str) -> HashMap<String, Vec<f32>> {
+    let bytes = std::fs::read(path).expect("read safetensors");
+    assert!(bytes.len() >= 8, "safetensors too short");
+    let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+    let header_end = 8 + header_len;
+    let header: serde_json::Value =
+        serde_json::from_slice(&bytes[8..header_end]).expect("parse safetensors header");
+    let obj = header.as_object().expect("header object");
+
+    let mut out = HashMap::new();
+    for (name, meta) in obj {
+        if name == "__metadata__" || !name.starts_with(prefix) {
+            continue;
+        }
+        let dtype = meta["dtype"].as_str().expect("dtype");
+        assert_eq!(dtype, "F32", "expected f32 weights, got {dtype} for {name}");
         let offsets = meta["data_offsets"].as_array().expect("data_offsets");
         let start = offsets[0].as_u64().unwrap() as usize;
         let end = offsets[1].as_u64().unwrap() as usize;
@@ -212,5 +250,79 @@ fn dolphin_encoder_parity() {
     assert!(
         m_final < 1.0e-3,
         "encoder_out max abs diff {m_final:.3e} exceeds the 1e-3 parity bound"
+    );
+}
+
+/// Canonical Dolphin decode prefix (OWSM-style): sos + lang + region + task +
+/// timestamp = `<sos><zh><SICHUAN><asr><notimestamp>`. The golden
+/// `decoder_step0_logits` is the distribution predicting the first content token
+/// given this whole prompt (the last row of the teacher-forced prompt logits).
+const DECODER_PROMPT: [u32; 5] = [2, 5, 10, 4, 109];
+
+#[test]
+#[ignore = "requires local Dolphin full.safetensors + golden under tmp/publish (not committed)"]
+fn dolphin_decoder_parity() {
+    let root = root();
+    let weights_path = root.join("weights/full.safetensors");
+    let encoder_out_path = root.join("golden/encoder_out.npy");
+    let step0_path = root.join("golden/decoder_step0_logits.npy");
+    if !weights_path.exists() || !step0_path.exists() {
+        eprintln!("skip: dolphin decoder weights/golden not present under {root:?}");
+        return;
+    }
+
+    let weights = load_safetensors_f32_prefixed(&weights_path, "decoder.");
+    let (enc_shape, encoder_out) = load_npy_f32(&encoder_out_path);
+    assert_eq!(enc_shape.len(), 3, "expected (1,T',768), got {enc_shape:?}");
+    let frames = enc_shape[1];
+    let d_model = enc_shape[2];
+
+    let config = DolphinDecoderConfig::small_cn();
+    assert_eq!(d_model, config.d_model, "encoder hidden mismatch");
+
+    let output = decode_prompt_logits(&config, &weights, &encoder_out, frames, &DECODER_PROMPT)
+        .expect("dolphin decoder");
+    assert_eq!(output.token_count, DECODER_PROMPT.len());
+    assert_eq!(output.vocab_size, config.vocab_size);
+
+    let actual = output.last_token_logits();
+    let (gshape, golden) = load_npy_f32(&step0_path);
+    assert_eq!(gshape, vec![config.vocab_size], "golden step0 shape");
+
+    let (max, mean) = diff(actual, &golden);
+    let rel = relative_max_diff(actual, &golden);
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                if x > bv { (i, x) } else { (bi, bv) }
+            })
+            .0
+    };
+    println!("== Dolphin Transformer decoder parity (first content step) ==");
+    println!(
+        "prompt {DECODER_PROMPT:?} -> {frames} encoder frames, {} tokens",
+        output.token_count
+    );
+    println!(
+        "decoder_step0 : max {max:.3e}  mean {mean:.3e}  rel {rel:.3e}  \
+         argmax actual={} golden={} (expect 3805)",
+        argmax(actual),
+        argmax(&golden)
+    );
+
+    // The decoder graph is assembled entirely in f32 (attention via
+    // mul_mat/soft_max_ext/mul_mat, no f16 KV cache), so it reproduces the
+    // PyTorch reference down to the f32 accumulation-order noise floor. Gate at
+    // the task's 1e-3 bound; an algorithmic divergence (wrong scale, mask,
+    // norm placement, cross-attn source) blows this up by orders of magnitude.
+    assert_eq!(
+        argmax(actual),
+        argmax(&golden),
+        "decoder first content token mismatch"
+    );
+    assert!(
+        max < 1.0e-3,
+        "decoder_step0 max abs diff {max:.3e} exceeds the 1e-3 parity bound"
     );
 }

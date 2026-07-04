@@ -7,6 +7,7 @@
 //! fbank frontend and CTC-prefix-beam + attention-rescoring joint decode land in
 //! a later phase.
 
+pub(crate) mod decoder_graph;
 pub(crate) mod encoder_graph;
 pub(crate) mod executor;
 pub mod package_import;
