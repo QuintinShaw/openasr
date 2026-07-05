@@ -35,7 +35,15 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
 - Phrase bias / hotword boosting is implemented for the native runtime decode
   path. Requests still fail closed when the selected model tokenizer cannot
   encode a requested phrase, and the mock backend still rejects non-empty
-  phrase-bias requests.
+  phrase-bias requests. Most families apply phrase bias as a per-token logit
+  boost during decoding; Dolphin instead runs its upstream-trained native
+  deep-biasing context module (`context_module.*`: a BiLSTM context encoder +
+  cross-attention fusion into the encoder output ahead of attention rescoring,
+  arXiv:2305.12493) and therefore has no per-phrase `boost` weight to apply --
+  the phrase *list* is the only signal it honors, and CTC prefix-beam n-best
+  generation still runs over the un-biased encoder output (only the
+  attention-rescoring decoder input is biased), matching the upstream
+  reference decode.
 - Word-level timestamp requests are accepted and exported in JSON/VTT. Whisper
   uses native decoder cross-attention frame probabilities and the CTC families
   (parakeet-ctc, wav2vec2-ctc) use decoder frame spans; Qwen, Cohere, and

@@ -1093,4 +1093,78 @@ mod tests {
             assert_eq!(qoutput.resolved_language, "zh-sichuan");
         }
     }
+
+    /// End-to-end hotword demo: the un-biased `attention_rescoring` decode gets the
+    /// 和/河 homophone wrong (see `REFERENCE_RESCORING_TEXT` above); native
+    /// `context_module.*` deep-biasing with the hotword "河" flips it to the correct
+    /// human transcript. Mirrors `work/hotword_parity.py`'s PyTorch reference demo
+    /// exactly (same clip, same hotword, same "no hotword" vs "with hotword" pair).
+    ///
+    /// `#[ignore]`: needs the checkpoint/golden under `tmp/publish` (not committed).
+    /// Run with:
+    /// `cargo test -p openasr-core dolphin_hotword_flips_recognition_error -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires local Dolphin checkpoint + golden clip under tmp/publish (not committed)"]
+    fn dolphin_hotword_flips_recognition_error() {
+        let root = root();
+        let clip = root.join("golden/clip_sichuan.wav");
+        let Some(pack) = ensure_dolphin_pack(&root, DolphinQuantizationMode::Fp16) else {
+            eprintln!("skip: dolphin checkpoint/units not present under {root:?}");
+            return;
+        };
+        if !clip.exists() {
+            eprintln!("skip: golden clip not present at {clip:?}");
+            return;
+        }
+
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            &clip,
+            "dolphin hotword demo",
+            "clip_sichuan.wav",
+        )
+        .expect("load clip");
+        let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
+        let metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
+
+        let no_hotword = transcribe_dolphin_pcm(
+            &reader,
+            &metadata,
+            &samples,
+            DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
+            GgmlCpuGraphBackend::Cpu,
+            Some("zh-sichuan"),
+            None,
+        )
+        .expect("dolphin transcribe (no hotword)");
+
+        let phrase_bias = crate::PhraseBiasConfig::from_phrases_with_default_boost(["河"], None)
+            .expect("hotword phrase config");
+        let with_hotword = transcribe_dolphin_pcm(
+            &reader,
+            &metadata,
+            &samples,
+            DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
+            GgmlCpuGraphBackend::Cpu,
+            Some("zh-sichuan"),
+            Some(&phrase_bias),
+        )
+        .expect("dolphin transcribe (with hotword)");
+
+        eprintln!("== Dolphin hotword deep-biasing demo (河) ==");
+        eprintln!("no hotword   : {}", no_hotword.text);
+        eprintln!("with hotword : {}", with_hotword.text);
+
+        assert_eq!(
+            no_hotword.text, REFERENCE_RESCORING_TEXT,
+            "no-hotword baseline diverged from the golden un-biased transcript"
+        );
+        assert_eq!(
+            with_hotword.text, REFERENCE_WSC_TEXT,
+            "hotword-biased transcript did not flip to the human WSC reference"
+        );
+        assert_ne!(
+            no_hotword.text, with_hotword.text,
+            "the hotword must change the rescored transcript on this clip"
+        );
+    }
 }
