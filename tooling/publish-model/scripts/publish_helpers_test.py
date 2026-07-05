@@ -13,6 +13,7 @@ from _catalog import (
     languages_for_model,
     load,
     load_catalog_series,
+    validate_recognition_language_code,
 )
 from _file_loaders import load_toml
 
@@ -60,10 +61,11 @@ class PublishHelpersTest(unittest.TestCase):
             self.assertIsInstance(langs, list)
             self.assertTrue(langs, f"model '{model}' has no languages")
             for code in langs:
-                # ISO 639-1 (2 letters) or 639-3 (3 letters); languages only.
-                self.assertRegex(
-                    code, r"^[a-z]{2,3}$", f"model '{model}' code {code!r} is not an ISO 639 code"
-                )
+                # Plain ISO 639-1/639-3 code, OR a registered dialect code
+                # (zh-sichuan, ...) for a dialect-capable family. The validator
+                # rejects a malformed/unregistered code and (via
+                # languages_for_model) an unauthorized family enumerating one.
+                validate_recognition_language_code(model, code)
             self.assertEqual(
                 langs, sorted(set(langs)), f"model '{model}' languages must be sorted + de-duped"
             )

@@ -53,6 +53,12 @@ pub const MOONSHINE_AUDIO_FRONTEND_ID: &str = crate::arch::MOONSHINE_AUDIO_FRONT
 pub const MOONSHINE_TOKENIZER_ID: &str = crate::arch::MOONSHINE_TOKENIZER_ID;
 pub const MOONSHINE_DECODE_POLICY_ID: &str = crate::arch::MOONSHINE_DECODE_POLICY_ID;
 
+pub const DOLPHIN_GGML_ARCHITECTURE_ID: &str = crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID;
+pub const DOLPHIN_GGML_ADAPTER_ID: &str = crate::arch::DOLPHIN_GGML_ADAPTER_ID;
+pub const DOLPHIN_AUDIO_FRONTEND_ID: &str = crate::arch::DOLPHIN_AUDIO_FRONTEND_ID;
+pub const DOLPHIN_TOKENIZER_ID: &str = crate::arch::DOLPHIN_TOKENIZER_ID;
+pub const DOLPHIN_DECODE_POLICY_ID: &str = crate::arch::DOLPHIN_DECODE_POLICY_ID;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GgmlFamilyRegistrySelectionError {
     InvalidMetadata(OasrV1MetadataError),
@@ -237,6 +243,13 @@ pub fn moonshine_runtime_descriptor_v1() -> GgmlFamilyAdapterDescriptor {
     OpenAsrArchitectureRegistry::with_builtins()
         .find_by_model_architecture(MOONSHINE_GGML_ARCHITECTURE_ID)
         .expect("builtin moonshine architecture must exist")
+        .ggml_family_adapter_descriptor()
+}
+
+pub fn dolphin_runtime_descriptor_v1() -> GgmlFamilyAdapterDescriptor {
+    OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(DOLPHIN_GGML_ARCHITECTURE_ID)
+        .expect("builtin dolphin architecture must exist")
         .ggml_family_adapter_descriptor()
 }
 

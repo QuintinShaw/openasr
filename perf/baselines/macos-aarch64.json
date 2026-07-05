@@ -666,6 +666,25 @@
       "cpp_best_ms": null,
       "load_ms": 214,
       "compute_ms": 675
+    },
+    {
+      "id": "dolphin-cn-dialect-small-fp16",
+      "family": "dolphin",
+      "quant": "fp16",
+      "elapsed_ms": 1712,
+      "audio_seconds": 2.38,
+      "rtf": 0.7195409663865547,
+      "peak_rss_bytes": 3742187520,
+      "wer": 0.0,
+      "wer_errors": 0,
+      "wer_ref_words": 1,
+      "text_chars": 13,
+      "segment_count": 1,
+      "gating": false,
+      "ordering_group": null,
+      "cpp_best_ms": null,
+      "load_ms": 627,
+      "compute_ms": 1712
     }
   ]
 }

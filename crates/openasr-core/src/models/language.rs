@@ -108,9 +108,15 @@ pub(crate) fn effective_reported_language(
 /// (openai/whisper tokenizer.py).
 pub(crate) fn code_to_english_name(code: &str) -> String {
     let normalized = normalize_language(code);
-    english_name_for_code(&normalized)
-        .map(str::to_string)
-        .unwrap_or(normalized)
+    if let Some(name) = english_name_for_code(&normalized) {
+        return name.to_string();
+    }
+    // Curated dialect/localized codes (e.g. `zh-sichuan`) are named by the display
+    // table; lowercase its English form to keep the OpenAI verbose_json convention.
+    if let Some(label) = language_display_label(&normalized) {
+        return label.en.to_ascii_lowercase();
+    }
+    normalized
 }
 
 fn english_name_for_code(code: &str) -> Option<&'static str> {
@@ -217,6 +223,110 @@ fn english_name_for_code(code: &str) -> Option<&'static str> {
         "yue" => "cantonese",
         _ => return None,
     })
+}
+
+/// A localized display label for a language or dialect recognition code, carried
+/// as plain data so app surfaces (including the web app, which does not depend on
+/// `@openasr/shared`) can render a code without re-deriving its name. This is the
+/// single in-repo source of truth for the curated per-code labels the signed
+/// catalog will later carry, so Rust and the catalog cannot disagree on how a
+/// dialect code is spelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LanguageDisplayLabel {
+    /// English display name, Title-cased for UI (e.g. `"Chinese (Sichuanese)"`).
+    pub en: &'static str,
+    /// Simplified-Chinese display name (e.g. `"中文（四川话）"`).
+    pub zh_cn: &'static str,
+}
+
+/// Curated, override-first display label for a language or dialect recognition
+/// code. Returns `Some` only for codes an app cannot name well from the plain ISO
+/// code alone: the Chinese province/dialect codes a recognition model advertises,
+/// plus the Sinitic codes whose ISO naming is unhelpful (`yue` -> Cantonese,
+/// `wuu` -> Wu, and base `zh`). Plain ISO codes return `None` and fall through to
+/// Intl-style naming on the app side. The code is normalized first, so a raw
+/// request code may be passed.
+pub(crate) fn language_display_label(code: &str) -> Option<LanguageDisplayLabel> {
+    let (en, zh_cn) = match normalize_language(code).as_str() {
+        "zh" => ("Chinese", "中文"),
+        "yue" => ("Cantonese", "粤语"),
+        "wuu" => ("Wu Chinese", "吴语"),
+        "zh-sichuan" => ("Chinese (Sichuanese)", "中文（四川话）"),
+        "zh-shanghai" => ("Chinese (Shanghainese)", "中文（上海话）"),
+        "zh-guangdong" => ("Chinese (Guangdong)", "中文（广东话）"),
+        "zh-hubei" => ("Chinese (Hubei)", "中文（湖北话）"),
+        "zh-shandong" => ("Chinese (Shandong)", "中文（山东话）"),
+        "zh-hebei" => ("Chinese (Hebei)", "中文（河北话）"),
+        "zh-shaanxi" => ("Chinese (Shaanxi)", "中文（陕西话）"),
+        "zh-shanxi" => ("Chinese (Shanxi)", "中文（山西话）"),
+        "zh-anhui" => ("Chinese (Anhui)", "中文（安徽话）"),
+        "zh-jiangsu" => ("Chinese (Jiangsu)", "中文（江苏话）"),
+        "zh-tianjin" => ("Chinese (Tianjin)", "中文（天津话）"),
+        "zh-ningxia" => ("Chinese (Ningxia)", "中文（宁夏话）"),
+        "zh-tw" => ("Chinese (Taiwan)", "中文（台湾）"),
+        _ => return None,
+    };
+    Some(LanguageDisplayLabel { en, zh_cn })
+}
+
+/// The explicit set of registered dialect recognition codes: base-language codes
+/// carrying a `-region` subtag that a model may advertise as a selectable source
+/// language (currently the Chinese province tags Dolphin recognizes). The
+/// languages validator accepts a `-region` code ONLY if it appears here, so a typo
+/// like `zh-sichaun` fails loudly instead of shipping in a signed catalog. Kept
+/// sorted + de-duplicated, and pinned to `language_display_label` by a test below.
+#[cfg_attr(not(test), allow(dead_code))] // Consumed by the catalog/executor phases.
+pub(crate) const REGISTERED_DIALECT_CODES: &[&str] = &[
+    "zh-anhui",
+    "zh-guangdong",
+    "zh-hebei",
+    "zh-hubei",
+    "zh-jiangsu",
+    "zh-ningxia",
+    "zh-shaanxi",
+    "zh-shandong",
+    "zh-shanghai",
+    "zh-shanxi",
+    "zh-sichuan",
+    "zh-tianjin",
+    "zh-tw",
+];
+
+/// Validate a single advertised recognition-language code. Deliberately distinct
+/// from the translation-only `[a-z]{2,3}` check: a recognition `languages` list may
+/// carry dialect codes (`zh-sichuan`), so this accepts a plain lowercase ISO base
+/// code OR a registered `-region` dialect code and rejects everything else -- a
+/// malformed shape or an unregistered `-region` subtag -- so typos ship loudly.
+/// Shape mirrors `^[a-z]{2,3}(-[a-z0-9]+)?$`. Expects an already-canonical
+/// (lowercase, trimmed) code, matching the stored catalog form.
+#[cfg_attr(not(test), allow(dead_code))] // Consumed by the catalog/executor phases.
+pub(crate) fn validate_language_code(code: &str) -> Result<(), String> {
+    let (base, region) = match code.split_once('-') {
+        Some((base, region)) => (base, Some(region)),
+        None => (code, None),
+    };
+    let base_ok =
+        (2..=3).contains(&base.len()) && base.bytes().all(|byte| byte.is_ascii_lowercase());
+    let region_ok = match region {
+        None => true,
+        Some(region) => {
+            !region.is_empty()
+                && region
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        }
+    };
+    if !base_ok || !region_ok {
+        return Err(format!(
+            "language code {code:?} must be a lowercase ISO 639 base code with an optional -region subtag"
+        ));
+    }
+    if region.is_some() && !REGISTERED_DIALECT_CODES.contains(&code) {
+        return Err(format!(
+            "dialect language code {code:?} is not in the registered dialect-code set"
+        ));
+    }
+    Ok(())
 }
 
 /// The Whisper language-code set (the codes whose `<|code|>` token can appear at
@@ -387,6 +497,115 @@ mod tests {
         // Fail-open: an unknown code returns normalized and unchanged.
         assert_eq!(code_to_english_name("xx"), "xx");
         assert_eq!(code_to_english_name("ZZ"), "zz");
+    }
+
+    #[test]
+    fn english_name_plain_iso_codes_stay_byte_identical() {
+        // Adding the dialect display table must not perturb the OpenAI
+        // verbose_json names for plain ISO codes.
+        assert_eq!(code_to_english_name("en"), "english");
+        assert_eq!(code_to_english_name("zh"), "chinese");
+        assert_eq!(code_to_english_name("ja"), "japanese");
+        assert_eq!(code_to_english_name("yue"), "cantonese");
+        assert_eq!(code_to_english_name("xx"), "xx");
+        // Dialect codes fall through to the display table (lowercased for the API).
+        assert_eq!(code_to_english_name("zh-sichuan"), "chinese (sichuanese)");
+    }
+
+    #[test]
+    fn dialect_display_labels_are_localized_and_titlecased() {
+        let sichuan = language_display_label("zh-sichuan").expect("registered");
+        assert_eq!(sichuan.en, "Chinese (Sichuanese)");
+        assert_eq!(sichuan.zh_cn, "中文（四川话）");
+        // The lookup normalizes its input (trim + lowercase, region preserved).
+        assert_eq!(
+            language_display_label(" ZH-Sichuan "),
+            Some(LanguageDisplayLabel {
+                en: "Chinese (Sichuanese)",
+                zh_cn: "中文（四川话）"
+            })
+        );
+        let tw = language_display_label("zh-tw").expect("registered");
+        assert_eq!(tw.en, "Chinese (Taiwan)");
+        assert_eq!(tw.zh_cn, "中文（台湾）");
+        // Sinitic base codes carry curated labels; plain ISO codes fall through.
+        assert_eq!(language_display_label("zh").map(|l| l.en), Some("Chinese"));
+        assert_eq!(language_display_label("yue").map(|l| l.zh_cn), Some("粤语"));
+        assert_eq!(language_display_label("wuu").map(|l| l.zh_cn), Some("吴语"));
+        assert_eq!(language_display_label("en"), None);
+        assert_eq!(language_display_label("ja"), None);
+    }
+
+    #[test]
+    fn registered_dialect_codes_are_sorted_labeled_and_valid() {
+        for &code in REGISTERED_DIALECT_CODES {
+            assert!(
+                code.contains('-'),
+                "registered dialect code '{code}' has no -region subtag"
+            );
+            assert!(
+                language_display_label(code).is_some(),
+                "registered dialect code '{code}' has no display label"
+            );
+            assert!(
+                validate_language_code(code).is_ok(),
+                "registered dialect code '{code}' fails its own validator"
+            );
+        }
+        // Sorted + de-duplicated (matches the catalog language-list rules).
+        let mut sorted = REGISTERED_DIALECT_CODES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.as_slice(), REGISTERED_DIALECT_CODES);
+    }
+
+    #[test]
+    fn display_label_english_does_not_drift_from_openai_names() {
+        // Where a code appears in both naming tables, the English strings must
+        // agree (case-insensitively), so the two sources cannot drift.
+        for &code in REGISTERED_DIALECT_CODES {
+            if let Some(name) = english_name_for_code(code) {
+                let label = language_display_label(code).expect("registered");
+                assert_eq!(label.en.to_ascii_lowercase(), name);
+            }
+        }
+        for code in ["zh", "yue"] {
+            let name = english_name_for_code(code).expect("in openai table");
+            let label = language_display_label(code).expect("curated");
+            assert_eq!(label.en.to_ascii_lowercase(), name);
+        }
+    }
+
+    #[test]
+    fn validate_language_code_accepts_iso_and_registered_rejects_typos() {
+        // Plain ISO base codes pass.
+        assert!(validate_language_code("en").is_ok());
+        assert!(validate_language_code("zh").is_ok());
+        assert!(validate_language_code("yue").is_ok());
+        assert!(validate_language_code("fil").is_ok());
+        // Registered dialect codes pass.
+        assert!(validate_language_code("zh-sichuan").is_ok());
+        assert!(validate_language_code("zh-tw").is_ok());
+        // A typo'd region ships loudly rather than silently.
+        assert!(validate_language_code("zh-sichaun").is_err());
+        // Well-formed but unregistered region is rejected (must be registered).
+        assert!(validate_language_code("zh-cn").is_err());
+        // Shape failures.
+        assert!(validate_language_code("EN").is_err()); // uppercase
+        assert!(validate_language_code("e").is_err()); // base too short
+        assert!(validate_language_code("abcd").is_err()); // base too long
+        assert!(validate_language_code("zh-").is_err()); // empty region
+        assert!(validate_language_code("-zh").is_err()); // empty base
+        assert!(validate_language_code("zh-a-b").is_err()); // second subtag
+        assert!(validate_language_code("zh_sichuan").is_err()); // underscore
+    }
+
+    #[test]
+    fn normalize_language_preserves_region_subtag() {
+        // Region-safe: lowercased, but the `-region` subtag survives verbatim.
+        assert_eq!(normalize_language("zh-Sichuan"), "zh-sichuan");
+        assert_eq!(normalize_language(" ZH-TW "), "zh-tw");
+        assert_eq!(normalize_language("ZH-GuangDong"), "zh-guangdong");
     }
 
     #[test]

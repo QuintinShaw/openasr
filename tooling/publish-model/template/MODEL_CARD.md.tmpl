@@ -52,13 +52,13 @@ All builds for this model:
 
 ## 📦 Available builds
 
-| Quant | File (`.oasr`) | Size | RAM peak | RTF · M1 CPU | RTF · M1 GPU | JFK ΔWER vs fp16 |
+| Quant | File (`.oasr`) | Size | RAM peak | RTF · M1 CPU | RTF · M1 GPU | {{drift_metric_label}} vs fp16 |
 |:------|:---------------|-----:|---------:|-------------:|-------------:|-----------------:|
 {{perf_table_rows}}
 
-<sub>RTF = real-time factor on the fixed 11s JFK clip (**lower is faster**); RAM peak measured per pack
-in an isolated subprocess. JFK ΔWER compares each quantized build's JFK transcript to this model's
-fp16 JFK transcript, so it measures quantization drift rather than absolute recognition accuracy.
+<sub>RTF = real-time factor on {{bench_clip_phrase}} (**lower is faster**); RAM peak measured per pack
+in an isolated subprocess. {{drift_metric_label}} compares each quantized build's {{bench_clip_short}} transcript to this model's
+fp16 {{bench_clip_short}} transcript, so it measures quantization drift rather than absolute recognition accuracy.
 **{{recommended_quant}}** is the recommended default — near-reference quality at a fraction of the
 footprint.</sub>
 

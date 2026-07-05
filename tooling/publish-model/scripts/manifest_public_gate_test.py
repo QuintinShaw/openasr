@@ -225,5 +225,62 @@ class ManifestPublicGateTest(unittest.TestCase):
         )
 
 
+class ModelSortKeyTest(unittest.TestCase):
+    @staticmethod
+    def _order(models: list[dict]) -> list[str]:
+        return [model["id"] for model in sorted(models, key=_manifest.model_sort_key)]
+
+    def test_sort_weight_dominates_release_date(self) -> None:
+        # A lower sort_weight never jumps ahead of a higher one, even when newer.
+        models = [
+            {"id": "low-new", "sort_weight": 10, "upstream_release_date": "2025-01-01"},
+            {"id": "high-old", "sort_weight": 20, "upstream_release_date": "2020-01-01"},
+        ]
+        self.assertEqual(self._order(models), ["high-old", "low-new"])
+
+    def test_newer_date_first_within_equal_weight(self) -> None:
+        models = [
+            {"id": "older", "sort_weight": 5, "upstream_release_date": "2021-06-01"},
+            {"id": "newer", "sort_weight": 5, "upstream_release_date": "2023-06-01"},
+        ]
+        self.assertEqual(self._order(models), ["newer", "older"])
+
+    def test_dated_models_precede_undated_within_equal_weight(self) -> None:
+        models = [
+            {"id": "undated", "sort_weight": 5},
+            {"id": "dated", "sort_weight": 5, "upstream_release_date": "2019-01-01"},
+        ]
+        self.assertEqual(self._order(models), ["dated", "undated"])
+
+    def test_id_breaks_remaining_tie(self) -> None:
+        models = [
+            {"id": "b", "sort_weight": 5},
+            {"id": "a", "sort_weight": 5},
+        ]
+        self.assertEqual(self._order(models), ["a", "b"])
+
+    def test_all_undated_matches_legacy_weight_then_id_order(self) -> None:
+        # With zero dates set the order matches the pre-tiebreaker
+        # (-sort_weight, id) sort, so the signed catalog stays byte-identical.
+        models = [
+            {"id": "c", "sort_weight": 0},
+            {"id": "a", "sort_weight": 10},
+            {"id": "b", "sort_weight": 10},
+        ]
+        self.assertEqual(self._order(models), ["a", "b", "c"])
+
+    def test_upsert_model_applies_the_tiebreaker(self) -> None:
+        catalog = {
+            "models": [
+                {"id": "older", "sort_weight": 5, "upstream_release_date": "2021-01-01"},
+            ],
+        }
+        result = _manifest.upsert_model(
+            catalog,
+            {"id": "newer", "sort_weight": 5, "upstream_release_date": "2024-01-01"},
+        )
+        self.assertEqual([model["id"] for model in result["models"]], ["newer", "older"])
+
+
 if __name__ == "__main__":
     unittest.main()

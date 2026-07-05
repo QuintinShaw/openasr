@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from _catalog import (
@@ -257,6 +257,7 @@ def build_catalog_model(model: str, entry: dict, args: argparse.Namespace) -> di
         "upstream_gguf_repo",
         "upstream_gguf_revision",
         "license_files",
+        "upstream_release_date",
     ):
         if key in entry:
             model_entry[key] = entry[key]
@@ -286,13 +287,28 @@ def load_catalog(path: Path) -> dict:
     return data
 
 
+def model_sort_key(item: dict) -> tuple:
+    """Display-order sort key for catalog `models[]`.
+
+    Primary key is `sort_weight` (higher first). Within an equal `sort_weight`,
+    a newer `upstream_release_date` sorts first and models with no date sort
+    after any dated model; `id` breaks any remaining tie for determinism. The
+    date is a TIEBREAKER only and never overrides `sort_weight`. ISO
+    `yyyy-mm-dd` ordinals negate so a newer (larger) date sorts earlier, and the
+    `has_date` flag keeps nulls last regardless of the (then-unused) ordinal.
+    """
+    raw_date = item.get("upstream_release_date")
+    has_date = raw_date is not None
+    ordinal = date.fromisoformat(raw_date).toordinal() if has_date else 0
+    return (-item.get("sort_weight", 0), not has_date, -ordinal, item["id"])
+
+
 def upsert_model(catalog: dict, model_entry: dict) -> dict:
     models = [model for model in catalog["models"] if model.get("id") != model_entry["id"]]
     models.append(model_entry)
     # Catalog array order is the display order consumers inherit for free
-    # (market/desktop listings render models[] as-is). Higher sort_weight
-    # first; ties break on id for determinism.
-    models.sort(key=lambda item: (-item.get("sort_weight", 0), item["id"]))
+    # (market/desktop listings render models[] as-is). See model_sort_key.
+    models.sort(key=model_sort_key)
     catalog["schema_version"] = CATALOG_SCHEMA_VERSION
     catalog["generated_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     catalog["catalog_url"] = CATALOG_URL

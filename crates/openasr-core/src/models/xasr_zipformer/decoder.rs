@@ -2,7 +2,7 @@
 
 use super::weights::XasrDecoderWeights;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct XasrDecoder {
     weights: XasrDecoderWeights,
     context_size: usize,
@@ -210,6 +210,7 @@ mod tests {
                     10.0, 20.0, 30.0, 40.0, // token 1
                     100.0, 200.0, 300.0, 400.0, // token 2
                 ],
+                native: None,
             },
             conv_weight: NamedTensor {
                 name: "decoder.conv.weight".to_string(),

@@ -5,6 +5,7 @@ pub(crate) mod ctc_streaming_driver;
 pub(crate) mod decode_policy_component_registry;
 pub(crate) mod decode_token_history;
 pub(crate) mod diarize_pack_import;
+pub(crate) mod dolphin;
 pub(crate) mod executor_component_registry;
 pub(crate) mod frame_sync_streaming_driver;
 pub(crate) mod frontend_component_registry;

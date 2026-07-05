@@ -2,15 +2,24 @@
 from __future__ import annotations
 
 import unittest
+from datetime import date, timedelta
 
 from _catalog import (
+    LANGUAGE_DISPLAY_LABELS,
+    LANG_BY_FAMILY,
+    REGISTERED_DIALECT_CODES,
     apply_catalog_series_defaults,
+    language_labels_wire,
     language_mode_for_model,
+    languages_for_model,
     prose_locale_source_sha256,
     validate_all_card_prose_locales,
     validate_card_prose_locales,
     validate_display_ranking,
     validate_prose_locale_block,
+    validate_recognition_language_code,
+    validate_recognition_languages,
+    validate_upstream_release_date,
 )
 
 
@@ -60,6 +69,43 @@ class DisplayRankingTest(unittest.TestCase):
         apply_catalog_series_defaults("m", entry, {})
         self.assertEqual(entry["sort_weight"], 10)
         self.assertFalse(entry["recommended"])
+
+
+class UpstreamReleaseDateTest(unittest.TestCase):
+    def test_absent_field_is_a_noop(self) -> None:
+        validate_upstream_release_date("m", {"family": "whisper"})  # must not raise
+
+    def test_explicit_none_is_a_noop(self) -> None:
+        validate_upstream_release_date("m", {"upstream_release_date": None})  # must not raise
+
+    def test_valid_past_date_passes(self) -> None:
+        validate_upstream_release_date("m", {"upstream_release_date": "2022-09-21"})
+
+    def test_today_passes(self) -> None:
+        validate_upstream_release_date("m", {"upstream_release_date": date.today().isoformat()})
+
+    def test_rejects_wrong_format(self) -> None:
+        with self.assertRaisesRegex(KeyError, "ISO yyyy-mm-dd"):
+            validate_upstream_release_date("m", {"upstream_release_date": "2022/09/21"})
+
+    def test_rejects_non_string(self) -> None:
+        with self.assertRaisesRegex(KeyError, "ISO yyyy-mm-dd"):
+            validate_upstream_release_date("m", {"upstream_release_date": 20220921})
+
+    def test_rejects_impossible_calendar_date(self) -> None:
+        with self.assertRaisesRegex(KeyError, "not a valid calendar date"):
+            validate_upstream_release_date("m", {"upstream_release_date": "2022-13-40"})
+
+    def test_rejects_future_date(self) -> None:
+        future = (date.today() + timedelta(days=1)).isoformat()
+        with self.assertRaisesRegex(KeyError, "in the future"):
+            validate_upstream_release_date("m", {"upstream_release_date": future})
+
+    def test_apply_catalog_series_defaults_runs_the_check(self) -> None:
+        future = (date.today() + timedelta(days=1)).isoformat()
+        entry = {"family": "whisper", "size": "tiny", "upstream_release_date": future}
+        with self.assertRaisesRegex(KeyError, "in the future"):
+            apply_catalog_series_defaults("m", entry, {})
 
 
 class ProseLocaleValidationTest(unittest.TestCase):
@@ -185,6 +231,63 @@ class LanguageModeForModelTest(unittest.TestCase):
     def test_translation_model_is_omitted(self) -> None:
         entry = {"kind": "translation-model", "family": "hymt2"}
         self.assertEqual(language_mode_for_model(entry, ["en", "zh"]), {})
+
+
+class RecognitionLanguageValidatorTest(unittest.TestCase):
+    def test_accepts_plain_iso_and_registered_dialects(self) -> None:
+        for code in ("en", "zh", "yue", "fil", "haw", "zh-sichuan", "zh-tw"):
+            validate_recognition_language_code("m", code)  # must not raise
+
+    def test_rejects_typo_and_unregistered_region(self) -> None:
+        # A typo'd region ships loudly.
+        with self.assertRaisesRegex(KeyError, "registered dialect-code set"):
+            validate_recognition_language_code("m", "zh-sichaun")
+        # Well-formed but unregistered region is rejected (must be registered).
+        with self.assertRaisesRegex(KeyError, "registered dialect-code set"):
+            validate_recognition_language_code("m", "zh-cn")
+
+    def test_rejects_malformed_shape(self) -> None:
+        for bad in ("EN", "e", "abcd", "zh-", "-zh", "zh-a-b", "zh_sichuan"):
+            with self.assertRaises(KeyError):
+                validate_recognition_language_code("m", bad)
+
+    def test_selective_collapse_blocks_dialect_on_non_dialect_family(self) -> None:
+        # A non-dialect-capable family may not enumerate dialect codes.
+        with self.assertRaisesRegex(KeyError, "not dialect-capable"):
+            validate_recognition_languages("qwen3-asr-1.7b", "qwen", ["zh", "zh-sichuan"])
+        # Dolphin (dialect-capable) may.
+        validate_recognition_languages(
+            "dolphin-cn-dialect-small", "dolphin", ["zh", "zh-sichuan"]
+        )
+
+    def test_dolphin_family_advertises_base_plus_registered_dialects(self) -> None:
+        expected = sorted(["zh", *REGISTERED_DIALECT_CODES])
+        self.assertEqual(LANG_BY_FAMILY["dolphin"], expected)
+        # Resolving through the public seam validates + returns the same set.
+        resolved = languages_for_model({"id": "dolphin-cn-dialect-small", "family": "dolphin"})
+        self.assertEqual(resolved, expected)
+
+
+class LanguageLabelsWireTest(unittest.TestCase):
+    def test_wire_shape_is_code_to_en_and_zh_cn(self) -> None:
+        wire = language_labels_wire()
+        # Every curated code is present with exactly {en, zh-CN}.
+        self.assertEqual(set(wire), set(LANGUAGE_DISPLAY_LABELS))
+        for code, entry in wire.items():
+            self.assertEqual(set(entry), {"en", "zh-CN"})
+            en, zh_cn = LANGUAGE_DISPLAY_LABELS[code]
+            self.assertEqual(entry["en"], en)
+            self.assertEqual(entry["zh-CN"], zh_cn)
+
+    def test_wire_is_sorted_by_code(self) -> None:
+        wire = language_labels_wire()
+        self.assertEqual(list(wire), sorted(wire))
+
+    def test_every_registered_dialect_has_a_label(self) -> None:
+        for code in REGISTERED_DIALECT_CODES:
+            self.assertIn(code, LANGUAGE_DISPLAY_LABELS)
+        # Registered dialect set is sorted + de-duplicated (catalog invariant).
+        self.assertEqual(REGISTERED_DIALECT_CODES, sorted(set(REGISTERED_DIALECT_CODES)))
 
     def test_capability_pack_is_omitted(self) -> None:
         entry = {"kind": "capability-pack", "family": "wespeaker"}
