@@ -6,8 +6,8 @@ use crate::arch::{
     COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID, DOLPHIN_EXECUTOR_COMPONENT_ID,
     MOONSHINE_EXECUTOR_COMPONENT_ID, OpenAsrArchitectureRegistry,
     PARAKEET_CTC_EXECUTOR_COMPONENT_ID, QWEN3_ASR_EXECUTOR_COMPONENT_ID,
-    WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID, WHISPER_EXECUTOR_COMPONENT_ID,
-    XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
+    SENSEVOICE_EXECUTOR_COMPONENT_ID, WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
+    WHISPER_EXECUTOR_COMPONENT_ID, XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
 };
 
 use super::cohere::CohereTranscribeGgmlExecutor;
@@ -16,6 +16,7 @@ use super::ggml_asr_executor::GgmlAsrExecutor;
 use super::moonshine::MoonshineGgmlExecutor;
 use super::parakeet_ctc::executor::ParakeetCtcGgmlExecutor;
 use super::qwen::Qwen3AsrGgmlExecutor;
+use super::sensevoice::executor::SenseVoiceGgmlExecutor;
 use super::wav2vec2_ctc::executor::Wav2Vec2CtcGgmlExecutor;
 use super::whisper::WhisperGgmlExecutor;
 use super::xasr_zipformer::executor::XasrZipformerGgmlExecutor;
@@ -72,6 +73,7 @@ fn materialize_builtin_executor_component(
         MOONSHINE_EXECUTOR_COMPONENT_ID => Some(Arc::new(MoonshineGgmlExecutor::default())),
         XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID => Some(Arc::new(XasrZipformerGgmlExecutor)),
         DOLPHIN_EXECUTOR_COMPONENT_ID => Some(Arc::new(DolphinGgmlExecutor)),
+        SENSEVOICE_EXECUTOR_COMPONENT_ID => Some(Arc::new(SenseVoiceGgmlExecutor)),
         _ => None,
     }
 }
@@ -149,6 +151,7 @@ mod tests {
             (crate::MOONSHINE_MODEL_FAMILY, true),
             (crate::arch::XASR_ZIPFORMER_MODEL_FAMILY, false),
             (crate::arch::DOLPHIN_MODEL_FAMILY, true),
+            (crate::arch::SENSEVOICE_MODEL_FAMILY, true),
         ]);
         let executors =
             materialize_builtin_executors_by_model_architecture().expect("executor map");

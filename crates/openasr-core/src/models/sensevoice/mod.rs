@@ -16,9 +16,15 @@
 // stage); until then they are exercised only by the unit tests here.
 #![allow(dead_code)]
 
+pub(crate) mod encoder_graph;
+pub(crate) mod encoder_weights;
+pub(crate) mod executor;
 pub(crate) mod frontend;
+pub(crate) mod graph_config;
 pub(crate) mod language;
 pub mod package_import;
+pub(crate) mod runtime_contract;
+pub(crate) mod tokenizer;
 pub use package_import::{
     SenseVoiceImportRequest, SenseVoiceImportResult, SenseVoiceQuantizationMode,
     convert_local_sensevoice_source_to_runtime_pack,

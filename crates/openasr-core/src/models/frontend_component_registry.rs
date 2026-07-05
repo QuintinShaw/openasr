@@ -126,7 +126,8 @@ pub(crate) fn materialize_builtin_audio_frontend(
         (
             crate::arch::PARAKEET_CTC_AUDIO_FRONTEND_ID
             | crate::arch::WAV2VEC2_CTC_AUDIO_FRONTEND_ID
-            | crate::arch::MOONSHINE_AUDIO_FRONTEND_ID,
+            | crate::arch::MOONSHINE_AUDIO_FRONTEND_ID
+            | crate::arch::SENSEVOICE_AUDIO_FRONTEND_ID,
             _,
         ) => Err(
             BuiltinAudioFrontendComponentRegistryError::UnsupportedMaterialization {
@@ -336,6 +337,7 @@ mod tests {
             crate::arch::PARAKEET_CTC_AUDIO_FRONTEND_ID,
             crate::arch::WAV2VEC2_CTC_AUDIO_FRONTEND_ID,
             crate::arch::MOONSHINE_AUDIO_FRONTEND_ID,
+            crate::arch::SENSEVOICE_AUDIO_FRONTEND_ID,
         ] {
             let error = materialize_builtin_audio_frontend(frontend_id, &reader, base_metadata)
                 .expect_err("dedicated-executor frontend must not materialize here");
