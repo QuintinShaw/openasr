@@ -16,12 +16,15 @@ import socket
 import ssl
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+
+from _pathlib_helpers import repo_root
 
 DEFAULT_PUBLIC_NAMESPACE = "OpenASR"
 HF_BASE_URL = "https://huggingface.co"
@@ -258,6 +261,65 @@ def _validate_min_cli(value: Any) -> None:
     _require(isinstance(value, str) and bool(GA_VERSION_RE.fullmatch(value)), "min_cli_version must be a GA semver like 0.1.0")
 
 
+_SEMVER_TUPLE_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def _semver_tuple(value: str, *, label: str) -> tuple[int, int, int]:
+    match = _SEMVER_TUPLE_RE.fullmatch(value.strip())
+    _require(match is not None, f"{label} must be a plain major.minor.patch semver, got {value!r}")
+    assert match is not None  # narrows for type checkers; _require already raised otherwise
+    major, minor, patch = match.groups()
+    return (int(major), int(minor), int(patch))
+
+
+def _workspace_version() -> str:
+    root = repo_root(Path(__file__))
+    cargo_toml = root / "Cargo.toml"
+    try:
+        data = tomllib.loads(cargo_toml.read_text())
+    except FileNotFoundError as error:
+        raise PublicGateError(f"workspace Cargo.toml not found at {cargo_toml}") from error
+    version = data.get("workspace", {}).get("package", {}).get("version")
+    if not isinstance(version, str):
+        raise PublicGateError(f"workspace Cargo.toml missing [workspace.package].version at {cargo_toml}")
+    return version
+
+
+def _validate_version_floor_consistency(model_id: str, model: Mapping[str, Any]) -> None:
+    """A public catalog entry must not advertise CLI/core compatibility floors
+    that are lower than reality: `min_cli_version` must be >= any declared
+    `min_core_version` (the CLI floor cannot be more permissive than the core
+    runtime floor the model actually needs), and neither floor may exceed the
+    workspace's current release version (both are meant to describe *already
+    shipped* builds, never a future one).
+    """
+    min_cli_version = model.get("min_cli_version")
+    min_cli_tuple = _semver_tuple(str(min_cli_version), label=f"{model_id}: min_cli_version")
+
+    min_core_version = model.get("min_core_version")
+    min_core_tuple: tuple[int, int, int] | None = None
+    if min_core_version is not None:
+        min_core_tuple = _semver_tuple(str(min_core_version), label=f"{model_id}: min_core_version")
+        _require(
+            min_cli_tuple >= min_core_tuple,
+            f"{model_id}: min_cli_version {min_cli_version} must be >= min_core_version "
+            f"{min_core_version} (a public entry cannot claim CLI compatibility older than "
+            "the core runtime it requires)",
+        )
+
+    workspace_version = _workspace_version()
+    workspace_tuple = _semver_tuple(workspace_version, label="workspace Cargo.toml version")
+    _require(
+        min_cli_tuple <= workspace_tuple,
+        f"{model_id}: min_cli_version {min_cli_version} exceeds the workspace version {workspace_version}",
+    )
+    if min_core_tuple is not None:
+        _require(
+            min_core_tuple <= workspace_tuple,
+            f"{model_id}: min_core_version {min_core_version} exceeds the workspace version {workspace_version}",
+        )
+
+
 def validate_public_model(
     model: Mapping[str, Any],
     *,
@@ -283,6 +345,7 @@ def validate_public_model(
     revision = model.get("hf_revision")
     _require(isinstance(revision, str) and bool(HF_REVISION_RE.fullmatch(revision)), f"{model_id}: hf_revision must be a 40-hex commit sha")
     _validate_min_cli(model.get("min_cli_version"))
+    _validate_version_floor_consistency(model_id, model)
 
     quants = model.get("quants")
     _require(isinstance(quants, list) and len(quants) > 0, f"{model_id}: public entry must include at least one quant")

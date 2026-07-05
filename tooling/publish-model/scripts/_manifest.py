@@ -92,6 +92,23 @@ def read_prose(model: str) -> dict:
     return load_toml(path) if path.exists() else {}
 
 
+def validate_public_prose(model: str, prose: dict) -> None:
+    """`--public` entries must ship real marketing prose, not a silently empty
+    card. A missing card, or a card missing tagline/intro, degrades quietly to
+    empty strings for staging/private entries (see `prose_block`) -- that
+    fallback is not acceptable once a model is public-facing.
+    """
+    path = TOOLING_ROOT / "cards" / f"{model}.toml"
+    if not path.exists():
+        raise SystemExit(f"{model}: --public requires a prose card at {path.relative_to(REPO_ROOT)}")
+    tagline = prose.get("tagline", "")
+    if not isinstance(tagline, str) or not tagline.strip():
+        raise SystemExit(f"{model}: --public requires a non-empty 'tagline' in {path.relative_to(REPO_ROOT)}")
+    intro = prose.get("intro", "")
+    if not isinstance(intro, str) or not intro.strip():
+        raise SystemExit(f"{model}: --public requires a non-empty 'intro' in {path.relative_to(REPO_ROOT)}")
+
+
 def prose_block(prose: dict) -> dict:
     intro = prose.get("intro", "").strip()
     overview = [intro] if intro else []
@@ -155,6 +172,21 @@ def quant_entry(
         raise SystemExit(
             f"metrics.json size_bytes for '{quant}' ({metric_size}) does not match result.json ({size})"
         )
+    # Bench-time binding: metrics.json must record the sha256 of the exact pack
+    # it benchmarked. No back-compat fallback for older metrics.json files
+    # without a sha256 -- a missing or mismatched value means the numbers may
+    # not describe the pack being published, so bench must be re-run.
+    metric_sha = metric.get("sha256")
+    if not isinstance(metric_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", metric_sha):
+        raise SystemExit(
+            f"metrics.json for '{quant}' is missing a valid pack sha256; re-run bench to record it "
+            f"({work_root(model) / 'metrics.json'})"
+        )
+    if metric_sha.lower() != sha.lower():
+        raise SystemExit(
+            f"metrics.json sha256 for '{quant}' ({metric_sha}) does not match result.json sha256 "
+            f"({sha}); the pack changed since the last bench run -- re-run bench before publishing"
+        )
     filename = Path(result.get("pack", f"{model}-{quant}.oasr")).name
     if not filename.endswith(".oasr"):
         raise SystemExit(f"{result_json(model, quant)} has invalid pack filename")
@@ -183,6 +215,8 @@ def build_catalog_model(model: str, entry: dict, args: argparse.Namespace) -> di
     hf_revision = read_hf_revision(model, args.hf_revision)
     metrics = load_required_json(work_root(model) / "metrics.json")
     prose = read_prose(model)
+    if args.public:
+        validate_public_prose(model, prose)
     quants = [
         quant_entry(
             model,
