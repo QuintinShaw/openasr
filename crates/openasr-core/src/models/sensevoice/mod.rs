@@ -8,8 +8,9 @@
 //! Stage status:
 //! - Frontend (fbank + LFR + CMVN) and prompt/language selection are implemented
 //!   and unit-tested here ([`frontend`], [`language`]).
-//! - The SAN-M/FSMN encoder graph, CTC executor, weight loader, and the
-//!   FunASR-checkpoint-to-GGUF converter land in later stages.
+//! - The FunASR-checkpoint-to-GGUF importer lives in [`package_import`].
+//! - The SAN-M/FSMN encoder graph, CTC executor, and weight loader land in the
+//!   executor stage.
 
 // The tag parser + re-exports are consumed by the SenseVoice executor (later
 // stage); until then they are exercised only by the unit tests here.
@@ -17,6 +18,11 @@
 
 pub(crate) mod frontend;
 pub(crate) mod language;
+pub mod package_import;
+pub use package_import::{
+    SenseVoiceImportRequest, SenseVoiceImportResult, SenseVoiceQuantizationMode,
+    convert_local_sensevoice_source_to_runtime_pack,
+};
 
 #[allow(unused_imports)]
 pub(crate) use frontend::{

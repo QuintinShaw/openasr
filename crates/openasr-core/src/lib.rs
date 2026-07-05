@@ -197,6 +197,10 @@ pub use models::{
         Qwen3AsrLocalSourceImportRuntimeResult, Qwen3AsrRuntimeQuantizationMode,
         convert_local_qwen_source_to_runtime_pack,
     },
+    sensevoice::{
+        SenseVoiceImportRequest, SenseVoiceImportResult, SenseVoiceQuantizationMode,
+        convert_local_sensevoice_source_to_runtime_pack,
+    },
     wav2vec2_ctc::{
         Wav2Vec2CtcImportRequest, Wav2Vec2CtcImportResult, Wav2Vec2CtcQuantizationMode,
         convert_local_wav2vec2_ctc_source_to_runtime_pack,

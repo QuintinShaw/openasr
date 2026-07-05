@@ -646,6 +646,20 @@ pub(crate) enum ImportCommand {
         #[arg(long, value_enum, default_value_t = ImportParakeetQuantization::Fp16)]
         quantization: ImportParakeetQuantization,
     },
+    /// Import one local SenseVoiceSmall (FunASR SAN-M/CTC) source directory into one runtime pack file (`.oasr`).
+    #[command(name = "sensevoice")]
+    Sensevoice {
+        /// Source directory containing model.safetensors (from pt_to_safetensors.py), am.mvn, config.yaml, and the SentencePiece bpe model.
+        source_root: PathBuf,
+        /// Output path for one runtime pack file (`.oasr`).
+        output_root: PathBuf,
+        /// Model id written to pack metadata (openasr.model.id).
+        #[arg(long)]
+        package_id: String,
+        /// Runtime tensor quantization for GGUF-backed `.oasr` output (FSMN kernels/norms always stay f32).
+        #[arg(long, value_enum, default_value_t = ImportSensevoiceQuantization::Fp16)]
+        quantization: ImportSensevoiceQuantization,
+    },
     /// Import one local X-ASR Zipformer2 transducer source directory into one runtime pack file (`.oasr`).
     #[command(name = "xasr-zipformer")]
     XasrZipformer {
@@ -807,6 +821,14 @@ pub(crate) enum ImportCohereQuantization {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[allow(non_camel_case_types)]
 pub(crate) enum ImportParakeetQuantization {
+    Fp16,
+    Q8_0,
+    Q4_K,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[allow(non_camel_case_types)]
+pub(crate) enum ImportSensevoiceQuantization {
     Fp16,
     Q8_0,
     Q4_K,

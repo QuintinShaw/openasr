@@ -110,6 +110,17 @@ pub(crate) const DOLPHIN_DECODE_POLICY_ID: &str = "dolphin.attention-rescoring.v
 pub(crate) const DOLPHIN_RUNTIME_TENSOR_CONTRACT_ID: &str = "dolphin.runtime-tensors.v0";
 pub(crate) const DOLPHIN_EXECUTOR_COMPONENT_ID: &str = "dolphin.ggml-executor.v0";
 
+// sensevoice (FunAudioLLM/SenseVoiceSmall: SAN-M/DFSMN encoder + CTC head,
+// FunASR Model License v1.1). Component ids are defined ahead of the full
+// architecture-descriptor entry (the parakeet S2->S4 staging precedent): the
+// importer writes them as pack metadata; the descriptor + executor wiring
+// lands with the executor stage.
+pub(crate) const SENSEVOICE_GGML_ARCHITECTURE_ID: &str = "sensevoice-sanm-ctc";
+pub(crate) const SENSEVOICE_MODEL_FAMILY: &str = "sensevoice";
+pub(crate) const SENSEVOICE_AUDIO_FRONTEND_ID: &str = "sensevoice.fbank80-lfr7x6.16khz.mono.v0";
+pub(crate) const SENSEVOICE_TOKENIZER_ID: &str = "sensevoice.spm-bpe.v0";
+pub(crate) const SENSEVOICE_DECODE_POLICY_ID: &str = "sensevoice.greedy.ctc.v0";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenAsrComponentKind {
     AudioFrontend,
