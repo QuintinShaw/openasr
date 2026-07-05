@@ -344,3 +344,84 @@ fn dolphin_decoder_parity() {
         "decoder_step0 max abs diff {max:.3e} exceeds the 1e-3 parity bound"
     );
 }
+
+// --- Hotword deep-biasing parity --------------------------------------------
+
+/// Cross-checks the Rust `context_module.*` fusion against
+/// `work/hotword_parity.py`'s PyTorch reference for the same checkpoint + clip:
+/// the "no hotword"/"with hotword 河" end-to-end demo where the un-biased
+/// `attention_rescoring` gets the 河/和 homophone wrong (matches
+/// `executor::tests::REFERENCE_RESCORING_TEXT`) and the hotword-biased decode
+/// gets it right (matches `executor::tests::REFERENCE_WSC_TEXT`).
+///
+/// `#[ignore]`: needs `weights/full.safetensors` and the
+/// `golden/hotword_*.npy` fixtures produced by
+/// `work/hotword_parity.py` (both gitignored, local-only). Run with:
+/// `cargo test -p openasr-core dolphin_hotword_context_parity -- --ignored --nocapture`
+#[test]
+#[ignore = "requires local Dolphin full.safetensors + hotword_parity.py golden under tmp/publish (not committed)"]
+fn dolphin_hotword_context_parity() {
+    use super::hotword_context::{apply_hotword_deep_biasing, encode_hotword_context_embeddings};
+
+    let root = root();
+    let weights_path = root.join("weights/full.safetensors");
+    let context_emb_path = root.join("golden/hotword_context_emb.npy");
+    if !weights_path.exists() || !context_emb_path.exists() {
+        eprintln!(
+            "skip: dolphin weights/hotword golden not present under {root:?} \
+             (run work/hotword_parity.py first)"
+        );
+        return;
+    }
+
+    let weights = load_safetensors_f32_prefixed(&weights_path, "context_module.");
+
+    // The golden fixture's hotword list: [no-bias `[0]`, "河" -> token id 6371].
+    let hotword_token_ids: Vec<Vec<u32>> = vec![vec![6371]];
+    let context_emb =
+        encode_hotword_context_embeddings(&weights, &hotword_token_ids).expect("context emb");
+
+    let (ctx_shape, golden_ctx) = load_npy_f32(&context_emb_path);
+    assert_eq!(ctx_shape, vec![2, 768], "golden context_emb shape");
+    let (ctx_max, ctx_mean) = diff(&context_emb, &golden_ctx);
+    let ctx_rel = relative_max_diff(&context_emb, &golden_ctx);
+    println!("== Dolphin hotword context_emb parity ==");
+    println!("context_emb : max {ctx_max:.3e}  mean {ctx_mean:.3e}  rel {ctx_rel:.3e}");
+    assert!(
+        ctx_max < 1.0e-3,
+        "context_emb max abs diff {ctx_max:.3e} exceeds the 1e-3 parity bound"
+    );
+
+    let (enc_shape, encoder_out_unbiased) =
+        load_npy_f32(&root.join("golden/hotword_encoder_out_unbiased.npy"));
+    assert_eq!(
+        enc_shape,
+        vec![58, 768],
+        "golden encoder_out_unbiased shape"
+    );
+    let frames = enc_shape[0];
+
+    let biased = apply_hotword_deep_biasing(
+        &weights,
+        &encoder_out_unbiased,
+        frames,
+        &context_emb,
+        GgmlCpuGraphBackend::Cpu,
+    )
+    .expect("hotword biasing fusion");
+
+    let (biased_shape, golden_biased) =
+        load_npy_f32(&root.join("golden/hotword_encoder_out_biased.npy"));
+    assert_eq!(
+        biased_shape,
+        vec![58, 768],
+        "golden encoder_out_biased shape"
+    );
+    let (bias_max, bias_mean) = diff(&biased, &golden_biased);
+    let bias_rel = relative_max_diff(&biased, &golden_biased);
+    println!("biased encoder_out : max {bias_max:.3e}  mean {bias_mean:.3e}  rel {bias_rel:.3e}");
+    assert!(
+        bias_max < 1.0e-3,
+        "biased encoder_out max abs diff {bias_max:.3e} exceeds the 1e-3 parity bound"
+    );
+}
