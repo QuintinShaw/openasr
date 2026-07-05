@@ -48,6 +48,14 @@ purpose — the exact symbol names drift, so read the code for current names:
 - Registries for the audio frontend, tokenizer, prepared-runtime cache, and
   runtime tensor contract, keyed by the component ids on your descriptor.
 
+**Punctuation fidelity is a product promise.** Whatever the model decodes is what
+the user sees, in every mode (batch, streaming, dictation, server API). Text
+production goes through the shared paths above -- a family may strip its own
+control/tag tokens (special token tables are family-specific), but must never
+add, drop, or rewrite punctuation in the transcript body. Do not introduce
+family-local text munging; if the raw decode carries no punctuation, that is the
+model's honest output.
+
 ## Step 1 — DATA: register the architecture (no graph code)
 
 In `arch/mod.rs`, add the component id consts, then a

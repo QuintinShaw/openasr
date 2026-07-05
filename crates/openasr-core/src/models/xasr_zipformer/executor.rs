@@ -19,6 +19,7 @@ use crate::models::thread_local_runtime_cache::{
     canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
 };
 
+use super::frontend::{XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES, XASR_SAMPLE_RATE_HZ};
 use super::graph_config::xasr_zipformer_encoder_graph_config;
 use super::runtime::{XasrZipformerPreparedRuntime, checkout_prepared_runtime};
 use super::streaming_decoder::XasrIncrementalDecoder;
@@ -43,13 +44,27 @@ fn transcription_from_decode(
     duration_seconds: f32,
 ) -> Result<XasrZipformerTranscription, String> {
     let words = if word_timestamps {
-        runtime.tokenizer().word_timestamps_from_emission_frames(
+        // `encoder_frames` covers the tail-padded audio, so map frames against
+        // the padded duration and clamp back into the real clip: words inside
+        // real speech keep their true times, and a token emitted in the pad
+        // region (terminal punctuation) lands at the audio end.
+        let padded_duration_seconds = if duration_seconds > 0.0 {
+            duration_seconds + XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES as f32 / XASR_SAMPLE_RATE_HZ as f32
+        } else {
+            duration_seconds
+        };
+        let mut words = runtime.tokenizer().word_timestamps_from_emission_frames(
             &result.token_ids,
             &result.emit_frames,
             &result.emit_probabilities,
             result.encoder_frames,
-            duration_seconds,
-        )?
+            padded_duration_seconds,
+        )?;
+        for word in &mut words {
+            word.start = word.start.min(duration_seconds);
+            word.end = word.end.min(duration_seconds);
+        }
+        words
     } else {
         Vec::new()
     };
