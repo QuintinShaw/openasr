@@ -72,7 +72,7 @@ credit all the same:
 - **torchaudio** — `torchaudio.compliance.kaldi` is the numeric parity oracle
   behind our from-scratch fbank frontends. <https://github.com/pytorch/audio>
 - **CrispASR** — we studied its Qwen ASR GGUF implementation while designing our
-  own Qwen family runtime.
+  own Qwen family runtime. <https://github.com/CrispStrobe/CrispASR>
 - **Handy** — side-by-side comparison with Handy's push-to-talk dictation shaped
   our desktop insertion and recording-stop behavior.
   <https://github.com/cjpais/Handy>

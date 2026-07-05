@@ -39,6 +39,7 @@ pub(crate) mod runtime_prepared_registry;
 pub(crate) mod runtime_selection_metadata;
 pub(crate) mod runtime_tensor_contract_registry;
 pub(crate) mod runtime_weight_component_registry;
+pub(crate) mod sensevoice;
 pub(crate) mod sentencepiece_word_timestamps;
 pub(crate) mod seq2seq_greedy_decode;
 mod seq2seq_serve_batch;

@@ -446,6 +446,7 @@ impl OpenAsrArchitectureRegistry {
                     &[
                         OpenAsrBlockKind::ConformerBlock,
                         OpenAsrBlockKind::Wav2Vec2PostNormEncoderLayer,
+                        OpenAsrBlockKind::SanMFsmnEncoderLayer,
                     ],
                     None,
                 ),
@@ -1158,6 +1159,59 @@ mod tests {
                     model_architecture: COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
                     orchestration_shape: OpenAsrOrchestrationShape::Seq2SeqEncoderDecoder,
                     block_kind: OpenAsrBlockKind::TransformerEncoderLayer,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn ctc_shape_accepts_sanm_fsmn_encoder_block() {
+        // SenseVoice's SAN-M/FSMN encoder is a valid CTC encoder block kind
+        // (encoder-only, no decoder stage). Reuse parakeet's Ctc descriptor and
+        // swap in the FSMN encoder block: it must validate.
+        let parakeet = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(PARAKEET_CTC_GGML_ARCHITECTURE_ID)
+            .expect("parakeet architecture");
+        let descriptor = OpenAsrArchitectureDescriptor {
+            block_stack: Some(OpenAsrBlockStackDescriptor {
+                orchestration_shape: OpenAsrOrchestrationShape::Ctc,
+                encoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::SanMFsmnEncoderLayer,
+                    layer_count_hparam: "parakeet.n_layers",
+                    tensor_name_scope: "enc.blk",
+                }),
+                decoder_stage: None,
+            }),
+            ..parakeet
+        };
+
+        assert_eq!(
+            OpenAsrArchitectureRegistry::validate_block_stack(descriptor),
+            Ok(())
+        );
+
+        // And a decoder stage under the Ctc shape must still fail closed.
+        let with_decoder = OpenAsrArchitectureDescriptor {
+            block_stack: Some(OpenAsrBlockStackDescriptor {
+                orchestration_shape: OpenAsrOrchestrationShape::Ctc,
+                encoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::SanMFsmnEncoderLayer,
+                    layer_count_hparam: "parakeet.n_layers",
+                    tensor_name_scope: "enc.blk",
+                }),
+                decoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::Seq2SeqDecoderLayer,
+                    layer_count_hparam: "parakeet.n_layers",
+                    tensor_name_scope: "dec.blk",
+                }),
+            }),
+            ..parakeet
+        };
+        assert_eq!(
+            OpenAsrArchitectureRegistry::validate_block_stack(with_decoder),
+            Err(
+                OpenAsrArchitectureRegistryError::CtcShapeMustNotHaveDecoderStage {
+                    model_architecture: PARAKEET_CTC_GGML_ARCHITECTURE_ID,
                 }
             )
         );
