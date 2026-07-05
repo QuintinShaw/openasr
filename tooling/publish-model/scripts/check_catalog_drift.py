@@ -8,6 +8,7 @@ and with any already committed machine-catalog entries.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -17,6 +18,7 @@ REPO_ROOT = SCRIPT_DIR.parents[2]
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from _catalog import (  # noqa: E402
+    LANG_BY_FAMILY,
     QUANT_METADATA,
     language_labels_wire,
     language_mode_for_model,
@@ -25,6 +27,50 @@ from _catalog import (  # noqa: E402
     validate_all_card_prose_locales,
 )
 from _manifest import prose_locales_block, read_prose  # noqa: E402
+
+# Human-prose keyword each catalog `family` id is expected to be findable by
+# (case-insensitive substring) in README.md's Model support table and
+# ACKNOWLEDGMENTS.md's Speech recognition list. Family ids are internal
+# (e.g. "xasr-zipformer"); prose calls it "X-ASR (Zipformer)".
+FAMILY_DOC_KEYWORDS = {
+    "whisper": "whisper",
+    "cohere": "cohere",
+    "qwen": "qwen",
+    "moonshine": "moonshine",
+    "dolphin": "dolphin",
+    "xasr-zipformer": "x-asr",
+    "parakeet": "parakeet",
+    "wav2vec2": "wav2vec2",
+}
+
+WORD_TO_NUMBER = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
+# Matches phrasing like "eight model families" / "Eight native families" /
+# "8 families" -- a number word (or digit), up to two intervening words, then
+# "families". Deliberately loose: false negatives (a phrasing this misses)
+# just mean the count isn't checked there, not a false failure.
+FAMILY_COUNT_RE = re.compile(
+    r"\b(" + "|".join(WORD_TO_NUMBER) + r"|\d+)\b(?:\s+\S+){0,2}\s+families\b",
+    re.IGNORECASE,
+)
+
+# Docs checked for a stale "N families" literal against the actual family
+# count (len(LANG_BY_FAMILY), the catalog's own family/language SSOT).
+FAMILY_COUNT_DOCS = ("README.md", "ARCHITECTURE.md", "docs/FAQ.md")
 
 
 def load_json(path: Path) -> dict:
@@ -168,6 +214,86 @@ def check_machine_catalog_entry(model: str, entry: dict, machine_model: dict, er
         errors.append(f"{model}: catalog quants drifted: got {observed!r}, expected {expected!r}")
 
 
+def extract_section(text: str, start: str, end_markers: tuple[str, ...]) -> str:
+    """Return the text between `start` (exclusive) and the first of
+    `end_markers` that appears after it (or end of file)."""
+    index = text.find(start)
+    if index < 0:
+        raise KeyError(f"section marker not found: {start!r}")
+    rest = text[index + len(start) :]
+    end = len(rest)
+    for marker in end_markers:
+        found = rest.find(marker)
+        if found != -1:
+            end = min(end, found)
+    return rest[:end]
+
+
+def check_family_count_strings(errors: list[str]) -> None:
+    """A doc claiming e.g. "eight families" must agree with the catalog's own
+    family/language SSOT (LANG_BY_FAMILY). Prevents the prose count silently
+    going stale when a family is added or removed.
+    """
+    expected = len(LANG_BY_FAMILY)
+    for relative in FAMILY_COUNT_DOCS:
+        path = REPO_ROOT / relative
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for match in FAMILY_COUNT_RE.finditer(text):
+            token = match.group(1).lower()
+            found = WORD_TO_NUMBER.get(token, None)
+            if found is None:
+                found = int(token)
+            if found != expected:
+                errors.append(
+                    f"{relative}: family count phrase {match.group(0)!r} says {found}, "
+                    f"but LANG_BY_FAMILY has {expected} families"
+                )
+
+
+def check_public_family_docs(machine_catalog: dict, errors: list[str]) -> None:
+    """Every publicly listed ASR family must be named in README.md's Model
+    support table and ACKNOWLEDGMENTS.md's Speech recognition list, so a newly
+    published public model can't silently ship without user-facing docs.
+    """
+    readme_path = REPO_ROOT / "README.md"
+    ack_path = REPO_ROOT / "ACKNOWLEDGMENTS.md"
+    if not readme_path.exists() or not ack_path.exists():
+        return
+
+    readme_section = extract_section(
+        readme_path.read_text(encoding="utf-8"), "## Model support", ("\n## ",)
+    ).lower()
+    ack_section = extract_section(
+        ack_path.read_text(encoding="utf-8"), "**Speech recognition**", ("\n**", "\n## ")
+    ).lower()
+
+    public_families = sorted(
+        {
+            model.get("family")
+            for model in machine_catalog.get("models", [])
+            if isinstance(model, dict)
+            and model.get("public") is True
+            and model.get("kind", "asr-model") == "asr-model"
+        }
+    )
+    for family in public_families:
+        if not family:
+            continue
+        keyword = FAMILY_DOC_KEYWORDS.get(family, family).lower()
+        if keyword not in readme_section:
+            errors.append(
+                f"family '{family}' (public model) missing from README.md's Model support "
+                f"table (expected to find {keyword!r})"
+            )
+        if keyword not in ack_section:
+            errors.append(
+                f"family '{family}' (public model) missing from ACKNOWLEDGMENTS.md's Speech "
+                f"recognition list (expected to find {keyword!r})"
+            )
+
+
 def main(argv: list[str]) -> int:
     publish_catalog = load_publish_catalog()
     selected = argv or sorted(publish_catalog)
@@ -202,6 +328,10 @@ def main(argv: list[str]) -> int:
             "catalog language_labels drifted from _catalog.LANGUAGE_DISPLAY_LABELS "
             "(re-run: _catalog.py write-language-labels model-registry/catalog.json)"
         )
+
+    check_family_count_strings(errors)
+    check_public_family_docs(machine_catalog, errors)
+
     for model in selected:
         entry = publish_catalog[model]
         machine_model = machine_by_id.get(entry["registry_id"])

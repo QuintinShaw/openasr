@@ -47,6 +47,7 @@ class ManifestPublicGateTest(unittest.TestCase):
                     )
                     metrics["quants"][quant] = {
                         "size_bytes": size,
+                        "sha256": f"{index}" * 64,
                         "rtf_cpu": 0.1 * index,
                         "rtf_metal": None,
                         "peak_rss_bytes": 2_000_000 * index,
@@ -101,6 +102,7 @@ class ManifestPublicGateTest(unittest.TestCase):
                             "quants": {
                                 "f32": {
                                     "size_bytes": 1234,
+                                    "sha256": "a" * 64,
                                     "rtf_cpu": 0.01,
                                     "peak_rss_bytes": 128,
                                 }
@@ -163,6 +165,7 @@ class ManifestPublicGateTest(unittest.TestCase):
                             "quants": {
                                 "q4_k_m": {
                                     "size_bytes": 123456,
+                                    "sha256": "f" * 64,
                                     "peak_rss_bytes": 1_400_000_000,
                                 }
                             }
@@ -199,6 +202,73 @@ class ManifestPublicGateTest(unittest.TestCase):
                 )
         finally:
             _manifest.REPO_ROOT = old_root
+
+    def test_quant_entry_rejects_metrics_missing_sha256(self) -> None:
+        old_root = _manifest.REPO_ROOT
+        model = "moonshine-tiny"
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                _manifest.REPO_ROOT = root
+                work = root / "tmp" / "publish" / model
+                packs = work / "packs"
+                packs.mkdir(parents=True)
+                filename = f"{model}-q8_0.oasr"
+                (packs / f"{model}.q8_0.result.json").write_text(
+                    json.dumps({"pack": str(packs / filename), "sha256": "a" * 64, "size_bytes": 10})
+                )
+                metrics = {"quants": {"q8_0": {"size_bytes": 10, "rtf_cpu": 0.1, "peak_rss_bytes": 1}}}
+
+                with self.assertRaisesRegex(SystemExit, "missing a valid pack sha256"):
+                    _manifest.quant_entry(model, model, "q8_0", "OpenASR/moonshine-tiny", "b" * 40, metrics)
+        finally:
+            _manifest.REPO_ROOT = old_root
+
+    def test_quant_entry_rejects_metrics_sha256_mismatch(self) -> None:
+        old_root = _manifest.REPO_ROOT
+        model = "moonshine-tiny"
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                _manifest.REPO_ROOT = root
+                work = root / "tmp" / "publish" / model
+                packs = work / "packs"
+                packs.mkdir(parents=True)
+                filename = f"{model}-q8_0.oasr"
+                (packs / f"{model}.q8_0.result.json").write_text(
+                    json.dumps({"pack": str(packs / filename), "sha256": "a" * 64, "size_bytes": 10})
+                )
+                metrics = {
+                    "quants": {
+                        "q8_0": {
+                            "size_bytes": 10,
+                            "sha256": "b" * 64,
+                            "rtf_cpu": 0.1,
+                            "peak_rss_bytes": 1,
+                        }
+                    }
+                }
+
+                with self.assertRaisesRegex(SystemExit, "does not match result.json sha256"):
+                    _manifest.quant_entry(model, model, "q8_0", "OpenASR/moonshine-tiny", "b" * 40, metrics)
+        finally:
+            _manifest.REPO_ROOT = old_root
+
+    def test_validate_public_prose_rejects_missing_card(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "requires a prose card"):
+            _manifest.validate_public_prose("no-such-model", {})
+
+    def test_validate_public_prose_rejects_empty_tagline_or_intro(self) -> None:
+        real_prose = _manifest.read_prose("moonshine-tiny")
+
+        with self.assertRaisesRegex(SystemExit, "non-empty 'tagline'"):
+            _manifest.validate_public_prose("moonshine-tiny", {**real_prose, "tagline": "   "})
+
+        with self.assertRaisesRegex(SystemExit, "non-empty 'intro'"):
+            _manifest.validate_public_prose("moonshine-tiny", {**real_prose, "intro": ""})
+
+    def test_validate_public_prose_accepts_populated_card(self) -> None:
+        _manifest.validate_public_prose("moonshine-tiny", _manifest.read_prose("moonshine-tiny"))
 
     def test_public_generation_requires_release_public_metadata(self) -> None:
         with self.assertRaises(SystemExit) as error:

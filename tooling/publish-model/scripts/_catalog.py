@@ -375,6 +375,7 @@ def apply_catalog_series_defaults(model: str, entry: dict, series: dict) -> None
     validate_translation_model(model, entry)
     validate_display_ranking(model, entry)
     validate_upstream_release_date(model, entry)
+    validate_min_core_version(model, entry)
 
     spec = series.get(entry["family"])
     if spec is not None and entry["size"] not in spec["member_sizes"]:
@@ -512,6 +513,28 @@ def validate_upstream_release_date(model: str, entry: dict) -> None:
     if parsed > date.today():
         raise KeyError(
             f"model '{model}' upstream_release_date {value!r} is in the future"
+        )
+
+
+MIN_CORE_VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
+
+
+def validate_min_core_version(model: str, entry: dict) -> None:
+    """`min_core_version` is the optional, author-set minimum core RUNTIME version
+    a model needs (distinct from the publish-time `min_cli_version` floor). It
+    lets a model be forward-published before older builds can execute it: those
+    builds surface it as "update to use" and refuse the pull (see registry.rs
+    CatalogModel::availability). Optional; when present it must be a plain
+    `major.minor.patch` semver triplet. The value is NEVER derived from the
+    current build -- it is set by hand per model.
+    """
+    value = entry.get("min_core_version")
+    if value is None:
+        return
+    if not isinstance(value, str) or MIN_CORE_VERSION_RE.fullmatch(value) is None:
+        raise KeyError(
+            f"model '{model}' min_core_version must be a major.minor.patch semver string, "
+            f"got {value!r}"
         )
 
 

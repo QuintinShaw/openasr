@@ -141,6 +141,12 @@ recommended_quant = "fp16"
 sort_weight = 905
 recommended = true
 upstream_release_date = "2026-05-13"
+# Forward-compat runtime floor: the dolphin family (E-Branchformer CTC +
+# attention rescoring, keep-quantized executor) needs the 0.1.3 core runtime, so
+# older builds surface it as "update to use" and refuse the pull rather than
+# fetching a pack they cannot load. Author-set; never derived from the current
+# build version.
+min_core_version = "0.1.3"
 
 # Diarization support packs: not ASR models. Published support packs keep their
 # catalog-declared variants. Speaker embedding/segmentation are

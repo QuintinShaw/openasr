@@ -18,6 +18,7 @@ from _catalog import (
     validate_display_ranking,
     validate_prose_locale_block,
     validate_recognition_language_code,
+    validate_min_core_version,
     validate_recognition_languages,
     validate_upstream_release_date,
 )
@@ -105,6 +106,34 @@ class UpstreamReleaseDateTest(unittest.TestCase):
         future = (date.today() + timedelta(days=1)).isoformat()
         entry = {"family": "whisper", "size": "tiny", "upstream_release_date": future}
         with self.assertRaisesRegex(KeyError, "in the future"):
+            apply_catalog_series_defaults("m", entry, {})
+
+
+class MinCoreVersionTest(unittest.TestCase):
+    def test_absent_field_is_a_noop(self) -> None:
+        validate_min_core_version("m", {"family": "whisper"})  # must not raise
+
+    def test_explicit_none_is_a_noop(self) -> None:
+        validate_min_core_version("m", {"min_core_version": None})  # must not raise
+
+    def test_valid_triplet_passes(self) -> None:
+        validate_min_core_version("m", {"min_core_version": "0.1.3"})
+
+    def test_rejects_two_component_version(self) -> None:
+        with self.assertRaisesRegex(KeyError, "major.minor.patch"):
+            validate_min_core_version("m", {"min_core_version": "0.1"})
+
+    def test_rejects_prerelease_suffix(self) -> None:
+        with self.assertRaisesRegex(KeyError, "major.minor.patch"):
+            validate_min_core_version("m", {"min_core_version": "0.1.3-rc.1"})
+
+    def test_rejects_non_string(self) -> None:
+        with self.assertRaisesRegex(KeyError, "major.minor.patch"):
+            validate_min_core_version("m", {"min_core_version": 13})
+
+    def test_apply_catalog_series_defaults_runs_the_check(self) -> None:
+        entry = {"family": "whisper", "size": "tiny", "min_core_version": "0.1"}
+        with self.assertRaisesRegex(KeyError, "major.minor.patch"):
             apply_catalog_series_defaults("m", entry, {})
 
 

@@ -353,6 +353,36 @@ class PublicGateTest(unittest.TestCase):
         with self.assertRaisesRegex(PublicGateError, "GA semver"):
             validate_public_model(model, probe=FakeProbe())
 
+    def test_rejects_min_cli_below_min_core(self) -> None:
+        model = valid_model()
+        model["min_cli_version"] = "0.0.9"
+        model["min_core_version"] = "0.1.0"
+
+        with self.assertRaisesRegex(PublicGateError, "must be >= min_core_version"):
+            validate_public_model(model, probe=FakeProbe())
+
+    def test_accepts_min_cli_at_or_above_min_core(self) -> None:
+        model = valid_model()
+        model["min_cli_version"] = "0.1.0"
+        model["min_core_version"] = "0.1.0"
+
+        validate_public_model(model, probe=FakeProbe())
+
+    def test_rejects_min_cli_version_exceeding_workspace_version(self) -> None:
+        model = valid_model()
+        model["min_cli_version"] = "9.9.9"
+
+        with self.assertRaisesRegex(PublicGateError, "exceeds the workspace version"):
+            validate_public_model(model, probe=FakeProbe())
+
+    def test_rejects_min_core_version_exceeding_workspace_version(self) -> None:
+        model = valid_model()
+        model["min_cli_version"] = "9.9.9"
+        model["min_core_version"] = "9.9.9"
+
+        with self.assertRaisesRegex(PublicGateError, "exceeds the workspace version"):
+            validate_public_model(model, probe=FakeProbe())
+
     def test_rejects_missing_metrics(self) -> None:
         model = valid_model()
         model["quants"][0]["perf"] = {

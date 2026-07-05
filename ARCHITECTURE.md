@@ -81,16 +81,16 @@ Adding or reading a family means understanding two directories under
   each family's block stack, hyperparameter schema, and component ids
   (frontend / tokenizer / decode policy / executor). Composer families (Cohere,
   Qwen) are materialized from these descriptors; dedicated-executor families
-  (Whisper, Moonshine, Parakeet-CTC, wav2vec2-CTC, X-ASR) are routed by them.
-  This is the "what does this pack need" layer and stays model-agnostic.
+  (Whisper, Moonshine, Parakeet-CTC, wav2vec2-CTC, Dolphin, X-ASR) are routed by
+  them. This is the "what does this pack need" layer and stays model-agnostic.
 - **`models/`** -- the executors and shared building blocks. Reusable neural
   blocks live in the sibling top-level `nn/` module (attention, conv, ffn,
   norm, encoder, decoder). Each family has its own subdirectory (`models/whisper/`, `models/qwen/`,
   `models/cohere/`, `models/parakeet_ctc/`, `models/wav2vec2_ctc/`,
-  `models/moonshine/`, `models/xasr_zipformer/`, plus the diarization capability
-  packs `models/wespeaker/` and `models/pyannote/`) that assembles those blocks
-  into a graph and owns family-specific tensor binding, frontend, decode, and
-  local-source import.
+  `models/moonshine/`, `models/dolphin/`, `models/xasr_zipformer/`, plus the
+  diarization capability packs `models/wespeaker/` and `models/pyannote/`) that
+  assembles those blocks into a graph and owns family-specific tensor binding,
+  frontend, decode, and local-source import.
 
 A typical family subdirectory (e.g. `models/whisper/`) contains `frontend.rs`,
 `ggml_encoder_graph.rs` / `ggml_decoder_graph.rs`, `*_weights.rs` /

@@ -58,6 +58,10 @@ class PublishCatalogTest(unittest.TestCase):
         self.env["OPENASR_PUBLIC_DIR"] = str(self.public_dir)
         self.env["OPENASR_CATALOG_EPOCH"] = "2026060101"
         self.env["OPENASR_CATALOG_SIGNING_KEY_SEED_HEX"] = "a" * 64
+        # Point the "previously committed epoch" floor at a fixture path that
+        # does not exist by default, so tests aren't coupled to the real
+        # repo's committed model-registry/catalog.public.signature.json.
+        self.env["OPENASR_COMMITTED_PUBLIC_MANIFEST"] = str(self.root / "committed" / "catalog.public.signature.json")
         self.env.pop("HF_TOKEN", None)
 
     def tearDown(self) -> None:
@@ -281,6 +285,33 @@ class PublishCatalogTest(unittest.TestCase):
         self.assertFalse((self.public_dir / "catalog.json").exists())
         self.assertFalse((self.public_dir / "catalog.signature.json").exists())
         self.assertFalse(self.cargo_log.exists())
+
+    def test_rejects_epoch_not_greater_than_previously_committed_epoch(self) -> None:
+        self.catalog.write_text(
+            json.dumps(catalog_with([{"id": "public-model", "public": True}]))
+        )
+        committed_manifest = Path(self.env["OPENASR_COMMITTED_PUBLIC_MANIFEST"])
+        committed_manifest.parent.mkdir(parents=True, exist_ok=True)
+        committed_manifest.write_text(json.dumps({"catalog_epoch": 2026060101}))
+
+        result = self.run_publish_catalog()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be strictly greater than the previously committed epoch 2026060101", result.stderr)
+        self.assertFalse((self.public_dir / "catalog.signature.json").exists())
+
+    def test_accepts_epoch_strictly_greater_than_previously_committed_epoch(self) -> None:
+        self.catalog.write_text(
+            json.dumps(catalog_with([{"id": "public-model", "public": True}]))
+        )
+        committed_manifest = Path(self.env["OPENASR_COMMITTED_PUBLIC_MANIFEST"])
+        committed_manifest.parent.mkdir(parents=True, exist_ok=True)
+        committed_manifest.write_text(json.dumps({"catalog_epoch": 2026060100}))
+
+        result = self.run_publish_catalog()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.public_dir / "catalog.json").exists())
 
 
 if __name__ == "__main__":

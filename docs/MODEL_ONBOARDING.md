@@ -12,7 +12,7 @@ a few new blocks + one step executor" is the target, not "new model = data, zero
 code". What is genuinely **data** (no new code) vs the irreducible
 **per-architecture code** is spelled out below.
 
-Seven families are onboarded today across several orchestration shapes:
+Eight families are onboarded today across several orchestration shapes:
 
 - `Seq2SeqEncoderDecoder` — Whisper (hand-written reference, the bit-identity
   regression gate), Cohere Transcribe (data-driven composer), Moonshine
@@ -20,14 +20,16 @@ Seven families are onboarded today across several orchestration shapes:
 - `LlmDecoder` — Qwen3-ASR (data-driven composer).
 - `Ctc` (non-autoregressive encoder + CTC head) — Parakeet-CTC and wav2vec2-CTC
   (`+data2vec`), dedicated executors.
+- Joint CTC + attention (E-Branchformer encoder + CTC head + Transformer
+  decoder rescoring) — Dolphin, a dedicated executor over the WeNet recipe.
 - Transducer (Zipformer2 encoder + RNN-T decoder/joiner) — X-ASR, a dedicated
   executor with its own multi-scale streaming cache topology.
 
-`whisper`, `moonshine`, and `x-asr` are intentional `block_stack: None` dedicated
-executors (the "a few new blocks" a genuinely-new architecture is permitted); all
-composer-shape families call `validate_stage_against_descriptor` at construction
-so a descriptor's shape / block-kind / tensor-scope / layer-count is enforced
-fail-closed.
+`whisper`, `moonshine`, `dolphin`, and `x-asr` are intentional `block_stack: None`
+dedicated executors (the "a few new blocks" a genuinely-new architecture is
+permitted); all composer-shape families call `validate_stage_against_descriptor`
+at construction so a descriptor's shape / block-kind / tensor-scope / layer-count
+is enforced fail-closed.
 
 ## What you get for free (shared, data-driven)
 
