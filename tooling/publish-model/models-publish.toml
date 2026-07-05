@@ -54,6 +54,16 @@ upstream_repo = "DataoceanAI1/dolphi-cn-dialect-small"
 source_revision = "main"
 needs_license_flags = false
 
+# SenseVoiceSmall FunASR -> .oasr converter. The importer takes model.safetensors
+# (from pt_to_safetensors.py) + am.mvn + config.yaml + the SentencePiece bpe
+# model; the FunASR Model License fields live in models-core.toml
+# (needs_license_flags = false, like dolphin/xasr-zipformer).
+["sensevoice-small"]
+import_subcommand = "import sensevoice"
+upstream_repo = "FunAudioLLM/SenseVoiceSmall"
+source_revision = "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7"
+needs_license_flags = false
+
 ["wespeaker-voxceleb-resnet34-lm"]
 import_subcommand = "import wespeaker"
 upstream_repo = "pyannote/wespeaker-voxceleb-resnet34-LM"

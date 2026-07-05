@@ -16,7 +16,7 @@
 OpenASR is the Apache-2.0 **open core** of a local-first STT platform: a single
 `openasr` Rust CLI, a local OpenAI-compatible HTTP API subset, a signed model
 catalog, and native [ggml](https://github.com/ggml-org/ggml)-backed inference
-across eight model families on CPU and Apple Metal.
+across nine model families on CPU and Apple Metal.
 
 <!-- TODO: demo GIF -->
 
@@ -49,7 +49,7 @@ confirmation, then everything runs offline on your hardware.
 
 ## Model support
 
-Eight native families run offline on CPU and Apple Metal, dispatched by the
+Nine native families run offline on CPU and Apple Metal, dispatched by the
 data-driven architecture registry. All families support opt-in diarization; most
 also export word-level timestamps -- the columns below show where they differ.
 

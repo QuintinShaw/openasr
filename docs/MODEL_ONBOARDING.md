@@ -12,7 +12,7 @@ a few new blocks + one step executor" is the target, not "new model = data, zero
 code". What is genuinely **data** (no new code) vs the irreducible
 **per-architecture code** is spelled out below.
 
-Eight families are onboarded today across several orchestration shapes:
+Nine families are onboarded today across several orchestration shapes:
 
 - `Seq2SeqEncoderDecoder` — Whisper (hand-written reference, the bit-identity
   regression gate), Cohere Transcribe (data-driven composer), Moonshine
