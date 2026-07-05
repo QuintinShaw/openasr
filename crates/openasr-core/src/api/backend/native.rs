@@ -67,7 +67,7 @@ pub struct NativeRuntimeModelAdapter {
 
 impl NativeRuntimeModelAdapter {
     fn new(descriptor: GgmlFamilyAdapterDescriptor, metadata: &crate::GgufMetadata) -> Self {
-        let capabilities = native_runtime_capabilities_from_metadata(metadata, &descriptor)
+        let capabilities = native_runtime_streaming_capabilities_for_descriptor(&descriptor)
             .with_phrase_bias(native_runtime_descriptor_supports_phrase_bias(&descriptor))
             .with_timestamps(true)
             .with_diarization(native_runtime_metadata_supports_diarization(
@@ -96,28 +96,28 @@ impl NativeRuntimeModelAdapter {
     }
 }
 
-fn native_runtime_capabilities_from_metadata(
-    metadata: &crate::GgufMetadata,
+fn native_runtime_streaming_capabilities_for_descriptor(
     descriptor: &GgmlFamilyAdapterDescriptor,
 ) -> NativeAsrCapabilities {
-    // Keep this as a fail-closed two-gate rollout: a pack must self-declare
-    // true streaming and the matching family executor must be registered.
-    // Keyless or un-baselined local packs stay on FilePerUtteranceFallback.
-    if native_runtime_metadata_declares_true_streaming(metadata)
-        && shared_native_ggml_streaming_execution_dispatch()
-            .is_ok_and(|dispatch| dispatch.has_streaming_executor_for(descriptor))
-    {
-        // Partial granularity is a property of the registered streaming
-        // executor, not the pack: a pack cannot self-declare frame-sync
-        // partials, so already-published packs stay accurate as the
-        // registry gains (or loses) frame-sync executors.
-        let frame_sync = shared_native_ggml_streaming_execution_dispatch()
-            .is_ok_and(|dispatch| dispatch.is_frame_sync_for(descriptor));
-        return NativeAsrCapabilities::native_true_streaming()
-            .with_partial_results(true)
-            .with_frame_sync_partials(frame_sync);
+    // Realtime cadence is descriptor/registry-driven, not pack-declared: a family
+    // gets true-streaming partials iff a streaming executor is registered for its
+    // adapter (`build_builtin_ggml_streaming_execution_dispatch`). Every builtin
+    // ASR family registers one -- the startup completeness gate there rejects any
+    // that does not -- so no real pack falls to the buffered file-per-utterance
+    // path anymore. The pack no longer needs to self-declare streaming; a stale
+    // declaration on an already-published pack is simply ignored.
+    let Ok(dispatch) = shared_native_ggml_streaming_execution_dispatch() else {
+        return NativeAsrCapabilities::native_offline();
+    };
+    if !dispatch.has_streaming_executor_for(descriptor) {
+        return NativeAsrCapabilities::native_offline();
     }
-    NativeAsrCapabilities::native_offline()
+    // Partial granularity is a property of the registered streaming executor:
+    // frame-sync (append-only, never revises) vs buffered (re-decodes a growing
+    // window). Only xasr-zipformer is frame-sync today.
+    NativeAsrCapabilities::native_true_streaming()
+        .with_partial_results(true)
+        .with_frame_sync_partials(dispatch.is_frame_sync_for(descriptor))
 }
 
 fn native_runtime_descriptor_supports_phrase_bias(

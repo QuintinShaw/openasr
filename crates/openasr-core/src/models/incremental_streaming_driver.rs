@@ -117,6 +117,15 @@ pub(crate) const STREAMING_PARTIAL_TUNING_WHISPER_SEQ2SEQ: StreamingPartialTunin
 pub(crate) const STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT: StreamingPartialTuning =
     StreamingPartialTuning::new(150, 0, None);
 
+/// Heavier snapshot families that re-decode via the full offline executor each
+/// partial (no cheap CTC greedy path), e.g. Dolphin's CTC/attention joint decode.
+/// Like the fast snapshot they carry no decode prompt (not autoregressive text
+/// continuation), but a short first-partial floor avoids paying a full joint
+/// decode over a sub-half-second window; the adaptive cadence backs the interval
+/// off further whenever a decode runs long.
+pub(crate) const STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT: StreamingPartialTuning =
+    StreamingPartialTuning::new(300, 500, None);
+
 /// Build the streaming driver for a runtime family's `start_streaming_session`.
 /// Each decode rebuilds [`GgmlAsrExecutionRequest`] from `request` plus the
 /// current audio and installs the request's thread-count override on the decode
