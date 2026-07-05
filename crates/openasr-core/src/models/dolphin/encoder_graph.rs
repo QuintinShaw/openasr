@@ -108,10 +108,31 @@ pub(crate) struct DolphinEncoderOutput {
     pub encoder_out: Vec<f32>,
 }
 
-/// Weight source keyed by the WeNet `encoder.*` tensor name, values in raw
-/// row-major f32.
+/// A rank-2 `.weight` matmul operand served in its native ggml block layout
+/// (quantized q8_0/q4_k or f16) instead of dequantized f32. `bytes` are the raw
+/// ggml row-major blocks straight from the pack mmap (no dequant); the graph
+/// binds them at `ggml_type` so the weight stays quantized in the backend buffer
+/// and is fed directly to `mul_mat` (which whitelists these lhs types).
+#[derive(Clone, Copy)]
+pub(crate) struct DolphinNativeWeight<'a> {
+    pub ggml_type: i32,
+    pub bytes: &'a [u8],
+}
+
+/// Weight source keyed by the WeNet `encoder.*`/`decoder.*`/`ctc.*` tensor name.
 pub(crate) trait DolphinWeightProvider {
+    /// Dequantized (or raw-f32) view: 1-D vectors, convs, position tables, the
+    /// decoder token embedding (get_rows), CMVN, and any rank-2 weight the
+    /// provider keeps in f32.
     fn tensor(&self, name: &str) -> Option<&[f32]>;
+
+    /// Native (quantized / f16) block bytes of a rank-2 `.weight` matmul operand,
+    /// when the provider keeps it quantized. Default `None` means every tensor is
+    /// served as f32 (the raw-safetensors parity provider), so the graph binds
+    /// f32xf32 and stays bit-exact.
+    fn native_weight(&self, _name: &str) -> Option<DolphinNativeWeight<'_>> {
+        None
+    }
 }
 
 impl DolphinWeightProvider for HashMap<String, Vec<f32>> {
@@ -196,12 +217,16 @@ struct EncoderWeights<'a> {
     after_norm_b: GgmlCpuTensor<'a>,
 }
 
-/// Pending weight upload: `(tensor, source-slice, static-label)`.
+/// Pending f32 weight upload: `(tensor, source-slice, static-label)`.
 type Upload<'a, 'p> = (GgmlCpuTensor<'a>, &'p [f32], &'static str);
+/// Pending native (quantized / f16) weight upload: `(tensor, raw-bytes,
+/// ggml-type, static-label)`.
+type NativeUpload<'a, 'p> = (GgmlCpuTensor<'a>, &'p [u8], i32, &'static str);
 
 struct WeightBuilder<'a, 'p> {
     provider: &'p dyn DolphinWeightProvider,
     uploads: Vec<Upload<'a, 'p>>,
+    native_uploads: Vec<NativeUpload<'a, 'p>>,
 }
 
 impl<'a, 'p> WeightBuilder<'a, 'p> {
@@ -209,6 +234,7 @@ impl<'a, 'p> WeightBuilder<'a, 'p> {
         Self {
             provider,
             uploads: Vec::new(),
+            native_uploads: Vec::new(),
         }
     }
 
@@ -244,9 +270,15 @@ impl<'a, 'p> WeightBuilder<'a, 'p> {
         Ok(tensor)
     }
 
-    /// A 2-D weight uploaded as ggml `[ne0=in, ne1=out]` for `mul_mat(w, x)`.
-    /// The PyTorch `Linear` weight `[out, in]` is row-major with `in` innermost,
-    /// which is exactly this ggml layout when uploaded raw.
+    /// A 2-D `.weight` matmul operand bound as ggml `[ne0=in, ne1=out]` for
+    /// `mul_mat(w, x)`. When the provider keeps this weight quantized/f16
+    /// (`native_weight`), it is bound at its stored ggml type and the raw block
+    /// bytes are uploaded verbatim -- the weight stays quantized in the backend
+    /// buffer, feeding `mul_mat`'s quantized-lhs path directly (no dequant-to-f32
+    /// blow-up). Otherwise (the raw-safetensors parity provider) it falls back to
+    /// the f32 bind. Both stored layouts (fp16's `[out, in]`, quant's reversed
+    /// `[in, out]`) share the same in-innermost byte order, so uploading raw into
+    /// the `[ne0=in, ne1=out]` graph tensor is order-preserving in either case.
     fn w2(
         &mut self,
         graph: &GgmlCpuGraphBuilder<'a>,
@@ -254,6 +286,14 @@ impl<'a, 'p> WeightBuilder<'a, 'p> {
         ne0: usize,
         ne1: usize,
     ) -> Result<GgmlCpuTensor<'a>, DolphinEncoderError> {
+        if let Some(native) = self.provider.native_weight(name) {
+            let tensor = graph
+                .new_matmul_weight_2d_typed(ne0, ne1, native.ggml_type, "dolphin_weight")
+                .map_err(ggml_err("weight_alloc_2d_native"))?;
+            self.native_uploads
+                .push((tensor, native.bytes, native.ggml_type, "dolphin_weight"));
+            return Ok(tensor);
+        }
         let data = self.fetch(name, ne0 * ne1)?;
         let tensor = graph
             .new_tensor_2d_f32(ne0, ne1, "dolphin_weight")
@@ -875,7 +915,9 @@ pub(crate) fn encode(
         graph.set_output(*tap).map_err(ggml_err("set_output"))?;
     }
 
-    // Phase C: upload inputs + weights, then compute.
+    // Phase C: upload inputs + weights, then compute. Native (quantized/f16)
+    // rank-2 `.weight` operands upload their raw block bytes verbatim so they stay
+    // quantized in the backend buffer; everything else uploads dequantized f32.
     graph
         .set_f32_slice(input, features, "dolphin_features")
         .map_err(ggml_err("upload_features"))?;
@@ -883,6 +925,11 @@ pub(crate) fn encode(
         graph
             .set_f32_slice(*tensor, data, name)
             .map_err(ggml_err("upload_weight"))?;
+    }
+    for (tensor, bytes, ggml_type, name) in &builder.native_uploads {
+        graph
+            .set_matmul_weight_bytes(*tensor, bytes, *ggml_type, name)
+            .map_err(ggml_err("upload_weight_native"))?;
     }
 
     let expected = frames * config.d_model;

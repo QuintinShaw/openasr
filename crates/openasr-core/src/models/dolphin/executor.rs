@@ -19,15 +19,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::api::backend::{Segment, Transcription};
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgufMetadata, GgufTensorDataReadError,
-    GgufTensorDataReader, RequestBackendPreference, request_backend_override,
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgufMetadata, GgufOwnedWeightTensorPayload,
+    GgufTensorDataReadError, GgufTensorDataReader, GgufWeightTensorElementType,
+    RequestBackendPreference, request_backend_override,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
 };
 
 use super::decoder_graph::DolphinDecoderConfig;
-use super::encoder_graph::{DolphinEncoderConfig, DolphinEncoderOutput, encode};
+use super::encoder_graph::{
+    DolphinEncoderConfig, DolphinEncoderOutput, DolphinNativeWeight, DolphinWeightProvider, encode,
+};
 use super::frontend::{DolphinFbankFrontend, NUM_MEL_BINS, apply_global_cmvn};
 use super::joint_decode::{DolphinJointDecodeConfig, detokenize_char_tokens, joint_decode};
 use super::language::build_dolphin_decode_prefix;
@@ -64,17 +67,56 @@ const DOLPHIN_BEAM_SIZE: usize = 10;
 /// Kept `0.0` so the runtime reproduces the golden reference decode.
 pub(crate) const DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT: f32 = 0.0;
 
-/// Load every tensor in the pack, dequantized to f32 and keyed by its exact WeNet
-/// name -- the provider shape the encoder/decoder/CTC graphs consume. Reading each
-/// tensor at its own stored dims keeps this layout-agnostic (each graph re-declares
-/// its own ggml shapes).
+/// Whether a pack tensor is a rank-2 `.weight` matmul operand that should be bound
+/// in its native (quantized / f16) ggml layout rather than dequantized to f32.
+///
+/// The quantized packs block-quantize exactly these rank-2 `.weight` matrices, and
+/// `mul_mat` runs the quantized/f16 lhs directly -- so keeping them native lets the
+/// backend buffer hold the small quantized weights (q4 < q8 < fp16 in RAM) instead
+/// of a dequantized-to-f32 blow-up. `decoder.embed.0.weight` is deliberately
+/// excluded: it is a `ggml_get_rows` operand (row lookup), which only accepts
+/// f32/f16 embeddings, so it stays f32 -- and only rank-2 `.weight` *matmul*
+/// operands go native by design.
+fn is_native_matmul_weight(name: &str, dims: &[u64]) -> bool {
+    name.ends_with(".weight") && dims.len() == 2 && name != "decoder.embed.0.weight"
+}
+
+/// Materialize one pack tensor into the pool: rank-2 `.weight` matmul operands are
+/// kept as their native (quantized / f16) mmap-backed block payload (zero-copy, no
+/// dequant); everything else (1-D norms/biases, convs, position tables, the CMVN
+/// vectors, the mel filterbank, and the decoder token embedding) is dequantized to
+/// f32. Reading each tensor at its own stored dims keeps this layout-agnostic --
+/// every graph re-declares its own ggml shapes and consumes the payload only by
+/// element/byte count.
+fn insert_pool_tensor(
+    pool: &mut DolphinRuntimeWeights,
+    reader: &GgufTensorDataReader,
+    name: &str,
+    dims: &[u64],
+) -> Result<(), GgufTensorDataReadError> {
+    if is_native_matmul_weight(name, dims) {
+        let payload = reader.owned_weight_tensor_payload_by_name(name)?;
+        if !matches!(payload.element_type, GgufWeightTensorElementType::F32) {
+            pool.native_weights.insert(name.to_string(), payload);
+            return Ok(());
+        }
+        // An f32-stored rank-2 `.weight` (not produced by the fp16/quant packs)
+        // has nothing to keep-quantize; fall through to the f32 path.
+    }
+    let values = reader.host_tensor_f32_copy_dequantized_by_name(name, dims)?;
+    pool.f32_tensors.insert(name.to_string(), values);
+    Ok(())
+}
+
+/// Load every tensor in the pack into the runtime pool (rank-2 `.weight` matmul
+/// operands kept native/quantized, the rest dequantized to f32) keyed by its exact
+/// WeNet name -- the provider shape the encoder/decoder/CTC graphs consume.
 pub(crate) fn load_dolphin_runtime_weights_from_pack(
     reader: &GgufTensorDataReader,
-) -> Result<HashMap<String, Vec<f32>>, GgufTensorDataReadError> {
-    let mut weights = HashMap::new();
+) -> Result<DolphinRuntimeWeights, GgufTensorDataReadError> {
+    let mut weights = DolphinRuntimeWeights::default();
     for tensor in reader.tensor_index().tensors() {
-        let values = reader.host_tensor_f32_copy_dequantized_by_name(&tensor.name, &tensor.dims)?;
-        weights.insert(tensor.name.clone(), values);
+        insert_pool_tensor(&mut weights, reader, &tensor.name, &tensor.dims)?;
     }
     Ok(weights)
 }
@@ -83,14 +125,13 @@ pub(crate) fn load_dolphin_runtime_weights_from_pack(
 /// path; the full transcribe path uses [`load_dolphin_runtime_weights_from_pack`]).
 pub(crate) fn load_dolphin_encoder_weights_from_pack(
     reader: &GgufTensorDataReader,
-) -> Result<HashMap<String, Vec<f32>>, GgufTensorDataReadError> {
-    let mut weights = HashMap::new();
+) -> Result<DolphinRuntimeWeights, GgufTensorDataReadError> {
+    let mut weights = DolphinRuntimeWeights::default();
     for tensor in reader.tensor_index().tensors() {
         if !tensor.name.starts_with(ENCODER_TENSOR_PREFIX) {
             continue;
         }
-        let values = reader.host_tensor_f32_copy_dequantized_by_name(&tensor.name, &tensor.dims)?;
-        weights.insert(tensor.name.clone(), values);
+        insert_pool_tensor(&mut weights, reader, &tensor.name, &tensor.dims)?;
     }
     Ok(weights)
 }
@@ -161,22 +202,46 @@ fn dolphin_runtime_backend() -> GgmlCpuGraphBackend {
     }
 }
 
-/// Dequantized runtime weights for one pack, shared behind an `Arc` so the
-/// process-level pool can hand the same immutable table to every call.
-pub(crate) type DolphinRuntimeWeights = HashMap<String, Vec<f32>>;
+/// Runtime weights for one pack, shared behind an `Arc` so the process-level pool
+/// can hand the same immutable table to every call. Rank-2 `.weight` matmul
+/// operands are held as their native (quantized / f16) mmap-backed block payload --
+/// zero-copy over the pack mmap, so the pool itself adds no per-tensor host copy
+/// for them and the quantized weight lands in the ggml backend buffer at run time.
+/// Everything else (1-D vectors, convs, position tables, CMVN, mel, the decoder
+/// token embedding) is dequantized to f32.
+#[derive(Default)]
+pub(crate) struct DolphinRuntimeWeights {
+    f32_tensors: HashMap<String, Vec<f32>>,
+    native_weights: HashMap<String, GgufOwnedWeightTensorPayload>,
+}
 
-/// Process-level pool of dequantized weights keyed by pack path. The fp16 pack is
-/// ~738 MB on disk and dequantizes to ~1.5 GB of host f32; doing that per request
-/// costs ~0.4 s (18% of the single-utterance wall on M1). Caching it lets warm
-/// calls skip the reload+dequant and reuse the same immutable table, mirroring the
-/// xasr process runtime pool. Keyed by path only: the dequantized weights are
-/// host-side f32 and backend-independent, so CPU and Metal runs share one entry.
+impl DolphinWeightProvider for DolphinRuntimeWeights {
+    fn tensor(&self, name: &str) -> Option<&[f32]> {
+        self.f32_tensors.get(name).map(Vec::as_slice)
+    }
+
+    fn native_weight(&self, name: &str) -> Option<DolphinNativeWeight<'_>> {
+        self.native_weights
+            .get(name)
+            .map(|payload| DolphinNativeWeight {
+                ggml_type: payload.element_type.ggml_type(),
+                bytes: payload.bytes(),
+            })
+    }
+}
+
+/// Process-level pool of runtime weights keyed by pack path. Building the pool
+/// (dequantizing the f32 vectors + mmapping the native weight blocks) costs ~0.4 s
+/// (18% of the single-utterance wall on M1); caching it lets warm calls skip the
+/// reload and reuse the same immutable table, mirroring the xasr process runtime
+/// pool. Keyed by path only: the native payloads carry the shared pack mmap and the
+/// f32 vectors are backend-independent, so CPU and Metal runs share one entry.
 static DOLPHIN_WEIGHTS_POOL: OnceLock<Mutex<HashMap<PathBuf, Arc<DolphinRuntimeWeights>>>> =
     OnceLock::new();
 
-/// Fetch the pack's dequantized weights from the pool, loading+dequantizing (via
-/// the already-resolved `reader`) and caching on a miss. The dequant runs outside
-/// the pool lock so concurrent first callers for distinct packs don't serialize.
+/// Fetch the pack's runtime weights from the pool, building them (via the
+/// already-resolved `reader`) and caching on a miss. The build runs outside the
+/// pool lock so concurrent first callers for distinct packs don't serialize.
 pub(crate) fn cached_dolphin_runtime_weights(
     cache_key: &Path,
     reader: &GgufTensorDataReader,
@@ -247,10 +312,10 @@ pub(crate) fn run_dolphin_pipeline(
         .compute(samples)
         .map_err(|error| format!("dolphin fbank frontend failed: {error}"))?;
     let cmvn_mean = weights
-        .get(CMVN_MEAN_TENSOR)
+        .tensor(CMVN_MEAN_TENSOR)
         .ok_or_else(|| format!("dolphin pack is missing '{CMVN_MEAN_TENSOR}'"))?;
     let cmvn_istd = weights
-        .get(CMVN_ISTD_TENSOR)
+        .tensor(CMVN_ISTD_TENSOR)
         .ok_or_else(|| format!("dolphin pack is missing '{CMVN_ISTD_TENSOR}'"))?;
     apply_global_cmvn(&mut features.data, NUM_MEL_BINS, cmvn_mean, cmvn_istd)
         .map_err(|error| format!("dolphin global CMVN failed: {error}"))?;
@@ -576,14 +641,14 @@ mod tests {
     }
 
     /// Per-quant encoder-from-pack tolerance on the scale-invariant relative max
-    /// diff of `encoder_out` vs the golden. fp16 is effectively bit-exact (the graph
-    /// itself is proven exact by `parity::dolphin_encoder_parity`; only fp16 weight
-    /// rounding through 12 E-Branchformer blocks moves it). q8_0/q4_k add per-block
-    /// weight quantization on the rank-2 projection matrices. The bounds sit a few x
-    /// above the measured relative max diff on the committed golden (fp16 ~3.0e-4,
-    /// q8_0 ~4.2e-3, q4_k ~5.4e-2; see the eprintln below), enough headroom for
-    /// thread-order jitter while an algorithmic/layout bug -- which blows the diff up
-    /// by orders of magnitude -- still trips the gate.
+    /// diff of `encoder_out` vs the golden. fp16 now binds its rank-2 `.weight`
+    /// operands as GGML_TYPE_F16 in-graph (keep-quantized), so the matmuls round
+    /// activations through f16 -- a small, deliberate lossy step above the raw-f32
+    /// bit-exact gate that stays in `parity::dolphin_encoder_parity`. q8_0/q4_k add
+    /// per-block weight quantization on those same rank-2 matrices. The bounds sit a
+    /// few x above the measured relative max diff on the committed golden (see the
+    /// eprintln), enough headroom for thread-order jitter while an algorithmic/layout
+    /// bug -- which blows the diff up by orders of magnitude -- still trips the gate.
     fn encoder_from_pack_rel_tolerance(quant: DolphinQuantizationMode) -> f32 {
         match quant {
             DolphinQuantizationMode::Fp16 => 3.0e-3,
@@ -592,13 +657,28 @@ mod tests {
         }
     }
 
+    /// Per-quant tolerance on the scale-invariant relative max diff of a quant
+    /// rung's `encoder_out` vs the **fp16-from-pack** reference (not the golden):
+    /// this is the "per-logit tolerance vs fp16" gate for the keep-quantized rungs.
+    /// q8_0 sits ~1e-2, q4_k looser; both are a few x above the measured spread.
+    fn encoder_vs_fp16_rel_tolerance(quant: DolphinQuantizationMode) -> f32 {
+        match quant {
+            DolphinQuantizationMode::Fp16 => 0.0,
+            DolphinQuantizationMode::Q8_0 => 5.0e-2,
+            DolphinQuantizationMode::Q4_K => 2.5e-1,
+        }
+    }
+
     /// Produce each `.oasr` rung (fp16/q8_0/q4_k) from the local WeNet checkpoint and
     /// assert the encoder-from-pack matches the golden `encoder_out` within that
     /// rung's tolerance. This is the convert+load gate: every rung loads, clears the
-    /// fail-closed install gate, its encoder weights bind under their WeNet names
-    /// (quantized ones via the reversed-dim dequant round-trip), and the verified
-    /// encoder graph reproduces the golden output. The f32-exact bit-level gate stays
-    /// in `parity::dolphin_encoder_parity`.
+    /// fail-closed install gate, and its encoder rank-2 `.weight` operands bind
+    /// **natively** under their WeNet names -- fp16 as GGML_TYPE_F16, q8_0/q4_k as
+    /// their reversed-dim block-quant types fed straight to `mul_mat` -- and the
+    /// verified encoder graph reproduces the golden output. Additionally gates each
+    /// quant rung's `encoder_out` against the fp16-from-pack reference (per-logit
+    /// tolerance vs fp16). The f32-exact bit-level gate stays in
+    /// `parity::dolphin_encoder_parity` (raw safetensors, f32xf32).
     ///
     /// `#[ignore]`: needs the 1.7 GB checkpoint under `tmp/publish` (never
     /// committed). Run with:
@@ -617,6 +697,9 @@ mod tests {
         let frames_in = in_shape[1];
         let (_, golden_out) = load_npy_f32(&root.join("golden/encoder_out.npy"));
 
+        // fp16-from-pack reference `encoder_out`, captured for the per-logit
+        // tolerance the quant rungs are held to.
+        let mut fp16_encoder_out: Vec<f32> = Vec::new();
         for quant in DOLPHIN_QUANT_RUNGS {
             let pack =
                 ensure_dolphin_pack(&root, quant).expect("pack builds when checkpoint present");
@@ -650,16 +733,32 @@ mod tests {
             let max = max_abs_diff(&output.encoder_out, &golden_out);
             let rel = relative_max_diff(&output.encoder_out, &golden_out);
             let tolerance = encoder_from_pack_rel_tolerance(quant);
+            let vs_fp16 = if quant == DolphinQuantizationMode::Fp16 {
+                0.0
+            } else {
+                relative_max_diff(&output.encoder_out, &fp16_encoder_out)
+            };
             eprintln!(
-                "dolphin encoder-from-pack ({}): size {:.1}MB  max abs {max:.3e}  rel {rel:.3e}  (gate {tolerance:.1e})",
+                "dolphin encoder-from-pack ({}): size {:.1}MB  max abs {max:.3e}  rel-vs-golden {rel:.3e}  (gate {tolerance:.1e})  rel-vs-fp16 {vs_fp16:.3e}  (gate {:.1e})",
                 quant.label(),
                 pack_bytes as f64 / 1.0e6,
+                encoder_vs_fp16_rel_tolerance(quant),
             );
             assert!(
                 rel < tolerance,
                 "encoder-from-pack relative max diff {rel:.3e} exceeds the {} tolerance {tolerance:.1e}",
                 quant.label()
             );
+            if quant == DolphinQuantizationMode::Fp16 {
+                fp16_encoder_out = output.encoder_out.clone();
+            } else {
+                let vs_fp16_tolerance = encoder_vs_fp16_rel_tolerance(quant);
+                assert!(
+                    vs_fp16 < vs_fp16_tolerance,
+                    "encoder-from-pack ({}) relative max diff vs fp16 {vs_fp16:.3e} exceeds {vs_fp16_tolerance:.1e}",
+                    quant.label()
+                );
+            }
         }
     }
 
@@ -670,7 +769,8 @@ mod tests {
     /// peak RSS. Never asserts a timing number (host-dependent); it only measures.
     ///
     /// Env: `OPENASR_DOLPHIN_AB_BACKEND=cpu|metal` (default cpu),
-    /// `OPENASR_DOLPHIN_AB_REUSE=0|1` (default 0 = reload+dequant each run),
+    /// `OPENASR_DOLPHIN_AB_QUANT=fp16|q8_0|q4_k` (default fp16),
+    /// `OPENASR_DOLPHIN_AB_REUSE=0|1` (default 0 = rebuild pool each run),
     /// `OPENASR_DOLPHIN_AB_RUNS=<n>` (default 3).
     #[test]
     #[ignore = "perf AB harness: requires local Dolphin checkpoint + golden clip under tmp/publish"]
@@ -678,8 +778,14 @@ mod tests {
         use std::time::{Duration, Instant};
         let root = root();
         let clip = root.join("golden/clip_sichuan.wav");
-        // Perf AB is measured on the fp16 (golden) rung.
-        let Some(pack) = ensure_dolphin_pack(&root, DolphinQuantizationMode::Fp16) else {
+        // Quant rung under test (fp16 golden by default); the driver script sweeps
+        // fp16/q8_0/q4_k so each is measured in its own process (isolated peak RSS).
+        let quant = match std::env::var("OPENASR_DOLPHIN_AB_QUANT").as_deref() {
+            Ok("q8_0") => DolphinQuantizationMode::Q8_0,
+            Ok("q4_k") => DolphinQuantizationMode::Q4_K,
+            _ => DolphinQuantizationMode::Fp16,
+        };
+        let Some(pack) = ensure_dolphin_pack(&root, quant) else {
             eprintln!("skip: dolphin checkpoint/units not present under {root:?}");
             return;
         };
@@ -712,9 +818,9 @@ mod tests {
             .max(1);
         let ctc_weight = DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT;
 
-        // Reuse == load+dequant the ~1.5 GB f32 weights once, reuse across runs
-        // (the pooled executor path). No-reuse == reload+dequant every run (the
-        // cold per-request cost). Best-of-N wall time isolates the reuse delta.
+        // Reuse == build the runtime pool once, reuse across runs (the pooled
+        // executor path). No-reuse == rebuild the pool every run (the cold
+        // per-request cost). Best-of-N wall time isolates the reuse delta.
         let preloaded =
             reuse.then(|| load_dolphin_runtime_weights_from_pack(&reader).expect("weights"));
         let mut best = Duration::MAX;
@@ -751,8 +857,9 @@ mod tests {
             .map(|bytes| bytes as f64 / 1.0e6)
             .unwrap_or(0.0);
         eprintln!(
-            "DOLPHIN_AB backend={backend:?} reuse={reuse} runs={runs} audio={audio_s:.2}s \
-             best={best:?} RTF={rtf:.3} peak_rss={peak_rss_mb:.0}MB text={text}"
+            "DOLPHIN_AB quant={} backend={backend:?} reuse={reuse} runs={runs} audio={audio_s:.2}s \
+             best={best:?} RTF={rtf:.3} peak_rss={peak_rss_mb:.0}MB text={text}",
+            quant.label()
         );
     }
 
@@ -869,11 +976,13 @@ mod tests {
         assert_eq!(output.resolved_language, "zh-sichuan");
 
         // Spot-check the quantized rungs transcribe the clip sensibly. fp16 is the
-        // bit-exact CER-0 golden above; q8_0/q4_k trade a documented dequant error
-        // for size, so they are held to a loose CER bound against the rescoring
-        // reference rather than exact equality. This proves the reversed-dim quant
-        // round-trip produces a usable transcript end-to-end (not just close encoder
-        // activations), and pins the size ordering fp16 > q8_0 > q4_k.
+        // CER-0 golden above; q8_0/q4_k keep their rank-2 `.weight` operands
+        // quantized in-graph (fed straight to `mul_mat`), trading a documented
+        // quantization error for size, so they are held to a loose CER bound against
+        // the rescoring reference rather than exact equality. This proves the
+        // keep-quantized native bind produces a usable transcript end-to-end (not
+        // just close encoder activations), and pins the size ordering
+        // fp16 > q8_0 > q4_k.
         let fp16_bytes = std::fs::metadata(&pack).expect("fp16 stat").len();
         for (quant, cer_bound) in [
             (DolphinQuantizationMode::Q8_0, 0.10_f32),

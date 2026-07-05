@@ -3575,6 +3575,46 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         )
     }
 
+    /// Upload the raw ggml block bytes of a native (quantized / f16) `mul_mat`
+    /// weight into a tensor previously allocated at `expected_ggml_type` via
+    /// [`new_matmul_weight_2d_typed`]. Unlike [`set_weight_tensor_from_payload`],
+    /// this deliberately does NOT compare the source's stored dims: keep-quantized
+    /// packs store rank-2 `.weight` matrices with reversed dims (`[in, out]`) and
+    /// fp16 packs keep the safetensors `[out, in]`, while the caller always
+    /// re-declares the graph tensor as `[ne0=in, ne1=out]`; both stored layouts are
+    /// the same in-innermost byte order, so an exact `ggml_nbytes == bytes.len()`
+    /// equality (plus the element-type match) is the sound integrity check. The
+    /// byte-for-byte upload keeps the weight quantized in the backend buffer (no
+    /// dequant-to-f32 blow-up), which is what shrinks resident memory for q8_0/q4_k.
+    pub(crate) fn set_matmul_weight_bytes(
+        &mut self,
+        tensor: GgmlCpuTensor<'a>,
+        bytes: &[u8],
+        expected_ggml_type: i32,
+        tensor_name: &'static str,
+    ) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_backend_buffer()?;
+        self.ensure_tensor_type(tensor, expected_ggml_type, "weight_upload")?;
+        let actual_nbytes = self.tensor_nbytes(tensor);
+        if actual_nbytes != bytes.len() {
+            return Err(GgmlCpuGraphError::TensorUploadByteSizeMismatch {
+                tensor: tensor_name.to_string(),
+                expected: bytes.len(),
+                actual: actual_nbytes,
+            });
+        }
+        self.ensure_tensor_contiguous(tensor, "tensor_upload")?;
+        unsafe {
+            write_tensor_data(
+                tensor.raw,
+                bytes.as_ptr().cast::<c_void>(),
+                0,
+                actual_nbytes,
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_i32_slice(
         &mut self,
         tensor: GgmlCpuTensor<'a>,

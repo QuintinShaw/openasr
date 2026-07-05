@@ -157,7 +157,12 @@ fn compute_ctc_log_probs(
     vocab: usize,
     backend: GgmlCpuGraphBackend,
 ) -> Result<Vec<f32>, DolphinJointDecodeError> {
-    let weight = fetch(provider, "ctc.ctc_lo.weight", vocab * d_model)?;
+    let native_weight = provider.native_weight("ctc.ctc_lo.weight");
+    let weight = if native_weight.is_some() {
+        None
+    } else {
+        Some(fetch(provider, "ctc.ctc_lo.weight", vocab * d_model)?)
+    };
     let bias = fetch(provider, "ctc.ctc_lo.bias", vocab)?;
 
     let graph_config = GgmlCpuGraphConfig {
@@ -174,11 +179,19 @@ fn compute_ctc_log_probs(
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml("runner_init"))?;
     let mut graph = runner.start_graph();
 
-    // Weight `[vocab, d_model]` uploads as ggml `[ne0=d_model, ne1=vocab]` so
-    // `mul_mat(weight, enc)` projects each frame to the vocab logits.
-    let weight_tensor = graph
-        .new_tensor_2d_f32(d_model, vocab, "dolphin_ctc_weight")
-        .map_err(ggml("weight_alloc"))?;
+    // Weight `[vocab, d_model]` binds as ggml `[ne0=d_model, ne1=vocab]` so
+    // `mul_mat(weight, enc)` projects each frame to the vocab logits. When the
+    // provider keeps it quantized/f16, it binds at the stored ggml type and the
+    // raw block bytes are uploaded verbatim (stays quantized in the buffer);
+    // otherwise it binds f32.
+    let weight_tensor = match native_weight {
+        Some(native) => graph
+            .new_matmul_weight_2d_typed(d_model, vocab, native.ggml_type, "dolphin_ctc_weight")
+            .map_err(ggml("weight_alloc_native"))?,
+        None => graph
+            .new_tensor_2d_f32(d_model, vocab, "dolphin_ctc_weight")
+            .map_err(ggml("weight_alloc"))?,
+    };
     let bias_tensor = graph
         .new_tensor_1d_f32(vocab, "dolphin_ctc_bias")
         .map_err(ggml("bias_alloc"))?;
@@ -194,9 +207,20 @@ fn compute_ctc_log_probs(
         .map_err(ggml("ctc_bias_add"))?;
     graph.set_output(logits).map_err(ggml("set_output"))?;
 
-    graph
-        .set_f32_slice(weight_tensor, weight, "dolphin_ctc_weight")
-        .map_err(ggml("upload_weight"))?;
+    match (native_weight, weight) {
+        (Some(native), _) => graph
+            .set_matmul_weight_bytes(
+                weight_tensor,
+                native.bytes,
+                native.ggml_type,
+                "dolphin_ctc_weight",
+            )
+            .map_err(ggml("upload_weight_native"))?,
+        (None, Some(weight)) => graph
+            .set_f32_slice(weight_tensor, weight, "dolphin_ctc_weight")
+            .map_err(ggml("upload_weight"))?,
+        (None, None) => unreachable!("ctc weight is fetched f32 when not native"),
+    }
     graph
         .set_f32_slice(bias_tensor, bias, "dolphin_ctc_bias")
         .map_err(ggml("upload_bias"))?;

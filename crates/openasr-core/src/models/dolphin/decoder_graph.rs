@@ -123,10 +123,14 @@ impl DolphinDecoderOutput {
 // --- weight upload plumbing (mirrors the encoder graph's WeightBuilder) --------
 
 type Upload<'a, 'p> = (GgmlCpuTensor<'a>, &'p [f32], &'static str);
+/// Pending native (quantized / f16) weight upload: `(tensor, raw-bytes,
+/// ggml-type, static-label)`.
+type NativeUpload<'a, 'p> = (GgmlCpuTensor<'a>, &'p [u8], i32, &'static str);
 
 struct WeightBuilder<'a, 'p> {
     provider: &'p dyn DolphinWeightProvider,
     uploads: Vec<Upload<'a, 'p>>,
+    native_uploads: Vec<NativeUpload<'a, 'p>>,
 }
 
 impl<'a, 'p> WeightBuilder<'a, 'p> {
@@ -134,6 +138,7 @@ impl<'a, 'p> WeightBuilder<'a, 'p> {
         Self {
             provider,
             uploads: Vec::new(),
+            native_uploads: Vec::new(),
         }
     }
 
@@ -169,11 +174,46 @@ impl<'a, 'p> WeightBuilder<'a, 'p> {
         Ok(tensor)
     }
 
-    /// A 2-D weight uploaded as ggml `[ne0=in, ne1=out]` for `mul_mat(w, x)`.
-    /// The PyTorch `Linear` weight `[out, in]` (and the `[vocab, d_model]` embed /
-    /// output tables) is row-major with `in` innermost, which is exactly this ggml
-    /// layout when uploaded raw.
+    /// A 2-D `.weight` matmul operand bound as ggml `[ne0=in, ne1=out]` for
+    /// `mul_mat(w, x)`. When the provider keeps this weight quantized/f16
+    /// (`native_weight`) it is bound at its stored ggml type with the raw block
+    /// bytes uploaded verbatim (stays quantized in the backend buffer, fed to
+    /// `mul_mat`'s quantized-lhs path); otherwise it falls back to the f32 bind.
+    /// NOT for the token embedding -- that is a `get_rows` operand and must stay
+    /// f32 (see [`w2_embedding`]).
     fn w2(
+        &mut self,
+        graph: &GgmlCpuGraphBuilder<'a>,
+        name: &str,
+        ne0: usize,
+        ne1: usize,
+    ) -> Result<GgmlCpuTensor<'a>, DolphinDecoderError> {
+        if let Some(native) = self.provider.native_weight(name) {
+            let tensor = graph
+                .new_matmul_weight_2d_typed(ne0, ne1, native.ggml_type, "dolphin_dec_weight")
+                .map_err(ggml_err("weight_alloc_2d_native"))?;
+            self.native_uploads.push((
+                tensor,
+                native.bytes,
+                native.ggml_type,
+                "dolphin_dec_weight",
+            ));
+            return Ok(tensor);
+        }
+        let data = self.fetch(name, ne0 * ne1)?;
+        let tensor = graph
+            .new_tensor_2d_f32(ne0, ne1, "dolphin_dec_weight")
+            .map_err(ggml_err("weight_alloc_2d"))?;
+        self.uploads.push((tensor, data, "dolphin_dec_weight"));
+        Ok(tensor)
+    }
+
+    /// The token embedding table `decoder.embed.0.weight`, always bound f32
+    /// regardless of how the pack stored it: it is consumed by `ggml_get_rows`
+    /// (row lookup), which only accepts f32/f16 embeddings, never a block-quant
+    /// tensor. Keeping it f32 also matches the invariant that only rank-2 `.weight`
+    /// *matmul* operands go native.
+    fn w2_embedding(
         &mut self,
         graph: &GgmlCpuGraphBuilder<'a>,
         name: &str,
@@ -530,7 +570,8 @@ pub(crate) fn decode_prompt_logits(
 
     // Phase A: create every weight tensor (must precede the first buffer alloc).
     let mut builder = WeightBuilder::new(provider);
-    let token_embed = builder.w2(&graph, "decoder.embed.0.weight", d, config.vocab_size)?;
+    let token_embed =
+        builder.w2_embedding(&graph, "decoder.embed.0.weight", d, config.vocab_size)?;
     let pos_emb = builder.pos_slice(
         &graph,
         "decoder.embed.1.pe",
@@ -622,6 +663,11 @@ pub(crate) fn decode_prompt_logits(
         graph
             .set_f32_slice(*tensor, data, name)
             .map_err(ggml_err("upload_weight"))?;
+    }
+    for (tensor, bytes, ggml_type, name) in &builder.native_uploads {
+        graph
+            .set_matmul_weight_bytes(*tensor, bytes, *ggml_type, name)
+            .map_err(ggml_err("upload_weight_native"))?;
     }
 
     let expected = tokens * config.vocab_size;
