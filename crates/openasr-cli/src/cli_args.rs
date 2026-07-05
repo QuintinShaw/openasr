@@ -646,6 +646,20 @@ pub(crate) enum ImportCommand {
         #[arg(long, value_enum, default_value_t = ImportParakeetQuantization::Fp16)]
         quantization: ImportParakeetQuantization,
     },
+    /// Import one local Dolphin (WeNet E-Branchformer CTC + attention) source directory into one runtime pack file (`.oasr`).
+    #[command(name = "dolphin")]
+    Dolphin {
+        /// Source directory containing full.safetensors (exported state dict, global_cmvn folded in) and units.txt.
+        source_root: PathBuf,
+        /// Output path for one runtime pack file (`.oasr`).
+        output_root: PathBuf,
+        /// Model id written to pack metadata (openasr.model.id).
+        #[arg(long)]
+        package_id: String,
+        /// Runtime tensor quantization for GGUF-backed `.oasr` output (context_module/CMVN/mel filterbank always stay f32).
+        #[arg(long, value_enum, default_value_t = ImportDolphinQuantization::Fp16)]
+        quantization: ImportDolphinQuantization,
+    },
     /// Import one local SenseVoiceSmall (FunASR SAN-M/CTC) source directory into one runtime pack file (`.oasr`).
     #[command(name = "sensevoice")]
     Sensevoice {
@@ -829,6 +843,14 @@ pub(crate) enum ImportParakeetQuantization {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[allow(non_camel_case_types)]
 pub(crate) enum ImportSensevoiceQuantization {
+    Fp16,
+    Q8_0,
+    Q4_K,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[allow(non_camel_case_types)]
+pub(crate) enum ImportDolphinQuantization {
     Fp16,
     Q8_0,
     Q4_K,

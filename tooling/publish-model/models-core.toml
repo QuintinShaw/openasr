@@ -149,13 +149,14 @@ upstream_release_date = "2026-05-13"
 min_core_version = "0.1.3"
 
 # SenseVoiceSmall (FunASR SAN-M/DFSMN encoder + CTC head): multilingual
-# zh/yue/en/ja/ko with model-side language id. NOT yet published
-# (no release_public): the entry stays on the internal lane until the user
-# authorizes the HF release. License is the FunASR Model License v1.1 --
-# a custom license permitting commercial use; never mislabel it Apache-2.0.
+# zh/yue/en/ja/ko with model-side language id. Published PUBLIC to
+# OpenASR/sensevoice-small: `release_public = true`. License is the FunASR
+# Model License v1.1 -- a custom license permitting commercial use; never
+# mislabel it Apache-2.0.
 ["sensevoice-small"]
 family = "sensevoice"
 hf_repo = "OpenASR/sensevoice-small"
+release_public = true
 aliases = ["sensevoice", "sensevoice-small"]
 pull_alias = "sensevoice"
 size = "small"
