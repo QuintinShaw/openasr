@@ -26,6 +26,7 @@ use super::encoder_weights::{
     XasrLinearWithBias,
 };
 use super::runtime_contract::XasrZipformerExecutionMetadata;
+use super::weights::StoredLinear;
 use crate::ggml_runtime::{
     GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
     GgmlPersistentGraphSession,
@@ -2032,9 +2033,9 @@ impl<'a> XasrEncoderEmbedGraphBinding<'a> {
                 weights.convnext_pointwise2.bias.len(),
                 "xasr_embed_cnx_p2_b",
             )?,
-            out_weight: graph.new_tensor_2d_f32(
-                weights.out.weight.input_dim,
-                weights.out.weight.output_dim,
+            out_weight: allocate_stored_linear_weight_tensor(
+                graph,
+                &weights.out.weight,
                 "xasr_embed_out_w",
             )?,
             out_bias: graph.new_tensor_1d_f32(weights.out.bias.len(), "xasr_embed_out_b")?,
@@ -2366,9 +2367,9 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                         &attn.in_proj,
                         "xasr_stack0_attn_in_b",
                     )?,
-                    linear_pos_weight: graph.new_tensor_2d_f32(
-                        attn.linear_pos.input_dim,
-                        attn.linear_pos.output_dim,
+                    linear_pos_weight: allocate_stored_linear_weight_tensor(
+                        graph,
+                        &attn.linear_pos,
                         "xasr_stack0_attn_pos_w",
                     )?,
                 },
@@ -2913,7 +2914,55 @@ fn allocate_linear_weight_tensor<'a>(
     weights: &XasrLinearWithBias,
     name: &'static str,
 ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
-    graph.new_tensor_2d_f32(weights.weight.input_dim, weights.weight.output_dim, name)
+    allocate_stored_linear_weight_tensor(graph, &weights.weight, name)
+}
+
+/// Allocate the ggml tensor for a rank-2 `.weight` `mul_mat` operand. When the
+/// weight carries a native (quantized / f16) payload it is allocated at that
+/// stored ggml type via `new_matmul_weight_2d_typed` -- gated to CPU-supported
+/// types for a direct GPU backend -- so the weight stays quantized in the backend
+/// buffer and feeds `mul_mat`'s quantized/f16 lhs path directly. Without a native
+/// payload (f32 test graphs / dequantized providers) it falls back to an f32
+/// tensor. The stored layout is `[ne0=in, ne1=out]` (the importer already reversed
+/// HF `[out, in]`), so the raw block bytes upload order-preserving.
+fn allocate_stored_linear_weight_tensor<'a>(
+    graph: &mut GgmlCpuGraphBuilder<'a>,
+    weight: &StoredLinear,
+    name: &'static str,
+) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+    match &weight.native {
+        Some(payload) => graph.new_matmul_weight_2d_typed(
+            weight.input_dim,
+            weight.output_dim,
+            payload.element_type.ggml_type(),
+            name,
+        ),
+        None => graph.new_tensor_2d_f32(weight.input_dim, weight.output_dim, name),
+    }
+}
+
+/// Upload a rank-2 `.weight` `mul_mat` operand. A native (quantized / f16) weight
+/// uploads its raw ggml block bytes verbatim (kept quantized in the backend
+/// buffer, no dequant-to-f32 blow-up); a dequantized weight uploads its f32
+/// `values`.
+fn upload_stored_linear_weight_tensor<'a>(
+    graph: &mut GgmlCpuGraphBuilder<'a>,
+    tensor: GgmlCpuTensor<'a>,
+    weight: &StoredLinear,
+    name: &'static str,
+) -> Result<(), XasrEncoderGraphError> {
+    match &weight.native {
+        Some(payload) => map_ggml_stage(
+            "stack0_layer_upload",
+            graph.set_matmul_weight_bytes(
+                tensor,
+                payload.bytes(),
+                payload.element_type.ggml_type(),
+                name,
+            ),
+        ),
+        None => upload_f32(graph, tensor, &weight.values, name),
+    }
 }
 
 fn allocate_linear_bias_tensor<'a>(
@@ -3086,10 +3135,10 @@ fn upload_attention_weights_tensors<'a>(
         tensors.in_proj_bias,
         &weights.in_proj,
     )?;
-    upload_f32(
+    upload_stored_linear_weight_tensor(
         graph,
         tensors.linear_pos_weight,
-        &weights.linear_pos.values,
+        &weights.linear_pos,
         "xasr_stack0_attn_pos_w",
     )
 }
@@ -3209,10 +3258,10 @@ fn upload_linear_with_bias_tensors<'a>(
     bias_tensor: GgmlCpuTensor<'a>,
     weights: &XasrLinearWithBias,
 ) -> Result<(), XasrEncoderGraphError> {
-    upload_f32(
+    upload_stored_linear_weight_tensor(
         graph,
         weight_tensor,
-        &weights.weight.values,
+        &weights.weight,
         "xasr_linear_weight",
     )?;
     upload_f32(graph, bias_tensor, &weights.bias, "xasr_linear_bias")
@@ -5250,6 +5299,7 @@ mod tests {
                     input_dim: 2432,
                     output_dim: 192,
                     values: vec![0.0; 2432 * 192],
+                    native: None,
                 },
                 bias: vec![0.0; 192],
             },
@@ -6059,6 +6109,7 @@ mod tests {
                     input_dim: DIM,
                     output_dim: HIDDEN,
                     values: in_weight_values.to_vec(),
+                    native: None,
                 },
                 bias: in_bias_values.to_vec(),
             },
@@ -6068,6 +6119,7 @@ mod tests {
                     input_dim: HIDDEN,
                     output_dim: DIM,
                     values: out_weight_values.to_vec(),
+                    native: None,
                 },
                 bias: out_bias_values.to_vec(),
             },
@@ -6402,6 +6454,7 @@ mod tests {
             input_dim: DIM,
             output_dim: OUT,
             values: weight_values.to_vec(),
+            native: None,
         };
         let mut expected = Vec::with_capacity(DIM * FRAMES);
         for frame in input_values.chunks_exact(DIM) {
@@ -6824,6 +6877,7 @@ mod tests {
                     input_dim: DIM,
                     output_dim: PROJECTED,
                     values: in_weight_values.to_vec(),
+                    native: None,
                 },
                 bias: in_bias_values.to_vec(),
             },
@@ -6854,6 +6908,7 @@ mod tests {
                     input_dim: DIM,
                     output_dim: DIM,
                     values: out_weight_values.to_vec(),
+                    native: None,
                 },
                 bias: out_bias_values.to_vec(),
             },
