@@ -1166,5 +1166,32 @@ mod tests {
             no_hotword.text, with_hotword.text,
             "the hotword must change the rescored transcript on this clip"
         );
+
+        // The quantized rungs must also load + transcribe with the hotword: this
+        // proves the keep-quantized biasing_layer/combiner weights (bound native,
+        // like every other family matmul weight) still drive a usable fused
+        // decode, not just the fp16 rung above.
+        for quant in [DolphinQuantizationMode::Q8_0, DolphinQuantizationMode::Q4_K] {
+            let qpack = ensure_dolphin_pack(&root, quant).expect("quant pack builds");
+            let qreader = GgufTensorDataReader::from_path(&qpack).expect("quant reader");
+            let qmetadata =
+                crate::ggml_runtime::read_gguf_metadata(&qpack).expect("quant metadata");
+            let qoutput = transcribe_dolphin_pcm(
+                &qreader,
+                &qmetadata,
+                &samples,
+                DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
+                GgmlCpuGraphBackend::Cpu,
+                Some("zh-sichuan"),
+                Some(&phrase_bias),
+            )
+            .expect("dolphin transcribe (quant, with hotword)");
+            eprintln!("with hotword ({}) : {}", quant.label(), qoutput.text);
+            assert!(
+                !qoutput.text.is_empty(),
+                "{} hotword transcript must not be empty",
+                quant.label()
+            );
+        }
     }
 }
