@@ -127,7 +127,7 @@ upstream_release_date = "2026-05-18"
 # (zh-sichuan, ...) as selectable source languages (see _catalog.py).
 ["dolphin-cn-dialect-small"]
 family = "dolphin"
-hf_repo = "DataoceanAI1/dolphi-cn-dialect-small"
+hf_repo = "OpenASR/dolphin-cn-dialect-small"
 aliases = ["dolphin", "dolphin-cn-dialect"]
 pull_alias = "dolphin"
 size = "small"
