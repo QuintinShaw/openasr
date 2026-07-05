@@ -5,25 +5,22 @@
 //!
 //! ```text
 //!   16 kHz mono f32
-//!     -> kaldi 80-mel fbank (25 ms window, 10 ms shift, Povey window,
-//!        pre-emphasis 0.97, remove_dc_offset, HTK mel 20..8000 Hz, snip_edges)
+//!     -> kaldi 80-mel fbank (25 ms window, 10 ms shift, Hamming window per the
+//!        checkpoint's `frontend_conf.window: hamming`, pre-emphasis 0.97,
+//!        remove_dc_offset, HTK mel 20..8000 Hz, snip_edges)
 //!     -> LFR stacking (m = 7 frames stacked, n = 6 stride)   [80 -> 560 dim]
 //!     -> CMVN normalization  (x + neg_mean) * inv_stddev     [560-dim am.mvn]
 //! ```
 //!
-//! The fbank stage is byte-for-byte the same kaldi computation the Dolphin
-//! frontend uses (both derive from `torchaudio.compliance.kaldi.fbank` at the
-//! WeNet/FunASR defaults), so its numeric behavior is exercised by the same
-//! discipline. What is *SenseVoice-specific* and owned here is the **LFR
-//! stacking** and the fact that CMVN is applied to the LFR-stacked 560-dim
-//! feature rather than the raw 80-dim mel. Both are unit-tested here with
-//! hand-computed expectations so the stacking/padding math is pinned
-//! independent of any downloaded model.
-//!
-//! Numeric parity of the *fbank window/mel* stage against reference `funasr`
-//! Python output is deferred until a converted `.oasr` pack + reference features
-//! are available (it requires the model + reference download); the structural
-//! stages (LFR geometry, CMVN affine) are verified here without weights.
+//! The fbank stage is the same kaldi computation the Dolphin frontend uses
+//! (both derive from `torchaudio.compliance.kaldi.fbank`), differing only in
+//! the window function: SenseVoice's checkpoint pins `window: hamming` where
+//! WeNet/Dolphin uses the Povey default. What is *SenseVoice-specific* and
+//! owned here is the **LFR stacking** and the fact that CMVN is applied to the
+//! LFR-stacked 560-dim feature rather than the raw 80-dim mel. LFR geometry and
+//! the CMVN affine are unit-tested with hand-computed expectations; fbank+LFR
+//! numeric parity is measured against reference FunASR features (see the
+//! onboarding notes for the recorded max-abs-error).
 
 #![allow(dead_code)]
 
@@ -121,10 +118,11 @@ impl SenseVoiceFbankFrontend {
     pub(crate) fn new() -> Self {
         let mut window = [0.0f32; FRAME_LENGTH];
         for (n, w) in window.iter_mut().enumerate() {
-            // Povey window: a Hann raised to 0.85 (kaldi/torchaudio default).
-            let hann = 0.5
-                - 0.5 * (2.0 * std::f32::consts::PI * n as f32 / (FRAME_LENGTH as f32 - 1.0)).cos();
-            *w = hann.powf(0.85);
+            // Kaldi Hamming window (the checkpoint's `frontend_conf.window:
+            // hamming`): 0.54 - 0.46 cos(2*pi*n / (N-1)).
+            *w = 0.54
+                - 0.46
+                    * (2.0 * std::f32::consts::PI * n as f32 / (FRAME_LENGTH as f32 - 1.0)).cos();
         }
         Self {
             window,
@@ -173,7 +171,7 @@ impl SenseVoiceFbankFrontend {
                 frame[i] -= PREEMPH_COEFF * frame[i - 1];
             }
             frame[0] -= PREEMPH_COEFF * frame[0];
-            // Povey window into the zero-padded FFT input.
+            // Hamming window into the zero-padded FFT input.
             fft_in.fill(0.0);
             for (slot, (sample, w)) in fft_in.iter_mut().zip(frame.iter().zip(self.window.iter())) {
                 *slot = *sample * *w;
@@ -203,11 +201,12 @@ impl SenseVoiceFbankFrontend {
 /// row-major features, producing `[ceil(n_frames / LFR_N), feature_dim * LFR_M]`.
 ///
 /// Matches FunASR's `apply_lfr(inputs, lfr_m, lfr_n)`:
+/// - the output frame count is `ceil(n_frames / LFR_N)` computed from the
+///   *original* (pre-padding) frame count,
 /// - left-pad `(LFR_M - 1) / 2` copies of the *first* frame,
-/// - emit `ceil(n_frames / LFR_N)` output frames; output `i` concatenates frames
-///   `[i*LFR_N, i*LFR_N + LFR_M)` of the padded input,
-/// - the final output frame, if it runs past the end, is padded by repeating the
-///   *last* input frame until it holds `LFR_M` frames.
+/// - output `i` concatenates frames `[i*LFR_N, i*LFR_N + LFR_M)` of the padded
+///   input; if it runs past the padded end, it repeats the *last* input frame
+///   until it holds `LFR_M` frames.
 pub(crate) fn apply_lfr(
     features: &[f32],
     feature_dim: usize,
@@ -239,7 +238,9 @@ pub(crate) fn apply_lfr(
         }
     };
 
-    let out_frames = padded_len.div_ceil(LFR_N);
+    // FunASR sizes the output from the ORIGINAL frame count (before the left
+    // padding is prepended), not the padded length.
+    let out_frames = n_frames.div_ceil(LFR_N);
     let out_dim = feature_dim * LFR_M;
     let mut out = vec![0.0f32; out_frames * out_dim];
     for i in 0..out_frames {
@@ -387,8 +388,9 @@ mod tests {
         }
         let lfr = apply_lfr(&feats, feature_dim).expect("lfr");
         assert_eq!(lfr.feature_dim, feature_dim * LFR_M); // 14
-        // padded_len = 5 + 3 = 8; out_frames = ceil(8 / 6) = 2.
-        assert_eq!(lfr.n_frames, 2);
+        // out_frames = ceil(ORIGINAL 5 / 6) = 1 (FunASR sizes from the
+        // pre-padding count, NOT the padded length 8).
+        assert_eq!(lfr.n_frames, 1);
 
         // Padded frame sequence (by original index, clamped):
         //   [0, 0, 0, 0, 1, 2, 3, 4]  (3 left-pad copies of frame 0)
@@ -399,26 +401,31 @@ mod tests {
             .flat_map(|&k| [k as f32, k as f32 + 100.0])
             .collect();
         assert_eq!(out0, expect0.as_slice());
+    }
 
-        // Output 1: base = 6, padded[6..13]; padded has 8 entries [0..8), so
-        //   padded[6]=frame3, padded[7]=frame4, then indices 8..12 run past the
-        //   padded end and repeat the LAST real frame (frame 4).
-        let out1 = &lfr.data[lfr.feature_dim..2 * lfr.feature_dim];
-        let expect1: Vec<f32> = [3, 4, 4, 4, 4, 4, 4]
-            .iter()
-            .flat_map(|&k| [k as f32, k as f32 + 100.0])
-            .collect();
-        assert_eq!(out1, expect1.as_slice());
+    /// A 13-frame input exercises the tail-padding path: out = ceil(13/6) = 3,
+    /// and output 2 (base 12) runs past the padded end (16), repeating frame 12.
+    #[test]
+    fn lfr_tail_frame_repeats_last_input_frame() {
+        let feature_dim = 1usize;
+        let feats: Vec<f32> = (0..13).map(|k| k as f32).collect();
+        let lfr = apply_lfr(&feats, feature_dim).expect("lfr");
+        assert_eq!(lfr.n_frames, 3);
+        // padded = [0,0,0, 0..12] (16 entries).
+        assert_eq!(&lfr.data[0..7], &[0., 0., 0., 0., 1., 2., 3.]);
+        assert_eq!(&lfr.data[7..14], &[3., 4., 5., 6., 7., 8., 9.]);
+        // base 12: padded[12..16] = frames 9,10,11,12 then repeat frame 12.
+        assert_eq!(&lfr.data[14..21], &[9., 10., 11., 12., 12., 12., 12.]);
     }
 
     #[test]
     fn lfr_output_dim_is_560_for_80_mel() {
-        // 60 fbank frames of 80-mel -> stacked 560-dim; out frames = ceil(63/6).
+        // 60 fbank frames of 80-mel -> stacked 560-dim; out frames = ceil(60/6).
         let feats = vec![0.5f32; 60 * NUM_MEL_BINS];
         let lfr = apply_lfr(&feats, NUM_MEL_BINS).expect("lfr");
         assert_eq!(lfr.feature_dim, LFR_FEATURE_DIM);
         assert_eq!(lfr.feature_dim, 560);
-        assert_eq!(lfr.n_frames, (60 + 3usize).div_ceil(LFR_N));
+        assert_eq!(lfr.n_frames, 60usize.div_ceil(LFR_N));
         assert_eq!(lfr.data.len(), lfr.n_frames * 560);
     }
 
@@ -435,6 +442,76 @@ mod tests {
     fn cmvn_rejects_mismatched_vector() {
         let mut feats = vec![0.0; 4];
         assert!(apply_cmvn(&mut feats, 2, &[0.0], &[1.0, 1.0]).is_err());
+    }
+
+    /// Offline parity harness against reference FunASR/torchaudio features.
+    /// Ignored by default (requires locally generated reference files); run as:
+    ///
+    /// ```text
+    /// SENSEVOICE_PARITY_DIR=/path/to/refs \
+    ///   cargo test -p openasr-core sensevoice_frontend_parity -- --ignored --nocapture
+    /// ```
+    ///
+    /// The directory must hold `jfk_samples_f32.bin` (16 kHz mono f32 PCM),
+    /// `jfk_fbank_ref.bin` ([T, 80] f32), `jfk_lfr_cmvn_ref.bin` ([T', 560] f32),
+    /// `cmvn_neg_mean.bin` + `cmvn_istd.bin` (560 f32 each), all little-endian,
+    /// produced by `torchaudio.compliance.kaldi.fbank(window_type="hamming",
+    /// dither=0)` + FunASR `apply_lfr(7, 6)` + the checkpoint's `am.mvn`.
+    #[test]
+    #[ignore = "requires SENSEVOICE_PARITY_DIR with locally generated reference features"]
+    fn sensevoice_frontend_parity_vs_reference() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("SENSEVOICE_PARITY_DIR").expect("SENSEVOICE_PARITY_DIR must be set"),
+        );
+        let read_f32 = |name: &str| -> Vec<f32> {
+            let bytes =
+                std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("read {name}: {e}"));
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let samples = read_f32("jfk_samples_f32.bin");
+        let fbank_ref = read_f32("jfk_fbank_ref.bin");
+        let lfr_cmvn_ref = read_f32("jfk_lfr_cmvn_ref.bin");
+        let neg_mean = read_f32("cmvn_neg_mean.bin");
+        let istd = read_f32("cmvn_istd.bin");
+
+        let fbank = SenseVoiceFbankFrontend::new()
+            .compute(&samples)
+            .expect("fbank");
+        assert_eq!(
+            fbank.data.len(),
+            fbank_ref.len(),
+            "fbank frame count mismatch: rust {} vs ref {}",
+            fbank.n_frames,
+            fbank_ref.len() / NUM_MEL_BINS
+        );
+        let fbank_err = fbank
+            .data
+            .iter()
+            .zip(&fbank_ref)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        let mut lfr = apply_lfr(&fbank.data, fbank.n_mels).expect("lfr");
+        apply_cmvn(&mut lfr.data, lfr.feature_dim, &neg_mean, &istd).expect("cmvn");
+        assert_eq!(
+            lfr.data.len(),
+            lfr_cmvn_ref.len(),
+            "lfr+cmvn shape mismatch"
+        );
+        let lfr_err = lfr
+            .data
+            .iter()
+            .zip(&lfr_cmvn_ref)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        println!("sensevoice frontend parity: fbank max-abs-err = {fbank_err:e}");
+        println!("sensevoice frontend parity: lfr+cmvn max-abs-err = {lfr_err:e}");
+        assert!(fbank_err < 2e-3, "fbank parity too loose: {fbank_err}");
+        assert!(lfr_err < 1e-3, "lfr+cmvn parity too loose: {lfr_err}");
     }
 
     #[test]
