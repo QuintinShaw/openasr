@@ -164,6 +164,28 @@ pub struct ModelCatalog {
     /// drift gates stay green.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backends: Vec<CatalogBackend>,
+    /// Curated display labels for language/dialect recognition codes, keyed by
+    /// the exact code a model advertises in `languages` (e.g. `zh-sichuan`).
+    /// Carried as signed catalog DATA so app surfaces -- including the web app,
+    /// which has no `@openasr/shared` dependency -- can render an advertised code
+    /// without re-deriving its name. The single source of truth is
+    /// `crate::models::language::language_display_label`; a drift test pins the
+    /// emitted map back to it (like the canonical quant-tag contract) so Rust and
+    /// the catalog cannot disagree. `skip_serializing_if` keeps a label-less
+    /// catalog byte-identical while empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub language_labels: BTreeMap<String, CatalogLanguageLabel>,
+}
+
+/// A localized display label for one language/dialect recognition code in the
+/// signed catalog's `language_labels` map. Mirrors
+/// `crate::models::language::LanguageDisplayLabel` on the wire (English plus a
+/// Simplified-Chinese `zh-CN` name) and is pinned to it by a drift test.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogLanguageLabel {
+    pub en: String,
+    #[serde(rename = "zh-CN")]
+    pub zh_cn: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -104,6 +104,12 @@ projection = {
     "catalog_url": catalog["catalog_url"],
     "models": public_models,
 }
+# The curated language/dialect label map is display DATA the served/embedded
+# public catalog needs too (app surfaces read it to name advertised codes), so
+# carry it into the projection verbatim when present.
+language_labels = catalog.get("language_labels")
+if language_labels:
+    projection["language_labels"] = language_labels
 target.write_text(json.dumps(projection, indent=2, sort_keys=False) + "\n")
 print(len(public_models))
 PY

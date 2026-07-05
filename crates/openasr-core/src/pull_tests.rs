@@ -266,6 +266,7 @@ fn catalog_for_resolved(resolved: &ResolvedCatalogPull) -> ModelCatalog {
         generated_at: "2026-06-08T00:00:00Z".to_string(),
         catalog_url: "fixture".to_string(),
         backends: Vec::new(),
+        language_labels: std::collections::BTreeMap::new(),
         models: vec![CatalogModel {
             id: resolved.model_id.clone(),
             kind: CatalogModelKind::AsrModel,
@@ -1747,6 +1748,7 @@ fn installed_pack_alias_catalog() -> ModelCatalog {
         generated_at: "2026-06-04T00:00:00Z".to_string(),
         catalog_url: "fixture".to_string(),
         backends: Vec::new(),
+        language_labels: std::collections::BTreeMap::new(),
         models: vec![CatalogModel {
             id: "qwen3-asr-0.6b".to_string(),
             kind: CatalogModelKind::AsrModel,

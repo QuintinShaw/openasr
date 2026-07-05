@@ -88,6 +88,57 @@ fn public_catalog_projection_signature_verifies_and_excludes_private_entries() {
     );
 }
 
+/// Python<->Rust drift contract for the signed catalog's `language_labels` map
+/// (design (c), analogous to the canonical quant-tag contract). The Python
+/// emitter in tooling/publish-model/scripts/_catalog.py writes the map into the
+/// committed catalog; this pins every emitted entry back to
+/// `language_display_label`, and requires exactly the curated code set (the
+/// Sinitic base codes plus every registered dialect code) so neither side can
+/// add, drop, or misspell a label without the other.
+#[test]
+fn bundled_catalog_language_labels_match_rust_display_table() {
+    use crate::models::language::{REGISTERED_DIALECT_CODES, language_display_label};
+
+    let catalog = bundled_catalog();
+    let labels = &catalog.language_labels;
+
+    // Exactly the curated set: Sinitic base codes + every registered dialect.
+    let mut expected_codes: Vec<String> = vec!["zh".into(), "yue".into(), "wuu".into()];
+    expected_codes.extend(REGISTERED_DIALECT_CODES.iter().map(|code| code.to_string()));
+    expected_codes.sort_unstable();
+    expected_codes.dedup();
+    let mut got_codes: Vec<String> = labels.keys().cloned().collect();
+    got_codes.sort_unstable();
+    assert_eq!(
+        got_codes, expected_codes,
+        "catalog language_labels code set drifted from the curated display table"
+    );
+
+    // Every emitted label must equal the Rust source of truth verbatim.
+    for code in &expected_codes {
+        let source = language_display_label(code)
+            .unwrap_or_else(|| panic!("curated code '{code}' has no language_display_label"));
+        let label = &labels[code];
+        assert_eq!(
+            label.en, source.en,
+            "catalog language_labels['{code}'].en drifted from language_display_label"
+        );
+        assert_eq!(
+            label.zh_cn, source.zh_cn,
+            "catalog language_labels['{code}'].zh_cn drifted from language_display_label"
+        );
+    }
+
+    // The public projection the binary embeds must carry the identical map.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry");
+    let public_contents = fs::read_to_string(root.join("catalog.public.json")).unwrap();
+    let public = parse_model_catalog(&public_contents, "public-projection").unwrap();
+    assert_eq!(
+        public.language_labels, catalog.language_labels,
+        "public projection language_labels drifted from the full catalog; re-run the catalog publish"
+    );
+}
+
 #[test]
 fn loads_toml_model_cards_sorted_by_id() {
     let temp = tempfile::tempdir().unwrap();

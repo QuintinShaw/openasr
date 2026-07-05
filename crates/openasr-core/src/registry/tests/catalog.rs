@@ -111,6 +111,7 @@ fn alias_contract_catalog() -> ModelCatalog {
         generated_at: "2026-06-04T00:00:00Z".to_string(),
         catalog_url: "fixture".to_string(),
         backends: Vec::new(),
+        language_labels: std::collections::BTreeMap::new(),
         models: vec![
             alias_contract_model(
                 "qwen3-asr-0.6b",

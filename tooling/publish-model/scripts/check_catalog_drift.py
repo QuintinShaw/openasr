@@ -18,6 +18,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from _catalog import (  # noqa: E402
     QUANT_METADATA,
+    language_labels_wire,
     language_mode_for_model,
     languages_for_model,
     load as load_publish_catalog,
@@ -188,6 +189,19 @@ def main(argv: list[str]) -> int:
         translated_cards = validate_all_card_prose_locales()
     except KeyError as error:
         errors.append(str(error))
+
+    # The signed catalog's top-level language/dialect label map is generated
+    # data (source = _catalog.LANGUAGE_DISPLAY_LABELS, itself pinned to Rust's
+    # language_display_label by a drift test). A hand-edit or a stale map that
+    # no longer matches the Python source fails the drift gate loudly. Only
+    # checked once a language_labels map exists so a label-less catalog is fine.
+    expected_language_labels = language_labels_wire()
+    actual_language_labels = machine_catalog.get("language_labels")
+    if actual_language_labels is not None and actual_language_labels != expected_language_labels:
+        errors.append(
+            "catalog language_labels drifted from _catalog.LANGUAGE_DISPLAY_LABELS "
+            "(re-run: _catalog.py write-language-labels model-registry/catalog.json)"
+        )
     for model in selected:
         entry = publish_catalog[model]
         machine_model = machine_by_id.get(entry["registry_id"])

@@ -277,6 +277,7 @@ mod tests {
             generated_at: "2026-01-01T00:00:00Z".to_string(),
             catalog_url: "https://example.test/catalog.json".to_string(),
             backends: Vec::new(),
+            language_labels: std::collections::BTreeMap::new(),
             models: vec![CatalogModel {
                 id: "qwen3-asr-0.6b".to_string(),
                 kind: CatalogModelKind::AsrModel,

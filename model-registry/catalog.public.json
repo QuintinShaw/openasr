@@ -2349,5 +2349,71 @@
       },
       "upstream_release_date": "2022-07-24"
     }
-  ]
+  ],
+  "language_labels": {
+    "wuu": {
+      "en": "Wu Chinese",
+      "zh-CN": "\u5434\u8bed"
+    },
+    "yue": {
+      "en": "Cantonese",
+      "zh-CN": "\u7ca4\u8bed"
+    },
+    "zh": {
+      "en": "Chinese",
+      "zh-CN": "\u4e2d\u6587"
+    },
+    "zh-anhui": {
+      "en": "Chinese (Anhui)",
+      "zh-CN": "\u4e2d\u6587\uff08\u5b89\u5fbd\u8bdd\uff09"
+    },
+    "zh-guangdong": {
+      "en": "Chinese (Guangdong)",
+      "zh-CN": "\u4e2d\u6587\uff08\u5e7f\u4e1c\u8bdd\uff09"
+    },
+    "zh-hebei": {
+      "en": "Chinese (Hebei)",
+      "zh-CN": "\u4e2d\u6587\uff08\u6cb3\u5317\u8bdd\uff09"
+    },
+    "zh-hubei": {
+      "en": "Chinese (Hubei)",
+      "zh-CN": "\u4e2d\u6587\uff08\u6e56\u5317\u8bdd\uff09"
+    },
+    "zh-jiangsu": {
+      "en": "Chinese (Jiangsu)",
+      "zh-CN": "\u4e2d\u6587\uff08\u6c5f\u82cf\u8bdd\uff09"
+    },
+    "zh-ningxia": {
+      "en": "Chinese (Ningxia)",
+      "zh-CN": "\u4e2d\u6587\uff08\u5b81\u590f\u8bdd\uff09"
+    },
+    "zh-shaanxi": {
+      "en": "Chinese (Shaanxi)",
+      "zh-CN": "\u4e2d\u6587\uff08\u9655\u897f\u8bdd\uff09"
+    },
+    "zh-shandong": {
+      "en": "Chinese (Shandong)",
+      "zh-CN": "\u4e2d\u6587\uff08\u5c71\u4e1c\u8bdd\uff09"
+    },
+    "zh-shanghai": {
+      "en": "Chinese (Shanghainese)",
+      "zh-CN": "\u4e2d\u6587\uff08\u4e0a\u6d77\u8bdd\uff09"
+    },
+    "zh-shanxi": {
+      "en": "Chinese (Shanxi)",
+      "zh-CN": "\u4e2d\u6587\uff08\u5c71\u897f\u8bdd\uff09"
+    },
+    "zh-sichuan": {
+      "en": "Chinese (Sichuanese)",
+      "zh-CN": "\u4e2d\u6587\uff08\u56db\u5ddd\u8bdd\uff09"
+    },
+    "zh-tianjin": {
+      "en": "Chinese (Tianjin)",
+      "zh-CN": "\u4e2d\u6587\uff08\u5929\u6d25\u8bdd\uff09"
+    },
+    "zh-tw": {
+      "en": "Chinese (Taiwan)",
+      "zh-CN": "\u4e2d\u6587\uff08\u53f0\u6e7e\uff09"
+    }
+  }
 }

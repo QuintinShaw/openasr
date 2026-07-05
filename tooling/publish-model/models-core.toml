@@ -120,8 +120,11 @@ upstream_release_date = "2026-05-18"
 # NOT yet written into the signed catalog.json (no OpenASR HF pack uploaded).
 # `hf_repo` points at the upstream repo until the .oasr pack is published to an
 # OpenASR-owned repo; `release_public` is intentionally omitted so the entry
-# cannot be flipped public before that upload. Mandarin + 22 Chinese dialects
-# (Sichuan, Wu, Minnan, ...) all collapse into the single language `zh`.
+# cannot be flipped public before that upload. Dolphin is dialect-capable (its
+# executor ships a code->region-prompt map), so unlike other Chinese models it
+# does NOT collapse regional dialects into a single `zh`: LANG_BY_FAMILY["dolphin"]
+# advertises the base `zh` plus the registered province dialect codes
+# (zh-sichuan, ...) as selectable source languages (see _catalog.py).
 ["dolphin-cn-dialect-small"]
 family = "dolphin"
 hf_repo = "DataoceanAI1/dolphi-cn-dialect-small"
@@ -133,7 +136,7 @@ display_name = "Dolphin CN-Dialect Small"
 license_name = "Apache-2.0"
 license_source = "https://huggingface.co/DataoceanAI1/dolphi-cn-dialect-small/blob/main/README.md"
 license_class = "permissive"
-quants = ["fp16"]
+quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "fp16"
 upstream_release_date = "2025-05-13"
 

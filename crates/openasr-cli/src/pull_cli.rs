@@ -347,6 +347,7 @@ mod tests {
             generated_at: "2026-06-11T00:00:00Z".to_string(),
             catalog_url: "fixture".to_string(),
             backends: Vec::new(),
+            language_labels: std::collections::BTreeMap::new(),
             models: vec![
                 catalog_model("moonshine-tiny", openasr_core::CatalogModelKind::AsrModel),
                 catalog_model(
@@ -375,6 +376,7 @@ mod tests {
             generated_at: "2026-06-11T00:00:00Z".to_string(),
             catalog_url: "fixture".to_string(),
             backends: Vec::new(),
+            language_labels: std::collections::BTreeMap::new(),
             models: vec![
                 catalog_model(
                     "wespeaker-voxceleb-resnet34-lm",
