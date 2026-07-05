@@ -237,6 +237,17 @@ pub struct CatalogModel {
     #[serde(default)]
     pub public: bool,
     pub min_cli_version: String,
+    // Optional, author-set (tooling/publish-model/models-core.toml) minimum core
+    // RUNTIME version this model needs -- distinct from the publish-time
+    // `min_cli_version` floor. A model forward-published before the running build
+    // can execute its family (e.g. a new decoder path) sets this so a too-old
+    // build gates it exactly like a too-new `min_cli_version`: surfaced as
+    // "update to use" and refused at pull time, never hidden or fail-the-catalog
+    // (see `availability`). Nullable; only serialized when set so unconstrained
+    // models keep the Rust-side serde default (None) and the signed catalog stays
+    // byte-identical while empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_core_version: Option<String>,
     // Denormalized signed-catalog wire fields derived from
     // tooling/publish-model/models-core.toml:recommended_quant. Keep all three:
     // Rust pull defaults consume recommended_quant, web/desktop use
@@ -356,26 +367,40 @@ impl CatalogModel {
             )
     }
 
-    /// Classify this model against the running build's version. A malformed
-    /// `min_cli_version` (already rejected at catalog-validation time) is treated
-    /// leniently here as [`ModelAvailability::Available`].
+    /// Classify this model against the running build's version. The build must
+    /// clear BOTH version floors the model declares: the publish-time
+    /// `min_cli_version` and, when present, the author-set `min_core_version`
+    /// runtime floor. The higher of the two unmet floors is reported as the
+    /// version to update to. A malformed floor (already rejected at
+    /// catalog-validation time) is treated leniently here as satisfied.
     ///
     /// Consumers: the pull path uses this in-repo to refuse a too-new model
     /// (`resolve_catalog_pull_with_profile`). The *listing* consumer — the model
     /// market that shows a too-new model with an "update to use" badge rather than
-    /// hiding it — is the desktop/web app; it reads this
-    /// classifier (or recomputes from the serialized `min_cli_version`). The
-    /// catalog itself always loads regardless, so the app receives every model.
+    /// hiding it — is the desktop/web app; it reads this classifier (or recomputes
+    /// from the serialized `min_cli_version` / `min_core_version`). The catalog
+    /// itself always loads regardless, so the app receives every model.
     pub fn availability(&self) -> ModelAvailability {
-        match (
-            parse_semver_triplet(&self.min_cli_version),
-            parse_semver_triplet(current_cli_version()),
-        ) {
-            (Some(min), Some(current)) if current < min => ModelAvailability::RequiresUpdate {
-                min_cli_version: self.min_cli_version.clone(),
+        let Some(current) = parse_semver_triplet(current_cli_version()) else {
+            return ModelAvailability::Available;
+        };
+        // Both floors feed one "you need >= X" answer: keep only the unmet floors
+        // and report whichever is highest as the version to update to.
+        let unmet = [
+            Some(self.min_cli_version.as_str()),
+            self.min_core_version.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|raw| parse_semver_triplet(raw).map(|parsed| (parsed, raw)))
+        .filter(|(parsed, _)| current < *parsed)
+        .max_by(|left, right| left.0.cmp(&right.0));
+        match unmet {
+            Some((_, required)) => ModelAvailability::RequiresUpdate {
+                min_cli_version: required.to_string(),
                 current_cli_version: current_cli_version().to_string(),
             },
-            _ => ModelAvailability::Available,
+            None => ModelAvailability::Available,
         }
     }
 }
@@ -1334,6 +1359,7 @@ fn validate_model_catalog(catalog: &ModelCatalog) -> Result<(), CatalogError> {
         validate_catalog_model_kind(model)?;
         validate_catalog_hf_repo(model)?;
         validate_catalog_min_cli_version_format(model)?;
+        validate_catalog_min_core_version_format(model)?;
         if model.hf_revision.len() != 40
             || !model
                 .hf_revision
@@ -1733,6 +1759,24 @@ fn validate_catalog_min_cli_version_format(model: &CatalogModel) -> Result<(), C
     if parse_semver_triplet(&model.min_cli_version).is_none() {
         return Err(CatalogError::InvalidCatalog(format!(
             "model '{}' min_cli_version must use major.minor.patch",
+            model.id
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the optional `min_core_version` gate is well-formed
+/// (major.minor.patch) when present. Like `min_cli_version`, the version
+/// *comparison* is intentionally NOT enforced here: a model requiring a newer
+/// core runtime than the running build must still load so the market can list it
+/// as "update to use" (see [`CatalogModel::availability`]); it is refused only at
+/// pull time, never hidden or fail-the-catalog. Absent means "no constraint".
+fn validate_catalog_min_core_version_format(model: &CatalogModel) -> Result<(), CatalogError> {
+    if let Some(min_core_version) = &model.min_core_version
+        && parse_semver_triplet(min_core_version).is_none()
+    {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "model '{}' min_core_version must use major.minor.patch",
             model.id
         )));
     }

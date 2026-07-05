@@ -52,6 +52,7 @@ fn catalog_model(id: &str, family: &str, aliases: &[&str], size: &str) -> ModelC
             hf_revision: revision.to_string(),
             public: true,
             min_cli_version: "0.1.0".to_string(),
+            min_core_version: None,
             recommended_quant: "q8_0".to_string(),
             pull_recommended: format!("{id}:q8"),
             sort_weight: 0,

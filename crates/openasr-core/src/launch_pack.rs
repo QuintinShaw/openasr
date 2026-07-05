@@ -301,6 +301,7 @@ mod tests {
                 hf_revision: "rev".to_string(),
                 public: true,
                 min_cli_version: "0.0.0".to_string(),
+                min_core_version: None,
                 recommended_quant: "q8_0".to_string(),
                 pull_recommended: "qwen3-asr-0.6b:q8".to_string(),
                 sort_weight: 0,

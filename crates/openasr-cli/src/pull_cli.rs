@@ -329,6 +329,7 @@ mod tests {
             hf_revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
             public: true,
             min_cli_version: "0.1.0".to_string(),
+            min_core_version: None,
             recommended_quant: "q8_0".to_string(),
             pull_recommended: format!("{id}:q8"),
             sort_weight: 0,

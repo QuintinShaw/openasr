@@ -258,6 +258,7 @@ def build_catalog_model(model: str, entry: dict, args: argparse.Namespace) -> di
         "upstream_gguf_revision",
         "license_files",
         "upstream_release_date",
+        "min_core_version",
     ):
         if key in entry:
             model_entry[key] = entry[key]
