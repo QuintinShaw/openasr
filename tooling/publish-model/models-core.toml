@@ -116,18 +116,18 @@ recommended = true
 upstream_release_date = "2026-05-18"
 
 # Dolphin cn-dialect small (WeNet E-Branchformer, CTC + attention rescoring).
-# STAGED / pre-upload: this entry lives in the publish source + card only and is
-# NOT yet written into the signed catalog.json (no OpenASR HF pack uploaded).
-# `hf_repo` points at the upstream repo until the .oasr pack is published to an
-# OpenASR-owned repo; `release_public` is intentionally omitted so the entry
-# cannot be flipped public before that upload. Dolphin is dialect-capable (its
-# executor ships a code->region-prompt map), so unlike other Chinese models it
-# does NOT collapse regional dialects into a single `zh`: LANG_BY_FAMILY["dolphin"]
-# advertises the base `zh` plus the registered province dialect codes
-# (zh-sichuan, ...) as selectable source languages (see _catalog.py).
+# Published PUBLIC to OpenASR/dolphin-cn-dialect-small: `release_public = true`
+# routes the publish lane to a public HF repo and lets --public run the
+# fail-closed public-listing gate and write the signed catalog.json entry,
+# pinned to the immutable HF revision + per-pack sha256. Dolphin is
+# dialect-capable (its executor ships a code->region-prompt map), so unlike other
+# Chinese models it does NOT collapse regional dialects into a single `zh`:
+# LANG_BY_FAMILY["dolphin"] advertises the base `zh` plus the registered province
+# dialect codes (zh-sichuan, ...) as selectable source languages (see _catalog.py).
 ["dolphin-cn-dialect-small"]
 family = "dolphin"
 hf_repo = "OpenASR/dolphin-cn-dialect-small"
+release_public = true
 aliases = ["dolphin", "dolphin-cn-dialect"]
 pull_alias = "dolphin"
 size = "small"
@@ -138,7 +138,9 @@ license_source = "https://huggingface.co/DataoceanAI1/dolphi-cn-dialect-small/bl
 license_class = "permissive"
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "fp16"
-upstream_release_date = "2025-05-13"
+sort_weight = 905
+recommended = true
+upstream_release_date = "2026-05-13"
 
 # Diarization support packs: not ASR models. Published support packs keep their
 # catalog-declared variants. Speaker embedding/segmentation are

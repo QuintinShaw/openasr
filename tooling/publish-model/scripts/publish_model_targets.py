@@ -50,6 +50,7 @@ RELEASE_LANE_MODELS = (
     "moonshine-tiny",
     "xasr-zh-en",
     "cohere-transcribe-03-2026",
+    "dolphin-cn-dialect-small",
     "whisper-small",
     "whisper-large-v3-turbo",
     "whisper-tiny",

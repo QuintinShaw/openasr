@@ -187,6 +187,7 @@ fn bundled_registry_ordering_is_deterministic() {
         vec![
             "qwen3-asr-0.6b",
             "cohere-transcribe-03-2026",
+            "dolphin-cn-dialect-small",
             "hymt2-1.8b",
             "moonshine-tiny",
             "pyannote-segmentation-3.0",
@@ -264,6 +265,7 @@ fn bundled_catalog_public_ids_match_current_signed_release_projection() {
         public_ids,
         vec![
             "cohere-transcribe-03-2026",
+            "dolphin-cn-dialect-small",
             "hymt2-1.8b",
             "moonshine-tiny",
             "pyannote-segmentation-3.0",
@@ -301,6 +303,7 @@ fn bundled_catalog_market_listed_ids_exclude_capability_packs() {
         market_ids,
         vec![
             "cohere-transcribe-03-2026",
+            "dolphin-cn-dialect-small",
             "hymt2-1.8b",
             "moonshine-tiny",
             "qwen3-asr-0.6b",

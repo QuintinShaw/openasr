@@ -1,8 +1,7 @@
 # Per-model card prose for openasr/dolphin-cn-dialect-small. Distilled
 # (paraphrased, not copied) from the upstream DataoceanAI1/dolphi-cn-dialect-small
 # model card. Claims are kept to what the upstream repo and architecture state;
-# re-verify against the upstream card before a public release. NOTE: this is a
-# STAGED entry -- the .oasr pack has not been uploaded to Hugging Face yet.
+# re-verify against the upstream card when the upstream weights change.
 
 tagline = "Chinese multi-dialect speech recognition -- a WeNet E-Branchformer (CTC + attention) tuned for Sichuan and 22 regional dialects"
 tagline_zh = "中文多方言语音识别 — 基于 WeNet E-Branchformer(CTC + 注意力),针对四川话与 22 种地方方言优化"
