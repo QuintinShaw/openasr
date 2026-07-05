@@ -19,10 +19,10 @@ use block_stack::{
 };
 use hparams::{
     COHERE_TRANSCRIBE_DECODER_LAYERS_KEY, COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY,
-    COHERE_TRANSCRIBE_HPARAM_SCHEMA, MOONSHINE_HPARAM_SCHEMA, PARAKEET_CTC_HPARAM_SCHEMA,
-    QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA, QWEN3_AUDIO_LAYERS_KEY,
-    QWEN3_LLM_LAYERS_KEY, WAV2VEC2_CTC_HPARAM_SCHEMA, WHISPER_HPARAM_SCHEMA,
-    XASR_ZIPFORMER_HPARAM_SCHEMA,
+    COHERE_TRANSCRIBE_HPARAM_SCHEMA, DOLPHIN_HPARAM_SCHEMA, MOONSHINE_HPARAM_SCHEMA,
+    PARAKEET_CTC_HPARAM_SCHEMA, QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA,
+    QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY, WAV2VEC2_CTC_HPARAM_SCHEMA,
+    WHISPER_HPARAM_SCHEMA, XASR_ZIPFORMER_HPARAM_SCHEMA,
 };
 
 pub(crate) const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
@@ -95,6 +95,20 @@ pub(crate) const MOONSHINE_TOKENIZER_ID: &str = "moonshine.spm-bpe.v0";
 pub(crate) const MOONSHINE_DECODE_POLICY_ID: &str = "moonshine.greedy.seq2seq.v1";
 pub(crate) const MOONSHINE_RUNTIME_TENSOR_CONTRACT_ID: &str = "moonshine.runtime-tensors.v0";
 pub(crate) const MOONSHINE_EXECUTOR_COMPONENT_ID: &str = "moonshine.ggml-executor.v0";
+
+// dolphin (WeNet E-Branchformer encoder + Transformer decoder + CTC head, char
+// tokenizer, CTC/attention joint decode). Dedicated executor: the E-Branchformer
+// encoder math (macaron FFN + rel-pos MHSA global branch + cgMLP/CSGU local
+// branch + depthwise merge) is family-specific and not one of the composer
+// block kinds, so it stays hand-written like xasr/moonshine (block_stack: None).
+pub(crate) const DOLPHIN_GGML_ARCHITECTURE_ID: &str = "dolphin-ebranchformer-ctc-attention";
+pub(crate) const DOLPHIN_GGML_ADAPTER_ID: &str = "ggml-family-dolphin-runtime-v1";
+pub(crate) const DOLPHIN_MODEL_FAMILY: &str = "dolphin";
+pub(crate) const DOLPHIN_AUDIO_FRONTEND_ID: &str = "dolphin.fbank80.16khz.mono.v0";
+pub(crate) const DOLPHIN_TOKENIZER_ID: &str = "dolphin.char.v0";
+pub(crate) const DOLPHIN_DECODE_POLICY_ID: &str = "dolphin.attention-rescoring.v0";
+pub(crate) const DOLPHIN_RUNTIME_TENSOR_CONTRACT_ID: &str = "dolphin.runtime-tensors.v0";
+pub(crate) const DOLPHIN_EXECUTOR_COMPONENT_ID: &str = "dolphin.ggml-executor.v0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenAsrComponentKind {
@@ -622,6 +636,26 @@ const BUILTIN_COMPONENT_DESCRIPTORS: &[OpenAsrComponentDescriptor] = &[
         kind: OpenAsrComponentKind::Executor,
         id: MOONSHINE_EXECUTOR_COMPONENT_ID,
     },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
+        id: DOLPHIN_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: DOLPHIN_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: DOLPHIN_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: DOLPHIN_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: DOLPHIN_EXECUTOR_COMPONENT_ID,
+    },
 ];
 
 const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
@@ -798,6 +832,30 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // Raw-waveform conv-stem + partial-RoPE seq2seq with a self-contained
         // dedicated executor (not the data-driven block-stack composer — its
         // RoPE conv-stem encoder + cross-attn decoder are not composer blocks).
+        block_stack: None,
+    },
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &[DOLPHIN_GGML_ARCHITECTURE_ID, "dolphin"],
+        model_family: DOLPHIN_MODEL_FAMILY,
+        model_architecture: DOLPHIN_GGML_ARCHITECTURE_ID,
+        adapter_id: DOLPHIN_GGML_ADAPTER_ID,
+        // The dialect prefix (`<sos> <zh> <SICHUAN> <asr> <notimestamp>`) selects
+        // the language/region via prompt tokens the same way OWSM/Whisper do; the
+        // detected language is not surfaced yet, so treat it as prompt-selected.
+        language_family_hint: LanguageFamilyHint::SelectsViaPrompt {
+            default_language: "zh",
+        },
+        audio_frontend_id: DOLPHIN_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: DOLPHIN_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: DOLPHIN_TOKENIZER_ID,
+        decode_policy_id: DOLPHIN_DECODE_POLICY_ID,
+        executor_component_id: DOLPHIN_EXECUTOR_COMPONENT_ID,
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        hparam_schema: DOLPHIN_HPARAM_SCHEMA,
+        // E-Branchformer encoder + Transformer decoder + CTC head stay on the
+        // dedicated executor (the E-Branchformer block is not a composer block
+        // kind), so no data-driven block-stack descriptor.
         block_stack: None,
     },
 ];

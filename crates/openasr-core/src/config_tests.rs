@@ -28,6 +28,7 @@ fn catalog_model(id: &str, family: &str, aliases: &[&str], size: &str) -> ModelC
         generated_at: "2026-06-04T00:00:00Z".to_string(),
         catalog_url: "fixture".to_string(),
         backends: Vec::new(),
+        language_labels: std::collections::BTreeMap::new(),
         models: vec![crate::CatalogModel {
             id: id.to_string(),
             kind: crate::CatalogModelKind::AsrModel,
@@ -55,6 +56,7 @@ fn catalog_model(id: &str, family: &str, aliases: &[&str], size: &str) -> ModelC
             pull_recommended: format!("{id}:q8"),
             sort_weight: 0,
             recommended: false,
+            upstream_release_date: None,
             prose: None,
             prose_locales: None,
             quants: vec![crate::CatalogQuant {

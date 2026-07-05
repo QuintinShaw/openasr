@@ -93,3 +93,9 @@ for model in "${MODELS[@]}"; do
   fi
   python3 "${manifest_args[@]}"
 done
+
+# Refresh the catalog's top-level language/dialect label map (generated data,
+# independent of any single model) so a full regenerate keeps it in lockstep
+# with _catalog.LANGUAGE_DISPLAY_LABELS. Idempotent; leaves models[] untouched.
+log "refreshing catalog language-label map"
+python3 "$CATALOG_PY" write-language-labels "$REPO_ROOT/model-registry/catalog.json"

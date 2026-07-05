@@ -72,7 +72,10 @@ permits:
 - **Frontend** loader/params (log-mel vs fbank vs raw waveform; sample rate,
   n_mels, hop, ...).
 - **Weights loader** that reads the GGUF/`.oasr` tensors by your
-  `tensor_name_scope` and builds the resident layer handles.
+  `tensor_name_scope` and builds the resident layer handles. Bind matmul weights
+  at their **native quantized type** — see [Runtime contract: keep quantized
+  weights quantized](#runtime-contract-keep-quantized-weights-quantized).
+  Dequantizing everything to f32 here silently throws away the whole q8/q4 win.
 - **Audio encoder** glue — assemble its stage via the shared `compose_*` walker
   over the appropriate `nn/` block; add a new block under `nn/` only if your
   attention variant or head does not exist yet.
@@ -93,7 +96,71 @@ If you extend or refactor an existing working family, you MUST prove byte-identi
 (see [Performance](../perf/PERFORMANCE.md) and the bit-identity discipline): qwen
 golden-diff, cohere stash-diff. A brand-new family has no prior golden, so add it
 to the bench-suite (`perf/suite.toml`) and freeze its first transcript as the
-reference.
+reference. Then run the [keep-quantized self-check](#self-check-after-publishing)
+on the rendered card.
+
+## Runtime contract: keep quantized weights quantized
+
+**Hard requirement.** A quantized `.oasr` pack MUST feed its weights to ggml
+`mul_mat` in their **native quantized type** (`Q8_0`, `Q4_K`, ...). **Never
+dequantize every weight to f32 at load time.** A load-time dequant still produces
+a smaller-on-disk q8/q4 file, but the graph then holds f32-resident weights and
+computes in f32 — so you lose **both** wins the quant existed for: no RAM
+reduction (peak RSS goes flat across quants) and no compute change (RTF goes flat
+across quants). The point of a quant build is that the quantized blocks live in
+the backend buffer and the matmul runs the int8 vec-dot path.
+
+**The seam** (carry the raw blocks from pack to graph; never turn them into
+`Vec<f32>`):
+
+- Read the tensor as a native payload with
+  `GgufTensorDataReader::weight_tensor_payload_by_name` (or the `owned_` variant)
+  — it hands back `{ ggml_type, dims, bytes }`, not a dequantized copy.
+- Allocate + upload at the native type via `new_tensor_from_weight_payload` /
+  `new_matmul_weight_2d_typed` + `set_matmul_weight_bytes`, then pass the tensor
+  straight into `graph.mul_mat`.
+- **Reference family: `qwen`** (`models/qwen/llm_transformer.rs`,
+  `models/qwen/logits_head.rs`) — every hot projection and the output head bind
+  native; `dolphin` and `cohere` follow the same pattern.
+
+**Orientation rule.** ggml `mul_mat(weight, input)` wants the weight operand as
+`[ne0 = in, ne1 = out]`. Store and validate quant blocks in that **`[in, out]`**
+orientation (qwen asserts `payload.dims == [input_width, output_width]`) so they
+bind with **no repack**. A transpose at load defeats native binding.
+
+**What stays f32/f16** — these are NOT `mul_mat` weights, so do not quantize them;
+route them through the f32 vector loader (`host_tensor_f32_copy_dequantized_by_name`,
+as qwen does for its 1-D tensors):
+
+- 1-D norm weights and biases (RMSNorm/LayerNorm gamma/beta, projection biases).
+- Convolution kernels (conv frontends, depthwise conv1d, convnext stems).
+- Anything consumed by `get_rows` — token / decoder **embeddings** — ggml needs
+  f32/f16 rows there.
+- Positional / rotary tables and attention masks.
+- Activation-times-activation matmuls (attention scores) are runtime tensors, not
+  weights, and stay f32/f16 regardless of the pack's quant.
+
+### Self-check after publishing
+
+Open the model card's **Available builds** table (the publisher renders RAM peak +
+RTF per quant) and read down the columns:
+
+- **RAM peak must order `q4 < q8 < fp16`.** This is the load-bearing signal. If
+  peak RSS is *flat* across quants, the family is almost certainly dequantizing
+  every weight to f32 at load — the pitfall above. Fix the loader before shipping.
+- **RTF should trend `q4 <= fp16`** on M1 CPU for encoder-heavy families. Two
+  documented exceptions where flat/inverted RTF is expected and is NOT a defect:
+  1. **Very small models** (whisper tiny/base tier): fixed non-matmul overhead
+     dominates, so `q4 ~= fp16` RTF even when binding natively.
+  2. **Autoregressive-decoder-dominated families at batch=1** (Phase-3 finding on
+     `cohere-transcribe`): native `q8_0` can be *slightly slower* than fp16 on M1
+     CPU because ggml's per-call quantize-activation + int8 vec-dot overhead is
+     not amortized at M=1, while M1's native f16 FMA is very fast; `q4_k`'s larger
+     bandwidth saving only tips it marginally faster. Both still win on **RAM** —
+     which is exactly why RAM, not RTF, is the reliable keep-quantized check.
+
+When RAM is flat *and* RTF is flat across quants, treat it as a keep-quantized
+regression and audit the weights loader, not the pack.
 
 ## Honest gap list — what still blocks true zero-code onboarding
 

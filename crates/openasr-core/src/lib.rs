@@ -139,6 +139,10 @@ pub use models::{
         CohereLocalSourceImportRuntimeResult, CohereRuntimeQuantizationMode,
         convert_local_cohere_source_to_runtime_pack,
     },
+    dolphin::{
+        DolphinImportRequest, DolphinImportResult, DolphinQuantizationMode,
+        convert_local_dolphin_wenet_source_to_runtime_pack,
+    },
     ggml_asr_executor::{
         GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
         GgmlAsrExecutionOptions, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
@@ -245,17 +249,18 @@ pub use realtime::{
 pub use registry::{
     BackendResolutionError, CATALOG_FEATURE_SPEAKER_DIARIZATION, CatalogBackend,
     CatalogBackendFile, CatalogBackendFileRole, CatalogBackendVendor, CatalogCapability,
-    CatalogCapabilityRole, CatalogError, CatalogMirror, CatalogModel, CatalogModelKind,
-    CatalogProse, CatalogPullRequest, CatalogQuant, CatalogQuantPerf,
+    CatalogCapabilityRole, CatalogError, CatalogLanguageMode, CatalogMirror, CatalogModel,
+    CatalogModelKind, CatalogProse, CatalogPullRequest, CatalogQuant, CatalogQuantPerf,
     CatalogQuantRecommendationProfile, LicenseClass, ModelAvailability, ModelCard, ModelCatalog,
     ModelRef, ModelResolutionError, ModelVariantMetadata, RegistryError,
     ResolvedCatalogBackendPull, ResolvedCatalogPull, ResolvedModel, ResolvedRuntimeModelRef,
     RuntimeModelRefSource, RuntimeModelResolutionError, canonical_quant_tag, current_cli_version,
-    default_catalog_cache_path, default_catalog_url, default_registry_dir, load_model_catalog,
-    load_registry, model_reference_matches_resolved_source,
-    model_refs_match_with_optional_tag_alias, parse_model_catalog, parse_model_ref,
-    recommend_catalog_quant, resolve_catalog_backend_pull, resolve_catalog_pull,
-    resolve_catalog_pull_with_profile, resolve_registry_model_ref, resolve_runtime_model_ref,
+    default_catalog_cache_path, default_catalog_url, default_registry_dir,
+    load_embedded_signed_catalog, load_model_catalog, load_registry,
+    model_reference_matches_resolved_source, model_refs_match_with_optional_tag_alias,
+    parse_model_catalog, parse_model_ref, recommend_catalog_quant, resolve_catalog_backend_pull,
+    resolve_catalog_pull, resolve_catalog_pull_with_profile, resolve_registry_model_ref,
+    resolve_runtime_model_ref,
 };
 pub use remote_compute::{
     certificate_fingerprint_sha256, pairing_safety_code_for_certificate_fingerprint,

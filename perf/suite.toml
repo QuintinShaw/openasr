@@ -512,3 +512,25 @@ audio_path = "tmp/audio/generated/frank_read_english_16k.wav"
 reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
 optional = true
 gating = false
+
+# dolphin-cn-dialect-small (#28 — WeNet E-Branchformer, CTC/attention joint decode;
+# the first Chinese-dialect entry). fp16 pack (738MB), the only quant produced so
+# far. Sichuan clip; reference is the model's own golden attention_rescoring output
+# (CER 0.0000, byte-identical CPU + Metal). Non-gating (fp16, host-local pack).
+#
+# Perf is AB-measured (perf/PERFORMANCE.md): unlike xasr's chunked encoder where
+# Metal loses, this 0.4B E-Branchformer is wide enough per step that Metal is
+# ~1.45x FASTER than CPU (warm RTF 0.47 vs 0.68) at comparable peak RSS. The
+# committed baseline below is the CPU default (the golden, parity-validated path);
+# Metal is the recommended opt-in via `OPENASR_GGML_BACKEND=metal` /
+# `--execution-target accelerated`. The executor pools dequantized weights per
+# pack, so run>=2 is compute-only (the load_ms/compute_ms split reflects it).
+[[entries]]
+id = "dolphin-cn-dialect-small-fp16"
+family = "dolphin"
+quant = "fp16"
+pack_path = "tmp/publish/dolphin-cn-dialect-small/packs/dolphin-cn-dialect-small-fp16.oasr"
+audio_path = "tmp/publish/dolphin-cn-dialect-small/golden/clip_sichuan.wav"
+reference = "学校和底下好多那种野生枸杞"
+optional = true
+gating = false

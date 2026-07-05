@@ -9,17 +9,18 @@ use crate::ggml_runtime::GgufTensorDataReader;
 
 use super::runtime_contract::XasrZipformerExecutionMetadata;
 use super::weights::{
-    NamedTensor, StoredLinear, XasrWeightsError, load_linear, load_named, load_vector,
+    NamedTensor, StoredLinear, XasrWeightsError, load_named, load_native_linear,
+    load_native_linear_by_actual_dims, load_vector,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct XasrEncoderWeights {
     pub embed: XasrEncoderEmbedWeights,
     pub stacks: Vec<XasrEncoderStackWeights>,
     pub downsample_output_bias: Vec<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct XasrEncoderEmbedWeights {
     pub conv0: XasrConv2dWeights,
     pub conv4: XasrConv2dWeights,
@@ -32,7 +33,7 @@ pub(crate) struct XasrEncoderEmbedWeights {
     pub out_norm_log_scale: Vec<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct XasrEncoderStackWeights {
     pub stack: usize,
     pub dim: usize,
@@ -42,7 +43,7 @@ pub(crate) struct XasrEncoderStackWeights {
     pub out_combiner_bypass_scale: Option<Vec<f32>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct XasrEncoderLayerWeights {
     pub feed_forward1: XasrLinearPairWeights,
     pub feed_forward2: XasrLinearPairWeights,
@@ -59,31 +60,31 @@ pub(crate) struct XasrEncoderLayerWeights {
     pub bypass_mid_scale: Vec<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct XasrLinearWithBias {
     pub weight: StoredLinear,
     pub bias: Vec<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct XasrLinearPairWeights {
     pub in_proj: XasrLinearWithBias,
     pub out_proj: XasrLinearWithBias,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct XasrSelfAttentionWeightsWeights {
     pub in_proj: XasrLinearWithBias,
     pub linear_pos: StoredLinear,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct XasrNonlinAttentionWeights {
     pub in_proj: XasrLinearWithBias,
     pub out_proj: XasrLinearWithBias,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct XasrConvolutionModuleWeights {
     pub in_proj: XasrLinearWithBias,
     pub depthwise_causal_conv: XasrConv1dWeights,
@@ -268,7 +269,7 @@ fn load_self_attention_weights(
     stack: usize,
     dim: usize,
 ) -> Result<XasrSelfAttentionWeightsWeights, XasrWeightsError> {
-    let linear_pos = load_rank2_linear_by_actual_dims(
+    let linear_pos = load_native_linear_by_actual_dims(
         reader,
         &format!("{prefix}.self_attn_weights.linear_pos.weight"),
     )?;
@@ -349,7 +350,7 @@ fn load_linear_with_bias(
     output_dim: usize,
 ) -> Result<XasrLinearWithBias, XasrWeightsError> {
     Ok(XasrLinearWithBias {
-        weight: load_linear(reader, &format!("{prefix}.weight"), input_dim, output_dim)?,
+        weight: load_native_linear(reader, &format!("{prefix}.weight"), input_dim, output_dim)?,
         bias: load_vector(reader, &format!("{prefix}.bias"), output_dim)?,
     })
 }
@@ -363,28 +364,8 @@ fn load_dynamic_linear_with_bias(
     ensure_dims(&bias, &[bias.values.len()])?;
     let output_dim = bias.values.len();
     Ok(XasrLinearWithBias {
-        weight: load_linear(reader, &format!("{prefix}.weight"), input_dim, output_dim)?,
+        weight: load_native_linear(reader, &format!("{prefix}.weight"), input_dim, output_dim)?,
         bias: bias.values,
-    })
-}
-
-fn load_rank2_linear_by_actual_dims(
-    reader: &GgufTensorDataReader,
-    upstream_name: &str,
-) -> Result<StoredLinear, XasrWeightsError> {
-    let tensor = load_named(reader, upstream_name)?;
-    if tensor.dims.len() != 2 {
-        return Err(XasrWeightsError::Rank {
-            name: tensor.name,
-            rank: tensor.dims.len(),
-            expected_rank: 2,
-        });
-    }
-    Ok(StoredLinear {
-        name: tensor.name,
-        input_dim: tensor.dims[0],
-        output_dim: tensor.dims[1],
-        values: tensor.values,
     })
 }
 

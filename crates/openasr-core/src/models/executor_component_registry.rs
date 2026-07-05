@@ -3,13 +3,15 @@ use std::{collections::BTreeMap, sync::Arc};
 use thiserror::Error;
 
 use crate::arch::{
-    COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID, MOONSHINE_EXECUTOR_COMPONENT_ID,
-    OpenAsrArchitectureRegistry, PARAKEET_CTC_EXECUTOR_COMPONENT_ID,
-    QWEN3_ASR_EXECUTOR_COMPONENT_ID, WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
-    WHISPER_EXECUTOR_COMPONENT_ID, XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
+    COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID, DOLPHIN_EXECUTOR_COMPONENT_ID,
+    MOONSHINE_EXECUTOR_COMPONENT_ID, OpenAsrArchitectureRegistry,
+    PARAKEET_CTC_EXECUTOR_COMPONENT_ID, QWEN3_ASR_EXECUTOR_COMPONENT_ID,
+    WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID, WHISPER_EXECUTOR_COMPONENT_ID,
+    XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
 };
 
 use super::cohere::CohereTranscribeGgmlExecutor;
+use super::dolphin::executor::DolphinGgmlExecutor;
 use super::ggml_asr_executor::GgmlAsrExecutor;
 use super::moonshine::MoonshineGgmlExecutor;
 use super::parakeet_ctc::executor::ParakeetCtcGgmlExecutor;
@@ -69,6 +71,7 @@ fn materialize_builtin_executor_component(
         WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID => Some(Arc::new(Wav2Vec2CtcGgmlExecutor)),
         MOONSHINE_EXECUTOR_COMPONENT_ID => Some(Arc::new(MoonshineGgmlExecutor::default())),
         XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID => Some(Arc::new(XasrZipformerGgmlExecutor)),
+        DOLPHIN_EXECUTOR_COMPONENT_ID => Some(Arc::new(DolphinGgmlExecutor)),
         _ => None,
     }
 }
@@ -145,6 +148,7 @@ mod tests {
             ("wav2vec2-ctc", true),
             (crate::MOONSHINE_MODEL_FAMILY, true),
             (crate::arch::XASR_ZIPFORMER_MODEL_FAMILY, false),
+            (crate::arch::DOLPHIN_MODEL_FAMILY, false),
         ]);
         let executors =
             materialize_builtin_executors_by_model_architecture().expect("executor map");

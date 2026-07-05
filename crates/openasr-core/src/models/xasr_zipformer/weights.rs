@@ -1,6 +1,8 @@
 //! X-ASR GGUF tensor loading helpers.
 
-use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
+use crate::ggml_runtime::{
+    GgufOwnedWeightTensorPayload, GgufTensorDataReadError, GgufTensorDataReader,
+};
 
 use super::package_import::compact_xasr_name;
 use super::runtime_contract::XasrZipformerExecutionMetadata;
@@ -30,14 +32,23 @@ pub(crate) struct NamedTensor {
     pub values: Vec<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct StoredLinear {
     pub name: String,
     /// GGML `ne0`; storage is output-major with this many input values.
     pub input_dim: usize,
     /// GGML `ne1`; number of output rows.
     pub output_dim: usize,
+    /// Dequantized row-major f32 weights, used by the per-symbol decoder/joiner
+    /// `apply`/`apply_into` matvecs and by the f32 test graphs. Empty when the
+    /// weight is served natively (`native` is `Some`) to the encoder ggml graph.
     pub values: Vec<f32>,
+    /// Native (quantized / f16) ggml block payload for an encoder `mul_mat`
+    /// weight operand. `Some` keeps the weight quantized end to end: the encoder
+    /// graph binds it at its stored ggml type and uploads the raw blocks verbatim
+    /// (mmap-backed, no dequant-to-f32 blow-up), so peak RSS orders q4 < q8 < fp16.
+    /// `None` means the dequantized `values` path (decoder/joiner matvecs, tests).
+    pub native: Option<GgufOwnedWeightTensorPayload>,
 }
 
 impl StoredLinear {
@@ -113,14 +124,14 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     (s0 + s1) + (s2 + s3) + tail
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct XasrDecoderWeights {
     pub embedding: StoredLinear,
     pub conv_weight: NamedTensor,
     pub groups: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct XasrJoinerWeights {
     pub encoder_proj_weight: StoredLinear,
     pub encoder_proj_bias: Vec<f32>,
@@ -248,6 +259,60 @@ pub(crate) fn load_linear(
         input_dim,
         output_dim,
         values: tensor.values,
+        native: None,
+    })
+}
+
+/// Load a rank-2 `.weight` projection as its native (quantized / f16) ggml block
+/// payload for an encoder `mul_mat` weight operand, instead of dequantizing to
+/// f32. The payload carries the pack mmap (zero-copy) and its stored element type
+/// (F16 / Q8_0 / Q4_K, decided per tensor by the importer); the encoder graph
+/// binds it at that type and feeds `mul_mat` directly, so the weight stays
+/// quantized in the backend buffer. Only the encoder linears (which run in the
+/// ggml graph) use this; the per-symbol decoder/joiner matvecs keep the
+/// dequantized f32 `values` path via [`load_linear`].
+pub(crate) fn load_native_linear(
+    reader: &GgufTensorDataReader,
+    upstream_name: &str,
+    input_dim: usize,
+    output_dim: usize,
+) -> Result<StoredLinear, XasrWeightsError> {
+    let stored = load_native_linear_by_actual_dims(reader, upstream_name)?;
+    if stored.input_dim != input_dim || stored.output_dim != output_dim {
+        return Err(XasrWeightsError::Dims {
+            name: stored.name,
+            dims: vec![stored.input_dim, stored.output_dim],
+            expected: vec![input_dim, output_dim],
+        });
+    }
+    Ok(stored)
+}
+
+/// Like [`load_native_linear`] but takes the rank-2 dims from the stored tensor
+/// (`ne0` = input, `ne1` = output) rather than validating against expected dims --
+/// used for `linear_pos`, whose output width is derived from the pack.
+pub(crate) fn load_native_linear_by_actual_dims(
+    reader: &GgufTensorDataReader,
+    upstream_name: &str,
+) -> Result<StoredLinear, XasrWeightsError> {
+    let name = compact_xasr_name(upstream_name);
+    let payload = reader.owned_weight_tensor_payload_by_name(&name)?;
+    let [input_dim, output_dim]: [usize; 2] =
+        payload
+            .dims
+            .as_slice()
+            .try_into()
+            .map_err(|_| XasrWeightsError::Rank {
+                name: name.clone(),
+                rank: payload.dims.len(),
+                expected_rank: 2,
+            })?;
+    Ok(StoredLinear {
+        name,
+        input_dim,
+        output_dim,
+        values: Vec::new(),
+        native: Some(payload),
     })
 }
 
@@ -273,6 +338,7 @@ mod tests {
             input_dim: 3,
             output_dim: 2,
             values: vec![1.0, 2.0, 3.0, 10.0, 20.0, 30.0],
+            native: None,
         };
         let output = weight.apply(&[1.0, 1.0, 1.0], Some(&[0.5, -1.0])).unwrap();
         assert_eq!(output, vec![6.5, 59.0]);

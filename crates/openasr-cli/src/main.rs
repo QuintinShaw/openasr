@@ -382,7 +382,11 @@ fn show_model(target: &str) -> Result<()> {
     if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("oasr") {
         return model_pack_cli::inspect_model_pack_path_command(path);
     }
-    search_models(Some(target))
+    search_models(Some(target))?;
+    // Follow the model table with its advertised source-language facts (codes,
+    // policy, default) so `openasr show <id>` documents what `--language` accepts.
+    print_model_language_details(target);
+    Ok(())
 }
 
 fn config_command(command: ConfigCommand) -> Result<()> {
@@ -661,6 +665,106 @@ fn normalize_language_hint(language: Option<String>) -> Option<String> {
     language.filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("auto"))
 }
 
+/// A catalog for the CLI's advertised-language surfaces (`openasr show` and the
+/// `transcribe --language` pre-check), resolved WITHOUT any network fetch: an
+/// explicit `OPENASR_CATALOG_URL` / local `model-registry/catalog.json` override
+/// if present (so a dev tree sees staged models too), else the signed catalog
+/// snapshot embedded in the binary. Returns `None` only when even the embedded
+/// snapshot can't be read/verified, in which case callers fall back to core's
+/// fail-closed executor seam. Language validation must never add a download.
+fn offline_language_catalog(home: &Path) -> Option<openasr_core::ModelCatalog> {
+    if let Ok(Some(catalog)) = load_cli_model_catalog(home) {
+        return Some(catalog);
+    }
+    openasr_core::load_embedded_signed_catalog(home).ok()
+}
+
+/// Reject an explicit `--language` the resolved model does not advertise, early
+/// and with the model's real code list, instead of loading the pack and decoding
+/// audio only to fail closed deep in the executor. Best-effort and additive: the
+/// concrete request still reaches core, whose per-pack fail-closed gate stays the
+/// authority. Skips silently when the ref matches no public catalog model (a
+/// local-only / staged pack) or when the policy rejects EVERY explicit code
+/// (`detect_implicit` self-detect, `fixed_multilingual` fixed set) -- there,
+/// listing "valid codes" would mislead, so core's mode-specific message wins.
+fn validate_requested_language(
+    catalog: &openasr_core::ModelCatalog,
+    model_ref: &str,
+    language: &str,
+) -> Result<()> {
+    use openasr_core::CatalogLanguageMode::{DetectAndSpecify, FixedMonolingual, SpecifyOnly};
+    let Some(model) = catalog.resolve_public_model(model_ref) else {
+        return Ok(());
+    };
+    if !matches!(
+        model.language_mode,
+        Some(DetectAndSpecify) | Some(SpecifyOnly) | Some(FixedMonolingual)
+    ) {
+        return Ok(());
+    }
+    // Advertised codes are canonical (trim + lowercase); compare case-insensitively
+    // so `--language ZH-Sichuan` matches `zh-sichuan`. The request itself is
+    // forwarded verbatim; core normalizes it on receipt.
+    let requested = language.trim();
+    if model
+        .languages
+        .iter()
+        .any(|code| code.eq_ignore_ascii_case(requested))
+    {
+        return Ok(());
+    }
+    Err(consent::CliExit::new(
+        consent::ExitCode::InputError,
+        format!(
+            "Model '{}' does not support --language '{}'.\nSupported languages: {}",
+            model.id,
+            language,
+            model.languages.join(", ")
+        ),
+    )
+    .into())
+}
+
+/// Human-readable gloss for a catalog `language_mode`, for `openasr show`.
+fn language_mode_label(mode: Option<openasr_core::CatalogLanguageMode>) -> &'static str {
+    use openasr_core::CatalogLanguageMode::{
+        DetectAndSpecify, DetectImplicit, FixedMonolingual, FixedMultilingual, SpecifyOnly,
+    };
+    match mode {
+        Some(DetectAndSpecify) => "detect_and_specify (auto-detect, or set --language)",
+        Some(DetectImplicit) => "detect_implicit (self-detects; --language is rejected)",
+        Some(SpecifyOnly) => "specify_only (set --language; the default is used when unset)",
+        Some(FixedMonolingual) => "fixed_monolingual (one fixed language)",
+        Some(FixedMultilingual) => "fixed_multilingual (built-in set; --language is rejected)",
+        None => "unspecified",
+    }
+}
+
+/// Print the catalog's advertised source-language facts for a model id -- the
+/// selectable `--language` codes, the per-request selection policy
+/// (`language_mode`), and the conditioned/default language. Best-effort and
+/// network-free: silent when the ref matches no public catalog model (a
+/// local-only / staged pack) or no catalog is available.
+fn print_model_language_details(target: &str) {
+    let Ok(home) = openasr_home() else {
+        return;
+    };
+    let Some(catalog) = offline_language_catalog(&home) else {
+        return;
+    };
+    let Some(model) = catalog.resolve_public_model(target) else {
+        return;
+    };
+    println!();
+    println!("Languages for {}:", model.id);
+    println!("- codes: {}", model.languages.join(", "));
+    println!("- mode: {}", language_mode_label(model.language_mode));
+    println!(
+        "- default: {}",
+        model.language_default.as_deref().unwrap_or("(none)")
+    );
+}
+
 /// `transcribe -` reads a WAV stream from stdin into a temp file used as the sole
 /// input (audio prep is extension-based, so stdin is treated as WAV). Returns the
 /// temp file to keep alive for the run; `-` must be the only input.
@@ -710,6 +814,22 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
         )
         .into());
     }
+    // Fail fast on an explicit --language the resolved model does not advertise,
+    // BEFORE any pack install or decode, with the model's real code list. Skipped
+    // for a local --model-pack (no catalog ref) and for refs/policies core owns;
+    // network-free (see offline_language_catalog).
+    if let Some(language) = options.language.as_deref()
+        && options.model_pack.is_none()
+        && let Some(catalog) = offline_language_catalog(&home)
+    {
+        let model_ref = options
+            .model
+            .map(str::to_string)
+            .or_else(|| config.default_model.clone())
+            .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+        validate_requested_language(&catalog, &model_ref, language)?;
+    }
+
     // CLI-only consent-pull: native (the default) without an explicit
     // --model-pack ensures the resolved model is installed, pulling it with a
     // visible confirmation when it is missing. The server never does this.
@@ -1208,5 +1328,82 @@ mod tests {
             normalize_language_hint(Some("en".to_string())),
             Some("en".to_string())
         );
+    }
+
+    fn local_test_catalog() -> openasr_core::ModelCatalog {
+        // The committed catalog is the authoritative advertised-code source; read
+        // it directly (network-free) so these assertions track real model data.
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry/catalog.json");
+        let contents = fs::read_to_string(&path).expect("read model-registry/catalog.json");
+        parse_model_catalog(&contents, path.to_string_lossy().as_ref()).expect("parse catalog")
+    }
+
+    #[test]
+    fn validate_requested_language_rejects_unadvertised_code_for_selectable_models() {
+        let catalog = local_test_catalog();
+        // Multilingual Whisper (detect_and_specify) honors an explicit code: an
+        // advertised one passes; an unadvertised one fails closed naming the model.
+        assert!(validate_requested_language(&catalog, "whisper-large-v3", "fr").is_ok());
+        let message = validate_requested_language(&catalog, "whisper-large-v3", "zz")
+            .expect_err("an unadvertised code must fail closed")
+            .to_string();
+        assert!(message.contains("does not support"), "{message}");
+        assert!(message.contains("whisper-large-v3"), "{message}");
+        // Cohere (specify_only) is likewise checkable early.
+        assert!(validate_requested_language(&catalog, "cohere-transcribe-03-2026", "en").is_ok());
+        assert!(validate_requested_language(&catalog, "cohere-transcribe-03-2026", "zz").is_err());
+    }
+
+    #[test]
+    fn validate_requested_language_is_case_insensitive_and_ignores_quant_suffix() {
+        let catalog = local_test_catalog();
+        assert!(validate_requested_language(&catalog, "whisper-large-v3", "FR").is_ok());
+        // A `:quant` suffix on the ref does not change the language axis.
+        assert!(validate_requested_language(&catalog, "whisper-large-v3:q8_0", "fr").is_ok());
+    }
+
+    #[test]
+    fn validate_requested_language_defers_to_core_for_self_detect_and_unknown_refs() {
+        let catalog = local_test_catalog();
+        // Qwen self-detects (detect_implicit) and X-ASR is a fixed set
+        // (fixed_multilingual): both reject EVERY explicit code, so the early
+        // membership check stays out of the way and lets core's mode-specific
+        // message win -- even for an unadvertised code.
+        assert!(validate_requested_language(&catalog, "qwen3-asr-0.6b", "zz").is_ok());
+        assert!(validate_requested_language(&catalog, "xasr-zh-en", "zz").is_ok());
+        // A ref with no public catalog model resolves to nothing -> skip.
+        assert!(validate_requested_language(&catalog, "not-a-real-model", "zz").is_ok());
+    }
+
+    #[test]
+    fn resolve_public_model_maps_refs_and_quant_suffixes() {
+        let catalog = local_test_catalog();
+        assert_eq!(
+            catalog
+                .resolve_public_model("whisper-large-v3")
+                .map(|model| model.id.as_str()),
+            Some("whisper-large-v3")
+        );
+        assert_eq!(
+            catalog
+                .resolve_public_model("whisper-large-v3:q8_0")
+                .map(|model| model.id.as_str()),
+            Some("whisper-large-v3")
+        );
+        assert!(catalog.resolve_public_model("not-a-real-model").is_none());
+    }
+
+    #[test]
+    fn language_mode_label_is_stable_for_each_policy() {
+        use openasr_core::CatalogLanguageMode::{
+            DetectAndSpecify, DetectImplicit, FixedMonolingual, FixedMultilingual, SpecifyOnly,
+        };
+        assert!(language_mode_label(Some(DetectAndSpecify)).starts_with("detect_and_specify"));
+        assert!(language_mode_label(Some(DetectImplicit)).starts_with("detect_implicit"));
+        assert!(language_mode_label(Some(SpecifyOnly)).starts_with("specify_only"));
+        assert!(language_mode_label(Some(FixedMonolingual)).starts_with("fixed_monolingual"));
+        assert!(language_mode_label(Some(FixedMultilingual)).starts_with("fixed_multilingual"));
+        assert_eq!(language_mode_label(None), "unspecified");
     }
 }

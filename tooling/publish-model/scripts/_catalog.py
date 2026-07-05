@@ -15,6 +15,8 @@ Usage:
   _catalog.py json    <model>           # full entry as JSON (with id injected)
   _catalog.py prose-locale-hash <model> # compute source_sha256 for cards/<model>.toml's EN tagline+highlights
   _catalog.py check-prose-locales       # validate every card's prose_locales block (format + staleness)
+  _catalog.py language-labels           # print the curated language/dialect label map as JSON
+  _catalog.py write-language-labels <catalog.json>  # refresh the catalog's top-level language_labels map
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 from _file_loaders import load_toml
@@ -69,13 +72,127 @@ QUANT_METADATA = {
     "q4_k_m": QuantMetadata(cli_token="q4-k-m", suffix="q4km", label="Q4_K_M"),
     "q3_k": QuantMetadata(cli_token="q3-k", suffix="q3", label="q3_k"),
 }
+# --- Recognition dialect codes + curated display labels ---------------------
+#
+# Python mirror of crate::models::language (Rust). REGISTERED_DIALECT_CODES and
+# LANGUAGE_DISPLAY_LABELS are the single Python source of truth here; the label
+# map is emitted into the signed catalog's top-level `language_labels`, and a
+# Rust drift test (bundled_catalog_language_labels_match_rust_display_table)
+# pins it back to `language_display_label` so the two languages cannot diverge
+# (like the canonical quant-tag contract).
+
+# Base-language codes carrying a `-region` subtag that a dialect-capable model
+# may advertise as a selectable source language (the Chinese province tags
+# Dolphin recognizes). Kept sorted + de-duplicated; must match Rust's
+# REGISTERED_DIALECT_CODES exactly.
+REGISTERED_DIALECT_CODES = [
+    "zh-anhui",
+    "zh-guangdong",
+    "zh-hebei",
+    "zh-hubei",
+    "zh-jiangsu",
+    "zh-ningxia",
+    "zh-shaanxi",
+    "zh-shandong",
+    "zh-shanghai",
+    "zh-shanxi",
+    "zh-sichuan",
+    "zh-tianjin",
+    "zh-tw",
+]
+
+# code -> (English, Simplified-Chinese) display label. The Sinitic base codes
+# whose ISO naming is unhelpful (`zh`/`yue`/`wuu`) plus every province dialect
+# code, matching `language_display_label()` in crate::models::language 1:1.
+LANGUAGE_DISPLAY_LABELS = {
+    "zh": ("Chinese", "中文"),
+    "yue": ("Cantonese", "粤语"),
+    "wuu": ("Wu Chinese", "吴语"),
+    "zh-anhui": ("Chinese (Anhui)", "中文（安徽话）"),
+    "zh-guangdong": ("Chinese (Guangdong)", "中文（广东话）"),
+    "zh-hebei": ("Chinese (Hebei)", "中文（河北话）"),
+    "zh-hubei": ("Chinese (Hubei)", "中文（湖北话）"),
+    "zh-jiangsu": ("Chinese (Jiangsu)", "中文（江苏话）"),
+    "zh-ningxia": ("Chinese (Ningxia)", "中文（宁夏话）"),
+    "zh-shaanxi": ("Chinese (Shaanxi)", "中文（陕西话）"),
+    "zh-shandong": ("Chinese (Shandong)", "中文（山东话）"),
+    "zh-shanghai": ("Chinese (Shanghainese)", "中文（上海话）"),
+    "zh-shanxi": ("Chinese (Shanxi)", "中文（山西话）"),
+    "zh-sichuan": ("Chinese (Sichuanese)", "中文（四川话）"),
+    "zh-tianjin": ("Chinese (Tianjin)", "中文（天津话）"),
+    "zh-tw": ("Chinese (Taiwan)", "中文（台湾）"),
+}
+
+# Families whose executor ships a concrete code->prompt map and MAY therefore
+# enumerate dialect recognition codes in `languages` (selective dialect
+# collapse). Every other family collapses regional dialects into the base
+# language (`zh`), so a stray dialect code fails loudly instead of shipping.
+DIALECT_CAPABLE_FAMILIES = {"dolphin"}
+
+# Shape of a recognition-language code: a lowercase ISO 639 base (2-3 letters)
+# with an OPTIONAL single `-region` subtag. Deliberately broader than the
+# translation-only `[a-z]{2,3}` check (validate_lang_list), matching Rust's
+# `validate_language_code` regex `^[a-z]{2,3}(-[a-z0-9]+)?$`.
+RECOGNITION_LANGUAGE_CODE_RE = re.compile(r"[a-z]{2,3}(?:-[a-z0-9]+)?")
+
+
+def validate_recognition_language_code(model: str, code: str) -> None:
+    """Validate one advertised recognition-language code, Rust-parity.
+
+    Accepts a plain lowercase ISO base code (`en`, `zh`, `yue`) OR a REGISTERED
+    `-region` dialect code (`zh-sichuan`); rejects a malformed shape or an
+    unregistered `-region` subtag so a typo (`zh-sichaun`) ships loudly rather
+    than landing in a signed catalog.
+    """
+    if not isinstance(code, str) or RECOGNITION_LANGUAGE_CODE_RE.fullmatch(code) is None:
+        raise KeyError(
+            f"model '{model}' languages contains malformed recognition code {code!r} "
+            "(expected a lowercase ISO base code with an optional -region subtag)"
+        )
+    if "-" in code and code not in REGISTERED_DIALECT_CODES:
+        raise KeyError(
+            f"model '{model}' languages dialect code {code!r} is not in the registered dialect-code set"
+        )
+
+
+def validate_recognition_languages(model: str, family: str, languages: list[str]) -> None:
+    """Validate a resolved recognition `languages` list and enforce SELECTIVE
+    dialect collapse: only a dialect-capable family may enumerate `-region`
+    dialect codes; every other family must fold regional dialects into `zh`.
+    """
+    for code in languages:
+        validate_recognition_language_code(model, code)
+    dialects = sorted(code for code in languages if "-" in code)
+    if dialects and family not in DIALECT_CAPABLE_FAMILIES:
+        raise KeyError(
+            f"model '{model}' family '{family}' advertises dialect code(s) "
+            f"{', '.join(dialects)} but is not dialect-capable; regional dialects "
+            "collapse into the base language unless the executor ships a code->prompt map"
+        )
+
+
+def language_labels_wire() -> dict:
+    """The catalog's top-level `language_labels` map: code -> {en, zh-CN},
+    sorted by code (BTreeMap order on the Rust side). Source of truth for the
+    signed catalog; a Rust drift test pins it to `language_display_label`.
+    """
+    return {
+        code: {"en": en, "zh-CN": zh_cn}
+        for code, (en, zh_cn) in sorted(LANGUAGE_DISPLAY_LABELS.items())
+    }
+
+
 # Per-family list of the natural languages a model officially supports, as
 # ISO 639-1 two-letter codes (ISO 639-3 where no 639-1 code exists), sorted.
-# RULE: LANGUAGES ONLY, NOT DIALECTS/ACCENTS. Chinese is a single language "zh"
-# (Mandarin/Cantonese/Wu/Min and regional dialects all collapse into "zh");
-# English is "en" (US/UK/etc. are not split). A card that advertises "30 languages
-# and 22 Chinese dialects" yields the 30 languages, with the dialects folded into
-# the single "zh". If a model supports N languages, list all N. See SKILL.md.
+# RULE (SELECTIVE dialect collapse): by DEFAULT list LANGUAGES ONLY, NOT
+# dialects/accents -- Chinese is a single language "zh" (Mandarin/Cantonese/Wu/
+# Min and regional dialects fold into "zh"), English is "en" (US/UK not split),
+# and a card advertising "30 languages and 22 Chinese dialects" yields the 30
+# languages with the dialects folded into "zh". EXCEPTION: a dialect-capable
+# family (DIALECT_CAPABLE_FAMILIES -- one whose executor ships a code->prompt
+# map, i.e. Dolphin) MAY enumerate REGISTERED_DIALECT_CODES (`zh-sichuan`, ...)
+# as selectable source languages alongside the base `zh`. If a model supports N
+# languages, list all N. See SKILL.md.
 LANG_BY_FAMILY = {
     # Qwen3-ASR card lists 30 languages; Cantonese folds into zh -> 29 ISO langs.
     "qwen": [
@@ -103,6 +220,11 @@ LANG_BY_FAMILY = {
     ],
     # X-ASR-zh-en: bilingual Chinese + English.
     "xasr-zipformer": ["en", "zh"],
+    # Dolphin cn-dialect small: Mandarin + 22 Chinese dialects (Sichuan, Wu,
+    # Minnan, ...). Dolphin is dialect-capable (its executor ships a
+    # code->region-prompt map), so it advertises the base `zh` plus every
+    # registered province dialect code as selectable source languages.
+    "dolphin": sorted(["zh", *REGISTERED_DIALECT_CODES]),
     "moonshine": ["en"],
     "parakeet": ["en"],
     "wav2vec2": ["en"],
@@ -135,6 +257,10 @@ LANGUAGE_MODE_BY_FAMILY = {
     # X-ASR zh-en: FixedMultilingual -- built-in bilingual set, no per-request
     # language selection at all.
     "xasr-zipformer": "fixed_multilingual",
+    # Dolphin: SelectsViaPrompt -- the dialect/region is chosen through prompt
+    # tokens (<sos> <zh> <SICHUAN> <asr> <notimestamp>), never a decode-time
+    # auto-detect, so it conditions on its default when the request omits one.
+    "dolphin": "specify_only",
     # CTC / Moonshine: FixedMonolingual -- intrinsically a single language.
     "moonshine": "fixed_monolingual",
     "parakeet": "fixed_monolingual",
@@ -148,6 +274,7 @@ LANGUAGE_MODE_BY_FAMILY = {
 # same-source-of-truth constant instead of guessed.
 LANGUAGE_MODE_DEFAULT_BY_FAMILY = {
     "cohere": "en",
+    "dolphin": "zh",
 }
 
 
@@ -247,6 +374,7 @@ def apply_catalog_series_defaults(model: str, entry: dict, series: dict) -> None
     validate_capability(model, entry)
     validate_translation_model(model, entry)
     validate_display_ranking(model, entry)
+    validate_upstream_release_date(model, entry)
 
     spec = series.get(entry["family"])
     if spec is not None and entry["size"] not in spec["member_sizes"]:
@@ -359,6 +487,34 @@ def validate_display_ranking(model: str, entry: dict) -> None:
             raise KeyError(f"model '{model}' recommended must be a bool, got {value!r}")
 
 
+UPSTREAM_RELEASE_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def validate_upstream_release_date(model: str, entry: dict) -> None:
+    """`upstream_release_date` is the upstream model's original release date
+    (ISO `yyyy-mm-dd`), an explicit author-set field distinct from our repack
+    `generated_at`. Optional (nullable); when present it must be a real calendar
+    date in `yyyy-mm-dd` form and not in the future.
+    """
+    value = entry.get("upstream_release_date")
+    if value is None:
+        return
+    if not isinstance(value, str) or UPSTREAM_RELEASE_DATE_RE.fullmatch(value) is None:
+        raise KeyError(
+            f"model '{model}' upstream_release_date must be an ISO yyyy-mm-dd string, got {value!r}"
+        )
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as error:
+        raise KeyError(
+            f"model '{model}' upstream_release_date is not a valid calendar date: {value!r}"
+        ) from error
+    if parsed > date.today():
+        raise KeyError(
+            f"model '{model}' upstream_release_date {value!r} is in the future"
+        )
+
+
 def validate_lang_list(model: str, field: str, value: object) -> None:
     if not isinstance(value, list) or not value:
         raise KeyError(f"model '{model}' {field} must be a non-empty list")
@@ -396,8 +552,16 @@ def languages_for_model(entry: dict) -> list[str]:
                 "expected a non-empty list of ISO language codes"
             )
         # De-dup + sort so the override obeys the same invariant as family lists.
-        return sorted(set(override))
-    return languages_for_family(entry["family"])
+        languages = sorted(set(override))
+    else:
+        languages = languages_for_family(entry["family"])
+    # Validate the resolved codes (shape + registered-dialect membership) and
+    # enforce selective dialect collapse, so a malformed/typo'd/unauthorized
+    # dialect code fails loudly here rather than shipping in a signed catalog.
+    validate_recognition_languages(
+        entry.get("id", "?"), entry.get("family", "?"), languages
+    )
+    return languages
 
 
 # --- prose_locales machine checks -------------------------------------------
@@ -589,6 +753,18 @@ def main(argv: list[str]) -> int:
     elif cmd == "check-prose-locales":
         translated = validate_all_card_prose_locales()
         print(f"prose_locales check passed for {len(translated)} model(s): {', '.join(translated)}")
+    elif cmd == "language-labels":
+        print(json.dumps(language_labels_wire(), indent=2, ensure_ascii=False))
+    elif cmd == "write-language-labels":
+        from _file_loaders import atomic_write_json
+
+        path = Path(argv[1])
+        data = json.loads(path.read_text(encoding="utf-8"))
+        # Refresh (or add) the top-level map in place, preserving key order so a
+        # per-model regenerate that only touches models[] stays a minimal diff.
+        data["language_labels"] = language_labels_wire()
+        atomic_write_json(path, data)
+        print(f"wrote language_labels ({len(data['language_labels'])} codes) to {path}")
     else:
         sys.exit(f"unknown command '{cmd}'")
     return 0

@@ -45,6 +45,15 @@ upstream_repo = "GilgameshWind/X-ASR-zh-en"
 source_revision = "main"
 needs_license_flags = false
 
+# Dolphin WeNet -> .oasr converter. The importer takes a local
+# full.safetensors + units.txt and emits fp16/q8_0/q4_k packs; it does not accept
+# license flags (needs_license_flags = false, like xasr-zipformer).
+["dolphin-cn-dialect-small"]
+import_subcommand = "import dolphin"
+upstream_repo = "DataoceanAI1/dolphi-cn-dialect-small"
+source_revision = "main"
+needs_license_flags = false
+
 ["wespeaker-voxceleb-resnet34-lm"]
 import_subcommand = "import wespeaker"
 upstream_repo = "pyannote/wespeaker-voxceleb-resnet34-LM"

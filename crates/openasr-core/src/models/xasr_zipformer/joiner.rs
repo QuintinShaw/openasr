@@ -9,7 +9,7 @@
 
 use super::weights::XasrJoinerWeights;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct XasrJoiner {
     weights: XasrJoinerWeights,
 }
@@ -121,6 +121,7 @@ mod tests {
                 input_dim: 2,
                 output_dim: 2,
                 values: vec![1.0, 0.0, 0.0, 1.0],
+                native: None,
             },
             output_linear_bias: vec![0.0, 0.0],
         });
@@ -139,6 +140,7 @@ mod tests {
             input_dim: dim,
             output_dim: dim,
             values,
+            native: None,
         }
     }
 }

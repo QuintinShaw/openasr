@@ -249,6 +249,7 @@ mod tests {
                     1.0, 0.0, // token 1
                     0.0, 1.0, // token 2
                 ],
+                native: None,
             },
             conv_weight: NamedTensor {
                 name: "conv".to_string(),
@@ -271,6 +272,7 @@ mod tests {
                 input_dim: 2,
                 output_dim: 2,
                 values: vec![-1.0, 0.0, 0.0, -1.0],
+                native: None,
             },
             decoder_proj_bias: vec![0.0, 0.0],
             output_linear_weight: StoredLinear {
@@ -282,6 +284,7 @@ mod tests {
                     4.0, -4.0, // token 1
                     -4.0, 4.0, // token 2
                 ],
+                native: None,
             },
             output_linear_bias: vec![0.0, 0.0, 0.0],
         }
@@ -297,6 +300,7 @@ mod tests {
             input_dim: dim,
             output_dim: dim,
             values,
+            native: None,
         }
     }
 }
