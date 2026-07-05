@@ -1229,6 +1229,26 @@ pub fn load_embedded_signed_catalog(home: &Path) -> Result<ModelCatalog, Catalog
     parse_model_catalog(EMBEDDED_CATALOG_JSON, "<embedded catalog>")
 }
 
+/// The embedded bundled catalog's signature-verified `(catalog_sha256,
+/// catalog_epoch)` fingerprint, with no filesystem side effects (unlike
+/// [`load_embedded_signed_catalog`], this never touches the on-disk
+/// epoch-rollback guard). Used by packaging tooling (the CLI's hidden
+/// `catalog-fingerprint` introspection command) to confirm a prebuilt
+/// sidecar binary's embedded catalog matches a copied catalog resource
+/// before it ships, without needing to run the binary's normal load path.
+pub fn embedded_catalog_fingerprint() -> Result<(String, u64), CatalogError> {
+    let verified = catalog_security::verify_catalog_signature_manifest(
+        EMBEDDED_CATALOG_JSON,
+        EMBEDDED_CATALOG_SIGNATURE_JSON,
+        DEFAULT_CATALOG_URL,
+    )
+    .map_err(|error| CatalogError::CatalogSecurity {
+        catalog_source: DEFAULT_CATALOG_URL.to_string(),
+        message: format!("embedded catalog rejected: {error}"),
+    })?;
+    Ok((verified.catalog_sha256, verified.catalog_epoch))
+}
+
 fn read_and_verify_cached_catalog_manifest(
     source: &str,
     home: &Path,

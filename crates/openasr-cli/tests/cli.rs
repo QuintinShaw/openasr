@@ -1609,6 +1609,52 @@ fn doctor_marks_legacy_saved_default_backend_as_legacy() {
 }
 
 #[test]
+fn catalog_fingerprint_prints_json_line_matching_embedded_signature() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry");
+    let public_contents =
+        std::fs::read_to_string(root.join("catalog.public.json")).expect("read public catalog");
+    let manifest_contents = std::fs::read_to_string(root.join("catalog.public.signature.json"))
+        .expect("read public catalog signature manifest");
+    let manifest: Value = serde_json::from_str(&manifest_contents).expect("parse manifest");
+    let expected_epoch = manifest["catalog_epoch"].as_u64().expect("catalog_epoch");
+    let expected_sha256 = {
+        let mut hasher = Sha256::new();
+        hasher.update(public_contents.as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+
+    let output = openasr()
+        .arg("catalog-fingerprint")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8 stdout");
+    let parsed: Value =
+        serde_json::from_str(stdout.trim()).expect("catalog-fingerprint prints a single JSON line");
+
+    assert_eq!(
+        parsed["catalog_sha256"].as_str().unwrap(),
+        expected_sha256,
+        "fingerprint sha256 must be byte-identical to sha256(catalog.public.json)"
+    );
+    assert_eq!(
+        parsed["catalog_epoch"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap(),
+        expected_epoch,
+        "fingerprint epoch must match the embedded signature manifest's epoch"
+    );
+}
+
+#[test]
 fn doctor_marks_sensevoice_cpp_saved_default_backend_as_legacy() {
     let home = temp_home();
     std::fs::write(

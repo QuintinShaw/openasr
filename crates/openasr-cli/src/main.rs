@@ -17,11 +17,11 @@ use openasr_core::{
     ResponseFormat, TranscriptionBackend, TranscriptionRequest, WhisperLocalSourceImportRequest,
     atomic_write_text, config_path, convert_local_cohere_source_to_runtime_pack,
     convert_local_qwen_source_to_runtime_pack, convert_local_whisper_hf_source_to_runtime_pack,
-    default_registry_dir, derive_catalog_public_key_hex, discover_batch_inputs, load_config,
-    load_registry, openasr_home, parse_model_catalog, parse_model_ref, render_batch_summary,
-    render_benchmark, render_catalog_signature_manifest, resolve_registry_model_ref,
-    resolve_runtime_model_ref, save_config, validate_local_native_model_pack_path,
-    verify_catalog_signature_manifest,
+    default_registry_dir, derive_catalog_public_key_hex, discover_batch_inputs,
+    embedded_catalog_fingerprint, load_config, load_registry, openasr_home, parse_model_catalog,
+    parse_model_ref, render_batch_summary, render_benchmark, render_catalog_signature_manifest,
+    resolve_registry_model_ref, resolve_runtime_model_ref, save_config,
+    validate_local_native_model_pack_path, verify_catalog_signature_manifest,
 };
 
 mod bench_suite_cli;
@@ -174,6 +174,7 @@ async fn run() -> Result<()> {
             &key_id,
             print_public_key,
         ),
+        Command::CatalogFingerprint => catalog_fingerprint_command(),
         Command::Transcribe {
             inputs,
             formats,
@@ -490,6 +491,24 @@ fn sign_catalog_manifest_command(
         )
     })?;
     println!("Wrote catalog signature manifest: {}", out.display());
+    Ok(())
+}
+
+/// Prints the embedded bundled catalog's signature-verified fingerprint as a
+/// single machine-readable JSON line: `{"catalog_epoch":"...","catalog_sha256":"..."}`.
+/// No network access, no filesystem writes -- packaging tooling shells out to
+/// this to confirm a prebuilt sidecar binary's embedded catalog matches the
+/// catalog resource copied alongside it before a bundle ships.
+fn catalog_fingerprint_command() -> Result<()> {
+    let (catalog_sha256, catalog_epoch) =
+        embedded_catalog_fingerprint().context("Could not verify embedded bundled catalog")?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "catalog_epoch": catalog_epoch.to_string(),
+            "catalog_sha256": catalog_sha256,
+        })
+    );
     Ok(())
 }
 

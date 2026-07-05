@@ -256,7 +256,7 @@ pub use registry::{
     ResolvedCatalogBackendPull, ResolvedCatalogPull, ResolvedModel, ResolvedRuntimeModelRef,
     RuntimeModelRefSource, RuntimeModelResolutionError, canonical_quant_tag, current_cli_version,
     default_catalog_cache_path, default_catalog_url, default_registry_dir,
-    load_embedded_signed_catalog, load_model_catalog, load_registry,
+    embedded_catalog_fingerprint, load_embedded_signed_catalog, load_model_catalog, load_registry,
     model_reference_matches_resolved_source, model_refs_match_with_optional_tag_alias,
     parse_model_catalog, parse_model_ref, recommend_catalog_quant, resolve_catalog_backend_pull,
     resolve_catalog_pull, resolve_catalog_pull_with_profile, resolve_registry_model_ref,

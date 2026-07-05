@@ -242,6 +242,12 @@ pub(crate) enum Command {
         #[arg(long)]
         print_public_key: bool,
     },
+    /// Internal helper: print the embedded bundled catalog's signature-verified
+    /// fingerprint (sha256 + epoch) as a single JSON line. No network, no side
+    /// effects. Used by packaging tooling to confirm a prebuilt sidecar's
+    /// embedded catalog matches a copied catalog resource.
+    #[command(name = "catalog-fingerprint", hide = true)]
+    CatalogFingerprint,
     /// Transcribe one or more audio files (or directories of audio).
     #[command(visible_alias = "t")]
     Transcribe {
