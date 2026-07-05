@@ -159,7 +159,12 @@ impl SenseVoicePreparedRuntime {
         language: Option<&str>,
         phrase_bias: Option<&PhraseBiasConfig>,
     ) -> Result<CtcGreedyDecodeResult, String> {
-        let prompt = build_sensevoice_prompt(language, false).map_err(|e| e.to_string())?;
+        // SenseVoice's own FunASR quick-start (and Handy's sherpa-based build)
+        // default to `withitn`: raw `woitn` output has no punctuation or digit
+        // normalization, which reads as a bug in real transcripts. There is no
+        // request-level toggle for this (no back-compat surface to preserve),
+        // so it is a fixed default rather than a plumbed parameter.
+        let prompt = build_sensevoice_prompt(language, true).map_err(|e| e.to_string())?;
         let dim = self.metadata.feature_dim;
 
         let fbank = SenseVoiceFbankFrontend::new()
@@ -213,7 +218,7 @@ impl SenseVoicePreparedRuntime {
         phrase_bias: Option<&PhraseBiasConfig>,
     ) -> Result<SenseVoiceTranscription, String> {
         let result = self.decode_result(samples, language, phrase_bias)?;
-        let requested = build_sensevoice_prompt(language, false).map_err(|e| e.to_string())?;
+        let requested = build_sensevoice_prompt(language, true).map_err(|e| e.to_string())?;
         Ok(sensevoice_result_to_transcription(
             &result.text,
             &requested.resolved_language,
@@ -471,9 +476,13 @@ mod tests {
         // The second character is genuinely ambiguous on this clip: the f32
         // PyTorch reference itself emits \u{653e} under the zh prompt and
         // \u{996d} under auto; quantized packs may land on either. Accept both.
+        // `withitn` (the product default) also normalizes the spoken digits to
+        // arabic numerals and appends terminal punctuation, e.g.
+        // "9\u{70b9}...5\u{70b9}\u{3002}" (9-point .. 5-point.) instead of the
+        // raw \u{4e5d}\u{70b9} / \u{4e94}\u{70b9} spoken forms.
         let zh_expected = [
-            "\u{5f00}\u{653e}\u{65f6}\u{95f4}\u{65e9}\u{4e0a}\u{4e5d}\u{70b9}\u{81f3}\u{4e0b}\u{5348}\u{4e94}\u{70b9}",
-            "\u{5f00}\u{996d}\u{65f6}\u{95f4}\u{65e9}\u{4e0a}\u{4e5d}\u{70b9}\u{81f3}\u{4e0b}\u{5348}\u{4e94}\u{70b9}",
+            "\u{5f00}\u{653e}\u{65f6}\u{95f4}\u{65e9}\u{4e0a}9\u{70b9}\u{81f3}\u{4e0b}\u{5348}5\u{70b9}\u{3002}",
+            "\u{5f00}\u{996d}\u{65f6}\u{95f4}\u{65e9}\u{4e0a}9\u{70b9}\u{81f3}\u{4e0b}\u{5348}5\u{70b9}\u{3002}",
         ];
         assert!(
             zh_expected.contains(&zh_out.text.as_str()),
@@ -489,8 +498,11 @@ mod tests {
             "sensevoice en: {:?} (lang {:?})",
             en_out.text, en_out.language
         );
+        // `withitn` capitalizes the sentence, spells the number as a numeral,
+        // and appends terminal punctuation (vs the raw spoken-form woitn
+        // reference this used to pin: "the tribal chieftain ... fifty ... gold").
         let en_reference =
-            "the tribal chieftain called for the boy and presented him with fifty pieces of gold";
+            "The tribal chieftain called for the boy and presented him with 50 pieces of gold.";
         if pack.to_string_lossy().contains("fp16") {
             // fp16 must reproduce the PyTorch reference transcript exactly.
             assert_eq!(en_out.text, en_reference);
