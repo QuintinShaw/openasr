@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::PhraseBiasConfig;
 use crate::api::backend::{Segment, Transcription};
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgufMetadata, GgufOwnedWeightTensorPayload,
@@ -32,6 +33,9 @@ use super::encoder_graph::{
     DolphinEncoderConfig, DolphinEncoderOutput, DolphinNativeWeight, DolphinWeightProvider, encode,
 };
 use super::frontend::{DolphinFbankFrontend, NUM_MEL_BINS, apply_global_cmvn};
+use super::hotword_context::{
+    apply_hotword_deep_biasing, encode_hotword_context_embeddings, tokenize_hotword_phrase,
+};
 use super::joint_decode::{DolphinJointDecodeConfig, detokenize_char_tokens, joint_decode};
 use super::language::build_dolphin_decode_prefix;
 use super::runtime_contract::parse_dolphin_execution_metadata;
@@ -73,12 +77,25 @@ pub(crate) const DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT: f32 = 0.0;
 /// The quantized packs block-quantize exactly these rank-2 `.weight` matrices, and
 /// `mul_mat` runs the quantized/f16 lhs directly -- so keeping them native lets the
 /// backend buffer hold the small quantized weights (q4 < q8 < fp16 in RAM) instead
-/// of a dequantized-to-f32 blow-up. `decoder.embed.0.weight` is deliberately
-/// excluded: it is a `ggml_get_rows` operand (row lookup), which only accepts
-/// f32/f16 embeddings, so it stays f32 -- and only rank-2 `.weight` *matmul*
-/// operands go native by design.
+/// of a dequantized-to-f32 blow-up. Three tensors are deliberately excluded because
+/// they are consumed outside `mul_mat`: `decoder.embed.0.weight` and
+/// `context_module.context_extractor.word_embedding.weight` are `ggml_get_rows`
+/// (row lookup) / plain-Rust row-lookup operands, and
+/// `context_module.context_encoder.0.weight` is a `Linear` consumed by the
+/// pure-Rust hotword context encoder (`models::dolphin::hotword_context`), not the
+/// ggml graph -- all three only accept f32 (or f32/f16 for get_rows), so they stay
+/// dequantized to f32 -- and only rank-2 `.weight` *matmul* operands actually fed
+/// to a ggml `mul_mat` go native by design.
+const PURE_RUST_MATMUL_WEIGHT_EXCLUSIONS: [&str; 3] = [
+    "decoder.embed.0.weight",
+    "context_module.context_extractor.word_embedding.weight",
+    "context_module.context_encoder.0.weight",
+];
+
 fn is_native_matmul_weight(name: &str, dims: &[u64]) -> bool {
-    name.ends_with(".weight") && dims.len() == 2 && name != "decoder.embed.0.weight"
+    name.ends_with(".weight")
+        && dims.len() == 2
+        && !PURE_RUST_MATMUL_WEIGHT_EXCLUSIONS.contains(&name)
 }
 
 /// Materialize one pack tensor into the pool: rank-2 `.weight` matmul operands are
@@ -276,10 +293,19 @@ pub(crate) fn transcribe_dolphin_pcm(
     ctc_weight: f32,
     backend: GgmlCpuGraphBackend,
     language: Option<&str>,
+    phrase_bias: Option<&PhraseBiasConfig>,
 ) -> Result<DolphinPipelineOutput, String> {
     let weights = load_dolphin_runtime_weights_from_pack(reader)
         .map_err(|error| format!("dolphin runtime weight load failed: {error}"))?;
-    run_dolphin_pipeline(&weights, metadata, samples, ctc_weight, backend, language)
+    run_dolphin_pipeline(
+        &weights,
+        metadata,
+        samples,
+        ctc_weight,
+        backend,
+        language,
+        phrase_bias,
+    )
 }
 
 /// Run the fbank+CMVN -> encoder -> joint-decode -> detokenize pipeline over
@@ -292,6 +318,7 @@ pub(crate) fn run_dolphin_pipeline(
     ctc_weight: f32,
     backend: GgmlCpuGraphBackend,
     language: Option<&str>,
+    phrase_bias: Option<&PhraseBiasConfig>,
 ) -> Result<DolphinPipelineOutput, String> {
     let tokens = metadata
         .get_string_array(TOKENIZER_TOKENS_KEY)
@@ -331,6 +358,35 @@ pub(crate) fn run_dolphin_pipeline(
     )
     .map_err(|error| format!("dolphin encoder graph failed: {error}"))?;
 
+    // Hotword deep-biasing (native `context_module.*` fusion). Upstream's
+    // `decode()` computes `ctc_logprobs` from the *unbiased* encoder output
+    // before `apply_deep_biasing` replaces it, so only the decoder's
+    // `attention_rescoring` input is biased -- the CTC prefix-beam n-best below
+    // always reads `encoder.encoder_out` unchanged. When no hotwords are
+    // requested this borrows the same buffer, so the no-hotword path pays no
+    // extra graph build/copy (byte-identical to before this feature).
+    let rescoring_encoder_out: std::borrow::Cow<'_, [f32]> = match phrase_bias {
+        Some(config) if !config.is_empty() => {
+            let hotword_token_ids: Vec<Vec<u32>> = config
+                .entries()
+                .iter()
+                .map(|entry| tokenize_hotword_phrase(tokens, entry.phrase()))
+                .collect();
+            let context_emb = encode_hotword_context_embeddings(weights, &hotword_token_ids)
+                .map_err(|error| format!("dolphin hotword context embedding failed: {error}"))?;
+            let biased = apply_hotword_deep_biasing(
+                weights,
+                &encoder.encoder_out,
+                encoder.frames,
+                &context_emb,
+                backend,
+            )
+            .map_err(|error| format!("dolphin hotword biasing fusion failed: {error}"))?;
+            std::borrow::Cow::Owned(biased)
+        }
+        _ => std::borrow::Cow::Borrowed(encoder.encoder_out.as_slice()),
+    };
+
     // CTC/attention joint decode.
     let decoder_config = DolphinDecoderConfig::small_cn();
     let decode_config = DolphinJointDecodeConfig {
@@ -344,6 +400,7 @@ pub(crate) fn run_dolphin_pipeline(
         &decoder_config,
         weights,
         &encoder.encoder_out,
+        &rescoring_encoder_out,
         encoder.frames,
         &decode_config,
         backend,
@@ -382,9 +439,11 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
     }
 
     fn supports_phrase_bias(&self) -> bool {
-        // Hotword biasing rides the `context_module.*` tensors, which the importer
-        // intentionally drops in this phase; report unsupported honestly.
-        false
+        // Native deep-biasing over the `context_module.*` tensors (see
+        // `models::dolphin::hotword_context`); the phrase list feeds the trained
+        // context extractor + biasing attention fusion. Per-phrase `boost` has no
+        // upstream semantics here (see that module's docs) and is ignored.
+        true
     }
 
     fn execute(
@@ -428,6 +487,7 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
             DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
             backend,
             request.request_options.language.as_deref(),
+            request.request_options.phrase_bias.as_ref(),
         )
         .map_err(fail)?;
 
@@ -835,6 +895,7 @@ mod tests {
                     ctc_weight,
                     backend,
                     Some("zh-sichuan"),
+                    None,
                 )
             } else {
                 let weights =
@@ -846,6 +907,7 @@ mod tests {
                     ctc_weight,
                     backend,
                     Some("zh-sichuan"),
+                    None,
                 )
             }
             .expect("dolphin pipeline");
@@ -907,6 +969,7 @@ mod tests {
             DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
             GgmlCpuGraphBackend::Cpu,
             Some("zh-sichuan"),
+            None,
         )
         .expect("dolphin transcribe");
 
@@ -948,6 +1011,7 @@ mod tests {
             0.3,
             GgmlCpuGraphBackend::Cpu,
             Some("zh-sichuan"),
+            None,
         )
         .expect("dolphin transcribe (ctc_weight 0.3)");
         eprintln!(
@@ -1000,6 +1064,7 @@ mod tests {
                 DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
                 GgmlCpuGraphBackend::Cpu,
                 Some("zh-sichuan"),
+                None,
             )
             .expect("dolphin transcribe (quant)");
             let qcer = char_error_rate(&qoutput.text, REFERENCE_RESCORING_TEXT);
@@ -1026,6 +1091,107 @@ mod tests {
                 quant.label()
             );
             assert_eq!(qoutput.resolved_language, "zh-sichuan");
+        }
+    }
+
+    /// End-to-end hotword demo: the un-biased `attention_rescoring` decode gets the
+    /// 和/河 homophone wrong (see `REFERENCE_RESCORING_TEXT` above); native
+    /// `context_module.*` deep-biasing with the hotword "河" flips it to the correct
+    /// human transcript. Mirrors `work/hotword_parity.py`'s PyTorch reference demo
+    /// exactly (same clip, same hotword, same "no hotword" vs "with hotword" pair).
+    ///
+    /// `#[ignore]`: needs the checkpoint/golden under `tmp/publish` (not committed).
+    /// Run with:
+    /// `cargo test -p openasr-core dolphin_hotword_flips_recognition_error -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires local Dolphin checkpoint + golden clip under tmp/publish (not committed)"]
+    fn dolphin_hotword_flips_recognition_error() {
+        let root = root();
+        let clip = root.join("golden/clip_sichuan.wav");
+        let Some(pack) = ensure_dolphin_pack(&root, DolphinQuantizationMode::Fp16) else {
+            eprintln!("skip: dolphin checkpoint/units not present under {root:?}");
+            return;
+        };
+        if !clip.exists() {
+            eprintln!("skip: golden clip not present at {clip:?}");
+            return;
+        }
+
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            &clip,
+            "dolphin hotword demo",
+            "clip_sichuan.wav",
+        )
+        .expect("load clip");
+        let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
+        let metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
+
+        let no_hotword = transcribe_dolphin_pcm(
+            &reader,
+            &metadata,
+            &samples,
+            DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
+            GgmlCpuGraphBackend::Cpu,
+            Some("zh-sichuan"),
+            None,
+        )
+        .expect("dolphin transcribe (no hotword)");
+
+        let phrase_bias = crate::PhraseBiasConfig::from_phrases_with_default_boost(["河"], None)
+            .expect("hotword phrase config");
+        let with_hotword = transcribe_dolphin_pcm(
+            &reader,
+            &metadata,
+            &samples,
+            DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
+            GgmlCpuGraphBackend::Cpu,
+            Some("zh-sichuan"),
+            Some(&phrase_bias),
+        )
+        .expect("dolphin transcribe (with hotword)");
+
+        eprintln!("== Dolphin hotword deep-biasing demo (河) ==");
+        eprintln!("no hotword   : {}", no_hotword.text);
+        eprintln!("with hotword : {}", with_hotword.text);
+
+        assert_eq!(
+            no_hotword.text, REFERENCE_RESCORING_TEXT,
+            "no-hotword baseline diverged from the golden un-biased transcript"
+        );
+        assert_eq!(
+            with_hotword.text, REFERENCE_WSC_TEXT,
+            "hotword-biased transcript did not flip to the human WSC reference"
+        );
+        assert_ne!(
+            no_hotword.text, with_hotword.text,
+            "the hotword must change the rescored transcript on this clip"
+        );
+
+        // The quantized rungs must also load + transcribe with the hotword: this
+        // proves the keep-quantized biasing_layer/combiner weights (bound native,
+        // like every other family matmul weight) still drive a usable fused
+        // decode, not just the fp16 rung above.
+        for quant in [DolphinQuantizationMode::Q8_0, DolphinQuantizationMode::Q4_K] {
+            let qpack = ensure_dolphin_pack(&root, quant).expect("quant pack builds");
+            let qreader = GgufTensorDataReader::from_path(&qpack).expect("quant reader");
+            let qmetadata =
+                crate::ggml_runtime::read_gguf_metadata(&qpack).expect("quant metadata");
+            let qoutput = transcribe_dolphin_pcm(
+                &qreader,
+                &qmetadata,
+                &samples,
+                DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
+                GgmlCpuGraphBackend::Cpu,
+                Some("zh-sichuan"),
+                Some(&phrase_bias),
+            )
+            .expect("dolphin transcribe (quant, with hotword)");
+            eprintln!("with hotword ({}) : {}", quant.label(), qoutput.text);
+            assert!(
+                !qoutput.text.is_empty(),
+                "{} hotword transcript must not be empty",
+                quant.label()
+            );
         }
     }
 }

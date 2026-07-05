@@ -25,9 +25,15 @@
 //! representation.
 //!
 //! Baked into the pack:
-//!   * every `encoder.*` / `decoder.*` / `ctc.*` tensor (the `context_module.*`
-//!     hotword-biasing tensors are intentionally dropped — not part of the core
-//!     ASR forward),
+//!   * every `encoder.*` / `decoder.*` / `ctc.*` tensor,
+//!   * the `context_module.*` native deep-biasing hotword tensors (the
+//!     `context_extractor` BiLSTM + word embedding, `context_encoder`,
+//!     `biasing_layer` cross-attention, `combiner`, `norm_aft_combiner`) --
+//!     everything the inference-time fusion in
+//!     `models::dolphin::hotword_context` needs. Only the training-only aux CTC
+//!     head over hotword context (`context_module.context_decoder*`) is dropped:
+//!     it is never exercised at inference (see
+//!     `models::dolphin::hotword_context` for the upstream reference),
 //!   * the global CMVN mean/istd (already present as `encoder.global_cmvn.*`),
 //!   * a kaldi/HTK mel filterbank (`dolphin.mel_filters`) reconstructed from the
 //!     `train.yaml` fbank config for the later frontend phase,
@@ -94,11 +100,18 @@ const FRAME_SHIFT_MS: u32 = 10;
 const FFT_SIZE: usize = 512;
 const MEL_LOW_HZ: f32 = 20.0;
 
-/// WeNet state-dict namespaces baked into the runtime pack (in order).
-const RUNTIME_TENSOR_PREFIXES: [&str; 3] = ["encoder.", "decoder.", "ctc."];
-/// Hotword contextual-biasing module: present in the checkpoint but not part of
-/// the core ASR forward, so it is dropped from the runtime pack.
-const DROPPED_TENSOR_PREFIX: &str = "context_module.";
+/// WeNet state-dict namespaces baked into the runtime pack (in order). The
+/// hotword deep-biasing module (`context_module.*`) is included here too --
+/// only its training-only aux CTC head (`DROPPED_TENSOR_PREFIXES`) is dropped.
+const RUNTIME_TENSOR_PREFIXES: [&str; 4] = ["encoder.", "decoder.", "ctc.", "context_module."];
+/// Training-only aux tensors under `context_module.*`: a CTC head over the
+/// hotword context embeddings, used only to regularize training. Inference
+/// (the deep-biasing fusion in `models::dolphin::hotword_context`) never reads
+/// these, so they are dropped to keep the pack lean.
+const DROPPED_TENSOR_PREFIXES: [&str; 2] = [
+    "context_module.context_decoder.",
+    "context_module.context_decoder_ctc_linear.",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[allow(non_camel_case_types)]
@@ -321,6 +334,41 @@ fn validate_checkpoint_shape(
             "dolphin checkpoint has {decoder_layers} decoder layers, expected {DECODER_N_LAYERS}"
         )));
     }
+
+    // Hotword deep-biasing module: only checked when present (older exports
+    // without a trained context module still import; the executor's
+    // `supports_phrase_bias` degrades to reporting no hotword capability for
+    // those packs via the tensor-index probe, not a hard import failure).
+    if safetensors
+        .tensor("context_module.context_extractor.word_embedding.weight")
+        .is_some()
+    {
+        expect(
+            "context_module.context_extractor.word_embedding.weight",
+            &shape("context_module.context_extractor.word_embedding.weight")?,
+            &[vocab_size as u64, ENCODER_D_MODEL as u64],
+        )?;
+        expect(
+            "context_module.context_extractor.sen_rnn.weight_ih_l0",
+            &shape("context_module.context_extractor.sen_rnn.weight_ih_l0")?,
+            &[4 * ENCODER_D_MODEL as u64, ENCODER_D_MODEL as u64],
+        )?;
+        expect(
+            "context_module.context_extractor.sen_rnn.weight_ih_l1",
+            &shape("context_module.context_extractor.sen_rnn.weight_ih_l1")?,
+            &[4 * ENCODER_D_MODEL as u64, 2 * ENCODER_D_MODEL as u64],
+        )?;
+        expect(
+            "context_module.biasing_layer.linear_q.weight",
+            &shape("context_module.biasing_layer.linear_q.weight")?,
+            &[ENCODER_D_MODEL as u64, ENCODER_D_MODEL as u64],
+        )?;
+        expect(
+            "context_module.combiner.weight",
+            &shape("context_module.combiner.weight")?,
+            &[ENCODER_D_MODEL as u64, ENCODER_D_MODEL as u64],
+        )?;
+    }
     Ok(())
 }
 
@@ -338,7 +386,10 @@ fn build_runtime_tensors(
     let mut seen = BTreeSet::new();
     for tensor in &safetensors.header().tensors {
         let name = tensor.name.as_str();
-        if name.starts_with(DROPPED_TENSOR_PREFIX) {
+        if DROPPED_TENSOR_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
             continue;
         }
         if !RUNTIME_TENSOR_PREFIXES

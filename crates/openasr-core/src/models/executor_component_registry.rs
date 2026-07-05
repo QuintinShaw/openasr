@@ -148,7 +148,7 @@ mod tests {
             ("wav2vec2-ctc", true),
             (crate::MOONSHINE_MODEL_FAMILY, true),
             (crate::arch::XASR_ZIPFORMER_MODEL_FAMILY, false),
-            (crate::arch::DOLPHIN_MODEL_FAMILY, false),
+            (crate::arch::DOLPHIN_MODEL_FAMILY, true),
         ]);
         let executors =
             materialize_builtin_executors_by_model_architecture().expect("executor map");

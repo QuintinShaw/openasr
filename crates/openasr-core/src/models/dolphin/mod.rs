@@ -12,6 +12,7 @@ pub(crate) mod decoder_graph;
 pub(crate) mod encoder_graph;
 pub(crate) mod executor;
 pub(crate) mod frontend;
+pub(crate) mod hotword_context;
 pub(crate) mod joint_decode;
 pub(crate) mod language;
 pub mod package_import;

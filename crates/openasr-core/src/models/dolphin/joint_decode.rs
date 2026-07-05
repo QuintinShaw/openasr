@@ -86,10 +86,18 @@ pub(crate) struct DolphinJointDecodeResult {
 ///
 /// `encoder_out` is the frame-major `[frames, d_model]` encoder output (d_model
 /// innermost), the layout the encoder graph emits and the decoder graph consumes.
+/// The CTC head (prefix-beam n-best generation) always reads `encoder_out`;
+/// `rescoring_encoder_out` is what the Transformer decoder rescores each
+/// hypothesis against -- ordinarily the same buffer, but the hotword deep-biasing
+/// fusion (`models::dolphin::hotword_context`) feeds a *different*, biased buffer
+/// there while leaving CTC's `encoder_out` unbiased, mirroring upstream's
+/// `decode()` (which computes `ctc_logprobs` before `apply_deep_biasing` replaces
+/// `encoder_out`).
 pub(crate) fn joint_decode(
     decoder_config: &DolphinDecoderConfig,
     provider: &dyn DolphinWeightProvider,
     encoder_out: &[f32],
+    rescoring_encoder_out: &[f32],
     frames: usize,
     decode_config: &DolphinJointDecodeConfig,
     backend: GgmlCpuGraphBackend,
@@ -101,6 +109,14 @@ pub(crate) fn joint_decode(
             reason: format!(
                 "encoder_out has {} values, expected {frames}x{d_model}",
                 encoder_out.len()
+            ),
+        });
+    }
+    if rescoring_encoder_out.len() != frames * d_model {
+        return Err(DolphinJointDecodeError::Shape {
+            reason: format!(
+                "rescoring_encoder_out has {} values, expected {frames}x{d_model}",
+                rescoring_encoder_out.len()
             ),
         });
     }
@@ -127,7 +143,7 @@ pub(crate) fn joint_decode(
     let scored_nbest = attention_rescore(
         decoder_config,
         provider,
-        encoder_out,
+        rescoring_encoder_out,
         frames,
         decode_config,
         &nbest,
