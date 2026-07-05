@@ -678,6 +678,17 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
                     )
                 })
         }
+        crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID => {
+            crate::models::sensevoice::runtime_contract::parse_sensevoice_execution_metadata(
+                &metadata,
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "sensevoice runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
+                )
+            })
+        }
         // No dedicated required-metadata parser for this architecture (yet):
         // stay Ok() here, same as before this check existed. The executor
         // still fails closed at first load if the pack is incomplete.

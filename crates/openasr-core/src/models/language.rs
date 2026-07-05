@@ -59,6 +59,7 @@ pub(crate) fn resolve_language_mode(
         LanguageFamilyHint::SelectsViaPrompt { default_language } => {
             LanguageMode::SpecifyOnly { default_language }
         }
+        LanguageFamilyHint::DetectAndSelectsViaPrompt => LanguageMode::DetectAndSpecify,
         LanguageFamilyHint::FixedMonolingual { language } => {
             LanguageMode::FixedMonolingual { language }
         }

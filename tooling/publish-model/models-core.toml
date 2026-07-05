@@ -148,6 +148,31 @@ upstream_release_date = "2026-05-13"
 # build version.
 min_core_version = "0.1.3"
 
+# SenseVoiceSmall (FunASR SAN-M/DFSMN encoder + CTC head): multilingual
+# zh/yue/en/ja/ko with model-side language id. NOT yet published
+# (no release_public): the entry stays on the internal lane until the user
+# authorizes the HF release. License is the FunASR Model License v1.1 --
+# a custom license permitting commercial use; never mislabel it Apache-2.0.
+["sensevoice-small"]
+family = "sensevoice"
+hf_repo = "OpenASR/sensevoice-small"
+aliases = ["sensevoice", "sensevoice-small"]
+pull_alias = "sensevoice"
+size = "small"
+registry_id = "sensevoice-small"
+display_name = "SenseVoice Small"
+license_name = "FunASR Model License v1.1"
+license_source = "https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE"
+license_class = "permissive"
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "fp16"
+sort_weight = 900
+upstream_release_date = "2024-07-04"
+# Forward-compat runtime floor: the sensevoice family (SAN-M/FSMN encoder,
+# keep-quantized executor) needs the next core runtime; older builds surface it
+# as "update to use" and refuse the pull. Author-set.
+min_core_version = "0.1.5"
+
 # Diarization support packs: not ASR models. Published support packs keep their
 # catalog-declared variants. Speaker embedding/segmentation are
 # language-agnostic; `languages` lists the product's validated domains.

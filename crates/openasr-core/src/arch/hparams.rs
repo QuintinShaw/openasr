@@ -153,6 +153,19 @@ pub(crate) static PARAKEET_CTC_HPARAM_SCHEMA: &[&str] = &[
     "ctc.blank_token_id",
 ];
 
+// ── sensevoice (FunAudioLLM/SenseVoiceSmall, SAN-M/CTC) hparam schema ────────
+pub(crate) static SENSEVOICE_HPARAM_SCHEMA: &[&str] = &[
+    "sensevoice.n_layers",
+    "sensevoice.tp_layers",
+    "sensevoice.d_model",
+    "sensevoice.n_heads",
+    "sensevoice.ffn_dim",
+    "sensevoice.fsmn_kernel",
+    "sensevoice.feature_dim",
+    "sensevoice.vocab_size",
+    "ctc.blank_token_id",
+];
+
 // ── wav2vec2-ctc (facebook/wav2vec2-base-960h) hparam schema ─────────────────
 pub(crate) static WAV2VEC2_CTC_HPARAM_SCHEMA: &[&str] = &[
     "wav2vec2.n_layers",

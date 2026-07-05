@@ -21,8 +21,8 @@ use hparams::{
     COHERE_TRANSCRIBE_DECODER_LAYERS_KEY, COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY,
     COHERE_TRANSCRIBE_HPARAM_SCHEMA, DOLPHIN_HPARAM_SCHEMA, MOONSHINE_HPARAM_SCHEMA,
     PARAKEET_CTC_HPARAM_SCHEMA, QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA,
-    QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY, WAV2VEC2_CTC_HPARAM_SCHEMA,
-    WHISPER_HPARAM_SCHEMA, XASR_ZIPFORMER_HPARAM_SCHEMA,
+    QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY, SENSEVOICE_HPARAM_SCHEMA,
+    WAV2VEC2_CTC_HPARAM_SCHEMA, WHISPER_HPARAM_SCHEMA, XASR_ZIPFORMER_HPARAM_SCHEMA,
 };
 
 pub(crate) const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
@@ -109,6 +109,20 @@ pub(crate) const DOLPHIN_TOKENIZER_ID: &str = "dolphin.char.v0";
 pub(crate) const DOLPHIN_DECODE_POLICY_ID: &str = "dolphin.attention-rescoring.v0";
 pub(crate) const DOLPHIN_RUNTIME_TENSOR_CONTRACT_ID: &str = "dolphin.runtime-tensors.v0";
 pub(crate) const DOLPHIN_EXECUTOR_COMPONENT_ID: &str = "dolphin.ggml-executor.v0";
+
+// sensevoice (FunAudioLLM/SenseVoiceSmall: SAN-M/DFSMN encoder + CTC head,
+// FunASR Model License v1.1). Component ids are defined ahead of the full
+// architecture-descriptor entry (the parakeet S2->S4 staging precedent): the
+// importer writes them as pack metadata; the descriptor + executor wiring
+// lands with the executor stage.
+pub(crate) const SENSEVOICE_GGML_ARCHITECTURE_ID: &str = "sensevoice-sanm-ctc";
+pub(crate) const SENSEVOICE_GGML_ADAPTER_ID: &str = "ggml-family-sensevoice-runtime-v1";
+pub(crate) const SENSEVOICE_MODEL_FAMILY: &str = "sensevoice";
+pub(crate) const SENSEVOICE_AUDIO_FRONTEND_ID: &str = "sensevoice.fbank80-lfr7x6.16khz.mono.v0";
+pub(crate) const SENSEVOICE_TOKENIZER_ID: &str = "sensevoice.spm-bpe.v0";
+pub(crate) const SENSEVOICE_DECODE_POLICY_ID: &str = "sensevoice.greedy.ctc.v0";
+pub(crate) const SENSEVOICE_RUNTIME_TENSOR_CONTRACT_ID: &str = "sensevoice.runtime-tensors.v0";
+pub(crate) const SENSEVOICE_EXECUTOR_COMPONENT_ID: &str = "sensevoice.ggml-executor.v0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenAsrComponentKind {
@@ -446,6 +460,7 @@ impl OpenAsrArchitectureRegistry {
                     &[
                         OpenAsrBlockKind::ConformerBlock,
                         OpenAsrBlockKind::Wav2Vec2PostNormEncoderLayer,
+                        OpenAsrBlockKind::SanMFsmnEncoderLayer,
                     ],
                     None,
                 ),
@@ -656,6 +671,26 @@ const BUILTIN_COMPONENT_DESCRIPTORS: &[OpenAsrComponentDescriptor] = &[
         kind: OpenAsrComponentKind::Executor,
         id: DOLPHIN_EXECUTOR_COMPONENT_ID,
     },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
+        id: SENSEVOICE_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: SENSEVOICE_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: SENSEVOICE_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: SENSEVOICE_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: SENSEVOICE_EXECUTOR_COMPONENT_ID,
+    },
 ];
 
 const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
@@ -857,6 +892,35 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // dedicated executor (the E-Branchformer block is not a composer block
         // kind), so no data-driven block-stack descriptor.
         block_stack: None,
+    },
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &[SENSEVOICE_GGML_ARCHITECTURE_ID, "sensevoice"],
+        model_family: SENSEVOICE_MODEL_FAMILY,
+        model_architecture: SENSEVOICE_GGML_ARCHITECTURE_ID,
+        adapter_id: SENSEVOICE_GGML_ADAPTER_ID,
+        // Accepts an explicit zh/yue/en/ja/ko selection via the 4-token prompt
+        // and auto-detects (readable `<|lang|>` CTC tag) when unset.
+        language_family_hint: LanguageFamilyHint::DetectAndSelectsViaPrompt,
+        audio_frontend_id: SENSEVOICE_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: SENSEVOICE_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: SENSEVOICE_TOKENIZER_ID,
+        decode_policy_id: SENSEVOICE_DECODE_POLICY_ID,
+        executor_component_id: SENSEVOICE_EXECUTOR_COMPONENT_ID,
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        hparam_schema: SENSEVOICE_HPARAM_SCHEMA,
+        // Non-autoregressive CTC: SAN-M/FSMN encoder + CTC head, no decoder
+        // stage. The `tp.blk` stage rides the same dedicated executor; the
+        // descriptor pins the primary `enc.blk` stack.
+        block_stack: Some(OpenAsrBlockStackDescriptor {
+            orchestration_shape: OpenAsrOrchestrationShape::Ctc,
+            encoder_stage: Some(OpenAsrStageDescriptor {
+                block_kind: OpenAsrBlockKind::SanMFsmnEncoderLayer,
+                layer_count_hparam: "sensevoice.n_layers",
+                tensor_name_scope: "enc.blk",
+            }),
+            decoder_stage: None,
+        }),
     },
 ];
 
@@ -1158,6 +1222,59 @@ mod tests {
                     model_architecture: COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
                     orchestration_shape: OpenAsrOrchestrationShape::Seq2SeqEncoderDecoder,
                     block_kind: OpenAsrBlockKind::TransformerEncoderLayer,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn ctc_shape_accepts_sanm_fsmn_encoder_block() {
+        // SenseVoice's SAN-M/FSMN encoder is a valid CTC encoder block kind
+        // (encoder-only, no decoder stage). Reuse parakeet's Ctc descriptor and
+        // swap in the FSMN encoder block: it must validate.
+        let parakeet = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(PARAKEET_CTC_GGML_ARCHITECTURE_ID)
+            .expect("parakeet architecture");
+        let descriptor = OpenAsrArchitectureDescriptor {
+            block_stack: Some(OpenAsrBlockStackDescriptor {
+                orchestration_shape: OpenAsrOrchestrationShape::Ctc,
+                encoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::SanMFsmnEncoderLayer,
+                    layer_count_hparam: "parakeet.n_layers",
+                    tensor_name_scope: "enc.blk",
+                }),
+                decoder_stage: None,
+            }),
+            ..parakeet
+        };
+
+        assert_eq!(
+            OpenAsrArchitectureRegistry::validate_block_stack(descriptor),
+            Ok(())
+        );
+
+        // And a decoder stage under the Ctc shape must still fail closed.
+        let with_decoder = OpenAsrArchitectureDescriptor {
+            block_stack: Some(OpenAsrBlockStackDescriptor {
+                orchestration_shape: OpenAsrOrchestrationShape::Ctc,
+                encoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::SanMFsmnEncoderLayer,
+                    layer_count_hparam: "parakeet.n_layers",
+                    tensor_name_scope: "enc.blk",
+                }),
+                decoder_stage: Some(OpenAsrStageDescriptor {
+                    block_kind: OpenAsrBlockKind::Seq2SeqDecoderLayer,
+                    layer_count_hparam: "parakeet.n_layers",
+                    tensor_name_scope: "dec.blk",
+                }),
+            }),
+            ..parakeet
+        };
+        assert_eq!(
+            OpenAsrArchitectureRegistry::validate_block_stack(with_decoder),
+            Err(
+                OpenAsrArchitectureRegistryError::CtcShapeMustNotHaveDecoderStage {
+                    model_architecture: PARAKEET_CTC_GGML_ARCHITECTURE_ID,
                 }
             )
         );

@@ -788,3 +788,271 @@ where
         map_err,
     )
 }
+
+/// Scalar/shape knobs for one SenseVoice SAN-M encoder block (self-attention
+/// with a DFSMN depthwise-conv memory branch, then a plain ReLU FFN).
+///
+/// `input_dim` may differ from `d_model` on the stack's first layer (SenseVoice
+/// feeds the 560-dim LFR+prompt feature straight into `enc.blk.0`, whose QKV
+/// projects 560 -> 3*512); when it differs the attention residual is skipped,
+/// matching FunASR's `EncoderLayerSANM` (`in_size != size` => no residual).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SanMFsmnBlockConfig {
+    pub d_model: usize,
+    pub input_dim: usize,
+    pub attention_heads: usize,
+    pub head_dim: usize,
+    pub frame_count: usize,
+    pub fsmn_kernel: usize,
+    pub layer_norm_epsilon: f32,
+}
+
+/// Weight handles for one SAN-M block. `attn_qkv_weight` is the fused
+/// `[input_dim, 3*d_model]` projection; `attn_fsmn_weight` is the depthwise
+/// conv kernel `[kernel, 1, d_model]` and MUST be f16 (ggml `conv_2d_dw`
+/// requires an f16 kernel, mirroring the conformer depthwise conv).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SanMFsmnBlockWeights<'a> {
+    pub attn_norm_weight: GgmlCpuTensor<'a>,
+    pub attn_norm_bias: GgmlCpuTensor<'a>,
+    pub attn_qkv_weight: GgmlCpuTensor<'a>,
+    pub attn_qkv_bias: GgmlCpuTensor<'a>,
+    pub attn_out_weight: GgmlCpuTensor<'a>,
+    pub attn_out_bias: GgmlCpuTensor<'a>,
+    pub attn_fsmn_weight: GgmlCpuTensor<'a>,
+    pub ffn_norm_weight: GgmlCpuTensor<'a>,
+    pub ffn_norm_bias: GgmlCpuTensor<'a>,
+    pub ffn_up_weight: GgmlCpuTensor<'a>,
+    pub ffn_up_bias: GgmlCpuTensor<'a>,
+    pub ffn_down_weight: GgmlCpuTensor<'a>,
+    pub ffn_down_bias: GgmlCpuTensor<'a>,
+}
+
+/// One SenseVoice/Paraformer SAN-M encoder block:
+///
+/// ```text
+///   xn  = LN(x)
+///   qkv = W_qkv xn + b        (fused; split into q/k/v views)
+///   mem = v + depthwise_conv1d(v, kernel, symmetric pad)   [DFSMN branch]
+///   att = W_out softmax(q k^T / sqrt(d_k)) v + b_out + mem
+///   x   = x + att             (skipped when input_dim != d_model)
+///   x   = x + W2 relu(W1 LN(x) + b1) + b2
+/// ```
+///
+/// Bidirectional (no attention mask): SenseVoice is a non-autoregressive CTC
+/// encoder over one utterance.
+pub(crate) fn sanm_fsmn_encoder_layer<'a, E, F>(
+    graph: &mut GgmlCpuGraphBuilder<'a>,
+    input: GgmlCpuTensor<'a>,
+    config: SanMFsmnBlockConfig,
+    weights: SanMFsmnBlockWeights<'a>,
+    map_err: F,
+) -> Result<GgmlCpuTensor<'a>, E>
+where
+    F: Fn(&'static str, GgmlCpuGraphError) -> E + Copy,
+{
+    let d_model = config.d_model;
+    let frame_count = config.frame_count;
+    let element = std::mem::size_of::<f32>();
+
+    // ----- pre-norm + fused QKV -----
+    let attn_norm = apply_affine_layer_norm(
+        graph,
+        input,
+        config.layer_norm_epsilon,
+        weights.attn_norm_weight,
+        weights.attn_norm_bias,
+        AffineLayerNormSteps {
+            norm: "ggml_norm(layer_norm)",
+            scale: "sanm_attn_norm",
+            bias: "sanm_attn_norm",
+        },
+        map_err,
+    )?;
+    let mut qkv = graph
+        .mul_mat(weights.attn_qkv_weight, attn_norm)
+        .map_err(|source| map_err("ggml_mul_mat(sanm_qkv)", source))?;
+    qkv = graph
+        .add(qkv, weights.attn_qkv_bias)
+        .map_err(|source| map_err("ggml_add(sanm_qkv_bias)", source))?;
+    qkv = graph
+        .cont(qkv)
+        .map_err(|source| map_err("ggml_cont(sanm_qkv)", source))?;
+    let qkv_row = 3 * d_model * element;
+    let split = |offset_units: usize, step: &'static str| {
+        graph
+            .view_2d(qkv, d_model, frame_count, qkv_row, offset_units * element)
+            .and_then(|view| graph.cont(view))
+            .map_err(|source| map_err(step, source))
+    };
+    let q = split(0, "ggml_view_2d(sanm_q)")?;
+    let k = split(d_model, "ggml_view_2d(sanm_k)")?;
+    let v = split(2 * d_model, "ggml_view_2d(sanm_v)")?;
+
+    // ----- DFSMN memory branch: v + depthwise conv1d over time -----
+    // Same im2col-backed depthwise pattern as the conformer conv module:
+    // kernel [kernel,1,d_model] -> 4-D, v [d_model,T] -> [T,1,d_model,1],
+    // conv_2d_dw with symmetric (kernel-1)/2 padding (sanm_shift = 0).
+    let dw_weight = graph
+        .reshape_4d(weights.attn_fsmn_weight, config.fsmn_kernel, 1, 1, d_model)
+        .map_err(|source| map_err("ggml_reshape_4d(sanm_fsmn_weight)", source))?;
+    let v_t = graph
+        .transpose(v)
+        .map_err(|source| map_err("ggml_transpose(sanm_fsmn_in)", source))?;
+    let v_t = graph
+        .cont(v_t)
+        .map_err(|source| map_err("ggml_cont(sanm_fsmn_in)", source))?;
+    let v_4d = graph
+        .reshape_4d(v_t, frame_count, 1, d_model, 1)
+        .map_err(|source| map_err("ggml_reshape_4d(sanm_fsmn_in)", source))?;
+    let mut fsmn = graph
+        .conv_2d_dw(dw_weight, v_4d, 1, 1, (config.fsmn_kernel - 1) / 2, 0, 1, 1)
+        .map_err(|source| map_err("ggml_conv_2d_dw(sanm_fsmn)", source))?;
+    fsmn = graph
+        .permute(fsmn, 1, 2, 0, 3)
+        .map_err(|source| map_err("ggml_permute(sanm_fsmn_out)", source))?;
+    fsmn = graph
+        .cont(fsmn)
+        .map_err(|source| map_err("ggml_cont(sanm_fsmn_out)", source))?;
+    fsmn = graph
+        .reshape_2d(fsmn, d_model, frame_count)
+        .map_err(|source| map_err("ggml_reshape_2d(sanm_fsmn_out)", source))?;
+    let fsmn_mem = graph
+        .add(fsmn, v)
+        .map_err(|source| map_err("ggml_add(sanm_fsmn_residual)", source))?;
+
+    // ----- bidirectional scaled-dot self-attention -----
+    let layout = AttentionHeadLayout {
+        head_dim: config.head_dim,
+        attention_heads: config.attention_heads,
+        sequence_len: frame_count,
+    };
+    let q_heads = reshape_projection_to_attention_heads(
+        graph,
+        q,
+        layout,
+        STANDARD_HEAD_PERMUTE_AXES,
+        false,
+        AttentionReshapeSteps {
+            reshape: "ggml_reshape_3d(sanm_q)",
+            permute: "ggml_permute(sanm_q)",
+            cont: "ggml_cont(sanm_q)",
+        },
+        map_err,
+    )?;
+    let k_heads = reshape_projection_to_attention_heads(
+        graph,
+        k,
+        layout,
+        STANDARD_HEAD_PERMUTE_AXES,
+        false,
+        AttentionReshapeSteps {
+            reshape: "ggml_reshape_3d(sanm_k)",
+            permute: "ggml_permute(sanm_k)",
+            cont: "ggml_cont(sanm_k)",
+        },
+        map_err,
+    )?;
+    let k_heads = graph
+        .cont(k_heads)
+        .map_err(|source| map_err("ggml_cont(sanm_k)", source))?;
+    let mut scores = graph
+        .mul_mat(k_heads, q_heads)
+        .map_err(|source| map_err("ggml_mul_mat(sanm_scores)", source))?;
+    scores = graph
+        .scale(scores, 1.0 / (config.head_dim as f32).sqrt())
+        .map_err(|source| map_err("ggml_scale(sanm_scores)", source))?;
+    let probs = graph
+        .soft_max(scores)
+        .map_err(|source| map_err("ggml_soft_max(sanm_scores)", source))?;
+    let v_heads = reshape_projection_to_attention_heads(
+        graph,
+        v,
+        layout,
+        STANDARD_HEAD_PERMUTE_AXES,
+        true,
+        AttentionReshapeSteps {
+            reshape: "ggml_reshape_3d(sanm_v)",
+            permute: "ggml_permute(sanm_v)",
+            cont: "ggml_cont(sanm_v)",
+        },
+        map_err,
+    )?;
+    let context = attention_context_from_probs(
+        graph,
+        v_heads,
+        probs,
+        layout,
+        AttentionValueMergeSteps {
+            value_permute: "ggml_permute(sanm_v_t)",
+            value_cont: "ggml_cont(sanm_v_t)",
+            context_mul: "ggml_mul_mat(sanm_ctx)",
+            context_merge_permute: "ggml_permute(sanm_ctx_merge)",
+            context_merge_cont: "ggml_cont(sanm_ctx_merge)",
+            context_merge_reshape: "ggml_reshape_2d(sanm_ctx_merge)",
+        },
+        map_err,
+    )?;
+    let mut attn_out = graph
+        .mul_mat(weights.attn_out_weight, context)
+        .map_err(|source| map_err("ggml_mul_mat(sanm_attn_out)", source))?;
+    attn_out = graph
+        .add(attn_out, weights.attn_out_bias)
+        .map_err(|source| map_err("ggml_add(sanm_attn_out_bias)", source))?;
+    attn_out = graph
+        .add(attn_out, fsmn_mem)
+        .map_err(|source| map_err("ggml_add(sanm_fsmn_mem)", source))?;
+    // FunASR EncoderLayerSANM: the attention residual only applies when the
+    // block's input width equals d_model (the 560-dim first layer skips it).
+    let state = if config.input_dim == d_model {
+        graph
+            .add(input, attn_out)
+            .map_err(|source| map_err("ggml_add(sanm_attn_residual)", source))?
+    } else {
+        attn_out
+    };
+
+    // ----- position-wise FFN (ReLU) with residual -----
+    let ffn_norm = apply_affine_layer_norm(
+        graph,
+        state,
+        config.layer_norm_epsilon,
+        weights.ffn_norm_weight,
+        weights.ffn_norm_bias,
+        AffineLayerNormSteps {
+            norm: "ggml_norm(layer_norm)",
+            scale: "sanm_ffn_norm",
+            bias: "sanm_ffn_norm",
+        },
+        map_err,
+    )?;
+    apply_feed_forward_residual(
+        graph,
+        ffn_norm,
+        state,
+        FeedForwardActivation::Relu,
+        None,
+        FeedForwardResidualSteps {
+            activation: "ggml_relu(sanm_ffn)",
+            scale: None,
+            residual: "ggml_add(sanm_ffn_residual)",
+        },
+        |graph, value| {
+            let up = graph
+                .mul_mat(weights.ffn_up_weight, value)
+                .map_err(|source| map_err("ggml_mul_mat(sanm_ffn_up)", source))?;
+            graph
+                .add(up, weights.ffn_up_bias)
+                .map_err(|source| map_err("ggml_add(sanm_ffn_up_bias)", source))
+        },
+        |graph, value| {
+            let down = graph
+                .mul_mat(weights.ffn_down_weight, value)
+                .map_err(|source| map_err("ggml_mul_mat(sanm_ffn_down)", source))?;
+            graph
+                .add(down, weights.ffn_down_bias)
+                .map_err(|source| map_err("ggml_add(sanm_ffn_down_bias)", source))
+        },
+        map_err,
+    )
+}

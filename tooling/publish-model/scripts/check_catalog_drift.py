@@ -41,6 +41,7 @@ FAMILY_DOC_KEYWORDS = {
     "xasr-zipformer": "x-asr",
     "parakeet": "parakeet",
     "wav2vec2": "wav2vec2",
+    "sensevoice": "sensevoice",
 }
 
 WORD_TO_NUMBER = {

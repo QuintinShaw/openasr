@@ -2,10 +2,10 @@
   "schema_version": 1,
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "catalog_sha256": "505213535e13f4466a118ac53f28c8e602f67953938e7f79fdf71c43266ff66b",
-  "catalog_epoch": 2026070501,
+  "catalog_epoch": 2026070601,
   "signature": {
     "algorithm": "ed25519",
     "key_id": "openasr-catalog-v1",
-    "value": "62833e4801b5785da1e0678c8bf95cb5a02e9975d736bbebc989aa543ba95c0203657a6ff0b23071bf0f08441f18b64b1457f25659ff7f3e018d4e1378aeb60a"
+    "value": "4eba55a05c94f6ca5698e9f9907fce4aec39abc59bf394651266ebd7c4e42791852265277d4c5d36dd48b1da4843f0785c31ef9beb9acf620109e07f09fd9708"
   }
 }

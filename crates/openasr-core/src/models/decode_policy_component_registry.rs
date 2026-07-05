@@ -165,6 +165,19 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         // wav2vec2-base-960h: vocab_size 32, pad_token_id 0 = the CTC blank.
         ctc_blank_token_id: Some(0),
     },
+    BuiltinDecodePolicyComponentDescriptor {
+        decode_policy_id: crate::SENSEVOICE_DECODE_POLICY_ID,
+        execution_kind: BuiltinDecodePolicyExecutionKind::CtcGreedyV0,
+        seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
+        seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Text,
+        longform_profile: BuiltinDecodePolicyLongformProfile::Default,
+        // SenseVoiceSmall: vocab_size 25055, piece 0 (`<unk>`) = the CTC blank
+        // (FunASR default blank_id 0).
+        ctc_blank_token_id: Some(0),
+    },
 ];
 
 pub(crate) trait BuiltinSeq2SeqDecodePolicyTokenSource: PhraseBiasTokenEncoder {

@@ -228,6 +228,8 @@ LANG_BY_FAMILY = {
     "moonshine": ["en"],
     "parakeet": ["en"],
     "wav2vec2": ["en"],
+    # SenseVoiceSmall: zh, yue (Cantonese), en, ja, ko with model-side LID.
+    "sensevoice": ["en", "ja", "ko", "yue", "zh"],
 }
 
 # Per-family source-language parameter policy for the catalog's `language_mode`
@@ -265,6 +267,9 @@ LANGUAGE_MODE_BY_FAMILY = {
     "moonshine": "fixed_monolingual",
     "parakeet": "fixed_monolingual",
     "wav2vec2": "fixed_monolingual",
+    # SenseVoice: DetectAndSelectsViaPrompt -- explicit zh/yue/en/ja/ko selection
+    # via the 4-token prompt, decode-time LID (readable <|lang|> tag) when unset.
+    "sensevoice": "detect_and_specify",
 }
 
 # SpecifyOnly's conditioned default, mirroring the `default_language` literal
