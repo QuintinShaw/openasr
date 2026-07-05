@@ -16,7 +16,7 @@
 OpenASR is the Apache-2.0 **open core** of a local-first STT platform: a single
 `openasr` Rust CLI, a local OpenAI-compatible HTTP API subset, a signed model
 catalog, and native [ggml](https://github.com/ggml-org/ggml)-backed inference
-across seven model families on CPU and Apple Metal.
+across eight model families on CPU and Apple Metal.
 
 <!-- TODO: demo GIF -->
 
@@ -26,9 +26,10 @@ whisper.cpp and faster-whisper are excellent Whisper runners. OpenASR is a
 broader local-first STT *platform* built around four things they do not bundle:
 
 - **Many model families, one binary.** Whisper, Cohere Transcribe, Qwen3-ASR,
-  Parakeet-CTC, wav2vec2-CTC (incl. data2vec), Moonshine, and X-ASR (Zipformer)
-  all run through the same data-driven architecture registry -- not a single
-  Whisper family. Pick the model that fits the task and keep one toolchain.
+  Parakeet-CTC, wav2vec2-CTC (incl. data2vec), Moonshine, Dolphin (Chinese
+  dialects), and X-ASR (Zipformer) all run through the same data-driven
+  architecture registry -- not a single Whisper family. Pick the model that
+  fits the task and keep one toolchain.
 - **A signed catalog with consent-gated pulls.** Models come from a signed
   catalog, and `openasr transcribe` installs a missing model only through a
   **visible confirmation** showing the model, quant, size, host, and license --
@@ -48,9 +49,9 @@ confirmation, then everything runs offline on your hardware.
 
 ## Model support
 
-Seven native families run offline on CPU and Apple Metal, dispatched by the
-data-driven architecture registry. All families export word-level timestamps and
-support opt-in diarization; the columns below show where they differ.
+Eight native families run offline on CPU and Apple Metal, dispatched by the
+data-driven architecture registry. All families support opt-in diarization; most
+also export word-level timestamps -- the columns below show where they differ.
 
 | Family | Streaming | Word timestamps | Quant tiers |
 | --- | --- | --- | --- |
@@ -60,14 +61,17 @@ support opt-in diarization; the columns below show where they differ.
 | Parakeet-CTC | declared-pack | acoustic | fp16 / q8_0 / q4_k |
 | wav2vec2-CTC (incl. data2vec) | declared-pack | acoustic | fp16 / q8_0 / q4_k |
 | Moonshine | declared-pack | approximate | fp16 / q8_0 / q4_k |
+| Dolphin (Chinese dialects) | none | none | fp16 / q8_0 / q4_k |
 | X-ASR (Zipformer, RNN-T) | declared-pack | acoustic | fp16 / q8_0 / q4_k |
 
 - **Streaming** -- native frame-synchronous streaming emits incremental partials
   for packs that declare the streaming feature; other packs fall back to
-  final-per-utterance output.
+  final-per-utterance output. Dolphin has no streaming executor yet, so it
+  always runs final-per-utterance.
 - **Word timestamps** -- *acoustic* means real acoustic frame alignment
   (Whisper decoder cross-attention; frame spans for the CTC/transducer families);
   *approximate* means decoder token-position estimates. Both export to JSON/VTT.
+  Dolphin does not emit word-level timing at all (segment-level only).
 - **Diarization** -- `--diarize` attributes anonymous `SPEAKER_NN` labels onto
   any family's transcript via pure-Rust WeSpeaker + pyannote capability packs;
   Cohere packs can additionally emit inline speaker tokens.
@@ -195,8 +199,8 @@ cargo run -p openasr-cli -- model-pack import qwen         <source_dir> <out.oas
 cargo run -p openasr-cli -- model-pack import moonshine    <source_dir> <out.oasr> --package-id moonshine-tiny --source-revision <rev>
 ```
 
-Other families: `cohere`, `parakeet-ctc`, `wav2vec2-ctc`, `xasr-zipformer`,
-`hymt2-gguf`, `wespeaker`, `pyannote`. Each accepts
+Other families: `cohere`, `parakeet-ctc`, `wav2vec2-ctc`, `dolphin`,
+`xasr-zipformer`, `hymt2-gguf`, `wespeaker`, `pyannote`. Each accepts
 `--quantization fp16|q8_0|q4_k` (Qwen also exposes `q3_k`).
 
 ## Local HTTP API
