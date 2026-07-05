@@ -177,6 +177,7 @@ fn alias_contract_model(
         hf_revision: revision.to_string(),
         public,
         min_cli_version: "0.1.0".to_string(),
+        min_core_version: None,
         recommended_quant: "q8_0".to_string(),
         pull_recommended: format!("{id}:q8"),
         sort_weight: 0,
@@ -1240,6 +1241,61 @@ fn catalog_with_future_min_cli_version_loads_but_gates_pull() {
     assert!(
         error.contains("requires OpenASR >="),
         "expected requires-update gate, got: {error}"
+    );
+}
+
+#[test]
+fn catalog_with_future_min_core_version_loads_but_gates_pull() {
+    // A model forward-published for a newer core runtime declares min_core_version
+    // (distinct from min_cli_version, which stays at the satisfied 0.1.0). An older
+    // build must still SEE it, surface it as "update to use", and refuse the pull.
+    let contents = catalog_json().replace(
+        r#""min_cli_version": "0.1.0","#,
+        r#""min_cli_version": "0.1.0",
+      "min_core_version": "999.0.0","#,
+    );
+
+    let catalog = parse_model_catalog(&contents, "fixture").expect("catalog should still parse");
+    let model = catalog
+        .models
+        .iter()
+        .find(|model| model.min_core_version.as_deref() == Some("999.0.0"))
+        .expect("model with future min_core_version present");
+
+    assert!(matches!(
+        model.availability(),
+        ModelAvailability::RequiresUpdate { .. }
+    ));
+
+    let request = CatalogPullRequest {
+        reference: model.id.clone(),
+        quant: None,
+        size: None,
+    };
+    let error = resolve_catalog_pull(&catalog, &request)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("requires OpenASR >= 999.0.0"),
+        "expected requires-update gate reporting the min_core_version floor, got: {error}"
+    );
+}
+
+#[test]
+fn catalog_parser_rejects_malformed_min_core_version() {
+    let contents = catalog_json().replace(
+        r#""min_cli_version": "0.1.0","#,
+        r#""min_cli_version": "0.1.0",
+      "min_core_version": "0.1","#,
+    );
+
+    let error = parse_model_catalog(&contents, "fixture")
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("min_core_version must use major.minor.patch"),
+        "expected min_core_version format rejection, got: {error}"
     );
 }
 

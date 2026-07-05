@@ -34,6 +34,7 @@ credits the people who built the original.
 - Qwen3-ASR — <https://huggingface.co/OpenASR/qwen3-asr-0.6b>
 - Moonshine — <https://huggingface.co/OpenASR/moonshine-tiny>
 - X-ASR (Zipformer) — <https://huggingface.co/OpenASR/xasr-zh-en>
+- Dolphin CN-Dialect Small (DataoceanAI) — <https://huggingface.co/OpenASR/dolphin-cn-dialect-small>
 - Parakeet-CTC (NVIDIA NeMo) and wav2vec2 / data2vec (Meta AI) run from
   user-imported packs.
 

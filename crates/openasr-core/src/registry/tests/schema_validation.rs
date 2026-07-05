@@ -88,6 +88,37 @@ fn public_catalog_projection_signature_verifies_and_excludes_private_entries() {
     );
 }
 
+#[test]
+fn embedded_catalog_fingerprint_matches_committed_public_catalog_and_signature() {
+    use sha2::{Digest, Sha256};
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry");
+    let public_contents = fs::read_to_string(root.join("catalog.public.json")).unwrap();
+    let manifest_contents = fs::read_to_string(root.join("catalog.public.signature.json")).unwrap();
+    let manifest: crate::CatalogSignatureManifest =
+        serde_json::from_str(&manifest_contents).unwrap();
+
+    let expected_sha256 = {
+        let mut hasher = Sha256::new();
+        hasher.update(public_contents.as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+
+    let (catalog_sha256, catalog_epoch) = crate::embedded_catalog_fingerprint().unwrap();
+
+    // Locks the CLI `catalog-fingerprint` contract: the fingerprint is byte-identical
+    // to sha256(model-registry/catalog.public.json) -- the exact bytes `include_str!`
+    // embeds -- and the epoch matches the committed signature manifest's epoch, so a
+    // packaging gate comparing this against a copied catalog resource is meaningful.
+    assert_eq!(catalog_sha256, expected_sha256);
+    assert_eq!(catalog_sha256, manifest.catalog_sha256);
+    assert_eq!(catalog_epoch, manifest.catalog_epoch);
+}
+
 /// Python<->Rust drift contract for the signed catalog's `language_labels` map
 /// (design (c), analogous to the canonical quant-tag contract). The Python
 /// emitter in tooling/publish-model/scripts/_catalog.py writes the map into the

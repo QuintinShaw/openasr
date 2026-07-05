@@ -21,7 +21,8 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   registered streaming executor. Local temporary packs for Qwen3-ASR, Whisper,
   Cohere Transcribe, Moonshine, Parakeet-CTC, and wav2vec2-CTC have passed the
   ignored smoke, but official published packs with that metadata and public
-  product guarantees are still pending.
+  product guarantees are still pending. Dolphin has no streaming executor at
+  all yet, so it always runs final-per-utterance.
 - Speaker diarization is opt-in (`--diarize` / the API `diarize` flag). It uses
   pure-Rust WeSpeaker speaker-embedding and pyannote segmentation capability packs
   (pulled/installed on demand) to attribute anonymous `SPEAKER_NN` labels onto any
@@ -40,6 +41,9 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   (parakeet-ctc, wav2vec2-ctc) use decoder frame spans; Qwen, Cohere, and
   Moonshine fall back to decoder token-position estimates because those runtimes
   do not expose acoustic attention, so their word timings are approximate.
+  Dolphin does not emit word-level timestamps at all -- its CTC/attention joint
+  decode only returns a single segment-level span, so `--word-timestamps`
+  requests against a Dolphin pack yield an empty word list rather than an error.
 - Hardware execution target selection is generic: Desktop/server requests support
   `auto`, `cpu`, and `accelerated` when the native runtime reports an accelerated
   device. There is no per-provider/per-device pinning surface such as `gpu0`,
@@ -77,6 +81,11 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   ignored -- use a multilingual Whisper pack when you need to force or read back the
   language. (Wiring Qwen's text-prompt language conditioning is tracked, but needs a
   real-pack parity check against the reference inference before it can be claimed.)
+  Dolphin is specify-only: it does not auto-detect, so an explicit `--language`
+  selects one of its 14 recognition codes (`zh` plus 13 Chinese regional-dialect
+  codes such as `zh-sichuan`, `zh-shanghai`, `zh-hebei`) via a decode-prompt
+  token, defaulting to `zh` when unset; an unsupported code is rejected rather
+  than silently falling back.
 
 ## What works now
 

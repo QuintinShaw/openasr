@@ -69,6 +69,11 @@ PUBLIC_DIR="${OPENASR_PUBLIC_DIR:-$REPO_ROOT/tmp/publish/catalog}"
 PUBLIC_CATALOG="$PUBLIC_DIR/catalog.json"
 PUBLIC_MANIFEST="$PUBLIC_DIR/catalog.signature.json"
 SIGNING_KEY_SEED="${OPENASR_CATALOG_SIGNING_KEY_SEED_HEX:-}"
+# Previously committed signed public manifest, whose catalog_epoch is the
+# floor the new epoch must strictly exceed (see epoch monotonicity check
+# below). Overridable so tests can point this at a fixture path instead of
+# the real committed repo file.
+COMMITTED_PUBLIC_MANIFEST="${OPENASR_COMMITTED_PUBLIC_MANIFEST:-$REPO_ROOT/model-registry/catalog.public.signature.json}"
 
 [[ "$SIGNING_KEY_SEED" =~ ^[0-9a-fA-F]{64}$ ]] || die "OPENASR_CATALOG_SIGNING_KEY_SEED_HEX must be set to a 64-hex Ed25519 seed before writing the public catalog projection"
 
@@ -122,6 +127,13 @@ else
   CATALOG_EPOCH="$(tr -d '[:space:]' < "$CATALOG_EPOCH_SRC")"
 fi
 [[ "$CATALOG_EPOCH" =~ ^[0-9]+$ && "$CATALOG_EPOCH" != "0" ]] || die "catalog epoch must be a positive integer"
+
+if [[ -f "$COMMITTED_PUBLIC_MANIFEST" ]]; then
+  PREVIOUS_EPOCH="$(python3 -c 'import json, sys; print(json.loads(open(sys.argv[1]).read())["catalog_epoch"])' "$COMMITTED_PUBLIC_MANIFEST")" \
+    || die "failed to read catalog_epoch from previously committed manifest: $COMMITTED_PUBLIC_MANIFEST"
+  [[ "$PREVIOUS_EPOCH" =~ ^[0-9]+$ ]] || die "previously committed catalog_epoch is not a valid integer: $COMMITTED_PUBLIC_MANIFEST"
+  (( CATALOG_EPOCH > PREVIOUS_EPOCH )) || die "catalog epoch $CATALOG_EPOCH must be strictly greater than the previously committed epoch $PREVIOUS_EPOCH ($COMMITTED_PUBLIC_MANIFEST)"
+fi
 
 log "signing public catalog projection at epoch $CATALOG_EPOCH"
 (cd "$REPO_ROOT" && cargo run --quiet -p openasr-cli -- __openasr-sign-catalog-manifest "$PUBLIC_CATALOG" --out "$PUBLIC_MANIFEST" --epoch "$CATALOG_EPOCH")
@@ -238,7 +250,6 @@ log "signing the full committed catalog at epoch $CATALOG_EPOCH"
 (cd "$REPO_ROOT" && cargo run --quiet -p openasr-cli -- __openasr-sign-catalog-manifest "$CATALOG_SRC" --out "$REPO_ROOT/model-registry/catalog.signature.json" --epoch "$CATALOG_EPOCH")
 
 COMMITTED_PUBLIC_CATALOG="$REPO_ROOT/model-registry/catalog.public.json"
-COMMITTED_PUBLIC_MANIFEST="$REPO_ROOT/model-registry/catalog.public.signature.json"
 log "refreshing committed public projection: $COMMITTED_PUBLIC_CATALOG (+ signature)"
 cp "$PUBLIC_CATALOG" "$COMMITTED_PUBLIC_CATALOG"
 cp "$PUBLIC_MANIFEST" "$COMMITTED_PUBLIC_MANIFEST"

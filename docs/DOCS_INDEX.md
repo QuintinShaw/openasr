@@ -11,7 +11,7 @@ contributors -- crate relationships, the audio-to-transcript pipeline, and the
 
 | Doc | What it covers |
 | --- | --- |
-| [Roadmap](ROADMAP.md) | Implementation truth, sequencing, and active priorities; the Implemented-baseline section records what runs today (active `mock`/`native` backends, the seven native model families, the `arch/` registry, the `.oasr`-only pack contract) and what is deferred. OpenASR is Apache-2.0 open core. |
+| [Roadmap](ROADMAP.md) | Implementation truth, sequencing, and active priorities; the Implemented-baseline section records what runs today (active `mock`/`native` backends, the eight native model families, the `arch/` registry, the `.oasr`-only pack contract) and what is deferred. OpenASR is Apache-2.0 open core. |
 | [Quickstart](QUICKSTART.md) | Three commands to a real transcript: build, transcribe (native by default, consent-pull on first run), and pick a model. |
 | [Model Onboarding](MODEL_ONBOARDING.md) | Contributor checklist for adding a new ASR architecture: shared `nn/` blocks plus a thin per-family step executor gated by a load-bearing block-stack descriptor (the llama.cpp model). |
 | [Model Catalog, Registry, and Distribution](MODEL_CATALOG_ARCHITECTURE.md) | Catalog ownership chain (human-edited publishing catalog -> generated `model-registry/catalog.json`), `openasr pull` install mechanics, the local `model-registry/models/*.toml` cards, signed catalog hosting/cache, and the no-implicit-download boundary. |
