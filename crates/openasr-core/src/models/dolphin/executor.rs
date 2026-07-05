@@ -403,8 +403,9 @@ mod tests {
         DolphinImportRequest, DolphinQuantizationMode,
         convert_local_dolphin_wenet_source_to_runtime_pack,
     };
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
 
     const FIXTURE_ROOT: &str =
         "/Volumes/QuintinDocument/openasr-dev/openasr/tmp/publish/dolphin-cn-dialect-small";
@@ -495,10 +496,20 @@ mod tests {
         char_edit_distance(hypothesis, reference) as f32 / ref_len as f32
     }
 
-    /// Produce-if-absent the fp16 `.oasr` pack at its stable path, exactly once
-    /// per process, and hand every caller the same path. The two heavy `#[ignore]`
-    /// tests below (a producer + a consumer) share this so a fresh checkout runs
-    /// the convert exactly once and later callers reuse the result.
+    /// The three quantization rungs the producer/consumer tests exercise, in the
+    /// order they are reported. fp16 is the parity/CER-0 golden; q8_0 and q4_k are
+    /// the size-shrunk rungs held to a documented dequant tolerance.
+    const DOLPHIN_QUANT_RUNGS: [DolphinQuantizationMode; 3] = [
+        DolphinQuantizationMode::Fp16,
+        DolphinQuantizationMode::Q8_0,
+        DolphinQuantizationMode::Q4_K,
+    ];
+
+    /// Produce-if-absent the `.oasr` pack for `quant` at its stable per-quant path,
+    /// exactly once per process, and hand every caller the same path. The heavy
+    /// `#[ignore]` tests below (producers + consumers over the three rungs) share
+    /// this so a fresh checkout converts each rung exactly once and later callers
+    /// reuse the result.
     ///
     /// The write is atomic: the pack is built into a uniquely-named temp file in
     /// the packs dir and then `rename`d into place. Same-directory rename is
@@ -509,16 +520,25 @@ mod tests {
     /// what removes the earlier producer/consumer race (the old producer did
     /// `remove_file` + in-place rewrite, opening a window where the consumer read
     /// an absent/torn pack); the `dolphin-pack` nextest test-group additionally
-    /// serializes the two so they never even overlap. Returns `None` when the
+    /// serializes the tests so they never even overlap. Returns `None` when the
     /// local checkpoint is absent (the tests skip).
-    fn ensure_dolphin_pack(root: &Path) -> Option<PathBuf> {
-        static PACK: OnceLock<Option<PathBuf>> = OnceLock::new();
-        PACK.get_or_init(|| produce_dolphin_pack_atomic(root))
+    fn ensure_dolphin_pack(root: &Path, quant: DolphinQuantizationMode) -> Option<PathBuf> {
+        static PACKS: OnceLock<Mutex<HashMap<DolphinQuantizationMode, Option<PathBuf>>>> =
+            OnceLock::new();
+        let mut memo = PACKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        memo.entry(quant)
+            .or_insert_with(|| produce_dolphin_pack_atomic(root, quant))
             .clone()
     }
 
-    fn produce_dolphin_pack_atomic(root: &Path) -> Option<PathBuf> {
-        let pack = root.join("packs/dolphin-cn-dialect-small-fp16.oasr");
+    fn produce_dolphin_pack_atomic(root: &Path, quant: DolphinQuantizationMode) -> Option<PathBuf> {
+        let pack = root.join(format!(
+            "packs/dolphin-cn-dialect-small-{}.oasr",
+            quant.label()
+        ));
         if pack.exists() {
             return Some(pack);
         }
@@ -548,19 +568,37 @@ mod tests {
             units_path: units,
             output_path: temp_path.to_path_buf(),
             model_id: "dolphin-cn-dialect-small".to_string(),
-            quantization: DolphinQuantizationMode::Fp16,
+            quantization: quant,
         })
         .expect("dolphin import");
         temp_path.persist(&pack).expect("publish dolphin pack");
         Some(pack)
     }
 
-    /// Produce the fp16 `.oasr` pack from the local WeNet checkpoint and assert
-    /// the encoder-from-pack matches the golden `encoder_out` within an fp16
-    /// quantization tolerance. This is the convert+load gate: the pack loads, the
-    /// encoder weights bind under their WeNet names, and the verified encoder
-    /// graph reproduces the golden output (the f32-exact bit-level gate stays in
-    /// `parity::dolphin_encoder_parity`).
+    /// Per-quant encoder-from-pack tolerance on the scale-invariant relative max
+    /// diff of `encoder_out` vs the golden. fp16 is effectively bit-exact (the graph
+    /// itself is proven exact by `parity::dolphin_encoder_parity`; only fp16 weight
+    /// rounding through 12 E-Branchformer blocks moves it). q8_0/q4_k add per-block
+    /// weight quantization on the rank-2 projection matrices. The bounds sit a few x
+    /// above the measured relative max diff on the committed golden (fp16 ~3.0e-4,
+    /// q8_0 ~4.2e-3, q4_k ~5.4e-2; see the eprintln below), enough headroom for
+    /// thread-order jitter while an algorithmic/layout bug -- which blows the diff up
+    /// by orders of magnitude -- still trips the gate.
+    fn encoder_from_pack_rel_tolerance(quant: DolphinQuantizationMode) -> f32 {
+        match quant {
+            DolphinQuantizationMode::Fp16 => 3.0e-3,
+            DolphinQuantizationMode::Q8_0 => 5.0e-2,
+            DolphinQuantizationMode::Q4_K => 2.5e-1,
+        }
+    }
+
+    /// Produce each `.oasr` rung (fp16/q8_0/q4_k) from the local WeNet checkpoint and
+    /// assert the encoder-from-pack matches the golden `encoder_out` within that
+    /// rung's tolerance. This is the convert+load gate: every rung loads, clears the
+    /// fail-closed install gate, its encoder weights bind under their WeNet names
+    /// (quantized ones via the reversed-dim dequant round-trip), and the verified
+    /// encoder graph reproduces the golden output. The f32-exact bit-level gate stays
+    /// in `parity::dolphin_encoder_parity`.
     ///
     /// `#[ignore]`: needs the 1.7 GB checkpoint under `tmp/publish` (never
     /// committed). Run with:
@@ -569,55 +607,60 @@ mod tests {
     #[ignore = "requires local Dolphin checkpoint + golden under tmp/publish (not committed)"]
     fn dolphin_encoder_from_pack_parity() {
         let root = root();
-        let Some(pack) = ensure_dolphin_pack(&root) else {
+        if ensure_dolphin_pack(&root, DolphinQuantizationMode::Fp16).is_none() {
             eprintln!("skip: dolphin checkpoint/units not present under {root:?}");
             return;
-        };
-
-        // The produced pack must clear the fail-closed install gate (adapter
-        // selection + the dolphin runtime-metadata contract) exactly as
-        // `openasr pull` would enforce it.
-        crate::validate_native_runtime_model_pack_contract(&pack)
-            .expect("dolphin pack must pass the native install gate");
-
-        // Vocab is a property of the produced pack (the char tokenizer table the
-        // importer baked from `units.txt`).
-        let pack_metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("pack metadata");
-        let vocab_size = pack_metadata
-            .get_string_array(TOKENIZER_TOKENS_KEY)
-            .expect("pack carries the tokenizer vocab")
-            .len();
-        assert_eq!(vocab_size, 18173);
+        }
 
         let (in_shape, features) = load_npy_f32(&root.join("golden/logmel_feats_cmvn.npy"));
         assert_eq!(in_shape.len(), 3, "expected (1,T,80), got {in_shape:?}");
         let frames_in = in_shape[1];
-
-        let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
-        let output = encode_dolphin_encoder_from_pack(
-            &reader,
-            &features,
-            frames_in,
-            GgmlCpuGraphBackend::Cpu,
-        )
-        .expect("encode");
-
         let (_, golden_out) = load_npy_f32(&root.join("golden/encoder_out.npy"));
-        let max = max_abs_diff(&output.encoder_out, &golden_out);
-        let rel = relative_max_diff(&output.encoder_out, &golden_out);
-        eprintln!("dolphin encoder-from-pack (fp16): max abs {max:.3e}  rel {rel:.3e}");
 
-        // fp16-weight tolerance: the graph itself is bit-exact (proven by the
-        // raw-f32 `dolphin_encoder_parity`); the only delta here is fp16 rounding
-        // of the rank>=2 weights through 12 E-Branchformer blocks. Measured on the
-        // committed golden: relative max diff ~3e-4 (abs ~2.4e-3). The gate sits an
-        // order of magnitude above that so thread-order/fp16 jitter is fine, but an
-        // algorithmic/layout bug (which blows this up by orders of magnitude) still
-        // trips it.
-        assert!(
-            rel < 3.0e-3,
-            "encoder-from-pack relative max diff {rel:.3e} exceeds the fp16 tolerance 3e-3"
-        );
+        for quant in DOLPHIN_QUANT_RUNGS {
+            let pack =
+                ensure_dolphin_pack(&root, quant).expect("pack builds when checkpoint present");
+
+            // The produced pack must clear the fail-closed install gate (adapter
+            // selection + the dolphin runtime-metadata contract) exactly as
+            // `openasr pull` would enforce it.
+            crate::validate_native_runtime_model_pack_contract(&pack)
+                .expect("dolphin pack must pass the native install gate");
+
+            // Vocab is a property of the produced pack (the char tokenizer table the
+            // importer baked from `units.txt`) -- unchanged across quant rungs.
+            let pack_metadata =
+                crate::ggml_runtime::read_gguf_metadata(&pack).expect("pack metadata");
+            let vocab_size = pack_metadata
+                .get_string_array(TOKENIZER_TOKENS_KEY)
+                .expect("pack carries the tokenizer vocab")
+                .len();
+            assert_eq!(vocab_size, 18173);
+
+            let pack_bytes = std::fs::metadata(&pack).expect("pack stat").len();
+            let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
+            let output = encode_dolphin_encoder_from_pack(
+                &reader,
+                &features,
+                frames_in,
+                GgmlCpuGraphBackend::Cpu,
+            )
+            .expect("encode");
+
+            let max = max_abs_diff(&output.encoder_out, &golden_out);
+            let rel = relative_max_diff(&output.encoder_out, &golden_out);
+            let tolerance = encoder_from_pack_rel_tolerance(quant);
+            eprintln!(
+                "dolphin encoder-from-pack ({}): size {:.1}MB  max abs {max:.3e}  rel {rel:.3e}  (gate {tolerance:.1e})",
+                quant.label(),
+                pack_bytes as f64 / 1.0e6,
+            );
+            assert!(
+                rel < tolerance,
+                "encoder-from-pack relative max diff {rel:.3e} exceeds the {} tolerance {tolerance:.1e}",
+                quant.label()
+            );
+        }
     }
 
     /// M1 CPU-vs-Metal x with/without weight-reuse AB harness. One config per
@@ -635,7 +678,8 @@ mod tests {
         use std::time::{Duration, Instant};
         let root = root();
         let clip = root.join("golden/clip_sichuan.wav");
-        let Some(pack) = ensure_dolphin_pack(&root) else {
+        // Perf AB is measured on the fp16 (golden) rung.
+        let Some(pack) = ensure_dolphin_pack(&root, DolphinQuantizationMode::Fp16) else {
             eprintln!("skip: dolphin checkpoint/units not present under {root:?}");
             return;
         };
@@ -725,7 +769,7 @@ mod tests {
     fn dolphin_joint_decode_end_to_end() {
         let root = root();
         let clip = root.join("golden/clip_sichuan.wav");
-        let Some(pack) = ensure_dolphin_pack(&root) else {
+        let Some(pack) = ensure_dolphin_pack(&root, DolphinQuantizationMode::Fp16) else {
             eprintln!("skip: dolphin checkpoint/units not present under {root:?}");
             return;
         };
@@ -823,5 +867,56 @@ mod tests {
         );
         // The decoded region/language is surfaced honestly (not None).
         assert_eq!(output.resolved_language, "zh-sichuan");
+
+        // Spot-check the quantized rungs transcribe the clip sensibly. fp16 is the
+        // bit-exact CER-0 golden above; q8_0/q4_k trade a documented dequant error
+        // for size, so they are held to a loose CER bound against the rescoring
+        // reference rather than exact equality. This proves the reversed-dim quant
+        // round-trip produces a usable transcript end-to-end (not just close encoder
+        // activations), and pins the size ordering fp16 > q8_0 > q4_k.
+        let fp16_bytes = std::fs::metadata(&pack).expect("fp16 stat").len();
+        for (quant, cer_bound) in [
+            (DolphinQuantizationMode::Q8_0, 0.10_f32),
+            (DolphinQuantizationMode::Q4_K, 0.35_f32),
+        ] {
+            let qpack = ensure_dolphin_pack(&root, quant).expect("quant pack builds");
+            let qbytes = std::fs::metadata(&qpack).expect("quant stat").len();
+            let qreader = GgufTensorDataReader::from_path(&qpack).expect("quant reader");
+            let qmetadata =
+                crate::ggml_runtime::read_gguf_metadata(&qpack).expect("quant metadata");
+            let qoutput = transcribe_dolphin_pcm(
+                &qreader,
+                &qmetadata,
+                &samples,
+                DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
+                GgmlCpuGraphBackend::Cpu,
+                Some("zh-sichuan"),
+            )
+            .expect("dolphin transcribe (quant)");
+            let qcer = char_error_rate(&qoutput.text, REFERENCE_RESCORING_TEXT);
+            eprintln!(
+                "quant {:5}: size {:.1}MB ({:.2}x fp16)  CER vs rescoring {qcer:.4}  text {}",
+                quant.label(),
+                qbytes as f64 / 1.0e6,
+                qbytes as f64 / fp16_bytes as f64,
+                qoutput.text,
+            );
+            assert!(
+                qbytes < fp16_bytes,
+                "{} pack ({qbytes} B) must be smaller than fp16 ({fp16_bytes} B)",
+                quant.label()
+            );
+            assert!(
+                !qoutput.text.is_empty(),
+                "{} transcript must not be empty",
+                quant.label()
+            );
+            assert!(
+                qcer <= cer_bound,
+                "{} CER {qcer:.4} exceeds the spot-check bound {cer_bound:.2}",
+                quant.label()
+            );
+            assert_eq!(qoutput.resolved_language, "zh-sichuan");
+        }
     }
 }

@@ -1,14 +1,28 @@
 //! Convert a local Dolphin WeNet checkpoint (exported `full.safetensors` +
 //! `units.txt` char vocab, with `global_cmvn` folded into the encoder tensors)
-//! into an OpenASR `.oasr` (GGUF-v0) runtime pack at fp16.
+//! into an OpenASR `.oasr` (GGUF-v0) runtime pack at fp16, q8_0, or q4_k.
 //!
 //! Naming contract: the encoder/decoder/CTC tensors are stored under their
-//! **exact WeNet state-dict names** in raw element order (only f32 -> f16 for the
-//! rank>=2 weight matrices/convs; the 1-D biases/norms and the CMVN vectors stay
-//! f32). This keeps the runtime executor trivial and, crucially, lets it feed the
-//! already parity-verified `encoder_graph::encode()` byte-for-byte the same tensor
-//! buffers the raw-safetensors parity harness used — the only delta is the fp16
-//! rounding of the weights.
+//! **exact WeNet state-dict names**. At fp16 they keep raw element order (only
+//! f32 -> f16 for the rank>=2 weight matrices/convs; the 1-D biases/norms and the
+//! CMVN vectors stay f32). This keeps the runtime executor trivial and, crucially,
+//! lets it feed the already parity-verified `encoder_graph::encode()` byte-for-byte
+//! the same tensor buffers the raw-safetensors parity harness used — the only delta
+//! is the fp16 rounding of the weights.
+//!
+//! Quantization (q8_0/q4_k) targets only the rank-2 `.weight` projection/embed/
+//! output matrices. ggml block-quantizes along ne0 (the contiguous axis), so those
+//! matrices are stored with their dims **reversed** (`[out, in]` -> `[in, out]`)
+//! exactly as the xasr/cohere importers do: that puts the row-major-innermost `in`
+//! dimension on ne0, block-aligns it (`in % 32`/`in % 256`), and groups each row's
+//! input features into a superblock. The runtime never trusts the stored dims for
+//! layout — it re-declares each graph tensor and only consumes the dequantized f32
+//! by element count — so a reversed-dim q-tensor dequantizes to the *same* raw
+//! element order an fp16 tensor would (round-trip is order-preserving); the only
+//! delta is the quantization rounding. Convs (rank>2), position tables, the CMVN
+//! vectors, 1-D biases/norms, and the mel filterbank are never quantized (their
+//! ne0 is either tiny/unaligned or numerically sensitive) and keep their fp16-mode
+//! representation.
 //!
 //! Baked into the pack:
 //!   * every `encoder.*` / `decoder.*` / `ctc.*` tensor (the `context_module.*`
@@ -17,7 +31,10 @@
 //!   * the global CMVN mean/istd (already present as `encoder.global_cmvn.*`),
 //!   * a kaldi/HTK mel filterbank (`dolphin.mel_filters`) reconstructed from the
 //!     `train.yaml` fbank config for the later frontend phase,
-//!   * the char tokenizer (`tokenizer.ggml.tokens`, ids in `units.txt` order),
+//!   * the char tokenizer (`tokenizer.ggml.tokens`, ids in `units.txt` order) —
+//!     the full special-token block, so every advertised `<REGION>` dialect code
+//!     resolves at request time (no single region baked as the default; the
+//!     importer asserts each advertised code's prefix builds against the vocab),
 //!   * the runtime scalar contract keys the install gate validates.
 
 #![allow(dead_code)]
@@ -30,10 +47,14 @@ use crate::arch::{
     DOLPHIN_MODEL_FAMILY, DOLPHIN_TOKENIZER_ID,
 };
 use crate::ggml_runtime::{
-    GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, read_gguf_tensor_index,
-    write_gguf_file_v0,
+    GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
+    read_gguf_tensor_index, write_gguf_file_v0,
+};
+use crate::models::dolphin::language::{
+    DOLPHIN_DEFAULT_LANGUAGE_CODE, build_dolphin_decode_prefix,
 };
 use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
+use crate::models::language::REGISTERED_DIALECT_CODES;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f32, encode_f16_bits_le,
     f32_to_f16_bits, validate_error, validate_output_pack_extension,
@@ -73,22 +94,36 @@ const FRAME_SHIFT_MS: u32 = 10;
 const FFT_SIZE: usize = 512;
 const MEL_LOW_HZ: f32 = 20.0;
 
-/// The reference Sichuan decode prefix `<sos> <zh> <SICHUAN> <asr> <notimestamp>`
-/// (OWSM-style: sos + lang + region + task + timestamp). Baked for the later
-/// decode phase; not consumed by the encoder-from-pack load path.
-const SICHUAN_PREFIX_TOKEN_IDS: [u32; 5] = [2, 5, 10, 4, 109];
-
 /// WeNet state-dict namespaces baked into the runtime pack (in order).
 const RUNTIME_TENSOR_PREFIXES: [&str; 3] = ["encoder.", "decoder.", "ctc."];
 /// Hotword contextual-biasing module: present in the checkpoint but not part of
 /// the core ASR forward, so it is dropped from the runtime pack.
 const DROPPED_TENSOR_PREFIX: &str = "context_module.";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[allow(non_camel_case_types)]
 pub enum DolphinQuantizationMode {
     /// fp16 weights (rank>=2), f32 for 1-D vectors + CMVN + mel filterbank.
     #[default]
     Fp16,
+    /// q8_0 for the rank-2 `.weight` matrices (ne0 % 32 == 0); everything else
+    /// keeps its fp16-mode representation.
+    Q8_0,
+    /// q4_k for the rank-2 `.weight` matrices whose ne0 % 256 == 0, else q8_0;
+    /// everything else keeps its fp16-mode representation.
+    Q4_K,
+}
+
+impl DolphinQuantizationMode {
+    /// Canonical lowercase pack-quant tag (`fp16`/`q8_0`/`q4_k`), used to name the
+    /// output pack and report the produced rung.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fp16 => "fp16",
+            Self::Q8_0 => "q8_0",
+            Self::Q4_K => "q4_k",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -120,8 +155,9 @@ pub fn convert_local_dolphin_wenet_source_to_runtime_pack(
     let safetensors = SafetensorsFile::open(&request.safetensors_path)?;
 
     validate_checkpoint_shape(&safetensors, vocab_size)?;
+    assert_every_advertised_dialect_code_resolves(&vocab_tokens)?;
 
-    let mut tensors = build_runtime_tensors(&safetensors)?;
+    let mut tensors = build_runtime_tensors(&safetensors, request.quantization)?;
     tensors.push(build_mel_filterbank_tensor());
 
     let metadata = dolphin_runtime_gguf_metadata(request, &vocab_tokens);
@@ -191,6 +227,31 @@ fn read_units_txt(path: &std::path::Path) -> Result<Vec<String>, LocalSourceImpo
         return Err(validate_error("dolphin units.txt produced an empty vocab"));
     }
     Ok(tokens)
+}
+
+/// Fail closed unless every advertised dialect recognition code (Phase 1's
+/// `REGISTERED_DIALECT_CODES` plus the bare `zh` default) builds a full decode
+/// prefix against the shipped vocab -- i.e. its `<REGION>` token and the shared
+/// `<sos>/<zh>/<asr>/<notimestamp>` control tokens are all present. This is the
+/// producer-side guard for the CRITICAL invariant that the picker never advertises
+/// a region the executor cannot honor: if a future checkpoint's `units.txt` drops
+/// a region token, the import fails here rather than shipping a pack whose picker
+/// lies. It runs on the full baked vocab (no single region is baked as *the*
+/// default; the region is selected per request at decode time).
+fn assert_every_advertised_dialect_code_resolves(
+    vocab_tokens: &[String],
+) -> Result<(), LocalSourceImportError> {
+    for &code in REGISTERED_DIALECT_CODES
+        .iter()
+        .chain(std::iter::once(&DOLPHIN_DEFAULT_LANGUAGE_CODE))
+    {
+        build_dolphin_decode_prefix(vocab_tokens, Some(code)).map_err(|error| {
+            validate_error(format!(
+                "dolphin pack vocab cannot honor advertised dialect code {code:?}: {error}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// Fail closed if the checkpoint does not match the small.cn shape the pack
@@ -264,10 +325,14 @@ fn validate_checkpoint_shape(
 }
 
 /// Emit every `encoder.*` / `decoder.*` / `ctc.*` tensor under its exact WeNet
-/// name, raw element order preserved (dims == the safetensors shape). rank>=2
-/// weights become f16, everything else (1-D biases/norms, CMVN) stays f32.
+/// name. At fp16, raw element order is preserved (dims == the safetensors shape):
+/// rank>=2 weights become f16, everything else (1-D biases/norms, CMVN) stays f32.
+/// At q8_0/q4_k, the rank-2 `.weight` matrices are block-quantized (dims reversed
+/// so the contiguous `in` axis lands on ne0); all other tensors keep their fp16
+/// representation.
 fn build_runtime_tensors(
     safetensors: &SafetensorsFile,
+    quantization: DolphinQuantizationMode,
 ) -> Result<Vec<GgufWriteTensor>, LocalSourceImportError> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
@@ -296,7 +361,8 @@ fn build_runtime_tensors(
             name.to_string(),
             tensor.shape.clone(),
             values,
-        ));
+            quantization,
+        )?);
     }
     if out.is_empty() {
         return Err(validate_error(
@@ -306,29 +372,83 @@ fn build_runtime_tensors(
     Ok(out)
 }
 
-/// f16 for rank>=2 weight matrices and convs; f32 for 1-D vectors (biases,
-/// norms, the CMVN mean/istd, the rel-pos bias). The name-preserving raw element
-/// order is kept in both cases.
-fn make_runtime_tensor(name: String, dims: Vec<u64>, values: Vec<f32>) -> GgufWriteTensor {
+/// Choose the block-quant type for a rank-2 `.weight` matrix, or `None` to keep
+/// its fp16-mode representation. ggml quantizes along ne0, which after the dim
+/// reversal (`[out, in]` -> `[in, out]`) is `in` (the safetensors innermost /
+/// row-major-contiguous dim). q4_k needs a 256-superblock (`in % 256`), q8_0 a
+/// 32-block (`in % 32`); an unaligned `in` falls back to fp16. Only 2-D `.weight`
+/// tensors qualify -- convs (rank>2), position tables, and 1-D/CMVN vectors are
+/// never quantized.
+fn dolphin_quant_type_for_tensor(
+    name: &str,
+    shape: &[u64],
+    quantization: DolphinQuantizationMode,
+) -> Option<GgufWriteTensorType> {
+    if quantization == DolphinQuantizationMode::Fp16 {
+        return None;
+    }
+    if !name.ends_with(".weight") || shape.len() != 2 {
+        return None;
+    }
+    // Reversed ne0 == the safetensors innermost (last) dim == `in`.
+    let ne0 = *shape.last()?;
+    if !ne0.is_multiple_of(32) {
+        return None;
+    }
+    if quantization == DolphinQuantizationMode::Q4_K && ne0.is_multiple_of(256) {
+        Some(GgufWriteTensorType::Q4_K)
+    } else {
+        Some(GgufWriteTensorType::Q8_0)
+    }
+}
+
+/// Build one runtime tensor. Quantizable rank-2 `.weight` matrices are block-
+/// quantized with **reversed dims** (ne0 = the contiguous `in` axis); the runtime
+/// re-declares its own graph shapes and consumes only the dequantized f32 by
+/// element count, so the reversal is transparent to it. Everything else keeps the
+/// fp16-mode layout: f16 for rank>=2, f32 for 1-D vectors (biases, norms, the CMVN
+/// mean/istd, the rel-pos bias), name-preserving raw element order in both cases.
+fn make_runtime_tensor(
+    name: String,
+    dims: Vec<u64>,
+    values: Vec<f32>,
+    quantization: DolphinQuantizationMode,
+) -> Result<GgufWriteTensor, LocalSourceImportError> {
+    if let Some(qtype) = dolphin_quant_type_for_tensor(&name, &dims, quantization) {
+        let mut reversed = dims.clone();
+        reversed.reverse();
+        let data =
+            quantize_f32_to_ggml_tensor_data(qtype, &reversed, &values).map_err(|error| {
+                validate_error(format!(
+                    "dolphin quantization failed for '{name}' ({qtype:?}): {error}"
+                ))
+            })?;
+        return Ok(GgufWriteTensor {
+            name,
+            dims: reversed,
+            tensor_type: qtype,
+            data,
+        });
+    }
     if dims.len() >= 2 {
         let bits: Vec<u16> = values.iter().copied().map(f32_to_f16_bits).collect();
-        GgufWriteTensor {
+        Ok(GgufWriteTensor {
             name,
             dims,
             tensor_type: GgufWriteTensorType::F16,
             data: encode_f16_bits_le(bits),
-        }
+        })
     } else {
         let mut bytes = Vec::with_capacity(values.len() * 4);
         for value in values {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
-        GgufWriteTensor {
+        Ok(GgufWriteTensor {
             name,
             dims,
             tensor_type: GgufWriteTensorType::F32,
             data: bytes,
-        }
+        })
     }
 }
 
@@ -429,10 +549,6 @@ fn dolphin_runtime_gguf_metadata(
     put_u32("dolphin.audio.n_mels", FEATURE_DIM as u32);
 
     metadata.insert(
-        "dolphin.prompt.prefix_token_ids".to_string(),
-        GgufWriteValue::U32Array(SICHUAN_PREFIX_TOKEN_IDS.to_vec()),
-    );
-    metadata.insert(
         "tokenizer.ggml.tokens".to_string(),
         GgufWriteValue::StringArray(vocab_tokens.to_vec()),
     );
@@ -442,6 +558,7 @@ fn dolphin_runtime_gguf_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use DolphinQuantizationMode::Fp16;
 
     fn string_metadata(metadata: &BTreeMap<String, GgufWriteValue>, key: &str) -> Option<String> {
         match metadata.get(key) {
@@ -489,6 +606,140 @@ mod tests {
             u32_metadata(&metadata, "dolphin.encoder.d_model"),
             Some(768)
         );
+    }
+
+    /// The full special-token block every advertised dialect code needs
+    /// (control tokens + one `<REGION>` token per registered code plus `<CN>`).
+    fn vocab_with_all_dialect_tokens() -> Vec<String> {
+        let mut tokens: Vec<String> = ["<sos>", "<eos>", "<asr>", "<zh>", "<notimestamp>", "<CN>"]
+            .iter()
+            .map(|token| token.to_string())
+            .collect();
+        for &code in REGISTERED_DIALECT_CODES {
+            let region = crate::models::dolphin::language::dolphin_region_token_for_code(code)
+                .expect("registered code maps to a region token");
+            tokens.push(region.to_string());
+        }
+        tokens
+    }
+
+    #[test]
+    fn advertised_dialect_codes_resolve_against_full_vocab() {
+        // A vocab carrying every region + control token clears the producer guard.
+        let vocab = vocab_with_all_dialect_tokens();
+        assert_every_advertised_dialect_code_resolves(&vocab).expect("all codes resolve");
+    }
+
+    #[test]
+    fn missing_region_token_fails_the_import_guard() {
+        // Drop `<SICHUAN>` (an advertised region) and the import must fail closed
+        // rather than ship a pack whose picker advertises a region it can't honor.
+        let mut vocab = vocab_with_all_dialect_tokens();
+        vocab.retain(|token| token != "<SICHUAN>");
+        let error = assert_every_advertised_dialect_code_resolves(&vocab)
+            .expect_err("missing region must fail the guard");
+        let message = error.to_string();
+        assert!(
+            message.contains("zh-sichuan"),
+            "guard error should name the unhonored code, got: {message}"
+        );
+    }
+
+    #[test]
+    fn quant_type_selection_matches_alignment_and_mode() {
+        // fp16 mode never quantizes.
+        assert_eq!(
+            dolphin_quant_type_for_tensor("decoder.output_layer.weight", &[18173, 768], Fp16),
+            None
+        );
+        // q8_0: any rank-2 `.weight` whose in-dim (last, -> reversed ne0) is 32-aligned.
+        assert_eq!(
+            dolphin_quant_type_for_tensor(
+                "decoder.output_layer.weight",
+                &[18173, 768],
+                DolphinQuantizationMode::Q8_0
+            ),
+            Some(GgufWriteTensorType::Q8_0)
+        );
+        // q4_k: in-dim 256-aligned -> Q4_K; only 32- (not 256-) aligned -> Q8_0.
+        assert_eq!(
+            dolphin_quant_type_for_tensor(
+                "encoder.encoders.0.feed_forward.w_2.weight",
+                &[768, 3072],
+                DolphinQuantizationMode::Q4_K
+            ),
+            Some(GgufWriteTensorType::Q4_K)
+        );
+        assert_eq!(
+            dolphin_quant_type_for_tensor(
+                "some.proj.weight",
+                &[10, 96],
+                DolphinQuantizationMode::Q4_K
+            ),
+            Some(GgufWriteTensorType::Q8_0)
+        );
+        // Unaligned in-dim, non-`.weight`, rank!=2, and 1-D tensors are never quantized.
+        assert_eq!(
+            dolphin_quant_type_for_tensor(
+                "some.proj.weight",
+                &[10, 100],
+                DolphinQuantizationMode::Q8_0
+            ),
+            None
+        );
+        assert_eq!(
+            dolphin_quant_type_for_tensor(
+                "encoder.embed.pos_enc.pe",
+                &[1, 5000, 768],
+                DolphinQuantizationMode::Q8_0
+            ),
+            None
+        );
+        assert_eq!(
+            dolphin_quant_type_for_tensor(
+                "encoder.embed.conv.0.bias",
+                &[768],
+                DolphinQuantizationMode::Q8_0
+            ),
+            None
+        );
+        assert_eq!(
+            dolphin_quant_type_for_tensor(
+                "encoder.embed.conv.2.weight",
+                &[768, 768, 3, 3],
+                DolphinQuantizationMode::Q8_0
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn fp16_tensor_layout_is_unchanged_by_the_quant_plumbing() {
+        // A rank-2 weight in fp16 mode stays f16 with raw (non-reversed) dims.
+        let weight = make_runtime_tensor("x.weight".to_string(), vec![4, 2], vec![1.0; 8], Fp16)
+            .expect("fp16 weight");
+        assert_eq!(weight.tensor_type, GgufWriteTensorType::F16);
+        assert_eq!(weight.dims, vec![4, 2]);
+        assert_eq!(weight.data.len(), 8 * 2); // f16 = 2 bytes/elem, no reversal.
+        // A 1-D vector stays f32.
+        let bias = make_runtime_tensor("x.bias".to_string(), vec![4], vec![1.0; 4], Fp16)
+            .expect("fp16 bias");
+        assert_eq!(bias.tensor_type, GgufWriteTensorType::F32);
+        assert_eq!(bias.dims, vec![4]);
+    }
+
+    #[test]
+    fn quantized_weight_reverses_dims_to_block_align_ne0() {
+        // in-dim 768 (256-aligned) -> q4_k, dims reversed so ne0 == 768.
+        let weight = make_runtime_tensor(
+            "decoder.output_layer.weight".to_string(),
+            vec![18173, 768],
+            vec![0.1; 18173 * 768],
+            DolphinQuantizationMode::Q4_K,
+        )
+        .expect("quantized weight");
+        assert_eq!(weight.tensor_type, GgufWriteTensorType::Q4_K);
+        assert_eq!(weight.dims, vec![768, 18173]);
     }
 
     #[test]
