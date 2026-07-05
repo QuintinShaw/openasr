@@ -82,6 +82,12 @@ fn import_command(command: ImportCommand) -> Result<()> {
         } => {
             import_parakeet_ctc_local_command(&source_root, &output_root, &package_id, quantization)
         }
+        ImportCommand::Dolphin {
+            source_root,
+            output_root,
+            package_id,
+            quantization,
+        } => import_dolphin_local_command(&source_root, &output_root, &package_id, quantization),
         ImportCommand::Sensevoice {
             source_root,
             output_root,
@@ -258,6 +264,37 @@ fn import_sensevoice_local_command(
         .map_err(anyhow::Error::new)?;
     println!(
         "Imported SenseVoice local source into runtime pack:\n- source: {}\n- output: {}\n- tensor_count: {}\n- vocab_size: {}",
+        source_root.display(),
+        result.output_path.display(),
+        result.tensor_count,
+        result.vocab_size
+    );
+    Ok(())
+}
+
+fn import_dolphin_local_command(
+    source_root: &Path,
+    output_root: &Path,
+    package_id: &str,
+    quantization: ImportDolphinQuantization,
+) -> Result<()> {
+    let request = openasr_core::DolphinImportRequest {
+        safetensors_path: source_root.join("full.safetensors"),
+        units_path: source_root.join("units.txt"),
+        output_path: output_root.to_path_buf(),
+        model_id: package_id.to_string(),
+        quantization: match quantization {
+            ImportDolphinQuantization::Fp16 => openasr_core::DolphinQuantizationMode::Fp16,
+            ImportDolphinQuantization::Q8_0 => openasr_core::DolphinQuantizationMode::Q8_0,
+            ImportDolphinQuantization::Q4_K => openasr_core::DolphinQuantizationMode::Q4_K,
+        },
+    };
+
+    ensure_ggml_package_output_suffix(output_root)?;
+    let result = openasr_core::convert_local_dolphin_wenet_source_to_runtime_pack(&request)
+        .map_err(anyhow::Error::new)?;
+    println!(
+        "Imported Dolphin local source into runtime pack:\n- source: {}\n- output: {}\n- tensor_count: {}\n- vocab_size: {}",
         source_root.display(),
         result.output_path.display(),
         result.tensor_count,

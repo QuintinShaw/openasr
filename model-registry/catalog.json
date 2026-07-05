@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-05T18:10:14+00:00",
+  "generated_at": "2026-07-05T19:27:33+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -268,7 +268,7 @@
       "license_url": "https://huggingface.co/DataoceanAI1/dolphi-cn-dialect-small/blob/main/README.md",
       "license_class": "permissive",
       "hf_repo": "OpenASR/dolphin-cn-dialect-small",
-      "hf_revision": "0290ab192163dc533cec8701a84276b937417985",
+      "hf_revision": "dc755d1a5a620305868c82ded14c007546dc9710",
       "public": true,
       "min_cli_version": "0.1.3",
       "recommended_quant": "fp16",
@@ -292,14 +292,14 @@
           "suffix": "fp16",
           "pull": "dolphin-cn-dialect-small:fp16",
           "filename": "dolphin-cn-dialect-small-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/0290ab192163dc533cec8701a84276b937417985/dolphin-cn-dialect-small-fp16.oasr",
-          "sha256": "3379ca497e284356ed1eedf775e11ce2503e9ee51d3f1775feddc9afd3dc4212",
-          "size_bytes": 774125056,
+          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/dc755d1a5a620305868c82ded14c007546dc9710/dolphin-cn-dialect-small-fp16.oasr",
+          "sha256": "008a812b0ded5420d6e9d864170ae63150155858a7f5a25c14db3b770894df0c",
+          "size_bytes": 859973344,
           "recommended": true,
           "perf": {
-            "rtf_cpu": 0.4750656689075631,
-            "rtf_metal": 0.33782309159663865,
-            "peak_rss_bytes": 1457831936,
+            "rtf_cpu": 0.31893675,
+            "rtf_metal": 0.25836886363636363,
+            "peak_rss_bytes": 2374828032,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -308,14 +308,14 @@
           "suffix": "q8",
           "pull": "dolphin-cn-dialect-small:q8",
           "filename": "dolphin-cn-dialect-small-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/0290ab192163dc533cec8701a84276b937417985/dolphin-cn-dialect-small-q8_0.oasr",
-          "sha256": "580ec9f598eab678632ffc5c200438684ed7925e68c33109dc5542fb4205ba7d",
-          "size_bytes": 425766784,
+          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/dc755d1a5a620305868c82ded14c007546dc9710/dolphin-cn-dialect-small-q8_0.oasr",
+          "sha256": "55083d6b6167c375f3a0b6d685f11158fab4e0357f0dd22412295506b8846aa6",
+          "size_bytes": 493553888,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.3818624651260504,
-            "rtf_metal": 0.2806313025210084,
-            "peak_rss_bytes": 1155432448,
+            "rtf_cpu": 0.24347663254545457,
+            "rtf_metal": 0.11658303027272728,
+            "peak_rss_bytes": 2883174400,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -324,15 +324,15 @@
           "suffix": "q4",
           "pull": "dolphin-cn-dialect-small:q4",
           "filename": "dolphin-cn-dialect-small-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/0290ab192163dc533cec8701a84276b937417985/dolphin-cn-dialect-small-q4_k.oasr",
-          "sha256": "aa88ec03cd69be856af17f323ede49b42dcc35dc3ec0dc47ef9d495957030274",
-          "size_bytes": 239975680,
+          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/dc755d1a5a620305868c82ded14c007546dc9710/dolphin-cn-dialect-small-q4_k.oasr",
+          "sha256": "a74581e11f19454c6d24cb4949be269e59f0bbdce9969cc8b60aa3a54c83c865",
+          "size_bytes": 298130144,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.33826348025210085,
-            "rtf_metal": 0.2386936974789916,
-            "peak_rss_bytes": 932315136,
-            "jfk_wer_vs_fp16": 0.0
+            "rtf_cpu": 0.2628012386363636,
+            "rtf_metal": 0.10596562872727272,
+            "peak_rss_bytes": 2651635712,
+            "jfk_wer_vs_fp16": 0.045454545454545456
           }
         }
       ],
@@ -509,7 +509,7 @@
       "license_class": "permissive",
       "hf_repo": "OpenASR/sensevoice-small",
       "hf_revision": "52fa74567f213c8280fbea6e2d919709b7a7209f",
-      "public": false,
+      "public": true,
       "min_cli_version": "0.1.5",
       "recommended_quant": "fp16",
       "pull_recommended": "sensevoice-small:fp16",
