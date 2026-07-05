@@ -35,6 +35,9 @@ credits the people who built the original.
 - Moonshine — <https://huggingface.co/OpenASR/moonshine-tiny>
 - X-ASR (Zipformer) — <https://huggingface.co/OpenASR/xasr-zh-en>
 - Dolphin CN-Dialect Small (DataoceanAI) — <https://huggingface.co/OpenASR/dolphin-cn-dialect-small>
+- SenseVoice (FunAudioLLM, Alibaba Group; FunASR Model License v1.1) --
+  <https://huggingface.co/FunAudioLLM/SenseVoiceSmall> (runs from user-imported
+  packs until an OpenASR pack is published)
 - Parakeet-CTC (NVIDIA NeMo) and wav2vec2 / data2vec (Meta AI) run from
   user-imported packs.
 

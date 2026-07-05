@@ -514,4 +514,46 @@ mod tests {
         );
         assert_eq!(auto_out.language.as_deref(), Some("zh"));
     }
+
+    /// RTF probe: warm the prepared runtime once, then time a decode of the
+    /// en clip. Prints seconds-of-audio / seconds-of-compute. Run with
+    /// OPENASR_GGML_BACKEND=metal for the Metal figure.
+    #[test]
+    #[ignore = "requires local sensevoice pack + audio clips; prints RTF"]
+    fn sensevoice_rtf_probe() {
+        let pack = PathBuf::from(std::env::var("SENSEVOICE_PACK").expect("SENSEVOICE_PACK"));
+        let audio_dir =
+            PathBuf::from(std::env::var("SENSEVOICE_AUDIO_DIR").expect("SENSEVOICE_AUDIO_DIR"));
+        let bytes = std::fs::read(audio_dir.join("en.wav")).expect("wav");
+        let mut samples = Vec::new();
+        let mut i = 12;
+        while i + 8 <= bytes.len() {
+            let id = &bytes[i..i + 4];
+            let size = u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]])
+                as usize;
+            if id == b"data" {
+                let start = i + 8;
+                let end = (start + size).min(bytes.len());
+                samples = bytes[start..end]
+                    .chunks_exact(2)
+                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                    .collect();
+                break;
+            }
+            i += 8 + size + (size & 1);
+        }
+        let duration = samples.len() as f32 / 16_000.0;
+        // Warm (load + first decode), then measure steady-state decodes.
+        transcribe_sensevoice_pcm_cached(&samples, &pack, Some("en"), None).expect("warm");
+        let runs = 3;
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            transcribe_sensevoice_pcm_cached(&samples, &pack, Some("en"), None).expect("run");
+        }
+        let per_run = start.elapsed().as_secs_f32() / runs as f32;
+        eprintln!(
+            "sensevoice rtf probe: audio {duration:.2}s, decode {per_run:.3}s, RTF = {:.4}",
+            per_run / duration
+        );
+    }
 }

@@ -19,7 +19,8 @@ Nine families are onboarded today across several orchestration shapes:
   (dedicated executor).
 - `LlmDecoder` — Qwen3-ASR (data-driven composer).
 - `Ctc` (non-autoregressive encoder + CTC head) — Parakeet-CTC and wav2vec2-CTC
-  (`+data2vec`), dedicated executors.
+  (`+data2vec`), dedicated executors; SenseVoice (SAN-M/DFSMN encoder with a
+  20-block tp stage and a 4-token prompt splice), dedicated executor.
 - Joint CTC + attention (E-Branchformer encoder + CTC head + Transformer
   decoder rescoring) — Dolphin, a dedicated executor over the WeNet recipe.
 - Transducer (Zipformer2 encoder + RNN-T decoder/joiner) — X-ASR, a dedicated

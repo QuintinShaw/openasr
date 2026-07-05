@@ -20,7 +20,8 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   `openasr.features.streaming=ggml-true-streaming-v1` and whose family has a
   registered streaming executor. Local temporary packs for Qwen3-ASR, Whisper,
   Cohere Transcribe, Moonshine, Parakeet-CTC, and wav2vec2-CTC have passed the
-  ignored smoke, but official published packs with that metadata and public
+  ignored smoke, and SenseVoice registers the same buffered streaming driver
+  (no streaming-declared SenseVoice pack has been smoke-tested yet), but official published packs with that metadata and public
   product guarantees are still pending. Dolphin has no streaming executor at
   all yet, so it always runs final-per-utterance.
 - Speaker diarization is opt-in (`--diarize` / the API `diarize` flag). It uses
@@ -52,6 +53,9 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   Dolphin does not emit word-level timestamps at all -- its CTC/attention joint
   decode only returns a single segment-level span, so `--word-timestamps`
   requests against a Dolphin pack yield an empty word list rather than an error.
+  SenseVoice likewise returns an empty word list: its CTC frames sit on a 60 ms
+  low-frame-rate grid behind 4 prompt frames, so per-word times would be
+  fabricated precision rather than acoustic timestamps.
 - Hardware execution target selection is generic: Desktop/server requests support
   `auto`, `cpu`, and `accelerated` when the native runtime reports an accelerated
   device. There is no per-provider/per-device pinning surface such as `gpu0`,
@@ -94,6 +98,12 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   codes such as `zh-sichuan`, `zh-shanghai`, `zh-hebei`) via a decode-prompt
   token, defaulting to `zh` when unset; an unsupported code is rejected rather
   than silently falling back.
+  SenseVoice accepts an explicit `zh`/`yue`/`en`/`ja`/`ko` selection via its
+  4-token decode prompt and auto-detects when unset (the model emits a readable
+  language tag); an unsupported code is rejected fail-closed, and a detected
+  code outside the advertised set reports `language: null` rather than a guess.
+  SenseVoice also classifies emotion and audio events internally, but those
+  tags are intentionally not exposed on the API surface yet.
 
 ## What works now
 

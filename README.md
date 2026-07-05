@@ -62,6 +62,7 @@ also export word-level timestamps -- the columns below show where they differ.
 | wav2vec2-CTC (incl. data2vec) | declared-pack | acoustic | fp16 / q8_0 / q4_k |
 | Moonshine | declared-pack | approximate | fp16 / q8_0 / q4_k |
 | Dolphin (Chinese dialects) | none | none | fp16 / q8_0 / q4_k |
+| SenseVoice (zh/yue/en/ja/ko) | declared-pack | none | fp16 / q8_0 / q4_k |
 | X-ASR (Zipformer, RNN-T) | declared-pack | acoustic | fp16 / q8_0 / q4_k |
 
 - **Streaming** -- native frame-synchronous streaming emits incremental partials

@@ -11,12 +11,12 @@ package-manager channels) is still deferred; build from source meanwhile.
 
 These were prior roadmap goals and are now shipped on the native runtime path:
 
-- Eight native model families: Whisper, Cohere Transcribe, Qwen3-ASR,
+- Nine native model families: Whisper, Cohere Transcribe, Qwen3-ASR,
   Parakeet-CTC, wav2vec2-CTC (incl. data2vec), Moonshine, Dolphin (Chinese
-  dialects), and X-ASR (Zipformer).
+  dialects), SenseVoice (zh/yue/en/ja/ko), and X-ASR (Zipformer).
 - Data-driven architecture registry (`arch/`): composer families (Cohere, Qwen)
   materialize from descriptors; dedicated executors (Whisper, Moonshine,
-  Parakeet, wav2vec2, Dolphin, X-ASR) own their loaders.
+  Parakeet, wav2vec2, Dolphin, SenseVoice, X-ASR) own their loaders.
 - `.oasr` packs are GGUF-backed and portable, with zero-copy mmap weight binding
   and graph buffer-reuse to bound peak RSS.
 - Quantization profiles `fp16`, `q8_0`, `q4_k` (Qwen also `q3_k`).
