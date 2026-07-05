@@ -45,6 +45,8 @@ pub(crate) mod seq2seq_greedy_decode;
 mod seq2seq_serve_batch;
 pub(crate) mod seq2seq_word_timestamps;
 pub(crate) mod serve_batch_env;
+#[cfg(test)]
+mod streaming_finalize_bench;
 pub(crate) mod streaming_partial_cadence;
 pub(crate) mod tensor_binding;
 pub(crate) mod tensor_schema;
