@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-05T13:28:40+00:00",
+  "generated_at": "2026-07-05T19:27:33+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -268,7 +268,7 @@
       "license_url": "https://huggingface.co/DataoceanAI1/dolphi-cn-dialect-small/blob/main/README.md",
       "license_class": "permissive",
       "hf_repo": "OpenASR/dolphin-cn-dialect-small",
-      "hf_revision": "0290ab192163dc533cec8701a84276b937417985",
+      "hf_revision": "dc755d1a5a620305868c82ded14c007546dc9710",
       "public": true,
       "min_cli_version": "0.1.3",
       "recommended_quant": "fp16",
@@ -292,14 +292,14 @@
           "suffix": "fp16",
           "pull": "dolphin-cn-dialect-small:fp16",
           "filename": "dolphin-cn-dialect-small-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/0290ab192163dc533cec8701a84276b937417985/dolphin-cn-dialect-small-fp16.oasr",
-          "sha256": "3379ca497e284356ed1eedf775e11ce2503e9ee51d3f1775feddc9afd3dc4212",
-          "size_bytes": 774125056,
+          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/dc755d1a5a620305868c82ded14c007546dc9710/dolphin-cn-dialect-small-fp16.oasr",
+          "sha256": "008a812b0ded5420d6e9d864170ae63150155858a7f5a25c14db3b770894df0c",
+          "size_bytes": 859973344,
           "recommended": true,
           "perf": {
-            "rtf_cpu": 0.4750656689075631,
-            "rtf_metal": 0.33782309159663865,
-            "peak_rss_bytes": 1457831936,
+            "rtf_cpu": 0.31893675,
+            "rtf_metal": 0.25836886363636363,
+            "peak_rss_bytes": 2374828032,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -308,14 +308,14 @@
           "suffix": "q8",
           "pull": "dolphin-cn-dialect-small:q8",
           "filename": "dolphin-cn-dialect-small-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/0290ab192163dc533cec8701a84276b937417985/dolphin-cn-dialect-small-q8_0.oasr",
-          "sha256": "580ec9f598eab678632ffc5c200438684ed7925e68c33109dc5542fb4205ba7d",
-          "size_bytes": 425766784,
+          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/dc755d1a5a620305868c82ded14c007546dc9710/dolphin-cn-dialect-small-q8_0.oasr",
+          "sha256": "55083d6b6167c375f3a0b6d685f11158fab4e0357f0dd22412295506b8846aa6",
+          "size_bytes": 493553888,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.3818624651260504,
-            "rtf_metal": 0.2806313025210084,
-            "peak_rss_bytes": 1155432448,
+            "rtf_cpu": 0.24347663254545457,
+            "rtf_metal": 0.11658303027272728,
+            "peak_rss_bytes": 2883174400,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -324,15 +324,15 @@
           "suffix": "q4",
           "pull": "dolphin-cn-dialect-small:q4",
           "filename": "dolphin-cn-dialect-small-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/0290ab192163dc533cec8701a84276b937417985/dolphin-cn-dialect-small-q4_k.oasr",
-          "sha256": "aa88ec03cd69be856af17f323ede49b42dcc35dc3ec0dc47ef9d495957030274",
-          "size_bytes": 239975680,
+          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/dc755d1a5a620305868c82ded14c007546dc9710/dolphin-cn-dialect-small-q4_k.oasr",
+          "sha256": "a74581e11f19454c6d24cb4949be269e59f0bbdce9969cc8b60aa3a54c83c865",
+          "size_bytes": 298130144,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.33826348025210085,
-            "rtf_metal": 0.2386936974789916,
-            "peak_rss_bytes": 932315136,
-            "jfk_wer_vs_fp16": 0.0
+            "rtf_cpu": 0.2628012386363636,
+            "rtf_metal": 0.10596562872727272,
+            "peak_rss_bytes": 2651635712,
+            "jfk_wer_vs_fp16": 0.045454545454545456
           }
         }
       ],
@@ -484,6 +484,114 @@
         }
       },
       "upstream_release_date": "2026-01-28"
+    },
+    {
+      "id": "sensevoice-small",
+      "kind": "asr-model",
+      "display_name": "SenseVoice Small",
+      "family": "sensevoice",
+      "aliases": [
+        "sensevoice",
+        "sensevoice-small"
+      ],
+      "pull_alias": "sensevoice",
+      "size": "small",
+      "languages": [
+        "en",
+        "ja",
+        "ko",
+        "yue",
+        "zh"
+      ],
+      "vendor": "FunAudioLLM",
+      "license": "FunASR Model License v1.1",
+      "license_url": "https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/sensevoice-small",
+      "hf_revision": "52fa74567f213c8280fbea6e2d919709b7a7209f",
+      "public": true,
+      "min_cli_version": "0.1.5",
+      "recommended_quant": "fp16",
+      "pull_recommended": "sensevoice-small:fp16",
+      "prose": {
+        "tagline": "Fast multilingual speech recognition from FunAudioLLM \u2014 non-autoregressive SenseVoice, tuned for Chinese, Cantonese, English, Japanese and Korean",
+        "overview": [
+          "SenseVoice Small is the compact member of **SenseVoice**, the speech understanding model family\nopen-sourced by **FunAudioLLM** (Alibaba). Trained on more than **400,000 hours** of speech, it\ndelivers high-precision transcription with automatic language detection for **Mandarin Chinese,\nCantonese, English, Japanese and Korean**, and the upstream card reports Chinese and Cantonese\naccuracy ahead of Whisper on open benchmarks such as AISHELL and WenetSpeech. Its\n**non-autoregressive end-to-end** architecture makes inference exceptionally fast \u2014 the upstream\nteam clocks about 70 ms for 10 seconds of audio, 15x faster than Whisper-Large. The upstream model\nalso carries speech emotion recognition and audio event detection; the OpenASR packs currently\nsurface plain transcription only (emotion/event tags are not yet exposed). This OpenASR repo\nrepackages the original weights as `.oasr` packs that run natively in the OpenASR runtime \u2014 no\nPython at inference time. The **fp16** build is the recommended default for maximum fidelity;\n**q8_0** halves the footprint at near-reference quality and **q4_k** suits tight-memory devices."
+        ],
+        "highlights": [
+          "\ud83c\udf0f **Multilingual, zh-first** \u2014 high-precision Mandarin, Cantonese, English, Japanese and Korean with automatic language detection",
+          "\u26a1 **Non-autoregressive speed** \u2014 an end-to-end architecture the upstream clocks at about 70 ms for 10 seconds of audio, 15 times faster than Whisper-Large",
+          "\ud83c\udc04 **Chinese benchmark strength** \u2014 trained on over 400,000 hours of speech; the upstream reports better Chinese and Cantonese accuracy than Whisper on AISHELL and WenetSpeech",
+          "\ud83e\udeb6 **Compact and local** \u2014 a small checkpoint that transcribes fully offline, from a 130 MB q4_k build up to full-fidelity fp16",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "sensevoice-small:fp16",
+          "filename": "sensevoice-small-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/sensevoice-small/resolve/52fa74567f213c8280fbea6e2d919709b7a7209f/sensevoice-small-fp16.oasr",
+          "sha256": "97a59d7cd080731a1972fc87fd089b3cccfd20ca77ce5bc3e90d54a8d0802ea7",
+          "size_bytes": 470203584,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.17906217045454545,
+            "rtf_metal": 0.04389847727272727,
+            "peak_rss_bytes": 744521728,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "sensevoice-small:q8",
+          "filename": "sensevoice-small-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/sensevoice-small/resolve/52fa74567f213c8280fbea6e2d919709b7a7209f/sensevoice-small-q8_0.oasr",
+          "sha256": "785a1d45ac22289a5c67927f16f2fc40fd5dae11a630c6c4484092f321517f82",
+          "size_bytes": 252476064,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.18403581436363636,
+            "rtf_metal": 0.04113636736363637,
+            "peak_rss_bytes": 513523712,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "sensevoice-small:q4",
+          "filename": "sensevoice-small-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/sensevoice-small/resolve/52fa74567f213c8280fbea6e2d919709b7a7209f/sensevoice-small-q4_k.oasr",
+          "sha256": "76a1f7fa28aff8f415dc375e635d9e403c7477941eae9d2ad16173c0c32e8aac",
+          "size_bytes": 136354720,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.22519102645454545,
+            "rtf_metal": 0.04520054545454545,
+            "peak_rss_bytes": 395329536,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ],
+      "language_mode": "detect_and_specify",
+      "sort_weight": 900,
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "FunAudioLLM \u51fa\u54c1\u7684\u9ad8\u901f\u591a\u8bed\u8a00\u8bed\u97f3\u8bc6\u522b \u2014 \u975e\u81ea\u56de\u5f52 SenseVoice,\u9762\u5411\u4e2d\u6587\u3001\u7ca4\u8bed\u3001\u82f1\u8bed\u3001\u65e5\u8bed\u3001\u97e9\u8bed\u4f18\u5316",
+          "highlights": [
+            "\ud83c\udf0f **\u591a\u8bed\u8a00\u3001\u4e2d\u6587\u4f18\u5148** \u2014 \u9ad8\u7cbe\u5ea6\u666e\u901a\u8bdd\u3001\u7ca4\u8bed\u3001\u82f1\u8bed\u3001\u65e5\u8bed\u3001\u97e9\u8bed,\u5e76\u652f\u6301\u81ea\u52a8\u8bed\u79cd\u8bc6\u522b",
+            "\u26a1 **\u975e\u81ea\u56de\u5f52\u9ad8\u901f\u63a8\u7406** \u2014 \u7aef\u5230\u7aef\u67b6\u6784,\u4e0a\u6e38\u5b9e\u6d4b 10 \u79d2\u97f3\u9891\u7ea6 70 ms,\u6bd4 Whisper-Large \u5feb 15 \u500d",
+            "\ud83c\udc04 **\u4e2d\u6587\u57fa\u51c6\u8868\u73b0\u7a81\u51fa** \u2014 \u8d85\u8fc7 400,000 \u5c0f\u65f6\u8bed\u97f3\u8bad\u7ec3;\u4e0a\u6e38\u62a5\u544a\u5728 AISHELL \u4e0e WenetSpeech \u4e0a\u4e2d\u6587\u3001\u7ca4\u8bed\u51c6\u786e\u7387\u4f18\u4e8e Whisper",
+            "\ud83e\udeb6 **\u5c0f\u5de7\u672c\u5730\u5316** \u2014 small \u68c0\u67e5\u70b9\u5b8c\u5168\u79bb\u7ebf\u8f6c\u5199,\u4ece 130 MB \u7684 q4_k \u5230\u5168\u4fdd\u771f fp16",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python,\u9488\u5bf9 CPU \u4e0e GPU \u7684\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+          ]
+        }
+      },
+      "upstream_release_date": "2024-07-04",
+      "min_core_version": "0.1.5"
     },
     {
       "id": "hymt2-1.8b",
