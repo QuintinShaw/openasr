@@ -30,6 +30,7 @@ use super::decoder_graph::DolphinDecoderConfig;
 use super::encoder_graph::{DolphinEncoderConfig, DolphinEncoderOutput, encode};
 use super::frontend::{DolphinFbankFrontend, NUM_MEL_BINS, apply_global_cmvn};
 use super::joint_decode::{DolphinJointDecodeConfig, detokenize_char_tokens, joint_decode};
+use super::language::build_dolphin_decode_prefix;
 use super::runtime_contract::parse_dolphin_execution_metadata;
 
 /// Encoder weight namespace baked into the pack under exact WeNet names.
@@ -46,8 +47,10 @@ const ENCODER_SENTINEL_TENSORS: [&str; 3] = [
 const CMVN_MEAN_TENSOR: &str = "encoder.global_cmvn.mean";
 const CMVN_ISTD_TENSOR: &str = "encoder.global_cmvn.istd";
 
-/// Pack metadata keys the decode reads (mirrors the importer's writes).
-const PROMPT_PREFIX_KEY: &str = "dolphin.prompt.prefix_token_ids";
+/// Pack metadata keys the decode reads (mirrors the importer's writes). The
+/// decode prefix is no longer read from the pack: it is built per request from the
+/// vocab + the requested language code (see [`build_dolphin_decode_prefix`]), so a
+/// single pack can honor any advertised dialect region rather than one baked one.
 const EOS_TOKEN_ID_KEY: &str = "dolphin.eos_token_id";
 const BLANK_TOKEN_ID_KEY: &str = "ctc.blank_token_id";
 const TOKENIZER_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
@@ -128,6 +131,9 @@ pub(crate) struct DolphinPipelineOutput {
     pub ctc_greedy_text: String,
     /// Rescored n-best, best-first.
     pub scored_nbest: Vec<DolphinScoredText>,
+    /// Normalized recognition code the decode prefix selected (`zh`, `zh-sichuan`,
+    /// ...), surfaced so the executor reports the language it actually decoded.
+    pub resolved_language: String,
 }
 
 /// Resolve the ggml backend for a Dolphin request. Fail-closed to the golden,
@@ -204,10 +210,11 @@ pub(crate) fn transcribe_dolphin_pcm(
     samples: &[f32],
     ctc_weight: f32,
     backend: GgmlCpuGraphBackend,
+    language: Option<&str>,
 ) -> Result<DolphinPipelineOutput, String> {
     let weights = load_dolphin_runtime_weights_from_pack(reader)
         .map_err(|error| format!("dolphin runtime weight load failed: {error}"))?;
-    run_dolphin_pipeline(&weights, metadata, samples, ctc_weight, backend)
+    run_dolphin_pipeline(&weights, metadata, samples, ctc_weight, backend, language)
 }
 
 /// Run the fbank+CMVN -> encoder -> joint-decode -> detokenize pipeline over
@@ -219,14 +226,15 @@ pub(crate) fn run_dolphin_pipeline(
     samples: &[f32],
     ctc_weight: f32,
     backend: GgmlCpuGraphBackend,
+    language: Option<&str>,
 ) -> Result<DolphinPipelineOutput, String> {
     let tokens = metadata
         .get_string_array(TOKENIZER_TOKENS_KEY)
         .ok_or_else(|| format!("dolphin pack is missing the '{TOKENIZER_TOKENS_KEY}' vocab"))?;
-    let prompt_prefix = metadata
-        .get_u32_array(PROMPT_PREFIX_KEY)
-        .ok_or_else(|| format!("dolphin pack is missing the '{PROMPT_PREFIX_KEY}' decode prompt"))?
-        .to_vec();
+    // Build the `<sos> <zh> <region> <asr> <notimestamp>` prefix per request from
+    // the pack vocab; fail closed (typed) on an unknown code or a missing region.
+    let prefix = build_dolphin_decode_prefix(tokens, language)
+        .map_err(|error| format!("dolphin decode prefix build failed: {error}"))?;
     let eos_token_id = metadata
         .get_u32(EOS_TOKEN_ID_KEY)
         .ok_or_else(|| format!("dolphin pack is missing '{EOS_TOKEN_ID_KEY}'"))?;
@@ -263,7 +271,7 @@ pub(crate) fn run_dolphin_pipeline(
     let decode_config = DolphinJointDecodeConfig {
         beam_size: DOLPHIN_BEAM_SIZE,
         ctc_weight,
-        prompt_prefix,
+        prompt_prefix: prefix.token_ids,
         eos_token_id,
         blank_token_id,
     };
@@ -295,6 +303,7 @@ pub(crate) fn run_dolphin_pipeline(
         best_token_ids: decoded.best_token_ids,
         ctc_greedy_text,
         scored_nbest,
+        resolved_language: prefix.resolved_language,
     })
 }
 
@@ -345,12 +354,15 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
         // ~0.4 s reload+dequant is paid once, later requests are compute-only.
         let weights =
             cached_dolphin_runtime_weights(&request.runtime_source_path, &reader).map_err(fail)?;
+        // Thread the request language into the decode prefix builder; an
+        // unsupported code / missing region token fails closed here (typed).
         let output = run_dolphin_pipeline(
             &weights,
             &preflight.metadata,
             &request.prepared_audio.samples_f32,
             DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
             backend,
+            request.request_options.language.as_deref(),
         )
         .map_err(fail)?;
 
@@ -374,7 +386,10 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
                 text: output.text,
                 segments,
                 longform: None,
-                language: None,
+                // Surface the region/language the prefix actually selected (the
+                // model does not detect it, but the selection is a genuine input);
+                // the transcribe layer prefers this per the SpecifyOnly mode.
+                language: Some(output.resolved_language),
             },
             carry_context: None,
         })
@@ -663,11 +678,25 @@ mod tests {
         for _ in 0..runs {
             let started = Instant::now();
             let output = if let Some(weights) = preloaded.as_ref() {
-                run_dolphin_pipeline(weights, &metadata, &samples, ctc_weight, backend)
+                run_dolphin_pipeline(
+                    weights,
+                    &metadata,
+                    &samples,
+                    ctc_weight,
+                    backend,
+                    Some("zh-sichuan"),
+                )
             } else {
                 let weights =
                     load_dolphin_runtime_weights_from_pack(&reader).expect("weights reload");
-                run_dolphin_pipeline(&weights, &metadata, &samples, ctc_weight, backend)
+                run_dolphin_pipeline(
+                    &weights,
+                    &metadata,
+                    &samples,
+                    ctc_weight,
+                    backend,
+                    Some("zh-sichuan"),
+                )
             }
             .expect("dolphin pipeline");
             best = best.min(started.elapsed());
@@ -716,13 +745,17 @@ mod tests {
         let metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
 
         // Reference-faithful decode: attention-only selection over the CTC n-best
-        // (ctc_weight 0.0), the WeNet `attention_rescoring` default.
+        // (ctc_weight 0.0), the WeNet `attention_rescoring` default. The Sichuan
+        // clip is decoded under the `zh-sichuan` prefix -- the same
+        // `<sos> <zh> <SICHUAN> <asr> <notimestamp>` ids the pack used to bake --
+        // so the golden transcript stays bit-exact through the per-code builder.
         let output = transcribe_dolphin_pcm(
             &reader,
             &metadata,
             &samples,
             DOLPHIN_REFERENCE_RESCORE_CTC_WEIGHT,
             GgmlCpuGraphBackend::Cpu,
+            Some("zh-sichuan"),
         )
         .expect("dolphin transcribe");
 
@@ -757,9 +790,15 @@ mod tests {
 
         // Also report what the task-mentioned 0.3 rescoring weight would pick, to
         // show the training-vs-decode ctc_weight distinction concretely.
-        let output_03 =
-            transcribe_dolphin_pcm(&reader, &metadata, &samples, 0.3, GgmlCpuGraphBackend::Cpu)
-                .expect("dolphin transcribe (ctc_weight 0.3)");
+        let output_03 = transcribe_dolphin_pcm(
+            &reader,
+            &metadata,
+            &samples,
+            0.3,
+            GgmlCpuGraphBackend::Cpu,
+            Some("zh-sichuan"),
+        )
+        .expect("dolphin transcribe (ctc_weight 0.3)");
         eprintln!(
             "with ctc_weight 0.3   : {}  (CER vs rescoring ref {:.4})",
             output_03.text,
@@ -782,5 +821,7 @@ mod tests {
             cer_vs_rescoring, 0.0,
             "CER against the rescoring reference must be 0"
         );
+        // The decoded region/language is surfaced honestly (not None).
+        assert_eq!(output.resolved_language, "zh-sichuan");
     }
 }
