@@ -28,6 +28,12 @@ pub(crate) enum OpenAsrBlockKind {
     /// (`do_stable_layer_norm=False`) self-attention + GeLU FFN, full
     /// bidirectional attention, no rel-pos (wav2vec2 base/hubert/data2vec).
     Wav2Vec2PostNormEncoderLayer,
+    /// `nn::encoder::sanm_fsmn_encoder_layer` — SenseVoice/Paraformer SAN-M
+    /// block: multi-head self-attention whose attention context is summed with a
+    /// DFSMN memory branch (a depthwise conv1d over the value/context sequence,
+    /// expressible via im2col like the conformer depthwise conv), followed by a
+    /// position-wise FFN. Non-autoregressive CTC encoder (`Ctc` shape).
+    SanMFsmnEncoderLayer,
     /// `nn::decoder::seq2seq_layer` — self-attention KV + cross-attention +
     /// ReLU FFN (cohere/whisper decoder).
     Seq2SeqDecoderLayer,

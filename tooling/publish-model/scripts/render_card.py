@@ -14,6 +14,7 @@ catalog fields, so a brand-new `发布 <x>` still produces a complete card.
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -38,6 +39,11 @@ DIARIZE_PIPELINE_TAG_BY_FAMILY = {
     "wespeaker": "feature-extraction",
     "pyannote-segmentation": "voice-activity-detection",
 }
+# SPDX ids (lowercased) that HF's YAML `license:` field accepts directly. A
+# license outside this set (e.g. the FunASR Model License) must use the HF
+# `license: other` convention with `license_name` + `license_link` instead of
+# an unrecognized bare value.
+HF_SPDX_LICENSE_IDS = {"apache-2.0", "mit", "cc-by-4.0"}
 OPENASR_NATIVE_HIGHLIGHT = (
     "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, "
     "engineered for peak performance on CPU & GPU"
@@ -116,8 +122,9 @@ def main(argv: list[str]) -> int:
         or DIARIZE_PIPELINE_TAG_BY_FAMILY.get(catalog["family"], "automatic-speech-recognition"),
         "upstream_license_id": catalog["license_name"],
         # HF requires the YAML `license:` to be a lowercase SPDX id from its
-        # allowed list; the body keeps the display-cased form.
-        "license_yaml": catalog["license_name"].lower(),
+        # allowed list; the body keeps the display-cased form. Non-SPDX
+        # licenses use the HF `other` convention with name + link.
+        "license_yaml": license_yaml(catalog),
         "license_badge": badge_text(catalog["license_name"]),
         "upstream_badge": badge_text(upstream.split("/")[-1]),
         "upstream_repo": upstream,
@@ -149,6 +156,15 @@ def main(argv: list[str]) -> int:
         text = text.replace("{{" + k + "}}", str(v))
     sys.stdout.write(text)
     return 0
+
+
+def license_yaml(c: dict) -> str:
+    """The YAML `license:` value (plus companions for non-SPDX licenses)."""
+    lowered = c["license_name"].lower()
+    if lowered in HF_SPDX_LICENSE_IDS:
+        return lowered
+    slug = re.sub(r"[^a-z0-9.]+", "-", lowered).strip("-")
+    return f"other\nlicense_name: {slug}\nlicense_link: {c['license_source']}"
 
 
 def badge_text(s: str) -> str:

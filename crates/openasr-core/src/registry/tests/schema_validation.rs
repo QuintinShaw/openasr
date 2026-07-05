@@ -223,6 +223,7 @@ fn bundled_registry_ordering_is_deterministic() {
             "moonshine-tiny",
             "pyannote-segmentation-3.0",
             "qwen3-asr-1.7b",
+            "sensevoice-small",
             "wespeaker-voxceleb-resnet34-lm",
             "whisper-base",
             "whisper-base.en",

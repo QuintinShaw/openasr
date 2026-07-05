@@ -11,9 +11,10 @@ runs native ggml-backed model packs offline.
 
 ## What native model families run today?
 
-Eight, dispatched by a data-driven architecture registry (`arch/`): Whisper,
+Nine, dispatched by a data-driven architecture registry (`arch/`): Whisper,
 Cohere Transcribe, Qwen3-ASR, Parakeet-CTC, wav2vec2-CTC (incl. data2vec),
-Moonshine, Dolphin (Chinese dialects), and X-ASR (Zipformer). They run local
+Moonshine, Dolphin (Chinese dialects), SenseVoice (zh/yue/en/ja/ko), and X-ASR
+(Zipformer). They run local
 offline transcription on CPU and Metal lanes. The
 [model support matrix](../README.md#model-support) in the README lists
 per-family streaming, word-timestamp, and quant-tier support.
@@ -53,7 +54,8 @@ accepted as CLI run input or importer output. See
 Use the per-family importer on a local HF-style source directory:
 `import whisper`, `import qwen`, `import cohere`,
 `import parakeet-ctc`, `import wav2vec2-ctc`,
-`import moonshine`, `import dolphin`. Each accepts `--quantization fp16|q8_0|q4_k`
+`import moonshine`, `import dolphin`, `import sensevoice`. Each accepts
+`--quantization fp16|q8_0|q4_k`
 (Qwen adds `q3_k`). `openasr pull` installs already-published packs; it does not
 replace local importer workflows. There is no `quantize` command.
 

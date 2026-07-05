@@ -12,14 +12,15 @@ a few new blocks + one step executor" is the target, not "new model = data, zero
 code". What is genuinely **data** (no new code) vs the irreducible
 **per-architecture code** is spelled out below.
 
-Eight families are onboarded today across several orchestration shapes:
+Nine families are onboarded today across several orchestration shapes:
 
 - `Seq2SeqEncoderDecoder` — Whisper (hand-written reference, the bit-identity
   regression gate), Cohere Transcribe (data-driven composer), Moonshine
   (dedicated executor).
 - `LlmDecoder` — Qwen3-ASR (data-driven composer).
 - `Ctc` (non-autoregressive encoder + CTC head) — Parakeet-CTC and wav2vec2-CTC
-  (`+data2vec`), dedicated executors.
+  (`+data2vec`), dedicated executors; SenseVoice (SAN-M/DFSMN encoder with a
+  20-block tp stage and a 4-token prompt splice), dedicated executor.
 - Joint CTC + attention (E-Branchformer encoder + CTC head + Transformer
   decoder rescoring) — Dolphin, a dedicated executor over the WeNet recipe.
 - Transducer (Zipformer2 encoder + RNN-T decoder/joiner) — X-ASR, a dedicated

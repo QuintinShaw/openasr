@@ -534,3 +534,42 @@ audio_path = "tmp/publish/dolphin-cn-dialect-small/golden/clip_sichuan.wav"
 reference = "学校和底下好多那种野生枸杞"
 optional = true
 gating = false
+
+# sensevoice-small (FunAudioLLM SenseVoiceSmall — SAN-M/DFSMN encoder + CTC,
+# the first zh/yue/en/ja/ko multilingual CTC entry). References are the model's
+# own PyTorch-reference transcripts (fp16 pack reproduces them byte-identically;
+# see the sensevoice executor E2E gate). Non-gating (host-local packs).
+# Measured on M1 (7.18s en clip, warm): CPU RTF ~0.06 fp16 / ~0.06 q8 / ~0.055
+# q4_k; Metal ~0.04 fp16. Keep-quantized RAM: q4_k 326MB < q8_0 437MB < fp16
+# 668MB peak RSS.
+[[entries]]
+id = "sensevoice-small-fp16"
+family = "sensevoice"
+quant = "fp16"
+pack_path = "tmp/publish/sensevoice-small/packs/sensevoice-small.fp16.oasr"
+audio_path = "tmp/audio/sensevoice/en.wav"
+reference = "the tribal chieftain called for the boy and presented him with fifty pieces of gold"
+optional = true
+gating = false
+
+[[entries]]
+id = "sensevoice-small-q8"
+family = "sensevoice"
+quant = "q8_0"
+pack_path = "tmp/publish/sensevoice-small/packs/sensevoice-small.q8_0.oasr"
+audio_path = "tmp/audio/sensevoice/en.wav"
+reference = "the tribal chieftain called for the boy and presented him with fifty pieces of gold"
+optional = true
+gating = false
+ordering_group = "sensevoice-small"
+
+[[entries]]
+id = "sensevoice-small-q4k"
+family = "sensevoice"
+quant = "q4_k"
+pack_path = "tmp/publish/sensevoice-small/packs/sensevoice-small.q4_k.oasr"
+audio_path = "tmp/audio/sensevoice/en.wav"
+reference = "the tribal chieftain called for the boy and presented him with fifty pieces of gold"
+optional = true
+gating = false
+ordering_group = "sensevoice-small"

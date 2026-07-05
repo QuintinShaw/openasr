@@ -28,6 +28,11 @@ pub const QWEN3_ASR_AUDIO_FRONTEND_ID: &str = crate::arch::QWEN3_ASR_AUDIO_FRONT
 pub const QWEN3_ASR_TOKENIZER_ID: &str = crate::arch::QWEN3_ASR_TOKENIZER_ID;
 pub const QWEN3_ASR_DECODE_POLICY_ID: &str = crate::arch::QWEN3_ASR_DECODE_POLICY_ID;
 
+pub const SENSEVOICE_GGML_ARCHITECTURE_ID: &str = crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID;
+pub const SENSEVOICE_GGML_ADAPTER_ID: &str = crate::arch::SENSEVOICE_GGML_ADAPTER_ID;
+pub const SENSEVOICE_AUDIO_FRONTEND_ID: &str = crate::arch::SENSEVOICE_AUDIO_FRONTEND_ID;
+pub const SENSEVOICE_TOKENIZER_ID: &str = crate::arch::SENSEVOICE_TOKENIZER_ID;
+pub const SENSEVOICE_DECODE_POLICY_ID: &str = crate::arch::SENSEVOICE_DECODE_POLICY_ID;
 pub const PARAKEET_CTC_GGML_ARCHITECTURE_ID: &str = crate::arch::PARAKEET_CTC_GGML_ARCHITECTURE_ID;
 pub const PARAKEET_CTC_GGML_ADAPTER_ID: &str = crate::arch::PARAKEET_CTC_GGML_ADAPTER_ID;
 pub const PARAKEET_CTC_AUDIO_FRONTEND_ID: &str = crate::arch::PARAKEET_CTC_AUDIO_FRONTEND_ID;
@@ -215,6 +220,13 @@ pub fn qwen3_asr_runtime_descriptor_v1() -> GgmlFamilyAdapterDescriptor {
     OpenAsrArchitectureRegistry::with_builtins()
         .find_by_model_architecture(QWEN3_ASR_GGML_ARCHITECTURE_ID)
         .expect("builtin qwen architecture must exist")
+        .ggml_family_adapter_descriptor()
+}
+
+pub fn sensevoice_runtime_descriptor_v1() -> GgmlFamilyAdapterDescriptor {
+    OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID)
+        .expect("builtin sensevoice architecture must exist")
         .ggml_family_adapter_descriptor()
 }
 

@@ -35,6 +35,9 @@ credits the people who built the original.
 - Moonshine — <https://huggingface.co/OpenASR/moonshine-tiny>
 - X-ASR (Zipformer) — <https://huggingface.co/OpenASR/xasr-zh-en>
 - Dolphin CN-Dialect Small (DataoceanAI) — <https://huggingface.co/OpenASR/dolphin-cn-dialect-small>
+- SenseVoice (FunAudioLLM, Alibaba Group; FunASR Model License v1.1) --
+  <https://huggingface.co/FunAudioLLM/SenseVoiceSmall> (runs from user-imported
+  packs until an OpenASR pack is published)
 - Parakeet-CTC (NVIDIA NeMo) and wav2vec2 / data2vec (Meta AI) run from
   user-imported packs.
 
@@ -49,6 +52,45 @@ credits the people who built the original.
 **Translation (experimental)**
 
 - Hy-MT2 — <https://huggingface.co/OpenASR/hymt2-1.8b>
+
+## Design and implementation references
+
+OpenASR's native runtime is written from scratch, but several components are
+clean-room reimplementations whose designs we learned by studying open reference
+code. We did not reuse their source; the ideas and the debugging trails deserve
+credit all the same:
+
+- **icefall / k2 (Next-gen Kaldi)** — X-ASR's Zipformer2 transducer encoder,
+  joiner, and streaming decoder reimplement the icefall recipe, and our importer
+  follows its checkpoint tensor naming. <https://github.com/k2-fsa/icefall>
+- **WeNet** — the Dolphin family reproduces WeNet's E-Branchformer encoder
+  layout, state-dict naming, and attention-rescoring decode.
+  <https://github.com/wenet-e2e/wenet>
+- **pyannote.audio** — our pure-Rust segmentation and speaker-embedding forward
+  passes port pyannote.audio's processing pipeline (beyond the model weights
+  credited above). <https://github.com/pyannote/pyannote-audio>
+- **sherpa-onnx (k2-fsa)** — the diarization clustering default follows
+  sherpa-onnx's average-linkage approach.
+  <https://github.com/k2-fsa/sherpa-onnx>
+- **torchaudio** — `torchaudio.compliance.kaldi` is the numeric parity oracle
+  behind our from-scratch fbank frontends. <https://github.com/pytorch/audio>
+- **CrispASR** — we studied its Qwen ASR GGUF implementation while designing our
+  own Qwen family runtime. <https://github.com/CrispStrobe/CrispASR>
+- **Handy** — side-by-side comparison with Handy's push-to-talk dictation shaped
+  our desktop insertion and recording-stop behavior.
+  <https://github.com/cjpais/Handy>
+
+## Inspiration
+
+- **Ollama** — the "pull a model and it just runs" experience is what OpenASR
+  aims to bring to speech recognition. <https://github.com/ollama/ollama>
+
+## Model hosting
+
+- **Hugging Face** hosts our model catalog and every `.oasr` pack we publish —
+  <https://huggingface.co/OpenASR>
+- **hf-mirror.com** keeps model downloads fast and reliable for users far from
+  the Hub.
 
 ## Data
 

@@ -51,6 +51,7 @@ RELEASE_LANE_MODELS = (
     "xasr-zh-en",
     "cohere-transcribe-03-2026",
     "dolphin-cn-dialect-small",
+    "sensevoice-small",
     "whisper-small",
     "whisper-large-v3-turbo",
     "whisper-tiny",

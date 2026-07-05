@@ -68,6 +68,7 @@ pub(crate) enum DedicatedRuntimeTensorContractFamily {
     Wav2Vec2Ctc,
     XasrZipformer,
     Moonshine,
+    SenseVoice,
 }
 
 impl DedicatedRuntimeTensorContractFamily {
@@ -77,6 +78,7 @@ impl DedicatedRuntimeTensorContractFamily {
             Self::Wav2Vec2Ctc => "wav2vec2-ctc",
             Self::XasrZipformer => "xasr-zipformer",
             Self::Moonshine => "moonshine",
+            Self::SenseVoice => "sensevoice",
         }
     }
 }
@@ -231,6 +233,9 @@ fn dedicated_runtime_tensor_contract_family(
         }
         MOONSHINE_RUNTIME_TENSOR_CONTRACT_ID => {
             Some(DedicatedRuntimeTensorContractFamily::Moonshine)
+        }
+        crate::arch::SENSEVOICE_RUNTIME_TENSOR_CONTRACT_ID => {
+            Some(DedicatedRuntimeTensorContractFamily::SenseVoice)
         }
         _ => None,
     }

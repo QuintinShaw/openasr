@@ -51,6 +51,9 @@ pub enum LanguageFamilyHint {
     /// Cohere transcribe: accepts explicit selection via a prompt language token;
     /// no decode-time auto-detect.
     SelectsViaPrompt { default_language: &'static str },
+    /// SenseVoice: accepts explicit selection via a prompt token AND detects at
+    /// decode time when unset (the model emits a readable `<|lang|>` tag).
+    DetectAndSelectsViaPrompt,
     /// Intrinsically a single language (CTC / Moonshine).
     FixedMonolingual { language: &'static str },
     /// Intrinsically a fixed multilingual set with no per-request steering (XASR zh-en).
