@@ -381,6 +381,19 @@ impl CatalogModel {
 }
 
 impl ModelCatalog {
+    /// Best-effort resolve a user-facing model ref -- an id, `pull_alias`, alias,
+    /// or series ref, optionally carrying a `:quant` suffix -- to the public
+    /// catalog model it names, for surfacing advertised metadata (languages,
+    /// `language_mode`, `language_default`) in the CLI. The `:quant` suffix is
+    /// stripped (quant does not change the language axis) and the default size is
+    /// used for a bare series ref. Returns `None` when the ref matches no public
+    /// model -- a local-only or staged (`public:false`) pack -- so callers fall
+    /// back to core's fail-closed executor seam rather than inventing a code list.
+    pub fn resolve_public_model(&self, model_ref: &str) -> Option<&CatalogModel> {
+        let (base, _quant) = parse_catalog_pull_reference(model_ref.trim()).ok()?;
+        resolve_catalog_model(self, base, None).ok()
+    }
+
     pub fn capability_packs_for_feature(&self, feature: &str) -> Vec<&CatalogModel> {
         self.models
             .iter()
@@ -1192,7 +1205,12 @@ fn load_signed_catalog_from_cache(
 /// embedded bytes are signature-verified against the canonical [`DEFAULT_CATALOG_URL`]
 /// and run through the same epoch-rollback guard as any other source, so a stale
 /// snapshot can never downgrade a newer catalog the device already cached.
-fn load_embedded_signed_catalog(home: &Path) -> Result<ModelCatalog, CatalogError> {
+///
+/// Also the CLI's network-free source for advertised model metadata (the
+/// `openasr show` language block and the `transcribe --language` pre-check): those
+/// must never trigger a catalog download, so they prefer a local/env override and
+/// fall back to this embedded snapshot rather than [`load_model_catalog`].
+pub fn load_embedded_signed_catalog(home: &Path) -> Result<ModelCatalog, CatalogError> {
     let verified = catalog_security::verify_catalog_signature_manifest(
         EMBEDDED_CATALOG_JSON,
         EMBEDDED_CATALOG_SIGNATURE_JSON,
