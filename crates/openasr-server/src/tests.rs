@@ -1028,12 +1028,11 @@ fn realtime_capabilities_for_native_runtime_come_from_model_pack() {
 
     let capabilities = realtime_capabilities_for_runtime(&runtime);
 
-    assert_eq!(
-        capabilities.mode,
-        RealtimeBackendMode::FilePerUtteranceFallback
-    );
+    // Realtime capability is registry-driven: the whisper family registers a
+    // streaming executor, so its pack advertises true streaming with partials.
+    assert_eq!(capabilities.mode, RealtimeBackendMode::TrueStreaming);
     assert!(capabilities.phrase_bias.supported);
-    assert!(!capabilities.supports_partial_results);
+    assert!(capabilities.supports_partial_results);
 }
 
 #[test]

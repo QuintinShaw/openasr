@@ -17,14 +17,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::NativeAsrSession;
 use crate::PhraseBiasConfig;
 use crate::api::backend::{Segment, Transcription};
+use crate::arch::DOLPHIN_GGML_ADAPTER_ID;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgufMetadata, GgufOwnedWeightTensorPayload,
     GgufTensorDataReadError, GgufTensorDataReader, GgufWeightTensorElementType,
     RequestBackendPreference, request_backend_override,
 };
-use crate::arch::DOLPHIN_GGML_ADAPTER_ID;
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
     GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
@@ -32,7 +33,6 @@ use crate::models::ggml_asr_executor::{
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
-use crate::NativeAsrSession;
 
 use super::decoder_graph::DolphinDecoderConfig;
 use super::encoder_graph::{

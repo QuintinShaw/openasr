@@ -186,7 +186,8 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
     // buffered file-per-utterance path -- the exact "no partials until a long
     // pause" defect. Reject that at startup so onboarding a new family fails
     // loudly here instead of shipping a broken live-caption cadence.
-    let family_registry = crate::models::ggml_family_registry::GgmlFamilyRegistry::with_builtin_adapters();
+    let family_registry =
+        crate::models::ggml_family_registry::GgmlFamilyRegistry::with_builtin_adapters();
     for descriptor in family_registry.descriptors() {
         if !dispatch.has_streaming_executor_for(descriptor) {
             return Err(

@@ -19,8 +19,7 @@ use crate::models::local_source_import::{
 use crate::models::moonshine::MOONSHINE_MODEL_FAMILY;
 use crate::models::moonshine::runtime_contract;
 use crate::models::oasr_metadata::{
-    OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1, OASR_METADATA_KEY_AUDIO_FRONTEND,
-    OASR_METADATA_KEY_DECODE_POLICY, OASR_METADATA_KEY_FEATURE_STREAMING,
+    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
@@ -508,11 +507,6 @@ fn moonshine_runtime_gguf_metadata(
         OASR_METADATA_KEY_DECODE_POLICY,
         MOONSHINE_DECODE_POLICY_ID,
     );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_FEATURE_STREAMING,
-        OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1,
-    );
     insert_metadata(&mut metadata, GGML_TOKENIZER_ID_KEY, MOONSHINE_TOKENIZER_ID);
     insert_metadata(&mut metadata, OPENASR_MODEL_ID_KEY, model_id);
     insert_metadata(
@@ -769,10 +763,6 @@ mod tests {
             &tokens,
         );
 
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_FEATURE_STREAMING),
-            OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1
-        );
         assert_eq!(
             string_metadata(&metadata, OASR_METADATA_KEY_MODEL_FAMILY),
             MOONSHINE_MODEL_FAMILY

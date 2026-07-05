@@ -172,10 +172,9 @@ pub use models::{
         XASR_ZIPFORMER_GGML_ADAPTER_ID, XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
         XASR_ZIPFORMER_TOKENIZER_ID, cohere_transcribe_runtime_descriptor_v1,
         dolphin_runtime_descriptor_v1, moonshine_runtime_descriptor_v1,
-        parakeet_ctc_runtime_descriptor_v1,
-        qwen3_asr_runtime_descriptor_v1, sensevoice_runtime_descriptor_v1,
-        wav2vec2_ctc_runtime_descriptor_v1, whisper_runtime_descriptor_v1,
-        xasr_zipformer_runtime_descriptor_v1,
+        parakeet_ctc_runtime_descriptor_v1, qwen3_asr_runtime_descriptor_v1,
+        sensevoice_runtime_descriptor_v1, wav2vec2_ctc_runtime_descriptor_v1,
+        whisper_runtime_descriptor_v1, xasr_zipformer_runtime_descriptor_v1,
     },
     hymt2::{
         HYMT2_PINNED_SOURCE_GGUF_SHA256, Hymt2ConfigError, Hymt2DecodeResult, Hymt2DecodeTimings,

@@ -24,8 +24,7 @@ use crate::models::ggml_family_registry::{
     XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
 };
 use crate::models::oasr_metadata::{
-    OASR_FEATURE_DIARIZATION_COHERE_TOKEN_STREAM_V1, OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1,
-    OASR_METADATA_KEY_FEATURE_DIARIZATION, OASR_METADATA_KEY_FEATURE_STREAMING,
+    OASR_FEATURE_DIARIZATION_COHERE_TOKEN_STREAM_V1, OASR_METADATA_KEY_FEATURE_DIARIZATION,
 };
 use crate::models::runtime_selection_metadata::selection_metadata_from_gguf;
 use crate::models::runtime_tensor_contract_registry::validate_builtin_runtime_tensor_contract_for_architecture;
@@ -723,14 +722,6 @@ pub(crate) fn native_runtime_metadata_supports_diarization(
             })
 }
 
-pub(crate) fn native_runtime_metadata_declares_true_streaming(
-    metadata: &crate::GgufMetadata,
-) -> bool {
-    metadata
-        .get_string(OASR_METADATA_KEY_FEATURE_STREAMING)
-        .is_some_and(|value| value.trim() == OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -904,10 +895,6 @@ mod tests {
             decode_policy.to_string(),
         );
         metadata.insert("openasr.tokenizer.id".to_string(), tokenizer.to_string());
-        metadata.insert(
-            crate::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_STREAMING.to_string(),
-            crate::models::oasr_metadata::OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1.to_string(),
-        );
         TinyGgufFixtureSpec::new(metadata)
     }
 
@@ -922,17 +909,11 @@ mod tests {
     }
 
     fn whisper_streaming_runtime_fixture_spec(model_id: &str) -> TinyGgufFixtureSpec {
-        TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu(model_id).with_metadata(
-            crate::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_STREAMING,
-            crate::models::oasr_metadata::OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1,
-        )
+        TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu(model_id)
     }
 
     fn cohere_streaming_runtime_fixture_spec(model_id: &str) -> TinyGgufFixtureSpec {
-        TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(model_id).with_metadata(
-            crate::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_STREAMING,
-            crate::models::oasr_metadata::OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1,
-        )
+        TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(model_id)
     }
 
     fn moonshine_streaming_runtime_fixture_spec(_model_id: &str) -> TinyGgufFixtureSpec {
@@ -1225,7 +1206,10 @@ mod tests {
         assert!(capabilities.supports_diarization);
         assert!(capabilities.supports_quantized_models);
         assert!(capabilities.supports_hardware_acceleration);
-        assert!(!capabilities.supports_true_streaming);
+        // Realtime cadence is registry-driven: cohere-transcribe registers a
+        // streaming executor, so any of its packs advertises true streaming
+        // regardless of pack metadata.
+        assert!(capabilities.supports_true_streaming);
         assert_eq!(
             adapter.tensor_layout().unwrap().name,
             crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID
@@ -1396,24 +1380,6 @@ mod tests {
     }
 
     #[test]
-    fn native_runtime_metadata_declares_true_streaming_feature() {
-        let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-streaming-runtime.gguf");
-        let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture")
-            .with_metadata(
-                crate::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_STREAMING,
-                format!(
-                    " {} ",
-                    crate::models::oasr_metadata::OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1
-                ),
-            );
-        write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
-        let metadata = crate::read_gguf_metadata(&runtime_path).unwrap();
-
-        assert!(native_runtime_metadata_declares_true_streaming(&metadata));
-    }
-
-    #[test]
     fn native_runtime_model_adapters_advertise_streaming_when_executor_is_registered() {
         for case in streaming_runtime_fixture_cases() {
             let temp = tempfile::tempdir().unwrap();
@@ -1424,13 +1390,6 @@ mod tests {
             let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
             let capabilities = adapter.capabilities();
             assert_eq!(adapter.adapter_id(), case.adapter_id, "{}", case.slug);
-            assert!(
-                native_runtime_metadata_declares_true_streaming(
-                    &crate::read_gguf_metadata(&runtime_path).unwrap()
-                ),
-                "{}",
-                case.slug
-            );
             assert!(capabilities.supports_true_streaming, "{}", case.slug);
             assert!(capabilities.supports_partials, "{}", case.slug);
 
@@ -2252,14 +2211,20 @@ mod tests {
 
         let capabilities = native_runtime_realtime_capabilities_for_path(&runtime_path);
 
+        // Realtime capability is owned by the streaming-executor registry, not the
+        // pack: cohere-transcribe registers a (buffered) streaming executor, so any
+        // of its packs advertises true streaming with partials and no VAD-boundary
+        // requirement -- regardless of pack metadata.
         assert_eq!(
             capabilities.mode,
-            crate::realtime::RealtimeBackendMode::FilePerUtteranceFallback
+            crate::realtime::RealtimeBackendMode::TrueStreaming
         );
         assert!(capabilities.supports_realtime_sessions);
         assert!(capabilities.phrase_bias.supported);
-        assert!(!capabilities.supports_partial_results);
-        assert!(capabilities.requires_vad_utterance_boundaries);
+        assert!(capabilities.supports_partial_results);
+        assert!(!capabilities.requires_vad_utterance_boundaries);
+        // Buffered granularity (re-decode), not frame-sync.
+        assert!(!capabilities.frame_sync_partials);
     }
 
     #[test]
