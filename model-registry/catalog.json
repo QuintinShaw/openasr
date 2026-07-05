@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-05T05:37:42+00:00",
+  "generated_at": "2026-07-05T06:14:13+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -153,7 +153,7 @@
       "license_url": "https://huggingface.co/GilgameshWind/X-ASR-zh-en/blob/main/README.md",
       "license_class": "permissive",
       "hf_repo": "OpenASR/xasr-zh-en",
-      "hf_revision": "2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5",
+      "hf_revision": "68aab6ccc9ae09add233449c22b34284277911b1",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -176,14 +176,14 @@
           "suffix": "fp16",
           "pull": "xasr-zh-en:fp16",
           "filename": "xasr-zh-en-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5/xasr-zh-en-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/68aab6ccc9ae09add233449c22b34284277911b1/xasr-zh-en-fp16.oasr",
           "sha256": "89316b6e912aa474121fa6b8b7738514b64c9ba144f26702cbb36313b69a2e95",
           "size_bytes": 314918720,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.08819234090909091,
-            "rtf_metal": 0.15154204545454544,
-            "peak_rss_bytes": 1365606400,
+            "rtf_cpu": 0.07231156436363637,
+            "rtf_metal": 0.12059844318181816,
+            "peak_rss_bytes": 824131584,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -192,14 +192,14 @@
           "suffix": "q8",
           "pull": "xasr-zh-en:q8",
           "filename": "xasr-zh-en-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5/xasr-zh-en-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/68aab6ccc9ae09add233449c22b34284277911b1/xasr-zh-en-q8_0.oasr",
           "sha256": "a0201070212ceff3a37d8dafd21455209ea48721d1b53b31e8eff328fc573fdb",
           "size_bytes": 175711040,
           "recommended": true,
           "perf": {
-            "rtf_cpu": 0.08679616281818182,
-            "rtf_metal": 0.15143581063636363,
-            "peak_rss_bytes": 1355874304,
+            "rtf_cpu": 0.061104651545454546,
+            "rtf_metal": 0.11829398863636365,
+            "peak_rss_bytes": 548929536,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -208,14 +208,14 @@
           "suffix": "q4",
           "pull": "xasr-zh-en:q4",
           "filename": "xasr-zh-en-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/2f8f2abc8b6a051ae2d3aa33120c3d9ba07d99c5/xasr-zh-en-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/68aab6ccc9ae09add233449c22b34284277911b1/xasr-zh-en-q4_k.oasr",
           "sha256": "f4bea03a10333ee2c31f797a1abbadb885a85e63327b419b83b99d8bd2823106",
           "size_bytes": 112003904,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.08677703790909091,
-            "rtf_metal": 0.14969315154545454,
-            "peak_rss_bytes": 1355841536,
+            "rtf_cpu": 0.06117626136363637,
+            "rtf_metal": 0.1166461060909091,
+            "peak_rss_bytes": 423411712,
             "jfk_wer_vs_fp16": 0.0
           }
         }
@@ -268,7 +268,7 @@
       "license_url": "https://huggingface.co/DataoceanAI1/dolphi-cn-dialect-small/blob/main/README.md",
       "license_class": "permissive",
       "hf_repo": "OpenASR/dolphin-cn-dialect-small",
-      "hf_revision": "d377ffe6f34ab04eaebf5db16053022846fb908d",
+      "hf_revision": "0290ab192163dc533cec8701a84276b937417985",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "fp16",
@@ -292,14 +292,14 @@
           "suffix": "fp16",
           "pull": "dolphin-cn-dialect-small:fp16",
           "filename": "dolphin-cn-dialect-small-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/d377ffe6f34ab04eaebf5db16053022846fb908d/dolphin-cn-dialect-small-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/0290ab192163dc533cec8701a84276b937417985/dolphin-cn-dialect-small-fp16.oasr",
           "sha256": "3379ca497e284356ed1eedf775e11ce2503e9ee51d3f1775feddc9afd3dc4212",
           "size_bytes": 774125056,
           "recommended": true,
           "perf": {
-            "rtf_cpu": 0.2882627840909091,
-            "rtf_metal": 0.14387888636363638,
-            "peak_rss_bytes": 2336374784,
+            "rtf_cpu": 0.4750656689075631,
+            "rtf_metal": 0.33782309159663865,
+            "peak_rss_bytes": 1457831936,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -308,14 +308,14 @@
           "suffix": "q8",
           "pull": "dolphin-cn-dialect-small:q8",
           "filename": "dolphin-cn-dialect-small-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/d377ffe6f34ab04eaebf5db16053022846fb908d/dolphin-cn-dialect-small-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/0290ab192163dc533cec8701a84276b937417985/dolphin-cn-dialect-small-q8_0.oasr",
           "sha256": "580ec9f598eab678632ffc5c200438684ed7925e68c33109dc5542fb4205ba7d",
           "size_bytes": 425766784,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.249155947,
-            "rtf_metal": 0.12099092045454544,
-            "peak_rss_bytes": 2174238720,
+            "rtf_cpu": 0.3818624651260504,
+            "rtf_metal": 0.2806313025210084,
+            "peak_rss_bytes": 1155432448,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -324,15 +324,15 @@
           "suffix": "q4",
           "pull": "dolphin-cn-dialect-small:q4",
           "filename": "dolphin-cn-dialect-small-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/d377ffe6f34ab04eaebf5db16053022846fb908d/dolphin-cn-dialect-small-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/0290ab192163dc533cec8701a84276b937417985/dolphin-cn-dialect-small-q4_k.oasr",
           "sha256": "aa88ec03cd69be856af17f323ede49b42dcc35dc3ec0dc47ef9d495957030274",
           "size_bytes": 239975680,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.2190510340909091,
-            "rtf_metal": 0.11689645827272728,
-            "peak_rss_bytes": 2430877696,
-            "jfk_wer_vs_fp16": 0.045454545454545456
+            "rtf_cpu": 0.33826348025210085,
+            "rtf_metal": 0.2386936974789916,
+            "peak_rss_bytes": 932315136,
+            "jfk_wer_vs_fp16": 0.0
           }
         }
       ],

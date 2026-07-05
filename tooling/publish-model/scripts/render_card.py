@@ -128,6 +128,13 @@ def main(argv: list[str]) -> int:
         "highlights_block": "\n".join(f"- {h}" for h in highlights),
         "intro": intro,
         "model_display_name": catalog["display_name"],
+        # Benchmark-clip wording. Defaults describe the fixed 11s JFK ruler used
+        # for every card; a prose file overrides them when the model is measured
+        # on a different clip (e.g. an in-language clip for a language whose
+        # audio JFK does not represent), so the caption never misstates the clip.
+        "bench_clip_phrase": prose.get("bench_clip_phrase") or "the fixed 11s JFK clip",
+        "bench_clip_short": prose.get("bench_clip_short") or "JFK",
+        "drift_metric_label": prose.get("drift_metric_label") or "JFK ΔWER",
         "perf_table_rows": "\n".join(rows),
         "recommended_quant": rec,
         "pull_recommended": f"openasr pull {registry_id}:{rec_suffix}",

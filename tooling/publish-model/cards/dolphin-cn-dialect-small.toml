@@ -6,6 +6,16 @@
 tagline = "Chinese multi-dialect speech recognition -- a WeNet E-Branchformer (CTC + attention) tuned for Sichuan and 22 regional dialects"
 tagline_zh = "中文多方言语音识别 — 基于 WeNet E-Branchformer(CTC + 注意力),针对四川话与 22 种地方方言优化"
 
+# This is a Chinese-only (character-vocabulary) model, so the shared 11s English
+# JFK ruler is out-of-distribution: decoding English forces degenerate CTC beam
+# search / attention rescoring whose quant-independent buffers dominate peak RSS
+# and hide the keep-quantized weight-footprint win. It is benchmarked on its own
+# in-language golden Sichuan clip instead, where peak RSS orders q4 < q8 < fp16
+# and the drift column is a character error rate (CJK has no word boundaries).
+bench_clip_phrase = "a 2.38s in-language Sichuan-dialect (川话) clip"
+bench_clip_short = "Sichuan-clip"
+drift_metric_label = "ΔCER"
+
 highlights = [
   "🀄 **22 Chinese dialects** — a WeNet E-Branchformer tuned for regional Mandarin, with a standout Sichuan (川话) strength across Wu, Cantonese, Minnan, Shanghainese and more",
   "🎯 **Dialect-first accuracy** — a reported ~38% relative gain on dialect recognition and ~16% lower CER versus the base Dolphin, without giving up standard Mandarin",
