@@ -59,11 +59,10 @@ Optional feature metadata:
   Cohere runtime pack can expose speaker diarization when the tokenizer also
   carries the required diarization/timestamp speaker tokens. OpenASR still
   fails closed for other families or incomplete tokenizers.
-- `openasr.features.streaming = "ggml-true-streaming-v1"` declares that the
-  runtime pack is intended for a product true-streaming GGML adapter. OpenASR
-  exposes this as a realtime capability only when a matching built-in streaming
-  executor is also registered; metadata alone must never make offline execution
-  look like true streaming.
+There is no pack-level realtime/streaming feature key. Realtime capability is
+derived entirely from the built-in streaming-executor registry (the pack's
+family must have a registered streaming executor); a pack cannot self-declare
+streaming and metadata alone can never turn offline execution into streaming.
 
 ## Runtime selection
 

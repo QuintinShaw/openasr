@@ -348,7 +348,6 @@ def ensure_cli(repo_root: Path, openasr_bin: Path) -> None:
 
 def check_inspect_output(output: str, pack: Path) -> None:
     required = [
-        "- openasr.features.streaming: ggml-true-streaming-v1",
         "- mode: true_streaming",
         "- supports_partial_results: true",
         "- is_true_streaming: true",
@@ -575,8 +574,8 @@ def build_validation_markdown(summary: dict) -> str:
     return (
         "### YYYY-MM-DD — Native streaming release-pack smoke evidence\n\n"
         "Scope:\n\n"
-        "- Ran the native streaming smoke helper against runtime packs that must "
-        "advertise `openasr.features.streaming=ggml-true-streaming-v1`.\n"
+        "- Ran the native streaming smoke helper against runtime packs whose "
+        "family registers a built-in streaming executor.\n"
         "- Verified inspect capability gates, `verify`, and the "
         "ignored real-runtime streaming smoke final transcript.\n\n"
         "Validation:\n\n"

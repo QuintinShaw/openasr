@@ -148,7 +148,6 @@ class NativeStreamingSmokeTests(unittest.TestCase):
             [
                 "Model identity: qwen3-asr-0.6b:q4_k (openasr.model.id)",
                 "- openasr.model.family: qwen3-asr",
-                "- openasr.features.streaming: ggml-true-streaming-v1",
                 "- mode: true_streaming",
                 "- supports_partial_results: true",
                 "- is_true_streaming: true",
@@ -302,7 +301,6 @@ class NativeStreamingSmokeTests(unittest.TestCase):
             [
                 "Model identity: qwen3-asr-0.6b:q4_k (openasr.model.id)",
                 "- openasr.model.family: qwen3-asr",
-                "- openasr.features.streaming: ggml-true-streaming-v1",
                 "- mode: true_streaming",
                 "- supports_partial_results: true",
                 "- is_true_streaming: true",
