@@ -1,6 +1,7 @@
 pub(crate) mod builtin_execution_dispatch;
 pub mod cohere;
 pub(crate) mod ctc_greedy_decode;
+pub(crate) mod ctc_prefix_beam;
 pub(crate) mod ctc_streaming_driver;
 pub(crate) mod decode_policy_component_registry;
 pub(crate) mod decode_token_history;

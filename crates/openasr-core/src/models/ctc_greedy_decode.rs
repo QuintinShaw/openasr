@@ -9,7 +9,8 @@
 
 use thiserror::Error;
 
-use crate::models::phrase_bias_decode::{TokenPhraseBias, apply_phrase_bias_to_logits};
+use crate::models::ctc_prefix_beam::{CtcContextGraph, run_ctc_prefix_beam_decode};
+use crate::models::phrase_bias_decode::TokenPhraseBias;
 use crate::models::seq2seq_greedy_decode::token_softmax_probability;
 
 /// Static CTC decode parameters carried from the pack metadata.
@@ -108,24 +109,13 @@ impl IncrementalCtcGreedyDecoder {
                 expected: self.config.vocab_size,
             });
         }
-        let biased_row;
-        let row = if self.config.phrase_biases.is_empty() {
-            row
-        } else {
-            // Sequence-aware: gate each phrase's own boost on the tokens collapsed
-            // so far, so only a phrase's next expected token is nudged (mirrors the
-            // seq2seq decode path) rather than boosting every phrase token, every
-            // frame, by a shared global maximum.
-            biased_row = {
-                let mut row = row.to_vec();
-                apply_phrase_bias_to_logits(&mut row, &self.token_ids, &self.config.phrase_biases);
-                row
-            };
-            biased_row.as_slice()
-        };
+        // The greedy path is blank-collapse argmax with NO phrase biasing: hotword
+        // biasing on CTC runs through the prefix-beam decoder instead (see
+        // `run_ctc_greedy_decode`), so this decoder only ever sees an empty bias
+        // set and its output stays byte-identical to the un-biased decode.
         let argmax = self.argmax_frame(row, frame)?;
-        // Confidence of this frame's pick over the same (possibly biased) row
-        // the argmax saw; a token's probability is the mean over its run.
+        // Confidence of this frame's pick; a token's probability is the mean over
+        // its argmax run.
         let probability = token_softmax_probability(row, argmax as usize);
         match self.prev_argmax {
             None => {
@@ -217,16 +207,47 @@ impl IncrementalCtcGreedyDecoder {
     }
 }
 
-/// Collapse CTC frame logits to token ids (argmax → merge consecutive duplicates
-/// → drop blank) and detokenize. `frame_logits[t]` is the length-`vocab_size`
-/// logit row for frame `t`; `decode_text_token_ids` maps the collapsed ids to
-/// text (e.g. a SentencePiece detokenizer). Fail-closed on every malformed input.
+/// Collapse CTC frame logits to token ids and detokenize. `frame_logits[t]` is
+/// the length-`vocab_size` logit row for frame `t`; `decode_text_token_ids` maps
+/// the collapsed ids to text (e.g. a SentencePiece detokenizer). Fail-closed on
+/// every malformed input.
+///
+/// Two decode paths, selected by whether the config carries hotwords:
+///
+/// - No phrase biases (the default): per-frame argmax -> merge consecutive
+///   duplicates -> drop blank. Byte-identical to the historical greedy decode;
+///   zero added work.
+/// - With hotwords: a CTC prefix-beam search biased by an Aho-Corasick context
+///   graph (`ctc_prefix_beam`). This is the ONLY place hotwords touch the CTC
+///   decode -- the greedy argmax above is never phrase-biased, because per-frame
+///   logit nudging cannot bias a maximum-alignment decoder without wrecking the
+///   transcript. If the biases produce no positive context (e.g. only negative
+///   anti-context, which the prefix beam does not represent), fall back to the
+///   plain greedy path.
 pub(crate) fn run_ctc_greedy_decode<E>(
     config: CtcGreedyDecodeConfig,
     frame_logits: &[&[f32]],
     decode_text_token_ids: impl Fn(&[u32]) -> Result<String, E>,
     map_err: impl Fn(E) -> CtcGreedyDecodeError,
 ) -> Result<CtcGreedyDecodeResult, CtcGreedyDecodeError> {
+    if config.blank_token_id as usize >= config.vocab_size {
+        return Err(CtcGreedyDecodeError::BlankOutOfRange {
+            blank: config.blank_token_id,
+            vocab_size: config.vocab_size,
+        });
+    }
+    if !config.phrase_biases.is_empty()
+        && let Some(graph) = CtcContextGraph::from_token_phrase_biases(&config.phrase_biases)
+    {
+        return run_ctc_prefix_beam_decode(
+            config.blank_token_id,
+            config.vocab_size,
+            &graph,
+            frame_logits,
+            decode_text_token_ids,
+            map_err,
+        );
+    }
     let mut decoder = IncrementalCtcGreedyDecoder::new(config)?;
     decoder.append_frames(frame_logits)?;
     decoder.finish(decode_text_token_ids, map_err)
@@ -430,7 +451,11 @@ mod tests {
     }
 
     #[test]
-    fn phrase_bias_can_change_ctc_frame_argmax() {
+    fn non_empty_phrase_bias_routes_to_the_prefix_beam_and_can_change_the_label() {
+        // A non-empty positive hotword makes `run_ctc_greedy_decode` route to the
+        // prefix-beam decoder, whose accumulated context score can flip the label
+        // away from the greedy argmax (token 2) to the hotword (token 1). The
+        // greedy path itself is never phrase-biased.
         let rows = [
             vec![0.0, 0.8, 1.0, 0.0, 0.0],
             vec![0.0, 0.0, 0.0, 0.0, 10.0],
@@ -440,7 +465,7 @@ mod tests {
             CtcGreedyDecodeConfig {
                 blank_token_id: BLANK,
                 vocab_size: VOCAB,
-                phrase_biases: vec![TokenPhraseBias::new(vec![vec![1]], 0.3).unwrap()],
+                phrase_biases: vec![TokenPhraseBias::new(vec![vec![1]], 5.0).unwrap()],
             },
             &refs,
             decode_ids,
@@ -512,7 +537,10 @@ mod tests {
     }
 
     #[test]
-    fn incremental_decoder_preserves_phrase_bias_semantics() {
+    fn incremental_greedy_decoder_ignores_phrase_biases() {
+        // The incremental greedy decoder is un-biased: hotwords are handled by the
+        // prefix-beam batch path, never here. Even with a bias in the config, this
+        // decoder emits the plain greedy argmax (token 2 wins frame 0).
         let rows = [
             vec![0.0, 0.8, 1.0, 0.0, 0.0],
             vec![0.0, 0.0, 0.0, 0.0, 10.0],
@@ -521,11 +549,8 @@ mod tests {
         let config = CtcGreedyDecodeConfig {
             blank_token_id: BLANK,
             vocab_size: VOCAB,
-            phrase_biases: vec![TokenPhraseBias::new(vec![vec![1]], 0.3).unwrap()],
+            phrase_biases: vec![TokenPhraseBias::new(vec![vec![1]], 5.0).unwrap()],
         };
-        let batch =
-            run_ctc_greedy_decode(config.clone(), &refs, decode_ids, |never| match never {})
-                .expect("batch ctc");
         let mut incremental = IncrementalCtcGreedyDecoder::new(config).expect("decoder");
         incremental.append_frame(refs[0]).expect("first");
         incremental.append_frame(refs[1]).expect("second");
@@ -533,7 +558,6 @@ mod tests {
             .finish(decode_ids, |never| match never {})
             .expect("streaming ctc");
 
-        assert_eq!(streamed, batch);
-        assert_eq!(streamed.token_ids, vec![1]);
+        assert_eq!(streamed.token_ids, vec![2]);
     }
 }
