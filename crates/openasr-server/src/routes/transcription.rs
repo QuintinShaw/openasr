@@ -179,14 +179,11 @@ pub(crate) fn record_file_transcription_history(
     output_format: ResponseFormat,
 ) -> Result<(), ApiError> {
     let home = distribution.openasr_home()?;
-    // History is opt-in (privacy default): only persist when the user enabled
-    // auto-save. A bare `serve` never writes transcripts to ~/.openasr.
+    // History persistence is governed solely by the saved-history scope
+    // (`history_retention`). `auto_save` controls transcript-file exports and
+    // must not gate history. "Off" retention is fail-fast: never write a
+    // transcript we would only prune away on the next sweep.
     let document = load_config_document(&home).unwrap_or_default();
-    if !document.preferences.auto_save {
-        return Ok(());
-    }
-    // "Off" retention is fail-fast: never write a transcript we would only
-    // prune away on the next sweep.
     if !document
         .preferences
         .history_retention

@@ -935,9 +935,14 @@ fn transcription_preferences_fill_missing_thread_request_only() {
 fn record_file_transcription_history_round_trips_structured_metadata() {
     let temp = tempfile::tempdir().unwrap();
     let distribution = distribution_context_for_test(temp.path());
+    // auto_save only controls transcript-file exports; history recording is
+    // governed by history_retention alone, so auto_save=false must still record.
     std::fs::write(
         temp.path().join("config.json"),
-        serde_json::json!({ "preferences": { "auto_save": true } }).to_string(),
+        serde_json::json!({
+            "preferences": { "auto_save": false, "history_retention": "last5" }
+        })
+        .to_string(),
     )
     .unwrap();
     let request = TranscriptionRequest::new(temp.path().join("sample.wav"), "qwen3-asr-0.6b:q8")
@@ -979,6 +984,40 @@ fn record_file_transcription_history_round_trips_structured_metadata() {
         detail.entry.provenance,
         Some(DaemonHistoryProvenance::AutoSaved)
     );
+}
+
+#[test]
+fn record_file_transcription_history_skips_write_when_retention_off() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+    // Even with auto_save enabled, "off" retention must skip the write:
+    // history_retention is the only history switch.
+    std::fs::write(
+        temp.path().join("config.json"),
+        serde_json::json!({
+            "preferences": { "auto_save": true, "history_retention": "off" }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let request = TranscriptionRequest::new(temp.path().join("sample.wav"), "qwen3-asr-0.6b:q8");
+    let transcription = Transcription {
+        text: "never stored".to_string(),
+        segments: Vec::new(),
+        longform: None,
+        language: None,
+    };
+
+    record_file_transcription_history(
+        &distribution,
+        &request,
+        &transcription,
+        ResponseFormat::Text,
+    )
+    .unwrap();
+
+    let store = DaemonHistoryStore::open(temp.path());
+    assert!(store.list().unwrap().is_empty());
 }
 
 #[test]

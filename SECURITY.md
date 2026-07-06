@@ -90,13 +90,14 @@ named person".
 ### Transcription history
 
 The local server can record a transcription history (the `/v1/history` endpoint
-backs the desktop history page). It is **opt-in and off by default**: a bare
-`openasr serve` records nothing. Recording is gated on the `auto_save` preference
-(the desktop's auto-save toggle, or `preferences.auto_save` in
-`~/.openasr/config.json`). When enabled, entries -- model, source name, duration,
-and transcript text -- are written under `~/.openasr` and pruned per the
-`history_retention` preference; authorized remote-compute provider runs are
-excluded.
+backs the desktop history page). Recording is governed by the
+`history_retention` preference (the desktop's "saved history" setting, or
+`preferences.history_retention` in `~/.openasr/config.json`): the default keeps
+only the five most recent entries, and `off` disables recording entirely.
+Entries -- model, source name, duration, and transcript text -- are written
+under `~/.openasr` (never transmitted anywhere) and pruned per the retention
+scope; authorized remote-compute provider runs are excluded. The `auto_save`
+preference only controls transcript-file exports, not history.
 
 ## Out of Scope for Security Reports
 

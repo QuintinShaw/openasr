@@ -2005,9 +2005,14 @@ async fn native_streaming_finish_forwards_final_and_records_history() {
         catalog_url: None,
     });
     std::fs::create_dir_all(&openasr_home).unwrap();
+    // History recording is governed by history_retention alone; auto_save
+    // stays false to lock in that it does not gate history.
     std::fs::write(
         openasr_home.join("config.json"),
-        serde_json::json!({ "preferences": { "auto_save": true } }).to_string(),
+        serde_json::json!({
+            "preferences": { "auto_save": false, "history_retention": "last5" }
+        })
+        .to_string(),
     )
     .unwrap();
     let (event_sender, mut event_receiver) = mpsc::channel(8);
@@ -3718,9 +3723,14 @@ async fn finish_records_completed_websocket_session_history() {
         openasr_home: Some(temp.path().to_path_buf()),
         catalog_url: None,
     });
+    // auto_save only controls transcript-file exports; history recording is
+    // governed by history_retention alone, so auto_save=false must still record.
     std::fs::write(
         temp.path().join("config.json"),
-        serde_json::json!({ "preferences": { "auto_save": true } }).to_string(),
+        serde_json::json!({
+            "preferences": { "auto_save": false, "history_retention": "last5" }
+        })
+        .to_string(),
     )
     .unwrap();
     let (event_sender, _event_receiver) = mpsc::channel(8);
@@ -3764,6 +3774,48 @@ async fn finish_records_completed_websocket_session_history() {
         detail.entry.provenance,
         Some(DaemonHistoryProvenance::AutoSaved)
     );
+}
+
+#[tokio::test]
+async fn finish_skips_websocket_session_history_when_retention_off() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = DistributionContext::new(crate::DistributionRuntime {
+        openasr_home: Some(temp.path().to_path_buf()),
+        catalog_url: None,
+    });
+    // Even with auto_save enabled, "off" retention must skip the write:
+    // history_retention is the only history switch.
+    std::fs::write(
+        temp.path().join("config.json"),
+        serde_json::json!({
+            "preferences": { "auto_save": true, "history_retention": "off" }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(ServerRuntime::default(), distribution, event_sender);
+    let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
+        "test_session",
+        "whisper-large-v3-turbo",
+        timestamp_now(),
+    ))
+    .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+        .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
+        .unwrap();
+    session.controller = Some(controller);
+    session.source_name = Some("Dictation".to_string());
+    session.history_text = vec!["hello".to_string()];
+    session.history_duration_ms = 500;
+
+    session.finish("client_closed", true).await.unwrap();
+
+    let store = DaemonHistoryStore::open(temp.path());
+    assert!(store.list().unwrap().is_empty());
 }
 
 #[tokio::test]

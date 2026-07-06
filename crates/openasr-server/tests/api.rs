@@ -2904,14 +2904,18 @@ async fn transcriptions_accept_word_timestamp_granularity_for_json() {
     assert_eq!(words.last().unwrap()["end"], 2.5);
 }
 
-/// Writes a config with auto-save on at `<temp>/home`, so the server records
-/// history (opt-in, off by default).
+/// Writes a config with auto-save off and last5 retention at `<temp>/home`,
+/// locking in that history recording is governed by `history_retention` alone
+/// (auto_save only controls transcript-file exports).
 fn enable_history(temp: &tempfile::TempDir) {
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(
         home.join("config.json"),
-        serde_json::json!({ "preferences": { "auto_save": true } }).to_string(),
+        serde_json::json!({
+            "preferences": { "auto_save": false, "history_retention": "last5" }
+        })
+        .to_string(),
     )
     .unwrap();
 }
@@ -2924,11 +2928,15 @@ async fn transcriptions_record_file_history_in_sqlite_store() {
         catalog_url: None,
     };
     let home = distribution.openasr_home.as_ref().unwrap().clone();
-    // History is opt-in: enable auto-save so the server records.
+    // History recording is governed by history_retention alone; auto_save
+    // stays false to lock in that it does not gate history.
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(
         home.join("config.json"),
-        serde_json::json!({ "preferences": { "auto_save": true } }).to_string(),
+        serde_json::json!({
+            "preferences": { "auto_save": false, "history_retention": "last5" }
+        })
+        .to_string(),
     )
     .unwrap();
     let app = openasr_server::app_with_runtime_and_distribution(
@@ -3041,6 +3049,55 @@ async fn transcriptions_record_file_history_in_sqlite_store() {
         )
         .await
         .unwrap();
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["data"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn transcriptions_skip_file_history_when_retention_off() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    // Even with auto_save enabled, "off" retention must skip the write:
+    // history_retention is the only history switch.
+    std::fs::write(
+        home.join("config.json"),
+        serde_json::json!({
+            "preferences": { "auto_save": true, "history_retention": "off" }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+        },
+    );
+
+    let response = app
+        .clone()
+        .oneshot(multipart_request(
+            "whisper-large-v3-turbo",
+            "sample.wav",
+            b"not a real wav",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
     let parsed: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(parsed["data"].as_array().unwrap().len(), 0);
