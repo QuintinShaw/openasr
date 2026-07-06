@@ -15,14 +15,34 @@
 //! time and REFUNDS the reward when a partial match breaks (the reward is stored
 //! relative to the graph node's accumulated score, so a fail-transition to a
 //! shallower node subtracts exactly the boost granted for the now-broken prefix).
-//! A completed hotword banks a permanent completion bonus. Because the boost lives
-//! in a path-level score rather than in the per-frame logits, a same-sounding
-//! competitor (`刁天成` vs the hotword `刁天宸`) is beaten by accumulated path
-//! evidence rather than by railroading a single frame's argmax.
+//! A completed hotword banks a permanent completion bonus; at the end of the
+//! decode a FINALIZE step refunds the climb of any still-unfinished prefix (see
+//! `CtcContextGraph::finalize_refund`). Because the boost lives in a path-level
+//! score rather than in the per-frame logits, a same-sounding competitor
+//! (`刁天成` vs the hotword `刁天宸`) is beaten by accumulated path evidence
+//! rather than by railroading a single frame's argmax.
 //!
 //! This path runs ONLY when the caller supplies a non-empty context graph; with
 //! no hotwords the CTC decode stays on the untouched greedy path, so the no-bias
 //! behavior is byte-for-byte unchanged and there is zero performance regression.
+//!
+//! # Downstream contract vs the greedy path (approximation, by design)
+//!
+//! The result shape (`CtcGreedyDecodeResult`) is identical, but two fields carry
+//! a slightly different meaning than the greedy run-based ones:
+//!
+//! - **Token spans are approximate alignments.** A span's `start_frame` is the
+//!   frame at which the winning beam FIRST appended the token (the earliest
+//!   alignment that survived merging), and its `end_frame` extends to the next
+//!   token's onset. Because blank-then-emit and emit-immediately alignments merge
+//!   into one prefix, the recorded onset can sit up to one argmax run LATER than
+//!   the greedy run start. Word timestamps derived from these spans inherit that
+//!   one-run tolerance.
+//! - **Confidence is a single-frame posterior.** `probability` is the softmax
+//!   posterior of the token at its recorded onset frame ("stamped" frame), not
+//!   the mean over an argmax run like the greedy path (a beam prefix has no
+//!   single run to average over). It remains an honest per-token posterior in
+//!   [0, 1], just a pointwise rather than run-averaged one.
 
 use std::collections::HashMap;
 
@@ -193,12 +213,35 @@ impl CtcContextGraph {
         0
     }
 
+    /// The accumulated per-token climb of the prefix that reaches `node` -- the
+    /// amount [`finalize_refund`](Self::finalize_refund) gives back when a decode
+    /// ends with the automaton parked mid-word at `node`.
+    fn pending_prefix_score(&self, node: usize) -> f32 {
+        self.node_score[node]
+    }
+
+    /// The refund applied to a beam's context score at END OF DECODE (the
+    /// standard finalize step of sherpa/icefall-style context biasing): give back
+    /// the per-token climb of whatever partial match the beam is still inside, so
+    /// an UNFINISHED hotword prefix nets zero -- exactly as it would have been
+    /// refunded had a mismatching token arrived. Banked completion bonuses
+    /// (`output_score`, realized on arrival at an end node) are NOT part of
+    /// `node_score` and are untouched. This also makes the end-of-utterance case
+    /// consistent with the mid-utterance one (where stepping off a match refunds
+    /// the climb), which removes the incentive to wedge a hotword prefix against
+    /// the end of the audio and the partial-transcript jitter it caused at
+    /// streaming window edges.
+    fn finalize_refund(&self, node: usize) -> f32 {
+        -self.pending_prefix_score(node)
+    }
+
     /// Advance one token from `node`, returning the destination node and the
     /// context-score DELTA to add to the beam. The delta is
     /// `node_score[dest] - node_score[node] + output_score[dest]`: a match climbs
     /// (positive per-token boost), a broken prefix fails back to a shallower node
-    /// (negative delta = refund of the boost granted for the broken prefix), and a
-    /// completed hotword adds its one-shot completion bonus via `output_score`.
+    /// (negative delta = refund of the boost granted for the now-broken prefix),
+    /// and a completed hotword adds its one-shot completion bonus via
+    /// `output_score`.
     fn step(&self, node: usize, token: u32) -> (usize, f32) {
         let mut cur = node;
         let dest = loop {
@@ -212,6 +255,13 @@ impl CtcContextGraph {
         };
         let delta = self.node_score[dest] - self.node_score[node] + self.output_score[dest];
         (dest, delta)
+    }
+
+    /// The completion bonus banked on arrival at `node` (0 when no hotword ends
+    /// there). Exposed so [`extend_beam`] can withhold it on an immediate
+    /// re-emission of the same completed word (see the repeat guard there).
+    fn completion_bonus(&self, node: usize) -> f32 {
+        self.output_score[node]
     }
 }
 
@@ -343,11 +393,20 @@ pub(crate) fn run_ctc_prefix_beam_decode<E>(
         beams = prune_beams(next, CTC_PREFIX_BEAM_WIDTH);
     }
 
+    // FINALIZE: select on the finalized score -- the running score plus the
+    // refund of any still-pending (unfinished) hotword prefix the beam's
+    // automaton is parked inside. Mid-stream, a partial match rightly keeps its
+    // provisional climb (that is what holds the hotword hypothesis in the beam);
+    // at the end of the decode an unfinished prefix has, by definition, not been
+    // confirmed, and letting it keep the climb would wedge wrong hotword prefixes
+    // against the end of the audio (and jitter streaming partials, which finalize
+    // at every window edge). Banked completion bonuses are untouched.
+    let finalized_score = |beam: &Beam| beam.score() + graph.finalize_refund(beam.context_node);
     let best = beams
         .into_iter()
         .max_by(|a, b| {
-            a.1.score()
-                .partial_cmp(&b.1.score())
+            finalized_score(&a.1)
+                .partial_cmp(&finalized_score(&b.1))
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
         })
@@ -417,7 +476,23 @@ fn extend_beam(
     frame: usize,
     token_lp: f32,
 ) -> Beam {
-    let (context_node, context_delta) = graph.step(parent.context_node, token);
+    let (context_node, mut context_delta) = graph.step(parent.context_node, token);
+    // Repeat guard: an IMMEDIATE re-emission of the token that just completed a
+    // hotword lands back on the same end node (single-token hotwords -- including
+    // the marker-stripped CJK bare variants of length 1 -- fail to root and
+    // re-enter it) and would re-bank the completion bonus every repeat, letting a
+    // blank-separated stutter of one plausible frame farm unbounded score.
+    // Withhold the bonus on that exact shape: same token as the last emit AND the
+    // automaton did not move. A genuinely repeated word with anything in between
+    // (or a multi-token hotword re-matched from its start) moves the automaton
+    // and banks normally. Both inputs are functions of the prefix (its last
+    // token, and the automaton state the prefix reaches), so the context stays
+    // deterministic-by-prefix and the merge invariant above holds.
+    if context_node == parent.context_node
+        && parent.emits.last().map(|emit| emit.token_id) == Some(token)
+    {
+        context_delta -= graph.completion_bonus(context_node);
+    }
     let mut emits = parent.emits.clone();
     emits.push(TokenEmit {
         token_id: token,
@@ -659,6 +734,83 @@ mod tests {
         let (_n23, d) = g.step(n2, 3);
         // climb 7 + completion bonus (7*2 = 14).
         assert_eq!(d, 7.0 + 14.0);
+    }
+
+    #[test]
+    fn finalize_refunds_an_unfinished_hotword_prefix_at_end_of_decode() {
+        // Hotword [1,2,3] (boost 5). The audio ends mid-word: a strong 1, then a
+        // last frame where the acoustically better token 4 narrowly beats the
+        // hotword continuation 2. Without the finalize refund, the pending prefix
+        // [1,2] would keep its provisional climb (2 * 5 = 10) and wedge the wrong
+        // hotword prefix against the end of the audio; with it, both hypotheses
+        // net zero context and the acoustically better [1,4] wins.
+        let last = {
+            let mut row = vec![0.0f32; VOCAB];
+            row[4] = 2.0; // acoustic winner at the final frame
+            row[2] = 0.0; // hotword continuation, 2 logits behind
+            row
+        };
+        // Margin 20 keeps the hotword tokens OUTSIDE the candidate plausibility
+        // margin (12) on the peaky frames, so the continuation is only ever
+        // explorable at the genuinely ambiguous final frame.
+        let rows = [frame(1, 20.0), frame(BLANK, 20.0), last];
+
+        assert_eq!(greedy(&rows), vec![1, 4]);
+
+        let hot = graph(&[(vec![1, 2, 3], 5.0)]);
+        let biased = run(&hot, &rows).unwrap();
+        assert_eq!(biased.token_ids, vec![1, 4]);
+    }
+
+    #[test]
+    fn finalize_does_not_revoke_a_completed_hotword_bonus() {
+        // Same shape, but the hotword is [1,2] so the final near-tie frame
+        // COMPLETES it. The finalize refund takes back only the per-token climb
+        // (node_score, 10); the banked completion bonus (boost * len = 10) stays,
+        // and it outweighs the 2-logit acoustic deficit -- the full match still
+        // wins at the end of the audio.
+        let last = {
+            let mut row = vec![0.0f32; VOCAB];
+            row[4] = 2.0;
+            row[2] = 0.0;
+            row
+        };
+        let rows = [frame(1, 20.0), frame(BLANK, 20.0), last];
+
+        assert_eq!(greedy(&rows), vec![1, 4]);
+
+        let hot = graph(&[(vec![1, 2], 5.0)]);
+        let biased = run(&hot, &rows).unwrap();
+        assert_eq!(biased.token_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn immediate_re_emission_of_a_single_token_hotword_does_not_re_bank_its_bonus() {
+        // Single-token hotword [4] (boost 5): its end node is re-entered on every
+        // re-emission (fail to root, goto 4), so without the repeat guard each
+        // blank-separated stutter would re-bank the completion bonus. Drive
+        // extend_beam directly: the first emission earns climb + bonus (10), an
+        // IMMEDIATE repeat earns nothing, and a repeat separated by another token
+        // (a genuine second utterance of the word) banks normally again.
+        let g = graph(&[(vec![4], 5.0)]);
+        let root_beam = Beam {
+            p_blank: 0.0,
+            p_non_blank: f32::NEG_INFINITY,
+            context_node: g.root(),
+            context_score: 0.0,
+            emits: Vec::new(),
+        };
+        let first = extend_beam(&root_beam, &g, 4, 0, -0.1);
+        assert_eq!(first.context_score, 10.0); // climb 5 + bonus 5
+
+        let stutter = extend_beam(&first, &g, 4, 2, -0.1);
+        assert_eq!(stutter.context_score, 10.0); // bonus withheld, climb 0
+
+        let other = extend_beam(&first, &g, 1, 2, -0.1);
+        assert_eq!(other.context_score, 5.0); // climb refunded on the break
+
+        let again = extend_beam(&other, &g, 4, 4, -0.1);
+        assert_eq!(again.context_score, 15.0); // separated repeat banks again
     }
 
     #[test]
