@@ -879,6 +879,50 @@ mod tests {
     }
 
     #[test]
+    fn daemon_history_store_search_treats_like_wildcards_as_literals() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let percent = record_history_for_test(&store, "progress hit 100% today");
+        let underscore = record_history_for_test(&store, "field a_b equals one");
+        // Decoy: matches an unescaped '%a_b%' pattern ('_' = any one char), so
+        // it only stays out of the results while escaping works.
+        let decoy = record_history_for_test(&store, "field axb equals one");
+        let backslash = record_history_for_test(&store, "path back\\slash here");
+
+        let search = |needle: &str| {
+            store
+                .query(&DaemonHistoryQuery {
+                    search: Some(needle.to_string()),
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+
+        // '%' unescaped matches every row; escaped it is a literal.
+        let page = search("%");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.entries[0].id, percent.id);
+
+        // '_' unescaped is a single-character wildcard that would also match
+        // the "axb" decoy; escaped it only hits the literal "a_b".
+        let page = search("a_b");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.entries[0].id, underscore.id);
+
+        // '\' is the ESCAPE character itself and must match literally.
+        let page = search("\\");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.entries[0].id, backslash.id);
+
+        // Ordinary substrings keep working alongside the escaping.
+        let page = search("field");
+        assert_eq!(page.total, 2);
+        let ids: Vec<&str> = page.entries.iter().map(|entry| entry.id.as_str()).collect();
+        assert!(ids.contains(&underscore.id.as_str()));
+        assert!(ids.contains(&decoy.id.as_str()));
+    }
+
+    #[test]
     fn daemon_history_store_query_filters_by_kind() {
         let temp = tempfile::tempdir().unwrap();
         let store = DaemonHistoryStore::open(temp.path());
