@@ -163,11 +163,6 @@ fn write_xasr_gguf_runtime_source(path: &std::path::Path, metadata_model_id: &st
         openasr_core::GGML_TOKENIZER_ID_KEY.to_string(),
         openasr_core::XASR_ZIPFORMER_TOKENIZER_ID.to_string(),
     );
-    metadata.insert(
-        openasr_core::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_STREAMING.to_string(),
-        openasr_core::models::oasr_metadata::OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1
-            .to_string(),
-    );
     let spec = TinyGgufFixtureSpec::new(metadata);
     write_tiny_gguf_runtime_source(path, &spec).expect("write xasr gguf runtime source");
 }

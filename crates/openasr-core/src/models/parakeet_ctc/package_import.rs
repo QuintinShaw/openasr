@@ -31,8 +31,7 @@ use crate::models::local_source_import::{
     validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
-    OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1, OASR_METADATA_KEY_AUDIO_FRONTEND,
-    OASR_METADATA_KEY_DECODE_POLICY, OASR_METADATA_KEY_FEATURE_STREAMING,
+    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
@@ -406,10 +405,6 @@ fn parakeet_runtime_gguf_metadata(
         OASR_METADATA_KEY_DECODE_POLICY,
         PARAKEET_CTC_DECODE_POLICY_ID,
     );
-    put_str(
-        OASR_METADATA_KEY_FEATURE_STREAMING,
-        OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1,
-    );
     put_str(GGML_TOKENIZER_ID_KEY, PARAKEET_CTC_TOKENIZER_ID);
     put_str("openasr.model.id", &request.model_id);
 
@@ -484,10 +479,6 @@ mod tests {
             &["<blank>".to_string(), "a".to_string(), "b".to_string()],
         );
 
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_FEATURE_STREAMING),
-            Some(OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1.to_string())
-        );
         assert_eq!(
             string_metadata(&metadata, OASR_METADATA_KEY_MODEL_FAMILY),
             Some(PARAKEET_CTC_MODEL_FAMILY.to_string())

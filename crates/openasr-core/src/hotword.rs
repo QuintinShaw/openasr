@@ -19,6 +19,16 @@ pub const MAX_PHRASE_BIAS_BOOST: f32 = 20.0;
 /// 5.0 means 5 at entry, then up to 10/15/20 deeper into the phrase. Escalated
 /// positive boosts are additionally gated on acoustic plausibility; see
 /// `apply_phrase_bias_to_logits` in `models::phrase_bias_decode`.
+///
+/// CTC families (sensevoice / parakeet-ctc / wav2vec2-ctc) decode hotwords
+/// through a prefix-beam search with a context graph instead
+/// (`models::ctc_prefix_beam`); there the value is the per-matched-token context
+/// climb. For CTC, boosts up to ~10 are the recommended range: the measured CJK
+/// homophone correction lands cleanly at the default, while boosts near the cap
+/// (20.0) exhibit a known drop pattern -- a confusable character ADJACENT to the
+/// hotword (e.g. the `叫` right before `刁天宸`) can be squeezed out of the
+/// transcript, because hypotheses that skip it into the hotword hold a transient
+/// context lead while the narrow beam prunes the keep-it-then-match alternative.
 pub const DEFAULT_PHRASE_BIAS_BOOST: f32 = 5.0;
 
 #[derive(Debug, Error, Clone, PartialEq)]

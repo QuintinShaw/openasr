@@ -48,6 +48,14 @@ purpose — the exact symbol names drift, so read the code for current names:
 - Registries for the audio frontend, tokenizer, prepared-runtime cache, and
   runtime tensor contract, keyed by the component ids on your descriptor.
 
+**Punctuation fidelity is a product promise.** Whatever the model decodes is what
+the user sees, in every mode (batch, streaming, dictation, server API). Text
+production goes through the shared paths above -- a family may strip its own
+control/tag tokens (special token tables are family-specific), but must never
+add, drop, or rewrite punctuation in the transcript body. Do not introduce
+family-local text munging; if the raw decode carries no punctuation, that is the
+model's honest output.
+
 ## Step 1 — DATA: register the architecture (no graph code)
 
 In `arch/mod.rs`, add the component id consts, then a
@@ -92,6 +100,34 @@ permits:
 Composer-shape families must call `validate_stage_against_descriptor` once per
 stage at construction so a data/code drift fails closed; a family that declares a
 `block_stack` but skips the call leaves the descriptor informational.
+
+### Realtime cadence is automatic — register a streaming executor
+
+Live captions / dictation cadence is **descriptor-driven**, not something you
+tune per family and not something the `.oasr` pack declares. There is no pack
+metadata streaming flag and there is no third "buffered file-per-utterance"
+realtime mode to wire up — that old path was removed. A realtime session can only
+land on one of two shared mechanisms:
+
+- **Incremental re-decode** (the default for every non-frame-sync family): the
+  shared driver re-decodes a growing/windowed buffer on an adaptive cadence, so
+  partials appear *while the user is still speaking* and the FINAL is
+  byte-identical to offline `execute()`. Wire it by implementing
+  `GgmlAsrStreamingExecutor` for your executor — reuse
+  `build_seq2seq_streaming_session` (offline re-decode; works for CTC/attention
+  and seq2seq alike) or `build_ctc_streaming_driver` (when you have a cheap
+  CTC-greedy partial surface) — then register it in
+  `build_builtin_ggml_streaming_execution_dispatch` with
+  `StreamingPartialGranularity::Buffered`.
+- **Frame-sync** (append-only, never revises emitted text): only for genuinely
+  frame-synchronous architectures like X-ASR. Register with
+  `StreamingPartialGranularity::FrameSync`.
+
+If you register an offline executor but forget the streaming one, the startup
+completeness gate in `build_builtin_ggml_streaming_execution_dispatch` **fails
+loudly** rather than silently degrading your family to a stuttering
+final-only cadence. Do not go looking for a metadata key or a per-family cadence
+switch — there isn't one.
 
 ## Step 4 — gate it byte-identically
 

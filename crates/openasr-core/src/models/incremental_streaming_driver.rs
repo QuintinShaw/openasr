@@ -117,6 +117,15 @@ pub(crate) const STREAMING_PARTIAL_TUNING_WHISPER_SEQ2SEQ: StreamingPartialTunin
 pub(crate) const STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT: StreamingPartialTuning =
     StreamingPartialTuning::new(150, 0, None);
 
+/// Heavier snapshot families that re-decode via the full offline executor each
+/// partial (no cheap CTC greedy path), e.g. Dolphin's CTC/attention joint decode.
+/// Like the fast snapshot they carry no decode prompt (not autoregressive text
+/// continuation), but a short first-partial floor avoids paying a full joint
+/// decode over a sub-half-second window; the adaptive cadence backs the interval
+/// off further whenever a decode runs long.
+pub(crate) const STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT: StreamingPartialTuning =
+    StreamingPartialTuning::new(300, 500, None);
+
 /// Build the streaming driver for a runtime family's `start_streaming_session`.
 /// Each decode rebuilds [`GgmlAsrExecutionRequest`] from `request` plus the
 /// current audio and installs the request's thread-count override on the decode
@@ -288,6 +297,23 @@ fn merge_partial_prompt(base_prompt: Option<&str>, partial_prompt: Option<&str>)
     Some(format!("{base}\n{partial}"))
 }
 
+/// A PARTIAL decode that covered the WHOLE current buffer, kept so a terminal
+/// finalize over an unchanged buffer can reuse it instead of re-running the
+/// byte-identical full-buffer decode. Reuse is only taken when the buffer's
+/// (start, end, sample-count) coverage AND the decode prompt still match, so
+/// the reused text is exactly what `decode_full_buffer` would recompute over
+/// the same samples with the same prompt through the same deterministic
+/// executor. Any new audio or a drain changes the coverage and forces the full
+/// re-decode fallback, so parity with the offline batch is never at risk.
+#[derive(Debug, Clone)]
+struct FinalizeReuse {
+    start_ms: Option<u64>,
+    end_ms: Option<u64>,
+    sample_count: usize,
+    prompt: Option<String>,
+    raw_text: String,
+}
+
 pub(crate) struct IncrementalStreamingTranscriptDriver {
     executor_id: &'static str,
     adapter_id: &'static str,
@@ -317,6 +343,16 @@ pub(crate) struct IncrementalStreamingTranscriptDriver {
     /// accumulated across re-decodes (that is what caused boundary drift).
     prompt_context: String,
     partial_prompt_tail_words: Option<usize>,
+    /// Cached whole-buffer PARTIAL decode reused by an unchanged terminal
+    /// finalize (see [`FinalizeReuse`]).
+    finalize_reuse: Option<FinalizeReuse>,
+    /// Instrumentation: terminal finalizes served from the reuse cache vs a full
+    /// re-decode. Read by the driver's tests; the fast/slow accounting is not
+    /// consumed in production builds.
+    #[cfg_attr(not(test), allow(dead_code))]
+    finalize_reuse_hits: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
+    finalize_reuse_misses: u64,
 }
 
 impl IncrementalStreamingTranscriptDriver {
@@ -349,6 +385,9 @@ impl IncrementalStreamingTranscriptDriver {
             window_ms: 0,
             prompt_context: String::new(),
             partial_prompt_tail_words: None,
+            finalize_reuse: None,
+            finalize_reuse_hits: 0,
+            finalize_reuse_misses: 0,
         };
         driver.utterance_id_prefix = driver.utterance_id.clone();
         driver.segment_id_prefix = driver.segment_id.clone();
@@ -446,6 +485,7 @@ impl IncrementalStreamingTranscriptDriver {
         self.final_emitted = false;
         self.cadence = self.new_cadence();
         self.prompt_context.clear();
+        self.finalize_reuse = None;
         self.utterance_index = self.utterance_index.saturating_add(1);
         self.utterance_id = format!("{}_{:06}", self.utterance_id_prefix, self.utterance_index);
         self.segment_index = self.segment_index.saturating_add(1);
@@ -482,6 +522,21 @@ impl IncrementalStreamingTranscriptDriver {
         self.segment_index = self.segment_index.saturating_add(1);
         self.segment_id = format!("{}_{:06}", self.segment_id_prefix, self.segment_index);
         Some(GgmlAsrStreamingTranscriptUpdate::final_(update))
+    }
+
+    /// The cached whole-buffer PARTIAL decode text, iff it still exactly
+    /// describes the current buffer coverage and finalize prompt. When it does,
+    /// reusing it is byte-identical to re-running `decode_full_buffer` (same
+    /// samples, same prompt, same deterministic executor), so a terminal
+    /// finalize can skip the redundant full re-decode. The cache is single-use
+    /// per finalize, so it is taken whether or not it matches.
+    fn take_reusable_finalize_text(&mut self, prompt: Option<&str>) -> Option<String> {
+        let cache = self.finalize_reuse.take()?;
+        (cache.start_ms == self.buffer.start_ms()
+            && cache.end_ms == self.buffer.end_ms()
+            && cache.sample_count == self.buffer.sample_count()
+            && cache.prompt.as_deref() == prompt)
+            .then_some(cache.raw_text)
     }
 
     /// Last finalized segment as the optional decode prompt (for families that opt
@@ -523,6 +578,22 @@ impl IncrementalStreamingTranscriptDriver {
         let audio = self.buffer.prepared_audio_window(window_dur_ms);
         let prompt = self.partial_prompt_tail();
         let transcription = (self.transcribe)(&audio, prompt.as_deref())?;
+
+        // If this decode spanned the WHOLE buffer (the window reached sample 0),
+        // its prepared audio is byte-identical to `prepared_audio_snapshot`, so a
+        // terminal finalize over the still-unchanged buffer can reuse this exact
+        // decode instead of re-running it. Any later drain in this same call, or
+        // any new audio before finalize, changes the coverage and invalidates the
+        // reuse (the match in `finish_updates` fails and it re-decodes).
+        let spans_whole_buffer = window_dur_ms.saturating_mul(SAMPLES_PER_MS_16KHZ as u64)
+            >= self.buffer.sample_count() as u64;
+        self.finalize_reuse = spans_whole_buffer.then(|| FinalizeReuse {
+            start_ms: self.buffer.start_ms(),
+            end_ms: self.buffer.end_ms(),
+            sample_count: self.buffer.sample_count(),
+            prompt: prompt.clone(),
+            raw_text: transcription.text.trim().to_string(),
+        });
 
         // qwen3-asr is autoregressive seq2seq with NO real token timestamps, so map
         // each decoded character to a proportional absolute time across the window
@@ -675,7 +746,24 @@ impl GgmlAsrStreamingTranscriptDriver for IncrementalStreamingTranscriptDriver {
         // finalized and their audio drained. It reuses the same prompt context the
         // segment's partials used, so the FINAL is consistent with the last partial.
         let prompt = self.partial_prompt_tail();
-        let transcription = self.decode_full_buffer(prompt.as_deref())?;
+        // Fast path: if the last whole-buffer PARTIAL decode still describes the
+        // exact current buffer + prompt, its result IS what `decode_full_buffer`
+        // would recompute, so reuse it and skip the redundant full re-decode.
+        // Otherwise (new tail audio, a drain, or a prompt change) fall back to the
+        // full re-decode, which keeps the terminal FINAL byte-identical to batch.
+        let raw_text = match self.take_reusable_finalize_text(prompt.as_deref()) {
+            Some(cached) => {
+                self.finalize_reuse_hits = self.finalize_reuse_hits.saturating_add(1);
+                cached
+            }
+            None => {
+                self.finalize_reuse_misses = self.finalize_reuse_misses.saturating_add(1);
+                self.decode_full_buffer(prompt.as_deref())?
+                    .text
+                    .trim()
+                    .to_string()
+            }
+        };
         // The drain safety margin (plus the proportional cut's acoustic
         // slack) leaves a sliver of the last committed sentence's audio in
         // the buffer, so this decode can re-hear its tail. Partials strip
@@ -684,7 +772,7 @@ impl GgmlAsrStreamingTranscriptDriver for IncrementalStreamingTranscriptDriver {
         // cut duplicates the committed tail into the next segment.
         let text = trim_committed_overlap(
             &self.prompt_context,
-            transcription.text.trim(),
+            raw_text.trim(),
             MAX_COMMITTED_OVERLAP_TRIM_CHARS,
         )
         .to_string();
@@ -1095,6 +1183,107 @@ mod tests {
             text, "后续继续说话中",
             "terminal FINAL must not re-emit the committed sentence tail"
         );
+    }
+
+    /// A windowed driver whose decode counts calls, so a test can prove the
+    /// terminal finalize reused a cached whole-buffer PARTIAL instead of
+    /// re-decoding. The returned text encodes the absolute window like
+    /// `windowed_transcription`, so reuse is verifiably byte-identical to a
+    /// fresh decode of the same audio.
+    fn counting_windowed_driver(
+        window_ms: u64,
+        calls: Arc<AtomicUsize>,
+    ) -> IncrementalStreamingTranscriptDriver {
+        IncrementalStreamingTranscriptDriver::new(
+            "token-incremental-test-executor",
+            crate::QWEN3_ASR_GGML_ADAPTER_ID,
+            "utt_reuse",
+            "seg_reuse",
+            0,
+            Box::new(move |audio, _prompt| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(windowed_transcription(audio))
+            }),
+        )
+        .with_partial_window_ms(window_ms)
+    }
+
+    #[test]
+    fn terminal_finalize_reuses_unchanged_whole_buffer_partial_decode() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut driver = counting_windowed_driver(30_000, Arc::clone(&calls));
+        for i in 1..=4 {
+            driver.push_audio(vframe(i, (i - 1) * 20)).unwrap();
+        }
+        // One whole-buffer PARTIAL decode; it populates the finalize reuse cache.
+        let partial = driver.poll_updates().unwrap();
+        assert_eq!(text_of(&partial[0]).0, "w0 w1 w2 w3");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // No new audio: the terminal finalize must reuse the cached decode and
+        // NOT call the executor again, yet emit the byte-identical final text.
+        let final_ = driver.finish_updates().unwrap();
+        assert_eq!(text_of(&final_[0]), ("w0 w1 w2 w3", 1, true));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "finalize must reuse the cached whole-buffer decode, not re-decode"
+        );
+        assert_eq!(driver.finalize_reuse_hits, 1);
+        assert_eq!(driver.finalize_reuse_misses, 0);
+    }
+
+    #[test]
+    fn terminal_finalize_redecodes_when_tail_audio_arrived_after_last_partial() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut driver = counting_windowed_driver(30_000, Arc::clone(&calls));
+        for i in 1..=4 {
+            driver.push_audio(vframe(i, (i - 1) * 20)).unwrap();
+        }
+        let _ = driver.poll_updates().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A grace-tail frame arrives after the last partial decode: the buffer
+        // coverage no longer matches the cache, so finalize must fall back to a
+        // full re-decode (parity with batch over the tail-inclusive audio).
+        driver.push_audio(vframe(5, 80)).unwrap();
+        let final_ = driver.finish_updates().unwrap();
+        assert_eq!(text_of(&final_[0]), ("w0 w1 w2 w3 w4", 1, true));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "new tail audio must force a full re-decode at finalize"
+        );
+        assert_eq!(driver.finalize_reuse_hits, 0);
+        assert_eq!(driver.finalize_reuse_misses, 1);
+    }
+
+    #[test]
+    fn reused_finalize_text_is_byte_identical_to_a_full_redecode() {
+        // Same audio, two drivers: one finalizes via reuse (a partial ran), the
+        // other via the full re-decode fallback (partials disabled). The emitted
+        // terminal FINAL text must be identical -- the reuse cannot drift from
+        // the offline/batch decode.
+        let reuse_calls = Arc::new(AtomicUsize::new(0));
+        let mut reuse_driver = counting_windowed_driver(30_000, Arc::clone(&reuse_calls));
+        for i in 1..=4 {
+            reuse_driver.push_audio(vframe(i, (i - 1) * 20)).unwrap();
+        }
+        let _ = reuse_driver.poll_updates().unwrap();
+        let reused = reuse_driver.finish_updates().unwrap();
+        assert_eq!(reuse_driver.finalize_reuse_hits, 1);
+
+        let redecode_calls = Arc::new(AtomicUsize::new(0));
+        let mut redecode_driver = counting_windowed_driver(30_000, Arc::clone(&redecode_calls))
+            .with_partial_results(false);
+        for i in 1..=4 {
+            redecode_driver.push_audio(vframe(i, (i - 1) * 20)).unwrap();
+        }
+        let _ = redecode_driver.poll_updates().unwrap();
+        let redecoded = redecode_driver.finish_updates().unwrap();
+        assert_eq!(redecode_driver.finalize_reuse_misses, 1);
+
+        assert_eq!(text_of(&reused[0]).0, text_of(&redecoded[0]).0);
     }
 
     #[test]

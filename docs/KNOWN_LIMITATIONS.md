@@ -16,14 +16,14 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
 - The consent-gated CLI pull, the no-silent-download boundary, and pull/install
   mechanics are centralized in [Model Catalog, Registry, and Distribution](MODEL_CATALOG_ARCHITECTURE.md);
   the HTTP server never pulls.
-- True-streaming native ASR exists only for runtime packs that explicitly declare
-  `openasr.features.streaming=ggml-true-streaming-v1` and whose family has a
-  registered streaming executor. Local temporary packs for Qwen3-ASR, Whisper,
-  Cohere Transcribe, Moonshine, Parakeet-CTC, and wav2vec2-CTC have passed the
-  ignored smoke, and SenseVoice registers the same buffered streaming driver
-  (no streaming-declared SenseVoice pack has been smoke-tested yet), but official published packs with that metadata and public
-  product guarantees are still pending. Dolphin has no streaming executor at
-  all yet, so it always runs final-per-utterance.
+- Realtime cadence is descriptor-driven: any pack whose family has a registered
+  streaming executor gets live partials, and every built-in ASR family
+  (Qwen3-ASR, Whisper, Cohere Transcribe, Moonshine, Parakeet-CTC, wav2vec2-CTC,
+  SenseVoice, Dolphin, and X-ASR) registers one -- a startup completeness gate
+  rejects any family that does not. X-ASR is frame-sync (append-only partials);
+  every other family re-decodes a growing window (may revise partials, FINAL is
+  byte-identical to offline). Official published packs with public product
+  guarantees are still pending.
 - Speaker diarization is opt-in (`--diarize` / the API `diarize` flag). It uses
   pure-Rust WeSpeaker speaker-embedding and pyannote segmentation capability packs
   (pulled/installed on demand) to attribute anonymous `SPEAKER_NN` labels onto any

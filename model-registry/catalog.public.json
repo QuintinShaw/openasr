@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-05T19:27:33+00:00",
+  "generated_at": "2026-07-06T02:01:34+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -118,6 +118,7 @@
         }
       ],
       "language_mode": "detect_implicit",
+      "emits_punctuation": true,
       "sort_weight": 920,
       "recommended": true,
       "prose_locales": {
@@ -221,6 +222,7 @@
         }
       ],
       "language_mode": "fixed_multilingual",
+      "emits_punctuation": true,
       "sort_weight": 910,
       "recommended": true,
       "prose_locales": {
@@ -338,6 +340,7 @@
       ],
       "language_mode": "specify_only",
       "language_default": "zh",
+      "emits_punctuation": false,
       "sort_weight": 905,
       "recommended": true,
       "prose_locales": {
@@ -470,6 +473,7 @@
         }
       ],
       "language_mode": "detect_implicit",
+      "emits_punctuation": true,
       "sort_weight": 900,
       "recommended": true,
       "prose_locales": {
@@ -577,6 +581,7 @@
         }
       ],
       "language_mode": "detect_and_specify",
+      "emits_punctuation": true,
       "sort_weight": 900,
       "prose_locales": {
         "zh-CN": {
@@ -776,6 +781,7 @@
       ],
       "language_mode": "specify_only",
       "language_default": "en",
+      "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u4e3a\u8f6c\u5199\u6253\u9020\u7684 2B \u4e13\u7528\u8bed\u97f3\u8bc6\u522b\u6a21\u578b\uff0c\u652f\u6301 14 \u79cd\u8bed\u8a00",
@@ -861,6 +867,7 @@
       ],
       "language_mode": "fixed_monolingual",
       "language_default": "en",
+      "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u4e13\u4e3a\u5b9e\u65f6\u7aef\u4fa7\u8f6c\u5199\u6253\u9020\u7684 27M \u53c2\u6570\u8d85\u8f7b\u91cf\u82f1\u8bed\u8bed\u97f3\u8bc6\u522b\u6a21\u578b",
@@ -1059,6 +1066,7 @@
         }
       ],
       "language_mode": "detect_and_specify",
+      "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u57fa\u4e8e\u88c1\u526a\u7248 large-v3 \u6253\u9020\u7684\u5feb\u901f\u591a\u8bed\u8a00 Whisper \u6a21\u578b",
@@ -1253,6 +1261,7 @@
         }
       ],
       "language_mode": "detect_and_specify",
+      "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
           "tagline": "OpenAI \u6700\u9ad8\u7cbe\u5ea6\u7684 Whisper \u6a21\u578b\uff0cv3 large \u7248\u672c",
@@ -1518,6 +1527,7 @@
         }
       ],
       "language_mode": "detect_and_specify",
+      "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u7d27\u51d1\u7684\u591a\u8bed\u8a00 Whisper \u6a21\u578b\uff0c\u76f8\u6bd4 tiny \u66f4\u8fdb\u4e00\u6b65",
@@ -1616,6 +1626,7 @@
       ],
       "language_mode": "fixed_monolingual",
       "language_default": "en",
+      "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u7d27\u51d1\u7684\u7eaf\u82f1\u8bed Whisper \u6a21\u578b\uff0c\u5feb\u901f\u5b8c\u6210\u82f1\u8bed\u8f6c\u5199",
@@ -1810,6 +1821,7 @@
         }
       ],
       "language_mode": "detect_and_specify",
+      "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u9ad8\u7cbe\u5ea6\u591a\u8bed\u8a00 Whisper \u6a21\u578b\uff0c769M \u53c2\u6570",
@@ -1908,6 +1920,7 @@
       ],
       "language_mode": "fixed_monolingual",
       "language_default": "en",
+      "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u9ad8\u7cbe\u5ea6\u7eaf\u82f1\u8bed Whisper \u6a21\u578b\uff0c769M \u53c2\u6570",
@@ -2102,6 +2115,7 @@
         }
       ],
       "language_mode": "detect_and_specify",
+      "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u7d27\u51d1\u7684\u591a\u8bed\u8a00 Whisper \u6a21\u578b\uff0c\u9002\u5408\u672c\u5730\u8f6c\u5199",
@@ -2200,6 +2214,7 @@
       ],
       "language_mode": "fixed_monolingual",
       "language_default": "en",
+      "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u5747\u8861\u7684\u7eaf\u82f1\u8bed Whisper \u6a21\u578b\uff0c\u9002\u5408\u7cbe\u51c6\u7684\u672c\u5730\u8f6c\u5199",
@@ -2394,6 +2409,7 @@
         }
       ],
       "language_mode": "detect_and_specify",
+      "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u4f53\u79ef\u6700\u5c0f\u7684\u591a\u8bed\u8a00 Whisper \u6a21\u578b\uff0c\u672c\u5730\u8f6c\u5199\u901f\u5ea6\u5feb",
@@ -2492,6 +2508,7 @@
       ],
       "language_mode": "fixed_monolingual",
       "language_default": "en",
+      "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u4f53\u79ef\u6700\u5c0f\u7684\u7eaf\u82f1\u8bed Whisper \u6a21\u578b\uff0c\u82f1\u8bed\u8bc6\u522b\u901f\u5ea6\u6700\u5feb",

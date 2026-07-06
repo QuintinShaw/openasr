@@ -58,6 +58,7 @@ fn catalog_model(id: &str, family: &str, aliases: &[&str], size: &str) -> ModelC
             sort_weight: 0,
             recommended: false,
             upstream_release_date: None,
+            emits_punctuation: None,
             prose: None,
             prose_locales: None,
             quants: vec![crate::CatalogQuant {

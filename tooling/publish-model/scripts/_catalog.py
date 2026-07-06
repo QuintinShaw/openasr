@@ -341,6 +341,55 @@ def language_mode_for_model(entry: dict, languages: list[str]) -> dict:
     return {"language_mode": mode}
 
 
+# Per-family whether the model's transcripts include punctuation, mirroring
+# whether the family's decoder/tokenizer can ever produce a punctuation token at
+# all (an architecture/training-corpus property, not a per-release editorial
+# choice -- like LANGUAGE_MODE_BY_FAMILY, derived here from the same family core
+# dispatches on). `wav2vec2`/`parakeet` (character/BPE CTC, no catalog entries
+# yet) are deliberately absent: whether a BYO-imported checkpoint's vocab
+# includes punctuation depends on that specific checkpoint, not the family, so
+# it cannot be stated as a fixed fact here.
+#
+# dolphin: DataoceanAI's cn-dialect-small training corpus is transcribed WITHOUT
+# punctuation and the model has no punctuation-prediction head/token to enable,
+# so its output is honestly unpunctuated -- product-decided (2026-07) to
+# disclose this in the model card and market UI rather than leave it
+# unexplained. Every other current asr-model family's training data/tokenizer
+# supports punctuation and its transcripts include it.
+PUNCTUATION_BY_FAMILY = {
+    "qwen": True,
+    "cohere": True,
+    "whisper": True,
+    "xasr-zipformer": True,
+    "dolphin": False,
+    "moonshine": True,
+    "sensevoice": True,
+}
+
+
+def punctuation_for_model(entry: dict) -> dict:
+    """Per-model `emits_punctuation` for the catalog, mirroring whether this
+    model's family ever predicts punctuation tokens (see module docstring on
+    `PUNCTUATION_BY_FAMILY`).
+
+    Returns {} for any kind other than asr-model: translation models (hymt2)
+    and capability packs (wespeaker/pyannote-segmentation) don't produce an ASR
+    transcript, so the field is omitted rather than guessed.
+    """
+    if entry.get("kind", DEFAULT_CATALOG_MODEL_KIND) != "asr-model":
+        return {}
+
+    family = entry["family"]
+    emits_punctuation = PUNCTUATION_BY_FAMILY.get(family)
+    if emits_punctuation is None:
+        known = ", ".join(sorted(PUNCTUATION_BY_FAMILY))
+        raise KeyError(
+            f"model '{entry.get('id', '?')}' family '{family}' has no emits_punctuation "
+            f"mapping. Known families: {known}"
+        )
+    return {"emits_punctuation": emits_punctuation}
+
+
 def load() -> dict:
     core = load_toml(CATALOG_CORE)
     publish = load_toml(CATALOG_PUBLISH)

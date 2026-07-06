@@ -183,6 +183,7 @@ fn alias_contract_model(
         sort_weight: 0,
         recommended: false,
         upstream_release_date: None,
+        emits_punctuation: None,
         prose: None,
         prose_locales: None,
         quants: vec![
@@ -963,6 +964,56 @@ fn embedded_catalog_language_mode_matches_core_language_mode_per_family() {
         assert_eq!(
             model.language_default, None,
             "{id} should omit language_default"
+        );
+    }
+}
+
+#[test]
+fn embedded_catalog_emits_punctuation_matches_family() {
+    // `emits_punctuation` is a family/training-corpus property, derived at
+    // catalog-authoring time (tooling/publish-model/scripts/_catalog.py's
+    // `punctuation_for_model`). Pin the published catalog's values per family so a
+    // future regenerate that silently drops or flips the flag is caught here, not
+    // just in the Python drift check. Dolphin is the one asr-model family whose
+    // training corpus has no punctuation at all -- product-decided to surface this
+    // honestly in the model card and market UI rather than hide it.
+    let home = tempfile::tempdir().unwrap();
+    let catalog = super::load_embedded_signed_catalog(home.path())
+        .expect("embedded catalog should verify and parse offline");
+    let find = |id: &str| {
+        catalog
+            .models
+            .iter()
+            .find(|model| model.id == id)
+            .unwrap_or_else(|| panic!("catalog model '{id}' missing"))
+    };
+
+    assert_eq!(find("qwen3-asr-1.7b").emits_punctuation, Some(true));
+    assert_eq!(find("xasr-zh-en").emits_punctuation, Some(true));
+    assert_eq!(
+        find("cohere-transcribe-03-2026").emits_punctuation,
+        Some(true)
+    );
+    assert_eq!(find("moonshine-tiny").emits_punctuation, Some(true));
+    assert_eq!(find("sensevoice-small").emits_punctuation, Some(true));
+    assert_eq!(find("whisper-base").emits_punctuation, Some(true));
+    assert_eq!(
+        find("dolphin-cn-dialect-small").emits_punctuation,
+        Some(false),
+        "dolphin's training corpus is unpunctuated; it never predicts punctuation tokens"
+    );
+
+    // hymt2 (translation-model) and the diarization capability packs have no
+    // ASR transcript-punctuation axis, so the field is omitted rather than guessed.
+    for id in [
+        "hymt2-1.8b",
+        "pyannote-segmentation-3.0",
+        "wespeaker-voxceleb-resnet34-lm",
+    ] {
+        assert_eq!(
+            find(id).emits_punctuation,
+            None,
+            "{id} should omit emits_punctuation"
         );
     }
 }

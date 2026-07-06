@@ -17,8 +17,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::NativeAsrSession;
 use crate::PhraseBiasConfig;
 use crate::api::backend::{Segment, Transcription};
+use crate::arch::DOLPHIN_GGML_ADAPTER_ID;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgufMetadata, GgufOwnedWeightTensorPayload,
     GgufTensorDataReadError, GgufTensorDataReader, GgufWeightTensorElementType,
@@ -26,6 +28,10 @@ use crate::ggml_runtime::{
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
+    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
+};
+use crate::models::incremental_streaming_driver::{
+    STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
 
 use super::decoder_graph::DolphinDecoderConfig;
@@ -518,6 +524,35 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
             },
             carry_context: None,
         })
+    }
+}
+
+const DOLPHIN_STREAMING_EXECUTOR_ID: &str = "dolphin-ggml-snapshot-streaming-executor-v1";
+
+impl GgmlAsrStreamingExecutor for DolphinGgmlExecutor {
+    fn executor_id(&self) -> &'static str {
+        DOLPHIN_STREAMING_EXECUTOR_ID
+    }
+
+    fn start_streaming_session(
+        &self,
+        request: &GgmlAsrStreamingSessionRequest,
+    ) -> Result<Box<dyn NativeAsrSession>, GgmlAsrExecutionError> {
+        // Dolphin has no cheap CTC-greedy partial surface (the pipeline output
+        // exposes only the rescored transcript), so partials re-decode the
+        // trailing window through the same offline joint decode as the FINAL.
+        // The shared re-decode session (used by every non-frame-sync family)
+        // keeps the FINAL byte-identical to `execute()`; only the partial cadence
+        // differs. Its adaptive throttle absorbs the heavier per-partial cost.
+        build_seq2seq_streaming_session(
+            self.clone(),
+            DOLPHIN_STREAMING_EXECUTOR_ID,
+            DOLPHIN_GGML_ADAPTER_ID,
+            "dolphin",
+            request,
+            STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT,
+            <DolphinGgmlExecutor as GgmlAsrExecutor>::execute,
+        )
     }
 }
 

@@ -1,6 +1,7 @@
 pub(crate) mod builtin_execution_dispatch;
 pub mod cohere;
 pub(crate) mod ctc_greedy_decode;
+pub(crate) mod ctc_prefix_beam;
 pub(crate) mod ctc_streaming_driver;
 pub(crate) mod decode_policy_component_registry;
 pub(crate) mod decode_token_history;
@@ -45,6 +46,8 @@ pub(crate) mod seq2seq_greedy_decode;
 mod seq2seq_serve_batch;
 pub(crate) mod seq2seq_word_timestamps;
 pub(crate) mod serve_batch_env;
+#[cfg(test)]
+mod streaming_finalize_bench;
 pub(crate) mod streaming_partial_cadence;
 pub(crate) mod tensor_binding;
 pub(crate) mod tensor_schema;

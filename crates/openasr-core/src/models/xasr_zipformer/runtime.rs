@@ -12,7 +12,7 @@ use super::encoder_graph::{
     XasrEncoderChunkState, XasrEncoderFeatureInput, XasrZipformerEncoderGraph,
 };
 use super::encoder_weights::load_xasr_encoder_weights;
-use super::frontend::{XasrFbankFeatures, XasrFbankFrontend};
+use super::frontend::{XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES, XasrFbankFeatures, XasrFbankFrontend};
 use super::graph_config::xasr_zipformer_encoder_graph_config;
 use super::greedy::{
     DEFAULT_MAX_SYMBOLS_PER_FRAME, XasrGreedyDecodeResult, greedy_decode_frames_incremental,
@@ -252,6 +252,19 @@ impl XasrZipformerPreparedRuntime {
         let total_profile = xasr_profile_start();
         let fbank_profile = xasr_profile_start();
         let frontend = XasrFbankFrontend::new();
+        // Batch decode is one shot, so the whole input is the final flush:
+        // append the tail padding here (the streaming path adds the same
+        // padding in `XasrIncrementalDecoder::finish`).
+        let padded;
+        let samples = if samples.is_empty() {
+            samples
+        } else {
+            let mut buffer = Vec::with_capacity(samples.len() + XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES);
+            buffer.extend_from_slice(samples);
+            buffer.resize(samples.len() + XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES, 0.0);
+            padded = buffer;
+            padded.as_slice()
+        };
         let features = frontend
             .features_from_samples(samples)
             .map_err(|e| e.to_string())?;
