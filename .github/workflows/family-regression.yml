@@ -43,6 +43,12 @@ jobs:
         with:
           shared-key: family-regression-${{ matrix.os }}
       - name: Build openasr CLI
+        # The binary is shared with the case jobs via an artifact, and
+        # GitHub's x86 runner fleet mixes CPU generations, so host-tuned ggml
+        # kernels can SIGILL on a different case runner (same rule as
+        # release-binaries.yml).
+        env:
+          OPENASR_GGML_NATIVE: "0"
         run: cargo build --release -p openasr-cli
       - uses: actions/upload-artifact@v4
         with:
