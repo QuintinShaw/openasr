@@ -97,9 +97,9 @@ jobs:
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\Bin"
 
       - name: Ensure Ninja
-        if: matrix.features == 'vulkan'
+        if: matrix.features == 'vulkan' || matrix.features == 'cuda'
         shell: pwsh
-        # build.rs configures the Windows Vulkan ggml build with -G Ninja.
+        # build.rs configures the Windows Vulkan/CUDA ggml build with -G Ninja.
         run: |
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y }
           ninja --version
