@@ -218,6 +218,7 @@ fn bundled_registry_ordering_is_deterministic() {
         vec![
             "qwen3-asr-0.6b",
             "cohere-transcribe-03-2026",
+            "dolphin-cn-dialect-base",
             "dolphin-cn-dialect-small",
             "hymt2-1.8b",
             "moonshine-tiny",
