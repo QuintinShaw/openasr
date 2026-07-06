@@ -36,6 +36,13 @@ jobs:
             target: x86_64-unknown-linux-gnu
             binary_name: openasr
             archive_ext: tar.gz
+          # Native arm64 GitHub-hosted runner (no cross-compile toolchain
+          # needed). Both llama.cpp and competing ASR releases ship a Linux
+          # arm64 build; this was our most visible gap.
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary_name: openasr
+            archive_ext: tar.gz
           - os: macos-15-intel
             target: x86_64-apple-darwin
             binary_name: openasr
@@ -64,10 +71,10 @@ jobs:
             features: cuda
             timeout: 180
             experimental: true
-          # AMD HIP variant. Builds the same "radeon" fat code object
-          # (gfx1030/31/32, gfx1100/01/02, gfx1150/51, gfx1200/01) llama.cpp's
-          # own Windows HIP release job targets, covering RDNA2/3/3.5/4. HIP
-          # is statically linked (build.rs use_backend_dl is false for HIP),
+          # AMD HIP variant. Builds openasr-core's default consumer RDNA2/3/
+          # 3.5/4 fat code object (gfx1030/31/32/35, gfx1100/01/02, gfx1150/
+          # 51, gfx1200/01; see hip_gpu_targets() in build.rs for provenance).
+          # HIP is statically linked (build.rs use_backend_dl is false for HIP),
           # but still dynamically loads the ROCm runtime/BLAS DLLs staged
           # below, so it cannot launch on this GPU-less, driver-less runner
           # any more than the CUDA leg can; build + package only.

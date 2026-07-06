@@ -1154,16 +1154,22 @@ fn hip_sdk_clang_path(hip_path: &Path) -> Option<PathBuf> {
 }
 
 fn hip_gpu_targets() -> String {
-    // The llama.cpp "radeon" consumer arch list (RDNA2/3/3.5/4): one fat code
-    // object covers every supported AMD card and the HIP runtime selects the ISA
-    // at load. Drops gfx906 (Vega20/CDNA1, not a consumer target) versus the old
-    // default. Override with OPENASR_HIP_GPU_TARGETS for a narrower/wider set.
+    // A consumer RDNA2/3/3.5/4 arch list: one fat code object covers every
+    // supported AMD card and the HIP runtime selects the ISA at load. Union
+    // of llama.cpp's current Windows HIP release list (gfx1030/31/32,
+    // gfx1100/01/02, gfx1150/51, gfx1200/01) and gfx1035 from a competing
+    // ASR product's HIP build, biased toward RDNA2/3/4 gaming/consumer cards.
+    // Deliberately excludes CDNA/datacenter compute cards (gfx906/908/90a):
+    // those are compute accelerators, not something an end user's desktop/
+    // laptop ships, and would meaningfully lengthen every HIP build for a
+    // target this product does not support. Override with
+    // OPENASR_HIP_GPU_TARGETS for a narrower/wider set.
     env::var("OPENASR_HIP_GPU_TARGETS")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {
-            "gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201"
+            "gfx1030;gfx1031;gfx1032;gfx1035;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201"
                 .to_string()
         })
 }
