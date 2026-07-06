@@ -935,9 +935,14 @@ fn transcription_preferences_fill_missing_thread_request_only() {
 fn record_file_transcription_history_round_trips_structured_metadata() {
     let temp = tempfile::tempdir().unwrap();
     let distribution = distribution_context_for_test(temp.path());
+    // auto_save only controls transcript-file exports; history recording is
+    // governed by history_retention alone, so auto_save=false must still record.
     std::fs::write(
         temp.path().join("config.json"),
-        serde_json::json!({ "preferences": { "auto_save": true } }).to_string(),
+        serde_json::json!({
+            "preferences": { "auto_save": false, "history_retention": "last5" }
+        })
+        .to_string(),
     )
     .unwrap();
     let request = TranscriptionRequest::new(temp.path().join("sample.wav"), "qwen3-asr-0.6b:q8")
@@ -968,7 +973,7 @@ fn record_file_transcription_history_round_trips_structured_metadata() {
     assert_eq!(entries[0].diarization_active, Some(true));
     assert_eq!(
         entries[0].provenance,
-        Some(DaemonHistoryProvenance::AutoSaved)
+        Some(DaemonHistoryProvenance::Recorded)
     );
 
     let detail = store.get(&entries[0].id).unwrap().unwrap();
@@ -977,8 +982,42 @@ fn record_file_transcription_history_round_trips_structured_metadata() {
     assert_eq!(detail.entry.diarization_active, Some(true));
     assert_eq!(
         detail.entry.provenance,
-        Some(DaemonHistoryProvenance::AutoSaved)
+        Some(DaemonHistoryProvenance::Recorded)
     );
+}
+
+#[test]
+fn record_file_transcription_history_skips_write_when_retention_off() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+    // Even with auto_save enabled, "off" retention must skip the write:
+    // history_retention is the only history switch.
+    std::fs::write(
+        temp.path().join("config.json"),
+        serde_json::json!({
+            "preferences": { "auto_save": true, "history_retention": "off" }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let request = TranscriptionRequest::new(temp.path().join("sample.wav"), "qwen3-asr-0.6b:q8");
+    let transcription = Transcription {
+        text: "never stored".to_string(),
+        segments: Vec::new(),
+        longform: None,
+        language: None,
+    };
+
+    record_file_transcription_history(
+        &distribution,
+        &request,
+        &transcription,
+        ResponseFormat::Text,
+    )
+    .unwrap();
+
+    let store = DaemonHistoryStore::open(temp.path());
+    assert!(store.list().unwrap().is_empty());
 }
 
 #[test]
@@ -994,7 +1033,7 @@ fn history_retention_last5_prunes_store() {
                 duration_seconds: None,
                 output_format: Some(ResponseFormat::Text),
                 diarization_active: Some(false),
-                provenance: Some(DaemonHistoryProvenance::AutoSaved),
+                provenance: Some(DaemonHistoryProvenance::Recorded),
                 formats: vec!["text".to_string()],
                 text: format!("transcript {index}"),
             })
@@ -1006,13 +1045,67 @@ fn history_retention_last5_prunes_store() {
         1
     );
 
-    assert_eq!(store.list().unwrap().len(), 5);
-    assert_eq!(
-        fs::read_dir(temp.path().join("history").join("texts"))
-            .unwrap()
-            .count(),
-        5
+    let remaining = store.list().unwrap();
+    assert_eq!(remaining.len(), 5);
+    // The oldest entry (index 0) was pruned; every surviving row still serves
+    // its transcript text from the SQLite store.
+    for entry in &remaining {
+        assert!(store.get(&entry.id).unwrap().is_some());
+    }
+    assert!(
+        !remaining
+            .iter()
+            .any(|entry| entry.source_name.as_deref() == Some("sample-0.wav"))
     );
+}
+
+#[test]
+fn history_retention_off_prunes_store_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = DaemonHistoryStore::open(temp.path());
+    for index in 0..3 {
+        store
+            .record(DaemonHistoryRecord {
+                kind: DaemonHistoryKind::File,
+                model: "whisper-large-v3-turbo".to_string(),
+                source_name: Some(format!("sample-{index}.wav")),
+                duration_seconds: None,
+                output_format: Some(ResponseFormat::Text),
+                diarization_active: Some(false),
+                provenance: Some(DaemonHistoryProvenance::Recorded),
+                formats: vec!["text".to_string()],
+                text: format!("transcript {index}"),
+            })
+            .unwrap();
+    }
+
+    // Switching to "Off" clears everything already stored, even though new
+    // writes are skipped upstream at the record sites.
+    assert_eq!(
+        prune_history_store(&store, HistoryRetentionPolicy::Off).unwrap(),
+        3
+    );
+    assert!(store.list().unwrap().is_empty());
+
+    // "Forever" is the keep-all policy: it never prunes.
+    let entry = store
+        .record(DaemonHistoryRecord {
+            kind: DaemonHistoryKind::File,
+            model: "whisper-large-v3-turbo".to_string(),
+            source_name: Some("kept.wav".to_string()),
+            duration_seconds: None,
+            output_format: Some(ResponseFormat::Text),
+            diarization_active: Some(false),
+            provenance: Some(DaemonHistoryProvenance::Recorded),
+            formats: vec!["text".to_string()],
+            text: "keep me".to_string(),
+        })
+        .unwrap();
+    assert_eq!(
+        prune_history_store(&store, HistoryRetentionPolicy::Forever).unwrap(),
+        0
+    );
+    assert!(store.get(&entry.id).unwrap().is_some());
 }
 
 #[test]
