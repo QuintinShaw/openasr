@@ -115,10 +115,12 @@ jobs:
           cuda: "13.2.0"
           method: network
           # nvcc+cublas(+dev) for the ggml-cuda build, cudart for the runtime
-          # DLLs shipped in the archive, cccl for the CUB headers ggml-cuda's
-          # sort/scan kernels use. Network subset keeps this ~GBs smaller than
+          # DLLs shipped in the archive, thrust for the CUB/CCCL headers
+          # ggml-cuda's sort/scan kernels use (still named thrust_13.x in the
+          # Windows silent installer; an unknown name fails the installer with
+          # exit code 3772776473). Network subset keeps this ~GBs smaller than
           # the full local installer.
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cccl"]'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
           use-github-cache: true
 
       - name: Install Rust toolchain
