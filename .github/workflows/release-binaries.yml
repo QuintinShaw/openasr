@@ -78,7 +78,13 @@ jobs:
           # but still dynamically loads the ROCm runtime/BLAS DLLs staged
           # below, so it cannot launch on this GPU-less, driver-less runner
           # any more than the CUDA leg can; build + package only.
-          - os: windows-latest
+          # Pinned to windows-2022 like llama.cpp's HIP release job:
+          # windows-latest's VS 2026 STL declares the C99 floating
+          # comparison macros (isgreater & co.) in a way ROCm clang's HIP
+          # wrapper headers cannot overload ("__device__ function cannot
+          # overload __host__ __device__ function" in __clang_hip_cmath.h),
+          # so the device compile only works against the VS 2022 STL.
+          - os: windows-2022
             target: x86_64-pc-windows-msvc-hip
             binary_name: openasr.exe
             archive_ext: zip

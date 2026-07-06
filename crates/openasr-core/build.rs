@@ -499,6 +499,20 @@ fn main() {
                 "cargo:rustc-link-search=native={}",
                 cuda_path.join("lib/x64").display()
             );
+            // libcuda.so is the DRIVER library: a real one only exists on a
+            // machine with an NVIDIA driver. Toolkit installs provide a link
+            // stub under lib64/stubs (cuda-driver-dev on Linux) precisely so
+            // driver-linking binaries can be built on driver-less hosts (CI).
+            // Listed last: a real driver library earlier on the search path
+            // still wins.
+            println!(
+                "cargo:rustc-link-search=native={}",
+                cuda_path.join("lib64/stubs").display()
+            );
+            println!(
+                "cargo:rustc-link-search=native={}",
+                cuda_path.join("lib/stubs").display()
+            );
         }
     }
 
