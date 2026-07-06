@@ -21,6 +21,7 @@ pub(crate) const DOLPHIN_ENCODER_CGMLP_UNITS_KEY: &str = "dolphin.encoder.cgmlp_
 pub(crate) const DOLPHIN_ENCODER_CGMLP_KERNEL_KEY: &str = "dolphin.encoder.cgmlp_kernel";
 pub(crate) const DOLPHIN_ENCODER_MERGE_KERNEL_KEY: &str = "dolphin.encoder.merge_kernel";
 pub(crate) const DOLPHIN_ENCODER_FEATURE_DIM_KEY: &str = "dolphin.encoder.feature_dim";
+pub(crate) const DOLPHIN_ENCODER_MAX_CTX_KEY: &str = "dolphin.encoder.max_ctx";
 pub(crate) const DOLPHIN_DECODER_N_LAYERS_KEY: &str = "dolphin.decoder.n_layers";
 pub(crate) const DOLPHIN_DECODER_N_HEADS_KEY: &str = "dolphin.decoder.n_heads";
 pub(crate) const DOLPHIN_DECODER_FFN_DIM_KEY: &str = "dolphin.decoder.ffn_dim";
@@ -42,6 +43,11 @@ pub(crate) struct DolphinExecutionMetadata {
     pub encoder_cgmlp_kernel: usize,
     pub encoder_merge_kernel: usize,
     pub feature_dim: usize,
+    /// Length of the sinusoidal position table baked into
+    /// `encoder.embed.pos_enc.pe` (independent of the decoder's own
+    /// `decoder.embed.1.pe` table; both happen to be 5000 on every checkpoint
+    /// observed so far, but are tracked separately since nothing ties them).
+    pub encoder_max_ctx: usize,
     pub decoder_n_layers: usize,
     pub decoder_n_heads: usize,
     pub decoder_ffn_dim: usize,
@@ -71,6 +77,7 @@ pub(crate) fn parse_dolphin_execution_metadata<M: ScalarMetadataView>(
     let encoder_cgmlp_kernel = usize_key(DOLPHIN_ENCODER_CGMLP_KERNEL_KEY)?;
     let encoder_merge_kernel = usize_key(DOLPHIN_ENCODER_MERGE_KERNEL_KEY)?;
     let feature_dim = usize_key(DOLPHIN_ENCODER_FEATURE_DIM_KEY)?;
+    let encoder_max_ctx = usize_key(DOLPHIN_ENCODER_MAX_CTX_KEY)?;
     let decoder_n_layers = usize_key(DOLPHIN_DECODER_N_LAYERS_KEY)?;
     let decoder_n_heads = usize_key(DOLPHIN_DECODER_N_HEADS_KEY)?;
     let decoder_ffn_dim = usize_key(DOLPHIN_DECODER_FFN_DIM_KEY)?;
@@ -90,6 +97,7 @@ pub(crate) fn parse_dolphin_execution_metadata<M: ScalarMetadataView>(
         (DOLPHIN_ENCODER_CGMLP_KERNEL_KEY, encoder_cgmlp_kernel),
         (DOLPHIN_ENCODER_MERGE_KERNEL_KEY, encoder_merge_kernel),
         (DOLPHIN_ENCODER_FEATURE_DIM_KEY, feature_dim),
+        (DOLPHIN_ENCODER_MAX_CTX_KEY, encoder_max_ctx),
         (DOLPHIN_DECODER_N_LAYERS_KEY, decoder_n_layers),
         (DOLPHIN_DECODER_N_HEADS_KEY, decoder_n_heads),
         (DOLPHIN_DECODER_FFN_DIM_KEY, decoder_ffn_dim),
@@ -151,6 +159,7 @@ pub(crate) fn parse_dolphin_execution_metadata<M: ScalarMetadataView>(
         encoder_cgmlp_kernel,
         encoder_merge_kernel,
         feature_dim,
+        encoder_max_ctx,
         decoder_n_layers,
         decoder_n_heads,
         decoder_ffn_dim,
@@ -179,6 +188,7 @@ mod tests {
             (DOLPHIN_ENCODER_CGMLP_KERNEL_KEY, "31"),
             (DOLPHIN_ENCODER_MERGE_KERNEL_KEY, "31"),
             (DOLPHIN_ENCODER_FEATURE_DIM_KEY, "80"),
+            (DOLPHIN_ENCODER_MAX_CTX_KEY, "5000"),
             (DOLPHIN_DECODER_N_LAYERS_KEY, "12"),
             (DOLPHIN_DECODER_N_HEADS_KEY, "12"),
             (DOLPHIN_DECODER_FFN_DIM_KEY, "3072"),
@@ -248,6 +258,7 @@ mod tests {
             DOLPHIN_ENCODER_CGMLP_KERNEL_KEY,
             DOLPHIN_ENCODER_MERGE_KERNEL_KEY,
             DOLPHIN_ENCODER_FEATURE_DIM_KEY,
+            DOLPHIN_ENCODER_MAX_CTX_KEY,
             DOLPHIN_DECODER_N_LAYERS_KEY,
             DOLPHIN_DECODER_N_HEADS_KEY,
             DOLPHIN_DECODER_FFN_DIM_KEY,

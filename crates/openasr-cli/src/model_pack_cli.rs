@@ -87,7 +87,14 @@ fn import_command(command: ImportCommand) -> Result<()> {
             output_root,
             package_id,
             quantization,
-        } => import_dolphin_local_command(&source_root, &output_root, &package_id, quantization),
+            language_scheme,
+        } => import_dolphin_local_command(
+            &source_root,
+            &output_root,
+            &package_id,
+            quantization,
+            language_scheme,
+        ),
         ImportCommand::Sensevoice {
             source_root,
             output_root,
@@ -277,6 +284,7 @@ fn import_dolphin_local_command(
     output_root: &Path,
     package_id: &str,
     quantization: ImportDolphinQuantization,
+    language_scheme: ImportDolphinLanguageScheme,
 ) -> Result<()> {
     let request = openasr_core::DolphinImportRequest {
         safetensors_path: source_root.join("full.safetensors"),
@@ -287,6 +295,14 @@ fn import_dolphin_local_command(
             ImportDolphinQuantization::Fp16 => openasr_core::DolphinQuantizationMode::Fp16,
             ImportDolphinQuantization::Q8_0 => openasr_core::DolphinQuantizationMode::Q8_0,
             ImportDolphinQuantization::Q4_K => openasr_core::DolphinQuantizationMode::Q4_K,
+        },
+        language_scheme: match language_scheme {
+            ImportDolphinLanguageScheme::CnDialect => {
+                openasr_core::DolphinLanguageScheme::CnDialect
+            }
+            ImportDolphinLanguageScheme::Multilingual => {
+                openasr_core::DolphinLanguageScheme::Multilingual
+            }
         },
     };
 

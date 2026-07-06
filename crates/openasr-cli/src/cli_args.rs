@@ -659,6 +659,9 @@ pub(crate) enum ImportCommand {
         /// Runtime tensor quantization for GGUF-backed `.oasr` output (context_module/CMVN/mel filterbank always stay f32).
         #[arg(long, value_enum, default_value_t = ImportDolphinQuantization::Fp16)]
         quantization: ImportDolphinQuantization,
+        /// Decode-prefix scheme the checkpoint's vocab uses: `cn-dialect` (fixed `<zh>` language token, small.cn/cn-dialect-base) or `multilingual` (per-code `<lang>` + `<region>`, dolphin-small/dolphin-base).
+        #[arg(long, value_enum, default_value_t = ImportDolphinLanguageScheme::CnDialect)]
+        language_scheme: ImportDolphinLanguageScheme,
     },
     /// Import one local SenseVoiceSmall (FunASR SAN-M/CTC) source directory into one runtime pack file (`.oasr`).
     #[command(name = "sensevoice")]
@@ -854,6 +857,18 @@ pub(crate) enum ImportDolphinQuantization {
     Fp16,
     Q8_0,
     Q4_K,
+}
+
+/// Which decode-prefix scheme the checkpoint's vocab uses. Defaults to
+/// `cn-dialect` (the existing `small.cn`/`cn-dialect-base` checkpoints, fixed
+/// `<zh>` language token) so every already-scripted import call keeps working
+/// unchanged; the multilingual checkpoints (`dolphin-small`/`dolphin-base`)
+/// pass `--language-scheme multilingual`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub(crate) enum ImportDolphinLanguageScheme {
+    #[default]
+    CnDialect,
+    Multilingual,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

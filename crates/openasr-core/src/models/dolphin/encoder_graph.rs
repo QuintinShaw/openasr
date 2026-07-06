@@ -74,6 +74,9 @@ pub(crate) struct DolphinEncoderConfig {
     pub merge_kernel: usize,
     pub num_blocks: usize,
     pub feature_dim: usize,
+    /// Length of the sinusoidal position table baked into
+    /// `encoder.embed.pos_enc.pe` (`dolphin.encoder.max_ctx`).
+    pub max_positions: usize,
     pub layer_norm_epsilon: f32,
 }
 
@@ -89,6 +92,31 @@ impl DolphinEncoderConfig {
             merge_kernel: 31,
             num_blocks: 12,
             feature_dim: 80,
+            max_positions: 5000,
+            layer_norm_epsilon: 1e-5,
+        }
+    }
+
+    /// Build the config from the pack's own parsed runtime metadata --
+    /// checkpoint-size-agnostic (`small.cn`/base/multilingual all resolve
+    /// through this same path). `layer_norm_epsilon` is not a per-checkpoint
+    /// metadata key: every observed Dolphin/WeNet checkpoint uses the same
+    /// `1e-5` LayerNorm epsilon, so it stays a fixed architecture constant
+    /// like `small_cn()`'s.
+    pub(crate) fn from_execution_metadata(
+        metadata: &super::runtime_contract::DolphinExecutionMetadata,
+    ) -> Self {
+        Self {
+            d_model: metadata.encoder_d_model,
+            attention_heads: metadata.encoder_n_heads,
+            head_dim: metadata.encoder_head_dim,
+            ffn_units: metadata.encoder_ffn_dim,
+            cgmlp_units: metadata.encoder_cgmlp_units,
+            cgmlp_kernel: metadata.encoder_cgmlp_kernel,
+            merge_kernel: metadata.encoder_merge_kernel,
+            num_blocks: metadata.encoder_n_layers,
+            feature_dim: metadata.feature_dim,
+            max_positions: metadata.encoder_max_ctx,
             layer_norm_epsilon: 1e-5,
         }
     }
@@ -353,7 +381,13 @@ fn build_embed_weights<'a, 'p>(
         conv1_b: builder.w4(graph, "encoder.embed.conv.2.bias", 1, 1, d, 1)?,
         out_w: builder.w2(graph, "encoder.embed.out.0.weight", flat, d)?,
         out_b: builder.w1(graph, "encoder.embed.out.0.bias", d)?,
-        pos_emb: builder.pos_slice(graph, "encoder.embed.pos_enc.pe", d, frames, 5000)?,
+        pos_emb: builder.pos_slice(
+            graph,
+            "encoder.embed.pos_enc.pe",
+            d,
+            frames,
+            config.max_positions,
+        )?,
     })
 }
 

@@ -212,6 +212,7 @@ pub(crate) static DOLPHIN_HPARAM_SCHEMA: &[&str] = &[
     "dolphin.encoder.cgmlp_kernel",
     "dolphin.encoder.merge_kernel",
     "dolphin.encoder.feature_dim",
+    "dolphin.encoder.max_ctx",
     "dolphin.decoder.n_layers",
     "dolphin.decoder.n_heads",
     "dolphin.decoder.ffn_dim",
