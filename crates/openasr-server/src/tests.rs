@@ -1006,12 +1006,17 @@ fn history_retention_last5_prunes_store() {
         1
     );
 
-    assert_eq!(store.list().unwrap().len(), 5);
-    assert_eq!(
-        fs::read_dir(temp.path().join("history").join("texts"))
-            .unwrap()
-            .count(),
-        5
+    let remaining = store.list().unwrap();
+    assert_eq!(remaining.len(), 5);
+    // The oldest entry (index 0) was pruned; every surviving row still serves
+    // its transcript text from the SQLite store.
+    for entry in &remaining {
+        assert!(store.get(&entry.id).unwrap().is_some());
+    }
+    assert!(
+        !remaining
+            .iter()
+            .any(|entry| entry.source_name.as_deref() == Some("sample-0.wav"))
     );
 }
 

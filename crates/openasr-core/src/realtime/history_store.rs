@@ -48,7 +48,6 @@
 //!   transcription itself unaffected by a broken history store.
 
 use std::{
-    fmt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -80,12 +79,6 @@ impl DaemonHistoryKind {
             "live" => Some(Self::Live),
             _ => None,
         }
-    }
-}
-
-impl fmt::Display for DaemonHistoryKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -183,8 +176,6 @@ pub enum DaemonHistoryStoreError {
     InvalidId { id: String, reason: &'static str },
     #[error("Invalid history record field '{field}': {reason}")]
     InvalidRecord { field: &'static str, reason: String },
-    #[error("Invalid history query field '{field}': {reason}")]
-    InvalidQuery { field: &'static str, reason: String },
     #[error("Could not create history directory '{path}': {source}")]
     CreateDir {
         path: PathBuf,
@@ -256,9 +247,10 @@ impl DaemonHistoryStore {
             let mut statement = conn.prepare(&sql).map_err(DaemonHistoryStoreError::Query)?;
             let param_refs: Vec<&dyn rusqlite::ToSql> =
                 params.iter().map(|value| value.as_ref()).collect();
-            statement
+            let count: i64 = statement
                 .query_row(param_refs.as_slice(), |row| row.get(0))
-                .map_err(DaemonHistoryStoreError::Query)?
+                .map_err(DaemonHistoryStoreError::Query)?;
+            count.max(0) as usize
         };
 
         let limit_sql = match query.limit {
@@ -315,11 +307,8 @@ impl DaemonHistoryStore {
         validate_history_id(id)?;
         let mut conn = self.connection()?;
         let tx = conn.transaction().map_err(DaemonHistoryStoreError::Query)?;
-        tx.execute(
-            "DELETE FROM history_entries_fts WHERE id = ?1",
-            params![id],
-        )
-        .map_err(DaemonHistoryStoreError::Query)?;
+        tx.execute("DELETE FROM history_entries_fts WHERE id = ?1", params![id])
+            .map_err(DaemonHistoryStoreError::Query)?;
         let removed = tx
             .execute("DELETE FROM history_entries WHERE id = ?1", params![id])
             .map_err(DaemonHistoryStoreError::Query)?;
@@ -425,8 +414,7 @@ impl DaemonHistoryStore {
             match insert_result {
                 Ok(_) => break,
                 Err(rusqlite::Error::SqliteFailure(error, _))
-                    if error.code == rusqlite::ErrorCode::ConstraintViolation
-                        && attempt < 1000 =>
+                    if error.code == rusqlite::ErrorCode::ConstraintViolation && attempt < 1000 =>
                 {
                     attempt += 1;
                     id = format!("{base}-{attempt}");
@@ -537,11 +525,13 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DaemonHistoryEntry>
         created_at_unix_seconds: created_at_unix_seconds.max(0) as u64,
         source_name: row.get(4)?,
         duration_seconds: row.get(5)?,
-        output_format: output_format.as_deref().and_then(|value| {
-            <ResponseFormat as std::str::FromStr>::from_str(value).ok()
-        }),
+        output_format: output_format
+            .as_deref()
+            .and_then(|value| <ResponseFormat as std::str::FromStr>::from_str(value).ok()),
         diarization_active,
-        provenance: provenance.as_deref().and_then(DaemonHistoryProvenance::parse),
+        provenance: provenance
+            .as_deref()
+            .and_then(DaemonHistoryProvenance::parse),
         formats: serde_json::from_str(&formats_json).unwrap_or_else(|_| vec!["text".to_string()]),
         preview: row.get(10)?,
     })
@@ -911,7 +901,11 @@ mod tests {
             .unwrap();
         assert_eq!(page_one.total, 3);
         assert_eq!(
-            page_one.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            page_one
+                .entries
+                .iter()
+                .map(|e| e.id.clone())
+                .collect::<Vec<_>>(),
             vec![third.id.clone(), second.id.clone()]
         );
 
@@ -924,7 +918,11 @@ mod tests {
             .unwrap();
         assert_eq!(page_two.total, 3);
         assert_eq!(
-            page_two.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            page_two
+                .entries
+                .iter()
+                .map(|e| e.id.clone())
+                .collect::<Vec<_>>(),
             vec![first.id.clone()]
         );
     }

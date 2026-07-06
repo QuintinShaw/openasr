@@ -2919,7 +2919,7 @@ fn enable_history(temp: &tempfile::TempDir) {
 }
 
 #[tokio::test]
-async fn transcriptions_record_file_history_with_text_sidecar() {
+async fn transcriptions_record_file_history_in_sqlite_store() {
     let temp = tempfile::tempdir().unwrap();
     let distribution = openasr_server::DistributionRuntime {
         openasr_home: Some(temp.path().join("home")),
@@ -3046,6 +3046,185 @@ async fn transcriptions_record_file_history_with_text_sidecar() {
     let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
     let parsed: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(parsed["data"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn history_list_supports_search_pagination_and_kind_filter() {
+    use openasr_core::realtime::history::{
+        DaemonHistoryKind, DaemonHistoryRecord, DaemonHistoryStore,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    enable_history(&temp);
+    let home = temp.path().join("home");
+    let store = DaemonHistoryStore::open(&home);
+    let record = |kind: DaemonHistoryKind, source: &str, text: &str| DaemonHistoryRecord {
+        kind,
+        model: "whisper-large-v3-turbo".to_string(),
+        source_name: Some(source.to_string()),
+        duration_seconds: None,
+        output_format: Some(ResponseFormat::Text),
+        diarization_active: Some(false),
+        provenance: None,
+        formats: vec!["text".to_string()],
+        text: text.to_string(),
+    };
+    let oldest = store
+        .record(record(
+            DaemonHistoryKind::File,
+            "notes.wav",
+            "english meeting notes",
+        ))
+        .unwrap();
+    let middle = store
+        .record(record(
+            DaemonHistoryKind::Live,
+            "live-zh",
+            "我们讨论了历史记录",
+        ))
+        .unwrap();
+    let newest = store
+        .record(record(
+            DaemonHistoryKind::Live,
+            "live-en",
+            "quick live note",
+        ))
+        .unwrap();
+
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+        },
+    );
+    let list = |uri: String| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+        }
+    };
+
+    // Default listing: newest first, additive pagination metadata present.
+    let (status, parsed) = list("/v1/history".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parsed["object"], "list");
+    assert_eq!(parsed["total"], 3);
+    assert_eq!(parsed["limit"], 50);
+    assert_eq!(parsed["offset"], 0);
+    let ids: Vec<&str> = parsed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![&newest.id, &middle.id, &oldest.id]);
+
+    // FTS search must handle CJK substrings (trigram tokenizer, not unicode61).
+    let (status, parsed) = list("/v1/history?search=%E5%8E%86%E5%8F%B2".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parsed["total"], 1);
+    assert_eq!(parsed["data"][0]["id"], middle.id.as_str());
+
+    // Search also covers source_name and model, and misses return empty pages.
+    let (status, parsed) = list("/v1/history?search=notes.wav".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parsed["total"], 1);
+    assert_eq!(parsed["data"][0]["id"], oldest.id.as_str());
+    let (_, parsed) = list("/v1/history?search=nonexistent-token".to_string()).await;
+    assert_eq!(parsed["total"], 0);
+    assert_eq!(parsed["data"].as_array().unwrap().len(), 0);
+
+    // Kind filter.
+    let (status, parsed) = list("/v1/history?kind=live".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parsed["total"], 2);
+    for entry in parsed["data"].as_array().unwrap() {
+        assert_eq!(entry["kind"], "live");
+    }
+    let (status, _) = list("/v1/history?kind=dictation".to_string()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Pagination: stable newest-first order across pages, total unaffected.
+    let (status, parsed) = list("/v1/history?limit=2&offset=0".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parsed["total"], 3);
+    assert_eq!(parsed["limit"], 2);
+    assert_eq!(parsed["offset"], 0);
+    let page_one: Vec<&str> = parsed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(page_one, vec![&newest.id, &middle.id]);
+    let (_, parsed) = list("/v1/history?limit=2&offset=2".to_string()).await;
+    assert_eq!(parsed["total"], 3);
+    assert_eq!(parsed["offset"], 2);
+    let page_two: Vec<&str> = parsed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(page_two, vec![&oldest.id]);
+
+    // Combined search + kind filter.
+    let (status, parsed) = list("/v1/history?search=live&kind=live".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parsed["total"], 2);
+}
+
+#[tokio::test]
+async fn history_routes_report_errors_for_corrupt_database_without_crashing() {
+    let temp = tempfile::tempdir().unwrap();
+    enable_history(&temp);
+    let home = temp.path().join("home");
+    let history_dir = home.join("history");
+    std::fs::create_dir_all(&history_dir).unwrap();
+    std::fs::write(history_dir.join("history.db"), b"not a sqlite database").unwrap();
+
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+        },
+    );
+
+    // History endpoints answer with a structured error instead of taking the
+    // daemon down.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("history")
+    );
+
+    // Transcription (the daemon's main job) still succeeds; the failed
+    // best-effort history side-write must not fail the request.
+    let request = multipart_request("whisper-large-v3-turbo", "sample.wav", b"not a real wav");
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

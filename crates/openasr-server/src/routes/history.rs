@@ -37,7 +37,10 @@ impl HistoryListQuery {
             None => None,
             Some(raw) => Some(parse_history_kind(raw)?),
         };
-        let limit = self.limit.unwrap_or(DEFAULT_HISTORY_LIMIT).min(MAX_HISTORY_LIMIT);
+        let limit = self
+            .limit
+            .unwrap_or(DEFAULT_HISTORY_LIMIT)
+            .min(MAX_HISTORY_LIMIT);
         let offset = self.offset.unwrap_or(0);
         let search = self
             .search
