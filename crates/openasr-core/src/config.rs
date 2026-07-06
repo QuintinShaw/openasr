@@ -74,7 +74,7 @@ pub struct Preferences {
     pub density: AppearanceDensity,
     #[serde(default = "default_dictation_shortcut")]
     pub dictation_shortcut: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_push_to_talk")]
     pub push_to_talk: bool,
     #[serde(default)]
     pub inference_threads: Option<u16>,
@@ -293,7 +293,7 @@ impl Default for Preferences {
             accent_color: None,
             density: AppearanceDensity::Comfortable,
             dictation_shortcut: default_dictation_shortcut(),
-            push_to_talk: false,
+            push_to_talk: default_push_to_talk(),
             inference_threads: None,
             quant_preference: QuantPreference::Auto,
             execution_target: ExecutionTarget::Auto,
@@ -565,8 +565,19 @@ fn render_download_source_pref(pref: &DownloadSourcePref) -> String {
     }
 }
 
+/// The product default dictation trigger: Option (macOS ⌥) alone, held or tapped
+/// per the push-to-talk mode. This is the single source of truth for the
+/// first-launch shortcut; the desktop frontend's `DEFAULT_DESKTOP_PREFERENCES`
+/// only mirrors it as an offline fallback (`"Alt"` <-> `["⌥"]`).
 fn default_dictation_shortcut() -> Option<String> {
-    Some("CommandOrControl+Shift+Space".to_string())
+    Some("Alt".to_string())
+}
+
+/// Push-to-talk (hold-to-speak) is on by default: hold the trigger to dictate,
+/// release to stop. The single source of truth for the first-launch value;
+/// the desktop frontend mirrors it as an offline fallback only.
+fn default_push_to_talk() -> bool {
+    true
 }
 
 fn resolve_default_model_config_value(

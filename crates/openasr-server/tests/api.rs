@@ -604,10 +604,10 @@ async fn config_endpoint_roundtrips_versioned_preferences() {
         document["preferences"]["version"],
         openasr_core::config::PREFERENCES_SCHEMA_VERSION
     );
-    assert_eq!(
-        document["preferences"]["dictation_shortcut"],
-        "CommandOrControl+Shift+Space"
-    );
+    // Fresh-config product defaults surfaced to the desktop: Option (⌥) alone,
+    // push-to-talk on. These are what a cleared-state first launch shows.
+    assert_eq!(document["preferences"]["dictation_shortcut"], "Alt");
+    assert_eq!(document["preferences"]["push_to_talk"], true);
     assert_eq!(document["preferences"]["word_timestamps"], false);
 
     document["preferences"]["language"] = serde_json::json!("en");

@@ -104,11 +104,29 @@ fn missing_config_file_returns_default_config_document_preferences() {
     assert_eq!(document.preferences.hotwords, Vec::<String>::new());
     assert_eq!(document.preferences.theme, AppearanceTheme::System);
     assert_eq!(document.preferences.density, AppearanceDensity::Comfortable);
+    // Product default: Option (⌥) alone, push-to-talk on. A fresh install (no
+    // config file) must land on these; the desktop first-launch experience
+    // reads them straight through /v1/config.
     assert_eq!(
         document.preferences.dictation_shortcut.as_deref(),
-        Some("CommandOrControl+Shift+Space")
+        Some("Alt")
     );
+    assert!(document.preferences.push_to_talk);
     assert_eq!(document.preferences.inference_threads, None);
+}
+
+#[test]
+fn preferences_missing_dictation_fields_fall_back_to_product_defaults() {
+    // A config file that omits the dictation trigger fields (e.g. one written by
+    // an older build, or hand-edited) must still deserialize to the product
+    // defaults via the serde field defaults -- not to bool's `false` or `None`.
+    let document: OpenAsrConfigDocument =
+        serde_json::from_str(r#"{ "config": {}, "preferences": { "language": "en" } }"#).unwrap();
+    assert_eq!(
+        document.preferences.dictation_shortcut.as_deref(),
+        Some("Alt")
+    );
+    assert!(document.preferences.push_to_talk);
 }
 
 #[test]
