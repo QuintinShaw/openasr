@@ -230,7 +230,12 @@ fn main() {
             ));
         }
     }
-    if (feat_hip || feat_vulkan) && is_windows {
+    // CUDA joins HIP/Vulkan on the Ninja generator because the default Visual
+    // Studio generator resolves enable_language(CUDA) through NVIDIA's VS
+    // build customizations, which trail new VS majors (VS 2026 has no CUDA
+    // toolset yet -> "No CUDA toolset found"). Ninja drives nvcc directly
+    // with the MSVC host compiler pinned below instead.
+    if (feat_hip || feat_vulkan || feat_cuda) && is_windows {
         configure.arg("-G").arg("Ninja");
     }
     if is_macos {
@@ -361,6 +366,16 @@ fn main() {
             if nvcc.is_file() {
                 configure.arg(format!("-DCMAKE_CUDA_COMPILER={}", cmake_path(&nvcc)));
             }
+        }
+        // Under Ninja nothing tells nvcc which host compiler to use (the VS
+        // generator used to imply it), so pin it to the same MSVC cl the rest
+        // of the build is compiled with; otherwise nvcc takes whatever cl.exe
+        // (or clang) PATH happens to expose first.
+        if is_windows && let Some(tool) = msvc_tool.as_ref() {
+            configure.arg(format!(
+                "-DCMAKE_CUDA_HOST_COMPILER={}",
+                cmake_path(tool.path())
+            ));
         }
         configure
             .arg(format!("-DCMAKE_CUDA_ARCHITECTURES={}", cuda_gpu_targets()))

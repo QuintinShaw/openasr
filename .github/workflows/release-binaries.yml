@@ -11,8 +11,13 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.target_name }}
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout || 60 }}
+    # Experimental legs (currently the Windows CUDA variant, whose hosted
+    # toolchain story is still settling) may fail without failing the run;
+    # their archives simply drop out of the artifact set until they stabilize.
+    continue-on-error: ${{ matrix.experimental || false }}
     # Distributed binaries must be portable. build.rs auto-enables GGML_NATIVE
     # (-march=native) when host==target on x86, which is correct for local
     # build-and-run but would tune these released x86 binaries to the CI
@@ -25,30 +30,107 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target_name: linux-x86_64
+            target: x86_64-unknown-linux-gnu
             binary_name: openasr
             archive_ext: tar.gz
           - os: macos-15-intel
-            target_name: macos-x86_64
+            target: x86_64-apple-darwin
             binary_name: openasr
             archive_ext: tar.gz
           - os: macos-latest
-            target_name: macos-aarch64
+            target: aarch64-apple-darwin
             binary_name: openasr
             archive_ext: tar.gz
           - os: windows-latest
-            target_name: windows-x86_64
+            target: x86_64-pc-windows-msvc
             binary_name: openasr.exe
             archive_ext: zip
+          # GPU-feature Windows variants. The hosted runners have no GPU, so
+          # these jobs validate "compiles + links + (where the loader allows)
+          # launches"; GPU inference is validated on real hardware.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc-vulkan
+            binary_name: openasr.exe
+            archive_ext: zip
+            features: vulkan
+            timeout: 120
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc-cuda
+            binary_name: openasr.exe
+            archive_ext: zip
+            features: cuda
+            timeout: 180
+            experimental: true
 
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      - name: Resolve workspace version
+        shell: bash
+        # Single source of truth: [workspace.package] version in the root
+        # Cargo.toml (same extraction release-core.yml uses). Archives are
+        # named openasr-<version>-<target>.<ext> to match the release assets.
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
+          if [ -z "${version}" ]; then
+            echo "could not read workspace version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "OPENASR_VERSION=${version}" >> "${GITHUB_ENV}"
+
       - name: Install Linux audio build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Install Vulkan SDK
+        if: matrix.features == 'vulkan'
+        shell: pwsh
+        env:
+          VULKAN_VERSION: 1.4.313.2
+        # LunarG silent install (the recipe llama.cpp's Windows Vulkan CI
+        # uses). Provides vulkan-1.lib, glslc, SPIRV-Headers, and the loader
+        # runtime that lets the produced exe launch on this GPU-less runner.
+        run: |
+          curl.exe --fail --location --retry 3 `
+            --output "$env:RUNNER_TEMP\vulkan-sdk-installer.exe" `
+            "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          & "$env:RUNNER_TEMP\vulkan-sdk-installer.exe" --accept-licenses --default-answer --confirm-command install | Out-Null
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\Bin"
+
+      - name: Ensure Ninja
+        if: matrix.features == 'vulkan' || matrix.features == 'cuda'
+        shell: pwsh
+        # build.rs configures the Windows Vulkan/CUDA ggml build with -G Ninja.
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y }
+          ninja --version
+
+      - name: Install CUDA toolkit
+        if: matrix.features == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          # 13.x is the first CUDA line whose host_config.h accepts the VS
+          # 2026 (MSVC 19.5x) toolset on windows-latest; 12.x rejects it with
+          # "unsupported Microsoft Visual Studio version". No VS-integration
+          # sub-package: the build uses the Ninja generator (build.rs).
+          cuda: "13.2.0"
+          method: network
+          # CUDA 13 splits the compiler across sub-packages: nvcc is only the
+          # driver, crt carries the front-end headers (include/crt/*), and
+          # nvvm carries the cicc device compiler nvcc dispatches to (missing
+          # nvvm fails with an unexpanded %CICC_PATH%). cudart supplies the
+          # runtime DLLs shipped in the archive, cublas(+dev) the GEMM
+          # library, thrust the CUB/CCCL headers ggml-cuda's sort/scan
+          # kernels use (still named thrust_13.x in the Windows silent
+          # installer; an unknown name fails the installer with exit code
+          # 3772776473). Network subset keeps this ~GBs smaller than the
+          # full installer.
+          sub-packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "thrust"]'
+          use-github-cache: true
 
       - name: Install Rust toolchain
         run: |
@@ -57,8 +139,13 @@ jobs:
           rustc --version
           cargo --version
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-binaries-${{ matrix.target }}
+
       - name: Build release binary
-        run: cargo build --release -p openasr-cli
+        shell: bash
+        run: cargo build --release -p openasr-cli ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
       - name: Smoke release binary
         if: runner.os != 'Windows'
@@ -67,53 +154,126 @@ jobs:
           ./target/release/openasr --help
           ./target/release/openasr list
 
+      # The CUDA exe import-links nvcuda.dll, which only ships with an NVIDIA
+      # driver, so it cannot launch on this GPU-less runner: build + package
+      # only. The Vulkan exe resolves against the SDK loader installed above,
+      # so it launches and runs CPU paths here.
       - name: Smoke release binary
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.features != 'cuda'
         shell: pwsh
         run: |
           .\target\release\openasr.exe --version
           .\target\release\openasr.exe --help
           .\target\release\openasr.exe list
 
+      - name: Restore model pack cache
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: actions/cache@v4
+        with:
+          path: ~/.openasr/models
+          key: openasr-packs-whisper-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('model-registry/catalog.json') }}
+
+      - name: Real-model CPU smoke
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        # Full-chain smoke for the CPU package: mock backend end to end, then
+        # a real signature-verified pull + native CPU transcription of the
+        # committed fixture (same chain family-regression exercises on
+        # Linux/macOS, which have no Windows lane).
+        run: |
+          set -euo pipefail
+          ./target/release/openasr.exe transcribe fixtures/jfk.wav --model whisper-small --backend mock --format json
+          ./target/release/openasr.exe pull whisper-tiny:q4 --accept-license
+          mkdir -p tmp
+          OPENASR_GGML_BACKEND=cpu ./target/release/openasr.exe transcribe fixtures/jfk.wav \
+            --model whisper-tiny:q4 --format text --output tmp/jfk.txt
+          cat tmp/jfk.txt
+          grep -qi "your country" tmp/jfk.txt
+
       - name: Package archive
         if: runner.os != 'Windows'
         run: |
-          dist_dir="dist/openasr-${{ matrix.target_name }}"
+          set -euo pipefail
+          archive="openasr-${OPENASR_VERSION}-${{ matrix.target }}"
+          dist_dir="dist/${archive}"
           mkdir -p "$dist_dir/docs"
           cp "target/release/${{ matrix.binary_name }}" "$dist_dir/"
           cp README.md LICENSE "$dist_dir/"
           cp -R model-registry "$dist_dir/model-registry"
           cp docs/FAQ.md docs/KNOWN_LIMITATIONS.md "$dist_dir/docs/"
-          tar -czf "dist/openasr-${{ matrix.target_name }}.${{ matrix.archive_ext }}" -C dist "openasr-${{ matrix.target_name }}"
+          tar -czf "dist/${archive}.${{ matrix.archive_ext }}" -C dist "${archive}"
 
       - name: Package archive
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $distDir = "dist\openasr-${{ matrix.target_name }}"
-          New-Item -ItemType Directory -Force -Path "$distDir\docs"
+          $ErrorActionPreference = "Stop"
+          $archive = "openasr-$env:OPENASR_VERSION-${{ matrix.target }}"
+          $distDir = "dist\$archive"
+          New-Item -ItemType Directory -Force -Path "$distDir\docs" | Out-Null
           Copy-Item "target\release\${{ matrix.binary_name }}" "$distDir\"
-          # The Windows build is a GGML_BACKEND_DL build (build.rs): openasr.exe
-          # dynamically loads the core (ggml-base.dll + ggml.dll) and the CPU
-          # backend plugins (ggml-cpu-<variant>.dll) at startup, so the archive
-          # must carry them or the binary cannot launch. build.rs stages them next
-          # to the binary in target/release. macOS/Linux stay statically linked
-          # (self-contained), so this is Windows-only.
+          # The CPU base build is a GGML_BACKEND_DL build (build.rs):
+          # openasr.exe dynamically loads the core (ggml-base.dll + ggml.dll)
+          # and the CPU backend plugins (ggml-cpu-<variant>.dll) at startup, so
+          # the archive must carry them or the binary cannot launch. build.rs
+          # stages them next to the binary in target/release. The GPU-feature
+          # variants link ggml statically (no ggml*.dll produced), and
+          # macOS/Linux stay statically linked, so this only matches on the
+          # Windows CPU build.
           Get-ChildItem "target\release" -Filter "ggml*.dll" | Copy-Item -Destination "$distDir\"
+          if ("${{ matrix.features }}" -eq "cuda") {
+            # The CUDA exe dynamically links the CUDA runtime; ship NVIDIA's
+            # redistributable runtime DLLs so end users only need a GPU driver
+            # (nvcuda.dll), not a CUDA toolkit install.
+            $cudaDlls = Get-ChildItem (Join-Path $env:CUDA_PATH "bin") -Recurse -File |
+              Where-Object { $_.Name -match '^(cudart64|cublas64|cublasLt64)_.*\.dll$' }
+            if (-not $cudaDlls) { Write-Error "no CUDA runtime DLLs found under $env:CUDA_PATH\bin" }
+            $cudaDlls | Copy-Item -Destination "$distDir\"
+          }
           Copy-Item README.md,LICENSE "$distDir\"
           Copy-Item model-registry "$distDir\model-registry" -Recurse
           Copy-Item docs\FAQ.md,docs\KNOWN_LIMITATIONS.md "$distDir\docs\"
-          # Smoke the binary from the staged dist dir (NOT target/release, whose
-          # build.rs-seeded DLLs would mask a packaging gap): openasr.exe
-          # import-links ggml-base.dll/ggml.dll, so it fails to launch here if the
-          # ggml DLL copy above ever regresses. This catches a broken archive
-          # before it ships.
-          & "$distDir\${{ matrix.binary_name }}" --version
-          Compress-Archive -Path "$distDir" -DestinationPath "dist\openasr-${{ matrix.target_name }}.${{ matrix.archive_ext }}" -Force
+          # Smoke the binary from the staged dist dir (NOT target/release,
+          # whose build.rs-seeded DLLs would mask a packaging gap), so a broken
+          # archive fails here before it ships. The CUDA exe cannot launch
+          # without an NVIDIA driver, so it is exempt (validated on hardware).
+          if ("${{ matrix.features }}" -ne "cuda") {
+            & "$distDir\${{ matrix.binary_name }}" --version
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          Compress-Archive -Path "$distDir" -DestinationPath "dist\$archive.${{ matrix.archive_ext }}" -Force
 
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
-          name: openasr-${{ matrix.target_name }}
-          path: dist/openasr-${{ matrix.target_name }}.${{ matrix.archive_ext }}
+          name: openasr-${{ matrix.target }}
+          path: dist/openasr-${{ env.OPENASR_VERSION }}-${{ matrix.target }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+  checksums:
+    name: Collect checksums
+    needs: build
+    # Sum whatever archives were produced even if one matrix leg failed, so a
+    # single flaky variant does not block checksums for the rest.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          path: staging
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find staging -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist/ \;
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Upload SHA256SUMS
+        uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
           if-no-files-found: error
