@@ -86,10 +86,11 @@ openasr pull qwen3-asr-0.6b:q8        # or pin a specific quant tier
 openasr list                          # what's installed
 ```
 
-The catalog ships **17 ready-to-pull ASR packs** across 7 families (50 signed
-quant downloads), plus diarization capability packs. Nine native families run
-offline on CPU and Apple Metal, dispatched by the data-driven architecture
-registry. All families support opt-in diarization; most also export word-level
+The catalog ships **17 ready-to-pull ASR packs** spanning seven of the nine
+native families (50 signed quant downloads), plus diarization capability
+packs; the remaining two (Parakeet-CTC, wav2vec2-CTC) run via `import` of your
+own checkpoints. Nine native families run offline on CPU and Apple Metal,
+dispatched by the data-driven architecture registry. All families support opt-in diarization; most also export word-level
 timestamps -- the columns below show where they differ.
 
 | Family | Streaming | Word timestamps | Quant tiers |
