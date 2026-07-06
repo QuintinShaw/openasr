@@ -1349,6 +1349,13 @@ struct CapabilitiesResponse {
 pub(crate) struct HistoryListResponse {
     pub(crate) object: &'static str,
     pub(crate) data: Vec<DaemonHistoryEntry>,
+    /// Total rows matching the filter, ignoring `limit`/`offset` -- lets
+    /// clients render pagination without a second request. Additive: absent
+    /// in the pre-SQLite contract, so existing consumers that only read
+    /// `data` are unaffected.
+    pub(crate) total: usize,
+    pub(crate) limit: usize,
+    pub(crate) offset: usize,
 }
 
 #[derive(Serialize)]

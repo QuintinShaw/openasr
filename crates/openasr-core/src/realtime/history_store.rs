@@ -1,17 +1,63 @@
+//! Daemon transcription history: a local SQLite store under
+//! `~/.openasr/history/history.db`.
+//!
+//! Design notes (this feature has never shipped to a user -- zero stored data
+//! to migrate -- so the previous JSON-index + text-sidecar implementation was
+//! replaced outright rather than migrated):
+//!
+//! - **Schema**: one `history_entries` row per `DaemonHistoryEntry`, full
+//!   transcript text included as a column (no `texts/*.txt` sidecar). The
+//!   entries here are transcripts (bytes to low KB), not audio -- there is no
+//!   size pressure that justifies a separate file per row, and folding the
+//!   text into the row removes the entire class of "index says the entry
+//!   exists but the sidecar write didn't land" partial-failure this file used
+//!   to guard against with a temp-file-based atomic writer.
+//! - **Full-text search**: a standalone (non "external content") FTS5 virtual
+//!   table `history_entries_fts(id UNINDEXED, search_text)` using the
+//!   `trigram` tokenizer, kept in sync by hand inside the same transaction as
+//!   every write/delete (chosen over `content=`/triggers because our primary
+//!   key is a `TEXT` id, not an integer `rowid`, which is what SQLite's
+//!   external-content-table sync machinery is built around; with a single
+//!   read-modify-write per call there is nothing an external-content trigger
+//!   would buy us). The trigram tokenizer indexes overlapping 3-character
+//!   windows over Unicode codepoints, so it does not depend on word
+//!   boundaries -- critical for Chinese/Japanese text, which unicode61's
+//!   whitespace/punctuation based tokenizer segments badly. Substring lookups
+//!   run as `search_text LIKE '%needle%'` against the FTS5 table rather than
+//!   `MATCH`: FTS5 `MATCH` queries shorter than 3 characters tokenize to
+//!   nothing and silently match zero rows, but a great many meaningful CJK
+//!   search terms *are* 1-2 characters (e.g. "历史"), so `MATCH` would break
+//!   the exact use case this feature exists for. `LIKE` against a
+//!   trigram-tokenized table is index-accelerated for patterns of 3+
+//!   characters and gracefully falls back to a full scan below that (see
+//!   <https://sqlite.org/fts5.html#the_trigram_tokenizer>) -- both are
+//!   correct at the local, single-user history sizes this store handles.
+//! - **Concurrency**: every call opens its own short-lived `Connection`
+//!   (matches the existing call pattern -- `DaemonHistoryStore::open` is
+//!   already called fresh per HTTP request / per realtime session) with WAL
+//!   journaling and a busy timeout, so SQLite's own file locking serializes
+//!   concurrent writers instead of an in-process `Mutex` registry. This is
+//!   simpler than the previous per-root `Mutex<()>` registry and remains
+//!   correct across processes, which the old in-process lock never was.
+//! - **Corruption isolation**: `open()` stays infallible (it only resolves a
+//!   path); connecting and touching the schema happens lazily on first use of
+//!   any method, so a corrupt `history.db` surfaces as a typed
+//!   `DaemonHistoryStoreError` from that call, not a panic. Callers already
+//!   treat history recording as best-effort (see
+//!   `record_file_transcription_history` in openasr-server), so this keeps
+//!   transcription itself unaffected by a broken history store.
+
 use std::{
-    collections::{HashMap, HashSet},
-    fs,
+    fmt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{ResponseFormat, atomic_file};
-
-pub const DAEMON_HISTORY_INDEX_VERSION: u32 = 1;
+use crate::ResponseFormat;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,11 +66,51 @@ pub enum DaemonHistoryKind {
     Live,
 }
 
+impl DaemonHistoryKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Live => "live",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "file" => Some(Self::File),
+            "live" => Some(Self::Live),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for DaemonHistoryKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DaemonHistoryProvenance {
     AutoSaved,
     UserInitiated,
+}
+
+impl DaemonHistoryProvenance {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::AutoSaved => "auto_saved",
+            Self::UserInitiated => "user_initiated",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto_saved" => Some(Self::AutoSaved),
+            "user_initiated" => Some(Self::UserInitiated),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -45,11 +131,6 @@ pub struct DaemonHistoryEntry {
     pub provenance: Option<DaemonHistoryProvenance>,
     pub formats: Vec<String>,
     pub preview: String,
-    // Internal sidecar location: derivable from `id`, never read back from a
-    // loaded entry, and must not leak into the on-disk index or the loopback
-    // HTTP response. Kept on the in-memory record for convenience only.
-    #[serde(skip)]
-    pub text_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,65 +153,52 @@ pub struct DaemonHistoryRecord {
     pub text: String,
 }
 
+/// Filter/pagination request for [`DaemonHistoryStore::query`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DaemonHistoryQuery {
+    /// Substring search over model, source name, and transcript text.
+    pub search: Option<String>,
+    pub kind: Option<DaemonHistoryKind>,
+    /// `None` means "no limit" (used by the back-compat `list()` helper).
+    pub limit: Option<usize>,
+    pub offset: usize,
+}
+
+/// A page of results plus the total row count matching the filter (ignoring
+/// `limit`/`offset`), so callers can render pagination controls.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DaemonHistoryPage {
+    pub entries: Vec<DaemonHistoryEntry>,
+    pub total: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct DaemonHistoryStore {
     root: PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct DaemonHistoryIndex {
-    version: u32,
-    entries: Vec<DaemonHistoryEntry>,
 }
 
 #[derive(Debug, Error)]
 pub enum DaemonHistoryStoreError {
     #[error("Invalid history id '{id}': {reason}")]
     InvalidId { id: String, reason: &'static str },
-    #[error("Unsupported history index version {found}. Expected version {expected}.")]
-    UnsupportedIndexVersion { found: u32, expected: u32 },
     #[error("Invalid history record field '{field}': {reason}")]
     InvalidRecord { field: &'static str, reason: String },
-    #[error("History store lock for '{path}' was poisoned.")]
-    LockPoisoned { path: PathBuf },
+    #[error("Invalid history query field '{field}': {reason}")]
+    InvalidQuery { field: &'static str, reason: String },
     #[error("Could not create history directory '{path}': {source}")]
     CreateDir {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("Could not read history index '{path}': {source}")]
-    ReadIndex {
+    #[error("Could not open history database '{path}': {source}")]
+    OpenDatabase {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: rusqlite::Error,
     },
-    #[error("Could not parse history index '{path}': {source}")]
-    ParseIndex {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("Could not serialize history index: {0}")]
-    SerializeIndex(serde_json::Error),
-    #[error("Could not write history file '{path}': {source}")]
-    WriteFile {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("Could not read history text sidecar '{path}': {source}")]
-    ReadText {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("Could not remove history text sidecar '{path}': {source}")]
-    RemoveText {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    #[error("History database query failed: {0}")]
+    Query(#[source] rusqlite::Error),
 }
 
 impl DaemonHistoryStore {
@@ -144,285 +212,358 @@ impl DaemonHistoryStore {
         &self.root
     }
 
+    /// All entries, most recent first. Back-compat convenience over
+    /// [`Self::query`] for callers that do not need filtering/pagination.
     pub fn list(&self) -> Result<Vec<DaemonHistoryEntry>, DaemonHistoryStoreError> {
-        let lock = history_store_lock(&self.root);
-        let _guard = lock
-            .lock()
-            .map_err(|_| DaemonHistoryStoreError::LockPoisoned {
-                path: self.root.clone(),
-            })?;
-        let mut entries = self.load_index()?.entries;
-        entries.sort_by(|left, right| {
-            right
-                .created_at_unix_seconds
-                .cmp(&left.created_at_unix_seconds)
-                .then_with(|| right.id.cmp(&left.id))
-        });
-        Ok(entries)
+        Ok(self.query(&DaemonHistoryQuery::default())?.entries)
+    }
+
+    /// Filtered, paginated listing, most recent first (ties broken by id
+    /// descending, matching the id's embedded-millis ordering).
+    pub fn query(
+        &self,
+        query: &DaemonHistoryQuery,
+    ) -> Result<DaemonHistoryPage, DaemonHistoryStoreError> {
+        let conn = self.connection()?;
+
+        let mut where_clauses: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let joined_search_table = query.search.is_some();
+
+        if let Some(kind) = query.kind {
+            where_clauses.push("e.kind = ?".to_string());
+            params.push(Box::new(kind.as_str().to_string()));
+        }
+        let like_pattern = query.search.as_deref().map(like_substring_pattern);
+        if let Some(pattern) = &like_pattern {
+            where_clauses.push("f.search_text LIKE ? ESCAPE '\\'".to_string());
+            params.push(Box::new(pattern.clone()));
+        }
+
+        let where_sql = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_clauses.join(" AND "))
+        };
+        let from_sql = if joined_search_table {
+            "history_entries e JOIN history_entries_fts f ON f.id = e.id"
+        } else {
+            "history_entries e"
+        };
+
+        let total: usize = {
+            let sql = format!("SELECT COUNT(*) FROM {from_sql} {where_sql}");
+            let mut statement = conn.prepare(&sql).map_err(DaemonHistoryStoreError::Query)?;
+            let param_refs: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(|value| value.as_ref()).collect();
+            statement
+                .query_row(param_refs.as_slice(), |row| row.get(0))
+                .map_err(DaemonHistoryStoreError::Query)?
+        };
+
+        let limit_sql = match query.limit {
+            Some(limit) => format!(" LIMIT {} OFFSET {}", limit, query.offset),
+            None => {
+                if query.offset > 0 {
+                    // SQLite requires a LIMIT for OFFSET to take effect; -1 means
+                    // "no limit".
+                    format!(" LIMIT -1 OFFSET {}", query.offset)
+                } else {
+                    String::new()
+                }
+            }
+        };
+        let sql = format!(
+            "SELECT e.id, e.kind, e.model, e.created_at_unix_seconds, e.source_name, \
+             e.duration_seconds, e.output_format, e.diarization_active, e.provenance, \
+             e.formats, e.preview \
+             FROM {from_sql} {where_sql} \
+             ORDER BY e.created_at_unix_seconds DESC, e.id DESC{limit_sql}"
+        );
+        let mut statement = conn.prepare(&sql).map_err(DaemonHistoryStoreError::Query)?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|value| value.as_ref()).collect();
+        let entries = statement
+            .query_map(param_refs.as_slice(), row_to_entry)
+            .map_err(DaemonHistoryStoreError::Query)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DaemonHistoryStoreError::Query)?;
+
+        Ok(DaemonHistoryPage { entries, total })
     }
 
     pub fn get(&self, id: &str) -> Result<Option<DaemonHistoryDetail>, DaemonHistoryStoreError> {
-        let lock = history_store_lock(&self.root);
-        let _guard = lock
-            .lock()
-            .map_err(|_| DaemonHistoryStoreError::LockPoisoned {
-                path: self.root.clone(),
-            })?;
         validate_history_id(id)?;
-        let index = self.load_index()?;
-        let Some(entry) = index.entries.into_iter().find(|entry| entry.id == id) else {
-            return Ok(None);
-        };
-        let text_path = self.text_path(id);
-        let text =
-            fs::read_to_string(&text_path).map_err(|source| DaemonHistoryStoreError::ReadText {
-                path: text_path,
-                source,
-            })?;
-        Ok(Some(DaemonHistoryDetail { entry, text }))
+        let conn = self.connection()?;
+        conn.query_row(
+            "SELECT e.id, e.kind, e.model, e.created_at_unix_seconds, e.source_name, \
+             e.duration_seconds, e.output_format, e.diarization_active, e.provenance, \
+             e.formats, e.preview, e.text \
+             FROM history_entries e WHERE e.id = ?1",
+            params![id],
+            |row| {
+                let entry = row_to_entry(row)?;
+                let text: String = row.get(11)?;
+                Ok(DaemonHistoryDetail { entry, text })
+            },
+        )
+        .optional()
+        .map_err(DaemonHistoryStoreError::Query)
     }
 
     pub fn delete(&self, id: &str) -> Result<bool, DaemonHistoryStoreError> {
-        let lock = history_store_lock(&self.root);
-        let _guard = lock
-            .lock()
-            .map_err(|_| DaemonHistoryStoreError::LockPoisoned {
-                path: self.root.clone(),
-            })?;
         validate_history_id(id)?;
-        let mut index = self.load_index()?;
-        let Some(position) = index.entries.iter().position(|entry| entry.id == id) else {
-            return Ok(false);
-        };
-        index.entries.remove(position);
-        self.remove_text_sidecar(id)?;
-        self.save_index(&index)?;
-        Ok(true)
+        let mut conn = self.connection()?;
+        let tx = conn.transaction().map_err(DaemonHistoryStoreError::Query)?;
+        tx.execute(
+            "DELETE FROM history_entries_fts WHERE id = ?1",
+            params![id],
+        )
+        .map_err(DaemonHistoryStoreError::Query)?;
+        let removed = tx
+            .execute("DELETE FROM history_entries WHERE id = ?1", params![id])
+            .map_err(DaemonHistoryStoreError::Query)?;
+        tx.commit().map_err(DaemonHistoryStoreError::Query)?;
+        Ok(removed > 0)
     }
 
     pub fn delete_older_than(
         &self,
         cutoff_unix_seconds: u64,
     ) -> Result<usize, DaemonHistoryStoreError> {
-        self.prune_entries(|entry| entry.created_at_unix_seconds < cutoff_unix_seconds)
+        let mut conn = self.connection()?;
+        let tx = conn.transaction().map_err(DaemonHistoryStoreError::Query)?;
+        tx.execute(
+            "DELETE FROM history_entries_fts WHERE id IN \
+             (SELECT id FROM history_entries WHERE created_at_unix_seconds < ?1)",
+            params![cutoff_unix_seconds as i64],
+        )
+        .map_err(DaemonHistoryStoreError::Query)?;
+        let removed = tx
+            .execute(
+                "DELETE FROM history_entries WHERE created_at_unix_seconds < ?1",
+                params![cutoff_unix_seconds as i64],
+            )
+            .map_err(DaemonHistoryStoreError::Query)?;
+        tx.commit().map_err(DaemonHistoryStoreError::Query)?;
+        Ok(removed)
     }
 
     pub fn retain_most_recent(&self, max_entries: usize) -> Result<usize, DaemonHistoryStoreError> {
-        let lock = history_store_lock(&self.root);
-        let _guard = lock
-            .lock()
-            .map_err(|_| DaemonHistoryStoreError::LockPoisoned {
-                path: self.root.clone(),
-            })?;
-        let mut index = self.load_index()?;
-        if index.entries.len() <= max_entries {
-            return Ok(0);
-        }
-
-        let mut ordered = index.entries.iter().collect::<Vec<_>>();
-        ordered.sort_by(|left, right| {
-            right
-                .created_at_unix_seconds
-                .cmp(&left.created_at_unix_seconds)
-                .then_with(|| right.id.cmp(&left.id))
-        });
-        let keep = ordered
-            .into_iter()
-            .take(max_entries)
-            .map(|entry| entry.id.clone())
-            .collect::<HashSet<_>>();
-
-        let removed = remove_index_entries(&mut index, |entry| !keep.contains(&entry.id));
-        if removed.is_empty() {
-            return Ok(0);
-        }
-        for id in &removed {
-            self.remove_text_sidecar(id)?;
-        }
-        self.save_index(&index)?;
-        Ok(removed.len())
+        let mut conn = self.connection()?;
+        let tx = conn.transaction().map_err(DaemonHistoryStoreError::Query)?;
+        let keep_cte = "WITH keep(id) AS (SELECT id FROM history_entries \
+             ORDER BY created_at_unix_seconds DESC, id DESC LIMIT ?1)";
+        tx.execute(
+            &format!(
+                "{keep_cte} DELETE FROM history_entries_fts WHERE id NOT IN (SELECT id FROM keep)"
+            ),
+            params![max_entries as i64],
+        )
+        .map_err(DaemonHistoryStoreError::Query)?;
+        let removed = tx
+            .execute(
+                &format!(
+                    "{keep_cte} DELETE FROM history_entries WHERE id NOT IN (SELECT id FROM keep)"
+                ),
+                params![max_entries as i64],
+            )
+            .map_err(DaemonHistoryStoreError::Query)?;
+        tx.commit().map_err(DaemonHistoryStoreError::Query)?;
+        Ok(removed)
     }
 
     pub fn record(
         &self,
         record: DaemonHistoryRecord,
     ) -> Result<DaemonHistoryEntry, DaemonHistoryStoreError> {
-        let lock = history_store_lock(&self.root);
-        let _guard = lock
-            .lock()
-            .map_err(|_| DaemonHistoryStoreError::LockPoisoned {
-                path: self.root.clone(),
-            })?;
         validate_record(&record)?;
-        fs::create_dir_all(self.texts_dir()).map_err(|source| {
-            DaemonHistoryStoreError::CreateDir {
-                path: self.texts_dir(),
-                source,
+        let mut conn = self.connection()?;
+        let tx = conn.transaction().map_err(DaemonHistoryStoreError::Query)?;
+
+        let model = record.model.trim().to_string();
+        let source_name = record
+            .source_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let formats = normalized_formats(record.formats);
+        let preview = preview_text(&record.text);
+        let created_at_unix_seconds = unix_seconds_now();
+        let formats_json = serde_json::to_string(&formats).expect("Vec<String> always serializes");
+        let search_text = format!(
+            "{model} {} {}",
+            source_name.as_deref().unwrap_or(""),
+            record.text
+        );
+
+        let base = format!("hist-{}", unix_millis_now());
+        let mut id = base.clone();
+        let mut attempt = 0u16;
+        loop {
+            let insert_result = tx.execute(
+                "INSERT INTO history_entries (\
+                    id, kind, model, created_at_unix_seconds, source_name, duration_seconds, \
+                    output_format, diarization_active, provenance, formats, preview, text\
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    id,
+                    record.kind.as_str(),
+                    model,
+                    created_at_unix_seconds as i64,
+                    source_name,
+                    record.duration_seconds,
+                    record.output_format.map(ResponseFormat::as_str),
+                    record.diarization_active,
+                    record.provenance.map(DaemonHistoryProvenance::as_str),
+                    formats_json,
+                    preview,
+                    record.text,
+                ],
+            );
+            match insert_result {
+                Ok(_) => break,
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::ConstraintViolation
+                        && attempt < 1000 =>
+                {
+                    attempt += 1;
+                    id = format!("{base}-{attempt}");
+                    continue;
+                }
+                Err(other) => return Err(DaemonHistoryStoreError::Query(other)),
             }
-        })?;
+        }
+        tx.execute(
+            "INSERT INTO history_entries_fts (id, search_text) VALUES (?1, ?2)",
+            params![id, search_text],
+        )
+        .map_err(DaemonHistoryStoreError::Query)?;
+        tx.commit().map_err(DaemonHistoryStoreError::Query)?;
 
-        let id = self.next_id();
-        let text_path = self.text_path(&id);
-        write_file_atomically(&text_path, record.text.as_bytes())?;
-
-        let entry = DaemonHistoryEntry {
+        Ok(DaemonHistoryEntry {
             id,
             kind: record.kind,
-            model: record.model.trim().to_string(),
-            created_at_unix_seconds: unix_seconds_now(),
-            source_name: record
-                .source_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned),
+            model,
+            created_at_unix_seconds,
+            source_name,
             duration_seconds: record.duration_seconds,
             output_format: record.output_format,
             diarization_active: record.diarization_active,
             provenance: record.provenance,
-            formats: normalized_formats(record.formats),
-            preview: preview_text(&record.text),
-            text_path,
-        };
-        let mut index = self.load_index()?;
-        index.entries.retain(|existing| existing.id != entry.id);
-        index.entries.push(entry.clone());
-        self.save_index(&index)?;
-        Ok(entry)
+            formats,
+            preview,
+        })
     }
 
-    fn load_index(&self) -> Result<DaemonHistoryIndex, DaemonHistoryStoreError> {
-        let path = self.index_path();
-        match fs::read_to_string(&path) {
-            Ok(contents) => {
-                let index: DaemonHistoryIndex =
-                    serde_json::from_str(&contents).map_err(|source| {
-                        DaemonHistoryStoreError::ParseIndex {
-                            path: path.clone(),
-                            source,
-                        }
-                    })?;
-                if index.version != DAEMON_HISTORY_INDEX_VERSION {
-                    return Err(DaemonHistoryStoreError::UnsupportedIndexVersion {
-                        found: index.version,
-                        expected: DAEMON_HISTORY_INDEX_VERSION,
-                    });
-                }
-                Ok(index)
+    fn connection(&self) -> Result<Connection, DaemonHistoryStoreError> {
+        std::fs::create_dir_all(&self.root).map_err(|source| {
+            DaemonHistoryStoreError::CreateDir {
+                path: self.root.clone(),
+                source,
             }
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                Ok(DaemonHistoryIndex {
-                    version: DAEMON_HISTORY_INDEX_VERSION,
-                    entries: Vec::new(),
-                })
-            }
-            Err(source) => Err(DaemonHistoryStoreError::ReadIndex { path, source }),
-        }
-    }
-
-    fn save_index(&self, index: &DaemonHistoryIndex) -> Result<(), DaemonHistoryStoreError> {
-        fs::create_dir_all(&self.root).map_err(|source| DaemonHistoryStoreError::CreateDir {
-            path: self.root.clone(),
+        })?;
+        let path = self.db_path();
+        let conn =
+            Connection::open(&path).map_err(|source| DaemonHistoryStoreError::OpenDatabase {
+                path: path.clone(),
+                source,
+            })?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|source| DaemonHistoryStoreError::OpenDatabase {
+                path: path.clone(),
+                source,
+            })?;
+        // WAL lets concurrent readers proceed alongside a writer; the daemon
+        // opens a fresh connection per call, so file-level locking (not an
+        // in-process mutex) is what serializes writers across requests.
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|source| DaemonHistoryStoreError::OpenDatabase {
+                path: path.clone(),
+                source,
+            })?;
+        ensure_schema(&conn).map_err(|source| DaemonHistoryStoreError::OpenDatabase {
+            path: path.clone(),
             source,
         })?;
-        let path = self.index_path();
-        let contents =
-            serde_json::to_vec_pretty(index).map_err(DaemonHistoryStoreError::SerializeIndex)?;
-        write_file_atomically(&path, &contents)
+        Ok(conn)
     }
 
-    fn prune_entries(
-        &self,
-        should_remove: impl FnMut(&DaemonHistoryEntry) -> bool,
-    ) -> Result<usize, DaemonHistoryStoreError> {
-        let lock = history_store_lock(&self.root);
-        let _guard = lock
-            .lock()
-            .map_err(|_| DaemonHistoryStoreError::LockPoisoned {
-                path: self.root.clone(),
-            })?;
-        let mut index = self.load_index()?;
-        let removed = remove_index_entries(&mut index, should_remove);
-        if removed.is_empty() {
-            return Ok(0);
-        }
-        for id in &removed {
-            self.remove_text_sidecar(id)?;
-        }
-        self.save_index(&index)?;
-        Ok(removed.len())
-    }
-
-    fn remove_text_sidecar(&self, id: &str) -> Result<(), DaemonHistoryStoreError> {
-        let text_path = self.text_path(id);
-        match fs::remove_file(&text_path) {
-            Ok(()) => Ok(()),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(DaemonHistoryStoreError::RemoveText {
-                path: text_path,
-                source,
-            }),
-        }
-    }
-
-    fn index_path(&self) -> PathBuf {
-        self.root.join("index.json")
-    }
-
-    fn texts_dir(&self) -> PathBuf {
-        self.root.join("texts")
-    }
-
-    fn text_path(&self, id: &str) -> PathBuf {
-        self.texts_dir().join(format!("{id}.txt"))
-    }
-
-    fn next_id(&self) -> String {
-        let base = format!("hist-{}", unix_millis_now());
-        for attempt in 0..1000_u16 {
-            let id = if attempt == 0 {
-                base.clone()
-            } else {
-                format!("{base}-{attempt}")
-            };
-            if !self.text_path(&id).exists() {
-                return id;
-            }
-        }
-        format!("{base}-{}", std::process::id())
+    fn db_path(&self) -> PathBuf {
+        self.root.join("history.db")
     }
 }
 
-fn remove_index_entries(
-    index: &mut DaemonHistoryIndex,
-    mut should_remove: impl FnMut(&DaemonHistoryEntry) -> bool,
-) -> Vec<String> {
-    let mut removed = Vec::new();
-    index.entries.retain(|entry| {
-        if should_remove(entry) {
-            removed.push(entry.id.clone());
-            false
-        } else {
-            true
+fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS history_entries (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            model TEXT NOT NULL,
+            created_at_unix_seconds INTEGER NOT NULL,
+            source_name TEXT,
+            duration_seconds REAL,
+            output_format TEXT,
+            diarization_active INTEGER,
+            provenance TEXT,
+            formats TEXT NOT NULL,
+            preview TEXT NOT NULL,
+            text TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS history_entries_created_at_idx
+            ON history_entries (created_at_unix_seconds DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS history_entries_kind_idx ON history_entries (kind);
+        CREATE VIRTUAL TABLE IF NOT EXISTS history_entries_fts USING fts5(
+            id UNINDEXED,
+            search_text,
+            tokenize = 'trigram'
+        );",
+    )
+}
+
+fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DaemonHistoryEntry> {
+    let kind: String = row.get(1)?;
+    let created_at_unix_seconds: i64 = row.get(3)?;
+    let output_format: Option<String> = row.get(6)?;
+    let diarization_active: Option<bool> = row.get(7)?;
+    let provenance: Option<String> = row.get(8)?;
+    let formats_json: String = row.get(9)?;
+
+    Ok(DaemonHistoryEntry {
+        id: row.get(0)?,
+        kind: DaemonHistoryKind::parse(&kind).unwrap_or(DaemonHistoryKind::File),
+        model: row.get(2)?,
+        created_at_unix_seconds: created_at_unix_seconds.max(0) as u64,
+        source_name: row.get(4)?,
+        duration_seconds: row.get(5)?,
+        output_format: output_format.as_deref().and_then(|value| {
+            <ResponseFormat as std::str::FromStr>::from_str(value).ok()
+        }),
+        diarization_active,
+        provenance: provenance.as_deref().and_then(DaemonHistoryProvenance::parse),
+        formats: serde_json::from_str(&formats_json).unwrap_or_else(|_| vec!["text".to_string()]),
+        preview: row.get(10)?,
+    })
+}
+
+/// Escapes `%`, `_`, and `\` for a `LIKE ... ESCAPE '\'` substring pattern,
+/// then wraps the needle in `%...%`.
+fn like_substring_pattern(needle: &str) -> String {
+    let mut escaped = String::with_capacity(needle.len() + 2);
+    escaped.push('%');
+    for ch in needle.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            escaped.push('\\');
         }
-    });
-    removed
+        escaped.push(ch);
+    }
+    escaped.push('%');
+    escaped
 }
 
 pub fn history_dir(openasr_home: impl AsRef<Path>) -> PathBuf {
     openasr_home.as_ref().join("history")
-}
-
-fn history_store_lock(root: &Path) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-    let mut locks = LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("history lock registry mutex poisoned");
-    locks
-        .entry(root.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
 }
 
 fn validate_history_id(id: &str) -> Result<(), DaemonHistoryStoreError> {
@@ -496,15 +637,6 @@ fn preview_text(text: &str) -> String {
     normalized.chars().take(160).collect()
 }
 
-fn write_file_atomically(path: &Path, contents: &[u8]) -> Result<(), DaemonHistoryStoreError> {
-    atomic_file::write_file_atomically(path, contents).map_err(|source| {
-        DaemonHistoryStoreError::WriteFile {
-            path: path.to_path_buf(),
-            source,
-        }
-    })
-}
-
 fn unix_seconds_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -524,7 +656,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daemon_history_store_records_lists_gets_and_deletes_sidecar() {
+    fn daemon_history_store_records_lists_gets_and_deletes() {
         let temp = tempfile::tempdir().unwrap();
         let store = DaemonHistoryStore::open(temp.path());
         let entry = store
@@ -541,7 +673,6 @@ mod tests {
             })
             .unwrap();
 
-        assert!(entry.text_path.exists());
         let entries = store.list().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].output_format, Some(ResponseFormat::Srt));
@@ -560,8 +691,8 @@ mod tests {
         );
 
         assert!(store.delete(&entry.id).unwrap());
-        assert!(!entry.text_path.exists());
         assert!(store.list().unwrap().is_empty());
+        assert!(store.get(&entry.id).unwrap().is_none());
     }
 
     #[test]
@@ -614,12 +745,11 @@ mod tests {
         assert_eq!(store.delete_older_than(15).unwrap(), 1);
 
         assert!(store.get(&old.id).unwrap().is_none());
-        assert!(!old.text_path.exists());
         assert!(store.get(&fresh.id).unwrap().is_some());
     }
 
     #[test]
-    fn daemon_history_store_retains_most_recent_entries_and_sidecars() {
+    fn daemon_history_store_retains_most_recent_entries() {
         let temp = tempfile::tempdir().unwrap();
         let store = DaemonHistoryStore::open(temp.path());
         let oldest = record_history_for_test(&store, "oldest transcript");
@@ -638,9 +768,9 @@ mod tests {
             .map(|entry| entry.id)
             .collect::<Vec<_>>();
         assert_eq!(remaining, vec![newest.id.clone(), middle.id.clone()]);
-        assert!(!oldest.text_path.exists());
-        assert!(middle.text_path.exists());
-        assert!(newest.text_path.exists());
+        assert!(store.get(&oldest.id).unwrap().is_none());
+        assert!(store.get(&middle.id).unwrap().is_some());
+        assert!(store.get(&newest.id).unwrap().is_some());
     }
 
     #[test]
@@ -657,7 +787,6 @@ mod tests {
             provenance: Some(DaemonHistoryProvenance::AutoSaved),
             formats: vec!["text".to_string()],
             preview: "hello".to_string(),
-            text_path: PathBuf::from("/tmp/openasr/history/texts/hist-1.txt"),
         };
         let detail = DaemonHistoryDetail {
             entry,
@@ -682,40 +811,151 @@ mod tests {
     #[test]
     fn daemon_history_store_reads_entries_without_optional_metadata() {
         let temp = tempfile::tempdir().unwrap();
-        let history_root = temp.path().join("history");
-        let texts = history_root.join("texts");
-        fs::create_dir_all(&texts).unwrap();
-        fs::write(texts.join("hist-old.txt"), "legacy text").unwrap();
-        fs::write(
-            history_root.join("index.json"),
-            r#"{
-  "version": 1,
-  "entries": [
-    {
-      "id": "hist-old",
-      "kind": "file",
-      "model": "whisper-large-v3-turbo",
-      "created_at_unix_seconds": 1780290000,
-      "duration_seconds": 1.25,
-      "formats": ["text"],
-      "preview": "legacy"
-    }
-  ]
-}"#,
-        )
-        .unwrap();
-
         let store = DaemonHistoryStore::open(temp.path());
+        store
+            .record(DaemonHistoryRecord {
+                kind: DaemonHistoryKind::File,
+                model: "whisper-large-v3-turbo".to_string(),
+                source_name: None,
+                duration_seconds: None,
+                output_format: None,
+                diarization_active: None,
+                provenance: None,
+                formats: vec![],
+                text: "legacy text".to_string(),
+            })
+            .unwrap();
+
         let entries = store.list().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].output_format, None);
         assert_eq!(entries[0].diarization_active, None);
         assert_eq!(entries[0].provenance, None);
-        let detail = store.get("hist-old").unwrap().unwrap();
-        assert_eq!(detail.text, "legacy text");
-        assert_eq!(detail.entry.output_format, None);
-        assert_eq!(detail.entry.diarization_active, None);
-        assert_eq!(detail.entry.provenance, None);
+        assert_eq!(entries[0].source_name, None);
+        assert_eq!(entries[0].duration_seconds, None);
+    }
+
+    #[test]
+    fn daemon_history_store_search_finds_chinese_substrings() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        record_history_for_test(&store, "我们讨论了历史记录的设计方案");
+        record_history_for_test(&store, "今天天气很好，适合散步");
+
+        let page = store
+            .query(&DaemonHistoryQuery {
+                search: Some("历史".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.entries.len(), 1);
+        assert!(page.entries[0].preview.contains("历史"));
+
+        let miss = store
+            .query(&DaemonHistoryQuery {
+                search: Some("天气预报".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(miss.total, 0);
+        assert!(miss.entries.is_empty());
+    }
+
+    #[test]
+    fn daemon_history_store_query_filters_by_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        store
+            .record(DaemonHistoryRecord {
+                kind: DaemonHistoryKind::File,
+                model: "whisper".to_string(),
+                source_name: None,
+                duration_seconds: None,
+                output_format: None,
+                diarization_active: None,
+                provenance: None,
+                formats: vec![],
+                text: "file transcript".to_string(),
+            })
+            .unwrap();
+        record_history_for_test(&store, "live transcript");
+
+        let page = store
+            .query(&DaemonHistoryQuery {
+                kind: Some(DaemonHistoryKind::Live),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.entries[0].kind, DaemonHistoryKind::Live);
+    }
+
+    #[test]
+    fn daemon_history_store_query_paginates_with_stable_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let first = record_history_for_test(&store, "entry one");
+        let second = record_history_for_test(&store, "entry two");
+        let third = record_history_for_test(&store, "entry three");
+        set_history_created_at_for_test(&store, &first.id, 10);
+        set_history_created_at_for_test(&store, &second.id, 20);
+        set_history_created_at_for_test(&store, &third.id, 30);
+
+        let page_one = store
+            .query(&DaemonHistoryQuery {
+                limit: Some(2),
+                offset: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page_one.total, 3);
+        assert_eq!(
+            page_one.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            vec![third.id.clone(), second.id.clone()]
+        );
+
+        let page_two = store
+            .query(&DaemonHistoryQuery {
+                limit: Some(2),
+                offset: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page_two.total, 3);
+        assert_eq!(
+            page_two.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            vec![first.id.clone()]
+        );
+    }
+
+    #[test]
+    fn daemon_history_store_reports_corrupt_database_without_panicking() {
+        let temp = tempfile::tempdir().unwrap();
+        let history_root = temp.path().join("history");
+        std::fs::create_dir_all(&history_root).unwrap();
+        // Not a valid SQLite file: any query against it must surface a typed
+        // error, not panic the caller (e.g. an in-flight transcription).
+        std::fs::write(history_root.join("history.db"), b"not a sqlite database").unwrap();
+
+        let store = DaemonHistoryStore::open(temp.path());
+        assert!(store.list().is_err());
+        assert!(store.get("hist-anything").is_err());
+        assert!(
+            store
+                .record(DaemonHistoryRecord {
+                    kind: DaemonHistoryKind::File,
+                    model: "whisper".to_string(),
+                    source_name: None,
+                    duration_seconds: None,
+                    output_format: None,
+                    diarization_active: None,
+                    provenance: None,
+                    formats: vec![],
+                    text: "should not persist".to_string(),
+                })
+                .is_err()
+        );
     }
 
     fn record_history_for_test(store: &DaemonHistoryStore, text: &str) -> DaemonHistoryEntry {
@@ -735,13 +975,11 @@ mod tests {
     }
 
     fn set_history_created_at_for_test(store: &DaemonHistoryStore, id: &str, created_at: u64) {
-        let mut index = store.load_index().unwrap();
-        let entry = index
-            .entries
-            .iter_mut()
-            .find(|entry| entry.id == id)
-            .expect("history entry exists");
-        entry.created_at_unix_seconds = created_at;
-        store.save_index(&index).unwrap();
+        let conn = store.connection().unwrap();
+        conn.execute(
+            "UPDATE history_entries SET created_at_unix_seconds = ?1 WHERE id = ?2",
+            params![created_at as i64, id],
+        )
+        .unwrap();
     }
 }

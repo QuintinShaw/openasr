@@ -45,6 +45,11 @@ rayon = "1.10"
 rcgen = "0.12"
 realfft = "3.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# `bundled` compiles SQLite from source (with FTS5 unconditionally enabled by
+# libsqlite3-sys' build script) so the daemon history store needs no system
+# libsqlite3 -- matches the rest of this workspace's "vendor the native deps"
+# posture (see ggml git submodule in openasr-core).
+rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = "0.23"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

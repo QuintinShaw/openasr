@@ -2989,13 +2989,11 @@ async fn transcriptions_record_file_history_with_text_sidecar() {
     assert_eq!(entry["diarization_active"], false);
     assert_eq!(entry["provenance"], "auto_saved");
     assert!(entry["preview"].as_str().unwrap().contains("OpenASR mock"));
-    // The internal sidecar path must not leak into the wire contract; it is
-    // derivable from the entry id under the daemon-owned history directory.
+    // Transcript text lives in the SQLite row, not a filesystem sidecar; it
+    // must not leak a path into the wire contract.
     assert!(entry.get("text_path").is_none());
-    let text_path = home.join("history").join("texts").join(format!("{id}.txt"));
-    assert!(text_path.starts_with(home.join("history")));
-    assert!(text_path.exists());
-    assert!(home.join("history").join("index.json").exists());
+    let history_db = home.join("history").join("history.db");
+    assert!(history_db.exists());
 
     let response = app
         .clone()
@@ -3035,7 +3033,6 @@ async fn transcriptions_record_file_history_with_text_sidecar() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(!text_path.exists());
 
     let response = app
         .oneshot(
