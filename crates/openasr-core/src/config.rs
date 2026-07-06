@@ -106,6 +106,10 @@ pub enum HistoryRetentionPolicy {
     Month,
     Quarter,
     Year,
+    // `never` is the pre-rename wire value shipped in 0.1.x configs; it meant
+    // "never clean up", which is exactly `Forever`. Accepted on read only --
+    // serialization always emits `forever`.
+    #[serde(alias = "never")]
     Forever,
 }
 

@@ -465,4 +465,17 @@ fn history_retention_policy_wire_strings_and_age_windows() {
         HistoryRetentionPolicy::default(),
         HistoryRetentionPolicy::Last5
     );
+    // 0.1.x configs on disk carry the pre-rename `never` wire value; it must
+    // keep parsing as `Forever` (read-only alias -- we always emit `forever`).
+    assert_eq!(
+        serde_json::from_value::<HistoryRetentionPolicy>(serde_json::Value::String(
+            "never".to_string()
+        ))
+        .unwrap(),
+        HistoryRetentionPolicy::Forever
+    );
+    assert_eq!(
+        serde_json::to_value(HistoryRetentionPolicy::Forever).unwrap(),
+        serde_json::Value::String("forever".to_string())
+    );
 }
