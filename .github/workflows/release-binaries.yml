@@ -85,6 +85,32 @@ jobs:
             features: hip
             timeout: 240
             experimental: true
+          # Linux GPU-feature variants, same rationale as the Windows ones
+          # above (no GPU on the hosted runner; build+package validated
+          # here, GPU inference validated on real hardware). Pinned to
+          # ubuntu-22.04 (not ubuntu-latest) so the LunarG/ROCm apt repos
+          # below target a codename known to exist in both.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu-vulkan
+            binary_name: openasr
+            archive_ext: tar.gz
+            features: vulkan
+            timeout: 90
+            experimental: true
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu-cuda
+            binary_name: openasr
+            archive_ext: tar.gz
+            features: cuda
+            timeout: 120
+            experimental: true
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu-rocm
+            binary_name: openasr
+            archive_ext: tar.gz
+            features: hip
+            timeout: 240
+            experimental: true
 
     steps:
       - uses: actions/checkout@v4
@@ -109,8 +135,42 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
 
-      - name: Install Vulkan SDK
-        if: matrix.features == 'vulkan'
+      - name: Install Linux Vulkan SDK
+        if: runner.os == 'Linux' && matrix.features == 'vulkan'
+        # LunarG's apt recipe for jammy (matches llama.cpp's ubuntu-22.04
+        # Vulkan release job). vulkan-sdk gives cmake's FindVulkan the
+        # loader/headers/glslc it needs; mesa-vulkan-drivers gives the
+        # llvmpipe software ICD, so the produced binary can actually launch
+        # and run CPU-emulated Vulkan on this GPU-less runner.
+        run: |
+          set -euo pipefail
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          sudo apt-get install -y vulkan-sdk mesa-vulkan-drivers
+
+      - name: Install Linux ROCm/HIP SDK
+        if: runner.os == 'Linux' && matrix.features == 'hip'
+        # AMD's official apt repo (the recipe llama.cpp's ubuntu-22-rocm
+        # release job uses). rocm-hip-sdk provides hipcc/the HIP clang
+        # toolchain, rocBLAS, and hipBLAS; ROCM_PATH lets both cmake's
+        # FindHIP language support and openasr-core's build.rs
+        # hip_toolkit_path() locate it.
+        run: |
+          set -euo pipefail
+          sudo mkdir --parents --mode=0755 /etc/apt/keyrings
+          wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.1 jammy main" \
+            | sudo tee /etc/apt/sources.list.d/rocm.list
+          printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' \
+            | sudo tee /etc/apt/preferences.d/rocm-pin-600
+          sudo apt-get update -y
+          sudo apt-get install -y rocm-hip-sdk
+          echo "ROCM_PATH=/opt/rocm" >> "${GITHUB_ENV}"
+          echo "/opt/rocm/bin" >> "${GITHUB_PATH}"
+
+      - name: Install Windows Vulkan SDK
+        if: matrix.features == 'vulkan' && runner.os == 'Windows'
         shell: pwsh
         env:
           VULKAN_VERSION: 1.4.313.2
@@ -126,15 +186,16 @@ jobs:
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\Bin"
 
       - name: Ensure Ninja
-        if: matrix.features == 'vulkan' || matrix.features == 'cuda' || matrix.features == 'hip'
+        if: runner.os == 'Windows' && (matrix.features == 'vulkan' || matrix.features == 'cuda' || matrix.features == 'hip')
         shell: pwsh
-        # build.rs configures the Windows Vulkan/CUDA/HIP ggml build with -G Ninja.
+        # build.rs only forces the Ninja generator for Windows GPU-feature
+        # builds (Linux keeps cmake's default Unix Makefiles generator).
         run: |
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y }
           ninja --version
 
       - name: Cache AMD HIP SDK install
-        if: matrix.features == 'hip'
+        if: runner.os == 'Windows' && matrix.features == 'hip'
         id: cache-hip-sdk
         uses: actions/cache@v4
         with:
@@ -142,7 +203,7 @@ jobs:
           key: hip-sdk-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ runner.os }}
 
       - name: Install AMD HIP SDK
-        if: matrix.features == 'hip' && steps.cache-hip-sdk.outputs.cache-hit != 'true'
+        if: runner.os == 'Windows' && matrix.features == 'hip' && steps.cache-hip-sdk.outputs.cache-hit != 'true'
         shell: pwsh
         # Same recipe llama.cpp's Windows HIP release job uses (no self-hosted
         # runner needed): AMD publishes a silent installer for the consumer
@@ -164,7 +225,7 @@ jobs:
           }
 
       - name: Resolve HIP SDK path
-        if: matrix.features == 'hip'
+        if: runner.os == 'Windows' && matrix.features == 'hip'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -213,8 +274,12 @@ jobs:
         shell: bash
         run: cargo build --release -p openasr-cli ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
+      # Same GPU-less-runner caveat as the Windows CUDA/HIP legs: those two
+      # exes dlopen the CUDA/ROCm runtime at launch, which needs a real
+      # driver this runner does not have. The Vulkan exe launches fine via
+      # the llvmpipe software ICD installed above.
       - name: Smoke release binary
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.features != 'cuda' && matrix.features != 'hip'
         run: |
           ./target/release/openasr --version
           ./target/release/openasr --help
@@ -265,6 +330,22 @@ jobs:
           dist_dir="dist/${archive}"
           mkdir -p "$dist_dir/docs"
           cp "target/release/${{ matrix.binary_name }}" "$dist_dir/"
+          if [ "${{ matrix.features }}" = "cuda" ]; then
+            # The CUDA exe dlopens the CUDA runtime; ship NVIDIA's
+            # redistributable runtime .so files so end users only need a
+            # GPU driver, not a CUDA toolkit install.
+            find "${CUDA_PATH}/lib64" -maxdepth 1 \( -name 'libcudart.so*' -o -name 'libcublas.so*' -o -name 'libcublasLt.so*' \) \
+              -exec cp {} "$dist_dir/" \;
+          fi
+          if [ "${{ matrix.features }}" = "hip" ]; then
+            # The HIP exe dlopens the ROCm runtime + rocBLAS; ship them (and
+            # rocBLAS's per-arch Tensile "library" dir, loaded at first
+            # matmul, not at launch) so end users only need a GPU driver,
+            # not the full ROCm SDK.
+            cp "${ROCM_PATH}"/lib/libamdhip64.so* "${ROCM_PATH}"/lib/libhipblas.so* "${ROCM_PATH}"/lib/librocblas.so* "$dist_dir/"
+            mkdir -p "$dist_dir/rocblas/library"
+            cp "${ROCM_PATH}"/lib/rocblas/library/* "$dist_dir/rocblas/library/"
+          fi
           cp README.md LICENSE "$dist_dir/"
           cp -R model-registry "$dist_dir/model-registry"
           cp docs/FAQ.md docs/KNOWN_LIMITATIONS.md "$dist_dir/docs/"
