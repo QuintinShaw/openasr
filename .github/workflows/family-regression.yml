@@ -14,9 +14,6 @@ on:
     - cron: "23 4 * * *"
   push:
     tags: ["v*"]
-    # TEMP(validation): branch trigger to register and exercise the workflow
-    # before merge; removed before merging.
-    branches: ["ci/family-regression"]
 
 concurrency:
   group: family-regression-${{ github.ref }}
