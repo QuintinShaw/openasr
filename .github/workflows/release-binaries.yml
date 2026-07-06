@@ -14,6 +14,10 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout || 60 }}
+    # Experimental legs (currently the Windows CUDA variant, whose hosted
+    # toolchain story is still settling) may fail without failing the run;
+    # their archives simply drop out of the artifact set until they stabilize.
+    continue-on-error: ${{ matrix.experimental || false }}
     # Distributed binaries must be portable. build.rs auto-enables GGML_NATIVE
     # (-march=native) when host==target on x86, which is correct for local
     # build-and-run but would tune these released x86 binaries to the CI
@@ -56,6 +60,7 @@ jobs:
             archive_ext: zip
             features: cuda
             timeout: 180
+            experimental: true
 
     steps:
       - uses: actions/checkout@v4
@@ -114,13 +119,14 @@ jobs:
           # sub-package: the build uses the Ninja generator (build.rs).
           cuda: "13.2.0"
           method: network
-          # nvcc+cublas(+dev) for the ggml-cuda build, cudart for the runtime
-          # DLLs shipped in the archive, thrust for the CUB/CCCL headers
-          # ggml-cuda's sort/scan kernels use (still named thrust_13.x in the
-          # Windows silent installer; an unknown name fails the installer with
-          # exit code 3772776473). Network subset keeps this ~GBs smaller than
-          # the full local installer.
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
+          # nvcc+cublas(+dev) for the ggml-cuda build, crt for the compiler
+          # front-end headers (include/crt/host_config.h ships separately in
+          # CUDA 13), cudart for the runtime DLLs shipped in the archive,
+          # thrust for the CUB/CCCL headers ggml-cuda's sort/scan kernels use
+          # (still named thrust_13.x in the Windows silent installer; an
+          # unknown name fails the installer with exit code 3772776473).
+          # Network subset keeps this ~GBs smaller than the full installer.
+          sub-packages: '["nvcc", "crt", "cudart", "cublas", "cublas_dev", "thrust"]'
           use-github-cache: true
 
       - name: Install Rust toolchain
