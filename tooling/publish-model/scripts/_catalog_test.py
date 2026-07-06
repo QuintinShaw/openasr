@@ -13,6 +13,7 @@ from _catalog import (
     language_mode_for_model,
     languages_for_model,
     prose_locale_source_sha256,
+    punctuation_for_model,
     validate_all_card_prose_locales,
     validate_card_prose_locales,
     validate_display_ranking,
@@ -260,6 +261,34 @@ class LanguageModeForModelTest(unittest.TestCase):
     def test_translation_model_is_omitted(self) -> None:
         entry = {"kind": "translation-model", "family": "hymt2"}
         self.assertEqual(language_mode_for_model(entry, ["en", "zh"]), {})
+
+
+class PunctuationForModelTest(unittest.TestCase):
+    def test_dolphin_does_not_emit_punctuation(self) -> None:
+        entry = {"kind": "asr-model", "family": "dolphin"}
+        self.assertEqual(punctuation_for_model(entry), {"emits_punctuation": False})
+
+    def test_other_asr_families_emit_punctuation(self) -> None:
+        for family in ("qwen", "cohere", "whisper", "xasr-zipformer", "moonshine", "sensevoice"):
+            entry = {"kind": "asr-model", "family": family}
+            self.assertEqual(
+                punctuation_for_model(entry),
+                {"emits_punctuation": True},
+                f"family {family!r} should emit punctuation",
+            )
+
+    def test_translation_model_is_omitted(self) -> None:
+        entry = {"kind": "translation-model", "family": "hymt2"}
+        self.assertEqual(punctuation_for_model(entry), {})
+
+    def test_capability_pack_is_omitted(self) -> None:
+        entry = {"kind": "capability-pack", "family": "wespeaker"}
+        self.assertEqual(punctuation_for_model(entry), {})
+
+    def test_unknown_family_raises(self) -> None:
+        entry = {"kind": "asr-model", "family": "made-up-family", "id": "m"}
+        with self.assertRaisesRegex(KeyError, "no emits_punctuation mapping"):
+            punctuation_for_model(entry)
 
 
 class RecognitionLanguageValidatorTest(unittest.TestCase):

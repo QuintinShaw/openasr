@@ -296,6 +296,7 @@ fn catalog_for_resolved(resolved: &ResolvedCatalogPull) -> ModelCatalog {
             sort_weight: 0,
             recommended: false,
             upstream_release_date: None,
+            emits_punctuation: None,
             prose: None,
             prose_locales: None,
             quants: vec![CatalogQuant {
@@ -1779,6 +1780,7 @@ fn installed_pack_alias_catalog() -> ModelCatalog {
             sort_weight: 0,
             recommended: false,
             upstream_release_date: None,
+            emits_punctuation: None,
             prose: None,
             prose_locales: None,
             quants: vec![CatalogQuant {

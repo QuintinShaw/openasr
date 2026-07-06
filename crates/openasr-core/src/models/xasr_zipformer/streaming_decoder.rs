@@ -3,8 +3,8 @@ use crate::models::ggml_asr_executor::{GgmlAsrExecutionError, GgmlAsrStreamingSe
 use crate::models::graph_runtime_config::install_request_inference_threads_override;
 
 use super::frontend::{
-    XASR_N_MELS, XasrFbankFeatures, XasrFbankFrontend, clean_frame_count_for_samples,
-    earliest_sample_needed_for_frame, total_frame_count_for_samples,
+    XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES, XASR_N_MELS, XasrFbankFeatures, XasrFbankFrontend,
+    clean_frame_count_for_samples, earliest_sample_needed_for_frame, total_frame_count_for_samples,
 };
 use super::runtime::{PooledRuntime, XasrChunkedDecodeState};
 use super::tokenizer::XasrStreamingDetokenizer;
@@ -191,6 +191,16 @@ impl IncrementalAudioDecoder for XasrIncrementalDecoder {
         let _thread_override = install_request_inference_threads_override(
             self.request.request_options.inference_threads,
         );
+        // Final flush: append the tail padding so the model sees the trailing
+        // silence it needs to emit end-of-sentence tokens (terminal
+        // punctuation). Mirrors the batch path in `PooledRuntime::transcribe`;
+        // the session driver guarantees finish() runs at most once.
+        if !self.audio.is_empty() {
+            self.audio.extend(std::iter::repeat_n(
+                0.0f32,
+                XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES,
+            ));
+        }
         self.process_available_chunks(true)
     }
 
@@ -332,6 +342,16 @@ mod tests {
             "batch transcript must be non-empty for a meaningful parity check"
         );
         assert_eq!(streaming, batch);
+        // Punctuation fidelity: the final-flush tail padding gives the model
+        // the trailing silence it needs to emit the terminal punctuation of
+        // the last sentence. Without the padding this clip decodes without
+        // its closing period.
+        assert!(
+            batch
+                .trim_end()
+                .ends_with(['.', '?', '!', '\u{3002}', '\u{ff1f}', '\u{ff01}']),
+            "batch transcript must keep the model's terminal punctuation: {batch:?}"
+        );
         // Prefix draining must have kept the session buffers bounded: the
         // 5.5s sample is ~88k samples / ~555 feature rows, of which only a
         // small working tail may remain resident.

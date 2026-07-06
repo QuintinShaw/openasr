@@ -24,6 +24,7 @@ from _catalog import (  # noqa: E402
     language_mode_for_model,
     languages_for_model,
     load as load_publish_catalog,
+    punctuation_for_model,
     validate_all_card_prose_locales,
 )
 from _manifest import prose_locales_block, read_prose  # noqa: E402
@@ -149,6 +150,10 @@ def check_machine_catalog_entry(model: str, entry: dict, machine_model: dict, er
     expected_language_mode = language_mode_for_model(entry, languages)
     expected_scalars["language_mode"] = expected_language_mode.get("language_mode")
     expected_scalars["language_default"] = expected_language_mode.get("language_default")
+    # emits_punctuation is likewise omitted entirely (not just falsy) for kinds
+    # punctuation_for_model() returns {} for; compare against None so a
+    # spuriously-added field on those entries is still caught as drift.
+    expected_scalars["emits_punctuation"] = punctuation_for_model(entry).get("emits_punctuation")
     for key, value in expected_scalars.items():
         if machine_model.get(key) != value:
             errors.append(f"{model}: catalog {key} drifted: got {machine_model.get(key)!r}, expected {value!r}")
@@ -264,7 +269,7 @@ def check_public_family_docs(machine_catalog: dict, errors: list[str]) -> None:
         return
 
     readme_section = extract_section(
-        readme_path.read_text(encoding="utf-8"), "## Model support", ("\n## ",)
+        readme_path.read_text(encoding="utf-8"), "## Models", ("\n## ",)
     ).lower()
     ack_section = extract_section(
         ack_path.read_text(encoding="utf-8"), "**Speech recognition**", ("\n**", "\n## ")

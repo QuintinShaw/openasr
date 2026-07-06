@@ -10,6 +10,13 @@ use realfft::{RealFftPlanner, RealToComplex};
 
 pub(crate) const XASR_SAMPLE_RATE_HZ: u32 = 16_000;
 pub(crate) const XASR_CHANNELS: u16 = 1;
+/// Trailing silence appended exactly once at final flush (0.8 s, the tail
+/// padding sherpa-onnx zipformer recipes feed before `InputFinished`). The
+/// streaming zipformer needs right acoustic context to emit trailing tokens --
+/// most visibly the terminal punctuation of the last sentence, which the model
+/// only produces after it has seen the following silence. Audio that ends
+/// abruptly at speech offset would otherwise lose that punctuation.
+pub(crate) const XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES: usize = XASR_SAMPLE_RATE_HZ as usize * 8 / 10;
 const FRAME_LENGTH: usize = 400; // 25 ms
 const FRAME_SHIFT: usize = 160; // 10 ms
 const N_FFT: usize = 512;

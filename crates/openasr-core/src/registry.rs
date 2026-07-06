@@ -272,6 +272,17 @@ pub struct CatalogModel {
     // signed catalog stays byte-identical while empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_release_date: Option<String>,
+    // Whether the model's transcripts include punctuation, derived at
+    // catalog-authoring time (tooling/publish-model/scripts/_catalog.py's
+    // `punctuation_for_model`) from the model's family -- an architecture/
+    // training-corpus property, not a per-release editorial choice. `None`
+    // means "unknown" (a catalog predating this field, or a kind core has no
+    // transcript-punctuation axis for, e.g. capability-pack); consumers must
+    // treat `None` as "assume punctuated" (`true`) rather than surfacing a
+    // false "no punctuation" notice for an older/omitted entry. Only
+    // serialized when set so an unmarked/legacy catalog stays byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emits_punctuation: Option<bool>,
     #[serde(default)]
     pub prose: Option<CatalogProse>,
     // Per-locale tagline/highlights translations of `prose` (first iteration:

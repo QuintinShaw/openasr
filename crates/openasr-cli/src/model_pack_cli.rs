@@ -706,7 +706,6 @@ fn render_openasr_runtime_metadata_values(
         openasr_core::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE,
         openasr_core::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND,
         openasr_core::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY,
-        openasr_core::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_STREAMING,
         openasr_core::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_DIARIZATION,
     ];
     keys.iter()
@@ -986,19 +985,10 @@ mod tests {
                 openasr_core::QWEN3_ASR_MODEL_FAMILY.to_string(),
             ),
         );
-        values.insert(
-            openasr_core::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_STREAMING.to_string(),
-            openasr_core::GgufMetadataValue::String(
-                openasr_core::models::oasr_metadata::OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1
-                    .to_string(),
-            ),
-        );
-
         let rendered = render_openasr_runtime_metadata_values(&values);
 
         assert!(rendered.contains("- openasr.package.version: 1"));
         assert!(rendered.contains("- openasr.model.family: qwen3-asr"));
-        assert!(rendered.contains("- openasr.features.streaming: ggml-true-streaming-v1"));
         assert!(rendered.contains("- openasr.features.diarization: <missing>"));
     }
 

@@ -7,6 +7,7 @@ use crate::StreamingPartialGranularity;
 use crate::arch::{OpenAsrArchitectureRegistry, OpenAsrArchitectureRegistryError};
 
 use super::cohere::CohereTranscribeGgmlExecutor;
+use super::dolphin::executor::DolphinGgmlExecutor;
 use super::executor_component_registry::{
     BuiltinExecutorComponentRegistryError, materialize_builtin_executors_by_model_architecture,
 };
@@ -31,6 +32,10 @@ pub(crate) enum BuiltinGgmlExecutionDispatchError {
         "builtin execution dispatch is missing a materialized executor for architecture '{model_architecture}'"
     )]
     MissingMaterializedExecutor { model_architecture: &'static str },
+    #[error(
+        "builtin streaming dispatch is missing a streaming executor for ASR architecture '{model_architecture}' (every registered family must declare one so realtime cadence stays descriptor-driven)"
+    )]
+    MissingStreamingExecutor { model_architecture: &'static str },
     #[error("builtin architecture registry failed validation: {error:?}")]
     ArchitectureRegistryInvalid {
         error: OpenAsrArchitectureRegistryError,
@@ -101,7 +106,7 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
     // emitted text) or a buffered/windowed re-decode driver (may revise).
     // Only xasr-zipformer runs the frame-sync driver today; every other
     // family re-decodes a growing or windowed buffer.
-    Ok(GgmlAsrExecutionDispatch::default()
+    let dispatch = GgmlAsrExecutionDispatch::default()
         .with_streaming_executor_for_adapter(
             crate::QWEN3_ASR_GGML_ADAPTER_ID,
             Arc::new(Qwen3AsrGgmlExecutor::default()),
@@ -159,13 +164,41 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
             StreamingPartialGranularity::Buffered,
         )
         .with_streaming_executor_for_adapter(
+            crate::arch::DOLPHIN_GGML_ADAPTER_ID,
+            Arc::new(DolphinGgmlExecutor),
+        )
+        .with_streaming_partial_granularity_for_adapter(
+            crate::arch::DOLPHIN_GGML_ADAPTER_ID,
+            StreamingPartialGranularity::Buffered,
+        )
+        .with_streaming_executor_for_adapter(
             crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
             Arc::new(XasrZipformerGgmlExecutor),
         )
         .with_streaming_partial_granularity_for_adapter(
             crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
             StreamingPartialGranularity::FrameSync,
-        ))
+        );
+
+    // Fail-fast completeness gate: realtime driver selection is descriptor-driven
+    // (see `native_runtime_streaming_capabilities_for_descriptor`). A registered
+    // ASR family with no streaming executor would silently fall back to the
+    // buffered file-per-utterance path -- the exact "no partials until a long
+    // pause" defect. Reject that at startup so onboarding a new family fails
+    // loudly here instead of shipping a broken live-caption cadence.
+    let family_registry =
+        crate::models::ggml_family_registry::GgmlFamilyRegistry::with_builtin_adapters();
+    for descriptor in family_registry.descriptors() {
+        if !dispatch.has_streaming_executor_for(descriptor) {
+            return Err(
+                BuiltinGgmlExecutionDispatchError::MissingStreamingExecutor {
+                    model_architecture: descriptor.model_architecture,
+                },
+            );
+        }
+    }
+
+    Ok(dispatch)
 }
 
 #[cfg(test)]
@@ -353,6 +386,8 @@ mod tests {
             crate::moonshine_runtime_descriptor_v1(),
             parakeet_ctc_runtime_descriptor_v1(),
             wav2vec2_ctc_runtime_descriptor_v1(),
+            crate::sensevoice_runtime_descriptor_v1(),
+            crate::dolphin_runtime_descriptor_v1(),
         ];
         for descriptor in &buffered_descriptors {
             assert!(
@@ -362,6 +397,25 @@ mod tests {
             );
         }
         assert!(dispatch.is_frame_sync_for(&xasr_zipformer_runtime_descriptor_v1()));
+    }
+
+    #[test]
+    fn builtin_streaming_dispatch_covers_every_registered_asr_family() {
+        // The startup completeness gate: every family the runtime can select must
+        // have a streaming executor, so realtime cadence stays descriptor-driven
+        // and no family silently falls back to buffered file-per-utterance.
+        let dispatch =
+            build_builtin_ggml_streaming_execution_dispatch().expect("builtin streaming dispatch");
+        let family_registry =
+            crate::models::ggml_family_registry::GgmlFamilyRegistry::with_builtin_adapters();
+        for descriptor in family_registry.descriptors() {
+            assert!(
+                dispatch.has_streaming_executor_for(descriptor),
+                "family '{}' ({}) has no streaming executor",
+                descriptor.adapter_id,
+                descriptor.model_architecture,
+            );
+        }
     }
 
     #[test]
@@ -392,6 +446,14 @@ mod tests {
             (
                 wav2vec2_ctc_runtime_descriptor_v1(),
                 "wav2vec2-ctc-ggml-snapshot-streaming-executor-v1",
+            ),
+            (
+                crate::sensevoice_runtime_descriptor_v1(),
+                "sensevoice-ggml-snapshot-streaming-executor-v1",
+            ),
+            (
+                crate::dolphin_runtime_descriptor_v1(),
+                "dolphin-ggml-snapshot-streaming-executor-v1",
             ),
             (
                 xasr_zipformer_runtime_descriptor_v1(),

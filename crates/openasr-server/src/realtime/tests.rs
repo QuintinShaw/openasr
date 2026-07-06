@@ -220,11 +220,6 @@ fn write_native_streaming_fixture_pack(
         openasr_core::GGML_TOKENIZER_ID_KEY.to_string(),
         tokenizer.to_string(),
     );
-    metadata.insert(
-        openasr_core::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_STREAMING.to_string(),
-        openasr_core::models::oasr_metadata::OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1
-            .to_string(),
-    );
     let spec = openasr_core::testing::TinyGgufFixtureSpec::new(metadata);
     openasr_core::testing::write_tiny_gguf_runtime_source(path, &spec)
         .expect("write native streaming fixture pack");
@@ -2531,44 +2526,6 @@ async fn native_streaming_configured_event_preserves_diarize_request() {
         "native true-streaming session.configured must reflect accepted diarize=true"
     );
 
-    let _ = session.finish("test_complete", true).await;
-}
-
-#[tokio::test]
-async fn fallback_diarize_session_does_not_build_native_change_detector() {
-    let _env_lock = speaker_embedder_env_lock().await;
-    let temp = tempfile::tempdir().unwrap();
-    let model_id = "whisper-fallback-diarize";
-    let pack_path = temp.path().join("whisper-fallback-diarize.oasr");
-    let spec =
-        openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu(model_id);
-    openasr_core::testing::write_tiny_gguf_runtime_source(&pack_path, &spec)
-        .expect("write non-streaming native fixture pack");
-    let wespeaker = temp.path().join("wespeaker.oasr");
-    std::fs::write(&wespeaker, b"GGUF\x00\x00\x00\x00").unwrap();
-    let _wespeaker = EnvVarGuard::set("OPENASR_WESPEAKER_PACK", &wespeaker);
-    let runtime = ServerRuntime {
-        backend: openasr_core::BackendKind::Native,
-        ffmpeg_bin: None,
-        model_pack_path: Some(pack_path),
-    };
-    let (event_sender, _event_receiver) = mpsc::channel(8);
-    let mut session = WsSession::new(runtime, test_distribution(), event_sender);
-    static EMBEDDER: FixedSpeakerEmbedder = FixedSpeakerEmbedder;
-    session.test_streaming_diarizer_embedder = Some(&EMBEDDER);
-
-    session
-        .start_session(StartSession {
-            model: Some(model_id.to_string()),
-            diarize: Some(true),
-            ..StartSession::default()
-        })
-        .await
-        .expect("fallback diarize session should start");
-
-    assert!(session.streaming_diarizer.is_some());
-    assert!(session.native_streaming.is_none());
-    assert!(session.native_speaker_change_detector.is_none());
     let _ = session.finish("test_complete", true).await;
 }
 

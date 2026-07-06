@@ -88,7 +88,7 @@ class PublicFamilyDocsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             drift.REPO_ROOT = root
-            (root / "README.md").write_text("## Model support\n\nWhisper is supported.\n\n## Benchmarks\n")
+            (root / "README.md").write_text("## Models\n\nWhisper is supported.\n\n## Benchmarks\n")
             (root / "ACKNOWLEDGMENTS.md").write_text(
                 "**Speech recognition**\n\n- Whisper -- link\n\n**Speaker diarization**\n"
             )
@@ -102,7 +102,7 @@ class PublicFamilyDocsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             drift.REPO_ROOT = root
-            (root / "README.md").write_text("## Model support\n\nWhisper is supported.\n\n## Benchmarks\n")
+            (root / "README.md").write_text("## Models\n\nWhisper is supported.\n\n## Benchmarks\n")
             (root / "ACKNOWLEDGMENTS.md").write_text(
                 "**Speech recognition**\n\n- Whisper -- link\n\n**Speaker diarization**\n"
             )
@@ -118,7 +118,7 @@ class PublicFamilyDocsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             drift.REPO_ROOT = root
-            (root / "README.md").write_text("## Model support\n\nWhisper is supported.\n\n## Benchmarks\n")
+            (root / "README.md").write_text("## Models\n\nWhisper is supported.\n\n## Benchmarks\n")
             (root / "ACKNOWLEDGMENTS.md").write_text(
                 "**Speech recognition**\n\n- Whisper -- link\n\n**Speaker diarization**\n"
             )

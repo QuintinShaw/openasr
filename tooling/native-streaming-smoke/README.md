@@ -20,11 +20,10 @@ It covers the seven native streaming families:
 For each family, it:
 
 1. imports a fresh `.oasr` pack into `tmp/native-streaming-smoke/`;
-2. runs `show` and requires
-   `openasr.features.streaming=ggml-true-streaming-v1`;
-3. requires derived realtime capability to be `true_streaming` with partials;
-4. runs `verify`;
-5. runs `cargo test -p openasr-core native_streaming_real_runtime_smoke_from_env
+2. runs `show` and requires the derived realtime capability to be
+   `true_streaming` with partials (registry-driven; no pack streaming key);
+3. runs `verify`;
+4. runs `cargo test -p openasr-core native_streaming_real_runtime_smoke_from_env
    -- --ignored --nocapture` against `fixtures/jfk.wav`.
 
 Useful focused run:

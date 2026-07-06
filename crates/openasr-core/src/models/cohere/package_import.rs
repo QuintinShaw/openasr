@@ -18,8 +18,7 @@ use crate::models::local_source_import::{
     tensor_element_count, validate_error, validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
-    OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1, OASR_METADATA_KEY_AUDIO_FRONTEND,
-    OASR_METADATA_KEY_DECODE_POLICY, OASR_METADATA_KEY_FEATURE_STREAMING,
+    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
@@ -719,11 +718,6 @@ fn cohere_runtime_gguf_metadata(
     );
     insert_metadata(
         &mut metadata,
-        OASR_METADATA_KEY_FEATURE_STREAMING,
-        OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1,
-    );
-    insert_metadata(
-        &mut metadata,
         GGML_TOKENIZER_ID_KEY,
         COHERE_TRANSCRIBE_TOKENIZER_ID,
     );
@@ -1023,10 +1017,6 @@ mod tests {
             &tokens,
         );
 
-        assert_eq!(
-            string_metadata(&metadata, OASR_METADATA_KEY_FEATURE_STREAMING),
-            OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1
-        );
         assert_eq!(
             string_metadata(&metadata, OASR_METADATA_KEY_MODEL_FAMILY),
             COHERE_TRANSCRIBE_MODEL_FAMILY

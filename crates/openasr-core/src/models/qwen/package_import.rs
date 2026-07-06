@@ -21,8 +21,7 @@ use crate::models::local_source_import::{
     read_source_json_file, tensor_element_count, validate_error, validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
-    OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1, OASR_METADATA_KEY_AUDIO_FRONTEND,
-    OASR_METADATA_KEY_DECODE_POLICY, OASR_METADATA_KEY_FEATURE_STREAMING,
+    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
@@ -488,11 +487,6 @@ fn qwen_runtime_gguf_metadata(
     );
     insert_metadata(
         &mut metadata,
-        OASR_METADATA_KEY_FEATURE_STREAMING,
-        OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1,
-    );
-    insert_metadata(
-        &mut metadata,
         OASR_METADATA_KEY_AUDIO_FRONTEND,
         QWEN3_ASR_AUDIO_FRONTEND_ID,
     );
@@ -940,15 +934,7 @@ fn mel_to_hz(mel: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use crate::ggml_runtime::GgufWriteValue;
-    use crate::models::oasr_metadata::{
-        OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1, OASR_METADATA_KEY_FEATURE_STREAMING,
-    };
-
-    use super::{
-        Qwen3AsrConfigJson, Qwen3AsrLocalSourceImportRequest, compose_model_id,
-        qwen_metadata_fields, qwen_runtime_gguf_metadata, should_reverse_qwen_tensor_dims,
-    };
+    use super::should_reverse_qwen_tensor_dims;
 
     #[test]
     fn qwen_tensor_dim_orientation_matches_runtime_contract() {
@@ -1001,63 +987,5 @@ mod tests {
         for row in rows {
             assert_eq!(row.len(), 4);
         }
-    }
-
-    #[test]
-    fn qwen_runtime_metadata_declares_snapshot_streaming_feature() {
-        let config = Qwen3AsrConfigJson {
-            thinker_config: super::Qwen3AsrThinkerConfigJson {
-                audio_config: super::Qwen3AsrAudioConfigJson {
-                    num_mel_bins: Some(8),
-                    encoder_layers: Some(1),
-                    d_model: Some(16),
-                    encoder_attention_heads: Some(2),
-                },
-                text_config: super::Qwen3AsrTextConfigJson {
-                    num_hidden_layers: Some(1),
-                    hidden_size: Some(16),
-                    num_attention_heads: Some(2),
-                    num_key_value_heads: Some(2),
-                    head_dim: Some(8),
-                    vocab_size: Some(4),
-                    max_position_embeddings: Some(128),
-                },
-                audio_token_id: Some(3),
-                audio_start_token_id: Some(1),
-                audio_end_token_id: Some(2),
-            },
-        };
-        let tokens = vec![
-            "<audio>".to_string(),
-            "<audio_end>".to_string(),
-            "<pad>".to_string(),
-            "hello".to_string(),
-        ];
-        let fields = qwen_metadata_fields(&config, &tokens);
-        let request = Qwen3AsrLocalSourceImportRequest {
-            source_root: "/tmp/qwen-src".into(),
-            output_root: "/tmp/qwen.oasr".into(),
-            package_id: "qwen3-asr-0.6b".to_string(),
-            package_variant: Some("q8_0".to_string()),
-            source_name: "Qwen3-ASR".to_string(),
-            source_revision: "test".to_string(),
-            license_name: "Apache-2.0".to_string(),
-            license_source: "https://example.invalid/license".to_string(),
-            quantization: super::Qwen3AsrRuntimeQuantizationMode::Q8_0,
-        };
-        let metadata = qwen_runtime_gguf_metadata(
-            &request,
-            &fields,
-            &compose_model_id(&request.package_id, request.package_variant.as_deref()),
-            &tokens,
-            &[],
-        );
-
-        assert_eq!(
-            metadata.get(OASR_METADATA_KEY_FEATURE_STREAMING),
-            Some(&GgufWriteValue::String(
-                OASR_FEATURE_STREAMING_GGML_TRUE_STREAMING_V1.to_string()
-            ))
-        );
     }
 }

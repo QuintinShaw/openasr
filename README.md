@@ -3,55 +3,95 @@
 [![CI](https://github.com/QuintinShaw/openasr/actions/workflows/ci.yml/badge.svg)](https://github.com/QuintinShaw/openasr/actions/workflows/ci.yml)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
+**The App Store for local ASR models -- signed, offline, private.**
+
+OpenASR is the Apache-2.0 **open core** of a local-first speech-to-text platform:
+a single `openasr` Rust CLI, a local OpenAI-compatible HTTP API, and a signed
+model catalog, all running native [ggml](https://github.com/ggml-org/ggml)-backed
+inference across nine model families on CPU and Apple Metal. No cloud, no
+telemetry, fail-closed by design.
+
+[Website](https://openasr.org) - [Documentation](docs/DOCS_INDEX.md) - [Acknowledgments](ACKNOWLEDGMENTS.md) - [License](LICENSE)
+
 > **Early stage (pre-v1).** OpenASR is under active development. CLI flags, the
 > HTTP API, and the `.oasr` pack format can change between `0.y` releases without
 > a compatibility promise. Not yet recommended for production. Website and docs:
 > **<https://openasr.org>**.
 
-**Local-first speech-to-text that gives you real transcripts on your own machine
--- no cloud, no telemetry, fail-closed by design.**
+<!-- demo GIF: placeholder, uploading 2026-07-07 -->
 
-[Website](https://openasr.org) - [Documentation](docs/DOCS_INDEX.md) - [Acknowledgments](ACKNOWLEDGMENTS.md) - [License](LICENSE)
+```bash
+git clone --recurse-submodules https://github.com/QuintinShaw/openasr.git && cd openasr
+cargo build --release -p openasr-cli          # binary at target/release/openasr
+target/release/openasr transcribe audio.wav   # first run offers the default model, then all-local
+```
 
-OpenASR is the Apache-2.0 **open core** of a local-first STT platform: a single
-`openasr` Rust CLI, a local OpenAI-compatible HTTP API subset, a signed model
-catalog, and native [ggml](https://github.com/ggml-org/ggml)-backed inference
-across nine model families on CPU and Apple Metal.
-
-<!-- TODO: demo GIF -->
-
-## Why OpenASR (vs whisper.cpp / faster-whisper)
-
-whisper.cpp and faster-whisper are excellent Whisper runners. OpenASR is a
-broader local-first STT *platform* built around four things they do not bundle:
-
-- **Many model families, one binary.** Whisper, Cohere Transcribe, Qwen3-ASR,
-  Parakeet-CTC, wav2vec2-CTC (incl. data2vec), Moonshine, Dolphin (Chinese
-  dialects), and X-ASR (Zipformer) all run through the same data-driven
-  architecture registry -- not a single Whisper family. Pick the model that
-  fits the task and keep one toolchain.
-- **A signed catalog with consent-gated pulls.** Models come from a signed
-  catalog, and `openasr transcribe` installs a missing model only through a
-  **visible confirmation** showing the model, quant, size, host, and license --
-  no hand-managed GGUF files, no silent downloads.
-- **A local OpenAI-compatible server.** `openasr serve` exposes
-  `/v1/audio/transcriptions` on `localhost`, so existing OpenAI-client tooling
-  works against your own machine, with optional TLS + pairing for remote serving.
-- **Fail-closed by design.** No telemetry, no phone-home, no background uploads;
-  audio never leaves the machine. The native runtime either produces a real
-  transcript or returns a typed error -- it never fabricates output and never
-  reaches for the network silently. `--offline` and non-interactive runs fail
-  closed before any download.
-
-`openasr transcribe audio.wav` runs a real local model out of the box (not a
-stub): the first run offers the default model (`qwen3-asr-0.6b`) with a visible
+The first run offers the default model (`qwen3-asr-0.6b`) with a visible
 confirmation, then everything runs offline on your hardware.
 
-## Model support
+## Why OpenASR
 
-Nine native families run offline on CPU and Apple Metal, dispatched by the
-data-driven architecture registry. All families support opt-in diarization; most
-also export word-level timestamps -- the columns below show where they differ.
+whisper.cpp and faster-whisper are excellent Whisper runners. OpenASR is a
+broader local-first STT *platform* built around three things they do not bundle.
+
+### Signed model distribution, not a pile of GGUFs
+
+Models come from a catalog whose manifest is cryptographically signed; every pull
+is checked against a committed public key and a SHA-256 hash before it runs.
+`openasr pull qwen3-asr-0.6b:q8` fetches one of **50 signed quant variants across
+17 catalog packs** -- no hand-managed GGUF files and no silent downloads. An
+install only happens behind a **visible consent prompt** showing the model, quant,
+size, host, and license.
+
+### Depth, not just Whisper
+
+**Nine model families** run through one binary and one ggml runtime: Whisper,
+Cohere Transcribe, Qwen3-ASR, Parakeet-CTC, wav2vec2-CTC, Moonshine, Dolphin
+(Chinese dialects), SenseVoice (zh/yue/en/ja/ko), and X-ASR (Zipformer). You get
+frame-synchronous streaming partials, opt-in speaker diarization, word-level
+timestamps with **per-word confidence**, and phrase-bias hotwords -- pick the
+model that fits the task and keep one toolchain.
+
+### Local and private, fail-closed
+
+No telemetry, no phone-home, no background uploads; audio never leaves the machine.
+The native runtime either produces a real transcript or returns a typed error --
+it never fabricates output and never reaches for the network silently. `--offline`
+and non-interactive runs fail closed before any download.
+
+## What you can do
+
+| You want to... | Command |
+| --- | --- |
+| Transcribe a file or a whole folder | `openasr transcribe audio.wav` |
+| Live captions from mic or system audio | `openasr live` |
+| Generate subtitles (SRT / VTT) | `openasr transcribe talk.wav -f srt -f vtt` |
+| Word-level timestamps + per-word confidence | `openasr transcribe audio.wav -f json --word-timestamps` |
+| Separate speakers (diarization) | `openasr transcribe meeting.wav --diarize` |
+| Bias toward domain terms (hotwords) | `openasr transcribe call.wav --hotword "OpenASR"` |
+| Serve an OpenAI-compatible API locally | `openasr serve` |
+
+See `openasr --help` for the full command set and [QUICKSTART](docs/QUICKSTART.md)
+for a guided first transcript.
+
+## Models
+
+Browse and install packs straight from the signed catalog; the `<id>:<quant>`
+syntax selects a specific quantization tier:
+
+```bash
+openasr search                        # browse the catalog
+openasr pull whisper-small            # install the recommended quant
+openasr pull qwen3-asr-0.6b:q8        # or pin a specific quant tier
+openasr list                          # what's installed
+```
+
+The catalog ships **17 ready-to-pull ASR packs** spanning seven of the nine
+native families (50 signed quant downloads), plus diarization capability
+packs; the remaining two (Parakeet-CTC, wav2vec2-CTC) run via `import` of your
+own checkpoints. Nine native families run offline on CPU and Apple Metal,
+dispatched by the data-driven architecture registry. All families support opt-in diarization; most also export word-level
+timestamps -- the columns below show where they differ.
 
 | Family | Streaming | Word timestamps | Quant tiers |
 | --- | --- | --- | --- |
@@ -114,7 +154,7 @@ until you install or build the packs -- see
 [Performance](perf/PERFORMANCE.md) for setup, gates, and caveats. WER on a
 17-word clip is coarse (one word is ~5.9%).
 
-## Quick start
+## Building from source
 
 Build once (the ggml backend compiles from source, so clone recursively and have
 `cmake`, a C/C++ toolchain, and on Linux `libasound2-dev`; Rust 1.95.0 is pinned
@@ -139,15 +179,9 @@ openasr t audio.wav -m whisper-small -f srt -o audio.srt
 # A whole folder (one transcript per file), or several formats at once.
 openasr transcribe ./recordings -o ./transcripts
 openasr transcribe audio.wav -f srt -f vtt -f json
-
-# Browse the catalog, install a pack, list what's installed.
-openasr search
-openasr pull whisper-small
-openasr list
 ```
 
-See [QUICKSTART](docs/QUICKSTART.md) for more, and `openasr --help` for the full
-command set. During development run without installing via
+During development run without installing via
 `cargo run -p openasr-cli -- <args>`; `--backend mock` gives deterministic,
 network-free output for CI.
 
@@ -186,23 +220,6 @@ Useful flags on `transcribe`: `-m/--model` (also `OPENASR_MODEL`), `-f/--format`
 `-l/--language` (`auto` or a hint like `en`), `--diarize`, `--word-timestamps`,
 `--continue-on-error` (multi-input), and `--hotword <PHRASE>` / `--hotword-boost`
 for phrase bias.
-
-## Building model packs
-
-Native packs are built from a local HF-style source directory with one per-family
-importer. `openasr pull` installs already-published catalog packs; local importing
-stays the path for caller-provided source weights and vendor-gated sources that
-must not be silently re-hosted.
-
-```bash
-cargo run -p openasr-cli -- model-pack import whisper      <source_dir> <out.oasr> --package-id whisper-small --source-revision <rev>
-cargo run -p openasr-cli -- model-pack import qwen         <source_dir> <out.oasr> --package-id qwen3-asr-0.6b --source-revision <rev>
-cargo run -p openasr-cli -- model-pack import moonshine    <source_dir> <out.oasr> --package-id moonshine-tiny --source-revision <rev>
-```
-
-Other families: `cohere`, `parakeet-ctc`, `wav2vec2-ctc`, `dolphin`,
-`xasr-zipformer`, `hymt2-gguf`, `wespeaker`, `pyannote`. Each accepts
-`--quantization fp16|q8_0|q4_k` (Qwen also exposes `q3_k`).
 
 ## Local HTTP API
 
@@ -244,6 +261,23 @@ cargo run -p openasr-cli -- serve --addr 0.0.0.0:8443 --tls-self-signed \
   --backend native --model-pack /path/to/model.oasr --model your-runtime-model-id
 ```
 
+## Building model packs
+
+Native packs are built from a local HF-style source directory with one per-family
+importer. `openasr pull` installs already-published catalog packs; local importing
+stays the path for caller-provided source weights and vendor-gated sources that
+must not be silently re-hosted.
+
+```bash
+cargo run -p openasr-cli -- model-pack import whisper      <source_dir> <out.oasr> --package-id whisper-small --source-revision <rev>
+cargo run -p openasr-cli -- model-pack import qwen         <source_dir> <out.oasr> --package-id qwen3-asr-0.6b --source-revision <rev>
+cargo run -p openasr-cli -- model-pack import moonshine    <source_dir> <out.oasr> --package-id moonshine-tiny --source-revision <rev>
+```
+
+Other families: `cohere`, `parakeet-ctc`, `wav2vec2-ctc`, `dolphin`,
+`xasr-zipformer`, `hymt2-gguf`, `wespeaker`, `pyannote`. Each accepts
+`--quantization fp16|q8_0|q4_k` (Qwen also exposes `q3_k`).
+
 ## Validation
 
 ```bash
@@ -269,6 +303,7 @@ portable distribution builds.
 - [Format Contract](docs/format/OASR_PACKAGE_CONTRACT_V1.md)
 - [Releasing](RELEASING.md) - versioning and release process
 - [Performance](perf/PERFORMANCE.md)
+- [Contributing](CONTRIBUTING.md) - build setup, branch naming, PR checklist, DCO
 
 ## License and acknowledgments
 
@@ -286,3 +321,5 @@ Model packs are distributed separately under their own upstream licenses (all
 permissive, MIT / Apache-2.0). A free, openly licensed pack -- e.g.
 `whisper-small` (Apache-2.0) or `moonshine-tiny` (MIT) -- runs the engine
 end-to-end.
+</content>
+</invoke>
