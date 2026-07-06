@@ -26,6 +26,7 @@ from _catalog import (
     language_mode_for_model,
     languages_for_model,
     load as load_publish_catalog,
+    punctuation_for_model,
     validate_card_prose_locales,
 )
 from _file_loaders import atomic_write_json, load_required_json, load_toml
@@ -271,6 +272,10 @@ def build_catalog_model(model: str, entry: dict, args: argparse.Namespace) -> di
     # language_mode_for_model()'s docstring for why translation-model /
     # capability-pack entries omit it).
     model_entry.update(language_mode_for_model(entry, languages))
+    # Whether this model's transcripts include punctuation, derived from its
+    # family (asr-model only; see punctuation_for_model()'s docstring for why
+    # translation-model / capability-pack entries omit it).
+    model_entry.update(punctuation_for_model(entry))
     if entry.get("experimental") is True:
         model_entry["experimental"] = True
     # Explicit, author-set display hints (models-core.toml `sort_weight`/
