@@ -154,7 +154,6 @@ fn save_and_load_config_document_roundtrip_preserves_preferences() {
             accent_color: Some("#0f766e".to_string()),
             density: AppearanceDensity::Compact,
             push_to_talk: true,
-            onboarded: true,
             inference_threads: Some(4),
             execution_target: ExecutionTarget::Cpu,
             history_retention: HistoryRetentionPolicy::Month,

@@ -77,8 +77,6 @@ pub struct Preferences {
     #[serde(default)]
     pub push_to_talk: bool,
     #[serde(default)]
-    pub onboarded: bool,
-    #[serde(default)]
     pub inference_threads: Option<u16>,
     #[serde(default)]
     pub quant_preference: QuantPreference,
@@ -278,7 +276,6 @@ impl Default for Preferences {
             density: AppearanceDensity::Comfortable,
             dictation_shortcut: default_dictation_shortcut(),
             push_to_talk: false,
-            onboarded: false,
             inference_threads: None,
             quant_preference: QuantPreference::Auto,
             execution_target: ExecutionTarget::Auto,

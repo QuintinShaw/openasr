@@ -619,7 +619,6 @@ async fn config_endpoint_roundtrips_versioned_preferences() {
     document["preferences"]["theme"] = serde_json::json!("dark");
     document["preferences"]["density"] = serde_json::json!("compact");
     document["preferences"]["push_to_talk"] = serde_json::json!(true);
-    document["preferences"]["onboarded"] = serde_json::json!(true);
     document["preferences"]["inference_threads"] = serde_json::json!(2);
 
     let response = app
@@ -782,7 +781,6 @@ async fn preferences_only_put_merges_partial_preferences() {
             "tray_icon": false,
             "dictation_shortcut": "Alt",
             "push_to_talk": true,
-            "onboarded": false,
             "inference_threads": 8,
             "theme": "dark",
             "accent_color": "#2fa663",
@@ -810,7 +808,7 @@ async fn preferences_only_put_merges_partial_preferences() {
                 .uri("/v1/config")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    serde_json::json!({ "preferences": { "onboarded": true } }).to_string(),
+                    serde_json::json!({ "preferences": { "diarize": true } }).to_string(),
                 ))
                 .unwrap(),
         )
@@ -819,7 +817,7 @@ async fn preferences_only_put_merges_partial_preferences() {
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
     let after: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(after["preferences"]["onboarded"], true);
+    assert_eq!(after["preferences"]["diarize"], true);
     assert_eq!(after["preferences"]["language"], "zh-CN");
     assert_eq!(after["preferences"]["auto_save"], true);
     assert_eq!(after["preferences"]["tray_icon"], false);
@@ -832,7 +830,7 @@ async fn preferences_only_put_merges_partial_preferences() {
 
     let file: Value =
         serde_json::from_slice(&std::fs::read(home.join("config.json")).unwrap()).unwrap();
-    assert_eq!(file["preferences"]["onboarded"], true);
+    assert_eq!(file["preferences"]["diarize"], true);
     assert_eq!(file["preferences"]["dictation_shortcut"], "Alt");
 }
 
