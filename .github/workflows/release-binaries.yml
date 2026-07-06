@@ -236,6 +236,14 @@ jobs:
           Add-Content $env:GITHUB_ENV "HIP_PATH=$hipRoot"
           Add-Content $env:GITHUB_PATH "$hipRoot\bin"
 
+      # build.rs's Windows HIP import-lib shim shells out to `dumpbin` (to
+      # read libhipblas.dll/rocblas.dll's exports and synthesize .lib files
+      # the linker needs), which only resolves once the MSVC dev environment
+      # is loaded -- a plain windows-latest shell does not have it on PATH.
+      - name: Enable MSVC dev environment
+        if: runner.os == 'Windows' && matrix.features == 'hip'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Install CUDA toolkit
         if: matrix.features == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.35
