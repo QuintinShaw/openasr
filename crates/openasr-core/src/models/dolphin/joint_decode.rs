@@ -507,10 +507,20 @@ fn score_hypothesis(
 
 // --- detokenize ------------------------------------------------------------
 
-/// Join char tokens into text, dropping the special `<...>` marker tokens (prompt/
-/// task/blank/unk). Content hypotheses carry pure char tokens, so this is just the
-/// concatenation, but the filter keeps the surface honest if a marker leaks in.
+/// Join Dolphin content tokens into text, dropping the special `<...>` marker
+/// tokens (prompt/task/blank/unk). Every Dolphin `units.txt` vocab observed so
+/// far (cn-dialect small/base, and the multilingual small/base's SentencePiece
+/// vocab) is a MIXED unigram vocab: single CJK characters are their own token
+/// (no separator needed, so plain concatenation is correct for them), while
+/// Latin-script words -- English code-switch tokens in the cn-dialect vocabs,
+/// and ordinary word pieces in the multilingual vocabs -- carry a leading
+/// SentencePiece `\u{2581}` ("▁") word-start marker. A token starting with `▁`
+/// therefore opens a new word (emit a preceding space, dropped at the very
+/// start of the transcript) with the marker itself stripped; every other
+/// token (a bare CJK char, or a continuation piece with no marker) is
+/// concatenated directly, exactly as before.
 pub(crate) fn detokenize_char_tokens(token_ids: &[u32], tokens: &[String]) -> String {
+    const WORD_START_MARKER: char = '\u{2581}'; // SentencePiece "▁"
     let mut text = String::new();
     for &id in token_ids {
         let Some(token) = tokens.get(id as usize) else {
@@ -519,7 +529,15 @@ pub(crate) fn detokenize_char_tokens(token_ids: &[u32], tokens: &[String]) -> St
         if is_special_token(token) {
             continue;
         }
-        text.push_str(token);
+        match token.strip_prefix(WORD_START_MARKER) {
+            Some(rest) => {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(rest);
+            }
+            None => text.push_str(token),
+        }
     }
     text
 }
