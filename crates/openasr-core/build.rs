@@ -123,6 +123,7 @@ fn main() {
     let vulkan_sdk = feat_vulkan.then(vulkan_sdk_path).flatten();
     let windows_hip_shim = if feat_hip && is_windows {
         Some(prepare_windows_hip_sdk_shim(
+            &target,
             hip_path
                 .as_deref()
                 .expect("HIP_PATH, ROCM_PATH, or ROCM_HOME must point to AMD HIP SDK"),
@@ -1206,7 +1207,7 @@ fn normalize_cuda_gpu_targets(raw: &str) -> String {
         .join(";")
 }
 
-fn prepare_windows_hip_sdk_shim(hip_path: &Path, out_dir: &Path) -> PathBuf {
+fn prepare_windows_hip_sdk_shim(target: &str, hip_path: &Path, out_dir: &Path) -> PathBuf {
     let shim_dir = out_dir.join("openasr-windows-hip-sdk-shim");
     let import_lib_dir = shim_dir.join("lib");
     fs::create_dir_all(&import_lib_dir).expect("create Windows HIP import lib dir");
@@ -1214,10 +1215,12 @@ fn prepare_windows_hip_sdk_shim(hip_path: &Path, out_dir: &Path) -> PathBuf {
     let bin_dir = hip_path.join("bin");
     let sdk_include_dir = hip_path.join("include");
     prepare_windows_import_lib(
+        target,
         &bin_dir.join("libhipblas.dll"),
         &import_lib_dir.join("libhipblas.lib"),
     );
     prepare_windows_import_lib(
+        target,
         &bin_dir.join("rocblas.dll"),
         &import_lib_dir.join("rocblas.lib"),
     );
@@ -1240,7 +1243,29 @@ fn prepare_windows_hip_sdk_shim(hip_path: &Path, out_dir: &Path) -> PathBuf {
     shim_dir
 }
 
-fn prepare_windows_import_lib(dll_path: &Path, import_lib_path: &Path) {
+/// Build a Command for an MSVC binutils-style tool (dumpbin.exe, lib.exe).
+///
+/// These live next to cl.exe in the VC tools bin directory, which is NOT on
+/// PATH outside a Developer Command Prompt (CI runners invoke cargo from a
+/// plain shell). cc's windows_registry finds cl.exe through the VS installer
+/// metadata, so derive the sibling tool from there and inherit the tool env
+/// (PATH additions for the DLLs the tool itself needs). Falls back to plain
+/// PATH lookup for developer prompts / exotic setups.
+fn msvc_bin_tool(target: &str, tool: &str) -> Command {
+    if let Some(cl) = cc::windows_registry::find_tool(target, "cl.exe") {
+        let path = cl.path().with_file_name(tool);
+        if path.is_file() {
+            let mut command = Command::new(path);
+            for (key, value) in cl.env() {
+                command.env(key, value);
+            }
+            return command;
+        }
+    }
+    Command::new(tool)
+}
+
+fn prepare_windows_import_lib(target: &str, dll_path: &Path, import_lib_path: &Path) {
     if import_lib_path.is_file() {
         return;
     }
@@ -1251,7 +1276,7 @@ fn prepare_windows_import_lib(dll_path: &Path, import_lib_path: &Path) {
         );
     }
 
-    let output = Command::new("dumpbin")
+    let output = msvc_bin_tool(target, "dumpbin.exe")
         .arg("/exports")
         .arg(dll_path)
         .output()
@@ -1280,7 +1305,7 @@ fn prepare_windows_import_lib(dll_path: &Path, import_lib_path: &Path) {
     let def = format!("LIBRARY {library_name}\nEXPORTS\n{}\n", exports.join("\n"));
     fs::write(&def_path, def).expect("write Windows HIP import library definition");
 
-    let status = Command::new("lib")
+    let status = msvc_bin_tool(target, "lib.exe")
         .arg(format!("/def:{}", def_path.display()))
         .arg("/machine:x64")
         .arg(format!("/out:{}", import_lib_path.display()))
