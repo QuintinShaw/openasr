@@ -44,6 +44,7 @@ jobs:
           python3 -m unittest discover -s tooling/publish-model/scripts -p '*_test.py'
           python3 -m unittest discover -s tooling/native-streaming-smoke -p 'test_*.py'
           python3 -m unittest discover -s tooling/public-hf-e2e -p 'test_*.py'
+          python3 -m unittest discover -s tooling/family-regression -p 'test_*.py'
       - name: Desktop system-audio backend gate
         run: |
           cargo fmt --check --manifest-path tooling/system-audio-check/Cargo.toml

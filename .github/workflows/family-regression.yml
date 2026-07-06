@@ -1,0 +1,126 @@
+name: Family Regression
+
+# Real-model regression net: for every public model family, pull the smallest
+# checkpoint at its smallest quant from the public catalog (real user chain,
+# signature-verified) and transcribe a committed fixture on the CPU backend,
+# comparing against committed goldens (tooling/family-regression/goldens/).
+#
+# Runs nightly, on release tags (release gate), and on demand. Kept outside
+# push/PR CI because it performs real network downloads and native inference.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 4 * * *"
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: family-regression-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-cli:
+    name: Build CLI (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake libasound2-dev
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: family-regression-${{ matrix.os }}
+      - name: Build openasr CLI
+        # The binary is shared with the case jobs via an artifact, and
+        # GitHub's x86 runner fleet mixes CPU generations, so host-tuned ggml
+        # kernels can SIGILL on a different case runner (same rule as
+        # release-binaries.yml).
+        env:
+          OPENASR_GGML_NATIVE: "0"
+        run: cargo build --release -p openasr-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openasr-cli-${{ matrix.os }}
+          path: target/release/openasr
+          retention-days: 3
+
+  family:
+    name: ${{ matrix.case.name }} (${{ matrix.os }})
+    needs: build-cli
+    strategy:
+      # A single family failure must stay readable and must not cancel the
+      # rest of the net.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # Family registry: one entry per public model family, smallest
+        # checkpoint x smallest quant. ONBOARDING A NEW FAMILY IS NOT DONE
+        # until it is registered here with a committed golden under
+        # tooling/family-regression/goldens/<name>/ (generate it with
+        # `tooling/family-regression/run.sh --case <name> --ref <ref>
+        # --update-golden` on a local CPU run, then confirm both CI
+        # platforms; add golden.<os>.txt variants when platforms disagree).
+        #
+        # mode=transcribe runs the real user chain (pull -> transcribe on the
+        # CPU backend -> golden compare). mode=verify covers packs with no
+        # batch transcribe path (pull -> ggml integrity probe only).
+        # strategy: exact | normalized | wer:<threshold> (see compare.py).
+        case:
+          - { name: whisper, ref: "whisper-tiny:q4", mode: transcribe, strategy: exact }
+          - { name: moonshine, ref: "moonshine-tiny:q8", mode: transcribe, strategy: exact }
+          - { name: qwen, ref: "qwen3-asr-0.6b:q4", mode: transcribe, strategy: exact }
+          - { name: sensevoice, ref: "sensevoice-small:q4", mode: transcribe, strategy: exact }
+          - { name: dolphin, ref: "dolphin-cn-dialect-small:q4", mode: transcribe, strategy: exact }
+          - { name: xasr, ref: "xasr-zh-en:q4", mode: transcribe, strategy: exact }
+          - { name: cohere, ref: "cohere-transcribe-03-2026:q4", mode: transcribe, strategy: exact }
+          # Diarization capability packs (pyannote-seg + wespeaker) are
+          # exercised end to end through --diarize on the whisper-tiny pack;
+          # the golden asserts the transcript, not speaker labels.
+          - { name: diarize, ref: "whisper-tiny:q4", mode: diarize, strategy: exact,
+              args: "--extra-pull pyannote-segmentation-3.0:f32 --extra-pull wespeaker-voxceleb-resnet34-lm:f32" }
+          # hymt2 is a translation model with no batch transcribe CLI path;
+          # cover the real pull + pack integrity chain only.
+          - { name: hymt2, ref: "hymt2-1.8b:q4km", mode: verify, strategy: exact }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: openasr-cli-${{ matrix.os }}
+          path: bin
+      - run: chmod +x bin/openasr
+      - name: Restore model pack cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.openasr/models
+          key: openasr-packs-${{ matrix.case.name }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('model-registry/catalog.json') }}
+      - name: Run family regression case
+        run: |
+          tooling/family-regression/run.sh \
+            --case "${{ matrix.case.name }}" \
+            --ref "${{ matrix.case.ref }}" \
+            --mode "${{ matrix.case.mode }}" \
+            --strategy "${{ matrix.case.strategy }}" \
+            --bin bin/openasr \
+            ${{ matrix.case.args || '' }}
+      - name: Upload transcript
+        if: always() && matrix.case.mode != 'verify'
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcript-${{ matrix.case.name }}-${{ matrix.os }}
+          path: tmp/family-regression/
+          if-no-files-found: ignore
+          retention-days: 14
