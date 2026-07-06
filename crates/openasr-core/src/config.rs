@@ -98,6 +98,7 @@ pub enum HistoryRetentionPolicy {
     Last5,
     Week,
     Month,
+    Quarter,
     Year,
 }
 
@@ -105,7 +106,7 @@ impl HistoryRetentionPolicy {
     pub const fn max_entries(self) -> Option<usize> {
         match self {
             Self::Last5 => Some(5),
-            Self::Never | Self::Week | Self::Month | Self::Year => None,
+            Self::Never | Self::Week | Self::Month | Self::Quarter | Self::Year => None,
         }
     }
 
@@ -113,6 +114,7 @@ impl HistoryRetentionPolicy {
         match self {
             Self::Week => Some(7 * 24 * 60 * 60),
             Self::Month => Some(30 * 24 * 60 * 60),
+            Self::Quarter => Some(90 * 24 * 60 * 60),
             Self::Year => Some(365 * 24 * 60 * 60),
             Self::Never | Self::Last5 => None,
         }

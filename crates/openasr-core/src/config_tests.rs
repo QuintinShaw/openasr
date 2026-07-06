@@ -390,3 +390,49 @@ fn default_model_with_catalog_preserves_registry_variant_refs() {
         Some("whisper:candidate")
     );
 }
+
+#[test]
+fn history_retention_policy_wire_strings_and_age_windows() {
+    // Wire contract: snake_case strings consumed by the desktop preferences
+    // client. Adding a variant is additive; renaming any of these breaks it.
+    let cases = [
+        (HistoryRetentionPolicy::Never, "never", None),
+        (HistoryRetentionPolicy::Last5, "last5", None),
+        (HistoryRetentionPolicy::Week, "week", Some(7 * 24 * 60 * 60)),
+        (
+            HistoryRetentionPolicy::Month,
+            "month",
+            Some(30 * 24 * 60 * 60),
+        ),
+        (
+            HistoryRetentionPolicy::Quarter,
+            "quarter",
+            Some(90 * 24 * 60 * 60),
+        ),
+        (
+            HistoryRetentionPolicy::Year,
+            "year",
+            Some(365 * 24 * 60 * 60),
+        ),
+    ];
+    for (policy, wire, max_age_seconds) in cases {
+        assert_eq!(
+            serde_json::to_value(policy).unwrap(),
+            serde_json::Value::String(wire.to_string())
+        );
+        assert_eq!(
+            serde_json::from_value::<HistoryRetentionPolicy>(serde_json::Value::String(
+                wire.to_string()
+            ))
+            .unwrap(),
+            policy
+        );
+        assert_eq!(policy.max_age_seconds(), max_age_seconds);
+    }
+    assert_eq!(
+        HistoryRetentionPolicy::Last5.max_entries(),
+        Some(5),
+        "last5 is the only entry-count policy"
+    );
+    assert_eq!(HistoryRetentionPolicy::Quarter.max_entries(), None);
+}

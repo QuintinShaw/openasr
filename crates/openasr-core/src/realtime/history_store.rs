@@ -739,6 +739,32 @@ mod tests {
     }
 
     #[test]
+    fn daemon_history_store_quarter_retention_prunes_at_the_90_day_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let now = unix_seconds_now();
+        let max_age = crate::config::HistoryRetentionPolicy::Quarter
+            .max_age_seconds()
+            .expect("quarter is an age-based policy");
+        assert_eq!(max_age, 90 * 24 * 60 * 60);
+        let cutoff = now - max_age;
+
+        let beyond = record_history_for_test(&store, "older than 90 days");
+        let exactly = record_history_for_test(&store, "exactly 90 days old");
+        let within = record_history_for_test(&store, "within 90 days");
+        set_history_created_at_for_test(&store, &beyond.id, cutoff - 1);
+        set_history_created_at_for_test(&store, &exactly.id, cutoff);
+        set_history_created_at_for_test(&store, &within.id, cutoff + 1);
+
+        // Strictly-older-than semantics: an entry created exactly at the
+        // cutoff instant survives.
+        assert_eq!(store.delete_older_than(cutoff).unwrap(), 1);
+        assert!(store.get(&beyond.id).unwrap().is_none());
+        assert!(store.get(&exactly.id).unwrap().is_some());
+        assert!(store.get(&within.id).unwrap().is_some());
+    }
+
+    #[test]
     fn daemon_history_store_retains_most_recent_entries() {
         let temp = tempfile::tempdir().unwrap();
         let store = DaemonHistoryStore::open(temp.path());
