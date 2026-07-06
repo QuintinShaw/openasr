@@ -25,6 +25,9 @@ jobs:
     # users tune locally via --features native or OPENASR_GGML_NATIVE=1.
     env:
       OPENASR_GGML_NATIVE: "0"
+      # AMD HIP SDK "PRO Edition" silent-installer release train, matched to
+      # llama.cpp's current Windows HIP release job.
+      HIPSDK_INSTALLER_VERSION: 26.Q1
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +63,20 @@ jobs:
             archive_ext: zip
             features: cuda
             timeout: 180
+            experimental: true
+          # AMD HIP variant. Builds the same "radeon" fat code object
+          # (gfx1030/31/32, gfx1100/01/02, gfx1150/51, gfx1200/01) llama.cpp's
+          # own Windows HIP release job targets, covering RDNA2/3/3.5/4. HIP
+          # is statically linked (build.rs use_backend_dl is false for HIP),
+          # but still dynamically loads the ROCm runtime/BLAS DLLs staged
+          # below, so it cannot launch on this GPU-less, driver-less runner
+          # any more than the CUDA leg can; build + package only.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc-hip
+            binary_name: openasr.exe
+            archive_ext: zip
+            features: hip
+            timeout: 240
             experimental: true
 
     steps:
@@ -102,12 +119,54 @@ jobs:
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\Bin"
 
       - name: Ensure Ninja
-        if: matrix.features == 'vulkan' || matrix.features == 'cuda'
+        if: matrix.features == 'vulkan' || matrix.features == 'cuda' || matrix.features == 'hip'
         shell: pwsh
-        # build.rs configures the Windows Vulkan/CUDA ggml build with -G Ninja.
+        # build.rs configures the Windows Vulkan/CUDA/HIP ggml build with -G Ninja.
         run: |
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y }
           ninja --version
+
+      - name: Cache AMD HIP SDK install
+        if: matrix.features == 'hip'
+        id: cache-hip-sdk
+        uses: actions/cache@v4
+        with:
+          path: C:\Program Files\AMD\ROCm
+          key: hip-sdk-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ runner.os }}
+
+      - name: Install AMD HIP SDK
+        if: matrix.features == 'hip' && steps.cache-hip-sdk.outputs.cache-hit != 'true'
+        shell: pwsh
+        # Same recipe llama.cpp's Windows HIP release job uses (no self-hosted
+        # runner needed): AMD publishes a silent installer for the consumer
+        # "PRO Edition" HIP SDK directly, so a GitHub-hosted windows-latest
+        # runner can provision it like any other toolchain.
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-$env:HIPSDK_INSTALLER_VERSION-Win11-For-HIP.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\rocm-install.exe"
+          $proc = Start-Process "$env:RUNNER_TEMP\rocm-install.exe" -ArgumentList '-install' -NoNewWindow -PassThru
+          if (-not $proc.WaitForExit(600000)) {
+            Write-Error "AMD HIP SDK installation timed out after 10 minutes."
+            $proc.Kill()
+            exit 1
+          }
+          if ($proc.ExitCode -ne 0) {
+            Write-Error "AMD HIP SDK installation failed with exit code $($proc.ExitCode)"
+            exit 1
+          }
+
+      - name: Resolve HIP SDK path
+        if: matrix.features == 'hip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $clang = Get-ChildItem 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | Select-Object -First 1
+          if (-not $clang) { Write-Error "AMD HIP SDK not found under C:\Program Files\AMD\ROCm"; exit 1 }
+          $hipRoot = $clang.Directory.Parent.FullName
+          & $clang.FullName --version
+          Add-Content $env:GITHUB_ENV "HIP_PATH=$hipRoot"
+          Add-Content $env:GITHUB_PATH "$hipRoot\bin"
 
       - name: Install CUDA toolkit
         if: matrix.features == 'cuda'
@@ -154,12 +213,13 @@ jobs:
           ./target/release/openasr --help
           ./target/release/openasr list
 
-      # The CUDA exe import-links nvcuda.dll, which only ships with an NVIDIA
-      # driver, so it cannot launch on this GPU-less runner: build + package
-      # only. The Vulkan exe resolves against the SDK loader installed above,
-      # so it launches and runs CPU paths here.
+      # The CUDA exe import-links nvcuda.dll (NVIDIA driver) and the HIP exe
+      # import-links amdhip64.dll (AMD driver), neither of which this GPU-less
+      # runner has, so those cannot launch here: build + package only. The
+      # Vulkan exe resolves against the SDK loader installed above, so it
+      # launches and runs CPU paths here.
       - name: Smoke release binary
-        if: runner.os == 'Windows' && matrix.features != 'cuda'
+        if: runner.os == 'Windows' && matrix.features != 'cuda' && matrix.features != 'hip'
         shell: pwsh
         run: |
           .\target\release\openasr.exe --version
@@ -230,14 +290,35 @@ jobs:
             if (-not $cudaDlls) { Write-Error "no CUDA runtime DLLs found under $env:CUDA_PATH\bin" }
             $cudaDlls | Copy-Item -Destination "$distDir\"
           }
+          if ("${{ matrix.features }}" -eq "hip") {
+            # The HIP exe dynamically links the ROCm runtime + BLAS; ship AMD's
+            # redistributable DLLs (and rocBLAS's per-arch Tensile "library"
+            # dir it loads at runtime -- omitting it fails at first matmul,
+            # not at launch) so end users only need a GPU driver, not the HIP
+            # SDK. hipBLASLt is optional (only some archs/tunings dispatch to
+            # it); copy it too when the SDK ships it.
+            $hipBin = Join-Path $env:HIP_PATH "bin"
+            $hipDlls = Get-ChildItem $hipBin -File |
+              Where-Object { $_.Name -match '^(amdhip64|libhipblas|rocblas|libhipblaslt)(_\d+)?\.dll$' }
+            if (-not $hipDlls) { Write-Error "no HIP runtime DLLs found under $hipBin" }
+            $hipDlls | Copy-Item -Destination "$distDir\"
+            New-Item -ItemType Directory -Force -Path "$distDir\rocblas\library" | Out-Null
+            Copy-Item (Join-Path $hipBin "rocblas\library\*") "$distDir\rocblas\library\"
+            $hipbltLibrary = Join-Path $hipBin "hipblaslt\library"
+            if (Test-Path $hipbltLibrary) {
+              New-Item -ItemType Directory -Force -Path "$distDir\hipblaslt\library" | Out-Null
+              Copy-Item (Join-Path $hipbltLibrary "*") "$distDir\hipblaslt\library\"
+            }
+          }
           Copy-Item README.md,LICENSE "$distDir\"
           Copy-Item model-registry "$distDir\model-registry" -Recurse
           Copy-Item docs\FAQ.md,docs\KNOWN_LIMITATIONS.md "$distDir\docs\"
           # Smoke the binary from the staged dist dir (NOT target/release,
           # whose build.rs-seeded DLLs would mask a packaging gap), so a broken
-          # archive fails here before it ships. The CUDA exe cannot launch
-          # without an NVIDIA driver, so it is exempt (validated on hardware).
-          if ("${{ matrix.features }}" -ne "cuda") {
+          # archive fails here before it ships. The CUDA/HIP exes cannot
+          # launch without a matching GPU driver, so they are exempt
+          # (validated on hardware).
+          if ("${{ matrix.features }}" -ne "cuda" -and "${{ matrix.features }}" -ne "hip") {
             & "$distDir\${{ matrix.binary_name }}" --version
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
