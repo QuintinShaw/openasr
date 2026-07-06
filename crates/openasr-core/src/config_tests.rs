@@ -104,11 +104,29 @@ fn missing_config_file_returns_default_config_document_preferences() {
     assert_eq!(document.preferences.hotwords, Vec::<String>::new());
     assert_eq!(document.preferences.theme, AppearanceTheme::System);
     assert_eq!(document.preferences.density, AppearanceDensity::Comfortable);
+    // Product default: Option (⌥) alone, push-to-talk on. A fresh install (no
+    // config file) must land on these; the desktop first-launch experience
+    // reads them straight through /v1/config.
     assert_eq!(
         document.preferences.dictation_shortcut.as_deref(),
-        Some("CommandOrControl+Shift+Space")
+        Some("Alt")
     );
+    assert!(document.preferences.push_to_talk);
     assert_eq!(document.preferences.inference_threads, None);
+}
+
+#[test]
+fn preferences_missing_dictation_fields_fall_back_to_product_defaults() {
+    // A config file that omits the dictation trigger fields (e.g. one written by
+    // an older build, or hand-edited) must still deserialize to the product
+    // defaults via the serde field defaults -- not to bool's `false` or `None`.
+    let document: OpenAsrConfigDocument =
+        serde_json::from_str(r#"{ "config": {}, "preferences": { "language": "en" } }"#).unwrap();
+    assert_eq!(
+        document.preferences.dictation_shortcut.as_deref(),
+        Some("Alt")
+    );
+    assert!(document.preferences.push_to_talk);
 }
 
 #[test]
@@ -154,7 +172,6 @@ fn save_and_load_config_document_roundtrip_preserves_preferences() {
             accent_color: Some("#0f766e".to_string()),
             density: AppearanceDensity::Compact,
             push_to_talk: true,
-            onboarded: true,
             inference_threads: Some(4),
             execution_target: ExecutionTarget::Cpu,
             history_retention: HistoryRetentionPolicy::Month,
@@ -388,5 +405,77 @@ fn default_model_with_catalog_preserves_registry_variant_refs() {
     assert_eq!(
         config.get(ConfigKey::DefaultModel).as_deref(),
         Some("whisper:candidate")
+    );
+}
+
+#[test]
+fn history_retention_policy_wire_strings_and_age_windows() {
+    // Wire contract: snake_case strings consumed by the desktop preferences
+    // client. Adding a variant is additive; renaming any of these breaks it.
+    let cases = [
+        (HistoryRetentionPolicy::Off, "off", None),
+        (HistoryRetentionPolicy::Last5, "last5", None),
+        (HistoryRetentionPolicy::Week, "week", Some(7 * 24 * 60 * 60)),
+        (
+            HistoryRetentionPolicy::Month,
+            "month",
+            Some(30 * 24 * 60 * 60),
+        ),
+        (
+            HistoryRetentionPolicy::Quarter,
+            "quarter",
+            Some(90 * 24 * 60 * 60),
+        ),
+        (
+            HistoryRetentionPolicy::Year,
+            "year",
+            Some(365 * 24 * 60 * 60),
+        ),
+        (HistoryRetentionPolicy::Forever, "forever", None),
+    ];
+    for (policy, wire, max_age_seconds) in cases {
+        assert_eq!(
+            serde_json::to_value(policy).unwrap(),
+            serde_json::Value::String(wire.to_string())
+        );
+        assert_eq!(
+            serde_json::from_value::<HistoryRetentionPolicy>(serde_json::Value::String(
+                wire.to_string()
+            ))
+            .unwrap(),
+            policy
+        );
+        assert_eq!(policy.max_age_seconds(), max_age_seconds);
+    }
+    assert_eq!(
+        HistoryRetentionPolicy::Last5.max_entries(),
+        Some(5),
+        "last5 keeps the five most recent entries"
+    );
+    // `Off` keeps zero entries, so switching to it prunes the store empty.
+    assert_eq!(HistoryRetentionPolicy::Off.max_entries(), Some(0));
+    assert!(!HistoryRetentionPolicy::Off.persists_new_entries());
+    // Age- and keep-all policies persist new entries and do not cap the count.
+    assert_eq!(HistoryRetentionPolicy::Quarter.max_entries(), None);
+    assert!(HistoryRetentionPolicy::Quarter.persists_new_entries());
+    assert_eq!(HistoryRetentionPolicy::Forever.max_entries(), None);
+    assert!(HistoryRetentionPolicy::Forever.persists_new_entries());
+    // The default is the five-most-recent policy, not keep-forever.
+    assert_eq!(
+        HistoryRetentionPolicy::default(),
+        HistoryRetentionPolicy::Last5
+    );
+    // 0.1.x configs on disk carry the pre-rename `never` wire value; it must
+    // keep parsing as `Forever` (read-only alias -- we always emit `forever`).
+    assert_eq!(
+        serde_json::from_value::<HistoryRetentionPolicy>(serde_json::Value::String(
+            "never".to_string()
+        ))
+        .unwrap(),
+        HistoryRetentionPolicy::Forever
+    );
+    assert_eq!(
+        serde_json::to_value(HistoryRetentionPolicy::Forever).unwrap(),
+        serde_json::Value::String("forever".to_string())
     );
 }

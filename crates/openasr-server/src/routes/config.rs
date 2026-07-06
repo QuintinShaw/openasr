@@ -47,7 +47,7 @@ fn config_document_from_update_payload(
 
     // The desktop preferences client owns only the nested `preferences` object.
     // Treat preferences-only requests as patches over the stored document so a
-    // narrow update like `{ "preferences": { "onboarded": true } }` cannot
+    // narrow update like `{ "preferences": { "diarize": true } }` cannot
     // reset shortcut, tray, inference, model, or mirror settings to defaults.
     let mut document = load_config_document(home).map_err(ApiError::Config)?;
     merge_preferences_patch(

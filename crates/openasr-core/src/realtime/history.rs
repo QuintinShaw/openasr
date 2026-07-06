@@ -2,9 +2,9 @@
 pub mod history_store;
 
 pub use history_store::{
-    DAEMON_HISTORY_INDEX_VERSION, DaemonHistoryDetail, DaemonHistoryEntry, DaemonHistoryKind,
-    DaemonHistoryProvenance, DaemonHistoryRecord, DaemonHistoryStore, DaemonHistoryStoreError,
-    history_dir,
+    DaemonHistoryDetail, DaemonHistoryEntry, DaemonHistoryKind, DaemonHistoryPage,
+    DaemonHistoryProvenance, DaemonHistoryQuery, DaemonHistoryRecord, DaemonHistoryStore,
+    DaemonHistoryStoreError, history_dir,
 };
 
 include!("history/core.rs");

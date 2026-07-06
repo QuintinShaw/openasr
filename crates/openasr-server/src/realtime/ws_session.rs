@@ -3153,10 +3153,17 @@ impl WsSession {
                 return Err(());
             }
         };
-        // History is opt-in (privacy default): only persist when the user
-        // enabled auto-save (matches the file-transcription path).
+        // History persistence is governed solely by the saved-history scope
+        // (`history_retention`), matching the file-transcription path.
+        // `auto_save` controls transcript-file exports and must not gate
+        // history. "Off" retention is fail-fast: never write a transcript we
+        // would only prune away on the next sweep.
         let document = openasr_core::config::load_config_document(&home).unwrap_or_default();
-        if !document.preferences.auto_save {
+        if !document
+            .preferences
+            .history_retention
+            .persists_new_entries()
+        {
             return Ok(());
         }
         let text = self.history_text.join("\n").trim().to_string();
@@ -3178,7 +3185,7 @@ impl WsSession {
             duration_seconds: Some(self.history_duration_ms as f32 / 1000.0),
             output_format: Some(ResponseFormat::Text),
             diarization_active: Some(self.streaming_diarizer.is_some()),
-            provenance: Some(DaemonHistoryProvenance::AutoSaved),
+            provenance: Some(DaemonHistoryProvenance::Recorded),
             formats: vec!["text".to_string()],
             text,
         }) {

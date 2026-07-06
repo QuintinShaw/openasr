@@ -249,8 +249,9 @@ Key constraints:
 - Phrase-bias / hotword fields are request-validated; unsupported backends return
   an explicit error rather than ignoring them.
 - `serve` runs a single model (the launched pack); restart to switch. Transcription
-  history is opt-in (off by default) and only recorded when the `auto_save`
-  preference is enabled. See [SECURITY](SECURITY.md) for what's stored.
+  history is local-only and governed by the `history_retention` preference
+  (default keeps the last 5 entries; `off` disables it). See
+  [SECURITY](SECURITY.md) for what's stored.
 
 Non-loopback binds are rejected unless launched with HTTPS/WSS and pairing auth:
 

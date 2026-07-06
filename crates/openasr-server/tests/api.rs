@@ -604,10 +604,10 @@ async fn config_endpoint_roundtrips_versioned_preferences() {
         document["preferences"]["version"],
         openasr_core::config::PREFERENCES_SCHEMA_VERSION
     );
-    assert_eq!(
-        document["preferences"]["dictation_shortcut"],
-        "CommandOrControl+Shift+Space"
-    );
+    // Fresh-config product defaults surfaced to the desktop: Option (⌥) alone,
+    // push-to-talk on. These are what a cleared-state first launch shows.
+    assert_eq!(document["preferences"]["dictation_shortcut"], "Alt");
+    assert_eq!(document["preferences"]["push_to_talk"], true);
     assert_eq!(document["preferences"]["word_timestamps"], false);
 
     document["preferences"]["language"] = serde_json::json!("en");
@@ -619,7 +619,6 @@ async fn config_endpoint_roundtrips_versioned_preferences() {
     document["preferences"]["theme"] = serde_json::json!("dark");
     document["preferences"]["density"] = serde_json::json!("compact");
     document["preferences"]["push_to_talk"] = serde_json::json!(true);
-    document["preferences"]["onboarded"] = serde_json::json!(true);
     document["preferences"]["inference_threads"] = serde_json::json!(2);
 
     let response = app
@@ -782,7 +781,6 @@ async fn preferences_only_put_merges_partial_preferences() {
             "tray_icon": false,
             "dictation_shortcut": "Alt",
             "push_to_talk": true,
-            "onboarded": false,
             "inference_threads": 8,
             "theme": "dark",
             "accent_color": "#2fa663",
@@ -810,7 +808,7 @@ async fn preferences_only_put_merges_partial_preferences() {
                 .uri("/v1/config")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    serde_json::json!({ "preferences": { "onboarded": true } }).to_string(),
+                    serde_json::json!({ "preferences": { "diarize": true } }).to_string(),
                 ))
                 .unwrap(),
         )
@@ -819,7 +817,7 @@ async fn preferences_only_put_merges_partial_preferences() {
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
     let after: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(after["preferences"]["onboarded"], true);
+    assert_eq!(after["preferences"]["diarize"], true);
     assert_eq!(after["preferences"]["language"], "zh-CN");
     assert_eq!(after["preferences"]["auto_save"], true);
     assert_eq!(after["preferences"]["tray_icon"], false);
@@ -832,7 +830,7 @@ async fn preferences_only_put_merges_partial_preferences() {
 
     let file: Value =
         serde_json::from_slice(&std::fs::read(home.join("config.json")).unwrap()).unwrap();
-    assert_eq!(file["preferences"]["onboarded"], true);
+    assert_eq!(file["preferences"]["diarize"], true);
     assert_eq!(file["preferences"]["dictation_shortcut"], "Alt");
 }
 
@@ -2906,31 +2904,39 @@ async fn transcriptions_accept_word_timestamp_granularity_for_json() {
     assert_eq!(words.last().unwrap()["end"], 2.5);
 }
 
-/// Writes a config with auto-save on at `<temp>/home`, so the server records
-/// history (opt-in, off by default).
+/// Writes a config with auto-save off and last5 retention at `<temp>/home`,
+/// locking in that history recording is governed by `history_retention` alone
+/// (auto_save only controls transcript-file exports).
 fn enable_history(temp: &tempfile::TempDir) {
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(
         home.join("config.json"),
-        serde_json::json!({ "preferences": { "auto_save": true } }).to_string(),
+        serde_json::json!({
+            "preferences": { "auto_save": false, "history_retention": "last5" }
+        })
+        .to_string(),
     )
     .unwrap();
 }
 
 #[tokio::test]
-async fn transcriptions_record_file_history_with_text_sidecar() {
+async fn transcriptions_record_file_history_in_sqlite_store() {
     let temp = tempfile::tempdir().unwrap();
     let distribution = openasr_server::DistributionRuntime {
         openasr_home: Some(temp.path().join("home")),
         catalog_url: None,
     };
     let home = distribution.openasr_home.as_ref().unwrap().clone();
-    // History is opt-in: enable auto-save so the server records.
+    // History recording is governed by history_retention alone; auto_save
+    // stays false to lock in that it does not gate history.
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(
         home.join("config.json"),
-        serde_json::json!({ "preferences": { "auto_save": true } }).to_string(),
+        serde_json::json!({
+            "preferences": { "auto_save": false, "history_retention": "last5" }
+        })
+        .to_string(),
     )
     .unwrap();
     let app = openasr_server::app_with_runtime_and_distribution(
@@ -2987,15 +2993,13 @@ async fn transcriptions_record_file_history_with_text_sidecar() {
     assert!(entry["duration_seconds"].as_f64().is_some());
     assert_eq!(entry["output_format"], "srt");
     assert_eq!(entry["diarization_active"], false);
-    assert_eq!(entry["provenance"], "auto_saved");
+    assert_eq!(entry["provenance"], "recorded");
     assert!(entry["preview"].as_str().unwrap().contains("OpenASR mock"));
-    // The internal sidecar path must not leak into the wire contract; it is
-    // derivable from the entry id under the daemon-owned history directory.
+    // Transcript text lives in the SQLite row, not a filesystem sidecar; it
+    // must not leak a path into the wire contract.
     assert!(entry.get("text_path").is_none());
-    let text_path = home.join("history").join("texts").join(format!("{id}.txt"));
-    assert!(text_path.starts_with(home.join("history")));
-    assert!(text_path.exists());
-    assert!(home.join("history").join("index.json").exists());
+    let history_db = home.join("history").join("history.db");
+    assert!(history_db.exists());
 
     let response = app
         .clone()
@@ -3015,7 +3019,7 @@ async fn transcriptions_record_file_history_with_text_sidecar() {
     assert!(detail["response_format"].is_null());
     assert_eq!(detail["output_format"], "srt");
     assert_eq!(detail["diarization_active"], false);
-    assert_eq!(detail["provenance"], "auto_saved");
+    assert_eq!(detail["provenance"], "recorded");
     assert!(
         detail["text"]
             .as_str()
@@ -3035,7 +3039,6 @@ async fn transcriptions_record_file_history_with_text_sidecar() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(!text_path.exists());
 
     let response = app
         .oneshot(
@@ -3049,6 +3052,234 @@ async fn transcriptions_record_file_history_with_text_sidecar() {
     let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
     let parsed: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(parsed["data"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn transcriptions_skip_file_history_when_retention_off() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    // Even with auto_save enabled, "off" retention must skip the write:
+    // history_retention is the only history switch.
+    std::fs::write(
+        home.join("config.json"),
+        serde_json::json!({
+            "preferences": { "auto_save": true, "history_retention": "off" }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+        },
+    );
+
+    let response = app
+        .clone()
+        .oneshot(multipart_request(
+            "whisper-large-v3-turbo",
+            "sample.wav",
+            b"not a real wav",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["data"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn history_list_supports_search_pagination_and_kind_filter() {
+    use openasr_core::realtime::history::{
+        DaemonHistoryKind, DaemonHistoryRecord, DaemonHistoryStore,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    enable_history(&temp);
+    let home = temp.path().join("home");
+    let store = DaemonHistoryStore::open(&home);
+    let record = |kind: DaemonHistoryKind, source: &str, text: &str| DaemonHistoryRecord {
+        kind,
+        model: "whisper-large-v3-turbo".to_string(),
+        source_name: Some(source.to_string()),
+        duration_seconds: None,
+        output_format: Some(ResponseFormat::Text),
+        diarization_active: Some(false),
+        provenance: None,
+        formats: vec!["text".to_string()],
+        text: text.to_string(),
+    };
+    let oldest = store
+        .record(record(
+            DaemonHistoryKind::File,
+            "notes.wav",
+            "english meeting notes",
+        ))
+        .unwrap();
+    let middle = store
+        .record(record(
+            DaemonHistoryKind::Live,
+            "live-zh",
+            "我们讨论了历史记录",
+        ))
+        .unwrap();
+    let newest = store
+        .record(record(
+            DaemonHistoryKind::Live,
+            "live-en",
+            "quick live note",
+        ))
+        .unwrap();
+
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+        },
+    );
+    let list = |uri: String| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+        }
+    };
+
+    // Default listing: newest first, additive pagination metadata present.
+    let (status, parsed) = list("/v1/history".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parsed["object"], "list");
+    assert_eq!(parsed["total"], 3);
+    assert_eq!(parsed["limit"], 50);
+    assert_eq!(parsed["offset"], 0);
+    let ids: Vec<&str> = parsed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![&newest.id, &middle.id, &oldest.id]);
+
+    // FTS search must handle CJK substrings (trigram tokenizer, not unicode61).
+    let (status, parsed) = list("/v1/history?search=%E5%8E%86%E5%8F%B2".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parsed["total"], 1);
+    assert_eq!(parsed["data"][0]["id"], middle.id.as_str());
+
+    // Search also covers source_name and model, and misses return empty pages.
+    let (status, parsed) = list("/v1/history?search=notes.wav".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parsed["total"], 1);
+    assert_eq!(parsed["data"][0]["id"], oldest.id.as_str());
+    let (_, parsed) = list("/v1/history?search=nonexistent-token".to_string()).await;
+    assert_eq!(parsed["total"], 0);
+    assert_eq!(parsed["data"].as_array().unwrap().len(), 0);
+
+    // Kind filter.
+    let (status, parsed) = list("/v1/history?kind=live".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parsed["total"], 2);
+    for entry in parsed["data"].as_array().unwrap() {
+        assert_eq!(entry["kind"], "live");
+    }
+    let (status, _) = list("/v1/history?kind=dictation".to_string()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Pagination: stable newest-first order across pages, total unaffected.
+    let (status, parsed) = list("/v1/history?limit=2&offset=0".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parsed["total"], 3);
+    assert_eq!(parsed["limit"], 2);
+    assert_eq!(parsed["offset"], 0);
+    let page_one: Vec<&str> = parsed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(page_one, vec![&newest.id, &middle.id]);
+    let (_, parsed) = list("/v1/history?limit=2&offset=2".to_string()).await;
+    assert_eq!(parsed["total"], 3);
+    assert_eq!(parsed["offset"], 2);
+    let page_two: Vec<&str> = parsed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(page_two, vec![&oldest.id]);
+
+    // Combined search + kind filter.
+    let (status, parsed) = list("/v1/history?search=live&kind=live".to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parsed["total"], 2);
+}
+
+#[tokio::test]
+async fn history_routes_report_errors_for_corrupt_database_without_crashing() {
+    let temp = tempfile::tempdir().unwrap();
+    enable_history(&temp);
+    let home = temp.path().join("home");
+    let history_dir = home.join("history");
+    std::fs::create_dir_all(&history_dir).unwrap();
+    std::fs::write(history_dir.join("history.db"), b"not a sqlite database").unwrap();
+
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+        },
+    );
+
+    // History endpoints answer with a structured error instead of taking the
+    // daemon down.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("history")
+    );
+
+    // Transcription (the daemon's main job) still succeeds; the failed
+    // best-effort history side-write must not fail the request.
+    let request = multipart_request("whisper-large-v3-turbo", "sample.wav", b"not a real wav");
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
