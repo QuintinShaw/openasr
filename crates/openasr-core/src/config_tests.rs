@@ -395,7 +395,7 @@ fn history_retention_policy_wire_strings_and_age_windows() {
     // Wire contract: snake_case strings consumed by the desktop preferences
     // client. Adding a variant is additive; renaming any of these breaks it.
     let cases = [
-        (HistoryRetentionPolicy::Never, "never", None),
+        (HistoryRetentionPolicy::Off, "off", None),
         (HistoryRetentionPolicy::Last5, "last5", None),
         (HistoryRetentionPolicy::Week, "week", Some(7 * 24 * 60 * 60)),
         (
@@ -413,6 +413,7 @@ fn history_retention_policy_wire_strings_and_age_windows() {
             "year",
             Some(365 * 24 * 60 * 60),
         ),
+        (HistoryRetentionPolicy::Forever, "forever", None),
     ];
     for (policy, wire, max_age_seconds) in cases {
         assert_eq!(
@@ -431,7 +432,19 @@ fn history_retention_policy_wire_strings_and_age_windows() {
     assert_eq!(
         HistoryRetentionPolicy::Last5.max_entries(),
         Some(5),
-        "last5 is the only entry-count policy"
+        "last5 keeps the five most recent entries"
     );
+    // `Off` keeps zero entries, so switching to it prunes the store empty.
+    assert_eq!(HistoryRetentionPolicy::Off.max_entries(), Some(0));
+    assert!(!HistoryRetentionPolicy::Off.persists_new_entries());
+    // Age- and keep-all policies persist new entries and do not cap the count.
     assert_eq!(HistoryRetentionPolicy::Quarter.max_entries(), None);
+    assert!(HistoryRetentionPolicy::Quarter.persists_new_entries());
+    assert_eq!(HistoryRetentionPolicy::Forever.max_entries(), None);
+    assert!(HistoryRetentionPolicy::Forever.persists_new_entries());
+    // The default is the five-most-recent policy, not keep-forever.
+    assert_eq!(
+        HistoryRetentionPolicy::default(),
+        HistoryRetentionPolicy::Last5
+    );
 }

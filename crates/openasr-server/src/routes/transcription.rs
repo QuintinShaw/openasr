@@ -185,6 +185,15 @@ pub(crate) fn record_file_transcription_history(
     if !document.preferences.auto_save {
         return Ok(());
     }
+    // "Off" retention is fail-fast: never write a transcript we would only
+    // prune away on the next sweep.
+    if !document
+        .preferences
+        .history_retention
+        .persists_new_entries()
+    {
+        return Ok(());
+    }
     let store = DaemonHistoryStore::open(&home);
     store
         .record(DaemonHistoryRecord {

@@ -88,23 +88,41 @@ pub struct Preferences {
     pub idle_unload: IdleUnloadPolicy,
 }
 
+/// How much dictation/transcription history to keep on disk.
+///
+/// This models "which saved history to keep", not "when to auto-clean":
+/// - `Off` does not persist new entries at all (fail-fast: nothing is written,
+///   and a switch to `Off` prunes everything already stored).
+/// - `Last5` keeps only the five most recent entries (the default).
+/// - `Week`/`Month`/`Quarter`/`Year` keep entries newer than the age window.
+/// - `Forever` keeps everything, permanently.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryRetentionPolicy {
+    Off,
     #[default]
-    Never,
     Last5,
     Week,
     Month,
     Quarter,
     Year,
+    Forever,
 }
 
 impl HistoryRetentionPolicy {
+    /// Whether new history entries should be written at all. `Off` is
+    /// fail-fast: callers skip the write instead of persisting then pruning.
+    pub const fn persists_new_entries(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
     pub const fn max_entries(self) -> Option<usize> {
         match self {
+            // `Off` keeps zero entries, so a switch to it clears the store on
+            // the next prune even though new writes are already skipped.
+            Self::Off => Some(0),
             Self::Last5 => Some(5),
-            Self::Never | Self::Week | Self::Month | Self::Quarter | Self::Year => None,
+            Self::Week | Self::Month | Self::Quarter | Self::Year | Self::Forever => None,
         }
     }
 
@@ -114,7 +132,7 @@ impl HistoryRetentionPolicy {
             Self::Month => Some(30 * 24 * 60 * 60),
             Self::Quarter => Some(90 * 24 * 60 * 60),
             Self::Year => Some(365 * 24 * 60 * 60),
-            Self::Never | Self::Last5 => None,
+            Self::Off | Self::Last5 | Self::Forever => None,
         }
     }
 }
@@ -279,7 +297,7 @@ impl Default for Preferences {
             inference_threads: None,
             quant_preference: QuantPreference::Auto,
             execution_target: ExecutionTarget::Auto,
-            history_retention: HistoryRetentionPolicy::Never,
+            history_retention: HistoryRetentionPolicy::Last5,
             idle_unload: IdleUnloadPolicy::Never,
         }
     }

@@ -3159,6 +3159,15 @@ impl WsSession {
         if !document.preferences.auto_save {
             return Ok(());
         }
+        // "Off" retention is fail-fast: never write a transcript we would only
+        // prune away on the next sweep.
+        if !document
+            .preferences
+            .history_retention
+            .persists_new_entries()
+        {
+            return Ok(());
+        }
         let text = self.history_text.join("\n").trim().to_string();
         if text.is_empty() {
             return Ok(());

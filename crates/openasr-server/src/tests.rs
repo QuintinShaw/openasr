@@ -1021,6 +1021,55 @@ fn history_retention_last5_prunes_store() {
 }
 
 #[test]
+fn history_retention_off_prunes_store_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = DaemonHistoryStore::open(temp.path());
+    for index in 0..3 {
+        store
+            .record(DaemonHistoryRecord {
+                kind: DaemonHistoryKind::File,
+                model: "whisper-large-v3-turbo".to_string(),
+                source_name: Some(format!("sample-{index}.wav")),
+                duration_seconds: None,
+                output_format: Some(ResponseFormat::Text),
+                diarization_active: Some(false),
+                provenance: Some(DaemonHistoryProvenance::AutoSaved),
+                formats: vec!["text".to_string()],
+                text: format!("transcript {index}"),
+            })
+            .unwrap();
+    }
+
+    // Switching to "Off" clears everything already stored, even though new
+    // writes are skipped upstream at the record sites.
+    assert_eq!(
+        prune_history_store(&store, HistoryRetentionPolicy::Off).unwrap(),
+        3
+    );
+    assert!(store.list().unwrap().is_empty());
+
+    // "Forever" is the keep-all policy: it never prunes.
+    let entry = store
+        .record(DaemonHistoryRecord {
+            kind: DaemonHistoryKind::File,
+            model: "whisper-large-v3-turbo".to_string(),
+            source_name: Some("kept.wav".to_string()),
+            duration_seconds: None,
+            output_format: Some(ResponseFormat::Text),
+            diarization_active: Some(false),
+            provenance: Some(DaemonHistoryProvenance::AutoSaved),
+            formats: vec!["text".to_string()],
+            text: "keep me".to_string(),
+        })
+        .unwrap();
+    assert_eq!(
+        prune_history_store(&store, HistoryRetentionPolicy::Forever).unwrap(),
+        0
+    );
+    assert!(store.get(&entry.id).unwrap().is_some());
+}
+
+#[test]
 fn realtime_capabilities_for_native_runtime_come_from_model_pack() {
     let temp = tempfile::tempdir().unwrap();
     let pack_root = temp.path().join("server-pack.oasr");
