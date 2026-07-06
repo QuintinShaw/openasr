@@ -41,10 +41,11 @@ use crate::models::phrase_bias_decode::TokenPhraseBias;
 const CTC_PREFIX_BEAM_WIDTH: usize = 8;
 
 /// How many top acoustic tokens each frame contributes as expansion candidates.
-/// The full hotword token set is ALWAYS a candidate on top of this (so a hotword
-/// continuation is explorable even when its acoustic rank is low), so this only
-/// has to cover the ordinary competing labels; 8 keeps the frame work bounded on
-/// large vocabularies (sensevoice ~25k) while never dropping a plausible label.
+/// Acoustically-plausible hotword edge tokens are added on top of this (see
+/// [`frame_candidate_tokens`]), so a hotword continuation is explorable even when
+/// its acoustic rank is low; this only has to cover the ordinary competing labels.
+/// 8 keeps the frame work bounded on large vocabularies (sensevoice ~25k) while
+/// never dropping a plausible label.
 const CTC_ACOUSTIC_CANDIDATE_TOP_K: usize = 8;
 
 /// Aho-Corasick context graph over hotword token-id sequences.
@@ -60,8 +61,9 @@ pub(crate) struct CtcContextGraph {
     fail: Vec<usize>,
     node_score: Vec<f32>,
     output_score: Vec<f32>,
-    /// Every token id that labels an edge anywhere in the graph -- the tokens a
-    /// beam must always be allowed to explore regardless of acoustic rank.
+    /// Every token id that labels an edge anywhere in the graph -- the hotword
+    /// tokens a beam is allowed to explore beyond the acoustic top-K, subject to
+    /// the per-frame plausibility filter in [`frame_candidate_tokens`].
     edge_tokens: Vec<u32>,
 }
 
