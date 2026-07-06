@@ -140,6 +140,13 @@ fn main() {
         .arg("-B")
         .arg(&build_dir)
         .arg("-DCMAKE_BUILD_TYPE=Release")
+        // ggml's static archives are linked into a Rust binary that is PIE by
+        // default on Linux. Host gcc/clang compile PIC anyway, but the ROCm
+        // and CUDA device-host compilers do not (amdclang++ emits non-PIC
+        // .eh_frame relocations that fail the final rust-lld link with
+        // "relocation R_X86_64_32 cannot be used against local symbol").
+        // Forcing PIC on is correct everywhere and required there.
+        .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON")
         .arg(cmake_flag("BUILD_SHARED_LIBS", use_backend_dl))
         .arg(cmake_flag("GGML_BACKEND_DL", use_backend_dl))
         .arg(cmake_flag("GGML_CPU_ALL_VARIANTS", use_backend_dl))

@@ -244,8 +244,23 @@ jobs:
         if: runner.os == 'Windows' && matrix.features == 'hip'
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Install CUDA toolkit
-        if: matrix.features == 'cuda'
+      - name: Install CUDA toolkit (Linux)
+        if: runner.os == 'Linux' && matrix.features == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "13.2.0"
+          method: network
+          # The Linux apt repo splits CUDA 13 differently from the Windows
+          # silent installer: nvvm is folded into cuda-nvcc, the CUB/Thrust
+          # headers live in cuda-cccl, cuBLAS is a lib* package (installed
+          # via non-cuda-sub-packages below), and the libcuda.so driver stub
+          # ggml-cuda's VMM path links against comes from cuda-driver-dev.
+          sub-packages: '["nvcc", "crt", "cudart", "cudart-dev", "cccl", "driver-dev"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+          use-github-cache: true
+
+      - name: Install CUDA toolkit (Windows)
+        if: runner.os == 'Windows' && matrix.features == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           # 13.x is the first CUDA line whose host_config.h accepts the VS
