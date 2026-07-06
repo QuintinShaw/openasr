@@ -3185,7 +3185,7 @@ impl WsSession {
             duration_seconds: Some(self.history_duration_ms as f32 / 1000.0),
             output_format: Some(ResponseFormat::Text),
             diarization_active: Some(self.streaming_diarizer.is_some()),
-            provenance: Some(DaemonHistoryProvenance::AutoSaved),
+            provenance: Some(DaemonHistoryProvenance::Recorded),
             formats: vec!["text".to_string()],
             text,
         }) {

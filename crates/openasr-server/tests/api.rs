@@ -2993,7 +2993,7 @@ async fn transcriptions_record_file_history_in_sqlite_store() {
     assert!(entry["duration_seconds"].as_f64().is_some());
     assert_eq!(entry["output_format"], "srt");
     assert_eq!(entry["diarization_active"], false);
-    assert_eq!(entry["provenance"], "auto_saved");
+    assert_eq!(entry["provenance"], "recorded");
     assert!(entry["preview"].as_str().unwrap().contains("OpenASR mock"));
     // Transcript text lives in the SQLite row, not a filesystem sidecar; it
     // must not leak a path into the wire contract.
@@ -3019,7 +3019,7 @@ async fn transcriptions_record_file_history_in_sqlite_store() {
     assert!(detail["response_format"].is_null());
     assert_eq!(detail["output_format"], "srt");
     assert_eq!(detail["diarization_active"], false);
-    assert_eq!(detail["provenance"], "auto_saved");
+    assert_eq!(detail["provenance"], "recorded");
     assert!(
         detail["text"]
             .as_str()

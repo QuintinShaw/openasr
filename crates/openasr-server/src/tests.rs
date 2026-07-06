@@ -973,7 +973,7 @@ fn record_file_transcription_history_round_trips_structured_metadata() {
     assert_eq!(entries[0].diarization_active, Some(true));
     assert_eq!(
         entries[0].provenance,
-        Some(DaemonHistoryProvenance::AutoSaved)
+        Some(DaemonHistoryProvenance::Recorded)
     );
 
     let detail = store.get(&entries[0].id).unwrap().unwrap();
@@ -982,7 +982,7 @@ fn record_file_transcription_history_round_trips_structured_metadata() {
     assert_eq!(detail.entry.diarization_active, Some(true));
     assert_eq!(
         detail.entry.provenance,
-        Some(DaemonHistoryProvenance::AutoSaved)
+        Some(DaemonHistoryProvenance::Recorded)
     );
 }
 
@@ -1033,7 +1033,7 @@ fn history_retention_last5_prunes_store() {
                 duration_seconds: None,
                 output_format: Some(ResponseFormat::Text),
                 diarization_active: Some(false),
-                provenance: Some(DaemonHistoryProvenance::AutoSaved),
+                provenance: Some(DaemonHistoryProvenance::Recorded),
                 formats: vec!["text".to_string()],
                 text: format!("transcript {index}"),
             })
@@ -1072,7 +1072,7 @@ fn history_retention_off_prunes_store_empty() {
                 duration_seconds: None,
                 output_format: Some(ResponseFormat::Text),
                 diarization_active: Some(false),
-                provenance: Some(DaemonHistoryProvenance::AutoSaved),
+                provenance: Some(DaemonHistoryProvenance::Recorded),
                 formats: vec!["text".to_string()],
                 text: format!("transcript {index}"),
             })
@@ -1096,7 +1096,7 @@ fn history_retention_off_prunes_store_empty() {
             duration_seconds: None,
             output_format: Some(ResponseFormat::Text),
             diarization_active: Some(false),
-            provenance: Some(DaemonHistoryProvenance::AutoSaved),
+            provenance: Some(DaemonHistoryProvenance::Recorded),
             formats: vec!["text".to_string()],
             text: "keep me".to_string(),
         })

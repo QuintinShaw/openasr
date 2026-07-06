@@ -206,7 +206,7 @@ pub(crate) fn record_file_transcription_history(
             duration_seconds: transcription_duration_seconds(transcription),
             output_format: Some(output_format),
             diarization_active: Some(request.diarize),
-            provenance: Some(DaemonHistoryProvenance::AutoSaved),
+            provenance: Some(DaemonHistoryProvenance::Recorded),
             formats: ResponseFormat::ALL
                 .iter()
                 .map(|format| (*format).to_string())

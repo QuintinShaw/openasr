@@ -85,21 +85,21 @@ impl DaemonHistoryKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DaemonHistoryProvenance {
-    AutoSaved,
+    Recorded,
     UserInitiated,
 }
 
 impl DaemonHistoryProvenance {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::AutoSaved => "auto_saved",
+            Self::Recorded => "recorded",
             Self::UserInitiated => "user_initiated",
         }
     }
 
     fn parse(value: &str) -> Option<Self> {
         match value {
-            "auto_saved" => Some(Self::AutoSaved),
+            "recorded" => Some(Self::Recorded),
             "user_initiated" => Some(Self::UserInitiated),
             _ => None,
         }
@@ -657,7 +657,7 @@ mod tests {
                 duration_seconds: Some(2.5),
                 output_format: Some(ResponseFormat::Srt),
                 diarization_active: Some(true),
-                provenance: Some(DaemonHistoryProvenance::AutoSaved),
+                provenance: Some(DaemonHistoryProvenance::Recorded),
                 formats: vec!["json".to_string()],
                 text: "hello OpenASR history".to_string(),
             })
@@ -669,7 +669,7 @@ mod tests {
         assert_eq!(entries[0].diarization_active, Some(true));
         assert_eq!(
             entries[0].provenance,
-            Some(DaemonHistoryProvenance::AutoSaved)
+            Some(DaemonHistoryProvenance::Recorded)
         );
         let detail = store.get(&entry.id).unwrap().unwrap();
         assert_eq!(detail.text, "hello OpenASR history");
@@ -677,7 +677,7 @@ mod tests {
         assert_eq!(detail.entry.diarization_active, Some(true));
         assert_eq!(
             detail.entry.provenance,
-            Some(DaemonHistoryProvenance::AutoSaved)
+            Some(DaemonHistoryProvenance::Recorded)
         );
 
         assert!(store.delete(&entry.id).unwrap());
@@ -703,7 +703,7 @@ mod tests {
                         duration_seconds: Some(index as f32),
                         output_format: Some(ResponseFormat::Text),
                         diarization_active: Some(false),
-                        provenance: Some(DaemonHistoryProvenance::AutoSaved),
+                        provenance: Some(DaemonHistoryProvenance::Recorded),
                         formats: vec!["text".to_string()],
                         text: format!("hello from session {index}"),
                     })
@@ -800,7 +800,7 @@ mod tests {
             duration_seconds: Some(2.5),
             output_format: Some(ResponseFormat::Text),
             diarization_active: Some(false),
-            provenance: Some(DaemonHistoryProvenance::AutoSaved),
+            provenance: Some(DaemonHistoryProvenance::Recorded),
             formats: vec!["text".to_string()],
             preview: "hello".to_string(),
         };
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(value["duration_seconds"], 2.5);
         assert_eq!(value["output_format"], "text");
         assert_eq!(value["diarization_active"], false);
-        assert_eq!(value["provenance"], "auto_saved");
+        assert_eq!(value["provenance"], "recorded");
         assert_eq!(value["text"], "hello world");
         assert!(value.get("response_format").is_none());
         assert!(value.get("text_path").is_none());
@@ -1035,7 +1035,7 @@ mod tests {
                 duration_seconds: None,
                 output_format: Some(ResponseFormat::Text),
                 diarization_active: Some(false),
-                provenance: Some(DaemonHistoryProvenance::AutoSaved),
+                provenance: Some(DaemonHistoryProvenance::Recorded),
                 formats: vec!["text".to_string()],
                 text: text.to_string(),
             })

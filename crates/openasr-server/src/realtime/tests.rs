@@ -3764,7 +3764,7 @@ async fn finish_records_completed_websocket_session_history() {
     assert_eq!(entries[0].diarization_active, Some(false));
     assert_eq!(
         entries[0].provenance,
-        Some(DaemonHistoryProvenance::AutoSaved)
+        Some(DaemonHistoryProvenance::Recorded)
     );
     let detail = store.get(&entries[0].id).unwrap().unwrap();
     assert_eq!(detail.text, "hello\nworld");
@@ -3772,7 +3772,7 @@ async fn finish_records_completed_websocket_session_history() {
     assert_eq!(detail.entry.diarization_active, Some(false));
     assert_eq!(
         detail.entry.provenance,
-        Some(DaemonHistoryProvenance::AutoSaved)
+        Some(DaemonHistoryProvenance::Recorded)
     );
 }
 
