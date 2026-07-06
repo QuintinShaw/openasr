@@ -119,14 +119,17 @@ jobs:
           # sub-package: the build uses the Ninja generator (build.rs).
           cuda: "13.2.0"
           method: network
-          # nvcc+cublas(+dev) for the ggml-cuda build, crt for the compiler
-          # front-end headers (include/crt/host_config.h ships separately in
-          # CUDA 13), cudart for the runtime DLLs shipped in the archive,
-          # thrust for the CUB/CCCL headers ggml-cuda's sort/scan kernels use
-          # (still named thrust_13.x in the Windows silent installer; an
-          # unknown name fails the installer with exit code 3772776473).
-          # Network subset keeps this ~GBs smaller than the full installer.
-          sub-packages: '["nvcc", "crt", "cudart", "cublas", "cublas_dev", "thrust"]'
+          # CUDA 13 splits the compiler across sub-packages: nvcc is only the
+          # driver, crt carries the front-end headers (include/crt/*), and
+          # nvvm carries the cicc device compiler nvcc dispatches to (missing
+          # nvvm fails with an unexpanded %CICC_PATH%). cudart supplies the
+          # runtime DLLs shipped in the archive, cublas(+dev) the GEMM
+          # library, thrust the CUB/CCCL headers ggml-cuda's sort/scan
+          # kernels use (still named thrust_13.x in the Windows silent
+          # installer; an unknown name fails the installer with exit code
+          # 3772776473). Network subset keeps this ~GBs smaller than the
+          # full installer.
+          sub-packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "thrust"]'
           use-github-cache: true
 
       - name: Install Rust toolchain
