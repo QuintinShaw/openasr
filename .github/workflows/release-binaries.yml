@@ -108,13 +108,17 @@ jobs:
         if: matrix.features == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: "12.8.1"
+          # 13.x is the first CUDA line whose host_config.h accepts the VS
+          # 2026 (MSVC 19.5x) toolset on windows-latest; 12.x rejects it with
+          # "unsupported Microsoft Visual Studio version". No VS-integration
+          # sub-package: the build uses the Ninja generator (build.rs).
+          cuda: "13.2.0"
           method: network
           # nvcc+cublas(+dev) for the ggml-cuda build, cudart for the runtime
-          # DLLs shipped in the archive, visual_studio_integration for the VS
-          # generator cmake uses on Windows. Network subset keeps this ~GBs
-          # smaller than the full local installer.
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+          # DLLs shipped in the archive, cccl for the CUB headers ggml-cuda's
+          # sort/scan kernels use. Network subset keeps this ~GBs smaller than
+          # the full local installer.
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cccl"]'
           use-github-cache: true
 
       - name: Install Rust toolchain
