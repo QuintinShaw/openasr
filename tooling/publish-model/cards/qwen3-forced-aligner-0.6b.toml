@@ -1,0 +1,102 @@
+# Per-model card prose for openasr/qwen3-forced-aligner-0.6b. Distilled
+# (paraphrased, not copied) from the upstream Qwen/Qwen3-ForcedAligner-0.6B
+# model card. Claims are kept to what the upstream repo and architecture
+# state; re-verify against the upstream card when the upstream weights
+# change.
+#
+# STAGING NOTE (not public): this is a NEW capability-pack catalog entry --
+# there is no prior public listing for this model. Published to a PRIVATE HF
+# repo only; the catalog entry stays public:false until a deliberate later
+# --public flip.
+
+tagline = "Word-level forced alignment for OpenASR transcripts -- a non-autoregressive Qwen3 audio+text model that refines per-word timestamps"
+tagline_zh = "为 OpenASR 转写结果提供词级强制对齐 — 非自回归的 Qwen3 音频+文本模型，用于精修逐词时间戳"
+
+highlights = [
+  "🎯 **Refined word timestamps** — consumes a finished transcript's text plus the source audio and replaces a model family's own approximate per-word timestamps with aligner-refined spans (`--word-timestamps=aligned`)",
+  "⚡ **Non-autoregressive** — a single forward pass over interleaved audio/text with argmax at `<timestamp>` positions (5000 80ms-wide bins), not incremental greedy decoding, so it is not dispatched through the qwen3-asr runtime",
+  "🧩 **Shares its backbone with Qwen3-ASR** — the same audio-encoder + LM `thinker` tensor layout, byte-for-byte; only the final head differs (an independent 5000-way classification head instead of the tied vocabulary head)",
+  "🔌 **Opt-in only** — a model family's own decode-time timestamps remain the default; this pack is only consulted when a transcribe call explicitly asks for `aligned` timestamps, and may auto-install under the same CLI consent flow as `--diarize`",
+  "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU",
+]
+
+highlights_zh = [
+  "🎯 **精修词级时间戳** — 输入已完成的转写文本与原始音频，用对齐模型精修后的时间跨度替换模型自身的近似逐词时间戳（`--word-timestamps=aligned`）",
+  "⚡ **非自回归** — 对交错的音频/文本做单次前向计算，在 `<timestamp>` 位置取 argmax（5000 个 80ms 宽的分箱），不是逐步贪心解码，因此不通过 qwen3-asr 运行时派发",
+  "🧩 **与 Qwen3-ASR 共享骨干** — 音频编码器 + LM 的 `thinker` 张量布局逐位相同，仅末端输出头不同（独立的 5000 分类头，而非共享词表的绑定头）",
+  "🔌 **仅为可选项** — 模型自身的解码时时间戳仍是默认值；只有转写调用显式要求 `aligned` 时间戳时才会用到本模型包，且可与 `--diarize` 一样走同一套 CLI 同意安装流程",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
+]
+
+intro = """
+Qwen3-ForcedAligner-0.6B is a **word-level forced-alignment** model from **Qwen**, sharing its
+audio-encoder + LM `thinker` tensor layout byte-for-byte with **Qwen3-ASR** (same
+`Qwen3ASRForConditionalGeneration` architecture). The only structural difference is the final
+head: instead of a tied vocabulary `lm_head`, it uses an independent `Linear(hidden_size,
+5000)` classification head over 80ms-wide timestamp bins. Given a transcript's text and its
+source audio, it runs a single non-autoregressive forward pass and reads off word-boundary
+timestamps at argmax `<timestamp>` positions -- refining a model family's own (typically
+decode-time-approximate) per-word timestamps. This OpenASR repo repackages the weights as
+`.oasr` packs that run natively in the OpenASR runtime -- no Python at inference, all decoding
+local. It ships in **fp16** (maximum fidelity, recommended), **q8_0**, and **q4_k** builds.
+
+**Not a standalone transcription model.** This pack cannot transcribe audio by itself; it is an
+opt-in refinement step consumed via `openasr transcribe <audio> --model <asr-model>
+--word-timestamps=aligned`. The base model's own timestamps (`--word-timestamps` /
+`--word-timestamps=approximate`) remain the default -- nothing changes unless `aligned` is
+requested explicitly.
+
+**Verification status:** this is a brand-new catalog entry (no prior public listing). Local
+verification so far covers a tensor-parity check against the real upstream checkpoint (every
+source safetensors tensor maps 1:1 to a destination tensor, plus the two synthesized frontend
+tensors, across fp16/q8_0/q4_k). This pack is staged in a private repo, not yet publicly listed.
+"""
+
+intro_zh = """
+Qwen3-ForcedAligner-0.6B 是 **Qwen** 推出的**词级强制对齐**模型，其音频编码器 + LM 的
+`thinker` 张量布局与 **Qwen3-ASR** 逐位相同（同一 `Qwen3ASRForConditionalGeneration`
+架构）。唯一的结构差异在末端输出头：不使用绑定词表的 `lm_head`，而是在 80ms 宽的时间戳分箱上
+使用独立的 `Linear(hidden_size, 5000)` 分类头。给定转写文本及其对应的原始音频，模型执行一次
+非自回归前向计算，在 `<timestamp>` 位置的 argmax 处读出词边界时间戳——用于精修某个模型家族自身
+（通常是解码时的近似值）的逐词时间戳。
+
+这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理，不会把音频上传到
+云端。提供 `fp16`（最高保真，推荐）、`q8_0`、`q4_k` 三种量化版本。
+
+**不是独立的转写模型。** 本模型包本身无法转写音频；它是通过
+`openasr transcribe <audio> --model <asr-model> --word-timestamps=aligned` 调用的可选精修步骤。
+基础模型自身的时间戳（`--word-timestamps` / `--word-timestamps=approximate`）仍是默认值——除非
+显式要求 `aligned`，否则不会有任何变化。
+
+**验证状态:** 这是一个全新的 catalog 条目（此前没有公开上架记录）。目前本地验证覆盖对照真实
+上游检查点的张量对齐检查（每个源 safetensors 张量都一一映射到目标张量，外加两个合成的前端张量，
+覆盖 fp16/q8_0/q4_k 三档）。本模型包目前仅暂存于私有仓库，尚未公开上架。
+"""
+
+acknowledgement = """
+This pack is a redistribution of **Qwen3-ForcedAligner-0.6B**, created and open-sourced by
+**Qwen** ([Qwen/Qwen3-ForcedAligner-0.6B](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B)).
+All credit for the original architecture, training, and weights belongs to the authors; the
+license is inherited from and identical to the upstream model (Apache-2.0). OpenASR only
+performs format conversion, quantization, runtime verification, and local-inference adaptation.
+"""
+
+acknowledgement_zh = """
+本模型包重新分发自 Qwen 开源的 Qwen3-ForcedAligner-0.6B
+([Qwen/Qwen3-ForcedAligner-0.6B](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B))。原始
+架构、训练和权重归作者所有，许可证继承上游 Apache-2.0。OpenASR 仅进行格式转换、量化、运行时
+校验和本地推理适配。
+"""
+
+[prose_locales."zh-CN"]
+tagline = "为 OpenASR 转写结果提供词级强制对齐 — 非自回归的 Qwen3 音频+文本模型，用于精修逐词时间戳"
+
+highlights = [
+  "🎯 **精修词级时间戳** — 输入已完成的转写文本与原始音频，用对齐模型精修后的时间跨度替换模型自身的近似逐词时间戳（`--word-timestamps=aligned`）",
+  "⚡ **非自回归** — 对交错的音频/文本做单次前向计算，在 `<timestamp>` 位置取 argmax（5000 个 80ms 宽的分箱），不是逐步贪心解码，因此不通过 qwen3-asr 运行时派发",
+  "🧩 **与 Qwen3-ASR 共享骨干** — 音频编码器 + LM 的 `thinker` 张量布局逐位相同，仅末端输出头不同（独立的 5000 分类头，而非共享词表的绑定头）",
+  "🔌 **仅为可选项** — 模型自身的解码时时间戳仍是默认值；只有转写调用显式要求 `aligned` 时间戳时才会用到本模型包，且可与 `--diarize` 一样走同一套 CLI 同意安装流程",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
+]
+
+source_sha256 = "688ff17f00adef4c4a997a658fbfdf056f5593d29763129849fc50503d7a0c7c"

@@ -28,16 +28,23 @@ TOOLING_ROOT = REPO_ROOT / "tooling" / "publish-model"
 TEMPLATE = TOOLING_ROOT / "template" / "MODEL_CARD.md.tmpl"
 DIARIZE_TEMPLATE = TOOLING_ROOT / "template" / "DIARIZE_CARD.md.tmpl"
 TRANSLATION_TEMPLATE = TOOLING_ROOT / "template" / "TRANSLATION_CARD.md.tmpl"
+CAPABILITY_TEMPLATE = TOOLING_ROOT / "template" / "CAPABILITY_CARD.md.tmpl"
 # Diarization support packs render the diarize card: no ASR pipeline tags,
 # no transcribe quickstart.
 DIARIZE_FAMILIES = {"wespeaker", "pyannote-segmentation"}
 # Translation models render the translation card: translation pipeline tag,
 # realtime-translation quickstart, no ASR bench columns.
 TRANSLATION_FAMILIES = {"hymt2"}
-# HF YAML pipeline tag per diarize family (the prose card may override).
+# Other (non-diarization) capability packs render the generic capability card:
+# no ASR pipeline tags/transcribe quickstart, no diarize-specific wording --
+# just quant/file/size and a note that this model augments another model's
+# decode path.
+CAPABILITY_FAMILIES = {"qwen3-forced-aligner"}
+# HF YAML pipeline tag per diarize/capability family (the prose card may override).
 DIARIZE_PIPELINE_TAG_BY_FAMILY = {
     "wespeaker": "feature-extraction",
     "pyannote-segmentation": "voice-activity-detection",
+    "qwen3-forced-aligner": "automatic-speech-recognition",
 }
 # SPDX ids (lowercased) that HF's YAML `license:` field accepts directly. A
 # license outside this set (e.g. the FunASR Model License) must use the HF
@@ -79,16 +86,17 @@ def main(argv: list[str]) -> int:
 
     diarize = catalog["family"] in DIARIZE_FAMILIES
     translation = catalog["family"] in TRANSLATION_FAMILIES
+    capability = catalog["family"] in CAPABILITY_FAMILIES
 
     # Perf table rows + pull lines, one per built quant (catalog order). The
-    # diarize card's table carries only quant/file/size — ASR bench columns
-    # (RTF/WER) do not apply to support packs.
+    # diarize/capability card's table carries only quant/file/size — ASR bench
+    # columns (RTF/WER) do not apply to support packs.
     rows, pulls = [], []
     qm = metrics.get("quants", {})
     for q in catalog["quants"]:
         meta = QUANT_METADATA[q]
         m = qm.get(q, {})
-        if diarize or translation:
+        if diarize or translation or capability:
             rows.append(f"| {meta.label} | `{model}-{q}.oasr` | {human_bytes(m.get('size_bytes'))} |")
         else:
             rows.append(
@@ -113,6 +121,8 @@ def main(argv: list[str]) -> int:
         template = DIARIZE_TEMPLATE
     elif translation:
         template = TRANSLATION_TEMPLATE
+    elif capability:
+        template = CAPABILITY_TEMPLATE
     else:
         template = TEMPLATE
     text = template.read_text()
