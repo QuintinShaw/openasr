@@ -65,9 +65,16 @@ pub struct NativeRuntimeModelAdapter {
 }
 
 impl NativeRuntimeModelAdapter {
-    fn new(descriptor: GgmlFamilyAdapterDescriptor, metadata: &crate::GgufMetadata) -> Self {
+    fn new(
+        descriptor: GgmlFamilyAdapterDescriptor,
+        metadata: &crate::GgufMetadata,
+        tensor_index: Option<&crate::GgufTensorIndex>,
+    ) -> Self {
         let capabilities = native_runtime_streaming_capabilities_for_descriptor(&descriptor)
-            .with_phrase_bias(native_runtime_descriptor_supports_phrase_bias(&descriptor))
+            .with_phrase_bias(native_runtime_descriptor_supports_phrase_bias(
+                &descriptor,
+                tensor_index,
+            ))
             .with_timestamps(true)
             .with_diarization(native_runtime_metadata_supports_diarization(
                 metadata,
@@ -119,9 +126,29 @@ fn native_runtime_streaming_capabilities_for_descriptor(
         .with_frame_sync_partials(dispatch.is_frame_sync_for(descriptor))
 }
 
+/// Phrase-bias capability for one runtime pack.
+///
+/// This is family/architecture-level (`builtin_executor_supports_phrase_bias_for_model_architecture`)
+/// for every architecture except Dolphin, where the deep-biasing `context_module.*`
+/// weights are only present on some packs within the family (the multi-lingual
+/// `small`/`base` catalog tiers never trained them) -- reporting the family-wide
+/// `true` there let requests reach `hotword_context.rs`, which then hard-fails
+/// with a `MissingWeight` error instead of a clean, pre-decode capability
+/// rejection. Dolphin therefore probes the pack's own GGUF tensor index for the
+/// context-module tensor rather than trusting the architecture constant; every
+/// other family keeps the prior architecture-level answer since their executors
+/// require the family's tensors unconditionally.
 fn native_runtime_descriptor_supports_phrase_bias(
     descriptor: &GgmlFamilyAdapterDescriptor,
+    tensor_index: Option<&crate::GgufTensorIndex>,
 ) -> bool {
+    if descriptor.model_architecture == DOLPHIN_GGML_ARCHITECTURE_ID {
+        return tensor_index.is_some_and(|tensor_index| {
+            tensor_index
+                .get(crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME)
+                .is_some()
+        });
+    }
     builtin_executor_supports_phrase_bias_for_model_architecture(descriptor.model_architecture)
         .unwrap_or(false)
 }
@@ -560,7 +587,15 @@ pub fn native_runtime_model_adapter_for_path(path: &Path) -> Option<NativeRuntim
         .select_from_gguf_metadata_v1(&selection_metadata)
         .ok()?
         .clone();
-    Some(NativeRuntimeModelAdapter::new(descriptor, &metadata))
+    // Best-effort: a tensor index read failure here should not fail the whole
+    // capability lookup (the adapter still resolves from metadata alone); it
+    // only narrows the Dolphin per-pack phrase-bias probe to "unsupported".
+    let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source).ok();
+    Some(NativeRuntimeModelAdapter::new(
+        descriptor,
+        &metadata,
+        tensor_index.as_ref(),
+    ))
 }
 
 pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), String> {
@@ -2270,6 +2305,62 @@ mod tests {
 
         assert!(error.contains("requires an explicit local runtime pack path"));
         assert!(!error.contains("silently ignoring phrase_bias"));
+    }
+
+    #[test]
+    fn dolphin_phrase_bias_probe_reports_true_only_when_context_module_tensor_is_baked() {
+        let dolphin_descriptor =
+            crate::models::ggml_family_registry::dolphin_runtime_descriptor_v1();
+        let temp = tempfile::tempdir().unwrap();
+
+        // Base-tier pack: no `context_module.*` weights baked -- must not
+        // report phrase-bias support (this used to be a family-wide `true`
+        // that let requests reach `hotword_context.rs` and hard-fail there).
+        let base_path = temp.path().join("dolphin-base.gguf");
+        write_tiny_gguf_runtime_source(&base_path, &TinyGgufFixtureSpec::new(Default::default()))
+            .unwrap();
+        let base_tensor_index = crate::read_gguf_tensor_index(&base_path).unwrap();
+        assert!(
+            !native_runtime_descriptor_supports_phrase_bias(
+                &dolphin_descriptor,
+                Some(&base_tensor_index),
+            ),
+            "a pack without the context-module tensor must not advertise phrase bias"
+        );
+        // No tensor index at all (best-effort read failure) must also fail closed.
+        assert!(!native_runtime_descriptor_supports_phrase_bias(
+            &dolphin_descriptor,
+            None,
+        ));
+
+        // Hotword-tier pack: the deep-biasing context module tensor is baked.
+        let hotword_path = temp.path().join("dolphin-cn-dialect-small.gguf");
+        let hotword_spec = TinyGgufFixtureSpec::new(Default::default()).with_added_tensor(
+            crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
+        );
+        write_tiny_gguf_runtime_source(&hotword_path, &hotword_spec).unwrap();
+        let hotword_tensor_index = crate::read_gguf_tensor_index(&hotword_path).unwrap();
+        assert!(
+            native_runtime_descriptor_supports_phrase_bias(
+                &dolphin_descriptor,
+                Some(&hotword_tensor_index),
+            ),
+            "a pack with the baked context-module tensor must advertise phrase bias"
+        );
+
+        // Every non-Dolphin architecture keeps the prior architecture-level
+        // answer regardless of the (irrelevant) tensor index passed in.
+        let whisper_descriptor =
+            crate::models::ggml_family_registry::GgmlFamilyRegistry::with_builtin_adapters()
+                .descriptors()
+                .iter()
+                .find(|descriptor| descriptor.model_architecture == WHISPER_GGML_ARCHITECTURE_ID)
+                .expect("whisper descriptor registered")
+                .clone();
+        assert!(native_runtime_descriptor_supports_phrase_bias(
+            &whisper_descriptor,
+            Some(&base_tensor_index),
+        ));
     }
 
     #[test]

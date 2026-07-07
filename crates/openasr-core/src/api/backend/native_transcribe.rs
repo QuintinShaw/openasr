@@ -244,7 +244,10 @@ fn run_native_transcription_impl(
     crate::api::backend::reject_unsupported_phrase_bias_for_model(
         selected_family.adapter_id,
         selected_family.model_family,
-        super::native_runtime_descriptor_supports_phrase_bias(&selected_family),
+        super::native_runtime_descriptor_supports_phrase_bias(
+            &selected_family,
+            Some(runtime_preflight.tensor_index.as_ref()),
+        ),
         request.phrase_bias.as_ref(),
     )?;
     // Diarization is supported when the model self-diarizes (e.g. cohere) or the
