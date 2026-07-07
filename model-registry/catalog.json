@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-07T04:35:00+00:00",
+  "generated_at": "2026-07-07T05:42:13+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -133,6 +133,130 @@
         }
       },
       "upstream_release_date": "2026-01-28"
+    },
+    {
+      "id": "parakeet-tdt-0.6b-v3",
+      "kind": "asr-model",
+      "display_name": "Parakeet TDT 0.6B v3",
+      "family": "parakeet-tdt",
+      "aliases": [],
+      "pull_alias": "parakeet-tdt-0.6b-v3",
+      "size": "0.6b",
+      "languages": [
+        "bg",
+        "cs",
+        "da",
+        "de",
+        "el",
+        "en",
+        "es",
+        "et",
+        "fi",
+        "fr",
+        "hr",
+        "hu",
+        "it",
+        "lt",
+        "lv",
+        "mt",
+        "nl",
+        "pl",
+        "pt",
+        "ro",
+        "ru",
+        "sk",
+        "sl",
+        "sv",
+        "uk"
+      ],
+      "vendor": "nvidia",
+      "license": "CC-BY-4.0",
+      "license_url": "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/parakeet-tdt-0.6b-v3",
+      "hf_revision": "4a16094df4ec3ab6081089a5aff415c2042342b7",
+      "public": false,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "parakeet-tdt-0.6b-v3:q8",
+      "prose": {
+        "tagline": "NVIDIA's multilingual speed flagship \u2014 25 European languages, TDT transducer with native word timestamps",
+        "overview": [
+          "Parakeet TDT 0.6B v3 is **NVIDIA's** 600M-parameter multilingual speech-recognition model, extending\nthe English-only v2 to **25 European languages** using the Granary multilingual corpus (~660k hours of\npseudo-labeled speech plus ~10k hours of human transcriptions). Architecturally it pairs a\n**FastConformer encoder** with a **Token-and-Duration Transducer (TDT)** decoder: each decode step\npredicts both the next token and how many 80 ms frames it occupies, then skips ahead by that duration \u2014\nwhich is what makes the family a speed benchmark for local transcription, and what gives it\nmodel-native word timestamps. The model auto-detects the spoken language, preserves punctuation and\ncapitalization, and is released under the permissive CC-BY-4.0 license. This OpenASR repo repackages\nthe weights as `.oasr` packs that run natively in the OpenASR runtime \u2014 no Python at inference time,\nall decoding local. The **q8_0** build is the recommended default; **q4_k** is the smallest build for\ntight-memory devices and **fp16** is for maximum fidelity or verification."
+        ],
+        "highlights": [
+          "\ud83c\uddea\ud83c\uddfa **25 European languages** \u2014 one 0.6B checkpoint covers bg/hr/cs/da/nl/en/et/fi/fr/de/el/hu/it/lv/lt/mt/pl/pt/ro/sk/sl/es/sv/ru/uk, auto-detecting the spoken language with no prompting",
+          "\u26a1 **Built for throughput** \u2014 the Token-and-Duration Transducer (TDT) decoder predicts how many frames each token spans and skips ahead, cutting decode steps versus conventional transducers",
+          "\ud83d\udd51 **Native word timestamps** \u2014 the duration head is the model's own alignment output, so word-level timings come from the model rather than a uniform approximation",
+          "\u270d\ufe0f **Punctuation and capitalization** \u2014 trained on transcripts that preserve both (Granary + NeMo ASR Set 3.0; ~670k hours), so the raw decode reads like text"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "parakeet-tdt-0.6b-v3:fp16",
+          "filename": "parakeet-tdt-0.6b-v3-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/parakeet-tdt-0.6b-v3/resolve/4a16094df4ec3ab6081089a5aff415c2042342b7/parakeet-tdt-0.6b-v3-fp16.oasr",
+          "sha256": "fde514b45dbeabd17b24bd3cdcba8b65b4bbc1be4b04efe085cb43d7eebe32a9",
+          "size_bytes": 1415202560,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.13968893936363636,
+            "rtf_metal": 0.053807321909090905,
+            "peak_rss_bytes": 1594720256,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "parakeet-tdt-0.6b-v3:q8",
+          "filename": "parakeet-tdt-0.6b-v3-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/parakeet-tdt-0.6b-v3/resolve/4a16094df4ec3ab6081089a5aff415c2042342b7/parakeet-tdt-0.6b-v3-q8_0.oasr",
+          "sha256": "4416134e5f4d42690ecfe6b2be8c30fcb3186eb5491434195355a1597f497454",
+          "size_bytes": 919136000,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.12882505309090908,
+            "rtf_metal": 0.048595378818181816,
+            "peak_rss_bytes": 1119027200,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "parakeet-tdt-0.6b-v3:q4",
+          "filename": "parakeet-tdt-0.6b-v3-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/parakeet-tdt-0.6b-v3/resolve/4a16094df4ec3ab6081089a5aff415c2042342b7/parakeet-tdt-0.6b-v3-q4_k.oasr",
+          "sha256": "6d67abccf17216832750284e402301669b9b5680bc726dedfef2f42467a995ec",
+          "size_bytes": 654567168,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.10859584472727274,
+            "rtf_metal": 0.04970001136363636,
+            "peak_rss_bytes": 919601152,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ],
+      "language_mode": "fixed_multilingual",
+      "emits_punctuation": true,
+      "sort_weight": 915,
+      "recommended": true,
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "NVIDIA \u591a\u8bed\u79cd\u901f\u5ea6\u65d7\u8230 \u2014 25 \u79cd\u6b27\u6d32\u8bed\u8a00,TDT transducer,\u539f\u751f\u8bcd\u7ea7\u65f6\u95f4\u6233",
+          "highlights": [
+            "\ud83c\uddea\ud83c\uddfa **25 \u79cd\u6b27\u6d32\u8bed\u8a00** \u2014 \u5355\u4e2a 0.6B \u68c0\u67e5\u70b9\u8986\u76d6\u82f1/\u6cd5/\u5fb7/\u897f/\u610f/\u4fc4/\u4e4c\u7b49\u6b27\u6d32\u8bed\u8a00\uff0c\u81ea\u52a8\u8bc6\u522b\u8bed\u79cd\u3001\u65e0\u9700\u63d0\u793a",
+            "\u26a1 **\u4e3a\u541e\u5410\u800c\u751f** \u2014 TDT(Token-and-Duration Transducer)\u89e3\u7801\u5668\u540c\u65f6\u9884\u6d4b token \u4e0e\u5176\u65f6\u957f\u5e76\u6309\u65f6\u957f\u8df3\u5e27\uff0c\u89e3\u7801\u6b65\u6570\u8fdc\u5c11\u4e8e\u5e38\u89c4 transducer",
+            "\ud83d\udd51 **\u539f\u751f\u8bcd\u7ea7\u65f6\u95f4\u6233** \u2014 \u65f6\u957f\u5934\u5c31\u662f\u6a21\u578b\u81ea\u5df1\u7684\u5bf9\u9f50\u8f93\u51fa\uff0c\u8bcd\u7ea7\u65f6\u95f4\u6765\u81ea\u6a21\u578b\u672c\u8eab\u800c\u975e\u5747\u5300\u8fd1\u4f3c",
+            "\u270d\ufe0f **\u6807\u70b9\u4e0e\u5927\u5c0f\u5199** \u2014 \u8bad\u7ec3\u8f6c\u5199\u4fdd\u7559\u6807\u70b9\u548c\u5927\u5c0f\u5199(Granary + NeMo ASR Set 3.0\uff0c~670k \u5c0f\u65f6)\uff0c\u539f\u59cb\u89e3\u7801\u7ed3\u679c\u5373\u6210\u6587"
+          ]
+        }
+      },
+      "upstream_release_date": "2025-08-14"
     },
     {
       "id": "xasr-zh-en",

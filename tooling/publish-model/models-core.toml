@@ -115,6 +115,28 @@ sort_weight = 910
 recommended = true
 upstream_release_date = "2026-05-18"
 
+# Parakeet TDT 0.6B v3 (NVIDIA FastConformer + Token-and-Duration Transducer,
+# 25 European languages, CC-BY-4.0). Languages inherit
+# LANG_BY_FAMILY["parakeet-tdt"] (the 25-language set from NVIDIA's card,
+# post-dialect-collapse; see _catalog.py).
+["parakeet-tdt-0.6b-v3"]
+family = "parakeet-tdt"
+hf_repo = "OpenASR/parakeet-tdt-0.6b-v3"
+release_public = true
+aliases = []
+pull_alias = "parakeet-tdt-0.6b-v3"
+size = "0.6b"
+registry_id = "parakeet-tdt-0.6b-v3"
+display_name = "Parakeet TDT 0.6B v3"
+license_name = "CC-BY-4.0"
+license_source = "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/blob/main/README.md"
+license_class = "permissive"
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+sort_weight = 915
+recommended = true
+upstream_release_date = "2025-08-14"
+
 # Dolphin cn-dialect small (WeNet E-Branchformer, CTC + attention rescoring).
 # Published PUBLIC to OpenASR/dolphin-cn-dialect-small: `release_public = true`
 # routes the publish lane to a public HF repo and lets --public run the

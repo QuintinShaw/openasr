@@ -40,6 +40,10 @@ credits the people who built the original.
   packs until an OpenASR pack is published)
 - Parakeet-CTC (NVIDIA NeMo) and wav2vec2 / data2vec (Meta AI) run from
   user-imported packs.
+- Parakeet TDT 0.6B v3 (NVIDIA, CC-BY-4.0) --
+  <https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3> (25 European languages;
+  FastConformer + Token-and-Duration Transducer, trained with NeMo on the
+  Granary corpus).
 
 **Speaker diarization**
 

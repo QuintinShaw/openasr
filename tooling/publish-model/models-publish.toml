@@ -155,3 +155,12 @@ import_subcommand = "import whisper"
 upstream_repo = "openai/whisper-medium.en"
 source_revision = "2e98eb6279edf5095af0c8dedb36bdec0acd172b"
 needs_license_flags = true
+
+# Parakeet TDT HF (transformers-format) -> .oasr converter. The importer takes
+# config.json + tokenizer.json + model.safetensors; license fields live in
+# models-core.toml (needs_license_flags = false, like parakeet-ctc/xasr).
+["parakeet-tdt-0.6b-v3"]
+import_subcommand = "import parakeet-tdt"
+upstream_repo = "nvidia/parakeet-tdt-0.6b-v3"
+source_revision = "7c35754d166cca382ad1e53e68b01e7c575f3a1d"
+needs_license_flags = false
