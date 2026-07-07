@@ -2,6 +2,7 @@ mod decode;
 mod errors;
 mod prepare;
 mod probe;
+mod symphonia_decode;
 mod types;
 mod validation;
 

@@ -901,6 +901,7 @@ async fn capabilities_endpoint_reflects_active_xasr_phrase_bias_capability() {
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     });
 
@@ -1000,6 +1001,7 @@ async fn native_transcription_without_installed_model_fails_closed_and_never_dow
         openasr_server::ServerRuntime {
             backend: openasr_core::BackendKind::Native,
             ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
             model_pack_path: None,
         },
         openasr_server::DistributionRuntime {
@@ -1056,6 +1058,7 @@ async fn daemon_starts_and_reports_ready_with_zero_models_installed() {
     let runtime = openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: None,
     };
     runtime
@@ -2157,6 +2160,7 @@ fn native_server_runtime_with_no_model_pack_is_accepted_at_startup_validation() 
     openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: None,
     }
     .validate()
@@ -2171,6 +2175,7 @@ fn native_server_runtime_falls_back_to_path_stem_when_metadata_model_id_is_retir
     openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     }
     .validate()
@@ -2185,6 +2190,7 @@ fn native_server_runtime_falls_back_to_path_stem_when_metadata_model_id_is_inval
     openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     }
     .validate()
@@ -2199,6 +2205,7 @@ fn native_server_runtime_rejects_reserved_oasr_container_magic() {
     let error = openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     }
     .validate()
@@ -3734,6 +3741,7 @@ async fn transcriptions_with_native_backend_fail_closed() {
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root.clone()),
     });
     let wav_bytes = sample_wav_bytes();
@@ -3755,6 +3763,7 @@ async fn transcriptions_with_native_xasr_hotword_returns_model_unsupported_error
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     });
     let wav_bytes = sample_wav_bytes();
@@ -3785,6 +3794,7 @@ async fn transcriptions_with_native_backend_model_mismatch_returns_bad_request()
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root.clone()),
     });
     let wav_bytes = sample_wav_bytes();
@@ -3813,6 +3823,7 @@ async fn transcriptions_with_native_backend_and_diarize_returns_bad_request() {
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root.clone()),
     });
     let wav_bytes = sample_wav_bytes();
@@ -3830,6 +3841,7 @@ async fn transcriptions_with_native_backend_reject_retired_legacy_model_alias() 
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: None,
     });
     let wav_bytes = sample_wav_bytes();
@@ -3857,6 +3869,7 @@ async fn transcriptions_with_native_backend_accepts_live_catalog_family_bare_met
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root.clone()),
     });
     let wav_bytes = sample_wav_bytes();
@@ -3878,6 +3891,7 @@ async fn stream_transcriptions_with_native_backend_reject_empty_model_form_value
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     });
     let wav_bytes = sample_wav_bytes();
@@ -3902,6 +3916,7 @@ async fn stream_transcriptions_with_mock_backend_emits_protocol_events() {
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Mock,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: None,
     });
     let wav_bytes = sample_wav_bytes();
@@ -3941,6 +3956,7 @@ async fn stream_transcription_succeeds_when_history_cannot_be_recorded() {
         openasr_server::ServerRuntime {
             backend: openasr_core::BackendKind::Mock,
             ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
             model_pack_path: None,
         },
         openasr_server::DistributionRuntime {
@@ -3976,6 +3992,7 @@ async fn static_bearer_remote_compute_stream_transcription_records_server_histor
         openasr_server::ServerRuntime {
             backend: openasr_core::BackendKind::Mock,
             ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
             model_pack_path: None,
         },
         openasr_server::DistributionRuntime {
@@ -4037,6 +4054,7 @@ async fn stream_transcriptions_with_native_backend_reject_srt_response_format() 
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     });
     let wav_bytes = sample_wav_bytes();
@@ -4064,6 +4082,7 @@ async fn stream_transcriptions_with_native_backend_reject_model_mismatch() {
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     });
     let wav_bytes = sample_wav_bytes();
@@ -4093,6 +4112,7 @@ async fn stream_transcriptions_with_native_xasr_hotword_emits_model_unsupported_
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     });
     let wav_bytes = sample_wav_bytes();
@@ -4129,6 +4149,7 @@ async fn stream_transcriptions_with_native_backend_reject_missing_model_pack_pat
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: None,
     });
     let wav_bytes = sample_wav_bytes();
@@ -4163,6 +4184,7 @@ async fn transcriptions_with_native_backend_srt_stays_fail_closed_for_unexecutab
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root.clone()),
     });
     let wav_bytes = sample_wav_bytes();
@@ -4190,6 +4212,7 @@ async fn models_with_native_backend_lists_loaded_local_pack_id() {
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     });
     let response = app
@@ -4216,6 +4239,7 @@ async fn models_with_native_backend_and_no_pack_lists_empty_instead_of_erroring(
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: None,
     });
     let response = app

@@ -387,6 +387,7 @@ fn prepare_input_file_samples_pcm16_mono_16khz(
         input_file,
         &AudioPreparationOptions::new(BackendKind::Native)
             .with_ffmpeg_bin(options.runtime_paths.ffmpeg_bin.clone())
+            .with_ffmpeg_bin_explicit(options.runtime_paths.ffmpeg_bin.is_some())
             .with_native_non_wav_conversion(true),
     )?;
     let mut reader = hound::WavReader::open(prepared.path()).with_context(|| {

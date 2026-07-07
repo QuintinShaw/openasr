@@ -27,6 +27,14 @@ pub enum AudioInputIssue {
 pub struct AudioPreparationOptions {
     pub backend: BackendKind,
     pub ffmpeg_bin: Option<PathBuf>,
+    /// Whether `ffmpeg_bin` (when set) came from an explicit user choice --
+    /// `--ffmpeg-bin`, `OPENASR_FFMPEG_BIN`, or `media.ffmpeg_bin` in config --
+    /// as opposed to auto-discovering `ffmpeg` on `PATH`. The in-process
+    /// symphonia decode path is the default for recognized non-WAV formats and
+    /// is only skipped in favor of external conversion when this is `true`:
+    /// a system that merely happens to have ffmpeg on PATH should not disable
+    /// it (see `crates/openasr-core/src/audio/prepare.rs`).
+    pub ffmpeg_bin_explicit: bool,
     pub native_non_wav_requires_conversion: bool,
 }
 
@@ -35,12 +43,20 @@ impl AudioPreparationOptions {
         Self {
             backend,
             ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
             native_non_wav_requires_conversion: false,
         }
     }
 
     pub fn with_ffmpeg_bin(mut self, ffmpeg_bin: Option<PathBuf>) -> Self {
         self.ffmpeg_bin = ffmpeg_bin;
+        self
+    }
+
+    /// Marks `ffmpeg_bin` as an explicit user choice rather than a PATH
+    /// auto-discovery result. No-op if `ffmpeg_bin` is `None`.
+    pub fn with_ffmpeg_bin_explicit(mut self, explicit: bool) -> Self {
+        self.ffmpeg_bin_explicit = explicit && self.ffmpeg_bin.is_some();
         self
     }
 
