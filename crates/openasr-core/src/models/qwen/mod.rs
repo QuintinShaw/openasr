@@ -1,7 +1,9 @@
 mod audio_encoder;
 mod batched_decode;
 mod decode_prompt;
+mod forced_aligner_align_text;
 mod forced_aligner_import;
+mod forced_aligner_runtime;
 mod frontend;
 mod ggml_executor;
 mod graph_config;
