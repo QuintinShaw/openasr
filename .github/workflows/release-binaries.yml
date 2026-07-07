@@ -14,9 +14,10 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout || 60 }}
-    # Experimental legs (currently the Windows CUDA variant, whose hosted
-    # toolchain story is still settling) may fail without failing the run;
-    # their archives simply drop out of the artifact set until they stabilize.
+    # Escape hatch for future legs whose toolchain story is still settling:
+    # mark them `experimental: true` and they may fail without failing the
+    # run (their archives simply drop out of the artifact set) until they
+    # prove green. Every current leg has, so none carry the flag today.
     continue-on-error: ${{ matrix.experimental || false }}
     # Distributed binaries must be portable. build.rs auto-enables GGML_NATIVE
     # (-march=native) when host==target on x86, which is correct for local
@@ -70,7 +71,6 @@ jobs:
             archive_ext: zip
             features: cuda
             timeout: 180
-            experimental: true
           # AMD HIP variant. Builds openasr-core's default consumer RDNA2/3/
           # 3.5/4 fat code object (gfx1030/31/32/35, gfx1100/01/02, gfx1150/
           # 51, gfx1200/01; see hip_gpu_targets() in build.rs for provenance).
@@ -90,7 +90,6 @@ jobs:
             archive_ext: zip
             features: hip
             timeout: 240
-            experimental: true
           # Linux GPU-feature variants, same rationale as the Windows ones
           # above (no GPU on the hosted runner; build+package validated
           # here, GPU inference validated on real hardware). Pinned to
@@ -102,21 +101,18 @@ jobs:
             archive_ext: tar.gz
             features: vulkan
             timeout: 90
-            experimental: true
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu-cuda
             binary_name: openasr
             archive_ext: tar.gz
             features: cuda
             timeout: 120
-            experimental: true
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu-rocm
             binary_name: openasr
             archive_ext: tar.gz
             features: hip
             timeout: 240
-            experimental: true
 
     steps:
       - uses: actions/checkout@v4
