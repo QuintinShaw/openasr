@@ -1,6 +1,6 @@
 //! Loader for speaker-embedder weight packs.
 //!
-//! Unlike the tiny vendored Silero VAD model, speaker embedders are delivered as
+//! Unlike the tiny vendored Stream-VAD model, speaker embedders are delivered as
 //! pulled `.oasr` packs, so weights are read from a file path at runtime — never
 //! `include_bytes!`. Raw safetensors remain supported as a dev fast path. `.oasr`
 //! packs are materialized into logical f32 buffers for the pure-Rust forward

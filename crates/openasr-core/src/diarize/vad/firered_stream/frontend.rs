@@ -19,8 +19,10 @@ use std::sync::Arc;
 use realfft::{RealFftPlanner, RealToComplex};
 
 pub(crate) const SAMPLE_RATE_HZ: u32 = 16_000;
-const FRAME_LENGTH: usize = 400; // 25 ms @ 16 kHz
-const FRAME_SHIFT: usize = 160; // 10 ms @ 16 kHz
+// `pub(crate)`: the Stream-VAD streaming detector needs these to know how
+// many raw samples must accumulate before the next fbank frame is ready.
+pub(crate) const FRAME_LENGTH: usize = 400; // 25 ms @ 16 kHz
+pub(crate) const FRAME_SHIFT: usize = 160; // 10 ms @ 16 kHz
 const FFT_SIZE: usize = 512; // next pow2 >= 400 (kaldi rounds the window up)
 pub(crate) const NUM_MEL_BINS: usize = 80;
 const MEL_LOW_HZ: f32 = 20.0;

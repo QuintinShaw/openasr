@@ -24,30 +24,16 @@ openasr-ggml
   this project possible. Improvements to the fork are contributed back
   upstream where applicable.
 
-Silero VAD
-  Path: crates/openasr-core/src/diarize/vad/assets/silero_vad_v6_16k.safetensors
-  License: MIT
-
-  The neural Voice Activity Detection model is Silero VAD v6.2 (16 kHz). The
-  vendored weights are the upstream silero_vad_16k_op15.onnx deployment tensors
-  re-serialized to safetensors; OpenASR reimplements the forward pass in pure
-  Rust. Source: https://github.com/snakers4/silero-vad (v6.2.1).
-
-      Copyright (c) 2024 Silero Team
-
-  We gratefully acknowledge the Silero Team for releasing a compact,
-  high-quality VAD under a permissive license.
-
-FireRedVAD
-  Path: crates/openasr-core/src/diarize/vad/assets/firered_vad_16k.safetensors
+FireRedVAD Stream-VAD
+  Path: crates/openasr-core/src/diarize/vad/assets/firered_stream_vad_16k.safetensors
   License: Apache-2.0
 
-  An alternative neural Voice Activity Detection model (a causal-FSMN
-  DetectModel, 16 kHz), selectable as a long-form VAD engine via
-  OPENASR_VAD=firered. The vendored weights are the upstream VAD/model.pth.tar
-  checkpoint and VAD/cmvn.ark CMVN stats re-serialized to safetensors; OpenASR
-  reimplements the forward pass in pure Rust. Source:
-  https://huggingface.co/FireRedTeam/FireRedVAD and
+  OpenASR's sole neural Voice Activity Detection model: a causal (no
+  lookahead) FSMN DetectModel (16 kHz), backing realtime endpointing,
+  long-form speech slicing, and diarization. The vendored weights are the
+  upstream Stream-VAD/model.pth.tar checkpoint and Stream-VAD/cmvn.ark CMVN
+  stats re-serialized to safetensors; OpenASR reimplements the forward pass in
+  pure Rust. Source: https://huggingface.co/FireRedTeam/FireRedVAD and
   https://github.com/FireRedTeam/FireRedASR2S (fireredvad package).
 
       Copyright 2026 Xiaohongshu

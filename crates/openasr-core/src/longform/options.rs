@@ -9,22 +9,24 @@ pub enum LongFormMode {
     Vad,
 }
 
-/// Which VAD provider backs `Vad`/`Auto` long-form slicing. `Silero` is the
-/// neural default (better speech boundaries); `Energy` is the zero-dependency
-/// RMS fallback; `FireRed` is an alternative neural engine (causal-FSMN
-/// `FireRedVAD`), selectable via `OPENASR_VAD=firered` but not yet the
-/// default (validated so far only on synthetic + a couple of real fixtures;
-/// promoting it needs a real-recording eval pass first). Every neural engine
-/// degrades to energy automatically when its model cannot load or the audio
-/// is not 16 kHz.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LongFormVadEngine {
-    #[default]
-    Silero,
-    Energy,
-    FireRed,
-}
-
+/// Long-form (Stream-VAD) hysteresis parameters. Tuned for the "clean
+/// segmentation" long-form use case (favor fewer, well-bounded slices over
+/// low latency, since there is no live listener) rather than realtime
+/// endpointing -- see `crate::diarize::vad`'s `DEFAULT_NEURAL_VAD_THRESHOLD` /
+/// `DEFAULT_NEURAL_SPEECH_START_MS` / `SHORT_NEURAL_SPEECH_STOP_MS` for the
+/// separately-tuned realtime defaults.
+///
+/// Values validated by a grid sweep (threshold in `0.2..=0.7`,
+/// `min_silence_duration_ms` in `150..=1000`, `min_speech_duration_ms` in
+/// `80..=250`) over Stream-VAD's per-frame probabilities on a real 5-minute
+/// narration recording (`black_cat_poe_ty_5min.wav`): `min_silence_duration_ms`
+/// dominates slice granularity (150ms fragments into 100+ sub-sentence spans;
+/// 1000ms under-segments into spans up to ~60s that then get re-split by the
+/// chunk-length cap anyway), while `threshold` and `min_speech_duration_ms`
+/// have only marginal effect in the tested ranges. 450/250/0.5 -- the
+/// pre-existing defaults -- sit in the flat, well-behaved part of that
+/// surface (64 spans / 242.7s retained speech / 13.6s max span at th=0.5), so
+/// they carry over unchanged from the pre-Stream-VAD engine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LongFormVadOptions {
     pub threshold: f32,
@@ -58,7 +60,6 @@ pub struct LongFormOptions {
     pub fallback_to_energy_when_vad_unavailable: bool,
     pub fallback_to_energy_when_vad_empty: bool,
     pub vad: LongFormVadOptions,
-    pub vad_engine: LongFormVadEngine,
 }
 
 impl Default for LongFormOptions {
@@ -78,7 +79,6 @@ impl Default for LongFormOptions {
             fallback_to_energy_when_vad_unavailable: true,
             fallback_to_energy_when_vad_empty: true,
             vad: LongFormVadOptions::default(),
-            vad_engine: LongFormVadEngine::default(),
         }
     }
 }

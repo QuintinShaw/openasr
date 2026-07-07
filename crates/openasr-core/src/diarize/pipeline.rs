@@ -53,7 +53,7 @@ pub fn resolve_diarization_regions(samples: &[f32]) -> Option<Vec<DiarizationReg
     }
 
     use crate::longform::LongFormVadProvider;
-    let vad = super::vad::SileroVadProvider::shared()?;
+    let vad = super::vad::FireRedStreamVadProvider::shared()?;
     let options = crate::LongFormOptions::default();
     let slices = vad.compute_speech_slices(samples, 16_000, &options).ok()?;
     Some(

@@ -4,7 +4,7 @@ mod tests {
     use crate::realtime::{RealtimeAudioFormat, RealtimeAudioFrame, SpeechBoundaryEvent, VadMode};
 
     #[test]
-    fn external_probability_mode_routes_through_neural_vad() {
+    fn external_probability_mode_routes_through_stream_vad() {
         // Skip if the vendored model is unavailable in this build.
         if crate::diarize::vad::shared_model().is_none() {
             return;
@@ -39,7 +39,7 @@ mod tests {
         }
         assert!(
             started,
-            "neural VAD (ExternalProbability) should emit SpeechStarted on golden speech"
+            "Stream-VAD (ExternalProbability) should emit SpeechStarted on golden speech"
         );
     }
 

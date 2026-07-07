@@ -1,15 +1,11 @@
-//! Vendored FireRedVAD (`FireRedTeam/FireRedVAD`, Apache-2.0) DFSMN weights
-//! and CMVN stats, plus a minimal safetensors loader.
+//! Vendored FireRedTeam/FireRedVAD **Stream-VAD** (`Stream-VAD/model.pth.tar`,
+//! Apache-2.0) DFSMN weights + CMVN stats, plus a minimal safetensors loader.
 //!
-//! The tensors are the upstream `VAD/model.pth.tar` checkpoint's
-//! `model_state_dict` (a `DetectModel` -- `dfsmn.*` + `out.*`) and
-//! `VAD/cmvn.ark` global CMVN stats, re-serialized into a small safetensors
-//! file with flattened, stable names (mirrors
-//! `crate::diarize::vad::weights`'s Silero vendoring). Parsing reuses the
-//! crate's existing `serde_json` for the header; tensor data is
-//! little-endian `f32`. A trailing `hparams` `I32` tensor records the
-//! upstream `DetectModel` hyperparameters so a mismatched export fails
-//! loudly instead of silently producing wrong numbers.
+//! `DetectModel` with `R=8, H=256, P=128, N1=20, N2=0`: the upstream args
+//! (`Namespace(R=8, H=256, P=128, N1=20, S1=1, N2=0, S2=1, idim=80, odim=1)`)
+//! drop the lookahead FSMN filter entirely, making the whole network strictly
+//! causal (no future-frame dependency at any layer) -- the point of the
+//! "Stream" checkpoint.
 
 use std::collections::BTreeMap;
 
@@ -17,32 +13,36 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use super::frontend::NUM_MEL_BINS;
-use super::model::{HIDDEN, LOOKAHEAD_ORDER, LOOKBACK_ORDER, NUM_BLOCKS, PROJ};
+use super::model::{HIDDEN, LOOKBACK_ORDER, NUM_BLOCKS, PROJ};
 
 /// Vendored weights blob (safetensors). ~2.3 MB; Apache-2.0 upstream model.
-const WEIGHTS_BYTES: &[u8] = include_bytes!("../assets/firered_vad_16k.safetensors");
+const WEIGHTS_BYTES: &[u8] = include_bytes!("../assets/firered_stream_vad_16k.safetensors");
 
 #[derive(Debug, Error)]
-pub enum FireRedVadWeightsError {
-    #[error("firered VAD weights blob is truncated (len {len}, need at least {need})")]
+pub enum FireRedStreamVadWeightsError {
+    #[error("firered Stream-VAD weights blob is truncated (len {len}, need at least {need})")]
     Truncated { len: usize, need: usize },
-    #[error("firered VAD weights header is not valid JSON: {0}")]
+    #[error("firered Stream-VAD weights header is not valid JSON: {0}")]
     Header(String),
-    #[error("firered VAD weights are missing tensor '{0}'")]
+    #[error("firered Stream-VAD weights are missing tensor '{0}'")]
     MissingTensor(String),
-    #[error("firered VAD tensor '{name}' has unexpected dtype '{dtype}' (only F32/I32 supported)")]
+    #[error(
+        "firered Stream-VAD tensor '{name}' has unexpected dtype '{dtype}' (only F32/I32 \
+         supported)"
+    )]
     Dtype { name: String, dtype: String },
-    #[error("firered VAD tensor '{name}' has {got} elements, expected {want}")]
+    #[error("firered Stream-VAD tensor '{name}' has {got} elements, expected {want}")]
     Len {
         name: String,
         got: usize,
         want: usize,
     },
-    #[error("firered VAD tensor '{name}' data range {range:?} is out of bounds")]
+    #[error("firered Stream-VAD tensor '{name}' data range {range:?} is out of bounds")]
     Bounds { name: String, range: [usize; 2] },
     #[error(
-        "firered VAD checkpoint hyperparameters {got:?} do not match the hand-written forward \
-         pass's compiled-in constants {want:?}"
+        "firered Stream-VAD checkpoint hyperparameters {got:?} do not match the hand-written \
+         forward pass's compiled-in constants {want:?} (N2 must be 0 -- a non-zero lookahead \
+         means this is not actually the causal Stream-VAD checkpoint)"
     )]
     HparamMismatch { got: Vec<i32>, want: Vec<i32> },
 }
@@ -54,26 +54,21 @@ struct TensorInfo {
     data_offsets: [usize; 2],
 }
 
-/// One DFSMN block's parameters (the `R - 1` repeated blocks after `fsmn1`).
+/// One `DFSMNBlock`'s parameters. Unlike the non-streaming checkpoint, there
+/// is no `lookahead` tensor at all (`N2 = 0`).
 pub(crate) struct BlockWeights {
-    pub fc1_w: Vec<f32>,     // [HIDDEN, PROJ]
-    pub fc1_b: Vec<f32>,     // [HIDDEN]
-    pub fc2_w: Vec<f32>,     // [PROJ, HIDDEN], no bias
-    pub lookback: Vec<f32>,  // [PROJ, LOOKBACK_ORDER]
-    pub lookahead: Vec<f32>, // [PROJ, LOOKAHEAD_ORDER]
+    pub fc1_w: Vec<f32>,    // [HIDDEN, PROJ]
+    pub fc1_b: Vec<f32>,    // [HIDDEN]
+    pub fc2_w: Vec<f32>,    // [PROJ, HIDDEN], no bias
+    pub lookback: Vec<f32>, // [PROJ, LOOKBACK_ORDER]
 }
 
-/// All FireRedVAD tensors held as flat row-major `f32`, ready for the
-/// forward pass. Linear weights are PyTorch-layout `[out, in]`; FSMN filters
-/// are depthwise `[channels, kernel]` (the singular `in_channels=1` conv1d
-/// dim is dropped).
-pub(crate) struct FireRedVadWeights {
+pub(crate) struct FireRedStreamVadWeights {
     pub fc1_w: Vec<f32>,           // [HIDDEN, NUM_MEL_BINS]
     pub fc1_b: Vec<f32>,           // [HIDDEN]
     pub fc2_w: Vec<f32>,           // [PROJ, HIDDEN]
     pub fc2_b: Vec<f32>,           // [PROJ]
     pub fsmn1_lookback: Vec<f32>,  // [PROJ, LOOKBACK_ORDER]
-    pub fsmn1_lookahead: Vec<f32>, // [PROJ, LOOKAHEAD_ORDER]
     pub blocks: Vec<BlockWeights>, // len NUM_BLOCKS
     pub dnn_w: Vec<f32>,           // [HIDDEN, PROJ]
     pub dnn_b: Vec<f32>,           // [HIDDEN]
@@ -83,17 +78,17 @@ pub(crate) struct FireRedVadWeights {
     pub cmvn_inv_stddev: [f32; NUM_MEL_BINS],
 }
 
-impl FireRedVadWeights {
+impl FireRedStreamVadWeights {
     /// Load the vendored, validated weights. Infallible in practice (the
-    /// blob is committed), but returns a typed error rather than panicking
-    /// so callers can decline to register the engine.
-    pub(crate) fn embedded() -> Result<Self, FireRedVadWeightsError> {
+    /// blob is committed), but returns a typed error rather than panicking so
+    /// callers can decline to register the engine.
+    pub(crate) fn embedded() -> Result<Self, FireRedStreamVadWeightsError> {
         Self::parse(WEIGHTS_BYTES)
     }
 
-    fn parse(bytes: &[u8]) -> Result<Self, FireRedVadWeightsError> {
+    fn parse(bytes: &[u8]) -> Result<Self, FireRedStreamVadWeightsError> {
         if bytes.len() < 8 {
-            return Err(FireRedVadWeightsError::Truncated {
+            return Err(FireRedStreamVadWeightsError::Truncated {
                 len: bytes.len(),
                 need: 8,
             });
@@ -102,31 +97,31 @@ impl FireRedVadWeights {
         let header_end = 8usize
             .checked_add(header_len)
             .filter(|end| *end <= bytes.len())
-            .ok_or(FireRedVadWeightsError::Truncated {
+            .ok_or(FireRedStreamVadWeightsError::Truncated {
                 len: bytes.len(),
                 need: 8 + header_len,
             })?;
         let header: BTreeMap<String, serde_json::Value> =
             serde_json::from_slice(&bytes[8..header_end])
-                .map_err(|error| FireRedVadWeightsError::Header(error.to_string()))?;
+                .map_err(|error| FireRedStreamVadWeightsError::Header(error.to_string()))?;
         let data = &bytes[header_end..];
 
         let load_named =
-            |name: String, want_len: usize| -> Result<Vec<f32>, FireRedVadWeightsError> {
+            |name: String, want_len: usize| -> Result<Vec<f32>, FireRedStreamVadWeightsError> {
                 let value = header
                     .get(&name)
-                    .ok_or_else(|| FireRedVadWeightsError::MissingTensor(name.clone()))?;
+                    .ok_or_else(|| FireRedStreamVadWeightsError::MissingTensor(name.clone()))?;
                 let info: TensorInfo = TensorInfo::deserialize(value)
-                    .map_err(|error| FireRedVadWeightsError::Header(error.to_string()))?;
+                    .map_err(|error| FireRedStreamVadWeightsError::Header(error.to_string()))?;
                 if info.dtype != "F32" {
-                    return Err(FireRedVadWeightsError::Dtype {
+                    return Err(FireRedStreamVadWeightsError::Dtype {
                         name,
                         dtype: info.dtype,
                     });
                 }
                 let got_len: usize = info.shape.iter().product();
                 if got_len != want_len {
-                    return Err(FireRedVadWeightsError::Len {
+                    return Err(FireRedStreamVadWeightsError::Len {
                         name,
                         got: got_len,
                         want: want_len,
@@ -134,7 +129,7 @@ impl FireRedVadWeights {
                 }
                 let [start, end] = info.data_offsets;
                 if end < start || end > data.len() {
-                    return Err(FireRedVadWeightsError::Bounds {
+                    return Err(FireRedStreamVadWeightsError::Bounds {
                         name,
                         range: [start, end],
                     });
@@ -143,24 +138,23 @@ impl FireRedVadWeights {
             };
         let load = |name: &str, want_len: usize| load_named(name.to_string(), want_len);
 
-        // Hyperparameter guard: the hand-written forward pass hard-codes
-        // R/M/H/P/N1/S1/N2/S2/idim/odim as Rust constants, so assert the
-        // vendored checkpoint still matches before trusting the tensor shapes.
+        // Hyperparameter guard: N2 = 0 is the load-bearing invariant that
+        // makes the hand-written forward pass causal-only.
         {
-            let value = header
-                .get("hparams")
-                .ok_or_else(|| FireRedVadWeightsError::MissingTensor("hparams".to_string()))?;
+            let value = header.get("hparams").ok_or_else(|| {
+                FireRedStreamVadWeightsError::MissingTensor("hparams".to_string())
+            })?;
             let info: TensorInfo = TensorInfo::deserialize(value)
-                .map_err(|error| FireRedVadWeightsError::Header(error.to_string()))?;
+                .map_err(|error| FireRedStreamVadWeightsError::Header(error.to_string()))?;
             if info.dtype != "I32" {
-                return Err(FireRedVadWeightsError::Dtype {
+                return Err(FireRedStreamVadWeightsError::Dtype {
                     name: "hparams".to_string(),
                     dtype: info.dtype,
                 });
             }
             let [start, end] = info.data_offsets;
             if end < start || end > data.len() {
-                return Err(FireRedVadWeightsError::Bounds {
+                return Err(FireRedStreamVadWeightsError::Bounds {
                     name: "hparams".to_string(),
                     range: [start, end],
                 });
@@ -176,13 +170,13 @@ impl FireRedVadWeights {
                 PROJ as i32,
                 LOOKBACK_ORDER as i32,
                 1,
-                LOOKAHEAD_ORDER as i32,
+                0, // N2 = 0: no lookahead, causal-only.
                 1,
                 NUM_MEL_BINS as i32,
                 1,
             ];
             if got != want {
-                return Err(FireRedVadWeightsError::HparamMismatch { got, want });
+                return Err(FireRedStreamVadWeightsError::HparamMismatch { got, want });
             }
         }
 
@@ -193,7 +187,6 @@ impl FireRedVadWeights {
                 fc1_b: load(&format!("dfsmn.block{i}.fc1.bias"), HIDDEN)?,
                 fc2_w: load(&format!("dfsmn.block{i}.fc2.weight"), PROJ * HIDDEN)?,
                 lookback: load(&format!("dfsmn.block{i}.lookback"), PROJ * LOOKBACK_ORDER)?,
-                lookahead: load(&format!("dfsmn.block{i}.lookahead"), PROJ * LOOKAHEAD_ORDER)?,
             });
         }
 
@@ -212,7 +205,6 @@ impl FireRedVadWeights {
             fc2_w: load("dfsmn.fc2.weight", PROJ * HIDDEN)?,
             fc2_b: load("dfsmn.fc2.bias", PROJ)?,
             fsmn1_lookback: load("dfsmn.fsmn1.lookback", PROJ * LOOKBACK_ORDER)?,
-            fsmn1_lookahead: load("dfsmn.fsmn1.lookahead", PROJ * LOOKAHEAD_ORDER)?,
             blocks,
             dnn_w: load("dfsmn.dnn.weight", HIDDEN * PROJ)?,
             dnn_b: load("dfsmn.dnn.bias", HIDDEN)?,
@@ -237,7 +229,7 @@ mod weights_tests {
 
     #[test]
     fn embedded_weights_parse_with_expected_shapes() {
-        let w = FireRedVadWeights::embedded().expect("vendored firered VAD weights parse");
+        let w = FireRedStreamVadWeights::embedded().expect("vendored firered Stream-VAD weights");
         assert_eq!(w.fc1_w.len(), HIDDEN * NUM_MEL_BINS);
         assert_eq!(w.blocks.len(), NUM_BLOCKS);
         assert_eq!(w.out_w.len(), HIDDEN);

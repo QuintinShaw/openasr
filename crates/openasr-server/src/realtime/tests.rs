@@ -1096,7 +1096,7 @@ fn into_vad_config_hangover_is_mode_conditional() {
     unsafe { std::env::remove_var("OPENASR_VAD") };
 
     let neural = ClientVadConfig {
-        engine: Some("silero".to_string()),
+        engine: Some("neural".to_string()),
         ..Default::default()
     }
     .into_vad_config(DEFAULT_FRAME_DURATION_MS);
@@ -1122,7 +1122,7 @@ fn into_vad_config_hangover_is_mode_conditional() {
 
     // An explicit client value wins in either mode.
     let pinned = ClientVadConfig {
-        engine: Some("silero".to_string()),
+        engine: Some("neural".to_string()),
         speech_stop_ms: Some(123),
         ..Default::default()
     }

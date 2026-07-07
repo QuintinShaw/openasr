@@ -706,8 +706,8 @@ impl ClientAudioFormat {
 #[derive(Debug, Default, Deserialize)]
 struct ClientVadConfig {
     enabled: Option<bool>,
-    /// `"silero"`/`"neural"` selects the neural detector; `"energy"`/`"rms"` the
-    /// energy gate. Unset defaults to neural. `OPENASR_VAD` overrides this.
+    /// `"neural"` selects the neural (Stream-VAD) detector; `"energy"`/`"rms"`
+    /// the energy gate. Unset defaults to neural. `OPENASR_VAD` overrides this.
     engine: Option<String>,
     speech_start_ms: Option<u32>,
     speech_stop_ms: Option<u32>,
@@ -732,9 +732,7 @@ impl ClientVadConfig {
         // Debounce defaults are mode-conditional: neural sessions can start
         // sooner and stop a little sooner than the RMS energy gate because the
         // probability stream is less noisy. A client-supplied value wins
-        // regardless of mode. See also the fallback in
-        // `RealtimeSession::new_with_sequencer`, which restores the energy
-        // hangover when the neural model is unavailable.
+        // regardless of mode.
         let default_speech_start_ms = match mode {
             VadMode::ExternalProbability => {
                 openasr_core::diarize::vad::DEFAULT_NEURAL_SPEECH_START_MS
@@ -760,9 +758,9 @@ impl ClientVadConfig {
 
 /// Resolve the realtime VAD mode: `OPENASR_VAD` wins, then the client's `engine`,
 /// else **default to the neural detector** (it is more accurate at endpointing and
-/// unlocks the shorter neural hangover; an explicit `energy`/`rms` opts out, and a
-/// missing model falls back to the energy gate at session construction). Delegates
-/// to the shared `openasr-core` resolver so the server and CLI never diverge.
+/// unlocks the shorter neural hangover; an explicit `energy`/`rms` opts out).
+/// Delegates to the shared `openasr-core` resolver so the server and CLI never
+/// diverge.
 fn resolve_realtime_vad_mode(engine: Option<&str>) -> VadMode {
     if openasr_core::diarize::vad::realtime_vad_prefers_neural(engine) {
         VadMode::ExternalProbability
