@@ -78,6 +78,28 @@ jobs:
           cargo check --manifest-path tooling/system-audio-check/Cargo.toml
           cargo test --manifest-path tooling/system-audio-check/Cargo.toml -- --nocapture
 
+  ios-compile:
+    name: iOS compile gate (aarch64-apple-ios)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+      # Phase 1: a compile-only gate for the iOS device build of the engine
+      # crate -- no xcframework packaging, no app target. GitHub-hosted macOS
+      # runners ship a full Xcode with the iphoneos SDK, so this exercises the
+      # real cross-compile path: ggml via CMake's built-in Apple platform
+      # support (crates/openasr-core/build.rs), plus the Rust dependency tree
+      # incl. reqwest/ring's iOS asm build. openasr-cli/-server/-system-audio
+      # are desktop/CLI-shaped (system audio capture, HTTP server) and are not
+      # part of this gate; openasr-core alone represents the inference engine.
+      - name: Check openasr-core for aarch64-apple-ios
+        run: cargo check -p openasr-core --target aarch64-apple-ios
+
   dependency-policy:
     runs-on: ubuntu-latest
     steps:
