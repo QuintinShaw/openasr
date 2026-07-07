@@ -209,9 +209,13 @@ min_core_version = "0.1.8"
 # dedicated cn-dialect models). Cantonese (Dolphin's own `ct` code) is listed
 # separately as `yue`, matching Dolphin's own languages.md, which treats it as
 # a top-level language rather than a zh dialect.
+# Flipped public 2026-07-08 as part of the 0.1.9 batch (HF repo already made
+# public; catalog entry moves public:false -> public:true alongside the
+# min_core_version = 0.1.9 core release).
 ["dolphin-small"]
 family = "dolphin"
 hf_repo = "OpenASR/dolphin-small"
+release_public = true
 size = "small"
 registry_id = "dolphin-small"
 display_name = "Dolphin Small"
@@ -233,9 +237,11 @@ upstream_release_date = "2026-05-13"
 # not 0.1.8, so pin the runtime floor there.
 min_core_version = "0.1.9"
 
+# Flipped public 2026-07-08 alongside dolphin-small, same 0.1.9 batch.
 ["dolphin-base"]
 family = "dolphin"
 hf_repo = "OpenASR/dolphin-base"
+release_public = true
 size = "base"
 registry_id = "dolphin-base"
 display_name = "Dolphin Base"
@@ -498,9 +504,9 @@ upstream_release_date = "2022-09-21"
 # (FireRedASR-AED-L) never went public and its catalog entry was replaced by
 # this one rather than kept alongside it. Forward-compat floor pinned to the
 # 0.1.9 release that ships the family, mirroring dolphin-cn-dialect-small's
-# own min_core_version launch pattern. Staged private (release_public = true
-# only gates the eventual --public flip; the catalog entry itself stays
-# public:false until the 0.1.9 batch).
+# own min_core_version launch pattern. Flipped public 2026-07-08 as part of
+# the 0.1.9 batch (release_public already true; catalog entry moves
+# public:false -> public:true).
 ["firered-aed-l-v2"]
 family = "firered-aed"
 hf_repo = "OpenASR/firered-aed-l-v2"
@@ -527,13 +533,19 @@ min_core_version = "0.1.9"
 # (`qwen3-forced-aligner`) since its NAR (single forward pass, argmax at
 # `<timestamp>` positions) decode policy is materially different from the
 # qwen3-asr autoregressive runtime -- see
-# crates/openasr-core/src/models/qwen/forced_aligner_import.rs. STAGED ONLY:
-# no `release_public` -- this pack has no public catalog entry yet, and
-# publishing here is a private-HF-repo staging step only.
+# crates/openasr-core/src/models/qwen/forced_aligner_import.rs.
+# release_public=true gates the eventual --public flip (explicit user
+# go-ahead for the 0.1.9 batch), but the catalog entry itself stays
+# public:false for now: the anonymous public-listing gate (public_gate.py)
+# probed OpenASR/qwen3-forced-aligner-0.6b on 2026-07-08 and got HTTP 401 --
+# the HF repo is still private, unlike the other four models in this batch.
+# The gate is fail-closed by design (same anonymous surface end users hit), so
+# --public correctly refuses until the repo is made public on HF.
 ["qwen3-forced-aligner-0.6b"]
 kind = "capability-pack"
 family = "qwen3-forced-aligner"
 hf_repo = "OpenASR/qwen3-forced-aligner-0.6b"
+release_public = true
 size = "0.6b"
 registry_id = "qwen3-forced-aligner-0.6b"
 display_name = "Qwen3-ForcedAligner 0.6B"

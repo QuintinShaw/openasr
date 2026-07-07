@@ -34,20 +34,28 @@ credits the people who built the original.
 - Qwen3-ASR — <https://huggingface.co/OpenASR/qwen3-asr-0.6b>
 - Moonshine — <https://huggingface.co/OpenASR/moonshine-tiny>
 - X-ASR (Zipformer) — <https://huggingface.co/OpenASR/xasr-zh-en>
-- Dolphin CN-Dialect Small (DataoceanAI) — <https://huggingface.co/OpenASR/dolphin-cn-dialect-small>
+- Dolphin CN-Dialect Small/Base (DataoceanAI) — <https://huggingface.co/OpenASR/dolphin-cn-dialect-small>
+- Dolphin Small/Base (DataoceanAI, multilingual) --
+  <https://huggingface.co/OpenASR/dolphin-small> (40 languages plus Chinese
+  dialects; WeNet/ESPnet E-Branchformer, CTC + attention rescoring).
 - SenseVoice (FunAudioLLM, Alibaba Group; FunASR Model License v1.1) --
-  <https://huggingface.co/FunAudioLLM/SenseVoiceSmall> (runs from user-imported
-  packs until an OpenASR pack is published)
+  <https://huggingface.co/OpenASR/sensevoice-small>
 - Parakeet-CTC (NVIDIA NeMo) and wav2vec2 / data2vec (Meta AI) run from
   user-imported packs.
 - Parakeet TDT 0.6B v3 (NVIDIA, CC-BY-4.0) --
-  <https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3> (25 European languages;
+  <https://huggingface.co/OpenASR/parakeet-tdt-0.6b-v3> (25 European languages;
   FastConformer + Token-and-Duration Transducer, trained with NeMo on the
-  Granary corpus).
+  Granary corpus; original weights:
+  <https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3>).
 - FireRedASR2-AED (FireRedTeam, Apache-2.0) --
-  <https://huggingface.co/FireRedTeam/FireRedASR2-AED> (Mandarin + English
+  <https://huggingface.co/OpenASR/firered-aed-l-v2> (Mandarin + English
   bilingual, plus Chinese dialects; Conformer encoder + Transformer decoder
-  attention-based encoder-decoder; an OpenASR pack is staged, not yet public).
+  attention-based encoder-decoder; original weights:
+  <https://huggingface.co/FireRedTeam/FireRedASR2-AED>).
+- Qwen3-ForcedAligner 0.6B (Alibaba Qwen team, Apache-2.0) --
+  <https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B> (optional word-level
+  timestamp refinement via `--word-timestamps=aligned`; OpenASR pack staged,
+  not yet public).
 
 **Speaker diarization**
 
