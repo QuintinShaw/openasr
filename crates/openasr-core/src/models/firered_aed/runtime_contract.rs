@@ -52,7 +52,7 @@ pub(crate) struct FireRedAedExecutionMetadata {
 impl FireRedAedExecutionMetadata {
     /// Maximum encoder frame count the baked rel-pos table supports.
     pub(crate) fn encoder_max_frames(&self) -> usize {
-        (self.encoder_pe_len + 1) / 2
+        self.encoder_pe_len.div_ceil(2)
     }
 }
 
