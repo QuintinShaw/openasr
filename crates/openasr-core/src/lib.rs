@@ -18,6 +18,7 @@ mod arch;
 pub(crate) mod audio;
 pub(crate) mod batch;
 pub(crate) mod benchmark;
+pub(crate) mod capability_pack;
 pub mod config;
 pub mod device;
 pub mod diarize;
@@ -265,12 +266,12 @@ pub use realtime::{
     VadStateMachine,
 };
 pub use registry::{
-    BackendResolutionError, CATALOG_FEATURE_SPEAKER_DIARIZATION, CatalogBackend,
-    CatalogBackendFile, CatalogBackendFileRole, CatalogBackendVendor, CatalogCapability,
-    CatalogCapabilityRole, CatalogError, CatalogLanguageMode, CatalogMirror, CatalogModel,
-    CatalogModelKind, CatalogProse, CatalogPullRequest, CatalogQuant, CatalogQuantPerf,
-    CatalogQuantRecommendationProfile, LicenseClass, ModelAvailability, ModelCard, ModelCatalog,
-    ModelRef, ModelResolutionError, ModelVariantMetadata, RegistryError,
+    BackendResolutionError, CATALOG_FEATURE_SPEAKER_DIARIZATION, CATALOG_FEATURE_WORD_TIMESTAMPS,
+    CatalogBackend, CatalogBackendFile, CatalogBackendFileRole, CatalogBackendVendor,
+    CatalogCapability, CatalogCapabilityRole, CatalogError, CatalogLanguageMode, CatalogMirror,
+    CatalogModel, CatalogModelKind, CatalogProse, CatalogPullRequest, CatalogQuant,
+    CatalogQuantPerf, CatalogQuantRecommendationProfile, LicenseClass, ModelAvailability,
+    ModelCard, ModelCatalog, ModelRef, ModelResolutionError, ModelVariantMetadata, RegistryError,
     ResolvedCatalogBackendPull, ResolvedCatalogPull, ResolvedModel, ResolvedRuntimeModelRef,
     RuntimeModelRefSource, RuntimeModelResolutionError, canonical_quant_tag, current_cli_version,
     default_catalog_cache_path, default_catalog_url, default_registry_dir,

@@ -59,6 +59,22 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   returns an empty word list -- its attention-based encoder-decoder has no
   alignment head exposed yet, so `--word-timestamps` requests yield a
   segment-level span rather than fabricated per-word times.
+- Word-timestamp refinement (`--word-timestamps=aligned` / API
+  `timestamp_granularities=word_aligned`) is an opt-in tier on top of the
+  approximate timestamps above: it re-runs the finished transcript and the full
+  source audio through the Qwen3-ForcedAligner-0.6B capability pack and
+  replaces each segment's word spans with the aligner's own output. Passing
+  `=aligned` is the consent to install the pack (mirroring `--diarize`'s
+  WeSpeaker auto-install); the native backend never installs it silently
+  otherwise, and the server never auto-installs it at all (operator-gated pull
+  only). It is native-backend-only, requires `--word-timestamps` semantics
+  implicitly (word timestamps are always emitted for `aligned`), and does not
+  yet support Japanese or Korean transcripts -- the reference routes those
+  through external morphological segmenters (`nagisa`/`soynlp`) that have not
+  been ported, so an `aligned` request against ja/ko text fails closed with a
+  typed error rather than mis-tokenizing. Every other family keeps its
+  approximate timestamps unchanged; `aligned` only affects the words replaced
+  by the aligner's output, never segment text or speaker attribution.
 - Hardware execution target selection is generic: Desktop/server requests support
   `auto`, `cpu`, and `accelerated` when the native runtime reports an accelerated
   device. There is no per-provider/per-device pinning surface such as `gpu0`,

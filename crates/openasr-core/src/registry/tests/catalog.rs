@@ -256,11 +256,19 @@ fn runtime_variant_card(id: &str, quantization: &str) -> ModelCard {
 }
 
 fn capability_pack_model(id: &str, role: CatalogCapabilityRole) -> CatalogModel {
+    capability_pack_model_with_feature(id, CATALOG_FEATURE_SPEAKER_DIARIZATION, role)
+}
+
+fn capability_pack_model_with_feature(
+    id: &str,
+    feature: &str,
+    role: CatalogCapabilityRole,
+) -> CatalogModel {
     let revision = "0123456789abcdef0123456789abcdef01234567";
     let mut model = alias_contract_model(id, id, id, &[], None, "embedder", true);
     model.kind = CatalogModelKind::CapabilityPack;
     model.capability = Some(CatalogCapability {
-        feature: CATALOG_FEATURE_SPEAKER_DIARIZATION.to_string(),
+        feature: feature.to_string(),
         role,
     });
     model.recommended_quant = "f32".to_string();
@@ -440,6 +448,50 @@ fn speaker_diarization_required_pack_selects_wespeaker_embedder() {
         .speaker_diarization_required_embedder_pack()
         .expect("WeSpeaker required pack");
     assert_eq!(default_required.id, "wespeaker-voxceleb-resnet34-lm");
+}
+
+#[test]
+fn word_timestamps_forced_aligner_pack_selects_the_aligner_capability_pack() {
+    let mut catalog = alias_contract_catalog();
+    catalog.models.push(capability_pack_model(
+        "wespeaker-voxceleb-resnet34-lm",
+        CatalogCapabilityRole::SpeakerEmbedder,
+    ));
+    catalog.models.push(capability_pack_model_with_feature(
+        "qwen3-forced-aligner-0.6b",
+        CATALOG_FEATURE_WORD_TIMESTAMPS,
+        CatalogCapabilityRole::ForcedAligner,
+    ));
+
+    let aligner = catalog
+        .word_timestamps_forced_aligner_pack()
+        .expect("forced-aligner capability pack");
+    assert_eq!(aligner.id, "qwen3-forced-aligner-0.6b");
+}
+
+#[test]
+fn word_timestamps_forced_aligner_pack_is_none_when_absent() {
+    let mut catalog = alias_contract_catalog();
+    catalog.models.push(capability_pack_model(
+        "wespeaker-voxceleb-resnet34-lm",
+        CatalogCapabilityRole::SpeakerEmbedder,
+    ));
+
+    assert!(catalog.word_timestamps_forced_aligner_pack().is_none());
+}
+
+#[test]
+fn word_timestamps_forced_aligner_pack_ignores_staged_non_public_entries() {
+    let mut catalog = alias_contract_catalog();
+    let mut staged = capability_pack_model_with_feature(
+        "qwen3-forced-aligner-0.6b",
+        CATALOG_FEATURE_WORD_TIMESTAMPS,
+        CatalogCapabilityRole::ForcedAligner,
+    );
+    staged.public = false;
+    catalog.models.push(staged);
+
+    assert!(catalog.word_timestamps_forced_aligner_pack().is_none());
 }
 
 #[test]

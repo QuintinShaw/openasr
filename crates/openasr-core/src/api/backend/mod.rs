@@ -302,6 +302,15 @@ pub struct TranscriptionRequest {
     pub inference_threads: Option<u16>,
     pub execution_target: Option<ExecutionTarget>,
     pub word_timestamps: bool,
+    /// Opt-in refinement tier (`--word-timestamps=aligned` / API
+    /// `word_timestamps_mode=aligned`): after the family's own decode produces
+    /// the transcript and its approximate per-word timestamps, re-run the
+    /// installed Qwen3-ForcedAligner-0.6B capability pack over the finished
+    /// text and full audio and replace each segment's words with the
+    /// aligner-refined spans. Requires `word_timestamps` to also be `true`
+    /// (checked fail-closed, not silently implied) and the capability pack to
+    /// already be installed -- the native backend never downloads it.
+    pub word_timestamps_refine: bool,
     pub longform: Option<LongFormOptions>,
     pub display_file_name: Option<String>,
     pub diarize: bool,
@@ -324,6 +333,7 @@ impl TranscriptionRequest {
             inference_threads: None,
             execution_target: None,
             word_timestamps: false,
+            word_timestamps_refine: false,
             longform: None,
             display_file_name: None,
             diarize: false,
@@ -363,6 +373,11 @@ impl TranscriptionRequest {
 
     pub fn with_word_timestamps(mut self, word_timestamps: bool) -> Self {
         self.word_timestamps = word_timestamps;
+        self
+    }
+
+    pub fn with_word_timestamps_refine(mut self, word_timestamps_refine: bool) -> Self {
+        self.word_timestamps_refine = word_timestamps_refine;
         self
     }
 
@@ -685,6 +700,18 @@ pub enum BackendError {
         "Native ASR Core serve-batch decode is temporarily unavailable: {reason}\nThis is a transient condition; retry the request."
     )]
     ServeBatchUnavailable { reason: String, retryable: bool },
+    #[error(
+        "word_timestamps_refine=true (--word-timestamps=aligned) requires word_timestamps=true.\nThe request was rejected instead of silently aligning without emitting words."
+    )]
+    WordTimestampAlignmentRequiresWordTimestamps,
+    #[error(
+        "Word-timestamp alignment refinement (--word-timestamps=aligned) is not available for the {backend} backend: the Qwen3-ForcedAligner-0.6B capability pack is not installed.\nInstall it, or use --word-timestamps for the model's own approximate timestamps."
+    )]
+    WordTimestampAlignmentPackMissing { backend: &'static str },
+    #[error(
+        "Word-timestamp alignment refinement failed: {reason}\nThe request was rejected instead of returning approximate timestamps silently relabeled as aligned."
+    )]
+    WordTimestampAlignmentFailed { reason: String },
 }
 
 #[cfg(test)]

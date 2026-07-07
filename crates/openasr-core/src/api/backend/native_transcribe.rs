@@ -29,7 +29,11 @@ use crate::{
 
 use super::{BackendError, Transcription, TranscriptionRequest};
 use crate::Segment;
+use crate::WordTimestamp;
 use crate::api::backend::TranscriptionLongFormMetadata;
+use crate::models::qwen::{
+    ForcedAlignItem, forced_aligner_pack, refine_word_timestamps_with_forced_aligner,
+};
 
 const DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS: f32 = 30.0;
 const COHERE_LONGFORM_MAX_CHUNK_SECONDS: f32 = 10.0;
@@ -96,7 +100,108 @@ struct NativeLongformPolicyResolution {
     provenance: Vec<String>,
 }
 
+/// Entry point for the native backend: runs the ordinary decode/longform/
+/// diarization pipeline unchanged (`run_native_transcription_impl`), then --
+/// only when the request opted into `--word-timestamps=aligned`
+/// (`word_timestamps_refine`) -- refines the finished transcript's per-word
+/// timestamps with the installed Qwen3-ForcedAligner-0.6B capability pack.
+/// Kept as a thin wrapper rather than threading the refinement into the
+/// (already long) decode/longform function: the aligner re-reads the whole
+/// file and the finished transcript text, so it has no dependency on any
+/// intermediate state that function computes.
 pub(super) fn run_native_transcription(
+    request: TranscriptionRequest,
+) -> Result<Transcription, BackendError> {
+    let refine = request.word_timestamps_refine;
+    if refine && !request.word_timestamps {
+        return Err(BackendError::WordTimestampAlignmentRequiresWordTimestamps);
+    }
+    let input_path = request.input_path.clone();
+    let language_hint = request.language.clone();
+    let transcription = run_native_transcription_impl(request)?;
+    if refine {
+        refine_transcription_word_timestamps_with_forced_aligner(
+            transcription,
+            &input_path,
+            language_hint.as_deref(),
+        )
+    } else {
+        Ok(transcription)
+    }
+}
+
+/// Re-decodes `input_path` and calls the installed Qwen3-ForcedAligner pack
+/// once over the whole finished transcript, then reassigns each segment's
+/// `words` from the aligner's own per-word spans (dropping the family's
+/// approximate per-word confidence -- the aligner does not produce one; never
+/// inventing a value is preferred to fabricating one). Segments/text/speaker
+/// attribution from the ordinary decode path are left untouched; only `words`
+/// changes.
+fn refine_transcription_word_timestamps_with_forced_aligner(
+    mut transcription: Transcription,
+    input_path: &Path,
+    language_hint: Option<&str>,
+) -> Result<Transcription, BackendError> {
+    let pack_path = forced_aligner_pack::resolve_forced_aligner_pack_path()
+        .ok_or(BackendError::WordTimestampAlignmentPackMissing { backend: "native" })?;
+    let prepared_audio = load_wav_16khz_mono_f32_v0(
+        input_path,
+        "Native ASR Core backend",
+        "Native ASR Core backend",
+    )
+    .map_err(|error| BackendError::NativeUnsupportedInputFormat {
+        reason: error.to_string(),
+    })?;
+    let language = transcription
+        .language
+        .clone()
+        .or_else(|| language_hint.map(str::to_string))
+        .unwrap_or_else(|| "en".to_string());
+    let items = refine_word_timestamps_with_forced_aligner(
+        &pack_path,
+        &prepared_audio,
+        &transcription.text,
+        &language,
+    )
+    .map_err(|error| BackendError::WordTimestampAlignmentFailed {
+        reason: error.to_string(),
+    })?;
+    assign_aligned_words_to_segments(&mut transcription.segments, &items);
+    Ok(transcription)
+}
+
+/// Distributes forced-aligner word spans onto the (time-ordered,
+/// non-overlapping) segments they fall into: each item's start time selects
+/// the last segment whose own start is `<=` it (segments are sorted and cover
+/// the whole file, so this always finds the enclosing segment for a
+/// well-formed decode). A segment with no aligned words keeps its prior
+/// (family-approximate) word list rather than being emptied -- most often
+/// because there is exactly one segment and the whole item list lands in it.
+fn assign_aligned_words_to_segments(segments: &mut [Segment], items: &[ForcedAlignItem]) {
+    if segments.is_empty() || items.is_empty() {
+        return;
+    }
+    let mut buckets: Vec<Vec<WordTimestamp>> = segments.iter().map(|_| Vec::new()).collect();
+    for item in items {
+        let segment_index = segments
+            .iter()
+            .rposition(|segment| f64::from(segment.start) <= item.start_time_s)
+            .unwrap_or(0);
+        buckets[segment_index].push(WordTimestamp {
+            word: item.text.clone(),
+            start: item.start_time_s as f32,
+            end: item.end_time_s as f32,
+            confidence: None,
+        });
+    }
+    for (segment, bucket) in segments.iter_mut().zip(buckets) {
+        if !bucket.is_empty() {
+            segment.words = bucket;
+        }
+    }
+}
+
+fn run_native_transcription_impl(
     request: TranscriptionRequest,
 ) -> Result<Transcription, BackendError> {
     let requested_model_id = normalize_and_validate_model_id(&request)?;
@@ -1721,5 +1826,69 @@ mod tests {
             LongFormVadEngine::FireRed,
             zh_wav_path(),
         );
+    }
+
+    fn segment(start: f32, end: f32, text: &str) -> Segment {
+        Segment {
+            start,
+            end,
+            text: text.to_string(),
+            speaker: None,
+            speaker_label: None,
+            speaker_profile_id: None,
+            words: vec![WordTimestamp {
+                word: text.to_string(),
+                start,
+                end,
+                confidence: Some(0.9),
+            }],
+        }
+    }
+
+    fn item(text: &str, start_time_s: f64, end_time_s: f64) -> ForcedAlignItem {
+        ForcedAlignItem {
+            text: text.to_string(),
+            start_time_s,
+            end_time_s,
+        }
+    }
+
+    #[test]
+    fn assign_aligned_words_replaces_words_within_one_segment() {
+        let mut segments = vec![segment(0.0, 2.0, "hello world")];
+        let items = vec![item("hello", 0.1, 0.4), item("world", 0.5, 0.9)];
+
+        assign_aligned_words_to_segments(&mut segments, &items);
+
+        let words = &segments[0].words;
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].word, "hello");
+        assert_eq!(words[0].start, 0.1);
+        assert_eq!(words[0].end, 0.4);
+        assert_eq!(words[0].confidence, None);
+        assert_eq!(words[1].word, "world");
+    }
+
+    #[test]
+    fn assign_aligned_words_distributes_across_segments_by_start_time() {
+        let mut segments = vec![segment(0.0, 1.0, "hi"), segment(1.0, 2.0, "there")];
+        let items = vec![item("hi", 0.1, 0.5), item("there", 1.2, 1.6)];
+
+        assign_aligned_words_to_segments(&mut segments, &items);
+
+        assert_eq!(segments[0].words.len(), 1);
+        assert_eq!(segments[0].words[0].word, "hi");
+        assert_eq!(segments[1].words.len(), 1);
+        assert_eq!(segments[1].words[0].word, "there");
+    }
+
+    #[test]
+    fn assign_aligned_words_leaves_segments_untouched_when_items_empty() {
+        let mut segments = vec![segment(0.0, 1.0, "hi")];
+        let original_words = segments[0].words.clone();
+
+        assign_aligned_words_to_segments(&mut segments, &[]);
+
+        assert_eq!(segments[0].words, original_words);
     }
 }

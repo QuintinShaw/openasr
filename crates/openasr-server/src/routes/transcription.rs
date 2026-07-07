@@ -504,9 +504,18 @@ impl TranscriptionRequestBuilder {
         };
         let phrase_bias =
             build_phrase_bias_config(&phrase_bias_phrases, hotword_boost, phrase_bias_boost)?;
-        let word_timestamps = timestamp_granularities
+        // `word_aligned` opts into the Qwen3-ForcedAligner-0.6B refinement tier
+        // (see `--word-timestamps=aligned`); it also implies `word` so callers
+        // do not have to pass both. The server never auto-installs the pack --
+        // a missing pack fails the request closed (BackendError mapped to 400)
+        // rather than silently falling back to approximate timestamps.
+        let word_timestamps_refine = timestamp_granularities
             .iter()
-            .any(|value| value.as_str() == "word");
+            .any(|value| value.as_str() == "word_aligned");
+        let word_timestamps = word_timestamps_refine
+            || timestamp_granularities
+                .iter()
+                .any(|value| value.as_str() == "word");
         let uploaded_path: &Path = uploaded_file.as_ref();
         let request = TranscriptionRequest::new(uploaded_path.to_path_buf(), model_id)
             .with_language(language)
@@ -517,6 +526,7 @@ impl TranscriptionRequestBuilder {
             .with_inference_threads(inference_threads)
             .with_execution_target(execution_target)
             .with_word_timestamps(word_timestamps)
+            .with_word_timestamps_refine(word_timestamps_refine)
             .with_display_file_name(file_name)
             .with_diarization(diarize)
             .with_diarize_speakers(speakers);
@@ -963,10 +973,10 @@ fn build_phrase_bias_config(
 fn validate_timestamp_granularities(values: &[String]) -> Result<(), ApiError> {
     for value in values {
         match value.as_str() {
-            "segment" | "word" => {}
+            "segment" | "word" | "word_aligned" => {}
             other => {
                 return Err(ApiError::BadRequest(format!(
-                    "Unsupported timestamp granularity '{other}'. Use one of: segment, word."
+                    "Unsupported timestamp granularity '{other}'. Use one of: segment, word, word_aligned."
                 )));
             }
         }
@@ -1043,7 +1053,8 @@ pub(crate) async fn transcribe_with_runtime(
                         .with_phrase_bias(request.phrase_bias.clone())
                         .with_inference_threads(request.inference_threads)
                         .with_diarization(request.diarize)
-                        .with_word_timestamps(request.word_timestamps),
+                        .with_word_timestamps(request.word_timestamps)
+                        .with_word_timestamps_refine(request.word_timestamps_refine),
                 )
                 .with_longform(request.longform.clone())
                 .with_display_file_name(request.display_file_name.clone());
