@@ -330,6 +330,38 @@ pub(crate) fn transcribe_dolphin_pcm(
     )
 }
 
+/// Parse the pack's `dolphin.language.scheme` metadata (see [`LANGUAGE_SCHEME_KEY`])
+/// into the typed [`DolphinLanguageScheme`] that dispatches the decode-prefix
+/// builder, audio frontend, and encoder rel-pos-attention scheme. A **missing**
+/// key is an intentional backward-compat default to `CnDialect` -- every pack
+/// baked before this key existed (both originally published dolphin packs) is
+/// cn-dialect. A key that IS **present** but holds anything other than the two
+/// recognized values fails closed with a typed error instead of silently
+/// falling back: a corrupt or future-versioned pack must never be silently
+/// misdispatched to the wrong frontend/attention scheme.
+fn parse_dolphin_language_scheme(metadata: &GgufMetadata) -> Result<DolphinLanguageScheme, String> {
+    parse_dolphin_language_scheme_value(metadata.get_string(LANGUAGE_SCHEME_KEY))
+}
+
+/// The string-level half of [`parse_dolphin_language_scheme`], split out so a
+/// test can pin it against [`DolphinLanguageScheme::label`] (the importer's
+/// writer) without needing to construct a [`GgufMetadata`] -- the two literal
+/// sets (writer labels here, reader match arms in `package_import.rs`) must
+/// never drift out of sync.
+fn parse_dolphin_language_scheme_value(
+    value: Option<&str>,
+) -> Result<DolphinLanguageScheme, String> {
+    match value {
+        None => Ok(DolphinLanguageScheme::CnDialect),
+        Some("cn_dialect") => Ok(DolphinLanguageScheme::CnDialect),
+        Some("multilingual") => Ok(DolphinLanguageScheme::Multilingual),
+        Some(other) => Err(format!(
+            "dolphin pack has unrecognized '{LANGUAGE_SCHEME_KEY}' value {other:?} \
+             (expected 'cn_dialect' or 'multilingual')"
+        )),
+    }
+}
+
 /// Run the fbank+CMVN -> encoder -> joint-decode -> detokenize pipeline over
 /// already-loaded `weights`. Split out from [`transcribe_dolphin_pcm`] so the
 /// executor can reuse pooled weights across requests without re-dequantizing.
@@ -351,11 +383,10 @@ pub(crate) fn run_dolphin_pipeline(
     // dispatches three things that all trace back to which of the two
     // DataoceanAI training pipelines produced the checkpoint: the decode
     // prefix builder (below), the audio frontend, and the encoder's
-    // relative-position-attention scheme (`DolphinEncoderConfig`).
-    let language_scheme = match metadata.get_string(LANGUAGE_SCHEME_KEY) {
-        Some("multilingual") => DolphinLanguageScheme::Multilingual,
-        _ => DolphinLanguageScheme::CnDialect,
-    };
+    // relative-position-attention scheme (`DolphinEncoderConfig`). See
+    // `parse_dolphin_language_scheme` for the fail-closed handling of a
+    // present-but-unrecognized value.
+    let language_scheme = parse_dolphin_language_scheme(metadata)?;
     // Build the `<sos> <lang> <region> <asr> <notimestamp>` prefix per request
     // from the pack vocab; fail closed (typed) on an unknown code or a missing
     // language/region token.
@@ -521,9 +552,14 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
         // Fail closed on an incomplete pack (missing runtime scalar keys).
         parse_dolphin_execution_metadata(&preflight.metadata, preflight.tensor_index.as_ref())
             .map_err(|error| fail(format!("dolphin runtime metadata contract failed: {error}")))?;
+        // Resolve the language scheme once here (fail closed on an unrecognized
+        // value at Gate-0, before any decode work); `run_dolphin_pipeline` below
+        // re-derives the same result from the same metadata key rather than
+        // threading it through, per its own doc comment.
+        let language_scheme = parse_dolphin_language_scheme(&preflight.metadata).map_err(fail)?;
         // Confirm the encoder + CTC namespaces are actually baked before decoding.
         let mut sentinels = ENCODER_SENTINEL_TENSORS.to_vec();
-        if preflight.metadata.get_string(LANGUAGE_SCHEME_KEY) != Some("multilingual") {
+        if language_scheme == DolphinLanguageScheme::CnDialect {
             sentinels.push(ENCODER_CN_DIALECT_SENTINEL_TENSOR);
         }
         for sentinel in sentinels {
@@ -626,6 +662,38 @@ mod tests {
 
     const FIXTURE_ROOT: &str =
         "/Volumes/QuintinDocument/openasr-dev/openasr/tmp/publish/dolphin-cn-dialect-small";
+
+    /// Pin the importer's `DolphinLanguageScheme::label()` writer against this
+    /// module's `parse_dolphin_language_scheme_value` reader: every scheme must
+    /// round-trip label -> parse -> the same scheme, so the two literal sets
+    /// (write side here, read side in `package_import.rs`) cannot silently drift
+    /// apart. Also pins the backward-compat default (missing key -> CnDialect)
+    /// and the fail-closed rejection of an unrecognized value.
+    #[test]
+    fn language_scheme_label_round_trips_through_the_executor_parser() {
+        for scheme in [
+            DolphinLanguageScheme::CnDialect,
+            DolphinLanguageScheme::Multilingual,
+        ] {
+            assert_eq!(
+                parse_dolphin_language_scheme_value(Some(scheme.label())),
+                Ok(scheme),
+                "label {:?} must parse back to {scheme:?}",
+                scheme.label()
+            );
+        }
+        assert_eq!(
+            parse_dolphin_language_scheme_value(None),
+            Ok(DolphinLanguageScheme::CnDialect),
+            "a missing scheme key must keep defaulting to cn-dialect for pre-existing packs"
+        );
+        assert!(
+            parse_dolphin_language_scheme_value(Some("bogus"))
+                .unwrap_err()
+                .contains("bogus"),
+            "an unrecognized scheme value must fail closed rather than silently default"
+        );
+    }
 
     /// Golden `attention_rescoring` transcript (manifest `text_nospecial`): the
     /// model's own joint-decode output for the Sichuan clip. This is the parity
