@@ -42,6 +42,53 @@ fn serve_batch_unavailable_non_retryable_maps_to_503() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
+fn header_map_with_bearer(token: &str) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    headers
+}
+
+#[test]
+fn from_token_hashes_authorizes_only_the_matching_token() {
+    let auth = ServerAuth::from_token_hashes([bearer_token_hash("agent-secret")]);
+    assert!(auth.authorizes(&header_map_with_bearer("agent-secret")));
+    assert!(!auth.authorizes(&header_map_with_bearer("wrong-token")));
+    assert!(!auth.authorizes(&axum::http::HeaderMap::new()));
+}
+
+#[test]
+fn from_token_hashes_with_no_hashes_disables_auth() {
+    let auth = ServerAuth::from_token_hashes(Vec::<String>::new());
+    assert!(!auth.is_enabled());
+    // Disabled auth authorizes everyone -- this is the loopback-default-free
+    // state before any `openasr apikey create`.
+    assert!(auth.authorizes(&axum::http::HeaderMap::new()));
+}
+
+#[test]
+fn from_token_hashes_supports_multiple_concurrently_valid_keys() {
+    let auth =
+        ServerAuth::from_token_hashes([bearer_token_hash("key-a"), bearer_token_hash("key-b")]);
+    assert!(auth.authorizes(&header_map_with_bearer("key-a")));
+    assert!(auth.authorizes(&header_map_with_bearer("key-b")));
+    assert!(!auth.authorizes(&header_map_with_bearer("key-c")));
+}
+
+#[test]
+fn core_api_key_hash_matches_server_bearer_hash() {
+    // `openasr-cli` persists `openasr_core::apikeys::ApiKeyStore` hashes and
+    // hands them to `ServerAuth::from_token_hashes`; the two hash functions
+    // must stay identical (SHA-256 hex) or every configured key would
+    // silently stop authorizing at the API boundary.
+    let token = "oasr_sk_test-drift-check-token";
+    let core_hash = openasr_core::apikeys::hash_api_key_token(token);
+    let auth = ServerAuth::from_token_hashes([core_hash]);
+    assert!(auth.authorizes(&header_map_with_bearer(token)));
+}
+
 fn resolved_pull_fixture() -> ResolvedCatalogPull {
     ResolvedCatalogPull {
         requested: "moonshine-tiny:q8".to_string(),

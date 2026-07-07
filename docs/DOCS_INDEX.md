@@ -18,6 +18,7 @@ contributors -- crate relationships, the audio-to-transcript pipeline, and the
 | [Known Limitations](KNOWN_LIMITATIONS.md) | Current user-visible limits: no public binary release yet, `.oasr`-only native packs, gated streaming/diarization (declared/capability packs only), generic accelerator selection, and internal-only benchmarks. |
 | [FAQ](FAQ.md) | Current-behavior questions: what OpenASR is, which families run, which backends are active, and the conservative offline transcription lane. |
 | [Releasing](../RELEASING.md) | The commit-driven release process: the single workspace version, `scripts/bump-version.sh`, and the version-triggered `Release core` workflow. |
+| [Agent Integration](AGENT_INTEGRATION.md) | How a coding agent uses OpenASR: the `skills/openasr` Skill (CLI path) and the local OpenAI-compatible HTTP API, including `openasr apikey` for opt-in loopback authentication. |
 
 ## Format contracts (`docs/format/`)
 
