@@ -1,13 +1,44 @@
 name: Release binaries
 
+# Three ways in:
+#   1. push: tags v* -- a maintainer pushes an annotated release tag directly
+#      (e.g. `git push --follow-tags` from scripts/bump-version.sh). Real tag
+#      pushes fire this natively.
+#   2. workflow_call -- release-core.yml calls this workflow directly (as a
+#      job, not a webhook) right after it creates the vX.Y.Z tag + GitHub
+#      Release. This is required because a tag created through the GITHUB_TOKEN
+#      API does *not* fire the `push: tags` event (GitHub does not cascade
+#      Actions-token-authored pushes into further workflow runs), so without
+#      this explicit call the full release matrix silently never builds.
+#   3. workflow_dispatch -- manual re-run/dry-run, with the same `ref` input
+#      as workflow_call so a maintainer can target an existing tag (e.g. to
+#      retry a failed platform leg, or dry-run the upload/completeness logic
+#      against an already-released tag without touching its assets).
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (tag) to build; empty = default branch"
+        required: false
+        default: ""
+      dry_run:
+        description: "Evaluate upload/completeness logic but do not upload or edit the release"
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref (tag) to build"
+        required: false
+        type: string
+        default: ""
   push:
     tags:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -29,6 +60,9 @@ jobs:
       # AMD HIP SDK "PRO Edition" silent-installer release train, matched to
       # llama.cpp's current Windows HIP release job.
       HIPSDK_INSTALLER_VERSION: 26.Q1
+    # NOTE: jobs.verify-completeness below hardcodes this same target/ext list
+    # (TARGETS) to assert the release ends up with every archive. Keep both
+    # in sync when adding/removing a leg.
     strategy:
       fail-fast: false
       matrix:
@@ -121,6 +155,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Resolve workspace version
         shell: bash
@@ -476,3 +511,149 @@ jobs:
           name: SHA256SUMS
           path: dist/SHA256SUMS
           if-no-files-found: error
+
+  upload-to-release:
+    name: Upload assets to release
+    needs: checksums
+    if: ${{ !cancelled() && needs.checksums.result == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Resolve the release tag for this ref
+        id: tag
+        shell: bash
+        # Only a ref that is (or resolves to) a `v*` tag has a GitHub Release
+        # to attach assets to. A `workflow_dispatch` run against a branch, or
+        # any other ref shape, has nothing to upload to -- that is not an
+        # error, just a no-op (lets this workflow still be dispatched for
+        # ad-hoc build-only smoke runs).
+        run: |
+          set -euo pipefail
+          ref="${{ inputs.ref }}"
+          if [ -z "$ref" ]; then
+            ref="${{ github.ref }}"
+          fi
+          case "$ref" in
+            refs/tags/*) tag="${ref#refs/tags/}" ;;
+            v[0-9]*.*) tag="$ref" ;;
+            *) tag="" ;;
+          esac
+          if [ -z "$tag" ]; then
+            echo "ref '$ref' does not resolve to a release tag -- nothing to upload" >&2
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "tag ${tag} does not exist on origin -- nothing to upload" >&2
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Download archives + SHA256SUMS
+        if: steps.tag.outputs.tag != ''
+        uses: actions/download-artifact@v8
+        with:
+          path: staging
+          merge-multiple: true
+
+      - name: List what would be uploaded
+        if: steps.tag.outputs.tag != ''
+        run: |
+          set -euo pipefail
+          echo "release: ${{ steps.tag.outputs.tag }}"
+          find staging -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name 'SHA256SUMS' \) -print | sort
+
+      - name: Upload assets to release
+        if: steps.tag.outputs.tag != '' && github.event.inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          if ! gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "release ${tag} does not exist yet -- release-core.yml should create it before calling this workflow" >&2
+            exit 1
+          fi
+          # --clobber so a re-run (retrying a flaky leg) replaces stale assets
+          # instead of failing on "asset already exists".
+          gh release upload "$tag" staging/*.tar.gz staging/*.zip staging/SHA256SUMS \
+            --repo "${{ github.repository }}" --clobber
+
+      - name: Dry run -- skipping upload
+        if: steps.tag.outputs.tag != '' && github.event.inputs.dry_run == 'true'
+        run: echo "dry_run=true -- not uploading to ${{ steps.tag.outputs.tag }} (evaluated condition/logic only)"
+
+  verify-completeness:
+    name: Verify release completeness
+    needs: upload-to-release
+    if: needs.upload-to-release.outputs.tag != ''
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Resolve workspace version
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
+          echo "OPENASR_VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - name: Assert the release has every expected matrix asset
+        # Keep this TARGETS list in sync with jobs.build.strategy.matrix.include
+        # above -- this is the release-integrity gate: a release "shipped" but
+        # missing a platform's archive (e.g. one matrix leg failed and
+        # `checksums` silently dropped it, per its `!cancelled()` condition)
+        # must fail loudly here instead of quietly shipping partial coverage.
+        run: |
+          set -euo pipefail
+          tag="${{ needs.upload-to-release.outputs.tag }}"
+          version="${OPENASR_VERSION}"
+
+          TARGETS=(
+            "x86_64-unknown-linux-gnu:tar.gz"
+            "aarch64-unknown-linux-gnu:tar.gz"
+            "x86_64-apple-darwin:tar.gz"
+            "aarch64-apple-darwin:tar.gz"
+            "x86_64-pc-windows-msvc:zip"
+            "x86_64-pc-windows-msvc-vulkan:zip"
+            "x86_64-pc-windows-msvc-cuda:zip"
+            "x86_64-pc-windows-msvc-hip:zip"
+            "x86_64-unknown-linux-gnu-vulkan:tar.gz"
+            "x86_64-unknown-linux-gnu-cuda:tar.gz"
+            "x86_64-unknown-linux-gnu-rocm:tar.gz"
+          )
+
+          expected_file="$(mktemp)"
+          for entry in "${TARGETS[@]}"; do
+            target="${entry%%:*}"
+            ext="${entry##*:}"
+            echo "openasr-${version}-${target}.${ext}" >> "$expected_file"
+          done
+          echo "SHA256SUMS" >> "$expected_file"
+          sort -o "$expected_file" "$expected_file"
+
+          actual_file="$(mktemp)"
+          gh release view "$tag" --repo "${{ github.repository }}" --json assets \
+            --jq '.assets[].name' | sort > "$actual_file"
+
+          echo "== expected =="
+          cat "$expected_file"
+          echo "== actual =="
+          cat "$actual_file"
+
+          missing="$(comm -23 "$expected_file" "$actual_file")"
+          if [ -n "$missing" ]; then
+            echo "::error::release ${tag} is missing expected asset(s):"
+            echo "$missing"
+            exit 1
+          fi
+          echo "release ${tag} has all $(wc -l < "$expected_file" | tr -d ' ') expected assets."
