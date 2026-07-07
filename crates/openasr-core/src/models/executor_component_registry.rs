@@ -5,9 +5,10 @@ use thiserror::Error;
 use crate::arch::{
     COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID, DOLPHIN_EXECUTOR_COMPONENT_ID,
     MOONSHINE_EXECUTOR_COMPONENT_ID, OpenAsrArchitectureRegistry,
-    PARAKEET_CTC_EXECUTOR_COMPONENT_ID, QWEN3_ASR_EXECUTOR_COMPONENT_ID,
-    SENSEVOICE_EXECUTOR_COMPONENT_ID, WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
-    WHISPER_EXECUTOR_COMPONENT_ID, XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
+    PARAKEET_CTC_EXECUTOR_COMPONENT_ID, PARAKEET_TDT_EXECUTOR_COMPONENT_ID,
+    QWEN3_ASR_EXECUTOR_COMPONENT_ID, SENSEVOICE_EXECUTOR_COMPONENT_ID,
+    WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID, WHISPER_EXECUTOR_COMPONENT_ID,
+    XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
 };
 
 use super::cohere::CohereTranscribeGgmlExecutor;
@@ -15,6 +16,7 @@ use super::dolphin::executor::DolphinGgmlExecutor;
 use super::ggml_asr_executor::GgmlAsrExecutor;
 use super::moonshine::MoonshineGgmlExecutor;
 use super::parakeet_ctc::executor::ParakeetCtcGgmlExecutor;
+use super::parakeet_tdt::executor::ParakeetTdtGgmlExecutor;
 use super::qwen::Qwen3AsrGgmlExecutor;
 use super::sensevoice::executor::SenseVoiceGgmlExecutor;
 use super::wav2vec2_ctc::executor::Wav2Vec2CtcGgmlExecutor;
@@ -69,6 +71,7 @@ fn materialize_builtin_executor_component(
         WHISPER_EXECUTOR_COMPONENT_ID => Some(Arc::new(WhisperGgmlExecutor::default())),
         QWEN3_ASR_EXECUTOR_COMPONENT_ID => Some(Arc::new(Qwen3AsrGgmlExecutor::default())),
         PARAKEET_CTC_EXECUTOR_COMPONENT_ID => Some(Arc::new(ParakeetCtcGgmlExecutor)),
+        PARAKEET_TDT_EXECUTOR_COMPONENT_ID => Some(Arc::new(ParakeetTdtGgmlExecutor)),
         WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID => Some(Arc::new(Wav2Vec2CtcGgmlExecutor)),
         MOONSHINE_EXECUTOR_COMPONENT_ID => Some(Arc::new(MoonshineGgmlExecutor::default())),
         XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID => Some(Arc::new(XasrZipformerGgmlExecutor)),
@@ -121,6 +124,10 @@ mod tests {
                 "parakeet-ctc",
             ),
             (
+                crate::arch::PARAKEET_TDT_GGML_ARCHITECTURE_ID,
+                "parakeet-tdt",
+            ),
+            (
                 crate::arch::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
                 "wav2vec2-ctc",
             ),
@@ -147,6 +154,7 @@ mod tests {
             ("whisper", true),
             (crate::QWEN3_ASR_MODEL_FAMILY, true),
             ("parakeet-ctc", true),
+            ("parakeet-tdt", false),
             ("wav2vec2-ctc", true),
             (crate::MOONSHINE_MODEL_FAMILY, true),
             (crate::arch::XASR_ZIPFORMER_MODEL_FAMILY, false),

@@ -1,0 +1,77 @@
+# Per-model card prose for openasr/parakeet-tdt-0.6b-v3. Distilled
+# (paraphrased, not copied) from the upstream nvidia/parakeet-tdt-0.6b-v3 model
+# card. Claims are kept to what the upstream card and the architecture state;
+# re-verify against the upstream card before a public release.
+
+tagline = "NVIDIA's multilingual speed flagship — 25 European languages, TDT transducer with native word timestamps"
+tagline_zh = "NVIDIA 多语种速度旗舰 — 25 种欧洲语言,TDT transducer,原生词级时间戳"
+
+highlights = [
+  "🇪🇺 **25 European languages** — one 0.6B checkpoint covers bg/hr/cs/da/nl/en/et/fi/fr/de/el/hu/it/lv/lt/mt/pl/pt/ro/sk/sl/es/sv/ru/uk, auto-detecting the spoken language with no prompting",
+  "⚡ **Built for throughput** — the Token-and-Duration Transducer (TDT) decoder predicts how many frames each token spans and skips ahead, cutting decode steps versus conventional transducers",
+  "🕑 **Native word timestamps** — the duration head is the model's own alignment output, so word-level timings come from the model rather than a uniform approximation",
+  "✍️ **Punctuation and capitalization** — trained on transcripts that preserve both (Granary + NeMo ASR Set 3.0; ~670k hours), so the raw decode reads like text",
+]
+
+highlights_zh = [
+  "25 种欧洲语言: 单个 0.6B 检查点覆盖英/法/德/西/意/俄/乌等欧洲语言，自动识别语种、无需提示",
+  "为吞吐而生: TDT(Token-and-Duration Transducer)解码器同时预测 token 和其时长并按时长跳帧，解码步数远少于常规 transducer",
+  "原生词级时间戳: 时长头就是模型自己的对齐输出，词级时间来自模型本身而非均匀近似",
+  "标点与大小写: 训练转写保留标点和大小写(Granary + NeMo ASR Set 3.0，~670k 小时)，原始解码结果即成文",
+]
+
+intro = """
+Parakeet TDT 0.6B v3 is **NVIDIA's** 600M-parameter multilingual speech-recognition model, extending
+the English-only v2 to **25 European languages** using the Granary multilingual corpus (~660k hours of
+pseudo-labeled speech plus ~10k hours of human transcriptions). Architecturally it pairs a
+**FastConformer encoder** with a **Token-and-Duration Transducer (TDT)** decoder: each decode step
+predicts both the next token and how many 80 ms frames it occupies, then skips ahead by that duration —
+which is what makes the family a speed benchmark for local transcription, and what gives it
+model-native word timestamps. The model auto-detects the spoken language, preserves punctuation and
+capitalization, and is released under the permissive CC-BY-4.0 license. This OpenASR repo repackages
+the weights as `.oasr` packs that run natively in the OpenASR runtime — no Python at inference time,
+all decoding local. The **q8_0** build is the recommended default; **q4_k** is the smallest build for
+tight-memory devices and **fp16** is for maximum fidelity or verification.
+"""
+
+intro_zh = """
+Parakeet TDT 0.6B v3 是 **NVIDIA** 开源的 6 亿参数多语种语音识别模型,在英语版 v2 的基础上借助
+Granary 多语种语料(约 66 万小时伪标注语音 + 约 1 万小时人工转写)扩展到 **25 种欧洲语言**。
+架构上它由 **FastConformer 编码器**和 **TDT(Token-and-Duration Transducer)解码器**组成:每步
+解码同时预测下一个 token 及其占用的 80ms 帧数,并按该时长向前跳帧——这既是该家族成为本地转写
+速度标杆的原因,也让词级时间戳来自模型自身的对齐输出。模型自动识别语种,保留标点与大小写,
+以宽松的 CC-BY-4.0 许可证发布。
+
+这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理,不会把音频上传到
+云端。`q8_0` 是推荐默认版本;`q4_k` 体积最小、适合内存更紧的设备;`fp16` 适合最高保真或验证。
+"""
+
+acknowledgement = """
+This pack is a redistribution of **parakeet-tdt-0.6b-v3**, created and released by **NVIDIA**
+([nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)), trained with the
+**NeMo** toolkit on the **Granary** corpus and NeMo ASR Set 3.0. All credit for the architecture
+(FastConformer encoder, TDT decoder), training, and weights belongs to NVIDIA; the license is
+inherited from and identical to the upstream model (**CC-BY-4.0**, which requires attribution — keep
+this credit when redistributing). OpenASR only performs format conversion, quantization, runtime
+verification, and local-inference adaptation.
+"""
+
+acknowledgement_zh = """
+本模型包重新分发自 NVIDIA 开源的 parakeet-tdt-0.6b-v3
+([nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)),模型使用
+**NeMo** 工具链在 **Granary** 语料与 NeMo ASR Set 3.0 上训练。原始架构(FastConformer 编码器、
+TDT 解码器)、训练和权重归 NVIDIA 所有,许可证继承上游 **CC-BY-4.0**(要求署名——再分发时请保留
+本致谢)。OpenASR 仅进行格式转换、量化、运行时校验和本地推理适配。
+"""
+
+[prose_locales."zh-CN"]
+tagline = "NVIDIA 多语种速度旗舰 — 25 种欧洲语言,TDT transducer,原生词级时间戳"
+
+highlights = [
+  "🇪🇺 **25 种欧洲语言** — 单个 0.6B 检查点覆盖英/法/德/西/意/俄/乌等欧洲语言，自动识别语种、无需提示",
+  "⚡ **为吞吐而生** — TDT(Token-and-Duration Transducer)解码器同时预测 token 与其时长并按时长跳帧，解码步数远少于常规 transducer",
+  "🕑 **原生词级时间戳** — 时长头就是模型自己的对齐输出，词级时间来自模型本身而非均匀近似",
+  "✍️ **标点与大小写** — 训练转写保留标点和大小写(Granary + NeMo ASR Set 3.0，~670k 小时)，原始解码结果即成文",
+]
+
+source_sha256 = "72fcce93a15c4ef0843c93ca3c0835c6ce645653a087a9658e931baa33fa15eb"

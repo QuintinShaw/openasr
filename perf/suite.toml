@@ -232,6 +232,45 @@ optional = true
 gating = false
 ordering_group = "parakeet-ctc-0.6b"
 
+# parakeet-tdt-0.6b-v3 (NVIDIA FastConformer + Token-and-Duration Transducer,
+# 25 European languages). Measured at publish (M1 CPU, 11s JFK clip): RTF
+# q4_k 0.109 < q8_0 0.129 < fp16 0.140 and peak RSS q4 920MB < q8 1119MB <
+# fp16 1595MB — unlike parakeet-ctc's q4_k, the TDT q4_k is BOTH the size and
+# the speed win here, so all three quants share one RTF-ordering group.
+# Optional + non-gating (host-local packs); the ordering assertion is the gate.
+[[entries]]
+id = "parakeet-tdt-0.6b-v3-q4k"
+family = "parakeet-tdt"
+quant = "q4_k"
+pack_path = "tmp/publish/parakeet-tdt-0.6b-v3/packs/parakeet-tdt-0.6b-v3-q4_k.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+ordering_group = "parakeet-tdt-0.6b-v3"
+
+[[entries]]
+id = "parakeet-tdt-0.6b-v3-q8"
+family = "parakeet-tdt"
+quant = "q8_0"
+pack_path = "tmp/publish/parakeet-tdt-0.6b-v3/packs/parakeet-tdt-0.6b-v3-q8_0.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+ordering_group = "parakeet-tdt-0.6b-v3"
+
+[[entries]]
+id = "parakeet-tdt-0.6b-v3-fp16"
+family = "parakeet-tdt"
+quant = "fp16"
+pack_path = "tmp/publish/parakeet-tdt-0.6b-v3/packs/parakeet-tdt-0.6b-v3-fp16.oasr"
+audio_path = "tmp/audio/librispeech/237-134500-0000.wav"
+reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"
+optional = true
+gating = false
+ordering_group = "parakeet-tdt-0.6b-v3"
+
 # whisper-base.en (onboarding model #1 — data-only via the existing whisper importer,
 # downloaded from hf-mirror). q4_k pack 82MB, WER 0.00% on the clip (metal+cpu).
 [[entries]]

@@ -68,6 +68,7 @@ RELEASE_LANE_MODELS = (
     "dolphin-cn-dialect-base",
     "dolphin-small",
     "dolphin-base",
+    "parakeet-tdt-0.6b-v3",
 )
 GGUF_GENERAL_ARCHITECTURE_KEY = b"general.architecture"
 

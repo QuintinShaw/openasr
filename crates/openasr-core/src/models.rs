@@ -28,6 +28,7 @@ pub(crate) mod lora_adapter;
 pub mod moonshine;
 pub mod oasr_metadata;
 pub(crate) mod parakeet_ctc;
+pub mod parakeet_tdt;
 pub(crate) mod phrase_bias_decode;
 pub(crate) mod prepared_runtime_cache;
 pub(crate) mod pyannote;

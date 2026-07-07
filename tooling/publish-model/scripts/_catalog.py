@@ -227,6 +227,13 @@ LANG_BY_FAMILY = {
     "dolphin": sorted(["zh", *REGISTERED_DIALECT_CODES]),
     "moonshine": ["en"],
     "parakeet": ["en"],
+    # parakeet-tdt-0.6b-v3 card: 25 European languages (bg hr cs da nl en et fi
+    # fr de el hu it lv lt mt pl pt ro sk sl es sv ru uk).
+    "parakeet-tdt": [
+        "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hr", "hu",
+        "it", "lt", "lv", "mt", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv",
+        "uk",
+    ],
     "wav2vec2": ["en"],
     # SenseVoiceSmall: zh, yue (Cantonese), en, ja, ko with model-side LID.
     "sensevoice": ["en", "ja", "ko", "yue", "zh"],
@@ -266,6 +273,9 @@ LANGUAGE_MODE_BY_FAMILY = {
     # CTC / Moonshine: FixedMonolingual -- intrinsically a single language.
     "moonshine": "fixed_monolingual",
     "parakeet": "fixed_monolingual",
+    # parakeet-tdt: FixedMultilingual -- built-in 25-language set, decodes
+    # whatever it hears, no per-request language selection.
+    "parakeet-tdt": "fixed_multilingual",
     "wav2vec2": "fixed_monolingual",
     # SenseVoice: DetectAndSelectsViaPrompt -- explicit zh/yue/en/ja/ko selection
     # via the 4-token prompt, decode-time LID (readable <|lang|> tag) when unset.
@@ -358,6 +368,10 @@ def language_mode_for_model(entry: dict, languages: list[str]) -> dict:
 # supports punctuation and its transcripts include it.
 PUNCTUATION_BY_FAMILY = {
     "qwen": True,
+    # parakeet-tdt: trained on transcripts that preserve punctuation and
+    # capitalization (verified on the imported pack: JFK decodes with full
+    # punctuation).
+    "parakeet-tdt": True,
     "cohere": True,
     "whisper": True,
     "xasr-zipformer": True,

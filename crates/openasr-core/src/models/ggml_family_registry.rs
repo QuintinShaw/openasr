@@ -39,6 +39,12 @@ pub const PARAKEET_CTC_AUDIO_FRONTEND_ID: &str = crate::arch::PARAKEET_CTC_AUDIO
 pub const PARAKEET_CTC_TOKENIZER_ID: &str = crate::arch::PARAKEET_CTC_TOKENIZER_ID;
 pub const PARAKEET_CTC_DECODE_POLICY_ID: &str = crate::arch::PARAKEET_CTC_DECODE_POLICY_ID;
 
+pub const PARAKEET_TDT_GGML_ARCHITECTURE_ID: &str = crate::arch::PARAKEET_TDT_GGML_ARCHITECTURE_ID;
+pub const PARAKEET_TDT_GGML_ADAPTER_ID: &str = crate::arch::PARAKEET_TDT_GGML_ADAPTER_ID;
+pub const PARAKEET_TDT_AUDIO_FRONTEND_ID: &str = crate::arch::PARAKEET_TDT_AUDIO_FRONTEND_ID;
+pub const PARAKEET_TDT_TOKENIZER_ID: &str = crate::arch::PARAKEET_TDT_TOKENIZER_ID;
+pub const PARAKEET_TDT_DECODE_POLICY_ID: &str = crate::arch::PARAKEET_TDT_DECODE_POLICY_ID;
+
 pub const WAV2VEC2_CTC_GGML_ARCHITECTURE_ID: &str = crate::arch::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID;
 pub const WAV2VEC2_CTC_GGML_ADAPTER_ID: &str = crate::arch::WAV2VEC2_CTC_GGML_ADAPTER_ID;
 pub const WAV2VEC2_CTC_AUDIO_FRONTEND_ID: &str = crate::arch::WAV2VEC2_CTC_AUDIO_FRONTEND_ID;
@@ -234,6 +240,13 @@ pub fn parakeet_ctc_runtime_descriptor_v1() -> GgmlFamilyAdapterDescriptor {
     OpenAsrArchitectureRegistry::with_builtins()
         .find_by_model_architecture(PARAKEET_CTC_GGML_ARCHITECTURE_ID)
         .expect("builtin parakeet-ctc architecture must exist")
+        .ggml_family_adapter_descriptor()
+}
+
+pub fn parakeet_tdt_runtime_descriptor_v1() -> GgmlFamilyAdapterDescriptor {
+    OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(PARAKEET_TDT_GGML_ARCHITECTURE_ID)
+        .expect("builtin parakeet-tdt architecture must exist")
         .ggml_family_adapter_descriptor()
 }
 

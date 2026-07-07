@@ -1,0 +1,10 @@
+id = "parakeet-tdt-0.6b-v3"
+default_variant = "published"
+display_name = "Parakeet TDT 0.6B v3 (OpenASR pack)"
+languages = ["bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hr", "hu", "it", "lt", "lv", "mt", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "uk"]
+size = "0.6b"
+license = "CC-BY-4.0"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/parakeet-tdt-0.6b-v3"
+
+[variant]
+quantization = "q8_0"

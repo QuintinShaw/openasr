@@ -8,7 +8,7 @@
 OpenASR is the Apache-2.0 **open core** of a local-first speech-to-text platform:
 a single `openasr` Rust CLI, a local OpenAI-compatible HTTP API, and a signed
 model catalog, all running native [ggml](https://github.com/ggml-org/ggml)-backed
-inference across nine model families on CPU and Apple Metal. No cloud, no
+inference across ten model families on CPU and Apple Metal. No cloud, no
 telemetry, fail-closed by design.
 
 [Website](https://openasr.org) - [Documentation](docs/DOCS_INDEX.md) - [Acknowledgments](ACKNOWLEDGMENTS.md) - [License](LICENSE)
@@ -45,9 +45,10 @@ size, host, and license.
 
 ### Depth, not just Whisper
 
-**Nine model families** run through one binary and one ggml runtime: Whisper,
-Cohere Transcribe, Qwen3-ASR, Parakeet-CTC, wav2vec2-CTC, Moonshine, Dolphin
-(Chinese dialects), SenseVoice (zh/yue/en/ja/ko), and X-ASR (Zipformer). You get
+**Ten model families** run through one binary and one ggml runtime: Whisper,
+Cohere Transcribe, Qwen3-ASR, Parakeet-CTC, Parakeet-TDT (25 European
+languages), wav2vec2-CTC, Moonshine, Dolphin (Chinese dialects), SenseVoice
+(zh/yue/en/ja/ko), and X-ASR (Zipformer). You get
 frame-synchronous streaming partials, opt-in speaker diarization, word-level
 timestamps with **per-word confidence**, and phrase-bias hotwords -- pick the
 model that fits the task and keep one toolchain.
@@ -86,10 +87,10 @@ openasr pull qwen3-asr-0.6b:q8        # or pin a specific quant tier
 openasr list                          # what's installed
 ```
 
-The catalog ships **17 ready-to-pull ASR packs** spanning seven of the nine
+The catalog ships **17 ready-to-pull ASR packs** spanning seven of the ten
 native families (50 signed quant downloads), plus diarization capability
-packs; the remaining two (Parakeet-CTC, wav2vec2-CTC) run via `import` of your
-own checkpoints. Nine native families run offline on CPU and Apple Metal,
+packs; the remaining three (Parakeet-CTC, Parakeet-TDT, wav2vec2-CTC) run via
+`import` of your own checkpoints. Ten native families run offline on CPU and Apple Metal,
 dispatched by the data-driven architecture registry. All families support opt-in diarization; most also export word-level
 timestamps -- the columns below show where they differ.
 
@@ -99,6 +100,7 @@ timestamps -- the columns below show where they differ.
 | Cohere Transcribe | declared-pack | approximate | fp16 / q8_0 / q4_k |
 | Qwen3-ASR (default) | declared-pack | approximate | fp16 / q8_0 / q4_k / q3_k |
 | Parakeet-CTC | declared-pack | acoustic | fp16 / q8_0 / q4_k |
+| Parakeet-TDT (25 European languages) | declared-pack | acoustic | fp16 / q8_0 / q4_k |
 | wav2vec2-CTC (incl. data2vec) | declared-pack | acoustic | fp16 / q8_0 / q4_k |
 | Moonshine | declared-pack | approximate | fp16 / q8_0 / q4_k |
 | Dolphin (Chinese dialects) | none | none | fp16 / q8_0 / q4_k |
@@ -118,7 +120,8 @@ timestamps -- the columns below show where they differ.
   Cohere packs can additionally emit inline speaker tokens.
 
 Multilingual coverage is per pack (a multilingual Whisper pack spans ~100
-languages; Qwen3-ASR ~29; others are English-only or bilingual). See the
+languages; Qwen3-ASR ~29; Parakeet-TDT 25 European languages; others are
+English-only or bilingual). See the
 per-model cards under [`model-registry/models/`](model-registry/models/) and
 [Known Limitations](docs/KNOWN_LIMITATIONS.md) for the exact scope of each
 capability.
@@ -275,7 +278,7 @@ cargo run -p openasr-cli -- model-pack import qwen         <source_dir> <out.oas
 cargo run -p openasr-cli -- model-pack import moonshine    <source_dir> <out.oasr> --package-id moonshine-tiny --source-revision <rev>
 ```
 
-Other families: `cohere`, `parakeet-ctc`, `wav2vec2-ctc`, `dolphin`,
+Other families: `cohere`, `parakeet-ctc`, `parakeet-tdt`, `wav2vec2-ctc`, `dolphin`,
 `xasr-zipformer`, `hymt2-gguf`, `wespeaker`, `pyannote`. Each accepts
 `--quantization fp16|q8_0|q4_k` (Qwen also exposes `q3_k`).
 
