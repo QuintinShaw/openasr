@@ -128,7 +128,11 @@ def main(argv: list[str]) -> int:
         "license_badge": badge_text(catalog["license_name"]),
         "upstream_badge": badge_text(upstream.split("/")[-1]),
         "upstream_repo": upstream,
-        "pull_alias": catalog["pull_alias"],
+        # Falls back to the registry id when a model has no short pull alias
+        # (e.g. no `catalog-series.toml` entry for its family, and none set
+        # per-model): every model has a registry id, so the YAML tags list
+        # never renders the literal string "None".
+        "pull_alias": catalog["pull_alias"] or registry_id,
         "openasr_repo": catalog["hf_repo"],
         "registry_id": registry_id,
         "tagline": tagline,

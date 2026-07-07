@@ -67,6 +67,18 @@ pub(crate) enum DolphinPrefixError {
         code: String,
         region_token: &'static str,
     },
+    /// Multilingual-only: the `<lang>` token this code selects is absent from
+    /// this pack's vocab. Kept separate from `ControlTokenMissing` (which uses
+    /// a `&'static str` token, since the cn-dialect family's `<lang>` slot is
+    /// the fixed `<zh>`) because the multilingual builder computes the token
+    /// content per code from [`DOLPHIN_MULTILINGUAL_LANGUAGE_TABLE`].
+    LanguageTokenMissing {
+        code: String,
+        language_token: String,
+    },
+    /// Multilingual-only: the `<region>` token this code's default region
+    /// selects is absent from this pack's vocab (see `LanguageTokenMissing`).
+    MultilingualRegionTokenMissing { code: String, region_token: String },
 }
 
 impl std::fmt::Display for DolphinPrefixError {
@@ -80,6 +92,17 @@ impl std::fmt::Display for DolphinPrefixError {
                 write!(f, "this dolphin pack vocab has no '{token}' control token")
             }
             Self::RegionTokenMissing { code, region_token } => write!(
+                f,
+                "this dolphin pack vocab has no '{region_token}' region token for language {code:?}"
+            ),
+            Self::LanguageTokenMissing {
+                code,
+                language_token,
+            } => write!(
+                f,
+                "this dolphin pack vocab has no '{language_token}' language token for language {code:?}"
+            ),
+            Self::MultilingualRegionTokenMissing { code, region_token } => write!(
                 f,
                 "this dolphin pack vocab has no '{region_token}' region token for language {code:?}"
             ),
@@ -136,6 +159,157 @@ pub(crate) fn build_dolphin_decode_prefix(
         resolved_language,
     })
 }
+
+// --- multilingual (dolphin-small / dolphin-base) ----------------------------
+//
+// The multilingual Dolphin checkpoints recognize 40 Eastern languages (plus
+// Mandarin's 22 dialects, which these checkpoints do NOT advertise as
+// separate recognition codes -- unlike the dedicated cn-dialect models, they
+// fold every Chinese dialect into `zh`). Their vocab uses the SAME OWSM-style
+// two-slot `<lang><region>` prompt as the cn-dialect family, but the `<lang>`
+// slot actually varies per code instead of being fixed at `<zh>`, and the
+/// `<region>` slot is a per-language country/region tag rather than a Chinese
+// province.
+//
+/// code -> (Dolphin's own `<lang>` token content, default `<region>` token
+/// content), both without angle brackets. Source: DataoceanAI's
+/// `languages.md` "Language Code" + "Language Region Code" tables. Dolphin's
+/// own language code matches this crate's normalized ISO code for every entry
+/// except Cantonese (Dolphin: `ct`, this table's key: `yue`, matching
+/// `LANG_BY_FAMILY`/`LANGUAGE_DISPLAY_LABELS`'s existing `yue` convention).
+/// The default region is the card's unqualified/most-common region where it
+/// lists several (e.g. Arabic's `ar-GLA` is the only entry labeled plain
+/// "Arabic", the rest carry a country qualifier), or `NULL` where the card
+/// only ever lists a `NULL` region (Yue, Uighur, Kabyle, Bashkir) -- these are
+/// defaults only; a request can always override the resolved language, though
+/// this builder does not yet expose a separate region parameter (see
+/// `build_dolphin_multilingual_decode_prefix`'s doc comment).
+const DOLPHIN_MULTILINGUAL_LANGUAGE_TABLE: &[(&str, &str, &str)] = &[
+    ("ar", "ar", "GLA"),
+    ("az", "az", "AZ"),
+    ("ba", "ba", "NULL"),
+    ("bn", "bn", "BD"),
+    ("fa", "fa", "IR"),
+    ("fil", "fil", "PH"),
+    ("gu", "gu", "IN"),
+    ("hi", "hi", "IN"),
+    ("id", "id", "ID"),
+    ("ja", "ja", "JP"),
+    ("jv", "jv", "ID"),
+    ("kab", "kab", "NULL"),
+    ("kk", "kk", "KZ"),
+    ("km", "km", "KH"),
+    ("ko", "ko", "KR"),
+    ("ks", "ks", "IN"),
+    ("ky", "ky", "KG"),
+    ("lo", "lo", "LA"),
+    ("mn", "mn", "MN"),
+    ("mr", "mr", "IN"),
+    ("ms", "ms", "MY"),
+    ("my", "my", "MM"),
+    ("ne", "ne", "NP"),
+    ("or", "or", "IN"),
+    ("pa", "pa", "IN"),
+    ("ps", "ps", "AF"),
+    ("ru", "ru", "RU"),
+    ("si", "si", "LK"),
+    ("su", "su", "ID"),
+    ("ta", "ta", "IN"),
+    ("te", "te", "IN"),
+    ("tg", "tg", "TJ"),
+    ("th", "th", "TH"),
+    ("tl", "tl", "PH"),
+    ("ug", "ug", "NULL"),
+    ("ur", "ur", "IN"),
+    ("uz", "uz", "UZ"),
+    ("vi", "vi", "VN"),
+    ("yue", "ct", "NULL"),
+    ("zh", "zh", "CN"),
+];
+
+/// The recognition code the multilingual builder defaults to when the request
+/// leaves `language` unset: Mandarin (`<zh><CN>`), matching the family's
+/// `SelectsViaPrompt { default: "zh" }` (same default as the cn-dialect
+/// builder's `DOLPHIN_DEFAULT_LANGUAGE_CODE`, kept as its own constant so the
+/// two builders stay independently readable).
+pub(crate) const DOLPHIN_MULTILINGUAL_DEFAULT_LANGUAGE_CODE: &str = "zh";
+
+/// code -> (`<lang>` token content, default `<region>` token content), or
+/// `None` for a language this multilingual table does not carry.
+pub(crate) fn dolphin_multilingual_lang_region_for_code(
+    code: &str,
+) -> Option<(&'static str, &'static str)> {
+    DOLPHIN_MULTILINGUAL_LANGUAGE_TABLE
+        .iter()
+        .find(|(table_code, _, _)| *table_code == code)
+        .map(|(_, lang, region)| (*lang, *region))
+}
+
+/// Build the OWSM-style decode prefix for the multilingual Dolphin
+/// checkpoints (`dolphin-small`/`dolphin-base`): `<sos> <lang> <region> <asr>
+/// <notimestamp>`, with BOTH `<lang>` and `<region>` varying per code (unlike
+/// the cn-dialect builder, whose `<lang>` is fixed at `<zh>`). `requested`
+/// selects the language only; the region always resolves to that language's
+/// table default -- there is no separate region parameter on the recognition
+/// request today, so a caller cannot yet pick e.g. `ar-EG` over the `ar`
+/// default `ar-GLA`. Fails closed (typed) on an unknown code or a missing
+/// language/region/control token, exactly like
+/// [`build_dolphin_decode_prefix`].
+pub(crate) fn build_dolphin_multilingual_decode_prefix(
+    vocab: &[String],
+    requested: Option<&str>,
+) -> Result<DolphinDecodePrefix, DolphinPrefixError> {
+    let resolved_language = requested
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .map(normalize_language)
+        .unwrap_or_else(|| DOLPHIN_MULTILINGUAL_DEFAULT_LANGUAGE_CODE.to_string());
+    let (language_token_content, region_token_content) =
+        dolphin_multilingual_lang_region_for_code(&resolved_language).ok_or_else(|| {
+            DolphinPrefixError::UnsupportedLanguageCode {
+                code: resolved_language.clone(),
+            }
+        })?;
+    let language_token = format!("<{language_token_content}>");
+    let region_token = format!("<{region_token_content}>");
+    let control_id = |token: &'static str| -> Result<u32, DolphinPrefixError> {
+        token_id_for_content(vocab, token).ok_or(DolphinPrefixError::ControlTokenMissing { token })
+    };
+    let token_ids = vec![
+        control_id(DOLPHIN_SOS_TOKEN)?,
+        token_id_for_content(vocab, &language_token).ok_or_else(|| {
+            DolphinPrefixError::LanguageTokenMissing {
+                code: resolved_language.clone(),
+                language_token: language_token.clone(),
+            }
+        })?,
+        token_id_for_content(vocab, &region_token).ok_or_else(|| {
+            DolphinPrefixError::MultilingualRegionTokenMissing {
+                code: resolved_language.clone(),
+                region_token: region_token.clone(),
+            }
+        })?,
+        control_id(DOLPHIN_TASK_TOKEN)?,
+        control_id(DOLPHIN_NOTIMESTAMP_TOKEN)?,
+    ];
+    Ok(DolphinDecodePrefix {
+        token_ids,
+        resolved_language,
+    })
+}
+
+/// The 40 codes `dolphin-small`/`dolphin-base` advertise as their catalog
+/// `languages` override (see `tooling/publish-model/models-core.toml`), kept
+/// in sync by hand with that TOML list -- there is no single Rust source of
+/// truth for a per-model catalog `languages` override, unlike the family-wide
+/// `REGISTERED_DIALECT_CODES`. Used both by the importer's producer-side
+/// guard (`assert_every_advertised_multilingual_code_resolves`) and this
+/// module's own tests.
+pub(crate) const DOLPHIN_MULTILINGUAL_CATALOG_LANGUAGES: &[&str] = &[
+    "ar", "az", "ba", "bn", "fa", "fil", "gu", "hi", "id", "ja", "jv", "kab", "kk", "km", "ko",
+    "ks", "ky", "lo", "mn", "mr", "ms", "my", "ne", "or", "pa", "ps", "ru", "si", "su", "ta", "te",
+    "tg", "th", "tl", "ug", "ur", "uz", "vi", "yue", "zh",
+];
 
 /// First vocab id whose token content is exactly `content`. Dolphin's special
 /// tokens are unique and front-loaded (ids < 110), so a linear scan is trivial.
@@ -316,6 +490,116 @@ mod tests {
         assert_eq!(
             dolphin_region_token_for_code(DOLPHIN_DEFAULT_LANGUAGE_CODE),
             Some("<CN>")
+        );
+    }
+
+    // --- multilingual (dolphin-small / dolphin-base) ------------------------
+
+    /// Synthetic vocab covering the multilingual control tokens plus every
+    /// `<lang>`/`<region>` token the catalog's 40-language list and their
+    /// table defaults need, at arbitrary (non-contiguous) ids -- unlike the
+    /// cn-dialect fixture, the real multilingual vocab does NOT front-load
+    /// `<sos>`/`<eos>` (they sit after ~40k BPE pieces), so this fixture
+    /// intentionally puts them at high ids too.
+    fn dolphin_multilingual_vocab() -> Vec<String> {
+        let mut tokens: Vec<String> = vec!["<blank>".to_string(), "<unk>".to_string()];
+        for &code in DOLPHIN_MULTILINGUAL_CATALOG_LANGUAGES {
+            let (lang, region) = dolphin_multilingual_lang_region_for_code(code)
+                .unwrap_or_else(|| panic!("catalog language '{code}' has no multilingual mapping"));
+            tokens.push(format!("<{lang}>"));
+            tokens.push(format!("<{region}>"));
+        }
+        tokens.push("<asr>".to_string());
+        tokens.push("<notimestamp>".to_string());
+        tokens.push("<sos>".to_string());
+        tokens.push("<eos>".to_string());
+        tokens
+    }
+
+    #[test]
+    fn multilingual_unset_language_defaults_to_mandarin_cn_region() {
+        let vocab = dolphin_multilingual_vocab();
+        let prefix = build_dolphin_multilingual_decode_prefix(&vocab, None).expect("build");
+        assert_eq!(prefix.resolved_language, "zh");
+        let sos = token_id_for_content(&vocab, "<sos>").unwrap();
+        let zh = token_id_for_content(&vocab, "<zh>").unwrap();
+        let cn = token_id_for_content(&vocab, "<CN>").unwrap();
+        let asr = token_id_for_content(&vocab, "<asr>").unwrap();
+        let notimestamp = token_id_for_content(&vocab, "<notimestamp>").unwrap();
+        assert_eq!(prefix.token_ids, vec![sos, zh, cn, asr, notimestamp]);
+    }
+
+    #[test]
+    fn multilingual_yue_selects_dolphins_own_ct_language_token() {
+        // The catalog's `yue` (ISO) recognition code maps to Dolphin's own
+        // `<ct>` language token, not a fabricated `<yue>` one.
+        let vocab = dolphin_multilingual_vocab();
+        let prefix = build_dolphin_multilingual_decode_prefix(&vocab, Some("yue")).expect("build");
+        assert_eq!(prefix.resolved_language, "yue");
+        let ct = token_id_for_content(&vocab, "<ct>").unwrap();
+        let null_region = token_id_for_content(&vocab, "<NULL>").unwrap();
+        assert!(prefix.token_ids.contains(&ct));
+        assert!(prefix.token_ids.contains(&null_region));
+    }
+
+    #[test]
+    fn multilingual_table_covers_exactly_the_catalog_languages() {
+        // Every language the catalog advertises for dolphin-small/dolphin-base
+        // must resolve to a `<lang><region>` pair, and the full prefix must
+        // build against a vocab carrying every one of those tokens -- the
+        // producer-side guard mirroring `region_map_covers_exactly_the_registered_dialect_codes`.
+        let vocab = dolphin_multilingual_vocab();
+        for &code in DOLPHIN_MULTILINGUAL_CATALOG_LANGUAGES {
+            dolphin_multilingual_lang_region_for_code(code)
+                .unwrap_or_else(|| panic!("catalog language '{code}' has no multilingual mapping"));
+            build_dolphin_multilingual_decode_prefix(&vocab, Some(code)).unwrap_or_else(|error| {
+                panic!("multilingual prefix build failed for '{code}': {error}")
+            });
+        }
+    }
+
+    #[test]
+    fn multilingual_unknown_code_fails_closed() {
+        let vocab = dolphin_multilingual_vocab();
+        assert_eq!(
+            build_dolphin_multilingual_decode_prefix(&vocab, Some("zh-sichuan")),
+            Err(DolphinPrefixError::UnsupportedLanguageCode {
+                code: "zh-sichuan".to_string()
+            })
+        );
+        assert_eq!(
+            build_dolphin_multilingual_decode_prefix(&vocab, Some("xx")),
+            Err(DolphinPrefixError::UnsupportedLanguageCode {
+                code: "xx".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn multilingual_missing_language_token_fails_closed() {
+        // A vocab with every region token but no `<ja>` language token for a
+        // registered code must reject, not silently decode under `<zh>`.
+        let mut vocab = dolphin_multilingual_vocab();
+        vocab.retain(|token| token != "<ja>");
+        assert_eq!(
+            build_dolphin_multilingual_decode_prefix(&vocab, Some("ja")),
+            Err(DolphinPrefixError::LanguageTokenMissing {
+                code: "ja".to_string(),
+                language_token: "<ja>".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn multilingual_missing_region_token_fails_closed() {
+        let mut vocab = dolphin_multilingual_vocab();
+        vocab.retain(|token| token != "<JP>");
+        assert_eq!(
+            build_dolphin_multilingual_decode_prefix(&vocab, Some("ja")),
+            Err(DolphinPrefixError::MultilingualRegionTokenMissing {
+                code: "ja".to_string(),
+                region_token: "<JP>".to_string(),
+            })
         );
     }
 }

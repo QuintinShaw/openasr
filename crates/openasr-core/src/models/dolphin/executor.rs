@@ -43,7 +43,7 @@ use super::hotword_context::{
     apply_hotword_deep_biasing, encode_hotword_context_embeddings, tokenize_hotword_phrase,
 };
 use super::joint_decode::{DolphinJointDecodeConfig, detokenize_char_tokens, joint_decode};
-use super::language::build_dolphin_decode_prefix;
+use super::language::{build_dolphin_decode_prefix, build_dolphin_multilingual_decode_prefix};
 use super::runtime_contract::parse_dolphin_execution_metadata;
 
 /// Encoder weight namespace baked into the pack under exact WeNet names.
@@ -65,6 +65,9 @@ const CMVN_ISTD_TENSOR: &str = "encoder.global_cmvn.istd";
 /// vocab + the requested language code (see [`build_dolphin_decode_prefix`]), so a
 /// single pack can honor any advertised dialect region rather than one baked one.
 const EOS_TOKEN_ID_KEY: &str = "dolphin.eos_token_id";
+/// Selects the decode-prefix builder (see `run_dolphin_pipeline`); absent on
+/// a pre-existing pack, which defaults to the cn-dialect scheme.
+const LANGUAGE_SCHEME_KEY: &str = "dolphin.language.scheme";
 const BLANK_TOKEN_ID_KEY: &str = "ctc.blank_token_id";
 const TOKENIZER_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 
@@ -253,6 +256,17 @@ impl DolphinWeightProvider for DolphinRuntimeWeights {
     }
 }
 
+// Lets the serving path (already-loaded weights) resolve
+// `dolphin.{encoder,decoder}.max_ctx` from the baked position-table tensor's
+// own element count, mirroring the `GgufTensorIndex`-based probe the install
+// gate uses before any weight is dequantized. See
+// `runtime_contract::resolve_position_table_max_ctx`.
+impl super::runtime_contract::DolphinPositionTableSource for DolphinRuntimeWeights {
+    fn tensor_element_count(&self, name: &str) -> Option<usize> {
+        DolphinWeightProvider::tensor(self, name).map(<[f32]>::len)
+    }
+}
+
 /// Process-level pool of runtime weights keyed by pack path. Building the pool
 /// (dequantizing the f32 vectors + mmapping the native weight blocks) costs ~0.4 s
 /// (18% of the single-utterance wall on M1); caching it lets warm calls skip the
@@ -329,16 +343,34 @@ pub(crate) fn run_dolphin_pipeline(
     let tokens = metadata
         .get_string_array(TOKENIZER_TOKENS_KEY)
         .ok_or_else(|| format!("dolphin pack is missing the '{TOKENIZER_TOKENS_KEY}' vocab"))?;
-    // Build the `<sos> <zh> <region> <asr> <notimestamp>` prefix per request from
-    // the pack vocab; fail closed (typed) on an unknown code or a missing region.
-    let prefix = build_dolphin_decode_prefix(tokens, language)
-        .map_err(|error| format!("dolphin decode prefix build failed: {error}"))?;
+    // Build the `<sos> <lang> <region> <asr> <notimestamp>` prefix per request
+    // from the pack vocab; fail closed (typed) on an unknown code or a missing
+    // language/region token. Dispatches on the pack's own
+    // `dolphin.language.scheme` (absent on every pack predating this key,
+    // which defaults to the cn-dialect family's fixed-`<zh>` builder -- both
+    // currently-published dolphin packs are cn-dialect).
+    let prefix = match metadata.get_string(LANGUAGE_SCHEME_KEY) {
+        Some("multilingual") => build_dolphin_multilingual_decode_prefix(tokens, language)
+            .map_err(|error| format!("dolphin multilingual decode prefix build failed: {error}"))?,
+        _ => build_dolphin_decode_prefix(tokens, language)
+            .map_err(|error| format!("dolphin decode prefix build failed: {error}"))?,
+    };
     let eos_token_id = metadata
         .get_u32(EOS_TOKEN_ID_KEY)
         .ok_or_else(|| format!("dolphin pack is missing '{EOS_TOKEN_ID_KEY}'"))?;
     let blank_token_id = metadata
         .get_u32(BLANK_TOKEN_ID_KEY)
         .ok_or_else(|| format!("dolphin pack is missing '{BLANK_TOKEN_ID_KEY}'"))?;
+    // Structural hparams (d_model/heads/FFN/layer counts/...) come from the
+    // pack's own runtime contract, never a fixed `small.cn` shape -- this is
+    // what lets base/small/multilingual checkpoints of any width share this
+    // one pipeline. `execute()`'s Gate-0 already fail-closed-validated this
+    // parses; re-parsing here (instead of threading the result through) keeps
+    // this function's signature stable for its other caller
+    // (`encode_dolphin_encoder_from_pack`'s parity test, which intentionally
+    // stays pinned to `small_cn()`).
+    let execution_metadata = parse_dolphin_execution_metadata(metadata, weights)
+        .map_err(|error| format!("dolphin runtime metadata contract failed: {error}"))?;
 
     // Frontend: kaldi fbank -> global CMVN (the exact tensor the encoder consumes).
     let mut features = DolphinFbankFrontend::new()
@@ -353,8 +385,8 @@ pub(crate) fn run_dolphin_pipeline(
     apply_global_cmvn(&mut features.data, NUM_MEL_BINS, cmvn_mean, cmvn_istd)
         .map_err(|error| format!("dolphin global CMVN failed: {error}"))?;
 
-    // Encoder (parity-verified).
-    let encoder_config = DolphinEncoderConfig::small_cn();
+    // Encoder (parity-verified for small.cn; shape-derived for every size).
+    let encoder_config = DolphinEncoderConfig::from_execution_metadata(&execution_metadata);
     let encoder = encode(
         &encoder_config,
         weights,
@@ -394,7 +426,7 @@ pub(crate) fn run_dolphin_pipeline(
     };
 
     // CTC/attention joint decode.
-    let decoder_config = DolphinDecoderConfig::small_cn();
+    let decoder_config = DolphinDecoderConfig::from_execution_metadata(&execution_metadata);
     let decode_config = DolphinJointDecodeConfig {
         beam_size: DOLPHIN_BEAM_SIZE,
         ctc_weight,
@@ -466,7 +498,7 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
             .resolve_runtime_source_preflight()
             .map_err(|error| fail(error.to_string()))?;
         // Fail closed on an incomplete pack (missing runtime scalar keys).
-        parse_dolphin_execution_metadata(&preflight.metadata)
+        parse_dolphin_execution_metadata(&preflight.metadata, preflight.tensor_index.as_ref())
             .map_err(|error| fail(format!("dolphin runtime metadata contract failed: {error}")))?;
         // Confirm the encoder + CTC namespaces are actually baked before decoding.
         for sentinel in ENCODER_SENTINEL_TENSORS {
@@ -729,6 +761,8 @@ mod tests {
             output_path: temp_path.to_path_buf(),
             model_id: "dolphin-cn-dialect-small".to_string(),
             quantization: quant,
+            language_scheme:
+                crate::models::dolphin::package_import::DolphinLanguageScheme::CnDialect,
         })
         .expect("dolphin import");
         temp_path.persist(&pack).expect("publish dolphin pack");

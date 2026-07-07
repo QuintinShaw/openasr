@@ -65,6 +65,9 @@ RELEASE_LANE_MODELS = (
     "wespeaker-voxceleb-resnet34-lm",
     "pyannote-segmentation-3.0",
     "hymt2-1.8b",
+    "dolphin-cn-dialect-base",
+    "dolphin-small",
+    "dolphin-base",
 )
 GGUF_GENERAL_ARCHITECTURE_KEY = b"general.architecture"
 

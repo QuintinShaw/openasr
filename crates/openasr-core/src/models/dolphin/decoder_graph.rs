@@ -98,6 +98,27 @@ impl DolphinDecoderConfig {
             layer_norm_epsilon: 1e-5,
         }
     }
+
+    /// Build the config from the pack's own parsed runtime metadata --
+    /// checkpoint-size-agnostic. The importer's `derive_dolphin_architecture`
+    /// asserts the decoder's own d_model equals the encoder's for every
+    /// observed Dolphin checkpoint before it ever writes the pack, so this
+    /// reuses `encoder_d_model` rather than tracking a redundant metadata key.
+    /// `layer_norm_epsilon` stays fixed at `1e-5`, like `small_cn()`'s.
+    pub(crate) fn from_execution_metadata(
+        metadata: &super::runtime_contract::DolphinExecutionMetadata,
+    ) -> Self {
+        Self {
+            d_model: metadata.encoder_d_model,
+            attention_heads: metadata.decoder_n_heads,
+            head_dim: metadata.encoder_head_dim,
+            ffn_units: metadata.decoder_ffn_dim,
+            num_layers: metadata.decoder_n_layers,
+            vocab_size: metadata.vocab_size,
+            max_positions: metadata.decoder_max_ctx,
+            layer_norm_epsilon: 1e-5,
+        }
+    }
 }
 
 /// Decoder logits over the teacher-forced prefix.
