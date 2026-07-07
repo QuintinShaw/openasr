@@ -474,7 +474,17 @@ pub(super) async fn serve(
         );
     }
     let ffmpeg_bin = resolve_ffmpeg_bin(runtime_paths.ffmpeg_bin.clone(), &config);
-    let api_key_hashes = load_active_api_key_hashes()?;
+    let api_key_hashes = if supervised_daemon_launch() {
+        // The desktop supervisor's managed daemon (marked by the instance-token
+        // env it always sets) has its own trust model: the UI talks to its
+        // daemon over loopback without bearer headers, and remote access goes
+        // through TLS + pairing. Enforcing user-created API keys here would
+        // lock the desktop app out of its own daemon, so keys apply only to
+        // manually-launched `openasr serve`.
+        Vec::new()
+    } else {
+        load_active_api_key_hashes()?
+    };
 
     let mut launch_options = serve_launch_options(addr, security, api_key_hashes)?;
     // Persist pairing credentials/revocations under OPENASR_HOME so a paired
@@ -493,6 +503,15 @@ pub(super) async fn serve(
         launch_options,
     )
     .await
+}
+
+/// True when this `serve` process was launched by the desktop supervisor,
+/// which always sets the server instance-token env for its managed daemon
+/// (`OPENASR_SERVER_INSTANCE_TOKEN`, consumed by `openasr-server` for
+/// same-port restart identity).
+fn supervised_daemon_launch() -> bool {
+    env::var_os("OPENASR_SERVER_INSTANCE_TOKEN")
+        .is_some_and(|value| !value.to_string_lossy().trim().is_empty())
 }
 
 /// Reads currently-active API key hashes from the local `apikeys.json` store
@@ -1595,6 +1614,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(approved.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn supervised_daemon_launch_detects_instance_token_env() {
+        with_env_lock(|| {
+            let _removed = EnvVarRestore::remove("OPENASR_SERVER_INSTANCE_TOKEN");
+            assert!(!supervised_daemon_launch());
+            let _blank = EnvVarRestore::set("OPENASR_SERVER_INSTANCE_TOKEN", "  ");
+            assert!(!supervised_daemon_launch());
+            let _set = EnvVarRestore::set("OPENASR_SERVER_INSTANCE_TOKEN", "desktop-token");
+            assert!(supervised_daemon_launch());
+        });
     }
 
     async fn models_status(app: axum::Router, bearer: Option<&str>) -> StatusCode {

@@ -94,6 +94,13 @@ openasr apikey revoke key_1a2b3c4d5e6f7a8b
 Revoking the last remaining key returns loopback `serve` to its key-free
 default.
 
+API keys apply to **manually-launched** `openasr serve` only. The desktop
+app's supervisor-managed daemon (identified by the instance-token environment
+variable the supervisor sets when spawning it) is exempt: its UI talks to it
+over loopback without bearer headers, and its remote access is secured by
+TLS + pairing instead -- so creating a key never locks the desktop app out
+of its own daemon.
+
 ### What API keys do not change
 
 A locally-created API key is a **loopback-only** convenience. Binding `serve`
