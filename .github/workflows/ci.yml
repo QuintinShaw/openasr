@@ -129,6 +129,14 @@ jobs:
     # SDKs), so unlike a Command-Line-Tools-only dev machine this produces all
     # three slices -- see scripts/build-xcframework.sh's SDK-detection
     # fallback for the local (CLT-only) degraded path.
+    #
+    # This is the dev-time, any-branch, build-only variant (raw xcframework
+    # dir as a build artifact, no packaging/release upload). The release
+    # train's version lives in .github/workflows/release-binaries.yml's
+    # `xcframework` job (zip + sha256 + attached to the tagged GitHub
+    # Release, gated by verify-completeness) -- keep the build steps here
+    # (targets/cbindgen/header-check/build script) in sync with that job if
+    # either changes.
     if: github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     steps:
