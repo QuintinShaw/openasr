@@ -202,11 +202,23 @@ def commit_stage(stage: Path, message: str, *, use_lfs: bool) -> str:
     return run(["git", "rev-parse", "HEAD"], cwd=stage)
 
 
-def ensure_hf_repo(repo: str, token: str, public: bool, dry_run: bool) -> None:
+def ensure_hf_repo(repo: str, token: str, dry_run: bool) -> None:
+    """Create (or reuse) the HF repo, always **private** at creation time.
+
+    Publish never flips a repo public on its own -- `release_public` in
+    models-core.toml only gates whether `_manifest.py --public` may list the
+    model in the *catalog*; it says nothing about Hugging Face repo
+    visibility. Making an HF repo public is a separate, deliberate step taken
+    manually (or via a dedicated script) after the catalog-listing gate has
+    already passed, so a model can never go public on HF purely because its
+    catalog metadata flipped a bit.
+    """
     if dry_run:
         return
-    args = ["hf", "repo", "create", repo, "--type", "model", "--exist-ok", "--token", token]
-    args.append("--public" if public else "--private")
+    args = [
+        "hf", "repo", "create", repo, "--type", "model", "--exist-ok", "--token", token,
+        "--private",
+    ]
     run(args)
 
 
@@ -232,7 +244,7 @@ def publish_hf(model: str, entry: dict, quants: list[str], dry_run: bool) -> str
         stage = Path(tmp)
         copy_stage(model, quants, hf_readme(model), stage)
         commit_stage(stage, f"publish {model} OpenASR packs", use_lfs=not dry_run)
-        ensure_hf_repo(repo, token or "", bool(entry.get("release_public")), dry_run)
+        ensure_hf_repo(repo, token or "", dry_run)
         revision = push_git(stage, hf_remote(repo, token or "DRY_RUN_TOKEN"), dry_run)
     if not dry_run:
         atomic_write_text(work_root(model) / "hf_repo.txt", repo + "\n")

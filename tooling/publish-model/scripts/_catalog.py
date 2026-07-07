@@ -672,6 +672,28 @@ BOLD_MARKER = "**"
 NUMBER_TOKEN_RE = re.compile(r"[0-9][0-9.,eE×xX%]*[A-Za-z]*")
 PROSE_LOCALE_OPTIONAL_FIELDS = {"tagline", "highlights", "source_sha256"}
 
+# A half-width ASCII punctuation mark sandwiched directly between two CJK
+# (Han) characters is almost always a stray Western-keyboard artifact in
+# otherwise full-width Chinese prose (e.g. "...E-Branchformer(CTC + 注意力),
+# 覆盖..." should read "...（CTC + 注意力），覆盖..."). Requiring CJK on *both*
+# sides keeps this from firing on legitimate ASCII usage: English clauses,
+# code/backtick spans, markdown link syntax, and thousands separators like
+# "400,000" all have a non-CJK neighbor on at least one side of the mark.
+_CJK_CHAR = "一-鿿"
+ZH_HALFWIDTH_PUNCT_BETWEEN_CJK_RE = re.compile(f"[{_CJK_CHAR}][,.!?;:][{_CJK_CHAR}]")
+
+
+def _check_no_halfwidth_punct_between_cjk(model: str, locale: str, label: str, text: str) -> None:
+    if not locale.lower().startswith("zh"):
+        return
+    match = ZH_HALFWIDTH_PUNCT_BETWEEN_CJK_RE.search(text)
+    if match:
+        raise KeyError(
+            f"model '{model}' prose_locales.{locale} {label}: half-width punctuation "
+            f"{match.group()[1]!r} directly between CJK characters ({match.group()!r}); "
+            "use the full-width equivalent (， 。 ！ ？ ； ：) in Chinese prose"
+        )
+
 
 def _leading_emoji(text: str) -> str:
     stripped = text.strip()
@@ -702,6 +724,7 @@ def _validate_prose_line_pair(
     *,
     check_leading_emoji: bool = True,
 ) -> None:
+    _check_no_halfwidth_punct_between_cjk(model, locale, label, translated_text)
     if en_text.count(BOLD_MARKER) != translated_text.count(BOLD_MARKER):
         raise KeyError(
             f"model '{model}' prose_locales.{locale} {label}: '**' bold-marker count drifted from English"

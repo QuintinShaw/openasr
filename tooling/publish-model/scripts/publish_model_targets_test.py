@@ -112,6 +112,79 @@ class PublishModelTargetsTest(unittest.TestCase):
 
             self.assertNotIn(["git", "lfs", "install", "--local"], commands)
 
+    def test_ensure_hf_repo_always_creates_private(self) -> None:
+        # Fail-closed visibility: repo creation never takes a `public` bit.
+        # Making a model's HF repo public is a separate, explicit step taken
+        # only after the `_manifest.py --public` catalog-listing gate has
+        # passed -- publish_hf must never do it implicitly.
+        commands: list[list[str]] = []
+
+        def fake_run(args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
+            del cwd, env
+            commands.append(args)
+            return ""
+
+        with mock.patch.object(publish, "run", side_effect=fake_run):
+            publish.ensure_hf_repo("OpenASR/some-model", "tok", False)
+
+        self.assertEqual(len(commands), 1)
+        self.assertIn("--private", commands[0])
+        self.assertNotIn("--public", commands[0])
+
+    def test_ensure_hf_repo_signature_has_no_public_visibility_parameter(self) -> None:
+        # Regression guard: `ensure_hf_repo` must not regain a `public`
+        # parameter that a caller could wire back up to `release_public`.
+        import inspect
+
+        params = list(inspect.signature(publish.ensure_hf_repo).parameters)
+        self.assertEqual(params, ["repo", "token", "dry_run"])
+
+    def test_publish_hf_never_requests_a_public_repo_even_when_release_public_is_true(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            packs = root / "tmp" / "publish" / "qwen3-asr-0.6b" / "packs"
+            repo = root / "tmp" / "publish" / "qwen3-asr-0.6b" / "repo"
+            packs.mkdir(parents=True)
+            repo.mkdir(parents=True)
+            (repo / "README.md").write_text("HF README\n")
+            for quant in publish.DEFAULT_QUANTS:
+                pack = packs / f"qwen3-asr-0.6b-{quant}.oasr"
+                pack.write_bytes(b"general.architecture\0qwen3-asr\0" + f"{quant}\n".encode())
+                (packs / f"qwen3-asr-0.6b.{quant}.result.json").write_text(
+                    json.dumps(
+                        {
+                            "pack": str(pack),
+                            "size_bytes": pack.stat().st_size,
+                            "sha256": "a" * 64,
+                        }
+                    )
+                )
+
+            entry = {
+                "hf_repo": "OpenASR/qwen3-asr-0.6b",
+                "release_public": True,
+                "license_name": "Apache-2.0",
+            }
+            calls: list[list[str]] = []
+
+            def fake_ensure_hf_repo(repo: str, token: str, dry_run: bool) -> None:
+                calls.append([repo, token, str(dry_run)])
+
+            old_root = publish.REPO_ROOT
+            try:
+                publish.REPO_ROOT = root
+                with mock.patch.object(publish, "ensure_hf_repo", side_effect=fake_ensure_hf_repo):
+                    publish.publish_hf(
+                        "qwen3-asr-0.6b", entry, list(publish.DEFAULT_QUANTS), True
+                    )
+            finally:
+                publish.REPO_ROOT = old_root
+
+            # release_public=True on the catalog entry must not leak into any
+            # HF-visibility argument -- ensure_hf_repo takes no such argument.
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], "OpenASR/qwen3-asr-0.6b")
+
     def test_pack_result_rejects_legacy_qwen_architecture_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
