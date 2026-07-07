@@ -13,6 +13,7 @@ mod http;
 // (workspace consumers enable the `testing` feature).
 pub mod adapter_pack;
 pub mod api;
+pub mod apikeys;
 mod arch;
 pub(crate) mod audio;
 pub(crate) mod batch;

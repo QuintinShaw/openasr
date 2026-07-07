@@ -469,8 +469,12 @@ pub(crate) enum Command {
     },
     /// Start the OpenAI-compatible API server.
     ///
-    /// Defaults to local HTTP on 127.0.0.1. Non-loopback remote serving must
-    /// use HTTPS/WSS and pairing auth.
+    /// Defaults to local HTTP on 127.0.0.1:8080 (a fixed, predictable port so
+    /// scripts and coding agents can rely on it). Loopback callers are trusted
+    /// by default (no key required); once an API key exists (`openasr apikey
+    /// create`) loopback requests must send it too. Non-loopback remote
+    /// serving must always use HTTPS/WSS and pairing auth, regardless of API
+    /// keys.
     Serve {
         /// Address to bind.
         #[arg(long, default_value = "127.0.0.1:8080", env = "OPENASR_ADDR")]
@@ -496,6 +500,34 @@ pub(crate) enum Command {
         /// Local `.oasr` runtime pack file for native backend transcription.
         #[arg(long)]
         model_pack: Option<PathBuf>,
+    },
+    /// Manage local API keys for `openasr serve` (`Authorization: Bearer
+    /// <key>`). Loopback callers need no key by default; creating one forces
+    /// every loopback request to present it too. Only a key's hash is
+    /// persisted -- the plaintext is shown once, at creation.
+    Apikey {
+        #[command(subcommand)]
+        command: ApiKeyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ApiKeyCommand {
+    /// Create a new API key. Prints the plaintext key exactly once -- it is
+    /// not recoverable afterward; only its hash is persisted.
+    Create {
+        /// Optional label to tell keys apart in `apikey list` (for example the
+        /// agent or host it is issued to).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List issued API keys (id, name, creation time, key preview). Never
+    /// prints a full key.
+    List,
+    /// Revoke (delete) an API key by id.
+    Revoke {
+        /// Key id, as printed by `apikey list` (e.g. key_1a2b3c4d5e6f7a8b).
+        id: String,
     },
 }
 

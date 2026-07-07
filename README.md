@@ -211,6 +211,7 @@ network-free output for CI.
 | `transcribe <inputs>...` | Transcribe files or directories. `--benchmark` prints run timing instead of the transcript; aliased as `t`. |
 | `live` | Microphone / system-audio capture; emits frame-synchronous streaming partials for packs that declare streaming, else final-per-utterance. |
 | `serve` | Local OpenAI-compatible HTTP API; secured remote serving via TLS + pairing. |
+| `apikey create/list/revoke` | Manage local API keys for `serve`; once one exists, loopback callers must send it too (see [Agent Integration](docs/AGENT_INTEGRATION.md)). |
 | `search [query]` / `pull <id>` | Browse the model catalog / download and install a pack. |
 | `list` / `show <id-or-pack>` / `rm <id>` | List installed packs / show catalog or pack details / remove a pack. |
 | `verify <pack.oasr>` | Probe a local pack's ggml integrity (no inference, no download). |
@@ -255,8 +256,13 @@ Key constraints:
   history is local-only and governed by the `history_retention` preference
   (default keeps the last 5 entries; `off` disables it). See
   [SECURITY](SECURITY.md) for what's stored.
+- The default `--addr` (`127.0.0.1:8080`) is a fixed, predictable port so
+  scripts and coding agents can rely on it. Loopback callers are trusted by
+  default (no key required); `openasr apikey create` opts into requiring a
+  bearer key even on loopback -- see [Agent Integration](docs/AGENT_INTEGRATION.md).
 
-Non-loopback binds are rejected unless launched with HTTPS/WSS and pairing auth:
+Non-loopback binds are rejected unless launched with HTTPS/WSS and pairing auth
+(an API key never substitutes for this -- it is a loopback-only escape hatch):
 
 ```bash
 export OPENASR_PAIRING_ADMIN_TOKEN="$(openssl rand -hex 32)"
