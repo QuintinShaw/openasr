@@ -2875,6 +2875,69 @@ async fn transcriptions_returns_mock_json_by_default() {
     );
 }
 
+/// A real-world upload filename containing CJK characters and a space must
+/// parse as multipart/form-data like any other filename -- this previously
+/// got misdiagnosed as a client encoding bug when the true cause was uploads
+/// exceeding the server's body-size limit (see the oversized-upload test
+/// below), not the filename itself.
+#[tokio::test]
+async fn transcriptions_accept_filename_with_cjk_characters_and_space() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+        },
+    );
+    let request = multipart_request(
+        "whisper-large-v3-turbo",
+        "0511 博弘讨论配合问题.m4a",
+        b"not a real m4a",
+    );
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        parsed["text"]
+            .as_str()
+            .unwrap()
+            .contains("OpenASR mock transcription")
+    );
+}
+
+/// An upload past the server's body-size ceiling must fail with a clear,
+/// actionable "file too large" message and 413, not the generic "Error
+/// parsing `multipart/form-data` request" text that `MultipartError`'s
+/// `Display` renders for every underlying `multer` failure (including this
+/// one) -- see `multipart_error_message` in `lib.rs`.
+#[tokio::test]
+async fn transcriptions_reject_upload_past_body_limit_with_clear_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+        },
+    );
+    let oversized = vec![0u8; 65 * 1024 * 1024];
+    let request = multipart_request("whisper-large-v3-turbo", "huge.wav", &oversized);
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    let message = parsed["error"]["message"].as_str().unwrap();
+    assert!(message.contains("too large"), "message was: {message}");
+    assert!(
+        !message.contains("Error parsing"),
+        "message regressed to the generic multipart error text: {message}"
+    );
+}
+
 #[tokio::test]
 async fn transcriptions_accept_word_timestamp_granularity_for_json() {
     let temp = tempfile::tempdir().unwrap();
