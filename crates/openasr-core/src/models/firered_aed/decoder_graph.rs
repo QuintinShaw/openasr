@@ -567,6 +567,21 @@ pub(crate) fn run_firered_aed_decoder_greedy(
     decode_text: impl Fn(&[u32]) -> Result<String, String>,
 ) -> Result<FireRedAedGreedyDecodeOutput, FireRedDecoderError> {
     let mut runtime = FireRedDecoderGraphRuntime::new(runtime_path, metadata, encoder_frame_count)?;
+    run_firered_aed_decoder_greedy_with_runtime(&mut runtime, metadata, encoder_rows, decode_text)
+}
+
+/// Same greedy decode loop as [`run_firered_aed_decoder_greedy`], but against
+/// an already-built (and possibly cached/reused across transcriptions)
+/// [`FireRedDecoderGraphRuntime`]. Resets the runtime's cross-KV cache and
+/// incremental self-KV position for this utterance via
+/// [`FireRedDecoderGraphRuntime::populate_cross_attention_cache`] before
+/// decoding, so a cache hit never leaks state from a prior utterance.
+pub(crate) fn run_firered_aed_decoder_greedy_with_runtime(
+    runtime: &mut FireRedDecoderGraphRuntime,
+    metadata: FireRedAedExecutionMetadata,
+    encoder_rows: &[f32],
+    decode_text: impl Fn(&[u32]) -> Result<String, String>,
+) -> Result<FireRedAedGreedyDecodeOutput, FireRedDecoderError> {
     runtime.populate_cross_attention_cache(encoder_rows)?;
 
     let max_new_tokens =

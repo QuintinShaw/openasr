@@ -28,6 +28,7 @@ use thiserror::Error;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
+    GgmlLoadedWeightContext,
 };
 use crate::models::cohere::encoder_graph::build_relative_positional_encoding;
 use crate::nn::attn::{
@@ -107,10 +108,59 @@ pub(crate) fn firered_encoder_graph_config() -> GgmlCpuGraphConfig {
     }
 }
 
+/// Owns the encoder's mmap'd weight context plus the ggml graph runner across
+/// calls, so a caller (see the thread-local cache in `executor.rs`) can reuse
+/// the same runtime for every transcription on this pack instead of
+/// re-loading the GGUF weight context from scratch each time -- the encoder
+/// forward itself stays a fresh single-shot graph per call (no incremental
+/// reuse across time steps, matching cohere's/parakeet's shape).
+pub(crate) struct FireRedEncoderGraphRuntime {
+    runner: GgmlCpuGraphRunner,
+    _loaded: GgmlLoadedWeightContext,
+    weights: FireRedEncoderWeights,
+    metadata: FireRedAedExecutionMetadata,
+}
+
+impl FireRedEncoderGraphRuntime {
+    pub(crate) fn new(
+        runtime_path: &Path,
+        metadata: FireRedAedExecutionMetadata,
+    ) -> Result<Self, FireRedEncoderError> {
+        let runner = GgmlCpuGraphRunner::new(firered_encoder_graph_config())
+            .map_err(|source| map_err("runner_init", source))?;
+        let loaded = runner
+            .load_gguf_weight_context(runtime_path)
+            .map_err(|source| map_err("load_gguf_weight_context", source))?;
+        let weights = FireRedEncoderWeights::load(&loaded, metadata.encoder_n_layers)?;
+        Ok(Self {
+            runner,
+            _loaded: loaded,
+            weights,
+            metadata,
+        })
+    }
+
+    pub(crate) fn encode(
+        &mut self,
+        cmvn_features: &[f32],
+        n_frames: usize,
+    ) -> Result<FireRedEncoderOutput, FireRedEncoderError> {
+        encode_firered_aed_audio_embeddings(
+            &mut self.runner,
+            &self.weights,
+            self.metadata,
+            cmvn_features,
+            n_frames,
+        )
+    }
+}
+
 /// Run the full encoder forward pass in a single ggml graph (no incremental
-/// reuse -- matches cohere's/parakeet's single-shot encoder shape).
-pub(crate) fn encode_firered_aed_audio_embeddings(
-    runtime_path: &Path,
+/// reuse -- matches cohere's/parakeet's single-shot encoder shape) against an
+/// already-loaded runner/weights pair.
+fn encode_firered_aed_audio_embeddings(
+    runner: &mut GgmlCpuGraphRunner,
+    weights: &FireRedEncoderWeights,
     metadata: FireRedAedExecutionMetadata,
     cmvn_features: &[f32],
     n_frames: usize,
@@ -122,13 +172,6 @@ pub(crate) fn encode_firered_aed_audio_embeddings(
     if cmvn_features.len() != n_frames * feature_dim {
         return Err(FireRedEncoderError::ShapeOverflow);
     }
-
-    let mut runner = GgmlCpuGraphRunner::new(firered_encoder_graph_config())
-        .map_err(|source| map_err("runner_init", source))?;
-    let loaded = runner
-        .load_gguf_weight_context(runtime_path)
-        .map_err(|source| map_err("load_gguf_weight_context", source))?;
-    let weights = FireRedEncoderWeights::load(&loaded, metadata.encoder_n_layers)?;
 
     // Zero-pad the time axis by `context - 1` frames (matches
     // `F.pad(padded_input, (0,0,0,context-1))`), then run the 2x Conv2d(k3,s2)
@@ -801,9 +844,9 @@ mod parity_tests {
             .expect("read inv_stddev");
         apply_cmvn(&mut fbank.data, fbank.n_mels, &neg_mean, &inv_stddev).expect("apply cmvn");
 
-        let output =
-            encode_firered_aed_audio_embeddings(&pack_path, metadata, &fbank.data, fbank.n_frames)
-                .expect("encode");
+        let mut runtime =
+            FireRedEncoderGraphRuntime::new(&pack_path, metadata).expect("build encoder runtime");
+        let output = runtime.encode(&fbank.data, fbank.n_frames).expect("encode");
 
         eprintln!(
             "firered encoder parity: frames={} hidden={} frame0_first8={:?}",
