@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-06T02:01:34+00:00",
+  "generated_at": "2026-07-07T04:35:00+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -597,6 +597,121 @@
       },
       "upstream_release_date": "2024-07-04",
       "min_core_version": "0.1.5"
+    },
+    {
+      "id": "dolphin-cn-dialect-base",
+      "kind": "asr-model",
+      "display_name": "Dolphin CN-Dialect Base",
+      "family": "dolphin",
+      "aliases": [],
+      "pull_alias": null,
+      "size": "base",
+      "languages": [
+        "zh",
+        "zh-anhui",
+        "zh-guangdong",
+        "zh-hebei",
+        "zh-hubei",
+        "zh-jiangsu",
+        "zh-ningxia",
+        "zh-shaanxi",
+        "zh-shandong",
+        "zh-shanghai",
+        "zh-shanxi",
+        "zh-sichuan",
+        "zh-tianjin",
+        "zh-tw"
+      ],
+      "vendor": "DataoceanAI",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/DataoceanAI/dolphin-cn-dialect-base/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/dolphin-cn-dialect-base",
+      "hf_revision": "e2996bbc639c4d4a16ca199cda934f7b54dcf476",
+      "public": true,
+      "min_cli_version": "0.1.8",
+      "recommended_quant": "fp16",
+      "pull_recommended": "dolphin-cn-dialect-base:fp16",
+      "prose": {
+        "tagline": "Chinese multi-dialect speech recognition, base tier -- a compact 140M WeNet E-Branchformer (CTC + attention) for Sichuan and 22 regional dialects",
+        "overview": [
+          "Dolphin CN-Dialect Base is the **140M \"base\" tier** of DataoceanAI's **Chinese multi-dialect**\nspeech-recognition line, built on the same **Dolphin / WeNet** recipe as the larger\n**Dolphin CN-Dialect Small**: an **E-Branchformer encoder + Transformer decoder** trained with a\n**joint CTC + attention** objective over a mixed character/BPE vocabulary. It covers the same\n**Sichuan (\u5ddd\u8bdd)**-forward set of 22 Chinese dialects (Wu, Cantonese, Minnan, Shanghainese and\nmore) as its `small.cn` sibling, but at roughly a third of the encoder/decoder width (512 vs 768\nd_model, 6 vs 12 layers) -- a smaller RAM/CPU footprint for deployments where the small tier's\naccuracy headroom is not needed. Unlike `small.cn`, this `base.cn` checkpoint does not ship a\ntrained hotword deep-biasing module. This OpenASR repo repackages the weights as `.oasr` packs\nthat run natively in the OpenASR runtime -- no Python at inference, all decoding local. It ships\nin **fp16** (maximum fidelity, recommended), **q8_0**, and **q4_k** builds.\n\n**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed\nwithout punctuation marks, so the decoder never predicts a punctuation token -- there is no\nsetting to enable it. Transcripts are plain, unpunctuated text by design."
+        ],
+        "highlights": [
+          "\ud83c\udc04 **22 Chinese dialects, base tier** \u2014 the same WeNet E-Branchformer dialect coverage as Dolphin CN-Dialect Small (Sichuan/\u5ddd\u8bdd, Wu, Cantonese, Minnan, Shanghainese and more), at a fraction of the size",
+          "\ud83e\udeb6 **140M parameters** \u2014 roughly a third the width of the `small.cn` checkpoint (512 vs 768 d_model, 6 vs 12 layers), for tighter RAM and faster CPU decode when the small tier is overkill",
+          "\ud83e\udde9 **Joint CTC + attention** \u2014 the same E-Branchformer encoder + Transformer decoder recipe with CTC/attention rescoring, verified against a shape-derived runtime contract shared with the rest of the Dolphin family",
+          "\ud83d\udc2c **Chinese-focused, mixed char/BPE vocab** \u2014 a character vocabulary for Chinese with SentencePiece word-piece tokens for code-switched English, purpose-built for zh audio including heavy accents",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "dolphin-cn-dialect-base:fp16",
+          "filename": "dolphin-cn-dialect-base-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-base/resolve/e2996bbc639c4d4a16ca199cda934f7b54dcf476/dolphin-cn-dialect-base-fp16.oasr",
+          "sha256": "7fa84334cdb81ec3d0ae09882e613424a79eef871a682d4028487ea72318e520",
+          "size_bytes": 224297952,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.1307834318181818,
+            "rtf_metal": 0.04882275381818182,
+            "peak_rss_bytes": 1038909440,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "dolphin-cn-dialect-base:q8",
+          "filename": "dolphin-cn-dialect-base-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-base/resolve/e2996bbc639c4d4a16ca199cda934f7b54dcf476/dolphin-cn-dialect-base-q8_0.oasr",
+          "sha256": "4cda4dbbb147c55af488c0d292acd6bd1bf406f44b3c97a23a2f0c79cbf17870",
+          "size_bytes": 127104192,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.09155731054545456,
+            "rtf_metal": 0.050060140181818175,
+            "peak_rss_bytes": 1058242560,
+            "jfk_wer_vs_fp16": 0.045454545454545456
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "dolphin-cn-dialect-base:q4",
+          "filename": "dolphin-cn-dialect-base-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-base/resolve/e2996bbc639c4d4a16ca199cda934f7b54dcf476/dolphin-cn-dialect-base-q4_k.oasr",
+          "sha256": "a03067df72326cbcf4e32e883d966d490ec0bcbef596cbab54dfa91af42c05db",
+          "size_bytes": 75267520,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.08801972727272728,
+            "rtf_metal": 0.04770343936363637,
+            "peak_rss_bytes": 1003208704,
+            "jfk_wer_vs_fp16": 0.09090909090909091
+          }
+        }
+      ],
+      "language_mode": "specify_only",
+      "language_default": "zh",
+      "emits_punctuation": false,
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u4e2d\u6587\u591a\u65b9\u8a00\u8bed\u97f3\u8bc6\u522b\uff08base \u6863\uff09\u2014 \u7d27\u51d1\u7684 140M \u53c2\u6570 WeNet E-Branchformer(CTC + \u6ce8\u610f\u529b),\u8986\u76d6\u56db\u5ddd\u8bdd\u4e0e 22 \u79cd\u5730\u65b9\u65b9\u8a00",
+          "highlights": [
+            "\ud83c\udc04 **22 \u79cd\u4e2d\u6587\u65b9\u8a00\uff0cbase \u6863** \u2014 \u4e0e Dolphin CN-Dialect Small \u76f8\u540c\u7684 WeNet E-Branchformer \u65b9\u8a00\u8986\u76d6(\u56db\u5ddd\u8bdd/\u5ddd\u8bdd\u3001\u5434\u8bed\u3001\u7ca4\u8bed\u3001\u95fd\u5357\u8bed\u3001\u4e0a\u6d77\u8bdd\u7b49),\u4f53\u79ef\u5c0f\u5f97\u591a",
+            "\ud83e\udeb6 **140M \u53c2\u6570** \u2014 \u5bbd\u5ea6\u7ea6\u4e3a `small.cn` \u68c0\u67e5\u70b9\u7684\u4e09\u5206\u4e4b\u4e00(d_model 512 \u5bf9 768\u30016 \u5c42\u5bf9 12 \u5c42),small \u6863\u8fc7\u91cd\u65f6\u53ef\u6362\u53d6\u66f4\u7701\u5185\u5b58\u3001\u66f4\u5feb\u7684 CPU \u89e3\u7801",
+            "\ud83e\udde9 **\u8054\u5408 CTC + \u6ce8\u610f\u529b** \u2014 \u4e0e Dolphin \u5bb6\u65cf\u4e00\u81f4\u7684 E-Branchformer \u7f16\u7801\u5668 + Transformer \u89e3\u7801\u5668\u914d\u65b9,\u914d\u5408 CTC/attention \u91cd\u6253\u5206,\u8fd0\u884c\u65f6\u5f62\u72b6\u53c2\u6570\u4e0e\u5168\u5bb6\u65cf\u5171\u4eab\u540c\u4e00\u4efd\u5951\u7ea6",
+            "\ud83d\udc2c **\u9762\u5411\u4e2d\u6587\u3001\u5b57\u7b26/BPE \u6df7\u5408\u8bcd\u8868** \u2014 \u4e2d\u6587\u7528\u5b57\u7b26\u8bcd\u8868,\u4e2d\u82f1\u6df7\u8bf4\u7684\u82f1\u6587\u7528 SentencePiece \u8bcd\u7247,\u4e13\u4e3a\u4e2d\u6587\u97f3\u9891(\u542b\u91cd\u53e3\u97f3)\u6253\u9020",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python,\u9488\u5bf9 CPU \u4e0e GPU \u7684\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+          ]
+        }
+      },
+      "upstream_release_date": "2026-05-13",
+      "min_core_version": "0.1.8"
     },
     {
       "id": "hymt2-1.8b",

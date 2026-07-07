@@ -89,6 +89,9 @@ jobs:
           - { name: qwen, ref: "qwen3-asr-0.6b:q4", mode: transcribe, strategy: exact }
           - { name: sensevoice, ref: "sensevoice-small:q4", mode: transcribe, strategy: exact }
           - { name: dolphin, ref: "dolphin-cn-dialect-small:q4", mode: transcribe, strategy: exact }
+          # Same dolphin family, base tier: covers the size-generalized runtime
+          # (512 d_model import path) that the small checkpoint does not reach.
+          - { name: dolphin-base-pack, ref: "dolphin-cn-dialect-base:q4", mode: transcribe, strategy: exact }
           - { name: xasr, ref: "xasr-zh-en:q4", mode: transcribe, strategy: exact }
           - { name: cohere, ref: "cohere-transcribe-03-2026:q4", mode: transcribe, strategy: exact }
           # Diarization capability packs (pyannote-seg + wespeaker) are
