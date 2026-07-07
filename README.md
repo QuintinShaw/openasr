@@ -88,10 +88,10 @@ openasr pull qwen3-asr-0.6b:q8        # or pin a specific quant tier
 openasr list                          # what's installed
 ```
 
-The catalog ships **17 ready-to-pull ASR packs** spanning seven of the eleven
-native families (50 signed quant downloads), plus diarization capability
-packs; the remaining four (Parakeet-CTC, Parakeet-TDT, wav2vec2-CTC,
-FireRedASR-AED) run via `import` of your own checkpoints. Eleven native
+The catalog ships **22 ready-to-pull ASR packs** spanning nine of the eleven
+native families (64 signed quant downloads), plus diarization capability
+packs; the remaining two (Parakeet-CTC, wav2vec2-CTC) run via `import` of your
+own checkpoints. Eleven native
 families run offline on CPU and Apple Metal,
 dispatched by the data-driven architecture registry. All families support opt-in diarization; most also export word-level
 timestamps -- the columns below show where they differ.
@@ -105,7 +105,7 @@ timestamps -- the columns below show where they differ.
 | Parakeet-TDT (25 European languages) | declared-pack | acoustic | fp16 / q8_0 / q4_k |
 | wav2vec2-CTC (incl. data2vec) | declared-pack | acoustic | fp16 / q8_0 / q4_k |
 | Moonshine | declared-pack | approximate | fp16 / q8_0 / q4_k |
-| Dolphin (Chinese dialects) | none | none | fp16 / q8_0 / q4_k |
+| Dolphin (multilingual + Chinese dialects) | none | none | fp16 / q8_0 / q4_k |
 | SenseVoice (zh/yue/en/ja/ko) | declared-pack | none | fp16 / q8_0 / q4_k |
 | FireRedASR-AED (Mandarin + English bilingual) | none | none | fp16 / q8_0 / q4_k |
 | X-ASR (Zipformer, RNN-T) | declared-pack | acoustic | fp16 / q8_0 / q4_k |

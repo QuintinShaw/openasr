@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-07T17:20:44+00:00",
+  "generated_at": "2026-07-07T18:37:50+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -175,8 +175,8 @@
       "license_class": "permissive",
       "hf_repo": "OpenASR/parakeet-tdt-0.6b-v3",
       "hf_revision": "4a16094df4ec3ab6081089a5aff415c2042342b7",
-      "public": false,
-      "min_cli_version": "0.1.0",
+      "public": true,
+      "min_cli_version": "0.1.9",
       "recommended_quant": "q8_0",
       "pull_recommended": "parakeet-tdt-0.6b-v3:q8",
       "prose": {
@@ -281,8 +281,8 @@
       "license_class": "permissive",
       "hf_repo": "OpenASR/firered-aed-l-v2",
       "hf_revision": "dc176bb00c78e4959e2bff2273f409533c0bfd9b",
-      "public": false,
-      "min_cli_version": "0.1.0",
+      "public": true,
+      "min_cli_version": "0.1.9",
       "recommended_quant": "q4_k",
       "pull_recommended": "firered-aed-l-v2:q4",
       "prose": {
@@ -887,8 +887,8 @@
       "license_class": "permissive",
       "hf_repo": "OpenASR/dolphin-base",
       "hf_revision": "cedd9f67c535032fcfae07c5469dc49f9d957aab",
-      "public": false,
-      "min_cli_version": "0.1.0",
+      "public": true,
+      "min_cli_version": "0.1.9",
       "recommended_quant": "q8_0",
       "pull_recommended": "dolphin-base:q8",
       "prose": {
@@ -1127,8 +1127,8 @@
       "license_class": "permissive",
       "hf_repo": "OpenASR/dolphin-small",
       "hf_revision": "85a23dd6899bb324c6938bd83ee2b1931d16ec2a",
-      "public": false,
-      "min_cli_version": "0.1.0",
+      "public": true,
+      "min_cli_version": "0.1.9",
       "recommended_quant": "q8_0",
       "pull_recommended": "dolphin-small:q8",
       "prose": {
