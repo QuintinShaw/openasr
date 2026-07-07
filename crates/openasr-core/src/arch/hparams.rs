@@ -188,6 +188,29 @@ pub(crate) static SENSEVOICE_HPARAM_SCHEMA: &[&str] = &[
     "ctc.blank_token_id",
 ];
 
+// ── firered-aed (FireRedTeam/FireRedASR-AED-L, Conformer AED) hparam schema ──
+// Keys mirror `models::firered_aed::runtime_contract`, the required-metadata
+// parser the install gate dispatches to for this architecture.
+pub(crate) static FIRERED_AED_HPARAM_SCHEMA: &[&str] = &[
+    "firered.encoder.n_layers",
+    "firered.encoder.d_model",
+    "firered.encoder.n_heads",
+    "firered.encoder.head_dim",
+    "firered.encoder.ffn_dim",
+    "firered.encoder.conv_kernel",
+    "firered.encoder.subsample_channels",
+    "firered.encoder.subsample_out_dim",
+    "firered.encoder.feature_dim",
+    "firered.encoder.pe_len",
+    "firered.decoder.n_layers",
+    "firered.decoder.ffn_dim",
+    "firered.decoder.pe_len",
+    "firered.vocab_size",
+    "firered.sos_token_id",
+    "firered.eos_token_id",
+    "firered.pad_token_id",
+];
+
 // ── wav2vec2-ctc (facebook/wav2vec2-base-960h) hparam schema ─────────────────
 pub(crate) static WAV2VEC2_CTC_HPARAM_SCHEMA: &[&str] = &[
     "wav2vec2.n_layers",

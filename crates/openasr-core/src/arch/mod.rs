@@ -19,11 +19,11 @@ use block_stack::{
 };
 use hparams::{
     COHERE_TRANSCRIBE_DECODER_LAYERS_KEY, COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY,
-    COHERE_TRANSCRIBE_HPARAM_SCHEMA, DOLPHIN_HPARAM_SCHEMA, MOONSHINE_HPARAM_SCHEMA,
-    PARAKEET_CTC_HPARAM_SCHEMA, PARAKEET_TDT_HPARAM_SCHEMA, QWEN3_ARCHITECTURE_VALUE,
-    QWEN3_ASR_HPARAM_SCHEMA, QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY,
-    SENSEVOICE_HPARAM_SCHEMA, WAV2VEC2_CTC_HPARAM_SCHEMA, WHISPER_HPARAM_SCHEMA,
-    XASR_ZIPFORMER_HPARAM_SCHEMA,
+    COHERE_TRANSCRIBE_HPARAM_SCHEMA, DOLPHIN_HPARAM_SCHEMA, FIRERED_AED_HPARAM_SCHEMA,
+    MOONSHINE_HPARAM_SCHEMA, PARAKEET_CTC_HPARAM_SCHEMA, PARAKEET_TDT_HPARAM_SCHEMA,
+    QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA, QWEN3_AUDIO_LAYERS_KEY,
+    QWEN3_LLM_LAYERS_KEY, SENSEVOICE_HPARAM_SCHEMA, WAV2VEC2_CTC_HPARAM_SCHEMA,
+    WHISPER_HPARAM_SCHEMA, XASR_ZIPFORMER_HPARAM_SCHEMA,
 };
 
 pub(crate) const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
@@ -138,16 +138,19 @@ pub(crate) const SENSEVOICE_RUNTIME_TENSOR_CONTRACT_ID: &str = "sensevoice.runti
 pub(crate) const SENSEVOICE_EXECUTOR_COMPONENT_ID: &str = "sensevoice.ggml-executor.v0";
 
 // firered-aed (FireRedTeam/FireRedASR-AED-L: Conformer encoder + Transformer
-// decoder attention-based encoder-decoder, no CTC branch, Apache-2.0).
-// Component ids are defined ahead of the full architecture-descriptor entry
-// (the sensevoice/parakeet staging precedent): the importer writes them as
-// pack metadata; the descriptor + executor wiring lands with the executor
-// stage.
+// decoder attention-based encoder-decoder, no CTC branch, Apache-2.0). The
+// Conformer encoder math (macaron FFN + rel-pos MHSA with independent q/k/v
+// LayerNorms + GLU/depthwise conv) is family-specific, so like dolphin/
+// moonshine/xasr it stays on a hand-written dedicated executor
+// (block_stack: None) rather than the data-driven composer.
 pub(crate) const FIRERED_AED_GGML_ARCHITECTURE_ID: &str = "firered-conformer-aed";
+pub(crate) const FIRERED_AED_GGML_ADAPTER_ID: &str = "ggml-family-firered-aed-runtime-v1";
 pub(crate) const FIRERED_AED_MODEL_FAMILY: &str = "firered-aed";
 pub(crate) const FIRERED_AED_AUDIO_FRONTEND_ID: &str = "firered-aed.fbank80.16khz.mono.v0";
 pub(crate) const FIRERED_AED_TOKENIZER_ID: &str = "firered-aed.char-spm.v0";
 pub(crate) const FIRERED_AED_DECODE_POLICY_ID: &str = "firered-aed.greedy.seq2seq.v0";
+pub(crate) const FIRERED_AED_RUNTIME_TENSOR_CONTRACT_ID: &str = "firered-aed.runtime-tensors.v0";
+pub(crate) const FIRERED_AED_EXECUTOR_COMPONENT_ID: &str = "firered-aed.ggml-executor.v0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenAsrComponentKind {
@@ -736,6 +739,26 @@ const BUILTIN_COMPONENT_DESCRIPTORS: &[OpenAsrComponentDescriptor] = &[
         kind: OpenAsrComponentKind::Executor,
         id: SENSEVOICE_EXECUTOR_COMPONENT_ID,
     },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
+        id: FIRERED_AED_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: FIRERED_AED_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: FIRERED_AED_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: FIRERED_AED_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: FIRERED_AED_EXECUTOR_COMPONENT_ID,
+    },
 ];
 
 const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
@@ -995,6 +1018,29 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             }),
             decoder_stage: None,
         }),
+    },
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &[FIRERED_AED_GGML_ARCHITECTURE_ID, "firered-aed"],
+        model_family: FIRERED_AED_MODEL_FAMILY,
+        model_architecture: FIRERED_AED_GGML_ARCHITECTURE_ID,
+        adapter_id: FIRERED_AED_GGML_ADAPTER_ID,
+        // No language-selection prompt token and no decode-time detection: the
+        // char+SPM vocab is a fixed Mandarin/Chinese-dialect + English set.
+        language_family_hint: LanguageFamilyHint::FixedMultilingual {
+            languages: &["zh", "en"],
+        },
+        audio_frontend_id: FIRERED_AED_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: FIRERED_AED_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: FIRERED_AED_TOKENIZER_ID,
+        decode_policy_id: FIRERED_AED_DECODE_POLICY_ID,
+        executor_component_id: FIRERED_AED_EXECUTOR_COMPONENT_ID,
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        hparam_schema: FIRERED_AED_HPARAM_SCHEMA,
+        // Conformer encoder + Transformer decoder attention-only decode stays
+        // on the dedicated executor (the Conformer block is not a composer
+        // block kind), so no data-driven block-stack descriptor.
+        block_stack: None,
     },
 ];
 

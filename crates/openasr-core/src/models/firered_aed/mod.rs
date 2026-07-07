@@ -13,11 +13,14 @@
 //! - The fbank+CMVN frontend ([`frontend`]), the detokenizer ([`tokenizer`]),
 //!   and the pack-metadata contract ([`runtime_contract`]) are implemented and
 //!   unit-tested here.
-//! - The Conformer encoder graph, KV-cached decoder, and executor land in the
-//!   executor stage.
+//! - The Conformer encoder graph ([`encoder_graph`]), the KV-cached decoder
+//!   ([`decoder_graph`]), and the dedicated [`executor`] complete the stage.
 
+pub(crate) mod decoder_graph;
+pub(crate) mod decoder_weights;
 pub(crate) mod encoder_graph;
 pub(crate) mod encoder_weights;
+pub(crate) mod executor;
 pub(crate) mod frontend;
 pub mod package_import;
 pub(crate) mod runtime_contract;

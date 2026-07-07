@@ -708,6 +708,17 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
                 )
             })
         }
+        crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID => {
+            crate::models::firered_aed::runtime_contract::parse_firered_aed_execution_metadata(
+                &metadata,
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "firered-aed runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
+                )
+            })
+        }
         // No dedicated required-metadata parser for this architecture (yet):
         // stay Ok() here, same as before this check existed. The executor
         // still fails closed at first load if the pack is incomplete.

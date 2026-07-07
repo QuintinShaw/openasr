@@ -11,6 +11,7 @@ use super::dolphin::executor::DolphinGgmlExecutor;
 use super::executor_component_registry::{
     BuiltinExecutorComponentRegistryError, materialize_builtin_executors_by_model_architecture,
 };
+use super::firered_aed::executor::FireRedAedGgmlExecutor;
 use super::ggml_composed_executor::ComposedGgmlAsrExecutor;
 use super::ggml_family_adapter::GgmlExecutionCapability;
 use super::moonshine::MoonshineGgmlExecutor;
@@ -178,6 +179,14 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
         )
         .with_streaming_partial_granularity_for_adapter(
             crate::arch::DOLPHIN_GGML_ADAPTER_ID,
+            StreamingPartialGranularity::Buffered,
+        )
+        .with_streaming_executor_for_adapter(
+            crate::arch::FIRERED_AED_GGML_ADAPTER_ID,
+            Arc::new(FireRedAedGgmlExecutor),
+        )
+        .with_streaming_partial_granularity_for_adapter(
+            crate::arch::FIRERED_AED_GGML_ADAPTER_ID,
             StreamingPartialGranularity::Buffered,
         )
         .with_streaming_executor_for_adapter(
