@@ -11,13 +11,18 @@ pub enum LongFormMode {
 
 /// Which VAD provider backs `Vad`/`Auto` long-form slicing. `Silero` is the
 /// neural default (better speech boundaries); `Energy` is the zero-dependency
-/// RMS fallback. The neural engine degrades to energy automatically when its
-/// model cannot load or the audio is not 16 kHz.
+/// RMS fallback; `FireRed` is an alternative neural engine (causal-FSMN
+/// `FireRedVAD`), selectable via `OPENASR_VAD=firered` but not yet the
+/// default (validated so far only on synthetic + a couple of real fixtures;
+/// promoting it needs a real-recording eval pass first). Every neural engine
+/// degrades to energy automatically when its model cannot load or the audio
+/// is not 16 kHz.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LongFormVadEngine {
     #[default]
     Silero,
     Energy,
+    FireRed,
 }
 
 #[derive(Debug, Clone, PartialEq)]

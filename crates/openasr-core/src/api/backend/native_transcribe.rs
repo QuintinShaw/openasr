@@ -649,8 +649,11 @@ fn shared_native_ggml_execution_dispatch() -> &'static GgmlAsrExecutionDispatch 
 /// Pick the long-form VAD provider for this request, returning the provider and
 /// a label for the engine that actually ran. The neural Silero model (over the
 /// process-wide shared weights) is the default; the energy gate is used when
-/// selected, and `energy-fallback` when Silero was requested but unavailable so
-/// the run metadata reflects what executed. `OPENASR_VAD` overrides the option.
+/// selected; FireRedVAD (an alternative neural engine, not yet the default --
+/// see [`LongFormVadEngine::FireRed`]) is used when explicitly selected. Any
+/// neural engine falls back to `*-fallback` energy when its weights are
+/// unavailable so the run metadata reflects what executed. `OPENASR_VAD`
+/// overrides the option (`silero`/`neural`, `energy`/`rms`, `firered`).
 fn resolve_longform_vad_provider(
     options: &crate::LongFormOptions,
 ) -> (Box<dyn LongFormVadProvider>, &'static str) {
@@ -660,15 +663,15 @@ fn resolve_longform_vad_provider(
             None => (Box::new(EnergyLongFormVadProvider), "energy-fallback"),
         },
         LongFormVadEngine::Energy => (Box::new(EnergyLongFormVadProvider), "energy"),
+        LongFormVadEngine::FireRed => match crate::diarize::vad::FireRedVadProvider::shared() {
+            Some(provider) => (Box::new(provider), "firered"),
+            None => (Box::new(EnergyLongFormVadProvider), "energy-fallback"),
+        },
     }
 }
 
 fn vad_engine_with_env_override(default: LongFormVadEngine) -> LongFormVadEngine {
-    match crate::diarize::vad::vad_engine_env_override() {
-        Some(true) => LongFormVadEngine::Silero,
-        Some(false) => LongFormVadEngine::Energy,
-        None => default,
-    }
+    crate::diarize::vad::longform_vad_engine_env_override().unwrap_or(default)
 }
 
 fn resolve_native_longform_policy(
@@ -1597,5 +1600,126 @@ mod tests {
                 "forced word timestamps must be stripped: {segment}"
             );
         }
+    }
+
+    // --- long-form VAD engine selection (Silero / Energy / FireRed) ---
+
+    #[test]
+    fn resolve_longform_vad_provider_honors_explicit_option() {
+        let mut options = crate::LongFormOptions {
+            vad_engine: LongFormVadEngine::Energy,
+            ..crate::LongFormOptions::default()
+        };
+        let (_, label) = resolve_longform_vad_provider(&options);
+        assert_eq!(label, "energy");
+
+        options.vad_engine = LongFormVadEngine::Silero;
+        let (_, label) = resolve_longform_vad_provider(&options);
+        assert_eq!(label, "silero");
+
+        options.vad_engine = LongFormVadEngine::FireRed;
+        let (_, label) = resolve_longform_vad_provider(&options);
+        assert_eq!(label, "firered");
+    }
+
+    #[test]
+    fn openasr_vad_env_override_selects_firered() {
+        let saved = std::env::var("OPENASR_VAD").ok();
+        // SAFETY: sequential mutation, restored before returning; mirrors the
+        // guard already used by
+        // `diarize::vad::tests::realtime_vad_prefers_neural_defaults_to_neural_with_env_precedence`.
+        unsafe { std::env::set_var("OPENASR_VAD", "firered") };
+        let engine = vad_engine_with_env_override(LongFormVadEngine::Silero);
+        assert_eq!(engine, LongFormVadEngine::FireRed);
+
+        unsafe { std::env::set_var("OPENASR_VAD", "energy") };
+        assert_eq!(
+            vad_engine_with_env_override(LongFormVadEngine::FireRed),
+            LongFormVadEngine::Energy
+        );
+
+        unsafe { std::env::remove_var("OPENASR_VAD") };
+        // Unrecognized values fall through to the caller's default, same as
+        // the realtime alias table.
+        unsafe { std::env::set_var("OPENASR_VAD", "not-an-engine") };
+        assert_eq!(
+            vad_engine_with_env_override(LongFormVadEngine::FireRed),
+            LongFormVadEngine::FireRed
+        );
+
+        match saved {
+            Some(value) => unsafe { std::env::set_var("OPENASR_VAD", value) },
+            None => unsafe { std::env::remove_var("OPENASR_VAD") },
+        }
+    }
+
+    // --- real-audio long-form slicing smoke test: Silero vs FireRed ---
+
+    fn jfk_wav_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav")
+    }
+
+    fn zh_wav_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/zh_sample.wav")
+    }
+
+    fn assert_engine_slices_real_audio_without_panicking(
+        engine: LongFormVadEngine,
+        wav_path: std::path::PathBuf,
+    ) {
+        let samples = load_wav_16khz_mono_f32_v0(
+            &wav_path,
+            "longform VAD engine smoke test",
+            "longform VAD engine smoke test",
+        )
+        .expect("load wav fixture");
+
+        let mut options = crate::LongFormOptions {
+            mode: LongFormMode::Vad,
+            vad_engine: engine,
+            ..crate::LongFormOptions::default()
+        };
+        // Keep the fixture (11-20s) comfortably above the min chunk size so
+        // `Vad` mode actually exercises slicing rather than the `total <=
+        // chunk_samples` single-slice shortcut.
+        options.chunk_seconds = 2.0;
+        let (provider, label) = resolve_longform_vad_provider(&options);
+        assert_ne!(
+            label, "energy-fallback",
+            "the neural engine's vendored weights must load in tests"
+        );
+
+        let plan = plan_longform_slices(&samples, 16_000, &options, Some(provider.as_ref()))
+            .unwrap_or_else(|error| panic!("{label} produced an invalid slice plan: {error}"));
+        assert!(
+            !plan.slices.is_empty(),
+            "{label} must produce at least one slice for {}",
+            wav_path.display()
+        );
+        for slice in &plan.slices {
+            assert!(slice.end_sample > slice.start_sample);
+            assert!(slice.end_sample <= plan.total_samples);
+        }
+    }
+
+    #[test]
+    fn silero_and_firered_both_slice_real_jfk_audio_without_panicking() {
+        assert_engine_slices_real_audio_without_panicking(
+            LongFormVadEngine::Silero,
+            jfk_wav_path(),
+        );
+        assert_engine_slices_real_audio_without_panicking(
+            LongFormVadEngine::FireRed,
+            jfk_wav_path(),
+        );
+    }
+
+    #[test]
+    fn silero_and_firered_both_slice_real_zh_audio_without_panicking() {
+        assert_engine_slices_real_audio_without_panicking(LongFormVadEngine::Silero, zh_wav_path());
+        assert_engine_slices_real_audio_without_panicking(
+            LongFormVadEngine::FireRed,
+            zh_wav_path(),
+        );
     }
 }

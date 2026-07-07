@@ -56,6 +56,8 @@ credits the people who built the original.
 - Silero VAD (voice activity detection) and the BUT Speech@FIT PLDA parameters
   (via the pyannote community bundle) power VAD and diarization refinement — see
   [NOTICE](NOTICE) for the vendored-asset attributions.
+- FireRedVAD (FireRedTeam, Apache-2.0) — an alternative long-form VAD engine
+  (`OPENASR_VAD=firered`), not yet the default — see [NOTICE](NOTICE).
 
 **Translation (experimental)**
 
