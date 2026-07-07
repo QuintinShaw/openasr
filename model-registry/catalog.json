@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-07T18:37:50+00:00",
+  "generated_at": "2026-07-07T20:18:09+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -477,10 +477,10 @@
       "display_name": "Dolphin CN-Dialect Small",
       "family": "dolphin",
       "aliases": [
-        "dolphin",
+        "dolphin-cn",
         "dolphin-cn-dialect"
       ],
-      "pull_alias": "dolphin",
+      "pull_alias": "dolphin-cn",
       "size": "small",
       "languages": [
         "zh",
@@ -511,7 +511,7 @@
       "prose": {
         "tagline": "Chinese multi-dialect speech recognition -- a WeNet E-Branchformer (CTC + attention) tuned for Sichuan and 22 regional dialects",
         "overview": [
-          "Dolphin CN-Dialect Small is a **Chinese multi-dialect** speech-recognition model from\n**DataoceanAI**, built on the **Dolphin / WeNet** recipe as an **E-Branchformer encoder +\nTransformer decoder** trained with a **joint CTC + attention** objective (the `small.cn`\ncheckpoint over a character vocabulary). It specializes in regional Mandarin \u2014 a standout\n**Sichuan (\u5ddd\u8bdd)** capability alongside 22 Chinese dialects such as Wu, Cantonese, Minnan and\nShanghainese \u2014 while keeping strong standard-Mandarin transcription (the card reports a large\nrelative gain on dialect recognition and a meaningful CER reduction over the base Dolphin).\nThis OpenASR repo repackages the weights as `.oasr` packs that run natively in the OpenASR\nruntime \u2014 no Python at inference, all decoding local. OpenASR decodes it with CTC beam search\nplus attention rescoring and verified the transcript bit-exact against a golden reference on a\nSichuan-dialect clip. It ships in **fp16** (maximum fidelity, recommended), **q8_0**, and **q4_k** builds."
+          "Dolphin CN-Dialect Small is a **Chinese multi-dialect** speech-recognition model from\n**DataoceanAI**, built on the **Dolphin / WeNet** recipe as an **E-Branchformer encoder +\nTransformer decoder** trained with a **joint CTC + attention** objective (the `small.cn`\ncheckpoint over a character vocabulary). It specializes in regional Mandarin \u2014 a standout\n**Sichuan (\u5ddd\u8bdd)** capability alongside 22 Chinese dialects such as Wu, Cantonese, Minnan and\nShanghainese \u2014 while keeping strong standard-Mandarin transcription (the card reports a large\nrelative gain on dialect recognition and a meaningful CER reduction over the base Dolphin).\nThis OpenASR repo repackages the weights as `.oasr` packs that run natively in the OpenASR\nruntime \u2014 no Python at inference, all decoding local. OpenASR decodes it with CTC beam search\nplus attention rescoring and verified the transcript bit-exact against a golden reference on a\nSichuan-dialect clip. It ships in **fp16** (maximum fidelity, recommended), **q8_0**, and **q4_k** builds.\n\n**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed\nwithout punctuation marks, so the decoder never predicts a punctuation token -- there is no\nsetting to enable it. Transcripts are plain, unpunctuated text by design."
         ],
         "highlights": [
           "\ud83c\udc04 **22 Chinese dialects** \u2014 a WeNet E-Branchformer tuned for regional Mandarin, with a standout Sichuan (\u5ddd\u8bdd) strength across Wu, Cantonese, Minnan, Shanghainese and more",
@@ -1076,8 +1076,10 @@
       "kind": "asr-model",
       "display_name": "Dolphin Small",
       "family": "dolphin",
-      "aliases": [],
-      "pull_alias": null,
+      "aliases": [
+        "dolphin"
+      ],
+      "pull_alias": "dolphin",
       "size": "small",
       "languages": [
         "ar",

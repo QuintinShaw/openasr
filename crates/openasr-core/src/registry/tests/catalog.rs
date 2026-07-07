@@ -1071,6 +1071,48 @@ fn embedded_catalog_emits_punctuation_matches_family() {
 }
 
 #[test]
+fn embedded_catalog_resolves_bare_dolphin_aliases_to_the_intended_tiers() {
+    // 2026-07: bare `dolphin` now resolves to the multilingual `dolphin-small`
+    // (what a user asking for plain "dolphin" almost certainly means), and
+    // `dolphin-cn` resolves to the Chinese-only `dolphin-cn-dialect-small`.
+    // Before this, `dolphin`'s pull_alias pointed at the CN-only dialect tier,
+    // which silently gave multilingual-audio users a model that only handles
+    // Mandarin + its dialects. Pin the resolution against the real, signed,
+    // embedded catalog so a future regenerate cannot silently swap these back.
+    let home = tempfile::tempdir().unwrap();
+    let catalog = super::load_embedded_signed_catalog(home.path())
+        .expect("embedded catalog should verify and parse offline");
+
+    let resolved = resolve_catalog_pull(
+        &catalog,
+        &CatalogPullRequest {
+            reference: "dolphin".to_string(),
+            quant: None,
+            size: None,
+        },
+    )
+    .expect("bare 'dolphin' should resolve");
+    assert_eq!(
+        resolved.model_id, "dolphin-small",
+        "bare 'dolphin' must resolve to the multilingual small tier, not the CN-only dialect tier"
+    );
+
+    let resolved_cn = resolve_catalog_pull(
+        &catalog,
+        &CatalogPullRequest {
+            reference: "dolphin-cn".to_string(),
+            quant: None,
+            size: None,
+        },
+    )
+    .expect("'dolphin-cn' should resolve");
+    assert_eq!(
+        resolved_cn.model_id, "dolphin-cn-dialect-small",
+        "'dolphin-cn' must resolve to the Chinese-only dialect tier"
+    );
+}
+
+#[test]
 fn signed_cache_miss_falls_back_to_embedded_for_default_source() {
     // Wiring: network failed (`error`) and there is no on-disk signed cache, so for
     // the canonical default catalog the loader drops to the embedded snapshot.

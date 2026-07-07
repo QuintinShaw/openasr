@@ -153,14 +153,31 @@ min_core_version = "0.1.9"
 family = "dolphin"
 hf_repo = "OpenASR/dolphin-cn-dialect-small"
 release_public = true
-aliases = ["dolphin", "dolphin-cn-dialect"]
-pull_alias = "dolphin"
+# Bare `dolphin-cn` now resolves here (Chinese-only dialect tier); bare
+# `dolphin` resolves to the multilingual `dolphin-small` instead (see
+# dolphin-small's own aliases/pull_alias below) -- the two pull-aliases were
+# swapped 2026-07 so the unqualified id defaults to the multilingual model a
+# user asking for plain "dolphin" almost certainly means, not the CN-only
+# dialect tier.
+aliases = ["dolphin-cn", "dolphin-cn-dialect"]
+pull_alias = "dolphin-cn"
 size = "small"
 registry_id = "dolphin-cn-dialect-small"
 display_name = "Dolphin CN-Dialect Small"
 license_name = "Apache-2.0"
 license_source = "https://huggingface.co/DataoceanAI1/dolphi-cn-dialect-small/blob/main/README.md"
 license_class = "permissive"
+# Explicit Chinese-only override (same value LANG_BY_FAMILY["dolphin"]
+# already resolves to, pinned here so this model's language claim can never
+# silently drift if the family default in _catalog.py changes) -- this is
+# the "language=Chinese-only" marking, the same mechanism whisper's `*.en`
+# checkpoints use (an explicit single/narrow `languages` override) rather
+# than a family-agnostic flag.
+languages = [
+    "zh", "zh-anhui", "zh-guangdong", "zh-hebei", "zh-hubei", "zh-jiangsu",
+    "zh-ningxia", "zh-shaanxi", "zh-shandong", "zh-shanghai", "zh-shanxi",
+    "zh-sichuan", "zh-tianjin", "zh-tw",
+]
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "fp16"
 sort_weight = 905
@@ -190,6 +207,13 @@ display_name = "Dolphin CN-Dialect Base"
 license_name = "Apache-2.0"
 license_source = "https://huggingface.co/DataoceanAI/dolphin-cn-dialect-base/blob/main/README.md"
 license_class = "permissive"
+# Explicit Chinese-only override; see dolphin-cn-dialect-small's identical
+# note above (same list, pinned per-model rather than inherited).
+languages = [
+    "zh", "zh-anhui", "zh-guangdong", "zh-hebei", "zh-hubei", "zh-jiangsu",
+    "zh-ningxia", "zh-shaanxi", "zh-shandong", "zh-shanghai", "zh-shanxi",
+    "zh-sichuan", "zh-tianjin", "zh-tw",
+]
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "fp16"
 upstream_release_date = "2026-05-13"
@@ -216,6 +240,10 @@ min_core_version = "0.1.8"
 family = "dolphin"
 hf_repo = "OpenASR/dolphin-small"
 release_public = true
+# Bare `dolphin` resolves here (multilingual small tier) -- see
+# dolphin-cn-dialect-small's note on the 2026-07 alias swap.
+aliases = ["dolphin"]
+pull_alias = "dolphin"
 size = "small"
 registry_id = "dolphin-small"
 display_name = "Dolphin Small"
