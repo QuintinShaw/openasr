@@ -1377,6 +1377,16 @@ fn ensure_available_space(
     Ok(())
 }
 
+/// Best-effort free space (in bytes) on the filesystem containing `path`.
+/// `None` means the platform/probe could not determine it -- callers should
+/// treat that as "unknown" and stay permissive, matching how
+/// [`ensure_available_space`] treats a `None` probe for model-pack pulls.
+/// Exposed for other crates (e.g. `openasr-server`'s streaming upload path)
+/// that need the same disk-headroom check pulls already rely on.
+pub fn available_disk_space_bytes(path: &Path) -> Option<u64> {
+    available_space_bytes(path)
+}
+
 fn file_size_and_sha256(path: &Path) -> Result<(u64, String), PullError> {
     let mut file = File::open(path).map_err(|source| PullError::Io {
         path: path.to_path_buf(),
