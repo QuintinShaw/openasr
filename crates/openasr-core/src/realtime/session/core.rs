@@ -15,7 +15,7 @@ use super::{
         VadStateMachine,
     },
 };
-use crate::diarize::vad::SileroStreamingVad;
+use crate::diarize::vad::FireRedStreamingVad;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RealtimeSessionConfig {
@@ -101,10 +101,10 @@ pub struct RealtimeSessionController {
     state: RealtimeSessionState,
     sequencer: RealtimeEventSequencer,
     pub vad: VadStateMachine,
-    /// Streaming neural detector, present only when the configured VAD mode is
-    /// `ExternalProbability` and the model loaded. Feeds probabilities into
-    /// `vad`; all endpointing stays in the state machine.
-    neural_vad: Option<SileroStreamingVad>,
+    /// Streaming Stream-VAD detector, present only when the configured VAD
+    /// mode is `ExternalProbability`. Feeds probabilities into `vad`; all
+    /// endpointing stays in the state machine.
+    neural_vad: Option<Box<FireRedStreamingVad>>,
     pub buffer: RealtimeBuffer,
     pub transcript: TranscriptLifecycle,
 }
@@ -224,28 +224,20 @@ impl RealtimeSessionController {
     }
 
     pub fn new_with_sequencer(
-        mut config: RealtimeSessionConfig,
+        config: RealtimeSessionConfig,
         sequencer: RealtimeEventSequencer,
     ) -> Result<Self, RealtimeSessionError> {
         config.validate()?;
         let neural_vad = if config.vad.mode == VadMode::ExternalProbability {
-            match SileroStreamingVad::shared() {
-                Some(detector) => Some(detector),
-                None => {
-                    // Neural VAD was requested but the model is unavailable.
-                    // Downgrade to the energy gate with energy-appropriate
-                    // defaults: the configured threshold is a probability (~0.5)
-                    // that, used as an RMS gate, would silence all speech; and the
-                    // hangover may have been tuned short for the neural detector,
-                    // which would chop words on an RMS gate. Restore both to the
-                    // energy-safe defaults so the fallback behaves like a real
-                    // energy session.
-                    config.vad.mode = VadMode::Energy;
-                    config.vad.energy_threshold = VadConfig::default().energy_threshold;
-                    config.vad.speech_stop_ms = VadConfig::default().speech_stop_ms;
-                    None
-                }
-            }
+            // Stream-VAD is the sole neural engine and is vendored
+            // (`include_bytes!`), so in practice this always loads (a build
+            // integrity problem otherwise). Still, fail closed with a typed
+            // error instead of panicking on the request path -- the server
+            // WS handler already surfaces `RealtimeSessionError` to the
+            // client as a startup error.
+            Some(Box::new(
+                FireRedStreamingVad::shared().ok_or(RealtimeSessionError::StreamVadUnavailable)?,
+            ))
         } else {
             None
         };
@@ -272,9 +264,9 @@ impl RealtimeSessionController {
 
     /// Process one audio frame through the configured VAD, returning any speech
     /// boundary events. Neural mode (`ExternalProbability`) feeds the streaming
-    /// Silero probability into the state machine; every other mode (and the
-    /// fallback when the neural model is unavailable) uses the energy gate. All
-    /// endpointing/hysteresis lives in the state machine, not here.
+    /// Stream-VAD probability into the state machine; every other mode uses the
+    /// energy gate. All endpointing/hysteresis lives in the state machine, not
+    /// here.
     pub fn process_vad_frame(&mut self, frame: &RealtimeAudioFrame) -> Vec<SpeechBoundaryEvent> {
         self.process_vad_frame_with_speech(frame).0
     }
@@ -415,4 +407,8 @@ pub enum RealtimeSessionError {
         from: RealtimeSessionState,
         action: &'static str,
     },
+    #[error(
+        "Stream-VAD is unavailable: vendored weights failed to parse (build-integrity problem)."
+    )]
+    StreamVadUnavailable,
 }

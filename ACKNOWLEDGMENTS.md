@@ -53,11 +53,12 @@ credits the people who built the original.
 
 - pyannote segmentation — <https://huggingface.co/OpenASR/pyannote-segmentation-3.0>
 - WeSpeaker speaker embedder — <https://huggingface.co/OpenASR/wespeaker-voxceleb-resnet34-lm>
-- Silero VAD (voice activity detection) and the BUT Speech@FIT PLDA parameters
-  (via the pyannote community bundle) power VAD and diarization refinement — see
-  [NOTICE](NOTICE) for the vendored-asset attributions.
-- FireRedVAD (FireRedTeam, Apache-2.0) — an alternative long-form VAD engine
-  (`OPENASR_VAD=firered`), not yet the default — see [NOTICE](NOTICE).
+- FireRedVAD Stream-VAD (FireRedTeam, Apache-2.0) — the sole voice-activity
+  detection engine, backing realtime endpointing, long-form speech slicing, and
+  diarization — see [NOTICE](NOTICE).
+- The BUT Speech@FIT PLDA parameters (via the pyannote community bundle) power
+  diarization refinement — see [NOTICE](NOTICE) for the vendored-asset
+  attributions.
 
 **Translation (experimental)**
 

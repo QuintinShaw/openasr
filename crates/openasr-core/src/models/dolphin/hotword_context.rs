@@ -12,8 +12,9 @@
 //!     (`Linear(3072, 768)` + `LayerNorm(768)`) projects it to one 768-dim context
 //!     row. This stage runs in plain Rust, not a ggml graph: ggml has no LSTM
 //!     primitive, one hotword list is a handful of short sequences (not a
-//!     per-frame op), and the codebase already has a pure-Rust LSTM precedent
-//!     (`diarize::vad::silero`) for exactly this shape of workload. The 3072-dim
+//!     per-frame op), and the codebase already has pure-Rust recurrent/hand-written
+//!     numeric forward-pass precedent (e.g. `diarize::vad::firered_stream`'s
+//!     causal DFSMN VAD) for exactly this shape of workload. The 3072-dim
 //!     recurrent weights and the embedding table are never quantized for the same
 //!     reason convs/embeddings elsewhere aren't: no established block-quant
 //!     precedent for recurrent/lookup operands in this codebase, and the
