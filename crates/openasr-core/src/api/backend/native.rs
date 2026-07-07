@@ -646,6 +646,17 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
                 )
             })
         }
+        crate::arch::PARAKEET_TDT_GGML_ARCHITECTURE_ID => {
+            crate::models::parakeet_tdt::runtime_contract::parse_parakeet_tdt_execution_metadata(
+                &metadata,
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "parakeet-tdt runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
+                )
+            })
+        }
         WAV2VEC2_CTC_GGML_ARCHITECTURE_ID => {
             crate::models::wav2vec2_ctc::runtime_contract::parse_wav2vec2_ctc_execution_metadata(
                 &metadata,

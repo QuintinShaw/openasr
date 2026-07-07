@@ -11,12 +11,13 @@ package-manager channels) is still deferred; build from source meanwhile.
 
 These were prior roadmap goals and are now shipped on the native runtime path:
 
-- Nine native model families: Whisper, Cohere Transcribe, Qwen3-ASR,
-  Parakeet-CTC, wav2vec2-CTC (incl. data2vec), Moonshine, Dolphin (Chinese
-  dialects), SenseVoice (zh/yue/en/ja/ko), and X-ASR (Zipformer).
+- Ten native model families: Whisper, Cohere Transcribe, Qwen3-ASR,
+  Parakeet-CTC, Parakeet-TDT (25 European languages), wav2vec2-CTC (incl.
+  data2vec), Moonshine, Dolphin (Chinese dialects), SenseVoice
+  (zh/yue/en/ja/ko), and X-ASR (Zipformer).
 - Data-driven architecture registry (`arch/`): composer families (Cohere, Qwen)
   materialize from descriptors; dedicated executors (Whisper, Moonshine,
-  Parakeet, wav2vec2, Dolphin, SenseVoice, X-ASR) own their loaders.
+  Parakeet-CTC/TDT, wav2vec2, Dolphin, SenseVoice, X-ASR) own their loaders.
 - `.oasr` packs are GGUF-backed and portable, with zero-copy mmap weight binding
   and graph buffer-reuse to bound peak RSS.
 - Quantization profiles `fp16`, `q8_0`, `q4_k` (Qwen also `q3_k`).
@@ -26,8 +27,8 @@ These were prior roadmap goals and are now shipped on the native runtime path:
 - Active backends are `mock` and guarded `native`; wrapper-era backends and
   legacy command surfaces are removed.
 - Native realtime has a declared-pack true-streaming path for Qwen3-ASR,
-  Whisper, Cohere Transcribe, Moonshine, Parakeet-CTC, and wav2vec2-CTC through
-  family-specific streaming executors. Local temporary packs pass the ignored
+  Whisper, Cohere Transcribe, Moonshine, Parakeet-CTC, Parakeet-TDT, and
+  wav2vec2-CTC through family-specific streaming executors. Local temporary packs pass the ignored
   real-runtime smoke; published release packs and product claims remain gated.
 - Desktop/server requests carry a generic native execution target
   (`auto`/`cpu`/`accelerated`) through preferences, file transcription, remote

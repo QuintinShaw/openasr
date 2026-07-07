@@ -153,6 +153,28 @@ pub(crate) static PARAKEET_CTC_HPARAM_SCHEMA: &[&str] = &[
     "ctc.blank_token_id",
 ];
 
+// ── parakeet-tdt (FastConformer + Token-and-Duration Transducer) ─────────────
+pub(crate) static PARAKEET_TDT_HPARAM_SCHEMA: &[&str] = &[
+    "parakeet-tdt.n_layers",
+    "parakeet-tdt.hidden_size",
+    "parakeet-tdt.n_heads",
+    "parakeet-tdt.head_dim",
+    "parakeet-tdt.ffn_dim",
+    "parakeet-tdt.conv_kernel",
+    "parakeet-tdt.n_mels",
+    "parakeet-tdt.subsampling_factor",
+    "parakeet-tdt.subsampling_channels",
+    "parakeet-tdt.scale_input",
+    "parakeet-tdt.vocab_size",
+    "parakeet-tdt.blank_token_id",
+    "parakeet-tdt.pred_hidden",
+    "parakeet-tdt.pred_layers",
+    "parakeet-tdt.joint_hidden",
+    "parakeet-tdt.n_durations",
+    "parakeet-tdt.durations",
+    "parakeet-tdt.max_symbols_per_step",
+];
+
 // ── sensevoice (FunAudioLLM/SenseVoiceSmall, SAN-M/CTC) hparam schema ────────
 pub(crate) static SENSEVOICE_HPARAM_SCHEMA: &[&str] = &[
     "sensevoice.n_layers",

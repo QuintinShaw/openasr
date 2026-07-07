@@ -222,6 +222,7 @@ fn bundled_registry_ordering_is_deterministic() {
             "dolphin-cn-dialect-small",
             "hymt2-1.8b",
             "moonshine-tiny",
+            "parakeet-tdt-0.6b-v3",
             "pyannote-segmentation-3.0",
             "qwen3-asr-1.7b",
             "sensevoice-small",
