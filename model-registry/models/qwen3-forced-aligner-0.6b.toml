@@ -1,0 +1,10 @@
+id = "qwen3-forced-aligner-0.6b"
+default_variant = "published"
+display_name = "Qwen3-ForcedAligner 0.6B (OpenASR pack)"
+languages = ["en", "zh"]
+size = "0.6b"
+license = "Apache-2.0"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/qwen3-forced-aligner-0.6b"
+
+[variant]
+quantization = "fp16"

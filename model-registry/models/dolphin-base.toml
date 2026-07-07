@@ -1,0 +1,10 @@
+id = "dolphin-base"
+default_variant = "published"
+display_name = "Dolphin Base (OpenASR pack)"
+languages = ["ar", "az", "ba", "bn", "fa", "fil", "gu", "hi", "id", "ja", "jv", "kab", "kk", "km", "ko", "ks", "ky", "lo", "mn", "mr", "ms", "my", "ne", "or", "pa", "ps", "ru", "si", "su", "ta", "te", "tg", "th", "tl", "ug", "ur", "uz", "vi", "yue", "zh"]
+size = "base"
+license = "Apache-2.0"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/dolphin-base"
+
+[variant]
+quantization = "fp16"
