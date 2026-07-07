@@ -215,6 +215,7 @@ async fn run() -> Result<()> {
             consent: consent::PullConsent::resolve(yes, offline),
         }),
         Command::Speaker { command } => speaker_command(command),
+        Command::Apikey { command } => apikey_command(command),
         Command::BenchSuite {
             config,
             baseline,
@@ -675,6 +676,81 @@ fn enroll_speaker(input: &Path, name: &str, match_similarity: Option<f32>) -> Re
         input.display(),
         path.display()
     );
+    Ok(())
+}
+
+fn apikey_command(command: ApiKeyCommand) -> Result<()> {
+    match command {
+        ApiKeyCommand::Create { name } => apikey_create(name),
+        ApiKeyCommand::List => apikey_list(),
+        ApiKeyCommand::Revoke { id } => apikey_revoke(&id),
+    }
+}
+
+fn api_key_store_path() -> Result<PathBuf> {
+    openasr_core::apikeys::api_key_store_path()
+        .context("Could not determine the OpenASR home directory for the API key store.")
+}
+
+fn apikey_create(name: Option<String>) -> Result<()> {
+    let path = api_key_store_path()?;
+    let mut store = openasr_core::apikeys::ApiKeyStore::load(&path)
+        .map_err(|reason| anyhow!("Could not read API key store: {reason}."))?;
+    let (token, record) = store
+        .create(name)
+        .map_err(|reason| anyhow!("Could not create API key: {reason}."))?;
+    store
+        .save(&path)
+        .map_err(|reason| anyhow!("Could not save API key store: {reason}."))?;
+    println!(
+        "Created API key {} ({}).\nThis is the ONLY time the full key is shown -- store it now:\n\n  {token}\n\nOnce any key exists, `openasr serve` requires it (Authorization: Bearer <key>) even on 127.0.0.1. Run `openasr apikey revoke {}` to remove it.",
+        record.id,
+        record.name.as_deref().unwrap_or("unnamed"),
+        record.id
+    );
+    Ok(())
+}
+
+fn apikey_list() -> Result<()> {
+    let path = api_key_store_path()?;
+    let store = openasr_core::apikeys::ApiKeyStore::load(&path)
+        .map_err(|reason| anyhow!("Could not read API key store: {reason}."))?;
+    if store.keys.is_empty() {
+        println!(
+            "No API keys configured; `openasr serve` trusts every loopback (127.0.0.1) caller. Run `openasr apikey create` to require one."
+        );
+        return Ok(());
+    }
+    println!("{:<22} {:<20} {:<26} PREVIEW", "ID", "NAME", "CREATED AT");
+    for key in &store.keys {
+        println!(
+            "{:<22} {:<20} {:<26} {}",
+            key.id,
+            key.name.as_deref().unwrap_or("-"),
+            key.created_at,
+            key.token_preview
+        );
+    }
+    Ok(())
+}
+
+fn apikey_revoke(id: &str) -> Result<()> {
+    let path = api_key_store_path()?;
+    let mut store = openasr_core::apikeys::ApiKeyStore::load(&path)
+        .map_err(|reason| anyhow!("Could not read API key store: {reason}."))?;
+    if !store.revoke(id) {
+        bail!("No API key with id '{id}'. Run `openasr apikey list` to see current keys.");
+    }
+    store
+        .save(&path)
+        .map_err(|reason| anyhow!("Could not save API key store: {reason}."))?;
+    if store.keys.is_empty() {
+        println!(
+            "Revoked API key {id}. No keys remain; `openasr serve` now trusts every loopback caller again."
+        );
+    } else {
+        println!("Revoked API key {id}.");
+    }
     Ok(())
 }
 

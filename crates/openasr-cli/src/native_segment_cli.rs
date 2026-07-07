@@ -474,8 +474,19 @@ pub(super) async fn serve(
         );
     }
     let ffmpeg_bin = resolve_ffmpeg_bin(runtime_paths.ffmpeg_bin.clone(), &config);
+    let api_key_hashes = if supervised_daemon_launch() {
+        // The desktop supervisor's managed daemon (marked by the instance-token
+        // env it always sets) has its own trust model: the UI talks to its
+        // daemon over loopback without bearer headers, and remote access goes
+        // through TLS + pairing. Enforcing user-created API keys here would
+        // lock the desktop app out of its own daemon, so keys apply only to
+        // manually-launched `openasr serve`.
+        Vec::new()
+    } else {
+        load_active_api_key_hashes()?
+    };
 
-    let mut launch_options = serve_launch_options(addr, security)?;
+    let mut launch_options = serve_launch_options(addr, security, api_key_hashes)?;
     // Persist pairing credentials/revocations under OPENASR_HOME so a paired
     // remote server keeps its devices across the restarts the desktop performs on
     // every daemon start (no-op for the local non-pairing UI daemon).
@@ -494,6 +505,28 @@ pub(super) async fn serve(
     .await
 }
 
+/// True when this `serve` process was launched by the desktop supervisor,
+/// which always sets the server instance-token env for its managed daemon
+/// (`OPENASR_SERVER_INSTANCE_TOKEN`, consumed by `openasr-server` for
+/// same-port restart identity).
+fn supervised_daemon_launch() -> bool {
+    env::var_os("OPENASR_SERVER_INSTANCE_TOKEN")
+        .is_some_and(|value| !value.to_string_lossy().trim().is_empty())
+}
+
+/// Reads currently-active API key hashes from the local `apikeys.json` store
+/// (see `openasr apikey create/list/revoke`). An unreadable store fails
+/// closed (serve refuses to start) rather than silently opening loopback
+/// access; a missing store is just "no keys yet" and returns empty.
+fn load_active_api_key_hashes() -> Result<Vec<String>> {
+    let Some(path) = openasr_core::apikeys::api_key_store_path() else {
+        return Ok(Vec::new());
+    };
+    let store = openasr_core::apikeys::ApiKeyStore::load(&path)
+        .with_context(|| format!("Could not load API key store at {}", path.display()))?;
+    Ok(store.active_token_hashes())
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct ServeSecurityOptions {
     pub tls_self_signed: bool,
@@ -504,6 +537,7 @@ pub(super) struct ServeSecurityOptions {
 fn serve_launch_options(
     addr: SocketAddr,
     security: ServeSecurityOptions,
+    api_key_hashes: Vec<String>,
 ) -> Result<openasr_server::ServerLaunchOptions> {
     let tls = if security.tls_self_signed {
         openasr_server::ServerTlsConfig::self_signed(default_tls_subject_alt_names(
@@ -528,6 +562,15 @@ fn serve_launch_options(
                 bail!("Pairing administrator token in ${env_name} must not be empty.");
             }
             openasr_server::ServerAuth::pairing(token)
+        }
+        // Local API keys (`openasr apikey create`) are a loopback-only escape
+        // hatch: they let a trusted-but-explicit caller (a coding agent, a
+        // script) require a bearer credential even from 127.0.0.1, where the
+        // server otherwise trusts every caller by default. They must never
+        // relax the non-loopback path, which stays fail-closed on TLS +
+        // device pairing regardless of any configured key.
+        None if addr.ip().is_loopback() => {
+            openasr_server::ServerAuth::from_token_hashes(api_key_hashes)
         }
         None => openasr_server::ServerAuth::disabled(),
     };
@@ -1476,6 +1519,7 @@ mod tests {
                     pairing_admin_token_env: Some("OPENASR_TEST_PAIRING_TOKEN".to_string()),
                     ..Default::default()
                 },
+                Vec::new(),
             )
             .expect_err("missing env must fail")
             .to_string();
@@ -1488,6 +1532,7 @@ mod tests {
                     pairing_admin_token_env: Some("OPENASR_TEST_PAIRING_TOKEN".to_string()),
                     ..Default::default()
                 },
+                Vec::new(),
             )
             .expect_err("empty env must fail")
             .to_string();
@@ -1508,6 +1553,7 @@ mod tests {
                     pairing_admin_token_env: Some("OPENASR_TEST_PAIRING_TOKEN_OK".to_string()),
                     ..Default::default()
                 },
+                Vec::new(),
             )
             .expect("serve launch options")
         };
@@ -1568,5 +1614,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(approved.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn supervised_daemon_launch_detects_instance_token_env() {
+        with_env_lock(|| {
+            let _removed = EnvVarRestore::remove("OPENASR_SERVER_INSTANCE_TOKEN");
+            assert!(!supervised_daemon_launch());
+            let _blank = EnvVarRestore::set("OPENASR_SERVER_INSTANCE_TOKEN", "  ");
+            assert!(!supervised_daemon_launch());
+            let _set = EnvVarRestore::set("OPENASR_SERVER_INSTANCE_TOKEN", "desktop-token");
+            assert!(supervised_daemon_launch());
+        });
+    }
+
+    async fn models_status(app: axum::Router, bearer: Option<&str>) -> StatusCode {
+        let mut request = Request::builder().method("GET").uri("/v1/models");
+        if let Some(bearer) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn serve_loopback_without_configured_keys_leaves_auth_disabled() {
+        let launch_options = serve_launch_options(
+            "127.0.0.1:8080".parse().unwrap(),
+            ServeSecurityOptions::default(),
+            Vec::new(),
+        )
+        .expect("serve launch options");
+        let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+            openasr_server::ServerRuntime::default(),
+            openasr_server::DistributionRuntime::default(),
+            launch_options,
+        );
+
+        assert_eq!(models_status(app, None).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn serve_loopback_with_configured_key_requires_matching_bearer() {
+        let key_hash = openasr_core::apikeys::hash_api_key_token("oasr_sk_test-agent-key");
+        let launch_options = serve_launch_options(
+            "127.0.0.1:8080".parse().unwrap(),
+            ServeSecurityOptions::default(),
+            vec![key_hash],
+        )
+        .expect("serve launch options");
+        let build_app = || {
+            openasr_server::app_with_runtime_and_distribution_and_launch_options(
+                openasr_server::ServerRuntime::default(),
+                openasr_server::DistributionRuntime::default(),
+                launch_options.clone(),
+            )
+        };
+
+        assert_eq!(
+            models_status(build_app(), None).await,
+            StatusCode::UNAUTHORIZED,
+            "loopback must require the key once one is configured"
+        );
+        assert_eq!(
+            models_status(build_app(), Some("wrong-key")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            models_status(build_app(), Some("oasr_sk_test-agent-key")).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_non_loopback_ignores_configured_keys_without_pairing() {
+        let key_hash = openasr_core::apikeys::hash_api_key_token("oasr_sk_test-agent-key");
+        let launch_options = serve_launch_options(
+            "0.0.0.0:8080".parse().unwrap(),
+            ServeSecurityOptions::default(),
+            vec![key_hash],
+        )
+        .expect("serve launch options");
+        let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+            openasr_server::ServerRuntime::default(),
+            openasr_server::DistributionRuntime::default(),
+            launch_options,
+        );
+
+        // A locally-created API key must never substitute for device pairing
+        // on a non-loopback bind: `validate_listen_security` is what actually
+        // fail-closes this bind (no TLS/auth), but at the auth-construction
+        // level the key must not have been wired in either.
+        assert_eq!(
+            models_status(app, Some("oasr_sk_test-agent-key")).await,
+            StatusCode::OK,
+            "non-loopback must not honor a loopback-only API key"
+        );
     }
 }

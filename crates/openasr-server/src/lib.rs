@@ -11,7 +11,7 @@ pub(crate) use routes::transcription::*;
 pub(crate) use routes::translation::*;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     env,
     ffi::OsStr,
@@ -385,7 +385,7 @@ pub struct ServerAuth {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ServerAuthMode {
     Disabled,
-    StaticBearer { token_hash: String },
+    StaticBearer { token_hashes: HashSet<String> },
     Pairing { admin_token_hash: String },
 }
 
@@ -409,10 +409,26 @@ impl ServerAuth {
         if token.is_empty() {
             return Self::disabled();
         }
+        Self::from_token_hashes([bearer_token_hash(&token)])
+    }
+
+    /// Enforces one of a set of pre-hashed bearer tokens (SHA-256 hex, matching
+    /// `bearer_token_hash`). Used to wire the CLI's persisted API-key store
+    /// (`openasr apikey create/list/revoke`, see `openasr_core::apikeys`) --
+    /// only hashes ever cross the store/serve boundary, never plaintext keys.
+    /// An empty set of hashes disables auth (loopback stays key-free by
+    /// default until at least one key exists).
+    pub fn from_token_hashes(token_hashes: impl IntoIterator<Item = String>) -> Self {
+        let token_hashes: HashSet<String> = token_hashes
+            .into_iter()
+            .map(|hash| hash.trim().to_ascii_lowercase())
+            .filter(|hash| !hash.is_empty())
+            .collect();
+        if token_hashes.is_empty() {
+            return Self::disabled();
+        }
         Self {
-            mode: ServerAuthMode::StaticBearer {
-                token_hash: bearer_token_hash(&token),
-            },
+            mode: ServerAuthMode::StaticBearer { token_hashes },
             pairing: Arc::new(Mutex::new(PairingRegistry::default())),
             pairing_safety_code: None,
         }
@@ -520,8 +536,8 @@ impl ServerAuth {
     fn authorizes(&self, headers: &axum::http::HeaderMap) -> bool {
         match &self.mode {
             ServerAuthMode::Disabled => true,
-            ServerAuthMode::StaticBearer { token_hash } => header_bearer_token(headers)
-                .is_some_and(|token| bearer_token_hash(token) == *token_hash),
+            ServerAuthMode::StaticBearer { token_hashes } => header_bearer_token(headers)
+                .is_some_and(|token| token_hashes.contains(&bearer_token_hash(token))),
             ServerAuthMode::Pairing { admin_token_hash } => header_bearer_token(headers)
                 .is_some_and(|token| {
                     let token_hash = bearer_token_hash(token);
