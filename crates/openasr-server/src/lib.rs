@@ -1686,6 +1686,13 @@ impl IntoResponse for ApiError {
             ),
         };
 
+        // Log every failed request to stderr (captured in daemon.log by the
+        // desktop sidecar) with the status and message that also went out in
+        // the HTTP response body. Before this, a failing request left no
+        // trace in the daemon log at all -- only the one-line startup banner
+        // -- making field reports impossible to diagnose from logs alone.
+        eprintln!("openasr-server: request failed status={status} message={message}");
+
         (
             status,
             Json(ErrorResponse {

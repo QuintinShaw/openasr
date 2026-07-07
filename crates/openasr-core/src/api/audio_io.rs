@@ -69,8 +69,18 @@ fn parse_wav_fmt(bytes: &[u8]) -> Result<WavFormat, NativeAsrError> {
     if bytes.len() < 16 {
         return Err(wav_error("fmt chunk is shorter than 16 bytes"));
     }
+    let mut audio_format = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
+    // WAVE_FORMAT_EXTENSIBLE (0xFFFE) carries the real codec in the first two
+    // bytes of the trailing 16-byte SubFormat GUID, not in the top-level
+    // audio_format field. macOS `afconvert -f WAVE` always emits this extended
+    // (40-byte) fmt chunk, even for plain mono PCM16, so it must be unwrapped
+    // here or every afconvert-produced WAV would be rejected as an unsupported
+    // format below.
+    if audio_format == 0xFFFE && bytes.len() >= 26 {
+        audio_format = u16::from_le_bytes(bytes[24..26].try_into().unwrap());
+    }
     Ok(WavFormat {
-        audio_format: u16::from_le_bytes(bytes[0..2].try_into().unwrap()),
+        audio_format,
         channels: u16::from_le_bytes(bytes[2..4].try_into().unwrap()),
         sample_rate_hz: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
         bits_per_sample: u16::from_le_bytes(bytes[14..16].try_into().unwrap()),
@@ -137,5 +147,55 @@ impl SampleEncoding {
 fn wav_error(message: impl Into<String>) -> NativeAsrError {
     NativeAsrError::SessionFailed {
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extensible_pcm16_mono_16k_wav(frames: u32) -> Vec<u8> {
+        // Mirrors the 40-byte WAVEFORMATEXTENSIBLE fmt chunk macOS
+        // `afconvert -f WAVE -d LEI16@16000` emits for mono PCM16, including
+        // the KSDATAFORMAT_SUBTYPE_PCM SubFormat GUID.
+        let data_size = frames * 2;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(4 + 8 + 40 + 8 + data_size).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&40_u32.to_le_bytes());
+        bytes.extend_from_slice(&0xFFFE_u16.to_le_bytes()); // WAVE_FORMAT_EXTENSIBLE
+        bytes.extend_from_slice(&1_u16.to_le_bytes()); // channels
+        bytes.extend_from_slice(&16_000_u32.to_le_bytes()); // sample rate
+        bytes.extend_from_slice(&32_000_u32.to_le_bytes()); // byte rate
+        bytes.extend_from_slice(&2_u16.to_le_bytes()); // block align
+        bytes.extend_from_slice(&16_u16.to_le_bytes()); // bits per sample
+        bytes.extend_from_slice(&22_u16.to_le_bytes()); // cbSize
+        bytes.extend_from_slice(&16_u16.to_le_bytes()); // valid bits per sample
+        bytes.extend_from_slice(&4_u32.to_le_bytes()); // channel mask
+        // SubFormat GUID: 00000001-0000-0010-8000-00AA00389B71 (PCM)
+        bytes.extend_from_slice(&[
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+            0x9B, 0x71,
+        ]);
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_size.to_le_bytes());
+        for index in 0..frames {
+            bytes.extend_from_slice(&(index as i16).to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn wave_format_extensible_pcm16_is_accepted() {
+        let bytes = extensible_pcm16_mono_16k_wav(4);
+
+        let samples = parse_wav_16khz_mono_f32(&bytes, "test").expect("extensible PCM16 WAV");
+
+        assert_eq!(
+            samples,
+            vec![0.0, 1.0 / 32768.0, 2.0 / 32768.0, 3.0 / 32768.0]
+        );
     }
 }
