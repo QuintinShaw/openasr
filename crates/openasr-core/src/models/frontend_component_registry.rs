@@ -125,6 +125,7 @@ pub(crate) fn materialize_builtin_audio_frontend(
         // wav2vec2's frontend id also covers data2vec (shared raw-waveform front).
         (
             crate::arch::PARAKEET_CTC_AUDIO_FRONTEND_ID
+            | crate::arch::PARAKEET_TDT_AUDIO_FRONTEND_ID
             | crate::arch::WAV2VEC2_CTC_AUDIO_FRONTEND_ID
             | crate::arch::MOONSHINE_AUDIO_FRONTEND_ID
             | crate::arch::SENSEVOICE_AUDIO_FRONTEND_ID,
@@ -335,6 +336,7 @@ mod tests {
 
         for frontend_id in [
             crate::arch::PARAKEET_CTC_AUDIO_FRONTEND_ID,
+            crate::arch::PARAKEET_TDT_AUDIO_FRONTEND_ID,
             crate::arch::WAV2VEC2_CTC_AUDIO_FRONTEND_ID,
             crate::arch::MOONSHINE_AUDIO_FRONTEND_ID,
             crate::arch::SENSEVOICE_AUDIO_FRONTEND_ID,

@@ -1,6 +1,3 @@
-// Consumed by the executor wired in the follow-up stage; tested meanwhile.
-#![allow(dead_code)]
-
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig};
 use crate::models::graph_runtime_config::{
     ModelMetalRuntimeOverrides, configure_model_runtime_graph_config_from_env,

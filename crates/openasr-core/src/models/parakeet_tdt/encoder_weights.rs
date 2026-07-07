@@ -8,9 +8,6 @@
 //! shared `nn::encoder::conformer_block`, which is bias-shaped. Zero biases
 //! are mathematically identity — nothing model-specific is fabricated.
 
-// Consumed by the executor wired in the follow-up stage; tested meanwhile.
-#![allow(dead_code)]
-
 use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
 
 use super::runtime_contract::ParakeetTdtExecutionMetadata;

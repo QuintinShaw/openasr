@@ -65,6 +65,7 @@ impl RuntimeTensorContractMetadata {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DedicatedRuntimeTensorContractFamily {
     ParakeetCtc,
+    ParakeetTdt,
     Wav2Vec2Ctc,
     XasrZipformer,
     Moonshine,
@@ -75,6 +76,7 @@ impl DedicatedRuntimeTensorContractFamily {
     fn label(self) -> &'static str {
         match self {
             Self::ParakeetCtc => "parakeet-ctc",
+            Self::ParakeetTdt => "parakeet-tdt",
             Self::Wav2Vec2Ctc => "wav2vec2-ctc",
             Self::XasrZipformer => "xasr-zipformer",
             Self::Moonshine => "moonshine",
@@ -224,6 +226,9 @@ fn dedicated_runtime_tensor_contract_family(
     match contract_id {
         PARAKEET_CTC_RUNTIME_TENSOR_CONTRACT_ID => {
             Some(DedicatedRuntimeTensorContractFamily::ParakeetCtc)
+        }
+        crate::arch::PARAKEET_TDT_RUNTIME_TENSOR_CONTRACT_ID => {
+            Some(DedicatedRuntimeTensorContractFamily::ParakeetTdt)
         }
         WAV2VEC2_CTC_RUNTIME_TENSOR_CONTRACT_ID => {
             Some(DedicatedRuntimeTensorContractFamily::Wav2Vec2Ctc)

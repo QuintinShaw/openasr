@@ -5,9 +5,6 @@
 //! hidden) applied in-graph instead of a CTC head. Output is the per-frame
 //! projected encoder representation the host-side TDT greedy loop consumes.
 
-// Consumed by the executor wired in the follow-up stage; tested meanwhile.
-#![allow(dead_code)]
-
 use std::path::Path;
 
 use crate::ggml_runtime::{
@@ -71,20 +68,16 @@ fn bf(step: &'static str) -> impl Fn(GgmlCpuGraphError) -> ParakeetTdtEncoderErr
     move |source| ParakeetTdtEncoderError::GraphBuildFailed { step, source }
 }
 
-/// See `parakeet_ctc::encoder_graph::WeightSlot`: a 2-D linear either bound
-/// zero-copy to the mmap'd pack (native q4_K/f16/f32) or arena-resident.
+/// A 2-D linear bound zero-copy to the mmap'd pack (native q4_K/f16/f32).
+/// Unlike parakeet-ctc there is no arena fallback variant: every bindable
+/// linear's host payload is dropped at load, so binding failure fails closed
+/// in `bind_loaded`.
 #[derive(Clone, Copy)]
-enum WeightSlot {
-    Arena(GgmlStaticTensor),
-    Loaded(GgmlLoadedTensor),
-}
+struct WeightSlot(GgmlLoadedTensor);
 
 impl WeightSlot {
-    fn graph<'a>(self, arena: &GgmlStaticTensorArena) -> GgmlCpuTensor<'a> {
-        match self {
-            Self::Arena(handle) => arena.graph_tensor(handle),
-            Self::Loaded(tensor) => tensor.as_graph_tensor(),
-        }
+    fn graph<'a>(self, _arena: &GgmlStaticTensorArena) -> GgmlCpuTensor<'a> {
+        self.0.as_graph_tensor()
     }
 }
 
@@ -96,7 +89,7 @@ fn bind_loaded(
     name: &str,
 ) -> Result<WeightSlot, ParakeetTdtEncoderError> {
     match loaded.and_then(|ctx| ctx.tensor(name)) {
-        Some(tensor) => Ok(WeightSlot::Loaded(tensor)),
+        Some(tensor) => Ok(WeightSlot(tensor)),
         None => Err(ParakeetTdtEncoderError::Shape {
             reason: format!(
                 "2-D linear '{name}' could not be bound zero-copy from the runtime pack \
@@ -233,8 +226,10 @@ struct SubArena {
 pub(crate) struct ParakeetTdtEncoderGraph {
     metadata: ParakeetTdtExecutionMetadata,
     runner: GgmlCpuGraphRunner,
-    // `loaded_weights` owns the mmap-backed buffer the `Loaded` slots alias;
+    // `loaded_weights` owns the mmap-backed buffer the bound slots alias;
     // field order mirrors parakeet_ctc/cohere (see the soundness note there).
+    // Never read directly -- it exists to keep the mapping alive.
+    #[allow(dead_code)]
     loaded_weights: Option<GgmlLoadedWeightContext>,
     arena: GgmlStaticTensorArena,
     sub: SubArena,

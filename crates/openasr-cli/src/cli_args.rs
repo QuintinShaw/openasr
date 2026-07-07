@@ -646,6 +646,20 @@ pub(crate) enum ImportCommand {
         #[arg(long, value_enum, default_value_t = ImportParakeetQuantization::Fp16)]
         quantization: ImportParakeetQuantization,
     },
+    /// Import one local Parakeet-TDT (NVIDIA FastConformer Token-and-Duration Transducer) HF-style source directory into one runtime pack file (`.oasr`).
+    #[command(name = "parakeet-tdt")]
+    ParakeetTdt {
+        /// Source directory containing config.json, tokenizer.json, and model.safetensors.
+        source_root: PathBuf,
+        /// Output path for one runtime pack file (`.oasr`).
+        output_root: PathBuf,
+        /// Model id written to pack metadata (openasr.model.id).
+        #[arg(long)]
+        package_id: String,
+        /// Runtime tensor quantization for GGUF-backed `.oasr` output (predictor/joint host tensors stay f16/f32).
+        #[arg(long, value_enum, default_value_t = ImportParakeetQuantization::Fp16)]
+        quantization: ImportParakeetQuantization,
+    },
     /// Import one local Dolphin (WeNet E-Branchformer CTC + attention) source directory into one runtime pack file (`.oasr`).
     #[command(name = "dolphin")]
     Dolphin {

@@ -1,9 +1,5 @@
 //! parakeet-tdt execution metadata parsed from the `.oasr` GGUF header.
 
-// Consumed by the encoder/executor wired in the follow-up stages; tested
-// standalone meanwhile (the parakeet-ctc staging precedent).
-#![allow(dead_code)]
-
 use crate::ggml_runtime::GgufMetadata;
 use crate::models::runtime_contract::{
     MetadataContractError, required_u64_scalar, u64_to_u32, u64_to_usize, validate_positive_usize,

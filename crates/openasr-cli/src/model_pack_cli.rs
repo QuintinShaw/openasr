@@ -82,6 +82,14 @@ fn import_command(command: ImportCommand) -> Result<()> {
         } => {
             import_parakeet_ctc_local_command(&source_root, &output_root, &package_id, quantization)
         }
+        ImportCommand::ParakeetTdt {
+            source_root,
+            output_root,
+            package_id,
+            quantization,
+        } => {
+            import_parakeet_tdt_local_command(&source_root, &output_root, &package_id, quantization)
+        }
         ImportCommand::Dolphin {
             source_root,
             output_root,
@@ -315,6 +323,36 @@ fn import_dolphin_local_command(
         result.output_path.display(),
         result.tensor_count,
         result.vocab_size
+    );
+    Ok(())
+}
+
+fn import_parakeet_tdt_local_command(
+    source_root: &Path,
+    output_root: &Path,
+    package_id: &str,
+    quantization: ImportParakeetQuantization,
+) -> Result<()> {
+    let request = openasr_core::ParakeetTdtImportRequest {
+        source_root: source_root.to_path_buf(),
+        output_root: output_root.to_path_buf(),
+        model_id: package_id.to_string(),
+        quantization: match quantization {
+            ImportParakeetQuantization::Fp16 => openasr_core::ParakeetTdtQuantizationMode::Fp16,
+            ImportParakeetQuantization::Q8_0 => openasr_core::ParakeetTdtQuantizationMode::Q8_0,
+            ImportParakeetQuantization::Q4_K => openasr_core::ParakeetTdtQuantizationMode::Q4_K,
+        },
+    };
+
+    ensure_ggml_package_output_suffix(output_root)?;
+    let result = openasr_core::convert_local_parakeet_tdt_source_to_runtime_pack(&request)
+        .map_err(anyhow::Error::new)?;
+    println!(
+        "Imported Parakeet-TDT local source into runtime pack:\n- source: {}\n- output: {}\n- tensor_count: {}\n- blank_token_id: {}",
+        source_root.display(),
+        result.output_path.display(),
+        result.tensor_count,
+        result.blank_token_id
     );
     Ok(())
 }

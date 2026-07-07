@@ -20,9 +20,10 @@ use block_stack::{
 use hparams::{
     COHERE_TRANSCRIBE_DECODER_LAYERS_KEY, COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY,
     COHERE_TRANSCRIBE_HPARAM_SCHEMA, DOLPHIN_HPARAM_SCHEMA, MOONSHINE_HPARAM_SCHEMA,
-    PARAKEET_CTC_HPARAM_SCHEMA, QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA,
-    QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY, SENSEVOICE_HPARAM_SCHEMA,
-    WAV2VEC2_CTC_HPARAM_SCHEMA, WHISPER_HPARAM_SCHEMA, XASR_ZIPFORMER_HPARAM_SCHEMA,
+    PARAKEET_CTC_HPARAM_SCHEMA, PARAKEET_TDT_HPARAM_SCHEMA, QWEN3_ARCHITECTURE_VALUE,
+    QWEN3_ASR_HPARAM_SCHEMA, QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY,
+    SENSEVOICE_HPARAM_SCHEMA, WAV2VEC2_CTC_HPARAM_SCHEMA, WHISPER_HPARAM_SCHEMA,
+    XASR_ZIPFORMER_HPARAM_SCHEMA,
 };
 
 pub(crate) const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
@@ -69,16 +70,12 @@ pub(crate) const PARAKEET_CTC_EXECUTOR_COMPONENT_ID: &str = "parakeet-ctc.ggml-e
 // languages). Component ids are defined ahead of the full descriptor entry
 // (the parakeet-ctc S2->S4 staging precedent): the importer writes them as
 // pack metadata; the descriptor + executor wiring lands with the executor.
-#[allow(dead_code)] // staged: consumed by the descriptor/executor stage
 pub(crate) const PARAKEET_TDT_GGML_ARCHITECTURE_ID: &str = "parakeet-fastconformer-tdt";
-#[allow(dead_code)] // staged: consumed by the descriptor/executor stage
 pub(crate) const PARAKEET_TDT_GGML_ADAPTER_ID: &str = "ggml-family-parakeet-tdt-runtime-v1";
 pub(crate) const PARAKEET_TDT_AUDIO_FRONTEND_ID: &str = "parakeet-tdt.logmel128.16khz.mono.v0";
 pub(crate) const PARAKEET_TDT_TOKENIZER_ID: &str = "parakeet-tdt.spm-bpe.v0";
 pub(crate) const PARAKEET_TDT_DECODE_POLICY_ID: &str = "parakeet-tdt.greedy.tdt.v0";
-#[allow(dead_code)] // staged: consumed by the descriptor/executor stage
 pub(crate) const PARAKEET_TDT_RUNTIME_TENSOR_CONTRACT_ID: &str = "parakeet-tdt.runtime-tensors.v0";
-#[allow(dead_code)] // staged: consumed by the descriptor/executor stage
 pub(crate) const PARAKEET_TDT_EXECUTOR_COMPONENT_ID: &str = "parakeet-tdt.ggml-executor.v0";
 
 // wav2vec2-ctc (facebook/wav2vec2-base-960h, raw-waveform CTC onboarding).
@@ -609,6 +606,26 @@ const BUILTIN_COMPONENT_DESCRIPTORS: &[OpenAsrComponentDescriptor] = &[
     },
     OpenAsrComponentDescriptor {
         kind: OpenAsrComponentKind::AudioFrontend,
+        id: PARAKEET_TDT_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: PARAKEET_TDT_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: PARAKEET_TDT_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: PARAKEET_TDT_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: PARAKEET_TDT_EXECUTOR_COMPONENT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
         id: WAV2VEC2_CTC_AUDIO_FRONTEND_ID,
     },
     OpenAsrComponentDescriptor {
@@ -818,6 +835,35 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             }),
             decoder_stage: None,
         }),
+    },
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &["parakeet-tdt"],
+        model_family: "parakeet-tdt",
+        model_architecture: PARAKEET_TDT_GGML_ARCHITECTURE_ID,
+        adapter_id: PARAKEET_TDT_GGML_ADAPTER_ID,
+        // parakeet-tdt-0.6b-v3: 25 European languages, no per-request language
+        // selection (the model decodes whatever it hears; NVIDIA's card lists
+        // the fixed set).
+        language_family_hint: LanguageFamilyHint::FixedMultilingual {
+            languages: &[
+                "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hr", "hu", "it", "lt",
+                "lv", "mt", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "uk",
+            ],
+        },
+        audio_frontend_id: PARAKEET_TDT_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: PARAKEET_TDT_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: PARAKEET_TDT_TOKENIZER_ID,
+        decode_policy_id: PARAKEET_TDT_DECODE_POLICY_ID,
+        executor_component_id: PARAKEET_TDT_EXECUTOR_COMPONENT_ID,
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        hparam_schema: PARAKEET_TDT_HPARAM_SCHEMA,
+        // The FastConformer encoder reuses the composer conformer block, but
+        // the TDT decode loop (LSTM prediction network + duration-driven
+        // frame skipping) is a transducer, which is not a composer
+        // orchestration shape -- dedicated executor, like xasr (block_stack:
+        // None).
+        block_stack: None,
     },
     OpenAsrArchitectureDescriptor {
         runtime_architecture_aliases: &["wav2vec2-ctc", "wav2vec2"],

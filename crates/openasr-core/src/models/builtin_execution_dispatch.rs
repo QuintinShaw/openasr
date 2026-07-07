@@ -15,6 +15,7 @@ use super::ggml_composed_executor::ComposedGgmlAsrExecutor;
 use super::ggml_family_adapter::GgmlExecutionCapability;
 use super::moonshine::MoonshineGgmlExecutor;
 use super::parakeet_ctc::executor::ParakeetCtcGgmlExecutor;
+use super::parakeet_tdt::executor::ParakeetTdtGgmlExecutor;
 use super::qwen::Qwen3AsrGgmlExecutor;
 use super::sensevoice::executor::SenseVoiceGgmlExecutor;
 use super::wav2vec2_ctc::executor::Wav2Vec2CtcGgmlExecutor;
@@ -145,6 +146,14 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
         )
         .with_streaming_partial_granularity_for_adapter(
             crate::PARAKEET_CTC_GGML_ADAPTER_ID,
+            StreamingPartialGranularity::Buffered,
+        )
+        .with_streaming_executor_for_adapter(
+            crate::PARAKEET_TDT_GGML_ADAPTER_ID,
+            Arc::new(ParakeetTdtGgmlExecutor),
+        )
+        .with_streaming_partial_granularity_for_adapter(
+            crate::PARAKEET_TDT_GGML_ADAPTER_ID,
             StreamingPartialGranularity::Buffered,
         )
         .with_streaming_executor_for_adapter(
