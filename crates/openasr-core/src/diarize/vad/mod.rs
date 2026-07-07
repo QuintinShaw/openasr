@@ -14,7 +14,14 @@
 //! streaming detector. The forward pass is validated bit-close (max abs prob
 //! error < 1e-3; the measured numpy-vs-ONNX delta is ~4e-6) against the upstream
 //! ONNX reference via a committed golden fixture (see `tests`).
+//!
+//! [`firered`] vendors a second, alternative long-form-only neural engine
+//! (`FireRedVAD`, Apache-2.0): a causal-FSMN `DetectModel`, selectable via
+//! `OPENASR_VAD=firered` but not the default (see
+//! [`crate::longform::LongFormVadEngine::FireRed`] for why). It is not wired
+//! into realtime endpointing or diarization.
 
+mod firered;
 mod provider;
 mod silero;
 mod streaming;
@@ -25,6 +32,7 @@ mod tests;
 
 use std::sync::OnceLock;
 
+pub use firered::{FireRedVadError, FireRedVadProvider};
 pub use provider::{SileroVadError, SileroVadProvider};
 pub use silero::{SileroVadModel, SileroVadState};
 pub use streaming::SileroStreamingVad;
@@ -52,11 +60,38 @@ pub fn parse_vad_engine(value: &str) -> Option<bool> {
 }
 
 /// The `OPENASR_VAD` environment override as a neural-vs-energy preference.
+/// Realtime-only (the `firered` engine is long-form-only; an
+/// `OPENASR_VAD=firered` value is unrecognized here and falls through to the
+/// caller's explicit engine / default, exactly like any other unknown string).
 pub fn vad_engine_env_override() -> Option<bool> {
     std::env::var("OPENASR_VAD")
         .ok()
         .as_deref()
         .and_then(parse_vad_engine)
+}
+
+/// Long-form VAD-engine selection strings, three-way (Silero / Energy /
+/// FireRed). Superset of [`parse_vad_engine`] for the long-form slicing path,
+/// which -- unlike realtime endpointing -- supports the FireRedVAD engine.
+pub fn parse_longform_vad_engine(value: &str) -> Option<crate::longform::LongFormVadEngine> {
+    use crate::longform::LongFormVadEngine;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "silero" | "neural" => Some(LongFormVadEngine::Silero),
+        "energy" | "rms" => Some(LongFormVadEngine::Energy),
+        "firered" | "fireredvad" => Some(LongFormVadEngine::FireRed),
+        _ => None,
+    }
+}
+
+/// The `OPENASR_VAD` environment override for long-form VAD-engine selection
+/// (tri-state: Silero/Energy/FireRed). Single source of truth for the
+/// `resolve_longform_vad_provider` env override so the alias table never
+/// diverges from [`parse_longform_vad_engine`].
+pub fn longform_vad_engine_env_override() -> Option<crate::longform::LongFormVadEngine> {
+    std::env::var("OPENASR_VAD")
+        .ok()
+        .as_deref()
+        .and_then(parse_longform_vad_engine)
 }
 
 /// Probability threshold for the neural (Silero) detector when the caller does not
