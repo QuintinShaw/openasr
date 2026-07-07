@@ -136,6 +136,9 @@ recommended_quant = "q8_0"
 sort_weight = 915
 recommended = true
 upstream_release_date = "2025-08-14"
+# Forward-compat runtime floor: a new family requiring the 0.1.9 core runtime,
+# same rationale/pin as firered-aed-l-v2.
+min_core_version = "0.1.9"
 
 # Dolphin cn-dialect small (WeNet E-Branchformer, CTC + attention rescoring).
 # Published PUBLIC to OpenASR/dolphin-cn-dialect-small: `release_public = true`
@@ -222,11 +225,13 @@ languages = [
     "uz", "vi", "yue", "zh",
 ]
 quants = ["fp16", "q8_0", "q4_k"]
-recommended_quant = "fp16"
+recommended_quant = "q8_0"
 upstream_release_date = "2026-05-13"
 # Needs both the dim-derivation import generalization AND the new multilingual
 # BPE tokenizer / two-level language-region prompt landing in this same change.
-min_core_version = "0.1.8"
+# Multilingual espnet front-end support (commit 91fc3d3) only lands in 0.1.9,
+# not 0.1.8, so pin the runtime floor there.
+min_core_version = "0.1.9"
 
 ["dolphin-base"]
 family = "dolphin"
@@ -243,10 +248,14 @@ languages = [
     "pa", "ps", "ru", "si", "su", "ta", "te", "tg", "th", "tl", "ug", "ur",
     "uz", "vi", "yue", "zh",
 ]
-quants = ["fp16", "q8_0", "q4_k"]
-recommended_quant = "fp16"
+# q4_k dropped: 8.8% CER drift measured for dolphin-base (dolphin-small's q4_k
+# is clean at 0.0 drift and stays).
+quants = ["fp16", "q8_0"]
+recommended_quant = "q8_0"
 upstream_release_date = "2026-05-13"
-min_core_version = "0.1.8"
+# Multilingual espnet front-end support (commit 91fc3d3) only lands in 0.1.9,
+# not 0.1.8, so pin the runtime floor there.
+min_core_version = "0.1.9"
 
 # SenseVoiceSmall (FunASR SAN-M/DFSMN encoder + CTC head): multilingual
 # zh/yue/en/ja/ko with model-side language id. Published PUBLIC to
@@ -510,3 +519,38 @@ sort_weight = 912
 recommended = true
 upstream_release_date = "2026-02-12"
 min_core_version = "0.1.9"
+
+# Qwen3-ForcedAligner-0.6B: a capability pack for the `word-timestamps`
+# feature (`--word-timestamps=aligned`), mirroring the wespeaker/pyannote
+# capability-pack entries above. Shares its thinker tensor layout with
+# qwen3-asr but is registered as its own family/architecture id
+# (`qwen3-forced-aligner`) since its NAR (single forward pass, argmax at
+# `<timestamp>` positions) decode policy is materially different from the
+# qwen3-asr autoregressive runtime -- see
+# crates/openasr-core/src/models/qwen/forced_aligner_import.rs. STAGED ONLY:
+# no `release_public` -- this pack has no public catalog entry yet, and
+# publishing here is a private-HF-repo staging step only.
+["qwen3-forced-aligner-0.6b"]
+kind = "capability-pack"
+family = "qwen3-forced-aligner"
+hf_repo = "OpenASR/qwen3-forced-aligner-0.6b"
+size = "0.6b"
+registry_id = "qwen3-forced-aligner-0.6b"
+display_name = "Qwen3-ForcedAligner 0.6B"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B/blob/main/README.md"
+license_class = "permissive"
+# Language-agnostic support pack (like the diarization embedder/segmenter
+# above): it aligns whatever text/audio pair a base ASR model already
+# produced, so there is no meaningful "family default" language list. This
+# override just documents the languages exercised by local verification so
+# far (see the align-text word-splitting support for en/zh).
+languages = ["en", "zh"]
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "fp16"
+upstream_release_date = "2026-01-28"
+min_core_version = "0.1.9"
+
+["qwen3-forced-aligner-0.6b".capability]
+feature = "word-timestamps"
+role = "forced-aligner"

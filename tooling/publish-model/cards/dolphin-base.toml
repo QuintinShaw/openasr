@@ -1,0 +1,117 @@
+# Per-model card prose for openasr/dolphin-base. Distilled (paraphrased, not
+# copied) from the upstream DataoceanAI/dolphin-base model card. Claims are
+# kept to what the upstream repo and architecture state; re-verify against the
+# upstream card when the upstream weights change.
+#
+# STAGING NOTE (not public): this is the multilingual Dolphin tier, published
+# to a PRIVATE HF repo only. Local sanity checking so far used a Mandarin clip
+# (this family's `en` support is out of scope -- `en` is not in the advertised
+# language list, so the shared JFK ruler is out-of-distribution and only used
+# for the standard cross-quant drift signal). q4_k is dropped from this pack's
+# quants: it showed an ~8.8% CER drift versus fp16 on the sanity clip (see
+# below); dolphin-small's q4_k is clean at 0.0 drift and is unaffected.
+
+tagline = "Multilingual speech recognition across 40 languages, base tier -- a compact 140M WeNet/ESPnet E-Branchformer (CTC + attention)"
+tagline_zh = "覆盖 40 种语言的多语种语音识别（base 档）— 紧凑的 140M 参数 WeNet/ESPnet E-Branchformer（CTC + 注意力）"
+
+# Same rationale as dolphin-small: this checkpoint's advertised language list
+# does not include English, so the shared JFK ruler is out-of-distribution. It
+# is still run against the shared JFK clip for the standard cross-quant
+# ΔWER/CER drift signal, but the primary in-language sanity check uses a
+# Mandarin clip.
+bench_clip_phrase = "the shared 11s JFK clip (out-of-distribution, drift signal only) plus an in-language Mandarin sanity clip"
+bench_clip_short = "JFK + zh sanity clip"
+drift_metric_label = "ΔCER"
+
+highlights = [
+  "🌏 **40 languages, base tier** — the same multilingual E-Branchformer coverage as Dolphin Small (South Asian, Southeast Asian, Central Asian/Turkic, Chinese/Cantonese), at a fraction of the size",
+  "🪶 **140M parameters** — roughly a third the width of the `small` checkpoint (512 vs 768 d_model, fewer layers), for tighter RAM and faster CPU decode when the small tier is overkill",
+  "🧩 **Joint CTC + attention** — the same E-Branchformer encoder + Transformer decoder recipe with CTC/attention rescoring, verified against a shape-derived runtime contract shared with the rest of the Dolphin family",
+  "🐬 **SentencePiece BPE vocab** — a shared subword vocabulary across all 40 languages (distinct from the cn-dialect family's fixed character vocab)",
+  "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU",
+]
+
+highlights_zh = [
+  "🌏 **40 种语言，base 档** — 与 Dolphin Small 相同的多语种 E-Branchformer 覆盖（南亚、东南亚、中亚/突厥语系、中文/粤语），体积小得多",
+  "🪶 **140M 参数** — 宽度约为 `small` 检查点的三分之一（d_model 512 对 768，层数更少），small 档过重时可换取更省内存、更快的 CPU 解码",
+  "🧩 **联合 CTC + 注意力** — 与 Dolphin 家族一致的 E-Branchformer 编码器 + Transformer 解码器配方，配合 CTC/attention 重打分，运行时形状参数与全家族共享同一份契约",
+  "🐬 **SentencePiece BPE 词表** — 40 种语言共享同一子词词表（不同于 cn-dialect 家族的固定字符词表）",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
+]
+
+intro = """
+Dolphin Base is the **140M "base" tier** of DataoceanAI's **multilingual** Dolphin speech-
+recognition line, built on the same **Dolphin / ESPnet** recipe as the larger **Dolphin Small**:
+an **E-Branchformer encoder + Transformer decoder** trained with a **joint CTC + attention**
+objective over a shared SentencePiece BPE vocabulary spanning the card's advertised 40 languages
+(South Asian, Southeast Asian, Central Asian/Turkic, and Chinese including Cantonese as `yue`),
+at roughly a third of the small tier's encoder/decoder width -- a smaller RAM/CPU footprint for
+deployments where the small tier's accuracy headroom is not needed. Like `dolphin-small`, this
+checkpoint collapses this product's own Chinese-dialect granularity into a single `zh` (the
+dedicated `dolphin-cn-dialect-small`/`-base` packs cover per-dialect prompting). This OpenASR
+repo repackages the weights as `.oasr` packs that run natively in the OpenASR runtime -- no
+Python at inference, all decoding local. It ships in **fp16** (maximum fidelity) and **q8_0**
+(recommended) builds. **q4_k** is not offered for this pack (see verification status below).
+
+**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed
+without punctuation marks, so the decoder never predicts a punctuation token -- there is no
+setting to enable it. Transcripts are plain, unpunctuated text by design.
+
+**Verification status:** this pack is staged in a private repo, not yet publicly listed. Local
+verification so far covers Mandarin (`zh`) sanity-checked against the upstream architecture and
+bit-stable at fp16/q8_0. q4_k showed an ~8.8% CER drift versus fp16 on the sanity clip and is
+dropped from this pack's quants (dolphin-small's q4_k is clean at 0.0 drift and is unaffected).
+"""
+
+intro_zh = """
+Dolphin Base 是 DataoceanAI **多语种** Dolphin 语音识别系列中 **140M 参数的 "base" 档**，与体积
+更大的 **Dolphin Small** 采用相同的 **Dolphin / ESPnet** 配方：**E-Branchformer 编码器 +
+Transformer 解码器**，以**联合 CTC + attention** 目标在覆盖卡片公布 40 种语言（南亚、东南亚、
+中亚/突厥语系与中文，粤语单独列为 `yue`）的共享 SentencePiece BPE 词表上训练，编解码器宽度约为
+small 档的三分之一——在不需要 small 档准确度余量的部署场景下，换取更小的内存与 CPU 占用。与
+`dolphin-small` 一样，本检查点将本产品自身的中文方言颗粒度收敛为单一 `zh`（各方言的分别提示由
+专门的 `dolphin-cn-dialect-small`/`-base` 包提供）。
+
+这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理，不会把音频上传到
+云端。提供 `fp16`（最高保真）、`q8_0`（推荐）两种量化版本；本包不提供 `q4_k`（原因见下方验证
+状态）。
+
+**说明:** 该模型不输出标点符号。其上游训练语料的转写不含标点，解码器从不预测标点符号——
+没有可开启的开关。转写结果按设计是不含标点的纯文本。
+
+**验证状态:** 本模型包目前仅暂存于私有仓库，尚未公开上架。目前本地验证覆盖普通话（`zh`），
+已对照上游架构做过合理性检查，fp16/q8_0 逐位稳定；q4_k 在合理性样本上相较 fp16 有约 8.8%
+的 CER 漂移，因此本包不提供 q4_k（dolphin-small 的 q4_k 干净、漂移为 0.0，不受影响）。
+"""
+
+acknowledgement = """
+This pack is a redistribution of **Dolphin Base**, created and open-sourced by **DataoceanAI**
+([DataoceanAI/dolphin-base](https://huggingface.co/DataoceanAI/dolphin-base)). All credit for the
+original architecture, training, and weights belongs to the authors; the license is inherited
+from and identical to the upstream model (Apache-2.0). The model builds on the **Dolphin**
+multilingual ASR project and the **ESPnet** E-Branchformer / joint CTC-attention recipe -- thank
+you to the Dolphin and ESPnet teams and to DataoceanAI for releasing their work openly. OpenASR
+only performs format conversion, quantization, runtime verification, and local-inference
+adaptation.
+"""
+
+acknowledgement_zh = """
+本模型包重新分发自 DataoceanAI 开源的 Dolphin Base
+([DataoceanAI/dolphin-base](https://huggingface.co/DataoceanAI/dolphin-base))。原始架构、训练和
+权重归作者所有，许可证继承上游 Apache-2.0。模型基于 **Dolphin** 多语言 ASR 项目与 **ESPnet** 的
+E-Branchformer / 联合 CTC-attention 配方，感谢 Dolphin、ESPnet 团队与 DataoceanAI 的开源工作。
+OpenASR 仅进行格式转换、量化、运行时校验和本地推理适配。
+"""
+
+[prose_locales."zh-CN"]
+tagline = "覆盖 40 种语言的多语种语音识别（base 档）— 紧凑的 140M 参数 WeNet/ESPnet E-Branchformer（CTC + 注意力）"
+
+highlights = [
+  "🌏 **40 种语言，base 档** — 与 Dolphin Small 相同的多语种 E-Branchformer 覆盖（南亚、东南亚、中亚/突厥语系、中文/粤语），体积小得多",
+  "🪶 **140M 参数** — 宽度约为 `small` 检查点的三分之一（d_model 512 对 768，层数更少），small 档过重时可换取更省内存、更快的 CPU 解码",
+  "🧩 **联合 CTC + 注意力** — 与 Dolphin 家族一致的 E-Branchformer 编码器 + Transformer 解码器配方，配合 CTC/attention 重打分，运行时形状参数与全家族共享同一份契约",
+  "🐬 **SentencePiece BPE 词表** — 40 种语言共享同一子词词表（不同于 cn-dialect 家族的固定字符词表）",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
+]
+
+source_sha256 = "db3c5473b1127493aae9c237482170c1de350ae10f8e02c3338a4e1ddd133569"

@@ -1,0 +1,79 @@
+---
+license: {{license_yaml}}
+base_model: {{upstream_repo}}
+pipeline_tag: {{pipeline_tag}}
+library_name: openasr
+tags:
+  - openasr
+  - oasr
+  - {{pull_alias}}
+---
+
+<div align="center">
+
+# {{model_display_name}} · OpenASR
+
+**{{tagline}}**
+
+[![License](https://img.shields.io/badge/license-{{license_badge}}-2563eb.svg)]({{upstream_license_link}})
+[![Format](https://img.shields.io/badge/format-.oasr-7c3aed.svg)](https://github.com/QuintinShaw/openasr)
+[![Runtime](https://img.shields.io/badge/runtime-OpenASR-111827.svg)](https://openasr.org)
+[![Base model](https://img.shields.io/badge/base-{{upstream_badge}}-f59e0b.svg)]({{upstream_link}})
+
+A capability-pack support model for the **[OpenASR](https://github.com/QuintinShaw/openasr)**
+runtime — pure-Rust inference, **no Python at inference time**. Not a standalone
+transcription model: it augments another OpenASR ASR model's own decode path.
+
+</div>
+
+---
+
+## ✨ Highlights
+
+{{highlights_block}}
+
+## 🚀 Quickstart
+
+```bash
+# 1. Install the OpenASR CLI  ·  https://openasr.org
+# 2. Pull the pack
+{{pull_recommended}}
+
+# 3. Use it as an opt-in refinement for another model's transcribe call
+openasr transcribe meeting.wav --model <asr-model> --word-timestamps=aligned
+```
+
+## 📦 Pack
+
+| Quant | File (`.oasr`) | Size |
+|:------|:---------------|-----:|
+{{perf_table_rows}}
+
+## 🧠 About {{model_display_name}}
+
+{{intro}}
+
+## ⚙️ How this pack was made
+
+Converted from [{{upstream_repo}}]({{upstream_link}}) with the OpenASR local-source
+converter (`convert_local_qwen_forced_aligner_source_to_runtime_pack`, not yet wired
+to a public `openasr model-pack import` subcommand -- the pack format and tensor
+mapping are stable, but CLI/family-registry wiring is a separate stage).
+
+The `.oasr` container is GGUF-backed; packs use zero-copy mmap weight binding.
+
+## ⚖️ License
+
+This pack **inherits the upstream model's license: {{upstream_license_id}}**
+([source]({{upstream_license_link}})). OpenASR packaging retains the upstream copyright;
+the only modifications are format conversion and quantization.
+
+## 🙏 Acknowledgements
+
+{{acknowledgement_block}}
+
+## 🔗 Links
+
+- 🦀 **OpenASR** — <https://github.com/QuintinShaw/openasr>
+- 🌐 **Website** — <https://openasr.org>
+- 🤗 **Upstream model** — [{{upstream_repo}}]({{upstream_link}})

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-07T11:08:27+00:00",
+  "generated_at": "2026-07-07T17:20:44+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -256,7 +256,8 @@
           ]
         }
       },
-      "upstream_release_date": "2025-08-14"
+      "upstream_release_date": "2025-08-14",
+      "min_core_version": "0.1.9"
     },
     {
       "id": "firered-aed-l-v2",
@@ -831,6 +832,131 @@
       "min_core_version": "0.1.5"
     },
     {
+      "id": "dolphin-base",
+      "kind": "asr-model",
+      "display_name": "Dolphin Base",
+      "family": "dolphin",
+      "aliases": [],
+      "pull_alias": null,
+      "size": "base",
+      "languages": [
+        "ar",
+        "az",
+        "ba",
+        "bn",
+        "fa",
+        "fil",
+        "gu",
+        "hi",
+        "id",
+        "ja",
+        "jv",
+        "kab",
+        "kk",
+        "km",
+        "ko",
+        "ks",
+        "ky",
+        "lo",
+        "mn",
+        "mr",
+        "ms",
+        "my",
+        "ne",
+        "or",
+        "pa",
+        "ps",
+        "ru",
+        "si",
+        "su",
+        "ta",
+        "te",
+        "tg",
+        "th",
+        "tl",
+        "ug",
+        "ur",
+        "uz",
+        "vi",
+        "yue",
+        "zh"
+      ],
+      "vendor": "DataoceanAI",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/DataoceanAI/dolphin-base/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/dolphin-base",
+      "hf_revision": "cedd9f67c535032fcfae07c5469dc49f9d957aab",
+      "public": false,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "dolphin-base:q8",
+      "prose": {
+        "tagline": "Multilingual speech recognition across 40 languages, base tier -- a compact 140M WeNet/ESPnet E-Branchformer (CTC + attention)",
+        "overview": [
+          "Dolphin Base is the **140M \"base\" tier** of DataoceanAI's **multilingual** Dolphin speech-\nrecognition line, built on the same **Dolphin / ESPnet** recipe as the larger **Dolphin Small**:\nan **E-Branchformer encoder + Transformer decoder** trained with a **joint CTC + attention**\nobjective over a shared SentencePiece BPE vocabulary spanning the card's advertised 40 languages\n(South Asian, Southeast Asian, Central Asian/Turkic, and Chinese including Cantonese as `yue`),\nat roughly a third of the small tier's encoder/decoder width -- a smaller RAM/CPU footprint for\ndeployments where the small tier's accuracy headroom is not needed. Like `dolphin-small`, this\ncheckpoint collapses this product's own Chinese-dialect granularity into a single `zh` (the\ndedicated `dolphin-cn-dialect-small`/`-base` packs cover per-dialect prompting). This OpenASR\nrepo repackages the weights as `.oasr` packs that run natively in the OpenASR runtime -- no\nPython at inference, all decoding local. It ships in **fp16** (maximum fidelity) and **q8_0**\n(recommended) builds. **q4_k** is not offered for this pack (see verification status below).\n\n**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed\nwithout punctuation marks, so the decoder never predicts a punctuation token -- there is no\nsetting to enable it. Transcripts are plain, unpunctuated text by design.\n\n**Verification status:** this pack is staged in a private repo, not yet publicly listed. Local\nverification so far covers Mandarin (`zh`) sanity-checked against the upstream architecture and\nbit-stable at fp16/q8_0. q4_k showed an ~8.8% CER drift versus fp16 on the sanity clip and is\ndropped from this pack's quants (dolphin-small's q4_k is clean at 0.0 drift and is unaffected)."
+        ],
+        "highlights": [
+          "\ud83c\udf0f **40 languages, base tier** \u2014 the same multilingual E-Branchformer coverage as Dolphin Small (South Asian, Southeast Asian, Central Asian/Turkic, Chinese/Cantonese), at a fraction of the size",
+          "\ud83e\udeb6 **140M parameters** \u2014 roughly a third the width of the `small` checkpoint (512 vs 768 d_model, fewer layers), for tighter RAM and faster CPU decode when the small tier is overkill",
+          "\ud83e\udde9 **Joint CTC + attention** \u2014 the same E-Branchformer encoder + Transformer decoder recipe with CTC/attention rescoring, verified against a shape-derived runtime contract shared with the rest of the Dolphin family",
+          "\ud83d\udc2c **SentencePiece BPE vocab** \u2014 a shared subword vocabulary across all 40 languages (distinct from the cn-dialect family's fixed character vocab)",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "dolphin-base:fp16",
+          "filename": "dolphin-base-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/dolphin-base/resolve/cedd9f67c535032fcfae07c5469dc49f9d957aab/dolphin-base-fp16.oasr",
+          "sha256": "f8d83121160f08c5d166d0251403ec5d6e4719cccd8a18956e8f675a7d031ec3",
+          "size_bytes": 286733696,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.148,
+            "rtf_metal": 0.136,
+            "peak_rss_bytes": 1922269184,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "dolphin-base:q8",
+          "filename": "dolphin-base-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/dolphin-base/resolve/cedd9f67c535032fcfae07c5469dc49f9d957aab/dolphin-base-q8_0.oasr",
+          "sha256": "79ca61ddfcba1d83aec875fa5f7d482b8a7e92939f80345e152553a4f453add7",
+          "size_bytes": 158106176,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.151,
+            "rtf_metal": 0.163,
+            "peak_rss_bytes": 1758412800,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ],
+      "language_mode": "specify_only",
+      "language_default": "zh",
+      "emits_punctuation": false,
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u8986\u76d6 40 \u79cd\u8bed\u8a00\u7684\u591a\u8bed\u79cd\u8bed\u97f3\u8bc6\u522b\uff08base \u6863\uff09\u2014 \u7d27\u51d1\u7684 140M \u53c2\u6570 WeNet/ESPnet E-Branchformer\uff08CTC + \u6ce8\u610f\u529b\uff09",
+          "highlights": [
+            "\ud83c\udf0f **40 \u79cd\u8bed\u8a00\uff0cbase \u6863** \u2014 \u4e0e Dolphin Small \u76f8\u540c\u7684\u591a\u8bed\u79cd E-Branchformer \u8986\u76d6\uff08\u5357\u4e9a\u3001\u4e1c\u5357\u4e9a\u3001\u4e2d\u4e9a/\u7a81\u53a5\u8bed\u7cfb\u3001\u4e2d\u6587/\u7ca4\u8bed\uff09\uff0c\u4f53\u79ef\u5c0f\u5f97\u591a",
+            "\ud83e\udeb6 **140M \u53c2\u6570** \u2014 \u5bbd\u5ea6\u7ea6\u4e3a `small` \u68c0\u67e5\u70b9\u7684\u4e09\u5206\u4e4b\u4e00\uff08d_model 512 \u5bf9 768\uff0c\u5c42\u6570\u66f4\u5c11\uff09\uff0csmall \u6863\u8fc7\u91cd\u65f6\u53ef\u6362\u53d6\u66f4\u7701\u5185\u5b58\u3001\u66f4\u5feb\u7684 CPU \u89e3\u7801",
+            "\ud83e\udde9 **\u8054\u5408 CTC + \u6ce8\u610f\u529b** \u2014 \u4e0e Dolphin \u5bb6\u65cf\u4e00\u81f4\u7684 E-Branchformer \u7f16\u7801\u5668 + Transformer \u89e3\u7801\u5668\u914d\u65b9\uff0c\u914d\u5408 CTC/attention \u91cd\u6253\u5206\uff0c\u8fd0\u884c\u65f6\u5f62\u72b6\u53c2\u6570\u4e0e\u5168\u5bb6\u65cf\u5171\u4eab\u540c\u4e00\u4efd\u5951\u7ea6",
+            "\ud83d\udc2c **SentencePiece BPE \u8bcd\u8868** \u2014 40 \u79cd\u8bed\u8a00\u5171\u4eab\u540c\u4e00\u5b50\u8bcd\u8bcd\u8868\uff08\u4e0d\u540c\u4e8e cn-dialect \u5bb6\u65cf\u7684\u56fa\u5b9a\u5b57\u7b26\u8bcd\u8868\uff09",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e GPU \u7684\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+          ]
+        }
+      },
+      "upstream_release_date": "2026-05-13",
+      "min_core_version": "0.1.9"
+    },
+    {
       "id": "dolphin-cn-dialect-base",
       "kind": "asr-model",
       "display_name": "Dolphin CN-Dialect Base",
@@ -944,6 +1070,147 @@
       },
       "upstream_release_date": "2026-05-13",
       "min_core_version": "0.1.8"
+    },
+    {
+      "id": "dolphin-small",
+      "kind": "asr-model",
+      "display_name": "Dolphin Small",
+      "family": "dolphin",
+      "aliases": [],
+      "pull_alias": null,
+      "size": "small",
+      "languages": [
+        "ar",
+        "az",
+        "ba",
+        "bn",
+        "fa",
+        "fil",
+        "gu",
+        "hi",
+        "id",
+        "ja",
+        "jv",
+        "kab",
+        "kk",
+        "km",
+        "ko",
+        "ks",
+        "ky",
+        "lo",
+        "mn",
+        "mr",
+        "ms",
+        "my",
+        "ne",
+        "or",
+        "pa",
+        "ps",
+        "ru",
+        "si",
+        "su",
+        "ta",
+        "te",
+        "tg",
+        "th",
+        "tl",
+        "ug",
+        "ur",
+        "uz",
+        "vi",
+        "yue",
+        "zh"
+      ],
+      "vendor": "DataoceanAI",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/DataoceanAI/dolphin-small/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/dolphin-small",
+      "hf_revision": "85a23dd6899bb324c6938bd83ee2b1931d16ec2a",
+      "public": false,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "dolphin-small:q8",
+      "prose": {
+        "tagline": "Multilingual speech recognition across 40 languages -- a WeNet/ESPnet E-Branchformer (CTC + attention) covering South/Southeast/Central Asian and Chinese-dialect speech",
+        "overview": [
+          "Dolphin Small is the **372M \"small\" tier** of DataoceanAI's **multilingual** Dolphin speech-\nrecognition line, built on the **Dolphin / ESPnet** recipe as an **E-Branchformer encoder +\nTransformer decoder** trained with a **joint CTC + attention** objective over a shared\nSentencePiece BPE vocabulary. Unlike the dedicated `dolphin-cn-dialect-*` checkpoints (fixed\n`<zh>` language token, Chinese-only char vocab), this multilingual checkpoint varies **both**\nthe language and region prompt slots across the card's advertised 40 languages -- South Asian,\nSoutheast Asian, Central Asian/Turkic, and Chinese (including Cantonese, listed separately as\n`yue`) -- while collapsing this product's own Chinese-dialect granularity into a single `zh`\n(the dedicated `dolphin-cn-dialect-small`/`-base` packs cover per-dialect prompting; this\ncheckpoint does not). This OpenASR repo repackages the weights as `.oasr` packs that run natively\nin the OpenASR runtime -- no Python at inference, all decoding local. It ships in **fp16**\n(maximum fidelity), **q8_0** (recommended), and **q4_k** builds.\n\n**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed\nwithout punctuation marks, so the decoder never predicts a punctuation token -- there is no\nsetting to enable it. Transcripts are plain, unpunctuated text by design.\n\n**Verification status:** this pack is staged in a private repo, not yet publicly listed. Local\nverification so far covers Mandarin (`zh`) sanity-checked against the upstream architecture and\nbit-stable across fp16/q8_0/q4_k quants."
+        ],
+        "highlights": [
+          "\ud83c\udf0f **40 languages, one checkpoint** \u2014 a WeNet/ESPnet E-Branchformer spanning South Asian (Hindi, Bengali, Urdu...), Southeast Asian (Vietnamese, Thai, Indonesian...), Central Asian/Turkic (Kazakh, Uzbek, Azerbaijani...), and Chinese/Cantonese speech, with per-utterance `<lang><region>` prompting",
+          "\ud83e\udde9 **Joint CTC + attention** \u2014 an E-Branchformer encoder with a Transformer decoder and CTC/attention rescoring, verified against a shape-derived runtime contract shared with the rest of the Dolphin family",
+          "\ud83d\udc2c **SentencePiece BPE vocab** \u2014 a shared subword vocabulary across all 40 languages (distinct from the cn-dialect family's fixed character vocab), suited to code-mixed and cross-lingual speech",
+          "\ud83e\udeb6 **372M parameters, `small` tier** \u2014 the larger of the two multilingual Dolphin sizes (paired with the more compact `dolphin-base`)",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "dolphin-small:fp16",
+          "filename": "dolphin-small-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/dolphin-small/resolve/85a23dd6899bb324c6938bd83ee2b1931d16ec2a/dolphin-small-fp16.oasr",
+          "sha256": "8e6dac3908f96871c3b887eb13880dbf516b35946aa7ae4e0a1f142ba8a2941e",
+          "size_bytes": 754136512,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.349,
+            "rtf_metal": 0.587,
+            "peak_rss_bytes": 3860742144,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "dolphin-small:q8",
+          "filename": "dolphin-small-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/dolphin-small/resolve/85a23dd6899bb324c6938bd83ee2b1931d16ec2a/dolphin-small-q8_0.oasr",
+          "sha256": "95554064292e0e63461b07839a254bd232030809bcb1b64b1dc34aee26767eec",
+          "size_bytes": 411711712,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.369,
+            "rtf_metal": 0.803,
+            "peak_rss_bytes": 2682699776,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "dolphin-small:q4",
+          "filename": "dolphin-small-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/dolphin-small/resolve/85a23dd6899bb324c6938bd83ee2b1931d16ec2a/dolphin-small-q4_k.oasr",
+          "sha256": "1ba5902f5101bc2c444ae8a4c4fd2f7d19fe60aab0d4c6bd6a9d59b9c4f0d4b3",
+          "size_bytes": 229085152,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.434,
+            "rtf_metal": 0.328,
+            "peak_rss_bytes": 3562340352,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ],
+      "language_mode": "specify_only",
+      "language_default": "zh",
+      "emits_punctuation": false,
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u8986\u76d6 40 \u79cd\u8bed\u8a00\u7684\u591a\u8bed\u79cd\u8bed\u97f3\u8bc6\u522b \u2014 \u57fa\u4e8e WeNet/ESPnet E-Branchformer\uff08CTC + \u6ce8\u610f\u529b\uff09\uff0c\u8986\u76d6\u5357\u4e9a\u3001\u4e1c\u5357\u4e9a\u3001\u4e2d\u4e9a\u8bed\u8a00\u4e0e\u4e2d\u6587\u65b9\u8a00",
+          "highlights": [
+            "\ud83c\udf0f **40 \u79cd\u8bed\u8a00\uff0c\u4e00\u4e2a\u68c0\u67e5\u70b9** \u2014 WeNet/ESPnet E-Branchformer\uff0c\u8986\u76d6\u5357\u4e9a\uff08\u5370\u5730\u8bed\u3001\u5b5f\u52a0\u62c9\u8bed\u3001\u4e4c\u5c14\u90fd\u8bed\u2026\u2026\uff09\u3001\u4e1c\u5357\u4e9a\uff08\u8d8a\u5357\u8bed\u3001\u6cf0\u8bed\u3001\u5370\u5c3c\u8bed\u2026\u2026\uff09\u3001\u4e2d\u4e9a/\u7a81\u53a5\u8bed\u7cfb\uff08\u54c8\u8428\u514b\u8bed\u3001\u4e4c\u5179\u522b\u514b\u8bed\u3001\u963f\u585e\u62dc\u7586\u8bed\u2026\u2026\uff09\u4e0e\u4e2d\u6587/\u7ca4\u8bed\uff0c\u6309 `<lang><region>` \u4e24\u7ea7\u524d\u7f00\u63d0\u793a",
+            "\ud83e\udde9 **\u8054\u5408 CTC + \u6ce8\u610f\u529b** \u2014 E-Branchformer \u7f16\u7801\u5668\u914d Transformer \u89e3\u7801\u5668\uff0c\u914d\u5408 CTC/attention \u91cd\u6253\u5206\uff0c\u8fd0\u884c\u65f6\u5f62\u72b6\u53c2\u6570\u4e0e\u5168\u5bb6\u65cf\u5171\u4eab\u540c\u4e00\u4efd\u5951\u7ea6",
+            "\ud83d\udc2c **SentencePiece BPE \u8bcd\u8868** \u2014 40 \u79cd\u8bed\u8a00\u5171\u4eab\u540c\u4e00\u5b50\u8bcd\u8bcd\u8868\uff08\u4e0d\u540c\u4e8e cn-dialect \u5bb6\u65cf\u7684\u56fa\u5b9a\u5b57\u7b26\u8bcd\u8868\uff09\uff0c\u9002\u5408\u4e2d\u82f1\u6df7\u8bf4\u4e0e\u8de8\u8bed\u79cd\u573a\u666f",
+            "\ud83e\udeb6 **372M \u53c2\u6570\uff0c`small` \u6863** \u2014 \u591a\u8bed\u79cd Dolphin \u4e24\u6863\u4e2d\u8f83\u5927\u7684\u4e00\u6863\uff08\u5bf9\u5e94\u66f4\u7d27\u51d1\u7684 `dolphin-base`\uff09",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e GPU \u7684\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+          ]
+        }
+      },
+      "upstream_release_date": "2026-05-13",
+      "min_core_version": "0.1.9"
     },
     {
       "id": "hymt2-1.8b",
@@ -1141,6 +1408,110 @@
         }
       },
       "upstream_release_date": "2026-03-24"
+    },
+    {
+      "id": "qwen3-forced-aligner-0.6b",
+      "kind": "capability-pack",
+      "capability": {
+        "feature": "word-timestamps",
+        "role": "forced-aligner"
+      },
+      "display_name": "Qwen3-ForcedAligner 0.6B",
+      "family": "qwen3-forced-aligner",
+      "aliases": [],
+      "pull_alias": null,
+      "size": "0.6b",
+      "languages": [
+        "en",
+        "zh"
+      ],
+      "vendor": "Qwen",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/qwen3-forced-aligner-0.6b",
+      "hf_revision": "617539a0e1088bac6abb0df19b13f7727e6ce94a",
+      "public": false,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "fp16",
+      "pull_recommended": "qwen3-forced-aligner-0.6b:fp16",
+      "prose": {
+        "tagline": "Word-level forced alignment for OpenASR transcripts -- a non-autoregressive Qwen3 audio+text model that refines per-word timestamps",
+        "overview": [
+          "Qwen3-ForcedAligner-0.6B is a **word-level forced-alignment** model from **Qwen**, sharing its\naudio-encoder + LM `thinker` tensor layout byte-for-byte with **Qwen3-ASR** (same\n`Qwen3ASRForConditionalGeneration` architecture). The only structural difference is the final\nhead: instead of a tied vocabulary `lm_head`, it uses an independent `Linear(hidden_size,\n5000)` classification head over 80ms-wide timestamp bins. Given a transcript's text and its\nsource audio, it runs a single non-autoregressive forward pass and reads off word-boundary\ntimestamps at argmax `<timestamp>` positions -- refining a model family's own (typically\ndecode-time-approximate) per-word timestamps. This OpenASR repo repackages the weights as\n`.oasr` packs that run natively in the OpenASR runtime -- no Python at inference, all decoding\nlocal. It ships in **fp16** (maximum fidelity, recommended), **q8_0**, and **q4_k** builds.\n\n**Not a standalone transcription model.** This pack cannot transcribe audio by itself; it is an\nopt-in refinement step consumed via `openasr transcribe <audio> --model <asr-model>\n--word-timestamps=aligned`. The base model's own timestamps (`--word-timestamps` /\n`--word-timestamps=approximate`) remain the default -- nothing changes unless `aligned` is\nrequested explicitly.\n\n**Verification status:** this is a brand-new catalog entry (no prior public listing). Local\nverification so far covers a tensor-parity check against the real upstream checkpoint (every\nsource safetensors tensor maps 1:1 to a destination tensor, plus the two synthesized frontend\ntensors, across fp16/q8_0/q4_k). This pack is staged in a private repo, not yet publicly listed."
+        ],
+        "highlights": [
+          "\ud83c\udfaf **Refined word timestamps** \u2014 consumes a finished transcript's text plus the source audio and replaces a model family's own approximate per-word timestamps with aligner-refined spans (`--word-timestamps=aligned`)",
+          "\u26a1 **Non-autoregressive** \u2014 a single forward pass over interleaved audio/text with argmax at `<timestamp>` positions (5000 80ms-wide bins), not incremental greedy decoding, so it is not dispatched through the qwen3-asr runtime",
+          "\ud83e\udde9 **Shares its backbone with Qwen3-ASR** \u2014 the same audio-encoder + LM `thinker` tensor layout, byte-for-byte; only the final head differs (an independent 5000-way classification head instead of the tied vocabulary head)",
+          "\ud83d\udd0c **Opt-in only** \u2014 a model family's own decode-time timestamps remain the default; this pack is only consulted when a transcribe call explicitly asks for `aligned` timestamps, and may auto-install under the same CLI consent flow as `--diarize`",
+          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "qwen3-forced-aligner-0.6b:fp16",
+          "filename": "qwen3-forced-aligner-0.6b-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-forced-aligner-0.6b/resolve/617539a0e1088bac6abb0df19b13f7727e6ce94a/qwen3-forced-aligner-0.6b-fp16.oasr",
+          "sha256": "2a1ad7e34ee9bb2ece1387d9c1d9ef010b6301086ffffa0f5bc2a2ecb58c2059",
+          "size_bytes": 1841709152,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": null,
+            "rtf_metal": null,
+            "peak_rss_bytes": null,
+            "jfk_wer_vs_fp16": null
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "qwen3-forced-aligner-0.6b:q8",
+          "filename": "qwen3-forced-aligner-0.6b-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-forced-aligner-0.6b/resolve/617539a0e1088bac6abb0df19b13f7727e6ce94a/qwen3-forced-aligner-0.6b-q8_0.oasr",
+          "sha256": "f0d06cabf6e96891aac400ace52faae33aa4f6bb28ef45aab2387c45430d7c29",
+          "size_bytes": 985596512,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": null,
+            "rtf_metal": null,
+            "peak_rss_bytes": null,
+            "jfk_wer_vs_fp16": null
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "qwen3-forced-aligner-0.6b:q4",
+          "filename": "qwen3-forced-aligner-0.6b-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-forced-aligner-0.6b/resolve/617539a0e1088bac6abb0df19b13f7727e6ce94a/qwen3-forced-aligner-0.6b-q4_k.oasr",
+          "sha256": "9ab57c1470f1a228b94799b5b7d25764a9c7f72ee4dff5b807324df566e58cab",
+          "size_bytes": 529003104,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": null,
+            "rtf_metal": null,
+            "peak_rss_bytes": null,
+            "jfk_wer_vs_fp16": null
+          }
+        }
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u4e3a OpenASR \u8f6c\u5199\u7ed3\u679c\u63d0\u4f9b\u8bcd\u7ea7\u5f3a\u5236\u5bf9\u9f50 \u2014 \u975e\u81ea\u56de\u5f52\u7684 Qwen3 \u97f3\u9891+\u6587\u672c\u6a21\u578b\uff0c\u7528\u4e8e\u7cbe\u4fee\u9010\u8bcd\u65f6\u95f4\u6233",
+          "highlights": [
+            "\ud83c\udfaf **\u7cbe\u4fee\u8bcd\u7ea7\u65f6\u95f4\u6233** \u2014 \u8f93\u5165\u5df2\u5b8c\u6210\u7684\u8f6c\u5199\u6587\u672c\u4e0e\u539f\u59cb\u97f3\u9891\uff0c\u7528\u5bf9\u9f50\u6a21\u578b\u7cbe\u4fee\u540e\u7684\u65f6\u95f4\u8de8\u5ea6\u66ff\u6362\u6a21\u578b\u81ea\u8eab\u7684\u8fd1\u4f3c\u9010\u8bcd\u65f6\u95f4\u6233\uff08`--word-timestamps=aligned`\uff09",
+            "\u26a1 **\u975e\u81ea\u56de\u5f52** \u2014 \u5bf9\u4ea4\u9519\u7684\u97f3\u9891/\u6587\u672c\u505a\u5355\u6b21\u524d\u5411\u8ba1\u7b97\uff0c\u5728 `<timestamp>` \u4f4d\u7f6e\u53d6 argmax\uff085000 \u4e2a 80ms \u5bbd\u7684\u5206\u7bb1\uff09\uff0c\u4e0d\u662f\u9010\u6b65\u8d2a\u5fc3\u89e3\u7801\uff0c\u56e0\u6b64\u4e0d\u901a\u8fc7 qwen3-asr \u8fd0\u884c\u65f6\u6d3e\u53d1",
+            "\ud83e\udde9 **\u4e0e Qwen3-ASR \u5171\u4eab\u9aa8\u5e72** \u2014 \u97f3\u9891\u7f16\u7801\u5668 + LM \u7684 `thinker` \u5f20\u91cf\u5e03\u5c40\u9010\u4f4d\u76f8\u540c\uff0c\u4ec5\u672b\u7aef\u8f93\u51fa\u5934\u4e0d\u540c\uff08\u72ec\u7acb\u7684 5000 \u5206\u7c7b\u5934\uff0c\u800c\u975e\u5171\u4eab\u8bcd\u8868\u7684\u7ed1\u5b9a\u5934\uff09",
+            "\ud83d\udd0c **\u4ec5\u4e3a\u53ef\u9009\u9879** \u2014 \u6a21\u578b\u81ea\u8eab\u7684\u89e3\u7801\u65f6\u65f6\u95f4\u6233\u4ecd\u662f\u9ed8\u8ba4\u503c\uff1b\u53ea\u6709\u8f6c\u5199\u8c03\u7528\u663e\u5f0f\u8981\u6c42 `aligned` \u65f6\u95f4\u6233\u65f6\u624d\u4f1a\u7528\u5230\u672c\u6a21\u578b\u5305\uff0c\u4e14\u53ef\u4e0e `--diarize` \u4e00\u6837\u8d70\u540c\u4e00\u5957 CLI \u540c\u610f\u5b89\u88c5\u6d41\u7a0b",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e GPU \u7684\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+          ]
+        }
+      },
+      "upstream_release_date": "2026-01-28",
+      "min_core_version": "0.1.9"
     },
     {
       "id": "moonshine-tiny",
