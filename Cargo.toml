@@ -3,6 +3,7 @@ members = [
     "crates/openasr-cli",
     "crates/openasr-client",
     "crates/openasr-core",
+    "crates/openasr-ffi",
     "crates/openasr-server",
     "crates/openasr-system-audio",
 ]

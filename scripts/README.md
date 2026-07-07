@@ -25,5 +25,15 @@ Local engineering scripts for validation and iteration.
 - `generate_longform_pause_probe.py`
   - Generate a deterministic longform pause probe from a local speech WAV — a
     test-data generator for longform planner validation.
+- `generate-ffi-header.sh`
+  - Regenerate `crates/openasr-ffi/include/openasr.h` from the `openasr-ffi`
+    Rust source via `cbindgen` (`--check` verifies the committed header is
+    current; used by the `xcframework` CI job). See `docs/SDK_IOS_MACOS.md`.
+- `build-xcframework.sh`
+  - Build `OpenASR.xcframework` (ios-arm64 / ios-arm64-simulator /
+    macos-arm64 slices) from `crates/openasr-ffi`, degrading gracefully to
+    whichever slices the host's Xcode install can actually produce. See
+    `docs/SDK_IOS_MACOS.md`.
+
 When adding new scripts, prefer ggml-compatible `.oasr` package assumptions and
 magic-led loader behavior (`GGUF` container for `.oasr` v1).
