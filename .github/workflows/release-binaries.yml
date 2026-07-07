@@ -14,9 +14,10 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout || 60 }}
-    # Experimental legs (currently the Windows CUDA variant, whose hosted
-    # toolchain story is still settling) may fail without failing the run;
-    # their archives simply drop out of the artifact set until they stabilize.
+    # Escape hatch for future legs whose toolchain story is still settling:
+    # mark them `experimental: true` and they may fail without failing the
+    # run (their archives simply drop out of the artifact set) until they
+    # prove green. Every current leg has, so none carry the flag today.
     continue-on-error: ${{ matrix.experimental || false }}
     # Distributed binaries must be portable. build.rs auto-enables GGML_NATIVE
     # (-march=native) when host==target on x86, which is correct for local
@@ -25,6 +26,9 @@ jobs:
     # users tune locally via --features native or OPENASR_GGML_NATIVE=1.
     env:
       OPENASR_GGML_NATIVE: "0"
+      # AMD HIP SDK "PRO Edition" silent-installer release train, matched to
+      # llama.cpp's current Windows HIP release job.
+      HIPSDK_INSTALLER_VERSION: 26.Q1
     strategy:
       fail-fast: false
       matrix:
@@ -33,11 +37,21 @@ jobs:
             target: x86_64-unknown-linux-gnu
             binary_name: openasr
             archive_ext: tar.gz
+          # Native arm64 GitHub-hosted runner (no cross-compile toolchain
+          # needed). Both llama.cpp and competing ASR releases ship a Linux
+          # arm64 build; this was our most visible gap.
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary_name: openasr
+            archive_ext: tar.gz
           - os: macos-15-intel
             target: x86_64-apple-darwin
             binary_name: openasr
             archive_ext: tar.gz
-          - os: macos-latest
+          # Pinned (not macos-latest, which migrates to macOS 26 from
+          # 2026-06-15): released binaries need a deterministic build
+          # environment that does not drift under the alias.
+          - os: macos-15
             target: aarch64-apple-darwin
             binary_name: openasr
             archive_ext: tar.gz
@@ -60,10 +74,51 @@ jobs:
             archive_ext: zip
             features: cuda
             timeout: 180
-            experimental: true
+          # AMD HIP variant. Builds openasr-core's default consumer RDNA2/3/
+          # 3.5/4 fat code object (gfx1030/31/32/35, gfx1100/01/02, gfx1150/
+          # 51, gfx1200/01; see hip_gpu_targets() in build.rs for provenance).
+          # HIP is statically linked (build.rs use_backend_dl is false for HIP),
+          # but still dynamically loads the ROCm runtime/BLAS DLLs staged
+          # below, so it cannot launch on this GPU-less, driver-less runner
+          # any more than the CUDA leg can; build + package only.
+          # Pinned to windows-2022 like llama.cpp's HIP release job:
+          # windows-latest's VS 2026 STL declares the C99 floating
+          # comparison macros (isgreater & co.) in a way ROCm clang's HIP
+          # wrapper headers cannot overload ("__device__ function cannot
+          # overload __host__ __device__ function" in __clang_hip_cmath.h),
+          # so the device compile only works against the VS 2022 STL.
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-hip
+            binary_name: openasr.exe
+            archive_ext: zip
+            features: hip
+            timeout: 240
+          # Linux GPU-feature variants, same rationale as the Windows ones
+          # above (no GPU on the hosted runner; build+package validated
+          # here, GPU inference validated on real hardware). Pinned to
+          # ubuntu-22.04 (not ubuntu-latest) so the LunarG/ROCm apt repos
+          # below target a codename known to exist in both.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu-vulkan
+            binary_name: openasr
+            archive_ext: tar.gz
+            features: vulkan
+            timeout: 90
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu-cuda
+            binary_name: openasr
+            archive_ext: tar.gz
+            features: cuda
+            timeout: 120
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu-rocm
+            binary_name: openasr
+            archive_ext: tar.gz
+            features: hip
+            timeout: 240
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -85,8 +140,52 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
 
-      - name: Install Vulkan SDK
-        if: matrix.features == 'vulkan'
+      - name: Install Linux Vulkan SDK
+        if: runner.os == 'Linux' && matrix.features == 'vulkan'
+        # LunarG's apt recipe for jammy (matches llama.cpp's ubuntu-22.04
+        # Vulkan release job). vulkan-sdk gives cmake's FindVulkan the
+        # loader/headers/glslc it needs; mesa-vulkan-drivers gives the
+        # llvmpipe software ICD, so the produced binary can actually launch
+        # and run CPU-emulated Vulkan on this GPU-less runner.
+        run: |
+          set -euo pipefail
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          sudo apt-get install -y vulkan-sdk mesa-vulkan-drivers
+
+      # The ROCm SDK plus the fat multi-gfx build overflow the hosted
+      # runner's disk (observed "No space left on device"); drop the
+      # preinstalled toolchains this job never touches first. Same action
+      # llama.cpp's ubuntu-rocm release job uses.
+      - name: Free up disk space
+        if: runner.os == 'Linux' && matrix.features == 'hip'
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+
+      - name: Install Linux ROCm/HIP SDK
+        if: runner.os == 'Linux' && matrix.features == 'hip'
+        # AMD's official apt repo (the recipe llama.cpp's ubuntu-22-rocm
+        # release job uses). rocm-hip-sdk provides hipcc/the HIP clang
+        # toolchain, rocBLAS, and hipBLAS; ROCM_PATH lets both cmake's
+        # FindHIP language support and openasr-core's build.rs
+        # hip_toolkit_path() locate it.
+        run: |
+          set -euo pipefail
+          sudo mkdir --parents --mode=0755 /etc/apt/keyrings
+          wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.1 jammy main" \
+            | sudo tee /etc/apt/sources.list.d/rocm.list
+          printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' \
+            | sudo tee /etc/apt/preferences.d/rocm-pin-600
+          sudo apt-get update -y
+          sudo apt-get install -y rocm-hip-sdk
+          echo "ROCM_PATH=/opt/rocm" >> "${GITHUB_ENV}"
+          echo "/opt/rocm/bin" >> "${GITHUB_PATH}"
+
+      - name: Install Windows Vulkan SDK
+        if: matrix.features == 'vulkan' && runner.os == 'Windows'
         shell: pwsh
         env:
           VULKAN_VERSION: 1.4.313.2
@@ -102,15 +201,73 @@ jobs:
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\Bin"
 
       - name: Ensure Ninja
-        if: matrix.features == 'vulkan' || matrix.features == 'cuda'
+        if: runner.os == 'Windows' && (matrix.features == 'vulkan' || matrix.features == 'cuda' || matrix.features == 'hip')
         shell: pwsh
-        # build.rs configures the Windows Vulkan/CUDA ggml build with -G Ninja.
+        # build.rs only forces the Ninja generator for Windows GPU-feature
+        # builds (Linux keeps cmake's default Unix Makefiles generator).
         run: |
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y }
           ninja --version
 
-      - name: Install CUDA toolkit
-        if: matrix.features == 'cuda'
+      - name: Cache AMD HIP SDK install
+        if: runner.os == 'Windows' && matrix.features == 'hip'
+        id: cache-hip-sdk
+        uses: actions/cache@v6
+        with:
+          path: C:\Program Files\AMD\ROCm
+          key: hip-sdk-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ runner.os }}
+
+      - name: Install AMD HIP SDK
+        if: runner.os == 'Windows' && matrix.features == 'hip' && steps.cache-hip-sdk.outputs.cache-hit != 'true'
+        shell: pwsh
+        # Same recipe llama.cpp's Windows HIP release job uses (no self-hosted
+        # runner needed): AMD publishes a silent installer for the consumer
+        # "PRO Edition" HIP SDK directly, so a GitHub-hosted windows-latest
+        # runner can provision it like any other toolchain.
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-$env:HIPSDK_INSTALLER_VERSION-Win11-For-HIP.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\rocm-install.exe"
+          $proc = Start-Process "$env:RUNNER_TEMP\rocm-install.exe" -ArgumentList '-install' -NoNewWindow -PassThru
+          if (-not $proc.WaitForExit(600000)) {
+            Write-Error "AMD HIP SDK installation timed out after 10 minutes."
+            $proc.Kill()
+            exit 1
+          }
+          if ($proc.ExitCode -ne 0) {
+            Write-Error "AMD HIP SDK installation failed with exit code $($proc.ExitCode)"
+            exit 1
+          }
+
+      - name: Resolve HIP SDK path
+        if: runner.os == 'Windows' && matrix.features == 'hip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $clang = Get-ChildItem 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | Select-Object -First 1
+          if (-not $clang) { Write-Error "AMD HIP SDK not found under C:\Program Files\AMD\ROCm"; exit 1 }
+          $hipRoot = $clang.Directory.Parent.FullName
+          & $clang.FullName --version
+          Add-Content $env:GITHUB_ENV "HIP_PATH=$hipRoot"
+          Add-Content $env:GITHUB_PATH "$hipRoot\bin"
+
+      - name: Install CUDA toolkit (Linux)
+        if: runner.os == 'Linux' && matrix.features == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "13.2.0"
+          method: network
+          # The Linux apt repo splits CUDA 13 differently from the Windows
+          # silent installer: nvvm is folded into cuda-nvcc, the CUB/Thrust
+          # headers live in cuda-cccl, cuBLAS is a lib* package (installed
+          # via non-cuda-sub-packages below), and the libcuda.so driver stub
+          # ggml-cuda's VMM path links against comes from cuda-driver-dev.
+          sub-packages: '["nvcc", "crt", "cudart", "cudart-dev", "cccl", "driver-dev"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+          use-github-cache: true
+
+      - name: Install CUDA toolkit (Windows)
+        if: runner.os == 'Windows' && matrix.features == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           # 13.x is the first CUDA line whose host_config.h accepts the VS
@@ -147,19 +304,24 @@ jobs:
         shell: bash
         run: cargo build --release -p openasr-cli ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
+      # Same GPU-less-runner caveat as the Windows CUDA/HIP legs: those two
+      # exes dlopen the CUDA/ROCm runtime at launch, which needs a real
+      # driver this runner does not have. The Vulkan exe launches fine via
+      # the llvmpipe software ICD installed above.
       - name: Smoke release binary
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.features != 'cuda' && matrix.features != 'hip'
         run: |
           ./target/release/openasr --version
           ./target/release/openasr --help
           ./target/release/openasr list
 
-      # The CUDA exe import-links nvcuda.dll, which only ships with an NVIDIA
-      # driver, so it cannot launch on this GPU-less runner: build + package
-      # only. The Vulkan exe resolves against the SDK loader installed above,
-      # so it launches and runs CPU paths here.
+      # The CUDA exe import-links nvcuda.dll (NVIDIA driver) and the HIP exe
+      # import-links amdhip64.dll (AMD driver), neither of which this GPU-less
+      # runner has, so those cannot launch here: build + package only. The
+      # Vulkan exe resolves against the SDK loader installed above, so it
+      # launches and runs CPU paths here.
       - name: Smoke release binary
-        if: runner.os == 'Windows' && matrix.features != 'cuda'
+        if: runner.os == 'Windows' && matrix.features != 'cuda' && matrix.features != 'hip'
         shell: pwsh
         run: |
           .\target\release\openasr.exe --version
@@ -168,7 +330,7 @@ jobs:
 
       - name: Restore model pack cache
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.openasr/models
           key: openasr-packs-whisper-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('model-registry/catalog.json') }}
@@ -198,6 +360,22 @@ jobs:
           dist_dir="dist/${archive}"
           mkdir -p "$dist_dir/docs"
           cp "target/release/${{ matrix.binary_name }}" "$dist_dir/"
+          if [ "${{ matrix.features }}" = "cuda" ]; then
+            # The CUDA exe dlopens the CUDA runtime; ship NVIDIA's
+            # redistributable runtime .so files so end users only need a
+            # GPU driver, not a CUDA toolkit install.
+            find "${CUDA_PATH}/lib64" -maxdepth 1 \( -name 'libcudart.so*' -o -name 'libcublas.so*' -o -name 'libcublasLt.so*' \) \
+              -exec cp {} "$dist_dir/" \;
+          fi
+          if [ "${{ matrix.features }}" = "hip" ]; then
+            # The HIP exe dlopens the ROCm runtime + rocBLAS; ship them (and
+            # rocBLAS's per-arch Tensile "library" dir, loaded at first
+            # matmul, not at launch) so end users only need a GPU driver,
+            # not the full ROCm SDK.
+            cp "${ROCM_PATH}"/lib/libamdhip64.so* "${ROCM_PATH}"/lib/libhipblas.so* "${ROCM_PATH}"/lib/librocblas.so* "$dist_dir/"
+            mkdir -p "$dist_dir/rocblas/library"
+            cp "${ROCM_PATH}"/lib/rocblas/library/* "$dist_dir/rocblas/library/"
+          fi
           cp README.md LICENSE "$dist_dir/"
           cp -R model-registry "$dist_dir/model-registry"
           cp docs/FAQ.md docs/KNOWN_LIMITATIONS.md "$dist_dir/docs/"
@@ -230,21 +408,42 @@ jobs:
             if (-not $cudaDlls) { Write-Error "no CUDA runtime DLLs found under $env:CUDA_PATH\bin" }
             $cudaDlls | Copy-Item -Destination "$distDir\"
           }
+          if ("${{ matrix.features }}" -eq "hip") {
+            # The HIP exe dynamically links the ROCm runtime + BLAS; ship AMD's
+            # redistributable DLLs (and rocBLAS's per-arch Tensile "library"
+            # dir it loads at runtime -- omitting it fails at first matmul,
+            # not at launch) so end users only need a GPU driver, not the HIP
+            # SDK. hipBLASLt is optional (only some archs/tunings dispatch to
+            # it); copy it too when the SDK ships it.
+            $hipBin = Join-Path $env:HIP_PATH "bin"
+            $hipDlls = Get-ChildItem $hipBin -File |
+              Where-Object { $_.Name -match '^(amdhip64|libhipblas|rocblas|libhipblaslt)(_\d+)?\.dll$' }
+            if (-not $hipDlls) { Write-Error "no HIP runtime DLLs found under $hipBin" }
+            $hipDlls | Copy-Item -Destination "$distDir\"
+            New-Item -ItemType Directory -Force -Path "$distDir\rocblas\library" | Out-Null
+            Copy-Item (Join-Path $hipBin "rocblas\library\*") "$distDir\rocblas\library\"
+            $hipbltLibrary = Join-Path $hipBin "hipblaslt\library"
+            if (Test-Path $hipbltLibrary) {
+              New-Item -ItemType Directory -Force -Path "$distDir\hipblaslt\library" | Out-Null
+              Copy-Item (Join-Path $hipbltLibrary "*") "$distDir\hipblaslt\library\"
+            }
+          }
           Copy-Item README.md,LICENSE "$distDir\"
           Copy-Item model-registry "$distDir\model-registry" -Recurse
           Copy-Item docs\FAQ.md,docs\KNOWN_LIMITATIONS.md "$distDir\docs\"
           # Smoke the binary from the staged dist dir (NOT target/release,
           # whose build.rs-seeded DLLs would mask a packaging gap), so a broken
-          # archive fails here before it ships. The CUDA exe cannot launch
-          # without an NVIDIA driver, so it is exempt (validated on hardware).
-          if ("${{ matrix.features }}" -ne "cuda") {
+          # archive fails here before it ships. The CUDA/HIP exes cannot
+          # launch without a matching GPU driver, so they are exempt
+          # (validated on hardware).
+          if ("${{ matrix.features }}" -ne "cuda" -and "${{ matrix.features }}" -ne "hip") {
             & "$distDir\${{ matrix.binary_name }}" --version
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
           Compress-Archive -Path "$distDir" -DestinationPath "dist\$archive.${{ matrix.archive_ext }}" -Force
 
       - name: Upload archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openasr-${{ matrix.target }}
           path: dist/openasr-${{ env.OPENASR_VERSION }}-${{ matrix.target }}.${{ matrix.archive_ext }}
@@ -259,7 +458,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: staging
           merge-multiple: true
@@ -272,7 +471,7 @@ jobs:
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
       - name: Upload SHA256SUMS
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SHA256SUMS
           path: dist/SHA256SUMS
