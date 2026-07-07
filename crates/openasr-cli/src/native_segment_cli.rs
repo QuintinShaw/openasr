@@ -321,14 +321,15 @@ pub(super) fn resolve_model_source_for_backend(
 }
 
 /// Resolves the installed `.oasr` pack for a model id (the resolved default when
-/// `model` is `None`). Never pulls: a missing model is a fail-closed error here.
-/// The CLI transcribe/live handlers ensure the pack is installed (consent-pull)
-/// before this runs; the server relies on this staying download-free.
-pub(super) fn resolve_installed_native_pack(
+/// `model` is `None`), or `Ok(None)` when no matching pack is installed yet (a
+/// normal state right after a fresh install, before the user has pulled any
+/// model). Genuine environment/registry errors (unreadable `OPENASR_HOME`,
+/// corrupt registry, ...) still return `Err`. Never pulls either way.
+fn resolve_installed_native_pack_opt(
     model: Option<&str>,
     config: &OpenAsrConfig,
     catalog: Option<&openasr_core::ModelCatalog>,
-) -> Result<PathBuf> {
+) -> Result<Option<PathBuf>> {
     let home = openasr_home()?;
     let model_ref = selected_model_ref(model, config, &[]);
     let packs = openasr_core::list_installed_packs(&home)?;
@@ -339,11 +340,26 @@ pub(super) fn resolve_installed_native_pack(
         host_profile: openasr_core::host_quant_recommendation_profile(),
     };
     match openasr_core::resolve_launch_pack(&packs, &request) {
-        Ok(selection) => Ok(selection.pack.path),
-        Err(_) => bail!(
-            "Model '{model_ref}' is not installed.\nRun: openasr pull {model_ref}\n(Or pass --model-pack <local.oasr> to run a specific local pack file.)"
-        ),
+        Ok(selection) => Ok(Some(selection.pack.path)),
+        Err(_) => Ok(None),
     }
+}
+
+/// Resolves the installed `.oasr` pack for a model id (the resolved default when
+/// `model` is `None`). Never pulls: a missing model is a fail-closed error here.
+/// The CLI transcribe/live handlers ensure the pack is installed (consent-pull)
+/// before this runs; the server relies on this staying download-free.
+pub(super) fn resolve_installed_native_pack(
+    model: Option<&str>,
+    config: &OpenAsrConfig,
+    catalog: Option<&openasr_core::ModelCatalog>,
+) -> Result<PathBuf> {
+    let model_ref = selected_model_ref(model, config, &[]);
+    resolve_installed_native_pack_opt(model, config, catalog)?.ok_or_else(|| {
+        anyhow!(
+            "Model '{model_ref}' is not installed.\nRun: openasr pull {model_ref}\n(Or pass --model-pack <local.oasr> to run a specific local pack file.)"
+        )
+    })
 }
 
 pub(super) fn prepare_backend_run(
@@ -366,6 +382,66 @@ pub(super) fn prepare_backend_run(
     })
 }
 
+/// Resolves the model source for `serve`. Unlike `resolve_model_source_for_backend`
+/// (used by `transcribe`/`live`, which run consent-pull first and so treat a
+/// missing pack as fatal), `serve` must come up with zero models installed --
+/// that is a normal post-install state, not a startup error. An explicit
+/// `--model-pack` escape hatch still fails closed if the path does not
+/// validate; only the "nothing installed yet" case degrades to no model bound,
+/// which `openasr-server` reports via `/health` and fails closed on a
+/// transcription request instead.
+pub(super) fn resolve_serve_model_source(
+    model: Option<&str>,
+    backend_kind: BackendKind,
+    model_pack: Option<&Path>,
+    config: &OpenAsrConfig,
+) -> Result<ResolvedModelSource> {
+    if backend_kind != BackendKind::Native {
+        return resolve_model_source_for_backend("serve", model, backend_kind, model_pack, config);
+    }
+    let catalog = load_cli_model_catalog(&openasr_home()?)?;
+    let model_pack_root = match model_pack {
+        Some(path) => Some(
+            validate_local_native_model_pack_path(path)
+                .map_err(|error| anyhow!("Native model-pack path rejected: {error}"))?,
+        ),
+        None => resolve_installed_native_pack_opt(model, config, catalog.as_ref())?,
+    };
+    let model_id = match &model_pack_root {
+        Some(_) => {
+            if let Some(model_ref) = model {
+                let normalized_model_ref = model_ref.trim();
+                parse_model_ref(normalized_model_ref).map_err(|error| {
+                    anyhow!(
+                        "Model '{model_ref}' is not a valid model id for native GGUF local-source serve: {error}"
+                    )
+                })?;
+                let cards = load_registry(default_registry_dir())
+                    .context("Could not load model registry")?;
+                match resolve_runtime_model_ref(&cards, catalog.as_ref(), normalized_model_ref) {
+                    Ok(resolved) => resolved.runtime_model_id,
+                    Err(error) if runtime_resolution_unknown_model(&error) => {
+                        normalized_model_ref.to_owned()
+                    }
+                    Err(error) => return Err(anyhow::anyhow!(error)),
+                }
+            } else {
+                NATIVE_RUNTIME_MODEL_ID_AUTO.to_string()
+            }
+        }
+        // No pack resolved: keep the requested model id (or the auto sentinel)
+        // around so the health/status payload can report which model, if any,
+        // was asked for.
+        None => model
+            .map(str::to_owned)
+            .unwrap_or_else(|| NATIVE_RUNTIME_MODEL_ID_AUTO.to_string()),
+    };
+    Ok(ResolvedModelSource {
+        model_id,
+        model_pack_path: model_pack_root,
+    })
+}
+
 pub(super) async fn serve(
     addr: SocketAddr,
     model: Option<&str>,
@@ -377,15 +453,11 @@ pub(super) async fn serve(
     let home = openasr_home()?;
     let config = load_config(&home)?;
     let backend = resolve_backend(backend_kind, &config)?;
-    let model_source =
-        resolve_model_source_for_backend("serve", model, backend, model_pack, &config)?;
-    if backend == BackendKind::Native {
-        let local_model_id = resolve_native_runtime_model_id_from_source(
-            model_source
-                .model_pack_path
-                .as_deref()
-                .expect("native source resolver checked above"),
-        )?;
+    let model_source = resolve_serve_model_source(model, backend, model_pack, &config)?;
+    if backend == BackendKind::Native
+        && let Some(model_pack_path) = model_source.model_pack_path.as_deref()
+    {
+        let local_model_id = resolve_native_runtime_model_id_from_source(model_pack_path)?;
         if let Some(model_ref) = model
             && model_source.model_id != local_model_id
         {
@@ -396,6 +468,10 @@ pub(super) async fn serve(
                 local_model_id
             );
         }
+    } else if backend == BackendKind::Native {
+        eprintln!(
+            "openasr-server: no installed native model pack found; starting with no model bound. Install one (openasr pull <model-id>) or install via the desktop model market; transcription requests will fail closed until then."
+        );
     }
     let ffmpeg_bin = resolve_ffmpeg_bin(runtime_paths.ffmpeg_bin.clone(), &config);
 
