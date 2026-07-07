@@ -201,9 +201,23 @@ pub fn convert_local_dolphin_wenet_source_to_runtime_pack(
     let mut tensors = build_runtime_tensors(&safetensors, request.quantization)?;
     tensors.push(build_mel_filterbank_tensor());
     // Synthesize the sinusoidal position table(s) the checkpoint itself did
-    // not bake as a state-dict buffer (the multilingual export computes them
-    // on the fly instead of storing them; see `sinusoidal_pos_table_max_ctx`).
-    if safetensors.tensor("encoder.embed.pos_enc.pe").is_none() {
+    // not bake as a state-dict buffer (see `sinusoidal_pos_table_max_ctx`).
+    // The encoder table is CnDialect-only: that family's WeNet-trained
+    // encoder attention consumes the simple non-centered `RelPositionalEncoding`
+    // sliced from this table (`encoder_graph::attention_branch`'s "sdpa fold, no
+    // rel_shift" path). The multilingual family's ESPnet-trained encoder uses
+    // `RelPositionalEncodingV1` instead -- a centered table ESPnet itself never
+    // bakes (computed fresh per forward call) -- so the runtime computes that
+    // one at graph-build time from the request's own frame count instead
+    // (`encoder_graph::dolphin_relative_positional_table`); baking a
+    // fixed-`max_ctx`-sized version of it here would be both wrong-shaped (this
+    // table's layout depends on the runtime frame count, not a fixed ceiling)
+    // and dead weight. The decoder's table is unaffected either way: both
+    // families' Transformer decoder uses the same plain absolute
+    // `PositionalEncoding`.
+    if request.language_scheme == DolphinLanguageScheme::CnDialect
+        && safetensors.tensor("encoder.embed.pos_enc.pe").is_none()
+    {
         tensors.push(synthesized_position_table_tensor(
             "encoder.embed.pos_enc.pe",
             architecture.encoder_d_model,

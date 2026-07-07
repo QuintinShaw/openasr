@@ -62,7 +62,22 @@ fn ggml_err(stage: &'static str) -> impl Fn(GgmlCpuGraphError) -> DolphinEncoder
     move |source| DolphinEncoderError::Ggml { stage, source }
 }
 
-/// Scalar/shape configuration for the Dolphin `small.cn` encoder.
+/// Scalar/shape configuration for the Dolphin encoder. `language_scheme`
+/// selects the encoder's relative-position-attention flavor, which differs
+/// between the two Dolphin training pipelines (confirmed by reading
+/// `DataoceanAI/Dolphin`'s own inference source, not assumed):
+///
+/// * [`DolphinLanguageScheme::CnDialect`] (`small.cn`/`cn-dialect-base`,
+///   WeNet-trained, `use_sdpa: true`): the simple non-centered
+///   `RelPositionalEncoding`, sliced `[0, frames)` from a baked/synthesized
+///   table, folded into the SDPA bias with **no `rel_shift`** (`pos_emb`
+///   length == `frames`) -- unchanged from before this scheme split existed.
+/// * [`DolphinLanguageScheme::Multilingual`] (`dolphin-small`/`dolphin-base`,
+///   ESPnet-trained, `use_sdpa: false`, `pos_enc_layer_type: rel_pos_v1`): the
+///   centered Transformer-XL `RelPositionalEncodingV1` (`2*frames-1` positions,
+///   `[frame-1 .. -(frame-1)]`), computed fresh per `frames` at graph-build
+///   time (see `dolphin_relative_positional_table`) and consumed through the
+///   real `rel_shift` (see `attention_branch`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DolphinEncoderConfig {
     pub d_model: usize,
@@ -75,9 +90,12 @@ pub(crate) struct DolphinEncoderConfig {
     pub num_blocks: usize,
     pub feature_dim: usize,
     /// Length of the sinusoidal position table baked into
-    /// `encoder.embed.pos_enc.pe` (`dolphin.encoder.max_ctx`).
+    /// `encoder.embed.pos_enc.pe` (`dolphin.encoder.max_ctx`). Only consulted
+    /// under [`DolphinLanguageScheme::CnDialect`]; the multilingual scheme
+    /// computes its rel-pos table fresh per request instead.
     pub max_positions: usize,
     pub layer_norm_epsilon: f32,
+    pub language_scheme: super::package_import::DolphinLanguageScheme,
 }
 
 impl DolphinEncoderConfig {
@@ -94,6 +112,7 @@ impl DolphinEncoderConfig {
             feature_dim: 80,
             max_positions: 5000,
             layer_norm_epsilon: 1e-5,
+            language_scheme: super::package_import::DolphinLanguageScheme::CnDialect,
         }
     }
 
@@ -102,9 +121,12 @@ impl DolphinEncoderConfig {
     /// through this same path). `layer_norm_epsilon` is not a per-checkpoint
     /// metadata key: every observed Dolphin/WeNet checkpoint uses the same
     /// `1e-5` LayerNorm epsilon, so it stays a fixed architecture constant
-    /// like `small_cn()`'s.
+    /// like `small_cn()`'s. `language_scheme` comes from the pack's
+    /// `dolphin.language.scheme` metadata (see `executor::run_dolphin_pipeline`),
+    /// same signal the decode-prefix builder and frontend already dispatch on.
     pub(crate) fn from_execution_metadata(
         metadata: &super::runtime_contract::DolphinExecutionMetadata,
+        language_scheme: super::package_import::DolphinLanguageScheme,
     ) -> Self {
         Self {
             d_model: metadata.encoder_d_model,
@@ -118,6 +140,7 @@ impl DolphinEncoderConfig {
             feature_dim: metadata.feature_dim,
             max_positions: metadata.encoder_max_ctx,
             layer_norm_epsilon: 1e-5,
+            language_scheme,
         }
     }
 }
@@ -190,8 +213,10 @@ struct EmbedWeights<'a> {
     conv1_b: GgmlCpuTensor<'a>,
     out_w: GgmlCpuTensor<'a>,
     out_b: GgmlCpuTensor<'a>,
-    /// `[d_model, frames]` slice of the shared sinusoidal position table.
-    pos_emb: GgmlCpuTensor<'a>,
+    // `pos_emb` moved out of `EmbedWeights`: its scheme-dependent shape/source
+    // (a baked-table slice for `CnDialect`, a graph-build-time-computed
+    // rel-pos-v1 table for `Multilingual`) is built directly in `encode()`
+    // instead, see `dolphin_relative_positional_table`.
 }
 
 struct BlockWeights<'a> {
@@ -370,7 +395,6 @@ fn build_embed_weights<'a, 'p>(
     graph: &GgmlCpuGraphBuilder<'a>,
     builder: &mut WeightBuilder<'a, 'p>,
     config: &DolphinEncoderConfig,
-    frames: usize,
 ) -> Result<EmbedWeights<'a>, DolphinEncoderError> {
     let d = config.d_model;
     let flat = d * subsample_width(config.feature_dim);
@@ -381,14 +405,36 @@ fn build_embed_weights<'a, 'p>(
         conv1_b: builder.w4(graph, "encoder.embed.conv.2.bias", 1, 1, d, 1)?,
         out_w: builder.w2(graph, "encoder.embed.out.0.weight", flat, d)?,
         out_b: builder.w1(graph, "encoder.embed.out.0.bias", d)?,
-        pos_emb: builder.pos_slice(
-            graph,
-            "encoder.embed.pos_enc.pe",
-            d,
-            frames,
-            config.max_positions,
-        )?,
     })
+}
+
+/// The centered Transformer-XL relative-position sinusoidal table ESPnet's
+/// `RelPositionalEncodingV1` computes fresh per forward call (never baked as a
+/// state-dict buffer): `2*frames-1` rows, position `frames-1` (row 0) down to
+/// `-(frames-1)` (last row) -- `pe_positive` (flipped) concatenated with
+/// `pe_negative[1:]` in the reference. Row-major `[position][d_model]`
+/// (d_model innermost), matching `pos_slice`'s baked-table layout so both
+/// schemes' `pos_emb` tensors share the same `[d_model, positions]` ggml
+/// binding convention downstream.
+fn dolphin_relative_positional_table(d_model: usize, frames: usize) -> Option<Vec<f32>> {
+    let n_positions = frames.checked_mul(2)?.checked_sub(1)?;
+    let total = n_positions.checked_mul(d_model)?;
+    let mut table = vec![0.0f32; total];
+    for position_idx in 0..n_positions {
+        let pos = (frames - 1) as f64 - position_idx as f64;
+        let row = &mut table[position_idx * d_model..(position_idx + 1) * d_model];
+        let mut i = 0;
+        while i < d_model {
+            let div_term = (-((i as f64) / (d_model as f64)) * 10000.0_f64.ln()).exp();
+            let angle = pos * div_term;
+            row[i] = angle.sin() as f32;
+            if i + 1 < d_model {
+                row[i + 1] = angle.cos() as f32;
+            }
+            i += 2;
+        }
+    }
+    Some(table)
 }
 
 fn build_block_weights<'a, 'p>(
@@ -540,10 +586,21 @@ fn feed_forward_half<'a>(
     )
 }
 
-/// The rel-pos global branch (WeNet `RelPositionMultiHeadedAttention` with
-/// `use_sdpa=true`): scores = `(q_u . k + q_v . p) / sqrt(head_dim)`, softmax,
-/// context. No `rel_shift` and `pos_emb` length == T because sdpa folds the bias
-/// straight into the scores; full-context single utterance so no mask term.
+/// The rel-pos global branch (`RelPositionMultiHeadedAttention`):
+/// scores = `(q_u . k + q_v . p) / sqrt(head_dim)`, softmax, context.
+///
+/// Two schemes, dispatched on `config.language_scheme` (see
+/// [`DolphinEncoderConfig`]'s doc comment):
+/// * `CnDialect` (`use_sdpa: true`): `pos_emb` length == `frames`, **no
+///   `rel_shift`** -- sdpa folds `matrix_bd` directly into the bias. Unchanged
+///   from the parity-verified small.cn path.
+/// * `Multilingual` (`use_sdpa: false`, `rel_pos_v1`): `pos_emb` length ==
+///   `2*frames-1` (centered), and `matrix_bd` goes through the real
+///   `rel_shift` (a strided `view_3d` reinterpretation, the same trick
+///   `nn::encoder::conformer_block` uses for cohere/parakeet's Transformer-XL
+///   rel-pos attention) before being added to `matrix_ac`.
+///
+/// Full-context single utterance either way, so no additive mask term.
 fn attention_branch<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     normed: GgmlCpuTensor<'a>,
@@ -599,10 +656,22 @@ fn attention_branch<'a>(
         reshape_steps,
         map_err,
     )?;
+    let is_multilingual = matches!(
+        config.language_scheme,
+        super::package_import::DolphinLanguageScheme::Multilingual
+    );
+    let pos_layout = if is_multilingual {
+        AttentionHeadLayout {
+            sequence_len: 2 * frames - 1,
+            ..layout
+        }
+    } else {
+        layout
+    };
     let p = reshape_projection_to_attention_heads(
         graph,
         p,
-        layout,
+        pos_layout,
         STANDARD_HEAD_PERMUTE_AXES,
         false,
         reshape_steps,
@@ -612,9 +681,47 @@ fn attention_branch<'a>(
     let ac = graph
         .mul_mat(graph.cont(k).map_err(map)?, q_u)
         .map_err(map)?;
-    let bd = graph
+    let bd_raw = graph
         .mul_mat(graph.cont(p).map_err(map)?, q_v)
         .map_err(map)?;
+    let bd = if is_multilingual {
+        // rel_shift: reinterpret `bd_raw` (`[2*frames-1, frames, heads]`) as
+        // `[frames, frames, heads]` via the classic pad+reshape+slice trick,
+        // done directly as a strided view (no extra copy) -- byte-identical
+        // stride formula to `nn::encoder::conformer_block`'s `bd` view.
+        let element = std::mem::size_of::<f32>();
+        let nb1 =
+            (2 * frames - 2)
+                .checked_mul(element)
+                .ok_or_else(|| DolphinEncoderError::Shape {
+                    reason: "rel_shift nb1 overflow".to_string(),
+                })?;
+        let nb2 = (2 * frames - 1)
+            .checked_mul(frames)
+            .and_then(|value| value.checked_mul(element))
+            .ok_or_else(|| DolphinEncoderError::Shape {
+                reason: "rel_shift nb2 overflow".to_string(),
+            })?;
+        let offset =
+            (frames - 1)
+                .checked_mul(element)
+                .ok_or_else(|| DolphinEncoderError::Shape {
+                    reason: "rel_shift offset overflow".to_string(),
+                })?;
+        graph
+            .view_3d(
+                bd_raw,
+                frames,
+                frames,
+                config.attention_heads,
+                nb1,
+                nb2,
+                offset,
+            )
+            .map_err(map)?
+    } else {
+        bd_raw
+    };
     let scores = graph.add(ac, bd).map_err(map)?;
     let scores = graph
         .scale(scores, 1.0 / (config.head_dim as f32).sqrt())
@@ -895,7 +1002,7 @@ pub(crate) fn encode(
 
     // Phase A: create every weight tensor (must precede the first buffer alloc).
     let mut builder = WeightBuilder::new(provider);
-    let embed = build_embed_weights(&graph, &mut builder, config, frames)?;
+    let embed = build_embed_weights(&graph, &mut builder, config)?;
     let mut blocks = Vec::with_capacity(config.num_blocks);
     for index in 0..config.num_blocks {
         blocks.push(build_block_weights(&graph, &mut builder, config, index)?);
@@ -907,6 +1014,39 @@ pub(crate) fn encode(
         blocks,
         after_norm_w,
         after_norm_b,
+    };
+
+    // The encoder's relative-position table: a baked-table slice for
+    // `CnDialect` (via the provider, like every other weight), or a table
+    // computed fresh for this request's `frames` for `Multilingual` (never
+    // baked -- see `dolphin_relative_positional_table`). The latter is
+    // uploaded like `input` below (an owned buffer kept alive for the whole
+    // call), not through `WeightBuilder` (which only holds provider-borrowed
+    // slices).
+    let is_multilingual = matches!(
+        config.language_scheme,
+        super::package_import::DolphinLanguageScheme::Multilingual
+    );
+    let mut computed_pos_table: Option<Vec<f32>> = None;
+    let pos_emb = if is_multilingual {
+        let table = dolphin_relative_positional_table(config.d_model, frames).ok_or_else(|| {
+            DolphinEncoderError::Shape {
+                reason: "relative position table size overflow".to_string(),
+            }
+        })?;
+        let tensor = graph
+            .new_tensor_2d_f32(config.d_model, 2 * frames - 1, "dolphin_rel_pos")
+            .map_err(ggml_err("weight_alloc_relpos"))?;
+        computed_pos_table = Some(table);
+        tensor
+    } else {
+        builder.pos_slice(
+            &graph,
+            "encoder.embed.pos_enc.pe",
+            config.d_model,
+            frames,
+            config.max_positions,
+        )?
     };
 
     let input = graph
@@ -925,14 +1065,7 @@ pub(crate) fn encode(
     taps.push(after_subsample);
     let mut hidden = after_subsample;
     for block in &weights.blocks {
-        hidden = encoder_block(
-            &mut graph,
-            hidden,
-            weights.embed.pos_emb,
-            block,
-            config,
-            frames,
-        )?;
+        hidden = encoder_block(&mut graph, hidden, pos_emb, block, config, frames)?;
         taps.push(hidden);
     }
     let encoder_out = affine_ln(
@@ -955,6 +1088,11 @@ pub(crate) fn encode(
     graph
         .set_f32_slice(input, features, "dolphin_features")
         .map_err(ggml_err("upload_features"))?;
+    if let Some(table) = &computed_pos_table {
+        graph
+            .set_f32_slice(pos_emb, table, "dolphin_rel_pos")
+            .map_err(ggml_err("upload_rel_pos"))?;
+    }
     for (tensor, data, name) in &builder.uploads {
         graph
             .set_f32_slice(*tensor, data, name)
@@ -984,4 +1122,62 @@ pub(crate) fn encode(
         blocks,
         encoder_out,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the centered Transformer-XL `RelPositionalEncodingV1` table's shape
+    /// and index direction (the multilingual dolphin encoder's only numeric
+    /// path with no weights-backed parity harness): `2*frames-1` rows running
+    /// from position `+(frames-1)` (row 0) down to `-(frames-1)` (last row),
+    /// the center row at `frames-1` being position 0, and rows symmetric about
+    /// that center differing only by `sin`'s sign (`cos` even). Catches an
+    /// off-by-one in the row/position mapping without loading a pack.
+    #[test]
+    fn relative_positional_table_is_centered_and_sign_symmetric() {
+        let d_model = 4usize;
+        let frames = 3usize;
+        let table = dolphin_relative_positional_table(d_model, frames).expect("table");
+        let n_positions = 2 * frames - 1; // 5
+        assert_eq!(table.len(), n_positions * d_model);
+
+        let row = |idx: usize| &table[idx * d_model..(idx + 1) * d_model];
+
+        // div_term for d_model=4: exp(0)=1 (pair 0), 10000^-0.5=0.01 (pair 1).
+        let expected_for_pos = |pos: f64| {
+            [
+                (pos * 1.0).sin() as f32,
+                (pos * 1.0).cos() as f32,
+                (pos * 0.01).sin() as f32,
+                (pos * 0.01).cos() as f32,
+            ]
+        };
+        // Row 0 is the most-positive position (frames-1 = 2), last row is -2.
+        for (bin, &expected) in expected_for_pos(2.0).iter().enumerate() {
+            assert!((row(0)[bin] - expected).abs() < 1.0e-6, "row0 bin{bin}");
+        }
+        // Center row (index frames-1 = 2) is position 0: sin=0, cos=1 per pair.
+        assert_eq!(row(frames - 1), &[0.0, 1.0, 0.0, 1.0]);
+        // Sign symmetry: row k and row (n_positions-1-k) hold opposite positions
+        // -- sin negated, cos preserved (off-by-one in the direction breaks this).
+        for k in 0..n_positions {
+            let mirror = n_positions - 1 - k;
+            let (a, b) = (row(k), row(mirror));
+            assert!((a[0] + b[0]).abs() < 1.0e-6, "sin pair0 antisymmetry k{k}");
+            assert!((a[1] - b[1]).abs() < 1.0e-6, "cos pair0 symmetry k{k}");
+            assert!((a[2] + b[2]).abs() < 1.0e-6, "sin pair1 antisymmetry k{k}");
+            assert!((a[3] - b[3]).abs() < 1.0e-6, "cos pair1 symmetry k{k}");
+        }
+    }
+
+    /// Odd `d_model` must still fill every row without indexing past the end
+    /// (the loop writes `row[i+1]` only when `i + 1 < d_model`).
+    #[test]
+    fn relative_positional_table_handles_odd_d_model() {
+        let table = dolphin_relative_positional_table(3, 2).expect("table");
+        assert_eq!(table.len(), (2 * 2 - 1) * 3);
+        assert!(table.iter().all(|v| v.is_finite()));
+    }
 }
