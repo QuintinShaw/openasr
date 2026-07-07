@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-06T20:24:09+00:00",
+  "generated_at": "2026-07-07T04:35:00+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -628,8 +628,8 @@
       "license_class": "permissive",
       "hf_repo": "OpenASR/dolphin-cn-dialect-base",
       "hf_revision": "e2996bbc639c4d4a16ca199cda934f7b54dcf476",
-      "public": false,
-      "min_cli_version": "0.1.0",
+      "public": true,
+      "min_cli_version": "0.1.8",
       "recommended_quant": "fp16",
       "pull_recommended": "dolphin-cn-dialect-base:fp16",
       "prose": {

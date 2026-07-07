@@ -153,11 +153,12 @@ min_core_version = "0.1.3"
 # region-prompt scheme (same 14 registered dialect codes), only the
 # encoder/decoder width shrinks (512 d_model / 8 heads / 2048 ffn / 6 layers vs
 # small's 768/12/3072/12, cross-checked against each checkpoint's train.yaml).
-# STAGED PRIVATE for now (release_public left unset/false): flip to public only
-# after explicit user go-ahead, mirroring dolphin-cn-dialect-small's own launch.
+# Flipped public 2026-07-07 on explicit user go-ahead, mirroring
+# dolphin-cn-dialect-small's own launch.
 ["dolphin-cn-dialect-base"]
 family = "dolphin"
 hf_repo = "OpenASR/dolphin-cn-dialect-base"
+release_public = true
 size = "base"
 registry_id = "dolphin-cn-dialect-base"
 display_name = "Dolphin CN-Dialect Base"
