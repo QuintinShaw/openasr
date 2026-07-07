@@ -65,6 +65,22 @@ pub(crate) const PARAKEET_CTC_DECODE_POLICY_ID: &str = "parakeet-ctc.greedy.ctc.
 pub(crate) const PARAKEET_CTC_RUNTIME_TENSOR_CONTRACT_ID: &str = "parakeet-ctc.runtime-tensors.v0";
 pub(crate) const PARAKEET_CTC_EXECUTOR_COMPONENT_ID: &str = "parakeet-ctc.ggml-executor.v0";
 
+// parakeet-tdt (FastConformer + Token-and-Duration Transducer, 25 European
+// languages). Component ids are defined ahead of the full descriptor entry
+// (the parakeet-ctc S2->S4 staging precedent): the importer writes them as
+// pack metadata; the descriptor + executor wiring lands with the executor.
+#[allow(dead_code)] // staged: consumed by the descriptor/executor stage
+pub(crate) const PARAKEET_TDT_GGML_ARCHITECTURE_ID: &str = "parakeet-fastconformer-tdt";
+#[allow(dead_code)] // staged: consumed by the descriptor/executor stage
+pub(crate) const PARAKEET_TDT_GGML_ADAPTER_ID: &str = "ggml-family-parakeet-tdt-runtime-v1";
+pub(crate) const PARAKEET_TDT_AUDIO_FRONTEND_ID: &str = "parakeet-tdt.logmel128.16khz.mono.v0";
+pub(crate) const PARAKEET_TDT_TOKENIZER_ID: &str = "parakeet-tdt.spm-bpe.v0";
+pub(crate) const PARAKEET_TDT_DECODE_POLICY_ID: &str = "parakeet-tdt.greedy.tdt.v0";
+#[allow(dead_code)] // staged: consumed by the descriptor/executor stage
+pub(crate) const PARAKEET_TDT_RUNTIME_TENSOR_CONTRACT_ID: &str = "parakeet-tdt.runtime-tensors.v0";
+#[allow(dead_code)] // staged: consumed by the descriptor/executor stage
+pub(crate) const PARAKEET_TDT_EXECUTOR_COMPONENT_ID: &str = "parakeet-tdt.ggml-executor.v0";
+
 // wav2vec2-ctc (facebook/wav2vec2-base-960h, raw-waveform CTC onboarding).
 pub(crate) const WAV2VEC2_CTC_GGML_ARCHITECTURE_ID: &str = "wav2vec2-ctc";
 pub(crate) const WAV2VEC2_CTC_GGML_ADAPTER_ID: &str = "ggml-family-wav2vec2-ctc-runtime-v1";
