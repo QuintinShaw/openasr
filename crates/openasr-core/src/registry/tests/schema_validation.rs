@@ -298,6 +298,7 @@ fn bundled_catalog_public_ids_match_current_signed_release_projection() {
         public_ids,
         vec![
             "cohere-transcribe-03-2026",
+            "dolphin-cn-dialect-base",
             "dolphin-cn-dialect-small",
             "hymt2-1.8b",
             "moonshine-tiny",
@@ -337,6 +338,7 @@ fn bundled_catalog_market_listed_ids_exclude_capability_packs() {
         market_ids,
         vec![
             "cohere-transcribe-03-2026",
+            "dolphin-cn-dialect-base",
             "dolphin-cn-dialect-small",
             "hymt2-1.8b",
             "moonshine-tiny",
