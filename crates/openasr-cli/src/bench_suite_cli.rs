@@ -23,8 +23,8 @@ use openasr_core::{
 
 use crate::cli_args::BenchSuiteCommandOptions;
 use crate::native_segment_cli::{
-    audio_preparation_options, configure_native_cpu_inference_threads, resolve_ffmpeg_bin,
-    transcribe_with_backend,
+    audio_preparation_options, configure_native_cpu_inference_threads, resolve_explicit_ffmpeg_bin,
+    resolve_ffmpeg_bin, transcribe_with_backend,
 };
 
 /// Marker prefixing the per-entry metrics JSON a child process emits on stdout,
@@ -47,6 +47,9 @@ pub(crate) fn bench_suite(options: BenchSuiteCommandOptions<'_>) -> Result<()> {
 
     let home = openasr_home()?;
     let app_config = load_config(&home)?;
+    let ffmpeg_bin_explicit =
+        resolve_explicit_ffmpeg_bin(options.runtime_paths.ffmpeg_bin.clone(), &app_config)
+            .is_some();
     let ffmpeg_bin = resolve_ffmpeg_bin(options.runtime_paths.ffmpeg_bin.clone(), &app_config);
 
     // Child mode (per-entry subprocess isolation): run exactly one entry in this
@@ -55,7 +58,13 @@ pub(crate) fn bench_suite(options: BenchSuiteCommandOptions<'_>) -> Result<()> {
     // only way to get an uncontaminated peak RSS (the parent's sequential
     // in-process loop made every entry inherit the largest earlier entry's peak).
     if let Some(entry_id) = options.run_single_entry {
-        return run_single_entry_child(&config, entry_id, ffmpeg_bin, options.runs);
+        return run_single_entry_child(
+            &config,
+            entry_id,
+            ffmpeg_bin,
+            ffmpeg_bin_explicit,
+            options.runs,
+        );
     }
 
     let mut metrics = Vec::new();
@@ -153,6 +162,7 @@ fn bench_execution_target() -> Option<ExecutionTarget> {
 fn run_entry(
     entry: &SuiteEntry,
     ffmpeg_bin: Option<PathBuf>,
+    ffmpeg_bin_explicit: bool,
     runs: usize,
 ) -> Result<Option<SuiteEntryMetrics>> {
     if !entry.pack_path.exists() {
@@ -169,7 +179,7 @@ fn run_entry(
 
     let prepared = prepare_audio_input(
         &entry.audio_path,
-        &audio_preparation_options(BackendKind::Native, ffmpeg_bin),
+        &audio_preparation_options(BackendKind::Native, ffmpeg_bin, ffmpeg_bin_explicit),
     )
     .with_context(|| format!("Could not prepare audio: {}", entry.audio_path.display()))?;
 
@@ -288,6 +298,7 @@ fn run_single_entry_child(
     config: &SuiteConfig,
     entry_id: &str,
     ffmpeg_bin: Option<PathBuf>,
+    ffmpeg_bin_explicit: bool,
     runs: usize,
 ) -> Result<()> {
     let entry = config
@@ -295,7 +306,7 @@ fn run_single_entry_child(
         .iter()
         .find(|entry| entry.id == entry_id)
         .ok_or_else(|| anyhow::anyhow!("unknown suite entry id '{entry_id}'"))?;
-    let measured = run_entry(entry, ffmpeg_bin, runs)
+    let measured = run_entry(entry, ffmpeg_bin, ffmpeg_bin_explicit, runs)
         .with_context(|| format!("Suite entry '{}' failed", entry.id))?;
     let envelope = serde_json::json!({
         "schema_version": BENCH_ENTRY_IPC_SCHEMA_VERSION,

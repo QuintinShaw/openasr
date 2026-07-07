@@ -1749,6 +1749,7 @@ async fn native_realtime_server_smoke_with_real_qwen_pack() {
     let runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
     };
     let mut session = WsSession::new(runtime, test_distribution(), event_sender);
@@ -2129,6 +2130,7 @@ async fn session_capabilities_event_reports_frame_sync_only_for_xasr_zipformer()
     let xasr_runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(xasr_path),
     };
     let (xasr_event_sender, mut xasr_event_receiver) = mpsc::channel(8);
@@ -2147,6 +2149,7 @@ async fn session_capabilities_event_reports_frame_sync_only_for_xasr_zipformer()
     let qwen_runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(qwen_path),
     };
     let (qwen_event_sender, mut qwen_event_receiver) = mpsc::channel(8);
@@ -2409,6 +2412,7 @@ async fn session_start_rejects_xasr_hotwords_from_active_native_capabilities() {
     let runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
     };
     let (event_sender, mut event_receiver) = mpsc::channel(8);
@@ -2450,6 +2454,7 @@ async fn session_start_accepts_hotwords_for_supporting_native_model() {
     let runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
     };
     let (event_sender, _event_receiver) = mpsc::channel(8);
@@ -2488,6 +2493,7 @@ async fn native_streaming_configured_event_preserves_diarize_request() {
     let runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
     };
     let (event_sender, mut event_receiver) = mpsc::channel(8);

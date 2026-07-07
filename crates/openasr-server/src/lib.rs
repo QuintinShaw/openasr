@@ -749,6 +749,11 @@ fn resolve_instance_token(launch_option: Option<String>) -> Option<String> {
 pub struct ServerRuntime {
     pub backend: BackendKind,
     pub ffmpeg_bin: Option<std::path::PathBuf>,
+    /// Whether `ffmpeg_bin` came from an explicit operator choice (CLI flag,
+    /// env var, or config) rather than PATH auto-discovery -- see
+    /// `AudioPreparationOptions::with_ffmpeg_bin_explicit`. Only an explicit
+    /// choice skips the in-process symphonia decode path.
+    pub ffmpeg_bin_explicit: bool,
     pub model_pack_path: Option<std::path::PathBuf>,
 }
 
@@ -757,6 +762,7 @@ impl Default for ServerRuntime {
         Self {
             backend: BackendKind::Mock,
             ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
             model_pack_path: None,
         }
     }
