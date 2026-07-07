@@ -236,10 +236,10 @@ pub use models::{
 pub use output::{OutputWriteError, atomic_write_text};
 pub use pull::{
     BackendFileFormat, DefaultPackPointer, InstalledBackend, InstalledPack, PullError,
-    PullModelPackRequest, PullProgress, default_pack_pointer_path, install_backend_pack,
-    install_catalog_model_pack_from_path, install_model_pack_from_path, list_installed_packs,
-    persist_default_pack_pointer, pull_model_pack, read_default_pack_pointer, remove_model_pack,
-    resolve_installed_pack_path, resolve_installed_pack_reference,
+    PullModelPackRequest, PullProgress, available_disk_space_bytes, default_pack_pointer_path,
+    install_backend_pack, install_catalog_model_pack_from_path, install_model_pack_from_path,
+    list_installed_packs, persist_default_pack_pointer, pull_model_pack, read_default_pack_pointer,
+    remove_model_pack, resolve_installed_pack_path, resolve_installed_pack_reference,
     resolve_installed_pack_reference_with_catalog,
 };
 pub use realtime::{

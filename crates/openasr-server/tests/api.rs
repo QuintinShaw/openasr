@@ -2973,11 +2973,46 @@ async fn transcriptions_accept_filename_with_cjk_characters_and_space() {
     );
 }
 
-/// An upload past the server's body-size ceiling must fail with a clear,
-/// actionable "file too large" message and 413, not the generic "Error
-/// parsing `multipart/form-data` request" text that `MultipartError`'s
-/// `Display` renders for every underlying `multer` failure (including this
-/// one) -- see `multipart_error_message` in `lib.rs`.
+/// Regression guard for the real-world report this change fixes: a meeting
+/// recording just over the *old* 64 MB ceiling used to fail with 413 even
+/// though the daemon could transcribe it fine. The `file` field now streams
+/// straight to disk (see `write_upload_temp_file_streaming` in
+/// `routes/transcription.rs`), so a 65 MB upload must succeed end to end.
+#[tokio::test]
+async fn transcriptions_accept_upload_past_old_64mb_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+        },
+    );
+    let past_old_limit = vec![0u8; 65 * 1024 * 1024];
+    let request = multipart_request("whisper-large-v3-turbo", "meeting.wav", &past_old_limit);
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        parsed["text"]
+            .as_str()
+            .unwrap()
+            .contains("OpenASR mock transcription"),
+        "expected a successful mock transcription, got: {parsed}"
+    );
+}
+
+/// An upload past the server's (now multi-gigabyte) body-size ceiling must
+/// still fail closed with a clear, actionable "file too large" message and
+/// 413, not the generic "Error parsing `multipart/form-data` request" text
+/// that `MultipartError`'s `Display` renders for every underlying `multer`
+/// failure (including this one) -- see `multipart_error_message` in
+/// `lib.rs`. The request body below is built from a handful of cheap
+/// `Bytes` clones (refcount bumps, not copies) streamed past the ceiling, so
+/// exercising the real multi-gigabyte limit doesn't require the test itself
+/// to hold multiple gigabytes in memory.
 #[tokio::test]
 async fn transcriptions_reject_upload_past_body_limit_with_clear_message() {
     let temp = tempfile::tempdir().unwrap();
@@ -2988,8 +3023,11 @@ async fn transcriptions_reject_upload_past_body_limit_with_clear_message() {
             catalog_url: None,
         },
     );
-    let oversized = vec![0u8; 65 * 1024 * 1024];
-    let request = multipart_request("whisper-large-v3-turbo", "huge.wav", &oversized);
+    // Mirrors `MAX_TRANSCRIPTION_UPLOAD_BYTES` in `lib.rs`; kept in sync by
+    // hand since it's a private constant of the crate under test (same
+    // convention the old 64 MB-scaled test above used).
+    const CEILING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    let request = oversized_streaming_multipart_request(CEILING_BYTES + 8 * 1024 * 1024);
     let response = app.oneshot(request).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -2998,9 +3036,184 @@ async fn transcriptions_reject_upload_past_body_limit_with_clear_message() {
     let message = parsed["error"]["message"].as_str().unwrap();
     assert!(message.contains("too large"), "message was: {message}");
     assert!(
+        message.contains("GB"),
+        "message should cite the new GB-scale ceiling, not the old MB one: {message}"
+    );
+    assert!(
         !message.contains("Error parsing"),
         "message regressed to the generic multipart error text: {message}"
     );
+}
+
+/// Builds a `/v1/audio/transcriptions` request whose `file` field streams
+/// `total_file_bytes` of zeroed content without ever materializing that much
+/// memory in the test process: the chunk is a single `Bytes` allocation,
+/// cloned (cheap, `Arc`-backed) for every repetition.
+fn oversized_streaming_multipart_request(total_file_bytes: u64) -> Request<Body> {
+    let boundary = "openasr-oversize-boundary";
+    let preamble = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"huge.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+    );
+
+    const CHUNK_BYTES: usize = 4 * 1024 * 1024;
+    let chunk = axum::body::Bytes::from(vec![0u8; CHUNK_BYTES]);
+    let chunk_count = (total_file_bytes / CHUNK_BYTES as u64) as usize + 1;
+
+    let head = futures_util::stream::once(async move {
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(preamble.into_bytes()))
+    });
+    let tail = futures_util::stream::iter(std::iter::repeat_n(chunk, chunk_count))
+        .map(Ok::<_, std::io::Error>)
+        .then(yield_between_chunks);
+    let body = Body::from_stream(head.chain(tail));
+
+    Request::builder()
+        .method("POST")
+        .uri("/v1/audio/transcriptions")
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .unwrap()
+}
+
+/// Real-world evidence that the upload path no longer buffers the whole
+/// file in memory: a 200 MB upload's resident-set growth must stay far
+/// below the file size, at roughly the same order of magnitude as a 1 MB
+/// upload's. Before this change, `field.bytes()` held the entire multipart
+/// field in memory, so this delta tracked file size almost 1:1.
+///
+/// This drives the *actual* running process (via `oneshot`, same process as
+/// the test) with a body streamed from cheap `Bytes` clones -- so the input
+/// construction itself doesn't add O(file) memory that would muddy the
+/// measurement -- and samples RSS with `ps`, which is available in this
+/// project's macOS and Linux CI targets.
+#[tokio::test]
+async fn transcriptions_large_upload_memory_stays_bounded() {
+    let temp = tempfile::tempdir().unwrap();
+    let build_app = || {
+        openasr_server::app_with_runtime_and_distribution(
+            openasr_server::ServerRuntime::default(),
+            openasr_server::DistributionRuntime {
+                openasr_home: Some(temp.path().join("home")),
+                catalog_url: None,
+            },
+        )
+    };
+    const SMALL_FILE_BYTES: u64 = 1024 * 1024;
+    const LARGE_FILE_BYTES: u64 = 200 * 1024 * 1024;
+
+    // Warm up allocator/paging so the first request's one-time setup costs
+    // don't get counted as part of either delta below.
+    let warmup = multipart_request(
+        "whisper-large-v3-turbo",
+        "warm.wav",
+        &vec![0u8; SMALL_FILE_BYTES as usize],
+    );
+    let response = build_app().oneshot(warmup).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let baseline_rss_kb = process_rss_kb();
+    let small = multipart_request(
+        "whisper-large-v3-turbo",
+        "small.wav",
+        &vec![0u8; SMALL_FILE_BYTES as usize],
+    );
+    let response = build_app().oneshot(small).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let after_small_rss_kb = process_rss_kb();
+
+    let large = streamed_zero_multipart_request(LARGE_FILE_BYTES);
+    let response = build_app().oneshot(large).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let after_large_rss_kb = process_rss_kb();
+
+    let small_delta_kb = after_small_rss_kb.saturating_sub(baseline_rss_kb);
+    let large_delta_kb = after_large_rss_kb.saturating_sub(after_small_rss_kb);
+    let large_file_kb = LARGE_FILE_BYTES / 1024;
+
+    // Generous ceiling (half the file size) to avoid flakiness from
+    // allocator/page-cache noise, while still failing hard if the upload
+    // path regresses back to buffering the whole file: full buffering would
+    // put `large_delta_kb` within shouting distance of `large_file_kb`.
+    assert!(
+        large_delta_kb < large_file_kb / 2,
+        "RSS grew by {large_delta_kb} KB for a {large_file_kb} KB upload \
+         (small-file baseline delta was {small_delta_kb} KB) -- looks like \
+         the upload is being buffered in memory again"
+    );
+}
+
+fn process_rss_kb() -> u64 {
+    let pid = std::process::id().to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+        .expect("`ps` should be available to sample this test process's RSS");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|error| panic!("could not parse `ps -o rss=` output: {error}"))
+}
+
+/// Builds a request that streams `total_file_bytes` of zeroed content as a
+/// well-formed, successfully-parseable multipart body (unlike
+/// `oversized_streaming_multipart_request`, which is truncated because the
+/// server is expected to reject it before the body ends).
+fn streamed_zero_multipart_request(total_file_bytes: u64) -> Request<Body> {
+    let boundary = "openasr-stream-boundary";
+    let preamble = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"large.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+    );
+    let trailer = format!(
+        "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n--{boundary}--\r\n"
+    );
+
+    const CHUNK_BYTES: usize = 64 * 1024;
+    let chunk = axum::body::Bytes::from(vec![0u8; CHUNK_BYTES]);
+    let full_chunks = (total_file_bytes / CHUNK_BYTES as u64) as usize;
+
+    let head = futures_util::stream::once(async move {
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(preamble.into_bytes()))
+    });
+    let body_chunks = futures_util::stream::iter(std::iter::repeat_n(chunk, full_chunks))
+        .map(Ok::<_, std::io::Error>)
+        .then(yield_between_chunks);
+    let tail = futures_util::stream::once(async move {
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(trailer.into_bytes()))
+    });
+    let body = Body::from_stream(head.chain(body_chunks).chain(tail));
+
+    Request::builder()
+        .method("POST")
+        .uri("/v1/audio/transcriptions")
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .unwrap()
+}
+
+/// Inserts a real async yield point between streamed body chunks.
+///
+/// Without this, `futures_util::stream::iter` resolves every poll
+/// immediately (`Poll::Ready`, never `Poll::Pending`), which is *not* how a
+/// real network body behaves -- a real client's bytes arrive as separate
+/// TCP reads with actual `Pending` gaps in between, and that backpressure is
+/// exactly what makes `multer`'s field-parsing loop hand back a chunk as
+/// soon as one is available instead of draining the whole stream in one
+/// synchronous sweep. Skipping this made an earlier version of the
+/// large-upload memory test below spuriously "prove" the upload was fully
+/// buffered (`field.chunk()` returned the *entire* file as a single chunk)
+/// even though the real server, driven by a real socket, streams correctly.
+async fn yield_between_chunks(
+    item: Result<axum::body::Bytes, std::io::Error>,
+) -> Result<axum::body::Bytes, std::io::Error> {
+    tokio::task::yield_now().await;
+    item
 }
 
 #[tokio::test]

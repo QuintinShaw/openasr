@@ -312,8 +312,7 @@ impl TranscriptionRequestBuilder {
                     .as_deref()
                     .and_then(safe_extension_suffix)
                     .unwrap_or_default();
-                let bytes = field.bytes().await.map_err(ApiError::Multipart)?;
-                self.uploaded_file = Some(write_upload_temp_file(&bytes, &suffix)?);
+                self.uploaded_file = Some(write_upload_temp_file_streaming(field, &suffix).await?);
             }
             "model" => {
                 self.model = Some(field.text().await.map_err(ApiError::Multipart)?);
@@ -1111,6 +1110,69 @@ pub(crate) fn write_upload_temp_file(
     Ok(file.into_temp_path())
 }
 
+/// Streams a multipart `file` field straight to a temp file, one chunk at a
+/// time, instead of buffering the whole upload in memory first. This is what
+/// lets `/v1/audio/transcriptions` accept multi-gigabyte recordings under
+/// `MAX_TRANSCRIPTION_UPLOAD_BYTES` with O(chunk) memory instead of O(file):
+/// the previous `field.bytes()` path held the entire upload in a `Bytes`
+/// buffer before ever touching disk.
+pub(crate) async fn write_upload_temp_file_streaming(
+    mut field: Field<'_>,
+    suffix: &str,
+) -> Result<tempfile::TempPath, ApiError> {
+    let mut file = tempfile::Builder::new()
+        .prefix("openasr-upload-")
+        .suffix(suffix)
+        .tempfile()
+        .map_err(ApiError::TempFile)?;
+    let temp_dir = file.path().parent().map(Path::to_path_buf);
+
+    // Preflight: fail closed before writing a single byte if the temp
+    // volume is already below the headroom floor.
+    check_temp_dir_headroom(temp_dir.as_deref())?;
+
+    let mut since_last_check: u64 = 0;
+    while let Some(chunk) = field.chunk().await.map_err(ApiError::Multipart)? {
+        since_last_check = since_last_check.saturating_add(chunk.len() as u64);
+        if since_last_check >= DISK_SPACE_CHECK_INTERVAL_BYTES {
+            since_last_check = 0;
+            check_temp_dir_headroom(temp_dir.as_deref())?;
+        }
+        file.write_all(&chunk).map_err(ApiError::TempFile)?;
+    }
+    file.flush().map_err(ApiError::TempFile)?;
+    Ok(file.into_temp_path())
+}
+
+/// Fails closed with a 507 if the temp directory's volume has dropped below
+/// [`MIN_FREE_DISK_HEADROOM_BYTES`] free. `None` (probe unsupported on this
+/// platform, or no temp dir to check) stays permissive, matching how
+/// `pull.rs`'s `ensure_available_space` treats an unknown probe.
+fn check_temp_dir_headroom(temp_dir: Option<&Path>) -> Result<(), ApiError> {
+    let Some(dir) = temp_dir else {
+        return Ok(());
+    };
+    check_disk_headroom_bytes(openasr_core::available_disk_space_bytes(dir), dir)
+}
+
+/// Pure decision function split out from `check_temp_dir_headroom` so the
+/// insufficient-space branch can be unit tested by injecting an `available_bytes`
+/// value directly, without needing to actually fill a disk.
+fn check_disk_headroom_bytes(available_bytes: Option<u64>, dir: &Path) -> Result<(), ApiError> {
+    match available_bytes {
+        Some(available) if available < MIN_FREE_DISK_HEADROOM_BYTES => {
+            Err(ApiError::InsufficientDiskSpace(format!(
+                "Not enough free disk space to receive this upload: {} MB free in '{}', \
+                 need at least {} MB headroom. Free up space on that volume and retry.",
+                available / (1024 * 1024),
+                dir.display(),
+                MIN_FREE_DISK_HEADROOM_BYTES / (1024 * 1024),
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn safe_extension_suffix(file_name: &str) -> Option<String> {
     let extension = std::path::Path::new(file_name)
         .file_name()
@@ -1131,8 +1193,8 @@ mod native_runtime_tests {
     use std::fs;
 
     use super::{
-        native_asr_error_to_backend, parse_bool_field, safe_extension_suffix,
-        write_upload_temp_file,
+        check_disk_headroom_bytes, native_asr_error_to_backend, parse_bool_field,
+        safe_extension_suffix, write_upload_temp_file,
     };
 
     #[test]
@@ -1223,6 +1285,37 @@ mod native_runtime_tests {
             }
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    // Disk-headroom checks below inject `available_bytes` directly (rather
+    // than filling a real disk) per `check_disk_headroom_bytes`'s doc comment.
+
+    #[test]
+    fn disk_headroom_check_fails_closed_when_available_space_is_below_the_floor() {
+        let dir = std::path::Path::new("/tmp/openasr-upload-test");
+        let error = check_disk_headroom_bytes(Some(1024), dir).unwrap_err();
+
+        match error {
+            super::ApiError::InsufficientDiskSpace(message) => {
+                assert!(message.contains("Not enough free disk space"), "{message}");
+                assert!(message.contains("/tmp/openasr-upload-test"), "{message}");
+            }
+            other => panic!("expected InsufficientDiskSpace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disk_headroom_check_passes_when_available_space_is_ample() {
+        let dir = std::path::Path::new("/tmp/openasr-upload-test");
+        assert!(check_disk_headroom_bytes(Some(64 * 1024 * 1024 * 1024), dir).is_ok());
+    }
+
+    #[test]
+    fn disk_headroom_check_stays_permissive_when_probe_is_unsupported() {
+        // `None` means the platform/probe couldn't tell -- must not block
+        // uploads on that basis, matching pull.rs's `ensure_available_space`.
+        let dir = std::path::Path::new("/tmp/openasr-upload-test");
+        assert!(check_disk_headroom_bytes(None, dir).is_ok());
     }
 }
 
