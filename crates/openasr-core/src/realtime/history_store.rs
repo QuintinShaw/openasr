@@ -58,6 +58,11 @@ use thiserror::Error;
 
 use crate::ResponseFormat;
 
+/// Guards the one-time-per-database WAL switch and schema creation in
+/// [`DaemonHistoryStore::connection`]. See that method for why this can't
+/// rely on `busy_timeout` alone.
+static CONNECTION_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DaemonHistoryKind {
@@ -445,6 +450,10 @@ impl DaemonHistoryStore {
         })
     }
 
+    /// Serializes the one-time-per-`history.db` WAL switch and schema
+    /// creation performed in [`Self::connection`] across all connections
+    /// opened by this process. See the comment at the lock's call site for
+    /// why this needs its own guard instead of relying on `busy_timeout`.
     fn connection(&self) -> Result<Connection, DaemonHistoryStoreError> {
         std::fs::create_dir_all(&self.root).map_err(|source| {
             DaemonHistoryStoreError::CreateDir {
@@ -465,7 +474,25 @@ impl DaemonHistoryStore {
             })?;
         // WAL lets concurrent readers proceed alongside a writer; the daemon
         // opens a fresh connection per call, so file-level locking (not an
-        // in-process mutex) is what serializes writers across requests.
+        // in-process mutex) is what serializes writers across requests once
+        // the database is already in WAL mode.
+        //
+        // The *first* switch from the default rollback-journal into WAL mode
+        // needs a brief exclusive lock to rewrite the file header, and that
+        // specific lock acquisition does not go through the normal
+        // busy-handler retry loop `busy_timeout` installs (that loop covers
+        // ordinary step-time lock contention, not this one-time schema-level
+        // transition) -- so concurrent first-time callers can observe an
+        // immediate `SQLITE_BUSY` here instead of a patient wait. The schema
+        // DDL right below has the same shape (CREATE TABLE/VIRTUAL TABLE IF
+        // NOT EXISTS still touches the schema even when it is a no-op). Both
+        // only matter once, on first use of a given `history.db`; serialize
+        // them with an in-process mutex so at most one thread performs the
+        // WAL switch/schema creation at a time instead of racing SQLite's
+        // exclusive lock for it.
+        let _setup_guard = CONNECTION_SETUP_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|source| DaemonHistoryStoreError::OpenDatabase {
                 path: path.clone(),
@@ -475,6 +502,7 @@ impl DaemonHistoryStore {
             path: path.clone(),
             source,
         })?;
+        drop(_setup_guard);
         Ok(conn)
     }
 
