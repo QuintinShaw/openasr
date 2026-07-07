@@ -2,8 +2,12 @@ use std::path::{Path, PathBuf};
 
 use crate::BackendKind;
 
+// `qta` is macOS QuickTime Player's audio recording extension -- a MOV
+// container (ffmpeg's `mov,mp4,m4a,3gp,3g2,mj2` demuxer probes and decodes it
+// like any other MOV/M4A file, no special handling needed beyond recognizing
+// the extension).
 pub(crate) const RECOGNIZED_EXTENSIONS: &[&str] =
-    &["wav", "mp3", "mp4", "m4a", "webm", "flac", "ogg"];
+    &["wav", "mp3", "mp4", "m4a", "webm", "flac", "ogg", "qta"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioInputInfo {

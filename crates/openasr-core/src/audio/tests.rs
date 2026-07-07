@@ -34,6 +34,19 @@ fn unknown_extension_is_marked_but_does_not_error() {
 }
 
 #[test]
+fn qta_extension_is_recognized() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("voice memo.qta");
+    fs::write(&input, b"not a real mov").unwrap();
+
+    let info = probe_audio_input(&input).unwrap();
+
+    assert_eq!(info.extension.as_deref(), Some("qta"));
+    assert!(info.recognized_extension);
+    assert!(info.issues.is_empty());
+}
+
+#[test]
 fn missing_file_errors() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("missing.wav");
@@ -174,6 +187,29 @@ fn native_non_wav_conversion_mode_requires_ffmpeg_when_enabled() {
     )
     .unwrap_err();
 
+    assert!(matches!(
+        error,
+        AudioPreparationError::MissingFfmpeg {
+            backend: BackendKind::Native
+        }
+    ));
+}
+
+#[test]
+fn native_qta_input_is_recognized_and_reaches_ffmpeg_conversion() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("sample.qta");
+    fs::write(&input, b"mock bytes").unwrap();
+
+    let error = prepare_audio_input(
+        &input,
+        &AudioPreparationOptions::new(BackendKind::Native).with_native_non_wav_conversion(true),
+    )
+    .unwrap_err();
+
+    // A `.qta` file must reach the ffmpeg conversion step (and fail only
+    // because no ffmpeg binary is configured in this test), not get rejected
+    // upfront as an unrecognized extension.
     assert!(matches!(
         error,
         AudioPreparationError::MissingFfmpeg {

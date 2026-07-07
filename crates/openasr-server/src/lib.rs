@@ -1516,7 +1516,7 @@ impl std::fmt::Display for ApiError {
             Self::History(error) => write!(f, "Could not update transcription history: {error}"),
             Self::JobStore(message) => f.write_str(message),
             Self::MultipartRejection(error) => write!(f, "Could not read multipart form: {error}"),
-            Self::Multipart(error) => write!(f, "Could not read multipart form: {error}"),
+            Self::Multipart(error) => write!(f, "{}", multipart_error_message(error)),
             Self::AudioPreparation(error) => {
                 write!(
                     f,
@@ -1591,10 +1591,11 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST,
                 format!("Could not read multipart form: {error}"),
             ),
-            Self::Multipart(error) => (
-                StatusCode::BAD_REQUEST,
-                format!("Could not read multipart form: {error}"),
-            ),
+            Self::Multipart(error) => {
+                let status = error.status();
+                let message = multipart_error_message(&error);
+                (status, message)
+            }
             Self::AudioPreparation(error) => (
                 StatusCode::BAD_REQUEST,
                 format!("Could not prepare uploaded audio for transcription: {error}"),
@@ -1694,6 +1695,26 @@ fn config_error_status(error: &openasr_core::ConfigError) -> StatusCode {
         | openasr_core::ConfigError::CreateHome { .. }
         | openasr_core::ConfigError::SerializeConfig(_)
         | openasr_core::ConfigError::WriteConfig { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// `axum::extract::multipart::MultipartError`'s `Display` always renders the
+/// generic "Error parsing `multipart/form-data` request", even when the
+/// underlying cause is the upload exceeding [`MAX_TRANSCRIPTION_UPLOAD_BYTES`]
+/// (`DefaultBodyLimit`). That generic text reads like a malformed-body/encoding
+/// bug when the real, actionable cause is "file too large". `MultipartError`'s
+/// `status`/`body_text` already classify the underlying `multer` error
+/// correctly, so use those instead of the raw `Display` for the client-facing
+/// message.
+fn multipart_error_message(error: &axum::extract::multipart::MultipartError) -> String {
+    if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        format!(
+            "Uploaded file is too large. The daemon accepts uploads up to {} MB; \
+             split the recording or use a smaller/compressed file.",
+            MAX_TRANSCRIPTION_UPLOAD_BYTES / (1024 * 1024)
+        )
+    } else {
+        format!("Could not read multipart form: {error}")
     }
 }
 

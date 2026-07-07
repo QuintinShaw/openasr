@@ -1114,7 +1114,9 @@ fn safe_extension_suffix(file_name: &str) -> Option<String> {
         .and_then(std::ffi::OsStr::to_str)?
         .to_ascii_lowercase();
     match extension.as_str() {
-        "wav" | "mp3" | "m4a" | "mp4" | "webm" | "flac" | "ogg" => Some(format!(".{extension}")),
+        "wav" | "mp3" | "m4a" | "mp4" | "webm" | "flac" | "ogg" | "qta" => {
+            Some(format!(".{extension}"))
+        }
         _ => None,
     }
 }
