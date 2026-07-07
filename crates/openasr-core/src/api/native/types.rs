@@ -225,6 +225,10 @@ pub struct NativeAsrRequestOptions {
     pub diarize: bool,
     pub partial_results: bool,
     pub word_timestamps: bool,
+    /// Opt-in `--word-timestamps=aligned` / `word_aligned` refinement tier;
+    /// see `TranscriptionRequest::word_timestamps_refine`. Offline-only:
+    /// streaming sessions never consult this field.
+    pub word_timestamps_refine: bool,
 }
 
 impl NativeAsrRequestOptions {
@@ -269,6 +273,11 @@ impl NativeAsrRequestOptions {
 
     pub fn with_word_timestamps(mut self, word_timestamps: bool) -> Self {
         self.word_timestamps = word_timestamps;
+        self
+    }
+
+    pub fn with_word_timestamps_refine(mut self, word_timestamps_refine: bool) -> Self {
+        self.word_timestamps_refine = word_timestamps_refine;
         self
     }
 }

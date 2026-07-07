@@ -25,7 +25,7 @@ pub(crate) struct TranscribeCommandOptions<'a> {
     pub(crate) runtime_paths: RuntimePathOverrides,
     pub(crate) diarize: bool,
     pub(crate) speakers: Option<u8>,
-    pub(crate) word_timestamps: bool,
+    pub(crate) word_timestamps_mode: Option<WordTimestampsMode>,
     pub(crate) model_pack: Option<&'a Path>,
     /// OADP Phase 0 `.oadp` adapter pack; plumbed through the transcription
     /// request (never the process environment — workers are already running).
@@ -143,6 +143,19 @@ pub(crate) struct PhraseBiasCliOptions {
     /// mid-phrase with matched depth; every applied value is capped at 20.0.
     #[arg(long = "hotword-boost", value_name = "BOOST")]
     pub(crate) hotword_boost: Option<f32>,
+}
+
+/// `--word-timestamps` tier: bare (or `=approximate`) keeps the model family's
+/// own decode-time word timestamps (free, every native family); `=aligned`
+/// additionally refines them by running the finished transcript and full
+/// audio back through the installed Qwen3-ForcedAligner-0.6B capability pack
+/// (native backend only; the pack is not auto-downloaded silently -- passing
+/// `=aligned` is itself the consent to install it, mirroring `--diarize`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub(crate) enum WordTimestampsMode {
+    Approximate,
+    Aligned,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Args)]
@@ -278,10 +291,13 @@ pub(crate) enum Command {
         /// Force an exact speaker count during diarization clustering.
         #[arg(long, requires = "diarize", value_parser = clap::value_parser!(u8).range(1..))]
         speakers: Option<u8>,
-        /// Request per-word timestamps from the model's own alignment
-        /// (rendered in json/verbose_json and word-timed VTT output).
-        #[arg(long)]
-        word_timestamps: bool,
+        /// Request per-word timestamps (rendered in json/verbose_json and
+        /// word-timed VTT output). Bare flag (or `=approximate`) uses the
+        /// model's own decode-time timestamps; `=aligned` refines them with
+        /// the Qwen3-ForcedAligner-0.6B capability pack (may install it if
+        /// missing; native backend only).
+        #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "approximate")]
+        word_timestamps: Option<WordTimestampsMode>,
         /// Local `.oasr` runtime pack file for native backend transcription.
         #[arg(long)]
         model_pack: Option<PathBuf>,

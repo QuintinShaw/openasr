@@ -112,8 +112,12 @@ pub(crate) fn word_list_for_language(
     text: &str,
     language: &str,
 ) -> Result<Vec<String>, Qwen3ForcedAlignerTextError> {
+    // Accepts both the reference's full language names and the ISO 639-1
+    // codes callers thread through from `Transcription::language` /
+    // `--language` (e.g. "ja"/"ko"), so a real caller's short codes trigger
+    // the same fail-closed guard as the reference's own "japanese"/"korean".
     let normalized = language.to_ascii_lowercase();
-    if normalized == "japanese" || normalized == "korean" {
+    if matches!(normalized.as_str(), "japanese" | "ja" | "korean" | "ko") {
         return Err(Qwen3ForcedAlignerTextError::UnsupportedLanguage {
             language: language.to_string(),
         });

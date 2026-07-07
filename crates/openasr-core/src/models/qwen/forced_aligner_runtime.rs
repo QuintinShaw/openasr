@@ -1,25 +1,16 @@
-//! Stage 3-5 NAR (non-autoregressive) execution pipeline for
+//! Stage 3-6 NAR (non-autoregressive) execution pipeline for
 //! Qwen3-ForcedAligner-0.6B: metadata parsing, prompt/token assembly, and the
 //! end-to-end "mel -> audio encoder -> LLM prefill -> classify head at
 //! `<timestamp>` positions -> fix_timestamp -> per-word spans" path.
 //!
-//! Deliberately NOT wired into `ggml_family_registry` or the CLI/server (same
-//! posture as Stage 1/2): this is a dev-machine-gated numeric-parity harness
-//! only. Product surface (capability-pack registration, `--word-timestamps`
-//! opt-in wiring, catalog publication) is tracked as follow-up work, not part
-//! of this stage.
-//!
-//! `#![allow(dead_code)]`: every entry point here is exercised only by the
-//! `#[cfg(test)]` Stage 5 gate below (mirroring the Stage 1/2 precedent in
-//! `forced_aligner_import.rs` / `audio_encoder.rs`'s dev-machine-only tests).
-//! Those precedents dodge `dead_code` by being `pub fn` re-exported from the
-//! crate's public surface; deliberately not doing that here, since it would
-//! force widening several execution-graph internals (audio encoder weights,
-//! logits head, layer projections, per-stage error enums) from `pub(crate)`
-//! to fully `pub` just to satisfy the lint, which is a real API-surface
-//! change this stage does not intend to make. Remove this allow once Stage 6
-//! (capability-pack registration / CLI wiring) adds a real caller.
-#![allow(dead_code)]
+//! Stage 6 adds the real caller: [`refine_word_timestamps_with_forced_aligner`]
+//! is invoked from `api::backend::native_transcribe` when a request opts into
+//! `--word-timestamps=aligned` and the capability pack
+//! (`models::qwen::forced_aligner_pack`) is installed. `align_forced` and
+//! `load_forced_aligner_prepared_assets` stay `pub(crate)` (not `pub`): the
+//! one in-crate caller does not need a wider surface, and every
+//! execution-graph internal they touch (audio encoder weights, logits head,
+//! layer projections, per-stage error enums) stays `pub(crate)` too.
 
 use thiserror::Error;
 
@@ -483,6 +474,23 @@ pub(crate) fn align_forced(
 /// rounding ambiguity to reproduce).
 fn round_to_millis(value: f64) -> f64 {
     (value * 1000.0).round() / 1000.0
+}
+
+/// One-shot entry point for the `--word-timestamps=aligned` opt-in refinement
+/// tier: loads the pack fresh (no process-wide cache -- this runs at most once
+/// per `transcribe` call, the same cost profile as loading the primary ASR
+/// pack) and runs the full NAR pipeline. `language` accepts either an ISO
+/// 639-1 code or a full name; unsupported languages (Japanese, Korean --
+/// see `forced_aligner_align_text`) fail closed with
+/// [`Qwen3ForcedAlignerRuntimeError::TextFailed`] rather than mis-tokenizing.
+pub(crate) fn refine_word_timestamps_with_forced_aligner(
+    pack_path: &std::path::Path,
+    audio_samples_16khz_mono: &[f32],
+    text: &str,
+    language: &str,
+) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
+    let assets = load_forced_aligner_prepared_assets(pack_path)?;
+    align_forced(pack_path, &assets, audio_samples_16khz_mono, text, language)
 }
 
 #[cfg(test)]

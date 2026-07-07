@@ -3,6 +3,7 @@ mod batched_decode;
 mod decode_prompt;
 mod forced_aligner_align_text;
 mod forced_aligner_import;
+pub(crate) mod forced_aligner_pack;
 mod forced_aligner_runtime;
 mod frontend;
 mod ggml_executor;
@@ -29,6 +30,9 @@ pub use forced_aligner_import::{
     Qwen3ForcedAlignerLocalSourceError, Qwen3ForcedAlignerLocalSourceImportRequest,
     Qwen3ForcedAlignerLocalSourceImportRuntimeResult,
     convert_local_qwen_forced_aligner_source_to_runtime_pack,
+};
+pub(crate) use forced_aligner_runtime::{
+    ForcedAlignItem, refine_word_timestamps_with_forced_aligner,
 };
 pub(crate) use frontend::{Qwen3AsrMelFrontendPlan, load_qwen3_mel_frontend_plan_from_reader};
 pub(crate) use ggml_executor::Qwen3AsrGgmlExecutor;
