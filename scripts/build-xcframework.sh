@@ -102,25 +102,31 @@ build_slice() {
     rustup target add "$rust_target"
   fi
 
-  # openasr-core's build.rs already floors IPHONEOS_DEPLOYMENT_TARGET at 15.0
-  # for the CMake-built ggml C/C++ objects (see ios_deployment_target_from in
-  # crates/openasr-core/build.rs), but that only governs those objects --
-  # rustc's own compile+link step for the Rust code (this cargo invocation)
-  # reads the same env var independently and otherwise falls back to a much
-  # older default min-iOS version. That mismatch leaves the final `cc` link
-  # targeting the old default, which lacks the `___chkstk_darwin` stack-probe
-  # symbol newer-min-version object code (both the ggml objects above and
-  # ring's asm) calls into -- undefined-symbol link failure. Export the same
-  # floor here so the whole slice (C++ and Rust) links against one consistent
-  # minimum.
+  # openasr-core's build.rs floors IPHONEOS_DEPLOYMENT_TARGET at 15.0 for the
+  # CMake-built ggml C/C++ objects (see ios_deployment_target_from in
+  # crates/openasr-core/build.rs), and ring's build script picks up the
+  # host's SDK version (26.5 on this runner) for its precompiled asm objects.
+  # But rustc's own final link of openasr-ffi's cdylib/staticlib hardcodes
+  # `-target arm64-apple-ios10.0.0` regardless of IPHONEOS_DEPLOYMENT_TARGET
+  # (that env var is not honored for the plain, non-simulator aarch64-apple-ios
+  # target as of rustc 1.95.0). Linking against that old a minimum makes the
+  # linker treat `___chkstk_darwin` (a stack-probe helper gated to iOS 11+ in
+  # the SDK's libSystem.tbd) as unavailable, so ggml's/ring's newer-floor
+  # object code fails with an undefined-symbol error. Force the real minimum
+  # via an explicit `-target` link-arg pair, which clang resolves last-wins
+  # over the one rustc already inserted, so the whole slice (C++ and Rust)
+  # links against one consistent, high-enough minimum.
+  local rustflags=""
   case "$rust_target" in
-    *-apple-ios*)
-      (cd "$repo_root" && IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build -p openasr-ffi $cargo_flag --target "$rust_target")
-      ;;
-    *)
-      (cd "$repo_root" && cargo build -p openasr-ffi $cargo_flag --target "$rust_target")
-      ;;
+    aarch64-apple-ios) rustflags="-C link-arg=-target -C link-arg=arm64-apple-ios15.0" ;;
+    aarch64-apple-ios-sim) rustflags="-C link-arg=-target -C link-arg=arm64-apple-ios15.0-simulator" ;;
   esac
+
+  if [[ -n "$rustflags" ]]; then
+    (cd "$repo_root" && RUSTFLAGS="$rustflags" cargo build -p openasr-ffi $cargo_flag --target "$rust_target")
+  else
+    (cd "$repo_root" && cargo build -p openasr-ffi $cargo_flag --target "$rust_target")
+  fi
 
   mkdir -p "$slice_dir/lib" "$slice_dir/include"
   cp "$repo_root/target/$rust_target/$cargo_profile_dir/$lib_name" "$slice_dir/lib/$lib_name"
