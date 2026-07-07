@@ -8,7 +8,7 @@
 OpenASR is the Apache-2.0 **open core** of a local-first speech-to-text platform:
 a single `openasr` Rust CLI, a local OpenAI-compatible HTTP API, and a signed
 model catalog, all running native [ggml](https://github.com/ggml-org/ggml)-backed
-inference across ten model families on CPU and Apple Metal. No cloud, no
+inference across eleven model families on CPU and Apple Metal. No cloud, no
 telemetry, fail-closed by design.
 
 [Website](https://openasr.org) - [Documentation](docs/DOCS_INDEX.md) - [Acknowledgments](ACKNOWLEDGMENTS.md) - [License](LICENSE)
@@ -45,10 +45,11 @@ size, host, and license.
 
 ### Depth, not just Whisper
 
-**Ten model families** run through one binary and one ggml runtime: Whisper,
+**Eleven model families** run through one binary and one ggml runtime: Whisper,
 Cohere Transcribe, Qwen3-ASR, Parakeet-CTC, Parakeet-TDT (25 European
 languages), wav2vec2-CTC, Moonshine, Dolphin (Chinese dialects), SenseVoice
-(zh/yue/en/ja/ko), and X-ASR (Zipformer). You get
+(zh/yue/en/ja/ko), FireRedASR-AED (Mandarin + English bilingual), and X-ASR
+(Zipformer). You get
 frame-synchronous streaming partials, opt-in speaker diarization, word-level
 timestamps with **per-word confidence**, and phrase-bias hotwords -- pick the
 model that fits the task and keep one toolchain.
@@ -87,10 +88,11 @@ openasr pull qwen3-asr-0.6b:q8        # or pin a specific quant tier
 openasr list                          # what's installed
 ```
 
-The catalog ships **17 ready-to-pull ASR packs** spanning seven of the ten
+The catalog ships **17 ready-to-pull ASR packs** spanning seven of the eleven
 native families (50 signed quant downloads), plus diarization capability
-packs; the remaining three (Parakeet-CTC, Parakeet-TDT, wav2vec2-CTC) run via
-`import` of your own checkpoints. Ten native families run offline on CPU and Apple Metal,
+packs; the remaining four (Parakeet-CTC, Parakeet-TDT, wav2vec2-CTC,
+FireRedASR-AED) run via `import` of your own checkpoints. Eleven native
+families run offline on CPU and Apple Metal,
 dispatched by the data-driven architecture registry. All families support opt-in diarization; most also export word-level
 timestamps -- the columns below show where they differ.
 
@@ -105,16 +107,17 @@ timestamps -- the columns below show where they differ.
 | Moonshine | declared-pack | approximate | fp16 / q8_0 / q4_k |
 | Dolphin (Chinese dialects) | none | none | fp16 / q8_0 / q4_k |
 | SenseVoice (zh/yue/en/ja/ko) | declared-pack | none | fp16 / q8_0 / q4_k |
+| FireRedASR-AED (Mandarin + English bilingual) | none | none | fp16 / q8_0 / q4_k |
 | X-ASR (Zipformer, RNN-T) | declared-pack | acoustic | fp16 / q8_0 / q4_k |
 
 - **Streaming** -- native frame-synchronous streaming emits incremental partials
   for packs that declare the streaming feature; other packs fall back to
-  final-per-utterance output. Dolphin has no streaming executor yet, so it
-  always runs final-per-utterance.
+  final-per-utterance output. Dolphin and FireRedASR-AED have no streaming
+  executor yet, so they always run final-per-utterance.
 - **Word timestamps** -- *acoustic* means real acoustic frame alignment
   (Whisper decoder cross-attention; frame spans for the CTC/transducer families);
   *approximate* means decoder token-position estimates. Both export to JSON/VTT.
-  Dolphin does not emit word-level timing at all (segment-level only).
+  Dolphin and FireRedASR-AED do not emit word-level timing at all (segment-level only).
 - **Diarization** -- `--diarize` attributes anonymous `SPEAKER_NN` labels onto
   any family's transcript via pure-Rust WeSpeaker + pyannote capability packs;
   Cohere packs can additionally emit inline speaker tokens.
@@ -285,8 +288,8 @@ cargo run -p openasr-cli -- model-pack import moonshine    <source_dir> <out.oas
 ```
 
 Other families: `cohere`, `parakeet-ctc`, `parakeet-tdt`, `wav2vec2-ctc`, `dolphin`,
-`xasr-zipformer`, `hymt2-gguf`, `wespeaker`, `pyannote`. Each accepts
-`--quantization fp16|q8_0|q4_k` (Qwen also exposes `q3_k`).
+`sensevoice`, `firered-aed`, `xasr-zipformer`, `hymt2-gguf`, `wespeaker`, `pyannote`.
+Each accepts `--quantization fp16|q8_0|q4_k` (Qwen also exposes `q3_k`).
 
 ## Validation
 

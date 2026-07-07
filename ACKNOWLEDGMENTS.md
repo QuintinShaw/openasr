@@ -44,6 +44,10 @@ credits the people who built the original.
   <https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3> (25 European languages;
   FastConformer + Token-and-Duration Transducer, trained with NeMo on the
   Granary corpus).
+- FireRedASR2-AED (FireRedTeam, Apache-2.0) --
+  <https://huggingface.co/FireRedTeam/FireRedASR2-AED> (Mandarin + English
+  bilingual, plus Chinese dialects; Conformer encoder + Transformer decoder
+  attention-based encoder-decoder; an OpenASR pack is staged, not yet public).
 
 **Speaker diarization**
 

@@ -278,6 +278,13 @@ pub fn dolphin_runtime_descriptor_v1() -> GgmlFamilyAdapterDescriptor {
         .ggml_family_adapter_descriptor()
 }
 
+pub fn firered_aed_runtime_descriptor_v1() -> GgmlFamilyAdapterDescriptor {
+    OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID)
+        .expect("builtin firered-aed architecture must exist")
+        .ggml_family_adapter_descriptor()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

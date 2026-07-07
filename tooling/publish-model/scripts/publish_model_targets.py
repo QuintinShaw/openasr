@@ -69,6 +69,7 @@ RELEASE_LANE_MODELS = (
     "dolphin-small",
     "dolphin-base",
     "parakeet-tdt-0.6b-v3",
+    "firered-aed-l-v2",
 )
 GGUF_GENERAL_ARCHITECTURE_KEY = b"general.architecture"
 
