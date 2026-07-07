@@ -1,0 +1,50 @@
+name: xcframework (manual)
+
+# Manual-only: builds the iOS/macOS xcframework SDK artifact (see
+# scripts/build-xcframework.sh, docs/SDK_IOS_MACOS.md). Kept in its own
+# workflow_dispatch-only workflow so it does not show up as a skipped check on
+# every push/PR; the per-push `ios-compile` gate in ci.yml already covers
+# openasr-ffi's iOS compile health. The release train's version lives in
+# .github/workflows/release-binaries.yml's `xcframework` job (zip + sha256 +
+# attached to the tagged GitHub Release, gated by verify-completeness) -- keep
+# the build steps here (targets/cbindgen/header-check/build script) in sync with
+# that job if either changes.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: xcframework-manual-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  xcframework:
+    name: Build OpenASR.xcframework
+    # GitHub-hosted macos-latest ships full Xcode (iphoneos + iphonesimulator
+    # SDKs), so unlike a Command-Line-Tools-only dev machine this produces all
+    # three slices (ios-arm64 device, ios-arm64-simulator, macos-arm64) -- see
+    # scripts/build-xcframework.sh's SDK-detection fallback for the local
+    # (CLT-only) degraded path. This is the dev-time, build-only variant (raw
+    # xcframework dir as a build artifact, no packaging/release upload).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cbindgen
+        run: cargo install cbindgen --locked
+      - name: Header drift gate
+        run: scripts/generate-ffi-header.sh --check
+      - name: Build xcframework
+        run: scripts/build-xcframework.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: OpenASR.xcframework
+          path: target/xcframework/OpenASR.xcframework
+          if-no-files-found: error
