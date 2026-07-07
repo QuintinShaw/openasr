@@ -2085,6 +2085,7 @@ fn apply_decoder_layer<'a>(
         total_token_count,
         position_offset,
         layer_norm_epsilon: COHERE_DECODER_LAYER_NORM_EPSILON,
+        ffn_activation: crate::nn::ffn::FeedForwardActivation::Relu,
         self_kv_max_positions: self_kv.max_positions,
         cross_frame_count: cross_runtime.frame_count,
         cross_hidden_size: cross_runtime.hidden_size,
