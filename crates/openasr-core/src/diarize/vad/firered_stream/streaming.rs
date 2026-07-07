@@ -1,9 +1,8 @@
 //! Streaming Stream-VAD for the realtime path.
 //!
-//! Mirrors [`crate::diarize::vad::streaming::SileroStreamingVad`]'s buffering
-//! contract (arbitrary-cadence PCM frames in, one probability out) but over
-//! the causal Stream-VAD DFSMN instead of Silero's LSTM: incoming PCM
-//! accumulates into a raw-sample buffer; whenever enough new samples have
+//! Buffering contract: arbitrary-cadence PCM frames in, one probability out.
+//! Incoming PCM accumulates into a raw-sample buffer; whenever enough new
+//! samples have
 //! arrived to complete one or more 10 ms fbank frames (25 ms window, 10 ms
 //! hop), those frames are pushed through
 //! [`FireRedStreamVadModel::forward_chunk`] with the carried
@@ -16,8 +15,8 @@
 
 use std::fmt;
 
+use super::frontend::FRAME_LENGTH;
 use super::model::{FRAME_SHIFT_MS, FireRedStreamVadCache, FireRedStreamVadModel};
-use crate::diarize::vad::firered::frontend::FRAME_LENGTH;
 
 /// Buffered, stateful Stream-VAD detector for one realtime session.
 pub struct FireRedStreamingVad {
@@ -38,7 +37,7 @@ impl fmt::Debug for FireRedStreamingVad {
 
 impl FireRedStreamingVad {
     /// Build a streaming detector over the shared model, or `None` if the
-    /// vendored weights are unavailable (callers fall back to Silero/energy).
+    /// vendored weights are unavailable.
     pub fn shared() -> Option<Self> {
         super::shared_model().map(|model| Self {
             model,
@@ -53,8 +52,7 @@ impl FireRedStreamingVad {
     /// fbank frame is available (25 ms of audio the first time, 10 ms of new
     /// audio thereafter); every completed frame advances the causal DFSMN
     /// cache. `10ms` granularity (`FRAME_SHIFT_MS`) is well within the
-    /// endpointer's hysteresis tolerance, matching the Silero streaming
-    /// contract.
+    /// endpointer's hysteresis tolerance.
     pub fn accept_frame(&mut self, samples: &[i16]) -> f32 {
         self.raw_buffer
             .extend(samples.iter().map(|sample| *sample as f32 / 32_768.0));

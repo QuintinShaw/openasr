@@ -15,39 +15,7 @@ use super::{
         VadStateMachine,
     },
 };
-use crate::diarize::vad::{FireRedStreamingVad, RealtimeNeuralVadEngine, SileroStreamingVad};
-
-/// The concrete streaming neural detector backing an `ExternalProbability`
-/// session: Silero (default) or FireRedVAD's causal Stream-VAD
-/// (`OPENASR_VAD=firered-stream`, opt-in -- see
-/// [`crate::diarize::vad::realtime_neural_vad_engine`]). Both expose the same
-/// `accept_frame`/`reset` contract; this enum is the seam so
-/// `RealtimeSessionController` does not need a trait object for two
-/// concrete, non-`dyn`-safe-by-necessity implementations.
-#[derive(Debug)]
-enum NeuralVad {
-    // Boxed: `SileroStreamingVad` carries a much larger inline buffer than
-    // `FireRedStreamingVad`, and this enum otherwise sizes to its largest
-    // variant (clippy::large_enum_variant).
-    Silero(Box<SileroStreamingVad>),
-    FireRedStream(Box<FireRedStreamingVad>),
-}
-
-impl NeuralVad {
-    fn accept_frame(&mut self, samples: &[i16]) -> f32 {
-        match self {
-            NeuralVad::Silero(detector) => detector.accept_frame(samples),
-            NeuralVad::FireRedStream(detector) => detector.accept_frame(samples),
-        }
-    }
-
-    fn reset(&mut self) {
-        match self {
-            NeuralVad::Silero(detector) => detector.reset(),
-            NeuralVad::FireRedStream(detector) => detector.reset(),
-        }
-    }
-}
+use crate::diarize::vad::FireRedStreamingVad;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RealtimeSessionConfig {
@@ -133,10 +101,10 @@ pub struct RealtimeSessionController {
     state: RealtimeSessionState,
     sequencer: RealtimeEventSequencer,
     pub vad: VadStateMachine,
-    /// Streaming neural detector, present only when the configured VAD mode is
-    /// `ExternalProbability` and the model loaded. Feeds probabilities into
-    /// `vad`; all endpointing stays in the state machine.
-    neural_vad: Option<NeuralVad>,
+    /// Streaming Stream-VAD detector, present only when the configured VAD
+    /// mode is `ExternalProbability`. Feeds probabilities into `vad`; all
+    /// endpointing stays in the state machine.
+    neural_vad: Option<Box<FireRedStreamingVad>>,
     pub buffer: RealtimeBuffer,
     pub transcript: TranscriptLifecycle,
 }
@@ -256,39 +224,18 @@ impl RealtimeSessionController {
     }
 
     pub fn new_with_sequencer(
-        mut config: RealtimeSessionConfig,
+        config: RealtimeSessionConfig,
         sequencer: RealtimeEventSequencer,
     ) -> Result<Self, RealtimeSessionError> {
         config.validate()?;
         let neural_vad = if config.vad.mode == VadMode::ExternalProbability {
-            // Which neural model backs this session: Silero by default,
-            // FireRedVAD's causal Stream-VAD opt-in via `OPENASR_VAD`. See
-            // `crate::diarize::vad::realtime_neural_vad_engine`.
-            let detector = match crate::diarize::vad::realtime_neural_vad_engine(None) {
-                RealtimeNeuralVadEngine::Silero => {
-                    SileroStreamingVad::shared().map(|d| NeuralVad::Silero(Box::new(d)))
-                }
-                RealtimeNeuralVadEngine::FireRedStream => {
-                    FireRedStreamingVad::shared().map(|d| NeuralVad::FireRedStream(Box::new(d)))
-                }
-            };
-            match detector {
-                Some(detector) => Some(detector),
-                None => {
-                    // Neural VAD was requested but the model is unavailable.
-                    // Downgrade to the energy gate with energy-appropriate
-                    // defaults: the configured threshold is a probability (~0.5)
-                    // that, used as an RMS gate, would silence all speech; and the
-                    // hangover may have been tuned short for the neural detector,
-                    // which would chop words on an RMS gate. Restore both to the
-                    // energy-safe defaults so the fallback behaves like a real
-                    // energy session.
-                    config.vad.mode = VadMode::Energy;
-                    config.vad.energy_threshold = VadConfig::default().energy_threshold;
-                    config.vad.speech_stop_ms = VadConfig::default().speech_stop_ms;
-                    None
-                }
-            }
+            // Stream-VAD is the sole neural engine and is vendored
+            // (`include_bytes!`), so it is expected to always load; the
+            // `.expect` here is a fail-closed build-integrity check, not a
+            // routine fallback.
+            Some(Box::new(FireRedStreamingVad::shared().expect(
+                "vendored Stream-VAD weights failed to parse; this indicates a corrupted build",
+            )))
         } else {
             None
         };
@@ -315,9 +262,9 @@ impl RealtimeSessionController {
 
     /// Process one audio frame through the configured VAD, returning any speech
     /// boundary events. Neural mode (`ExternalProbability`) feeds the streaming
-    /// Silero probability into the state machine; every other mode (and the
-    /// fallback when the neural model is unavailable) uses the energy gate. All
-    /// endpointing/hysteresis lives in the state machine, not here.
+    /// Stream-VAD probability into the state machine; every other mode uses the
+    /// energy gate. All endpointing/hysteresis lives in the state machine, not
+    /// here.
     pub fn process_vad_frame(&mut self, frame: &RealtimeAudioFrame) -> Vec<SpeechBoundaryEvent> {
         self.process_vad_frame_with_speech(frame).0
     }

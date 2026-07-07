@@ -1,14 +1,11 @@
-//! [`LongFormVadProvider`] backed by the causal Stream-VAD DFSMN model, used
-//! to run Stream-VAD over a whole long-form utterance (mode "Stream-VAD as
-//! longform" -- research question: does one causal-only checkpoint suffice
-//! for both realtime and long-form, or do the two engines need to stay
-//! separate). Not the default; see [`crate::longform::LongFormVadEngine::FireRedStream`].
+//! [`LongFormVadProvider`] backed by the causal Stream-VAD DFSMN model: the
+//! sole long-form VAD engine, run over the whole long-form utterance.
 
 use thiserror::Error;
 
+use super::frontend::SAMPLE_RATE_HZ;
 use super::model::{FRAME_SHIFT_MS, FireRedStreamVadModel};
 use super::weights::FireRedStreamVadWeightsError;
-use crate::diarize::vad::firered::frontend::SAMPLE_RATE_HZ;
 use crate::longform::{
     LongFormOptions, LongFormVadProvider, LongFormVadProviderKind, LongFormVadSlice,
 };
@@ -27,7 +24,7 @@ pub struct FireRedStreamVadProvider {
 
 impl FireRedStreamVadProvider {
     /// Borrow the shared Stream-VAD model. Returns `None` when the vendored
-    /// weights could not be loaded (callers fall back to Silero/energy).
+    /// weights could not be loaded.
     pub fn shared() -> Option<Self> {
         super::shared_model().map(|model| Self { model })
     }
@@ -66,10 +63,7 @@ impl LongFormVadProvider for FireRedStreamVadProvider {
 const FRAME_SAMPLES: usize = (SAMPLE_RATE_HZ as u64 * FRAME_SHIFT_MS as u64 / 1000) as usize;
 
 /// Convert per-frame speech probabilities into sample-space speech spans with
-/// threshold gating plus min-speech / min-silence hysteresis. Identical logic
-/// to `firered::provider::spans_from_probs` (kept as a small, family-local
-/// copy rather than a shared helper -- the two providers' frame cadence
-/// happens to match today but are independent checkpoints).
+/// threshold gating plus min-speech / min-silence hysteresis.
 fn spans_from_probs(
     probs: &[f32],
     total_samples: usize,

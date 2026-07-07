@@ -3,14 +3,12 @@ use std::{collections::BTreeMap, path::Path, sync::OnceLock};
 use crate::NATIVE_RUNTIME_MODEL_ID_AUTO;
 use crate::api::audio_io::load_wav_16khz_mono_f32_v0;
 use crate::arch::OpenAsrArchitectureRegistry;
-use crate::diarize::vad::SileroVadProvider;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, install_request_backend_override,
 };
 use crate::longform::{
-    AudioSliceKind, EnergyLongFormVadProvider, LongFormMode, LongFormVadEngine,
-    LongFormVadProvider, SegmentMergePolicy, SegmentTimeDomain, SliceTranscript,
-    TranscriptAssembler, plan_longform_slices,
+    AudioSliceKind, LongFormMode, LongFormVadProvider, SegmentMergePolicy, SegmentTimeDomain,
+    SliceTranscript, TranscriptAssembler, plan_longform_slices,
 };
 use crate::models::builtin_execution_dispatch::build_builtin_ggml_execution_dispatch;
 use crate::models::decode_policy_component_registry::{
@@ -258,7 +256,7 @@ fn run_native_transcription_impl(
     let vad_diarization = request.diarize && !model_self_diarizes;
     if vad_diarization
         && (crate::diarize::embed::shared_embedder().is_none()
-            || crate::diarize::vad::SileroVadProvider::shared().is_none())
+            || crate::diarize::vad::FireRedStreamVadProvider::shared().is_none())
     {
         // Fail closed up front rather than silently returning a speaker-less
         // transcript when the embedder or VAD model is unavailable.
@@ -751,40 +749,17 @@ fn shared_native_ggml_execution_dispatch() -> &'static GgmlAsrExecutionDispatch 
     })
 }
 
-/// Pick the long-form VAD provider for this request, returning the provider and
-/// a label for the engine that actually ran. The neural Silero model (over the
-/// process-wide shared weights) is the default; the energy gate is used when
-/// selected; FireRedVAD's non-streaming and Stream-VAD checkpoints (alternative
-/// neural engines, neither yet the default -- see [`LongFormVadEngine::FireRed`]
-/// / [`LongFormVadEngine::FireRedStream`]) are used when explicitly selected.
-/// Any neural engine falls back to `*-fallback` energy when its weights are
-/// unavailable so the run metadata reflects what executed. `OPENASR_VAD`
-/// overrides the option (`silero`/`neural`, `energy`/`rms`, `firered`,
-/// `firered-stream`).
+/// Resolve the long-form VAD provider for this request, returning the
+/// provider and a label for the engine that ran. Stream-VAD is the sole VAD
+/// engine and is vendored (`include_bytes!`), so it is expected to always
+/// load; the `.expect` here is a fail-closed build-integrity check, not a
+/// routine fallback.
 fn resolve_longform_vad_provider(
-    options: &crate::LongFormOptions,
+    _options: &crate::LongFormOptions,
 ) -> (Box<dyn LongFormVadProvider>, &'static str) {
-    match vad_engine_with_env_override(options.vad_engine) {
-        LongFormVadEngine::Silero => match SileroVadProvider::shared() {
-            Some(provider) => (Box::new(provider), "silero"),
-            None => (Box::new(EnergyLongFormVadProvider), "energy-fallback"),
-        },
-        LongFormVadEngine::Energy => (Box::new(EnergyLongFormVadProvider), "energy"),
-        LongFormVadEngine::FireRed => match crate::diarize::vad::FireRedVadProvider::shared() {
-            Some(provider) => (Box::new(provider), "firered"),
-            None => (Box::new(EnergyLongFormVadProvider), "energy-fallback"),
-        },
-        LongFormVadEngine::FireRedStream => {
-            match crate::diarize::vad::FireRedStreamVadProvider::shared() {
-                Some(provider) => (Box::new(provider), "firered-stream"),
-                None => (Box::new(EnergyLongFormVadProvider), "energy-fallback"),
-            }
-        }
-    }
-}
-
-fn vad_engine_with_env_override(default: LongFormVadEngine) -> LongFormVadEngine {
-    crate::diarize::vad::longform_vad_engine_env_override().unwrap_or(default)
+    let provider = crate::diarize::vad::FireRedStreamVadProvider::shared()
+        .expect("vendored Stream-VAD weights failed to parse; this indicates a corrupted build");
+    (Box::new(provider), "firered-stream")
 }
 
 fn resolve_native_longform_policy(
@@ -1715,62 +1690,16 @@ mod tests {
         }
     }
 
-    // --- long-form VAD engine selection (Silero / Energy / FireRed) ---
+    // --- long-form VAD provider resolution (Stream-VAD is the sole engine) ---
 
     #[test]
-    fn resolve_longform_vad_provider_honors_explicit_option() {
-        let mut options = crate::LongFormOptions {
-            vad_engine: LongFormVadEngine::Energy,
-            ..crate::LongFormOptions::default()
-        };
-        let (_, label) = resolve_longform_vad_provider(&options);
-        assert_eq!(label, "energy");
-
-        options.vad_engine = LongFormVadEngine::Silero;
-        let (_, label) = resolve_longform_vad_provider(&options);
-        assert_eq!(label, "silero");
-
-        options.vad_engine = LongFormVadEngine::FireRed;
-        let (_, label) = resolve_longform_vad_provider(&options);
-        assert_eq!(label, "firered");
-
-        options.vad_engine = LongFormVadEngine::FireRedStream;
+    fn resolve_longform_vad_provider_always_resolves_stream_vad() {
+        let options = crate::LongFormOptions::default();
         let (_, label) = resolve_longform_vad_provider(&options);
         assert_eq!(label, "firered-stream");
     }
 
-    #[test]
-    fn openasr_vad_env_override_selects_firered() {
-        let saved = std::env::var("OPENASR_VAD").ok();
-        // SAFETY: sequential mutation, restored before returning; mirrors the
-        // guard already used by
-        // `diarize::vad::tests::realtime_vad_prefers_neural_defaults_to_neural_with_env_precedence`.
-        unsafe { std::env::set_var("OPENASR_VAD", "firered") };
-        let engine = vad_engine_with_env_override(LongFormVadEngine::Silero);
-        assert_eq!(engine, LongFormVadEngine::FireRed);
-
-        unsafe { std::env::set_var("OPENASR_VAD", "energy") };
-        assert_eq!(
-            vad_engine_with_env_override(LongFormVadEngine::FireRed),
-            LongFormVadEngine::Energy
-        );
-
-        unsafe { std::env::remove_var("OPENASR_VAD") };
-        // Unrecognized values fall through to the caller's default, same as
-        // the realtime alias table.
-        unsafe { std::env::set_var("OPENASR_VAD", "not-an-engine") };
-        assert_eq!(
-            vad_engine_with_env_override(LongFormVadEngine::FireRed),
-            LongFormVadEngine::FireRed
-        );
-
-        match saved {
-            Some(value) => unsafe { std::env::set_var("OPENASR_VAD", value) },
-            None => unsafe { std::env::remove_var("OPENASR_VAD") },
-        }
-    }
-
-    // --- real-audio long-form slicing smoke test: Silero vs FireRed ---
+    // --- real-audio long-form slicing smoke test ---
 
     fn jfk_wav_path() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav")
@@ -1780,20 +1709,16 @@ mod tests {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/zh_sample.wav")
     }
 
-    fn assert_engine_slices_real_audio_without_panicking(
-        engine: LongFormVadEngine,
-        wav_path: std::path::PathBuf,
-    ) {
+    fn assert_stream_vad_slices_real_audio_without_panicking(wav_path: std::path::PathBuf) {
         let samples = load_wav_16khz_mono_f32_v0(
             &wav_path,
-            "longform VAD engine smoke test",
-            "longform VAD engine smoke test",
+            "longform VAD smoke test",
+            "longform VAD smoke test",
         )
         .expect("load wav fixture");
 
         let mut options = crate::LongFormOptions {
             mode: LongFormMode::Vad,
-            vad_engine: engine,
             ..crate::LongFormOptions::default()
         };
         // Keep the fixture (11-20s) comfortably above the min chunk size so
@@ -1801,9 +1726,9 @@ mod tests {
         // chunk_samples` single-slice shortcut.
         options.chunk_seconds = 2.0;
         let (provider, label) = resolve_longform_vad_provider(&options);
-        assert_ne!(
-            label, "energy-fallback",
-            "the neural engine's vendored weights must load in tests"
+        assert_eq!(
+            label, "firered-stream",
+            "Stream-VAD's vendored weights must load in tests"
         );
 
         let plan = plan_longform_slices(&samples, 16_000, &options, Some(provider.as_ref()))
@@ -1820,32 +1745,13 @@ mod tests {
     }
 
     #[test]
-    fn silero_and_firered_both_slice_real_jfk_audio_without_panicking() {
-        assert_engine_slices_real_audio_without_panicking(
-            LongFormVadEngine::Silero,
-            jfk_wav_path(),
-        );
-        assert_engine_slices_real_audio_without_panicking(
-            LongFormVadEngine::FireRed,
-            jfk_wav_path(),
-        );
-        assert_engine_slices_real_audio_without_panicking(
-            LongFormVadEngine::FireRedStream,
-            jfk_wav_path(),
-        );
+    fn stream_vad_slices_real_jfk_audio_without_panicking() {
+        assert_stream_vad_slices_real_audio_without_panicking(jfk_wav_path());
     }
 
     #[test]
-    fn silero_and_firered_both_slice_real_zh_audio_without_panicking() {
-        assert_engine_slices_real_audio_without_panicking(LongFormVadEngine::Silero, zh_wav_path());
-        assert_engine_slices_real_audio_without_panicking(
-            LongFormVadEngine::FireRed,
-            zh_wav_path(),
-        );
-        assert_engine_slices_real_audio_without_panicking(
-            LongFormVadEngine::FireRedStream,
-            zh_wav_path(),
-        );
+    fn stream_vad_slices_real_zh_audio_without_panicking() {
+        assert_stream_vad_slices_real_audio_without_panicking(zh_wav_path());
     }
 
     fn segment(start: f32, end: f32, text: &str) -> Segment {

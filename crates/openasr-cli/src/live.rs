@@ -1214,8 +1214,7 @@ struct LivePipelineConfig {
 
 /// Resolve the live VAD mode. Delegates to the shared `openasr-core` resolver so
 /// the CLI and the server WS never diverge: `OPENASR_VAD` wins, else **default to
-/// the neural detector** (`OPENASR_VAD=energy`/`rms` opts out; a missing model
-/// falls back to the energy gate at session construction).
+/// the neural detector** (`OPENASR_VAD=energy`/`rms` opts out).
 fn resolve_cli_vad_mode() -> VadMode {
     if openasr_core::diarize::vad::realtime_vad_prefers_neural(None) {
         VadMode::ExternalProbability

@@ -5,9 +5,9 @@
 use super::model::FireRedStreamVadModel;
 use super::provider::FireRedStreamVadProvider;
 
-/// Golden fixture: the same 3 s (48,000-sample) excerpt of `fixtures/jfk.wav`
-/// as `firered_vad_16k_golden.bin`, plus reference per-10ms-frame speech
-/// probabilities from a numpy reproduction of the upstream `DetectModel`
+/// Golden fixture: a 3 s (48,000-sample) excerpt of `fixtures/jfk.wav`, plus
+/// reference per-10ms-frame speech probabilities from a numpy reproduction of
+/// the upstream `DetectModel`
 /// forward with `N2 = 0` (no lookahead) run against the vendored
 /// `Stream-VAD/model.pth.tar` + `Stream-VAD/cmvn.ark` checkpoint (there is no
 /// upstream Python streaming-VAD "batch" entrypoint to diff against directly;
@@ -128,11 +128,7 @@ fn provider_shared_computes_speech_slices_on_golden_clip() {
     let provider = FireRedStreamVadProvider::shared().expect("shared Stream-VAD provider");
     let options = LongFormOptions::default();
     let slices = provider
-        .compute_speech_slices(
-            &samples,
-            crate::diarize::vad::firered::frontend::SAMPLE_RATE_HZ,
-            &options,
-        )
+        .compute_speech_slices(&samples, super::frontend::SAMPLE_RATE_HZ, &options)
         .expect("speech slices");
     assert!(!slices.is_empty(), "expected at least one speech span");
     for slice in &slices {
@@ -151,4 +147,39 @@ fn provider_rejects_wrong_sample_rate() {
         .compute_speech_slices(&samples, 8_000, &LongFormOptions::default())
         .expect_err("wrong sample rate must fail closed");
     assert!(err.contains("16000"));
+}
+
+/// Host-local RTF benchmark over a real 5-minute recording (not part of the
+/// default gate; run explicitly with `--ignored` on a machine that has the
+/// fixture). Prints wall-clock forward-pass time and RTF (`elapsed / audio_s`)
+/// to stdout with `--nocapture`.
+#[test]
+#[ignore = "host-local: requires tmp/audio/clips/black_cat_poe_ty_5min.wav"]
+fn benchmark_forward_pass_rtf_on_real_5min_recording() {
+    let path = std::path::PathBuf::from(
+        "/Volumes/QuintinDocument/openasr-dev/openasr-legacy/tmp/audio/clips/black_cat_poe_ty_5min.wav",
+    );
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &path,
+        "Stream-VAD RTF benchmark",
+        "Stream-VAD RTF benchmark",
+    )
+    .expect("load real 5-minute wav fixture");
+    let audio_seconds = samples.len() as f64 / super::frontend::SAMPLE_RATE_HZ as f64;
+
+    let model = FireRedStreamVadModel::embedded().expect("vendored Stream-VAD weights");
+    // Warm up (page-in, allocator warm) before timing.
+    let _ = model.probabilities(&samples[..samples.len().min(16_000)]);
+
+    let start = std::time::Instant::now();
+    let probs = model.probabilities(&samples);
+    let elapsed = start.elapsed();
+
+    let rtf = elapsed.as_secs_f64() / audio_seconds;
+    println!(
+        "Stream-VAD forward pass: {audio_seconds:.1}s audio in {:.3}s ({} frames), RTF={rtf:.5}",
+        elapsed.as_secs_f64(),
+        probs.len(),
+    );
+    assert!(!probs.is_empty());
 }

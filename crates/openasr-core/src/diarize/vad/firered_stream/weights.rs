@@ -1,22 +1,19 @@
 //! Vendored FireRedTeam/FireRedVAD **Stream-VAD** (`Stream-VAD/model.pth.tar`,
 //! Apache-2.0) DFSMN weights + CMVN stats, plus a minimal safetensors loader.
 //!
-//! Same checkpoint family as [`crate::diarize::vad::firered`]'s `VAD/model.pth.tar`
-//! (`DetectModel` with `R=8, H=256, P=128, N1=20`) but with `N2=0`: the
-//! upstream args (`Namespace(R=8, H=256, P=128, N1=20, S1=1, N2=0, S2=1,
-//! idim=80, odim=1)`) drop the lookahead FSMN filter entirely, making the
-//! whole network strictly causal (no future-frame dependency at any layer) --
-//! the point of the "Stream" checkpoint. The vendored CMVN stats are
-//! numerically identical to the non-streaming checkpoint's (same shared
-//! frontend), reused here rather than re-derived.
+//! `DetectModel` with `R=8, H=256, P=128, N1=20, N2=0`: the upstream args
+//! (`Namespace(R=8, H=256, P=128, N1=20, S1=1, N2=0, S2=1, idim=80, odim=1)`)
+//! drop the lookahead FSMN filter entirely, making the whole network strictly
+//! causal (no future-frame dependency at any layer) -- the point of the
+//! "Stream" checkpoint.
 
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
 use thiserror::Error;
 
+use super::frontend::NUM_MEL_BINS;
 use super::model::{HIDDEN, LOOKBACK_ORDER, NUM_BLOCKS, PROJ};
-use crate::diarize::vad::firered::frontend::NUM_MEL_BINS;
 
 /// Vendored weights blob (safetensors). ~2.3 MB; Apache-2.0 upstream model.
 const WEIGHTS_BYTES: &[u8] = include_bytes!("../assets/firered_stream_vad_16k.safetensors");

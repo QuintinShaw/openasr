@@ -4,7 +4,7 @@ mod tests {
     use crate::realtime::{RealtimeAudioFormat, RealtimeAudioFrame, SpeechBoundaryEvent, VadMode};
 
     #[test]
-    fn external_probability_mode_routes_through_neural_vad() {
+    fn external_probability_mode_routes_through_stream_vad() {
         // Skip if the vendored model is unavailable in this build.
         if crate::diarize::vad::shared_model().is_none() {
             return;
@@ -39,65 +39,7 @@ mod tests {
         }
         assert!(
             started,
-            "neural VAD (ExternalProbability) should emit SpeechStarted on golden speech"
-        );
-    }
-
-    #[test]
-    fn external_probability_mode_honors_firered_stream_opt_in() {
-        // Opt-in via OPENASR_VAD: the realtime session must construct the
-        // FireRedVAD Stream-VAD detector instead of Silero, and Silero must
-        // stay untouched as the default when the env var is unset (asserted
-        // by `external_probability_mode_routes_through_neural_vad` above).
-        if crate::diarize::vad::FireRedStreamVadProvider::shared().is_none() {
-            return;
-        }
-        let saved = std::env::var("OPENASR_VAD").ok();
-        // SAFETY: sequential mutation, restored before returning; mirrors the
-        // guard already used elsewhere for this same env var in this crate's
-        // tests (e.g. `native_transcribe::tests::openasr_vad_env_override_selects_firered`).
-        unsafe { std::env::set_var("OPENASR_VAD", "firered-stream") };
-
-        let mut config = RealtimeSessionConfig::new(
-            "rt_neural_stream",
-            "whisper-small:candidate",
-            "2026-05-09T00:00:00Z",
-        );
-        config.vad.mode = VadMode::ExternalProbability;
-        config.vad.energy_threshold = 0.5;
-        config.vad.frame_duration_ms = 20;
-        let mut controller = RealtimeSessionController::new(config).unwrap();
-
-        let format = RealtimeAudioFormat::pcm16_mono_16khz();
-        let pcm = crate::diarize::vad::test_fixtures::golden_pcm();
-        let mut started = false;
-        let mut start_ms = 0u64;
-        for (seq, frame_samples) in pcm.chunks(320).enumerate() {
-            if frame_samples.len() < 320 {
-                break;
-            }
-            let frame =
-                RealtimeAudioFrame::new(seq as u64, start_ms, format, frame_samples.to_vec())
-                    .unwrap();
-            let boundaries = controller.process_vad_frame(&frame);
-            if boundaries
-                .iter()
-                .any(|b| matches!(b, SpeechBoundaryEvent::SpeechStarted { .. }))
-            {
-                started = true;
-                break;
-            }
-            start_ms += 20;
-        }
-
-        match saved {
-            Some(value) => unsafe { std::env::set_var("OPENASR_VAD", value) },
-            None => unsafe { std::env::remove_var("OPENASR_VAD") },
-        }
-
-        assert!(
-            started,
-            "Stream-VAD (opt-in ExternalProbability) should emit SpeechStarted on golden speech"
+            "Stream-VAD (ExternalProbability) should emit SpeechStarted on golden speech"
         );
     }
 

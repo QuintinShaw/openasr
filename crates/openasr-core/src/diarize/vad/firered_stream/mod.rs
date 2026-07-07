@@ -1,20 +1,19 @@
 //! FireRedVAD **Stream-VAD** (`FireRedTeam/FireRedVAD`, Apache-2.0,
-//! `Stream-VAD/model.pth.tar`): the causal (`N2 = 0`, no lookahead) sibling
-//! of [`crate::diarize::vad::firered`]'s non-streaming `VAD/model.pth.tar`.
-//! Vendored the same way (a ~2.3 MB `f32` safetensors blob baked in via
-//! `include_bytes!`, no ggml/.oasr/catalog involvement).
+//! `Stream-VAD/model.pth.tar`): a causal (`N2 = 0`, no lookahead) DFSMN
+//! voice-activity detector. Vendored as a ~2.3 MB `f32` safetensors blob
+//! baked in via `include_bytes!` (no ggml/.oasr/catalog involvement), so it
+//! is always available.
 //!
-//! Because it is strictly causal, Stream-VAD is the only FireRedVAD
-//! checkpoint suitable for realtime endpointing: it wires into
-//! [`crate::realtime`]'s `VadMode::ExternalProbability` path as a selectable
-//! neural sub-engine alongside Silero (`OPENASR_VAD=firered-stream`), and
-//! also drops into the [`crate::longform::LongFormVadProvider`] seam
-//! (`OPENASR_VAD=firered-stream` for long-form too) so the same checkpoint
-//! can be benchmarked as a long-form engine against the non-streaming
-//! `VAD/model.pth.tar` -- the open question this module exists to let
-//! callers measure, not to answer by picking a new default. **Silero stays
-//! the default for both paths**; this is opt-in only.
+//! This is the **sole VAD engine** in OpenASR: because it is strictly
+//! causal, the same checkpoint backs both realtime endpointing
+//! ([`crate::realtime`]'s `VadMode::ExternalProbability` path, via
+//! [`FireRedStreamingVad`]) and long-form speech slicing (the
+//! [`crate::longform::LongFormVadProvider`] seam, via
+//! [`FireRedStreamVadProvider`]) and diarization's speech-region resolution.
+//! There is no other neural engine and no runtime engine-selection
+//! mechanism to opt out of it.
 
+mod frontend;
 mod model;
 mod provider;
 mod streaming;
@@ -32,8 +31,9 @@ pub use streaming::FireRedStreamingVad;
 static SHARED_MODEL: OnceLock<Option<FireRedStreamVadModel>> = OnceLock::new();
 
 /// The process-wide Stream-VAD model, loaded once (~2.3 MB). Returns `None`
-/// if the vendored weights fail to parse, so callers fall back to
-/// Silero/energy.
+/// only if the vendored weights blob fails to parse (a build-integrity
+/// problem, since the blob is a fixed, committed asset); callers should treat
+/// that as an unexpected fail-closed condition, not a routine fallback.
 pub fn shared_model() -> Option<&'static FireRedStreamVadModel> {
     SHARED_MODEL
         .get_or_init(|| FireRedStreamVadModel::embedded().ok())
