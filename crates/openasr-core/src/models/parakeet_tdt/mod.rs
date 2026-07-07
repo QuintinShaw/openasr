@@ -17,8 +17,10 @@ pub use package_import::{
     ParakeetTdtImportRequest, ParakeetTdtImportResult, ParakeetTdtQuantizationMode,
     convert_local_parakeet_tdt_source_to_runtime_pack,
 };
-// Encoder graph / predictor / greedy decode / executor land in the follow-up
-// stages; the importer + runtime contract are the S1 surface.
+// Predictor / greedy decode / executor land in the follow-up stages.
+pub(crate) mod encoder_graph;
+pub(crate) mod encoder_weights;
+pub(crate) mod graph_config;
 pub(crate) mod runtime_contract;
 
 pub(crate) const PARAKEET_TDT_MODEL_FAMILY: &str = "parakeet-tdt";

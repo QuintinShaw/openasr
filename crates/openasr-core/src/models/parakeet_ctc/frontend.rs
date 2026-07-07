@@ -49,7 +49,14 @@ pub(crate) struct ParakeetFrontend {
 
 impl ParakeetFrontend {
     pub(crate) fn new(metadata: &ParakeetCtcExecutionMetadata) -> Self {
-        let n_mels = metadata.n_mels;
+        Self::with_n_mels(metadata.n_mels)
+    }
+
+    /// Same NeMo/HF `ParakeetFeatureExtractor` pipeline for a caller-chosen
+    /// mel-bin count (parakeet-tdt uses 128 mels; everything else — window,
+    /// hop, preemphasis, slaney filterbank, log guard, per-feature norm — is
+    /// identical across the parakeet family).
+    pub(crate) fn with_n_mels(n_mels: usize) -> Self {
         let fft_bins = N_FFT / 2 + 1;
         Self {
             n_mels,
