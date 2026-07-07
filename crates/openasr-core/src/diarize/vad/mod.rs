@@ -24,9 +24,13 @@
 //! [`crate::realtime::VadMode::Energy`] for realtime) remains available as an
 //! explicit, independently useful mode -- not a VAD engine choice, but a
 //! deliberately simpler alternative for callers that want no model
-//! dependency at all (e.g. `--segment-mode energy`, `OPENASR_VAD=energy`).
-//! There is no other neural engine and no runtime engine-selection mechanism
-//! between neural implementations: Stream-VAD is not optional.
+//! dependency at all. Selection is surface-specific: long-form picks the
+//! energy gate only via the explicit `--segment-mode energy` slicing mode
+//! (`resolve_longform_vad_provider` does not consult any env var and always
+//! resolves Stream-VAD for VAD-based slicing); `OPENASR_VAD=energy` only
+//! affects realtime (`crate::realtime::VadMode`). There is no other neural
+//! engine and no runtime engine-selection mechanism between neural
+//! implementations: Stream-VAD is not optional.
 
 mod firered_stream;
 

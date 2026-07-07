@@ -359,7 +359,7 @@ fn run_native_transcription_impl(
         install_request_backend_override(backend_preference.request_backend_override());
     let mut longform_metadata: Option<TranscriptionLongFormMetadata> = None;
     if run_longform {
-        let (vad_provider, vad_engine_label) = resolve_longform_vad_provider(&longform_options);
+        let (vad_provider, vad_engine_label) = resolve_longform_vad_provider(&longform_options)?;
         let plan = plan_longform_slices(
             &prepared_audio,
             16_000,
@@ -751,15 +751,20 @@ fn shared_native_ggml_execution_dispatch() -> &'static GgmlAsrExecutionDispatch 
 
 /// Resolve the long-form VAD provider for this request, returning the
 /// provider and a label for the engine that ran. Stream-VAD is the sole VAD
-/// engine and is vendored (`include_bytes!`), so it is expected to always
-/// load; the `.expect` here is a fail-closed build-integrity check, not a
-/// routine fallback.
+/// engine and is vendored (`include_bytes!`), so in practice this always
+/// loads (a build-integrity problem otherwise); still, fail closed with a
+/// typed `BackendError` on the request path instead of panicking.
 fn resolve_longform_vad_provider(
     _options: &crate::LongFormOptions,
-) -> (Box<dyn LongFormVadProvider>, &'static str) {
-    let provider = crate::diarize::vad::FireRedStreamVadProvider::shared()
-        .expect("vendored Stream-VAD weights failed to parse; this indicates a corrupted build");
-    (Box::new(provider), "firered-stream")
+) -> Result<(Box<dyn LongFormVadProvider>, &'static str), BackendError> {
+    let provider = crate::diarize::vad::FireRedStreamVadProvider::shared().ok_or_else(|| {
+        BackendError::NativeFailClosed {
+            reason: "Stream-VAD is unavailable: vendored weights failed to parse \
+                         (build-integrity problem)"
+                .to_string(),
+        }
+    })?;
+    Ok((Box::new(provider), "firered-stream"))
 }
 
 fn resolve_native_longform_policy(
@@ -1695,7 +1700,8 @@ mod tests {
     #[test]
     fn resolve_longform_vad_provider_always_resolves_stream_vad() {
         let options = crate::LongFormOptions::default();
-        let (_, label) = resolve_longform_vad_provider(&options);
+        let (_, label) =
+            resolve_longform_vad_provider(&options).expect("Stream-VAD must resolve in tests");
         assert_eq!(label, "firered-stream");
     }
 
@@ -1725,7 +1731,8 @@ mod tests {
         // `Vad` mode actually exercises slicing rather than the `total <=
         // chunk_samples` single-slice shortcut.
         options.chunk_seconds = 2.0;
-        let (provider, label) = resolve_longform_vad_provider(&options);
+        let (provider, label) = resolve_longform_vad_provider(&options)
+            .expect("Stream-VAD's vendored weights must load in tests");
         assert_eq!(
             label, "firered-stream",
             "Stream-VAD's vendored weights must load in tests"

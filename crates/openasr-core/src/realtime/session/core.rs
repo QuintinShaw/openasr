@@ -230,12 +230,14 @@ impl RealtimeSessionController {
         config.validate()?;
         let neural_vad = if config.vad.mode == VadMode::ExternalProbability {
             // Stream-VAD is the sole neural engine and is vendored
-            // (`include_bytes!`), so it is expected to always load; the
-            // `.expect` here is a fail-closed build-integrity check, not a
-            // routine fallback.
-            Some(Box::new(FireRedStreamingVad::shared().expect(
-                "vendored Stream-VAD weights failed to parse; this indicates a corrupted build",
-            )))
+            // (`include_bytes!`), so in practice this always loads (a build
+            // integrity problem otherwise). Still, fail closed with a typed
+            // error instead of panicking on the request path -- the server
+            // WS handler already surfaces `RealtimeSessionError` to the
+            // client as a startup error.
+            Some(Box::new(
+                FireRedStreamingVad::shared().ok_or(RealtimeSessionError::StreamVadUnavailable)?,
+            ))
         } else {
             None
         };
@@ -405,4 +407,8 @@ pub enum RealtimeSessionError {
         from: RealtimeSessionState,
         action: &'static str,
     },
+    #[error(
+        "Stream-VAD is unavailable: vendored weights failed to parse (build-integrity problem)."
+    )]
+    StreamVadUnavailable,
 }
