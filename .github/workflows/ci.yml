@@ -10,6 +10,12 @@ on:
     paths-ignore:
       - "docs/**"
       - "**/*.md"
+  # Manual-only: builds the iOS/macOS xcframework SDK artifact (see
+  # scripts/build-xcframework.sh, docs/SDK_IOS_MACOS.md). Not run on every PR
+  # -- three arch slices plus `xcodebuild -create-xcframework` is too heavy
+  # for the per-PR gate; `ios-compile` below already covers openasr-ffi's
+  # compile health for aarch64-apple-ios on every push/PR.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -97,8 +103,12 @@ jobs:
       # incl. reqwest/ring's iOS asm build. openasr-cli/-server/-system-audio
       # are desktop/CLI-shaped (system audio capture, HTTP server) and are not
       # part of this gate; openasr-core alone represents the inference engine.
-      - name: Check openasr-core for aarch64-apple-ios
-        run: cargo check -p openasr-core --target aarch64-apple-ios
+      # Phase 2 adds openasr-ffi (the xcframework SDK's C ABI crate, see
+      # crates/openasr-ffi) to the same check -- it wraps openasr-core so its
+      # own iOS cross-compile health rides along here for free, cheaper than
+      # the full xcframework build (see the `xcframework` job below).
+      - name: Check openasr-core and openasr-ffi for aarch64-apple-ios
+        run: cargo check -p openasr-core -p openasr-ffi --target aarch64-apple-ios
 
   dependency-policy:
     runs-on: ubuntu-latest
@@ -109,3 +119,34 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           rust-version: 1.95.0
+
+  xcframework:
+    name: Build OpenASR.xcframework (manual)
+    # Manual-only (see the workflow_dispatch trigger comment above): three
+    # arch slices (ios-arm64 device, ios-arm64-simulator, macos-arm64) plus
+    # `xcodebuild -create-xcframework` is too heavy for the per-PR gate.
+    # GitHub-hosted macos-latest ships full Xcode (iphoneos + iphonesimulator
+    # SDKs), so unlike a Command-Line-Tools-only dev machine this produces all
+    # three slices -- see scripts/build-xcframework.sh's SDK-detection
+    # fallback for the local (CLT-only) degraded path.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cbindgen
+        run: cargo install cbindgen --locked
+      - name: Header drift gate
+        run: scripts/generate-ffi-header.sh --check
+      - name: Build xcframework
+        run: scripts/build-xcframework.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: OpenASR.xcframework
+          path: target/xcframework/OpenASR.xcframework
+          if-no-files-found: error
