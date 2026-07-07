@@ -237,6 +237,11 @@ LANG_BY_FAMILY = {
     "wav2vec2": ["en"],
     # SenseVoiceSmall: zh, yue (Cantonese), en, ja, ko with model-side LID.
     "sensevoice": ["en", "ja", "ko", "yue", "zh"],
+    # FireRedASR-AED-L: fixed bilingual Mandarin + English char/SPM vocab, no
+    # language-selection prompt token (mirrors LanguageFamilyHint::
+    # FixedMultilingual { languages: &["zh", "en"] } in
+    # ggml_family_adapter.rs / arch/mod.rs).
+    "firered-aed": ["en", "zh"],
 }
 
 # Per-family source-language parameter policy for the catalog's `language_mode`
@@ -280,6 +285,9 @@ LANGUAGE_MODE_BY_FAMILY = {
     # SenseVoice: DetectAndSelectsViaPrompt -- explicit zh/yue/en/ja/ko selection
     # via the 4-token prompt, decode-time LID (readable <|lang|> tag) when unset.
     "sensevoice": "detect_and_specify",
+    # FireRedASR-AED: FixedMultilingual -- fixed zh+en char/SPM vocab, no
+    # per-request language selection or decode-time LID token at all.
+    "firered-aed": "fixed_multilingual",
 }
 
 # SpecifyOnly's conditioned default, mirroring the `default_language` literal
@@ -378,6 +386,11 @@ PUNCTUATION_BY_FAMILY = {
     "dolphin": False,
     "moonshine": True,
     "sensevoice": True,
+    # firered-aed: the reference tokenizer's dict.txt has no punctuation/
+    # <space> entries (char + SPM vocab trained on unpunctuated Mandarin ASR
+    # corpora), so the raw decode is honestly punctuation-free (verified on
+    # the golden-diff fixture transcript).
+    "firered-aed": False,
 }
 
 

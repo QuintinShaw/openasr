@@ -746,9 +746,21 @@ fn build_firered_runtime_tensors(
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for tensor in &safetensors.header().tensors {
-        // Fail closed on ANY unrecognized tensor: the AED checkpoint has no
-        // droppable tensors, so an unmapped name means upstream drift this
-        // importer has not been audited against.
+        // FireRedASR2-AED adds a post-hoc CTC branch (`ctc.ctc_lo.{weight,bias}`)
+        // on top of the byte-identical v1 AED architecture. This importer only
+        // ever runs the AED decoder path (no timestamp/CTC feature in this
+        // family yet), so the CTC head is intentionally dropped rather than
+        // mapped: it is unused by the runtime and carrying it would need a new
+        // tensor class for no behavioral benefit. Everything else must still
+        // map 1:1, so this is a narrow, explicit skip -- not a blanket
+        // "ignore unknown tensors" escape hatch.
+        if tensor.name.starts_with("ctc.") {
+            continue;
+        }
+        // Fail closed on any OTHER unrecognized tensor: the AED checkpoint has
+        // no droppable tensors beyond the CTC branch above, so an unmapped
+        // name means upstream drift this importer has not been audited
+        // against.
         let Some((target_name, class)) = map_firered_tensor_name(tensor.name.as_str()) else {
             return Err(validate_error(format!(
                 "firered-aed source has an unrecognized tensor '{}'",
@@ -1156,5 +1168,87 @@ mod tests {
             metadata.get("tokenizer.ggml.tokens"),
             Some(GgufWriteValue::StringArray(list)) if list.len() == 7832
         ));
+    }
+
+    /// Writes a minimal on-disk F32 safetensors file (mirrors
+    /// `pt_to_safetensors.write_safetensors`'s wire format: an 8-byte LE
+    /// header length, the JSON header, then raw tensor bytes).
+    fn write_minimal_safetensors(path: &Path, tensors: &[(&str, Vec<u64>, Vec<f32>)]) {
+        let mut header = serde_json::Map::new();
+        let mut blob = Vec::new();
+        for (name, shape, values) in tensors {
+            let start = blob.len();
+            for value in values {
+                blob.extend_from_slice(&value.to_le_bytes());
+            }
+            header.insert(
+                (*name).to_string(),
+                serde_json::json!({
+                    "dtype": "F32",
+                    "shape": shape,
+                    "data_offsets": [start, blob.len()],
+                }),
+            );
+        }
+        let header_bytes = serde_json::to_vec(&header).unwrap();
+        let mut file_bytes = Vec::new();
+        file_bytes.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        file_bytes.extend_from_slice(&header_bytes);
+        file_bytes.extend_from_slice(&blob);
+        std::fs::write(path, file_bytes).unwrap();
+    }
+
+    #[test]
+    fn build_firered_runtime_tensors_drops_ctc_branch_but_keeps_the_rest() {
+        // FireRedASR2-AED adds `ctc.ctc_lo.{weight,bias}` on top of the
+        // otherwise-identical v1 tensor set; the importer must silently skip
+        // that branch (see the comment in `build_firered_runtime_tensors`)
+        // while still mapping every other tensor and rejecting genuinely
+        // unrecognized ones.
+        let dir =
+            std::env::temp_dir().join(format!("firered-ctc-skip-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        write_minimal_safetensors(
+            &path,
+            &[
+                ("ctc.ctc_lo.weight", vec![2, 3], vec![0.0; 6]),
+                ("ctc.ctc_lo.bias", vec![2], vec![0.0; 2]),
+                ("decoder.layer_norm_out.weight", vec![2], vec![1.0, 2.0]),
+            ],
+        );
+        let safetensors = SafetensorsFile::open(&path).unwrap();
+        let out = build_firered_runtime_tensors(&safetensors, FireRedAedQuantizationMode::Fp16)
+            .expect("ctc.* tensors must be skipped, not rejected");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(out.len(), 1, "only the non-CTC tensor should be written");
+        assert_eq!(out[0].name, "dec.out_norm.weight");
+    }
+
+    #[test]
+    fn build_firered_runtime_tensors_still_rejects_other_unknown_tensors() {
+        // The ctc.* skip must stay narrow: any other unmapped tensor name is
+        // still upstream drift this importer has not been audited against.
+        let dir = std::env::temp_dir().join(format!(
+            "firered-unknown-tensor-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        write_minimal_safetensors(
+            &path,
+            &[("some.brand.new.head.weight", vec![2], vec![1.0, 2.0])],
+        );
+        let safetensors = SafetensorsFile::open(&path).unwrap();
+        let error = build_firered_runtime_tensors(&safetensors, FireRedAedQuantizationMode::Fp16)
+            .expect_err("unmapped, non-ctc tensor names must still fail closed");
+        std::fs::remove_dir_all(&dir).ok();
+        match error {
+            LocalSourceImportError::Validate(message) => {
+                assert!(message.contains("unrecognized tensor"), "{message}");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 }

@@ -164,3 +164,18 @@ import_subcommand = "import parakeet-tdt"
 upstream_repo = "nvidia/parakeet-tdt-0.6b-v3"
 source_revision = "7c35754d166cca382ad1e53e68b01e7c575f3a1d"
 needs_license_flags = false
+
+# FireRedASR2-AED: same Conformer-encoder + Transformer-decoder importer as
+# v1 (architecture is byte-identical per upstream source diff); only the
+# vocab (7832 -> 8667 tokens) and a new post-hoc CTC branch
+# (`ctc.ctc_lo.{weight,bias}`, dropped at import -- no timestamp feature in
+# this family yet) changed. Takes model.safetensors (from
+# pt_to_safetensors.py) + dict.txt + cmvn.txt; license fields live in
+# models-core.toml (needs_license_flags = false, like dolphin/sensevoice/
+# xasr-zipformer). Only v2 ships -- v1 (FireRedASR-AED-L) was superseded
+# before its catalog entry ever went public.
+["firered-aed-l-v2"]
+import_subcommand = "import firered-aed"
+upstream_repo = "FireRedTeam/FireRedASR2-AED"
+source_revision = "2304afed56eacfee6256dee5937ed22ffa0b64ec"
+needs_license_flags = false

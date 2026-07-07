@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-07T05:42:13+00:00",
+  "generated_at": "2026-07-07T11:08:27+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -257,6 +257,114 @@
         }
       },
       "upstream_release_date": "2025-08-14"
+    },
+    {
+      "id": "firered-aed-l-v2",
+      "kind": "asr-model",
+      "display_name": "FireRedASR2 AED-L",
+      "family": "firered-aed",
+      "aliases": [
+        "firered-aed",
+        "firered",
+        "firered-aed-v2"
+      ],
+      "pull_alias": "firered-aed-l-v2",
+      "size": "l",
+      "languages": [
+        "en",
+        "zh"
+      ],
+      "vendor": "FireRedTeam",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/FireRedTeam/FireRedASR2-AED/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/firered-aed-l-v2",
+      "hf_revision": "dc176bb00c78e4959e2bff2273f409533c0bfd9b",
+      "public": false,
+      "min_cli_version": "0.1.0",
+      "recommended_quant": "q4_k",
+      "pull_recommended": "firered-aed-l-v2:q4",
+      "prose": {
+        "tagline": "FireRedTeam's Mandarin-first bilingual ASR \u2014 attention encoder-decoder tuned for state-of-the-art Chinese and dialect accuracy",
+        "overview": [
+          "FireRedASR2-AED is the attention-based encoder-decoder member of **FireRedASR2**, the successor\nto FireRedTeam's open-source industrial-grade **FireRedASR** speech-recognition family, released\nas part of the **FireRedASR2S** all-in-one ASR system. It pairs a **Conformer encoder** with a\n**Transformer decoder** at 1.1B parameters -- architecturally byte-identical to the original\nFireRedASR-AED-L -- retrained on a larger token vocabulary. The FireRedASR2S technical report\n(arXiv:2603.10420, Table 2) reports **3.05% average Character Error Rate** across four public\nMandarin benchmarks (aishell1 at 0.57%), **11.67% average CER** across 19 public Chinese\ndialect/accent benchmarks, and **1.17% CER** on a singing-lyrics benchmark, outperforming\nDoubao-ASR and matching Qwen3-ASR on the paper's own comparison table. It is bilingual (Mandarin\nChinese and English, including code-switching). This OpenASR repo repackages the weights as\n`.oasr` packs that run natively in the OpenASR runtime -- no Python at inference time, all\ndecoding local. The **q4_k** build is the recommended default for everyday use; **q8_0** trades\nsome size for closer fp16 fidelity and **fp16** is for maximum fidelity or verification. Note:\nFireRedTeam also publishes a larger **FireRedASR2-LLM** (Encoder-Adapter-LLM, 2.89%/11.55% avg\nCER) variant that this repo does not distribute -- the numbers above are for this AED checkpoint\nonly, and should not be conflated with the original (v1) FireRedASR-AED-L's 3.18%/0.55% figures,\nwhich come from a different training run and benchmark protocol."
+        ],
+        "highlights": [
+          "\ud83e\udd47 **State-of-the-art Mandarin accuracy** \u2014 3.05% average CER across four public Mandarin benchmarks, with 0.57% CER on aishell1 (arXiv:2603.10420 Table 2)",
+          "\ud83d\udde3\ufe0f **Strong dialect coverage** \u2014 11.67% average CER across 19 public Chinese dialect/accent benchmarks, beating Doubao-ASR (15.39%) and matching Qwen3-ASR (11.85%) on the paper's own comparison table",
+          "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **Bilingual Mandarin + English** \u2014 one 1.1B checkpoint decodes both languages plus code-switching, no language flag needed",
+          "\ud83c\udfa4 **Singing-lyrics robustness** \u2014 the paper reports 1.17% CER on a singing-lyrics benchmark, alongside the speech-recognition numbers above",
+          "\ud83c\udfd7\ufe0f **Conformer encoder + Transformer decoder** \u2014 an attention-based encoder-decoder, architecturally identical to FireRedASR-AED-L, retrained on a larger vocabulary"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "firered-aed-l-v2:fp16",
+          "filename": "firered-aed-l-v2-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/firered-aed-l-v2/resolve/dc176bb00c78e4959e2bff2273f409533c0bfd9b/firered-aed-l-v2-fp16.oasr",
+          "sha256": "da280b2280c52c4f5034a91f7e21c93731e4a26d060d04d6bc7421f396787306",
+          "size_bytes": 2345595360,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.3950785113636363,
+            "rtf_metal": 0.7874602424545455,
+            "peak_rss_bytes": 4739596288,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "firered-aed-l-v2:q8",
+          "filename": "firered-aed-l-v2-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/firered-aed-l-v2/resolve/dc176bb00c78e4959e2bff2273f409533c0bfd9b/firered-aed-l-v2-q8_0.oasr",
+          "sha256": "aab62beffd6e64ce7d1d946e1c0275abc67f200d3476393af8ba8fa9d9c1f9a7",
+          "size_bytes": 1277697376,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.3554502461818182,
+            "rtf_metal": 0.3453623030909091,
+            "peak_rss_bytes": 4348919808,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "firered-aed-l-v2:q4",
+          "filename": "firered-aed-l-v2-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/firered-aed-l-v2/resolve/dc176bb00c78e4959e2bff2273f409533c0bfd9b/firered-aed-l-v2-q4_k.oasr",
+          "sha256": "e262cfdc8cda5a5bc72c6299ddb06c2940e37c679e554566199b9cf0694b9388",
+          "size_bytes": 708540896,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.38383374618181815,
+            "rtf_metal": 0.30726010227272726,
+            "peak_rss_bytes": 4095672320,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ],
+      "language_mode": "fixed_multilingual",
+      "emits_punctuation": false,
+      "sort_weight": 912,
+      "recommended": true,
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "FireRedTeam \u51fa\u54c1\u7684\u4e2d\u6587\u4f18\u5148\u53cc\u8bed\u8bed\u97f3\u8bc6\u522b \u2014 \u6ce8\u610f\u529b\u7f16\u7801\u5668-\u89e3\u7801\u5668\u67b6\u6784\uff0c\u4e2d\u6587\u4e0e\u65b9\u8a00\u8bc6\u522b\u51c6\u786e\u7387\u4e1a\u754c\u9886\u5148",
+          "highlights": [
+            "\ud83e\udd47 **\u4e2d\u6587\u8bc6\u522b\u51c6\u786e\u7387\u4e1a\u754c\u9886\u5148** \u2014 \u5728\u56db\u4e2a\u516c\u5f00\u4e2d\u6587\u57fa\u51c6\u4e0a\u5e73\u5747\u5b57\u9519\u7387 3.05%\uff0caishell1 \u4e0a\u4f4e\u81f3 0.57%\uff08arXiv:2603.10420 \u8868 2\uff09",
+            "\ud83d\udde3\ufe0f **\u65b9\u8a00\u8986\u76d6\u80fd\u529b\u5f3a** \u2014 \u5728 19 \u4e2a\u516c\u5f00\u4e2d\u6587\u65b9\u8a00/\u53e3\u97f3\u57fa\u51c6\u4e0a\u5e73\u5747\u5b57\u9519\u7387 11.67%\uff0c\u4f18\u4e8e Doubao-ASR\uff0815.39%\uff09\uff0c\u4e0e Qwen3-ASR\uff0811.85%\uff09\u76f8\u5f53\uff08\u8bba\u6587\u81ea\u8eab\u5bf9\u6bd4\u8868\uff09",
+            "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **\u4e2d\u82f1\u53cc\u8bed** \u2014 \u5355\u4e2a 1.1B \u53c2\u6570\u68c0\u67e5\u70b9\u540c\u65f6\u652f\u6301\u4e2d\u6587\u3001\u82f1\u8bed\u53ca\u4e2d\u82f1\u6df7\u8bf4\uff0c\u65e0\u9700\u6307\u5b9a\u8bed\u8a00",
+            "\ud83c\udfa4 **\u6f14\u5531\u6b4c\u8bcd\u9c81\u68d2\u6027** \u2014 \u8bba\u6587\u62a5\u544a\u5728\u6f14\u5531\u6b4c\u8bcd\u57fa\u51c6\u4e0a\u5b57\u9519\u7387 1.17%\uff0c\u4e0e\u4e0a\u8ff0\u8bed\u97f3\u8bc6\u522b\u6307\u6807\u5e76\u5217",
+            "\ud83c\udfd7\ufe0f **Conformer \u7f16\u7801\u5668 + Transformer \u89e3\u7801\u5668** \u2014 \u6ce8\u610f\u529b\u7f16\u7801\u5668-\u89e3\u7801\u5668\u67b6\u6784\uff0c\u4e0e FireRedASR-AED-L \u67b6\u6784\u5b8c\u5168\u76f8\u540c\uff0c\u5728\u66f4\u5927\u8bcd\u8868\u4e0a\u91cd\u65b0\u8bad\u7ec3"
+          ]
+        }
+      },
+      "upstream_release_date": "2026-02-12",
+      "min_core_version": "0.1.9"
     },
     {
       "id": "xasr-zh-en",

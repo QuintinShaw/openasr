@@ -1,0 +1,97 @@
+# Per-model card prose for openasr/firered-aed-l-v2. Distilled (paraphrased,
+# not copied) from the upstream FireRedTeam/FireRedASR2-AED model card and the
+# FireRedASR2S technical report (arXiv:2603.10420, Table 2) -- see
+# tmp/firered2-src/README.md at import time. Claims are kept to what those two
+# sources state; re-verify if the checkpoint changes. CER numbers below are
+# for the AED variant only -- the LLM variant (FireRedASR2-LLM, 2.89% avg
+# Mandarin CER / 11.55% avg dialect CER) is a different, larger model this
+# repo does not distribute; never conflate the two, and never mix these v2
+# numbers with the superseded v1 FireRedASR-AED-L figures (3.18%/0.55%) from a
+# different training run and benchmark protocol.
+
+tagline = "FireRedTeam's Mandarin-first bilingual ASR — attention encoder-decoder tuned for state-of-the-art Chinese and dialect accuracy"
+tagline_zh = "FireRedTeam 出品的中文优先双语语音识别 — 注意力编码器-解码器架构，中文与方言识别准确率业界领先"
+
+highlights = [
+  "🥇 **State-of-the-art Mandarin accuracy** — 3.05% average CER across four public Mandarin benchmarks, with 0.57% CER on aishell1 (arXiv:2603.10420 Table 2)",
+  "🗣️ **Strong dialect coverage** — 11.67% average CER across 19 public Chinese dialect/accent benchmarks, beating Doubao-ASR (15.39%) and matching Qwen3-ASR (11.85%) on the paper's own comparison table",
+  "🇨🇳🇬🇧 **Bilingual Mandarin + English** — one 1.1B checkpoint decodes both languages plus code-switching, no language flag needed",
+  "🎤 **Singing-lyrics robustness** — the paper reports 1.17% CER on a singing-lyrics benchmark, alongside the speech-recognition numbers above",
+  "🏗️ **Conformer encoder + Transformer decoder** — an attention-based encoder-decoder, architecturally identical to FireRedASR-AED-L, retrained on a larger vocabulary",
+]
+
+highlights_zh = [
+  "🥇 **中文识别准确率业界领先** — 在四个公开中文基准上平均字错率 3.05%，aishell1 上低至 0.57%（arXiv:2603.10420 表 2）",
+  "🗣️ **方言覆盖能力强** — 在 19 个公开中文方言/口音基准上平均字错率 11.67%，优于 Doubao-ASR（15.39%），与 Qwen3-ASR（11.85%）相当（论文自身对比表）",
+  "🇨🇳🇬🇧 **中英双语** — 单个 1.1B 参数检查点同时支持中文、英语及中英混说，无需指定语言",
+  "🎤 **演唱歌词鲁棒性** — 论文报告在演唱歌词基准上字错率 1.17%，与上述语音识别指标并列",
+  "🏗️ **Conformer 编码器 + Transformer 解码器** — 注意力编码器-解码器架构，与 FireRedASR-AED-L 架构完全相同，在更大词表上重新训练",
+]
+
+intro = """
+FireRedASR2-AED is the attention-based encoder-decoder member of **FireRedASR2**, the successor
+to FireRedTeam's open-source industrial-grade **FireRedASR** speech-recognition family, released
+as part of the **FireRedASR2S** all-in-one ASR system. It pairs a **Conformer encoder** with a
+**Transformer decoder** at 1.1B parameters -- architecturally byte-identical to the original
+FireRedASR-AED-L -- retrained on a larger token vocabulary. The FireRedASR2S technical report
+(arXiv:2603.10420, Table 2) reports **3.05% average Character Error Rate** across four public
+Mandarin benchmarks (aishell1 at 0.57%), **11.67% average CER** across 19 public Chinese
+dialect/accent benchmarks, and **1.17% CER** on a singing-lyrics benchmark, outperforming
+Doubao-ASR and matching Qwen3-ASR on the paper's own comparison table. It is bilingual (Mandarin
+Chinese and English, including code-switching). This OpenASR repo repackages the weights as
+`.oasr` packs that run natively in the OpenASR runtime -- no Python at inference time, all
+decoding local. The **q4_k** build is the recommended default for everyday use; **q8_0** trades
+some size for closer fp16 fidelity and **fp16** is for maximum fidelity or verification. Note:
+FireRedTeam also publishes a larger **FireRedASR2-LLM** (Encoder-Adapter-LLM, 2.89%/11.55% avg
+CER) variant that this repo does not distribute -- the numbers above are for this AED checkpoint
+only, and should not be conflated with the original (v1) FireRedASR-AED-L's 3.18%/0.55% figures,
+which come from a different training run and benchmark protocol.
+"""
+
+intro_zh = """
+FireRedASR2-AED 是 **FireRedTeam** 开源工业级语音识别模型家族 **FireRedASR** 的下一代
+**FireRedASR2** 中基于注意力编码器-解码器（AED）架构的成员，作为一体化语音识别系统
+**FireRedASR2S** 的一部分发布。它由 **Conformer 编码器**与 **Transformer 解码器**组成，11 亿
+参数——与初代 FireRedASR-AED-L 架构逐字节相同，在更大的词表上重新训练。FireRedASR2S 技术报告
+（arXiv:2603.10420，表 2）报告：在 aishell1、aishell2、WenetSpeech-net、WenetSpeech-meeting 四
+个公开中文基准上平均字错率 **3.05%**（aishell1 上 0.57%），在 19 个公开中文方言/口音基准上平均
+字错率 **11.67%**，在演唱歌词基准上字错率 **1.17%**，在论文自身对比表中优于 Doubao-ASR、与
+Qwen3-ASR 相当。它支持中英双语（含中英混说）。
+
+这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理，不会把音频上传到云端。
+`q4_k` 是日常使用的推荐默认版本；`q8_0` 在体积和保真度间取得更接近 fp16 的平衡；`fp16` 适合最高保真
+或验证场景。注意：FireRedTeam 同时发布了更大的 **FireRedASR2-LLM**（Encoder-Adapter-LLM 架构，
+平均字错率 2.89%/11.55%）变体，本仓库不分发该变体——以上数据仅针对本 AED 检查点，且不应与初代
+（v1）FireRedASR-AED-L 的 3.18%/0.55% 数据混同，两者来自不同的训练与评测口径。
+"""
+
+acknowledgement = """
+This pack is a redistribution of **FireRedASR2-AED**, created and released by **FireRedTeam**
+([FireRedTeam/FireRedASR2-AED](https://huggingface.co/FireRedTeam/FireRedASR2-AED),
+[FireRedTeam/FireRedASR2S](https://github.com/FireRedTeam/FireRedASR2S)). All credit for the
+architecture, training, and weights belongs to FireRedTeam; the license is inherited from and
+identical to the upstream model (**Apache-2.0**, as declared on the upstream model card). Thank
+you to FireRedTeam for releasing their work openly. OpenASR only performs format conversion,
+quantization, runtime verification, and local-inference adaptation.
+"""
+
+acknowledgement_zh = """
+本模型包重新分发自 **FireRedTeam** 开源的 FireRedASR2-AED
+([FireRedTeam/FireRedASR2-AED](https://huggingface.co/FireRedTeam/FireRedASR2-AED)，
+[FireRedTeam/FireRedASR2S](https://github.com/FireRedTeam/FireRedASR2S))。原始架构、训练和权重归
+FireRedTeam 所有；许可证继承上游 **Apache-2.0**（上游模型卡声明）。感谢 FireRedTeam 的开源工作。
+OpenASR 仅进行格式转换、量化、运行时校验和本地推理适配。
+"""
+
+[prose_locales."zh-CN"]
+tagline = "FireRedTeam 出品的中文优先双语语音识别 — 注意力编码器-解码器架构，中文与方言识别准确率业界领先"
+
+highlights = [
+  "🥇 **中文识别准确率业界领先** — 在四个公开中文基准上平均字错率 3.05%，aishell1 上低至 0.57%（arXiv:2603.10420 表 2）",
+  "🗣️ **方言覆盖能力强** — 在 19 个公开中文方言/口音基准上平均字错率 11.67%，优于 Doubao-ASR（15.39%），与 Qwen3-ASR（11.85%）相当（论文自身对比表）",
+  "🇨🇳🇬🇧 **中英双语** — 单个 1.1B 参数检查点同时支持中文、英语及中英混说，无需指定语言",
+  "🎤 **演唱歌词鲁棒性** — 论文报告在演唱歌词基准上字错率 1.17%，与上述语音识别指标并列",
+  "🏗️ **Conformer 编码器 + Transformer 解码器** — 注意力编码器-解码器架构，与 FireRedASR-AED-L 架构完全相同，在更大词表上重新训练",
+]
+
+source_sha256 = "76c40a34259d839e41916b31815572adb9d43c1d1df79dd1d38c89cf0b241a95"
