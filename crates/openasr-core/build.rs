@@ -123,6 +123,7 @@ fn main() {
     let vulkan_sdk = feat_vulkan.then(vulkan_sdk_path).flatten();
     let windows_hip_shim = if feat_hip && is_windows {
         Some(prepare_windows_hip_sdk_shim(
+            &target,
             hip_path
                 .as_deref()
                 .expect("HIP_PATH, ROCM_PATH, or ROCM_HOME must point to AMD HIP SDK"),
@@ -140,6 +141,13 @@ fn main() {
         .arg("-B")
         .arg(&build_dir)
         .arg("-DCMAKE_BUILD_TYPE=Release")
+        // ggml's static archives are linked into a Rust binary that is PIE by
+        // default on Linux. Host gcc/clang compile PIC anyway, but the ROCm
+        // and CUDA device-host compilers do not (amdclang++ emits non-PIC
+        // .eh_frame relocations that fail the final rust-lld link with
+        // "relocation R_X86_64_32 cannot be used against local symbol").
+        // Forcing PIC on is correct everywhere and required there.
+        .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON")
         .arg(cmake_flag("BUILD_SHARED_LIBS", use_backend_dl))
         .arg(cmake_flag("GGML_BACKEND_DL", use_backend_dl))
         .arg(cmake_flag("GGML_CPU_ALL_VARIANTS", use_backend_dl))
@@ -490,6 +498,20 @@ fn main() {
             println!(
                 "cargo:rustc-link-search=native={}",
                 cuda_path.join("lib/x64").display()
+            );
+            // libcuda.so is the DRIVER library: a real one only exists on a
+            // machine with an NVIDIA driver. Toolkit installs provide a link
+            // stub under lib64/stubs (cuda-driver-dev on Linux) precisely so
+            // driver-linking binaries can be built on driver-less hosts (CI).
+            // Listed last: a real driver library earlier on the search path
+            // still wins.
+            println!(
+                "cargo:rustc-link-search=native={}",
+                cuda_path.join("lib64/stubs").display()
+            );
+            println!(
+                "cargo:rustc-link-search=native={}",
+                cuda_path.join("lib/stubs").display()
             );
         }
     }
@@ -1154,16 +1176,22 @@ fn hip_sdk_clang_path(hip_path: &Path) -> Option<PathBuf> {
 }
 
 fn hip_gpu_targets() -> String {
-    // The llama.cpp "radeon" consumer arch list (RDNA2/3/3.5/4): one fat code
-    // object covers every supported AMD card and the HIP runtime selects the ISA
-    // at load. Drops gfx906 (Vega20/CDNA1, not a consumer target) versus the old
-    // default. Override with OPENASR_HIP_GPU_TARGETS for a narrower/wider set.
+    // A consumer RDNA2/3/3.5/4 arch list: one fat code object covers every
+    // supported AMD card and the HIP runtime selects the ISA at load. Union
+    // of llama.cpp's current Windows HIP release list (gfx1030/31/32,
+    // gfx1100/01/02, gfx1150/51, gfx1200/01) and gfx1035 from a competing
+    // ASR product's HIP build, biased toward RDNA2/3/4 gaming/consumer cards.
+    // Deliberately excludes CDNA/datacenter compute cards (gfx906/908/90a):
+    // those are compute accelerators, not something an end user's desktop/
+    // laptop ships, and would meaningfully lengthen every HIP build for a
+    // target this product does not support. Override with
+    // OPENASR_HIP_GPU_TARGETS for a narrower/wider set.
     env::var("OPENASR_HIP_GPU_TARGETS")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {
-            "gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201"
+            "gfx1030;gfx1031;gfx1032;gfx1035;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201"
                 .to_string()
         })
 }
@@ -1193,7 +1221,7 @@ fn normalize_cuda_gpu_targets(raw: &str) -> String {
         .join(";")
 }
 
-fn prepare_windows_hip_sdk_shim(hip_path: &Path, out_dir: &Path) -> PathBuf {
+fn prepare_windows_hip_sdk_shim(target: &str, hip_path: &Path, out_dir: &Path) -> PathBuf {
     let shim_dir = out_dir.join("openasr-windows-hip-sdk-shim");
     let import_lib_dir = shim_dir.join("lib");
     fs::create_dir_all(&import_lib_dir).expect("create Windows HIP import lib dir");
@@ -1201,10 +1229,12 @@ fn prepare_windows_hip_sdk_shim(hip_path: &Path, out_dir: &Path) -> PathBuf {
     let bin_dir = hip_path.join("bin");
     let sdk_include_dir = hip_path.join("include");
     prepare_windows_import_lib(
+        target,
         &bin_dir.join("libhipblas.dll"),
         &import_lib_dir.join("libhipblas.lib"),
     );
     prepare_windows_import_lib(
+        target,
         &bin_dir.join("rocblas.dll"),
         &import_lib_dir.join("rocblas.lib"),
     );
@@ -1227,7 +1257,29 @@ fn prepare_windows_hip_sdk_shim(hip_path: &Path, out_dir: &Path) -> PathBuf {
     shim_dir
 }
 
-fn prepare_windows_import_lib(dll_path: &Path, import_lib_path: &Path) {
+/// Build a Command for an MSVC binutils-style tool (dumpbin.exe, lib.exe).
+///
+/// These live next to cl.exe in the VC tools bin directory, which is NOT on
+/// PATH outside a Developer Command Prompt (CI runners invoke cargo from a
+/// plain shell). cc's windows_registry finds cl.exe through the VS installer
+/// metadata, so derive the sibling tool from there and inherit the tool env
+/// (PATH additions for the DLLs the tool itself needs). Falls back to plain
+/// PATH lookup for developer prompts / exotic setups.
+fn msvc_bin_tool(target: &str, tool: &str) -> Command {
+    if let Some(cl) = cc::windows_registry::find_tool(target, "cl.exe") {
+        let path = cl.path().with_file_name(tool);
+        if path.is_file() {
+            let mut command = Command::new(path);
+            for (key, value) in cl.env() {
+                command.env(key, value);
+            }
+            return command;
+        }
+    }
+    Command::new(tool)
+}
+
+fn prepare_windows_import_lib(target: &str, dll_path: &Path, import_lib_path: &Path) {
     if import_lib_path.is_file() {
         return;
     }
@@ -1238,7 +1290,7 @@ fn prepare_windows_import_lib(dll_path: &Path, import_lib_path: &Path) {
         );
     }
 
-    let output = Command::new("dumpbin")
+    let output = msvc_bin_tool(target, "dumpbin.exe")
         .arg("/exports")
         .arg(dll_path)
         .output()
@@ -1267,7 +1319,7 @@ fn prepare_windows_import_lib(dll_path: &Path, import_lib_path: &Path) {
     let def = format!("LIBRARY {library_name}\nEXPORTS\n{}\n", exports.join("\n"));
     fs::write(&def_path, def).expect("write Windows HIP import library definition");
 
-    let status = Command::new("lib")
+    let status = msvc_bin_tool(target, "lib.exe")
         .arg(format!("/def:{}", def_path.display()))
         .arg("/machine:x64")
         .arg(format!("/out:{}", import_lib_path.display()))
