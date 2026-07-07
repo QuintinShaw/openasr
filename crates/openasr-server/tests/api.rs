@@ -1017,19 +1017,76 @@ async fn native_transcription_without_installed_model_fails_closed_and_never_dow
         .await
         .unwrap();
 
-    assert_ne!(
+    // A missing model is a client error (400), not a crash and not a silent
+    // 500 -- the daemon is up, it just needs the caller to install a model
+    // first (see also `daemon_starts_and_reports_ready_with_zero_models_installed`,
+    // which locks in that the same empty-home startup itself never fails).
+    assert_eq!(
         response.status(),
-        StatusCode::OK,
-        "native serve must not transcribe an uninstalled model"
+        StatusCode::BAD_REQUEST,
+        "expected a fail-closed 400 for an uninstalled model"
     );
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    let message = json["error"]["message"].as_str().unwrap();
     assert!(
-        response.status().is_client_error() || response.status().is_server_error(),
-        "expected a fail-closed error status, got {}",
-        response.status()
+        message.contains("qwen3-asr-0.6b") && message.contains("not installed"),
+        "expected a clear 'model not installed' message naming the model id, got: {message}"
     );
     assert!(
         !home.join("models").exists(),
         "the server must never download a model"
+    );
+}
+
+#[tokio::test]
+async fn daemon_starts_and_reports_ready_with_zero_models_installed() {
+    // The core regression this guards: a fresh install with zero pulled
+    // models must not prevent the daemon from starting at all. Previously
+    // `ServerRuntime::validate()` (run before the HTTP listener ever binds)
+    // hard-failed for the native backend whenever no model pack was resolved,
+    // so a brand-new install's daemon process exited immediately and the
+    // desktop app's health poll just timed out waiting for a process that was
+    // already dead. Starting the app (which runs the same validation the real
+    // `serve_with_launch_options` entrypoint runs) and hitting /health must
+    // succeed and honestly report that no model is installed yet.
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let runtime = openasr_server::ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        ffmpeg_bin: None,
+        model_pack_path: None,
+    };
+    runtime
+        .validate()
+        .expect("serve must not fail closed at startup just because zero models are installed");
+
+    let app = openasr_server::app_with_runtime_and_distribution(
+        runtime,
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(
+        parsed["model_installed"], false,
+        "health must honestly report no model bound instead of just being unreachable"
     );
 }
 
@@ -2092,17 +2149,18 @@ async fn speaker_reenroll_fails_closed_when_embedder_pack_is_missing() {
 }
 
 #[test]
-fn native_server_runtime_is_rejected_at_startup_validation() {
-    let error = openasr_server::ServerRuntime {
+fn native_server_runtime_with_no_model_pack_is_accepted_at_startup_validation() {
+    // A native backend with no model pack bound (a fresh install with zero
+    // models pulled) must still pass startup validation -- the daemon has to
+    // come up and answer /health; "no model" is a fail-closed error at
+    // transcription-request time, not a reason to refuse to serve at all.
+    openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         ffmpeg_bin: None,
         model_pack_path: None,
     }
     .validate()
-    .unwrap_err()
-    .to_string();
-
-    assert!(error.contains("requires an explicit local .oasr runtime pack path"));
+    .expect("zero installed models must not block server startup");
 }
 
 #[test]
@@ -2269,7 +2327,7 @@ async fn health_returns_identity_json_without_instance_token() {
     );
     assert_eq!(parsed["pid"], serde_json::json!(std::process::id()));
     assert!(parsed["instance_token"].is_null());
-    assert_eq!(parsed.as_object().expect("health response object").len(), 4);
+    assert_eq!(parsed.as_object().expect("health response object").len(), 5);
 }
 
 #[tokio::test]
@@ -2301,7 +2359,7 @@ async fn health_echoes_launch_instance_token_without_env() {
         parsed["instance_token"],
         serde_json::json!("launch-health-token")
     );
-    assert_eq!(parsed.as_object().expect("health response object").len(), 4);
+    assert_eq!(parsed.as_object().expect("health response object").len(), 5);
 }
 
 #[tokio::test]
@@ -2335,7 +2393,7 @@ async fn health_prefers_env_instance_token_over_launch_option() {
         parsed["instance_token"],
         serde_json::json!("env-health-token")
     );
-    assert_eq!(parsed.as_object().expect("health response object").len(), 4);
+    assert_eq!(parsed.as_object().expect("health response object").len(), 5);
 }
 
 #[tokio::test]
@@ -4085,4 +4143,30 @@ async fn models_with_native_backend_lists_loaded_local_pack_id() {
     let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
     let parsed: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(parsed["data"][0]["id"], "native-pack");
+}
+
+#[tokio::test]
+async fn models_with_native_backend_and_no_pack_lists_empty_instead_of_erroring() {
+    // Zero installed models is a normal listing result (an empty catalog of
+    // "currently loaded" models), not an error -- /v1/models must not fail
+    // closed the way an actual transcription request does.
+    let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        ffmpeg_bin: None,
+        model_pack_path: None,
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["data"].as_array().unwrap().len(), 0);
 }

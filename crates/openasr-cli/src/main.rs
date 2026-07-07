@@ -1247,6 +1247,50 @@ mod tests {
     }
 
     #[test]
+    fn resolve_serve_model_source_degrades_to_no_model_when_none_installed() {
+        // Root-cause regression: `serve` must not fail closed at startup just
+        // because a fresh install has zero pulled models -- that used to bail
+        // via `resolve_installed_native_pack`'s "is not installed" error before
+        // the HTTP listener ever bound, so the daemon process exited
+        // immediately and desktop's health poll just timed out on a process
+        // that was already dead.
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("OPENASR_HOME", temp.path()) };
+
+        let source = resolve_serve_model_source(
+            Some("qwen3-asr-0.6b"),
+            BackendKind::Native,
+            None,
+            &OpenAsrConfig::default(),
+        )
+        .expect("serve must resolve a model source even with zero packs installed");
+
+        assert_eq!(source.model_pack_path, None);
+        assert_eq!(source.model_id, "qwen3-asr-0.6b");
+    }
+
+    #[test]
+    fn resolve_serve_model_source_still_validates_explicit_model_pack_path() {
+        // The `--model-pack` escape hatch is explicit user input, so it must
+        // still fail closed (unlike the "nothing installed yet" case above)
+        // when the path itself does not validate.
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("OPENASR_HOME", temp.path()) };
+        let missing_pack = temp.path().join("does-not-exist.oasr");
+
+        let error = resolve_serve_model_source(
+            None,
+            BackendKind::Native,
+            Some(&missing_pack),
+            &OpenAsrConfig::default(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Native model-pack path rejected"));
+    }
+
+    #[test]
     fn benchmark_flag_accepts_native_model_pack() {
         let cli = Cli::try_parse_from([
             "openasr",

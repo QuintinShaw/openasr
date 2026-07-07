@@ -826,18 +826,147 @@ fn serve_native_rejects_model_id_mismatch_with_local_runtime_source() {
         ));
 }
 
+/// Spawns the real `openasr serve` binary against `home` and blocks until it
+/// prints its "listening on http://<addr>" line, returning the bound address.
+/// Panics with the child's stderr if it exits before ever reporting ready --
+/// the exact old failure mode where a fresh, model-less install's daemon
+/// process died before the HTTP listener bound.
+// The happy path intentionally returns the still-running child to the
+// caller, which owns killing and waiting on it once its assertions are done
+// (every call site does); clippy's zombie-process heuristic can't see across
+// that boundary.
+#[allow(clippy::zombie_processes)]
+fn spawn_serve_and_wait_until_listening(home: &Path) -> (std::process::Child, String) {
+    // `serve` prints back the `--addr` it was given verbatim rather than the
+    // listener's actual bound address, so `--addr 127.0.0.1:0` would echo the
+    // unusable "port 0". Reserve a real ephemeral port ourselves, release it,
+    // and pass that through -- a race in principle, but a released loopback
+    // port is not reused within a single test's tiny window in practice.
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve ephemeral port");
+    let addr = reserved
+        .local_addr()
+        .expect("reserved listener addr")
+        .to_string();
+    drop(reserved);
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_openasr"));
+    command
+        .env("OPENASR_HOME", home)
+        .env_remove("OPENASR_MODEL")
+        .env_remove("OPENASR_ADDR")
+        .env_remove("OPENASR_ASSUME_YES")
+        .env_remove("OPENASR_OFFLINE")
+        .args(["serve", "--backend", "native", "--addr", &addr])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().expect("spawn openasr serve");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = std::io::BufReader::new(stdout);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        use std::io::BufRead;
+        let mut line = String::new();
+        let bytes_read = reader.read_line(&mut line).expect("read stdout line");
+        if bytes_read == 0 {
+            let status = child.wait().expect("child exit status");
+            let mut stderr = String::new();
+            if let Some(mut handle) = child.stderr.take() {
+                use std::io::Read;
+                let _ = handle.read_to_string(&mut stderr);
+            }
+            panic!(
+                "openasr serve exited before reporting it was listening (status: {status:?}, stderr: {stderr})"
+            );
+        }
+        if line
+            .trim_end()
+            .starts_with("OpenASR server listening on http://")
+        {
+            return (child, addr);
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("openasr serve did not report listening within 10s");
+        }
+    }
+}
+
+fn raw_http_request(addr: &str, request: &[u8]) -> String {
+    use std::io::{Read, Write};
+    let stream = std::net::TcpStream::connect(addr).expect("connect to daemon");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    (&stream).write_all(request).unwrap();
+    let mut response = Vec::new();
+    (&stream).read_to_end(&mut response).expect("read response");
+    String::from_utf8_lossy(&response).into_owned()
+}
+
 #[test]
-fn serve_native_without_installed_model_fails_closed() {
-    // With native as the default, `serve` resolves an installed pack by model id
-    // and never downloads. With nothing installed it fails closed (the server is
-    // never started) and points at the explicit pull command.
+fn serve_native_without_installed_model_starts_and_answers_health() {
+    // Root-cause regression, exercised through the real `openasr` binary: a
+    // fresh install with zero pulled models must still start the daemon and
+    // answer /health. Before the fix, `serve` bailed with "is not installed"
+    // before the HTTP listener ever bound, so the daemon process exited
+    // immediately -- and desktop's health poll just watched a process that
+    // was already dead until its 30s timeout gave up.
     let temp = tempfile::tempdir().unwrap();
-    openasr()
-        .env("OPENASR_HOME", temp.path())
-        .args(["serve", "--backend", "native", "--addr", "127.0.0.1:0"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("is not installed"));
+    let (mut child, addr) = spawn_serve_and_wait_until_listening(temp.path());
+
+    let response = raw_http_request(
+        &addr,
+        format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected a healthy 200 response, got: {response}"
+    );
+    assert!(
+        response.contains("\"model_installed\":false"),
+        "expected /health to honestly report no model installed, got: {response}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn transcriptions_via_daemon_with_no_installed_model_return_clear_400() {
+    // The other half of the same regression: once the daemon is up (see
+    // `serve_native_without_installed_model_starts_and_answers_health`), an
+    // actual transcription request with no model installed must fail closed
+    // with a clear, structured client error naming the model id -- not a
+    // connection error and not a 500.
+    let temp = tempfile::tempdir().unwrap();
+    let (mut child, addr) = spawn_serve_and_wait_until_listening(temp.path());
+
+    let boundary = "openasr-nomodel-test-boundary";
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: audio/wav\r\n\r\nnot a real wav\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nqwen3-asr-0.6b\r\n--{boundary}--\r\n"
+    )
+    .into_bytes();
+    let mut request = format!(
+        "POST /v1/audio/transcriptions HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.append(&mut body);
+
+    let response = raw_http_request(&addr, &request);
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "expected a fail-closed 400 for an uninstalled model, got: {response}"
+    );
+    assert!(
+        response.contains("qwen3-asr-0.6b") && response.contains("not installed"),
+        "expected a clear 'model not installed' message naming the model id, got: {response}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[test]
