@@ -754,11 +754,13 @@ fn shared_native_ggml_execution_dispatch() -> &'static GgmlAsrExecutionDispatch 
 /// Pick the long-form VAD provider for this request, returning the provider and
 /// a label for the engine that actually ran. The neural Silero model (over the
 /// process-wide shared weights) is the default; the energy gate is used when
-/// selected; FireRedVAD (an alternative neural engine, not yet the default --
-/// see [`LongFormVadEngine::FireRed`]) is used when explicitly selected. Any
-/// neural engine falls back to `*-fallback` energy when its weights are
+/// selected; FireRedVAD's non-streaming and Stream-VAD checkpoints (alternative
+/// neural engines, neither yet the default -- see [`LongFormVadEngine::FireRed`]
+/// / [`LongFormVadEngine::FireRedStream`]) are used when explicitly selected.
+/// Any neural engine falls back to `*-fallback` energy when its weights are
 /// unavailable so the run metadata reflects what executed. `OPENASR_VAD`
-/// overrides the option (`silero`/`neural`, `energy`/`rms`, `firered`).
+/// overrides the option (`silero`/`neural`, `energy`/`rms`, `firered`,
+/// `firered-stream`).
 fn resolve_longform_vad_provider(
     options: &crate::LongFormOptions,
 ) -> (Box<dyn LongFormVadProvider>, &'static str) {
@@ -772,6 +774,12 @@ fn resolve_longform_vad_provider(
             Some(provider) => (Box::new(provider), "firered"),
             None => (Box::new(EnergyLongFormVadProvider), "energy-fallback"),
         },
+        LongFormVadEngine::FireRedStream => {
+            match crate::diarize::vad::FireRedStreamVadProvider::shared() {
+                Some(provider) => (Box::new(provider), "firered-stream"),
+                None => (Box::new(EnergyLongFormVadProvider), "energy-fallback"),
+            }
+        }
     }
 }
 
@@ -1725,6 +1733,10 @@ mod tests {
         options.vad_engine = LongFormVadEngine::FireRed;
         let (_, label) = resolve_longform_vad_provider(&options);
         assert_eq!(label, "firered");
+
+        options.vad_engine = LongFormVadEngine::FireRedStream;
+        let (_, label) = resolve_longform_vad_provider(&options);
+        assert_eq!(label, "firered-stream");
     }
 
     #[test]
@@ -1817,6 +1829,10 @@ mod tests {
             LongFormVadEngine::FireRed,
             jfk_wav_path(),
         );
+        assert_engine_slices_real_audio_without_panicking(
+            LongFormVadEngine::FireRedStream,
+            jfk_wav_path(),
+        );
     }
 
     #[test]
@@ -1824,6 +1840,10 @@ mod tests {
         assert_engine_slices_real_audio_without_panicking(LongFormVadEngine::Silero, zh_wav_path());
         assert_engine_slices_real_audio_without_panicking(
             LongFormVadEngine::FireRed,
+            zh_wav_path(),
+        );
+        assert_engine_slices_real_audio_without_panicking(
+            LongFormVadEngine::FireRedStream,
             zh_wav_path(),
         );
     }

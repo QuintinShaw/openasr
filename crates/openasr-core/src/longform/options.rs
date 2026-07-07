@@ -14,7 +14,12 @@ pub enum LongFormMode {
 /// RMS fallback; `FireRed` is an alternative neural engine (causal-FSMN
 /// `FireRedVAD`), selectable via `OPENASR_VAD=firered` but not yet the
 /// default (validated so far only on synthetic + a couple of real fixtures;
-/// promoting it needs a real-recording eval pass first). Every neural engine
+/// promoting it needs a real-recording eval pass first). `FireRedStream` runs
+/// the causal Stream-VAD checkpoint (the realtime engine, see
+/// `crate::diarize::vad::RealtimeNeuralVadEngine::FireRedStream`) over a whole
+/// long-form utterance instead -- a research option to measure whether one
+/// causal-only checkpoint can serve both paths, selectable via
+/// `OPENASR_VAD=firered-stream`; also not the default. Every neural engine
 /// degrades to energy automatically when its model cannot load or the audio
 /// is not 16 kHz.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -23,6 +28,7 @@ pub enum LongFormVadEngine {
     Silero,
     Energy,
     FireRed,
+    FireRedStream,
 }
 
 #[derive(Debug, Clone, PartialEq)]

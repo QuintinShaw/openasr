@@ -9,7 +9,12 @@
 //! (~2.3 MB as `f32` safetensors), so it is baked into the binary via
 //! `include_bytes!` rather than pulled as a user-facing model pack.
 
-mod frontend;
+// `pub(super)`: the Stream-VAD sibling engine (`super::firered_stream`)
+// reuses this exact kaldi-fbank + global-CMVN frontend -- the two checkpoints
+// share the same frontend/CMVN stats (verified byte-identical against the
+// upstream `Stream-VAD/cmvn.ark`), so it stays the single source of truth
+// rather than growing a second copy.
+pub(super) mod frontend;
 mod model;
 mod provider;
 mod weights;

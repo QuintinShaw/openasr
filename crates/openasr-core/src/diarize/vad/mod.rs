@@ -20,8 +20,19 @@
 //! `OPENASR_VAD=firered` but not the default (see
 //! [`crate::longform::LongFormVadEngine::FireRed`] for why). It is not wired
 //! into realtime endpointing or diarization.
+//!
+//! [`firered_stream`] vendors a third engine, FireRedVAD's **Stream-VAD**
+//! checkpoint (causal, no lookahead): unlike `firered`, it *is* wired into
+//! realtime endpointing (`OPENASR_VAD=firered-stream`, see
+//! [`RealtimeNeuralVadEngine::FireRedStream`]) because it is the only
+//! FireRedVAD checkpoint that is actually causal, and it can also run
+//! long-form (`OPENASR_VAD=firered-stream` there too, see
+//! [`crate::longform::LongFormVadEngine::FireRedStream`]) so the two engines
+//! can be benchmarked head-to-head on the same audio. Silero stays the
+//! default on both paths.
 
 mod firered;
+mod firered_stream;
 mod provider;
 mod silero;
 mod streaming;
@@ -33,6 +44,7 @@ mod tests;
 use std::sync::OnceLock;
 
 pub use firered::{FireRedVadError, FireRedVadProvider};
+pub use firered_stream::{FireRedStreamVadError, FireRedStreamVadProvider, FireRedStreamingVad};
 pub use provider::{SileroVadError, SileroVadProvider};
 pub use silero::{SileroVadModel, SileroVadState};
 pub use streaming::SileroStreamingVad;
@@ -70,15 +82,19 @@ pub fn vad_engine_env_override() -> Option<bool> {
         .and_then(parse_vad_engine)
 }
 
-/// Long-form VAD-engine selection strings, three-way (Silero / Energy /
-/// FireRed). Superset of [`parse_vad_engine`] for the long-form slicing path,
-/// which -- unlike realtime endpointing -- supports the FireRedVAD engine.
+/// Long-form VAD-engine selection strings, four-way (Silero / Energy /
+/// FireRed / FireRedStream). Superset of [`parse_vad_engine`] for the
+/// long-form slicing path, which -- unlike realtime endpointing -- supports
+/// both FireRedVAD checkpoints.
 pub fn parse_longform_vad_engine(value: &str) -> Option<crate::longform::LongFormVadEngine> {
     use crate::longform::LongFormVadEngine;
     match value.trim().to_ascii_lowercase().as_str() {
         "silero" | "neural" => Some(LongFormVadEngine::Silero),
         "energy" | "rms" => Some(LongFormVadEngine::Energy),
         "firered" | "fireredvad" => Some(LongFormVadEngine::FireRed),
+        "firered-stream" | "firered_stream" | "fireredstream" => {
+            Some(LongFormVadEngine::FireRedStream)
+        }
         _ => None,
     }
 }
@@ -120,6 +136,50 @@ pub const SHORT_NEURAL_SPEECH_STOP_MS: u32 = 500;
 /// bool so this module does not depend on the realtime `VadMode`).
 pub fn realtime_vad_prefers_neural(engine: Option<&str>) -> bool {
     vad_engine_env_override().or_else(|| engine.and_then(parse_vad_engine)) != Some(false)
+}
+
+/// Which neural model backs a realtime `ExternalProbability` session, once
+/// [`realtime_vad_prefers_neural`] has already decided neural-vs-energy.
+/// Independent of that bool decision: `OPENASR_VAD=firered-stream` is
+/// unrecognized by [`parse_vad_engine`] (falls through to neural's default,
+/// same as any other unknown string), so it never flips a session to the
+/// energy gate -- it only picks which neural model runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RealtimeNeuralVadEngine {
+    #[default]
+    Silero,
+    FireRedStream,
+}
+
+/// Parse a realtime neural sub-engine selection string. Unlike
+/// [`parse_vad_engine`], `energy`/`rms` are not valid here (mode selection is
+/// a separate decision) -- only which neural model to run.
+pub fn parse_realtime_neural_vad_engine(value: &str) -> Option<RealtimeNeuralVadEngine> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "silero" | "neural" => Some(RealtimeNeuralVadEngine::Silero),
+        "firered-stream" | "firered_stream" | "fireredstream" => {
+            Some(RealtimeNeuralVadEngine::FireRedStream)
+        }
+        _ => None,
+    }
+}
+
+/// The `OPENASR_VAD` environment override for the realtime neural sub-engine.
+pub fn realtime_neural_vad_engine_env_override() -> Option<RealtimeNeuralVadEngine> {
+    std::env::var("OPENASR_VAD")
+        .ok()
+        .as_deref()
+        .and_then(parse_realtime_neural_vad_engine)
+}
+
+/// Resolve which neural model a realtime `ExternalProbability` session should
+/// run: `OPENASR_VAD` wins, then the client's explicit `engine` string, else
+/// **Silero** (the default -- opting into Stream-VAD requires an explicit
+/// `firered-stream`/`firered_stream` value on one of those two inputs).
+pub fn realtime_neural_vad_engine(engine: Option<&str>) -> RealtimeNeuralVadEngine {
+    realtime_neural_vad_engine_env_override()
+        .or_else(|| engine.and_then(parse_realtime_neural_vad_engine))
+        .unwrap_or_default()
 }
 
 /// Shared golden-clip fixture (16 kHz JFK: leading silence then speech) used by

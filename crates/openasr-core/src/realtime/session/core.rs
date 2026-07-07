@@ -15,7 +15,39 @@ use super::{
         VadStateMachine,
     },
 };
-use crate::diarize::vad::SileroStreamingVad;
+use crate::diarize::vad::{FireRedStreamingVad, RealtimeNeuralVadEngine, SileroStreamingVad};
+
+/// The concrete streaming neural detector backing an `ExternalProbability`
+/// session: Silero (default) or FireRedVAD's causal Stream-VAD
+/// (`OPENASR_VAD=firered-stream`, opt-in -- see
+/// [`crate::diarize::vad::realtime_neural_vad_engine`]). Both expose the same
+/// `accept_frame`/`reset` contract; this enum is the seam so
+/// `RealtimeSessionController` does not need a trait object for two
+/// concrete, non-`dyn`-safe-by-necessity implementations.
+#[derive(Debug)]
+enum NeuralVad {
+    // Boxed: `SileroStreamingVad` carries a much larger inline buffer than
+    // `FireRedStreamingVad`, and this enum otherwise sizes to its largest
+    // variant (clippy::large_enum_variant).
+    Silero(Box<SileroStreamingVad>),
+    FireRedStream(Box<FireRedStreamingVad>),
+}
+
+impl NeuralVad {
+    fn accept_frame(&mut self, samples: &[i16]) -> f32 {
+        match self {
+            NeuralVad::Silero(detector) => detector.accept_frame(samples),
+            NeuralVad::FireRedStream(detector) => detector.accept_frame(samples),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            NeuralVad::Silero(detector) => detector.reset(),
+            NeuralVad::FireRedStream(detector) => detector.reset(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RealtimeSessionConfig {
@@ -104,7 +136,7 @@ pub struct RealtimeSessionController {
     /// Streaming neural detector, present only when the configured VAD mode is
     /// `ExternalProbability` and the model loaded. Feeds probabilities into
     /// `vad`; all endpointing stays in the state machine.
-    neural_vad: Option<SileroStreamingVad>,
+    neural_vad: Option<NeuralVad>,
     pub buffer: RealtimeBuffer,
     pub transcript: TranscriptLifecycle,
 }
@@ -229,7 +261,18 @@ impl RealtimeSessionController {
     ) -> Result<Self, RealtimeSessionError> {
         config.validate()?;
         let neural_vad = if config.vad.mode == VadMode::ExternalProbability {
-            match SileroStreamingVad::shared() {
+            // Which neural model backs this session: Silero by default,
+            // FireRedVAD's causal Stream-VAD opt-in via `OPENASR_VAD`. See
+            // `crate::diarize::vad::realtime_neural_vad_engine`.
+            let detector = match crate::diarize::vad::realtime_neural_vad_engine(None) {
+                RealtimeNeuralVadEngine::Silero => {
+                    SileroStreamingVad::shared().map(|d| NeuralVad::Silero(Box::new(d)))
+                }
+                RealtimeNeuralVadEngine::FireRedStream => {
+                    FireRedStreamingVad::shared().map(|d| NeuralVad::FireRedStream(Box::new(d)))
+                }
+            };
+            match detector {
                 Some(detector) => Some(detector),
                 None => {
                     // Neural VAD was requested but the model is unavailable.
