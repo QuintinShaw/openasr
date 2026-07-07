@@ -38,6 +38,23 @@ Silero VAD
   We gratefully acknowledge the Silero Team for releasing a compact,
   high-quality VAD under a permissive license.
 
+FireRedVAD
+  Path: crates/openasr-core/src/diarize/vad/assets/firered_vad_16k.safetensors
+  License: Apache-2.0
+
+  An alternative neural Voice Activity Detection model (a causal-FSMN
+  DetectModel, 16 kHz), selectable as a long-form VAD engine via
+  OPENASR_VAD=firered. The vendored weights are the upstream VAD/model.pth.tar
+  checkpoint and VAD/cmvn.ark CMVN stats re-serialized to safetensors; OpenASR
+  reimplements the forward pass in pure Rust. Source:
+  https://huggingface.co/FireRedTeam/FireRedVAD and
+  https://github.com/FireRedTeam/FireRedASR2S (fireredvad package).
+
+      Copyright 2026 Xiaohongshu
+
+  We gratefully acknowledge the FireRedTeam for releasing a compact VAD model
+  under a permissive license.
+
 pyannote community-1 PLDA/LDA parameters
   Path: crates/openasr-core/src/diarize/vbx/assets/community1_plda_f32.bin
   License: CC-BY-4.0
