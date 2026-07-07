@@ -71,9 +71,23 @@ use tokio::{
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
-// The current upload path buffers multipart fields in memory via `field.bytes()`,
-// so keep the request ceiling conservative until uploads stream directly to disk.
-const MAX_TRANSCRIPTION_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+// The `file` field of `/v1/audio/transcriptions` (and `/v1/audio/translations`)
+// streams straight to a temp file in fixed-size chunks (see
+// `write_upload_temp_file_streaming` in routes/transcription.rs), so memory use
+// is O(chunk), not O(file); this ceiling is now just a finite abuse cap for a
+// single request, not a memory guard. 2 GiB comfortably covers multi-hour
+// uncompressed meeting recordings.
+const MAX_TRANSCRIPTION_UPLOAD_BYTES: usize = 2 * 1024 * 1024 * 1024;
+// Minimum free space the upload's temp volume must retain while an upload is
+// streaming to disk. Checked periodically (see `DISK_SPACE_CHECK_INTERVAL_BYTES`)
+// so a huge upload fails closed with a clear 507 instead of filling the disk;
+// mirrors the headroom check `pull.rs` already does before downloading a model
+// pack, via the shared `available_disk_space_bytes` probe.
+const MIN_FREE_DISK_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
+// How often (in bytes written) to re-check free disk space while streaming an
+// upload to its temp file: frequent enough to catch a disk filling up
+// mid-upload, infrequent enough that the statvfs probe doesn't dominate I/O.
+const DISK_SPACE_CHECK_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
 const SERVER_INSTANCE_TOKEN_ENV: &str = "OPENASR_SERVER_INSTANCE_TOKEN";
 const MAX_CONCURRENT_PULL_JOBS_PER_HOME: usize = 1;
 const PULL_JOB_PROGRESS_PERSIST_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
@@ -1552,6 +1566,10 @@ pub(crate) enum ApiError {
     Registry(openasr_core::RegistryError),
     Serialize(serde_json::Error),
     TempFile(std::io::Error),
+    /// The upload's temp volume ran (or was about to run) low on free space
+    /// mid-stream. The message is pre-built at the call site since it needs
+    /// the probed byte counts and temp-dir path.
+    InsufficientDiskSpace(String),
 }
 
 impl std::fmt::Display for ApiError {
@@ -1588,6 +1606,7 @@ impl std::fmt::Display for ApiError {
                     "Could not prepare uploaded audio for transcription: {error}"
                 )
             }
+            Self::InsufficientDiskSpace(message) => f.write_str(message),
         }
     }
 }
@@ -1706,6 +1725,7 @@ impl IntoResponse for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Could not prepare uploaded audio for transcription: {error}"),
             ),
+            Self::InsufficientDiskSpace(message) => (StatusCode::INSUFFICIENT_STORAGE, message),
         };
 
         // Log every failed request to stderr (captured in daemon.log by the
@@ -1726,6 +1746,7 @@ impl IntoResponse for ApiError {
                         StatusCode::NOT_FOUND => "not_found_error",
                         StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
                         StatusCode::SERVICE_UNAVAILABLE => "service_unavailable_error",
+                        StatusCode::INSUFFICIENT_STORAGE => "insufficient_storage_error",
                         _ => "openasr_error",
                     },
                 },
@@ -1765,9 +1786,9 @@ fn config_error_status(error: &openasr_core::ConfigError) -> StatusCode {
 fn multipart_error_message(error: &axum::extract::multipart::MultipartError) -> String {
     if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
         format!(
-            "Uploaded file is too large. The daemon accepts uploads up to {} MB; \
+            "Uploaded file is too large. The daemon accepts uploads up to {} GB; \
              split the recording or use a smaller/compressed file.",
-            MAX_TRANSCRIPTION_UPLOAD_BYTES / (1024 * 1024)
+            MAX_TRANSCRIPTION_UPLOAD_BYTES / (1024 * 1024 * 1024)
         )
     } else {
         format!("Could not read multipart form: {error}")
