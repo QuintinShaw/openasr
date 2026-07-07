@@ -220,6 +220,7 @@ fn bundled_registry_ordering_is_deterministic() {
             "cohere-transcribe-03-2026",
             "dolphin-cn-dialect-base",
             "dolphin-cn-dialect-small",
+            "firered-aed-l-v2",
             "hymt2-1.8b",
             "moonshine-tiny",
             "parakeet-tdt-0.6b-v3",
