@@ -1123,3 +1123,61 @@ pub(crate) fn encode(
         encoder_out,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the centered Transformer-XL `RelPositionalEncodingV1` table's shape
+    /// and index direction (the multilingual dolphin encoder's only numeric
+    /// path with no weights-backed parity harness): `2*frames-1` rows running
+    /// from position `+(frames-1)` (row 0) down to `-(frames-1)` (last row),
+    /// the center row at `frames-1` being position 0, and rows symmetric about
+    /// that center differing only by `sin`'s sign (`cos` even). Catches an
+    /// off-by-one in the row/position mapping without loading a pack.
+    #[test]
+    fn relative_positional_table_is_centered_and_sign_symmetric() {
+        let d_model = 4usize;
+        let frames = 3usize;
+        let table = dolphin_relative_positional_table(d_model, frames).expect("table");
+        let n_positions = 2 * frames - 1; // 5
+        assert_eq!(table.len(), n_positions * d_model);
+
+        let row = |idx: usize| &table[idx * d_model..(idx + 1) * d_model];
+
+        // div_term for d_model=4: exp(0)=1 (pair 0), 10000^-0.5=0.01 (pair 1).
+        let expected_for_pos = |pos: f64| {
+            [
+                (pos * 1.0).sin() as f32,
+                (pos * 1.0).cos() as f32,
+                (pos * 0.01).sin() as f32,
+                (pos * 0.01).cos() as f32,
+            ]
+        };
+        // Row 0 is the most-positive position (frames-1 = 2), last row is -2.
+        for (bin, &expected) in expected_for_pos(2.0).iter().enumerate() {
+            assert!((row(0)[bin] - expected).abs() < 1.0e-6, "row0 bin{bin}");
+        }
+        // Center row (index frames-1 = 2) is position 0: sin=0, cos=1 per pair.
+        assert_eq!(row(frames - 1), &[0.0, 1.0, 0.0, 1.0]);
+        // Sign symmetry: row k and row (n_positions-1-k) hold opposite positions
+        // -- sin negated, cos preserved (off-by-one in the direction breaks this).
+        for k in 0..n_positions {
+            let mirror = n_positions - 1 - k;
+            let (a, b) = (row(k), row(mirror));
+            assert!((a[0] + b[0]).abs() < 1.0e-6, "sin pair0 antisymmetry k{k}");
+            assert!((a[1] - b[1]).abs() < 1.0e-6, "cos pair0 symmetry k{k}");
+            assert!((a[2] + b[2]).abs() < 1.0e-6, "sin pair1 antisymmetry k{k}");
+            assert!((a[3] - b[3]).abs() < 1.0e-6, "cos pair1 symmetry k{k}");
+        }
+    }
+
+    /// Odd `d_model` must still fill every row without indexing past the end
+    /// (the loop writes `row[i+1]` only when `i + 1 < d_model`).
+    #[test]
+    fn relative_positional_table_handles_odd_d_model() {
+        let table = dolphin_relative_positional_table(3, 2).expect("table");
+        assert_eq!(table.len(), (2 * 2 - 1) * 3);
+        assert!(table.iter().all(|v| v.is_finite()));
+    }
+}
