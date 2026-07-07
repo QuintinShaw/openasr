@@ -57,7 +57,8 @@ use crate::ggml_runtime::{
     read_gguf_tensor_index, write_gguf_file_v0,
 };
 use crate::models::dolphin::language::{
-    DOLPHIN_DEFAULT_LANGUAGE_CODE, build_dolphin_decode_prefix,
+    DOLPHIN_DEFAULT_LANGUAGE_CODE, DOLPHIN_MULTILINGUAL_CATALOG_LANGUAGES,
+    build_dolphin_decode_prefix, build_dolphin_multilingual_decode_prefix,
 };
 use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::language::REGISTERED_DIALECT_CODES;
@@ -71,25 +72,18 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
 
-// --- fixed small.cn E-Branchformer / Transformer configuration ----------------
-// Cross-checked against the checkpoint below (layer counts, d_model, vocab, mel
-// dim) so a mismatched export fails closed rather than mislabels the pack.
-const ENCODER_N_LAYERS: usize = 12;
-const ENCODER_D_MODEL: usize = 768;
-const ENCODER_N_HEADS: usize = 12;
-const ENCODER_HEAD_DIM: usize = 64;
-const ENCODER_FFN_DIM: usize = 3072;
-const ENCODER_CGMLP_UNITS: usize = 3072;
-const ENCODER_CGMLP_KERNEL: usize = 31;
-const ENCODER_MERGE_KERNEL: usize = 31;
-const DECODER_N_LAYERS: usize = 12;
-const DECODER_N_HEADS: usize = 12;
-const DECODER_FFN_DIM: usize = 3072;
-const DECODER_MAX_CTX: usize = 5000;
+// --- E-Branchformer / Transformer configuration -------------------------------
+// Every structural hparam (layer counts, d_model, head count/dim, FFN/cgMLP
+// widths, conv kernels, decoder max context) is read directly off the
+// checkpoint's OWN tensor shapes by `derive_dolphin_architecture` below, not
+// hardcoded -- the small.cn (768/12L), cn-dialect-base and multilingual base
+// (512/8L) and multilingual small (768/12L, but with a *different*
+// encoder FFN width than small.cn: 1536 vs 3072) checkpoints all differ on at
+// least one of these axes, so a fixed per-size const block would silently
+// mismatch a new size. `FEATURE_DIM` is the one frontend choice this importer
+// itself fixes (the mel filterbank it reconstructs), and is cross-checked
+// against the checkpoint's own CMVN vector length instead of assumed.
 const FEATURE_DIM: usize = 80;
-const SOS_TOKEN_ID: u32 = 2;
-const EOS_TOKEN_ID: u32 = 3;
-const CTC_BLANK_TOKEN_ID: u32 = 0;
 
 // fbank config from `train.yaml` (`fbank_conf`): 25 ms window, 10 ms shift, 80
 // mel bins, 16 kHz. Kaldi rounds the 400-sample window up to the next power of
@@ -139,6 +133,32 @@ impl DolphinQuantizationMode {
     }
 }
 
+/// Which decode-prefix scheme this checkpoint's vocab uses. The cn-dialect
+/// family (small.cn, cn-dialect-base) fixes the OWSM `<lang>` slot at `<zh>`
+/// and only the `<region>` slot varies (Chinese province dialects); the
+/// multilingual family (dolphin-small, dolphin-base) varies BOTH slots across
+/// 40 languages. Baked into the pack as `dolphin.language.scheme` so the
+/// executor picks the matching prefix builder without re-deriving it from the
+/// vocab shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DolphinLanguageScheme {
+    /// Fixed `<zh>` language token, per-code Chinese dialect `<region>`.
+    #[default]
+    CnDialect,
+    /// Per-code `<lang>` AND `<region>`, spanning the 40-language table.
+    Multilingual,
+}
+
+impl DolphinLanguageScheme {
+    /// The `dolphin.language.scheme` metadata value this variant writes.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CnDialect => "cn_dialect",
+            Self::Multilingual => "multilingual",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DolphinImportRequest {
     /// The exported full state dict (`full.safetensors`, all-f32).
@@ -148,6 +168,7 @@ pub struct DolphinImportRequest {
     /// Output `.oasr` runtime pack path.
     pub output_path: PathBuf,
     pub model_id: String,
+    pub language_scheme: DolphinLanguageScheme,
     pub quantization: DolphinQuantizationMode,
 }
 
@@ -167,13 +188,37 @@ pub fn convert_local_dolphin_wenet_source_to_runtime_pack(
     let vocab_size = vocab_tokens.len();
     let safetensors = SafetensorsFile::open(&request.safetensors_path)?;
 
-    validate_checkpoint_shape(&safetensors, vocab_size)?;
-    assert_every_advertised_dialect_code_resolves(&vocab_tokens)?;
+    let architecture = derive_dolphin_architecture(&safetensors, vocab_size, &vocab_tokens)?;
+    match request.language_scheme {
+        DolphinLanguageScheme::CnDialect => {
+            assert_every_advertised_dialect_code_resolves(&vocab_tokens)?
+        }
+        DolphinLanguageScheme::Multilingual => {
+            assert_every_advertised_multilingual_code_resolves(&vocab_tokens)?
+        }
+    }
 
     let mut tensors = build_runtime_tensors(&safetensors, request.quantization)?;
     tensors.push(build_mel_filterbank_tensor());
+    // Synthesize the sinusoidal position table(s) the checkpoint itself did
+    // not bake as a state-dict buffer (the multilingual export computes them
+    // on the fly instead of storing them; see `sinusoidal_pos_table_max_ctx`).
+    if safetensors.tensor("encoder.embed.pos_enc.pe").is_none() {
+        tensors.push(synthesized_position_table_tensor(
+            "encoder.embed.pos_enc.pe",
+            architecture.encoder_d_model,
+            architecture.encoder_max_ctx,
+        ));
+    }
+    if safetensors.tensor("decoder.embed.1.pe").is_none() {
+        tensors.push(synthesized_position_table_tensor(
+            "decoder.embed.1.pe",
+            architecture.encoder_d_model,
+            architecture.decoder_max_ctx,
+        ));
+    }
 
-    let metadata = dolphin_runtime_gguf_metadata(request, &vocab_tokens);
+    let metadata = dolphin_runtime_gguf_metadata(request, &vocab_tokens, &architecture);
     write_gguf_file_v0(&request.output_path, &metadata, &tensors).map_err(|error| {
         validate_error(format!(
             "dolphin GGUF writer failed for '{}': {error}",
@@ -190,7 +235,7 @@ pub fn convert_local_dolphin_wenet_source_to_runtime_pack(
         output_path: request.output_path.clone(),
         tensor_count: index.tensors().len(),
         vocab_size,
-        blank_token_id: CTC_BLANK_TOKEN_ID,
+        blank_token_id: architecture.blank_token_id,
     })
 }
 
@@ -267,12 +312,61 @@ fn assert_every_advertised_dialect_code_resolves(
     Ok(())
 }
 
-/// Fail closed if the checkpoint does not match the small.cn shape the pack
-/// metadata will declare (vocab, d_model, layer counts).
-fn validate_checkpoint_shape(
+/// The multilingual counterpart of `assert_every_advertised_dialect_code_resolves`:
+/// fail closed unless every catalog-advertised language code (the
+/// `dolphin-small`/`dolphin-base` `languages` list) builds a full decode
+/// prefix -- both its `<lang>` AND `<region>` tokens, plus the shared control
+/// tokens -- against the shipped vocab.
+fn assert_every_advertised_multilingual_code_resolves(
+    vocab_tokens: &[String],
+) -> Result<(), LocalSourceImportError> {
+    for &code in DOLPHIN_MULTILINGUAL_CATALOG_LANGUAGES {
+        build_dolphin_multilingual_decode_prefix(vocab_tokens, Some(code)).map_err(|error| {
+            validate_error(format!(
+                "dolphin pack vocab cannot honor advertised language code {code:?}: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Structural hparams read directly off the checkpoint's own tensor shapes
+/// (never hardcoded), so one importer handles every current and future
+/// Dolphin size (base/small/medium/large, cn-dialect or multilingual) without
+/// a new per-size const block. See the module-level note above `FEATURE_DIM`.
+#[derive(Debug, Clone, Copy)]
+struct DolphinArchitecture {
+    encoder_n_layers: usize,
+    encoder_d_model: usize,
+    encoder_n_heads: usize,
+    encoder_head_dim: usize,
+    encoder_ffn_dim: usize,
+    encoder_cgmlp_units: usize,
+    encoder_cgmlp_kernel: usize,
+    encoder_merge_kernel: usize,
+    encoder_max_ctx: usize,
+    decoder_n_layers: usize,
+    decoder_n_heads: usize,
+    decoder_ffn_dim: usize,
+    decoder_max_ctx: usize,
+    sos_token_id: u32,
+    eos_token_id: u32,
+    blank_token_id: u32,
+}
+
+/// Derive [`DolphinArchitecture`] from the checkpoint, failing closed on any
+/// missing tensor or an internally-inconsistent shape (e.g. encoder/decoder
+/// width disagreeing, or a head_dim that does not evenly divide d_model).
+/// Cross-checked against small.cn (768 d_model/12 heads/12 layers, encoder FFN
+/// == cgMLP == 3072), the multilingual small/base checkpoints (which tie
+/// decoder width to encoder width and decoder head_dim to encoder head_dim in
+/// every observed variant, but let the encoder FFN width diverge from the
+/// cgMLP width), and the 140M base tier (512/8/6, FFN == cgMLP == 2048).
+fn derive_dolphin_architecture(
     safetensors: &SafetensorsFile,
     vocab_size: usize,
-) -> Result<(), LocalSourceImportError> {
+    vocab_tokens: &[String],
+) -> Result<DolphinArchitecture, LocalSourceImportError> {
     let shape = |name: &str| -> Result<Vec<u64>, LocalSourceImportError> {
         safetensors
             .tensor(name)
@@ -288,27 +382,91 @@ fn validate_checkpoint_shape(
             )))
         }
     };
+    let rank1 = |name: &str| -> Result<usize, LocalSourceImportError> {
+        let dims = shape(name)?;
+        match dims.as_slice() {
+            [d0] => Ok(*d0 as usize),
+            _ => Err(validate_error(format!(
+                "dolphin checkpoint tensor '{name}' has shape {dims:?}, expected rank 1"
+            ))),
+        }
+    };
+    let rank2_dim0 = |name: &str| -> Result<usize, LocalSourceImportError> {
+        let dims = shape(name)?;
+        match dims.as_slice() {
+            [d0, _] => Ok(*d0 as usize),
+            _ => Err(validate_error(format!(
+                "dolphin checkpoint tensor '{name}' has shape {dims:?}, expected rank 2"
+            ))),
+        }
+    };
+    let last_dim = |name: &str| -> Result<usize, LocalSourceImportError> {
+        let dims = shape(name)?;
+        dims.last().map(|d| *d as usize).ok_or_else(|| {
+            validate_error(format!(
+                "dolphin checkpoint tensor '{name}' has an empty shape"
+            ))
+        })
+    };
 
+    let encoder_d_model = rank1("encoder.after_norm.weight")?;
+    let cmvn_len = rank1("encoder.global_cmvn.mean")?;
+    if cmvn_len != FEATURE_DIM {
+        return Err(validate_error(format!(
+            "dolphin checkpoint CMVN vector has {cmvn_len} elements, expected the {FEATURE_DIM}-mel frontend"
+        )));
+    }
     expect(
         "ctc.ctc_lo.weight",
         &shape("ctc.ctc_lo.weight")?,
-        &[vocab_size as u64, ENCODER_D_MODEL as u64],
+        &[vocab_size as u64, encoder_d_model as u64],
     )?;
     expect(
         "decoder.output_layer.weight",
         &shape("decoder.output_layer.weight")?,
-        &[vocab_size as u64, ENCODER_D_MODEL as u64],
+        &[vocab_size as u64, encoder_d_model as u64],
     )?;
-    expect(
-        "encoder.after_norm.weight",
-        &shape("encoder.after_norm.weight")?,
-        &[ENCODER_D_MODEL as u64],
-    )?;
-    expect(
-        "encoder.global_cmvn.mean",
-        &shape("encoder.global_cmvn.mean")?,
-        &[FEATURE_DIM as u64],
-    )?;
+    let decoder_d_model = rank1("decoder.after_norm.weight")?;
+    if decoder_d_model != encoder_d_model {
+        return Err(validate_error(format!(
+            "dolphin checkpoint decoder d_model {decoder_d_model} != encoder d_model {encoder_d_model}"
+        )));
+    }
+
+    let pos_bias = shape("encoder.encoders.0.attn.pos_bias_u")?;
+    let (encoder_n_heads, encoder_head_dim) = match pos_bias.as_slice() {
+        [heads, head_dim] => (*heads as usize, *head_dim as usize),
+        _ => {
+            return Err(validate_error(format!(
+                "dolphin checkpoint 'encoder.encoders.0.attn.pos_bias_u' has shape {pos_bias:?}, expected rank 2"
+            )));
+        }
+    };
+    if encoder_n_heads * encoder_head_dim != encoder_d_model {
+        return Err(validate_error(format!(
+            "dolphin checkpoint encoder heads {encoder_n_heads} * head_dim {encoder_head_dim} != d_model {encoder_d_model}"
+        )));
+    }
+    // The decoder never stores a relative-position bias tensor to read a head
+    // count off directly; every observed Dolphin checkpoint (small.cn,
+    // cn-dialect-base, multilingual small/base) ties the decoder's head_dim to
+    // the encoder's, so derive decoder_n_heads from that instead of a guess.
+    if !decoder_d_model.is_multiple_of(encoder_head_dim) {
+        return Err(validate_error(format!(
+            "dolphin checkpoint decoder d_model {decoder_d_model} is not a multiple of the encoder head_dim {encoder_head_dim}"
+        )));
+    }
+    let decoder_n_heads = decoder_d_model / encoder_head_dim;
+
+    let encoder_ffn_dim = rank2_dim0("encoder.encoders.0.feed_forward.w_1.weight")?;
+    let encoder_cgmlp_units = rank2_dim0("encoder.encoders.0.cgmlp.channel_proj1.0.weight")?;
+    let encoder_cgmlp_kernel = last_dim("encoder.encoders.0.cgmlp.csgu.conv.weight")?;
+    let encoder_merge_kernel = last_dim("encoder.encoders.0.depthwise_conv_fusion.weight")?;
+    let encoder_max_ctx =
+        sinusoidal_pos_table_max_ctx(safetensors, "encoder.embed.pos_enc.pe", encoder_d_model)?;
+    let decoder_ffn_dim = rank2_dim0("decoder.decoders.0.feed_forward.w_1.weight")?;
+    let decoder_max_ctx =
+        sinusoidal_pos_table_max_ctx(safetensors, "decoder.embed.1.pe", decoder_d_model)?;
 
     let layer_count = |prefix: &str, joint: &str| -> usize {
         let mut seen = BTreeSet::new();
@@ -322,17 +480,17 @@ fn validate_checkpoint_shape(
         }
         seen.len()
     };
-    let encoder_layers = layer_count("encoder.encoders.", ".");
-    if encoder_layers != ENCODER_N_LAYERS {
-        return Err(validate_error(format!(
-            "dolphin checkpoint has {encoder_layers} encoder layers, expected {ENCODER_N_LAYERS}"
-        )));
+    let encoder_n_layers = layer_count("encoder.encoders.", ".");
+    if encoder_n_layers == 0 {
+        return Err(validate_error(
+            "dolphin checkpoint has no 'encoder.encoders.N.*' layer tensors",
+        ));
     }
-    let decoder_layers = layer_count("decoder.decoders.", ".");
-    if decoder_layers != DECODER_N_LAYERS {
-        return Err(validate_error(format!(
-            "dolphin checkpoint has {decoder_layers} decoder layers, expected {DECODER_N_LAYERS}"
-        )));
+    let decoder_n_layers = layer_count("decoder.decoders.", ".");
+    if decoder_n_layers == 0 {
+        return Err(validate_error(
+            "dolphin checkpoint has no 'decoder.decoders.N.*' layer tensors",
+        ));
     }
 
     // Hotword deep-biasing module: only checked when present (older exports
@@ -346,30 +504,155 @@ fn validate_checkpoint_shape(
         expect(
             "context_module.context_extractor.word_embedding.weight",
             &shape("context_module.context_extractor.word_embedding.weight")?,
-            &[vocab_size as u64, ENCODER_D_MODEL as u64],
+            &[vocab_size as u64, encoder_d_model as u64],
         )?;
         expect(
             "context_module.context_extractor.sen_rnn.weight_ih_l0",
             &shape("context_module.context_extractor.sen_rnn.weight_ih_l0")?,
-            &[4 * ENCODER_D_MODEL as u64, ENCODER_D_MODEL as u64],
+            &[4 * encoder_d_model as u64, encoder_d_model as u64],
         )?;
         expect(
             "context_module.context_extractor.sen_rnn.weight_ih_l1",
             &shape("context_module.context_extractor.sen_rnn.weight_ih_l1")?,
-            &[4 * ENCODER_D_MODEL as u64, 2 * ENCODER_D_MODEL as u64],
+            &[4 * encoder_d_model as u64, 2 * encoder_d_model as u64],
         )?;
         expect(
             "context_module.biasing_layer.linear_q.weight",
             &shape("context_module.biasing_layer.linear_q.weight")?,
-            &[ENCODER_D_MODEL as u64, ENCODER_D_MODEL as u64],
+            &[encoder_d_model as u64, encoder_d_model as u64],
         )?;
         expect(
             "context_module.combiner.weight",
             &shape("context_module.combiner.weight")?,
-            &[ENCODER_D_MODEL as u64, ENCODER_D_MODEL as u64],
+            &[encoder_d_model as u64, encoder_d_model as u64],
         )?;
     }
-    Ok(())
+
+    let blank_token_id = required_special_token_id(vocab_tokens, "<blank>")?;
+    let sos_token_id = required_special_token_id(vocab_tokens, "<sos>")?;
+    let eos_token_id = required_special_token_id(vocab_tokens, "<eos>")?;
+
+    Ok(DolphinArchitecture {
+        encoder_n_layers,
+        encoder_d_model,
+        encoder_n_heads,
+        encoder_head_dim,
+        encoder_ffn_dim,
+        encoder_cgmlp_units,
+        encoder_cgmlp_kernel,
+        encoder_merge_kernel,
+        encoder_max_ctx,
+        decoder_n_layers,
+        decoder_n_heads,
+        decoder_ffn_dim,
+        decoder_max_ctx,
+        sos_token_id,
+        eos_token_id,
+        blank_token_id,
+    })
+}
+
+/// Default sinusoidal position-table length ESPnet/WeNet's `PositionalEncoding`
+/// classes use when the checkpoint does not bake the table as a state-dict
+/// buffer (see `sinusoidal_pos_table_max_ctx`): every Dolphin checkpoint
+/// observed so far -- baked (small.cn, cn-dialect-base) or not (dolphin-small,
+/// dolphin-base) -- uses this exact value, and it is a decode-length ceiling
+/// choice independent of encoder/decoder width, not an architecture property.
+const DEFAULT_SINUSOIDAL_POS_TABLE_MAX_CTX: usize = 5000;
+
+/// The sinusoidal position table's length, from the checkpoint's own baked
+/// tensor when present, else the documented default. The cn-dialect WeNet
+/// export bakes this table as a state-dict buffer (`encoder.embed.pos_enc.pe`/
+/// `decoder.embed.1.pe`); the multilingual ESPnet export does not (its
+/// `RelPositionalEncoding`/`PositionalEncoding` compute the sinusoid on the
+/// fly in `forward()` instead of registering it as a buffer) -- either way the
+/// values are the deterministic textbook formula
+/// (`build_sinusoidal_position_table`), verified byte-for-byte against the
+/// cn-dialect-base checkpoint's own baked table, so a checkpoint that omits it
+/// gets the identical table synthesized at import time instead of failing
+/// closed on a tensor that was never going to exist.
+fn sinusoidal_pos_table_max_ctx(
+    safetensors: &SafetensorsFile,
+    name: &str,
+    expected_d_model: usize,
+) -> Result<usize, LocalSourceImportError> {
+    let Some(tensor) = safetensors.tensor(name) else {
+        return Ok(DEFAULT_SINUSOIDAL_POS_TABLE_MAX_CTX);
+    };
+    match tensor.shape.as_slice() {
+        [_, max_ctx, d_model] if *d_model == expected_d_model as u64 => Ok(*max_ctx as usize),
+        shape => Err(validate_error(format!(
+            "dolphin checkpoint '{name}' has shape {shape:?}, expected [1, max_ctx, {expected_d_model}]"
+        ))),
+    }
+}
+
+/// Build the deterministic sinusoidal position table WeNet/ESPnet bake as
+/// `encoder.embed.pos_enc.pe` / `decoder.embed.1.pe`:
+/// `pe[pos, 2i] = sin(pos * exp(-2i/d_model * ln(10000)))`,
+/// `pe[pos, 2i+1] = cos(pos * exp(-2i/d_model * ln(10000)))`. Verified
+/// byte-for-byte (< 1e-6 abs diff, float32 rounding only) against the
+/// cn-dialect-base checkpoint's own baked table before being trusted as a
+/// synthesized substitute for a checkpoint that does not bake one.
+fn build_sinusoidal_position_table(d_model: usize, max_positions: usize) -> Vec<f32> {
+    let mut table = vec![0.0_f32; max_positions * d_model];
+    for pos in 0..max_positions {
+        let row = &mut table[pos * d_model..(pos + 1) * d_model];
+        let mut i = 0;
+        while i < d_model {
+            let div_term = (-((i as f64) / (d_model as f64)) * 10000.0_f64.ln()).exp();
+            let angle = pos as f64 * div_term;
+            row[i] = angle.sin() as f32;
+            if i + 1 < d_model {
+                row[i + 1] = angle.cos() as f32;
+            }
+            i += 2;
+        }
+    }
+    table
+}
+
+/// Wrap `build_sinusoidal_position_table` as the `[1, max_positions, d_model]`
+/// runtime tensor the encoder/decoder graphs expect at `name`, in fp16 mode --
+/// matching `make_runtime_tensor`'s convention for every other rank>=2 tensor
+/// (only 1-D vectors stay f32), so a synthesized table is byte-layout
+/// consistent with a checkpoint-baked one.
+fn synthesized_position_table_tensor(
+    name: &str,
+    d_model: usize,
+    max_positions: usize,
+) -> GgufWriteTensor {
+    let table = build_sinusoidal_position_table(d_model, max_positions);
+    let bits: Vec<u16> = table.iter().copied().map(f32_to_f16_bits).collect();
+    GgufWriteTensor {
+        name: name.to_string(),
+        dims: vec![1, max_positions as u64, d_model as u64],
+        tensor_type: GgufWriteTensorType::F16,
+        data: encode_f16_bits_le(bits),
+    }
+}
+
+/// The id of a required control token (`<blank>`/`<sos>`/`<eos>`). WeNet vocabs
+/// place these at different ids across Dolphin variants (front-loaded at
+/// 0/2/3 for the char-vocab cn-dialect models; appended after ~40k BPE pieces
+/// for the multilingual models), so this looks the token up by content rather
+/// than assuming a fixed id.
+fn required_special_token_id(
+    vocab_tokens: &[String],
+    token: &str,
+) -> Result<u32, LocalSourceImportError> {
+    token_id_for_content(vocab_tokens, token)
+        .ok_or_else(|| validate_error(format!("dolphin checkpoint vocab has no '{token}' token")))
+}
+
+/// First vocab id whose token content is exactly `content` (mirrors
+/// `language::token_id_for_content`; duplicated here to keep the importer free
+/// of a dependency on the dialect-only prefix builder's private helper).
+fn token_id_for_content(vocab: &[String], content: &str) -> Option<u32> {
+    vocab
+        .iter()
+        .position(|token| token == content)
+        .map(|index| index as u32)
 }
 
 /// Emit every `encoder.*` / `decoder.*` / `ctc.*` tensor under its exact WeNet
@@ -553,6 +836,7 @@ fn hz_to_mel(hz: f32) -> f32 {
 fn dolphin_runtime_gguf_metadata(
     request: &DolphinImportRequest,
     vocab_tokens: &[String],
+    architecture: &DolphinArchitecture,
 ) -> BTreeMap<String, GgufWriteValue> {
     let vocab_size = vocab_tokens.len();
     let mut metadata = BTreeMap::new();
@@ -571,27 +855,73 @@ fn dolphin_runtime_gguf_metadata(
     put_str(GGML_TOKENIZER_ID_KEY, DOLPHIN_TOKENIZER_ID);
     put_str("openasr.model.id", &request.model_id);
     put_str("dolphin.tokenizer.model", "char");
+    // Selects the decode-prefix builder at runtime (executor.rs): the
+    // cn-dialect family's fixed-`<zh>` builder, or the multilingual family's
+    // per-code `<lang>` + `<region>` builder. Absent on a pack predating this
+    // key (none exist yet -- both currently-published dolphin packs are
+    // cn-dialect), the executor's reader defaults to `cn_dialect`.
+    put_str("dolphin.language.scheme", request.language_scheme.label());
 
     let mut put_u32 = |key: &str, value: u32| {
         metadata.insert(key.to_string(), GgufWriteValue::U32(value));
     };
-    put_u32("dolphin.encoder.n_layers", ENCODER_N_LAYERS as u32);
-    put_u32("dolphin.encoder.d_model", ENCODER_D_MODEL as u32);
-    put_u32("dolphin.encoder.n_heads", ENCODER_N_HEADS as u32);
-    put_u32("dolphin.encoder.head_dim", ENCODER_HEAD_DIM as u32);
-    put_u32("dolphin.encoder.ffn_dim", ENCODER_FFN_DIM as u32);
-    put_u32("dolphin.encoder.cgmlp_units", ENCODER_CGMLP_UNITS as u32);
-    put_u32("dolphin.encoder.cgmlp_kernel", ENCODER_CGMLP_KERNEL as u32);
-    put_u32("dolphin.encoder.merge_kernel", ENCODER_MERGE_KERNEL as u32);
+    put_u32(
+        "dolphin.encoder.n_layers",
+        architecture.encoder_n_layers as u32,
+    );
+    put_u32(
+        "dolphin.encoder.d_model",
+        architecture.encoder_d_model as u32,
+    );
+    put_u32(
+        "dolphin.encoder.n_heads",
+        architecture.encoder_n_heads as u32,
+    );
+    put_u32(
+        "dolphin.encoder.head_dim",
+        architecture.encoder_head_dim as u32,
+    );
+    put_u32(
+        "dolphin.encoder.ffn_dim",
+        architecture.encoder_ffn_dim as u32,
+    );
+    put_u32(
+        "dolphin.encoder.cgmlp_units",
+        architecture.encoder_cgmlp_units as u32,
+    );
+    put_u32(
+        "dolphin.encoder.cgmlp_kernel",
+        architecture.encoder_cgmlp_kernel as u32,
+    );
+    put_u32(
+        "dolphin.encoder.merge_kernel",
+        architecture.encoder_merge_kernel as u32,
+    );
     put_u32("dolphin.encoder.feature_dim", FEATURE_DIM as u32);
-    put_u32("dolphin.decoder.n_layers", DECODER_N_LAYERS as u32);
-    put_u32("dolphin.decoder.n_heads", DECODER_N_HEADS as u32);
-    put_u32("dolphin.decoder.ffn_dim", DECODER_FFN_DIM as u32);
-    put_u32("dolphin.decoder.max_ctx", DECODER_MAX_CTX as u32);
+    put_u32(
+        "dolphin.encoder.max_ctx",
+        architecture.encoder_max_ctx as u32,
+    );
+    put_u32(
+        "dolphin.decoder.n_layers",
+        architecture.decoder_n_layers as u32,
+    );
+    put_u32(
+        "dolphin.decoder.n_heads",
+        architecture.decoder_n_heads as u32,
+    );
+    put_u32(
+        "dolphin.decoder.ffn_dim",
+        architecture.decoder_ffn_dim as u32,
+    );
+    put_u32(
+        "dolphin.decoder.max_ctx",
+        architecture.decoder_max_ctx as u32,
+    );
     put_u32("dolphin.vocab_size", vocab_size as u32);
-    put_u32("dolphin.sos_token_id", SOS_TOKEN_ID);
-    put_u32("dolphin.eos_token_id", EOS_TOKEN_ID);
-    put_u32("ctc.blank_token_id", CTC_BLANK_TOKEN_ID);
+    put_u32("dolphin.sos_token_id", architecture.sos_token_id);
+    put_u32("dolphin.eos_token_id", architecture.eos_token_id);
+    put_u32("ctc.blank_token_id", architecture.blank_token_id);
     // fbank frontend config (the mel filterbank contract for the later phase).
     put_u32("dolphin.audio.sample_rate", SAMPLE_RATE_HZ);
     put_u32("dolphin.audio.n_fft", FFT_SIZE as u32);
@@ -632,13 +962,39 @@ mod tests {
             output_path: PathBuf::from("/tmp/dolphin-out.oasr"),
             model_id: "dolphin-cn-dialect-small".to_string(),
             quantization: DolphinQuantizationMode::Fp16,
+            language_scheme: DolphinLanguageScheme::CnDialect,
+        }
+    }
+
+    /// The `small.cn` architecture (768 d_model/12 heads/12 layers), matching
+    /// the historical hardcoded consts this fixture exercised before the
+    /// import became shape-derived.
+    fn small_cn_architecture() -> DolphinArchitecture {
+        DolphinArchitecture {
+            encoder_n_layers: 12,
+            encoder_d_model: 768,
+            encoder_n_heads: 12,
+            encoder_head_dim: 64,
+            encoder_ffn_dim: 3072,
+            encoder_cgmlp_units: 3072,
+            encoder_cgmlp_kernel: 31,
+            encoder_merge_kernel: 31,
+            encoder_max_ctx: 5000,
+            decoder_n_layers: 12,
+            decoder_n_heads: 12,
+            decoder_ffn_dim: 3072,
+            decoder_max_ctx: 5000,
+            sos_token_id: 2,
+            eos_token_id: 3,
+            blank_token_id: 0,
         }
     }
 
     #[test]
     fn runtime_metadata_declares_dolphin_selection_and_contract_keys() {
         let tokens: Vec<String> = (0..18173).map(|i| format!("t{i}")).collect();
-        let metadata = dolphin_runtime_gguf_metadata(&fixture_request(), &tokens);
+        let metadata =
+            dolphin_runtime_gguf_metadata(&fixture_request(), &tokens, &small_cn_architecture());
         assert_eq!(
             string_metadata(&metadata, OASR_METADATA_KEY_MODEL_FAMILY),
             Some(DOLPHIN_MODEL_FAMILY.to_string())

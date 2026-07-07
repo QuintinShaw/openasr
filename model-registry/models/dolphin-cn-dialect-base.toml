@@ -1,0 +1,10 @@
+id = "dolphin-cn-dialect-base"
+default_variant = "published"
+display_name = "Dolphin CN-Dialect Base (OpenASR pack)"
+languages = ["zh", "zh-anhui", "zh-guangdong", "zh-hebei", "zh-hubei", "zh-jiangsu", "zh-ningxia", "zh-shaanxi", "zh-shandong", "zh-shanghai", "zh-shanxi", "zh-sichuan", "zh-tianjin", "zh-tw"]
+size = "base"
+license = "Apache-2.0"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/dolphin-cn-dialect-base"
+
+[variant]
+quantization = "fp16"

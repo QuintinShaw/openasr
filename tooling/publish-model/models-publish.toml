@@ -54,6 +54,30 @@ upstream_repo = "DataoceanAI1/dolphi-cn-dialect-small"
 source_revision = "main"
 needs_license_flags = false
 
+["dolphin-cn-dialect-base"]
+import_subcommand = "import dolphin"
+upstream_repo = "DataoceanAI/dolphin-cn-dialect-base"
+source_revision = "main"
+needs_license_flags = false
+
+# Dolphin multilingual (small/base) -> .oasr converter: same "import dolphin"
+# subcommand, but the source ships a SentencePiece bpe.model + config.yaml
+# instead of the cn-dialect family's raw units.txt-only char vocab (the
+# importer's units.txt is still the id-ordered token list either way; only the
+# detokenize join differs at runtime, keyed off the pack's own
+# `dolphin.tokenizer.model` metadata).
+["dolphin-small"]
+import_subcommand = "import dolphin"
+upstream_repo = "DataoceanAI/dolphin-small"
+source_revision = "main"
+needs_license_flags = false
+
+["dolphin-base"]
+import_subcommand = "import dolphin"
+upstream_repo = "DataoceanAI/dolphin-base"
+source_revision = "main"
+needs_license_flags = false
+
 # SenseVoiceSmall FunASR -> .oasr converter. The importer takes model.safetensors
 # (from pt_to_safetensors.py) + am.mvn + config.yaml + the SentencePiece bpe
 # model; the FunASR Model License fields live in models-core.toml

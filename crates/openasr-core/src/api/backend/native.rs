@@ -669,13 +669,22 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
             })
         }
         DOLPHIN_GGML_ARCHITECTURE_ID => {
-            crate::models::dolphin::runtime_contract::parse_dolphin_execution_metadata(&metadata)
-                .map(|_| ())
-                .map_err(|error| {
-                    format!(
-                        "dolphin runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
-                    )
-                })
+            // `max_ctx` resolution needs the tensor index (the baked
+            // position-table tensor's own shape is authoritative over the
+            // metadata scalar when present); see
+            // `runtime_contract::resolve_position_table_max_ctx`.
+            let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source)
+                .map_err(|error| format!("tensor index read failed: {error}"))?;
+            crate::models::dolphin::runtime_contract::parse_dolphin_execution_metadata(
+                &metadata,
+                &tensor_index,
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "dolphin runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
+                )
+            })
         }
         crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID => {
             crate::models::sensevoice::runtime_contract::parse_sensevoice_execution_metadata(

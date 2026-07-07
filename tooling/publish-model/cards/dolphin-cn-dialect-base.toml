@@ -1,0 +1,99 @@
+# Per-model card prose for openasr/dolphin-cn-dialect-base. Distilled
+# (paraphrased, not copied) from the upstream DataoceanAI/dolphin-cn-dialect-base
+# model card. Claims are kept to what the upstream repo and architecture state;
+# re-verify against the upstream card when the upstream weights change.
+
+tagline = "Chinese multi-dialect speech recognition, base tier -- a compact 140M WeNet E-Branchformer (CTC + attention) for Sichuan and 22 regional dialects"
+tagline_zh = "中文多方言语音识别（base 档）— 紧凑的 140M 参数 WeNet E-Branchformer(CTC + 注意力),覆盖四川话与 22 种地方方言"
+
+# Same rationale as dolphin-cn-dialect-small: this is a Chinese-only
+# (character-vocabulary) model, so the shared JFK ruler is out-of-distribution.
+# It is still run against the shared JFK clip for the standard cross-quant
+# ΔWER drift signal (see metrics.json), but the primary in-language sanity
+# check is a synthesized Mandarin clip, not JFK.
+bench_clip_phrase = "the shared 11s JFK clip (out-of-distribution English, drift signal only) plus an in-language Mandarin sanity clip"
+bench_clip_short = "JFK + zh sanity clip"
+drift_metric_label = "ΔWER"
+
+highlights = [
+  "🀄 **22 Chinese dialects, base tier** — the same WeNet E-Branchformer dialect coverage as Dolphin CN-Dialect Small (Sichuan/川话, Wu, Cantonese, Minnan, Shanghainese and more), at a fraction of the size",
+  "🪶 **140M parameters** — roughly a third the width of the `small.cn` checkpoint (512 vs 768 d_model, 6 vs 12 layers), for tighter RAM and faster CPU decode when the small tier is overkill",
+  "🧩 **Joint CTC + attention** — the same E-Branchformer encoder + Transformer decoder recipe with CTC/attention rescoring, verified against a shape-derived runtime contract shared with the rest of the Dolphin family",
+  "🐬 **Chinese-focused, mixed char/BPE vocab** — a character vocabulary for Chinese with SentencePiece word-piece tokens for code-switched English, purpose-built for zh audio including heavy accents",
+  "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU",
+]
+
+highlights_zh = [
+  "🀄 **22 种中文方言，base 档** — 与 Dolphin CN-Dialect Small 相同的 WeNet E-Branchformer 方言覆盖(四川话/川话、吴语、粤语、闽南语、上海话等),体积小得多",
+  "🪶 **140M 参数** — 宽度约为 `small.cn` 检查点的三分之一(d_model 512 对 768、6 层对 12 层),small 档过重时可换取更省内存、更快的 CPU 解码",
+  "🧩 **联合 CTC + 注意力** — 与 Dolphin 家族一致的 E-Branchformer 编码器 + Transformer 解码器配方,配合 CTC/attention 重打分,运行时形状参数与全家族共享同一份契约",
+  "🐬 **面向中文、字符/BPE 混合词表** — 中文用字符词表,中英混说的英文用 SentencePiece 词片,专为中文音频(含重口音)打造",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python,针对 CPU 与 GPU 的极致性能优化",
+]
+
+intro = """
+Dolphin CN-Dialect Base is the **140M "base" tier** of DataoceanAI's **Chinese multi-dialect**
+speech-recognition line, built on the same **Dolphin / WeNet** recipe as the larger
+**Dolphin CN-Dialect Small**: an **E-Branchformer encoder + Transformer decoder** trained with a
+**joint CTC + attention** objective over a mixed character/BPE vocabulary. It covers the same
+**Sichuan (川话)**-forward set of 22 Chinese dialects (Wu, Cantonese, Minnan, Shanghainese and
+more) as its `small.cn` sibling, but at roughly a third of the encoder/decoder width (512 vs 768
+d_model, 6 vs 12 layers) -- a smaller RAM/CPU footprint for deployments where the small tier's
+accuracy headroom is not needed. Unlike `small.cn`, this `base.cn` checkpoint does not ship a
+trained hotword deep-biasing module. This OpenASR repo repackages the weights as `.oasr` packs
+that run natively in the OpenASR runtime -- no Python at inference, all decoding local. It ships
+in **fp16** (maximum fidelity, recommended), **q8_0**, and **q4_k** builds.
+
+**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed
+without punctuation marks, so the decoder never predicts a punctuation token -- there is no
+setting to enable it. Transcripts are plain, unpunctuated text by design.
+"""
+
+intro_zh = """
+Dolphin CN-Dialect Base 是 DataoceanAI **中文多方言**语音识别系列中 **140M 参数的 "base" 档**,
+与体积更大的 **Dolphin CN-Dialect Small** 采用相同的 **Dolphin / WeNet** 配方:
+**E-Branchformer 编码器 + Transformer 解码器**,以**联合 CTC + attention** 目标在字符/BPE
+混合词表上训练。它覆盖与 `small.cn` 同款、以**四川话(川话)**为重点的 22 种中国方言(吴语、
+粤语、闽南语、上海话等),但编解码器宽度约为其三分之一(d_model 512 对 768、6 层对 12 层)——
+在不需要 small 档准确度余量的部署场景下,换取更小的内存与 CPU 占用。与 `small.cn` 不同,这个
+`base.cn` 检查点未附带训练好的热词深度偏置模块。
+
+这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理,不会把音频上传到
+云端。提供 `fp16`(最高保真,推荐)、`q8_0`、`q4_k` 三种量化版本。
+
+**说明:** 该模型不输出标点符号。其上游训练语料的转写不含标点,解码器从不预测标点符号——
+没有可开启的开关。转写结果按设计是不含标点的纯文本。
+"""
+
+acknowledgement = """
+This pack is a redistribution of **Dolphin CN-Dialect Base** (`base.cn`), created and
+open-sourced by **DataoceanAI**
+([DataoceanAI/dolphin-cn-dialect-base](https://huggingface.co/DataoceanAI/dolphin-cn-dialect-base)).
+All credit for the original architecture, training, and weights belongs to the authors; the
+license is inherited from and identical to the upstream model (Apache-2.0). The model builds on
+the **Dolphin** multilingual ASR project and the **WeNet** E-Branchformer / joint CTC-attention
+recipe -- thank you to the Dolphin and WeNet teams and to DataoceanAI for releasing their work
+openly. OpenASR only performs format conversion, quantization, runtime verification, and
+local-inference adaptation.
+"""
+
+acknowledgement_zh = """
+本模型包重新分发自 DataoceanAI 开源的 Dolphin CN-Dialect Base(`base.cn`)
+([DataoceanAI/dolphin-cn-dialect-base](https://huggingface.co/DataoceanAI/dolphin-cn-dialect-base))。
+原始架构、训练和权重归作者所有,许可证继承上游 Apache-2.0。模型基于 **Dolphin** 多语言 ASR 项目与
+**WeNet** 的 E-Branchformer / 联合 CTC-attention 配方,感谢 Dolphin、WeNet 团队与 DataoceanAI 的
+开源工作。OpenASR 仅进行格式转换、量化、运行时校验和本地推理适配。
+"""
+
+[prose_locales."zh-CN"]
+tagline = "中文多方言语音识别（base 档）— 紧凑的 140M 参数 WeNet E-Branchformer(CTC + 注意力),覆盖四川话与 22 种地方方言"
+
+highlights = [
+  "🀄 **22 种中文方言，base 档** — 与 Dolphin CN-Dialect Small 相同的 WeNet E-Branchformer 方言覆盖(四川话/川话、吴语、粤语、闽南语、上海话等),体积小得多",
+  "🪶 **140M 参数** — 宽度约为 `small.cn` 检查点的三分之一(d_model 512 对 768、6 层对 12 层),small 档过重时可换取更省内存、更快的 CPU 解码",
+  "🧩 **联合 CTC + 注意力** — 与 Dolphin 家族一致的 E-Branchformer 编码器 + Transformer 解码器配方,配合 CTC/attention 重打分,运行时形状参数与全家族共享同一份契约",
+  "🐬 **面向中文、字符/BPE 混合词表** — 中文用字符词表,中英混说的英文用 SentencePiece 词片,专为中文音频(含重口音)打造",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python,针对 CPU 与 GPU 的极致性能优化",
+]
+
+source_sha256 = "e42adf1e2a2bf70633e54f8ff8e8e7d40343ac5409ca6cedd0ef2969ea7e38aa"

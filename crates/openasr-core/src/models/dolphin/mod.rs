@@ -19,7 +19,7 @@ pub mod package_import;
 pub(crate) mod runtime_contract;
 
 pub use package_import::{
-    DolphinImportRequest, DolphinImportResult, DolphinQuantizationMode,
+    DolphinImportRequest, DolphinImportResult, DolphinLanguageScheme, DolphinQuantizationMode,
     convert_local_dolphin_wenet_source_to_runtime_pack,
 };
 

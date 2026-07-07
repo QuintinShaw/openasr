@@ -148,6 +148,83 @@ upstream_release_date = "2026-05-13"
 # build version.
 min_core_version = "0.1.3"
 
+# Dolphin cn-dialect base (140M): the "base" tier of the same
+# small.cn/cn-dialect-small architecture family -- identical char vocab +
+# region-prompt scheme (same 14 registered dialect codes), only the
+# encoder/decoder width shrinks (512 d_model / 8 heads / 2048 ffn / 6 layers vs
+# small's 768/12/3072/12, cross-checked against each checkpoint's train.yaml).
+# STAGED PRIVATE for now (release_public left unset/false): flip to public only
+# after explicit user go-ahead, mirroring dolphin-cn-dialect-small's own launch.
+["dolphin-cn-dialect-base"]
+family = "dolphin"
+hf_repo = "OpenASR/dolphin-cn-dialect-base"
+size = "base"
+registry_id = "dolphin-cn-dialect-base"
+display_name = "Dolphin CN-Dialect Base"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/DataoceanAI/dolphin-cn-dialect-base/blob/main/README.md"
+license_class = "permissive"
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "fp16"
+upstream_release_date = "2026-05-13"
+# Same forward-compat runtime floor as dolphin-cn-dialect-small: needs the
+# dim-derivation import generalization landing in this same change, so pin the
+# next core release rather than claim compatibility with anything older.
+min_core_version = "0.1.8"
+
+# Dolphin small (372M) + Dolphin base (140M): the multilingual siblings of the
+# cn-dialect family. Card: "40 Eastern languages ... plus 22 Chinese dialects",
+# SentencePiece BPE vocab (not char), and a two-level `<lang><region>` prompt
+# (vs cn-dialect's fixed `<zh><region>`). `languages` lists the 40 officially
+# supported languages (ISO 639-1 where one exists, 639-3 otherwise), collapsing
+# the 22 Chinese dialects into the `zh` already among them (product's dialect-
+# collapse rule -- Dolphin's OWN region-prompt granularity for those dialects is
+# not separately advertised for the multilingual checkpoints, unlike the
+# dedicated cn-dialect models). Cantonese (Dolphin's own `ct` code) is listed
+# separately as `yue`, matching Dolphin's own languages.md, which treats it as
+# a top-level language rather than a zh dialect.
+["dolphin-small"]
+family = "dolphin"
+hf_repo = "OpenASR/dolphin-small"
+size = "small"
+registry_id = "dolphin-small"
+display_name = "Dolphin Small"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/DataoceanAI/dolphin-small/blob/main/README.md"
+license_class = "permissive"
+languages = [
+    "ar", "az", "ba", "bn", "fa", "fil", "gu", "hi", "id", "ja", "jv", "kab",
+    "kk", "km", "ko", "ks", "ky", "lo", "mn", "mr", "ms", "my", "ne", "or",
+    "pa", "ps", "ru", "si", "su", "ta", "te", "tg", "th", "tl", "ug", "ur",
+    "uz", "vi", "yue", "zh",
+]
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "fp16"
+upstream_release_date = "2026-05-13"
+# Needs both the dim-derivation import generalization AND the new multilingual
+# BPE tokenizer / two-level language-region prompt landing in this same change.
+min_core_version = "0.1.8"
+
+["dolphin-base"]
+family = "dolphin"
+hf_repo = "OpenASR/dolphin-base"
+size = "base"
+registry_id = "dolphin-base"
+display_name = "Dolphin Base"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/DataoceanAI/dolphin-base/blob/main/README.md"
+license_class = "permissive"
+languages = [
+    "ar", "az", "ba", "bn", "fa", "fil", "gu", "hi", "id", "ja", "jv", "kab",
+    "kk", "km", "ko", "ks", "ky", "lo", "mn", "mr", "ms", "my", "ne", "or",
+    "pa", "ps", "ru", "si", "su", "ta", "te", "tg", "th", "tl", "ug", "ur",
+    "uz", "vi", "yue", "zh",
+]
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "fp16"
+upstream_release_date = "2026-05-13"
+min_core_version = "0.1.8"
+
 # SenseVoiceSmall (FunASR SAN-M/DFSMN encoder + CTC head): multilingual
 # zh/yue/en/ja/ko with model-side language id. Published PUBLIC to
 # OpenASR/sensevoice-small: `release_public = true`. License is the FunASR
