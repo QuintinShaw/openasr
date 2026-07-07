@@ -10,10 +10,16 @@
 //!
 //! Stage status:
 //! - The checkpoint-to-GGUF importer lives in [`package_import`].
-//! - The Conformer encoder graph, KV-cached decoder, executor, tokenizer, and
-//!   frontend land in the executor stage.
+//! - The fbank+CMVN frontend ([`frontend`]), the detokenizer ([`tokenizer`]),
+//!   and the pack-metadata contract ([`runtime_contract`]) are implemented and
+//!   unit-tested here.
+//! - The Conformer encoder graph, KV-cached decoder, and executor land in the
+//!   executor stage.
 
+pub(crate) mod frontend;
 pub mod package_import;
+pub(crate) mod runtime_contract;
+pub(crate) mod tokenizer;
 
 pub use package_import::{
     FireRedAedImportRequest, FireRedAedImportResult, FireRedAedQuantizationMode,
