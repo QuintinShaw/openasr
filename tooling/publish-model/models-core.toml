@@ -136,6 +136,9 @@ recommended_quant = "q8_0"
 sort_weight = 915
 recommended = true
 upstream_release_date = "2025-08-14"
+# Forward-compat runtime floor: a new family requiring the 0.1.9 core runtime,
+# same rationale/pin as firered-aed-l-v2.
+min_core_version = "0.1.9"
 
 # Dolphin cn-dialect small (WeNet E-Branchformer, CTC + attention rescoring).
 # Published PUBLIC to OpenASR/dolphin-cn-dialect-small: `release_public = true`
