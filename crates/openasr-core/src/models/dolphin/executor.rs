@@ -38,23 +38,25 @@ use super::decoder_graph::DolphinDecoderConfig;
 use super::encoder_graph::{
     DolphinEncoderConfig, DolphinEncoderOutput, DolphinNativeWeight, DolphinWeightProvider, encode,
 };
-use super::frontend::{DolphinFbankFrontend, NUM_MEL_BINS, apply_global_cmvn};
+use super::frontend::{DolphinEspnetFrontend, DolphinFbankFrontend, apply_global_cmvn};
 use super::hotword_context::{
     apply_hotword_deep_biasing, encode_hotword_context_embeddings, tokenize_hotword_phrase,
 };
 use super::joint_decode::{DolphinJointDecodeConfig, detokenize_char_tokens, joint_decode};
 use super::language::{build_dolphin_decode_prefix, build_dolphin_multilingual_decode_prefix};
+use super::package_import::DolphinLanguageScheme;
 use super::runtime_contract::parse_dolphin_execution_metadata;
 
 /// Encoder weight namespace baked into the pack under exact WeNet names.
 const ENCODER_TENSOR_PREFIX: &str = "encoder.";
 /// Sentinels proving the pack baked the encoder + CTC head namespaces (cheap
-/// index probe, no dequantization).
-const ENCODER_SENTINEL_TENSORS: [&str; 3] = [
-    "encoder.embed.pos_enc.pe",
-    "encoder.after_norm.weight",
-    "ctc.ctc_lo.weight",
-];
+/// index probe, no dequantization), common to both language schemes.
+const ENCODER_SENTINEL_TENSORS: [&str; 2] = ["encoder.after_norm.weight", "ctc.ctc_lo.weight"];
+/// CnDialect-only sentinel: the multilingual scheme's encoder attention never
+/// bakes this table (its `rel_pos_v1` table is computed fresh per request
+/// instead -- see `encoder_graph::dolphin_relative_positional_table`), so
+/// requiring it there would fail closed on every valid multilingual pack.
+const ENCODER_CN_DIALECT_SENTINEL_TENSOR: &str = "encoder.embed.pos_enc.pe";
 
 /// Global CMVN vectors baked in the pack (checkpoint's own `encoder.global_cmvn`).
 const CMVN_MEAN_TENSOR: &str = "encoder.global_cmvn.mean";
@@ -343,16 +345,27 @@ pub(crate) fn run_dolphin_pipeline(
     let tokens = metadata
         .get_string_array(TOKENIZER_TOKENS_KEY)
         .ok_or_else(|| format!("dolphin pack is missing the '{TOKENIZER_TOKENS_KEY}' vocab"))?;
+    // The pack's own `dolphin.language.scheme` (absent on every pack predating
+    // this key, which defaults to the cn-dialect family -- both originally
+    // published dolphin packs are cn-dialect). This single signal now
+    // dispatches three things that all trace back to which of the two
+    // DataoceanAI training pipelines produced the checkpoint: the decode
+    // prefix builder (below), the audio frontend, and the encoder's
+    // relative-position-attention scheme (`DolphinEncoderConfig`).
+    let language_scheme = match metadata.get_string(LANGUAGE_SCHEME_KEY) {
+        Some("multilingual") => DolphinLanguageScheme::Multilingual,
+        _ => DolphinLanguageScheme::CnDialect,
+    };
     // Build the `<sos> <lang> <region> <asr> <notimestamp>` prefix per request
     // from the pack vocab; fail closed (typed) on an unknown code or a missing
-    // language/region token. Dispatches on the pack's own
-    // `dolphin.language.scheme` (absent on every pack predating this key,
-    // which defaults to the cn-dialect family's fixed-`<zh>` builder -- both
-    // currently-published dolphin packs are cn-dialect).
-    let prefix = match metadata.get_string(LANGUAGE_SCHEME_KEY) {
-        Some("multilingual") => build_dolphin_multilingual_decode_prefix(tokens, language)
-            .map_err(|error| format!("dolphin multilingual decode prefix build failed: {error}"))?,
-        _ => build_dolphin_decode_prefix(tokens, language)
+    // language/region token.
+    let prefix = match language_scheme {
+        DolphinLanguageScheme::Multilingual => {
+            build_dolphin_multilingual_decode_prefix(tokens, language).map_err(|error| {
+                format!("dolphin multilingual decode prefix build failed: {error}")
+            })?
+        }
+        DolphinLanguageScheme::CnDialect => build_dolphin_decode_prefix(tokens, language)
             .map_err(|error| format!("dolphin decode prefix build failed: {error}"))?,
     };
     let eos_token_id = metadata
@@ -372,21 +385,29 @@ pub(crate) fn run_dolphin_pipeline(
     let execution_metadata = parse_dolphin_execution_metadata(metadata, weights)
         .map_err(|error| format!("dolphin runtime metadata contract failed: {error}"))?;
 
-    // Frontend: kaldi fbank -> global CMVN (the exact tensor the encoder consumes).
-    let mut features = DolphinFbankFrontend::new()
-        .compute(samples)
-        .map_err(|error| format!("dolphin fbank frontend failed: {error}"))?;
+    // Frontend: kaldi fbank (cn-dialect) or the ESPnet DefaultFrontend
+    // (multilingual) -> global CMVN (the exact tensor the encoder consumes).
+    // See `frontend::DolphinEspnetFrontend`'s doc comment for why these two
+    // checkpoints need materially different feature pipelines.
+    let mut features = match language_scheme {
+        DolphinLanguageScheme::CnDialect => DolphinFbankFrontend::new().compute(samples),
+        DolphinLanguageScheme::Multilingual => DolphinEspnetFrontend::new().compute(samples),
+    }
+    .map_err(|error| format!("dolphin frontend failed: {error}"))?;
     let cmvn_mean = weights
         .tensor(CMVN_MEAN_TENSOR)
         .ok_or_else(|| format!("dolphin pack is missing '{CMVN_MEAN_TENSOR}'"))?;
     let cmvn_istd = weights
         .tensor(CMVN_ISTD_TENSOR)
         .ok_or_else(|| format!("dolphin pack is missing '{CMVN_ISTD_TENSOR}'"))?;
-    apply_global_cmvn(&mut features.data, NUM_MEL_BINS, cmvn_mean, cmvn_istd)
+    apply_global_cmvn(&mut features.data, features.n_mels, cmvn_mean, cmvn_istd)
         .map_err(|error| format!("dolphin global CMVN failed: {error}"))?;
 
-    // Encoder (parity-verified for small.cn; shape-derived for every size).
-    let encoder_config = DolphinEncoderConfig::from_execution_metadata(&execution_metadata);
+    // Encoder (parity-verified for small.cn; shape-derived for every size;
+    // `language_scheme` picks the rel-pos-attention flavor -- see
+    // `DolphinEncoderConfig`'s doc comment).
+    let encoder_config =
+        DolphinEncoderConfig::from_execution_metadata(&execution_metadata, language_scheme);
     let encoder = encode(
         &encoder_config,
         weights,
@@ -501,7 +522,11 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
         parse_dolphin_execution_metadata(&preflight.metadata, preflight.tensor_index.as_ref())
             .map_err(|error| fail(format!("dolphin runtime metadata contract failed: {error}")))?;
         // Confirm the encoder + CTC namespaces are actually baked before decoding.
-        for sentinel in ENCODER_SENTINEL_TENSORS {
+        let mut sentinels = ENCODER_SENTINEL_TENSORS.to_vec();
+        if preflight.metadata.get_string(LANGUAGE_SCHEME_KEY) != Some("multilingual") {
+            sentinels.push(ENCODER_CN_DIALECT_SENTINEL_TENSOR);
+        }
+        for sentinel in sentinels {
             if preflight.tensor_index.get(sentinel).is_none() {
                 return Err(fail(format!(
                     "dolphin pack is missing required tensor '{sentinel}'"
