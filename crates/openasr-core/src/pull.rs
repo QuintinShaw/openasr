@@ -2601,11 +2601,15 @@ fn available_space_bytes(path: &Path) -> Option<u64> {
         return None;
     }
     let stats = unsafe { stats.assume_init() };
-    #[cfg(target_os = "macos")]
+    // Apple's `statvfs` (macOS and iOS share the same struct layout in libc's
+    // `unix/bsd/apple` module) reports f_bavail/f_frsize as narrower integer
+    // types than the POSIX-typical u64 used elsewhere (e.g. Linux); widen
+    // before multiplying so the byte-count math cannot silently truncate.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         Some(u64::from(stats.f_bavail).saturating_mul(stats.f_frsize))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         Some(stats.f_bavail.saturating_mul(stats.f_frsize))
     }

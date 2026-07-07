@@ -26,6 +26,11 @@ fn main() {
     // The android triple (e.g. aarch64-linux-android) also contains "linux", so
     // it must be detected explicitly and BEFORE any `contains("linux")` check.
     let is_android = target.contains("android");
+    // iOS device target (aarch64-apple-ios). Deliberately distinct from
+    // `is_macos` (which only matches "apple-darwin"): iOS device builds have no
+    // bundled libomp (same as macOS) and, in this phase, no Metal/Accelerate/BLAS
+    // -- those already stay off because their gates key off `is_macos`.
+    let is_ios = target.contains("apple-ios");
     let host = env::var("HOST").unwrap_or_default();
     // Backend-DL plugin build for the CPU-only (no GPU feature) WINDOWS base:
     // ship ggml-base.dll + ggml.dll + ggml-cpu-<variant>.dll loaded via the ggml
@@ -74,7 +79,7 @@ fn main() {
             env::var("OPENASR_GGML_OPENMP").ok().as_deref(),
             Some("0" | "off" | "OFF" | "false" | "FALSE")
         );
-    let openmp_unsupported_target = is_macos || is_android || (feat_hip && is_windows);
+    let openmp_unsupported_target = is_macos || is_ios || is_android || (feat_hip && is_windows);
     let effective_openmp = openmp_requested && !openmp_unsupported_target;
     if openmp_requested && !effective_openmp && feat_hip && is_windows {
         println!(
@@ -251,6 +256,24 @@ fn main() {
             "-DCMAKE_OSX_DEPLOYMENT_TARGET={}",
             macos_deployment_target()
         ));
+    }
+    if is_ios {
+        // Cross-compile ggml for the iOS device ABI. Unlike Android this needs no
+        // separate CMake toolchain file: CMake's built-in Apple platform support
+        // drives Clang cross-compilation straight from CMAKE_OSX_SYSROOT (the SDK
+        // Clang targets) + CMAKE_OSX_ARCHITECTURES (only arm64 device hardware is
+        // wired up -- no armv7/i386 simulator support). Phase 1 is a CPU-only
+        // compile gate: Metal/Accelerate/BLAS already stay off here because their
+        // cmake_flag(...) calls above key off `is_macos`, which is `false` for the
+        // "apple-ios" target triple.
+        configure
+            .arg("-DCMAKE_SYSTEM_NAME=iOS")
+            .arg("-DCMAKE_OSX_SYSROOT=iphoneos")
+            .arg("-DCMAKE_OSX_ARCHITECTURES=arm64")
+            .arg(format!(
+                "-DCMAKE_OSX_DEPLOYMENT_TARGET={}",
+                ios_deployment_target()
+            ));
     }
     if is_android {
         // Cross-compile ggml with the NDK's CMake toolchain file. build.rs shells
@@ -1357,6 +1380,21 @@ fn macos_deployment_target() -> String {
     macos_deployment_target_from(configured.as_deref())
 }
 
+fn ios_deployment_target() -> String {
+    let configured = env::var("IPHONEOS_DEPLOYMENT_TARGET").ok();
+    ios_deployment_target_from(configured.as_deref())
+}
+
+fn ios_deployment_target_from(configured: Option<&str>) -> String {
+    // arm64-only device hardware (see is_ios above) already implies iOS 11+, but
+    // pin a newer floor to match the Rust std minimum for aarch64-apple-ios.
+    const MINIMUM: &str = "15.0";
+    match configured {
+        Some(value) if version_at_least(value, MINIMUM) => value.trim().to_string(),
+        _ => MINIMUM.to_string(),
+    }
+}
+
 fn macos_deployment_target_from(configured: Option<&str>) -> String {
     const MINIMUM: &str = "13.3";
     match configured {
@@ -1455,8 +1493,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        CudaTuning, HipTuning, cuda_gpu_targets_from_raw, macos_deployment_target_from,
-        parse_bool_env, resolve_ggml_native_enabled, target_is_x86, version_at_least,
+        CudaTuning, HipTuning, cuda_gpu_targets_from_raw, ios_deployment_target_from,
+        macos_deployment_target_from, parse_bool_env, resolve_ggml_native_enabled, target_is_x86,
+        version_at_least,
     };
 
     #[test]
@@ -1650,6 +1689,20 @@ mod tests {
         assert_eq!(macos_deployment_target_from(Some("13.3")), "13.3");
         assert_eq!(macos_deployment_target_from(Some("13.3.0")), "13.3.0");
         assert_eq!(macos_deployment_target_from(Some("14.0")), "14.0");
+    }
+
+    #[test]
+    fn ios_deployment_target_clamps_below_minimum_or_malformed_values() {
+        assert_eq!(ios_deployment_target_from(None), "15.0");
+        assert_eq!(ios_deployment_target_from(Some("12.0")), "15.0");
+        assert_eq!(ios_deployment_target_from(Some("14.x")), "15.0");
+        assert_eq!(ios_deployment_target_from(Some("")), "15.0");
+    }
+
+    #[test]
+    fn ios_deployment_target_keeps_valid_minimum_or_newer_values() {
+        assert_eq!(ios_deployment_target_from(Some("15.0")), "15.0");
+        assert_eq!(ios_deployment_target_from(Some("17.2")), "17.2");
     }
 
     #[test]

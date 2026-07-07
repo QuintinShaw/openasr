@@ -61,11 +61,13 @@ pub fn peak_rss_bytes() -> Option<u64> {
     }
     let max_rss = usage.ru_maxrss as u64;
 
-    #[cfg(target_os = "macos")]
+    // `ru_maxrss` units follow the kernel, not just the OS name: Darwin (macOS
+    // and iOS alike) reports bytes; Linux/BSD report kilobytes.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         Some(max_rss) // bytes
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         Some(max_rss.saturating_mul(1024)) // kilobytes -> bytes (Linux/BSD)
     }
