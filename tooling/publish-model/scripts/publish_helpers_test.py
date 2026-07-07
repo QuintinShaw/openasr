@@ -20,7 +20,16 @@ from _file_loaders import load_toml
 
 EXPECTED_CAPABILITY_PACKS = {
     "pyannote-segmentation-3.0": "speaker-segmenter",
+    "qwen3-forced-aligner-0.6b": "forced-aligner",
     "wespeaker-voxceleb-resnet34-lm": "speaker-embedder",
+}
+# Capability-pack feature per model: most existing packs serve
+# speaker-diarization, but qwen3-forced-aligner-0.6b serves the distinct
+# word-timestamps feature (see registry.rs CATALOG_FEATURE_WORD_TIMESTAMPS).
+EXPECTED_CAPABILITY_FEATURES = {
+    "pyannote-segmentation-3.0": "speaker-diarization",
+    "qwen3-forced-aligner-0.6b": "word-timestamps",
+    "wespeaker-voxceleb-resnet34-lm": "speaker-diarization",
 }
 EXPECTED_TRANSLATION_MODELS = {
     "hymt2-1.8b": (["zh"], ["en"]),
@@ -107,7 +116,7 @@ class PublishHelpersTest(unittest.TestCase):
             self.assertIn("kind", entry, model)
             if model in explicit_capability_packs:
                 self.assertEqual(entry["kind"], "capability-pack")
-                self.assertEqual(entry["capability"]["feature"], "speaker-diarization")
+                self.assertEqual(entry["capability"]["feature"], EXPECTED_CAPABILITY_FEATURES[model])
                 self.assertEqual(entry["capability"]["role"], explicit_capability_packs[model])
             elif model in explicit_translation_models:
                 self.assertEqual(entry["kind"], "translation-model")

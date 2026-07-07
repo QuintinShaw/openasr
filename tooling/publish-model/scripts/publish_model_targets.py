@@ -70,6 +70,7 @@ RELEASE_LANE_MODELS = (
     "dolphin-base",
     "parakeet-tdt-0.6b-v3",
     "firered-aed-l-v2",
+    "qwen3-forced-aligner-0.6b",
 )
 GGUF_GENERAL_ARCHITECTURE_KEY = b"general.architecture"
 

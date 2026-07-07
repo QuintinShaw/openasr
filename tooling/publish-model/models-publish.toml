@@ -179,3 +179,18 @@ import_subcommand = "import firered-aed"
 upstream_repo = "FireRedTeam/FireRedASR2-AED"
 source_revision = "2304afed56eacfee6256dee5937ed22ffa0b64ec"
 needs_license_flags = false
+
+# Qwen3-ForcedAligner-0.6B: shares its thinker (audio encoder + LM) tensor
+# layout byte-for-byte with qwen3-asr (see
+# crates/openasr-core/src/models/qwen/forced_aligner_import.rs); only the
+# final head differs (independent classify_num=5000 timestamp-bin head vs
+# tied lm_head). Not yet wired to a public `openasr model-pack import`
+# subcommand -- built via the publish-only
+# `examples/pack_qwen3_forced_aligner.rs` driver instead (family/CLI wiring
+# for the NAR decode policy is a separate stage; see the importer's module
+# doc comment).
+["qwen3-forced-aligner-0.6b"]
+import_subcommand = "pack_qwen3_forced_aligner example (not yet a public model-pack import subcommand)"
+upstream_repo = "Qwen/Qwen3-ForcedAligner-0.6B"
+source_revision = "main"
+needs_license_flags = false
