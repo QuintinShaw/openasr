@@ -4,7 +4,7 @@
 # re-verify against the upstream card when the upstream weights change.
 
 tagline = "Chinese multi-dialect speech recognition -- a WeNet E-Branchformer (CTC + attention) tuned for Sichuan and 22 regional dialects"
-tagline_zh = "中文多方言语音识别 — 基于 WeNet E-Branchformer(CTC + 注意力),针对四川话与 22 种地方方言优化"
+tagline_zh = "中文多方言语音识别 — 基于 WeNet E-Branchformer（CTC + 注意力），针对四川话与 22 种地方方言优化"
 
 # This is a Chinese-only (character-vocabulary) model, so the shared 11s English
 # JFK ruler is out-of-distribution: decoding English forces degenerate CTC beam
@@ -25,11 +25,11 @@ highlights = [
 ]
 
 highlights_zh = [
-  "🀄 **22 种中文方言** — 基于 WeNet E-Branchformer,针对地方普通话优化,四川话(川话)表现突出,同时覆盖吴语、粤语、闽南语、上海话等",
+  "🀄 **22 种中文方言** — 基于 WeNet E-Branchformer，针对地方普通话优化，四川话（川话）表现突出，同时覆盖吴语、粤语、闽南语、上海话等",
   "🎯 **方言优先的准确度** — 方言识别相对提升约 38%，相较基础 Dolphin 的 CER 降低约 16%，同时不牺牲标准普通话",
-  "🧩 **联合 CTC + 注意力** — E-Branchformer 编码器配 Transformer 解码器,配合 CTC/attention 重打分,OpenASR 对齐 golden 参考逐位一致",
-  "🐬 **面向中文、字级建模** — 紧凑的 `small.cn` 检查点,基于字符词表,专为中文音频(含重口音与中英混说)打造",
-  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python,针对 CPU 与 GPU 的极致性能优化",
+  "🧩 **联合 CTC + 注意力** — E-Branchformer 编码器配 Transformer 解码器，配合 CTC/attention 重打分，OpenASR 对齐 golden 参考逐位一致",
+  "🐬 **面向中文、字级建模** — 紧凑的 `small.cn` 检查点，基于字符词表，专为中文音频（含重口音与中英混说）打造",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
 ]
 
 intro = """
@@ -51,17 +51,17 @@ setting to enable it. Transcripts are plain, unpunctuated text by design.
 """
 
 intro_zh = """
-Dolphin CN-Dialect Small 是 **DataoceanAI** 开源的**中文多方言**语音识别模型,基于
-**Dolphin / WeNet** 配方,采用 **E-Branchformer 编码器 + Transformer 解码器**并以
-**联合 CTC + attention** 目标训练(`small.cn` 检查点,字符级词表)。它专注地方普通话——
-以**四川话(川话)**表现突出,同时覆盖吴语、粤语、闽南语、上海话等 22 种中国方言,并保持较强的
-标准普通话转写(模型卡称方言识别相对大幅提升,相较基础 Dolphin 的 CER 也明显下降)。
+Dolphin CN-Dialect Small 是 **DataoceanAI** 开源的**中文多方言**语音识别模型，基于
+**Dolphin / WeNet** 配方，采用 **E-Branchformer 编码器 + Transformer 解码器**并以
+**联合 CTC + attention** 目标训练（`small.cn` 检查点，字符级词表）。它专注地方普通话——
+以**四川话（川话）**表现突出，同时覆盖吴语、粤语、闽南语、上海话等 22 种中国方言，并保持较强的
+标准普通话转写（模型卡称方言识别相对大幅提升，相较基础 Dolphin 的 CER 也明显下降）。
 
-这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理,不会把音频上传到
-云端;解码采用 CTC beam search 加 attention 重打分,并在一段四川话样本上与 golden 参考逐位一致。
-提供 `fp16`(最高保真,推荐)、`q8_0`、`q4_k` 三种量化版本。
+这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理，不会把音频上传到
+云端；解码采用 CTC beam search 加 attention 重打分，并在一段四川话样本上与 golden 参考逐位一致。
+提供 `fp16`（最高保真，推荐）、`q8_0`、`q4_k` 三种量化版本。
 
-**说明:** 该模型不输出标点符号。其上游训练语料的转写不含标点,解码器从不预测标点符号——
+**说明:** 该模型不输出标点符号。其上游训练语料的转写不含标点，解码器从不预测标点符号——
 没有可开启的开关。转写结果按设计是不含标点的纯文本。
 """
 
@@ -79,20 +79,20 @@ local-inference adaptation.
 acknowledgement_zh = """
 本模型包重新分发自 DataoceanAI 开源的 Dolphin CN-Dialect Small
 ([DataoceanAI1/dolphi-cn-dialect-small](https://huggingface.co/DataoceanAI1/dolphi-cn-dialect-small))。
-原始架构、训练和权重归作者所有,许可证继承上游 Apache-2.0。模型基于 **Dolphin** 多语言 ASR 项目与
-**WeNet** 的 E-Branchformer / 联合 CTC-attention 配方,感谢 Dolphin、WeNet 团队与 DataoceanAI 的
+原始架构、训练和权重归作者所有，许可证继承上游 Apache-2.0。模型基于 **Dolphin** 多语言 ASR 项目与
+**WeNet** 的 E-Branchformer / 联合 CTC-attention 配方，感谢 Dolphin、WeNet 团队与 DataoceanAI 的
 开源工作。OpenASR 仅进行格式转换、量化、运行时校验和本地推理适配。
 """
 
 [prose_locales."zh-CN"]
-tagline = "中文多方言语音识别 — 基于 WeNet E-Branchformer(CTC + 注意力),针对四川话与 22 种地方方言优化"
+tagline = "中文多方言语音识别 — 基于 WeNet E-Branchformer（CTC + 注意力），针对四川话与 22 种地方方言优化"
 
 highlights = [
-  "🀄 **22 种中文方言** — 基于 WeNet E-Branchformer,针对地方普通话优化,四川话(川话)表现突出,同时覆盖吴语、粤语、闽南语、上海话等",
+  "🀄 **22 种中文方言** — 基于 WeNet E-Branchformer，针对地方普通话优化，四川话（川话）表现突出，同时覆盖吴语、粤语、闽南语、上海话等",
   "🎯 **方言优先的准确度** — 方言识别相对提升约 38%，相较基础 Dolphin 的 CER 降低约 16%，同时不牺牲标准普通话",
-  "🧩 **联合 CTC + 注意力** — E-Branchformer 编码器配 Transformer 解码器,配合 CTC/attention 重打分,OpenASR 对齐 golden 参考逐位一致",
-  "🐬 **面向中文、字级建模** — 紧凑的 `small.cn` 检查点,基于字符词表,专为中文音频(含重口音与中英混说)打造",
-  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python,针对 CPU 与 GPU 的极致性能优化",
+  "🧩 **联合 CTC + 注意力** — E-Branchformer 编码器配 Transformer 解码器，配合 CTC/attention 重打分，OpenASR 对齐 golden 参考逐位一致",
+  "🐬 **面向中文、字级建模** — 紧凑的 `small.cn` 检查点，基于字符词表，专为中文音频（含重口音与中英混说）打造",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
 ]
 
 source_sha256 = "00faebf70fb5370020d82e90c9dbe8ffb25c24ef450ffed55719849390d538e7"

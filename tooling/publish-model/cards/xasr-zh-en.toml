@@ -35,13 +35,13 @@ maximum fidelity or verification.
 
 intro_zh = """
 X-ASR-zh-en 是 **GilgameshWind** 开源的轻量**中英双语**流式语音识别模型，基于 **icefall / k2**
-配方,是一个 cache-aware 的 **Zipformer2 RNN-T transducer**(6 段、19 层 Zipformer2 编码器 +
-无状态 RNN-T 解码器 + tanh joiner,5000 BPE 词表,约 0.16B 参数)。同一个检查点既能做低延迟
-**流式**字幕,也能做整段**离线**转写,适合端侧中英文听写和实时字幕。
+配方，是一个 cache-aware 的 **Zipformer2 RNN-T transducer**（6 段、19 层 Zipformer2 编码器 +
+无状态 RNN-T 解码器 + tanh joiner，5000 BPE 词表，约 0.16B 参数）。同一个检查点既能做低延迟
+**流式**字幕，也能做整段**离线**转写，适合端侧中英文听写和实时字幕。
 
-这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理,不会把音频上传到
-云端。`q8_0` 是推荐默认版本(在 OpenASR 的校验中与 fp16 转写逐字节一致);`q4_k` 体积最小、
-适合内存更紧的设备;`fp16` 适合最高保真或验证。
+这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理，不会把音频上传到
+云端。`q8_0` 是推荐默认版本（在 OpenASR 的校验中与 fp16 转写逐字节一致）；`q4_k` 体积最小、
+适合内存更紧的设备；`fp16` 适合最高保真或验证。
 """
 
 acknowledgement = """
@@ -57,8 +57,8 @@ runtime verification, and local-inference adaptation.
 acknowledgement_zh = """
 本模型包重新分发自 GilgameshWind 开源的 X-ASR-zh-en
 ([GilgameshWind/X-ASR-zh-en](https://huggingface.co/GilgameshWind/X-ASR-zh-en))。原始架构、
-训练和权重归作者所有,许可证继承上游 Apache-2.0。模型基于 **icefall** / **k2(新一代 Kaldi)**
-的 Zipformer2 transducer 配方,感谢 icefall 团队与 GilgameshWind 的开源工作。OpenASR 仅进行
+训练和权重归作者所有，许可证继承上游 Apache-2.0。模型基于 **icefall** / **k2（新一代 Kaldi）**
+的 Zipformer2 transducer 配方，感谢 icefall 团队与 GilgameshWind 的开源工作。OpenASR 仅进行
 格式转换、量化、运行时校验和本地推理适配。
 """
 
