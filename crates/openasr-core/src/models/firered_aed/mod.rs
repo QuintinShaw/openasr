@@ -16,6 +16,8 @@
 //! - The Conformer encoder graph, KV-cached decoder, and executor land in the
 //!   executor stage.
 
+pub(crate) mod encoder_graph;
+pub(crate) mod encoder_weights;
 pub(crate) mod frontend;
 pub mod package_import;
 pub(crate) mod runtime_contract;
