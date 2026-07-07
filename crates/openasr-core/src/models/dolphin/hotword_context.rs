@@ -58,6 +58,16 @@ use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 
 use super::encoder_graph::DolphinWeightProvider;
 
+/// Name of the `context_module.*` tensor that only exists on packs actually
+/// trained with the deep-biasing context module (the multi-lingual `base`/
+/// `small` dialect packs never had it). Its presence in a pack's GGUF tensor
+/// index is the per-pack phrase-bias capability probe
+/// (`api::backend::native::native_runtime_descriptor_supports_phrase_bias`) --
+/// checking it there keeps a base-tier pack from being misreported as
+/// hotword-capable and then hard-failing here at decode time.
+pub(crate) const CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME: &str =
+    "context_module.context_extractor.word_embedding.weight";
+
 /// `context_module.*` embedding/hidden width (== the encoder `d_model`).
 pub(crate) const HOTWORD_EMBED_DIM: usize = 768;
 /// `_BLSTM`'s `nn.LSTM(..., num_layers=2, bidirectional=True)`.
@@ -313,9 +323,9 @@ pub(crate) fn encode_hotword_context_embeddings(
 ) -> Result<Vec<f32>, DolphinHotwordError> {
     let d = HOTWORD_EMBED_DIM;
     let vocab_embed = provider
-        .tensor("context_module.context_extractor.word_embedding.weight")
+        .tensor(CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME)
         .ok_or_else(|| DolphinHotwordError::MissingWeight {
-            name: "context_module.context_extractor.word_embedding.weight".to_string(),
+            name: CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME.to_string(),
         })?;
     if !vocab_embed.len().is_multiple_of(d) {
         return Err(DolphinHotwordError::Shape {
