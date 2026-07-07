@@ -31,9 +31,9 @@ pub enum AudioPreparationError {
         extensions: String,
     },
     #[error(
-        "Input requires audio conversion before the {backend} backend can read it, but ffmpeg was not found.\nInstall ffmpeg and add it to PATH, pass --ffmpeg-bin /path/to/ffmpeg, set OPENASR_FFMPEG_BIN, or run `openasr config set media.ffmpeg_bin /path/to/ffmpeg`."
+        "Input requires audio conversion before the {backend} backend can read it, but no audio converter was found.\n{hint}"
     )]
-    MissingFfmpeg { backend: BackendKind },
+    MissingFfmpeg { backend: BackendKind, hint: String },
     #[error(
         "Configured ffmpeg binary was not found or is not a regular file: {path}\nPass --ffmpeg-bin /path/to/ffmpeg, set OPENASR_FFMPEG_BIN, or run `openasr config set media.ffmpeg_bin /path/to/ffmpeg` with a valid ffmpeg executable."
     )]
@@ -43,17 +43,19 @@ pub enum AudioPreparationError {
     )]
     TempDir { source: std::io::Error },
     #[error(
-        "Could not convert input audio for the {backend} backend with ffmpeg (status {status}).\nOpenASR prepares recognized non-WAV inputs as temporary 16 kHz mono PCM WAV for non-mock backends. Check that your local ffmpeg can decode this container/codec, pass a different --ffmpeg-bin, or convert the file to WAV yourself.{stderr}"
+        "Could not convert input audio for the {backend} backend with {tool} (status {status}).\nOpenASR prepares recognized non-WAV inputs as temporary 16 kHz mono PCM WAV for non-mock backends. Check that your local {tool} can decode this container/codec, pass a different --ffmpeg-bin, or convert the file to WAV yourself.{stderr}"
     )]
-    FfmpegFailed {
+    ConversionFailed {
         backend: BackendKind,
+        tool: String,
         status: String,
         stderr: String,
     },
     #[error(
-        "Could not run ffmpeg: {path}\nPlease check that the file exists and is executable, or configure ffmpeg with --ffmpeg-bin, OPENASR_FFMPEG_BIN, or `openasr config set media.ffmpeg_bin`. Details: {source}"
+        "Could not run {tool}: {path}\nPlease check that the file exists and is executable, or configure ffmpeg with --ffmpeg-bin, OPENASR_FFMPEG_BIN, or `openasr config set media.ffmpeg_bin`. Details: {source}"
     )]
-    FfmpegSpawn {
+    ConversionSpawn {
+        tool: String,
         path: PathBuf,
         #[source]
         source: std::io::Error,
