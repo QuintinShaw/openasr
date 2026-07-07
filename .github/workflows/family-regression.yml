@@ -28,11 +28,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # macos pinned (not macos-latest, which migrates to macOS 26 from
+        # 2026-06-15): the regression net's environment must not drift
+        # under the alias.
+        os: [ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install build dependencies
@@ -50,7 +53,7 @@ jobs:
         env:
           OPENASR_GGML_NATIVE: "0"
         run: cargo build --release -p openasr-cli
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: openasr-cli-${{ matrix.os }}
           path: target/release/openasr
@@ -64,7 +67,10 @@ jobs:
       # rest of the net.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # macos pinned (not macos-latest, which migrates to macOS 26 from
+        # 2026-06-15): the regression net's environment must not drift
+        # under the alias.
+        os: [ubuntu-latest, macos-15]
         # Family registry: one entry per public model family, smallest
         # checkpoint x smallest quant. ONBOARDING A NEW FAMILY IS NOT DONE
         # until it is registered here with a committed golden under
@@ -96,14 +102,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: openasr-cli-${{ matrix.os }}
           path: bin
       - run: chmod +x bin/openasr
       - name: Restore model pack cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.openasr/models
           key: openasr-packs-${{ matrix.case.name }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('model-registry/catalog.json') }}
@@ -118,7 +124,7 @@ jobs:
             ${{ matrix.case.args || '' }}
       - name: Upload transcript
         if: always() && matrix.case.mode != 'verify'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: transcript-${{ matrix.case.name }}-${{ matrix.os }}
           path: tmp/family-regression/

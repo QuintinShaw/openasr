@@ -37,7 +37,7 @@ jobs:
       tag: ${{ steps.v.outputs.tag }}
       should_release: ${{ steps.v.outputs.should_release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: v
         name: Read workspace version and check for an existing tag
         run: |
@@ -83,7 +83,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install Linux build dependencies
@@ -111,7 +111,7 @@ jobs:
           cp README.md LICENSE "${stage}/"
           tar -czf "dist/openasr-${version}-${target}.tar.gz" -C dist "openasr-${version}-${target}"
       - name: Upload archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openasr-${{ matrix.target }}
           path: dist/openasr-${{ needs.resolve.outputs.version }}-${{ matrix.target }}.tar.gz
@@ -123,9 +123,9 @@ jobs:
     if: needs.resolve.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download build archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: staging
           merge-multiple: true

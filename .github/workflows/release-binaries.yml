@@ -48,7 +48,10 @@ jobs:
             target: x86_64-apple-darwin
             binary_name: openasr
             archive_ext: tar.gz
-          - os: macos-latest
+          # Pinned (not macos-latest, which migrates to macOS 26 from
+          # 2026-06-15): released binaries need a deterministic build
+          # environment that does not drift under the alias.
+          - os: macos-15
             target: aarch64-apple-darwin
             binary_name: openasr
             archive_ext: tar.gz
@@ -115,7 +118,7 @@ jobs:
             timeout: 240
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -199,7 +202,7 @@ jobs:
       - name: Cache AMD HIP SDK install
         if: runner.os == 'Windows' && matrix.features == 'hip'
         id: cache-hip-sdk
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: C:\Program Files\AMD\ROCm
           key: hip-sdk-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ runner.os }}
@@ -317,7 +320,7 @@ jobs:
 
       - name: Restore model pack cache
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.openasr/models
           key: openasr-packs-whisper-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('model-registry/catalog.json') }}
@@ -430,7 +433,7 @@ jobs:
           Compress-Archive -Path "$distDir" -DestinationPath "dist\$archive.${{ matrix.archive_ext }}" -Force
 
       - name: Upload archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openasr-${{ matrix.target }}
           path: dist/openasr-${{ env.OPENASR_VERSION }}-${{ matrix.target }}.${{ matrix.archive_ext }}
@@ -445,7 +448,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: staging
           merge-multiple: true
@@ -458,7 +461,7 @@ jobs:
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
       - name: Upload SHA256SUMS
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SHA256SUMS
           path: dist/SHA256SUMS
