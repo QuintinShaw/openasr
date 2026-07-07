@@ -1,7 +1,6 @@
 //! Causal, cache-carrying forward pass of FireRedVAD's **Stream-VAD**
-//! (`Stream-VAD/model.pth.tar`): the same `DetectModel` DFSMN architecture as
-//! [`crate::diarize::vad::firered`], but exported with `N2 = 0` (no
-//! lookahead), i.e. strictly causal at every layer.
+//! (`Stream-VAD/model.pth.tar`): a `DetectModel` DFSMN architecture exported
+//! with `N2 = 0` (no lookahead), i.e. strictly causal at every layer.
 //!
 //! Because there is no lookahead term, a single [`forward_chunk`] call is
 //! *the entire model* -- the "whole-utterance" batch path
@@ -18,10 +17,8 @@
 //!
 //! [`forward_chunk`]: FireRedStreamVadModel::forward_chunk
 
+use super::frontend::{FbankFeatures, FireRedVadFbankFrontend, NUM_MEL_BINS, apply_cmvn};
 use super::weights::{FireRedStreamVadWeights, FireRedStreamVadWeightsError};
-use crate::diarize::vad::firered::frontend::{
-    FbankFeatures, FireRedVadFbankFrontend, NUM_MEL_BINS, apply_cmvn,
-};
 
 /// Frame shift of the shared fbank frontend (10 ms).
 pub const FRAME_SHIFT_MS: u32 = 10;
@@ -170,6 +167,14 @@ impl FireRedStreamVadModel {
 /// spanning `cache ++ this chunk` so the FIR sees exactly the same history it
 /// would in a single whole-utterance call. `cache` is replaced with the
 /// trailing `<= K - 1` frames of `cache ++ x` for the next call.
+///
+/// The naive form of this loop (channel-outer, tap-innermost) reads
+/// `combined` with a `channels`-wide stride per tap -- cache-hostile and not
+/// auto-vectorizable. Instead this transposes `cache ++ x` to channel-major
+/// with a `K - 1` zero-pad up front, so each channel's causal FIR becomes a
+/// branch-free contiguous [`dot`] over a sliding window (no `src >= 0`
+/// bounds check in the hot loop; the zero-pad supplies the "no history yet"
+/// case at the very start of a session).
 fn fsmn_apply_causal_cached(
     x: &[f32],
     t: usize,
@@ -178,27 +183,32 @@ fn fsmn_apply_causal_cached(
     cache: &mut Vec<f32>,
 ) -> Vec<f32> {
     let cache_frames = cache.len() / channels;
-    let mut combined = Vec::with_capacity((cache_frames + t) * channels);
+    let total = cache_frames + t;
+    let mut combined = Vec::with_capacity(total * channels);
     combined.extend_from_slice(cache);
     combined.extend_from_slice(x);
 
     let mut out = x.to_vec();
-    for c in 0..channels {
-        let lb_w = &lookback_w[c * LOOKBACK_ORDER..(c + 1) * LOOKBACK_ORDER];
-        for ti_new in 0..t {
-            let ti = cache_frames + ti_new;
-            let mut lb = 0.0f32;
-            for (k, wt) in lb_w.iter().enumerate() {
-                let src = ti as isize - (LOOKBACK_ORDER as isize - 1) + k as isize;
-                if src >= 0 {
-                    lb += wt * combined[src as usize * channels + c];
-                }
-            }
-            out[ti_new * channels + c] += lb;
+
+    let pad = LOOKBACK_ORDER - 1;
+    let row_len = pad + total;
+    let mut padded = vec![0.0f32; channels * row_len];
+    for (frame, src_frame) in combined.chunks_exact(channels).enumerate() {
+        for (c, &v) in src_frame.iter().enumerate() {
+            padded[c * row_len + pad + frame] = v;
         }
     }
 
-    let total = cache_frames + t;
+    for c in 0..channels {
+        let lb_w = &lookback_w[c * LOOKBACK_ORDER..(c + 1) * LOOKBACK_ORDER];
+        let chan_row = &padded[c * row_len..(c + 1) * row_len];
+        for ti_new in 0..t {
+            let ti = cache_frames + ti_new;
+            let window = &chan_row[ti..ti + LOOKBACK_ORDER];
+            out[ti_new * channels + c] += dot(window, lb_w);
+        }
+    }
+
     let keep = total.min(CACHE_FRAMES);
     let start = total - keep;
     *cache = combined[start * channels..].to_vec();
@@ -220,11 +230,7 @@ fn linear_relu(
         let row = &x[ti * in_dim..(ti + 1) * in_dim];
         for o in 0..out_dim {
             let w_row = &weight[o * in_dim..(o + 1) * in_dim];
-            let mut acc = bias[o];
-            for (xi, wi) in row.iter().zip(w_row) {
-                acc += xi * wi;
-            }
-            out[ti * out_dim + o] = acc.max(0.0);
+            out[ti * out_dim + o] = (bias[o] + dot(row, w_row)).max(0.0);
         }
     }
     out
@@ -238,14 +244,35 @@ fn linear_no_bias(x: &[f32], t: usize, in_dim: usize, weight: &[f32], out_dim: u
         let row = &x[ti * in_dim..(ti + 1) * in_dim];
         for o in 0..out_dim {
             let w_row = &weight[o * in_dim..(o + 1) * in_dim];
-            let mut acc = 0.0f32;
-            for (xi, wi) in row.iter().zip(w_row) {
-                acc += xi * wi;
-            }
-            out[ti * out_dim + o] = acc;
+            out[ti * out_dim + o] = dot(row, w_row);
         }
     }
     out
+}
+
+/// Dot product with 8 independent accumulator lanes. A single running
+/// accumulator (`acc += a[i]*b[i]`) creates a serial dependency chain that
+/// blocks auto-vectorization of the float reduction; splitting into 8 lanes
+/// gives the compiler independent accumulations it can pack into SIMD
+/// registers (NEON/AVX) before the final horizontal reduction.
+#[inline]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    const LANES: usize = 8;
+    let mut acc = [0.0f32; LANES];
+    let chunks = a.len() / LANES;
+    for i in 0..chunks {
+        let ai = &a[i * LANES..i * LANES + LANES];
+        let bi = &b[i * LANES..i * LANES + LANES];
+        for lane in 0..LANES {
+            acc[lane] += ai[lane] * bi[lane];
+        }
+    }
+    let mut sum = acc.iter().sum::<f32>();
+    for i in chunks * LANES..a.len() {
+        sum += a[i] * b[i];
+    }
+    sum
 }
 
 #[inline]
