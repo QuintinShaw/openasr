@@ -44,6 +44,7 @@ pub(super) fn transcribe_many(
         model_pack_path: prepared_run.model_source.model_pack_path.clone(),
         backend_kind: prepared_run.backend_kind,
         ffmpeg_bin: prepared_run.ffmpeg_bin.clone(),
+        ffmpeg_bin_explicit: prepared_run.ffmpeg_bin_explicit,
         longform,
         diarize: options.diarize,
         speakers: options.speakers,
@@ -113,7 +114,11 @@ pub(super) fn transcribe_batch_item(
 ) -> Result<BatchOutput> {
     let prepared = openasr_core::prepare_audio_input(
         input_path,
-        &audio_preparation_options(context.backend_kind, context.ffmpeg_bin.clone()),
+        &audio_preparation_options(
+            context.backend_kind,
+            context.ffmpeg_bin.clone(),
+            context.ffmpeg_bin_explicit,
+        ),
     )?;
     print_audio_input_notes(prepared.original());
     print_audio_preparation_notes(&prepared);
@@ -189,7 +194,11 @@ pub(super) fn run_benchmark(
 ) -> Result<()> {
     let prepared = openasr_core::prepare_audio_input(
         file,
-        &audio_preparation_options(prepared_run.backend_kind, prepared_run.ffmpeg_bin.clone()),
+        &audio_preparation_options(
+            prepared_run.backend_kind,
+            prepared_run.ffmpeg_bin.clone(),
+            prepared_run.ffmpeg_bin_explicit,
+        ),
     )?;
     print_audio_input_notes(prepared.original());
     print_audio_preparation_notes(&prepared);
@@ -256,6 +265,10 @@ pub(super) struct PreparedBackendRun {
     pub(super) backend_kind: BackendKind,
     pub(super) model_source: ResolvedModelSource,
     pub(super) ffmpeg_bin: Option<PathBuf>,
+    /// Whether `ffmpeg_bin` came from an explicit user choice (CLI flag, env
+    /// var, or config) rather than PATH auto-discovery -- see
+    /// `AudioPreparationOptions::with_ffmpeg_bin_explicit`.
+    pub(super) ffmpeg_bin_explicit: bool,
 }
 
 pub(super) fn resolve_model_source_for_backend(
@@ -373,12 +386,15 @@ pub(super) fn prepare_backend_run(
     let backend_kind = resolve_backend(backend_kind, config)?;
     let model_source =
         resolve_model_source_for_backend(command_label, model, backend_kind, model_pack, config)?;
+    let ffmpeg_bin_explicit =
+        resolve_explicit_ffmpeg_bin(runtime_paths.ffmpeg_bin.clone(), config).is_some();
     let ffmpeg_bin = resolve_ffmpeg_bin(runtime_paths.ffmpeg_bin.clone(), config);
 
     Ok(PreparedBackendRun {
         backend_kind,
         model_source,
         ffmpeg_bin,
+        ffmpeg_bin_explicit,
     })
 }
 
@@ -473,6 +489,8 @@ pub(super) async fn serve(
             "openasr-server: no installed native model pack found; starting with no model bound. Install one (openasr pull <model-id>) or install via the desktop model market; transcription requests will fail closed until then."
         );
     }
+    let ffmpeg_bin_explicit =
+        resolve_explicit_ffmpeg_bin(runtime_paths.ffmpeg_bin.clone(), &config).is_some();
     let ffmpeg_bin = resolve_ffmpeg_bin(runtime_paths.ffmpeg_bin.clone(), &config);
     let api_key_hashes = if supervised_daemon_launch() {
         // The desktop supervisor's managed daemon (marked by the instance-token
@@ -498,6 +516,7 @@ pub(super) async fn serve(
         openasr_server::ServerRuntime {
             backend,
             ffmpeg_bin,
+            ffmpeg_bin_explicit,
             model_pack_path: model_source.model_pack_path,
         },
         launch_options,
@@ -635,18 +654,31 @@ pub(super) fn resolve_ffmpeg_bin(
     cli_path: Option<PathBuf>,
     config: &OpenAsrConfig,
 ) -> Option<PathBuf> {
+    resolve_explicit_ffmpeg_bin(cli_path, config).or_else(|| find_in_path("ffmpeg"))
+}
+
+/// Resolves ffmpeg only from explicit user choices (`--ffmpeg-bin`,
+/// `OPENASR_FFMPEG_BIN`, or the persisted `media.ffmpeg_bin` config) --
+/// excludes PATH auto-discovery. A system that merely happens to have ffmpeg
+/// on PATH should not disable the in-process symphonia decode path, so this
+/// is what decides `AudioPreparationOptions::with_ffmpeg_bin_explicit`.
+pub(super) fn resolve_explicit_ffmpeg_bin(
+    cli_path: Option<PathBuf>,
+    config: &OpenAsrConfig,
+) -> Option<PathBuf> {
     cli_path
         .or_else(|| env_path(OPENASR_FFMPEG_BIN))
         .or_else(|| config.media.ffmpeg_bin.as_ref().map(PathBuf::from))
-        .or_else(|| find_in_path("ffmpeg"))
 }
 
 pub(super) fn audio_preparation_options(
     backend: BackendKind,
     ffmpeg_bin: Option<PathBuf>,
+    ffmpeg_bin_explicit: bool,
 ) -> AudioPreparationOptions {
     AudioPreparationOptions::new(backend)
         .with_ffmpeg_bin(ffmpeg_bin)
+        .with_ffmpeg_bin_explicit(ffmpeg_bin_explicit)
         .with_native_non_wav_conversion(backend == BackendKind::Native)
 }
 

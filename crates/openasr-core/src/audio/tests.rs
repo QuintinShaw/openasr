@@ -270,6 +270,10 @@ fn native_qta_input_reaches_afconvert_conversion() {
 #[test]
 #[cfg(target_os = "macos")]
 fn native_m4a_input_converts_via_afconvert_without_ffmpeg() {
+    // With symphonia now the default in-process decoder for m4a/AAC-LC, this
+    // real m4a normally decodes via `try_symphonia_prepare` rather than
+    // reaching afconvert -- but either path must land here on a valid,
+    // converted 16 kHz WAV, so this still covers the end-to-end contract.
     let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|path| path.parent())
@@ -292,12 +296,122 @@ fn native_m4a_input_converts_via_afconvert_without_ffmpeg() {
         &m4a,
         &AudioPreparationOptions::new(BackendKind::Native).with_native_non_wav_conversion(true),
     )
-    .expect("afconvert fallback should decode a real m4a without ffmpeg configured");
+    .expect("decoding a real m4a without ffmpeg configured should succeed");
 
     assert!(prepared.is_converted());
     let bytes = fs::read(prepared.path()).unwrap();
     assert_eq!(&bytes[0..4], b"RIFF");
     assert_eq!(&bytes[8..12], b"WAVE");
+}
+
+fn crate_fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+fn prepare_native_conversion(path: &Path) -> Result<PreparedAudioInput, AudioPreparationError> {
+    prepare_audio_input(
+        path,
+        &AudioPreparationOptions::new(BackendKind::Native).with_native_non_wav_conversion(true),
+    )
+}
+
+fn assert_prepared_16k_mono_wav(prepared: &PreparedAudioInput) {
+    assert!(prepared.is_converted());
+    let bytes = fs::read(prepared.path()).unwrap();
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(prepared.path(), "test", "test")
+        .expect("prepared output must be a valid 16 kHz mono WAV");
+    assert_eq!(&bytes[0..4], b"RIFF");
+    assert_eq!(&bytes[8..12], b"WAVE");
+    assert!(!samples.is_empty());
+}
+
+#[test]
+fn symphonia_decodes_m4a_aac_lc_in_process() {
+    let prepared = prepare_native_conversion(&crate_fixture("tone_mono.m4a"))
+        .expect("m4a/AAC-LC should decode via the in-process symphonia path");
+    assert_prepared_16k_mono_wav(&prepared);
+}
+
+#[test]
+fn symphonia_decodes_qta_container_in_process() {
+    let prepared = prepare_native_conversion(&crate_fixture("tone_mono.qta"))
+        .expect(".qta (mov/m4a container) should decode via the in-process symphonia path");
+    assert_prepared_16k_mono_wav(&prepared);
+}
+
+#[test]
+fn symphonia_decodes_mp3_in_process() {
+    let prepared = prepare_native_conversion(&crate_fixture("tone_mono.mp3"))
+        .expect("mp3 should decode via the in-process symphonia path");
+    assert_prepared_16k_mono_wav(&prepared);
+}
+
+#[test]
+fn symphonia_decodes_flac_in_process() {
+    let prepared = prepare_native_conversion(&crate_fixture("tone_mono.flac"))
+        .expect("flac should decode via the in-process symphonia path");
+    assert_prepared_16k_mono_wav(&prepared);
+}
+
+#[test]
+fn symphonia_decodes_ogg_vorbis_in_process() {
+    let prepared = prepare_native_conversion(&crate_fixture("tone_stereo.ogg"))
+        .expect("ogg/vorbis should decode (and downmix) via the in-process symphonia path");
+    assert_prepared_16k_mono_wav(&prepared);
+}
+
+#[test]
+fn symphonia_decodes_and_resamples_non_conformant_wav() {
+    // A real (non-16k-mono) wav is not passed through blindly: it is decoded
+    // and resampled via the same symphonia path as the other formats.
+    let prepared = prepare_native_conversion(&crate_fixture("tone_stereo_44100.wav"))
+        .expect("non-conformant wav should decode via the in-process symphonia path");
+    assert_prepared_16k_mono_wav(&prepared);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn he_aac_falls_back_to_afconvert_when_symphonia_cannot_decode_it() {
+    // HE-AAC (SBR) is outside what the enabled symphonia `aac` feature can
+    // correctly decode (see `is_unsupported_aac_extension`); this must fall
+    // back to afconvert, which macOS ships and can decode HE-AAC, rather than
+    // silently emitting bandwidth-limited audio.
+    let prepared = prepare_native_conversion(&crate_fixture("tone_heaac.m4a"))
+        .expect("HE-AAC should fall back to afconvert and still succeed");
+    assert_prepared_16k_mono_wav(&prepared);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn opus_in_ogg_is_unsupported_by_symphonia_and_requires_ffmpeg() {
+    // The enabled symphonia features intentionally exclude an Opus decoder
+    // (see Cargo.toml), so a real Opus-in-Ogg file must fall back to an
+    // external converter instead of silently mis-decoding, and this host has
+    // neither ffmpeg configured nor (being non-macOS) an afconvert fallback.
+    let error = prepare_native_conversion(&crate_fixture("tone_opus.ogg")).unwrap_err();
+    assert!(matches!(error, AudioPreparationError::MissingFfmpeg { .. }));
+}
+
+#[test]
+fn explicit_ffmpeg_bin_skips_symphonia_even_for_a_decodable_format() {
+    // A bare (PATH-relative) command name is accepted by `resolve_conversion_tool`
+    // without an existence check, so this deterministically proves the
+    // in-process decoder was *not* tried: if it had been, this real, valid m4a
+    // fixture would have decoded successfully instead of failing to spawn a
+    // nonexistent tool.
+    let options = AudioPreparationOptions::new(BackendKind::Native)
+        .with_native_non_wav_conversion(true)
+        .with_ffmpeg_bin(Some(PathBuf::from("openasr-test-nonexistent-ffmpeg")))
+        .with_ffmpeg_bin_explicit(true);
+
+    let error = prepare_audio_input(crate_fixture("tone_mono.m4a"), &options).unwrap_err();
+
+    assert!(matches!(
+        error,
+        AudioPreparationError::ConversionSpawn { tool, .. } if tool == "ffmpeg"
+    ));
 }
 
 fn write_test_wav(path: &Path, sample_rate: u32, channels: u16, bits_per_sample: u16, frames: u32) {

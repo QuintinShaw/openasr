@@ -61,6 +61,7 @@ pub(crate) struct BatchRunContext<'a> {
     pub(crate) model_pack_path: Option<PathBuf>,
     pub(crate) backend_kind: BackendKind,
     pub(crate) ffmpeg_bin: Option<PathBuf>,
+    pub(crate) ffmpeg_bin_explicit: bool,
     pub(crate) longform: Option<openasr_core::LongFormOptions>,
     pub(crate) diarize: bool,
     pub(crate) speakers: Option<u8>,

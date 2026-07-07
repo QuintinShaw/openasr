@@ -9,6 +9,17 @@ pub(crate) fn probe_wav_duration_inner(path: &Path) -> std::io::Result<Option<f6
     probe_wav_duration_from_file(&mut file)
 }
 
+/// Cheap fmt-chunk probe used to decide whether a `.wav` input already
+/// matches the 16 kHz mono PCM16/float32 shape `api::audio_io` expects (in
+/// which case it can be passed straight through) or needs to go through the
+/// symphonia decode path first. Returns `None` for anything that cannot even
+/// be parsed as RIFF/WAVE with a fmt chunk (garbage input is left for the
+/// existing downstream WAV reader to reject with a precise error).
+pub(crate) fn probe_wav_pcm_shape(path: &Path) -> std::io::Result<Option<WavFmt>> {
+    let mut file = File::open(path)?;
+    Ok(read_wav_fmt_and_data_size(&mut file)?.map(|(fmt, _)| fmt))
+}
+
 fn probe_wav_duration_from_file(file: &mut File) -> std::io::Result<Option<f64>> {
     let Some((fmt, data_size)) = read_wav_fmt_and_data_size(file)? else {
         return Ok(None);
@@ -107,9 +118,9 @@ fn padded_chunk_size(size: u32) -> u64 {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct WavFmt {
-    audio_format: u16,
-    channels: u16,
-    sample_rate: u32,
-    bits_per_sample: u16,
+pub(crate) struct WavFmt {
+    pub(crate) audio_format: u16,
+    pub(crate) channels: u16,
+    pub(crate) sample_rate: u32,
+    pub(crate) bits_per_sample: u16,
 }
