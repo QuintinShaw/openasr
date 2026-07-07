@@ -4,8 +4,17 @@ name: Release core
 # Cargo.toml changes on main, this builds the `openasr` CLI for the platforms the
 # desktop app consumes and publishes a GitHub Release tagged `vX.Y.Z`. Editing
 # Cargo.toml without changing the version (deps, metadata) is a safe no-op because
-# the resolve job exits cleanly when tag `vX.Y.Z` already exists. `workflow_dispatch`
-# lets the maintainer cut the very first release (no bump) or re-run a failed one.
+# the resolve job exits cleanly when a Release for `vX.Y.Z` already exists.
+# `workflow_dispatch` lets the maintainer cut the very first release (no bump)
+# or re-run a failed one.
+#
+# The `vX.Y.Z` tag itself is created locally by `scripts/bump-version.sh
+# --notes "..."` (an *annotated* tag whose message is the release notes) and
+# shipped to origin by `git push --follow-tags` alongside the version-bump
+# commit -- see RELEASING.md. This workflow does not create the tag; it reads
+# the tag's annotation for the release's Highlights section and fails loudly
+# if the tag is missing (a maintainer who forgot `--follow-tags` should see
+# that immediately, not get a release with an empty Highlights block).
 
 on:
   push:
@@ -14,7 +23,8 @@ on:
       - "Cargo.toml"
   workflow_dispatch:
 
-# Only tag+release; no other write scope.
+# tag annotation is read-only (git fetch); write scope is for creating the
+# release and calling release-binaries.yml (contents: write).
 permissions:
   contents: write
 
@@ -36,10 +46,11 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
       should_release: ${{ steps.v.outputs.should_release }}
+      highlights: ${{ steps.highlights.outputs.highlights }}
     steps:
       - uses: actions/checkout@v7
       - id: v
-        name: Read workspace version and check for an existing tag
+        name: Read workspace version and check whether it is already released
         run: |
           set -euo pipefail
           # Single source of truth: [workspace.package] version in the root
@@ -53,18 +64,55 @@ jobs:
           tag="v${version}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-            echo "tag ${tag} already exists -- nothing to release"
+
+          # The tag must already exist on origin -- scripts/bump-version.sh
+          # --notes creates it locally and `git push --follow-tags` ships it
+          # together with this Cargo.toml commit. If it's missing, fail
+          # loudly instead of silently skipping (a push without the tag is a
+          # maintainer mistake, not a legitimate "already released" no-op).
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            {
+              echo "::error::tag ${tag} not found on origin."
+              echo "Did you run scripts/bump-version.sh ${version} --notes \"...\" and git push --follow-tags? See RELEASING.md."
+            } >&2
+            exit 1
+          fi
+
+          if gh release view "${tag}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "release ${tag} already exists -- nothing to do"
             echo "should_release=false" >> "${GITHUB_OUTPUT}"
           else
-            echo "tag ${tag} is new -- will build and release"
+            echo "release ${tag} does not exist yet -- will build and release"
             echo "should_release=true" >> "${GITHUB_OUTPUT}"
           fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - id: highlights
+        name: Read the annotated tag's message as release Highlights
+        if: steps.v.outputs.should_release == 'true'
+        run: |
+          set -euo pipefail
+          tag="${{ steps.v.outputs.tag }}"
+          git fetch --no-tags origin "refs/tags/${tag}:refs/tags/${tag}"
+          # Strip the trailing PGP signature block (present if the tagger's
+          # git config auto-signs tags) -- only the annotation text itself is
+          # the Highlights content.
+          body="$(git for-each-ref "refs/tags/${tag}" --format='%(contents)' \
+            | sed '/-----BEGIN PGP SIGNATURE-----/,$d')"
+          if [ -z "${body// /}" ]; then
+            echo "::error::tag ${tag} has an empty annotation -- was it created with \`git tag -a\` (not \`git tag\`)? See RELEASING.md." >&2
+            exit 1
+          fi
+          {
+            echo "highlights<<RELEASE_HIGHLIGHTS_EOF"
+            echo "$body"
+            echo "RELEASE_HIGHLIGHTS_EOF"
+          } >> "${GITHUB_OUTPUT}"
 
   build:
     name: Build ${{ matrix.target }}
     needs: resolve
-    if: needs.resolve.outputs.should_release == 'true'
+    if: needs.resolve.outputs.should_release == 'true' && success()
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     # Distributed binaries must be portable across end-user CPUs. build.rs
@@ -120,8 +168,10 @@ jobs:
   release:
     name: Publish release
     needs: [resolve, build]
-    if: needs.resolve.outputs.should_release == 'true'
+    if: needs.resolve.outputs.should_release == 'true' && success()
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
       - name: Download build archives
@@ -137,16 +187,82 @@ jobs:
           cd dist
           sha256sum *.tar.gz > SHA256SUMS
           cat SHA256SUMS
-      - name: Create GitHub Release
+
+      - name: Assemble release notes (Highlights / What's Changed / Install & Verify)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HIGHLIGHTS: ${{ needs.resolve.outputs.highlights }}
         run: |
           set -euo pipefail
           tag="${{ needs.resolve.outputs.tag }}"
-          # gh creates the tag at this commit if it does not exist yet, then
-          # publishes the release with the archives + checksum file attached.
+
+          {
+            echo "## Highlights"
+            echo
+            printf '%s\n' "$HIGHLIGHTS"
+          } > highlights.md
+
+          # "What's Changed": GitHub's generated-notes body already includes
+          # its own "## What's Changed" heading, PR bullet list, and a
+          # trailing "Full Changelog" compare link -- reuse it verbatim
+          # instead of reimplementing PR-diffing.
+          gh api "repos/${{ github.repository }}/releases/generate-notes" \
+            -f "tag_name=${tag}" -f "target_commitish=${{ github.sha }}" \
+            --jq .body > whats-changed.md
+
+          # Install & Verify: stub for now (this job's own build only covers
+          # macOS arm64 + Linux x86_64; the full multi-platform matrix hasn't
+          # built yet). The `finalize-notes` job below replaces this section
+          # with the real asset list once `binaries` (release-binaries.yml)
+          # finishes uploading everything.
+          printf '' | scripts/render-install-verify.sh \
+            "${{ needs.resolve.outputs.version }}" "${{ github.repository }}" "${tag}" \
+            > install-verify.md
+
+          cat highlights.md whats-changed.md install-verify.md > body.md
+
+      - name: Create GitHub Release
+        run: |
+          set -euo pipefail
+          tag="${{ needs.resolve.outputs.tag }}"
+          # The tag already exists (scripts/bump-version.sh --notes created
+          # it locally; `git push --follow-tags` shipped it), so `gh release
+          # create` publishes against that existing tag rather than minting
+          # a fresh one.
           gh release create "${tag}" \
-            --target "${{ github.sha }}" \
             --title "${tag}" \
-            --notes "Automated release of the \`openasr\` CLI for ${tag}. Prebuilt binaries for macOS arm64 and Linux x86_64; verify with SHA256SUMS." \
+            --notes-file body.md \
             dist/*.tar.gz dist/SHA256SUMS
+
+  binaries:
+    name: Build full release matrix
+    needs: [resolve, release]
+    if: needs.resolve.outputs.should_release == 'true' && success()
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-binaries.yml
+    with:
+      ref: ${{ needs.resolve.outputs.tag }}
+
+  finalize-notes:
+    name: Finalize Install & Verify with real assets
+    needs: [resolve, release, binaries]
+    if: needs.resolve.outputs.should_release == 'true' && success()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rebuild Install & Verify from the release's actual assets
+        run: |
+          set -euo pipefail
+          tag="${{ needs.resolve.outputs.tag }}"
+          version="${{ needs.resolve.outputs.version }}"
+
+          gh release view "$tag" --json assets --jq '.assets[].name' > asset-names.txt
+          scripts/render-install-verify.sh "$version" "${{ github.repository }}" "$tag" \
+            < asset-names.txt > install-verify.md
+          gh release view "$tag" --json body --jq .body > current-body.md
+
+          python3 scripts/splice-install-verify.py current-body.md install-verify.md > new-body.md
+
+          gh release edit "$tag" --notes-file new-body.md

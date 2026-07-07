@@ -5,9 +5,9 @@ version bump pushed to `main` IS the release.
 
 Feature, fix, and any other content changes go through pull requests as usual.
 The release bump itself is the exception: a maintainer pushes it directly to
-`main` as a single `chore(release)` commit. Routing the bump through a PR adds
-nothing (the release fires on the merge commit anyway) and CI runs on `main`
-push regardless.
+`main` as a single `chore(release)` commit plus its annotated `vX.Y.Z` tag.
+Routing the bump through a PR adds nothing (the release fires on the merge
+commit anyway) and CI runs on `main` push regardless.
 
 ## Versioning
 
@@ -29,27 +29,67 @@ bump, or CI's `--locked` builds fail:
 1. On `main`, run:
 
    ```bash
-   scripts/bump-version.sh X.Y.Z
+   scripts/bump-version.sh X.Y.Z --notes "Release highlights go here."
    ```
 
-   This bumps the version, regenerates both lockfiles, and self-checks the
-   result with `cargo metadata --locked`. It is idempotent -- rerunning it
-   with the version already at `X.Y.Z` is a no-op diff.
-2. Commit and push to `main`:
+   `--notes` is **required** (the script fails closed without it, or with a
+   blank/whitespace-only value): it becomes the message of an *annotated*
+   `vX.Y.Z` git tag, which `release-core.yml` reads verbatim as the
+   release's **Highlights** section. Write it like the top of a changelog
+   entry -- one or a few lines of plain markdown, no need to restate the
+   version number.
+
+   The script bumps the version, regenerates both lockfiles, self-checks the
+   result with `cargo metadata --locked`, commits `chore(release): vX.Y.Z`,
+   and creates the annotated `vX.Y.Z` tag on that commit. It is idempotent:
+   rerunning with the same version and no pending file changes skips the
+   commit, and if the tag already exists locally it is left alone (delete it
+   first with `git tag -d vX.Y.Z` to redo the notes).
+
+2. Push the commit **and** the tag together:
 
    ```bash
-   git add Cargo.toml Cargo.lock tooling/system-audio-check/Cargo.lock
-   git commit -m "chore(release): vX.Y.Z"
-   git push
+   git push --follow-tags
    ```
+
+   Pushing just the commit without the tag (plain `git push`) is a mistake
+   `release-core.yml` catches and fails loudly on -- it needs the tag's
+   annotation for Highlights and refuses to guess.
+
 3. The `Release core` workflow (`.github/workflows/release-core.yml`)
    triggers on `Cargo.toml` changes:
-   - reads the workspace version;
-   - exits cleanly if the tag `vX.Y.Z` already exists (so unrelated
-     `Cargo.toml` edits and re-runs are no-ops);
-   - otherwise builds release binaries for macOS arm64 and Linux x86_64,
-     creates the `vX.Y.Z` tag, and publishes a GitHub Release with
-     `openasr-<version>-<target>.tar.gz` artifacts plus `SHA256SUMS`.
+   - reads the workspace version and confirms the `vX.Y.Z` tag exists on
+     origin (failing loudly if it's missing -- see step 2);
+   - exits cleanly if a GitHub Release for `vX.Y.Z` already exists (so
+     unrelated `Cargo.toml` edits and re-runs are no-ops);
+   - otherwise builds its own macOS-arm64 + Linux-x86_64 binaries, reads the
+     tag annotation for Highlights, and creates the GitHub Release with a
+     three-part body (see below);
+   - then calls `.github/workflows/release-binaries.yml` directly (as a
+     `workflow_call`, not a webhook -- tags created through the
+     `GITHUB_TOKEN` API do not cascade into further Actions triggers, so a
+     real `push: tags` event alone would never fire for a tag this workflow
+     created) to build the full release matrix (Linux x86_64/arm64, macOS
+     x86_64/arm64, Windows, plus Vulkan/CUDA/HIP feature variants) and
+     upload every archive to the same release;
+   - `release-binaries.yml`'s own completeness gate then asserts the release
+     ends up with every expected platform archive, failing the run if one is
+     missing instead of silently shipping a partial release;
+   - finally, `release-core.yml` rewrites the release's Install & Verify
+     section from the now-complete, real asset list.
+
+### Release notes structure
+
+Every release body has three sections:
+
+- **Highlights** -- the `--notes` text from the annotated tag, verbatim.
+- **What's Changed** -- GitHub's auto-generated PR list between this tag and
+  the previous one, plus a "Full Changelog" compare link.
+- **Install & Verify** -- one bullet per shipped platform archive (label +
+  direct download link) plus a `sha256sum -c` snippet, generated from the
+  release's actual asset list. Never hand-written, so it can't drift the way
+  a fixed "macOS arm64 and Linux x86_64" sentence would once more platforms
+  ship.
 
 No pre-release channels: the core releases plain `X.Y.Z` versions only.
 
@@ -57,4 +97,12 @@ No pre-release channels: the core releases plain `X.Y.Z` versions only.
 
 `workflow_dispatch` on the `Release core` workflow performs the same
 resolve-and-release for the version currently on `main` (useful for retries;
-it is idempotent thanks to the existing-tag check).
+it is idempotent thanks to the existing-release check).
+
+`workflow_dispatch` on `Release binaries` (`.github/workflows/release-binaries.yml`)
+independently rebuilds/re-uploads the full matrix for an existing tag: pass
+`ref: vX.Y.Z` to target it, or `dry_run: true` to exercise the tag-resolution,
+upload, and completeness-gate logic without mutating the release's assets
+(the completeness check still runs and will fail loudly if that release is
+genuinely incomplete -- that failure is expected and informative, not a bug
+in the dry run).
