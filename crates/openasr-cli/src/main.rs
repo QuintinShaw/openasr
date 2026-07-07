@@ -202,7 +202,7 @@ async fn run() -> Result<()> {
             runtime_paths: RuntimePathOverrides { ffmpeg_bin },
             diarize,
             speakers,
-            word_timestamps,
+            word_timestamps_mode: word_timestamps,
             model_pack: model_pack.as_deref(),
             adapter: adapter.as_deref(),
             output: output.as_deref(),
@@ -897,7 +897,7 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
     // ignoring them (fail-closed). Checked before any pack install or network.
     if options.benchmark
         && (options.diarize
-            || options.word_timestamps
+            || options.word_timestamps_mode.is_some()
             || options.adapter.is_some()
             || options.language.is_some()
             || options.task.is_some()
@@ -954,6 +954,17 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
         prepared_run.model_source.model_pack_path.as_deref(),
         options.diarize,
     )?;
+    // Passing --word-timestamps=aligned is itself the consent to install the
+    // Qwen3-ForcedAligner-0.6B capability pack, mirroring --diarize's WeSpeaker
+    // auto-install above; approximate (or omitted) never touches the network.
+    ensure_cli_word_timestamps_pack_installed(
+        prepared_run.backend_kind,
+        options.word_timestamps_mode,
+    )?;
+    ensure_word_timestamps_alignment_supported(
+        prepared_run.backend_kind,
+        options.word_timestamps_mode,
+    )?;
 
     // stdin: `transcribe -` reads a WAV stream from stdin into a temp file used
     // as the single input. Kept alive until the end of the run.
@@ -1003,7 +1014,10 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
     )?;
 
     if per_file_output {
-        if options.word_timestamps || options.adapter.is_some() || phrase_bias.is_some() {
+        if options.word_timestamps_mode.is_some()
+            || options.adapter.is_some()
+            || phrase_bias.is_some()
+        {
             return Err(consent::CliExit::new(
                 consent::ExitCode::InputError,
                 "--word-timestamps, --adapter, and --phrase-bias apply to a single input only."
@@ -1056,7 +1070,11 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
         .with_phrase_bias(phrase_bias)
         .with_diarization(options.diarize)
         .with_diarize_speakers(options.speakers)
-        .with_word_timestamps(options.word_timestamps);
+        .with_word_timestamps(options.word_timestamps_mode.is_some())
+        .with_word_timestamps_refine(matches!(
+            options.word_timestamps_mode,
+            Some(WordTimestampsMode::Aligned)
+        ));
     let transcription =
         transcribe_with_backend(prepared_run.backend_kind, request).map_err(|error| {
             consent::CliExit::new(consent::ExitCode::RuntimeFailed, error.to_string())

@@ -846,7 +846,7 @@ pub(super) fn ensure_cli_diarization_packs_installed(
             )
         })?;
 
-    install_cli_diarization_capability_pack_if_missing(
+    install_cli_capability_pack_if_missing(
         &installed_packs,
         &catalog,
         required_pack,
@@ -857,7 +857,61 @@ pub(super) fn ensure_cli_diarization_packs_installed(
     Ok(())
 }
 
-fn install_cli_diarization_capability_pack_if_missing(
+/// Whether `--word-timestamps=aligned` requires a backend it does not run on.
+/// The alignment refinement pass re-decodes the full file and the finished
+/// transcript through a second local pack, which only the native backend
+/// supports; approximate (or omitted) timestamps are unaffected.
+pub(super) fn ensure_word_timestamps_alignment_supported(
+    backend: BackendKind,
+    word_timestamps_mode: Option<WordTimestampsMode>,
+) -> Result<()> {
+    if !matches!(word_timestamps_mode, Some(WordTimestampsMode::Aligned)) {
+        return Ok(());
+    }
+    if backend != BackendKind::Native {
+        bail!("--word-timestamps=aligned requires the native backend.");
+    }
+    Ok(())
+}
+
+/// Passing `--word-timestamps=aligned` is itself the consent to install the
+/// Qwen3-ForcedAligner-0.6B capability pack, mirroring `--diarize`'s WeSpeaker
+/// auto-install above -- `approximate` (or an omitted flag) never touches the
+/// network.
+pub(super) fn ensure_cli_word_timestamps_pack_installed(
+    backend: BackendKind,
+    word_timestamps_mode: Option<WordTimestampsMode>,
+) -> Result<()> {
+    if !matches!(word_timestamps_mode, Some(WordTimestampsMode::Aligned))
+        || backend != BackendKind::Native
+    {
+        return Ok(());
+    }
+
+    let home = openasr_home()?;
+    let config = load_config(&home)?;
+    let catalog = match load_cli_model_catalog(&home)? {
+        Some(catalog) => catalog,
+        None => openasr_core::load_model_catalog(None, &home)?,
+    };
+    let installed_packs = openasr_core::list_installed_packs(&home)?;
+    let source_chain = openasr_core::resolve_chain(&config.download_source);
+    let required_pack = catalog.word_timestamps_forced_aligner_pack().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Public catalog does not contain a word-timestamps forced-alignment capability pack."
+        )
+    })?;
+
+    install_cli_capability_pack_if_missing(
+        &installed_packs,
+        &catalog,
+        required_pack,
+        &home,
+        &source_chain,
+    )
+}
+
+fn install_cli_capability_pack_if_missing(
     installed_packs: &[openasr_core::InstalledPack],
     catalog: &openasr_core::ModelCatalog,
     model: &openasr_core::CatalogModel,
@@ -881,10 +935,10 @@ fn install_cli_diarization_capability_pack_if_missing(
             size: None,
         },
     )?;
-    install_cli_diarization_capability_pack(&resolved, home, source_chain)
+    install_cli_capability_pack(&resolved, home, source_chain)
 }
 
-fn install_cli_diarization_capability_pack(
+fn install_cli_capability_pack(
     resolved: &openasr_core::ResolvedCatalogPull,
     home: &Path,
     source_chain: &[openasr_core::DownloadSource],
@@ -1479,6 +1533,57 @@ mod tests {
 
         ensure_diarization_supported(BackendKind::Native, Some(&declared_runtime_path), true)
             .expect("declared Cohere diarization pack should pass the CLI gate");
+    }
+
+    #[test]
+    fn word_timestamps_alignment_supported_only_when_aligned_requested() {
+        // Absent / approximate never gates on backend -- only `aligned` does.
+        ensure_word_timestamps_alignment_supported(BackendKind::Mock, None)
+            .expect("no word-timestamps request is always fine");
+        ensure_word_timestamps_alignment_supported(
+            BackendKind::Mock,
+            Some(WordTimestampsMode::Approximate),
+        )
+        .expect("approximate word timestamps do not require the native backend");
+    }
+
+    #[test]
+    fn word_timestamps_alignment_requires_native_backend() {
+        let error = ensure_word_timestamps_alignment_supported(
+            BackendKind::Mock,
+            Some(WordTimestampsMode::Aligned),
+        )
+        .expect_err("aligned refinement should reject the mock backend")
+        .to_string();
+        assert!(error.contains("--word-timestamps=aligned"));
+        assert!(error.contains("native"));
+
+        ensure_word_timestamps_alignment_supported(
+            BackendKind::Native,
+            Some(WordTimestampsMode::Aligned),
+        )
+        .expect("aligned refinement is allowed on the native backend");
+    }
+
+    #[test]
+    fn word_timestamps_pack_install_is_a_no_op_without_aligned_mode() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
+
+        // Neither absent nor approximate ever touches the catalog/network.
+        ensure_cli_word_timestamps_pack_installed(BackendKind::Native, None)
+            .expect("no word-timestamps request never installs a pack");
+        ensure_cli_word_timestamps_pack_installed(
+            BackendKind::Native,
+            Some(WordTimestampsMode::Approximate),
+        )
+        .expect("approximate word timestamps never install the forced-aligner pack");
+        ensure_cli_word_timestamps_pack_installed(
+            BackendKind::Mock,
+            Some(WordTimestampsMode::Aligned),
+        )
+        .expect("the mock backend never needs the native-only forced-aligner pack");
     }
 
     fn cohere_diarization_tokens() -> [&'static str; 31] {

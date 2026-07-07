@@ -471,6 +471,7 @@ fn native_offline_request_to_transcription_request(
         .with_inference_threads(request.options.inference_threads)
         .with_execution_target(Some(execution_target))
         .with_word_timestamps(request.options.word_timestamps)
+        .with_word_timestamps_refine(request.options.word_timestamps_refine)
         .with_diarization(request.options.diarize)
         .with_longform(request.longform)
         .with_display_file_name(request.display_file_name)

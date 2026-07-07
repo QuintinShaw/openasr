@@ -216,7 +216,7 @@ pub fn convert_local_qwen_source_to_runtime_pack(
     })
 }
 
-fn build_qwen_runtime_tensors(
+pub(super) fn build_qwen_runtime_tensors(
     safetensor_files: &[SafetensorsFile],
     quantization: Qwen3AsrRuntimeQuantizationMode,
     n_mels: usize,
@@ -627,7 +627,7 @@ fn qwen_runtime_gguf_metadata(
     metadata
 }
 
-fn patch_added_tokens(
+pub(super) fn patch_added_tokens(
     source_root: &Path,
     tokens: &mut [String],
 ) -> Result<(), LocalSourceImportError> {
@@ -652,7 +652,7 @@ fn patch_added_tokens(
     Ok(())
 }
 
-fn load_vocab_tokens(source_root: &Path) -> Result<Vec<String>, LocalSourceImportError> {
+pub(super) fn load_vocab_tokens(source_root: &Path) -> Result<Vec<String>, LocalSourceImportError> {
     let vocab: BTreeMap<String, usize> = read_source_json_file(source_root, SOURCE_VOCAB_JSON)?;
     if vocab.is_empty() {
         return Err(validate_error("Qwen vocab.json cannot be empty"));
@@ -670,7 +670,7 @@ fn load_vocab_tokens(source_root: &Path) -> Result<Vec<String>, LocalSourceImpor
     Ok(tokens)
 }
 
-fn load_merges(source_root: &Path) -> Result<Vec<String>, LocalSourceImportError> {
+pub(super) fn load_merges(source_root: &Path) -> Result<Vec<String>, LocalSourceImportError> {
     let path = source_root.join(SOURCE_MERGES_TXT);
     if !path.exists() {
         return Ok(Vec::new());
@@ -690,7 +690,7 @@ fn load_merges(source_root: &Path) -> Result<Vec<String>, LocalSourceImportError
         .collect())
 }
 
-fn discover_safetensor_files(
+pub(super) fn discover_safetensor_files(
     request: &Qwen3AsrLocalSourceImportRequest,
 ) -> Result<Vec<SafetensorsFile>, LocalSourceImportError> {
     let mut paths = Vec::new();
@@ -799,7 +799,7 @@ fn f32_tensor(name: &str, dims: Vec<u64>, values: Vec<f32>) -> GgufWriteTensor {
     }
 }
 
-fn compose_model_id(package_id: &str, package_variant: Option<&str>) -> String {
+pub(super) fn compose_model_id(package_id: &str, package_variant: Option<&str>) -> String {
     match package_variant
         .map(str::trim)
         .filter(|variant| !variant.is_empty())
@@ -841,7 +841,7 @@ fn validate_request(
     Ok(())
 }
 
-fn insert_metadata(
+pub(super) fn insert_metadata(
     metadata: &mut BTreeMap<String, GgufWriteValue>,
     key: &str,
     value: impl ToString,
@@ -849,11 +849,15 @@ fn insert_metadata(
     metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
 }
 
-fn insert_metadata_u32(metadata: &mut BTreeMap<String, GgufWriteValue>, key: &str, value: u32) {
+pub(super) fn insert_metadata_u32(
+    metadata: &mut BTreeMap<String, GgufWriteValue>,
+    key: &str,
+    value: u32,
+) {
     metadata.insert(key.to_string(), GgufWriteValue::U32(value));
 }
 
-fn insert_metadata_string_array(
+pub(super) fn insert_metadata_string_array(
     metadata: &mut BTreeMap<String, GgufWriteValue>,
     key: &str,
     values: &[String],

@@ -30,6 +30,11 @@ const CATALOG_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CATALOG_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 pub const CATALOG_FEATURE_SPEAKER_DIARIZATION: &str = "speaker-diarization";
 const CATALOG_SPEAKER_EMBEDDER_WESPEAKER_ID: &str = "wespeaker-voxceleb-resnet34-lm";
+/// Capability-pack feature key for the optional forced-alignment word-timestamp
+/// refinement tier (`--word-timestamps=aligned`). Mirrors
+/// `CATALOG_FEATURE_SPEAKER_DIARIZATION`'s role as the shared vocabulary
+/// between the catalog and the CLI/server opt-in wiring.
+pub const CATALOG_FEATURE_WORD_TIMESTAMPS: &str = "word-timestamps";
 // Soft-disabled for the initial public release lane. The ModelScope URL
 // validation block below stays in place so re-enabling is a one-switch decision.
 const MODELSCOPE_CATALOG_MIRRORS_ENABLED: bool = false;
@@ -337,6 +342,12 @@ pub struct CatalogCapability {
 pub enum CatalogCapabilityRole {
     SpeakerEmbedder,
     SpeakerSegmenter,
+    /// A forced-alignment refinement model for the `word-timestamps` feature
+    /// (e.g. Qwen3-ForcedAligner-0.6B): consumes a finished transcript's text
+    /// plus the source audio and replaces the model family's own approximate
+    /// per-word timestamps with aligner-refined spans. Opt-in only; the
+    /// family's own approximate timestamps remain the default.
+    ForcedAligner,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,6 +467,21 @@ impl ModelCatalog {
                     && model.capability.as_ref().is_some_and(|capability| {
                         capability.role == CatalogCapabilityRole::SpeakerEmbedder
                     })
+            })
+    }
+
+    /// The forced-alignment capability pack for the `word-timestamps` feature
+    /// (`--word-timestamps=aligned`), when the catalog carries one. Unlike
+    /// diarization's single pinned embedder id, any public pack advertising
+    /// `(word-timestamps, ForcedAligner)` qualifies -- there is exactly one
+    /// today (Qwen3-ForcedAligner-0.6B) but callers should not hardcode its id.
+    pub fn word_timestamps_forced_aligner_pack(&self) -> Option<&CatalogModel> {
+        self.capability_packs_for_feature(CATALOG_FEATURE_WORD_TIMESTAMPS)
+            .into_iter()
+            .find(|model| {
+                model.capability.as_ref().is_some_and(|capability| {
+                    capability.role == CatalogCapabilityRole::ForcedAligner
+                })
             })
     }
 }

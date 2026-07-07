@@ -1680,6 +1680,9 @@ impl IntoResponse for ApiError {
                     | openasr_core::BackendError::NativeModelSelectionMismatch { .. }
                     | openasr_core::BackendError::NativeModelPackPathRequired
                     | openasr_core::BackendError::NativeModelPackPathRejected { .. }
+                    | openasr_core::BackendError::WordTimestampAlignmentRequiresWordTimestamps
+                    | openasr_core::BackendError::WordTimestampAlignmentPackMissing { .. }
+                    | openasr_core::BackendError::WordTimestampAlignmentFailed { .. }
                     | openasr_core::BackendError::NativeFailClosed { .. } => {
                         // Native backend "fail-closed" is a deliberate, client-facing
                         // refusal (unexecutable/unsupported request or unusable pack),

@@ -1344,4 +1344,140 @@ mod tests {
         assert_eq!(values[0], 0.0);
         assert_eq!(values[4], 1.0);
     }
+
+    /// Stage 2 bisection gate: run the ggml audio encoder (24 layers/1024/16
+    /// heads, reused unmodified from qwen3-asr -- everything here is
+    /// metadata-driven) against the Qwen3-ForcedAligner-0.6B checkpoint's real
+    /// weights, fed the exact mel input the Python reference
+    /// (`thinker.get_audio_features`) consumed for `fixtures/jfk.wav`, and
+    /// compare row-for-row against the Python reference's `last_hidden_state`.
+    /// Dev-machine only (needs the Stage 0 HF download + Stage 0 reference
+    /// dump); skips cleanly elsewhere.
+    #[test]
+    fn forced_aligner_audio_encoder_matches_python_reference_for_jfk() {
+        use std::path::PathBuf;
+
+        use super::super::forced_aligner_import::{
+            Qwen3ForcedAlignerLocalSourceImportRequest,
+            convert_local_qwen_forced_aligner_source_to_runtime_pack,
+        };
+        use super::super::package_import::Qwen3AsrRuntimeQuantizationMode as ForcedAlignerQuantMode;
+        use crate::ggml_runtime::GgufTensorDataReader;
+        use crate::models::qwen::runtime_contract::Qwen3AsrExecutionMetadata;
+
+        let source_root =
+            PathBuf::from("/Volumes/QuintinDocument/hf-cache/qwen3-forced-aligner-0.6b");
+        let ref_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/forced-aligner-ref/fixtures");
+        let mel_path = ref_dir.join("audio_mel_input.f32le");
+        let output_path = ref_dir.join("audio_encoder_output.f32le");
+        if !source_root.exists() || !mel_path.exists() || !output_path.exists() {
+            eprintln!(
+                "skipping: {} / {} not present (Stage 0/2 dev-machine reference artifacts)",
+                source_root.display(),
+                mel_path.display()
+            );
+            return;
+        }
+
+        let pack_dir = std::env::temp_dir().join("openasr-forced-aligner-stage2-test");
+        let _ = std::fs::create_dir_all(&pack_dir);
+        let pack_path = pack_dir.join("qwen3-forced-aligner-0.6b-fp16.oasr");
+        let _ = std::fs::remove_file(&pack_path);
+        let request = Qwen3ForcedAlignerLocalSourceImportRequest {
+            source_root,
+            output_root: pack_path.clone(),
+            package_id: "qwen3-forced-aligner-0.6b".to_string(),
+            package_variant: Some("fp16".to_string()),
+            source_name: "Qwen/Qwen3-ForcedAligner-0.6B".to_string(),
+            source_revision: "test".to_string(),
+            license_name: "Apache-2.0".to_string(),
+            license_source: "https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B".to_string(),
+            quantization: ForcedAlignerQuantMode::Fp16,
+        };
+        convert_local_qwen_forced_aligner_source_to_runtime_pack(&request)
+            .expect("forced-aligner conversion must succeed");
+
+        let metadata = Qwen3AsrExecutionMetadata {
+            sample_rate_hz: 16_000,
+            n_mels: 128,
+            n_fft: 400,
+            win_length: 400,
+            hop_length: 160,
+            audio_layers: 24,
+            audio_d_model: 1024,
+            audio_heads: 16,
+            llm_layers: 28,
+            llm_d_model: 1024,
+            llm_heads: 16,
+            llm_kv_heads: 8,
+            llm_head_dim: 128,
+            vocab_size: 152_064,
+            llm_max_positions: 8_192,
+            audio_start_token_id: 151_669,
+            audio_end_token_id: 151_670,
+            audio_pad_token_id: 151_676,
+            eos_token_id: 151_645,
+            pad_token_id: 151_643,
+        };
+
+        let reader = GgufTensorDataReader::from_path(&pack_path).expect("gguf reader");
+        let weights = load_qwen3_audio_encoder_weights_from_reader(&reader, metadata)
+            .expect("audio encoder weights");
+        assert_eq!(weights.layer_count(), 24);
+
+        let mel_bytes = std::fs::read(&mel_path).expect("read reference mel");
+        let mel_values: Vec<f32> = mel_bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(mel_values.len(), 128 * 1100);
+        let mel_features = Qwen3AsrMelFeatures {
+            n_mels: 128,
+            n_frames: 1100,
+            data: mel_values,
+        };
+
+        let mut runtime = Qwen3AsrAudioEncoderRuntime::new(Some(&pack_path)).expect("runtime");
+        let output = runtime
+            .encode(&weights, metadata, &mel_features)
+            .expect("encode");
+
+        let ref_bytes = std::fs::read(&output_path).expect("read reference output");
+        let ref_values: Vec<f32> = ref_bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(ref_values.len(), 143 * 1024);
+        assert_eq!(
+            output.row_count, 143,
+            "ggml chunked row count must match the Python reference's audio-feature row count"
+        );
+        assert_eq!(output.rows.len(), ref_values.len());
+
+        let mut max_abs_diff = 0.0_f32;
+        let mut sum_abs_diff = 0.0_f64;
+        for (a, b) in output.rows.iter().zip(ref_values.iter()) {
+            let diff = (a - b).abs();
+            max_abs_diff = max_abs_diff.max(diff);
+            sum_abs_diff += diff as f64;
+        }
+        let mean_abs_diff = sum_abs_diff / output.rows.len() as f64;
+        eprintln!(
+            "forced_aligner_audio_encoder_matches_python_reference_for_jfk: max_abs_diff={max_abs_diff} mean_abs_diff={mean_abs_diff}"
+        );
+        // fp16-quantized 2D weights (Python ran fp32) accumulated over 24
+        // encoder layers. Observed parity is fp16-rounding-level tight
+        // (max_abs_diff ~0.006, mean_abs_diff ~0.0002); bound with headroom so
+        // the test still catches wiring bugs (wrong shapes/permutes/layer
+        // count/head count) without being brittle to harmless rounding drift.
+        assert!(
+            max_abs_diff < 0.1,
+            "audio encoder output diverges from Python reference: max_abs_diff={max_abs_diff}"
+        );
+        assert!(
+            mean_abs_diff < 0.01,
+            "audio encoder output diverges from Python reference on average: mean_abs_diff={mean_abs_diff}"
+        );
+    }
 }
