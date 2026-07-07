@@ -230,6 +230,15 @@ mod tests {
     const GOLDEN_JFK_TEXT: &str = "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO \
          FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY";
 
+    // Pinned to the reference PyTorch decode of `fixtures/zh_sample.wav` (a
+    // macOS `say -v Tingting` synthesis of an original, non-copyrighted
+    // Mandarin sentence written for this test) via the same
+    // `tmp/firered-ref-src` harness. The reference tokenizer's `dict.txt` has
+    // no punctuation/`<space>` entries, so the golden text is intentionally
+    // punctuation-free.
+    const GOLDEN_ZH_TEXT: &str = "今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的\
+         川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下";
+
     fn dev_pack_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tmp/firered-out/firered-aed-l-fp16.oasr")
@@ -239,20 +248,22 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav")
     }
 
-    #[test]
-    #[ignore = "requires the private dev-only firered-aed-l-fp16.oasr pack; see module docs"]
-    fn golden_diff_end_to_end_transcribe_matches_reference_pytorch_decode_on_jfk_wav() {
+    fn zh_wav_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/zh_sample.wav")
+    }
+
+    fn transcribe_with_dev_pack(wav_path: PathBuf) -> Option<String> {
         let pack_path = dev_pack_path();
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
-            return;
+            return None;
         }
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
-            jfk_wav_path(),
+            wav_path,
             "firered-aed golden test",
             "firered-aed golden test",
         )
-        .expect("load jfk.wav");
+        .expect("load wav fixture");
 
         let request = GgmlAsrExecutionRequest {
             runtime_source_path: pack_path,
@@ -265,6 +276,24 @@ mod tests {
 
         let executor = FireRedAedGgmlExecutor;
         let result = executor.execute(&request).expect("firered-aed transcribe");
-        assert_eq!(result.transcription.text, GOLDEN_JFK_TEXT);
+        Some(result.transcription.text)
+    }
+
+    #[test]
+    #[ignore = "requires the private dev-only firered-aed-l-fp16.oasr pack; see module docs"]
+    fn golden_diff_end_to_end_transcribe_matches_reference_pytorch_decode_on_jfk_wav() {
+        let Some(text) = transcribe_with_dev_pack(jfk_wav_path()) else {
+            return;
+        };
+        assert_eq!(text, GOLDEN_JFK_TEXT);
+    }
+
+    #[test]
+    #[ignore = "requires the private dev-only firered-aed-l-fp16.oasr pack; see module docs"]
+    fn golden_diff_end_to_end_transcribe_matches_reference_pytorch_decode_on_zh_sample_wav() {
+        let Some(text) = transcribe_with_dev_pack(zh_wav_path()) else {
+            return;
+        };
+        assert_eq!(text, GOLDEN_ZH_TEXT);
     }
 }
