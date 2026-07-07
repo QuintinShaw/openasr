@@ -26,11 +26,20 @@ fn main() {
     // The android triple (e.g. aarch64-linux-android) also contains "linux", so
     // it must be detected explicitly and BEFORE any `contains("linux")` check.
     let is_android = target.contains("android");
-    // iOS device target (aarch64-apple-ios). Deliberately distinct from
-    // `is_macos` (which only matches "apple-darwin"): iOS device builds have no
-    // bundled libomp (same as macOS) and, in this phase, no Metal/Accelerate/BLAS
-    // -- those already stay off because their gates key off `is_macos`.
+    // iOS device or simulator target (aarch64-apple-ios /
+    // aarch64-apple-ios-sim). Deliberately distinct from `is_macos` (which only
+    // matches "apple-darwin"): iOS builds have no bundled libomp (same as
+    // macOS) and, in this phase, no Metal/Accelerate/BLAS -- those already
+    // stay off because their gates key off `is_macos`.
     let is_ios = target.contains("apple-ios");
+    // Rust's simulator targets are suffixed `-sim` (e.g. aarch64-apple-ios-sim);
+    // the device target (aarch64-apple-ios) has no such suffix. Only this
+    // distinguishes them -- both contain "apple-ios" -- and CMake needs to
+    // point at the right SDK (iphonesimulator vs iphoneos) below, or the
+    // resulting objects have the wrong Apple platform tag and fail to link
+    // against the other slices' objects ("building for 'iOS-simulator', but
+    // linking in object file ... built for 'iOS'").
+    let is_ios_simulator = is_ios && target.ends_with("-sim");
     let host = env::var("HOST").unwrap_or_default();
     // Backend-DL plugin build for the CPU-only (no GPU feature) WINDOWS base:
     // ship ggml-base.dll + ggml.dll + ggml-cpu-<variant>.dll loaded via the ggml
@@ -258,17 +267,23 @@ fn main() {
         ));
     }
     if is_ios {
-        // Cross-compile ggml for the iOS device ABI. Unlike Android this needs no
-        // separate CMake toolchain file: CMake's built-in Apple platform support
-        // drives Clang cross-compilation straight from CMAKE_OSX_SYSROOT (the SDK
-        // Clang targets) + CMAKE_OSX_ARCHITECTURES (only arm64 device hardware is
-        // wired up -- no armv7/i386 simulator support). Phase 1 is a CPU-only
-        // compile gate: Metal/Accelerate/BLAS already stay off here because their
-        // cmake_flag(...) calls above key off `is_macos`, which is `false` for the
-        // "apple-ios" target triple.
+        // Cross-compile ggml for the iOS device or simulator ABI. Unlike
+        // Android this needs no separate CMake toolchain file: CMake's
+        // built-in Apple platform support drives Clang cross-compilation
+        // straight from CMAKE_OSX_SYSROOT (the SDK Clang targets) +
+        // CMAKE_OSX_ARCHITECTURES (only arm64 is wired up -- no armv7/i386
+        // device, no x86_64 simulator). Phase 1 is a CPU-only compile gate:
+        // Metal/Accelerate/BLAS already stay off here because their
+        // cmake_flag(...) calls above key off `is_macos`, which is `false` for
+        // the "apple-ios" target triple.
+        let sysroot = if is_ios_simulator {
+            "iphonesimulator"
+        } else {
+            "iphoneos"
+        };
         configure
             .arg("-DCMAKE_SYSTEM_NAME=iOS")
-            .arg("-DCMAKE_OSX_SYSROOT=iphoneos")
+            .arg(format!("-DCMAKE_OSX_SYSROOT={sysroot}"))
             .arg("-DCMAKE_OSX_ARCHITECTURES=arm64")
             .arg(format!(
                 "-DCMAKE_OSX_DEPLOYMENT_TARGET={}",

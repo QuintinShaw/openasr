@@ -62,7 +62,9 @@ jobs:
       HIPSDK_INSTALLER_VERSION: 26.Q1
     # NOTE: jobs.verify-completeness below hardcodes this same target/ext list
     # (TARGETS) to assert the release ends up with every archive. Keep both
-    # in sync when adding/removing a leg.
+    # in sync when adding/removing a leg. The xcframework job further below is
+    # a separate, non-matrix leg (macOS/iOS SDK, not a CLI binary) but its
+    # asset is folded into the same TARGETS list -- keep that in sync too.
     strategy:
       fail-fast: false
       matrix:
@@ -484,9 +486,77 @@ jobs:
           path: dist/openasr-${{ env.OPENASR_VERSION }}-${{ matrix.target }}.${{ matrix.archive_ext }}
           if-no-files-found: error
 
+  xcframework:
+    name: Build OpenASR.xcframework
+    # Not part of the `build` matrix above: it is a macOS/iOS SDK artifact
+    # (three arch slices assembled via `xcodebuild -create-xcframework`), not
+    # a CLI binary, so it gets its own job with its own toolchain/packaging
+    # shape. See scripts/build-xcframework.sh and docs/SDK_IOS_MACOS.md for
+    # the build itself -- this job only adds release packaging (zip + sha256)
+    # around it. Mirrors (and supersedes for tagged releases) the
+    # workflow_dispatch-only `xcframework` job in ci.yml, which stays for
+    # ad-hoc dev-time builds off any branch; see the comment there.
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Resolve workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
+          if [ -z "${version}" ]; then
+            echo "could not read workspace version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "OPENASR_VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-binaries-xcframework
+
+      - name: Install cbindgen
+        run: cargo install cbindgen --locked
+
+      - name: Header drift gate
+        run: scripts/generate-ffi-header.sh --check
+
+      - name: Build xcframework (three slices)
+        run: scripts/build-xcframework.sh
+
+      - name: Package xcframework archive
+        run: |
+          set -euo pipefail
+          archive="openasr-${OPENASR_VERSION}-xcframework"
+          mkdir -p dist
+          (cd target/xcframework && zip -r -X -q "${GITHUB_WORKSPACE}/dist/${archive}.zip" OpenASR.xcframework)
+          (cd dist && shasum -a 256 "${archive}.zip" > "${archive}.zip.sha256")
+          cat "dist/${archive}.zip.sha256"
+
+      - name: Upload xcframework archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: openasr-xcframework
+          path: |
+            dist/openasr-${{ env.OPENASR_VERSION }}-xcframework.zip
+            dist/openasr-${{ env.OPENASR_VERSION }}-xcframework.zip.sha256
+          if-no-files-found: error
+
   checksums:
     name: Collect checksums
-    needs: build
+    needs: [build, xcframework]
     # Sum whatever archives were produced even if one matrix leg failed, so a
     # single flaky variant does not block checksums for the rest.
     if: ${{ !cancelled() }}
@@ -567,7 +637,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "release: ${{ steps.tag.outputs.tag }}"
-          find staging -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name 'SHA256SUMS' \) -print | sort
+          find staging -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' -o -name 'SHA256SUMS' \) -print | sort
 
       - name: Upload assets to release
         if: steps.tag.outputs.tag != '' && github.event.inputs.dry_run != 'true'
@@ -580,9 +650,14 @@ jobs:
             echo "release ${tag} does not exist yet -- release-core.yml should create it before calling this workflow" >&2
             exit 1
           fi
+          # nullglob so a pattern with no matches (e.g. no *.sha256 sidecars
+          # if the xcframework leg did not run) drops out of the arg list
+          # instead of being passed to `gh` as a literal, unmatched path.
+          shopt -s nullglob
+          assets=(staging/*.tar.gz staging/*.zip staging/*.sha256 staging/SHA256SUMS)
           # --clobber so a re-run (retrying a flaky leg) replaces stale assets
           # instead of failing on "asset already exists".
-          gh release upload "$tag" staging/*.tar.gz staging/*.zip staging/SHA256SUMS \
+          gh release upload "$tag" "${assets[@]}" \
             --repo "${{ github.repository }}" --clobber
 
       - name: Dry run -- skipping upload
@@ -609,9 +684,10 @@ jobs:
 
       - name: Assert the release has every expected matrix asset
         # Keep this TARGETS list in sync with jobs.build.strategy.matrix.include
-        # above -- this is the release-integrity gate: a release "shipped" but
-        # missing a platform's archive (e.g. one matrix leg failed and
-        # `checksums` silently dropped it, per its `!cancelled()` condition)
+        # above, plus jobs.xcframework's asset -- this is the release-integrity
+        # gate: a release "shipped" but missing a platform's archive (e.g. one
+        # matrix leg failed and `checksums` silently dropped it, per its
+        # `!cancelled()` condition)
         # must fail loudly here instead of quietly shipping partial coverage.
         run: |
           set -euo pipefail
@@ -630,6 +706,11 @@ jobs:
             "x86_64-unknown-linux-gnu-vulkan:tar.gz"
             "x86_64-unknown-linux-gnu-cuda:tar.gz"
             "x86_64-unknown-linux-gnu-rocm:tar.gz"
+            # Not a CLI binary leg (see jobs.xcframework above), but still a
+            # released, version-named asset -- keep it in this same
+            # completeness gate so a broken xcframework build fails loudly
+            # instead of quietly shipping a release without the SDK.
+            "xcframework:zip"
           )
 
           expected_file="$(mktemp)"
@@ -638,6 +719,7 @@ jobs:
             ext="${entry##*:}"
             echo "openasr-${version}-${target}.${ext}" >> "$expected_file"
           done
+          echo "openasr-${version}-xcframework.zip.sha256" >> "$expected_file"
           echo "SHA256SUMS" >> "$expected_file"
           sort -o "$expected_file" "$expected_file"
 
