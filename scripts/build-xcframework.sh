@@ -102,7 +102,25 @@ build_slice() {
     rustup target add "$rust_target"
   fi
 
-  (cd "$repo_root" && cargo build -p openasr-ffi $cargo_flag --target "$rust_target")
+  # openasr-core's build.rs already floors IPHONEOS_DEPLOYMENT_TARGET at 15.0
+  # for the CMake-built ggml C/C++ objects (see ios_deployment_target_from in
+  # crates/openasr-core/build.rs), but that only governs those objects --
+  # rustc's own compile+link step for the Rust code (this cargo invocation)
+  # reads the same env var independently and otherwise falls back to a much
+  # older default min-iOS version. That mismatch leaves the final `cc` link
+  # targeting the old default, which lacks the `___chkstk_darwin` stack-probe
+  # symbol newer-min-version object code (both the ggml objects above and
+  # ring's asm) calls into -- undefined-symbol link failure. Export the same
+  # floor here so the whole slice (C++ and Rust) links against one consistent
+  # minimum.
+  case "$rust_target" in
+    *-apple-ios*)
+      (cd "$repo_root" && IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build -p openasr-ffi $cargo_flag --target "$rust_target")
+      ;;
+    *)
+      (cd "$repo_root" && cargo build -p openasr-ffi $cargo_flag --target "$rust_target")
+      ;;
+  esac
 
   mkdir -p "$slice_dir/lib" "$slice_dir/include"
   cp "$repo_root/target/$rust_target/$cargo_profile_dir/$lib_name" "$slice_dir/lib/$lib_name"
