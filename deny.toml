@@ -47,6 +47,11 @@ allow = [
     "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
+    # symphonia (in-process audio decoding, crates/openasr-core/src/audio) is
+    # MPL-2.0: weak copyleft that only requires sharing modifications to its
+    # own source files, not this crate -- compatible with the Apache-2.0 open
+    # core the same way BSL-1.0 already is here.
+    "MPL-2.0",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",

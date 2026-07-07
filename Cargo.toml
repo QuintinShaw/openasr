@@ -45,6 +45,14 @@ rayon = "1.10"
 rcgen = "0.12"
 realfft = "3.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# In-process audio decoding for non-WAV inputs (m4a/AAC-LC, mp3, flac,
+# ogg/vorbis, wav): no default-features -- only the demuxers/decoders this
+# workspace actually decodes are enabled, to keep the dependency tree and
+# release binary small (see crates/openasr-core/src/audio/symphonia_decode.rs).
+symphonia = { version = "0.5.4", default-features = false, features = ["isomp4", "aac", "mp3", "flac", "ogg", "vorbis", "wav", "pcm"] }
+# Pure-Rust resampler used to bring decoded symphonia audio to the 16 kHz mono
+# PCM the ASR pipeline expects.
+rubato = "0.15"
 # `bundled` compiles SQLite from source (with FTS5 unconditionally enabled by
 # libsqlite3-sys' build script) so the daemon history store needs no system
 # libsqlite3 -- matches the rest of this workspace's "vendor the native deps"

@@ -1024,6 +1024,7 @@ pub(crate) async fn transcribe_with_runtime(
                 &request.input_path,
                 &AudioPreparationOptions::new(runtime.backend)
                     .with_ffmpeg_bin(runtime.ffmpeg_bin.clone())
+                    .with_ffmpeg_bin_explicit(runtime.ffmpeg_bin_explicit)
                     .with_native_non_wav_conversion(true),
             )
             .map_err(TranscriptionRuntimeError::AudioPreparation)?;

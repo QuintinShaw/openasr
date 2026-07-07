@@ -1163,6 +1163,7 @@ fn realtime_capabilities_for_native_runtime_come_from_model_pack() {
     let runtime = ServerRuntime {
         backend: BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     };
 
@@ -1183,6 +1184,7 @@ fn native_server_runtime_rejects_directory_runtime_source() {
     let runtime = ServerRuntime {
         backend: BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     };
     let error = runtime.validate().unwrap_err().to_string();
@@ -1369,6 +1371,7 @@ fn native_server_runtime_rejects_non_gguf_runtime_source_file() {
     let runtime = ServerRuntime {
         backend: BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
     };
     let error = runtime.validate().unwrap_err().to_string();
@@ -1383,6 +1386,7 @@ fn native_server_runtime_rejects_directory_runtime_source_without_file_fallback(
     let runtime = ServerRuntime {
         backend: BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     };
     let error = runtime.validate().unwrap_err().to_string();
@@ -1399,6 +1403,7 @@ async fn native_transcribe_stays_fail_closed_with_local_pack_only_validation() {
     let runtime = ServerRuntime {
         backend: BackendKind::Native,
         ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     };
     let request = TranscriptionRequest::new(sample_wav, "whisper-large-v3-turbo");

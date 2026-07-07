@@ -4,7 +4,7 @@ use crate::{
     BackendKind,
     audio::{
         AudioInputInfo, AudioPreparationError, AudioPreparationOptions, PreparedAudioInput,
-        RECOGNIZED_EXTENSIONS,
+        RECOGNIZED_EXTENSIONS, decode, symphonia_decode,
     },
 };
 
@@ -23,7 +23,11 @@ pub(crate) fn prepare_external_input(
         });
     }
 
-    if info.extension.as_deref() == Some("wav") {
+    let is_wav = info.extension.as_deref() == Some("wav");
+    if is_wav && wav_is_already_conformant(&info.path) {
+        // Already matches the 16 kHz mono PCM16/float32 shape the rest of the
+        // pipeline expects: pass it through untouched (cheap, and preserves
+        // today's behavior for already-conformant recordings).
         let prepared_path = info.path.clone();
         return Ok(PreparedAudioInput {
             original: info,
@@ -31,8 +35,30 @@ pub(crate) fn prepare_external_input(
             temp_dir: None,
         });
     }
+    if is_wav && !options.ffmpeg_bin_explicit {
+        // Non-conformant (other sample rate, stereo, ...) and no explicit
+        // ffmpeg was requested: decode via the same in-process symphonia path
+        // as the other formats below.
+        if let Some(prepared) = try_symphonia_prepare(&info)? {
+            return Ok(prepared);
+        }
+        // Symphonia could not parse this as a wav at all (corrupt/foreign
+        // bytes with a `.wav` extension): preserve today's leniency and pass
+        // the original bytes through untouched rather than hard-failing here
+        // -- downstream rejects it with a precise WAV-format error if it
+        // truly isn't valid input.
+        let prepared_path = info.path.clone();
+        return Ok(PreparedAudioInput {
+            original: info,
+            prepared_path,
+            temp_dir: None,
+        });
+    }
+    // A non-conformant wav with an *explicit* ffmpeg configured falls through
+    // to the general external-tool conversion below instead of returning here,
+    // so the user's stated intent is actually honored for wav too.
 
-    if !info.recognized_extension {
+    if !is_wav && !info.recognized_extension {
         let description = info
             .extension
             .as_deref()
@@ -43,6 +69,19 @@ pub(crate) fn prepare_external_input(
             description,
             extensions: RECOGNIZED_EXTENSIONS.join(", "),
         });
+    }
+
+    // In-process decode is the default main path for every other recognized
+    // format (m4a/AAC-LC, mp4, qta, mp3, flac, ogg/vorbis). It only ever
+    // returns `None` (never a hard error) when the container/codec is not
+    // supported (e.g. HE-AAC, Opus, webm) or the file is malformed, in which
+    // case control falls through to the external ffmpeg/afconvert chain
+    // below exactly as before. An explicitly configured ffmpeg binary is an
+    // escape hatch that always wins, so it is checked first.
+    if !options.ffmpeg_bin_explicit
+        && let Some(prepared) = try_symphonia_prepare(&info)?
+    {
+        return Ok(prepared);
     }
 
     let tool = resolve_conversion_tool(options)?;
@@ -82,6 +121,45 @@ pub(crate) fn prepare_external_input(
             path: prepared_path,
         }),
     }
+}
+
+fn wav_is_already_conformant(path: &std::path::Path) -> bool {
+    matches!(
+        decode::probe_wav_pcm_shape(path),
+        Ok(Some(fmt)) if fmt.channels == 1
+            && fmt.sample_rate == 16_000
+            && matches!((fmt.audio_format, fmt.bits_per_sample), (1, 16) | (3, 32))
+    )
+}
+
+/// Tries the in-process symphonia decode path for `info`. Returns `Ok(None)`
+/// (never a hard error) when the format/codec is unsupported or decoding
+/// otherwise fails, so the caller falls back to the external converter chain.
+fn try_symphonia_prepare(
+    info: &AudioInputInfo,
+) -> Result<Option<PreparedAudioInput>, AudioPreparationError> {
+    let Some(wav_bytes) =
+        symphonia_decode::try_decode_to_pcm16_mono_16k_wav(&info.path, info.extension.as_deref())
+    else {
+        return Ok(None);
+    };
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix("openasr-audio-")
+        .tempdir()
+        .map_err(|source| AudioPreparationError::TempDir { source })?;
+    let prepared_path = temp_dir.path().join("prepared.wav");
+    fs::write(&prepared_path, &wav_bytes).map_err(|_source| {
+        AudioPreparationError::PreparedFileMissing {
+            path: prepared_path.clone(),
+        }
+    })?;
+
+    Ok(Some(PreparedAudioInput {
+        original: info.clone(),
+        prepared_path,
+        temp_dir: Some(temp_dir),
+    }))
 }
 
 /// An external tool used to convert a non-WAV input into a 16 kHz mono PCM16
@@ -191,12 +269,12 @@ fn missing_converter_hint() -> String {
     #[cfg(target_os = "macos")]
     {
         format!(
-            "Install ffmpeg and add it to PATH, pass --ffmpeg-bin /path/to/ffmpeg, set OPENASR_FFMPEG_BIN, run `openasr config set media.ffmpeg_bin /path/to/ffmpeg`, or restore {MACOS_AFCONVERT_PATH} (OpenASR falls back to it automatically when ffmpeg is not configured, but it cannot decode every codec, e.g. Opus/WebM or Ogg Vorbis -- install ffmpeg for full format support)."
+            "OpenASR's built-in decoder does not support this format (e.g. HE-AAC, Opus, or WebM); it needs ffmpeg. Install ffmpeg and add it to PATH, pass --ffmpeg-bin /path/to/ffmpeg, set OPENASR_FFMPEG_BIN, run `openasr config set media.ffmpeg_bin /path/to/ffmpeg`, or restore {MACOS_AFCONVERT_PATH} (OpenASR falls back to it automatically when ffmpeg is not configured, but it cannot decode every codec either -- install ffmpeg for full format support)."
         )
     }
     #[cfg(not(target_os = "macos"))]
     {
-        "Install ffmpeg and add it to PATH, pass --ffmpeg-bin /path/to/ffmpeg, set OPENASR_FFMPEG_BIN, or run `openasr config set media.ffmpeg_bin /path/to/ffmpeg`.".to_string()
+        "OpenASR's built-in decoder does not support this format (e.g. HE-AAC, Opus, or WebM); it needs ffmpeg. Install ffmpeg and add it to PATH, pass --ffmpeg-bin /path/to/ffmpeg, set OPENASR_FFMPEG_BIN, or run `openasr config set media.ffmpeg_bin /path/to/ffmpeg`.".to_string()
     }
 }
 

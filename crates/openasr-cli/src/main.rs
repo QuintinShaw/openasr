@@ -1024,7 +1024,11 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
     let file = files[0].as_path();
     let prepared = openasr_core::prepare_audio_input(
         file,
-        &audio_preparation_options(prepared_run.backend_kind, prepared_run.ffmpeg_bin.clone()),
+        &audio_preparation_options(
+            prepared_run.backend_kind,
+            prepared_run.ffmpeg_bin.clone(),
+            prepared_run.ffmpeg_bin_explicit,
+        ),
     )
     .map_err(|error| consent::CliExit::new(consent::ExitCode::InputError, error.to_string()))?;
     print_audio_input_notes(prepared.original());
