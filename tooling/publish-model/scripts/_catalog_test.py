@@ -8,6 +8,7 @@ from _catalog import (
     LANGUAGE_DISPLAY_LABELS,
     LANG_BY_FAMILY,
     REGISTERED_DIALECT_CODES,
+    _check_no_halfwidth_punct_between_cjk,
     apply_catalog_series_defaults,
     language_labels_wire,
     language_mode_for_model,
@@ -205,6 +206,45 @@ class ProseLocaleValidationTest(unittest.TestCase):
         original = prose_locale_source_sha256(EN_TAGLINE, EN_HIGHLIGHTS)
         changed = prose_locale_source_sha256(EN_TAGLINE + " updated", EN_HIGHLIGHTS)
         self.assertNotEqual(original, changed)
+
+    def test_rejects_halfwidth_comma_between_cjk_chars(self) -> None:
+        # Regression case for the market-page bug: a half-width ASCII comma
+        # sandwiched between two CJK characters, as previously shipped in
+        # dolphin-cn-dialect-small's highlights_zh ("...表现突出,同时覆盖...").
+        block = valid_locale_block()
+        block["highlights"][0] = (
+            "🀄 **22 种中文方言** — 四川话（川话）表现突出,同时覆盖吴语、粤语"
+        )
+        with self.assertRaisesRegex(KeyError, "half-width punctuation"):
+            validate_prose_locale_block("m", "zh-CN", EN_TAGLINE, EN_HIGHLIGHTS, block)
+
+    def test_rejects_halfwidth_comma_between_cjk_chars_sensevoice_case(self) -> None:
+        # Regression case for sensevoice-small's highlights_zh
+        # ("...并支持自动语种识别" followed by a halfwidth comma before the
+        # next clause, e.g. "...日语、韩语,并支持自动语种识别").
+        block = valid_locale_block()
+        block["highlights"][0] = "🌏 **多语言、中文优先** — 高精度普通话、粤语,并支持自动语种识别"
+        with self.assertRaisesRegex(KeyError, "half-width punctuation"):
+            validate_prose_locale_block("m", "zh-CN", EN_TAGLINE, EN_HIGHLIGHTS, block)
+
+    def test_allows_halfwidth_comma_as_english_thousands_separator(self) -> None:
+        # A halfwidth comma is fine when at least one neighbor is not CJK,
+        # e.g. inside a number run like "400,000" embedded in otherwise
+        # full-width Chinese prose (sensevoice-small's real highlight text).
+        _check_no_halfwidth_punct_between_cjk(
+            "m", "zh-CN", "highlight[0]",
+            "🀄 **中文基准表现突出** — 超过 400,000 小时语音训练；上游报告优于 Whisper",
+        )  # must not raise
+
+    def test_ignores_non_zh_locales(self) -> None:
+        # The check is zh-specific; other locales are free to use halfwidth
+        # ASCII punctuation between non-Latin scripts without tripping it.
+        block = {
+            "tagline": EN_TAGLINE,
+            "highlights": EN_HIGHLIGHTS,
+            "source_sha256": prose_locale_source_sha256(EN_TAGLINE, EN_HIGHLIGHTS),
+        }
+        validate_prose_locale_block("m", "en-US", EN_TAGLINE, EN_HIGHLIGHTS, block)  # must not raise
 
     def test_card_with_no_prose_locales_is_a_noop(self) -> None:
         validate_card_prose_locales("m", {"tagline": EN_TAGLINE, "highlights": EN_HIGHLIGHTS})
