@@ -154,6 +154,16 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y vulkan-sdk mesa-vulkan-drivers
 
+      # The ROCm SDK plus the fat multi-gfx build overflow the hosted
+      # runner's disk (observed "No space left on device"); drop the
+      # preinstalled toolchains this job never touches first. Same action
+      # llama.cpp's ubuntu-rocm release job uses.
+      - name: Free up disk space
+        if: runner.os == 'Linux' && matrix.features == 'hip'
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+
       - name: Install Linux ROCm/HIP SDK
         if: runner.os == 'Linux' && matrix.features == 'hip'
         # AMD's official apt repo (the recipe llama.cpp's ubuntu-22-rocm
