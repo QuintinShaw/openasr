@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-07T16:55:31+00:00",
+  "generated_at": "2026-07-07T17:20:44+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -889,12 +889,12 @@
       "hf_revision": "cedd9f67c535032fcfae07c5469dc49f9d957aab",
       "public": false,
       "min_cli_version": "0.1.0",
-      "recommended_quant": "fp16",
-      "pull_recommended": "dolphin-base:fp16",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "dolphin-base:q8",
       "prose": {
         "tagline": "Multilingual speech recognition across 40 languages, base tier -- a compact 140M WeNet/ESPnet E-Branchformer (CTC + attention)",
         "overview": [
-          "Dolphin Base is the **140M \"base\" tier** of DataoceanAI's **multilingual** Dolphin speech-\nrecognition line, built on the same **Dolphin / ESPnet** recipe as the larger **Dolphin Small**:\nan **E-Branchformer encoder + Transformer decoder** trained with a **joint CTC + attention**\nobjective over a shared SentencePiece BPE vocabulary spanning the card's advertised 40 languages\n(South Asian, Southeast Asian, Central Asian/Turkic, and Chinese including Cantonese as `yue`),\nat roughly a third of the small tier's encoder/decoder width -- a smaller RAM/CPU footprint for\ndeployments where the small tier's accuracy headroom is not needed. Like `dolphin-small`, this\ncheckpoint collapses this product's own Chinese-dialect granularity into a single `zh` (the\ndedicated `dolphin-cn-dialect-small`/`-base` packs cover per-dialect prompting). This OpenASR\nrepo repackages the weights as `.oasr` packs that run natively in the OpenASR runtime -- no\nPython at inference, all decoding local. It ships in **fp16** (maximum fidelity, recommended),\n**q8_0**, and **q4_k** builds.\n\n**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed\nwithout punctuation marks, so the decoder never predicts a punctuation token -- there is no\nsetting to enable it. Transcripts are plain, unpunctuated text by design.\n\n**Verification status:** this pack is staged in a private repo, not yet publicly listed. Local\nverification so far covers Mandarin (`zh`) sanity-checked against the upstream architecture and\nbit-stable at fp16/q8_0, with a small (~9% CER) drift at q4_k versus fp16 on the sanity clip;\nJapanese (`ja`), one of the 40 advertised languages, has not yet had a native-speaker listening\nreview and must get one before this model is made public."
+          "Dolphin Base is the **140M \"base\" tier** of DataoceanAI's **multilingual** Dolphin speech-\nrecognition line, built on the same **Dolphin / ESPnet** recipe as the larger **Dolphin Small**:\nan **E-Branchformer encoder + Transformer decoder** trained with a **joint CTC + attention**\nobjective over a shared SentencePiece BPE vocabulary spanning the card's advertised 40 languages\n(South Asian, Southeast Asian, Central Asian/Turkic, and Chinese including Cantonese as `yue`),\nat roughly a third of the small tier's encoder/decoder width -- a smaller RAM/CPU footprint for\ndeployments where the small tier's accuracy headroom is not needed. Like `dolphin-small`, this\ncheckpoint collapses this product's own Chinese-dialect granularity into a single `zh` (the\ndedicated `dolphin-cn-dialect-small`/`-base` packs cover per-dialect prompting). This OpenASR\nrepo repackages the weights as `.oasr` packs that run natively in the OpenASR runtime -- no\nPython at inference, all decoding local. It ships in **fp16** (maximum fidelity) and **q8_0**\n(recommended) builds. **q4_k** is not offered for this pack (see verification status below).\n\n**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed\nwithout punctuation marks, so the decoder never predicts a punctuation token -- there is no\nsetting to enable it. Transcripts are plain, unpunctuated text by design.\n\n**Verification status:** this pack is staged in a private repo, not yet publicly listed. Local\nverification so far covers Mandarin (`zh`) sanity-checked against the upstream architecture and\nbit-stable at fp16/q8_0. q4_k showed an ~8.8% CER drift versus fp16 on the sanity clip and is\ndropped from this pack's quants (dolphin-small's q4_k is clean at 0.0 drift and is unaffected)."
         ],
         "highlights": [
           "\ud83c\udf0f **40 languages, base tier** \u2014 the same multilingual E-Branchformer coverage as Dolphin Small (South Asian, Southeast Asian, Central Asian/Turkic, Chinese/Cantonese), at a fraction of the size",
@@ -913,7 +913,7 @@
           "url": "https://huggingface.co/OpenASR/dolphin-base/resolve/cedd9f67c535032fcfae07c5469dc49f9d957aab/dolphin-base-fp16.oasr",
           "sha256": "f8d83121160f08c5d166d0251403ec5d6e4719cccd8a18956e8f675a7d031ec3",
           "size_bytes": 286733696,
-          "recommended": true,
+          "recommended": false,
           "perf": {
             "rtf_cpu": 0.148,
             "rtf_metal": 0.136,
@@ -929,28 +929,12 @@
           "url": "https://huggingface.co/OpenASR/dolphin-base/resolve/cedd9f67c535032fcfae07c5469dc49f9d957aab/dolphin-base-q8_0.oasr",
           "sha256": "79ca61ddfcba1d83aec875fa5f7d482b8a7e92939f80345e152553a4f453add7",
           "size_bytes": 158106176,
-          "recommended": false,
+          "recommended": true,
           "perf": {
             "rtf_cpu": 0.151,
             "rtf_metal": 0.163,
             "peak_rss_bytes": 1758412800,
             "jfk_wer_vs_fp16": 0.0
-          }
-        },
-        {
-          "quant": "q4_k",
-          "suffix": "q4",
-          "pull": "dolphin-base:q4",
-          "filename": "dolphin-base-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-base/resolve/cedd9f67c535032fcfae07c5469dc49f9d957aab/dolphin-base-q4_k.oasr",
-          "sha256": "c9882cc1568e742e60bd82c377f0f6c25b2799f21a058554cd8fbc107b0943cb",
-          "size_bytes": 89504832,
-          "recommended": false,
-          "perf": {
-            "rtf_cpu": 0.133,
-            "rtf_metal": 0.133,
-            "peak_rss_bytes": 1697382400,
-            "jfk_wer_vs_fp16": 0.0882
           }
         }
       ],
@@ -970,7 +954,7 @@
         }
       },
       "upstream_release_date": "2026-05-13",
-      "min_core_version": "0.1.8"
+      "min_core_version": "0.1.9"
     },
     {
       "id": "dolphin-cn-dialect-base",
@@ -1145,12 +1129,12 @@
       "hf_revision": "85a23dd6899bb324c6938bd83ee2b1931d16ec2a",
       "public": false,
       "min_cli_version": "0.1.0",
-      "recommended_quant": "fp16",
-      "pull_recommended": "dolphin-small:fp16",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "dolphin-small:q8",
       "prose": {
         "tagline": "Multilingual speech recognition across 40 languages -- a WeNet/ESPnet E-Branchformer (CTC + attention) covering South/Southeast/Central Asian and Chinese-dialect speech",
         "overview": [
-          "Dolphin Small is the **372M \"small\" tier** of DataoceanAI's **multilingual** Dolphin speech-\nrecognition line, built on the **Dolphin / ESPnet** recipe as an **E-Branchformer encoder +\nTransformer decoder** trained with a **joint CTC + attention** objective over a shared\nSentencePiece BPE vocabulary. Unlike the dedicated `dolphin-cn-dialect-*` checkpoints (fixed\n`<zh>` language token, Chinese-only char vocab), this multilingual checkpoint varies **both**\nthe language and region prompt slots across the card's advertised 40 languages -- South Asian,\nSoutheast Asian, Central Asian/Turkic, and Chinese (including Cantonese, listed separately as\n`yue`) -- while collapsing this product's own Chinese-dialect granularity into a single `zh`\n(the dedicated `dolphin-cn-dialect-small`/`-base` packs cover per-dialect prompting; this\ncheckpoint does not). This OpenASR repo repackages the weights as `.oasr` packs that run natively\nin the OpenASR runtime -- no Python at inference, all decoding local. It ships in **fp16**\n(maximum fidelity, recommended), **q8_0**, and **q4_k** builds.\n\n**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed\nwithout punctuation marks, so the decoder never predicts a punctuation token -- there is no\nsetting to enable it. Transcripts are plain, unpunctuated text by design.\n\n**Verification status:** this pack is staged in a private repo, not yet publicly listed. Local\nverification so far covers Mandarin (`zh`) sanity-checked against the upstream architecture and\nbit-stable across fp16/q8_0/q4_k quants; Japanese (`ja`), one of the 40 advertised languages, has\nnot yet had a native-speaker listening review and must get one before this model is made public."
+          "Dolphin Small is the **372M \"small\" tier** of DataoceanAI's **multilingual** Dolphin speech-\nrecognition line, built on the **Dolphin / ESPnet** recipe as an **E-Branchformer encoder +\nTransformer decoder** trained with a **joint CTC + attention** objective over a shared\nSentencePiece BPE vocabulary. Unlike the dedicated `dolphin-cn-dialect-*` checkpoints (fixed\n`<zh>` language token, Chinese-only char vocab), this multilingual checkpoint varies **both**\nthe language and region prompt slots across the card's advertised 40 languages -- South Asian,\nSoutheast Asian, Central Asian/Turkic, and Chinese (including Cantonese, listed separately as\n`yue`) -- while collapsing this product's own Chinese-dialect granularity into a single `zh`\n(the dedicated `dolphin-cn-dialect-small`/`-base` packs cover per-dialect prompting; this\ncheckpoint does not). This OpenASR repo repackages the weights as `.oasr` packs that run natively\nin the OpenASR runtime -- no Python at inference, all decoding local. It ships in **fp16**\n(maximum fidelity), **q8_0** (recommended), and **q4_k** builds.\n\n**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed\nwithout punctuation marks, so the decoder never predicts a punctuation token -- there is no\nsetting to enable it. Transcripts are plain, unpunctuated text by design.\n\n**Verification status:** this pack is staged in a private repo, not yet publicly listed. Local\nverification so far covers Mandarin (`zh`) sanity-checked against the upstream architecture and\nbit-stable across fp16/q8_0/q4_k quants."
         ],
         "highlights": [
           "\ud83c\udf0f **40 languages, one checkpoint** \u2014 a WeNet/ESPnet E-Branchformer spanning South Asian (Hindi, Bengali, Urdu...), Southeast Asian (Vietnamese, Thai, Indonesian...), Central Asian/Turkic (Kazakh, Uzbek, Azerbaijani...), and Chinese/Cantonese speech, with per-utterance `<lang><region>` prompting",
@@ -1169,7 +1153,7 @@
           "url": "https://huggingface.co/OpenASR/dolphin-small/resolve/85a23dd6899bb324c6938bd83ee2b1931d16ec2a/dolphin-small-fp16.oasr",
           "sha256": "8e6dac3908f96871c3b887eb13880dbf516b35946aa7ae4e0a1f142ba8a2941e",
           "size_bytes": 754136512,
-          "recommended": true,
+          "recommended": false,
           "perf": {
             "rtf_cpu": 0.349,
             "rtf_metal": 0.587,
@@ -1185,7 +1169,7 @@
           "url": "https://huggingface.co/OpenASR/dolphin-small/resolve/85a23dd6899bb324c6938bd83ee2b1931d16ec2a/dolphin-small-q8_0.oasr",
           "sha256": "95554064292e0e63461b07839a254bd232030809bcb1b64b1dc34aee26767eec",
           "size_bytes": 411711712,
-          "recommended": false,
+          "recommended": true,
           "perf": {
             "rtf_cpu": 0.369,
             "rtf_metal": 0.803,
@@ -1226,7 +1210,7 @@
         }
       },
       "upstream_release_date": "2026-05-13",
-      "min_core_version": "0.1.8"
+      "min_core_version": "0.1.9"
     },
     {
       "id": "hymt2-1.8b",

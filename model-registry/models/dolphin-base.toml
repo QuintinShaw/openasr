@@ -7,4 +7,4 @@ license = "Apache-2.0"
 source = "Published OpenASR packs: https://huggingface.co/OpenASR/dolphin-base"
 
 [variant]
-quantization = "fp16"
+quantization = "q8_0"

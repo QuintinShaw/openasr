@@ -185,12 +185,12 @@ needs_license_flags = false
 # crates/openasr-core/src/models/qwen/forced_aligner_import.rs); only the
 # final head differs (independent classify_num=5000 timestamp-bin head vs
 # tied lm_head). Not yet wired to a public `openasr model-pack import`
-# subcommand -- built via the publish-only
-# `examples/pack_qwen3_forced_aligner.rs` driver instead (family/CLI wiring
-# for the NAR decode policy is a separate stage; see the importer's module
-# doc comment).
+# subcommand (family/CLI wiring for the NAR decode policy is a separate
+# stage; see the importer's module doc comment). The pack was built with a
+# one-off publish driver (since removed post-upload); re-packing would need
+# a new driver against `convert_local_qwen_forced_aligner_source_to_runtime_pack`.
 ["qwen3-forced-aligner-0.6b"]
-import_subcommand = "pack_qwen3_forced_aligner example (not yet a public model-pack import subcommand)"
+import_subcommand = "not yet a public model-pack import subcommand"
 upstream_repo = "Qwen/Qwen3-ForcedAligner-0.6B"
 source_revision = "main"
 needs_license_flags = false
