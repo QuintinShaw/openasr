@@ -12,7 +12,16 @@ Local engineering scripts for validation and iteration.
 ## Current scripts
 
 - `bump-version.sh`
-  - Bump the workspace release version in one command (see `RELEASING.md`).
+  - Bump the workspace release version, commit, and tag it (`--notes`
+    required; see `RELEASING.md`).
+- `render-install-verify.sh`
+  - Render a release's "Install & Verify" section from its actual asset list
+    (used by `.github/workflows/release-core.yml`, both for the initial stub
+    and the final finalize-notes pass).
+- `splice-install-verify.py`
+  - Replace the `<!-- install-verify:start/end -->` section of a release
+    body in place (used by `.github/workflows/release-core.yml`'s
+    `finalize-notes` job).
 - `generate_longform_pause_probe.py`
   - Generate a deterministic longform pause probe from a local speech WAV — a
     test-data generator for longform planner validation.
