@@ -176,6 +176,7 @@ fn native_float_wav_passthrough_without_ffmpeg() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn native_non_wav_conversion_mode_requires_ffmpeg_when_enabled() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("sample.mp3");
@@ -190,12 +191,14 @@ fn native_non_wav_conversion_mode_requires_ffmpeg_when_enabled() {
     assert!(matches!(
         error,
         AudioPreparationError::MissingFfmpeg {
-            backend: BackendKind::Native
+            backend: BackendKind::Native,
+            ..
         }
     ));
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn native_qta_input_is_recognized_and_reaches_ffmpeg_conversion() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("sample.qta");
@@ -213,9 +216,88 @@ fn native_qta_input_is_recognized_and_reaches_ffmpeg_conversion() {
     assert!(matches!(
         error,
         AudioPreparationError::MissingFfmpeg {
-            backend: BackendKind::Native
+            backend: BackendKind::Native,
+            ..
         }
     ));
+}
+
+// On macOS these same inputs reach the afconvert fallback instead of erroring
+// with MissingFfmpeg -- see the macos-only tests below (`native_non_wav_*` /
+// `native_qta_*` counterparts) that assert the conversion actually happens.
+#[test]
+#[cfg(target_os = "macos")]
+fn native_non_wav_conversion_falls_back_to_afconvert_when_ffmpeg_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("sample.mp3");
+    fs::write(&input, b"mock bytes, not a real mp3").unwrap();
+
+    let error = prepare_audio_input(
+        &input,
+        &AudioPreparationOptions::new(BackendKind::Native).with_native_non_wav_conversion(true),
+    )
+    .unwrap_err();
+
+    // Reaches afconvert (present at /usr/bin/afconvert on every macOS
+    // install) and fails there because the fixture bytes are not a real MP3
+    // stream -- proof the fallback is wired up rather than short-circuiting
+    // to MissingFfmpeg.
+    assert!(matches!(
+        error,
+        AudioPreparationError::ConversionFailed { tool, .. } if tool == "afconvert"
+    ));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn native_qta_input_reaches_afconvert_conversion() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("sample.qta");
+    fs::write(&input, b"mock bytes, not a real mov").unwrap();
+
+    let error = prepare_audio_input(
+        &input,
+        &AudioPreparationOptions::new(BackendKind::Native).with_native_non_wav_conversion(true),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AudioPreparationError::ConversionFailed { tool, .. } if tool == "afconvert"
+    ));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn native_m4a_input_converts_via_afconvert_without_ffmpeg() {
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap()
+        .join("fixtures");
+    let temp = tempfile::tempdir().unwrap();
+    let m4a = temp.path().join("jfk.m4a");
+    let status = std::process::Command::new("/usr/bin/afconvert")
+        .arg("-f")
+        .arg("m4af")
+        .arg("-d")
+        .arg("aac")
+        .arg(fixture_dir.join("jfk.wav"))
+        .arg(&m4a)
+        .status()
+        .expect("afconvert must be available to build the m4a fixture");
+    assert!(status.success());
+
+    let prepared = prepare_audio_input(
+        &m4a,
+        &AudioPreparationOptions::new(BackendKind::Native).with_native_non_wav_conversion(true),
+    )
+    .expect("afconvert fallback should decode a real m4a without ffmpeg configured");
+
+    assert!(prepared.is_converted());
+    let bytes = fs::read(prepared.path()).unwrap();
+    assert_eq!(&bytes[0..4], b"RIFF");
+    assert_eq!(&bytes[8..12], b"WAVE");
 }
 
 fn write_test_wav(path: &Path, sample_rate: u32, channels: u16, bits_per_sample: u16, frames: u32) {
