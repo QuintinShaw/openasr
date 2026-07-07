@@ -256,6 +256,17 @@ impl DolphinWeightProvider for DolphinRuntimeWeights {
     }
 }
 
+// Lets the serving path (already-loaded weights) resolve
+// `dolphin.{encoder,decoder}.max_ctx` from the baked position-table tensor's
+// own element count, mirroring the `GgufTensorIndex`-based probe the install
+// gate uses before any weight is dequantized. See
+// `runtime_contract::resolve_position_table_max_ctx`.
+impl super::runtime_contract::DolphinPositionTableSource for DolphinRuntimeWeights {
+    fn tensor_element_count(&self, name: &str) -> Option<usize> {
+        DolphinWeightProvider::tensor(self, name).map(<[f32]>::len)
+    }
+}
+
 /// Process-level pool of runtime weights keyed by pack path. Building the pool
 /// (dequantizing the f32 vectors + mmapping the native weight blocks) costs ~0.4 s
 /// (18% of the single-utterance wall on M1); caching it lets warm calls skip the
@@ -358,7 +369,7 @@ pub(crate) fn run_dolphin_pipeline(
     // this function's signature stable for its other caller
     // (`encode_dolphin_encoder_from_pack`'s parity test, which intentionally
     // stays pinned to `small_cn()`).
-    let execution_metadata = parse_dolphin_execution_metadata(metadata)
+    let execution_metadata = parse_dolphin_execution_metadata(metadata, weights)
         .map_err(|error| format!("dolphin runtime metadata contract failed: {error}"))?;
 
     // Frontend: kaldi fbank -> global CMVN (the exact tensor the encoder consumes).
@@ -487,7 +498,7 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
             .resolve_runtime_source_preflight()
             .map_err(|error| fail(error.to_string()))?;
         // Fail closed on an incomplete pack (missing runtime scalar keys).
-        parse_dolphin_execution_metadata(&preflight.metadata)
+        parse_dolphin_execution_metadata(&preflight.metadata, preflight.tensor_index.as_ref())
             .map_err(|error| fail(format!("dolphin runtime metadata contract failed: {error}")))?;
         // Confirm the encoder + CTC namespaces are actually baked before decoding.
         for sentinel in ENCODER_SENTINEL_TENSORS {

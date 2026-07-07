@@ -212,6 +212,10 @@ pub(crate) static DOLPHIN_HPARAM_SCHEMA: &[&str] = &[
     "dolphin.encoder.cgmlp_kernel",
     "dolphin.encoder.merge_kernel",
     "dolphin.encoder.feature_dim",
+    // `max_ctx` (encoder + decoder): tensor length is authoritative when a
+    // baked position-table tensor exists, so these two keys are conditionally
+    // (not unconditionally) required -- see
+    // `models::dolphin::runtime_contract::resolve_position_table_max_ctx`.
     "dolphin.encoder.max_ctx",
     "dolphin.decoder.n_layers",
     "dolphin.decoder.n_heads",
