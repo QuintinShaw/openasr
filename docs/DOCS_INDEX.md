@@ -44,6 +44,7 @@ no persistent voiceprint, identity-stays-on-client) live in
 | --- | --- |
 | [GPU Plugin Build](GPU_PLUGIN_BUILD.md) | Building the optional GPU backend plugin packs (Vulkan / HIP / CUDA). |
 | [Android Build](ANDROID_BUILD.md) | Android (aarch64) cross-compilation. |
+| [iOS / macOS SDK](SDK_IOS_MACOS.md) | `crates/openasr-ffi`'s C ABI and `OpenASR.xcframework`: build, C API, Swift bridging sketch, CPU-only v1 posture. |
 
 ## Notes
 

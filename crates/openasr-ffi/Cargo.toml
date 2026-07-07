@@ -1,0 +1,26 @@
+[package]
+name = "openasr-ffi"
+description = "C ABI for embedding the OpenASR engine (openasr-core) in iOS/macOS apps via an xcframework. CPU-only v1: load a local .oasr pack, transcribe one in-memory PCM buffer, get back text (+ optional segment timestamps)."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+# Both crate-types are built so the same source serves the xcframework's static
+# libs (staticlib, linked into an app bundle -- see scripts/build-xcframework.sh)
+# and local/dev consumption as a dylib (cdylib) without a second crate.
+[lib]
+name = "openasr_ffi"
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[dependencies]
+openasr-core.workspace = true
+libc.workspace = true
+tempfile.workspace = true
+hound = "3.5"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
