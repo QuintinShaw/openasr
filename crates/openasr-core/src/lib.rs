@@ -144,6 +144,10 @@ pub use models::{
         DolphinImportRequest, DolphinImportResult, DolphinLanguageScheme, DolphinQuantizationMode,
         convert_local_dolphin_wenet_source_to_runtime_pack,
     },
+    firered_aed::{
+        FireRedAedImportRequest, FireRedAedImportResult, FireRedAedQuantizationMode,
+        convert_local_firered_aed_source_to_runtime_pack,
+    },
     ggml_asr_executor::{
         GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
         GgmlAsrExecutionOptions, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,

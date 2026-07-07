@@ -70,6 +70,7 @@ pub(crate) enum DedicatedRuntimeTensorContractFamily {
     XasrZipformer,
     Moonshine,
     SenseVoice,
+    FireRedAed,
 }
 
 impl DedicatedRuntimeTensorContractFamily {
@@ -81,6 +82,7 @@ impl DedicatedRuntimeTensorContractFamily {
             Self::XasrZipformer => "xasr-zipformer",
             Self::Moonshine => "moonshine",
             Self::SenseVoice => "sensevoice",
+            Self::FireRedAed => "firered-aed",
         }
     }
 }
@@ -241,6 +243,9 @@ fn dedicated_runtime_tensor_contract_family(
         }
         crate::arch::SENSEVOICE_RUNTIME_TENSOR_CONTRACT_ID => {
             Some(DedicatedRuntimeTensorContractFamily::SenseVoice)
+        }
+        crate::arch::FIRERED_AED_RUNTIME_TENSOR_CONTRACT_ID => {
+            Some(DedicatedRuntimeTensorContractFamily::FireRedAed)
         }
         _ => None,
     }

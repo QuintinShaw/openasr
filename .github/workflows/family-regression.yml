@@ -94,6 +94,11 @@ jobs:
           - { name: dolphin-base-pack, ref: "dolphin-cn-dialect-base:q4", mode: transcribe, strategy: exact }
           - { name: xasr, ref: "xasr-zh-en:q4", mode: transcribe, strategy: exact }
           - { name: cohere, ref: "cohere-transcribe-03-2026:q4", mode: transcribe, strategy: exact }
+          # FireRedASR2-AED: catalog entry ships staged private (public:false
+          # until the 0.1.9 batch, see models-core.toml), so this row starts
+          # failing closed on the pull step until that flip -- matches
+          # dolphin's own staged-then-flipped onboarding history.
+          - { name: firered, ref: "firered-aed-l-v2:q4", mode: transcribe, strategy: exact }
           # Diarization capability packs (pyannote-seg + wespeaker) are
           # exercised end to end through --diarize on the whisper-tiny pack;
           # the golden asserts the transcript, not speaker labels.

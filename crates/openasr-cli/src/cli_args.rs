@@ -724,6 +724,20 @@ pub(crate) enum ImportCommand {
         #[arg(long, value_enum, default_value_t = ImportSensevoiceQuantization::Fp16)]
         quantization: ImportSensevoiceQuantization,
     },
+    /// Import one local FireRedASR-AED (Conformer encoder + Transformer decoder AED) source directory into one runtime pack file (`.oasr`).
+    #[command(name = "firered-aed")]
+    FireredAed {
+        /// Source directory containing model.safetensors (from pt_to_safetensors.py), dict.txt, and cmvn.txt.
+        source_root: PathBuf,
+        /// Output path for one runtime pack file (`.oasr`).
+        output_root: PathBuf,
+        /// Model id written to pack metadata (openasr.model.id).
+        #[arg(long)]
+        package_id: String,
+        /// Runtime tensor quantization for GGUF-backed `.oasr` output (conv kernels/norms/CMVN always stay f16/f32).
+        #[arg(long, value_enum, default_value_t = ImportFireredAedQuantization::Fp16)]
+        quantization: ImportFireredAedQuantization,
+    },
     /// Import one local X-ASR Zipformer2 transducer source directory into one runtime pack file (`.oasr`).
     #[command(name = "xasr-zipformer")]
     XasrZipformer {
@@ -901,6 +915,14 @@ pub(crate) enum ImportSensevoiceQuantization {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[allow(non_camel_case_types)]
 pub(crate) enum ImportDolphinQuantization {
+    Fp16,
+    Q8_0,
+    Q4_K,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[allow(non_camel_case_types)]
+pub(crate) enum ImportFireredAedQuantization {
     Fp16,
     Q8_0,
     Q4_K,

@@ -1,0 +1,10 @@
+id = "firered-aed-l-v2"
+default_variant = "published"
+display_name = "FireRedASR2 AED-L (OpenASR pack)"
+languages = ["en", "zh"]
+size = "l"
+license = "Apache-2.0"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/firered-aed-l-v2"
+
+[variant]
+quantization = "q4_k"

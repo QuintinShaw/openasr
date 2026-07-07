@@ -11,10 +11,11 @@ runs native ggml-backed model packs offline.
 
 ## What native model families run today?
 
-Ten, dispatched by a data-driven architecture registry (`arch/`): Whisper,
+Eleven, dispatched by a data-driven architecture registry (`arch/`): Whisper,
 Cohere Transcribe, Qwen3-ASR, Parakeet-CTC, Parakeet-TDT (25 European
 languages), wav2vec2-CTC (incl. data2vec), Moonshine, Dolphin (Chinese
-dialects), SenseVoice (zh/yue/en/ja/ko), and X-ASR (Zipformer). They run local
+dialects), SenseVoice (zh/yue/en/ja/ko), FireRedASR-AED (Mandarin + English
+bilingual), and X-ASR (Zipformer). They run local
 offline transcription on CPU and Metal lanes. The
 [model support matrix](../README.md#model-support) in the README lists
 per-family streaming, word-timestamp, and quant-tier support.

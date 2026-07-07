@@ -55,7 +55,10 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   requests against a Dolphin pack yield an empty word list rather than an error.
   SenseVoice likewise returns an empty word list: its CTC frames sit on a 60 ms
   low-frame-rate grid behind 4 prompt frames, so per-word times would be
-  fabricated precision rather than acoustic timestamps.
+  fabricated precision rather than acoustic timestamps. FireRedASR-AED also
+  returns an empty word list -- its attention-based encoder-decoder has no
+  alignment head exposed yet, so `--word-timestamps` requests yield a
+  segment-level span rather than fabricated per-word times.
 - Hardware execution target selection is generic: Desktop/server requests support
   `auto`, `cpu`, and `accelerated` when the native runtime reports an accelerated
   device. There is no per-provider/per-device pinning surface such as `gpu0`,

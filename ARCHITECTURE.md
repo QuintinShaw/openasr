@@ -82,7 +82,7 @@ Adding or reading a family means understanding two directories under
   (frontend / tokenizer / decode policy / executor). Composer families (Cohere,
   Qwen) are materialized from these descriptors; dedicated-executor families
   (Whisper, Moonshine, Parakeet-CTC, Parakeet-TDT, wav2vec2-CTC, Dolphin,
-  SenseVoice, X-ASR)
+  SenseVoice, FireRedASR-AED, X-ASR)
   are routed by
   them. This is the "what does this pack need" layer and stays model-agnostic.
 - **`models/`** -- the executors and shared building blocks. Reusable neural
@@ -91,7 +91,7 @@ Adding or reading a family means understanding two directories under
   `models/cohere/`, `models/parakeet_ctc/`, `models/parakeet_tdt/`,
   `models/wav2vec2_ctc/`,
   `models/moonshine/`, `models/dolphin/`, `models/sensevoice/`,
-`models/xasr_zipformer/`, plus the
+`models/firered_aed/`, `models/xasr_zipformer/`, plus the
   diarization capability packs `models/wespeaker/` and `models/pyannote/`) that
   assembles those blocks into a graph and owns family-specific tensor binding,
   frontend, decode, and local-source import.

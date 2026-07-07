@@ -479,3 +479,34 @@ languages = ["en"]
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
 upstream_release_date = "2022-09-21"
+
+# FireRedASR2-AED (FireRedTeam Conformer encoder + Transformer decoder
+# attention-based encoder-decoder, bilingual Mandarin + English + dialects).
+# Same firered-aed family/executor and architecture as v1 (byte-identical
+# per upstream source diff); v2 retrains on a larger vocab (8667 vs 7832
+# tokens) and adds a post-hoc CTC branch this importer intentionally does not
+# carry (no timestamp feature in this family yet). Only v2 ships -- v1
+# (FireRedASR-AED-L) never went public and its catalog entry was replaced by
+# this one rather than kept alongside it. Forward-compat floor pinned to the
+# 0.1.9 release that ships the family, mirroring dolphin-cn-dialect-small's
+# own min_core_version launch pattern. Staged private (release_public = true
+# only gates the eventual --public flip; the catalog entry itself stays
+# public:false until the 0.1.9 batch).
+["firered-aed-l-v2"]
+family = "firered-aed"
+hf_repo = "OpenASR/firered-aed-l-v2"
+release_public = true
+aliases = ["firered-aed", "firered", "firered-aed-v2"]
+pull_alias = "firered-aed-l-v2"
+size = "l"
+registry_id = "firered-aed-l-v2"
+display_name = "FireRedASR2 AED-L"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/FireRedTeam/FireRedASR2-AED/blob/main/README.md"
+license_class = "permissive"
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q4_k"
+sort_weight = 912
+recommended = true
+upstream_release_date = "2026-02-12"
+min_core_version = "0.1.9"

@@ -12,11 +12,12 @@ a few new blocks + one step executor" is the target, not "new model = data, zero
 code". What is genuinely **data** (no new code) vs the irreducible
 **per-architecture code** is spelled out below.
 
-Ten families are onboarded today across several orchestration shapes:
+Eleven families are onboarded today across several orchestration shapes:
 
 - `Seq2SeqEncoderDecoder` — Whisper (hand-written reference, the bit-identity
   regression gate), Cohere Transcribe (data-driven composer), Moonshine
-  (dedicated executor).
+  (dedicated executor), FireRedASR-AED (Conformer encoder + Transformer
+  decoder, no CTC branch, dedicated executor).
 - `LlmDecoder` — Qwen3-ASR (data-driven composer).
 - `Ctc` (non-autoregressive encoder + CTC head) — Parakeet-CTC and wav2vec2-CTC
   (`+data2vec`), dedicated executors; SenseVoice (SAN-M/DFSMN encoder with a
@@ -29,7 +30,7 @@ Ten families are onboarded today across several orchestration shapes:
   duration-driven frame skipping), a dedicated executor that reuses the shared
   conformer block for its encoder.
 
-`whisper`, `moonshine`, `dolphin`, `x-asr`, and `parakeet-tdt` are intentional `block_stack: None`
+`whisper`, `moonshine`, `dolphin`, `x-asr`, `parakeet-tdt`, and `firered-aed` are intentional `block_stack: None`
 dedicated executors (the "a few new blocks" a genuinely-new architecture is
 permitted); all composer-shape families call `validate_stage_against_descriptor`
 at construction so a descriptor's shape / block-kind / tensor-scope / layer-count

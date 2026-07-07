@@ -64,6 +64,10 @@ pub(crate) struct Seq2SeqLayerConfig {
     /// Write slot into the self-KV cache for this step.
     pub position_offset: usize,
     pub layer_norm_epsilon: f32,
+    /// FFN activation between `ffn_up`/`ffn_down` (Whisper/cohere/paraformer use
+    /// ReLU; FireRedASR's decoder FFN uses GELU). Additive field, defaults kept
+    /// explicit at each call site.
+    pub ffn_activation: FeedForwardActivation,
     /// Self-KV persistent f16 storage geometry:
     /// `n_seq == 1`: `[head_dim, max_positions, heads]`;
     /// `n_seq > 1`: `[head_dim, max_positions, heads, n_seq]`.
@@ -943,9 +947,20 @@ where
         "decoder_ffn_up",
         map_err,
     )?;
-    let ff = graph
-        .relu(ff)
-        .map_err(|source| map_err("ggml_relu(ffn_up)", source))?;
+    let ff = match config.ffn_activation {
+        FeedForwardActivation::Relu => graph
+            .relu(ff)
+            .map_err(|source| map_err("ggml_relu(ffn_up)", source))?,
+        FeedForwardActivation::Gelu => graph
+            .gelu(ff)
+            .map_err(|source| map_err("ggml_gelu(ffn_up)", source))?,
+        FeedForwardActivation::GeluErf => graph
+            .gelu_erf(ff)
+            .map_err(|source| map_err("ggml_gelu_erf(ffn_up)", source))?,
+        FeedForwardActivation::Silu => graph
+            .silu(ff)
+            .map_err(|source| map_err("ggml_silu(ffn_up)", source))?,
+    };
     let ff = apply_linear_with_bias(
         graph,
         ff,
@@ -2315,6 +2330,7 @@ mod tests {
                 total_token_count: MAX_POSITIONS,
                 position_offset: 0,
                 layer_norm_epsilon: 1.0e-6,
+                ffn_activation: FeedForwardActivation::Relu,
                 self_kv_max_positions: MAX_POSITIONS,
                 cross_frame_count: CROSS_FRAMES,
                 cross_hidden_size: HIDDEN,
