@@ -109,6 +109,14 @@ fn import_command(command: ImportCommand) -> Result<()> {
             package_id,
             quantization,
         } => import_sensevoice_local_command(&source_root, &output_root, &package_id, quantization),
+        ImportCommand::FireredAed {
+            source_root,
+            output_root,
+            package_id,
+            quantization,
+        } => {
+            import_firered_aed_local_command(&source_root, &output_root, &package_id, quantization)
+        }
         ImportCommand::XasrZipformer {
             source_root,
             output_root,
@@ -279,6 +287,36 @@ fn import_sensevoice_local_command(
         .map_err(anyhow::Error::new)?;
     println!(
         "Imported SenseVoice local source into runtime pack:\n- source: {}\n- output: {}\n- tensor_count: {}\n- vocab_size: {}",
+        source_root.display(),
+        result.output_path.display(),
+        result.tensor_count,
+        result.vocab_size
+    );
+    Ok(())
+}
+
+fn import_firered_aed_local_command(
+    source_root: &Path,
+    output_root: &Path,
+    package_id: &str,
+    quantization: ImportFireredAedQuantization,
+) -> Result<()> {
+    let request = openasr_core::FireRedAedImportRequest {
+        source_root: source_root.to_path_buf(),
+        output_root: output_root.to_path_buf(),
+        model_id: package_id.to_string(),
+        quantization: match quantization {
+            ImportFireredAedQuantization::Fp16 => openasr_core::FireRedAedQuantizationMode::Fp16,
+            ImportFireredAedQuantization::Q8_0 => openasr_core::FireRedAedQuantizationMode::Q8_0,
+            ImportFireredAedQuantization::Q4_K => openasr_core::FireRedAedQuantizationMode::Q4_K,
+        },
+    };
+
+    ensure_ggml_package_output_suffix(output_root)?;
+    let result = openasr_core::convert_local_firered_aed_source_to_runtime_pack(&request)
+        .map_err(anyhow::Error::new)?;
+    println!(
+        "Imported FireRedASR-AED local source into runtime pack:\n- source: {}\n- output: {}\n- tensor_count: {}\n- vocab_size: {}",
         source_root.display(),
         result.output_path.display(),
         result.tensor_count,

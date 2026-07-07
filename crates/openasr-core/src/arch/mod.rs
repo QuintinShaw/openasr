@@ -137,6 +137,18 @@ pub(crate) const SENSEVOICE_DECODE_POLICY_ID: &str = "sensevoice.greedy.ctc.v0";
 pub(crate) const SENSEVOICE_RUNTIME_TENSOR_CONTRACT_ID: &str = "sensevoice.runtime-tensors.v0";
 pub(crate) const SENSEVOICE_EXECUTOR_COMPONENT_ID: &str = "sensevoice.ggml-executor.v0";
 
+// firered-aed (FireRedTeam/FireRedASR-AED-L: Conformer encoder + Transformer
+// decoder attention-based encoder-decoder, no CTC branch, Apache-2.0).
+// Component ids are defined ahead of the full architecture-descriptor entry
+// (the sensevoice/parakeet staging precedent): the importer writes them as
+// pack metadata; the descriptor + executor wiring lands with the executor
+// stage.
+pub(crate) const FIRERED_AED_GGML_ARCHITECTURE_ID: &str = "firered-conformer-aed";
+pub(crate) const FIRERED_AED_MODEL_FAMILY: &str = "firered-aed";
+pub(crate) const FIRERED_AED_AUDIO_FRONTEND_ID: &str = "firered-aed.fbank80.16khz.mono.v0";
+pub(crate) const FIRERED_AED_TOKENIZER_ID: &str = "firered-aed.char-spm.v0";
+pub(crate) const FIRERED_AED_DECODE_POLICY_ID: &str = "firered-aed.greedy.seq2seq.v0";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenAsrComponentKind {
     AudioFrontend,
