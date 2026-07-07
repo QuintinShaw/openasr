@@ -747,21 +747,36 @@ impl Default for ServerRuntime {
 }
 
 impl ServerRuntime {
+    /// Validates the runtime is *safe to serve with*, not that a model is
+    /// installed: no model bound at all (`model_pack_path: None`) is a normal
+    /// state for a fresh install with zero pulled models, and the daemon must
+    /// still start and answer `/health` in that state. Only a `model_pack_path`
+    /// that is actually set but fails to validate (bad path, corrupt/foreign
+    /// pack, ...) is a startup error -- that is a misconfiguration, not "no
+    /// model yet". Requests that need a model fail closed at request time
+    /// instead (see `validate_native_request_model`).
     pub fn validate(&self) -> Result<(), openasr_core::BackendError> {
         match self.backend {
             BackendKind::Mock => Ok(()),
             BackendKind::Native => {
                 let Some(model_pack_path) = self.model_pack_path.as_deref() else {
-                    return Err(openasr_core::BackendError::NativeModelPackPathRejected {
-                        reason: "native backend requires an explicit local .oasr runtime pack path"
-                            .to_string(),
-                    });
+                    return Ok(());
                 };
                 let pack_root =
                     openasr_core::validate_local_native_model_pack_path(model_pack_path)?;
                 let _ = validate_native_runtime_pack(&pack_root)?;
                 Ok(())
             }
+        }
+    }
+
+    /// Whether a native model pack is currently bound (surfaced by `/health` so
+    /// clients can distinguish "daemon not reachable" from "daemon ready, no
+    /// model installed" without racing a separate models-list call).
+    fn has_model_bound(&self) -> bool {
+        match self.backend {
+            BackendKind::Mock => true,
+            BackendKind::Native => self.model_pack_path.is_some(),
         }
     }
 }
@@ -1193,12 +1208,16 @@ fn load_persisted_pull_jobs(runtime: &DistributionRuntime) -> HashMap<String, Pu
     jobs
 }
 
-async fn health(Extension(identity): Extension<ServerHealthIdentity>) -> Json<HealthResponse> {
+async fn health(
+    State(runtime): State<ServerRuntime>,
+    Extension(identity): Extension<ServerHealthIdentity>,
+) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         server_version: identity.server_version,
         pid: identity.pid,
         instance_token: identity.instance_token.clone(),
+        model_installed: runtime.has_model_bound(),
     })
 }
 
@@ -1210,18 +1229,20 @@ async fn models(State(runtime): State<ServerRuntime>) -> Result<Json<ModelsRespo
             .map(|card| card.id)
             .collect(),
         BackendKind::Native => {
-            let Some(model_pack_path) = runtime.model_pack_path.as_deref() else {
-                return Err(ApiError::Backend(
-                    openasr_core::BackendError::NativeModelPackPathRejected {
-                        reason: "native backend requires an explicit local .oasr runtime pack path"
-                            .to_string(),
-                    },
-                ));
-            };
-            let pack_root = openasr_core::validate_local_native_model_pack_path(model_pack_path)
-                .map_err(ApiError::Backend)?;
-            let identity = validate_native_runtime_pack(&pack_root).map_err(ApiError::Backend)?;
-            vec![identity.model_id]
+            // No model bound is a normal fresh-install state, not an error:
+            // report an empty model list rather than fail-closed here (the
+            // transcription path is the fail-closed boundary for "no model").
+            match runtime.model_pack_path.as_deref() {
+                None => Vec::new(),
+                Some(model_pack_path) => {
+                    let pack_root =
+                        openasr_core::validate_local_native_model_pack_path(model_pack_path)
+                            .map_err(ApiError::Backend)?;
+                    let identity =
+                        validate_native_runtime_pack(&pack_root).map_err(ApiError::Backend)?;
+                    vec![identity.model_id]
+                }
+            }
         }
     };
     Ok(Json(ModelsResponse {
@@ -1323,6 +1344,12 @@ struct HealthResponse {
     server_version: &'static str,
     pid: u32,
     instance_token: Option<String>,
+    /// Whether a model is currently bound and ready to serve transcription
+    /// requests. `false` on a fresh install with zero pulled models -- the
+    /// daemon is still up and healthy, it just has nothing to transcribe with
+    /// yet. Clients should treat this as "go install a model", not "daemon
+    /// unreachable".
+    model_installed: bool,
 }
 
 #[derive(Serialize)]

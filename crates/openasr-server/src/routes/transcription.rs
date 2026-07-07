@@ -639,9 +639,13 @@ pub(crate) fn validate_native_request_model(
     model: &str,
 ) -> Result<(), String> {
     let Some(model_pack_path) = runtime.model_pack_path.as_deref() else {
-        return Err(
-            "Native backend requires an explicit local .oasr runtime pack path.".to_string(),
-        );
+        // No model bound at all: a fresh install with zero pulled models is a
+        // normal daemon state (it starts and answers /health fine), but a
+        // transcription request needs a model, so this is where that need
+        // becomes a fail-closed, structured error.
+        return Err(format!(
+            "Model '{model}' is not installed. No models are installed on this server yet -- install one first (openasr pull {model}, or via the model market)."
+        ));
     };
     let pack_root = openasr_core::validate_local_native_model_pack_path(model_pack_path)
         .map_err(|error| error.to_string())?;
