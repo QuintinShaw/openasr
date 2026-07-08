@@ -10,10 +10,11 @@ mod native;
 
 pub use mock::transcribe_with_mock_backend;
 pub use native::{
-    NativeBackend, NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
-    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, NativeTranscriptionPhase,
-    NativeTranscriptionProgress, native_runtime_model_adapter_for_path,
-    native_runtime_realtime_capabilities_for_path,
+    ActiveTranscriptionControlGuard, NativeBackend, NativeBackendExecutor,
+    NativeRuntimeModelAdapter, NativeRuntimeModelIdSource, NativeRuntimeModelIdentity,
+    NativeRuntimeModelIdentityError, NativeTranscriptionPhase, NativeTranscriptionProgress,
+    SliceBoundaryControl, TranscriptionControl, install_active_transcription_control,
+    native_runtime_model_adapter_for_path, native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,
     resolve_local_native_runtime_model_identity, validate_local_native_model_pack_path,
     validate_native_runtime_model_pack_contract,
@@ -712,6 +713,10 @@ pub enum BackendError {
         "Native ASR Core serve-batch decode is temporarily unavailable: {reason}\nThis is a transient condition; retry the request."
     )]
     ServeBatchUnavailable { reason: String, retryable: bool },
+    #[error(
+        "Native ASR Core transcription was canceled at a slice boundary before completion.\nThe already-decoded portion was discarded; no partial transcript is returned."
+    )]
+    TranscriptionCanceled,
     #[error(
         "word_timestamps_refine=true (--word-timestamps=aligned) requires word_timestamps=true.\nThe request was rejected instead of silently aligning without emitting words."
     )]

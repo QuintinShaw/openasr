@@ -713,7 +713,22 @@ fn run_native_transcription_impl(
                 .map(|slice| slice.duration_samples() as u64)
                 .sum();
             let mut decode_progress = DecodeProgress::begin(total_decode_samples, with_align);
+            // In-session pause/cancel control for this in-flight transcription,
+            // bound to this decode thread by the caller (see
+            // `install_active_transcription_control`). Checked at each slice
+            // boundary: a cancel unwinds cleanly with `TranscriptionCanceled`
+            // (dropping the assembler and progress guard), and a pause blocks the
+            // worker here until resume or cancel. Absent (CLI / no control
+            // registered) leaves the decode byte-identical to before.
+            let transcription_control =
+                super::transcription_control::current_transcription_control();
             for slice in plan.slices {
+                if let Some(control) = &transcription_control
+                    && control.wait_at_slice_boundary()
+                        == super::transcription_control::SliceBoundaryControl::Canceled
+                {
+                    return Err(BackendError::TranscriptionCanceled);
+                }
                 let slice_samples = slice.duration_samples() as u64;
                 let relative_start = slice
                     .content_start_sample

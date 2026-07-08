@@ -670,7 +670,7 @@ async fn run_realtime_backend_job(runtime: ServerRuntime, job: BackendJob) -> Ba
         .with_execution_target(job.execution_target)
         .with_word_timestamps(job.word_timestamps)
         .with_display_file_name(Some(job.display_name));
-    match transcribe_with_runtime(runtime, request).await {
+    match transcribe_with_runtime(runtime, request, None).await {
         Ok(transcription) => {
             let words = realtime_words_from_transcription(&transcription);
             BackendResult::Final(BackendSuccess {

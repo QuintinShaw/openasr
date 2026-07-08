@@ -1,7 +1,7 @@
 //! HTTP transcription/translation handlers and all supporting helpers.
 //! Pure code-motion from `lib.rs`; shared crate-root items come via `use crate::*`.
 
-use std::{io::Write, path::Path, str::FromStr};
+use std::{io::Write, path::Path, str::FromStr, sync::Arc};
 
 use openasr_core::config::load_config_document;
 use openasr_core::realtime::history::{
@@ -114,6 +114,127 @@ pub(crate) async fn transcription_progress() -> Json<TranscriptionProgressBody> 
     Json(body)
 }
 
+/// Wire status returned by the pause/resume/cancel control endpoints.
+#[derive(serde::Serialize)]
+pub(crate) struct TranscriptionControlBody {
+    /// The client-supplied transcription id the control acted on.
+    id: String,
+    /// The requested control state: `"paused"`, `"running"` (after resume), or
+    /// `"canceled"`. This is the request that was recorded on the in-flight run;
+    /// the actual decode observes it at the next long-form slice boundary.
+    state: &'static str,
+}
+
+/// RAII cleanup that removes an in-flight transcription's control from the
+/// registry when the request handler returns (success, error, or cancel), so a
+/// finished transcription's id can never be paused/canceled afterward.
+///
+/// This is also the leak-prevention safety net for a client that disconnects
+/// mid-run. A paused (or still-decoding) native transcription holds its
+/// `spawn_blocking` worker thread parked on `TranscriptionControl`'s Condvar
+/// until a resume/cancel arrives; if the client goes away first (closes the
+/// connection, or the app quits), nothing would ever wake that thread. Axum
+/// drops the handler's async future when the connection closes, which drops
+/// every local still live at the suspended `.await` point -- including this
+/// guard. While `armed`, `Drop` fires `control.request_cancel()` so the
+/// worker wakes at the next slice boundary (immediately, if it was parked
+/// mid-pause) and unwinds through `TranscriptionCanceled` instead of leaking
+/// its thread forever. `disarm()` is called right after the decode call
+/// returns on its own (success or failure) -- from that point on there is no
+/// more worker thread to protect, so a normal completion must never also
+/// fire a spurious cancel.
+struct ActiveTranscriptionCleanup {
+    distribution: DistributionContext,
+    transcription_id: String,
+    control: Arc<openasr_core::TranscriptionControl>,
+    armed: bool,
+}
+
+impl ActiveTranscriptionCleanup {
+    fn new(
+        distribution: DistributionContext,
+        transcription_id: String,
+        control: Arc<openasr_core::TranscriptionControl>,
+    ) -> Self {
+        Self {
+            distribution,
+            transcription_id,
+            control,
+            armed: true,
+        }
+    }
+
+    /// Disarms the disconnect-cancel safety net. Call this once the decode
+    /// call has returned by itself (success or failure); doing so before then
+    /// would let a genuine mid-decode disconnect leak the worker thread.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ActiveTranscriptionCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            self.control.request_cancel();
+        }
+        self.distribution
+            .clear_transcription(&self.transcription_id);
+    }
+}
+
+fn control_body_response(id: String, state: &'static str) -> Result<Response, ApiError> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(TranscriptionControlBody { id, state }),
+    )
+        .into_response())
+}
+
+fn active_transcription_control(
+    distribution: &DistributionContext,
+    id: &str,
+) -> Result<Arc<openasr_core::TranscriptionControl>, ApiError> {
+    distribution.transcription_control(id).ok_or_else(|| {
+        ApiError::NotFound(format!(
+            "No in-flight transcription with id '{id}'. It may have already finished, been canceled, or never opted into control (missing transcription_id)."
+        ))
+    })
+}
+
+/// `POST /v1/audio/transcriptions/{id}/cancel`: cancel an in-flight file
+/// transcription. The decode stops at the next long-form slice boundary and the
+/// original transcription request fails closed with a canceled status; the
+/// already-decoded portion is discarded (see `BackendError::TranscriptionCanceled`).
+pub(crate) async fn cancel_transcription_job(
+    AxumPath(id): AxumPath<String>,
+    Extension(distribution): Extension<DistributionContext>,
+) -> Result<Response, ApiError> {
+    active_transcription_control(&distribution, &id)?.request_cancel();
+    control_body_response(id, "canceled")
+}
+
+/// `POST /v1/audio/transcriptions/{id}/pause`: pause an in-flight file
+/// transcription at the next long-form slice boundary. The decode thread (and
+/// the original request) block until a matching resume or cancel arrives.
+pub(crate) async fn pause_transcription_job(
+    AxumPath(id): AxumPath<String>,
+    Extension(distribution): Extension<DistributionContext>,
+) -> Result<Response, ApiError> {
+    active_transcription_control(&distribution, &id)?.request_pause();
+    control_body_response(id, "paused")
+}
+
+/// `POST /v1/audio/transcriptions/{id}/resume`: resume a paused in-flight file
+/// transcription. Decoding continues from the next slice within the same
+/// in-flight run, keeping the already-accumulated segments.
+pub(crate) async fn resume_transcription_job(
+    AxumPath(id): AxumPath<String>,
+    Extension(distribution): Extension<DistributionContext>,
+) -> Result<Response, ApiError> {
+    active_transcription_control(&distribution, &id)?.request_resume();
+    control_body_response(id, "running")
+}
+
 /// Shared non-streaming transcription/translation core. `task_override` forces
 /// the task regardless of the request body (used by the translations alias) and
 /// wins over both the multipart field and saved preferences.
@@ -160,7 +281,51 @@ async fn run_offline_transcription(
         validate_native_request_model(&runtime, &parsed.request.model_id)
             .map_err(ApiError::BadRequest)?;
     }
-    let transcription = transcribe_with_runtime(runtime, parsed.request).await?;
+    // Register an in-session pause/cancel control when the client supplied a
+    // transcription id and the native backend is in use (control acts at
+    // long-form slice boundaries; the mock backend has no such loop). The
+    // cleanup guard removes the registry entry on every exit -- success, error,
+    // or cancel.
+    let control = (runtime.backend == BackendKind::Native)
+        .then(|| parsed.transcription_id.clone())
+        .flatten()
+        .map(|id| {
+            let control = Arc::new(openasr_core::TranscriptionControl::new());
+            distribution.register_transcription(&id, Arc::clone(&control));
+            (id, control)
+        });
+    // Armed for as long as the decode call below is in flight: if the client
+    // disconnects and axum drops this handler future first, `Drop` cancels the
+    // control so the (possibly paused) worker thread wakes and exits instead
+    // of leaking. Disarmed immediately after that call returns, either way.
+    let mut control_cleanup = control.as_ref().map(|(id, control)| {
+        ActiveTranscriptionCleanup::new(distribution.clone(), id.clone(), Arc::clone(control))
+    });
+    let control_handle = control.as_ref().map(|(_, control)| Arc::clone(control));
+    let transcription =
+        match transcribe_with_runtime(runtime, parsed.request, control_handle.clone()).await {
+            Ok(transcription) => {
+                if let Some(cleanup) = control_cleanup.as_mut() {
+                    cleanup.disarm();
+                }
+                transcription
+            }
+            Err(error) => {
+                if let Some(cleanup) = control_cleanup.as_mut() {
+                    cleanup.disarm();
+                }
+                // A cancel surfaces from core as a generic fail-closed error (the
+                // typed cancel is flattened through the NativeAsrError layer), so
+                // consult the control to report it honestly as a 409 canceled result
+                // rather than a 400 fail-closed refusal.
+                if control_handle.is_some_and(|control| control.is_canceled()) {
+                    return Err(ApiError::Backend(
+                        openasr_core::BackendError::TranscriptionCanceled,
+                    ));
+                }
+                return Err(error);
+            }
+        };
     let rendered = render_transcription(&transcription, parsed.response_format)
         .map_err(ApiError::Serialize)?;
     // History is a best-effort audit side-write: a successful transcription must
@@ -268,6 +433,12 @@ pub(crate) struct TranscriptionQuery {
 pub(crate) struct ParsedTranscriptionRequest {
     pub(crate) request: TranscriptionRequest,
     pub(crate) response_format: ResponseFormat,
+    /// Optional client-supplied id for this transcription. When present, the
+    /// handler registers a pause/cancel control under it so the
+    /// `/v1/audio/transcriptions/{id}/{pause,resume,cancel}` endpoints can act on
+    /// the in-flight run. Absent (older clients) keeps today's uncontrolled,
+    /// run-to-completion behavior.
+    pub(crate) transcription_id: Option<String>,
     pub(crate) _uploaded_file: tempfile::TempPath,
 }
 
@@ -275,6 +446,7 @@ struct TranscriptionRequestBuilder {
     file_name: Option<String>,
     saw_file: bool,
     uploaded_file: Option<tempfile::TempPath>,
+    transcription_id: Option<String>,
     model: Option<String>,
     language: Option<String>,
     task: Option<TranscriptionTask>,
@@ -304,6 +476,7 @@ impl Default for TranscriptionRequestBuilder {
             file_name: None,
             saw_file: false,
             uploaded_file: None,
+            transcription_id: None,
             model: None,
             language: None,
             task: None,
@@ -342,6 +515,11 @@ impl TranscriptionRequestBuilder {
                     .and_then(safe_extension_suffix)
                     .unwrap_or_default();
                 self.uploaded_file = Some(write_upload_temp_file_streaming(field, &suffix).await?);
+            }
+            "transcription_id" => {
+                let value = field.text().await.map_err(ApiError::Multipart)?;
+                let trimmed = value.trim();
+                self.transcription_id = (!trimmed.is_empty()).then(|| trimmed.to_string());
             }
             "model" => {
                 self.model = Some(field.text().await.map_err(ApiError::Multipart)?);
@@ -450,6 +628,7 @@ impl TranscriptionRequestBuilder {
             file_name,
             saw_file,
             uploaded_file,
+            transcription_id,
             model,
             language,
             task,
@@ -563,6 +742,7 @@ impl TranscriptionRequestBuilder {
         Ok(ParsedTranscriptionRequest {
             request,
             response_format,
+            transcription_id,
             _uploaded_file: uploaded_file,
         })
     }
@@ -809,6 +989,77 @@ mod native_model_ref_tests {
     }
 }
 
+/// Coverage for the disconnect-cancel safety net: `ActiveTranscriptionCleanup`
+/// must cancel the control when dropped while still armed (simulating the
+/// handler future being dropped mid-decode on a client disconnect), and must
+/// not when disarmed first (the normal completion path).
+#[cfg(test)]
+mod active_transcription_cleanup_tests {
+    use std::sync::Arc;
+
+    use super::{ActiveTranscriptionCleanup, DistributionContext, DistributionRuntime};
+
+    fn distribution_for_test() -> DistributionContext {
+        DistributionContext::new(DistributionRuntime {
+            openasr_home: None,
+            catalog_url: None,
+        })
+    }
+
+    #[test]
+    fn drop_while_armed_cancels_control_and_clears_registry() {
+        let distribution = distribution_for_test();
+        let control = Arc::new(openasr_core::TranscriptionControl::new());
+        distribution.register_transcription("txn-disconnect", Arc::clone(&control));
+
+        {
+            let _cleanup = ActiveTranscriptionCleanup::new(
+                distribution.clone(),
+                "txn-disconnect".to_string(),
+                Arc::clone(&control),
+            );
+            assert!(!control.is_canceled());
+            // Dropped here without ever calling `disarm()`, exactly as happens
+            // when a client disconnects and axum drops the handler future
+            // before the decode call above it returns.
+        }
+
+        assert!(
+            control.is_canceled(),
+            "a disconnect before disarm must cancel the control so a paused/decoding worker thread wakes and exits"
+        );
+        assert!(
+            distribution
+                .transcription_control("txn-disconnect")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn disarm_then_drop_does_not_cancel_but_still_clears_registry() {
+        let distribution = distribution_for_test();
+        let control = Arc::new(openasr_core::TranscriptionControl::new());
+        distribution.register_transcription("txn-normal", Arc::clone(&control));
+
+        {
+            let mut cleanup = ActiveTranscriptionCleanup::new(
+                distribution.clone(),
+                "txn-normal".to_string(),
+                Arc::clone(&control),
+            );
+            cleanup.disarm();
+            // Normal completion path: disarmed right after the decode call
+            // returns, before this guard drops at the end of the handler.
+        }
+
+        assert!(
+            !control.is_canceled(),
+            "a normal completion must never fire a spurious cancel"
+        );
+        assert!(distribution.transcription_control("txn-normal").is_none());
+    }
+}
+
 // ── Multipart field parsers ───────────────────────────────────────────────────
 
 pub(crate) fn parse_bool_field(name: &str, value: &str) -> Result<bool, ApiError> {
@@ -1019,9 +1270,14 @@ fn validate_timestamp_granularities(values: &[String]) -> Result<(), ApiError> {
 pub(crate) async fn transcribe_with_runtime(
     runtime: ServerRuntime,
     request: TranscriptionRequest,
+    control: Option<Arc<openasr_core::TranscriptionControl>>,
 ) -> Result<openasr_core::Transcription, ApiError> {
     match runtime.backend {
         BackendKind::Mock => {
+            // The mock backend runs a single opaque decode with no slice loop, so
+            // there is no boundary to observe a pause/cancel; the control (if any)
+            // is simply not installed here.
+            let _ = &control;
             let prepared = prepare_audio_input(
                 &request.input_path,
                 &AudioPreparationOptions::new(runtime.backend),
@@ -1039,6 +1295,11 @@ pub(crate) async fn transcribe_with_runtime(
             Ok(transcription)
         }
         BackendKind::Native => tokio::task::spawn_blocking(move || {
+            // Bind the pause/cancel control to this decode thread for the whole
+            // synchronous run so the long-form slice loop can observe it; the
+            // guard clears the binding on any exit. `None` (no control requested)
+            // leaves the decode byte-identical to before.
+            let _control_guard = control.map(openasr_core::install_active_transcription_control);
             let model_pack_path = runtime.model_pack_path.clone().ok_or_else(|| {
                 TranscriptionRuntimeError::Backend(
                     openasr_core::BackendError::NativeModelPackPathRejected {
