@@ -3,7 +3,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlStaticTensor,
+    GgmlStaticTensorArena,
 };
 use crate::{Segment, Transcription};
 
@@ -35,7 +36,15 @@ use crate::nn::decoder::{
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 
 const COHERE_DECODER_LAYER_NORM_EPSILON: f32 = 1.0e-5;
-const COHERE_DECODER_GRAPH_CONTEXT_BYTES: usize = 512 * 1024 * 1024;
+/// Floor for the decoder's `no_alloc` metadata context node/tensor budget:
+/// covers both the per-step decode cgraph AND every static tensor allocated
+/// directly in the arena (weights, embeddings, cross-KV, self-KV -- see
+/// `GgmlStaticTensorArena`, which is metadata-only: real tensor bytes land in
+/// a backend buffer sized from the tensors' actual shapes, independent of
+/// this context's size). Mirrors the encoder's proven `16_384` headroom
+/// (`cohere_encoder_graph_config_with_overrides`) -- comfortably above the
+/// realistic weight+KV tensor count for any decoder layer depth.
+const COHERE_DECODER_GRAPH_SIZE_FLOOR: usize = 16_384;
 const COHERE_DISABLE_INCREMENTAL_SELF_KV_ENV: &str = "OPENASR_COHERE_DISABLE_INCREMENTAL_SELF_KV";
 const COHERE_MAX_GENERATED_TOKENS_OVERRIDE_ENV: &str =
     "OPENASR_COHERE_MAX_GENERATED_TOKENS_OVERRIDE";
@@ -431,6 +440,11 @@ pub(crate) struct CohereDecoderGraphRuntime {
     reuse: Option<Seq2SeqReusableDecodeGraph>,
     metadata: CohereTranscribeExecutionMetadata,
     runner: GgmlCpuGraphRunner,
+    /// The `no_alloc` metadata context size used for `runner`'s own graph
+    /// context and `arena`; reused verbatim for
+    /// `start_persistent_graph_session` in [`Self::build_reusable_decode_graph`]
+    /// so it does not have to be recomputed from a hardcoded constant.
+    persistent_graph_context_bytes: usize,
     arena: GgmlStaticTensorArena,
     token_embedding: GgmlStaticTensor,
     positional_embedding: GgmlStaticTensor,
@@ -584,7 +598,14 @@ impl CohereDecoderGraphRuntime {
         )?;
 
         let mut config = cohere_decoder_graph_config(prefer_cpu_backend);
-        config.context_bytes = COHERE_DECODER_GRAPH_CONTEXT_BYTES;
+        config.graph_size = config.graph_size.max(COHERE_DECODER_GRAPH_SIZE_FLOOR);
+        config.context_bytes =
+            config
+                .context_bytes
+                .max(GgmlCpuGraphConfig::metadata_context_bytes(
+                    config.graph_size,
+                ));
+        let persistent_graph_context_bytes = config.context_bytes;
         let runner = GgmlCpuGraphRunner::new(config).map_err(|source| {
             CohereDecoderGraphError::GraphBuildFailed {
                 step: "runner_init",
@@ -854,6 +875,7 @@ impl CohereDecoderGraphRuntime {
             reuse: None,
             metadata,
             runner,
+            persistent_graph_context_bytes,
             arena,
             token_embedding,
             positional_embedding,
@@ -1766,7 +1788,7 @@ impl CohereDecoderGraphRuntime {
         let n_seq = self.n_seq;
         let mut session = self
             .runner
-            .start_persistent_graph_session(COHERE_DECODER_GRAPH_CONTEXT_BYTES)
+            .start_persistent_graph_session(self.persistent_graph_context_bytes)
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "cohere_reuse_session",
                 source,

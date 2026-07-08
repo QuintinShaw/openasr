@@ -50,7 +50,6 @@ use super::encoder_weights::{
 use super::runtime_contract::FireRedAedExecutionMetadata;
 
 const FIRERED_ENCODER_LAYER_NORM_EPSILON: f32 = 1.0e-5;
-const FIRERED_ENCODER_GRAPH_CONTEXT_BYTES: usize = 512 * 1024 * 1024;
 const FIRERED_ENCODER_GRAPH_SIZE: usize = 32_768;
 /// `Conv2dSubsampling.context = left_context(3) + 1 + right_context(3)`; the
 /// encoder pads the time axis by `context - 1` zero frames before the stem
@@ -100,7 +99,11 @@ pub(crate) fn firered_encoder_graph_config() -> GgmlCpuGraphConfig {
     // parity is established (matches the parakeet-ctc/sensevoice staging
     // precedent of correctness-first, backend-breadth-later).
     GgmlCpuGraphConfig {
-        context_bytes: FIRERED_ENCODER_GRAPH_CONTEXT_BYTES,
+        // `no_alloc` metadata context sized from the actual node count (see
+        // `GgmlCpuGraphConfig::metadata_context_bytes`); previously a flat
+        // hardcoded 512 MiB per cached encoder runtime (see the thread-local
+        // cache in `executor.rs`).
+        context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(FIRERED_ENCODER_GRAPH_SIZE),
         graph_size: FIRERED_ENCODER_GRAPH_SIZE,
         n_threads: None,
         backend: GgmlCpuGraphBackend::Cpu,

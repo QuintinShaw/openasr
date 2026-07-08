@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -50,7 +49,8 @@ use crate::models::runtime_prepared_registry::{
     BuiltinPreparedRuntimeCache, BuiltinPreparedRuntimeRegistryError,
 };
 use crate::models::thread_local_runtime_cache::{
-    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
+    with_thread_local_cached_mut_by_key,
 };
 
 const COHERE_EXECUTOR_ID: &str = "cohere-transcribe-ggml-executor-v1";
@@ -60,10 +60,10 @@ const COHERE_DEBUG_TIMINGS_ENV: &str = "OPENASR_COHERE_DEBUG_TIMINGS";
 const COHERE_DEBUG_ENCODER_ENV: &str = "OPENASR_COHERE_DEBUG_ENCODER";
 
 thread_local! {
-    static COHERE_ENCODER_RUNTIME_BY_KEY: RefCell<HashMap<CohereEncoderRuntimeCacheKey, CohereTranscribeEncoderGraphRuntime>> =
-        RefCell::new(HashMap::new());
-    static COHERE_DECODER_RUNTIME_BY_KEY: RefCell<HashMap<CohereDecoderRuntimeCacheKey, CohereDecoderGraphRuntime>> =
-        RefCell::new(HashMap::new());
+    static COHERE_ENCODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<CohereEncoderRuntimeCacheKey, CohereTranscribeEncoderGraphRuntime>> =
+        RefCell::new(BoundedRuntimeCache::new());
+    static COHERE_DECODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<CohereDecoderRuntimeCacheKey, CohereDecoderGraphRuntime>> =
+        RefCell::new(BoundedRuntimeCache::new());
 }
 
 type CohereEncoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
@@ -394,6 +394,7 @@ fn encode_with_cached_cohere_encoder_runtime(
     with_thread_local_cached_mut_by_key(
         &COHERE_ENCODER_RUNTIME_BY_KEY,
         key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
         || {
             CohereTranscribeEncoderGraphRuntime::new(
                 &prepared_runtime.encoder_weights,
@@ -429,6 +430,7 @@ fn decode_with_cached_cohere_decoder_runtime(
     with_thread_local_cached_mut_by_key(
         &COHERE_DECODER_RUNTIME_BY_KEY,
         key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
         || {
             CohereDecoderGraphRuntime::new(
                 decoder_weights,
