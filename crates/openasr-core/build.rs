@@ -23,6 +23,11 @@ fn main() {
     let feat_openmp = env::var("CARGO_FEATURE_OPENMP").is_ok();
     let feat_native = env::var("CARGO_FEATURE_NATIVE").is_ok();
     let is_windows = target.contains("windows");
+    // Windows arm64, always cross-compiled from an x86_64 host runner (there is
+    // no arm64 GitHub-hosted Windows runner today). See the Ninja-generator
+    // block below for why this needs the same generator override as the GPU
+    // Windows legs.
+    let is_windows_arm64 = is_windows && target.starts_with("aarch64");
     // The android triple (e.g. aarch64-linux-android) also contains "linux", so
     // it must be detected explicitly and BEFORE any `contains("linux")` check.
     let is_android = target.contains("android");
@@ -60,6 +65,15 @@ fn main() {
     // GGML_CPU_ALL_VARIANTS requires GGML_NATIVE=OFF (CMake FATAL_ERROR otherwise),
     // and a portable base must not bake the build host's ISA anyway.
     let use_backend_dl = is_windows && !feat_cuda && !feat_vulkan && !feat_hip;
+    // GGML_CPU_ALL_VARIANTS compiles the multi-ISA CPU dispatch set (sse42/avx/
+    // avx2/... on x86). ggml has NO Windows ARM entry in that variant table
+    // (src/CMakeLists.txt only wires ARM ALL_VARIANTS for Linux/Android/Apple),
+    // and on the windows-arm64 cross the host-arch fallback would otherwise emit
+    // x86 variants whose x86-only GEMM/repack kernels have no ARM implementation
+    // and fail the link with unresolved externals (ggml_gemm_q6_K_8x4_q8_K, ...).
+    // So the arm64 cross builds a single ARM64 CPU backend instead (still a
+    // GGML_BACKEND_DL plugin DLL, just not the multi-variant set).
+    let ggml_cpu_all_variants = use_backend_dl && !is_windows_arm64;
     let ggml_native = resolve_ggml_native_enabled(
         feat_native,
         &target,
@@ -164,7 +178,7 @@ fn main() {
         .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON")
         .arg(cmake_flag("BUILD_SHARED_LIBS", use_backend_dl))
         .arg(cmake_flag("GGML_BACKEND_DL", use_backend_dl))
-        .arg(cmake_flag("GGML_CPU_ALL_VARIANTS", use_backend_dl))
+        .arg(cmake_flag("GGML_CPU_ALL_VARIANTS", ggml_cpu_all_variants))
         .arg("-DGGML_BUILD_TESTS=OFF")
         .arg("-DGGML_BUILD_EXAMPLES=OFF")
         .arg(cmake_flag("GGML_NATIVE", ggml_native))
@@ -257,8 +271,44 @@ fn main() {
     // build customizations, which trail new VS majors (VS 2026 has no CUDA
     // toolset yet -> "No CUDA toolset found"). Ninja drives nvcc directly
     // with the MSVC host compiler pinned below instead.
-    if (feat_hip || feat_vulkan || feat_cuda) && is_windows {
+    //
+    // The windows arm64 cross build (host x86_64, target aarch64-pc-windows-msvc)
+    // joins them so the target ISA is driven purely by the compiler + explicit
+    // CMAKE_SYSTEM_PROCESSOR (set in the is_windows_arm64 block below) rather
+    // than the default Visual Studio generator's multi-arch project shape, which
+    // configures for the HOST platform (x64) and would fight the arm64 cross
+    // toolchain. See that block for the ARM-arch and clang-cl requirements.
+    if (feat_hip || feat_vulkan || feat_cuda || is_windows_arm64) && is_windows {
         configure.arg("-G").arg("Ninja");
+    }
+    if is_windows_arm64 {
+        // Cross-compile ggml for ARM64 Windows from an x86_64 host.
+        //
+        // CMAKE_SYSTEM_NAME=Windows puts CMake into explicit cross-compile mode;
+        // CMAKE_SYSTEM_PROCESSOR=ARM64 makes ggml's ggml_get_system_arch()
+        // resolve GGML_SYSTEM_ARCH=ARM. Under the Ninja generator there is no
+        // CMAKE_GENERATOR_PLATFORM signal, so ggml would otherwise fall back to
+        // the host processor (AMD64) and wrongly select the x86 CPU backend --
+        // the source of the "unresolved external ggml_gemm_q6_K_8x4_q8_K" link
+        // failures (x86-only kernels compiled for an ARM target).
+        //
+        // ggml's ARM CPU backend refuses MSVC cl outright
+        // (src/ggml-cpu/CMakeLists.txt: "MSVC is not supported for ARM, use
+        // clang"), so the arm64 cross must be compiled with clang-cl. clang-cl
+        // still consumes the MSVC ARM64 headers/libs (the INCLUDE/LIB/PATH env
+        // that msvc_tool.env() exports below); CMAKE_<LANG>_COMPILER_TARGET makes
+        // CMake pass `--target=arm64-pc-windows-msvc` so clang-cl emits ARM64
+        // objects. GGML_NATIVE is already OFF for a cross build, and there are no
+        // check_cxx_source_runs() probes on this path (the ARM feature detection
+        // uses compile-only checks), so no arm64 test binary is ever executed on
+        // the x64 host.
+        configure
+            .arg("-DCMAKE_SYSTEM_NAME=Windows")
+            .arg("-DCMAKE_SYSTEM_PROCESSOR=ARM64")
+            .arg("-DCMAKE_C_COMPILER=clang-cl")
+            .arg("-DCMAKE_CXX_COMPILER=clang-cl")
+            .arg("-DCMAKE_C_COMPILER_TARGET=arm64-pc-windows-msvc")
+            .arg("-DCMAKE_CXX_COMPILER_TARGET=arm64-pc-windows-msvc");
     }
     if is_macos {
         configure.arg(format!(
@@ -452,10 +502,16 @@ fn main() {
             .arg("-DCMAKE_CXX_COMPILER=icpx");
     }
     if let Some(tool) = msvc_tool.as_ref() {
-        let cl = cmake_path(tool.path());
-        configure
-            .arg(format!("-DCMAKE_C_COMPILER={cl}"))
-            .arg(format!("-DCMAKE_CXX_COMPILER={cl}"));
+        // The windows-arm64 cross pins clang-cl (+ its --target) above because
+        // ggml's ARM CPU backend rejects MSVC cl; here it only needs the arm64
+        // MSVC INCLUDE/LIB/PATH env that find_tool resolved. Every other Windows
+        // leg compiles ggml with cl directly.
+        if !is_windows_arm64 {
+            let cl = cmake_path(tool.path());
+            configure
+                .arg(format!("-DCMAKE_C_COMPILER={cl}"))
+                .arg(format!("-DCMAKE_CXX_COMPILER={cl}"));
+        }
         for (key, val) in tool.env() {
             configure.env(key, val);
         }
