@@ -203,26 +203,46 @@ jobs:
             archive_ext: zip
             experimental: true
             timeout: 120
-          # DEFERRED (intentionally not in the matrix): the two Linux musl CPU
-          # legs -- x86_64-unknown-linux-musl (asset linux-x86_64-musl) and
-          # aarch64-unknown-linux-musl (asset linux-arm64-musl). They cannot be
-          # built cleanly on a stock GitHub-hosted ubuntu runner today:
-          #   * ggml is C++ (compiled by build.rs via CMake). A musl target
-          #     needs a musl C++ compiler, but Ubuntu's `musl-tools` ships only
-          #     `musl-gcc` (C) -- there is no apt `musl-g++`. So the ggml C++
-          #     objects cannot be produced for musl without a musl-cross
-          #     toolchain (musl.cc / musl-cross-make) or building inside an
-          #     Alpine container.
-          #   * musl defaults to crt-static ON, but build.rs links libstdc++
-          #     and libgomp dynamically on Linux (see the `target.contains(
-          #     "linux")` block), which a fully static musl binary cannot pull;
-          #     enabling them needs `-C target-feature=-crt-static` (a dynamic
-          #     musl binary) plus a musl libstdc++, or static-libstdc++ wiring.
-          # Enabling musl is therefore a build.rs + toolchain task, not an
-          # asset-rename one. When done, add two legs here with rust_target set
-          # (like the windows-arm64 leg), the friendly assets above, and -- once
-          # green -- the TARGETS entries linux-x86_64-musl:tar.gz and
-          # linux-arm64-musl:tar.gz.
+          # Fully static Linux musl CPU legs (single self-contained binary that
+          # runs on any Linux userland -- Alpine, distroless, glibc hosts alike).
+          # Both are cross-compiled with cargo-zigbuild (zig cc/c++ = clang plus a
+          # bundled musl libc + libc++) on the stock x86_64 ubuntu runner: zig is
+          # a reliable, self-contained cross toolchain (installed via pip's
+          # `ziglang` wheel + `cargo install cargo-zigbuild`), which sidesteps the
+          # old blockers -- Ubuntu ships no apt `musl-g++` for ggml's C++, and a
+          # musl-cross download source (musl.cc) proved flaky/offline in CI. See
+          # the "Install musl cross build toolchain" + "Build static ALSA for
+          # musl" + zigbuild branch in the build step below, and the is_musl
+          # handling in crates/openasr-core/build.rs (static libc++ instead of
+          # dynamic libstdc++/libgomp; explicit CMake cross toolchain file).
+          #
+          # `zigbuild: true` selects `cargo zigbuild` over `cargo build`;
+          # rust_target is set so RELEASE_DIR / the cross-leg smoke skips behave
+          # exactly like the windows-arm64 cross leg (build + package only -- the
+          # x86_64 static binary could run on the runner, but the aarch64 one
+          # cannot, so both are treated as cross for a uniform code path). Kept
+          # `experimental: true` (non-blocking, excluded from
+          # verify-completeness) until they prove green on a real runner; once
+          # green, drop `experimental` and add linux-x86_64-musl:tar.gz +
+          # linux-arm64-musl:tar.gz to verify-completeness TARGETS.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: linux-x86_64-musl
+            rust_target: x86_64-unknown-linux-musl
+            binary_name: openasr
+            archive_ext: tar.gz
+            zigbuild: true
+            experimental: true
+            timeout: 90
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset: linux-arm64-musl
+            rust_target: aarch64-unknown-linux-musl
+            binary_name: openasr
+            archive_ext: tar.gz
+            zigbuild: true
+            experimental: true
+            timeout: 90
           # Linux GPU-feature variants, same rationale as the Windows ones
           # above (no GPU on the hosted runner; build+package validated
           # here, GPU inference validated on real hardware). Pinned to
@@ -493,10 +513,79 @@ jobs:
         with:
           shared-key: release-binaries-${{ matrix.target }}
 
+      # musl legs are cross-compiled with cargo-zigbuild: zig cc/c++ is a
+      # self-contained clang + bundled musl libc/libc++ cross toolchain, so no
+      # apt musl-cross (or the flaky musl.cc download) is needed. ziglang ships
+      # as a pip wheel (cargo-zigbuild auto-discovers `python3 -m ziglang`); the
+      # target std comes from the "Add cross Rust target" step above.
+      - name: Install musl cross build toolchain
+        if: matrix.zigbuild && env.LEG_SELECTED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user ziglang
+          cargo install cargo-zigbuild --version 0.23.0 --locked
+          python3 -m ziglang version
+
+      # ggml's CPU backend pulls in ALSA transitively (openasr-cli -> cpal ->
+      # alsa-sys) on Linux, and a fully static musl binary needs a musl-built
+      # static libasound.a -- the runner's apt libasound2-dev is glibc-only.
+      # Cross-build ALSA from its official release tarball with the same zig cc
+      # (targeting <arch>-linux-musl), then point alsa-sys' pkg-config probe at
+      # it via the target-scoped PKG_CONFIG_* vars (PKG_CONFIG_LIBDIR_<target>
+      # replaces the search path so the host glibc alsa.pc is never picked).
+      - name: Build static ALSA for musl
+        if: matrix.zigbuild && env.LEG_SELECTED == 'true'
+        shell: bash
+        env:
+          ALSA_VERSION: 1.2.13
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.rust_target }}"; arch="${arch%%-*}"   # x86_64 | aarch64
+          zig_triple="${arch}-linux-musl"
+          wrapper="${RUNNER_TEMP}/zigcc-${arch}.sh"
+          cat > "${wrapper}" <<EOF
+          #!/bin/sh
+          exec python3 -m ziglang cc -target ${zig_triple} "\$@"
+          EOF
+          chmod +x "${wrapper}"
+
+          cd "${RUNNER_TEMP}"
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 30 \
+            -o alsa-lib.tar.bz2 \
+            "https://www.alsa-project.org/files/pub/lib/alsa-lib-${ALSA_VERSION}.tar.bz2"
+          tar xjf alsa-lib.tar.bz2
+          cd "alsa-lib-${ALSA_VERSION}"
+          CC="${wrapper}" ./configure \
+            --host="${zig_triple}" \
+            --prefix="${RUNNER_TEMP}/alsa-musl" \
+            --enable-static --disable-shared --disable-python \
+            --disable-topology --disable-ucm --disable-alisp --disable-old-symbols
+          CC="${wrapper}" make -j"$(nproc)"
+          CC="${wrapper}" make install
+
+          # Target-scoped pkg-config wiring so alsa-sys probes the freshly
+          # cross-built static libasound instead of the host's glibc one.
+          et="$(echo "${{ matrix.rust_target }}" | tr '-' '_')"
+          pc_dir="${RUNNER_TEMP}/alsa-musl/lib/pkgconfig"
+          {
+            echo "PKG_CONFIG_ALLOW_CROSS=1"
+            echo "PKG_CONFIG_ALLOW_CROSS_${et}=1"
+            echo "PKG_CONFIG_PATH_${et}=${pc_dir}"
+            echo "PKG_CONFIG_LIBDIR_${et}=${pc_dir}"
+            echo "PKG_CONFIG_SYSROOT_DIR_${et}=${RUNNER_TEMP}/alsa-musl"
+          } >> "${GITHUB_ENV}"
+
       - name: Build release binary
         if: env.LEG_SELECTED == 'true'
         shell: bash
-        run: cargo build --release -p openasr-cli ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.zigbuild }}" = "true" ]; then
+            cargo zigbuild --release -p openasr-cli --target ${{ matrix.rust_target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+          else
+            cargo build --release -p openasr-cli ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+          fi
 
       # Same GPU-less-runner caveat as the Windows CUDA/HIP legs: those two
       # exes dlopen the CUDA/ROCm runtime at launch, which needs a real
