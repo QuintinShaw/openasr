@@ -40,7 +40,7 @@ use crate::models::seq2seq_serve_batch::{
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
-    ServeBatchStepOutcome, serve_batch_estimate_seq2seq_slot_bytes, serve_batch_select_greedy_step,
+    serve_batch_estimate_seq2seq_slot_bytes, serve_batch_select_and_apply_greedy_step,
 };
 
 const WHISPER_SERVE_BATCH_MAX_BATCH_LIMIT: usize = 8;
@@ -671,24 +671,15 @@ impl WhisperBatchSlot {
         &mut self,
         logits: Vec<f32>,
     ) -> Result<(), WhisperServeBatchError> {
-        match serve_batch_select_greedy_step(
+        serve_batch_select_and_apply_greedy_step(
             &self.job.decode_config,
-            &self.generated_tokens,
+            &mut self.generated_tokens,
+            &mut self.generated_probabilities,
+            &mut self.done,
             self.stop_token_ids.as_slice(),
             logits,
         )
-        .map_err(map_greedy_error)?
-        {
-            ServeBatchStepOutcome::ReachedEot => self.done = true,
-            ServeBatchStepOutcome::Token {
-                token_id,
-                probability,
-            } => {
-                self.generated_tokens.push(token_id);
-                self.generated_probabilities.push(probability);
-            }
-        }
-        Ok(())
+        .map_err(map_greedy_error)
     }
 
     fn finish(self) -> Result<WhisperExecutionOutput, WhisperServeBatchError> {

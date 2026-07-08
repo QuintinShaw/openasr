@@ -6,7 +6,7 @@ use crate::models::phrase_bias_decode::{TokenPhraseBias, apply_phrase_bias_to_lo
 /// characters). An observed greedy loop is a very short cycle - a single
 /// stuttered token, or a 2-4 token phrase emitted back to back - so 8 covers
 /// the field failures while keeping the per-step tail scan tiny.
-const MAX_REPEAT_NGRAM: usize = 8;
+pub(crate) const MAX_REPEAT_NGRAM: usize = 8;
 
 /// Consecutive identical cycles that mark a greedy loop as degenerate. Kept
 /// deliberately high so legitimate human repetition never trips it: Mandarin
@@ -14,7 +14,7 @@ const MAX_REPEAT_NGRAM: usize = 8;
 /// 3 cycles, so a threshold of 4 leaves normal speech untouched while still
 /// catching the degenerate loops (a phrase repeated 5+ times). Set to 0 to
 /// disable the guard entirely (fail-safe).
-const MAX_CONSECUTIVE_NGRAM_REPEATS: usize = 4;
+pub(crate) const MAX_CONSECUTIVE_NGRAM_REPEATS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Seq2SeqGreedyDecodeConfig {
@@ -156,6 +156,17 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_with_adapter_v0<E>(
     })
 }
 
+/// The single greedy autoregressive decode driver for every AED / seq2seq
+/// family (whisper, cohere, qwen, moonshine, firered-aed, ...). It owns the step
+/// loop, argmax selection, suppression/phrase-bias/stop-token handling, and the
+/// degenerate-loop guard, so every family shares one hardened implementation.
+///
+/// INVARIANT (see the repo AGENTS.md "One greedy decode driver"): a new autoregressive family
+/// MUST reach greedy decode through this driver -- provide a
+/// [`Seq2SeqGreedyDecodeStepExecutor`] and declare a decode-policy descriptor in
+/// `decode_policy_component_registry` (route via `run_builtin_seq2seq_decode_policy`)
+/// -- and MUST NOT hand-write its own argmax step loop. Hand-rolled loops miss the
+/// shared guard and drift the semantics this driver centralizes.
 pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
     config: &Seq2SeqGreedyDecodeConfig,
     step_executor: &mut dyn Seq2SeqGreedyDecodeStepExecutor,
@@ -349,12 +360,12 @@ fn suppress_logits(logits: &mut [f32], token_ids: &[u32]) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DegenerateNgramRepeat {
+pub(crate) struct DegenerateNgramRepeat {
     /// Number of leading tokens to keep: the sequence truncated to a single
     /// occurrence of the repeated n-gram (loop start + one cycle).
-    keep_len: usize,
-    ngram_len: usize,
-    repeats: usize,
+    pub(crate) keep_len: usize,
+    pub(crate) ngram_len: usize,
+    pub(crate) repeats: usize,
 }
 
 /// Detect a degenerate consecutive-n-gram loop in the tail of `tokens`.
@@ -368,7 +379,9 @@ struct DegenerateNgramRepeat {
 ///
 /// Pure over the token-id tail: no logits, no tokenizer, unit-testable in
 /// isolation and shared by every seq2seq family that routes through the loop.
-fn detect_degenerate_ngram_repeat(
+/// Also reused by the serve-batch selection helper so the continuous-batching
+/// slots trip the exact same guard as the single-utterance loop.
+pub(crate) fn detect_degenerate_ngram_repeat(
     tokens: &[u32],
     max_ngram: usize,
     max_consecutive_repeats: usize,

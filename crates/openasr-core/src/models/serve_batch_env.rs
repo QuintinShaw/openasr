@@ -9,7 +9,8 @@ use crate::ggml_runtime::{
     GgmlBackendKind, GgmlCpuGraphBackend, GgmlDeviceMemory, ggml_available_devices,
 };
 use crate::models::seq2seq_greedy_decode::{
-    Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepLogitsOutput,
+    MAX_CONSECUTIVE_NGRAM_REPEATS, MAX_REPEAT_NGRAM, Seq2SeqGreedyDecodeConfig,
+    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepLogitsOutput, detect_degenerate_ngram_repeat,
     select_seq2seq_greedy_step_token,
 };
 
@@ -109,6 +110,45 @@ pub(crate) fn serve_batch_select_greedy_step(
             probability: selection.probability,
         }
     })
+}
+
+/// Select the next greedy token for a serve-batch slot AND fold the outcome into
+/// the slot's `(generated_tokens, generated_probabilities, done)` state. This is
+/// the one place every seq2seq serve-batch family (whisper / cohere / moonshine /
+/// qwen) mutates its slot, so the degenerate-loop guard that the single-utterance
+/// `run_seq2seq_greedy_decode_loop_v0` applies is applied here too, byte-for-byte:
+/// after appending a token, if the generated tail turns into a short cycle
+/// repeated to the degenerate threshold, keep a single occurrence and finish the
+/// slot instead of letting the batched decode spin to the token cap (issue #60,
+/// server side). Inert on healthy decodes.
+pub(crate) fn serve_batch_select_and_apply_greedy_step(
+    decode_config: &Seq2SeqGreedyDecodeConfig,
+    generated_tokens: &mut Vec<u32>,
+    generated_probabilities: &mut Vec<f32>,
+    done: &mut bool,
+    stop_token_ids: &[u32],
+    logits: Vec<f32>,
+) -> Result<(), Seq2SeqGreedyDecodeError> {
+    match serve_batch_select_greedy_step(decode_config, generated_tokens, stop_token_ids, logits)? {
+        ServeBatchStepOutcome::ReachedEot => *done = true,
+        ServeBatchStepOutcome::Token {
+            token_id,
+            probability,
+        } => {
+            generated_tokens.push(token_id);
+            generated_probabilities.push(probability);
+            if let Some(loop_hit) = detect_degenerate_ngram_repeat(
+                generated_tokens,
+                MAX_REPEAT_NGRAM,
+                MAX_CONSECUTIVE_NGRAM_REPEATS,
+            ) {
+                generated_tokens.truncate(loop_hit.keep_len);
+                generated_probabilities.truncate(loop_hit.keep_len);
+                *done = true;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn serve_batch_max_from_env(
@@ -499,6 +539,55 @@ pub(crate) fn with_serve_batch_env_lock<T>(run: impl FnOnce() -> T) -> T {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    fn one_hot_logits(vocab_size: usize, index: usize) -> Vec<f32> {
+        let mut logits = vec![-1000.0_f32; vocab_size];
+        logits[index] = 1000.0;
+        logits
+    }
+
+    #[test]
+    fn serve_batch_apply_step_trips_degenerate_loop_guard_like_single_path() {
+        // The batched serve path must trip the same degenerate n-gram guard as the
+        // single-utterance `run_seq2seq_greedy_decode_loop_v0`: argmax would emit
+        // token 5 forever (EOT id 7 never wins), so after the stutter reaches the
+        // degenerate threshold the slot keeps one occurrence and finishes, instead
+        // of spinning to the token cap (issue #60, server side).
+        let config = Seq2SeqGreedyDecodeConfig {
+            initial_prompt_tokens: vec![42],
+            eot_token_id: 7,
+            stop_token_ids: Vec::new(),
+            vocab_size: 16,
+            max_generated_tokens: 32,
+            suppress_first_step_token_ids: Vec::new(),
+            suppress_token_ids: Vec::new(),
+            phrase_biases: Vec::new(),
+        };
+        let stop_token_ids = [config.eot_token_id];
+        let mut generated_tokens = Vec::new();
+        let mut generated_probabilities = Vec::new();
+        let mut done = false;
+        let mut steps = 0usize;
+        while !done && steps < 10 {
+            serve_batch_select_and_apply_greedy_step(
+                &config,
+                &mut generated_tokens,
+                &mut generated_probabilities,
+                &mut done,
+                &stop_token_ids,
+                one_hot_logits(config.vocab_size, 5),
+            )
+            .expect("serve batch step selects");
+            steps += 1;
+        }
+
+        // Same outcome as the single-path guard test: truncated to one occurrence.
+        assert!(done, "guard must finish the slot");
+        assert_eq!(generated_tokens, vec![5]);
+        assert_eq!(generated_probabilities.len(), 1);
+        // Tripped at the 4th identical token (steps 0..=3), so no further steps.
+        assert_eq!(steps, 4);
+    }
 
     #[test]
     fn owner_alive_guard_marks_dead_on_panic() {
