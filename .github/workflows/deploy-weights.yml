@@ -1,0 +1,77 @@
+name: Deploy weights proxy
+
+# Deploys the Hugging Face resolve proxy (weights.openasr.org) to Cloudflare
+# when its code changes on main. This Worker is NOT a trust anchor (see
+# cloudflare/weights/README.md); its only integrity story is "open source +
+# publicly deployed by CI from a known commit", so this workflow injects
+# `github.sha` as the live BUILD_COMMIT and then checks GET /_version reports
+# it, so anyone can verify the deployed code matches this repository.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cloudflare/weights/**"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-weights
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Forks should never attempt to deploy to the maintainer's Cloudflare
+    # account (and would fail anyway without CLOUDFLARE_API_TOKEN).
+    if: github.repository == 'QuintinShaw/openasr'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        working-directory: cloudflare/weights
+        run: npm ci
+
+      - name: Run gating unit tests
+        working-directory: cloudflare/weights
+        run: npm test
+
+      - name: Deploy to Cloudflare
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          wranglerVersion: "4.108.0"
+          workingDirectory: cloudflare/weights
+          # Stamp the live BUILD_COMMIT var with the commit being deployed, so
+          # GET /_version proves which open-source revision is running.
+          command: deploy --var BUILD_COMMIT:${{ github.sha }}
+
+      - name: Verify live endpoint reports this commit
+        run: |
+          # The edge cache and asset propagation lag the deploy by up to ~a
+          # minute; retry with a cache-busting query (this Worker itself never
+          # caches, but retry anyway to absorb propagation delay) instead of
+          # failing on the first stale hit.
+          for attempt in $(seq 1 12); do
+            body="$(curl -fsSL "https://weights.openasr.org/_version?cb=${GITHUB_SHA}-${attempt}" || true)"
+            if echo "$body" | grep -q "\"build_commit\":\"${GITHUB_SHA}\""; then
+              echo "live weights.openasr.org reports build_commit=${GITHUB_SHA}"
+              exit 0
+            fi
+            echo "live /_version not yet updated (attempt $attempt): $body"
+            sleep 10
+          done
+          echo "::error::live weights.openasr.org never reported build_commit=${GITHUB_SHA}"
+          exit 1
+
+# First-time setup (maintainer-only, not automated here):
+#   1. Add repo secret CLOUDFLARE_API_TOKEN (Workers Scripts:Edit + a scope
+#      covering the `openasr.org` zone for the Custom Domain route), same
+#      account/token used by deploy-catalog.yml can be reused if scoped widely
+#      enough, or mint a narrower dedicated token.
+#   2. First deploy from a maintainer machine (`npx wrangler login && npx
+#      wrangler deploy` from cloudflare/weights/) to create the Worker and
+#      provision the weights.openasr.org Custom Domain route; after that this
+#      workflow keeps it updated.

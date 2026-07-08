@@ -1,0 +1,17 @@
+{
+  "name": "openasr-weights",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Cloudflare Worker that PROXIES huggingface.co resolve requests for OpenASR/* model weights, so clients that cannot reach the resolve hop directly still get redirected to the reachable CDN blob host. Not a trust anchor: clients verify sha256 + the signed catalog independently.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.5.0",
+    "vitest": "^2.1.0",
+    "wrangler": "^4.0.0"
+  }
+}
