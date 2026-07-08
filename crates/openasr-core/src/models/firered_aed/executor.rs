@@ -13,7 +13,6 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -31,7 +30,8 @@ use crate::models::incremental_streaming_driver::{
 };
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 use crate::models::thread_local_runtime_cache::{
-    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
+    with_thread_local_cached_mut_by_key,
 };
 
 use super::decoder_graph::firered_decoder_graph_config;
@@ -52,10 +52,10 @@ const CMVN_INV_STDDEV_TENSOR: &str = "frontend.cmvn.inv_stddev";
 const TOKENIZER_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 
 thread_local! {
-    static FIRERED_AED_ENCODER_RUNTIME_BY_KEY: RefCell<HashMap<FireRedAedEncoderRuntimeCacheKey, FireRedEncoderGraphRuntime>> =
-        RefCell::new(HashMap::new());
-    static FIRERED_AED_DECODER_RUNTIME_BY_KEY: RefCell<HashMap<FireRedAedDecoderRuntimeCacheKey, FireRedDecoderGraphRuntime>> =
-        RefCell::new(HashMap::new());
+    static FIRERED_AED_ENCODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<FireRedAedEncoderRuntimeCacheKey, FireRedEncoderGraphRuntime>> =
+        RefCell::new(BoundedRuntimeCache::new());
+    static FIRERED_AED_DECODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<FireRedAedDecoderRuntimeCacheKey, FireRedDecoderGraphRuntime>> =
+        RefCell::new(BoundedRuntimeCache::new());
 }
 
 type FireRedAedEncoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
@@ -79,6 +79,7 @@ fn encode_with_cached_runtime(
     with_thread_local_cached_mut_by_key(
         &FIRERED_AED_ENCODER_RUNTIME_BY_KEY,
         key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
         || FireRedEncoderGraphRuntime::new(runtime_path, metadata),
         |runtime| runtime.encode(cmvn_features, n_frames),
     )
@@ -102,6 +103,7 @@ fn decode_with_cached_runtime(
     with_thread_local_cached_mut_by_key(
         &FIRERED_AED_DECODER_RUNTIME_BY_KEY,
         key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
         || FireRedDecoderGraphRuntime::new(runtime_path, metadata, encoder_frame_count),
         |runtime| {
             run_firered_aed_decoder_greedy_with_runtime(

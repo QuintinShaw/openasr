@@ -5,7 +5,6 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::PhraseBiasConfig;
@@ -29,7 +28,8 @@ use crate::models::ggml_asr_executor::{
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT;
 use crate::models::thread_local_runtime_cache::{
-    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
+    with_thread_local_cached_mut_by_key,
 };
 use crate::{NativeAsrSession, WAV2VEC2_CTC_GGML_ADAPTER_ID};
 
@@ -45,8 +45,8 @@ use super::tokenizer::Wav2Vec2Tokenizer;
 type Wav2Vec2RuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
 
 thread_local! {
-    static WAV2VEC2_CTC_RUNTIME_BY_KEY: RefCell<HashMap<Wav2Vec2RuntimeCacheKey, Wav2Vec2CtcPreparedRuntime>> =
-        RefCell::new(HashMap::new());
+    static WAV2VEC2_CTC_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<Wav2Vec2RuntimeCacheKey, Wav2Vec2CtcPreparedRuntime>> =
+        RefCell::new(BoundedRuntimeCache::new());
 }
 
 /// Resolves the wav2vec2 block-stack `layer_count_hparam` against the parsed
@@ -128,6 +128,7 @@ fn transcribe_wav2vec2_ctc_pcm_cached(
     with_thread_local_cached_mut_by_key(
         &WAV2VEC2_CTC_RUNTIME_BY_KEY,
         key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
         || build_wav2vec2_prepared_runtime(pack_path),
         |runtime| runtime.transcribe(samples, phrase_bias, word_timestamps),
     )
@@ -143,6 +144,7 @@ fn decode_wav2vec2_ctc_pcm_cached(
     with_thread_local_cached_mut_by_key(
         &WAV2VEC2_CTC_RUNTIME_BY_KEY,
         key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
         || build_wav2vec2_prepared_runtime(pack_path),
         |runtime| runtime.decode_result(samples, phrase_bias),
     )

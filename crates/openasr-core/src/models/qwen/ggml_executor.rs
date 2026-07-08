@@ -55,7 +55,8 @@ use crate::models::seq2seq_greedy_decode::{
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::thread_local_runtime_cache::{
-    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
+    with_thread_local_cached_mut_by_key,
 };
 use crate::{
     GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
@@ -83,10 +84,15 @@ type WholeDecoderCacheKey = (PathBuf, GgmlCpuGraphBackend, String);
 type AudioEncoderCacheKey = (PathBuf, GgmlCpuGraphBackend);
 
 thread_local! {
+    // Kept as a plain `HashMap` (not the shared bounded LRU): keyed by
+    // (pack path, backend, adapter fingerprint), which does not explode
+    // per audio chunk the way a frame-count-keyed cache does -- one entry is
+    // built and reused across the whole longform run for a given pack, so
+    // there is no unbounded-growth hazard to bound here.
     static QWEN_WHOLE_DECODER_BY_KEY: RefCell<HashMap<WholeDecoderCacheKey, Qwen3AsrLlmWholeDecoderGraphExecutor>> =
         RefCell::new(HashMap::new());
-    static QWEN_AUDIO_ENCODER_BY_KEY: RefCell<HashMap<AudioEncoderCacheKey, Qwen3AsrAudioEncoderRuntime>> =
-        RefCell::new(HashMap::new());
+    static QWEN_AUDIO_ENCODER_BY_KEY: RefCell<BoundedRuntimeCache<AudioEncoderCacheKey, Qwen3AsrAudioEncoderRuntime>> =
+        RefCell::new(BoundedRuntimeCache::new());
 }
 
 fn take_cached_whole_decoder(
@@ -114,6 +120,7 @@ fn encode_qwen_audio_embeddings_cached(
     with_thread_local_cached_mut_by_key(
         &QWEN_AUDIO_ENCODER_BY_KEY,
         key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
         || Qwen3AsrAudioEncoderRuntime::new(Some(runtime_source_path)),
         |runtime| runtime.encode(audio_encoder_weights, metadata, mel_features),
     )
