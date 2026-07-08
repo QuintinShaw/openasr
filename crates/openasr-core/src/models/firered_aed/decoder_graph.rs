@@ -48,9 +48,12 @@ use super::decoder_weights::{FireRedDecoderWeights, FireRedDecoderWeightsError};
 use super::runtime_contract::FireRedAedExecutionMetadata;
 
 const FIRERED_DECODER_LAYER_NORM_EPSILON: f32 = 1.0e-5;
-const FIRERED_DECODER_GRAPH_CONTEXT_BYTES: usize = 512 * 1024 * 1024;
-const FIRERED_DECODER_CACHE_ARENA_BYTES: usize = 256 * 1024 * 1024;
 const FIRERED_DECODER_GRAPH_SIZE: usize = 8192;
+/// Static tensors created directly in the decoder's arena (not through
+/// `start_graph`): one shared zero-bias vector plus, per decoder layer, a
+/// cross-K/cross-V pair and a self-K/self-V pair.
+const FIRERED_DECODER_ARENA_TENSORS_PER_LAYER: usize = 4;
+const FIRERED_DECODER_ARENA_FIXED_TENSORS: usize = 1;
 
 #[derive(Debug, Error)]
 pub(crate) enum FireRedDecoderError {
@@ -76,12 +79,33 @@ fn map_err(step: &'static str, source: GgmlCpuGraphError) -> FireRedDecoderError
 
 pub(crate) fn firered_decoder_graph_config() -> GgmlCpuGraphConfig {
     GgmlCpuGraphConfig {
-        context_bytes: FIRERED_DECODER_GRAPH_CONTEXT_BYTES,
+        // `no_alloc` metadata context: only needs `ggml_tensor_overhead()` per
+        // graph node plus the cgraph object itself (see
+        // `GgmlCpuGraphConfig::metadata_context_bytes`), NOT the real tensor
+        // byte sizes -- those live in a separately-sized backend buffer.
+        // Previously hardcoded to 512 MiB, which is what let a single cached
+        // per-encoder-frame-count decoder runtime (see the thread-local cache
+        // in `executor.rs`) balloon far past what the graph actually needs.
+        context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(FIRERED_DECODER_GRAPH_SIZE),
         graph_size: FIRERED_DECODER_GRAPH_SIZE,
         n_threads: None,
         backend: GgmlCpuGraphBackend::Cpu,
         use_scheduler: false,
     }
+}
+
+/// Byte capacity for the decoder's static-tensor arena context. Like the
+/// graph context above, this is a `no_alloc` metadata pool: `start_static_tensor_arena`
+/// only needs room for the `ggml_tensor` struct + name of each tensor created
+/// in it (one shared zero-bias vector, plus a cross-K/V and self-K/V pair per
+/// decoder layer); the real cross-KV/self-KV bytes are allocated afterwards
+/// into their own backend buffer sized from the tensors' actual shapes
+/// (`ggml_backend_alloc_ctx_tensors`), independent of this context's size.
+/// Previously hardcoded to a flat 256 MiB regardless of layer count.
+fn firered_decoder_arena_context_bytes(decoder_n_layers: usize) -> usize {
+    let tensor_count = FIRERED_DECODER_ARENA_FIXED_TENSORS
+        .saturating_add(FIRERED_DECODER_ARENA_TENSORS_PER_LAYER.saturating_mul(decoder_n_layers));
+    GgmlCpuGraphConfig::metadata_context_bytes(tensor_count)
 }
 
 #[derive(Clone, Copy)]
@@ -134,7 +158,9 @@ impl FireRedDecoderGraphRuntime {
         let weights = FireRedDecoderWeights::load(&loaded, metadata.decoder_n_layers)?;
 
         let arena = runner
-            .start_static_tensor_arena(FIRERED_DECODER_CACHE_ARENA_BYTES)
+            .start_static_tensor_arena(firered_decoder_arena_context_bytes(
+                metadata.decoder_n_layers,
+            ))
             .map_err(|source| map_err("static_tensor_arena", source))?;
         let zero_bias = arena
             .new_tensor_1d_f32(metadata.d_model, "firered_dec_zero_bias")

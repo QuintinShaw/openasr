@@ -16,7 +16,6 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::PhraseBiasConfig;
@@ -38,7 +37,8 @@ use crate::models::ggml_asr_executor::{
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT;
 use crate::models::thread_local_runtime_cache::{
-    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
+    with_thread_local_cached_mut_by_key,
 };
 use crate::{NativeAsrSession, SENSEVOICE_GGML_ADAPTER_ID};
 
@@ -53,8 +53,8 @@ use super::{SenseVoiceTagShadow, strip_sensevoice_tag_prefix};
 type SenseVoiceRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
 
 thread_local! {
-    static SENSEVOICE_RUNTIME_BY_KEY: RefCell<HashMap<SenseVoiceRuntimeCacheKey, SenseVoicePreparedRuntime>> =
-        RefCell::new(HashMap::new());
+    static SENSEVOICE_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<SenseVoiceRuntimeCacheKey, SenseVoicePreparedRuntime>> =
+        RefCell::new(BoundedRuntimeCache::new());
 }
 
 const SENSEVOICE_STREAMING_EXECUTOR_ID: &str = "sensevoice-ggml-snapshot-streaming-executor-v1";
@@ -262,6 +262,7 @@ fn decode_sensevoice_pcm_cached(
     with_thread_local_cached_mut_by_key(
         &SENSEVOICE_RUNTIME_BY_KEY,
         key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
         || build_sensevoice_prepared_runtime(pack_path),
         |runtime| runtime.decode_result(samples, language, phrase_bias),
     )
@@ -278,6 +279,7 @@ fn transcribe_sensevoice_pcm_cached(
     with_thread_local_cached_mut_by_key(
         &SENSEVOICE_RUNTIME_BY_KEY,
         key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
         || build_sensevoice_prepared_runtime(pack_path),
         |runtime| runtime.transcribe(samples, language, phrase_bias),
     )

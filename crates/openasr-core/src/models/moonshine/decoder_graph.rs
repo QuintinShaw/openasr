@@ -1,6 +1,5 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -9,9 +8,9 @@ use thiserror::Error;
 
 use crate::PhraseBiasConfig;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlStaticTensor,
-    GgmlStaticTensorArena,
+    GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
+    GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
@@ -23,7 +22,8 @@ use crate::models::seq2seq_greedy_decode::{
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::thread_local_runtime_cache::{
-    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
+    with_thread_local_cached_mut_by_key,
 };
 use crate::nn::decoder::{
     LlmResidentKvArena, Seq2SeqReusableDecodeGraph, allocate_zeroed_llm_resident_kv_arena,
@@ -42,7 +42,14 @@ use super::tokenizer::MoonshineTokenizer;
 use super::weights::{MoonshineDecoderLayerWeights, MoonshineDecoderWeights, MoonshineWeight};
 
 const MOONSHINE_LAYER_NORM_EPSILON: f32 = 1.0e-5;
-const MOONSHINE_DECODER_GRAPH_CONTEXT_BYTES: usize = 512 * 1024 * 1024;
+/// Floor for the decoder's `no_alloc` metadata context node/tensor budget:
+/// covers the per-step decode cgraph, the weight+cross-KV arena, and the
+/// resident self-KV arena (all metadata-only -- see
+/// `GgmlStaticTensorArena`/`allocate_zeroed_llm_resident_kv_arena`: real
+/// tensor bytes land in a backend buffer sized from actual shapes,
+/// independent of this context's size). Mirrors the encoder's proven
+/// `16_384` headroom (`moonshine_encoder_graph_config`).
+const MOONSHINE_DECODER_GRAPH_SIZE_FLOOR: usize = 16_384;
 
 /// (canonical pack path, backend, cross frame count, adapter fingerprint).
 /// The adapter fingerprint MUST stay in this key: the runtime owns prepared
@@ -51,8 +58,8 @@ const MOONSHINE_DECODER_GRAPH_CONTEXT_BYTES: usize = 512 * 1024 * 1024;
 type MoonshineDecoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend, usize, String);
 
 thread_local! {
-    static MOONSHINE_DECODER_RUNTIME_BY_KEY: RefCell<HashMap<MoonshineDecoderRuntimeCacheKey, MoonshineDecoderGraphRuntime>> =
-        RefCell::new(HashMap::new());
+    static MOONSHINE_DECODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<MoonshineDecoderRuntimeCacheKey, MoonshineDecoderGraphRuntime>> =
+        RefCell::new(BoundedRuntimeCache::new());
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +107,7 @@ pub(crate) fn run_moonshine_decoder_short_form(
         return with_thread_local_cached_mut_by_key(
             &MOONSHINE_DECODER_RUNTIME_BY_KEY,
             key,
+            DEFAULT_RUNTIME_CACHE_CAPACITY,
             || {
                 MoonshineDecoderGraphRuntime::new(
                     decoder_weights,
@@ -394,6 +402,12 @@ pub(crate) struct MoonshineDecoderGraphRuntime {
     #[allow(dead_code)]
     loaded_weights: Option<GgmlLoadedWeightContext>,
     runner: GgmlCpuGraphRunner,
+    /// The `no_alloc` metadata context size used for `runner`'s own graph
+    /// context and `arena`; reused for the resident self-KV arena
+    /// ([`Self::ensure_resident_self_kv_arena`]) and for
+    /// `start_persistent_graph_session` in
+    /// [`Self::build_reusable_decode_graph`] instead of a hardcoded constant.
+    persistent_graph_context_bytes: usize,
     arena: GgmlStaticTensorArena,
     embedding: GgmlStaticTensor,
     out_norm: GgmlStaticTensor,
@@ -454,7 +468,7 @@ impl MoonshineDecoderGraphRuntime {
         self.resident_kv = Some(
             allocate_zeroed_llm_resident_kv_arena(
                 &self.runner,
-                MOONSHINE_DECODER_GRAPH_CONTEXT_BYTES,
+                self.persistent_graph_context_bytes,
                 self.layers.len(),
                 self.metadata.head_dim,
                 self.metadata.decoder_max_context,
@@ -517,7 +531,14 @@ impl MoonshineDecoderGraphRuntime {
         }
 
         let mut config = moonshine_decoder_graph_config(prefer_cpu_backend);
-        config.context_bytes = MOONSHINE_DECODER_GRAPH_CONTEXT_BYTES;
+        config.graph_size = config.graph_size.max(MOONSHINE_DECODER_GRAPH_SIZE_FLOOR);
+        config.context_bytes =
+            config
+                .context_bytes
+                .max(GgmlCpuGraphConfig::metadata_context_bytes(
+                    config.graph_size,
+                ));
+        let persistent_graph_context_bytes = config.context_bytes;
         let runner = GgmlCpuGraphRunner::new(config).map_err(build_err("runner_init"))?;
         // Bind the per-layer 2-D linears (self/cross attn + ffn) zero-copy from the
         // mmap'd pack (native q8_0 [in,out]); the loader supplies them meta-only, so
@@ -661,6 +682,7 @@ impl MoonshineDecoderGraphRuntime {
             resident_kv: None,
             loaded_weights,
             runner,
+            persistent_graph_context_bytes,
             arena,
             embedding,
             out_norm,
@@ -1179,7 +1201,7 @@ impl MoonshineDecoderGraphRuntime {
 
         let mut session = self
             .runner
-            .start_persistent_graph_session(MOONSHINE_DECODER_GRAPH_CONTEXT_BYTES)
+            .start_persistent_graph_session(self.persistent_graph_context_bytes)
             .map_err(build_err("moonshine_reuse_session"))?;
         let graph = session.builder();
         let token_id = graph

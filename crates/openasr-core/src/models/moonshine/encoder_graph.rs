@@ -3,8 +3,8 @@ use thiserror::Error;
 use std::path::Path;
 
 use crate::ggml_runtime::{
-    GGML_TYPE_F16, GgmlCpuGraphBuilder, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlStaticTensor,
+    GGML_TYPE_F16, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
+    GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlStaticTensor,
     GgmlStaticTensorArena,
 };
 
@@ -16,7 +16,6 @@ use super::weights::{MoonshineEncoderLayerWeights, MoonshineEncoderWeights, Moon
 
 const MOONSHINE_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 const MOONSHINE_GROUP_NORM_EPSILON: f32 = 1.0e-5;
-const MOONSHINE_ENCODER_GRAPH_CONTEXT_BYTES: usize = 512 * 1024 * 1024;
 
 // Conv stem strides/kernels are architecture constants.
 const CONV1_KERNEL: usize = 127;
@@ -166,7 +165,17 @@ impl MoonshineEncoderGraphRuntime {
         adapter: Option<&MoonshineLoraAdapter>,
     ) -> Result<Self, MoonshineEncoderError> {
         let mut config = moonshine_encoder_graph_config();
-        config.context_bytes = MOONSHINE_ENCODER_GRAPH_CONTEXT_BYTES;
+        // `no_alloc` metadata context: covers both the encoder's own forward
+        // graph AND the arena's weight tensors (see `GgmlStaticTensorArena`
+        // -- real tensor bytes land in a separately sized backend buffer,
+        // independent of this context's size). Previously hardcoded to a
+        // flat 512 MiB regardless of `graph_size`.
+        config.context_bytes =
+            config
+                .context_bytes
+                .max(GgmlCpuGraphConfig::metadata_context_bytes(
+                    config.graph_size,
+                ));
         let runner = GgmlCpuGraphRunner::new(config).map_err(build_err("runner_init"))?;
         // Goals 7+8 memory lever: bind the per-layer 2-D linears zero-copy from the
         // mmap'd pack (native q8_0 [in,out]) instead of dequantizing them to

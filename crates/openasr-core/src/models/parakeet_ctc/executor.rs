@@ -7,7 +7,6 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::PARAKEET_CTC_DECODE_POLICY_ID;
@@ -31,7 +30,8 @@ use crate::models::ggml_asr_executor::{
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT;
 use crate::models::thread_local_runtime_cache::{
-    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
+    with_thread_local_cached_mut_by_key,
 };
 use crate::{NativeAsrSession, PARAKEET_CTC_GGML_ADAPTER_ID};
 
@@ -47,8 +47,8 @@ use super::tokenizer::ParakeetTokenizer;
 type ParakeetRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
 
 thread_local! {
-    static PARAKEET_CTC_RUNTIME_BY_KEY: RefCell<HashMap<ParakeetRuntimeCacheKey, ParakeetCtcPreparedRuntime>> =
-        RefCell::new(HashMap::new());
+    static PARAKEET_CTC_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<ParakeetRuntimeCacheKey, ParakeetCtcPreparedRuntime>> =
+        RefCell::new(BoundedRuntimeCache::new());
 }
 
 /// Resolves the parakeet block-stack `layer_count_hparam` against the parsed
@@ -132,6 +132,7 @@ fn transcribe_parakeet_ctc_pcm_cached(
     with_thread_local_cached_mut_by_key(
         &PARAKEET_CTC_RUNTIME_BY_KEY,
         key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
         || build_parakeet_prepared_runtime(pack_path),
         |runtime| runtime.transcribe(samples, phrase_bias, word_timestamps),
     )
@@ -147,6 +148,7 @@ fn decode_parakeet_ctc_pcm_cached(
     with_thread_local_cached_mut_by_key(
         &PARAKEET_CTC_RUNTIME_BY_KEY,
         key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
         || build_parakeet_prepared_runtime(pack_path),
         |runtime| runtime.decode_result(samples, phrase_bias),
     )

@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -35,15 +34,16 @@ use crate::models::incremental_streaming_driver::{
 };
 use crate::models::prepared_runtime_cache::PreparedRuntimeCache;
 use crate::models::thread_local_runtime_cache::{
-    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
+    with_thread_local_cached_mut_by_key,
 };
 
 const MOONSHINE_EXECUTOR_ID: &str = "moonshine-ggml-executor-v1";
 const MOONSHINE_STREAMING_EXECUTOR_ID: &str = "moonshine-ggml-snapshot-streaming-executor-v1";
 
 thread_local! {
-    static MOONSHINE_ENCODER_RUNTIME_BY_KEY: RefCell<HashMap<MoonshineEncoderRuntimeCacheKey, MoonshineEncoderGraphRuntime>> =
-        RefCell::new(HashMap::new());
+    static MOONSHINE_ENCODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<MoonshineEncoderRuntimeCacheKey, MoonshineEncoderGraphRuntime>> =
+        RefCell::new(BoundedRuntimeCache::new());
 }
 
 /// (canonical pack path, backend, adapter fingerprint). The adapter
@@ -244,6 +244,7 @@ fn encode_with_cached_runtime(
     with_thread_local_cached_mut_by_key(
         &MOONSHINE_ENCODER_RUNTIME_BY_KEY,
         key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
         || {
             MoonshineEncoderGraphRuntime::new(
                 &prepared_runtime.encoder_weights,
