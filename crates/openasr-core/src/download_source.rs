@@ -12,6 +12,15 @@ pub enum DownloadSource {
     Hf,
     #[serde(rename = "hf-mirror")]
     HfMirror,
+    /// The first-party `weights.openasr.org` Cloudflare Worker, which proxies the
+    /// `huggingface.co` `OpenASR/*` `/resolve/...` endpoint and transparently
+    /// passes through the 302 into Hugging Face's Xet CDN (`us.aws.cdn.hf.co`).
+    /// The start URL host is swapped to the worker; the Xet redirect is then
+    /// followed VERBATIM, exactly like the direct `Hf` source (see
+    /// [`super::pull::mirror_endpoint_for_current_url`]). Anonymous only -- the HF
+    /// bearer token is never sent to the worker.
+    #[serde(rename = "weights")]
+    Weights,
 }
 
 impl DownloadSource {
@@ -19,6 +28,7 @@ impl DownloadSource {
         match value.trim().to_ascii_lowercase().as_str() {
             "hf" | "huggingface" | "hugging-face" => Some(Self::Hf),
             "hf-mirror" | "hf_mirror" | "mirror" => Some(Self::HfMirror),
+            "weights" | "openasr" | "openasr-weights" => Some(Self::Weights),
             _ => None,
         }
     }
@@ -27,6 +37,7 @@ impl DownloadSource {
         match self {
             Self::Hf => "hf",
             Self::HfMirror => "hf-mirror",
+            Self::Weights => "weights",
         }
     }
 
@@ -34,6 +45,7 @@ impl DownloadSource {
         match self {
             Self::Hf => Some(pull.url.clone()),
             Self::HfMirror => Some(http::apply_default_hf_mirror(&pull.url)),
+            Self::Weights => Some(http::apply_weights_endpoint(&pull.url)),
         }
     }
 }
@@ -80,18 +92,38 @@ pub(crate) fn source_chain_from_env() -> Vec<DownloadSource> {
 }
 
 fn default_source_chain(hf_endpoint_set: bool, prefer_china: bool) -> Vec<DownloadSource> {
-    if hf_endpoint_set || prefer_china {
-        vec![DownloadSource::HfMirror, DownloadSource::Hf]
-    } else {
-        auto_source_chain(prefer_china)
+    if hf_endpoint_set {
+        // An explicit `HF_ENDPOINT` override points the mirror rewrite at a custom
+        // endpoint, so honor that mirror first; the first-party worker and the
+        // direct source stay as deeper fallbacks.
+        return vec![
+            DownloadSource::HfMirror,
+            DownloadSource::Weights,
+            DownloadSource::Hf,
+        ];
     }
+    auto_source_chain(prefer_china)
 }
 
 fn auto_source_chain(prefer_china: bool) -> Vec<DownloadSource> {
     if prefer_china {
-        vec![DownloadSource::HfMirror, DownloadSource::Hf]
+        // huggingface.co is walled from China networks (resolve times out), so lead
+        // with the first-party worker we control, keep hf-mirror.com as a deeper
+        // fallback (no longer a single point of failure), and try the direct source
+        // last.
+        vec![
+            DownloadSource::Weights,
+            DownloadSource::HfMirror,
+            DownloadSource::Hf,
+        ]
     } else {
-        vec![DownloadSource::Hf, DownloadSource::HfMirror]
+        // Overseas the direct source is reachable and carries zero worker load, so
+        // it leads; the worker and mirror are fallbacks.
+        vec![
+            DownloadSource::Hf,
+            DownloadSource::Weights,
+            DownloadSource::HfMirror,
+        ]
     }
 }
 
@@ -173,18 +205,66 @@ mod tests {
     }
 
     #[test]
-    fn default_auto_source_uses_hf_mirror_for_china_context() {
+    fn china_context_leads_with_weights_then_mirror_then_direct() {
+        // China: first-party worker primary, hf-mirror.com a deeper fallback (no
+        // longer the single point of failure), huggingface.co last.
         assert_eq!(
             default_source_chain(false, true),
-            vec![DownloadSource::HfMirror, DownloadSource::Hf]
+            vec![
+                DownloadSource::Weights,
+                DownloadSource::HfMirror,
+                DownloadSource::Hf,
+            ]
         );
     }
 
     #[test]
-    fn default_source_keeps_explicit_hf_endpoint_first_outside_china_context() {
+    fn overseas_context_leads_with_direct_then_weights_then_mirror() {
+        // Overseas: direct huggingface.co primary (zero worker load), worker and
+        // mirror as fallbacks.
+        assert_eq!(
+            default_source_chain(false, false),
+            vec![
+                DownloadSource::Hf,
+                DownloadSource::Weights,
+                DownloadSource::HfMirror,
+            ]
+        );
+    }
+
+    #[test]
+    fn default_source_keeps_explicit_hf_endpoint_first() {
+        // A pinned HF_ENDPOINT keeps the mirror first regardless of locale; the
+        // worker and direct source stay as deeper fallbacks.
         assert_eq!(
             default_source_chain(true, false),
-            vec![DownloadSource::HfMirror, DownloadSource::Hf]
+            vec![
+                DownloadSource::HfMirror,
+                DownloadSource::Weights,
+                DownloadSource::Hf,
+            ]
+        );
+        assert_eq!(
+            default_source_chain(true, true),
+            default_source_chain(true, false)
+        );
+    }
+
+    #[test]
+    fn auto_chain_is_region_aware_and_token_independent() {
+        // The Auto preference orders purely by region: China leads with the worker,
+        // overseas leads with the direct source. A present HF token never reorders
+        // the chain (it only scopes which requests carry Authorization, in pull.rs)
+        // -- overseas already leads with the direct source, and China stays on the
+        // anonymous worker because huggingface.co is walled regardless of token.
+        assert_eq!(
+            resolve_chain(&DownloadSourcePref::Auto),
+            auto_source_chain(locale_prefers_china_sources())
+        );
+        assert_eq!(auto_source_chain(false).first(), Some(&DownloadSource::Hf));
+        assert_eq!(
+            auto_source_chain(true).first(),
+            Some(&DownloadSource::Weights)
         );
     }
 
@@ -205,6 +285,15 @@ mod tests {
             DownloadSource::parse("hf-mirror"),
             Some(DownloadSource::HfMirror)
         );
+        assert_eq!(
+            DownloadSource::parse("weights"),
+            Some(DownloadSource::Weights)
+        );
+        assert_eq!(
+            DownloadSource::parse("openasr-weights"),
+            Some(DownloadSource::Weights)
+        );
+        assert_eq!(DownloadSource::Weights.as_env_value(), "weights");
         assert_eq!(DownloadSource::parse("modelscope"), None);
         assert_eq!(DownloadSourcePref::parse_env_value("ms"), None);
         assert_eq!(
@@ -221,6 +310,13 @@ mod tests {
         assert_eq!(
             DownloadSource::HfMirror.url_for(&pull),
             Some("https://hf-mirror.com/OpenASR/moonshine-tiny/resolve/0123456789abcdef0123456789abcdef01234567/moonshine-tiny-q8_0.oasr".to_string())
+        );
+        // The worker source swaps only the huggingface.co host onto
+        // weights.openasr.org; the signed /resolve/<rev>/<file> path is preserved
+        // verbatim so the Xet redirect (and sha256) stay intact.
+        assert_eq!(
+            DownloadSource::Weights.url_for(&pull),
+            Some("https://weights.openasr.org/OpenASR/moonshine-tiny/resolve/0123456789abcdef0123456789abcdef01234567/moonshine-tiny-q8_0.oasr".to_string())
         );
     }
 }

@@ -192,8 +192,8 @@ pub(crate) enum Command {
         /// Override the model catalog URL or local catalog path.
         #[arg(long)]
         catalog_url: Option<String>,
-        /// Download source: auto, hf, or hf-mirror.
-        #[arg(long, value_parser = ["auto", "hf", "hf-mirror"])]
+        /// Download source: auto, hf, hf-mirror, or weights.
+        #[arg(long, value_parser = ["auto", "hf", "hf-mirror", "weights"])]
         source: Option<String>,
         /// Acknowledge the model license when the catalog requires it.
         #[arg(long)]
