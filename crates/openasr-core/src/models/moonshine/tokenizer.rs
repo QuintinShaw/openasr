@@ -5,11 +5,11 @@ use crate::ggml_runtime::GgufMetadata;
 use crate::models::phrase_bias_decode::{
     PhraseBiasTokenEncoder, encode_sentencepiece_phrase_bias_tokens,
 };
+use crate::models::spm_decoder::{SpmDecoderConfig, decode_spm_pieces};
 
 const TOKENIZER_GGML_MODEL_KEY: &str = "tokenizer.ggml.model";
 const TOKENIZER_GGML_MODEL_VALUE_LLAMA: &str = "llama";
 const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
-const SENTENCEPIECE_WORD_START: &str = "\u{2581}";
 
 /// SentencePiece-style ▁/byte-fallback BPE tokenizer used by Moonshine.
 ///
@@ -66,19 +66,7 @@ impl MoonshineTokenizer {
         &self,
         token_ids: &[u32],
     ) -> Result<String, NativeAsrError> {
-        let mut output = String::new();
-        let mut pending_bytes = Vec::new();
-
-        let flush_pending_bytes = |output: &mut String, pending_bytes: &mut Vec<u8>| {
-            if pending_bytes.is_empty() {
-                return;
-            }
-            if let Ok(text) = String::from_utf8(pending_bytes.clone()) {
-                output.push_str(&text);
-            }
-            pending_bytes.clear();
-        };
-
+        let mut pieces = Vec::with_capacity(token_ids.len());
         for token_id in token_ids {
             let index = usize::try_from(*token_id).map_err(|_| NativeAsrError::SessionFailed {
                 message: format!("Moonshine tokenizer id {token_id} does not fit into usize"),
@@ -88,28 +76,13 @@ impl MoonshineTokenizer {
                     message: format!("Moonshine tokenizer id {token_id} is not in vocab"),
                 });
             };
-
-            if let Some(byte) = parse_sentencepiece_byte_fallback(token) {
-                pending_bytes.push(byte);
-                continue;
-            }
-
-            flush_pending_bytes(&mut output, &mut pending_bytes);
-            if token.starts_with('<') && token.ends_with('>') {
-                continue;
-            }
-            output.push_str(&token.replace(SENTENCEPIECE_WORD_START, " "));
+            pieces.push(token.as_str());
         }
-        flush_pending_bytes(&mut output, &mut pending_bytes);
-        Ok(output.strip_prefix(' ').unwrap_or(&output).to_string())
+        Ok(decode_spm_pieces(
+            pieces,
+            SpmDecoderConfig::BYTE_FALLBACK_BPE,
+        ))
     }
-}
-
-fn parse_sentencepiece_byte_fallback(token: &str) -> Option<u8> {
-    if !token.starts_with("<0x") || !token.ends_with('>') || token.len() != 6 {
-        return None;
-    }
-    u8::from_str_radix(&token[3..5], 16).ok()
 }
 
 fn required_metadata_string<'a>(

@@ -3,13 +3,15 @@
 //! The upstream tokenizer (`ChineseCharEnglishSpmTokenizer`) is a char + SPM
 //! hybrid: one Chinese char per token, English split into SentencePiece pieces
 //! carrying the `\u{2581}` word-boundary marker. Inference only needs the
-//! id -> text direction (`detokenize`): join token strings, replace the SPM
-//! space marker with a space, trim. The SentencePiece *encoder* model is a
-//! training-side asset and is deliberately not shipped in the pack.
+//! id -> text direction (`detokenize`): resolve ids to token strings and hand
+//! them to the shared [`crate::models::spm_decoder`], which drops bracketed
+//! structural tokens, replaces the SPM space marker with a space, and trims.
+//! The SentencePiece *encoder* model is a training-side asset and is
+//! deliberately not shipped in the pack.
 
 #![allow(dead_code)]
 
-const SPM_SPACE: char = '\u{2581}';
+use crate::models::spm_decoder::{SpmDecoderConfig, decode_spm_pieces};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FireRedTokenizerError {
@@ -57,29 +59,17 @@ impl FireRedTokenizer {
     /// entries for real Chinese/English content, so this cannot misfire on
     /// normal text.
     pub(crate) fn decode(&self, token_ids: &[u32]) -> Result<String, FireRedTokenizerError> {
-        let mut joined = String::new();
+        let mut pieces = Vec::with_capacity(token_ids.len());
         for &id in token_ids {
-            let content = self.token_content(id)?;
-            if is_structural_token(content) {
-                continue;
-            }
-            joined.push_str(content);
+            pieces.push(self.token_content(id)?);
         }
-        let replaced: String = joined
-            .chars()
-            .map(|c| if c == SPM_SPACE { ' ' } else { c })
-            .collect();
-        Ok(replaced.trim().to_string())
+        // `dict.txt` structural entries (`<sos>`, `<eos>`, `<blank>`, `<unk>`,
+        // `<pad>`, `<sil>`, ...) are dropped by `SpmDecoderConfig`'s
+        // bracketed-token policy. The literal `<space>` entry is remapped to a
+        // plain `" "` by `read_dict_txt` before it ever reaches the
+        // tokenizer, so it never hits that check.
+        Ok(decode_spm_pieces(pieces, SpmDecoderConfig::CHAR_SPM_HYBRID))
     }
-}
-
-/// A `dict.txt` entry is structural (not real transcript text) iff it is
-/// wrapped in angle brackets, e.g. `<sos>`, `<eos>`, `<blank>`, `<unk>`,
-/// `<pad>`, `<sil>`. The literal `<space>` entry is remapped to a plain `" "`
-/// by `read_dict_txt` before it ever reaches the tokenizer, so it never hits
-/// this check.
-fn is_structural_token(content: &str) -> bool {
-    content.len() >= 2 && content.starts_with('<') && content.ends_with('>')
 }
 
 #[cfg(test)]

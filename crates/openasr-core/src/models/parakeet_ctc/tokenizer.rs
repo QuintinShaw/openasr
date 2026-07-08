@@ -11,9 +11,9 @@ use crate::models::phrase_bias_decode::{
     PhraseBiasTokenEncoder, encode_sentencepiece_phrase_bias_tokens,
 };
 use crate::models::sentencepiece_word_timestamps::{
-    TimedSentencePieceToken, WORD_START_MARKER, assemble_sentencepiece_word_timestamps,
-    frame_to_seconds,
+    TimedSentencePieceToken, assemble_sentencepiece_word_timestamps, frame_to_seconds,
 };
+use crate::models::spm_decoder::{SpmDecoderConfig, decode_spm_pieces};
 
 pub(crate) struct ParakeetTokenizer {
     tokens: Vec<String>,
@@ -39,14 +39,14 @@ impl ParakeetTokenizer {
     /// SentencePiece detokenize: concatenate token pieces, turn the `▁` word
     /// marker into a space, and trim. (The CTC ids are already blank-collapsed.)
     pub(crate) fn decode(&self, ids: &[u32]) -> Result<String, String> {
-        let mut out = String::new();
+        let mut pieces = Vec::with_capacity(ids.len());
         for &id in ids {
             let token = self.tokens.get(id as usize).ok_or_else(|| {
                 format!("token id {id} out of range (vocab {})", self.tokens.len())
             })?;
-            out.push_str(token);
+            pieces.push(token.as_str());
         }
-        Ok(out.replace(WORD_START_MARKER, " ").trim().to_string())
+        Ok(decode_spm_pieces(pieces, SpmDecoderConfig::PLAIN_UNIGRAM))
     }
 
     pub(crate) fn word_timestamps_from_token_spans(
