@@ -618,6 +618,15 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
     {
         return result.map_err(|error| format!("translation pack validation failed: {error}"));
     }
+    // Punctuation packs (FireRedPunc) are a text-in/labels-out post-processor,
+    // not an ASR runtime adapter; their contract is "the punctuation metadata
+    // geometry validates" -- checked here so `openasr pull` stays fail-closed
+    // for them too.
+    if let Some(result) =
+        crate::models::firered_punc::validate_punctuation_runtime_pack_contract(path, &metadata)
+    {
+        return result.map_err(|error| format!("punctuation pack validation failed: {error}"));
+    }
     let selection_metadata = selection_metadata_from_gguf(&metadata);
     let registry = GgmlFamilyRegistry::with_builtin_adapters();
     let descriptor = registry

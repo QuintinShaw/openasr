@@ -9,6 +9,7 @@ pub(crate) mod diarize_pack_import;
 pub(crate) mod dolphin;
 pub(crate) mod executor_component_registry;
 pub(crate) mod firered_aed;
+pub(crate) mod firered_punc;
 pub(crate) mod frame_sync_streaming_driver;
 pub(crate) mod frontend_component_registry;
 pub mod ggml_asr_executor;
