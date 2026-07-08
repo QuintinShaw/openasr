@@ -412,7 +412,13 @@ impl TranscriptionRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+// Serde shape is byte-for-byte the API's `JsonSegment`/`JsonWord` (see
+// `format/json.rs`): same field order, same `skip_serializing_if`. This is what
+// lets daemon history persist `segments_json` and hand it back to the desktop
+// export UI without a second, drifting segment schema. `#[serde(default)]` on
+// every skippable field makes the round-trip robust when those fields were
+// omitted on write.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WordTimestamp {
     pub word: String,
     pub start: f32,
@@ -420,17 +426,22 @@ pub struct WordTimestamp {
     /// Mean softmax probability of the decoded tokens forming this word
     /// (`0..=1`), when the family's decoder exposes per-token scores; `None`
     /// otherwise — never invented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Segment {
     pub start: f32,
     pub end: f32,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub words: Vec<WordTimestamp>,
 }
 

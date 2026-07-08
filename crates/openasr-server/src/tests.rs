@@ -1081,7 +1081,7 @@ fn history_retention_last5_prunes_store() {
                 output_format: Some(ResponseFormat::Text),
                 diarization_active: Some(false),
                 provenance: Some(DaemonHistoryProvenance::Recorded),
-                formats: vec!["text".to_string()],
+                segments: Vec::new(),
                 text: format!("transcript {index}"),
             })
             .unwrap();
@@ -1120,7 +1120,7 @@ fn history_retention_off_prunes_store_empty() {
                 output_format: Some(ResponseFormat::Text),
                 diarization_active: Some(false),
                 provenance: Some(DaemonHistoryProvenance::Recorded),
-                formats: vec!["text".to_string()],
+                segments: Vec::new(),
                 text: format!("transcript {index}"),
             })
             .unwrap();
@@ -1144,7 +1144,7 @@ fn history_retention_off_prunes_store_empty() {
             output_format: Some(ResponseFormat::Text),
             diarization_active: Some(false),
             provenance: Some(DaemonHistoryProvenance::Recorded),
-            formats: vec!["text".to_string()],
+            segments: Vec::new(),
             text: "keep me".to_string(),
         })
         .unwrap();
