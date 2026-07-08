@@ -56,7 +56,7 @@ jobs:
           # failing on the first stale hit.
           for attempt in $(seq 1 12); do
             body="$(curl -fsSL "https://weights.openasr.org/_version?cb=${GITHUB_SHA}-${attempt}" || true)"
-            if echo "$body" | grep -q "\"build_commit\":\"${GITHUB_SHA}\""; then
+            if [ "$(printf '%s' "$body" | jq -r '.build_commit // empty' 2>/dev/null)" = "${GITHUB_SHA}" ]; then
               echo "live weights.openasr.org reports build_commit=${GITHUB_SHA}"
               exit 0
             fi
