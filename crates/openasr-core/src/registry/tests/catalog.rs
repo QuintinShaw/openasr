@@ -1055,6 +1055,40 @@ fn embedded_catalog_emits_punctuation_matches_family() {
         "dolphin's training corpus is unpunctuated; it never predicts punctuation tokens"
     );
 
+    // Cross-check the catalog's Python-authored values against the Rust arch
+    // descriptor's single declaration of this fact
+    // (`arch::OpenAsrArchitectureDescriptor::emits_punctuation`, via
+    // `emits_punctuation_for_model_architecture`) so `_catalog.py`'s
+    // `PUNCTUATION_BY_FAMILY` cannot silently drift from the compiled-in
+    // engine fact for any family both sides know about.
+    for (id, model_architecture) in [
+        ("qwen3-asr-1.7b", crate::QWEN3_ASR_GGML_ARCHITECTURE_ID),
+        (
+            "xasr-zh-en",
+            crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+        ),
+        (
+            "cohere-transcribe-03-2026",
+            crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+        ),
+        ("moonshine-tiny", crate::MOONSHINE_GGML_ARCHITECTURE_ID),
+        (
+            "sensevoice-small",
+            crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID,
+        ),
+        ("whisper-base", crate::WHISPER_GGML_ARCHITECTURE_ID),
+        (
+            "dolphin-cn-dialect-small",
+            crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID,
+        ),
+    ] {
+        assert_eq!(
+            find(id).emits_punctuation,
+            crate::arch::emits_punctuation_for_model_architecture(model_architecture),
+            "'{id}' catalog emits_punctuation must match the arch descriptor's declared value"
+        );
+    }
+
     // hymt2 (translation-model) and the diarization capability packs have no
     // ASR transcript-punctuation axis, so the field is omitted rather than guessed.
     for id in [

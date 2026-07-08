@@ -70,6 +70,14 @@ pub struct GgmlFamilyAdapterDescriptor {
     pub decode_policy_id: &'static str,
     pub execution_capability: GgmlExecutionCapability,
     pub language_family_hint: LanguageFamilyHint,
+    /// Whether this family's own decode loop produces the diarization tokens
+    /// (e.g. the cohere token-stream's `<|diarize|>`/`<|spltoken0|>`), the
+    /// single declaration of this architecture-level fact. Mirrored from
+    /// `arch::OpenAsrArchitectureDescriptor::self_diarizes`; a pack still has
+    /// to carry the actual runtime metadata for this to activate (see
+    /// `native_runtime_metadata_supports_diarization`), so this flag alone is
+    /// "capable of", not "this exact pack does".
+    pub self_diarizes: bool,
 }
 
 impl GgmlFamilyAdapterDescriptor {

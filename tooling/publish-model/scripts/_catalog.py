@@ -374,6 +374,21 @@ def language_mode_for_model(entry: dict, languages: list[str]) -> dict:
 # disclose this in the model card and market UI rather than leave it
 # unexplained. Every other current asr-model family's training data/tokenizer
 # supports punctuation and its transcripts include it.
+#
+# Conceptual single source of truth: the Rust engine's own declaration of this
+# fact is `OpenAsrArchitectureDescriptor::emits_punctuation` in
+# crates/openasr-core/src/arch/mod.rs (one field per builtin architecture,
+# looked up via `emits_punctuation_for_model_architecture`). There is no
+# Rust<->Python codegen bridge yet -- and this dict is keyed by the catalog's
+# `family` string (e.g. "qwen", "cohere"), a different vocabulary from the
+# engine's `model_family`/`model_architecture` constants (e.g. "qwen3-asr",
+# "cohere-transcribe-conformer-transformer") -- so this table is hand-kept in
+# lockstep with the Rust descriptor rather than generated from it. Rust's
+# `registry/tests/catalog.rs::embedded_catalog_emits_punctuation_matches_family`
+# cross-checks the shipped catalog's values against the descriptor for every
+# family it can map, so a hand-edit here that drifts from the engine fact
+# fails that test. Keep any change to a family's punctuation behavior
+# synchronized on both sides.
 PUNCTUATION_BY_FAMILY = {
     "qwen": True,
     # parakeet-tdt: trained on transcripts that preserve punctuation and

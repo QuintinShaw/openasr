@@ -182,6 +182,31 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     pub executor_component_id: &'static str,
     pub execution_capability: GgmlExecutionCapability,
     pub prefer_cpu_decoder_for_multichunk_metal: bool,
+    /// Whether this family's own decode loop can emit diarization tokens (the
+    /// cohere token-stream is the only builtin case today). The single
+    /// declaration of this architecture-level capability fact -- runtime
+    /// dispatch reads it via `GgmlFamilyAdapterDescriptor::self_diarizes`
+    /// rather than matching on `adapter_id` (see
+    /// `native_runtime_metadata_supports_diarization`, which still verifies
+    /// the specific pack actually carries the tokens before trusting this).
+    pub self_diarizes: bool,
+    /// Whether this family's transcripts include punctuation -- an
+    /// architecture/training-corpus property, not a per-release editorial
+    /// choice (e.g. Dolphin's training corpus has no punctuation to learn
+    /// from, so it is honestly `Some(false)`). `None` means "no fixed
+    /// per-family answer" (e.g. a CTC/character family whose vocab depends on
+    /// the specific imported checkpoint, not the architecture).
+    ///
+    /// This is the single Rust-side declaration of the fact; catalog
+    /// authoring (`tooling/publish-model/scripts/_catalog.py`'s
+    /// `PUNCTUATION_BY_FAMILY`) is hand-kept in lockstep with it (no
+    /// Rust<->Python codegen bridge exists yet) and
+    /// `registry/tests/catalog.rs`'s `embedded_catalog_emits_punctuation_matches_family`
+    /// cross-checks the shipped catalog against
+    /// [`emits_punctuation_for_model_architecture`] so the two cannot drift
+    /// silently. `registry::CatalogModel::emits_punctuation` is a read-only
+    /// wire mirror of the catalog value, not an independent declaration.
+    pub emits_punctuation: Option<bool>,
     /// Canonical required GGUF/`.oasr` hparam keys for this architecture.
     /// Authoritative source of truth for the hparam schema; the per-arch
     /// runtime contract resolves aliases and optional consistency keys on top.
@@ -210,8 +235,25 @@ impl OpenAsrArchitectureDescriptor {
             tokenizer_id: self.tokenizer_id,
             decode_policy_id: self.decode_policy_id,
             execution_capability: self.execution_capability,
+            self_diarizes: self.self_diarizes,
         }
     }
+}
+
+/// Whether a builtin family's decoder ever predicts a punctuation token (see
+/// [`OpenAsrArchitectureDescriptor::emits_punctuation`]), looked up by GGUF
+/// `model_architecture`. The single Rust-side accessor for this fact --
+/// mirrors `executor_component_registry::builtin_executor_supports_phrase_bias_for_model_architecture`'s
+/// per-architecture lookup shape. Only test-consumed today (same pending-wiring
+/// status as `punctuation::should_apply_punctuation`, which this is meant to
+/// feed once the restoration stage is wired into a transcription path), hence
+/// the explicit allow rather than `#[cfg(test)]` -- this is the intended
+/// production accessor, not test-only scaffolding.
+#[allow(dead_code)]
+pub(crate) fn emits_punctuation_for_model_architecture(model_architecture: &str) -> Option<bool> {
+    OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(model_architecture)
+        .and_then(|descriptor| descriptor.emits_punctuation)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -777,6 +819,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: true,
+        self_diarizes: true,
+        emits_punctuation: Some(true),
         hparam_schema: COHERE_TRANSCRIBE_HPARAM_SCHEMA,
         block_stack: Some(OpenAsrBlockStackDescriptor {
             orchestration_shape: OpenAsrOrchestrationShape::Seq2SeqEncoderDecoder,
@@ -805,6 +849,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: WHISPER_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        self_diarizes: false,
+        emits_punctuation: Some(true),
         hparam_schema: WHISPER_HPARAM_SCHEMA,
         // whisper remains the hand-written bit-level regression gate and is
         // never composed — no block-stack data until P9 sinks its optimizations
@@ -831,6 +877,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: QWEN3_ASR_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::NativeGraphLoweringV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        self_diarizes: false,
+        emits_punctuation: Some(true),
         hparam_schema: QWEN3_ASR_HPARAM_SCHEMA,
         block_stack: Some(OpenAsrBlockStackDescriptor {
             orchestration_shape: OpenAsrOrchestrationShape::LlmDecoder,
@@ -859,6 +907,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: PARAKEET_CTC_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        self_diarizes: false,
+        // Character/BPE CTC: whether an imported checkpoint's vocab includes
+        // punctuation depends on that specific checkpoint's training corpus,
+        // not the architecture, so this cannot be stated as a fixed
+        // per-family fact (mirrors `_catalog.py`'s `PUNCTUATION_BY_FAMILY`
+        // module docstring, which deliberately omits parakeet/wav2vec2).
+        emits_punctuation: None,
         hparam_schema: PARAKEET_CTC_HPARAM_SCHEMA,
         // Non-autoregressive CTC: encoder + CTC head only, no decoder stage.
         block_stack: Some(OpenAsrBlockStackDescriptor {
@@ -892,6 +947,11 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: PARAKEET_TDT_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        self_diarizes: false,
+        // Verified on the imported pack: trained on transcripts that preserve
+        // punctuation and capitalization (mirrors `_catalog.py`'s
+        // `PUNCTUATION_BY_FAMILY["parakeet-tdt"]`).
+        emits_punctuation: Some(true),
         hparam_schema: PARAKEET_TDT_HPARAM_SCHEMA,
         // The FastConformer encoder reuses the composer conformer block, but
         // the TDT decode loop (LSTM prediction network + duration-driven
@@ -913,6 +973,9 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        self_diarizes: false,
+        // Character CTC: same BYO-checkpoint reasoning as parakeet-ctc above.
+        emits_punctuation: None,
         hparam_schema: WAV2VEC2_CTC_HPARAM_SCHEMA,
         // Non-autoregressive CTC: raw-waveform conv extractor + post-norm
         // transformer encoder + CTC head, no decoder stage.
@@ -941,6 +1004,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        self_diarizes: false,
+        emits_punctuation: Some(true),
         hparam_schema: XASR_ZIPFORMER_HPARAM_SCHEMA,
         // Zipformer2 uses multi-scale streaming cache topology plus RNN-T
         // decoder/joiner, so it stays on its dedicated executor rather than the
@@ -960,6 +1025,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: MOONSHINE_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        self_diarizes: false,
+        emits_punctuation: Some(true),
         hparam_schema: MOONSHINE_HPARAM_SCHEMA,
         // Raw-waveform conv-stem + partial-RoPE seq2seq with a self-contained
         // dedicated executor (not the data-driven block-stack composer — its
@@ -984,6 +1051,11 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: DOLPHIN_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        self_diarizes: false,
+        // DataoceanAI's cn-dialect-small training corpus is transcribed
+        // without punctuation and the model has no punctuation-prediction
+        // head/token to enable -- honestly unpunctuated, not "unknown".
+        emits_punctuation: Some(false),
         hparam_schema: DOLPHIN_HPARAM_SCHEMA,
         // E-Branchformer encoder + Transformer decoder + CTC head stay on the
         // dedicated executor (the E-Branchformer block is not a composer block
@@ -1005,6 +1077,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: SENSEVOICE_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        self_diarizes: false,
+        emits_punctuation: Some(true),
         hparam_schema: SENSEVOICE_HPARAM_SCHEMA,
         // Non-autoregressive CTC: SAN-M/FSMN encoder + CTC head, no decoder
         // stage. The `tp.blk` stage rides the same dedicated executor; the
@@ -1036,6 +1110,11 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: FIRERED_AED_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        self_diarizes: false,
+        // The reference tokenizer's dict.txt has no punctuation/<space>
+        // entries (char + SPM vocab trained on unpunctuated Mandarin ASR
+        // corpora); verified on the golden-diff fixture transcript.
+        emits_punctuation: Some(false),
         hparam_schema: FIRERED_AED_HPARAM_SCHEMA,
         // Conformer encoder + Transformer decoder attention-only decode stays
         // on the dedicated executor (the Conformer block is not a composer
@@ -1053,6 +1132,59 @@ mod tests {
         OpenAsrArchitectureRegistry::with_builtins()
             .validate_references()
             .expect("builtins must reference known components");
+    }
+
+    /// Pins `self_diarizes` and `emits_punctuation` per builtin architecture --
+    /// the single Rust-side declaration of both capability-single-source facts
+    /// this test protects against silent drift. Cohere-transcribe is the only
+    /// builtin family that self-diarizes; `emits_punctuation` values mirror
+    /// `tooling/publish-model/scripts/_catalog.py`'s `PUNCTUATION_BY_FAMILY`
+    /// (`registry/tests/catalog.rs`'s `embedded_catalog_emits_punctuation_matches_family`
+    /// cross-checks the shipped catalog against
+    /// [`emits_punctuation_for_model_architecture`] so the two stay in lockstep).
+    #[test]
+    fn builtin_architectures_declare_self_diarizes_and_emits_punctuation() {
+        let expected: &[(&str, bool, Option<bool>)] = &[
+            (COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, true, Some(true)),
+            (WHISPER_GGML_ARCHITECTURE_ID, false, Some(true)),
+            (QWEN3_ASR_GGML_ARCHITECTURE_ID, false, Some(true)),
+            (PARAKEET_CTC_GGML_ARCHITECTURE_ID, false, None),
+            (PARAKEET_TDT_GGML_ARCHITECTURE_ID, false, Some(true)),
+            (WAV2VEC2_CTC_GGML_ARCHITECTURE_ID, false, None),
+            (XASR_ZIPFORMER_GGML_ARCHITECTURE_ID, false, Some(true)),
+            (MOONSHINE_GGML_ARCHITECTURE_ID, false, Some(true)),
+            (DOLPHIN_GGML_ARCHITECTURE_ID, false, Some(false)),
+            (SENSEVOICE_GGML_ARCHITECTURE_ID, false, Some(true)),
+            (FIRERED_AED_GGML_ARCHITECTURE_ID, false, Some(false)),
+        ];
+        let registry = OpenAsrArchitectureRegistry::with_builtins();
+        let mut seen = std::collections::BTreeSet::new();
+
+        for (model_architecture, self_diarizes, emits_punctuation) in expected.iter().copied() {
+            let descriptor = registry
+                .find_by_model_architecture(model_architecture)
+                .unwrap_or_else(|| panic!("missing builtin architecture '{model_architecture}'"));
+            assert_eq!(
+                descriptor.self_diarizes, self_diarizes,
+                "'{model_architecture}' self_diarizes mismatch"
+            );
+            assert_eq!(
+                descriptor.emits_punctuation, emits_punctuation,
+                "'{model_architecture}' emits_punctuation mismatch"
+            );
+            assert_eq!(
+                emits_punctuation_for_model_architecture(model_architecture),
+                emits_punctuation,
+                "'{model_architecture}' accessor must match the descriptor field"
+            );
+            seen.insert(model_architecture);
+        }
+
+        assert_eq!(
+            seen.len(),
+            registry.descriptors().len(),
+            "expectation table must cover every builtin architecture, no more, no less"
+        );
     }
 
     #[test]

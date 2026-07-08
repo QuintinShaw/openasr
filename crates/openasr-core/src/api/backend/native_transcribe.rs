@@ -524,7 +524,7 @@ fn run_native_transcription_impl(
     // model-agnostic neural VAD + active speaker-embedder pack is available.
     let model_self_diarizes = super::native_runtime_metadata_supports_diarization(
         &runtime_preflight.metadata,
-        selected_family.adapter_id,
+        selected_family.self_diarizes,
     );
     let vad_diarization = request.diarize && !model_self_diarizes;
     if vad_diarization
