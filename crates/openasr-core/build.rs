@@ -31,6 +31,10 @@ fn main() {
     // The android triple (e.g. aarch64-linux-android) also contains "linux", so
     // it must be detected explicitly and BEFORE any `contains("linux")` check.
     let is_android = target.contains("android");
+    // musl triples (e.g. x86_64-unknown-linux-musl) also contain "linux" and must
+    // be detected explicitly before any `contains("linux")` check; see the
+    // is_musl link-lib arm below for why they need a different C++ runtime.
+    let is_musl = target.contains("musl");
     // iOS device or simulator target (aarch64-apple-ios /
     // aarch64-apple-ios-sim). Deliberately distinct from `is_macos` (which only
     // matches "apple-darwin"): iOS builds have no bundled libomp (same as
@@ -95,6 +99,9 @@ fn main() {
     //  - android: bionic ships no `libgomp` and lacks `pthread_setaffinity` (the
     //    NDK's OpenMP is opt-in `libomp`, not the GOMP runtime ggml-cpu links); CPU
     //    threading on android comes from ggml's own thread pool instead.
+    //  - musl: built with zig cc/c++ (clang), which does not bundle libomp for
+    //    musl targets, so `-fopenmp` would fail to link the same way it does on
+    //    android; CPU threading falls back to ggml's own thread pool there too.
     // We neutralize OpenMP for those rather than forcing the whole feature
     // opt-in. `OPENASR_GGML_OPENMP=0` force-disables everywhere.
     let openmp_requested = feat_openmp
@@ -102,7 +109,8 @@ fn main() {
             env::var("OPENASR_GGML_OPENMP").ok().as_deref(),
             Some("0" | "off" | "OFF" | "false" | "FALSE")
         );
-    let openmp_unsupported_target = is_macos || is_ios || is_android || (feat_hip && is_windows);
+    let openmp_unsupported_target =
+        is_macos || is_ios || is_android || is_musl || (feat_hip && is_windows);
     let effective_openmp = openmp_requested && !openmp_unsupported_target;
     if openmp_requested && !effective_openmp && feat_hip && is_windows {
         println!(
@@ -413,6 +421,33 @@ fn main() {
             }
         }
     }
+    if is_musl {
+        // Every musl leg is a cross build (there is no musl GitHub-hosted host
+        // runner): without an explicit toolchain file cmake configures for the
+        // HOST compiler/arch, silently producing host-arch objects that rustc's
+        // linker skips as format-incompatible -- which surfaces downstream as a
+        // confusing wall of "undefined symbol: ggml_*" at the final binary link,
+        // not a clear cross-compile error here.
+        //
+        // `cargo zigbuild` (the required build entry point for musl targets; see
+        // CI) sets `CMAKE_TOOLCHAIN_FILE_<target>` to a toolchain file it
+        // generates, pinning CC/CXX/AR/RANLIB to its zig cc/zig c++ wrappers plus
+        // the CMAKE_FIND_ROOT_PATH_MODE_* settings cross-compiling CMake needs;
+        // prefer that. Fall back to a minimal, self-authored toolchain file built
+        // from CC_<target>/CXX_<target> (or plain CC/CXX) so a build that
+        // exports those manually (without `cargo zigbuild`) still cross-compiles
+        // correctly instead of silently falling back to the host toolchain.
+        let env_target = target.replace('-', "_");
+        let toolchain_file = env::var(format!("CMAKE_TOOLCHAIN_FILE_{env_target}"))
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| write_musl_cmake_toolchain_file(&target, &out_dir));
+        configure.arg(format!(
+            "-DCMAKE_TOOLCHAIN_FILE={}",
+            cmake_path(&toolchain_file)
+        ));
+    }
     if feat_hip {
         configure.arg("-DCMAKE_HIP_PLATFORM=amd");
         if let Some(path) = hip_path.as_deref() {
@@ -671,6 +706,30 @@ fn main() {
         // so link the shared libc++ runtime and emit no gomp. This MUST be checked
         // before the `linux` arm because aarch64-linux-android also contains "linux".
         println!("cargo:rustc-link-lib=dylib=c++_shared");
+    } else if is_musl {
+        // musl targets are built with zig cc/c++ (clang), not GCC, and crt-static
+        // defaults ON: there is no dynamic libstdc++/libgomp to link against in a
+        // musl sysroot, and a portable static musl binary must not require them at
+        // runtime anyway. Statically link LLVM's libc++ (the runtime clang/zig
+        // pairs ggml's C++ objects with) instead of GNU libstdc++. No gomp: clang
+        // silently ignores `#pragma omp` without `-fopenmp` (unlike GCC, which
+        // partially recognizes it even when GGML_OPENMP=OFF), so a clang-built
+        // ggml-cpu.a has no GOMP_*/omp_* undefined symbols to satisfy. This MUST be
+        // checked before the `linux` arm below because musl triples also contain
+        // "linux" (e.g. x86_64-unknown-linux-musl).
+        //
+        // rustc validates a `kind=static` native library's existence (via the
+        // emitted `-L` search paths) while compiling THIS crate, not later at the
+        // final binary's link step -- so the .a files must already exist in
+        // `lib_dir` by the time this build script exits. zig only builds its
+        // bundled libc++/libc++abi/libunwind from source (into its own opaque,
+        // content-hashed global cache) on demand, the first time something asks
+        // to link them; materialize them into `lib_dir` here so both the
+        // existence check and the real link succeed.
+        materialize_musl_libcxx_archives(&target, &lib_dir);
+        println!("cargo:rustc-link-lib=static=c++");
+        println!("cargo:rustc-link-lib=static=c++abi");
+        println!("cargo:rustc-link-lib=static=unwind");
     } else if target.contains("linux") {
         println!("cargo:rustc-link-lib=dylib=stdc++");
         // The static ggml-cpu.a references OpenMP runtime symbols (GOMP_*/omp_*)
@@ -851,6 +910,160 @@ fn main() {
 
 fn cmake_flag(name: &str, enabled: bool) -> String {
     format!("-D{}={}", name, if enabled { "ON" } else { "OFF" })
+}
+
+/// Fallback CMake toolchain file for a musl cross build when `cargo zigbuild`'s
+/// own `CMAKE_TOOLCHAIN_FILE_<target>` env var isn't set (e.g. a manual `cargo
+/// build` with CC/CXX exported by hand). Mirrors the shape cargo-zigbuild itself
+/// generates: explicit CMAKE_SYSTEM_NAME/PROCESSOR (cross-compiling cmake does
+/// NOT infer these from the target triple on its own -- left alone it detects
+/// the BUILD host, which is wrong for a cross build) and the FIND_ROOT_PATH
+/// modes that keep `find_package`/`find_library` (e.g. ggml's `pkg-config`-based
+/// probes) scoped to the target sysroot rather than falling back to the host.
+fn write_musl_cmake_toolchain_file(target: &str, out_dir: &Path) -> PathBuf {
+    let env_target = target.replace('-', "_");
+    let cc = env::var(format!("CC_{env_target}"))
+        .or_else(|_| env::var("CC"))
+        .unwrap_or_else(|_| {
+            panic!(
+                "no C compiler found for musl target {target}: set CC_{env_target} (cargo \
+                 zigbuild sets this automatically -- build via `cargo zigbuild`, not plain \
+                 `cargo build`) or CC to a zig-cc-for-musl wrapper"
+            )
+        });
+    let cxx = env::var(format!("CXX_{env_target}"))
+        .or_else(|_| env::var("CXX"))
+        .unwrap_or_else(|_| {
+            panic!(
+                "no C++ compiler found for musl target {target}: set CXX_{env_target} (cargo \
+                 zigbuild sets this automatically -- build via `cargo zigbuild`, not plain \
+                 `cargo build`) or CXX to a zig-c++-for-musl wrapper"
+            )
+        });
+    let processor = if target.starts_with("aarch64") {
+        "aarch64"
+    } else if target.starts_with("x86_64") {
+        "x86_64"
+    } else {
+        panic!("unsupported musl cross arch in target {target}: only x86_64/aarch64 are wired up")
+    };
+    let content = format!(
+        "set(CMAKE_SYSTEM_NAME Linux)\n\
+         set(CMAKE_SYSTEM_PROCESSOR {processor})\n\
+         set(CMAKE_C_COMPILER {cc})\n\
+         set(CMAKE_CXX_COMPILER {cxx})\n\
+         set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)\n\
+         set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)\n\
+         set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)\n\
+         set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)\n"
+    );
+    let path = out_dir.join("musl-toolchain.cmake");
+    fs::write(&path, content).expect("write fallback musl cmake toolchain file");
+    path
+}
+
+/// Ensure `libc++.a` / `libc++abi.a` / `libunwind.a` for a musl cross target exist
+/// in `lib_dir` (already on the crate's `-L` search path), building them via zig's
+/// C++ frontend if needed. A no-op if they are already there (keeps incremental
+/// rebuilds fast).
+///
+/// Why this exists: musl targets are cross-compiled with zig cc/c++ (see
+/// `docs`/CI: `cargo zigbuild`, which sets `CC_<target>`/`CXX_<target>` env vars to
+/// its generated wrapper scripts). Zig bundles LLVM's libc++/libc++abi/libunwind
+/// source for musl targets and compiles+archives them on first use into its own
+/// global cache (`zig env`'s `global_cache_dir`, content-hashed, not a stable
+/// path) -- there is no prebuilt musl libc++ package to fetch instead (unlike
+/// e.g. Alpine's alsa-lib, which ships a normal shared build). rustc's own
+/// `#[link(kind = "static")]` handling requires the archive to already exist in a
+/// `-L` dir at the time THIS crate compiles (unlike `dylib` links, which are only
+/// resolved at the final binary's link step) -- so it must be produced here in
+/// build.rs, not left for the final `openasr` binary link to trigger lazily.
+///
+/// Approach: compile+link a trivial `<iostream>`-using stub with `-v` (verbose),
+/// which makes zig print the exact `ld.lld` invocation it runs -- including the
+/// fully resolved, absolute paths to the three archives it just built into its
+/// cache -- then copy those three files into `lib_dir` under their conventional
+/// names so the plain `cargo:rustc-link-lib=static=c++` (+ c++abi, unwind)
+/// directives resolve normally.
+fn materialize_musl_libcxx_archives(target: &str, lib_dir: &Path) {
+    let archives = ["libc++.a", "libc++abi.a", "libunwind.a"];
+    if archives.iter().all(|name| lib_dir.join(name).is_file()) {
+        return;
+    }
+
+    let env_target = target.replace('-', "_");
+    let cxx = env::var(format!("CXX_{env_target}"))
+        .or_else(|_| env::var("CXX"))
+        .unwrap_or_else(|_| {
+            panic!(
+                "no C++ compiler found for musl target {target}: set CXX_{env_target} (cargo \
+                 zigbuild sets this automatically -- build via `cargo zigbuild`, not plain \
+                 `cargo build`) or CXX to a zig-c++-for-musl wrapper (`zig c++ -target \
+                 {target_arch}-linux-musl`)",
+                target_arch = target.split('-').next().unwrap_or("x86_64"),
+            )
+        });
+
+    let stub_source = lib_dir.join("musl_libcxx_probe.cpp");
+    fs::write(
+        &stub_source,
+        "#include <iostream>\nint main() { std::cout << \"probe\"; return 0; }\n",
+    )
+    .expect("write musl libc++ probe source");
+    let stub_binary = lib_dir.join("musl_libcxx_probe");
+
+    // Split on whitespace: CXX_<target>/CXX may be a "compiler plus flags" string
+    // (as cargo/cc-rs conventionally allow), not just a bare executable path.
+    let mut parts = cxx.split_whitespace();
+    let cxx_program = parts
+        .next()
+        .unwrap_or_else(|| panic!("CXX_{env_target}/CXX is empty"));
+    let mut probe = Command::new(cxx_program);
+    probe
+        .args(parts)
+        .arg("-v")
+        .arg("-static")
+        .arg("-o")
+        .arg(&stub_binary)
+        .arg(&stub_source);
+    let output = probe
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {cxx} to build the musl libc++ probe: {e}"));
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        panic!(
+            "musl libc++ probe build failed (exit {:?}) using `{cxx}`:\n{combined}",
+            output.status.code()
+        );
+    }
+
+    for name in archives {
+        let found = combined
+            .split_whitespace()
+            .find(|tok| tok.ends_with(name) && Path::new(tok).is_file())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!(
+                    "could not find an absolute path to {name} in the musl libc++ probe's \
+                     verbose link output; zig's `-v` output format may have changed. Full \
+                     output:\n{combined}"
+                )
+            });
+        fs::copy(&found, lib_dir.join(name)).unwrap_or_else(|e| {
+            panic!(
+                "failed to copy {} to {}: {e}",
+                found.display(),
+                lib_dir.display()
+            )
+        });
+    }
+
+    let _ = fs::remove_file(&stub_source);
+    let _ = fs::remove_file(&stub_binary);
 }
 
 /// Copy the backend-DL runtime DLLs (ggml-base / ggml / ggml-cpu-<variant>) next
