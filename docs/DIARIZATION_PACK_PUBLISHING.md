@@ -23,9 +23,10 @@ Everything except the actual HF upload + catalog re-sign is committed in-repo:
   `template/DIARIZE_CARD.md.tmpl` + `cards/<id>.toml` prose (no ASR pipeline
   tags / bench table).
 - `openasr pull` validates these packs by **constructing the diarize model from
-  the pack** (`crate::diarize::validate_diarize_runtime_pack_contract`, routed
-  from `validate_native_runtime_model_pack_contract`) instead of ASR runtime
-  adapter selection — fail-closed either way.
+  the pack** (dispatched through `crate::models::aux_pack_registry`, which
+  `validate_native_runtime_model_pack_contract` calls before ASR runtime
+  adapter selection) instead of ASR runtime adapter selection — fail-closed
+  either way.
 
 The published packs are raw **f32** GGUF-v0 so embeddings and the 7-class
 powerset logits stay bit-exact.
