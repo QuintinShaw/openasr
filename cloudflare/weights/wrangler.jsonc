@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "openasr-weights",
+  "main": "src/index.js",
+  "compatibility_date": "2026-06-06",
+  // Required by @cloudflare/vitest-pool-workers (this worker's own code has no
+  // Node.js dependency).
+  "compatibility_flags": ["nodejs_compat"],
+  // Bind the Worker to the weights host. `openasr.org` must already be a zone on
+  // the deploying Cloudflare account; the Custom Domain provisions TLS for the
+  // subdomain automatically.
+  "routes": [{ "pattern": "weights.openasr.org", "custom_domain": true }],
+  // Build provenance: overridden at deploy time to `github.sha` (see
+  // .github/workflows/deploy-weights.yml) so `GET /_version` proves which
+  // commit of this open-source code is live. Local dev/tests keep the
+  // "local-dev" placeholder.
+  "vars": {
+    "BUILD_COMMIT": "local-dev"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}
