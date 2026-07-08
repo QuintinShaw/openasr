@@ -26,6 +26,10 @@ on:
         required: false
         default: false
         type: boolean
+      only_target:
+        description: "Build only this matrix.target key (empty = all legs; for validating a single platform without the full matrix)"
+        required: false
+        default: ""
   workflow_call:
     inputs:
       ref:
@@ -60,6 +64,15 @@ jobs:
       # AMD HIP SDK "PRO Edition" silent-installer release train, matched to
       # llama.cpp's current Windows HIP release job.
       HIPSDK_INSTALLER_VERSION: 26.Q1
+      # Single-leg validation gate. jobs.<job_id>.if cannot see the `matrix`
+      # context (only jobs.<job_id>.steps[*].if can), so the only_target
+      # filter is computed once here (job-level `env:` can see `matrix`, same
+      # as RELEASE_DIR below) and every step's `if` below ANDs this in. On a
+      # workflow_dispatch run with only_target set, every step short-circuits
+      # to a no-op for non-matching legs; every other trigger (push tag,
+      # workflow_call, or a dispatch that leaves only_target empty) builds
+      # every leg exactly as before.
+      LEG_SELECTED: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == '' || matrix.target == github.event.inputs.only_target }}
       # Where the built binary + build.rs-staged runtime DLLs land. A native
       # leg (no matrix.rust_target) builds into target/release; a cross leg
       # (--target <triple>) builds into target/<triple>/release. Every package/
@@ -258,11 +271,11 @@ jobs:
           echo "OPENASR_VERSION=${version}" >> "${GITHUB_ENV}"
 
       - name: Install Linux audio build dependencies
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.LEG_SELECTED == 'true'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
 
       - name: Install Linux Vulkan SDK
-        if: runner.os == 'Linux' && matrix.features == 'vulkan'
+        if: runner.os == 'Linux' && matrix.features == 'vulkan' && env.LEG_SELECTED == 'true'
         # LunarG's apt recipe for jammy (matches llama.cpp's ubuntu-22.04
         # Vulkan release job). vulkan-sdk gives cmake's FindVulkan the
         # loader/headers/glslc it needs; mesa-vulkan-drivers gives the
@@ -280,13 +293,13 @@ jobs:
       # preinstalled toolchains this job never touches first. Same action
       # llama.cpp's ubuntu-rocm release job uses.
       - name: Free up disk space
-        if: runner.os == 'Linux' && matrix.features == 'hip'
+        if: runner.os == 'Linux' && matrix.features == 'hip' && env.LEG_SELECTED == 'true'
         uses: ggml-org/free-disk-space@v1.3.1
         with:
           tool-cache: true
 
       - name: Install Linux ROCm/HIP SDK
-        if: runner.os == 'Linux' && matrix.features == 'hip'
+        if: runner.os == 'Linux' && matrix.features == 'hip' && env.LEG_SELECTED == 'true'
         # AMD's official apt repo (the recipe llama.cpp's ubuntu-22-rocm
         # release job uses). rocm-hip-sdk provides hipcc/the HIP clang
         # toolchain, rocBLAS, and hipBLAS; ROCM_PATH lets both cmake's
@@ -306,7 +319,7 @@ jobs:
           echo "/opt/rocm/bin" >> "${GITHUB_PATH}"
 
       - name: Install Windows Vulkan SDK
-        if: matrix.features == 'vulkan' && runner.os == 'Windows'
+        if: matrix.features == 'vulkan' && runner.os == 'Windows' && env.LEG_SELECTED == 'true'
         shell: pwsh
         env:
           VULKAN_VERSION: 1.4.313.2
@@ -322,7 +335,7 @@ jobs:
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\Bin"
 
       - name: Install MSVC ARM64 build tools
-        if: matrix.rust_target == 'aarch64-pc-windows-msvc'
+        if: matrix.rust_target == 'aarch64-pc-windows-msvc' && env.LEG_SELECTED == 'true'
         shell: pwsh
         # windows-latest preinstalls VS with only the x86_64 v143 toolset.
         # build.rs cross-compiles ggml for aarch64-pc-windows-msvc via
@@ -348,7 +361,7 @@ jobs:
           }
 
       - name: Ensure clang-cl (windows-arm64)
-        if: matrix.rust_target == 'aarch64-pc-windows-msvc'
+        if: matrix.rust_target == 'aarch64-pc-windows-msvc' && env.LEG_SELECTED == 'true'
         shell: pwsh
         # ggml's ARM CPU backend refuses MSVC cl ("MSVC is not supported for
         # ARM, use clang"), so build.rs compiles this cross with clang-cl (which
@@ -370,7 +383,7 @@ jobs:
           & $clangClPath --version
 
       - name: Ensure Ninja
-        if: runner.os == 'Windows' && (matrix.features == 'vulkan' || matrix.features == 'cuda' || matrix.features == 'hip' || matrix.rust_target == 'aarch64-pc-windows-msvc')
+        if: runner.os == 'Windows' && (matrix.features == 'vulkan' || matrix.features == 'cuda' || matrix.features == 'hip' || matrix.rust_target == 'aarch64-pc-windows-msvc') && env.LEG_SELECTED == 'true'
         shell: pwsh
         # build.rs forces the Ninja generator for Windows GPU-feature builds
         # and the windows-arm64 cross leg (Linux keeps cmake's default Unix
@@ -380,7 +393,7 @@ jobs:
           ninja --version
 
       - name: Cache AMD HIP SDK install
-        if: runner.os == 'Windows' && matrix.features == 'hip'
+        if: runner.os == 'Windows' && matrix.features == 'hip' && env.LEG_SELECTED == 'true'
         id: cache-hip-sdk
         uses: actions/cache@v6
         with:
@@ -388,7 +401,7 @@ jobs:
           key: hip-sdk-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ runner.os }}
 
       - name: Install AMD HIP SDK
-        if: runner.os == 'Windows' && matrix.features == 'hip' && steps.cache-hip-sdk.outputs.cache-hit != 'true'
+        if: runner.os == 'Windows' && matrix.features == 'hip' && steps.cache-hip-sdk.outputs.cache-hit != 'true' && env.LEG_SELECTED == 'true'
         shell: pwsh
         # Same recipe llama.cpp's Windows HIP release job uses (no self-hosted
         # runner needed): AMD publishes a silent installer for the consumer
@@ -410,7 +423,7 @@ jobs:
           }
 
       - name: Resolve HIP SDK path
-        if: runner.os == 'Windows' && matrix.features == 'hip'
+        if: runner.os == 'Windows' && matrix.features == 'hip' && env.LEG_SELECTED == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -422,7 +435,7 @@ jobs:
           Add-Content $env:GITHUB_PATH "$hipRoot\bin"
 
       - name: Install CUDA toolkit (Linux)
-        if: runner.os == 'Linux' && matrix.features == 'cuda'
+        if: runner.os == 'Linux' && matrix.features == 'cuda' && env.LEG_SELECTED == 'true'
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: "13.2.0"
@@ -437,7 +450,7 @@ jobs:
           use-github-cache: true
 
       - name: Install CUDA toolkit (Windows)
-        if: runner.os == 'Windows' && matrix.features == 'cuda'
+        if: runner.os == 'Windows' && matrix.features == 'cuda' && env.LEG_SELECTED == 'true'
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           # 13.x is the first CUDA line whose host_config.h accepts the VS
@@ -460,6 +473,7 @@ jobs:
           use-github-cache: true
 
       - name: Install Rust toolchain
+        if: env.LEG_SELECTED == 'true'
         run: |
           rustup toolchain install 1.95.0 --profile minimal
           rustup default 1.95.0
@@ -471,14 +485,16 @@ jobs:
       # this. Runs in the default shell (pwsh on Windows, bash elsewhere); the
       # `rustup target add` invocation is identical in both.
       - name: Add cross Rust target
-        if: matrix.rust_target
+        if: matrix.rust_target && env.LEG_SELECTED == 'true'
         run: rustup target add ${{ matrix.rust_target }}
 
       - uses: Swatinem/rust-cache@v2
+        if: env.LEG_SELECTED == 'true'
         with:
           shared-key: release-binaries-${{ matrix.target }}
 
       - name: Build release binary
+        if: env.LEG_SELECTED == 'true'
         shell: bash
         run: cargo build --release -p openasr-cli ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
@@ -490,7 +506,7 @@ jobs:
       # runner cannot execute, so they skip every smoke step (build + package
       # validation only).
       - name: Smoke release binary
-        if: runner.os != 'Windows' && matrix.features != 'cuda' && matrix.features != 'hip' && !matrix.rust_target
+        if: runner.os != 'Windows' && matrix.features != 'cuda' && matrix.features != 'hip' && !matrix.rust_target && env.LEG_SELECTED == 'true'
         run: |
           "${RELEASE_DIR}/openasr" --version
           "${RELEASE_DIR}/openasr" --help
@@ -502,7 +518,7 @@ jobs:
       # Vulkan exe resolves against the SDK loader installed above, so it
       # launches and runs CPU paths here.
       - name: Smoke release binary
-        if: runner.os == 'Windows' && matrix.features != 'cuda' && matrix.features != 'hip' && !matrix.rust_target
+        if: runner.os == 'Windows' && matrix.features != 'cuda' && matrix.features != 'hip' && !matrix.rust_target && env.LEG_SELECTED == 'true'
         shell: pwsh
         run: |
           & "$env:RELEASE_DIR\openasr.exe" --version
@@ -510,14 +526,14 @@ jobs:
           & "$env:RELEASE_DIR\openasr.exe" list
 
       - name: Restore model pack cache
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: matrix.target == 'x86_64-pc-windows-msvc' && env.LEG_SELECTED == 'true'
         uses: actions/cache@v6
         with:
           path: ~/.openasr/models
           key: openasr-packs-whisper-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('model-registry/catalog.json') }}
 
       - name: Real-model CPU smoke
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: matrix.target == 'x86_64-pc-windows-msvc' && env.LEG_SELECTED == 'true'
         shell: bash
         # Full-chain smoke for the CPU package: mock backend end to end, then
         # a real signature-verified pull + native CPU transcription of the
@@ -534,7 +550,7 @@ jobs:
           grep -qi "your country" tmp/jfk.txt
 
       - name: Package archive
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && env.LEG_SELECTED == 'true'
         run: |
           set -euo pipefail
           archive="openasr-${OPENASR_VERSION}-${{ matrix.asset }}"
@@ -563,7 +579,7 @@ jobs:
           tar -czf "dist/${archive}.${{ matrix.archive_ext }}" -C dist "${archive}"
 
       - name: Package archive
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && env.LEG_SELECTED == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -625,6 +641,7 @@ jobs:
           Compress-Archive -Path "$distDir" -DestinationPath "dist\$archive.${{ matrix.archive_ext }}" -Force
 
       - name: Upload archive
+        if: env.LEG_SELECTED == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: openasr-${{ matrix.target }}
@@ -812,7 +829,10 @@ jobs:
   verify-completeness:
     name: Verify release completeness
     needs: upload-to-release
-    if: needs.upload-to-release.outputs.tag != ''
+    # Single-leg dispatch runs (only_target set) intentionally produce just
+    # one archive, not the full asset set this job asserts on -- skip the
+    # completeness gate for those runs instead of failing it by design.
+    if: ${{ needs.upload-to-release.outputs.tag != '' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == '') }}
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
