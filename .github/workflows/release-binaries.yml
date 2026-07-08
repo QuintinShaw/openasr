@@ -164,16 +164,19 @@ jobs:
           #   * The runner is x86_64, so the produced arm64 exe cannot execute
           #     here; the smoke steps are skipped for cross legs (matrix.rust_target
           #     set), so this validates "compiles + links + packages" only.
-          #   * build.rs drives ggml's C++ via CMake using the MSVC `cl` that
-          #     cc::windows_registry::find_tool(target=aarch64-pc-windows-msvc)
-          #     resolves; that needs the "MSVC v143 ARM64 build tools" VS
-          #     component, installed below via `vs_installer.exe modify` (the
-          #     hosted runner's preinstalled VS only carries the x86_64 v143
-          #     toolset). build.rs now also forces the Ninja generator for this
-          #     leg (same as the CUDA/HIP/Vulkan Windows legs) so the pinned
-          #     arm64 `cl.exe` drives the whole build instead of fighting the
-          #     default multi-arch Visual Studio generator platform -- see the
-          #     is_windows_arm64 comment in build.rs for the full reasoning.
+          #   * build.rs drives ggml's C++ via CMake. It needs the "MSVC v143
+          #     ARM64 build tools" VS component (arm64 headers/libs), installed
+          #     below via `vs_installer.exe modify` -- the hosted runner's
+          #     preinstalled VS only carries the x86_64 v143 toolset. It compiles
+          #     with clang-cl (installed/verified below), not MSVC cl: ggml's ARM
+          #     CPU backend refuses cl ("MSVC is not supported for ARM, use
+          #     clang"). build.rs forces the Ninja generator + an explicit
+          #     CMAKE_SYSTEM_PROCESSOR=ARM64 for this leg so ggml selects the ARM
+          #     CPU backend (a single ARM64 variant; GGML_CPU_ALL_VARIANTS is
+          #     off, as its multi-ISA table has no Windows-ARM entry) instead of
+          #     mis-detecting the x86_64 host and building x86 SSE/AVX variants
+          #     that fail the link -- see the is_windows_arm64 comments in
+          #     build.rs for the full reasoning.
           #   * ring/rustls support aarch64-pc-windows-msvc (0.17+), so the Rust
           #     dep tree itself is expected to be fine.
           # Validate via `workflow_dispatch` before the next real release, and
@@ -343,6 +346,26 @@ jobs:
             Write-Error "vs_installer modify failed with exit code $($proc.ExitCode)"
             exit 1
           }
+
+      - name: Ensure clang-cl (windows-arm64)
+        if: matrix.rust_target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        # ggml's ARM CPU backend refuses MSVC cl ("MSVC is not supported for
+        # ARM, use clang"), so build.rs compiles this cross with clang-cl (which
+        # still links the MSVC ARM64 libs installed above). windows-latest
+        # preinstalls LLVM, but pull it via choco if a runner image ever drops
+        # it. build.rs invokes `clang-cl` off PATH.
+        run: |
+          $clangCl = Get-Command clang-cl -ErrorAction SilentlyContinue
+          if (-not $clangCl) {
+            $llvmBin = "C:\Program Files\LLVM\bin"
+            if (-not (Test-Path "$llvmBin\clang-cl.exe")) { choco install llvm -y }
+            Add-Content $env:GITHUB_PATH $llvmBin
+            $clangCl = "$llvmBin\clang-cl.exe"
+          }
+          # GITHUB_PATH only affects later steps; verify via the resolved path so
+          # this step works even right after a fresh install.
+          & (if ($clangCl -is [string]) { $clangCl } else { $clangCl.Source }) --version
 
       - name: Ensure Ninja
         if: runner.os == 'Windows' && (matrix.features == 'vulkan' || matrix.features == 'cuda' || matrix.features == 'hip' || matrix.rust_target == 'aarch64-pc-windows-msvc')
