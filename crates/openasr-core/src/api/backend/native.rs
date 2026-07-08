@@ -45,7 +45,9 @@ mod native_transcribe;
 pub use native_model_id::{
     NativeRuntimeModelIdSource, NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
 };
-pub use native_transcribe::native_transcription_progress;
+pub use native_transcribe::{
+    NativeTranscriptionPhase, NativeTranscriptionProgress, native_transcription_progress,
+};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NativeBackend;

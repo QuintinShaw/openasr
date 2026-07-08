@@ -38,51 +38,196 @@ const COHERE_LONGFORM_MAX_CHUNK_SECONDS: f32 = 10.0;
 const COHERE_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
 static NATIVE_GGML_EXECUTION_DISPATCH: OnceLock<GgmlAsrExecutionDispatch> = OnceLock::new();
 
-// Coarse long-form transcription progress, published as a single global slot.
-// The local desktop daemon transcribes one file at a time, so one slot is enough
-// to drive the UI progress bar; concurrent runs on a single daemon would share
-// it. Short single-pass decodes never touch it (there are no slices to count),
-// so callers see None and fall back to a time-based estimate.
-static PROGRESS_SLICES_DONE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static PROGRESS_SLICES_TOTAL: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+// Phase-aware progress for the in-flight native file transcription, published as
+// a single global slot. The local desktop daemon transcribes one file at a time,
+// so one slot is enough to drive the UI progress bar; concurrent runs on a single
+// daemon would share it. Progress is a monotonic overall fraction (0..=1) plus a
+// coarse phase label, so the UI advances smoothly across decode -> assemble ->
+// forced-align refine instead of stalling once the last slice decodes. The old
+// bare slice counter reached "done" at the last decode and then sat frozen through
+// assembly/merge and the whole-file forced-align pass, which read to users as a
+// bar stuck near the end (issue #61). Short single-pass decodes never activate the
+// slot (there are no slices to weight, and a single opaque decode call exposes no
+// sub-step), so callers see None and fall back to a time-based estimate.
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
-/// `(slices_done, slices_total)` of the in-flight native long-form run, or `None`
-/// when no multi-slice run is active.
-pub fn native_transcription_progress() -> Option<(usize, usize)> {
-    use std::sync::atomic::Ordering;
-    let total = PROGRESS_SLICES_TOTAL.load(Ordering::Relaxed);
-    if total == 0 {
+static PROGRESS_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PROGRESS_PHASE: AtomicU8 = AtomicU8::new(0);
+static PROGRESS_FRACTION_BITS: AtomicU32 = AtomicU32::new(0);
+
+// Heuristic phase ceilings the monotonic overall fraction climbs to at each phase
+// boundary -- not measured timings. Decode (autoregressive, per-slice) dominates;
+// the assembly/merge/resegment tail is short; the forced-align refine is a single
+// non-autoregressive forward pass over the whole file, present only when the caller
+// opted into word_timestamps=aligned. The monotonic clamp keeps the bar honest even
+// when a run's real mix differs from these shares.
+const DECODE_CEIL_WITH_ALIGN: f32 = 0.75;
+const ASSEMBLE_CEIL_WITH_ALIGN: f32 = 0.80;
+const ALIGN_CEIL: f32 = 0.92;
+const DECODE_CEIL_NO_ALIGN: f32 = 0.92;
+const ASSEMBLE_CEIL_NO_ALIGN: f32 = 0.97;
+
+/// Coarse phase of the in-flight native file transcription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeTranscriptionPhase {
+    /// Decoding audio slices.
+    Decode,
+    /// Merging slice transcripts and re-segmenting into subtitle cues.
+    Assemble,
+    /// Refining per-word timestamps with the forced aligner (word_timestamps=aligned).
+    Align,
+}
+
+impl NativeTranscriptionPhase {
+    fn to_tag(self) -> u8 {
+        match self {
+            NativeTranscriptionPhase::Decode => 0,
+            NativeTranscriptionPhase::Assemble => 1,
+            NativeTranscriptionPhase::Align => 2,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Self {
+        match tag {
+            1 => NativeTranscriptionPhase::Assemble,
+            2 => NativeTranscriptionPhase::Align,
+            _ => NativeTranscriptionPhase::Decode,
+        }
+    }
+
+    /// Stable lowercase label for the wire contract and the optional UI phase text.
+    pub fn label(self) -> &'static str {
+        match self {
+            NativeTranscriptionPhase::Decode => "decode",
+            NativeTranscriptionPhase::Assemble => "assemble",
+            NativeTranscriptionPhase::Align => "align",
+        }
+    }
+}
+
+/// Snapshot of the in-flight native run: a monotonic overall `fraction` in
+/// `0..=1` plus the current `phase`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NativeTranscriptionProgress {
+    pub phase: NativeTranscriptionPhase,
+    pub fraction: f32,
+}
+
+/// Progress of the in-flight native long-form / forced-align run, or `None` when
+/// no multi-slice / refine run is active (short single-pass decodes report
+/// nothing and the caller estimates from elapsed time).
+pub fn native_transcription_progress() -> Option<NativeTranscriptionProgress> {
+    if !PROGRESS_ACTIVE.load(Ordering::Acquire) {
         return None;
     }
-    let done = PROGRESS_SLICES_DONE.load(Ordering::Relaxed).min(total);
-    Some((done, total))
+    let fraction = f32::from_bits(PROGRESS_FRACTION_BITS.load(Ordering::Relaxed));
+    let phase = NativeTranscriptionPhase::from_tag(PROGRESS_PHASE.load(Ordering::Relaxed));
+    Some(NativeTranscriptionProgress { phase, fraction })
 }
 
-/// RAII guard: publishes the slice total on creation and resets the slot on drop,
-/// so normal completion, an early `?` return, or a panic all clear it.
-struct LongformProgressGuard;
+/// Publish `phase` and raise the overall fraction monotonically (a later phase or a
+/// further-along slice never moves the bar backward). Activates the slot on the
+/// first report of a run.
+fn publish_progress(phase: NativeTranscriptionPhase, fraction: f32) {
+    let clamped = fraction.clamp(0.0, 1.0);
+    PROGRESS_PHASE.store(phase.to_tag(), Ordering::Relaxed);
+    // Monotonic max on the f32 bits via a CAS loop: only ever raise the fraction.
+    let mut current = PROGRESS_FRACTION_BITS.load(Ordering::Relaxed);
+    loop {
+        let next = f32::from_bits(current).max(clamped);
+        match PROGRESS_FRACTION_BITS.compare_exchange_weak(
+            current,
+            next.to_bits(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+    // Release so a reader that observes `active` (Acquire) also sees the phase and
+    // fraction written above.
+    PROGRESS_ACTIVE.store(true, Ordering::Release);
+}
 
-impl LongformProgressGuard {
-    fn begin(total: usize) -> Self {
-        use std::sync::atomic::Ordering;
-        PROGRESS_SLICES_DONE.store(0, Ordering::Relaxed);
-        PROGRESS_SLICES_TOTAL.store(total, Ordering::Relaxed);
+/// Enter the assembly/merge phase, raising the bar to that phase's ceiling.
+fn publish_assemble_progress(with_align: bool) {
+    let ceil = if with_align {
+        ASSEMBLE_CEIL_WITH_ALIGN
+    } else {
+        ASSEMBLE_CEIL_NO_ALIGN
+    };
+    publish_progress(NativeTranscriptionPhase::Assemble, ceil);
+}
+
+/// Enter the forced-align refine phase, raising the bar to the align ceiling. The
+/// refine is a single opaque forward pass, so the bar holds here (with the "align"
+/// phase label explaining the pause) until the run completes and the slot clears.
+fn publish_align_progress() {
+    publish_progress(NativeTranscriptionPhase::Align, ALIGN_CEIL);
+}
+
+/// Decode-phase progress for the multi-slice long-form path. Each slice is weighted
+/// by its audio sample count (not a flat per-slice tick) so the bar tracks decode
+/// time -- which scales with audio duration -- rather than slice number, which makes
+/// variable-length VAD slices advance the bar unevenly.
+struct DecodeProgress {
+    total_samples: u64,
+    decoded_samples: u64,
+    decode_ceil: f32,
+}
+
+impl DecodeProgress {
+    fn begin(total_samples: u64, with_align: bool) -> Self {
+        let decode_ceil = if with_align {
+            DECODE_CEIL_WITH_ALIGN
+        } else {
+            DECODE_CEIL_NO_ALIGN
+        };
+        publish_progress(NativeTranscriptionPhase::Decode, 0.0);
+        Self {
+            total_samples,
+            decoded_samples: 0,
+            decode_ceil,
+        }
+    }
+
+    /// Mark one slice decoded (or skipped as silent -- silence still consumes its
+    /// share of the audio timeline), advancing the bar by that slice's sample share.
+    fn complete_slice(&mut self, slice_samples: u64) {
+        self.decoded_samples = self.decoded_samples.saturating_add(slice_samples);
+        let ratio = if self.total_samples == 0 {
+            1.0
+        } else {
+            (self.decoded_samples as f32 / self.total_samples as f32).clamp(0.0, 1.0)
+        };
+        publish_progress(NativeTranscriptionPhase::Decode, self.decode_ceil * ratio);
+    }
+}
+
+/// RAII reset for the global progress slot: clears it on normal completion, an early
+/// `?` return, or a panic, so a stale fraction never leaks into the next run. Created
+/// once per `run_native_transcription` so its lifetime spans decode, assembly, and
+/// the forced-align refine.
+struct NativeProgressGuard;
+
+impl NativeProgressGuard {
+    fn new() -> Self {
+        clear_progress_slot();
         Self
     }
+}
 
-    fn advance(&self) {
-        PROGRESS_SLICES_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+impl Drop for NativeProgressGuard {
+    fn drop(&mut self) {
+        clear_progress_slot();
     }
 }
 
-impl Drop for LongformProgressGuard {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
-        PROGRESS_SLICES_DONE.store(0, Ordering::Relaxed);
-        PROGRESS_SLICES_TOTAL.store(0, Ordering::Relaxed);
-    }
+fn clear_progress_slot() {
+    PROGRESS_ACTIVE.store(false, Ordering::Release);
+    PROGRESS_FRACTION_BITS.store(0, Ordering::Relaxed);
+    PROGRESS_PHASE.store(0, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,10 +259,15 @@ pub(super) fn run_native_transcription(
     if refine && !request.word_timestamps {
         return Err(BackendError::WordTimestampAlignmentRequiresWordTimestamps);
     }
+    // Spans the whole run (decode + assembly inside impl, then the forced-align
+    // refine below) so the progress slot is cleared on every exit and the align
+    // phase advances the same monotonic bar rather than running uncounted.
+    let _progress = NativeProgressGuard::new();
     let input_path = request.input_path.clone();
     let language_hint = request.language.clone();
     let transcription = run_native_transcription_impl(request)?;
     if refine {
+        publish_align_progress();
         refine_transcription_word_timestamps_with_forced_aligner(
             transcription,
             &input_path,
@@ -431,11 +581,20 @@ fn run_native_transcription_impl(
                 .processed_audio
                 .as_deref()
                 .unwrap_or(prepared_audio.as_slice());
-            // Publish per-slice progress for the UI; the guard clears the slot on
-            // any exit from this long-form path.
-            let slice_progress = LongformProgressGuard::begin(plan.slices.len());
+            // Publish per-slice decode progress for the UI, weighted by each
+            // slice's audio samples so the bar tracks decode time rather than slice
+            // number. The forced-align refine (if any) continues the same monotonic
+            // bar from the outer wrapper; the run-scoped guard clears the slot on
+            // any exit. `word_timestamps_refine` reserves headroom for that phase.
+            let with_align = request.word_timestamps_refine;
+            let total_decode_samples: u64 = plan
+                .slices
+                .iter()
+                .map(|slice| slice.duration_samples() as u64)
+                .sum();
+            let mut decode_progress = DecodeProgress::begin(total_decode_samples, with_align);
             for slice in plan.slices {
-                slice_progress.advance();
+                let slice_samples = slice.duration_samples() as u64;
                 let relative_start = slice
                     .content_start_sample
                     .saturating_sub(slice.start_sample);
@@ -457,6 +616,7 @@ fn run_native_transcription_impl(
                         segments: Vec::new(),
                         time_domain: SegmentTimeDomain::AbsoluteOriginal,
                     });
+                    decode_progress.complete_slice(slice_samples);
                     continue;
                 }
                 let mut slice_options = request_options.clone();
@@ -511,7 +671,11 @@ fn run_native_transcription_impl(
                     segments: transcription.segments,
                     time_domain: SegmentTimeDomain::RelativeToSliceContent,
                 });
+                decode_progress.complete_slice(slice_samples);
             }
+            // Decode done; the merge/resegment tail below runs uncounted otherwise,
+            // which is where the bar used to sit frozen at the last slice count.
+            publish_assemble_progress(with_align);
             let (assembled, assemble_stats) = assembler.into_parts();
             let run_metadata = build_longform_metadata(
                 &longform_options,
@@ -1279,15 +1443,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn longform_progress_guard_publishes_and_clears() {
+    fn native_progress_is_monotonic_across_phases_and_clears() {
         // No run active -> None (short single-pass decodes report nothing).
         assert_eq!(native_transcription_progress(), None);
         {
-            let guard = LongformProgressGuard::begin(3);
-            assert_eq!(native_transcription_progress(), Some((0, 3)));
-            guard.advance();
-            guard.advance();
-            assert_eq!(native_transcription_progress(), Some((2, 3)));
+            let _guard = NativeProgressGuard::new();
+            // Decode phase, weighted by sample share; a run that will forced-align
+            // reserves headroom above the decode ceiling.
+            let mut decode = DecodeProgress::begin(1000, true);
+            let start = native_transcription_progress().expect("run is active");
+            assert_eq!(start.phase, NativeTranscriptionPhase::Decode);
+            assert_eq!(start.fraction, 0.0);
+
+            decode.complete_slice(400);
+            let mid = native_transcription_progress().unwrap();
+            assert_eq!(mid.phase, NativeTranscriptionPhase::Decode);
+            assert!(mid.fraction >= start.fraction);
+            assert!((mid.fraction - DECODE_CEIL_WITH_ALIGN * 0.4).abs() < 1e-6);
+
+            decode.complete_slice(600);
+            let decoded = native_transcription_progress().unwrap();
+            assert!(decoded.fraction >= mid.fraction);
+            // All samples decoded -> exactly the decode ceiling.
+            assert!((decoded.fraction - DECODE_CEIL_WITH_ALIGN).abs() < 1e-6);
+
+            publish_assemble_progress(true);
+            let assembled = native_transcription_progress().unwrap();
+            assert_eq!(assembled.phase, NativeTranscriptionPhase::Assemble);
+            assert!(assembled.fraction >= decoded.fraction);
+            assert!((assembled.fraction - ASSEMBLE_CEIL_WITH_ALIGN).abs() < 1e-6);
+
+            publish_align_progress();
+            let aligning = native_transcription_progress().unwrap();
+            assert_eq!(aligning.phase, NativeTranscriptionPhase::Align);
+            assert!(aligning.fraction >= assembled.fraction);
+            assert!(aligning.fraction <= 1.0);
+
+            // A late lower report (e.g. an out-of-order slice) never moves the bar
+            // backward; only the phase label follows the latest report.
+            publish_progress(NativeTranscriptionPhase::Decode, 0.1);
+            let after = native_transcription_progress().unwrap();
+            assert_eq!(after.fraction, aligning.fraction);
         }
         // Guard dropped (completion / early return / panic) -> slot cleared.
         assert_eq!(native_transcription_progress(), None);
