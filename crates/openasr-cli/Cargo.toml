@@ -14,6 +14,7 @@ name = "openasr"
 path = "src/main.rs"
 
 [features]
+default = ["mic-capture"]
 ## Accelerator backends — forwarded 1:1 to openasr-core so the binary can be
 ## built with GPU acceleration (e.g. `cargo build --features hip`).
 cuda = ["openasr-core/cuda"]
@@ -22,11 +23,17 @@ hip = ["openasr-core/hip"]
 sycl = ["openasr-core/sycl"]
 openmp = ["openasr-core/openmp"]
 native = ["openasr-core/native"]
+## `live --source mic` support (cpal + platform audio backend, e.g. ALSA on
+## Linux). Off by default only for the static musl release legs, which need a
+## fully static binary and have no static libasound archive to link against
+## (see release-binaries.yml musl matrix legs); `--source system` and
+## `--input-file` stay available either way.
+mic-capture = ["dep:cpal"]
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-cpal.workspace = true
+cpal = { workspace = true, optional = true }
 indicatif.workspace = true
 openasr-core.workspace = true
 openasr-server.workspace = true

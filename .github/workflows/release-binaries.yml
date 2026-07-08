@@ -190,26 +190,59 @@ jobs:
             archive_ext: zip
             experimental: true
             timeout: 120
-          # DEFERRED (intentionally not in the matrix): the two Linux musl CPU
-          # legs -- x86_64-unknown-linux-musl (asset linux-x86_64-musl) and
-          # aarch64-unknown-linux-musl (asset linux-arm64-musl). They cannot be
-          # built cleanly on a stock GitHub-hosted ubuntu runner today:
-          #   * ggml is C++ (compiled by build.rs via CMake). A musl target
-          #     needs a musl C++ compiler, but Ubuntu's `musl-tools` ships only
-          #     `musl-gcc` (C) -- there is no apt `musl-g++`. So the ggml C++
-          #     objects cannot be produced for musl without a musl-cross
-          #     toolchain (musl.cc / musl-cross-make) or building inside an
-          #     Alpine container.
-          #   * musl defaults to crt-static ON, but build.rs links libstdc++
-          #     and libgomp dynamically on Linux (see the `target.contains(
-          #     "linux")` block), which a fully static musl binary cannot pull;
-          #     enabling them needs `-C target-feature=-crt-static` (a dynamic
-          #     musl binary) plus a musl libstdc++, or static-libstdc++ wiring.
-          # Enabling musl is therefore a build.rs + toolchain task, not an
-          # asset-rename one. When done, add two legs here with rust_target set
-          # (like the windows-arm64 leg), the friendly assets above, and -- once
-          # green -- the TARGETS entries linux-x86_64-musl:tar.gz and
-          # linux-arm64-musl:tar.gz.
+          # Linux musl CPU legs -- fully static binaries (portable across any
+          # glibc version, and even non-glibc distros). Both cross-compile from
+          # an x86_64 ubuntu-latest host via a musl-cross-make toolchain (see
+          # the "Install musl cross" step below):
+          #   * ggml is C++ (compiled by build.rs via CMake). Apt's
+          #     `musl-tools` ships only `musl-gcc` (C, no C++), so a stock
+          #     runner cannot produce the ggml C++ objects for musl. musl.cc's
+          #     prebuilt standalone gcc/g++ cross toolchains (musl-cross-make,
+          #     `--disable-shared`) fill that gap and, crucially, ship ONLY
+          #     static target libs (libstdc++.a, libgomp.a, libc.a, ...) --
+          #     exactly what a fully static (+crt-static, the musl Rust
+          #     default) binary needs to resolve build.rs's existing
+          #     `-lstdc++ -lgomp` (see the `target.contains("linux")` block),
+          #     so build.rs itself needs no musl-specific branch.
+          #   * cpal's Linux backend links ALSA (`-lasound`) dynamically only
+          #     (alsa-sys has no vendored/static path), which a `-static` link
+          #     cannot satisfy (Ubuntu ships no `libasound.a`). These two legs
+          #     therefore build openasr-cli with `--no-default-features`,
+          #     which drops the `mic-capture` feature (see
+          #     crates/openasr-cli/Cargo.toml and src/live.rs): `live --source
+          #     mic` is unavailable in this build, `--source system` and
+          #     `--input-file` are unaffected.
+          # The aarch64 leg cross-compiles from the same x86_64 host (musl.cc
+          # has no aarch64-hosted toolchain build), so -- like the
+          # windows-arm64 leg -- it cannot execute here (`foreign_arch: true`
+          # skips the smoke step); the x86_64 leg runs on its native arch and
+          # is smoke-tested normally.
+          # NEEDS CI VALIDATION -- experimental (non-blocking, excluded from
+          # verify-completeness) until proven green: whether every dependency
+          # that compiles native C (notably aws-lc-sys/ring, pulled in via
+          # reqwest's rustls-tls) cross-compiles cleanly against this
+          # toolchain is unconfirmed. Promote once proven (drop `experimental`
+          # + `continue-on-error`, add the linux-*-musl:tar.gz entries to
+          # verify-completeness).
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: linux-x86_64-musl
+            rust_target: x86_64-unknown-linux-musl
+            binary_name: openasr
+            archive_ext: tar.gz
+            musl: true
+            experimental: true
+            timeout: 90
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset: linux-arm64-musl
+            rust_target: aarch64-unknown-linux-musl
+            binary_name: openasr
+            archive_ext: tar.gz
+            musl: true
+            foreign_arch: true
+            experimental: true
+            timeout: 90
           # Linux GPU-feature variants, same rationale as the Windows ones
           # above (no GPU on the hosted runner; build+package validated
           # here, GPU inference validated on real hardware). Pinned to
@@ -258,8 +291,55 @@ jobs:
           echo "OPENASR_VERSION=${version}" >> "${GITHUB_ENV}"
 
       - name: Install Linux audio build dependencies
-        if: runner.os == 'Linux'
+        # The musl legs build with --no-default-features (no `mic-capture` /
+        # cpal / ALSA -- see the matrix comment above), so libasound2-dev is
+        # unneeded there.
+        if: runner.os == 'Linux' && !matrix.musl
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Install musl cross C/C++ toolchain
+        if: matrix.musl
+        shell: bash
+        # musl.cc's prebuilt standalone gcc/g++ cross toolchains (built via
+        # musl-cross-make with --disable-shared): every target lib is a
+        # static archive only (libstdc++.a, libgomp.a, libc.a, ...), matching
+        # what build.rs's existing `-lstdc++ -lgomp` Linux link directives
+        # need for a fully static (+crt-static) musl binary -- see the matrix
+        # comment above for why this is needed instead of apt's musl-tools
+        # (musl-gcc only, no musl-g++). Both legs cross-compile from this
+        # same x86_64 host (musl.cc ships no aarch64-hosted toolchain build).
+        run: |
+          set -euo pipefail
+          case "${{ matrix.rust_target }}" in
+            x86_64-unknown-linux-musl) pkg=x86_64-linux-musl-cross ;;
+            aarch64-unknown-linux-musl) pkg=aarch64-linux-musl-cross ;;
+            *)
+              echo "no musl cross toolchain mapping for ${{ matrix.rust_target }}" >&2
+              exit 1
+              ;;
+          esac
+          curl -fsSL --retry 3 -o /tmp/musl-cross.tgz "https://musl.cc/${pkg}.tgz"
+          mkdir -p "${HOME}/.local"
+          tar -xzf /tmp/musl-cross.tgz -C "${HOME}/.local"
+          triple="${pkg%-cross}"
+          bin_dir="${HOME}/.local/${pkg}/bin"
+          echo "${bin_dir}" >> "${GITHUB_PATH}"
+          "${bin_dir}/${triple}-gcc" --version
+          "${bin_dir}/${triple}-g++" --version
+          # Target-specific vars for the `cc` crate (aws-lc-sys, ring, the
+          # bundled libsqlite3-sys C build, ...); plain CC/CXX so build.rs's
+          # own `cmake` invocation (which does not set a compiler explicitly
+          # on Linux, relying on cmake's own CC/CXX env detection) picks up
+          # the same musl compiler for ggml.
+          env_suffix="$(echo "${{ matrix.rust_target }}" | tr '-' '_' | tr '[:lower:]' '[:upper:]')"
+          {
+            echo "CC_${env_suffix}=${bin_dir}/${triple}-gcc"
+            echo "CXX_${env_suffix}=${bin_dir}/${triple}-g++"
+            echo "AR_${env_suffix}=${bin_dir}/${triple}-ar"
+            echo "CARGO_TARGET_${env_suffix}_LINKER=${bin_dir}/${triple}-gcc"
+            echo "CC=${bin_dir}/${triple}-gcc"
+            echo "CXX=${bin_dir}/${triple}-g++"
+          } >> "${GITHUB_ENV}"
 
       - name: Install Linux Vulkan SDK
         if: runner.os == 'Linux' && matrix.features == 'vulkan'
@@ -478,17 +558,24 @@ jobs:
 
       - name: Build release binary
         shell: bash
-        run: cargo build --release -p openasr-cli ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+        # --no-default-features on the musl legs drops `mic-capture` (cpal /
+        # ALSA), which cannot link statically here -- see the matrix comment.
+        run: cargo build --release -p openasr-cli ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }} ${{ matrix.musl && '--no-default-features' || '' }}
 
       # Same GPU-less-runner caveat as the Windows CUDA/HIP legs: those two
       # exes dlopen the CUDA/ROCm runtime at launch, which needs a real
       # driver this runner does not have. The Vulkan exe launches fine via
       # the llvmpipe software ICD installed above.
-      # Cross legs (matrix.rust_target set) build an exe for a foreign arch the
-      # runner cannot execute, so they skip every smoke step (build + package
-      # validation only).
+      # A foreign-arch cross leg builds an exe this runner cannot execute, so
+      # it skips every smoke step (build + package validation only) --
+      # currently only the aarch64-musl leg (cross-compiled from an x86_64
+      # host; matrix.foreign_arch: true). The Windows arm64 leg is the other
+      # such cross leg, but it never reaches this (non-Windows) step. The
+      # x86_64-musl leg sets matrix.rust_target too (to select the musl
+      # target triple) but runs on its native arch, so it IS smoke-tested
+      # normally like any other native leg.
       - name: Smoke release binary
-        if: runner.os != 'Windows' && matrix.features != 'cuda' && matrix.features != 'hip' && !matrix.rust_target
+        if: runner.os != 'Windows' && matrix.features != 'cuda' && matrix.features != 'hip' && !matrix.foreign_arch
         run: |
           "${RELEASE_DIR}/openasr" --version
           "${RELEASE_DIR}/openasr" --help

@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+#[cfg(feature = "mic-capture")]
 use cpal::{
     Device, Host, SampleFormat, Stream, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -61,6 +62,8 @@ pub(crate) enum LiveOutputFormat {
 pub(crate) struct LiveCommandOptions<'a> {
     pub source: LiveSource,
     pub list_devices: bool,
+    // Only read on the mic-capture path (select_input_device); dead without it.
+    #[cfg_attr(not(feature = "mic-capture"), allow(dead_code))]
     pub device: Option<String>,
     pub input_file: Option<PathBuf>,
     pub model: Option<&'a str>,
@@ -119,10 +122,9 @@ pub(crate) fn parse_live_output_format(
 pub(crate) async fn run_live(options: LiveCommandOptions<'_>) -> Result<()> {
     validate_live_limits(options.max_seconds, options.max_utterances)?;
 
-    let host = cpal::default_host();
     if options.list_devices {
         match options.source {
-            LiveSource::Mic => list_input_devices(&host)?,
+            LiveSource::Mic => list_input_devices()?,
             LiveSource::System => list_system_audio_source(),
         }
         return Ok(());
@@ -182,59 +184,75 @@ pub(crate) async fn run_live(options: LiveCommandOptions<'_>) -> Result<()> {
         );
     }
 
-    let device = select_input_device(&host, options.device.as_deref())?;
-    let device_label = device_label(&device);
-    let supported_config = device
-        .default_input_config()
-        .with_context(|| format!("Could not query default input config for {device_label}"))?;
-    let sample_format = supported_config.sample_format();
-    let stream_config: StreamConfig = supported_config.clone().into();
-    let normalizer = LiveAudioNormalizer::new(
-        stream_config.sample_rate,
-        stream_config.channels,
-        options.frame_duration_ms,
-    )?;
-    let (sender, receiver) = mpsc::sync_channel(LIVE_CAPTURE_QUEUE_CAPACITY);
-    let overflowed = Arc::new(AtomicBool::new(false));
-    let stream = build_input_stream(&device, &stream_config, sample_format, sender, &overflowed)?;
-    stream
-        .play()
-        .with_context(|| format!("Could not start microphone stream for {device_label}"))?;
+    // Only LiveSource::Mic reaches here (System and the input-file override
+    // both returned above).
+    #[cfg(feature = "mic-capture")]
+    {
+        let host = cpal::default_host();
+        let device = select_input_device(&host, options.device.as_deref())?;
+        let device_label = device_label(&device);
+        let supported_config = device
+            .default_input_config()
+            .with_context(|| format!("Could not query default input config for {device_label}"))?;
+        let sample_format = supported_config.sample_format();
+        let stream_config: StreamConfig = supported_config.clone().into();
+        let normalizer = LiveAudioNormalizer::new(
+            stream_config.sample_rate,
+            stream_config.channels,
+            options.frame_duration_ms,
+        )?;
+        let (sender, receiver) = mpsc::sync_channel(LIVE_CAPTURE_QUEUE_CAPACITY);
+        let overflowed = Arc::new(AtomicBool::new(false));
+        let stream =
+            build_input_stream(&device, &stream_config, sample_format, sender, &overflowed)?;
+        stream
+            .play()
+            .with_context(|| format!("Could not start microphone stream for {device_label}"))?;
 
-    let stop_requested = Arc::new(AtomicBool::new(false));
-    let signal_flag = Arc::clone(&stop_requested);
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_flag.store(true, Ordering::SeqCst);
-        }
-    });
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let signal_flag = Arc::clone(&stop_requested);
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                signal_flag.store(true, Ordering::SeqCst);
+            }
+        });
 
-    let mut pipeline = LivePipeline::new(
-        live_config,
-        options.output_format,
-        options.max_utterances,
-        save_options,
-    )?;
-    pipeline.configure_prototype_sinks(obs_options, markdown_note_options);
-    pipeline.start()?;
-    eprintln!(
-        "OpenASR live microphone started on {device_label} ({sample_format}, {} Hz, {} channel(s)). Streaming partial/final updates are enabled.",
-        stream_config.sample_rate, stream_config.channels
-    );
-    let transcription_worker = LiveTranscriptionWorker::spawn(backend, model_pack_path);
-    let mut capture = LiveCaptureRun {
-        receiver,
-        normalizer,
-        overflowed,
-        started_at: Instant::now(),
-        max_seconds: options.max_seconds,
-        max_utterances: options.max_utterances,
-        stop_requested,
-        transcription_worker,
-    };
-    let result = capture.run(&mut pipeline);
-    drop(stream);
-    result
+        let mut pipeline = LivePipeline::new(
+            live_config,
+            options.output_format,
+            options.max_utterances,
+            save_options,
+        )?;
+        pipeline.configure_prototype_sinks(obs_options, markdown_note_options);
+        pipeline.start()?;
+        eprintln!(
+            "OpenASR live microphone started on {device_label} ({sample_format}, {} Hz, {} channel(s)). Streaming partial/final updates are enabled.",
+            stream_config.sample_rate, stream_config.channels
+        );
+        let transcription_worker = LiveTranscriptionWorker::spawn(backend, model_pack_path);
+        let mut capture = LiveCaptureRun {
+            receiver,
+            normalizer,
+            overflowed,
+            started_at: Instant::now(),
+            max_seconds: options.max_seconds,
+            max_utterances: options.max_utterances,
+            stop_requested,
+            transcription_worker,
+        };
+        let result = capture.run(&mut pipeline);
+        drop(stream);
+        result
+    }
+    #[cfg(not(feature = "mic-capture"))]
+    {
+        bail!(
+            "Microphone capture is not available in this build (compiled without the \
+             `mic-capture` feature -- e.g. the static musl release binaries, which have no \
+             static ALSA archive to link against). Use `--source system` or `--input-file` \
+             instead."
+        )
+    }
 }
 
 fn run_live_from_system_audio(
@@ -812,7 +830,9 @@ fn validate_live_limits(max_seconds: Option<u64>, max_utterances: Option<usize>)
     Ok(())
 }
 
-fn list_input_devices(host: &Host) -> Result<()> {
+#[cfg(feature = "mic-capture")]
+fn list_input_devices() -> Result<()> {
+    let host = cpal::default_host();
     let mut devices = host
         .input_devices()
         .context("Could not enumerate CPAL input devices")?
@@ -842,6 +862,15 @@ fn list_input_devices(host: &Host) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "mic-capture"))]
+fn list_input_devices() -> Result<()> {
+    bail!(
+        "Microphone capture is not available in this build (compiled without the \
+         `mic-capture` feature -- e.g. the static musl release binaries, which have no static \
+         ALSA archive to link against)."
+    )
+}
+
 fn list_system_audio_source() {
     let support = openasr_system_audio::support_status();
     println!("{}", support.label);
@@ -850,6 +879,7 @@ fn list_system_audio_source() {
     println!("  detail={}", support.detail);
 }
 
+#[cfg(feature = "mic-capture")]
 fn select_input_device(host: &Host, requested: Option<&str>) -> Result<Device> {
     if let Some(requested) = requested {
         let devices = host
@@ -875,6 +905,7 @@ fn select_input_device(host: &Host, requested: Option<&str>) -> Result<Device> {
     })
 }
 
+#[cfg(feature = "mic-capture")]
 fn device_label(device: &Device) -> String {
     device
         .description()
@@ -882,6 +913,7 @@ fn device_label(device: &Device) -> String {
         .unwrap_or_else(|error| format!("<unknown input device: {error}>"))
 }
 
+#[cfg(feature = "mic-capture")]
 fn build_input_stream(
     device: &Device,
     config: &StreamConfig,
@@ -905,6 +937,7 @@ fn build_input_stream(
     }
 }
 
+#[cfg(feature = "mic-capture")]
 fn build_typed_input_stream<T>(
     device: &Device,
     config: &StreamConfig,
@@ -940,6 +973,9 @@ where
 }
 
 #[derive(Debug)]
+// F32/U16 are only ever constructed by the mic-capture path
+// (build_input_stream); without that feature only I16 (system audio) is used.
+#[cfg_attr(not(feature = "mic-capture"), allow(dead_code))]
 enum CaptureChunk {
     F32(Vec<f32>),
     I16(Vec<i16>),
