@@ -2,7 +2,6 @@
 //! stateless RNN-T greedy decode.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::NativeAsrSession;
@@ -16,7 +15,8 @@ use crate::models::ggml_asr_executor::{
 };
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::thread_local_runtime_cache::{
-    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
+    with_thread_local_cached_mut_by_key,
 };
 
 use super::frontend::{XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES, XASR_SAMPLE_RATE_HZ};
@@ -27,8 +27,8 @@ use super::streaming_decoder::XasrIncrementalDecoder;
 type XasrRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
 
 thread_local! {
-    static XASR_ZIPFORMER_RUNTIME_BY_KEY: RefCell<HashMap<XasrRuntimeCacheKey, XasrZipformerPreparedRuntime>> =
-        RefCell::new(HashMap::new());
+    static XASR_ZIPFORMER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<XasrRuntimeCacheKey, XasrZipformerPreparedRuntime>> =
+        RefCell::new(BoundedRuntimeCache::new());
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +108,7 @@ fn transcribe_xasr_zipformer_pcm_cached(
     with_thread_local_cached_mut_by_key(
         &XASR_ZIPFORMER_RUNTIME_BY_KEY,
         key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
         || XasrZipformerPreparedRuntime::load(pack_path),
         |runtime| {
             let result = runtime.transcribe(samples)?;

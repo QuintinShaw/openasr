@@ -4,8 +4,8 @@ use std::time::Instant;
 use thiserror::Error;
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedTensor, GgmlLoadedWeightContext,
-    GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedTensor,
+    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena,
 };
 use crate::nn::conv::{
     Conv2dParams, ConvActivation, ConvBlockSteps, apply_conv_2d_bias_activation,
@@ -18,7 +18,6 @@ use super::graph_config::cohere_encoder_graph_config;
 use super::runtime_contract::CohereTranscribeExecutionMetadata;
 
 const COHERE_ENCODER_LAYER_NORM_EPSILON: f32 = 1.0e-5;
-const COHERE_ENCODER_GRAPH_CONTEXT_BYTES: usize = 512 * 1024 * 1024;
 const GGML_TYPE_F16: i32 = 1;
 const COHERE_DEBUG_ENCODER_ENV: &str = "OPENASR_COHERE_DEBUG_ENCODER";
 const COHERE_DEBUG_ENCODER_BUILD_ENV: &str = "OPENASR_COHERE_DEBUG_ENCODER_BUILD";
@@ -157,7 +156,17 @@ impl CohereTranscribeEncoderGraphRuntime {
         let build_debug = std::env::var_os(COHERE_DEBUG_ENCODER_BUILD_ENV).is_some();
         let runner_start = Instant::now();
         let mut config = cohere_encoder_graph_config();
-        config.context_bytes = COHERE_ENCODER_GRAPH_CONTEXT_BYTES;
+        // `no_alloc` metadata context: covers both the encoder's own forward
+        // graph AND the arena's weight tensors (see
+        // `GgmlStaticTensorArena` -- real tensor bytes land in a separately
+        // sized backend buffer, independent of this context's size).
+        // Previously hardcoded to a flat 512 MiB regardless of `graph_size`.
+        config.context_bytes =
+            config
+                .context_bytes
+                .max(GgmlCpuGraphConfig::metadata_context_bytes(
+                    config.graph_size,
+                ));
         let runner = GgmlCpuGraphRunner::new(config).map_err(|source| {
             CohereTranscribeEncoderError::GraphBuildFailed {
                 step: "runner_init",

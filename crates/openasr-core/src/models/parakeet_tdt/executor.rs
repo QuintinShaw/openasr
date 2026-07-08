@@ -2,7 +2,6 @@
 //! joint encoder projection) -> host TDT greedy decode -> detokenize.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::api::backend::WordTimestamp;
@@ -16,7 +15,8 @@ use crate::models::incremental_streaming_driver::{
 };
 use crate::models::parakeet_ctc::frontend::ParakeetFrontend;
 use crate::models::thread_local_runtime_cache::{
-    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
+    with_thread_local_cached_mut_by_key,
 };
 use crate::{NativeAsrSession, PARAKEET_TDT_GGML_ADAPTER_ID};
 
@@ -36,8 +36,8 @@ use super::tokenizer::ParakeetTdtTokenizer;
 type ParakeetTdtRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
 
 thread_local! {
-    static PARAKEET_TDT_RUNTIME_BY_KEY: RefCell<HashMap<ParakeetTdtRuntimeCacheKey, ParakeetTdtPreparedRuntime>> =
-        RefCell::new(HashMap::new());
+    static PARAKEET_TDT_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<ParakeetTdtRuntimeCacheKey, ParakeetTdtPreparedRuntime>> =
+        RefCell::new(BoundedRuntimeCache::new());
 }
 
 const PARAKEET_TDT_STREAMING_EXECUTOR_ID: &str = "parakeet-tdt-ggml-redecode-streaming-executor-v1";
@@ -144,6 +144,7 @@ pub(crate) fn transcribe_parakeet_tdt_pcm_cached(
     with_thread_local_cached_mut_by_key(
         &PARAKEET_TDT_RUNTIME_BY_KEY,
         key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
         || build_parakeet_tdt_prepared_runtime(pack_path),
         |runtime| runtime.transcribe(samples, word_timestamps),
     )
