@@ -356,16 +356,18 @@ jobs:
         # preinstalls LLVM, but pull it via choco if a runner image ever drops
         # it. build.rs invokes `clang-cl` off PATH.
         run: |
-          $clangCl = Get-Command clang-cl -ErrorAction SilentlyContinue
-          if (-not $clangCl) {
+          $existing = Get-Command clang-cl -ErrorAction SilentlyContinue
+          if ($existing) {
+            $clangClPath = $existing.Source
+          } else {
             $llvmBin = "C:\Program Files\LLVM\bin"
             if (-not (Test-Path "$llvmBin\clang-cl.exe")) { choco install llvm -y }
             Add-Content $env:GITHUB_PATH $llvmBin
-            $clangCl = "$llvmBin\clang-cl.exe"
+            $clangClPath = "$llvmBin\clang-cl.exe"
           }
           # GITHUB_PATH only affects later steps; verify via the resolved path so
           # this step works even right after a fresh install.
-          & (if ($clangCl -is [string]) { $clangCl } else { $clangCl.Source }) --version
+          & $clangClPath --version
 
       - name: Ensure Ninja
         if: runner.os == 'Windows' && (matrix.features == 'vulkan' || matrix.features == 'cuda' || matrix.features == 'hip' || matrix.rust_target == 'aarch64-pc-windows-msvc')
