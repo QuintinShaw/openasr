@@ -277,11 +277,19 @@ pub struct CatalogModel {
     // signed catalog stays byte-identical while empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_release_date: Option<String>,
-    // Whether the model's transcripts include punctuation, derived at
-    // catalog-authoring time (tooling/publish-model/scripts/_catalog.py's
-    // `punctuation_for_model`) from the model's family -- an architecture/
-    // training-corpus property, not a per-release editorial choice. `None`
-    // means "unknown" (a catalog predating this field, or a kind core has no
+    // Whether the model's transcripts include punctuation -- an architecture/
+    // training-corpus property, not a per-release editorial choice. This field
+    // is a read-only wire mirror, not an independent declaration: the single
+    // Rust-side source of truth is
+    // `arch::OpenAsrArchitectureDescriptor::emits_punctuation` (see
+    // `arch::emits_punctuation_for_model_architecture`), and catalog authoring
+    // (`tooling/publish-model/scripts/_catalog.py`'s `punctuation_for_model` /
+    // `PUNCTUATION_BY_FAMILY`) is hand-kept in lockstep with it -- there is no
+    // Rust<->Python codegen bridge yet, so
+    // `registry/tests/catalog.rs`'s `embedded_catalog_emits_punctuation_matches_family`
+    // cross-checks the shipped catalog against the descriptor value for every
+    // family both sides know about, to catch drift. `None` means "unknown" (a
+    // catalog predating this field, or a kind core has no
     // transcript-punctuation axis for, e.g. capability-pack); consumers must
     // treat `None` as "assume punctuated" (`true`) rather than surfacing a
     // false "no punctuation" notice for an older/omitted entry. Only

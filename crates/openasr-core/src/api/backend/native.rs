@@ -17,11 +17,10 @@ use crate::models::builtin_execution_dispatch::build_builtin_ggml_streaming_exec
 use crate::models::executor_component_registry::builtin_executor_supports_phrase_bias_for_model_architecture;
 use crate::models::ggml_family_adapter::GgmlFamilyAdapterDescriptor;
 use crate::models::ggml_family_registry::{
-    COHERE_TRANSCRIBE_GGML_ADAPTER_ID, COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-    DOLPHIN_GGML_ARCHITECTURE_ID, GgmlFamilyRegistry, MOONSHINE_GGML_ARCHITECTURE_ID,
-    PARAKEET_CTC_GGML_ARCHITECTURE_ID, QWEN3_ASR_GGML_ARCHITECTURE_ID,
-    WAV2VEC2_CTC_GGML_ARCHITECTURE_ID, WHISPER_GGML_ARCHITECTURE_ID,
-    XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+    COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, DOLPHIN_GGML_ARCHITECTURE_ID, GgmlFamilyRegistry,
+    MOONSHINE_GGML_ARCHITECTURE_ID, PARAKEET_CTC_GGML_ARCHITECTURE_ID,
+    QWEN3_ASR_GGML_ARCHITECTURE_ID, WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
+    WHISPER_GGML_ARCHITECTURE_ID, XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
 };
 use crate::models::oasr_metadata::{
     OASR_FEATURE_DIARIZATION_COHERE_TOKEN_STREAM_V1, OASR_METADATA_KEY_FEATURE_DIARIZATION,
@@ -86,7 +85,7 @@ impl NativeRuntimeModelAdapter {
             .with_timestamps(true)
             .with_diarization(native_runtime_metadata_supports_diarization(
                 metadata,
-                descriptor.adapter_id,
+                descriptor.self_diarizes,
             ))
             .with_quantized_models(true)
             .with_hardware_acceleration(true);
@@ -789,11 +788,18 @@ pub(crate) fn native_runtime_path_supports_diarization(path: &Path) -> bool {
         .is_some_and(|adapter| adapter.capabilities().supports_diarization)
 }
 
+/// Diarization support for a runtime pack: the family must be capable of
+/// self-diarizing (`GgmlFamilyAdapterDescriptor::self_diarizes`, declared once
+/// on the arch descriptor -- see `arch::OpenAsrArchitectureDescriptor::self_diarizes`)
+/// AND the specific pack must carry the runtime metadata/tokens a real
+/// self-diarizing decode needs. The family-level fact is descriptor-driven so
+/// no call site re-derives "which family self-diarizes" from an `adapter_id`
+/// string match; only the per-pack verification stays here.
 pub(crate) fn native_runtime_metadata_supports_diarization(
     metadata: &crate::GgufMetadata,
-    adapter_id: &str,
+    self_diarizes: bool,
 ) -> bool {
-    adapter_id == COHERE_TRANSCRIBE_GGML_ADAPTER_ID
+    self_diarizes
         && metadata
             .get_string(OASR_METADATA_KEY_FEATURE_DIARIZATION)
             .is_some_and(|value| value.trim() == OASR_FEATURE_DIARIZATION_COHERE_TOKEN_STREAM_V1)
@@ -1281,7 +1287,10 @@ mod tests {
 
         let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
 
-        assert_eq!(adapter.adapter_id(), COHERE_TRANSCRIBE_GGML_ADAPTER_ID);
+        assert_eq!(
+            adapter.adapter_id(),
+            crate::COHERE_TRANSCRIBE_GGML_ADAPTER_ID
+        );
         assert_eq!(adapter.model_family(), "cohere-transcribe");
         let capabilities = adapter.capabilities();
         assert!(capabilities.is_native_adapter());
