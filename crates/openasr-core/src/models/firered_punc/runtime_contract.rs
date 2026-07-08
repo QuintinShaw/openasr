@@ -19,9 +19,11 @@ use super::config::{
 };
 use crate::arch::GENERAL_ARCHITECTURE_KEY;
 
-/// Returns `true` when the pack declares the FireRedPunc architecture. Used by
-/// the pull-time dispatch to route punctuation packs to this family instead of
-/// the ASR/translation adapters.
+/// Returns `true` when the pack declares the FireRedPunc architecture. The
+/// pull-time dispatch (`crate::models::aux_pack_registry`) matches the same
+/// `general.architecture` value directly against
+/// [`FIRERED_PUNC_ARCHITECTURE_VALUE`] rather than calling this helper; it
+/// stays as the geometry-parsing internal check and its own unit tests below.
 pub(crate) fn metadata_declares_firered_punc<M: ScalarMetadataView>(metadata: &M) -> bool {
     metadata
         .get_string_scalar(GENERAL_ARCHITECTURE_KEY)
