@@ -167,7 +167,38 @@ pub(crate) struct OpenAsrComponentDescriptor {
     pub id: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How this architecture's encoder attends over time -- the single
+/// declaration of the encoder memory-scaling fact that longform safety caps
+/// consult (see `native_transcribe::apply_encoder_attention_span_longform_safety_policy`).
+/// A pure compute/memory-footprint property, independent of the
+/// `ConservativeSeq2SeqV1` decode-side longform profile
+/// (`BuiltinDecodePolicyLongformProfile`, issue #60's repetition guard): a
+/// family can carry both a `GlobalQuadratic` encoder cap and a tighter
+/// `ConservativeSeq2SeqV1` chunk cap at once. Both constrain the same
+/// `LongFormOptions` fields, so the tighter cap always wins (the policy
+/// applies them in sequence and never widens a value the other narrowed).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum OpenAsrEncoderAttentionSpan {
+    /// Full O(frames^2) self-attention over the whole encoder input: every
+    /// additional second of audio in a single chunk adds one more row and
+    /// column to every layer's attention matrix, so encoder activation memory
+    /// grows quadratically with the wall-clock length of that chunk.
+    /// `max_safe_chunk_seconds` is the longest chunk this repo has validated
+    /// as safe on commodity RAM; longform slicing must never hand this
+    /// architecture a chunk longer than that (issue #68).
+    GlobalQuadratic { max_safe_chunk_seconds: f32 },
+    /// Architecture-fixed attention window (whisper's 30s log-mel frame): the
+    /// encoder never attends beyond a fixed span regardless of the requested
+    /// longform chunk length, so no additional longform safety cap applies.
+    FixedWindow,
+    /// Local/chunked attention with a bounded per-chunk cache (zipformer's
+    /// streaming multi-scale encoder): encoder memory is bounded per chunk by
+    /// construction, independent of how long the logical longform chunk is,
+    /// so no additional longform safety cap applies.
+    LocalChunked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct OpenAsrArchitectureDescriptor {
     pub runtime_architecture_aliases: &'static [&'static str],
     pub model_family: &'static str,
@@ -216,9 +247,29 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     /// hand-written executor and are never composed (whisper, the bit-level
     /// regression gate). See [`block_stack`].
     pub block_stack: Option<OpenAsrBlockStackDescriptor>,
+    /// How this architecture's encoder scales with chunk length -- the single
+    /// source of truth `native_transcribe`'s longform safety policy consults
+    /// to keep long, pause-free audio from handing a quadratic-attention
+    /// encoder an unbounded chunk (issue #68). See
+    /// [`OpenAsrEncoderAttentionSpan`]. A mandatory field (not `Option`) so a
+    /// new architecture cannot compile without declaring it.
+    pub encoder_attention_span: OpenAsrEncoderAttentionSpan,
 }
 
 impl OpenAsrArchitectureDescriptor {
+    /// The longform chunk-length safety cap this architecture's encoder
+    /// tolerates, if any (`None` when the encoder needs no additional cap --
+    /// `FixedWindow`/`LocalChunked`). See [`OpenAsrEncoderAttentionSpan`].
+    pub(crate) fn longform_max_safe_chunk_seconds(self) -> Option<f32> {
+        match self.encoder_attention_span {
+            OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                max_safe_chunk_seconds,
+            } => Some(max_safe_chunk_seconds),
+            OpenAsrEncoderAttentionSpan::FixedWindow
+            | OpenAsrEncoderAttentionSpan::LocalChunked => None,
+        }
+    }
+
     fn matches_runtime_architecture_alias(&self, alias: &str) -> bool {
         self.runtime_architecture_aliases
             .iter()
@@ -256,7 +307,7 @@ pub(crate) fn emits_punctuation_for_model_architecture(model_architecture: &str)
         .and_then(|descriptor| descriptor.emits_punctuation)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum OpenAsrArchitectureRegistryError {
     MissingComponentReference {
         model_architecture: &'static str,
@@ -306,6 +357,13 @@ pub(crate) enum OpenAsrArchitectureRegistryError {
     NonCtcShapeMustHaveDecoderStage {
         model_architecture: &'static str,
         orchestration_shape: OpenAsrOrchestrationShape,
+    },
+    /// A `GlobalQuadratic` encoder declared a `max_safe_chunk_seconds` that is
+    /// not finite and positive. Garbage data here would silently disable the
+    /// longform safety cap it exists to enforce (issue #68).
+    EncoderAttentionSpanNotFinitePositive {
+        model_architecture: &'static str,
+        max_safe_chunk_seconds: f32,
     },
 }
 
@@ -400,6 +458,7 @@ impl OpenAsrArchitectureRegistry {
             )?;
             Self::validate_hparam_schema(*descriptor)?;
             Self::validate_block_stack(*descriptor)?;
+            Self::validate_encoder_attention_span(*descriptor)?;
         }
         Ok(())
     }
@@ -472,6 +531,29 @@ impl OpenAsrArchitectureRegistry {
                     key,
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Fail-closed consistency check on the encoder-attention-span cap: a
+    /// `GlobalQuadratic` architecture's `max_safe_chunk_seconds` must be
+    /// finite and positive, otherwise the longform safety policy that reads
+    /// it (`native_transcribe::apply_encoder_attention_span_longform_safety_policy`)
+    /// would silently no-op on garbage data.
+    fn validate_encoder_attention_span(
+        descriptor: OpenAsrArchitectureDescriptor,
+    ) -> Result<(), OpenAsrArchitectureRegistryError> {
+        if let OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+            max_safe_chunk_seconds,
+        } = descriptor.encoder_attention_span
+            && !(max_safe_chunk_seconds.is_finite() && max_safe_chunk_seconds > 0.0)
+        {
+            return Err(
+                OpenAsrArchitectureRegistryError::EncoderAttentionSpanNotFinitePositive {
+                    model_architecture: descriptor.model_architecture,
+                    max_safe_chunk_seconds,
+                },
+            );
         }
         Ok(())
     }
@@ -835,6 +917,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                 tensor_name_scope: "dec.blk",
             }),
         }),
+        // Conformer encoder is full self-attention over the whole chunk:
+        // quadratic in chunk length, same 30s safe ceiling as the other
+        // global-quadratic builtins (issue #68).
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+            max_safe_chunk_seconds: 30.0,
+        },
     },
     OpenAsrArchitectureDescriptor {
         runtime_architecture_aliases: &["whisper"],
@@ -856,6 +944,10 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // never composed — no block-stack data until P9 sinks its optimizations
         // into the shared blocks.
         block_stack: None,
+        // Architecture-fixed 30s log-mel window: the encoder never sees more
+        // than a fixed span no matter how long the requested longform chunk
+        // is, so it needs no additional longform safety cap.
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::FixedWindow,
     },
     OpenAsrArchitectureDescriptor {
         runtime_architecture_aliases: &[QWEN3_ARCHITECTURE_VALUE],
@@ -893,6 +985,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                 tensor_name_scope: "blk",
             }),
         }),
+        // The audio encoder is full self-attention over the whole chunk:
+        // quadratic in chunk length (issue #68); the LLM decoder side is
+        // autoregressive token generation, not chunk-length-scaled encoder
+        // attention, so it does not change this classification.
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+            max_safe_chunk_seconds: 30.0,
+        },
     },
     OpenAsrArchitectureDescriptor {
         runtime_architecture_aliases: &["parakeet-ctc", "parakeet"],
@@ -925,6 +1024,11 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             }),
             decoder_stage: None,
         }),
+        // FastConformer encoder is full self-attention over the whole chunk:
+        // quadratic in chunk length (issue #68).
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+            max_safe_chunk_seconds: 30.0,
+        },
     },
     OpenAsrArchitectureDescriptor {
         runtime_architecture_aliases: &["parakeet-tdt"],
@@ -959,6 +1063,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // orchestration shape -- dedicated executor, like xasr (block_stack:
         // None).
         block_stack: None,
+        // The FastConformer encoder is full self-attention over the whole
+        // chunk: quadratic in chunk length (issue #68). The TDT
+        // decoder/joiner is a separate autoregressive stage and does not
+        // change the encoder's scaling.
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+            max_safe_chunk_seconds: 30.0,
+        },
     },
     OpenAsrArchitectureDescriptor {
         runtime_architecture_aliases: &["wav2vec2-ctc", "wav2vec2"],
@@ -988,6 +1099,11 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             }),
             decoder_stage: None,
         }),
+        // Post-norm transformer encoder is full self-attention over the
+        // whole chunk: quadratic in chunk length (issue #68).
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+            max_safe_chunk_seconds: 30.0,
+        },
     },
     OpenAsrArchitectureDescriptor {
         runtime_architecture_aliases: &["xasr-zipformer", "xasr-zh-en"],
@@ -1011,6 +1127,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // decoder/joiner, so it stays on its dedicated executor rather than the
         // generic block-stack composer.
         block_stack: None,
+        // Zipformer2's multi-scale streaming cache is local/chunked
+        // attention with a bounded per-chunk cache, not global quadratic
+        // attention: encoder memory is bounded independent of the logical
+        // longform chunk length, so no additional longform safety cap
+        // applies (issue #68).
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::LocalChunked,
     },
     OpenAsrArchitectureDescriptor {
         runtime_architecture_aliases: &["moonshine", "moonshine-encoder-decoder"],
@@ -1032,6 +1154,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // dedicated executor (not the data-driven block-stack composer — its
         // RoPE conv-stem encoder + cross-attn decoder are not composer blocks).
         block_stack: None,
+        // The RoPE encoder is full self-attention over the whole chunk:
+        // quadratic in chunk length (issue #68). Also carries the tighter
+        // `ConservativeSeq2SeqV1` decode-side longform profile (issue #60);
+        // the two caps combine by taking the min.
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+            max_safe_chunk_seconds: 30.0,
+        },
     },
     OpenAsrArchitectureDescriptor {
         runtime_architecture_aliases: &[DOLPHIN_GGML_ARCHITECTURE_ID, "dolphin"],
@@ -1061,6 +1190,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // dedicated executor (the E-Branchformer block is not a composer block
         // kind), so no data-driven block-stack descriptor.
         block_stack: None,
+        // The E-Branchformer's rel-pos MHSA global branch is full
+        // self-attention over the whole chunk: quadratic in chunk length
+        // (issue #68).
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+            max_safe_chunk_seconds: 30.0,
+        },
     },
     OpenAsrArchitectureDescriptor {
         runtime_architecture_aliases: &[SENSEVOICE_GGML_ARCHITECTURE_ID, "sensevoice"],
@@ -1092,6 +1227,11 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             }),
             decoder_stage: None,
         }),
+        // SAN-M/FSMN encoder's self-attention memory block is full attention
+        // over the whole chunk: quadratic in chunk length (issue #68).
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+            max_safe_chunk_seconds: 30.0,
+        },
     },
     OpenAsrArchitectureDescriptor {
         runtime_architecture_aliases: &[FIRERED_AED_GGML_ARCHITECTURE_ID, "firered-aed"],
@@ -1120,6 +1260,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // on the dedicated executor (the Conformer block is not a composer
         // block kind), so no data-driven block-stack descriptor.
         block_stack: None,
+        // Conformer encoder is full self-attention over the whole chunk:
+        // quadratic in chunk length (issue #68). Also carries the tighter
+        // `ConservativeSeq2SeqV1` decode-side longform profile (issue #60);
+        // the two caps combine by taking the min.
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+            max_safe_chunk_seconds: 30.0,
+        },
     },
 ];
 
@@ -1185,6 +1332,149 @@ mod tests {
             registry.descriptors().len(),
             "expectation table must cover every builtin architecture, no more, no less"
         );
+    }
+
+    /// Pins `encoder_attention_span` per builtin architecture -- the single
+    /// Rust-side declaration `native_transcribe`'s longform safety policy
+    /// consults to cap chunk length for quadratic-attention encoders (issue
+    /// #68). Whisper's fixed 30s window and zipformer's local/chunked
+    /// streaming encoder need no additional cap; every other builtin
+    /// architecture's encoder is full self-attention over the whole chunk,
+    /// so all nine are `GlobalQuadratic` with the same validated-safe 30s
+    /// ceiling.
+    #[test]
+    fn builtin_architectures_declare_encoder_attention_span() {
+        let expected: &[(&str, OpenAsrEncoderAttentionSpan)] = &[
+            (
+                COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                    max_safe_chunk_seconds: 30.0,
+                },
+            ),
+            (
+                WHISPER_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::FixedWindow,
+            ),
+            (
+                QWEN3_ASR_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                    max_safe_chunk_seconds: 30.0,
+                },
+            ),
+            (
+                PARAKEET_CTC_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                    max_safe_chunk_seconds: 30.0,
+                },
+            ),
+            (
+                PARAKEET_TDT_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                    max_safe_chunk_seconds: 30.0,
+                },
+            ),
+            (
+                WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                    max_safe_chunk_seconds: 30.0,
+                },
+            ),
+            (
+                XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::LocalChunked,
+            ),
+            (
+                MOONSHINE_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                    max_safe_chunk_seconds: 30.0,
+                },
+            ),
+            (
+                DOLPHIN_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                    max_safe_chunk_seconds: 30.0,
+                },
+            ),
+            (
+                SENSEVOICE_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                    max_safe_chunk_seconds: 30.0,
+                },
+            ),
+            (
+                FIRERED_AED_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                    max_safe_chunk_seconds: 30.0,
+                },
+            ),
+        ];
+        let registry = OpenAsrArchitectureRegistry::with_builtins();
+        let mut seen = std::collections::BTreeSet::new();
+
+        for (model_architecture, expected_span) in expected.iter().copied() {
+            let descriptor = registry
+                .find_by_model_architecture(model_architecture)
+                .unwrap_or_else(|| panic!("missing builtin architecture '{model_architecture}'"));
+            assert_eq!(
+                descriptor.encoder_attention_span, expected_span,
+                "'{model_architecture}' encoder_attention_span mismatch"
+            );
+            assert_eq!(
+                descriptor.longform_max_safe_chunk_seconds(),
+                match expected_span {
+                    OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                        max_safe_chunk_seconds,
+                    } => Some(max_safe_chunk_seconds),
+                    OpenAsrEncoderAttentionSpan::FixedWindow
+                    | OpenAsrEncoderAttentionSpan::LocalChunked => None,
+                },
+                "'{model_architecture}' longform_max_safe_chunk_seconds accessor mismatch"
+            );
+            seen.insert(model_architecture);
+        }
+
+        assert_eq!(
+            seen.len(),
+            registry.descriptors().len(),
+            "expectation table must cover every builtin architecture, no more, no less"
+        );
+    }
+
+    #[test]
+    fn validate_references_rejects_non_finite_positive_encoder_attention_span_cap() {
+        let base = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(FIRERED_AED_GGML_ARCHITECTURE_ID)
+            .expect("firered architecture");
+
+        for bad_value in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+            let descriptor = OpenAsrArchitectureDescriptor {
+                encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                    max_safe_chunk_seconds: bad_value,
+                },
+                ..base
+            };
+            let error = OpenAsrArchitectureRegistry::validate_encoder_attention_span(descriptor)
+                .expect_err("non-finite/non-positive max_safe_chunk_seconds must fail closed");
+            // NaN != NaN under PartialEq, so match structurally instead of
+            // asserting equality against a NaN-carrying expected value.
+            match error {
+                OpenAsrArchitectureRegistryError::EncoderAttentionSpanNotFinitePositive {
+                    model_architecture,
+                    max_safe_chunk_seconds,
+                } => {
+                    assert_eq!(model_architecture, FIRERED_AED_GGML_ARCHITECTURE_ID);
+                    assert!(
+                        max_safe_chunk_seconds == bad_value
+                            || (max_safe_chunk_seconds.is_nan() && bad_value.is_nan())
+                    );
+                }
+                other => panic!("unexpected error variant: {other:?}"),
+            }
+        }
+
+        // A well-formed cap still validates.
+        OpenAsrArchitectureRegistry::validate_encoder_attention_span(base)
+            .expect("firered's real descriptor has a valid encoder_attention_span cap");
     }
 
     #[test]
