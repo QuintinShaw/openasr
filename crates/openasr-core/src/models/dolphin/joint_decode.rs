@@ -22,6 +22,7 @@ use crate::ggml_runtime::{
 
 use super::decoder_graph::{DolphinDecoderConfig, DolphinDecoderError, decode_prompt_logits};
 use super::encoder_graph::DolphinWeightProvider;
+use crate::models::spm_decoder::{SpmDecoderConfig, decode_spm_pieces};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DolphinJointDecodeError {
@@ -520,30 +521,10 @@ fn score_hypothesis(
 /// token (a bare CJK char, or a continuation piece with no marker) is
 /// concatenated directly, exactly as before.
 pub(crate) fn detokenize_char_tokens(token_ids: &[u32], tokens: &[String]) -> String {
-    const WORD_START_MARKER: char = '\u{2581}'; // SentencePiece "▁"
-    let mut text = String::new();
-    for &id in token_ids {
-        let Some(token) = tokens.get(id as usize) else {
-            continue;
-        };
-        if is_special_token(token) {
-            continue;
-        }
-        match token.strip_prefix(WORD_START_MARKER) {
-            Some(rest) => {
-                if !text.is_empty() {
-                    text.push(' ');
-                }
-                text.push_str(rest);
-            }
-            None => text.push_str(token),
-        }
-    }
-    text
-}
-
-fn is_special_token(token: &str) -> bool {
-    token.starts_with('<') && token.ends_with('>') && token.len() >= 2
+    let pieces = token_ids
+        .iter()
+        .filter_map(|&id| tokens.get(id as usize).map(String::as_str));
+    decode_spm_pieces(pieces, SpmDecoderConfig::MIXED_UNIGRAM_LEADING_MARKER)
 }
 
 #[cfg(test)]
