@@ -26,6 +26,12 @@ contributors -- crate relationships, the audio-to-transcript pipeline, and the
 | --- | --- |
 | [OASR Package Contract v1](format/OASR_PACKAGE_CONTRACT_V1.md) | Normative `.oasr` distribution contract: v1 payload is standard GGUF bytes; separates the extension-agnostic container probe from the user-facing extension check; runtime/backend selection is metadata-driven, not free-form string parsing. |
 
+## Design docs (`docs/design/`)
+
+| Doc | What it covers |
+| --- | --- |
+| [Model Onboarding Contract](design/model-onboarding-contract.md) | Reviewer-facing anti-fragmentation contract for new ASR-architecture PRs: the shared registration/decode/packaging/tokenizer/`nn/`/capabilities/progress facilities every family must reuse instead of re-implementing, plus a PR checklist. Written after the FireRedASR-AED long-audio repetition bug (issue #60) showed the cost of a family bypassing the shared decode driver. |
+
 ## Speaker diarization
 
 | Doc | What it covers |
