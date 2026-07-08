@@ -167,10 +167,13 @@ jobs:
           #   * build.rs drives ggml's C++ via CMake using the MSVC `cl` that
           #     cc::windows_registry::find_tool(target=aarch64-pc-windows-msvc)
           #     resolves; that needs the "MSVC v143 ARM64 build tools" VS
-          #     component present on the runner. build.rs does not pass CMake an
-          #     explicit `-A ARM64`, so if the default generator platform fights
-          #     the pinned arm64 cl this leg fails here (build.rs follow-up:
-          #     wire the ARM64 generator platform for a windows arm cross).
+          #     component, installed below via `vs_installer.exe modify` (the
+          #     hosted runner's preinstalled VS only carries the x86_64 v143
+          #     toolset). build.rs now also forces the Ninja generator for this
+          #     leg (same as the CUDA/HIP/Vulkan Windows legs) so the pinned
+          #     arm64 `cl.exe` drives the whole build instead of fighting the
+          #     default multi-arch Visual Studio generator platform -- see the
+          #     is_windows_arm64 comment in build.rs for the full reasoning.
           #   * ring/rustls support aarch64-pc-windows-msvc (0.17+), so the Rust
           #     dep tree itself is expected to be fine.
           # Validate via `workflow_dispatch` before the next real release, and
@@ -315,11 +318,38 @@ jobs:
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\Bin"
 
-      - name: Ensure Ninja
-        if: runner.os == 'Windows' && (matrix.features == 'vulkan' || matrix.features == 'cuda' || matrix.features == 'hip')
+      - name: Install MSVC ARM64 build tools
+        if: matrix.rust_target == 'aarch64-pc-windows-msvc'
         shell: pwsh
-        # build.rs only forces the Ninja generator for Windows GPU-feature
-        # builds (Linux keeps cmake's default Unix Makefiles generator).
+        # windows-latest preinstalls VS with only the x86_64 v143 toolset.
+        # build.rs cross-compiles ggml for aarch64-pc-windows-msvc via
+        # cc::windows_registry::find_tool(target=aarch64-...), which needs the
+        # Hostx64/arm64 `cl.exe` from the "VC.Tools.ARM64" component. Modify
+        # the existing VS install in place rather than provisioning a second
+        # VS install.
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -latest -products * -property installationPath
+          if (-not $installPath) { Write-Error "no Visual Studio installation found"; exit 1 }
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          $proc = Start-Process -FilePath $installer -ArgumentList @(
+            "modify",
+            "--installPath", "`"$installPath`"",
+            "--add", "Microsoft.VisualStudio.Component.VC.Tools.ARM64",
+            "--quiet", "--norestart", "--nocache"
+          ) -NoNewWindow -PassThru -Wait
+          if ($proc.ExitCode -ne 0) {
+            Write-Error "vs_installer modify failed with exit code $($proc.ExitCode)"
+            exit 1
+          }
+
+      - name: Ensure Ninja
+        if: runner.os == 'Windows' && (matrix.features == 'vulkan' || matrix.features == 'cuda' || matrix.features == 'hip' || matrix.rust_target == 'aarch64-pc-windows-msvc')
+        shell: pwsh
+        # build.rs forces the Ninja generator for Windows GPU-feature builds
+        # and the windows-arm64 cross leg (Linux keeps cmake's default Unix
+        # Makefiles generator).
         run: |
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y }
           ninja --version

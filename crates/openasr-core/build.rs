@@ -23,6 +23,11 @@ fn main() {
     let feat_openmp = env::var("CARGO_FEATURE_OPENMP").is_ok();
     let feat_native = env::var("CARGO_FEATURE_NATIVE").is_ok();
     let is_windows = target.contains("windows");
+    // Windows arm64, always cross-compiled from an x86_64 host runner (there is
+    // no arm64 GitHub-hosted Windows runner today). See the Ninja-generator
+    // block below for why this needs the same generator override as the GPU
+    // Windows legs.
+    let is_windows_arm64 = is_windows && target.starts_with("aarch64");
     // The android triple (e.g. aarch64-linux-android) also contains "linux", so
     // it must be detected explicitly and BEFORE any `contains("linux")` check.
     let is_android = target.contains("android");
@@ -257,7 +262,21 @@ fn main() {
     // build customizations, which trail new VS majors (VS 2026 has no CUDA
     // toolset yet -> "No CUDA toolset found"). Ninja drives nvcc directly
     // with the MSVC host compiler pinned below instead.
-    if (feat_hip || feat_vulkan || feat_cuda) && is_windows {
+    //
+    // The windows arm64 cross build (host x86_64, target aarch64-pc-windows-msvc)
+    // joins them for a different reason: the default CMake Visual Studio
+    // generator is multi-arch and, without an explicit `-A ARM64` / matching
+    // `CMAKE_GENERATOR_PLATFORM`, configures for the HOST platform (x64) --
+    // which then fights the arm64 `cl.exe` pinned below via msvc_tool (CMake's
+    // compiler-works check invokes that arm64 cl through a VS project shaped
+    // for x64, and fails or silently produces host-arch objects that fail the
+    // final aarch64-pc-windows-msvc rust-lld link). Ninja has no per-arch
+    // generator platform concept: it just invokes whatever compiler CMake is
+    // told about (the pinned arm64 `cl.exe` + its INCLUDE/LIB/PATH env from
+    // `msvc_tool.env()` below), so the arch is determined solely by that
+    // compiler -- the same mechanism already proven for the CUDA/HIP/Vulkan
+    // Windows legs above.
+    if (feat_hip || feat_vulkan || feat_cuda || is_windows_arm64) && is_windows {
         configure.arg("-G").arg("Ninja");
     }
     if is_macos {
