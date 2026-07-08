@@ -66,23 +66,52 @@ pub(crate) async fn translations(
     .await
 }
 
+/// Fixed denominator for the backward-compatible `done`/`total` ratio: `done /
+/// total == fraction`. Only exists so clients that predate the `fraction` field
+/// keep working; new clients read `fraction` directly.
+const PROGRESS_LEGACY_SCALE: u32 = 1000;
+
 #[derive(serde::Serialize)]
 pub(crate) struct TranscriptionProgressBody {
-    /// Slices decoded so far in the in-flight long-form run.
-    done: usize,
-    /// Total slices in the in-flight long-form run; `0` when no long-form run is
-    /// active (the client then falls back to a time-based estimate).
-    total: usize,
+    /// Coarse phase label of the in-flight run (`"decode"`, `"assemble"`, or
+    /// `"align"`), or `null` when no native run is in flight. The UI may show this
+    /// as phase text (e.g. "Refining word timestamps") next to the bar.
+    phase: Option<&'static str>,
+    /// Monotonic overall progress in `0.0..=1.0`; `0.0` when idle. The UI progress
+    /// bar reads this directly -- it already spans decode, assembly, and the
+    /// forced-align refine, so it no longer stalls near the end.
+    fraction: f32,
+    /// Backward-compatible ratio for clients that predate `fraction`: `done/total`
+    /// equals `fraction`. `total` is `0` when idle, so legacy clients still fall
+    /// back to a time-based estimate exactly as before.
+    done: u32,
+    total: u32,
 }
 
-/// Coarse progress of the in-flight long-form file transcription, for the UI
-/// progress bar. Returns `{done:0,total:0}` when nothing long-form is running:
-/// short single-pass decodes have no slices to count, so the client estimates.
-/// Auth is enforced by the shared middleware like every other non-operator route.
+/// Progress of the in-flight file transcription, for the UI progress bar. Returns
+/// `{phase:null,fraction:0,done:0,total:0}` when nothing is running: short
+/// single-pass decodes expose no sub-step, so the client estimates from elapsed
+/// time. Auth is enforced by the shared middleware like every other non-operator
+/// route.
 pub(crate) async fn transcription_progress() -> Json<TranscriptionProgressBody> {
-    let (done, total) =
-        openasr_core::api::backend::native_transcription_progress().unwrap_or((0, 0));
-    Json(TranscriptionProgressBody { done, total })
+    let body = match openasr_core::api::backend::native_transcription_progress() {
+        Some(progress) => {
+            let fraction = progress.fraction.clamp(0.0, 1.0);
+            TranscriptionProgressBody {
+                phase: Some(progress.phase.label()),
+                fraction,
+                done: (fraction * PROGRESS_LEGACY_SCALE as f32).round() as u32,
+                total: PROGRESS_LEGACY_SCALE,
+            }
+        }
+        None => TranscriptionProgressBody {
+            phase: None,
+            fraction: 0.0,
+            done: 0,
+            total: 0,
+        },
+    };
+    Json(body)
 }
 
 /// Shared non-streaming transcription/translation core. `task_override` forces
@@ -1327,6 +1356,21 @@ mod native_runtime_tests {
         // uploads on that basis, matching pull.rs's `ensure_available_space`.
         let dir = std::path::Path::new("/tmp/openasr-upload-test");
         assert!(check_disk_headroom_bytes(None, dir).is_ok());
+    }
+
+    // Locks the wire shape of GET /v1/audio/transcriptions/progress. No native run
+    // is in flight in this unit test, so the idle body must stay backward
+    // compatible: `total == 0` keeps legacy clients on their time-based estimate,
+    // and the new `phase`/`fraction` fields are present (null / 0.0) for clients
+    // that read them.
+    #[tokio::test]
+    async fn transcription_progress_idle_body_is_backward_compatible() {
+        let axum::Json(body) = super::transcription_progress().await;
+        let value = serde_json::to_value(&body).expect("progress body serializes");
+        assert_eq!(value["phase"], serde_json::Value::Null);
+        assert_eq!(value["fraction"], serde_json::json!(0.0));
+        assert_eq!(value["done"], serde_json::json!(0));
+        assert_eq!(value["total"], serde_json::json!(0));
     }
 }
 
