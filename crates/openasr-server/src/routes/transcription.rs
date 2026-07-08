@@ -128,13 +128,55 @@ pub(crate) struct TranscriptionControlBody {
 /// RAII cleanup that removes an in-flight transcription's control from the
 /// registry when the request handler returns (success, error, or cancel), so a
 /// finished transcription's id can never be paused/canceled afterward.
+///
+/// This is also the leak-prevention safety net for a client that disconnects
+/// mid-run. A paused (or still-decoding) native transcription holds its
+/// `spawn_blocking` worker thread parked on `TranscriptionControl`'s Condvar
+/// until a resume/cancel arrives; if the client goes away first (closes the
+/// connection, or the app quits), nothing would ever wake that thread. Axum
+/// drops the handler's async future when the connection closes, which drops
+/// every local still live at the suspended `.await` point -- including this
+/// guard. While `armed`, `Drop` fires `control.request_cancel()` so the
+/// worker wakes at the next slice boundary (immediately, if it was parked
+/// mid-pause) and unwinds through `TranscriptionCanceled` instead of leaking
+/// its thread forever. `disarm()` is called right after the decode call
+/// returns on its own (success or failure) -- from that point on there is no
+/// more worker thread to protect, so a normal completion must never also
+/// fire a spurious cancel.
 struct ActiveTranscriptionCleanup {
     distribution: DistributionContext,
     transcription_id: String,
+    control: Arc<openasr_core::TranscriptionControl>,
+    armed: bool,
+}
+
+impl ActiveTranscriptionCleanup {
+    fn new(
+        distribution: DistributionContext,
+        transcription_id: String,
+        control: Arc<openasr_core::TranscriptionControl>,
+    ) -> Self {
+        Self {
+            distribution,
+            transcription_id,
+            control,
+            armed: true,
+        }
+    }
+
+    /// Disarms the disconnect-cancel safety net. Call this once the decode
+    /// call has returned by itself (success or failure); doing so before then
+    /// would let a genuine mid-decode disconnect leak the worker thread.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for ActiveTranscriptionCleanup {
     fn drop(&mut self) {
+        if self.armed {
+            self.control.request_cancel();
+        }
         self.distribution
             .clear_transcription(&self.transcription_id);
     }
@@ -252,15 +294,26 @@ async fn run_offline_transcription(
             distribution.register_transcription(&id, Arc::clone(&control));
             (id, control)
         });
-    let _control_cleanup = control.as_ref().map(|(id, _)| ActiveTranscriptionCleanup {
-        distribution: distribution.clone(),
-        transcription_id: id.clone(),
+    // Armed for as long as the decode call below is in flight: if the client
+    // disconnects and axum drops this handler future first, `Drop` cancels the
+    // control so the (possibly paused) worker thread wakes and exits instead
+    // of leaking. Disarmed immediately after that call returns, either way.
+    let mut control_cleanup = control.as_ref().map(|(id, control)| {
+        ActiveTranscriptionCleanup::new(distribution.clone(), id.clone(), Arc::clone(control))
     });
     let control_handle = control.as_ref().map(|(_, control)| Arc::clone(control));
     let transcription =
         match transcribe_with_runtime(runtime, parsed.request, control_handle.clone()).await {
-            Ok(transcription) => transcription,
+            Ok(transcription) => {
+                if let Some(cleanup) = control_cleanup.as_mut() {
+                    cleanup.disarm();
+                }
+                transcription
+            }
             Err(error) => {
+                if let Some(cleanup) = control_cleanup.as_mut() {
+                    cleanup.disarm();
+                }
                 // A cancel surfaces from core as a generic fail-closed error (the
                 // typed cancel is flattened through the NativeAsrError layer), so
                 // consult the control to report it honestly as a 409 canceled result
@@ -933,6 +986,77 @@ mod native_model_ref_tests {
             "qwen3-asr-0.6b:typo",
             "qwen3-asr-0.6b:q8_0"
         ));
+    }
+}
+
+/// Coverage for the disconnect-cancel safety net: `ActiveTranscriptionCleanup`
+/// must cancel the control when dropped while still armed (simulating the
+/// handler future being dropped mid-decode on a client disconnect), and must
+/// not when disarmed first (the normal completion path).
+#[cfg(test)]
+mod active_transcription_cleanup_tests {
+    use std::sync::Arc;
+
+    use super::{ActiveTranscriptionCleanup, DistributionContext, DistributionRuntime};
+
+    fn distribution_for_test() -> DistributionContext {
+        DistributionContext::new(DistributionRuntime {
+            openasr_home: None,
+            catalog_url: None,
+        })
+    }
+
+    #[test]
+    fn drop_while_armed_cancels_control_and_clears_registry() {
+        let distribution = distribution_for_test();
+        let control = Arc::new(openasr_core::TranscriptionControl::new());
+        distribution.register_transcription("txn-disconnect", Arc::clone(&control));
+
+        {
+            let _cleanup = ActiveTranscriptionCleanup::new(
+                distribution.clone(),
+                "txn-disconnect".to_string(),
+                Arc::clone(&control),
+            );
+            assert!(!control.is_canceled());
+            // Dropped here without ever calling `disarm()`, exactly as happens
+            // when a client disconnects and axum drops the handler future
+            // before the decode call above it returns.
+        }
+
+        assert!(
+            control.is_canceled(),
+            "a disconnect before disarm must cancel the control so a paused/decoding worker thread wakes and exits"
+        );
+        assert!(
+            distribution
+                .transcription_control("txn-disconnect")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn disarm_then_drop_does_not_cancel_but_still_clears_registry() {
+        let distribution = distribution_for_test();
+        let control = Arc::new(openasr_core::TranscriptionControl::new());
+        distribution.register_transcription("txn-normal", Arc::clone(&control));
+
+        {
+            let mut cleanup = ActiveTranscriptionCleanup::new(
+                distribution.clone(),
+                "txn-normal".to_string(),
+                Arc::clone(&control),
+            );
+            cleanup.disarm();
+            // Normal completion path: disarmed right after the decode call
+            // returns, before this guard drops at the end of the handler.
+        }
+
+        assert!(
+            !control.is_canceled(),
+            "a normal completion must never fire a spurious cancel"
+        );
+        assert!(distribution.transcription_control("txn-normal").is_none());
     }
 }
 
