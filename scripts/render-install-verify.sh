@@ -9,8 +9,8 @@
 #
 # asset-names.txt: one release asset filename per line (as returned by
 # `gh release view <tag> --json assets --jq '.assets[].name'`), e.g.:
-#   openasr-0.1.8-aarch64-apple-darwin.tar.gz
-#   openasr-0.1.8-x86_64-pc-windows-msvc.zip
+#   openasr-0.1.10-macos-arm64.tar.gz
+#   openasr-0.1.10-windows-x86_64.zip
 #   SHA256SUMS
 #
 # Prints a self-delimited markdown section (including its start/end HTML
@@ -28,23 +28,26 @@ version="$1"
 repo="$2"
 tag="$3"
 
-# Human label for each known target substring. Order matters: more specific
-# substrings (with a GPU-feature suffix) must be matched before their base
-# target, since e.g. "x86_64-pc-windows-msvc-vulkan" also contains
-# "x86_64-pc-windows-msvc".
+# Human label for each known friendly asset segment (the `asset:` field in
+# release-binaries.yml, e.g. "linux-x86_64", "windows-x86_64-cuda"). Order
+# matters: a GPU/libc-suffixed name must be matched before its base, since a
+# glob like windows-x86_64* would otherwise catch windows-x86_64-cuda first.
 label_for_target() {
   case "$1" in
-    x86_64-pc-windows-msvc-vulkan) echo "Windows x86_64 (Vulkan)" ;;
-    x86_64-pc-windows-msvc-cuda) echo "Windows x86_64 (CUDA)" ;;
-    x86_64-pc-windows-msvc-hip) echo "Windows x86_64 (AMD HIP/ROCm)" ;;
-    x86_64-pc-windows-msvc) echo "Windows x86_64" ;;
-    x86_64-unknown-linux-gnu-vulkan) echo "Linux x86_64 (Vulkan)" ;;
-    x86_64-unknown-linux-gnu-cuda) echo "Linux x86_64 (CUDA)" ;;
-    x86_64-unknown-linux-gnu-rocm) echo "Linux x86_64 (AMD HIP/ROCm)" ;;
-    x86_64-unknown-linux-gnu) echo "Linux x86_64" ;;
-    aarch64-unknown-linux-gnu) echo "Linux arm64" ;;
-    x86_64-apple-darwin) echo "macOS x86_64 (Intel)" ;;
-    aarch64-apple-darwin) echo "macOS arm64 (Apple Silicon)" ;;
+    windows-x86_64-vulkan) echo "Windows x86_64 (Vulkan)" ;;
+    windows-x86_64-cuda) echo "Windows x86_64 (CUDA)" ;;
+    windows-x86_64-rocm) echo "Windows x86_64 (AMD ROCm)" ;;
+    windows-x86_64) echo "Windows x86_64" ;;
+    windows-arm64) echo "Windows arm64" ;;
+    linux-x86_64-vulkan) echo "Linux x86_64 (Vulkan)" ;;
+    linux-x86_64-cuda) echo "Linux x86_64 (CUDA)" ;;
+    linux-x86_64-rocm) echo "Linux x86_64 (AMD ROCm)" ;;
+    linux-x86_64-musl) echo "Linux x86_64 (musl)" ;;
+    linux-x86_64) echo "Linux x86_64" ;;
+    linux-arm64-musl) echo "Linux arm64 (musl)" ;;
+    linux-arm64) echo "Linux arm64" ;;
+    macos-x86_64) echo "macOS x86_64 (Intel)" ;;
+    macos-arm64) echo "macOS arm64 (Apple Silicon)" ;;
     *) echo "$1" ;;
   esac
 }
