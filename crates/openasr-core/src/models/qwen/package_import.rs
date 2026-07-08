@@ -25,6 +25,12 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
+// Re-exported at `pub(super)` (not just imported) because `forced_aligner_import.rs`
+// pulls these in via `use super::package_import::{insert_metadata, ...}`.
+pub(super) use crate::models::oasr_metadata::{
+    insert_metadata, insert_metadata_string_array, insert_metadata_u32,
+};
+use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
 use crate::models::runtime_tensor_contract_registry::validate_builtin_runtime_tensor_contract_for_architecture;
 use crate::models::{qwen::QWEN3_ASR_MODEL_FAMILY, qwen::runtime_contract};
 
@@ -69,15 +75,7 @@ pub struct Qwen3AsrLocalSourceImportRuntimeResult {
     pub tensor_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(non_camel_case_types)]
-pub enum Qwen3AsrRuntimeQuantizationMode {
-    #[default]
-    Fp16,
-    Q8_0,
-    Q3_K,
-    Q4_K,
-}
+pub type Qwen3AsrRuntimeQuantizationMode = PackQuant;
 
 #[derive(Debug, Deserialize)]
 struct Qwen3AsrConfigJson {
@@ -772,18 +770,7 @@ fn quantized_tensor_type_for_qwen(
         return None;
     }
     let ne0 = dims.first().copied()?;
-    if !ne0.is_multiple_of(32_u64) {
-        return None;
-    }
-    if ne0.is_multiple_of(256_u64) {
-        if quantization == Qwen3AsrRuntimeQuantizationMode::Q3_K {
-            return Some(GgufWriteTensorType::Q3_K);
-        }
-        if quantization == Qwen3AsrRuntimeQuantizationMode::Q4_K {
-            return Some(GgufWriteTensorType::Q4_K);
-        }
-    }
-    Some(GgufWriteTensorType::Q8_0)
+    classify_quant_tensor(ne0, quantization)
 }
 
 fn f32_tensor(name: &str, dims: Vec<u64>, values: Vec<f32>) -> GgufWriteTensor {
@@ -839,33 +826,6 @@ fn validate_request(
     }
     validate_output_pack_extension(&request.output_root)?;
     Ok(())
-}
-
-pub(super) fn insert_metadata(
-    metadata: &mut BTreeMap<String, GgufWriteValue>,
-    key: &str,
-    value: impl ToString,
-) {
-    metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
-}
-
-pub(super) fn insert_metadata_u32(
-    metadata: &mut BTreeMap<String, GgufWriteValue>,
-    key: &str,
-    value: u32,
-) {
-    metadata.insert(key.to_string(), GgufWriteValue::U32(value));
-}
-
-pub(super) fn insert_metadata_string_array(
-    metadata: &mut BTreeMap<String, GgufWriteValue>,
-    key: &str,
-    values: &[String],
-) {
-    metadata.insert(
-        key.to_string(),
-        GgufWriteValue::StringArray(values.to_vec()),
-    );
 }
 
 fn hann_window(length: usize) -> Vec<f32> {

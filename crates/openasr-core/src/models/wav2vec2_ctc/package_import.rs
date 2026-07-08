@@ -32,6 +32,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
+use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
 use crate::nn::wav2vec2::fold_pos_conv_weight_norm;
 
 use super::{WAV2VEC2_CTC_GGML_ARCHITECTURE_ID, WAV2VEC2_CTC_MODEL_FAMILY};
@@ -64,24 +65,7 @@ fn canonicalize_backbone_prefix(name: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(name)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(non_camel_case_types)]
-pub enum Wav2Vec2CtcQuantizationMode {
-    #[default]
-    Fp16,
-    Q8_0,
-    Q4_K,
-}
-
-impl Wav2Vec2CtcQuantizationMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Fp16 => "fp16",
-            Self::Q8_0 => "q8_0",
-            Self::Q4_K => "q4_k",
-        }
-    }
-}
+pub type Wav2Vec2CtcQuantizationMode = PackQuant;
 
 #[derive(Debug, Clone)]
 pub struct Wav2Vec2CtcImportRequest {
@@ -579,13 +563,7 @@ fn quantized_tensor_type_for_wav2vec2_tensor(
         return None;
     }
     let ne0 = dims.first().copied()?;
-    if !ne0.is_multiple_of(32_u64) {
-        return None;
-    }
-    if quantization == Wav2Vec2CtcQuantizationMode::Q4_K && ne0.is_multiple_of(256_u64) {
-        return Some(GgufWriteTensorType::Q4_K);
-    }
-    Some(GgufWriteTensorType::Q8_0)
+    classify_quant_tensor(ne0, quantization)
 }
 
 fn wav2vec2_runtime_gguf_metadata(

@@ -71,6 +71,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
+use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
 
 // --- E-Branchformer / Transformer configuration -------------------------------
 // Every structural hparam (layer counts, d_model, head count/dim, FFN/cgMLP
@@ -107,31 +108,10 @@ const DROPPED_TENSOR_PREFIXES: [&str; 2] = [
     "context_module.context_decoder_ctc_linear.",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[allow(non_camel_case_types)]
-pub enum DolphinQuantizationMode {
-    /// fp16 weights (rank>=2), f32 for 1-D vectors + CMVN + mel filterbank.
-    #[default]
-    Fp16,
-    /// q8_0 for the rank-2 `.weight` matrices (ne0 % 32 == 0); everything else
-    /// keeps its fp16-mode representation.
-    Q8_0,
-    /// q4_k for the rank-2 `.weight` matrices whose ne0 % 256 == 0, else q8_0;
-    /// everything else keeps its fp16-mode representation.
-    Q4_K,
-}
-
-impl DolphinQuantizationMode {
-    /// Canonical lowercase pack-quant tag (`fp16`/`q8_0`/`q4_k`), used to name the
-    /// output pack and report the produced rung.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Fp16 => "fp16",
-            Self::Q8_0 => "q8_0",
-            Self::Q4_K => "q4_k",
-        }
-    }
-}
+/// fp16 weights (rank>=2), f32 for 1-D vectors + CMVN + mel filterbank; q8_0 for
+/// the rank-2 `.weight` matrices (ne0 % 32 == 0); q4_k for the rank-2 `.weight`
+/// matrices whose ne0 % 256 == 0 (else q8_0). See `PackQuant`.
+pub type DolphinQuantizationMode = PackQuant;
 
 /// Which decode-prefix scheme this checkpoint's vocab uses. The cn-dialect
 /// family (small.cn, cn-dialect-base) fixes the OWSM `<lang>` slot at `<zh>`
@@ -740,14 +720,7 @@ fn dolphin_quant_type_for_tensor(
     }
     // Reversed ne0 == the safetensors innermost (last) dim == `in`.
     let ne0 = *shape.last()?;
-    if !ne0.is_multiple_of(32) {
-        return None;
-    }
-    if quantization == DolphinQuantizationMode::Q4_K && ne0.is_multiple_of(256) {
-        Some(GgufWriteTensorType::Q4_K)
-    } else {
-        Some(GgufWriteTensorType::Q8_0)
-    }
+    classify_quant_tensor(ne0, quantization)
 }
 
 /// Build one runtime tensor. Quantizable rank-2 `.weight` matrices are block-
@@ -953,7 +926,9 @@ fn dolphin_runtime_gguf_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use DolphinQuantizationMode::Fp16;
+    // `DolphinQuantizationMode` is now a type alias for the shared `PackQuant`;
+    // `use`-importing a bare variant has to name the real enum, not the alias.
+    use PackQuant::Fp16;
 
     fn string_metadata(metadata: &BTreeMap<String, GgufWriteValue>, key: &str) -> Option<String> {
         match metadata.get(key) {

@@ -29,6 +29,7 @@ pub(crate) mod local_source_import;
 pub(crate) mod lora_adapter;
 pub mod moonshine;
 pub mod oasr_metadata;
+pub mod pack_quant;
 pub(crate) mod parakeet_ctc;
 pub mod parakeet_tdt;
 pub(crate) mod phrase_bias_decode;
