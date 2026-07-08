@@ -1,7 +1,10 @@
 # Model onboarding: adding a new ASR architecture
 
 This is the contributor checklist for adding a new ASR architecture to OpenASR.
-(For getting OpenASR running, see [QUICKSTART](QUICKSTART.md).)
+(For getting OpenASR running, see [QUICKSTART](QUICKSTART.md).) For the
+reviewer-facing anti-fragmentation checklist -- which shared facilities a new
+family PR must reuse instead of re-implementing -- see the
+[Model Onboarding Contract](design/model-onboarding-contract.md).
 
 The architectural model is exactly llama.cpp's: **shared `nn/` blocks + a thin
 per-family executor that hand-writes its `compose_*` layer loop, gated by a
