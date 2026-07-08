@@ -72,6 +72,16 @@ and the open-core trust boundary. Treat them as hard constraints:
 - **Keep infrastructure model-agnostic.** Generic capabilities sink into the base
   layers; model-family semantics stay under `models/` and the `arch/` descriptors.
   Don't push family-specific tensor logic into shared infrastructure.
+- **One greedy decode driver.** Every AED / autoregressive seq2seq family reaches
+  greedy decode through the single shared driver
+  `run_seq2seq_greedy_decode_loop_v0` (via `run_builtin_seq2seq_decode_policy`). A
+  new such family MUST provide a `Seq2SeqGreedyDecodeStepExecutor` and declare a
+  decode-policy descriptor in `models/decode_policy_component_registry.rs`; it MUST
+  NOT hand-write its own argmax step loop or build a decode config that bypasses the
+  registry. Hand-rolled loops miss the shared degenerate-loop guard and drift the
+  argmax / suppression / stop-token semantics the driver centralizes (a hand-rolled
+  firered loop is what caused the long-audio repetition, issue #60). The
+  `*.greedy.seq2seq.*` registry-resolution test fails closed on a half-connect.
 
 ## Validation before you finish
 

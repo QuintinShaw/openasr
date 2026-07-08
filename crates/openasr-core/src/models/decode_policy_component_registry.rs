@@ -104,6 +104,25 @@ pub(crate) enum BuiltinDecodePolicyComponentRegistryError {
     },
 }
 
+/// Execution descriptors for every built-in decode policy whose runtime shape is
+/// one of the two the shared decode paths can drive: `Seq2SeqGreedyV0` (routed
+/// through `run_seq2seq_greedy_decode_loop_v0` via `run_builtin_seq2seq_decode_policy`)
+/// and `CtcGreedyV0` (routed through `run_builtin_ctc_decode_policy`).
+///
+/// Not every `*_DECODE_POLICY_ID` constant belongs here. A family is registered
+/// IFF its decode runs on one of those two shared shapes. Families whose decode
+/// is a dedicated non-shared loop are intentionally ABSENT, and that is the
+/// registration criterion, not an oversight. Both
+/// `xasr-zipformer.greedy.transducer.v0` and `parakeet-tdt.greedy.tdt.v0` are
+/// RNN-T / TDT transducers (prediction network plus joiner, duration-driven frame
+/// skipping): a transducer loop, not greedy seq2seq or CTC collapse. The policy
+/// `dolphin.attention-rescoring.v0` is CTC-prefix with attention rescoring, its
+/// own joint-decode loop. Those ride dedicated executors and never reach
+/// `resolve_builtin_decode_policy`.
+///
+/// The `all_seq2seq_greedy_arch_decode_policies_resolve` regression test enforces
+/// that every `*.greedy.seq2seq.*` policy IS registered, so a new seq2seq family
+/// cannot half-connect (constant present, execution descriptor missing).
 const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor] = &[
     BuiltinDecodePolicyComponentDescriptor {
         decode_policy_id: crate::COHERE_TRANSCRIBE_DECODE_POLICY_ID,
@@ -137,6 +156,36 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Text,
         longform_profile: BuiltinDecodePolicyLongformProfile::Default,
+        ctc_blank_token_id: None,
+    },
+    BuiltinDecodePolicyComponentDescriptor {
+        decode_policy_id: crate::MOONSHINE_DECODE_POLICY_ID,
+        execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
+        seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
+        seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
+        // Token-history carry mirrors cohere (the other conservative AED). The
+        // conservative longform profile caps chunk length and disables prompt
+        // carry, keeping moonshine's small-context decoder off the long-audio
+        // repetition failure mode.
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
+        ctc_blank_token_id: None,
+    },
+    BuiltinDecodePolicyComponentDescriptor {
+        // Source of truth is `crate::arch`; firered has no crate-root re-export
+        // (it is not selected through the ggml_family_registry const surface).
+        decode_policy_id: crate::arch::FIRERED_AED_DECODE_POLICY_ID,
+        execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
+        seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
+        seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
+        // firered-aed is a plain `<sos>`-prompted AED; conservative slicing is the
+        // structural fix for its long-audio repetition (issue #60).
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
         ctc_blank_token_id: None,
     },
     BuiltinDecodePolicyComponentDescriptor {
@@ -624,6 +673,40 @@ mod tests {
             error,
             BuiltinDecodePolicyComponentRegistryError::UnknownDecodePolicy { .. }
         ));
+    }
+
+    #[test]
+    fn all_seq2seq_greedy_arch_decode_policies_resolve() {
+        // Half-connect guard: every architecture whose decode policy id is a
+        // greedy-seq2seq shape MUST have a matching execution descriptor here. A
+        // new seq2seq family that registers `*.greedy.seq2seq.*` in the arch
+        // registry but forgets the execution descriptor trips this test instead
+        // of silently failing at decode time.
+        let mut checked = 0usize;
+        for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
+            if !descriptor.decode_policy_id.contains(".greedy.seq2seq.") {
+                continue;
+            }
+            let policy = resolve_builtin_decode_policy(descriptor.decode_policy_id)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "seq2seq-greedy decode policy '{}' for architecture '{}' is not registered: {error}",
+                        descriptor.decode_policy_id, descriptor.model_architecture
+                    )
+                });
+            assert_eq!(
+                policy.execution_kind,
+                BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
+                "decode policy '{}' must be Seq2SeqGreedyV0",
+                descriptor.decode_policy_id
+            );
+            checked += 1;
+        }
+        // cohere-transcribe + whisper + qwen3-asr + moonshine + firered-aed.
+        assert_eq!(
+            checked, 5,
+            "expected exactly 5 greedy-seq2seq architectures to resolve"
+        );
     }
 
     struct SyntheticStepExecutor {

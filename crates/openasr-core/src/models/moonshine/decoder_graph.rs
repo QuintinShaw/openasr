@@ -13,13 +13,13 @@ use crate::ggml_runtime::{
     GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlStaticTensor,
     GgmlStaticTensorArena,
 };
-use crate::models::decode_policy_component_registry::BuiltinDecodePolicySeq2SeqTextPostprocessKind;
-use crate::models::phrase_bias_decode::build_token_phrase_biases;
+use crate::models::decode_policy_component_registry::{
+    BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
+    BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
+};
 use crate::models::seq2seq_greedy_decode::{
-    Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult,
-    Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
-    Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyTokenDecoder,
-    run_seq2seq_greedy_decode_loop_v0,
+    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
+    Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyTokenDecoder,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::thread_local_runtime_cache::{
@@ -176,29 +176,30 @@ fn run_moonshine_decoder_short_form_with_runtime(
         .decoder_max_context
         .saturating_sub(prompt_tokens.len())
         .max(1);
-    let config = Seq2SeqGreedyDecodeConfig {
+    // moonshine routes through the shared decode-policy registry (same path as
+    // whisper/cohere/qwen) instead of hand-building a config: the descriptor
+    // declares no suppression, no extra stop tokens and Identity postprocess, so
+    // the resolved config is byte-identical to the previous inline one, and the
+    // registry owns phrase-bias tokenization against the tokenizer token source.
+    let config = BuiltinSeq2SeqDecodePolicyConfigInput {
         initial_prompt_tokens: prompt_tokens,
         eot_token_id: metadata.eos_token_id,
-        stop_token_ids: Vec::new(),
         vocab_size: metadata.vocab_size,
         max_generated_tokens,
-        suppress_first_step_token_ids: Vec::new(),
-        suppress_token_ids: Vec::new(),
-        phrase_biases: build_token_phrase_biases(phrase_bias, tokenizer).map_err(|error| {
-            MoonshineDecoderGraphError::InvalidInput {
-                reason: format!("moonshine phrase-bias tokenization failed: {error}"),
-            }
-        })?,
     };
-
-    let mut trace_token = |_: usize, _: u32, _: bool| {};
-    let mut on_topk = |_: usize, _: &[f32]| {};
-    let decode = match run_seq2seq_greedy_decode_loop_v0(
+    let decode_text_token_ids = |token_ids: &[u32]| token_decoder.decode_text_token_ids(token_ids);
+    let decode = match run_builtin_seq2seq_decode_policy::<Seq2SeqGreedyDecodeError>(
+        crate::MOONSHINE_DECODE_POLICY_ID,
         &config,
+        tokenizer,
+        phrase_bias,
         &mut step_executor,
-        &token_decoder,
-        &mut trace_token,
-        &mut on_topk,
+        &decode_text_token_ids,
+        |error| error,
+        |error| error,
+        |error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
+            reason: error.to_string(),
+        },
     ) {
         Ok(output) => output,
         Err(Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {
@@ -275,6 +276,12 @@ impl Seq2SeqGreedyTokenDecoder for MoonshineGreedyTokenDecoder<'_> {
             })
     }
 }
+
+/// moonshine has no whisper-style special control tokens (no stop tokens beyond
+/// `<eos>`, no suppression list), so the decode-policy token source is the empty
+/// default over the tokenizer, which supplies phrase-bias encoding via the
+/// [`PhraseBiasTokenEncoder`] supertrait it already implements.
+impl BuiltinSeq2SeqDecodePolicyTokenSource for MoonshineTokenizer {}
 
 /// A 2-D linear: bound zero-copy from the mmap'd pack (native q8_0 `[in,out]`)
 /// or, as a fallback, an arena-resident f32 tensor. moonshine loads its bindable

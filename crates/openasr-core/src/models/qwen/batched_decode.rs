@@ -27,10 +27,10 @@ use crate::models::seq2seq_greedy_decode::{
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
-    OwnerAliveGuard, ServeBatchEnvError, ServeBatchStepOutcome, serve_batch_bucket_width,
+    OwnerAliveGuard, ServeBatchEnvError, serve_batch_bucket_width,
     serve_batch_collect_window_from_env, serve_batch_compact_active_slots,
     serve_batch_drain_compatible_batch, serve_batch_estimate_llm_kv_slot_bytes,
-    serve_batch_max_from_env, serve_batch_owner_alive, serve_batch_select_greedy_step,
+    serve_batch_max_from_env, serve_batch_owner_alive, serve_batch_select_and_apply_greedy_step,
     serve_batch_submit_with_timeout, serve_batch_trace_enabled, serve_batch_vram_capped_max_batch,
 };
 use crate::nn::decoder::reusable_decode_graph_supported;
@@ -1928,25 +1928,17 @@ impl Qwen3AsrBatchSlot {
         &mut self,
         logits: Vec<f32>,
     ) -> Result<(), Qwen3AsrServeBatchError> {
-        match serve_batch_select_greedy_step(
+        serve_batch_select_and_apply_greedy_step(
             &self.job.decode_config,
-            &self.generated_tokens,
+            &mut self.generated_tokens,
+            &mut self.generated_probabilities,
+            &mut self.done,
             self.stop_token_ids.as_slice(),
             logits,
         )
         .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
             reason: error.to_string(),
-        })? {
-            ServeBatchStepOutcome::ReachedEot => self.done = true,
-            ServeBatchStepOutcome::Token {
-                token_id,
-                probability,
-            } => {
-                self.generated_tokens.push(token_id);
-                self.generated_probabilities.push(probability);
-            }
-        }
-        Ok(())
+        })
     }
 
     fn finish(self) -> Result<GgmlAsrExecutionResult, Qwen3AsrServeBatchError> {
