@@ -28,3 +28,24 @@ pub(crate) mod runtime_contract;
 pub(crate) mod tensor_names;
 pub(crate) mod tokenizer;
 pub(crate) mod weights;
+
+/// Pull-time contract for FireRedPunc punctuation packs.
+///
+/// Returns `Some` only when the pack declares the `firered-punc` GGUF
+/// architecture; ASR/translation packs fall through to their own adapters. The
+/// check is the cheap metadata-only geometry validation (no weight load), so
+/// `openasr pull` stays fail-closed for punctuation packs without paying a full
+/// model build.
+pub(crate) fn validate_punctuation_runtime_pack_contract(
+    _path: &std::path::Path,
+    metadata: &crate::GgufMetadata,
+) -> Option<Result<(), String>> {
+    if !runtime_contract::metadata_declares_firered_punc(metadata) {
+        return None;
+    }
+    Some(
+        runtime_contract::parse_and_validate_firered_punc_metadata(metadata)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+    )
+}
