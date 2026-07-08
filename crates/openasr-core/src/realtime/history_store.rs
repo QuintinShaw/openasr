@@ -64,6 +64,16 @@ use crate::api::backend::Segment;
 /// rely on `busy_timeout` alone.
 static CONNECTION_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Columns shared by every query that needs to build a [`DaemonHistoryEntry`]
+/// via [`row_to_entry`]. Deliberately selects `segments_json` instead of the
+/// persisted (and no longer trusted -- see that column's schema comment)
+/// `formats` column: `row_to_entry` derives the advertised formats from
+/// whether this row actually has segments, at read time, rather than
+/// replaying whatever a past write recorded.
+const ENTRY_COLUMNS: &str = "e.id, e.kind, e.model, e.created_at_unix_seconds, e.source_name, \
+     e.duration_seconds, e.output_format, e.diarization_active, e.provenance, e.segments_json, \
+     e.preview";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DaemonHistoryKind {
@@ -224,8 +234,6 @@ pub enum DaemonHistoryStoreError {
     },
     #[error("History database query failed: {0}")]
     Query(#[source] rusqlite::Error),
-    #[error("Could not serialize history segments: {0}")]
-    SerializeSegments(#[source] serde_json::Error),
 }
 
 impl DaemonHistoryStore {
@@ -302,9 +310,7 @@ impl DaemonHistoryStore {
             }
         };
         let sql = format!(
-            "SELECT e.id, e.kind, e.model, e.created_at_unix_seconds, e.source_name, \
-             e.duration_seconds, e.output_format, e.diarization_active, e.provenance, \
-             e.formats, e.preview \
+            "SELECT {ENTRY_COLUMNS} \
              FROM {from_sql} {where_sql} \
              ORDER BY e.created_at_unix_seconds DESC, e.id DESC{limit_sql}"
         );
@@ -324,22 +330,20 @@ impl DaemonHistoryStore {
         validate_history_id(id)?;
         let conn = self.connection()?;
         conn.query_row(
-            "SELECT e.id, e.kind, e.model, e.created_at_unix_seconds, e.source_name, \
-             e.duration_seconds, e.output_format, e.diarization_active, e.provenance, \
-             e.formats, e.preview, e.text, e.segments_json \
-             FROM history_entries e WHERE e.id = ?1",
+            &format!("SELECT {ENTRY_COLUMNS}, e.text FROM history_entries e WHERE e.id = ?1"),
             params![id],
             |row| {
                 let entry = row_to_entry(row)?;
                 let text: String = row.get(11)?;
-                let segments_json: Option<String> = row.get(12)?;
-                // A NULL column (rows written before segments were persisted, or
-                // live entries) or an unparseable blob degrades to no segments:
-                // the transcript text still comes back and detail fetches never
-                // 500 on a corrupt segment payload.
-                let segments = segments_json
-                    .and_then(|json| serde_json::from_str::<Vec<Segment>>(&json).ok())
-                    .unwrap_or_default();
+                // segments_json lives at the same ordinal `row_to_entry` already
+                // read to derive `entry.formats`; re-read it here for the full
+                // segment payload. A NULL column (rows written before segments
+                // were persisted, or Live entries, which persist only aggregated
+                // text) or an unparseable blob degrades to no segments: the
+                // transcript text still comes back and detail fetches never 500
+                // on a corrupt segment payload.
+                let segments_json: Option<String> = row.get(9)?;
+                let segments = parse_segments_json(segments_json);
                 Ok(DaemonHistoryDetail {
                     entry,
                     text,
@@ -428,17 +432,31 @@ impl DaemonHistoryStore {
         // Serialize segments (word/speaker timing) alongside the text so exports
         // can rebuild SRT/VTT/JSON later; `formats` is derived from their
         // presence so we never advertise a format the stored data can't render.
+        // Serialization only fails on non-finite floats (NaN/Inf timestamps), a
+        // narrow case that must not cost the whole row: degrade to a
+        // segments-less (text-only) row instead of erroring out of the INSERT,
+        // symmetric with the read path treating a corrupt/legacy blob as "no
+        // segments" rather than failing the whole fetch.
         let segments_json = if record.segments.is_empty() {
             None
         } else {
-            Some(
-                serde_json::to_string(&record.segments)
-                    .map_err(DaemonHistoryStoreError::SerializeSegments)?,
-            )
+            match serde_json::to_string(&record.segments) {
+                Ok(json) => Some(json),
+                Err(error) => {
+                    eprintln!(
+                        "history: could not serialize segments, recording \
+                         text-only for this row: {error}"
+                    );
+                    None
+                }
+            }
         };
-        let formats = formats_for_content(!record.segments.is_empty());
+        let formats = formats_for_content(segments_json.is_some());
         let preview = preview_text(&record.text);
         let created_at_unix_seconds = unix_seconds_now();
+        // `formats` is written for backward-compatible schema reasons only
+        // (the column is `NOT NULL`); no read path trusts it -- see the
+        // `formats` column comment in `ensure_schema` and `ENTRY_COLUMNS`.
         let formats_json = serde_json::to_string(&formats).expect("Vec<String> always serializes");
         let search_text = format!(
             "{model} {} {}",
@@ -579,6 +597,13 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             output_format TEXT,
             diarization_active INTEGER,
             provenance TEXT,
+            -- Legacy: written for schema/back-compat continuity (NOT NULL) but
+            -- no longer trusted by any read path. Rows written under 0.1.10 and
+            -- earlier persisted a build-time `ResponseFormat::ALL` here that
+            -- overclaimed srt/vtt for text-only rows; every read now derives
+            -- `formats` from `segments_json` instead (see `ENTRY_COLUMNS` /
+            -- `row_to_entry`), so old and new rows report equally honest
+            -- formats regardless of what this column says.
             formats TEXT NOT NULL,
             preview TEXT NOT NULL,
             text TEXT NOT NULL,
@@ -615,13 +640,32 @@ fn ensure_segments_json_column(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Parses a persisted `segments_json` column into segments. A `NULL` column
+/// (rows written before segments were persisted, or Live entries, which
+/// persist only aggregated text) or an unparseable blob degrades to "no
+/// segments" rather than surfacing an error -- callers must not 500 (or, for
+/// `row_to_entry`, misreport `formats`) on a corrupt/legacy payload.
+fn parse_segments_json(segments_json: Option<String>) -> Vec<Segment> {
+    segments_json
+        .and_then(|json| serde_json::from_str::<Vec<Segment>>(&json).ok())
+        .unwrap_or_default()
+}
+
+/// Builds a [`DaemonHistoryEntry`] from a row selected via [`ENTRY_COLUMNS`].
+/// `formats` is derived here from whether `segments_json` actually holds
+/// segments, not read back from the persisted `formats` column: that column
+/// can lie (rows written under 0.1.10 and earlier claimed srt/vtt for every
+/// row regardless of content), so trusting it would let a stale write-time
+/// snapshot re-surface a bug already fixed at read time. Deriving at read time
+/// keeps old and new rows equally honest and needs no data migration.
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DaemonHistoryEntry> {
     let kind: String = row.get(1)?;
     let created_at_unix_seconds: i64 = row.get(3)?;
     let output_format: Option<String> = row.get(6)?;
     let diarization_active: Option<bool> = row.get(7)?;
     let provenance: Option<String> = row.get(8)?;
-    let formats_json: String = row.get(9)?;
+    let segments_json: Option<String> = row.get(9)?;
+    let has_segments = !parse_segments_json(segments_json).is_empty();
 
     Ok(DaemonHistoryEntry {
         id: row.get(0)?,
@@ -637,7 +681,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DaemonHistoryEntry>
         provenance: provenance
             .as_deref()
             .and_then(DaemonHistoryProvenance::parse),
-        formats: serde_json::from_str(&formats_json).unwrap_or_else(|_| vec!["text".to_string()]),
+        formats: formats_for_content(has_segments),
         preview: row.get(10)?,
     })
 }
@@ -1336,6 +1380,73 @@ mod tests {
         assert_eq!(fresh_detail.segments.len(), 1);
         assert_eq!(fresh_detail.segments[0].text, "new body");
     }
+
+    /// Regression for the read-path fix: rows written under 0.1.10 and earlier
+    /// persisted a `formats` column that unconditionally claimed every format
+    /// (including srt/vtt) regardless of whether segments were ever stored.
+    /// `segments_json` is `NULL` for these rows (segments did not exist yet),
+    /// so the old "trust the persisted column" read path rendered an empty
+    /// SRT/VTT for them. `row_to_entry` must ignore that lying column and
+    /// derive `formats` from `segments_json` instead, so both `list()`/`query()`
+    /// and `get()` report the honest (text-shaped only) set.
+    #[test]
+    fn daemon_history_store_read_path_corrects_legacy_lying_formats() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        // Force schema creation (including the segments_json column) before
+        // hand-inserting a row that predates it in spirit: formats overclaims
+        // srt/vtt/verbose_json, segments_json is NULL.
+        let conn = store.connection().unwrap();
+        conn.execute(
+            "INSERT INTO history_entries (\
+                id, kind, model, created_at_unix_seconds, source_name, duration_seconds, \
+                output_format, diarization_active, provenance, formats, preview, text, \
+                segments_json\
+            ) VALUES ('hist-legacy-lie', 'file', 'whisper', 100, NULL, NULL, 'text', NULL, \
+                NULL, '[\"text\",\"srt\",\"vtt\",\"verbose_json\",\"json\",\"markdown\"]', \
+                'legacy lie', 'legacy lie body', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO history_entries_fts (id, search_text) VALUES ('hist-legacy-lie', 'legacy lie body')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let honest_formats = vec![
+            "json".to_string(),
+            "markdown".to_string(),
+            "text".to_string(),
+        ];
+
+        let entries = store.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].formats, honest_formats,
+            "list() must not echo the persisted formats column's srt/vtt overclaim"
+        );
+
+        let detail = store.get("hist-legacy-lie").unwrap().unwrap();
+        assert_eq!(detail.entry.formats, honest_formats);
+        assert!(detail.segments.is_empty());
+    }
+
+    // No test exercises `record()`'s "segments fail to serialize -> degrade to
+    // text-only" branch (the fix B change in `record`) with a real trigger:
+    // `serde_json::to_string` cannot actually fail for `Vec<Segment>`. Its only
+    // fields are `String`/`f32`/`Option`/`Vec` with derived `Serialize` impls,
+    // and non-finite floats do not error -- confirmed empirically
+    // (`serde_json::to_string(&f32::NAN)` and `&f64::INFINITY` both return
+    // `Ok("null")` on serde_json 1.0.149, the version pinned here). There is no
+    // reachable input that produces `Err` from that call today, so the branch
+    // is unreachable in practice; it is kept as defense-in-depth (symmetric
+    // with the read path's "corrupt/legacy blob -> no segments" degrade) in
+    // case that ever changes, e.g. a future field with a fallible custom
+    // `Serialize` impl. Manufacturing a fake failure would require injecting a
+    // test-only non-`Segment` payload into `record()`, which isn't a real
+    // regression guard and isn't worth the extra surface.
 
     fn record_history_for_test(store: &DaemonHistoryStore, text: &str) -> DaemonHistoryEntry {
         store
