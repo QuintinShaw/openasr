@@ -1710,20 +1710,36 @@ impl HttpDownloadClient {
     }
 }
 
-/// Optional Hugging Face access token from `OPENASR_HF_TOKEN`, trimmed; `None`
-/// when unset or empty. The desktop app injects it at daemon launch so model
-/// pulls can authenticate under shared-IP rate limits. Never read on any
-/// fail-closed local path: an unset var simply means anonymous downloads.
+/// Env var names carrying an optional Hugging Face access token, in precedence
+/// order: the OpenASR-specific var the desktop app injects at daemon launch first,
+/// then the two standard HF client vars so a token already in the user's
+/// environment is picked up. First non-empty wins.
+const HF_TOKEN_ENV_VARS: &[&str] = &["OPENASR_HF_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"];
+
+/// Optional Hugging Face access token from the environment (see
+/// [`HF_TOKEN_ENV_VARS`]), trimmed; `None` when unset or empty. The desktop app
+/// injects it so model pulls can authenticate under shared-IP rate limits. Never
+/// read on any fail-closed local path, and only ever attached to a direct
+/// huggingface.co request (see [`hf_token_allowed_for_host`]): an unset var simply
+/// means anonymous downloads, and the worker/mirror sources are always anonymous.
 fn hf_token_from_env() -> Option<String> {
-    std::env::var("OPENASR_HF_TOKEN")
-        .ok()
+    HF_TOKEN_ENV_VARS
+        .iter()
+        .find_map(|var| normalize_hf_token(std::env::var(var).ok()))
+}
+
+/// Trim a raw token value and drop it if empty. Extracted so the selection logic is
+/// unit-testable without mutating process-global environment variables.
+fn normalize_hf_token(value: Option<String>) -> Option<String> {
+    value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
 
 /// Whether the optional HF bearer token may be attached to a request to `host`.
-/// Restricted to `huggingface.co` so the credential never reaches a CDN, mirror,
-/// or attacker-controlled redirect target.
+/// Restricted to `huggingface.co` (the direct source) so the credential never
+/// reaches a CDN, mirror, the weights.openasr.org worker, or an
+/// attacker-controlled redirect target.
 fn hf_token_allowed_for_host(host: Option<&str>) -> bool {
     host == Some("huggingface.co")
 }
@@ -1916,9 +1932,16 @@ fn is_source_fallback_error(error: &PullError) -> bool {
 fn mirror_endpoint_for_current_url(current: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(current).ok()?;
     let host = parsed.host_str()?;
+    // Sources whose downstream CDN 302 must be followed VERBATIM (no host swap):
+    // - huggingface.co / modelscope.cn: the direct sources, whose Xet redirect is
+    //   already on a reachable host.
+    // - weights.openasr.org: the first-party worker transparently passes the 302
+    //   through to Xet (`us.aws.cdn.hf.co`), which the worker does NOT re-serve;
+    //   rewriting the redirect back onto the worker would 404. Behaves exactly like
+    //   the direct Hf source here.
     if matches!(
         host,
-        "huggingface.co" | "modelscope.cn" | "www.modelscope.cn"
+        "huggingface.co" | "modelscope.cn" | "www.modelscope.cn" | "weights.openasr.org"
     ) {
         return None;
     }
