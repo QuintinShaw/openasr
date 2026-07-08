@@ -60,17 +60,36 @@ jobs:
       # AMD HIP SDK "PRO Edition" silent-installer release train, matched to
       # llama.cpp's current Windows HIP release job.
       HIPSDK_INSTALLER_VERSION: 26.Q1
-    # NOTE: jobs.verify-completeness below hardcodes this same target/ext list
-    # (TARGETS) to assert the release ends up with every archive. Keep both
-    # in sync when adding/removing a leg. The xcframework job further below is
-    # a separate, non-matrix leg (macOS/iOS SDK, not a CLI binary) but its
-    # asset is folded into the same TARGETS list -- keep that in sync too.
+      # Where the built binary + build.rs-staged runtime DLLs land. A native
+      # leg (no matrix.rust_target) builds into target/release; a cross leg
+      # (--target <triple>) builds into target/<triple>/release. Every package/
+      # smoke step reads $RELEASE_DIR so both shapes share one code path.
+      RELEASE_DIR: ${{ matrix.rust_target && format('target/{0}/release', matrix.rust_target) || 'target/release' }}
+    # Asset naming: `matrix.target` is the INTERNAL key (used for cache keys,
+    # smoke/gating conditions, and the upload-artifact name); `matrix.asset` is
+    # the FRIENDLY, user-facing filename segment that lands in the release as
+    # openasr-<version>-<asset>.<ext>. The mapping normalizes the Rust target
+    # triple to human terms: unknown-linux-gnu -> linux, apple-darwin -> macos,
+    # pc-windows-msvc -> windows; aarch64 -> arm64 (x86_64 unchanged); the AMD
+    # GPU leg is `-rocm` on every OS (Windows' internal feature is `hip`, but
+    # the asset name stays `-rocm` for cross-platform consistency -- this only
+    # renames the asset, never the build feature flag); gnu libc is the
+    # unsuffixed default, musl would carry `-musl`.
+    #
+    # NOTE: jobs.verify-completeness below hardcodes this same asset/ext list
+    # (TARGETS, now friendly asset names) to assert the release ends up with
+    # every archive. Keep both in sync when adding/removing a leg. The
+    # xcframework job further below is a separate, non-matrix leg (macOS/iOS
+    # SDK, not a CLI binary) but its asset is folded into the same TARGETS list
+    # -- keep that in sync too. Legs marked `experimental: true` are NOT in
+    # TARGETS (they may drop out until proven green), so keep them out of it.
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            asset: linux-x86_64
             binary_name: openasr
             archive_ext: tar.gz
           # Native arm64 GitHub-hosted runner (no cross-compile toolchain
@@ -78,10 +97,12 @@ jobs:
           # arm64 build; this was our most visible gap.
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
+            asset: linux-arm64
             binary_name: openasr
             archive_ext: tar.gz
           - os: macos-15-intel
             target: x86_64-apple-darwin
+            asset: macos-x86_64
             binary_name: openasr
             archive_ext: tar.gz
           # Pinned (not macos-latest, which migrates to macOS 26 from
@@ -89,10 +110,12 @@ jobs:
           # environment that does not drift under the alias.
           - os: macos-15
             target: aarch64-apple-darwin
+            asset: macos-arm64
             binary_name: openasr
             archive_ext: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            asset: windows-x86_64
             binary_name: openasr.exe
             archive_ext: zip
           # GPU-feature Windows variants. The hosted runners have no GPU, so
@@ -100,12 +123,14 @@ jobs:
           # launches"; GPU inference is validated on real hardware.
           - os: windows-latest
             target: x86_64-pc-windows-msvc-vulkan
+            asset: windows-x86_64-vulkan
             binary_name: openasr.exe
             archive_ext: zip
             features: vulkan
             timeout: 120
           - os: windows-latest
             target: x86_64-pc-windows-msvc-cuda
+            asset: windows-x86_64-cuda
             binary_name: openasr.exe
             archive_ext: zip
             features: cuda
@@ -117,6 +142,7 @@ jobs:
           # but still dynamically loads the ROCm runtime/BLAS DLLs staged
           # below, so it cannot launch on this GPU-less, driver-less runner
           # any more than the CUDA leg can; build + package only.
+          # Asset is `-rocm` (not `-hip`) to match the Linux AMD leg's name.
           # Pinned to windows-2022 like llama.cpp's HIP release job:
           # windows-latest's VS 2026 STL declares the C99 floating
           # comparison macros (isgreater & co.) in a way ROCm clang's HIP
@@ -125,10 +151,59 @@ jobs:
           # so the device compile only works against the VS 2022 STL.
           - os: windows-2022
             target: x86_64-pc-windows-msvc-hip
+            asset: windows-x86_64-rocm
             binary_name: openasr.exe
             archive_ext: zip
             features: hip
             timeout: 240
+          # Windows arm64 (cross-compiled from the x86_64 windows runner via
+          # --target aarch64-pc-windows-msvc). CPU-only, no GPU feature.
+          #
+          # NEEDS CI VALIDATION -- experimental (non-blocking, excluded from
+          # verify-completeness) until proven green on a real runner:
+          #   * The runner is x86_64, so the produced arm64 exe cannot execute
+          #     here; the smoke steps are skipped for cross legs (matrix.rust_target
+          #     set), so this validates "compiles + links + packages" only.
+          #   * build.rs drives ggml's C++ via CMake using the MSVC `cl` that
+          #     cc::windows_registry::find_tool(target=aarch64-pc-windows-msvc)
+          #     resolves; that needs the "MSVC v143 ARM64 build tools" VS
+          #     component present on the runner. build.rs does not pass CMake an
+          #     explicit `-A ARM64`, so if the default generator platform fights
+          #     the pinned arm64 cl this leg fails here (build.rs follow-up:
+          #     wire the ARM64 generator platform for a windows arm cross).
+          #   * ring/rustls support aarch64-pc-windows-msvc (0.17+), so the Rust
+          #     dep tree itself is expected to be fine.
+          # Validate via `workflow_dispatch` before the next real release, and
+          # once green: drop `experimental` and add windows-arm64:zip to
+          # verify-completeness TARGETS to make it a required asset.
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            asset: windows-arm64
+            rust_target: aarch64-pc-windows-msvc
+            binary_name: openasr.exe
+            archive_ext: zip
+            experimental: true
+            timeout: 120
+          # DEFERRED (intentionally not in the matrix): the two Linux musl CPU
+          # legs -- x86_64-unknown-linux-musl (asset linux-x86_64-musl) and
+          # aarch64-unknown-linux-musl (asset linux-arm64-musl). They cannot be
+          # built cleanly on a stock GitHub-hosted ubuntu runner today:
+          #   * ggml is C++ (compiled by build.rs via CMake). A musl target
+          #     needs a musl C++ compiler, but Ubuntu's `musl-tools` ships only
+          #     `musl-gcc` (C) -- there is no apt `musl-g++`. So the ggml C++
+          #     objects cannot be produced for musl without a musl-cross
+          #     toolchain (musl.cc / musl-cross-make) or building inside an
+          #     Alpine container.
+          #   * musl defaults to crt-static ON, but build.rs links libstdc++
+          #     and libgomp dynamically on Linux (see the `target.contains(
+          #     "linux")` block), which a fully static musl binary cannot pull;
+          #     enabling them needs `-C target-feature=-crt-static` (a dynamic
+          #     musl binary) plus a musl libstdc++, or static-libstdc++ wiring.
+          # Enabling musl is therefore a build.rs + toolchain task, not an
+          # asset-rename one. When done, add two legs here with rust_target set
+          # (like the windows-arm64 leg), the friendly assets above, and -- once
+          # green -- the TARGETS entries linux-x86_64-musl:tar.gz and
+          # linux-arm64-musl:tar.gz.
           # Linux GPU-feature variants, same rationale as the Windows ones
           # above (no GPU on the hosted runner; build+package validated
           # here, GPU inference validated on real hardware). Pinned to
@@ -136,18 +211,21 @@ jobs:
           # below target a codename known to exist in both.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu-vulkan
+            asset: linux-x86_64-vulkan
             binary_name: openasr
             archive_ext: tar.gz
             features: vulkan
             timeout: 90
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu-cuda
+            asset: linux-x86_64-cuda
             binary_name: openasr
             archive_ext: tar.gz
             features: cuda
             timeout: 120
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu-rocm
+            asset: linux-x86_64-rocm
             binary_name: openasr
             archive_ext: tar.gz
             features: hip
@@ -333,24 +411,35 @@ jobs:
           rustc --version
           cargo --version
 
+      # Cross legs (matrix.rust_target set, e.g. the windows-arm64 experimental
+      # leg) need their std installed for the target triple; native legs skip
+      # this. Runs in the default shell (pwsh on Windows, bash elsewhere); the
+      # `rustup target add` invocation is identical in both.
+      - name: Add cross Rust target
+        if: matrix.rust_target
+        run: rustup target add ${{ matrix.rust_target }}
+
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-binaries-${{ matrix.target }}
 
       - name: Build release binary
         shell: bash
-        run: cargo build --release -p openasr-cli ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+        run: cargo build --release -p openasr-cli ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
       # Same GPU-less-runner caveat as the Windows CUDA/HIP legs: those two
       # exes dlopen the CUDA/ROCm runtime at launch, which needs a real
       # driver this runner does not have. The Vulkan exe launches fine via
       # the llvmpipe software ICD installed above.
+      # Cross legs (matrix.rust_target set) build an exe for a foreign arch the
+      # runner cannot execute, so they skip every smoke step (build + package
+      # validation only).
       - name: Smoke release binary
-        if: runner.os != 'Windows' && matrix.features != 'cuda' && matrix.features != 'hip'
+        if: runner.os != 'Windows' && matrix.features != 'cuda' && matrix.features != 'hip' && !matrix.rust_target
         run: |
-          ./target/release/openasr --version
-          ./target/release/openasr --help
-          ./target/release/openasr list
+          "${RELEASE_DIR}/openasr" --version
+          "${RELEASE_DIR}/openasr" --help
+          "${RELEASE_DIR}/openasr" list
 
       # The CUDA exe import-links nvcuda.dll (NVIDIA driver) and the HIP exe
       # import-links amdhip64.dll (AMD driver), neither of which this GPU-less
@@ -358,12 +447,12 @@ jobs:
       # Vulkan exe resolves against the SDK loader installed above, so it
       # launches and runs CPU paths here.
       - name: Smoke release binary
-        if: runner.os == 'Windows' && matrix.features != 'cuda' && matrix.features != 'hip'
+        if: runner.os == 'Windows' && matrix.features != 'cuda' && matrix.features != 'hip' && !matrix.rust_target
         shell: pwsh
         run: |
-          .\target\release\openasr.exe --version
-          .\target\release\openasr.exe --help
-          .\target\release\openasr.exe list
+          & "$env:RELEASE_DIR\openasr.exe" --version
+          & "$env:RELEASE_DIR\openasr.exe" --help
+          & "$env:RELEASE_DIR\openasr.exe" list
 
       - name: Restore model pack cache
         if: matrix.target == 'x86_64-pc-windows-msvc'
@@ -393,10 +482,10 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          archive="openasr-${OPENASR_VERSION}-${{ matrix.target }}"
+          archive="openasr-${OPENASR_VERSION}-${{ matrix.asset }}"
           dist_dir="dist/${archive}"
           mkdir -p "$dist_dir/docs"
-          cp "target/release/${{ matrix.binary_name }}" "$dist_dir/"
+          cp "${RELEASE_DIR}/${{ matrix.binary_name }}" "$dist_dir/"
           if [ "${{ matrix.features }}" = "cuda" ]; then
             # The CUDA exe dlopens the CUDA runtime; ship NVIDIA's
             # redistributable runtime .so files so end users only need a
@@ -423,10 +512,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $archive = "openasr-$env:OPENASR_VERSION-${{ matrix.target }}"
+          $archive = "openasr-$env:OPENASR_VERSION-${{ matrix.asset }}"
           $distDir = "dist\$archive"
           New-Item -ItemType Directory -Force -Path "$distDir\docs" | Out-Null
-          Copy-Item "target\release\${{ matrix.binary_name }}" "$distDir\"
+          Copy-Item "$env:RELEASE_DIR\${{ matrix.binary_name }}" "$distDir\"
           # The CPU base build is a GGML_BACKEND_DL build (build.rs):
           # openasr.exe dynamically loads the core (ggml-base.dll + ggml.dll)
           # and the CPU backend plugins (ggml-cpu-<variant>.dll) at startup, so
@@ -435,7 +524,7 @@ jobs:
           # variants link ggml statically (no ggml*.dll produced), and
           # macOS/Linux stay statically linked, so this only matches on the
           # Windows CPU build.
-          Get-ChildItem "target\release" -Filter "ggml*.dll" | Copy-Item -Destination "$distDir\"
+          Get-ChildItem "$env:RELEASE_DIR" -Filter "ggml*.dll" | Copy-Item -Destination "$distDir\"
           if ("${{ matrix.features }}" -eq "cuda") {
             # The CUDA exe dynamically links the CUDA runtime; ship NVIDIA's
             # redistributable runtime DLLs so end users only need a GPU driver
@@ -472,8 +561,9 @@ jobs:
           # whose build.rs-seeded DLLs would mask a packaging gap), so a broken
           # archive fails here before it ships. The CUDA/HIP exes cannot
           # launch without a matching GPU driver, so they are exempt
-          # (validated on hardware).
-          if ("${{ matrix.features }}" -ne "cuda" -and "${{ matrix.features }}" -ne "hip") {
+          # (validated on hardware). A cross leg (rust_target set) builds a
+          # foreign-arch exe the runner cannot execute, so it is exempt too.
+          if ("${{ matrix.features }}" -ne "cuda" -and "${{ matrix.features }}" -ne "hip" -and "${{ matrix.rust_target }}" -eq "") {
             & "$distDir\${{ matrix.binary_name }}" --version
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
@@ -483,7 +573,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: openasr-${{ matrix.target }}
-          path: dist/openasr-${{ env.OPENASR_VERSION }}-${{ matrix.target }}.${{ matrix.archive_ext }}
+          path: dist/openasr-${{ env.OPENASR_VERSION }}-${{ matrix.asset }}.${{ matrix.archive_ext }}
           if-no-files-found: error
 
   xcframework:
@@ -683,29 +773,34 @@ jobs:
           echo "OPENASR_VERSION=${version}" >> "${GITHUB_ENV}"
 
       - name: Assert the release has every expected matrix asset
-        # Keep this TARGETS list in sync with jobs.build.strategy.matrix.include
+        # Keep this TARGETS list (friendly asset names, matching each matrix
+        # leg's `asset:` field) in sync with jobs.build.strategy.matrix.include
         # above, plus jobs.xcframework's asset -- this is the release-integrity
         # gate: a release "shipped" but missing a platform's archive (e.g. one
         # matrix leg failed and `checksums` silently dropped it, per its
         # `!cancelled()` condition)
         # must fail loudly here instead of quietly shipping partial coverage.
+        # `experimental: true` legs (e.g. windows-arm64) are deliberately NOT
+        # listed: they may fail without failing the run, so requiring their
+        # asset here would defeat the escape hatch. Promote such a leg (drop
+        # `experimental`, add its asset:ext here) once it proves green.
         run: |
           set -euo pipefail
           tag="${{ needs.upload-to-release.outputs.tag }}"
           version="${OPENASR_VERSION}"
 
           TARGETS=(
-            "x86_64-unknown-linux-gnu:tar.gz"
-            "aarch64-unknown-linux-gnu:tar.gz"
-            "x86_64-apple-darwin:tar.gz"
-            "aarch64-apple-darwin:tar.gz"
-            "x86_64-pc-windows-msvc:zip"
-            "x86_64-pc-windows-msvc-vulkan:zip"
-            "x86_64-pc-windows-msvc-cuda:zip"
-            "x86_64-pc-windows-msvc-hip:zip"
-            "x86_64-unknown-linux-gnu-vulkan:tar.gz"
-            "x86_64-unknown-linux-gnu-cuda:tar.gz"
-            "x86_64-unknown-linux-gnu-rocm:tar.gz"
+            "linux-x86_64:tar.gz"
+            "linux-arm64:tar.gz"
+            "macos-x86_64:tar.gz"
+            "macos-arm64:tar.gz"
+            "windows-x86_64:zip"
+            "windows-x86_64-vulkan:zip"
+            "windows-x86_64-cuda:zip"
+            "windows-x86_64-rocm:zip"
+            "linux-x86_64-vulkan:tar.gz"
+            "linux-x86_64-cuda:tar.gz"
+            "linux-x86_64-rocm:tar.gz"
             # Not a CLI binary leg (see jobs.xcframework above), but still a
             # released, version-named asset -- keep it in this same
             # completeness gate so a broken xcframework build fails loudly
