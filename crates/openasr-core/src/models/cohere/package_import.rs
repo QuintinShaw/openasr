@@ -20,8 +20,9 @@ use crate::models::local_source_import::{
 use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, OasrMetadataBuilder,
 };
+use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
 use crate::models::runtime_tensor_contract_registry::validate_builtin_runtime_tensor_contract_for_architecture;
 use crate::models::{cohere::COHERE_TRANSCRIBE_MODEL_FAMILY, cohere::runtime_contract};
 use crate::{read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source};
@@ -66,14 +67,7 @@ pub struct CohereLocalSourceImportRuntimeResult {
     pub tensor_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(non_camel_case_types)]
-pub enum CohereRuntimeQuantizationMode {
-    #[default]
-    Fp16,
-    Q8_0,
-    Q4_K,
-}
+pub type CohereRuntimeQuantizationMode = PackQuant;
 
 #[derive(Debug, Deserialize)]
 struct CohereConfigJson {
@@ -554,13 +548,7 @@ fn quantized_tensor_type_for_cohere_tensor(
         return None;
     }
     let ne0 = dims.first().copied()?;
-    if !ne0.is_multiple_of(32_u64) {
-        return None;
-    }
-    if quantization == CohereRuntimeQuantizationMode::Q4_K && ne0.is_multiple_of(256_u64) {
-        return Some(GgufWriteTensorType::Q4_K);
-    }
-    Some(GgufWriteTensorType::Q8_0)
+    classify_quant_tensor(ne0, quantization)
 }
 
 #[derive(Debug, Clone)]
@@ -690,160 +678,110 @@ fn cohere_runtime_gguf_metadata(
     model_id: &str,
     vocab_tokens: &[String],
 ) -> BTreeMap<String, GgufWriteValue> {
-    let mut metadata = BTreeMap::new();
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_PACKAGE_VERSION,
-        OASR_PACKAGE_VERSION_V1,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_MODEL_FAMILY,
-        COHERE_TRANSCRIBE_MODEL_FAMILY,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_MODEL_ARCHITECTURE,
-        COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_AUDIO_FRONTEND,
-        COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID,
-    );
-    insert_metadata(
-        &mut metadata,
-        OASR_METADATA_KEY_DECODE_POLICY,
-        COHERE_TRANSCRIBE_DECODE_POLICY_ID,
-    );
-    insert_metadata(
-        &mut metadata,
-        GGML_TOKENIZER_ID_KEY,
-        COHERE_TRANSCRIBE_TOKENIZER_ID,
-    );
-    insert_metadata(&mut metadata, OPENASR_MODEL_ID_KEY, model_id);
-    insert_metadata(
-        &mut metadata,
-        GENERAL_ARCHITECTURE_KEY,
-        COHERE_ARCHITECTURE_VALUE,
-    );
-
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_VOCAB_SIZE_KEY,
-        fields.vocab_size as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY,
-        fields.encoder_layers as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_ENCODER_D_MODEL_KEY,
-        fields.encoder_d_model as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_ENCODER_HEADS_KEY,
-        fields.encoder_heads as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_ENCODER_HEAD_DIM_KEY,
-        fields.encoder_head_dim as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_ENCODER_FFN_DIM_KEY,
-        fields.encoder_ffn_dim as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_ENCODER_CONV_KERNEL_KEY,
-        fields.encoder_conv_kernel as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_DECODER_LAYERS_KEY,
-        fields.decoder_layers as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_DECODER_D_MODEL_KEY,
-        fields.decoder_d_model as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_DECODER_HEADS_KEY,
-        fields.decoder_heads as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_DECODER_HEAD_DIM_KEY,
-        fields.decoder_head_dim as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_DECODER_FFN_DIM_KEY,
-        fields.decoder_ffn_dim as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_DECODER_MAX_CONTEXT_KEY,
-        fields.decoder_max_context as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_DECODER_START_TOKEN_ID_KEY,
-        fields.decoder_start_token_id as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_AUDIO_SAMPLE_RATE_KEY,
-        fields.sample_rate_hz,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_AUDIO_MELS_COUNT_KEY,
-        fields.n_mels as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_AUDIO_N_FFT_KEY,
-        fields.n_fft as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_AUDIO_HOP_LENGTH_KEY,
-        fields.hop_length as u32,
-    );
-    insert_metadata_u32(
-        &mut metadata,
-        runtime_contract::COHERE_TRANSCRIBE_AUDIO_WIN_LENGTH_KEY,
-        fields.win_length as u32,
-    );
-
-    insert_metadata(
-        &mut metadata,
-        TOKENIZER_GGML_MODEL_KEY,
-        TOKENIZER_GGML_MODEL_VALUE_LLAMA,
-    );
-    insert_metadata_string_array(&mut metadata, TOKENIZER_GGML_TOKENS_KEY, vocab_tokens);
-
-    insert_metadata(&mut metadata, "openasr.source.name", &request.source_name);
-    insert_metadata(
-        &mut metadata,
-        "openasr.source.revision",
-        &request.source_revision,
-    );
-    insert_metadata(&mut metadata, "openasr.license.name", &request.license_name);
-    insert_metadata(
-        &mut metadata,
-        "openasr.license.source",
-        &request.license_source,
-    );
-    metadata
+    OasrMetadataBuilder::new()
+        .str(OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1)
+        .str(
+            OASR_METADATA_KEY_MODEL_FAMILY,
+            COHERE_TRANSCRIBE_MODEL_FAMILY,
+        )
+        .str(
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE,
+            COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+        )
+        .str(
+            OASR_METADATA_KEY_AUDIO_FRONTEND,
+            COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID,
+        )
+        .str(
+            OASR_METADATA_KEY_DECODE_POLICY,
+            COHERE_TRANSCRIBE_DECODE_POLICY_ID,
+        )
+        .str(GGML_TOKENIZER_ID_KEY, COHERE_TRANSCRIBE_TOKENIZER_ID)
+        .str(OPENASR_MODEL_ID_KEY, model_id)
+        .str(GENERAL_ARCHITECTURE_KEY, COHERE_ARCHITECTURE_VALUE)
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_VOCAB_SIZE_KEY,
+            fields.vocab_size as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY,
+            fields.encoder_layers as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_ENCODER_D_MODEL_KEY,
+            fields.encoder_d_model as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_ENCODER_HEADS_KEY,
+            fields.encoder_heads as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_ENCODER_HEAD_DIM_KEY,
+            fields.encoder_head_dim as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_ENCODER_FFN_DIM_KEY,
+            fields.encoder_ffn_dim as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_ENCODER_CONV_KERNEL_KEY,
+            fields.encoder_conv_kernel as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_DECODER_LAYERS_KEY,
+            fields.decoder_layers as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_DECODER_D_MODEL_KEY,
+            fields.decoder_d_model as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_DECODER_HEADS_KEY,
+            fields.decoder_heads as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_DECODER_HEAD_DIM_KEY,
+            fields.decoder_head_dim as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_DECODER_FFN_DIM_KEY,
+            fields.decoder_ffn_dim as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_DECODER_MAX_CONTEXT_KEY,
+            fields.decoder_max_context as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_DECODER_START_TOKEN_ID_KEY,
+            fields.decoder_start_token_id as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_AUDIO_SAMPLE_RATE_KEY,
+            fields.sample_rate_hz,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_AUDIO_MELS_COUNT_KEY,
+            fields.n_mels as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_AUDIO_N_FFT_KEY,
+            fields.n_fft as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_AUDIO_HOP_LENGTH_KEY,
+            fields.hop_length as u32,
+        )
+        .u32(
+            runtime_contract::COHERE_TRANSCRIBE_AUDIO_WIN_LENGTH_KEY,
+            fields.win_length as u32,
+        )
+        .str(TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_MODEL_VALUE_LLAMA)
+        .string_array(TOKENIZER_GGML_TOKENS_KEY, vocab_tokens)
+        .str("openasr.source.name", &request.source_name)
+        .str("openasr.source.revision", &request.source_revision)
+        .str("openasr.license.name", &request.license_name)
+        .str("openasr.license.source", &request.license_source)
+        .build()
 }
 
 fn build_vocab_tokens(
@@ -927,29 +865,6 @@ fn validate_request(
     }
     validate_output_pack_extension(&request.output_root)?;
     Ok(())
-}
-
-fn insert_metadata(
-    metadata: &mut BTreeMap<String, GgufWriteValue>,
-    key: &str,
-    value: impl ToString,
-) {
-    metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
-}
-
-fn insert_metadata_u32(metadata: &mut BTreeMap<String, GgufWriteValue>, key: &str, value: u32) {
-    metadata.insert(key.to_string(), GgufWriteValue::U32(value));
-}
-
-fn insert_metadata_string_array(
-    metadata: &mut BTreeMap<String, GgufWriteValue>,
-    key: &str,
-    values: &[String],
-) {
-    metadata.insert(
-        key.to_string(),
-        GgufWriteValue::StringArray(values.to_vec()),
-    );
 }
 
 #[cfg(test)]
