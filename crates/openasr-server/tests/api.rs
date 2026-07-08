@@ -3339,6 +3339,21 @@ async fn transcriptions_record_file_history_in_sqlite_store() {
     // Transcript text lives in the SQLite row, not a filesystem sidecar; it
     // must not leak a path into the wire contract.
     assert!(entry.get("text_path").is_none());
+    // `formats` is derived from the stored transcript: this file transcription
+    // has timed segments, so the timing-dependent exports are advertised too
+    // (no longer the old blanket ResponseFormat::ALL claim).
+    let format_strs: Vec<&str> = entry["formats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    for expected in ["text", "json", "markdown", "srt", "vtt"] {
+        assert!(
+            format_strs.contains(&expected),
+            "missing {expected}: {format_strs:?}"
+        );
+    }
     let history_db = home.join("history").join("history.db");
     assert!(history_db.exists());
 
@@ -3367,6 +3382,13 @@ async fn transcriptions_record_file_history_in_sqlite_store() {
             .unwrap()
             .contains("OpenASR mock transcription")
     );
+    // Detail carries the per-segment transcript in the transcription API's
+    // JsonSegment shape so the desktop export UI can rebuild SRT/VTT/JSON.
+    let detail_segments = detail["segments"].as_array().unwrap();
+    assert!(!detail_segments.is_empty());
+    assert!(detail_segments[0]["text"].as_str().is_some());
+    assert!(detail_segments[0]["start"].as_f64().is_some());
+    assert!(detail_segments[0]["end"].as_f64().is_some());
 
     let response = app
         .clone()
@@ -3462,7 +3484,7 @@ async fn history_list_supports_search_pagination_and_kind_filter() {
         output_format: Some(ResponseFormat::Text),
         diarization_active: Some(false),
         provenance: None,
-        formats: vec!["text".to_string()],
+        segments: Vec::new(),
         text: text.to_string(),
     };
     let oldest = store
