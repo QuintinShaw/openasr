@@ -67,6 +67,7 @@ fn host_total_memory_is_probed_on_supported_platforms() {
 
 mod catalog;
 mod diagnostics;
+mod runtime_registry;
 mod schema_validation;
 mod source_parsing;
 mod variant_selection;

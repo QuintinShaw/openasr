@@ -37,11 +37,11 @@ use openasr_core::{
     TranscriptSegmentId, TranscriptUpdate, TranscriptUtteranceId, Transcription, TranslationOutput,
     TranslationQueueError, TranslationRequest, TranslationSession, TranslationWorkerOutput,
     VadConfig, VadMode, VadSpeechStartedEvent, VadSpeechStoppedEvent, VadState, WordTimestamp,
-    default_registry_dir, load_registry, native_runtime_model_adapter_for_path, parse_model_ref,
+    native_runtime_model_adapter_for_path, parse_model_ref,
     realtime::history::{
         DaemonHistoryKind, DaemonHistoryProvenance, DaemonHistoryRecord, DaemonHistoryStore,
     },
-    resolve_runtime_model_ref,
+    resolve_runtime_model_ref, runtime_registry,
 };
 use openasr_core::{
     Hymt2Runtime, Hymt2TranslationSessionCache, NativeAsrExecutor, NativeAsrModelAdapter,
@@ -848,7 +848,6 @@ fn resolve_model(
     distribution: &DistributionContext,
     model: &str,
 ) -> Result<String, String> {
-    let registry = load_registry(default_registry_dir()).map_err(|error| error.to_string())?;
     let catalog = if distribution.catalog_url().is_some() {
         let home = distribution
             .openasr_home()
@@ -858,6 +857,7 @@ fn resolve_model(
     } else {
         None
     };
+    let registry = runtime_registry(catalog.as_ref()).map_err(|error| error.to_string())?;
     match runtime.backend {
         openasr_core::BackendKind::Mock => {
             let resolved = resolve_runtime_model_ref(&registry, catalog.as_ref(), model)

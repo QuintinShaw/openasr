@@ -194,7 +194,7 @@ fn loads_toml_model_cards_sorted_by_id() {
 
 #[test]
 fn bundled_model_cards_parse_successfully() {
-    let cards = load_registry(default_registry_dir()).unwrap();
+    let cards = load_registry(test_model_registry_dir()).unwrap();
 
     assert!(cards.len() >= 5);
     assert!(
@@ -210,7 +210,7 @@ fn bundled_model_cards_parse_successfully() {
 
 #[test]
 fn bundled_registry_ordering_is_deterministic() {
-    let cards = load_registry(default_registry_dir()).unwrap();
+    let cards = load_registry(test_model_registry_dir()).unwrap();
     let ids: Vec<_> = cards.iter().map(|card| card.id.as_str()).collect();
 
     assert_eq!(
@@ -249,7 +249,7 @@ fn bundled_registry_ordering_is_deterministic() {
 #[test]
 fn bundled_catalog_json_parses_and_matches_registry_cards() {
     let catalog = bundled_catalog();
-    let cards = load_registry(default_registry_dir()).unwrap();
+    let cards = load_registry(test_model_registry_dir()).unwrap();
     let card_ids: Vec<_> = cards.iter().map(|card| card.id.as_str()).collect();
 
     for model in &catalog.models {
@@ -564,7 +564,7 @@ fn bundled_catalog_public_models_have_legal_license_fields() {
 
 #[test]
 fn bundled_model_cards_have_required_metadata() {
-    let cards = load_registry(default_registry_dir()).unwrap();
+    let cards = load_registry(test_model_registry_dir()).unwrap();
 
     for card in cards {
         assert!(!card.display_name.is_empty());
@@ -582,7 +582,7 @@ fn bundled_model_cards_have_required_metadata() {
 
 #[test]
 fn bundled_model_ids_are_unique() {
-    let cards = load_registry(default_registry_dir()).unwrap();
+    let cards = load_registry(test_model_registry_dir()).unwrap();
     validate_unique_ids(&cards).unwrap();
 }
 

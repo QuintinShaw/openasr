@@ -286,8 +286,7 @@ pub(super) fn resolve_model_source_for_backend(
                 "--model-pack is only supported with --backend native.\nUse --backend native, or remove --model-pack."
             );
         }
-        let cards =
-            load_registry(default_registry_dir()).context("Could not load model registry")?;
+        let cards = runtime_registry(catalog.as_ref()).context("Could not load model registry")?;
         let model_ref = selected_model_ref(model, config, &cards);
         let model_id = find_runtime_model_id(&cards, catalog.as_ref(), &model_ref)?;
         return Ok(ResolvedModelSource {
@@ -315,8 +314,7 @@ pub(super) fn resolve_model_source_for_backend(
         // Resolve catalog aliases (e.g. `qwen:q8`) to the canonical runtime id so
         // the alias-blind native matcher accepts the request. The reported
         // identity still derives from pack metadata downstream.
-        let cards =
-            load_registry(default_registry_dir()).context("Could not load model registry")?;
+        let cards = runtime_registry(catalog.as_ref()).context("Could not load model registry")?;
         match resolve_runtime_model_ref(&cards, catalog.as_ref(), normalized_model_ref) {
             Ok(resolved) => resolved.runtime_model_id,
             Err(error) if runtime_resolution_unknown_model(&error) => {
@@ -432,8 +430,8 @@ pub(super) fn resolve_serve_model_source(
                         "Model '{model_ref}' is not a valid model id for native GGUF local-source serve: {error}"
                     )
                 })?;
-                let cards = load_registry(default_registry_dir())
-                    .context("Could not load model registry")?;
+                let cards =
+                    runtime_registry(catalog.as_ref()).context("Could not load model registry")?;
                 match resolve_runtime_model_ref(&cards, catalog.as_ref(), normalized_model_ref) {
                     Ok(resolved) => resolved.runtime_model_id,
                     Err(error) if runtime_resolution_unknown_model(&error) => {

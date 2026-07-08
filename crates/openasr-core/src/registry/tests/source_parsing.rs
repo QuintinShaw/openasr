@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn whisper_model_card_resolves_by_family_and_tag() {
-    let cards = load_registry(default_registry_dir()).unwrap();
+    let cards = load_registry(test_model_registry_dir()).unwrap();
 
     let resolved = resolve_registry_model_ref(&cards, "whisper-small:published").unwrap();
 
@@ -16,7 +16,7 @@ fn whisper_model_card_resolves_by_family_and_tag() {
 
 #[test]
 fn qwen_model_card_resolves_by_family_and_tag() {
-    let cards = load_registry(default_registry_dir()).unwrap();
+    let cards = load_registry(test_model_registry_dir()).unwrap();
 
     let resolved = resolve_registry_model_ref(&cards, "qwen3-asr-0.6b:published").unwrap();
 
@@ -29,7 +29,7 @@ fn qwen_model_card_resolves_by_family_and_tag() {
 
 #[test]
 fn cohere_model_card_resolves_by_family_and_tag() {
-    let cards = load_registry(default_registry_dir()).unwrap();
+    let cards = load_registry(test_model_registry_dir()).unwrap();
 
     let resolved =
         resolve_registry_model_ref(&cards, "cohere-transcribe-03-2026:published").unwrap();
@@ -44,7 +44,7 @@ fn cohere_model_card_resolves_by_family_and_tag() {
 
 #[test]
 fn whisper_unknown_tag_lists_available_tags() {
-    let cards = load_registry(default_registry_dir()).unwrap();
+    let cards = load_registry(test_model_registry_dir()).unwrap();
 
     let error = resolve_registry_model_ref(&cards, "whisper-small:q8_0")
         .unwrap_err()
@@ -80,7 +80,7 @@ fn model_reference_matching_requires_explicit_quant_when_source_has_quant() {
 
 #[test]
 fn bundled_whisper_cards_are_published_packs() {
-    let cards = load_registry(default_registry_dir()).unwrap();
+    let cards = load_registry(test_model_registry_dir()).unwrap();
 
     for id in ["whisper-small", "whisper-large-v3-turbo"] {
         let card = cards
@@ -97,7 +97,7 @@ fn bundled_whisper_cards_are_published_packs() {
 
 #[test]
 fn bundled_model_cards_have_default_variants() {
-    let cards = load_registry(default_registry_dir()).unwrap();
+    let cards = load_registry(test_model_registry_dir()).unwrap();
 
     for card in cards {
         let variant = card.variant.as_ref().unwrap();

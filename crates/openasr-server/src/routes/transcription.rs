@@ -13,10 +13,10 @@ use openasr_core::{
     NativeAsrHardwareTarget, NativeAsrModelAdapter, NativeAsrModelPackRef, NativeAsrOfflineRequest,
     NativeAsrRequestOptions, NativeBackendExecutor, NativeRuntimeModelIdSource, PhraseBiasConfig,
     ResponseFormat, RuntimeModelResolutionError, TranscriptionRequest, TranscriptionTask,
-    add_segment_word_timestamps, config::MAX_INFERENCE_THREADS, default_registry_dir,
-    load_model_catalog, load_registry, native_runtime_model_adapter_for_path, parse_model_ref,
-    prepare_audio_input, render_transcription, resolve_local_native_runtime_model_identity,
-    resolve_runtime_model_ref,
+    add_segment_word_timestamps, config::MAX_INFERENCE_THREADS,
+    native_runtime_model_adapter_for_path, parse_model_ref, prepare_audio_input,
+    render_transcription, resolve_local_native_runtime_model_identity, resolve_runtime_catalog,
+    resolve_runtime_model_ref, runtime_registry,
 };
 
 use crate::*;
@@ -561,7 +561,7 @@ pub(crate) fn load_runtime_model_catalog(
     home: &Path,
 ) -> Result<Option<openasr_core::ModelCatalog>, ApiError> {
     catalog_url
-        .map(|url| load_model_catalog(Some(url), home).map_err(ApiError::Catalog))
+        .map(|url| resolve_runtime_catalog(Some(url), home).map_err(ApiError::Catalog))
         .transpose()
 }
 
@@ -617,7 +617,7 @@ pub(crate) fn resolve_and_validate_form_model_id(
     backend: BackendKind,
     catalog: Option<&openasr_core::ModelCatalog>,
 ) -> Result<String, ApiError> {
-    let registry = load_registry(default_registry_dir()).map_err(ApiError::Registry)?;
+    let registry = runtime_registry(catalog).map_err(ApiError::from)?;
 
     match backend {
         BackendKind::Mock => {

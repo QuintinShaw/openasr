@@ -27,10 +27,11 @@ use openasr_core::{
     atomic_write_text, prepare_audio_input,
 };
 
+use crate::catalog_cli::load_cli_model_catalog;
 use crate::{
-    BackendKind, RuntimePathOverrides, TranscriptionRequest, backend_name, default_registry_dir,
+    BackendKind, RuntimePathOverrides, TranscriptionRequest, backend_name,
     ensure_cli_diarization_packs_installed, ensure_diarization_supported, find_model, load_config,
-    load_registry, openasr_home, resolve_backend, selected_model_ref, transcribe_with_backend,
+    openasr_home, resolve_backend, runtime_registry, selected_model_ref, transcribe_with_backend,
     validate_local_native_model_pack_path,
 };
 
@@ -129,7 +130,8 @@ pub(crate) async fn run_live(options: LiveCommandOptions<'_>) -> Result<()> {
 
     let home = openasr_home()?;
     let config = load_config(&home)?;
-    let cards = load_registry(default_registry_dir()).context("Could not load model registry")?;
+    let catalog = load_cli_model_catalog(&home)?;
+    let cards = runtime_registry(catalog.as_ref()).context("Could not load model registry")?;
     let model_ref = selected_model_ref(options.model, &config, &cards);
     let card = find_model(&cards, &model_ref)?.card;
     let backend = resolve_backend(options.backend, &config)?;
