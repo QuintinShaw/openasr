@@ -35,6 +35,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
+use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
 
 use super::{PARAKEET_CTC_GGML_ARCHITECTURE_ID, PARAKEET_CTC_MODEL_FAMILY};
 
@@ -42,24 +43,7 @@ const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_TOKENIZER_JSON: &str = "tokenizer.json";
 const SOURCE_MODEL_SAFETENSORS: &str = "model.safetensors";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(non_camel_case_types)]
-pub enum ParakeetCtcQuantizationMode {
-    #[default]
-    Fp16,
-    Q8_0,
-    Q4_K,
-}
-
-impl ParakeetCtcQuantizationMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Fp16 => "fp16",
-            Self::Q8_0 => "q8_0",
-            Self::Q4_K => "q4_k",
-        }
-    }
-}
+pub type ParakeetCtcQuantizationMode = PackQuant;
 
 #[derive(Debug, Clone)]
 pub struct ParakeetCtcImportRequest {
@@ -369,13 +353,7 @@ fn quantized_tensor_type_for_parakeet_tensor(
         return None;
     }
     let ne0 = dims.first().copied()?;
-    if !ne0.is_multiple_of(32_u64) {
-        return None;
-    }
-    if quantization == ParakeetCtcQuantizationMode::Q4_K && ne0.is_multiple_of(256_u64) {
-        return Some(GgufWriteTensorType::Q4_K);
-    }
-    Some(GgufWriteTensorType::Q8_0)
+    classify_quant_tensor(ne0, quantization)
 }
 
 fn parakeet_runtime_gguf_metadata(

@@ -22,8 +22,10 @@ use crate::models::{
     oasr_metadata::{
         OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
         OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-        OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+        OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, insert_metadata,
+        insert_metadata_string_array, insert_metadata_u32, insert_metadata_u32_array,
     },
+    pack_quant::{PackQuant, classify_quant_tensor},
     whisper::WHISPER_MODEL_FAMILY,
 };
 
@@ -71,24 +73,7 @@ pub struct WhisperLocalSourceImportRuntimeResult {
     pub tensor_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(non_camel_case_types)]
-pub enum WhisperRuntimeQuantizationMode {
-    #[default]
-    Fp16,
-    Q8_0,
-    Q4_K,
-}
-
-impl WhisperRuntimeQuantizationMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Fp16 => "fp16",
-            Self::Q8_0 => "q8_0",
-            Self::Q4_K => "q4_k",
-        }
-    }
-}
+pub type WhisperRuntimeQuantizationMode = PackQuant;
 
 #[derive(Debug, Deserialize)]
 struct WhisperConfigJson {
@@ -236,13 +221,7 @@ fn quantization_tensor_type_for_whisper_tensor(
     }
     let dims = gguf_runtime_tensor_dims_from_source_tensor(tensor);
     let ne0 = dims.first().copied()?;
-    if ne0.is_multiple_of(32_u64) {
-        if quantization == WhisperRuntimeQuantizationMode::Q4_K && ne0.is_multiple_of(256_u64) {
-            return Some(GgufWriteTensorType::Q4_K);
-        }
-        return Some(GgufWriteTensorType::Q8_0);
-    }
-    None
+    classify_quant_tensor(ne0, quantization)
 }
 
 fn gguf_quantized_tensor_from_safetensors(
@@ -889,37 +868,6 @@ fn whisper_runtime_gguf_metadata(
     );
 
     metadata
-}
-
-fn insert_metadata(
-    metadata: &mut BTreeMap<String, GgufWriteValue>,
-    key: &str,
-    value: impl ToString,
-) {
-    metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
-}
-
-fn insert_metadata_u32(metadata: &mut BTreeMap<String, GgufWriteValue>, key: &str, value: u32) {
-    metadata.insert(key.to_string(), GgufWriteValue::U32(value));
-}
-
-fn insert_metadata_string_array(
-    metadata: &mut BTreeMap<String, GgufWriteValue>,
-    key: &str,
-    values: &[String],
-) {
-    metadata.insert(
-        key.to_string(),
-        GgufWriteValue::StringArray(values.to_vec()),
-    );
-}
-
-fn insert_metadata_u32_array(
-    metadata: &mut BTreeMap<String, GgufWriteValue>,
-    key: &str,
-    values: &[u32],
-) {
-    metadata.insert(key.to_string(), GgufWriteValue::U32Array(values.to_vec()));
 }
 
 fn whisper_gguf_tensor_binding_context(

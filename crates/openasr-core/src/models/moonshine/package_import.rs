@@ -21,8 +21,10 @@ use crate::models::moonshine::runtime_contract;
 use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
-    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+    OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, insert_metadata,
+    insert_metadata_string_array as insert_string_array, insert_metadata_u32 as insert_u32,
 };
+use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
 use crate::{read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source};
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
@@ -55,14 +57,7 @@ pub struct MoonshineLocalSourceImportRuntimeResult {
     pub tensor_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(non_camel_case_types)]
-pub enum MoonshineRuntimeQuantizationMode {
-    #[default]
-    Fp16,
-    Q8_0,
-    Q4_K,
-}
+pub type MoonshineRuntimeQuantizationMode = PackQuant;
 
 #[derive(Debug, Deserialize)]
 struct MoonshineConfigJson {
@@ -418,10 +413,7 @@ fn quantized_tensor_type_for_moonshine_tensor(
     if name == "dec.emb.weight" {
         return Some(GgufWriteTensorType::Q8_0);
     }
-    if quantization == MoonshineRuntimeQuantizationMode::Q4_K && ne0.is_multiple_of(256_u64) {
-        return Some(GgufWriteTensorType::Q4_K);
-    }
-    Some(GgufWriteTensorType::Q8_0)
+    classify_quant_tensor(ne0, quantization)
 }
 
 #[derive(Debug, Clone)]
@@ -679,29 +671,6 @@ fn validate_request(
     }
     validate_output_pack_extension(&request.output_root)?;
     Ok(())
-}
-
-fn insert_metadata(
-    metadata: &mut BTreeMap<String, GgufWriteValue>,
-    key: &str,
-    value: impl ToString,
-) {
-    metadata.insert(key.to_string(), GgufWriteValue::String(value.to_string()));
-}
-
-fn insert_u32(metadata: &mut BTreeMap<String, GgufWriteValue>, key: &str, value: u32) {
-    metadata.insert(key.to_string(), GgufWriteValue::U32(value));
-}
-
-fn insert_string_array(
-    metadata: &mut BTreeMap<String, GgufWriteValue>,
-    key: &str,
-    values: &[String],
-) {
-    metadata.insert(
-        key.to_string(),
-        GgufWriteValue::StringArray(values.to_vec()),
-    );
 }
 
 #[cfg(test)]
