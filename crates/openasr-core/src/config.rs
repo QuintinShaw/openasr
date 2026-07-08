@@ -225,7 +225,7 @@ pub enum ConfigError {
     UnknownKey(String),
     #[error("Unsupported backend '{0}'. Use one of: {backends}.", backends = BackendKind::SELECTABLE.join(", "))]
     UnsupportedBackend(String),
-    #[error("Unsupported download source '{0}'. Use one of: auto, hf, hf-mirror.")]
+    #[error("Unsupported download source '{0}'. Use one of: auto, hf, hf-mirror, weights.")]
     UnsupportedDownloadSource(String),
     #[error(
         "Backend '{0}' cannot be persisted as default_backend.\nUse `default_backend=mock` and pass `--backend native` explicitly when you need local GGUF runtime execution with fail-closed behavior."

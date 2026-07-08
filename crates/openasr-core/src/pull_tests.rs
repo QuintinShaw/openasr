@@ -431,13 +431,65 @@ fn redirect_cookies_are_scoped_to_the_setting_host() {
 #[test]
 fn hf_token_only_attaches_to_the_huggingface_host() {
     // The optional bearer token authenticates to huggingface.co only; it must
-    // never ride a redirect to a CDN, mirror, or attacker host.
+    // never ride a redirect to a CDN, mirror, the first-party worker, or an
+    // attacker host.
     assert!(hf_token_allowed_for_host(Some("huggingface.co")));
     assert!(!hf_token_allowed_for_host(Some("cdn-lfs.huggingface.co")));
     assert!(!hf_token_allowed_for_host(Some("hf-mirror.com")));
     assert!(!hf_token_allowed_for_host(Some("modelscope.cn")));
+    // The weights worker and the Xet CDN it forwards to are always anonymous.
+    assert!(!hf_token_allowed_for_host(Some("weights.openasr.org")));
+    assert!(!hf_token_allowed_for_host(Some("us.aws.cdn.hf.co")));
     assert!(!hf_token_allowed_for_host(Some("cdn-lfs.evil.example")));
     assert!(!hf_token_allowed_for_host(None));
+}
+
+#[test]
+fn hf_token_normalizes_and_drops_empty_values() {
+    // A whitespace-only or empty token reads as absent (anonymous); a real token is
+    // trimmed. This is the per-var selection used by `hf_token_from_env` across
+    // OPENASR_HF_TOKEN / HF_TOKEN / HUGGING_FACE_HUB_TOKEN.
+    assert_eq!(normalize_hf_token(None), None);
+    assert_eq!(normalize_hf_token(Some("   ".to_string())), None);
+    assert_eq!(normalize_hf_token(Some(String::new())), None);
+    assert_eq!(
+        normalize_hf_token(Some("  hf_abc123  ".to_string())),
+        Some("hf_abc123".to_string())
+    );
+}
+
+#[test]
+fn weights_worker_redirect_into_xet_is_followed_verbatim() {
+    // The weights.openasr.org worker 302s a /resolve request through to Hugging
+    // Face's Xet CDN, which the worker does NOT re-serve. That hop must be followed
+    // verbatim (host unchanged) -- rewriting it back onto the worker would 404.
+    // Same behavior as the direct huggingface.co source.
+    let resolved = resolve_redirect_location(
+        "https://weights.openasr.org/OpenASR/moonshine-tiny/resolve/abc/model.oasr",
+        "https://us.aws.cdn.hf.co/repos/xx/blob?X-Amz-Signature=deadbeef",
+    )
+    .expect("xet redirect resolves");
+    assert_eq!(
+        resolved,
+        "https://us.aws.cdn.hf.co/repos/xx/blob?X-Amz-Signature=deadbeef"
+    );
+}
+
+#[test]
+fn mirror_source_redirect_into_us_aws_cdn_is_followed_verbatim() {
+    // Under the hf-mirror source, a 302 into the `us.aws.cdn.hf.co` Xet frontend
+    // must be followed verbatim too: hf-mirror.com does not proxy Xet CAS paths, so
+    // host-swapping it onto the mirror endpoint would 404. (`us.aws.cdn.hf.co` ends
+    // with `.hf.co` but not `.huggingface.co`.)
+    let resolved = resolve_redirect_location(
+        "https://hf-mirror.com/OpenASR/moonshine-tiny/resolve/abc/model.oasr",
+        "https://us.aws.cdn.hf.co/repos/xx/blob?X-Amz-Signature=deadbeef",
+    )
+    .expect("xet redirect resolves");
+    assert_eq!(
+        resolved,
+        "https://us.aws.cdn.hf.co/repos/xx/blob?X-Amz-Signature=deadbeef"
+    );
 }
 
 #[test]

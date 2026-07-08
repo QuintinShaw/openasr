@@ -39,6 +39,13 @@ pub(crate) fn error_message(error: &reqwest::Error) -> String {
 pub(crate) const HUGGING_FACE_HOST: &str = "https://huggingface.co/";
 pub(crate) const HF_MIRROR_ENDPOINT: &str = "https://hf-mirror.com";
 
+/// First-party Cloudflare Worker that proxies `huggingface.co`'s `OpenASR/*`
+/// `/resolve/...` endpoint and transparently passes through the 302 into the Xet
+/// CDN. Used by [`DownloadSource::Weights`](crate::DownloadSource::Weights) as the
+/// primary China source (self-controlled, no dependency on third-party mirrors)
+/// and as an overseas fallback.
+pub(crate) const WEIGHTS_ENDPOINT: &str = "https://weights.openasr.org";
+
 /// Optional transport host for legacy HF-shaped catalog URLs. The default catalog
 /// URL is already `https://catalog.openasr.org/v1/catalog.json`; this endpoint is
 /// retained for self-host tests and older pinned catalog identities.
@@ -47,6 +54,14 @@ pub(crate) const DEFAULT_CATALOG_ENDPOINT: &str = "https://catalog.openasr.org";
 pub(crate) fn apply_default_hf_mirror(url: &str) -> String {
     let endpoint = hf_endpoint().unwrap_or_else(|| HF_MIRROR_ENDPOINT.to_string());
     rewrite_to_mirror(url, Some(&endpoint))
+}
+
+/// Swap only the `https://huggingface.co/` host of a resolve URL onto the
+/// first-party [`WEIGHTS_ENDPOINT`], preserving the signed `/resolve/<rev>/<file>`
+/// path verbatim (so the sha256 gate and the downstream Xet redirect are
+/// unaffected). Non-huggingface URLs pass through untouched.
+pub(crate) fn apply_weights_endpoint(url: &str) -> String {
+    rewrite_to_mirror(url, Some(WEIGHTS_ENDPOINT))
 }
 
 /// Rewrite only legacy `https://huggingface.co/...` catalog identities onto the
@@ -116,16 +131,22 @@ pub(crate) fn is_allowed_mirror_host(url: &str) -> bool {
         || host == "www.modelscope.cn"
 }
 
-const HF_CDN_HOST_SUFFIXES: &[&str] = &[".hf.co", ".huggingface.co"];
+/// The legacy Hugging Face LFS CDN (`cdn-lfs.huggingface.co`, `cdn-lfs-us-1...`,
+/// etc.) lives under the `.huggingface.co` domain and IS proxied by hf-mirror.com,
+/// so a `/resolve/...` 302 into it can be host-swapped onto the configured mirror
+/// endpoint (keeping the signed query string intact).
+const HF_LEGACY_CDN_HOST_SUFFIX: &str = ".huggingface.co";
 
-/// Hugging Face's Xet content-addressed-storage bridge (`cas-bridge.xethub.hf.co`
-/// and siblings). A `/resolve/...` request for a Xet-backed file 302s here. Unlike
-/// the legacy LFS CDN, hf-mirror.com does NOT proxy these hosts — rewriting a Xet
-/// redirect onto the mirror yields a 404. So Xet redirects must be followed
-/// VERBATIM (the official mirror tools, `hf`/`hfd`, reach Xet via its chunk
-/// protocol, which this plain-HTTP downloader does not speak). Matched before the
-/// generic `.hf.co` suffix so it is excluded from the rewrite.
-const HF_XET_CAS_HOST_SUFFIX: &str = "xethub.hf.co";
+/// Hugging Face's Xet content-addressed storage is served from the short `.hf.co`
+/// domain: the CAS bridge (`cas-bridge.xethub.hf.co`) and the AWS CDN in front of
+/// it (`us.aws.cdn.hf.co`), among others. Neither hf-mirror.com nor the
+/// weights.openasr.org worker re-serve these Xet CAS paths, so a `/resolve/...`
+/// 302 into Xet must be followed VERBATIM -- host-swapping it onto an endpoint
+/// yields a 404. (The official mirror tools `hf`/`hfd` reach Xet via its chunk
+/// protocol, which this plain-HTTP downloader does not speak.) Any host under
+/// `.hf.co` is treated as a Xet frontend and excluded from the rewrite; the legacy
+/// LFS CDN stays under `.huggingface.co`, which does not match this suffix.
+const HF_XET_CAS_HOST_SUFFIX: &str = ".hf.co";
 
 fn rewrite_cdn_redirect_to_mirror(location: &str, endpoint: Option<&str>) -> String {
     let Some(endpoint) = endpoint else {
@@ -138,12 +159,12 @@ fn rewrite_cdn_redirect_to_mirror(location: &str, endpoint: Option<&str>) -> Str
         .strip_prefix("https://")
         .or_else(|| scheme_host.strip_prefix("http://"))
         .unwrap_or(scheme_host);
-    let is_hf_cdn = host != "huggingface.co"
-        && !host.ends_with(HF_XET_CAS_HOST_SUFFIX)
-        && HF_CDN_HOST_SUFFIXES
-            .iter()
-            .any(|suffix| host.ends_with(suffix));
-    if is_hf_cdn {
+    // Only the legacy LFS CDN (`.huggingface.co`) is proxied by the mirror; every
+    // Xet frontend (`.hf.co`, e.g. `us.aws.cdn.hf.co`, `cas-bridge.xethub.hf.co`)
+    // is followed verbatim so the transparent Xet redirect is never broken.
+    let is_legacy_lfs_cdn =
+        host.ends_with(HF_LEGACY_CDN_HOST_SUFFIX) && !host.ends_with(HF_XET_CAS_HOST_SUFFIX);
+    if is_legacy_lfs_cdn {
         format!("{endpoint}{rest}")
     } else {
         location.to_string()
@@ -238,6 +259,18 @@ mod tests {
                 endpoint
             ),
             "https://cas-bridge.xethub.hf.co/xet-bridge-us/abc?X-Amz-Signature=deadbeef"
+        );
+        // The AWS CDN in front of Xet (`us.aws.cdn.hf.co`) is also a `.hf.co` Xet
+        // frontend and must be followed verbatim. It ends with `.hf.co` but NOT
+        // `.huggingface.co`; a previous version keyed the exclusion on the literal
+        // `xethub.hf.co` suffix only and wrongly host-swapped this active host onto
+        // the endpoint (a guaranteed 404). Regression guard.
+        assert_eq!(
+            rewrite_cdn_redirect_to_mirror(
+                "https://us.aws.cdn.hf.co/repos/xx/yy/blob?X-Amz-Signature=deadbeef",
+                endpoint
+            ),
+            "https://us.aws.cdn.hf.co/repos/xx/yy/blob?X-Amz-Signature=deadbeef"
         );
         // The legacy LFS CDN, which hf-mirror DOES proxy, is still host-swapped,
         // keeping the signed query string intact.
