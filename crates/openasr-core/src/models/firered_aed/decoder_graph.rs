@@ -29,6 +29,14 @@ use crate::ggml_runtime::{
     GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedWeightContext, GgmlStaticTensor,
     GgmlStaticTensorArena,
 };
+use crate::models::decode_policy_component_registry::{
+    BuiltinSeq2SeqDecodePolicyConfigInput, run_builtin_seq2seq_decode_policy,
+};
+use crate::models::decode_token_history::context_window_budget;
+use crate::models::seq2seq_greedy_decode::{
+    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
+    Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
+};
 use crate::nn::decoder::{
     CrossKvHandle, SelfKvHandle, Seq2SeqLayerConfig, Seq2SeqLayerWeights,
     build_causal_mask_f16_bits, seq2seq_layer,
@@ -482,6 +490,34 @@ impl FireRedDecoderGraphRuntime {
     }
 }
 
+/// firered-aed decodes through the shared seq2seq greedy driver: every step
+/// recomputes logits for the full `<sos> ++ generated` prefix (the incremental
+/// KV cache inside [`Self::compute_step_logits`] makes this cheap after the
+/// prefill). `greedy_token_hint: None` -- firered has no device-side argmax, so
+/// the shared loop owns the host argmax.
+impl Seq2SeqGreedyDecodeStepExecutor for FireRedDecoderGraphRuntime {
+    fn decode_step_logits(
+        &mut self,
+        input: Seq2SeqGreedyDecodeStepInput<'_>,
+    ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError> {
+        let prefix: Vec<u32> = input
+            .initial_prompt_tokens
+            .iter()
+            .copied()
+            .chain(input.generated_tokens.iter().copied())
+            .collect();
+        let logits = self.compute_step_logits(&prefix).map_err(|error| {
+            Seq2SeqGreedyDecodeError::DecoderStepFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+            logits,
+            greedy_token_hint: None,
+        })
+    }
+}
+
 fn apply_linear_with_bias<'a>(
     graph: &mut GgmlCpuGraphBuilder<'a>,
     input: GgmlCpuTensor<'a>,
@@ -554,28 +590,18 @@ pub(crate) struct FireRedAedGreedyDecodeOutput {
     pub generated_tokens: Vec<u32>,
 }
 
-/// Run the full attention-based greedy decode for one utterance: build a
-/// fresh decoder runtime sized to `encoder_frame_count`, precompute the
-/// cross-KV cache from `encoder_rows`, then autoregress from `<sos>` one
-/// token at a time (argmax logits) until `<eos>` or the generation budget is
-/// exhausted.
-pub(crate) fn run_firered_aed_decoder_greedy(
-    runtime_path: &Path,
-    metadata: FireRedAedExecutionMetadata,
-    encoder_rows: &[f32],
-    encoder_frame_count: usize,
-    decode_text: impl Fn(&[u32]) -> Result<String, String>,
-) -> Result<FireRedAedGreedyDecodeOutput, FireRedDecoderError> {
-    let mut runtime = FireRedDecoderGraphRuntime::new(runtime_path, metadata, encoder_frame_count)?;
-    run_firered_aed_decoder_greedy_with_runtime(&mut runtime, metadata, encoder_rows, decode_text)
-}
-
-/// Same greedy decode loop as [`run_firered_aed_decoder_greedy`], but against
-/// an already-built (and possibly cached/reused across transcriptions)
+/// Run the full attention-based greedy decode for one utterance against an
+/// already-built (and possibly cached/reused across transcriptions)
 /// [`FireRedDecoderGraphRuntime`]. Resets the runtime's cross-KV cache and
 /// incremental self-KV position for this utterance via
 /// [`FireRedDecoderGraphRuntime::populate_cross_attention_cache`] before
-/// decoding, so a cache hit never leaks state from a prior utterance.
+/// decoding, then autoregresses from `<sos>` through the shared seq2seq greedy
+/// driver (`run_builtin_seq2seq_decode_policy` -> `run_seq2seq_greedy_decode_loop_v0`)
+/// under the firered decode-policy descriptor. Routing through the shared driver
+/// (rather than a hand-written argmax loop) is what gives firered the degenerate
+/// n-gram-repeat guard for free (issue #60): firered declares no phrase bias,
+/// no suppression and no extra stop tokens, so the policy config is a plain
+/// `<sos>`-prompted greedy decode to `<eos>`.
 pub(crate) fn run_firered_aed_decoder_greedy_with_runtime(
     runtime: &mut FireRedDecoderGraphRuntime,
     metadata: FireRedAedExecutionMetadata,
@@ -584,37 +610,59 @@ pub(crate) fn run_firered_aed_decoder_greedy_with_runtime(
 ) -> Result<FireRedAedGreedyDecodeOutput, FireRedDecoderError> {
     runtime.populate_cross_attention_cache(encoder_rows)?;
 
-    let max_new_tokens =
-        crate::models::decode_token_history::context_window_budget(metadata.decoder_pe_len, 1)
-            .unwrap_or(0);
-    let mut prefix = vec![metadata.sos_token_id];
-    let mut generated_tokens = Vec::new();
-    for _ in 0..max_new_tokens {
-        let logits = runtime.compute_step_logits(&prefix)?;
-        let next_token = argmax_token_id(&logits)?;
-        if next_token == metadata.eos_token_id {
-            break;
+    let max_generated_tokens = context_window_budget(metadata.decoder_pe_len, 1).unwrap_or(0);
+    let config = BuiltinSeq2SeqDecodePolicyConfigInput {
+        initial_prompt_tokens: vec![metadata.sos_token_id],
+        eot_token_id: metadata.eos_token_id,
+        vocab_size: metadata.vocab_size,
+        max_generated_tokens,
+    };
+    let decode_text_token_ids = |token_ids: &[u32]| {
+        decode_text(token_ids)
+            .map_err(|reason| Seq2SeqGreedyDecodeError::TokenizerDecodeFailed { reason })
+    };
+    let decode = match run_builtin_seq2seq_decode_policy::<Seq2SeqGreedyDecodeError>(
+        crate::arch::FIRERED_AED_DECODE_POLICY_ID,
+        &config,
+        // firered has no special tokens and no phrase bias (supports_phrase_bias
+        // is false), so the unit token source with `phrase_bias: None` never
+        // needs to encode anything.
+        &(),
+        None,
+        runtime,
+        &decode_text_token_ids,
+        |error| error,
+        |error| error,
+        |error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
+            reason: error.to_string(),
+        },
+    ) {
+        Ok(output) => output,
+        // Budget exhausted before `<eos>`: keep the generated prefix and
+        // detokenize it, matching the pre-unification behavior (return the
+        // partial transcript rather than erroring out).
+        Err(Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {
+            generated_tokens, ..
+        }) => {
+            let text = decode_text(&generated_tokens).map_err(|reason| {
+                FireRedDecoderError::InvalidInput {
+                    reason: format!("tokenizer decode failed: {reason}"),
+                }
+            })?;
+            Seq2SeqGreedyDecodeResult {
+                text,
+                generated_tokens,
+                generated_probabilities: Vec::new(),
+            }
         }
-        prefix.push(next_token);
-        generated_tokens.push(next_token);
-    }
-    let text =
-        decode_text(&generated_tokens).map_err(|reason| FireRedDecoderError::InvalidInput {
-            reason: format!("tokenizer decode failed: {reason}"),
-        })?;
+        Err(error) => {
+            return Err(FireRedDecoderError::InvalidInput {
+                reason: error.to_string(),
+            });
+        }
+    };
     Ok(FireRedAedGreedyDecodeOutput {
-        text,
-        generated_tokens,
+        text: decode.text,
+        generated_tokens: decode.generated_tokens,
     })
-}
-
-fn argmax_token_id(logits: &[f32]) -> Result<u32, FireRedDecoderError> {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(index, _)| index as u32)
-        .ok_or(FireRedDecoderError::InvalidInput {
-            reason: "decoder step produced empty logits".to_string(),
-        })
 }
