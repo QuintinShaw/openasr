@@ -876,6 +876,10 @@ mod tests {
             DolphinQuantizationMode::Fp16 => 3.0e-3,
             DolphinQuantizationMode::Q8_0 => 5.0e-2,
             DolphinQuantizationMode::Q4_K => 2.5e-1,
+            // Dolphin's importer only ever produces fp16/q8_0/q4_k (see
+            // `DOLPHIN_QUANT_RUNGS`); q3_k is unreachable for this family even
+            // though the shared `PackQuant` enum also carries it for qwen.
+            DolphinQuantizationMode::Q3_K => unreachable!("dolphin never produces a q3_k pack"),
         }
     }
 
@@ -888,6 +892,7 @@ mod tests {
             DolphinQuantizationMode::Fp16 => 0.0,
             DolphinQuantizationMode::Q8_0 => 5.0e-2,
             DolphinQuantizationMode::Q4_K => 2.5e-1,
+            DolphinQuantizationMode::Q3_K => unreachable!("dolphin never produces a q3_k pack"),
         }
     }
 
