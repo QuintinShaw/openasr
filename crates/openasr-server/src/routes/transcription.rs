@@ -207,10 +207,10 @@ pub(crate) fn record_file_transcription_history(
             output_format: Some(output_format),
             diarization_active: Some(request.diarize),
             provenance: Some(DaemonHistoryProvenance::Recorded),
-            formats: ResponseFormat::ALL
-                .iter()
-                .map(|format| (*format).to_string())
-                .collect(),
+            // Persist the per-segment timing so exports can rebuild SRT/VTT/JSON
+            // later; the store derives the advertised `formats` from these so we
+            // never claim a format the stored transcript cannot render.
+            segments: transcription.segments.clone(),
             text: transcription.text.clone(),
         })
         .map_err(ApiError::History)?;

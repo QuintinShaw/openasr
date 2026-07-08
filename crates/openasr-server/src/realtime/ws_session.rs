@@ -3186,7 +3186,10 @@ impl WsSession {
             output_format: Some(ResponseFormat::Text),
             diarization_active: Some(self.streaming_diarizer.is_some()),
             provenance: Some(DaemonHistoryProvenance::Recorded),
-            formats: vec!["text".to_string()],
+            // Live daemon history persists only the aggregated transcript text;
+            // per-segment timing lives in the realtime transcript history. No
+            // segments here means the store advertises text-shaped exports only.
+            segments: Vec::new(),
             text,
         }) {
             self.emit_error(
