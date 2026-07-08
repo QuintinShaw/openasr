@@ -180,6 +180,18 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
             "/v1/audio/transcriptions/progress",
             get(transcription_progress),
         )
+        .route(
+            "/v1/audio/transcriptions/{id}/cancel",
+            post(cancel_transcription_job),
+        )
+        .route(
+            "/v1/audio/transcriptions/{id}/pause",
+            post(pause_transcription_job),
+        )
+        .route(
+            "/v1/audio/transcriptions/{id}/resume",
+            post(resume_transcription_job),
+        )
         .route("/v1/audio/translations", post(translations))
         .route("/v1/audio/realtime", any(realtime::websocket))
         .layer(middleware::from_fn_with_state(
@@ -838,14 +850,50 @@ impl Default for DistributionRuntime {
 pub(crate) struct DistributionContext {
     runtime: DistributionRuntime,
     jobs: Arc<DistributionJobs>,
+    // In-flight file transcriptions that opted into control, keyed by the
+    // client-supplied transcription id. The pause/resume/cancel HTTP handlers
+    // flip these flags while the blocking decode runs on a `spawn_blocking`
+    // worker. In-session only: an entry lives just for one transcription's
+    // lifetime and is cleared when the request returns.
+    transcriptions: Arc<Mutex<HashMap<String, Arc<openasr_core::TranscriptionControl>>>>,
 }
 
 impl DistributionContext {
     fn new(runtime: DistributionRuntime) -> Self {
         Self {
             jobs: Arc::new(DistributionJobs::new(load_persisted_pull_jobs(&runtime))),
+            transcriptions: Arc::new(Mutex::new(HashMap::new())),
             runtime,
         }
+    }
+
+    fn register_transcription(
+        &self,
+        transcription_id: &str,
+        control: Arc<openasr_core::TranscriptionControl>,
+    ) {
+        self.transcriptions
+            .lock()
+            .expect("active transcription registry mutex poisoned")
+            .insert(transcription_id.to_string(), control);
+    }
+
+    fn clear_transcription(&self, transcription_id: &str) {
+        self.transcriptions
+            .lock()
+            .expect("active transcription registry mutex poisoned")
+            .remove(transcription_id);
+    }
+
+    fn transcription_control(
+        &self,
+        transcription_id: &str,
+    ) -> Option<Arc<openasr_core::TranscriptionControl>> {
+        self.transcriptions
+            .lock()
+            .expect("active transcription registry mutex poisoned")
+            .get(transcription_id)
+            .cloned()
     }
 
     fn openasr_home(&self) -> Result<PathBuf, ApiError> {
@@ -1707,6 +1755,10 @@ impl IntoResponse for ApiError {
                             StatusCode::SERVICE_UNAVAILABLE
                         }
                     }
+                    // A caller-requested cancel is not a fault: the client asked
+                    // to stop this in-flight transcription. 409 distinguishes it
+                    // from the 400 fail-closed refusals and the 5xx faults.
+                    openasr_core::BackendError::TranscriptionCanceled => StatusCode::CONFLICT,
                 };
                 (status, format!("Could not transcribe audio: {error}"))
             }

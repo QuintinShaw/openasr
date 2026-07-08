@@ -1282,6 +1282,56 @@ async fn pull_job_control_ack_sets_flag_without_terminal_state_flip() {
     distribution.clear_active_job("pull-control");
 }
 
+#[tokio::test]
+async fn transcription_control_endpoints_flip_pause_resume_cancel_flags() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+    let control = Arc::new(openasr_core::TranscriptionControl::new());
+    distribution.register_transcription("txn-1", Arc::clone(&control));
+
+    pause_transcription_job(
+        AxumPath("txn-1".to_string()),
+        Extension(distribution.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(control.is_paused());
+
+    resume_transcription_job(
+        AxumPath("txn-1".to_string()),
+        Extension(distribution.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(!control.is_paused());
+
+    cancel_transcription_job(
+        AxumPath("txn-1".to_string()),
+        Extension(distribution.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(control.is_canceled());
+
+    // Cleared entry (finished run) and unknown ids both fail closed with 404.
+    distribution.clear_transcription("txn-1");
+    assert!(distribution.transcription_control("txn-1").is_none());
+    let error = cancel_transcription_job(
+        AxumPath("txn-1".to_string()),
+        Extension(distribution.clone()),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, ApiError::NotFound(_)));
+}
+
+#[test]
+fn transcription_canceled_backend_error_maps_to_409() {
+    let response =
+        ApiError::Backend(openasr_core::BackendError::TranscriptionCanceled).into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
 #[test]
 fn pull_job_reuses_existing_nonterminal_snapshot_for_same_pull() {
     let temp = tempfile::tempdir().unwrap();
@@ -1407,7 +1457,9 @@ async fn native_transcribe_stays_fail_closed_with_local_pack_only_validation() {
         model_pack_path: Some(pack_root),
     };
     let request = TranscriptionRequest::new(sample_wav, "whisper-large-v3-turbo");
-    let error = transcribe_with_runtime(runtime, request).await.unwrap_err();
+    let error = transcribe_with_runtime(runtime, request, None)
+        .await
+        .unwrap_err();
     let rendered = error.to_string();
     assert!(rendered.contains("Could not transcribe audio"));
 }
