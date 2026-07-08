@@ -25,6 +25,7 @@ pub(crate) const FIRERED_PUNC_ATTENTION_HEAD_COUNT_KEY: &str = "firered-punc.att
 pub(crate) const FIRERED_PUNC_ATTENTION_LAYER_NORM_EPSILON_KEY: &str =
     "firered-punc.attention.layer_norm_epsilon";
 pub(crate) const FIRERED_PUNC_CONTEXT_LENGTH_KEY: &str = "firered-punc.context_length";
+pub(crate) const FIRERED_PUNC_VOCAB_SIZE_KEY: &str = "firered-punc.vocab_size";
 pub(crate) const FIRERED_PUNC_LABEL_COUNT_KEY: &str = "firered-punc.label_count";
 pub(crate) const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 
