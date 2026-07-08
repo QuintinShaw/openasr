@@ -22,5 +22,6 @@
 #![allow(dead_code)]
 
 pub(crate) mod config;
+pub(crate) mod runtime_contract;
 pub(crate) mod tensor_names;
 pub(crate) mod tokenizer;
