@@ -17,10 +17,10 @@ use openasr_core::{
     ResponseFormat, TranscriptionBackend, TranscriptionRequest, WhisperLocalSourceImportRequest,
     atomic_write_text, config_path, convert_local_cohere_source_to_runtime_pack,
     convert_local_qwen_source_to_runtime_pack, convert_local_whisper_hf_source_to_runtime_pack,
-    default_registry_dir, derive_catalog_public_key_hex, discover_batch_inputs,
-    embedded_catalog_fingerprint, load_config, load_registry, openasr_home, parse_model_catalog,
-    parse_model_ref, render_batch_summary, render_benchmark, render_catalog_signature_manifest,
-    resolve_registry_model_ref, resolve_runtime_model_ref, save_config,
+    derive_catalog_public_key_hex, discover_batch_inputs, embedded_catalog_fingerprint,
+    load_config, openasr_home, parse_model_catalog, parse_model_ref, render_batch_summary,
+    render_benchmark, render_catalog_signature_manifest, resolve_registry_model_ref,
+    resolve_runtime_model_ref, runtime_registry, save_config,
     validate_local_native_model_pack_path, verify_catalog_signature_manifest,
 };
 
@@ -336,7 +336,12 @@ async fn run() -> Result<()> {
 }
 
 fn search_models(query: Option<&str>) -> Result<()> {
-    let cards = load_registry(default_registry_dir()).context("Could not load model registry")?;
+    // Offline by design: the derived registry comes from the local/embedded signed
+    // catalog (no network), so `openasr search` never triggers a download.
+    let catalog = openasr_home()
+        .ok()
+        .and_then(|home| load_cli_model_catalog(&home).ok().flatten());
+    let cards = runtime_registry(catalog.as_ref()).context("Could not load model registry")?;
     let needle = query.map(|q| q.to_ascii_lowercase());
     println!(
         "{:<30} {:<24} {:<10} {:<7} {:<14} {:<10} {:<10} {:<14} {:<28} DISPLAY NAME",
@@ -424,9 +429,8 @@ fn config_command(command: ConfigCommand) -> Result<()> {
 fn set_config_value(config: &mut OpenAsrConfig, key: ConfigKey, value: String) -> Result<()> {
     if key == ConfigKey::DefaultModel {
         let home = openasr_home()?;
-        let cards =
-            load_registry(default_registry_dir()).context("Could not load model registry")?;
         let catalog = load_cli_model_catalog(&home)?;
+        let cards = runtime_registry(catalog.as_ref()).context("Could not load model registry")?;
         config.set_with_catalog(key, value, &cards, catalog.as_ref())?;
     } else {
         config.set(key, value, &[])?;
@@ -532,8 +536,8 @@ fn doctor() -> Result<()> {
     let home = openasr_home()?;
     let config_file = config_path(&home);
     let config = load_config(&home)?;
-    let cards = load_registry(default_registry_dir()).context("Could not load model registry")?;
     let catalog = load_cli_model_catalog(&home)?;
+    let cards = runtime_registry(catalog.as_ref()).context("Could not load model registry")?;
     let default_model = config.default_model.as_deref().unwrap_or(DEFAULT_MODEL_ID);
     let default_backend = config
         .default_backend

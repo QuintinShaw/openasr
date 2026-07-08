@@ -52,13 +52,13 @@ use openasr_core::{
     InstalledPack, LaunchPackRequest, LicenseClass, OpenAsrHomeError, PullError,
     PullModelPackRequest, PullProgress, QuantPreference, RealtimeBackendCapabilities,
     ResolvedCatalogPull, certificate_fingerprint_sha256, default_pack_pointer_path,
-    default_registry_dir, host_quant_recommendation_profile, install_catalog_model_pack_from_path,
+    host_quant_recommendation_profile, install_catalog_model_pack_from_path,
     install_model_pack_from_path, list_installed_packs, load_config, load_model_catalog,
-    load_registry, native_runtime_realtime_capabilities_for_path,
+    native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, openasr_home, persist_default_pack_pointer,
     read_default_pack_pointer, remove_model_pack, resolve_catalog_pull,
     resolve_installed_pack_reference, resolve_installed_pack_reference_with_catalog,
-    resolve_launch_pack, save_default_model_selection,
+    resolve_launch_pack, runtime_registry, save_default_model_selection,
 };
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -1259,8 +1259,8 @@ async fn health(
 
 async fn models(State(runtime): State<ServerRuntime>) -> Result<Json<ModelsResponse>, ApiError> {
     let ids: Vec<String> = match runtime.backend {
-        BackendKind::Mock => load_registry(default_registry_dir())
-            .map_err(ApiError::Registry)?
+        BackendKind::Mock => runtime_registry(None)
+            .map_err(ApiError::from)?
             .into_iter()
             .map(|card| card.id)
             .collect(),
@@ -1570,6 +1570,15 @@ pub(crate) enum ApiError {
     /// mid-stream. The message is pre-built at the call site since it needs
     /// the probed byte counts and temp-dir path.
     InsufficientDiskSpace(String),
+}
+
+impl From<openasr_core::RuntimeRegistryError> for ApiError {
+    fn from(error: openasr_core::RuntimeRegistryError) -> Self {
+        match error {
+            openasr_core::RuntimeRegistryError::Registry(error) => Self::Registry(error),
+            openasr_core::RuntimeRegistryError::Catalog(error) => Self::Catalog(error),
+        }
+    }
 }
 
 impl std::fmt::Display for ApiError {

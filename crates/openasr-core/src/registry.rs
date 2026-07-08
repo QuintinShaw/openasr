@@ -829,12 +829,37 @@ pub enum RuntimeModelResolutionError {
     Catalog(#[from] CatalogError),
 }
 
-pub fn default_registry_dir() -> PathBuf {
-    let from_cwd = PathBuf::from("model-registry/models");
-    if from_cwd.exists() {
-        return from_cwd;
-    }
+/// Environment override that points the runtime model registry at an on-disk
+/// `model-registry/models` directory instead of deriving it from the signed
+/// catalog. Set it for fast `cargo run` iteration against a working tree; it is
+/// NEVER set in a bundled/release environment (see [`runtime_registry`]).
+pub const OPENASR_REGISTRY_DIR_ENV: &str = "OPENASR_REGISTRY_DIR";
 
+/// The on-disk registry directory a WORKING TREE resolves to, relative to the
+/// current directory. This is a build-time / tooling / test convenience only --
+/// it is NOT a release runtime source (a deployed binary ships no
+/// `model-registry/` tree). The release runtime resolves the registry from the
+/// signed catalog via [`runtime_registry`]; the only on-disk path the runtime
+/// ever reads is an explicit [`OPENASR_REGISTRY_DIR_ENV`] override.
+pub fn default_registry_dir() -> PathBuf {
+    PathBuf::from("model-registry/models")
+}
+
+/// The explicit dev override directory, when [`OPENASR_REGISTRY_DIR_ENV`] is set
+/// to a non-empty value. Absent otherwise, which drives the runtime onto the
+/// catalog-derived registry.
+fn registry_dir_override() -> Option<PathBuf> {
+    std::env::var_os(OPENASR_REGISTRY_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The registry directory a test/tooling harness reads from the committed
+/// working tree (an absolute path, independent of the process cwd). Kept out of
+/// the release runtime deliberately: `env!("CARGO_MANIFEST_DIR")` is a
+/// build-machine path that does not exist on a user's device.
+#[cfg(test)]
+pub(crate) fn test_model_registry_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry/models")
 }
 
@@ -927,6 +952,71 @@ pub fn load_model_catalog(
             }
             Err(error) => load_cached_catalog(source, &cache_path, error),
         }
+    }
+}
+
+/// Whether the runtime should prefer the embedded catalog snapshot over the
+/// network/cache tier, chosen purely by catalog_epoch freshness. Split out as a
+/// pure function so the epoch-max policy is unit-testable without live signing.
+///
+/// SECURITY: this is a freshness preference only, never a rollback relaxation.
+/// The embedded snapshot is only ever *loaded* through
+/// [`load_embedded_signed_catalog`], which runs the same `enforce_catalog_epoch`
+/// rollback guard as any other source (it refuses an embedded epoch below the
+/// stored floor). Here we additionally require the embedded epoch to be STRICTLY
+/// newer than the epoch the network/cache tier just established, so a lower/equal
+/// embedded snapshot can never displace a newer catalog the device already has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeCatalogChoice {
+    Network,
+    Embedded,
+}
+
+fn choose_runtime_catalog(
+    network_epoch: Option<u64>,
+    embedded_epoch: Option<u64>,
+) -> RuntimeCatalogChoice {
+    match (embedded_epoch, network_epoch) {
+        (Some(embedded), Some(network)) if embedded > network => RuntimeCatalogChoice::Embedded,
+        _ => RuntimeCatalogChoice::Network,
+    }
+}
+
+/// Resolve the catalog the runtime should use, picking the signature-verified
+/// source with the HIGHEST `catalog_epoch` across the network/on-disk-cache tier
+/// ([`load_model_catalog`], which already falls back to the on-disk cache and the
+/// embedded snapshot when offline) and the embedded signed snapshot as an
+/// epoch-max floor.
+///
+/// Effect: in a release build the embedded epoch is <= production, so the network
+/// catalog wins and users get the latest models; in a local preview build that
+/// embeds a catalog AHEAD of production, the embedded snapshot wins (test
+/// unreleased models with zero infrastructure). Offline with no cache, the
+/// embedded snapshot is the permanent floor so the runtime still starts.
+///
+/// Scoped to the canonical [`default_catalog_url`]: an explicit override URL is
+/// honored verbatim, never silently replaced by the bundled catalog. Anti-rollback
+/// is unchanged (see [`choose_runtime_catalog`]).
+pub fn resolve_runtime_catalog(
+    catalog_url: Option<&str>,
+    openasr_home: impl AsRef<Path>,
+) -> Result<ModelCatalog, CatalogError> {
+    let home = openasr_home.as_ref();
+    let network = load_model_catalog(catalog_url, home)?;
+    // The epoch-max embedded floor only applies to the canonical catalog: an
+    // explicit override is authoritative on its own.
+    if catalog_url.is_some_and(|url| url != DEFAULT_CATALOG_URL) {
+        return Ok(network);
+    }
+    let embedded_epoch = embedded_catalog_fingerprint().ok().map(|(_, epoch)| epoch);
+    // The stored epoch reflects what the network/cache tier just enforced/recorded.
+    let network_epoch =
+        catalog_security::read_catalog_epoch(&catalog_security::default_catalog_epoch_path(home))
+            .ok()
+            .flatten();
+    match choose_runtime_catalog(network_epoch, embedded_epoch) {
+        RuntimeCatalogChoice::Embedded => Ok(load_embedded_signed_catalog(home).unwrap_or(network)),
+        RuntimeCatalogChoice::Network => Ok(network),
     }
 }
 
@@ -1106,6 +1196,115 @@ pub fn load_registry(path: impl AsRef<Path>) -> Result<Vec<ModelCard>, RegistryE
     validation::validate_unique_ids(&cards)?;
     validation::validate_variant_index(&cards)?;
     Ok(cards)
+}
+
+#[derive(Debug, Error)]
+pub enum RuntimeRegistryError {
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
+}
+
+/// The runtime model registry -- the flat model-id list plus display metadata
+/// every server/CLI resolution path needs -- resolved so a RELEASE binary is
+/// self-contained and never depends on a source-tree `model-registry/` path.
+///
+/// Resolution order:
+/// 1. [`OPENASR_REGISTRY_DIR_ENV`] override (dev/`cargo run` fast iteration) ->
+///    load the on-disk cards. Never set in a bundle/release.
+/// 2. Otherwise DERIVE the cards from the signed model catalog: the `catalog` the
+///    caller already resolved (carrying the epoch-max embedded floor from
+///    [`resolve_runtime_catalog`]) when present, else the signature-verified
+///    embedded snapshot ([`load_embedded_signed_catalog`]) as the permanent
+///    offline floor. No filesystem source dependency, so a deployed binary with
+///    no `model-registry/` directory still resolves and lists models.
+///
+/// Family/alias resolution stays catalog-first (`resolve_runtime_model_ref`); the
+/// derived registry only supplies the flat id list and display metadata, so each
+/// derived card is its own family (`family_name() == id`, matching the committed
+/// cards) and never collapses `whisper-*` into one ambiguous family.
+pub fn runtime_registry(
+    catalog: Option<&ModelCatalog>,
+) -> Result<Vec<ModelCard>, RuntimeRegistryError> {
+    if let Some(dir) = registry_dir_override() {
+        return Ok(load_registry(dir)?);
+    }
+    match catalog {
+        Some(catalog) => Ok(model_cards_from_catalog(catalog)?),
+        None => {
+            let home = crate::home::openasr_home().map_err(|_| {
+                RegistryError::MissingDirectory(PathBuf::from(
+                    "<embedded catalog: OPENASR_HOME unresolved>",
+                ))
+            })?;
+            let embedded = load_embedded_signed_catalog(&home)?;
+            Ok(model_cards_from_catalog(&embedded)?)
+        }
+    }
+}
+
+/// Derive the runtime [`ModelCard`] list from a resolved signed catalog. Every
+/// `public` catalog entry becomes one card; the derivation is the empirically
+/// verified 1:1 projection of the on-disk cards:
+/// - `family = None` so `family_name()` falls back to `id` (the committed cards
+///   set no family; using `catalog.family` would collapse `whisper-*` into one
+///   family and break resolution/listing -- see [`runtime_registry`]).
+/// - `variant.quantization = recommended_quant`; tag/format/role and
+///   default_variant/backend/quality_profile are the same constants the on-disk
+///   cards default to.
+///
+/// Non-public (staged) entries are intentionally excluded: the runtime registry
+/// only advertises released models.
+pub fn model_cards_from_catalog(catalog: &ModelCatalog) -> Result<Vec<ModelCard>, RegistryError> {
+    let mut cards: Vec<ModelCard> = catalog
+        .models
+        .iter()
+        .filter(|model| model.public)
+        .map(model_card_from_catalog)
+        .collect();
+    cards.sort_by(|left: &ModelCard, right| {
+        match (
+            left.id.as_str() == DEFAULT_MODEL_ID,
+            right.id.as_str() == DEFAULT_MODEL_ID,
+        ) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => left.id.cmp(&right.id),
+        }
+    });
+    validation::validate_unique_ids(&cards)?;
+    validation::validate_variant_index(&cards)?;
+    Ok(cards)
+}
+
+fn model_card_from_catalog(model: &CatalogModel) -> ModelCard {
+    ModelCard {
+        id: model.id.clone(),
+        // Deliberately None: family_name() falls back to id, keeping each model
+        // its own family exactly like the committed cards.
+        family: None,
+        default_variant: Some(default_model_variant_tag()),
+        variant: Some(ModelVariantMetadata {
+            tag: default_model_variant_tag(),
+            format: default_model_variant_format(),
+            quantization: Some(model.recommended_quant.clone()),
+            role: default_model_variant_role(),
+        }),
+        display_name: model.display_name.clone(),
+        backend: default_model_backend(),
+        task: default_model_task(),
+        languages: model.languages.clone(),
+        size: model.size.clone(),
+        recommended_hardware: default_model_recommended_hardware(),
+        license: model.license.clone(),
+        features: default_model_features(),
+        quality_profile: default_model_quality_profile(),
+        source: format!(
+            "Published OpenASR packs: {HUGGING_FACE_BASE_URL}{}",
+            model.hf_repo
+        ),
+    }
 }
 
 fn read_catalog_source(source: &str) -> Result<String, CatalogError> {

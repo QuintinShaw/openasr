@@ -112,9 +112,9 @@ pub(crate) fn validate_config_document(
     document: &OpenAsrConfigDocument,
     distribution: &DistributionContext,
 ) -> Result<(), ApiError> {
-    let registry = load_registry(default_registry_dir()).map_err(ApiError::Registry)?;
     let home = distribution.openasr_home()?;
     let catalog = load_runtime_model_catalog(distribution.catalog_url(), &home)?;
+    let registry = runtime_registry(catalog.as_ref()).map_err(ApiError::from)?;
     document
         .validate_with_catalog(&registry, catalog.as_ref())
         .map_err(ApiError::Config)
