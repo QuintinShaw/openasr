@@ -526,7 +526,6 @@ jobs:
           python3 -m pip install --user ziglang
           cargo install cargo-zigbuild --version 0.23.0 --locked
           python3 -m ziglang version
-          cargo zigbuild --version
 
       # ggml's CPU backend pulls in ALSA transitively (openasr-cli -> cpal ->
       # alsa-sys) on Linux, and a fully static musl binary needs a musl-built
