@@ -11,8 +11,9 @@ mod native;
 pub use mock::transcribe_with_mock_backend;
 pub use native::{
     NativeBackend, NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
-    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
-    native_runtime_model_adapter_for_path, native_runtime_realtime_capabilities_for_path,
+    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, NativeTranscriptionPhase,
+    NativeTranscriptionProgress, native_runtime_model_adapter_for_path,
+    native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,
     resolve_local_native_runtime_model_identity, validate_local_native_model_pack_path,
     validate_native_runtime_model_pack_contract,
