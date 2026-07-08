@@ -42,11 +42,17 @@ mod native_model_id;
 mod native_path;
 #[path = "native_transcribe.rs"]
 mod native_transcribe;
+#[path = "transcription_control.rs"]
+mod transcription_control;
 pub use native_model_id::{
     NativeRuntimeModelIdSource, NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
 };
 pub use native_transcribe::{
     NativeTranscriptionPhase, NativeTranscriptionProgress, native_transcription_progress,
+};
+pub use transcription_control::{
+    ActiveTranscriptionControlGuard, SliceBoundaryControl, TranscriptionControl,
+    install_active_transcription_control,
 };
 
 #[derive(Debug, Default, Clone, Copy)]

@@ -194,7 +194,7 @@ pub(crate) async fn stream_transcription(
             send_sse(&sender, started).await;
         }
 
-        match transcribe_with_runtime(runtime, request).await {
+        match transcribe_with_runtime(runtime, request, None).await {
             Ok(transcription) => {
                 let end_ms = transcription_end_ms(&transcription);
                 let history_transcription = transcription.clone();

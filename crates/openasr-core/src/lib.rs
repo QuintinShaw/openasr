@@ -46,11 +46,12 @@ pub mod testing;
 pub(crate) mod translation;
 
 pub use api::backend::{
-    BackendError, BackendKind, ExecutionTarget, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend,
-    NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
-    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, Segment, Transcription,
-    TranscriptionBackend, TranscriptionRequest, TranscriptionTask, WordTimestamp,
-    add_segment_word_timestamps, native_adapter_supports_source_language_hint,
+    ActiveTranscriptionControlGuard, BackendError, BackendKind, ExecutionTarget,
+    NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend, NativeBackendExecutor, NativeRuntimeModelAdapter,
+    NativeRuntimeModelIdSource, NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
+    Segment, SliceBoundaryControl, Transcription, TranscriptionBackend, TranscriptionControl,
+    TranscriptionRequest, TranscriptionTask, WordTimestamp, add_segment_word_timestamps,
+    install_active_transcription_control, native_adapter_supports_source_language_hint,
     native_runtime_model_adapter_for_path, native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path,
     resolve_local_native_runtime_model_identity, validate_local_native_model_pack_path,
