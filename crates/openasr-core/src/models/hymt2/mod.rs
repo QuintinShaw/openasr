@@ -16,25 +16,10 @@ pub use runtime::{
 };
 pub use tokenizer::Hymt2Tokenizer;
 
-/// Pull-time contract for translation runtime packs.
-///
-/// Returns `Some` only when the pack declares the Hy-MT2 GGUF architecture
-/// (`general.architecture = "hunyuan-dense"`); ASR packs fall through to
-/// family-adapter selection. The contract is the cheap [`runtime::Hymt2Runtime`]
-/// probe (metadata + tensor-index validation, no weight materialization), so
-/// `openasr pull` stays fail-closed for translation packs without paying a
-/// full model load.
-pub(crate) fn validate_translation_runtime_pack_contract(
-    path: &std::path::Path,
-    metadata: &crate::GgufMetadata,
-) -> Option<Result<(), String>> {
-    let architecture = metadata.get_string(crate::arch::GENERAL_ARCHITECTURE_KEY)?;
-    if architecture.trim() != config::HUNYUAN_DENSE_ARCHITECTURE_VALUE {
-        return None;
-    }
-    Some(
-        runtime::Hymt2Runtime::probe_path(path)
-            .map(|_| ())
-            .map_err(|error| error.to_string()),
-    )
-}
+// Pull-time contract validation for translation runtime packs (Hy-MT2,
+// `general.architecture = "hunyuan-dense"`) is dispatched through
+// `crate::models::aux_pack_registry`, alongside the other auxiliary (non-ASR)
+// families (diarization, punctuation) -- one table instead of a per-family
+// function called from an ad hoc chain in `api::backend::native`. The contract
+// itself is still the cheap [`runtime::Hymt2Runtime`] probe (metadata +
+// tensor-index validation, no weight materialization).

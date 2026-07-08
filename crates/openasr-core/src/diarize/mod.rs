@@ -18,30 +18,11 @@ pub fn vad_diarization_available() -> bool {
     embed::embedder_pack_installed()
 }
 
-/// Validate a diarization runtime pack by constructing its model from the pack
-/// exactly the way the runtime loaders do — every required tensor must be
-/// present with the right shape. Returns `None` when `metadata` does not
-/// identify a diarization pack (the caller falls through to ASR runtime
-/// validation).
-pub fn validate_diarize_runtime_pack_contract(
-    path: &std::path::Path,
-    metadata: &crate::GgufMetadata,
-) -> Option<Result<(), String>> {
-    let architecture = metadata.get_string("general.architecture")?;
-    match architecture.trim() {
-        crate::models::wespeaker::WESPEAKER_GGML_ARCHITECTURE_ID => Some(
-            embed::WeSpeakerEmbedder::from_oasr(path)
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-        ),
-        crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID => Some(
-            segment::PyannoteSegmenter::from_oasr(path)
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-        ),
-        _ => None,
-    }
-}
+// Pull-time contract validation for diarization support packs (WeSpeaker
+// speaker embedder, pyannote speaker segmenter) is dispatched through
+// `crate::models::aux_pack_registry`, alongside the other auxiliary (non-ASR)
+// families (translation, punctuation) -- one table instead of a per-family
+// function called from an ad hoc chain in `api::backend::native`.
 
 pub mod attribution;
 #[doc(hidden)]

@@ -610,29 +610,18 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
         .map_err(|error| error.to_string())?;
     let metadata = read_gguf_metadata_from_runtime_source(&runtime_source)
         .map_err(|error| format!("metadata read failed: {error}"))?;
-    // Diarization support packs (speaker embedder, pyannote segmenter) never
-    // select an ASR runtime adapter; their contract is "the diarize loader can
-    // construct the model from this pack" — checked here so `openasr pull`
-    // stays fail-closed for them too.
-    if let Some(result) = crate::diarize::validate_diarize_runtime_pack_contract(path, &metadata) {
-        return result.map_err(|error| format!("diarization pack validation failed: {error}"));
-    }
-    // Translation packs (Hy-MT2) never select an ASR runtime adapter either;
-    // their contract is "the translation runtime probe accepts this pack" —
-    // checked here so `openasr pull` stays fail-closed for them too.
-    if let Some(result) =
-        crate::models::hymt2::validate_translation_runtime_pack_contract(path, &metadata)
+    // Auxiliary (non-ASR) packs -- diarization support (speaker embedder,
+    // speaker segmenter), translation (Hy-MT2), punctuation (FireRedPunc) --
+    // never select an ASR runtime adapter; their contract is "this family's own
+    // runtime-loader probe accepts the pack". One table
+    // (`aux_pack_registry::AUX_PACK_DESCRIPTORS`) dispatches all of them by
+    // `general.architecture`, fail-closed the same way ASR family-adapter
+    // selection is below: an aux pack with no ASR-shaped selection metadata
+    // never reaches (and is never rejected by) ASR adapter selection.
+    if let Some((kind, result)) =
+        crate::models::aux_pack_registry::validate_aux_runtime_pack_contract(path, &metadata)
     {
-        return result.map_err(|error| format!("translation pack validation failed: {error}"));
-    }
-    // Punctuation packs (FireRedPunc) are a text-in/labels-out post-processor,
-    // not an ASR runtime adapter; their contract is "the punctuation metadata
-    // geometry validates" -- checked here so `openasr pull` stays fail-closed
-    // for them too.
-    if let Some(result) =
-        crate::models::firered_punc::validate_punctuation_runtime_pack_contract(path, &metadata)
-    {
-        return result.map_err(|error| format!("punctuation pack validation failed: {error}"));
+        return result.map_err(|error| format!("{}: {error}", kind.validation_failure_label()));
     }
     let selection_metadata = selection_metadata_from_gguf(&metadata);
     let registry = GgmlFamilyRegistry::with_builtin_adapters();
