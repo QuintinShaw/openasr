@@ -14,13 +14,30 @@ pub(crate) fn blocking_client(
 /// A client that does NOT follow redirects, so the caller can inspect and
 /// rewrite each `Location` hop (used by the model downloader to route the
 /// Hugging Face CDN redirect through the mirror when `HF_ENDPOINT` is set).
+///
+/// Used for large model-pack downloads (`pull::HttpDownloadClient`), so it
+/// deliberately does **not** set a total-request timeout: `reqwest::blocking`
+/// exposes only `ClientBuilder::timeout`, which its own doc comment
+/// describes as covering "connect, read and write operations" as a *single*
+/// deadline that starts at request-send and keeps counting down through
+/// every subsequent response-body read (it is carried into the returned
+/// `Response` and re-checked on each read, not reset by progress). Worse,
+/// this is not opt-in: reqwest's blocking `Timeout` defaults to
+/// `Some(Duration::from_secs(30))` even if `.timeout()` is never called, so
+/// leaving it unset would silently keep killing any download whose
+/// wall-clock time exceeds 30 seconds -- every real multi-hundred-MB model
+/// pack on any non-trivial connection -- regardless of active progress,
+/// long before the application-level stall detection
+/// (`pull::StallGuardedReader`, `pull::LowSpeedWindow`) ever gets a chance
+/// to run. `.timeout(None)` below explicitly disables it; only
+/// `connect_timeout` (bounding the TCP/TLS handshake, which legitimately
+/// should be short) is left as a hard deadline here.
 pub(crate) fn blocking_client_no_redirect(
     connect_timeout: Duration,
-    timeout: Duration,
 ) -> Result<reqwest::blocking::Client, reqwest::Error> {
     reqwest::blocking::Client::builder()
         .connect_timeout(connect_timeout)
-        .timeout(timeout)
+        .timeout(None)
         .redirect(reqwest::redirect::Policy::none())
         .build()
 }
