@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-07T20:18:09+00:00",
+  "generated_at": "2026-07-09T17:29:07+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -1410,6 +1410,77 @@
         }
       },
       "upstream_release_date": "2026-03-24"
+    },
+    {
+      "id": "firered-punc",
+      "kind": "capability-pack",
+      "capability": {
+        "feature": "punctuation",
+        "role": "punctuation-restorer"
+      },
+      "display_name": "FireRedPunc",
+      "family": "firered-punc",
+      "aliases": [],
+      "pull_alias": null,
+      "size": "base",
+      "languages": [
+        "zh"
+      ],
+      "vendor": "FireRedTeam",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/FireRedTeam/FireRedPunc",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/firered-punc",
+      "hf_revision": "61306bcc8c84441794cad658a3f991fcf841bbdd",
+      "public": true,
+      "min_cli_version": "0.1.11",
+      "recommended_quant": "fp16",
+      "pull_recommended": "firered-punc:fp16",
+      "prose": {
+        "tagline": "Chinese punctuation restoration for OpenASR -- a BERT token classifier that adds full-width marks to unpunctuated transcripts, fully on-device",
+        "overview": [
+          "FireRedPunc is a **punctuation-prediction** model from **FireRedTeam**, part of the\nFireRedASR2S all-in-one ASR system. It adopts a BERT-style encoder initialized from\n`chinese-lert-base` (a 12-layer, 768-hidden, 12-head BERT) with a token-classification head\nthat predicts, for each subword, which of five classes follows it: none, or one of the four\nChinese full-width marks `\uff0c`, `\u3002`, `\uff1f`, `\uff01`. It is a text-in / labels-out post-processor,\nnot an ASR model -- no audio frontend, no autoregressive decode.\n\nIn OpenASR it is packaged as an optional **punctuation capability pack**: an unpunctuated\nfamily's finished transcript (e.g. Dolphin or FireRedASR2-AED) is passed through the classifier\nonce, and the predicted marks are re-inserted into the original characters. The stage is\nauto-gated on the ASR model's catalog `emits_punctuation == false` and only runs when this pack\nis installed, so punctuating families are never double-punctuated. Because the released label\nset is Chinese-only, the integration is Chinese-only by construction (the architecture cannot\nemit English half-width marks).\n\nThis OpenASR repo repackages the upstream weights as `.oasr` packs that run natively in the\nOpenASR runtime -- no Python at inference, all decoding local. It ships in **fp16**.\n\n**Not a standalone transcription model.** This pack cannot transcribe audio by itself; it is an\nopt-in post-process applied to an unpunctuated ASR model's output.\n\n**Verification status:** this is a brand-new catalog entry (no prior public listing). Local\nverification covers exact per-token label parity against the upstream PyTorch forward across a\nset of Chinese golden sentences (all four punctuation classes plus the no-mark class)."
+        ],
+        "highlights": [
+          "\ud83c\ude36 **Chinese punctuation restoration** -- restores full-width `\uff0c\u3002\uff1f\uff01` on an unpunctuated ASR transcript (e.g. Dolphin, FireRedASR2-AED) in a finalize-only post-processing pass",
+          "\ud83e\udde0 **BERT token classifier** -- a 12-layer `chinese-lert-base` encoder with a 5-class head predicting which of none/\uff0c\u3002\uff1f\uff01 follows each subword",
+          "\ud83c\udde8\ud83c\uddf3 **Chinese-only by construction** -- the released label set has no English half-width marks, so only Chinese text is punctuated",
+          "\ud83d\udd0c **Opt-in and auto-gated** -- runs only when the ASR model is unpunctuated and this pack is installed, so punctuating families are never double-punctuated",
+          "\ud83e\udd80 **Native in OpenASR** -- `.oasr` packs run with no Python at inference, all decoding local"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "firered-punc:fp16",
+          "filename": "firered-punc-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/firered-punc/resolve/61306bcc8c84441794cad658a3f991fcf841bbdd/firered-punc-fp16.oasr",
+          "sha256": "95033ed3842e5399f6eec430c28950d34ecba0b41d0c0f7069ccbd8280f48234",
+          "size_bytes": 203631008,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": null,
+            "rtf_metal": null,
+            "peak_rss_bytes": 1112309760,
+            "jfk_wer_vs_fp16": null
+          }
+        }
+      ],
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u4e3a OpenASR \u63d0\u4f9b\u4e2d\u6587\u6807\u70b9\u6062\u590d \u2014 \u57fa\u4e8e BERT \u9010\u8bcd\u5206\u7c7b\u5668\uff0c\u4e3a\u65e0\u6807\u70b9\u8f6c\u5199\u8865\u56de\u5168\u89d2\u6807\u70b9\uff0c\u5168\u7a0b\u5728\u8bbe\u5907\u672c\u5730\u8fd0\u884c",
+          "highlights": [
+            "\ud83c\ude36 **\u4e2d\u6587\u6807\u70b9\u6062\u590d** \u2014 \u5728\u65e0\u6807\u70b9\u7684 ASR \u8f6c\u5199\uff08\u5982 Dolphin\u3001FireRedASR2-AED\uff09\u4e0a\uff0c\u4ee5\u4ec5\u7ec8\u7a3f\u7684\u540e\u5904\u7406\u9636\u6bb5\u8865\u56de\u5168\u89d2 `\uff0c\u3002\uff1f\uff01`",
+            "\ud83e\udde0 **BERT \u9010\u8bcd\u5206\u7c7b\u5668** \u2014 12 \u5c42 `chinese-lert-base` \u7f16\u7801\u5668\uff0c\u914d 5 \u5206\u7c7b\u8f93\u51fa\u5934\uff0c\u9884\u6d4b\u6bcf\u4e2a\u5b50\u8bcd\u540e\u9762\u63a5\u54ea\u4e00\u79cd\uff08\u65e0\u6807\u70b9\u6216 \uff0c\u3002\uff1f\uff01\uff09",
+            "\ud83c\udde8\ud83c\uddf3 **\u5929\u751f\u4ec5\u652f\u6301\u4e2d\u6587** \u2014 \u53d1\u5e03\u7684\u6807\u7b7e\u96c6\u4e0d\u542b\u82f1\u6587\u534a\u89d2\u6807\u70b9\uff0c\u56e0\u6b64\u53ea\u4e3a\u4e2d\u6587\u6587\u672c\u8865\u6807\u70b9",
+            "\ud83d\udd0c **\u53ef\u9009\u4e14\u81ea\u52a8\u95e8\u63a7** \u2014 \u4ec5\u5f53 ASR \u6a21\u578b\u672c\u8eab\u65e0\u6807\u70b9\u4e14\u5df2\u5b89\u88c5\u672c\u5305\u65f6\u624d\u8fd0\u884c\uff0c\u5e26\u6807\u70b9\u7684\u5bb6\u65cf\u7edd\u4e0d\u4f1a\u88ab\u91cd\u590d\u52a0\u6807\u70b9",
+            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u5168\u90e8\u89e3\u7801\u5747\u5728\u672c\u5730\u5b8c\u6210"
+          ]
+        }
+      },
+      "upstream_release_date": "2026-02-12",
+      "min_core_version": "0.1.11"
     },
     {
       "id": "moonshine-tiny",
