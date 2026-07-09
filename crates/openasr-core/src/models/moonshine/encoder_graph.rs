@@ -476,6 +476,12 @@ impl MoonshineEncoderGraphRuntime {
         graph
             .set_output(hidden)
             .map_err(build_err("ggml_set_output(enc)"))?;
+        // Allocate the forward graph through the scheduler's gallocr (liveness-
+        // based buffer reuse) before uploading inputs, same ordering as the
+        // moonshine decoder graphs and the sibling cohere/firered encoders.
+        graph
+            .prepare_outputs_for_upload(&[hidden])
+            .map_err(build_err("ggml_prepare_outputs(enc)"))?;
 
         // Upload inputs after the graph is fully built (deferred allocation).
         graph
