@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, path::Path, sync::OnceLock};
 
 use crate::NATIVE_RUNTIME_MODEL_ID_AUTO;
 use crate::api::audio_io::load_wav_16khz_mono_f32_v0;
-use crate::arch::OpenAsrArchitectureRegistry;
+use crate::arch::{DEFAULT_ENCODER_SAFE_CHUNK_SECONDS, OpenAsrArchitectureRegistry};
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, install_request_backend_override,
 };
@@ -34,7 +34,21 @@ use crate::models::qwen::{
 };
 
 const DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS: f32 = 30.0;
-const COHERE_LONGFORM_MAX_CHUNK_SECONDS: f32 = 10.0;
+/// Chunk-length ceiling for the decode-side `ConservativeSeq2SeqV1`
+/// repetition-guard profile (issue #60: cohere-transcribe, moonshine,
+/// firered-aed). Historically this was a hard-coded `10.0` with no model
+/// basis -- a defensive patch from when the repetition failure mode was
+/// first found, predating the structural fix (the shared greedy-decode
+/// driver's degenerate-loop guard, which is the actual anti-repetition
+/// mechanism and stays in place regardless of chunk length). That 10s value
+/// has since been surveyed against the same industry evidence backing
+/// `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS` (Whisper/Moonshine/NeMo/FunASR/
+/// Dolphin/Cohere all converge near 30s) and found to have no independent
+/// justification, so it is unified with that default: the previous name
+/// (`COHERE_LONGFORM_MAX_CHUNK_SECONDS`) was also misleading on both counts
+/// (not 10s anymore, and not cohere-only -- moonshine and firered-aed carry
+/// the same profile).
+const CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS: f32 = DEFAULT_ENCODER_SAFE_CHUNK_SECONDS;
 const COHERE_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
 static NATIVE_GGML_EXECUTION_DISPATCH: OnceLock<GgmlAsrExecutionDispatch> = OnceLock::new();
 
@@ -1128,10 +1142,17 @@ fn apply_longform_safety_policy(
 /// Caps longform chunking for the decode-side `ConservativeSeq2SeqV1`
 /// repetition-guard profile (issue #60): plain `<sos>`-prompted AED decoders
 /// with a small effective context (cohere-transcribe, moonshine, firered-aed)
-/// repeat/hallucinate on long, pause-free chunks, so their chunk length is
-/// capped hard and prompt carry across slices is disabled. This is a decode
+/// repeat/hallucinate on long, pause-free chunks, so prompt carry across
+/// slices is disabled here. The chunk-length cap itself
+/// (`CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS`) is *not* the
+/// repetition fix -- that is the shared greedy-decode driver's
+/// degenerate-loop guard, which applies regardless of chunk length -- so
+/// this cap uses the same industry-surveyed default as the encoder-memory
+/// cap below rather than an arbitrarily tighter number. This is a decode
 /// semantics cap, independent of the encoder-memory cap below (which caps a
-/// different, larger set of architectures for a different reason).
+/// different, larger set of architectures for a different reason); the two
+/// happen to share the same default value today, but remain conceptually
+/// distinct and compose by taking the min if a future override diverges them.
 fn apply_conservative_seq2seq_longform_safety_policy(
     model_architecture: &str,
     options: &mut crate::LongFormOptions,
@@ -1144,16 +1165,16 @@ fn apply_conservative_seq2seq_longform_safety_policy(
         return;
     }
     let mut changed = false;
-    if options.chunk_seconds > COHERE_LONGFORM_MAX_CHUNK_SECONDS {
-        options.chunk_seconds = COHERE_LONGFORM_MAX_CHUNK_SECONDS;
+    if options.chunk_seconds > CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS {
+        options.chunk_seconds = CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS;
         changed = true;
     }
-    if options.max_chunk_seconds > COHERE_LONGFORM_MAX_CHUNK_SECONDS {
-        options.max_chunk_seconds = COHERE_LONGFORM_MAX_CHUNK_SECONDS;
+    if options.max_chunk_seconds > CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS {
+        options.max_chunk_seconds = CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS;
         changed = true;
     }
-    if options.min_chunk_seconds > COHERE_LONGFORM_MAX_CHUNK_SECONDS {
-        options.min_chunk_seconds = COHERE_LONGFORM_MAX_CHUNK_SECONDS;
+    if options.min_chunk_seconds > CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS {
+        options.min_chunk_seconds = CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS;
         changed = true;
     }
     if options.max_chunk_seconds < options.chunk_seconds {
@@ -1180,7 +1201,7 @@ fn apply_conservative_seq2seq_longform_safety_policy(
     if changed {
         provenance.push(format!(
             "core.native.longform.policy:cohere-chunk-cap={}",
-            COHERE_LONGFORM_MAX_CHUNK_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         ));
     }
 }
@@ -1884,11 +1905,11 @@ mod tests {
         assert_eq!(resolution.options.mode, LongFormMode::Auto);
         assert_eq!(
             resolution.options.chunk_seconds,
-            COHERE_LONGFORM_MAX_CHUNK_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         );
         assert_eq!(
             resolution.options.max_chunk_seconds,
-            COHERE_LONGFORM_MAX_CHUNK_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         );
         assert_eq!(resolution.options.min_chunk_seconds, 1.0);
         assert_eq!(
@@ -1930,15 +1951,15 @@ mod tests {
         );
         assert_eq!(
             resolution.options.chunk_seconds,
-            COHERE_LONGFORM_MAX_CHUNK_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         );
         assert_eq!(
             resolution.options.max_chunk_seconds,
-            COHERE_LONGFORM_MAX_CHUNK_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         );
         assert_eq!(
             resolution.options.min_chunk_seconds,
-            COHERE_LONGFORM_MAX_CHUNK_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         );
         assert_eq!(
             resolution.options.overlap_seconds,
@@ -1993,8 +2014,9 @@ mod tests {
         );
 
         // Correct wiring: keying off model_architecture applies BOTH the
-        // encoder-attention-span cap (30s) and the tighter conservative
-        // seq2seq cap (10s) -- the min of the two, 10s, wins.
+        // encoder-attention-span cap and the conservative seq2seq cap --
+        // both now resolve to the same default (30s), so composing them
+        // (taking the min) is a no-op, but both must still actually run.
         let correct = resolve_native_longform_policy_for_backend(
             None,
             120.0,
@@ -2003,7 +2025,7 @@ mod tests {
         );
         assert_eq!(
             correct.options.max_chunk_seconds,
-            COHERE_LONGFORM_MAX_CHUNK_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         );
         assert!(correct.options.max_chunk_seconds < 120.0);
 
@@ -2024,7 +2046,14 @@ mod tests {
     /// (issue #68): a `GlobalQuadratic` encoder must never be handed a
     /// longform chunk longer than its declared safe ceiling, while
     /// `FixedWindow` (whisper) and `LocalChunked` (zipformer) architectures
-    /// need no additional cap and keep the unmodified 120s default.
+    /// need no additional cap and keep the unmodified 120s default. All nine
+    /// `GlobalQuadratic` builtins (including firered-aed/cohere-transcribe/
+    /// moonshine, which also carry the decode-side `ConservativeSeq2SeqV1`
+    /// cap) declare `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`, so this asserts
+    /// exact equality, not just an upper bound: the two caps stacked on the
+    /// conservative-seq2seq trio must resolve to the same 30s default, not
+    /// silently over-tighten to something smaller than either cap alone
+    /// intends.
     #[test]
     fn encoder_attention_span_caps_every_builtin_architecture_on_the_production_path() {
         for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
@@ -2036,11 +2065,16 @@ mod tests {
             );
             match descriptor.longform_max_safe_chunk_seconds() {
                 Some(max_safe_chunk_seconds) => {
-                    assert!(
-                        resolution.options.max_chunk_seconds <= max_safe_chunk_seconds,
-                        "'{}' must cap max_chunk_seconds to <= {max_safe_chunk_seconds}, got {}",
-                        descriptor.model_architecture,
-                        resolution.options.max_chunk_seconds
+                    assert_eq!(
+                        max_safe_chunk_seconds, DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
+                        "'{}' GlobalQuadratic ceiling must be the shared default absent a cited \
+                         upstream override",
+                        descriptor.model_architecture
+                    );
+                    assert_eq!(
+                        resolution.options.max_chunk_seconds, max_safe_chunk_seconds,
+                        "'{}' must resolve max_chunk_seconds to exactly {max_safe_chunk_seconds}, got {}",
+                        descriptor.model_architecture, resolution.options.max_chunk_seconds
                     );
                     assert!(
                         resolution.options.chunk_seconds <= max_safe_chunk_seconds,

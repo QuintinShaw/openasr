@@ -35,6 +35,28 @@ matching `BUILTIN_COMPONENT_DESCRIPTORS`, and wire the executor through
 `materialize_builtin_executor_component` in
 `crates/openasr-core/src/models/executor_component_registry.rs`.
 
+The descriptor also requires an `encoder_attention_span`
+(`OpenAsrEncoderAttentionSpan`, issue #68) declaring how the new
+architecture's encoder scales with chunk length -- this is a mandatory field,
+so a new architecture cannot compile without it:
+
+- Full self-attention over the whole encoder input (the common case for a
+  Conformer/Transformer/E-Branchformer/RoPE encoder) is `GlobalQuadratic`.
+  Use `arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS` (30s) for
+  `max_safe_chunk_seconds` -- the value every major encoder family this repo
+  has surveyed converges on (Whisper's fixed window, Moonshine's own "<30s"
+  guidance, NeMo/Parakeet's 20-30s guidance, FunASR's 30000ms default,
+  Dolphin's 30s training/eval padding, Cohere's 30s reference sliding
+  window). **Only** override it with a different `max_safe_chunk_seconds`
+  when the upstream model card states an explicit, different recommended
+  chunk length, and cite that source in a comment next to the override (see
+  `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`'s own doc comment for the citation
+  format).
+- An architecture-fixed attention window (like Whisper's 30s log-mel frame)
+  is `FixedWindow`.
+- A local/chunked streaming encoder with a bounded per-chunk cache (like
+  Zipformer2's multi-scale cache) is `LocalChunked`.
+
 **Do not** add a parallel hand-written family dispatch branch in
 `crates/openasr-core/src/api/backend/native.rs` (`validate_local_native_model_pack_path`,
 `validate_native_runtime_model_pack_contract`) or in
@@ -146,6 +168,13 @@ with a one-line structural justification for going another way):
       `dispatch_reports_unknown_family` / `returns_ambiguous_when_multiple_descriptors_match`
       in `crates/openasr-core/src/models/ggml_family_registry.rs` for the
       pattern to extend).
+- [ ] Descriptor declares `encoder_attention_span` (issue #68). A
+      `GlobalQuadratic` encoder uses `arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`
+      unless the upstream model card states an explicit, different
+      recommended chunk length -- if it does, the override cites that source
+      in a comment. `builtin_architectures_declare_encoder_attention_span`
+      (`arch/mod.rs`) and `encoder_attention_span_caps_every_builtin_architecture_on_the_production_path`
+      (`api/backend/native_transcribe.rs`) must cover the new architecture.
 - [ ] No hand-written decode step loop: `grep -rn 'for .*argmax\|while .*argmax'`
       (or an equivalent manual scan of the new executor) turns up nothing; the
       family implements `Seq2SeqGreedyDecodeStepExecutor` or calls
