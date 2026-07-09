@@ -203,7 +203,7 @@ mod tests {
             persisted,
             GgmlAsrRuntimeSourcePreflight {
                 runtime_source,
-                metadata,
+                metadata: Arc::new(metadata),
                 tensor_index: Arc::new(tensor_index),
             },
         )
@@ -254,7 +254,7 @@ mod tests {
             .expect("read gguf tensor index");
         let preflight = GgmlAsrRuntimeSourcePreflight {
             runtime_source,
-            metadata,
+            metadata: Arc::new(metadata),
             tensor_index: Arc::new(tensor_index),
         };
 

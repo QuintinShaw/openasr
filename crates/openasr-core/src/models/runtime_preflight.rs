@@ -57,7 +57,7 @@ pub(crate) fn load_runtime_source_metadata_and_tensor_index_from_source(
         )?;
     Ok(GgmlAsrRuntimeSourcePreflight {
         runtime_source: runtime_source.clone(),
-        metadata,
+        metadata: Arc::new(metadata),
         tensor_index: Arc::new(tensor_index),
     })
 }
