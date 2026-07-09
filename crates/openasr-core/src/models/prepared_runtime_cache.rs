@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use crate::stage_timing;
 
 fn prepared_runtime_cache_key(runtime_path: &Path) -> PathBuf {
     std::fs::canonicalize(runtime_path).unwrap_or_else(|_| runtime_path.to_path_buf())
@@ -34,7 +37,23 @@ impl<T> PreparedRuntimeCache<T> {
         if let Some(runtime) = self.get_by_key(&cache_key, &map_poisoned_lock)? {
             return Ok(runtime);
         }
+        // Model pack loading (mmap + tensor materialization + context/graph
+        // construction, up to inference-ready) happens exactly here, exactly
+        // once per distinct runtime path per process (subsequent calls hit the
+        // cache check above). This one call site covers every builtin model
+        // family that goes through this cache, so it is the single place to
+        // time "how long did loading this pack take" without instrumenting
+        // each family's build function separately.
+        let load_started = Instant::now();
         let prepared = Arc::new(build()?);
+        stage_timing::log_event(
+            "model_pack_load",
+            format_args!(
+                "path={} duration_ms={:.3}",
+                runtime_path.display(),
+                load_started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
         let mut cache = self.cache_by_path.lock().map_err(|_| map_poisoned_lock())?;
         let entry = cache
             .entry(cache_key)
