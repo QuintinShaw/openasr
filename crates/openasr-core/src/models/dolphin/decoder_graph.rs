@@ -584,7 +584,11 @@ pub(crate) fn decode_prompt_logits(
             crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::Decoder,
         ),
         backend,
-        use_scheduler: backend.is_gpu_class(),
+        // See the matching comment in encoder_graph.rs: unconditionally
+        // enabling the gallocr scheduler (like the sibling cohere/moonshine
+        // decoders) only bounds memory footprint, never the decoder's
+        // computed output.
+        use_scheduler: true,
     };
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
     let mut graph = runner.start_graph();
@@ -664,6 +668,36 @@ pub(crate) fn decode_prompt_logits(
         .add(logits, weights.output_bias)
         .map_err(ggml_err("output_layer_bias"))?;
     graph.set_output(logits).map_err(ggml_err("set_output"))?;
+    // Every tensor this graph uploads to (rather than computes) must be
+    // flagged `set_input`: dolphin has no persistent weight arena, so every
+    // weight and every non-weight input is a fresh leaf tensor in this
+    // per-call graph with no buffer yet -- without the flag the scheduler's
+    // backend-assignment pass has no rule to place it on and aborts.
+    graph
+        .set_input(token_ids)
+        .map_err(ggml_err("mark_input(tokens)"))?;
+    graph
+        .set_input(encoder_mem)
+        .map_err(ggml_err("mark_input(encoder_out)"))?;
+    graph
+        .set_input(causal_mask)
+        .map_err(ggml_err("mark_input(causal_mask)"))?;
+    for (tensor, _, _) in &builder.uploads {
+        graph
+            .set_input(*tensor)
+            .map_err(ggml_err("mark_input(weight)"))?;
+    }
+    for (tensor, _, _, _) in &builder.native_uploads {
+        graph
+            .set_input(*tensor)
+            .map_err(ggml_err("mark_input(weight_native)"))?;
+    }
+    // Allocate the forward graph through the scheduler's gallocr for
+    // liveness-based buffer reuse before uploading inputs (mirrors the
+    // encoder above and the sibling cohere/moonshine decoders).
+    graph
+        .prepare_outputs_for_upload(&[logits])
+        .map_err(ggml_err("prepare_outputs"))?;
 
     // Phase C: upload inputs + weights, then compute.
     let token_ids_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();

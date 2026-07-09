@@ -519,7 +519,10 @@ pub(crate) fn apply_hotword_deep_biasing(
             crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::Default,
         ),
         backend,
-        use_scheduler: backend.is_gpu_class(),
+        // See the matching comment in encoder_graph.rs: unconditionally
+        // enabling the gallocr scheduler only bounds memory footprint, never
+        // the hotword biasing layer's computed output.
+        use_scheduler: true,
     };
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
     let mut graph = runner.start_graph();
@@ -691,6 +694,36 @@ pub(crate) fn apply_hotword_deep_biasing(
         |s, source| DolphinHotwordError::Ggml { stage: s, source },
     )?;
     graph.set_output(output).map_err(ggml_err("set_output"))?;
+    // Every tensor this graph uploads to (rather than computes) must be
+    // flagged `set_input`: each is a fresh leaf tensor in this per-call graph
+    // with no buffer yet, so without the flag the scheduler's
+    // backend-assignment pass has no rule to place it on and aborts.
+    for tensor in [
+        encoder_tensor,
+        context_tensor,
+        q_w,
+        q_b,
+        k_w,
+        k_b,
+        v_w,
+        v_b,
+        out_w,
+        out_b,
+        combiner_w,
+        combiner_b,
+        norm_w,
+        norm_b,
+    ] {
+        graph
+            .set_input(tensor)
+            .map_err(ggml_err("mark_input(hotword_tensor)"))?;
+    }
+    // Allocate the forward graph through the scheduler's gallocr for
+    // liveness-based buffer reuse before uploading inputs (mirrors the other
+    // dolphin graphs).
+    graph
+        .prepare_outputs_for_upload(&[output])
+        .map_err(ggml_err("prepare_outputs"))?;
 
     // Phase C: upload inputs + weights, then compute.
     graph
