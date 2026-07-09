@@ -140,6 +140,9 @@ fn renders_json() {
     assert!(rendered.contains("\"text\": \"hello world\""));
     assert!(rendered.contains("\"start\": 0.0"));
     assert!(!rendered.contains("\"speaker\""));
+    // The plain `json` format stays free of the verbose_json-only fields.
+    assert!(!rendered.contains("\"id\""));
+    assert!(!rendered.contains("\"duration\""));
 }
 
 #[test]
@@ -164,8 +167,23 @@ fn renders_verbose_json() {
     let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     assert_eq!(parsed["text"], "hello world");
     assert_eq!(parsed["segments"][0]["start"], 0.0);
-    assert!(parsed.get("duration").is_none());
+    // OpenAI verbose_json compatibility surface: `duration` (last segment end)
+    // and zero-based segment `id`s; `words` only appears with word timestamps.
+    assert_eq!(parsed["duration"], 2.5);
+    assert_eq!(parsed["segments"][0]["id"], 0);
+    assert!(parsed.get("words").is_none());
     assert!(parsed.get("language").is_none());
+}
+
+#[test]
+fn renders_verbose_json_with_top_level_words() {
+    let rendered = render_transcription(&word_sample(), ResponseFormat::VerboseJson).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(parsed["words"][0]["word"], "hello");
+    assert_eq!(parsed["words"][1]["word"], "world");
+    assert_eq!(parsed["words"][1]["end"], 1.0);
+    // The per-segment words stay for existing clients.
+    assert_eq!(parsed["segments"][0]["words"][0]["word"], "hello");
 }
 
 #[test]
