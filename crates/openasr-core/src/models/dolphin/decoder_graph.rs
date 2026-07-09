@@ -34,7 +34,7 @@
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlStaticTensor, GgmlStaticTensorArena,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
@@ -141,20 +141,38 @@ impl DolphinDecoderOutput {
     }
 }
 
-// --- weight upload plumbing (mirrors the encoder graph's WeightBuilder) --------
+// --- persistent weight arena -------------------------------------------------
+//
+// Perf (P5, see joint_decode::attention_rescore): attention-rescoring calls this
+// decoder once per CTC n-best hypothesis (up to DOLPHIN_BEAM_SIZE). Only the
+// token ids / causal mask / sequence length actually differ across those calls
+// -- the ~200 decoder weight tensors and the encoder memory are identical for
+// every hypothesis of one utterance. Rebuilding a fresh graph AND re-uploading
+// every weight per hypothesis (the pre-P5 behavior) paid that upload cost
+// `beam_size` times over for no reason. This mirrors the firered_aed decoder's
+// `GgmlStaticTensorArena`-backed persistent weights (`decoder_weights.rs` /
+// `decoder_graph.rs`): weights (+ the encoder memory) are declared and uploaded
+// ONCE into a static arena by [`DolphinDecoderRescoreRuntime::new`]; each
+// [`DolphinDecoderRescoreRuntime::decode_prompt_logits`] call then only builds
+// the small per-hypothesis graph (token embed lookup, absolute-position view,
+// causal mask, the stacked layers, output projection) referencing those
+// already-resident static tensors -- no weight re-upload, no encoder-memory
+// re-upload. The forward math (`decoder_layer`/`linear`/`affine_ln`/etc. below)
+// is untouched, so this is a pure execution-strategy change: same graph, same
+// numbers, golden-identical output.
 
-type Upload<'a, 'p> = (GgmlCpuTensor<'a>, &'p [f32], &'static str);
+type Upload<'p> = (GgmlStaticTensor, &'p [f32], &'static str);
 /// Pending native (quantized / f16) weight upload: `(tensor, raw-bytes,
-/// ggml-type, static-label)`.
-type NativeUpload<'a, 'p> = (GgmlCpuTensor<'a>, &'p [u8], i32, &'static str);
+/// static-label)`.
+type NativeUpload<'p> = (GgmlStaticTensor, &'p [u8], &'static str);
 
-struct WeightBuilder<'a, 'p> {
+struct StaticWeightBuilder<'p> {
     provider: &'p dyn DolphinWeightProvider,
-    uploads: Vec<Upload<'a, 'p>>,
-    native_uploads: Vec<NativeUpload<'a, 'p>>,
+    uploads: Vec<Upload<'p>>,
+    native_uploads: Vec<NativeUpload<'p>>,
 }
 
-impl<'a, 'p> WeightBuilder<'a, 'p> {
+impl<'p> StaticWeightBuilder<'p> {
     fn new(provider: &'p dyn DolphinWeightProvider) -> Self {
         Self {
             provider,
@@ -183,12 +201,12 @@ impl<'a, 'p> WeightBuilder<'a, 'p> {
     /// A 1-D weight (bias / LayerNorm gamma-beta).
     fn w1(
         &mut self,
-        graph: &GgmlCpuGraphBuilder<'a>,
+        arena: &GgmlStaticTensorArena,
         name: &str,
         len: usize,
-    ) -> Result<GgmlCpuTensor<'a>, DolphinDecoderError> {
+    ) -> Result<GgmlStaticTensor, DolphinDecoderError> {
         let data = self.fetch(name, len)?;
-        let tensor = graph
+        let tensor = arena
             .new_tensor_1d_f32(len, "dolphin_dec_weight")
             .map_err(ggml_err("weight_alloc_1d"))?;
         self.uploads.push((tensor, data, "dolphin_dec_weight"));
@@ -204,25 +222,21 @@ impl<'a, 'p> WeightBuilder<'a, 'p> {
     /// f32 (see [`w2_embedding`]).
     fn w2(
         &mut self,
-        graph: &GgmlCpuGraphBuilder<'a>,
+        arena: &GgmlStaticTensorArena,
         name: &str,
         ne0: usize,
         ne1: usize,
-    ) -> Result<GgmlCpuTensor<'a>, DolphinDecoderError> {
+    ) -> Result<GgmlStaticTensor, DolphinDecoderError> {
         if let Some(native) = self.provider.native_weight(name) {
-            let tensor = graph
+            let tensor = arena
                 .new_matmul_weight_2d_typed(ne0, ne1, native.ggml_type, "dolphin_dec_weight")
                 .map_err(ggml_err("weight_alloc_2d_native"))?;
-            self.native_uploads.push((
-                tensor,
-                native.bytes,
-                native.ggml_type,
-                "dolphin_dec_weight",
-            ));
+            self.native_uploads
+                .push((tensor, native.bytes, "dolphin_dec_weight"));
             return Ok(tensor);
         }
         let data = self.fetch(name, ne0 * ne1)?;
-        let tensor = graph
+        let tensor = arena
             .new_tensor_2d_f32(ne0, ne1, "dolphin_dec_weight")
             .map_err(ggml_err("weight_alloc_2d"))?;
         self.uploads.push((tensor, data, "dolphin_dec_weight"));
@@ -236,35 +250,36 @@ impl<'a, 'p> WeightBuilder<'a, 'p> {
     /// *matmul* operands go native.
     fn w2_embedding(
         &mut self,
-        graph: &GgmlCpuGraphBuilder<'a>,
+        arena: &GgmlStaticTensorArena,
         name: &str,
         ne0: usize,
         ne1: usize,
-    ) -> Result<GgmlCpuTensor<'a>, DolphinDecoderError> {
+    ) -> Result<GgmlStaticTensor, DolphinDecoderError> {
         let data = self.fetch(name, ne0 * ne1)?;
-        let tensor = graph
+        let tensor = arena
             .new_tensor_2d_f32(ne0, ne1, "dolphin_dec_weight")
             .map_err(ggml_err("weight_alloc_2d"))?;
         self.uploads.push((tensor, data, "dolphin_dec_weight"));
         Ok(tensor)
     }
 
-    /// The first `positions` rows of the `[1, max_positions, d_model]` absolute
-    /// sinusoidal position table.
-    fn pos_slice(
+    /// The full `[1, max_positions, d_model]` absolute sinusoidal position
+    /// table, uploaded once at its baked length. Per-call decode takes a
+    /// contiguous leading view of the first `tokens` rows (see
+    /// [`DolphinDecoderRescoreRuntime::decode_prompt_logits`]) instead of this
+    /// builder re-slicing and re-uploading a `positions`-sized copy every call.
+    fn pos_full(
         &mut self,
-        graph: &GgmlCpuGraphBuilder<'a>,
+        arena: &GgmlStaticTensorArena,
         name: &str,
         d_model: usize,
-        positions: usize,
         max_positions: usize,
-    ) -> Result<GgmlCpuTensor<'a>, DolphinDecoderError> {
-        let full = self.fetch(name, d_model * max_positions)?;
-        let slice = &full[..d_model * positions];
-        let tensor = graph
-            .new_tensor_2d_f32(d_model, positions, "dolphin_dec_weight")
+    ) -> Result<GgmlStaticTensor, DolphinDecoderError> {
+        let data = self.fetch(name, d_model * max_positions)?;
+        let tensor = arena
+            .new_tensor_2d_f32(d_model, max_positions, "dolphin_dec_weight")
             .map_err(ggml_err("weight_alloc_pos"))?;
-        self.uploads.push((tensor, slice, "dolphin_dec_weight"));
+        self.uploads.push((tensor, data, "dolphin_dec_weight"));
         Ok(tensor)
     }
 }
@@ -295,64 +310,152 @@ struct DecoderLayerWeights<'a> {
     ff_w2: LinearWeights<'a>,
 }
 
-struct DecoderWeights<'a> {
-    token_embed: GgmlCpuTensor<'a>,
-    pos_emb: GgmlCpuTensor<'a>,
-    layers: Vec<DecoderLayerWeights<'a>>,
-    after_norm: NormWeights<'a>,
-    output_weight: GgmlCpuTensor<'a>,
-    output_bias: GgmlCpuTensor<'a>,
+/// Static (arena-resident) counterpart of [`LinearWeights`] / [`NormWeights`] /
+/// [`DecoderLayerWeights`]: same shapes, but the tensors live in the runtime's
+/// persistent [`GgmlStaticTensorArena`] instead of a per-call transient graph.
+/// `to_transient` reborrows each field into the current call's graph lifetime
+/// via [`GgmlStaticTensorArena::graph_tensor`] (mirrors `cohere::decoder_graph`).
+#[derive(Clone, Copy)]
+struct LinearStaticWeights {
+    weight: GgmlStaticTensor,
+    bias: GgmlStaticTensor,
 }
 
-fn build_linear_weights<'a, 'p>(
-    graph: &GgmlCpuGraphBuilder<'a>,
-    builder: &mut WeightBuilder<'a, 'p>,
+impl LinearStaticWeights {
+    fn to_transient<'a>(self, arena: &GgmlStaticTensorArena) -> LinearWeights<'a> {
+        LinearWeights {
+            weight: arena.graph_tensor(self.weight),
+            bias: arena.graph_tensor(self.bias),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NormStaticWeights {
+    weight: GgmlStaticTensor,
+    bias: GgmlStaticTensor,
+}
+
+impl NormStaticWeights {
+    fn to_transient<'a>(self, arena: &GgmlStaticTensorArena) -> NormWeights<'a> {
+        NormWeights {
+            weight: arena.graph_tensor(self.weight),
+            bias: arena.graph_tensor(self.bias),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DecoderLayerStaticWeights {
+    norm1: NormStaticWeights,
+    self_q: LinearStaticWeights,
+    self_k: LinearStaticWeights,
+    self_v: LinearStaticWeights,
+    self_o: LinearStaticWeights,
+    norm2: NormStaticWeights,
+    src_q: LinearStaticWeights,
+    src_k: LinearStaticWeights,
+    src_v: LinearStaticWeights,
+    src_o: LinearStaticWeights,
+    norm3: NormStaticWeights,
+    ff_w1: LinearStaticWeights,
+    ff_w2: LinearStaticWeights,
+}
+
+impl DecoderLayerStaticWeights {
+    fn to_transient<'a>(self, arena: &GgmlStaticTensorArena) -> DecoderLayerWeights<'a> {
+        DecoderLayerWeights {
+            norm1: self.norm1.to_transient(arena),
+            self_q: self.self_q.to_transient(arena),
+            self_k: self.self_k.to_transient(arena),
+            self_v: self.self_v.to_transient(arena),
+            self_o: self.self_o.to_transient(arena),
+            norm2: self.norm2.to_transient(arena),
+            src_q: self.src_q.to_transient(arena),
+            src_k: self.src_k.to_transient(arena),
+            src_v: self.src_v.to_transient(arena),
+            src_o: self.src_o.to_transient(arena),
+            norm3: self.norm3.to_transient(arena),
+            ff_w1: self.ff_w1.to_transient(arena),
+            ff_w2: self.ff_w2.to_transient(arena),
+        }
+    }
+}
+
+struct DecoderStaticWeights {
+    token_embed: GgmlStaticTensor,
+    /// Full `[d_model, max_positions]` absolute position table (see
+    /// [`StaticWeightBuilder::pos_full`]); sliced per call via a graph view.
+    pos_emb_full: GgmlStaticTensor,
+    layers: Vec<DecoderLayerStaticWeights>,
+    after_norm: NormStaticWeights,
+    output_weight: GgmlStaticTensor,
+    output_bias: GgmlStaticTensor,
+}
+
+fn build_linear_static_weights(
+    arena: &GgmlStaticTensorArena,
+    builder: &mut StaticWeightBuilder<'_>,
     prefix: &str,
     d_in: usize,
     d_out: usize,
-) -> Result<LinearWeights<'a>, DolphinDecoderError> {
-    Ok(LinearWeights {
-        weight: builder.w2(graph, &format!("{prefix}.weight"), d_in, d_out)?,
-        bias: builder.w1(graph, &format!("{prefix}.bias"), d_out)?,
+) -> Result<LinearStaticWeights, DolphinDecoderError> {
+    Ok(LinearStaticWeights {
+        weight: builder.w2(arena, &format!("{prefix}.weight"), d_in, d_out)?,
+        bias: builder.w1(arena, &format!("{prefix}.bias"), d_out)?,
     })
 }
 
-fn build_norm_weights<'a, 'p>(
-    graph: &GgmlCpuGraphBuilder<'a>,
-    builder: &mut WeightBuilder<'a, 'p>,
+fn build_norm_static_weights(
+    arena: &GgmlStaticTensorArena,
+    builder: &mut StaticWeightBuilder<'_>,
     prefix: &str,
     d: usize,
-) -> Result<NormWeights<'a>, DolphinDecoderError> {
-    Ok(NormWeights {
-        weight: builder.w1(graph, &format!("{prefix}.weight"), d)?,
-        bias: builder.w1(graph, &format!("{prefix}.bias"), d)?,
+) -> Result<NormStaticWeights, DolphinDecoderError> {
+    Ok(NormStaticWeights {
+        weight: builder.w1(arena, &format!("{prefix}.weight"), d)?,
+        bias: builder.w1(arena, &format!("{prefix}.bias"), d)?,
     })
 }
 
-fn build_layer_weights<'a, 'p>(
-    graph: &GgmlCpuGraphBuilder<'a>,
-    builder: &mut WeightBuilder<'a, 'p>,
+fn build_layer_static_weights(
+    arena: &GgmlStaticTensorArena,
+    builder: &mut StaticWeightBuilder<'_>,
     config: &DolphinDecoderConfig,
     index: usize,
-) -> Result<DecoderLayerWeights<'a>, DolphinDecoderError> {
+) -> Result<DecoderLayerStaticWeights, DolphinDecoderError> {
     let d = config.d_model;
     let ffn = config.ffn_units;
     let p = |suffix: &str| format!("decoder.decoders.{index}.{suffix}");
-    Ok(DecoderLayerWeights {
-        norm1: build_norm_weights(graph, builder, &p("norm1"), d)?,
-        self_q: build_linear_weights(graph, builder, &p("self_attn.linear_q"), d, d)?,
-        self_k: build_linear_weights(graph, builder, &p("self_attn.linear_k"), d, d)?,
-        self_v: build_linear_weights(graph, builder, &p("self_attn.linear_v"), d, d)?,
-        self_o: build_linear_weights(graph, builder, &p("self_attn.linear_out"), d, d)?,
-        norm2: build_norm_weights(graph, builder, &p("norm2"), d)?,
-        src_q: build_linear_weights(graph, builder, &p("src_attn.linear_q"), d, d)?,
-        src_k: build_linear_weights(graph, builder, &p("src_attn.linear_k"), d, d)?,
-        src_v: build_linear_weights(graph, builder, &p("src_attn.linear_v"), d, d)?,
-        src_o: build_linear_weights(graph, builder, &p("src_attn.linear_out"), d, d)?,
-        norm3: build_norm_weights(graph, builder, &p("norm3"), d)?,
-        ff_w1: build_linear_weights(graph, builder, &p("feed_forward.w_1"), d, ffn)?,
-        ff_w2: build_linear_weights(graph, builder, &p("feed_forward.w_2"), ffn, d)?,
+    Ok(DecoderLayerStaticWeights {
+        norm1: build_norm_static_weights(arena, builder, &p("norm1"), d)?,
+        self_q: build_linear_static_weights(arena, builder, &p("self_attn.linear_q"), d, d)?,
+        self_k: build_linear_static_weights(arena, builder, &p("self_attn.linear_k"), d, d)?,
+        self_v: build_linear_static_weights(arena, builder, &p("self_attn.linear_v"), d, d)?,
+        self_o: build_linear_static_weights(arena, builder, &p("self_attn.linear_out"), d, d)?,
+        norm2: build_norm_static_weights(arena, builder, &p("norm2"), d)?,
+        src_q: build_linear_static_weights(arena, builder, &p("src_attn.linear_q"), d, d)?,
+        src_k: build_linear_static_weights(arena, builder, &p("src_attn.linear_k"), d, d)?,
+        src_v: build_linear_static_weights(arena, builder, &p("src_attn.linear_v"), d, d)?,
+        src_o: build_linear_static_weights(arena, builder, &p("src_attn.linear_out"), d, d)?,
+        norm3: build_norm_static_weights(arena, builder, &p("norm3"), d)?,
+        ff_w1: build_linear_static_weights(arena, builder, &p("feed_forward.w_1"), d, ffn)?,
+        ff_w2: build_linear_static_weights(arena, builder, &p("feed_forward.w_2"), ffn, d)?,
     })
+}
+
+/// Static-arena tensor count for [`GgmlCpuGraphConfig::metadata_context_bytes`]:
+/// per layer, 13 `(weight, bias)`-style pairs (norm1/self_q/self_k/self_v/
+/// self_o/norm2/src_q/src_k/src_v/src_o/norm3/ff_w1/ff_w2) = 26 tensors, plus
+/// the fixed token embedding, full position table, after_norm (2), output
+/// weight and output bias, plus one encoder-memory tensor.
+const DOLPHIN_DECODER_ARENA_TENSORS_PER_LAYER: usize = 26;
+const DOLPHIN_DECODER_ARENA_FIXED_TENSORS: usize = 6;
+
+fn dolphin_decoder_arena_context_bytes(num_layers: usize) -> usize {
+    let tensor_count = DOLPHIN_DECODER_ARENA_FIXED_TENSORS
+        .saturating_add(DOLPHIN_DECODER_ARENA_TENSORS_PER_LAYER.saturating_mul(num_layers));
+    GgmlCpuGraphConfig::metadata_context_bytes(tensor_count)
 }
 
 // --- graph ops -------------------------------------------------------------
@@ -529,54 +632,8 @@ fn build_causal_mask(tokens: usize) -> Vec<f32> {
     mask
 }
 
-/// Run the Dolphin Transformer decoder over a teacher-forced prompt prefix and
-/// return the per-position logits. `encoder_out` is the frame-major
-/// `[frames, d_model]` encoder output (d_model innermost), matching the golden
-/// `encoder_out` fixture layout.
-pub(crate) fn decode_prompt_logits(
-    config: &DolphinDecoderConfig,
-    provider: &dyn DolphinWeightProvider,
-    encoder_out: &[f32],
-    frames: usize,
-    prompt_tokens: &[u32],
-    backend: GgmlCpuGraphBackend,
-) -> Result<DolphinDecoderOutput, DolphinDecoderError> {
-    let d = config.d_model;
-    let tokens = prompt_tokens.len();
-    if tokens == 0 {
-        return Err(DolphinDecoderError::Shape {
-            reason: "prompt must contain at least one token".to_string(),
-        });
-    }
-    if tokens > config.max_positions {
-        return Err(DolphinDecoderError::Shape {
-            reason: format!(
-                "prompt length {tokens} exceeds position table {}",
-                config.max_positions
-            ),
-        });
-    }
-    if frames == 0 || encoder_out.len() != frames * d {
-        return Err(DolphinDecoderError::Shape {
-            reason: format!(
-                "encoder_out has {} values, expected {frames}x{d}",
-                encoder_out.len()
-            ),
-        });
-    }
-    if let Some(bad) = prompt_tokens
-        .iter()
-        .find(|&&t| t as usize >= config.vocab_size)
-    {
-        return Err(DolphinDecoderError::Shape {
-            reason: format!(
-                "prompt token {bad} out of vocab range {}",
-                config.vocab_size
-            ),
-        });
-    }
-
-    let graph_config = GgmlCpuGraphConfig {
+fn dolphin_decoder_runner_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+    GgmlCpuGraphConfig {
         context_bytes: 128 * 1024 * 1024,
         graph_size: 16384,
         n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
@@ -589,150 +646,261 @@ pub(crate) fn decode_prompt_logits(
         // decoders) only bounds memory footprint, never the decoder's
         // computed output.
         use_scheduler: true,
-    };
-    let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
-    let mut graph = runner.start_graph();
-
-    // Phase A: create every weight tensor (must precede the first buffer alloc).
-    let mut builder = WeightBuilder::new(provider);
-    let token_embed =
-        builder.w2_embedding(&graph, "decoder.embed.0.weight", d, config.vocab_size)?;
-    let pos_emb = builder.pos_slice(
-        &graph,
-        "decoder.embed.1.pe",
-        d,
-        tokens,
-        config.max_positions,
-    )?;
-    let mut layers = Vec::with_capacity(config.num_layers);
-    for index in 0..config.num_layers {
-        layers.push(build_layer_weights(&graph, &mut builder, config, index)?);
     }
-    let after_norm = build_norm_weights(&graph, &mut builder, "decoder.after_norm", d)?;
-    let output_weight = builder.w2(&graph, "decoder.output_layer.weight", d, config.vocab_size)?;
-    let output_bias = builder.w1(&graph, "decoder.output_layer.bias", config.vocab_size)?;
-    let weights = DecoderWeights {
-        token_embed,
-        pos_emb,
-        layers,
-        after_norm,
-        output_weight,
-        output_bias,
-    };
+}
 
-    // Input tensors: token ids (i32), encoder memory (f32), causal mask (f32).
-    let token_ids = graph
-        .new_tensor_1d_i32(tokens, "dolphin_dec_tokens")
-        .map_err(ggml_err("input_alloc_tokens"))?;
-    let encoder_mem = graph
-        .new_tensor_2d_f32(d, frames, "dolphin_dec_encoder_out")
-        .map_err(ggml_err("input_alloc_encoder"))?;
-    let causal_mask = graph
-        .new_tensor_2d_f32(tokens, tokens, "dolphin_dec_causal_mask")
-        .map_err(ggml_err("input_alloc_mask"))?;
+/// Build-once/run-many Dolphin decoder runtime for one utterance's rescoring
+/// pass (P5). [`Self::new`] loads every decoder weight tensor plus the
+/// encoder's memory into a persistent [`GgmlStaticTensorArena`] exactly once;
+/// [`Self::decode_prompt_logits`] can then be called once per CTC n-best
+/// hypothesis without re-uploading either. Owns a dedicated
+/// [`GgmlCpuGraphRunner`] (rather than sharing the caller's) so the arena's
+/// backend buffer and the per-call transient graphs agree on the same backend
+/// instance.
+pub(crate) struct DolphinDecoderRescoreRuntime {
+    runner: GgmlCpuGraphRunner,
+    arena: GgmlStaticTensorArena,
+    config: DolphinDecoderConfig,
+    frames: usize,
+    weights: DecoderStaticWeights,
+    encoder_mem: GgmlStaticTensor,
+}
 
-    // Phase B: build the forward graph.
-    // Embedding: token_embed(ids) * sqrt(d_model) + absolute positional encoding.
-    let token_state = graph
-        .get_rows(weights.token_embed, token_ids)
-        .map_err(ggml_err("embed_get_rows"))?;
-    let scaled = graph
-        .scale(token_state, (d as f32).sqrt())
-        .map_err(ggml_err("embed_xscale"))?;
-    let mut hidden = graph
-        .add(scaled, weights.pos_emb)
-        .map_err(ggml_err("embed_pos"))?;
-    for layer in &weights.layers {
-        hidden = decoder_layer(
-            &mut graph,
-            hidden,
-            encoder_mem,
-            causal_mask,
-            layer,
-            config,
-            tokens,
+impl DolphinDecoderRescoreRuntime {
+    /// `encoder_out` is the frame-major `[frames, d_model]` encoder output
+    /// (d_model innermost), matching the golden `encoder_out` fixture layout;
+    /// it is uploaded once here and shared by every subsequent
+    /// [`Self::decode_prompt_logits`] call on this runtime.
+    pub(crate) fn new(
+        config: &DolphinDecoderConfig,
+        provider: &dyn DolphinWeightProvider,
+        encoder_out: &[f32],
+        frames: usize,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, DolphinDecoderError> {
+        let d = config.d_model;
+        if frames == 0 || encoder_out.len() != frames * d {
+            return Err(DolphinDecoderError::Shape {
+                reason: format!(
+                    "encoder_out has {} values, expected {frames}x{d}",
+                    encoder_out.len()
+                ),
+            });
+        }
+
+        let runner = GgmlCpuGraphRunner::new(dolphin_decoder_runner_config(backend))
+            .map_err(ggml_err("runner_init"))?;
+        let arena = runner
+            .start_static_tensor_arena(dolphin_decoder_arena_context_bytes(config.num_layers))
+            .map_err(ggml_err("static_tensor_arena"))?;
+
+        // Phase A: create every weight + encoder-memory tensor (must precede
+        // the arena's first buffer alloc, which freezes further creation).
+        let mut builder = StaticWeightBuilder::new(provider);
+        let token_embed =
+            builder.w2_embedding(&arena, "decoder.embed.0.weight", d, config.vocab_size)?;
+        let pos_emb_full =
+            builder.pos_full(&arena, "decoder.embed.1.pe", d, config.max_positions)?;
+        let mut layers = Vec::with_capacity(config.num_layers);
+        for index in 0..config.num_layers {
+            layers.push(build_layer_static_weights(
+                &arena,
+                &mut builder,
+                config,
+                index,
+            )?);
+        }
+        let after_norm = build_norm_static_weights(&arena, &mut builder, "decoder.after_norm", d)?;
+        let output_weight =
+            builder.w2(&arena, "decoder.output_layer.weight", d, config.vocab_size)?;
+        let output_bias = builder.w1(&arena, "decoder.output_layer.bias", config.vocab_size)?;
+        let encoder_mem = arena
+            .new_tensor_2d_f32(d, frames, "dolphin_dec_encoder_out")
+            .map_err(ggml_err("encoder_mem_alloc"))?;
+
+        // Phase B: upload every weight + the encoder memory exactly once.
+        let mut arena = arena;
+        for (tensor, data, name) in &builder.uploads {
+            arena
+                .set_f32_slice(*tensor, data, name)
+                .map_err(ggml_err("upload_weight"))?;
+        }
+        for (tensor, bytes, name) in &builder.native_uploads {
+            arena
+                .set_bytes_slice(*tensor, bytes, name)
+                .map_err(ggml_err("upload_weight_native"))?;
+        }
+        arena
+            .set_f32_slice(encoder_mem, encoder_out, "dolphin_dec_encoder_out")
+            .map_err(ggml_err("upload_encoder"))?;
+
+        Ok(Self {
+            runner,
+            arena,
+            config: *config,
             frames,
+            weights: DecoderStaticWeights {
+                token_embed,
+                pos_emb_full,
+                layers,
+                after_norm,
+                output_weight,
+                output_bias,
+            },
+            encoder_mem,
+        })
+    }
+
+    /// Run the decoder over one teacher-forced prompt prefix and return the
+    /// per-position logits. Only token ids, the causal mask, and the absolute-
+    /// position view depend on `prompt_tokens`; every weight and the encoder
+    /// memory are the already-resident arena tensors from [`Self::new`].
+    pub(crate) fn decode_prompt_logits(
+        &mut self,
+        prompt_tokens: &[u32],
+    ) -> Result<DolphinDecoderOutput, DolphinDecoderError> {
+        let config = &self.config;
+        let d = config.d_model;
+        let tokens = prompt_tokens.len();
+        if tokens == 0 {
+            return Err(DolphinDecoderError::Shape {
+                reason: "prompt must contain at least one token".to_string(),
+            });
+        }
+        if tokens > config.max_positions {
+            return Err(DolphinDecoderError::Shape {
+                reason: format!(
+                    "prompt length {tokens} exceeds position table {}",
+                    config.max_positions
+                ),
+            });
+        }
+        if let Some(bad) = prompt_tokens
+            .iter()
+            .find(|&&t| t as usize >= config.vocab_size)
+        {
+            return Err(DolphinDecoderError::Shape {
+                reason: format!(
+                    "prompt token {bad} out of vocab range {}",
+                    config.vocab_size
+                ),
+            });
+        }
+
+        let arena = &self.arena;
+        let mut graph = self.runner.start_graph();
+
+        // Input tensors: token ids (i32) and the causal mask (f32) -- the only
+        // two things that actually differ per call. Weights and the encoder
+        // memory are arena-resident (real backend buffer already allocated),
+        // so unlike the transient inputs below they need no `set_input`.
+        let token_ids = graph
+            .new_tensor_1d_i32(tokens, "dolphin_dec_tokens")
+            .map_err(ggml_err("input_alloc_tokens"))?;
+        let causal_mask = graph
+            .new_tensor_2d_f32(tokens, tokens, "dolphin_dec_causal_mask")
+            .map_err(ggml_err("input_alloc_mask"))?;
+
+        // Embedding: token_embed(ids) * sqrt(d_model) + absolute positional
+        // encoding, the latter a contiguous leading view (rows `0..tokens`) of
+        // the arena's full position table -- no re-upload, no re-slice.
+        let token_state = graph
+            .get_rows(arena.graph_tensor(self.weights.token_embed), token_ids)
+            .map_err(ggml_err("embed_get_rows"))?;
+        let scaled = graph
+            .scale(token_state, (d as f32).sqrt())
+            .map_err(ggml_err("embed_xscale"))?;
+        let row_stride = d * std::mem::size_of::<f32>();
+        let pos_view = graph
+            .view_2d(
+                arena.graph_tensor(self.weights.pos_emb_full),
+                d,
+                tokens,
+                row_stride,
+                0,
+            )
+            .map_err(ggml_err("embed_pos_view"))?;
+        let mut hidden = graph.add(scaled, pos_view).map_err(ggml_err("embed_pos"))?;
+        let encoder_mem = arena.graph_tensor(self.encoder_mem);
+        for layer in &self.weights.layers {
+            let layer = layer.to_transient(arena);
+            hidden = decoder_layer(
+                &mut graph,
+                hidden,
+                encoder_mem,
+                causal_mask,
+                &layer,
+                config,
+                tokens,
+                self.frames,
+            )?;
+        }
+        let after_norm = self.weights.after_norm.to_transient(arena);
+        let normed = affine_ln(
+            &graph,
+            hidden,
+            config.layer_norm_epsilon,
+            &after_norm,
+            "after_norm",
         )?;
-    }
-    let normed = affine_ln(
-        &graph,
-        hidden,
-        config.layer_norm_epsilon,
-        &weights.after_norm,
-        "after_norm",
-    )?;
-    let logits = graph
-        .mul_mat(weights.output_weight, normed)
-        .map_err(ggml_err("output_layer"))?;
-    let logits = graph
-        .add(logits, weights.output_bias)
-        .map_err(ggml_err("output_layer_bias"))?;
-    graph.set_output(logits).map_err(ggml_err("set_output"))?;
-    // Every tensor this graph uploads to (rather than computes) must be
-    // flagged `set_input`: dolphin has no persistent weight arena, so every
-    // weight and every non-weight input is a fresh leaf tensor in this
-    // per-call graph with no buffer yet -- without the flag the scheduler's
-    // backend-assignment pass has no rule to place it on and aborts.
-    graph
-        .set_input(token_ids)
-        .map_err(ggml_err("mark_input(tokens)"))?;
-    graph
-        .set_input(encoder_mem)
-        .map_err(ggml_err("mark_input(encoder_out)"))?;
-    graph
-        .set_input(causal_mask)
-        .map_err(ggml_err("mark_input(causal_mask)"))?;
-    for (tensor, _, _) in &builder.uploads {
+        let logits = graph
+            .mul_mat(arena.graph_tensor(self.weights.output_weight), normed)
+            .map_err(ggml_err("output_layer"))?;
+        let logits = graph
+            .add(logits, arena.graph_tensor(self.weights.output_bias))
+            .map_err(ggml_err("output_layer_bias"))?;
+        graph.set_output(logits).map_err(ggml_err("set_output"))?;
         graph
-            .set_input(*tensor)
-            .map_err(ggml_err("mark_input(weight)"))?;
-    }
-    for (tensor, _, _, _) in &builder.native_uploads {
+            .set_input(token_ids)
+            .map_err(ggml_err("mark_input(tokens)"))?;
         graph
-            .set_input(*tensor)
-            .map_err(ggml_err("mark_input(weight_native)"))?;
-    }
-    // Allocate the forward graph through the scheduler's gallocr for
-    // liveness-based buffer reuse before uploading inputs (mirrors the
-    // encoder above and the sibling cohere/moonshine decoders).
-    graph
-        .prepare_outputs_for_upload(&[logits])
-        .map_err(ggml_err("prepare_outputs"))?;
+            .set_input(causal_mask)
+            .map_err(ggml_err("mark_input(causal_mask)"))?;
+        // Allocate the forward graph through the scheduler's gallocr for
+        // liveness-based buffer reuse before uploading inputs (mirrors the
+        // encoder above and the sibling cohere/moonshine decoders).
+        graph
+            .prepare_outputs_for_upload(&[logits])
+            .map_err(ggml_err("prepare_outputs"))?;
 
-    // Phase C: upload inputs + weights, then compute.
-    let token_ids_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
-    graph
-        .set_i32_slice(token_ids, &token_ids_i32, "dolphin_dec_tokens")
-        .map_err(ggml_err("upload_tokens"))?;
-    graph
-        .set_f32_slice(encoder_mem, encoder_out, "dolphin_dec_encoder_out")
-        .map_err(ggml_err("upload_encoder"))?;
-    graph
-        .set_f32_slice(
-            causal_mask,
-            &build_causal_mask(tokens),
-            "dolphin_dec_causal_mask",
-        )
-        .map_err(ggml_err("upload_mask"))?;
-    for (tensor, data, name) in &builder.uploads {
+        let token_ids_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
         graph
-            .set_f32_slice(*tensor, data, name)
-            .map_err(ggml_err("upload_weight"))?;
-    }
-    for (tensor, bytes, ggml_type, name) in &builder.native_uploads {
+            .set_i32_slice(token_ids, &token_ids_i32, "dolphin_dec_tokens")
+            .map_err(ggml_err("upload_tokens"))?;
         graph
-            .set_matmul_weight_bytes(*tensor, bytes, *ggml_type, name)
-            .map_err(ggml_err("upload_weight_native"))?;
+            .set_f32_slice(
+                causal_mask,
+                &build_causal_mask(tokens),
+                "dolphin_dec_causal_mask",
+            )
+            .map_err(ggml_err("upload_mask"))?;
+
+        let expected = tokens * config.vocab_size;
+        let logits = graph
+            .compute_output_f32(logits, expected)
+            .map_err(ggml_err("compute"))?;
+
+        Ok(DolphinDecoderOutput {
+            token_count: tokens,
+            vocab_size: config.vocab_size,
+            logits,
+        })
     }
+}
 
-    let expected = tokens * config.vocab_size;
-    let logits = graph
-        .compute_output_f32(logits, expected)
-        .map_err(ggml_err("compute"))?;
-
-    Ok(DolphinDecoderOutput {
-        token_count: tokens,
-        vocab_size: config.vocab_size,
-        logits,
-    })
+/// One-shot convenience wrapper over [`DolphinDecoderRescoreRuntime`] for
+/// callers that only need a single prompt's logits (the `parity` dev
+/// harness). Attention-rescoring builds and reuses the runtime directly
+/// across its whole CTC n-best (see `joint_decode::attention_rescore`) instead
+/// of calling this per hypothesis.
+pub(crate) fn decode_prompt_logits(
+    config: &DolphinDecoderConfig,
+    provider: &dyn DolphinWeightProvider,
+    encoder_out: &[f32],
+    frames: usize,
+    prompt_tokens: &[u32],
+    backend: GgmlCpuGraphBackend,
+) -> Result<DolphinDecoderOutput, DolphinDecoderError> {
+    DolphinDecoderRescoreRuntime::new(config, provider, encoder_out, frames, backend)?
+        .decode_prompt_logits(prompt_tokens)
 }
