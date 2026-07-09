@@ -115,6 +115,13 @@ jobs:
     if: needs.resolve.outputs.should_release == 'true' && success()
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    # id-token/attestations for the build-provenance attestation step below;
+    # this job only reads the repo and uploads a workflow artifact, so
+    # contents stays read-only (narrower than the workflow-level default).
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     # Distributed binaries must be portable across end-user CPUs. build.rs
     # auto-enables GGML_NATIVE (-march=native) when host==target on x86, which
     # would tune the released Linux binary to the CI runner and SIGILL elsewhere.
@@ -165,6 +172,10 @@ jobs:
           cp target/release/openasr "${stage}/"
           cp README.md LICENSE "${stage}/"
           tar -czf "dist/openasr-${version}-${asset}.tar.gz" -C dist "openasr-${version}-${asset}"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/openasr-${{ needs.resolve.outputs.version }}-${{ matrix.asset }}.tar.gz
       - name: Upload archive
         uses: actions/upload-artifact@v7
         with:
@@ -244,8 +255,14 @@ jobs:
     name: Build full release matrix
     needs: [resolve, release]
     if: needs.resolve.outputs.should_release == 'true' && success()
+    # Grants the ceiling for every job in the called workflow -- reusable
+    # workflows cannot elevate beyond what the caller job grants here. The
+    # called workflow's own build/xcframework jobs need id-token/attestations
+    # to attest each packaged archive's build provenance.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/release-binaries.yml
     with:
       ref: ${{ needs.resolve.outputs.tag }}
