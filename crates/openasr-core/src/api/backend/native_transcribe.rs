@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, path::Path, sync::OnceLock};
 
 use crate::NATIVE_RUNTIME_MODEL_ID_AUTO;
 use crate::api::audio_io::load_wav_16khz_mono_f32_v0;
-use crate::arch::OpenAsrArchitectureRegistry;
+use crate::arch::{DEFAULT_ENCODER_SAFE_CHUNK_SECONDS, OpenAsrArchitectureRegistry};
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, install_request_backend_override,
 };
@@ -34,7 +34,21 @@ use crate::models::qwen::{
 };
 
 const DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS: f32 = 30.0;
-const COHERE_LONGFORM_MAX_CHUNK_SECONDS: f32 = 10.0;
+/// Chunk-length ceiling for the decode-side `ConservativeSeq2SeqV1`
+/// repetition-guard profile (issue #60: cohere-transcribe, moonshine,
+/// firered-aed). Historically this was a hard-coded `10.0` with no model
+/// basis -- a defensive patch from when the repetition failure mode was
+/// first found, predating the structural fix (the shared greedy-decode
+/// driver's degenerate-loop guard, which is the actual anti-repetition
+/// mechanism and stays in place regardless of chunk length). That 10s value
+/// has since been surveyed against the same industry evidence backing
+/// `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS` (Whisper/Moonshine/NeMo/FunASR/
+/// Dolphin/Cohere all converge near 30s) and found to have no independent
+/// justification, so it is unified with that default: the previous name
+/// (`COHERE_LONGFORM_MAX_CHUNK_SECONDS`) was also misleading on both counts
+/// (not 10s anymore, and not cohere-only -- moonshine and firered-aed carry
+/// the same profile).
+const CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS: f32 = DEFAULT_ENCODER_SAFE_CHUNK_SECONDS;
 const COHERE_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
 static NATIVE_GGML_EXECUTION_DISPATCH: OnceLock<GgmlAsrExecutionDispatch> = OnceLock::new();
 
@@ -575,7 +589,7 @@ fn run_native_transcription_impl(
     let longform_resolution = resolve_native_longform_policy(
         request.longform.as_ref(),
         audio_duration_seconds,
-        selected_family.adapter_id,
+        selected_family.model_architecture,
     );
     let longform_options = longform_resolution.options.clone();
     let run_longform = !matches!(longform_options.mode, LongFormMode::Off);
@@ -1108,7 +1122,38 @@ fn resolve_native_longform_policy_for_backend(
     }
 }
 
+/// Applies every family-specific longform safety cap for `model_architecture`.
+/// Two independent caps can apply to the same architecture (e.g.
+/// firered-aed/cohere/moonshine carry both), and they are combined by never
+/// letting a later cap *widen* a value an earlier cap already narrowed --
+/// each helper only clamps downward, so the net effect is always the min of
+/// whichever caps apply. Order does not matter for that reason; the
+/// repetition-guard profile runs first only because it is the
+/// longer-standing check.
 fn apply_longform_safety_policy(
+    model_architecture: &str,
+    options: &mut crate::LongFormOptions,
+    provenance: &mut Vec<String>,
+) {
+    apply_conservative_seq2seq_longform_safety_policy(model_architecture, options, provenance);
+    apply_encoder_attention_span_longform_safety_policy(model_architecture, options, provenance);
+}
+
+/// Caps longform chunking for the decode-side `ConservativeSeq2SeqV1`
+/// repetition-guard profile (issue #60): plain `<sos>`-prompted AED decoders
+/// with a small effective context (cohere-transcribe, moonshine, firered-aed)
+/// repeat/hallucinate on long, pause-free chunks, so prompt carry across
+/// slices is disabled here. The chunk-length cap itself
+/// (`CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS`) is *not* the
+/// repetition fix -- that is the shared greedy-decode driver's
+/// degenerate-loop guard, which applies regardless of chunk length -- so
+/// this cap uses the same industry-surveyed default as the encoder-memory
+/// cap below rather than an arbitrarily tighter number. This is a decode
+/// semantics cap, independent of the encoder-memory cap below (which caps a
+/// different, larger set of architectures for a different reason); the two
+/// happen to share the same default value today, but remain conceptually
+/// distinct and compose by taking the min if a future override diverges them.
+fn apply_conservative_seq2seq_longform_safety_policy(
     model_architecture: &str,
     options: &mut crate::LongFormOptions,
     provenance: &mut Vec<String>,
@@ -1120,16 +1165,16 @@ fn apply_longform_safety_policy(
         return;
     }
     let mut changed = false;
-    if options.chunk_seconds > COHERE_LONGFORM_MAX_CHUNK_SECONDS {
-        options.chunk_seconds = COHERE_LONGFORM_MAX_CHUNK_SECONDS;
+    if options.chunk_seconds > CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS {
+        options.chunk_seconds = CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS;
         changed = true;
     }
-    if options.max_chunk_seconds > COHERE_LONGFORM_MAX_CHUNK_SECONDS {
-        options.max_chunk_seconds = COHERE_LONGFORM_MAX_CHUNK_SECONDS;
+    if options.max_chunk_seconds > CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS {
+        options.max_chunk_seconds = CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS;
         changed = true;
     }
-    if options.min_chunk_seconds > COHERE_LONGFORM_MAX_CHUNK_SECONDS {
-        options.min_chunk_seconds = COHERE_LONGFORM_MAX_CHUNK_SECONDS;
+    if options.min_chunk_seconds > CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS {
+        options.min_chunk_seconds = CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS;
         changed = true;
     }
     if options.max_chunk_seconds < options.chunk_seconds {
@@ -1156,7 +1201,59 @@ fn apply_longform_safety_policy(
     if changed {
         provenance.push(format!(
             "core.native.longform.policy:cohere-chunk-cap={}",
-            COHERE_LONGFORM_MAX_CHUNK_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
+        ));
+    }
+}
+
+/// Caps longform chunking to the architecture's declared
+/// `OpenAsrEncoderAttentionSpan::GlobalQuadratic` safety ceiling (issue #68):
+/// a global-quadratic-attention encoder's activation memory grows with the
+/// square of chunk length, so a long, pause-free recording that lets the
+/// auto/energy/VAD slicer grow a chunk up to the (much larger)
+/// `LongFormOptions::default().max_chunk_seconds` can exhaust RAM. Whisper
+/// (`FixedWindow`) and zipformer (`LocalChunked`) need no cap here -- their
+/// encoders do not scale with the logical chunk length -- so this is a no-op
+/// for them. Only ever clamps downward, so it composes safely with
+/// `apply_conservative_seq2seq_longform_safety_policy`'s tighter cap on the
+/// families that carry both.
+fn apply_encoder_attention_span_longform_safety_policy(
+    model_architecture: &str,
+    options: &mut crate::LongFormOptions,
+    provenance: &mut Vec<String>,
+) {
+    let Some(descriptor) =
+        OpenAsrArchitectureRegistry::with_builtins().find_by_model_architecture(model_architecture)
+    else {
+        return;
+    };
+    let Some(max_safe_chunk_seconds) = descriptor.longform_max_safe_chunk_seconds() else {
+        return;
+    };
+    let mut changed = false;
+    if options.chunk_seconds > max_safe_chunk_seconds {
+        options.chunk_seconds = max_safe_chunk_seconds;
+        changed = true;
+    }
+    if options.max_chunk_seconds > max_safe_chunk_seconds {
+        options.max_chunk_seconds = max_safe_chunk_seconds;
+        changed = true;
+    }
+    if options.min_chunk_seconds > max_safe_chunk_seconds {
+        options.min_chunk_seconds = max_safe_chunk_seconds;
+        changed = true;
+    }
+    if options.max_chunk_seconds < options.chunk_seconds {
+        options.max_chunk_seconds = options.chunk_seconds;
+        changed = true;
+    }
+    if options.min_chunk_seconds > options.chunk_seconds {
+        options.min_chunk_seconds = options.chunk_seconds;
+        changed = true;
+    }
+    if changed {
+        provenance.push(format!(
+            "core.native.longform.policy:encoder-attention-span-chunk-cap={max_safe_chunk_seconds}"
         ));
     }
 }
@@ -1808,11 +1905,11 @@ mod tests {
         assert_eq!(resolution.options.mode, LongFormMode::Auto);
         assert_eq!(
             resolution.options.chunk_seconds,
-            COHERE_LONGFORM_MAX_CHUNK_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         );
         assert_eq!(
             resolution.options.max_chunk_seconds,
-            COHERE_LONGFORM_MAX_CHUNK_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         );
         assert_eq!(resolution.options.min_chunk_seconds, 1.0);
         assert_eq!(
@@ -1854,15 +1951,15 @@ mod tests {
         );
         assert_eq!(
             resolution.options.chunk_seconds,
-            COHERE_LONGFORM_MAX_CHUNK_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         );
         assert_eq!(
             resolution.options.max_chunk_seconds,
-            COHERE_LONGFORM_MAX_CHUNK_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         );
         assert_eq!(
             resolution.options.min_chunk_seconds,
-            COHERE_LONGFORM_MAX_CHUNK_SECONDS
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         );
         assert_eq!(
             resolution.options.overlap_seconds,
@@ -1873,6 +1970,12 @@ mod tests {
 
     #[test]
     fn qwen_metal_longform_policy_keeps_default_chunk_size() {
+        // qwen has no `ConservativeSeq2SeqV1` decode-side profile, so
+        // `chunk_seconds` (already 30.0 by default) is untouched. But qwen's
+        // audio encoder IS `GlobalQuadratic` (issue #68), so the much larger
+        // `max_chunk_seconds` default (120.0) -- the true ceiling the VAD/
+        // energy/auto slicer can grow a chunk to on long, pause-free audio --
+        // must still be capped down to the 30s safe ceiling.
         let resolution = resolve_native_longform_policy_for_backend(
             None,
             120.0,
@@ -1880,7 +1983,115 @@ mod tests {
             GgmlCpuGraphBackend::Metal,
         );
         assert_eq!(resolution.options.chunk_seconds, 30.0);
-        assert!(resolution.provenance.is_empty());
+        assert_eq!(resolution.options.max_chunk_seconds, 30.0);
+        assert!(resolution.provenance.iter().any(|entry| {
+            entry.contains("core.native.longform.policy:encoder-attention-span-chunk-cap=30")
+        }));
+    }
+
+    /// Production-path regression test for the issue #68 wiring bug: the real
+    /// call site (`run_native_transcription`) resolves the longform safety
+    /// cap from the `GgmlFamilyAdapterDescriptor` the same way
+    /// `validate_runtime_source_and_select_adapter` builds it, and MUST key
+    /// off `model_architecture` -- never `adapter_id`. The two are different
+    /// strings for every builtin family (asserted below), so passing the
+    /// wrong one makes `resolve_builtin_decode_policy_for_architecture` and
+    /// `OpenAsrArchitectureRegistry::find_by_model_architecture` both miss,
+    /// silently dropping every family-specific longform safety cap -- which
+    /// is exactly how firered-aed/cohere/moonshine's `ConservativeSeq2SeqV1`
+    /// cap and every `GlobalQuadratic` family's encoder-memory cap went live
+    /// but never actually applied in production (chunk length stayed at the
+    /// unsafe 120s default) until this fix.
+    #[test]
+    fn native_longform_policy_uses_selected_family_model_architecture_not_adapter_id() {
+        let selected_family = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID)
+            .expect("firered-aed architecture")
+            .ggml_family_adapter_descriptor();
+        assert_ne!(
+            selected_family.adapter_id,
+            selected_family.model_architecture
+        );
+
+        // Correct wiring: keying off model_architecture applies BOTH the
+        // encoder-attention-span cap and the conservative seq2seq cap --
+        // both now resolve to the same default (30s), so composing them
+        // (taking the min) is a no-op, but both must still actually run.
+        let correct = resolve_native_longform_policy_for_backend(
+            None,
+            120.0,
+            selected_family.model_architecture,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(
+            correct.options.max_chunk_seconds,
+            CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
+        );
+        assert!(correct.options.max_chunk_seconds < 120.0);
+
+        // The bug class this guards against: keying off adapter_id finds no
+        // matching architecture, so every safety cap silently no-ops and the
+        // unsafe 120s default max_chunk_seconds survives untouched.
+        let wrong = resolve_native_longform_policy_for_backend(
+            None,
+            120.0,
+            selected_family.adapter_id,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(wrong.options.max_chunk_seconds, 120.0);
+        assert!(wrong.provenance.is_empty());
+    }
+
+    /// Data-driven production-path coverage over every builtin architecture
+    /// (issue #68): a `GlobalQuadratic` encoder must never be handed a
+    /// longform chunk longer than its declared safe ceiling, while
+    /// `FixedWindow` (whisper) and `LocalChunked` (zipformer) architectures
+    /// need no additional cap and keep the unmodified 120s default. All nine
+    /// `GlobalQuadratic` builtins (including firered-aed/cohere-transcribe/
+    /// moonshine, which also carry the decode-side `ConservativeSeq2SeqV1`
+    /// cap) declare `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`, so this asserts
+    /// exact equality, not just an upper bound: the two caps stacked on the
+    /// conservative-seq2seq trio must resolve to the same 30s default, not
+    /// silently over-tighten to something smaller than either cap alone
+    /// intends.
+    #[test]
+    fn encoder_attention_span_caps_every_builtin_architecture_on_the_production_path() {
+        for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
+            let resolution = resolve_native_longform_policy_for_backend(
+                None,
+                120.0,
+                descriptor.model_architecture,
+                GgmlCpuGraphBackend::Cpu,
+            );
+            match descriptor.longform_max_safe_chunk_seconds() {
+                Some(max_safe_chunk_seconds) => {
+                    assert_eq!(
+                        max_safe_chunk_seconds, DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
+                        "'{}' GlobalQuadratic ceiling must be the shared default absent a cited \
+                         upstream override",
+                        descriptor.model_architecture
+                    );
+                    assert_eq!(
+                        resolution.options.max_chunk_seconds, max_safe_chunk_seconds,
+                        "'{}' must resolve max_chunk_seconds to exactly {max_safe_chunk_seconds}, got {}",
+                        descriptor.model_architecture, resolution.options.max_chunk_seconds
+                    );
+                    assert!(
+                        resolution.options.chunk_seconds <= max_safe_chunk_seconds,
+                        "'{}' must cap chunk_seconds to <= {max_safe_chunk_seconds}, got {}",
+                        descriptor.model_architecture,
+                        resolution.options.chunk_seconds
+                    );
+                }
+                None => {
+                    assert_eq!(
+                        resolution.options.max_chunk_seconds, 120.0,
+                        "'{}' (FixedWindow/LocalChunked) must keep the unmodified default",
+                        descriptor.model_architecture
+                    );
+                }
+            }
+        }
     }
 
     #[test]
