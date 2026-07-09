@@ -30,6 +30,7 @@ QWEN3_ASR_EXPECTED_GENERAL_ARCHITECTURE = b"qwen3-asr"
 QWEN3_ASR_LEGACY_GENERAL_ARCHITECTURE = b"qwen3asr"
 XASR_ZIPFORMER_EXPECTED_GENERAL_ARCHITECTURE = b"xasr-zipformer-transducer"
 HYMT2_EXPECTED_GENERAL_ARCHITECTURE = b"hunyuan-dense"
+FIRERED_PUNC_EXPECTED_GENERAL_ARCHITECTURE = b"firered-punc"
 HYMT2_REQUIRED_HEADER_MARKERS = (
     b"openasr.model.kind",
     b"translation-model",
@@ -71,6 +72,7 @@ RELEASE_LANE_MODELS = (
     "parakeet-tdt-0.6b-v3",
     "firered-aed-l-v2",
     "qwen3-forced-aligner-0.6b",
+    "firered-punc",
 )
 GGUF_GENERAL_ARCHITECTURE_KEY = b"general.architecture"
 
@@ -104,6 +106,8 @@ def expected_general_architecture(model: str) -> bytes | None:
         return XASR_ZIPFORMER_EXPECTED_GENERAL_ARCHITECTURE
     if model == "hymt2-1.8b":
         return HYMT2_EXPECTED_GENERAL_ARCHITECTURE
+    if model == "firered-punc":
+        return FIRERED_PUNC_EXPECTED_GENERAL_ARCHITECTURE
     return None
 
 
