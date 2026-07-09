@@ -310,7 +310,10 @@ impl CohereTranscribeGgmlExecutor {
                     decoder_weights: prepared_runtime.decoder_weights.clone(),
                     tokenizer: prepared_runtime.tokenizer.clone(),
                     metadata: prepared_runtime.metadata,
-                    encoder_output: encoder_output.clone(),
+                    // Moved (not cloned): this branch is the last use of
+                    // `encoder_output` -- the `else` branch below only
+                    // borrows it, and nothing reads it after the if/else.
+                    encoder_output,
                     decode_config,
                     text_postprocess_kind: cohere_serve_batch_text_postprocess_kind().map_err(
                         |error| CohereTranscribeGgmlExecutorError::DecoderFailed {

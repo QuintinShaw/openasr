@@ -785,7 +785,10 @@ fn update_hymt2_source_prefix_cache(
             cache.config.unstable_tail_backoff_tokens,
             finalized,
         );
-        let mut staged_layer_kv_caches = active.layer_kv_caches.clone();
+        // The pre-reuse KV caches are fully replaced by `staged_layer_kv_caches`
+        // below (on success) or discarded by `cache.invalidate()` (on error),
+        // so `mem::take` avoids cloning the whole multi-layer KV cache here.
+        let mut staged_layer_kv_caches = std::mem::take(&mut active.layer_kv_caches);
         for layer in &mut staged_layer_kv_caches {
             layer
                 .truncate_written_positions(reuse_plan.reused_prefix_tokens)

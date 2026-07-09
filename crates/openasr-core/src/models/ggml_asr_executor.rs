@@ -56,7 +56,11 @@ impl GgmlAsrPreparedAudio {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GgmlAsrRuntimeSourcePreflight {
     pub runtime_source: GgmlRuntimeSource,
-    pub metadata: GgufMetadata,
+    /// `Arc`-wrapped so cloning this preflight (done once per long-form
+    /// slice on the native transcribe hot path) is a refcount bump instead
+    /// of a deep copy of the full GGUF metadata map (which typically
+    /// embeds the whole tokenizer vocab).
+    pub metadata: Arc<GgufMetadata>,
     pub tensor_index: Arc<GgufTensorIndex>,
 }
 

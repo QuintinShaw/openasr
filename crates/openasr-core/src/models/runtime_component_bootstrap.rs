@@ -119,7 +119,7 @@ mod tests {
             persisted,
             GgmlAsrRuntimeSourcePreflight {
                 runtime_source,
-                metadata,
+                metadata: Arc::new(metadata),
                 tensor_index: Arc::new(tensor_index),
             },
         )
@@ -257,7 +257,7 @@ mod tests {
             persisted,
             GgmlAsrRuntimeSourcePreflight {
                 runtime_source,
-                metadata,
+                metadata: Arc::new(metadata),
                 tensor_index: Arc::new(tensor_index),
             },
         )
@@ -296,7 +296,7 @@ mod tests {
         let (_runtime_path, mut preflight) = write_qwen_preflight();
         let mut values = preflight.metadata.values().clone();
         values.remove("tokenizer.ggml.tokens");
-        preflight.metadata = crate::GgufMetadata::from_values_for_test(values);
+        preflight.metadata = std::sync::Arc::new(crate::GgufMetadata::from_values_for_test(values));
 
         let components = build_builtin_runtime_component_bootstrap(
             crate::QWEN3_ASR_GGML_ARCHITECTURE_ID,

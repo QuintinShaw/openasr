@@ -74,7 +74,7 @@ fn read_runtime_source_preflight(runtime_path: &Path) -> GgmlAsrRuntimeSourcePre
         read_gguf_tensor_index_from_runtime_source(&runtime_source).expect("read tensor index");
     GgmlAsrRuntimeSourcePreflight {
         runtime_source,
-        metadata,
+        metadata: Arc::new(metadata),
         tensor_index: Arc::new(tensor_index),
     }
 }

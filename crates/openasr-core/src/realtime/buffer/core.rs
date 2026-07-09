@@ -67,6 +67,10 @@ pub(super) struct ActiveUtterance {
     utterance_id: TranscriptUtteranceId,
     start_ms: u64,
     frames: Vec<RealtimeAudioFrame>,
+    /// Running total of `frames.iter().map(sample_count).sum()`, maintained
+    /// incrementally so capacity checks on ingest don't need to re-walk (or
+    /// clone) the whole accumulated frame buffer.
+    samples: usize,
 }
 
 impl RealtimeBuffer {
@@ -156,15 +160,21 @@ impl RealtimeBuffer {
     }
 
     fn push_active(&mut self, frame: RealtimeAudioFrame) -> Result<(), RealtimeBufferError> {
-        let mut frames = self
-            .active
-            .as_ref()
-            .map(|active| active.frames.clone())
-            .unwrap_or_default();
-        frames.push(frame.clone());
-        self.ensure_capacity(&frames)?;
+        // Project the post-push frame/sample counts from the running
+        // `samples` tally instead of cloning the accumulated frame buffer
+        // just to size-check it: for a long active utterance that clone
+        // would be O(n) per frame (O(n^2) memcpy over the utterance).
+        let (projected_frame_count, projected_samples) = match self.active.as_ref() {
+            Some(active) => (
+                active.frames.len() + 1,
+                active.samples + frame.sample_count(),
+            ),
+            None => (1, frame.sample_count()),
+        };
+        self.ensure_capacity_counts(projected_frame_count, projected_samples)?;
         if let Some(active) = self.active.as_mut() {
             active.frames.push(frame);
+            active.samples = projected_samples;
         }
         Ok(())
     }
@@ -174,6 +184,21 @@ impl RealtimeBuffer {
         frames: &[RealtimeAudioFrame],
     ) -> Result<(), RealtimeBufferError> {
         if let Err(error) = buffer_helpers::ensure_capacity(self.config, frames) {
+            self.last_overflow = Some(error.clone());
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    fn ensure_capacity_counts(
+        &mut self,
+        frame_count: usize,
+        sample_count: usize,
+    ) -> Result<(), RealtimeBufferError> {
+        if let Err(error) =
+            buffer_helpers::ensure_capacity_counts(self.config, frame_count, sample_count)
+        {
             self.last_overflow = Some(error.clone());
             return Err(error);
         }
@@ -235,11 +260,13 @@ impl RealtimeBuffer {
         let mut frames = self.pre_roll.iter().cloned().collect::<Vec<_>>();
         frames.push(frame);
         self.ensure_capacity(&frames)?;
+        let samples = buffer_helpers::buffered_samples(&frames);
         self.pre_roll.clear();
         self.active = Some(ActiveUtterance {
             utterance_id: utterance_id.clone(),
             start_ms,
             frames,
+            samples,
         });
         Ok(())
     }
