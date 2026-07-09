@@ -167,6 +167,32 @@ pub(crate) struct OpenAsrComponentDescriptor {
     pub id: &'static str,
 }
 
+/// Default `GlobalQuadratic` safe chunk-length ceiling (issue #68) -- the
+/// value every new `GlobalQuadratic` builtin architecture should declare
+/// unless the upstream model publishes a different explicit recommendation.
+/// This is not an arbitrary number: it is where the major encoder families
+/// this repo has surveyed independently converge --
+///
+/// - Whisper's encoder is architecture-fixed at a 30s log-mel window (see
+///   `FixedWindow` below, which needs no cap at all because of this).
+/// - Moonshine's model card recommends audio chunks "less than 30 seconds".
+/// - NVIDIA NeMo/Parakeet's published offline/streaming guidance targets
+///   20-30s chunks for FastConformer encoders.
+/// - FunASR's default VAD max single-segment length is 30000ms.
+/// - Dolphin (WeNet E-Branchformer) is trained and evaluated with audio
+///   padded/truncated to 30s.
+/// - Cohere's own longform reference decoder uses a 30s sliding window.
+///
+/// A new `GlobalQuadratic` architecture should use this default. Only
+/// override `max_safe_chunk_seconds` with a different value when the
+/// upstream model card states an explicit, different recommended chunk
+/// length -- and cite that source in a comment next to the override (see
+/// firered-aed's descriptor entry below, whose upstream guidance --
+/// 60s-warn/200s-error -- is wider than this default; it still uses this
+/// default rather than the wider figure, for RAM margin and cross-family
+/// consistency, and says so in its own comment).
+pub(crate) const DEFAULT_ENCODER_SAFE_CHUNK_SECONDS: f32 = 30.0;
+
 /// How this architecture's encoder attends over time -- the single
 /// declaration of the encoder memory-scaling fact that longform safety caps
 /// consult (see `native_transcribe::apply_encoder_attention_span_longform_safety_policy`).
@@ -185,7 +211,9 @@ pub(crate) enum OpenAsrEncoderAttentionSpan {
     /// grows quadratically with the wall-clock length of that chunk.
     /// `max_safe_chunk_seconds` is the longest chunk this repo has validated
     /// as safe on commodity RAM; longform slicing must never hand this
-    /// architecture a chunk longer than that (issue #68).
+    /// architecture a chunk longer than that (issue #68). Use
+    /// [`DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`] unless the upstream model card
+    /// gives an explicit different recommendation (see that constant's doc).
     GlobalQuadratic { max_safe_chunk_seconds: f32 },
     /// Architecture-fixed attention window (whisper's 30s log-mel frame): the
     /// encoder never attends beyond a fixed span regardless of the requested
@@ -918,10 +946,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             }),
         }),
         // Conformer encoder is full self-attention over the whole chunk:
-        // quadratic in chunk length, same 30s safe ceiling as the other
-        // global-quadratic builtins (issue #68).
+        // quadratic in chunk length, same safe ceiling as the other
+        // global-quadratic builtins (issue #68). Also carries the
+        // `ConservativeSeq2SeqV1` decode-side longform profile (issue #60's
+        // repetition guard); the two caps now agree at the same default, so
+        // composing them (taking the min) is a no-op here.
         encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-            max_safe_chunk_seconds: 30.0,
+            max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -990,7 +1021,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // autoregressive token generation, not chunk-length-scaled encoder
         // attention, so it does not change this classification.
         encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-            max_safe_chunk_seconds: 30.0,
+            max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -1027,7 +1058,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // FastConformer encoder is full self-attention over the whole chunk:
         // quadratic in chunk length (issue #68).
         encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-            max_safe_chunk_seconds: 30.0,
+            max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -1068,7 +1099,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // decoder/joiner is a separate autoregressive stage and does not
         // change the encoder's scaling.
         encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-            max_safe_chunk_seconds: 30.0,
+            max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -1102,7 +1133,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // Post-norm transformer encoder is full self-attention over the
         // whole chunk: quadratic in chunk length (issue #68).
         encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-            max_safe_chunk_seconds: 30.0,
+            max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -1155,11 +1186,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // RoPE conv-stem encoder + cross-attn decoder are not composer blocks).
         block_stack: None,
         // The RoPE encoder is full self-attention over the whole chunk:
-        // quadratic in chunk length (issue #68). Also carries the tighter
-        // `ConservativeSeq2SeqV1` decode-side longform profile (issue #60);
-        // the two caps combine by taking the min.
+        // quadratic in chunk length (issue #68), matching Moonshine's own
+        // model-card guidance to keep chunks under 30 seconds. Also carries
+        // the `ConservativeSeq2SeqV1` decode-side longform profile (issue
+        // #60's repetition guard); the two caps now agree at the same
+        // default, so composing them (taking the min) is a no-op here.
         encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-            max_safe_chunk_seconds: 30.0,
+            max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -1194,7 +1227,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // self-attention over the whole chunk: quadratic in chunk length
         // (issue #68).
         encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-            max_safe_chunk_seconds: 30.0,
+            max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -1230,7 +1263,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // SAN-M/FSMN encoder's self-attention memory block is full attention
         // over the whole chunk: quadratic in chunk length (issue #68).
         encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-            max_safe_chunk_seconds: 30.0,
+            max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
         },
     },
     OpenAsrArchitectureDescriptor {
@@ -1261,11 +1294,17 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // block kind), so no data-driven block-stack descriptor.
         block_stack: None,
         // Conformer encoder is full self-attention over the whole chunk:
-        // quadratic in chunk length (issue #68). Also carries the tighter
-        // `ConservativeSeq2SeqV1` decode-side longform profile (issue #60);
-        // the two caps combine by taking the min.
+        // quadratic in chunk length (issue #68). FireRedASR's own upstream
+        // guidance is wider than the shared default -- it warns past 60s and
+        // errors past 200s -- so `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS` (30s)
+        // is comfortably inside FireRedASR's own safe range; used here for
+        // RAM margin and cross-family consistency rather than the wider
+        // upstream figure. Also carries the `ConservativeSeq2SeqV1`
+        // decode-side longform profile (issue #60's repetition guard, not a
+        // model-accuracy limit); the two caps now agree at the same default,
+        // so composing them (taking the min) is a no-op here.
         encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-            max_safe_chunk_seconds: 30.0,
+            max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
         },
     },
 ];
@@ -1340,15 +1379,16 @@ mod tests {
     /// #68). Whisper's fixed 30s window and zipformer's local/chunked
     /// streaming encoder need no additional cap; every other builtin
     /// architecture's encoder is full self-attention over the whole chunk,
-    /// so all nine are `GlobalQuadratic` with the same validated-safe 30s
-    /// ceiling.
+    /// so all nine are `GlobalQuadratic` at `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`
+    /// (none of the nine has an upstream-recommended value that overrides
+    /// the shared default; see that constant's doc for the survey).
     #[test]
     fn builtin_architectures_declare_encoder_attention_span() {
         let expected: &[(&str, OpenAsrEncoderAttentionSpan)] = &[
             (
                 COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-                    max_safe_chunk_seconds: 30.0,
+                    max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                 },
             ),
             (
@@ -1358,25 +1398,25 @@ mod tests {
             (
                 QWEN3_ASR_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-                    max_safe_chunk_seconds: 30.0,
+                    max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                 },
             ),
             (
                 PARAKEET_CTC_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-                    max_safe_chunk_seconds: 30.0,
+                    max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                 },
             ),
             (
                 PARAKEET_TDT_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-                    max_safe_chunk_seconds: 30.0,
+                    max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                 },
             ),
             (
                 WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-                    max_safe_chunk_seconds: 30.0,
+                    max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                 },
             ),
             (
@@ -1386,25 +1426,25 @@ mod tests {
             (
                 MOONSHINE_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-                    max_safe_chunk_seconds: 30.0,
+                    max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                 },
             ),
             (
                 DOLPHIN_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-                    max_safe_chunk_seconds: 30.0,
+                    max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                 },
             ),
             (
                 SENSEVOICE_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-                    max_safe_chunk_seconds: 30.0,
+                    max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                 },
             ),
             (
                 FIRERED_AED_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-                    max_safe_chunk_seconds: 30.0,
+                    max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                 },
             ),
         ];
