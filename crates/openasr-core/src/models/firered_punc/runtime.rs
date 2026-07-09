@@ -120,4 +120,54 @@ mod tests {
         let out = runtime.punctuate("你好世界").expect("punctuate");
         assert_eq!(out, "你好世界。", "upstream README golden");
     }
+
+    /// Converter golden gate: the engine's per-token argmax labels for the
+    /// converted `.oasr` pack must exactly match the upstream PyTorch forward.
+    /// Both env vars are dev-only (the pack is uncommitted; the JSON is emitted
+    /// by `tmp/firered-punc-src/reference_forward.py`), so the default suite
+    /// skips this -- it is the publish-time parity proof, mirroring the qwen
+    /// forced-aligner reference convention. The JSON is a list of
+    /// `{content_ids: [u32], ref_labels: [usize]}` entries; the same content
+    /// ids are fed to both sides so this isolates the numeric forward from
+    /// tokenization.
+    #[test]
+    fn real_pack_labels_match_pytorch_reference_golden() {
+        let (Some(pack), Some(json)) = (
+            std::env::var_os("OPENASR_FIRERED_PUNC_REAL_PACK"),
+            std::env::var_os("OPENASR_FIRERED_PUNC_GOLDEN_JSON"),
+        ) else {
+            return;
+        };
+        let runtime = FireRedPuncRuntime::from_pack(Path::new(&pack)).expect("load real pack");
+        let text = std::fs::read_to_string(Path::new(&json)).expect("read golden json");
+        let entries: serde_json::Value = serde_json::from_str(&text).expect("parse golden json");
+        let entries = entries.as_array().expect("golden json is a list");
+        let mut checked = 0usize;
+        for entry in entries {
+            let content_ids: Vec<u32> = entry["content_ids"]
+                .as_array()
+                .expect("content_ids array")
+                .iter()
+                .map(|value| value.as_u64().expect("id is u64") as u32)
+                .collect();
+            let ref_labels: Vec<usize> = entry["ref_labels"]
+                .as_array()
+                .expect("ref_labels array")
+                .iter()
+                .map(|value| value.as_u64().expect("label is u64") as usize)
+                .collect();
+            let engine_labels = runtime
+                .predict_window_labels(&content_ids)
+                .expect("engine predict");
+            assert_eq!(
+                engine_labels,
+                ref_labels,
+                "label mismatch for sentence {:?}",
+                entry.get("sentence")
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "golden json had no entries");
+        eprintln!("firered-punc golden: {checked} sentences matched PyTorch reference");
+    }
 }
