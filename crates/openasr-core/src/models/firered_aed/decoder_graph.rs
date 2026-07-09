@@ -90,7 +90,11 @@ pub(crate) fn firered_decoder_graph_config() -> GgmlCpuGraphConfig {
         graph_size: FIRERED_DECODER_GRAPH_SIZE,
         n_threads: None,
         backend: GgmlCpuGraphBackend::Cpu,
-        use_scheduler: false,
+        // See the matching comment in encoder_graph.rs: the CPU-backend
+        // gallocr scheduler reuses tensor buffer space by lifetime instead of
+        // allocating every non-view tensor independently, cutting memory
+        // without changing the graph's computed output (#68).
+        use_scheduler: true,
     }
 }
 
@@ -288,6 +292,13 @@ impl FireRedDecoderGraphRuntime {
         graph
             .set_output(output_root)
             .map_err(|source| map_err("cross_cache_set_output", source))?;
+        // Allocate the cross-KV precompute graph (side-effect cpy writes plus the
+        // output root) through the scheduler's gallocr for liveness-based buffer
+        // reuse before uploading the encoder rows -- same ordering as the encoder
+        // forward and the sibling cohere/moonshine decoders.
+        graph
+            .prepare_outputs_for_upload(&[output_root])
+            .map_err(|source| map_err("cross_cache_prepare_outputs", source))?;
         graph
             .set_f32_slice(encoder_tensor, encoder_rows, "firered_dec_encoder_rows")
             .map_err(|source| map_err("encoder_rows_upload", source))?;
@@ -397,6 +408,14 @@ impl FireRedDecoderGraphRuntime {
             .map_err(|source| map_err("embed_add_pos", source))?;
 
         let zero_bias_tensor = self.arena.graph_tensor(self.zero_bias);
+        // Deferred input uploads (mirrors cohere's decoder): every graph-input
+        // write is queued and applied AFTER `prepare_outputs_for_upload`, so no
+        // upload triggers an independent backend-buffer allocation mid-build and
+        // the scheduler's gallocr owns the whole graph's tensor allocation. For
+        // firered this queue always stays empty (the shared top-level causal mask
+        // means `seq2seq_layer` never emits a per-layer `deferred_self_mask`), but
+        // queuing keeps the ordering invariant robust and matches the sibling.
+        let mut deferred_self_masks = Vec::new();
         for (layer, (cross, self_kv)) in self
             .weights
             .layers
@@ -460,10 +479,8 @@ impl FireRedDecoderGraphRuntime {
                 cross_kv_handle,
                 map_err,
             )?;
-            if let Some((mask_tensor, bits)) = block.deferred_self_mask {
-                graph
-                    .set_f16_bits_slice(mask_tensor, &bits, "firered_dec_layer_self_mask")
-                    .map_err(|source| map_err("layer_self_mask_upload", source))?;
+            if let Some(deferred) = block.deferred_self_mask {
+                deferred_self_masks.push(deferred);
             }
             state = block.output;
         }
@@ -488,6 +505,14 @@ impl FireRedDecoderGraphRuntime {
         graph
             .set_output(logits)
             .map_err(|source| map_err("set_output", source))?;
+        // Allocate the decode graph through the scheduler's gallocr for
+        // liveness-based buffer reuse before uploading inputs (mirrors the
+        // cohere/moonshine decoders); the queued uploads below then write into the
+        // already-allocated input tensors instead of forcing an independent
+        // allocation.
+        graph
+            .prepare_outputs_for_upload(&[logits])
+            .map_err(|source| map_err("prepare_outputs", source))?;
 
         graph
             .set_i32_slice(token_ids_tensor, &token_ids_i32, "firered_dec_tokens")
@@ -504,6 +529,11 @@ impl FireRedDecoderGraphRuntime {
             graph
                 .set_f16_bits_slice(mask, &bits, "firered_dec_self_mask")
                 .map_err(|source| map_err("self_mask_upload", source))?;
+        }
+        for (mask_tensor, bits) in deferred_self_masks {
+            graph
+                .set_f16_bits_slice(mask_tensor, &bits, "firered_dec_layer_self_mask")
+                .map_err(|source| map_err("layer_self_mask_upload", source))?;
         }
 
         let output = graph
