@@ -538,7 +538,7 @@ mod tests {
             persisted,
             GgmlAsrRuntimeSourcePreflight {
                 runtime_source,
-                metadata,
+                metadata: Arc::new(metadata),
                 tensor_index: Arc::new(tensor_index),
             },
         )
@@ -581,7 +581,7 @@ mod tests {
             .expect("read gguf tensor index");
         let preflight = GgmlAsrRuntimeSourcePreflight {
             runtime_source,
-            metadata,
+            metadata: Arc::new(metadata),
             tensor_index: Arc::new(tensor_index),
         };
         let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("tensor reader");
@@ -614,7 +614,7 @@ mod tests {
             .expect("read gguf tensor index");
         let preflight = GgmlAsrRuntimeSourcePreflight {
             runtime_source,
-            metadata,
+            metadata: Arc::new(metadata),
             tensor_index: Arc::new(tensor_index),
         };
         let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("tensor reader");
@@ -647,7 +647,7 @@ mod tests {
             .expect("read gguf tensor index");
         let preflight = GgmlAsrRuntimeSourcePreflight {
             runtime_source,
-            metadata,
+            metadata: Arc::new(metadata),
             tensor_index: Arc::new(tensor_index),
         };
         let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("tensor reader");
