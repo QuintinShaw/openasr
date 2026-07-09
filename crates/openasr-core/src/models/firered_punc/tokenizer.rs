@@ -262,7 +262,12 @@ fn is_unicode_punctuation(c: char) -> bool {
 /// BERT `_is_chinese_char`: the CJK Unified Ideograph blocks. Note this is the
 /// upstream definition -- it deliberately excludes CJK punctuation/kana, which
 /// are handled as punctuation/other words.
-fn is_cjk_char(c: char) -> bool {
+///
+/// `pub(crate)`: also the definition `crate::punctuation` uses to gate the
+/// restoration stage per segment (this classifier's vocab and training data
+/// are Chinese-only, so a segment with no Han ideograph is not something it
+/// can honestly punctuate -- see that module's `restore_punctuation`).
+pub(crate) fn is_cjk_char(c: char) -> bool {
     let cp = c as u32;
     (0x4E00..=0x9FFF).contains(&cp)
         || (0x3400..=0x4DBF).contains(&cp)
