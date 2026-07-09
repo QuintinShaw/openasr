@@ -107,7 +107,13 @@ pub(crate) fn firered_encoder_graph_config() -> GgmlCpuGraphConfig {
         graph_size: FIRERED_ENCODER_GRAPH_SIZE,
         n_threads: None,
         backend: GgmlCpuGraphBackend::Cpu,
-        use_scheduler: false,
+        // ggml's gallocr scheduler reuses buffer space across tensors whose
+        // lifetimes don't overlap instead of giving every non-view tensor its
+        // own allocation (`ggml_backend_alloc_ctx_tensors`); on the CPU
+        // backend both allocators produce identical results, so this only
+        // changes memory footprint, never the encoder's output (see #68: a
+        // single 30s slice requested ~12.5 GiB without the scheduler).
+        use_scheduler: true,
     }
 }
 
@@ -327,6 +333,15 @@ fn encode_firered_aed_audio_embeddings(
     graph
         .set_output(state)
         .map_err(|source| map_err("ggml_set_output(encoder)", source))?;
+    // Peak-RSS lever (mirrors the cohere/moonshine encoder path): allocate the
+    // forward graph through the scheduler's gallocr (liveness-based buffer
+    // REUSE) BEFORE uploading inputs, collapsing the per-conformer-layer
+    // intermediate accumulation to the working-set peak instead of giving every
+    // non-view tensor its own allocation. The three inputs below are marked
+    // `set_input`, so gallocr keeps them live across the whole graph.
+    graph
+        .prepare_outputs_for_upload(&[state])
+        .map_err(|source| map_err("ggml_prepare_outputs(encoder)", source))?;
     graph
         .set_f32_slice(mel, &padded, "firered_enc_mel")
         .map_err(|source| map_err("ggml_set_f32_slice(mel)", source))?;
