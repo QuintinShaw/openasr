@@ -259,9 +259,19 @@ Key constraints:
 - `serve --backend native` runs a local `.oasr`: pass `--model-pack <local.oasr>`,
   or omit it to use an already-installed pack resolved by `--model` id (a missing
   pack fails closed -- transcription never triggers a download). A supplied
-  `--model` must match the pack's runtime model id.
-- `stream=true` is SSE and rejects `response_format=srt|vtt`; use the
-  non-streaming endpoint for subtitle files.
+  `--model` must name the same pack (quant-tag tolerant: `whisper-tiny:q8`
+  matches a bare `whisper-tiny` runtime id).
+- OpenAI SDKs work out of the box for non-streaming calls
+  (`base_url="http://127.0.0.1:8080/v1"`, any placeholder `api_key`); errors
+  use the OpenAI envelope, and `verbose_json` includes `duration`, segment
+  `id`s, and a top-level `words` array when word timestamps are requested.
+  OpenAI parameters with no local equivalent (`temperature`, `include[]`,
+  `chunking_strategy`, `known_speaker_*`) are accepted and ignored.
+- `?stream=true` (query parameter) is SSE with OpenASR realtime events -- not
+  OpenAI `transcript.text.*` events, so OpenAI SDK `stream=True` (the `stream`
+  form field) is rejected with an explicit 400 instead of hanging the client.
+  Streaming rejects `response_format=srt|vtt`; use the non-streaming endpoint
+  for subtitle files.
 - Longform fields (`segment_mode`, `chunk_seconds`, `segment_overlap_seconds`,
   `vad_*`, `min_segment_seconds`, `suppress_silent_slices`) are native-only;
   default is `segment_mode=auto`.

@@ -478,13 +478,21 @@ pub(super) async fn serve(
         && let Some(model_pack_path) = model_source.model_pack_path.as_deref()
     {
         let local_model_id = resolve_native_runtime_model_id_from_source(model_pack_path)?;
+        // Tolerant matching, not string equality: `model_source.model_id` is the
+        // catalog-resolved ref (e.g. `whisper-tiny:q8_0`) while the pack's
+        // runtime id is bare (`whisper-tiny`), so equality would reject every
+        // catalog-installed pack the daemon is about to serve.
         if let Some(model_ref) = model
-            && model_source.model_id != local_model_id
+            && !openasr_core::native_runtime_model_refs_match(
+                &model_source.model_id,
+                &local_model_id,
+            )
         {
             bail!(
-                "Native GGUF local-source serve mode requires --model to match local source id '{}', got '{}'.\nUse --model {} or omit --model.",
+                "Native GGUF local-source serve mode requires --model to match local source id '{}', got '{}' (resolved '{}').\nUse --model {} or omit --model.",
                 local_model_id,
                 model_ref,
+                model_source.model_id,
                 local_model_id
             );
         }
