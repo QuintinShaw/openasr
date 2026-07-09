@@ -63,7 +63,10 @@ impl TestOnlyNativeStreamingSession {
             return Ok(Vec::new());
         }
         let mut events = self.drain_pending_events();
-        let finalized = self.emitter.finalize_pending_output_at(test_time(89))?;
+        let finalized = match self.emitter.take_pending_partial_update() {
+            Some(update) => self.emitter.apply_final(update, test_time(89))?,
+            None => Vec::new(),
+        };
         if !finalized.is_empty() {
             self.utterance_index += 1;
         }

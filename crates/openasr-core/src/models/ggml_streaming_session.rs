@@ -280,6 +280,40 @@ where
         (self.clock)()
     }
 
+    /// FINAL-only punctuation stage: a segment's text is punctuated exactly
+    /// once, at the moment it stops being revised. Fail-closed per segment --
+    /// a classifier error keeps the driver's original text.
+    ///
+    /// INVARIANT: every update that can surface as a visible FINAL passes
+    /// through here first. There are exactly two producers of finals in this
+    /// session -- driver-emitted finals ([`Self::emit_update`]'s `Final`
+    /// branch) and the session-promoted pending tail partial
+    /// ([`Self::finalize_pending_output`]) -- and both call this before
+    /// `apply_final`. Never call `emitter.apply_final` or
+    /// `emitter.finalize_pending_output_at` from anywhere else in this
+    /// session, or a final can bypass the stage.
+    fn punctuate_final_update(&self, update: &mut TranscriptUpdate) {
+        if let Some(punctuate) = &self.final_punctuator
+            && let Ok(punctuated) = punctuate(&update.text)
+        {
+            update.text = punctuated;
+        }
+    }
+
+    /// Promotes the emitter's pending tail partial (if any) into a FINAL,
+    /// running the punctuation stage on it exactly like a driver-emitted
+    /// final. A driver that only ever emits partials (relying on the session
+    /// to finalize the tail on flush/finalize/finish) therefore cannot leak
+    /// an unpunctuated final.
+    fn finalize_pending_output(&mut self) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
+        let finalized_at = self.now();
+        let Some(mut update) = self.emitter.take_pending_partial_update() else {
+            return Ok(Vec::new());
+        };
+        self.punctuate_final_update(&mut update);
+        self.emitter.apply_final(update, finalized_at)
+    }
+
     fn emit_update(
         &mut self,
         update: GgmlAsrStreamingTranscriptUpdate,
@@ -290,15 +324,7 @@ where
                 self.emitter.apply_partial(update, created_at)
             }
             GgmlAsrStreamingTranscriptUpdate::Final(mut update) => {
-                // FINAL-only punctuation stage: a segment's text is
-                // punctuated exactly once, at the moment it stops being
-                // revised. Fail-closed per segment -- a classifier error
-                // keeps the driver's original text.
-                if let Some(punctuate) = &self.final_punctuator
-                    && let Ok(punctuated) = punctuate(&update.text)
-                {
-                    update.text = punctuated;
-                }
+                self.punctuate_final_update(&mut update);
                 self.emitter.apply_final(update, created_at)
             }
         }
@@ -347,8 +373,7 @@ where
             .flush_updates()
             .map_err(|error| self.driver_error_to_native(error))?;
         let mut events = self.emit_updates(updates)?;
-        let finalized_at = self.now();
-        let finalized = self.emitter.finalize_pending_output_at(finalized_at)?;
+        let finalized = self.finalize_pending_output()?;
         self.emitter
             .ensure_output_capacity(events.len() + finalized.len())?;
         events.extend(finalized);
@@ -414,8 +439,7 @@ where
             .finish_updates()
             .map_err(|error| self.driver_error_to_native(error))?;
         let mut events = self.emit_updates(updates)?;
-        let finalized_at = self.now();
-        let finalized = self.emitter.finalize_pending_output_at(finalized_at)?;
+        let finalized = self.finalize_pending_output()?;
         self.emitter
             .ensure_output_capacity(events.len() + finalized.len())?;
         events.extend(finalized);
@@ -454,8 +478,7 @@ where
             return self.emit_updates(Vec::new());
         }
         let mut events = self.emit_updates(updates)?;
-        let finalized_at = self.now();
-        let finalized = self.emitter.finalize_pending_output_at(finalized_at)?;
+        let finalized = self.finalize_pending_output()?;
         self.emitter
             .ensure_output_capacity(events.len() + finalized.len())?;
         events.extend(finalized);
@@ -476,8 +499,7 @@ where
             .finish_updates()
             .map_err(|error| self.driver_error_to_native(error))?;
         let mut events = self.emit_updates(updates)?;
-        let finalized_at = self.now();
-        let finalized = self.emitter.finalize_pending_output_at(finalized_at)?;
+        let finalized = self.finalize_pending_output()?;
         self.emitter
             .ensure_output_capacity(events.len() + finalized.len())?;
         events.extend(finalized);
@@ -914,6 +936,65 @@ mod tests {
         let final_event = session.push_audio(test_frame(1, 0)).unwrap();
         assert_event_types(&final_event, &["transcript.final"]);
         assert_transcript_text(&final_event[0], "你好世界", 1);
+    }
+
+    #[test]
+    fn promoted_pending_partial_is_punctuated_on_flush() {
+        // A driver that only ever emits partials relies on the session to
+        // promote the pending tail into a FINAL on flush/finalize/finish
+        // (`finalize_pending_output`); that promotion path never goes through
+        // `emit_update`'s Final branch, so it must run the punctuation stage
+        // itself -- this is the seam the ScriptStep::Final-based tests above
+        // do not cover.
+        let request = request(false);
+        let driver = ScriptDriver::new([ScriptStep::Partial {
+            revision: 1,
+            text: "你好世界",
+        }]);
+        let mut session = GgmlAsrStreamingTranscriptSession::new_with_clock_and_punctuator(
+            "script-streaming-executor",
+            &request,
+            driver,
+            test_clock(),
+            Some(Box::new(|text: &str| Ok(format!("{text}。")))),
+        )
+        .unwrap();
+        let _ = session.poll_events().unwrap();
+
+        assert!(session.push_audio(test_frame(1, 0)).unwrap().is_empty());
+        let flushed = session.flush().unwrap();
+
+        assert_event_types(&flushed, &["transcript.final"]);
+        assert_transcript_text(&flushed[0], "你好世界。", 1);
+    }
+
+    #[test]
+    fn promoted_pending_partial_is_punctuated_on_finalize_utterance() {
+        // Same promotion seam via finalize_utterance with visible partials:
+        // the emitted partial must stay untouched, and the tail promoted at
+        // the utterance boundary must be punctuated.
+        let request = request(true);
+        let driver = ScriptDriver::new([ScriptStep::Partial {
+            revision: 1,
+            text: "你好世界",
+        }]);
+        let mut session = GgmlAsrStreamingTranscriptSession::new_with_clock_and_punctuator(
+            "script-streaming-executor",
+            &request,
+            driver,
+            test_clock(),
+            Some(Box::new(|text: &str| Ok(format!("{text}。")))),
+        )
+        .unwrap();
+        let _ = session.poll_events().unwrap();
+
+        let partial = session.push_audio(test_frame(1, 0)).unwrap();
+        assert_event_types(&partial, &["transcript.partial"]);
+        assert_transcript_text(&partial[0], "你好世界", 1);
+
+        let finalized = session.finalize_utterance().unwrap();
+        assert_event_types(&finalized, &["transcript.final", "audio.input.started"]);
+        assert_transcript_text(&finalized[0], "你好世界。", 1);
     }
 
     #[test]
