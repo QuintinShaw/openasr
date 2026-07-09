@@ -195,6 +195,9 @@ fn dolphin_encoder_parity() {
         &features,
         frames_in,
         GgmlCpuGraphBackend::Cpu,
+        // This harness reads `after_subsample` + every per-block tap below, so
+        // it must opt in (see `encode`'s doc comment, P6).
+        true,
     )
     .expect("encode");
 
