@@ -684,6 +684,41 @@ pub struct ResolvedCatalogPull {
     pub license_class: LicenseClass,
 }
 
+impl ResolvedCatalogPull {
+    /// Build a `ResolvedCatalogPull` from a matched `(model, quant)` pair.
+    /// `requested` is the only field that isn't derived from `model`/`quant`
+    /// -- callers resolving a user-typed reference pass that reference
+    /// through verbatim; callers matching by some other identity (e.g. a
+    /// local file's sha256/size digest) pass `quant.pull.clone()` so
+    /// `requested` still reads as a valid pull spec. Shared by
+    /// [`resolve_catalog_pull`] and [`crate::pull::resolve_catalog_pull_by_file_digest`]
+    /// so the 12 fields mapped straight from `model`/`quant` can't drift
+    /// between the two call sites.
+    pub fn from_model_and_quant(
+        model: &CatalogModel,
+        quant: &CatalogQuant,
+        requested: String,
+    ) -> Self {
+        Self {
+            requested,
+            model_id: model.id.clone(),
+            display_name: model.display_name.clone(),
+            quant: quant.quant.clone(),
+            suffix: quant.suffix.clone(),
+            pull: quant.pull.clone(),
+            filename: quant.filename.clone(),
+            url: quant.url.clone(),
+            mirrors: quant.mirrors.clone(),
+            hf_revision: model.hf_revision.clone(),
+            sha256: quant.sha256.clone(),
+            size_bytes: quant.size_bytes,
+            license: model.license.clone(),
+            license_url: model.license_url.clone(),
+            license_class: model.license_class.clone(),
+        }
+    }
+}
+
 /// A resolved backend-pack pull: the pack identity plus the files to download
 /// into `OPENASR_HOME/backends/<vendor>/<version>/`. The download orchestration
 /// fetches each file (sha256-verified, then [`crate::pull::preflight_backend_file`]),
@@ -1164,23 +1199,11 @@ pub fn resolve_catalog_pull_with_profile(
         (explicit, _) => resolve_catalog_quant(model, explicit)?,
     };
 
-    Ok(ResolvedCatalogPull {
-        requested: requested.to_string(),
-        model_id: model.id.clone(),
-        display_name: model.display_name.clone(),
-        quant: quant.quant.clone(),
-        suffix: quant.suffix.clone(),
-        pull: quant.pull.clone(),
-        filename: quant.filename.clone(),
-        url: quant.url.clone(),
-        mirrors: quant.mirrors.clone(),
-        hf_revision: model.hf_revision.clone(),
-        sha256: quant.sha256.clone(),
-        size_bytes: quant.size_bytes,
-        license: model.license.clone(),
-        license_url: model.license_url.clone(),
-        license_class: model.license_class.clone(),
-    })
+    Ok(ResolvedCatalogPull::from_model_and_quant(
+        model,
+        quant,
+        requested.to_string(),
+    ))
 }
 
 pub fn load_registry(path: impl AsRef<Path>) -> Result<Vec<ModelCard>, RegistryError> {
