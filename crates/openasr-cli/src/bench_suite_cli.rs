@@ -209,7 +209,11 @@ fn run_entry(
             .with_model_pack_path(Some(validated_pack.clone()))
             .with_language(entry.language.clone())
             .with_task(entry.task)
-            .with_execution_target(bench_execution_target());
+            .with_execution_target(bench_execution_target())
+            // The perf suite measures ASR decode RTF/RSS; an optional
+            // post-process stage running when a FireRedPunc pack happens to be
+            // installed would skew both, so it stays off for every entry.
+            .with_punctuation(false);
         configure_native_cpu_inference_threads();
         let started = Instant::now();
         let transcription = transcribe_with_backend(BackendKind::Native, request)?;
