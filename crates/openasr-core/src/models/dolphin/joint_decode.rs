@@ -20,7 +20,9 @@ use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
 };
 
-use super::decoder_graph::{DolphinDecoderConfig, DolphinDecoderError, decode_prompt_logits};
+use super::decoder_graph::{
+    DolphinDecoderConfig, DolphinDecoderError, DolphinDecoderRescoreRuntime,
+};
 use super::encoder_graph::DolphinWeightProvider;
 use crate::models::spm_decoder::{SpmDecoderConfig, decode_spm_pieces};
 
@@ -457,18 +459,19 @@ fn attention_rescore(
     let vocab = decoder_config.vocab_size;
     let eos = decode_config.eos_token_id as usize;
 
+    // Build-once/run-many (P5): every hypothesis below teacher-forces the same
+    // decoder weights over the same encoder_out, differing only in the token
+    // sequence, so the ~200 decoder weight tensors + the encoder memory are
+    // loaded into the runtime's persistent arena exactly once here rather than
+    // rebuilt and re-uploaded per hypothesis (up to DOLPHIN_BEAM_SIZE times).
+    let mut runtime =
+        DolphinDecoderRescoreRuntime::new(decoder_config, provider, encoder_out, frames, backend)?;
+
     let mut scored = Vec::with_capacity(nbest.len());
     for (tokens, ctc_score) in nbest {
         let attention_score = if tokens.is_empty() {
             // Empty hypothesis: score is just log P(eos | prompt).
-            let logits = decode_prompt_logits(
-                decoder_config,
-                provider,
-                encoder_out,
-                frames,
-                prompt,
-                backend,
-            )?;
+            let logits = runtime.decode_prompt_logits(prompt)?;
             let mut row = logits.last_token_logits().to_vec();
             log_softmax_in_place(&mut row);
             row[eos]
@@ -476,14 +479,7 @@ fn attention_rescore(
             let mut sequence = Vec::with_capacity(prompt_len + tokens.len());
             sequence.extend_from_slice(prompt);
             sequence.extend_from_slice(tokens);
-            let logits = decode_prompt_logits(
-                decoder_config,
-                provider,
-                encoder_out,
-                frames,
-                &sequence,
-                backend,
-            )?;
+            let logits = runtime.decode_prompt_logits(&sequence)?;
             score_hypothesis(&logits.logits, vocab, prompt_len, tokens, eos)
         };
         let combined = attention_score + decode_config.ctc_weight * *ctc_score;

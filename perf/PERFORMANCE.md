@@ -73,33 +73,45 @@ reproduce the golden transcript exactly (CER 0.0000):
 
 | Backend | Weight reuse | RTF | Peak RSS |
 | --- | --- | ---: | ---: |
-| CPU | cold (reload/dequant each request) | 0.89 | ~3.7 GB |
-| CPU | warm (pooled weights) | **0.72** | ~3.7 GB |
-| Metal | cold | 0.67 | ~3.4 GB |
-| Metal | warm (pooled weights) | **0.48** | ~3.4 GB |
+| CPU | cold (reload/dequant each request) | 0.34 | ~1.88 GB |
+| CPU | warm (pooled weights) | **0.29** | ~1.88 GB |
+| Metal | cold | 0.32 | ~1.78 GB |
+| Metal | warm (pooled weights) | **0.29** | ~1.78 GB |
 
-(CPU warm 0.72 / Metal warm 0.48 reproduced through the real `bench-suite`
-dispatch: CPU default RTF 0.72, `OPENASR_GGML_BACKEND=metal` RTF 0.48.)
+**Re-measured post-#P5/#P6** (attention-rescoring build-once/run-many decoder
+weights + gated encoder taps; release, best-of-5, same clip/host as above). The
+previous rows in this table (CPU 0.89/0.72, Metal 0.67/0.48, ~3.4-3.7 GB) predate
+both fixes: every one of the CTC n-best's `DOLPHIN_BEAM_SIZE=10` rescoring calls
+used to rebuild the whole decoder graph and re-upload all ~200 decoder weight
+tensors from scratch, and the encoder unconditionally materialized every
+per-block hidden state as an extra f32 graph output. Removing that per-hypothesis
+rebuild/re-upload (P5) plus gating the encoder's per-block taps off in production
+(P6) cuts RTF by roughly half-to-2/3 and peak RSS by close to 2x across every
+cell, dominating the older cross-request `DOLPHIN_WEIGHTS_POOL` reuse effect below.
 
-Two findings, both measured (not assumed):
+Findings, both measured (not assumed):
 
-1. **Reuse helps.** The executor pools the ~1.5 GB dequantized f32 weights per pack
-   (`DOLPHIN_WEIGHTS_POOL`), so the ~0.6 s reload+dequant is paid once and later
-   requests are compute-only — visible as the baseline's `load_ms` vs `compute_ms`
-   split. Peak RSS is unchanged (the weights stay resident either way).
-2. **Metal WINS here — the opposite of xasr.** xasr's chunked encoder loses on
-   Metal (per-chunk graph too small to amortize GPU dispatch), so it pins CPU. This
-   0.4B E-Branchformer runs a wide full-utterance encoder + 10-way attention
-   rescoring per step, wide enough that Metal is ~1.45x faster at slightly lower
-   peak RSS.
+1. **Reuse still helps, but far less than before.** The executor still pools the
+   dequantized f32 weights per pack (`DOLPHIN_WEIGHTS_POOL`) across *requests*,
+   so cold vs warm still shows a small gap (0.34 -> 0.29 CPU, 0.32 -> 0.29 Metal).
+   That gap used to be much larger because the old per-hypothesis decoder rebuild
+   dwarfed the one-time pack-load cost it was hiding; now that the rescore loop
+   itself is build-once/run-many, cross-request reuse is a minor tail rather than
+   the dominant lever.
+2. **CPU and Metal are now close, not a clear Metal win.** The previous "Metal
+   WINS here" conclusion was measured when the decoder rebuilt its whole graph
+   (weights included) 10x per utterance -- wide enough per rebuild to amortize
+   GPU dispatch. With the rebuild/re-upload gone, the two backends land within
+   noise of each other on this clip (warm RTF 0.29 both). Re-validate on a longer
+   clip before leaning on a backend recommendation from this table alone.
 
 **Default = CPU** anyway: the parity gate is CPU bit-exact and Metal's fp16
 numerics are not golden-validated (identical transcript on this clip is evidence,
-not a guarantee across GPUs/audio). Metal is the recommended **opt-in** via
+not a guarantee across GPUs/audio). Metal remains an **opt-in** via
 `--execution-target accelerated` / `OPENASR_GGML_BACKEND=metal`; the executor
 fail-closes to CPU on the Auto default and engages Metal only on an explicit
-accelerated request (mirrors the xasr policy, opposite perf conclusion). Harness:
-the `dolphin_perf_ab` ignored test (`OPENASR_DOLPHIN_AB_BACKEND`/`_REUSE`/`_RUNS`).
+accelerated request. Harness: the `dolphin_perf_ab` ignored test
+(`OPENASR_DOLPHIN_AB_BACKEND`/`_REUSE`/`_RUNS`).
 
 ## Caveats
 

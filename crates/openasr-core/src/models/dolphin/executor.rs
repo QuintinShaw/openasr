@@ -177,7 +177,10 @@ pub(crate) fn encode_dolphin_encoder_from_pack(
     let weights = load_dolphin_encoder_weights_from_pack(reader)
         .map_err(|error| format!("dolphin encoder weight load failed: {error}"))?;
     let config = DolphinEncoderConfig::small_cn();
-    encode(&config, &weights, features, frames_in, backend)
+    // Every caller of this pack-from-disk entry point (the production pipeline
+    // plus the fp16/quant-rung regression test) only reads `encoder_out`, so
+    // taps stay off here (P6): see `encode`'s doc comment.
+    encode(&config, &weights, features, frames_in, backend, false)
         .map_err(|error| format!("dolphin encoder graph failed: {error}"))
 }
 
@@ -439,12 +442,16 @@ pub(crate) fn run_dolphin_pipeline(
     // `DolphinEncoderConfig`'s doc comment).
     let encoder_config =
         DolphinEncoderConfig::from_execution_metadata(&execution_metadata, language_scheme);
+    // Production transcription only ever reads `encoder.encoder_out` below;
+    // `after_subsample`/per-block taps exist solely for `#[cfg(test)]` parity,
+    // so they stay off here (P6: see `encoder_graph::encode`'s doc comment).
     let encoder = encode(
         &encoder_config,
         weights,
         &features.data,
         features.n_frames,
         backend,
+        false,
     )
     .map_err(|error| format!("dolphin encoder graph failed: {error}"))?;
 
