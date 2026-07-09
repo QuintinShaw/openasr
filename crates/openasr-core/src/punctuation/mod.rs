@@ -23,10 +23,6 @@
 //! orchestration is fully unit-testable without model weights; the ggml
 //! FireRedPunc runtime implements the trait.
 
-// The runtime trait impl and the finalize-path caller land in following stages;
-// allow the not-yet-wired surface until then.
-#![allow(dead_code)]
-
 use crate::models::firered_punc::config::punctuation_for_label;
 use crate::models::firered_punc::tokenizer::{FireRedPuncTokenizer, WordPiecePiece};
 
