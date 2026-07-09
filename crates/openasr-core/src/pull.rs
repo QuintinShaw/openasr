@@ -1,7 +1,13 @@
 use std::{
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,6 +36,39 @@ const HTTP_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_LOW_SPEED_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_LOW_SPEED_MIN_BYTES: u64 = 64 * 1024;
 const DOWNLOAD_USER_AGENT: &str = concat!("OpenASR/", env!("CARGO_PKG_VERSION"));
+/// Fixed segment size for concurrent chunked downloads. 64 MiB amortizes
+/// per-segment overhead (redirect resolution, TLS/connection setup) over a
+/// large body while still giving the default connection count real
+/// parallelism on typical multi-hundred-MB to multi-GB model packs (e.g. a
+/// 300 MB pack still splits into 5 segments at 4 connections). This is a
+/// fixed build-time constant, not an env knob: resumable segment bitmaps
+/// (`SegmentedPartialMeta`) are keyed on it, so changing it is a format
+/// change, not a runtime tuning parameter (see `PARALLEL_META_FORMAT`).
+const DOWNLOAD_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+/// Default number of concurrent Range connections for chunked downloads.
+const DEFAULT_PULL_CONNECTIONS: usize = 4;
+/// Hard upper clamp on `OPENASR_PULL_CONNECTIONS` so a misconfigured
+/// environment can't open an unbounded number of sockets against a download
+/// source.
+const MAX_PULL_CONNECTIONS: usize = 8;
+/// Environment override for the concurrent chunked-download connection
+/// count; clamped to `[1, MAX_PULL_CONNECTIONS]`. Setting it to `1` disables
+/// concurrent chunking entirely (the single-stream path is always used when
+/// `connections <= 1`), which doubles as the escape hatch for a source that
+/// misbehaves under concurrent Range requests.
+const PULL_CONNECTIONS_ENV_VAR: &str = "OPENASR_PULL_CONNECTIONS";
+/// Bounded per-segment retry attempts before the whole chunked attempt fails
+/// and control returns to the outer `download_with_retries` retry loop
+/// (which retries the whole attempt, resuming from the on-disk segment
+/// bitmap). Deliberately smaller than `DOWNLOAD_MAX_RETRIES`: a segment this
+/// persistently broken likely reflects a source-wide problem the outer loop
+/// is already positioned to retry or fall back away from.
+const SEGMENT_MAX_RETRIES: usize = 3;
+/// Discriminator stamped into the segmented-download partial-meta file so a
+/// resume never misreads a legacy (pre-chunking) `PartialMeta` -- or a future
+/// incompatible format -- as a valid segment bitmap. Bumping the segment size
+/// or the bitmap's shape must also bump this string.
+const PARALLEL_META_FORMAT: &str = "segmented-v1";
 const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
 const MAX_GGUF_METADATA_ENTRIES: u64 = 100_000;
 const MAX_GGUF_TENSORS: u64 = 1_000_000;
@@ -171,6 +210,24 @@ pub enum PullError {
         expected: String,
         actual: String,
     },
+    #[error(
+        "Concurrent chunk fetch for '{url}' returned a different ETag than the first segment; the download was restarted"
+    )]
+    EtagChanged { url: String },
+    #[error(
+        "Downloaded segment [{start}-{end}] size mismatch for '{path}': expected {expected} bytes, got {actual}"
+    )]
+    SegmentSizeMismatch {
+        path: PathBuf,
+        start: u64,
+        end: u64,
+        expected: u64,
+        actual: u64,
+    },
+    #[error(
+        "Concurrent chunk fetch for '{url}' returned a Content-Range starting at a different offset than requested"
+    )]
+    SegmentRangeMismatch { url: String },
     #[error("Downloaded pack failed Rust-only GGUF preflight for '{path}': {reason}")]
     GgufPreflight { path: PathBuf, reason: String },
     #[error("Downloaded backend file failed binary preflight for '{path}': {reason}")]
@@ -220,6 +277,13 @@ struct PullPaths {
     final_path: PathBuf,
     partial_path: PathBuf,
     partial_meta_path: PathBuf,
+    /// Segment-completion bitmap for the chunked-download path. Deliberately
+    /// a separate file from `partial_meta_path` (rather than a new variant
+    /// of the same file) so the existing single-stream `PartialMeta` format
+    /// and its resume logic are untouched by this feature: a resume only
+    /// ever reads the meta file matching the mode it is about to use, and
+    /// `cleanup_partial` removes both unconditionally.
+    partial_segments_meta_path: PathBuf,
     installed_meta_path: PathBuf,
     lock_path: PathBuf,
 }
@@ -229,6 +293,12 @@ struct PullOptions {
     available_space_override: Option<u64>,
     low_speed_timeout: Duration,
     low_speed_min_bytes: u64,
+    /// Test-only override for `DOWNLOAD_SEGMENT_BYTES`, so unit tests can
+    /// exercise multi-segment concurrent download logic (splitting, resume
+    /// bitmap, ETag invalidation, ...) against small in-memory fixtures
+    /// instead of needing real multi-hundred-MB bodies. `None` in
+    /// production, always -- the real segment size is the fixed constant.
+    parallel_segment_bytes_override: Option<u64>,
 }
 
 impl PullOptions {
@@ -237,12 +307,43 @@ impl PullOptions {
             available_space_override: None,
             low_speed_timeout: DOWNLOAD_LOW_SPEED_TIMEOUT,
             low_speed_min_bytes: DOWNLOAD_LOW_SPEED_MIN_BYTES,
+            parallel_segment_bytes_override: None,
+        }
+    }
+}
+
+/// An HTTP byte-range request bound: open-ended (`bytes=start-`) when `end`
+/// is `None` -- used by the single-stream resume path exactly as before --
+/// or the inclusive `bytes=start-end` window a concurrent chunk fetch asks
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ByteRange {
+    start: u64,
+    end: Option<u64>,
+}
+
+impl ByteRange {
+    fn from_start(start: u64) -> Self {
+        Self { start, end: None }
+    }
+
+    fn bounded(start: u64, end_inclusive: u64) -> Self {
+        Self {
+            start,
+            end: Some(end_inclusive),
+        }
+    }
+
+    fn header_value(self) -> String {
+        match self.end {
+            Some(end) => format!("bytes={}-{end}", self.start),
+            None => format!("bytes={}-", self.start),
         }
     }
 }
 
 trait DownloadClient {
-    fn open(&mut self, url: &str, range_start: Option<u64>) -> Result<DownloadResponse, PullError>;
+    fn open(&mut self, url: &str, range: Option<ByteRange>) -> Result<DownloadResponse, PullError>;
 }
 
 struct DownloadResponse {
@@ -253,12 +354,41 @@ struct DownloadResponse {
     reader: Box<dyn Read>,
 }
 
+/// A `DownloadClient` boxed for use across worker threads: each concurrent
+/// segment worker owns one, produced fresh by a `ParallelDownloadConfig`
+/// factory (see its doc comment for why -- `DownloadClient::open` takes
+/// `&mut self`, so a single client instance can't be shared between threads).
+type BoxedDownloadClient = Box<dyn DownloadClient + Send>;
+
+/// Concurrency knobs for the chunked-download path, threaded through from
+/// `PullModelPackRequest::execute` (production, env-configured) or
+/// constructed directly by tests. Absent (`None`) anywhere upstream simply
+/// means "never chunk" -- the single-stream path is unconditionally correct
+/// and is what every caller falls back to.
+struct ParallelDownloadConfig<'a> {
+    /// Upper bound on simultaneous Range connections; the actual worker
+    /// count is `min(connections, remaining segment count)`.
+    connections: usize,
+    /// Produces one fresh, independently usable `DownloadClient` per worker
+    /// thread. For `HttpDownloadClient` this clones the underlying
+    /// `reqwest::blocking::Client`, which is an `Arc`-backed connection pool
+    /// designed to be shared across threads -- so cloning it (rather than
+    /// building a brand new pool per worker) lets concurrent segment
+    /// requests to the same host reuse keep-alive connections.
+    factory: &'a dyn Fn() -> Result<BoxedDownloadClient, PullError>,
+}
+
 struct DownloadedPartial {
     bytes_done: u64,
     sha256: String,
 }
 
+#[derive(Clone)]
 struct HttpDownloadClient {
+    /// `reqwest::blocking::Client` wraps an `Arc`-backed connection pool, so
+    /// cloning is cheap and shares keep-alive connections across threads --
+    /// exactly what the chunked-download worker threads want (see
+    /// `ParallelDownloadConfig::factory`).
     client: reqwest::blocking::Client,
     /// Optional Hugging Face access token (`OPENASR_HF_TOKEN`). Attached only to
     /// requests whose host is `huggingface.co`, never to the CDN/mirror redirect
@@ -331,12 +461,26 @@ impl<'a> PullModelPackRequest<'a> {
                 &env_sources
             }
         };
+        // Each worker thread gets its own clone of `client` (a cheap,
+        // `Arc`-backed connection pool -- see `HttpDownloadClient`'s doc
+        // comment) rather than an independently constructed client, so
+        // concurrent segment requests to the same host can share keep-alive
+        // connections instead of each opening a fresh one.
+        let worker_client = client.clone();
+        let factory = move || -> Result<BoxedDownloadClient, PullError> {
+            Ok(Box::new(worker_client.clone()))
+        };
+        let parallel = ParallelDownloadConfig {
+            connections: pull_connections_from_env(),
+            factory: &factory,
+        };
         pull_model_pack_with_client_sources_and_cancel(
             resolved,
             home,
             &mut client,
             PullOptions::default(),
             sources,
+            Some(parallel),
             progress,
             || should_cancel.as_ref().is_some_and(|f| f()),
             || should_pause.as_ref().is_some_and(|f| f()),
@@ -442,23 +586,7 @@ fn resolved_catalog_pull_from_quant(
     model: &CatalogModel,
     quant: &CatalogQuant,
 ) -> ResolvedCatalogPull {
-    ResolvedCatalogPull {
-        requested: quant.pull.clone(),
-        model_id: model.id.clone(),
-        display_name: model.display_name.clone(),
-        quant: quant.quant.clone(),
-        suffix: quant.suffix.clone(),
-        pull: quant.pull.clone(),
-        filename: quant.filename.clone(),
-        url: quant.url.clone(),
-        mirrors: quant.mirrors.clone(),
-        hf_revision: model.hf_revision.clone(),
-        sha256: quant.sha256.clone(),
-        size_bytes: quant.size_bytes,
-        license: model.license.clone(),
-        license_url: model.license_url.clone(),
-        license_class: model.license_class.clone(),
-    }
+    ResolvedCatalogPull::from_model_and_quant(model, quant, quant.pull.clone())
 }
 
 pub fn list_installed_packs(home: impl AsRef<Path>) -> Result<Vec<InstalledPack>, PullError> {
@@ -692,18 +820,50 @@ fn pull_model_pack_with_client_and_cancel<C: DownloadClient>(
         client,
         options,
         &[DownloadSource::Hf],
+        None,
         progress,
         should_cancel,
         should_pause,
     )
 }
 
+/// Test-only entry point that exercises the concurrent chunked-download path
+/// (`pull_model_pack_with_client_and_cancel` / the production
+/// `PullModelPackRequest::execute` never pass `parallel: None` in production,
+/// but tests need to opt in explicitly with a mock client factory).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn pull_model_pack_with_client_parallel<C: DownloadClient>(
+    resolved: &ResolvedCatalogPull,
+    home: &Path,
+    client: &mut C,
+    options: PullOptions,
+    parallel: ParallelDownloadConfig,
+    progress: impl FnMut(PullProgress),
+    should_cancel: impl Fn() -> bool,
+    should_pause: impl Fn() -> bool,
+) -> Result<InstalledPack, PullError> {
+    pull_model_pack_with_client_sources_and_cancel(
+        resolved,
+        home,
+        client,
+        options,
+        &[DownloadSource::Hf],
+        Some(parallel),
+        progress,
+        should_cancel,
+        should_pause,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn pull_model_pack_with_client_sources_and_cancel<C: DownloadClient>(
     resolved: &ResolvedCatalogPull,
     home: &Path,
     client: &mut C,
     options: PullOptions,
     sources: &[DownloadSource],
+    parallel: Option<ParallelDownloadConfig>,
     mut progress: impl FnMut(PullProgress),
     should_cancel: impl Fn() -> bool,
     should_pause: impl Fn() -> bool,
@@ -729,6 +889,7 @@ fn pull_model_pack_with_client_sources_and_cancel<C: DownloadClient>(
             &paths,
             client,
             options.clone(),
+            parallel.as_ref(),
             &mut progress,
             &should_cancel,
             &should_pause,
@@ -791,15 +952,25 @@ fn source_targets(
     Ok(targets)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn download_with_retries<C: DownloadClient>(
     target: &PullTarget,
     paths: &PullPaths,
     client: &mut C,
     options: PullOptions,
+    parallel: Option<&ParallelDownloadConfig>,
     progress: &mut impl FnMut(PullProgress),
     should_cancel: &impl Fn() -> bool,
     should_pause: &impl Fn() -> bool,
 ) -> Result<DownloadedPartial, PullError> {
+    let segment_bytes = options
+        .parallel_segment_bytes_override
+        .unwrap_or(DOWNLOAD_SEGMENT_BYTES);
+    // Sticky within this call: once a probe (or a mid-download segment
+    // response) shows the source ignores Range, don't keep re-probing on
+    // every retry -- fall back to the single-stream path for the rest of
+    // this pull attempt.
+    let mut range_supported = true;
     let mut attempt = 0_usize;
     loop {
         if should_cancel() {
@@ -813,6 +984,40 @@ fn download_with_retries<C: DownloadClient>(
                 reference: target.pull.clone(),
             });
         }
+
+        if range_supported
+            && let Some(parallel) = parallel
+            && parallel_download_eligible(target, parallel.connections, segment_bytes)
+        {
+            match download_parallel_attempt(
+                target,
+                paths,
+                client,
+                parallel,
+                segment_bytes,
+                &options,
+                progress,
+                should_cancel,
+                should_pause,
+            ) {
+                Ok(ParallelAttemptOutcome::Completed(downloaded)) => return Ok(downloaded),
+                Ok(ParallelAttemptOutcome::RangeNotSupported) => {
+                    range_supported = false;
+                    cleanup_partial(paths);
+                    // Fall through to the single-stream path below for this
+                    // same loop iteration -- no wasted attempt/backoff.
+                }
+                Err(error)
+                    if attempt < DOWNLOAD_MAX_RETRIES && is_retryable_download_error(&error) =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(retry_backoff(attempt));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
         let resume_from = prepare_partial_for_resume(target, paths)?;
         if resume_from == target.size_bytes {
             let (_, sha256) = file_size_and_sha256(&paths.partial_path)?;
@@ -824,7 +1029,10 @@ fn download_with_retries<C: DownloadClient>(
         let needed = reserve_space_bytes(target.size_bytes.saturating_sub(resume_from));
         ensure_available_space(&paths.dir, needed, options.clone())?;
         let result = client
-            .open(&target.url, (resume_from > 0).then_some(resume_from))
+            .open(
+                &target.url,
+                (resume_from > 0).then(|| ByteRange::from_start(resume_from)),
+            )
             .and_then(|response| {
                 download_response(
                     target,
@@ -985,6 +1193,734 @@ fn download_response(
 fn cleanup_partial(paths: &PullPaths) {
     let _ = fs::remove_file(&paths.partial_path);
     let _ = fs::remove_file(&paths.partial_meta_path);
+    let _ = fs::remove_file(&paths.partial_segments_meta_path);
+}
+
+/// The env override for the chunked-download connection count, clamped to
+/// `[1, MAX_PULL_CONNECTIONS]`. `connections <= 1` makes the download
+/// unconditionally single-stream (see `parallel_download_eligible`).
+fn pull_connections_from_env() -> usize {
+    std::env::var(PULL_CONNECTIONS_ENV_VAR)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|connections| *connections > 0)
+        .unwrap_or(DEFAULT_PULL_CONNECTIONS)
+        .min(MAX_PULL_CONNECTIONS)
+}
+
+/// A pack only benefits from chunking once it splits into at least 2
+/// segments -- otherwise a single Range request already reads the whole
+/// body, and going concurrent would only add a wasted probe request.
+fn parallel_download_eligible(target: &PullTarget, connections: usize, segment_bytes: u64) -> bool {
+    connections > 1 && target.size_bytes >= segment_bytes.saturating_mul(2)
+}
+
+fn segment_count(size_bytes: u64, segment_bytes: u64) -> usize {
+    size_bytes.div_ceil(segment_bytes) as usize
+}
+
+/// The inclusive `[start, end]` byte range for segment `index`, clamped to
+/// `size_bytes` for the final (possibly short) segment.
+fn segment_range(index: usize, size_bytes: u64, segment_bytes: u64) -> (u64, u64) {
+    let start = index as u64 * segment_bytes;
+    let end = start
+        .saturating_add(segment_bytes)
+        .saturating_sub(1)
+        .min(size_bytes.saturating_sub(1));
+    (start, end)
+}
+
+/// Per-segment completion bitmap for a chunked download, persisted next to
+/// the (preallocated, full-size) `.partial` file as a distinct file from the
+/// single-stream `PartialMeta` -- see `PullPaths::partial_segments_meta_path`.
+///
+/// Deliberately carries **no per-segment hash**: segments can complete out of
+/// order across worker threads, so an incrementally-advancing hash cursor
+/// (like the single-stream path's inline `Sha256`) would need to buffer or
+/// stall on out-of-order bytes to hash them in file order, which defeats the
+/// point of concurrency. Instead, integrity is checked once, the same way an
+/// already-fully-resumed single-stream download is
+/// (`download_with_retries`' `resume_from == target.size_bytes` shortcut):
+/// after every segment is marked done, `download_parallel_attempt` rereads
+/// the whole file and compares its sha256 against the catalog-pinned digest
+/// in `verify_partial_and_install`, exactly like every other pull path. The
+/// cost is one extra full-file sequential read, which is fast relative to
+/// network transfer (see the PR description for measured overhead).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SegmentedPartialMeta {
+    /// Discriminator against the single-stream `PartialMeta` format and
+    /// against any future incompatible bitmap shape; see
+    /// `PARALLEL_META_FORMAT`.
+    format: String,
+    model_id: String,
+    quant: String,
+    filename: String,
+    hf_revision: String,
+    sha256: String,
+    size_bytes: u64,
+    /// The fixed segment size this bitmap was built against. A resume whose
+    /// current `DOWNLOAD_SEGMENT_BYTES` no longer matches is invalidated
+    /// (see `load_segmented_meta`) rather than reinterpreted, since segment
+    /// boundaries -- and therefore bitmap indices -- would no longer align.
+    segment_bytes: u64,
+    /// The ETag every segment's response is checked against
+    /// (`fetch_segment_once`); `None` when the source sent no ETag at all,
+    /// in which case cross-segment consistency can't be checked and the
+    /// final sha256 comparison is the only integrity gate (same gap the
+    /// single-stream path already has today).
+    etag: Option<String>,
+    segments_done: Vec<bool>,
+    updated_at_unix_seconds: u64,
+}
+
+impl SegmentedPartialMeta {
+    fn new(
+        target: &PullTarget,
+        segment_bytes: u64,
+        etag: Option<String>,
+        total_segments: usize,
+    ) -> Self {
+        Self {
+            format: PARALLEL_META_FORMAT.to_string(),
+            model_id: target.model_id.clone(),
+            quant: target.quant.clone(),
+            filename: target.filename.clone(),
+            hf_revision: target.hf_revision.clone(),
+            sha256: target.sha256.clone(),
+            size_bytes: target.size_bytes,
+            segment_bytes,
+            etag,
+            segments_done: vec![false; total_segments],
+            updated_at_unix_seconds: unix_seconds_now(),
+        }
+    }
+
+    /// Same content-identity comparison as `PartialMeta::matches_target` --
+    /// see its doc comment for why the transport URL is intentionally
+    /// excluded (mirrors serve the same bytes under different hosts).
+    fn matches_target(&self, target: &PullTarget) -> bool {
+        self.format == PARALLEL_META_FORMAT
+            && self.model_id == target.model_id
+            && self.quant == target.quant
+            && self.filename == target.filename
+            && self.hf_revision == target.hf_revision
+            && self.sha256 == target.sha256
+            && self.size_bytes == target.size_bytes
+    }
+
+    fn bytes_done(&self, size_bytes: u64, segment_bytes: u64) -> u64 {
+        self.segments_done
+            .iter()
+            .enumerate()
+            .filter(|(_, done)| **done)
+            .map(|(index, _)| {
+                let (start, end) = segment_range(index, size_bytes, segment_bytes);
+                end - start + 1
+            })
+            .sum()
+    }
+}
+
+fn write_partial_segments_meta(path: &Path, meta: &SegmentedPartialMeta) -> Result<(), PullError> {
+    let json = serde_json::to_string_pretty(meta).map_err(|source| PullError::SerializeMeta {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    write_json_atomic(path, &format!("{json}\n"))
+}
+
+/// Load a usable segment bitmap for `target`/`segment_bytes`, or start fresh.
+///
+/// Backward/forward compatibility choice: a bitmap is reused only if it
+/// parses as the current `SegmentedPartialMeta` shape, matches the target's
+/// content identity, was built with the *same* `segment_bytes`, has exactly
+/// `total_segments` entries, and the on-disk `.partial` file is already at
+/// full size (this path always preallocates to `size_bytes` up front, so
+/// anything else means the file predates this feature or is otherwise
+/// inconsistent). Anything else -- including a legacy single-stream
+/// `.partial` left by a version of OpenASR before chunked downloads existed
+/// -- is **not** reinterpreted: its bytes were never segment-aligned, so
+/// `cleanup_partial` wipes both partial files and the download restarts from
+/// segment 0. This trades a possible redundant re-download of an
+/// in-progress legacy partial for never having to guess at a foreign file's
+/// layout.
+fn load_segmented_meta(
+    target: &PullTarget,
+    paths: &PullPaths,
+    segment_bytes: u64,
+    total_segments: usize,
+) -> Result<SegmentedPartialMeta, PullError> {
+    let partial_len = fs::metadata(&paths.partial_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let parsed = if paths.partial_path.exists() {
+        fs::read_to_string(&paths.partial_segments_meta_path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<SegmentedPartialMeta>(&contents).ok())
+    } else {
+        None
+    };
+    if let Some(meta) = parsed
+        && meta.matches_target(target)
+        && meta.segment_bytes == segment_bytes
+        && meta.segments_done.len() == total_segments
+        && partial_len == target.size_bytes
+    {
+        return Ok(meta);
+    }
+    cleanup_partial(paths);
+    Ok(SegmentedPartialMeta::new(
+        target,
+        segment_bytes,
+        None,
+        total_segments,
+    ))
+}
+
+/// Outcome of one concurrent chunked-download attempt.
+enum ParallelAttemptOutcome {
+    /// Every segment verified complete; the caller feeds this straight into
+    /// `verify_partial_and_install` exactly like the single-stream path.
+    Completed(DownloadedPartial),
+    /// The probe request got a `200` instead of `206`: the source is
+    /// ignoring the `Range` header entirely. Concurrent chunking cannot work
+    /// against this URL (writing a `200`'s from-byte-0 body into a
+    /// mid-file segment window would corrupt the file), so the caller wipes
+    /// the preallocated partial state and falls back to the existing
+    /// single-stream path, which already handles a `200` response correctly.
+    RangeNotSupported,
+}
+
+/// Run one attempt of the concurrent chunked-download path for `target`.
+///
+/// Sequence: reuse or initialize the segment bitmap: `load_segmented_meta`
+/// -> if every segment is already done, skip the network entirely and
+/// re-verify the file (same shortcut `download_with_retries` uses for a
+/// fully-resumed single-stream download) -> otherwise probe the first
+/// missing segment synchronously (confirms Range support and establishes the
+/// reference ETag before any concurrency starts) -> spawn up to
+/// `parallel.connections` worker threads pulling remaining segment indices
+/// off a shared queue, each writing directly into its slice of the
+/// preallocated file at the matching offset -> aggregate progress and
+/// segment-done events over an `mpsc` channel on this (the caller's) thread,
+/// which is also the only thread that polls `should_cancel`/`should_pause`
+/// (matching how the single-stream path already confines those predicates to
+/// one thread) -> once all workers finish, fsync and reread the whole file's
+/// sha256 for the final integrity gate.
+#[allow(clippy::too_many_arguments)]
+fn download_parallel_attempt<C: DownloadClient + ?Sized>(
+    target: &PullTarget,
+    paths: &PullPaths,
+    probe_client: &mut C,
+    parallel: &ParallelDownloadConfig,
+    segment_bytes: u64,
+    options: &PullOptions,
+    progress: &mut impl FnMut(PullProgress),
+    should_cancel: &impl Fn() -> bool,
+    should_pause: &impl Fn() -> bool,
+) -> Result<ParallelAttemptOutcome, PullError> {
+    let total_segments = segment_count(target.size_bytes, segment_bytes);
+    let mut meta = load_segmented_meta(target, paths, segment_bytes, total_segments)?;
+
+    let missing: Vec<usize> = meta
+        .segments_done
+        .iter()
+        .enumerate()
+        .filter(|(_, done)| !**done)
+        .map(|(index, _)| index)
+        .collect();
+
+    if missing.is_empty() {
+        let (actual_size, sha256) = file_size_and_sha256(&paths.partial_path)?;
+        return Ok(ParallelAttemptOutcome::Completed(DownloadedPartial {
+            bytes_done: actual_size,
+            sha256,
+        }));
+    }
+
+    let resume_from = meta.bytes_done(target.size_bytes, segment_bytes);
+    progress(PullProgress::DownloadStarted {
+        bytes_total: target.size_bytes,
+        resume_from,
+    });
+
+    ensure_available_space(
+        &paths.dir,
+        reserve_space_bytes((missing.len() as u64).saturating_mul(segment_bytes)),
+        options.clone(),
+    )?;
+
+    // Probe the first still-missing segment with a real, bounded Range
+    // request before committing to concurrency. A single request both (a)
+    // confirms the source honors Range (206) rather than ignoring it (200 --
+    // handled by the caller falling back to the single-stream path) and (b)
+    // establishes the reference ETag every other segment's response is
+    // checked against, so this is not a wasted request: its bytes become the
+    // probed segment's real data below.
+    let probe_index = missing[0];
+    let (probe_start, probe_end) = segment_range(probe_index, target.size_bytes, segment_bytes);
+    let probe_response = probe_client.open(
+        &target.url,
+        Some(ByteRange::bounded(probe_start, probe_end)),
+    )?;
+    if probe_response.status == 200 {
+        return Ok(ParallelAttemptOutcome::RangeNotSupported);
+    }
+    if probe_response.status != 206 {
+        return Err(PullError::UnexpectedStatus {
+            url: target.url.clone(),
+            status: probe_response.status,
+        });
+    }
+    if let Some(reference) = meta.etag.as_deref()
+        && let Some(probe_etag) = probe_response.etag.as_deref()
+        && reference != probe_etag
+    {
+        // A prior run's reference ETag no longer matches: the object behind
+        // this URL changed since the segment bitmap was last written. Wipe
+        // the whole partial state (bytes from two versions of the file can't
+        // be selectively resumed) so the retry in `download_with_retries`
+        // restarts clean from segment 0 with a fresh reference ETag.
+        cleanup_partial(paths);
+        return Err(PullError::EtagChanged {
+            url: target.url.clone(),
+        });
+    }
+    let reference_etag = meta.etag.clone().or_else(|| probe_response.etag.clone());
+    meta.etag = reference_etag.clone();
+
+    {
+        // `truncate(false)`: a resumed download's `.partial` already holds
+        // previously-written segment bytes at their correct offsets (see
+        // `load_segmented_meta`) that must survive this open -- only a fresh
+        // download hits `create(true)` for real, and `set_len` below is what
+        // establishes the full preallocated size either way.
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&paths.partial_path)
+            .map_err(|source| PullError::Io {
+                path: paths.partial_path.clone(),
+                source,
+            })?;
+        file.set_len(target.size_bytes)
+            .map_err(|source| PullError::Io {
+                path: paths.partial_path.clone(),
+                source,
+            })?;
+    }
+    write_partial_segments_meta(&paths.partial_segments_meta_path, &meta)?;
+
+    let mut bytes_done = resume_from;
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&paths.partial_path)
+            .map_err(|source| PullError::Io {
+                path: paths.partial_path.clone(),
+                source,
+            })?;
+        let written = write_segment_body(
+            &mut file,
+            &paths.partial_path,
+            probe_start,
+            probe_end,
+            probe_response.reader,
+            |delta| {
+                bytes_done = bytes_done.saturating_add(delta);
+                progress(PullProgress::Downloading {
+                    bytes_done,
+                    bytes_total: target.size_bytes,
+                });
+            },
+            None,
+        )?;
+        let expected = probe_end - probe_start + 1;
+        if written != expected {
+            cleanup_partial(paths);
+            return Err(PullError::SegmentSizeMismatch {
+                path: paths.partial_path.clone(),
+                start: probe_start,
+                end: probe_end,
+                expected,
+                actual: written,
+            });
+        }
+    }
+    meta.segments_done[probe_index] = true;
+    write_partial_segments_meta(&paths.partial_segments_meta_path, &meta)?;
+
+    let remaining: VecDeque<usize> = missing
+        .into_iter()
+        .filter(|index| *index != probe_index)
+        .collect();
+    if remaining.is_empty() {
+        sync_partial_file(&paths.partial_path)?;
+        let (actual_size, sha256) = file_size_and_sha256(&paths.partial_path)?;
+        let _ = fs::remove_file(&paths.partial_segments_meta_path);
+        return Ok(ParallelAttemptOutcome::Completed(DownloadedPartial {
+            bytes_done: actual_size,
+            sha256,
+        }));
+    }
+
+    let remaining_count = remaining.len();
+    let queue = Arc::new(Mutex::new(remaining));
+    let abort = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = mpsc::channel::<SegmentEvent>();
+    // No lock needed yet: no worker thread exists before the spawn loop
+    // below, so `remaining_count` (captured before `remaining` moved into
+    // the mutex) is exact, not just a snapshot.
+    let worker_count = parallel.connections.min(remaining_count).max(1);
+    let size_bytes = target.size_bytes;
+    let mut handles = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let worker_client = (parallel.factory)()?;
+        let worker_queue = queue.clone();
+        let worker_abort = abort.clone();
+        let worker_sender = sender.clone();
+        let worker_path = paths.partial_path.clone();
+        let worker_url = target.url.clone();
+        let worker_reference_etag = reference_etag.clone();
+        handles.push(std::thread::spawn(move || {
+            run_segment_worker(
+                worker_client,
+                worker_queue,
+                worker_abort,
+                worker_sender,
+                worker_path,
+                worker_url,
+                size_bytes,
+                segment_bytes,
+                worker_reference_etag,
+            );
+        }));
+    }
+    drop(sender);
+
+    let mut first_error: Option<PullError> = None;
+    let mut canceled = false;
+    let mut paused = false;
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(SegmentEvent::Progress(delta)) => {
+                bytes_done = bytes_done.saturating_add(delta);
+                progress(PullProgress::Downloading {
+                    bytes_done,
+                    bytes_total: target.size_bytes,
+                });
+            }
+            Ok(SegmentEvent::Done(index)) => {
+                meta.segments_done[index] = true;
+                write_partial_segments_meta(&paths.partial_segments_meta_path, &meta)?;
+            }
+            Ok(SegmentEvent::Failed(error)) => {
+                let is_etag_change = matches!(error, PullError::EtagChanged { .. });
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                abort.store(true, Ordering::SeqCst);
+                if is_etag_change {
+                    // Same "can't selectively resume across an object swap"
+                    // reasoning as the probe-time ETag check above.
+                    cleanup_partial(paths);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if !canceled && !paused {
+            if should_cancel() {
+                canceled = true;
+                abort.store(true, Ordering::SeqCst);
+            } else if should_pause() {
+                paused = true;
+                abort.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    if canceled {
+        cleanup_partial(paths);
+        return Err(PullError::Canceled {
+            reference: target.pull.clone(),
+        });
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    if paused {
+        return Err(PullError::Paused {
+            reference: target.pull.clone(),
+        });
+    }
+    if meta.segments_done.iter().any(|done| !done) {
+        // Unreachable in practice: every other exit path above requires the
+        // work queue to have drained without cancellation, pause, or error.
+        // Kept as a defensive fail-closed check so a future bug in the
+        // orchestration above can never mistake a partially-filled file for
+        // a complete one.
+        return Err(PullError::Io {
+            path: paths.partial_path.clone(),
+            source: io::Error::other(
+                "chunked download loop exited without completing every segment",
+            ),
+        });
+    }
+
+    sync_partial_file(&paths.partial_path)?;
+    let (actual_size, sha256) = file_size_and_sha256(&paths.partial_path)?;
+    let _ = fs::remove_file(&paths.partial_segments_meta_path);
+    Ok(ParallelAttemptOutcome::Completed(DownloadedPartial {
+        bytes_done: actual_size,
+        sha256,
+    }))
+}
+
+fn sync_partial_file(path: &Path) -> Result<(), PullError> {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|source| PullError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.sync_all().map_err(|source| PullError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Stream `reader` (already capped to the segment's expected length by the
+/// caller's use of `.take`, applied inside this function) into `file` at
+/// `[start, end_inclusive]`, calling `on_progress` with each chunk's byte
+/// count as it's written. Stops early (without error) if `abort` is set,
+/// leaving the segment's on-disk bytes incomplete but never marked done by
+/// the caller. Shared by the synchronous probe-segment write (main thread,
+/// `abort: None`) and every worker's per-segment fetch
+/// (`fetch_segment_once`), so both paths write segments identically.
+fn write_segment_body(
+    file: &mut File,
+    path_for_errors: &Path,
+    start: u64,
+    end_inclusive: u64,
+    reader: Box<dyn Read>,
+    mut on_progress: impl FnMut(u64),
+    abort: Option<&AtomicBool>,
+) -> Result<u64, PullError> {
+    file.seek(SeekFrom::Start(start))
+        .map_err(|source| PullError::Io {
+            path: path_for_errors.to_path_buf(),
+            source,
+        })?;
+    let expected_len = end_inclusive - start + 1;
+    let mut reader = reader.take(expected_len);
+    let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
+    let mut written = 0_u64;
+    loop {
+        if abort.is_some_and(|abort| abort.load(Ordering::SeqCst)) {
+            break;
+        }
+        let read = reader.read(&mut buffer).map_err(|source| PullError::Io {
+            path: path_for_errors.to_path_buf(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .map_err(|source| PullError::Io {
+                path: path_for_errors.to_path_buf(),
+                source,
+            })?;
+        written = written.saturating_add(read as u64);
+        on_progress(read as u64);
+    }
+    Ok(written)
+}
+
+/// Events a segment worker thread reports back to the orchestrating thread
+/// over the `mpsc` channel. Kept intentionally minimal: only the
+/// orchestrating thread touches `should_cancel`/`should_pause`, the segment
+/// bitmap, and the `progress` callback, so workers never need anything more
+/// than "here is a byte delta" / "this segment index is done" / "this
+/// segment failed".
+enum SegmentEvent {
+    Progress(u64),
+    Done(usize),
+    Failed(PullError),
+}
+
+/// One worker thread's loop: pop segment indices off the shared `queue`
+/// until it's empty or `abort` is set, fetching and writing each with
+/// `fetch_segment_with_retries`. Never panics on I/O failure -- every error
+/// path reports a `SegmentEvent::Failed` and returns instead.
+#[allow(clippy::too_many_arguments)]
+fn run_segment_worker(
+    mut client: BoxedDownloadClient,
+    queue: Arc<Mutex<VecDeque<usize>>>,
+    abort: Arc<AtomicBool>,
+    sender: mpsc::Sender<SegmentEvent>,
+    path: PathBuf,
+    url: String,
+    size_bytes: u64,
+    segment_bytes: u64,
+    reference_etag: Option<String>,
+) {
+    let mut file = match OpenOptions::new().write(true).open(&path) {
+        Ok(file) => file,
+        Err(source) => {
+            let _ = sender.send(SegmentEvent::Failed(PullError::Io {
+                path: path.clone(),
+                source,
+            }));
+            return;
+        }
+    };
+    loop {
+        if abort.load(Ordering::SeqCst) {
+            return;
+        }
+        let index = {
+            let mut queue = queue.lock().unwrap();
+            match queue.pop_front() {
+                Some(index) => index,
+                None => return,
+            }
+        };
+        let (start, end) = segment_range(index, size_bytes, segment_bytes);
+        match fetch_segment_with_retries(
+            client.as_mut(),
+            &mut file,
+            &path,
+            &url,
+            start,
+            end,
+            reference_etag.as_deref(),
+            &abort,
+            &sender,
+        ) {
+            Ok(true) => {
+                if sender.send(SegmentEvent::Done(index)).is_err() {
+                    return;
+                }
+            }
+            Ok(false) => return, // aborted mid-segment; no event, orchestrator already knows
+            Err(error) => {
+                let _ = sender.send(SegmentEvent::Failed(error));
+                return;
+            }
+        }
+    }
+}
+
+/// Retry one segment fetch up to `SEGMENT_MAX_RETRIES` times, backing off
+/// between attempts exactly like the single-stream path's outer retry loop.
+#[allow(clippy::too_many_arguments)]
+fn fetch_segment_with_retries(
+    client: &mut dyn DownloadClient,
+    file: &mut File,
+    path: &Path,
+    url: &str,
+    start: u64,
+    end: u64,
+    reference_etag: Option<&str>,
+    abort: &AtomicBool,
+    sender: &mpsc::Sender<SegmentEvent>,
+) -> Result<bool, PullError> {
+    let mut attempt = 0_usize;
+    loop {
+        if abort.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        match fetch_segment_once(
+            client,
+            file,
+            path,
+            url,
+            start,
+            end,
+            reference_etag,
+            abort,
+            sender,
+        ) {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) if attempt < SEGMENT_MAX_RETRIES && is_retryable_download_error(&error) => {
+                attempt += 1;
+                std::thread::sleep(retry_backoff(attempt));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fetch_segment_once(
+    client: &mut dyn DownloadClient,
+    file: &mut File,
+    path: &Path,
+    url: &str,
+    start: u64,
+    end: u64,
+    reference_etag: Option<&str>,
+    abort: &AtomicBool,
+    sender: &mpsc::Sender<SegmentEvent>,
+) -> Result<bool, PullError> {
+    let response = client.open(url, Some(ByteRange::bounded(start, end)))?;
+    if response.status != 206 {
+        return Err(PullError::UnexpectedStatus {
+            url: url.to_string(),
+            status: response.status,
+        });
+    }
+    if let (Some(reference), Some(etag)) = (reference_etag, response.etag.as_deref())
+        && reference != etag
+    {
+        return Err(PullError::EtagChanged {
+            url: url.to_string(),
+        });
+    }
+    if let Some(content_range) = response.content_range.as_deref()
+        && let Some(parsed) = parse_content_range(content_range)
+        && parsed.start != start
+    {
+        // A 206 whose Content-Range doesn't start where we asked: a
+        // misbehaving proxy/CDN, not a normal condition. Treated the same
+        // way the single-stream path treats a resume Content-Range mismatch
+        // -- restart rather than trust a response at the wrong offset.
+        return Err(PullError::SegmentRangeMismatch {
+            url: url.to_string(),
+        });
+    }
+    let written = write_segment_body(
+        file,
+        path,
+        start,
+        end,
+        response.reader,
+        |delta| {
+            let _ = sender.send(SegmentEvent::Progress(delta));
+        },
+        Some(abort),
+    )?;
+    if abort.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+    let expected = end - start + 1;
+    if written != expected {
+        return Err(PullError::SegmentSizeMismatch {
+            path: path.to_path_buf(),
+            start,
+            end,
+            expected,
+            actual: written,
+        });
+    }
+    Ok(true)
 }
 
 fn verify_partial_and_install(
@@ -1232,6 +2168,7 @@ fn pull_paths(home: &Path, target: &PullTarget) -> Result<PullPaths, PullError> 
     Ok(PullPaths {
         partial_path: dir.join(format!("{}.partial", target.filename)),
         partial_meta_path: dir.join(format!("{}.partial.meta.json", target.filename)),
+        partial_segments_meta_path: dir.join(format!("{}.partial.segments.json", target.filename)),
         installed_meta_path: dir.join("installed.json"),
         lock_path: dir.join(format!("{}.lock", target.filename)),
         dir,
@@ -1297,6 +2234,119 @@ fn parse_content_range(value: &str) -> Option<ParsedContentRange> {
         value => Some(value.parse().ok()?),
     };
     Some(ParsedContentRange { start, end, total })
+}
+
+/// Bounds how long a single underlying `Read::read` call may hang before
+/// it's treated as a stall, filling the gap left by
+/// `http::blocking_client_no_redirect` deliberately setting no total request
+/// timeout (see its doc comment): without any bound at all, a connection
+/// that goes silently dead (no error, no EOF, no more bytes) could hang a
+/// `read` call forever, and the app-level `LowSpeedWindow` below can't catch
+/// that either -- it only measures elapsed time *between* successful reads,
+/// so it never gets a chance to run while a single `read` is stuck.
+///
+/// Runs the real `Read::read` calls on a dedicated background thread and
+/// relays each chunk (or EOF, or the underlying I/O error) over a bounded
+/// channel; `Read::read` below waits on that channel with
+/// `recv_timeout(stall_timeout)` and turns an elapsed wait into an
+/// `io::ErrorKind::TimedOut` error -- the same kind
+/// `map_download_read_error` already recognizes and reports as a stall, and
+/// the same kind `is_retryable_download_error` already retries.
+///
+/// A caveat this doesn't (and structurally can't) fully close: if the
+/// background thread's own `read` call is the one that's stuck, the thread
+/// itself is never reclaimed (its `Sender` just sits there, the channel
+/// recv on the foreground side keeps timing out every `stall_timeout` and
+/// reports the stall each time, and this download attempt is abandoned by
+/// the retry/fallback logic above it -- see `is_retryable_download_error`).
+/// The leaked thread is bounded in number by the download concurrency limit
+/// (`MAX_PULL_CONNECTIONS` for the chunked path, one for the single-stream
+/// path) and is reclaimed by the OS once the underlying connection is
+/// eventually torn down, so this trades an unbounded hang for a small,
+/// bounded resource cost -- an acceptable trade for a downloader.
+struct StallGuardedReader {
+    receiver: mpsc::Receiver<io::Result<Vec<u8>>>,
+    stall_timeout: Duration,
+    /// Bytes already received from the background thread but not yet
+    /// returned to the caller, because the caller's `buf` was smaller than
+    /// the chunk that arrived. `Read::read` is allowed to return fewer bytes
+    /// than `buf.len()`, but must never drop bytes it already has.
+    pending: VecDeque<u8>,
+    /// Set once EOF, an error, or a disconnect has been observed and
+    /// reported, so a `Read` contract-following caller that calls `read`
+    /// again afterward gets a clean `Ok(0)` instead of hanging on a closed
+    /// channel.
+    finished: bool,
+}
+
+impl StallGuardedReader {
+    fn new(mut reader: Box<dyn Read + Send>, stall_timeout: Duration) -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<io::Result<Vec<u8>>>(1);
+        std::thread::spawn(move || {
+            let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
+            loop {
+                let (message, stop) = match reader.read(&mut buffer) {
+                    Ok(0) => (Ok(Vec::new()), true),
+                    Ok(read) => (Ok(buffer[..read].to_vec()), false),
+                    Err(error) => (Err(error), true),
+                };
+                if sender.send(message).is_err() || stop {
+                    // Either the foreground gave up (dropped the receiver --
+                    // this attempt was abandoned) or this was the last
+                    // message (EOF/error); either way, stop reading.
+                    return;
+                }
+            }
+        });
+        Self {
+            receiver,
+            stall_timeout,
+            pending: VecDeque::new(),
+            finished: false,
+        }
+    }
+}
+
+impl Read for StallGuardedReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.pending.is_empty() {
+            let len = self.pending.len().min(buf.len());
+            for slot in &mut buf[..len] {
+                *slot = self.pending.pop_front().expect("checked non-empty above");
+            }
+            return Ok(len);
+        }
+        if self.finished {
+            return Ok(0);
+        }
+        match self.receiver.recv_timeout(self.stall_timeout) {
+            Ok(Ok(chunk)) if chunk.is_empty() => {
+                self.finished = true;
+                Ok(0)
+            }
+            Ok(Ok(chunk)) => {
+                let len = chunk.len().min(buf.len());
+                buf[..len].copy_from_slice(&chunk[..len]);
+                self.pending.extend(&chunk[len..]);
+                Ok(len)
+            }
+            Ok(Err(error)) => {
+                self.finished = true;
+                Err(error)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "no data received from the download source within {stall_timeout:?}",
+                    stall_timeout = self.stall_timeout
+                ),
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.finished = true;
+                Ok(0)
+            }
+        }
+    }
 }
 
 struct LowSpeedWindow {
@@ -1698,11 +2748,12 @@ impl HttpDownloadClient {
     fn new() -> Result<Self, PullError> {
         // The downloader follows redirects manually (see `open`) so it can route
         // the Hugging Face CDN hop through the mirror; hence a no-redirect client.
-        let client = http::blocking_client_no_redirect(HTTP_CONNECT_TIMEOUT, HTTP_STALL_TIMEOUT)
-            .map_err(|source| PullError::Http {
+        let client = http::blocking_client_no_redirect(HTTP_CONNECT_TIMEOUT).map_err(|source| {
+            PullError::Http {
                 url: "<client>".to_string(),
                 message: http::error_message(&source),
-            })?;
+            }
+        })?;
         Ok(Self {
             client,
             hf_token: hf_token_from_env(),
@@ -1745,7 +2796,7 @@ fn hf_token_allowed_for_host(host: Option<&str>) -> bool {
 }
 
 impl DownloadClient for HttpDownloadClient {
-    fn open(&mut self, url: &str, range_start: Option<u64>) -> Result<DownloadResponse, PullError> {
+    fn open(&mut self, url: &str, range: Option<ByteRange>) -> Result<DownloadResponse, PullError> {
         let mut current = url.to_string();
         let mut redirect_cookies: Vec<RedirectCookie> = Vec::new();
         for _ in 0..=DOWNLOAD_MAX_REDIRECTS {
@@ -1770,8 +2821,8 @@ impl DownloadClient for HttpDownloadClient {
                     request = request.header(reqwest::header::COOKIE, scoped.join("; "));
                 }
             }
-            if let Some(start) = range_start {
-                request = request.header(reqwest::header::RANGE, format!("bytes={start}-"));
+            if let Some(range) = range {
+                request = request.header(reqwest::header::RANGE, range.header_value());
             }
             let response = request.send().map_err(|source| PullError::Http {
                 url: url.to_string(),
@@ -1808,7 +2859,15 @@ impl DownloadClient for HttpDownloadClient {
                 content_length,
                 content_range,
                 etag,
-                reader: Box::new(response),
+                // `blocking_client_no_redirect` deliberately sets no total
+                // request timeout (see its doc comment), so a single `read`
+                // on this response body could otherwise hang indefinitely on
+                // a connection that goes silently dead without an error or
+                // EOF. `StallGuardedReader` bounds that per-read wait.
+                reader: Box::new(StallGuardedReader::new(
+                    Box::new(response),
+                    HTTP_STALL_TIMEOUT,
+                )),
             });
         }
         Err(PullError::Http {
@@ -1908,7 +2967,10 @@ fn is_retryable_download_error(error: &PullError) -> bool {
         PullError::Http { .. }
         | PullError::Io { .. }
         | PullError::RestartedPartial { .. }
-        | PullError::SizeMismatch { .. } => true,
+        | PullError::SizeMismatch { .. }
+        | PullError::EtagChanged { .. }
+        | PullError::SegmentSizeMismatch { .. }
+        | PullError::SegmentRangeMismatch { .. } => true,
         PullError::UnexpectedStatus { status, .. } => *status >= 500,
         _ => false,
     }
@@ -1923,7 +2985,10 @@ fn is_source_fallback_error(error: &PullError) -> bool {
         | PullError::ShaMismatch { .. }
         | PullError::GgufPreflight { .. }
         | PullError::BackendFilePreflight { .. }
-        | PullError::RuntimeValidation { .. } => true,
+        | PullError::RuntimeValidation { .. }
+        | PullError::EtagChanged { .. }
+        | PullError::SegmentSizeMismatch { .. }
+        | PullError::SegmentRangeMismatch { .. } => true,
         PullError::UnexpectedStatus { status, .. } => *status >= 500,
         _ => false,
     }
