@@ -22,6 +22,7 @@ pub(crate) mod encoder_graph;
 pub(crate) mod encoder_weights;
 pub(crate) mod executor;
 pub(crate) mod frontend;
+pub(crate) mod graph_config;
 pub mod package_import;
 pub(crate) mod runtime_contract;
 pub(crate) mod tokenizer;

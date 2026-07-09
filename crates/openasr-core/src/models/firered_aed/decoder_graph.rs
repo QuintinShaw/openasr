@@ -14,9 +14,11 @@
 //! Built on the shared incremental seq2seq decoder block
 //! ([`crate::nn::decoder::seq2seq_layer`]): pre-norm causal self-attention
 //! with an f16 KV cache, pre-norm cross-attention over cross-KV precomputed
-//! once from the encoder output, and a GELU feed-forward. Runs CPU-only,
-//! rebuilding a fresh graph every decode step (matches the Stage 2 encoder's
-//! CPU-only staging -- GPU reuse can follow once parity is established).
+//! once from the encoder output, and a GELU feed-forward. Rebuilds a fresh
+//! graph every decode step regardless of backend (see [`super::graph_config`]
+//! for the dynamic CPU/Metal backend selection -- unlike cohere's serve-batch
+//! path, this never reuses a fixed-span-KV graph across tokens, so it carries
+//! none of the reused-graph caveats that motivate CPU-only fallback there).
 
 #![allow(dead_code)]
 
@@ -25,9 +27,8 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedWeightContext, GgmlStaticTensor,
-    GgmlStaticTensorArena,
+    GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
+    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinSeq2SeqDecodePolicyConfigInput, run_builtin_seq2seq_decode_policy,
@@ -45,10 +46,10 @@ use crate::nn::ffn::FeedForwardActivation;
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 
 use super::decoder_weights::{FireRedDecoderWeights, FireRedDecoderWeightsError};
+use super::graph_config::firered_decoder_graph_config;
 use super::runtime_contract::FireRedAedExecutionMetadata;
 
 const FIRERED_DECODER_LAYER_NORM_EPSILON: f32 = 1.0e-5;
-const FIRERED_DECODER_GRAPH_SIZE: usize = 8192;
 /// Static tensors created directly in the decoder's arena (not through
 /// `start_graph`): one shared zero-bias vector plus, per decoder layer, a
 /// cross-K/cross-V pair and a self-K/self-V pair.
@@ -75,27 +76,6 @@ pub(crate) enum FireRedDecoderError {
 
 fn map_err(step: &'static str, source: GgmlCpuGraphError) -> FireRedDecoderError {
     FireRedDecoderError::GraphBuildFailed { step, source }
-}
-
-pub(crate) fn firered_decoder_graph_config() -> GgmlCpuGraphConfig {
-    GgmlCpuGraphConfig {
-        // `no_alloc` metadata context: only needs `ggml_tensor_overhead()` per
-        // graph node plus the cgraph object itself (see
-        // `GgmlCpuGraphConfig::metadata_context_bytes`), NOT the real tensor
-        // byte sizes -- those live in a separately-sized backend buffer.
-        // Previously hardcoded to 512 MiB, which is what let a single cached
-        // per-encoder-frame-count decoder runtime (see the thread-local cache
-        // in `executor.rs`) balloon far past what the graph actually needs.
-        context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(FIRERED_DECODER_GRAPH_SIZE),
-        graph_size: FIRERED_DECODER_GRAPH_SIZE,
-        n_threads: None,
-        backend: GgmlCpuGraphBackend::Cpu,
-        // See the matching comment in encoder_graph.rs: the CPU-backend
-        // gallocr scheduler reuses tensor buffer space by lifetime instead of
-        // allocating every non-view tensor independently, cutting memory
-        // without changing the graph's computed output (#68).
-        use_scheduler: true,
-    }
 }
 
 /// Byte capacity for the decoder's static-tensor arena context. Like the
