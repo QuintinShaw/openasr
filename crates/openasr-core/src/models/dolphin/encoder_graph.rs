@@ -145,15 +145,20 @@ impl DolphinEncoderConfig {
     }
 }
 
-/// Full encoder result plus per-stage taps for parity gating.
+/// Full encoder result. `encoder_out` is always populated; `after_subsample`
+/// and `blocks` are per-stage taps that [`encode`]'s `capture_taps` flag only
+/// materializes for `#[cfg(test)]` parity gating (empty otherwise -- see
+/// [`encode`]'s doc comment, P6).
 #[derive(Debug, Clone)]
 pub(crate) struct DolphinEncoderOutput {
     pub frames: usize,
     pub dim: usize,
     /// Frame-major `[frames, dim]` output of `Conv2dSubsampling4 * sqrt(d_model)`
-    /// (the hidden entering block 0).
+    /// (the hidden entering block 0). Empty unless `encode` was called with
+    /// `capture_taps: true`.
     pub after_subsample: Vec<f32>,
     /// Frame-major `[frames, dim]` output after each block's `norm_final`.
+    /// Empty unless `encode` was called with `capture_taps: true`.
     pub blocks: Vec<Vec<f32>>,
     /// Frame-major `[frames, dim]` encoder output = `after_norm(block_last)`.
     pub encoder_out: Vec<f32>,
@@ -967,14 +972,28 @@ fn subsample<'a>(
     Ok((scaled, frames))
 }
 
-/// Build and run the full encoder graph on the CPU backend. Returns the encoder
-/// output plus per-stage taps for parity.
+/// Build and run the full encoder graph on the CPU backend. Always returns
+/// `encoder_out`; when `capture_taps` is true it additionally materializes
+/// `after_subsample` and every per-block hidden state for the parity harness
+/// (see [`DolphinEncoderOutput`]).
+///
+/// Perf (P6): every per-block tap unconditionally `set_output` + f32-materialized
+/// used to pin ~200MB+ of intermediate hidden state resident for the whole graph
+/// (plus a host copy per block) on every production call, even though the
+/// executor (`executor::run_dolphin_pipeline`) only ever reads `encoder_out` --
+/// `blocks`/`after_subsample` exist solely for `#[cfg(test)]` parity
+/// (`parity::dolphin_encoder_parity`). With `capture_taps: false` (the
+/// production default via `executor::encode_dolphin_encoder_from_pack`), only
+/// `encoder_out` is declared an output, so gallocr's liveness-based allocator is
+/// free to recycle each block's buffer as soon as the next block stops reading
+/// it, exactly like every other tap-free encoder in this codebase.
 pub(crate) fn encode(
     config: &DolphinEncoderConfig,
     provider: &dyn DolphinWeightProvider,
     features: &[f32],
     frames_in: usize,
     backend: GgmlCpuGraphBackend,
+    capture_taps: bool,
 ) -> Result<DolphinEncoderOutput, DolphinEncoderError> {
     let feat = config.feature_dim;
     if features.len() != frames_in * feat {
@@ -1067,12 +1086,20 @@ pub(crate) fn encode(
             reason: format!("subsample produced {frames_check} frames, expected {frames}"),
         });
     }
-    let mut taps: Vec<GgmlCpuTensor> = Vec::with_capacity(config.num_blocks + 2);
-    taps.push(after_subsample);
+    let mut taps: Vec<GgmlCpuTensor> = Vec::with_capacity(if capture_taps {
+        config.num_blocks + 2
+    } else {
+        1
+    });
+    if capture_taps {
+        taps.push(after_subsample);
+    }
     let mut hidden = after_subsample;
     for block in &weights.blocks {
         hidden = encoder_block(&mut graph, hidden, pos_emb, block, config, frames)?;
-        taps.push(hidden);
+        if capture_taps {
+            taps.push(hidden);
+        }
     }
     let encoder_out = affine_ln(
         &graph,
@@ -1082,6 +1109,7 @@ pub(crate) fn encode(
         weights.after_norm_b,
         "after_norm",
     )?;
+    // encoder_out is always the last (and, when `!capture_taps`, only) tap.
     taps.push(encoder_out);
 
     for tap in &taps {
@@ -1149,8 +1177,13 @@ pub(crate) fn encode(
         .map_err(ggml_err("compute"))?;
 
     let encoder_out = outputs.pop().expect("encoder_out tap");
-    let blocks = outputs.split_off(1);
-    let after_subsample = outputs.pop().expect("after_subsample tap");
+    let (after_subsample, blocks) = if capture_taps {
+        let blocks = outputs.split_off(1);
+        let after_subsample = outputs.pop().expect("after_subsample tap");
+        (after_subsample, blocks)
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     Ok(DolphinEncoderOutput {
         frames,
