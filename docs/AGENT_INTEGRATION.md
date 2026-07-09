@@ -26,13 +26,17 @@ npx skills add QuintinShaw/openasr --skill openasr --agent claude-code
 # or interactively: npx skills add QuintinShaw/openasr
 ```
 
-This copies `SKILL.md` into the agent's local skills directory (for example
-`.claude/skills/openasr/SKILL.md` for Claude Code). Verified locally with
-`npx skills add <path-to-checkout> --skill openasr --agent claude-code`, which
-installs to `./.claude/skills/openasr/SKILL.md`. The Skill teaches the
-agent the `openasr` CLI surface: `transcribe`, `live`, `search`/`pull`/`list`,
-`serve`, and `apikey`, including expected output shapes and common failure
-modes (missing model, `--offline` fail-closed, non-WAV without `ffmpeg`).
+This copies the whole skill directory -- `SKILL.md` plus
+`references/http-api.md` -- into the agent's local skills directory (for
+example `.claude/skills/openasr/` for Claude Code). Verified locally with
+`npx skills add <path-to-checkout> --skill openasr --agent claude-code`,
+which installs both files under `./.claude/skills/openasr/`. The Skill
+teaches the agent the `openasr` CLI surface: `transcribe`, `live`,
+`search`/`pull`/`list`, `serve`, and `apikey`, including expected output
+shapes and common failure modes (missing model, `--offline` fail-closed,
+non-WAV without `ffmpeg`); the reference file carries the full HTTP API
+parameter matrix so it only enters the agent's context when needed
+(progressive disclosure).
 
 Prerequisite: the `openasr` binary must be on `PATH` (`cargo install
 --path crates/openasr-cli` from a source checkout, or a released binary).
@@ -118,6 +122,26 @@ remote-serving flow.
 - `POST /v1/audio/transcriptions` -- OpenAI-compatible transcription
   (multipart `file` + `model`; `response_format` of `json`, `text`, `srt`,
   `vtt`, `verbose_json`, or `markdown`).
+- `POST /v1/audio/translations` -- OpenAI-compatible X->English translation
+  (non-streaming; families without a translate task reject it explicitly).
 
-See the root [README](../README.md#local-http-api) for the full request-field
-reference (longform/segment options, phrase-bias/hotword fields, streaming).
+### OpenAI SDK compatibility
+
+Official OpenAI SDKs work against `serve` out of the box for non-streaming
+calls (`base_url="http://127.0.0.1:8080/v1"`, any placeholder `api_key`,
+or a real key once one exists). Errors use the OpenAI envelope
+(`error.{message,type,param,code}`). `verbose_json` carries `language`,
+`duration`, segment `id`s, and a top-level `words` array when word
+timestamps are requested; it does not fabricate `task`, `usage`, or decoder
+internals (`avg_logprob`, `no_speech_prob`, ...). OpenAI parameters with no
+local equivalent (`temperature`, `include[]`, `chunking_strategy`,
+`known_speaker_*`) are accepted and ignored. SDK `stream=True` (the `stream`
+form field) is rejected with an actionable 400: SSE streaming is the
+OpenASR realtime protocol behind the `?stream=true` query parameter, not
+OpenAI `transcript.text.*` events.
+
+The full parameter-by-parameter matrix lives in the Skill's
+[`references/http-api.md`](../skills/openasr/references/http-api.md); the
+root [README](../README.md#local-http-api) documents the request-field
+reference (longform/segment options, phrase-bias/hotword fields,
+streaming).
