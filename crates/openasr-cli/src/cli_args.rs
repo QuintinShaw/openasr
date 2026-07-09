@@ -754,6 +754,34 @@ pub(crate) enum ImportCommand {
         #[arg(long, value_enum, default_value_t = ImportFireredAedQuantization::Fp16)]
         quantization: ImportFireredAedQuantization,
     },
+    /// Import a local FireRedPunc (chinese-lert-base BERT + 5-class head) source into one punctuation runtime pack file (`.oasr`).
+    #[command(name = "firered-punc")]
+    FireredPunc {
+        /// Source F32 model.safetensors (from pt_to_safetensors.py of model.pth.tar).
+        source_safetensors: PathBuf,
+        /// Upstream WordPiece vocab.txt (21128 lines).
+        vocab_txt: PathBuf,
+        /// Output path for one runtime pack file (`.oasr`).
+        output_pack: PathBuf,
+        /// Model id written to pack metadata (openasr.model.id).
+        #[arg(long, default_value = "firered-punc")]
+        package_id: String,
+        /// Source name written to openasr.source.name.
+        #[arg(long, default_value = "FireRedTeam/FireRedPunc")]
+        source_name: String,
+        /// Source revision written to openasr.source.revision.
+        #[arg(long, default_value = "main")]
+        source_revision: String,
+        /// License name written to openasr.license.name.
+        #[arg(long, default_value = "Apache-2.0")]
+        license_name: String,
+        /// License/source URL written to openasr.license.source.
+        #[arg(long, default_value = "https://huggingface.co/FireRedTeam/FireRedPunc")]
+        license_source: String,
+        /// Runtime tensor quantization for GGUF-backed `.oasr` output (1D biases/norms always stay f16).
+        #[arg(long, value_enum, default_value_t = ImportFireredPuncQuantization::Fp16)]
+        quantization: ImportFireredPuncQuantization,
+    },
     /// Import one local X-ASR Zipformer2 transducer source directory into one runtime pack file (`.oasr`).
     #[command(name = "xasr-zipformer")]
     XasrZipformer {
@@ -939,6 +967,14 @@ pub(crate) enum ImportDolphinQuantization {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[allow(non_camel_case_types)]
 pub(crate) enum ImportFireredAedQuantization {
+    Fp16,
+    Q8_0,
+    Q4_K,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[allow(non_camel_case_types)]
+pub(crate) enum ImportFireredPuncQuantization {
     Fp16,
     Q8_0,
     Q4_K,

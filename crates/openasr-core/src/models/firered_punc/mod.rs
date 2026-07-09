@@ -23,6 +23,7 @@
 
 pub(crate) mod config;
 pub(crate) mod graph;
+pub(crate) mod package_import;
 pub(crate) mod runtime;
 pub(crate) mod runtime_contract;
 pub(crate) mod tensor_names;
