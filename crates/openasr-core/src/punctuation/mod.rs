@@ -12,6 +12,29 @@
 //!   (`Some(false)` -> run; `Some(true)`/`None` -> leave the text untouched, so
 //!   punctuating families like whisper/qwen are never double-punctuated). See
 //!   [`should_apply_punctuation`].
+//! - **Chinese-only by construction, gated at the runtime entry.** FireRedPunc's
+//!   label space is five full-width Chinese marks and its training data is
+//!   Chinese-only, but `emits_punctuation` is a model-family-wide capability
+//!   flag -- it cannot see that a *given segment* has no Chinese in it (e.g. a
+//!   `LanguageFamilyHint::FixedMultilingual` family like FireRed, whose
+//!   `Transcription.language` is always `None`, can still emit an all-English
+//!   segment). That per-segment check lives in
+//!   `FireRedPuncRuntime::punctuate` (the single entry both the batch stage
+//!   and the streaming session call): a segment with zero Han ideographs (per
+//!   [`crate::models::firered_punc::tokenizer::is_cjk_char`], the same
+//!   definition the tokenizer was built against) is returned verbatim. The
+//!   [`restore_punctuation`] mechanism below stays deliberately
+//!   language-agnostic -- policy belongs to the caller, not the walk.
+//!
+//!   Known boundaries of that gate (accepted, documented, not bugs):
+//!   - A mixed zh/en segment that *does* contain Han ideographs is punctuated
+//!     with full-width marks throughout, which is the correct GB/T 15834
+//!     treatment of Chinese text with embedded Latin; no half-width mapping is
+//!     attempted on the Latin spans.
+//!   - For multilingual families like dolphin, a Japanese segment containing
+//!     kanji passes the Han gate and gets Chinese punctuation (pre-existing
+//!     limitation). Honest en/mixed punctuation needs an upstream zh+en punc
+//!     checkpoint (long-term item), not more gating here.
 //! - **Finalize-only.** It is meant to run once on a finalized segment, not per
 //!   streaming partial -- re-punctuating every partial with a bidirectional
 //!   encoder is expensive and reintroduces caption flicker.

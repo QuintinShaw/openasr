@@ -1,14 +1,53 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::api::native::NativeStreamingTranscriptEmitter;
+use crate::arch::emits_punctuation_for_model_architecture;
+use crate::models::firered_punc::pack::resolve_firered_punc_pack_path;
+use crate::models::firered_punc::runtime::SendableFireRedPuncRuntime;
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrStreamingSessionConfig, GgmlAsrStreamingSessionRequest,
 };
+use crate::punctuation::{PunctuationError, should_apply_punctuation};
 use crate::realtime::events::realtime_timestamp_now;
 use crate::{
     NativeAsrError, NativeAsrRequestOptions, NativeAsrSession, NativeAsrStreamingSessionConfig,
     RealtimeAudioFrame, RealtimeEventEnvelope, RealtimeSessionState, TranscriptUpdate,
 };
+
+/// Punctuates one FINAL segment's text before it is emitted. `Err` means
+/// "leave the segment text unchanged" (fail-closed, mirroring the batch
+/// stage's `punctuate_transcription_segments` contract); partials never go
+/// through this (re-punctuating every partial re-runs a bidirectional encoder
+/// per revision and reintroduces caption flicker).
+pub(crate) type StreamingFinalPunctuator =
+    Box<dyn Fn(&str) -> Result<String, PunctuationError> + Send>;
+
+/// Whether the punctuation stage applies to this model architecture: same
+/// capability fact the batch path reads from the pack's
+/// `general.architecture` (see `model_emits_punctuation` in
+/// `native_transcribe`), sourced here from the already-selected adapter
+/// descriptor so no pack re-read is needed.
+fn streaming_punctuation_stage_applies(model_architecture: &str) -> bool {
+    should_apply_punctuation(emits_punctuation_for_model_architecture(model_architecture))
+}
+
+/// Streaming counterpart of the batch `apply_punctuation_stage_if_applicable`
+/// gate, resolved once at session construction: the stage activates only for
+/// a model family the catalog honestly declares unpunctuated AND when the
+/// FireRedPunc capability pack is installed ("pack installed => stage on",
+/// no protocol field). A missing or unloadable pack deactivates the stage
+/// (fail-closed, never an error); the loaded runtime is cached on the session
+/// so finals do not reload BERT weights.
+fn resolve_streaming_final_punctuator(
+    request: &GgmlAsrStreamingSessionRequest,
+) -> Option<StreamingFinalPunctuator> {
+    if !streaming_punctuation_stage_applies(request.selected_family.model_architecture) {
+        return None;
+    }
+    let pack_path = resolve_firered_punc_pack_path()?;
+    let runtime = SendableFireRedPuncRuntime::from_pack(&pack_path).ok()?;
+    Some(Box::new(move |text| runtime.punctuate(text)))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GgmlAsrStreamingTranscriptUpdate {
@@ -139,6 +178,10 @@ where
     emitter: NativeStreamingTranscriptEmitter,
     driver: D,
     clock: Box<dyn FnMut() -> String + Send>,
+    /// FINAL-segment punctuation stage (see [`StreamingFinalPunctuator`]);
+    /// `None` when the stage does not apply to this model family or no
+    /// FireRedPunc pack is installed.
+    final_punctuator: Option<StreamingFinalPunctuator>,
     queued_audio_frames: usize,
     closed: bool,
 }
@@ -164,19 +207,32 @@ where
         request: &GgmlAsrStreamingSessionRequest,
         driver: D,
     ) -> Result<Self, GgmlAsrExecutionError> {
-        Self::new_with_clock(
+        Self::new_with_clock_and_punctuator(
             executor_id,
             request,
             driver,
             Box::new(realtime_timestamp_now),
+            resolve_streaming_final_punctuator(request),
         )
     }
 
+    /// Test constructor: injectable clock, punctuation stage off (no probing
+    /// of the environment for an installed FireRedPunc pack).
     pub(crate) fn new_with_clock(
         executor_id: &'static str,
         request: &GgmlAsrStreamingSessionRequest,
         driver: D,
+        clock: Box<dyn FnMut() -> String + Send>,
+    ) -> Result<Self, GgmlAsrExecutionError> {
+        Self::new_with_clock_and_punctuator(executor_id, request, driver, clock, None)
+    }
+
+    pub(crate) fn new_with_clock_and_punctuator(
+        executor_id: &'static str,
+        request: &GgmlAsrStreamingSessionRequest,
+        driver: D,
         mut clock: Box<dyn FnMut() -> String + Send>,
+        final_punctuator: Option<StreamingFinalPunctuator>,
     ) -> Result<Self, GgmlAsrExecutionError> {
         let adapter_id = request.selected_family.adapter_id;
         let native_options = NativeAsrRequestOptions::new()
@@ -214,6 +270,7 @@ where
             emitter,
             driver,
             clock,
+            final_punctuator,
             queued_audio_frames: 0,
             closed: false,
         })
@@ -221,6 +278,40 @@ where
 
     fn now(&mut self) -> String {
         (self.clock)()
+    }
+
+    /// FINAL-only punctuation stage: a segment's text is punctuated exactly
+    /// once, at the moment it stops being revised. Fail-closed per segment --
+    /// a classifier error keeps the driver's original text.
+    ///
+    /// INVARIANT: every update that can surface as a visible FINAL passes
+    /// through here first. There are exactly two producers of finals in this
+    /// session -- driver-emitted finals ([`Self::emit_update`]'s `Final`
+    /// branch) and the session-promoted pending tail partial
+    /// ([`Self::finalize_pending_output`]) -- and both call this before
+    /// `apply_final`. Never call `emitter.apply_final` or
+    /// `emitter.finalize_pending_output_at` from anywhere else in this
+    /// session, or a final can bypass the stage.
+    fn punctuate_final_update(&self, update: &mut TranscriptUpdate) {
+        if let Some(punctuate) = &self.final_punctuator
+            && let Ok(punctuated) = punctuate(&update.text)
+        {
+            update.text = punctuated;
+        }
+    }
+
+    /// Promotes the emitter's pending tail partial (if any) into a FINAL,
+    /// running the punctuation stage on it exactly like a driver-emitted
+    /// final. A driver that only ever emits partials (relying on the session
+    /// to finalize the tail on flush/finalize/finish) therefore cannot leak
+    /// an unpunctuated final.
+    fn finalize_pending_output(&mut self) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
+        let finalized_at = self.now();
+        let Some(mut update) = self.emitter.take_pending_partial_update() else {
+            return Ok(Vec::new());
+        };
+        self.punctuate_final_update(&mut update);
+        self.emitter.apply_final(update, finalized_at)
     }
 
     fn emit_update(
@@ -232,7 +323,8 @@ where
             GgmlAsrStreamingTranscriptUpdate::Partial(update) => {
                 self.emitter.apply_partial(update, created_at)
             }
-            GgmlAsrStreamingTranscriptUpdate::Final(update) => {
+            GgmlAsrStreamingTranscriptUpdate::Final(mut update) => {
+                self.punctuate_final_update(&mut update);
                 self.emitter.apply_final(update, created_at)
             }
         }
@@ -281,8 +373,7 @@ where
             .flush_updates()
             .map_err(|error| self.driver_error_to_native(error))?;
         let mut events = self.emit_updates(updates)?;
-        let finalized_at = self.now();
-        let finalized = self.emitter.finalize_pending_output_at(finalized_at)?;
+        let finalized = self.finalize_pending_output()?;
         self.emitter
             .ensure_output_capacity(events.len() + finalized.len())?;
         events.extend(finalized);
@@ -348,8 +439,7 @@ where
             .finish_updates()
             .map_err(|error| self.driver_error_to_native(error))?;
         let mut events = self.emit_updates(updates)?;
-        let finalized_at = self.now();
-        let finalized = self.emitter.finalize_pending_output_at(finalized_at)?;
+        let finalized = self.finalize_pending_output()?;
         self.emitter
             .ensure_output_capacity(events.len() + finalized.len())?;
         events.extend(finalized);
@@ -388,8 +478,7 @@ where
             return self.emit_updates(Vec::new());
         }
         let mut events = self.emit_updates(updates)?;
-        let finalized_at = self.now();
-        let finalized = self.emitter.finalize_pending_output_at(finalized_at)?;
+        let finalized = self.finalize_pending_output()?;
         self.emitter
             .ensure_output_capacity(events.len() + finalized.len())?;
         events.extend(finalized);
@@ -410,8 +499,7 @@ where
             .finish_updates()
             .map_err(|error| self.driver_error_to_native(error))?;
         let mut events = self.emit_updates(updates)?;
-        let finalized_at = self.now();
-        let finalized = self.emitter.finalize_pending_output_at(finalized_at)?;
+        let finalized = self.finalize_pending_output()?;
         self.emitter
             .ensure_output_capacity(events.len() + finalized.len())?;
         events.extend(finalized);
@@ -475,6 +563,7 @@ mod tests {
     use std::{collections::VecDeque, path::PathBuf};
 
     use super::*;
+    use crate::models::ggml_family_registry::firered_aed_runtime_descriptor_v1;
     use crate::{
         GgmlAsrBackendPreference, GgmlAsrExecutionOptions, RealtimeEvent, RealtimeTranscriptEvent,
         qwen3_asr_runtime_descriptor_v1,
@@ -771,5 +860,163 @@ mod tests {
             &["transcript.final", "audio.input.started"],
         );
         assert_transcript_text(&second_finalized[0], "second final", 4);
+    }
+
+    #[test]
+    fn punctuation_stage_applies_only_to_unpunctuated_architectures() {
+        // Same capability fact as the batch gate: firered (catalog
+        // emits_punctuation = false) opts in; qwen (already punctuates) and
+        // unknown architectures stay off.
+        assert!(streaming_punctuation_stage_applies(
+            firered_aed_runtime_descriptor_v1().model_architecture
+        ));
+        assert!(!streaming_punctuation_stage_applies(
+            qwen3_asr_runtime_descriptor_v1().model_architecture
+        ));
+        assert!(!streaming_punctuation_stage_applies("no-such-architecture"));
+    }
+
+    #[test]
+    fn final_updates_are_punctuated_partials_are_not() {
+        // The FINAL-only punctuation stage runs at the single point where a
+        // driver update becomes a transcript event, so every entry path
+        // (push_audio / poll / flush / finalize / finish) is covered; partial
+        // updates must reach the emitter untouched.
+        let request = request(true);
+        let driver = ScriptDriver::new([
+            ScriptStep::Partial {
+                revision: 1,
+                text: "你好世",
+            },
+            ScriptStep::Final {
+                revision: 2,
+                text: "你好世界",
+            },
+        ]);
+        let mut session = GgmlAsrStreamingTranscriptSession::new_with_clock_and_punctuator(
+            "script-streaming-executor",
+            &request,
+            driver,
+            test_clock(),
+            Some(Box::new(|text: &str| Ok(format!("{text}。")))),
+        )
+        .unwrap();
+        let _ = session.poll_events().unwrap();
+
+        let partial = session.push_audio(test_frame(1, 0)).unwrap();
+        assert_event_types(&partial, &["transcript.partial"]);
+        assert_transcript_text(&partial[0], "你好世", 1);
+
+        let final_event = session.push_audio(test_frame(2, 20)).unwrap();
+        assert_event_types(&final_event, &["transcript.final"]);
+        assert_transcript_text(&final_event[0], "你好世界。", 2);
+    }
+
+    #[test]
+    fn final_punctuator_error_keeps_original_text() {
+        // Fail-closed, mirroring the batch stage: a classifier failure leaves
+        // the driver's text exactly as produced instead of dropping the final.
+        let request = request(true);
+        let driver = ScriptDriver::new([ScriptStep::Final {
+            revision: 1,
+            text: "你好世界",
+        }]);
+        let mut session = GgmlAsrStreamingTranscriptSession::new_with_clock_and_punctuator(
+            "script-streaming-executor",
+            &request,
+            driver,
+            test_clock(),
+            Some(Box::new(|_: &str| {
+                Err(PunctuationError::Classifier("forward failed".to_string()))
+            })),
+        )
+        .unwrap();
+        let _ = session.poll_events().unwrap();
+
+        let final_event = session.push_audio(test_frame(1, 0)).unwrap();
+        assert_event_types(&final_event, &["transcript.final"]);
+        assert_transcript_text(&final_event[0], "你好世界", 1);
+    }
+
+    #[test]
+    fn promoted_pending_partial_is_punctuated_on_flush() {
+        // A driver that only ever emits partials relies on the session to
+        // promote the pending tail into a FINAL on flush/finalize/finish
+        // (`finalize_pending_output`); that promotion path never goes through
+        // `emit_update`'s Final branch, so it must run the punctuation stage
+        // itself -- this is the seam the ScriptStep::Final-based tests above
+        // do not cover.
+        let request = request(false);
+        let driver = ScriptDriver::new([ScriptStep::Partial {
+            revision: 1,
+            text: "你好世界",
+        }]);
+        let mut session = GgmlAsrStreamingTranscriptSession::new_with_clock_and_punctuator(
+            "script-streaming-executor",
+            &request,
+            driver,
+            test_clock(),
+            Some(Box::new(|text: &str| Ok(format!("{text}。")))),
+        )
+        .unwrap();
+        let _ = session.poll_events().unwrap();
+
+        assert!(session.push_audio(test_frame(1, 0)).unwrap().is_empty());
+        let flushed = session.flush().unwrap();
+
+        assert_event_types(&flushed, &["transcript.final"]);
+        assert_transcript_text(&flushed[0], "你好世界。", 1);
+    }
+
+    #[test]
+    fn promoted_pending_partial_is_punctuated_on_finalize_utterance() {
+        // Same promotion seam via finalize_utterance with visible partials:
+        // the emitted partial must stay untouched, and the tail promoted at
+        // the utterance boundary must be punctuated.
+        let request = request(true);
+        let driver = ScriptDriver::new([ScriptStep::Partial {
+            revision: 1,
+            text: "你好世界",
+        }]);
+        let mut session = GgmlAsrStreamingTranscriptSession::new_with_clock_and_punctuator(
+            "script-streaming-executor",
+            &request,
+            driver,
+            test_clock(),
+            Some(Box::new(|text: &str| Ok(format!("{text}。")))),
+        )
+        .unwrap();
+        let _ = session.poll_events().unwrap();
+
+        let partial = session.push_audio(test_frame(1, 0)).unwrap();
+        assert_event_types(&partial, &["transcript.partial"]);
+        assert_transcript_text(&partial[0], "你好世界", 1);
+
+        let finalized = session.finalize_utterance().unwrap();
+        assert_event_types(&finalized, &["transcript.final", "audio.input.started"]);
+        assert_transcript_text(&finalized[0], "你好世界。", 1);
+    }
+
+    #[test]
+    fn sessions_without_punctuator_leave_finals_untouched() {
+        // `new_with_clock` (and any family the stage does not apply to)
+        // carries no punctuator: finals pass through byte-for-byte.
+        let request = request(true);
+        let driver = ScriptDriver::new([ScriptStep::Final {
+            revision: 1,
+            text: "hello world",
+        }]);
+        let mut session = GgmlAsrStreamingTranscriptSession::new_with_clock(
+            "script-streaming-executor",
+            &request,
+            driver,
+            test_clock(),
+        )
+        .unwrap();
+        let _ = session.poll_events().unwrap();
+
+        let final_event = session.push_audio(test_frame(1, 0)).unwrap();
+        assert_event_types(&final_event, &["transcript.final"]);
+        assert_transcript_text(&final_event[0], "hello world", 1);
     }
 }
