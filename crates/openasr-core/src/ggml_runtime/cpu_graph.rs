@@ -28,6 +28,30 @@ const I32_WIDTH_BYTES: usize = std::mem::size_of::<i32>();
 const DEFAULT_CONTEXT_BYTES: usize = 1024 * 1024;
 const DEFAULT_GRAPH_SIZE: usize = 4096;
 
+/// `head_dim` (q/k/v ne0) values the Metal `GGML_OP_FLASH_ATTN_EXT` support
+/// check accepts, mirrored from `ggml-metal-device.m`'s
+/// `ggml_metal_device_supports_op` switch on `GGML_OP_FLASH_ATTN_EXT` ("for
+/// new head sizes, add checks here"). Any other head_dim silently falls back
+/// to a CPU-side (non-Metal) path inside ggml or asserts, depending on ggml
+/// version, so `flash_attn_ext` fails closed here instead of trusting the
+/// caller to have picked a supported head_dim.
+const METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS: &[usize] = &[
+    32, 40, 48, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576,
+];
+
+/// Pure predicate behind `ensure_flash_attn_ext_metal_head_dim_supported`,
+/// pulled out of the tensor-bearing method so the whitelist logic is testable
+/// without standing up a live Metal backend. Only the Metal backend enforces
+/// the whitelist; CPU/Gpu accept any head_dim `flash_attn_ext`'s other shape
+/// checks already allow.
+fn flash_attn_ext_head_dim_supported_on_backend(
+    backend_kind: GgmlCpuGraphBackend,
+    head_dim: usize,
+) -> bool {
+    backend_kind != GgmlCpuGraphBackend::Metal
+        || METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS.contains(&head_dim)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GgmlCpuGraphConfig {
     pub context_bytes: usize,
@@ -610,6 +634,13 @@ pub enum GgmlCpuGraphError {
         axis1: i32,
         axis2: i32,
         axis3: i32,
+    },
+    #[error(
+        "ggml_flash_attn_ext head_dim={head_dim} is not in the Metal backend's supported set {supported:?} (see ggml-metal-device.m FLASH_ATTN_EXT support check); use the naive attention fallback for this head_dim on Metal"
+    )]
+    FlashAttnExtUnsupportedMetalHeadDim {
+        head_dim: usize,
+        supported: &'static [usize],
     },
 }
 
@@ -1635,6 +1666,10 @@ impl GgmlStaticTensorArena {
 }
 
 impl<'a> GgmlCpuGraphBuilder<'a> {
+    pub(crate) fn backend_kind(&self) -> GgmlCpuGraphBackend {
+        self.backend_kind
+    }
+
     pub(crate) fn new_tensor_1d_f32(
         &self,
         len: usize,
@@ -2462,6 +2497,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             });
         }
         self.ensure_flash_attn_ext_compatible(q, k, v)?;
+        self.ensure_flash_attn_ext_metal_head_dim_supported(q)?;
 
         let mask_raw = if let Some(mask) = mask {
             self.ensure_tensor_type(mask, ffi::GGML_TYPE_F16, "ggml_flash_attn_ext mask")?;
@@ -2588,6 +2624,17 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.ensure_supported_storage_type(target_type, "ggml_cast target")?;
         let raw = unsafe { ffi::ggml_cast(self.context.as_ptr(), input.raw.as_ptr(), target_type) };
         self.new_tensor_checked(raw, "ggml_cast")
+    }
+
+    /// `cast` specialized to an F16 target, exposed so callers outside this
+    /// module (`ffi::GGML_TYPE_F16` is private to `ggml_runtime`) can convert
+    /// an additive f32 attention mask to the F16 type `flash_attn_ext`
+    /// requires without reaching into the ffi layer themselves.
+    pub(crate) fn cast_to_f16(
+        &self,
+        input: GgmlCpuTensor<'a>,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.cast(input, ffi::GGML_TYPE_F16)
     }
 
     pub(crate) fn cont(
@@ -4530,6 +4577,27 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         Ok(())
     }
 
+    /// Metal's `GGML_OP_FLASH_ATTN_EXT` support check only accepts a fixed
+    /// whitelist of head sizes (`METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS`).
+    /// Building the op with an unsupported head_dim on Metal degrades into a
+    /// backend-scheduler fallback or, on some ggml versions, an assert deep in
+    /// the Metal kernel dispatch. Fail closed here with a typed error instead,
+    /// so callers (e.g. a future encoder with head_dim 36/52 such as
+    /// moonshine) can catch it and fall back to the naive attention path.
+    fn ensure_flash_attn_ext_metal_head_dim_supported(
+        &self,
+        q: GgmlCpuTensor<'a>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        let head_dim = self.tensor_shape_4d(q)?[0];
+        if flash_attn_ext_head_dim_supported_on_backend(self.backend_kind, head_dim) {
+            return Ok(());
+        }
+        Err(GgmlCpuGraphError::FlashAttnExtUnsupportedMetalHeadDim {
+            head_dim,
+            supported: METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
+        })
+    }
+
     fn validate_permute_axes(
         &self,
         axis0: i32,
@@ -5074,6 +5142,7 @@ mod tests {
     use super::{
         GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy,
         GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlRopeExtParams,
+        METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS, flash_attn_ext_head_dim_supported_on_backend,
         runtime_gpu_is_available,
     };
 
@@ -6983,6 +7052,71 @@ mod tests {
                     reason: "ggml_flash_attn_ext max_bias > 0 requires a mask tensor",
                 }
             ),
+        }
+    }
+
+    #[test]
+    fn flash_attn_ext_metal_head_dim_whitelist_matches_ggml_metal_device_support_check() {
+        // Every whitelisted head_dim must be accepted on Metal...
+        for &head_dim in METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS {
+            assert!(
+                flash_attn_ext_head_dim_supported_on_backend(GgmlCpuGraphBackend::Metal, head_dim),
+                "head_dim={head_dim} should be Metal-supported"
+            );
+        }
+        // ...and a handful of unsupported values (including moonshine's
+        // relative-position head sizes 36/52, the concrete future-caller risk
+        // this guard exists for) must be rejected on Metal.
+        for head_dim in [1, 16, 36, 52, 60, 100, 200, 577] {
+            assert!(
+                !flash_attn_ext_head_dim_supported_on_backend(GgmlCpuGraphBackend::Metal, head_dim),
+                "head_dim={head_dim} should not be Metal-supported"
+            );
+        }
+        // Cpu/Gpu never enforce the whitelist -- only Metal's kernel dispatch
+        // is fixed to this set of head sizes.
+        for head_dim in [1, 36, 52, 64, 577] {
+            assert!(flash_attn_ext_head_dim_supported_on_backend(
+                GgmlCpuGraphBackend::Cpu,
+                head_dim
+            ));
+            assert!(flash_attn_ext_head_dim_supported_on_backend(
+                GgmlCpuGraphBackend::Gpu,
+                head_dim
+            ));
+        }
+    }
+
+    #[test]
+    fn flash_attn_ext_rejects_unsupported_metal_head_dim_end_to_end() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner should initialize");
+        let graph = runner.start_graph();
+        // head_dim=3 is not in the Metal whitelist; the guard must fire even
+        // though this graph never touches a real Metal backend (backend_kind
+        // is a config value the builder carries, independent of which
+        // physical device the test happens to run compute on).
+        let mut metal_graph = graph;
+        metal_graph.backend_kind = GgmlCpuGraphBackend::Metal;
+        let q = metal_graph
+            .new_tensor_4d_f32(3, 1, 1, 1, "q")
+            .expect("q should allocate");
+        let k = metal_graph
+            .new_tensor_4d_f32(3, 2, 1, 1, "k")
+            .expect("k should allocate");
+        let v = metal_graph
+            .new_tensor_4d_f32(3, 2, 1, 1, "v")
+            .expect("v should allocate");
+        match metal_graph.flash_attn_ext(q, k, v, None, 1.0, 0.0, 0.0) {
+            Ok(_) => panic!("flash_attn_ext must reject head_dim=3 on the Metal backend"),
+            Err(GgmlCpuGraphError::FlashAttnExtUnsupportedMetalHeadDim {
+                head_dim,
+                supported,
+            }) => {
+                assert_eq!(head_dim, 3);
+                assert_eq!(supported, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS);
+            }
+            Err(err) => panic!("unexpected flash_attn_ext error: {err}"),
         }
     }
 
