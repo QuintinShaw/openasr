@@ -913,19 +913,29 @@ mod tests {
         assert_eq!(deferred.into_iter().collect::<Vec<_>>(), vec![2, 4]);
     }
 
+    // The two receiver-draining tests below intentionally use a GENEROUS
+    // collect window and a dropped sender: their loops must terminate via the
+    // batch cap or channel disconnect, never via the wall clock. A tiny (1ms)
+    // window makes the collect loop's `now >= deadline` check a race against
+    // scheduler preemption on a loaded runner -- the loop can expire before
+    // the first `recv_timeout` even runs, silently truncating the batch
+    // (observed as a CI-only flake). The window never actually elapses, so
+    // the generous value does not slow the tests down.
+
     #[test]
     fn serve_batch_drain_compatible_batch_collects_receiver_until_cap() {
         let (sender, receiver) = std::sync::mpsc::channel();
         sender.send(1).expect("first");
         sender.send(2).expect("second");
         sender.send(3).expect("third");
+        drop(sender);
         let mut deferred = VecDeque::new();
 
         let batch = serve_batch_drain_compatible_batch(
             &mut deferred,
             &receiver,
             2,
-            Duration::from_millis(1),
+            Duration::from_secs(30),
             |_, _| true,
         )
         .expect("drained batch");
@@ -948,7 +958,7 @@ mod tests {
             &mut deferred,
             &receiver,
             3,
-            Duration::from_millis(1),
+            Duration::from_secs(30),
             |first, next| first % 2 == next % 2,
         )
         .expect("drained batch");
