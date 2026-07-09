@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Path, sync::OnceLock};
+use std::{collections::BTreeMap, path::Path, sync::OnceLock, time::Instant};
 
 use crate::NATIVE_RUNTIME_MODEL_ID_AUTO;
 use crate::api::audio_io::load_wav_16khz_mono_f32_v0;
@@ -413,10 +413,25 @@ pub(super) fn run_native_transcription(
     let language_hint = request.language.clone();
     let model_pack_path = request.model_pack_path.clone();
     let punctuate = request.punctuate;
+    // Coarse per-request stage timing: "inference" spans model resolution +
+    // audio prep (see the `audio_prep` stage logged inside `_impl` around the
+    // WAV load) + decode/longform-assembly, i.e. the whole
+    // `run_native_transcription_impl` call; "postprocess" covers the
+    // optional punctuation-restoration and forced-align refine stages below.
+    // Grain matches what the task asked for (per-request, not per-frame); the
+    // finer `audio_prep` sub-stage nests inside `inference`'s span rather than
+    // being disjoint from it, which is called out in both log lines' names.
+    let inference_started = Instant::now();
     let transcription = run_native_transcription_impl(request)?;
+    crate::stage_timing::log_stage(
+        "native_transcribe",
+        "inference",
+        inference_started.elapsed(),
+    );
+    let postprocess_started = Instant::now();
     let transcription =
         apply_punctuation_stage_if_applicable(transcription, model_pack_path.as_deref(), punctuate);
-    if refine {
+    let result = if refine {
         publish_align_progress();
         refine_transcription_word_timestamps_with_forced_aligner(
             transcription,
@@ -425,7 +440,13 @@ pub(super) fn run_native_transcription(
         )
     } else {
         Ok(transcription)
-    }
+    };
+    crate::stage_timing::log_stage(
+        "native_transcribe",
+        "postprocess",
+        postprocess_started.elapsed(),
+    );
+    result
 }
 
 /// Whether the punctuation-restoration stage should attempt to run: the
@@ -574,6 +595,7 @@ fn assign_aligned_words_to_segments(segments: &mut [Segment], items: &[ForcedAli
 fn run_native_transcription_impl(
     request: TranscriptionRequest,
 ) -> Result<Transcription, BackendError> {
+    let model_resolve_started = Instant::now();
     let requested_model_id = normalize_and_validate_model_id(&request)?;
     let model_pack_path = request
         .model_pack_path
@@ -651,6 +673,17 @@ fn run_native_transcription_impl(
             });
         }
     }
+    // OPENASR_TIMING=1 detail: model-pack path validation + gguf metadata/
+    // tensor-index preflight + family/adapter selection, i.e. everything
+    // above this point in the request path. Nested inside the coarse
+    // `inference` stage the caller (`run_native_transcription`) already logs
+    // unconditionally.
+    crate::stage_timing::log_detail_stage(
+        "native_transcribe",
+        "model_resolve",
+        model_resolve_started.elapsed(),
+    );
+    let audio_prep_started = Instant::now();
     let prepared_audio = load_wav_16khz_mono_f32_v0(
         &request.input_path,
         "Native ASR Core backend",
@@ -659,6 +692,11 @@ fn run_native_transcription_impl(
     .map_err(|error| BackendError::NativeUnsupportedInputFormat {
         reason: error.to_string(),
     })?;
+    crate::stage_timing::log_stage(
+        "native_transcribe",
+        "audio_prep",
+        audio_prep_started.elapsed(),
+    );
 
     // Compute speaker turns up front (independent of the transcript) so they can
     // be attributed onto whichever transcription path runs below.
@@ -824,6 +862,7 @@ fn run_native_transcription_impl(
             // registered) leaves the decode byte-identical to before.
             let transcription_control =
                 super::transcription_control::current_transcription_control();
+            let mut slice_index = 0usize;
             for slice in plan.slices {
                 if let Some(control) = &transcription_control
                     && control.wait_at_slice_boundary()
@@ -872,6 +911,8 @@ fn run_native_transcription_impl(
                         }
                     }
                 }
+                slice_index += 1;
+                let slice_decode_started = Instant::now();
                 let result = run_dispatch_once(
                     dispatch,
                     &runtime_preflight,
@@ -880,6 +921,18 @@ fn run_native_transcription_impl(
                     slice_options,
                     backend_preference,
                 )?;
+                // OPENASR_TIMING=1 detail: per-longform-slice decode time.
+                // Coarse by default (only the whole-request `inference` stage
+                // is logged unconditionally) since a long recording can chunk
+                // into many slices -- one line per slice would be noisy for
+                // the always-on tier.
+                crate::stage_timing::log_detail_event(
+                    "native_transcribe",
+                    format_args!(
+                        "stage=longform_slice_decode index={slice_index} samples={slice_samples} duration_ms={:.3}",
+                        slice_decode_started.elapsed().as_secs_f64() * 1000.0
+                    ),
+                );
                 // Destructure instead of `result.clone().into_transcription()`:
                 // both fields are consumed below and nothing needs `result`
                 // as a whole afterwards, so there is nothing left to clone.
