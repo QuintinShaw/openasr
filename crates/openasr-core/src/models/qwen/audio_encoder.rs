@@ -24,6 +24,19 @@ use super::runtime_contract::Qwen3AsrExecutionMetadata;
 /// graph build/upload; `compute_us` covers the GPU graph compute. Used to
 /// confirm whether the longform encoder bottleneck is upload/setup or compute.
 const QWEN3_ENCODER_PROFILE_ENV: &str = "OPENASR_QWEN_ENCODER_PROFILE";
+
+/// Opt-out escape hatch for `transformer_layer`'s flash-attention branch in
+/// the qwen audio encoder self-attention, mirrored from the Whisper encoder's
+/// `OPENASR_WHISPER_GGML_DISABLE_ENCODER_FLASH_ATTN` convention
+/// (`models/whisper/execution_policy.rs`): fused softmax/scale on a trusted
+/// backend (Metal/CPU), no materialized `[seq, seq]` scores tensor, default
+/// on.
+const OPENASR_QWEN_GGML_DISABLE_AUDIO_ENCODER_FLASH_ATTN: &str =
+    "OPENASR_QWEN_GGML_DISABLE_AUDIO_ENCODER_FLASH_ATTN";
+
+fn qwen_audio_encoder_flash_attention_enabled() -> bool {
+    std::env::var_os(OPENASR_QWEN_GGML_DISABLE_AUDIO_ENCODER_FLASH_ATTN).is_none()
+}
 use super::tensor_names::{
     AUDIO_CONV_OUT_BIAS, AUDIO_CONV_OUT_WEIGHT, AUDIO_CONV1_BIAS, AUDIO_CONV1_WEIGHT,
     AUDIO_CONV2_BIAS, AUDIO_CONV2_WEIGHT, AUDIO_CONV3_BIAS, AUDIO_CONV3_WEIGHT, AUDIO_LN_POST_BIAS,
@@ -503,6 +516,7 @@ fn encode_qwen3_audio_embeddings_with_graph<'a>(
         metadata.audio_heads,
         chunked_mel.row_count,
         mask_tensor,
+        qwen_audio_encoder_flash_attention_enabled(),
     )?;
 
     state = graph
@@ -938,6 +952,7 @@ pub(crate) fn load_qwen3_audio_encoder_weights_from_reader(
 /// `qwen3-asr.audio.n_layers` hparam) and the block KIND is `transformer_layer`
 /// (the descriptor's `TransformerEncoderLayer`). The encoder mirror of the
 /// LlmDecoder composer (S2); the emitted op sequence is unchanged.
+#[allow(clippy::too_many_arguments)]
 fn compose_transformer_encoder_layer_stack<'a>(
     graph: &mut crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
     mut state: crate::ggml_runtime::GgmlCpuTensor<'a>,
@@ -946,6 +961,7 @@ fn compose_transformer_encoder_layer_stack<'a>(
     attention_heads: usize,
     token_count: usize,
     mask: crate::ggml_runtime::GgmlCpuTensor<'a>,
+    use_flash_attention: bool,
 ) -> Result<crate::ggml_runtime::GgmlCpuTensor<'a>, Qwen3AsrAudioEncoderError> {
     for (layer_idx, tensors) in layer_inputs {
         state = run_audio_encoder_layer(
@@ -956,12 +972,14 @@ fn compose_transformer_encoder_layer_stack<'a>(
             attention_heads,
             token_count,
             mask,
+            use_flash_attention,
             tensors,
         )?;
     }
     Ok(state)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_audio_encoder_layer<'a>(
     graph: &mut crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
     layer_idx: usize,
@@ -970,6 +988,7 @@ fn run_audio_encoder_layer<'a>(
     attention_heads: usize,
     token_count: usize,
     mask: crate::ggml_runtime::GgmlCpuTensor<'a>,
+    use_flash_attention: bool,
     tensors: &AudioLayerGraphTensors<'a>,
 ) -> Result<crate::ggml_runtime::GgmlCpuTensor<'a>, Qwen3AsrAudioEncoderError> {
     let _ = layer_idx;
@@ -983,6 +1002,7 @@ fn run_audio_encoder_layer<'a>(
             token_count,
             layer_norm_epsilon: QWEN3_AUDIO_LAYER_NORM_EPSILON,
             ffn_activation: FeedForwardActivation::GeluErf,
+            use_flash_attention,
         },
         TransformerEncoderLayerWeights {
             attn_norm_weight: tensors.attn_norm_weight,
@@ -1478,6 +1498,86 @@ mod tests {
         assert!(
             mean_abs_diff < 0.01,
             "audio encoder output diverges from Python reference on average: mean_abs_diff={mean_abs_diff}"
+        );
+    }
+
+    const QWEN_AUDIO_ENCODER_REAL_PACK_ENV: &str = "OPENASR_QWEN_AUDIO_ENCODER_REAL_PACK";
+
+    /// Long-audio degradation guard for the flash-attention self-attention
+    /// path: run the real audio encoder near the family's
+    /// `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS` (30s) chunk cap -- this test does
+    /// NOT change that cap, it only probes flash's numerical behavior at the
+    /// edge of it -- and confirm the output stays finite and bounded over the
+    /// full self-attention sequence length. Dev-machine-only (needs a real
+    /// qwen3-asr `.oasr` pack); skips via `#[ignore]` like the other
+    /// `*_REAL_PACK` harnesses in this family (see `llm_transformer.rs`).
+    #[test]
+    #[ignore = "manual real-pack harness: set OPENASR_QWEN_AUDIO_ENCODER_REAL_PACK to a qwen3-asr .oasr model pack"]
+    fn qwen_audio_encoder_flash_attention_stays_finite_near_chunk_cap() {
+        use std::path::PathBuf;
+
+        use crate::arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS;
+        use crate::{read_gguf_metadata_from_runtime_source, validate_ggml_runtime_source_path};
+
+        let pack_path = std::env::var_os(QWEN_AUDIO_ENCODER_REAL_PACK_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{QWEN_AUDIO_ENCODER_REAL_PACK_ENV} must point to a qwen3-asr .oasr model pack"
+                )
+            });
+
+        let runtime_source =
+            validate_ggml_runtime_source_path(&pack_path).expect("valid qwen3-asr runtime source");
+        let raw_metadata = read_gguf_metadata_from_runtime_source(&runtime_source)
+            .expect("read qwen3-asr runtime metadata");
+        let metadata =
+            super::super::runtime_contract::parse_qwen3_execution_metadata(&raw_metadata)
+                .expect("parse qwen3-asr metadata");
+
+        let reader = GgufTensorDataReader::from_path(&pack_path).expect("gguf reader");
+        let weights = load_qwen3_audio_encoder_weights_from_reader(&reader, metadata)
+            .expect("audio encoder weights");
+
+        // Just under the 30s cap this test deliberately does not touch.
+        let target_seconds = DEFAULT_ENCODER_SAFE_CHUNK_SECONDS - 2.0;
+        let frames_per_second = metadata.sample_rate_hz as usize / metadata.hop_length;
+        let n_frames = (frames_per_second as f32 * target_seconds) as usize;
+        // Deterministic pseudo-mel data (not real speech): this test targets
+        // NUMERICAL degeneration (NaN/Inf/unbounded growth) in the flash
+        // self-attention over a long sequence, which real-speech content
+        // would not exercise any more directly than a dense synthetic signal.
+        let data: Vec<f32> = (0..metadata.n_mels * n_frames)
+            .map(|index| ((index % 97) as f32 - 48.0) / 97.0)
+            .collect();
+        let mel_features = Qwen3AsrMelFeatures {
+            n_mels: metadata.n_mels,
+            n_frames,
+            data,
+        };
+
+        let mut runtime = Qwen3AsrAudioEncoderRuntime::new(Some(&pack_path)).expect("runtime");
+        let output = runtime
+            .encode(&weights, metadata, &mel_features)
+            .expect("encode near the chunk cap");
+
+        assert!(!output.rows.is_empty());
+        assert_eq!(output.rows.len(), output.row_count * metadata.llm_d_model);
+        let mut max_abs = 0.0_f32;
+        for &value in &output.rows {
+            assert!(
+                value.is_finite(),
+                "flash-attention encoder output must stay finite near the chunk cap"
+            );
+            max_abs = max_abs.max(value.abs());
+        }
+        eprintln!(
+            "qwen_audio_encoder_flash_attention_stays_finite_near_chunk_cap: n_frames={n_frames} row_count={} max_abs={max_abs}",
+            output.row_count
+        );
+        assert!(
+            max_abs < 1.0e4,
+            "flash-attention encoder output magnitude blew up near the chunk cap: max_abs={max_abs}"
         );
     }
 }
