@@ -52,8 +52,7 @@ opt-in post-process applied to an unpunctuated ASR model's output.
 
 **Verification status:** this is a brand-new catalog entry (no prior public listing). Local
 verification covers exact per-token label parity against the upstream PyTorch forward across a
-set of Chinese golden sentences (all four punctuation classes plus the no-mark class). This
-pack is staged in a private repo, not yet publicly listed.
+set of Chinese golden sentences (all four punctuation classes plus the no-mark class).
 """
 
 intro_zh = """
@@ -74,8 +73,7 @@ FireRedPunc 是 **FireRedTeam** 推出的**标点预测**模型，属于 FireRed
 **不是独立的转写模型。** 本模型包本身无法转写音频；它是应用于无标点 ASR 模型输出的可选后处理步骤。
 
 **验证状态:** 这是一个全新的 catalog 条目（此前没有公开上架记录）。本地验证覆盖了在一组中文黄金句
-（涵盖全部四种标点类别以及无标点类别）上，与上游 PyTorch 前向逐词标签完全一致的对齐检查。本模型包
-目前仅暂存于私有仓库，尚未公开上架。
+（涵盖全部四种标点类别以及无标点类别）上，与上游 PyTorch 前向逐词标签完全一致的对齐检查。
 """
 
 acknowledgement = """
