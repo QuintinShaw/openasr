@@ -17,21 +17,23 @@ pub(super) fn ensure_capacity(
     config: RealtimeBufferConfig,
     frames: &[RealtimeAudioFrame],
 ) -> Result<(), RealtimeBufferError> {
-    if frames.len() > config.max_buffered_frames {
-        return Err(RealtimeBufferError::AudioBufferOverflow {
-            buffered_frames: frames.len(),
-            max_buffered_frames: config.max_buffered_frames,
-            buffered_samples: buffered_samples(frames),
-            max_buffered_samples: config.max_buffered_samples,
-        });
-    }
+    ensure_capacity_counts(config, frames.len(), buffered_samples(frames))
+}
 
-    let samples = buffered_samples(frames);
-    if samples > config.max_buffered_samples {
+/// Same capacity check as [`ensure_capacity`], but taking an already-known
+/// frame count / sample count instead of a frame slice. This lets hot paths
+/// that maintain a running projection (e.g. active-utterance ingestion)
+/// validate capacity without materializing or cloning the frame buffer.
+pub(super) fn ensure_capacity_counts(
+    config: RealtimeBufferConfig,
+    frame_count: usize,
+    sample_count: usize,
+) -> Result<(), RealtimeBufferError> {
+    if frame_count > config.max_buffered_frames || sample_count > config.max_buffered_samples {
         return Err(RealtimeBufferError::AudioBufferOverflow {
-            buffered_frames: frames.len(),
+            buffered_frames: frame_count,
             max_buffered_frames: config.max_buffered_frames,
-            buffered_samples: samples,
+            buffered_samples: sample_count,
             max_buffered_samples: config.max_buffered_samples,
         });
     }

@@ -880,7 +880,13 @@ fn run_native_transcription_impl(
                     slice_options,
                     backend_preference,
                 )?;
-                let transcription = result.clone().into_transcription();
+                // Destructure instead of `result.clone().into_transcription()`:
+                // both fields are consumed below and nothing needs `result`
+                // as a whole afterwards, so there is nothing left to clone.
+                let GgmlAsrExecutionResult {
+                    transcription,
+                    carry_context,
+                } = result;
                 ran_any_slice = true;
                 match carry_prompt_mode {
                     LongformPromptCarryMode::Disabled => {}
@@ -894,9 +900,8 @@ fn run_native_transcription_impl(
                         }
                     }
                     LongformPromptCarryMode::TokenHistory => {
-                        if let Some(prompt_token_ids) = result
-                            .carry_context
-                            .and_then(|context| context.prompt_token_ids)
+                        if let Some(prompt_token_ids) =
+                            carry_context.and_then(|context| context.prompt_token_ids)
                         {
                             rolling_prompt_token_ids = prompt_token_ids;
                         }

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -17,6 +18,19 @@ impl ScalarMetadataView for GgufMetadata {
     fn get_u64_scalar(&self, key: &str) -> Option<u64> {
         self.get_u64(key)
             .or_else(|| self.get_u32(key).map(u64::from))
+    }
+}
+
+/// Forwarding impl so call sites can pass `&Arc<GgufMetadata>` (as stored on
+/// `GgmlAsrRuntimeSourcePreflight::metadata`) directly, without an explicit
+/// deref at every one of the ~25 read sites across model families.
+impl<T: ScalarMetadataView + ?Sized> ScalarMetadataView for Arc<T> {
+    fn get_string_scalar(&self, key: &str) -> Option<&str> {
+        T::get_string_scalar(self, key)
+    }
+
+    fn get_u64_scalar(&self, key: &str) -> Option<u64> {
+        T::get_u64_scalar(self, key)
     }
 }
 

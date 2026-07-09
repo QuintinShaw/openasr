@@ -3185,7 +3185,7 @@ mod tests {
             persisted,
             GgmlAsrRuntimeSourcePreflight {
                 runtime_source,
-                metadata,
+                metadata: Arc::new(metadata),
                 tensor_index: Arc::new(tensor_index),
             },
         )

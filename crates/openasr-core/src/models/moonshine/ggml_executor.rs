@@ -161,7 +161,10 @@ impl MoonshineGgmlExecutor {
                         backend: decoder_config.backend,
                         uses_scheduler: decoder_config.use_scheduler,
                         prepared_runtime: Arc::clone(&prepared_runtime),
-                        encoder_output: encoder_output.clone(),
+                        // Moved (not cloned): this branch is the last use of
+                        // `encoder_output` -- the `else` branch below only
+                        // borrows it, and nothing reads it after the if/else.
+                        encoder_output,
                         decode_config,
                         word_timestamps: request.request_options.word_timestamps,
                         audio_duration_seconds: audio_duration,
