@@ -995,7 +995,13 @@ pub(crate) fn encode(
             crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
         ),
         backend,
-        use_scheduler: backend.is_gpu_class(),
+        // Ggml's gallocr scheduler reuses buffer space across tensors whose
+        // lifetimes don't overlap instead of giving every non-view tensor its
+        // own allocation; on the CPU backend both allocators produce
+        // identical results, so unconditionally enabling it (like the
+        // sibling cohere/moonshine encoders) only bounds memory footprint on
+        // long audio, never the encoder's output.
+        use_scheduler: true,
     };
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
     let mut graph = runner.start_graph();
@@ -1081,6 +1087,37 @@ pub(crate) fn encode(
     for tap in &taps {
         graph.set_output(*tap).map_err(ggml_err("set_output"))?;
     }
+    // Every tensor this graph uploads to (rather than computes) must be
+    // flagged `set_input`: unlike firered/moonshine/cohere, dolphin has no
+    // persistent weight arena -- every weight (and the audio features / the
+    // relative-position table) is a fresh leaf tensor in this per-call graph
+    // with no buffer of its own yet, so without the flag the scheduler's
+    // backend-assignment pass has no rule to place it on and aborts.
+    graph
+        .set_input(input)
+        .map_err(ggml_err("mark_input(features)"))?;
+    if is_multilingual {
+        graph
+            .set_input(pos_emb)
+            .map_err(ggml_err("mark_input(rel_pos)"))?;
+    }
+    for (tensor, _, _) in &builder.uploads {
+        graph
+            .set_input(*tensor)
+            .map_err(ggml_err("mark_input(weight)"))?;
+    }
+    for (tensor, _, _, _) in &builder.native_uploads {
+        graph
+            .set_input(*tensor)
+            .map_err(ggml_err("mark_input(weight_native)"))?;
+    }
+    // Allocate the forward graph through the scheduler's gallocr for
+    // liveness-based buffer reuse before uploading inputs -- every tap above
+    // is already marked as an output, so gallocr keeps each one's buffer
+    // resident instead of recycling it once a later block stops reading it.
+    graph
+        .prepare_outputs_for_upload(&taps)
+        .map_err(ggml_err("prepare_outputs"))?;
 
     // Phase C: upload inputs + weights, then compute. Native (quantized/f16)
     // rank-2 `.weight` operands upload their raw block bytes verbatim so they stay

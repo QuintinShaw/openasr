@@ -1167,6 +1167,12 @@ impl MoonshineDecoderGraphRuntime {
         graph
             .set_output(logits)
             .map_err(build_err("ggml_set_output(prefill_logits)"))?;
+        // Allocate the batched prefill graph through the scheduler's gallocr
+        // before uploading inputs, mirroring the single-step reuse graph above
+        // and the sibling cohere/firered decoders.
+        graph
+            .prepare_outputs_for_upload(&[logits])
+            .map_err(build_err("ggml_prepare_outputs(prefill_logits)"))?;
 
         graph
             .set_i32_slice(token_ids_tensor, &token_ids, "moonshine_prefill_token")
@@ -1396,6 +1402,12 @@ impl MoonshineDecoderGraphRuntime {
         graph
             .set_output(logits)
             .map_err(build_err("ggml_set_output(logits)"))?;
+        // Allocate the full-prefix step graph through the scheduler's gallocr
+        // before uploading inputs, mirroring the single-step reuse graph and
+        // batched prefill above.
+        graph
+            .prepare_outputs_for_upload(&[logits])
+            .map_err(build_err("ggml_prepare_outputs(logits)"))?;
 
         let token_values = tokens_as_i32(tokens)?;
         let position_values: Vec<i32> = (0..token_count as i32).collect();
