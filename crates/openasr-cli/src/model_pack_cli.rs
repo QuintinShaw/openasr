@@ -117,6 +117,27 @@ fn import_command(command: ImportCommand) -> Result<()> {
         } => {
             import_firered_aed_local_command(&source_root, &output_root, &package_id, quantization)
         }
+        ImportCommand::FireredPunc {
+            source_safetensors,
+            vocab_txt,
+            output_pack,
+            package_id,
+            source_name,
+            source_revision,
+            license_name,
+            license_source,
+            quantization,
+        } => import_firered_punc_local_command(
+            &source_safetensors,
+            &vocab_txt,
+            &output_pack,
+            &package_id,
+            &source_name,
+            &source_revision,
+            &license_name,
+            &license_source,
+            quantization,
+        ),
         ImportCommand::XasrZipformer {
             source_root,
             output_root,
@@ -321,6 +342,47 @@ fn import_firered_aed_local_command(
         result.output_path.display(),
         result.tensor_count,
         result.vocab_size
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn import_firered_punc_local_command(
+    source_safetensors: &Path,
+    vocab_txt: &Path,
+    output_pack: &Path,
+    package_id: &str,
+    source_name: &str,
+    source_revision: &str,
+    license_name: &str,
+    license_source: &str,
+    quantization: ImportFireredPuncQuantization,
+) -> Result<()> {
+    let request = openasr_core::FireRedPuncImportRequest {
+        source_safetensors: source_safetensors.to_path_buf(),
+        vocab_txt: vocab_txt.to_path_buf(),
+        output_pack: output_pack.to_path_buf(),
+        model_id: package_id.to_string(),
+        source_name: source_name.to_string(),
+        source_revision: source_revision.to_string(),
+        license_name: license_name.to_string(),
+        license_source: license_source.to_string(),
+        quantization: match quantization {
+            ImportFireredPuncQuantization::Fp16 => openasr_core::FireRedPuncQuantizationMode::Fp16,
+            ImportFireredPuncQuantization::Q8_0 => openasr_core::FireRedPuncQuantizationMode::Q8_0,
+            ImportFireredPuncQuantization::Q4_K => openasr_core::FireRedPuncQuantizationMode::Q4_K,
+        },
+    };
+
+    ensure_ggml_package_output_suffix(output_pack)?;
+    let result = openasr_core::convert_local_firered_punc_source_to_runtime_pack(&request)
+        .map_err(anyhow::Error::new)?;
+    println!(
+        "Imported FireRedPunc local source into punctuation runtime pack:\n- source: {}\n- output: {}\n- tensor_count: {}\n- token_count: {}",
+        source_safetensors.display(),
+        result.output_path.display(),
+        result.tensor_count,
+        result.token_count
     );
     Ok(())
 }
