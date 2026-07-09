@@ -35,6 +35,12 @@ const CATALOG_SPEAKER_EMBEDDER_WESPEAKER_ID: &str = "wespeaker-voxceleb-resnet34
 /// `CATALOG_FEATURE_SPEAKER_DIARIZATION`'s role as the shared vocabulary
 /// between the catalog and the CLI/server opt-in wiring.
 pub const CATALOG_FEATURE_WORD_TIMESTAMPS: &str = "word-timestamps";
+/// Capability-pack feature key for the optional punctuation-restoration
+/// post-processing stage (restores Chinese full-width marks on an unpunctuated
+/// family's transcript). Mirrors `CATALOG_FEATURE_SPEAKER_DIARIZATION` /
+/// `CATALOG_FEATURE_WORD_TIMESTAMPS` as the shared catalog<->runtime vocabulary
+/// for an opt-in capability pack.
+pub const CATALOG_FEATURE_PUNCTUATION: &str = "punctuation";
 // Soft-disabled for the initial public release lane. The ModelScope URL
 // validation block below stays in place so re-enabling is a one-switch decision.
 const MODELSCOPE_CATALOG_MIRRORS_ENABLED: bool = false;
@@ -356,6 +362,13 @@ pub enum CatalogCapabilityRole {
     /// per-word timestamps with aligner-refined spans. Opt-in only; the
     /// family's own approximate timestamps remain the default.
     ForcedAligner,
+    /// A punctuation-restoration model for the `punctuation` feature (e.g.
+    /// FireRedPunc): a text-in/labels-out BERT classifier that adds Chinese
+    /// full-width marks to an unpunctuated family's transcript in a
+    /// finalize-only post-process. Opt-in and auto-gated on the ASR model's
+    /// `emits_punctuation == Some(false)`; never re-punctuates a punctuating
+    /// family.
+    PunctuationRestorer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -489,6 +502,21 @@ impl ModelCatalog {
             .find(|model| {
                 model.capability.as_ref().is_some_and(|capability| {
                     capability.role == CatalogCapabilityRole::ForcedAligner
+                })
+            })
+    }
+
+    /// The punctuation-restoration capability pack for the `punctuation`
+    /// feature, when the catalog carries one. Any public pack advertising
+    /// `(punctuation, PunctuationRestorer)` qualifies -- there is exactly one
+    /// today (FireRedPunc) but callers should not hardcode its id (mirrors
+    /// `word_timestamps_forced_aligner_pack`).
+    pub fn punctuation_restorer_pack(&self) -> Option<&CatalogModel> {
+        self.capability_packs_for_feature(CATALOG_FEATURE_PUNCTUATION)
+            .into_iter()
+            .find(|model| {
+                model.capability.as_ref().is_some_and(|capability| {
+                    capability.role == CatalogCapabilityRole::PunctuationRestorer
                 })
             })
     }

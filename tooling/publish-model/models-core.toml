@@ -594,3 +594,34 @@ min_core_version = "0.1.9"
 ["qwen3-forced-aligner-0.6b".capability]
 feature = "word-timestamps"
 role = "forced-aligner"
+
+# Punctuation-restoration support pack: a chinese-lert-base BERT token
+# classifier (upstream FireRedTeam/FireRedPunc) that adds Chinese full-width
+# marks to an unpunctuated family's transcript in a finalize-only post-process.
+# Not an ASR model. Chinese-only by construction (the released label set is the
+# 5 classes none/，。？！). Staged to a PRIVATE HF repo; the catalog entry stays
+# public:false (published without --public) until a deliberate later flip, like
+# the diarization/forced-aligner capability packs above.
+["firered-punc"]
+kind = "capability-pack"
+family = "firered-punc"
+hf_repo = "OpenASR/firered-punc"
+release_public = true
+size = "base"
+registry_id = "firered-punc"
+display_name = "FireRedPunc"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/FireRedTeam/FireRedPunc"
+license_class = "permissive"
+# Chinese-only by construction: the released label set cannot emit English
+# half-width marks, so this documents the single supported recognition language
+# rather than inheriting a family default.
+languages = ["zh"]
+quants = ["fp16"]
+recommended_quant = "fp16"
+upstream_release_date = "2026-02-12"
+min_core_version = "0.1.11"
+
+["firered-punc".capability]
+feature = "punctuation"
+role = "punctuation-restorer"

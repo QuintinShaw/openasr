@@ -46,7 +46,12 @@ REGISTRY_CARD_DEFAULTS = {
 }
 DEFAULT_CATALOG_MODEL_KIND = "asr-model"
 SUPPORTED_CATALOG_MODEL_KINDS = {"asr-model", "capability-pack", "translation-model"}
-SUPPORTED_CAPABILITY_ROLES = {"speaker-embedder", "speaker-segmenter", "forced-aligner"}
+SUPPORTED_CAPABILITY_ROLES = {
+    "speaker-embedder",
+    "speaker-segmenter",
+    "forced-aligner",
+    "punctuation-restorer",
+}
 GIT_REVISION_RE = re.compile(r"[0-9a-fA-F]{40}")
 TRANSLATION_REQUIRED_LICENSE_FILES = {"LICENSE.txt", "NOTICE.openasr.txt"}
 
