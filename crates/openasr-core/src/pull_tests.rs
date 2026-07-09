@@ -2,11 +2,12 @@ use std::{
     cell::Cell,
     collections::VecDeque,
     fs,
-    io::{self, Cursor, Read},
+    io::{self, Cursor, Read, Write},
+    net::TcpListener,
     path::Path,
     sync::{
         Arc, Barrier, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -58,7 +59,8 @@ impl FakeClient {
 }
 
 impl DownloadClient for FakeClient {
-    fn open(&mut self, url: &str, range_start: Option<u64>) -> Result<DownloadResponse, PullError> {
+    fn open(&mut self, url: &str, range: Option<ByteRange>) -> Result<DownloadResponse, PullError> {
+        let range_start = range.map(|range| range.start);
         self.urls.lock().unwrap().push(url.to_string());
         self.ranges.lock().unwrap().push(range_start);
         let response = self
@@ -124,8 +126,9 @@ impl DownloadClient for StalledThenSuccessClient {
     fn open(
         &mut self,
         _url: &str,
-        range_start: Option<u64>,
+        range: Option<ByteRange>,
     ) -> Result<DownloadResponse, PullError> {
+        let range_start = range.map(|range| range.start);
         self.ranges.push(range_start);
         self.attempts += 1;
         let reader: Box<dyn Read> = match (&self.first_response, self.attempts) {
@@ -188,8 +191,9 @@ impl DownloadClient for InvalidRangeThenSuccessClient {
     fn open(
         &mut self,
         _url: &str,
-        range_start: Option<u64>,
+        range: Option<ByteRange>,
     ) -> Result<DownloadResponse, PullError> {
+        let range_start = range.map(|range| range.start);
         self.ranges.push(range_start);
         self.attempts += 1;
         if self.attempts == 1 {
@@ -210,6 +214,107 @@ impl DownloadClient for InvalidRangeThenSuccessClient {
             etag: Some("etag-test".to_string()),
             reader: Box::new(Cursor::new(self.bytes.clone())),
         })
+    }
+}
+
+/// A range-aware mock `DownloadClient` for the concurrent chunked-download
+/// tests. Unlike `FakeClient`'s fixed response queue (which assumes requests
+/// arrive in a known sequential order), this serves any requested byte range
+/// directly out of an in-memory buffer -- exactly how a real Range server
+/// behaves -- so it gives deterministic, byte-correct responses regardless
+/// of which order concurrent worker threads happen to issue requests in.
+#[derive(Clone)]
+struct RangeServerClient {
+    bytes: Arc<Vec<u8>>,
+    supports_range: Arc<AtomicBool>,
+    /// ETags served in call order: the Nth call gets
+    /// `etags[min(N, etags.len() - 1)]`, so a test can make the ETag change
+    /// after a fixed number of requests to simulate a mid-download CDN swap.
+    etags: Arc<Vec<String>>,
+    calls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<(u64, Option<u64>)>>>,
+}
+
+impl RangeServerClient {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Arc::new(bytes),
+            supports_range: Arc::new(AtomicBool::new(true)),
+            etags: Arc::new(vec!["etag-a".to_string()]),
+            calls: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn without_range_support(self) -> Self {
+        self.supports_range.store(false, Ordering::SeqCst);
+        self
+    }
+
+    fn with_etag_sequence(mut self, etags: &[&str]) -> Self {
+        self.etags = Arc::new(etags.iter().map(|etag| etag.to_string()).collect());
+        self
+    }
+
+    fn requests(&self) -> Vec<(u64, Option<u64>)> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl DownloadClient for RangeServerClient {
+    fn open(
+        &mut self,
+        _url: &str,
+        range: Option<ByteRange>,
+    ) -> Result<DownloadResponse, PullError> {
+        let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests.lock().unwrap().push((
+            range.map(|r| r.start).unwrap_or(0),
+            range.and_then(|r| r.end),
+        ));
+        let etag = self.etags[call_index.min(self.etags.len() - 1)].clone();
+        let total = self.bytes.len() as u64;
+        if !self.supports_range.load(Ordering::SeqCst) || range.is_none() {
+            return Ok(DownloadResponse {
+                status: 200,
+                content_length: Some(total),
+                content_range: None,
+                etag: Some(etag),
+                reader: Box::new(Cursor::new(self.bytes.as_ref().clone())),
+            });
+        }
+        let range = range.expect("checked above");
+        let end = range
+            .end
+            .unwrap_or(total.saturating_sub(1))
+            .min(total.saturating_sub(1));
+        let start = range.start.min(end);
+        let slice = self.bytes[start as usize..=end as usize].to_vec();
+        Ok(DownloadResponse {
+            status: 206,
+            content_length: Some(slice.len() as u64),
+            content_range: Some(format!("bytes {start}-{end}/{total}")),
+            etag: Some(etag),
+            reader: Box::new(Cursor::new(slice)),
+        })
+    }
+}
+
+/// A segment size that splits `total` bytes into roughly `segments` chunks,
+/// for tests that need real multi-segment behavior without multi-hundred-MB
+/// fixtures (see `PullOptions::parallel_segment_bytes_override`).
+fn small_segment_bytes(total: usize, segments: u64) -> u64 {
+    ((total as u64) / segments).max(1)
+}
+
+fn parallel_test_options(segment_bytes: u64) -> PullOptions {
+    PullOptions {
+        parallel_segment_bytes_override: Some(segment_bytes),
+        ..PullOptions::default()
     }
 }
 
@@ -721,6 +826,7 @@ fn pull_falls_back_to_next_source_after_sha_mismatch() {
         &mut client,
         PullOptions::default(),
         &[DownloadSource::Hf, DownloadSource::HfMirror],
+        None,
         |_| {},
         || false,
         || false,
@@ -758,6 +864,7 @@ fn pinned_source_does_not_fallback_after_sha_mismatch() {
         &mut client,
         PullOptions::default(),
         &[DownloadSource::Hf],
+        None,
         |_| {},
         || false,
         || false,
@@ -2133,5 +2240,401 @@ fn remove_existing_final_pack_reports_model_in_use_for_held_handle() {
     assert!(
         matches!(error, PullError::ModelInUse { .. }),
         "expected ModelInUse, got {error:?}"
+    );
+}
+
+// -- Concurrent chunked-download tests -------------------------------------
+//
+// These exercise `download_parallel_attempt` and friends via
+// `pull_model_pack_with_client_parallel`, using `RangeServerClient` (a
+// range-aware mock that serves any byte range from an in-memory buffer,
+// independent of request order) plus a small `parallel_segment_bytes_override`
+// so multi-segment behavior is exercised against tiny fixtures.
+
+/// Build a probe-client clone (for the caller's primary `client: &mut C`)
+/// plus a boxed worker-client factory, both backed by clones of `server`.
+/// Every clone shares the same `Arc`-backed state (bytes, ETag sequence,
+/// call counter, request log), so assertions against `server` after the
+/// pull see everything every worker thread (and the probe) did. Returns a
+/// concrete `Box<dyn Fn>` (rather than `-> impl Fn`) purely to sidestep
+/// edition-2024 RPIT lifetime-capture rules for a helper that borrows
+/// `server` only to clone it.
+fn parallel_probe_and_factory(
+    server: &RangeServerClient,
+) -> (
+    RangeServerClient,
+    Box<dyn Fn() -> Result<BoxedDownloadClient, PullError>>,
+) {
+    let probe_client = server.clone();
+    let factory_server = server.clone();
+    let factory: Box<dyn Fn() -> Result<BoxedDownloadClient, PullError>> =
+        Box::new(move || Ok(Box::new(factory_server.clone()) as BoxedDownloadClient));
+    (probe_client, factory)
+}
+
+#[test]
+fn parallel_download_splits_into_segments_and_reassembles_correctly() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let segment_bytes = small_segment_bytes(bytes.len(), 5);
+    let total_segments = segment_count(bytes.len() as u64, segment_bytes);
+    assert!(
+        total_segments >= 2,
+        "fixture too small to exercise chunking"
+    );
+
+    let server = RangeServerClient::new(bytes.clone());
+    let (mut probe_client, factory) = parallel_probe_and_factory(&server);
+    let parallel = ParallelDownloadConfig {
+        connections: 4,
+        factory: &*factory,
+    };
+
+    let installed = pull_model_pack_with_client_parallel(
+        &resolved,
+        temp.path(),
+        &mut probe_client,
+        parallel_test_options(segment_bytes),
+        parallel,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap();
+
+    assert_eq!(installed.pull, "moonshine-tiny:q8");
+    let paths = paths_for(temp.path(), &resolved);
+    assert_eq!(fs::read(&paths.final_path).unwrap(), bytes);
+    assert!(!paths.partial_path.exists());
+    assert!(!paths.partial_segments_meta_path.exists());
+    assert_eq!(server.call_count(), total_segments);
+    // Every request is a genuinely bounded Range (has an explicit `end`),
+    // confirming this went through the chunked path, not a bare open-ended
+    // sequential fetch that happened to succeed.
+    for (_, end) in server.requests() {
+        assert!(end.is_some());
+    }
+}
+
+#[test]
+fn parallel_download_falls_back_to_sequential_when_source_ignores_range() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let segment_bytes = small_segment_bytes(bytes.len(), 4);
+
+    let server = RangeServerClient::new(bytes.clone()).without_range_support();
+    let (mut probe_client, factory) = parallel_probe_and_factory(&server);
+    let parallel = ParallelDownloadConfig {
+        connections: 4,
+        factory: &*factory,
+    };
+
+    let installed = pull_model_pack_with_client_parallel(
+        &resolved,
+        temp.path(),
+        &mut probe_client,
+        parallel_test_options(segment_bytes),
+        parallel,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap();
+
+    assert_eq!(installed.pull, "moonshine-tiny:q8");
+    let paths = paths_for(temp.path(), &resolved);
+    assert_eq!(fs::read(&paths.final_path).unwrap(), bytes);
+    assert!(!paths.partial_segments_meta_path.exists());
+    // One wasted probe (200, ignored) plus one real single-stream fetch.
+    assert_eq!(server.call_count(), 2);
+}
+
+#[test]
+fn parallel_download_restarts_whole_download_when_etag_changes_mid_download() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let segment_bytes = small_segment_bytes(bytes.len(), 4);
+    let total_segments = segment_count(bytes.len() as u64, segment_bytes);
+    assert!(total_segments >= 2, "fixture too small for this ETag test");
+
+    // Call 0 (the synchronous probe) gets "etag-a"; every later call (every
+    // worker's first segment fetch) is clamped to the sequence's last entry,
+    // "etag-b" -- deterministically regardless of thread scheduling. So
+    // attempt 1 always: probes with "etag-a", then every worker sees
+    // "etag-b" and fails with `EtagChanged`, wiping the partial. Attempt 2's
+    // probe then itself gets "etag-b" (still the last entry) and every
+    // following call keeps matching it, so the retry succeeds cleanly.
+    let server = RangeServerClient::new(bytes.clone()).with_etag_sequence(&["etag-a", "etag-b"]);
+    let (mut probe_client, factory) = parallel_probe_and_factory(&server);
+    let parallel = ParallelDownloadConfig {
+        connections: 4,
+        factory: &*factory,
+    };
+
+    let installed = pull_model_pack_with_client_parallel(
+        &resolved,
+        temp.path(),
+        &mut probe_client,
+        parallel_test_options(segment_bytes),
+        parallel,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap();
+
+    assert_eq!(installed.pull, "moonshine-tiny:q8");
+    let paths = paths_for(temp.path(), &resolved);
+    assert_eq!(fs::read(&paths.final_path).unwrap(), bytes);
+    assert!(!paths.partial_path.exists());
+    assert!(!paths.partial_segments_meta_path.exists());
+    // At least one full failed attempt (whose segment fetches all errored)
+    // plus one fully successful attempt happened.
+    assert!(server.call_count() > total_segments);
+}
+
+#[test]
+fn parallel_download_resumes_from_segment_bitmap_without_refetching_done_segments() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let target = PullTarget::from_resolved(&resolved).unwrap();
+    let paths = pull_paths(temp.path(), &target).unwrap();
+    ensure_storage_dir_within_root(temp.path(), &paths).unwrap();
+    let segment_bytes = small_segment_bytes(bytes.len(), 4);
+    let total_segments = segment_count(bytes.len() as u64, segment_bytes);
+    assert!(
+        total_segments >= 3,
+        "fixture too small for this bitmap test"
+    );
+
+    // Pre-seed the on-disk state exactly as a prior (interrupted) attempt
+    // would leave it after segment 0 completed: a full-size `.partial` file
+    // with segment 0's window already correct (the rest is unwritten/zero)
+    // and a segment bitmap marking only index 0 done.
+    let (seg0_start, seg0_end) = segment_range(0, bytes.len() as u64, segment_bytes);
+    let mut partial_content = vec![0_u8; bytes.len()];
+    partial_content[seg0_start as usize..=seg0_end as usize]
+        .copy_from_slice(&bytes[seg0_start as usize..=seg0_end as usize]);
+    fs::write(&paths.partial_path, &partial_content).unwrap();
+    let mut segments_done = vec![false; total_segments];
+    segments_done[0] = true;
+    let meta = SegmentedPartialMeta {
+        format: PARALLEL_META_FORMAT.to_string(),
+        model_id: target.model_id.clone(),
+        quant: target.quant.clone(),
+        filename: target.filename.clone(),
+        hf_revision: target.hf_revision.clone(),
+        sha256: target.sha256.clone(),
+        size_bytes: target.size_bytes,
+        segment_bytes,
+        etag: Some("etag-a".to_string()),
+        segments_done,
+        updated_at_unix_seconds: 0,
+    };
+    write_partial_segments_meta(&paths.partial_segments_meta_path, &meta).unwrap();
+
+    let server = RangeServerClient::new(bytes.clone()).with_etag_sequence(&["etag-a"]);
+    let (mut probe_client, factory) = parallel_probe_and_factory(&server);
+    let parallel = ParallelDownloadConfig {
+        connections: 4,
+        factory: &*factory,
+    };
+
+    let installed = pull_model_pack_with_client_parallel(
+        &resolved,
+        temp.path(),
+        &mut probe_client,
+        parallel_test_options(segment_bytes),
+        parallel,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap();
+
+    assert_eq!(installed.pull, "moonshine-tiny:q8");
+    assert_eq!(fs::read(&paths.final_path).unwrap(), bytes);
+    // Segment 0's byte range is never requested again.
+    for (start, _) in server.requests() {
+        assert_ne!(
+            start, seg0_start,
+            "already-completed segment 0 should not be refetched"
+        );
+    }
+    assert_eq!(server.call_count(), total_segments - 1);
+}
+
+#[test]
+fn parallel_download_cancel_deletes_partial_and_allows_clean_restart() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let segment_bytes = small_segment_bytes(bytes.len(), 4);
+
+    let server = RangeServerClient::new(bytes.clone());
+    let (mut probe_client, factory) = parallel_probe_and_factory(&server);
+    let parallel = ParallelDownloadConfig {
+        connections: 4,
+        factory: &*factory,
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_on_progress = cancel.clone();
+
+    let error = pull_model_pack_with_client_parallel(
+        &resolved,
+        temp.path(),
+        &mut probe_client,
+        parallel_test_options(segment_bytes),
+        parallel,
+        move |event| {
+            if matches!(event, PullProgress::Downloading { .. }) {
+                cancel_on_progress.store(true, Ordering::SeqCst);
+            }
+        },
+        move || cancel.load(Ordering::SeqCst),
+        || false,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, PullError::Canceled { .. }));
+    let paths = paths_for(temp.path(), &resolved);
+    assert!(!paths.partial_path.exists());
+    assert!(!paths.partial_segments_meta_path.exists());
+    assert!(!paths.final_path.exists());
+
+    // A fresh, uncanceled pull afterward succeeds cleanly.
+    let server2 = RangeServerClient::new(bytes.clone());
+    let (mut probe_client2, factory2) = parallel_probe_and_factory(&server2);
+    let parallel2 = ParallelDownloadConfig {
+        connections: 4,
+        factory: &*factory2,
+    };
+    let installed = pull_model_pack_with_client_parallel(
+        &resolved,
+        temp.path(),
+        &mut probe_client2,
+        parallel_test_options(segment_bytes),
+        parallel2,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap();
+    assert_eq!(installed.pull, "moonshine-tiny:q8");
+    assert_eq!(fs::read(&paths.final_path).unwrap(), bytes);
+}
+
+#[test]
+fn parallel_download_sha_mismatch_deletes_partial() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let segment_bytes = small_segment_bytes(bytes.len(), 4);
+    let mut corrupted = bytes.clone();
+    let mid = corrupted.len() / 2;
+    corrupted[mid] ^= 0x01;
+
+    // The source serves bit-flipped bytes, but `resolved` is still pinned to
+    // the original (correct) sha256/size -- every segment fetch and the
+    // per-segment content-range/ETag checks succeed, so only the final
+    // full-file re-hash catches this.
+    let server = RangeServerClient::new(corrupted);
+    let (mut probe_client, factory) = parallel_probe_and_factory(&server);
+    let parallel = ParallelDownloadConfig {
+        connections: 4,
+        factory: &*factory,
+    };
+
+    let error = pull_model_pack_with_client_parallel(
+        &resolved,
+        temp.path(),
+        &mut probe_client,
+        parallel_test_options(segment_bytes),
+        parallel,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, PullError::ShaMismatch { .. }));
+    let paths = paths_for(temp.path(), &resolved);
+    assert!(!paths.partial_path.exists());
+    assert!(!paths.partial_segments_meta_path.exists());
+    assert!(!paths.final_path.exists());
+}
+
+/// Regression guard: `reqwest::blocking::ClientBuilder::timeout` defaults to
+/// `Some(Duration::from_secs(30))` even when `.timeout()` is never called
+/// (see `Timeout::default()` in reqwest's blocking client), and it caps
+/// connect + send + the ENTIRE response body read as a single deadline that
+/// keeps ticking while the body streams -- not an idle/stall timeout. A
+/// prior version of `blocking_client_no_redirect` passed
+/// `HTTP_STALL_TIMEOUT` (30s) straight into `.timeout(...)`, so any download
+/// whose wall-clock time exceeded 30 seconds -- every real multi-hundred-MB
+/// model pack on any non-trivial connection -- was silently killed
+/// regardless of active progress, before the low-speed/stall detection ever
+/// got a chance to run. This drives a real socket that dribbles the body
+/// slowly over > 30 seconds through the exact client constructor
+/// `HttpDownloadClient::new` uses, and asserts the transfer still completes.
+#[test]
+fn download_client_does_not_kill_a_slow_but_steadily_progressing_transfer() {
+    let body: Vec<u8> = (0_u8..32).cycle().take(32 * 16).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_body = body.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        // Drain the request line and headers up to the blank-line terminator;
+        // this test never inspects it (a bare GET is all `reqwest` sends).
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut buf).unwrap();
+            request.extend_from_slice(&buf[..read]);
+            if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            server_body.len()
+        );
+        stream.write_all(header.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        // 32 chunks of 16 bytes, paced 1 second apart (31 sleeps): a >= 31s
+        // transfer, comfortably past the historical 30s bug boundary, while
+        // keeping the data volume itself trivial.
+        let chunk_size = 16;
+        for (index, chunk) in server_body.chunks(chunk_size).enumerate() {
+            if index > 0 {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            stream.write_all(chunk).unwrap();
+            stream.flush().unwrap();
+        }
+    });
+
+    let client = http::blocking_client_no_redirect(HTTP_CONNECT_TIMEOUT).unwrap();
+    let started = Instant::now();
+    let mut response = client
+        .get(format!("http://{addr}/slow-file"))
+        .send()
+        .unwrap();
+    let mut received = Vec::new();
+    response.read_to_end(&mut received).unwrap();
+    let elapsed = started.elapsed();
+    server.join().unwrap();
+
+    assert_eq!(received, body);
+    assert!(
+        elapsed >= Duration::from_secs(30),
+        "expected the transfer to genuinely take >= 30s (was {elapsed:?}); a shorter \
+         elapsed time here means this test stopped exercising the historical 30s \
+         total-timeout bug"
     );
 }
