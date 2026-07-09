@@ -194,3 +194,14 @@ import_subcommand = "not yet a public model-pack import subcommand"
 upstream_repo = "Qwen/Qwen3-ForcedAligner-0.6B"
 source_revision = "main"
 needs_license_flags = false
+
+# FireRedPunc punctuation capability pack. Imported via the public
+# `openasr model-pack import firered-punc` subcommand from the upstream
+# model.pth.tar (chinese-lert-base BERT + 5-class head) normalized to
+# safetensors by pt_to_safetensors.py. Staged to a private HF repo; the
+# catalog entry stays public:false until a deliberate later --public flip.
+["firered-punc"]
+import_subcommand = "import firered-punc"
+upstream_repo = "FireRedTeam/FireRedPunc"
+source_revision = "e448fd967f44182a1c323cc30f5d89f2400c28da"
+needs_license_flags = false

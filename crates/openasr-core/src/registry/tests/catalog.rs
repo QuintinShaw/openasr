@@ -495,6 +495,35 @@ fn word_timestamps_forced_aligner_pack_ignores_staged_non_public_entries() {
 }
 
 #[test]
+fn punctuation_restorer_pack_selects_the_punctuation_capability_pack() {
+    let mut catalog = alias_contract_catalog();
+    catalog.models.push(capability_pack_model_with_feature(
+        "firered-punc",
+        CATALOG_FEATURE_PUNCTUATION,
+        CatalogCapabilityRole::PunctuationRestorer,
+    ));
+
+    let pack = catalog
+        .punctuation_restorer_pack()
+        .expect("punctuation capability pack");
+    assert_eq!(pack.id, "firered-punc");
+}
+
+#[test]
+fn punctuation_restorer_pack_ignores_staged_non_public_entries() {
+    let mut catalog = alias_contract_catalog();
+    let mut staged = capability_pack_model_with_feature(
+        "firered-punc",
+        CATALOG_FEATURE_PUNCTUATION,
+        CatalogCapabilityRole::PunctuationRestorer,
+    );
+    staged.public = false;
+    catalog.models.push(staged);
+
+    assert!(catalog.punctuation_restorer_pack().is_none());
+}
+
+#[test]
 fn catalog_capability_pack_requires_capability_metadata() {
     let mut catalog = alias_contract_catalog();
     let mut pack = capability_pack_model(

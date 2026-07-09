@@ -39,12 +39,13 @@ TRANSLATION_FAMILIES = {"hymt2"}
 # no ASR pipeline tags/transcribe quickstart, no diarize-specific wording --
 # just quant/file/size and a note that this model augments another model's
 # decode path.
-CAPABILITY_FAMILIES = {"qwen3-forced-aligner"}
+CAPABILITY_FAMILIES = {"qwen3-forced-aligner", "firered-punc"}
 # HF YAML pipeline tag per diarize/capability family (the prose card may override).
 DIARIZE_PIPELINE_TAG_BY_FAMILY = {
     "wespeaker": "feature-extraction",
     "pyannote-segmentation": "voice-activity-detection",
     "qwen3-forced-aligner": "automatic-speech-recognition",
+    "firered-punc": "automatic-speech-recognition",
 }
 # SPDX ids (lowercased) that HF's YAML `license:` field accepts directly. A
 # license outside this set (e.g. the FunASR Model License) must use the HF

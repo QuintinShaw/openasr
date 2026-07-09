@@ -1,0 +1,105 @@
+# Per-model card prose for OpenASR/firered-punc. Distilled (paraphrased, not
+# copied) from the upstream FireRedTeam/FireRedPunc model card and the
+# FireRedASR2S technical report. Claims are kept to what the upstream repo and
+# architecture state; re-verify against the upstream card when the upstream
+# weights change.
+#
+# STAGING NOTE (not public): this is a NEW capability-pack catalog entry --
+# there is no prior public listing for this model. Published to a PRIVATE HF
+# repo only; the catalog entry stays public:false until a deliberate later
+# --public flip (same convention as the diarization / forced-aligner packs).
+
+tagline = "Chinese punctuation restoration for OpenASR -- a BERT token classifier that adds full-width marks to unpunctuated transcripts, fully on-device"
+tagline_zh = "为 OpenASR 提供中文标点恢复 — 基于 BERT 逐词分类器，为无标点转写补回全角标点，全程在设备本地运行"
+
+highlights = [
+  "🈶 **Chinese punctuation restoration** -- restores full-width `，。？！` on an unpunctuated ASR transcript (e.g. Dolphin, FireRedASR2-AED) in a finalize-only post-processing pass",
+  "🧠 **BERT token classifier** -- a 12-layer `chinese-lert-base` encoder with a 5-class head predicting which of none/，。？！ follows each subword",
+  "🇨🇳 **Chinese-only by construction** -- the released label set has no English half-width marks, so only Chinese text is punctuated",
+  "🔌 **Opt-in and auto-gated** -- runs only when the ASR model is unpunctuated and this pack is installed, so punctuating families are never double-punctuated",
+  "🦀 **Native in OpenASR** -- `.oasr` packs run with no Python at inference, all decoding local",
+]
+
+highlights_zh = [
+  "🈶 **中文标点恢复** — 在无标点的 ASR 转写（如 Dolphin、FireRedASR2-AED）上，以仅终稿的后处理阶段补回全角 `，。？！`",
+  "🧠 **BERT 逐词分类器** — 12 层 `chinese-lert-base` 编码器，配 5 分类输出头，预测每个子词后面接哪一种（无标点或 ，。？！）",
+  "🇨🇳 **天生仅支持中文** — 发布的标签集不含英文半角标点，因此只为中文文本补标点",
+  "🔌 **可选且自动门控** — 仅当 ASR 模型本身无标点且已安装本包时才运行，带标点的家族绝不会被重复加标点",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，全部解码均在本地完成",
+]
+
+intro = """
+FireRedPunc is a **punctuation-prediction** model from **FireRedTeam**, part of the
+FireRedASR2S all-in-one ASR system. It adopts a BERT-style encoder initialized from
+`chinese-lert-base` (a 12-layer, 768-hidden, 12-head BERT) with a token-classification head
+that predicts, for each subword, which of five classes follows it: none, or one of the four
+Chinese full-width marks `，`, `。`, `？`, `！`. It is a text-in / labels-out post-processor,
+not an ASR model -- no audio frontend, no autoregressive decode.
+
+In OpenASR it is packaged as an optional **punctuation capability pack**: an unpunctuated
+family's finished transcript (e.g. Dolphin or FireRedASR2-AED) is passed through the classifier
+once, and the predicted marks are re-inserted into the original characters. The stage is
+auto-gated on the ASR model's catalog `emits_punctuation == false` and only runs when this pack
+is installed, so punctuating families are never double-punctuated. Because the released label
+set is Chinese-only, the integration is Chinese-only by construction (the architecture cannot
+emit English half-width marks).
+
+This OpenASR repo repackages the upstream weights as `.oasr` packs that run natively in the
+OpenASR runtime -- no Python at inference, all decoding local. It ships in **fp16**.
+
+**Not a standalone transcription model.** This pack cannot transcribe audio by itself; it is an
+opt-in post-process applied to an unpunctuated ASR model's output.
+
+**Verification status:** this is a brand-new catalog entry (no prior public listing). Local
+verification covers exact per-token label parity against the upstream PyTorch forward across a
+set of Chinese golden sentences (all four punctuation classes plus the no-mark class). This
+pack is staged in a private repo, not yet publicly listed.
+"""
+
+intro_zh = """
+FireRedPunc 是 **FireRedTeam** 推出的**标点预测**模型，属于 FireRedASR2S 一体化 ASR 系统的一
+部分。它采用 BERT 风格的编码器，从 `chinese-lert-base`（12 层、768 隐藏维、12 头的 BERT）初始化，
+并接一个逐词分类输出头：对每个子词预测其后接的五个类别之一——无标点，或四个中文全角标点
+`，`、`。`、`？`、`！` 之一。它是文本进、标签出的后处理器，不是 ASR 模型——没有音频前端，也没有
+自回归解码。
+
+在 OpenASR 中，它被打包为一个可选的**标点能力包**：无标点家族（如 Dolphin 或 FireRedASR2-AED）
+的最终转写会经分类器处理一次，预测出的标点被重新插回原始字符。该阶段依据 ASR 模型 catalog 中的
+`emits_punctuation == false` 自动门控，且仅在安装本包时运行，因此带标点的家族绝不会被重复加标点。
+由于发布的标签集仅含中文标点，本集成天生仅支持中文（该架构无法输出英文半角标点）。
+
+这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理，不会把文本上传到
+云端。提供 `fp16` 量化版本。
+
+**不是独立的转写模型。** 本模型包本身无法转写音频；它是应用于无标点 ASR 模型输出的可选后处理步骤。
+
+**验证状态:** 这是一个全新的 catalog 条目（此前没有公开上架记录）。本地验证覆盖了在一组中文黄金句
+（涵盖全部四种标点类别以及无标点类别）上，与上游 PyTorch 前向逐词标签完全一致的对齐检查。本模型包
+目前仅暂存于私有仓库，尚未公开上架。
+"""
+
+acknowledgement = """
+This pack is a redistribution of **FireRedPunc**, created and open-sourced by **FireRedTeam**
+([FireRedTeam/FireRedPunc](https://huggingface.co/FireRedTeam/FireRedPunc)). All credit for the
+original architecture, training, and weights belongs to the authors; the license is inherited
+from and identical to the upstream model (Apache-2.0). OpenASR only performs format conversion,
+runtime verification, and local-inference adaptation.
+"""
+
+acknowledgement_zh = """
+本模型包重新分发自 FireRedTeam 开源的 FireRedPunc
+([FireRedTeam/FireRedPunc](https://huggingface.co/FireRedTeam/FireRedPunc))。原始架构、训练和
+权重归作者所有，许可证继承上游 Apache-2.0。OpenASR 仅进行格式转换、运行时校验和本地推理适配。
+"""
+
+[prose_locales."zh-CN"]
+tagline = "为 OpenASR 提供中文标点恢复 — 基于 BERT 逐词分类器，为无标点转写补回全角标点，全程在设备本地运行"
+
+highlights = [
+  "🈶 **中文标点恢复** — 在无标点的 ASR 转写（如 Dolphin、FireRedASR2-AED）上，以仅终稿的后处理阶段补回全角 `，。？！`",
+  "🧠 **BERT 逐词分类器** — 12 层 `chinese-lert-base` 编码器，配 5 分类输出头，预测每个子词后面接哪一种（无标点或 ，。？！）",
+  "🇨🇳 **天生仅支持中文** — 发布的标签集不含英文半角标点，因此只为中文文本补标点",
+  "🔌 **可选且自动门控** — 仅当 ASR 模型本身无标点且已安装本包时才运行，带标点的家族绝不会被重复加标点",
+  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，全部解码均在本地完成",
+]
+source_sha256 = "36f5bf2afcf768b9eeacb93bd632dfd43738fb9a623cf57435ecde2436826d98"

@@ -19,14 +19,17 @@ from _file_loaders import load_toml
 
 
 EXPECTED_CAPABILITY_PACKS = {
+    "firered-punc": "punctuation-restorer",
     "pyannote-segmentation-3.0": "speaker-segmenter",
     "qwen3-forced-aligner-0.6b": "forced-aligner",
     "wespeaker-voxceleb-resnet34-lm": "speaker-embedder",
 }
 # Capability-pack feature per model: most existing packs serve
 # speaker-diarization, but qwen3-forced-aligner-0.6b serves the distinct
-# word-timestamps feature (see registry.rs CATALOG_FEATURE_WORD_TIMESTAMPS).
+# word-timestamps feature (see registry.rs CATALOG_FEATURE_WORD_TIMESTAMPS) and
+# firered-punc serves the punctuation feature (CATALOG_FEATURE_PUNCTUATION).
 EXPECTED_CAPABILITY_FEATURES = {
+    "firered-punc": "punctuation",
     "pyannote-segmentation-3.0": "speaker-diarization",
     "qwen3-forced-aligner-0.6b": "word-timestamps",
     "wespeaker-voxceleb-resnet34-lm": "speaker-diarization",
