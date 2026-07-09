@@ -23,7 +23,7 @@ use super::wav2vec2_ctc::executor::Wav2Vec2CtcGgmlExecutor;
 use super::whisper::WhisperGgmlExecutor;
 use super::xasr_zipformer::executor::XasrZipformerGgmlExecutor;
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, PartialEq)]
 pub(crate) enum BuiltinGgmlExecutionDispatchError {
     #[error("builtin executor materialization failed: {source}")]
     ExecutorMaterialization {
