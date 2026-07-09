@@ -214,29 +214,88 @@ pub async fn serve_with_launch_options(
     runtime: ServerRuntime,
     launch_options: ServerLaunchOptions,
 ) -> anyhow::Result<()> {
+    // Boot stage timing: each phase logged as its own timestamped line so a
+    // slow daemon start (validate/bind/router-build/model-bind) can be
+    // attributed to a specific phase from `daemon.log` alone, instead of
+    // guessing from wall-clock reads of surrounding, untimed events. Additive
+    // only -- the existing "OpenASR server listening on ..." banners below are
+    // left byte-for-byte unchanged, since `crates/openasr-cli/tests/cli.rs`
+    // waits on that exact prefix and the desktop sidecar's readiness probe
+    // must keep working unmodified.
+    let boot_started = Instant::now();
+    let mut stage_started = boot_started;
     validate_listen_security(addr, &launch_options)?;
+    openasr_core::stage_timing::log_stage(
+        "server_boot",
+        "validate_listen_security",
+        stage_started.elapsed(),
+    );
+    stage_started = Instant::now();
     runtime.validate()?;
+    openasr_core::stage_timing::log_stage(
+        "server_boot",
+        "runtime_validate",
+        stage_started.elapsed(),
+    );
+    stage_started = Instant::now();
     let listener = TcpListener::bind(addr).await?;
+    openasr_core::stage_timing::log_stage(
+        "server_boot",
+        "tcp_listener_bind",
+        stage_started.elapsed(),
+    );
     match &launch_options.tls.clone() {
         ServerTlsConfig::Disabled => {
+            stage_started = Instant::now();
             let app = app_with_runtime_and_distribution_and_launch_options(
                 runtime,
                 DistributionRuntime::default(),
                 launch_options,
             );
+            openasr_core::stage_timing::log_stage(
+                "server_boot",
+                "router_build",
+                stage_started.elapsed(),
+            );
+            openasr_core::stage_timing::log_event(
+                "server_boot",
+                format_args!(
+                    "stage=ready total_ms={:.3} addr=http://{addr}",
+                    boot_started.elapsed().as_secs_f64() * 1000.0
+                ),
+            );
             println!("OpenASR server listening on http://{addr}");
             axum::serve(listener, app).await?;
         }
         ServerTlsConfig::SelfSigned { subject_alt_names } => {
+            stage_started = Instant::now();
             let identity = self_signed_tls_identity(subject_alt_names)?;
+            openasr_core::stage_timing::log_stage(
+                "server_boot",
+                "tls_self_signed_identity",
+                stage_started.elapsed(),
+            );
             let mut launch_options = launch_options;
             launch_options.auth = launch_options.auth.with_pairing_safety_code(Some(
                 pairing_safety_code_for_certificate_fingerprint(&identity.certificate_sha256),
             ));
+            stage_started = Instant::now();
             let app = app_with_runtime_and_distribution_and_launch_options(
                 runtime,
                 DistributionRuntime::default(),
                 launch_options,
+            );
+            openasr_core::stage_timing::log_stage(
+                "server_boot",
+                "router_build",
+                stage_started.elapsed(),
+            );
+            openasr_core::stage_timing::log_event(
+                "server_boot",
+                format_args!(
+                    "stage=ready total_ms={:.3} addr=https://{addr}",
+                    boot_started.elapsed().as_secs_f64() * 1000.0
+                ),
             );
             println!(
                 "OpenASR server listening on https://{addr} (certificate sha256:{}, pairing code {})",

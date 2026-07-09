@@ -455,7 +455,10 @@ pub(crate) fn warm_up_native_streaming_session_once(
     if WARMED.with(std::cell::Cell::get) {
         return Ok(());
     }
+    openasr_core::stage_timing::log_event("realtime_warmup", "stage=start");
+    let warmup_started = Instant::now();
     session.warm_up()?;
+    openasr_core::stage_timing::log_stage("realtime_warmup", "complete", warmup_started.elapsed());
     WARMED.with(|warmed| warmed.set(true));
     Ok(())
 }
