@@ -1813,6 +1813,8 @@ impl IntoResponse for ApiError {
                         StatusCode::INSUFFICIENT_STORAGE => "insufficient_storage_error",
                         _ => "openasr_error",
                     },
+                    param: None,
+                    code: None,
                 },
             }),
         )
@@ -1868,6 +1870,11 @@ struct ErrorResponse {
 struct ErrorBody {
     message: String,
     r#type: &'static str,
+    /// Always `null` today. Present (not skipped) so clients written against
+    /// the OpenAI error envelope find every key they expect: `{"error":
+    /// {"message", "type", "param", "code"}}`.
+    param: Option<String>,
+    code: Option<String>,
 }
 
 #[cfg(test)]

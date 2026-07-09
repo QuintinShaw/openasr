@@ -807,6 +807,9 @@ fn serve_native_rejects_model_id_mismatch_with_local_runtime_source() {
     let pack_root = temp.path().join("whisper-runtime.oasr");
     write_whisper_oasr_v1_fixture(&pack_root, "whisper-runtime");
 
+    // A `name:quant` request matches a bare local id under the bare-id
+    // contract (same tolerant matcher as transcribe/server), so mismatch
+    // rejection needs a genuinely different family base.
     openasr()
         .args([
             "serve",
@@ -815,7 +818,7 @@ fn serve_native_rejects_model_id_mismatch_with_local_runtime_source() {
             "--model-pack",
             &pack_root.display().to_string(),
             "--model",
-            "whisper-runtime:typo",
+            "not-whisper-runtime",
             "--addr",
             "127.0.0.1:0",
         ])
@@ -824,6 +827,75 @@ fn serve_native_rejects_model_id_mismatch_with_local_runtime_source() {
         .stderr(predicate::str::contains(
             "requires --model to match local source id",
         ));
+}
+
+#[test]
+fn serve_native_accepts_quant_pinned_model_ref_for_bare_local_runtime_source() {
+    // Regression guard for the serve startup gate: the catalog resolves a
+    // requested id to a quant-pinned ref (e.g. `whisper-tiny` ->
+    // `whisper-tiny:q8_0`) while the pack's runtime id stays bare, so the gate
+    // must use the tolerant bare-id matcher, not string equality -- strict
+    // equality rejected every catalog-installed pack it was about to serve.
+    let temp = tempfile::tempdir().unwrap();
+    let pack_root = temp.path().join("whisper-runtime.oasr");
+    write_whisper_oasr_v1_fixture(&pack_root, "whisper-runtime");
+
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve ephemeral port");
+    let addr = reserved.local_addr().expect("reserved addr").to_string();
+    drop(reserved);
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_openasr"))
+        .env("OPENASR_HOME", temp.path())
+        .env_remove("OPENASR_MODEL")
+        .env_remove("OPENASR_ADDR")
+        .args([
+            "serve",
+            "--backend",
+            "native",
+            "--model-pack",
+            &pack_root.display().to_string(),
+            "--model",
+            "whisper-runtime:q8_0",
+            "--addr",
+            &addr,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn openasr serve");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = std::io::BufReader::new(stdout);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        use std::io::BufRead;
+        let mut line = String::new();
+        let bytes_read = reader.read_line(&mut line).expect("read stdout line");
+        if bytes_read == 0 {
+            let status = child.wait().expect("child exit status");
+            let mut stderr = String::new();
+            if let Some(mut handle) = child.stderr.take() {
+                use std::io::Read;
+                let _ = handle.read_to_string(&mut stderr);
+            }
+            panic!(
+                "openasr serve rejected a quant-pinned ref for a bare local source id (status: {status:?}, stderr: {stderr})"
+            );
+        }
+        if line
+            .trim_end()
+            .starts_with("OpenASR server listening on http://")
+        {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("openasr serve did not report listening within 10s");
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Spawns the real `openasr serve` binary against `home` and blocks until it
