@@ -2,9 +2,12 @@ use std::{collections::BTreeMap, path::Path, sync::OnceLock};
 
 use crate::NATIVE_RUNTIME_MODEL_ID_AUTO;
 use crate::api::audio_io::load_wav_16khz_mono_f32_v0;
-use crate::arch::{DEFAULT_ENCODER_SAFE_CHUNK_SECONDS, OpenAsrArchitectureRegistry};
+use crate::arch::{
+    DEFAULT_ENCODER_SAFE_CHUNK_SECONDS, GENERAL_ARCHITECTURE_KEY, OpenAsrArchitectureRegistry,
+    emits_punctuation_for_model_architecture,
+};
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphConfig, install_request_backend_override,
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, install_request_backend_override, read_gguf_metadata,
 };
 use crate::longform::{
     AudioSliceKind, LongFormMode, LongFormVadProvider, SegmentMergePolicy, SegmentTimeDomain,
@@ -29,9 +32,12 @@ use super::{BackendError, Transcription, TranscriptionRequest};
 use crate::Segment;
 use crate::WordTimestamp;
 use crate::api::backend::TranscriptionLongFormMetadata;
+use crate::models::firered_punc::pack::resolve_firered_punc_pack_path;
+use crate::models::firered_punc::runtime::FireRedPuncRuntime;
 use crate::models::qwen::{
     ForcedAlignItem, forced_aligner_pack, refine_word_timestamps_with_forced_aligner,
 };
+use crate::punctuation::should_apply_punctuation;
 
 const DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS: f32 = 30.0;
 /// Chunk-length ceiling for the decode-side `ConservativeSeq2SeqV1`
@@ -379,13 +385,18 @@ struct NativeLongformPolicyResolution {
 
 /// Entry point for the native backend: runs the ordinary decode/longform/
 /// diarization pipeline unchanged (`run_native_transcription_impl`), then --
-/// only when the request opted into `--word-timestamps=aligned`
-/// (`word_timestamps_refine`) -- refines the finished transcript's per-word
-/// timestamps with the installed Qwen3-ForcedAligner-0.6B capability pack.
-/// Kept as a thin wrapper rather than threading the refinement into the
-/// (already long) decode/longform function: the aligner re-reads the whole
-/// file and the finished transcript text, so it has no dependency on any
-/// intermediate state that function computes.
+/// gated on the resolved model's `emits_punctuation` capability and the
+/// request's `punctuate` opt-out -- restores punctuation with the installed
+/// FireRedPunc capability pack, then -- only when the request opted into
+/// `--word-timestamps=aligned` (`word_timestamps_refine`) -- refines the
+/// finished transcript's per-word timestamps with the installed
+/// Qwen3-ForcedAligner-0.6B capability pack. Kept as a thin wrapper rather
+/// than threading either post-process into the (already long) decode/longform
+/// function: both re-read only the finished transcript (the aligner also
+/// re-reads the audio file), so neither has a dependency on any intermediate
+/// state that function computes. Punctuation runs before the forced-aligner
+/// refine so the aligner (and every other downstream consumer) sees the
+/// punctuated text.
 pub(super) fn run_native_transcription(
     request: TranscriptionRequest,
 ) -> Result<Transcription, BackendError> {
@@ -393,13 +404,18 @@ pub(super) fn run_native_transcription(
     if refine && !request.word_timestamps {
         return Err(BackendError::WordTimestampAlignmentRequiresWordTimestamps);
     }
-    // Spans the whole run (decode + assembly inside impl, then the forced-align
-    // refine below) so the progress slot is cleared on every exit and the align
-    // phase advances the same monotonic bar rather than running uncounted.
+    // Spans the whole run (decode + assembly inside impl, then the punctuation
+    // and forced-align post-processes below) so the progress slot is cleared
+    // on every exit and the align phase advances the same monotonic bar
+    // rather than running uncounted.
     let _progress = NativeProgressGuard::new();
     let input_path = request.input_path.clone();
     let language_hint = request.language.clone();
+    let model_pack_path = request.model_pack_path.clone();
+    let punctuate = request.punctuate;
     let transcription = run_native_transcription_impl(request)?;
+    let transcription =
+        apply_punctuation_stage_if_applicable(transcription, model_pack_path.as_deref(), punctuate);
     if refine {
         publish_align_progress();
         refine_transcription_word_timestamps_with_forced_aligner(
@@ -410,6 +426,78 @@ pub(super) fn run_native_transcription(
     } else {
         Ok(transcription)
     }
+}
+
+/// Whether the punctuation-restoration stage should attempt to run: the
+/// request has not opted out (`punctuate`, the desktop preference toggle) AND
+/// the resolved model's `emits_punctuation` capability is honestly `Some(false)`
+/// (see [`should_apply_punctuation`]) -- a model that already punctuates, or
+/// whose capability is unknown, is never re-punctuated.
+fn should_run_punctuation_stage(punctuate: bool, emits_punctuation: Option<bool>) -> bool {
+    punctuate && should_apply_punctuation(emits_punctuation)
+}
+
+/// The `general.architecture` value's `emits_punctuation` capability for the
+/// pack at `model_pack_path`, or `None` when the path is absent or its
+/// metadata cannot be read/does not declare a known architecture -- callers
+/// treat `None` exactly like an ASR family with unknown punctuation status
+/// (stage does not run), never a hard error: this is a best-effort read of
+/// metadata already validated once by `run_native_transcription_impl`.
+fn model_emits_punctuation(model_pack_path: Option<&Path>) -> Option<bool> {
+    let path = model_pack_path?;
+    let metadata = read_gguf_metadata(path).ok()?;
+    let architecture = metadata.get_string(GENERAL_ARCHITECTURE_KEY)?;
+    emits_punctuation_for_model_architecture(architecture)
+}
+
+/// Punctuation-restoration post-process: runs only for an ASR result the
+/// catalog honestly declares unpunctuated, and only when the FireRedPunc
+/// capability pack is installed. Fail-closed by design -- a missing pack, a
+/// corrupt pack, or a classifier failure all leave `transcription` exactly as
+/// the ASR family produced it rather than crashing the request or fabricating
+/// punctuation; the native backend never downloads this pack.
+fn apply_punctuation_stage_if_applicable(
+    transcription: Transcription,
+    model_pack_path: Option<&Path>,
+    punctuate: bool,
+) -> Transcription {
+    if !should_run_punctuation_stage(punctuate, model_emits_punctuation(model_pack_path)) {
+        return transcription;
+    }
+    let Some(punc_pack_path) = resolve_firered_punc_pack_path() else {
+        return transcription;
+    };
+    let Ok(runtime) = FireRedPuncRuntime::from_pack(&punc_pack_path) else {
+        return transcription;
+    };
+    punctuate_transcription_segments(transcription, &runtime)
+}
+
+/// Restores punctuation on each finalized segment's text independently (the
+/// stage's documented "finalize-only, per segment" contract -- see
+/// `crate::punctuation`'s module docs) and rebuilds the top-level `text` field
+/// from the punctuated segments the same way the longform assembler does
+/// (trim, drop empties, join with a space), so the punctuated text and
+/// segments stay consistent. A segment whose classifier call fails keeps its
+/// original (unpunctuated) text -- fail-closed per segment rather than
+/// aborting the whole transcript.
+fn punctuate_transcription_segments(
+    mut transcription: Transcription,
+    runtime: &FireRedPuncRuntime,
+) -> Transcription {
+    for segment in &mut transcription.segments {
+        if let Ok(punctuated) = runtime.punctuate(&segment.text) {
+            segment.text = punctuated;
+        }
+    }
+    transcription.text = transcription
+        .segments
+        .iter()
+        .map(|segment| segment.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    transcription
 }
 
 /// Re-decodes `input_path` and calls the installed Qwen3-ForcedAligner pack
@@ -2484,5 +2572,90 @@ mod tests {
         assign_aligned_words_to_segments(&mut segments, &[]);
 
         assert_eq!(segments[0].words, original_words);
+    }
+
+    #[test]
+    fn should_run_punctuation_stage_requires_both_opt_in_and_unpunctuated_capability() {
+        // The stage only runs when the request has not opted out AND the
+        // model's capability is honestly `Some(false)` -- an unknown or
+        // already-punctuated model is never re-punctuated, and an explicit
+        // opt-out wins even for an unpunctuated model.
+        assert!(should_run_punctuation_stage(true, Some(false)));
+        assert!(!should_run_punctuation_stage(false, Some(false)));
+        assert!(!should_run_punctuation_stage(true, Some(true)));
+        assert!(!should_run_punctuation_stage(true, None));
+    }
+
+    #[test]
+    fn model_emits_punctuation_reads_the_architectures_capability_from_pack_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let dolphin_pack = dir.path().join("dolphin.oasr");
+        let mut dolphin_metadata = std::collections::BTreeMap::new();
+        dolphin_metadata.insert(
+            GENERAL_ARCHITECTURE_KEY.to_string(),
+            crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        crate::testing::write_tiny_gguf_runtime_source(
+            &dolphin_pack,
+            &crate::testing::TinyGgufFixtureSpec::new(dolphin_metadata),
+        )
+        .expect("write dolphin fixture");
+        // Dolphin's cn-dialect training corpus is honestly unpunctuated.
+        assert_eq!(model_emits_punctuation(Some(&dolphin_pack)), Some(false));
+
+        let whisper_pack = dir.path().join("whisper.oasr");
+        let mut whisper_metadata = std::collections::BTreeMap::new();
+        whisper_metadata.insert(
+            GENERAL_ARCHITECTURE_KEY.to_string(),
+            crate::arch::WHISPER_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        crate::testing::write_tiny_gguf_runtime_source(
+            &whisper_pack,
+            &crate::testing::TinyGgufFixtureSpec::new(whisper_metadata),
+        )
+        .expect("write whisper fixture");
+        assert_eq!(model_emits_punctuation(Some(&whisper_pack)), Some(true));
+
+        let unknown_pack = dir.path().join("unknown.oasr");
+        crate::testing::write_tiny_gguf_runtime_source(
+            &unknown_pack,
+            &crate::testing::TinyGgufFixtureSpec::new(std::collections::BTreeMap::new()),
+        )
+        .expect("write unknown fixture");
+        assert_eq!(model_emits_punctuation(Some(&unknown_pack)), None);
+
+        assert_eq!(model_emits_punctuation(None), None);
+        assert_eq!(
+            model_emits_punctuation(Some(Path::new("/nonexistent/pack.oasr"))),
+            None
+        );
+    }
+
+    #[test]
+    fn apply_punctuation_stage_leaves_transcription_unchanged_when_stage_does_not_run() {
+        // No model pack path at all -> `model_emits_punctuation` is `None` ->
+        // the stage never runs, regardless of the FireRedPunc pack's install
+        // state on this machine -- fail-closed, never fabricated punctuation.
+        let transcription = Transcription {
+            text: "hello world".to_string(),
+            segments: vec![Segment {
+                start: 0.0,
+                end: 1.0,
+                text: "hello world".to_string(),
+                speaker: None,
+                speaker_label: None,
+                speaker_profile_id: None,
+                words: Vec::new(),
+            }],
+            longform: None,
+            language: None,
+        };
+        let unchanged = apply_punctuation_stage_if_applicable(transcription.clone(), None, true);
+        assert_eq!(unchanged, transcription);
+
+        // Explicit opt-out short-circuits before any pack resolution too.
+        let unchanged = apply_punctuation_stage_if_applicable(transcription.clone(), None, false);
+        assert_eq!(unchanged, transcription);
     }
 }

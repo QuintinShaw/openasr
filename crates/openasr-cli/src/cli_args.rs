@@ -25,6 +25,8 @@ pub(crate) struct TranscribeCommandOptions<'a> {
     pub(crate) runtime_paths: RuntimePathOverrides,
     pub(crate) diarize: bool,
     pub(crate) speakers: Option<u8>,
+    /// Opt-out of the auto-gated punctuation-restoration stage (`--no-punctuate`).
+    pub(crate) punctuate: bool,
     pub(crate) word_timestamps_mode: Option<WordTimestampsMode>,
     pub(crate) model_pack: Option<&'a Path>,
     /// OADP Phase 0 `.oadp` adapter pack; plumbed through the transcription
@@ -291,6 +293,14 @@ pub(crate) enum Command {
         /// Force an exact speaker count during diarization clustering.
         #[arg(long, requires = "diarize", value_parser = clap::value_parser!(u8).range(1..))]
         speakers: Option<u8>,
+        /// Skip punctuation restoration for models whose transcripts are
+        /// honestly unpunctuated (e.g. dolphin). Punctuation restoration is
+        /// on by default but only ever activates when both the model's
+        /// catalog `emits_punctuation` capability is `false` and the
+        /// FireRedPunc capability pack is installed; this flag opts out even
+        /// then. Never installs anything either way.
+        #[arg(long)]
+        no_punctuate: bool,
         /// Request per-word timestamps (rendered in json/verbose_json and
         /// word-timed VTT output). Bare flag (or `=approximate`) uses the
         /// model's own decode-time timestamps; `=aligned` refines them with

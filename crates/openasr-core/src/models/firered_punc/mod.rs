@@ -11,18 +11,14 @@
 //! The released label space is Chinese-only, so the integration is Chinese-only
 //! by construction; the architecture cannot emit English half-width marks.
 //!
-//! Stage status:
-//! - [`config`] / [`tensor_names`] / [`tokenizer`] define the pack geometry,
-//!   GGUF tensor layout, and the offset-preserving WordPiece encoder.
-
-// Later integration stages (runtime, package import, pull-contract dispatch,
-// and the punctuation post-processing stage) consume the geometry, tensor
-// names, label table, and tokenizer defined here; allow the not-yet-wired
-// surface until those stages land.
+//! Stage status: the runtime, punctuation post-processing stage, pull-time
+//! contract, and package import (`.pt` -> `.oasr` conversion for publishing
+//! via `tooling/publish-model`) are all wired.
 #![allow(dead_code)]
 
 pub(crate) mod config;
 pub(crate) mod graph;
+pub(crate) mod pack;
 pub(crate) mod package_import;
 pub(crate) mod runtime;
 pub(crate) mod runtime_contract;
