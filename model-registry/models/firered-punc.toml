@@ -1,0 +1,10 @@
+id = "firered-punc"
+default_variant = "published"
+display_name = "FireRedPunc (OpenASR pack)"
+languages = ["zh"]
+size = "base"
+license = "Apache-2.0"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/firered-punc"
+
+[variant]
+quantization = "fp16"
