@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- OpenAI API compatibility: `verbose_json` now carries `duration`, segment `id`s, and a top-level `words` array; error envelope includes `param`/`code`; the OpenAI-SDK `stream` form field is rejected with an actionable error instead of silently returning a non-streaming body
+- Agent Skill: split into `SKILL.md` + `references/http-api.md` (progressive disclosure) with a verified OpenAI parameter compatibility matrix
+
 - CLI redesign (round 1 + 2): newcomer-friendly subcommand surface, language capability framework, improved help output
 - Sentence segmentation for long-form transcription, long-form progress endpoint, and Hugging Face token authentication for gated model pulls
 - Full Whisper family (tiny/base/small/medium/large-v3) and remaining ASR models published to catalog; catalog signing pipeline
@@ -26,3 +29,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Catalog: dropped ModelScope mirror; unified quant tag scheme (`canonical_quant_tag`)
 - Server: extracted config, history, and translation routes into dedicated modules
 - Pre-open-source cleanup: removed private docs/artifacts, aligned license metadata, dep hygiene
+
+### Fixed
+
+- `serve --model <id>` no longer rejects a catalog-resolved quant-pinned ref against a bare pack runtime id (previously failed with a self-contradictory "requires --model to match local source id 'X', got 'X'" error); the startup gate now uses the same tolerant bare-id matcher as transcribe and the server request path

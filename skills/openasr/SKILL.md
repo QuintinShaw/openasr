@@ -1,27 +1,28 @@
 ---
 name: openasr
-description: Transcribe audio, dictate, and manage local speech-to-text models with the OpenASR CLI (`openasr`) -- local-first, no cloud calls, no telemetry. Use this whenever the user asks to transcribe an audio/video file, capture a microphone/system-audio dictation, list or install ASR models, or run a local OpenAI-compatible transcription API.
+description: Transcribes audio and video, captures live dictation, and manages local speech-to-text models with the OpenASR CLI (`openasr`) and its local OpenAI-compatible HTTP API. Use when the user asks to transcribe an audio/video file or recording, generate subtitles (SRT/VTT), capture microphone or system-audio dictation, list/install/remove ASR models, or point an OpenAI SDK client at a local transcription endpoint. Local-first -- no cloud calls, no telemetry, no silent downloads.
 license: Apache-2.0
+allowed-tools: Bash(openasr *)
 ---
 
 # OpenASR
 
 OpenASR is a local-first speech-to-text CLI (`openasr`) and local HTTP server.
-Everything below runs on-device: no network calls unless you explicitly
-`pull` a model, no telemetry, no cloud fallback.
+Everything runs on-device: no network calls unless you explicitly `pull` a
+model, no telemetry, no cloud fallback.
 
-Prerequisite: the `openasr` binary must be on `PATH`. Check with `openasr
---version`; if missing, tell the user to install it (`cargo install --path
-crates/openasr-cli` from a source checkout, or a released binary) rather than
-guessing a path.
+Prerequisite: the `openasr` binary must be on `PATH`. Check with
+`openasr --version`; if missing, tell the user to install it (`cargo install
+--path crates/openasr-cli` from a source checkout, or a released binary)
+rather than guessing a path.
 
 ## Quick decision guide
 
 - One-off file/batch transcription -> `openasr transcribe`.
 - Live microphone or system-audio capture -> `openasr live`.
 - "What models do I have / can I get" -> `openasr list` / `openasr search`.
-- Need a long-lived local HTTP endpoint (e.g. another tool wants to POST
-  audio) -> `openasr serve`, see "Local HTTP API" below.
+- Another tool needs to POST audio over HTTP (or an OpenAI SDK client should
+  hit a local endpoint) -> `openasr serve`, see "Local HTTP API" below.
 
 ## Transcribing files
 
@@ -35,10 +36,10 @@ openasr transcribe audio.wav --model whisper-small --format json
   `verbose_json`, `markdown`; repeat `-f` to write several formats at once as
   sidecar files.
 - `--model <id>` selects a model id from the registry (see `openasr search`);
-  omit it to use the configured default. If the model is not installed yet,
-  the CLI prompts to download it interactively -- pass `-y/--yes` to accept
-  non-interactively, or `--offline` to fail closed instead of prompting/
-  downloading (use `--offline` in any non-interactive/CI context).
+  omit it to use the configured default. If the model is not installed, the
+  CLI prompts to download it interactively -- pass `-y/--yes` to accept
+  non-interactively, or `--offline` to fail closed instead (use `--offline`
+  in any non-interactive/CI context).
 - `--diarize` labels speakers (`SPEAKER_00`, ...); `--word-timestamps` asks
   for per-word timing where the model supports it.
 - `--benchmark` prints timing (elapsed, audio duration, real-time factor)
@@ -48,8 +49,8 @@ openasr transcribe audio.wav --model whisper-small --format json
 
 Common failure modes:
 
-- "model not installed" + a non-interactive shell: add `-y` (install) or
-  `--offline` (explicitly skip and fail) depending on intent -- do not assume.
+- "model not installed" in a non-interactive shell: add `-y` (install) or
+  `--offline` (fail closed) depending on the user's intent -- do not assume.
 - Unsupported audio container without `ffmpeg`: install `ffmpeg` or convert
   first (`ffmpeg -i in.mp4 -ac 1 -ar 16000 -c:a pcm_s16le out.wav`).
 - A partially-supported model/format combination returns an explicit error
@@ -65,7 +66,7 @@ openasr live --model whisper-small
 Streams from the default input device and prints frame-synchronous partial
 results for packs that declare streaming support, otherwise final text per
 utterance. Run `openasr live --help` for device selection and output flags;
-behavior mirrors `transcribe`'s model-resolution and consent-pull rules.
+model resolution and consent-pull rules mirror `transcribe`.
 
 ## Managing models
 
@@ -83,67 +84,38 @@ Models are distributed as `.oasr` packs (GGUF-backed internally); bare
 
 ## Local HTTP API
 
-`openasr serve` exposes a local OpenAI-compatible HTTP API -- use this when a
-tool needs to POST audio over HTTP instead of shelling out per file.
+`openasr serve` exposes a local OpenAI-compatible HTTP API subset. Use it
+when a tool wants a long-lived endpoint instead of a process per file.
 
 ```bash
-openasr serve --addr 127.0.0.1:8080 --backend native \
-  --model-pack /path/to/model.oasr --model your-runtime-model-id
-```
+openasr serve   # binds 127.0.0.1:8080, serves an installed local .oasr pack
 
-`--addr` defaults to `127.0.0.1:8080` (fixed, not random) so you can hardcode
-the base URL. Loopback (`127.0.0.1`) requests are trusted by default -- no
-`Authorization` header needed:
-
-```bash
 curl -s http://127.0.0.1:8080/v1/audio/transcriptions \
   -F file=@audio.wav \
-  -F model=your-runtime-model-id \
+  -F model=<installed-model-id> \
   -F response_format=verbose_json
 ```
 
-Key endpoints: `GET /health` (liveness, unauthenticated), `GET /v1/models`
-(installed packs), `POST /v1/audio/transcriptions` (the transcription call
-above). `response_format` accepts `json`, `text`, `srt`, `vtt`,
-`verbose_json`, `markdown`.
+- `--addr` defaults to `127.0.0.1:8080` (fixed, not random) so the base URL
+  can be hardcoded. Loopback callers are trusted by default (no auth header).
+- The server never downloads models: a request for a model other than the
+  loaded pack fails closed with an explicit error. Install models with
+  `openasr pull` first, restart `serve` to switch models.
+- OpenAI SDK clients work out of the box for non-streaming calls
+  (`base_url="http://127.0.0.1:8080/v1"`, any placeholder `api_key`). SDK
+  `stream=True` is rejected with an explicit error -- SSE streaming uses an
+  OpenASR-specific protocol (`?stream=true` query parameter), not OpenAI
+  `transcript.text.*` events.
 
-### Optional: requiring an API key even on loopback
-
-If the deployment wants an explicit credential even for local callers, create
-one first:
-
-```bash
-openasr apikey create --name "my-agent"
-# prints the plaintext key exactly once -- save it, it cannot be re-shown
-```
-
-Once any key exists, every `serve` request (except `/health`) must carry
-`Authorization: Bearer <key>`, including from `127.0.0.1`:
-
-```bash
-curl -s http://127.0.0.1:8080/v1/audio/transcriptions \
-  -H "Authorization: Bearer oasr_sk_<...>" \
-  -F file=@audio.wav -F model=your-runtime-model-id
-```
-
-Manage keys with `openasr apikey list` / `openasr apikey revoke <id>`.
-Revoking the last key returns loopback `serve` to its key-free default.
-
-An API key is a **loopback-only** convenience -- binding `serve` to a
-non-loopback address for real remote/network access always requires
-HTTPS/WSS plus device pairing (`--tls-self-signed
---pairing-admin-token-env ...`), regardless of any configured key.
-
-Full reference (longform/segment fields, phrase-bias/hotword fields,
-streaming, pairing flow): see `docs/AGENT_INTEGRATION.md` and the "Local HTTP
-API" section of the repo README at
-https://github.com/QuintinShaw/openasr.
+For the full endpoint list, the OpenAI parameter compatibility matrix, SDK
+examples, API keys, and streaming details, read
+[references/http-api.md](references/http-api.md).
 
 ## Guardrails
 
 - Never suggest or attempt to send audio to a cloud service; OpenASR is
   local-only by design.
 - Do not fabricate a transcript or model id -- if a command fails, surface
-  the actual error and, if it is a missing-model/consent case, ask the user
-  how to proceed rather than guessing `-y` vs `--offline`.
+  the actual error, and for missing-model/consent cases ask the user how to
+  proceed rather than guessing `-y` vs `--offline`.
 - `.oasr` is the only accepted user-facing pack format.
