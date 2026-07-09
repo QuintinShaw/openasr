@@ -1293,11 +1293,52 @@ impl CohereDecoderGraphRuntime {
                 step: "ggml_set_output(logits)",
                 source,
             })?;
+        let debug_prompt_step =
+            std::env::var_os("OPENASR_COHERE_DEBUG_TOKENS").is_some() && position_offset == 0;
+        // When the debug-token dump is enabled, the intermediate taps below must
+        // also be marked as graph outputs (like logits) before
+        // `prepare_outputs_for_upload` runs the gallocr scheduler -- otherwise the
+        // scheduler's liveness-based buffer reuse would recycle their backend
+        // storage as soon as the last consumer inside the first decoder layer
+        // finishes, and the debug read-back below would return reused memory
+        // instead of the tap's actual values.
+        if debug_prompt_step {
+            let debug = prompt_debug_tensors.ok_or(CohereDecoderGraphError::InvalidInput {
+                reason: "missing prompt debug tensors for first decoder layer".to_string(),
+            })?;
+            for tap in [
+                debug.token_state,
+                debug.position_state,
+                debug.emb_ln,
+                debug.l0_attn_norm,
+                debug.l0_q_proj,
+                debug.l0_k_proj,
+                debug.l0_v_proj,
+                debug.h0_after_sa,
+                debug.h0_after_ca,
+                debug.h0_after_ffn,
+                debug.final_state,
+            ] {
+                graph.set_output(tap).map_err(|source| {
+                    CohereDecoderGraphError::GraphBuildFailed {
+                        step: "ggml_set_output(debug_tap)",
+                        source,
+                    }
+                })?;
+            }
+        }
+        // Allocate the decode graph through the scheduler's gallocr for
+        // liveness-based buffer reuse before uploading inputs, same ordering as
+        // the sibling firered/moonshine decoders.
+        graph
+            .prepare_outputs_for_upload(&[logits])
+            .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
+                step: "ggml_prepare_outputs(logits)",
+                source,
+            })?;
         for upload in uploads {
             upload.apply(&mut graph)?;
         }
-        let debug_prompt_step =
-            std::env::var_os("OPENASR_COHERE_DEBUG_TOKENS").is_some() && position_offset == 0;
         let output = if debug_prompt_step {
             let debug = prompt_debug_tensors.ok_or(CohereDecoderGraphError::InvalidInput {
                 reason: "missing prompt debug tensors for first decoder layer".to_string(),
@@ -1741,6 +1782,17 @@ impl CohereDecoderGraphRuntime {
             .set_output(logits)
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_set_output(prefill_logits)",
+                source,
+            })?;
+        // Allocate the batched prefill graph through the scheduler's gallocr
+        // before uploading inputs, same ordering as the single-step decoder
+        // above and the sibling firered/moonshine decoders. `uploads` is always
+        // empty here (n_seq > 1 never emits cross-KV deferred writes; see the
+        // debug_assert above), so there is nothing to defer past this point.
+        graph
+            .prepare_outputs_for_upload(&[logits])
+            .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
+                step: "ggml_prepare_outputs(prefill_logits)",
                 source,
             })?;
 

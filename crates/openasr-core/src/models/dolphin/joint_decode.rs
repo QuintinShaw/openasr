@@ -190,7 +190,10 @@ fn compute_ctc_log_probs(
             crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::Default,
         ),
         backend,
-        use_scheduler: backend.is_gpu_class(),
+        // See the matching comment in encoder_graph.rs: unconditionally
+        // enabling the gallocr scheduler only bounds memory footprint, never
+        // the CTC head's computed output.
+        use_scheduler: true,
     };
     let ggml = |stage: &'static str| move |source| DolphinJointDecodeError::Ggml { stage, source };
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml("runner_init"))?;
@@ -223,6 +226,25 @@ fn compute_ctc_log_probs(
         .add(logits, bias_tensor)
         .map_err(ggml("ctc_bias_add"))?;
     graph.set_output(logits).map_err(ggml("set_output"))?;
+    // Every tensor this graph uploads to (rather than computes) must be
+    // flagged `set_input`: it is a fresh leaf tensor in this per-call graph
+    // with no buffer yet, so without the flag the scheduler's
+    // backend-assignment pass has no rule to place it on and aborts.
+    graph
+        .set_input(weight_tensor)
+        .map_err(ggml("mark_input(weight)"))?;
+    graph
+        .set_input(bias_tensor)
+        .map_err(ggml("mark_input(bias)"))?;
+    graph
+        .set_input(encoder_tensor)
+        .map_err(ggml("mark_input(encoder_out)"))?;
+    // Allocate the forward graph through the scheduler's gallocr for
+    // liveness-based buffer reuse before uploading inputs (mirrors the
+    // encoder/decoder graphs).
+    graph
+        .prepare_outputs_for_upload(&[logits])
+        .map_err(ggml("prepare_outputs"))?;
 
     match (native_weight, weight) {
         (Some(native), _) => graph
