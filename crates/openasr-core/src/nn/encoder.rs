@@ -557,6 +557,14 @@ pub(crate) struct TransformerEncoderConfig {
     pub token_count: usize,
     pub layer_norm_epsilon: f32,
     pub ffn_activation: FeedForwardActivation,
+    /// Route self-attention through `ggml_flash_attn_ext` instead of the
+    /// naive `mul_mat -> add(mask) -> soft_max_ext` sequence. Mirrors the
+    /// Whisper encoder's `use_flash_attention` convention (see
+    /// `models/whisper/ggml_executor.rs`): fused softmax/scale, no materialized
+    /// `[seq, seq]` scores tensor. Callers building the additive `mask` passed
+    /// to `transformer_layer` keep it f32; the flash branch casts its own
+    /// F16 copy since `flash_attn_ext` requires an F16 contiguous mask.
+    pub use_flash_attention: bool,
 }
 
 /// Per-block graph tensors: attn (norm, q/k/v/out + biases) → ffn (norm,
@@ -661,12 +669,19 @@ where
         "attn_v",
         map_err,
     )?;
+    // Flash-attn on a GPU-class backend consumes strided (permuted, not
+    // `cont`'d) q/k/v views directly -- mirrors the Whisper encoder's
+    // `reshape_encoder_projection_to_heads_for_flash` GPU/CPU split in
+    // `models/whisper/ggml_executor.rs`. The naive path (and flash on CPU)
+    // keeps the original `cont`'d heads unchanged.
+    let use_strided_views = config.use_flash_attention && graph.backend_kind().is_gpu_class();
+    let heads_contiguous = !use_strided_views;
     let q = reshape_projection_to_attention_heads(
         graph,
         q,
         layout,
         STANDARD_HEAD_PERMUTE_AXES,
-        true,
+        heads_contiguous,
         AttentionReshapeSteps {
             reshape: "ggml_reshape_3d(attn_q)",
             permute: "ggml_permute(attn_q)",
@@ -679,7 +694,7 @@ where
         k,
         layout,
         STANDARD_HEAD_PERMUTE_AXES,
-        true,
+        heads_contiguous,
         AttentionReshapeSteps {
             reshape: "ggml_reshape_3d(attn_k)",
             permute: "ggml_permute(attn_k)",
@@ -692,7 +707,7 @@ where
         v,
         layout,
         STANDARD_HEAD_PERMUTE_AXES,
-        true,
+        heads_contiguous,
         AttentionReshapeSteps {
             reshape: "ggml_reshape_3d(attn_v)",
             permute: "ggml_permute(attn_v)",
@@ -700,33 +715,54 @@ where
         },
         map_err,
     )?;
-    let scores = graph
-        .mul_mat(k, q)
-        .map_err(|source| map_err("ggml_mul_mat(attn_scores)", source))?;
-    let scores = graph
-        .add(scores, mask)
-        .map_err(|source| map_err("ggml_add(attn_mask)", source))?;
-    let scores = graph
-        .cont(scores)
-        .map_err(|source| map_err("ggml_cont(attn_scores)", source))?;
-    let scores = graph
-        .soft_max_ext(scores, None, 1.0 / (config.head_dim as f32).sqrt(), 0.0)
-        .map_err(|source| map_err("ggml_soft_max_ext(attn_probs)", source))?;
-    let context = attention_context_from_probs(
-        graph,
-        v,
-        scores,
-        layout,
-        AttentionValueMergeSteps {
-            value_permute: "ggml_permute(attn_v_t)",
-            value_cont: "ggml_cont(attn_v_t)",
-            context_mul: "ggml_mul_mat(attn_context)",
-            context_merge_permute: "ggml_permute(attn_merge)",
-            context_merge_cont: "ggml_cont(attn_merge)",
-            context_merge_reshape: "ggml_reshape_2d(attn_merge)",
-        },
-        map_err,
-    )?;
+    let scale = 1.0 / (config.head_dim as f32).sqrt();
+    let context = if config.use_flash_attention {
+        // `flash_attn_ext` requires an F16 contiguous mask (unlike
+        // `soft_max_ext`, which also accepts f32); cast the caller's additive
+        // f32 padding mask once per layer. See `nn/decoder.rs`'s shared
+        // seq2seq decoder for the same F16-mask convention.
+        let flash_mask = graph
+            .cast_to_f16(mask)
+            .map_err(|source| map_err("ggml_cast(attn_flash_mask)", source))?;
+        let flash = graph
+            .flash_attn_ext(q, k, v, Some(flash_mask), scale, 0.0, 0.0)
+            .map_err(|source| map_err("ggml_flash_attn_ext(attn)", source))?;
+        graph
+            .reshape_2d(
+                flash,
+                config.head_dim * config.attention_heads,
+                config.token_count,
+            )
+            .map_err(|source| map_err("ggml_reshape_2d(attn_flash_merge)", source))?
+    } else {
+        let scores = graph
+            .mul_mat(k, q)
+            .map_err(|source| map_err("ggml_mul_mat(attn_scores)", source))?;
+        let scores = graph
+            .add(scores, mask)
+            .map_err(|source| map_err("ggml_add(attn_mask)", source))?;
+        let scores = graph
+            .cont(scores)
+            .map_err(|source| map_err("ggml_cont(attn_scores)", source))?;
+        let scores = graph
+            .soft_max_ext(scores, None, scale, 0.0)
+            .map_err(|source| map_err("ggml_soft_max_ext(attn_probs)", source))?;
+        attention_context_from_probs(
+            graph,
+            v,
+            scores,
+            layout,
+            AttentionValueMergeSteps {
+                value_permute: "ggml_permute(attn_v_t)",
+                value_cont: "ggml_cont(attn_v_t)",
+                context_mul: "ggml_mul_mat(attn_context)",
+                context_merge_permute: "ggml_permute(attn_merge)",
+                context_merge_cont: "ggml_cont(attn_merge)",
+                context_merge_reshape: "ggml_reshape_2d(attn_merge)",
+            },
+            map_err,
+        )?
+    };
     let attn_out = linear_with_bias(
         graph,
         weights.attn_out_weight,
@@ -1055,4 +1091,238 @@ where
         },
         map_err,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphRunner};
+
+    // Mirrors the tiny fixed-size harness `nn/decoder.rs` uses for its shared
+    // seq2seq block tests (HIDDEN=4, HEAD_DIM=2, HEADS=2): small enough to hand
+    // -verify, big enough to actually exercise 2 attention heads.
+    const HIDDEN: usize = 4;
+    const HEAD_DIM: usize = 2;
+    const HEADS: usize = 2;
+    const TOKENS: usize = 3;
+    const IDENTITY_4X4: [f32; HIDDEN * HIDDEN] = [
+        1.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, //
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    const ZERO_4X4: [f32; HIDDEN * HIDDEN] = [0.0; HIDDEN * HIDDEN];
+    const NORM_WEIGHT: [f32; HIDDEN] = [1.0; HIDDEN];
+    const ZERO_1D: [f32; HIDDEN] = [0.0; HIDDEN];
+
+    fn identity_map_err(step: &'static str, source: GgmlCpuGraphError) -> GgmlCpuGraphError {
+        let _ = step;
+        source
+    }
+
+    /// Build a tiny `transformer_layer` graph (identity QKV/out projections,
+    /// zero-bias FFN so it degenerates to a residual passthrough after
+    /// attention) and return the computed output. `mask_values` is the raw
+    /// f32 additive mask fed to both the naive and flash branches -- flash
+    /// casts its own F16 copy internally, so this is the one input the two
+    /// branches genuinely share unmodified.
+    fn run_transformer_layer(
+        backend: GgmlCpuGraphBackend,
+        use_flash_attention: bool,
+        state_values: &[f32; HIDDEN * TOKENS],
+        mask_values: &[f32; TOKENS * TOKENS],
+    ) -> Vec<f32> {
+        let config = GgmlCpuGraphConfig {
+            backend,
+            ..GgmlCpuGraphConfig::conservative_default()
+        };
+        let mut runner = GgmlCpuGraphRunner::new(config).expect("cpu graph runner should init");
+        let mut graph = runner.start_graph();
+
+        let input = graph
+            .new_tensor_2d_f32(HIDDEN, TOKENS, "input")
+            .expect("input tensor");
+        let mask = graph
+            .new_tensor_2d_f32(TOKENS, TOKENS, "mask")
+            .expect("mask tensor");
+        let attn_norm_weight = graph
+            .new_tensor_1d_f32(HIDDEN, "attn_norm_weight")
+            .expect("attn_norm_weight");
+        let attn_norm_bias = graph
+            .new_tensor_1d_f32(HIDDEN, "attn_norm_bias")
+            .expect("attn_norm_bias");
+        let attn_q_weight = graph
+            .new_tensor_2d_f32(HIDDEN, HIDDEN, "attn_q_weight")
+            .expect("attn_q_weight");
+        let attn_k_weight = graph
+            .new_tensor_2d_f32(HIDDEN, HIDDEN, "attn_k_weight")
+            .expect("attn_k_weight");
+        let attn_v_weight = graph
+            .new_tensor_2d_f32(HIDDEN, HIDDEN, "attn_v_weight")
+            .expect("attn_v_weight");
+        let attn_out_weight = graph
+            .new_tensor_2d_f32(HIDDEN, HIDDEN, "attn_out_weight")
+            .expect("attn_out_weight");
+        let attn_bias = graph
+            .new_tensor_1d_f32(HIDDEN, "attn_bias")
+            .expect("attn_bias");
+        let ffn_norm_weight = graph
+            .new_tensor_1d_f32(HIDDEN, "ffn_norm_weight")
+            .expect("ffn_norm_weight");
+        let ffn_norm_bias = graph
+            .new_tensor_1d_f32(HIDDEN, "ffn_norm_bias")
+            .expect("ffn_norm_bias");
+        let ffn_up_weight = graph
+            .new_tensor_2d_f32(HIDDEN, HIDDEN, "ffn_up_weight")
+            .expect("ffn_up_weight");
+        let ffn_down_weight = graph
+            .new_tensor_2d_f32(HIDDEN, HIDDEN, "ffn_down_weight")
+            .expect("ffn_down_weight");
+        let ffn_bias = graph
+            .new_tensor_1d_f32(HIDDEN, "ffn_bias")
+            .expect("ffn_bias");
+
+        for tensor in [
+            input,
+            mask,
+            attn_norm_weight,
+            attn_norm_bias,
+            attn_q_weight,
+            attn_k_weight,
+            attn_v_weight,
+            attn_out_weight,
+            attn_bias,
+            ffn_norm_weight,
+            ffn_norm_bias,
+            ffn_up_weight,
+            ffn_down_weight,
+            ffn_bias,
+        ] {
+            graph.set_input(tensor).expect("tensor should be an input");
+        }
+
+        let output = transformer_layer(
+            &mut graph,
+            input,
+            mask,
+            TransformerEncoderConfig {
+                head_dim: HEAD_DIM,
+                attention_heads: HEADS,
+                token_count: TOKENS,
+                layer_norm_epsilon: 1.0e-5,
+                ffn_activation: FeedForwardActivation::GeluErf,
+                use_flash_attention,
+            },
+            TransformerEncoderLayerWeights {
+                attn_norm_weight,
+                attn_norm_bias,
+                attn_q_weight,
+                attn_q_bias: attn_bias,
+                attn_k_weight,
+                attn_k_bias: attn_bias,
+                attn_v_weight,
+                attn_v_bias: attn_bias,
+                attn_out_weight,
+                attn_out_bias: attn_bias,
+                ffn_norm_weight,
+                ffn_norm_bias,
+                ffn_up_weight,
+                ffn_up_bias: ffn_bias,
+                ffn_down_weight,
+                ffn_down_bias: ffn_bias,
+            },
+            identity_map_err,
+        )
+        .expect("transformer_layer should build");
+        graph.set_output(output).expect("output should be settable");
+
+        graph
+            .set_f32_slice(input, state_values, "input")
+            .expect("input upload");
+        graph
+            .set_f32_slice(mask, mask_values, "mask")
+            .expect("mask upload");
+        graph
+            .set_f32_slice(attn_norm_weight, &NORM_WEIGHT, "attn_norm_weight")
+            .expect("attn_norm_weight upload");
+        graph
+            .set_f32_slice(attn_norm_bias, &ZERO_1D, "attn_norm_bias")
+            .expect("attn_norm_bias upload");
+        graph
+            .set_f32_slice(ffn_norm_weight, &NORM_WEIGHT, "ffn_norm_weight")
+            .expect("ffn_norm_weight upload");
+        graph
+            .set_f32_slice(ffn_norm_bias, &ZERO_1D, "ffn_norm_bias")
+            .expect("ffn_norm_bias upload");
+        graph
+            .set_f32_slice(attn_bias, &ZERO_1D, "attn_bias")
+            .expect("attn_bias upload");
+        graph
+            .set_f32_slice(ffn_bias, &ZERO_1D, "ffn_bias")
+            .expect("ffn_bias upload");
+        for (tensor, values, name) in [
+            (attn_q_weight, &IDENTITY_4X4, "attn_q_weight"),
+            (attn_k_weight, &IDENTITY_4X4, "attn_k_weight"),
+            (attn_v_weight, &IDENTITY_4X4, "attn_v_weight"),
+            (attn_out_weight, &IDENTITY_4X4, "attn_out_weight"),
+            // Zero the FFN so the block degenerates to a residual passthrough
+            // after attention; this test's job is comparing the ATTENTION
+            // branches, not exercising the (config-shared, unmodified) FFN.
+            (ffn_up_weight, &ZERO_4X4, "ffn_up_weight"),
+            (ffn_down_weight, &ZERO_4X4, "ffn_down_weight"),
+        ] {
+            graph.set_f32_slice(tensor, values, name).expect(name);
+        }
+
+        graph
+            .compute_output_f32(output, HIDDEN * TOKENS)
+            .expect("transformer_layer graph should compute")
+    }
+
+    #[test]
+    fn naive_fallback_builds_and_stays_finite_when_flash_disabled() {
+        let state = [
+            0.4, -0.3, 0.2, 0.1, //
+            -0.1, 0.5, -0.2, 0.3, //
+            0.2, 0.1, 0.4, -0.4,
+        ];
+        let zero_mask = [0.0_f32; TOKENS * TOKENS];
+        let output = run_transformer_layer(GgmlCpuGraphBackend::Cpu, false, &state, &zero_mask);
+        assert_eq!(output.len(), HIDDEN * TOKENS);
+        assert!(
+            output.iter().all(|value| value.is_finite()),
+            "naive attention fallback must produce a finite output: {output:?}"
+        );
+    }
+
+    /// Flash and naive attention reduce in different float orders and must
+    /// never be asserted bit-identical (see AGENTS-level golden-test
+    /// guidance); this only checks they land in the same numerical ballpark
+    /// for a tiny, hand-checkable case, including one masked (-inf) position
+    /// to exercise the f32->F16 flash-mask cast on a non-trivial mask.
+    #[test]
+    fn flash_attention_matches_naive_within_tolerance_on_cpu() {
+        let state = [
+            0.4, -0.3, 0.2, 0.1, //
+            -0.1, 0.5, -0.2, 0.3, //
+            0.2, 0.1, 0.4, -0.4,
+        ];
+        let mut mask = [0.0_f32; TOKENS * TOKENS];
+        // Mask token 2 out of every other token's attention (row-major
+        // [query, key]-ish additive mask, matching how the naive branch
+        // adds it to `mul_mat(k, q)` before softmax).
+        mask[2] = f32::NEG_INFINITY;
+        mask[TOKENS + 2] = f32::NEG_INFINITY;
+
+        let naive = run_transformer_layer(GgmlCpuGraphBackend::Cpu, false, &state, &mask);
+        let flash = run_transformer_layer(GgmlCpuGraphBackend::Cpu, true, &state, &mask);
+
+        assert_eq!(naive.len(), flash.len());
+        for (index, (a, b)) in naive.iter().zip(flash.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1.0e-3,
+                "flash vs naive diverge at element {index}: naive={a} flash={b}"
+            );
+        }
+    }
 }
