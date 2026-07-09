@@ -1401,7 +1401,18 @@ fn validate_runtime_source_and_select_adapter(
     Ok(selected)
 }
 
-fn native_runtime_model_refs_match(requested: &str, runtime_source_id: &str) -> bool {
+/// Whether a requested model ref names the same native pack as a local runtime
+/// source id. This is the single tolerant matcher for the "bare id contract":
+/// packs burn no quant tag into `openasr.model.id`, so a quant-pinned request
+/// (`family:quant`) matches a bare runtime id (`family`) -- the
+/// `(Some(_), None) => true` arm below is load-bearing. Quant tags on both
+/// sides compare through `canonical_quant_tag` so catalog aliases (`q8` vs
+/// `q8_0`) match. Every requested-vs-loaded-pack gate (core dispatch, server
+/// request validation, CLI serve startup) must use this instead of comparing
+/// strings, or catalog-resolved refs spuriously mismatch the loaded pack.
+pub fn native_runtime_model_refs_match(requested: &str, runtime_source_id: &str) -> bool {
+    let requested = requested.trim();
+    let runtime_source_id = runtime_source_id.trim();
     if requested == runtime_source_id {
         return true;
     }

@@ -250,6 +250,14 @@ async fn run_offline_transcription(
     let catalog = load_runtime_model_catalog(distribution.catalog_url(), &home)?;
     let mut parsed =
         parse_transcription_multipart(multipart, runtime.backend, catalog.as_ref()).await?;
+    if parsed.stream_form_field {
+        // Fail closed instead of silently returning a JSON body an OpenAI SDK
+        // streaming client would hang on (it expects `transcript.text.*` SSE
+        // events, which this server does not emit).
+        return Err(ApiError::BadRequest(
+            "The 'stream' form field is not supported. SSE streaming on this server is the OpenASR realtime protocol, enabled with the '?stream=true' query parameter, and does not emit OpenAI transcript.text.* events -- OpenAI SDK stream=True calls cannot parse it. Retry without 'stream' for a complete response, or POST to /v1/audio/transcriptions?stream=true and handle OpenASR realtime events.".to_string(),
+        ));
+    }
     // A well-formed transcription request must not fail because the daemon's
     // on-disk preferences are unreadable or hold out-of-range values: degrade to
     // defaults (and log) rather than failing the request. The /v1/config
@@ -439,6 +447,13 @@ pub(crate) struct ParsedTranscriptionRequest {
     /// the in-flight run. Absent (older clients) keeps today's uncontrolled,
     /// run-to-completion behavior.
     pub(crate) transcription_id: Option<String>,
+    /// `true` when the client sent `stream=true` as a multipart form field
+    /// (OpenAI SDK semantics). The non-streaming handler rejects this fail
+    /// closed: our SSE protocol is enabled by the `?stream=true` query
+    /// parameter and emits OpenASR realtime events, not OpenAI
+    /// `transcript.text.*` events, so silently ignoring the field would leave
+    /// an OpenAI SDK streaming client hanging over a JSON body it never parses.
+    pub(crate) stream_form_field: bool,
     pub(crate) _uploaded_file: tempfile::TempPath,
 }
 
@@ -447,6 +462,7 @@ struct TranscriptionRequestBuilder {
     saw_file: bool,
     uploaded_file: Option<tempfile::TempPath>,
     transcription_id: Option<String>,
+    stream: bool,
     model: Option<String>,
     language: Option<String>,
     task: Option<TranscriptionTask>,
@@ -478,6 +494,7 @@ impl Default for TranscriptionRequestBuilder {
             saw_file: false,
             uploaded_file: None,
             transcription_id: None,
+            stream: false,
             model: None,
             language: None,
             task: None,
@@ -527,6 +544,10 @@ impl TranscriptionRequestBuilder {
                 let value = field.text().await.map_err(ApiError::Multipart)?;
                 let trimmed = value.trim();
                 self.transcription_id = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            }
+            "stream" => {
+                let value = field.text().await.map_err(ApiError::Multipart)?;
+                self.stream = parse_bool_field("stream", &value)?;
             }
             "model" => {
                 self.model = Some(field.text().await.map_err(ApiError::Multipart)?);
@@ -640,6 +661,7 @@ impl TranscriptionRequestBuilder {
             saw_file,
             uploaded_file,
             transcription_id,
+            stream,
             model,
             language,
             task,
@@ -756,6 +778,7 @@ impl TranscriptionRequestBuilder {
             request,
             response_format,
             transcription_id,
+            stream_form_field: stream,
             _uploaded_file: uploaded_file,
         })
     }
@@ -898,30 +921,9 @@ pub(crate) fn validate_native_request_model(
 }
 
 fn native_model_refs_match(requested: &str, runtime_source_id: &str) -> bool {
-    let requested = requested.trim();
-    let runtime_source_id = runtime_source_id.trim();
-    if requested == runtime_source_id {
-        return true;
-    }
-
-    let Ok(requested_ref) = parse_model_ref(requested) else {
-        return false;
-    };
-    let Ok(runtime_ref) = parse_model_ref(runtime_source_id) else {
-        return false;
-    };
-    if requested_ref.family != runtime_ref.family {
-        return false;
-    }
-
-    match (requested_ref.tag.as_deref(), runtime_ref.tag.as_deref()) {
-        (Some(requested_quant), Some(runtime_quant)) => {
-            openasr_core::canonical_quant_tag(requested_quant)
-                == openasr_core::canonical_quant_tag(runtime_quant)
-        }
-        (Some(_), None) => true,
-        _ => false,
-    }
+    // Single source of truth for the bare-id / quant-alias matching contract;
+    // the local tests below stay as a regression net over the same semantics.
+    openasr_core::native_runtime_model_refs_match(requested, runtime_source_id)
 }
 
 // Bare ids of models that are *live* in the current catalog must never be
