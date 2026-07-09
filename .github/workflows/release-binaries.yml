@@ -54,6 +54,16 @@ jobs:
     # run (their archives simply drop out of the artifact set) until they
     # prove green. Every current leg has, so none carry the flag today.
     continue-on-error: ${{ matrix.experimental || false }}
+    # id-token/attestations for the build-provenance attestation step below
+    # (every leg, including experimental ones, since they still ship a
+    # release asset); this job only reads the repo and uploads a workflow
+    # artifact, so contents stays read-only (narrower than the
+    # workflow-level default, and within whatever release-core.yml's
+    # `binaries` job granted when this runs via workflow_call).
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     # Distributed binaries must be portable. build.rs auto-enables GGML_NATIVE
     # (-march=native) when host==target on x86, which is correct for local
     # build-and-run but would tune these released x86 binaries to the CI
@@ -729,6 +739,16 @@ jobs:
           }
           Compress-Archive -Path "$distDir" -DestinationPath "dist\$archive.${{ matrix.archive_ext }}" -Force
 
+      # Covers every leg that reaches this point, including `experimental:
+      # true` ones (windows-arm64, musl) -- they still ship a release asset,
+      # so they still get provenance. Only the packaged archive is attested,
+      # not the SHA256SUMS text file assembled later in `checksums`.
+      - name: Attest build provenance
+        if: env.LEG_SELECTED == 'true'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/openasr-${{ env.OPENASR_VERSION }}-${{ matrix.asset }}.${{ matrix.archive_ext }}
+
       - name: Upload archive
         if: env.LEG_SELECTED == 'true'
         uses: actions/upload-artifact@v7
@@ -749,6 +769,13 @@ jobs:
     # ad-hoc dev-time builds off any branch; see the comment there.
     runs-on: macos-latest
     timeout-minutes: 60
+    # id-token/attestations for the build-provenance attestation step below;
+    # this job only reads the repo and uploads a workflow artifact, so
+    # contents stays read-only.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -795,6 +822,12 @@ jobs:
           (cd target/xcframework && zip -r -X -q "${GITHUB_WORKSPACE}/dist/${archive}.zip" OpenASR.xcframework)
           (cd dist && shasum -a 256 "${archive}.zip" > "${archive}.zip.sha256")
           cat "dist/${archive}.zip.sha256"
+
+      # Only the zip is attested, not its .sha256 sidecar text file.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/openasr-${{ env.OPENASR_VERSION }}-xcframework.zip
 
       - name: Upload xcframework archive
         uses: actions/upload-artifact@v7

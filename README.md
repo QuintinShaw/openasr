@@ -191,6 +191,18 @@ During development run without installing via
 `cargo run -p openasr-cli -- <args>`; `--backend mock` gives deterministic,
 network-free output for CI.
 
+### Verifying downloads
+
+Prebuilt binaries on the [Releases page](https://github.com/QuintinShaw/openasr/releases)
+carry a [GitHub Actions build provenance attestation](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds),
+proving each archive was built by this repository's own CI from the tagged
+source, not hand-assembled or tampered with in transit. Verify a downloaded
+archive with the [GitHub CLI](https://cli.github.com/):
+
+```bash
+gh attestation verify <downloaded-archive> --repo QuintinShaw/openasr
+```
+
 ## Execution posture
 
 - **`native` is the default backend.** It runs local ggml-backed `.oasr` model
