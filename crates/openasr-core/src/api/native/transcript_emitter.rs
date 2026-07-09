@@ -154,14 +154,14 @@ impl NativeStreamingTranscriptEmitter {
         self.emit_transcript_lifecycle(result, created_at)
     }
 
-    pub(crate) fn finalize_pending_output_at(
-        &mut self,
-        created_at: impl Into<String>,
-    ) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
-        let Some(update) = self.pending_partial_update.take() else {
-            return Ok(Vec::new());
-        };
-        self.apply_final(update, created_at)
+    /// Takes the pending tail partial (if any) so the caller can post-process
+    /// its text before promoting it into a FINAL with [`Self::apply_final`].
+    /// Deliberately the only way to promote the pending tail: a session that
+    /// runs a FINAL post-processing stage (e.g. the ggml streaming session's
+    /// punctuation stage) gets no emitter-level shortcut that could promote
+    /// the text as-is behind that stage's back.
+    pub(crate) fn take_pending_partial_update(&mut self) -> Option<TranscriptUpdate> {
+        self.pending_partial_update.take()
     }
 
     pub(crate) fn lifecycle_event(

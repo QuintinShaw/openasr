@@ -14,7 +14,9 @@ impl TestOnlyNativeStreamingSession {
 
         match mode {
             CloseMode::Finish | CloseMode::Close => {
-                events.extend(self.emitter.finalize_pending_output_at(test_time(89))?);
+                if let Some(update) = self.emitter.take_pending_partial_update() {
+                    events.extend(self.emitter.apply_final(update, test_time(89))?);
+                }
                 self.push_stop_close_events(mode, &mut events)?;
             }
             CloseMode::Cancel => {
