@@ -3951,6 +3951,54 @@ async fn transcriptions_reject_phrase_bias_boost_without_phrase() {
 }
 
 #[tokio::test]
+async fn transcriptions_reject_openai_stream_form_field_fail_closed() {
+    // The OpenAI SDK sends `stream=true` as a multipart form field. This server
+    // only streams via the `?stream=true` query parameter (OpenASR realtime SSE
+    // events, not OpenAI `transcript.text.*`), so the field must fail closed
+    // with an actionable error instead of silently returning a JSON body an SDK
+    // streaming client would hang on. Doubles as the error-envelope shape
+    // check: OpenAI clients expect `error.{message,type,param,code}`.
+    let request = multipart_request_with_extra_fields(
+        "/v1/audio/transcriptions",
+        "whisper-large-v3-turbo",
+        "sample.wav",
+        b"not a real wav",
+        &[("stream", "true")],
+    );
+    let response = openasr_server::app().oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    let message = parsed["error"]["message"].as_str().unwrap();
+    assert!(message.contains("'stream' form field is not supported"));
+    assert!(message.contains("?stream=true"));
+    assert!(message.contains("transcript.text"));
+    assert_eq!(parsed["error"]["type"], "invalid_request_error");
+    assert!(parsed["error"]["param"].is_null());
+    assert!(parsed["error"]["code"].is_null());
+}
+
+#[tokio::test]
+async fn transcriptions_accept_explicit_stream_false_form_field() {
+    // `stream=false` is what an OpenAI SDK caller sends when not streaming; it
+    // must parse cleanly and run the normal non-streaming pipeline.
+    let request = multipart_request_with_extra_fields(
+        "/v1/audio/transcriptions",
+        "whisper-large-v3-turbo",
+        "sample.wav",
+        b"not a real wav",
+        &[("stream", "false")],
+    );
+    let response = openasr_server::app().oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(parsed["text"].is_string());
+}
+
+#[tokio::test]
 async fn transcriptions_reject_invalid_phrase_bias_boost_before_backend_dispatch() {
     let request = multipart_request_with_extra_fields(
         "/v1/audio/transcriptions",
