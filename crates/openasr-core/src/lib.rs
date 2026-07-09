@@ -40,6 +40,7 @@ pub mod realtime;
 pub(crate) mod registry;
 pub(crate) mod remote_compute;
 pub(crate) mod safety;
+pub mod stage_timing;
 mod tensor;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
