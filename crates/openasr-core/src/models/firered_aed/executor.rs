@@ -34,14 +34,12 @@ use crate::models::thread_local_runtime_cache::{
     with_thread_local_cached_mut_by_key,
 };
 
-use super::decoder_graph::firered_decoder_graph_config;
 use super::decoder_graph::{
     FireRedDecoderGraphRuntime, run_firered_aed_decoder_greedy_with_runtime,
 };
-use super::encoder_graph::{
-    FireRedEncoderGraphRuntime, FireRedEncoderOutput, firered_encoder_graph_config,
-};
+use super::encoder_graph::{FireRedEncoderGraphRuntime, FireRedEncoderOutput};
 use super::frontend::{FireRedFbankFrontend, apply_cmvn};
+use super::graph_config::{firered_decoder_graph_config, firered_encoder_graph_config};
 use super::runtime_contract::{FireRedAedExecutionMetadata, parse_firered_aed_execution_metadata};
 use super::tokenizer::FireRedTokenizer;
 

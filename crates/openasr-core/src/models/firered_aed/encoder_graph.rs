@@ -26,10 +26,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
-    GgmlLoadedWeightContext,
-};
+use crate::ggml_runtime::{GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext};
 use crate::models::cohere::encoder_graph::build_relative_positional_encoding;
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
@@ -47,10 +44,10 @@ use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 use super::encoder_weights::{
     FireRedEncoderLayerWeights, FireRedEncoderWeights, FireRedEncoderWeightsError,
 };
+use super::graph_config::firered_encoder_graph_config;
 use super::runtime_contract::FireRedAedExecutionMetadata;
 
 const FIRERED_ENCODER_LAYER_NORM_EPSILON: f32 = 1.0e-5;
-const FIRERED_ENCODER_GRAPH_SIZE: usize = 32_768;
 /// `Conv2dSubsampling.context = left_context(3) + 1 + right_context(3)`; the
 /// encoder pads the time axis by `context - 1` zero frames before the stem
 /// (`fireredasr` `ConformerEncoder.forward(..., pad=True)`).
@@ -92,29 +89,6 @@ fn conv_out_dim(input: usize, kernel: usize, stride: usize) -> Result<usize, Fir
         .and_then(|v| v.checked_div(stride))
         .and_then(|v| v.checked_add(1))
         .ok_or(FireRedEncoderError::ShapeOverflow)
-}
-
-pub(crate) fn firered_encoder_graph_config() -> GgmlCpuGraphConfig {
-    // Stage 2 lands CPU-only; GPU backends can follow once decoder/executor
-    // parity is established (matches the parakeet-ctc/sensevoice staging
-    // precedent of correctness-first, backend-breadth-later).
-    GgmlCpuGraphConfig {
-        // `no_alloc` metadata context sized from the actual node count (see
-        // `GgmlCpuGraphConfig::metadata_context_bytes`); previously a flat
-        // hardcoded 512 MiB per cached encoder runtime (see the thread-local
-        // cache in `executor.rs`).
-        context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(FIRERED_ENCODER_GRAPH_SIZE),
-        graph_size: FIRERED_ENCODER_GRAPH_SIZE,
-        n_threads: None,
-        backend: GgmlCpuGraphBackend::Cpu,
-        // ggml's gallocr scheduler reuses buffer space across tensors whose
-        // lifetimes don't overlap instead of giving every non-view tensor its
-        // own allocation (`ggml_backend_alloc_ctx_tensors`); on the CPU
-        // backend both allocators produce identical results, so this only
-        // changes memory footprint, never the encoder's output (see #68: a
-        // single 30s slice requested ~12.5 GiB without the scheduler).
-        use_scheduler: true,
-    }
 }
 
 /// Owns the encoder's mmap'd weight context plus the ggml graph runner across
