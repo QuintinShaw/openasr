@@ -455,6 +455,7 @@ struct TranscriptionRequestBuilder {
     timestamp_granularities: Vec<String>,
     diarize: bool,
     speakers: Option<u8>,
+    punctuate: bool,
     segment_mode: Option<String>,
     chunk_seconds: Option<f32>,
     segment_overlap_seconds: Option<f32>,
@@ -485,6 +486,12 @@ impl Default for TranscriptionRequestBuilder {
             timestamp_granularities: Vec::new(),
             diarize: false,
             speakers: None,
+            // Auto-on, mirroring `TranscriptionRequest::new`'s default: this
+            // form field is only a client-facing opt-out (the desktop
+            // punctuation preference toggle), not the primary gate -- the
+            // stage itself still requires `emits_punctuation == Some(false)`
+            // and the FireRedPunc capability pack to be installed.
+            punctuate: true,
             segment_mode: None,
             chunk_seconds: None,
             segment_overlap_seconds: None,
@@ -543,6 +550,10 @@ impl TranscriptionRequestBuilder {
             "diarize" => {
                 let value = field.text().await.map_err(ApiError::Multipart)?;
                 self.diarize = parse_bool_field("diarize", &value)?;
+            }
+            "punctuate" => {
+                let value = field.text().await.map_err(ApiError::Multipart)?;
+                self.punctuate = parse_bool_field("punctuate", &value)?;
             }
             "speakers" => {
                 let value = field.text().await.map_err(ApiError::Multipart)?;
@@ -637,6 +648,7 @@ impl TranscriptionRequestBuilder {
             timestamp_granularities,
             diarize,
             speakers,
+            punctuate,
             segment_mode,
             chunk_seconds,
             segment_overlap_seconds,
@@ -737,7 +749,8 @@ impl TranscriptionRequestBuilder {
             .with_word_timestamps_refine(word_timestamps_refine)
             .with_display_file_name(file_name)
             .with_diarization(diarize)
-            .with_diarize_speakers(speakers);
+            .with_diarize_speakers(speakers)
+            .with_punctuation(punctuate);
 
         Ok(ParsedTranscriptionRequest {
             request,

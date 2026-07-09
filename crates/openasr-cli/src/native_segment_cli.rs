@@ -216,7 +216,13 @@ pub(super) fn run_benchmark(
                 file.file_name()
                     .and_then(|name| name.to_str())
                     .map(str::to_string),
-            );
+            )
+            // `--benchmark` measures plain ASR decode timing; punctuation
+            // restoration is an optional post-process (like diarization and
+            // word-timestamp alignment, neither of which this request enables
+            // either) and would silently skew the real-time factor for an
+            // unpunctuated model with the FireRedPunc pack installed.
+            .with_punctuation(false);
     let started = Instant::now();
     let transcription = transcribe_with_backend(prepared_run.backend_kind, request)?;
     let elapsed = started.elapsed();

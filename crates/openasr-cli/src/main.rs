@@ -183,6 +183,7 @@ async fn run() -> Result<()> {
             ffmpeg_bin,
             diarize,
             speakers,
+            no_punctuate,
             word_timestamps,
             model_pack,
             adapter,
@@ -202,6 +203,7 @@ async fn run() -> Result<()> {
             runtime_paths: RuntimePathOverrides { ffmpeg_bin },
             diarize,
             speakers,
+            punctuate: !no_punctuate,
             word_timestamps_mode: word_timestamps,
             model_pack: model_pack.as_deref(),
             adapter: adapter.as_deref(),
@@ -1074,6 +1076,7 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
         .with_phrase_bias(phrase_bias)
         .with_diarization(options.diarize)
         .with_diarize_speakers(options.speakers)
+        .with_punctuation(options.punctuate)
         .with_word_timestamps(options.word_timestamps_mode.is_some())
         .with_word_timestamps_refine(matches!(
             options.word_timestamps_mode,

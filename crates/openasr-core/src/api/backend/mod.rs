@@ -319,6 +319,14 @@ pub struct TranscriptionRequest {
     /// Exact speaker count to force during diarization clustering (the
     /// `DiarizeHint::NumSpeakers` hint); `None` lets the threshold decide.
     pub diarize_speakers: Option<u8>,
+    /// Whether the punctuation-restoration post-processing stage may run.
+    /// Defaults to `true` (auto-on): the stage itself is separately gated on
+    /// the resolved model's `emits_punctuation` capability being `Some(false)`
+    /// and on the FireRedPunc capability pack actually being installed, so
+    /// this flag is only a user-facing opt-out (the desktop punctuation
+    /// preference toggle), not the primary gate. Never triggers a download --
+    /// same fail-closed contract as `word_timestamps_refine`.
+    pub punctuate: bool,
 }
 
 impl TranscriptionRequest {
@@ -340,6 +348,7 @@ impl TranscriptionRequest {
             display_file_name: None,
             diarize: false,
             diarize_speakers: None,
+            punctuate: true,
         }
     }
 
@@ -410,6 +419,11 @@ impl TranscriptionRequest {
 
     pub fn with_diarize_speakers(mut self, diarize_speakers: Option<u8>) -> Self {
         self.diarize_speakers = diarize_speakers;
+        self
+    }
+
+    pub fn with_punctuation(mut self, punctuate: bool) -> Self {
+        self.punctuate = punctuate;
         self
     }
 }
