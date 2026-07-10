@@ -476,6 +476,10 @@ impl GgmlAsrExecutor for CohereTranscribeGgmlExecutor {
         self.execute_inner(request, false)
             .map_err(|error| cohere_execute_error_to_ggml(self, error, request))
     }
+
+    fn unload_idle_state(&self) {
+        self.runtime_cache_by_path.clear();
+    }
 }
 
 impl CohereTranscribeGgmlExecutor {
@@ -525,6 +529,10 @@ impl GgmlAsrStreamingExecutor for CohereTranscribeGgmlExecutor {
             STREAMING_PARTIAL_TUNING_HEAVY_SEQ2SEQ,
             CohereTranscribeGgmlExecutor::execute_streaming,
         )
+    }
+
+    fn unload_idle_state(&self) {
+        self.runtime_cache_by_path.clear();
     }
 }
 

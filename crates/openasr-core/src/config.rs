@@ -144,16 +144,40 @@ impl HistoryRetentionPolicy {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdleUnloadPolicy {
-    #[default]
     Never,
     #[serde(rename = "now")]
     Now,
     #[serde(rename = "2m")]
     After2m,
+    /// Default: a bound native model pack (up to ~1.4 GiB resident for the
+    /// larger builtin families) is released after 10 minutes with no active
+    /// request or realtime session, instead of staying resident in RAM for
+    /// the daemon's whole lifetime. A later request just pays the normal
+    /// load+warm-up cost again. Only the default changed here -- an existing
+    /// config that already sets `idle_unload` explicitly (including `never`)
+    /// is unaffected.
+    #[default]
     #[serde(rename = "10m")]
     After10m,
     #[serde(rename = "1h")]
     After1h,
+}
+
+impl IdleUnloadPolicy {
+    /// The idle threshold as a duration, or `None` for `Never` (no reaper
+    /// should even run). `Now` is treated as an aggressive-but-real threshold
+    /// (a few seconds) rather than "unload synchronously after every
+    /// request" -- that would defeat back-to-back requests reusing the warm
+    /// runtime, which is the whole point of caching it in the first place.
+    pub const fn idle_threshold(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Never => None,
+            Self::Now => Some(std::time::Duration::from_secs(5)),
+            Self::After2m => Some(std::time::Duration::from_secs(2 * 60)),
+            Self::After10m => Some(std::time::Duration::from_secs(10 * 60)),
+            Self::After1h => Some(std::time::Duration::from_secs(60 * 60)),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -302,7 +326,7 @@ impl Default for Preferences {
             quant_preference: QuantPreference::Auto,
             execution_target: ExecutionTarget::Auto,
             history_retention: HistoryRetentionPolicy::Last5,
-            idle_unload: IdleUnloadPolicy::Never,
+            idle_unload: IdleUnloadPolicy::After10m,
         }
     }
 }

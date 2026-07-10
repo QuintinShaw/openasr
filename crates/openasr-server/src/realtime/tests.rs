@@ -1481,6 +1481,172 @@ async fn native_streaming_warm_up_runs_immediately_and_once_per_worker() {
 }
 
 #[tokio::test]
+async fn boot_native_warmup_runs_in_background_without_blocking_a_concurrent_task() {
+    // Exercises `attach_and_run_boot_warmup` (the session-agnostic half of
+    // `spawn_boot_native_warmup`, which `serve_with_launch_options` fires
+    // right after bind) against an artificially slow fake session, in place
+    // of a real (and much harder to slow down predictably in a test) model
+    // pack. This is the property that actually matters for
+    // "/health must not wait on warm-up": whatever spawns this must get
+    // control back immediately, and anything else the runtime schedules
+    // concurrently must not be starved by the slow warm-up.
+    let warm_calls = Arc::new(AtomicUsize::new(0));
+    let session = Box::new(SlowWarmNativeSession {
+        inner: TestServerNativeSession::new("boot-warmup-nonblocking"),
+        warm_sleep: Duration::from_millis(300),
+        warm_calls: Arc::clone(&warm_calls),
+    });
+    let key = test_native_streaming_worker_key("boot-warmup-nonblocking");
+
+    let spawn_started = Instant::now();
+    let warmup_handle = tokio::spawn(attach_and_run_boot_warmup(key, session));
+    assert!(
+        spawn_started.elapsed() < Duration::from_millis(100),
+        "spawning the boot warm-up must not itself block"
+    );
+
+    // A concurrent tokio task must be free to run to completion while the
+    // slow warm-up is still sleeping (on its own dedicated worker OS thread,
+    // not the tokio runtime) -- standing in for `/health` staying responsive.
+    tokio::time::timeout(Duration::from_millis(100), async { 1 + 1 })
+        .await
+        .expect("a concurrent tokio task must not be starved by the slow warm-up");
+
+    warmup_handle
+        .await
+        .expect("boot warmup task must not panic");
+    assert_eq!(
+        warm_calls.load(Ordering::Acquire),
+        1,
+        "the slow warm-up must actually have run to completion"
+    );
+}
+
+#[tokio::test]
+async fn health_answers_immediately_while_boot_warmup_is_artificially_slow() {
+    use tower::ServiceExt;
+
+    // The literal /health acceptance: with the boot warm-up artificially
+    // slowed (injected slow mock), a real GET /health through the real router
+    // must still answer immediately -- warm-up must never sit anywhere on the
+    // health path.
+    let warm_calls = Arc::new(AtomicUsize::new(0));
+    let session = Box::new(SlowWarmNativeSession {
+        inner: TestServerNativeSession::new("health-vs-slow-warmup"),
+        warm_sleep: Duration::from_millis(500),
+        warm_calls: Arc::clone(&warm_calls),
+    });
+    let key = test_native_streaming_worker_key("health-vs-slow-warmup");
+    let warmup_started = Instant::now();
+    let warmup_handle = tokio::spawn(attach_and_run_boot_warmup(key, session));
+
+    let app = crate::app_with_runtime(ServerRuntime::default());
+    let response = tokio::time::timeout(
+        Duration::from_millis(200),
+        app.oneshot(
+            axum::http::Request::builder()
+                .uri("/health")
+                .body(axum::body::Body::empty())
+                .expect("build health request"),
+        ),
+    )
+    .await
+    .expect("/health must answer while warm-up is still running, not after it")
+    .expect("/health request must succeed");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert!(
+        warmup_started.elapsed() < Duration::from_millis(500),
+        "/health answered only after the 500ms warm-up window had fully \
+         elapsed -- this test then proved nothing about ordering"
+    );
+
+    warmup_handle
+        .await
+        .expect("boot warmup task must not panic");
+    assert_eq!(warm_calls.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn boot_native_warmup_leaves_the_worker_thread_warm_for_the_next_real_attach() {
+    // Confirms warm-up dedup: a boot warm-up and a subsequent
+    // real WS attach on the SAME worker key share the one thread-local
+    // `WARMED` gate (`warm_up_native_streaming_session_once`) -- the real
+    // session's own `Warm` command must be a no-op, not a second cold build.
+    let warm_calls = Arc::new(AtomicUsize::new(0));
+    let key = test_native_streaming_worker_key("boot-warmup-reuse");
+
+    let boot_session = Box::new(SlowWarmNativeSession {
+        inner: TestServerNativeSession::new("boot-warmup-reuse-boot"),
+        warm_sleep: Duration::from_millis(50),
+        warm_calls: Arc::clone(&warm_calls),
+    });
+    attach_and_run_boot_warmup(key.clone(), boot_session).await;
+    assert_eq!(warm_calls.load(Ordering::Acquire), 1);
+
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut real_session =
+        WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    real_session
+        .attach_native_streaming_session(
+            key,
+            Box::new(SlowWarmNativeSession {
+                inner: TestServerNativeSession::new(real_session.session_id.0.clone()),
+                warm_sleep: Duration::from_millis(50),
+                warm_calls: Arc::clone(&warm_calls),
+            }),
+        )
+        .await
+        .unwrap();
+    real_session
+        .send_native_streaming_command(NativeStreamingCommand::Warm)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    real_session
+        .drain_native_streaming_outcomes()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        warm_calls.load(Ordering::Acquire),
+        1,
+        "the real session's own Warm must be a no-op on the already-warmed \
+         worker thread -- warm_up() must not run a second time"
+    );
+    real_session.finish("client_closed", true).await.unwrap();
+}
+
+#[tokio::test]
+async fn attached_native_streaming_session_keeps_the_global_activity_tracker_non_idle() {
+    // Integration counterpart of the isolated tracker-logic unit tests in
+    // `idle_activity.rs`: proves the real attach/release call sites in
+    // `native_worker.rs` (`native_streaming_worker_for_key` /
+    // `spawn_native_streaming_worker`) actually drive the process-wide
+    // tracker the `idle_unload` reaper reads. Only asserts the "never idle
+    // while active" direction against the real (process-wide, shared with
+    // every other test in this crate) tracker -- the only direction that
+    // stays deterministic under test parallelism, and exactly the safety
+    // property that matters: an active session must never be raced by an
+    // idle-triggered unload.
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    session
+        .attach_native_streaming_session(
+            test_native_streaming_worker_key("activity-tracker-stays-non-idle"),
+            Box::new(TestServerNativeSession::new(session.session_id.0.clone())),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !crate::idle_activity::native_activity_is_idle_for(Instant::now(), Duration::ZERO),
+        "a live attach must never read idle, even against a zero threshold"
+    );
+
+    session.finish("client_closed", true).await.unwrap();
+}
+
+#[tokio::test]
 async fn native_streaming_finalize_keeps_session_open_for_next_utterance() {
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);

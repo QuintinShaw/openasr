@@ -1211,6 +1211,16 @@ fn shared_native_ggml_execution_dispatch() -> &'static GgmlAsrExecutionDispatch 
     })
 }
 
+/// Idle-unload for the offline (file-transcription) dispatch. Deliberately
+/// uses `get()`, not `get_or_init` -- a daemon that never served a file
+/// transcription has nothing resident here, and this must not be the thing
+/// that first builds the dispatch.
+pub(crate) fn unload_idle_native_offline_runtime_caches() {
+    if let Some(dispatch) = NATIVE_GGML_EXECUTION_DISPATCH.get() {
+        dispatch.unload_all();
+    }
+}
+
 /// Resolve the long-form VAD provider for this request, returning the
 /// provider and a label for the engine that ran. Stream-VAD is the sole VAD
 /// engine and is vendored (`include_bytes!`), so in practice this always

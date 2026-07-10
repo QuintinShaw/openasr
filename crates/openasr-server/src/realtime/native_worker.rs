@@ -300,6 +300,11 @@ pub(crate) fn native_streaming_worker_for_key(
         && !entry.sender.is_closed()
     {
         entry.state.acquire();
+        // idle_unload must never fire while a native session is attached to
+        // (or attaching to) any worker -- paired with the matching
+        // `native_activity_exit` in `spawn_native_streaming_worker`'s
+        // `state.release()`.
+        crate::idle_activity::native_activity_enter();
         return NativeStreamingWorkerHandle {
             sender: entry.sender.clone(),
             state: entry.state.clone(),
@@ -309,6 +314,7 @@ pub(crate) fn native_streaming_worker_for_key(
     let (sender, receiver) =
         mpsc::channel::<NativeStreamingWorkerMessage>(SHARED_BACKEND_WORKER_QUEUE_CAPACITY);
     let state = Arc::new(NativeStreamingWorkerState::new_acquired(Instant::now()));
+    crate::idle_activity::native_activity_enter();
     spawn_native_streaming_worker(receiver, state.clone());
     workers.insert(
         key,
@@ -373,6 +379,9 @@ pub(crate) fn spawn_native_streaming_worker(
                             cancel_requested,
                         );
                         state.release();
+                        // Paired with the `native_activity_enter` calls in
+                        // `native_streaming_worker_for_key`.
+                        crate::idle_activity::native_activity_exit();
                     }
                 }
             }
@@ -461,6 +470,109 @@ pub(crate) fn warm_up_native_streaming_session_once(
     openasr_core::stage_timing::log_stage("realtime_warmup", "complete", warmup_started.elapsed());
     WARMED.with(|warmed| warmed.set(true));
     Ok(())
+}
+
+/// Warms the worker thread for the daemon's default bound native model pack
+/// in the background, right after `serve_with_launch_options` finishes
+/// binding the listener -- so the very first real dictation session does not
+/// pay the cold model-pack-load cost (observed 1.7-2.1s) before its first
+/// partial. Fire-and-forget: never blocks bind/serve/health, and any failure
+/// here (bad pack, no adapter, ...) is swallowed silently -- a real request
+/// still fails closed with a proper error through the normal request path.
+/// The existing WS-attach `Warm` command (see `start_native_streaming_session`
+/// in `ws_session.rs`) remains the fallback for whatever this boot warm-up
+/// does not cover: no pack bound yet at boot, an explicit
+/// `inference_threads`/`execution_target` that does not match the default
+/// worker key used here, or the bound pack having changed since boot.
+///
+/// Dedup with a concurrent real attach is structural, not a flag: this
+/// attaches its own short-lived "session" to the same
+/// [`NativeStreamingWorkerKey`] a matching real WS attach would use, sends
+/// `Warm`, waits for it to finish, and only then releases the worker -- the
+/// worker thread processes one attached session's commands at a time, so a
+/// real attach for the same key that arrives mid-warm-up queues behind this
+/// one instead of racing a second cold build. Whichever attach's `Warm`
+/// actually runs first pays the cost once (see the thread-local `WARMED` gate
+/// in `warm_up_native_streaming_session_once`); every later attach on that
+/// thread reuses the now-warm state.
+pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime) {
+    tokio::spawn(async move {
+        warm_up_default_native_streaming_worker(runtime).await;
+    });
+}
+
+async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {
+    if runtime.backend != openasr_core::BackendKind::Native {
+        return;
+    }
+    let Some(model_pack_path) = runtime.model_pack_path.clone() else {
+        // Fresh install / no model installed yet: nothing to warm. The daemon
+        // still serves `/health`; a bound pack arrives on a future restart.
+        return;
+    };
+    let Some(adapter) = openasr_core::native_runtime_model_adapter_for_path(&model_pack_path)
+    else {
+        return;
+    };
+    let model_pack =
+        NativeAsrModelPackRef::new("native-default", adapter.model_family(), model_pack_path);
+    let context = NativeAsrSessionContext::new("boot-warmup");
+    let options = NativeAsrRequestOptions::new();
+    let session_config = NativeAsrStreamingSessionConfig::new()
+        .with_audio_format(RealtimeAudioFormat::pcm16_mono_16khz());
+    let executor = NativeBackendExecutor;
+    // Matches the hardware target / thread count a WS session defaults to
+    // when the client does not override them (`execution_target` /
+    // `inference_threads` both unset) -- the common case, and exactly the
+    // worker key this warm-up needs to land on to actually help.
+    let hardware_target = native_hardware_target_from_execution_target(None);
+    let session = match NativeAsrExecutor::start_streaming_session(
+        &executor,
+        &adapter,
+        &model_pack,
+        hardware_target,
+        context,
+        options,
+        session_config,
+    ) {
+        Ok(session) => session,
+        Err(_) => return,
+    };
+    let key = NativeStreamingWorkerKey::new(model_pack.root.clone(), hardware_target, None);
+    attach_and_run_boot_warmup(key, session).await;
+}
+
+/// The generic (session-agnostic) half of the boot warm-up: attach `session`
+/// under `key`, send `Warm`, wait for it to finish, then release. Split out
+/// from `warm_up_default_native_streaming_worker` so the async-scheduling
+/// property that actually matters -- this runs to completion in the
+/// background without the caller (`spawn_boot_native_warmup`, called from
+/// `serve_with_launch_options` right after bind) ever awaiting it -- is
+/// testable with a fake, injectable-latency [`NativeAsrSession`] instead of a
+/// real model pack.
+pub(crate) async fn attach_and_run_boot_warmup(
+    key: NativeStreamingWorkerKey,
+    session: Box<dyn NativeAsrSession>,
+) {
+    let Ok(mut worker) = NativeStreamingDecodeWorker::attach(key, session).await else {
+        return;
+    };
+    let envelope = NativeStreamingCommandEnvelope {
+        kind: NativeStreamingCommandKind::Warm,
+        command: NativeStreamingCommand::Warm,
+    };
+    if worker.commands.send(envelope).await.is_ok() {
+        // Wait for the Warm outcome so this session -- and the worker-key
+        // acquisition it holds -- does not release before warm-up actually
+        // finishes; otherwise a concurrent real attach would not meaningfully
+        // "queue behind" this one.
+        let _ = worker.outcomes.recv().await;
+    }
+    // No Finish/Cancel is sent, so the worker thread cancels this session on
+    // its behalf (see `run_native_streaming_session_on_worker`) and loops
+    // straight back to accept the next real Attach -- the thread-local warm
+    // state this call just primed stays resident for it.
+    worker.join();
 }
 
 pub(crate) fn finish_native_streaming_session_in_worker(

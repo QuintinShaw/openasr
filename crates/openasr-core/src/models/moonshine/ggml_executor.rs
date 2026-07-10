@@ -277,6 +277,10 @@ impl GgmlAsrExecutor for MoonshineGgmlExecutor {
         self.execute_inner(request, false)
             .map_err(|error| moonshine_execute_error_to_ggml(self, error, request))
     }
+
+    fn unload_idle_state(&self) {
+        self.runtime_cache_by_path.clear();
+    }
 }
 
 impl MoonshineGgmlExecutor {
@@ -326,6 +330,10 @@ impl GgmlAsrStreamingExecutor for MoonshineGgmlExecutor {
             STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT,
             MoonshineGgmlExecutor::execute_streaming,
         )
+    }
+
+    fn unload_idle_state(&self) {
+        self.runtime_cache_by_path.clear();
     }
 }
 
