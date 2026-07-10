@@ -1,15 +1,14 @@
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    fmt,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::{cell::RefCell, fmt, path::PathBuf};
 
 use thiserror::Error;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlStaticTensor,
     GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader, env_toggle_with_raw,
+};
+use crate::models::thread_local_runtime_cache::{
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
+    with_thread_local_cached_mut_by_key,
 };
 
 use super::graph_config::qwen_runtime_graph_config;
@@ -22,6 +21,12 @@ const DEFAULT_RMS_NORM_EPSILON: f32 = 1e-6;
 const QWEN3_LLM_LOGITS_GRAPH_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
 const OPENASR_QWEN3_LLM_LOGITS_GGML_ENV: &str = "OPENASR_QWEN3_LLM_LOGITS_GGML";
 
+/// (canonical pack path, backend): identifies the resident fused logits-head
+/// graph executor for a loaded pack, mirroring the `(PathBuf,
+/// GgmlCpuGraphBackend)` key convention used by the qwen audio-encoder and
+/// firered-aed encoder/decoder runtime caches.
+type QwenLogitsHeadExecutorCacheKey = (PathBuf, GgmlCpuGraphBackend);
+
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3AsrLlmLogitsHead {
     d_model: usize,
@@ -32,7 +37,7 @@ pub(crate) struct Qwen3AsrLlmLogitsHead {
     output_weight_values: Option<Vec<f32>>,
     output_weight_layout: OutputWeightLayout,
     ggml_output_weight: Option<OwnedGgmlLogitsWeight>,
-    ggml_executor_id: Option<u64>,
+    ggml_executor_cache_key: Option<QwenLogitsHeadExecutorCacheKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,11 +121,12 @@ impl Qwen3AsrLlmLogitsHead {
             return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
         }
 
-        if let (Some(executor_id), Some(output_weight)) =
-            (self.ggml_executor_id, self.ggml_output_weight.as_ref())
-        {
+        if let (Some(cache_key), Some(output_weight)) = (
+            self.ggml_executor_cache_key.as_ref(),
+            self.ggml_output_weight.as_ref(),
+        ) {
             return with_thread_local_logits_head_executor(
-                executor_id,
+                cache_key.clone(),
                 self.d_model,
                 self.vocab_size,
                 self.rms_norm_epsilon,
@@ -185,11 +191,12 @@ impl Qwen3AsrLlmLogitsHead {
             return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
         }
 
-        if let (Some(executor_id), Some(output_weight)) =
-            (self.ggml_executor_id, self.ggml_output_weight.as_ref())
-        {
+        if let (Some(cache_key), Some(output_weight)) = (
+            self.ggml_executor_cache_key.as_ref(),
+            self.ggml_output_weight.as_ref(),
+        ) {
             let token_id = with_thread_local_logits_head_executor(
-                executor_id,
+                cache_key.clone(),
                 self.d_model,
                 self.vocab_size,
                 self.rms_norm_epsilon,
@@ -300,9 +307,12 @@ pub(crate) fn load_qwen3_llm_logits_head_from_reader_with_output_tensor(
         output_weight_tensor_name,
         output_weight_values,
         output_weight_layout,
-        ggml_executor_id: raw_output_weight
-            .as_ref()
-            .map(|_| next_qwen_logits_head_executor_id()),
+        ggml_executor_cache_key: raw_output_weight.as_ref().map(|_| {
+            (
+                canonical_runtime_cache_path(reader.tensor_index().path()),
+                qwen_runtime_graph_config().backend,
+            )
+        }),
         ggml_output_weight: raw_output_weight,
     })
 }
@@ -342,18 +352,25 @@ struct Qwen3AsrLlmLogitsHeadGraphExecutor {
 }
 
 thread_local! {
-    static QWEN_LLM_LOGITS_HEAD_EXECUTOR_BY_ID: RefCell<HashMap<u64, Qwen3AsrLlmLogitsHeadGraphExecutor>> =
-        RefCell::new(HashMap::new());
-}
-
-static NEXT_QWEN_LLM_LOGITS_HEAD_EXECUTOR_ID: AtomicU64 = AtomicU64::new(1);
-
-fn next_qwen_logits_head_executor_id() -> u64 {
-    NEXT_QWEN_LLM_LOGITS_HEAD_EXECUTOR_ID.fetch_add(1, Ordering::Relaxed)
+    // Bounded LRU (not a plain `HashMap`): each entry owns a resident ggml
+    // static-tensor arena holding the full vocab x d_model output-weight
+    // matrix. The previous design keyed this cache on a thread-local
+    // monotonic id minted once per model *load* and never evicted or
+    // reused, so every load of a qwen pack left one more multi-hundred-MB
+    // entry permanently resident per thread for the life of the process --
+    // the same "memory roller coaster" root cause already fixed for the
+    // other per-pack runtime caches (see
+    // `thread_local_runtime_cache::DEFAULT_RUNTIME_CACHE_CAPACITY`). Keying
+    // on `(canonical pack path, backend)` instead lets repeated loads of the
+    // same pack reuse one entry and bounds the worst case to
+    // `DEFAULT_RUNTIME_CACHE_CAPACITY` resident executors per thread.
+    static QWEN_LLM_LOGITS_HEAD_EXECUTOR_BY_KEY: RefCell<
+        BoundedRuntimeCache<QwenLogitsHeadExecutorCacheKey, Qwen3AsrLlmLogitsHeadGraphExecutor>,
+    > = RefCell::new(BoundedRuntimeCache::new());
 }
 
 fn with_thread_local_logits_head_executor<R>(
-    executor_id: u64,
+    cache_key: QwenLogitsHeadExecutorCacheKey,
     d_model: usize,
     vocab_size: usize,
     rms_norm_epsilon: f32,
@@ -361,23 +378,21 @@ fn with_thread_local_logits_head_executor<R>(
     output_weight: &OwnedGgmlLogitsWeight,
     use_executor: impl FnOnce(&mut Qwen3AsrLlmLogitsHeadGraphExecutor) -> Result<R, GgmlCpuGraphError>,
 ) -> Result<R, GgmlCpuGraphError> {
-    QWEN_LLM_LOGITS_HEAD_EXECUTOR_BY_ID.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(executor_id) {
-            let executor = Qwen3AsrLlmLogitsHeadGraphExecutor::new(
+    with_thread_local_cached_mut_by_key(
+        &QWEN_LLM_LOGITS_HEAD_EXECUTOR_BY_KEY,
+        cache_key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
+        || {
+            Qwen3AsrLlmLogitsHeadGraphExecutor::new(
                 d_model,
                 vocab_size,
                 rms_norm_epsilon,
                 output_norm_weight,
                 output_weight,
-            )?;
-            e.insert(executor);
-        }
-        let executor = cache
-            .get_mut(&executor_id)
-            .expect("qwen logits-head executor cache must contain inserted entry");
-        use_executor(executor)
-    })
+            )
+        },
+        use_executor,
+    )
 }
 
 impl fmt::Debug for Qwen3AsrLlmLogitsHeadGraphExecutor {
@@ -662,7 +677,7 @@ mod tests {
             ]),
             output_weight_layout: OutputWeightLayout::HiddenVocab,
             ggml_output_weight: None,
-            ggml_executor_id: None,
+            ggml_executor_cache_key: None,
         };
         let logits = head
             .compute_logits_for_last_hidden(&[1.0, 2.0])
@@ -682,7 +697,7 @@ mod tests {
             output_weight_values: Some(vec![0.0; 32]),
             output_weight_layout: OutputWeightLayout::HiddenVocab,
             ggml_output_weight: None,
-            ggml_executor_id: None,
+            ggml_executor_cache_key: None,
         };
         let error = head
             .compute_logits_for_last_hidden(&[0.0; 3])
@@ -752,5 +767,80 @@ mod tests {
     fn logits_head_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Qwen3AsrLlmLogitsHead>();
+    }
+
+    fn ggml_logits_head_with_cache_key(
+        cache_key: QwenLogitsHeadExecutorCacheKey,
+        output_norm_weight: Vec<f32>,
+    ) -> Qwen3AsrLlmLogitsHead {
+        // A valid rank-2 [d_model x vocab_size] f32 weight for d_model=2,
+        // vocab_size=3, matching the fused-logits fixture in
+        // `llm_transformer::tests::fused_logits_top1_selects_first_token_on_equal_logit_tie`.
+        let output_weight_values: [f32; 6] = [
+            0.1, 0.0, //
+            0.3, 0.0, //
+            0.3, 0.0,
+        ];
+        Qwen3AsrLlmLogitsHead {
+            d_model: 2,
+            vocab_size: 3,
+            rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
+            output_norm_weight,
+            output_weight_tensor_name: OUTPUT_WEIGHT_TENSOR_NAME,
+            output_weight_values: None,
+            output_weight_layout: OutputWeightLayout::HiddenVocab,
+            ggml_output_weight: Some(OwnedGgmlLogitsWeight {
+                ggml_type: crate::ggml_runtime::GGML_TYPE_F32,
+                dims: vec![2, 3],
+                bytes: output_weight_values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+            }),
+            ggml_executor_cache_key: Some(cache_key),
+        }
+    }
+
+    fn ggml_logits_head_test_cache_key(id: usize) -> QwenLogitsHeadExecutorCacheKey {
+        (
+            PathBuf::from(format!("/tmp/openasr-test-logits-head-cache-{id}.gguf")),
+            GgmlCpuGraphBackend::Cpu,
+        )
+    }
+
+    #[test]
+    fn ggml_logits_head_executor_cache_reuses_same_key_without_rebuilding() {
+        let key = ggml_logits_head_test_cache_key(9_000_001);
+        let first = ggml_logits_head_with_cache_key(key.clone(), vec![1.0, 1.0]);
+        first
+            .compute_top1_token_for_last_hidden(&[1.0, 2.0])
+            .expect("first compute builds and caches the executor");
+
+        // Same cache key, but a norm-weight width that would fail
+        // `Qwen3AsrLlmLogitsHeadGraphExecutor::new`'s shape validation if it
+        // were actually rebuilt. Success here proves the cached executor
+        // from `first` was reused and this (invalid) weight was never used
+        // to build a new one.
+        let second = ggml_logits_head_with_cache_key(key, vec![1.0, 1.0, 1.0]);
+        second
+            .compute_top1_token_for_last_hidden(&[1.0, 2.0])
+            .expect("second compute must reuse the cached executor, not rebuild from bad input");
+    }
+
+    #[test]
+    fn ggml_logits_head_executor_cache_evicts_beyond_capacity() {
+        let base_id = 9_100_000;
+        for offset in 0..(DEFAULT_RUNTIME_CACHE_CAPACITY + 3) {
+            let key = ggml_logits_head_test_cache_key(base_id + offset);
+            let head = ggml_logits_head_with_cache_key(key, vec![1.0, 1.0]);
+            head.compute_top1_token_for_last_hidden(&[1.0, 2.0])
+                .unwrap_or_else(|error| panic!("compute for distinct key {offset}: {error}"));
+
+            let len = QWEN_LLM_LOGITS_HEAD_EXECUTOR_BY_KEY.with(|cache| cache.borrow().len());
+            assert!(
+                len <= DEFAULT_RUNTIME_CACHE_CAPACITY,
+                "cache must never exceed the configured capacity (cap={DEFAULT_RUNTIME_CACHE_CAPACITY}), got {len}"
+            );
+        }
     }
 }

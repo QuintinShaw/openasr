@@ -5,14 +5,16 @@ use crate::ggml_runtime::GgufMetadata;
 use crate::models::gpt2_bpe::{
     build_merge_rank, build_token_to_id, encode_byte_level_piece, token_to_bytes,
 };
+use crate::models::oasr_metadata::{
+    TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
+    required_metadata_string, required_metadata_string_array,
+};
 use unicode_general_category::{GeneralCategory, get_general_category};
 
-const TOKENIZER_GGML_MODEL_KEY: &str = "tokenizer.ggml.model";
+const HYMT2_TOKENIZER_FAMILY: &str = "Hy-MT2";
 const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
 const TOKENIZER_GGML_PRE_KEY: &str = "tokenizer.ggml.pre";
 const TOKENIZER_GGML_PRE_VALUE_HUNYUAN_DENSE: &str = "hunyuan-dense";
-const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
-const TOKENIZER_GGML_MERGES_KEY: &str = "tokenizer.ggml.merges";
 
 pub(crate) const HYMT2_BOS_TOKEN_ID: u32 = 120_000;
 pub(crate) const HYMT2_PAD_TOKEN_ID: u32 = 120_002;
@@ -40,7 +42,8 @@ pub struct Hymt2Tokenizer {
 
 impl Hymt2Tokenizer {
     pub(crate) fn from_gguf_metadata(metadata: &GgufMetadata) -> Result<Self, NativeAsrError> {
-        let tokenizer_model = required_metadata_string(metadata, TOKENIZER_GGML_MODEL_KEY)?;
+        let tokenizer_model =
+            required_metadata_string(metadata, TOKENIZER_GGML_MODEL_KEY, HYMT2_TOKENIZER_FAMILY)?;
         if !tokenizer_model.eq_ignore_ascii_case(TOKENIZER_GGML_MODEL_VALUE_GPT2) {
             return Err(NativeAsrError::UnsupportedModelPack {
                 reason: format!(
@@ -49,7 +52,8 @@ impl Hymt2Tokenizer {
                 ),
             });
         }
-        let tokenizer_pre = required_metadata_string(metadata, TOKENIZER_GGML_PRE_KEY)?;
+        let tokenizer_pre =
+            required_metadata_string(metadata, TOKENIZER_GGML_PRE_KEY, HYMT2_TOKENIZER_FAMILY)?;
         if !tokenizer_pre.eq_ignore_ascii_case(TOKENIZER_GGML_PRE_VALUE_HUNYUAN_DENSE) {
             return Err(NativeAsrError::UnsupportedModelPack {
                 reason: format!(
@@ -59,8 +63,16 @@ impl Hymt2Tokenizer {
             });
         }
 
-        let tokens = required_metadata_string_array(metadata, TOKENIZER_GGML_TOKENS_KEY)?;
-        let merges = required_metadata_string_array(metadata, TOKENIZER_GGML_MERGES_KEY)?;
+        let tokens = required_metadata_string_array(
+            metadata,
+            TOKENIZER_GGML_TOKENS_KEY,
+            HYMT2_TOKENIZER_FAMILY,
+        )?;
+        let merges = required_metadata_string_array(
+            metadata,
+            TOKENIZER_GGML_MERGES_KEY,
+            HYMT2_TOKENIZER_FAMILY,
+        )?;
         if tokens.is_empty() || merges.is_empty() {
             return Err(NativeAsrError::UnsupportedModelPack {
                 reason: "Hy-MT2 GGUF tokenizer tokens and merges must be non-empty".to_string(),
@@ -508,35 +520,6 @@ fn validate_token_id_in_range(
             id_to_token.len()
         ),
     })
-}
-
-fn required_metadata_string<'a>(
-    metadata: &'a GgufMetadata,
-    key: &'static str,
-) -> Result<&'a str, NativeAsrError> {
-    let value = metadata
-        .get_string(key)
-        .ok_or_else(|| NativeAsrError::UnsupportedModelPack {
-            reason: format!("Hy-MT2 GGUF tokenizer is missing required key '{key}'"),
-        })?;
-    let normalized = value.trim();
-    if normalized.is_empty() {
-        return Err(NativeAsrError::UnsupportedModelPack {
-            reason: format!("Hy-MT2 GGUF tokenizer key '{key}' cannot be empty"),
-        });
-    }
-    Ok(normalized)
-}
-
-fn required_metadata_string_array<'a>(
-    metadata: &'a GgufMetadata,
-    key: &'static str,
-) -> Result<&'a [String], NativeAsrError> {
-    metadata
-        .get_string_array(key)
-        .ok_or_else(|| NativeAsrError::UnsupportedModelPack {
-            reason: format!("Hy-MT2 GGUF tokenizer is missing required key '{key}'"),
-        })
 }
 
 #[cfg(test)]

@@ -2,14 +2,17 @@ use std::collections::BTreeMap;
 
 use crate::NativeAsrError;
 use crate::ggml_runtime::GgufMetadata;
+use crate::models::oasr_metadata::{
+    TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY, required_metadata_string,
+    required_metadata_string_array,
+};
 use crate::models::phrase_bias_decode::{
     PhraseBiasTokenEncoder, encode_sentencepiece_phrase_bias_tokens,
 };
 use crate::models::spm_decoder::{SpmDecoderConfig, decode_spm_pieces};
 
-const TOKENIZER_GGML_MODEL_KEY: &str = "tokenizer.ggml.model";
+const MOONSHINE_TOKENIZER_FAMILY: &str = "Moonshine";
 const TOKENIZER_GGML_MODEL_VALUE_LLAMA: &str = "llama";
-const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 
 /// SentencePiece-style ▁/byte-fallback BPE tokenizer used by Moonshine.
 ///
@@ -30,7 +33,11 @@ impl PhraseBiasTokenEncoder for MoonshineTokenizer {
 
 impl MoonshineTokenizer {
     pub(crate) fn from_gguf_metadata(metadata: &GgufMetadata) -> Result<Self, NativeAsrError> {
-        let tokenizer_model = required_metadata_string(metadata, TOKENIZER_GGML_MODEL_KEY)?;
+        let tokenizer_model = required_metadata_string(
+            metadata,
+            TOKENIZER_GGML_MODEL_KEY,
+            MOONSHINE_TOKENIZER_FAMILY,
+        )?;
         if !tokenizer_model.eq_ignore_ascii_case(TOKENIZER_GGML_MODEL_VALUE_LLAMA) {
             return Err(NativeAsrError::UnsupportedModelPack {
                 reason: format!(
@@ -38,7 +45,11 @@ impl MoonshineTokenizer {
                 ),
             });
         }
-        let tokens = required_metadata_string_array(metadata, TOKENIZER_GGML_TOKENS_KEY)?;
+        let tokens = required_metadata_string_array(
+            metadata,
+            TOKENIZER_GGML_TOKENS_KEY,
+            MOONSHINE_TOKENIZER_FAMILY,
+        )?;
         if tokens.is_empty() {
             return Err(NativeAsrError::UnsupportedModelPack {
                 reason: format!(
@@ -83,26 +94,4 @@ impl MoonshineTokenizer {
             SpmDecoderConfig::BYTE_FALLBACK_BPE,
         ))
     }
-}
-
-fn required_metadata_string<'a>(
-    metadata: &'a GgufMetadata,
-    key: &'static str,
-) -> Result<&'a str, NativeAsrError> {
-    metadata
-        .get_string(key)
-        .ok_or_else(|| NativeAsrError::UnsupportedModelPack {
-            reason: format!("Moonshine GGUF metadata is missing required key '{key}'"),
-        })
-}
-
-fn required_metadata_string_array<'a>(
-    metadata: &'a GgufMetadata,
-    key: &'static str,
-) -> Result<&'a [String], NativeAsrError> {
-    metadata
-        .get_string_array(key)
-        .ok_or_else(|| NativeAsrError::UnsupportedModelPack {
-            reason: format!("Moonshine GGUF metadata is missing required string array '{key}'"),
-        })
 }

@@ -3,14 +3,17 @@ use std::collections::BTreeMap;
 use crate::NativeAsrError;
 use crate::ggml_runtime::GgufMetadata;
 use crate::models::decode_policy_component_registry::BuiltinSeq2SeqDecodePolicyTokenSource;
+use crate::models::oasr_metadata::{
+    TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY, required_metadata_string,
+    required_metadata_string_array,
+};
 use crate::models::phrase_bias_decode::{
     PhraseBiasTokenEncoder, encode_sentencepiece_phrase_bias_tokens,
 };
 use crate::models::spm_decoder::{SpmDecoderConfig, decode_spm_pieces};
 
-const TOKENIZER_GGML_MODEL_KEY: &str = "tokenizer.ggml.model";
+const COHERE_TOKENIZER_FAMILY: &str = "Cohere Transcribe";
 const TOKENIZER_GGML_MODEL_VALUE_LLAMA: &str = "llama";
-const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 
 #[derive(Debug, Clone)]
 pub(crate) struct CohereTranscribeTokenizer {
@@ -28,7 +31,8 @@ impl BuiltinSeq2SeqDecodePolicyTokenSource for CohereTranscribeTokenizer {}
 
 impl CohereTranscribeTokenizer {
     pub(crate) fn from_gguf_metadata(metadata: &GgufMetadata) -> Result<Self, NativeAsrError> {
-        let tokenizer_model = required_metadata_string(metadata, TOKENIZER_GGML_MODEL_KEY)?;
+        let tokenizer_model =
+            required_metadata_string(metadata, TOKENIZER_GGML_MODEL_KEY, COHERE_TOKENIZER_FAMILY)?;
         if !tokenizer_model.eq_ignore_ascii_case(TOKENIZER_GGML_MODEL_VALUE_LLAMA) {
             return Err(NativeAsrError::UnsupportedModelPack {
                 reason: format!(
@@ -37,7 +41,11 @@ impl CohereTranscribeTokenizer {
                 ),
             });
         }
-        let tokens = required_metadata_string_array(metadata, TOKENIZER_GGML_TOKENS_KEY)?;
+        let tokens = required_metadata_string_array(
+            metadata,
+            TOKENIZER_GGML_TOKENS_KEY,
+            COHERE_TOKENIZER_FAMILY,
+        )?;
         if tokens.is_empty() {
             return Err(NativeAsrError::UnsupportedModelPack {
                 reason: format!(
@@ -98,37 +106,6 @@ impl CohereTranscribeTokenizer {
             SpmDecoderConfig::BYTE_FALLBACK_BPE,
         ))
     }
-}
-
-fn required_metadata_string<'a>(
-    metadata: &'a GgufMetadata,
-    key: &'static str,
-) -> Result<&'a str, NativeAsrError> {
-    let value = metadata
-        .get_string(key)
-        .ok_or_else(|| NativeAsrError::UnsupportedModelPack {
-            reason: format!("Cohere Transcribe GGUF tokenizer is missing required key '{key}'"),
-        })?;
-    let normalized = value.trim();
-    if normalized.is_empty() {
-        return Err(NativeAsrError::UnsupportedModelPack {
-            reason: format!("Cohere Transcribe GGUF tokenizer key '{key}' cannot be empty"),
-        });
-    }
-    Ok(normalized)
-}
-
-fn required_metadata_string_array<'a>(
-    metadata: &'a GgufMetadata,
-    key: &'static str,
-) -> Result<&'a [String], NativeAsrError> {
-    metadata
-        .get_string_array(key)
-        .ok_or_else(|| NativeAsrError::UnsupportedModelPack {
-            reason: format!(
-                "Cohere Transcribe GGUF tokenizer requires key '{key}' as array[string]"
-            ),
-        })
 }
 
 #[cfg(test)]

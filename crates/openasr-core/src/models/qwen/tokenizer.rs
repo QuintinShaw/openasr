@@ -6,6 +6,10 @@ use crate::models::decode_policy_component_registry::BuiltinSeq2SeqDecodePolicyT
 use crate::models::gpt2_bpe::{
     build_merge_rank, build_token_to_id, encode_prompt_text, token_to_bytes,
 };
+use crate::models::oasr_metadata::{
+    TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
+    required_metadata_string, required_metadata_string_array, required_metadata_u32,
+};
 use crate::models::phrase_bias_decode::{PhraseBiasTokenEncoder, encode_bpe_phrase_bias_variants};
 
 use super::runtime_contract::{
@@ -13,10 +17,8 @@ use super::runtime_contract::{
     QWEN3_EOS_TOKEN_ID_KEY, QWEN3_LLM_VOCAB_SIZE_KEY, QWEN3_PAD_TOKEN_ID_KEY,
 };
 
-const TOKENIZER_GGML_MODEL_KEY: &str = "tokenizer.ggml.model";
+const QWEN3_TOKENIZER_FAMILY: &str = "Qwen3-ASR";
 const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
-const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
-const TOKENIZER_GGML_MERGES_KEY: &str = "tokenizer.ggml.merges";
 
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3AsrTokenizer {
@@ -32,7 +34,8 @@ pub(crate) struct Qwen3AsrTokenizer {
 
 impl Qwen3AsrTokenizer {
     pub fn from_gguf_metadata(metadata: &GgufMetadata) -> Result<Self, NativeAsrError> {
-        let tokenizer_model = required_metadata_string(metadata, TOKENIZER_GGML_MODEL_KEY)?;
+        let tokenizer_model =
+            required_metadata_string(metadata, TOKENIZER_GGML_MODEL_KEY, QWEN3_TOKENIZER_FAMILY)?;
         if !tokenizer_model.eq_ignore_ascii_case(TOKENIZER_GGML_MODEL_VALUE_GPT2) {
             return Err(NativeAsrError::UnsupportedModelPack {
                 reason: format!(
@@ -42,7 +45,11 @@ impl Qwen3AsrTokenizer {
             });
         }
 
-        let tokens = required_metadata_string_array(metadata, TOKENIZER_GGML_TOKENS_KEY)?;
+        let tokens = required_metadata_string_array(
+            metadata,
+            TOKENIZER_GGML_TOKENS_KEY,
+            QWEN3_TOKENIZER_FAMILY,
+        )?;
         if tokens.is_empty() {
             return Err(NativeAsrError::UnsupportedModelPack {
                 reason: format!(
@@ -51,7 +58,11 @@ impl Qwen3AsrTokenizer {
                 ),
             });
         }
-        let merges = required_metadata_string_array(metadata, TOKENIZER_GGML_MERGES_KEY)?;
+        let merges = required_metadata_string_array(
+            metadata,
+            TOKENIZER_GGML_MERGES_KEY,
+            QWEN3_TOKENIZER_FAMILY,
+        )?;
         if merges.is_empty() {
             return Err(NativeAsrError::UnsupportedModelPack {
                 reason: format!(
@@ -61,7 +72,8 @@ impl Qwen3AsrTokenizer {
             });
         }
 
-        let vocab_size = required_metadata_u32(metadata, QWEN3_LLM_VOCAB_SIZE_KEY)?;
+        let vocab_size =
+            required_metadata_u32(metadata, QWEN3_LLM_VOCAB_SIZE_KEY, QWEN3_TOKENIZER_FAMILY)?;
         let token_count =
             u32::try_from(tokens.len()).map_err(|_| NativeAsrError::UnsupportedModelPack {
                 reason: format!(
@@ -78,11 +90,25 @@ impl Qwen3AsrTokenizer {
             });
         }
 
-        let audio_start_token_id = required_metadata_u32(metadata, QWEN3_AUDIO_START_TOKEN_ID_KEY)?;
-        let audio_end_token_id = required_metadata_u32(metadata, QWEN3_AUDIO_END_TOKEN_ID_KEY)?;
-        let audio_pad_token_id = required_metadata_u32(metadata, QWEN3_AUDIO_PAD_TOKEN_ID_KEY)?;
-        let eos_token_id = required_metadata_u32(metadata, QWEN3_EOS_TOKEN_ID_KEY)?;
-        let pad_token_id = required_metadata_u32(metadata, QWEN3_PAD_TOKEN_ID_KEY)?;
+        let audio_start_token_id = required_metadata_u32(
+            metadata,
+            QWEN3_AUDIO_START_TOKEN_ID_KEY,
+            QWEN3_TOKENIZER_FAMILY,
+        )?;
+        let audio_end_token_id = required_metadata_u32(
+            metadata,
+            QWEN3_AUDIO_END_TOKEN_ID_KEY,
+            QWEN3_TOKENIZER_FAMILY,
+        )?;
+        let audio_pad_token_id = required_metadata_u32(
+            metadata,
+            QWEN3_AUDIO_PAD_TOKEN_ID_KEY,
+            QWEN3_TOKENIZER_FAMILY,
+        )?;
+        let eos_token_id =
+            required_metadata_u32(metadata, QWEN3_EOS_TOKEN_ID_KEY, QWEN3_TOKENIZER_FAMILY)?;
+        let pad_token_id =
+            required_metadata_u32(metadata, QWEN3_PAD_TOKEN_ID_KEY, QWEN3_TOKENIZER_FAMILY)?;
 
         let mut id_to_token = tokens
             .iter()
@@ -226,62 +252,6 @@ fn validate_token_id_in_range(
             id_to_token.len()
         ),
     })
-}
-
-fn required_metadata_string<'a>(
-    metadata: &'a GgufMetadata,
-    key: &'static str,
-) -> Result<&'a str, NativeAsrError> {
-    let value = metadata
-        .get_string(key)
-        .ok_or_else(|| NativeAsrError::UnsupportedModelPack {
-            reason: format!("Qwen3-ASR GGUF tokenizer is missing required key '{key}'"),
-        })?;
-    let normalized = value.trim();
-    if normalized.is_empty() {
-        return Err(NativeAsrError::UnsupportedModelPack {
-            reason: format!("Qwen3-ASR GGUF tokenizer key '{key}' cannot be empty"),
-        });
-    }
-    Ok(normalized)
-}
-
-fn required_metadata_u32(
-    metadata: &GgufMetadata,
-    key: &'static str,
-) -> Result<u32, NativeAsrError> {
-    if let Some(value) = metadata.get_u32(key) {
-        return Ok(value);
-    }
-    if let Some(value) = metadata.get_u64(key) {
-        return u32::try_from(value).map_err(|_| NativeAsrError::UnsupportedModelPack {
-            reason: format!("Qwen3-ASR GGUF tokenizer key '{key}' value {value} does not fit u32"),
-        });
-    }
-    if let Some(value) = metadata.get_string(key) {
-        let parsed = value.trim().parse::<u32>().map_err(|error| {
-            NativeAsrError::UnsupportedModelPack {
-                reason: format!(
-                    "Qwen3-ASR GGUF tokenizer key '{key}' cannot parse '{value}' as u32: {error}"
-                ),
-            }
-        })?;
-        return Ok(parsed);
-    }
-    Err(NativeAsrError::UnsupportedModelPack {
-        reason: format!("Qwen3-ASR GGUF tokenizer is missing required key '{key}'"),
-    })
-}
-
-fn required_metadata_string_array<'a>(
-    metadata: &'a GgufMetadata,
-    key: &'static str,
-) -> Result<&'a [String], NativeAsrError> {
-    metadata
-        .get_string_array(key)
-        .ok_or_else(|| NativeAsrError::UnsupportedModelPack {
-            reason: format!("Qwen3-ASR GGUF tokenizer requires key '{key}' as array[string]"),
-        })
 }
 
 #[cfg(test)]
