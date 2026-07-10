@@ -27,8 +27,9 @@ use crate::nn::decoder::{
     LlmReusableDecodeGraph, allocate_zeroed_llm_resident_kv_arena,
     build_fixed_kv_attention_mask_bits, build_fixed_kv_attention_mask_bits_for_query_rows,
     build_fixed_kv_attention_mask_bits_for_sequences, compose_llm_decoder_layer_stack,
-    f32_slice_to_f16_bits, reusable_decode_graph_supported_for_runner,
+    reusable_decode_graph_supported_for_runner,
 };
+use crate::nn::half::f32_slice_to_f16_bits;
 
 const DEFAULT_RMS_NORM_EPSILON: f32 = 1e-6;
 // The whole-step decoder builds all layers into one graph per token, so its

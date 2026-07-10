@@ -19,7 +19,7 @@ use crate::ggml_runtime::{
     bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
     upload_static_f32 as arena_upload_static_f32,
 };
-use crate::models::cohere::encoder_graph::{build_relative_positional_encoding, f32_to_f16_bits};
+use crate::models::cohere::encoder_graph::build_relative_positional_encoding;
 use crate::models::parakeet_ctc::graph_config::parakeet_ctc_encoder_graph_config;
 
 use crate::nn::conv::{
@@ -27,6 +27,7 @@ use crate::nn::conv::{
     apply_conv_2d_depthwise_bias_activation, reshape_bias_4d,
 };
 use crate::nn::encoder::{ConformerBlockConfig, ConformerBlockWeights, conformer_block};
+use crate::nn::half::f32_to_f16_bits;
 
 use super::encoder_weights::{NamedTensor, ParakeetEncoderLayerWeights, ParakeetEncoderWeights};
 use super::runtime_contract::ParakeetCtcExecutionMetadata;

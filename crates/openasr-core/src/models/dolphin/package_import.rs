@@ -64,7 +64,7 @@ use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::language::REGISTERED_DIALECT_CODES;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f32, encode_f16_bits_le,
-    f32_to_f16_bits, validate_error, validate_output_pack_extension,
+    validate_error, validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
@@ -72,6 +72,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
 use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
+use crate::nn::half::f32_to_f16_bits;
 
 // --- E-Branchformer / Transformer configuration -------------------------------
 // Every structural hparam (layer counts, d_model, head count/dim, FFN/cgMLP
