@@ -911,6 +911,23 @@ impl ServerRuntime {
             BackendKind::Native => self.model_pack_path.is_some(),
         }
     }
+
+    /// Whether the bound model's runtime is resident right now (surfaced by
+    /// `/health` as `model_resident`, gated on `has_model_bound` -- see the
+    /// call site) so clients can tell "loaded, ready to transcribe
+    /// instantly" apart from "bound but idle-unloaded, the next request pays
+    /// a cold rebuild". `mock` has no runtime to unload -- it is resident
+    /// whenever it is bound. `native`'s residency is the real, process-wide
+    /// idle-unload signal in `idle_activity`, not a guess: it reads `true`
+    /// only after a successful load/decode, and flips back to `false` the
+    /// moment the `idle_unload` reaper evicts the cached runtime, without
+    /// this method reaching into any per-thread cache itself.
+    fn model_is_resident(&self) -> bool {
+        match self.backend {
+            BackendKind::Mock => true,
+            BackendKind::Native => idle_activity::native_model_is_resident(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1386,6 +1403,7 @@ async fn health(
         pid: identity.pid,
         instance_token: identity.instance_token.clone(),
         model_installed: runtime.has_model_bound(),
+        model_resident: runtime.has_model_bound() && runtime.model_is_resident(),
     })
 }
 
@@ -1518,6 +1536,18 @@ struct HealthResponse {
     /// yet. Clients should treat this as "go install a model", not "daemon
     /// unreachable".
     model_installed: bool,
+    /// Whether the bound model's runtime is currently resident in memory,
+    /// i.e. ready to transcribe instantly with no cold-load latency. Added in
+    /// 0.1.13 alongside the `idle_unload` reaper actually releasing the
+    /// runtime after an idle period: `model_installed: true,
+    /// model_resident: false` means a model is bound but its runtime has been
+    /// unloaded (idle past the configured `idle_unload` threshold, or never
+    /// loaded yet this boot) -- the next transcription request pays a cold
+    /// rebuild before it can run, but is not itself an error. Always `false`
+    /// when `model_installed` is `false` (nothing to be resident). Additive:
+    /// absent in the pre-0.1.13 contract, so an older client that only reads
+    /// `model_installed` keeps working unchanged.
+    model_resident: bool,
 }
 
 #[derive(Serialize)]

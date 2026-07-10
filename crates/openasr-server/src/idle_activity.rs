@@ -95,6 +95,80 @@ pub(crate) fn bump_native_unload_generation() {
     NATIVE_UNLOAD_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Process-wide unload generation as of the most recent successful native
+/// model warm state transition (an offline decode or a realtime streaming
+/// warm-up that actually built or reused the resident runtime). Compared
+/// against [`native_unload_generation`], this is the source of truth for
+/// `/health`'s `model_resident` field: the two read equal only when no
+/// `idle_unload` eviction has happened since that last successful load.
+///
+/// `u64::MAX` is the "never warmed yet" sentinel -- unreachable via the
+/// generation counter's own increments in a running process -- so a fresh
+/// boot reads as not-resident until the first successful load completes,
+/// same as after a real eviction.
+static LAST_WARM_GENERATION: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Records that the native model runtime is resident as of right now, at the
+/// current unload generation. Call sites: [`crate::realtime::native_worker`]'s
+/// streaming warm-up gate and the offline-decode path in
+/// `routes::transcription`, both right after their respective build/decode
+/// succeeds.
+///
+/// Safe against a racing `idle_unload` eviction: the reaper only unloads
+/// while [`native_activity_is_idle_for`] reads true, i.e. while the active
+/// count is zero, and every call site runs from inside an active
+/// [`NativeActivityGuard`] (or an attached streaming session's equivalent
+/// window) -- so the generation read here cannot be bumped out from under an
+/// in-flight caller before its request finishes.
+pub(crate) fn mark_native_model_warm() {
+    LAST_WARM_GENERATION.store(native_unload_generation(), Ordering::Relaxed);
+}
+
+/// Whether the bound native model runtime is resident right now: warmed, and
+/// not evicted by an `idle_unload` sweep since. Reads `false` before the
+/// first successful load of the process's lifetime, and `false` again after
+/// any eviction until the next successful load.
+pub(crate) fn native_model_is_resident() -> bool {
+    LAST_WARM_GENERATION.load(Ordering::Relaxed) == native_unload_generation()
+}
+
+/// Single shared lock serializing every test in this crate that mutates
+/// `NATIVE_UNLOAD_GENERATION` (via [`bump_native_unload_generation`]) or
+/// `LAST_WARM_GENERATION` (via [`mark_native_model_warm`], including
+/// indirectly by exercising a real `warm_up_native_streaming_session_once`
+/// success path with a fake session) against each other -- without it, a
+/// bump or mark from one test could land between another test's own bump and
+/// check under `cargo test`'s default same-process test-thread parallelism.
+/// `cargo nextest` isolates each test in its own process and would not need
+/// this at all.
+///
+/// `tokio::sync::Mutex` (not `std::sync::Mutex`) because some holders are
+/// async tests that keep the guard alive across an `.await` (e.g. awaiting
+/// `attach_and_run_boot_warmup`) -- a `std::sync::MutexGuard` is not `Send`,
+/// so it cannot survive an await point on a multi-threaded runtime.
+/// [`native_unload_generation_test_lock_blocking`] is the sync-test
+/// counterpart, for callers (like this module's own `#[test]`s) that never
+/// hold the guard across an await point.
+#[cfg(test)]
+fn native_unload_generation_test_lock_mutex() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+pub(crate) async fn native_unload_generation_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    native_unload_generation_test_lock_mutex().lock().await
+}
+
+/// Blocking counterpart of [`native_unload_generation_test_lock`] for plain
+/// (non-`tokio::test`) `#[test]`s, which never run inside an async executor
+/// -- `Mutex::blocking_lock` would panic if called from one.
+#[cfg(test)]
+pub(crate) fn native_unload_generation_test_lock_blocking() -> tokio::sync::MutexGuard<'static, ()>
+{
+    native_unload_generation_test_lock_mutex().blocking_lock()
+}
+
 /// Marks one native request/session as started. Must be paired with a later
 /// [`native_activity_exit`] -- prefer [`NativeActivityGuard`] over calling
 /// this directly when the activity's lifetime is a single lexical scope.
@@ -241,5 +315,62 @@ mod tests {
         // absolute or relative count, which would be flaky under contention.
         let _guard = NativeActivityGuard::enter();
         drop(_guard);
+    }
+
+    #[test]
+    fn native_model_is_not_resident_before_any_warm_mark() {
+        // Regression guard for the `u64::MAX` sentinel: a generation counter
+        // that starts at 0 must never accidentally equal it, or a fresh boot
+        // (before the first successful load) would misreport resident.
+        let _generation_guard = native_unload_generation_test_lock_blocking();
+        assert_ne!(
+            native_unload_generation(),
+            u64::MAX,
+            "a real process-wide generation must never coincide with the never-warmed sentinel"
+        );
+    }
+
+    #[test]
+    fn marking_warm_makes_native_model_read_resident() {
+        let _generation_guard = native_unload_generation_test_lock_blocking();
+        bump_native_unload_generation();
+        assert!(
+            !native_model_is_resident(),
+            "a fresh bump with no matching mark must read as not resident"
+        );
+
+        mark_native_model_warm();
+        assert!(
+            native_model_is_resident(),
+            "marking warm at the current generation must read as resident"
+        );
+    }
+
+    #[test]
+    fn idle_unload_eviction_flips_resident_back_to_false() {
+        // Exercises the exact flip this field exists for: reload (mark warm)
+        // makes it true, and a subsequent idle-unload eviction (bump the
+        // generation, as `spawn_idle_unload_reaper` does) makes it false
+        // again without any further mark -- the reader never has to poll a
+        // second signal to notice the eviction.
+        let _generation_guard = native_unload_generation_test_lock_blocking();
+        bump_native_unload_generation();
+        mark_native_model_warm();
+        assert!(
+            native_model_is_resident(),
+            "just-marked warm at the current generation must read as resident"
+        );
+
+        bump_native_unload_generation();
+        assert!(
+            !native_model_is_resident(),
+            "an idle-unload eviction must flip resident back to false until the next mark"
+        );
+
+        mark_native_model_warm();
+        assert!(
+            native_model_is_resident(),
+            "a reload after the eviction (mark at the new generation) must flip resident back to true"
+        );
     }
 }
