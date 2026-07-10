@@ -63,6 +63,18 @@ impl GgmlAsrExecutor for ComposedGgmlAsrExecutor {
         };
         executor.execute(request)
     }
+
+    fn unload_idle_state(&self) {
+        // The composed executor is itself registered in the dispatch maps
+        // (see `builtin_execution_dispatch.rs`), so the reaper only ever
+        // calls unload on this wrapper -- without forwarding, every
+        // architecture behind it (e.g. qwen3-asr's NativeGraphLoweringV1
+        // executor) never sees `unload_idle_state` and its cached prepared
+        // runtime lives forever.
+        for executor in self.executors_by_model_architecture.values() {
+            executor.unload_idle_state();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -149,5 +161,44 @@ mod tests {
                 capability: "model-architecture-executor",
             }
         ));
+    }
+
+    #[test]
+    fn unload_idle_state_forwards_to_every_wrapped_architecture_executor() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Reproduces the qwen3-asr idle-unload bug: the composed executor is
+        // what the daemon's reaper actually holds a handle to (registered by
+        // model-architecture executor set), so if it does not forward
+        // `unload_idle_state` to the wrapped per-architecture executors, the
+        // inner executor's cached prepared runtime is never evicted.
+        struct CountingExecutor(Arc<AtomicUsize>);
+        impl GgmlAsrExecutor for CountingExecutor {
+            fn executor_id(&self) -> &'static str {
+                "counting-architecture-stub"
+            }
+            fn supports_phrase_bias(&self) -> bool {
+                true
+            }
+            fn execute(
+                &self,
+                _request: &GgmlAsrExecutionRequest,
+            ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+                unreachable!("this test never executes a request")
+            }
+            fn unload_idle_state(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let unload_calls = Arc::new(AtomicUsize::new(0));
+        let executor = ComposedGgmlAsrExecutor::default().with_architecture_executor(
+            crate::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            Arc::new(CountingExecutor(Arc::clone(&unload_calls))),
+        );
+
+        executor.unload_idle_state();
+
+        assert_eq!(unload_calls.load(Ordering::SeqCst), 1);
     }
 }
