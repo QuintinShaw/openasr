@@ -3,7 +3,7 @@
 //! via `use crate::*`, translation/pack types from `openasr_core`.
 
 use std::{
-    env, fs,
+    env,
     path::{Path, PathBuf},
 };
 
@@ -103,34 +103,17 @@ fn find_installed_hymt2_translation_pack(
     home: &Path,
     requested_model: Option<&str>,
 ) -> Option<InstalledPack> {
-    let root = home.join("models");
-    let model_dirs = fs::read_dir(root).ok()?;
-    let mut candidates = Vec::new();
-    for model_dir in model_dirs.flatten() {
-        let Ok(quant_dirs) = fs::read_dir(model_dir.path()) else {
-            continue;
-        };
-        for quant_dir in quant_dirs.flatten() {
-            let metadata_path = quant_dir.path().join("installed.json");
-            let Ok(contents) = fs::read_to_string(metadata_path) else {
-                continue;
-            };
-            let Ok(pack) = serde_json::from_str::<InstalledPack>(&contents) else {
-                continue;
-            };
-            if !translation_installed_pack_matches(&pack, requested_model) {
-                continue;
-            }
-            if fs::symlink_metadata(&pack.path)
-                .ok()
-                .is_some_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-            {
-                candidates.push(pack);
-            }
-        }
-    }
-    candidates.sort_by(|left, right| left.pull.cmp(&right.pull));
-    candidates.into_iter().next()
+    // Reuse `list_installed_packs`'s trust-boundary validation (safe
+    // relative model_id/quant/filename components, no path traversal, the
+    // record's declared `path` must literally be `quant_dir/filename`, and
+    // the file must be a real non-symlink regular file) instead of a
+    // hand-rolled directory scan that trusted `installed.json`'s `path`
+    // field outright. Already sorted by `pull`, so `.find()` preserves the
+    // same "first by pull order" tie-break the old manual scan applied.
+    let packs = openasr_core::list_installed_packs(home).ok()?;
+    packs
+        .into_iter()
+        .find(|pack| translation_installed_pack_matches(pack, requested_model))
 }
 
 fn translation_installed_pack_matches(pack: &InstalledPack, requested_model: Option<&str>) -> bool {
@@ -171,4 +154,64 @@ fn validate_hymt2_translation_pack(path: &Path) -> Result<(), String> {
                 error
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn stub_installed_pack(path: PathBuf, filename: &str) -> InstalledPack {
+        InstalledPack {
+            model_id: HYMT2_TRANSLATION_MODEL_ID.to_string(),
+            display_name: "Hy-MT2 1.8B".to_string(),
+            quant: "q4_k_m".to_string(),
+            suffix: "q4_k_m".to_string(),
+            pull: HYMT2_TRANSLATION_MODEL_ID.to_string(),
+            filename: filename.to_string(),
+            path,
+            url: "https://example.invalid/model.oasr".to_string(),
+            hf_revision: "a".repeat(40),
+            sha256: "b".repeat(64),
+            size_bytes: 0,
+            installed_at_unix_seconds: 0,
+            source: None,
+        }
+    }
+
+    /// Aligns `find_installed_hymt2_translation_pack` with the trust
+    /// boundary `list_installed_packs` already enforces: an `installed.json`
+    /// record whose declared `path` does not resolve to
+    /// `<quant_dir>/<filename>` must be rejected outright, not trusted just
+    /// because the path happens to exist and isn't a symlink. The
+    /// hand-rolled directory scan this replaced only checked the latter, so
+    /// a record like this would previously have been accepted.
+    #[test]
+    fn rejects_installed_record_whose_declared_path_escapes_its_quant_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let quant_dir = home
+            .path()
+            .join("models")
+            .join(HYMT2_TRANSLATION_MODEL_ID)
+            .join("q4_k_m");
+        fs::create_dir_all(&quant_dir).unwrap();
+
+        // A real, non-symlink file elsewhere under `home` -- the crafted
+        // record points `path` at this instead of `quant_dir/model.oasr`.
+        let escaped_path = home.path().join("escaped.oasr");
+        fs::write(&escaped_path, b"not a real pack, just needs to exist").unwrap();
+
+        let pack = stub_installed_pack(escaped_path, "model.oasr");
+        fs::write(
+            quant_dir.join("installed.json"),
+            serde_json::to_string(&pack).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            find_installed_hymt2_translation_pack(home.path(), None).is_none(),
+            "an installed.json record whose declared path escapes its own quant \
+             directory must be rejected, not silently trusted"
+        );
+    }
 }

@@ -1973,6 +1973,11 @@ fn verify_partial_and_install(
     })?;
     atomic_file::sync_parent_dir_best_effort(&paths.final_path);
     let _ = fs::remove_file(&paths.partial_meta_path);
+    // A resume can switch from the chunked/parallel path (which persists
+    // `partial_segments_meta_path`) to this single-stream success path once
+    // the remaining bytes drop below the parallel-eligibility threshold; clean
+    // it up here too so it cannot outlive the `.partial` file it describes.
+    let _ = fs::remove_file(&paths.partial_segments_meta_path);
     let pack = write_installed_record(target, paths)?;
     progress(PullProgress::Installed {
         path: pack.path.clone(),

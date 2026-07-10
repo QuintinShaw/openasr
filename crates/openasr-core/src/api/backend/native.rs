@@ -2201,6 +2201,74 @@ mod tests {
         );
     }
 
+    /// `validate_native_runtime_model_pack_contract`'s per-family dispatch
+    /// (the `match descriptor.model_architecture { ... }` above) has a
+    /// catch-all `_ => Ok(())` arm for architectures with no dedicated
+    /// required-metadata parser (yet). That arm must never silently swallow
+    /// an architecture that *should* have fail-closed validation wired up.
+    ///
+    /// Mirrors the sibling completeness tests in `builtin_execution_dispatch`
+    /// (`builtins_cover_all_dedicated_runtime_architectures` /
+    /// `..._native_graph_lowering_architectures`), but black-box: rather than
+    /// checking a lookup table contains a key, it feeds every builtin
+    /// architecture a pack that carries only the bare adapter-selection
+    /// metadata (family/architecture/audio-frontend/decode-policy) and
+    /// nothing else, and asserts install-time validation rejects it. Every
+    /// architecture wired up today (via a dedicated `runtime_contract`
+    /// parser, or via the qwen3/cohere tensor-contract check, or via the
+    /// aux-pack table) fails closed on such a bare-bones pack, so if a
+    /// future architecture's dispatch arm is missing (or someone widens the
+    /// `_` arm's reach), it would fall through to `Ok(())` here and this
+    /// test would catch it.
+    #[test]
+    fn install_time_family_metadata_validation_covers_every_builtin_architecture() {
+        use crate::arch::OpenAsrArchitectureRegistry;
+        use crate::models::oasr_metadata::{
+            OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
+            OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
+            OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
+        };
+        use std::collections::BTreeMap;
+
+        for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
+            let mut metadata = BTreeMap::new();
+            metadata.insert(
+                OASR_METADATA_KEY_PACKAGE_VERSION.to_string(),
+                OASR_PACKAGE_VERSION_V1.to_string(),
+            );
+            metadata.insert(
+                OASR_METADATA_KEY_MODEL_FAMILY.to_string(),
+                descriptor.model_family.to_string(),
+            );
+            metadata.insert(
+                OASR_METADATA_KEY_MODEL_ARCHITECTURE.to_string(),
+                descriptor.model_architecture.to_string(),
+            );
+            metadata.insert(
+                OASR_METADATA_KEY_AUDIO_FRONTEND.to_string(),
+                descriptor.audio_frontend_id.to_string(),
+            );
+            metadata.insert(
+                OASR_METADATA_KEY_DECODE_POLICY.to_string(),
+                descriptor.decode_policy_id.to_string(),
+            );
+            let spec = TinyGgufFixtureSpec::new(metadata);
+            let temp = tempfile::tempdir().unwrap();
+            let pack_path = temp.path().join("fixture.gguf");
+            write_tiny_gguf_runtime_source(&pack_path, &spec).unwrap();
+
+            let result = validate_native_runtime_model_pack_contract(&pack_path);
+            assert!(
+                result.is_err(),
+                "{} accepted an install-time pack that carries only bare \
+                 adapter-selection metadata; every builtin architecture must fail \
+                 closed on missing family-specific runtime metadata (a silent \
+                 `_ => Ok(())` dispatch arm would let this through)",
+                descriptor.model_architecture,
+            );
+        }
+    }
+
     #[test]
     fn native_backend_rejects_speakers_hint_without_diarize() {
         with_forced_cpu_backend_for_test(|| {

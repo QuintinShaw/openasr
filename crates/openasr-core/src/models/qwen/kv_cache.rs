@@ -1,62 +1,4 @@
-use crate::ggml_runtime::{
-    GgmlCpuGraphBuilder, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlStaticTensor,
-    GgmlStaticTensorArena,
-};
-
-use super::graph_config::qwen_runtime_graph_config;
-use super::runtime_contract::Qwen3AsrExecutionMetadata;
-
-#[allow(dead_code)]
-const QWEN3_LLM_KV_CACHE_ARENA_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Qwen3AsrKvCacheLayout {
-    pub head_dim: usize,
-    pub kv_heads: usize,
-    pub max_positions: usize,
-    pub layers: usize,
-    pub key_width: usize,
-    pub value_width: usize,
-}
-
-#[allow(dead_code)]
-impl Qwen3AsrKvCacheLayout {
-    pub(crate) fn from_metadata(
-        metadata: Qwen3AsrExecutionMetadata,
-    ) -> Result<Self, GgmlCpuGraphError> {
-        let key_width = metadata
-            .llm_kv_heads
-            .checked_mul(metadata.llm_head_dim)
-            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "qwen kv key width overflow",
-            })?;
-        let value_width = key_width;
-        Ok(Self {
-            head_dim: metadata.llm_head_dim,
-            kv_heads: metadata.llm_kv_heads,
-            max_positions: metadata.llm_max_positions,
-            layers: metadata.llm_layers,
-            key_width,
-            value_width,
-        })
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) struct Qwen3AsrPersistentKvCache {
-    layout: Qwen3AsrKvCacheLayout,
-    arena: GgmlStaticTensorArena,
-    layers: Vec<Qwen3AsrPersistentKvLayer>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Qwen3AsrPersistentKvLayer {
-    #[allow(dead_code)]
-    pub key: GgmlStaticTensor,
-    #[allow(dead_code)]
-    pub value: GgmlStaticTensor,
-}
+use crate::ggml_runtime::{GgmlCpuGraphBuilder, GgmlCpuGraphError, GgmlCpuTensor};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3AsrLayerKvCacheState {
@@ -83,55 +25,6 @@ pub(crate) struct Qwen3AsrLayerKvCacheHistory<'a> {
     pub written_positions: usize,
     pub keys: &'a [f32],
     pub values: &'a [f32],
-}
-
-#[allow(dead_code)]
-impl Qwen3AsrPersistentKvCache {
-    pub(crate) fn allocate(metadata: Qwen3AsrExecutionMetadata) -> Result<Self, GgmlCpuGraphError> {
-        let layout = Qwen3AsrKvCacheLayout::from_metadata(metadata)?;
-        let mut config = qwen_runtime_graph_config();
-        config.context_bytes = QWEN3_LLM_KV_CACHE_ARENA_CONTEXT_BYTES;
-        let runner = GgmlCpuGraphRunner::new(config)?;
-        let mut arena = runner.start_static_tensor_arena(config.context_bytes)?;
-        let mut layers = Vec::with_capacity(layout.layers);
-        for layer_idx in 0..layout.layers {
-            let key_name =
-                Box::leak(format!("qwen_llm_kv_cache_key_layer_{layer_idx}").into_boxed_str());
-            let value_name =
-                Box::leak(format!("qwen_llm_kv_cache_value_layer_{layer_idx}").into_boxed_str());
-            let key = arena.new_tensor_3d_f32(
-                layout.head_dim,
-                layout.max_positions,
-                layout.kv_heads,
-                key_name,
-            )?;
-            let value = arena.new_tensor_3d_f32(
-                layout.head_dim,
-                layout.max_positions,
-                layout.kv_heads,
-                value_name,
-            )?;
-            layers.push(Qwen3AsrPersistentKvLayer { key, value });
-        }
-        arena.allocate_backend_buffer()?;
-        Ok(Self {
-            layout,
-            arena,
-            layers,
-        })
-    }
-
-    pub(crate) fn layout(&self) -> Qwen3AsrKvCacheLayout {
-        self.layout
-    }
-
-    pub(crate) fn layer(&self, layer_idx: usize) -> Option<Qwen3AsrPersistentKvLayer> {
-        self.layers.get(layer_idx).copied()
-    }
-
-    pub(crate) fn arena(&self) -> &GgmlStaticTensorArena {
-        &self.arena
-    }
 }
 
 impl Qwen3AsrLayerKvCacheState {
@@ -605,31 +498,6 @@ impl Qwen3AsrLayerKvCacheState {
 mod tests {
     use super::*;
 
-    fn tiny_metadata() -> Qwen3AsrExecutionMetadata {
-        Qwen3AsrExecutionMetadata {
-            sample_rate_hz: 16_000,
-            n_mels: 8,
-            n_fft: 400,
-            win_length: 400,
-            hop_length: 160,
-            audio_layers: 2,
-            audio_d_model: 16,
-            audio_heads: 2,
-            llm_layers: 3,
-            llm_d_model: 16,
-            llm_heads: 2,
-            llm_kv_heads: 2,
-            llm_head_dim: 8,
-            vocab_size: 32,
-            llm_max_positions: 64,
-            audio_start_token_id: 2,
-            audio_end_token_id: 3,
-            audio_pad_token_id: 4,
-            eos_token_id: 0,
-            pad_token_id: 6,
-        }
-    }
-
     #[test]
     fn host_kv_cache_tracks_written_prefix() {
         let mut cache = Qwen3AsrLayerKvCacheState::new(8, 1, 2);
@@ -710,22 +578,5 @@ mod tests {
         cache.truncate_written_positions(1).expect("truncate");
         assert_eq!(cache.written_positions(), 1);
         assert!(cache.truncate_written_positions(2).is_err());
-    }
-
-    #[test]
-    fn persistent_kv_cache_allocates_all_layers() {
-        let cache =
-            Qwen3AsrPersistentKvCache::allocate(tiny_metadata()).expect("allocate kv cache");
-        let layout = cache.layout();
-
-        assert_eq!(layout.layers, 3);
-        assert_eq!(layout.head_dim, 8);
-        assert_eq!(layout.kv_heads, 2);
-        assert_eq!(layout.max_positions, 64);
-        assert!(cache.layer(0).is_some());
-        assert!(cache.layer(2).is_some());
-        assert!(cache.layer(3).is_none());
-
-        let _ = cache.arena();
     }
 }
