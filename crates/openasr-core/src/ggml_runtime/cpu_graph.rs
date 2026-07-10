@@ -561,6 +561,11 @@ pub enum GgmlCpuGraphError {
     GraphBuildFailed { step: &'static str },
     #[error("ggml cpu graph backend buffer allocation failed")]
     BackendBufferAllocationFailed,
+    #[error(
+        "ggml cpu graph backend has no device (backend outlived the thread-local \
+         backend that owns it); refusing to allocate against a dangling backend"
+    )]
+    BackendDeviceUnavailable,
     #[error("ggml cpu graph could not create loaded weight context: {reason}")]
     LoadedWeightContextFailed { reason: String },
     #[error("ggml cpu graph loaded tensor '{tensor}' is missing from context")]
@@ -4903,6 +4908,26 @@ fn backend_set_n_threads(backend: NonNull<c_void>, n_threads: c_int) {
     }
 }
 
+/// True when `backend` still resolves to a device. A live ggml backend always
+/// has one; a null device means the backend is no longer usable -- e.g. a
+/// cached (`free_on_drop=false`) Metal/GPU backend whose owning thread-local
+/// `THREAD_BACKEND_CACHE_BY_KIND` entry was dropped when its thread exited,
+/// leaving a non-owning guard elsewhere pointing at freed memory.
+/// `ggml_backend_alloc_ctx_tensors` dereferences the device unconditionally and
+/// `GGML_ASSERT(device)`-aborts the whole daemon on null, so buffer allocation
+/// fails closed here (typed error, propagated up the graph builder) instead.
+fn backend_device_present(backend: NonNull<c_void>) -> bool {
+    !unsafe { ffi::ggml_backend_get_device(backend.as_ptr()) }.is_null()
+}
+
+fn ensure_backend_device_present(backend: NonNull<c_void>) -> Result<(), GgmlCpuGraphError> {
+    if backend_device_present(backend) {
+        Ok(())
+    } else {
+        Err(GgmlCpuGraphError::BackendDeviceUnavailable)
+    }
+}
+
 fn backend_name(backend: NonNull<c_void>) -> String {
     let raw_name = unsafe { ffi::ggml_backend_name(backend.as_ptr()) };
     cstr_lossy(raw_name)
@@ -4971,6 +4996,7 @@ impl GgmlBackendBufferGuard {
         context: NonNull<c_void>,
         backend: NonNull<c_void>,
     ) -> Result<Self, GgmlCpuGraphError> {
+        ensure_backend_device_present(backend)?;
         let raw =
             unsafe { ffi::ggml_backend_alloc_ctx_tensors(context.as_ptr(), backend.as_ptr()) };
         NonNull::new(raw)
@@ -4983,6 +5009,7 @@ impl GgmlBackendBufferGuard {
         backend: NonNull<c_void>,
         usage: c_int,
     ) -> Result<Self, GgmlCpuGraphError> {
+        ensure_backend_device_present(backend)?;
         let raw =
             unsafe { ffi::ggml_backend_alloc_ctx_tensors(context.as_ptr(), backend.as_ptr()) };
         let Some(raw) = NonNull::new(raw) else {
@@ -5149,6 +5176,19 @@ mod tests {
 
     fn softplus_reference(value: f32) -> f32 {
         value.max(0.0) + (-(value.abs())).exp().ln_1p()
+    }
+
+    #[test]
+    fn backend_device_present_holds_for_a_live_backend() {
+        // A live ggml backend always resolves to a device, so the fail-closed
+        // buffer-allocation guard must accept it. The null case it defends
+        // against -- a cached GPU-class backend whose owning thread exited,
+        // leaving a dangling non-owning guard -- is a use-after-free that cannot
+        // be forged safely here; this pins the positive path so the guard stays a
+        // safety net and never rejects a valid backend.
+        let backend = super::GgmlBackendGuard::cpu().expect("cpu backend");
+        assert!(super::backend_device_present(backend.raw));
+        assert!(super::ensure_backend_device_present(backend.raw).is_ok());
     }
 
     #[test]
