@@ -72,7 +72,7 @@ pub(crate) struct CohereServeBatchJob {
     pub backend: GgmlCpuGraphBackend,
     pub uses_scheduler: bool,
     pub decoder_weights: Arc<CohereTranscribeDecoderWeights>,
-    pub tokenizer: CohereTranscribeTokenizer,
+    pub tokenizer: Arc<CohereTranscribeTokenizer>,
     pub metadata: CohereTranscribeExecutionMetadata,
     pub encoder_output: CohereTranscribeEncoderOutput,
     pub decode_config: Seq2SeqGreedyDecodeConfig,
@@ -859,7 +859,7 @@ mod tests {
         backend: GgmlCpuGraphBackend,
         uses_scheduler: bool,
         decoder_weights: Arc<CohereTranscribeDecoderWeights>,
-        tokenizer: CohereTranscribeTokenizer,
+        tokenizer: Arc<CohereTranscribeTokenizer>,
         metadata: CohereTranscribeExecutionMetadata,
         encoder_output: CohereTranscribeEncoderOutput,
         prefer_cpu_backend: bool,
@@ -883,7 +883,7 @@ mod tests {
         backend: GgmlCpuGraphBackend,
         uses_scheduler: bool,
         decoder_weights: Arc<CohereTranscribeDecoderWeights>,
-        tokenizer: CohereTranscribeTokenizer,
+        tokenizer: Arc<CohereTranscribeTokenizer>,
         metadata: CohereTranscribeExecutionMetadata,
         encoder_output: CohereTranscribeEncoderOutput,
         prefer_cpu_backend: bool,
@@ -939,8 +939,9 @@ mod tests {
             )
             .expect("decoder weights"),
         );
-        let tokenizer =
-            CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata).expect("tokenizer");
+        let tokenizer = Arc::new(
+            CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata).expect("tokenizer"),
+        );
         let encoder_output_0 =
             sample_encoder_output_with_frame_count(metadata, 0.0, encoder_frame_count);
         let encoder_output_1 =
@@ -1069,8 +1070,9 @@ mod tests {
             )
             .expect("decoder weights"),
         );
-        let tokenizer =
-            CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata).expect("tokenizer");
+        let tokenizer = Arc::new(
+            CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata).expect("tokenizer"),
+        );
 
         let envelope = |encoder_phase: f32, max_generated_tokens: usize| {
             let job = batch_job_with_max_generated_tokens(
@@ -1162,8 +1164,10 @@ mod tests {
                 )
                 .expect("decoder weights"),
             );
-            let tokenizer = CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata)
-                .expect("tokenizer");
+            let tokenizer = Arc::new(
+                CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata)
+                    .expect("tokenizer"),
+            );
 
             let envelope = |encoder_phase: f32, max_generated_tokens: usize| {
                 let job = batch_job_with_max_generated_tokens(
@@ -1241,8 +1245,10 @@ mod tests {
                 )
                 .expect("decoder weights"),
             );
-            let tokenizer = CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata)
-                .expect("tokenizer");
+            let tokenizer = Arc::new(
+                CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata)
+                    .expect("tokenizer"),
+            );
 
             let envelope = |encoder_phase: f32, max_generated_tokens: usize| {
                 let job = batch_job_with_max_generated_tokens(
@@ -1327,8 +1333,10 @@ mod tests {
                 )
                 .expect("decoder weights"),
             );
-            let tokenizer = CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata)
-                .expect("tokenizer");
+            let tokenizer = Arc::new(
+                CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata)
+                    .expect("tokenizer"),
+            );
 
             let envelope = |encoder_phase: f32, max_generated_tokens: usize| {
                 let job = batch_job_with_max_generated_tokens(
@@ -1420,8 +1428,10 @@ mod tests {
                 )
                 .expect("decoder weights"),
             );
-            let tokenizer = CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata)
-                .expect("tokenizer");
+            let tokenizer = Arc::new(
+                CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata)
+                    .expect("tokenizer"),
+            );
 
             let envelope = |encoder_phase: f32, max_generated_tokens: usize| {
                 let job = batch_job_with_max_generated_tokens(
@@ -1508,8 +1518,10 @@ mod tests {
                 )
                 .expect("decoder weights"),
             );
-            let tokenizer = CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata)
-                .expect("tokenizer");
+            let tokenizer = Arc::new(
+                CohereTranscribeTokenizer::from_gguf_metadata(&preflight.metadata)
+                    .expect("tokenizer"),
+            );
 
             let envelope = |encoder_phase: f32, max_generated_tokens: usize| {
                 let job = batch_job_with_max_generated_tokens(
