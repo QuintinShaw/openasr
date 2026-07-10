@@ -25,6 +25,7 @@ pub(crate) mod gpt2_bpe;
 pub(crate) mod graph_runtime_config;
 pub mod hymt2;
 pub(crate) mod incremental_streaming_driver;
+pub(crate) mod kaldi_fbank;
 pub(crate) mod language;
 pub(crate) mod local_source_import;
 pub(crate) mod lora_adapter;

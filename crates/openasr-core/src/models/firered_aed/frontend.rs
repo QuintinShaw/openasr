@@ -7,31 +7,34 @@
 //! `frontend.cmvn.neg_mean` / `frontend.cmvn.inv_stddev`, applied as
 //! `(x + neg_mean) * inv_stddev`.
 //!
-//! The fbank math is byte-identical in structure to the dolphin frontend (both
-//! upstreams run kaldi fbank with the same 80/25ms/10ms/16kHz/dither-0 config
-//! and defaults: Povey window, remove_dc_offset, pre-emphasis 0.97, HTK mel
-//! 20 Hz..Nyquist, `log(max(energy, eps))`). Kept family-local like every
-//! other frontend so nothing generic grows a FireRed special case.
+//! The fbank math itself is the shared [`crate::models::kaldi_fbank`] engine
+//! (Povey window, remove_dc_offset, pre-emphasis 0.97, HTK mel 20 Hz..Nyquist,
+//! `log(max(energy, eps))`), which the dolphin and sensevoice frontends also
+//! use with the same 80/25ms/10ms/16kHz/dither-0 config -- see that module's
+//! doc for why the engine is shared but the CMVN/error types stay family-local.
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
-
-use realfft::{RealFftPlanner, RealToComplex};
+use crate::models::kaldi_fbank::{
+    KaldiFbankConfig, KaldiFbankError, KaldiFbankFrontend, KaldiWindowKind,
+};
 
 pub(crate) const SAMPLE_RATE_HZ: u32 = 16_000;
-const FRAME_LENGTH: usize = 400; // 25 ms @ 16 kHz
-const FRAME_SHIFT: usize = 160; // 10 ms @ 16 kHz
-const FFT_SIZE: usize = 512; // next pow2 >= 400 (kaldi rounds the window up)
 pub(crate) const NUM_MEL_BINS: usize = 80;
-const MEL_LOW_HZ: f32 = 20.0;
-const MEL_HIGH_HZ: f32 = 8_000.0; // high_freq <= 0 in kaldi => Nyquist
-const PREEMPH_COEFF: f32 = 0.97;
-/// float `[-1, 1]` -> int16 magnitude, the domain kaldi fbank operates in
-/// (upstream feeds raw int16-valued waveforms from `kaldiio.load_mat`).
-const INPUT_SCALE: f32 = 32_768.0;
-/// kaldi mel-energy floor before the log.
-const LOG_ENERGY_FLOOR: f32 = 1.192_092_9e-7;
+
+const FRONTEND_CONFIG: KaldiFbankConfig = KaldiFbankConfig {
+    sample_rate_hz: SAMPLE_RATE_HZ,
+    frame_length: 400, // 25 ms @ 16 kHz
+    frame_shift: 160,  // 10 ms @ 16 kHz
+    fft_size: 512,     // next pow2 >= 400 (kaldi rounds the window up)
+    num_mel_bins: NUM_MEL_BINS,
+    mel_low_hz: 20.0,
+    mel_high_hz: 8_000.0, // high_freq <= 0 in kaldi => Nyquist
+    preemph_coeff: 0.97,
+    input_scale: 32_768.0, // float [-1, 1] -> int16 magnitude
+    log_energy_floor: 1.192_092_9e-7,
+    window: KaldiWindowKind::Povey,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FireRedFrontendError {
@@ -53,30 +56,25 @@ pub(crate) enum FireRedFrontendError {
     },
 }
 
-/// Pre-CMVN log-mel features, row-major `[frame][mel]` (mel innermost).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct FireRedFbankFeatures {
-    pub data: Vec<f32>,
-    pub n_frames: usize,
-    pub n_mels: usize,
+impl From<KaldiFbankError> for FireRedFrontendError {
+    fn from(error: KaldiFbankError) -> Self {
+        match error {
+            KaldiFbankError::UnsupportedAudio => Self::UnsupportedAudio,
+            KaldiFbankError::NoFrames { samples } => Self::NoFrames { samples },
+        }
+    }
 }
 
-/// One triangular mel filter as a contiguous weight run over FFT power bins.
-struct MelFilter {
-    first_bin: usize,
-    weights: Vec<f32>,
-}
+/// Pre-CMVN log-mel features, row-major `[frame][mel]` (mel innermost).
+pub(crate) type FireRedFbankFeatures = crate::models::kaldi_fbank::KaldiFbankFeatures;
 
 pub(crate) struct FireRedFbankFrontend {
-    window: [f32; FRAME_LENGTH],
-    filters: Vec<MelFilter>,
-    fft: Arc<dyn RealToComplex<f32>>,
+    inner: KaldiFbankFrontend,
 }
 
 impl std::fmt::Debug for FireRedFbankFrontend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FireRedFbankFrontend")
-            .field("n_mels", &self.filters.len())
             .finish_non_exhaustive()
     }
 }
@@ -89,17 +87,8 @@ impl Default for FireRedFbankFrontend {
 
 impl FireRedFbankFrontend {
     pub(crate) fn new() -> Self {
-        let mut window = [0.0f32; FRAME_LENGTH];
-        for (n, w) in window.iter_mut().enumerate() {
-            // Povey window: a Hann raised to 0.85 (kaldi default).
-            let hann = 0.5
-                - 0.5 * (2.0 * std::f32::consts::PI * n as f32 / (FRAME_LENGTH as f32 - 1.0)).cos();
-            *w = hann.powf(0.85);
-        }
         Self {
-            window,
-            filters: build_mel_filters(),
-            fft: RealFftPlanner::<f32>::new().plan_fft_forward(FFT_SIZE),
+            inner: KaldiFbankFrontend::new(FRONTEND_CONFIG),
         }
     }
 
@@ -111,62 +100,7 @@ impl FireRedFbankFrontend {
         &self,
         samples: &[f32],
     ) -> Result<FireRedFbankFeatures, FireRedFrontendError> {
-        if samples.iter().any(|v| !v.is_finite()) {
-            return Err(FireRedFrontendError::UnsupportedAudio);
-        }
-        if samples.len() < FRAME_LENGTH {
-            return Err(FireRedFrontendError::NoFrames {
-                samples: samples.len(),
-            });
-        }
-        let n_frames = 1 + (samples.len() - FRAME_LENGTH) / FRAME_SHIFT;
-        let r2c = &self.fft;
-        let mut fft_in = r2c.make_input_vec();
-        let mut fft_out = r2c.make_output_vec();
-        let mut scratch = r2c.make_scratch_vec();
-        let mut power = vec![0.0f32; FFT_SIZE / 2 + 1];
-
-        let mut feats = vec![0.0f32; n_frames * NUM_MEL_BINS];
-        let mut frame = [0.0f32; FRAME_LENGTH];
-        for fr in 0..n_frames {
-            let start = fr * FRAME_SHIFT;
-            for (dst, src) in frame.iter_mut().zip(&samples[start..start + FRAME_LENGTH]) {
-                *dst = *src * INPUT_SCALE;
-            }
-            // remove_dc_offset: subtract the frame mean.
-            let mean = frame.iter().sum::<f32>() / FRAME_LENGTH as f32;
-            for v in &mut frame {
-                *v -= mean;
-            }
-            // pre-emphasis with replicate padding: x[i] -= 0.97 x[i-1] (i>=1),
-            // x[0] -= 0.97 x[0].
-            for i in (1..FRAME_LENGTH).rev() {
-                frame[i] -= PREEMPH_COEFF * frame[i - 1];
-            }
-            frame[0] -= PREEMPH_COEFF * frame[0];
-            // Povey window into the zero-padded FFT input.
-            fft_in.fill(0.0);
-            for (slot, (sample, w)) in fft_in.iter_mut().zip(frame.iter().zip(self.window.iter())) {
-                *slot = *sample * *w;
-            }
-            r2c.process_with_scratch(&mut fft_in, &mut fft_out, &mut scratch)
-                .expect("firered fbank rfft");
-            for (bin, value) in fft_out.iter().enumerate() {
-                power[bin] = value.re * value.re + value.im * value.im;
-            }
-            for (bin, filter) in self.filters.iter().enumerate() {
-                let mut energy = 0.0f32;
-                for (j, weight) in filter.weights.iter().enumerate() {
-                    energy += weight * power[filter.first_bin + j];
-                }
-                feats[fr * NUM_MEL_BINS + bin] = energy.max(LOG_ENERGY_FLOOR).ln();
-            }
-        }
-        Ok(FireRedFbankFeatures {
-            data: feats,
-            n_frames,
-            n_mels: NUM_MEL_BINS,
-        })
+        Ok(self.inner.compute(samples)?)
     }
 }
 
@@ -206,51 +140,6 @@ pub(crate) fn apply_cmvn(
         }
     }
     Ok(())
-}
-
-fn mel_scale(freq: f32) -> f32 {
-    1127.0 * (1.0 + freq / 700.0).ln()
-}
-
-/// Kaldi triangular mel filterbank over `FFT_SIZE/2 + 1` power bins:
-/// `NUM_MEL_BINS` peak-normalized triangles spanning `[MEL_LOW_HZ, MEL_HIGH_HZ]`
-/// on the HTK mel scale, gated to bins strictly inside the filter band.
-fn build_mel_filters() -> Vec<MelFilter> {
-    let n_fft_bins = FFT_SIZE / 2 + 1;
-    let fft_bin_width = SAMPLE_RATE_HZ as f32 / FFT_SIZE as f32;
-    let mel_low = mel_scale(MEL_LOW_HZ);
-    let mel_high = mel_scale(MEL_HIGH_HZ);
-    let mel_delta = (mel_high - mel_low) / (NUM_MEL_BINS as f32 + 1.0);
-
-    let mut filters = Vec::with_capacity(NUM_MEL_BINS);
-    for bin in 0..NUM_MEL_BINS {
-        let left = mel_low + bin as f32 * mel_delta;
-        let center = mel_low + (bin as f32 + 1.0) * mel_delta;
-        let right = mel_low + (bin as f32 + 2.0) * mel_delta;
-        let mut first_bin = None;
-        let mut weights = Vec::new();
-        for k in 0..n_fft_bins {
-            let mel = mel_scale(fft_bin_width * k as f32);
-            if mel > left && mel < right {
-                let weight = if mel <= center {
-                    (mel - left) / (center - left)
-                } else {
-                    (right - mel) / (right - center)
-                };
-                if first_bin.is_none() {
-                    first_bin = Some(k);
-                }
-                weights.push(weight);
-            } else if first_bin.is_some() {
-                break;
-            }
-        }
-        filters.push(MelFilter {
-            first_bin: first_bin.unwrap_or(0),
-            weights,
-        });
-    }
-    filters
 }
 
 #[cfg(test)]
