@@ -103,6 +103,9 @@ pub use device::capabilities::{
     HardwareFallbackPolicy, HardwareProvider, ProviderAvailability, ProviderAvailabilityState,
     detect_hardware_capabilities,
 };
+pub use device::compute_devices::{
+    ComputeDevice, compute_devices_from_runtime, default_execution_target,
+};
 pub use device::types::{CapabilityClass, DeviceCapabilities};
 pub use download_source::{DownloadSource, DownloadSourcePref, resolve_chain};
 pub use format::{ResponseFormat, render_transcription};
