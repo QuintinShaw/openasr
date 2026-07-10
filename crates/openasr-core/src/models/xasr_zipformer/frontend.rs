@@ -3,6 +3,17 @@
 //! This is the production-side Rust frontend scaffold. The exact constants are
 //! intentionally local to X-ASR because sherpa/icefall fbank parity is part of
 //! this family contract, not a generic OpenASR mel frontend.
+//!
+//! Deliberately **not** built on the shared batch engine in
+//! [`crate::models::kaldi_fbank`] (which firered_aed/dolphin/sensevoice do
+//! share): this frontend runs `snip_edges=false` framing with incremental,
+//! cacheable frame-range computation (`features_for_frame_range_from`,
+//! `earliest_sample_needed_for_frame`) for O(1)-memory streaming, skips
+//! pre-emphasis/DC-removal/int16 rescale entirely, and stores mel filters
+//! densely with precomputed per-mel bin ranges for that range slicing --
+//! folding it into the shared engine would mean threading streaming-only
+//! control flow through a batch-oriented API, i.e. a shared-layer special
+//! case rather than a config difference.
 
 use std::sync::Arc;
 
