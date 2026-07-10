@@ -1091,6 +1091,48 @@ async fn daemon_starts_and_reports_ready_with_zero_models_installed() {
         parsed["model_installed"], false,
         "health must honestly report no model bound instead of just being unreachable"
     );
+    assert_eq!(
+        parsed["model_resident"], false,
+        "nothing can be resident when no model is bound at all"
+    );
+}
+
+#[tokio::test]
+async fn health_reports_model_bound_but_not_resident_before_any_load() {
+    // A native pack can be bound (`model_installed: true`) at boot without
+    // its runtime ever having been loaded yet -- the boot warm-up runs in
+    // the background and this test never triggers it or any transcription.
+    // `/health` must not conflate "bound" with "resident": a client polling
+    // right after daemon start must see `model_resident: false` until an
+    // actual load (warm-up or first request) completes.
+    let temp = tempfile::tempdir().unwrap();
+    let pack_root = temp.path().join("native-pack.oasr");
+    write_mock_gguf_runtime_source(&pack_root, None);
+    let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_root),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["model_installed"], true, "a model pack is bound");
+    assert_eq!(
+        parsed["model_resident"], false,
+        "a bound pack whose runtime has never been loaded this boot must not read resident"
+    );
 }
 
 #[tokio::test]
@@ -2334,7 +2376,11 @@ async fn health_returns_identity_json_without_instance_token() {
     );
     assert_eq!(parsed["pid"], serde_json::json!(std::process::id()));
     assert!(parsed["instance_token"].is_null());
-    assert_eq!(parsed.as_object().expect("health response object").len(), 5);
+    assert_eq!(
+        parsed["model_resident"], true,
+        "the mock backend has no runtime to unload, so it reads resident whenever bound"
+    );
+    assert_eq!(parsed.as_object().expect("health response object").len(), 6);
 }
 
 #[tokio::test]
@@ -2366,7 +2412,7 @@ async fn health_echoes_launch_instance_token_without_env() {
         parsed["instance_token"],
         serde_json::json!("launch-health-token")
     );
-    assert_eq!(parsed.as_object().expect("health response object").len(), 5);
+    assert_eq!(parsed.as_object().expect("health response object").len(), 6);
 }
 
 #[tokio::test]
@@ -2400,7 +2446,7 @@ async fn health_prefers_env_instance_token_over_launch_option() {
         parsed["instance_token"],
         serde_json::json!("env-health-token")
     );
-    assert_eq!(parsed.as_object().expect("health response object").len(), 5);
+    assert_eq!(parsed.as_object().expect("health response object").len(), 6);
 }
 
 #[tokio::test]

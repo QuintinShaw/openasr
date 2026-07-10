@@ -33,6 +33,12 @@ pack that is being served.
 ## Endpoints
 
 - `GET /health` -- liveness + server identity; never requires auth.
+  `{"status","server_version","pid","instance_token","model_installed",
+  "model_resident"}`. `model_installed` is whether a pack is bound at all;
+  `model_resident` (0.1.13+) is whether that pack's runtime is currently
+  loaded in memory -- `false` means the next transcription request pays a
+  cold rebuild (idle-unloaded past the `idle_unload` threshold, or not yet
+  loaded this boot), not an error.
 - `GET /v1/models` -- OpenAI-style list of the served pack
   (`{"object":"list","data":[{"id","object":"model","owned_by":"openasr"}]}`;
   no `created` field).
