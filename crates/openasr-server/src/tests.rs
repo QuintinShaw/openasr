@@ -1176,6 +1176,37 @@ fn realtime_capabilities_for_native_runtime_come_from_model_pack() {
     assert!(capabilities.supports_partial_results);
 }
 
+#[tokio::test]
+async fn devices_endpoint_enumerates_this_daemons_runtime() {
+    // The endpoint reflects the daemon process's own ggml runtime -- the whole
+    // point of moving enumeration server-side (a CPU-only desktop shell can no
+    // longer under-report a GPU sidecar). It always offers at least Auto + CPU,
+    // and the reported default matches Auto's effective target.
+    let response = devices().await.0;
+    assert_eq!(response.object, "devices");
+    let ids: Vec<_> = response.devices.iter().map(|d| d.id.as_str()).collect();
+    assert!(ids.contains(&"auto"), "auto target missing: {ids:?}");
+    assert!(ids.contains(&"cpu"), "cpu target missing: {ids:?}");
+    assert!(
+        response.default_execution_target == "cpu"
+            || response.default_execution_target == "accelerated",
+        "unexpected default target: {}",
+        response.default_execution_target
+    );
+    let auto = response.devices.iter().find(|d| d.id == "auto").unwrap();
+    assert_eq!(auto.effective_target, response.default_execution_target);
+}
+
+#[test]
+fn devices_endpoint_is_not_operator_gated() {
+    // Local UI read: reachable like `/v1/capabilities`, not behind the
+    // operator-only pull/write gate.
+    assert!(!is_operator_only_path(
+        &axum::http::Method::GET,
+        "/v1/devices"
+    ));
+}
+
 #[test]
 fn native_server_runtime_rejects_directory_runtime_source() {
     let temp = tempfile::tempdir().unwrap();
