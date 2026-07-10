@@ -12,8 +12,11 @@
 use std::path::Path;
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor,
-    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena,
+    ArenaAllocError, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext,
+    GgmlStaticTensor, GgmlStaticTensorArena, WeightSlot,
+    alloc_static_f16 as arena_alloc_static_f16, alloc_static_f32 as arena_alloc_static_f32,
+    bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
+    upload_static_f32 as arena_upload_static_f32,
 };
 use crate::models::cohere::encoder_graph::f32_to_f16_bits;
 use crate::nn::encoder::{SanMFsmnBlockConfig, SanMFsmnBlockWeights, sanm_fsmn_encoder_layer};
@@ -26,7 +29,6 @@ use super::runtime_contract::SenseVoiceExecutionMetadata;
 const SENSEVOICE_ENCODER_GRAPH_CONTEXT_BYTES: usize = 768 * 1024 * 1024;
 /// FunASR LayerNorm epsilon (torch LayerNorm eps=1e-12 in EncoderLayerSANM).
 const ENCODER_LAYER_NORM_EPSILON: f32 = 1.0e-12;
-const GGML_TYPE_F16: i32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SenseVoiceEncoderError {
@@ -63,36 +65,19 @@ pub(crate) struct SenseVoiceEncoderOutput {
     pub logits: Vec<f32>,
 }
 
-/// A 2-D linear weight: arena tensor or zero-copy bound to the mmap'd pack
-/// (native f16/q8_0/q4_k — the keep-quantized seam).
-#[derive(Clone, Copy)]
-enum WeightSlot {
-    Arena(GgmlStaticTensor),
-    Loaded(GgmlLoadedTensor),
-}
-
-impl WeightSlot {
-    fn graph<'a>(self, arena: &GgmlStaticTensorArena) -> GgmlCpuTensor<'a> {
-        match self {
-            Self::Arena(handle) => arena.graph_tensor(handle),
-            Self::Loaded(tensor) => tensor.as_graph_tensor(),
-        }
-    }
-}
+// `WeightSlot` (imported above from `ggml_runtime`): arena tensor or
+// zero-copy bound to the mmap'd pack (native f16/q8_0/q4_k — the
+// keep-quantized seam). Shared with parakeet-ctc/parakeet-tdt/wav2vec2-ctc —
+// see `ggml_runtime::arena_weight_pipeline` — since it is pure residency
+// plumbing with no sensevoice-specific semantics.
 
 fn bind_loaded(
     loaded: Option<&GgmlLoadedWeightContext>,
     name: &str,
 ) -> Result<WeightSlot, SenseVoiceEncoderError> {
-    match loaded.and_then(|ctx| ctx.tensor(name)) {
-        Some(tensor) => Ok(WeightSlot::Loaded(tensor)),
-        None => Err(SenseVoiceEncoderError::Shape {
-            reason: format!(
-                "2-D linear '{name}' could not be bound zero-copy from the runtime pack \
-                 (loaded weight context missing or tensor absent); host payload was dropped"
-            ),
-        }),
-    }
+    arena_bind_loaded(loaded, name)
+        .map(WeightSlot::Loaded)
+        .map_err(|reason| SenseVoiceEncoderError::Shape { reason })
 }
 
 fn alloc_static(
@@ -100,20 +85,16 @@ fn alloc_static(
     weight: &NamedTensor,
     step: &'static str,
 ) -> Result<GgmlStaticTensor, SenseVoiceEncoderError> {
-    let map = |source| SenseVoiceEncoderError::GraphBuildFailed { step, source };
-    match weight.dims.as_slice() {
-        [] | [_] => arena
-            .new_tensor_1d_f32(weight.values.len(), step)
-            .map_err(map),
-        [ne0, ne1] => arena.new_tensor_2d_f32(*ne0, *ne1, step).map_err(map),
-        [ne0, ne1, ne2] => arena.new_tensor_3d_f32(*ne0, *ne1, *ne2, step).map_err(map),
-        _ => Err(SenseVoiceEncoderError::Shape {
-            reason: format!(
-                "tensor '{}' has unsupported rank {:?}",
-                weight.name, weight.dims
-            ),
-        }),
-    }
+    arena_alloc_static_f32(arena, &weight.dims, weight.values.len(), step, false).map_err(|e| {
+        match e {
+            ArenaAllocError::Graph(source) => {
+                SenseVoiceEncoderError::GraphBuildFailed { step, source }
+            }
+            ArenaAllocError::UnsupportedRank(dims) => SenseVoiceEncoderError::Shape {
+                reason: format!("tensor '{}' has unsupported rank {:?}", weight.name, dims),
+            },
+        }
+    })
 }
 
 fn alloc_static_f16(
@@ -121,15 +102,12 @@ fn alloc_static_f16(
     weight: &NamedTensor,
     step: &'static str,
 ) -> Result<GgmlStaticTensor, SenseVoiceEncoderError> {
-    let map = |source| SenseVoiceEncoderError::GraphBuildFailed { step, source };
-    match weight.dims.as_slice() {
-        [ne0, ne1, ne2] => arena
-            .new_tensor_3d_typed(*ne0, *ne1, *ne2, GGML_TYPE_F16, step)
-            .map_err(map),
-        _ => Err(SenseVoiceEncoderError::Shape {
-            reason: format!("f16 fsmn kernel '{}' rank {:?}", weight.name, weight.dims),
-        }),
-    }
+    arena_alloc_static_f16(arena, &weight.dims, step, false).map_err(|e| match e {
+        ArenaAllocError::Graph(source) => SenseVoiceEncoderError::GraphBuildFailed { step, source },
+        ArenaAllocError::UnsupportedRank(dims) => SenseVoiceEncoderError::Shape {
+            reason: format!("f16 fsmn kernel '{}' rank {:?}", weight.name, dims),
+        },
+    })
 }
 
 fn upload_static(
@@ -138,8 +116,7 @@ fn upload_static(
     weight: &NamedTensor,
     step: &'static str,
 ) -> Result<(), SenseVoiceEncoderError> {
-    arena
-        .set_f32_slice(tensor, &weight.values, step)
+    arena_upload_static_f32(arena, tensor, &weight.values, step)
         .map_err(|source| SenseVoiceEncoderError::GraphBuildFailed { step, source })
 }
 
@@ -149,9 +126,7 @@ fn upload_static_f16(
     weight: &NamedTensor,
     step: &'static str,
 ) -> Result<(), SenseVoiceEncoderError> {
-    let bits: Vec<u16> = weight.values.iter().copied().map(f32_to_f16_bits).collect();
-    arena
-        .set_f16_bits_slice(tensor, &bits, step)
+    arena_upload_static_f16(arena, tensor, &weight.values, step, f32_to_f16_bits)
         .map_err(|source| SenseVoiceEncoderError::GraphBuildFailed { step, source })
 }
 
