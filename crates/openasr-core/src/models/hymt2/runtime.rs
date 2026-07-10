@@ -4,14 +4,20 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+use crate::arch::HYMT2_DECODE_POLICY_ID;
 use crate::ggml_runtime::{
     GgmlCpuGraphError, GgufMetadataReadError, GgufTensorDataReadError, GgufTensorDataReader,
     GgufTensorIndexReadError,
+};
+use crate::models::decode_policy_component_registry::{
+    BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
+    BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
 };
 use crate::models::hymt2::prompt::{
     build_hymt2_subtitle_prompt_token_parts, build_hymt2_user_chat_prompt_tokens,
     build_subtitle_translation_prompt, max_output_tokens_for_source_tokens,
 };
+use crate::models::phrase_bias_decode::PhraseBiasTokenEncoder;
 use crate::models::qwen::{
     Qwen3AsrLayerKvCacheState, Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLayerAttentionProjection,
     Qwen3AsrLlmLogitsHead, Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrLlmWholeStepOutput,
@@ -19,6 +25,10 @@ use crate::models::qwen::{
     load_qwen3_llm_attention_projections_from_reader_with_materialized_qkv,
     load_qwen3_llm_logits_head_from_reader_with_output_tensor,
     load_qwen3_token_embedding_table_from_reader,
+};
+use crate::models::seq2seq_greedy_decode::{
+    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
+    Seq2SeqGreedyDecodeStepLogitsOutput,
 };
 use crate::{
     GgmlRuntimeSourcePathError, NativeAsrError, read_gguf_metadata_from_runtime_source,
@@ -30,7 +40,11 @@ use super::config::{
     validate_hymt2_runtime_tensors_with_index,
 };
 use super::tensor_names::TOKEN_EMBD_WEIGHT;
-use super::tokenizer::Hymt2Tokenizer;
+use super::tokenizer::{
+    HYMT2_ASSISTANT_TOKEN, HYMT2_ASSISTANT_TOKEN_ID, HYMT2_BOS_TOKEN, HYMT2_BOS_TOKEN_ID,
+    HYMT2_EOS_TOKEN_ID, HYMT2_EOT_TOKEN, HYMT2_EOT_TOKEN_ID, HYMT2_USER_TOKEN, HYMT2_USER_TOKEN_ID,
+    Hymt2Tokenizer,
+};
 
 const HYMT2_PROFILE_ENV: &str = "OPENASR_HYMT2_PROFILE";
 const HYMT2_PREFILL_CHUNK_TOKENS_ENV: &str = "OPENASR_HYMT2_PREFILL_CHUNK_TOKENS";
@@ -453,8 +467,7 @@ impl Hymt2Runtime {
             .ok_or_else(|| Hymt2RuntimeError::Decode {
                 reason: "Hy-MT2 cached prefill token count overflowed".to_string(),
             })?;
-        let stop_token_ids = self.tokenizer.stop_token_ids();
-        let (first_step_logits, generated_tokens, prefill, decode) = {
+        let (first_step_logits, generated_tokens, text, prefill, decode) = {
             let session_started_at = hymt2_profile_start();
             let mut session = self.session.lock().map_err(|_| Hymt2RuntimeError::Decode {
                 reason: "Hy-MT2 runtime session lock poisoned".to_string(),
@@ -482,28 +495,18 @@ impl Hymt2Runtime {
             let prefill = prefill_started_at.elapsed();
             let first_step_logits = logits.clone();
 
-            let mut generated_tokens = Vec::with_capacity(max_output_tokens);
             let decode_started_at = Instant::now();
-            let mut token_id = greedy_argmax(&logits)?;
-            for _ in 0..max_output_tokens {
-                if stop_token_ids.contains(&token_id) {
-                    break;
-                }
-                generated_tokens.push(token_id);
-                if generated_tokens.len() == max_output_tokens {
-                    break;
-                }
-                token_id = stepper.decode_next_token_id(&generated_tokens)?;
-            }
+            let (generated_tokens, text) = run_hymt2_shared_greedy_decode(
+                logits,
+                &mut |generated| stepper.decode_next_token_id(generated),
+                &|token_ids| self.tokenizer.decode_text_token_ids(token_ids),
+                &parts.prompt_tokens,
+                self.metadata.vocab_size,
+                max_output_tokens,
+            )?;
             let decode = decode_started_at.elapsed();
-            (first_step_logits, generated_tokens, prefill, decode)
+            (first_step_logits, generated_tokens, text, prefill, decode)
         };
-        let text = self
-            .tokenizer
-            .decode_text_token_ids(&generated_tokens)
-            .map_err(|source| Hymt2RuntimeError::Tokenizer { source })?
-            .trim()
-            .to_string();
         let generated_token_count = generated_tokens.len();
         if finalized {
             cache.invalidate();
@@ -627,27 +630,16 @@ impl Hymt2Runtime {
         let logits = stepper.prefill_prompt_and_compute_last_logits(&prompt_embeddings)?;
         let prefill = prefill_started_at.elapsed();
         let first_step_logits = logits.clone();
-        let stop_token_ids = self.tokenizer.stop_token_ids();
-        let mut generated_tokens = Vec::with_capacity(max_output_tokens);
         let decode_started_at = Instant::now();
-        let mut token_id = greedy_argmax(&logits)?;
-        for _ in 0..max_output_tokens {
-            if stop_token_ids.contains(&token_id) {
-                break;
-            }
-            generated_tokens.push(token_id);
-            if generated_tokens.len() == max_output_tokens {
-                break;
-            }
-            token_id = stepper.decode_next_token_id(&generated_tokens)?;
-        }
+        let (generated_tokens, text) = run_hymt2_shared_greedy_decode(
+            logits,
+            &mut |generated| stepper.decode_next_token_id(generated),
+            &|token_ids| self.tokenizer.decode_text_token_ids(token_ids),
+            &prompt_tokens,
+            self.metadata.vocab_size,
+            max_output_tokens,
+        )?;
         let decode = decode_started_at.elapsed();
-        let text = self
-            .tokenizer
-            .decode_text_token_ids(&generated_tokens)
-            .map_err(|source| Hymt2RuntimeError::Tokenizer { source })?
-            .trim()
-            .to_string();
         let generated_token_count = generated_tokens.len();
         Ok(Hymt2DecodeResult {
             prompt_tokens: prompt_tokens.clone(),
@@ -1541,28 +1533,166 @@ impl Hymt2GreedyStepper<'_> {
     }
 }
 
-fn greedy_argmax(logits: &[f32]) -> Result<u32, Hymt2RuntimeError> {
-    if logits.is_empty() {
-        return Err(Hymt2RuntimeError::Decode {
-            reason: "Hy-MT2 decode step produced empty logits".to_string(),
-        });
+/// Token source for the hymt2 decode-policy descriptor: resolves the chat
+/// boundary markers (`Hymt2ChatBoundaryV0` stop tokens) by content. The ids
+/// are the compile-time tokenizer constants, so the registry stays declarative
+/// while the id/content pairing lives with the tokenizer.
+struct Hymt2DecodePolicyTokenSource;
+
+impl PhraseBiasTokenEncoder for Hymt2DecodePolicyTokenSource {
+    fn encode_phrase_bias_tokens(&self, _phrase: &str) -> Result<Option<Vec<u32>>, String> {
+        // Phrase bias is an ASR-transcription feature; hymt2 never requests it
+        // (the shared path passes `phrase_bias: None`), so encoding is
+        // declared unsupported rather than half-implemented.
+        Ok(None)
     }
-    let mut best_index = 0usize;
-    let mut best = f32::NEG_INFINITY;
-    for (index, value) in logits.iter().copied().enumerate() {
-        if !value.is_finite() {
-            return Err(Hymt2RuntimeError::Decode {
-                reason: format!("Hy-MT2 decode logits contain non-finite value at {index}"),
+}
+
+impl BuiltinSeq2SeqDecodePolicyTokenSource for Hymt2DecodePolicyTokenSource {
+    fn token_id_by_content(&self, content: &str) -> Option<u32> {
+        match content {
+            HYMT2_EOT_TOKEN => Some(HYMT2_EOT_TOKEN_ID),
+            HYMT2_BOS_TOKEN => Some(HYMT2_BOS_TOKEN_ID),
+            HYMT2_USER_TOKEN => Some(HYMT2_USER_TOKEN_ID),
+            HYMT2_ASSISTANT_TOKEN => Some(HYMT2_ASSISTANT_TOKEN_ID),
+            _ => None,
+        }
+    }
+}
+
+/// hymt2's step executor for the shared greedy decode driver. Step 0 replays
+/// the full logit row the prefill already computed (the driver's host argmax
+/// selects from it, byte-identical to the previous in-module argmax);
+/// subsequent steps run the fused device top-1 decode and surface the selected
+/// token through `greedy_token_hint` with an empty logits row -- the driver's
+/// hint-only step shape -- so the fused kernel never has to materialize a
+/// full-vocab row per step.
+struct Hymt2SharedGreedyStepExecutor<'a> {
+    pending_first_step_logits: Option<Vec<f32>>,
+    next_token_id: &'a mut dyn FnMut(&[u32]) -> Result<u32, Hymt2RuntimeError>,
+}
+
+impl Seq2SeqGreedyDecodeStepExecutor for Hymt2SharedGreedyStepExecutor<'_> {
+    fn decode_step_logits(
+        &mut self,
+        input: Seq2SeqGreedyDecodeStepInput<'_>,
+    ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError> {
+        if input.step_index == 0 {
+            let logits = self.pending_first_step_logits.take().ok_or_else(|| {
+                Seq2SeqGreedyDecodeError::DecoderStepFailed {
+                    reason: "Hy-MT2 first-step logits were already consumed".to_string(),
+                }
+            })?;
+            return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits,
+                greedy_token_hint: None,
             });
         }
-        if value > best {
-            best = value;
-            best_index = index;
-        }
+        let token_id = (self.next_token_id)(input.generated_tokens).map_err(|error| {
+            Seq2SeqGreedyDecodeError::DecoderStepFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+            logits: Vec::new(),
+            greedy_token_hint: Some(token_id),
+        })
     }
-    u32::try_from(best_index).map_err(|_| Hymt2RuntimeError::Decode {
-        reason: format!("Hy-MT2 greedy token index {best_index} does not fit u32"),
+}
+
+/// Family-side error for the shared-driver run: `Truncated` is hymt2's normal
+/// outcome when the decode reaches its output budget
+/// (`max_output_tokens_for_source_tokens`) before a stop token -- the caller
+/// degrades to the generated prefix instead of failing the clause.
+enum Hymt2SharedDecodeError {
+    Truncated { generated_tokens: Vec<u32> },
+    Runtime(Hymt2RuntimeError),
+}
+
+fn map_hymt2_family_error_to_shared(error: Hymt2SharedDecodeError) -> Seq2SeqGreedyDecodeError {
+    Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
+        reason: match error {
+            Hymt2SharedDecodeError::Runtime(error) => error.to_string(),
+            // Unreachable: the token-decoder closure only fails with Runtime.
+            Hymt2SharedDecodeError::Truncated { .. } => {
+                "Hy-MT2 token decoder reported truncation".to_string()
+            }
+        },
+    }
+}
+
+fn map_shared_error_to_hymt2(error: Seq2SeqGreedyDecodeError) -> Hymt2SharedDecodeError {
+    match error {
+        Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {
+            generated_tokens, ..
+        } => Hymt2SharedDecodeError::Truncated { generated_tokens },
+        other => Hymt2SharedDecodeError::Runtime(Hymt2RuntimeError::Decode {
+            reason: other.to_string(),
+        }),
+    }
+}
+
+fn map_registry_error_to_hymt2(
+    error: BuiltinDecodePolicyComponentRegistryError,
+) -> Hymt2SharedDecodeError {
+    Hymt2SharedDecodeError::Runtime(Hymt2RuntimeError::Decode {
+        reason: error.to_string(),
     })
+}
+
+/// Route one hymt2 greedy decode through the shared seq2seq driver (the repo
+/// AGENTS.md "One greedy decode driver" invariant). The registry descriptor
+/// for [`HYMT2_DECODE_POLICY_ID`] declares the chat-boundary stop tokens and
+/// whitespace-trim postprocess; the driver owns argmax, stop handling, and the
+/// degenerate-loop guard. Reaching `max_output_tokens` before a stop token is
+/// hymt2's expected truncation outcome, so the driver's no-EOT error is
+/// degraded to the generated prefix here instead of failing the clause.
+fn run_hymt2_shared_greedy_decode(
+    first_step_logits: Vec<f32>,
+    next_token_id: &mut dyn FnMut(&[u32]) -> Result<u32, Hymt2RuntimeError>,
+    decode_text_token_ids: &dyn Fn(&[u32]) -> Result<String, NativeAsrError>,
+    prompt_tokens: &[u32],
+    vocab_size: usize,
+    max_output_tokens: usize,
+) -> Result<(Vec<u32>, String), Hymt2RuntimeError> {
+    let mut step_executor = Hymt2SharedGreedyStepExecutor {
+        pending_first_step_logits: Some(first_step_logits),
+        next_token_id,
+    };
+    let config_input = BuiltinSeq2SeqDecodePolicyConfigInput {
+        initial_prompt_tokens: prompt_tokens.to_vec(),
+        eot_token_id: HYMT2_EOS_TOKEN_ID,
+        vocab_size,
+        max_generated_tokens: max_output_tokens,
+    };
+    let decode_text = |token_ids: &[u32]| {
+        decode_text_token_ids(token_ids).map_err(|source| {
+            Hymt2SharedDecodeError::Runtime(Hymt2RuntimeError::Tokenizer { source })
+        })
+    };
+    match run_builtin_seq2seq_decode_policy(
+        HYMT2_DECODE_POLICY_ID,
+        &config_input,
+        &Hymt2DecodePolicyTokenSource,
+        None,
+        &mut step_executor,
+        &decode_text,
+        map_hymt2_family_error_to_shared,
+        map_shared_error_to_hymt2,
+        map_registry_error_to_hymt2,
+    ) {
+        Ok(result) => Ok((result.generated_tokens, result.text)),
+        Err(Hymt2SharedDecodeError::Truncated { generated_tokens }) => {
+            // Mirror the driver's TrimWhitespaceV0 postprocess on the degraded
+            // prefix so both exits produce identically normalized text.
+            let text = decode_text_token_ids(&generated_tokens)
+                .map_err(|source| Hymt2RuntimeError::Tokenizer { source })?
+                .trim()
+                .to_string();
+            Ok((generated_tokens, text))
+        }
+        Err(Hymt2SharedDecodeError::Runtime(error)) => Err(error),
+    }
 }
 
 fn tokens_per_second(tokens: usize, elapsed: Duration) -> f64 {
@@ -1749,9 +1879,127 @@ mod tests {
         }
     }
 
+    /// Vocab wide enough to contain the real hymt2 special-token ids, so the
+    /// shared-decode tests exercise the actual stop set (EOS + chat markers).
+    const SHARED_DECODE_TEST_VOCAB: usize = 120_021;
+
+    fn shared_decode_first_step_logits(token_id: u32) -> Vec<f32> {
+        let mut logits = vec![0.0_f32; SHARED_DECODE_TEST_VOCAB];
+        logits[token_id as usize] = 1.0;
+        logits
+    }
+
+    fn shared_decode_text(token_ids: &[u32]) -> Result<String, NativeAsrError> {
+        Ok(token_ids
+            .iter()
+            .map(|token_id| format!(" t{token_id}"))
+            .collect::<String>())
+    }
+
     #[test]
-    fn greedy_argmax_selects_first_max() {
-        assert_eq!(greedy_argmax(&[0.1, 0.3, 0.3]).expect("argmax"), 1);
+    fn shared_greedy_decode_selects_prefill_argmax_then_hint_tokens_until_eos() {
+        let mut scripted = vec![6_u32, HYMT2_EOS_TOKEN_ID].into_iter();
+        let mut next_token_id = |generated: &[u32]| {
+            assert!(!generated.is_empty(), "hint steps follow the first token");
+            Ok(scripted.next().expect("scripted token"))
+        };
+
+        let (generated_tokens, text) = run_hymt2_shared_greedy_decode(
+            shared_decode_first_step_logits(5),
+            &mut next_token_id,
+            &shared_decode_text,
+            &[42, 43],
+            SHARED_DECODE_TEST_VOCAB,
+            8,
+        )
+        .expect("shared decode");
+
+        assert_eq!(generated_tokens, vec![5, 6]);
+        // TrimWhitespaceV0: the leading space from detokenization is trimmed.
+        assert_eq!(text, "t5 t6");
+    }
+
+    #[test]
+    fn shared_greedy_decode_stops_on_chat_boundary_marker() {
+        let mut next_token_id = |_: &[u32]| Ok(HYMT2_USER_TOKEN_ID);
+
+        let (generated_tokens, text) = run_hymt2_shared_greedy_decode(
+            shared_decode_first_step_logits(5),
+            &mut next_token_id,
+            &shared_decode_text,
+            &[42],
+            SHARED_DECODE_TEST_VOCAB,
+            8,
+        )
+        .expect("shared decode");
+
+        assert_eq!(generated_tokens, vec![5]);
+        assert_eq!(text, "t5");
+    }
+
+    #[test]
+    fn shared_greedy_decode_degrades_to_prefix_at_output_budget() {
+        // Distinct tokens (no degenerate cycle) that never reach a stop token:
+        // the driver's no-EOT error must degrade to the generated prefix, the
+        // pre-driver truncation contract of `max_output_tokens_for_source_tokens`.
+        let mut scripted = vec![6_u32, 7, 8].into_iter();
+        let mut next_token_id = |_: &[u32]| Ok(scripted.next().expect("scripted token"));
+
+        let (generated_tokens, text) = run_hymt2_shared_greedy_decode(
+            shared_decode_first_step_logits(5),
+            &mut next_token_id,
+            &shared_decode_text,
+            &[42],
+            SHARED_DECODE_TEST_VOCAB,
+            3,
+        )
+        .expect("shared decode");
+
+        assert_eq!(generated_tokens, vec![5, 6, 7]);
+        assert_eq!(text, "t5 t6 t7");
+    }
+
+    #[test]
+    fn shared_greedy_decode_truncates_degenerate_repeat_loop() {
+        // A stuck greedy loop (same token forever) now trips the driver's
+        // shared degenerate n-gram guard instead of spinning to the cap.
+        let mut next_token_id = |_: &[u32]| Ok(5_u32);
+
+        let (generated_tokens, _) = run_hymt2_shared_greedy_decode(
+            shared_decode_first_step_logits(5),
+            &mut next_token_id,
+            &shared_decode_text,
+            &[42],
+            SHARED_DECODE_TEST_VOCAB,
+            10,
+        )
+        .expect("shared decode");
+
+        assert_eq!(generated_tokens, vec![5]);
+    }
+
+    #[test]
+    fn shared_greedy_decode_surfaces_decoder_step_failures() {
+        let mut next_token_id = |_: &[u32]| {
+            Err(Hymt2RuntimeError::Decode {
+                reason: "synthetic step failure".to_string(),
+            })
+        };
+
+        let error = run_hymt2_shared_greedy_decode(
+            shared_decode_first_step_logits(5),
+            &mut next_token_id,
+            &shared_decode_text,
+            &[42],
+            SHARED_DECODE_TEST_VOCAB,
+            8,
+        )
+        .expect_err("step failure must surface");
+
+        assert!(matches!(
+            error,
+            Hymt2RuntimeError::Decode { reason } if reason.contains("synthetic step failure")
+        ));
     }
 
     #[test]

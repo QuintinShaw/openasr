@@ -262,6 +262,29 @@ pub(crate) fn select_seq2seq_greedy_step_token(
     on_topk: &mut dyn FnMut(usize, &[f32]),
 ) -> Result<Seq2SeqGreedyStepSelection, Seq2SeqGreedyDecodeError> {
     if step_logits.logits.is_empty() {
+        // Hint-only step: executors whose decode step ends in a fused
+        // device-side argmax (e.g. hymt2's fused top1 logits head) never
+        // materialize a host logit row, and forcing one per step would regress
+        // the very kernel that fusion exists for. Honor the hint when nothing
+        // about this step needs the row (no phrase bias, hint not suppressed);
+        // otherwise fail closed on the existing empty-logits error, because a
+        // suppressed hint has no row to fall back to.
+        if config.phrase_biases.is_empty()
+            && let Some(next_token) = step_logits.greedy_token_hint
+        {
+            validate_selected_token(step_index, next_token, config.vocab_size)?;
+            let is_suppressed = config.suppress_token_ids.contains(&next_token)
+                || (step_index == 0 && config.suppress_first_step_token_ids.contains(&next_token));
+            if !is_suppressed {
+                return Ok(Seq2SeqGreedyStepSelection {
+                    token_id: next_token,
+                    reached_eot: is_stop_token(next_token, stop_token_ids),
+                    // No host row to score against: report zero probability
+                    // (hint-only families do not consume per-token scores).
+                    probability: 0.0,
+                });
+            }
+        }
         return Err(Seq2SeqGreedyDecodeError::EmptyStepLogits { step_index });
     }
     if step_logits.logits.len() != config.vocab_size {
@@ -586,6 +609,155 @@ mod tests {
             }
         );
         assert_eq!(topk_calls, 0);
+    }
+
+    #[test]
+    fn seq2seq_step_selection_accepts_hint_only_step_without_logits() {
+        let config = Seq2SeqGreedyDecodeConfig {
+            initial_prompt_tokens: vec![42],
+            eot_token_id: 7,
+            stop_token_ids: Vec::new(),
+            vocab_size: 16,
+            max_generated_tokens: 8,
+            suppress_first_step_token_ids: Vec::new(),
+            suppress_token_ids: Vec::new(),
+            phrase_biases: Vec::new(),
+        };
+        let stop = build_seq2seq_greedy_stop_token_ids(&config);
+        let mut on_topk = |_: usize, _: &[f32]| panic!("hint-only step must not emit topk");
+
+        let selection = select_seq2seq_greedy_step_token(
+            &config,
+            &[],
+            1,
+            Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: Vec::new(),
+                greedy_token_hint: Some(3),
+            },
+            &stop,
+            &mut on_topk,
+        )
+        .expect("hint-only step should select");
+
+        assert_eq!(
+            selection,
+            Seq2SeqGreedyStepSelection {
+                token_id: 3,
+                reached_eot: false,
+                probability: 0.0,
+            }
+        );
+
+        let eot_selection = select_seq2seq_greedy_step_token(
+            &config,
+            &[3],
+            2,
+            Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: Vec::new(),
+                greedy_token_hint: Some(7),
+            },
+            &stop,
+            &mut on_topk,
+        )
+        .expect("hint-only eot should select");
+        assert!(eot_selection.reached_eot);
+    }
+
+    #[test]
+    fn seq2seq_step_selection_hint_only_fails_closed_without_a_fallback_row() {
+        let biased_config = Seq2SeqGreedyDecodeConfig {
+            initial_prompt_tokens: vec![42],
+            eot_token_id: 7,
+            stop_token_ids: Vec::new(),
+            vocab_size: 16,
+            max_generated_tokens: 8,
+            suppress_first_step_token_ids: Vec::new(),
+            suppress_token_ids: Vec::new(),
+            phrase_biases: vec![TokenPhraseBias::new(vec![vec![1, 2]], 0.2).unwrap()],
+        };
+        let suppressed_config = Seq2SeqGreedyDecodeConfig {
+            suppress_token_ids: vec![3],
+            phrase_biases: Vec::new(),
+            ..biased_config.clone()
+        };
+        let no_hint_config = Seq2SeqGreedyDecodeConfig {
+            suppress_token_ids: Vec::new(),
+            ..suppressed_config.clone()
+        };
+        let out_of_vocab_config = no_hint_config.clone();
+        let mut on_topk = |_: usize, _: &[f32]| {};
+
+        // Phrase bias needs the logit row: empty logits must fail closed.
+        let biased = select_seq2seq_greedy_step_token(
+            &biased_config,
+            &[],
+            0,
+            Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: Vec::new(),
+                greedy_token_hint: Some(3),
+            },
+            &build_seq2seq_greedy_stop_token_ids(&biased_config),
+            &mut on_topk,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            biased,
+            Seq2SeqGreedyDecodeError::EmptyStepLogits { step_index: 0 }
+        ));
+
+        // A suppressed hint has no row to fall back to: fail closed.
+        let suppressed = select_seq2seq_greedy_step_token(
+            &suppressed_config,
+            &[],
+            0,
+            Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: Vec::new(),
+                greedy_token_hint: Some(3),
+            },
+            &build_seq2seq_greedy_stop_token_ids(&suppressed_config),
+            &mut on_topk,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            suppressed,
+            Seq2SeqGreedyDecodeError::EmptyStepLogits { step_index: 0 }
+        ));
+
+        // Empty logits without a hint keeps the pre-existing error.
+        let no_hint = select_seq2seq_greedy_step_token(
+            &no_hint_config,
+            &[],
+            0,
+            Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: Vec::new(),
+                greedy_token_hint: None,
+            },
+            &build_seq2seq_greedy_stop_token_ids(&no_hint_config),
+            &mut on_topk,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            no_hint,
+            Seq2SeqGreedyDecodeError::EmptyStepLogits { step_index: 0 }
+        ));
+
+        // A hint outside the declared vocab is rejected, not trusted.
+        let out_of_vocab = select_seq2seq_greedy_step_token(
+            &out_of_vocab_config,
+            &[],
+            0,
+            Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: Vec::new(),
+                greedy_token_hint: Some(16),
+            },
+            &build_seq2seq_greedy_stop_token_ids(&out_of_vocab_config),
+            &mut on_topk,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            out_of_vocab,
+            Seq2SeqGreedyDecodeError::SelectedTokenOutOfVocab { token_id: 16, .. }
+        ));
     }
 
     #[test]
