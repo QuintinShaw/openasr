@@ -166,6 +166,12 @@ impl BuiltinPreparedRuntimeCache {
             use_runtime,
         )
     }
+
+    /// Evicts every cached prepared runtime (idle_unload); see
+    /// `PreparedRuntimeCache::clear`.
+    pub(crate) fn clear(&self) {
+        self.runtimes_by_path.clear();
+    }
 }
 
 pub(crate) fn build_builtin_prepared_runtime(
@@ -260,6 +266,44 @@ mod tests {
 
         assert!(Arc::ptr_eq(&runtime_a, &runtime_b));
         assert!(runtime_a.as_ref().as_cohere_transcribe().is_some());
+    }
+
+    #[test]
+    fn clear_evicts_the_prepared_runtime_so_the_next_call_rebuilds_it() {
+        // idle_unload's actual production path: `clear()` is what
+        // `Qwen3AsrGgmlExecutor::unload_idle_state` /
+        // `CohereTranscribeGgmlExecutor::unload_idle_state` call. Proves the
+        // real (not stub) prepared-runtime build is evicted and a later
+        // request just rebuilds it -- functions normally, pays the cold cost
+        // again -- exactly the documented idle_unload contract.
+        let (_runtime_path, preflight) = write_cohere_preflight();
+        let cache = BuiltinPreparedRuntimeCache::default();
+        let build = |cache: &BuiltinPreparedRuntimeCache| {
+            cache
+                .prepared_runtime_for_preflight(
+                    crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                    &preflight,
+                    |error| error,
+                    || BuiltinPreparedRuntimeRegistryError::UnknownArchitecture {
+                        model_architecture: "poisoned".to_string(),
+                    },
+                )
+                .expect("prepared runtime")
+        };
+
+        let runtime_a = build(&cache);
+        cache.clear();
+        let runtime_b = build(&cache);
+
+        assert!(
+            !Arc::ptr_eq(&runtime_a, &runtime_b),
+            "clear() must evict the cached runtime so the next call rebuilds it"
+        );
+        assert!(runtime_b.as_ref().as_cohere_transcribe().is_some());
+
+        // After the rebuild, the cache is warm again: a third call reuses it.
+        let runtime_c = build(&cache);
+        assert!(Arc::ptr_eq(&runtime_b, &runtime_c));
     }
 
     #[test]

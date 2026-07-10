@@ -3113,6 +3113,10 @@ impl GgmlAsrExecutor for WhisperGgmlExecutor {
         // Offline decode: batch worker allowed.
         self.execute_whisper_inner(request, false)
     }
+
+    fn unload_idle_state(&self) {
+        self.runtime_cache_by_path.clear();
+    }
 }
 
 impl WhisperGgmlExecutor {
@@ -3228,6 +3232,10 @@ impl GgmlAsrStreamingExecutor for WhisperGgmlExecutor {
             STREAMING_PARTIAL_TUNING_WHISPER_SEQ2SEQ,
             WhisperGgmlExecutor::execute_streaming,
         )
+    }
+
+    fn unload_idle_state(&self) {
+        self.runtime_cache_by_path.clear();
     }
 }
 

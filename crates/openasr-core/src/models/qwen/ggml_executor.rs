@@ -1344,6 +1344,10 @@ impl GgmlAsrExecutor for Qwen3AsrGgmlExecutor {
         self.execute_inner(request, false)
             .map_err(|error| qwen_execute_error_to_ggml(error, request.selected_family.adapter_id))
     }
+
+    fn unload_idle_state(&self) {
+        self.runtime_cache_by_path.clear();
+    }
 }
 
 impl Qwen3AsrGgmlExecutor {
@@ -1392,6 +1396,10 @@ impl GgmlAsrStreamingExecutor for Qwen3AsrGgmlExecutor {
             STREAMING_PARTIAL_TUNING_HEAVY_SEQ2SEQ,
             Qwen3AsrGgmlExecutor::execute_streaming,
         )
+    }
+
+    fn unload_idle_state(&self) {
+        self.runtime_cache_by_path.clear();
     }
 }
 

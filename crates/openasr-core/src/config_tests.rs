@@ -175,7 +175,10 @@ fn save_and_load_config_document_roundtrip_preserves_preferences() {
             inference_threads: Some(4),
             execution_target: ExecutionTarget::Cpu,
             history_retention: HistoryRetentionPolicy::Month,
-            idle_unload: IdleUnloadPolicy::After10m,
+            // Distinct from `IdleUnloadPolicy::default()` (`After10m`) so this
+            // still proves the field round-trips rather than just matching
+            // the default either way.
+            idle_unload: IdleUnloadPolicy::After1h,
             ..Preferences::default()
         },
     };
@@ -478,4 +481,46 @@ fn history_retention_policy_wire_strings_and_age_windows() {
         serde_json::to_value(HistoryRetentionPolicy::Forever).unwrap(),
         serde_json::Value::String("forever".to_string())
     );
+}
+
+#[test]
+fn idle_unload_policy_wire_strings_and_thresholds() {
+    use std::time::Duration;
+
+    // Wire contract: snake_case strings consumed by the desktop preferences
+    // client. Adding a variant is additive; renaming any of these breaks it.
+    let cases = [
+        (IdleUnloadPolicy::Never, "never", None),
+        (IdleUnloadPolicy::Now, "now", Some(Duration::from_secs(5))),
+        (
+            IdleUnloadPolicy::After2m,
+            "2m",
+            Some(Duration::from_secs(2 * 60)),
+        ),
+        (
+            IdleUnloadPolicy::After10m,
+            "10m",
+            Some(Duration::from_secs(10 * 60)),
+        ),
+        (
+            IdleUnloadPolicy::After1h,
+            "1h",
+            Some(Duration::from_secs(60 * 60)),
+        ),
+    ];
+    for (policy, wire, threshold) in cases {
+        assert_eq!(
+            serde_json::to_value(policy).unwrap(),
+            serde_json::Value::String(wire.to_string())
+        );
+        assert_eq!(
+            serde_json::from_value::<IdleUnloadPolicy>(serde_json::Value::String(wire.to_string()))
+                .unwrap(),
+            policy
+        );
+        assert_eq!(policy.idle_threshold(), threshold);
+    }
+    // Product decision (0.1.12-B): a bound model pack should not sit resident
+    // in RAM for the daemon's whole lifetime by default any more.
+    assert_eq!(IdleUnloadPolicy::default(), IdleUnloadPolicy::After10m);
 }

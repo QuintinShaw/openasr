@@ -22,10 +22,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Realtime translation: livelock fix for mixed-language (CJK + Latin) input
 - Windows: UTF-8 console output, PATH executable detection, host RAM/disk probing, mmap'd model re-pull error
 - Docker smoke test in CI; serve-batch real-pack parity lane
+- Server: the daemon's bound native model pack is now warmed up in the background right after boot (bind), instead of on the first realtime WS attach, so the first dictation session no longer pays the cold model-pack-load cost (observed 1.7-2.1s) before its first partial; `/health` remains unaffected (bind-then-serve, never gated on warm-up)
+- Server: `idle_unload` now actually releases the cached native model runtime (mmap/materialized tensors/Metal or CPU graph context) once idle past the configured threshold, freeing the RAM a bound pack otherwise held for the daemon's whole lifetime; a later request just rebuilds it through the normal load-and-warm-up path
 
 ### Changed
 
 - Default model changed to `qwen3-asr-0.6b`; Qwen3-ASR family promoted to primary recommendation
+- `idle_unload` preference default changed from `never` to `10m`: a bound native model pack is now released from RAM after 10 minutes with no active request/realtime session, instead of staying resident until the daemon exits; an explicitly configured `idle_unload` (including `never`) is unaffected -- only the default changed
 - Catalog: dropped ModelScope mirror; unified quant tag scheme (`canonical_quant_tag`)
 - Server: extracted config, history, and translation routes into dedicated modules
 - Pre-open-source cleanup: removed private docs/artifacts, aligned license metadata, dep hygiene

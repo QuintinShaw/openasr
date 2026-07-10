@@ -1,6 +1,8 @@
+mod idle_activity;
 mod realtime;
 mod routes;
 
+pub(crate) use idle_activity::{NativeActivityGuard, spawn_idle_unload_reaper};
 pub(crate) use routes::config::*;
 pub(crate) use routes::history::*;
 pub(crate) use routes::models_api::*;
@@ -244,6 +246,18 @@ pub async fn serve_with_launch_options(
         "tcp_listener_bind",
         stage_started.elapsed(),
     );
+    // Warm the daemon's default bound native model pack in the background,
+    // right after bind succeeds -- deliberately after this line and before
+    // anything below that could block, so it never gates bind/serve/health.
+    // See `spawn_boot_native_warmup`'s doc comment for the dedup story with a
+    // concurrent real WS attach.
+    realtime::spawn_boot_native_warmup(runtime.clone());
+    // idle_unload: only spawn the reaper when the resolved policy is not
+    // `never` (`idle_unload_after` is `None` for `never` and for every
+    // existing caller/test that does not set it, so this is a no-op there).
+    if let Some(idle_unload_after) = launch_options.idle_unload_after {
+        spawn_idle_unload_reaper(idle_unload_after);
+    }
     match &launch_options.tls.clone() {
         ServerTlsConfig::Disabled => {
             stage_started = Instant::now();
@@ -427,6 +441,11 @@ pub struct ServerLaunchOptions {
     pub instance_token: Option<String>,
     pub auth: ServerAuth,
     pub tls: ServerTlsConfig,
+    /// Resolved `idle_unload` threshold (see
+    /// `openasr_core::config::IdleUnloadPolicy::idle_threshold`); `None`
+    /// (the default, and what `never` resolves to) never spawns the reaper,
+    /// matching every existing caller/test that does not set this.
+    pub idle_unload_after: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

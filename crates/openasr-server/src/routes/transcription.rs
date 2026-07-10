@@ -1310,6 +1310,11 @@ pub(crate) async fn transcribe_with_runtime(
             Ok(transcription)
         }
         BackendKind::Native => tokio::task::spawn_blocking(move || {
+            // Marks this offline (file-transcription / realtime-per-utterance
+            // backend-job) decode as active for the whole synchronous run, so
+            // the idle_unload reaper never evicts the model runtime cache out
+            // from under it; dropped (any exit path) once the decode returns.
+            let _activity_guard = NativeActivityGuard::enter();
             // Bind the pause/cancel control to this decode thread for the whole
             // synchronous run so the long-form slice loop can observe it; the
             // guard clears the binding on any exit. `None` (no control requested)
