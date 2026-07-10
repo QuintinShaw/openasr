@@ -17,8 +17,20 @@ use crate::models::gpt2_bpe::{
     build_merge_rank, build_token_to_id, encode_prompt_text, token_to_bytes,
 };
 use crate::models::language::{language_control_token, normalize_language};
+// Re-exported at this path (rather than imported privately) because
+// `whisper::package_import` and `whisper::batched_decode` reach these three
+// shared keys via `super::tokenizer::TOKENIZER_GGML_*`, matching how they
+// already pull `TOKENIZER_GGML_MODEL_VALUE_GPT2` from this module.
+pub(crate) use crate::models::oasr_metadata::{
+    TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
+};
+use crate::models::oasr_metadata::{
+    optional_metadata_u32, required_metadata_string, required_metadata_string_array,
+    required_metadata_u32, required_metadata_u32_array,
+};
 use crate::models::phrase_bias_decode::{PhraseBiasTokenEncoder, encode_bpe_phrase_bias_variants};
 
+const WHISPER_TOKENIZER_FAMILY: &str = "Whisper";
 const SOURCE_TOKENIZER_JSON: &str = "tokenizer.json";
 const SOURCE_VOCAB_JSON: &str = "vocab.json";
 const SOURCE_MERGES_TXT: &str = "merges.txt";
@@ -29,9 +41,7 @@ const END_OF_TEXT_TOKEN: &str = "<|endoftext|>";
 const TRANSCRIBE_TOKEN: &str = "<|transcribe|>";
 const TRANSLATE_TOKEN: &str = "<|translate|>";
 const ENGLISH_LANGUAGE_TOKEN: &str = "<|en|>";
-pub(crate) const TOKENIZER_GGML_MODEL_KEY: &str = "tokenizer.ggml.model";
 pub(crate) const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
-pub(crate) const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 
 /// True when a Whisper pack carries the multilingual language-token block, using
 /// the same `vocab_size > WHISPER_ENGLISH_ONLY_MAX_VOCAB_SIZE` rule the decoder
@@ -39,12 +49,15 @@ pub(crate) const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 /// decoder still validates the explicit `<|lang|>` token before use, so this only
 /// affects whether an English-only pack rejects a foreign-language hint.
 pub(crate) fn whisper_metadata_is_multilingual(metadata: &GgufMetadata) -> bool {
-    match required_metadata_string_array(metadata, TOKENIZER_GGML_TOKENS_KEY) {
+    match required_metadata_string_array(
+        metadata,
+        TOKENIZER_GGML_TOKENS_KEY,
+        WHISPER_TOKENIZER_FAMILY,
+    ) {
         Ok(tokens) => tokens.len() > super::ggml_executor::WHISPER_ENGLISH_ONLY_MAX_VOCAB_SIZE,
         Err(_) => true,
     }
 }
-pub(crate) const TOKENIZER_GGML_MERGES_KEY: &str = "tokenizer.ggml.merges";
 pub(crate) const TOKENIZER_GGML_SPECIAL_TOKEN_IDS_KEY: &str = "tokenizer.ggml.special_token_ids";
 pub(crate) const TOKENIZER_GGML_SOT_TOKEN_ID_KEY: &str = "tokenizer.ggml.sot_token_id";
 pub(crate) const TOKENIZER_GGML_EOT_TOKEN_ID_KEY: &str = "tokenizer.ggml.eot_token_id";
@@ -129,7 +142,8 @@ impl WhisperTokenizer {
     }
 
     pub(crate) fn from_gguf_metadata(metadata: &GgufMetadata) -> Result<Self, NativeAsrError> {
-        let tokenizer_model = required_metadata_string(metadata, TOKENIZER_GGML_MODEL_KEY)?;
+        let tokenizer_model =
+            required_metadata_string(metadata, TOKENIZER_GGML_MODEL_KEY, WHISPER_TOKENIZER_FAMILY)?;
         if !tokenizer_model.eq_ignore_ascii_case(TOKENIZER_GGML_MODEL_VALUE_GPT2) {
             return Err(NativeAsrError::UnsupportedModelPack {
                 reason: format!(
@@ -139,7 +153,11 @@ impl WhisperTokenizer {
             });
         }
 
-        let tokens = required_metadata_string_array(metadata, TOKENIZER_GGML_TOKENS_KEY)?;
+        let tokens = required_metadata_string_array(
+            metadata,
+            TOKENIZER_GGML_TOKENS_KEY,
+            WHISPER_TOKENIZER_FAMILY,
+        )?;
         if tokens.is_empty() {
             return Err(NativeAsrError::UnsupportedModelPack {
                 reason: format!(
@@ -148,7 +166,11 @@ impl WhisperTokenizer {
                 ),
             });
         }
-        let merges = required_metadata_string_array(metadata, TOKENIZER_GGML_MERGES_KEY)?;
+        let merges = required_metadata_string_array(
+            metadata,
+            TOKENIZER_GGML_MERGES_KEY,
+            WHISPER_TOKENIZER_FAMILY,
+        )?;
         if merges.is_empty() {
             return Err(NativeAsrError::UnsupportedModelPack {
                 reason: format!(
@@ -157,8 +179,11 @@ impl WhisperTokenizer {
                 ),
             });
         }
-        let special_token_ids =
-            required_metadata_u32_array(metadata, TOKENIZER_GGML_SPECIAL_TOKEN_IDS_KEY)?;
+        let special_token_ids = required_metadata_u32_array(
+            metadata,
+            TOKENIZER_GGML_SPECIAL_TOKEN_IDS_KEY,
+            WHISPER_TOKENIZER_FAMILY,
+        )?;
         if special_token_ids.is_empty() {
             return Err(NativeAsrError::UnsupportedModelPack {
                 reason: format!(
@@ -168,7 +193,9 @@ impl WhisperTokenizer {
             });
         }
 
-        if let Some(vocab_size) = optional_metadata_u32(metadata, WHISPER_VOCAB_SIZE_KEY)? {
+        if let Some(vocab_size) =
+            optional_metadata_u32(metadata, WHISPER_VOCAB_SIZE_KEY, WHISPER_TOKENIZER_FAMILY)?
+        {
             let token_count =
                 u32::try_from(tokens.len()).map_err(|_| NativeAsrError::UnsupportedModelPack {
                     reason: format!(
@@ -186,12 +213,26 @@ impl WhisperTokenizer {
             }
         }
 
-        let sot_token_id = required_metadata_u32(metadata, TOKENIZER_GGML_SOT_TOKEN_ID_KEY)?;
-        let eot_token_id = required_metadata_u32(metadata, TOKENIZER_GGML_EOT_TOKEN_ID_KEY)?;
-        let transcribe_token_id =
-            required_metadata_u32(metadata, TOKENIZER_GGML_TRANSCRIBE_TOKEN_ID_KEY)?;
-        let no_timestamps_token_id =
-            required_metadata_u32(metadata, TOKENIZER_GGML_NO_TIMESTAMPS_TOKEN_ID_KEY)?;
+        let sot_token_id = required_metadata_u32(
+            metadata,
+            TOKENIZER_GGML_SOT_TOKEN_ID_KEY,
+            WHISPER_TOKENIZER_FAMILY,
+        )?;
+        let eot_token_id = required_metadata_u32(
+            metadata,
+            TOKENIZER_GGML_EOT_TOKEN_ID_KEY,
+            WHISPER_TOKENIZER_FAMILY,
+        )?;
+        let transcribe_token_id = required_metadata_u32(
+            metadata,
+            TOKENIZER_GGML_TRANSCRIBE_TOKEN_ID_KEY,
+            WHISPER_TOKENIZER_FAMILY,
+        )?;
+        let no_timestamps_token_id = required_metadata_u32(
+            metadata,
+            TOKENIZER_GGML_NO_TIMESTAMPS_TOKEN_ID_KEY,
+            WHISPER_TOKENIZER_FAMILY,
+        )?;
 
         let id_to_token = tokens
             .iter()
@@ -660,77 +701,6 @@ impl PhraseBiasTokenEncoder for WhisperTokenizer {
         // mid-sentence, not just the standalone tokenization.
         encode_bpe_phrase_bias_variants(phrase, |text| self.encode_prompt_text(text)).map(Some)
     }
-}
-
-fn required_metadata_string<'a>(
-    metadata: &'a GgufMetadata,
-    key: &'static str,
-) -> Result<&'a str, NativeAsrError> {
-    let value = metadata
-        .get_string(key)
-        .ok_or_else(|| NativeAsrError::UnsupportedModelPack {
-            reason: format!("Whisper GGUF tokenizer is missing required key '{key}'"),
-        })?;
-    let normalized = value.trim();
-    if normalized.is_empty() {
-        return Err(NativeAsrError::UnsupportedModelPack {
-            reason: format!("Whisper GGUF tokenizer key '{key}' cannot be empty"),
-        });
-    }
-    Ok(normalized)
-}
-
-fn required_metadata_u32(
-    metadata: &GgufMetadata,
-    key: &'static str,
-) -> Result<u32, NativeAsrError> {
-    optional_metadata_u32(metadata, key)?.ok_or_else(|| NativeAsrError::UnsupportedModelPack {
-        reason: format!("Whisper GGUF tokenizer is missing required key '{key}'"),
-    })
-}
-
-fn optional_metadata_u32(
-    metadata: &GgufMetadata,
-    key: &'static str,
-) -> Result<Option<u32>, NativeAsrError> {
-    if let Some(value) = metadata.get_u32(key) {
-        return Ok(Some(value));
-    }
-    if let Some(value) = metadata.get_string(key) {
-        let parsed =
-            value
-                .trim()
-                .parse::<u32>()
-                .map_err(|error| NativeAsrError::UnsupportedModelPack {
-                    reason: format!(
-                        "Whisper GGUF tokenizer key '{key}' cannot parse '{value}' as u32: {error}"
-                    ),
-                })?;
-        return Ok(Some(parsed));
-    }
-    Ok(None)
-}
-
-fn required_metadata_string_array<'a>(
-    metadata: &'a GgufMetadata,
-    key: &'static str,
-) -> Result<&'a [String], NativeAsrError> {
-    metadata
-        .get_string_array(key)
-        .ok_or_else(|| NativeAsrError::UnsupportedModelPack {
-            reason: format!("Whisper GGUF tokenizer requires key '{key}' as array[string]"),
-        })
-}
-
-fn required_metadata_u32_array<'a>(
-    metadata: &'a GgufMetadata,
-    key: &'static str,
-) -> Result<&'a [u32], NativeAsrError> {
-    metadata
-        .get_u32_array(key)
-        .ok_or_else(|| NativeAsrError::UnsupportedModelPack {
-            reason: format!("Whisper GGUF tokenizer requires key '{key}' as array[uint32]"),
-        })
 }
 
 fn read_json_file<T: for<'de> Deserialize<'de>>(
