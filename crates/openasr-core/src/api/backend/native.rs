@@ -460,6 +460,28 @@ fn shared_native_ggml_streaming_execution_dispatch()
     }
 }
 
+/// Idle-unload for the realtime-streaming dispatch. Like its offline
+/// counterpart, uses `get()` so a daemon that never started a streaming
+/// session does not build the dispatch just to unload nothing.
+pub(crate) fn unload_idle_native_streaming_runtime_caches() {
+    if let Some(Ok(dispatch)) = NATIVE_GGML_STREAMING_EXECUTION_DISPATCH.get() {
+        dispatch.unload_all();
+    }
+}
+
+/// Evicts every process-lifetime native model runtime cache (offline
+/// transcription dispatch + realtime streaming dispatch), releasing the
+/// resident mmap/tensor/Metal state a bound model pack accumulates after use.
+/// The `idle_unload` server preference calls this from a background reaper
+/// once the daemon has been idle (no active request/session) past its
+/// configured threshold; a subsequent request just rebuilds via the normal
+/// load-on-first-use path (paying the cold build cost again, same as the
+/// very first request after boot).
+pub fn unload_idle_native_model_runtime_caches() {
+    native_transcribe::unload_idle_native_offline_runtime_caches();
+    unload_idle_native_streaming_runtime_caches();
+}
+
 fn native_ggml_streaming_error_to_asr(
     adapter_id: &'static str,
     error: GgmlAsrExecutionError,
@@ -1245,6 +1267,16 @@ mod tests {
         ) -> Result<Vec<crate::realtime::RealtimeEventEnvelope>, NativeAsrError> {
             Ok(Vec::new())
         }
+    }
+
+    #[test]
+    fn unload_idle_native_model_runtime_caches_is_a_safe_no_op_before_any_dispatch_use() {
+        // The common daemon-boot-with-no-request-yet case (and the general
+        // "idle_unload reaper fires before either dispatch was ever built"
+        // case, since both use `OnceLock::get()` rather than
+        // `get_or_init()`): must not build the dispatch just to unload
+        // nothing from it, and must never panic.
+        unload_idle_native_model_runtime_caches();
     }
 
     #[test]

@@ -68,6 +68,21 @@ impl<T> PreparedRuntimeCache<T> {
         let cache = self.cache_by_path.lock().map_err(|_| map_poisoned_lock())?;
         Ok(cache.get(cache_key).cloned())
     }
+
+    /// Drops every cached prepared runtime, releasing the `Arc<T>` this cache
+    /// holds. If nothing else is currently borrowing an entry (no in-flight
+    /// request holding its own clone), this frees whatever native resources
+    /// `T` owns -- mmap, materialized tensors, Metal/CPU graph context -- right
+    /// away; otherwise the last outstanding clone's drop frees it once that
+    /// request finishes. Used by the idle-unload reaper: a poisoned lock is
+    /// swallowed (best-effort eviction, not a request-path operation) rather
+    /// than propagated, since a subsequent `get_or_try_insert_with` will just
+    /// rebuild on the next real request either way.
+    pub(crate) fn clear(&self) {
+        if let Ok(mut cache) = self.cache_by_path.lock() {
+            cache.clear();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -137,5 +152,32 @@ mod tests {
         assert_eq!(build_count.get(), 1);
         assert!(Arc::ptr_eq(&runtime_a, &runtime_b));
         assert_eq!(runtime_b.value, 7);
+    }
+
+    #[test]
+    fn clear_evicts_cached_entry_so_the_next_call_rebuilds() {
+        let cache = PreparedRuntimeCache::<StubRuntime>::default();
+        let path = Path::new("/tmp/test-runtime-clear.gguf");
+        let build_count = Cell::new(0usize);
+
+        let build = |value: usize| {
+            build_count.set(build_count.get() + 1);
+            Ok::<_, &'static str>(StubRuntime { value })
+        };
+
+        let runtime_a = cache
+            .get_or_try_insert_with(path, || build(7), || "poisoned")
+            .expect("runtime a");
+        assert_eq!(build_count.get(), 1);
+
+        cache.clear();
+
+        let runtime_b = cache
+            .get_or_try_insert_with(path, || build(9), || "poisoned")
+            .expect("runtime b");
+
+        assert_eq!(build_count.get(), 2, "clear must force a rebuild");
+        assert!(!Arc::ptr_eq(&runtime_a, &runtime_b));
+        assert_eq!(runtime_b.value, 9);
     }
 }

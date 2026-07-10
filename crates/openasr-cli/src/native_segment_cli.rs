@@ -523,6 +523,14 @@ pub(super) async fn serve(
     launch_options.auth = launch_options
         .auth
         .with_pairing_store(home.join("pairing-registry.json"));
+    // `idle_unload` lives on `Preferences`, not the plain `OpenAsrConfig`
+    // already loaded above -- read the full config document for it. A
+    // missing/unreadable document (fresh install) falls back to the default
+    // policy rather than failing serve over a preferences read.
+    launch_options.idle_unload_after = openasr_core::load_config_document(&home)
+        .map(|document| document.preferences.idle_unload)
+        .unwrap_or_default()
+        .idle_threshold();
     openasr_server::serve_with_launch_options(
         addr,
         openasr_server::ServerRuntime {

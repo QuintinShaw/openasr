@@ -329,6 +329,14 @@ pub trait GgmlAsrExecutor: Send + Sync {
         &self,
         request: &GgmlAsrExecutionRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError>;
+    /// Drops this executor's process-lifetime cached prepared runtime(s)
+    /// (mmap + materialized tensors + Metal/CPU graph context), if it caches
+    /// one at all. Called by the daemon's idle-unload reaper (`idle_unload`
+    /// preference); the default no-op covers executors whose only caching is
+    /// per-thread and already self-bounded/self-expiring (bounded LRU capacity,
+    /// or a worker thread the realtime idle reaper already recycles), so they
+    /// need no additional eviction here.
+    fn unload_idle_state(&self) {}
 }
 
 pub trait GgmlAsrStreamingExecutor: Send + Sync {
@@ -337,6 +345,11 @@ pub trait GgmlAsrStreamingExecutor: Send + Sync {
         &self,
         request: &GgmlAsrStreamingSessionRequest,
     ) -> Result<Box<dyn NativeAsrSession>, GgmlAsrExecutionError>;
+    /// Streaming-side counterpart of [`GgmlAsrExecutor::unload_idle_state`].
+    /// Families registered on both dispatches (offline + streaming) hold two
+    /// independent executor instances with two independent caches, so both
+    /// must be evicted for `idle_unload` to actually free the resident model.
+    fn unload_idle_state(&self) {}
 }
 
 /// Partial-result granularity of a registered streaming executor. This is a
@@ -528,6 +541,25 @@ impl GgmlAsrExecutionDispatch {
                 .get(capability_label(descriptor.execution_capability)),
             Some(StreamingPartialGranularity::FrameSync)
         )
+    }
+
+    /// Idle-unload: evicts every registered executor's process-lifetime
+    /// cached prepared runtime. Safe to call opportunistically (e.g. from a
+    /// background reaper) -- executors with nothing resident, or whose
+    /// caching is per-thread and self-managed, just no-op.
+    pub fn unload_all(&self) {
+        for executor in self.executors_by_adapter_id.values() {
+            executor.unload_idle_state();
+        }
+        for executor in self.executors_by_capability.values() {
+            executor.unload_idle_state();
+        }
+        for executor in self.streaming_executors_by_adapter_id.values() {
+            executor.unload_idle_state();
+        }
+        for executor in self.streaming_executors_by_capability.values() {
+            executor.unload_idle_state();
+        }
     }
 }
 
@@ -987,6 +1019,110 @@ mod tests {
                 StreamingPartialGranularity::FrameSync,
             );
         assert!(capability_dispatch.is_frame_sync_for(&qwen));
+    }
+
+    #[test]
+    fn unload_all_reaches_every_registered_executor_map() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // One stub per registration slot (offline adapter-id, offline
+        // capability, streaming adapter-id, streaming capability), each
+        // bumping its own counter from `unload_idle_state` -- proves
+        // `unload_all` walks all four maps, not just the offline/adapter-id
+        // one every other test in this file happens to exercise.
+        struct CountingExecutor(Arc<AtomicUsize>);
+        impl GgmlAsrExecutor for CountingExecutor {
+            fn executor_id(&self) -> &'static str {
+                "counting-offline-stub"
+            }
+            fn supports_phrase_bias(&self) -> bool {
+                false
+            }
+            fn execute(
+                &self,
+                _request: &GgmlAsrExecutionRequest,
+            ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+                unreachable!("this test never executes a request")
+            }
+            fn unload_idle_state(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct CountingStreamingExecutor(Arc<AtomicUsize>);
+        impl GgmlAsrStreamingExecutor for CountingStreamingExecutor {
+            fn executor_id(&self) -> &'static str {
+                "counting-streaming-stub"
+            }
+            fn start_streaming_session(
+                &self,
+                _request: &GgmlAsrStreamingSessionRequest,
+            ) -> Result<Box<dyn crate::NativeAsrSession>, GgmlAsrExecutionError> {
+                unreachable!("this test never starts a streaming session")
+            }
+            fn unload_idle_state(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let offline_adapter_calls = Arc::new(AtomicUsize::new(0));
+        let offline_capability_calls = Arc::new(AtomicUsize::new(0));
+        let streaming_adapter_calls = Arc::new(AtomicUsize::new(0));
+        let streaming_capability_calls = Arc::new(AtomicUsize::new(0));
+
+        let dispatch = GgmlAsrExecutionDispatch::default()
+            .with_executor_for_adapter(
+                WHISPER_GGML_ADAPTER_ID,
+                Arc::new(CountingExecutor(Arc::clone(&offline_adapter_calls))),
+            )
+            .with_executor_for_capability(
+                GgmlExecutionCapability::NativeGraphLoweringV1,
+                Arc::new(CountingExecutor(Arc::clone(&offline_capability_calls))),
+            )
+            .with_streaming_executor_for_adapter(
+                WHISPER_GGML_ADAPTER_ID,
+                Arc::new(CountingStreamingExecutor(Arc::clone(
+                    &streaming_adapter_calls,
+                ))),
+            )
+            .with_streaming_executor_for_capability(
+                GgmlExecutionCapability::NativeGraphLoweringV1,
+                Arc::new(CountingStreamingExecutor(Arc::clone(
+                    &streaming_capability_calls,
+                ))),
+            );
+
+        dispatch.unload_all();
+
+        assert_eq!(offline_adapter_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(offline_capability_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(streaming_adapter_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(streaming_capability_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn unload_idle_state_default_is_a_no_op() {
+        // Any executor that does not override `unload_idle_state` (every
+        // family whose only caching is per-thread/bounded) must tolerate
+        // being told to unload -- the default no-op must not panic.
+        struct NoCacheExecutor;
+        impl GgmlAsrExecutor for NoCacheExecutor {
+            fn executor_id(&self) -> &'static str {
+                "no-cache-stub"
+            }
+            fn supports_phrase_bias(&self) -> bool {
+                false
+            }
+            fn execute(
+                &self,
+                _request: &GgmlAsrExecutionRequest,
+            ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+                unreachable!("this test never executes a request")
+            }
+        }
+
+        let dispatch = GgmlAsrExecutionDispatch::default()
+            .with_executor_for_adapter(WHISPER_GGML_ADAPTER_ID, Arc::new(NoCacheExecutor));
+        dispatch.unload_all();
     }
 
     #[test]

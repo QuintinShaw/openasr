@@ -17,8 +17,8 @@ pub use native::{
     native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
     native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,
-    resolve_local_native_runtime_model_identity, validate_local_native_model_pack_path,
-    validate_native_runtime_model_pack_contract,
+    resolve_local_native_runtime_model_identity, unload_idle_native_model_runtime_caches,
+    validate_local_native_model_pack_path, validate_native_runtime_model_pack_contract,
 };
 
 pub const NATIVE_RUNTIME_MODEL_ID_AUTO: &str = "__openasr_native_runtime_model_id_auto__";
