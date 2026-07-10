@@ -909,18 +909,11 @@ fn serve_native_accepts_quant_pinned_model_ref_for_bare_local_runtime_source() {
 // that boundary.
 #[allow(clippy::zombie_processes)]
 fn spawn_serve_and_wait_until_listening(home: &Path) -> (std::process::Child, String) {
-    // `serve` prints back the `--addr` it was given verbatim rather than the
-    // listener's actual bound address, so `--addr 127.0.0.1:0` would echo the
-    // unusable "port 0". Reserve a real ephemeral port ourselves, release it,
-    // and pass that through -- a race in principle, but a released loopback
-    // port is not reused within a single test's tiny window in practice.
-    let reserved = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve ephemeral port");
-    let addr = reserved
-        .local_addr()
-        .expect("reserved listener addr")
-        .to_string();
-    drop(reserved);
-
+    // `--addr 127.0.0.1:0` asks the OS for an ephemeral port; `serve` reports
+    // back the listener's actual bound address (not the `:0` it was given
+    // verbatim), so the real port is parsed straight from that banner line
+    // instead of pre-reserving one ourselves (which was also a race, in
+    // principle, against the reserved port being reused before `serve` binds).
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_openasr"));
     command
         .env("OPENASR_HOME", home)
@@ -928,7 +921,7 @@ fn spawn_serve_and_wait_until_listening(home: &Path) -> (std::process::Child, St
         .env_remove("OPENASR_ADDR")
         .env_remove("OPENASR_ASSUME_YES")
         .env_remove("OPENASR_OFFLINE")
-        .args(["serve", "--backend", "native", "--addr", &addr])
+        .args(["serve", "--backend", "native", "--addr", "127.0.0.1:0"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = command.spawn().expect("spawn openasr serve");
@@ -951,11 +944,15 @@ fn spawn_serve_and_wait_until_listening(home: &Path) -> (std::process::Child, St
                 "openasr serve exited before reporting it was listening (status: {status:?}, stderr: {stderr})"
             );
         }
-        if line
-            .trim_end()
-            .starts_with("OpenASR server listening on http://")
-        {
-            return (child, addr);
+        let trimmed = line.trim_end();
+        if let Some(addr) = trimmed.strip_prefix("OpenASR server listening on http://") {
+            assert_ne!(
+                addr, "127.0.0.1:0",
+                "serve must report the listener's real bound port, not the \
+                 requested wildcard address, or every caller of this helper \
+                 would try to connect to the unusable port 0"
+            );
+            return (child, addr.to_string());
         }
         if std::time::Instant::now() > deadline {
             let _ = child.kill();

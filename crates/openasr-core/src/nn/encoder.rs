@@ -1325,4 +1325,237 @@ mod tests {
             );
         }
     }
+
+    // ----- SAN-M (SenseVoice/Paraformer) `input_dim == d_model` vs `!=` -----
+    //
+    // The only real caller (`models::sensevoice::encoder_graph`) exercises the
+    // `input_dim != d_model` branch (the 560-dim LFR+prompt feature feeding
+    // `enc.blk.0`) only through a bring-up test gated on
+    // `#[ignore = "requires SENSEVOICE_BRINGUP_DIR + SENSEVOICE_PACK ..."]`,
+    // which needs a local oracle pack and never runs in CI. These tiny
+    // synthetic-tensor tests exercise both sides of the residual-skip
+    // conditional (`config.input_dim == d_model` above) directly, independent
+    // of any real pack.
+
+    const SANM_D_MODEL: usize = HIDDEN;
+    const SANM_MISMATCHED_INPUT_DIM: usize = 6;
+    const SANM_FSMN_KERNEL: usize = 1;
+
+    /// Build a tiny `sanm_fsmn_encoder_layer` graph with every weight/bias
+    /// zeroed except the two LayerNorm scale vectors (kept at 1 so the norm
+    /// itself stays well-defined). Every affine transform downstream of the
+    /// norms (QKV, attention-out, the FSMN depthwise conv, the FFN) then
+    /// multiplies by zero, so the whole attention+FFN contribution collapses
+    /// to exactly zero and the block's output reduces to plain `state`: the
+    /// original `input` when the residual add fires (`input_dim == d_model`),
+    /// or exactly the zero vector when it is skipped (`input_dim !=
+    /// d_model`, so `state = attn_out = 0`). That makes both branches of the
+    /// conditional hand-verifiable without needing a full identity-attention
+    /// reference implementation.
+    fn run_sanm_fsmn_encoder_layer_zeroed(input_dim: usize, input_values: &[f32]) -> Vec<f32> {
+        assert_eq!(input_values.len(), input_dim * TOKENS);
+        let config = GgmlCpuGraphConfig {
+            backend: GgmlCpuGraphBackend::Cpu,
+            ..GgmlCpuGraphConfig::conservative_default()
+        };
+        let mut runner = GgmlCpuGraphRunner::new(config).expect("cpu graph runner should init");
+        let mut graph = runner.start_graph();
+
+        let input = graph
+            .new_tensor_2d_f32(input_dim, TOKENS, "sanm_input")
+            .expect("input tensor");
+        let attn_norm_weight = graph
+            .new_tensor_1d_f32(input_dim, "sanm_attn_norm_weight")
+            .expect("attn_norm_weight");
+        let attn_norm_bias = graph
+            .new_tensor_1d_f32(input_dim, "sanm_attn_norm_bias")
+            .expect("attn_norm_bias");
+        let attn_qkv_weight = graph
+            .new_tensor_2d_f32(input_dim, 3 * SANM_D_MODEL, "sanm_qkv_weight")
+            .expect("attn_qkv_weight");
+        let attn_qkv_bias = graph
+            .new_tensor_1d_f32(3 * SANM_D_MODEL, "sanm_qkv_bias")
+            .expect("attn_qkv_bias");
+        let attn_out_weight = graph
+            .new_tensor_2d_f32(SANM_D_MODEL, SANM_D_MODEL, "sanm_out_weight")
+            .expect("attn_out_weight");
+        let attn_out_bias = graph
+            .new_tensor_1d_f32(SANM_D_MODEL, "sanm_out_bias")
+            .expect("attn_out_bias");
+        let attn_fsmn_weight = graph
+            .new_tensor_3d_f16(SANM_FSMN_KERNEL, 1, SANM_D_MODEL, "sanm_fsmn_weight")
+            .expect("attn_fsmn_weight");
+        let ffn_norm_weight = graph
+            .new_tensor_1d_f32(SANM_D_MODEL, "sanm_ffn_norm_weight")
+            .expect("ffn_norm_weight");
+        let ffn_norm_bias = graph
+            .new_tensor_1d_f32(SANM_D_MODEL, "sanm_ffn_norm_bias")
+            .expect("ffn_norm_bias");
+        let ffn_up_weight = graph
+            .new_tensor_2d_f32(SANM_D_MODEL, SANM_D_MODEL, "sanm_ffn_up_weight")
+            .expect("ffn_up_weight");
+        let ffn_up_bias = graph
+            .new_tensor_1d_f32(SANM_D_MODEL, "sanm_ffn_up_bias")
+            .expect("ffn_up_bias");
+        let ffn_down_weight = graph
+            .new_tensor_2d_f32(SANM_D_MODEL, SANM_D_MODEL, "sanm_ffn_down_weight")
+            .expect("ffn_down_weight");
+        let ffn_down_bias = graph
+            .new_tensor_1d_f32(SANM_D_MODEL, "sanm_ffn_down_bias")
+            .expect("ffn_down_bias");
+
+        for tensor in [
+            input,
+            attn_norm_weight,
+            attn_norm_bias,
+            attn_qkv_weight,
+            attn_qkv_bias,
+            attn_out_weight,
+            attn_out_bias,
+            attn_fsmn_weight,
+            ffn_norm_weight,
+            ffn_norm_bias,
+            ffn_up_weight,
+            ffn_up_bias,
+            ffn_down_weight,
+            ffn_down_bias,
+        ] {
+            graph.set_input(tensor).expect("tensor should be an input");
+        }
+
+        let output = sanm_fsmn_encoder_layer(
+            &mut graph,
+            input,
+            SanMFsmnBlockConfig {
+                d_model: SANM_D_MODEL,
+                input_dim,
+                attention_heads: HEADS,
+                head_dim: HEAD_DIM,
+                frame_count: TOKENS,
+                fsmn_kernel: SANM_FSMN_KERNEL,
+                layer_norm_epsilon: 1.0e-5,
+            },
+            SanMFsmnBlockWeights {
+                attn_norm_weight,
+                attn_norm_bias,
+                attn_qkv_weight,
+                attn_qkv_bias,
+                attn_out_weight,
+                attn_out_bias,
+                attn_fsmn_weight,
+                ffn_norm_weight,
+                ffn_norm_bias,
+                ffn_up_weight,
+                ffn_up_bias,
+                ffn_down_weight,
+                ffn_down_bias,
+            },
+            identity_map_err,
+        )
+        .expect("sanm_fsmn_encoder_layer should build");
+        graph.set_output(output).expect("output should be settable");
+
+        graph
+            .set_f32_slice(input, input_values, "sanm_input")
+            .expect("input upload");
+        graph
+            .set_f32_slice(
+                attn_norm_weight,
+                &vec![1.0f32; input_dim],
+                "sanm_attn_norm_weight",
+            )
+            .expect("attn_norm_weight upload");
+        graph
+            .set_f32_slice(
+                attn_norm_bias,
+                &vec![0.0f32; input_dim],
+                "sanm_attn_norm_bias",
+            )
+            .expect("attn_norm_bias upload");
+        graph
+            .set_f32_slice(
+                attn_qkv_weight,
+                &vec![0.0f32; input_dim * 3 * SANM_D_MODEL],
+                "sanm_qkv_weight",
+            )
+            .expect("attn_qkv_weight upload");
+        graph
+            .set_f32_slice(attn_qkv_bias, &[0.0f32; 3 * SANM_D_MODEL], "sanm_qkv_bias")
+            .expect("attn_qkv_bias upload");
+        graph
+            .set_f32_slice(attn_out_weight, &ZERO_4X4, "sanm_out_weight")
+            .expect("attn_out_weight upload");
+        graph
+            .set_f32_slice(attn_out_bias, &ZERO_1D, "sanm_out_bias")
+            .expect("attn_out_bias upload");
+        graph
+            .set_f16_bits_slice(
+                attn_fsmn_weight,
+                &[0u16; SANM_FSMN_KERNEL * SANM_D_MODEL],
+                "sanm_fsmn_weight",
+            )
+            .expect("attn_fsmn_weight upload");
+        graph
+            .set_f32_slice(ffn_norm_weight, &NORM_WEIGHT, "sanm_ffn_norm_weight")
+            .expect("ffn_norm_weight upload");
+        graph
+            .set_f32_slice(ffn_norm_bias, &ZERO_1D, "sanm_ffn_norm_bias")
+            .expect("ffn_norm_bias upload");
+        graph
+            .set_f32_slice(ffn_up_weight, &ZERO_4X4, "sanm_ffn_up_weight")
+            .expect("ffn_up_weight upload");
+        graph
+            .set_f32_slice(ffn_up_bias, &ZERO_1D, "sanm_ffn_up_bias")
+            .expect("ffn_up_bias upload");
+        graph
+            .set_f32_slice(ffn_down_weight, &ZERO_4X4, "sanm_ffn_down_weight")
+            .expect("ffn_down_weight upload");
+        graph
+            .set_f32_slice(ffn_down_bias, &ZERO_1D, "sanm_ffn_down_bias")
+            .expect("ffn_down_bias upload");
+
+        graph
+            .compute_output_f32(output, SANM_D_MODEL * TOKENS)
+            .expect("sanm_fsmn_encoder_layer graph should compute")
+    }
+
+    #[test]
+    fn sanm_residual_adds_input_when_input_dim_matches_d_model() {
+        let input = [
+            0.4, -0.3, 0.2, 0.1, //
+            -0.1, 0.5, -0.2, 0.3, //
+            0.2, 0.1, 0.4, -0.4,
+        ];
+        let output = run_sanm_fsmn_encoder_layer_zeroed(SANM_D_MODEL, &input);
+        assert_eq!(output.len(), input.len());
+        for (index, (actual, expected)) in output.iter().zip(input.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1.0e-5,
+                "element {index}: with attention/FFN weights zeroed, the residual add \
+                 must pass `input` through unchanged when input_dim == d_model, got \
+                 {actual} expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanm_residual_is_skipped_when_input_dim_differs_from_d_model() {
+        // A wider first-layer input (SenseVoice's real shape feeds a 560-dim
+        // LFR+prompt feature into a 512-dim d_model); the specific values
+        // don't matter here since every weight downstream is zeroed -- only
+        // that input_dim != d_model.
+        let input: Vec<f32> = (0..(SANM_MISMATCHED_INPUT_DIM * TOKENS))
+            .map(|i| 0.1 * (i as f32 + 1.0))
+            .collect();
+        let output = run_sanm_fsmn_encoder_layer_zeroed(SANM_MISMATCHED_INPUT_DIM, &input);
+        assert_eq!(output.len(), SANM_D_MODEL * TOKENS);
+        for (index, actual) in output.iter().enumerate() {
+            assert!(
+                actual.abs() <= 1.0e-5,
+                "element {index}: with attention/FFN weights zeroed, the residual add \
+                 must be SKIPPED when input_dim != d_model, so the block output should \
+                 reduce to exactly zero, got {actual}"
+            );
+        }
+    }
 }
