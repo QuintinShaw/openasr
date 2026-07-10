@@ -2,6 +2,7 @@
 
 use crate::api::native::NativeStreamingTranscriptEmitter;
 use crate::arch::emits_punctuation_for_model_architecture;
+use crate::models::firered_punc::config::PUNC_LABELS;
 use crate::models::firered_punc::pack::resolve_firered_punc_pack_path;
 use crate::models::firered_punc::runtime::SendableFireRedPuncRuntime;
 use crate::models::ggml_asr_executor::{
@@ -29,6 +30,37 @@ pub(crate) type StreamingFinalPunctuator =
 /// descriptor so no pack re-read is needed.
 fn streaming_punctuation_stage_applies(model_architecture: &str) -> bool {
     should_apply_punctuation(emits_punctuation_for_model_architecture(model_architecture))
+}
+
+/// Whether `c` is one of FireRedPunc's *sentence-ending* marks. Its full
+/// label space (`PUNC_LABELS`) is `<none>`, `，`, `。`, `？`, `！`; the comma
+/// is not a sentence end, so only the other three count as a "terminal" mark
+/// a soft boundary can suppress.
+fn is_soft_boundary_terminal_mark(c: char) -> bool {
+    const COMMA: char = '，';
+    c != COMMA && PUNC_LABELS.into_iter().flatten().any(|mark| mark == c)
+}
+
+/// Strips a single trailing terminal mark (`。`/`？`/`！`) that FireRedPunc
+/// unconditionally appended to a segment ending at a *soft* streaming
+/// boundary -- a VAD-pause segment cut, the 12s force-cut, or a max-duration
+/// `SplitUtterance` -- none of which are an actual sentence end (see
+/// `is_hard_boundary` on [`GgmlAsrStreamingTranscriptSession::punctuate_final_update`]).
+/// Only the last non-whitespace character is inspected and at most one mark
+/// is removed; punctuation anywhere earlier in the segment (a comma, or a
+/// genuine mid-segment period) is left exactly as FireRedPunc produced it. A
+/// *hard* boundary (a real VAD stop / session finish) never calls this -- its
+/// terminal mark is a real sentence end and must survive.
+fn strip_soft_boundary_terminal(text: &str) -> String {
+    let trimmed_len = text.trim_end().len();
+    let (body, trailing_ws) = text.split_at(trimmed_len);
+    let mut chars: Vec<char> = body.chars().collect();
+    if matches!(chars.last(), Some(&c) if is_soft_boundary_terminal_mark(c)) {
+        chars.pop();
+    }
+    let mut result: String = chars.into_iter().collect();
+    result.push_str(trailing_ws);
+    result
 }
 
 /// Streaming counterpart of the batch `apply_punctuation_stage_if_applicable`
@@ -284,6 +316,15 @@ where
     /// once, at the moment it stops being revised. Fail-closed per segment --
     /// a classifier error keeps the driver's original text.
     ///
+    /// `is_hard_boundary` distinguishes an actual language boundary (a real
+    /// VAD stop via `finalize_utterance`, or `finish`) from a *soft* boundary
+    /// that cuts the transcript without the speaker actually having stopped
+    /// (a driver-emitted mid-utterance segment final, the 12s force-cut, or a
+    /// max-duration `split_utterance`). FireRedPunc closes every window it
+    /// punctuates the same way it closes a real sentence, so at a soft
+    /// boundary that terminal mark is spurious and is stripped by
+    /// [`strip_soft_boundary_terminal`]; a hard boundary keeps it untouched.
+    ///
     /// INVARIANT: every update that can surface as a visible FINAL passes
     /// through here first. There are exactly two producers of finals in this
     /// session -- driver-emitted finals ([`Self::emit_update`]'s `Final`
@@ -292,11 +333,15 @@ where
     /// `apply_final`. Never call `emitter.apply_final` or
     /// `emitter.finalize_pending_output_at` from anywhere else in this
     /// session, or a final can bypass the stage.
-    fn punctuate_final_update(&self, update: &mut TranscriptUpdate) {
+    fn punctuate_final_update(&self, update: &mut TranscriptUpdate, is_hard_boundary: bool) {
         if let Some(punctuate) = &self.final_punctuator
             && let Ok(punctuated) = punctuate(&update.text)
         {
-            update.text = punctuated;
+            update.text = if is_hard_boundary {
+                punctuated
+            } else {
+                strip_soft_boundary_terminal(&punctuated)
+            };
         }
     }
 
@@ -304,19 +349,24 @@ where
     /// running the punctuation stage on it exactly like a driver-emitted
     /// final. A driver that only ever emits partials (relying on the session
     /// to finalize the tail on flush/finalize/finish) therefore cannot leak
-    /// an unpunctuated final.
-    fn finalize_pending_output(&mut self) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
+    /// an unpunctuated final. `is_hard_boundary` is forwarded to
+    /// [`Self::punctuate_final_update`] unchanged.
+    fn finalize_pending_output(
+        &mut self,
+        is_hard_boundary: bool,
+    ) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
         let finalized_at = self.now();
         let Some(mut update) = self.emitter.take_pending_partial_update() else {
             return Ok(Vec::new());
         };
-        self.punctuate_final_update(&mut update);
+        self.punctuate_final_update(&mut update, is_hard_boundary);
         self.emitter.apply_final(update, finalized_at)
     }
 
     fn emit_update(
         &mut self,
         update: GgmlAsrStreamingTranscriptUpdate,
+        is_hard_boundary: bool,
     ) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
         let created_at = self.now();
         match update {
@@ -324,7 +374,7 @@ where
                 self.emitter.apply_partial(update, created_at)
             }
             GgmlAsrStreamingTranscriptUpdate::Final(mut update) => {
-                self.punctuate_final_update(&mut update);
+                self.punctuate_final_update(&mut update, is_hard_boundary);
                 self.emitter.apply_final(update, created_at)
             }
         }
@@ -333,10 +383,11 @@ where
     fn emit_updates(
         &mut self,
         updates: Vec<GgmlAsrStreamingTranscriptUpdate>,
+        is_hard_boundary: bool,
     ) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
         let mut events = self.emitter.drain_pending_events();
         for update in updates {
-            let emitted = self.emit_update(update)?;
+            let emitted = self.emit_update(update, is_hard_boundary)?;
             self.emitter
                 .ensure_output_capacity(events.len() + emitted.len())?;
             events.extend(emitted);
@@ -367,16 +418,51 @@ where
         Ok(())
     }
 
-    fn flush_driver_updates(&mut self) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
+    /// Used by `flush`/`close`, both of which drain and settle whatever is
+    /// left with no further continuation expected -- treated as a hard
+    /// boundary.
+    fn flush_driver_updates(
+        &mut self,
+        is_hard_boundary: bool,
+    ) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
         let updates = self
             .driver
             .flush_updates()
             .map_err(|error| self.driver_error_to_native(error))?;
-        let mut events = self.emit_updates(updates)?;
-        let finalized = self.finalize_pending_output()?;
+        let mut events = self.emit_updates(updates, is_hard_boundary)?;
+        let finalized = self.finalize_pending_output(is_hard_boundary)?;
         self.emitter
             .ensure_output_capacity(events.len() + finalized.len())?;
         events.extend(finalized);
+        Ok(events)
+    }
+
+    /// Shared body for [`NativeAsrSession::finalize_utterance`] (a real
+    /// VAD-detected utterance end, `is_hard_boundary = true`) and
+    /// [`NativeAsrSession::split_utterance`]'s fallback for drivers without
+    /// soft-split support (a forced max-duration cut that is not a language
+    /// boundary, `is_hard_boundary = false`).
+    fn finalize_or_split_impl(
+        &mut self,
+        is_hard_boundary: bool,
+    ) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
+        let updates = self
+            .driver
+            .finish_updates()
+            .map_err(|error| self.driver_error_to_native(error))?;
+        let mut events = self.emit_updates(updates, is_hard_boundary)?;
+        let finalized = self.finalize_pending_output(is_hard_boundary)?;
+        self.emitter
+            .ensure_output_capacity(events.len() + finalized.len())?;
+        events.extend(finalized);
+        self.driver
+            .reset_utterance()
+            .map_err(|error| self.driver_error_to_native(error))?;
+        let restarted_at = self.now();
+        if let Some(restarted) = self.emitter.reset_for_next_utterance(restarted_at)? {
+            self.emitter.ensure_output_capacity(events.len() + 1)?;
+            events.push(restarted);
+        }
         Ok(events)
     }
 }
@@ -400,7 +486,9 @@ where
         let result = self.driver.push_audio(frame);
         self.queued_audio_frames = self.queued_audio_frames.saturating_sub(1);
         let updates = result.map_err(|error| self.driver_error_to_native(error))?;
-        self.emit_updates(updates)
+        // A driver-emitted final here is a mid-utterance segment cut (e.g.
+        // `emit_segment_final`), never a real language boundary: soft.
+        self.emit_updates(updates, false)
     }
 
     fn poll_events(&mut self) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
@@ -411,14 +499,16 @@ where
             .driver
             .poll_updates()
             .map_err(|error| self.driver_error_to_native(error))?;
-        self.emit_updates(updates)
+        // Same source of finals as `push_audio` (the cadence-driven partial
+        // decode can also settle a sentence): soft.
+        self.emit_updates(updates, false)
     }
 
     fn flush(&mut self) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
         if self.closed {
             return Ok(Vec::new());
         }
-        self.flush_driver_updates()
+        self.flush_driver_updates(true)
     }
 
     fn warm_up(&mut self) -> Result<(), NativeAsrError> {
@@ -434,37 +524,23 @@ where
         if self.closed {
             return Ok(Vec::new());
         }
-        let updates = self
-            .driver
-            .finish_updates()
-            .map_err(|error| self.driver_error_to_native(error))?;
-        let mut events = self.emit_updates(updates)?;
-        let finalized = self.finalize_pending_output()?;
-        self.emitter
-            .ensure_output_capacity(events.len() + finalized.len())?;
-        events.extend(finalized);
-        self.driver
-            .reset_utterance()
-            .map_err(|error| self.driver_error_to_native(error))?;
-        let restarted_at = self.now();
-        if let Some(restarted) = self.emitter.reset_for_next_utterance(restarted_at)? {
-            self.emitter.ensure_output_capacity(events.len() + 1)?;
-            events.push(restarted);
-        }
-        Ok(events)
+        // A real VAD-detected utterance end: hard boundary, terminal
+        // punctuation is a genuine sentence end and must survive.
+        self.finalize_or_split_impl(true)
     }
 
     /// Segment split at a forced (max-utterance-duration) boundary. Unlike
     /// [`Self::finalize_utterance`] this preserves the driver's decode state
     /// when the driver supports it, so an arbitrary mid-speech cut cannot
     /// degrade recognition on either side of the boundary. Drivers without
-    /// soft-split support fall back to the full finalize+reset.
+    /// soft-split support fall back to the full finalize+reset. Neither path
+    /// is an actual language boundary, so both treat the cut as soft.
     fn split_utterance(&mut self) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
         if self.closed {
             return Ok(Vec::new());
         }
         if !self.driver.supports_soft_split() {
-            return self.finalize_utterance();
+            return self.finalize_or_split_impl(false);
         }
         let updates = self
             .driver
@@ -475,10 +551,10 @@ where
             // advance its segment identity, so skip the emitter
             // finalize/reset cycle too — otherwise the client would receive a
             // spurious audio.input.started with no segment around it.
-            return self.emit_updates(Vec::new());
+            return self.emit_updates(Vec::new(), false);
         }
-        let mut events = self.emit_updates(updates)?;
-        let finalized = self.finalize_pending_output()?;
+        let mut events = self.emit_updates(updates, false)?;
+        let finalized = self.finalize_pending_output(false)?;
         self.emitter
             .ensure_output_capacity(events.len() + finalized.len())?;
         events.extend(finalized);
@@ -498,8 +574,9 @@ where
             .driver
             .finish_updates()
             .map_err(|error| self.driver_error_to_native(error))?;
-        let mut events = self.emit_updates(updates)?;
-        let finalized = self.finalize_pending_output()?;
+        // Session finish: hard boundary, same as `finalize_utterance`.
+        let mut events = self.emit_updates(updates, true)?;
+        let finalized = self.finalize_pending_output(true)?;
         self.emitter
             .ensure_output_capacity(events.len() + finalized.len())?;
         events.extend(finalized);
@@ -518,7 +595,7 @@ where
             return Ok(Vec::new());
         }
         self.closed = true;
-        let mut events = self.flush_driver_updates()?;
+        let mut events = self.flush_driver_updates(true)?;
         let stopped_at = self.now();
         if let Some(stopped) = self.emitter.close_if_running("client_closed", stopped_at)? {
             events.push(stopped);
@@ -881,7 +958,15 @@ mod tests {
         // The FINAL-only punctuation stage runs at the single point where a
         // driver update becomes a transcript event, so every entry path
         // (push_audio / poll / flush / finalize / finish) is covered; partial
-        // updates must reach the emitter untouched.
+        // updates must reach the emitter untouched. A driver-emitted FINAL via
+        // `push_audio` is a soft boundary (a mid-utterance segment cut, not a
+        // real sentence end), so the mock punctuator here adds a mid-segment
+        // comma in addition to its trailing period: the soft-boundary strip
+        // removes only that last period, and the surviving comma still proves
+        // the punctuation stage ran (see the dedicated
+        // `soft_segment_final_strips_trailing_terminal_*` and
+        // `hard_boundary_*` tests for the boundary-suppression behavior
+        // itself).
         let request = request(true);
         let driver = ScriptDriver::new([
             ScriptStep::Partial {
@@ -898,7 +983,7 @@ mod tests {
             &request,
             driver,
             test_clock(),
-            Some(Box::new(|text: &str| Ok(format!("{text}。")))),
+            Some(Box::new(|text: &str| Ok(format!("{text}，。")))),
         )
         .unwrap();
         let _ = session.poll_events().unwrap();
@@ -909,7 +994,7 @@ mod tests {
 
         let final_event = session.push_audio(test_frame(2, 20)).unwrap();
         assert_event_types(&final_event, &["transcript.final"]);
-        assert_transcript_text(&final_event[0], "你好世界。", 2);
+        assert_transcript_text(&final_event[0], "你好世界，", 2);
     }
 
     #[test]
@@ -1018,5 +1103,161 @@ mod tests {
         let final_event = session.push_audio(test_frame(1, 0)).unwrap();
         assert_event_types(&final_event, &["transcript.final"]);
         assert_transcript_text(&final_event[0], "hello world", 1);
+    }
+
+    // -- `strip_soft_boundary_terminal` unit coverage --------------------
+
+    #[test]
+    fn strip_soft_boundary_terminal_removes_only_trailing_mark() {
+        assert_eq!(strip_soft_boundary_terminal("所以今天。"), "所以今天");
+        assert_eq!(strip_soft_boundary_terminal("你确定吗？"), "你确定吗");
+        assert_eq!(strip_soft_boundary_terminal("太好了！"), "太好了");
+    }
+
+    #[test]
+    fn strip_soft_boundary_terminal_keeps_comma_and_no_terminal_text_unchanged() {
+        // A comma is not in the terminal set: nothing to strip.
+        assert_eq!(strip_soft_boundary_terminal("所以今天，"), "所以今天，");
+        // No trailing punctuation at all: unchanged.
+        assert_eq!(strip_soft_boundary_terminal("所以今天"), "所以今天");
+    }
+
+    #[test]
+    fn strip_soft_boundary_terminal_only_strips_the_last_mark() {
+        // An earlier, genuine mid-segment period must survive; only the very
+        // last terminal mark is removed.
+        assert_eq!(
+            strip_soft_boundary_terminal("先前的话。所以今天就只能把他。"),
+            "先前的话。所以今天就只能把他"
+        );
+    }
+
+    #[test]
+    fn strip_soft_boundary_terminal_preserves_trailing_whitespace() {
+        assert_eq!(strip_soft_boundary_terminal("所以今天。 "), "所以今天 ");
+    }
+
+    // -- soft vs. hard boundary integration coverage ---------------------
+
+    /// A mock punctuator that mirrors FireRedPunc's unconditional
+    /// window-closing behavior: it appends a trailing period to whatever text
+    /// it is given, regardless of where the text was actually cut.
+    fn appends_period_punctuator() -> StreamingFinalPunctuator {
+        Box::new(|text: &str| Ok(format!("{text}。")))
+    }
+
+    #[test]
+    fn soft_segment_final_strips_trailing_terminal_but_keeps_mid_segment_punctuation() {
+        // A driver-emitted FINAL reaching the session via `push_audio` is a
+        // mid-utterance segment cut (`emit_segment_final`), not a real
+        // sentence end -- the session must treat it as a soft boundary.
+        let request = request(true);
+        let driver = ScriptDriver::new([ScriptStep::Final {
+            revision: 1,
+            text: "所以，今天就只能把他",
+        }]);
+        let mut session = GgmlAsrStreamingTranscriptSession::new_with_clock_and_punctuator(
+            "script-streaming-executor",
+            &request,
+            driver,
+            test_clock(),
+            Some(appends_period_punctuator()),
+        )
+        .unwrap();
+        let _ = session.poll_events().unwrap();
+
+        let final_event = session.push_audio(test_frame(1, 0)).unwrap();
+        assert_event_types(&final_event, &["transcript.final"]);
+        // The punctuator appended "。"; the soft boundary must strip exactly
+        // that one trailing mark while leaving the mid-segment comma intact.
+        assert_transcript_text(&final_event[0], "所以，今天就只能把他", 1);
+    }
+
+    #[test]
+    fn hard_boundary_finalize_utterance_keeps_terminal_punctuation() {
+        // `finalize_utterance` fires on a real VAD stop: a hard boundary, so
+        // the punctuator's terminal mark is a genuine sentence end and must
+        // survive.
+        let request = request(true);
+        let driver = ScriptDriver::new([
+            ScriptStep::Partial {
+                revision: 1,
+                text: "所以今天就只能把他",
+            },
+            ScriptStep::Final {
+                revision: 2,
+                text: "所以今天就只能把他",
+            },
+        ]);
+        let mut session = GgmlAsrStreamingTranscriptSession::new_with_clock_and_punctuator(
+            "script-streaming-executor",
+            &request,
+            driver,
+            test_clock(),
+            Some(appends_period_punctuator()),
+        )
+        .unwrap();
+        let _ = session.poll_events().unwrap();
+        let _ = session.push_audio(test_frame(1, 0)).unwrap();
+
+        let finalized = session.finalize_utterance().unwrap();
+        assert_event_types(&finalized, &["transcript.final", "audio.input.started"]);
+        assert_transcript_text(&finalized[0], "所以今天就只能把他。", 2);
+    }
+
+    #[test]
+    fn hard_boundary_finish_keeps_terminal_punctuation() {
+        // `finish` ends the session outright: also a hard boundary.
+        let request = request(true);
+        let driver = ScriptDriver::new([ScriptStep::Final {
+            revision: 1,
+            text: "所以今天就只能把他",
+        }]);
+        let mut session = GgmlAsrStreamingTranscriptSession::new_with_clock_and_punctuator(
+            "script-streaming-executor",
+            &request,
+            driver,
+            test_clock(),
+            Some(appends_period_punctuator()),
+        )
+        .unwrap();
+        let _ = session.poll_events().unwrap();
+
+        let finished = session.finish().unwrap();
+        assert_event_types(&finished, &["transcript.final", "audio.input.stopped"]);
+        assert_transcript_text(&finished[0], "所以今天就只能把他。", 1);
+    }
+
+    #[test]
+    fn soft_boundary_split_utterance_strips_trailing_terminal() {
+        // `ScriptDriver` does not override `supports_soft_split`, so
+        // `split_utterance` falls back to the shared finalize body with
+        // `is_hard_boundary = false` -- a forced max-duration cut (the 12s
+        // force-cut / `SplitUtterance`), not a language boundary.
+        let request = request(true);
+        let driver = ScriptDriver::new([
+            ScriptStep::Partial {
+                revision: 1,
+                text: "所以今天就只能把他",
+            },
+            ScriptStep::Final {
+                revision: 2,
+                text: "所以今天就只能把他",
+            },
+        ]);
+        let mut session = GgmlAsrStreamingTranscriptSession::new_with_clock_and_punctuator(
+            "script-streaming-executor",
+            &request,
+            driver,
+            test_clock(),
+            Some(appends_period_punctuator()),
+        )
+        .unwrap();
+        let _ = session.poll_events().unwrap();
+        let _ = session.push_audio(test_frame(1, 0)).unwrap();
+
+        let split = session.split_utterance().unwrap();
+        assert_event_types(&split, &["transcript.final", "audio.input.started"]);
+        assert_transcript_text(&split[0], "所以今天就只能把他", 2);
     }
 }
