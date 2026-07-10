@@ -1,3 +1,4 @@
+mod arena_weight_pipeline;
 mod backend;
 mod cpu_graph;
 mod env_flags;
@@ -10,6 +11,10 @@ mod gguf_write;
 mod package_probe;
 mod runtime_source;
 
+pub(crate) use arena_weight_pipeline::{
+    ArenaAllocError, WeightSlot, alloc_static_f16, alloc_static_f32, bind_loaded,
+    upload_static_f16, upload_static_f32,
+};
 pub(crate) use backend::ensure_backends_loaded;
 pub use backend::{
     GgmlBackend, GgmlBackendDevice, GgmlBackendKind, GgmlCpuFeatures, GgmlDeviceMemory,
