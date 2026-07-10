@@ -1378,6 +1378,11 @@ pub(crate) async fn transcribe_with_runtime(
             )
             .map_err(native_asr_error_to_backend)
             .map_err(TranscriptionRuntimeError::Backend)?;
+            // The decode above only returns `Ok` after the model runtime is
+            // built (or reused) and actually ran, so this is the resident
+            // signal `/health`'s `model_resident` field reads -- see
+            // `idle_activity::native_model_is_resident`.
+            crate::idle_activity::mark_native_model_warm();
             if word_timestamps {
                 add_segment_word_timestamps(&mut transcription);
             }

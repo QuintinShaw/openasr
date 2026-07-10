@@ -50,20 +50,6 @@ async fn speaker_embedder_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
-/// `idle_activity::NATIVE_UNLOAD_GENERATION` is a process-wide counter (it
-/// has to be: a real idle-unload evicts every worker thread's resident
-/// runtime, not just one). Only the two warm-up/generation tests below
-/// mutate it directly (via `bump_native_unload_generation`); this lock keeps
-/// those two from racing each other under `cargo test`'s default test-thread
-/// parallelism, the same way `speaker_embedder_env_lock` above serializes
-/// tests that share process-wide env state.
-async fn native_unload_generation_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
-}
-
 fn test_native_streaming_worker_key(name: &str) -> NativeStreamingWorkerKey {
     NativeStreamingWorkerKey::new(
         PathBuf::from(format!("/test/native-streaming/{name}")),
@@ -1467,7 +1453,7 @@ async fn native_streaming_warm_up_runs_immediately_and_once_per_worker() {
     // running idle-unload-generation test cannot bump the process-wide
     // counter mid-window and make this one flake (see
     // `native_unload_generation_test_lock`'s doc comment).
-    let _generation_lock = native_unload_generation_test_lock().await;
+    let _generation_lock = crate::idle_activity::native_unload_generation_test_lock().await;
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
     let warm_calls = Arc::new(AtomicUsize::new(0));
@@ -1598,7 +1584,7 @@ async fn boot_native_warmup_leaves_the_worker_thread_warm_for_the_next_real_atta
     // `native_streaming_warm_up_runs_immediately_and_once_per_worker`: this
     // spans two attaches expecting one warm-up, so a concurrent generation
     // bump from another test would otherwise flake it.
-    let _generation_lock = native_unload_generation_test_lock().await;
+    let _generation_lock = crate::idle_activity::native_unload_generation_test_lock().await;
     let warm_calls = Arc::new(AtomicUsize::new(0));
     let key = test_native_streaming_worker_key("boot-warmup-reuse");
 
@@ -1651,7 +1637,7 @@ async fn native_streaming_warm_up_stays_once_across_reattach_without_an_idle_unl
     // regress the plain reuse case `boot_native_warmup_leaves_the_worker_\
     // thread_warm_for_the_next_real_attach` already covers for the
     // boot-warmup/real-attach pairing.
-    let _generation_lock = native_unload_generation_test_lock().await;
+    let _generation_lock = crate::idle_activity::native_unload_generation_test_lock().await;
     let warm_calls = Arc::new(AtomicUsize::new(0));
     let key = test_native_streaming_worker_key("warm-once-across-reattach-no-unload");
 
@@ -1725,7 +1711,7 @@ async fn native_streaming_warm_up_rewarms_after_idle_unload_bumps_the_generation
     // between two attaches on the same worker key, and asserts the second
     // attach's `Warm` actually re-runs `warm_up()` instead of reading the
     // stale flag.
-    let _generation_lock = native_unload_generation_test_lock().await;
+    let _generation_lock = crate::idle_activity::native_unload_generation_test_lock().await;
     let warm_calls = Arc::new(AtomicUsize::new(0));
     let key = test_native_streaming_worker_key("rewarm-after-idle-unload-generation-bump");
 
