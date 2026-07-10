@@ -955,42 +955,12 @@ fn install_cli_capability_pack(
     home: &Path,
     source_chain: &[openasr_core::DownloadSource],
 ) -> Result<()> {
-    let mut last_reported = 0_u64;
-    let progress = |event: openasr_core::PullProgress| match event {
-        openasr_core::PullProgress::UsingInstalled { path } => {
-            eprintln!("Already installed: {}", path.display());
-        }
-        openasr_core::PullProgress::DownloadStarted {
-            bytes_total,
-            resume_from,
-        } => {
-            if resume_from > 0 {
-                eprintln!(
-                    "Resuming {} from {resume_from}/{bytes_total} bytes",
-                    resolved.pull
-                );
-            } else {
-                eprintln!("Downloading {} ({bytes_total} bytes)", resolved.pull);
-            }
-        }
-        openasr_core::PullProgress::Downloading {
-            bytes_done,
-            bytes_total,
-        } => {
-            if bytes_done == bytes_total
-                || bytes_done.saturating_sub(last_reported) >= 8 * 1024 * 1024
-            {
-                last_reported = bytes_done;
-                eprintln!("Downloaded {bytes_done}/{bytes_total} bytes");
-            }
-        }
-        openasr_core::PullProgress::Verifying { .. } => {
-            eprintln!("Verifying {}", resolved.pull);
-        }
-        openasr_core::PullProgress::Installed { path } => {
-            eprintln!("Installed {} at {}", resolved.pull, path.display());
-        }
-    };
+    // Reuse the same progress UX as the main `pull` command (indicatif bar on a
+    // TTY, plain periodic lines otherwise) instead of a second, weaker
+    // hand-rolled renderer that never showed a progress bar for
+    // diarization/word-timestamps/punc capability-pack downloads.
+    let mut reporter = crate::progress::PullReporter::new(&resolved.pull);
+    let progress = |event| reporter.on(event);
     openasr_core::PullModelPackRequest::new(resolved, home)
         .sources(source_chain)
         .execute(progress)?;

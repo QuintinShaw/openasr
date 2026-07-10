@@ -140,8 +140,13 @@ pub(crate) async fn run_live(options: LiveCommandOptions<'_>) -> Result<()> {
     if backend == BackendKind::Native && options.model_pack.is_none() {
         crate::pull_cli::ensure_asr_model_installed(options.model, &config, &options.consent)?;
     }
-    let model_pack_path =
-        resolve_live_model_pack(backend, options.model, &config, options.model_pack)?;
+    let model_pack_path = resolve_live_model_pack(
+        backend,
+        options.model,
+        &config,
+        options.model_pack,
+        catalog.as_ref(),
+    )?;
     ensure_cli_diarization_packs_installed(backend, model_pack_path.as_deref(), options.diarize)?;
     ensure_diarization_supported(backend, model_pack_path.as_deref(), options.diarize)?;
     ensure_live_backend_ready(backend, model_pack_path.as_deref())?;
@@ -446,6 +451,7 @@ fn resolve_live_model_pack(
     model: Option<&str>,
     config: &openasr_core::OpenAsrConfig,
     model_pack: Option<&Path>,
+    catalog: Option<&openasr_core::ModelCatalog>,
 ) -> Result<Option<PathBuf>> {
     if backend != BackendKind::Native {
         if model_pack.is_some() {
@@ -463,9 +469,11 @@ fn resolve_live_model_pack(
             Ok(Some(validated))
         }
         // No explicit pack: resolve an installed pack by model id. The consent-pull
-        // in run_live already ensured it is installed; this never pulls.
+        // in run_live already ensured it is installed; this never pulls. Forward
+        // the catalog already loaded by run_live so family:tag aliases (e.g.
+        // `qwen:q8`) resolve the same way here as they do for `transcribe`.
         None => Ok(Some(
-            crate::native_segment_cli::resolve_installed_native_pack(model, config, None)?,
+            crate::native_segment_cli::resolve_installed_native_pack(model, config, catalog)?,
         )),
     }
 }
@@ -2654,6 +2662,107 @@ mod tests {
             .to_string();
         assert!(error.contains("requires --model-pack"));
         assert!(error.contains("fail-closed"));
+    }
+
+    #[test]
+    fn live_model_pack_resolution_matches_transcribe_for_catalog_aliases() {
+        // Regression for the `openasr live` catalog-blindness bug: resolving an
+        // installed pack by a catalog family:tag alias (e.g. `qwen:q8`) must
+        // succeed the same way it does for `transcribe`'s
+        // `resolve_model_source_for_backend`, which forwards the loaded
+        // catalog into `resolve_installed_native_pack`. Before the fix, `live`
+        // hardcoded `None` for the catalog there, so the same alias that
+        // installed cleanly for `transcribe` was reported "not installed" for
+        // `live`.
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("OPENASR_HOME", temp.path()) };
+        let home = openasr_home().unwrap();
+        let config = openasr_core::OpenAsrConfig::default();
+        let catalog = load_cli_model_catalog(&home).unwrap();
+        assert!(
+            catalog.is_some(),
+            "repo-local model-registry/catalog.json must load"
+        );
+
+        // Hand-write an installed-pack record directly (bypassing the real
+        // download/signature-verified install path, which is orthogonal to
+        // this alias-resolution regression): `list_installed_packs` needs
+        // `models/<model_id>/<quant>/installed.json` plus a same-named pack
+        // file on disk that passes `validate_native_runtime_model_pack_contract`,
+        // so the pack payload itself must be a structurally valid (if tiny)
+        // runtime pack -- the registry-facing `model_id` label is independent
+        // of the pack's internal `openasr.*` GGUF metadata, so a generic
+        // one-layer fixture works under the "qwen3-asr-0.6b" registry id.
+        let model_id = "qwen3-asr-0.6b";
+        let quant = "q8_0";
+        let pack_dir = home.join("models").join(model_id).join(quant);
+        fs::create_dir_all(&pack_dir).unwrap();
+        let pack_filename = format!("{model_id}-{quant}.oasr");
+        let pack_path = pack_dir.join(&pack_filename);
+        let fixture_spec =
+            openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(
+                model_id,
+            );
+        openasr_core::testing::write_tiny_gguf_runtime_source(&pack_path, &fixture_spec).unwrap();
+        let installed = openasr_core::InstalledPack {
+            model_id: model_id.to_string(),
+            display_name: "Qwen3-ASR 0.6B".to_string(),
+            quant: quant.to_string(),
+            suffix: "q8".to_string(),
+            pull: format!("{model_id}:{quant}"),
+            filename: pack_filename,
+            path: pack_path.clone(),
+            url: "https://example.invalid/qwen3-asr-0.6b-q8_0.oasr".to_string(),
+            hf_revision: "0".repeat(40),
+            sha256: "0".repeat(64),
+            size_bytes: fs::metadata(&pack_path).unwrap().len(),
+            installed_at_unix_seconds: 0,
+            source: None,
+        };
+        fs::write(
+            pack_dir.join("installed.json"),
+            serde_json::to_string(&installed).unwrap(),
+        )
+        .unwrap();
+
+        // Sanity check: the `qwen:q8` shorthand only resolves through the
+        // catalog (family alias "qwen" -> canonical id "qwen3-asr-0.6b");
+        // catalog-blind resolution must fail to prove the alias genuinely
+        // needs the catalog forwarded.
+        let without_catalog = crate::native_segment_cli::resolve_installed_native_pack(
+            Some("qwen:q8"),
+            &config,
+            None,
+        );
+        assert!(
+            without_catalog.is_err(),
+            "catalog-blind resolution unexpectedly matched the installed pack"
+        );
+
+        let transcribe_source = crate::native_segment_cli::resolve_model_source_for_backend(
+            "transcription",
+            Some("qwen:q8"),
+            BackendKind::Native,
+            None,
+            &config,
+        )
+        .expect("transcribe resolution must resolve the qwen:q8 alias via the catalog");
+        assert_eq!(
+            transcribe_source.model_pack_path,
+            Some(installed.path.clone())
+        );
+
+        let live_pack = resolve_live_model_pack(
+            BackendKind::Native,
+            Some("qwen:q8"),
+            &config,
+            None,
+            catalog.as_ref(),
+        )
+        .expect(
+            "live resolution must resolve the qwen:q8 alias via the catalog, matching transcribe",
+        );
+        assert_eq!(live_pack, Some(installed.path));
     }
 
     fn assert_eventually_file_equals(path: &Path, expected: &str) {
