@@ -1501,12 +1501,12 @@ fn safe_extension_suffix(file_name: &str) -> Option<String> {
         .and_then(std::path::Path::extension)
         .and_then(std::ffi::OsStr::to_str)?
         .to_ascii_lowercase();
-    match extension.as_str() {
-        "wav" | "mp3" | "m4a" | "mp4" | "webm" | "flac" | "ogg" | "qta" => {
-            Some(format!(".{extension}"))
-        }
-        _ => None,
-    }
+    // Single source of truth for the recognized-audio-extension whitelist
+    // (was a second hand-kept copy of the list in `openasr_core::audio::types`,
+    // which could silently drift from it).
+    openasr_core::recognized_audio_extensions()
+        .contains(&extension.as_str())
+        .then(|| format!(".{extension}"))
 }
 
 #[cfg(test)]

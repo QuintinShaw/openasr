@@ -1234,6 +1234,46 @@ fn pull_rejects_size_mismatch_and_removes_partial_metadata() {
 }
 
 #[test]
+fn verify_partial_and_install_removes_stale_segments_meta_on_single_stream_success() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let (target, paths) = write_complete_partial(temp.path(), &resolved, &bytes);
+
+    // Simulate a resume that began as a chunked/parallel download (which
+    // persists `partial_segments_meta_path`) but finished through this
+    // single-stream success path once the remaining bytes dropped below the
+    // parallel-eligibility threshold, leaving a stale segments bitmap behind
+    // that this success path must also clean up (it previously only removed
+    // `partial_meta_path`).
+    let meta = SegmentedPartialMeta {
+        format: PARALLEL_META_FORMAT.to_string(),
+        model_id: target.model_id.clone(),
+        quant: target.quant.clone(),
+        filename: target.filename.clone(),
+        hf_revision: target.hf_revision.clone(),
+        sha256: target.sha256.clone(),
+        size_bytes: target.size_bytes,
+        segment_bytes: bytes.len() as u64,
+        etag: Some("etag-a".to_string()),
+        segments_done: vec![true],
+        updated_at_unix_seconds: 0,
+    };
+    write_partial_segments_meta(&paths.partial_segments_meta_path, &meta).unwrap();
+    assert!(paths.partial_segments_meta_path.exists());
+
+    verify_partial_and_install(&target, &paths, None, &|| false, |_| {}).unwrap();
+
+    assert!(paths.final_path.exists());
+    assert!(!paths.partial_meta_path.exists());
+    assert!(
+        !paths.partial_segments_meta_path.exists(),
+        "single-stream success must also clean up a stale segments bitmap left \
+         over from an earlier chunked/parallel attempt"
+    );
+}
+
+#[test]
 fn download_response_rejects_fresh_content_length_mismatch_before_reading() {
     let bytes = tiny_pack_bytes();
     let resolved = resolved_for(&bytes);
