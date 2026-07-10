@@ -193,16 +193,32 @@ impl GgmlBackendKind {
 /// Register backend plugin DLLs once per process before the first registry
 /// query. Under `GGML_BACKEND_DL` the static `GGML_USE_*` backend registration
 /// is compiled out, so without this the registry is empty and every
-/// init/enumeration call returns nothing; in a statically-linked build (macOS,
-/// GPU-feature builds) it finds no plugin DLLs and is a harmless no-op.
+/// init/enumeration call returns nothing.
+///
+/// In a statically-linked build (macOS, Linux, GPU-feature Windows builds —
+/// `ggml_backend_dl_build_enabled() == false`) the compute backend is already
+/// registered at static-init time, so the directory scan is NOT run: it is not
+/// a harmless no-op. `ggml_backend_load_all` dlopens every `ggml-*.dll`/`.so`
+/// sitting next to the exe, and a desktop bundle can legitimately ship the CPU
+/// `BACKEND_DL` plugin DLLs next to a statically-linked GPU exe (the shell app
+/// needs them for other components). Loading that plugin pulls a second copy
+/// of ggml core into the process, and the two copies' global state collide at
+/// `ggml.cpp:22 GGML_ASSERT(prev != ggml_uncaught_exception)`, which fastfails
+/// the whole process (0xc0000409) rather than returning an error. Skipping the
+/// scan for static builds avoids that mixed-build crash while keeping the
+/// scan for genuine `BACKEND_DL` builds, which have no static backend and
+/// would otherwise register nothing at all.
 /// Idempotent and process-wide.
 pub(crate) fn ensure_backends_loaded() {
     use std::sync::OnceLock;
     static LOADED: OnceLock<()> = OnceLock::new();
     LOADED.get_or_init(|| {
-        // Base-installer plugins next to the exe + GGML_BACKEND_PATH (the CPU
-        // variants on Windows; a no-op on static macOS/Linux).
-        unsafe { ffi::ggml_backend_load_all() };
+        if ggml_backend_dl_build_enabled() {
+            // Base-installer plugins next to the exe + GGML_BACKEND_PATH (the
+            // CPU variants on Windows). Only safe/needed under GGML_BACKEND_DL,
+            // where no backend is statically registered — see the doc comment.
+            unsafe { ffi::ggml_backend_load_all() };
+        }
         // Downloaded GPU packs under OPENASR_HOME/backends/<vendor>/<version>/.
         load_installed_backend_plugins();
     });
@@ -406,6 +422,14 @@ impl GgmlCpuFeatures {
 
 pub fn ggml_native_build_enabled() -> bool {
     option_env!("OPENASR_GGML_NATIVE_ENABLED") == Some("1")
+}
+
+/// Whether this build compiled ggml with `GGML_BACKEND_DL` (build.rs
+/// `use_backend_dl`): the CPU/GPU compute backends are runtime-loaded plugin
+/// DLLs rather than statically linked. See [`ensure_backends_loaded`] for why
+/// this gates the `ggml_backend_load_all` directory scan.
+fn ggml_backend_dl_build_enabled() -> bool {
+    option_env!("OPENASR_GGML_BACKEND_DL_ENABLED") == Some("1")
 }
 
 pub fn ggml_hip_tuning_summary() -> Option<&'static str> {
