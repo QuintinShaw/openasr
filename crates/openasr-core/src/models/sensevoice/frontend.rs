@@ -12,35 +12,42 @@
 //!     -> CMVN normalization  (x + neg_mean) * inv_stddev     [560-dim am.mvn]
 //! ```
 //!
-//! The fbank stage is the same kaldi computation the Dolphin frontend uses
-//! (both derive from `torchaudio.compliance.kaldi.fbank`), differing only in
-//! the window function: SenseVoice's checkpoint pins `window: hamming` where
-//! WeNet/Dolphin uses the Povey default. What is *SenseVoice-specific* and
-//! owned here is the **LFR stacking** and the fact that CMVN is applied to the
-//! LFR-stacked 560-dim feature rather than the raw 80-dim mel. LFR geometry and
-//! the CMVN affine are unit-tested with hand-computed expectations; fbank+LFR
-//! numeric parity is measured against reference FunASR features (see the
-//! onboarding notes for the recorded max-abs-error).
+//! The fbank stage is the shared [`crate::models::kaldi_fbank`] engine, the
+//! same kaldi computation the firered_aed and dolphin (kaldi variant)
+//! frontends use (all derive from `torchaudio.compliance.kaldi.fbank`),
+//! differing only in the window function: SenseVoice's checkpoint pins
+//! `window: hamming` where WeNet/Dolphin uses the Povey default. What is
+//! *SenseVoice-specific* and owned here is the **LFR stacking** and the fact
+//! that CMVN is applied to the LFR-stacked 560-dim feature rather than the raw
+//! 80-dim mel. LFR geometry and the CMVN affine are unit-tested with
+//! hand-computed expectations; fbank+LFR numeric parity is measured against
+//! reference FunASR features (see the onboarding notes for the recorded
+//! max-abs-error).
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
-
-use realfft::{RealFftPlanner, RealToComplex};
+use crate::models::kaldi_fbank::{
+    KaldiFbankConfig, KaldiFbankError, KaldiFbankFrontend, KaldiWindowKind,
+};
 
 /// 16 kHz, 25 ms window / 10 ms shift, 80 mel bins (FunASR `WavFrontend` fbank).
 pub(crate) const SAMPLE_RATE_HZ: u32 = 16_000;
-const FRAME_LENGTH: usize = 400; // 25 ms @ 16 kHz
-const FRAME_SHIFT: usize = 160; // 10 ms @ 16 kHz
-const FFT_SIZE: usize = 512; // next pow2 >= 400 (kaldi rounds the window up)
 pub(crate) const NUM_MEL_BINS: usize = 80;
-const MEL_LOW_HZ: f32 = 20.0;
-const MEL_HIGH_HZ: f32 = 8_000.0; // high_freq <= 0 in kaldi => Nyquist (8 kHz)
-const PREEMPH_COEFF: f32 = 0.97;
-/// float `[-1, 1]` -> int16 magnitude, the domain kaldi fbank operates in.
-const INPUT_SCALE: f32 = 32_768.0;
-/// kaldi/torchaudio mel-energy floor before the log (`torch.finfo(f32).eps`).
-const LOG_ENERGY_FLOOR: f32 = 1.192_092_9e-7;
+
+const FRONTEND_CONFIG: KaldiFbankConfig = KaldiFbankConfig {
+    sample_rate_hz: SAMPLE_RATE_HZ,
+    frame_length: 400, // 25 ms @ 16 kHz
+    frame_shift: 160,  // 10 ms @ 16 kHz
+    fft_size: 512,     // next pow2 >= 400 (kaldi rounds the window up)
+    num_mel_bins: NUM_MEL_BINS,
+    mel_low_hz: 20.0,
+    mel_high_hz: 8_000.0, // high_freq <= 0 in kaldi => Nyquist (8 kHz)
+    preemph_coeff: 0.97,
+    input_scale: 32_768.0, // float [-1, 1] -> int16 magnitude
+    log_energy_floor: 1.192_092_9e-7,
+    // Kaldi Hamming window (the checkpoint's `frontend_conf.window: hamming`).
+    window: KaldiWindowKind::Hamming,
+};
 
 /// LFR (low frame rate) stacking parameters for SenseVoiceSmall: stack `m = 7`
 /// consecutive fbank frames per output frame, advancing by `n = 6` frames.
@@ -71,13 +78,17 @@ pub(crate) enum SenseVoiceFrontendError {
     },
 }
 
-/// Pre-CMVN 80-mel fbank features, row-major `[frame][mel]` (mel innermost).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct SenseVoiceFbankFeatures {
-    pub data: Vec<f32>,
-    pub n_frames: usize,
-    pub n_mels: usize,
+impl From<KaldiFbankError> for SenseVoiceFrontendError {
+    fn from(error: KaldiFbankError) -> Self {
+        match error {
+            KaldiFbankError::UnsupportedAudio => Self::UnsupportedAudio,
+            KaldiFbankError::NoFrames { samples } => Self::NoFrames { samples },
+        }
+    }
 }
+
+/// Pre-CMVN 80-mel fbank features, row-major `[frame][mel]` (mel innermost).
+pub(crate) type SenseVoiceFbankFeatures = crate::models::kaldi_fbank::KaldiFbankFeatures;
 
 /// LFR-stacked features, row-major `[lfr_frame][560]` (stacked mel innermost).
 /// This is the layout the SenseVoice encoder input projection consumes.
@@ -88,22 +99,13 @@ pub(crate) struct SenseVoiceLfrFeatures {
     pub feature_dim: usize,
 }
 
-/// One triangular mel filter as a contiguous weight run over FFT power bins.
-struct MelFilter {
-    first_bin: usize,
-    weights: Vec<f32>,
-}
-
 pub(crate) struct SenseVoiceFbankFrontend {
-    window: [f32; FRAME_LENGTH],
-    filters: Vec<MelFilter>,
-    fft: Arc<dyn RealToComplex<f32>>,
+    inner: KaldiFbankFrontend,
 }
 
 impl std::fmt::Debug for SenseVoiceFbankFrontend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SenseVoiceFbankFrontend")
-            .field("n_mels", &self.filters.len())
             .finish_non_exhaustive()
     }
 }
@@ -116,18 +118,8 @@ impl Default for SenseVoiceFbankFrontend {
 
 impl SenseVoiceFbankFrontend {
     pub(crate) fn new() -> Self {
-        let mut window = [0.0f32; FRAME_LENGTH];
-        for (n, w) in window.iter_mut().enumerate() {
-            // Kaldi Hamming window (the checkpoint's `frontend_conf.window:
-            // hamming`): 0.54 - 0.46 cos(2*pi*n / (N-1)).
-            *w = 0.54
-                - 0.46
-                    * (2.0 * std::f32::consts::PI * n as f32 / (FRAME_LENGTH as f32 - 1.0)).cos();
-        }
         Self {
-            window,
-            filters: build_mel_filters(),
-            fft: RealFftPlanner::<f32>::new().plan_fft_forward(FFT_SIZE),
+            inner: KaldiFbankFrontend::new(FRONTEND_CONFIG),
         }
     }
 
@@ -138,62 +130,7 @@ impl SenseVoiceFbankFrontend {
         &self,
         samples: &[f32],
     ) -> Result<SenseVoiceFbankFeatures, SenseVoiceFrontendError> {
-        if samples.iter().any(|v| !v.is_finite()) {
-            return Err(SenseVoiceFrontendError::UnsupportedAudio);
-        }
-        if samples.len() < FRAME_LENGTH {
-            return Err(SenseVoiceFrontendError::NoFrames {
-                samples: samples.len(),
-            });
-        }
-        let n_frames = 1 + (samples.len() - FRAME_LENGTH) / FRAME_SHIFT;
-        let r2c = &self.fft;
-        let mut fft_in = r2c.make_input_vec();
-        let mut fft_out = r2c.make_output_vec();
-        let mut scratch = r2c.make_scratch_vec();
-        let mut power = vec![0.0f32; FFT_SIZE / 2 + 1];
-
-        let mut feats = vec![0.0f32; n_frames * NUM_MEL_BINS];
-        let mut frame = [0.0f32; FRAME_LENGTH];
-        for fr in 0..n_frames {
-            let start = fr * FRAME_SHIFT;
-            for (dst, src) in frame.iter_mut().zip(&samples[start..start + FRAME_LENGTH]) {
-                *dst = *src * INPUT_SCALE;
-            }
-            // remove_dc_offset: subtract the frame mean.
-            let mean = frame.iter().sum::<f32>() / FRAME_LENGTH as f32;
-            for v in &mut frame {
-                *v -= mean;
-            }
-            // pre-emphasis with replicate padding: x[i] -= 0.97 x[i-1] (i>=1),
-            // x[0] -= 0.97 x[0].
-            for i in (1..FRAME_LENGTH).rev() {
-                frame[i] -= PREEMPH_COEFF * frame[i - 1];
-            }
-            frame[0] -= PREEMPH_COEFF * frame[0];
-            // Hamming window into the zero-padded FFT input.
-            fft_in.fill(0.0);
-            for (slot, (sample, w)) in fft_in.iter_mut().zip(frame.iter().zip(self.window.iter())) {
-                *slot = *sample * *w;
-            }
-            r2c.process_with_scratch(&mut fft_in, &mut fft_out, &mut scratch)
-                .expect("sensevoice fbank rfft");
-            for (bin, value) in fft_out.iter().enumerate() {
-                power[bin] = value.re * value.re + value.im * value.im;
-            }
-            for (bin, filter) in self.filters.iter().enumerate() {
-                let mut energy = 0.0f32;
-                for (j, weight) in filter.weights.iter().enumerate() {
-                    energy += weight * power[filter.first_bin + j];
-                }
-                feats[fr * NUM_MEL_BINS + bin] = energy.max(LOG_ENERGY_FLOOR).ln();
-            }
-        }
-        Ok(SenseVoiceFbankFeatures {
-            data: feats,
-            n_frames,
-            n_mels: NUM_MEL_BINS,
-        })
+        Ok(self.inner.compute(samples)?)
     }
 }
 
@@ -300,51 +237,6 @@ pub(crate) fn apply_cmvn(
         }
     }
     Ok(())
-}
-
-fn mel_scale(freq: f32) -> f32 {
-    1127.0 * (1.0 + freq / 700.0).ln()
-}
-
-/// Kaldi triangular mel filterbank over `FFT_SIZE/2 + 1` power bins: `NUM_MEL_BINS`
-/// filters spanning `[MEL_LOW_HZ, MEL_HIGH_HZ]` on the HTK mel scale, each a peak-
-/// normalized triangle gated to bins strictly inside the filter band.
-fn build_mel_filters() -> Vec<MelFilter> {
-    let n_fft_bins = FFT_SIZE / 2 + 1;
-    let fft_bin_width = SAMPLE_RATE_HZ as f32 / FFT_SIZE as f32;
-    let mel_low = mel_scale(MEL_LOW_HZ);
-    let mel_high = mel_scale(MEL_HIGH_HZ);
-    let mel_delta = (mel_high - mel_low) / (NUM_MEL_BINS as f32 + 1.0);
-
-    let mut filters = Vec::with_capacity(NUM_MEL_BINS);
-    for bin in 0..NUM_MEL_BINS {
-        let left = mel_low + bin as f32 * mel_delta;
-        let center = mel_low + (bin as f32 + 1.0) * mel_delta;
-        let right = mel_low + (bin as f32 + 2.0) * mel_delta;
-        let mut first_bin = None;
-        let mut weights = Vec::new();
-        for k in 0..n_fft_bins {
-            let mel = mel_scale(fft_bin_width * k as f32);
-            if mel > left && mel < right {
-                let weight = if mel <= center {
-                    (mel - left) / (center - left)
-                } else {
-                    (right - mel) / (right - center)
-                };
-                if first_bin.is_none() {
-                    first_bin = Some(k);
-                }
-                weights.push(weight);
-            } else if first_bin.is_some() {
-                break;
-            }
-        }
-        filters.push(MelFilter {
-            first_bin: first_bin.unwrap_or(0),
-            weights,
-        });
-    }
-    filters
 }
 
 #[cfg(test)]
