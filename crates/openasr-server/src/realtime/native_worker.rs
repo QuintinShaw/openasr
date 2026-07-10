@@ -448,27 +448,40 @@ pub(crate) fn run_native_streaming_session_on_worker(
     // live on this worker thread and remain available to the next attachment.
 }
 
-/// Pays the cold runtime-build cost exactly once per worker thread (worker
-/// threads are keyed by backend+pack and persist across sessions). The old
-/// "warm only if idle for 5s" gate skipped warm-up the moment live audio
+/// Pays the cold runtime-build cost exactly once per worker thread *per
+/// resident runtime generation* (worker threads are keyed by backend+pack and
+/// persist across sessions, well past any `idle_unload` eviction of the
+/// runtime they built -- see `idle_activity::native_unload_generation`). The
+/// old "warm only if idle for 5s" gate skipped warm-up the moment live audio
 /// frames queued — which is exactly the case where the cold build then landed
 /// on the first real decode and delayed the first partial by many seconds.
 /// Warm-up is enqueued before any audio, so paying it immediately moves the
-/// cold build ahead of speech; on an already-warm thread it is a no-op.
+/// cold build ahead of speech; on an already-warm thread whose runtime is
+/// still resident it is a no-op.
+///
+/// The gate is keyed by unload generation, not a bare bool: under an opt-in
+/// `idle_unload` policy shorter than the worker thread's own hard-release
+/// threshold, the thread stays alive after its runtime has been evicted. A
+/// bare "warmed once" bool would keep reading true post-eviction and skip
+/// re-warm, silently pushing the cold rebuild back onto the first real decode
+/// of the next attach -- the exact first-frame-latency regression this gate
+/// exists to avoid.
 pub(crate) fn warm_up_native_streaming_session_once(
     session: &mut dyn NativeAsrSession,
 ) -> Result<(), openasr_core::NativeAsrError> {
     thread_local! {
-        static WARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static WARMED_AT_GENERATION: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
     }
-    if WARMED.with(std::cell::Cell::get) {
+    let current_generation = crate::idle_activity::native_unload_generation();
+    if WARMED_AT_GENERATION.with(std::cell::Cell::get) == Some(current_generation) {
         return Ok(());
     }
     openasr_core::stage_timing::log_event("realtime_warmup", "stage=start");
     let warmup_started = Instant::now();
     session.warm_up()?;
     openasr_core::stage_timing::log_stage("realtime_warmup", "complete", warmup_started.elapsed());
-    WARMED.with(|warmed| warmed.set(true));
+    WARMED_AT_GENERATION.with(|warmed| warmed.set(Some(current_generation)));
     Ok(())
 }
 
@@ -492,9 +505,10 @@ pub(crate) fn warm_up_native_streaming_session_once(
 /// worker thread processes one attached session's commands at a time, so a
 /// real attach for the same key that arrives mid-warm-up queues behind this
 /// one instead of racing a second cold build. Whichever attach's `Warm`
-/// actually runs first pays the cost once (see the thread-local `WARMED` gate
-/// in `warm_up_native_streaming_session_once`); every later attach on that
-/// thread reuses the now-warm state.
+/// actually runs first pays the cost once (see the thread-local
+/// `WARMED_AT_GENERATION` gate in `warm_up_native_streaming_session_once`);
+/// every later attach on that thread reuses the now-warm state, until an
+/// `idle_unload` eviction bumps the generation and forces a re-warm.
 pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime) {
     tokio::spawn(async move {
         warm_up_default_native_streaming_worker(runtime).await;

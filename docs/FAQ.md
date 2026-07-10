@@ -100,6 +100,14 @@ installed on demand) to attribute anonymous `SPEAKER_NN` labels onto any model's
 transcript; without the required capability pack the request fails closed rather
 than fabricating speakers.
 
+## Does the server keep the model resident in RAM forever?
+
+No. By default the daemon releases the bound model's resident runtime (mmap,
+tensors, Metal state) after 10 minutes with no active transcription request or
+realtime session; the next request just reloads and re-warms it, paying the
+normal cold-build cost again. Adjust or disable this via the `idle_unload`
+preference (`never`, `now`, `2m`, `10m` (default), `1h`).
+
 ## Is OpenASR public/open source now?
 
 Yes. OpenASR is licensed under Apache-2.0 and maintained as the public open core.
