@@ -119,6 +119,26 @@ impl GgmlBackendDevice {
             .map(|(name, ggml_type)| (*name, self.supports_matmul_for_type(*ggml_type)))
             .collect()
     }
+
+    /// Build a metadata-only device for tests that exercise pure enumeration
+    /// shaping (name/description/kind/memory) without a live ggml backend. The
+    /// `raw` handle is dangling and must never be initialized or probed; only
+    /// the shaping consumers that read the public fields are valid callers.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        name: &str,
+        description: &str,
+        kind: GgmlBackendKind,
+        memory: Option<GgmlDeviceMemory>,
+    ) -> Self {
+        Self {
+            raw: NonNull::dangling(),
+            name: name.to_string(),
+            description: description.to_string(),
+            kind,
+            memory,
+        }
+    }
 }
 
 /// The float + quantized weight types OpenASR materializes as direct-GPU
