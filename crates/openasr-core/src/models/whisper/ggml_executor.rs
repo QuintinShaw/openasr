@@ -37,7 +37,9 @@ use crate::models::incremental_streaming_driver::{
 };
 use crate::models::prepared_runtime_cache::PreparedRuntimeCache;
 use crate::models::runtime_contract::MetadataContractError;
-use crate::models::thread_local_runtime_cache::canonical_runtime_cache_path;
+use crate::models::thread_local_runtime_cache::{
+    UnloadGenerationGated, canonical_runtime_cache_path,
+};
 use crate::models::tokenizer_component_registry::materialize_builtin_tokenizer_for_architecture;
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
@@ -347,12 +349,17 @@ type WhisperEncoderPersistentSessionKey = (PathBuf, GgmlCpuGraphBackend);
 type WhisperDecoderPersistentSessionKey = (PathBuf, GgmlCpuGraphBackend);
 
 thread_local! {
+    // Gated on the idle-unload generation: these sessions pin the resident
+    // encoder/decoder weight caches in the TLS of a reused spawn_blocking
+    // thread, where the idle-unload reaper cannot drop them, so every access
+    // goes through `synced()` and discards pre-unload sessions on the owning
+    // thread instead of reusing them.
     static WHISPER_ENCODER_PERSISTENT_SESSION_BY_KEY:
-        RefCell<HashMap<WhisperEncoderPersistentSessionKey, WhisperEncoderPersistentStaticSession>> =
-            RefCell::new(HashMap::new());
+        RefCell<UnloadGenerationGated<HashMap<WhisperEncoderPersistentSessionKey, WhisperEncoderPersistentStaticSession>>> =
+            RefCell::new(UnloadGenerationGated::new());
     static WHISPER_DECODER_PERSISTENT_SESSION_BY_KEY:
-        RefCell<HashMap<WhisperDecoderPersistentSessionKey, Vec<WhisperDecoderPersistentStaticSession>>> =
-            RefCell::new(HashMap::new());
+        RefCell<UnloadGenerationGated<HashMap<WhisperDecoderPersistentSessionKey, Vec<WhisperDecoderPersistentStaticSession>>>> =
+            RefCell::new(UnloadGenerationGated::new());
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3380,6 +3387,7 @@ fn take_whisper_encoder_persistent_static_session(
     WHISPER_ENCODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
         sessions
             .borrow_mut()
+            .synced()
             .remove(&(canonical_runtime_cache_path(runtime_path), backend))
     })
 }
@@ -3393,7 +3401,7 @@ fn store_whisper_encoder_persistent_static_session(
             canonical_runtime_cache_path(runtime_path),
             session.graph_config.backend,
         );
-        sessions.borrow_mut().insert(key, session);
+        sessions.borrow_mut().synced().insert(key, session);
     });
 }
 
@@ -3568,6 +3576,7 @@ fn take_or_build_whisper_decoder_persistent_static_session(
     );
     WHISPER_DECODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
         let mut sessions = sessions.borrow_mut();
+        let sessions = sessions.synced();
         if let Some(pool) = sessions.get_mut(&key)
             && let Some(index) = pool.iter().position(|session| {
                 decoder_persistent_session_matches_runtime(
@@ -3601,6 +3610,7 @@ fn store_whisper_decoder_persistent_static_session(
 ) {
     WHISPER_DECODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
         let mut sessions = sessions.borrow_mut();
+        let sessions = sessions.synced();
         let key = (
             canonical_runtime_cache_path(runtime_path),
             session.graph_config.backend,

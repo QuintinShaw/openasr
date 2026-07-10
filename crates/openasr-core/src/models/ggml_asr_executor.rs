@@ -333,9 +333,11 @@ pub trait GgmlAsrExecutor: Send + Sync {
     /// (mmap + materialized tensors + Metal/CPU graph context), if it caches
     /// one at all. Called by the daemon's idle-unload reaper (`idle_unload`
     /// preference); the default no-op covers executors whose only caching is
-    /// per-thread and already self-bounded/self-expiring (bounded LRU capacity,
-    /// or a worker thread the realtime idle reaper already recycles), so they
-    /// need no additional eviction here.
+    /// per-thread. Per-thread caches are not reachable from the reaper's
+    /// thread at all -- they are instead invalidated lazily through the
+    /// unload generation (`thread_local_runtime_cache::bump_unload_generation`,
+    /// bumped by `unload_idle_native_model_runtime_caches` after the dispatch
+    /// sweep that calls this method), so they need no eviction here either.
     fn unload_idle_state(&self) {}
 }
 
