@@ -29,12 +29,13 @@ use crate::models::{
     whisper::WHISPER_MODEL_FAMILY,
 };
 
+use crate::models::local_source_import::{
+    SafetensorsFile, SafetensorsHeader, SafetensorsTensorHeader,
+};
+
 use super::ggml_tensor_binding::{WhisperGgufTensorBindingContext, bind_whisper_gguf_tensors};
 use super::local_source::{
-    SafetensorsHeaderV0, SafetensorsTensorHeaderV0, WhisperLocalSourceError,
-    load_safetensors_header_v0,
-    source_io::{read_source_file_bytes, read_source_json_file},
-    validate_error,
+    WhisperLocalSourceError, source_io::read_source_json_file, validate_error,
 };
 use super::tokenizer::{
     TOKENIZER_GGML_EOT_TOKEN_ID_KEY, TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY,
@@ -47,7 +48,6 @@ use super::tokenizer::{
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_MODEL_SAFETENSORS: &str = "model.safetensors";
 const DECODER_TOKEN_EMBEDDING_TENSOR_NAME: &str = "model.decoder.embed_tokens.weight";
-const SAFETENSORS_HEADER_LENGTH_PREFIX_BYTES: u64 = 8;
 const OPENASR_MODEL_ID_KEY: &str = "openasr.model.id";
 const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
 const GGUF_WHISPER_ARCHITECTURE_VALUE: &str = "whisper";
@@ -106,11 +106,14 @@ pub fn convert_local_whisper_hf_source_to_runtime_pack(
         ))
     })?;
 
+    // The `.safetensors` source is read through the shared hardened parser
+    // (header byte cap, duplicate-key rejection, offset-range coverage, and
+    // shape x dtype byte cross-checks), which also memory-maps the payload
+    // instead of reading the whole file into memory.
     let safetensors_source_path = request.source_root.join(SOURCE_MODEL_SAFETENSORS);
-    let model_bytes = read_source_file_bytes(&request.source_root, SOURCE_MODEL_SAFETENSORS)?;
-    let safetensors_header = load_safetensors_header_v0(&safetensors_source_path)?;
-    validate_whisper_tokenizer_contract(&tokenizer, &config, &safetensors_header)?;
-    let tensors = gguf_tensors_from_safetensors(&safetensors_header, &model_bytes, request)?;
+    let safetensors_file = SafetensorsFile::open(&safetensors_source_path)?;
+    validate_whisper_tokenizer_contract(&tokenizer, &config, safetensors_file.header())?;
+    let tensors = gguf_tensors_from_safetensors(&safetensors_file, request)?;
     let model_id = compose_model_id(&request.package_id, request.package_variant.as_deref());
     let metadata = whisper_runtime_gguf_metadata(request, &config, &tokenizer, &model_id);
 
@@ -149,38 +152,24 @@ pub fn convert_local_whisper_hf_source_to_runtime_pack(
 }
 
 fn gguf_tensors_from_safetensors(
-    header: &SafetensorsHeaderV0,
-    model_bytes: &[u8],
+    file: &SafetensorsFile,
     request: &WhisperLocalSourceImportRequest,
 ) -> Result<Vec<GgufWriteTensor>, WhisperLocalSourceError> {
-    if header.tensors.is_empty() {
-        return Err(validate_error(
-            "Whisper local-source GGUF import requires at least one safetensors tensor".to_string(),
-        ));
-    }
-
-    header
+    // `SafetensorsFile::open` already rejected empty tensor lists and
+    // validated every tensor's byte range, so each `tensor_data` call below
+    // is an in-bounds mmap slice of the exact payload the header declared.
+    file.header()
         .tensors
         .iter()
         .map(|tensor| {
-            let range = safetensors_payload_range(
-                &tensor.name,
-                header.header_length_bytes,
-                tensor.data_offsets,
-            )?;
-            let data = model_bytes.get(range).ok_or_else(|| {
-                validate_error(format!(
-                    "Whisper local-source GGUF import tensor '{}' data range is out of bounds",
-                    tensor.name
-                ))
-            })?;
+            let data = file.tensor_data(tensor)?;
             gguf_tensor_from_safetensors_tensor(tensor, data, request.quantization)
         })
         .collect()
 }
 
 fn gguf_tensor_from_safetensors_tensor(
-    tensor: &SafetensorsTensorHeaderV0,
+    tensor: &SafetensorsTensorHeader,
     data: &[u8],
     quantization: WhisperRuntimeQuantizationMode,
 ) -> Result<GgufWriteTensor, WhisperLocalSourceError> {
@@ -206,7 +195,7 @@ fn gguf_tensor_from_safetensors_tensor(
 }
 
 fn quantization_tensor_type_for_whisper_tensor(
-    tensor: &SafetensorsTensorHeaderV0,
+    tensor: &SafetensorsTensorHeader,
     quantization: WhisperRuntimeQuantizationMode,
 ) -> Option<GgufWriteTensorType> {
     if quantization == WhisperRuntimeQuantizationMode::Fp16 {
@@ -225,7 +214,7 @@ fn quantization_tensor_type_for_whisper_tensor(
 }
 
 fn gguf_quantized_tensor_from_safetensors(
-    tensor: &SafetensorsTensorHeaderV0,
+    tensor: &SafetensorsTensorHeader,
     data: &[u8],
     quantization: WhisperRuntimeQuantizationMode,
     tensor_type: GgufWriteTensorType,
@@ -258,7 +247,7 @@ fn gguf_quantized_tensor_from_safetensors(
     })
 }
 
-fn gguf_runtime_tensor_dims_from_source_tensor(tensor: &SafetensorsTensorHeaderV0) -> Vec<u64> {
+fn gguf_runtime_tensor_dims_from_source_tensor(tensor: &SafetensorsTensorHeader) -> Vec<u64> {
     if (is_whisper_encoder_linear_weight(&tensor.name)
         || is_whisper_decoder_linear_weight(&tensor.name))
         && tensor.shape.len() == 2
@@ -338,7 +327,7 @@ fn is_whisper_runtime_f16_weight(name: &str) -> bool {
 }
 
 fn gguf_runtime_f16_tensor_from_safetensors(
-    tensor: &SafetensorsTensorHeaderV0,
+    tensor: &SafetensorsTensorHeader,
     data: &[u8],
 ) -> Result<GgufWriteTensor, WhisperLocalSourceError> {
     let values = match tensor.dtype.as_str() {
@@ -369,7 +358,7 @@ fn gguf_runtime_f16_tensor_from_safetensors(
 }
 
 fn gguf_runtime_decoder_token_embedding_tensor_from_safetensors(
-    tensor: &SafetensorsTensorHeaderV0,
+    tensor: &SafetensorsTensorHeader,
     data: &[u8],
 ) -> Result<GgufWriteTensor, WhisperLocalSourceError> {
     let [vocab_dim, hidden_dim] = tensor.shape.as_slice() else {
@@ -409,7 +398,7 @@ fn gguf_runtime_decoder_token_embedding_tensor_from_safetensors(
 }
 
 fn gguf_runtime_encoder_linear_tensor_from_safetensors(
-    tensor: &SafetensorsTensorHeaderV0,
+    tensor: &SafetensorsTensorHeader,
     data: &[u8],
 ) -> Result<GgufWriteTensor, WhisperLocalSourceError> {
     let [output_dim, input_dim] = tensor.shape.as_slice() else {
@@ -627,54 +616,10 @@ fn f32_to_f16_bits(value: f32) -> u16 {
     half
 }
 
-fn safetensors_payload_range(
-    tensor_name: &str,
-    header_length_bytes: u64,
-    data_offsets: [u64; 2],
-) -> Result<std::ops::Range<usize>, WhisperLocalSourceError> {
-    let data_section_start = SAFETENSORS_HEADER_LENGTH_PREFIX_BYTES
-        .checked_add(header_length_bytes)
-        .ok_or_else(|| {
-            validate_error(format!(
-                "Whisper local-source GGUF import safetensors header offset overflow for tensor '{tensor_name}'"
-            ))
-        })?;
-    let start = data_section_start
-        .checked_add(data_offsets[0])
-        .ok_or_else(|| {
-            validate_error(format!(
-                "Whisper local-source GGUF import safetensors start offset overflow for tensor '{tensor_name}'"
-            ))
-        })?;
-    let end = data_section_start
-        .checked_add(data_offsets[1])
-        .ok_or_else(|| {
-            validate_error(format!(
-                "Whisper local-source GGUF import safetensors end offset overflow for tensor '{tensor_name}'"
-            ))
-        })?;
-    if end < start {
-        return Err(validate_error(format!(
-            "Whisper local-source GGUF import tensor '{tensor_name}' has inverted safetensors data offsets"
-        )));
-    }
-    let start = usize::try_from(start).map_err(|_| {
-        validate_error(format!(
-            "Whisper local-source GGUF import tensor '{tensor_name}' start offset does not fit usize"
-        ))
-    })?;
-    let end = usize::try_from(end).map_err(|_| {
-        validate_error(format!(
-            "Whisper local-source GGUF import tensor '{tensor_name}' end offset does not fit usize"
-        ))
-    })?;
-    Ok(start..end)
-}
-
 fn validate_whisper_tokenizer_contract(
     tokenizer: &WhisperHfTokenizerImport,
     config: &WhisperConfigJson,
-    safetensors_header: &SafetensorsHeaderV0,
+    safetensors_header: &SafetensorsHeader,
 ) -> Result<(), WhisperLocalSourceError> {
     let tokenizer_vocab_size = u32::try_from(tokenizer.vocab_size()).map_err(|_| {
         validate_error(format!(
@@ -1203,7 +1148,7 @@ mod tests {
 
     #[test]
     fn encoder_linear_import_writes_runtime_ready_f16_input_output_layout() {
-        let tensor = SafetensorsTensorHeaderV0 {
+        let tensor = SafetensorsTensorHeader {
             name: "model.encoder.layers.0.fc1.weight".to_string(),
             dtype: "F32".to_string(),
             shape: vec![2, 3],
@@ -1234,7 +1179,7 @@ mod tests {
 
     #[test]
     fn runtime_f16_weight_import_preserves_shape_and_halves_payload() {
-        let tensor = SafetensorsTensorHeaderV0 {
+        let tensor = SafetensorsTensorHeader {
             name: "model.decoder.layers.0.encoder_attn.q_proj.weight".to_string(),
             dtype: "F32".to_string(),
             shape: vec![2, 2],
@@ -1264,7 +1209,7 @@ mod tests {
 
     #[test]
     fn decoder_token_embedding_import_writes_runtime_ready_hidden_vocab_layout() {
-        let tensor = SafetensorsTensorHeaderV0 {
+        let tensor = SafetensorsTensorHeader {
             name: DECODER_TOKEN_EMBEDDING_TENSOR_NAME.to_string(),
             dtype: "F32".to_string(),
             shape: vec![2, 3],
@@ -1294,7 +1239,7 @@ mod tests {
 
     #[test]
     fn quantized_encoder_linear_import_q8_0_writes_q8_payload() {
-        let tensor = SafetensorsTensorHeaderV0 {
+        let tensor = SafetensorsTensorHeader {
             name: "model.encoder.layers.0.fc1.weight".to_string(),
             dtype: "F32".to_string(),
             shape: vec![2, 256],
@@ -1319,7 +1264,7 @@ mod tests {
 
     #[test]
     fn quantized_encoder_linear_import_q4_k_is_smaller_than_q8_0() {
-        let tensor = SafetensorsTensorHeaderV0 {
+        let tensor = SafetensorsTensorHeader {
             name: "model.encoder.layers.0.fc1.weight".to_string(),
             dtype: "F32".to_string(),
             shape: vec![2, 256],
@@ -1351,7 +1296,7 @@ mod tests {
 
     #[test]
     fn quantized_decoder_linear_import_q8_0_writes_q8_payload() {
-        let tensor = SafetensorsTensorHeaderV0 {
+        let tensor = SafetensorsTensorHeader {
             name: "model.decoder.layers.0.encoder_attn.q_proj.weight".to_string(),
             dtype: "F32".to_string(),
             shape: vec![2, 256],
