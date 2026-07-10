@@ -24,7 +24,7 @@ use crate::models::runtime_weight_component_registry::{
 #[derive(Debug, Clone)]
 pub(crate) struct CoherePreparedRuntime {
     pub metadata: CohereTranscribeExecutionMetadata,
-    pub tokenizer: CohereTranscribeTokenizer,
+    pub tokenizer: Arc<CohereTranscribeTokenizer>,
     pub frontend_plan: CohereTranscribeFrontendPlan,
     pub encoder_weights: Arc<CohereTranscribeEncoderWeights>,
     pub decoder_weights: Arc<CohereTranscribeDecoderWeights>,
@@ -122,7 +122,7 @@ pub(crate) fn build_cohere_prepared_runtime_from_components(
     }
     Ok(CoherePreparedRuntime {
         metadata,
-        tokenizer,
+        tokenizer: Arc::new(tokenizer),
         frontend_plan,
         encoder_weights: Arc::new(encoder_weights),
         decoder_weights: Arc::new(decoder_weights),

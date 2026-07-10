@@ -1077,7 +1077,7 @@ fn download_response(
             });
         }
     };
-    if append && !resume_content_range_matches(target, &response, resume_from) {
+    if append && !resume_content_range_matches(target.size_bytes, &response, resume_from) {
         let _ = fs::remove_file(&paths.partial_path);
         let _ = fs::remove_file(&paths.partial_meta_path);
         return Err(PullError::RestartedPartial {
@@ -1150,7 +1150,7 @@ fn download_response(
         }
         let read = reader
             .read(&mut buffer)
-            .map_err(|source| map_download_read_error(target, &paths.partial_path, source))?;
+            .map_err(|source| map_download_read_error(&target.url, &paths.partial_path, source))?;
         if read == 0 {
             break;
         }
@@ -1165,7 +1165,13 @@ fn download_response(
             bytes_done,
             bytes_total: target.size_bytes,
         });
-        low_speed.observe(target, bytes_done, read as u64, options)?;
+        low_speed.observe(
+            &target.url,
+            target.size_bytes,
+            bytes_done,
+            read as u64,
+            options,
+        )?;
         if bytes_done >= next_meta_write {
             write_partial_meta(
                 &paths.partial_meta_path,
@@ -2197,8 +2203,11 @@ struct ParsedContentRange {
     total: Option<u64>,
 }
 
+/// Shared by the model-pack single-stream resume path and the backend-pack
+/// downloader ([`download_backend_file`]): only needs the expected total
+/// size, so it takes that directly rather than a whole `&PullTarget`.
 fn resume_content_range_matches(
-    target: &PullTarget,
+    expected_size_bytes: u64,
     response: &DownloadResponse,
     resume_from: u64,
 ) -> bool {
@@ -2208,14 +2217,14 @@ fn resume_content_range_matches(
     let Some(parsed) = parse_content_range(content_range) else {
         return false;
     };
-    let Some(expected_end) = target.size_bytes.checked_sub(1) else {
+    let Some(expected_end) = expected_size_bytes.checked_sub(1) else {
         return false;
     };
     parsed.start == resume_from
         && parsed.end == expected_end
         && parsed
             .total
-            .map(|total| total == target.size_bytes)
+            .map(|total| total == expected_size_bytes)
             .unwrap_or(true)
 }
 
@@ -2362,14 +2371,18 @@ impl LowSpeedWindow {
         }
     }
 
+    /// Shared by the model-pack and backend-pack downloaders; only needs the
+    /// URL (for the error message) and the expected total size, not a whole
+    /// `&PullTarget`.
     fn observe(
         &mut self,
-        target: &PullTarget,
+        url: &str,
+        size_bytes: u64,
         bytes_done: u64,
         bytes_read: u64,
         options: &PullOptions,
     ) -> Result<(), PullError> {
-        if options.low_speed_min_bytes == 0 || bytes_done >= target.size_bytes {
+        if options.low_speed_min_bytes == 0 || bytes_done >= size_bytes {
             return Ok(());
         }
         self.bytes_read = self.bytes_read.saturating_add(bytes_read);
@@ -2379,7 +2392,7 @@ impl LowSpeedWindow {
         }
         if self.bytes_read < options.low_speed_min_bytes {
             return Err(PullError::Http {
-                url: target.url.clone(),
+                url: url.to_string(),
                 message: format!(
                     "download stalled: received {} bytes in {:.1}s, below the {} byte minimum",
                     self.bytes_read,
@@ -2394,10 +2407,15 @@ impl LowSpeedWindow {
     }
 }
 
-fn map_download_read_error(target: &PullTarget, path: &Path, source: io::Error) -> PullError {
+/// Shared by the model-pack and backend-pack ([`download_backend_file`])
+/// stream-to-file loops: turns the stall-guard's `TimedOut` read error into
+/// the retryable `PullError::Http` variant `is_retryable_download_error`
+/// recognizes, everything else into a plain `Io` error. Takes the URL
+/// directly rather than a whole `&PullTarget` so both callers can share it.
+fn map_download_read_error(url: &str, path: &Path, source: io::Error) -> PullError {
     if source.kind() == io::ErrorKind::TimedOut {
         return PullError::Http {
-            url: target.url.clone(),
+            url: url.to_string(),
             message: format!("download stalled while reading response body: {source}"),
         };
     }
@@ -3272,48 +3290,163 @@ fn install_backend_pack_with_client<C: DownloadClient>(
     Ok(record)
 }
 
+/// Download a single backend-pack file (plugin binary or archive) to `dest`,
+/// streamed to a `.partial` file and sha256-verified before the atomic
+/// rename -- the backend-pack analogue of the model-pack single-stream path
+/// (`download_with_retries` / `download_response`), sharing its retry
+/// backoff, resume, and stall/low-speed detection rather than a second,
+/// weaker re-derivation of that machinery (previously: any dropped
+/// connection failed the whole ~150 MB backend pack permanently). Every
+/// `DownloadClient::open` response already comes back wrapped in
+/// `StallGuardedReader`, so `map_download_read_error` promotes a stalled
+/// read into the retryable `PullError::Http` variant here exactly as it does
+/// for model packs.
+///
+/// Resume spans retries within this one call only (an in-memory
+/// `expected_etag`, not a persisted meta file like the model-pack path
+/// uses): a `.partial` left over from a previous process invocation has no
+/// such provenance and is discarded up front, so only an in-process retry
+/// after a transient failure resumes from a `.partial` offset.
 fn download_backend_file<C: DownloadClient>(
     client: &mut C,
     file: &CatalogBackendFile,
     dest: &Path,
     progress: &mut impl FnMut(PullProgress),
 ) -> Result<(), PullError> {
-    let response = client.open(&file.url, None)?;
-    if response.status != 200 {
-        return Err(PullError::UnexpectedStatus {
-            url: file.url.clone(),
-            status: response.status,
-        });
-    }
-    if let Some(content_length) = response.content_length
-        && content_length != file.size_bytes
-    {
-        return Err(PullError::SizeMismatch {
-            path: dest.to_path_buf(),
-            expected: file.size_bytes,
-            actual: content_length,
-        });
-    }
     let partial = dest.with_extension("partial");
-    let mut hasher = Sha256::new();
-    let mut out = File::create(&partial).map_err(|source| PullError::Io {
-        path: partial.clone(),
-        source,
-    })?;
-    let mut reader = response.reader;
-    let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
-    let mut bytes_done = 0_u64;
+    let _ = fs::remove_file(&partial);
+
+    let mut attempt = 0_usize;
+    let mut expected_etag: Option<String> = None;
     loop {
-        let read = reader.read(&mut buffer).map_err(|source| PullError::Io {
-            path: partial.clone(),
+        match download_backend_file_attempt(
+            client,
+            file,
+            dest,
+            &partial,
+            &mut expected_etag,
+            progress,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < DOWNLOAD_MAX_RETRIES && is_retryable_download_error(&error) => {
+                attempt += 1;
+                std::thread::sleep(retry_backoff(attempt));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn prepare_backend_partial_for_resume(partial: &Path, size_bytes: u64) -> Result<u64, PullError> {
+    if !partial.exists() {
+        return Ok(0);
+    }
+    let partial_len = fs::metadata(partial)
+        .map_err(|source| PullError::Io {
+            path: partial.to_path_buf(),
+            source,
+        })?
+        .len();
+    if partial_len > size_bytes {
+        let _ = fs::remove_file(partial);
+        return Ok(0);
+    }
+    Ok(partial_len)
+}
+
+fn download_backend_file_attempt<C: DownloadClient>(
+    client: &mut C,
+    file: &CatalogBackendFile,
+    dest: &Path,
+    partial: &Path,
+    expected_etag: &mut Option<String>,
+    progress: &mut impl FnMut(PullProgress),
+) -> Result<(), PullError> {
+    let resume_from = prepare_backend_partial_for_resume(partial, file.size_bytes)?;
+    let response = client.open(
+        &file.url,
+        (resume_from > 0).then(|| ByteRange::from_start(resume_from)),
+    )?;
+
+    if resume_from > 0
+        && let (Some(expected), Some(actual)) = (expected_etag.as_deref(), response.etag.as_deref())
+        && expected != actual
+    {
+        let _ = fs::remove_file(partial);
+        return Err(PullError::RestartedPartial {
+            url: file.url.clone(),
+        });
+    }
+    if expected_etag.is_none() {
+        *expected_etag = response.etag.clone();
+    }
+
+    let append = match (resume_from, response.status) {
+        (0, 200 | 206) => false,
+        (_, 206) => true,
+        (_, 200) => false,
+        (_, status) => {
+            return Err(PullError::UnexpectedStatus {
+                url: file.url.clone(),
+                status,
+            });
+        }
+    };
+    if append && !resume_content_range_matches(file.size_bytes, &response, resume_from) {
+        let _ = fs::remove_file(partial);
+        return Err(PullError::RestartedPartial {
+            url: file.url.clone(),
+        });
+    }
+    let actual_resume = if append { resume_from } else { 0 };
+    if resume_from > 0 && !append {
+        let _ = fs::remove_file(partial);
+    }
+    if let Some(content_length) = response.content_length {
+        let expected_body = file.size_bytes.saturating_sub(actual_resume);
+        if content_length != expected_body {
+            let _ = fs::remove_file(partial);
+            return Err(PullError::SizeMismatch {
+                path: dest.to_path_buf(),
+                expected: expected_body,
+                actual: content_length,
+            });
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    if append {
+        hash_existing_partial(partial, &mut hasher)?;
+    }
+    let mut out = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(partial)
+        .map_err(|source| PullError::Io {
+            path: partial.to_path_buf(),
             source,
         })?;
+    let mut reader = response.reader;
+    let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
+    let mut bytes_done = actual_resume;
+    let mut low_speed = LowSpeedWindow::new();
+    let low_speed_options = PullOptions::default();
+    progress(PullProgress::DownloadStarted {
+        bytes_total: file.size_bytes,
+        resume_from: actual_resume,
+    });
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|source| map_download_read_error(&file.url, partial, source))?;
         if read == 0 {
             break;
         }
         out.write_all(&buffer[..read])
             .map_err(|source| PullError::Io {
-                path: partial.clone(),
+                path: partial.to_path_buf(),
                 source,
             })?;
         hasher.update(&buffer[..read]);
@@ -3322,22 +3455,29 @@ fn download_backend_file<C: DownloadClient>(
             bytes_done,
             bytes_total: file.size_bytes,
         });
+        low_speed.observe(
+            &file.url,
+            file.size_bytes,
+            bytes_done,
+            read as u64,
+            &low_speed_options,
+        )?;
     }
     out.sync_all().map_err(|source| PullError::Io {
-        path: partial.clone(),
+        path: partial.to_path_buf(),
         source,
     })?;
     drop(out);
     let actual = format!("{:x}", hasher.finalize());
     if actual != file.sha256 {
-        let _ = fs::remove_file(&partial);
+        let _ = fs::remove_file(partial);
         return Err(PullError::ShaMismatch {
             path: dest.to_path_buf(),
             expected: file.sha256.clone(),
             actual,
         });
     }
-    fs::rename(&partial, dest).map_err(|source| PullError::Io {
+    fs::rename(partial, dest).map_err(|source| PullError::Io {
         path: dest.to_path_buf(),
         source,
     })?;
