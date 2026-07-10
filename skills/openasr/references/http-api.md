@@ -1,6 +1,6 @@
 # OpenASR local HTTP API reference
 
-Verified against `openasr serve` (core 0.1.11). Everything here is local:
+Verified against `openasr serve` (core 0.1.11+). Everything here is local:
 the server never downloads models, never phones home, and fails closed on
 anything it cannot execute.
 
