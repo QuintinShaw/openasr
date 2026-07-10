@@ -7,6 +7,7 @@ use crate::ggml_runtime::{
     GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlStaticTensor,
     GgmlStaticTensorArena,
 };
+use crate::nn::half::f32_to_f16_bits;
 
 use super::frontend::MoonshineWaveformFeatures;
 use super::graph_config::moonshine_encoder_graph_config;
@@ -862,41 +863,6 @@ fn upload_f16(
     arena
         .set_f16_bits_slice(tensor, &bits, name)
         .map_err(|source| MoonshineEncoderError::GraphBuildFailed { step: name, source })
-}
-
-fn f32_to_f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x7f_ffff;
-    if exponent == 0xff {
-        return sign | if mantissa == 0 { 0x7c00 } else { 0x7e00 };
-    }
-    let half_exponent = exponent - 127 + 15;
-    if half_exponent >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if half_exponent <= 0 {
-        if half_exponent < -10 {
-            return sign;
-        }
-        let mantissa_with_hidden = mantissa | 0x0080_0000;
-        let shift = (14 - half_exponent) as u32;
-        let mut half_mantissa = (mantissa_with_hidden >> shift) as u16;
-        let round_bit = 1_u32 << shift.saturating_sub(1);
-        if shift > 0
-            && (mantissa_with_hidden & round_bit) != 0
-            && ((mantissa_with_hidden & (round_bit - 1)) != 0 || (half_mantissa & 1) != 0)
-        {
-            half_mantissa = half_mantissa.wrapping_add(1);
-        }
-        return sign | half_mantissa;
-    }
-    let mut half = sign | ((half_exponent as u16) << 10) | ((mantissa >> 13) as u16);
-    if (mantissa & 0x1000) != 0 {
-        half = half.wrapping_add(1);
-    }
-    half
 }
 
 fn upload_layer(

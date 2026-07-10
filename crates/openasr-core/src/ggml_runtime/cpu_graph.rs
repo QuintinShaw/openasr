@@ -5138,6 +5138,7 @@ mod tests {
     use crate::ggml_runtime::{
         GgufTensorMetadata, GgufWeightTensorElementType, GgufWeightTensorPayload, ffi,
     };
+    use crate::nn::half::f32_to_f16_bits as f32_to_f16_bits_for_test;
 
     use super::{
         GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy,
@@ -5332,34 +5333,6 @@ mod tests {
             size_bytes,
             offset_bytes: 0,
         }
-    }
-
-    /// Round-to-nearest f32 -> f16 bit pattern (test-only; mirrors the cohere
-    /// importer's `f32_to_f16_bits`). Used to stage conv kernels as f16 in the
-    /// grouped-conv unit test.
-    fn f32_to_f16_bits_for_test(value: f32) -> u16 {
-        let bits = value.to_bits();
-        let sign = ((bits >> 16) & 0x8000) as u16;
-        let exponent = ((bits >> 23) & 0xff) as i32;
-        let mantissa = bits & 0x7f_ffff;
-        if exponent == 0xff {
-            return sign | if mantissa == 0 { 0x7c00 } else { 0x7e00 };
-        }
-        let half_exponent = exponent - 127 + 15;
-        if half_exponent >= 0x1f {
-            return sign | 0x7c00;
-        }
-        if half_exponent <= 0 {
-            if half_exponent < -10 {
-                return sign;
-            }
-            let mantissa_with_hidden = mantissa | 0x0080_0000;
-            let shift = (14 - half_exponent) as u32;
-            let half_mantissa = (mantissa_with_hidden >> shift) as u16;
-            return sign | half_mantissa;
-        }
-        let half_mantissa = (mantissa >> 13) as u16;
-        sign | ((half_exponent as u16) << 10) | half_mantissa
     }
 
     fn reference_softmax(scores: &[f32]) -> Vec<f32> {

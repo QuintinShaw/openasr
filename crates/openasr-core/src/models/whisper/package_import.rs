@@ -28,6 +28,7 @@ use crate::models::{
     pack_quant::{PackQuant, classify_quant_tensor},
     whisper::WHISPER_MODEL_FAMILY,
 };
+use crate::nn::half::f32_to_f16_bits;
 
 use crate::models::local_source_import::{
     SafetensorsFile, SafetensorsHeader, SafetensorsTensorHeader,
@@ -583,37 +584,6 @@ fn gguf_tensor_type_from_safetensors_dtype(
             "Whisper local-source GGUF import supports only F32/F16 safetensors tensors this round; tensor '{name}' has dtype '{other}'"
         ))),
     }
-}
-
-fn f32_to_f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x7fffff;
-    if exponent == 255 {
-        return sign | if mantissa == 0 { 0x7c00 } else { 0x7e00 };
-    }
-    let half_exp = exponent - 127 + 15;
-    if half_exp >= 31 {
-        return sign | 0x7c00;
-    }
-    if half_exp <= 0 {
-        if half_exp < -10 {
-            return sign;
-        }
-        let mantissa = mantissa | 0x800000;
-        let shift = 14 - half_exp;
-        let mut half = (mantissa >> shift) as u16;
-        if ((mantissa >> (shift - 1)) & 1) != 0 {
-            half = half.saturating_add(1);
-        }
-        return sign | half;
-    }
-    let mut half = sign | ((half_exp as u16) << 10) | ((mantissa >> 13) as u16);
-    if (mantissa & 0x1000) != 0 {
-        half = half.saturating_add(1);
-    }
-    half
 }
 
 fn validate_whisper_tokenizer_contract(

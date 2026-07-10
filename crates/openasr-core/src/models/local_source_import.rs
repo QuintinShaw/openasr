@@ -7,6 +7,8 @@ use memmap2::Mmap;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::nn::half::f32_to_f16_bits;
+
 #[derive(Debug, Error)]
 pub enum LocalSourceImportError {
     #[error("could not read model source file '{path}': {source}")]
@@ -469,41 +471,6 @@ pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
         sign | ((exponent + 112) << 23) | (mantissa << 13)
     };
     f32::from_bits(out)
-}
-
-pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x7f_ff_ff;
-
-    if exponent == 255 {
-        return sign | if mantissa == 0 { 0x7c00 } else { 0x7e00 };
-    }
-    if exponent <= 112 {
-        if exponent < 103 {
-            return sign;
-        }
-        let shift = (126 - exponent) as u32;
-        let mut subnormal = (mantissa | 0x80_00_00) >> shift;
-        if (subnormal & 0x0000_1000) != 0 {
-            subnormal = subnormal.saturating_add(0x0000_2000);
-        }
-        return sign | ((subnormal >> 13) as u16);
-    }
-    if exponent >= 143 {
-        return sign | 0x7c00;
-    }
-
-    let exp = (exponent - 112) as u16;
-    let mut frac = mantissa;
-    if (frac & 0x0000_1000) != 0 {
-        frac = frac.saturating_add(0x0000_2000);
-        if (frac & 0x0080_0000) != 0 {
-            return sign | ((exp + 1) << 10);
-        }
-    }
-    sign | (exp << 10) | ((frac >> 13) as u16)
 }
 
 pub(crate) fn tensor_element_count(

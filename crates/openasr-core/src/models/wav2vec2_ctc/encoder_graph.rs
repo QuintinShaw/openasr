@@ -16,6 +16,7 @@ use crate::ggml_runtime::{
     GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena,
 };
 use crate::models::wav2vec2_ctc::graph_config::wav2vec2_ctc_encoder_graph_config;
+use crate::nn::half::f32_to_f16_bits;
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 use crate::nn::wav2vec2::{
     GroupedConv1dParams, Wav2Vec2EncoderLayerConfig, Wav2Vec2EncoderLayerWeights, grouped_conv_1d,
@@ -911,30 +912,4 @@ fn layer_weights<'a>(
         final_layer_norm_weight: g(h.final_norm_weight),
         final_layer_norm_bias: g(h.final_norm_bias),
     }
-}
-
-/// Round-to-nearest f32 -> f16 bit pattern (mirrors the cohere importer).
-fn f32_to_f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x7f_ffff;
-    if exponent == 0xff {
-        return sign | if mantissa == 0 { 0x7c00 } else { 0x7e00 };
-    }
-    let half_exponent = exponent - 127 + 15;
-    if half_exponent >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if half_exponent <= 0 {
-        if half_exponent < -10 {
-            return sign;
-        }
-        let mantissa_with_hidden = mantissa | 0x0080_0000;
-        let shift = (14 - half_exponent) as u32;
-        let half_mantissa = (mantissa_with_hidden >> shift) as u16;
-        return sign | half_mantissa;
-    }
-    let half_mantissa = (mantissa >> 13) as u16;
-    sign | ((half_exponent as u16) << 10) | half_mantissa
 }

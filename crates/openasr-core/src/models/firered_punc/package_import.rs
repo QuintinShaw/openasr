@@ -23,13 +23,14 @@ use crate::ggml_runtime::{
 };
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, SafetensorsTensorHeader,
-    decode_safetensors_payload_as_f32, encode_f16_bits_le, f32_to_f16_bits, validate_error,
+    decode_safetensors_payload_as_f32, encode_f16_bits_le, validate_error,
     validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
+use crate::nn::half::f32_to_f16_bits;
 
 use super::config::{
     FIRERED_PUNC_ARCHITECTURE_VALUE, FIRERED_PUNC_ATTENTION_HEAD_COUNT_KEY,

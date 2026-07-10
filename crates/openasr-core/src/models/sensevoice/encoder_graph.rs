@@ -15,8 +15,8 @@ use crate::ggml_runtime::{
     GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor,
     GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena,
 };
-use crate::models::cohere::encoder_graph::f32_to_f16_bits;
 use crate::nn::encoder::{SanMFsmnBlockConfig, SanMFsmnBlockWeights, sanm_fsmn_encoder_layer};
+use crate::nn::half::f32_to_f16_bits;
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 
 use super::encoder_weights::{NamedTensor, SenseVoiceEncoderWeights, SenseVoiceLayerWeights};
