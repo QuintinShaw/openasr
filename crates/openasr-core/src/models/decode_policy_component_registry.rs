@@ -37,6 +37,9 @@ pub(crate) enum BuiltinDecodePolicyExecutionKind {
 pub(crate) enum BuiltinDecodePolicySeq2SeqTextPostprocessKind {
     Identity,
     Qwen3AsrStripControlPrefixV0,
+    /// Trim leading/trailing whitespace around the decoded text (hymt2:
+    /// chat-format completions lead with a space after the assistant marker).
+    TrimWhitespaceV0,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +52,10 @@ pub(crate) enum BuiltinDecodePolicySeq2SeqTraceKind {
 pub(crate) enum BuiltinDecodePolicySeq2SeqStopTokenKind {
     None,
     Qwen3AsrAudioBoundaryV0,
+    /// hymt2 chat-boundary markers (EOT + BOS + role markers) on top of the
+    /// EOS eot token: a decoder-only chat LLM must stop when it starts a new
+    /// turn, not only on EOS.
+    Hymt2ChatBoundaryV0,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +127,15 @@ pub(crate) enum BuiltinDecodePolicyComponentRegistryError {
 /// own joint-decode loop. Those ride dedicated executors and never reach
 /// `resolve_builtin_decode_policy`.
 ///
+/// Hy-MT2 (`models/hymt2`) IS registered here even though it is not an ASR
+/// architecture: it is an auxiliary translation family invoked directly by
+/// the CLI/server (`Hymt2Runtime::translate_clause*` / `decode_prompt_tokens`)
+/// rather than dispatched through the `OpenAsrArchitectureRegistry`, so its
+/// runtime resolves the policy by id (`resolve_builtin_decode_policy`) instead
+/// of by `model_architecture`. Its decode steps ride the fused device top-1
+/// logits head, surfacing tokens through `greedy_token_hint` with no host
+/// logit row (the driver's hint-only step shape).
+///
 /// The `all_seq2seq_greedy_arch_decode_policies_resolve` regression test enforces
 /// that every `*.greedy.seq2seq.*` policy IS registered, so a new seq2seq family
 /// cannot half-connect (constant present, execution descriptor missing).
@@ -186,6 +202,23 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         // structural fix for its long-audio repetition (issue #60).
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
         longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
+        ctc_blank_token_id: None,
+    },
+    BuiltinDecodePolicyComponentDescriptor {
+        // hymt2 is an auxiliary translation family (no arch-registry entry, no
+        // crate-root re-export); its runtime resolves this descriptor directly
+        // by policy id. Source of truth for the id is `crate::arch`.
+        decode_policy_id: crate::arch::HYMT2_DECODE_POLICY_ID,
+        execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
+        seq2seq_text_postprocess_kind:
+            BuiltinDecodePolicySeq2SeqTextPostprocessKind::TrimWhitespaceV0,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::Hymt2ChatBoundaryV0,
+        seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
+        // Longform fields are inert for hymt2: translation decodes one clause
+        // per request and never enters the longform transcription orchestrator.
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Text,
+        longform_profile: BuiltinDecodePolicyLongformProfile::Default,
         ctc_blank_token_id: None,
     },
     BuiltinDecodePolicyComponentDescriptor {
@@ -419,6 +452,25 @@ pub(crate) fn build_builtin_seq2seq_decode_policy_config(
                 token_source.audio_end_token_id(),
             )?,
         ],
+        BuiltinDecodePolicySeq2SeqStopTokenKind::Hymt2ChatBoundaryV0 => {
+            use crate::models::hymt2::tokenizer::{
+                HYMT2_ASSISTANT_TOKEN, HYMT2_BOS_TOKEN, HYMT2_EOT_TOKEN, HYMT2_USER_TOKEN,
+            };
+            let mut stop_token_ids = Vec::with_capacity(4);
+            for marker in [
+                HYMT2_EOT_TOKEN,
+                HYMT2_BOS_TOKEN,
+                HYMT2_USER_TOKEN,
+                HYMT2_ASSISTANT_TOKEN,
+            ] {
+                stop_token_ids.push(require_special_token(
+                    descriptor,
+                    marker,
+                    token_source.token_id_by_content(marker),
+                )?);
+            }
+            stop_token_ids
+        }
     };
 
     let (suppress_first_step_token_ids, suppress_token_ids) =
@@ -546,6 +598,9 @@ pub(crate) fn apply_seq2seq_text_postprocess(
             [seq2seq_transcript_byte_start(kind, decoded)..]
             .trim()
             .to_string(),
+        BuiltinDecodePolicySeq2SeqTextPostprocessKind::TrimWhitespaceV0 => {
+            decoded.trim().to_string()
+        }
     }
 }
 
@@ -558,7 +613,8 @@ pub(crate) fn seq2seq_transcript_byte_start(
     decoded: &str,
 ) -> usize {
     match kind {
-        BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity => 0,
+        BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity
+        | BuiltinDecodePolicySeq2SeqTextPostprocessKind::TrimWhitespaceV0 => 0,
         BuiltinDecodePolicySeq2SeqTextPostprocessKind::Qwen3AsrStripControlPrefixV0 => decoded
             .find(QWEN3_ASR_TEXT_MARKER)
             .map(|index| index + QWEN3_ASR_TEXT_MARKER.len())
@@ -661,6 +717,96 @@ mod tests {
         assert_eq!(
             qwen.seq2seq_text_postprocess_kind,
             BuiltinDecodePolicySeq2SeqTextPostprocessKind::Qwen3AsrStripControlPrefixV0
+        );
+    }
+
+    #[test]
+    fn hymt2_decode_policy_resolves_as_seq2seq_greedy_with_chat_boundary_stops() {
+        // hymt2 has no arch-registry entry (auxiliary translation family), so
+        // the arch-driven completeness test cannot cover it; this pins its
+        // registration and stop-token wiring directly by policy id.
+        let descriptor = resolve_builtin_decode_policy(crate::arch::HYMT2_DECODE_POLICY_ID)
+            .expect("hymt2 decode policy");
+        assert_eq!(
+            descriptor.execution_kind,
+            BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0
+        );
+        assert_eq!(
+            descriptor.seq2seq_text_postprocess_kind,
+            BuiltinDecodePolicySeq2SeqTextPostprocessKind::TrimWhitespaceV0
+        );
+        assert_eq!(
+            descriptor.seq2seq_stop_token_kind,
+            BuiltinDecodePolicySeq2SeqStopTokenKind::Hymt2ChatBoundaryV0
+        );
+
+        use crate::models::hymt2::tokenizer::{
+            HYMT2_ASSISTANT_TOKEN, HYMT2_BOS_TOKEN, HYMT2_EOT_TOKEN, HYMT2_USER_TOKEN,
+        };
+        let token_source = SyntheticTokenSource {
+            audio_end_token_id: None,
+            audio_pad_token_id: None,
+            start_of_transcript_token_id: None,
+            transcribe_token_id: None,
+            no_timestamps_token_id: None,
+            token_ids_by_content: BTreeMap::from([
+                (HYMT2_EOT_TOKEN, 11),
+                (HYMT2_BOS_TOKEN, 12),
+                (HYMT2_USER_TOKEN, 13),
+                (HYMT2_ASSISTANT_TOKEN, 14),
+            ]),
+        };
+        let config = build_builtin_seq2seq_decode_policy_config(
+            descriptor,
+            &BuiltinSeq2SeqDecodePolicyConfigInput {
+                initial_prompt_tokens: vec![1, 2],
+                eot_token_id: 7,
+                vocab_size: 32,
+                max_generated_tokens: 16,
+            },
+            &token_source,
+            None,
+        )
+        .expect("hymt2 config");
+        assert_eq!(config.eot_token_id, 7);
+        assert_eq!(config.stop_token_ids, vec![11, 12, 13, 14]);
+        assert!(config.suppress_token_ids.is_empty());
+        assert!(config.suppress_first_step_token_ids.is_empty());
+
+        // Fail closed when a chat-boundary marker cannot be resolved.
+        let error = build_builtin_seq2seq_decode_policy_config(
+            descriptor,
+            &BuiltinSeq2SeqDecodePolicyConfigInput {
+                initial_prompt_tokens: vec![1],
+                eot_token_id: 7,
+                vocab_size: 32,
+                max_generated_tokens: 16,
+            },
+            &(),
+            None,
+        )
+        .expect_err("missing hymt2 chat markers must fail closed");
+        assert!(matches!(
+            error,
+            BuiltinDecodePolicyComponentRegistryError::MissingRequiredSpecialToken { .. }
+        ));
+    }
+
+    #[test]
+    fn trim_whitespace_postprocess_trims_and_keeps_transcript_start() {
+        assert_eq!(
+            apply_seq2seq_text_postprocess(
+                BuiltinDecodePolicySeq2SeqTextPostprocessKind::TrimWhitespaceV0,
+                " translated clause \n",
+            ),
+            "translated clause"
+        );
+        assert_eq!(
+            seq2seq_transcript_byte_start(
+                BuiltinDecodePolicySeq2SeqTextPostprocessKind::TrimWhitespaceV0,
+                " translated clause",
+            ),
+            0
         );
     }
 
