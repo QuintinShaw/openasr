@@ -48,6 +48,7 @@ use crate::nn::conv::{
     Conv1dParams, ConvActivation, ConvBlockSteps, apply_conv_1d_bias_activation,
 };
 use crate::nn::decoder::{Seq2SeqReusableDecodeGraph, reusable_decode_graph_supported_for_runner};
+use crate::nn::half::f32_to_f16_bits;
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 use crate::{
     GgmlAsrExecutionError, GgmlAsrExecutionOptions, GgmlAsrExecutionRequest,
@@ -2808,50 +2809,6 @@ fn transpose_sequence_hidden_to_hidden_sequence(
         }
     }
     output
-}
-
-fn f32_to_f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x7fffff;
-
-    if exponent == 0xff {
-        if mantissa == 0 {
-            return sign | 0x7c00;
-        }
-        let mut payload = (mantissa >> 13) as u16;
-        if payload == 0 {
-            payload = 1;
-        }
-        return sign | 0x7c00 | payload;
-    }
-
-    let half_exponent = exponent - 127 + 15;
-    if half_exponent >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if half_exponent <= 0 {
-        if half_exponent < -10 {
-            return sign;
-        }
-        let mantissa_with_hidden = mantissa | 0x800000;
-        let shift = (14 - half_exponent) as u32;
-        let mut half_mantissa = (mantissa_with_hidden >> shift) as u16;
-        let round_bit = 1_u32 << (shift - 1);
-        if (mantissa_with_hidden & round_bit) != 0
-            && ((mantissa_with_hidden & (round_bit - 1)) != 0 || (half_mantissa & 1) != 0)
-        {
-            half_mantissa = half_mantissa.wrapping_add(1);
-        }
-        return sign | half_mantissa;
-    }
-
-    let mut half = sign | ((half_exponent as u16) << 10) | ((mantissa >> 13) as u16);
-    if (mantissa & 0x0000_1000) != 0 {
-        half = half.wrapping_add(1);
-    }
-    half
 }
 
 impl WhisperMelFeatureInputProvider for WhisperMelFeatureInputProviderFrontendV0 {
