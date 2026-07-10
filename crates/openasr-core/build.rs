@@ -62,10 +62,16 @@ fn main() {
     // unverified Linux runtime plugin-discovery path (ggml dlopen of the
     // ggml-cpu-<variant>.so set, which `copy_runtime_dlls` does not stage). The
     // host-side registry refactor (init_by_type / ensure_backends_loaded) still
-    // runs on the macOS+Linux static builds — init_by_type(CPU) resolves the
-    // statically-registered backend and load_all is a harmless no-op there — so
-    // the DL and static paths share one code path. GPU-feature builds keep the
-    // static link regardless of OS (migrated to plugins in a later phase).
+    // runs on the macOS+Linux+GPU-feature static builds, but
+    // `ensure_backends_loaded` (ggml_runtime/backend.rs) now skips the
+    // `ggml_backend_load_all` directory scan there and relies on the
+    // statically-registered backend instead: that scan is NOT a harmless no-op
+    // when it finds `ggml-*.dll` plugins sitting next to the exe (e.g. a desktop
+    // bundle that ships the CPU BACKEND_DL variant alongside a statically-linked
+    // GPU exe) — it dlopens a second copy of ggml core into the process and
+    // `ggml.cpp:22 GGML_ASSERT(prev != ggml_uncaught_exception)` fastfails
+    // (0xc0000409). GPU-feature builds keep the static link regardless of OS
+    // (migrated to plugins in a later phase).
     // GGML_CPU_ALL_VARIANTS requires GGML_NATIVE=OFF (CMake FATAL_ERROR otherwise),
     // and a portable base must not bake the build host's ISA anyway.
     let use_backend_dl = is_windows && !feat_cuda && !feat_vulkan && !feat_hip;
@@ -839,6 +845,10 @@ fn main() {
     println!(
         "cargo:rustc-env=OPENASR_GGML_NATIVE_ENABLED={}",
         if ggml_native { "1" } else { "0" }
+    );
+    println!(
+        "cargo:rustc-env=OPENASR_GGML_BACKEND_DL_ENABLED={}",
+        if use_backend_dl { "1" } else { "0" }
     );
     println!(
         "cargo:rustc-env=OPENASR_HIP_TUNING={}",
