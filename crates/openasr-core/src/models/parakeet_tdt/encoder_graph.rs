@@ -8,13 +8,15 @@
 use std::path::Path;
 
 use crate::ggml_runtime::{
-    GGML_TYPE_F32, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor,
+    ArenaAllocError, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor,
     GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena,
+    alloc_static_f16 as arena_alloc_static_f16, alloc_static_f32 as arena_alloc_static_f32,
+    bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
+    upload_static_f32 as arena_upload_static_f32,
 };
 use crate::models::cohere::encoder_graph::{build_relative_positional_encoding, f32_to_f16_bits};
 use crate::models::parakeet_tdt::graph_config::parakeet_tdt_encoder_graph_config;
 
-const GGML_TYPE_F16: i32 = 1;
 use crate::nn::conv::{
     Conv2dParams, ConvActivation, ConvBlockSteps, apply_conv_2d_bias_activation,
     apply_conv_2d_depthwise_bias_activation, reshape_bias_4d,
@@ -88,15 +90,9 @@ fn bind_loaded(
     loaded: Option<&GgmlLoadedWeightContext>,
     name: &str,
 ) -> Result<WeightSlot, ParakeetTdtEncoderError> {
-    match loaded.and_then(|ctx| ctx.tensor(name)) {
-        Some(tensor) => Ok(WeightSlot(tensor)),
-        None => Err(ParakeetTdtEncoderError::Shape {
-            reason: format!(
-                "2-D linear '{name}' could not be bound zero-copy from the runtime pack \
-                 (loaded weight context missing or tensor absent); host payload was dropped"
-            ),
-        }),
-    }
+    arena_bind_loaded(loaded, name)
+        .map(WeightSlot)
+        .map_err(|reason| ParakeetTdtEncoderError::Shape { reason })
 }
 
 fn conv_out_dim(input: usize) -> usize {
@@ -108,23 +104,16 @@ fn alloc_static(
     weight: &NamedTensor,
     step: &'static str,
 ) -> Result<GgmlStaticTensor, ParakeetTdtEncoderError> {
-    let map = |source| ParakeetTdtEncoderError::GraphBuildFailed { step, source };
-    match weight.dims.as_slice() {
-        [] | [_] => arena
-            .new_tensor_1d_f32(weight.values.len(), step)
-            .map_err(map),
-        [ne0, ne1] => arena.new_tensor_2d_f32(*ne0, *ne1, step).map_err(map),
-        [ne0, ne1, ne2] => arena.new_tensor_3d_f32(*ne0, *ne1, *ne2, step).map_err(map),
-        [ne0, ne1, ne2, ne3] => arena
-            .new_tensor_4d_typed(*ne0, *ne1, *ne2, *ne3, GGML_TYPE_F32, step)
-            .map_err(map),
-        _ => Err(ParakeetTdtEncoderError::Shape {
-            reason: format!(
-                "tensor '{}' has unsupported rank {:?}",
-                weight.name, weight.dims
-            ),
-        }),
-    }
+    arena_alloc_static_f32(arena, &weight.dims, weight.values.len(), step, true).map_err(
+        |e| match e {
+            ArenaAllocError::Graph(source) => {
+                ParakeetTdtEncoderError::GraphBuildFailed { step, source }
+            }
+            ArenaAllocError::UnsupportedRank(dims) => ParakeetTdtEncoderError::Shape {
+                reason: format!("tensor '{}' has unsupported rank {:?}", weight.name, dims),
+            },
+        },
+    )
 }
 
 fn upload_static(
@@ -133,8 +122,7 @@ fn upload_static(
     weight: &NamedTensor,
     step: &'static str,
 ) -> Result<(), ParakeetTdtEncoderError> {
-    arena
-        .set_f32_slice(tensor, &weight.values, step)
+    arena_upload_static_f32(arena, tensor, &weight.values, step)
         .map_err(|source| ParakeetTdtEncoderError::GraphBuildFailed { step, source })
 }
 
@@ -143,18 +131,14 @@ fn alloc_static_f16(
     weight: &NamedTensor,
     step: &'static str,
 ) -> Result<GgmlStaticTensor, ParakeetTdtEncoderError> {
-    let map = |source| ParakeetTdtEncoderError::GraphBuildFailed { step, source };
-    match weight.dims.as_slice() {
-        [ne0, ne1, ne2] => arena
-            .new_tensor_3d_typed(*ne0, *ne1, *ne2, GGML_TYPE_F16, step)
-            .map_err(map),
-        [ne0, ne1, ne2, ne3] => arena
-            .new_tensor_4d_typed(*ne0, *ne1, *ne2, *ne3, GGML_TYPE_F16, step)
-            .map_err(map),
-        _ => Err(ParakeetTdtEncoderError::Shape {
-            reason: format!("f16 depthwise '{}' rank {:?}", weight.name, weight.dims),
-        }),
-    }
+    arena_alloc_static_f16(arena, &weight.dims, step, true).map_err(|e| match e {
+        ArenaAllocError::Graph(source) => {
+            ParakeetTdtEncoderError::GraphBuildFailed { step, source }
+        }
+        ArenaAllocError::UnsupportedRank(dims) => ParakeetTdtEncoderError::Shape {
+            reason: format!("f16 depthwise '{}' rank {:?}", weight.name, dims),
+        },
+    })
 }
 
 fn upload_static_f16(
@@ -163,9 +147,7 @@ fn upload_static_f16(
     weight: &NamedTensor,
     step: &'static str,
 ) -> Result<(), ParakeetTdtEncoderError> {
-    let bits: Vec<u16> = weight.values.iter().copied().map(f32_to_f16_bits).collect();
-    arena
-        .set_f16_bits_slice(tensor, &bits, step)
+    arena_upload_static_f16(arena, tensor, &weight.values, step, f32_to_f16_bits)
         .map_err(|source| ParakeetTdtEncoderError::GraphBuildFailed { step, source })
 }
 
