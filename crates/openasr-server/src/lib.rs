@@ -133,6 +133,7 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         .route("/v1/catalog", get(catalog))
         .route("/v1/config", get(get_config).put(put_config))
         .route("/v1/capabilities", get(capabilities))
+        .route("/v1/devices", get(devices))
         .route("/v1/history", get(history_list))
         .route("/v1/history/{id}", get(history_get).delete(history_delete))
         .route("/v1/speakers", get(list_speakers).post(create_speaker))
@@ -1456,6 +1457,23 @@ async fn capabilities(
     }))
 }
 
+/// Read-only compute-device enumeration for the local UI's execution-target
+/// picker. Derives the device list from *this* (the daemon's) ggml runtime, so
+/// a shell built in a different backend shape than the sidecar (e.g. a CPU-only
+/// desktop supervising a Vulkan sidecar on Windows) sees the backends inference
+/// actually runs on instead of its own. Pure hardware facts, no secrets; sits
+/// behind the same local auth layer as `/v1/capabilities`.
+async fn devices() -> Json<DevicesResponse> {
+    let runtime = openasr_core::GgmlRuntimeInfo::detect();
+    let devices = openasr_core::compute_devices_from_runtime(&runtime);
+    let default_execution_target = openasr_core::default_execution_target(&devices);
+    Json(DevicesResponse {
+        object: "devices",
+        default_execution_target,
+        devices,
+    })
+}
+
 pub(crate) fn realtime_capabilities_for_runtime(
     runtime: &ServerRuntime,
 ) -> RealtimeBackendCapabilities {
@@ -1538,6 +1556,16 @@ struct CapabilitiesResponse {
     object: &'static str,
     transcription: TranscriptionBackendCapabilities,
     realtime: RealtimeBackendCapabilities,
+}
+
+#[derive(Serialize)]
+struct DevicesResponse {
+    object: &'static str,
+    /// What the `auto` target resolves to on this daemon (`cpu` or
+    /// `accelerated`), so a client can render the default without re-deriving
+    /// it from the list.
+    default_execution_target: String,
+    devices: Vec<openasr_core::ComputeDevice>,
 }
 
 #[derive(Serialize)]
