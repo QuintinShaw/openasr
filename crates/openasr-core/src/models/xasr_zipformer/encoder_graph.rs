@@ -31,11 +31,30 @@ use crate::ggml_runtime::{
     GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
     GgmlPersistentGraphSession,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
+use std::thread::ThreadId;
 use std::time::Instant;
 
 const XASR_PROFILE_ENV: &str = "OPENASR_XASR_PROFILE";
+
+/// Records the OS thread a set of thread-affine ggml runners was last built on
+/// and reports whether execution has since moved to a different thread.
+///
+/// The streaming runtimes are handed out from a process-global pool
+/// (`XASR_PROCESS_RUNTIME_POOL`) and therefore migrate between decode worker
+/// threads. Their GPU-class (Metal/GPU) backend guards are non-owning
+/// (`free_on_drop=false`) views into the *building* thread's thread-local
+/// backend cache; that cache -- and the backend it owns -- is freed when its
+/// thread exits (a native streaming worker is hard-released after 60s idle).
+/// Reusing such a runner from another thread would dereference a freed backend
+/// and `GGML_ASSERT(device)`-abort the daemon. Returning `true` here tells the
+/// caller to drop those runners so they rebuild against the current thread's
+/// backend. Returns `false` on the first bind (nothing built yet) and while the
+/// thread is unchanged.
+fn thread_moved_since_bind(bound: &Cell<Option<ThreadId>>, current: ThreadId) -> bool {
+    matches!(bound.replace(Some(current)), Some(previous) if previous != current)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum XasrEncoderGraphError {
@@ -154,6 +173,11 @@ pub(crate) struct XasrZipformerEncoderGraph {
     // full-encoder persistent session's prepared (frozen) graph buffer between
     // chunk computes.
     embed_ggml_runner: RefCell<Option<GgmlCpuGraphRunner>>,
+    // The OS thread the ggml runners above were last built on. Their GPU-class
+    // backend guards are non-owning views into that thread's thread-local
+    // backend cache, so when a pooled runtime migrates to another decode worker
+    // thread the runners must be rebuilt before use. See `thread_moved_since_bind`.
+    bound_thread: Cell<Option<ThreadId>>,
 }
 
 impl std::fmt::Debug for XasrZipformerEncoderGraph {
@@ -181,6 +205,7 @@ impl XasrZipformerEncoderGraph {
             full_encoder_reuse: RefCell::new(None),
             ggml_runner: RefCell::new(None),
             embed_ggml_runner: RefCell::new(None),
+            bound_thread: Cell::new(None),
         })
     }
 
@@ -198,6 +223,7 @@ impl XasrZipformerEncoderGraph {
             full_encoder_reuse: RefCell::new(None),
             ggml_runner: RefCell::new(None),
             embed_ggml_runner: RefCell::new(None),
+            bound_thread: Cell::new(None),
         })
     }
 
@@ -215,6 +241,7 @@ impl XasrZipformerEncoderGraph {
             full_encoder_reuse: RefCell::new(None),
             ggml_runner: RefCell::new(None),
             embed_ggml_runner: RefCell::new(None),
+            bound_thread: Cell::new(None),
         })
     }
 
@@ -282,11 +309,31 @@ impl XasrZipformerEncoderGraph {
         self.encode_from_embed_rows(&embed.rows, embed.frames, embed.dim, input.frames)
     }
 
+    /// Drop the thread-affine ggml runners when streaming execution has moved to
+    /// a different OS thread than they were built on, so they rebuild against the
+    /// current thread's backend cache instead of dereferencing the previous
+    /// thread's (possibly already-freed) GPU-class backend. See
+    /// [`thread_moved_since_bind`] for the pooled-runtime migration this guards.
+    ///
+    /// Clears in field-declaration order: `full_encoder_reuse` holds raw backend
+    /// pointers into `ggml_runner`, so it is dropped first. The runners are pure
+    /// graph builders -- per-utterance encoder cache state lives in the caller's
+    /// `XasrEncoderChunkState`, not here -- so a rebuild only re-pays the graph
+    /// warm-up, never loses decode state.
+    fn rebind_ggml_runners_to_current_thread(&self) {
+        if thread_moved_since_bind(&self.bound_thread, std::thread::current().id()) {
+            *self.full_encoder_reuse.borrow_mut() = None;
+            *self.ggml_runner.borrow_mut() = None;
+            *self.embed_ggml_runner.borrow_mut() = None;
+        }
+    }
+
     pub(crate) fn encode_streaming_chunk_from_features(
         &self,
         input: &XasrEncoderFeatureInput,
         state: Option<&XasrEncoderChunkState>,
     ) -> Result<XasrEncoderChunkOutput, XasrEncoderGraphError> {
+        self.rebind_ggml_runners_to_current_thread();
         if self.backend != XasrEncoderGraphBackend::GgmlCpuFullEncoder {
             return Err(XasrEncoderGraphError::Shape {
                 reason: "streaming chunk execution requires GgmlCpuFullEncoder backend".to_string(),
@@ -5245,8 +5292,29 @@ mod tests {
     };
     use crate::models::xasr_zipformer::runtime_contract::parse_xasr_zipformer_execution_metadata;
     use crate::models::xasr_zipformer::weights::{NamedTensor, StoredLinear};
+    use std::cell::Cell;
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn thread_moved_since_bind_reports_only_real_thread_changes() {
+        let bound: Cell<Option<std::thread::ThreadId>> = Cell::new(None);
+        let a = std::thread::current().id();
+        // First bind: nothing has been built yet, so no rebuild is requested.
+        assert!(!thread_moved_since_bind(&bound, a));
+        // Same thread on every later use: reuse the warm runners.
+        assert!(!thread_moved_since_bind(&bound, a));
+        // A pooled runtime migrating to another decode worker thread must force a
+        // rebuild so it never touches the previous thread's (freed) backend.
+        let b = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .expect("spawned thread id");
+        assert_ne!(a, b, "spawned thread must have a distinct id");
+        assert!(thread_moved_since_bind(&bound, b));
+        // Once rebound it stays put until the thread changes again.
+        assert!(!thread_moved_since_bind(&bound, b));
+        assert!(thread_moved_since_bind(&bound, a));
+    }
 
     fn metadata() -> XasrZipformerExecutionMetadata {
         XasrZipformerExecutionMetadata {
