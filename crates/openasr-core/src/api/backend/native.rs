@@ -480,6 +480,14 @@ pub(crate) fn unload_idle_native_streaming_runtime_caches() {
 pub fn unload_idle_native_model_runtime_caches() {
     native_transcribe::unload_idle_native_offline_runtime_caches();
     unload_idle_native_streaming_runtime_caches();
+    // The per-family *thread-local* runtime caches (device-resident decoder /
+    // encoder sessions living in reused spawn_blocking worker TLS) cannot be
+    // dropped from this thread. Bumping the unload generation makes each
+    // owning thread discard its pre-unload runtimes on next use instead of
+    // handing them back out as cache hits -- without it, a worker thread that
+    // tokio keeps alive pins those weights (e.g. the qwen whole-decoder's
+    // device-uploaded LLM layers) across the unload indefinitely.
+    crate::models::thread_local_runtime_cache::bump_unload_generation();
 }
 
 fn native_ggml_streaming_error_to_asr(
@@ -1276,7 +1284,27 @@ mod tests {
         // case, since both use `OnceLock::get()` rather than
         // `get_or_init()`): must not build the dispatch just to unload
         // nothing from it, and must never panic.
+        let _generation_guard =
+            crate::models::thread_local_runtime_cache::unload_generation_test_lock();
         unload_idle_native_model_runtime_caches();
+    }
+
+    #[test]
+    fn unload_idle_native_model_runtime_caches_advances_the_thread_local_unload_generation() {
+        // The thread-local per-family runtime caches (e.g. the qwen
+        // whole-decoder's device-uploaded weights in a spawn_blocking
+        // thread's TLS) are unreachable from the reaper thread; the unload
+        // generation bump is the only signal that makes their owning threads
+        // discard them, so an unload sweep that does not advance it would
+        // silently reintroduce the post-unload residency leak.
+        let _generation_guard =
+            crate::models::thread_local_runtime_cache::unload_generation_test_lock();
+        let before = crate::models::thread_local_runtime_cache::current_unload_generation();
+        unload_idle_native_model_runtime_caches();
+        assert!(
+            crate::models::thread_local_runtime_cache::current_unload_generation() > before,
+            "idle unload must advance the thread-local cache unload generation"
+        );
     }
 
     #[test]

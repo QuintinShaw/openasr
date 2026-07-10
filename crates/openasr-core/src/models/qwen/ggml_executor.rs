@@ -56,7 +56,7 @@ use crate::models::seq2seq_greedy_decode::{
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::thread_local_runtime_cache::{
     BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
-    with_thread_local_cached_mut_by_key,
+    current_unload_generation, take_generation_tagged, with_thread_local_cached_mut_by_key,
 };
 use crate::{
     GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
@@ -88,8 +88,13 @@ thread_local! {
     // (pack path, backend, adapter fingerprint), which does not explode
     // per audio chunk the way a frame-count-keyed cache does -- one entry is
     // built and reused across the whole longform run for a given pack, so
-    // there is no unbounded-growth hazard to bound here.
-    static QWEN_WHOLE_DECODER_BY_KEY: RefCell<HashMap<WholeDecoderCacheKey, Qwen3AsrLlmWholeDecoderGraphExecutor>> =
+    // there is no unbounded-growth hazard to bound here. Entries are tagged
+    // with the idle-unload generation they were built under: this cache holds
+    // the device-uploaded LLM layer weights (hundreds of MB) in the TLS of a
+    // reused spawn_blocking thread, where the idle-unload reaper cannot drop
+    // them, so `take_cached_whole_decoder` discards any decoder built before
+    // the last unload instead of handing it back out.
+    static QWEN_WHOLE_DECODER_BY_KEY: RefCell<HashMap<WholeDecoderCacheKey, (u64, Qwen3AsrLlmWholeDecoderGraphExecutor)>> =
         RefCell::new(HashMap::new());
     static QWEN_AUDIO_ENCODER_BY_KEY: RefCell<BoundedRuntimeCache<AudioEncoderCacheKey, Qwen3AsrAudioEncoderRuntime>> =
         RefCell::new(BoundedRuntimeCache::new());
@@ -97,16 +102,19 @@ thread_local! {
 
 fn take_cached_whole_decoder(
     key: &WholeDecoderCacheKey,
+    unload_generation: u64,
 ) -> Option<Qwen3AsrLlmWholeDecoderGraphExecutor> {
-    QWEN_WHOLE_DECODER_BY_KEY.with(|cache| cache.borrow_mut().remove(key))
+    QWEN_WHOLE_DECODER_BY_KEY
+        .with(|cache| take_generation_tagged(&mut cache.borrow_mut(), key, unload_generation))
 }
 
 fn store_cached_whole_decoder(
     key: WholeDecoderCacheKey,
+    unload_generation: u64,
     decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
 ) {
     QWEN_WHOLE_DECODER_BY_KEY.with(|cache| {
-        cache.borrow_mut().insert(key, decoder);
+        cache.borrow_mut().insert(key, (unload_generation, decoder));
     });
 }
 
@@ -503,7 +511,13 @@ impl Qwen3AsrGgmlExecutor {
             adapter_fingerprint,
         );
         let whole_decoder_started_at = qwen_decode_profile_start();
-        let whole_decoder = match take_cached_whole_decoder(&decoder_cache_key) {
+        // Sampled before the cache take and reused for the store-back below:
+        // if the idle-unload reaper bumps the generation while this decode is
+        // in flight, the decoder goes back tagged with the pre-unload
+        // generation and the *next* take discards it, so an unload can never
+        // be lost to an overlapping decode.
+        let unload_generation = current_unload_generation();
+        let whole_decoder = match take_cached_whole_decoder(&decoder_cache_key, unload_generation) {
             // Resident hit: layer weights already uploaded to the device and the
             // reuse graph already built — skip the per-chunk rebuild + re-upload.
             Some(decoder) => {
@@ -580,7 +594,11 @@ impl Qwen3AsrGgmlExecutor {
         // Return the resident whole-decoder to the cache for the next chunk /
         // execute(); its weights + reuse graph stay valid regardless of outcome.
         let store_decoder_started_at = qwen_decode_profile_start();
-        store_cached_whole_decoder(decoder_cache_key, step_executor.whole_decoder);
+        store_cached_whole_decoder(
+            decoder_cache_key,
+            unload_generation,
+            step_executor.whole_decoder,
+        );
         qwen_decode_profile_log_opt("store_cached_whole_decoder", store_decoder_started_at);
         // Hitting the token budget without EOT degrades to the generated prefix
         // (mirrors cohere/moonshine) rather than failing the call — so a no-EOT
