@@ -2197,6 +2197,140 @@ fn install_backend_pack_rejects_unsafe_version_segment() {
     ));
 }
 
+/// A reader that yields the first `remaining` bytes of `inner` and then
+/// fails with a plain (non-timeout) I/O error, simulating a dropped
+/// connection mid-body -- distinct from `TimedOutReader`'s stall, but the
+/// same "retryable, should resume" class per `is_retryable_download_error`.
+struct DropAfterBytesReader {
+    inner: Cursor<Vec<u8>>,
+    remaining: usize,
+}
+
+impl Read for DropAfterBytesReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "simulated mid-stream connection drop",
+            ));
+        }
+        let cap = buf.len().min(self.remaining);
+        let read = self.inner.read(&mut buf[..cap])?;
+        self.remaining -= read;
+        Ok(read)
+    }
+}
+
+/// First `open()` call drops the connection after `split` bytes; every
+/// subsequent call serves the remainder as a proper Range (206) response,
+/// so a real resume (not a from-scratch restart) is what makes the transfer
+/// finish -- this is what `download_backend_file`'s retry loop must do.
+struct BackendMidStreamDropThenResumeClient {
+    bytes: Vec<u8>,
+    split: usize,
+    attempts: usize,
+    ranges: Vec<Option<u64>>,
+}
+
+impl BackendMidStreamDropThenResumeClient {
+    fn new(bytes: Vec<u8>, split: usize) -> Self {
+        Self {
+            bytes,
+            split,
+            attempts: 0,
+            ranges: Vec::new(),
+        }
+    }
+
+    fn ranges(&self) -> Vec<Option<u64>> {
+        self.ranges.clone()
+    }
+}
+
+impl DownloadClient for BackendMidStreamDropThenResumeClient {
+    fn open(
+        &mut self,
+        _url: &str,
+        range: Option<ByteRange>,
+    ) -> Result<DownloadResponse, PullError> {
+        let range_start = range.map(|range| range.start);
+        self.ranges.push(range_start);
+        self.attempts += 1;
+        if self.attempts == 1 {
+            return Ok(DownloadResponse {
+                status: 200,
+                content_length: Some(self.bytes.len() as u64),
+                content_range: None,
+                etag: Some("etag-test".to_string()),
+                reader: Box::new(DropAfterBytesReader {
+                    inner: Cursor::new(self.bytes.clone()),
+                    remaining: self.split,
+                }),
+            });
+        }
+        let start = range_start.unwrap_or(0) as usize;
+        let total = self.bytes.len() as u64;
+        let body = self.bytes[start..].to_vec();
+        Ok(DownloadResponse {
+            status: if start > 0 { 206 } else { 200 },
+            content_length: Some(body.len() as u64),
+            content_range: if start > 0 {
+                Some(format!("bytes {start}-{}/{total}", total - 1))
+            } else {
+                None
+            },
+            etag: Some("etag-test".to_string()),
+            reader: Box::new(Cursor::new(body)),
+        })
+    }
+}
+
+#[test]
+fn install_backend_pack_retries_stalled_read_and_succeeds() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let mut resolved = hip_pack_resolved(&plugin, &tensile_zip_bytes());
+    resolved.files.truncate(1); // plugin only
+    let mut client = StalledThenSuccessClient::new(plugin.clone(), FirstResponse::Timeout);
+
+    let installed =
+        install_backend_pack_with_client(&resolved, home.path(), &mut client, |_| {}).unwrap();
+
+    let dir = home.path().join("backends").join("hip").join("0.13.1");
+    assert_eq!(installed.dir, dir);
+    assert!(dir.join("ggml-hip.dll").is_file());
+    assert_eq!(fs::read(dir.join("ggml-hip.dll")).unwrap(), plugin);
+}
+
+#[test]
+fn install_backend_pack_resumes_after_mid_stream_drop_and_retries() {
+    let home = tempfile::tempdir().unwrap();
+    // Long enough that a partial prefix is meaningfully smaller than the
+    // whole file (the minimal PE fixture is only 0x44 bytes). Starts with
+    // the ELF magic so `preflight_backend_file` accepts it as a native
+    // library after the (fake) content is written.
+    let mut plugin: Vec<u8> = vec![0x7F, b'E', b'L', b'F'];
+    plugin.extend((0_u32..2000).map(|value| (value % 251) as u8));
+    let mut resolved = hip_pack_resolved(&plugin, &tensile_zip_bytes());
+    resolved.files.truncate(1); // plugin only
+    resolved.files[0].filename = "libbackend.so".to_string();
+    resolved.files[0].sha256 = sha256_hex(&plugin);
+    resolved.files[0].size_bytes = plugin.len() as u64;
+    let mut client = BackendMidStreamDropThenResumeClient::new(plugin.clone(), 700);
+
+    let installed =
+        install_backend_pack_with_client(&resolved, home.path(), &mut client, |_| {}).unwrap();
+
+    let dir = home.path().join("backends").join("hip").join("0.13.1");
+    assert_eq!(installed.dir, dir);
+    assert_eq!(fs::read(dir.join("libbackend.so")).unwrap(), plugin);
+    // Second attempt must have asked for a Range starting at the byte the
+    // dropped connection had already delivered -- a from-scratch restart
+    // would instead show `[None, None]`.
+    assert_eq!(client.ranges(), vec![None, Some(700)]);
+    assert!(!dir.join("libbackend.so.partial").exists());
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_in_use_os_errors_classify_as_model_in_use() {
