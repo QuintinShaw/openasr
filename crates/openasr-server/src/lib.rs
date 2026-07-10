@@ -241,6 +241,12 @@ pub async fn serve_with_launch_options(
     );
     stage_started = Instant::now();
     let listener = TcpListener::bind(addr).await?;
+    // Shadow the requested `addr` (which may be an OS-assigned wildcard like
+    // `:0`) with the listener's actual bound address so everything below --
+    // the "listening on" banners and the stage-timing "ready" event -- reports
+    // the real, connectable port instead of echoing the CLI's `--addr` input
+    // back verbatim.
+    let addr = listener.local_addr()?;
     openasr_core::stage_timing::log_stage(
         "server_boot",
         "tcp_listener_bind",
