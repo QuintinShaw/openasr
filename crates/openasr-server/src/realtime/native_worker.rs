@@ -482,6 +482,10 @@ pub(crate) fn warm_up_native_streaming_session_once(
     session.warm_up()?;
     openasr_core::stage_timing::log_stage("realtime_warmup", "complete", warmup_started.elapsed());
     WARMED_AT_GENERATION.with(|warmed| warmed.set(Some(current_generation)));
+    // Process-wide counterpart of the thread-local gate above, so `/health`
+    // can answer "is the model resident" without reaching into any worker
+    // thread's TLS -- see `idle_activity::native_model_is_resident`.
+    crate::idle_activity::mark_native_model_warm();
     Ok(())
 }
 

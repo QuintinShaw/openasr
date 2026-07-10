@@ -117,7 +117,10 @@ remote-serving flow.
 
 ### Endpoints an agent typically needs
 
-- `GET /health` -- liveness + server identity, unauthenticated.
+- `GET /health` -- liveness + server identity, unauthenticated. Includes
+  `model_installed` (a pack is bound) and `model_resident` (0.1.13+: that
+  pack's runtime is currently loaded in memory, vs. idle-unloaded or not yet
+  loaded this boot).
 - `GET /v1/models` -- installed packs.
 - `POST /v1/audio/transcriptions` -- OpenAI-compatible transcription
   (multipart `file` + `model`; `response_format` of `json`, `text`, `srt`,
