@@ -14,7 +14,7 @@
 
 use std::sync::{
     Mutex, OnceLock,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -65,6 +65,34 @@ static NATIVE_ACTIVITY: OnceLock<NativeActivityTracker> = OnceLock::new();
 
 fn native_activity() -> &'static NativeActivityTracker {
     NATIVE_ACTIVITY.get_or_init(NativeActivityTracker::new)
+}
+
+/// Process-wide count of successful `unload_idle_native_model_runtime_caches`
+/// calls, bumped once per eviction by [`bump_native_unload_generation`]
+/// (currently only [`spawn_idle_unload_reaper`]'s loop). A realtime-streaming
+/// decode worker's OS thread survives an `idle_unload` eviction -- it only
+/// tears down much later, at the separate hard-release threshold -- so its
+/// thread-local "have I warmed this thread" state cannot be a bare bool: that
+/// would keep reading "warmed" after the resident runtime it warmed has
+/// already been evicted, skipping re-warm and pushing the cold rebuild onto
+/// the first real decode of the next attach instead. The warm-up gate in
+/// `native_worker.rs` instead records the generation it warmed at and
+/// re-warms whenever the current generation has moved on.
+static NATIVE_UNLOAD_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Current unload generation. `Relaxed` is sufficient: this is a coarse
+/// "has an unload happened since I last checked" signal, not a coordination
+/// primitive, and it is never combined with a specific unload's Ordering.
+pub(crate) fn native_unload_generation() -> u64 {
+    NATIVE_UNLOAD_GENERATION.load(Ordering::Relaxed)
+}
+
+/// Marks one `unload_idle_native_model_runtime_caches` eviction. Exposed
+/// beyond [`spawn_idle_unload_reaper`]'s own use so tests can simulate an
+/// idle-unload deterministically instead of waiting on the reaper's poll
+/// interval.
+pub(crate) fn bump_native_unload_generation() {
+    NATIVE_UNLOAD_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Marks one native request/session as started. Must be paired with a later
@@ -121,6 +149,7 @@ pub(crate) fn spawn_idle_unload_reaper(idle_for: Duration) {
             tokio::time::sleep(poll_interval).await;
             if native_activity_is_idle_for(Instant::now(), idle_for) {
                 openasr_core::unload_idle_native_model_runtime_caches();
+                bump_native_unload_generation();
             }
         }
     });

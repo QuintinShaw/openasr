@@ -50,6 +50,20 @@ async fn speaker_embedder_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
+/// `idle_activity::NATIVE_UNLOAD_GENERATION` is a process-wide counter (it
+/// has to be: a real idle-unload evicts every worker thread's resident
+/// runtime, not just one). Only the two warm-up/generation tests below
+/// mutate it directly (via `bump_native_unload_generation`); this lock keeps
+/// those two from racing each other under `cargo test`'s default test-thread
+/// parallelism, the same way `speaker_embedder_env_lock` above serializes
+/// tests that share process-wide env state.
+async fn native_unload_generation_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
 fn test_native_streaming_worker_key(name: &str) -> NativeStreamingWorkerKey {
     NativeStreamingWorkerKey::new(
         PathBuf::from(format!("/test/native-streaming/{name}")),
@@ -1448,6 +1462,12 @@ async fn native_streaming_warm_up_does_not_block_audio_ingest() {
 
 #[tokio::test]
 async fn native_streaming_warm_up_runs_immediately_and_once_per_worker() {
+    // Two Warm commands with no idle-unload between them must still collapse
+    // to one real warm-up; take the shared generation lock so a concurrently
+    // running idle-unload-generation test cannot bump the process-wide
+    // counter mid-window and make this one flake (see
+    // `native_unload_generation_test_lock`'s doc comment).
+    let _generation_lock = native_unload_generation_test_lock().await;
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
     let warm_calls = Arc::new(AtomicUsize::new(0));
@@ -1570,8 +1590,15 @@ async fn health_answers_immediately_while_boot_warmup_is_artificially_slow() {
 async fn boot_native_warmup_leaves_the_worker_thread_warm_for_the_next_real_attach() {
     // Confirms warm-up dedup: a boot warm-up and a subsequent
     // real WS attach on the SAME worker key share the one thread-local
-    // `WARMED` gate (`warm_up_native_streaming_session_once`) -- the real
-    // session's own `Warm` command must be a no-op, not a second cold build.
+    // `WARMED_AT_GENERATION` gate (`warm_up_native_streaming_session_once`)
+    // -- the real session's own `Warm` command must be a no-op, not a second
+    // cold build, as long as no idle-unload has happened in between (see
+    // `native_streaming_warm_up_rewarms_after_idle_unload_bumps_the_generation`
+    // for that case). Takes the shared generation lock for the same reason as
+    // `native_streaming_warm_up_runs_immediately_and_once_per_worker`: this
+    // spans two attaches expecting one warm-up, so a concurrent generation
+    // bump from another test would otherwise flake it.
+    let _generation_lock = native_unload_generation_test_lock().await;
     let warm_calls = Arc::new(AtomicUsize::new(0));
     let key = test_native_streaming_worker_key("boot-warmup-reuse");
 
@@ -1614,6 +1641,156 @@ async fn boot_native_warmup_leaves_the_worker_thread_warm_for_the_next_real_atta
          worker thread -- warm_up() must not run a second time"
     );
     real_session.finish("client_closed", true).await.unwrap();
+}
+
+#[tokio::test]
+async fn native_streaming_warm_up_stays_once_across_reattach_without_an_idle_unload() {
+    // Companion to the generation-bump regression test below: two separate
+    // attaches on the SAME worker key, with no idle-unload in between, must
+    // still share the one warm-up -- the generation-keyed gate must not
+    // regress the plain reuse case `boot_native_warmup_leaves_the_worker_\
+    // thread_warm_for_the_next_real_attach` already covers for the
+    // boot-warmup/real-attach pairing.
+    let _generation_lock = native_unload_generation_test_lock().await;
+    let warm_calls = Arc::new(AtomicUsize::new(0));
+    let key = test_native_streaming_worker_key("warm-once-across-reattach-no-unload");
+
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut first_session =
+        WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    first_session
+        .attach_native_streaming_session(
+            key.clone(),
+            Box::new(SlowWarmNativeSession {
+                inner: TestServerNativeSession::new(first_session.session_id.0.clone()),
+                warm_sleep: Duration::from_millis(1),
+                warm_calls: Arc::clone(&warm_calls),
+            }),
+        )
+        .await
+        .unwrap();
+    first_session
+        .send_native_streaming_command(NativeStreamingCommand::Warm)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    first_session
+        .drain_native_streaming_outcomes()
+        .await
+        .unwrap();
+    assert_eq!(warm_calls.load(Ordering::Acquire), 1);
+    first_session.finish("client_closed", true).await.unwrap();
+
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut second_session =
+        WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    second_session
+        .attach_native_streaming_session(
+            key,
+            Box::new(SlowWarmNativeSession {
+                inner: TestServerNativeSession::new(second_session.session_id.0.clone()),
+                warm_sleep: Duration::from_millis(1),
+                warm_calls: Arc::clone(&warm_calls),
+            }),
+        )
+        .await
+        .unwrap();
+    second_session
+        .send_native_streaming_command(NativeStreamingCommand::Warm)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    second_session
+        .drain_native_streaming_outcomes()
+        .await
+        .unwrap();
+    assert_eq!(
+        warm_calls.load(Ordering::Acquire),
+        1,
+        "no idle-unload happened between the two attaches, so the second \
+         attach's Warm must still be a no-op on the reused worker thread"
+    );
+    second_session.finish("client_closed", true).await.unwrap();
+}
+
+#[tokio::test]
+async fn native_streaming_warm_up_rewarms_after_idle_unload_bumps_the_generation() {
+    // Regression test for the WARMED/idle-unload race: an opt-in
+    // `idle_unload` policy can evict the resident runtime well before the
+    // decode worker OS thread's own (much longer) hard-release threshold, so
+    // the worker thread stays alive with a stale "already warmed" bit while
+    // the runtime it warmed is gone. Simulates that by bumping the process-
+    // wide unload generation directly (what the real `idle_unload` reaper
+    // does right after calling `unload_idle_native_model_runtime_caches`)
+    // between two attaches on the same worker key, and asserts the second
+    // attach's `Warm` actually re-runs `warm_up()` instead of reading the
+    // stale flag.
+    let _generation_lock = native_unload_generation_test_lock().await;
+    let warm_calls = Arc::new(AtomicUsize::new(0));
+    let key = test_native_streaming_worker_key("rewarm-after-idle-unload-generation-bump");
+
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut first_session =
+        WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    first_session
+        .attach_native_streaming_session(
+            key.clone(),
+            Box::new(SlowWarmNativeSession {
+                inner: TestServerNativeSession::new(first_session.session_id.0.clone()),
+                warm_sleep: Duration::from_millis(1),
+                warm_calls: Arc::clone(&warm_calls),
+            }),
+        )
+        .await
+        .unwrap();
+    first_session
+        .send_native_streaming_command(NativeStreamingCommand::Warm)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    first_session
+        .drain_native_streaming_outcomes()
+        .await
+        .unwrap();
+    assert_eq!(warm_calls.load(Ordering::Acquire), 1);
+    first_session.finish("client_closed", true).await.unwrap();
+
+    // Simulate an `idle_unload` firing between the two attaches: the worker
+    // OS thread for `key` is still alive (attach/detach never tears it
+    // down on its own), but the resident runtime it warmed is now gone.
+    crate::idle_activity::bump_native_unload_generation();
+
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut second_session =
+        WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    second_session
+        .attach_native_streaming_session(
+            key,
+            Box::new(SlowWarmNativeSession {
+                inner: TestServerNativeSession::new(second_session.session_id.0.clone()),
+                warm_sleep: Duration::from_millis(1),
+                warm_calls: Arc::clone(&warm_calls),
+            }),
+        )
+        .await
+        .unwrap();
+    second_session
+        .send_native_streaming_command(NativeStreamingCommand::Warm)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    second_session
+        .drain_native_streaming_outcomes()
+        .await
+        .unwrap();
+    assert_eq!(
+        warm_calls.load(Ordering::Acquire),
+        2,
+        "a generation bump between attaches must force a real re-warm, not \
+         reuse a stale thread-local WARMED_AT_GENERATION flag from before \
+         the idle-unload evicted the resident runtime"
+    );
+    second_session.finish("client_closed", true).await.unwrap();
 }
 
 #[tokio::test]
