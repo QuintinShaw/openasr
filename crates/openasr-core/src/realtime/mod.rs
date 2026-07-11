@@ -6,6 +6,8 @@ pub mod history;
 pub mod session;
 pub mod transcript;
 pub mod vad;
+#[cfg(test)]
+mod wire_bindings_test;
 
 pub use audio::{
     DEFAULT_REALTIME_CHANNELS, DEFAULT_REALTIME_SAMPLE_RATE_HZ, RealtimeAudioEncoding,

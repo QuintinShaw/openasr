@@ -5,7 +5,13 @@ pub const DEFAULT_REALTIME_SAMPLE_RATE_HZ: u32 = 16_000;
 pub const DEFAULT_REALTIME_CHANNELS: u16 = 1;
 const SUPPORTED_FRAME_DURATIONS_MS: &[u32] = &[10, 20, 30];
 
+// TS export for the realtime wire contract: gated to `cfg(test)` so ts-rs is
+// a dev-only dependency, never part of the shipped rlib. See
+// crates/openasr-core/tests/realtime_wire_bindings.rs for the golden
+// "regenerate == committed" guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub enum RealtimeAudioEncoding {
     #[serde(rename = "pcm_s16le")]
     PcmS16Le,
@@ -20,6 +26,8 @@ impl RealtimeAudioEncoding {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct RealtimeAudioFormat {
     pub encoding: RealtimeAudioEncoding,
     pub sample_rate_hz: u32,

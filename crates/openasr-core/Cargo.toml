@@ -70,3 +70,14 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# TS binding codegen for the realtime WebSocket wire types (crate::realtime).
+# Dev-only: the derive is gated behind `#[cfg_attr(test, derive(ts_rs::TS))]`
+# on the wire structs, so this never becomes part of the shipped rlib -- it
+# only participates in `cargo test` builds, where the golden regen test lives.
+# `no-serde-warnings`: our `#[serde(transparent)]` newtype ids (RealtimeSessionId
+# et al.) hit a ts-rs diagnostic ("failed to parse serde attribute: transparent")
+# even though ts-rs's own newtype-unwrap convention already produces the
+# correct `export type X = string` output for them regardless of the
+# attribute; the warning is pure proc-macro noise and would otherwise trip
+# `cargo clippy --all-targets -- -D warnings`.
+ts-rs = { version = "12.0.1", features = ["no-serde-warnings"] }

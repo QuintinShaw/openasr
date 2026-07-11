@@ -125,7 +125,14 @@ impl FromStr for BackendKind {
 
 use crate::{LongFormOptions, PhraseBiasConfig};
 
+// TS export for the realtime wire contract (crate::realtime pulls this type
+// in through RealtimeBackendCapabilities): gated to `cfg(test)` so ts-rs is a
+// dev-only dependency, never part of the shipped rlib. See
+// crates/openasr-core/tests/realtime_wire_bindings.rs for the golden
+// "regenerate == committed" guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 #[serde(rename_all = "snake_case")]
 pub enum BackendCapabilityBehavior {
     Supported,
@@ -134,6 +141,8 @@ pub enum BackendCapabilityBehavior {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct BackendFeatureCapability {
     pub supported: bool,
     pub behavior: BackendCapabilityBehavior,
