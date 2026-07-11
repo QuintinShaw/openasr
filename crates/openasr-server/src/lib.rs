@@ -62,10 +62,11 @@ use openasr_core::{
     resolve_installed_pack_reference, resolve_installed_pack_reference_with_catalog,
     resolve_launch_pack, runtime_registry, save_default_model_selection,
 };
-use rcgen::generate_simple_self_signed;
+use rcgen::{Certificate, CertificateParams};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Semaphore, watch},
@@ -290,7 +291,10 @@ pub async fn serve_with_launch_options(
         }
         ServerTlsConfig::SelfSigned { subject_alt_names } => {
             stage_started = Instant::now();
-            let identity = self_signed_tls_identity(subject_alt_names)?;
+            let identity = load_or_generate_self_signed_tls_identity(
+                subject_alt_names,
+                launch_options.tls_identity_store.as_deref(),
+            )?;
             openasr_core::stage_timing::log_stage(
                 "server_boot",
                 "tls_self_signed_identity",
@@ -328,6 +332,18 @@ pub async fn serve_with_launch_options(
     Ok(())
 }
 
+/// Validity window for a freshly generated self-signed TLS identity: long
+/// enough that "expired, regenerate" is a rare, load-bearing rotation rather
+/// than something routine daemon restarts would ever hit, short enough to
+/// still be a believable server certificate lifetime (this mirrors the
+/// ~397-day cap modern browsers/CAs enforce for publicly-trusted TLS server
+/// certs -- nothing here is publicly trusted, but there is no reason to mint
+/// something longer-lived).
+const TLS_IDENTITY_VALIDITY_DAYS: i64 = 397;
+/// Backdate `not_before` by this much so a client whose clock runs slightly
+/// behind the server's still sees an already-valid certificate.
+const TLS_IDENTITY_CLOCK_SKEW_BACKDATE_HOURS: i64 = 24;
+
 #[derive(Clone)]
 struct TlsIdentity {
     acceptor: TlsAcceptor,
@@ -337,12 +353,67 @@ struct TlsIdentity {
     certificate_der: CertificateDer<'static>,
 }
 
+/// On-disk shape of a persisted self-signed TLS identity: the private key +
+/// certificate DER, plus the metadata needed to decide whether it is still
+/// usable without re-parsing X.509 fields. Stored as plain JSON like
+/// `pairing-registry.json`; the private key field is the sensitive one,
+/// which is why `persist_tls_identity` writes the file with owner-only
+/// (0600) permissions, matching the pairing store and API key store's
+/// convention for secret-bearing files under OPENASR_HOME.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedTlsIdentity {
+    subject_alt_names: Vec<String>,
+    certificate_der: Vec<u8>,
+    private_key_der: Vec<u8>,
+    not_before_unix_secs: u64,
+    not_after_unix_secs: u64,
+}
+
+/// Generates a brand new self-signed identity for `subject_alt_names` with no
+/// persistence -- every call mints a fresh keypair+certificate. Used directly
+/// by tests that want an ephemeral identity, and as the fallback inside
+/// `load_or_generate_self_signed_tls_identity` when no store path is given.
 fn self_signed_tls_identity(subject_alt_names: &[String]) -> anyhow::Result<TlsIdentity> {
-    let certified = generate_simple_self_signed(subject_alt_names.to_vec())?;
-    let certificate_der = CertificateDer::from(certified.serialize_der()?);
-    let private_key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(
-        certified.serialize_private_key_der(),
-    ));
+    let (certificate_der, private_key_der, ..) =
+        generate_self_signed_tls_material(subject_alt_names)?;
+    tls_identity_from_der(certificate_der, private_key_der)
+}
+
+/// Generates a new self-signed keypair + certificate for `subject_alt_names`.
+/// Returns the raw DER encodings (so callers can persist them) alongside the
+/// validity window's Unix-epoch bounds (so callers can record expiry without
+/// re-parsing the certificate's X.509 fields later).
+fn generate_self_signed_tls_material(
+    subject_alt_names: &[String],
+) -> anyhow::Result<(Vec<u8>, Vec<u8>, u64, u64)> {
+    let mut params = CertificateParams::new(subject_alt_names.to_vec());
+    let now = OffsetDateTime::now_utc();
+    let not_before = now - time::Duration::hours(TLS_IDENTITY_CLOCK_SKEW_BACKDATE_HOURS);
+    let not_after = now + time::Duration::days(TLS_IDENTITY_VALIDITY_DAYS);
+    params.not_before = not_before;
+    params.not_after = not_after;
+    let certified = Certificate::from_params(params)?;
+    let certificate_der = certified.serialize_der()?;
+    let private_key_der = certified.serialize_private_key_der();
+    Ok((
+        certificate_der,
+        private_key_der,
+        not_before.unix_timestamp() as u64,
+        not_after.unix_timestamp() as u64,
+    ))
+}
+
+/// Builds a `TlsIdentity` (fingerprint, pairing safety code, rustls acceptor)
+/// from raw DER bytes, whether they were just generated or loaded back from
+/// `persist_tls_identity`'s store file. The single place that turns key
+/// material into a live rustls `ServerConfig`, so a persisted identity and a
+/// freshly generated one are wired up identically.
+fn tls_identity_from_der(
+    certificate_der: Vec<u8>,
+    private_key_der: Vec<u8>,
+) -> anyhow::Result<TlsIdentity> {
+    let certificate_der = CertificateDer::from(certificate_der);
+    let private_key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(private_key_der));
     let certificate_sha256 = certificate_fingerprint_sha256(certificate_der.as_ref());
     let config = rustls::ServerConfig::builder_with_provider(
         rustls::crypto::ring::default_provider().into(),
@@ -357,6 +428,157 @@ fn self_signed_tls_identity(subject_alt_names: &[String]) -> anyhow::Result<TlsI
         #[cfg(test)]
         certificate_der,
     })
+}
+
+/// Loads a persisted self-signed TLS identity from `store_path` (if given)
+/// and reuses it when it is readable, was issued for the same
+/// `subject_alt_names`, and has not expired -- otherwise generates a fresh
+/// identity and persists it to `store_path` for next time. `store_path: None`
+/// keeps the previous always-generate-in-memory behavior (used by tests and
+/// any caller with no durable home to persist under).
+///
+/// This is what keeps a paired remote client's TOFU-pinned certificate
+/// fingerprint (and the human-readable pairing safety code derived from it,
+/// see `pairing_safety_code_for_certificate_fingerprint`) stable across the
+/// daemon restarts the desktop app performs on every model switch: before
+/// this, `serve_with_launch_options` minted a brand new keypair+certificate
+/// on *every* start, so every restart rotated the identity out from under
+/// already-paired clients and forced them to re-pair.
+///
+/// Fail-closed on a damaged store: a present-but-corrupt or
+/// permission-denied file is never silently treated as "no identity yet" --
+/// only a genuinely missing file is. Any other read/parse error falls
+/// through to generating (and re-persisting) a fresh identity, logging why,
+/// rather than risk serving with a partially-loaded or tampered keypair. A
+/// missing file, or an expired/SAN-mismatched identity, are ordinary
+/// rotation and are not logged as errors.
+fn load_or_generate_self_signed_tls_identity(
+    subject_alt_names: &[String],
+    store_path: Option<&Path>,
+) -> anyhow::Result<TlsIdentity> {
+    let Some(store_path) = store_path else {
+        return self_signed_tls_identity(subject_alt_names);
+    };
+    match load_persisted_tls_identity(store_path, subject_alt_names) {
+        Ok(Some((certificate_der, private_key_der))) => {
+            return tls_identity_from_der(certificate_der, private_key_der);
+        }
+        Ok(None) => {
+            // Missing, expired, or issued for different subject alt names:
+            // ordinary rotation, already logged (if interesting) by
+            // load_persisted_tls_identity. Fall through to regenerate.
+        }
+        Err(error) => {
+            eprintln!(
+                "openasr-server: could not load persisted TLS identity from {} ({error}); regenerating a new identity (paired remote clients will need to re-confirm the new fingerprint)",
+                store_path.display()
+            );
+        }
+    }
+    let (certificate_der, private_key_der, not_before_unix_secs, not_after_unix_secs) =
+        generate_self_signed_tls_material(subject_alt_names)?;
+    persist_tls_identity(
+        store_path,
+        subject_alt_names,
+        &certificate_der,
+        &private_key_der,
+        not_before_unix_secs,
+        not_after_unix_secs,
+    );
+    tls_identity_from_der(certificate_der, private_key_der)
+}
+
+/// Returns `Ok(Some(..))` when `store_path` holds a still-usable identity for
+/// `subject_alt_names`, `Ok(None)` when it is absent/expired/for different
+/// names (normal, not-logged-as-error rotation), and `Err` when the file is
+/// present but unreadable as a well-formed identity (corrupt JSON, empty key
+/// material) -- the caller treats `Err` as a louder "this should not happen"
+/// event distinct from routine rotation.
+fn load_persisted_tls_identity(
+    store_path: &Path,
+    subject_alt_names: &[String],
+) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let bytes = match fs::read(store_path) {
+        Ok(bytes) => bytes,
+        // Absent file = legitimately no persisted identity yet (fresh
+        // install, or first ever --tls-self-signed run).
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // Anything else (permission denied, I/O error) is NOT "no identity":
+        // returning Err keeps the caller from treating a locked-out file as
+        // license to silently mint (and overwrite) a new one without saying
+        // why.
+        Err(error) => return Err(error.into()),
+    };
+    let persisted: PersistedTlsIdentity = serde_json::from_slice(&bytes)?;
+    if persisted.certificate_der.is_empty() || persisted.private_key_der.is_empty() {
+        anyhow::bail!("persisted TLS identity has empty certificate or private key material");
+    }
+    if persisted.subject_alt_names != subject_alt_names {
+        eprintln!(
+            "openasr-server: persisted TLS identity at {} was issued for different subject alt names ({:?}, now requesting {:?}); rotating",
+            store_path.display(),
+            persisted.subject_alt_names,
+            subject_alt_names
+        );
+        return Ok(None);
+    }
+    if unix_now_secs() >= persisted.not_after_unix_secs {
+        eprintln!(
+            "openasr-server: persisted TLS identity at {} expired (not_after unix {}); rotating",
+            store_path.display(),
+            persisted.not_after_unix_secs
+        );
+        return Ok(None);
+    }
+    Ok(Some((persisted.certificate_der, persisted.private_key_der)))
+}
+
+/// Persists `certificate_der`/`private_key_der` (plus the metadata needed to
+/// validate reuse later) to `store_path`, atomically and with owner-only
+/// (0600) permissions -- this is the only place a self-signed TLS private key
+/// touches disk. Best-effort: a write failure is logged and otherwise
+/// swallowed (the freshly generated in-memory identity still serves this
+/// boot; it simply will not survive the next restart), matching
+/// `persist_pairing_credentials_locked`'s "never fail serve over a
+/// persistence hiccup" posture.
+fn persist_tls_identity(
+    store_path: &Path,
+    subject_alt_names: &[String],
+    certificate_der: &[u8],
+    private_key_der: &[u8],
+    not_before_unix_secs: u64,
+    not_after_unix_secs: u64,
+) {
+    let persisted = PersistedTlsIdentity {
+        subject_alt_names: subject_alt_names.to_vec(),
+        certificate_der: certificate_der.to_vec(),
+        private_key_der: private_key_der.to_vec(),
+        not_before_unix_secs,
+        not_after_unix_secs,
+    };
+    match serde_json::to_vec_pretty(&persisted) {
+        Ok(bytes) => {
+            if let Err(error) = write_bytes_atomically(store_path, &bytes) {
+                eprintln!(
+                    "openasr-server: could not persist TLS identity to {} (continuing without persistence; this identity will not survive a restart): {error}",
+                    store_path.display()
+                );
+            } else {
+                // Holds a private key: owner-only, like the pairing store and
+                // API key store.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(store_path, std::fs::Permissions::from_mode(0o600));
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "openasr-server: could not serialize TLS identity (continuing without persistence): {error}"
+            );
+        }
+    }
 }
 
 struct TlsListener {
@@ -453,6 +675,15 @@ pub struct ServerLaunchOptions {
     /// (the default, and what `never` resolves to) never spawns the reaper,
     /// matching every existing caller/test that does not set this.
     pub idle_unload_after: Option<Duration>,
+    /// Where to persist (and load back) the self-signed TLS private key +
+    /// certificate across restarts -- see
+    /// `load_or_generate_self_signed_tls_identity`. `None` keeps the
+    /// pre-persistence behavior of generating a brand new identity on every
+    /// `serve_with_launch_options` call; only a caller that sets this (the
+    /// CLI, to `OPENASR_HOME/tls-identity.json`, alongside
+    /// `pairing-registry.json`) gets an identity that survives a restart.
+    /// No-op when `tls` is `ServerTlsConfig::Disabled`.
+    pub tls_identity_store: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

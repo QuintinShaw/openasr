@@ -630,6 +630,108 @@ fn self_signed_tls_defaults_to_localhost_and_reports_certificate_fingerprint() {
     assert_eq!(identity.pairing_safety_code.len(), "ABCD-1234".len());
 }
 
+#[test]
+fn load_or_generate_self_signed_tls_identity_loads_persisted_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let store_path = temp.path().join("tls-identity.json");
+    let sans = vec!["127.0.0.1".to_string()];
+
+    let first = load_or_generate_self_signed_tls_identity(&sans, Some(&store_path)).unwrap();
+    // A second call against the same store must load the persisted keypair +
+    // certificate back rather than minting a new one -- this is the crux of
+    // "restart does not rotate the pairing fingerprint".
+    let second = load_or_generate_self_signed_tls_identity(&sans, Some(&store_path)).unwrap();
+
+    assert_eq!(first.certificate_sha256, second.certificate_sha256);
+    assert_eq!(first.certificate_der, second.certificate_der);
+    assert_eq!(first.pairing_safety_code, second.pairing_safety_code);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&store_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "persisted TLS identity file must be owner-only"
+        );
+    }
+}
+
+#[test]
+fn load_or_generate_self_signed_tls_identity_generates_and_persists_when_store_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    // Deliberately does not exist yet -- a fresh install / first ever
+    // --tls-self-signed run.
+    let store_path = temp.path().join("tls-identity.json");
+    let sans = vec!["localhost".to_string()];
+    assert!(!store_path.exists());
+
+    let identity = load_or_generate_self_signed_tls_identity(&sans, Some(&store_path)).unwrap();
+
+    assert!(store_path.exists());
+    let persisted: PersistedTlsIdentity =
+        serde_json::from_slice(&fs::read(&store_path).unwrap()).unwrap();
+    assert_eq!(persisted.subject_alt_names, sans);
+    assert_eq!(
+        certificate_fingerprint_sha256(&persisted.certificate_der),
+        identity.certificate_sha256
+    );
+    assert!(persisted.not_after_unix_secs > unix_now_secs());
+}
+
+#[test]
+fn load_or_generate_self_signed_tls_identity_regenerates_on_corrupt_store() {
+    let temp = tempfile::tempdir().unwrap();
+    let store_path = temp.path().join("tls-identity.json");
+    // Present but not valid JSON at all -- simulates disk corruption /
+    // truncation, distinct from "file does not exist".
+    fs::write(&store_path, b"not valid json { at all").unwrap();
+    let sans = vec!["localhost".to_string()];
+
+    // Must fail closed by regenerating rather than propagating the parse
+    // error or, worse, serving with unusable key material.
+    let identity = load_or_generate_self_signed_tls_identity(&sans, Some(&store_path)).unwrap();
+
+    assert_eq!(identity.certificate_sha256.len(), 64);
+    // The corrupt file must have been overwritten with a freshly generated,
+    // well-formed identity -- not left corrupt for the next boot to trip over
+    // again.
+    let persisted: PersistedTlsIdentity =
+        serde_json::from_slice(&fs::read(&store_path).unwrap()).unwrap();
+    assert_eq!(
+        certificate_fingerprint_sha256(&persisted.certificate_der),
+        identity.certificate_sha256
+    );
+}
+
+#[test]
+fn load_or_generate_self_signed_tls_identity_regenerates_on_expired_certificate() {
+    let temp = tempfile::tempdir().unwrap();
+    let store_path = temp.path().join("tls-identity.json");
+    let sans = vec!["localhost".to_string()];
+
+    let (certificate_der, private_key_der, ..) = generate_self_signed_tls_material(&sans).unwrap();
+    let expired_fingerprint = certificate_fingerprint_sha256(&certificate_der);
+    let expired = PersistedTlsIdentity {
+        subject_alt_names: sans.clone(),
+        certificate_der,
+        private_key_der,
+        // Both bounds safely in the past: an already-expired identity, not
+        // merely "expiring soon".
+        not_before_unix_secs: unix_now_secs().saturating_sub(3600),
+        not_after_unix_secs: unix_now_secs().saturating_sub(60),
+    };
+    fs::write(&store_path, serde_json::to_vec_pretty(&expired).unwrap()).unwrap();
+
+    let identity = load_or_generate_self_signed_tls_identity(&sans, Some(&store_path)).unwrap();
+
+    // A genuinely new identity was minted, not the expired one reused.
+    assert_ne!(identity.certificate_sha256, expired_fingerprint);
+    let persisted: PersistedTlsIdentity =
+        serde_json::from_slice(&fs::read(&store_path).unwrap()).unwrap();
+    assert!(persisted.not_after_unix_secs > unix_now_secs());
+}
+
 #[tokio::test]
 async fn loopback_tls_pairing_device_transcription_skips_server_history() {
     let temp = tempfile::tempdir().unwrap();
