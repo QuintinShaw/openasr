@@ -190,11 +190,19 @@ pub(crate) fn native_activity_is_idle_for(now: Instant, idle_for: Duration) -> b
     native_activity().is_idle_for(now, idle_for)
 }
 
-/// RAII pairing of one `native_activity_enter`/`native_activity_exit` call
-/// with a lexical scope. Used at the offline/backend-job transcribe call
-/// site, where the request's activity window is exactly one function call
-/// (unlike the realtime streaming worker, whose attach/release already sit at
-/// two different call sites in `native_worker.rs` and are paired directly).
+/// RAII pairing of one `native_activity_enter`/`native_activity_exit` call.
+/// Used at the offline/backend-job transcribe call site, where the request's
+/// activity window is exactly one lexical scope, and at the realtime
+/// native-streaming attach path in `native_worker.rs`, where the window spans
+/// an async attach attempt and a handoff to a different OS thread: there the
+/// guard is constructed once in `native_streaming_worker_for_key`, then
+/// travels with the attach attempt as a value (through
+/// `NativeStreamingWorkerHandle`, then the `Attach` message) until whichever
+/// side ends up owning it when it drops -- the sender, if the attach never
+/// reaches the worker thread, or the worker thread, once it finishes
+/// processing that session. Moving the guard itself (rather than pairing bare
+/// `enter`/`exit` calls by hand across those call sites) is what makes every
+/// exit path -- including a failed `send` -- retire the count exactly once.
 pub(crate) struct NativeActivityGuard(());
 
 impl NativeActivityGuard {
