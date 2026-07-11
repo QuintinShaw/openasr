@@ -6,7 +6,7 @@
 //! NeMo dw_striding: regular conv0+ReLU, depthwise conv2, pointwise conv3+ReLU,
 //! depthwise conv5, pointwise conv6+ReLU), so the #1 frame-count risk is borrowed
 //! from a proven impl. The conformer layers reuse `nn::encoder::conformer_block`
-//! and the rel-pos table reuses cohere's `build_relative_positional_encoding`.
+//! and the rel-pos table reuses the shared `nn::encoder::build_relative_positional_encoding`.
 
 #![allow(dead_code)]
 
@@ -19,14 +19,16 @@ use crate::ggml_runtime::{
     bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
     upload_static_f32 as arena_upload_static_f32,
 };
-use crate::models::cohere::encoder_graph::build_relative_positional_encoding;
 use crate::models::parakeet_ctc::graph_config::parakeet_ctc_encoder_graph_config;
 
 use crate::nn::conv::{
     Conv2dParams, ConvActivation, ConvBlockSteps, apply_conv_2d_bias_activation,
     apply_conv_2d_depthwise_bias_activation, reshape_bias_4d,
 };
-use crate::nn::encoder::{ConformerBlockConfig, ConformerBlockWeights, conformer_block};
+use crate::nn::encoder::{
+    ConformerBlockConfig, ConformerBlockWeights, build_relative_positional_encoding,
+    conformer_block,
+};
 use crate::nn::half::f32_to_f16_bits;
 
 use super::encoder_weights::{NamedTensor, ParakeetEncoderLayerWeights, ParakeetEncoderWeights};
@@ -395,12 +397,11 @@ impl ParakeetCtcEncoderGraph {
         let d_model = metadata.hidden_size;
         let subsampled_frames = conv_out_dim(conv_out_dim(conv_out_dim(mel.n_frames)));
         let subsampled_freq = conv_out_dim(conv_out_dim(conv_out_dim(mel.n_mels)));
-        let positional =
-            build_relative_positional_encoding(d_model, subsampled_frames).map_err(|e| {
-                ParakeetEncoderError::Shape {
-                    reason: e.to_string(),
-                }
-            })?;
+        let positional = build_relative_positional_encoding(d_model, subsampled_frames, || {
+            ParakeetEncoderError::Shape {
+                reason: "relative positional encoding shape overflow".to_string(),
+            }
+        })?;
 
         let mut graph = self.runner.start_graph();
 

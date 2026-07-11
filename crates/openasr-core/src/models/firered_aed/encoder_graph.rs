@@ -17,8 +17,9 @@
 //! dolphin/sensevoice/xasr precedent: hand-written, `block_stack: None`,
 //! built from the lower-level `nn::attn` / `nn::norm` / `nn::conv` primitives.
 //! The relative-position table math IS bit-identical to cohere/parakeet-ctc's
-//! shared Transformer-XL formula (same ESPnet/WeNet lineage), so that helper
-//! is reused directly instead of re-derived.
+//! shared Transformer-XL formula (same ESPnet/WeNet lineage), so the shared
+//! `nn::encoder::build_relative_positional_encoding` helper is reused directly
+//! instead of re-derived.
 
 #![allow(dead_code)]
 
@@ -27,7 +28,6 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::ggml_runtime::{GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext};
-use crate::models::cohere::encoder_graph::build_relative_positional_encoding;
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
     STANDARD_HEAD_PERMUTE_AXES, attention_context_from_probs,
@@ -36,6 +36,7 @@ use crate::nn::attn::{
 use crate::nn::conv::{
     Conv2dParams, ConvActivation, ConvBlockSteps, apply_conv_2d_bias_activation, reshape_bias_4d,
 };
+use crate::nn::encoder::build_relative_positional_encoding;
 use crate::nn::ffn::{
     FeedForwardActivation, FeedForwardResidualSteps, apply_feed_forward_residual,
 };
@@ -189,8 +190,10 @@ fn encode_firered_aed_audio_embeddings(
         .set_input(mel)
         .map_err(|source| map_err("ggml_set_input(mel)", source))?;
 
-    let positional_values = build_relative_positional_encoding(metadata.d_model, frame_count)
-        .map_err(|_| FireRedEncoderError::ShapeOverflow)?;
+    let positional_values =
+        build_relative_positional_encoding(metadata.d_model, frame_count, || {
+            FireRedEncoderError::ShapeOverflow
+        })?;
     let pos_enc = graph
         .new_tensor_2d_f32(metadata.d_model, 2 * frame_count - 1, "firered_enc_rel_pos")
         .map_err(|source| map_err("ggml_new_tensor_2d(pos_enc)", source))?;

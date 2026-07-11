@@ -14,14 +14,16 @@ use crate::ggml_runtime::{
     bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
     upload_static_f32 as arena_upload_static_f32,
 };
-use crate::models::cohere::encoder_graph::build_relative_positional_encoding;
 use crate::models::parakeet_tdt::graph_config::parakeet_tdt_encoder_graph_config;
 
 use crate::nn::conv::{
     Conv2dParams, ConvActivation, ConvBlockSteps, apply_conv_2d_bias_activation,
     apply_conv_2d_depthwise_bias_activation, reshape_bias_4d,
 };
-use crate::nn::encoder::{ConformerBlockConfig, ConformerBlockWeights, conformer_block};
+use crate::nn::encoder::{
+    ConformerBlockConfig, ConformerBlockWeights, build_relative_positional_encoding,
+    conformer_block,
+};
 use crate::nn::half::f32_to_f16_bits;
 
 use super::encoder_weights::{
@@ -368,12 +370,11 @@ impl ParakeetTdtEncoderGraph {
         let d_model = metadata.hidden_size;
         let subsampled_frames = conv_out_dim(conv_out_dim(conv_out_dim(mel.n_frames)));
         let subsampled_freq = conv_out_dim(conv_out_dim(conv_out_dim(mel.n_mels)));
-        let positional =
-            build_relative_positional_encoding(d_model, subsampled_frames).map_err(|e| {
-                ParakeetTdtEncoderError::Shape {
-                    reason: e.to_string(),
-                }
-            })?;
+        let positional = build_relative_positional_encoding(d_model, subsampled_frames, || {
+            ParakeetTdtEncoderError::Shape {
+                reason: "relative positional encoding shape overflow".to_string(),
+            }
+        })?;
 
         let mut graph = self.runner.start_graph();
 

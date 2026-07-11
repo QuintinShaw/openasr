@@ -11,6 +11,7 @@ use crate::nn::conv::{
     Conv2dParams, ConvActivation, ConvBlockSteps, apply_conv_2d_bias_activation,
     apply_conv_2d_depthwise_bias_activation, reshape_bias_4d as nn_reshape_bias_4d,
 };
+use crate::nn::encoder::build_relative_positional_encoding;
 use crate::nn::half::f32_to_f16_bits;
 
 use super::encoder_weights::{CohereEncoderLayerWeights, CohereTranscribeEncoderWeights};
@@ -581,8 +582,11 @@ impl CohereTranscribeEncoderGraphRuntime {
         let subsampled_frames = conv_out_dim(mel_features.n_frames, 3, 2, 1)?;
         let subsampled_frames = conv_out_dim(subsampled_frames, 3, 2, 1)?;
         let subsampled_frames = conv_out_dim(subsampled_frames, 3, 2, 1)?;
-        let positional =
-            build_relative_positional_encoding(metadata.encoder_d_model, subsampled_frames)?;
+        let positional = build_relative_positional_encoding(
+            metadata.encoder_d_model,
+            subsampled_frames,
+            || CohereTranscribeEncoderError::ShapeOverflow,
+        )?;
 
         let mut graph = self.runner.start_graph();
         let mel = graph
@@ -1286,36 +1290,6 @@ fn validate_mel_features(
         });
     }
     Ok(())
-}
-
-/// Conformer Transformer-XL relative-position sinusoidal table. Shared with the
-/// parakeet-ctc encoder (S3c) — same conformer rel-pos that `conformer_block`'s
-/// rel_shift consumes; exposed `pub(crate)` for reuse (additive, no behavior
-/// change to cohere).
-pub(crate) fn build_relative_positional_encoding(
-    d_model: usize,
-    frame_count: usize,
-) -> Result<Vec<f32>, CohereTranscribeEncoderError> {
-    let n_positions = frame_count
-        .checked_mul(2)
-        .and_then(|value| value.checked_sub(1))
-        .ok_or(CohereTranscribeEncoderError::ShapeOverflow)?;
-    let total = n_positions
-        .checked_mul(d_model)
-        .ok_or(CohereTranscribeEncoderError::ShapeOverflow)?;
-    let mut values = vec![0.0_f32; total];
-    for position_idx in 0..n_positions {
-        let pos = (frame_count - 1) as f32 - position_idx as f32;
-        for j in 0..(d_model / 2) {
-            let div = 10000.0_f32.powf((2.0 * j as f32) / d_model as f32);
-            let base = position_idx * d_model + 2 * j;
-            values[base] = (pos / div).sin();
-            if base + 1 < values.len() {
-                values[base + 1] = (pos / div).cos();
-            }
-        }
-    }
-    Ok(values)
 }
 
 fn emit_cohere_debug_encoder_stage_preview(
