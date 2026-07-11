@@ -9,6 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Server: `/health` now reports `model_resident`, whether the bound model's native runtime is currently loaded in memory versus idle-unloaded (or not yet loaded this boot) -- lets clients (e.g. the desktop status indicator) distinguish "ready, instant transcription" from "bound but will pay a cold rebuild on the next request" without guessing from the `idle_unload` timer. Additive; `model_installed` is unchanged.
 
+### Changed
+
+- Core: the offline and realtime-streaming dispatch stacks now share one process-wide executor instance for qwen, cohere, whisper, and moonshine (the families that host-materialize a prepared runtime instead of relying purely on the pack's own mmap), instead of each stack holding its own independent instance and cache. A model warmed on both stacks no longer pays for its resident weights twice: measured on `qwen3-asr-0.6b` q4_k, warming both stacks on the same pack now costs ~1x instead of ~2x (2965 MiB -> 2197 MiB physical footprint in a same-process repro). AED/CTC/transducer families keep zero-copy mmap-shared weights already and are unaffected.
+
 ## [0.1.12] - 2026-07-11
 
 ### Added
