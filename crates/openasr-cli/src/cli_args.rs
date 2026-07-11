@@ -527,6 +527,15 @@ pub(crate) enum Command {
         /// Local `.oasr` runtime pack file for native backend transcription.
         #[arg(long)]
         model_pack: Option<PathBuf>,
+        /// Pid of the process that launched this daemon (e.g. a desktop app's
+        /// supervisor). While set, this process watches that pid and exits
+        /// shortly after it disappears -- including an ungraceful death (a
+        /// SIGKILL, a crash, a Force Quit/End Task) that never reaches the
+        /// supervisor's normal stop/shutdown path and would otherwise leave
+        /// this daemon running forever as an orphan. Internal launch detail,
+        /// not meant for interactive use.
+        #[arg(long, hide = true)]
+        parent_pid: Option<u32>,
     },
     /// Manage local API keys for `openasr serve` (`Authorization: Bearer
     /// <key>`). Loopback callers need no key by default; creating one forces

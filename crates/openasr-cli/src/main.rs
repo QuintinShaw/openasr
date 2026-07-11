@@ -32,6 +32,7 @@ mod doctor_cli;
 mod live;
 mod model_pack_cli;
 mod native_segment_cli;
+mod parent_watchdog;
 mod progress;
 mod pull_cli;
 
@@ -319,7 +320,11 @@ async fn run() -> Result<()> {
             backend,
             ffmpeg_bin,
             model_pack,
+            parent_pid,
         } => {
+            if let Some(parent_pid) = parent_pid {
+                parent_watchdog::spawn(parent_pid);
+            }
             serve(
                 addr,
                 model.as_deref(),
