@@ -22,9 +22,9 @@
 /// Which hz<->mel warping (and filter-construction convention) to use.
 ///
 /// `Htk`/`Kaldi` are not yet consumed by any switched-over family (only
-/// `Slaney` is, via `parakeet_ctc`) -- they're declared now per this
-/// module's target API and covered by their own unit tests below, so the
-/// family PRs that migrate `xasr_zipformer` / `kaldi_fbank`'s consumers
+/// `Slaney` is, via `parakeet_ctc`/`whisper`) -- they're declared now per
+/// this module's target API and covered by their own unit tests below, so
+/// the family PRs that migrate `xasr_zipformer` / `kaldi_fbank`'s consumers
 /// onto this module can wire them in directly instead of inventing the
 /// scale math a second time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +48,39 @@ pub(crate) enum MelScale {
     Kaldi,
 }
 
+/// Which floating-point operation order to use when placing `n_mels + 2`
+/// filter edges evenly spaced in the mel domain between `mel_min` and
+/// `mel_max`. Both orders compute the exact same real number; they round
+/// differently in f32 for some `(n_mels, mel_min, mel_max)` combinations
+/// (confirmed by exhaustive bit comparison for the whisper 80/128-mel
+/// configs), so picking the wrong one silently drifts filter weights -- and
+/// everything downstream -- from a family's pinned pre-refactor
+/// implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MelPointOrder {
+    /// `mel_min + (mel_max - mel_min) * i / (n_mels + 1)`: multiply the mel
+    /// span by the point index before dividing by the point count. Used by
+    /// `parakeet_ctc`/`parakeet_tdt` and `xasr_zipformer`'s Htk filterbank.
+    SpanTimesIndexFirst,
+    /// `mel_min + (i / (n_mels + 1)) * (mel_max - mel_min)`: compute the
+    /// `[0, 1]` ratio first, then scale by the mel span. Used by `whisper`.
+    RatioFirst,
+}
+
+impl MelPointOrder {
+    fn point(self, mel_min: f32, mel_max: f32, i: usize, n_mels: usize) -> f32 {
+        match self {
+            MelPointOrder::SpanTimesIndexFirst => {
+                mel_min + (mel_max - mel_min) * i as f32 / (n_mels + 1) as f32
+            }
+            MelPointOrder::RatioFirst => {
+                let ratio = i as f32 / (n_mels + 1) as f32;
+                mel_min + ratio * (mel_max - mel_min)
+            }
+        }
+    }
+}
+
 /// Geometry for [`filterbank`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FilterbankConfig {
@@ -57,6 +90,9 @@ pub(crate) struct FilterbankConfig {
     pub n_mels: usize,
     pub fmin: f32,
     pub fmax: f32,
+    /// Only consulted by the Hz-domain constructions (`Slaney`/`Htk`);
+    /// ignored by `Kaldi` (mel-domain edges, no round-trip).
+    pub mel_point_order: MelPointOrder,
 }
 
 /// `hz -> mel` for `scale`.
@@ -132,6 +168,7 @@ fn hz_domain_filterbank(config: FilterbankConfig, fft_bins: usize, slaney_norm: 
         n_mels,
         fmin,
         fmax,
+        mel_point_order,
     } = config;
     let fft_freqs: Vec<f32> = (0..fft_bins)
         .map(|i| i as f32 * sample_rate_hz / n_fft as f32)
@@ -139,7 +176,7 @@ fn hz_domain_filterbank(config: FilterbankConfig, fft_bins: usize, slaney_norm: 
     let mel_min = hz_to_mel(scale, fmin);
     let mel_max = hz_to_mel(scale, fmax);
     let mel_points: Vec<f32> = (0..n_mels + 2)
-        .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (n_mels + 1) as f32)
+        .map(|i| mel_point_order.point(mel_min, mel_max, i, n_mels))
         .collect();
     let hz_points: Vec<f32> = mel_points.iter().map(|&m| mel_to_hz(scale, m)).collect();
 
@@ -178,6 +215,7 @@ fn mel_domain_filterbank(config: FilterbankConfig, fft_bins: usize) -> Vec<f32> 
         n_mels,
         fmin,
         fmax,
+        ..
     } = config;
     let fft_bin_width = sample_rate_hz / n_fft as f32;
     let mel_low = hz_to_mel(scale, fmin);
@@ -257,6 +295,7 @@ mod tests {
             n_mels,
             fmin: 0.0,
             fmax: 8_000.0,
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
         });
         assert_eq!(expected, actual);
 
@@ -269,6 +308,7 @@ mod tests {
             n_mels: n_mels128,
             fmin: 0.0,
             fmax: 8_000.0,
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
         });
         assert_eq!(expected128, actual128);
     }
@@ -291,6 +331,7 @@ mod tests {
             n_mels: 80,
             fmin: 20.0,
             fmax: 7_600.0,
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
         });
         for m in 0..80 {
             let row = &fb[m * 257..(m + 1) * 257];
@@ -313,6 +354,7 @@ mod tests {
             n_mels: 80,
             fmin: 20.0,
             fmax: 8_000.0,
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
         });
         for m in 0..80 {
             let row = &fb[m * 257..(m + 1) * 257];
@@ -347,6 +389,61 @@ mod tests {
                     "scale={scale:?} hz={hz} round_trip={back}"
                 );
             }
+        }
+    }
+
+    /// Exact reimplementation of the pre-refactor `whisper::mel::slaney_mel_filterbank`
+    /// (`RatioFirst` mel-point order), kept only in this test to pin
+    /// `MelPointOrder::RatioFirst` to the values `whisper` shipped before
+    /// this module existed.
+    fn reference_whisper_slaney_filterbank(
+        n_mels: usize,
+        n_fft: usize,
+        fft_bins: usize,
+    ) -> Vec<f32> {
+        const SAMPLE_RATE: f32 = 16_000.0;
+        let fft_frequencies = (0..fft_bins)
+            .map(|bin| bin as f32 * SAMPLE_RATE / n_fft as f32)
+            .collect::<Vec<_>>();
+        let mel_min = hz_to_mel_slaney(0.0);
+        let mel_max = hz_to_mel_slaney(8_000.0);
+        let mel_points = (0..n_mels + 2)
+            .map(|index| {
+                let ratio = index as f32 / (n_mels + 1) as f32;
+                mel_to_hz_slaney(mel_min + ratio * (mel_max - mel_min))
+            })
+            .collect::<Vec<_>>();
+        let mut filters = vec![0.0_f32; n_mels * fft_bins];
+        for mel_idx in 0..n_mels {
+            let left = mel_points[mel_idx];
+            let center = mel_points[mel_idx + 1];
+            let right = mel_points[mel_idx + 2];
+            let norm = 2.0 / (right - left).max(f32::EPSILON);
+            for (bin_idx, hz) in fft_frequencies.iter().copied().enumerate() {
+                let rising = (hz - left) / (center - left).max(f32::EPSILON);
+                let falling = (right - hz) / (right - center).max(f32::EPSILON);
+                let value = rising.min(falling).max(0.0) * norm;
+                filters[mel_idx * fft_bins + bin_idx] = value;
+            }
+        }
+        filters
+    }
+
+    #[test]
+    fn ratio_first_mel_point_order_is_byte_identical_to_pre_refactor_whisper_impl() {
+        for n_mels in [80usize, 128usize] {
+            let (n_fft, fft_bins) = (400, 201);
+            let expected = reference_whisper_slaney_filterbank(n_mels, n_fft, fft_bins);
+            let actual = filterbank(FilterbankConfig {
+                scale: MelScale::Slaney,
+                sample_rate_hz: 16_000.0,
+                n_fft,
+                n_mels,
+                fmin: 0.0,
+                fmax: 8_000.0,
+                mel_point_order: MelPointOrder::RatioFirst,
+            });
+            assert_eq!(expected, actual, "n_mels={n_mels}");
         }
     }
 }

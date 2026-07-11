@@ -173,6 +173,21 @@ pub(crate) fn hann_window_centered(win_length: usize, n_fft: usize) -> Vec<f32> 
     window
 }
 
+/// Periodic Hann window of `length`, computed by pre-dividing the angular
+/// step (`2*pi / length`) once and multiplying by the sample index, rather
+/// than [`hann_window_centered`]'s per-sample `(2*pi*i) / length` operation
+/// order. The two are the exact same real-valued formula but round
+/// differently in f32 for some lengths (confirmed by exhaustive bit
+/// comparison at length 400); this is `whisper`'s own bit-exact
+/// construction, used only where `win_length == n_fft` (no centering slack,
+/// hence no `n_fft` parameter).
+pub(crate) fn hann_window_periodic_scale_first(length: usize) -> Vec<f32> {
+    let scale = std::f32::consts::PI * 2.0 / length as f32;
+    (0..length)
+        .map(|i| 0.5 - 0.5 * (scale * i as f32).cos())
+        .collect()
+}
+
 /// numpy/`torch.stft`-style reflect padding (no edge repeat): pads `pad`
 /// samples of mirrored signal onto both ends of `samples`.
 fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
@@ -313,5 +328,26 @@ mod tests {
         // (ddof=0), so the ddof=1 std is larger and its normalized
         // magnitudes are smaller.
         assert!(ddof1[0].abs() < ddof0[0].abs());
+    }
+
+    /// Exact reimplementation of the pre-refactor `whisper::mel::hann_window`,
+    /// kept only to pin [`hann_window_periodic_scale_first`] to the values
+    /// `whisper` shipped before this module existed.
+    fn reference_whisper_hann_window(length: usize) -> Vec<f32> {
+        let scale = std::f32::consts::PI * 2.0 / length as f32;
+        (0..length)
+            .map(|index| 0.5 - 0.5 * (scale * index as f32).cos())
+            .collect()
+    }
+
+    #[test]
+    fn hann_window_periodic_scale_first_is_byte_identical_to_pre_refactor_whisper_impl() {
+        for length in [400usize, 512usize] {
+            assert_eq!(
+                reference_whisper_hann_window(length),
+                hann_window_periodic_scale_first(length),
+                "length={length}"
+            );
+        }
     }
 }
