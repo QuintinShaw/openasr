@@ -260,7 +260,7 @@ impl Qwen3AsrGgmlExecutor {
                 request.selected_family.model_architecture,
                 preflight.as_ref(),
                 map_prepared_runtime_registry_error,
-                qwen_runtime_cache_poisoned,
+                qwen_runtime_cache_slot_unavailable,
                 || Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
                     reason: format!(
                         "prepared runtime registry returned non-qwen runtime for architecture '{}'",
@@ -766,9 +766,16 @@ impl Qwen3AsrGgmlExecutor {
     }
 }
 
-fn qwen_runtime_cache_poisoned() -> Qwen3AsrGgmlExecutorError {
+// Covers both a genuinely poisoned slot mutex and a build attempt that
+// panicked and was caught (mutex stays unpoisoned, slot stays empty,
+// retryable) -- see `PreparedRuntimeCache::get_or_try_insert_with`. Either way
+// the cache could not deliver a prepared runtime for this attempt; the
+// caller's next request retries clean.
+fn qwen_runtime_cache_slot_unavailable() -> Qwen3AsrGgmlExecutorError {
     Qwen3AsrGgmlExecutorError::RuntimeMetadataReadFailed {
-        reason: "qwen runtime cache mutex is poisoned".to_string(),
+        reason:
+            "qwen runtime cache slot unavailable (poisoned lock or a caught build panic); retry"
+                .to_string(),
     }
 }
 

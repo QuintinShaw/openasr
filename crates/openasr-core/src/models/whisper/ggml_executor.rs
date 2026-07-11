@@ -3050,14 +3050,21 @@ impl WhisperGgmlExecutor {
                     self.tokenizer_provider.as_ref(),
                 )
             },
-            whisper_runtime_cache_poisoned,
+            whisper_runtime_cache_slot_unavailable,
         )
     }
 }
 
-fn whisper_runtime_cache_poisoned() -> WhisperGgmlExecutorError {
+// Covers both a genuinely poisoned slot mutex (a prior caller panicked while
+// holding it -- extremely unlikely, see `PreparedRuntimeCache::get_or_try_insert_with`)
+// and a build attempt that panicked and was caught (mutex stays unpoisoned,
+// slot stays empty, retryable). Either way the cache could not deliver a
+// prepared runtime for this attempt; the caller's next request retries clean.
+fn whisper_runtime_cache_slot_unavailable() -> WhisperGgmlExecutorError {
     WhisperGgmlExecutorError::TensorMaterializationFailed {
-        reason: "whisper runtime cache mutex is poisoned".to_string(),
+        reason:
+            "whisper runtime cache slot unavailable (poisoned lock or a caught build panic); retry"
+                .to_string(),
     }
 }
 

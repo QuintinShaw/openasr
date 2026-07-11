@@ -145,7 +145,7 @@ impl CohereTranscribeGgmlExecutor {
                 request.selected_family.model_architecture,
                 preflight.as_ref(),
                 map_prepared_runtime_registry_error,
-                cohere_runtime_cache_poisoned,
+                cohere_runtime_cache_slot_unavailable,
                 || CohereTranscribeGgmlExecutorError::PreparedRuntimeFailed {
                     reason: format!(
                         "prepared runtime registry returned non-cohere runtime for architecture '{}'",
@@ -377,9 +377,16 @@ impl CohereTranscribeGgmlExecutor {
     }
 }
 
-fn cohere_runtime_cache_poisoned() -> CohereTranscribeGgmlExecutorError {
+// Covers both a genuinely poisoned slot mutex and a build attempt that
+// panicked and was caught (mutex stays unpoisoned, slot stays empty,
+// retryable) -- see `PreparedRuntimeCache::get_or_try_insert_with`. Either way
+// the cache could not deliver a prepared runtime for this attempt; the
+// caller's next request retries clean.
+fn cohere_runtime_cache_slot_unavailable() -> CohereTranscribeGgmlExecutorError {
     CohereTranscribeGgmlExecutorError::PreparedRuntimeFailed {
-        reason: "cohere runtime cache mutex is poisoned".to_string(),
+        reason:
+            "cohere runtime cache slot unavailable (poisoned lock or a caught build panic); retry"
+                .to_string(),
     }
 }
 
@@ -954,7 +961,7 @@ mod tests {
                 request.selected_family.model_architecture,
                 &preflight,
                 map_prepared_runtime_registry_error,
-                cohere_runtime_cache_poisoned,
+                cohere_runtime_cache_slot_unavailable,
             )
             .expect("prepared runtime should build");
         let runtime_b = executor
@@ -963,10 +970,86 @@ mod tests {
                 request.selected_family.model_architecture,
                 &preflight,
                 map_prepared_runtime_registry_error,
-                cohere_runtime_cache_poisoned,
+                cohere_runtime_cache_slot_unavailable,
             )
             .expect("prepared runtime should reuse cache");
         assert!(Arc::ptr_eq(&runtime_a, &runtime_b));
+    }
+
+    /// Core-layer regression coverage for the shared-executor change (PR
+    /// #96): `shared_cohere_transcribe_executor()` is the literal process-wide
+    /// singleton that BOTH `build_builtin_ggml_execution_dispatch` (offline)
+    /// and `build_builtin_ggml_streaming_execution_dispatch` (streaming)
+    /// register into their respective dispatch tables (see
+    /// `executor_component_registry.rs`) -- this test drives that same
+    /// singleton through its two real entry points (`execute`, the offline
+    /// path, and `execute_streaming`, exactly what
+    /// `GgmlAsrStreamingExecutor::start_streaming_session` calls per chunk)
+    /// and asserts they resolve to the *same* `Arc<CoherePreparedRuntime>`,
+    /// not just that both happen to succeed. A regression that reintroduced
+    /// a second executor instance (or a second `runtime_cache_by_path`) would
+    /// still let both calls decode successfully -- the host-materialized
+    /// weights would just be duplicated in memory -- so pointer identity is
+    /// the assertion that actually catches it.
+    #[test]
+    fn cohere_offline_and_streaming_entries_share_the_same_prepared_runtime() {
+        with_forced_cpu_backend_for_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let runtime_path = temp.path().join("cohere-runtime.gguf");
+            let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
+            write_tiny_gguf_runtime_source(&runtime_path, &spec).expect("write fixture");
+
+            let shared =
+                crate::models::executor_component_registry::shared_cohere_transcribe_executor();
+            let request = runtime_ready_request(runtime_path);
+            let preflight = request
+                .resolve_runtime_source_preflight()
+                .expect("preflight should resolve")
+                .into_owned();
+
+            // Cold fetch through the exact call `execute_inner` makes
+            // internally for the offline path (`with_cohere_transcribe_runtime_for_preflight`
+            // -> `prepared_runtime_for_preflight`), captured directly so its
+            // Arc identity is observable (`execute`'s return type does not
+            // expose it).
+            let runtime_via_offline_style_lookup = shared
+                .runtime_cache_by_path
+                .prepared_runtime_for_preflight(
+                    request.selected_family.model_architecture,
+                    &preflight,
+                    map_prepared_runtime_registry_error,
+                    cohere_runtime_cache_slot_unavailable,
+                )
+                .expect("offline-style lookup should build the prepared runtime");
+
+            // Real streaming entry, real decode, through the same shared
+            // singleton -- not a stand-in.
+            shared
+                .execute_streaming(&request)
+                .expect("streaming entry should decode using the shared singleton's cache");
+
+            // Now a pure cache hit if (and only if) `execute_streaming` above
+            // reused `runtime_cache_by_path` rather than materializing its
+            // own separate prepared runtime.
+            let runtime_after_streaming_entry = shared
+                .runtime_cache_by_path
+                .prepared_runtime_for_preflight(
+                    request.selected_family.model_architecture,
+                    &preflight,
+                    map_prepared_runtime_registry_error,
+                    cohere_runtime_cache_slot_unavailable,
+                )
+                .expect("post-streaming lookup should still be cached");
+
+            assert!(
+                Arc::ptr_eq(
+                    &runtime_via_offline_style_lookup,
+                    &runtime_after_streaming_entry
+                ),
+                "offline and streaming entry points on the shared executor singleton must \
+                 resolve the same prepared-runtime Arc, proving the cache is actually shared"
+            );
+        });
     }
 
     #[test]
