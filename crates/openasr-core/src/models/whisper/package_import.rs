@@ -28,7 +28,7 @@ use crate::models::{
     pack_quant::{PackQuant, classify_quant_tensor},
     whisper::WHISPER_MODEL_FAMILY,
 };
-use crate::nn::half::f32_to_f16_bits;
+use crate::nn::half::{f16_bits_slice_to_f32, f32_to_f16_bits};
 
 use crate::models::local_source_import::{
     SafetensorsFile, SafetensorsHeader, SafetensorsTensorHeader,
@@ -538,39 +538,12 @@ fn decode_safetensors_payload_as_f32(
         }
         "F16" => {
             let values = decode_f16_safetensors_payload_bits(tensor_name, data)?;
-            Ok(values.into_iter().map(f16_bits_to_f32).collect())
+            Ok(f16_bits_slice_to_f32(&values))
         }
         other => Err(validate_error(format!(
             "Whisper local-source GGUF import tensor '{tensor_name}' quantization supports only F32/F16 source tensors, got '{other}'"
         ))),
     }
-}
-
-fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = ((bits & 0x8000) as u32) << 16;
-    let exponent = ((bits >> 10) & 0x1f) as u32;
-    let mantissa = (bits & 0x03ff) as u32;
-    let f32_bits = if exponent == 0 {
-        if mantissa == 0 {
-            sign
-        } else {
-            let mut mant = mantissa;
-            let mut exp = -1_i32;
-            while (mant & 0x0400) == 0 {
-                mant <<= 1;
-                exp -= 1;
-            }
-            mant &= 0x03ff;
-            let exponent_f32 = (127 - 15 + 1 + exp) as u32;
-            sign | (exponent_f32 << 23) | (mant << 13)
-        }
-    } else if exponent == 0x1f {
-        sign | 0x7f80_0000 | (mantissa << 13)
-    } else {
-        let exponent_f32 = exponent + (127 - 15);
-        sign | (exponent_f32 << 23) | (mantissa << 13)
-    };
-    f32::from_bits(f32_bits)
 }
 
 fn gguf_tensor_type_from_safetensors_dtype(

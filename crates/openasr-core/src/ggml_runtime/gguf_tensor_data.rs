@@ -7,6 +7,8 @@ use std::{
 use memmap2::Mmap;
 use thiserror::Error;
 
+use crate::nn::half::f16_bits_slice_to_f32;
+
 use super::{
     GgmlRuntimeSource, GgmlRuntimeSourcePathError, GgufMetadataReadError, GgufTensorIndex,
     GgufTensorIndexReadError, GgufTensorMetadata, ffi, read_gguf_metadata,
@@ -366,7 +368,7 @@ impl GgufTensorDataReader {
             GGML_TYPE_F16 => {
                 let values =
                     self.host_tensor_f16_bits_copy_from_payload(payload, expected_shape)?;
-                Ok(values.into_iter().map(f16_bits_to_f32).collect())
+                Ok(f16_bits_slice_to_f32(&values))
             }
             _ => self.host_tensor_quantized_dequantize_to_f32_from_payload(payload),
         }
@@ -641,33 +643,6 @@ impl GgufTensorDataReader {
             len: borrowed.bytes.len(),
         })
     }
-}
-
-fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = ((bits & 0x8000) as u32) << 16;
-    let exponent = ((bits >> 10) & 0x1f) as u32;
-    let mantissa = (bits & 0x03ff) as u32;
-    let f32_bits = if exponent == 0 {
-        if mantissa == 0 {
-            sign
-        } else {
-            let mut mant = mantissa;
-            let mut exp = -1_i32;
-            while (mant & 0x0400) == 0 {
-                mant <<= 1;
-                exp -= 1;
-            }
-            mant &= 0x03ff;
-            let exponent_f32 = (127 - 15 + 1 + exp) as u32;
-            sign | (exponent_f32 << 23) | (mant << 13)
-        }
-    } else if exponent == 0x1f {
-        sign | 0x7f80_0000 | (mantissa << 13)
-    } else {
-        let exponent_f32 = exponent + (127 - 15);
-        sign | (exponent_f32 << 23) | (mantissa << 13)
-    };
-    f32::from_bits(f32_bits)
 }
 
 #[derive(Debug, Clone, Copy)]
