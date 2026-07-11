@@ -4,20 +4,28 @@
 //! intentionally local to X-ASR because sherpa/icefall fbank parity is part of
 //! this family contract, not a generic OpenASR mel frontend.
 //!
-//! Deliberately **not** built on the shared batch engine in
-//! [`crate::models::kaldi_fbank`] (which firered_aed/dolphin/sensevoice do
-//! share): this frontend runs `snip_edges=false` framing with incremental,
-//! cacheable frame-range computation (`features_for_frame_range_from`,
-//! `earliest_sample_needed_for_frame`) for O(1)-memory streaming, skips
-//! pre-emphasis/DC-removal/int16 rescale entirely, and stores mel filters
-//! densely with precomputed per-mel bin ranges for that range slicing --
-//! folding it into the shared engine would mean threading streaming-only
-//! control flow through a batch-oriented API, i.e. a shared-layer special
-//! case rather than a config difference.
+//! The window/FFT/power-spectrum step now goes through
+//! [`crate::models::audio_frontend`]'s `StftFramer` via
+//! `PadMode::KaldiSnipEdgesFalse` (kaldi's asymmetric `snip_edges=false`
+//! offset, reflected against the *total* stream length rather than a
+//! once-materialized padded buffer), which preserves this frontend's O(1)
+//! streaming property: `power_spectrogram_kaldi_snip_edges_false_range`
+//! takes an explicit frame range plus a `sample_offset` for a tail-only
+//! buffer, so callers can drop consumed audio exactly as before
+//! (`features_for_frame_range_from`, `earliest_sample_needed_for_frame`).
+//! This is deliberately **not** the shared batch engine in
+//! [`crate::models::kaldi_fbank`] (which firered_aed/dolphin/sensevoice
+//! share): that engine computes a whole buffer in one call, and skips
+//! pre-emphasis/DC-removal/int16 rescale entirely here, plus stores mel
+//! filters densely with precomputed per-mel bin ranges for that range
+//! slicing -- folding *that* into the batch engine would still be a
+//! shared-layer special case rather than a config difference, so the
+//! frame-range caching and sparse-bin-range projection loop stay local.
 
-use std::sync::Arc;
-
-use realfft::{RealFftPlanner, RealToComplex};
+use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale};
+use crate::models::audio_frontend::{
+    KaldiFrameRangeError, PadMode, StftFramer, povey_window_left_aligned,
+};
 
 pub(crate) const XASR_SAMPLE_RATE_HZ: u32 = 16_000;
 pub(crate) const XASR_CHANNELS: u16 = 1;
@@ -57,16 +65,17 @@ pub(crate) enum XasrFrontendError {
 
 #[derive(Clone)]
 pub(crate) struct XasrFbankFrontend {
-    window: Vec<f32>,
+    /// Owns the analysis window and the (planned-once) FFT; planning the
+    /// twiddle tables per call dominated the per-push cost of incremental
+    /// streaming fbank, which is why `StftFramer` builds its plan once at
+    /// construction rather than per `compute_frames_into` call.
+    framer: StftFramer,
     mel_filters: Vec<f32>,
     /// Per-mel half-open `[start, end)` range of nonzero filter bins; the
     /// triangular filters cover only a narrow band, so iterating the full
     /// 257-bin row wastes most of the multiply-adds.
     mel_bin_ranges: Vec<(usize, usize)>,
     fft_bins: usize,
-    /// Planned once: building the planner + twiddle tables per call dominated
-    /// the per-push cost of incremental streaming fbank.
-    fft: Arc<dyn RealToComplex<f32>>,
 }
 
 impl std::fmt::Debug for XasrFbankFrontend {
@@ -86,7 +95,15 @@ impl Default for XasrFbankFrontend {
 impl XasrFbankFrontend {
     pub(crate) fn new() -> Self {
         let fft_bins = N_FFT / 2 + 1;
-        let mel_filters = htk_mel_filterbank(N_MELS, N_FFT, fft_bins);
+        let mel_filters = crate::models::audio_frontend::mel::filterbank(FilterbankConfig {
+            scale: MelScale::Htk,
+            sample_rate_hz: XASR_SAMPLE_RATE_HZ as f32,
+            n_fft: N_FFT,
+            n_mels: N_MELS,
+            fmin: MEL_FMIN,
+            fmax: MEL_FMAX,
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
+        });
         let mel_bin_ranges = (0..N_MELS)
             .map(|mel| {
                 let row = &mel_filters[mel * fft_bins..(mel + 1) * fft_bins];
@@ -95,12 +112,18 @@ impl XasrFbankFrontend {
                 (start, end.max(start))
             })
             .collect();
+        let framer = StftFramer::new(
+            N_FFT,
+            FRAME_LENGTH,
+            FRAME_SHIFT,
+            PadMode::KaldiSnipEdgesFalse,
+            povey_window_left_aligned(FRAME_LENGTH, N_FFT),
+        );
         Self {
-            window: povey_window(FRAME_LENGTH),
+            framer,
             mel_filters,
             mel_bin_ranges,
             fft_bins,
-            fft: RealFftPlanner::<f32>::new().plan_fft_forward(N_FFT),
         }
     }
 
@@ -179,28 +202,24 @@ impl XasrFbankFrontend {
         output: &mut [f32],
     ) -> Result<(), XasrFrontendError> {
         let total_len = sample_offset + samples.len();
-        let r2c = &self.fft;
-        let mut fft_in = r2c.make_input_vec();
-        let mut fft_out = r2c.make_output_vec();
-        let mut scratch = r2c.make_scratch_vec();
-        let mut power = vec![0.0_f32; self.fft_bins];
+        let spectrogram = self
+            .framer
+            .power_spectrogram_kaldi_snip_edges_false_range(
+                samples,
+                sample_offset,
+                total_len,
+                start_frame,
+                end_frame,
+            )
+            .map_err(|error| match error {
+                KaldiFrameRangeError::MissingPrefix { frame } => {
+                    XasrFrontendError::MissingPrefix { frame }
+                }
+            })?;
 
         for frame in start_frame..end_frame {
-            fft_in.fill(0.0);
-            let start = frame as isize * FRAME_SHIFT as isize - (FRAME_LENGTH as isize / 2)
-                + (FRAME_SHIFT as isize / 2);
-            for (i, sample) in fft_in.iter_mut().enumerate().take(FRAME_LENGTH) {
-                let absolute_idx = reflect_sample_index(start + i as isize, total_len);
-                let sample_idx = absolute_idx
-                    .checked_sub(sample_offset)
-                    .ok_or(XasrFrontendError::MissingPrefix { frame })?;
-                *sample = samples[sample_idx] * self.window[i];
-            }
-            r2c.process_with_scratch(&mut fft_in, &mut fft_out, &mut scratch)
-                .expect("rfft");
-            for (bin, value) in fft_out.iter().enumerate() {
-                power[bin] = value.norm_sqr();
-            }
+            let power = &spectrogram.data
+                [(frame - start_frame) * self.fft_bins..(frame - start_frame + 1) * self.fft_bins];
             let row_offset = (frame - start_frame) * N_MELS;
             for mel in 0..N_MELS {
                 let row = &self.mel_filters[mel * self.fft_bins..(mel + 1) * self.fft_bins];
@@ -241,65 +260,6 @@ fn snip_edges_false_frame_count(num_samples: usize) -> usize {
         return 0;
     }
     (num_samples + FRAME_SHIFT / 2) / FRAME_SHIFT
-}
-
-fn reflect_sample_index(index: isize, len: usize) -> usize {
-    if len <= 1 {
-        return 0;
-    }
-    let last = len as isize - 1;
-    let period = 2 * last;
-    let mut folded = index % period;
-    if folded < 0 {
-        folded += period;
-    }
-    if folded > last {
-        (period - folded) as usize
-    } else {
-        folded as usize
-    }
-}
-
-fn povey_window(length: usize) -> Vec<f32> {
-    (0..length)
-        .map(|i| {
-            let hann =
-                0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (length - 1) as f32).cos();
-            hann.powf(0.85)
-        })
-        .collect()
-}
-
-fn hz_to_mel_htk(hz: f32) -> f32 {
-    1127.0 * (1.0 + hz / 700.0).ln()
-}
-
-fn mel_to_hz_htk(mel: f32) -> f32 {
-    700.0 * ((mel / 1127.0).exp() - 1.0)
-}
-
-fn htk_mel_filterbank(n_mels: usize, n_fft: usize, fft_bins: usize) -> Vec<f32> {
-    let mel_min = hz_to_mel_htk(MEL_FMIN);
-    let mel_max = hz_to_mel_htk(MEL_FMAX);
-    let mel_points = (0..n_mels + 2)
-        .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (n_mels + 1) as f32)
-        .map(mel_to_hz_htk)
-        .collect::<Vec<_>>();
-    let fft_freqs = (0..fft_bins)
-        .map(|i| i as f32 * XASR_SAMPLE_RATE_HZ as f32 / n_fft as f32)
-        .collect::<Vec<_>>();
-    let mut filters = vec![0.0_f32; n_mels * fft_bins];
-    for mel in 0..n_mels {
-        let left = mel_points[mel];
-        let center = mel_points[mel + 1];
-        let right = mel_points[mel + 2];
-        for (bin, &freq) in fft_freqs.iter().enumerate() {
-            let lower = (freq - left) / (center - left);
-            let upper = (right - freq) / (right - center);
-            filters[mel * fft_bins + bin] = lower.min(upper).max(0.0);
-        }
-    }
-    filters
 }
 
 #[cfg(test)]
@@ -365,11 +325,16 @@ mod tests {
 
     #[test]
     fn reflection_stays_in_bounds() {
-        let values = (-20..20)
-            .map(|i| reflect_sample_index(i, 5))
+        // Same reflect-index math xasr shipped before this module existed,
+        // now `crate::models::audio_frontend::reflect_index_no_repeat`
+        // (pinned bit-exact there); re-checked here against xasr's own
+        // fixed points since this frontend depends on it directly.
+        use crate::models::audio_frontend::reflect_index_no_repeat;
+        let values = (-20i64..20)
+            .map(|i| reflect_index_no_repeat(5, i))
             .collect::<Vec<_>>();
         assert!(values.iter().all(|&i| i < 5));
-        assert_eq!(reflect_sample_index(-1, 5), 1);
-        assert_eq!(reflect_sample_index(5, 5), 3);
+        assert_eq!(reflect_index_no_repeat(5, -1), 1);
+        assert_eq!(reflect_index_no_repeat(5, 5), 3);
     }
 }
