@@ -547,6 +547,36 @@ where
     })
 }
 
+/// Conformer Transformer-XL relative-position sinusoidal table: the per-frame
+/// `[2*frame_count-1, d_model]` sin/cos table that `conformer_block`'s
+/// `rel_shift` view consumes. Pure math, no model-specific state -- generic
+/// over the caller's error `E` (via `overflow_err`) like every other `nn/`
+/// builder, so no family's error type leaks into another's.
+pub(crate) fn build_relative_positional_encoding<E>(
+    d_model: usize,
+    frame_count: usize,
+    overflow_err: impl Fn() -> E,
+) -> Result<Vec<f32>, E> {
+    let n_positions = frame_count
+        .checked_mul(2)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or_else(&overflow_err)?;
+    let total = n_positions.checked_mul(d_model).ok_or_else(overflow_err)?;
+    let mut values = vec![0.0_f32; total];
+    for position_idx in 0..n_positions {
+        let pos = (frame_count - 1) as f32 - position_idx as f32;
+        for j in 0..(d_model / 2) {
+            let div = 10000.0_f32.powf((2.0 * j as f32) / d_model as f32);
+            let base = position_idx * d_model + 2 * j;
+            values[base] = (pos / div).sin();
+            if base + 1 < values.len() {
+                values[base + 1] = (pos / div).cos();
+            }
+        }
+    }
+    Ok(values)
+}
+
 /// Scalar/shape knobs for one standard pre-norm Transformer encoder block
 /// (masked scaled-dot self-attention + a single biased FFN — the Whisper /
 /// Qwen-audio encoder shape).
