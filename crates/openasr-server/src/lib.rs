@@ -358,8 +358,13 @@ struct TlsIdentity {
 /// usable without re-parsing X.509 fields. Stored as plain JSON like
 /// `pairing-registry.json`; the private key field is the sensitive one,
 /// which is why `persist_tls_identity` writes the file with owner-only
-/// (0600) permissions, matching the pairing store and API key store's
-/// convention for secret-bearing files under OPENASR_HOME.
+/// (0600) permissions from the moment it is created -- on unix, via
+/// `openasr_core::write_owner_only_file_atomically`, there is no
+/// group/other-readable window at any point, matching the pairing store and
+/// API key store's convention for secret-bearing files under OPENASR_HOME.
+/// Windows has no equivalent owner-only chmod here; the file relies on the
+/// user profile directory's default ACL (see `write_owner_only_file_atomically`'s
+/// unix-only permission step) -- tracked as a gap, not fixed by this PR.
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedTlsIdentity {
     subject_alt_names: Vec<String>,
@@ -447,10 +452,13 @@ fn tls_identity_from_der(
 ///
 /// Fail-closed on a damaged store: a present-but-corrupt or
 /// permission-denied file is never silently treated as "no identity yet" --
-/// only a genuinely missing file is. Any other read/parse error falls
+/// only a genuinely missing file is. Any other read/parse error, *and* a
+/// present-and-well-formed-JSON-but-unusable DER payload (truncated/bit-flipped
+/// key or certificate bytes that parse as JSON but fail to build into a
+/// rustls `ServerConfig` -- see the `tls_identity_from_der` call below), falls
 /// through to generating (and re-persisting) a fresh identity, logging why,
-/// rather than risk serving with a partially-loaded or tampered keypair. A
-/// missing file, or an expired/SAN-mismatched identity, are ordinary
+/// rather than risking a hard startup failure over a damaged on-disk keypair.
+/// A missing file, or an expired/SAN-mismatched identity, are ordinary
 /// rotation and are not logged as errors.
 fn load_or_generate_self_signed_tls_identity(
     subject_alt_names: &[String],
@@ -459,9 +467,25 @@ fn load_or_generate_self_signed_tls_identity(
     let Some(store_path) = store_path else {
         return self_signed_tls_identity(subject_alt_names);
     };
+    harden_tls_identity_store_dir_permissions(store_path);
     match load_persisted_tls_identity(store_path, subject_alt_names) {
         Ok(Some((certificate_der, private_key_der))) => {
-            return tls_identity_from_der(certificate_der, private_key_der);
+            match tls_identity_from_der(certificate_der, private_key_der) {
+                Ok(identity) => return Ok(identity),
+                Err(error) => {
+                    // Legitimate JSON envelope, but the DER payload inside it
+                    // does not parse/build into a usable rustls keypair
+                    // (truncated write, bit flip, hand-edited file). Treat
+                    // exactly like corrupt JSON: log and regenerate below,
+                    // rather than let the `?`-propagated error here fail
+                    // serve's startup outright and require manual deletion of
+                    // the store file to recover.
+                    eprintln!(
+                        "openasr-server: persisted TLS identity at {} did not load as a valid keypair/certificate ({error}); treating as corrupt and regenerating (paired remote clients will need to re-confirm the new fingerprint)",
+                        store_path.display()
+                    );
+                }
+            }
         }
         Ok(None) => {
             // Missing, expired, or issued for different subject alt names:
@@ -486,6 +510,40 @@ fn load_or_generate_self_signed_tls_identity(
         not_after_unix_secs,
     );
     tls_identity_from_der(certificate_der, private_key_der)
+}
+
+/// Best-effort owner-only (0700) hardening of the directory that will hold
+/// `store_path` (in practice `OPENASR_HOME`), applied unconditionally on
+/// every load/generate call -- not just the first time the directory is
+/// created -- so a directory that predates this PR (or was widened by some
+/// other tool) gets tightened back up on the next daemon start rather than
+/// staying at whatever mode `create_dir_all` + the process umask produced.
+/// Creates the directory if it does not exist yet (the TLS identity store,
+/// unlike the pairing/API-key stores, has no other writer upstream in the
+/// boot sequence that is guaranteed to have created `OPENASR_HOME` first).
+/// Never fails serve over this: a create or chmod failure is logged and
+/// swallowed, matching every other persistence step in this module.
+fn harden_tls_identity_store_dir_permissions(store_path: &Path) {
+    let Some(parent) = store_path.parent() else {
+        return;
+    };
+    if let Err(error) = fs::create_dir_all(parent) {
+        eprintln!(
+            "openasr-server: could not create {} to hold the TLS identity store ({error}); continuing (persistence may fail)",
+            parent.display()
+        );
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
+            eprintln!(
+                "openasr-server: could not tighten {} to owner-only (0700) permissions ({error}); continuing",
+                parent.display()
+            );
+        }
+    }
 }
 
 /// Returns `Ok(Some(..))` when `store_path` holds a still-usable identity for
@@ -535,10 +593,15 @@ fn load_persisted_tls_identity(
 
 /// Persists `certificate_der`/`private_key_der` (plus the metadata needed to
 /// validate reuse later) to `store_path`, atomically and with owner-only
-/// (0600) permissions -- this is the only place a self-signed TLS private key
-/// touches disk. Best-effort: a write failure is logged and otherwise
-/// swallowed (the freshly generated in-memory identity still serves this
-/// boot; it simply will not survive the next restart), matching
+/// (0600) permissions applied from the moment the temporary file is
+/// created (on unix; see `openasr_core::write_owner_only_file_atomically`) --
+/// this is the only place a self-signed TLS private key touches disk. Unlike
+/// a plain atomic write followed by a post-rename `chmod`, there is no
+/// window where the renamed file (or its temp-file predecessor) is
+/// group/other readable: the raw PKCS8 key never sits on disk at a
+/// permissive mode, even transiently. Best-effort: a write failure is logged
+/// and otherwise swallowed (the freshly generated in-memory identity still
+/// serves this boot; it simply will not survive the next restart), matching
 /// `persist_pairing_credentials_locked`'s "never fail serve over a
 /// persistence hiccup" posture.
 fn persist_tls_identity(
@@ -558,19 +621,11 @@ fn persist_tls_identity(
     };
     match serde_json::to_vec_pretty(&persisted) {
         Ok(bytes) => {
-            if let Err(error) = write_bytes_atomically(store_path, &bytes) {
+            if let Err(error) = openasr_core::write_owner_only_file_atomically(store_path, &bytes) {
                 eprintln!(
                     "openasr-server: could not persist TLS identity to {} (continuing without persistence; this identity will not survive a restart): {error}",
                     store_path.display()
                 );
-            } else {
-                // Holds a private key: owner-only, like the pairing store and
-                // API key store.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(store_path, std::fs::Permissions::from_mode(0o600));
-                }
             }
         }
         Err(error) => {
@@ -619,6 +674,22 @@ impl Listener for TlsListener {
     }
 }
 
+/// Generates a brand-new, wholly ephemeral self-signed identity for
+/// `subject_alt_names` and returns its certificate fingerprint. **Not** a
+/// preview of, or in any way tied to, the identity a real
+/// `--tls-self-signed` daemon actually serves: it calls
+/// `self_signed_tls_identity` directly (bypassing
+/// `load_or_generate_self_signed_tls_identity` and any `tls_identity_store`),
+/// so every call mints a fresh keypair+certificate with its own fingerprint,
+/// independent of whatever a running daemon has persisted to
+/// `OPENASR_HOME/tls-identity.json`. Do not use this to predict or display
+/// "the" server fingerprint for a paired/persisted identity -- read that from
+/// a live server's `/health` or pairing response instead. Kept as-is
+/// (unchanged by the TLS-identity-persistence work) because nothing in this
+/// codebase currently calls it for that purpose; if a future caller wants a
+/// persistence-aware preview, it should call
+/// `load_or_generate_self_signed_tls_identity` (or a thin wrapper around it)
+/// instead of this function.
 pub fn server_certificate_fingerprint_for_subject_alt_names(
     subject_alt_names: impl IntoIterator<Item = impl Into<String>>,
 ) -> anyhow::Result<String> {

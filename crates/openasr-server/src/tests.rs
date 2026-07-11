@@ -732,6 +732,207 @@ fn load_or_generate_self_signed_tls_identity_regenerates_on_expired_certificate(
     assert!(persisted.not_after_unix_secs > unix_now_secs());
 }
 
+#[cfg(unix)]
+#[test]
+fn load_or_generate_self_signed_tls_identity_hardens_openasr_home_to_0700() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("openasr-home");
+    // Simulate an OPENASR_HOME that predates this PR (or was widened by some
+    // other tool/umask): world-traversable 0755, the `create_dir_all`
+    // default under a typical 022 umask.
+    fs::create_dir_all(&home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+    let store_path = home.join("tls-identity.json");
+    let sans = vec!["localhost".to_string()];
+
+    load_or_generate_self_signed_tls_identity(&sans, Some(&store_path)).unwrap();
+
+    let mode = fs::metadata(&home).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "OPENASR_HOME must be tightened to owner-only even when it already existed wider"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn load_or_generate_self_signed_tls_identity_creates_and_hardens_missing_openasr_home() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    // Deliberately does not exist yet -- the TLS identity store has no other
+    // writer upstream (unlike apikeys.json/pairing-registry.json) guaranteed
+    // to have created OPENASR_HOME first.
+    let home = temp.path().join("openasr-home");
+    let store_path = home.join("tls-identity.json");
+    let sans = vec!["localhost".to_string()];
+    assert!(!home.exists());
+
+    load_or_generate_self_signed_tls_identity(&sans, Some(&store_path)).unwrap();
+
+    let mode = fs::metadata(&home).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
+#[test]
+fn load_or_generate_self_signed_tls_identity_regenerates_on_corrupt_der_inside_valid_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let store_path = temp.path().join("tls-identity.json");
+    let sans = vec!["localhost".to_string()];
+
+    // The JSON envelope itself is well-formed (unlike
+    // `..._regenerates_on_corrupt_store`, which corrupts the JSON layer) --
+    // only the DER payloads inside it are garbage, simulating a truncated
+    // write or a bit-flipped disk that still leaves valid-looking JSON
+    // structure. `load_persisted_tls_identity` only checks the DER fields are
+    // non-empty, so this reaches `tls_identity_from_der` and must be handled
+    // there (this is the regression test for S1: before the fix, the `?`
+    // inside `tls_identity_from_der`'s rustls `with_single_cert` call
+    // propagated straight out of `load_or_generate_self_signed_tls_identity`,
+    // failing serve's startup instead of rotating).
+    let corrupt = PersistedTlsIdentity {
+        subject_alt_names: sans.clone(),
+        certificate_der: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        private_key_der: vec![8, 7, 6, 5, 4, 3, 2, 1],
+        not_before_unix_secs: unix_now_secs().saturating_sub(3600),
+        not_after_unix_secs: unix_now_secs() + 3600,
+    };
+    fs::write(&store_path, serde_json::to_vec_pretty(&corrupt).unwrap()).unwrap();
+
+    let identity = load_or_generate_self_signed_tls_identity(&sans, Some(&store_path))
+        .expect("a DER-corrupt-but-JSON-valid store must regenerate, not fail startup");
+
+    assert_eq!(identity.certificate_sha256.len(), 64);
+    // The corrupt DER must have been overwritten with a freshly generated,
+    // internally-consistent identity, not left in place for the next boot to
+    // trip over again.
+    let persisted: PersistedTlsIdentity =
+        serde_json::from_slice(&fs::read(&store_path).unwrap()).unwrap();
+    assert_eq!(
+        certificate_fingerprint_sha256(&persisted.certificate_der),
+        identity.certificate_sha256
+    );
+    // The regenerated identity must actually build into a usable rustls
+    // config, i.e. round-trips through `tls_identity_from_der` cleanly.
+    tls_identity_from_der(persisted.certificate_der, persisted.private_key_der)
+        .expect("regenerated identity must itself load back as a valid keypair/certificate");
+}
+
+#[test]
+fn load_or_generate_self_signed_tls_identity_regenerates_on_key_cert_mismatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let store_path = temp.path().join("tls-identity.json");
+    let sans = vec!["localhost".to_string()];
+
+    // Each half is individually well-formed DER, but the private key does
+    // not correspond to the certificate's public key -- rustls's
+    // `with_single_cert` documents that it fails in exactly this case ("if
+    // the SubjectPublicKeyInfo from the private key does not match the
+    // public key for the end-entity certificate"). Simulates one field of a
+    // persisted identity being replaced/corrupted independently of the
+    // other.
+    let (certificate_der, _matching_key_der, ..) =
+        generate_self_signed_tls_material(&sans).unwrap();
+    let (_other_certificate_der, mismatched_key_der, ..) =
+        generate_self_signed_tls_material(&sans).unwrap();
+    let mismatched = PersistedTlsIdentity {
+        subject_alt_names: sans.clone(),
+        certificate_der,
+        private_key_der: mismatched_key_der,
+        not_before_unix_secs: unix_now_secs().saturating_sub(3600),
+        not_after_unix_secs: unix_now_secs() + 3600,
+    };
+    fs::write(&store_path, serde_json::to_vec_pretty(&mismatched).unwrap()).unwrap();
+
+    let identity = load_or_generate_self_signed_tls_identity(&sans, Some(&store_path))
+        .expect("a key/cert mismatch must regenerate, not fail startup");
+
+    let persisted: PersistedTlsIdentity =
+        serde_json::from_slice(&fs::read(&store_path).unwrap()).unwrap();
+    assert_eq!(
+        certificate_fingerprint_sha256(&persisted.certificate_der),
+        identity.certificate_sha256
+    );
+    tls_identity_from_der(persisted.certificate_der, persisted.private_key_der)
+        .expect("regenerated identity must have a matching key and certificate");
+}
+
+/// `write_bytes_atomically`'s rename is atomic, but there is no cross-process
+/// file lock around "read store, decide to (re)generate, write store" -- the
+/// TLS identity store has the same gap the review flagged for
+/// `persist_pairing_credentials_locked` (whose `_locked` suffix is an
+/// in-process `Mutex`, not an `flock`). Two daemons racing their first
+/// `--tls-self-signed` start against the same `OPENASR_HOME` can each
+/// generate their own identity and each call `persist_tls_identity`; the
+/// atomic rename means the loser's write is fully overwritten (never a
+/// torn/partial file), but the two in-memory server processes end up serving
+/// *different* certificates for one boot cycle, and only one of the two
+/// generated identities survives on disk.
+///
+/// This is a known, documented gap (see `load_or_generate_self_signed_tls_identity`'s
+/// module-level discussion and the PR description) rather than something this
+/// test suite adds cross-process locking for. What *is* guaranteed, and what
+/// this test pins down, is that the loser's overwrite never corrupts the
+/// store into something unusable: whichever identity's `persist_tls_identity`
+/// call won the race is a complete, well-formed, self-consistent identity,
+/// and the next daemon start (no race this time) loads it back rather than
+/// tripping the corrupt-store regeneration path.
+#[test]
+fn concurrent_first_boot_race_self_heals_to_the_last_writer_on_next_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let store_path = temp.path().join("tls-identity.json");
+    let sans = vec!["localhost".to_string()];
+
+    // Two "processes" independently generate an identity before either has
+    // written anything -- the miss-then-generate race window.
+    let (first_cert, first_key, first_not_before, first_not_after) =
+        generate_self_signed_tls_material(&sans).unwrap();
+    let (second_cert, second_key, second_not_before, second_not_after) =
+        generate_self_signed_tls_material(&sans).unwrap();
+    let first_fingerprint = certificate_fingerprint_sha256(&first_cert);
+    let second_fingerprint = certificate_fingerprint_sha256(&second_cert);
+    assert_ne!(
+        first_fingerprint, second_fingerprint,
+        "two independent generations must not coincidentally collide"
+    );
+
+    // Both persist, "first" then "second" -- last-writer-wins via atomic
+    // rename (see `write_bytes_atomically` / `openasr_core::write_owner_only_file_atomically`).
+    persist_tls_identity(
+        &store_path,
+        &sans,
+        &first_cert,
+        &first_key,
+        first_not_before,
+        first_not_after,
+    );
+    persist_tls_identity(
+        &store_path,
+        &sans,
+        &second_cert,
+        &second_key,
+        second_not_before,
+        second_not_after,
+    );
+
+    // Next daemon start (no concurrent writer this time) must load the
+    // survivor back cleanly -- not trip the corrupt-store/DER-mismatch
+    // regeneration path added for S1, and not silently keep serving the
+    // loser's in-memory identity forever.
+    let loaded = load_or_generate_self_signed_tls_identity(&sans, Some(&store_path)).unwrap();
+    assert_eq!(loaded.certificate_sha256, second_fingerprint);
+    assert_ne!(loaded.certificate_sha256, first_fingerprint);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&store_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}
+
 #[tokio::test]
 async fn loopback_tls_pairing_device_transcription_skips_server_history() {
     let temp = tempfile::tempdir().unwrap();
