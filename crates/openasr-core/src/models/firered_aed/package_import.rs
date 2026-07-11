@@ -49,6 +49,7 @@ use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
     read_gguf_tensor_index, write_gguf_file_v0,
 };
+use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale, filterbank};
 use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f16_bits,
@@ -812,32 +813,21 @@ fn build_firered_runtime_tensors(
 
 /// Kaldi/HTK mel filterbank `[n_mels, fft_bins]` (peak-normalized triangles)
 /// for the frontend phase, matching the dolphin fbank convention (both
-/// frontends are kaldi-style 80-mel/25ms/10ms/16kHz).
+/// frontends are kaldi-style 80-mel/25ms/10ms/16kHz), via the shared
+/// [`crate::models::audio_frontend::mel`] `MelScale::Kaldi` construction.
 fn build_mel_filterbank_tensor(n_mels: usize) -> GgufWriteTensor {
     let fft_bins = FFT_SIZE / 2 + 1;
     let high_hz = (SAMPLE_RATE_HZ as f32) / 2.0;
-    let mel_low = hz_to_mel(MEL_LOW_HZ);
-    let mel_high = hz_to_mel(high_hz);
-    let mel_delta = (mel_high - mel_low) / (n_mels as f32 + 1.0);
-
-    let mut filters = vec![0.0_f32; n_mels * fft_bins];
-    for mel_idx in 0..n_mels {
-        let left = mel_low + (mel_idx as f32) * mel_delta;
-        let center = mel_low + (mel_idx as f32 + 1.0) * mel_delta;
-        let right = mel_low + (mel_idx as f32 + 2.0) * mel_delta;
-        for (bin_idx, cell) in filters
-            .iter_mut()
-            .skip(mel_idx * fft_bins)
-            .take(fft_bins)
-            .enumerate()
-        {
-            let hz = (bin_idx as f32) * (SAMPLE_RATE_HZ as f32) / (FFT_SIZE as f32);
-            let mel = hz_to_mel(hz);
-            let rising = (mel - left) / (center - left);
-            let falling = (right - mel) / (right - center);
-            *cell = rising.min(falling).max(0.0);
-        }
-    }
+    let filters = filterbank(FilterbankConfig {
+        scale: MelScale::Kaldi,
+        sample_rate_hz: SAMPLE_RATE_HZ as f32,
+        n_fft: FFT_SIZE,
+        n_mels,
+        fmin: MEL_LOW_HZ,
+        fmax: high_hz,
+        // Not consulted by `MelScale::Kaldi` (mel-domain edges, no round-trip).
+        mel_point_order: MelPointOrder::SpanTimesIndexFirst,
+    });
     let mut bytes = Vec::with_capacity(filters.len() * 4);
     for value in &filters {
         bytes.extend_from_slice(&value.to_le_bytes());
@@ -848,11 +838,6 @@ fn build_mel_filterbank_tensor(n_mels: usize) -> GgufWriteTensor {
         tensor_type: GgufWriteTensorType::F32,
         data: bytes,
     }
-}
-
-/// Kaldi/HTK mel scale: `mel(f) = 1127 * ln(1 + f / 700)`.
-fn hz_to_mel(hz: f32) -> f32 {
-    1127.0 * (1.0 + hz / 700.0).ln()
 }
 
 fn firered_runtime_gguf_metadata(
@@ -1227,6 +1212,63 @@ mod tests {
                 assert!(message.contains("unrecognized tensor"), "{message}");
             }
             other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    /// Exact reimplementation of this importer's pre-shared-mel-module
+    /// `build_mel_filterbank_tensor`/`hz_to_mel` (the version that shipped
+    /// before it was switched to `crate::models::audio_frontend::mel`'s
+    /// `MelScale::Kaldi` construction), kept only here to pin the baked
+    /// `firered.mel_filters` tensor to a byte-identical value across the
+    /// migration.
+    fn reference_pre_refactor_build_mel_filterbank_tensor(n_mels: usize) -> GgufWriteTensor {
+        fn hz_to_mel(hz: f32) -> f32 {
+            1127.0 * (1.0 + hz / 700.0).ln()
+        }
+        let fft_bins = FFT_SIZE / 2 + 1;
+        let high_hz = (SAMPLE_RATE_HZ as f32) / 2.0;
+        let mel_low = hz_to_mel(MEL_LOW_HZ);
+        let mel_high = hz_to_mel(high_hz);
+        let mel_delta = (mel_high - mel_low) / (n_mels as f32 + 1.0);
+
+        let mut filters = vec![0.0_f32; n_mels * fft_bins];
+        for mel_idx in 0..n_mels {
+            let left = mel_low + (mel_idx as f32) * mel_delta;
+            let center = mel_low + (mel_idx as f32 + 1.0) * mel_delta;
+            let right = mel_low + (mel_idx as f32 + 2.0) * mel_delta;
+            for (bin_idx, cell) in filters
+                .iter_mut()
+                .skip(mel_idx * fft_bins)
+                .take(fft_bins)
+                .enumerate()
+            {
+                let hz = (bin_idx as f32) * (SAMPLE_RATE_HZ as f32) / (FFT_SIZE as f32);
+                let mel = hz_to_mel(hz);
+                let rising = (mel - left) / (center - left);
+                let falling = (right - mel) / (right - center);
+                *cell = rising.min(falling).max(0.0);
+            }
+        }
+        let mut bytes = Vec::with_capacity(filters.len() * 4);
+        for value in &filters {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        GgufWriteTensor {
+            name: "firered.mel_filters".to_string(),
+            dims: vec![n_mels as u64, fft_bins as u64],
+            tensor_type: GgufWriteTensorType::F32,
+            data: bytes,
+        }
+    }
+
+    #[test]
+    fn mel_filterbank_tensor_is_byte_identical_to_pre_refactor_impl() {
+        for n_mels in [80usize, 128usize] {
+            let expected = reference_pre_refactor_build_mel_filterbank_tensor(n_mels);
+            let actual = build_mel_filterbank_tensor(n_mels);
+            assert_eq!(expected.dims, actual.dims, "n_mels={n_mels}");
+            assert_eq!(expected.tensor_type, actual.tensor_type, "n_mels={n_mels}");
+            assert_eq!(expected.data, actual.data, "n_mels={n_mels}");
         }
     }
 }
