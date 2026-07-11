@@ -17,7 +17,16 @@ pub(crate) fn write_file_atomically(path: &Path, contents: &[u8]) -> io::Result<
     )
 }
 
-pub(crate) fn write_owner_only_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+/// Atomically writes `contents` to `path`, creating the temporary file with
+/// owner-only (0600) permissions from the moment it is created (not
+/// after-the-fact via a post-rename `chmod`), then re-asserting 0600 on the
+/// renamed target as a defense-in-depth belt-and-suspenders step. Callers
+/// with secret-bearing files (API key hashes, voiceprint enrollments, TLS
+/// private keys) use this instead of [`write_file_atomically`] so there is
+/// never a window where the file is readable by group/other, regardless of
+/// umask. Exposed crate-externally (via the crate-root re-export) for
+/// `openasr-server`'s TLS identity store, which holds a raw private key.
+pub fn write_owner_only_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     write_owner_only_file_atomically_with(&RealAtomicFileSystem, path, contents)
 }
 
@@ -104,6 +113,14 @@ impl AtomicFileSystem for RealAtomicFileSystem {
         options.open(path)
     }
 
+    // TODO(windows): this is a no-op on Windows. An owner-only equivalent
+    // would mean building and applying a DACL (via
+    // Win32_Security_Authorization's SetNamedSecurityInfoW or similar) that
+    // grants access only to the current user's SID -- meaningfully more than
+    // a `windows-sys` feature-flag addition, so it is not done here. Secret
+    // stores written through `write_owner_only_file_atomically` (API keys,
+    // voiceprint enrollments, TLS private keys) rely on the Windows user
+    // profile directory's default ACL for protection on that platform.
     fn set_owner_only_permissions(&self, path: &Path) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -403,6 +420,33 @@ mod tests {
         assert_eq!(
             fs.state.owner_only_permission_paths.borrow().as_slice(),
             &[fs.temp_path()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_temp_file_is_0600_from_the_moment_it_is_created() {
+        // Regression test for a write-then-chmod window: exercises the real
+        // (non-faked) `RealAtomicFileSystem::create_new` in `OwnerOnly` mode
+        // and stats the temp file immediately -- before any `write_all`,
+        // `rename`, or the later explicit `set_owner_only_permissions` call
+        // that `write_file_atomically_with` performs on the renamed target --
+        // to pin down that the file is 0600 from creation, not merely 0600 in
+        // steady state. A temp file created with a permissive default mode
+        // (0666 & ~umask, commonly 0644) and only tightened to 0600 after
+        // rename would leave a group/other-readable window during which a
+        // local user could read a raw private key off disk.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let temp_path = dir.path().join(".probe.tmp");
+        let file = RealAtomicFileSystem
+            .create_new(&temp_path, AtomicFileMode::OwnerOnly)
+            .unwrap();
+        let mode = file.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "temp file must be 0600 the instant create_new returns, before any later chmod"
         );
     }
 }

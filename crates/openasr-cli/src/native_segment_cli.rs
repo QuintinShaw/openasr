@@ -523,6 +523,12 @@ pub(super) async fn serve(
     launch_options.auth = launch_options
         .auth
         .with_pairing_store(home.join("pairing-registry.json"));
+    // Persist the self-signed TLS private key + certificate under OPENASR_HOME,
+    // alongside pairing-registry.json, so a --tls-self-signed daemon keeps the
+    // same certificate fingerprint (and therefore the same pairing safety code
+    // and every already-paired client's TOFU pin) across the restarts the
+    // desktop performs on every model switch. No-op when TLS is disabled.
+    launch_options.tls_identity_store = Some(home.join("tls-identity.json"));
     // `idle_unload` lives on `Preferences`, not the plain `OpenAsrConfig`
     // already loaded above -- read the full config document for it. A
     // missing/unreadable document (fresh install) falls back to the default
