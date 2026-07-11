@@ -21,7 +21,17 @@ const BYTES_PER_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 /// runtime. `id`/`kind`/`target` use the stable wire vocabulary
 /// (`auto`/`cpu`/`accelerated`) the desktop `ExecutionTarget` mirrors;
 /// `effective_target` is what `auto` actually resolves to on this machine.
+// TS export for the `/v1/devices` HTTP wire contract (openasr-server's
+// `DevicesResponse` pulls this type in): gated to `cfg(test)` so ts-rs is a
+// dev-only dependency, never part of the shipped rlib. See
+// crates/openasr-server/src/http_wire_bindings_test.rs for the golden
+// "regenerate == committed" guard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(any(test, feature = "ts-export"), derive(ts_rs::TS))]
+#[cfg_attr(
+    any(test, feature = "ts-export"),
+    ts(export_to = "generated/http-wire/")
+)]
 pub struct ComputeDevice {
     pub id: String,
     pub name: String,

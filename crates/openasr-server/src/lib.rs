@@ -1818,7 +1818,17 @@ fn cached_native_realtime_capabilities_for_path(path: &Path) -> RealtimeBackendC
     capabilities
 }
 
+// TS export for the HTTP daemon response wire contract (`/health`,
+// `/v1/models`, `/v1/capabilities`, `/v1/devices`): gated to `cfg(test)` so
+// ts-rs is a dev-only dependency, never part of the shipped rlib. See
+// `src/http_wire_bindings_test.rs` for the golden "regenerate == committed"
+// guard, and its module doc for the directory-layout rationale (a few
+// openasr-core capability leaf types are legitimately re-exported here,
+// alongside their already-committed copy under
+// `crates/openasr-core/generated/realtime-wire/`).
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
 struct HealthResponse {
     status: &'static str,
     server_version: &'static str,
@@ -1845,12 +1855,16 @@ struct HealthResponse {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
 struct ModelsResponse {
     object: &'static str,
     data: Vec<ModelResponse>,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
 struct ModelResponse {
     id: String,
     object: &'static str,
@@ -1858,6 +1872,8 @@ struct ModelResponse {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
 struct CapabilitiesResponse {
     object: &'static str,
     transcription: TranscriptionBackendCapabilities,
@@ -1865,6 +1881,8 @@ struct CapabilitiesResponse {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
 struct DevicesResponse {
     object: &'static str,
     /// What the `auto` target resolves to on this daemon (`cpu` or
@@ -2294,6 +2312,10 @@ struct ErrorBody {
     param: Option<String>,
     code: Option<String>,
 }
+
+#[cfg(test)]
+#[path = "http_wire_bindings_test.rs"]
+mod http_wire_bindings_test;
 
 #[cfg(test)]
 #[path = "tests.rs"]

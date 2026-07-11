@@ -1694,6 +1694,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite",
  "tower",
+ "ts-rs",
 ]
 
 [[package]]

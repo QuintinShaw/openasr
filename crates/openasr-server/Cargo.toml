@@ -38,7 +38,21 @@ tokio-rustls.workspace = true
 tokio-stream.workspace = true
 
 [dev-dependencies]
-# Enable the `testing` fixtures only for this crate's tests.
-openasr-core = { workspace = true, features = ["testing"] }
+# Enable the `testing` fixtures, and (for this crate's HTTP wire golden test
+# only) openasr-core's `ts-export` feature. `cfg(test)` inside openasr-core
+# itself would only fire when openasr-core is compiled as *its own* test
+# target, not when it is linked as an ordinary library dependency of this
+# crate's test binary -- see openasr-core's Cargo.toml comment on
+# `ts-export` for why a feature flag is the mechanism instead. This edge is
+# the only place that turns it on: openasr-core's real build, and every
+# other consumer, never see ts-rs.
+openasr-core = { workspace = true, features = ["testing", "ts-export"] }
 tokio-tungstenite.workspace = true
 tower.workspace = true
+# TS binding codegen for the `/health` / `/v1/models` / `/v1/capabilities` /
+# `/v1/devices` HTTP response wire types (see `src/http_wire_bindings_test.rs`).
+# Dev-only: the derive is gated behind `#[cfg_attr(test, derive(ts_rs::TS))]`
+# on the response structs, so this never becomes part of the shipped rlib --
+# it only participates in `cargo test` builds. `no-serde-warnings` matches
+# openasr-core's own use of this dependency (see its Cargo.toml comment).
+ts-rs = { version = "12.0.1", features = ["no-serde-warnings"] }
