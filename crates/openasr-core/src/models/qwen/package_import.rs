@@ -10,6 +10,7 @@ use crate::ggml_runtime::{
     read_gguf_tensor_index_from_runtime_source, validate_ggml_runtime_source_path,
     write_gguf_file_v0,
 };
+use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale, filterbank};
 use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::ggml_family_registry::{
     QWEN3_ASR_AUDIO_FRONTEND_ID, QWEN3_ASR_DECODE_POLICY_ID, QWEN3_ASR_GGML_ARCHITECTURE_ID,
@@ -835,6 +836,10 @@ fn hann_window(length: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Slaney-scale filterbank, via the shared
+/// [`crate::models::audio_frontend::mel`] `MelScale::Slaney` +
+/// `MelPointOrder::RatioFirst` construction (the same hz<->mel warp, edge
+/// placement, and ramp/area-normalization `whisper`'s frontend uses).
 fn slaney_mel_filterbank(
     n_mels: usize,
     n_fft: usize,
@@ -843,57 +848,27 @@ fn slaney_mel_filterbank(
     fmax: f32,
 ) -> Result<Vec<f32>, LocalSourceImportError> {
     let fft_bins = n_fft / 2 + 1;
-    let fft_frequencies = (0..fft_bins)
-        .map(|bin| bin as f32 * sample_rate as f32 / n_fft as f32)
-        .collect::<Vec<_>>();
-    let mel_min = hz_to_mel(fmin);
-    let mel_max = hz_to_mel(fmax);
-    let mel_points = (0..n_mels + 2)
-        .map(|index| {
-            let ratio = index as f32 / (n_mels + 1) as f32;
-            mel_to_hz(mel_min + ratio * (mel_max - mel_min))
-        })
-        .collect::<Vec<_>>();
+    let mel_major = filterbank(FilterbankConfig {
+        scale: MelScale::Slaney,
+        sample_rate_hz: sample_rate as f32,
+        n_fft,
+        n_mels,
+        fmin,
+        fmax,
+        mel_point_order: MelPointOrder::RatioFirst,
+    });
     // GGUF stores qwen audio.mel_filters with dims [n_mels, fft_bins], but
     // ggml's ne0/ne1 memory layout makes the contiguous payload freq-major.
-    // Keep the runtime contract aligned with the working cstr reference.
+    // Keep the runtime contract aligned with the working cstr reference:
+    // transpose the shared module's mel-major `[n_mels, fft_bins]` matrix
+    // into `[fft_bins, n_mels]` (bin-major, mel innermost).
     let mut filters = vec![0.0_f32; n_mels * fft_bins];
     for mel_idx in 0..n_mels {
-        let left = mel_points[mel_idx];
-        let center = mel_points[mel_idx + 1];
-        let right = mel_points[mel_idx + 2];
-        let norm = 2.0 / (right - left).max(f32::EPSILON);
-        for (bin_idx, hz) in fft_frequencies.iter().copied().enumerate() {
-            let rising = (hz - left) / (center - left).max(f32::EPSILON);
-            let falling = (right - hz) / (right - center).max(f32::EPSILON);
-            filters[bin_idx * n_mels + mel_idx] = rising.min(falling).max(0.0) * norm;
+        for bin_idx in 0..fft_bins {
+            filters[bin_idx * n_mels + mel_idx] = mel_major[mel_idx * fft_bins + bin_idx];
         }
     }
     Ok(filters)
-}
-
-fn hz_to_mel(hz: f32) -> f32 {
-    let linear_scale = 200.0 / 3.0;
-    let min_log_hz = 1000.0;
-    let min_log_mel = min_log_hz / linear_scale;
-    if hz < min_log_hz {
-        hz / linear_scale
-    } else {
-        let log_step = 6.4_f32.ln() / 27.0;
-        min_log_mel + (hz / min_log_hz).ln() / log_step
-    }
-}
-
-fn mel_to_hz(mel: f32) -> f32 {
-    let linear_scale = 200.0 / 3.0;
-    let min_log_hz = 1000.0;
-    let min_log_mel = min_log_hz / linear_scale;
-    if mel < min_log_mel {
-        mel * linear_scale
-    } else {
-        let log_step = 6.4_f32.ln() / 27.0;
-        min_log_hz * (log_step * (mel - min_log_mel)).exp()
-    }
 }
 
 #[cfg(test)]
@@ -950,6 +925,81 @@ mod tests {
 
         for row in rows {
             assert_eq!(row.len(), 4);
+        }
+    }
+
+    /// Exact reimplementation of this importer's pre-shared-mel-module
+    /// `slaney_mel_filterbank`/`hz_to_mel`/`mel_to_hz` (the version that
+    /// shipped before it was switched to
+    /// `crate::models::audio_frontend::mel`'s `MelScale::Slaney` +
+    /// `MelPointOrder::RatioFirst` construction), kept only here to pin the
+    /// baked `audio.mel_filters` tensor to a byte-identical value across the
+    /// migration. Freq-major layout (`[fft_bins, n_mels]`), same as the live
+    /// function.
+    fn reference_pre_refactor_slaney_mel_filterbank(
+        n_mels: usize,
+        n_fft: usize,
+        sample_rate: u32,
+        fmin: f32,
+        fmax: f32,
+    ) -> Vec<f32> {
+        fn hz_to_mel(hz: f32) -> f32 {
+            let linear_scale = 200.0 / 3.0;
+            let min_log_hz = 1000.0;
+            let min_log_mel = min_log_hz / linear_scale;
+            if hz < min_log_hz {
+                hz / linear_scale
+            } else {
+                let log_step = 6.4_f32.ln() / 27.0;
+                min_log_mel + (hz / min_log_hz).ln() / log_step
+            }
+        }
+        fn mel_to_hz(mel: f32) -> f32 {
+            let linear_scale = 200.0 / 3.0;
+            let min_log_hz = 1000.0;
+            let min_log_mel = min_log_hz / linear_scale;
+            if mel < min_log_mel {
+                mel * linear_scale
+            } else {
+                let log_step = 6.4_f32.ln() / 27.0;
+                min_log_hz * (log_step * (mel - min_log_mel)).exp()
+            }
+        }
+        let fft_bins = n_fft / 2 + 1;
+        let fft_frequencies = (0..fft_bins)
+            .map(|bin| bin as f32 * sample_rate as f32 / n_fft as f32)
+            .collect::<Vec<_>>();
+        let mel_min = hz_to_mel(fmin);
+        let mel_max = hz_to_mel(fmax);
+        let mel_points = (0..n_mels + 2)
+            .map(|index| {
+                let ratio = index as f32 / (n_mels + 1) as f32;
+                mel_to_hz(mel_min + ratio * (mel_max - mel_min))
+            })
+            .collect::<Vec<_>>();
+        let mut filters = vec![0.0_f32; n_mels * fft_bins];
+        for mel_idx in 0..n_mels {
+            let left = mel_points[mel_idx];
+            let center = mel_points[mel_idx + 1];
+            let right = mel_points[mel_idx + 2];
+            let norm = 2.0 / (right - left).max(f32::EPSILON);
+            for (bin_idx, hz) in fft_frequencies.iter().copied().enumerate() {
+                let rising = (hz - left) / (center - left).max(f32::EPSILON);
+                let falling = (right - hz) / (right - center).max(f32::EPSILON);
+                filters[bin_idx * n_mels + mel_idx] = rising.min(falling).max(0.0) * norm;
+            }
+        }
+        filters
+    }
+
+    #[test]
+    fn mel_filterbank_is_byte_identical_to_pre_refactor_impl() {
+        for n_mels in [80usize, 128usize] {
+            let expected =
+                reference_pre_refactor_slaney_mel_filterbank(n_mels, 400, 16_000, 0.0, 8_000.0);
+            let actual = super::slaney_mel_filterbank(n_mels, 400, 16_000, 0.0, 8_000.0)
+                .expect("filterbank");
+            assert_eq!(expected, actual, "n_mels={n_mels}");
         }
     }
 }
