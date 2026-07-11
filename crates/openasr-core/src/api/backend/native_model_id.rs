@@ -24,7 +24,7 @@ pub struct NativeRuntimeModelIdentity {
     pub source: NativeRuntimeModelIdSource,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum NativeRuntimeModelIdentityError {
     #[error("could not validate GGUF-backed runtime source '{path}': {reason}")]
     RuntimeSourceValidation { path: String, reason: String },

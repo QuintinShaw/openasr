@@ -496,11 +496,19 @@ pub(crate) fn warm_up_native_streaming_session_once(
 /// partial. Fire-and-forget: never blocks bind/serve/health, and any failure
 /// here (bad pack, no adapter, ...) is swallowed silently -- a real request
 /// still fails closed with a proper error through the normal request path.
-/// The existing WS-attach `Warm` command (see `start_native_streaming_session`
-/// in `ws_session.rs`) remains the fallback for whatever this boot warm-up
-/// does not cover: no pack bound yet at boot, an explicit
-/// `inference_threads`/`execution_target` that does not match the default
-/// worker key used here, or the bound pack having changed since boot.
+/// Derives its `hardware_target`/`inference_threads` from the user's saved
+/// preferences the same way a real WS attach without an explicit per-session
+/// override does (see `realtime_execution_target_preference` /
+/// `realtime_inference_threads_preference`), so a user who changed their
+/// default execution target or thread count still lands this warm-up on the
+/// same [`NativeStreamingWorkerKey`] their next real attach will use -- a
+/// worker warmed under the *bare* default key would otherwise sit unused
+/// while the real attach pays the cold-build cost on a different key. The
+/// existing WS-attach `Warm` command (see `start_native_streaming_session` in
+/// `ws_session.rs`) remains the fallback for whatever this boot warm-up does
+/// not cover: no pack bound yet at boot, an explicit per-session
+/// `inference_threads`/`execution_target` override that differs from the
+/// saved preference, or the bound pack having changed since boot.
 ///
 /// Dedup with a concurrent real attach is structural, not a flag: this
 /// attaches its own short-lived "session" to the same
@@ -535,15 +543,27 @@ async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {
     let model_pack =
         NativeAsrModelPackRef::new("native-default", adapter.model_family(), model_pack_path);
     let context = NativeAsrSessionContext::new("boot-warmup");
-    let options = NativeAsrRequestOptions::new();
+    // Same saved-preferences fallback a real WS attach applies when a session
+    // does not set an explicit `execution_target`/`inference_threads`
+    // override (`realtime_execution_target_preference` /
+    // `realtime_inference_threads_preference` in `realtime/mod.rs`), so a
+    // user who changed their default hardware target or thread count still
+    // gets a worker warmed at the key their next attach will actually use.
+    // `openasr_home()` resolution failing here (unreadable env, race) just
+    // means "no preference found" -- same graceful fallback to defaults the
+    // request-time paths use.
+    let preferences_home = openasr_core::openasr_home().ok();
+    let inference_threads = preferences_home
+        .as_deref()
+        .and_then(realtime_inference_threads_preference);
+    let execution_target_preference = preferences_home
+        .as_deref()
+        .and_then(realtime_execution_target_preference);
+    let options = NativeAsrRequestOptions::new().with_inference_threads(inference_threads);
     let session_config = NativeAsrStreamingSessionConfig::new()
         .with_audio_format(RealtimeAudioFormat::pcm16_mono_16khz());
     let executor = NativeBackendExecutor;
-    // Matches the hardware target / thread count a WS session defaults to
-    // when the client does not override them (`execution_target` /
-    // `inference_threads` both unset) -- the common case, and exactly the
-    // worker key this warm-up needs to land on to actually help.
-    let hardware_target = native_hardware_target_from_execution_target(None);
+    let hardware_target = native_hardware_target_from_execution_target(execution_target_preference);
     let session = match NativeAsrExecutor::start_streaming_session(
         &executor,
         &adapter,
@@ -556,7 +576,8 @@ async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {
         Ok(session) => session,
         Err(_) => return,
     };
-    let key = NativeStreamingWorkerKey::new(model_pack.root.clone(), hardware_target, None);
+    let key =
+        NativeStreamingWorkerKey::new(model_pack.root.clone(), hardware_target, inference_threads);
     attach_and_run_boot_warmup(key, session).await;
 }
 

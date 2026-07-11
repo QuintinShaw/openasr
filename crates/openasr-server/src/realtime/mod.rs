@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -650,17 +650,22 @@ fn seconds_to_millis(value: f32) -> u64 {
     (value as f64 * 1000.0).round() as u64
 }
 
-fn realtime_inference_threads_preference(distribution: &DistributionContext) -> Option<u16> {
-    let home = distribution.openasr_home().ok()?;
+/// Reads the user's saved `inference_threads` preference from `home`'s config
+/// document. Takes a resolved home directory rather than a
+/// [`DistributionContext`] so it can be shared by both a real WS attach
+/// (which already has one) and the boot warm-up (which runs before the
+/// per-request `DistributionContext` exists) -- see
+/// `warm_up_default_native_streaming_worker` in `native_worker.rs`.
+fn realtime_inference_threads_preference(home: &Path) -> Option<u16> {
     openasr_core::config::load_config_document(home)
         .ok()
         .and_then(|document| document.preferences.inference_threads)
 }
 
-fn realtime_execution_target_preference(
-    distribution: &DistributionContext,
-) -> Option<openasr_core::ExecutionTarget> {
-    let home = distribution.openasr_home().ok()?;
+/// Reads the user's saved `execution_target` preference from `home`'s config
+/// document. See [`realtime_inference_threads_preference`] for why this takes
+/// a resolved home directory instead of a [`DistributionContext`].
+fn realtime_execution_target_preference(home: &Path) -> Option<openasr_core::ExecutionTarget> {
     openasr_core::config::load_config_document(home)
         .ok()
         .map(|document| document.preferences.execution_target)
