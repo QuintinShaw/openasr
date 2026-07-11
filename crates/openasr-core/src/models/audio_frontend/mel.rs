@@ -46,6 +46,48 @@ pub(crate) enum MelScale {
     /// `torchaudio.compliance.kaldi.fbank`'s construction, used by
     /// [`crate::models::kaldi_fbank`] (`firered_aed`/`dolphin`/`sensevoice`).
     Kaldi,
+    /// Same real-valued formula as [`MelScale::Slaney`]
+    /// (`librosa.filters.mel(..., htk=False)`), but every step -- hz<->mel
+    /// warp, edge placement, ramp/area-normalization -- runs in **f64**, only
+    /// casting the final per-bin weight to f32. This is ESPnet's
+    /// `DefaultFrontend`/`LogMel` precision (`dolphin-small`/`dolphin-base`);
+    /// an exhaustive bit comparison against the plain f32 [`MelScale::Slaney`]
+    /// construction shows real mismatches (not just theoretical), so this
+    /// stays a separate scale rather than a precision flag on the f32 path.
+    SlaneyF64Espnet,
+}
+
+/// Which floating-point operation order to use when placing `n_mels + 2`
+/// filter edges evenly spaced in the mel domain between `mel_min` and
+/// `mel_max`. Both orders compute the exact same real number; they round
+/// differently in f32 for some `(n_mels, mel_min, mel_max)` combinations
+/// (confirmed by exhaustive bit comparison for the whisper 80/128-mel
+/// configs), so picking the wrong one silently drifts filter weights -- and
+/// everything downstream -- from a family's pinned pre-refactor
+/// implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MelPointOrder {
+    /// `mel_min + (mel_max - mel_min) * i / (n_mels + 1)`: multiply the mel
+    /// span by the point index before dividing by the point count. Used by
+    /// `parakeet_ctc`/`parakeet_tdt` and `xasr_zipformer`'s Htk filterbank.
+    SpanTimesIndexFirst,
+    /// `mel_min + (i / (n_mels + 1)) * (mel_max - mel_min)`: compute the
+    /// `[0, 1]` ratio first, then scale by the mel span. Used by `whisper`.
+    RatioFirst,
+}
+
+impl MelPointOrder {
+    fn point(self, mel_min: f32, mel_max: f32, i: usize, n_mels: usize) -> f32 {
+        match self {
+            MelPointOrder::SpanTimesIndexFirst => {
+                mel_min + (mel_max - mel_min) * i as f32 / (n_mels + 1) as f32
+            }
+            MelPointOrder::RatioFirst => {
+                let ratio = i as f32 / (n_mels + 1) as f32;
+                mel_min + ratio * (mel_max - mel_min)
+            }
+        }
+    }
 }
 
 /// Geometry for [`filterbank`].
@@ -57,6 +99,11 @@ pub(crate) struct FilterbankConfig {
     pub n_mels: usize,
     pub fmin: f32,
     pub fmax: f32,
+    /// Only consulted by the Hz-domain constructions (`Slaney`/`Htk`);
+    /// ignored by `Kaldi` (mel-domain edges, no round-trip) and
+    /// `SlaneyF64Espnet` (its own f64 edge placement, see
+    /// [`slaney_f64_espnet_filterbank`]).
+    pub mel_point_order: MelPointOrder,
 }
 
 /// `hz -> mel` for `scale`.
@@ -64,6 +111,7 @@ pub(crate) fn hz_to_mel(scale: MelScale, hz: f32) -> f32 {
     match scale {
         MelScale::Slaney => hz_to_mel_slaney(hz),
         MelScale::Htk | MelScale::Kaldi => hz_to_mel_htk(hz),
+        MelScale::SlaneyF64Espnet => hz_to_mel_slaney_f64(hz as f64) as f32,
     }
 }
 
@@ -72,6 +120,7 @@ pub(crate) fn mel_to_hz(scale: MelScale, mel: f32) -> f32 {
     match scale {
         MelScale::Slaney => mel_to_hz_slaney(mel),
         MelScale::Htk | MelScale::Kaldi => mel_to_hz_htk(mel),
+        MelScale::SlaneyF64Espnet => mel_to_hz_slaney_f64(mel as f64) as f32,
     }
 }
 
@@ -82,6 +131,7 @@ pub(crate) fn filterbank(config: FilterbankConfig) -> Vec<f32> {
         MelScale::Slaney => hz_domain_filterbank(config, fft_bins, true),
         MelScale::Htk => hz_domain_filterbank(config, fft_bins, false),
         MelScale::Kaldi => mel_domain_filterbank(config, fft_bins),
+        MelScale::SlaneyF64Espnet => slaney_f64_espnet_filterbank(config, fft_bins),
     }
 }
 
@@ -132,6 +182,7 @@ fn hz_domain_filterbank(config: FilterbankConfig, fft_bins: usize, slaney_norm: 
         n_mels,
         fmin,
         fmax,
+        mel_point_order,
     } = config;
     let fft_freqs: Vec<f32> = (0..fft_bins)
         .map(|i| i as f32 * sample_rate_hz / n_fft as f32)
@@ -139,7 +190,7 @@ fn hz_domain_filterbank(config: FilterbankConfig, fft_bins: usize, slaney_norm: 
     let mel_min = hz_to_mel(scale, fmin);
     let mel_max = hz_to_mel(scale, fmax);
     let mel_points: Vec<f32> = (0..n_mels + 2)
-        .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (n_mels + 1) as f32)
+        .map(|i| mel_point_order.point(mel_min, mel_max, i, n_mels))
         .collect();
     let hz_points: Vec<f32> = mel_points.iter().map(|&m| mel_to_hz(scale, m)).collect();
 
@@ -178,6 +229,7 @@ fn mel_domain_filterbank(config: FilterbankConfig, fft_bins: usize) -> Vec<f32> 
         n_mels,
         fmin,
         fmax,
+        ..
     } = config;
     let fft_bin_width = sample_rate_hz / n_fft as f32;
     let mel_low = hz_to_mel(scale, fmin);
@@ -199,6 +251,79 @@ fn mel_domain_filterbank(config: FilterbankConfig, fft_bins: usize) -> Vec<f32> 
                 };
                 filters[m * fft_bins + k] = weight;
             }
+        }
+    }
+    filters
+}
+
+fn hz_to_mel_slaney_f64(freq: f64) -> f64 {
+    const F_SP: f64 = 200.0 / 3.0;
+    const MIN_LOG_HZ: f64 = 1000.0;
+    const MIN_LOG_MEL: f64 = MIN_LOG_HZ / F_SP; // 15.0
+    let logstep = 6.4f64.ln() / 27.0;
+    if freq >= MIN_LOG_HZ {
+        MIN_LOG_MEL + (freq / MIN_LOG_HZ).ln() / logstep
+    } else {
+        freq / F_SP
+    }
+}
+
+fn mel_to_hz_slaney_f64(mel: f64) -> f64 {
+    const F_SP: f64 = 200.0 / 3.0;
+    const MIN_LOG_HZ: f64 = 1000.0;
+    const MIN_LOG_MEL: f64 = MIN_LOG_HZ / F_SP; // 15.0
+    let logstep = 6.4f64.ln() / 27.0;
+    if mel >= MIN_LOG_MEL {
+        MIN_LOG_HZ * (logstep * (mel - MIN_LOG_MEL)).exp()
+    } else {
+        F_SP * mel
+    }
+}
+
+/// `librosa.filters.mel(sr, n_fft, n_mels, fmin, fmax, htk=False)` computed
+/// entirely in f64 (edges, ramps, area-normalization) -- ESPnet's
+/// `DefaultFrontend`/`LogMel` precision (`dolphin-small`/`dolphin-base`, see
+/// `dolphin::frontend::DolphinEspnetFrontend`). Only the final per-bin
+/// weight is cast to f32. This is a literal port of the pre-refactor
+/// `dolphin::frontend::build_slaney_mel_filters` (same order of operations
+/// throughout), not a new construction.
+fn slaney_f64_espnet_filterbank(config: FilterbankConfig, fft_bins: usize) -> Vec<f32> {
+    let FilterbankConfig {
+        sample_rate_hz,
+        n_fft,
+        n_mels,
+        fmin,
+        fmax,
+        ..
+    } = config;
+    let sr = sample_rate_hz as f64;
+    let fft_freqs: Vec<f64> = (0..fft_bins)
+        .map(|k| k as f64 * sr / n_fft as f64)
+        .collect();
+
+    let min_mel = hz_to_mel_slaney_f64(fmin as f64);
+    let max_mel = hz_to_mel_slaney_f64(fmax as f64);
+    let n_edges = n_mels + 2;
+    let mel_edges_hz: Vec<f64> = (0..n_edges)
+        .map(|i| {
+            let mel = if n_edges == 1 {
+                min_mel
+            } else {
+                min_mel + (max_mel - min_mel) * i as f64 / (n_edges - 1) as f64
+            };
+            mel_to_hz_slaney_f64(mel)
+        })
+        .collect();
+    let fdiff: Vec<f64> = mel_edges_hz.windows(2).map(|w| w[1] - w[0]).collect();
+
+    let mut filters = vec![0.0f32; n_mels * fft_bins];
+    for m in 0..n_mels {
+        let enorm = 2.0 / (mel_edges_hz[m + 2] - mel_edges_hz[m]);
+        for (k, &freq) in fft_freqs.iter().enumerate() {
+            let lower = -(mel_edges_hz[m] - freq) / fdiff[m];
+            let upper = (mel_edges_hz[m + 2] - freq) / fdiff[m + 1];
+            let weight = lower.min(upper).max(0.0) * enorm;
+            filters[m * fft_bins + k] = weight as f32;
         }
     }
     filters
@@ -257,6 +382,7 @@ mod tests {
             n_mels,
             fmin: 0.0,
             fmax: 8_000.0,
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
         });
         assert_eq!(expected, actual);
 
@@ -269,6 +395,7 @@ mod tests {
             n_mels: n_mels128,
             fmin: 0.0,
             fmax: 8_000.0,
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
         });
         assert_eq!(expected128, actual128);
     }
@@ -291,6 +418,7 @@ mod tests {
             n_mels: 80,
             fmin: 20.0,
             fmax: 7_600.0,
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
         });
         for m in 0..80 {
             let row = &fb[m * 257..(m + 1) * 257];
@@ -313,6 +441,7 @@ mod tests {
             n_mels: 80,
             fmin: 20.0,
             fmax: 8_000.0,
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
         });
         for m in 0..80 {
             let row = &fb[m * 257..(m + 1) * 257];
@@ -338,7 +467,12 @@ mod tests {
 
     #[test]
     fn hz_to_mel_and_mel_to_hz_round_trip_for_every_scale() {
-        for scale in [MelScale::Slaney, MelScale::Htk, MelScale::Kaldi] {
+        for scale in [
+            MelScale::Slaney,
+            MelScale::Htk,
+            MelScale::Kaldi,
+            MelScale::SlaneyF64Espnet,
+        ] {
             for hz in [0.0f32, 20.0, 440.0, 1000.0, 4000.0, 8000.0] {
                 let mel = hz_to_mel(scale, hz);
                 let back = mel_to_hz(scale, mel);
@@ -347,6 +481,148 @@ mod tests {
                     "scale={scale:?} hz={hz} round_trip={back}"
                 );
             }
+        }
+    }
+
+    /// Exact reimplementation of the pre-refactor
+    /// `dolphin::frontend::build_slaney_mel_filters` (f64 throughout, cast to
+    /// f32 only for the final weight), kept only in this test to pin
+    /// `MelScale::SlaneyF64Espnet` to the values `DolphinEspnetFrontend`
+    /// shipped before this module existed.
+    fn reference_dolphin_espnet_slaney_f64_filterbank(
+        n_mels: usize,
+        n_fft: usize,
+        fft_bins: usize,
+    ) -> Vec<f32> {
+        fn hz_to_mel(freq: f64) -> f64 {
+            const F_SP: f64 = 200.0 / 3.0;
+            const MIN_LOG_HZ: f64 = 1000.0;
+            const MIN_LOG_MEL: f64 = MIN_LOG_HZ / F_SP;
+            let logstep = 6.4f64.ln() / 27.0;
+            if freq >= MIN_LOG_HZ {
+                MIN_LOG_MEL + (freq / MIN_LOG_HZ).ln() / logstep
+            } else {
+                freq / F_SP
+            }
+        }
+        fn mel_to_hz(mel: f64) -> f64 {
+            const F_SP: f64 = 200.0 / 3.0;
+            const MIN_LOG_HZ: f64 = 1000.0;
+            const MIN_LOG_MEL: f64 = MIN_LOG_HZ / F_SP;
+            let logstep = 6.4f64.ln() / 27.0;
+            if mel >= MIN_LOG_MEL {
+                MIN_LOG_HZ * (logstep * (mel - MIN_LOG_MEL)).exp()
+            } else {
+                F_SP * mel
+            }
+        }
+        const SAMPLE_RATE_HZ: u32 = 16_000;
+        let sr = f64::from(SAMPLE_RATE_HZ);
+        let fft_freqs: Vec<f64> = (0..fft_bins)
+            .map(|k| k as f64 * sr / n_fft as f64)
+            .collect();
+        let min_mel = hz_to_mel(0.0);
+        let max_mel = hz_to_mel(8_000.0);
+        let n_edges = n_mels + 2;
+        let mel_edges_hz: Vec<f64> = (0..n_edges)
+            .map(|i| {
+                let mel = if n_edges == 1 {
+                    min_mel
+                } else {
+                    min_mel + (max_mel - min_mel) * i as f64 / (n_edges - 1) as f64
+                };
+                mel_to_hz(mel)
+            })
+            .collect();
+        let fdiff: Vec<f64> = mel_edges_hz.windows(2).map(|w| w[1] - w[0]).collect();
+        let mut filters = vec![0.0f32; n_mels * fft_bins];
+        for m in 0..n_mels {
+            let enorm = 2.0 / (mel_edges_hz[m + 2] - mel_edges_hz[m]);
+            for (k, &freq) in fft_freqs.iter().enumerate() {
+                let lower = -(mel_edges_hz[m] - freq) / fdiff[m];
+                let upper = (mel_edges_hz[m + 2] - freq) / fdiff[m + 1];
+                let weight = lower.min(upper).max(0.0) * enorm;
+                filters[m * fft_bins + k] = weight as f32;
+            }
+        }
+        filters
+    }
+
+    #[test]
+    fn slaney_f64_espnet_filterbank_is_byte_identical_to_pre_refactor_dolphin_impl() {
+        let (n_mels, n_fft, fft_bins) = (80, 512, 257);
+        let expected = reference_dolphin_espnet_slaney_f64_filterbank(n_mels, n_fft, fft_bins);
+        let actual = filterbank(FilterbankConfig {
+            scale: MelScale::SlaneyF64Espnet,
+            sample_rate_hz: 16_000.0,
+            n_fft,
+            n_mels,
+            fmin: 0.0,
+            fmax: 8_000.0,
+            // Unused by this scale (its own f64 edge placement); any value
+            // must produce the same output.
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
+        });
+        assert_eq!(expected, actual);
+
+        // librosa.filters.mel(...)[0][:4] / [79][240:244] pinned values from
+        // dolphin's own parity test (`slaney_mel_filterbank_matches_librosa_reference`).
+        assert!((actual[1] - 2.253_456e-2).abs() < 1.0e-6);
+        assert!((actual[79 * fft_bins + 240] - 1.066_234_2e-3).abs() < 1.0e-6);
+    }
+
+    /// Exact reimplementation of the pre-refactor `whisper::mel::slaney_mel_filterbank`
+    /// (`RatioFirst` mel-point order), kept only in this test to pin
+    /// `MelPointOrder::RatioFirst` to the values `whisper` shipped before
+    /// this module existed.
+    fn reference_whisper_slaney_filterbank(
+        n_mels: usize,
+        n_fft: usize,
+        fft_bins: usize,
+    ) -> Vec<f32> {
+        const SAMPLE_RATE: f32 = 16_000.0;
+        let fft_frequencies = (0..fft_bins)
+            .map(|bin| bin as f32 * SAMPLE_RATE / n_fft as f32)
+            .collect::<Vec<_>>();
+        let mel_min = hz_to_mel_slaney(0.0);
+        let mel_max = hz_to_mel_slaney(8_000.0);
+        let mel_points = (0..n_mels + 2)
+            .map(|index| {
+                let ratio = index as f32 / (n_mels + 1) as f32;
+                mel_to_hz_slaney(mel_min + ratio * (mel_max - mel_min))
+            })
+            .collect::<Vec<_>>();
+        let mut filters = vec![0.0_f32; n_mels * fft_bins];
+        for mel_idx in 0..n_mels {
+            let left = mel_points[mel_idx];
+            let center = mel_points[mel_idx + 1];
+            let right = mel_points[mel_idx + 2];
+            let norm = 2.0 / (right - left).max(f32::EPSILON);
+            for (bin_idx, hz) in fft_frequencies.iter().copied().enumerate() {
+                let rising = (hz - left) / (center - left).max(f32::EPSILON);
+                let falling = (right - hz) / (right - center).max(f32::EPSILON);
+                let value = rising.min(falling).max(0.0) * norm;
+                filters[mel_idx * fft_bins + bin_idx] = value;
+            }
+        }
+        filters
+    }
+
+    #[test]
+    fn ratio_first_mel_point_order_is_byte_identical_to_pre_refactor_whisper_impl() {
+        for n_mels in [80usize, 128usize] {
+            let (n_fft, fft_bins) = (400, 201);
+            let expected = reference_whisper_slaney_filterbank(n_mels, n_fft, fft_bins);
+            let actual = filterbank(FilterbankConfig {
+                scale: MelScale::Slaney,
+                sample_rate_hz: 16_000.0,
+                n_fft,
+                n_mels,
+                fmin: 0.0,
+                fmax: 8_000.0,
+                mel_point_order: MelPointOrder::RatioFirst,
+            });
+            assert_eq!(expected, actual, "n_mels={n_mels}");
         }
     }
 }

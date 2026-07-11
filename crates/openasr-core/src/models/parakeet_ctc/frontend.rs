@@ -19,7 +19,7 @@
 
 use super::encoder_graph::ParakeetMelFeatures;
 use super::runtime_contract::ParakeetCtcExecutionMetadata;
-use crate::models::audio_frontend::mel::{FilterbankConfig, MelScale};
+use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale};
 use crate::models::audio_frontend::{
     PadMode, StftError, StftFramer, hann_window_centered, per_feature_normalize,
 };
@@ -87,6 +87,7 @@ impl ParakeetFrontend {
             n_mels,
             fmin: MEL_FMIN,
             fmax: MEL_FMAX,
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
         });
         Self {
             n_mels,
@@ -186,6 +187,7 @@ mod tests {
             n_mels: 80,
             fmin: MEL_FMIN,
             fmax: MEL_FMAX,
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
         });
         // every row has positive mass, bounded weights.
         for m in 0..80 {
