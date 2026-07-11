@@ -1,7 +1,7 @@
-use realfft::RealFftPlanner;
 use thiserror::Error;
 
 use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
+use crate::models::audio_frontend::{PadMode, StftFramer, center_embed_window};
 use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
 
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
@@ -43,8 +43,6 @@ pub(crate) enum Qwen3AsrMelFrontendError {
     InvalidAudioSamples,
     #[error("qwen3-asr mel frontend frame calculation overflowed")]
     FrameCountOverflow,
-    #[error("qwen3-asr mel frontend FFT failed: {reason}")]
-    FftFailed { reason: String },
     #[error("qwen3-asr mel frontend mel projection failed: {reason}")]
     MelProjectionFailed { reason: String },
 }
@@ -124,46 +122,35 @@ fn qwen3_mel_features_from_samples(
     if samples.is_empty() {
         return Err(Qwen3AsrMelFrontendError::InvalidAudioSamples);
     }
-    let padded = center_pad_samples(samples, plan.n_fft / 2)?;
-    let all_frames = padded
-        .len()
-        .checked_sub(plan.n_fft)
-        .ok_or(Qwen3AsrMelFrontendError::FrameCountOverflow)?
-        .checked_div(plan.hop_length)
-        .and_then(|value| value.checked_add(1))
-        .ok_or(Qwen3AsrMelFrontendError::FrameCountOverflow)?;
-    let frame_count = all_frames
+
+    // `win_length == n_fft` is enforced by `load_qwen3_mel_frontend_plan_from_reader`,
+    // so `center_embed_window` is a no-op copy here (offset 0); kept for
+    // parity with `cohere`, whose `win_length` can be shorter than `n_fft`.
+    let framer = StftFramer::new(
+        plan.n_fft,
+        plan.n_fft,
+        plan.hop_length,
+        PadMode::ZeroCenter,
+        center_embed_window(&plan.window, plan.n_fft),
+    );
+    let spectrogram = framer
+        .power_spectrogram(samples)
+        .map_err(|_| Qwen3AsrMelFrontendError::FrameCountOverflow)?;
+    // `torch.stft`-shaped framing over a signal zero-padded to `n_fft/2` on
+    // each side yields one more frame than the audio's "real" frame count;
+    // the pre-refactor frontend always dropped that trailing frame.
+    let frame_count = spectrogram
+        .n_frames
         .checked_sub(1)
         .ok_or(Qwen3AsrMelFrontendError::FrameCountOverflow)?;
     if frame_count == 0 {
         return Err(Qwen3AsrMelFrontendError::InvalidAudioSamples);
     }
-
-    let fft_bins = plan.n_fft / 2 + 1;
-    let mut planner = RealFftPlanner::<f32>::new();
-    let r2c = planner.plan_fft_forward(plan.n_fft);
-    let mut fft_input = r2c.make_input_vec();
-    let mut fft_output = r2c.make_output_vec();
-    let mut fft_scratch = r2c.make_scratch_vec();
-    let mut power_spectrogram = vec![0.0_f32; frame_count * fft_bins];
-
-    for frame_idx in 0..frame_count {
-        let start = frame_idx * plan.hop_length;
-        let frame = &padded[start..start + plan.n_fft];
-        for (index, value) in fft_input.iter_mut().enumerate() {
-            *value = frame[index] * plan.window[index];
-        }
-        r2c.process_with_scratch(&mut fft_input, &mut fft_output, &mut fft_scratch)
-            .map_err(|error| Qwen3AsrMelFrontendError::FftFailed {
-                reason: error.to_string(),
-            })?;
-        for (bin, complex) in fft_output.iter().enumerate() {
-            power_spectrogram[frame_idx * fft_bins + bin] = complex.norm_sqr();
-        }
-    }
+    let fft_bins = framer.n_fft_bins();
+    let power_spectrogram = &spectrogram.data[..frame_count * fft_bins];
 
     let mut mel_values = project_power_spectrogram_to_mels_time(
-        &power_spectrogram,
+        power_spectrogram,
         frame_count,
         fft_bins,
         &plan.mel_filters,
@@ -223,22 +210,6 @@ fn project_power_spectrogram_to_mels_time(
         }
     }
     Ok(mel_values)
-}
-
-fn center_pad_samples(
-    samples: &[f32],
-    pad_each_side: usize,
-) -> Result<Vec<f32>, Qwen3AsrMelFrontendError> {
-    let total_len = samples
-        .len()
-        .checked_add(pad_each_side)
-        .and_then(|value| value.checked_add(pad_each_side))
-        .ok_or(Qwen3AsrMelFrontendError::FrameCountOverflow)?;
-    let mut padded = vec![0.0_f32; total_len];
-    let start = pad_each_side;
-    let end = start + samples.len();
-    padded[start..end].copy_from_slice(samples);
-    Ok(padded)
 }
 
 fn normalize_log_mel_in_place(values: &mut [f32]) {

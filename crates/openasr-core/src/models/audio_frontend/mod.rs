@@ -37,9 +37,18 @@ pub(crate) enum PadMode {
     /// `torch.stft(center=True, pad_mode="reflect")`: reflect-pad `n_fft/2`
     /// samples on both ends (no edge repeat) before framing at `hop`
     /// stride, i.e. `n_frames = (padded_len - n_fft) / hop + 1`. Used by
-    /// `parakeet_ctc`/`parakeet_tdt`, `whisper`, `cohere`, `qwen`, and
-    /// `dolphin`'s ESPnet-variant frontend (`DolphinEspnetFrontend`).
+    /// `parakeet_ctc`/`parakeet_tdt`, `whisper`, and `dolphin`'s ESPnet-variant
+    /// frontend (`DolphinEspnetFrontend`).
     ReflectCenter,
+    /// Zero-pad `n_fft/2` samples on both ends (no reflection) before framing
+    /// at `hop` stride -- same `n_frames = (padded_len - n_fft) / hop + 1`
+    /// formula as [`Self::ReflectCenter`], but the padding is silence rather
+    /// than a mirrored signal. `qwen` and `cohere`'s own pre-refactor
+    /// frontends both build this padding as a zero-filled buffer with the
+    /// real samples copied into the middle (not `torch.stft`'s reflect
+    /// convention despite `center=True`-shaped framing math), so this is a
+    /// distinct mode rather than reuse of [`Self::ReflectCenter`].
+    ZeroCenter,
     /// Kaldi/sherpa-onnx `snip_edges=false`: frame `i`'s window starts at
     /// absolute sample index `i*hop - (win/2 - hop/2)` (the asymmetric
     /// kaldi offset, distinct from `ReflectCenter`'s symmetric `n_fft/2`
@@ -143,6 +152,7 @@ impl StftFramer {
     pub(crate) fn power_spectrogram(&self, samples: &[f32]) -> Result<PowerSpectrogram, StftError> {
         match self.pad_mode {
             PadMode::ReflectCenter => self.power_spectrogram_reflect_center(samples),
+            PadMode::ZeroCenter => self.power_spectrogram_zero_center(samples),
             PadMode::KaldiSnipEdgesFalse => panic!(
                 "StftFramer::power_spectrogram: PadMode::KaldiSnipEdgesFalse has no whole-buffer \
                  entry point -- use power_spectrogram_kaldi_snip_edges_false_range"
@@ -213,9 +223,30 @@ impl StftFramer {
     ) -> Result<PowerSpectrogram, StftError> {
         let pad = self.n_fft / 2;
         let padded = reflect_pad(samples, pad);
+        self.power_spectrogram_from_centered_pad(padded, samples.len())
+    }
+
+    fn power_spectrogram_zero_center(
+        &self,
+        samples: &[f32],
+    ) -> Result<PowerSpectrogram, StftError> {
+        let pad = self.n_fft / 2;
+        let padded = zero_pad(samples, pad);
+        self.power_spectrogram_from_centered_pad(padded, samples.len())
+    }
+
+    /// Shared frame + window + FFT loop for the two centered pad modes
+    /// ([`PadMode::ReflectCenter`] and [`PadMode::ZeroCenter`]) once the
+    /// caller has already produced the padded buffer -- identical arithmetic,
+    /// only the padding differs between them.
+    fn power_spectrogram_from_centered_pad(
+        &self,
+        padded: Vec<f32>,
+        original_len: usize,
+    ) -> Result<PowerSpectrogram, StftError> {
         if padded.len() < self.n_fft {
             return Err(StftError::TooShort {
-                samples: samples.len(),
+                samples: original_len,
             });
         }
         let n_frames = (padded.len() - self.n_fft) / self.hop + 1;
@@ -260,6 +291,19 @@ pub(crate) fn hann_window_centered(win_length: usize, n_fft: usize) -> Vec<f32> 
     window
 }
 
+/// Center-embeds an arbitrary analysis `window` (e.g. one loaded verbatim
+/// from a model checkpoint, so not one of this module's own hann/povey
+/// builders) into an `n_fft`-length buffer, using the same symmetric
+/// centering offset as [`hann_window_centered`] (`(n_fft - window.len()) /
+/// 2`). Used by `cohere` and `qwen`, whose checkpoints ship their own
+/// window values rather than a formula this module would compute.
+pub(crate) fn center_embed_window(window: &[f32], n_fft: usize) -> Vec<f32> {
+    let mut embedded = vec![0.0f32; n_fft];
+    let offset = (n_fft - window.len()) / 2;
+    embedded[offset..offset + window.len()].copy_from_slice(window);
+    embedded
+}
+
 /// Periodic Hann window of `length`, computed by pre-dividing the angular
 /// step (`2*pi / length`) once and multiplying by the sample index, rather
 /// than [`hann_window_centered`]'s per-sample `(2*pi*i) / length` operation
@@ -293,6 +337,15 @@ pub(crate) fn povey_window_left_aligned(win_length: usize, n_fft: usize) -> Vec<
         *slot = hann.powf(0.85);
     }
     window
+}
+
+/// Zero padding: pads `pad` silent samples onto both ends of `samples`
+/// (contrast [`reflect_pad`], which mirrors the signal instead). Used by
+/// [`PadMode::ZeroCenter`].
+fn zero_pad(samples: &[f32], pad: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; samples.len() + 2 * pad];
+    out[pad..pad + samples.len()].copy_from_slice(samples);
+    out
 }
 
 /// numpy/`torch.stft`-style reflect padding (no edge repeat): pads `pad`
@@ -420,6 +473,94 @@ mod tests {
         let spectrogram = framer.power_spectrogram(&samples).expect("spectrogram");
         assert_eq!(spectrogram.n_frames, 1);
         assert!(spectrogram.data.iter().all(|v| v.is_finite() && *v >= 0.0));
+    }
+
+    fn qwen_style_framer(window: Vec<f32>) -> StftFramer {
+        StftFramer::new(400, 400, 160, PadMode::ZeroCenter, window)
+    }
+
+    #[test]
+    fn zero_center_frame_count_matches_zero_padded_formula() {
+        let framer = qwen_style_framer(vec![1.0f32; 400]);
+        // 1 s @ 16 kHz -> padded len = 16000 + 400, n_frames = (padded -
+        // 400) / 160 + 1 -- same frame-count formula as ReflectCenter, only
+        // the padding differs.
+        let samples = vec![0.01f32; 16_000];
+        let spectrogram = framer.power_spectrogram(&samples).expect("spectrogram");
+        let expected_frames = (16_000 + 400 - 400) / 160 + 1;
+        assert_eq!(spectrogram.n_frames, expected_frames);
+        assert_eq!(spectrogram.n_fft_bins, 201);
+        assert!(spectrogram.data.iter().all(|v| v.is_finite() && *v >= 0.0));
+    }
+
+    /// Reimplementation of the pre-refactor `qwen`/`cohere`
+    /// `center_pad_samples` (zero-fill a buffer, copy samples into the
+    /// middle) -- kept only to pin [`PadMode::ZeroCenter`] to the exact
+    /// values those frontends produced before this module existed.
+    fn reference_zero_center_pad(samples: &[f32], pad_each_side: usize) -> Vec<f32> {
+        let mut padded = vec![0.0f32; samples.len() + 2 * pad_each_side];
+        padded[pad_each_side..pad_each_side + samples.len()].copy_from_slice(samples);
+        padded
+    }
+
+    #[test]
+    fn zero_center_matches_reference_zero_pad_power_spectrogram() {
+        let n_fft = 400;
+        let hop = 160;
+        let window: Vec<f32> = (0..n_fft)
+            .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n_fft as f32).cos())
+            .collect();
+        let samples: Vec<f32> = (0..8_000)
+            .map(|i| (2.0 * std::f32::consts::PI * 220.0 * i as f32 / 16_000.0).sin() * 0.3)
+            .collect();
+
+        let framer = StftFramer::new(n_fft, n_fft, hop, PadMode::ZeroCenter, window.clone());
+        let actual = framer.power_spectrogram(&samples).expect("spectrogram");
+
+        // Reference: manual zero-pad + frame + window + rfft, mirroring the
+        // pre-refactor qwen/cohere loop directly (not via StftFramer).
+        let padded = reference_zero_center_pad(&samples, n_fft / 2);
+        let n_frames = (padded.len() - n_fft) / hop + 1;
+        let fft_bins = n_fft / 2 + 1;
+        let mut planner = realfft::RealFftPlanner::<f32>::new();
+        let r2c = planner.plan_fft_forward(n_fft);
+        let mut fft_in = r2c.make_input_vec();
+        let mut fft_out = r2c.make_output_vec();
+        let mut scratch = r2c.make_scratch_vec();
+        let mut expected = vec![0.0f32; n_frames * fft_bins];
+        for frame_idx in 0..n_frames {
+            let start = frame_idx * hop;
+            for i in 0..n_fft {
+                fft_in[i] = padded[start + i] * window[i];
+            }
+            r2c.process_with_scratch(&mut fft_in, &mut fft_out, &mut scratch)
+                .expect("reference rfft");
+            for (bin, c) in fft_out.iter().enumerate() {
+                expected[frame_idx * fft_bins + bin] = c.norm_sqr();
+            }
+        }
+
+        assert_eq!(actual.n_frames, n_frames);
+        assert_eq!(actual.data, expected);
+    }
+
+    #[test]
+    fn center_embed_window_matches_reference_zero_pad_window() {
+        // Reimplementation of the pre-refactor `cohere::frontend::zero_pad_window`.
+        fn reference_zero_pad_window(window: &[f32], n_fft: usize) -> Vec<f32> {
+            let mut padded = vec![0.0f32; n_fft];
+            let left_pad = (n_fft - window.len()) / 2;
+            padded[left_pad..left_pad + window.len()].copy_from_slice(window);
+            padded
+        }
+        let window = vec![0.1f32, 0.2, 0.3, 0.4];
+        assert_eq!(
+            center_embed_window(&window, 8),
+            reference_zero_pad_window(&window, 8)
+        );
+        // win_length == n_fft (qwen's invariant): a no-op copy.
+        let full = vec![0.5f32; 6];
+        assert_eq!(center_embed_window(&full, 6), full);
     }
 
     #[test]
