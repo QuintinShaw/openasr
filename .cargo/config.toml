@@ -11,3 +11,11 @@
 # Linux ARM64 (no Metal) so it already used CPU — this just matches it locally.
 [env]
 OPENASR_GGML_BACKEND = { value = "cpu", force = false }
+# ts-rs (realtime wire-type TS codegen, see crates/openasr-core/tests/realtime_wire_bindings.rs)
+# maps u64/i64/u128/i128 to `bigint` by default. The wire types that use u64
+# (seq/start_ms/end_ms/revision/source_version/translation_version) are all
+# well within Number.MAX_SAFE_INTEGER and JSON.parse always hands callers a
+# `number`, never a `bigint` -- so bindings must say `number` to match what
+# actually crosses the wire. `force = false` still lets a one-off invocation
+# override it.
+TS_RS_LARGE_INT = { value = "number", force = false }

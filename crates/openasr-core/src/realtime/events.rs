@@ -3,21 +3,39 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{audio::RealtimeAudioFormat, backend::RealtimeBackendCapabilities};
 
+// TS export for the realtime wire contract: gated to `cfg(test)` so ts-rs is
+// a dev-only dependency, never part of the shipped rlib. See
+// crates/openasr-core/tests/realtime_wire_bindings.rs for the golden
+// "regenerate == committed" guard.
+//
+// The untagged envelope shape (`RealtimeEvent` and its per-family enums) is
+// deliberately NOT derived here -- see that test file's module doc for why
+// serde(untagged) + the `event_type` discriminant computed outside serde
+// cannot be faithfully codegen'd, and what TS gets instead (a hand-written
+// discriminated union built from these generated leaf payload types).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 #[serde(transparent)]
 pub struct RealtimeSessionId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 #[serde(transparent)]
 pub struct RealtimeEventId(pub String);
 
 pub type RealtimeEventSeq = u64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 #[serde(transparent)]
 pub struct TranscriptUtteranceId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 #[serde(transparent)]
 pub struct TranscriptSegmentId(pub String);
 
@@ -82,11 +100,15 @@ impl RealtimeLifecycleEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct SessionCreatedEvent {
     pub audio_format: RealtimeAudioFormat,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct SessionCapabilitiesEvent {
     pub capabilities: RealtimeBackendCapabilities,
     pub audio_format: RealtimeAudioFormat,
@@ -96,6 +118,8 @@ pub struct SessionCapabilitiesEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct SessionConfiguredEvent {
     pub model: String,
     pub partial_results: bool,
@@ -106,6 +130,8 @@ pub struct SessionConfiguredEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct SessionTranslationSummary {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,11 +154,15 @@ impl SessionTranslationSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct SessionVadSummary {
     pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct SessionClosedEvent {
     pub reason: String,
 }
@@ -154,9 +184,13 @@ impl RealtimeAudioInputEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct AudioInputStartedEvent {}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct AudioInputStoppedEvent {
     pub reason: String,
 }
@@ -178,12 +212,16 @@ impl RealtimeVadEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct VadSpeechStartedEvent {
     pub utterance_id: TranscriptUtteranceId,
     pub start_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct VadSpeechStoppedEvent {
     pub utterance_id: TranscriptUtteranceId,
     pub start_ms: u64,
@@ -209,6 +247,8 @@ impl RealtimeTranscriptEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct RealtimeTranscriptWord {
     pub word: String,
     pub start_ms: u64,
@@ -220,6 +260,8 @@ pub struct RealtimeTranscriptWord {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct RealtimeTranscriptPartial {
     pub utterance_id: TranscriptUtteranceId,
     pub segment_id: TranscriptSegmentId,
@@ -247,6 +289,8 @@ pub struct RealtimeTranscriptPartial {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct RealtimeTranscriptFinal {
     pub utterance_id: TranscriptUtteranceId,
     pub segment_id: TranscriptSegmentId,
@@ -274,6 +318,8 @@ pub struct RealtimeTranscriptFinal {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct RealtimeTranscriptRevision {
     pub utterance_id: TranscriptUtteranceId,
     pub segment_id: TranscriptSegmentId,
@@ -331,6 +377,8 @@ impl RealtimeTranslationEvent {
 /// configured-truthfulness contract: enabled -> either `translation.status`
 /// ready or a session-fatal error.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct RealtimeTranslationStatus {
     pub state: String,
     pub model: String,
@@ -342,6 +390,8 @@ impl RealtimeTranslationStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct RealtimeTranslationPartial {
     pub clause_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -362,6 +412,8 @@ pub struct RealtimeTranslationPartial {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct RealtimeTranslationFinal {
     pub clause_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -381,6 +433,8 @@ pub struct RealtimeTranslationFinal {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct RealtimeTranslationTombstone {
     pub clause_id: String,
     pub source_segment_id: String,
@@ -392,6 +446,8 @@ pub struct RealtimeTranslationTombstone {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct RealtimeErrorEvent {
     pub code: RealtimeErrorCode,
     pub message: String,
@@ -399,6 +455,8 @@ pub struct RealtimeErrorEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub enum RealtimeErrorCode {
     #[serde(rename = "startup_config_error")]
     StartupConfigError,
