@@ -1,18 +1,24 @@
 //! Load a parakeet-tdt `.oasr` pack into host weights: the FastConformer
-//! encoder stack (mirroring `parakeet_ctc::encoder_weights`, including the
-//! conv BatchNorm fold), the encoder joint projection, and the host-side
-//! prediction-network / joint tensors.
+//! encoder stack (the shared `models::fastconformer::weights` skeleton --
+//! BatchNorm fold + zero-bias synthesis for the checkpoint's missing
+//! attn/conv/FFN biases -- `parakeet_ctc::encoder_weights` also builds on),
+//! the encoder joint projection, and the host-side prediction-network /
+//! joint tensors (parakeet-tdt-only, no `parakeet_ctc` equivalent).
 //!
 //! The v3 checkpoint has NO attention/conv/FFN biases (`attention_bias` /
-//! `convolution_bias` false), so the loader synthesizes zero biases for the
-//! shared `nn::encoder::conformer_block`, which is bias-shaped. Zero biases
-//! are mathematically identity — nothing model-specific is fabricated.
+//! `convolution_bias` false), so the shared loader synthesizes zero biases
+//! for the shared `nn::encoder::conformer_block`, which is bias-shaped. Zero
+//! biases are mathematically identity -- nothing model-specific is fabricated.
 
 use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
+use crate::models::fastconformer::{self, FastConformerLayerWeights, FastConformerWeightsError};
+// Re-exported (not just imported) so `parakeet_tdt::greedy`/`predictor` --
+// which construct `NamedTensor` values directly in their own tests -- can
+// keep referring to it as `encoder_weights::NamedTensor`, unchanged by the
+// type's move into the shared `fastconformer` module.
+pub(crate) use crate::models::fastconformer::NamedTensor;
 
 use super::runtime_contract::ParakeetTdtExecutionMetadata;
-
-const CONV_BN_EPSILON: f32 = 1.0e-5;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ParakeetTdtWeightsError {
@@ -28,68 +34,15 @@ pub(crate) enum ParakeetTdtWeightsError {
     BatchNormFold { reason: String },
 }
 
-/// A host weight: its stored dims (from the GGUF index) + dequantized f32
-/// values. Bias slots the checkpoint does not ship are synthesized as zeros
-/// (empty `name` marks them as synthetic for debugging only).
-#[derive(Debug, Clone)]
-pub(crate) struct NamedTensor {
-    pub name: String,
-    pub dims: Vec<usize>,
-    pub values: Vec<f32>,
-}
-
-impl NamedTensor {
-    fn element_count(&self) -> usize {
-        self.values.len()
-    }
-
-    /// Drop the resident f32 host `values` (keeping name + dims) for a weight
-    /// the encoder graph binds zero-copy from the mmap'd pack (see
-    /// `parakeet_ctc::encoder_weights::NamedTensor::drop_bound_payload`).
-    fn drop_bound_payload(&mut self) {
-        self.values = Vec::new();
+impl FastConformerWeightsError for ParakeetTdtWeightsError {
+    fn batchnorm_fold(reason: String) -> Self {
+        Self::BatchNormFold { reason }
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ParakeetTdtEncoderLayerWeights {
-    pub ff1_norm_weight: NamedTensor,
-    pub ff1_norm_bias: NamedTensor,
-    pub ff1_up_weight: NamedTensor,
-    pub ff1_up_bias: NamedTensor,
-    pub ff1_down_weight: NamedTensor,
-    pub ff1_down_bias: NamedTensor,
-    pub attn_norm_weight: NamedTensor,
-    pub attn_norm_bias: NamedTensor,
-    pub attn_q_weight: NamedTensor,
-    pub attn_q_bias: NamedTensor,
-    pub attn_k_weight: NamedTensor,
-    pub attn_k_bias: NamedTensor,
-    pub attn_v_weight: NamedTensor,
-    pub attn_v_bias: NamedTensor,
-    pub attn_out_weight: NamedTensor,
-    pub attn_out_bias: NamedTensor,
-    pub attn_pos_weight: NamedTensor,
-    pub attn_pos_bias_u: NamedTensor,
-    pub attn_pos_bias_v: NamedTensor,
-    pub conv_norm_weight: NamedTensor,
-    pub conv_norm_bias: NamedTensor,
-    pub conv_pw1_weight: NamedTensor,
-    pub conv_pw1_bias: NamedTensor,
-    /// BatchNorm folded into these two at load (the graph sees a plain dw conv).
-    pub conv_dw_weight: NamedTensor,
-    pub conv_dw_bias: NamedTensor,
-    pub conv_pw2_weight: NamedTensor,
-    pub conv_pw2_bias: NamedTensor,
-    pub ff2_norm_weight: NamedTensor,
-    pub ff2_norm_bias: NamedTensor,
-    pub ff2_up_weight: NamedTensor,
-    pub ff2_up_bias: NamedTensor,
-    pub ff2_down_weight: NamedTensor,
-    pub ff2_down_bias: NamedTensor,
-    pub out_norm_weight: NamedTensor,
-    pub out_norm_bias: NamedTensor,
-}
+/// v3 ships no attn/conv/FFN bias tensors at all -- the shared loader
+/// synthesizes zero biases of the right width for every layer.
+pub(crate) type ParakeetTdtEncoderLayerWeights = FastConformerLayerWeights;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParakeetTdtEncoderWeights {
@@ -136,191 +89,46 @@ pub(crate) struct ParakeetTdtJointWeights {
     pub out_bias: NamedTensor,
 }
 
-fn load_named(
-    reader: &GgufTensorDataReader,
-    name: &str,
+fn expect_elements(
+    tensor: NamedTensor,
+    expected: usize,
 ) -> Result<NamedTensor, ParakeetTdtWeightsError> {
-    let tensor = reader.tensor_index().get(name).ok_or_else(|| {
-        ParakeetTdtWeightsError::Read(GgufTensorDataReadError::TensorNotFound {
-            path: reader.tensor_index().path().to_path_buf(),
-            tensor_name: name.to_string(),
-        })
-    })?;
-    let dims: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
-    let shape_u64: Vec<u64> = tensor.dims.clone();
-    let values = reader.host_tensor_f32_copy_dequantized_by_name(name, &shape_u64)?;
-    Ok(NamedTensor {
-        name: name.to_string(),
-        dims,
-        values,
-    })
-}
-
-/// Zero bias for a projection the checkpoint ships bias-free
-/// (`attention_bias`/`convolution_bias`/FFN bias all false in v3). The shared
-/// conformer block is bias-shaped; a zero bias is the mathematical identity.
-fn zero_bias(name: String, len: usize) -> NamedTensor {
-    NamedTensor {
-        name,
-        dims: vec![len],
-        values: vec![0.0; len],
-    }
-}
-
-fn load_layer(
-    reader: &GgufTensorDataReader,
-    metadata: &ParakeetTdtExecutionMetadata,
-    layer: usize,
-) -> Result<ParakeetTdtEncoderLayerWeights, ParakeetTdtWeightsError> {
-    let n = |suffix: &str| format!("enc.blk.{layer}.{suffix}");
-    let d_model = metadata.hidden_size;
-    let ffn = metadata.ffn_dim;
-    let mut weights = ParakeetTdtEncoderLayerWeights {
-        ff1_norm_weight: load_named(reader, &n("ff1.norm.weight"))?,
-        ff1_norm_bias: load_named(reader, &n("ff1.norm.bias"))?,
-        ff1_up_weight: load_named(reader, &n("ff1.up.weight"))?,
-        ff1_up_bias: zero_bias(n("ff1.up.bias"), ffn),
-        ff1_down_weight: load_named(reader, &n("ff1.down.weight"))?,
-        ff1_down_bias: zero_bias(n("ff1.down.bias"), d_model),
-        attn_norm_weight: load_named(reader, &n("attn.norm.weight"))?,
-        attn_norm_bias: load_named(reader, &n("attn.norm.bias"))?,
-        attn_q_weight: load_named(reader, &n("attn.q.weight"))?,
-        attn_q_bias: zero_bias(n("attn.q.bias"), d_model),
-        attn_k_weight: load_named(reader, &n("attn.k.weight"))?,
-        attn_k_bias: zero_bias(n("attn.k.bias"), d_model),
-        attn_v_weight: load_named(reader, &n("attn.v.weight"))?,
-        attn_v_bias: zero_bias(n("attn.v.bias"), d_model),
-        attn_out_weight: load_named(reader, &n("attn.out.weight"))?,
-        attn_out_bias: zero_bias(n("attn.out.bias"), d_model),
-        attn_pos_weight: load_named(reader, &n("attn.pos.weight"))?,
-        attn_pos_bias_u: load_named(reader, &n("attn.pos_bias_u"))?,
-        attn_pos_bias_v: load_named(reader, &n("attn.pos_bias_v"))?,
-        conv_norm_weight: load_named(reader, &n("conv.norm.weight"))?,
-        conv_norm_bias: load_named(reader, &n("conv.norm.bias"))?,
-        conv_pw1_weight: load_named(reader, &n("conv.pw1.weight"))?,
-        conv_pw1_bias: zero_bias(n("conv.pw1.bias"), 2 * d_model),
-        conv_dw_weight: load_named(reader, &n("conv.dw.weight"))?,
-        conv_dw_bias: zero_bias(n("conv.dw.bias"), d_model),
-        conv_pw2_weight: load_named(reader, &n("conv.pw2.weight"))?,
-        conv_pw2_bias: zero_bias(n("conv.pw2.bias"), d_model),
-        ff2_norm_weight: load_named(reader, &n("ff2.norm.weight"))?,
-        ff2_norm_bias: load_named(reader, &n("ff2.norm.bias"))?,
-        ff2_up_weight: load_named(reader, &n("ff2.up.weight"))?,
-        ff2_up_bias: zero_bias(n("ff2.up.bias"), ffn),
-        ff2_down_weight: load_named(reader, &n("ff2.down.weight"))?,
-        ff2_down_bias: zero_bias(n("ff2.down.bias"), d_model),
-        out_norm_weight: load_named(reader, &n("out.norm.weight"))?,
-        out_norm_bias: load_named(reader, &n("out.norm.bias"))?,
-    };
-    fold_batchnorm_into_depthwise(reader, layer, &mut weights)?;
-    Ok(weights)
-}
-
-/// Fold the conv BatchNorm1d into the depthwise weight + (zero-synthesized)
-/// bias so the graph runs a plain depthwise conv — identical math to
-/// `parakeet_ctc::encoder_weights::fold_batchnorm_into_depthwise`.
-fn fold_batchnorm_into_depthwise(
-    reader: &GgufTensorDataReader,
-    layer: usize,
-    weights: &mut ParakeetTdtEncoderLayerWeights,
-) -> Result<(), ParakeetTdtWeightsError> {
-    let n = |suffix: &str| format!("enc.blk.{layer}.{suffix}");
-    let gamma = load_named(reader, &n("conv.bn.weight"))?;
-    let beta = load_named(reader, &n("conv.bn.bias"))?;
-    let mean = load_named(reader, &n("conv.bn.mean"))?;
-    let var = load_named(reader, &n("conv.bn.var"))?;
-
-    let channels = weights.conv_dw_bias.element_count();
-    if gamma.element_count() != channels
-        || beta.element_count() != channels
-        || mean.element_count() != channels
-        || var.element_count() != channels
-    {
-        return Err(ParakeetTdtWeightsError::BatchNormFold {
-            reason: format!(
-                "per-channel sizes disagree: dw_bias={channels} gamma={} beta={} mean={} var={}",
-                gamma.element_count(),
-                beta.element_count(),
-                mean.element_count(),
-                var.element_count()
-            ),
+    if tensor.element_count() != expected {
+        return Err(ParakeetTdtWeightsError::ElementCount {
+            name: tensor.name.clone(),
+            got: tensor.element_count(),
+            expected,
         });
     }
-    let dw_elems = weights.conv_dw_weight.element_count();
-    if !dw_elems.is_multiple_of(channels) {
-        return Err(ParakeetTdtWeightsError::BatchNormFold {
-            reason: format!("depthwise weight {dw_elems} not divisible by channels {channels}"),
-        });
-    }
-    let kernel = dw_elems / channels;
-    let scale: Vec<f32> = (0..channels)
-        .map(|c| gamma.values[c] / (var.values[c] + CONV_BN_EPSILON).sqrt())
-        .collect();
-    #[allow(clippy::needless_range_loop)]
-    for c in 0..channels {
-        for k in 0..kernel {
-            weights.conv_dw_weight.values[c * kernel + k] *= scale[c];
-        }
-        weights.conv_dw_bias.values[c] =
-            beta.values[c] + (weights.conv_dw_bias.values[c] - mean.values[c]) * scale[c];
-    }
-    Ok(())
-}
-
-/// Drop the f32 host payload of the 2-D linears the encoder graph binds
-/// zero-copy (same set as parakeet-ctc plus the joint encoder projection).
-fn drop_bound_linear_payloads(layer: &mut ParakeetTdtEncoderLayerWeights) {
-    for w in [
-        &mut layer.ff1_up_weight,
-        &mut layer.ff1_down_weight,
-        &mut layer.attn_q_weight,
-        &mut layer.attn_k_weight,
-        &mut layer.attn_v_weight,
-        &mut layer.attn_out_weight,
-        &mut layer.attn_pos_weight,
-        &mut layer.conv_pw1_weight,
-        &mut layer.conv_pw2_weight,
-        &mut layer.ff2_up_weight,
-        &mut layer.ff2_down_weight,
-    ] {
-        w.drop_bound_payload();
-    }
-}
-
-fn drop_bound_subsampling_payloads(subsampling: &mut [NamedTensor]) {
-    for weight in subsampling {
-        if weight.name == "enc.sub.linear.weight" {
-            weight.drop_bound_payload();
-        }
-    }
+    Ok(tensor)
 }
 
 pub(crate) fn load_parakeet_tdt_encoder_weights(
     reader: &GgufTensorDataReader,
     metadata: &ParakeetTdtExecutionMetadata,
 ) -> Result<ParakeetTdtEncoderWeights, ParakeetTdtWeightsError> {
-    let mut subsampling = Vec::new();
-    for sub_layer in [0usize, 2, 3, 5, 6] {
-        for kind in ["weight", "bias"] {
-            let name = format!("enc.sub.layers.{sub_layer}.{kind}");
-            if reader.tensor_index().get(&name).is_some() {
-                subsampling.push(load_named(reader, &name)?);
-            }
-        }
-    }
-    subsampling.push(load_named(reader, "enc.sub.linear.weight")?);
-    subsampling.push(load_named(reader, "enc.sub.linear.bias")?);
-    drop_bound_subsampling_payloads(&mut subsampling);
+    let subsampling =
+        fastconformer::load_fastconformer_subsampling::<ParakeetTdtWeightsError>(reader)?;
 
     let mut layers = Vec::with_capacity(metadata.n_layers);
     for layer in 0..metadata.n_layers {
-        let mut layer_weights = load_layer(reader, metadata, layer)?;
-        drop_bound_linear_payloads(&mut layer_weights);
-        layers.push(layer_weights);
+        // bias_present = false: v3 ships no attn/conv/FFN bias tensors; the
+        // shared loader synthesizes zero biases of the right width instead.
+        layers.push(fastconformer::load_fastconformer_layer::<
+            ParakeetTdtWeightsError,
+        >(
+            reader,
+            layer,
+            metadata.hidden_size,
+            metadata.ffn_dim,
+            false,
+        )?);
     }
 
-    let mut enc_proj_weight = load_named(reader, "enc.proj.weight")?;
-    let enc_proj_bias = load_named(reader, "enc.proj.bias")?;
+    let mut enc_proj_weight: NamedTensor =
+        fastconformer::load_named::<ParakeetTdtWeightsError>(reader, "enc.proj.weight")?;
+    let enc_proj_bias: NamedTensor =
+        fastconformer::load_named::<ParakeetTdtWeightsError>(reader, "enc.proj.bias")?;
     let expected_proj = metadata.joint_hidden * metadata.hidden_size;
     if enc_proj_weight.element_count() != expected_proj {
         return Err(ParakeetTdtWeightsError::ElementCount {
@@ -346,37 +154,35 @@ pub(crate) fn load_parakeet_tdt_encoder_weights(
     })
 }
 
-fn expect_elements(
-    tensor: NamedTensor,
-    expected: usize,
-) -> Result<NamedTensor, ParakeetTdtWeightsError> {
-    if tensor.element_count() != expected {
-        return Err(ParakeetTdtWeightsError::ElementCount {
-            name: tensor.name.clone(),
-            got: tensor.element_count(),
-            expected,
-        });
-    }
-    Ok(tensor)
-}
-
 pub(crate) fn load_parakeet_tdt_predictor_weights(
     reader: &GgufTensorDataReader,
     metadata: &ParakeetTdtExecutionMetadata,
 ) -> Result<ParakeetTdtPredictorWeights, ParakeetTdtWeightsError> {
     let hidden = metadata.pred_hidden;
     let embedding = expect_elements(
-        load_named(reader, "dec.embed.weight")?,
+        fastconformer::load_named::<ParakeetTdtWeightsError>(reader, "dec.embed.weight")?,
         metadata.vocab_size * hidden,
     )?;
     let mut lstm_layers = Vec::with_capacity(metadata.pred_layers);
     for layer in 0..metadata.pred_layers {
         let n = |suffix: &str| format!("dec.lstm.{layer}.{suffix}");
         lstm_layers.push(ParakeetTdtLstmLayerWeights {
-            w_ih: expect_elements(load_named(reader, &n("w_ih"))?, 4 * hidden * hidden)?,
-            w_hh: expect_elements(load_named(reader, &n("w_hh"))?, 4 * hidden * hidden)?,
-            b_ih: expect_elements(load_named(reader, &n("b_ih"))?, 4 * hidden)?,
-            b_hh: expect_elements(load_named(reader, &n("b_hh"))?, 4 * hidden)?,
+            w_ih: expect_elements(
+                fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &n("w_ih"))?,
+                4 * hidden * hidden,
+            )?,
+            w_hh: expect_elements(
+                fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &n("w_hh"))?,
+                4 * hidden * hidden,
+            )?,
+            b_ih: expect_elements(
+                fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &n("b_ih"))?,
+                4 * hidden,
+            )?,
+            b_hh: expect_elements(
+                fastconformer::load_named::<ParakeetTdtWeightsError>(reader, &n("b_hh"))?,
+                4 * hidden,
+            )?,
         });
     }
     Ok(ParakeetTdtPredictorWeights {
@@ -393,12 +199,21 @@ pub(crate) fn load_parakeet_tdt_joint_weights(
     let out_rows = metadata.vocab_size + metadata.n_durations;
     Ok(ParakeetTdtJointWeights {
         pred_weight: expect_elements(
-            load_named(reader, "joint.pred.weight")?,
+            fastconformer::load_named::<ParakeetTdtWeightsError>(reader, "joint.pred.weight")?,
             joint * metadata.pred_hidden,
         )?,
-        pred_bias: expect_elements(load_named(reader, "joint.pred.bias")?, joint)?,
-        out_weight: expect_elements(load_named(reader, "joint.out.weight")?, out_rows * joint)?,
-        out_bias: expect_elements(load_named(reader, "joint.out.bias")?, out_rows)?,
+        pred_bias: expect_elements(
+            fastconformer::load_named::<ParakeetTdtWeightsError>(reader, "joint.pred.bias")?,
+            joint,
+        )?,
+        out_weight: expect_elements(
+            fastconformer::load_named::<ParakeetTdtWeightsError>(reader, "joint.out.weight")?,
+            out_rows * joint,
+        )?,
+        out_bias: expect_elements(
+            fastconformer::load_named::<ParakeetTdtWeightsError>(reader, "joint.out.bias")?,
+            out_rows,
+        )?,
     })
 }
 
