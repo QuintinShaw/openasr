@@ -1,3 +1,4 @@
+pub(crate) mod audio_frontend;
 pub(crate) mod aux_pack_registry;
 pub(crate) mod builtin_execution_dispatch;
 pub mod cohere;
