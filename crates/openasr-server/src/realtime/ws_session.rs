@@ -1109,17 +1109,24 @@ impl WsSession {
         self.phrase_bias = phrase_bias;
         self.inference_threads =
             match validate_realtime_inference_threads(session.inference_threads) {
-                Ok(inference_threads) => inference_threads
-                    .or_else(|| realtime_inference_threads_preference(&self.distribution)),
+                Ok(inference_threads) => inference_threads.or_else(|| {
+                    self.distribution
+                        .openasr_home()
+                        .ok()
+                        .and_then(|home| realtime_inference_threads_preference(&home))
+                }),
                 Err(message) => {
                     self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
                         .await?;
                     return Err(());
                 }
             };
-        self.execution_target = session
-            .execution_target
-            .or_else(|| realtime_execution_target_preference(&self.distribution));
+        self.execution_target = session.execution_target.or_else(|| {
+            self.distribution
+                .openasr_home()
+                .ok()
+                .and_then(|home| realtime_execution_target_preference(&home))
+        });
         self.word_timestamps = word_timestamps;
         self.source_name = source_name;
         self.translation = translation;
