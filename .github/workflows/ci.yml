@@ -24,8 +24,40 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
-    name: Rust workspace gate
+  # Split from a single ~356s "Rust workspace gate" job into two parallel jobs
+  # (lint / test) so PR wall-clock is max(lint, test) instead of their sum.
+  # Every check that used to run still runs -- none were dropped, only
+  # regrouped. Each job gets its own rust-cache shared-key so they restore/save
+  # independent caches and don't clobber each other's incremental artifacts.
+  lint:
+    name: Rust lint (fmt, clippy, catalog, python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libasound2-dev
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+      - run: cargo fmt --check
+      - name: Catalog drift gate
+        run: tooling/publish-model/scripts/regenerate_all.sh --check
+      - name: Python helper gates
+        run: |
+          python3 -m unittest discover -s tooling/publish-model/scripts -p '*_test.py'
+          python3 -m unittest discover -s tooling/native-streaming-smoke -p 'test_*.py'
+          python3 -m unittest discover -s tooling/public-hf-e2e -p 'test_*.py'
+          python3 -m unittest discover -s tooling/family-regression -p 'test_*.py'
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Rust test (nextest, doctests, sys-audio)
     # GitHub-hosted: runs for pushes and every PR, including forks (the repo is
     # public, so hosted-runner minutes are free and unlimited).
     runs-on: ubuntu-latest
@@ -38,24 +70,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake libasound2-dev
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
-          components: rustfmt, clippy
+          components: rustfmt
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - name: Catalog drift gate
-        run: tooling/publish-model/scripts/regenerate_all.sh --check
-      - name: Python helper gates
-        run: |
-          python3 -m unittest discover -s tooling/publish-model/scripts -p '*_test.py'
-          python3 -m unittest discover -s tooling/native-streaming-smoke -p 'test_*.py'
-          python3 -m unittest discover -s tooling/public-hf-e2e -p 'test_*.py'
-          python3 -m unittest discover -s tooling/family-regression -p 'test_*.py'
+        with:
+          shared-key: test
       - name: Desktop system-audio backend gate
         run: |
           cargo fmt --check --manifest-path tooling/system-audio-check/Cargo.toml
           cargo test --locked --manifest-path tooling/system-audio-check/Cargo.toml -- --nocapture
           cargo check --locked --manifest-path tooling/system-audio-check/Cargo.toml --target x86_64-pc-windows-msvc
-      - run: cargo clippy --all-targets -- -D warnings
       - name: Golden diff gate
         run: cargo test -p openasr-core golden_diff -- --nocapture
       - name: Catalog signature gate
@@ -74,7 +98,7 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
-      # The Linux gate (job `rust`) compiles the Linux backend natively and
+      # The Linux gate (job `test`) compiles the Linux backend natively and
       # cross-checks Windows, but the macOS CoreAudio backend (the largest
       # system-audio module) had no compile coverage. Build + test it on a real
       # macOS runner so a CoreAudio-backend break fails CI.
