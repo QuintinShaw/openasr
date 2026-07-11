@@ -144,8 +144,15 @@ fn validate_hymt2_installed_pack_revision(pack: &InstalledPack) -> Result<(), St
     }
 }
 
+/// Validates the pack via [`openasr_core::Hymt2Runtime::probe_path_cached`]
+/// rather than the raw `probe_path`: this is on the `/v1/capabilities` hot
+/// path (every call reaches here through `resolve_translation_pack_selection`
+/// once a Hy-MT2 pack is found), and the probe itself -- GGUF metadata +
+/// tensor-index read + tensor-contract validation -- was previously redone
+/// on every call against a model much larger than the ASR packs the sibling
+/// `native_runtime_model_adapter_for_path` cache already covers.
 fn validate_hymt2_translation_pack(path: &Path) -> Result<(), String> {
-    openasr_core::Hymt2Runtime::probe_path(path)
+    openasr_core::Hymt2Runtime::probe_path_cached(path)
         .map(|_| ())
         .map_err(|error| {
             format!(
