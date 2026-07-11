@@ -66,6 +66,11 @@ getrandom = "0.3"
 sha2 = "0.10"
 tempfile = "3.10"
 thiserror = "2.0"
+# rcgen's `CertificateParams::not_before`/`not_after` are `time::OffsetDateTime`;
+# depended on directly (not just transitively via rcgen) to set an explicit,
+# bounded validity window on generated self-signed TLS identities (see
+# `openasr-server`'s `generate_self_signed_tls_material`).
+time = "0.3"
 tokio = { version = "1.37", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 tokio-rustls = "0.26"
