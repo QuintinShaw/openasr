@@ -6,21 +6,19 @@ use crate::GgmlAsrExecutionDispatch;
 use crate::StreamingPartialGranularity;
 use crate::arch::{OpenAsrArchitectureRegistry, OpenAsrArchitectureRegistryError};
 
-use super::cohere::CohereTranscribeGgmlExecutor;
 use super::dolphin::executor::DolphinGgmlExecutor;
 use super::executor_component_registry::{
     BuiltinExecutorComponentRegistryError, materialize_builtin_executors_by_model_architecture,
+    shared_cohere_transcribe_executor, shared_moonshine_executor, shared_qwen3_asr_executor,
+    shared_whisper_executor,
 };
 use super::firered_aed::executor::FireRedAedGgmlExecutor;
 use super::ggml_composed_executor::ComposedGgmlAsrExecutor;
 use super::ggml_family_adapter::GgmlExecutionCapability;
-use super::moonshine::MoonshineGgmlExecutor;
 use super::parakeet_ctc::executor::ParakeetCtcGgmlExecutor;
 use super::parakeet_tdt::executor::ParakeetTdtGgmlExecutor;
-use super::qwen::Qwen3AsrGgmlExecutor;
 use super::sensevoice::executor::SenseVoiceGgmlExecutor;
 use super::wav2vec2_ctc::executor::Wav2Vec2CtcGgmlExecutor;
-use super::whisper::WhisperGgmlExecutor;
 use super::xasr_zipformer::executor::XasrZipformerGgmlExecutor;
 
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -111,7 +109,7 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
     let dispatch = GgmlAsrExecutionDispatch::default()
         .with_streaming_executor_for_adapter(
             crate::QWEN3_ASR_GGML_ADAPTER_ID,
-            Arc::new(Qwen3AsrGgmlExecutor::default()),
+            shared_qwen3_asr_executor(),
         )
         .with_streaming_partial_granularity_for_adapter(
             crate::QWEN3_ASR_GGML_ADAPTER_ID,
@@ -119,7 +117,7 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
         )
         .with_streaming_executor_for_adapter(
             crate::WHISPER_GGML_ADAPTER_ID,
-            Arc::new(WhisperGgmlExecutor::default()),
+            shared_whisper_executor(),
         )
         .with_streaming_partial_granularity_for_adapter(
             crate::WHISPER_GGML_ADAPTER_ID,
@@ -127,7 +125,7 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
         )
         .with_streaming_executor_for_adapter(
             crate::COHERE_TRANSCRIBE_GGML_ADAPTER_ID,
-            Arc::new(CohereTranscribeGgmlExecutor::default()),
+            shared_cohere_transcribe_executor(),
         )
         .with_streaming_partial_granularity_for_adapter(
             crate::COHERE_TRANSCRIBE_GGML_ADAPTER_ID,
@@ -135,7 +133,7 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
         )
         .with_streaming_executor_for_adapter(
             crate::MOONSHINE_GGML_ADAPTER_ID,
-            Arc::new(MoonshineGgmlExecutor::default()),
+            shared_moonshine_executor(),
         )
         .with_streaming_partial_granularity_for_adapter(
             crate::MOONSHINE_GGML_ADAPTER_ID,
