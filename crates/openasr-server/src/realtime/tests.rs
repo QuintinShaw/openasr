@@ -1810,6 +1810,80 @@ async fn attached_native_streaming_session_keeps_the_global_activity_tracker_non
 }
 
 #[tokio::test]
+async fn failed_native_streaming_attach_send_retires_the_activity_guard() {
+    // Regression test for the must-fix bug in
+    // `NativeStreamingDecodeWorker::attach`: its error branch (hit when
+    // `worker.sender.send(Attach).await` fails -- e.g. a reused worker died
+    // between `native_streaming_worker_for_key`'s registry `is_closed` check
+    // and the send actually landing) used to call only `worker.state.release()`
+    // and skip the paired `idle_activity::native_activity_exit()`, permanently
+    // pinning the process-wide native activity tracker non-idle and silently
+    // disabling `idle_unload` for the rest of the daemon's lifetime, with no
+    // log or error surfaced anywhere.
+    //
+    // `NativeStreamingWorkerHandle::activity` and
+    // `NativeStreamingWorkerMessage::Attach::activity` now carry that
+    // accounting as a `NativeActivityGuard` value instead of two hand-paired
+    // free-function calls: it either rides into the worker thread inside a
+    // successfully delivered `Attach` message (retired there once the session
+    // finishes -- see `attached_native_streaming_session_keeps_the_global_\
+    // activity_tracker_non_idle` above), or -- if delivery fails -- drops
+    // along with the returned `SendError`, right where the old code silently
+    // dropped only the message and forgot the guard.
+    //
+    // Reproduces a failed send deterministically (no timing race needed) by
+    // sending directly into a channel whose receiver was already dropped,
+    // which is exactly what a dead worker's `sender` looks like from the
+    // caller's side once `send` actually executes. This test's own guard is
+    // the only activity token it creates and never spawns any worker thread
+    // or shared-registry entry another concurrently running test could
+    // perturb, so the "now idle" assertion below is deterministic under
+    // `cargo nextest`'s per-test process isolation (the project's mandated
+    // test runner); it can only be racy against unrelated concurrently
+    // running tests under plain `cargo test`'s in-process thread
+    // parallelism, same caveat as the sibling test above.
+    let (sender, receiver) = mpsc::channel::<NativeStreamingWorkerMessage>(1);
+    drop(receiver);
+
+    let activity = crate::idle_activity::NativeActivityGuard::enter();
+    assert!(
+        !crate::idle_activity::native_activity_is_idle_for(Instant::now(), Duration::ZERO),
+        "must not read idle immediately after entering activity"
+    );
+
+    let (_command_tx, command_rx) = mpsc::channel(1);
+    let (outcome_tx, _outcome_rx) = mpsc::channel(1);
+    let send_result = sender
+        .send(NativeStreamingWorkerMessage::Attach {
+            session: Box::new(TestServerNativeSession::new(
+                "failed-attach-send-activity-guard",
+            )),
+            commands: command_rx,
+            outcomes: outcome_tx,
+            finalize_requested: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            activity,
+        })
+        .await;
+    assert!(
+        send_result.is_err(),
+        "sending into a channel with no live receiver must fail, exactly like \
+         the reused-worker-died-mid-attach race this test stands in for"
+    );
+    // Mirrors production: `NativeStreamingDecodeWorker::attach` does not keep
+    // the `SendError` around either, it just observes `is_err()` and lets the
+    // value (message, guard included) drop.
+    drop(send_result);
+
+    assert!(
+        crate::idle_activity::native_activity_is_idle_for(Instant::now(), Duration::ZERO),
+        "a failed attach send must still retire the activity guard, so \
+         idle_unload can go on to fire instead of being silently disabled \
+         for the rest of the process's life"
+    );
+}
+
+#[tokio::test]
 async fn native_streaming_finalize_keeps_session_open_for_next_utterance() {
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);

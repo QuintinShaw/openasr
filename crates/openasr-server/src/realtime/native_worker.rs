@@ -81,6 +81,17 @@ pub(crate) struct NativeStreamingWorkerEntry {
 pub(crate) struct NativeStreamingWorkerHandle {
     pub(crate) sender: mpsc::Sender<NativeStreamingWorkerMessage>,
     pub(crate) state: Arc<NativeStreamingWorkerState>,
+    /// Owns this attach attempt's `idle_activity` accounting. Constructed once,
+    /// here, and then handed off atomically: either it rides along inside the
+    /// `Attach` message and the worker thread becomes its owner once the
+    /// message is actually received (see `spawn_native_streaming_worker`), or
+    /// -- if the handle is dropped without ever being attached (e.g. `send`
+    /// fails) -- its `Drop` fires right here and retires the activity count.
+    /// There is no code path that can enter without a guard that will
+    /// eventually drop exactly once, unlike the previous bare
+    /// `native_activity_enter`/`native_activity_exit` pairing across two call
+    /// sites, which a send failure could skip.
+    pub(crate) activity: crate::idle_activity::NativeActivityGuard,
 }
 
 pub(crate) struct NativeStreamingWorkerState {
@@ -219,6 +230,13 @@ pub(crate) enum NativeStreamingWorkerMessage {
         outcomes: mpsc::Sender<NativeStreamingOutcome>,
         finalize_requested: Arc<AtomicBool>,
         cancel_requested: Arc<AtomicBool>,
+        /// Transfers ownership of this attach attempt's `idle_activity` guard
+        /// to whichever side ends up retiring it: the worker thread once it
+        /// has fully processed the session (see
+        /// `spawn_native_streaming_worker`), or the sender if the message
+        /// never gets received at all (the `mpsc::Sender::send` error path
+        /// returns the whole message, guard included, so it drops there).
+        activity: crate::idle_activity::NativeActivityGuard,
     },
 }
 
@@ -248,7 +266,14 @@ impl NativeStreamingDecodeWorker {
         let finalize_requested = Arc::new(AtomicBool::new(false));
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let worker = native_streaming_worker_for_key(key);
-        if worker
+        // `worker.activity` moves into the message: on success the worker
+        // thread now owns retiring it (exactly once, after it finishes
+        // processing this session); on failure `send` hands the whole
+        // message -- guard included -- back in its `Err`, so letting that
+        // error value drop here retires the activity count without any
+        // separate manual call. There is no path that both enters and never
+        // exits.
+        if let Err(send_error) = worker
             .sender
             .send(NativeStreamingWorkerMessage::Attach {
                 session,
@@ -256,10 +281,11 @@ impl NativeStreamingDecodeWorker {
                 outcomes: outcome_tx,
                 finalize_requested: Arc::clone(&finalize_requested),
                 cancel_requested: Arc::clone(&cancel_requested),
+                activity: worker.activity,
             })
             .await
-            .is_err()
         {
+            drop(send_error);
             worker.state.release();
             return Err("native streaming worker stopped before session attach".to_string());
         }
@@ -301,20 +327,21 @@ pub(crate) fn native_streaming_worker_for_key(
     {
         entry.state.acquire();
         // idle_unload must never fire while a native session is attached to
-        // (or attaching to) any worker -- paired with the matching
-        // `native_activity_exit` in `spawn_native_streaming_worker`'s
-        // `state.release()`.
-        crate::idle_activity::native_activity_enter();
+        // (or attaching to) any worker. `NativeActivityGuard::enter()` starts
+        // that window; ownership rides in `NativeStreamingWorkerHandle` (and
+        // then the `Attach` message) until whichever side ends up retiring it
+        // -- see the doc comments on those types.
         return NativeStreamingWorkerHandle {
             sender: entry.sender.clone(),
             state: entry.state.clone(),
+            activity: crate::idle_activity::NativeActivityGuard::enter(),
         };
     }
 
     let (sender, receiver) =
         mpsc::channel::<NativeStreamingWorkerMessage>(SHARED_BACKEND_WORKER_QUEUE_CAPACITY);
     let state = Arc::new(NativeStreamingWorkerState::new_acquired(Instant::now()));
-    crate::idle_activity::native_activity_enter();
+    let activity = crate::idle_activity::NativeActivityGuard::enter();
     spawn_native_streaming_worker(receiver, state.clone());
     workers.insert(
         key,
@@ -323,7 +350,11 @@ pub(crate) fn native_streaming_worker_for_key(
             state: state.clone(),
         },
     );
-    NativeStreamingWorkerHandle { sender, state }
+    NativeStreamingWorkerHandle {
+        sender,
+        state,
+        activity,
+    }
 }
 
 pub(crate) fn spawn_native_streaming_worker_reaper() {
@@ -370,6 +401,7 @@ pub(crate) fn spawn_native_streaming_worker(
                         outcomes,
                         finalize_requested,
                         cancel_requested,
+                        activity,
                     } => {
                         run_native_streaming_session_on_worker(
                             session,
@@ -379,9 +411,14 @@ pub(crate) fn spawn_native_streaming_worker(
                             cancel_requested,
                         );
                         state.release();
-                        // Paired with the `native_activity_enter` calls in
-                        // `native_streaming_worker_for_key`.
-                        crate::idle_activity::native_activity_exit();
+                        // `activity` was handed off from
+                        // `native_streaming_worker_for_key` once this message
+                        // was actually received; dropping it here (rather
+                        // than a separate manual `native_activity_exit` call)
+                        // is what makes the enter/exit pairing unconditional
+                        // -- there is no longer a code path that enters
+                        // without a guard whose drop retires it exactly once.
+                        drop(activity);
                     }
                 }
             }
