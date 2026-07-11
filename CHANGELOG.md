@@ -8,10 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - Server: `/health` now reports `model_resident`, whether the bound model's native runtime is currently loaded in memory versus idle-unloaded (or not yet loaded this boot) -- lets clients (e.g. the desktop status indicator) distinguish "ready, instant transcription" from "bound but will pay a cold rebuild on the next request" without guessing from the `idle_unload` timer. Additive; `model_installed` is unchanged.
+- Server: `GET /v1/devices` enumerates the daemon's own ggml compute devices (Auto/CPU/accelerated), so a UI can read the backends inference actually runs on instead of enumerating its own runtime -- a shell built in a different backend shape than the sidecar (e.g. a CPU-only desktop supervising a Vulkan sidecar on Windows) previously hid the GPU. Device shaping (`compute_devices_from_runtime`, `default_execution_target`, `ComputeDevice`) lives in `openasr-core` as the single source of truth, reused by the endpoint and by a shell offline fallback.
 
 ### Changed
 
 - Core: the offline and realtime-streaming dispatch stacks now share one process-wide executor instance for qwen, cohere, whisper, and moonshine (the families that host-materialize a prepared runtime instead of relying purely on the pack's own mmap), instead of each stack holding its own independent instance and cache. A model warmed on both stacks no longer pays for its resident weights twice: measured on `qwen3-asr-0.6b` q4_k, warming both stacks on the same pack now costs ~1x instead of ~2x (2965 MiB -> 2197 MiB physical footprint in a same-process repro). AED/CTC/transducer families keep zero-copy mmap-shared weights already and are unaffected.
+
+### Fixed
+
+- `ggml`: statically-linked builds (macOS, Linux, and Windows GPU-feature builds where `GGML_BACKEND_DL` is off) no longer unconditionally `dlopen()` every `ggml-*.dll` next to the exe on startup -- harmless on its own, but actively dangerous when the exe directory also carries CPU BACKEND_DL plugin DLLs (e.g. a desktop bundle shipping them for other components): loading a second copy of ggml core collided with the statically-linked copy's global state and fastfailed the process. The backend directory scan is now gated on `OPENASR_GGML_BACKEND_DL_ENABLED` (same pattern as `OPENASR_GGML_NATIVE_ENABLED`); genuine `GGML_BACKEND_DL` builds are unaffected. Also: `catalog.public.json`/`catalog.public.signature.json` were missing from the `eol=lf` rules covering the private catalog trio, so Windows checkouts with `core.autocrlf=true` rewrote them to CRLF and broke the bundled-catalog sha256 signature check (fail-closed, blocking desktop bundling on Windows).
 
 ## [0.1.12] - 2026-07-11
 

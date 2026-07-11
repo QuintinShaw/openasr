@@ -50,6 +50,15 @@ pack that is being served.
 - `POST /v1/audio/transcriptions/{id}/pause|resume|cancel` -- OpenASR
   extension: control an in-flight request that supplied a `transcription_id`
   form field.
+- `GET /v1/devices` -- OpenASR extension (0.1.13+): read-only enumeration of
+  this daemon's own ggml compute devices (`{"object":"devices",
+  "default_execution_target","devices":[{"id","name","meta","kind","target",
+  "effective_target","memory"?}]}`). Always includes `auto` and `cpu`; an
+  `accelerated` entry (Metal/CUDA/Vulkan/HIP, per platform) is present only
+  when the runtime detects one. `default_execution_target` is what `auto`
+  resolves to on this daemon (`cpu` or `accelerated`). Not operator-gated --
+  same local-auth layer as `/v1/models`. Intended for a UI's execution-target
+  picker; reflects the daemon's own runtime, not a remote sidecar's.
 
 ## OpenAI parameter compatibility matrix
 
