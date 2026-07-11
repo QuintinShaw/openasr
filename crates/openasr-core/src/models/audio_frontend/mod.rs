@@ -37,14 +37,36 @@ pub(crate) enum PadMode {
     /// `torch.stft(center=True, pad_mode="reflect")`: reflect-pad `n_fft/2`
     /// samples on both ends (no edge repeat) before framing at `hop`
     /// stride, i.e. `n_frames = (padded_len - n_fft) / hop + 1`. Used by
-    /// `parakeet_ctc`/`parakeet_tdt`, `whisper`, `cohere`, `qwen`.
+    /// `parakeet_ctc`/`parakeet_tdt`, `whisper`, `cohere`, `qwen`, and
+    /// `dolphin`'s ESPnet-variant frontend (`DolphinEspnetFrontend`).
     ReflectCenter,
+    /// Kaldi/sherpa-onnx `snip_edges=false`: frame `i`'s window starts at
+    /// absolute sample index `i*hop - (win/2 - hop/2)` (the asymmetric
+    /// kaldi offset, distinct from `ReflectCenter`'s symmetric `n_fft/2`
+    /// centering), reflected (no edge repeat) against the *total* stream
+    /// length rather than a once-materialized padded buffer. There is no
+    /// whole-buffer [`StftFramer::power_spectrogram`] entry point for this
+    /// mode -- drive it exclusively through
+    /// [`StftFramer::power_spectrogram_kaldi_snip_edges_false_range`], which
+    /// takes an explicit frame range and an optional dropped-prefix offset
+    /// so streaming callers can hold only a tail of the signal (O(1) memory)
+    /// instead of the whole utterance. Used by `xasr_zipformer`'s streaming
+    /// fbank.
+    KaldiSnipEdgesFalse,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StftError {
     #[error("stft framer produced no frames from {samples} samples")]
     TooShort { samples: usize },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum KaldiFrameRangeError {
+    #[error(
+        "kaldi snip_edges=false frame range needs a sample earlier than the retained prefix (frame {frame})"
+    )]
+    MissingPrefix { frame: usize },
 }
 
 /// Power spectrogram, row-major `[frame][fft_bin]` (bin innermost).
@@ -57,7 +79,11 @@ pub(crate) struct PowerSpectrogram {
 
 /// Frames raw audio, applies an analysis window, and runs a real FFT to
 /// produce a power spectrogram. Owns the FFT plan (built once per instance)
-/// since planning dominates the per-call cost for short frames.
+/// since planning dominates the per-call cost for short frames. `Clone`
+/// clones the `Arc`-held FFT plan (cheap, shares the twiddle tables) --
+/// needed so `xasr_zipformer::frontend::XasrFbankFrontend` (which embeds
+/// this) can keep deriving `Clone` itself.
+#[derive(Clone)]
 pub(crate) struct StftFramer {
     n_fft: usize,
     /// Analysis window length before any `n_fft` zero-pad (documentation +
@@ -117,7 +143,68 @@ impl StftFramer {
     pub(crate) fn power_spectrogram(&self, samples: &[f32]) -> Result<PowerSpectrogram, StftError> {
         match self.pad_mode {
             PadMode::ReflectCenter => self.power_spectrogram_reflect_center(samples),
+            PadMode::KaldiSnipEdgesFalse => panic!(
+                "StftFramer::power_spectrogram: PadMode::KaldiSnipEdgesFalse has no whole-buffer \
+                 entry point -- use power_spectrogram_kaldi_snip_edges_false_range"
+            ),
         }
+    }
+
+    /// Kaldi `snip_edges=false` incremental framing (see
+    /// [`PadMode::KaldiSnipEdgesFalse`]): computes power-spectrogram rows for
+    /// frames `[start_frame, end_frame)` of a stream whose total length is
+    /// `total_len`, reading only `samples[sample_offset..]` (streaming
+    /// callers may have already dropped the earlier prefix). Returns
+    /// [`KaldiFrameRangeError::MissingPrefix`] instead of panicking when a
+    /// frame needs a sample before `sample_offset`.
+    pub(crate) fn power_spectrogram_kaldi_snip_edges_false_range(
+        &self,
+        samples: &[f32],
+        sample_offset: usize,
+        total_len: usize,
+        start_frame: usize,
+        end_frame: usize,
+    ) -> Result<PowerSpectrogram, KaldiFrameRangeError> {
+        debug_assert_eq!(self.pad_mode, PadMode::KaldiSnipEdgesFalse);
+        // Kaldi's asymmetric offset: half the window, minus half the hop.
+        let frame_offset = (self.win / 2) as i64 - (self.hop / 2) as i64;
+        let fft_bins = self.n_fft_bins();
+        let r2c = &self.fft;
+        let mut fft_in = r2c.make_input_vec();
+        let mut fft_out = r2c.make_output_vec();
+        let mut scratch = r2c.make_scratch_vec();
+
+        let n_frames = end_frame.saturating_sub(start_frame);
+        let mut data = vec![0.0f32; n_frames * fft_bins];
+        for frame in start_frame..end_frame {
+            for value in fft_in.iter_mut() {
+                *value = 0.0;
+            }
+            let start = frame as i64 * self.hop as i64 - frame_offset;
+            for (i, (slot, &window_value)) in fft_in
+                .iter_mut()
+                .zip(self.window.iter())
+                .enumerate()
+                .take(self.win)
+            {
+                let absolute_idx = reflect_index_no_repeat(total_len, start + i as i64);
+                let sample_idx = absolute_idx
+                    .checked_sub(sample_offset)
+                    .ok_or(KaldiFrameRangeError::MissingPrefix { frame })?;
+                *slot = samples[sample_idx] * window_value;
+            }
+            r2c.process_with_scratch(&mut fft_in, &mut fft_out, &mut scratch)
+                .expect("stft framer kaldi-range rfft");
+            let row_offset = (frame - start_frame) * fft_bins;
+            for (bin, c) in fft_out.iter().enumerate() {
+                data[row_offset + bin] = c.norm_sqr();
+            }
+        }
+        Ok(PowerSpectrogram {
+            data,
+            n_frames,
+            n_fft_bins: fft_bins,
+        })
     }
 
     fn power_spectrogram_reflect_center(
@@ -173,6 +260,41 @@ pub(crate) fn hann_window_centered(win_length: usize, n_fft: usize) -> Vec<f32> 
     window
 }
 
+/// Periodic Hann window of `length`, computed by pre-dividing the angular
+/// step (`2*pi / length`) once and multiplying by the sample index, rather
+/// than [`hann_window_centered`]'s per-sample `(2*pi*i) / length` operation
+/// order. The two are the exact same real-valued formula but round
+/// differently in f32 for some lengths (confirmed by exhaustive bit
+/// comparison at length 400); this is `whisper`'s own bit-exact
+/// construction, used only where `win_length == n_fft` (no centering slack,
+/// hence no `n_fft` parameter).
+pub(crate) fn hann_window_periodic_scale_first(length: usize) -> Vec<f32> {
+    let scale = std::f32::consts::PI * 2.0 / length as f32;
+    (0..length)
+        .map(|i| 0.5 - 0.5 * (scale * i as f32).cos())
+        .collect()
+}
+
+/// Kaldi "Povey" window (`hann(i)^0.85`, `torch.hann_window`'s
+/// `periodic=True` formula raised to the 0.85 power), zero-padded on the
+/// right into an `n_fft`-length buffer (`window[win_length..]` stays zero).
+/// This is the kaldi `snip_edges=false` left-aligned convention -- the
+/// `win_length < n_fft` slack goes entirely on the right, as opposed to
+/// [`hann_window_centered`]'s symmetric centering (see
+/// [`PadMode::KaldiSnipEdgesFalse`]). Used by `xasr_zipformer`'s streaming
+/// fbank; `kaldi_fbank.rs`'s batch engine builds its own copy of this same
+/// formula independently (unifying that is a separate follow-up, out of
+/// scope here).
+pub(crate) fn povey_window_left_aligned(win_length: usize, n_fft: usize) -> Vec<f32> {
+    let mut window = vec![0.0f32; n_fft];
+    for (i, slot) in window.iter_mut().enumerate().take(win_length) {
+        let hann =
+            0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (win_length - 1) as f32).cos();
+        *slot = hann.powf(0.85);
+    }
+    window
+}
+
 /// numpy/`torch.stft`-style reflect padding (no edge repeat): pads `pad`
 /// samples of mirrored signal onto both ends of `samples`.
 fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
@@ -187,6 +309,31 @@ fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
         out.push(samples[idx.min(n.saturating_sub(1))]);
     }
     out
+}
+
+/// `numpy`/`torch` `mode="reflect"` sample lookup at a possibly
+/// out-of-range signal index (may be negative or `>= samples_len`): mirrors
+/// the signal about each edge without repeating the edge sample, matching
+/// `torch.stft`'s `pad_mode="reflect"` -- the per-index equivalent of
+/// [`reflect_pad`], usable when materializing the whole padded buffer up
+/// front isn't practical (kaldi `snip_edges=false` incremental streaming
+/// framing, `xasr_zipformer`; ESPnet per-frame framing, `dolphin`). Single-
+/// or zero-sample signals fold to index 0.
+pub(crate) fn reflect_index_no_repeat(samples_len: usize, index: i64) -> usize {
+    if samples_len <= 1 {
+        return 0;
+    }
+    let last = samples_len as i64 - 1;
+    let period = 2 * last;
+    let mut folded = index % period;
+    if folded < 0 {
+        folded += period;
+    }
+    if folded > last {
+        (period - folded) as usize
+    } else {
+        folded as usize
+    }
 }
 
 /// Per-feature (column) mean/std normalization of a row-major
@@ -313,5 +460,143 @@ mod tests {
         // (ddof=0), so the ddof=1 std is larger and its normalized
         // magnitudes are smaller.
         assert!(ddof1[0].abs() < ddof0[0].abs());
+    }
+
+    /// Exact reimplementation of the pre-refactor `whisper::mel::hann_window`,
+    /// kept only to pin [`hann_window_periodic_scale_first`] to the values
+    /// `whisper` shipped before this module existed.
+    fn reference_whisper_hann_window(length: usize) -> Vec<f32> {
+        let scale = std::f32::consts::PI * 2.0 / length as f32;
+        (0..length)
+            .map(|index| 0.5 - 0.5 * (scale * index as f32).cos())
+            .collect()
+    }
+
+    #[test]
+    fn hann_window_periodic_scale_first_is_byte_identical_to_pre_refactor_whisper_impl() {
+        for length in [400usize, 512usize] {
+            assert_eq!(
+                reference_whisper_hann_window(length),
+                hann_window_periodic_scale_first(length),
+                "length={length}"
+            );
+        }
+    }
+
+    /// Exact reimplementation of the pre-refactor
+    /// `xasr_zipformer::frontend::povey_window`, kept only to pin
+    /// [`povey_window_left_aligned`] to the values `xasr_zipformer` shipped
+    /// before this module existed.
+    fn reference_xasr_povey_window(length: usize) -> Vec<f32> {
+        (0..length)
+            .map(|i| {
+                let hann =
+                    0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (length - 1) as f32).cos();
+                hann.powf(0.85)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn povey_window_left_aligned_is_byte_identical_to_pre_refactor_xasr_impl() {
+        let expected = reference_xasr_povey_window(400);
+        let actual = povey_window_left_aligned(400, 512);
+        assert_eq!(&actual[..400], expected.as_slice());
+        assert!(actual[400..].iter().all(|&v| v == 0.0));
+    }
+
+    /// Exact reimplementation of the pre-refactor
+    /// `xasr_zipformer::frontend::reflect_sample_index`, kept only to pin
+    /// [`reflect_index_no_repeat`] to the values `xasr_zipformer` shipped
+    /// before this module existed. (`dolphin::frontend::reflect_sample`'s
+    /// per-index math is the same formula independently derived; both
+    /// families' pre-refactor golden coverage exercises this indirectly.)
+    fn reference_xasr_reflect_sample_index(index: i64, len: usize) -> usize {
+        if len <= 1 {
+            return 0;
+        }
+        let last = len as i64 - 1;
+        let period = 2 * last;
+        let mut folded = index % period;
+        if folded < 0 {
+            folded += period;
+        }
+        if folded > last {
+            (period - folded) as usize
+        } else {
+            folded as usize
+        }
+    }
+
+    #[test]
+    fn reflect_index_no_repeat_is_byte_identical_to_pre_refactor_xasr_impl() {
+        for len in [1usize, 2, 5, 400] {
+            for index in -20i64..40 {
+                assert_eq!(
+                    reference_xasr_reflect_sample_index(index, len),
+                    reflect_index_no_repeat(len, index),
+                    "len={len} index={index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reflect_index_no_repeat_stays_in_bounds() {
+        for &i in &(-20..20).collect::<Vec<i64>>() {
+            assert!(reflect_index_no_repeat(5, i) < 5);
+        }
+        assert_eq!(reflect_index_no_repeat(5, -1), 1);
+        assert_eq!(reflect_index_no_repeat(5, 5), 3);
+    }
+
+    fn xasr_style_framer() -> StftFramer {
+        StftFramer::new(
+            512,
+            400,
+            160,
+            PadMode::KaldiSnipEdgesFalse,
+            povey_window_left_aligned(400, 512),
+        )
+    }
+
+    #[test]
+    fn kaldi_snip_edges_false_range_matches_full_computation_when_split() {
+        let framer = xasr_style_framer();
+        let samples: Vec<f32> = (0..8_000)
+            .map(|i| (2.0 * std::f32::consts::PI * 313.0 * i as f32 / 16_000.0).sin() * 0.1)
+            .collect();
+        let total_len = samples.len();
+        // 7 frames covers the whole clip at this length; split the range to
+        // confirm the incremental range API is order/slice independent.
+        let full = framer
+            .power_spectrogram_kaldi_snip_edges_false_range(&samples, 0, total_len, 0, 7)
+            .expect("full range");
+        let head = framer
+            .power_spectrogram_kaldi_snip_edges_false_range(&samples, 0, total_len, 0, 3)
+            .expect("head range");
+        let tail = framer
+            .power_spectrogram_kaldi_snip_edges_false_range(&samples, 0, total_len, 3, 7)
+            .expect("tail range");
+        assert_eq!(head.data, full.data[..3 * full.n_fft_bins]);
+        assert_eq!(tail.data, full.data[3 * full.n_fft_bins..]);
+    }
+
+    #[test]
+    fn kaldi_snip_edges_false_range_rejects_dropped_prefix() {
+        let framer = xasr_style_framer();
+        let samples = vec![0.01f32; 8_000];
+        // Frame 0 needs samples starting at 0*160 - (400/2 - 160/2) = -120,
+        // reflected into [0, total_len); asking for frame 0 while
+        // `sample_offset` has already dropped everything before absolute
+        // sample 4000 must fail closed, not panic or read out of bounds.
+        let tail = &samples[4_000..];
+        let error = framer
+            .power_spectrogram_kaldi_snip_edges_false_range(tail, 4_000, 8_000, 0, 1)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            KaldiFrameRangeError::MissingPrefix { frame: 0 }
+        ));
     }
 }

@@ -1,8 +1,6 @@
-use std::sync::{Arc, OnceLock};
-
-use realfft::{RealFftPlanner, RealToComplex};
-
 use crate::NativeAsrError;
+use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale};
+use crate::models::audio_frontend::{PadMode, StftFramer, hann_window_periodic_scale_first};
 use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
 use crate::tensor::{TensorOwnedF32, TensorViewF32, linear_f32};
 
@@ -16,12 +14,14 @@ const WHISPER_LOG_SPEC_FLOOR: f32 = 1e-10;
 const WHISPER_LOG_SPEC_DYNAMIC_RANGE: f32 = 8.0;
 const WHISPER_LOG_SPEC_SHIFT: f32 = 4.0;
 
-static WHISPER_R2C_PLAN_V0: OnceLock<Arc<dyn RealToComplex<f32>>> = OnceLock::new();
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct WhisperMelFrontendPlan {
     pub n_mels: usize,
     pub target_frames: usize,
+    /// Periodic Hann window, `n_fft` (== `WHISPER_N_FFT`) long -- whisper
+    /// never needs the `win_length < n_fft` centering slack
+    /// [`crate::models::audio_frontend::hann_window_centered`] handles for
+    /// other families.
     pub window: Vec<f32>,
     pub mel_filters: Vec<f32>,
 }
@@ -75,14 +75,21 @@ pub fn build_whisper_mel_frontend_plan_v0(
     Ok(WhisperMelFrontendPlan {
         n_mels,
         target_frames,
-        window: hann_window(WHISPER_N_FFT),
-        mel_filters: slaney_mel_filterbank(
+        window: hann_window_periodic_scale_first(WHISPER_N_FFT),
+        mel_filters: crate::models::audio_frontend::mel::filterbank(FilterbankConfig {
+            scale: MelScale::Slaney,
+            sample_rate_hz: WHISPER_SAMPLE_RATE_HZ as f32,
+            n_fft: WHISPER_N_FFT,
             n_mels,
-            WHISPER_N_FFT,
-            WHISPER_SAMPLE_RATE_HZ,
-            WHISPER_MEL_FMIN,
-            WHISPER_MEL_FMAX,
-        )?,
+            fmin: WHISPER_MEL_FMIN,
+            fmax: WHISPER_MEL_FMAX,
+            // whisper's own pre-refactor filterbank builder computed the
+            // mel-domain edge ratio before scaling by the mel span; see
+            // `MelPointOrder::RatioFirst`'s doc for why this must stay
+            // pinned rather than reuse `parakeet_ctc`'s edge-construction
+            // order.
+            mel_point_order: MelPointOrder::RatioFirst,
+        }),
     })
 }
 
@@ -137,53 +144,50 @@ pub fn whisper_mel_features_from_samples_with_plan_v0(
         });
     }
 
-    let padded = whisper_pad_for_stft_center_v0(samples, plan.target_frames)?;
-    let r2c = whisper_r2c_plan_v0();
-    let mut fft_input = r2c.make_input_vec();
-    let mut fft_output = r2c.make_output_vec();
-    let mut fft_scratch = r2c.make_scratch_vec();
-
-    let all_frames = padded
-        .len()
-        .checked_sub(WHISPER_N_FFT)
+    // OpenAI whisper's `log_mel_spectrogram` pads/trims to a fixed
+    // `target_frames * hop` sample window before framing (untrusted-pack
+    // sizes stay checked-arithmetic since `target_frames` comes from parsed
+    // `.oasr` metadata).
+    let target_audio_samples = plan
+        .target_frames
+        .checked_mul(WHISPER_HOP_LENGTH)
         .ok_or_else(|| NativeAsrError::SessionFailed {
-            message: "Whisper frontend padded signal is shorter than the FFT window".to_string(),
-        })?
-        .checked_div(WHISPER_HOP_LENGTH)
-        .and_then(|value| value.checked_add(1))
-        .ok_or_else(|| NativeAsrError::SessionFailed {
-            message: "Whisper frontend frame count overflow".to_string(),
+            message: "Whisper frontend target frame count overflows audio length".to_string(),
         })?;
-    let frame_count = all_frames
-        .checked_sub(1)
-        .ok_or_else(|| NativeAsrError::SessionFailed {
-            message: "Whisper frontend produced zero spectrogram frames".to_string(),
-        })?;
-    if frame_count == 0 {
-        return Err(NativeAsrError::SessionFailed {
-            message: "Whisper frontend produced zero spectrogram frames".to_string(),
-        });
-    }
+    let audio = pad_or_trim_audio(samples, target_audio_samples);
 
-    let fft_bins = WHISPER_N_FFT / 2 + 1;
-    let mut power_spectrogram = vec![0.0_f32; frame_count * fft_bins];
-    for frame_idx in 0..frame_count {
-        let start = frame_idx * WHISPER_HOP_LENGTH;
-        let frame = &padded[start..start + WHISPER_N_FFT];
-        for (index, value) in fft_input.iter_mut().enumerate() {
-            *value = frame[index] * plan.window[index];
-        }
-        r2c.process_with_scratch(&mut fft_input, &mut fft_output, &mut fft_scratch)
+    let framer = StftFramer::new(
+        WHISPER_N_FFT,
+        WHISPER_N_FFT,
+        WHISPER_HOP_LENGTH,
+        PadMode::ReflectCenter,
+        plan.window.clone(),
+    );
+    let spectrogram =
+        framer
+            .power_spectrogram(&audio)
             .map_err(|error| NativeAsrError::SessionFailed {
-                message: format!("Whisper frontend FFT failed: {error}"),
+                message: format!("Whisper frontend STFT failed: {error}"),
             })?;
 
-        for (bin, complex) in fft_output.iter().enumerate() {
-            power_spectrogram[frame_idx * fft_bins + bin] = complex.norm_sqr();
-        }
+    // `torch.stft(..., center=True, pad_mode="reflect")` on a signal padded
+    // to exactly `target_frames * hop` samples yields `target_frames + 1`
+    // frames; OpenAI whisper's `log_mel_spectrogram` always drops the
+    // trailing frame (`log_spec[..., :-1]`) to land on exactly
+    // `target_frames`.
+    let fft_bins = framer.n_fft_bins();
+    if spectrogram.n_frames <= plan.target_frames {
+        return Err(NativeAsrError::SessionFailed {
+            message: format!(
+                "Whisper frontend produced {} spectrogram frames, expected more than {}",
+                spectrogram.n_frames, plan.target_frames
+            ),
+        });
     }
+    let frame_count = plan.target_frames;
+    let power_spectrogram = &spectrogram.data[..frame_count * fft_bins];
 
-    let power_view = TensorViewF32::contiguous(&power_spectrogram, &[frame_count, fft_bins])
+    let power_view = TensorViewF32::contiguous(power_spectrogram, &[frame_count, fft_bins])
         .map_err(|error| NativeAsrError::SessionFailed {
             message: format!("Whisper frontend power spectrogram view failed: {error}"),
         })?;
@@ -236,49 +240,6 @@ fn emit_mel_probe_trace(values: &[f32], n_mels: usize, n_frames: usize) {
     );
 }
 
-fn whisper_r2c_plan_v0() -> &'static Arc<dyn RealToComplex<f32>> {
-    WHISPER_R2C_PLAN_V0.get_or_init(|| {
-        let mut planner = RealFftPlanner::<f32>::new();
-        planner.plan_fft_forward(WHISPER_N_FFT)
-    })
-}
-
-fn whisper_pad_for_stft_center_v0(
-    samples: &[f32],
-    target_frames: usize,
-) -> Result<Vec<f32>, NativeAsrError> {
-    let target_audio_samples = target_frames
-        .checked_mul(WHISPER_HOP_LENGTH)
-        .ok_or_else(|| NativeAsrError::SessionFailed {
-            message: "Whisper frontend target frame count overflows audio length".to_string(),
-        })?;
-    let padded_audio_len = target_audio_samples
-        .checked_add(WHISPER_N_FFT)
-        .ok_or_else(|| NativeAsrError::SessionFailed {
-            message: "Whisper frontend target frame count overflows padded signal length"
-                .to_string(),
-        })?;
-    let pad = WHISPER_N_FFT / 2;
-    let audio = pad_or_trim_audio(samples, target_audio_samples);
-    let mut output = vec![0.0_f32; padded_audio_len];
-
-    for (index, out) in output.iter_mut().enumerate().take(pad) {
-        *out = reflect_index(&audio, pad - index);
-    }
-    output[pad..pad + audio.len()].copy_from_slice(&audio);
-    for index in 0..pad {
-        let reflect_pos =
-            audio
-                .len()
-                .checked_add(index)
-                .ok_or_else(|| NativeAsrError::SessionFailed {
-                    message: "Whisper frontend right-pad reflection index overflow".to_string(),
-                })?;
-        output[pad + audio.len() + index] = reflect_index(&audio, reflect_pos);
-    }
-    Ok(output)
-}
-
 fn pad_or_trim_audio(samples: &[f32], target_audio_samples: usize) -> Vec<f32> {
     let trimmed = if samples.len() > target_audio_samples {
         &samples[..target_audio_samples]
@@ -288,69 +249,6 @@ fn pad_or_trim_audio(samples: &[f32], target_audio_samples: usize) -> Vec<f32> {
     let mut output = vec![0.0_f32; target_audio_samples];
     output[..trimmed.len()].copy_from_slice(trimmed);
     output
-}
-
-fn reflect_index(samples: &[f32], index: usize) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    if samples.len() == 1 {
-        return samples[0];
-    }
-    let period = samples.len().saturating_sub(1).saturating_mul(2);
-    if period == 0 {
-        return samples[0];
-    }
-    let folded = index % period;
-    let actual = if folded < samples.len() {
-        folded
-    } else {
-        period - folded
-    };
-    samples[actual]
-}
-
-fn hann_window(length: usize) -> Vec<f32> {
-    let scale = std::f32::consts::PI * 2.0 / length as f32;
-    (0..length)
-        .map(|index| 0.5 - 0.5 * (scale * index as f32).cos())
-        .collect()
-}
-
-fn slaney_mel_filterbank(
-    n_mels: usize,
-    n_fft: usize,
-    sample_rate: u32,
-    fmin: f32,
-    fmax: f32,
-) -> Result<Vec<f32>, NativeAsrError> {
-    let fft_bins = n_fft / 2 + 1;
-    let fft_frequencies = (0..fft_bins)
-        .map(|bin| bin as f32 * sample_rate as f32 / n_fft as f32)
-        .collect::<Vec<_>>();
-    let mel_min = hz_to_mel(fmin);
-    let mel_max = hz_to_mel(fmax);
-    let mel_points = (0..n_mels + 2)
-        .map(|index| {
-            let ratio = index as f32 / (n_mels + 1) as f32;
-            mel_to_hz(mel_min + ratio * (mel_max - mel_min))
-        })
-        .collect::<Vec<_>>();
-
-    let mut filters = vec![0.0_f32; n_mels * fft_bins];
-    for mel_idx in 0..n_mels {
-        let left = mel_points[mel_idx];
-        let center = mel_points[mel_idx + 1];
-        let right = mel_points[mel_idx + 2];
-        let norm = 2.0 / (right - left).max(f32::EPSILON);
-        for (bin_idx, hz) in fft_frequencies.iter().copied().enumerate() {
-            let rising = (hz - left) / (center - left).max(f32::EPSILON);
-            let falling = (right - hz) / (right - center).max(f32::EPSILON);
-            let value = rising.min(falling).max(0.0) * norm;
-            filters[mel_idx * fft_bins + bin_idx] = value;
-        }
-    }
-    Ok(filters)
 }
 
 fn normalize_log_mel_in_place(values: &mut [f32]) {
@@ -364,30 +262,6 @@ fn normalize_log_mel_in_place(values: &mut [f32]) {
     let floor = max_value - WHISPER_LOG_SPEC_DYNAMIC_RANGE;
     for value in values.iter_mut() {
         *value = ((*value).max(floor) + WHISPER_LOG_SPEC_SHIFT) / WHISPER_LOG_SPEC_SHIFT;
-    }
-}
-
-fn hz_to_mel(hz: f32) -> f32 {
-    let linear_scale = 200.0 / 3.0;
-    let min_log_hz = 1000.0;
-    let min_log_mel = min_log_hz / linear_scale;
-    if hz < min_log_hz {
-        hz / linear_scale
-    } else {
-        let log_step = 6.4_f32.ln() / 27.0;
-        min_log_mel + (hz / min_log_hz).ln() / log_step
-    }
-}
-
-fn mel_to_hz(mel: f32) -> f32 {
-    let linear_scale = 200.0 / 3.0;
-    let min_log_hz = 1000.0;
-    let min_log_mel = min_log_hz / linear_scale;
-    if mel < min_log_mel {
-        mel * linear_scale
-    } else {
-        let log_step = 6.4_f32.ln() / 27.0;
-        min_log_hz * (log_step * (mel - min_log_mel)).exp()
     }
 }
 

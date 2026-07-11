@@ -31,15 +31,18 @@
 //! periodic Hann window (not Povey), `torch.stft`-style reflect-centered
 //! framing (not kaldi `snip_edges`), no pre-emphasis/DC-removal/int16 scaling,
 //! and a **Slaney**-normalized librosa mel scale/filterbank (not HTK
-//! peak-normalized) -- see `build_slaney_mel_filters`. It stays family-local
-//! (not shared kaldi-fbank infrastructure).
+//! peak-normalized, and f64-precision throughout --
+//! [`crate::models::audio_frontend::mel::MelScale::SlaneyF64Espnet`]). The
+//! STFT framing/windowing/FFT and mel filterbank construction now go through
+//! the shared [`crate::models::audio_frontend`] primitives (same arithmetic,
+//! relocated); the log-energy floor placement (before `.ln()`, no CMVN here
+//! since ESPnet checkpoints bake normalization into the encoder) stays
+//! family-local.
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
-
-use realfft::{RealFftPlanner, RealToComplex};
-
+use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale};
+use crate::models::audio_frontend::{PadMode, StftFramer, hann_window_centered};
 use crate::models::kaldi_fbank::{
     KaldiFbankConfig, KaldiFbankError, KaldiFbankFrontend, KaldiWindowKind,
 };
@@ -187,30 +190,19 @@ const ESPNET_FMAX_HZ: f64 = 8_000.0;
 /// `torch.clamp(mel_feat, min=1e-10)` before `.log()` in `LogMel.forward`.
 const ESPNET_LOG_ENERGY_FLOOR: f32 = 1.0e-10;
 
-/// One triangular Slaney mel filter over the full `0..=n_fft/2` power-bin
-/// range (unlike the shared kaldi engine's sparse filter, not gated to a
-/// contiguous nonzero run: the
-/// area-normalized Slaney weights are small enough near the band edges that
-/// hand-rolling a first/last-bin search buys little, and dense storage keeps
-/// the librosa reference formula ported verbatim below).
-struct EspnetMelFilter {
-    weights: Vec<f32>,
-}
-
 pub(crate) struct DolphinEspnetFrontend {
-    /// Periodic Hann window (`torch.hann_window(win_length)` default,
-    /// `periodic=True`), zero-padded/centered into the `n_fft`-length FFT
-    /// input buffer (`left = (n_fft - win_length) / 2`), mirroring
-    /// `torch.stft`'s own window centering when `win_length < n_fft`.
-    windowed_zero_pad: [f32; ESPNET_N_FFT],
-    filters: Vec<EspnetMelFilter>,
-    fft: Arc<dyn RealToComplex<f32>>,
+    framer: StftFramer,
+    /// Row-major `[n_mels][fft_bins]` Slaney mel filterbank
+    /// (`MelScale::SlaneyF64Espnet`'s f64-precision edge placement).
+    mel_filters: Vec<f32>,
+    n_mels: usize,
+    fft_bins: usize,
 }
 
 impl std::fmt::Debug for DolphinEspnetFrontend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DolphinEspnetFrontend")
-            .field("n_mels", &self.filters.len())
+            .field("n_mels", &self.n_mels)
             .finish_non_exhaustive()
     }
 }
@@ -223,27 +215,33 @@ impl Default for DolphinEspnetFrontend {
 
 impl DolphinEspnetFrontend {
     pub(crate) fn new() -> Self {
-        let mut windowed_zero_pad = [0.0f32; ESPNET_N_FFT];
-        let left = (ESPNET_N_FFT - ESPNET_WIN_LENGTH) / 2;
-        for (n, slot) in windowed_zero_pad[left..left + ESPNET_WIN_LENGTH]
-            .iter_mut()
-            .enumerate()
-        {
-            // Periodic Hann: `0.5 - 0.5*cos(2*pi*n/N)` (N = win_length in the
-            // denominator, not N-1 -- `torch.hann_window`'s default).
-            *slot = 0.5
-                - 0.5 * (2.0 * std::f32::consts::PI * n as f32 / ESPNET_WIN_LENGTH as f32).cos();
-        }
+        // Periodic Hann window (`torch.hann_window(win_length)` default,
+        // `periodic=True`), zero-padded/centered into the `n_fft`-length FFT
+        // input buffer, mirroring `torch.stft`'s own window centering when
+        // `win_length < n_fft`.
+        let framer = StftFramer::new(
+            ESPNET_N_FFT,
+            ESPNET_WIN_LENGTH,
+            ESPNET_HOP_LENGTH,
+            PadMode::ReflectCenter,
+            hann_window_centered(ESPNET_WIN_LENGTH, ESPNET_N_FFT),
+        );
+        let mel_filters = crate::models::audio_frontend::mel::filterbank(FilterbankConfig {
+            scale: MelScale::SlaneyF64Espnet,
+            sample_rate_hz: SAMPLE_RATE_HZ as f32,
+            n_fft: ESPNET_N_FFT,
+            n_mels: ESPNET_NUM_MEL_BINS,
+            fmin: ESPNET_FMIN_HZ as f32,
+            fmax: ESPNET_FMAX_HZ as f32,
+            // `SlaneyF64Espnet` places edges with its own f64 formula and
+            // ignores this field.
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
+        });
         Self {
-            windowed_zero_pad,
-            filters: build_slaney_mel_filters(
-                SAMPLE_RATE_HZ,
-                ESPNET_N_FFT,
-                ESPNET_NUM_MEL_BINS,
-                ESPNET_FMIN_HZ,
-                ESPNET_FMAX_HZ,
-            ),
-            fft: RealFftPlanner::<f32>::new().plan_fft_forward(ESPNET_N_FFT),
+            framer,
+            mel_filters,
+            n_mels: ESPNET_NUM_MEL_BINS,
+            fft_bins: ESPNET_N_FFT / 2 + 1,
         }
     }
 
@@ -262,33 +260,27 @@ impl DolphinEspnetFrontend {
         if samples.is_empty() || samples.iter().any(|v| !v.is_finite()) {
             return Err(DolphinFrontendError::UnsupportedAudio);
         }
-        let pad = ESPNET_N_FFT / 2;
-        let n_frames = 1 + samples.len() / ESPNET_HOP_LENGTH;
-        let r2c = &self.fft;
-        let mut fft_in = r2c.make_input_vec();
-        let mut fft_out = r2c.make_output_vec();
-        let mut scratch = r2c.make_scratch_vec();
-        let mut power = vec![0.0f32; ESPNET_N_FFT / 2 + 1];
+        let spectrogram = self
+            .framer
+            .power_spectrogram(samples)
+            // `ReflectCenter` pads by `n_fft/2` both sides, so `TooShort`
+            // never actually triggers for the nonempty input already
+            // checked above (see `audio_frontend`'s own equivalent note).
+            .map_err(|_| DolphinFrontendError::UnsupportedAudio)?;
+        let n_frames = spectrogram.n_frames;
+        let n_mels = self.n_mels;
+        let fft_bins = self.fft_bins;
 
-        let n_mels = self.filters.len();
         let mut feats = vec![0.0f32; n_frames * n_mels];
         for fr in 0..n_frames {
-            let frame_start = (fr * ESPNET_HOP_LENGTH) as i64 - pad as i64;
-            for (j, slot) in fft_in.iter_mut().enumerate() {
-                let sample = reflect_sample(samples, frame_start + j as i64);
-                *slot = sample * self.windowed_zero_pad[j];
-            }
-            r2c.process_with_scratch(&mut fft_in, &mut fft_out, &mut scratch)
-                .expect("dolphin espnet fbank rfft");
-            for (bin, value) in fft_out.iter().enumerate() {
-                power[bin] = value.re * value.re + value.im * value.im;
-            }
-            for (bin, filter) in self.filters.iter().enumerate() {
+            let power = &spectrogram.data[fr * fft_bins..(fr + 1) * fft_bins];
+            for m in 0..n_mels {
+                let row = &self.mel_filters[m * fft_bins..(m + 1) * fft_bins];
                 let mut energy = 0.0f32;
-                for (weight, p) in filter.weights.iter().zip(power.iter()) {
-                    energy += weight * p;
+                for bin in 0..fft_bins {
+                    energy += row[bin] * power[bin];
                 }
-                feats[fr * n_mels + bin] = energy.max(ESPNET_LOG_ENERGY_FLOOR).ln();
+                feats[fr * n_mels + m] = energy.max(ESPNET_LOG_ENERGY_FLOOR).ln();
             }
         }
         Ok(DolphinFbankFeatures {
@@ -297,108 +289,6 @@ impl DolphinEspnetFrontend {
             n_mels,
         })
     }
-}
-
-/// `numpy`/`torch` `mode="reflect"` boundary sample at signal index `k`
-/// (may be negative or `>= samples.len()`): mirrors the signal about each
-/// edge without repeating the edge sample itself, matching `torch.stft`'s
-/// `pad_mode="reflect"` centering. Single-sample signals fold to that sample.
-fn reflect_sample(samples: &[f32], k: i64) -> f32 {
-    let len = samples.len();
-    if len <= 1 {
-        return samples.first().copied().unwrap_or(0.0);
-    }
-    let period = 2 * (len as i64 - 1);
-    let mut m = k % period;
-    if m < 0 {
-        m += period;
-    }
-    let m = if m < len as i64 { m } else { period - m };
-    samples[m as usize]
-}
-
-/// librosa's Slaney (non-HTK) mel scale: linear below 1 kHz, logarithmic
-/// above. `htk=False` is `librosa.filters.mel`'s default and what
-/// `DefaultFrontend`'s `LogMel` uses when `htk` is left unset (as
-/// dolphin-small/dolphin-base's `frontend_conf` does).
-fn hz_to_mel_slaney(freq: f64) -> f64 {
-    const F_SP: f64 = 200.0 / 3.0;
-    const MIN_LOG_HZ: f64 = 1000.0;
-    const MIN_LOG_MEL: f64 = MIN_LOG_HZ / F_SP; // 15.0
-    let logstep = 6.4f64.ln() / 27.0;
-    if freq >= MIN_LOG_HZ {
-        MIN_LOG_MEL + (freq / MIN_LOG_HZ).ln() / logstep
-    } else {
-        freq / F_SP
-    }
-}
-
-fn mel_to_hz_slaney(mel: f64) -> f64 {
-    const F_SP: f64 = 200.0 / 3.0;
-    const MIN_LOG_HZ: f64 = 1000.0;
-    const MIN_LOG_MEL: f64 = MIN_LOG_HZ / F_SP; // 15.0
-    let logstep = 6.4f64.ln() / 27.0;
-    if mel >= MIN_LOG_MEL {
-        MIN_LOG_HZ * (logstep * (mel - MIN_LOG_MEL)).exp()
-    } else {
-        F_SP * mel
-    }
-}
-
-/// `librosa.filters.mel(sr, n_fft, n_mels, fmin, fmax, htk=False)` (default
-/// `norm="slaney"`): `n_mels` overlapping triangles over `n_fft/2+1` linear FFT
-/// bins, with edges chosen evenly spaced in Slaney-mel space and each row
-/// scaled by `2 / (mel_edge[i+2] - mel_edge[i])` (area, not peak, normalized --
-/// the opposite convention from the kaldi/HTK filters above).
-fn build_slaney_mel_filters(
-    sample_rate_hz: u32,
-    n_fft: usize,
-    n_mels: usize,
-    fmin_hz: f64,
-    fmax_hz: f64,
-) -> Vec<EspnetMelFilter> {
-    let n_fft_bins = n_fft / 2 + 1;
-    let sr = f64::from(sample_rate_hz);
-
-    // `fft_frequencies`: linear bins `k * sr / n_fft`.
-    let fft_freqs: Vec<f64> = (0..n_fft_bins)
-        .map(|k| k as f64 * sr / n_fft as f64)
-        .collect();
-
-    // `mel_frequencies(n_mels + 2, fmin, fmax)`: `n_mels+2` Hz edges, evenly
-    // spaced in mel space then mapped back to Hz.
-    let min_mel = hz_to_mel_slaney(fmin_hz);
-    let max_mel = hz_to_mel_slaney(fmax_hz);
-    let n_edges = n_mels + 2;
-    // `mel_frequencies`: Hz values of `n_edges` mel-evenly-spaced points.
-    // NOTE: librosa's `mel()` keeps `mel_f`/`fdiff`/`ramps` in **Hz** space
-    // from here on (only the edge placement itself uses the mel scale) --
-    // it never round-trips back through `hz_to_mel`.
-    let mel_edges_hz: Vec<f64> = (0..n_edges)
-        .map(|i| {
-            let mel = if n_edges == 1 {
-                min_mel
-            } else {
-                min_mel + (max_mel - min_mel) * i as f64 / (n_edges - 1) as f64
-            };
-            mel_to_hz_slaney(mel)
-        })
-        .collect();
-    let fdiff: Vec<f64> = mel_edges_hz.windows(2).map(|w| w[1] - w[0]).collect();
-
-    let mut filters = Vec::with_capacity(n_mels);
-    for m in 0..n_mels {
-        let enorm = 2.0 / (mel_edges_hz[m + 2] - mel_edges_hz[m]);
-        let mut weights = vec![0.0f32; n_fft_bins];
-        for (k, &freq) in fft_freqs.iter().enumerate() {
-            let lower = -(mel_edges_hz[m] - freq) / fdiff[m];
-            let upper = (mel_edges_hz[m + 2] - freq) / fdiff[m + 1];
-            let weight = lower.min(upper).max(0.0) * enorm;
-            weights[k] = weight as f32;
-        }
-        filters.push(EspnetMelFilter { weights });
-    }
-    filters
 }
 
 #[cfg(test)]
@@ -464,14 +354,17 @@ mod tests {
 
     #[test]
     fn slaney_mel_filterbank_matches_librosa_reference() {
-        let filters = build_slaney_mel_filters(
-            SAMPLE_RATE_HZ,
-            ESPNET_N_FFT,
-            ESPNET_NUM_MEL_BINS,
-            0.0,
-            8_000.0,
-        );
-        assert_eq!(filters.len(), 80);
+        let fft_bins = ESPNET_N_FFT / 2 + 1;
+        let filters = crate::models::audio_frontend::mel::filterbank(FilterbankConfig {
+            scale: MelScale::SlaneyF64Espnet,
+            sample_rate_hz: SAMPLE_RATE_HZ as f32,
+            n_fft: ESPNET_N_FFT,
+            n_mels: ESPNET_NUM_MEL_BINS,
+            fmin: 0.0,
+            fmax: 8_000.0,
+            mel_point_order: MelPointOrder::SpanTimesIndexFirst,
+        });
+        assert_eq!(filters.len(), 80 * fft_bins);
 
         // librosa.filters.mel(...)[0][:10]
         let expected_row0: [f32; 10] = [
@@ -487,7 +380,7 @@ mod tests {
             0.0,
         ];
         for (bin, &expected) in expected_row0.iter().enumerate() {
-            let actual = filters[0].weights[bin];
+            let actual = filters[bin];
             assert!(
                 (actual - expected).abs() < 1.0e-6,
                 "mel row0 bin{bin}: actual {actual} expected {expected}"
@@ -515,7 +408,7 @@ mod tests {
             0.0,
         ];
         for (offset, &expected) in expected_row79_tail.iter().enumerate() {
-            let actual = filters[79].weights[240 + offset];
+            let actual = filters[79 * fft_bins + 240 + offset];
             assert!(
                 (actual - expected).abs() < 1.0e-6,
                 "mel row79 bin{}: actual {actual} expected {expected}",
