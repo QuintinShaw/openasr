@@ -736,10 +736,26 @@ fn build_native_runtime_model_adapter_for_path(path: &Path) -> Option<NativeRunt
         .select_from_gguf_metadata_v1(&selection_metadata)
         .ok()?
         .clone();
+    // Only Dolphin's phrase-bias probe
+    // (`native_runtime_descriptor_supports_phrase_bias`) ever consults the
+    // tensor index -- every other architecture answers phrase-bias support
+    // from the architecture constant alone
+    // (`builtin_executor_supports_phrase_bias_for_model_architecture`) and
+    // never looks at `tensor_index`. Gate the read on architecture so the
+    // other (large majority) of installed packs skip a full GGUF tensor
+    // directory parse (`gguf_init_from_file`) here; this build already runs
+    // at most once per pack per process thanks to
+    // `NATIVE_RUNTIME_MODEL_ADAPTER_CACHE` above, so this trims that one
+    // parse rather than a per-request cost.
+    //
     // Best-effort: a tensor index read failure here should not fail the whole
     // capability lookup (the adapter still resolves from metadata alone); it
     // only narrows the Dolphin per-pack phrase-bias probe to "unsupported".
-    let tensor_index = read_gguf_tensor_index_from_runtime_source(&runtime_source).ok();
+    let tensor_index = if descriptor.model_architecture == DOLPHIN_GGML_ARCHITECTURE_ID {
+        read_gguf_tensor_index_from_runtime_source(&runtime_source).ok()
+    } else {
+        None
+    };
     Some(NativeRuntimeModelAdapter::new(
         descriptor,
         &metadata,
@@ -2617,6 +2633,57 @@ mod tests {
             &whisper_descriptor,
             Some(&base_tensor_index),
         ));
+    }
+
+    #[test]
+    fn dolphin_adapter_builder_still_probes_tensor_index_end_to_end() {
+        // Regression test for the tensor-index read gating in
+        // `build_native_runtime_model_adapter_for_path`: the read is now
+        // conditional on `descriptor.model_architecture ==
+        // DOLPHIN_GGML_ARCHITECTURE_ID`, so this exercises the full
+        // `native_runtime_model_adapter_for_path` -> family-registry
+        // selection -> conditional tensor-index read path end to end (not
+        // just the already-covered `native_runtime_descriptor_supports_phrase_bias`
+        // unit above) to confirm Dolphin's per-pack phrase-bias probe still
+        // fires correctly through the gate.
+        let temp = tempfile::tempdir().unwrap();
+        let mut architecture_only_metadata = std::collections::BTreeMap::new();
+        architecture_only_metadata.insert(
+            crate::arch::GENERAL_ARCHITECTURE_KEY.to_string(),
+            DOLPHIN_GGML_ARCHITECTURE_ID.to_string(),
+        );
+
+        let base_path = temp.path().join("dolphin-base-e2e.gguf");
+        write_tiny_gguf_runtime_source(
+            &base_path,
+            &TinyGgufFixtureSpec::new(architecture_only_metadata.clone()),
+        )
+        .unwrap();
+        let base_adapter = native_runtime_model_adapter_for_path(&base_path).unwrap();
+        assert_eq!(
+            base_adapter.descriptor.model_architecture,
+            DOLPHIN_GGML_ARCHITECTURE_ID
+        );
+        assert!(
+            !base_adapter.capabilities().supports_phrase_bias,
+            "a Dolphin pack without the context-module tensor must not advertise phrase bias"
+        );
+
+        let hotword_path = temp.path().join("dolphin-hotword-e2e.gguf");
+        let hotword_spec = TinyGgufFixtureSpec::new(architecture_only_metadata).with_added_tensor(
+            crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
+        );
+        write_tiny_gguf_runtime_source(&hotword_path, &hotword_spec).unwrap();
+        let hotword_adapter = native_runtime_model_adapter_for_path(&hotword_path).unwrap();
+        assert!(
+            hotword_adapter.capabilities().supports_phrase_bias,
+            "a Dolphin pack with the baked context-module tensor must advertise phrase bias"
+        );
+
+        // Non-Dolphin architectures never consult the tensor index; the
+        // Cohere/whisper full-path tests elsewhere in this module already
+        // cover their `supports_phrase_bias` derivation running through this
+        // same builder with the read now skipped.
     }
 
     #[test]

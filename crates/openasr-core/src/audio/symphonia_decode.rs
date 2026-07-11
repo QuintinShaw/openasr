@@ -202,6 +202,17 @@ where
 /// Resamples mono `input` at `input_rate` Hz to 16 kHz using a pure-Rust FFT
 /// resampler (rubato), processing fixed-size chunks and flushing the
 /// resampler's internal delay at the end so no trailing audio is dropped.
+///
+/// The main loop uses `process_into_buffer` with a pair of buffers allocated
+/// once up front (`Resampler::input_buffer_allocate` /
+/// `output_buffer_allocate`, sized to what `FftFixedIn` needs per call) and
+/// reused across every chunk, instead of the convenience `process()` +
+/// `chunk.to_vec()` pairing that used to allocate a fresh input `Vec` and a
+/// fresh output `Vec<Vec<f32>>` for every `RESAMPLE_CHUNK_FRAMES` chunk (a
+/// 10-minute 48 kHz input is ~2160 chunks). The numeric path is unchanged --
+/// `process_into_buffer` is what `process()` itself calls internally after
+/// allocating its buffers (see `Resampler::process` in rubato); only the
+/// buffer lifetime moved from per-chunk to per-call.
 fn resample_mono_to_16k(input: &[f32], input_rate: u32) -> Option<Vec<f32>> {
     let mut resampler = FftFixedIn::<f32>::new(
         input_rate as usize,
@@ -218,20 +229,37 @@ fn resample_mono_to_16k(input: &[f32], input_rate: u32) -> Option<Vec<f32>> {
     );
     let mut position = 0usize;
 
+    // `FftFixedIn::input_frames_max()` is the fixed `RESAMPLE_CHUNK_FRAMES`
+    // chunk size, so this input buffer is reused verbatim (only its contents
+    // change) across every full-chunk iteration below.
+    let mut input_buffer = resampler.input_buffer_allocate(true);
+    let mut output_buffer = resampler.output_buffer_allocate(true);
+
     while position + RESAMPLE_CHUNK_FRAMES <= input.len() {
-        let chunk = vec![input[position..position + RESAMPLE_CHUNK_FRAMES].to_vec()];
-        let processed = resampler.process(&chunk, None).ok()?;
-        output.extend_from_slice(&processed[0]);
+        input_buffer[0].copy_from_slice(&input[position..position + RESAMPLE_CHUNK_FRAMES]);
+        let (_, out_len) = resampler
+            .process_into_buffer(&input_buffer, &mut output_buffer, None)
+            .ok()?;
+        output.extend_from_slice(&output_buffer[0][..out_len]);
         position += RESAMPLE_CHUNK_FRAMES;
     }
 
+    // Tail handling (a short final chunk, plus the zero-input flush that
+    // drains the resampler's internal delay line) runs at most twice per
+    // call regardless of input length, so it keeps using the
+    // `process_partial_into_buffer` convenience method for its zero-padding;
+    // only the *output* buffer is the shared, pre-allocated one.
     if position < input.len() {
-        let remainder = vec![input[position..].to_vec()];
-        let processed = resampler.process_partial(Some(&remainder), None).ok()?;
-        output.extend_from_slice(&processed[0]);
+        let remainder = [input[position..].to_vec()];
+        let (_, out_len) = resampler
+            .process_partial_into_buffer(Some(&remainder), &mut output_buffer, None)
+            .ok()?;
+        output.extend_from_slice(&output_buffer[0][..out_len]);
     } else {
-        let processed = resampler.process_partial::<Vec<f32>>(None, None).ok()?;
-        output.extend_from_slice(&processed[0]);
+        let (_, out_len) = resampler
+            .process_partial_into_buffer(Option::<&[Vec<f32>]>::None, &mut output_buffer, None)
+            .ok()?;
+        output.extend_from_slice(&output_buffer[0][..out_len]);
     }
 
     Some(output)

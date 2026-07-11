@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -1720,14 +1720,23 @@ fn hymt2_prefill_chunk_size_for(
     decoder.safe_multi_query_prefill_chunk_size_for(token_count)
 }
 
+// `OPENASR_HYMT2_PROFILE` is a process-level launch toggle (set once, before
+// the daemon/CLI starts, to opt into per-step profiling), not something a
+// running process is expected to hot-toggle. Cache the parsed result behind
+// a `OnceLock` -- same pattern as `diarize::debug::diarize_debug_enabled` --
+// so per-token/per-step call sites in the decode loop pay one atomic load
+// instead of a full env lookup (lock + environ scan) every time.
 fn hymt2_profile_enabled() -> bool {
-    std::env::var(HYMT2_PROFILE_ENV)
-        .ok()
-        .map(|value| {
-            let normalized = value.trim().to_ascii_lowercase();
-            !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
-        })
-        .unwrap_or(false)
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(HYMT2_PROFILE_ENV)
+            .ok()
+            .map(|value| {
+                let normalized = value.trim().to_ascii_lowercase();
+                !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn hymt2_profile_start() -> Option<Instant> {
