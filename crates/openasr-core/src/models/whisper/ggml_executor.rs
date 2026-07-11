@@ -50,7 +50,7 @@ use crate::nn::conv::{
     Conv1dParams, ConvActivation, ConvBlockSteps, apply_conv_1d_bias_activation,
 };
 use crate::nn::decoder::{Seq2SeqReusableDecodeGraph, reusable_decode_graph_supported_for_runner};
-use crate::nn::half::f32_to_f16_bits;
+use crate::nn::half::{f16_bits_to_f32, f32_to_f16_bits};
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 use crate::{
     GgmlAsrExecutionError, GgmlAsrExecutionOptions, GgmlAsrExecutionRequest,
@@ -159,34 +159,6 @@ fn whisper_can_use_serve_batch(
     graph_config.backend.is_gpu_class() && !graph_config.use_scheduler
 }
 
-fn f16_to_f32_local_v0(bits: u16) -> f32 {
-    let sign = u32::from(bits & 0x8000) << 16;
-    let exponent = (bits >> 10) & 0x1f;
-    let mantissa = u32::from(bits & 0x03ff);
-    let fp32 = match exponent {
-        0 => {
-            if mantissa == 0 {
-                sign
-            } else {
-                let mut mantissa = mantissa;
-                let mut exponent = -14_i32;
-                while (mantissa & 0x0400) == 0 {
-                    mantissa <<= 1;
-                    exponent -= 1;
-                }
-                mantissa &= 0x03ff;
-                let exponent_bits = ((exponent + 127) as u32) << 23;
-                sign | exponent_bits | (mantissa << 13)
-            }
-        }
-        0x1f => sign | 0x7f80_0000 | (mantissa << 13),
-        _ => {
-            let exponent_bits = (u32::from(exponent) + 112) << 23;
-            sign | exponent_bits | (mantissa << 13)
-        }
-    };
-    f32::from_bits(fp32)
-}
 #[derive(Debug, Error)]
 pub enum WhisperGgmlExecutorError {
     #[error("whisper ggml executor requires adapter '{expected}', got '{found}'")]
@@ -391,10 +363,7 @@ impl WhisperDecoderTensorSource for WhisperDecoderMaterializedTensorSource {
                     },
                 );
             };
-            return Ok(values
-                .iter()
-                .map(|bits| f16_to_f32_local_v0(*bits))
-                .collect());
+            return Ok(values.iter().map(|bits| f16_bits_to_f32(*bits)).collect());
         };
         Ok(values.to_vec())
     }
@@ -415,7 +384,7 @@ impl WhisperDecoderTensorSource for WhisperDecoderMaterializedTensorSource {
             return Ok(Arc::<[f32]>::from(
                 values
                     .iter()
-                    .map(|bits| f16_to_f32_local_v0(*bits))
+                    .map(|bits| f16_bits_to_f32(*bits))
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
             ));
@@ -1756,7 +1725,7 @@ fn encoder_tensor_values_f32<'a>(
         WhisperMaterializedTensorPayload::F32(values) => Cow::Borrowed(values.as_slice()),
         WhisperMaterializedTensorPayload::F16Bits(values) => values
             .iter()
-            .map(|bits| f16_to_f32_local_v0(*bits))
+            .map(|bits| f16_bits_to_f32(*bits))
             .collect::<Vec<_>>()
             .into(),
         WhisperMaterializedTensorPayload::Quantized { ggml_type, .. } => {

@@ -7,7 +7,7 @@ use memmap2::Mmap;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::nn::half::f32_to_f16_bits;
+use crate::nn::half::{f16_bits_to_f32, f32_to_f16_bits};
 
 #[derive(Debug, Error)]
 pub enum LocalSourceImportError {
@@ -446,31 +446,6 @@ pub(crate) fn encode_f16_bits_le(values: Vec<u16>) -> Vec<u8> {
         encoded.extend_from_slice(&value.to_le_bytes());
     }
     encoded
-}
-
-pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = ((bits & 0x8000) as u32) << 16;
-    let exponent = ((bits >> 10) & 0x1f) as u32;
-    let mantissa = (bits & 0x03ff) as u32;
-    let out = if exponent == 0 {
-        if mantissa == 0 {
-            sign
-        } else {
-            let mut mant = mantissa;
-            let mut exp = 113_u32;
-            while mant & 0x0400 == 0 {
-                mant <<= 1;
-                exp = exp.saturating_sub(1);
-            }
-            mant &= 0x03ff;
-            sign | (exp << 23) | (mant << 13)
-        }
-    } else if exponent == 0x1f {
-        sign | 0x7f80_0000 | (mantissa << 13)
-    } else {
-        sign | ((exponent + 112) << 23) | (mantissa << 13)
-    };
-    f32::from_bits(out)
 }
 
 pub(crate) fn tensor_element_count(
