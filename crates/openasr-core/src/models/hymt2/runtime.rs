@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -359,6 +360,51 @@ impl Hymt2Runtime {
         validate_hymt2_runtime_tensors_with_index(&tensor_index, hymt2_metadata)
             .map_err(|source| Hymt2RuntimeError::Config { source })?;
         Ok(hymt2_metadata)
+    }
+
+    /// Process-lifetime-cached wrapper over [`Hymt2Runtime::probe_path`],
+    /// keyed on the canonicalized path -- same discipline as
+    /// `native_runtime_model_adapter_for_path` in
+    /// `api::backend::native`: an installed pack's bytes are immutable for
+    /// the life of the daemon process (a re-pull that actually changes
+    /// content lands under its own path per `pull_paths`'s
+    /// `model_id/quant/filename` layout, not by mutating an already-bound
+    /// path in place), so a fixed path deterministically reprobes to the
+    /// same metadata/error for the rest of the process's life.
+    ///
+    /// This exists because `translation_capability_for_distribution`
+    /// (`/v1/capabilities`) re-validated the full Hy-MT2 pack -- GGUF
+    /// metadata read, tensor-index read, and tensor-contract check -- on
+    /// every single call with no cross-call memoization, even though the
+    /// *discovery* of which pack path to probe
+    /// (`find_installed_hymt2_translation_pack`) is already a cheap,
+    /// uncached directory scan performed fresh on every call. Caching only
+    /// the expensive probe below means a pack installed or removed while
+    /// the daemon is running is still picked up immediately (discovery
+    /// reruns every call and hands this a different/absent path), while a
+    /// repeat probe of the same already-known pack no longer re-parses a
+    /// model many times larger than the ASR packs the sibling cache
+    /// targets.
+    ///
+    /// Errors are cached as their rendered message (`Hymt2RuntimeError`
+    /// itself is not `Clone`): callers here only ever display the error, and
+    /// a fixed input path fails the same way every time.
+    pub fn probe_path_cached(path: impl AsRef<Path>) -> Result<Hymt2ExecutionMetadata, String> {
+        static CACHE: OnceLock<Mutex<HashMap<PathBuf, Result<Hymt2ExecutionMetadata, String>>>> =
+            OnceLock::new();
+        let path = path.as_ref();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let cache_key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if let Ok(cache) = cache.lock()
+            && let Some(cached) = cache.get(&cache_key)
+        {
+            return cached.clone();
+        }
+        let result = Self::probe_path(path).map_err(|error| error.to_string());
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert(cache_key, result.clone());
+        }
+        result
     }
 
     pub fn metadata(&self) -> Hymt2ExecutionMetadata {
@@ -2145,6 +2191,36 @@ mod tests {
         let active = cache.active.as_ref().expect("rebuilt active cache");
         assert_eq!(active.source_prefix_tokens, [1, 2, 3, 4, 5]);
         assert_eq!(active.layer_kv_caches[0].written_positions(), 5);
+    }
+
+    /// `probe_path_cached` must serve a repeat call for the same path from
+    /// the process-lifetime cache rather than re-reading the file: writes a
+    /// too-short file (fails as `FileTooShort`), probes it, then overwrites
+    /// the same path with a longer file carrying unrecognized magic bytes
+    /// (which would fail as a *different* `UnknownMagic` error if actually
+    /// re-probed). The second call must still report the first, cached
+    /// error string, proving it never touched the file the second time.
+    #[test]
+    fn probe_path_cached_does_not_reread_an_already_probed_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("probe-cache-test.oasr");
+
+        std::fs::write(&path, b"ab").expect("write too-short file");
+        let first = Hymt2Runtime::probe_path_cached(&path);
+        assert!(
+            first.is_err(),
+            "a 2-byte file must fail runtime source validation"
+        );
+
+        std::fs::write(&path, b"ZZZZ-not-a-real-gguf-package").expect("overwrite with new bytes");
+        let second = Hymt2Runtime::probe_path_cached(&path);
+
+        assert_eq!(
+            first, second,
+            "a cached probe must return the exact same error on a repeat call for the \
+             same path, even though the file's content (and therefore its uncached \
+             error) changed in between"
+        );
     }
 
     #[test]
