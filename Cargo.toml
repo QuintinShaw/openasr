@@ -75,7 +75,7 @@ tokio = { version = "1.37", features = ["macros", "net", "rt-multi-thread", "sig
 tokio-stream = "0.1"
 tokio-rustls = "0.26"
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
-toml = "0.9"
+toml = "1"
 tower = "0.5"
 unicode-general-category = "1.1"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }

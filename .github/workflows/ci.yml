@@ -55,6 +55,10 @@ jobs:
           python3 -m unittest discover -s tooling/public-hf-e2e -p 'test_*.py'
           python3 -m unittest discover -s tooling/family-regression -p 'test_*.py'
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Install cbindgen
+        run: cargo install cbindgen --locked
+      - name: FFI header drift gate
+        run: scripts/generate-ffi-header.sh --check
 
   test:
     name: Rust test (nextest, doctests, sys-audio)

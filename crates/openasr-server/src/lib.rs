@@ -674,32 +674,6 @@ impl Listener for TlsListener {
     }
 }
 
-/// Generates a brand-new, wholly ephemeral self-signed identity for
-/// `subject_alt_names` and returns its certificate fingerprint. **Not** a
-/// preview of, or in any way tied to, the identity a real
-/// `--tls-self-signed` daemon actually serves: it calls
-/// `self_signed_tls_identity` directly (bypassing
-/// `load_or_generate_self_signed_tls_identity` and any `tls_identity_store`),
-/// so every call mints a fresh keypair+certificate with its own fingerprint,
-/// independent of whatever a running daemon has persisted to
-/// `OPENASR_HOME/tls-identity.json`. Do not use this to predict or display
-/// "the" server fingerprint for a paired/persisted identity -- read that from
-/// a live server's `/health` or pairing response instead. Kept as-is
-/// (unchanged by the TLS-identity-persistence work) because nothing in this
-/// codebase currently calls it for that purpose; if a future caller wants a
-/// persistence-aware preview, it should call
-/// `load_or_generate_self_signed_tls_identity` (or a thin wrapper around it)
-/// instead of this function.
-pub fn server_certificate_fingerprint_for_subject_alt_names(
-    subject_alt_names: impl IntoIterator<Item = impl Into<String>>,
-) -> anyhow::Result<String> {
-    let tls = ServerTlsConfig::self_signed(subject_alt_names);
-    let ServerTlsConfig::SelfSigned { subject_alt_names } = tls else {
-        unreachable!("self_signed always returns self-signed config")
-    };
-    Ok(self_signed_tls_identity(&subject_alt_names)?.certificate_sha256)
-}
-
 fn validate_listen_security(
     addr: SocketAddr,
     launch_options: &ServerLaunchOptions,
