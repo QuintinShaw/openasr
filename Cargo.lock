@@ -1610,6 +1610,7 @@ dependencies = [
  "cpal",
  "hound",
  "indicatif",
+ "libc",
  "openasr-core",
  "openasr-server",
  "openasr-system-audio",
@@ -1622,6 +1623,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
