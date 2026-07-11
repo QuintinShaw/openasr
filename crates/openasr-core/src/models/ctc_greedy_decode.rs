@@ -115,8 +115,15 @@ impl IncrementalCtcGreedyDecoder {
         // set and its output stays byte-identical to the un-biased decode.
         let argmax = self.argmax_frame(row, frame)?;
         // Confidence of this frame's pick; a token's probability is the mean over
-        // its argmax run.
-        let probability = token_softmax_probability(row, argmax as usize);
+        // its argmax run. Blank runs are dropped whole in `push_ctc_token_run`
+        // before their probability is ever read, so skip the full-vocab softmax
+        // scan for blank frames -- this is the hottest path in blank-dominated
+        // audio (most frames between spoken tokens).
+        let probability = if argmax == self.config.blank_token_id {
+            0.0
+        } else {
+            token_softmax_probability(row, argmax as usize)
+        };
         match self.prev_argmax {
             None => {
                 self.prev_argmax = Some(argmax);
