@@ -995,31 +995,21 @@ fn run_native_transcription_impl(
                     fallback_options,
                     backend_preference,
                 )?;
-                return Ok(with_reported_language(
-                    apply_speaker_turns(
-                        with_longform_metadata(
-                            normalize_transcription_segments(
-                                fallback.into_transcription(),
-                                0.0,
-                                audio_duration_seconds,
-                            ),
-                            Some(run_metadata),
-                        ),
-                        &speaker_turns,
-                        strip_forced_word_timestamps,
-                    ),
+                return Ok(finalize_native_transcription(
+                    fallback.into_transcription(),
+                    audio_duration_seconds,
+                    Some(run_metadata),
+                    &speaker_turns,
+                    strip_forced_word_timestamps,
                     reported_language.clone(),
                 ));
             }
-            return Ok(with_reported_language(
-                apply_speaker_turns(
-                    with_longform_metadata(
-                        normalize_transcription_segments(assembled, 0.0, audio_duration_seconds),
-                        Some(run_metadata),
-                    ),
-                    &speaker_turns,
-                    strip_forced_word_timestamps,
-                ),
+            return Ok(finalize_native_transcription(
+                assembled,
+                audio_duration_seconds,
+                Some(run_metadata),
+                &speaker_turns,
+                strip_forced_word_timestamps,
                 reported_language.clone(),
             ));
         }
@@ -1042,19 +1032,47 @@ fn run_native_transcription_impl(
         request_options,
         backend_preference,
     )?;
-    let normalized = normalize_transcription_segments(
+    Ok(finalize_native_transcription(
         transcription.into_transcription(),
-        0.0,
         audio_duration_seconds,
-    );
-    Ok(with_reported_language(
+        longform_metadata,
+        &speaker_turns,
+        strip_forced_word_timestamps,
+        reported_language,
+    ))
+}
+
+/// Finalize a decoded transcription for return from
+/// `run_native_transcription_impl`: normalize segment timing/text (dropping
+/// empty segments, filling a fallback span from the request-level audio
+/// duration), stamp the longform metadata for this run, attribute + re-segment
+/// speaker turns, and stamp the reported source language -- in that fixed
+/// order. Every exit path of `run_native_transcription_impl` (the longform
+/// all-silent fallback, the longform assembled result, and the short-form /
+/// single-slice result) funnels through this single function so the order and
+/// parameters of the chain cannot drift between paths; only the decoded
+/// `Transcription` body and its longform metadata differ per call site. See
+/// the `C1` pipeline-split roadmap: this collapses what were three
+/// byte-for-byte-identical call chains into one.
+fn finalize_native_transcription(
+    transcription: Transcription,
+    audio_duration_seconds: f32,
+    longform_metadata: Option<TranscriptionLongFormMetadata>,
+    speaker_turns: &SpeakerAttribution,
+    strip_forced_word_timestamps: bool,
+    reported_language: Option<String>,
+) -> Transcription {
+    with_reported_language(
         apply_speaker_turns(
-            with_longform_metadata(normalized, longform_metadata),
-            &speaker_turns,
+            with_longform_metadata(
+                normalize_transcription_segments(transcription, 0.0, audio_duration_seconds),
+                longform_metadata,
+            ),
+            speaker_turns,
             strip_forced_word_timestamps,
         ),
         reported_language,
-    ))
+    )
 }
 
 /// Stamp the effective source language onto a finished transcription so every
