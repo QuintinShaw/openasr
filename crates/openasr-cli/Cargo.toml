@@ -40,6 +40,12 @@ tokio.workspace = true
 toml.workspace = true
 hound = "3.5"
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 assert_cmd.workspace = true
 axum.workspace = true
