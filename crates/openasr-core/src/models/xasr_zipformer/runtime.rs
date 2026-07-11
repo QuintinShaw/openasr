@@ -201,6 +201,23 @@ fn runtime_pool() -> &'static Mutex<RuntimePool> {
     XASR_PROCESS_RUNTIME_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Idle-unload hook for the X-ASR streaming executor
+/// (`GgmlAsrStreamingExecutor::unload_idle_state`). Drops every pooled idle
+/// runtime for every pack+backend key, freeing the mmap'd weights and
+/// Metal/CPU graph context they hold. Unlike the other builtin families'
+/// `Arc`-shared caches, entries here are only ever pooled while genuinely idle
+/// (a session in flight holds its runtime checked out via `PooledRuntime`,
+/// which never touches the pool until `Drop`), so clearing is a plain
+/// eviction with nothing left half-referenced. The next
+/// `checkout_prepared_runtime` call after this simply misses the pool and
+/// loads a fresh runtime, exactly like a cold start -- there is no separate
+/// "rebuild" step to coordinate.
+pub(super) fn clear_idle_runtime_pool() {
+    if let Ok(mut pool) = runtime_pool().lock() {
+        pool.clear();
+    }
+}
+
 impl XasrZipformerPreparedRuntime {
     pub(super) fn load(pack_path: &Path) -> Result<Self, String> {
         let profile = xasr_profile_start();
@@ -521,6 +538,106 @@ fn xasr_profile_log_duration(stage: &str, elapsed: Duration, detail: std::fmt::A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Single shared lock serializing every test in this file that touches
+    /// the process-wide `XASR_PROCESS_RUNTIME_POOL` (via `checkout_prepared_runtime`
+    /// / `clear_idle_runtime_pool` / a dropped `PooledRuntime`) against each
+    /// other -- without it, `cargo test`'s default same-process parallelism
+    /// could interleave one test's pool population with another's clear.
+    /// `cargo nextest` isolates each test into its own process and would not
+    /// need this at all, but taking the lock costs nothing there either.
+    fn runtime_pool_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("runtime pool test lock poisoned")
+    }
+
+    fn xasr_test_pack_or_skip(file_name: &str) -> Option<PathBuf> {
+        let pack = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/xasr-test/out")
+            .join(file_name);
+        if pack.exists() {
+            Some(pack)
+        } else {
+            eprintln!("skipping: xasr pack absent at {}", pack.display());
+            None
+        }
+    }
+
+    #[test]
+    #[ignore = "host-local: requires the X-ASR fp16 pack under tmp/xasr-test/out"]
+    fn idle_unload_clears_the_pool_and_the_next_checkout_rebuilds_cleanly() {
+        // Regression test for the must-fix bug: X-ASR's streaming path pools
+        // idle runtimes in the process-lifetime `XASR_PROCESS_RUNTIME_POOL`
+        // (via `PooledRuntime::drop`), but nothing wired that pool into
+        // `idle_unload` -- unlike every other builtin family, whose
+        // `unload_idle_state` override actually drops its cache, X-ASR used
+        // the trait's no-op default, so pooled runtimes stayed resident for
+        // the rest of the process's life regardless of how long the daemon
+        // sat idle. `XasrZipformerGgmlExecutor::unload_idle_state` (in
+        // `executor.rs`) now calls `clear_idle_runtime_pool` (this file),
+        // which this test exercises directly against a real pack: checkout,
+        // return-to-pool, unload, checkout again, and confirm the rebuilt
+        // runtime still decodes.
+        let _pool_lock = runtime_pool_test_lock();
+        let Some(pack) = xasr_test_pack_or_skip("xasr-zh-en-onnx-fp16.oasr") else {
+            return;
+        };
+
+        let key = (
+            canonical_runtime_cache_path(&pack),
+            xasr_zipformer_encoder_graph_config().backend,
+        );
+
+        // Start from a known-empty pool for this key so pre-existing state
+        // from another (ignored, host-local) test run in this same process
+        // cannot make the "pool has an idle entry" assertion below vacuous.
+        clear_idle_runtime_pool();
+        {
+            let pool = runtime_pool().lock().expect("runtime pool lock poisoned");
+            assert!(
+                pool.get(&key).is_none_or(Vec::is_empty),
+                "pool must start empty for this key"
+            );
+        }
+
+        let runtime = checkout_prepared_runtime(&pack).expect("first checkout must build");
+        drop(runtime);
+        {
+            let pool = runtime_pool().lock().expect("runtime pool lock poisoned");
+            assert_eq!(
+                pool.get(&key).map(Vec::len),
+                Some(1),
+                "returning a checked-out runtime must pool it while idle"
+            );
+        }
+
+        clear_idle_runtime_pool();
+        {
+            let pool = runtime_pool().lock().expect("runtime pool lock poisoned");
+            assert!(
+                pool.get(&key).is_none_or(Vec::is_empty),
+                "idle_unload's clear_idle_runtime_pool must evict every pooled \
+                 runtime, not leave it resident for the rest of the process's \
+                 life"
+            );
+        }
+
+        // The next checkout after an idle-unload eviction must miss the
+        // (now-empty) pool and build fresh, exactly like a cold start -- and
+        // the rebuilt runtime must still be fully functional, not some
+        // half-initialized leftover.
+        let mut rebuilt =
+            checkout_prepared_runtime(&pack).expect("checkout after clear must rebuild");
+        let samples = (0..16_000)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin() * 0.05)
+            .collect::<Vec<_>>();
+        let result = rebuilt
+            .transcribe(&samples)
+            .expect("rebuilt runtime must decode");
+        assert!(result.text.is_char_boundary(result.text.len()));
+    }
 
     #[test]
     fn feature_chunk_rows_pads_tail_with_last_frame() {

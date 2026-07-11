@@ -21,7 +21,9 @@ use crate::models::thread_local_runtime_cache::{
 
 use super::frontend::{XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES, XASR_SAMPLE_RATE_HZ};
 use super::graph_config::xasr_zipformer_encoder_graph_config;
-use super::runtime::{XasrZipformerPreparedRuntime, checkout_prepared_runtime};
+use super::runtime::{
+    XasrZipformerPreparedRuntime, checkout_prepared_runtime, clear_idle_runtime_pool,
+};
 use super::streaming_decoder::XasrIncrementalDecoder;
 
 type XasrRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
@@ -265,6 +267,17 @@ impl GgmlAsrStreamingExecutor for XasrZipformerGgmlExecutor {
             driver,
         )?;
         Ok(Box::new(session))
+    }
+
+    /// The process-level `XASR_PROCESS_RUNTIME_POOL` in `runtime.rs` is the
+    /// only resident state this family's streaming path caches outside a
+    /// live session (unlike the other builtin families, X-ASR streaming has
+    /// no thread-local runtime cache to fall back on), so it must be reached
+    /// by `idle_unload` explicitly -- the trait default no-op would otherwise
+    /// leave every idle pooled runtime resident for the rest of the process's
+    /// life.
+    fn unload_idle_state(&self) {
+        clear_idle_runtime_pool();
     }
 }
 
