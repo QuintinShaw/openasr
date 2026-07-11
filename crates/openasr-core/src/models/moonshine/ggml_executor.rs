@@ -208,8 +208,14 @@ impl MoonshineGgmlExecutor {
         self.runtime_cache_by_path.get_or_try_insert_with(
             preflight.runtime_source.path(),
             || build_moonshine_prepared_runtime(preflight).map_err(map_prepared_runtime_error),
+            // Covers both a genuinely poisoned slot mutex and a build attempt
+            // that panicked and was caught (mutex stays unpoisoned, slot
+            // stays empty, retryable) -- see
+            // `PreparedRuntimeCache::get_or_try_insert_with`. Either way the
+            // cache could not deliver a prepared runtime for this attempt;
+            // the caller's next request retries clean.
             || MoonshineGgmlExecutorError::PreparedRuntimeFailed {
-                reason: "moonshine runtime cache mutex is poisoned".to_string(),
+                reason: "moonshine runtime cache slot unavailable (poisoned lock or a caught build panic); retry".to_string(),
             },
         )
     }
