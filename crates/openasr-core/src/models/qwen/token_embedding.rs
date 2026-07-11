@@ -4,6 +4,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
+use crate::nn::half::f16_bits_to_f32;
 
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::tensor_names::TOKEN_EMBD_WEIGHT as TOKEN_EMBEDDING_TENSOR_NAME;
@@ -180,43 +181,6 @@ fn token_index_or_error(
         });
     }
     Ok(token_index)
-}
-
-fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = ((bits & 0x8000) as u32) << 16;
-    let exponent = (bits >> 10) & 0x1f;
-    let fraction = (bits & 0x03ff) as u32;
-
-    let f32_bits = match exponent {
-        0 => {
-            if fraction == 0 {
-                sign
-            } else {
-                let mut fraction_norm = fraction;
-                let mut exponent_shift = -14_i32;
-                while (fraction_norm & 0x0400) == 0 {
-                    fraction_norm <<= 1;
-                    exponent_shift -= 1;
-                }
-                fraction_norm &= 0x03ff;
-                let exponent_bits = ((exponent_shift + 127) as u32) << 23;
-                let fraction_bits = fraction_norm << 13;
-                sign | exponent_bits | fraction_bits
-            }
-        }
-        0x1f => {
-            let exponent_bits = 0xff_u32 << 23;
-            let fraction_bits = fraction << 13;
-            sign | exponent_bits | fraction_bits
-        }
-        _ => {
-            let exponent_bits = ((exponent as i32 - 15 + 127) as u32) << 23;
-            let fraction_bits = fraction << 13;
-            sign | exponent_bits | fraction_bits
-        }
-    };
-
-    f32::from_bits(f32_bits)
 }
 
 fn transpose_vocab_hidden_to_token_major(
