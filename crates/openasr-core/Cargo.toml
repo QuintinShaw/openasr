@@ -28,6 +28,23 @@ native  = []   # GGML_NATIVE  — tune for the current host CPU; off for distrib
 ## enable it through dev-dependencies. The module is also available under
 ## `cfg(test)` for this crate's own unit tests.
 testing = []
+## Cross-crate ts-rs TS-binding codegen switch for the HTTP capability/device
+## types this crate shares with openasr-server's `/v1/capabilities` and
+## `/v1/devices` responses (`BackendKind`, `LanguageCapability`,
+## `TranscriptionBackendCapabilities`, `ComputeDevice`, and the realtime
+## capability types they pull in transitively). Off by default -- never part
+## of a shipped rlib. `cfg(test)` alone (this crate's own mechanism for its
+## realtime wire bindings, see `src/realtime/wire_bindings_test.rs`) cannot
+## reach across a crate boundary: a dependency's own `[dev-dependencies]`
+## (ts-rs included) are never linked into a downstream consumer's build, even
+## that consumer's own test binary. A downstream crate's golden regen test
+## (e.g. `crates/openasr-server/src/http_wire_bindings_test.rs`) instead
+## enables this feature on its `openasr-core` **dev-dependency** edge only,
+## so cargo compiles a separate, feature-enabled copy of this crate solely for
+## that consumer's test target -- the consumer's real (non-test) library/binary
+## build, and every other consumer, still get the plain build with ts-rs
+## absent entirely.
+ts-export = ["dep:ts-rs"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
@@ -52,6 +69,14 @@ thiserror.workspace = true
 toml.workspace = true
 unicode-general-category.workspace = true
 zip.workspace = true
+# Optional, feature-gated (`ts-export`) real dependency: lets a downstream
+# crate's dev-dependency edge (with the feature turned on) see the TS impls
+# on the capability/device types below when this crate is compiled as an
+# ordinary library dependency of that consumer's test binary -- see the
+# `ts-export` feature doc above. Not used by this crate's own build unless
+# that feature is enabled; this crate's own tests keep using the unconditional
+# dev-dependency entry below via `cfg(test)`.
+ts-rs = { version = "12.0.1", features = ["no-serde-warnings"], optional = true }
 
 [build-dependencies]
 # Locate the MSVC `cl` toolchain (path + vcvars env) so build.rs can pin it for
