@@ -471,9 +471,14 @@ pub(super) async fn serve(
     security: ServeSecurityOptions,
 ) -> Result<()> {
     let home = openasr_home()?;
-    let config = load_config(&home)?;
-    let backend = resolve_backend(backend_kind, &config)?;
-    let model_source = resolve_serve_model_source(model, backend, model_pack, &config)?;
+    // Read the config document once: `config` and `idle_unload` (used below
+    // for `idle_unload_after`) both live on it, so reading it a second time
+    // further down would be a redundant fs::read + serde_json parse on every
+    // serve() startup.
+    let config_document = openasr_core::load_config_document(&home)?;
+    let config = &config_document.config;
+    let backend = resolve_backend(backend_kind, config)?;
+    let model_source = resolve_serve_model_source(model, backend, model_pack, config)?;
     if backend == BackendKind::Native
         && let Some(model_pack_path) = model_source.model_pack_path.as_deref()
     {
@@ -502,8 +507,8 @@ pub(super) async fn serve(
         );
     }
     let ffmpeg_bin_explicit =
-        resolve_explicit_ffmpeg_bin(runtime_paths.ffmpeg_bin.clone(), &config).is_some();
-    let ffmpeg_bin = resolve_ffmpeg_bin(runtime_paths.ffmpeg_bin.clone(), &config);
+        resolve_explicit_ffmpeg_bin(runtime_paths.ffmpeg_bin.clone(), config).is_some();
+    let ffmpeg_bin = resolve_ffmpeg_bin(runtime_paths.ffmpeg_bin.clone(), config);
     let api_key_hashes = if supervised_daemon_launch() {
         // The desktop supervisor's managed daemon (marked by the instance-token
         // env it always sets) has its own trust model: the UI talks to its
@@ -529,14 +534,9 @@ pub(super) async fn serve(
     // and every already-paired client's TOFU pin) across the restarts the
     // desktop performs on every model switch. No-op when TLS is disabled.
     launch_options.tls_identity_store = Some(home.join("tls-identity.json"));
-    // `idle_unload` lives on `Preferences`, not the plain `OpenAsrConfig`
-    // already loaded above -- read the full config document for it. A
-    // missing/unreadable document (fresh install) falls back to the default
-    // policy rather than failing serve over a preferences read.
-    launch_options.idle_unload_after = openasr_core::load_config_document(&home)
-        .map(|document| document.preferences.idle_unload)
-        .unwrap_or_default()
-        .idle_threshold();
+    // `idle_unload` lives on `Preferences`, on the same document already
+    // loaded above as `config_document` -- no second read needed.
+    launch_options.idle_unload_after = config_document.preferences.idle_unload.idle_threshold();
     openasr_server::serve_with_launch_options(
         addr,
         openasr_server::ServerRuntime {
