@@ -1,4 +1,8 @@
-use std::{path::Path, sync::OnceLock};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+};
 
 use super::{
     BackendError, BackendFeatureCapability, BackendKind, Transcription, TranscriptionBackend,
@@ -477,6 +481,15 @@ pub(crate) fn unload_idle_native_streaming_runtime_caches() {
 /// configured threshold; a subsequent request just rebuilds via the normal
 /// load-on-first-use path (paying the cold build cost again, same as the
 /// very first request after boot).
+///
+/// This deliberately does not touch the process-lifetime GGUF
+/// metadata/adapter/identity caches (`NATIVE_RUNTIME_MODEL_ADAPTER_CACHE`,
+/// `NATIVE_RUNTIME_MODEL_IDENTITY_CACHE`): those hold small parsed metadata,
+/// not resident weights/device state, and idle-unload's contract is "release
+/// what the model actually costs memory/device-residency for", not "forget
+/// what we know about an installed pack's identity/capabilities". Re-deriving
+/// them is also unconditionally safe (installed-pack content immutability),
+/// so there is no correctness reason to evict them here either.
 pub fn unload_idle_native_model_runtime_caches() {
     native_transcribe::unload_idle_native_offline_runtime_caches();
     unload_idle_native_streaming_runtime_caches();
@@ -554,14 +567,59 @@ pub fn validate_local_native_model_pack_path(
     native_path::validate_local_native_model_pack_path(path)
 }
 
+/// Process-lifetime cache key for the caches below: an installed pack is
+/// content-immutable for the life of the daemon (see the doc comment on
+/// [`native_runtime_model_adapter_for_path`]), but the same on-disk pack can
+/// be reached through different (relative, symlinked, `..`-containing) path
+/// spellings across callers, so cache on the canonicalized path rather than
+/// the raw one. Canonicalization can fail (path race, permissions); fall back
+/// to the given path rather than panicking or refusing to cache -- worst case
+/// two spellings of the same pack each get their own entry, same as before
+/// this cache existed.
+fn native_runtime_cache_key_for_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+type NativeRuntimeIdentityCacheKey = (PathBuf, Option<String>);
+type NativeRuntimeIdentityCacheValue =
+    Result<NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError>;
+
+static NATIVE_RUNTIME_MODEL_IDENTITY_CACHE: OnceLock<
+    Mutex<HashMap<NativeRuntimeIdentityCacheKey, NativeRuntimeIdentityCacheValue>>,
+> = OnceLock::new();
+
+/// Cached wrapper over [`native_model_id::resolve_local_native_runtime_model_identity`].
+///
+/// Keyed on `(canonicalized path, explicit_model_id_fallback)`, not path
+/// alone: `explicit_model_id_fallback` is a per-request value (e.g. the
+/// server forwards the client's requested model string on every transcription
+/// request as the fallback), and it only changes the resolved identity when
+/// the pack's own GGUF metadata does not already carry a usable id -- so two
+/// calls for the same pack with different fallbacks must not share a cache
+/// entry. Errors are cached too (a pack that fails to resolve now will keep
+/// failing the same way for the rest of the process's life).
 pub fn resolve_local_native_runtime_model_identity(
     runtime_path: &Path,
     explicit_model_id_fallback: Option<&str>,
 ) -> Result<NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError> {
-    native_model_id::resolve_local_native_runtime_model_identity(
+    let cache = NATIVE_RUNTIME_MODEL_IDENTITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_key = (
+        native_runtime_cache_key_for_path(runtime_path),
+        explicit_model_id_fallback.map(str::to_string),
+    );
+    if let Ok(cache) = cache.lock()
+        && let Some(cached) = cache.get(&cache_key)
+    {
+        return cached.clone();
+    }
+    let resolved = native_model_id::resolve_local_native_runtime_model_identity(
         runtime_path,
         explicit_model_id_fallback,
-    )
+    );
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(cache_key, resolved.clone());
+    }
+    resolved
 }
 
 pub fn native_runtime_transcription_capabilities_for_path(
@@ -630,7 +688,46 @@ fn native_runtime_capabilities_for_adapter(
         .unwrap_or_else(NativeAsrCapabilities::unsupported)
 }
 
+static NATIVE_RUNTIME_MODEL_ADAPTER_CACHE: OnceLock<
+    Mutex<HashMap<PathBuf, Option<NativeRuntimeModelAdapter>>>,
+> = OnceLock::new();
+
+/// Resolves (and process-lifetime caches) the runtime adapter for an
+/// installed native model pack: GGUF metadata + tensor-index parse, family
+/// registry selection, and the derived capability/language facets.
+///
+/// Caching is safe under the same invariant the realtime capabilities cache
+/// in `openasr-server` already relies on
+/// (`cached_native_realtime_capabilities_for_path`): an installed pack's
+/// content is immutable for the life of the process. A model switch rebinds
+/// the server to a new `--model-pack` path (a restart), and the operator-only
+/// pull API installs new/updated packs under their own path rather than
+/// overwriting the path of an already-bound, in-use pack -- so there is no
+/// live path where a cached entry's underlying bytes change out from under
+/// it. `None` results (path fails to validate, or does not match any builtin
+/// family) are cached too, since a fixed input path deterministically
+/// produces the same non-adapter answer.
+///
+/// This function used to re-open and re-parse the pack's GGUF metadata (and,
+/// best-effort, its tensor index) on every call; every capability probe,
+/// preflight check, and CLI capability summary for the same pack now shares
+/// one parse for the process's lifetime instead of paying it again per call.
 pub fn native_runtime_model_adapter_for_path(path: &Path) -> Option<NativeRuntimeModelAdapter> {
+    let cache = NATIVE_RUNTIME_MODEL_ADAPTER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_key = native_runtime_cache_key_for_path(path);
+    if let Ok(cache) = cache.lock()
+        && let Some(cached) = cache.get(&cache_key)
+    {
+        return cached.clone();
+    }
+    let adapter = build_native_runtime_model_adapter_for_path(path);
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(cache_key, adapter.clone());
+    }
+    adapter
+}
+
+fn build_native_runtime_model_adapter_for_path(path: &Path) -> Option<NativeRuntimeModelAdapter> {
     let runtime_source = native_path::validate_local_native_runtime_source(path).ok()?;
     let metadata = read_gguf_metadata_from_runtime_source(&runtime_source).ok()?;
     let selection_metadata = selection_metadata_from_gguf(&metadata);
