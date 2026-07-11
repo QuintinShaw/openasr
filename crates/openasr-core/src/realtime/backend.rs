@@ -12,8 +12,11 @@ use serde::Serialize;
 // crates/openasr-core/tests/realtime_wire_bindings.rs for the golden
 // "regenerate == committed" guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
+#[cfg_attr(any(test, feature = "ts-export"), derive(ts_rs::TS))]
+#[cfg_attr(
+    any(test, feature = "ts-export"),
+    ts(export_to = "generated/realtime-wire/")
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RealtimeBackendMode {
     Unsupported,
@@ -22,8 +25,11 @@ pub enum RealtimeBackendMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
+#[cfg_attr(any(test, feature = "ts-export"), derive(ts_rs::TS))]
+#[cfg_attr(
+    any(test, feature = "ts-export"),
+    ts(export_to = "generated/realtime-wire/")
+)]
 pub struct RealtimeBackendCapabilities {
     pub mode: RealtimeBackendMode,
     pub supports_realtime_sessions: bool,
@@ -45,8 +51,11 @@ pub struct RealtimeBackendCapabilities {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
+#[cfg_attr(any(test, feature = "ts-export"), derive(ts_rs::TS))]
+#[cfg_attr(
+    any(test, feature = "ts-export"),
+    ts(export_to = "generated/realtime-wire/")
+)]
 pub struct RealtimeTranslationCapability {
     pub supported: bool,
     pub installed: bool,

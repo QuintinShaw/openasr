@@ -23,7 +23,23 @@ pub use native::{
 
 pub const NATIVE_RUNTIME_MODEL_ID_AUTO: &str = "__openasr_native_runtime_model_id_auto__";
 
+// TS export for the `/v1/capabilities` HTTP wire contract (openasr-server's
+// `CapabilitiesResponse` pulls this type in through
+// `TranscriptionBackendCapabilities`): gated to `cfg(any(test, feature =
+// "ts-export"))`. `test` covers this crate's own build; `ts-export` (see this
+// crate's Cargo.toml) is what lets openasr-server's cross-crate golden test
+// see the TS impl when this crate is compiled as its ordinary (non-test)
+// library dependency -- `cfg(test)` alone cannot reach across a crate
+// boundary. Either way ts-rs stays out of a normal shipped build: `ts-export`
+// defaults off and only openasr-server's dev-dependency edge turns it on. See
+// crates/openasr-server/src/http_wire_bindings_test.rs for the golden
+// "regenerate == committed" guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(any(test, feature = "ts-export"), derive(ts_rs::TS))]
+#[cfg_attr(
+    any(test, feature = "ts-export"),
+    ts(export_to = "generated/http-wire/")
+)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     Mock,
@@ -126,13 +142,20 @@ impl FromStr for BackendKind {
 use crate::{LongFormOptions, PhraseBiasConfig};
 
 // TS export for the realtime wire contract (crate::realtime pulls this type
-// in through RealtimeBackendCapabilities): gated to `cfg(test)` so ts-rs is a
-// dev-only dependency, never part of the shipped rlib. See
-// crates/openasr-core/tests/realtime_wire_bindings.rs for the golden
-// "regenerate == committed" guard.
+// in through RealtimeBackendCapabilities) *and* the `/v1/capabilities` HTTP
+// wire contract (openasr-server's `CapabilitiesResponse.realtime` pulls it in
+// through the same `RealtimeBackendCapabilities`): gated to `cfg(any(test,
+// feature = "ts-export"))`, see the `BackendKind` doc above for why the
+// feature exists alongside `test`. See
+// crates/openasr-core/src/realtime/wire_bindings_test.rs and
+// crates/openasr-server/src/http_wire_bindings_test.rs for the two golden
+// "regenerate == committed" guards this type participates in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
+#[cfg_attr(any(test, feature = "ts-export"), derive(ts_rs::TS))]
+#[cfg_attr(
+    any(test, feature = "ts-export"),
+    ts(export_to = "generated/realtime-wire/")
+)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendCapabilityBehavior {
     Supported,
@@ -141,8 +164,11 @@ pub enum BackendCapabilityBehavior {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
+#[cfg_attr(any(test, feature = "ts-export"), derive(ts_rs::TS))]
+#[cfg_attr(
+    any(test, feature = "ts-export"),
+    ts(export_to = "generated/realtime-wire/")
+)]
 pub struct BackendFeatureCapability {
     pub supported: bool,
     pub behavior: BackendCapabilityBehavior,
@@ -181,6 +207,11 @@ impl BackendFeatureCapability {
 /// controls a given model actually honors. Drift-free by construction: it is
 /// produced from the same mode the fail-closed gate dispatches on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(any(test, feature = "ts-export"), derive(ts_rs::TS))]
+#[cfg_attr(
+    any(test, feature = "ts-export"),
+    ts(export_to = "generated/http-wire/")
+)]
 pub struct LanguageCapability {
     /// Stable machine tag: detect_and_specify | detect_implicit | specify_only |
     /// fixed_monolingual | fixed_multilingual.
@@ -251,6 +282,11 @@ impl From<LanguageMode> for LanguageCapability {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(any(test, feature = "ts-export"), derive(ts_rs::TS))]
+#[cfg_attr(
+    any(test, feature = "ts-export"),
+    ts(export_to = "generated/http-wire/")
+)]
 pub struct TranscriptionBackendCapabilities {
     pub backend: BackendKind,
     pub segment_timestamps: BackendFeatureCapability,
