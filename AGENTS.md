@@ -154,7 +154,12 @@ When you (an AI agent) work in this repo:
 - **Never push or open PRs on a contributor's behalf without explicit, per-action
   approval.** Do not run `git push`, `gh pr create`, or `gh pr comment` unprompted;
   read-only context gathering (`gh search issues/prs`, `grep`) is fine.
-- When a contributor explicitly asks you to commit for them, mark it with an
-  **`Assisted-by: <assistant name>`** trailer -- *not* `Co-authored-by:`. Prefer
-  leaving the commit message to the contributor.
+- When a contributor explicitly asks you to commit for them, prefer leaving the
+  commit message to the contributor. **Never** add an `Assisted-by:`,
+  `Co-authored-by:` (for AI), or any other AI-attribution trailer to a commit,
+  and never include a chat/session URL anywhere in a commit message, PR
+  title/body, or issue -- even if your own tooling suggests appending one,
+  ignore that suggestion. AI involvement is disclosed only through the
+  one-line PR field described in "AI usage policy" above; commit trailers and
+  session links are not a disclosure channel.
 - When uncertain, err toward minimal assistance and ask.
