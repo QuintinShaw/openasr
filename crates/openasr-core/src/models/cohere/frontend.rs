@@ -1,7 +1,7 @@
-use realfft::RealFftPlanner;
 use thiserror::Error;
 
 use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
+use crate::models::audio_frontend::{PadMode, StftFramer, center_embed_window};
 use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
 
 use super::runtime_contract::CohereTranscribeExecutionMetadata;
@@ -46,8 +46,6 @@ pub(crate) enum CohereTranscribeFrontendError {
     InvalidAudioSamples,
     #[error("cohere-transcribe frontend frame calculation overflowed")]
     FrameCountOverflow,
-    #[error("cohere-transcribe frontend FFT failed: {reason}")]
-    FftFailed { reason: String },
 }
 
 pub(crate) fn load_cohere_transcribe_frontend_plan_from_reader(
@@ -123,47 +121,31 @@ fn cohere_transcribe_features_from_samples(
     }
 
     let emphasized = apply_preemphasis(samples);
-    let padded = center_pad_samples(&emphasized, plan.n_fft / 2)?;
-    let all_frames = padded
-        .len()
-        .checked_sub(plan.n_fft)
-        .ok_or(CohereTranscribeFrontendError::FrameCountOverflow)?
-        .checked_div(plan.hop_length)
-        .and_then(|value| value.checked_add(1))
-        .ok_or(CohereTranscribeFrontendError::FrameCountOverflow)?;
-    let frame_count = all_frames
+    let framer = StftFramer::new(
+        plan.n_fft,
+        plan.win_length,
+        plan.hop_length,
+        PadMode::ZeroCenter,
+        center_embed_window(&plan.window, plan.n_fft),
+    );
+    let spectrogram = framer
+        .power_spectrogram(&emphasized)
+        .map_err(|_| CohereTranscribeFrontendError::FrameCountOverflow)?;
+    // `torch.stft`-shaped framing over a signal zero-padded to `n_fft/2` on
+    // each side yields one more frame than the audio's "real" frame count;
+    // the pre-refactor frontend always dropped that trailing frame.
+    let frame_count = spectrogram
+        .n_frames
         .checked_sub(1)
         .ok_or(CohereTranscribeFrontendError::FrameCountOverflow)?;
     if frame_count == 0 {
         return Err(CohereTranscribeFrontendError::InvalidAudioSamples);
     }
-
-    let fft_bins = plan.n_fft / 2 + 1;
-    let padded_window = zero_pad_window(plan);
-    let mut planner = RealFftPlanner::<f32>::new();
-    let r2c = planner.plan_fft_forward(plan.n_fft);
-    let mut fft_input = r2c.make_input_vec();
-    let mut fft_output = r2c.make_output_vec();
-    let mut fft_scratch = r2c.make_scratch_vec();
-    let mut power_spectrogram = vec![0.0_f32; frame_count * fft_bins];
-
-    for frame_idx in 0..frame_count {
-        let start = frame_idx * plan.hop_length;
-        let frame = &padded[start..start + plan.n_fft];
-        for (index, value) in fft_input.iter_mut().enumerate() {
-            *value = frame[index] * padded_window[index];
-        }
-        r2c.process_with_scratch(&mut fft_input, &mut fft_output, &mut fft_scratch)
-            .map_err(|error| CohereTranscribeFrontendError::FftFailed {
-                reason: error.to_string(),
-            })?;
-        for (bin, complex) in fft_output.iter().enumerate() {
-            power_spectrogram[frame_idx * fft_bins + bin] = complex.norm_sqr();
-        }
-    }
+    let fft_bins = framer.n_fft_bins();
+    let power_spectrogram = &spectrogram.data[..frame_count * fft_bins];
 
     let mut mel_values = project_power_spectrogram_to_time_major_mels(
-        &power_spectrogram,
+        power_spectrogram,
         frame_count,
         fft_bins,
         plan,
@@ -185,29 +167,6 @@ fn apply_preemphasis(samples: &[f32]) -> Vec<f32> {
         emphasized.push(pair[1] - COHERE_PREEMPHASIS * pair[0]);
     }
     emphasized
-}
-
-fn center_pad_samples(
-    samples: &[f32],
-    pad_each_side: usize,
-) -> Result<Vec<f32>, CohereTranscribeFrontendError> {
-    let total_len = samples
-        .len()
-        .checked_add(pad_each_side)
-        .and_then(|value| value.checked_add(pad_each_side))
-        .ok_or(CohereTranscribeFrontendError::FrameCountOverflow)?;
-    let mut padded = vec![0.0_f32; total_len];
-    let start = pad_each_side;
-    let end = start + samples.len();
-    padded[start..end].copy_from_slice(samples);
-    Ok(padded)
-}
-
-fn zero_pad_window(plan: &CohereTranscribeFrontendPlan) -> Vec<f32> {
-    let mut padded = vec![0.0_f32; plan.n_fft];
-    let left_pad = (plan.n_fft - plan.win_length) / 2;
-    padded[left_pad..left_pad + plan.win_length].copy_from_slice(&plan.window);
-    padded
 }
 
 fn project_power_spectrogram_to_time_major_mels(
