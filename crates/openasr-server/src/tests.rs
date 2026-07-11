@@ -116,9 +116,22 @@ fn distribution_context_for_test(home: &std::path::Path) -> DistributionContext 
     })
 }
 
-fn bundled_catalog_url_for_test() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry/catalog.json");
-    format!("file://{}", path.display())
+/// Copies the real, committed `model-registry/catalog.json` into `dir` and
+/// re-signs the copy with the public local-dev key for the exact `file://`
+/// path the test will pass as `catalog_url`. The committed catalog's own
+/// signature is bound to the production HTTPS identity
+/// (`https://catalog.openasr.org/v1/catalog.json`), not to an arbitrary local
+/// path, so a test that wants to load the real bundled catalog contents
+/// through a local `--catalog-url` override must sign a fresh, path-bound
+/// copy rather than pointing straight at the committed file + its committed
+/// signature.
+fn bundled_catalog_url_for_test(dir: &std::path::Path) -> String {
+    let source_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry/catalog.json");
+    let contents = fs::read_to_string(&source_path).expect("read bundled catalog fixture");
+    let copy_path = dir.join("bundled-catalog-for-test.json");
+    openasr_core::testing::write_local_dev_signed_catalog(&copy_path, &contents, 1);
+    format!("file://{}", copy_path.display())
 }
 
 fn write_valid_installed_pack_for_test(
@@ -578,7 +591,7 @@ fn native_execution_target_mapping_preserves_server_request_semantics() {
 fn default_pack_lookup_resolves_series_alias_through_catalog() {
     let temp = tempfile::tempdir().unwrap();
     let pack = write_valid_installed_pack_for_test(temp.path(), "qwen3-asr-0.6b", "q8_0", "q8");
-    let catalog_url = bundled_catalog_url_for_test();
+    let catalog_url = bundled_catalog_url_for_test(temp.path());
 
     let resolved = find_installed_pack_reference(temp.path(), Some(&catalog_url), "qwen:q8")
         .unwrap()
@@ -590,7 +603,7 @@ fn default_pack_lookup_resolves_series_alias_through_catalog() {
 #[test]
 fn form_model_resolution_preserves_native_request_id() {
     let temp = tempfile::tempdir().unwrap();
-    let catalog_url = bundled_catalog_url_for_test();
+    let catalog_url = bundled_catalog_url_for_test(temp.path());
     let catalog = load_model_catalog(Some(&catalog_url), temp.path()).unwrap();
 
     let native_model =

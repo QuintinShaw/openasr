@@ -179,12 +179,32 @@ catalog (an explicit `OPENASR_CATALOG_URL` override is honoured, not replaced).
 This guarantees a fresh, fully offline install still shows the verified model
 list; because every installer ships the sidecar binary, the offline catalog is
 bundled transitively with no per-installer packaging. The embedded snapshot is
-kept current by the catalog drift and bundled-signature CI gates. Unsigned caches
-are accepted only for local `file://` or filesystem catalog sources used by
-development and bundled-resource flows. Current trust
+kept current by the catalog drift and bundled-signature CI gates. Current trust
 comes from HTTPS, signature verification, anti-rollback epoch checks, schema
 validation, pinned immutable pack URLs, sha256/size verification, Rust GGUF
 preflight, runtime-source validation, and atomic install.
+
+A LOCAL (`file://` or bare filesystem path) `catalog_url` override -- CLI
+`--catalog-url`/`OPENASR_CATALOG_URL`, the server's equivalent, or the CLI's
+repo-checkout auto-discovery of `model-registry/catalog.json` with no override
+set -- goes through the same signature/schema/anti-rollback pipeline as an
+HTTPS catalog: there is no unsigned local path. It additionally trusts a
+public, non-secret **local-dev signing key**
+(`openasr-catalog-local-dev-v1` / `LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX` in
+`crates/openasr-core/src/catalog_security.rs`) alongside the production key --
+that key carries no confidentiality (whoever supplies a local catalog file
+already controls its contents), it only forces every local catalog through
+real signature/sha256/catalog_url verification instead of a bypass. A
+signature is bound to the exact catalog_url identity it was issued for (an
+HTTPS URL for a production catalog, the repo-checkout auto-discovery's
+canonical `DEFAULT_CATALOG_URL` identity for `model-registry/catalog.json`, or
+the literal `file://<path>` for an explicit override) -- copying a signed
+local catalog to a different path/URL does not carry its signature with it.
+To preview local/staged catalog edits (e.g. after `regenerate_all.sh`) without
+the real production signing seed, run
+`tooling/publish-model/scripts/sign_local_catalog.sh` to (re-)sign a dev copy;
+never commit its dev-signed output over the committed, production-signed
+`catalog.signature.json`.
 
 ## Forward Compatibility
 

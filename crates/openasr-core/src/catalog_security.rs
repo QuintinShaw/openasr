@@ -31,6 +31,51 @@ pub const OPENASR_CATALOG_TRUST_ROOTS: &[CatalogTrustRoot] = &[CatalogTrustRoot 
     public_key_hex: OPENASR_CATALOG_V1_PUBLIC_KEY_HEX,
 }];
 
+/// Key id + public key for the **local-catalog development signing key**.
+///
+/// A local/`file://`/filesystem catalog source is only ever reached through an
+/// explicit `catalog_url` override (CLI `--catalog-url`, `OPENASR_CATALOG_URL`,
+/// or the server's equivalent) -- never the production HTTPS endpoint, the
+/// on-disk cache tier, or the embedded snapshot. Whoever supplies that catalog
+/// file already fully controls its contents, so this key adds no
+/// confidentiality; its only job is to force every local catalog through the
+/// same signature/sha256/catalog_url/schema checks a production catalog goes
+/// through, closing the "a local path skips verification entirely" bypass.
+///
+/// The seed is therefore intentionally NOT secret: it is the deterministic
+/// `sha256` of a fixed public label (see [`LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX`]),
+/// so any contributor can re-derive it without a shared secret. This key is
+/// added ONLY to [`OPENASR_LOCAL_CATALOG_TRUST_ROOTS`], never to
+/// [`OPENASR_CATALOG_TRUST_ROOTS`] -- a widely-known dev key must never be
+/// able to validate an HTTPS/cached/embedded production catalog.
+pub const CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID: &str = "openasr-catalog-local-dev-v1";
+const OPENASR_CATALOG_LOCAL_DEV_PUBLIC_KEY_HEX: &str =
+    "bc1306d4cc4a1cbc817a862ee0223713ff79208c39bc8ce732da851db3c6b6a1";
+
+/// The deterministic, publicly documented seed behind
+/// [`CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID`] --
+/// `sha256("openasr.catalog_manifest.v1.local-dev-signing-key-seed")`. Not a
+/// secret (see the trust-root doc comment above); exposed so tooling/tests can
+/// sign a local/dev catalog without touching the production signing seed.
+pub const LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX: &str =
+    "7181d685f3c226e1c111574368512b603d67964c057165ad004683b84998960e";
+
+/// Trust roots accepted for a LOCAL (`file://` / bare filesystem path) catalog
+/// source: the production key (so a local copy of the real, committed catalog
+/// and its production signature still verifies) plus the public local-dev key
+/// above. Never used for an `https://` source; see
+/// [`verify_local_catalog_signature_manifest`].
+pub const OPENASR_LOCAL_CATALOG_TRUST_ROOTS: &[CatalogTrustRoot] = &[
+    CatalogTrustRoot {
+        key_id: CATALOG_SIGNATURE_KEY_ID,
+        public_key_hex: OPENASR_CATALOG_V1_PUBLIC_KEY_HEX,
+    },
+    CatalogTrustRoot {
+        key_id: CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+        public_key_hex: OPENASR_CATALOG_LOCAL_DEV_PUBLIC_KEY_HEX,
+    },
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogSignatureManifest {
@@ -199,6 +244,24 @@ pub fn verify_catalog_signature_manifest(
         manifest_contents,
         expected_catalog_url,
         OPENASR_CATALOG_TRUST_ROOTS,
+    )
+}
+
+/// Like [`verify_catalog_signature_manifest`], but for a LOCAL (`file://` /
+/// bare filesystem path) catalog source: trusts the production key or the
+/// public local-dev key (see [`OPENASR_LOCAL_CATALOG_TRUST_ROOTS`]). Never use
+/// this for an `https://`/embedded/cached-network source -- that must stay
+/// scoped to [`verify_catalog_signature_manifest`]'s production-only roots.
+pub fn verify_local_catalog_signature_manifest(
+    catalog_contents: &str,
+    manifest_contents: &str,
+    expected_catalog_url: &str,
+) -> Result<VerifiedCatalogSignature, CatalogSecurityError> {
+    verify_catalog_signature_manifest_with_roots(
+        catalog_contents,
+        manifest_contents,
+        expected_catalog_url,
+        OPENASR_LOCAL_CATALOG_TRUST_ROOTS,
     )
 }
 
@@ -545,6 +608,73 @@ mod tests {
         .to_string();
 
         assert!(error.contains("Catalog sha256 mismatch"));
+    }
+
+    #[test]
+    fn local_dev_public_key_matches_its_documented_seed() {
+        // The dev seed is intentionally public (see the doc comment on
+        // `CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID`); pin the derivation so the
+        // committed public key and the committed seed can never silently drift
+        // apart from each other.
+        assert_eq!(
+            derive_catalog_public_key_hex(LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX).unwrap(),
+            OPENASR_CATALOG_LOCAL_DEV_PUBLIC_KEY_HEX
+        );
+    }
+
+    #[test]
+    fn local_catalog_trust_roots_include_the_production_key() {
+        // A local copy of the real, committed catalog + its production
+        // signature must still verify through the local trust-root set.
+        assert!(
+            OPENASR_LOCAL_CATALOG_TRUST_ROOTS
+                .iter()
+                .any(|root| root.key_id == CATALOG_SIGNATURE_KEY_ID
+                    && root.public_key_hex == OPENASR_CATALOG_V1_PUBLIC_KEY_HEX)
+        );
+    }
+
+    #[test]
+    fn local_dev_signed_manifest_verifies_through_local_roots() {
+        let catalog = r#"{"schema_version":1,"models":[]}"#;
+        let source = "file:///tmp/local-catalog.json";
+        let manifest = render_catalog_signature_manifest(
+            catalog,
+            source,
+            7,
+            CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+            LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
+        )
+        .unwrap();
+
+        let verified = verify_local_catalog_signature_manifest(catalog, &manifest, source).unwrap();
+        assert_eq!(verified.catalog_epoch, 7);
+        assert_eq!(verified.key_id, CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID);
+    }
+
+    #[test]
+    fn local_dev_signed_manifest_never_verifies_as_a_production_catalog() {
+        // The whole point of keeping the dev key out of
+        // `OPENASR_CATALOG_TRUST_ROOTS`: a widely-known dev key must never
+        // authorize an HTTPS/embedded/cached production catalog.
+        let catalog = r#"{"schema_version":1,"models":[]}"#;
+        let source = "https://catalog.openasr.org/v1/catalog.json";
+        let manifest = render_catalog_signature_manifest(
+            catalog,
+            source,
+            7,
+            CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+            LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
+        )
+        .unwrap();
+
+        let error = verify_catalog_signature_manifest(catalog, &manifest, source)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Unknown catalog signature key id"),
+            "{error}"
+        );
     }
 
     #[test]

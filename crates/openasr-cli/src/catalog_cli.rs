@@ -4,7 +4,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use openasr_core::{ModelCatalog, load_model_catalog};
+use openasr_core::{
+    ModelCatalog, default_catalog_url, load_local_catalog_file_with_identity, load_model_catalog,
+};
 
 const OPENASR_CATALOG_URL: &str = "OPENASR_CATALOG_URL";
 
@@ -20,11 +22,21 @@ pub(super) fn load_cli_model_catalog(openasr_home: &Path) -> Result<Option<Model
 
     for path in local_catalog_candidates()? {
         if path.is_file() {
-            return load_catalog(Some(path.to_string_lossy().as_ref()), openasr_home)
-                .map(Some)
-                .with_context(|| {
-                    format!("Could not load local model catalog '{}'", path.display())
-                });
+            // `model-registry/catalog.json` discovered relative to the repo
+            // checkout is the pre-deployment source of truth for the
+            // canonical catalog identity (mirroring the binary's embedded
+            // snapshot), so it is verified against that identity -- not the
+            // incidental local path -- accepting either the production
+            // signature (the committed `catalog.signature.json` as-is) or a
+            // locally (uncommitted) dev-signed one for previewing staged
+            // edits. See `load_local_catalog_file_with_identity`.
+            return load_local_catalog_file_with_identity(
+                &path,
+                default_catalog_url(),
+                openasr_home,
+            )
+            .map(Some)
+            .with_context(|| format!("Could not load local model catalog '{}'", path.display()));
         }
     }
 

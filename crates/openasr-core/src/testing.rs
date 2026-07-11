@@ -1733,6 +1733,34 @@ pub fn write_reserved_oasr_container(path: impl AsRef<Path>) -> io::Result<()> {
     fs::write(path, bytes)
 }
 
+/// Writes `contents` to `path` plus an adjacent, matching LOCAL-catalog
+/// signature manifest signed with the public, non-secret local-dev catalog
+/// key (`catalog_security::CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID` /
+/// `LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX`). A local `file://`/filesystem
+/// catalog source now requires a valid sidecar signature just like a
+/// production HTTPS catalog does (see `registry::load_model_catalog`), so any
+/// test that loads a local catalog fixture must go through this helper (or
+/// deliberately omit/break the sidecar to exercise the fail-closed path).
+///
+/// Signs for the exact `file://<path>` catalog_url the caller will pass as
+/// `catalog_url`/`--catalog-url`. Call again (bumping `epoch` is not required,
+/// only monotonic-or-equal) after any in-place mutation of `path`'s contents:
+/// a stale sidecar is treated as tampering, not a no-op.
+pub fn write_local_dev_signed_catalog(path: &Path, contents: &str, epoch: u64) {
+    fs::write(path, contents).expect("write local catalog test fixture");
+    let catalog_url = format!("file://{}", path.display());
+    let manifest = crate::catalog_security::render_catalog_signature_manifest(
+        contents,
+        &catalog_url,
+        epoch,
+        crate::catalog_security::CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+        crate::catalog_security::LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
+    )
+    .expect("sign local catalog test fixture with the dev key");
+    let signature_path = path.with_file_name(crate::catalog_security::CATALOG_SIGNATURE_FILE_NAME);
+    fs::write(signature_path, manifest).expect("write local catalog signature test fixture");
+}
+
 fn push_gguf_string(bytes: &mut Vec<u8>, value: &str) {
     bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
     bytes.extend_from_slice(value.as_bytes());

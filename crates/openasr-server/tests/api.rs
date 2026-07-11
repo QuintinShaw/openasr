@@ -6,7 +6,8 @@ use axum::{
 use futures_util::StreamExt;
 use openasr_core::api::backend::transcribe_with_mock_backend;
 use openasr_core::testing::{
-    TinyGgufFixtureSpec, write_reserved_oasr_container, write_tiny_gguf_runtime_source,
+    TinyGgufFixtureSpec, write_local_dev_signed_catalog, write_reserved_oasr_container,
+    write_tiny_gguf_runtime_source,
 };
 use openasr_core::{ResponseFormat, TranscriptionRequest, render_transcription};
 use serde_json::Value;
@@ -220,11 +221,12 @@ fn write_moonshine_pull_fixture(
         }]
     });
     let catalog_path = root.join("catalog.json");
-    std::fs::write(
-        &catalog_path,
-        serde_json::to_vec_pretty(&catalog).expect("serialize catalog fixture"),
-    )
-    .unwrap();
+    let catalog_json =
+        String::from_utf8(serde_json::to_vec_pretty(&catalog).expect("serialize catalog fixture"))
+            .expect("catalog fixture is valid utf-8");
+    // A local `file://` catalog now requires the same signed sidecar a
+    // production HTTPS catalog does; sign it with the public local-dev key.
+    write_local_dev_signed_catalog(&catalog_path, &catalog_json, 1);
 
     (
         pack_path,
@@ -261,7 +263,11 @@ fn pad_pull_fixture_pack_to(
     let quant = &mut catalog["models"][0]["quants"][0];
     quant["sha256"] = serde_json::json!(sha256);
     quant["size_bytes"] = serde_json::json!(bytes.len() as u64);
-    std::fs::write(catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
+    let catalog_json = String::from_utf8(serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
+    // Re-sign after mutating the catalog bytes in place: a stale sidecar
+    // would now be treated as tampering, not a no-op (see
+    // `write_local_dev_signed_catalog`'s doc comment).
+    write_local_dev_signed_catalog(catalog_path, &catalog_json, 1);
 }
 
 async fn create_approved_pairing_credential(app: &Router, device_name: &str) -> (String, String) {
@@ -489,7 +495,10 @@ fn mutate_fixture_catalog_pack_identity(distribution: &openasr_server::Distribut
     quant["sha256"] =
         serde_json::json!("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
     quant["size_bytes"] = serde_json::json!(1);
-    std::fs::write(catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
+    let catalog_json = String::from_utf8(serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
+    // Re-sign after mutating the catalog bytes in place (see
+    // `pad_pull_fixture_pack_to`'s matching comment).
+    write_local_dev_signed_catalog(catalog_path, &catalog_json, 1);
 }
 
 fn write_reserved_oasr_runtime_source(path: &std::path::Path) {
