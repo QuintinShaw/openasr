@@ -567,10 +567,14 @@ pub fn resolve_local_native_runtime_model_identity(
 pub fn native_runtime_transcription_capabilities_for_path(
     path: &Path,
 ) -> TranscriptionBackendCapabilities {
+    // Build the adapter once and derive every facet (phrase_bias,
+    // diarization, language) from it, instead of re-reading and re-parsing
+    // the pack's GGUF metadata/tensor index once per facet.
+    let adapter = native_runtime_model_adapter_for_path(path);
     let mut capabilities = TranscriptionBackendCapabilities::for_backend_kind(BackendKind::Native);
-    capabilities.phrase_bias = native_phrase_bias_capability_for_path(path);
-    capabilities.diarization = native_diarization_capability_for_path(path);
-    if let Some(adapter) = native_runtime_model_adapter_for_path(path) {
+    capabilities.phrase_bias = native_phrase_bias_capability_for_adapter(adapter.as_ref());
+    capabilities.diarization = native_diarization_capability_for_adapter(adapter.as_ref());
+    if let Some(adapter) = adapter.as_ref() {
         capabilities.language = super::LanguageCapability::from(adapter.language_mode());
     }
     capabilities
@@ -578,10 +582,10 @@ pub fn native_runtime_transcription_capabilities_for_path(
 
 pub(crate) const NATIVE_PHRASE_BIAS_UNAVAILABLE_REASON: &str = "Phrase bias / hotword boosting is not implemented for this native model; requests with phrase_bias or hotword fields are rejected.";
 
-fn native_phrase_bias_capability_for_path(path: &Path) -> BackendFeatureCapability {
-    if native_runtime_model_adapter_for_path(path)
-        .is_some_and(|adapter| adapter.capabilities().supports_phrase_bias)
-    {
+fn native_phrase_bias_capability_for_adapter(
+    adapter: Option<&NativeRuntimeModelAdapter>,
+) -> BackendFeatureCapability {
+    if adapter.is_some_and(|adapter| adapter.capabilities().supports_phrase_bias) {
         BackendFeatureCapability::supported()
     } else {
         BackendFeatureCapability::reject_request(NATIVE_PHRASE_BIAS_UNAVAILABLE_REASON)
@@ -595,8 +599,11 @@ pub(crate) const NATIVE_DIARIZATION_UNAVAILABLE_REASON: &str = "Diarization need
 /// Diarization capability for a runtime pack: supported when the model
 /// self-diarizes (e.g. the cohere token-stream) or the model-agnostic
 /// VAD + active speaker-embedder path is installed for this process.
-fn native_diarization_capability_for_path(path: &Path) -> BackendFeatureCapability {
-    if native_runtime_path_supports_diarization(path) || crate::diarize::vad_diarization_available()
+fn native_diarization_capability_for_adapter(
+    adapter: Option<&NativeRuntimeModelAdapter>,
+) -> BackendFeatureCapability {
+    if native_runtime_adapter_supports_diarization(adapter)
+        || crate::diarize::vad_diarization_available()
     {
         BackendFeatureCapability::supported()
     } else {
@@ -605,13 +612,20 @@ fn native_diarization_capability_for_path(path: &Path) -> BackendFeatureCapabili
 }
 
 pub fn native_runtime_realtime_capabilities_for_path(path: &Path) -> RealtimeBackendCapabilities {
-    RealtimeBackendCapabilities::from_native_capabilities(
-        &native_runtime_asr_capabilities_for_path(path),
-    )
+    // Same single-build discipline as the transcription facets above: one
+    // adapter build serves the one realtime facet derived from it today, and
+    // keeps this entry point structurally consistent if more facets are
+    // added later.
+    let adapter = native_runtime_model_adapter_for_path(path);
+    RealtimeBackendCapabilities::from_native_capabilities(&native_runtime_capabilities_for_adapter(
+        adapter.as_ref(),
+    ))
 }
 
-fn native_runtime_asr_capabilities_for_path(path: &Path) -> NativeAsrCapabilities {
-    native_runtime_model_adapter_for_path(path)
+fn native_runtime_capabilities_for_adapter(
+    adapter: Option<&NativeRuntimeModelAdapter>,
+) -> NativeAsrCapabilities {
+    adapter
         .map(|adapter| adapter.capabilities())
         .unwrap_or_else(NativeAsrCapabilities::unsupported)
 }
@@ -803,9 +817,10 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
 /// have written, not that the file is corrupt.
 const RUNTIME_CONTRACT_OUTDATED_PACK_HINT: &str = "this pack was likely produced by an outdated or incompatible conversion pipeline; re-convert or re-pull the model pack";
 
-pub(crate) fn native_runtime_path_supports_diarization(path: &Path) -> bool {
-    native_runtime_model_adapter_for_path(path)
-        .is_some_and(|adapter| adapter.capabilities().supports_diarization)
+fn native_runtime_adapter_supports_diarization(
+    adapter: Option<&NativeRuntimeModelAdapter>,
+) -> bool {
+    adapter.is_some_and(|adapter| adapter.capabilities().supports_diarization)
 }
 
 /// Diarization support for a runtime pack: the family must be capable of
