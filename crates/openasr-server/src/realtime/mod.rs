@@ -158,7 +158,7 @@ pub(crate) async fn stream_transcription(
     record_history: bool,
 ) -> Result<Response, ApiError> {
     let home = distribution.openasr_home()?;
-    let catalog = super::load_runtime_model_catalog(distribution.catalog_url(), &home)?;
+    let catalog = super::load_runtime_model_catalog(distribution.catalog_source(), &home)?;
     let parsed =
         parse_transcription_multipart(multipart, runtime.backend, catalog.as_ref()).await?;
     if matches!(
@@ -853,11 +853,11 @@ fn resolve_model(
     distribution: &DistributionContext,
     model: &str,
 ) -> Result<String, String> {
-    let catalog = if distribution.catalog_url().is_some() {
+    let catalog = if distribution.catalog_source().is_some() {
         let home = distribution
             .openasr_home()
             .map_err(|error| error.to_string())?;
-        super::load_runtime_model_catalog(distribution.catalog_url(), &home)
+        super::load_runtime_model_catalog(distribution.catalog_source(), &home)
             .map_err(|error| error.to_string())?
     } else {
         None

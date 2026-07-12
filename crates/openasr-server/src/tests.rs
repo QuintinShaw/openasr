@@ -113,6 +113,7 @@ fn distribution_context_for_test(home: &std::path::Path) -> DistributionContext 
     DistributionContext::new(DistributionRuntime {
         openasr_home: Some(home.to_path_buf()),
         catalog_url: None,
+        catalog_local_override: None,
     })
 }
 
@@ -132,6 +133,196 @@ fn bundled_catalog_url_for_test(dir: &std::path::Path) -> String {
     let copy_path = dir.join("bundled-catalog-for-test.json");
     openasr_core::testing::write_local_dev_signed_catalog(&copy_path, &contents, 1);
     format!("file://{}", copy_path.display())
+}
+
+/// Copies the real, committed, PRODUCTION-signed `model-registry/catalog.json`
+/// and its `catalog.signature.json` pair -- byte-for-byte what desktop
+/// bundles into `Contents/Resources` -- into `dir`, returning the copied
+/// catalog path.
+fn copy_bundled_production_catalog_to(dir: &std::path::Path) -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry");
+    let catalog_path = dir.join("catalog.json");
+    fs::copy(root.join("catalog.json"), &catalog_path).expect("copy bundled catalog.json");
+    fs::copy(
+        root.join(openasr_core::CATALOG_SIGNATURE_FILE_NAME),
+        catalog_path.with_file_name(openasr_core::CATALOG_SIGNATURE_FILE_NAME),
+    )
+    .expect("copy bundled catalog.signature.json");
+    catalog_path
+}
+
+/// RAII guard restoring `OPENASR_CATALOG_URL` / `OPENASR_CATALOG_FILE` /
+/// `OPENASR_CATALOG_IDENTITY` to their prior values. These three env vars are
+/// process-global, so tests that mutate them must run under `cargo nextest`
+/// (one process per test, per this repo's AGENTS.md) -- a plain multi-threaded
+/// `cargo test` run within one binary could race a concurrently-running test
+/// that calls `DistributionRuntime::default()`.
+struct CatalogEnvGuard {
+    url: Option<String>,
+    file: Option<String>,
+    identity: Option<String>,
+}
+
+impl CatalogEnvGuard {
+    fn capture() -> Self {
+        Self {
+            url: env::var("OPENASR_CATALOG_URL").ok(),
+            file: env::var("OPENASR_CATALOG_FILE").ok(),
+            identity: env::var("OPENASR_CATALOG_IDENTITY").ok(),
+        }
+    }
+
+    /// Sets up the OLD desktop wiring this PR replaces: a bare
+    /// `OPENASR_CATALOG_URL=file://<path>` override, using the install path
+    /// as both fetch source and verification identity.
+    fn set_url_override(url: &str) -> Self {
+        let guard = Self::capture();
+        unsafe {
+            env::set_var("OPENASR_CATALOG_URL", url);
+            env::remove_var("OPENASR_CATALOG_FILE");
+            env::remove_var("OPENASR_CATALOG_IDENTITY");
+        }
+        guard
+    }
+
+    /// Sets up the NEW mechanism: bytes read from `path`, verified against
+    /// the separately-declared `identity`.
+    fn set_local_file_override(path: &std::path::Path, identity: &str) -> Self {
+        let guard = Self::capture();
+        unsafe {
+            env::set_var("OPENASR_CATALOG_FILE", path);
+            env::set_var("OPENASR_CATALOG_IDENTITY", identity);
+            env::remove_var("OPENASR_CATALOG_URL");
+        }
+        guard
+    }
+}
+
+impl Drop for CatalogEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.url.take() {
+                Some(value) => env::set_var("OPENASR_CATALOG_URL", value),
+                None => env::remove_var("OPENASR_CATALOG_URL"),
+            }
+            match self.file.take() {
+                Some(value) => env::set_var("OPENASR_CATALOG_FILE", value),
+                None => env::remove_var("OPENASR_CATALOG_FILE"),
+            }
+            match self.identity.take() {
+                Some(value) => env::set_var("OPENASR_CATALOG_IDENTITY", value),
+                None => env::remove_var("OPENASR_CATALOG_IDENTITY"),
+            }
+        }
+    }
+}
+
+/// `OPENASR_CATALOG_URL`/`OPENASR_CATALOG_FILE`/`OPENASR_CATALOG_IDENTITY` are
+/// process-global env vars, and `cargo test` (unlike `cargo nextest`, this
+/// repo's canonical runner, which isolates each test in its own process) runs
+/// tests within one binary on multiple threads by default -- so the 3 tests
+/// mutating these env vars below must serialize against each other or they
+/// race and read each other's overrides. Same pattern as
+/// `realtime::tests::speaker_embedder_env_lock`.
+fn catalog_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[test]
+fn desktop_bundled_catalog_via_bare_file_url_override_is_rejected() {
+    let _lock = catalog_env_lock();
+    // Reproduces the 0.1.13 desktop packaging regression at the ACTUAL server
+    // wiring surface (not just the underlying core primitive): the old
+    // `sidecar.rs::resolve_catalog_url` set
+    // `OPENASR_CATALOG_URL=file:///Applications/.../catalog.json`, using the
+    // install path as both fetch source and verification identity for the
+    // exact production-signed catalog desktop bundles. `DistributionRuntime`
+    // picks this up via `catalog_url`, and `catalog_source()` /
+    // `load_catalog_for_source` must reject it -- this is the crash
+    // ("Could not load model catalog...") desktop hit on every core >=
+    // dcce58b build.
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let catalog_path = copy_bundled_production_catalog_to(temp.path());
+    let file_url = format!("file://{}", catalog_path.display());
+
+    let _guard = CatalogEnvGuard::set_url_override(&file_url);
+    let runtime = DistributionRuntime {
+        openasr_home: Some(home.clone()),
+        ..DistributionRuntime::default()
+    };
+    let distribution = DistributionContext::new(runtime);
+    let source = distribution
+        .catalog_source()
+        .expect("OPENASR_CATALOG_URL override must be picked up");
+    let error = load_catalog_for_source(source, &home)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Catalog signature manifest URL mismatch")
+            || error.contains("no usable signed cache"),
+        "{error}"
+    );
+}
+
+#[test]
+fn desktop_bundled_catalog_via_file_and_identity_override_loads() {
+    let _lock = catalog_env_lock();
+    // The fix: the SAME bundled bytes, but the server picks up
+    // `OPENASR_CATALOG_FILE` (bytes) + `OPENASR_CATALOG_IDENTITY` (the real
+    // production identity the signature is bound to) instead of folding both
+    // into a single `file://` URL. `catalog_source()` must prefer this local
+    // override over `OPENASR_CATALOG_URL`, and the load must succeed.
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let catalog_path = copy_bundled_production_catalog_to(temp.path());
+    let identity = openasr_core::default_catalog_url();
+
+    let _guard = CatalogEnvGuard::set_local_file_override(&catalog_path, identity);
+    let runtime = DistributionRuntime {
+        openasr_home: Some(home.clone()),
+        ..DistributionRuntime::default()
+    };
+    let distribution = DistributionContext::new(runtime);
+    let source = distribution
+        .catalog_source()
+        .expect("OPENASR_CATALOG_FILE/IDENTITY override must be picked up");
+    let catalog = load_catalog_for_source(source, &home)
+        .expect("bundled catalog + declared identity must verify");
+    assert!(!catalog.models.is_empty());
+}
+
+#[test]
+fn catalog_local_override_takes_precedence_over_catalog_url() {
+    let _lock = catalog_env_lock();
+    // If both `OPENASR_CATALOG_URL` and `OPENASR_CATALOG_FILE`/`_IDENTITY` are
+    // set (e.g. a stale env left over from a different launch path), the
+    // explicit local-file override wins -- it is the more specific,
+    // more recently introduced configuration, and silently preferring the
+    // legacy `catalog_url` here would resurrect the exact regression this PR
+    // fixes for any caller that (redundantly) sets both.
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let catalog_path = copy_bundled_production_catalog_to(temp.path());
+    let identity = openasr_core::default_catalog_url();
+    let bogus_file_url = format!("file://{}", catalog_path.display());
+
+    let _url_guard = CatalogEnvGuard::set_url_override(&bogus_file_url);
+    unsafe {
+        env::set_var("OPENASR_CATALOG_FILE", &catalog_path);
+        env::set_var("OPENASR_CATALOG_IDENTITY", identity);
+    }
+    let runtime = DistributionRuntime {
+        openasr_home: Some(home.clone()),
+        ..DistributionRuntime::default()
+    };
+    let distribution = DistributionContext::new(runtime);
+    let source = distribution.catalog_source().expect("override present");
+    assert!(matches!(source, CatalogSource::LocalFile { .. }));
+    load_catalog_for_source(source, &home).expect("local override must win and verify");
 }
 
 fn write_valid_installed_pack_for_test(
@@ -260,6 +451,7 @@ async fn spawn_loopback_pairing_server(home: &Path) -> LoopbackTlsServer {
         DistributionRuntime {
             openasr_home: Some(home.to_path_buf()),
             catalog_url: None,
+            catalog_local_override: None,
         },
         ServerLaunchOptions {
             auth: ServerAuth::pairing_with_safety_code("admin-secret", Some(safety_code)),
@@ -593,9 +785,13 @@ fn default_pack_lookup_resolves_series_alias_through_catalog() {
     let pack = write_valid_installed_pack_for_test(temp.path(), "qwen3-asr-0.6b", "q8_0", "q8");
     let catalog_url = bundled_catalog_url_for_test(temp.path());
 
-    let resolved = find_installed_pack_reference(temp.path(), Some(&catalog_url), "qwen:q8")
-        .unwrap()
-        .unwrap();
+    let resolved = find_installed_pack_reference(
+        temp.path(),
+        Some(CatalogSource::Url(&catalog_url)),
+        "qwen:q8",
+    )
+    .unwrap()
+    .unwrap();
 
     assert_eq!(resolved.pull, pack.pull);
 }
@@ -1272,7 +1468,7 @@ async fn delete_model_allows_current_default_and_clears_default_selection() {
         Some("moonshine-tiny:q8")
     );
     assert!(list_installed_packs(temp.path()).unwrap().is_empty());
-    let default = default_model_response(temp.path(), distribution.catalog_url()).unwrap();
+    let default = default_model_response(temp.path(), distribution.catalog_source()).unwrap();
     assert!(default.default_model.is_none());
     assert!(default.default_pull.is_none());
     assert!(default.pack.is_none());

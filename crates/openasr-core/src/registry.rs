@@ -1,7 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::BTreeMap,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -1091,6 +1091,77 @@ pub fn load_local_catalog_file_with_identity(
     cache_catalog(home, &cache_path, &contents)?;
     cache_catalog_security(home, &manifest_contents, &verified)?;
     Ok(catalog)
+}
+
+/// `OPENASR_CATALOG_FILE` env var name; paired with
+/// [`OPENASR_CATALOG_IDENTITY_ENV_VAR`] to load a local catalog file's bytes
+/// under an explicitly declared verification identity, decoupled from the
+/// file's own path. See [`resolve_local_catalog_env_override`].
+pub const OPENASR_CATALOG_FILE_ENV_VAR: &str = "OPENASR_CATALOG_FILE";
+/// `OPENASR_CATALOG_IDENTITY` env var name; see
+/// [`OPENASR_CATALOG_FILE_ENV_VAR`].
+pub const OPENASR_CATALOG_IDENTITY_ENV_VAR: &str = "OPENASR_CATALOG_IDENTITY";
+
+/// A local catalog file to load with its bytes and its verification identity
+/// deliberately decoupled -- see [`resolve_local_catalog_env_override`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalCatalogEnvOverride {
+    pub path: PathBuf,
+    pub identity: String,
+}
+
+/// Reads the `OPENASR_CATALOG_FILE` + `OPENASR_CATALOG_IDENTITY` env var pair,
+/// shared by every host binary that needs to load a local catalog file under
+/// an identity decoupled from the file's own path -- e.g. `openasr-cli`'s
+/// `serve`/`search`/`show` startup catalog resolution and `openasr-server`'s
+/// per-request `DistributionRuntime`. The motivating case: a desktop-bundled,
+/// production-signed `catalog.json` copied to
+/// `Contents/Resources/catalog.json` must verify as the real
+/// `https://catalog.openasr.org/v1/catalog.json` identity, not the incidental
+/// `file:///Applications/...` install path -- the signature is bound to the
+/// former, so asserting the latter (what a bare `OPENASR_CATALOG_URL=file://`
+/// override does) fails closed via [`load_local_catalog_file_with_identity`]'s
+/// underlying identity check.
+///
+/// Both vars must be set (and non-blank) together: a lone
+/// `OPENASR_CATALOG_FILE` without a declared identity, or vice versa, is a
+/// misconfiguration, not a valid override. Rather than silently dropping half
+/// the config or guessing an identity, that case returns `(None, Some(warning))`
+/// so the caller can surface the warning (stderr, log, ...) instead of
+/// quietly changing trust behavior; a fully-set pair returns
+/// `(Some(override), None)`, and an unset pair returns `(None, None)`.
+///
+/// This function has no loading side effects of its own -- callers still
+/// route the actual load through [`load_local_catalog_file_with_identity`].
+pub fn resolve_local_catalog_env_override() -> (Option<LocalCatalogEnvOverride>, Option<String>) {
+    let file = env::var(OPENASR_CATALOG_FILE_ENV_VAR)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let identity = env::var(OPENASR_CATALOG_IDENTITY_ENV_VAR)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    match (file, identity) {
+        (Some(path), Some(identity)) => (
+            Some(LocalCatalogEnvOverride {
+                path: PathBuf::from(path),
+                identity,
+            }),
+            None,
+        ),
+        (Some(_), None) => (
+            None,
+            Some(format!(
+                "{OPENASR_CATALOG_FILE_ENV_VAR} is set without {OPENASR_CATALOG_IDENTITY_ENV_VAR}; ignoring {OPENASR_CATALOG_FILE_ENV_VAR} (both must be set together)."
+            )),
+        ),
+        (None, Some(_)) => (
+            None,
+            Some(format!(
+                "{OPENASR_CATALOG_IDENTITY_ENV_VAR} is set without {OPENASR_CATALOG_FILE_ENV_VAR}; ignoring {OPENASR_CATALOG_IDENTITY_ENV_VAR} (both must be set together)."
+            )),
+        ),
+        (None, None) => (None, None),
+    }
 }
 
 /// Whether the runtime should prefer the embedded catalog snapshot over the

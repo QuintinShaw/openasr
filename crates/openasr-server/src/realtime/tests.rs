@@ -12,6 +12,7 @@ fn test_distribution() -> DistributionContext {
     DistributionContext::new(crate::DistributionRuntime {
         openasr_home: Some(openasr_home),
         catalog_url: None,
+        catalog_local_override: None,
     })
 }
 
@@ -2407,6 +2408,7 @@ async fn native_streaming_finish_forwards_final_and_records_history() {
     let distribution = DistributionContext::new(crate::DistributionRuntime {
         openasr_home: Some(openasr_home.clone()),
         catalog_url: None,
+        catalog_local_override: None,
     });
     std::fs::create_dir_all(&openasr_home).unwrap();
     // History recording is governed by history_retention alone; auto_save
@@ -4131,6 +4133,7 @@ async fn finish_records_completed_websocket_session_history() {
     let distribution = DistributionContext::new(crate::DistributionRuntime {
         openasr_home: Some(temp.path().to_path_buf()),
         catalog_url: None,
+        catalog_local_override: None,
     });
     // auto_save only controls transcript-file exports; history recording is
     // governed by history_retention alone, so auto_save=false must still record.
@@ -4191,6 +4194,7 @@ async fn finish_skips_websocket_session_history_when_retention_off() {
     let distribution = DistributionContext::new(crate::DistributionRuntime {
         openasr_home: Some(temp.path().to_path_buf()),
         catalog_url: None,
+        catalog_local_override: None,
     });
     // Even with auto_save enabled, "off" retention must skip the write:
     // history_retention is the only history switch.
@@ -4233,6 +4237,7 @@ async fn remote_compute_websocket_session_does_not_record_server_history() {
     let distribution = DistributionContext::new(crate::DistributionRuntime {
         openasr_home: Some(temp.path().to_path_buf()),
         catalog_url: None,
+        catalog_local_override: None,
     });
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut session =

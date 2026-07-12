@@ -346,9 +346,31 @@ async fn run() -> Result<()> {
 fn search_models(query: Option<&str>) -> Result<()> {
     // Offline by design: the derived registry comes from the local/embedded signed
     // catalog (no network), so `openasr search` never triggers a download.
-    let catalog = openasr_home()
-        .ok()
-        .and_then(|home| load_cli_model_catalog(&home).ok().flatten());
+    //
+    // A catalog load failure degrades to the builtin registry rather than
+    // failing the command (this is a read-only listing command, not `serve`,
+    // which stays fail-closed) -- but the degrade must be VISIBLE. Silently
+    // swallowing the error here is exactly what let a broken
+    // `OPENASR_CATALOG_URL`/local-catalog signature (e.g. the desktop
+    // bundled-catalog identity mismatch) hide behind a quietly-shrunk model
+    // list instead of surfacing the real cause.
+    let catalog = match openasr_home() {
+        Ok(home) => match load_cli_model_catalog(&home) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                eprintln!(
+                    "warning: could not load model catalog, falling back to the builtin model registry: {error:#}"
+                );
+                None
+            }
+        },
+        Err(error) => {
+            eprintln!(
+                "warning: could not resolve OPENASR_HOME, falling back to the builtin model registry: {error:#}"
+            );
+            None
+        }
+    };
     let cards = runtime_registry(catalog.as_ref()).context("Could not load model registry")?;
     let needle = query.map(|q| q.to_ascii_lowercase());
     println!(

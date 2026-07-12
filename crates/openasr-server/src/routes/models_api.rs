@@ -10,7 +10,7 @@ pub(crate) async fn local_models(
     let home = distribution.openasr_home()?;
     let packs = list_installed_packs(&home).map_err(ApiError::Pull)?;
     let default_pull =
-        resolve_default_pack(&home, distribution.catalog_url())?.map(|pack| pack.pull);
+        resolve_default_pack(&home, distribution.catalog_source())?.map(|pack| pack.pull);
     Ok(Json(LocalModelsResponse {
         object: "list",
         data: packs
@@ -29,7 +29,7 @@ pub(crate) async fn default_model(
     let home = distribution.openasr_home()?;
     Ok(Json(default_model_response(
         &home,
-        distribution.catalog_url(),
+        distribution.catalog_source(),
     )?))
 }
 
@@ -38,12 +38,12 @@ pub(crate) async fn set_default_model(
     Json(request): Json<SetDefaultRequest>,
 ) -> Result<Json<DefaultModelResponse>, ApiError> {
     let home = distribution.openasr_home()?;
-    let pack = resolve_installed_pack_for_default(&home, distribution.catalog_url(), &request)?;
+    let pack = resolve_installed_pack_for_default(&home, distribution.catalog_source(), &request)?;
     let preference = request.quant_preference_for_pack(&pack);
     persist_default_pack(&home, &pack, preference)?;
     Ok(Json(default_model_response(
         &home,
-        distribution.catalog_url(),
+        distribution.catalog_source(),
     )?))
 }
 
@@ -53,7 +53,7 @@ pub(crate) async fn delete_model(
 ) -> Result<Json<DeleteModelResponse>, ApiError> {
     let home = distribution.openasr_home()?;
     let default_pull =
-        resolve_default_pack(&home, distribution.catalog_url())?.map(|pack| pack.pull);
+        resolve_default_pack(&home, distribution.catalog_source())?.map(|pack| pack.pull);
     let removed = remove_model_pack(&home, &id).map_err(ApiError::Pull)?;
     if removed
         .as_ref()
@@ -73,8 +73,8 @@ pub(crate) async fn import_local_model(
 ) -> Result<Json<ImportLocalModelResponse>, ApiError> {
     let home = distribution.openasr_home()?;
     let path = resolve_local_pull_source_path(request.path)?;
-    let catalog =
-        load_model_catalog(distribution.catalog_url(), &home).map_err(ApiError::Catalog)?;
+    let catalog = load_catalog_for_optional_source(distribution.catalog_source(), &home)
+        .map_err(ApiError::Catalog)?;
     let mut progress = |_| {};
     let installed = install_catalog_model_pack_from_path(&catalog, path, &home, &mut progress)
         .map_err(ApiError::Pull)?;
@@ -98,11 +98,11 @@ pub(crate) fn matching_installed_pack(
 
 pub(crate) fn resolve_default_pack(
     home: &Path,
-    catalog_url: Option<&str>,
+    catalog_source: Option<CatalogSource<'_>>,
 ) -> Result<Option<InstalledPack>, ApiError> {
     let packs = list_installed_packs(home).map_err(ApiError::Pull)?;
-    let catalog = catalog_url
-        .map(|catalog_url| load_model_catalog(Some(catalog_url), home))
+    let catalog = catalog_source
+        .map(|source| load_catalog_for_source(source, home))
         .transpose()
         .map_err(ApiError::Catalog)?;
     let document = load_config_document(home).map_err(ApiError::Config)?;
@@ -149,9 +149,9 @@ pub(crate) fn resolve_default_pack(
 
 pub(crate) fn default_model_response(
     home: &Path,
-    catalog_url: Option<&str>,
+    catalog_source: Option<CatalogSource<'_>>,
 ) -> Result<DefaultModelResponse, ApiError> {
-    let pack = resolve_default_pack(home, catalog_url)?;
+    let pack = resolve_default_pack(home, catalog_source)?;
     // The `default_model` field reports the bare model identity; the quant lives in
     // `default_pull`/`pack.pull`. Appending the quant here would duplicate it (with a
     // different spelling) and diverge from the persisted bare `config.default_model`.
@@ -188,14 +188,14 @@ pub(crate) fn select_launch_pack_from_list(
 
 pub(crate) fn resolve_installed_pack_for_default(
     home: &Path,
-    catalog_url: Option<&str>,
+    catalog_source: Option<CatalogSource<'_>>,
     request: &SetDefaultRequest,
 ) -> Result<InstalledPack, ApiError> {
     let reference = request.reference()?;
     if request.is_auto_request() {
         let packs = list_installed_packs(home).map_err(ApiError::Pull)?;
-        let catalog = catalog_url
-            .map(|catalog_url| load_model_catalog(Some(catalog_url), home))
+        let catalog = catalog_source
+            .map(|source| load_catalog_for_source(source, home))
             .transpose()
             .map_err(ApiError::Catalog)?;
         if let Some(pack) = select_launch_pack_from_list(
@@ -207,13 +207,13 @@ pub(crate) fn resolve_installed_pack_for_default(
             return Ok(pack);
         }
     }
-    find_installed_pack_reference(home, catalog_url, &reference)?
+    find_installed_pack_reference(home, catalog_source, &reference)?
         .ok_or_else(|| ApiError::BadRequest(format!("Installed model pack not found: {reference}")))
 }
 
 pub(crate) fn find_installed_pack_reference(
     home: &Path,
-    catalog_url: Option<&str>,
+    catalog_source: Option<CatalogSource<'_>>,
     reference: &str,
 ) -> Result<Option<InstalledPack>, ApiError> {
     let packs = list_installed_packs(home).map_err(ApiError::Pull)?;
@@ -222,10 +222,10 @@ pub(crate) fn find_installed_pack_reference(
     {
         return Ok(Some(pack));
     }
-    let Some(catalog_url) = catalog_url else {
+    let Some(catalog_source) = catalog_source else {
         return Ok(None);
     };
-    let catalog = load_model_catalog(Some(catalog_url), home).map_err(ApiError::Catalog)?;
+    let catalog = load_catalog_for_source(catalog_source, home).map_err(ApiError::Catalog)?;
     resolve_installed_pack_reference_with_catalog(&packs, &catalog, reference)
         .map_err(ApiError::Pull)
 }
