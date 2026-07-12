@@ -989,6 +989,14 @@ pub fn default_catalog_cache_path(openasr_home: impl AsRef<Path>) -> PathBuf {
     openasr_home.as_ref().join("catalog.json")
 }
 
+/// Loads the model catalog from `catalog_url` (default: [`DEFAULT_CATALOG_URL`]),
+/// always through the same fail-closed signature-verification pipeline --
+/// remote (`https://`), local (`file://`/bare filesystem path), and the
+/// on-disk signed cache all require a matching, valid `catalog.signature.json`
+/// sidecar. There is no unsigned/trust-bypass path: a local catalog source is
+/// only ever reachable via an explicit `catalog_url` override, and whoever
+/// supplies it must sign it (see [`catalog_security::verify_local_catalog_signature_manifest`]
+/// and the local-dev key it accepts in addition to the production key).
 pub fn load_model_catalog(
     catalog_url: Option<&str>,
     openasr_home: impl AsRef<Path>,
@@ -997,33 +1005,92 @@ pub fn load_model_catalog(
     let cache_path = default_catalog_cache_path(home);
     let source = catalog_url.unwrap_or(DEFAULT_CATALOG_URL);
 
-    if catalog_source_requires_signature(source) {
-        match read_catalog_source(source) {
-            Ok(contents) => match read_and_verify_catalog_manifest(source, home, &contents) {
-                Ok(verified) => {
-                    let catalog = parse_model_catalog(&contents, source)?;
-                    cache_catalog(home, &cache_path, &contents)?;
-                    cache_catalog_security(
-                        home,
-                        &verified.manifest_contents,
-                        verified.catalog_epoch,
-                    )?;
-                    Ok(catalog)
-                }
-                Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
-            },
-            Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
-        }
-    } else {
-        match read_catalog_source(source) {
-            Ok(contents) => {
+    match read_catalog_source(source) {
+        Ok(contents) => match read_and_verify_catalog_manifest(source, home, &contents) {
+            Ok(verified) => {
                 let catalog = parse_model_catalog(&contents, source)?;
                 cache_catalog(home, &cache_path, &contents)?;
+                cache_catalog_security(home, &verified.manifest_contents, &verified.signature)?;
                 Ok(catalog)
             }
-            Err(error) => load_cached_catalog(source, &cache_path, error),
-        }
+            Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
+        },
+        Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
     }
+}
+
+/// Loads a LOCAL catalog file directly from `path`, verifying its adjacent
+/// `catalog.signature.json` sidecar against `expected_catalog_url` -- which is
+/// deliberately NOT required to be a `file://`/path form of `path` itself.
+///
+/// This exists for exactly one caller: the CLI's "run from a repo checkout"
+/// dev convenience that auto-discovers `model-registry/catalog.json` relative
+/// to the current directory / build tree with no `OPENASR_CATALOG_URL`
+/// override set (see `openasr-cli`'s `catalog_cli::load_cli_model_catalog`).
+/// That file and its committed sidecar ARE the pre-deployment source of truth
+/// for the canonical [`DEFAULT_CATALOG_URL`] identity -- the same relationship
+/// [`load_embedded_signed_catalog`] has to the binary's embedded snapshot.
+///
+/// The trust roots are chosen from `expected_catalog_url` itself, through the
+/// same [`catalog_security::classify_catalog_identity`] used for every other
+/// source (see [`verify_catalog_manifest_for_source`]): when the caller
+/// asserts the canonical production (`https://`) identity -- as the repo
+/// auto-discovery of `model-registry/catalog.json` does -- ONLY the
+/// production key verifies, exactly like a real HTTPS/cached/embedded
+/// production catalog. The committed `model-registry/catalog.signature.json`
+/// is production-signed, so this is zero-impact for the real, deployed pair.
+/// The widely-known public local-dev key is accepted only when
+/// `expected_catalog_url` is itself a non-production (local) identity -- i.e.
+/// an explicit `--catalog-url file://...`/`OPENASR_CATALOG_URL` override,
+/// which goes through [`load_model_catalog`], not this function. A local-dev
+/// key bound to the production identity must never be treated as a stand-in
+/// for the real production catalog (that would let a malicious CWD override
+/// what a careless `cd`-and-run sees as the canonical model list/pull
+/// targets); see `registry/tests/catalog.rs`'s
+/// `local_catalog_auto_discovery_rejects_dev_key_bound_to_production_identity`.
+///
+/// Runs the same anti-rollback epoch floor as every other source, scoped to
+/// `openasr_home` -- see [`load_embedded_signed_catalog`]'s doc comment for
+/// why that is a freshness floor, not a confidentiality mechanism -- except
+/// that a local-dev-key verification never touches that floor at all (see
+/// [`catalog_security::participates_in_epoch_floor`]).
+pub fn load_local_catalog_file_with_identity(
+    path: &Path,
+    expected_catalog_url: &str,
+    openasr_home: impl AsRef<Path>,
+) -> Result<ModelCatalog, CatalogError> {
+    let home = openasr_home.as_ref();
+    let source_label = path.display().to_string();
+    let contents = fs::read_to_string(path).map_err(|error| CatalogError::ReadCatalog {
+        catalog_source: source_label.clone(),
+        message: error.to_string(),
+    })?;
+    let manifest_path = path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME);
+    let manifest_contents =
+        fs::read_to_string(&manifest_path).map_err(|error| CatalogError::CatalogSecurity {
+            catalog_source: source_label.clone(),
+            message: format!(
+                "could not read signature manifest '{}': {error}",
+                manifest_path.display()
+            ),
+        })?;
+    let verified =
+        verify_catalog_manifest_for_source(expected_catalog_url, &contents, &manifest_contents)
+            .map_err(|error| CatalogError::CatalogSecurity {
+                catalog_source: source_label.clone(),
+                message: error.to_string(),
+            })?;
+    catalog_security::enforce_catalog_epoch_for_verified(home, &verified).map_err(|error| {
+        CatalogError::CatalogSecurity {
+            catalog_source: source_label.clone(),
+            message: error.to_string(),
+        }
+    })?;
+    let catalog = parse_model_catalog(&contents, &source_label)?;
+    let cache_path = default_catalog_cache_path(home);
+    cache_catalog(home, &cache_path, &contents)?;
+    cache_catalog_security(home, &manifest_contents, &verified)?;
+    Ok(catalog)
 }
 
 /// Whether the runtime should prefer the embedded catalog snapshot over the
@@ -1367,14 +1434,12 @@ fn model_card_from_catalog(model: &CatalogModel) -> ModelCard {
 }
 
 fn read_catalog_source(source: &str) -> Result<String, CatalogError> {
-    if let Some(path) = source.strip_prefix("file://") {
-        return fs::read_to_string(path).map_err(|error| CatalogError::ReadCatalog {
-            catalog_source: source.to_string(),
-            message: error.to_string(),
-        });
-    }
-
-    if source.starts_with("https://") {
+    // Transport dispatch shares `classify_catalog_identity` with trust-root
+    // selection (`verify_catalog_manifest_for_source`) so the two can never
+    // drift apart on a future scheme -- see that function's doc comment.
+    if catalog_security::classify_catalog_identity(source)
+        == catalog_security::CatalogSourceKind::Remote
+    {
         let client = http::blocking_client(CATALOG_HTTP_CONNECT_TIMEOUT, CATALOG_HTTP_TIMEOUT)
             .map_err(|error| CatalogError::ReadCatalog {
                 catalog_source: source.to_string(),
@@ -1403,6 +1468,13 @@ fn read_catalog_source(source: &str) -> Result<String, CatalogError> {
         });
     }
 
+    if let Some(path) = source.strip_prefix("file://") {
+        return fs::read_to_string(path).map_err(|error| CatalogError::ReadCatalog {
+            catalog_source: source.to_string(),
+            message: error.to_string(),
+        });
+    }
+
     if source.starts_with("http://") {
         return Err(CatalogError::ReadCatalog {
             catalog_source: source.to_string(),
@@ -1418,11 +1490,45 @@ fn read_catalog_source(source: &str) -> Result<String, CatalogError> {
 
 struct VerifiedCatalogManifestContents {
     manifest_contents: String,
-    catalog_epoch: u64,
+    signature: catalog_security::VerifiedCatalogSignature,
 }
 
-fn catalog_source_requires_signature(source: &str) -> bool {
-    source.starts_with("https://")
+/// Selects which signing keys a `catalog_url`/identity may be trusted under,
+/// via the single shared [`catalog_security::classify_catalog_identity`]:
+/// [`catalog_security::CatalogSourceKind::Remote`] (`https://`) sources are
+/// restricted to the production-only root (the widely-known local-dev key
+/// must never authorize a network catalog), while
+/// [`catalog_security::CatalogSourceKind::Local`] (`file://`, a bare
+/// filesystem path, or any other non-production identity -- i.e. anything
+/// reached only through an explicit local `catalog_url` override, or asserted
+/// by a caller as a non-production identity) additionally accepts the public
+/// local-dev key. See the doc comment on `CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID`
+/// for why that key carries no confidentiality risk, and
+/// [`classify_catalog_identity`]'s doc comment for why `read_catalog_source`
+/// must classify through the same function.
+///
+/// [`classify_catalog_identity`]: catalog_security::classify_catalog_identity
+fn verify_catalog_manifest_for_source(
+    source: &str,
+    catalog_contents: &str,
+    manifest_contents: &str,
+) -> Result<catalog_security::VerifiedCatalogSignature, catalog_security::CatalogSecurityError> {
+    match catalog_security::classify_catalog_identity(source) {
+        catalog_security::CatalogSourceKind::Remote => {
+            catalog_security::verify_catalog_signature_manifest(
+                catalog_contents,
+                manifest_contents,
+                source,
+            )
+        }
+        catalog_security::CatalogSourceKind::Local => {
+            catalog_security::verify_local_catalog_signature_manifest(
+                catalog_contents,
+                manifest_contents,
+                source,
+            )
+        }
+    }
 }
 
 fn read_and_verify_catalog_manifest(
@@ -1436,11 +1542,7 @@ fn read_and_verify_catalog_manifest(
             catalog_source: source.to_string(),
             message: error.to_string(),
         })?;
-    let verified = match catalog_security::verify_catalog_signature_manifest(
-        contents,
-        &manifest_contents,
-        source,
-    ) {
+    let verified = match verify_catalog_manifest_for_source(source, contents, &manifest_contents) {
         Ok(verified) => verified,
         Err(error) => {
             return Err(CatalogError::CatalogSecurity {
@@ -1449,7 +1551,7 @@ fn read_and_verify_catalog_manifest(
             });
         }
     };
-    catalog_security::enforce_catalog_epoch(home, verified.catalog_epoch).map_err(|error| {
+    catalog_security::enforce_catalog_epoch_for_verified(home, &verified).map_err(|error| {
         CatalogError::CatalogSecurity {
             catalog_source: source.to_string(),
             message: error.to_string(),
@@ -1457,24 +1559,8 @@ fn read_and_verify_catalog_manifest(
     })?;
     Ok(VerifiedCatalogManifestContents {
         manifest_contents,
-        catalog_epoch: verified.catalog_epoch,
+        signature: verified,
     })
-}
-
-fn load_cached_catalog(
-    source: &str,
-    cache_path: &Path,
-    error: CatalogError,
-) -> Result<ModelCatalog, CatalogError> {
-    let cached =
-        fs::read_to_string(cache_path).map_err(|cache_error| CatalogError::ReadCatalog {
-            catalog_source: source.to_string(),
-            message: format!(
-                "{error}; no usable cache at '{}': {cache_error}",
-                cache_path.display()
-            ),
-        })?;
-    parse_model_catalog(&cached, &cache_path.display().to_string())
 }
 
 fn load_cached_signed_catalog(
@@ -1540,7 +1626,7 @@ pub fn load_embedded_signed_catalog(home: &Path) -> Result<ModelCatalog, Catalog
         catalog_source: DEFAULT_CATALOG_URL.to_string(),
         message: format!("embedded catalog rejected: {error}"),
     })?;
-    catalog_security::enforce_catalog_epoch(home, verified.catalog_epoch).map_err(|error| {
+    catalog_security::enforce_catalog_epoch_for_verified(home, &verified).map_err(|error| {
         CatalogError::CatalogSecurity {
             catalog_source: DEFAULT_CATALOG_URL.to_string(),
             message: format!("embedded catalog rejected: {error}"),
@@ -1584,13 +1670,13 @@ fn read_and_verify_cached_catalog_manifest(
                 manifest_path.display()
             ),
         })?;
-    let verified =
-        catalog_security::verify_catalog_signature_manifest(cached, &manifest_contents, source)
-            .map_err(|error| CatalogError::CatalogSecurity {
-                catalog_source: source.to_string(),
-                message: format!("{original_error}; cached catalog rejected: {error}"),
-            })?;
-    catalog_security::enforce_catalog_epoch(home, verified.catalog_epoch).map_err(|error| {
+    let verified = verify_catalog_manifest_for_source(source, cached, &manifest_contents).map_err(
+        |error| CatalogError::CatalogSecurity {
+            catalog_source: source.to_string(),
+            message: format!("{original_error}; cached catalog rejected: {error}"),
+        },
+    )?;
+    catalog_security::enforce_catalog_epoch_for_verified(home, &verified).map_err(|error| {
         CatalogError::CatalogSecurity {
             catalog_source: source.to_string(),
             message: format!("{original_error}; cached catalog rejected: {error}"),
@@ -1614,7 +1700,7 @@ fn cache_catalog(home: &Path, cache_path: &Path, contents: &str) -> Result<(), C
 fn cache_catalog_security(
     home: &Path,
     manifest_contents: &str,
-    catalog_epoch: u64,
+    verified: &catalog_security::VerifiedCatalogSignature,
 ) -> Result<(), CatalogError> {
     catalog_security::cache_catalog_manifest(home, manifest_contents).map_err(|error| {
         CatalogError::CatalogSecurity {
@@ -1624,7 +1710,10 @@ fn cache_catalog_security(
             message: error.to_string(),
         }
     })?;
-    catalog_security::record_catalog_epoch(home, catalog_epoch).map_err(|error| {
+    // Gated by `participates_in_epoch_floor`: a local-dev-key-verified catalog
+    // must never advance the shared production anti-rollback floor (see the
+    // doc comment on that function for the persistent DoS this closes).
+    catalog_security::record_catalog_epoch_for_verified(home, verified).map_err(|error| {
         CatalogError::CatalogSecurity {
             catalog_source: catalog_security::default_catalog_epoch_path(home)
                 .display()

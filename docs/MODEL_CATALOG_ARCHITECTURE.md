@@ -179,12 +179,57 @@ catalog (an explicit `OPENASR_CATALOG_URL` override is honoured, not replaced).
 This guarantees a fresh, fully offline install still shows the verified model
 list; because every installer ships the sidecar binary, the offline catalog is
 bundled transitively with no per-installer packaging. The embedded snapshot is
-kept current by the catalog drift and bundled-signature CI gates. Unsigned caches
-are accepted only for local `file://` or filesystem catalog sources used by
-development and bundled-resource flows. Current trust
+kept current by the catalog drift and bundled-signature CI gates. Current trust
 comes from HTTPS, signature verification, anti-rollback epoch checks, schema
 validation, pinned immutable pack URLs, sha256/size verification, Rust GGUF
 preflight, runtime-source validation, and atomic install.
+
+A LOCAL (`file://` or bare filesystem path) `catalog_url` override -- CLI
+`--catalog-url`/`OPENASR_CATALOG_URL`, the server's equivalent, or the CLI's
+repo-checkout auto-discovery of `model-registry/catalog.json` with no override
+set -- goes through the same signature/schema/anti-rollback pipeline as an
+HTTPS catalog: there is no unsigned local path. Trust roots are chosen from
+the *identity a signature is checked against* (`catalog_security::classify_catalog_identity`),
+not merely from how the bytes were read:
+
+- A production (`https://`) identity -- including the repo-checkout
+  auto-discovery of `model-registry/catalog.json`, which is verified against
+  the canonical `DEFAULT_CATALOG_URL` identity, not its incidental local path
+  -- accepts **only the production key**. A widely-known dev key must never
+  be able to stand in for the canonical production catalog just because a
+  malicious CWD happens to contain a `model-registry/catalog.json` +
+  `catalog.signature.json` pair.
+- Any other (local) identity -- i.e. an explicit `file://<path>` override via
+  `--catalog-url`/`OPENASR_CATALOG_URL` -- additionally trusts a public,
+  non-secret **local-dev signing key** (`openasr-catalog-local-dev-v1` /
+  `LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX` in
+  `crates/openasr-core/src/catalog_security.rs`). That key carries no
+  confidentiality (whoever supplies a local catalog file already controls its
+  contents); it only forces every local catalog through real
+  signature/sha256/catalog_url verification instead of a bypass.
+
+A signature is bound to the exact catalog_url identity it was issued for (an
+HTTPS URL for a production catalog, or the literal `file://<path>` for an
+explicit override) -- copying a signed local catalog to a different path/URL
+does not carry its signature with it.
+
+A local-dev-key-verified catalog also never touches the shared, cross-source
+anti-rollback epoch floor in `$OPENASR_HOME/catalog.epoch` (neither reading it
+as a floor nor writing to it): that floor exists to protect genuine production
+distribution channels (HTTPS, the on-disk signed cache, the embedded offline
+snapshot) from a stale re-serve, and the dev key's self-signed preview content
+has no such channel to protect -- letting it participate would let one
+locally-signed catalog with an inflated epoch permanently brick every
+subsequent production catalog load until `catalog.epoch` was deleted by hand.
+
+To preview local/staged catalog edits (e.g. after `regenerate_all.sh`) without
+the real production signing seed, run
+`tooling/publish-model/scripts/sign_local_catalog.sh` to sign a dev copy bound
+to an explicit `file://<path>` identity, then load it with
+`OPENASR_CATALOG_URL=file://<path>` (the repo-checkout auto-discovery path no
+longer accepts the dev key, since it asserts the production identity). Never
+commit a dev-signed manifest over the committed, production-signed
+`catalog.signature.json`.
 
 ## Forward Compatibility
 

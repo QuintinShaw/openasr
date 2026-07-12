@@ -1,7 +1,8 @@
 use assert_cmd::Command;
 use openasr_core::api::backend::transcribe_with_mock_backend;
 use openasr_core::testing::{
-    TinyGgufFixtureSpec, write_reserved_oasr_container, write_tiny_gguf_runtime_source,
+    TinyGgufFixtureSpec, write_local_dev_signed_catalog, write_reserved_oasr_container,
+    write_tiny_gguf_runtime_source,
 };
 use openasr_core::{ResponseFormat, TranscriptionRequest, render_transcription};
 use predicates::prelude::*;
@@ -163,7 +164,10 @@ fn write_catalog_models_fixture(path: &std::path::Path, models: Vec<Value>) {
       "models": models
     });
     let json = serde_json::to_string_pretty(&catalog).expect("serialize catalog fixture");
-    std::fs::write(path, json).expect("write catalog fixture");
+    // A local `file://` catalog now requires the same signed sidecar a
+    // production HTTPS catalog does; sign it with the public local-dev key so
+    // `--catalog-url file://<path>` fixtures keep loading.
+    write_local_dev_signed_catalog(path, &json, 1);
 }
 
 fn write_catalog_fixture(path: &std::path::Path, sha256: &str, size_bytes: u64) {
@@ -192,7 +196,7 @@ fn write_unsupported_catalog_schema_fixture(path: &std::path::Path) {
       "models": []
     });
     let json = serde_json::to_string_pretty(&catalog).expect("serialize catalog fixture");
-    std::fs::write(path, json).expect("write catalog fixture");
+    write_local_dev_signed_catalog(path, &json, 1);
 }
 
 fn write_ambiguous_moonshine_catalog_fixture(
