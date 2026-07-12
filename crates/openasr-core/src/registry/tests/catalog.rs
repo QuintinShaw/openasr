@@ -924,7 +924,9 @@ fn catalog_loader_caches_file_source_and_falls_back_to_cache() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("source-catalog.json");
     let home = temp.path().join("home");
-    fs::write(&source_path, catalog_json()).unwrap();
+    // A local `file://` source now requires the same signed sidecar a
+    // production HTTPS catalog does; sign it with the public local-dev key.
+    crate::testing::write_local_dev_signed_catalog(&source_path, &catalog_json(), 1);
 
     let source = format!("file://{}", source_path.display());
     let catalog = load_model_catalog(Some(&source), &home).unwrap();
@@ -941,7 +943,7 @@ fn catalog_loader_falls_back_to_cache_on_network_failure() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("source-catalog.json");
     let home = temp.path().join("home");
-    fs::write(&source_path, catalog_json()).unwrap();
+    crate::testing::write_local_dev_signed_catalog(&source_path, &catalog_json(), 1);
 
     let seeded_source = format!("file://{}", source_path.display());
     load_model_catalog(Some(&seeded_source), &home).unwrap();
@@ -949,7 +951,328 @@ fn catalog_loader_falls_back_to_cache_on_network_failure() {
     let error = load_model_catalog(Some("https://127.0.0.1:1/catalog.json"), &home)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("no usable signed cache"), "{error}");
+    // The on-disk signed cache is bound to the catalog_url identity that
+    // produced it (see the URL-mismatch test below): a DIFFERENT catalog_url
+    // cannot silently reuse it, so this now fails closed on the URL-mismatch
+    // check rather than the (no-signed-cache-exists) message it used to hit
+    // when local sources were unsigned and never wrote a signed cache at all.
+    assert!(error.contains("Could not read model catalog"), "{error}");
+    assert!(error.contains("URL mismatch"), "{error}");
+}
+
+#[test]
+fn local_catalog_source_fails_closed_when_signature_sidecar_is_missing() {
+    // The core of this fix: a local/`file://` catalog source with no adjacent
+    // `catalog.signature.json` at all must fail closed, exactly like an
+    // unsigned HTTPS response would -- there is no "local path skips
+    // verification" bypass left.
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("source-catalog.json");
+    let home = temp.path().join("home");
+    fs::write(&source_path, catalog_json()).unwrap();
+    // Deliberately no signature sidecar written.
+
+    let source = format!("file://{}", source_path.display());
+    let error = load_model_catalog(Some(&source), &home)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("Model catalog security check failed"),
+        "{error}"
+    );
+    assert!(!default_catalog_cache_path(&home).exists());
+}
+
+#[test]
+fn local_catalog_source_fails_closed_on_unknown_signing_key() {
+    // A signature manifest signed by a key that is neither the production
+    // root nor the public local-dev root must be rejected, not silently
+    // trusted because the source happens to be local.
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("source-catalog.json");
+    let home = temp.path().join("home");
+    let contents = catalog_json();
+    fs::write(&source_path, &contents).unwrap();
+    let source = format!("file://{}", source_path.display());
+
+    let manifest = catalog_security::render_catalog_signature_manifest(
+        &contents,
+        &source,
+        1,
+        "some-unrelated-key",
+        catalog_security::LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
+    )
+    .unwrap();
+    fs::write(
+        source_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        manifest,
+    )
+    .unwrap();
+
+    let error = load_model_catalog(Some(&source), &home)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Unknown catalog signature key id"),
+        "{error}"
+    );
+}
+
+#[test]
+fn local_catalog_source_fails_closed_when_signature_bytes_do_not_verify() {
+    // A structurally valid manifest (right schema, right key id, right
+    // catalog_url/sha256) whose signature bytes are simply wrong must be
+    // rejected -- not just a sha256/key-id mismatch, the actual ed25519
+    // check must run for local sources too.
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("source-catalog.json");
+    let home = temp.path().join("home");
+    let contents = catalog_json();
+    fs::write(&source_path, &contents).unwrap();
+    let source = format!("file://{}", source_path.display());
+
+    let manifest = catalog_security::render_catalog_signature_manifest(
+        &contents,
+        &source,
+        1,
+        catalog_security::CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+        catalog_security::LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
+    )
+    .unwrap();
+    // Flip a single hex nibble of the signature value, leaving everything
+    // else (schema, catalog_url, catalog_sha256, key_id) intact.
+    let mut parsed: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    let signature_value = parsed["signature"]["value"].as_str().unwrap().to_string();
+    let flipped_first_char = if &signature_value[0..1] == "0" {
+        "1"
+    } else {
+        "0"
+    };
+    let tampered_value = format!("{flipped_first_char}{}", &signature_value[1..]);
+    parsed["signature"]["value"] = serde_json::Value::String(tampered_value);
+    let tampered_manifest = serde_json::to_string_pretty(&parsed).unwrap();
+    fs::write(
+        source_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        tampered_manifest,
+    )
+    .unwrap();
+
+    let error = load_model_catalog(Some(&source), &home)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Model catalog security check failed"),
+        "{error}"
+    );
+}
+
+#[test]
+fn local_catalog_source_fails_closed_on_catalog_url_mismatch() {
+    // A local catalog + sidecar signed for one path must not verify when
+    // copied and loaded from a different path -- the signature is bound to
+    // the exact catalog_url it was issued for, same as an HTTPS catalog.
+    let temp = tempfile::tempdir().unwrap();
+    let dir_a = temp.path().join("dir-a");
+    let dir_b = temp.path().join("dir-b");
+    fs::create_dir_all(&dir_a).unwrap();
+    fs::create_dir_all(&dir_b).unwrap();
+    let signed_for_path = dir_a.join("catalog.json");
+    let relocated_path = dir_b.join("catalog.json");
+    let home = temp.path().join("home");
+    let contents = catalog_json();
+
+    crate::testing::write_local_dev_signed_catalog(&signed_for_path, &contents, 1);
+    fs::copy(&signed_for_path, &relocated_path).unwrap();
+    fs::copy(
+        signed_for_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        relocated_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+    )
+    .unwrap();
+
+    let source = format!("file://{}", relocated_path.display());
+    let error = load_model_catalog(Some(&source), &home)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("URL mismatch"), "{error}");
+}
+
+#[test]
+fn local_dev_catalog_epoch_never_advances_or_is_blocked_by_the_shared_production_floor() {
+    // B1 regression guard: a local catalog verified with the public dev key
+    // must never touch the shared, cross-source anti-rollback floor in
+    // $OPENASR_HOME/catalog.epoch. Before this fix, loading ONE dev-signed
+    // local catalog with an inflated epoch would permanently reject every
+    // subsequent production catalog load (network, on-disk cache, and the
+    // embedded offline snapshot) until an operator manually deleted
+    // catalog.epoch -- a persistent, self-inflicted DoS requiring no key
+    // compromise at all, since the dev seed is public and derivable by
+    // anyone (see the doc comment on `CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID`).
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let evil_path = temp.path().join("evil-catalog.json");
+    let contents = catalog_json();
+    let evil_url = format!("file://{}", evil_path.display());
+
+    fs::write(&evil_path, &contents).unwrap();
+    let manifest = catalog_security::render_catalog_signature_manifest(
+        &contents,
+        &evil_url,
+        u64::MAX,
+        catalog_security::CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+        catalog_security::LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
+    )
+    .unwrap();
+    fs::write(
+        evil_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        manifest,
+    )
+    .unwrap();
+
+    load_model_catalog(Some(&evil_url), &home)
+        .expect("a dev-signed local catalog at a non-production identity loads at any epoch");
+
+    assert!(
+        !catalog_security::default_catalog_epoch_path(&home).exists(),
+        "a dev-key-verified local catalog must never persist a shared epoch floor"
+    );
+
+    // A subsequent production-signed load (here: the offline embedded
+    // snapshot, whose real epoch is far below u64::MAX) must still succeed --
+    // it must not be rejected as a rollback against the dev catalog's epoch.
+    super::load_embedded_signed_catalog(&home).expect(
+        "the embedded production catalog must not be bricked by a prior dev-key local catalog",
+    );
+}
+
+#[test]
+fn local_catalog_auto_discovery_rejects_dev_key_bound_to_production_identity() {
+    // S1 regression guard: `load_local_catalog_file_with_identity` is the
+    // repo-checkout auto-discovery path, always called with the canonical
+    // production `DEFAULT_CATALOG_URL` identity (see `catalog_cli.rs`). A
+    // dev-key-signed manifest bound to that SAME identity must be rejected --
+    // otherwise any CWD containing an attacker-controlled
+    // model-registry/catalog.json + catalog.signature.json pair (no flag
+    // needed) could substitute itself for the canonical production catalog,
+    // since the dev signing key is public and derivable by anyone.
+    let temp = tempfile::tempdir().unwrap();
+    let catalog_path = temp.path().join("catalog.json");
+    let home = temp.path().join("home");
+    let contents = catalog_json();
+    fs::write(&catalog_path, &contents).unwrap();
+
+    let manifest = catalog_security::render_catalog_signature_manifest(
+        &contents,
+        DEFAULT_CATALOG_URL,
+        1,
+        catalog_security::CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+        catalog_security::LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
+    )
+    .unwrap();
+    fs::write(
+        catalog_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        manifest,
+    )
+    .unwrap();
+
+    let error = load_local_catalog_file_with_identity(&catalog_path, DEFAULT_CATALOG_URL, &home)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Unknown catalog signature key id"),
+        "{error}"
+    );
+}
+
+#[test]
+fn local_catalog_auto_discovery_accepts_the_real_production_signed_catalog() {
+    // Zero-impact check for the S1 fix: the committed, production-signed
+    // model-registry/catalog.json + catalog.signature.json pair -- exactly
+    // what the CLI's repo-checkout auto-discovery loads via
+    // `load_local_catalog_file_with_identity` -- must still verify once trust
+    // roots for the production identity are scoped to the production key
+    // only.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry");
+    let temp = tempfile::tempdir().unwrap();
+    let catalog_path = temp.path().join("catalog.json");
+    let home = temp.path().join("home");
+    fs::copy(root.join("catalog.json"), &catalog_path).unwrap();
+    fs::copy(
+        root.join(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        catalog_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+    )
+    .unwrap();
+
+    let catalog = load_local_catalog_file_with_identity(&catalog_path, DEFAULT_CATALOG_URL, &home)
+        .expect("the real committed production catalog + signature must still verify");
+    assert!(!catalog.models.is_empty());
+}
+
+#[test]
+fn local_catalog_file_with_identity_accepts_dev_key_for_a_non_production_identity() {
+    // `load_local_catalog_file_with_identity` also supports a non-production
+    // expected identity (any future caller besides the production-identity
+    // auto-discovery path currently in `catalog_cli.rs`) -- that case stays
+    // local-dev-key eligible, and (like every dev-key verification) never
+    // touches the shared epoch floor.
+    let temp = tempfile::tempdir().unwrap();
+    let catalog_path = temp.path().join("preview-catalog.json");
+    let home = temp.path().join("home");
+    let contents = catalog_json();
+    let identity = "file:///preview/staged-catalog.json";
+
+    fs::write(&catalog_path, &contents).unwrap();
+    let manifest = catalog_security::render_catalog_signature_manifest(
+        &contents,
+        identity,
+        3,
+        catalog_security::CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+        catalog_security::LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
+    )
+    .unwrap();
+    fs::write(
+        catalog_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        manifest,
+    )
+    .unwrap();
+
+    let catalog = load_local_catalog_file_with_identity(&catalog_path, identity, &home)
+        .expect("dev key must still verify a non-production expected identity");
+    assert_eq!(catalog.models.len(), 2);
+    assert!(
+        !catalog_security::default_catalog_epoch_path(&home).exists(),
+        "a dev-key-verified identity-decoupled load must not persist a shared epoch floor"
+    );
+}
+
+#[test]
+fn catalog_loader_falls_back_to_last_good_cache_when_local_source_is_tampered_without_resigning() {
+    // Tampering with a local catalog's bytes WITHOUT re-signing must not be
+    // silently accepted: the sha256 no longer matches the sidecar, so the
+    // loader falls back to the last verified-good on-disk cache instead of
+    // trusting the mutated bytes -- the same behavior an HTTPS source gets on
+    // a MITM/corruption. The on-disk cache stays untouched either way.
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("source-catalog.json");
+    let home = temp.path().join("home");
+    let source = format!("file://{}", source_path.display());
+    crate::testing::write_local_dev_signed_catalog(&source_path, &catalog_json(), 1);
+    load_model_catalog(Some(&source), &home).unwrap();
+    let cache_path = default_catalog_cache_path(&home);
+    let cached_before = fs::read_to_string(&cache_path).unwrap();
+
+    // Mutate the catalog bytes in place without touching the signature
+    // sidecar -- this is what an on-disk corruption/tamper looks like.
+    fs::write(
+        &source_path,
+        catalog_json().replace("\"schema_version\": 1", "\"schema_version\": 99"),
+    )
+    .unwrap();
+
+    let catalog = load_model_catalog(Some(&source), &home)
+        .expect("tampered local source falls back to the last verified-good cache");
+    assert_eq!(catalog.models.len(), 2);
+    assert_eq!(fs::read_to_string(&cache_path).unwrap(), cached_before);
 }
 
 #[test]
@@ -1245,27 +1568,23 @@ fn catalog_model_available_for_current_build() {
 
 #[test]
 fn catalog_loader_does_not_cache_invalid_source() {
+    // A properly-signed local catalog (signature matches these exact,
+    // schema-invalid bytes) still must not be cached: signature verification
+    // is orthogonal to schema validation, and a schema failure must surface
+    // as a hard error with no pre-existing cache to fall back to.
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("source-catalog.json");
     let home = temp.path().join("home");
-    fs::write(&source_path, catalog_json()).unwrap();
+    let bad_contents = catalog_json().replace("\"schema_version\": 1", "\"schema_version\": 99");
+    crate::testing::write_local_dev_signed_catalog(&source_path, &bad_contents, 1);
 
     let source = format!("file://{}", source_path.display());
-    load_model_catalog(Some(&source), &home).unwrap();
-    let cache_path = default_catalog_cache_path(&home);
-    let cached_before = fs::read_to_string(&cache_path).unwrap();
-
-    fs::write(
-        &source_path,
-        catalog_json().replace("\"schema_version\": 1", "\"schema_version\": 99"),
-    )
-    .unwrap();
     let error = load_model_catalog(Some(&source), &home)
         .unwrap_err()
         .to_string();
 
     assert!(error.contains("Unsupported model catalog schema_version 99"));
-    assert_eq!(fs::read_to_string(&cache_path).unwrap(), cached_before);
+    assert!(!default_catalog_cache_path(&home).exists());
 }
 
 #[test]

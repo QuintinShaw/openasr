@@ -84,11 +84,12 @@ pub use benchmark::{
 };
 pub use catalog_security::{
     CATALOG_EPOCH_FILE_NAME, CATALOG_SIGNATURE_ALGORITHM, CATALOG_SIGNATURE_FILE_NAME,
-    CATALOG_SIGNATURE_KEY_ID, CATALOG_SIGNATURE_SCHEMA_VERSION, CatalogSecurityError,
-    CatalogSignature, CatalogSignatureManifest, VerifiedCatalogSignature, catalog_signature_source,
+    CATALOG_SIGNATURE_KEY_ID, CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID, CATALOG_SIGNATURE_SCHEMA_VERSION,
+    CatalogSecurityError, CatalogSignature, CatalogSignatureManifest,
+    LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX, VerifiedCatalogSignature, catalog_signature_source,
     default_catalog_epoch_path, default_catalog_signature_cache_path,
     derive_catalog_public_key_hex, render_catalog_signature_manifest,
-    verify_catalog_signature_manifest,
+    verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
 };
 pub use metrics::{
     WerCounts, cer_counts, normalize_text, peak_rss_bytes, wer, wer_counts, word_prefix_error_rate,
@@ -287,7 +288,8 @@ pub use registry::{
     ResolvedCatalogBackendPull, ResolvedCatalogPull, ResolvedModel, ResolvedRuntimeModelRef,
     RuntimeModelRefSource, RuntimeModelResolutionError, RuntimeRegistryError, canonical_quant_tag,
     current_cli_version, default_catalog_cache_path, default_catalog_url, default_registry_dir,
-    embedded_catalog_fingerprint, load_embedded_signed_catalog, load_model_catalog, load_registry,
+    embedded_catalog_fingerprint, load_embedded_signed_catalog,
+    load_local_catalog_file_with_identity, load_model_catalog, load_registry,
     model_cards_from_catalog, model_reference_matches_resolved_source,
     model_refs_match_with_optional_tag_alias, parse_model_catalog, parse_model_ref,
     recommend_catalog_quant, resolve_catalog_backend_pull, resolve_catalog_pull,

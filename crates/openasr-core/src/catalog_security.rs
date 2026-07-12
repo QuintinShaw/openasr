@@ -31,6 +31,51 @@ pub const OPENASR_CATALOG_TRUST_ROOTS: &[CatalogTrustRoot] = &[CatalogTrustRoot 
     public_key_hex: OPENASR_CATALOG_V1_PUBLIC_KEY_HEX,
 }];
 
+/// Key id + public key for the **local-catalog development signing key**.
+///
+/// A local/`file://`/filesystem catalog source is only ever reached through an
+/// explicit `catalog_url` override (CLI `--catalog-url`, `OPENASR_CATALOG_URL`,
+/// or the server's equivalent) -- never the production HTTPS endpoint, the
+/// on-disk cache tier, or the embedded snapshot. Whoever supplies that catalog
+/// file already fully controls its contents, so this key adds no
+/// confidentiality; its only job is to force every local catalog through the
+/// same signature/sha256/catalog_url/schema checks a production catalog goes
+/// through, closing the "a local path skips verification entirely" bypass.
+///
+/// The seed is therefore intentionally NOT secret: it is the deterministic
+/// `sha256` of a fixed public label (see [`LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX`]),
+/// so any contributor can re-derive it without a shared secret. This key is
+/// added ONLY to [`OPENASR_LOCAL_CATALOG_TRUST_ROOTS`], never to
+/// [`OPENASR_CATALOG_TRUST_ROOTS`] -- a widely-known dev key must never be
+/// able to validate an HTTPS/cached/embedded production catalog.
+pub const CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID: &str = "openasr-catalog-local-dev-v1";
+const OPENASR_CATALOG_LOCAL_DEV_PUBLIC_KEY_HEX: &str =
+    "bc1306d4cc4a1cbc817a862ee0223713ff79208c39bc8ce732da851db3c6b6a1";
+
+/// The deterministic, publicly documented seed behind
+/// [`CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID`] --
+/// `sha256("openasr.catalog_manifest.v1.local-dev-signing-key-seed")`. Not a
+/// secret (see the trust-root doc comment above); exposed so tooling/tests can
+/// sign a local/dev catalog without touching the production signing seed.
+pub const LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX: &str =
+    "7181d685f3c226e1c111574368512b603d67964c057165ad004683b84998960e";
+
+/// Trust roots accepted for a LOCAL (`file://` / bare filesystem path) catalog
+/// source: the production key (so a local copy of the real, committed catalog
+/// and its production signature still verifies) plus the public local-dev key
+/// above. Never used for an `https://` source; see
+/// [`verify_local_catalog_signature_manifest`].
+pub const OPENASR_LOCAL_CATALOG_TRUST_ROOTS: &[CatalogTrustRoot] = &[
+    CatalogTrustRoot {
+        key_id: CATALOG_SIGNATURE_KEY_ID,
+        public_key_hex: OPENASR_CATALOG_V1_PUBLIC_KEY_HEX,
+    },
+    CatalogTrustRoot {
+        key_id: CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+        public_key_hex: OPENASR_CATALOG_LOCAL_DEV_PUBLIC_KEY_HEX,
+    },
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogSignatureManifest {
@@ -202,6 +247,24 @@ pub fn verify_catalog_signature_manifest(
     )
 }
 
+/// Like [`verify_catalog_signature_manifest`], but for a LOCAL (`file://` /
+/// bare filesystem path) catalog source: trusts the production key or the
+/// public local-dev key (see [`OPENASR_LOCAL_CATALOG_TRUST_ROOTS`]). Never use
+/// this for an `https://`/embedded/cached-network source -- that must stay
+/// scoped to [`verify_catalog_signature_manifest`]'s production-only roots.
+pub fn verify_local_catalog_signature_manifest(
+    catalog_contents: &str,
+    manifest_contents: &str,
+    expected_catalog_url: &str,
+) -> Result<VerifiedCatalogSignature, CatalogSecurityError> {
+    verify_catalog_signature_manifest_with_roots(
+        catalog_contents,
+        manifest_contents,
+        expected_catalog_url,
+        OPENASR_LOCAL_CATALOG_TRUST_ROOTS,
+    )
+}
+
 pub(crate) fn verify_catalog_signature_manifest_with_roots(
     catalog_contents: &str,
     manifest_contents: &str,
@@ -285,6 +348,88 @@ pub(crate) fn enforce_catalog_epoch(
         });
     }
     Ok(())
+}
+
+/// Whether a signature verified under `key_id` participates in the shared,
+/// cross-source anti-rollback epoch floor (`enforce_catalog_epoch_for_verified`
+/// / `record_catalog_epoch_for_verified`).
+///
+/// Scoped to the production key only. The local-dev key is public and
+/// self-signed by definition (see the doc comment on
+/// [`CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID`]), so a dev-key-verified local catalog
+/// must never touch the shared floor: not to advance it, and not to be
+/// rejected by it. Without this gate, loading a single local catalog signed
+/// with the (widely-known, publicly derivable) dev key at a very high
+/// `catalog_epoch` would permanently raise the floor every production source
+/// (HTTPS, on-disk signed cache, and the embedded offline snapshot) is checked
+/// against, bricking all of them until an operator manually deleted
+/// `catalog.epoch` -- a persistent, self-inflicted DoS with no signing-key
+/// compromise required. The local dev workflow does not need the anti-rollback
+/// floor's protection in the first place: it is a developer signing content
+/// for their own preview, not a production distribution channel that needs
+/// protecting against a stale/rolled-back re-serve.
+pub(crate) fn participates_in_epoch_floor(key_id: &str) -> bool {
+    key_id != CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID
+}
+
+/// Runs [`enforce_catalog_epoch`] for `verified`, but only if its key
+/// [`participates_in_epoch_floor`]. Use this (not the raw `enforce_catalog_epoch`)
+/// at every catalog-load call site so the local-dev key can never be rejected
+/// by -- or, via [`record_catalog_epoch_for_verified`], advance -- the shared
+/// production floor.
+pub(crate) fn enforce_catalog_epoch_for_verified(
+    openasr_home: &Path,
+    verified: &VerifiedCatalogSignature,
+) -> Result<(), CatalogSecurityError> {
+    if !participates_in_epoch_floor(&verified.key_id) {
+        return Ok(());
+    }
+    enforce_catalog_epoch(openasr_home, verified.catalog_epoch)
+}
+
+/// Runs [`record_catalog_epoch`] for `verified`, but only if its key
+/// [`participates_in_epoch_floor`]. See [`enforce_catalog_epoch_for_verified`].
+pub(crate) fn record_catalog_epoch_for_verified(
+    openasr_home: &Path,
+    verified: &VerifiedCatalogSignature,
+) -> Result<(), CatalogSecurityError> {
+    if !participates_in_epoch_floor(&verified.key_id) {
+        return Ok(());
+    }
+    record_catalog_epoch(openasr_home, verified.catalog_epoch)
+}
+
+/// Classifies a catalog `catalog_url`/identity into the two trust domains a
+/// catalog signature can be verified under. This single classification is
+/// deliberately the ONE place that decides both (a) which trust roots a
+/// signature may be verified against (production-only for [`Remote`],
+/// additionally the public local-dev key for [`Local`] --
+/// [`CatalogSourceKind::Remote`]/[`CatalogSourceKind::Local`]) and (b), in
+/// `registry::read_catalog_source`, which transport reads the bytes. Routing
+/// both decisions through the same function means a future catalog source
+/// scheme cannot be added to one without also changing the other -- there is
+/// no second `starts_with` check to forget and leave classified as `Local`
+/// (and therefore local-dev-key-eligible) by omission.
+///
+/// [`Remote`]: CatalogSourceKind::Remote
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogSourceKind {
+    /// Fetched over the network (`https://`); only the production key may
+    /// sign it.
+    Remote,
+    /// Read from the local filesystem (`file://` or a bare path), OR an
+    /// identity that is not itself a network address (e.g. a caller-supplied
+    /// non-production `expected_catalog_url`); additionally accepts the
+    /// public local-dev key.
+    Local,
+}
+
+pub(crate) fn classify_catalog_identity(identity: &str) -> CatalogSourceKind {
+    if identity.starts_with("https://") {
+        CatalogSourceKind::Remote
+    } else {
+        CatalogSourceKind::Local
+    }
 }
 
 pub(crate) fn cache_catalog_manifest(
@@ -548,6 +693,73 @@ mod tests {
     }
 
     #[test]
+    fn local_dev_public_key_matches_its_documented_seed() {
+        // The dev seed is intentionally public (see the doc comment on
+        // `CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID`); pin the derivation so the
+        // committed public key and the committed seed can never silently drift
+        // apart from each other.
+        assert_eq!(
+            derive_catalog_public_key_hex(LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX).unwrap(),
+            OPENASR_CATALOG_LOCAL_DEV_PUBLIC_KEY_HEX
+        );
+    }
+
+    #[test]
+    fn local_catalog_trust_roots_include_the_production_key() {
+        // A local copy of the real, committed catalog + its production
+        // signature must still verify through the local trust-root set.
+        assert!(
+            OPENASR_LOCAL_CATALOG_TRUST_ROOTS
+                .iter()
+                .any(|root| root.key_id == CATALOG_SIGNATURE_KEY_ID
+                    && root.public_key_hex == OPENASR_CATALOG_V1_PUBLIC_KEY_HEX)
+        );
+    }
+
+    #[test]
+    fn local_dev_signed_manifest_verifies_through_local_roots() {
+        let catalog = r#"{"schema_version":1,"models":[]}"#;
+        let source = "file:///tmp/local-catalog.json";
+        let manifest = render_catalog_signature_manifest(
+            catalog,
+            source,
+            7,
+            CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+            LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
+        )
+        .unwrap();
+
+        let verified = verify_local_catalog_signature_manifest(catalog, &manifest, source).unwrap();
+        assert_eq!(verified.catalog_epoch, 7);
+        assert_eq!(verified.key_id, CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID);
+    }
+
+    #[test]
+    fn local_dev_signed_manifest_never_verifies_as_a_production_catalog() {
+        // The whole point of keeping the dev key out of
+        // `OPENASR_CATALOG_TRUST_ROOTS`: a widely-known dev key must never
+        // authorize an HTTPS/embedded/cached production catalog.
+        let catalog = r#"{"schema_version":1,"models":[]}"#;
+        let source = "https://catalog.openasr.org/v1/catalog.json";
+        let manifest = render_catalog_signature_manifest(
+            catalog,
+            source,
+            7,
+            CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+            LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
+        )
+        .unwrap();
+
+        let error = verify_catalog_signature_manifest(catalog, &manifest, source)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Unknown catalog signature key id"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn epoch_guard_rejects_rollback() {
         let temp = tempfile::tempdir().unwrap();
         record_catalog_epoch(temp.path(), 10).unwrap();
@@ -557,5 +769,91 @@ mod tests {
             .to_string();
 
         assert!(error.contains("rollback"));
+    }
+
+    #[test]
+    fn only_the_production_key_participates_in_the_epoch_floor() {
+        // B1 unit guard: the gate the higher-level `registry.rs` call sites
+        // rely on to keep a dev-key-verified local catalog out of the shared
+        // anti-rollback floor.
+        assert!(participates_in_epoch_floor(CATALOG_SIGNATURE_KEY_ID));
+        assert!(!participates_in_epoch_floor(
+            CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID
+        ));
+        assert!(participates_in_epoch_floor("some-unrelated-key"));
+    }
+
+    #[test]
+    fn enforce_and_record_for_verified_skip_the_floor_for_the_dev_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let dev_verified = VerifiedCatalogSignature {
+            catalog_epoch: u64::MAX,
+            catalog_sha256: "0".repeat(64),
+            key_id: CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID.to_string(),
+        };
+
+        // Recording a dev-key verification must not create the shared epoch
+        // file at all.
+        record_catalog_epoch_for_verified(temp.path(), &dev_verified).unwrap();
+        assert!(!default_catalog_epoch_path(temp.path()).exists());
+
+        // A production catalog at a low epoch must not be rejected as a
+        // rollback against the dev catalog's (never persisted) high epoch.
+        let production_verified = VerifiedCatalogSignature {
+            catalog_epoch: 1,
+            catalog_sha256: "0".repeat(64),
+            key_id: CATALOG_SIGNATURE_KEY_ID.to_string(),
+        };
+        enforce_catalog_epoch_for_verified(temp.path(), &production_verified)
+            .expect("no floor was ever recorded, so epoch 1 must be accepted");
+    }
+
+    #[test]
+    fn enforce_and_record_for_verified_still_apply_the_floor_for_the_production_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let high = VerifiedCatalogSignature {
+            catalog_epoch: 10,
+            catalog_sha256: "0".repeat(64),
+            key_id: CATALOG_SIGNATURE_KEY_ID.to_string(),
+        };
+        record_catalog_epoch_for_verified(temp.path(), &high).unwrap();
+        assert_eq!(
+            read_catalog_epoch(&default_catalog_epoch_path(temp.path())).unwrap(),
+            Some(10)
+        );
+
+        let low = VerifiedCatalogSignature {
+            catalog_epoch: 9,
+            catalog_sha256: "0".repeat(64),
+            key_id: CATALOG_SIGNATURE_KEY_ID.to_string(),
+        };
+        let error = enforce_catalog_epoch_for_verified(temp.path(), &low)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rollback"), "{error}");
+    }
+
+    #[test]
+    fn classify_catalog_identity_only_treats_https_as_remote() {
+        // S2 unit guard: this single classification is what both
+        // `registry::read_catalog_source` (transport) and
+        // `registry::verify_catalog_manifest_for_source` (trust roots) must
+        // consult, so they can never drift apart on a new scheme.
+        assert_eq!(
+            classify_catalog_identity("https://catalog.openasr.org/v1/catalog.json"),
+            CatalogSourceKind::Remote
+        );
+        assert_eq!(
+            classify_catalog_identity("file:///tmp/catalog.json"),
+            CatalogSourceKind::Local
+        );
+        assert_eq!(
+            classify_catalog_identity("/tmp/catalog.json"),
+            CatalogSourceKind::Local
+        );
+        assert_eq!(
+            classify_catalog_identity("http://catalog.openasr.org/v1/catalog.json"),
+            CatalogSourceKind::Local
+        );
     }
 }

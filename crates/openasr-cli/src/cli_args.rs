@@ -237,7 +237,13 @@ pub(crate) enum Command {
         /// Runtime pack path to parse.
         path: PathBuf,
     },
-    /// Internal helper for release catalog signature manifests.
+    /// Internal helper for release AND local/dev catalog signature manifests.
+    /// A local `--catalog-url file://...` catalog now requires the same
+    /// signed `catalog.signature.json` sidecar a production catalog does; use
+    /// `--key-id openasr-catalog-local-dev-v1` with
+    /// `OPENASR_CATALOG_SIGNING_KEY_SEED_HEX` set to
+    /// `openasr_core::LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX` (documented, not
+    /// secret) to sign a local preview catalog instead of the real release.
     #[command(name = "__openasr-sign-catalog-manifest", hide = true)]
     SignCatalogManifest {
         /// Catalog JSON file to sign.
@@ -251,7 +257,9 @@ pub(crate) enum Command {
         /// Override catalog_url from the catalog JSON.
         #[arg(long)]
         catalog_url: Option<String>,
-        /// Signature key id.
+        /// Signature key id: `openasr-catalog-v1` (production; needs the real
+        /// signing seed) or `openasr-catalog-local-dev-v1` (public dev key,
+        /// for local `--catalog-url file://...` previews only).
         #[arg(long, default_value = "openasr-catalog-v1")]
         key_id: String,
         /// Print the derived public key for the env signing seed and exit.

@@ -11,17 +11,18 @@ use clap::Parser;
 use openasr_core::api::backend::transcribe_with_mock_backend;
 use openasr_core::{
     AudioInputInfo, AudioInputIssue, AudioPreparationOptions, BackendKind, BatchFailure,
-    BatchOutput, BatchSummary, BenchmarkFormat, BenchmarkResult, CohereLocalSourceImportRequest,
-    ConfigKey, DEFAULT_BACKEND_ID, DEFAULT_MODEL_ID, ModelCard, NATIVE_RUNTIME_MODEL_ID_AUTO,
-    NativeBackend, OpenAsrConfig, PreparedAudioInput, Qwen3AsrLocalSourceImportRequest,
-    ResponseFormat, TranscriptionBackend, TranscriptionRequest, WhisperLocalSourceImportRequest,
-    atomic_write_text, config_path, convert_local_cohere_source_to_runtime_pack,
-    convert_local_qwen_source_to_runtime_pack, convert_local_whisper_hf_source_to_runtime_pack,
-    derive_catalog_public_key_hex, discover_batch_inputs, embedded_catalog_fingerprint,
-    load_config, openasr_home, parse_model_catalog, parse_model_ref, render_batch_summary,
-    render_benchmark, render_catalog_signature_manifest, resolve_registry_model_ref,
-    resolve_runtime_model_ref, runtime_registry, save_config,
-    validate_local_native_model_pack_path, verify_catalog_signature_manifest,
+    BatchOutput, BatchSummary, BenchmarkFormat, BenchmarkResult, CATALOG_SIGNATURE_KEY_ID,
+    CohereLocalSourceImportRequest, ConfigKey, DEFAULT_BACKEND_ID, DEFAULT_MODEL_ID, ModelCard,
+    NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend, OpenAsrConfig, PreparedAudioInput,
+    Qwen3AsrLocalSourceImportRequest, ResponseFormat, TranscriptionBackend, TranscriptionRequest,
+    WhisperLocalSourceImportRequest, atomic_write_text, config_path,
+    convert_local_cohere_source_to_runtime_pack, convert_local_qwen_source_to_runtime_pack,
+    convert_local_whisper_hf_source_to_runtime_pack, derive_catalog_public_key_hex,
+    discover_batch_inputs, embedded_catalog_fingerprint, load_config, openasr_home,
+    parse_model_catalog, parse_model_ref, render_batch_summary, render_benchmark,
+    render_catalog_signature_manifest, resolve_registry_model_ref, resolve_runtime_model_ref,
+    runtime_registry, save_config, validate_local_native_model_pack_path,
+    verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
 };
 
 mod bench_suite_cli;
@@ -487,10 +488,20 @@ fn sign_catalog_manifest_command(
         &signing_key_seed_hex,
     )
     .context("Could not render catalog signature manifest")?;
-    verify_catalog_signature_manifest(&catalog_contents, &manifest, &resolved_catalog_url)
-        .context(
-            "Rendered catalog signature manifest did not verify against the built-in public key",
-        )?;
+    // The production trust root (`openasr-catalog-v1`) self-verifies against
+    // only the production public key; any other key id -- e.g. the public
+    // `openasr-catalog-local-dev-v1` dev key used to sign a local/preview
+    // catalog for `--catalog-url file://...` -- self-verifies against the
+    // wider local trust-root set instead, so this command stays usable for
+    // both the real release signing flow and local dev catalog previews.
+    let self_verify = if key_id == CATALOG_SIGNATURE_KEY_ID {
+        verify_catalog_signature_manifest(&catalog_contents, &manifest, &resolved_catalog_url)
+    } else {
+        verify_local_catalog_signature_manifest(&catalog_contents, &manifest, &resolved_catalog_url)
+    };
+    self_verify.context(
+        "Rendered catalog signature manifest did not verify against a known trust root for this key id",
+    )?;
 
     if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
