@@ -233,6 +233,7 @@ fn write_moonshine_pull_fixture(
         openasr_server::DistributionRuntime {
             openasr_home: Some(root.join("home")),
             catalog_url: Some(format!("file://{}", catalog_path.display())),
+            catalog_local_override: None,
         },
     )
 }
@@ -589,6 +590,7 @@ async fn config_endpoint_roundtrips_versioned_preferences() {
     let distribution = openasr_server::DistributionRuntime {
         openasr_home: Some(temp.path().join("home")),
         catalog_url: None,
+        catalog_local_override: None,
     };
     let home = distribution.openasr_home.as_ref().unwrap().clone();
     let app = openasr_server::app_with_runtime_and_distribution(
@@ -661,6 +663,7 @@ async fn config_endpoint_rejects_invalid_whole_object_update() {
     let distribution = openasr_server::DistributionRuntime {
         openasr_home: Some(temp.path().join("home")),
         catalog_url: None,
+        catalog_local_override: None,
     };
     let app = openasr_server::app_with_runtime_and_distribution(
         openasr_server::ServerRuntime::default(),
@@ -700,6 +703,7 @@ async fn preferences_only_put_preserves_daemon_managed_config() {
     let distribution = openasr_server::DistributionRuntime {
         openasr_home: Some(temp.path().join("home")),
         catalog_url: None,
+        catalog_local_override: None,
     };
     let app = openasr_server::app_with_runtime_and_distribution(
         openasr_server::ServerRuntime::default(),
@@ -772,6 +776,7 @@ async fn preferences_only_put_merges_partial_preferences() {
     let distribution = openasr_server::DistributionRuntime {
         openasr_home: Some(temp.path().join("home")),
         catalog_url: None,
+        catalog_local_override: None,
     };
     let home = distribution.openasr_home.as_ref().unwrap().clone();
     let app = openasr_server::app_with_runtime_and_distribution(
@@ -854,6 +859,7 @@ async fn capabilities_endpoint_exposes_transcription_capability_contract() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(temp.path().to_path_buf()),
             catalog_url: None,
+            catalog_local_override: None,
         },
     )
     .oneshot(
@@ -949,6 +955,7 @@ async fn config_endpoint_reports_malformed_stored_config_as_server_error() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(home),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
 
@@ -979,6 +986,7 @@ async fn transcription_degrades_to_defaults_when_stored_config_is_malformed() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(home),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
 
@@ -1016,6 +1024,7 @@ async fn native_transcription_without_installed_model_fails_closed_and_never_dow
         openasr_server::DistributionRuntime {
             openasr_home: Some(home.clone()),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
 
@@ -1079,6 +1088,7 @@ async fn daemon_starts_and_reports_ready_with_zero_models_installed() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(home),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
 
@@ -1158,6 +1168,7 @@ async fn transcription_succeeds_when_history_cannot_be_recorded() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(home),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
 
@@ -1977,6 +1988,7 @@ async fn speaker_routes_require_operator_credentials_for_paired_devices() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(temp.path().join("home")),
             catalog_url: None,
+            catalog_local_override: None,
         },
         openasr_server::ServerLaunchOptions {
             auth: openasr_server::ServerAuth::pairing("admin-secret"),
@@ -2022,6 +2034,7 @@ async fn speaker_routes_list_rename_and_delete_profiles() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(home),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
 
@@ -2103,6 +2116,7 @@ async fn speaker_enrollment_routes_reject_short_silent_and_missing_pack() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(home.clone()),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
 
@@ -2177,6 +2191,7 @@ async fn speaker_reenroll_fails_closed_when_embedder_pack_is_missing() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(home.clone()),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
 
@@ -2979,6 +2994,7 @@ async fn transcriptions_returns_mock_json_by_default() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(temp.path().join("home")),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
     let request = multipart_request("whisper-large-v3-turbo", "sample.wav", b"not a real wav");
@@ -3008,6 +3024,7 @@ async fn transcriptions_accept_filename_with_cjk_characters_and_space() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(temp.path().join("home")),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
     let request = multipart_request(
@@ -3041,6 +3058,7 @@ async fn transcriptions_accept_upload_past_old_64mb_limit() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(temp.path().join("home")),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
     let past_old_limit = vec![0u8; 65 * 1024 * 1024];
@@ -3076,6 +3094,7 @@ async fn transcriptions_reject_upload_past_body_limit_with_clear_message() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(temp.path().join("home")),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
     // Mirrors `MAX_TRANSCRIPTION_UPLOAD_BYTES` in `lib.rs`; kept in sync by
@@ -3154,6 +3173,7 @@ async fn transcriptions_large_upload_memory_stays_bounded() {
             openasr_server::DistributionRuntime {
                 openasr_home: Some(temp.path().join("home")),
                 catalog_url: None,
+                catalog_local_override: None,
             },
         )
     };
@@ -3279,6 +3299,7 @@ async fn transcriptions_accept_word_timestamp_granularity_for_json() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(temp.path().join("home")),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
     let request = multipart_request_with_extra_fields(
@@ -3322,6 +3343,7 @@ async fn transcriptions_record_file_history_in_sqlite_store() {
     let distribution = openasr_server::DistributionRuntime {
         openasr_home: Some(temp.path().join("home")),
         catalog_url: None,
+        catalog_local_override: None,
     };
     let home = distribution.openasr_home.as_ref().unwrap().clone();
     // History recording is governed by history_retention alone; auto_save
@@ -3492,6 +3514,7 @@ async fn transcriptions_skip_file_history_when_retention_off() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(home.clone()),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
 
@@ -3569,6 +3592,7 @@ async fn history_list_supports_search_pagination_and_kind_filter() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(home),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
     let list = |uri: String| {
@@ -3668,6 +3692,7 @@ async fn history_routes_report_errors_for_corrupt_database_without_crashing() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(home),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
 
@@ -3709,6 +3734,7 @@ async fn static_bearer_remote_compute_transcription_records_server_history() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(temp.path().join("home")),
             catalog_url: None,
+            catalog_local_override: None,
         },
         openasr_server::ServerLaunchOptions {
             auth: openasr_server::ServerAuth::bearer("remote-secret"),
@@ -3755,6 +3781,7 @@ async fn paired_device_remote_compute_transcription_skips_history_and_honors_rev
         openasr_server::DistributionRuntime {
             openasr_home: Some(temp.path().join("home")),
             catalog_url: None,
+            catalog_local_override: None,
         },
         openasr_server::ServerLaunchOptions {
             auth: openasr_server::ServerAuth::pairing("admin-secret"),
@@ -3827,6 +3854,7 @@ async fn remote_compute_header_without_auth_still_records_server_history() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(temp.path().join("home")),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
 
@@ -3876,6 +3904,7 @@ async fn transcriptions_mock_backend_formats_match_core_renderers() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(temp.path().join("home")),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
     let wav_bytes = b"not a real wav";
@@ -4300,6 +4329,7 @@ async fn stream_transcription_succeeds_when_history_cannot_be_recorded() {
         openasr_server::DistributionRuntime {
             openasr_home: Some(home),
             catalog_url: None,
+            catalog_local_override: None,
         },
     );
     let wav_bytes = sample_wav_bytes();
@@ -4336,6 +4366,7 @@ async fn static_bearer_remote_compute_stream_transcription_records_server_histor
         openasr_server::DistributionRuntime {
             openasr_home: Some(temp.path().join("home")),
             catalog_url: None,
+            catalog_local_override: None,
         },
         openasr_server::ServerLaunchOptions {
             auth: openasr_server::ServerAuth::bearer("remote-secret"),

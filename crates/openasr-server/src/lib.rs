@@ -51,16 +51,17 @@ pub use openasr_core::pairing_safety_code_for_certificate_fingerprint;
 use openasr_core::realtime::history::{DaemonHistoryEntry, DaemonHistoryStoreError};
 use openasr_core::{
     AudioPreparationError, BackendKind, CatalogError, CatalogMirror, CatalogPullRequest,
-    InstalledPack, LaunchPackRequest, LicenseClass, OpenAsrHomeError, PullError,
+    InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog, OpenAsrHomeError, PullError,
     PullModelPackRequest, PullProgress, QuantPreference, RealtimeBackendCapabilities,
     ResolvedCatalogPull, certificate_fingerprint_sha256, default_pack_pointer_path,
     host_quant_recommendation_profile, install_catalog_model_pack_from_path,
-    install_model_pack_from_path, list_installed_packs, load_config, load_model_catalog,
+    install_model_pack_from_path, list_installed_packs, load_config,
+    load_local_catalog_file_with_identity, load_model_catalog,
     native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, openasr_home, persist_default_pack_pointer,
     read_default_pack_pointer, remove_model_pack, resolve_catalog_pull,
     resolve_installed_pack_reference, resolve_installed_pack_reference_with_catalog,
-    resolve_launch_pack, runtime_registry, save_default_model_selection,
+    resolve_launch_pack, resolve_runtime_catalog, runtime_registry, save_default_model_selection,
 };
 use rcgen::{Certificate, CertificateParams};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -1207,10 +1208,94 @@ impl ServerRuntime {
     }
 }
 
+/// Where to load the runtime model catalog from: either a URL/path string
+/// used as both fetch source and verification identity (the pre-existing
+/// `OPENASR_CATALOG_URL` / `--catalog-url` behavior), or a local file whose
+/// bytes and verification identity are supplied separately (the
+/// `OPENASR_CATALOG_FILE` + `OPENASR_CATALOG_IDENTITY` pair, resolved by the
+/// shared [`openasr_core::resolve_local_catalog_env_override`] and also used
+/// by `openasr-cli`'s startup catalog resolution). See
+/// [`openasr_core::LocalCatalogEnvOverride`]'s doc comment for why the split
+/// exists.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CatalogSource<'a> {
+    Url(&'a str),
+    LocalFile { path: &'a Path, identity: &'a str },
+}
+
+/// Loads the catalog for an explicit [`CatalogSource`], routing a `LocalFile`
+/// source through [`load_local_catalog_file_with_identity`] (bytes from
+/// `path`, signature checked against `identity`) and a `Url` source through
+/// the existing [`load_model_catalog`] (fetch + verify against the same
+/// string), unchanged from today's behavior.
+pub(crate) fn load_catalog_for_source(
+    source: CatalogSource<'_>,
+    home: &Path,
+) -> Result<ModelCatalog, CatalogError> {
+    match source {
+        CatalogSource::Url(url) => load_model_catalog(Some(url), home),
+        CatalogSource::LocalFile { path, identity } => {
+            load_local_catalog_file_with_identity(path, identity, home)
+        }
+    }
+}
+
+/// Same as [`load_catalog_for_source`], but `None` falls back to
+/// [`load_model_catalog`]'s own default-catalog resolution (network/cache/
+/// embedded) instead of skipping the load -- for call sites that always need
+/// *some* catalog, matching the pre-existing `load_model_catalog(catalog_url,
+/// home)` behavior when `catalog_url` was `None`.
+pub(crate) fn load_catalog_for_optional_source(
+    source: Option<CatalogSource<'_>>,
+    home: &Path,
+) -> Result<ModelCatalog, CatalogError> {
+    match source {
+        Some(source) => load_catalog_for_source(source, home),
+        None => load_model_catalog(None, home),
+    }
+}
+
+/// Same split as [`load_catalog_for_source`], but for the
+/// [`resolve_runtime_catalog`] (network/cache tier + embedded-epoch-max
+/// floor) resolution path rather than the plain network/cache
+/// [`load_model_catalog`] one. A `LocalFile` override is authoritative on its
+/// own -- like an explicit non-default URL override already is in
+/// `resolve_runtime_catalog` -- so it is loaded directly without the embedded
+/// epoch-max comparison.
+pub(crate) fn resolve_runtime_catalog_for_source(
+    source: CatalogSource<'_>,
+    home: &Path,
+) -> Result<ModelCatalog, CatalogError> {
+    match source {
+        CatalogSource::Url(url) => resolve_runtime_catalog(Some(url), home),
+        CatalogSource::LocalFile { path, identity } => {
+            load_local_catalog_file_with_identity(path, identity, home)
+        }
+    }
+}
+
+/// Reads the `OPENASR_CATALOG_FILE` + `OPENASR_CATALOG_IDENTITY` env var pair
+/// via the shared [`openasr_core::resolve_local_catalog_env_override`],
+/// surfacing a half-configured pair as a stderr warning (rather than silently
+/// dropping half the config) so the misconfiguration is visible instead of
+/// quietly changing trust behavior.
+fn catalog_local_override_from_env() -> Option<openasr_core::LocalCatalogEnvOverride> {
+    let (override_, warning) = openasr_core::resolve_local_catalog_env_override();
+    if let Some(warning) = warning {
+        eprintln!("warning: {warning} Falling back to OPENASR_CATALOG_URL / the default catalog.");
+    }
+    override_
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistributionRuntime {
     pub openasr_home: Option<PathBuf>,
     pub catalog_url: Option<String>,
+    /// Explicit local-file + declared-identity catalog override; see
+    /// [`openasr_core::LocalCatalogEnvOverride`]. Takes precedence over
+    /// `catalog_url` when set (see `DistributionContext::catalog_source`);
+    /// `catalog_url`'s behavior is otherwise completely unchanged.
+    pub catalog_local_override: Option<openasr_core::LocalCatalogEnvOverride>,
 }
 
 impl Default for DistributionRuntime {
@@ -1220,6 +1305,7 @@ impl Default for DistributionRuntime {
             catalog_url: env::var("OPENASR_CATALOG_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
+            catalog_local_override: catalog_local_override_from_env(),
         }
     }
 }
@@ -1283,8 +1369,14 @@ impl DistributionContext {
             .map_err(ApiError::Home)
     }
 
-    fn catalog_url(&self) -> Option<&str> {
-        self.runtime.catalog_url.as_deref()
+    pub(crate) fn catalog_source(&self) -> Option<CatalogSource<'_>> {
+        if let Some(local) = &self.runtime.catalog_local_override {
+            return Some(CatalogSource::LocalFile {
+                path: &local.path,
+                identity: &local.identity,
+            });
+        }
+        self.runtime.catalog_url.as_deref().map(CatalogSource::Url)
     }
 
     fn next_job_id(&self) -> String {
@@ -1726,8 +1818,8 @@ async fn catalog(
 ) -> Result<Json<openasr_core::ModelCatalog>, ApiError> {
     distribution.ensure_restart_resumes_started();
     let home = distribution.openasr_home()?;
-    let catalog =
-        load_model_catalog(distribution.catalog_url(), &home).map_err(ApiError::Catalog)?;
+    let catalog = load_catalog_for_optional_source(distribution.catalog_source(), &home)
+        .map_err(ApiError::Catalog)?;
     Ok(Json(catalog))
 }
 

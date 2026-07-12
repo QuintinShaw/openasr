@@ -1209,6 +1209,69 @@ fn local_catalog_auto_discovery_accepts_the_real_production_signed_catalog() {
 }
 
 #[test]
+fn bundled_production_catalog_loaded_via_file_url_as_identity_is_rejected() {
+    // Reproduces the 0.1.13 desktop packaging regression: the exact
+    // committed, production-signed `model-registry/catalog.json` +
+    // `catalog.signature.json` pair -- byte-for-byte what desktop copies into
+    // `Contents/Resources` -- loaded through `load_model_catalog` with its
+    // install-path `file://` URL used as BOTH the fetch source AND the
+    // expected verification identity. The signature is bound to the
+    // production `https://catalog.openasr.org/v1/catalog.json` identity, not
+    // to an incidental local install path, so this MUST reject -- this is
+    // exactly the crash desktop hit (`sidecar.rs`'s `resolve_catalog_url`
+    // building `OPENASR_CATALOG_URL=file:///Applications/.../catalog.json`).
+    // See `bundled_production_catalog_via_declared_identity_loads` for the
+    // fix: same bytes, declared identity decoupled from the file path.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry");
+    let temp = tempfile::tempdir().unwrap();
+    let catalog_path = temp.path().join("catalog.json");
+    let home = temp.path().join("home");
+    fs::copy(root.join("catalog.json"), &catalog_path).unwrap();
+    fs::copy(
+        root.join(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        catalog_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+    )
+    .unwrap();
+
+    let file_url = format!("file://{}", catalog_path.display());
+    let error = load_model_catalog(Some(&file_url), &home)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Catalog signature manifest URL mismatch"),
+        "{error}"
+    );
+}
+
+#[test]
+fn bundled_production_catalog_via_declared_identity_loads() {
+    // The fix side of the regression above: the SAME bundled bytes, loaded
+    // through `load_local_catalog_file_with_identity` with the bytes read
+    // from the local file but the verification identity declared explicitly
+    // as the real production URL (what the new
+    // OPENASR_CATALOG_FILE/OPENASR_CATALOG_IDENTITY server wiring does) --
+    // this must succeed. This is the same call
+    // `local_catalog_auto_discovery_accepts_the_real_production_signed_catalog`
+    // already exercises for the CLI's repo-checkout auto-discovery path;
+    // restated here under the desktop-bundling scenario's naming for
+    // traceability to the regression this PR fixes.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry");
+    let temp = tempfile::tempdir().unwrap();
+    let catalog_path = temp.path().join("catalog.json");
+    let home = temp.path().join("home");
+    fs::copy(root.join("catalog.json"), &catalog_path).unwrap();
+    fs::copy(
+        root.join(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        catalog_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+    )
+    .unwrap();
+
+    let catalog = load_local_catalog_file_with_identity(&catalog_path, DEFAULT_CATALOG_URL, &home)
+        .expect("bundled catalog bytes + declared production identity must verify");
+    assert!(!catalog.models.is_empty());
+}
+
+#[test]
 fn local_catalog_file_with_identity_accepts_dev_key_for_a_non_production_identity() {
     // `load_local_catalog_file_with_identity` also supports a non-production
     // expected identity (any future caller besides the production-identity

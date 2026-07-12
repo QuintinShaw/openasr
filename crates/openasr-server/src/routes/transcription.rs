@@ -15,8 +15,8 @@ use openasr_core::{
     ResponseFormat, RuntimeModelResolutionError, TranscriptionRequest, TranscriptionTask,
     add_segment_word_timestamps, config::MAX_INFERENCE_THREADS,
     native_runtime_model_adapter_for_path, parse_model_ref, prepare_audio_input,
-    render_transcription, resolve_local_native_runtime_model_identity, resolve_runtime_catalog,
-    resolve_runtime_model_ref, runtime_registry,
+    render_transcription, resolve_local_native_runtime_model_identity, resolve_runtime_model_ref,
+    runtime_registry,
 };
 
 use crate::*;
@@ -247,7 +247,7 @@ async fn run_offline_transcription(
     task_override: Option<TranscriptionTask>,
 ) -> Result<Response, ApiError> {
     let home = distribution.openasr_home()?;
-    let catalog = load_runtime_model_catalog(distribution.catalog_url(), &home)?;
+    let catalog = load_runtime_model_catalog(distribution.catalog_source(), &home)?;
     let mut parsed =
         parse_transcription_multipart(multipart, runtime.backend, catalog.as_ref()).await?;
     if parsed.stream_form_field {
@@ -802,11 +802,11 @@ pub(crate) async fn parse_transcription_multipart(
 // ── Model catalog / resolution helpers ───────────────────────────────────────
 
 pub(crate) fn load_runtime_model_catalog(
-    catalog_url: Option<&str>,
+    catalog_source: Option<CatalogSource<'_>>,
     home: &Path,
 ) -> Result<Option<openasr_core::ModelCatalog>, ApiError> {
-    catalog_url
-        .map(|url| resolve_runtime_catalog(Some(url), home).map_err(ApiError::Catalog))
+    catalog_source
+        .map(|source| resolve_runtime_catalog_for_source(source, home).map_err(ApiError::Catalog))
         .transpose()
 }
 
@@ -1018,6 +1018,7 @@ mod active_transcription_cleanup_tests {
         DistributionContext::new(DistributionRuntime {
             openasr_home: None,
             catalog_url: None,
+            catalog_local_override: None,
         })
     }
 

@@ -288,8 +288,8 @@ pub(crate) async fn start_pull_job(
     Json(request): Json<StartPullRequest>,
 ) -> Result<Response, ApiError> {
     let home = distribution.openasr_home()?;
-    let catalog =
-        load_model_catalog(distribution.catalog_url(), &home).map_err(ApiError::Catalog)?;
+    let catalog = load_catalog_for_optional_source(distribution.catalog_source(), &home)
+        .map_err(ApiError::Catalog)?;
     let resolved = resolve_catalog_pull(
         &catalog,
         &CatalogPullRequest {
