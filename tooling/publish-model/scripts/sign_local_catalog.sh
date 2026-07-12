@@ -15,17 +15,26 @@
 # Defaults:
 #   <catalog.json>   model-registry/catalog.json (repo-relative)
 #   --out            the catalog's own directory, i.e. <catalog.json's dir>/catalog.signature.json
-#   --catalog-url    the catalog JSON's own `catalog_url` field (normally
-#                     https://catalog.openasr.org/v1/catalog.json) -- this
-#                     matches the CLI's repo-checkout auto-discovery
-#                     (`openasr` run with no OPENASR_CATALOG_URL set finds
-#                     model-registry/catalog.json and verifies it against that
-#                     canonical identity, mirroring the binary's embedded
-#                     snapshot). Pass an explicit `file://<path>` here instead
-#                     if you plan to load the catalog via `--catalog-url`/
-#                     `OPENASR_CATALOG_URL` rather than the auto-discovery path.
+#   --catalog-url    `file://<absolute path to <catalog.json>>`. The dev key
+#                     is ONLY accepted for a non-production (local) identity
+#                     (see catalog_security::classify_catalog_identity /
+#                     docs/MODEL_CATALOG_ARCHITECTURE.md): the CLI's
+#                     repo-checkout auto-discovery of model-registry/catalog.json
+#                     verifies against the canonical production
+#                     `https://.../catalog.json` identity and requires the
+#                     real production signature, so a dev-signed manifest
+#                     bound to that identity would be rejected everywhere.
+#                     Load the dev-signed output of this script via an
+#                     explicit `OPENASR_CATALOG_URL=file://<path>` (or
+#                     `--catalog-url file://<path>`) override instead of
+#                     auto-discovery. Pass a different `--catalog-url` only if
+#                     you are intentionally signing for some other explicit
+#                     local override path.
 #   --epoch          the epoch already recorded in model-registry/catalog.epoch,
-#                     or 1 if that file does not exist yet.
+#                     or 1 if that file does not exist yet. A dev-key-signed
+#                     manifest never advances (or is blocked by) the shared
+#                     $OPENASR_HOME/catalog.epoch anti-rollback floor, so any
+#                     positive value is safe to reuse across runs.
 #
 # Environment:
 #   OPENASR_LOCAL_CATALOG_SIGNING_KEY_SEED_HEX overrides the (public,
@@ -34,8 +43,9 @@
 # WARNING: model-registry/catalog.signature.json is git-tracked and normally
 # holds the REAL PRODUCTION signature (see publish_catalog.sh). Running this
 # script overwrites it locally with a dev-signed manifest so you can preview
-# catalog edits -- never commit that dev-signed file. Restore the real one
-# with `git checkout -- model-registry/catalog.signature.json` (or by rerunning
+# catalog edits via `OPENASR_CATALOG_URL=file://<path>` -- never commit that
+# dev-signed file. Restore the real one with
+# `git checkout -- model-registry/catalog.signature.json` (or by rerunning
 # publish_catalog.sh with the real signing seed) before committing anything else.
 set -euo pipefail
 
@@ -108,21 +118,27 @@ if [[ -z "$EPOCH" ]]; then
 fi
 [[ "$EPOCH" =~ ^[0-9]+$ && "$EPOCH" != "0" ]] || die "epoch must be a positive integer, got: $EPOCH"
 
-CATALOG_URL_ARGS=()
-if [[ -n "$CATALOG_URL" ]]; then
-  CATALOG_URL_ARGS=(--catalog-url "$CATALOG_URL")
+if [[ -z "$CATALOG_URL" ]]; then
+  # The dev key only verifies against a non-production (local) identity (see
+  # the --catalog-url doc comment above), so default to the literal
+  # `file://<absolute path>` of the catalog being signed -- NOT the catalog
+  # JSON's own `catalog_url` field, which is the production https identity
+  # and would produce a manifest that verifies nowhere.
+  CATALOG_DIR="$(cd "$(dirname "$CATALOG")" && pwd)"
+  CATALOG_URL="file://$CATALOG_DIR/$(basename "$CATALOG")"
 fi
+CATALOG_URL_ARGS=(--catalog-url "$CATALOG_URL")
 
 log "signing '$CATALOG' with the public local-dev key ($LOCAL_DEV_KEY_ID) at epoch $EPOCH"
-# `${arr[@]+"${arr[@]}"}` (not plain `${arr[@]}`) is required under `set -u` on
-# bash 3.2 (macOS's default /bin/bash): an empty array expands to an unbound
-# variable error otherwise. The explicit assignment overrides whatever
-# OPENASR_CATALOG_SIGNING_KEY_SEED_HEX may already be set to in this shell.
+log "catalog_url identity: $CATALOG_URL"
+# The explicit assignment overrides whatever OPENASR_CATALOG_SIGNING_KEY_SEED_HEX
+# may already be set to in this shell.
 OPENASR_CATALOG_SIGNING_KEY_SEED_HEX="$LOCAL_DEV_SEED" \
   cargo run --quiet -p openasr-cli -- __openasr-sign-catalog-manifest "$CATALOG" \
     --out "$OUT" --epoch "$EPOCH" --key-id "$LOCAL_DEV_KEY_ID" \
-    "${CATALOG_URL_ARGS[@]+"${CATALOG_URL_ARGS[@]}"}"
+    "${CATALOG_URL_ARGS[@]}"
 
 log "wrote dev-signed manifest: $OUT"
 log "reminder: this is a LOCAL preview signature -- never commit it; restore the"
 log "committed production manifest with 'git checkout -- $OUT' before committing anything else"
+log "load it with: OPENASR_CATALOG_URL='$CATALOG_URL' cargo run -p openasr-cli -- <command>"

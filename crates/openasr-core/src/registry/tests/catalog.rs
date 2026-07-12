@@ -1098,6 +1098,154 @@ fn local_catalog_source_fails_closed_on_catalog_url_mismatch() {
 }
 
 #[test]
+fn local_dev_catalog_epoch_never_advances_or_is_blocked_by_the_shared_production_floor() {
+    // B1 regression guard: a local catalog verified with the public dev key
+    // must never touch the shared, cross-source anti-rollback floor in
+    // $OPENASR_HOME/catalog.epoch. Before this fix, loading ONE dev-signed
+    // local catalog with an inflated epoch would permanently reject every
+    // subsequent production catalog load (network, on-disk cache, and the
+    // embedded offline snapshot) until an operator manually deleted
+    // catalog.epoch -- a persistent, self-inflicted DoS requiring no key
+    // compromise at all, since the dev seed is public and derivable by
+    // anyone (see the doc comment on `CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID`).
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let evil_path = temp.path().join("evil-catalog.json");
+    let contents = catalog_json();
+    let evil_url = format!("file://{}", evil_path.display());
+
+    fs::write(&evil_path, &contents).unwrap();
+    let manifest = catalog_security::render_catalog_signature_manifest(
+        &contents,
+        &evil_url,
+        u64::MAX,
+        catalog_security::CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+        catalog_security::LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
+    )
+    .unwrap();
+    fs::write(
+        evil_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        manifest,
+    )
+    .unwrap();
+
+    load_model_catalog(Some(&evil_url), &home)
+        .expect("a dev-signed local catalog at a non-production identity loads at any epoch");
+
+    assert!(
+        !catalog_security::default_catalog_epoch_path(&home).exists(),
+        "a dev-key-verified local catalog must never persist a shared epoch floor"
+    );
+
+    // A subsequent production-signed load (here: the offline embedded
+    // snapshot, whose real epoch is far below u64::MAX) must still succeed --
+    // it must not be rejected as a rollback against the dev catalog's epoch.
+    super::load_embedded_signed_catalog(&home).expect(
+        "the embedded production catalog must not be bricked by a prior dev-key local catalog",
+    );
+}
+
+#[test]
+fn local_catalog_auto_discovery_rejects_dev_key_bound_to_production_identity() {
+    // S1 regression guard: `load_local_catalog_file_with_identity` is the
+    // repo-checkout auto-discovery path, always called with the canonical
+    // production `DEFAULT_CATALOG_URL` identity (see `catalog_cli.rs`). A
+    // dev-key-signed manifest bound to that SAME identity must be rejected --
+    // otherwise any CWD containing an attacker-controlled
+    // model-registry/catalog.json + catalog.signature.json pair (no flag
+    // needed) could substitute itself for the canonical production catalog,
+    // since the dev signing key is public and derivable by anyone.
+    let temp = tempfile::tempdir().unwrap();
+    let catalog_path = temp.path().join("catalog.json");
+    let home = temp.path().join("home");
+    let contents = catalog_json();
+    fs::write(&catalog_path, &contents).unwrap();
+
+    let manifest = catalog_security::render_catalog_signature_manifest(
+        &contents,
+        DEFAULT_CATALOG_URL,
+        1,
+        catalog_security::CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+        catalog_security::LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
+    )
+    .unwrap();
+    fs::write(
+        catalog_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        manifest,
+    )
+    .unwrap();
+
+    let error = load_local_catalog_file_with_identity(&catalog_path, DEFAULT_CATALOG_URL, &home)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Unknown catalog signature key id"),
+        "{error}"
+    );
+}
+
+#[test]
+fn local_catalog_auto_discovery_accepts_the_real_production_signed_catalog() {
+    // Zero-impact check for the S1 fix: the committed, production-signed
+    // model-registry/catalog.json + catalog.signature.json pair -- exactly
+    // what the CLI's repo-checkout auto-discovery loads via
+    // `load_local_catalog_file_with_identity` -- must still verify once trust
+    // roots for the production identity are scoped to the production key
+    // only.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry");
+    let temp = tempfile::tempdir().unwrap();
+    let catalog_path = temp.path().join("catalog.json");
+    let home = temp.path().join("home");
+    fs::copy(root.join("catalog.json"), &catalog_path).unwrap();
+    fs::copy(
+        root.join(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        catalog_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+    )
+    .unwrap();
+
+    let catalog = load_local_catalog_file_with_identity(&catalog_path, DEFAULT_CATALOG_URL, &home)
+        .expect("the real committed production catalog + signature must still verify");
+    assert!(!catalog.models.is_empty());
+}
+
+#[test]
+fn local_catalog_file_with_identity_accepts_dev_key_for_a_non_production_identity() {
+    // `load_local_catalog_file_with_identity` also supports a non-production
+    // expected identity (any future caller besides the production-identity
+    // auto-discovery path currently in `catalog_cli.rs`) -- that case stays
+    // local-dev-key eligible, and (like every dev-key verification) never
+    // touches the shared epoch floor.
+    let temp = tempfile::tempdir().unwrap();
+    let catalog_path = temp.path().join("preview-catalog.json");
+    let home = temp.path().join("home");
+    let contents = catalog_json();
+    let identity = "file:///preview/staged-catalog.json";
+
+    fs::write(&catalog_path, &contents).unwrap();
+    let manifest = catalog_security::render_catalog_signature_manifest(
+        &contents,
+        identity,
+        3,
+        catalog_security::CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+        catalog_security::LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
+    )
+    .unwrap();
+    fs::write(
+        catalog_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        manifest,
+    )
+    .unwrap();
+
+    let catalog = load_local_catalog_file_with_identity(&catalog_path, identity, &home)
+        .expect("dev key must still verify a non-production expected identity");
+    assert_eq!(catalog.models.len(), 2);
+    assert!(
+        !catalog_security::default_catalog_epoch_path(&home).exists(),
+        "a dev-key-verified identity-decoupled load must not persist a shared epoch floor"
+    );
+}
+
+#[test]
 fn catalog_loader_falls_back_to_last_good_cache_when_local_source_is_tampered_without_resigning() {
     // Tampering with a local catalog's bytes WITHOUT re-signing must not be
     // silently accepted: the sha256 no longer matches the sidecar, so the

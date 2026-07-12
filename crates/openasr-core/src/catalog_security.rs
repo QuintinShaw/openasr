@@ -350,6 +350,88 @@ pub(crate) fn enforce_catalog_epoch(
     Ok(())
 }
 
+/// Whether a signature verified under `key_id` participates in the shared,
+/// cross-source anti-rollback epoch floor (`enforce_catalog_epoch_for_verified`
+/// / `record_catalog_epoch_for_verified`).
+///
+/// Scoped to the production key only. The local-dev key is public and
+/// self-signed by definition (see the doc comment on
+/// [`CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID`]), so a dev-key-verified local catalog
+/// must never touch the shared floor: not to advance it, and not to be
+/// rejected by it. Without this gate, loading a single local catalog signed
+/// with the (widely-known, publicly derivable) dev key at a very high
+/// `catalog_epoch` would permanently raise the floor every production source
+/// (HTTPS, on-disk signed cache, and the embedded offline snapshot) is checked
+/// against, bricking all of them until an operator manually deleted
+/// `catalog.epoch` -- a persistent, self-inflicted DoS with no signing-key
+/// compromise required. The local dev workflow does not need the anti-rollback
+/// floor's protection in the first place: it is a developer signing content
+/// for their own preview, not a production distribution channel that needs
+/// protecting against a stale/rolled-back re-serve.
+pub(crate) fn participates_in_epoch_floor(key_id: &str) -> bool {
+    key_id != CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID
+}
+
+/// Runs [`enforce_catalog_epoch`] for `verified`, but only if its key
+/// [`participates_in_epoch_floor`]. Use this (not the raw `enforce_catalog_epoch`)
+/// at every catalog-load call site so the local-dev key can never be rejected
+/// by -- or, via [`record_catalog_epoch_for_verified`], advance -- the shared
+/// production floor.
+pub(crate) fn enforce_catalog_epoch_for_verified(
+    openasr_home: &Path,
+    verified: &VerifiedCatalogSignature,
+) -> Result<(), CatalogSecurityError> {
+    if !participates_in_epoch_floor(&verified.key_id) {
+        return Ok(());
+    }
+    enforce_catalog_epoch(openasr_home, verified.catalog_epoch)
+}
+
+/// Runs [`record_catalog_epoch`] for `verified`, but only if its key
+/// [`participates_in_epoch_floor`]. See [`enforce_catalog_epoch_for_verified`].
+pub(crate) fn record_catalog_epoch_for_verified(
+    openasr_home: &Path,
+    verified: &VerifiedCatalogSignature,
+) -> Result<(), CatalogSecurityError> {
+    if !participates_in_epoch_floor(&verified.key_id) {
+        return Ok(());
+    }
+    record_catalog_epoch(openasr_home, verified.catalog_epoch)
+}
+
+/// Classifies a catalog `catalog_url`/identity into the two trust domains a
+/// catalog signature can be verified under. This single classification is
+/// deliberately the ONE place that decides both (a) which trust roots a
+/// signature may be verified against (production-only for [`Remote`],
+/// additionally the public local-dev key for [`Local`] --
+/// [`CatalogSourceKind::Remote`]/[`CatalogSourceKind::Local`]) and (b), in
+/// `registry::read_catalog_source`, which transport reads the bytes. Routing
+/// both decisions through the same function means a future catalog source
+/// scheme cannot be added to one without also changing the other -- there is
+/// no second `starts_with` check to forget and leave classified as `Local`
+/// (and therefore local-dev-key-eligible) by omission.
+///
+/// [`Remote`]: CatalogSourceKind::Remote
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogSourceKind {
+    /// Fetched over the network (`https://`); only the production key may
+    /// sign it.
+    Remote,
+    /// Read from the local filesystem (`file://` or a bare path), OR an
+    /// identity that is not itself a network address (e.g. a caller-supplied
+    /// non-production `expected_catalog_url`); additionally accepts the
+    /// public local-dev key.
+    Local,
+}
+
+pub(crate) fn classify_catalog_identity(identity: &str) -> CatalogSourceKind {
+    if identity.starts_with("https://") {
+        CatalogSourceKind::Remote
+    } else {
+        CatalogSourceKind::Local
+    }
+}
+
 pub(crate) fn cache_catalog_manifest(
     openasr_home: &Path,
     manifest_contents: &str,
@@ -687,5 +769,91 @@ mod tests {
             .to_string();
 
         assert!(error.contains("rollback"));
+    }
+
+    #[test]
+    fn only_the_production_key_participates_in_the_epoch_floor() {
+        // B1 unit guard: the gate the higher-level `registry.rs` call sites
+        // rely on to keep a dev-key-verified local catalog out of the shared
+        // anti-rollback floor.
+        assert!(participates_in_epoch_floor(CATALOG_SIGNATURE_KEY_ID));
+        assert!(!participates_in_epoch_floor(
+            CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID
+        ));
+        assert!(participates_in_epoch_floor("some-unrelated-key"));
+    }
+
+    #[test]
+    fn enforce_and_record_for_verified_skip_the_floor_for_the_dev_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let dev_verified = VerifiedCatalogSignature {
+            catalog_epoch: u64::MAX,
+            catalog_sha256: "0".repeat(64),
+            key_id: CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID.to_string(),
+        };
+
+        // Recording a dev-key verification must not create the shared epoch
+        // file at all.
+        record_catalog_epoch_for_verified(temp.path(), &dev_verified).unwrap();
+        assert!(!default_catalog_epoch_path(temp.path()).exists());
+
+        // A production catalog at a low epoch must not be rejected as a
+        // rollback against the dev catalog's (never persisted) high epoch.
+        let production_verified = VerifiedCatalogSignature {
+            catalog_epoch: 1,
+            catalog_sha256: "0".repeat(64),
+            key_id: CATALOG_SIGNATURE_KEY_ID.to_string(),
+        };
+        enforce_catalog_epoch_for_verified(temp.path(), &production_verified)
+            .expect("no floor was ever recorded, so epoch 1 must be accepted");
+    }
+
+    #[test]
+    fn enforce_and_record_for_verified_still_apply_the_floor_for_the_production_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let high = VerifiedCatalogSignature {
+            catalog_epoch: 10,
+            catalog_sha256: "0".repeat(64),
+            key_id: CATALOG_SIGNATURE_KEY_ID.to_string(),
+        };
+        record_catalog_epoch_for_verified(temp.path(), &high).unwrap();
+        assert_eq!(
+            read_catalog_epoch(&default_catalog_epoch_path(temp.path())).unwrap(),
+            Some(10)
+        );
+
+        let low = VerifiedCatalogSignature {
+            catalog_epoch: 9,
+            catalog_sha256: "0".repeat(64),
+            key_id: CATALOG_SIGNATURE_KEY_ID.to_string(),
+        };
+        let error = enforce_catalog_epoch_for_verified(temp.path(), &low)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rollback"), "{error}");
+    }
+
+    #[test]
+    fn classify_catalog_identity_only_treats_https_as_remote() {
+        // S2 unit guard: this single classification is what both
+        // `registry::read_catalog_source` (transport) and
+        // `registry::verify_catalog_manifest_for_source` (trust roots) must
+        // consult, so they can never drift apart on a new scheme.
+        assert_eq!(
+            classify_catalog_identity("https://catalog.openasr.org/v1/catalog.json"),
+            CatalogSourceKind::Remote
+        );
+        assert_eq!(
+            classify_catalog_identity("file:///tmp/catalog.json"),
+            CatalogSourceKind::Local
+        );
+        assert_eq!(
+            classify_catalog_identity("/tmp/catalog.json"),
+            CatalogSourceKind::Local
+        );
+        assert_eq!(
+            classify_catalog_identity("http://catalog.openasr.org/v1/catalog.json"),
+            CatalogSourceKind::Local
+        );
     }
 }
