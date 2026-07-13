@@ -1114,6 +1114,19 @@ async fn daemon_starts_and_reports_ready_with_zero_models_installed() {
         parsed["model_resident"], false,
         "nothing can be resident when no model is bound at all"
     );
+    // Additive debug-observability fields (see `HealthResponse`'s doc
+    // comments): with `model_pack_path: None`, `spawn_boot_native_warmup`
+    // returns immediately without ever entering the native activity
+    // tracker, so this fresh-in-process tracker reads deterministically
+    // zero on both.
+    assert_eq!(
+        parsed["native_active_count"], 0,
+        "nothing ever entered the native activity tracker when no model is bound"
+    );
+    assert_eq!(
+        parsed["idle_seconds"], 0,
+        "a tracker that has never seen any activity reads zero idle seconds, not stale/uninitialized"
+    );
 }
 
 #[tokio::test]
@@ -1151,6 +1164,19 @@ async fn health_reports_model_bound_but_not_resident_before_any_load() {
     assert_eq!(
         parsed["model_resident"], false,
         "a bound pack whose runtime has never been loaded this boot must not read resident"
+    );
+    // Additive debug-observability fields: unlike the zero-models-installed
+    // test above, a background boot warm-up is spawned here (even though it
+    // never completes a load in time to flip `model_resident`), so this only
+    // pins the wire shape/type -- not an exact count/duration, which would
+    // race the warm-up task's own scheduling.
+    assert!(
+        parsed["native_active_count"].is_u64(),
+        "native_active_count must serialize as a JSON number"
+    );
+    assert!(
+        parsed["idle_seconds"].is_u64(),
+        "idle_seconds must serialize as a JSON number"
     );
 }
 
@@ -2404,7 +2430,12 @@ async fn health_returns_identity_json_without_instance_token() {
         parsed["model_resident"], true,
         "the mock backend has no runtime to unload, so it reads resident whenever bound"
     );
-    assert_eq!(parsed.as_object().expect("health response object").len(), 6);
+    assert_eq!(
+        parsed.as_object().expect("health response object").len(),
+        8,
+        "status/server_version/pid/instance_token/model_installed/model_resident \
+         plus the 0.1.14 additive native_active_count/idle_seconds debug fields"
+    );
 }
 
 #[tokio::test]
@@ -2436,7 +2467,12 @@ async fn health_echoes_launch_instance_token_without_env() {
         parsed["instance_token"],
         serde_json::json!("launch-health-token")
     );
-    assert_eq!(parsed.as_object().expect("health response object").len(), 6);
+    assert_eq!(
+        parsed.as_object().expect("health response object").len(),
+        8,
+        "status/server_version/pid/instance_token/model_installed/model_resident \
+         plus the 0.1.14 additive native_active_count/idle_seconds debug fields"
+    );
 }
 
 #[tokio::test]
@@ -2470,7 +2506,12 @@ async fn health_prefers_env_instance_token_over_launch_option() {
         parsed["instance_token"],
         serde_json::json!("env-health-token")
     );
-    assert_eq!(parsed.as_object().expect("health response object").len(), 6);
+    assert_eq!(
+        parsed.as_object().expect("health response object").len(),
+        8,
+        "status/server_version/pid/instance_token/model_installed/model_resident \
+         plus the 0.1.14 additive native_active_count/idle_seconds debug fields"
+    );
 }
 
 #[tokio::test]

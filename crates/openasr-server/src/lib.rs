@@ -1773,6 +1773,8 @@ async fn health(
         instance_token: identity.instance_token.clone(),
         model_installed: runtime.has_model_bound(),
         model_resident: runtime.has_model_bound() && runtime.model_is_resident(),
+        native_active_count: idle_activity::native_activity_active_count() as u64,
+        idle_seconds: idle_activity::native_activity_idle_seconds(Instant::now()),
     })
 }
 
@@ -1944,6 +1946,25 @@ struct HealthResponse {
     /// absent in the pre-0.1.13 contract, so an older client that only reads
     /// `model_installed` keeps working unchanged.
     model_resident: bool,
+    /// Debug-observability field: the process-wide count of currently active
+    /// native requests/sessions (see the `idle_activity` module doc) --
+    /// in-flight offline transcriptions/translations and attached realtime
+    /// native-streaming sessions both count. Not gated on `model_installed`;
+    /// reads `0` on the mock backend and on a fresh install with no model
+    /// bound, since nothing ever enters the tracker there. Not a stable
+    /// health signal on its own -- a transient nonzero count during a single
+    /// request is normal, not a problem -- but useful when diagnosing why
+    /// `idle_unload` has not fired ("is a session still counted active?").
+    /// Additive: absent in the pre-0.1.14 contract.
+    native_active_count: u64,
+    /// Debug-observability field: seconds elapsed since the process-wide
+    /// native activity count last returned to zero, as of this response
+    /// (`0` while `native_active_count` is nonzero -- there is no
+    /// meaningful idle duration mid-request). Pairs with
+    /// `native_active_count` to diagnose `idle_unload` timing: compare
+    /// against the configured `idle_unload` threshold to see how close the
+    /// next sweep is. Additive: absent in the pre-0.1.14 contract.
+    idle_seconds: u64,
 }
 
 #[derive(Serialize)]
