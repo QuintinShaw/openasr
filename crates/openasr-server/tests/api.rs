@@ -1127,6 +1127,10 @@ async fn daemon_starts_and_reports_ready_with_zero_models_installed() {
         parsed["idle_seconds"], 0,
         "a tracker that has never seen any activity reads zero idle seconds, not stale/uninitialized"
     );
+    assert_eq!(
+        parsed["abandoned_worker_count"], 0,
+        "no decode worker has hung, so the fail-loud abandonment counter reads zero"
+    );
 }
 
 #[tokio::test]
@@ -1177,6 +1181,10 @@ async fn health_reports_model_bound_but_not_resident_before_any_load() {
     assert!(
         parsed["idle_seconds"].is_u64(),
         "idle_seconds must serialize as a JSON number"
+    );
+    assert!(
+        parsed["abandoned_worker_count"].is_u64(),
+        "abandoned_worker_count must serialize as a JSON number"
     );
 }
 
@@ -2432,9 +2440,10 @@ async fn health_returns_identity_json_without_instance_token() {
     );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        8,
+        9,
         "status/server_version/pid/instance_token/model_installed/model_resident \
-         plus the 0.1.14 additive native_active_count/idle_seconds debug fields"
+         plus the 0.1.14 additive native_active_count/idle_seconds and the 0.1.15 \
+         additive abandoned_worker_count debug fields"
     );
 }
 
@@ -2469,9 +2478,10 @@ async fn health_echoes_launch_instance_token_without_env() {
     );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        8,
+        9,
         "status/server_version/pid/instance_token/model_installed/model_resident \
-         plus the 0.1.14 additive native_active_count/idle_seconds debug fields"
+         plus the 0.1.14 additive native_active_count/idle_seconds and the 0.1.15 \
+         additive abandoned_worker_count debug fields"
     );
 }
 
@@ -2508,9 +2518,10 @@ async fn health_prefers_env_instance_token_over_launch_option() {
     );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        8,
+        9,
         "status/server_version/pid/instance_token/model_installed/model_resident \
-         plus the 0.1.14 additive native_active_count/idle_seconds debug fields"
+         plus the 0.1.14 additive native_active_count/idle_seconds and the 0.1.15 \
+         additive abandoned_worker_count debug fields"
     );
 }
 

@@ -45,4 +45,16 @@ native_active_count: number,
  * against the configured `idle_unload` threshold to see how close the
  * next sweep is. Additive: absent in the pre-0.1.14 contract.
  */
-idle_seconds: number, };
+idle_seconds: number, 
+/**
+ * Debug-observability field: the process-wide count of native streaming
+ * decode workers the decode watchdog has abandoned because a decode never
+ * returned within its budget (each presumed a permanently wedged OS
+ * thread pinning a resident model runtime). Normally `0`; a nonzero value
+ * is a strong signal of a GPU/driver-level decode hang. The daemon fails
+ * loud and exits once this reaches its internal threshold (so a
+ * supervisor can restart it with a clean slate), making this the field to
+ * watch for that condition. Reads `0` on the mock backend. Additive:
+ * absent in the pre-0.1.15 contract.
+ */
+abandoned_worker_count: number, };

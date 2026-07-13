@@ -292,6 +292,50 @@ impl Drop for NativeActivityGuard {
     }
 }
 
+/// A [`NativeActivityGuard`] shared between the native-streaming decode
+/// worker OS thread that normally retires it and an external supervisor that
+/// may need to force an early release if that thread never gets the chance
+/// to retire it itself -- see `realtime::native_worker`'s decode watchdog
+/// (`abandon_stuck_native_streaming_worker`, for a command that does not
+/// return within its budget) and same-key preemption
+/// (`native_streaming_worker_for_key`, for a new attach that finds the key's
+/// worker still occupied by a session whose owning WS connection already
+/// disconnected). Both of those triggers exist precisely because the worker
+/// OS thread cannot be interrupted mid-decode (a stuck Metal
+/// `waitUntilCompleted` cannot be aborted from outside its own thread), so
+/// the guard itself must be releasable from outside that thread too.
+///
+/// [`Self::release`] is idempotent: whichever side -- the worker thread
+/// finishing normally, or an external trigger firing first -- calls it
+/// first actually drops the inner guard (retiring the process-wide native
+/// activity count); every later call, from any clone, is a no-op. This is
+/// enforced by taking the guard out of a `Mutex<Option<_>>` rather than
+/// relying on `Drop` timing between independent owners racing each other.
+/// If neither side ever calls `release()` explicitly (e.g. a worker-message
+/// `send` failed before any attach reached the worker thread), the guard
+/// still retires normally once every clone has dropped: dropping the last
+/// `Arc` drops the `Mutex<Option<NativeActivityGuard>>` it wraps, which -- if
+/// the inner guard is still `Some` -- drops that guard too.
+#[derive(Clone)]
+pub(crate) struct SharedNativeActivityGuard(std::sync::Arc<Mutex<Option<NativeActivityGuard>>>);
+
+impl SharedNativeActivityGuard {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Arc::new(Mutex::new(Some(
+            NativeActivityGuard::enter(),
+        ))))
+    }
+
+    /// Idempotent early release -- see the type-level doc comment.
+    pub(crate) fn release(&self) {
+        let mut guard = self
+            .0
+            .lock()
+            .expect("shared native activity guard mutex poisoned");
+        guard.take();
+    }
+}
+
 /// Spawns the background `idle_unload` reaper. Polls at a fraction of
 /// `idle_for` so the actual unload lands within roughly one tick of crossing
 /// the threshold, without spinning for a short threshold (the `now` policy's
@@ -510,6 +554,69 @@ mod tests {
         // absolute or relative count, which would be flaky under contention.
         let _guard = NativeActivityGuard::enter();
         drop(_guard);
+    }
+
+    #[test]
+    fn shared_native_activity_guard_release_is_idempotent() {
+        // Delta-based (not absolute) against the real process-wide singleton,
+        // with no `.await`/sleep between snapshot and assertions, keeping the
+        // window against other concurrently running tests as tight as
+        // possible -- see `guard_pairs_enter_and_exit_without_panicking`'s
+        // comment on why this file avoids absolute assertions on the
+        // singleton.
+        let before = native_activity_active_count();
+        let guard = SharedNativeActivityGuard::new();
+        assert_eq!(native_activity_active_count(), before + 1);
+
+        let clone = guard.clone();
+        // Either clone may be the one to observe/trigger the release first
+        // (this mirrors the real race between a worker thread finishing
+        // normally and an external watchdog/preemption trigger firing
+        // first); whichever fires first must win, and the other must be a
+        // no-op.
+        clone.release();
+        assert_eq!(
+            before,
+            native_activity_active_count(),
+            "release from a clone must retire the shared guard"
+        );
+
+        guard.release();
+        assert_eq!(
+            before,
+            native_activity_active_count(),
+            "a second release from a different clone must be a no-op, not double-decrement"
+        );
+
+        drop(guard);
+        drop(clone);
+        assert_eq!(
+            before,
+            native_activity_active_count(),
+            "dropping the already-released clones must not decrement again"
+        );
+    }
+
+    #[test]
+    fn shared_native_activity_guard_releases_on_last_drop_if_never_explicitly_released() {
+        let before = native_activity_active_count();
+        let guard = SharedNativeActivityGuard::new();
+        let clone = guard.clone();
+        assert_eq!(native_activity_active_count(), before + 1);
+
+        drop(guard);
+        assert_eq!(
+            native_activity_active_count(),
+            before + 1,
+            "one remaining clone must still hold the guard"
+        );
+
+        drop(clone);
+        assert_eq!(
+            native_activity_active_count(),
+            before,
+            "dropping the last clone without an explicit release() must still retire the guard"
+        );
     }
 
     #[test]

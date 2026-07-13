@@ -24,8 +24,15 @@ pub(crate) struct WsSession {
     pub(crate) native_had_speech_since_last_poll: bool,
     pub(crate) native_poll_outstanding: usize,
     pub(crate) native_command_watchdogs: VecDeque<(NativeStreamingCommandKind, Instant)>,
-    /// Watchdog bound for a single native-streaming decode round-trip.
-    pub(crate) native_decode_timeout: Duration,
+    /// Test-only override for the native-streaming decode watchdog: when
+    /// `Some`, used verbatim for every command kind, regardless of
+    /// `native_streaming_command_timeout`'s per-kind production default.
+    /// Lets tests shrink the budget (to exercise the watchdog without a real
+    /// multi-second sleep) or grow it (the real-model smoke test, to absorb
+    /// hardware timing variance) without needing a per-kind override. `None`
+    /// in production: every real `WsSession` uses the per-kind budgets from
+    /// `native_streaming_command_timeout`.
+    pub(crate) native_decode_timeout_override: Option<Duration>,
     pub(crate) event_sender: mpsc::Sender<RealtimeEventEnvelope>,
     pub(crate) backend_jobs: Option<mpsc::Sender<RealtimeBackendWorkerMessage>>,
     pub(crate) backend_results: Option<mpsc::Receiver<BackendResult>>,
@@ -640,7 +647,7 @@ impl WsSession {
             native_had_speech_since_last_poll: false,
             native_poll_outstanding: 0,
             native_command_watchdogs: VecDeque::new(),
-            native_decode_timeout: backend_result_timeout(),
+            native_decode_timeout_override: None,
             event_sender,
             backend_jobs: None,
             backend_results: None,
@@ -1724,18 +1731,41 @@ impl WsSession {
         self.enforce_native_streaming_watchdog().await
     }
 
+    /// Resolves the decode-watchdog budget for one command `kind`: the test
+    /// override if set, otherwise the per-kind production default (see
+    /// `native_streaming_command_timeout`).
+    fn native_streaming_watchdog_timeout(&self, kind: NativeStreamingCommandKind) -> Duration {
+        self.native_decode_timeout_override
+            .unwrap_or_else(|| native_streaming_command_timeout(kind))
+    }
+
     pub(crate) async fn enforce_native_streaming_watchdog(&mut self) -> Result<(), ()> {
         let Some((kind, started_at)) = self.native_command_watchdogs.front().copied() else {
             return Ok(());
         };
-        if started_at.elapsed() < self.native_decode_timeout {
+        let timeout = self.native_streaming_watchdog_timeout(kind);
+        let elapsed = started_at.elapsed();
+        if elapsed < timeout {
             return Ok(());
+        }
+        if let Some(worker) = self.native_streaming.as_ref() {
+            // A.1: the worker OS thread cannot be interrupted, so recovery is
+            // eviction, not cancellation -- see `abandon_stuck_native_streaming_worker`.
+            abandon_stuck_native_streaming_worker(
+                &worker.key,
+                &worker.state,
+                &format!(
+                    "decode_watchdog_timeout kind={kind:?} elapsed_ms={} timeout_ms={}",
+                    elapsed.as_millis(),
+                    timeout.as_millis()
+                ),
+            );
         }
         self.apply_native_streaming_outcome(NativeStreamingOutcome::Error {
             kind,
             message: format!(
                 "decode did not return within {}s; the decode step may be hung",
-                self.native_decode_timeout.as_secs()
+                timeout.as_secs()
             ),
         })
         .await
@@ -1752,7 +1782,12 @@ impl WsSession {
         let expected_kind = command.kind();
         self.send_native_streaming_command(command).await?;
         loop {
-            let timeout = self.native_decode_timeout;
+            let kind = self
+                .native_command_watchdogs
+                .front()
+                .map(|(kind, _)| *kind)
+                .unwrap_or(expected_kind);
+            let timeout = self.native_streaming_watchdog_timeout(kind);
             let outcome = {
                 let Some(worker) = self.native_streaming.as_mut() else {
                     return Ok((expected_kind, Vec::new()));
@@ -1761,11 +1796,22 @@ impl WsSession {
                     Ok(Some(outcome)) => outcome,
                     Ok(None) => return self.fail_native_streaming_worker_stopped().await,
                     Err(_elapsed) => {
-                        let kind = self
+                        let elapsed = self
                             .native_command_watchdogs
                             .front()
-                            .map(|(kind, _)| *kind)
-                            .unwrap_or(expected_kind);
+                            .map(|(_, started_at)| started_at.elapsed())
+                            .unwrap_or(timeout);
+                        // A.1, same rationale as `enforce_native_streaming_watchdog`
+                        // above: evict, do not try to cancel the stuck worker.
+                        abandon_stuck_native_streaming_worker(
+                            &worker.key,
+                            &worker.state,
+                            &format!(
+                                "decode_watchdog_timeout kind={kind:?} elapsed_ms={} timeout_ms={}",
+                                elapsed.as_millis(),
+                                timeout.as_millis()
+                            ),
+                        );
                         NativeStreamingOutcome::Error {
                             kind,
                             message: format!(
