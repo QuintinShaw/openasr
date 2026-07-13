@@ -720,6 +720,19 @@ impl IncrementalStreamingTranscriptDriver {
         Ok(emitted)
     }
 
+    /// Promote whatever text was last shown to the client (`last_text`) to a
+    /// terminal FINAL with no new decode. Used by `finish_updates`'s early
+    /// short circuits (empty buffer, sub-floor trailing window) that cannot
+    /// safely attempt a decode but must not silently drop text the client
+    /// has already seen as a PARTIAL: an empty increment (no new decoded
+    /// content), but a final snapshot of the last known text. `None` when
+    /// nothing was ever shown for the still-open segment, in which case
+    /// there is nothing to snapshot and finishing is a true no-op.
+    fn emit_terminal_snapshot(&mut self) -> Option<GgmlAsrStreamingTranscriptUpdate> {
+        let text = self.last_text.clone()?;
+        self.emit_update(&text, true)
+    }
+
     fn emit_update(
         &mut self,
         raw_text: &str,
@@ -788,17 +801,32 @@ impl GgmlAsrStreamingTranscriptDriver for IncrementalStreamingTranscriptDriver {
     fn finish_updates(
         &mut self,
     ) -> Result<Vec<GgmlAsrStreamingTranscriptUpdate>, GgmlAsrExecutionError> {
-        if self.buffer.is_empty() || self.final_emitted {
+        if self.final_emitted {
             return Ok(Vec::new());
+        }
+        // Nothing left to decode: whatever was already
+        // committed/finalized earlier in the utterance stands, and (per the
+        // buffer/last_text invariant maintained by `decode_and_commit_window`
+        // and `reset_current_utterance`) an empty buffer only ever coincides
+        // with `last_text` already being `None`, so this is a true no-op.
+        // Routed through the same terminal-snapshot helper as the sub-floor
+        // case below rather than duplicated, so both short circuits finish
+        // identically instead of via two copies of the same logic.
+        if self.buffer.is_empty() {
+            return Ok(self.emit_terminal_snapshot().into_iter().collect());
         }
         // A trailing window shorter than the encoder's receptive field is
         // normal usage (e.g. a very brief press-to-talk that never crossed
-        // the first-partial floor, so no partial ever ran either), not an
-        // error: finish cleanly with no additional update instead of
-        // attempting a decode the encoder cannot turn into output. Whatever
-        // was already committed/finalized earlier in the utterance stands.
+        // the first-partial floor, so no partial ever ran either) -- but it
+        // can also happen later in a longer utterance, e.g. right after a
+        // sentence cut drains the buffer down to a short trailing remainder.
+        // Either way, finish cleanly with no additional decode attempt (the
+        // encoder cannot turn this tail into output), but do not silently
+        // drop text the client has already seen as a PARTIAL: promote the
+        // last shown text (if any) to a terminal FINAL snapshot instead of
+        // leaving the client holding an un-finalized PARTIAL forever.
         if self.buffer_below_minimum_encodable_samples() {
-            return Ok(Vec::new());
+            return Ok(self.emit_terminal_snapshot().into_iter().collect());
         }
         // The FINAL decodes whatever audio remains in the buffer — i.e. the current
         // (still-uncut) trailing segment, since earlier sentences were already
@@ -1458,5 +1486,99 @@ mod tests {
         driver.push_audio(frame(1, 0)).unwrap();
         let final_ = driver.finish_updates().unwrap();
         assert_eq!(text_of(&final_[0]).0, "ok");
+    }
+
+    #[test]
+    fn finish_promotes_the_last_shown_partial_to_a_terminal_final_below_the_floor() {
+        // Regression test: a sub-floor finish must not silently drop text the
+        // client has already seen as a PARTIAL. Commit a normal windowed
+        // partial decode (so `last_text` holds real, already-surfaced text),
+        // then finish while the buffer sits below the minimum-encodable-
+        // samples floor (e.g. capture stopped just after the last partial,
+        // or a sentence cut drained the trailing remainder below the floor).
+        // The FINAL must still land -- carrying the last known text, with no
+        // new decode attempt -- instead of being swallowed.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut driver = counting_windowed_driver(30_000, Arc::clone(&calls));
+
+        for i in 1..=4 {
+            driver.push_audio(vframe(i, (i - 1) * 20)).unwrap();
+        }
+        // No floor yet, so this partial decodes normally and populates
+        // `last_text` -- modelling the real trigger (a sentence cut, or the
+        // capture simply stopping) that leaves the trailing buffer short
+        // enough to fall under the family's floor by the time finish runs.
+        let partial = driver.poll_updates().unwrap();
+        assert_eq!(text_of(&partial[0]).0, "w0 w1 w2 w3");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Now impose a floor above the current buffer, so finish hits the
+        // sub-floor short circuit under test.
+        driver.minimum_encodable_samples = Some(driver.buffer.sample_count() + 1);
+
+        let final_ = driver.finish_updates().unwrap();
+        assert_eq!(
+            final_.len(),
+            1,
+            "the last shown partial must be promoted to a terminal FINAL, not dropped"
+        );
+        assert_eq!(text_of(&final_[0]), ("w0 w1 w2 w3", 1, true));
+        assert!(driver.final_emitted);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the sub-floor finish must not attempt a new decode"
+        );
+    }
+
+    #[test]
+    fn finish_below_the_floor_with_nothing_ever_shown_stays_a_true_no_op() {
+        // The empty-buffer and sub-floor short circuits share the same
+        // terminal-snapshot helper; when nothing was ever shown (`last_text`
+        // is `None`, as in the pre-existing
+        // `finish_skips_decode_and_returns_empty_below_the_minimum_encodable_samples_floor`
+        // scenario) there is nothing to promote and finish must stay empty.
+        let mut driver = counting_windowed_driver(30_000, Arc::new(AtomicUsize::new(0)))
+            .with_minimum_encodable_samples(2_000);
+        driver.push_audio(vframe(1, 0)).unwrap();
+        assert!(driver.last_text.is_none());
+
+        let final_ = driver.finish_updates().unwrap();
+        assert!(final_.is_empty());
+        assert!(!driver.final_emitted);
+    }
+
+    #[test]
+    fn poll_updates_below_the_floor_leaves_an_already_shown_partial_untouched() {
+        // Pinning the current (correct) contract: once a PARTIAL has been
+        // shown, a later poll tick whose buffer sits below the floor must
+        // stay a pure no-op -- it must not re-emit, promote to FINAL, or
+        // clear `last_text`. Only `finish_updates` promotes a pending
+        // snapshot to a terminal FINAL (the fix above); `poll_updates` has
+        // no terminal concept and the utterance is still ongoing, so the
+        // already-shown partial simply stands until either more audio lifts
+        // the buffer back over the floor or the utterance finishes.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut driver = counting_windowed_driver(30_000, Arc::clone(&calls));
+
+        for i in 1..=4 {
+            driver.push_audio(vframe(i, (i - 1) * 20)).unwrap();
+        }
+        let partial = driver.poll_updates().unwrap();
+        assert_eq!(text_of(&partial[0]).0, "w0 w1 w2 w3");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Impose a floor above the current buffer so the next poll tick
+        // short-circuits without decoding.
+        driver.minimum_encodable_samples = Some(driver.buffer.sample_count() + 1);
+        let updates = driver.poll_updates().unwrap();
+        assert!(updates.is_empty());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "must not attempt a decode below the floor"
+        );
+        assert_eq!(driver.last_text.as_deref(), Some("w0 w1 w2 w3"));
+        assert!(!driver.final_emitted);
     }
 }

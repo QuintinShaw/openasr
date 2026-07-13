@@ -36,11 +36,39 @@ impl NativeActivityTracker {
     }
 
     fn exit(&self) {
-        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(
-            previous > 0,
-            "native activity exited more times than it was entered"
-        );
+        // Saturate at zero instead of a plain `fetch_sub`: a bare `fetch_sub`
+        // on an already-zero counter wraps to `usize::MAX` (atomics use
+        // wrapping arithmetic unconditionally, in debug and release alike),
+        // which would pin `is_idle_for` to "never idle" -- silently and
+        // permanently disabling `idle_unload` -- for the rest of the
+        // process's life. `fetch_update` lets us clamp the new value while
+        // still reading the pre-update count to detect the mismatch.
+        let previous = self
+            .active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(1))
+            })
+            .expect("closure always returns Some, so fetch_update never returns Err");
+        if previous == 0 {
+            // An enter/exit accounting bug (a double-release, or an exit
+            // whose matching enter never landed). Catch it loudly in debug
+            // builds where a panic is safe and useful to a developer -- but
+            // never panic a running release daemon over an internal
+            // bookkeeping mismatch; a live server killed by this would be
+            // far worse than idle_unload staying disabled (or, worst case,
+            // firing while a session is still attached) until the next
+            // balanced enter/exit. Log it (release and debug both) so an
+            // operator/maintainer can still notice and file it.
+            debug_assert!(
+                false,
+                "native activity exited more times than it was entered"
+            );
+            eprintln!(
+                "openasr-server: native activity accounting underflow: exit() called with no \
+                 matching enter() (idle_unload may misbehave until the next balanced enter/exit)"
+            );
+            return;
+        }
         if previous == 1 {
             *self
                 .idle_since
@@ -58,6 +86,34 @@ impl NativeActivityTracker {
             .lock()
             .expect("native activity idle mutex poisoned");
         now.checked_duration_since(idle_since).unwrap_or_default() >= idle_for
+    }
+
+    /// Current active native request/session count. Debug-observability
+    /// getter (surfaced by `/health` as `native_active_count`); the reaper
+    /// itself only ever needs [`Self::is_idle_for`]'s bool.
+    fn active_count(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Seconds elapsed since the active count last returned to zero, as of
+    /// `now`. `0` while any activity is active -- there is no meaningful
+    /// "idle duration" mid-request, and `0` (rather than some stale prior
+    /// idle window) is the least surprising reading for a client polling
+    /// `/health` moment to moment. Debug-observability getter (surfaced by
+    /// `/health` as `idle_seconds`), expressed with the same `idle_since`
+    /// field `is_idle_for` already reads, so the two can never disagree
+    /// about what "idle" means.
+    fn idle_seconds(&self, now: Instant) -> u64 {
+        if self.active.load(Ordering::Acquire) != 0 {
+            return 0;
+        }
+        let idle_since = *self
+            .idle_since
+            .lock()
+            .expect("native activity idle mutex poisoned");
+        now.checked_duration_since(idle_since)
+            .unwrap_or_default()
+            .as_secs()
     }
 }
 
@@ -190,6 +246,24 @@ pub(crate) fn native_activity_is_idle_for(now: Instant, idle_for: Duration) -> b
     native_activity().is_idle_for(now, idle_for)
 }
 
+/// Process-wide active native request/session count right now. Debug-only
+/// observability, surfaced by `/health` as `native_active_count` so an
+/// operator/support session can tell "server looks idle but a session is
+/// still counted active" apart from "idle_unload just has not swept yet"
+/// without attaching a debugger.
+pub(crate) fn native_activity_active_count() -> usize {
+    native_activity().active_count()
+}
+
+/// Seconds since the process-wide tracker's active count last returned to
+/// zero, as of `now` (`0` while any activity is active). Debug-only
+/// observability, surfaced by `/health` as `idle_seconds`; expressed via the
+/// same tracker state `native_activity_is_idle_for` reads, so the two can
+/// never disagree about what "idle" means.
+pub(crate) fn native_activity_idle_seconds(now: Instant) -> u64 {
+    native_activity().idle_seconds(now)
+}
+
 /// RAII pairing of one `native_activity_enter`/`native_activity_exit` call.
 /// Used at the offline/backend-job transcribe call site, where the request's
 /// activity window is exactly one lexical scope, and at the realtime
@@ -306,10 +380,123 @@ mod tests {
     }
 
     #[test]
+    fn active_count_and_idle_seconds_mirror_is_idle_for() {
+        // The `/health` debug-observability getters (`active_count`,
+        // `idle_seconds`) must never disagree with the boolean
+        // `is_idle_for` the reaper actually acts on -- they read the exact
+        // same `active`/`idle_since` state, just shaped differently.
+        let tracker = NativeActivityTracker::new();
+        assert_eq!(tracker.active_count(), 0);
+        assert_eq!(
+            tracker.idle_seconds(Instant::now() + Duration::from_secs(3600)),
+            3600,
+            "idle_seconds must read a real elapsed duration once idle, matching is_idle_for"
+        );
+
+        tracker.enter();
+        assert_eq!(tracker.active_count(), 1);
+        assert_eq!(
+            tracker.idle_seconds(Instant::now() + Duration::from_secs(3600)),
+            0,
+            "idle_seconds must read zero while active, no matter how far `now` is"
+        );
+
+        tracker.enter();
+        assert_eq!(tracker.active_count(), 2);
+
+        tracker.exit();
+        assert_eq!(
+            tracker.active_count(),
+            1,
+            "one remaining active entry still counts as active"
+        );
+        assert_eq!(tracker.idle_seconds(Instant::now()), 0);
+
+        tracker.exit();
+        assert_eq!(tracker.active_count(), 0);
+        assert_eq!(
+            tracker.idle_seconds(Instant::now()),
+            0,
+            "real elapsed time just after the count returns to zero is microseconds, not a full second yet"
+        );
+        assert_eq!(
+            tracker.idle_seconds(Instant::now() + Duration::from_secs(90)),
+            90
+        );
+    }
+
+    // Debug-only half of the contract: `debug_assert!` is compiled out under
+    // `cargo test --release`, where the release-safe (saturate + log,
+    // no panic) behavior applies instead -- see
+    // `release_builds_do_not_panic_on_an_accounting_underflow` below.
+    #[cfg(debug_assertions)]
+    #[test]
     #[should_panic(expected = "exited more times than it was entered")]
     fn exit_without_matching_enter_is_a_bug() {
         let tracker = NativeActivityTracker::new();
         tracker.exit();
+    }
+
+    #[test]
+    fn extra_exits_saturate_instead_of_wrapping_and_do_not_corrupt_the_counter() {
+        // A bare `fetch_sub` on an already-zero counter wraps to
+        // `usize::MAX` (atomics use wrapping arithmetic unconditionally,
+        // debug or release), which would pin `is_idle_for` to "never idle"
+        // forever -- silently disabling `idle_unload` for the rest of the
+        // process's life. The saturating fix in `exit` must land before the
+        // debug_assert/log, so this invariant holds in EVERY build profile,
+        // unlike the debug-only panic covered by
+        // `exit_without_matching_enter_is_a_bug` above. In a debug build
+        // (this one included, `cargo test`'s default) each extra `exit()`
+        // still panics via that same debug_assert; catch it so this test can
+        // assert the underlying counter state regardless.
+        let tracker = NativeActivityTracker::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tracker.exit()));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tracker.exit()));
+
+        assert_eq!(
+            tracker.active.load(Ordering::Acquire),
+            0,
+            "the counter must saturate at zero, never wrap past it"
+        );
+        assert!(
+            tracker.is_idle_for(
+                Instant::now() + Duration::from_secs(3600),
+                Duration::from_secs(1)
+            ),
+            "a saturated (not wrapped) zero counter must still read as idle"
+        );
+
+        // The earlier accounting bug must not leave the tracker wedged: a
+        // later, legitimate enter/exit pair still works normally.
+        tracker.enter();
+        tracker.exit();
+        assert!(tracker.is_idle_for(
+            Instant::now() + Duration::from_secs(3600),
+            Duration::from_secs(1)
+        ));
+    }
+
+    // Only compiled (and only meaningful) with `debug_assertions` off, i.e.
+    // under `cargo test --release`: proves the release half of the
+    // contract that `exit_without_matching_enter_is_a_bug` cannot -- an
+    // accounting underflow must NOT panic a running release daemon. If this
+    // panicked, the test itself would fail (no `catch_unwind` here, unlike
+    // the profile-agnostic test above). Absent from the default
+    // `cargo test`/`cargo nextest run` (debug) run, where `debug_assert`
+    // deliberately still panics; that half of the contract is pinned by
+    // `exit_without_matching_enter_is_a_bug` instead.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_builds_do_not_panic_on_an_accounting_underflow() {
+        let tracker = NativeActivityTracker::new();
+        tracker.exit();
+        tracker.exit();
+        assert_eq!(tracker.active.load(Ordering::Acquire), 0);
+        assert!(tracker.is_idle_for(
+            Instant::now() + Duration::from_secs(3600),
+            Duration::from_secs(1)
+        ));
     }
 
     #[test]
