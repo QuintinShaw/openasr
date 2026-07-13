@@ -143,6 +143,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # Pinned to the last known-good commit: on 2026-07-13 the floating v2
+      # tag moved to a release whose entrypoint mis-assembles its arguments
+      # (cargo-deny exits with "unrecognized subcommand 'warn'"). Bump
+      # deliberately after verifying upstream fixed the entrypoint.
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe
         with:
           rust-version: 1.95.0
