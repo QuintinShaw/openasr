@@ -197,13 +197,51 @@ impl DolphinWeightProvider for HashMap<String, Vec<f32>> {
     }
 }
 
-/// Subsampled frame count after two `k3 s2` conv layers (4x time downsample).
-fn subsample_len(frames: usize) -> usize {
-    let after_first = (frames.saturating_sub(3)) / 2 + 1;
-    (after_first.saturating_sub(3)) / 2 + 1
+/// One `k3 s2` (no padding) Conv2d layer's output length along an axis, or
+/// `Err` if `input` is smaller than the kernel (the ggml `im2col`/`conv_2d`
+/// precondition `OH > 0` -- feeding it an under-sized input aborts the whole
+/// process instead of returning a Rust error, so this must be checked before
+/// the graph is ever built; see `subsample_len`/`subsample`/`encode`).
+fn conv2d_no_pad_stride2_out_len(
+    input: usize,
+    kernel: usize,
+) -> Result<usize, DolphinEncoderError> {
+    const STRIDE: usize = 2;
+    input
+        .checked_sub(kernel)
+        .and_then(|value| value.checked_div(STRIDE))
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| DolphinEncoderError::Shape {
+            reason: format!(
+                "conv2d subsampling requires at least {kernel} input frames, got {input}"
+            ),
+        })
+}
+
+/// Subsampled frame count after two `k3 s2` (no padding) conv layers (4x time
+/// downsample). `Err` when `frames_in` is too short for the two-layer
+/// receptive field (7 frames minimum: `(7-3)/2+1=3` after layer one, `(3-3)/2+1=1`
+/// after layer two) instead of silently producing a degenerate frame count that
+/// would abort the ggml conv at graph-build time.
+fn subsample_len(frames: usize) -> Result<usize, DolphinEncoderError> {
+    let after_first = conv2d_no_pad_stride2_out_len(frames, 3)?;
+    conv2d_no_pad_stride2_out_len(after_first, 3)
+}
+
+/// The smallest `frames_in` for which [`subsample_len`] succeeds. Derived by
+/// walking the same checked formula forward instead of a hardcoded constant,
+/// so it cannot drift out of sync with it.
+pub(crate) fn minimum_subsample_input_frames() -> usize {
+    (1..)
+        .find(|&frames| subsample_len(frames).is_ok())
+        .expect("subsample_len's two-layer k3/s2 chain has a finite minimum valid input")
 }
 
 /// Subsampled feature width after the same two conv layers on the mel axis.
+/// Unlike `subsample_len` this always runs over the model's fixed
+/// `feature_dim` config (e.g. 80 mel bins), never a runtime-variable audio
+/// length, so it stays infallible (saturating is safe: `feature_dim` is always
+/// far above the two-layer receptive field for every published Dolphin pack).
 fn subsample_width(features: usize) -> usize {
     let after_first = (features.saturating_sub(3)) / 2 + 1;
     (after_first.saturating_sub(3)) / 2 + 1
@@ -943,7 +981,7 @@ fn subsample<'a>(
     let d = config.d_model;
     let feat = config.feature_dim;
     let width = subsample_width(feat);
-    let frames = subsample_len(frames_in);
+    let frames = subsample_len(frames_in)?;
 
     // ggml conv_2d: data [W=feat, H=T, C_in=1, N=1], kernel [KW, KH, C_in, C_out].
     let data = graph
@@ -1004,7 +1042,16 @@ pub(crate) fn encode(
             ),
         });
     }
-    let frames = subsample_len(frames_in);
+    // Reject a frames_in too short for the two-layer k3/s2 subsampling stem
+    // before any graph/runner allocation: ggml's `conv_2d`/`im2col` asserts
+    // `OH > 0` and aborts the whole process on an under-sized input rather
+    // than returning a Rust error, so this must fail closed here first (see
+    // `subsample_len`). A streaming FINAL over a too-short trailing window is
+    // the reachable real-world trigger (short press-to-talk after idle
+    // unload); the streaming driver also skips the encode call entirely in
+    // that case (see `incremental_streaming_driver`), so this is defense in
+    // depth for any other caller.
+    let frames = subsample_len(frames_in)?;
 
     let graph_config = GgmlCpuGraphConfig {
         context_bytes: 64 * 1024 * 1024,
@@ -1197,6 +1244,47 @@ pub(crate) fn encode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two k3/s2 (no padding) layers: `(7-3)/2+1=3` after layer one, `(3-3)/2+1=1`
+    /// after layer two -- the smallest input that survives both. Regression check
+    /// on `subsample_len`'s checked arithmetic (was a `saturating_sub` that
+    /// silently produced a degenerate frame count for anything shorter instead
+    /// of failing closed).
+    #[test]
+    fn minimum_subsample_input_frames_is_seven() {
+        assert_eq!(minimum_subsample_input_frames(), 7);
+        assert!(subsample_len(6).is_err());
+        assert!(subsample_len(7).is_ok());
+    }
+
+    /// The historical crash (mac 0.1.8 field report): a streaming FINAL over a
+    /// too-short trailing window (fewer frames than the Conv2dSubsampling4
+    /// receptive field) reached `ggml_conv_2d`/`ggml_im2col`, which asserts
+    /// `OH > 0` and `ggml_abort()`s the whole process -- not a catchable Rust
+    /// panic. `encode` must reject this before ever building the graph.
+    #[test]
+    fn encode_rejects_frames_below_subsampling_receptive_field_instead_of_aborting() {
+        let config = DolphinEncoderConfig::small_cn();
+        let feat = config.feature_dim;
+        let frames_in = minimum_subsample_input_frames() - 1;
+        let features = vec![0.0f32; frames_in * feat];
+        // The rejection happens before any weight is looked up, so an empty
+        // provider is enough -- if this regresses to reading weights first,
+        // the test will fail with a `MissingWeight` error instead of `Shape`.
+        let provider: HashMap<String, Vec<f32>> = HashMap::new();
+        let result = encode(
+            &config,
+            &provider,
+            &features,
+            frames_in,
+            GgmlCpuGraphBackend::Cpu,
+            false,
+        );
+        assert!(
+            matches!(result, Err(DolphinEncoderError::Shape { .. })),
+            "expected a typed Shape error for {frames_in} frames, got {result:?}"
+        );
+    }
 
     /// Pins the centered Transformer-XL `RelPositionalEncodingV1` table's shape
     /// and index direction (the multilingual dolphin encoder's only numeric

@@ -136,6 +136,19 @@ impl DolphinFbankFrontend {
     }
 }
 
+/// The inverse of `DolphinFbankFrontend::compute`'s frame-count formula
+/// (`1 + (len - FRAME_LENGTH) / FRAME_SHIFT`): the fewest 16 kHz samples
+/// guaranteed to produce at least `min_frames` snip-edges fbank frames. Lets a
+/// caller (the streaming driver) reject/skip a too-short trailing window
+/// before ever computing features, using the same framing constants
+/// `compute` does so the two cannot drift apart.
+pub(crate) fn kaldi_min_samples_for_frames(min_frames: usize) -> usize {
+    if min_frames == 0 {
+        return 0;
+    }
+    FRONTEND_CONFIG.frame_length + (min_frames - 1) * FRONTEND_CONFIG.frame_shift
+}
+
 /// Apply the checkpoint's `global_cmvn` `(x - mean) * istd` in place, per mel bin.
 /// `features` is row-major `[frames, feature_dim]`; `mean`/`istd` are the
 /// `encoder.global_cmvn.*` vectors baked in the pack (both length `feature_dim`).
@@ -289,6 +302,19 @@ impl DolphinEspnetFrontend {
             n_mels,
         })
     }
+}
+
+/// The inverse of `DolphinEspnetFrontend::compute`'s frame-count formula
+/// (`1 + samples.len() / HOP_LENGTH`, per that method's doc comment): the
+/// fewest 16 kHz samples guaranteed to produce at least `min_frames`
+/// reflect-centered STFT frames. See `kaldi_min_samples_for_frames` for the
+/// `CnDialect` counterpart; the two schemes' framing differs (reflect-padded
+/// vs. snip-edges) so each frontend owns its own inverse.
+pub(crate) fn espnet_min_samples_for_frames(min_frames: usize) -> usize {
+    if min_frames == 0 {
+        return 0;
+    }
+    (min_frames - 1) * ESPNET_HOP_LENGTH
 }
 
 #[cfg(test)]
@@ -493,5 +519,52 @@ mod tests {
             DolphinEspnetFrontend::new().compute(&[]),
             Err(DolphinFrontendError::UnsupportedAudio)
         ));
+    }
+
+    // --- min-samples-for-frames inverses (streaming short-tail guard) ------
+
+    #[test]
+    fn kaldi_min_samples_for_frames_round_trips_through_compute() {
+        for min_frames in 1..=8usize {
+            let min_samples = kaldi_min_samples_for_frames(min_frames);
+            let features = DolphinFbankFrontend::new()
+                .compute(&vec![0.01f32; min_samples])
+                .expect("fbank");
+            assert!(
+                features.n_frames >= min_frames,
+                "min_frames={min_frames} min_samples={min_samples} produced only {} frames",
+                features.n_frames
+            );
+            // One sample short must not still reach `min_frames` (the bound is
+            // tight, not just sufficient), except at min_frames=1 where even 0
+            // samples is a distinct, separately-rejected edge case.
+            if min_samples > 0 {
+                let short = &vec![0.01f32; min_samples - 1];
+                let frames_short = DolphinFbankFrontend::new()
+                    .compute(short)
+                    .map(|f| f.n_frames)
+                    .unwrap_or(0);
+                assert!(
+                    frames_short < min_frames,
+                    "min_frames={min_frames}: {} samples unexpectedly reached {frames_short} frames",
+                    min_samples - 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn espnet_min_samples_for_frames_round_trips_through_compute() {
+        for min_frames in 1..=8usize {
+            let min_samples = espnet_min_samples_for_frames(min_frames);
+            let features = DolphinEspnetFrontend::new()
+                .compute(&vec![0.01f32; min_samples.max(1)])
+                .expect("espnet fbank");
+            assert!(
+                features.n_frames >= min_frames,
+                "min_frames={min_frames} min_samples={min_samples} produced only {} frames",
+                features.n_frames
+            );
+        }
     }
 }
