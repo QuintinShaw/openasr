@@ -889,7 +889,7 @@ async fn native_streaming_decode_timeout_fails_closed() {
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
     // Watchdog far below the stub's hang so the round-trip times out.
-    session.native_decode_timeout = Duration::from_millis(20);
+    session.native_decode_timeout_override = Some(Duration::from_millis(20));
     session
         .attach_native_streaming_session(
             test_native_streaming_worker_key("decode-timeout"),
@@ -1086,6 +1086,250 @@ fn native_streaming_worker_prune_releases_only_idle_entries() {
     assert!(
         !workers.contains_key(&key),
         "idle native streaming worker should be pruned after the release threshold"
+    );
+}
+
+// --- Worker watchdog (A.1) and same-key preemption (B) ---
+//
+// These exercise the structural fix for the "warm-up queues behind a stuck
+// worker / a hung decode never returns / idle_unload is pinned for minutes"
+// three-symptom bug: a shared native-streaming decode worker OS thread cannot
+// be interrupted mid-decode (a stuck Metal `waitUntilCompleted` cannot be
+// aborted from another thread), so recovery is eviction -- abandoning the
+// worker instance (registry entry + activity accounting), never joining or
+// cancelling the stuck thread itself.
+
+#[tokio::test]
+async fn native_streaming_watchdog_abandons_stuck_worker_and_frees_new_attach() {
+    // Delta-based against the real process-wide singleton, deterministic
+    // under `cargo nextest`'s per-test process isolation (the project's
+    // mandated test runner) -- see `failed_native_streaming_attach_send_\
+    // retires_the_activity_guard`'s identical caveat.
+    let before_active = crate::idle_activity::native_activity_active_count();
+    let key = test_native_streaming_worker_key("watchdog-abandon");
+
+    let (event_sender, mut event_receiver) = mpsc::channel(8);
+    let mut stuck_session =
+        WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    // Far below the stub's hang so the round-trip times out quickly; this is
+    // the same override mechanism the pre-existing
+    // `native_streaming_decode_timeout_fails_closed` test uses, now
+    // renamed/repurposed as the test escape hatch for the per-kind production
+    // budgets (see `native_streaming_command_timeout`).
+    stuck_session.native_decode_timeout_override = Some(Duration::from_millis(20));
+    stuck_session
+        .attach_native_streaming_session(
+            key.clone(),
+            Box::new(ConfigurableNativeSession {
+                session_id: stuck_session.session_id.0.clone(),
+                behavior: StubDecodeBehavior::Hang(Duration::from_secs(30)),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::idle_activity::native_activity_active_count(),
+        before_active + 1,
+        "attach must enter the process-wide activity count"
+    );
+
+    // Sends PushAudio, which the stub hangs on for 30s -- far longer than
+    // this test should ever wait.
+    stuck_session.handle_binary(&vec![0; 640]).await.unwrap();
+    drain_native_until_backend_failed(&mut stuck_session).await;
+    assert!(stuck_session.backend_failed);
+    let mut events = Vec::new();
+    while let Ok(event) = event_receiver.try_recv() {
+        events.push(event);
+    }
+    assert_eq!(
+        first_error_code(&events),
+        Some(RealtimeErrorCode::BackendCrashed)
+    );
+
+    // The watchdog fired: this attach's activity accounting must be released
+    // even though the underlying OS thread is still stuck 30s deep in
+    // `push_audio`'s sleep, and the reaper-visible idle state must recover.
+    assert_eq!(
+        crate::idle_activity::native_activity_active_count(),
+        before_active,
+        "the decode watchdog must force-release the stuck attach's activity guard"
+    );
+    assert!(
+        crate::idle_activity::native_activity_is_idle_for(
+            Instant::now() + Duration::from_secs(3600),
+            Duration::from_secs(1)
+        ),
+        "idle_unload's reaper-visible idle state must recover once the stuck \
+         attach's guard is released, not stay pinned for as long as the \
+         abandoned thread takes to (maybe never) unwind"
+    );
+
+    // A brand new attach for the SAME key must get a fresh worker right away
+    // -- not queue behind the still-stuck OS thread.
+    let (event_sender2, mut event_receiver2) = mpsc::channel(8);
+    let mut fresh_session =
+        WsSession::new(ServerRuntime::default(), test_distribution(), event_sender2);
+    let attach_started = Instant::now();
+    fresh_session
+        .attach_native_streaming_session(
+            key,
+            Box::new(TestServerNativeSession::new(
+                fresh_session.session_id.0.clone(),
+            )),
+        )
+        .await
+        .unwrap();
+    assert!(
+        attach_started.elapsed() < Duration::from_millis(500),
+        "attach after an abandoned worker must not queue behind the stuck OS thread"
+    );
+
+    fresh_session.handle_binary(&vec![0; 640]).await.unwrap();
+    let event = recv_native_event(&mut fresh_session, &mut event_receiver2).await;
+    assert_eq!(event.event_type, "transcript.partial");
+    fresh_session
+        .finish_native_streaming_session(true, false)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn native_streaming_same_key_preemption_frees_new_attach_after_client_disconnect() {
+    let key = test_native_streaming_worker_key("same-key-preemption");
+    let threads = Arc::new(Mutex::new(Vec::new()));
+
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut abandoned_session =
+        WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let (started_sender, started_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    abandoned_session
+        .attach_native_streaming_session(
+            key.clone(),
+            Box::new(BlockingCancelableNativeSession {
+                session_id: abandoned_session.session_id.0.clone(),
+                started: started_sender,
+                release: Arc::new(Mutex::new(release_receiver)),
+            }),
+        )
+        .await
+        .unwrap();
+    abandoned_session
+        .send_native_streaming_command(NativeStreamingCommand::PushAudio(frame(1, 0, 1)))
+        .await
+        .unwrap();
+    started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocked decode started");
+
+    // Client disconnects: the existing transport-close path already calls
+    // `detach_cancel` (sets `cancel_requested`, drops the per-session command
+    // channel) -- no new protocol -- but the worker OS thread is still stuck
+    // inside the blocked `push_audio` call above and cannot act on either
+    // signal yet.
+    abandoned_session
+        .finish_native_streaming_session(false, true)
+        .await
+        .unwrap();
+    assert!(abandoned_session.native_streaming.is_none());
+
+    // A brand new attach for the same key must not queue behind the still-
+    // blocked worker: `native_streaming_worker_for_key` must observe the
+    // disconnected occupant and preempt it immediately.
+    let (event_sender2, _event_receiver2) = mpsc::channel(8);
+    let mut fresh_session =
+        WsSession::new(ServerRuntime::default(), test_distribution(), event_sender2);
+    let attach_started = Instant::now();
+    fresh_session
+        .attach_native_streaming_session(
+            key,
+            Box::new(ThreadRecordingNativeSession {
+                session_id: fresh_session.session_id.0.clone(),
+                threads: threads.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    fresh_session
+        .send_native_streaming_command(NativeStreamingCommand::PushAudio(frame(1, 0, 1)))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            fresh_session
+                .drain_native_streaming_outcomes()
+                .await
+                .unwrap();
+            if !threads
+                .lock()
+                .expect("thread recorder mutex poisoned")
+                .is_empty()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect(
+        "the fresh attach must make progress promptly on a new worker, not \
+         queue behind the disconnected session's still-blocked one",
+    );
+    assert!(
+        attach_started.elapsed() < Duration::from_millis(500),
+        "same-key preemption must not wait for the abandoned worker"
+    );
+
+    fresh_session
+        .finish_native_streaming_session(true, false)
+        .await
+        .unwrap();
+
+    // Let the old, preempted worker's blocked decode return, so it does not
+    // sit blocked in the background for the rest of this test binary's life.
+    release_sender.send(()).expect("release blocked decode");
+}
+
+#[test]
+fn abandoned_worker_warm_up_does_not_mark_model_resident() {
+    // Regression test for the "late write-back after abandonment" hazard
+    // called out by the investigation this closes: a worker instance
+    // abandoned by the decode watchdog or same-key preemption can still be
+    // stuck deep inside `session.warm_up()` when it is abandoned (the OS
+    // thread cannot be interrupted); if that call eventually returns, it must
+    // not mark the process-wide model resident on behalf of a worker
+    // instance the rest of the process has already forgotten about.
+    let _generation_guard = crate::idle_activity::native_unload_generation_test_lock_blocking();
+    crate::idle_activity::bump_native_unload_generation();
+    assert!(!crate::idle_activity::native_model_is_resident());
+
+    let abandoned = AtomicBool::new(true);
+    let mut session = TestServerNativeSession::new("abandoned-warm-up");
+    warm_up_native_streaming_session_once(&mut session, &abandoned)
+        .expect("warm-up itself still succeeds -- only its process-wide side effect is discarded");
+    assert!(
+        !crate::idle_activity::native_model_is_resident(),
+        "a warm-up finishing after its worker was abandoned must not mark the model resident"
+    );
+
+    // Sanity check that the `abandoned` flag -- not something else -- is
+    // what suppressed the mark above: the same call with `abandoned=false`
+    // (the normal, not-abandoned path) must still mark resident. Runs on a
+    // fresh OS thread so `warm_up_native_streaming_session_once`'s
+    // thread-local `WARMED_AT_GENERATION` gate (already warmed at this
+    // generation on the current test thread, from the call above) does not
+    // skip this one.
+    std::thread::spawn(|| {
+        let not_abandoned = AtomicBool::new(false);
+        let mut session = TestServerNativeSession::new("normal-warm-up");
+        warm_up_native_streaming_session_once(&mut session, &not_abandoned).unwrap();
+    })
+    .join()
+    .unwrap();
+    assert!(
+        crate::idle_activity::native_model_is_resident(),
+        "the normal (not abandoned) path must still mark resident"
     );
 }
 
@@ -1824,13 +2068,16 @@ async fn failed_native_streaming_attach_send_retires_the_activity_guard() {
     //
     // `NativeStreamingWorkerHandle::activity` and
     // `NativeStreamingWorkerMessage::Attach::activity` now carry that
-    // accounting as a `NativeActivityGuard` value instead of two hand-paired
-    // free-function calls: it either rides into the worker thread inside a
-    // successfully delivered `Attach` message (retired there once the session
-    // finishes -- see `attached_native_streaming_session_keeps_the_global_\
-    // activity_tracker_non_idle` above), or -- if delivery fails -- drops
-    // along with the returned `SendError`, right where the old code silently
-    // dropped only the message and forgot the guard.
+    // accounting as a `SharedNativeActivityGuard` value instead of two
+    // hand-paired free-function calls: it either rides into the worker
+    // thread inside a successfully delivered `Attach` message (retired there
+    // once the session finishes -- see `attached_native_streaming_session_\
+    // keeps_the_global_activity_tracker_non_idle` above), or -- if delivery
+    // fails -- drops along with the returned `SendError`, right where the old
+    // code silently dropped only the message and forgot the guard. (It is
+    // `Clone`-able so a decode watchdog or same-key preemption can force an
+    // early release too, but nothing here exercises that -- see the
+    // watchdog/preemption tests instead.)
     //
     // Reproduces a failed send deterministically (no timing race needed) by
     // sending directly into a channel whose receiver was already dropped,
@@ -1846,7 +2093,7 @@ async fn failed_native_streaming_attach_send_retires_the_activity_guard() {
     let (sender, receiver) = mpsc::channel::<NativeStreamingWorkerMessage>(1);
     drop(receiver);
 
-    let activity = crate::idle_activity::NativeActivityGuard::enter();
+    let activity = crate::idle_activity::SharedNativeActivityGuard::new();
     assert!(
         !crate::idle_activity::native_activity_is_idle_for(Instant::now(), Duration::ZERO),
         "must not read idle immediately after entering activity"
@@ -2157,7 +2404,7 @@ async fn native_realtime_server_smoke_with_real_qwen_pack() {
         model_pack_path: Some(pack_path),
     };
     let mut session = WsSession::new(runtime, test_distribution(), event_sender);
-    session.native_decode_timeout = Duration::from_secs(180);
+    session.native_decode_timeout_override = Some(Duration::from_secs(180));
     let session_start_started = Instant::now();
     session
         .handle_text(

@@ -91,12 +91,51 @@ pub(crate) struct NativeStreamingWorkerHandle {
     /// eventually drop exactly once, unlike the previous bare
     /// `native_activity_enter`/`native_activity_exit` pairing across two call
     /// sites, which a send failure could skip.
-    pub(crate) activity: crate::idle_activity::NativeActivityGuard,
+    ///
+    /// Shared (not a bare `NativeActivityGuard`) so a stuck worker's decode
+    /// watchdog or a same-key preemption can force an early release without
+    /// waiting for (or being able to interrupt) the worker OS thread -- see
+    /// `SharedNativeActivityGuard` and `abandon_native_streaming_worker_state`.
+    pub(crate) activity: crate::idle_activity::SharedNativeActivityGuard,
 }
 
 pub(crate) struct NativeStreamingWorkerState {
     pub(crate) active_or_attaching: AtomicUsize,
     pub(crate) idle_since: Mutex<Instant>,
+    /// Cancellation flag of whichever session is *currently* attached to this
+    /// worker's OS thread (the one `run_native_streaming_session_on_worker` is
+    /// presently driving), if any -- `None` while the thread is idle between
+    /// attaches. Set (and cleared again once that attach finishes, whether
+    /// normally or abandoned) by `NativeStreamingDecodeWorker::attach` and
+    /// `spawn_native_streaming_worker`'s loop.
+    ///
+    /// A same-key attach that finds the worker still occupied checks this
+    /// before deciding to queue behind it (see
+    /// `native_streaming_worker_for_key`): if the occupant's owning WS
+    /// connection already called `detach_cancel` (transport close, or an
+    /// explicit session cancel -- the only two ways `cancel_requested` gets
+    /// set in this codebase, and both already drop that attach's command
+    /// channel in the same call), continuing to wait cannot help -- a
+    /// cancelled attach does no further useful decode work, it is only
+    /// waiting for whatever single in-flight command it was mid-processing
+    /// to return. In that case the new attach immediately abandons this
+    /// worker (the same eviction path the decode watchdog uses) instead of
+    /// queueing behind an occupant nobody is waiting on anymore.
+    pub(crate) current_cancel_requested: Mutex<Option<Arc<AtomicBool>>>,
+    /// The current occupant's shared activity guard, mirroring
+    /// `current_cancel_requested` above -- so the same-key preemption path
+    /// can force-release it without the registry needing a live reference to
+    /// the specific `WsSession` that owns it.
+    pub(crate) current_activity: Mutex<Option<crate::idle_activity::SharedNativeActivityGuard>>,
+    /// Set once by `abandon_native_streaming_worker_state` when this worker
+    /// instance is abandoned (decode watchdog timeout, or same-key
+    /// preemption). The worker OS thread cannot be interrupted, so if it is
+    /// currently stuck it keeps running; this flag is what makes its
+    /// eventual (possibly much later) completion harmless -- see
+    /// `run_native_streaming_session_on_worker` and
+    /// `warm_up_native_streaming_session_once`, which both check it after a
+    /// blocking call returns, before performing any process-wide side effect.
+    pub(crate) abandoned: AtomicBool,
 }
 
 impl NativeStreamingWorkerState {
@@ -104,6 +143,9 @@ impl NativeStreamingWorkerState {
         Self {
             active_or_attaching: AtomicUsize::new(1),
             idle_since: Mutex::new(now),
+            current_cancel_requested: Mutex::new(None),
+            current_activity: Mutex::new(None),
+            abandoned: AtomicBool::new(false),
         }
     }
 
@@ -235,8 +277,12 @@ pub(crate) enum NativeStreamingWorkerMessage {
         /// has fully processed the session (see
         /// `spawn_native_streaming_worker`), or the sender if the message
         /// never gets received at all (the `mpsc::Sender::send` error path
-        /// returns the whole message, guard included, so it drops there).
-        activity: crate::idle_activity::NativeActivityGuard,
+        /// returns the whole message, guard included, so it drops there). A
+        /// clone of this same guard also lives in `NativeStreamingWorkerState
+        /// ::current_activity` for as long as this attach is the worker's
+        /// occupant, so a decode watchdog timeout or a same-key preemption can
+        /// force an early release; see `SharedNativeActivityGuard`.
+        activity: crate::idle_activity::SharedNativeActivityGuard,
     },
 }
 
@@ -251,6 +297,14 @@ pub(crate) struct NativeStreamingDecodeWorker {
     pub(crate) outcomes: mpsc::Receiver<NativeStreamingOutcome>,
     pub(crate) finalize_requested: Arc<AtomicBool>,
     pub(crate) cancel_requested: Arc<AtomicBool>,
+    /// The worker-key and shared registry state this attach's OS thread is
+    /// keyed under. Retained so the WS-session-level decode watchdog
+    /// (`ws_session.rs`'s `enforce_native_streaming_watchdog` /
+    /// `native_streaming_command`) can evict a stuck worker via
+    /// `abandon_stuck_native_streaming_worker` without a second registry
+    /// lookup.
+    pub(crate) key: NativeStreamingWorkerKey,
+    pub(crate) state: Arc<NativeStreamingWorkerState>,
 }
 
 impl NativeStreamingDecodeWorker {
@@ -265,14 +319,15 @@ impl NativeStreamingDecodeWorker {
             mpsc::channel::<NativeStreamingOutcome>(NATIVE_STREAMING_OUTCOME_QUEUE_CAPACITY);
         let finalize_requested = Arc::new(AtomicBool::new(false));
         let cancel_requested = Arc::new(AtomicBool::new(false));
-        let worker = native_streaming_worker_for_key(key);
+        let worker = native_streaming_worker_for_key(key.clone());
         // `worker.activity` moves into the message: on success the worker
         // thread now owns retiring it (exactly once, after it finishes
-        // processing this session); on failure `send` hands the whole
-        // message -- guard included -- back in its `Err`, so letting that
-        // error value drop here retires the activity count without any
-        // separate manual call. There is no path that both enters and never
-        // exits.
+        // processing this session, or earlier if a watchdog/preemption
+        // trigger force-releases it first -- see `SharedNativeActivityGuard`);
+        // on failure `send` hands the whole message -- guard included -- back
+        // in its `Err`, so letting that error value drop here retires the
+        // activity count without any separate manual call. There is no path
+        // that both enters and never exits.
         if let Err(send_error) = worker
             .sender
             .send(NativeStreamingWorkerMessage::Attach {
@@ -281,7 +336,7 @@ impl NativeStreamingDecodeWorker {
                 outcomes: outcome_tx,
                 finalize_requested: Arc::clone(&finalize_requested),
                 cancel_requested: Arc::clone(&cancel_requested),
-                activity: worker.activity,
+                activity: worker.activity.clone(),
             })
             .await
         {
@@ -289,11 +344,30 @@ impl NativeStreamingDecodeWorker {
             worker.state.release();
             return Err("native streaming worker stopped before session attach".to_string());
         }
+        // Only now, after the worker thread is guaranteed to (eventually)
+        // receive this Attach message, record it as the worker's current
+        // occupant: a failed `send` above means no occupant change actually
+        // happened, and must not stomp whatever occupant record (if any)
+        // already belonged to the previous attach.
+        *worker
+            .state
+            .current_cancel_requested
+            .lock()
+            .expect("native streaming worker current-cancel mutex poisoned") =
+            Some(Arc::clone(&cancel_requested));
+        *worker
+            .state
+            .current_activity
+            .lock()
+            .expect("native streaming worker current-activity mutex poisoned") =
+            Some(worker.activity.clone());
         Ok(Self {
             commands: command_tx,
             outcomes: outcome_rx,
             finalize_requested,
             cancel_requested,
+            key,
+            state: worker.state,
         })
     }
 
@@ -322,26 +396,56 @@ pub(crate) fn native_streaming_worker_for_key(
     let mut workers = registry
         .lock()
         .expect("native streaming worker registry mutex poisoned");
-    if let Some(entry) = workers.get(&key)
-        && !entry.sender.is_closed()
-    {
-        entry.state.acquire();
-        // idle_unload must never fire while a native session is attached to
-        // (or attaching to) any worker. `NativeActivityGuard::enter()` starts
-        // that window; ownership rides in `NativeStreamingWorkerHandle` (and
-        // then the `Attach` message) until whichever side ends up retiring it
-        // -- see the doc comments on those types.
-        return NativeStreamingWorkerHandle {
-            sender: entry.sender.clone(),
-            state: entry.state.clone(),
-            activity: crate::idle_activity::NativeActivityGuard::enter(),
-        };
+    if let Some(entry) = workers.get(&key) {
+        // Fix B (same-key preemption): the worker OS thread is alive, but if
+        // its current occupant's owning WS connection already disconnected
+        // (`detach_cancel` already set `cancel_requested` -- the same signal
+        // a transport close or an explicit session cancel already produce,
+        // no new protocol), waiting for it cannot help this new attach. A
+        // cancelled occupant does no further useful decode work; it can only
+        // still be mid-processing whatever single command it happened to be
+        // running when its client disappeared, which may never return (a
+        // stuck Metal `waitUntilCompleted` cannot be aborted). Abandon it now
+        // instead of queueing behind it.
+        let occupant_abandoned_by_client = entry
+            .state
+            .current_cancel_requested
+            .lock()
+            .expect("native streaming worker current-cancel mutex poisoned")
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire));
+        if !entry.sender.is_closed() && !occupant_abandoned_by_client {
+            entry.state.acquire();
+            // idle_unload must never fire while a native session is attached to
+            // (or attaching to) any worker. `SharedNativeActivityGuard::new()`
+            // starts that window; ownership rides in
+            // `NativeStreamingWorkerHandle` (and then the `Attach` message)
+            // until whichever side ends up retiring it -- see the doc
+            // comments on those types.
+            return NativeStreamingWorkerHandle {
+                sender: entry.sender.clone(),
+                state: entry.state.clone(),
+                activity: crate::idle_activity::SharedNativeActivityGuard::new(),
+            };
+        }
+        if occupant_abandoned_by_client {
+            abandon_native_streaming_worker_state(
+                &key,
+                &entry.state,
+                "same_key_preemption: previous occupant's client already disconnected",
+            );
+        }
+        // Either the OS thread already exited (`sender.is_closed()`) or its
+        // occupant was just abandoned above: fall through and spawn a fresh
+        // worker. `workers.insert` a few lines down replaces this entry,
+        // dropping the registry's last handle to the old thread's message
+        // sender.
     }
 
     let (sender, receiver) =
         mpsc::channel::<NativeStreamingWorkerMessage>(SHARED_BACKEND_WORKER_QUEUE_CAPACITY);
     let state = Arc::new(NativeStreamingWorkerState::new_acquired(Instant::now()));
-    let activity = crate::idle_activity::NativeActivityGuard::enter();
+    let activity = crate::idle_activity::SharedNativeActivityGuard::new();
     spawn_native_streaming_worker(receiver, state.clone());
     workers.insert(
         key,
@@ -386,6 +490,116 @@ pub(crate) fn prune_idle_native_streaming_workers(now: Instant, idle_for: Durati
     before - workers.len()
 }
 
+/// Native decode worker watchdog timeouts, one budget per operation class.
+/// The desktop client gives up on a stuck finalize after ~8s and force-
+/// restarts the daemon (see the investigation that motivated this: the WS
+/// session used to wait on the shared, HTTP-job-oriented 300s
+/// `OPENASR_REALTIME_BACKEND_RESULT_TIMEOUT_SECS` default, far past that 8s
+/// deadline). Every budget below is deliberately smaller so the *server*
+/// fails closed with a typed `BackendCrashed` error, and evicts the stuck
+/// worker (see `abandon_stuck_native_streaming_worker`), before the client
+/// ever gives up and force-restarts the daemon -- an explainable error beats
+/// a bare timeout plus a lost daemon.
+///
+/// `Warm`/`Finalize`/`SplitUtterance`/`Finish`/`Cancel` can each pay a cold
+/// runtime rebuild (observed 1.5-2.1s) or a full re-decode of the buffered
+/// utterance (observed sub-second for realistic dictation utterances); 6s
+/// leaves more than 2x headroom over the slowest observed legitimate case
+/// while still finishing a full 2s before the client's ~8s deadline.
+const NATIVE_STREAMING_HEAVY_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
+/// `PushAudio`/`Poll` push or pull one ~20ms audio frame's worth of
+/// incremental decode state and are never expected to approach the
+/// cold-rebuild budget; a much tighter 3s budget catches a stuck per-frame
+/// step long before it could ever compound into a client-visible stall.
+const NATIVE_STREAMING_LIGHT_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Production default decode-watchdog budget for one command `kind`. Tests
+/// that need a different budget (a tight one, to exercise the watchdog
+/// without a real multi-second sleep, or -- for the real-model smoke test --
+/// a much longer one to absorb real hardware variance) set
+/// `WsSession::native_decode_timeout_override` instead of calling this
+/// directly.
+pub(crate) fn native_streaming_command_timeout(kind: NativeStreamingCommandKind) -> Duration {
+    match kind {
+        NativeStreamingCommandKind::Warm
+        | NativeStreamingCommandKind::Finalize
+        | NativeStreamingCommandKind::SplitUtterance
+        | NativeStreamingCommandKind::Finish
+        | NativeStreamingCommandKind::Cancel => NATIVE_STREAMING_HEAVY_COMMAND_TIMEOUT,
+        NativeStreamingCommandKind::PushAudio | NativeStreamingCommandKind::Poll => {
+            NATIVE_STREAMING_LIGHT_COMMAND_TIMEOUT
+        }
+    }
+}
+
+/// The state-mutating half of worker abandonment: shared by
+/// `abandon_stuck_native_streaming_worker` (the decode-watchdog trigger,
+/// which does not already hold the registry lock and so also evicts the
+/// registry entry itself) and `native_streaming_worker_for_key`'s same-key
+/// preemption check (which already holds the registry lock and lets its own
+/// following `workers.insert` replace the entry instead of removing it here).
+///
+/// Marks the worker instance abandoned and force-releases whatever activity
+/// accounting its current occupant still holds. Does **not** touch the OS
+/// thread itself -- a stuck Metal `waitUntilCompleted` cannot be aborted from
+/// outside its own thread, so the thread is simply left to finish (or never
+/// finish) on its own; see `run_native_streaming_session_on_worker` and
+/// `warm_up_native_streaming_session_once` for how its eventual late
+/// completion is made harmless.
+fn abandon_native_streaming_worker_state(
+    key: &NativeStreamingWorkerKey,
+    state: &NativeStreamingWorkerState,
+    reason: &str,
+) {
+    state.abandoned.store(true, Ordering::Release);
+    let released_activity = state
+        .current_activity
+        .lock()
+        .expect("native streaming worker current-activity mutex poisoned")
+        .take();
+    if let Some(activity) = released_activity {
+        activity.release();
+    }
+    openasr_core::stage_timing::log_event(
+        "native_streaming_watchdog",
+        format_args!(
+            "model_pack_path={} hardware_target={} inference_threads={:?} reason={reason} \
+             action=abandon_worker",
+            key.model_pack_path.display(),
+            key.hardware_target,
+            key.inference_threads,
+        ),
+    );
+}
+
+/// Decode-watchdog trigger: `key`'s worker did not return a command outcome
+/// within its budget (see `ws_session.rs`'s `enforce_native_streaming_watchdog`
+/// / `native_streaming_command`). Evicts `key`'s registry entry -- but only if
+/// it still points at exactly `state` (`Arc::ptr_eq`), guarding against a
+/// race with a *different* trigger (the same-key preemption path, or another
+/// watchdog firing concurrently) that already evicted or replaced it, which
+/// would otherwise remove a different, perfectly healthy worker that has
+/// since taken this key -- then delegates the rest of the abandonment to
+/// [`abandon_native_streaming_worker_state`].
+pub(crate) fn abandon_stuck_native_streaming_worker(
+    key: &NativeStreamingWorkerKey,
+    state: &Arc<NativeStreamingWorkerState>,
+    reason: &str,
+) {
+    if let Some(registry) = SHARED_NATIVE_STREAMING_WORKERS.get() {
+        let mut workers = registry
+            .lock()
+            .expect("native streaming worker registry mutex poisoned");
+        if workers
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.state, state))
+        {
+            workers.remove(key);
+        }
+    }
+    abandon_native_streaming_worker_state(key, state, reason);
+}
+
 pub(crate) fn spawn_native_streaming_worker(
     mut receiver: mpsc::Receiver<NativeStreamingWorkerMessage>,
     state: Arc<NativeStreamingWorkerState>,
@@ -409,16 +623,34 @@ pub(crate) fn spawn_native_streaming_worker(
                             outcomes,
                             finalize_requested,
                             cancel_requested,
+                            &state.abandoned,
                         );
                         state.release();
                         // `activity` was handed off from
                         // `native_streaming_worker_for_key` once this message
-                        // was actually received; dropping it here (rather
-                        // than a separate manual `native_activity_exit` call)
-                        // is what makes the enter/exit pairing unconditional
-                        // -- there is no longer a code path that enters
-                        // without a guard whose drop retires it exactly once.
-                        drop(activity);
+                        // was actually received. Calling `release()` (rather
+                        // than relying on `Drop`) is what makes the
+                        // enter/exit pairing unconditional -- there is no
+                        // longer a code path that enters without a guard
+                        // whose release retires it exactly once -- and it is
+                        // idempotent, so this is a no-op if a decode watchdog
+                        // or same-key preemption already force-released this
+                        // same guard while this call was stuck.
+                        activity.release();
+                        // Clear the occupant record: whoever attaches next
+                        // (reusing this thread, or -- if this attach was
+                        // abandoned -- a brand new one spawned under the same
+                        // key) must not inherit a stale cancelled/activity
+                        // record that belonged to this now-finished attach.
+                        *state
+                            .current_cancel_requested
+                            .lock()
+                            .expect("native streaming worker current-cancel mutex poisoned") = None;
+                        *state
+                            .current_activity
+                            .lock()
+                            .expect("native streaming worker current-activity mutex poisoned") =
+                            None;
                     }
                 }
             }
@@ -432,17 +664,32 @@ pub(crate) fn run_native_streaming_session_on_worker(
     outcomes: mpsc::Sender<NativeStreamingOutcome>,
     finalize_requested: Arc<AtomicBool>,
     cancel_requested: Arc<AtomicBool>,
+    abandoned: &AtomicBool,
 ) {
     session.set_cancellation_token(Arc::clone(&cancel_requested));
     let mut terminal_received = false;
     while let Some(envelope) = commands.blocking_recv() {
         let kind = envelope.kind;
+        if abandoned.load(Ordering::Acquire) {
+            // This attach was abandoned (decode watchdog timeout, or a
+            // same-key preemption) while this thread was stuck processing a
+            // previous command, or idle between commands: stop taking
+            // further commands for a session the rest of the process has
+            // already forgotten about (its registry entry and activity
+            // accounting are already gone). Whatever was in flight when the
+            // abandonment happened is not affected by this check -- it can
+            // only run to completion or hang forever, per the usual
+            // un-abortable-Metal-call caveat -- this only stops the *next*
+            // command from starting.
+            break;
+        }
         if cancel_requested.load(Ordering::Acquire) && kind != NativeStreamingCommandKind::Cancel {
             break;
         }
         let (result, terminal) = match envelope.command {
             NativeStreamingCommand::Warm => (
-                warm_up_native_streaming_session_once(session.as_mut()).map(|()| Vec::new()),
+                warm_up_native_streaming_session_once(session.as_mut(), abandoned)
+                    .map(|()| Vec::new()),
                 false,
             ),
             NativeStreamingCommand::PushAudio(frame) => (session.push_audio(frame), false),
@@ -505,6 +752,7 @@ pub(crate) fn run_native_streaming_session_on_worker(
 /// exists to avoid.
 pub(crate) fn warm_up_native_streaming_session_once(
     session: &mut dyn NativeAsrSession,
+    abandoned: &AtomicBool,
 ) -> Result<(), openasr_core::NativeAsrError> {
     thread_local! {
         static WARMED_AT_GENERATION: std::cell::Cell<Option<u64>> =
@@ -519,10 +767,23 @@ pub(crate) fn warm_up_native_streaming_session_once(
     session.warm_up()?;
     openasr_core::stage_timing::log_stage("realtime_warmup", "complete", warmup_started.elapsed());
     WARMED_AT_GENERATION.with(|warmed| warmed.set(Some(current_generation)));
-    // Process-wide counterpart of the thread-local gate above, so `/health`
-    // can answer "is the model resident" without reaching into any worker
-    // thread's TLS -- see `idle_activity::native_model_is_resident`.
-    crate::idle_activity::mark_native_model_warm();
+    // A decode watchdog or same-key preemption may have already abandoned
+    // this attach (evicted its registry entry, force-released its activity
+    // guard) while `session.warm_up()` above was still stuck -- this thread
+    // has no way to know that until the blocking call above actually
+    // returns. If so, this warm-up finished too late to matter to anything
+    // still watching, and must not mark the model resident here: `/health`
+    // would otherwise report a model resident on the strength of a worker
+    // instance the process has already abandoned, possibly while a fresh
+    // worker for the same key has its own, unrelated warm state in
+    // progress -- see `idle_activity::mark_native_model_warm`.
+    if !abandoned.load(Ordering::Acquire) {
+        // Process-wide counterpart of the thread-local gate above, so
+        // `/health` can answer "is the model resident" without reaching into
+        // any worker thread's TLS -- see
+        // `idle_activity::native_model_is_resident`.
+        crate::idle_activity::mark_native_model_warm();
+    }
     Ok(())
 }
 

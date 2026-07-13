@@ -5,6 +5,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Server: the shared native-streaming decode worker (one OS thread per model-key, serially processing every attached session's commands) now has a real watchdog and same-key preemption, closing three related failure modes that traced back to one structural gap -- a single decode call had no timeout smaller than the WS layer's 300s HTTP-job-oriented default, and a stuck worker OS thread cannot be interrupted (a Metal `waitUntilCompleted` cannot be aborted from another thread): (1) a hung `PushAudio`/`Finish`/etc. call used to leave the WS session waiting up to 300s -- far past the desktop client's own ~8s finalize deadline, so the client gave up and force-restarted the daemon before the server ever reported anything; (2) a new attach for the same model-key queued behind that stuck worker indefinitely, since nothing evicted it; (3) `idle_unload`'s activity accounting stayed pinned non-idle for as long as the stuck (or merely slow-to-notice-its-WS-closed) session's worker thread never returned, delaying the next eviction by however long that took. The watchdog now fires well inside the client's deadline (6s for cold-build-or-full-redecode commands, 3s for per-frame commands) and evicts the stuck worker (removes it from the shared registry, force-releases its `idle_unload` activity accounting) instead of waiting on it; the abandoned OS thread is deliberately never joined or cancelled, only abandoned, and a new attach for the same key that finds the current occupant already disconnected preempts it immediately instead of queuing behind it. A late-finishing abandoned thread's warm-up can no longer mark the model resident on `/health`'s behalf.
+
 ## [0.1.13] - 2026-07-12
 
 ### Added
