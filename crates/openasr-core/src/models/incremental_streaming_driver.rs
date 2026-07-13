@@ -65,6 +65,15 @@ pub(crate) struct StreamingPartialTuning {
     first_partial_audio_ms: u32,
     window_ms: u64,
     partial_prompt_tail_words: Option<usize>,
+    /// Fewest raw samples this family's encoder can turn into at least one
+    /// output frame. `None` means every family sharing this tuning constant
+    /// already fails closed on a too-short input by itself (no separate
+    /// pre-decode floor needed); set per-session via
+    /// `with_minimum_encodable_samples` for families whose encoder aborts
+    /// instead of erroring on an under-sized input (see dolphin's
+    /// `start_streaming_session`). Below this floor the driver skips the
+    /// decode call entirely instead of attempting one the encoder cannot run.
+    minimum_encodable_samples: Option<usize>,
 }
 
 impl StreamingPartialTuning {
@@ -78,7 +87,17 @@ impl StreamingPartialTuning {
             first_partial_audio_ms,
             window_ms: DEFAULT_TOKEN_INCREMENTAL_WINDOW_MS,
             partial_prompt_tail_words,
+            minimum_encodable_samples: None,
         }
+    }
+
+    /// Attach a per-session minimum encodable sample count (computed from the
+    /// pack's own resolved config, e.g. dolphin's language scheme -> frontend
+    /// framing -> encoder receptive field), without disturbing the shared
+    /// `const` tuning profile other families reuse.
+    pub(crate) const fn with_minimum_encodable_samples(mut self, samples: usize) -> Self {
+        self.minimum_encodable_samples = Some(samples);
+        self
     }
 
     pub(crate) const fn min_partial_interval_ms(&self) -> u32 {
@@ -95,6 +114,10 @@ impl StreamingPartialTuning {
 
     pub(crate) const fn partial_prompt_tail_words(&self) -> Option<usize> {
         self.partial_prompt_tail_words
+    }
+
+    pub(crate) const fn minimum_encodable_samples(&self) -> Option<usize> {
+        self.minimum_encodable_samples
     }
 }
 
@@ -185,21 +208,23 @@ where
                 .map(|result| result.transcription)
         },
     );
-    Box::new(
-        IncrementalStreamingTranscriptDriver::new(
-            executor_id,
-            adapter_id,
-            utterance_id,
-            segment_id,
-            1,
-            transcribe,
-        )
-        .with_partial_results(partial_results)
-        .with_partial_cadence(partial_floor_ms)
-        .with_first_partial_audio_ms(u64::from(tuning.first_partial_audio_ms))
-        .with_partial_window_ms(tuning.window_ms)
-        .with_partial_prompt_tail_words(tuning.partial_prompt_tail_words()),
+    let mut driver = IncrementalStreamingTranscriptDriver::new(
+        executor_id,
+        adapter_id,
+        utterance_id,
+        segment_id,
+        1,
+        transcribe,
     )
+    .with_partial_results(partial_results)
+    .with_partial_cadence(partial_floor_ms)
+    .with_first_partial_audio_ms(u64::from(tuning.first_partial_audio_ms))
+    .with_partial_window_ms(tuning.window_ms)
+    .with_partial_prompt_tail_words(tuning.partial_prompt_tail_words());
+    if let Some(minimum_encodable_samples) = tuning.minimum_encodable_samples() {
+        driver = driver.with_minimum_encodable_samples(minimum_encodable_samples);
+    }
+    Box::new(driver)
 }
 
 /// Shared `start_streaming_session` body for the seq2seq GGML families
@@ -343,6 +368,13 @@ pub(crate) struct IncrementalStreamingTranscriptDriver {
     /// accumulated across re-decodes (that is what caused boundary drift).
     prompt_context: String,
     partial_prompt_tail_words: Option<usize>,
+    /// Fewest raw samples the family's encoder can turn into at least one
+    /// output frame (see `StreamingPartialTuning::minimum_encodable_samples`).
+    /// Below this floor, `poll_updates`/`finish_updates` skip the decode call
+    /// and return a clean empty result instead of attempting a decode the
+    /// encoder cannot run: a too-short trailing window (e.g. a very brief
+    /// press-to-talk) is normal usage, not an error.
+    minimum_encodable_samples: Option<usize>,
     /// Cached whole-buffer PARTIAL decode reused by an unchanged terminal
     /// finalize (see [`FinalizeReuse`]).
     finalize_reuse: Option<FinalizeReuse>,
@@ -385,6 +417,7 @@ impl IncrementalStreamingTranscriptDriver {
             window_ms: 0,
             prompt_context: String::new(),
             partial_prompt_tail_words: None,
+            minimum_encodable_samples: None,
             finalize_reuse: None,
             finalize_reuse_hits: 0,
             finalize_reuse_misses: 0,
@@ -422,6 +455,19 @@ impl IncrementalStreamingTranscriptDriver {
     pub(crate) fn with_partial_prompt_tail_words(mut self, tail_words: Option<usize>) -> Self {
         self.partial_prompt_tail_words = tail_words.filter(|words| *words > 0);
         self
+    }
+
+    /// See the field doc on `minimum_encodable_samples`.
+    pub(crate) fn with_minimum_encodable_samples(mut self, samples: usize) -> Self {
+        self.minimum_encodable_samples = Some(samples);
+        self
+    }
+
+    /// Whether the current buffer has fewer samples than the family's encoder
+    /// can turn into output (a no-op / `None` floor never blocks a decode).
+    fn buffer_below_minimum_encodable_samples(&self) -> bool {
+        self.minimum_encodable_samples
+            .is_some_and(|minimum| self.buffer.sample_count() < minimum)
     }
 
     fn new_cadence(&self) -> PartialDecodeCadence {
@@ -465,7 +511,11 @@ impl IncrementalStreamingTranscriptDriver {
     fn decode_partial_if_due(
         &mut self,
     ) -> Result<Vec<GgmlAsrStreamingTranscriptUpdate>, GgmlAsrExecutionError> {
-        if !self.partial_results || self.final_emitted || self.buffer.is_empty() {
+        if !self.partial_results
+            || self.final_emitted
+            || self.buffer.is_empty()
+            || self.buffer_below_minimum_encodable_samples()
+        {
             return Ok(Vec::new());
         }
         let audio_end_ms = self.buffer.end_ms().unwrap_or(0);
@@ -739,6 +789,15 @@ impl GgmlAsrStreamingTranscriptDriver for IncrementalStreamingTranscriptDriver {
         &mut self,
     ) -> Result<Vec<GgmlAsrStreamingTranscriptUpdate>, GgmlAsrExecutionError> {
         if self.buffer.is_empty() || self.final_emitted {
+            return Ok(Vec::new());
+        }
+        // A trailing window shorter than the encoder's receptive field is
+        // normal usage (e.g. a very brief press-to-talk that never crossed
+        // the first-partial floor, so no partial ever ran either), not an
+        // error: finish cleanly with no additional update instead of
+        // attempting a decode the encoder cannot turn into output. Whatever
+        // was already committed/finalized earlier in the utterance stands.
+        if self.buffer_below_minimum_encodable_samples() {
             return Ok(Vec::new());
         }
         // The FINAL decodes whatever audio remains in the buffer — i.e. the current
@@ -1320,5 +1379,84 @@ mod tests {
             trim_committed_overlap("确实是在我的预料之中啊。", "的预料之中啊！后续内容", 12),
             "后续内容"
         );
+    }
+
+    // --- minimum-encodable-samples short-tail guard -------------------------
+    //
+    // Regression coverage for the dolphin idle_unload crash: a streaming FINAL
+    // (or, defensively, a PARTIAL) over a trailing window shorter than the
+    // family's encoder can turn into output must finish cleanly with no
+    // decode attempt, not surface an error or crash.
+
+    #[test]
+    fn finish_skips_decode_and_returns_empty_below_the_minimum_encodable_samples_floor() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_decode = Arc::clone(&calls);
+        let mut driver = IncrementalStreamingTranscriptDriver::new(
+            "token-incremental-test-executor",
+            crate::QWEN3_ASR_GGML_ADAPTER_ID,
+            "utt_min_final",
+            "seg_min_final",
+            0,
+            Box::new(move |_audio, _prompt| {
+                calls_for_decode.fetch_add(1, Ordering::SeqCst);
+                Ok(transcription("should never be reached"))
+            }),
+        )
+        .with_partial_results(false)
+        .with_minimum_encodable_samples(1_000);
+
+        // One 20 ms frame is 320 samples, well under the 1,000-sample floor.
+        driver.push_audio(frame(0, 0)).unwrap();
+        let final_ = driver.finish_updates().unwrap();
+        assert!(
+            final_.is_empty(),
+            "a too-short trailing window must finish with an empty (not erroring) result"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "must not attempt a decode the encoder cannot run"
+        );
+    }
+
+    #[test]
+    fn finish_decodes_normally_once_the_buffer_reaches_the_minimum_encodable_samples_floor() {
+        let mut driver = driver(VecDeque::from(["ok"])).with_minimum_encodable_samples(100);
+        // frame() pushes 320 samples, at/over the 100-sample floor.
+        driver.push_audio(frame(1, 0)).unwrap();
+        let final_ = driver.finish_updates().unwrap();
+        assert_eq!(text_of(&final_[0]).0, "ok");
+    }
+
+    #[test]
+    fn poll_updates_skips_decode_below_the_minimum_encodable_samples_floor() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut driver = counting_windowed_driver(30_000, Arc::clone(&calls))
+            .with_minimum_encodable_samples(1_000);
+
+        // One 20 ms frame is 320 samples, under the floor: poll must not decode.
+        driver.push_audio(vframe(1, 0)).unwrap();
+        let updates = driver.poll_updates().unwrap();
+        assert!(updates.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Once enough audio has accumulated, partials resume normally.
+        for i in 2..=4 {
+            driver.push_audio(vframe(i, (i - 1) * 20)).unwrap();
+        }
+        let updates = driver.poll_updates().unwrap();
+        assert_eq!(text_of(&updates[0]).0, "w0 w1 w2 w3");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn no_minimum_encodable_samples_floor_never_blocks_a_decode() {
+        // Default (no family opted in): even a single-frame buffer decodes
+        // normally, matching every family's behavior before this guard existed.
+        let mut driver = driver(VecDeque::from(["ok"]));
+        driver.push_audio(frame(1, 0)).unwrap();
+        let final_ = driver.finish_updates().unwrap();
+        assert_eq!(text_of(&final_[0]).0, "ok");
     }
 }

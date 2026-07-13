@@ -37,8 +37,12 @@ use crate::models::incremental_streaming_driver::{
 use super::decoder_graph::DolphinDecoderConfig;
 use super::encoder_graph::{
     DolphinEncoderConfig, DolphinEncoderOutput, DolphinNativeWeight, DolphinWeightProvider, encode,
+    minimum_subsample_input_frames,
 };
-use super::frontend::{DolphinEspnetFrontend, DolphinFbankFrontend, apply_global_cmvn};
+use super::frontend::{
+    DolphinEspnetFrontend, DolphinFbankFrontend, apply_global_cmvn, espnet_min_samples_for_frames,
+    kaldi_min_samples_for_frames,
+};
 use super::hotword_context::{
     apply_hotword_deep_biasing, encode_hotword_context_embeddings, tokenize_hotword_phrase,
 };
@@ -638,6 +642,28 @@ impl GgmlAsrStreamingExecutor for DolphinGgmlExecutor {
         &self,
         request: &GgmlAsrStreamingSessionRequest,
     ) -> Result<Box<dyn NativeAsrSession>, GgmlAsrExecutionError> {
+        let fail = |reason: String| GgmlAsrExecutionError::ExecutorFailed {
+            executor_id: DOLPHIN_STREAMING_EXECUTOR_ID,
+            adapter_id: request.selected_family.adapter_id,
+            reason,
+        };
+        // Resolve the pack's language scheme once here so the streaming driver
+        // can be told the minimum raw-sample count its frontend + encoder can
+        // turn into output (see `minimum_encodable_samples` below): a trailing
+        // window shorter than the Conv2dSubsampling4 receptive field (7 mel
+        // frames, no padding) reaches `ggml_conv_2d`'s `im2col` precondition
+        // and aborts the whole process instead of returning a Rust error (the
+        // idle_unload short-press crash), so the driver must skip that decode
+        // call entirely rather than rely on catching an error afterward.
+        let preflight = request
+            .resolve_runtime_source_preflight()
+            .map_err(|error| fail(error.to_string()))?;
+        let language_scheme = parse_dolphin_language_scheme(&preflight.metadata).map_err(fail)?;
+        let min_frames = minimum_subsample_input_frames();
+        let min_samples = match language_scheme {
+            DolphinLanguageScheme::CnDialect => kaldi_min_samples_for_frames(min_frames),
+            DolphinLanguageScheme::Multilingual => espnet_min_samples_for_frames(min_frames),
+        };
         // Dolphin has no cheap CTC-greedy partial surface (the pipeline output
         // exposes only the rescored transcript), so partials re-decode the
         // trailing window through the same offline joint decode as the FINAL.
@@ -650,7 +676,7 @@ impl GgmlAsrStreamingExecutor for DolphinGgmlExecutor {
             DOLPHIN_GGML_ADAPTER_ID,
             "dolphin",
             request,
-            STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT,
+            STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT.with_minimum_encodable_samples(min_samples),
             <DolphinGgmlExecutor as GgmlAsrExecutor>::execute,
         )
     }
