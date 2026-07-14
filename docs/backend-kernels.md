@@ -95,20 +95,27 @@ This is a linkage sanity check, orthogonal to the `sha256` check:
 
 ## Signing
 
-Reuses `openasr-core`'s existing catalog-signature scheme byte-for-byte: the
-same envelope shape (`schema_version`, `catalog_url`, `catalog_sha256`,
-`catalog_epoch`, `signature{algorithm,key_id,value}`), the same Ed25519
-algorithm, and the **same production trust roots**
-(`OPENASR_CATALOG_TRUST_ROOTS`) the model catalog signature already uses.
-There is no separate backend-kernel signing key to provision, rotate, or keep
-in sync -- see `crates/openasr-core/src/catalog_security.rs`.
+Signature verification lives in `crates/openasr-core/src/backends_manifest_security.rs`
+(module `backends_manifest_security`, re-exported at the crate root as
+`verify_backends_manifest_signature` / `render_backends_manifest_signature`),
+**not** in `backend_manifest.rs`. It reuses the model catalog's production
+signing key and trust root (`catalog_security::OPENASR_CATALOG_TRUST_ROOTS`,
+key id `openasr-catalog-v1`) -- one signing seed, one trust root, one place a
+maintainer manages key custody -- but signs under its own
+domain-separation label, `openasr.backends_manifest.v1` (vs. the catalog's
+`openasr.catalog_manifest.v1`), so a catalog signature can never be replayed
+as a backends-manifest signature or vice versa even though both verify under
+the same public key. The signature envelope is its own shape (`schema_version`,
+`manifest_url`, `manifest_sha256`, `signature{algorithm,key_id,value}`) --
+notably no `catalog_epoch`: unlike the catalog, this manifest has no shared
+mutable endpoint a stale signature could roll back (it is generated fresh per
+immutable, version-namespaced release URL), so it carries no anti-rollback
+epoch.
 
-In that reused envelope, `catalog_url` is the backends-manifest's own URL
-(binding a signature to exactly the URL it was fetched from, so it can never
-be replayed against a different manifest), and `catalog_epoch` is a
-monotonic publish counter scoped to this manifest, unrelated to the model
-catalog's epoch.
-
+`backend_manifest.rs` (this manifest's JSON *schema* -- `BackendsManifest`,
+`PlatformBackends`, `BackendEntry`, the `core_version` match rule, and the
+per-backend sha256 helper) calls into `backends_manifest_security` for the
+signature check and never re-implements Ed25519 verification itself.
 Verification entry point: `openasr_core::backend_manifest::verify_and_parse`
 (or `verify_and_parse_for_core_version`, which additionally enforces the
 version-match rule below). Both are fail-closed: a missing signature file, a
@@ -116,6 +123,10 @@ tampered manifest, a signature that does not verify, or an unsupported
 `schema_version` (anything other than `1`) all return `Err` with no
 partial-trust fallback. See `crates/openasr-core/src/backend_manifest.rs`'s
 module doc comment and unit tests for the exact failure modes covered.
+
+Signing itself stays a local, maintainer-run operation via the hidden CLI
+subcommand `__openasr-sign-backends-manifest` (the signing seed never enters
+CI) -- see `backends_manifest_security.rs`'s module doc comment.
 
 ## Version-matching rule
 

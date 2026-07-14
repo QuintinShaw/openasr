@@ -1,24 +1,36 @@
-//! Verification for the desktop app's **inference kernel** manifest
-//! (`backends-manifest.json` + `backends-manifest.signature.json`).
+//! Schema parsing + verified-fetch entry point for the desktop app's
+//! **inference kernel** manifest (`backends-manifest.json` +
+//! `backends-manifest.signature.json`).
 //!
-//! This is a SEPARATE concept from [`crate::pull::install_backend_pack`] (which
-//! downloads dynamically-loaded ggml backend *plugins* into a running daemon).
-//! The manifest verified here instead describes prebuilt, statically-linked
-//! `openasr-cli` release archives -- desktop swaps its whole sidecar binary
-//! (vulkan/cuda/hip) rather than loading a plugin into one. See
-//! `docs/backend-kernels.md` for the full contract.
+//! Signature verification itself is NOT implemented here: it is owned by
+//! [`crate::backends_manifest_security`] (Ed25519, reusing the model
+//! catalog's production signing key and trust root under a distinct
+//! domain-separation label, `openasr.backends_manifest.v1` vs the catalog's
+//! `openasr.catalog_manifest.v1`, so a catalog signature can never be
+//! replayed as a backends-manifest signature or vice versa -- see that
+//! module's doc comment for the full rationale). This module only:
 //!
-//! Signing reuses the exact catalog-signature scheme and production trust
-//! roots from [`crate::catalog_security`] (same Ed25519 keys, same
-//! `schema_version`/`catalog_url`/`catalog_sha256`/`catalog_epoch`/`signature`
-//! envelope shape) -- there is no second signing key or verification path to
-//! keep in sync. `catalog_url` in that envelope is the manifest's own URL, and
-//! `catalog_epoch` is a monotonic publish counter for this manifest, not the
-//! model catalog's.
+//! - defines the manifest's own JSON schema ([`BackendsManifest`],
+//!   [`PlatformBackends`], [`BackendEntry`]),
+//! - calls [`crate::verify_backends_manifest_signature`] before ever parsing
+//!   the manifest body ([`verify_and_parse`] is fail-closed: an unverified
+//!   manifest is never parsed, let alone trusted),
+//! - enforces the `core_version` match rule desktop relies on
+//!   ([`verify_and_parse_for_core_version`]), and
+//! - looks up entries by platform/backend and verifies a downloaded
+//!   archive's sha256 against them ([`BackendsManifest::backend_entry`],
+//!   [`BackendEntry::verify_sha256`]).
 //!
-//! Fail-closed: any missing signature, tampered manifest, signature mismatch,
-//! or unsupported `schema_version` is rejected. There is no "trust anyway"
-//! path.
+//! This is a SEPARATE concept from [`crate::pull::install_backend_pack`]
+//! (which downloads dynamically-loaded ggml backend *plugins* into a running
+//! daemon). The manifest verified here instead describes prebuilt,
+//! statically-linked `openasr-cli` release archives -- desktop swaps its
+//! whole sidecar binary (vulkan/cuda/hip) rather than loading a plugin into
+//! one. See `docs/backend-kernels.md` for the full contract.
+//!
+//! Fail-closed: any missing signature, tampered manifest, signature
+//! mismatch, or unsupported `schema_version` is rejected. There is no
+//! "trust anyway" path.
 
 use std::collections::BTreeMap;
 use std::str::Utf8Error;
@@ -27,17 +39,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::catalog_security::{self, CatalogSecurityError, CatalogTrustRoot};
+use crate::BackendsManifestSecurityError;
+#[cfg(test)]
+use crate::catalog_security::CatalogTrustRoot;
 
 /// Only `1` is understood. A manifest declaring anything else is rejected
 /// rather than best-effort parsed -- see [`BackendManifestError::UnsupportedSchema`].
 pub const BACKENDS_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
-/// Canonical manifest filename, served alongside its detached signature at
+/// Canonical manifest filename, served alongside its detached signature
+/// (see [`crate::BACKENDS_MANIFEST_SIGNATURE_FILE_NAME`], owned by
+/// [`crate::backends_manifest_security`]) at
 /// `https://dl.openasr.org/core/v<version>/` and as a GitHub release asset.
 pub const BACKENDS_MANIFEST_FILE_NAME: &str = "backends-manifest.json";
-/// Detached signature filename; same directory as the manifest.
-pub const BACKENDS_MANIFEST_SIGNATURE_FILE_NAME: &str = "backends-manifest.signature.json";
 
 /// Full parsed + schema-validated manifest. Signature verification and schema
 /// validation both already happened by the time a caller holds one of these --
@@ -130,7 +144,7 @@ pub enum BackendManifestError {
     #[error("could not parse backends manifest JSON: {0}")]
     Parse(#[source] serde_json::Error),
     #[error("backends manifest signature rejected: {0}")]
-    Signature(#[source] CatalogSecurityError),
+    Signature(#[source] BackendsManifestSecurityError),
     #[error(
         "unsupported backends manifest schema_version {found} (this build understands {BACKENDS_MANIFEST_SCHEMA_VERSION})"
     )]
@@ -147,28 +161,26 @@ pub enum BackendManifestError {
     Sha256Mismatch { expected: String, actual: String },
 }
 
-/// Verify the detached signature over `manifest_bytes` against the production
-/// catalog trust roots (see [`catalog_security::OPENASR_CATALOG_TRUST_ROOTS`]),
+/// Verify the detached signature over `manifest_bytes`
+/// ([`crate::verify_backends_manifest_signature`], production trust root),
 /// then parse and schema-validate the manifest. Fail-closed: a missing/invalid
 /// signature, a sha256 mismatch between `manifest_bytes` and what the signature
 /// covers, or an unsupported `schema_version` all return `Err` -- there is no
 /// partial-trust fallback.
 ///
 /// `expected_manifest_url` must be the exact URL the manifest was fetched from
-/// (or, for a local/dev manifest, the identity it was signed under) -- it is
-/// bound into the signed payload the same way a catalog URL is, so a signature
-/// for one manifest URL can never be replayed against another.
+/// -- it is bound into the signed payload the same way a catalog URL is, so a
+/// signature for one manifest URL can never be replayed against another.
 pub fn verify_and_parse(
     manifest_bytes: &[u8],
     signature_bytes: &[u8],
     expected_manifest_url: &str,
 ) -> Result<BackendsManifest, BackendManifestError> {
-    verify_and_parse_with_roots(
-        manifest_bytes,
-        signature_bytes,
-        expected_manifest_url,
-        catalog_security::OPENASR_CATALOG_TRUST_ROOTS,
-    )
+    let manifest_text = std::str::from_utf8(manifest_bytes)?;
+    let signature_text = std::str::from_utf8(signature_bytes)?;
+    crate::verify_backends_manifest_signature(manifest_text, signature_text, expected_manifest_url)
+        .map_err(BackendManifestError::Signature)?;
+    parse_and_validate_schema(manifest_text)
 }
 
 /// Like [`verify_and_parse`], additionally rejecting a manifest whose
@@ -193,11 +205,16 @@ pub fn verify_and_parse_for_core_version(
     Ok(manifest)
 }
 
-/// Test-only (and internal-reuse) hook: same as [`verify_and_parse`] but
-/// against a caller-supplied trust root set, mirroring
-/// `catalog_security::verify_catalog_signature_manifest_with_roots`. Exists so
-/// unit tests can sign fixtures with a throwaway keypair instead of the real
-/// (secret) production signing key -- see the `tests` module below.
+/// Test-only hook: same as [`verify_and_parse`] but against a caller-supplied
+/// trust root set, mirroring
+/// `backends_manifest_security::verify_backends_manifest_signature_with_roots`.
+/// Exists so unit tests can sign fixtures with a throwaway keypair instead of
+/// the real (secret) production signing key -- see the `tests` module below.
+/// `#[cfg(test)]`: unlike catalog_security's `_with_roots` (which the
+/// production-only wrapper itself funnels through), `verify_and_parse` calls
+/// `verify_backends_manifest_signature` directly, so this helper has no
+/// non-test caller.
+#[cfg(test)]
 pub(crate) fn verify_and_parse_with_roots(
     manifest_bytes: &[u8],
     signature_bytes: &[u8],
@@ -206,14 +223,19 @@ pub(crate) fn verify_and_parse_with_roots(
 ) -> Result<BackendsManifest, BackendManifestError> {
     let manifest_text = std::str::from_utf8(manifest_bytes)?;
     let signature_text = std::str::from_utf8(signature_bytes)?;
-    catalog_security::verify_catalog_signature_manifest_with_roots(
+    crate::backends_manifest_security::verify_backends_manifest_signature_with_roots(
         manifest_text,
         signature_text,
         expected_manifest_url,
         trust_roots,
     )
     .map_err(BackendManifestError::Signature)?;
+    parse_and_validate_schema(manifest_text)
+}
 
+fn parse_and_validate_schema(
+    manifest_text: &str,
+) -> Result<BackendsManifest, BackendManifestError> {
     let manifest: BackendsManifest =
         serde_json::from_str(manifest_text).map_err(BackendManifestError::Parse)?;
     if manifest.schema_version != BACKENDS_MANIFEST_SCHEMA_VERSION {
@@ -239,11 +261,12 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use catalog_security::{derive_catalog_public_key_hex, render_catalog_signature_manifest};
+    use crate::render_backends_manifest_signature;
 
     // Throwaway test keypair -- NOT the production signing key (that secret
-    // never appears in this repo). Mirrors catalog_security's own test
-    // fixtures, which use the identical pattern for the same reason.
+    // never appears in this repo). Mirrors both catalog_security's and
+    // backends_manifest_security's own test fixtures, which use the same
+    // pattern for the same reason.
     const TEST_SEED_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
     const TEST_KEY_ID: &str = "test-backends-manifest-key";
     const TEST_MANIFEST_URL: &str = "https://dl.openasr.org/core/v0.1.14/backends-manifest.json";
@@ -252,7 +275,7 @@ mod tests {
         [CatalogTrustRoot {
             key_id: TEST_KEY_ID,
             public_key_hex: Box::leak(
-                derive_catalog_public_key_hex(TEST_SEED_HEX)
+                crate::derive_catalog_public_key_hex(TEST_SEED_HEX)
                     .unwrap()
                     .into_boxed_str(),
             ),
@@ -289,8 +312,7 @@ mod tests {
     }
 
     fn sign(manifest_json: &str, url: &str) -> String {
-        render_catalog_signature_manifest(manifest_json, url, 1, TEST_KEY_ID, TEST_SEED_HEX)
-            .unwrap()
+        render_backends_manifest_signature(manifest_json, url, TEST_KEY_ID, TEST_SEED_HEX).unwrap()
     }
 
     #[test]
@@ -399,16 +421,16 @@ mod tests {
         let manifest_json = sample_manifest_json();
         let signature = sign(&manifest_json, TEST_MANIFEST_URL);
 
+        // verify_and_parse_for_core_version uses the production trust roots
+        // (via verify_and_parse), so this test-signed fixture fails signature
+        // verification first -- exercise the version-mismatch branch that is
+        // unique to this function directly against a parsed manifest instead.
         let error = verify_and_parse_for_core_version(
             manifest_json.as_bytes(),
             signature.as_bytes(),
             TEST_MANIFEST_URL,
             "9.9.9",
         );
-        // verify_and_parse_for_core_version uses the production trust roots, so
-        // this (test-signed) fixture fails signature verification first --
-        // exercise the version-mismatch branch directly against the parsed
-        // manifest instead, which is the part unique to this function.
         assert!(error.is_err());
 
         let parsed = verify_and_parse_with_roots(
