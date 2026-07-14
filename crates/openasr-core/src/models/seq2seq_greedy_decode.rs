@@ -1,6 +1,65 @@
+use std::cell::RefCell;
+
 use thiserror::Error;
 
 use crate::models::phrase_bias_decode::{TokenPhraseBias, apply_phrase_bias_to_logits};
+
+thread_local! {
+    // Optional per-token progress observer for the in-flight decode on this
+    // thread. Deliberately separate from `trace_token` (debug tracing has its
+    // own opt-in kind per policy, see `BuiltinDecodePolicySeq2SeqTraceKind`,
+    // and stays a no-op in production) -- this is a distinct, always-wireable
+    // hook so a higher layer (native file transcription) can observe decode
+    // progress without perturbing trace semantics. Modeled as a thread-local
+    // callback rather than a new parameter threaded through every family's
+    // `run_builtin_seq2seq_decode_policy` wrapper (cohere, whisper, qwen,
+    // moonshine, firered-aed, hymt2 each have their own error-mapping
+    // boilerplate around that single call): installing/removing the sink
+    // here keeps every family wrapper untouched. Native transcription runs
+    // the decode loop synchronously on the calling thread (see
+    // `CURRENT_PROGRESS_GENERATION` in `native_transcribe.rs` for the same
+    // assumption), so a thread-local is enough to attribute callbacks to the
+    // run that installed them.
+    static TOKEN_STEP_PROGRESS_SINK: RefCell<Option<Box<dyn FnMut(usize, usize)>>> =
+        const { RefCell::new(None) };
+}
+
+/// RAII handle for an installed token-step progress sink: restores whatever
+/// sink (if any) was previously installed on this thread when dropped, so a
+/// caller's guard never has to know whether it is nesting inside another.
+pub(crate) struct TokenStepProgressGuard {
+    previous: Option<Box<dyn FnMut(usize, usize)>>,
+}
+
+impl Drop for TokenStepProgressGuard {
+    fn drop(&mut self) {
+        TOKEN_STEP_PROGRESS_SINK.with(|cell| {
+            *cell.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Install `sink` as the active token-step progress callback for this thread
+/// for the returned guard's lifetime. `sink` is called once per generated
+/// token as `sink(step_index, max_generated_tokens)` -- `step_index` is
+/// 0-based and `max_generated_tokens` is this decode's configured cap (a
+/// conservative denominator: real decodes almost always finish well before
+/// it, so a fraction derived from it never overshoots what the eventual
+/// slice-complete signal reports).
+pub(crate) fn install_token_step_progress_sink(
+    sink: impl FnMut(usize, usize) + 'static,
+) -> TokenStepProgressGuard {
+    let previous = TOKEN_STEP_PROGRESS_SINK.with(|cell| cell.borrow_mut().replace(Box::new(sink)));
+    TokenStepProgressGuard { previous }
+}
+
+pub(crate) fn report_token_step_progress(step_index: usize, max_generated_tokens: usize) {
+    TOKEN_STEP_PROGRESS_SINK.with(|cell| {
+        if let Some(sink) = cell.borrow_mut().as_mut() {
+            sink(step_index, max_generated_tokens);
+        }
+    });
+}
 
 /// Largest token n-gram the degenerate-loop guard inspects (token ids, not
 /// characters). An observed greedy loop is a very short cycle - a single
@@ -205,6 +264,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
             on_topk,
         )?;
         trace_token(step_index, selection.token_id, selection.reached_eot);
+        report_token_step_progress(step_index, config.max_generated_tokens);
         if selection.reached_eot {
             reached_eot = true;
             break;
@@ -566,6 +626,118 @@ mod tests {
         assert_eq!(output.generated_tokens, vec![1, 2]);
         assert_eq!(output.text, "hello");
         assert_eq!(step_executor.logits_calls, 3);
+    }
+
+    #[test]
+    fn token_step_progress_sink_is_a_no_op_when_none_is_installed() {
+        // No sink installed on this thread: `report_token_step_progress`
+        // (called every step by the loop below) must be a silent no-op, not
+        // a panic or a decode-affecting side effect -- the default state for
+        // every caller that never installs a sink (mock backend, tests, any
+        // decode that runs before native transcription wires one up).
+        let mut step_executor = SyntheticStepExecutor {
+            vocab_size: 16,
+            sequence: vec![1, 2, 7],
+            logits_calls: 0,
+        };
+        let token_decoder = SyntheticTokenDecoder {
+            table: BTreeMap::from([(1, "he"), (2, "llo")]),
+        };
+        let config = Seq2SeqGreedyDecodeConfig {
+            initial_prompt_tokens: vec![42, 43],
+            eot_token_id: 7,
+            stop_token_ids: Vec::new(),
+            vocab_size: 16,
+            max_generated_tokens: 8,
+            suppress_first_step_token_ids: Vec::new(),
+            suppress_token_ids: Vec::new(),
+            phrase_biases: Vec::new(),
+        };
+        let mut no_token_trace = |_: usize, _: u32, _: bool| {};
+        let mut no_topk_trace = |_: usize, _: &[f32]| {};
+
+        let output = run_seq2seq_greedy_decode_loop_v0(
+            &config,
+            &mut step_executor,
+            &token_decoder,
+            &mut no_token_trace,
+            &mut no_topk_trace,
+        )
+        .unwrap();
+
+        assert_eq!(output.generated_tokens, vec![1, 2]);
+        assert_eq!(output.text, "hello");
+    }
+
+    #[test]
+    fn token_step_progress_sink_receives_one_call_per_step_with_max_generated_tokens() {
+        let mut step_executor = SyntheticStepExecutor {
+            vocab_size: 16,
+            sequence: vec![1, 2, 7],
+            logits_calls: 0,
+        };
+        let token_decoder = SyntheticTokenDecoder {
+            table: BTreeMap::from([(1, "he"), (2, "llo")]),
+        };
+        let config = Seq2SeqGreedyDecodeConfig {
+            initial_prompt_tokens: vec![42, 43],
+            eot_token_id: 7,
+            stop_token_ids: Vec::new(),
+            vocab_size: 16,
+            max_generated_tokens: 8,
+            suppress_first_step_token_ids: Vec::new(),
+            suppress_token_ids: Vec::new(),
+            phrase_biases: Vec::new(),
+        };
+        let mut no_token_trace = |_: usize, _: u32, _: bool| {};
+        let mut no_topk_trace = |_: usize, _: &[f32]| {};
+
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed_for_sink = observed.clone();
+        let _sink_guard =
+            install_token_step_progress_sink(move |step_index, max_generated_tokens| {
+                observed_for_sink
+                    .borrow_mut()
+                    .push((step_index, max_generated_tokens));
+            });
+
+        let output = run_seq2seq_greedy_decode_loop_v0(
+            &config,
+            &mut step_executor,
+            &token_decoder,
+            &mut no_token_trace,
+            &mut no_topk_trace,
+        )
+        .unwrap();
+
+        assert_eq!(output.generated_tokens, vec![1, 2]);
+        // One report per decode step, including the terminal EOT step (3
+        // `decode_step_logits` calls for a 2-token result), each carrying the
+        // driver's own `config.max_generated_tokens` -- not something the
+        // sink has to compute or guess.
+        assert_eq!(*observed.borrow(), vec![(0, 8), (1, 8), (2, 8)]);
+
+        drop(_sink_guard);
+        // Dropping the guard restores the prior (unset) sink: a step after
+        // the guard is gone must not still be observed.
+        let mut post_guard_step_executor = SyntheticStepExecutor {
+            vocab_size: 16,
+            sequence: vec![7],
+            logits_calls: 0,
+        };
+        let post_guard_config = Seq2SeqGreedyDecodeConfig {
+            max_generated_tokens: 3,
+            ..config
+        };
+        run_seq2seq_greedy_decode_loop_v0(
+            &post_guard_config,
+            &mut post_guard_step_executor,
+            &token_decoder,
+            &mut no_token_trace,
+            &mut no_topk_trace,
+        )
+        .unwrap();
+        assert_eq!(observed.borrow().len(), 3, "guard drop must stop reports");
     }
 
     #[test]
