@@ -1,360 +1,131 @@
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+<div align="center">
+
 # OpenASR
 
+**Turn speech into text, entirely on your device.**
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![CI](https://github.com/QuintinShaw/openasr/actions/workflows/ci.yml/badge.svg)](https://github.com/QuintinShaw/openasr/actions/workflows/ci.yml)
-![License](https://img.shields.io/badge/license-Apache--2.0-blue)
+[![Release](https://img.shields.io/github/v/release/QuintinShaw/openasr)](https://github.com/QuintinShaw/openasr/releases)
+[![Downloads](https://img.shields.io/github/downloads/QuintinShaw/openasr/total)](https://github.com/QuintinShaw/openasr/releases)
 
-**The App Store for local ASR models -- signed, offline, private.**
+[Website](https://openasr.org) · [Documentation](docs/DOCS_INDEX.md) · [License](LICENSE)
 
-OpenASR is the Apache-2.0 **open core** of a local-first speech-to-text platform:
-a single `openasr` Rust CLI, a local OpenAI-compatible HTTP API, and a signed
-model catalog, all running native [ggml](https://github.com/ggml-org/ggml)-backed
-inference across eleven model families on CPU and Apple Metal. No cloud, no
-telemetry, fail-closed by design.
+<img src="https://openasr.org/assets/openasr-desktop-preview-en-final.jpg" alt="OpenASR Desktop App" width="720" />
 
-[Website](https://openasr.org) - [Documentation](docs/DOCS_INDEX.md) - [Acknowledgments](ACKNOWLEDGMENTS.md) - [License](LICENSE)
+<sub>Pre-v1 — under active development. CLI flags, API surface, and pack format may change between 0.x releases.</sub>
 
-> **Early stage (pre-v1).** OpenASR is under active development. CLI flags, the
-> HTTP API, and the `.oasr` pack format can change between `0.y` releases without
-> a compatibility promise. Not yet recommended for production. Website and docs:
-> **<https://openasr.org>**.
+</div>
 
-<!-- demo GIF: placeholder, uploading 2026-07-07 -->
+---
 
-```bash
-git clone --recurse-submodules https://github.com/QuintinShaw/openasr.git && cd openasr
-cargo build --release -p openasr-cli          # binary at target/release/openasr
-target/release/openasr transcribe audio.wav   # first run offers the default model, then all-local
-```
+<div align="center">
+<h3><a href="https://openasr.org/download/">Download the Desktop App</a></h3>
+<p><strong>macOS</strong> (Apple Silicon) · <strong>Windows</strong> (x64, Windows 10+) · Linux desktop coming soon</p>
+</div>
 
-The first run offers the default model (`qwen3-asr-0.6b`) with a visible
-confirmation, then everything runs offline on your hardware.
+No terminal needed. Install the app, drop in an audio file, and get your transcript — everything runs on your machine.
+
+> This repository is the Apache-2.0 open core behind the desktop app: a Rust CLI, a local OpenAI-compatible HTTP API, and the ggml inference engine. The desktop app wraps the same engine in a native GUI — no hidden network calls.
+
+---
+
+## What it does
+
+- **Transcribe audio files** — single files or entire folders, output as plain text, SRT/VTT subtitles, or JSON with word-level timestamps
+- **Live captions** — real-time transcription from your microphone with streaming partial results
+- **System audio capture** — caption meetings, lectures, and podcasts by recording what your computer plays
+- **Speaker separation** — automatically label who said what
+- **Translation** — transcribe and translate to English in one step
+- **Local API** — OpenAI-compatible `/v1/audio/transcriptions` endpoint, works with existing SDKs
 
 ## Why OpenASR
 
-whisper.cpp and faster-whisper are excellent Whisper runners. OpenASR is a
-broader local-first STT *platform* built around three things they do not bundle.
+**Private.** Your audio never leaves your machine. No uploads, no cloud processing, no telemetry. The engine either produces a real transcript or tells you why it can't — it never silently reaches for the internet.
 
-### Signed model distribution, not a pile of GGUFs
+**Broad.** 26 models across 11 families — Whisper, Qwen3-ASR, Parakeet, SenseVoice, FireRed, Dolphin, Moonshine, and more. Pick the one that fits your language and workload. All run through one binary on CPU and Apple Metal.
 
-Models come from a catalog whose manifest is cryptographically signed; every pull
-is checked against a committed public key and a SHA-256 hash before it runs.
-`openasr pull qwen3-asr-0.6b:q8` fetches one of **50 signed quant variants across
-17 catalog packs** -- no hand-managed GGUF files and no silent downloads. An
-install only happens behind a **visible consent prompt** showing the model, quant,
-size, host, and license.
+**Open.** The engine is Apache-2.0. Models ship under their own permissive licenses. Every model download is verified against a signed catalog before it runs.
 
-### Depth, not just Whisper
+---
 
-**Eleven model families** run through one binary and one ggml runtime: Whisper,
-Cohere Transcribe, Qwen3-ASR, Parakeet-CTC, Parakeet-TDT (25 European
-languages), wav2vec2-CTC, Moonshine, Dolphin (Chinese dialects), SenseVoice
-(zh/yue/en/ja/ko), FireRedASR-AED (Mandarin + English bilingual), and X-ASR
-(Zipformer). You get
-frame-synchronous streaming partials, opt-in speaker diarization, word-level
-timestamps with **per-word confidence**, and phrase-bias hotwords -- pick the
-model that fits the task and keep one toolchain.
+## For developers
 
-### Local and private, fail-closed
+### CLI quickstart
 
-No telemetry, no phone-home, no background uploads; audio never leaves the machine.
-The native runtime either produces a real transcript or returns a typed error --
-it never fabricates output and never reaches for the network silently. `--offline`
-and non-interactive runs fail closed before any download.
+```bash
+# Option A: Homebrew (macOS / Linux)
+brew install quintinshaw/tap/openasr
 
-## What you can do
+# Option B: one-line installer (macOS / Linux)
+curl -fsSL https://dl.openasr.org/install.sh | sh
 
-| You want to... | Command |
-| --- | --- |
-| Transcribe a file or a whole folder | `openasr transcribe audio.wav` |
-| Live captions from mic or system audio | `openasr live` |
-| Generate subtitles (SRT / VTT) | `openasr transcribe talk.wav -f srt -f vtt` |
-| Word-level timestamps + per-word confidence | `openasr transcribe audio.wav -f json --word-timestamps` |
-| Separate speakers (diarization) | `openasr transcribe meeting.wav --diarize` |
-| Bias toward domain terms (hotwords) | `openasr transcribe call.wav --hotword "OpenASR"` |
-| Serve an OpenAI-compatible API locally | `openasr serve` |
+# Option C: grab a prebuilt binary from Releases
+# https://github.com/QuintinShaw/openasr/releases
 
-See `openasr --help` for the full command set and [QUICKSTART](docs/QUICKSTART.md)
-for a guided first transcript.
+# Transcribe a file (first run offers to download a model — you confirm first)
+openasr transcribe recording.wav
+
+# Live mic captions
+openasr live
+
+# SRT subtitles with speaker labels
+openasr transcribe meeting.wav -f srt --diarize
+```
+
+See [Quickstart](docs/QUICKSTART.md) for a guided walkthrough, or run `openasr --help`.
+
+### Local API
+
+```bash
+openasr serve
+
+curl http://127.0.0.1:8080/v1/audio/transcriptions \
+  -F file=@audio.wav -F model=qwen3-asr-0.6b
+```
+
+Drop-in compatible with OpenAI SDKs (`base_url="http://127.0.0.1:8080/v1"`). See [Agent Integration](docs/AGENT_INTEGRATION.md) for API key setup and agent workflows.
+
+### Building from source
+
+```bash
+git clone --recurse-submodules https://github.com/QuintinShaw/openasr.git
+cd openasr
+cargo build --release -p openasr-cli
+```
+
+Requires Rust (pinned via `rust-toolchain.toml`), CMake, and a C/C++ toolchain. Full build setup and development workflow in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Models
 
-Browse and install packs straight from the signed catalog; the `<id>:<quant>`
-syntax selects a specific quantization tier:
+26 models across 11 families, from tiny English-only models that run faster than real-time to large multilingual models covering 100+ languages. Browse them at [openasr.org/models](https://openasr.org/models/) or from the CLI:
 
 ```bash
-openasr search                        # browse the catalog
-openasr pull whisper-small            # install the recommended quant
-openasr pull qwen3-asr-0.6b:q8        # or pin a specific quant tier
-openasr list                          # what's installed
+openasr search            # browse available models
+openasr pull whisper-small  # install one
 ```
 
-The catalog ships **22 ready-to-pull ASR packs** spanning nine of the eleven
-native families (64 signed quant downloads), plus diarization capability
-packs; the remaining two (Parakeet-CTC, wav2vec2-CTC) run via `import` of your
-own checkpoints. Eleven native
-families run offline on CPU and Apple Metal,
-dispatched by the data-driven architecture registry. All families support opt-in diarization; most also export word-level
-timestamps -- the columns below show where they differ.
-
-| Family | Streaming | Word timestamps | Quant tiers |
-| --- | --- | --- | --- |
-| Whisper (multilingual + English-only) | declared-pack | acoustic | fp16 / q8_0 / q4_k |
-| Cohere Transcribe | declared-pack | approximate | fp16 / q8_0 / q4_k |
-| Qwen3-ASR (default) | declared-pack | approximate | fp16 / q8_0 / q4_k / q3_k |
-| Parakeet-CTC | declared-pack | acoustic | fp16 / q8_0 / q4_k |
-| Parakeet-TDT (25 European languages) | declared-pack | acoustic | fp16 / q8_0 / q4_k |
-| wav2vec2-CTC (incl. data2vec) | declared-pack | acoustic | fp16 / q8_0 / q4_k |
-| Moonshine | declared-pack | approximate | fp16 / q8_0 / q4_k |
-| Dolphin (multilingual + Chinese dialects) | none | none | fp16 / q8_0 / q4_k |
-| SenseVoice (zh/yue/en/ja/ko) | declared-pack | none | fp16 / q8_0 / q4_k |
-| FireRedASR-AED (Mandarin + English bilingual) | none | none | fp16 / q8_0 / q4_k |
-| X-ASR (Zipformer, RNN-T) | declared-pack | acoustic | fp16 / q8_0 / q4_k |
-
-- **Streaming** -- native frame-synchronous streaming emits incremental partials
-  for packs that declare the streaming feature; other packs fall back to
-  final-per-utterance output. Dolphin and FireRedASR-AED have no streaming
-  executor yet, so they always run final-per-utterance.
-- **Word timestamps** -- *acoustic* means real acoustic frame alignment
-  (Whisper decoder cross-attention; frame spans for the CTC/transducer families);
-  *approximate* means decoder token-position estimates. Both export to JSON/VTT.
-  Dolphin and FireRedASR-AED do not emit word-level timing at all (segment-level only).
-- **Diarization** -- `--diarize` attributes anonymous `SPEAKER_NN` labels onto
-  any family's transcript via pure-Rust WeSpeaker + pyannote capability packs;
-  Cohere packs can additionally emit inline speaker tokens.
-
-Multilingual coverage is per pack (a multilingual Whisper pack spans ~100
-languages; Qwen3-ASR ~29; Parakeet-TDT 25 European languages; others are
-English-only or bilingual). See the
-per-model cards under [`model-registry/models/`](model-registry/models/) and
-[Known Limitations](docs/KNOWN_LIMITATIONS.md) for the exact scope of each
-capability.
-
-## Benchmarks
-
-Real numbers from the committed performance baseline
-([`perf/baselines/macos-aarch64.json`](perf/baselines/macos-aarch64.json)) on a
-macOS aarch64 CPU lane over a fixed 6.13 s LibriSpeech clip. RTF is
-compute-time / audio-time (lower is faster; 0.10 = ~10x faster than real time);
-WER is on the fixed harness clip.
-
-| Model pack | Family | Quant | RTF | WER |
-| --- | --- | --- | --- | --- |
-| `whisper-tiny.en` | Whisper | q8_0 | 0.04 | 5.9% |
-| `whisper-small.en` | Whisper | q8_0 | 0.13 | 0.0% |
-| `whisper-large-v3-turbo` | Whisper | q8_0 | 0.39 | 0.0% |
-| `cohere-transcribe` | Cohere | q8_0 | 0.11 | 0.0% |
-| `qwen3-asr-0.6b` | Qwen3-ASR | q8_0 | 0.41 | 0.0% |
-| `parakeet-ctc-0.6b`\* | Parakeet-CTC | q8_0 | 0.06 | 0.0% |
-| `wav2vec2-base-960h`\* | wav2vec2-CTC | q4_k | 0.05 | 0.0% |
-| `moonshine-base`\* | Moonshine | q4_k | 0.06 | 5.9% |
-
-\* Import-only: not in the signed catalog. These packs are built locally with
-`openasr model-pack import` from source weights; the unstarred rows install with
-`openasr pull`.
-
-The suite (`cargo run --release -p openasr-cli -- bench-suite`) drives the real
-`transcribe` call path and gates against the committed baseline. It reads
-host-local packs from the paths in [`perf/suite.toml`](perf/suite.toml)
-(gitignored `tmp/`, every entry optional), so on a fresh clone it skips entries
-until you install or build the packs -- see
-[Performance](perf/PERFORMANCE.md) for setup, gates, and caveats. WER on a
-17-word clip is coarse (one word is ~5.9%).
-
-## Building from source
-
-Build once (the ggml backend compiles from source, so clone recursively and have
-`cmake`, a C/C++ toolchain, and on Linux `libasound2-dev`; Rust 1.95.0 is pinned
-by `rust-toolchain.toml`; expect the first build to take several minutes while
-ggml compiles):
-
-```bash
-git clone --recurse-submodules https://github.com/QuintinShaw/openasr.git && cd openasr
-cargo build --release -p openasr-cli      # binary at target/release/openasr
-```
-
-Then, with `openasr` on your PATH:
-
-```bash
-# Transcribe a file. The first run offers to download the default model
-# (qwen3-asr-0.6b) with a visible confirmation, then runs offline.
-openasr transcribe audio.wav
-
-# Choose a model, a format, write to a file (-m/-f/-o; `t` aliases transcribe).
-openasr t audio.wav -m whisper-small -f srt -o audio.srt
-
-# A whole folder (one transcript per file), or several formats at once.
-openasr transcribe ./recordings -o ./transcripts
-openasr transcribe audio.wav -f srt -f vtt -f json
-```
-
-During development run without installing via
-`cargo run -p openasr-cli -- <args>`; `--backend mock` gives deterministic,
-network-free output for CI.
-
-### Verifying downloads
-
-Prebuilt binaries on the [Releases page](https://github.com/QuintinShaw/openasr/releases)
-carry a [GitHub Actions build provenance attestation](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds),
-proving each archive was built by this repository's own CI from the tagged
-source, not hand-assembled or tampered with in transit. Verify a downloaded
-archive with the [GitHub CLI](https://cli.github.com/):
-
-```bash
-gh attestation verify <downloaded-archive> --repo QuintinShaw/openasr
-```
-
-## Execution posture
-
-- **`native` is the default backend.** It runs local ggml-backed `.oasr` model
-  packs and is fail-closed by staged runtime boundaries.
-- **No silent downloads.** For `transcribe`/`live`, the CLI installs a missing
-  model only through a **visible consent prompt** showing the model, quant, size,
-  host, and license; `--offline` (or any non-interactive run) fails closed before
-  touching the network. The **HTTP server never downloads to satisfy a request**
-  -- transcription runs only an explicit local pack, and the only server-side
-  install path is the operator-authenticated pull API.
-- **`mock` is an opt-in stub** (`--backend mock`) that emits deterministic
-  placeholder text for plumbing and CI. It downloads nothing and needs no weights.
-- **`.oasr` is the only user-facing pack format** (GGUF-backed internally); bare
-  `.gguf` is not accepted as run input or importer output.
-- **No telemetry.** OpenASR does not phone home.
-
-## CLI overview
-
-| Command | Purpose |
-| --- | --- |
-| `transcribe <inputs>...` | Transcribe files or directories. `--benchmark` prints run timing instead of the transcript; aliased as `t`. |
-| `live` | Microphone / system-audio capture; emits frame-synchronous streaming partials for packs that declare streaming, else final-per-utterance. |
-| `serve` | Local OpenAI-compatible HTTP API; secured remote serving via TLS + pairing. |
-| `apikey create/list/revoke` | Manage local API keys for `serve`; once one exists, loopback callers must send it too (see [Agent Integration](docs/AGENT_INTEGRATION.md)). |
-| `search [query]` / `pull <id>` | Browse the model catalog / download and install a pack. |
-| `list` / `show <id-or-pack>` / `rm <id>` | List installed packs / show catalog or pack details / remove a pack. |
-| `verify <pack.oasr>` | Probe a local pack's ggml integrity (no inference, no download). |
-| `speaker enroll/clear` | Manage local voice-match profiles for diarization display names (embeddings only; not authentication). |
-| `model-pack import <family>` | Build a local `.oasr` pack from source weights (maintainer tool). |
-| `config` / `doctor` / `bench-suite` | Edit config / print diagnostics / run the performance suite. |
-
-Useful flags on `transcribe`: `-m/--model` (also `OPENASR_MODEL`), `-f/--format`
-(`text`, `json`, `srt`, `vtt`, `verbose_json`, `markdown`), `-o/--output`,
-`-l/--language` (`auto` or a hint like `en`), `--diarize`, `--word-timestamps`,
-`--continue-on-error` (multi-input), and `--hotword <PHRASE>` / `--hotword-boost`
-for phrase bias.
-
-## Local HTTP API
-
-```bash
-cargo run -p openasr-cli -- serve --addr 127.0.0.1:8080 --backend native --model-pack /path/to/model.oasr --model your-runtime-model-id
-
-curl -s http://127.0.0.1:8080/v1/audio/transcriptions \
-  -F file=@audio.wav \
-  -F model=your-runtime-model-id \
-  -F response_format=verbose_json
-```
-
-Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/audio/transcriptions`.
-Response formats: `json`, `text`, `srt`, `vtt`, `verbose_json`, `markdown`.
-
-Key constraints:
-
-- `serve --backend native` runs a local `.oasr`: pass `--model-pack <local.oasr>`,
-  or omit it to use an already-installed pack resolved by `--model` id (a missing
-  pack fails closed -- transcription never triggers a download). A supplied
-  `--model` must name the same pack (quant-tag tolerant: `whisper-tiny:q8`
-  matches a bare `whisper-tiny` runtime id).
-- OpenAI SDKs work out of the box for non-streaming calls
-  (`base_url="http://127.0.0.1:8080/v1"`, any placeholder `api_key`); errors
-  use the OpenAI envelope, and `verbose_json` includes `duration`, segment
-  `id`s, and a top-level `words` array when word timestamps are requested.
-  OpenAI parameters with no local equivalent (`temperature`, `include[]`,
-  `chunking_strategy`, `known_speaker_*`) are accepted and ignored.
-- `?stream=true` (query parameter) is SSE with OpenASR realtime events -- not
-  OpenAI `transcript.text.*` events, so OpenAI SDK `stream=True` (the `stream`
-  form field) is rejected with an explicit 400 instead of hanging the client.
-  Streaming rejects `response_format=srt|vtt`; use the non-streaming endpoint
-  for subtitle files.
-- Longform fields (`segment_mode`, `chunk_seconds`, `segment_overlap_seconds`,
-  `vad_*`, `min_segment_seconds`, `suppress_silent_slices`) are native-only;
-  default is `segment_mode=auto`.
-- Phrase-bias / hotword fields are request-validated; unsupported backends return
-  an explicit error rather than ignoring them.
-- `serve` runs a single model (the launched pack); restart to switch. Transcription
-  history is local-only and governed by the `history_retention` preference
-  (default keeps the last 5 entries; `off` disables it). See
-  [SECURITY](SECURITY.md) for what's stored.
-- The default `--addr` (`127.0.0.1:8080`) is a fixed, predictable port so
-  scripts and coding agents can rely on it. Loopback callers are trusted by
-  default (no key required); `openasr apikey create` opts into requiring a
-  bearer key even on loopback -- see [Agent Integration](docs/AGENT_INTEGRATION.md).
-
-Non-loopback binds are rejected unless launched with HTTPS/WSS and pairing auth
-(an API key never substitutes for this -- it is a loopback-only escape hatch):
-
-```bash
-export OPENASR_PAIRING_ADMIN_TOKEN="$(openssl rand -hex 32)"
-cargo run -p openasr-cli -- serve --addr 0.0.0.0:8443 --tls-self-signed \
-  --pairing-admin-token-env OPENASR_PAIRING_ADMIN_TOKEN \
-  --backend native --model-pack /path/to/model.oasr --model your-runtime-model-id
-```
-
-## Building model packs
-
-Native packs are built from a local HF-style source directory with one per-family
-importer. `openasr pull` installs already-published catalog packs; local importing
-stays the path for caller-provided source weights and vendor-gated sources that
-must not be silently re-hosted.
-
-```bash
-cargo run -p openasr-cli -- model-pack import whisper      <source_dir> <out.oasr> --package-id whisper-small --source-revision <rev>
-cargo run -p openasr-cli -- model-pack import qwen         <source_dir> <out.oasr> --package-id qwen3-asr-0.6b --source-revision <rev>
-cargo run -p openasr-cli -- model-pack import moonshine    <source_dir> <out.oasr> --package-id moonshine-tiny --source-revision <rev>
-```
-
-Other families: `cohere`, `parakeet-ctc`, `parakeet-tdt`, `wav2vec2-ctc`, `dolphin`,
-`sensevoice`, `firered-aed`, `xasr-zipformer`, `hymt2-gguf`, `wespeaker`, `pyannote`.
-Each accepts `--quantization fp16|q8_0|q4_k` (Qwen also exposes `q3_k`).
-
-## Validation
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo nextest run --workspace        # or: cargo test
-cargo test --workspace --doc
-```
-
-Tests default to the CPU ggml backend and pass `--backend mock` where they need
-deterministic, weight-free output. On x86/x86_64 host builds, OpenASR enables
-ggml's `GGML_NATIVE` CPU tuning by default; set `OPENASR_GGML_NATIVE=0` for
-portable distribution builds.
+Benchmarks from the committed performance baseline are in [Performance](perf/PERFORMANCE.md).
 
 ## Documentation
 
-- [Docs Index](docs/DOCS_INDEX.md) - map of all documentation
-- [Architecture](ARCHITECTURE.md) - crate map and the transcription pipeline
-- [Quickstart](docs/QUICKSTART.md) - three commands to a real transcript
-- [Roadmap](docs/ROADMAP.md) - what runs today and what is deferred
-- [Known Limitations](docs/KNOWN_LIMITATIONS.md)
-- [Model Catalog, Registry, and Distribution](docs/MODEL_CATALOG_ARCHITECTURE.md)
-- [Format Contract](docs/format/OASR_PACKAGE_CONTRACT_V1.md)
-- [Releasing](RELEASING.md) - versioning and release process
-- [Performance](perf/PERFORMANCE.md)
-- [Contributing](CONTRIBUTING.md) - build setup, branch naming, PR checklist, DCO
+| | |
+|---|---|
+| [Docs Index](docs/DOCS_INDEX.md) | Full documentation map |
+| [Quickstart](docs/QUICKSTART.md) | First transcript in three commands |
+| [FAQ](docs/FAQ.md) | Common questions answered |
+| [Known Limitations](docs/KNOWN_LIMITATIONS.md) | What works and what does not yet |
+| [Roadmap](docs/ROADMAP.md) | What is planned next |
+| [Architecture](ARCHITECTURE.md) | Crate map and transcription pipeline |
 
-## License and acknowledgments
+## Contributing
 
-OpenASR -- the `openasr-core`, `openasr-cli`, `openasr-client`, `openasr-server`,
-and `openasr-system-audio` crates -- is licensed under the
-[Apache License 2.0](LICENSE). See [`NOTICE`](NOTICE) for attribution.
+Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for build setup, branch naming, the PR checklist, and DCO sign-off.
 
-The inference backend `crates/openasr-core/third_party/openasr-ggml` is a fork of
-[ggml](https://github.com/ggml-org/ggml) under the MIT License. OpenASR is built
-directly on it; we gratefully acknowledge Georgi Gerganov and the ggml /
-llama.cpp / whisper.cpp communities. See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md)
-for the projects and model authors OpenASR builds on.
+## License
 
-Model packs are distributed separately under their own upstream licenses (all
-permissive, MIT / Apache-2.0). A free, openly licensed pack -- e.g.
-`whisper-small` (Apache-2.0) or `moonshine-tiny` (MIT) -- runs the engine
-end-to-end.
-</content>
-</invoke>
+[Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
+
+The ggml inference backend is MIT-licensed. Model packs carry their own upstream licenses (MIT / Apache-2.0). See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) for the projects and model authors OpenASR builds on.
