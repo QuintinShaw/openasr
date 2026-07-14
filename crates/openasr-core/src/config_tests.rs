@@ -165,6 +165,7 @@ fn save_and_load_config_roundtrip() {
             ffmpeg_bin: Some("/tmp/ffmpeg".to_string()),
         },
         download_source: DownloadSourcePref::Auto,
+        models_dir: None,
     };
 
     save_config(temp.path(), &config).unwrap();
@@ -184,6 +185,7 @@ fn save_and_load_config_document_roundtrip_preserves_preferences() {
                 ffmpeg_bin: Some("/tmp/ffmpeg".to_string()),
             },
             download_source: DownloadSourcePref::Auto,
+            models_dir: None,
         },
         preferences: Preferences {
             language: Some("en".to_string()),
@@ -257,6 +259,7 @@ fn save_config_preserves_existing_config_document_preferences() {
         default_backend: Some("mock".to_string()),
         media: MediaConfig::default(),
         download_source: DownloadSourcePref::Auto,
+        models_dir: None,
     };
     save_config(temp.path(), &updated_config).unwrap();
     let loaded = load_config_document(temp.path()).unwrap();
@@ -549,4 +552,78 @@ fn idle_unload_policy_wire_strings_and_thresholds() {
     // Product decision (0.1.12-B): a bound model pack should not sit resident
     // in RAM for the daemon's whole lifetime by default any more.
     assert_eq!(IdleUnloadPolicy::default(), IdleUnloadPolicy::After10m);
+}
+
+#[test]
+fn resolve_models_dir_defaults_under_home() {
+    let home = PathBuf::from("/tmp/example/.openasr");
+    let resolved = resolve_models_dir(&home, None, None);
+    assert_eq!(resolved, PathBuf::from("/tmp/example/.openasr/models"));
+}
+
+#[test]
+fn resolve_models_dir_config_override_wins_over_default() {
+    let home = PathBuf::from("/tmp/example/.openasr");
+    let config_override = PathBuf::from("/mnt/big-disk/openasr-models");
+    let resolved = resolve_models_dir(&home, None, Some(&config_override));
+    assert_eq!(resolved, config_override);
+}
+
+#[test]
+fn resolve_models_dir_env_override_wins_over_config() {
+    let home = PathBuf::from("/tmp/example/.openasr");
+    let config_override = PathBuf::from("/mnt/big-disk/openasr-models");
+    let env_override = std::ffi::OsString::from("/mnt/other-disk/models");
+    let resolved = resolve_models_dir(&home, Some(env_override.clone()), Some(&config_override));
+    assert_eq!(resolved, PathBuf::from(env_override));
+}
+
+#[test]
+fn resolve_models_dir_ignores_empty_env_override() {
+    let home = PathBuf::from("/tmp/example/.openasr");
+    let resolved = resolve_models_dir(&home, Some(std::ffi::OsString::new()), None);
+    assert_eq!(resolved, PathBuf::from("/tmp/example/.openasr/models"));
+}
+
+#[test]
+fn models_dir_reads_the_config_field() {
+    let home = PathBuf::from("/tmp/example/.openasr");
+    let mut config = OpenAsrConfig::default();
+    assert_eq!(models_dir(&home, &config), home.join("models"));
+
+    config.models_dir = Some(PathBuf::from("/mnt/big-disk/openasr-models"));
+    assert_eq!(
+        models_dir(&home, &config),
+        PathBuf::from("/mnt/big-disk/openasr-models")
+    );
+}
+
+#[test]
+fn validate_rejects_relative_models_dir() {
+    let config = OpenAsrConfig {
+        models_dir: Some(PathBuf::from("relative/models")),
+        ..OpenAsrConfig::default()
+    };
+    let error = config.validate(&registry()).unwrap_err();
+    assert!(matches!(
+        error,
+        ConfigError::InvalidPreference {
+            field: "models_dir",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn validate_accepts_absolute_models_dir_that_does_not_exist_yet() {
+    let absolute_path = if cfg!(windows) {
+        "D:\\not-yet-created\\openasr-models"
+    } else {
+        "/mnt/not-yet-created/openasr-models"
+    };
+    let config = OpenAsrConfig {
+        models_dir: Some(PathBuf::from(absolute_path)),
+        ..OpenAsrConfig::default()
+    };
+    config.validate(&registry()).unwrap();
 }

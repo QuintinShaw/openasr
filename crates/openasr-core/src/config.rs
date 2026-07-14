@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    env, ffi, fs,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -29,6 +29,10 @@ pub const DEFAULT_MODEL_BOOTSTRAP_QUANT: &str = "q4_k";
 pub const DEFAULT_BACKEND_ID: &str = "native";
 pub const PREFERENCES_SCHEMA_VERSION: u32 = 1;
 pub const MAX_INFERENCE_THREADS: u16 = 256;
+/// Env override for the model-pack storage root; highest priority in
+/// [`models_dir`]'s resolution order. Mirrors the `OPENASR_HOME` env-override
+/// convention in `home.rs`.
+pub const OPENASR_MODELS_DIR_ENV: &str = "OPENASR_MODELS_DIR";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAsrConfig {
@@ -49,6 +53,13 @@ pub struct OpenAsrConfig {
     pub media: MediaConfig,
     #[serde(default)]
     pub download_source: DownloadSourcePref,
+    /// Override for the model-pack storage root (where `pull`/`list`/`delete`
+    /// read and write `.oasr` packs). `None` means "not overridden": resolve
+    /// via [`models_dir`], which still checks the `OPENASR_MODELS_DIR` env var
+    /// above this field before falling back to `<home>/models`. Must be an
+    /// absolute path when set -- see [`OpenAsrConfig::validate_with_catalog`].
+    #[serde(default)]
+    pub models_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -315,6 +326,7 @@ impl Default for OpenAsrConfig {
             default_backend: default_backend(),
             media: MediaConfig::default(),
             download_source: DownloadSourcePref::Auto,
+            models_dir: None,
         }
     }
 }
@@ -445,6 +457,15 @@ impl OpenAsrConfig {
                 ));
             }
         }
+        if let Some(models_dir) = self.models_dir.as_deref() {
+            // Deliberately lenient beyond "absolute": an override naming a
+            // directory that does not exist yet is valid -- pull/list/delete
+            // (via `models_dir`) create it lazily on first write, the same way
+            // `<home>/models` is never pre-created either.
+            if !models_dir.is_absolute() {
+                return invalid_preference("models_dir", "must be an absolute path");
+            }
+        }
         Ok(())
     }
 }
@@ -521,6 +542,39 @@ impl Preferences {
 
 pub fn config_path(openasr_home: impl AsRef<Path>) -> PathBuf {
     openasr_home.as_ref().join("config.json")
+}
+
+/// Single resolution point for the model-pack storage root. Every read/write
+/// of an installed `.oasr` pack (download landing, `list_installed_packs`,
+/// deletion, capability-pack lookup, `default_selection`'s pack path) must go
+/// through this instead of hardcoding `<home>/models` -- see `pull.rs`'s
+/// `models_root` and `capability_pack::resolve_installed_capability_pack`.
+///
+/// Priority: `OPENASR_MODELS_DIR` env var (if non-empty) wins, then the
+/// persisted `config.models_dir` field, then the default `<home>/models`.
+pub fn models_dir(openasr_home: impl AsRef<Path>, config: &OpenAsrConfig) -> PathBuf {
+    resolve_models_dir(
+        openasr_home.as_ref(),
+        env::var_os(OPENASR_MODELS_DIR_ENV),
+        config.models_dir.as_deref(),
+    )
+}
+
+/// Pure resolution logic behind [`models_dir`], split out so the three-way
+/// priority (env / config / default) is unit-testable without touching real
+/// environment variables or a config file on disk.
+pub fn resolve_models_dir(
+    openasr_home: &Path,
+    env_override: Option<ffi::OsString>,
+    config_override: Option<&Path>,
+) -> PathBuf {
+    if let Some(value) = env_override.filter(|value| !value.is_empty()) {
+        return PathBuf::from(value);
+    }
+    if let Some(path) = config_override {
+        return path.to_path_buf();
+    }
+    openasr_home.join("models")
 }
 
 pub fn load_config(openasr_home: impl AsRef<Path>) -> Result<OpenAsrConfig, ConfigError> {

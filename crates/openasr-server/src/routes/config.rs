@@ -102,6 +102,7 @@ fn payload_has_config_fields(payload: &serde_json::Value) -> bool {
             "default_backend",
             "media",
             "download_source",
+            "models_dir",
         ]
         .iter()
         .any(|key| object.contains_key(*key))

@@ -98,8 +98,9 @@ pub use metrics::{
 
 pub use config::{
     ConfigError, ConfigKey, DEFAULT_BACKEND_ID, DEFAULT_MODEL_BOOTSTRAP_QUANT, DEFAULT_MODEL_ID,
-    MAX_INFERENCE_THREADS, OpenAsrConfig, OpenAsrConfigDocument, config_path, load_config,
-    load_config_document, save_config, save_config_document, save_default_model_selection,
+    MAX_INFERENCE_THREADS, OPENASR_MODELS_DIR_ENV, OpenAsrConfig, OpenAsrConfigDocument,
+    config_path, load_config, load_config_document, models_dir, resolve_models_dir, save_config,
+    save_config_document, save_default_model_selection,
 };
 pub use device::capabilities::{
     ApplePlatformHints, CpuArchitectureFamily, CpuCapabilities, HardwareCapabilities,
