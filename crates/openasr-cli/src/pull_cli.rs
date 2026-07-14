@@ -6,9 +6,8 @@ use openasr_core::{
     InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog, OpenAsrConfig,
     PullModelPackRequest, QuantPreference, ResolvedCatalogPull, host_quant_recommendation_profile,
     install_model_pack_from_path, list_installed_packs, load_config, load_model_catalog,
-    openasr_home, persist_default_pack_pointer, remove_model_pack,
-    resolve_catalog_pull_with_profile, resolve_chain, resolve_launch_pack,
-    save_default_model_selection,
+    openasr_home, remove_model_pack, resolve_catalog_pull_with_profile, resolve_chain,
+    resolve_launch_pack,
 };
 
 use crate::PullCommandOptions;
@@ -70,8 +69,7 @@ pub(crate) fn pull(options: PullCommandOptions<'_>) -> Result<()> {
         QuantPreference::Auto
     };
     if should_update_default_asr_model(&catalog, &installed.model_id) {
-        save_default_model_selection(&home, installed.model_id.clone(), preference)?;
-        persist_default_pack_pointer(&home, &installed)?;
+        openasr_core::default_selection::persist(&home, &installed, preference)?;
     } else {
         eprintln!(
             "{}",
@@ -277,8 +275,7 @@ pub(crate) fn ensure_asr_model_installed(
     })?;
     if should_update_default_asr_model(&catalog, &installed.model_id) {
         let preference = QuantPreference::pinned(&installed.quant);
-        save_default_model_selection(&home, installed.model_id.clone(), preference)?;
-        persist_default_pack_pointer(&home, &installed)?;
+        openasr_core::default_selection::persist(&home, &installed, preference)?;
     }
     Ok(())
 }

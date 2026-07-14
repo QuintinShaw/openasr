@@ -1472,6 +1472,37 @@ async fn delete_model_allows_current_default_and_clears_default_selection() {
     assert!(default.default_model.is_none());
     assert!(default.default_pull.is_none());
     assert!(default.pack.is_none());
+    assert_eq!(default.default_model_status, "unset");
+}
+
+#[tokio::test]
+async fn default_model_response_reports_installed_not_installed_and_unset() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+
+    let unset = default_model_response(temp.path(), distribution.catalog_source()).unwrap();
+    assert_eq!(unset.default_model_status, "unset");
+    assert!(unset.pack.is_none());
+
+    let mut document = openasr_core::load_config_document(temp.path()).unwrap();
+    document.config.default_model = Some("whisper-small".to_string());
+    openasr_core::save_config_document(temp.path(), &document).unwrap();
+    let not_installed = default_model_response(temp.path(), distribution.catalog_source()).unwrap();
+    assert_eq!(not_installed.default_model_status, "not_installed");
+    assert_eq!(
+        not_installed.default_model.as_deref(),
+        Some("whisper-small")
+    );
+    assert!(not_installed.pack.is_none());
+
+    let pack = write_valid_installed_pack_for_test(temp.path(), "whisper-small", "q8_0", "q8");
+    persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
+    let installed = default_model_response(temp.path(), distribution.catalog_source()).unwrap();
+    assert_eq!(installed.default_model_status, "installed");
+    assert_eq!(
+        installed.pack.as_ref().map(|pack| pack.pull.as_str()),
+        Some("whisper-small:q8")
+    );
 }
 
 #[test]

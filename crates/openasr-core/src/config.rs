@@ -14,6 +14,12 @@ use crate::{
 };
 use crate::{download_source::DownloadSourcePref, launch_pack::QuantPreference};
 
+/// The CLI's bare-invocation convention: which model id `transcribe`/`live`/
+/// `pull` resolve to when the caller passes neither `--model` nor has a
+/// persisted `default_model` in `config.json`. This is decoupled from config
+/// persistence -- it is never written into a fresh config as an implicit
+/// selection (see `OpenAsrConfig::default`); it only feeds the CLI's
+/// last-resort fallback in `selected_model_ref` and the consent-pull prompt.
 pub const DEFAULT_MODEL_ID: &str = "qwen3-asr-0.6b";
 /// Quant pinned for the first-run install of `DEFAULT_MODEL_ID`, so the very
 /// first download a newcomer triggers is bounded and predictable instead of the
@@ -26,7 +32,16 @@ pub const MAX_INFERENCE_THREADS: u16 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAsrConfig {
-    #[serde(default = "default_model")]
+    /// The user's persisted default model, or `None` when nothing has been
+    /// explicitly selected yet. Unlike `default_backend`, this field carries
+    /// no implicit value: a fresh config (missing field, or `OpenAsrConfig::
+    /// default()`) deserializes to `None`, not `DEFAULT_MODEL_ID`. Conflating
+    /// "the CLI's bare-invocation convention" with "the user's saved choice"
+    /// is what made a fresh install report a phantom default that was never
+    /// actually installed; see `openasr_core::default_selection` for the
+    /// single resolver that turns this (plus the `default.json` pointer)
+    /// into an actual installed pack.
+    #[serde(default)]
     pub default_model: Option<String>,
     #[serde(default = "default_backend")]
     pub default_backend: Option<String>,
@@ -296,7 +311,7 @@ pub enum ConfigError {
 impl Default for OpenAsrConfig {
     fn default() -> Self {
         Self {
-            default_model: default_model(),
+            default_model: None,
             default_backend: default_backend(),
             media: MediaConfig::default(),
             download_source: DownloadSourcePref::Auto,
@@ -568,10 +583,6 @@ fn write_config_atomically(path: &Path, contents: &[u8]) -> Result<(), ConfigErr
         path: path.to_path_buf(),
         source,
     })
-}
-
-fn default_model() -> Option<String> {
-    Some(DEFAULT_MODEL_ID.to_string())
 }
 
 fn default_backend() -> Option<String> {

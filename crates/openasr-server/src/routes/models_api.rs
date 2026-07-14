@@ -96,74 +96,59 @@ pub(crate) fn matching_installed_pack(
     }))
 }
 
+// Default-model resolution/persistence is NOT reimplemented here: it is owned
+// by `openasr_core::default_selection` (fail-closed: config.default_model wins,
+// the default.json pointer is a fallback only, and a configured-but-uninstalled
+// default never silently substitutes a different installed pack). This module
+// stays a thin delegate so the server, the CLI, and (eventually) the desktop
+// shell all read the same resolver -- see docs/default-model-resolution.md.
+
 pub(crate) fn resolve_default_pack(
     home: &Path,
     catalog_source: Option<CatalogSource<'_>>,
 ) -> Result<Option<InstalledPack>, ApiError> {
-    let packs = list_installed_packs(home).map_err(ApiError::Pull)?;
     let catalog = catalog_source
         .map(|source| load_catalog_for_source(source, home))
         .transpose()
         .map_err(ApiError::Catalog)?;
-    let document = load_config_document(home).map_err(ApiError::Config)?;
-    let pointer = read_default_pack_pointer(home).map_err(ApiError::Pull)?;
-    if matches!(
-        document.preferences.quant_preference,
-        QuantPreference::Pinned { .. }
-    ) && let Some(pointer) = pointer.as_ref()
-    {
-        let pointer_preference = QuantPreference::pinned(&pointer.quant);
-        // Use the BARE model id (preferring config.default_model when set) so
-        // installed_packs_for_model enumerates ALL quants: this lets the Pinned-hit /
-        // Pinned-missing-fallback ladder work, and honors `config set default_model`.
-        // Passing the quant-tagged pointer.pull would pre-filter to one quant and make
-        // the fallback unreachable (default model would break if that quant is removed).
-        let reference = document
-            .config
-            .default_model
-            .as_deref()
-            .unwrap_or(pointer.model_id.as_str());
-        return Ok(select_launch_pack_from_list(
-            &packs,
-            reference,
-            &pointer_preference,
-            catalog.as_ref(),
-        ));
-    }
-
-    let Some(default_model) = document
-        .config
-        .default_model
-        .as_deref()
-        .or_else(|| pointer.as_ref().map(|pointer| pointer.model_id.as_str()))
-    else {
-        return Ok(None);
-    };
-    Ok(select_launch_pack_from_list(
-        &packs,
-        default_model,
-        &document.preferences.quant_preference,
-        catalog.as_ref(),
-    ))
+    Ok(
+        openasr_core::default_selection::resolve_with_catalog(home, catalog.as_ref())?
+            .into_installed_pack(),
+    )
 }
 
 pub(crate) fn default_model_response(
     home: &Path,
     catalog_source: Option<CatalogSource<'_>>,
 ) -> Result<DefaultModelResponse, ApiError> {
-    let pack = resolve_default_pack(home, catalog_source)?;
+    let catalog = catalog_source
+        .map(|source| load_catalog_for_source(source, home))
+        .transpose()
+        .map_err(ApiError::Catalog)?;
+    let resolution = openasr_core::default_selection::resolve_with_catalog(home, catalog.as_ref())?;
+    let status = match &resolution {
+        openasr_core::default_selection::DefaultModelResolution::Installed(_) => "installed",
+        openasr_core::default_selection::DefaultModelResolution::NotInstalled(_) => "not_installed",
+        openasr_core::default_selection::DefaultModelResolution::Unset => "unset",
+    };
     // The `default_model` field reports the bare model identity; the quant lives in
     // `default_pull`/`pack.pull`. Appending the quant here would duplicate it (with a
     // different spelling) and diverge from the persisted bare `config.default_model`.
-    let default_model = pack.as_ref().map(|pack| pack.model_id.clone()).or_else(|| {
-        load_config(home)
-            .ok()
-            .and_then(|config| config.default_model)
-    });
+    let default_model = match &resolution {
+        openasr_core::default_selection::DefaultModelResolution::Installed(pack) => {
+            Some(pack.model_id.clone())
+        }
+        openasr_core::default_selection::DefaultModelResolution::NotInstalled(reference) => {
+            Some(reference.clone())
+        }
+        openasr_core::default_selection::DefaultModelResolution::Unset => None,
+    };
+    let pack = resolution.into_installed_pack();
 
     Ok(DefaultModelResponse {
         object: "model.default",
         default_model,
+        default_model_status: status,
         default_pull: pack.as_ref().map(|pack| pack.pull.clone()),
         pack,
     })
@@ -235,21 +220,13 @@ pub(crate) fn persist_default_pack(
     pack: &InstalledPack,
     quant_preference: QuantPreference,
 ) -> Result<(), ApiError> {
-    save_default_model_selection(home, pack.model_id.clone(), quant_preference)
-        .map_err(ApiError::Config)?;
-    persist_default_pack_pointer(home, pack).map_err(ApiError::Pull)
+    Ok(openasr_core::default_selection::persist(
+        home,
+        pack,
+        quant_preference,
+    )?)
 }
 
 pub(crate) fn clear_default_model_selection(home: &Path) -> Result<(), ApiError> {
-    let mut document = load_config_document(home).map_err(ApiError::Config)?;
-    document.config.default_model = None;
-    document.preferences.quant_preference = QuantPreference::Auto;
-    save_config_document(home, &document).map_err(ApiError::Config)?;
-
-    let path = default_pack_pointer_path(home);
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(ApiError::Pull(PullError::Io { path, source })),
-    }
+    Ok(openasr_core::default_selection::clear(home)?)
 }

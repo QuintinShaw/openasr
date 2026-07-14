@@ -19,6 +19,7 @@ contributors -- crate relationships, the audio-to-transcript pipeline, and the
 | [FAQ](FAQ.md) | Current-behavior questions: what OpenASR is, which families run, which backends are active, and the conservative offline transcription lane. |
 | [Releasing](../RELEASING.md) | The commit-driven release process: the single workspace version, `scripts/bump-version.sh`, and the version-triggered `Release core` workflow. |
 | [Agent Integration](AGENT_INTEGRATION.md) | How a coding agent uses OpenASR: the `skills/openasr` Skill (CLI path) and the local OpenAI-compatible HTTP API, including `openasr apikey` for opt-in loopback authentication. |
+| [Default Model Resolution](default-model-resolution.md) | The single-authority `default_selection` resolver (fail-closed, `config.json` + `default.json` pointer, three-state result) that the server, CLI, and any future shell must all read/write through -- no second resolver, no fabricated defaults. |
 
 ## Format contracts (`docs/format/`)
 

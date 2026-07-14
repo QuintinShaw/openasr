@@ -342,16 +342,45 @@ pub(super) fn resolve_model_source_for_backend(
 /// normal state right after a fresh install, before the user has pulled any
 /// model). Genuine environment/registry errors (unreadable `OPENASR_HOME`,
 /// corrupt registry, ...) still return `Err`. Never pulls either way.
+///
+/// An explicit `model` reference is a CLI-local concern (not "the default") and
+/// is matched directly against installed packs with `QuantPreference::Auto`.
+/// With no explicit reference, resolving `config.default_model` against
+/// installed packs -- including the `default.json` pointer fallback and
+/// `Pinned` quant recovery -- is delegated to `openasr_core::default_selection`,
+/// the single authority also used by the server; only the
+/// no-persisted-default-at-all fallback to `DEFAULT_MODEL_ID` stays here, since
+/// that bare-invocation convention is CLI-specific, not part of "the default".
 fn resolve_installed_native_pack_opt(
     model: Option<&str>,
-    config: &OpenAsrConfig,
+    // `default_selection::resolve_with_catalog` reads `config.default_model`
+    // straight off disk (the single-authority contract requires re-reading, not
+    // trusting a possibly-stale in-memory copy); kept for signature parity with
+    // `resolve_installed_native_pack`, whose error message still needs it.
+    _config: &OpenAsrConfig,
     catalog: Option<&openasr_core::ModelCatalog>,
 ) -> Result<Option<PathBuf>> {
     let home = openasr_home()?;
-    let model_ref = selected_model_ref(model, config, &[]);
-    let packs = openasr_core::list_installed_packs(&home)?;
+    if let Some(model_ref) = model {
+        return resolve_launch_pack_path(&home, model_ref, catalog);
+    }
+
+    use openasr_core::default_selection::DefaultModelResolution;
+    match openasr_core::default_selection::resolve_with_catalog(&home, catalog)? {
+        DefaultModelResolution::Installed(pack) => Ok(Some(pack.path)),
+        DefaultModelResolution::NotInstalled(_) => Ok(None),
+        DefaultModelResolution::Unset => resolve_launch_pack_path(&home, DEFAULT_MODEL_ID, catalog),
+    }
+}
+
+fn resolve_launch_pack_path(
+    home: &Path,
+    model_ref: &str,
+    catalog: Option<&openasr_core::ModelCatalog>,
+) -> Result<Option<PathBuf>> {
+    let packs = openasr_core::list_installed_packs(home)?;
     let request = openasr_core::LaunchPackRequest {
-        model_ref: &model_ref,
+        model_ref,
         preference: &openasr_core::QuantPreference::Auto,
         catalog,
         host_profile: openasr_core::host_quant_recommendation_profile(),
@@ -1260,6 +1289,43 @@ mod tests {
     fn with_env_lock<T>(run: impl FnOnce() -> T) -> T {
         let _guard = env_lock();
         run()
+    }
+
+    // Locks the three-tier priority `selected_model_ref` must keep: an explicit
+    // `--model` always wins, then the persisted `config.default_model`, and only
+    // with neither does the CLI fall back to `DEFAULT_MODEL_ID` -- the
+    // bare-invocation convention that (post-refactor) is no longer implicitly
+    // written into `config.json` (see `openasr_core::config::DEFAULT_MODEL_ID`
+    // and `default_selection`).
+    #[test]
+    fn selected_model_ref_explicit_wins_over_config_default() {
+        let config = OpenAsrConfig {
+            default_model: Some("whisper-small".to_string()),
+            ..OpenAsrConfig::default()
+        };
+        assert_eq!(
+            selected_model_ref(Some("whisper-large-v3-turbo"), &config, &[]),
+            "whisper-large-v3-turbo"
+        );
+    }
+
+    #[test]
+    fn selected_model_ref_falls_back_to_config_default_when_no_explicit_model() {
+        let config = OpenAsrConfig {
+            default_model: Some("whisper-small".to_string()),
+            ..OpenAsrConfig::default()
+        };
+        assert_eq!(selected_model_ref(None, &config, &[]), "whisper-small");
+    }
+
+    #[test]
+    fn selected_model_ref_falls_back_to_default_model_id_when_config_default_is_unset() {
+        // A fresh config (or one built by `OpenAsrConfig::default()`) has
+        // `default_model: None` -- the CLI convention fallback, not a config value,
+        // must still resolve to something usable.
+        let config = OpenAsrConfig::default();
+        assert_eq!(config.default_model, None);
+        assert_eq!(selected_model_ref(None, &config, &[]), DEFAULT_MODEL_ID);
     }
 
     #[test]

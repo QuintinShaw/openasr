@@ -85,9 +85,35 @@ fn missing_config_file_returns_default_config() {
     let temp = tempfile::tempdir().unwrap();
     let config = load_config(temp.path()).unwrap();
 
-    assert_eq!(config.default_model.as_deref(), Some("qwen3-asr-0.6b"));
+    // A fresh install has no persisted default -- see `default_selection` for the
+    // module that turns `None` here (plus the `default.json` pointer) into an
+    // actual resolved pack, and `DEFAULT_MODEL_ID` for the separate CLI
+    // bare-invocation convention this field must not be conflated with.
+    assert_eq!(config.default_model, None);
     assert_eq!(config.default_backend.as_deref(), Some("native"));
     assert_eq!(config.media.ffmpeg_bin, None);
+}
+
+#[test]
+fn default_config_document_has_no_default_model() {
+    assert_eq!(OpenAsrConfig::default().default_model, None);
+}
+
+#[test]
+fn config_json_missing_default_model_field_deserializes_to_none() {
+    // Simulates an older config.json written before `default_model` existed, or
+    // one hand-edited to remove the key -- the field must default via serde
+    // rather than fail to deserialize or silently reintroduce an implicit value.
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(config_path(temp.path()), r#"{ "default_backend": "mock" }"#).unwrap();
+
+    let loaded = load_config_document(temp.path()).unwrap();
+
+    assert_eq!(loaded.config.default_model, None);
+    loaded
+        .config
+        .validate(&registry())
+        .expect("None default_model must not fail validation");
 }
 
 #[test]

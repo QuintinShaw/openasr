@@ -20,6 +20,7 @@ pub(crate) mod batch;
 pub(crate) mod benchmark;
 pub(crate) mod capability_pack;
 pub mod config;
+pub mod default_selection;
 pub mod device;
 pub mod diarize;
 pub(crate) mod download_source;
