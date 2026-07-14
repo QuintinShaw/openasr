@@ -84,11 +84,17 @@ class PublicFamilyDocsTest(unittest.TestCase):
             ]
         }
 
+    def _write_faq(self, root: Path, body: str = "Whisper is supported.") -> None:
+        (root / "docs").mkdir(parents=True, exist_ok=True)
+        (root / "docs" / "FAQ.md").write_text(
+            f"{drift.FAQ_FAMILY_SECTION_HEADING}\n\n{body}\n\n## What backends are active right now?\n"
+        )
+
     def test_documented_family_passes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             drift.REPO_ROOT = root
-            (root / "README.md").write_text("## Models\n\nWhisper is supported.\n\n## Benchmarks\n")
+            self._write_faq(root)
             (root / "ACKNOWLEDGMENTS.md").write_text(
                 "**Speech recognition**\n\n- Whisper -- link\n\n**Speaker diarization**\n"
             )
@@ -102,7 +108,7 @@ class PublicFamilyDocsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             drift.REPO_ROOT = root
-            (root / "README.md").write_text("## Models\n\nWhisper is supported.\n\n## Benchmarks\n")
+            self._write_faq(root)
             (root / "ACKNOWLEDGMENTS.md").write_text(
                 "**Speech recognition**\n\n- Whisper -- link\n\n**Speaker diarization**\n"
             )
@@ -111,14 +117,14 @@ class PublicFamilyDocsTest(unittest.TestCase):
             drift.check_public_family_docs(self._catalog("dolphin"), errors)
 
             self.assertEqual(len(errors), 2)
-            self.assertIn("README.md", errors[0])
+            self.assertIn("docs/FAQ.md", errors[0])
             self.assertIn("ACKNOWLEDGMENTS.md", errors[1])
 
     def test_private_family_is_not_required_in_docs(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             drift.REPO_ROOT = root
-            (root / "README.md").write_text("## Models\n\nWhisper is supported.\n\n## Benchmarks\n")
+            self._write_faq(root)
             (root / "ACKNOWLEDGMENTS.md").write_text(
                 "**Speech recognition**\n\n- Whisper -- link\n\n**Speaker diarization**\n"
             )

@@ -16,9 +16,10 @@ Cohere Transcribe, Qwen3-ASR, Parakeet-CTC, Parakeet-TDT (25 European
 languages), wav2vec2-CTC (incl. data2vec), Moonshine, Dolphin (Chinese
 dialects), SenseVoice (zh/yue/en/ja/ko), FireRedASR-AED (Mandarin + English
 bilingual), and X-ASR (Zipformer). They run local
-offline transcription on CPU and Metal lanes. The
-[model support matrix](../README.md#model-support) in the README lists
-per-family streaming, word-timestamp, and quant-tier support.
+offline transcription on CPU and Metal lanes. See
+[Known Limitations](KNOWN_LIMITATIONS.md) for per-family streaming and
+word-timestamp support, and the per-model cards under
+[`model-registry/models/`](../model-registry/models/) for quant tiers.
 
 ## What backends are active right now?
 

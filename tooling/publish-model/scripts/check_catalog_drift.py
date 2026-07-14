@@ -30,9 +30,9 @@ from _catalog import (  # noqa: E402
 from _manifest import prose_locales_block, read_prose  # noqa: E402
 
 # Human-prose keyword each catalog `family` id is expected to be findable by
-# (case-insensitive substring) in README.md's Model support table and
-# ACKNOWLEDGMENTS.md's Speech recognition list. Family ids are internal
-# (e.g. "xasr-zipformer"); prose calls it "X-ASR (Zipformer)".
+# (case-insensitive substring) in docs/FAQ.md's "What native model families run
+# today?" answer and ACKNOWLEDGMENTS.md's Speech recognition list. Family ids
+# are internal (e.g. "xasr-zipformer"); prose calls it "X-ASR (Zipformer)".
 FAMILY_DOC_KEYWORDS = {
     "whisper": "whisper",
     "cohere": "cohere",
@@ -259,18 +259,29 @@ def check_family_count_strings(errors: list[str]) -> None:
                 )
 
 
+FAQ_FAMILY_SECTION_HEADING = "## What native model families run today?"
+
+
 def check_public_family_docs(machine_catalog: dict, errors: list[str]) -> None:
-    """Every publicly listed ASR family must be named in README.md's Model
-    support table and ACKNOWLEDGMENTS.md's Speech recognition list, so a newly
-    published public model can't silently ship without user-facing docs.
+    """Every publicly listed ASR family must be named in docs/FAQ.md's "What
+    native model families run today?" answer and ACKNOWLEDGMENTS.md's Speech
+    recognition list, so a newly published public model can't silently ship
+    without user-facing docs.
+
+    This used to check README.md's per-family "Model support" table, but the
+    818b1fe bilingual rewrite intentionally replaced that table with prose
+    (README.md is no longer a per-family enumeration surface -- see
+    docs/DOCS_INDEX.md). docs/FAQ.md's family-list answer is the surviving
+    user-facing doc that enumerates every native family by name, so the gate
+    now targets that instead of re-adding the table the rewrite removed.
     """
-    readme_path = REPO_ROOT / "README.md"
+    faq_path = REPO_ROOT / "docs" / "FAQ.md"
     ack_path = REPO_ROOT / "ACKNOWLEDGMENTS.md"
-    if not readme_path.exists() or not ack_path.exists():
+    if not faq_path.exists() or not ack_path.exists():
         return
 
-    readme_section = extract_section(
-        readme_path.read_text(encoding="utf-8"), "## Models", ("\n## ",)
+    faq_section = extract_section(
+        faq_path.read_text(encoding="utf-8"), FAQ_FAMILY_SECTION_HEADING, ("\n## ",)
     ).lower()
     ack_section = extract_section(
         ack_path.read_text(encoding="utf-8"), "**Speech recognition**", ("\n**", "\n## ")
@@ -289,10 +300,11 @@ def check_public_family_docs(machine_catalog: dict, errors: list[str]) -> None:
         if not family:
             continue
         keyword = FAMILY_DOC_KEYWORDS.get(family, family).lower()
-        if keyword not in readme_section:
+        if keyword not in faq_section:
             errors.append(
-                f"family '{family}' (public model) missing from README.md's Model support "
-                f"table (expected to find {keyword!r})"
+                f"family '{family}' (public model) missing from docs/FAQ.md's "
+                f"\"{FAQ_FAMILY_SECTION_HEADING.lstrip('# ')}\" answer "
+                f"(expected to find {keyword!r})"
             )
         if keyword not in ack_section:
             errors.append(
