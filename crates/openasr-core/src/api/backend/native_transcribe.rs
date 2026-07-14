@@ -67,17 +67,21 @@ static NATIVE_GGML_EXECUTION_DISPATCH: OnceLock<GgmlAsrExecutionDispatch> = Once
 // An owner generation (`PROGRESS_OWNER` / `NativeProgressGuard::generation`)
 // keeps a second, unrelated run from clobbering the first: only the run that is
 // actually reporting progress ever claims the slot, and only that run clears it
-// on exit. A short single-pass decode that never calls `publish_progress` (there
-// are no slices to weight, and a single opaque decode call exposes no sub-step)
-// never claims the slot and so never clears someone else's in-progress run out
-// from under it -- see `NativeProgressGuard` and `publish_progress` below.
+// on exit. A run whose guard is created but that fails before its first
+// `publish_progress` call (e.g. model resolution errors out) never claims the
+// slot and so never clears someone else's in-progress run out from under it --
+// see `NativeProgressGuard` and `publish_progress` below.
 // Progress is a monotonic overall fraction (0..=1) plus a coarse phase label, so
 // the UI advances smoothly across decode -> assemble -> forced-align refine
 // instead of stalling once the last slice decodes. The old bare slice counter
 // reached "done" at the last decode and then sat frozen through assembly/merge
 // and the whole-file forced-align pass, which read to users as a bar stuck near
-// the end (issue #61). Short single-pass decodes never activate the slot, so
-// callers see None and fall back to a time-based estimate.
+// the end (issue #61). Every `run_dispatch_once` call for every builtin seq2seq
+// family -- long-form slices and the short single-pass / single-slice path
+// alike -- also reports continuous per-token progress within its own share of
+// the decode phase (see `run_dispatch_once_with_progress`, `SliceProgressWindow`),
+// closing the gap where short audio used to report nothing at all and fall
+// back entirely on a time-based estimate (issue: short-audio progress bar).
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
@@ -162,9 +166,14 @@ pub struct NativeTranscriptionProgress {
     pub fraction: f32,
 }
 
-/// Progress of the in-flight native long-form / forced-align run, or `None` when
-/// no multi-slice / refine run is active (short single-pass decodes report
-/// nothing and the caller estimates from elapsed time).
+/// Progress of the in-flight native transcription run, or `None` when no run
+/// is active. Every decode call -- long-form multi-slice, forced-align
+/// refine, and the short single-pass / single-slice path (a "whole file is
+/// one slice" `DecodeProgress`, see `run_dispatch_once_with_progress`) --
+/// reports through this slot; `None` means nothing is decoding right now, not
+/// that the in-flight run is short. Only a decode that fails before its first
+/// report (e.g. model resolution) leaves no signal, and the caller falls back
+/// to a time-based estimate for the gap.
 pub fn native_transcription_progress() -> Option<NativeTranscriptionProgress> {
     if !PROGRESS_ACTIVE.load(Ordering::Acquire) {
         return None;
@@ -304,6 +313,126 @@ impl DecodeProgress {
         };
         publish_progress(NativeTranscriptionPhase::Decode, self.decode_ceil * ratio);
     }
+
+    /// The [start, start+span) sub-range of the overall decode-phase fraction
+    /// that the slice about to be decoded (`slice_samples` long, not yet
+    /// folded into `decoded_samples`) owns. Per-token progress during that
+    /// slice's decode interpolates within this window; `complete_slice`
+    /// (called once the slice actually finishes) supersedes it with the
+    /// slice's full share regardless of where token interpolation left off.
+    fn slice_progress_window(&self, slice_samples: u64) -> SliceProgressWindow {
+        let total = (self.total_samples.max(1)) as f32;
+        let start_ratio = (self.decoded_samples as f32 / total).clamp(0.0, 1.0);
+        let span_ratio = (slice_samples as f32 / total).clamp(0.0, 1.0 - start_ratio);
+        SliceProgressWindow {
+            start_fraction: self.decode_ceil * start_ratio,
+            span_fraction: self.decode_ceil * span_ratio,
+        }
+    }
+}
+
+/// A slice's own sub-range of the overall decode-phase fraction (see
+/// `DecodeProgress::slice_progress_window`), token-level interpolation runs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SliceProgressWindow {
+    start_fraction: f32,
+    span_fraction: f32,
+}
+
+/// Fraction of a decode slice's own progress-bar span (`SliceProgressWindow`)
+/// considered "reached" after `step_index` (0-based) of an estimated
+/// `estimated_total_tokens` steps. Capped below 1.0 so token-level
+/// interpolation never completes a slice's full span before
+/// `DecodeProgress::complete_slice` (called once the slice actually
+/// finishes decoding) closes it out -- without the cap, a short decode
+/// against a generous `max_generated_tokens` budget would already read as
+/// "fully decoded" mid-stream, leaving nothing for `complete_slice` to
+/// visibly add and reintroducing the old flat-then-jump behavior at a
+/// smaller scale.
+const TOKEN_PROGRESS_SLICE_SHARE_CAP: f32 = 0.95;
+
+/// Publish at most every Nth generated token (plus always the first) so a
+/// very fast decoder does not spend cycles on redundant atomic CAS traffic;
+/// the visual granularity given up is well under the frontend's 240ms poll
+/// interval, so it is not user-visible.
+const TOKEN_PROGRESS_PUBLISH_STRIDE: usize = 4;
+
+/// Pure progress math shared by every token-step sink below: how far through
+/// its own window (see `SliceProgressWindow`) a slice's decode should read
+/// after generating `step_index + 1` of an estimated `estimated_total_tokens`
+/// tokens. `estimated_total_tokens` is deliberately the decode's configured
+/// `max_generated_tokens` cap, not a measured or duration-derived estimate:
+/// every builtin seq2seq family already picks that cap conservatively for its
+/// own architecture (context-window budget, corpus-derived step ceiling,
+/// ...), so real decodes almost always finish well under it -- using it as
+/// the denominator can only under-promise (fraction climbs slower than real
+/// progress), never over-promise (jump past what `complete_slice` will
+/// confirm).
+fn token_step_fraction(
+    window: SliceProgressWindow,
+    step_index: usize,
+    estimated_total_tokens: usize,
+) -> f32 {
+    let ratio = if estimated_total_tokens == 0 {
+        TOKEN_PROGRESS_SLICE_SHARE_CAP
+    } else {
+        // step_index is 0-based; +1 so the first generated token already
+        // shows forward motion instead of reporting the window's start again.
+        let raw = (step_index.saturating_add(1)) as f32 / estimated_total_tokens as f32;
+        raw.min(TOKEN_PROGRESS_SLICE_SHARE_CAP)
+    };
+    window.start_fraction + window.span_fraction * ratio
+}
+
+/// Throttle predicate for the token-step sink: true on the first token and
+/// every `TOKEN_PROGRESS_PUBLISH_STRIDE`th one after it. A pure function so
+/// the stride behavior is unit-testable without a live decode.
+fn should_publish_token_step(step_index: usize) -> bool {
+    step_index.is_multiple_of(TOKEN_PROGRESS_PUBLISH_STRIDE)
+}
+
+/// Run one `run_dispatch_once` call with a per-token progress sink wired to
+/// `decode_progress`'s window for `slice_samples`, then close the slice out
+/// with `complete_slice` on success. This is the single place that turns
+/// per-token decode steps into `publish_progress` calls, so every call site
+/// that decodes one slice of audio -- the long-form per-slice loop and the
+/// short single-pass / single-slice path, which is `DecodeProgress` for a
+/// "whole file is one slice" run -- shares the same continuous signal
+/// instead of the short path reporting nothing (see module docs above on why
+/// short/single-slice decodes used to never call `publish_progress`).
+#[allow(clippy::too_many_arguments)]
+fn run_dispatch_once_with_progress(
+    dispatch: &GgmlAsrExecutionDispatch,
+    runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
+    selected_family: &GgmlFamilyAdapterDescriptor,
+    chunk: Vec<f32>,
+    request_options: GgmlAsrExecutionOptions,
+    backend_preference: GgmlAsrBackendPreference,
+    decode_progress: &mut DecodeProgress,
+    slice_samples: u64,
+) -> Result<GgmlAsrExecutionResult, BackendError> {
+    let window = decode_progress.slice_progress_window(slice_samples);
+    let _token_progress_guard =
+        crate::models::seq2seq_greedy_decode::install_token_step_progress_sink(
+            move |step_index, max_generated_tokens| {
+                if should_publish_token_step(step_index) {
+                    publish_progress(
+                        NativeTranscriptionPhase::Decode,
+                        token_step_fraction(window, step_index, max_generated_tokens),
+                    );
+                }
+            },
+        );
+    let result = run_dispatch_once(
+        dispatch,
+        runtime_preflight,
+        selected_family,
+        chunk,
+        request_options,
+        backend_preference,
+    )?;
+    decode_progress.complete_slice(slice_samples);
+    Ok(result)
 }
 
 /// RAII reset for the global progress slot: clears it on normal completion, an early
@@ -317,9 +446,9 @@ impl DecodeProgress {
 /// unrelated `run_native_transcription` can start and finish while a first one is
 /// still decoding; without this check the second run's guard would unconditionally
 /// clear the slot on both construction and drop and blank out the first run's
-/// progress mid-flight. A run that never calls `publish_progress` (a short
-/// single-pass decode has no slices to weight) never claims the slot at all, so it
-/// can never steal or clear another run's ownership.
+/// progress mid-flight. A run that never calls `publish_progress` at all (it fails
+/// before reaching its first decode call, e.g. model resolution) never claims the
+/// slot, so it can never steal or clear another run's ownership.
 struct NativeProgressGuard {
     generation: u64,
 }
@@ -913,13 +1042,15 @@ fn run_native_transcription_impl(
                 }
                 slice_index += 1;
                 let slice_decode_started = Instant::now();
-                let result = run_dispatch_once(
+                let result = run_dispatch_once_with_progress(
                     dispatch,
                     &runtime_preflight,
                     &selected_family,
                     chunk,
                     slice_options,
                     backend_preference,
+                    &mut decode_progress,
+                    slice_samples,
                 )?;
                 // OPENASR_TIMING=1 detail: per-longform-slice decode time.
                 // Coarse by default (only the whole-request `inference` stage
@@ -966,7 +1097,6 @@ fn run_native_transcription_impl(
                     segments: transcription.segments,
                     time_domain: SegmentTimeDomain::RelativeToSliceContent,
                 });
-                decode_progress.complete_slice(slice_samples);
             }
             // Decode done; the merge/resegment tail below runs uncounted otherwise,
             // which is where the bar used to sit frozen at the last slice count.
@@ -1024,13 +1154,26 @@ fn run_native_transcription_impl(
         ));
     }
 
-    let transcription = run_dispatch_once(
+    // Short audio (no longform) and a longform run that planned down to a
+    // single un-resampled slice both land here with the whole file decoded
+    // in one `run_dispatch_once` call. Give that call its own one-slice
+    // `DecodeProgress` (the slice's own window spans the entire decode-phase
+    // fraction) instead of leaving it unreported: this used to be the exact
+    // gap that left short-audio transcriptions with no progress signal at
+    // all, forcing the UI onto a pure time estimate that had no way to know
+    // decode had actually finished (issue: short-audio progress bar).
+    let single_pass_total_samples = prepared_audio.len() as u64;
+    let mut single_pass_decode_progress =
+        DecodeProgress::begin(single_pass_total_samples, request.word_timestamps_refine);
+    let transcription = run_dispatch_once_with_progress(
         dispatch,
         &runtime_preflight,
         &selected_family,
         prepared_audio,
         request_options,
         backend_preference,
+        &mut single_pass_decode_progress,
+        single_pass_total_samples,
     )?;
     Ok(finalize_native_transcription(
         transcription.into_transcription(),
@@ -1874,7 +2017,7 @@ mod tests {
         let _serialize = PROGRESS_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // No run active -> None (short single-pass decodes report nothing).
+        // No run active -> None.
         assert_eq!(native_transcription_progress(), None);
         {
             let _guard = NativeProgressGuard::new();
@@ -1920,17 +2063,17 @@ mod tests {
     }
 
     /// Regression for the owner-token fix: the server has no concurrency gate
-    /// on native transcription, so a short single-pass decode (which never
-    /// calls `publish_progress`) can start and finish entirely while a longer,
-    /// still-decoding run owns the global progress slot. Before this fix,
-    /// `NativeProgressGuard::new()`/`Drop` unconditionally cleared the slot,
-    /// so the short run's guard blanked out the long run's progress out from
-    /// under it even though the short run never reported anything. This test
-    /// uses a real background thread for the long run (a distinct generation
-    /// lives in a distinct thread's `CURRENT_PROGRESS_GENERATION`) so the
-    /// short run's guard, created on the test's own thread, is a genuinely
-    /// different, concurrently-live generation -- not just a second guard in
-    /// the same call stack.
+    /// on native transcription, so a run that never calls `publish_progress`
+    /// (e.g. it fails before its first decode call) can start and finish
+    /// entirely while a longer, still-decoding run owns the global progress
+    /// slot. Before this fix, `NativeProgressGuard::new()`/`Drop`
+    /// unconditionally cleared the slot, so the second run's guard blanked
+    /// out the first run's progress out from under it even though the second
+    /// run never reported anything. This test uses a real background thread
+    /// for the long run (a distinct generation lives in a distinct thread's
+    /// `CURRENT_PROGRESS_GENERATION`) so the second run's guard, created on
+    /// the test's own thread, is a genuinely different, concurrently-live
+    /// generation -- not just a second guard in the same call stack.
     #[test]
     fn native_progress_concurrent_short_run_does_not_clobber_owner() {
         use std::sync::mpsc;
@@ -1961,8 +2104,8 @@ mod tests {
         assert!((owned.fraction - 0.4).abs() < 1e-6);
 
         // A second, unrelated run starts and finishes on this thread without
-        // ever publishing progress -- exactly what a short single-pass decode
-        // does. Its guard must not touch the long run's ownership at all.
+        // ever publishing progress (e.g. it fails before its first decode
+        // call). Its guard must not touch the long run's ownership at all.
         {
             let _short_guard = NativeProgressGuard::new();
         }
@@ -2019,6 +2162,258 @@ mod tests {
             assert_eq!(run2_assembled.phase, NativeTranscriptionPhase::Assemble);
             assert!((run2_assembled.fraction - 0.6).abs() < 1e-6);
         }
+        assert_eq!(native_transcription_progress(), None);
+    }
+
+    #[test]
+    fn token_step_fraction_normalizes_step_index_against_estimated_total() {
+        let window = SliceProgressWindow {
+            start_fraction: 0.0,
+            span_fraction: 1.0,
+        };
+        // step_index is 0-based, so "step 0 of 10" already reads as 1/10 of
+        // the window, not 0/10 -- the first generated token must show
+        // forward motion instead of reporting the window's start again.
+        assert!((token_step_fraction(window, 0, 10) - 0.1).abs() < 1e-6);
+        assert!((token_step_fraction(window, 4, 10) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn token_step_fraction_scales_by_the_slice_window() {
+        // A slice that owns [0.2, 0.2 + 0.3) of the decode-phase fraction:
+        // token progress must land inside that sub-range, not [0, 1].
+        let window = SliceProgressWindow {
+            start_fraction: 0.2,
+            span_fraction: 0.3,
+        };
+        let at_start = token_step_fraction(window, 0, 100);
+        let at_half = token_step_fraction(window, 49, 100);
+        assert!((at_start - (0.2 + 0.3 * 0.01)).abs() < 1e-6);
+        assert!((at_half - (0.2 + 0.3 * 0.50)).abs() < 1e-6);
+        assert!(at_start >= window.start_fraction);
+        assert!(at_half <= window.start_fraction + window.span_fraction);
+    }
+
+    #[test]
+    fn token_step_fraction_caps_below_the_full_slice_span() {
+        // Even once step_index reaches (or blows past) estimated_total_tokens,
+        // the window's own share must stay strictly under its full span --
+        // `DecodeProgress::complete_slice` owns closing out the remaining
+        // sliver, not per-token interpolation racing ahead of it.
+        let window = SliceProgressWindow {
+            start_fraction: 0.0,
+            span_fraction: 1.0,
+        };
+        let at_cap = token_step_fraction(window, 99, 100);
+        let past_cap = token_step_fraction(window, 500, 100);
+        assert!((at_cap - TOKEN_PROGRESS_SLICE_SHARE_CAP).abs() < 1e-6);
+        assert!((past_cap - TOKEN_PROGRESS_SLICE_SHARE_CAP).abs() < 1e-6);
+        assert!(at_cap < window.start_fraction + window.span_fraction);
+    }
+
+    #[test]
+    fn token_step_fraction_is_monotonic_in_step_index() {
+        let window = SliceProgressWindow {
+            start_fraction: 0.1,
+            span_fraction: 0.4,
+        };
+        let mut previous = token_step_fraction(window, 0, 37);
+        for step_index in 1..200 {
+            let current = token_step_fraction(window, step_index, 37);
+            assert!(
+                current >= previous,
+                "fraction regressed at step {step_index}: {previous} -> {current}"
+            );
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn token_step_fraction_falls_back_to_the_cap_when_estimate_is_zero() {
+        // A zero denominator (defensive: no builtin family emits
+        // max_generated_tokens=0, `Seq2SeqGreedyDecodeConfig` fails closed on
+        // it) must not divide by zero or report the window as fully done --
+        // the cap is the safe fallback, matching an "unknown, assume
+        // in-progress" reading.
+        let window = SliceProgressWindow {
+            start_fraction: 0.0,
+            span_fraction: 1.0,
+        };
+        assert!((token_step_fraction(window, 0, 0) - TOKEN_PROGRESS_SLICE_SHARE_CAP).abs() < 1e-6);
+    }
+
+    #[test]
+    fn slice_progress_window_places_slices_back_to_back_within_the_decode_ceiling() {
+        // `DecodeProgress::begin`/`complete_slice` call `publish_progress`,
+        // which writes the real process-global slot, so this needs the same
+        // lock + guard discipline as the other progress-slot tests above
+        // (see `PROGRESS_TEST_LOCK`'s doc comment) even though the assertions
+        // below only look at the pure `SliceProgressWindow` values.
+        let _serialize = PROGRESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = NativeProgressGuard::new();
+
+        let mut decode = DecodeProgress::begin(1000, false);
+        let first = decode.slice_progress_window(400);
+        assert!((first.start_fraction - 0.0).abs() < 1e-6);
+        assert!((first.span_fraction - DECODE_CEIL_NO_ALIGN * 0.4).abs() < 1e-6);
+
+        decode.complete_slice(400);
+        let second = decode.slice_progress_window(600);
+        // The second slice's window starts exactly where the first slice's
+        // completed share left off, so token interpolation never overlaps or
+        // skips ahead relative to the sample-weighted slice boundaries.
+        assert!((second.start_fraction - DECODE_CEIL_NO_ALIGN * 0.4).abs() < 1e-6);
+        assert!((second.span_fraction - DECODE_CEIL_NO_ALIGN * 0.6).abs() < 1e-6);
+        assert!((second.start_fraction + second.span_fraction - DECODE_CEIL_NO_ALIGN).abs() < 1e-6);
+    }
+
+    #[test]
+    fn slice_progress_window_is_the_full_decode_ceiling_for_a_single_slice_run() {
+        // Same rationale as the test above: `DecodeProgress::begin` writes
+        // the real global slot, so it needs the lock + guard.
+        let _serialize = PROGRESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = NativeProgressGuard::new();
+
+        // The short single-pass / single-slice path treats the whole file as
+        // one slice: its window must span the entire decode phase exactly
+        // like the long-form path's last slice does, not some smaller
+        // fixed share -- this is what makes the two paths share one signal.
+        let decode = DecodeProgress::begin(1000, true);
+        let window = decode.slice_progress_window(1000);
+        assert!((window.start_fraction - 0.0).abs() < 1e-6);
+        assert!((window.span_fraction - DECODE_CEIL_WITH_ALIGN).abs() < 1e-6);
+    }
+
+    #[test]
+    fn should_publish_token_step_throttles_to_every_stride_and_always_the_first() {
+        assert!(should_publish_token_step(0));
+        for step_index in 1..TOKEN_PROGRESS_PUBLISH_STRIDE {
+            assert!(
+                !should_publish_token_step(step_index),
+                "step {step_index} should be throttled"
+            );
+        }
+        assert!(should_publish_token_step(TOKEN_PROGRESS_PUBLISH_STRIDE));
+        assert!(should_publish_token_step(TOKEN_PROGRESS_PUBLISH_STRIDE * 5));
+    }
+
+    /// End-to-end wiring test: a `run_dispatch_once`-shaped call routed
+    /// through the shared decode driver's token-step sink must land token-
+    /// level `publish_progress` calls strictly inside the installed window,
+    /// increasing monotonically, without needing a real model pack. Exercises
+    /// `install_token_step_progress_sink` (the models-layer hook) and this
+    /// module's sink closure shape together, the same composition
+    /// `run_dispatch_once_with_progress` installs around a real decode.
+    #[test]
+    fn token_step_progress_sink_reports_monotonically_inside_its_window() {
+        let _serialize = PROGRESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(native_transcription_progress(), None);
+
+        {
+            let _guard = NativeProgressGuard::new();
+            let window = SliceProgressWindow {
+                start_fraction: 0.0,
+                span_fraction: DECODE_CEIL_NO_ALIGN,
+            };
+            let _sink_guard =
+                crate::models::seq2seq_greedy_decode::install_token_step_progress_sink(
+                    move |step_index, max_generated_tokens| {
+                        if should_publish_token_step(step_index) {
+                            publish_progress(
+                                NativeTranscriptionPhase::Decode,
+                                token_step_fraction(window, step_index, max_generated_tokens),
+                            );
+                        }
+                    },
+                );
+
+            let mut previous = 0.0_f32;
+            for step_index in 0..40 {
+                crate::models::seq2seq_greedy_decode::report_token_step_progress(step_index, 40);
+                let progress =
+                    native_transcription_progress().expect("sink published at least once");
+                assert!(progress.fraction >= previous);
+                assert!(progress.fraction <= window.start_fraction + window.span_fraction);
+                previous = progress.fraction;
+            }
+        }
+        // Both guards dropped (sink first, then the run guard) -> slot cleared.
+        assert_eq!(native_transcription_progress(), None);
+    }
+
+    /// Real-decode regression for the short-audio / single-pass progress gap
+    /// this change fixes: before it, `run_native_transcription` on audio
+    /// under the longform trigger (`fixtures/jfk.wav`, ~11s) never called
+    /// `publish_progress` at all -- `native_transcription_progress()` stayed
+    /// `None` for the whole decode, and the UI fell back to a pure time
+    /// estimate with no relationship to real progress (see the recon this
+    /// change is based on). Runs a real firered-aed decode on a background
+    /// thread while polling the progress slot from this thread, and requires
+    /// at least one snapshot strictly between 0 and the decode ceiling --
+    /// proof of a genuine intermediate signal, not just an initial 0.0
+    /// immediately followed by the ceiling.
+    #[test]
+    #[ignore = "host-local: requires tmp/firered-aed-l-v2-q4_k.oasr (a real firered-aed pack)"]
+    fn real_decode_short_audio_reports_intermediate_token_level_progress() {
+        let pack =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp/firered-aed-l-v2-q4_k.oasr");
+        if !pack.exists() {
+            eprintln!("skipping: pack ({}) absent", pack.display());
+            return;
+        }
+        let wav = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
+
+        let _serialize = PROGRESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(native_transcription_progress(), None);
+
+        let pack = pack.canonicalize().expect("pack path must canonicalize");
+        let wav = wav.canonicalize().expect("wav path must canonicalize");
+        let request = TranscriptionRequest::new(wav, NATIVE_RUNTIME_MODEL_ID_AUTO)
+            .with_model_pack_path(Some(pack));
+
+        let decode_thread = std::thread::spawn(move || run_native_transcription(request));
+
+        let mut saw_intermediate_signal = false;
+        let mut previous_fraction = 0.0_f32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !decode_thread.is_finished() && std::time::Instant::now() < deadline {
+            if let Some(progress) = native_transcription_progress() {
+                assert_eq!(progress.phase, NativeTranscriptionPhase::Decode);
+                // Monotonic even across raw polling (no lock held across
+                // reads, but the CAS inside `publish_progress` guarantees a
+                // reader never observes a regression).
+                assert!(progress.fraction >= previous_fraction);
+                previous_fraction = progress.fraction;
+                if progress.fraction > 0.0 && progress.fraction < DECODE_CEIL_NO_ALIGN {
+                    saw_intermediate_signal = true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let transcription = decode_thread
+            .join()
+            .expect("decode thread must not panic")
+            .expect("real decode must succeed");
+        assert!(
+            transcription.text.to_uppercase().contains("COUNTRY"),
+            "unexpected transcript: {:?}",
+            transcription.text
+        );
+        assert!(
+            saw_intermediate_signal,
+            "expected at least one progress snapshot strictly between 0 and the decode ceiling; \
+             short-audio decode must report continuous token-level progress, not stay silent \
+             until completion"
+        );
         assert_eq!(native_transcription_progress(), None);
     }
 
