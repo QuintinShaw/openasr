@@ -56,10 +56,7 @@ No terminal needed. Install the app, drop in an audio file, and get your transcr
 ### CLI quickstart
 
 ```bash
-# Option A: Homebrew (macOS / Linux)
-brew install quintinshaw/tap/openasr
-
-# Option B: grab a prebuilt binary from Releases
+# Grab a prebuilt binary from Releases
 # https://github.com/QuintinShaw/openasr/releases
 
 # Transcribe a file (first run offers to download a model — you confirm first)
