@@ -1,4 +1,6 @@
-use std::{env, fs};
+use std::env;
+#[cfg(unix)]
+use std::fs;
 
 use serde::{Deserialize, Serialize};
 

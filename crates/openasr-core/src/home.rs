@@ -10,6 +10,10 @@ pub enum OpenAsrHomeError {
     MissingHome,
 }
 
+// Resolution contract: OPENASR_HOME overrides, otherwise <user home>/.openasr.
+// Downstream installers that cannot link this crate replicate this rule (e.g.
+// the desktop NSIS uninstaller's app-data cleanup); keep them in sync when
+// changing it.
 pub fn openasr_home() -> Result<PathBuf, OpenAsrHomeError> {
     resolve_openasr_home(env::var_os("OPENASR_HOME"), user_home_dir())
 }

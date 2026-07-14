@@ -46,22 +46,20 @@ use axum::{
 };
 use futures_util::stream;
 use openasr_core::api::backend::TranscriptionBackendCapabilities;
-use openasr_core::config::{load_config_document, save_config_document};
 pub use openasr_core::pairing_safety_code_for_certificate_fingerprint;
 use openasr_core::realtime::history::{DaemonHistoryEntry, DaemonHistoryStoreError};
 use openasr_core::{
     AudioPreparationError, BackendKind, CatalogError, CatalogMirror, CatalogPullRequest,
     InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog, OpenAsrHomeError, PullError,
     PullModelPackRequest, PullProgress, QuantPreference, RealtimeBackendCapabilities,
-    ResolvedCatalogPull, certificate_fingerprint_sha256, default_pack_pointer_path,
-    host_quant_recommendation_profile, install_catalog_model_pack_from_path,
-    install_model_pack_from_path, list_installed_packs, load_config,
+    ResolvedCatalogPull, certificate_fingerprint_sha256, host_quant_recommendation_profile,
+    install_catalog_model_pack_from_path, install_model_pack_from_path, list_installed_packs,
     load_local_catalog_file_with_identity, load_model_catalog,
     native_runtime_realtime_capabilities_for_path,
-    native_runtime_transcription_capabilities_for_path, openasr_home, persist_default_pack_pointer,
-    read_default_pack_pointer, remove_model_pack, resolve_catalog_pull,
-    resolve_installed_pack_reference, resolve_installed_pack_reference_with_catalog,
-    resolve_launch_pack, resolve_runtime_catalog, runtime_registry, save_default_model_selection,
+    native_runtime_transcription_capabilities_for_path, openasr_home, remove_model_pack,
+    resolve_catalog_pull, resolve_installed_pack_reference,
+    resolve_installed_pack_reference_with_catalog, resolve_launch_pack, resolve_runtime_catalog,
+    runtime_registry,
 };
 use rcgen::{Certificate, CertificateParams};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -524,6 +522,11 @@ fn load_or_generate_self_signed_tls_identity(
 /// boot sequence that is guaranteed to have created `OPENASR_HOME` first).
 /// Never fails serve over this: a create or chmod failure is logged and
 /// swallowed, matching every other persistence step in this module.
+// On non-unix targets the `#[cfg(unix)]` chmod block below does not exist, so
+// this early `return` becomes the function's last statement and clippy (on
+// those targets only) reads it as needless; it stays required on unix to skip
+// that block after a failed `create_dir_all`.
+#[cfg_attr(not(unix), allow(clippy::needless_return))]
 fn harden_tls_identity_store_dir_permissions(store_path: &Path) {
     let Some(parent) = store_path.parent() else {
         return;
@@ -2149,6 +2152,14 @@ struct DefaultModelResponse {
     object: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     default_model: Option<String>,
+    /// Tri-state read straight off `openasr_core::default_selection::
+    /// DefaultModelResolution`: "installed" (`pack`/`default_pull` populated),
+    /// "not_installed" (a default is configured but has no matching installed
+    /// pack -- `default_model` still names it), or "unset" (nothing configured
+    /// at all). Always present, unlike the other fields, so a client can
+    /// distinguish "reinstall your default" from "choose a model" without
+    /// falling back to null-checking `pack`.
+    default_model_status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     default_pull: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2185,6 +2196,22 @@ impl From<openasr_core::RuntimeRegistryError> for ApiError {
         match error {
             openasr_core::RuntimeRegistryError::Registry(error) => Self::Registry(error),
             openasr_core::RuntimeRegistryError::Catalog(error) => Self::Catalog(error),
+        }
+    }
+}
+
+impl From<openasr_core::default_selection::DefaultSelectionError> for ApiError {
+    fn from(error: openasr_core::default_selection::DefaultSelectionError) -> Self {
+        match error {
+            openasr_core::default_selection::DefaultSelectionError::Config(error) => {
+                Self::Config(error)
+            }
+            openasr_core::default_selection::DefaultSelectionError::Pull(error) => {
+                Self::Pull(error)
+            }
+            openasr_core::default_selection::DefaultSelectionError::Catalog(error) => {
+                Self::Catalog(error)
+            }
         }
     }
 }

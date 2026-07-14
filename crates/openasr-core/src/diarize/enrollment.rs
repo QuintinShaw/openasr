@@ -782,7 +782,7 @@ fn write_owner_only_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     crate::atomic_file::write_owner_only_file_atomically(path, bytes)
 }
 
-fn set_owner_only_dir_permissions(path: &Path) {
+fn set_owner_only_dir_permissions(#[cfg_attr(not(unix), allow(unused_variables))] path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

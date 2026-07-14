@@ -2381,10 +2381,7 @@ fn windows_in_use_os_errors_classify_as_model_in_use() {
     // ERROR_FILE_NOT_FOUND (2) and ERROR_ACCESS_DENIED (5, ambiguous) are not.
     assert!(!is_file_in_use_error(&io::Error::from_raw_os_error(2)));
     assert!(!is_file_in_use_error(&io::Error::from_raw_os_error(5)));
-    assert!(!is_file_in_use_error(&io::Error::new(
-        io::ErrorKind::Other,
-        "x"
-    )));
+    assert!(!is_file_in_use_error(&io::Error::other("x")));
 }
 
 #[cfg(windows)]
