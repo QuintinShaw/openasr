@@ -130,6 +130,9 @@ impl ParakeetCtcEncoderGraph {
                 conv_kernel: metadata.conv_kernel,
                 subsampling_channels: metadata.subsampling_channels,
                 scale_input: true,
+                // Metal F16-activation experiment is parakeet-tdt-only for
+                // now; parakeet-ctc keeps the byte-identical F32 path.
+                f16_activations: false,
             },
             mel.n_mels,
             mel.n_frames,

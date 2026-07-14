@@ -13,7 +13,7 @@
 //! relative-shift byte strides are passed in (the caller keeps its
 //! overflow-checked arithmetic), keeping the block free of fallible pre-math.
 
-use crate::ggml_runtime::{GgmlCpuGraphBuilder, GgmlCpuGraphError, GgmlCpuTensor};
+use crate::ggml_runtime::{GGML_TYPE_F16, GgmlCpuGraphBuilder, GgmlCpuGraphError, GgmlCpuTensor};
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
     STANDARD_HEAD_PERMUTE_AXES, attention_context_from_probs,
@@ -43,6 +43,20 @@ pub(crate) struct ConformerBlockConfig {
     pub rel_shift_nb1: usize,
     pub rel_shift_nb2: usize,
     pub rel_shift_offset: usize,
+    /// Experiment (default false): cast selected mul_mat-adjacent
+    /// "bandwidth leaf" activations -- tensors that live only between two
+    /// `mul_mat`s (which always output F32 regardless of input type) -- to
+    /// F16 inside the attention head-reshape and conv GLU sections. `norm`,
+    /// `soft_max`, and the FF1/FF2 halves are deliberately left untouched.
+    /// Two of these casts (`attn_out` into `attn_out_weight`, and the conv
+    /// tail into `conv_pw2_weight`) sit directly on a mul_mat rhs whose lhs
+    /// weight may be quantized in a `.oasr` pack; Metal has no
+    /// quantized-lhs x F16-rhs *mv* kernel (narrow rhs, ne11 <= 8), so those
+    /// two sites additionally require the matching weight tensor to be F16
+    /// before they cast, and fall back to the unchanged F32 path otherwise.
+    /// When false the block builds the exact same graph (same ops, same
+    /// order, same F32 types) as before this field existed.
+    pub f16_activations: bool,
 }
 
 /// Per-block graph tensors, in submodule order: FF1 (macaron) → rel-pos
@@ -284,21 +298,50 @@ where
         },
         map_err,
     )?;
+    // `f16_activations` (default off): cast the mul_mat leaves that live
+    // only between two matmuls -- `mul_mat` always outputs F32 regardless of
+    // operand type, so these casts are pure bandwidth for the ac/bd/context
+    // matmuls and never touch the softmax/norm/residual math, which stays
+    // F32. Disabled, `k_for_ac`/`r_for_bd`/`q_u`/`q_v` are exactly the
+    // original `cont(k)`/`cont(r)`/`q_u`/`q_v` expressions -- same ops, same
+    // order, same types.
+    let k_for_ac = if config.f16_activations {
+        graph
+            .cast_to_f16(k)
+            .map_err(|source| map_err("ggml_cast_f16(attn_k)", source))?
+    } else {
+        graph
+            .cont(k)
+            .map_err(|source| map_err("ggml_cont(attn_k)", source))?
+    };
+    let q_u = if config.f16_activations {
+        graph
+            .cast_to_f16(q_u)
+            .map_err(|source| map_err("ggml_cast_f16(attn_q_u)", source))?
+    } else {
+        q_u
+    };
     let ac = graph
-        .mul_mat(
-            graph
-                .cont(k)
-                .map_err(|source| map_err("ggml_cont(attn_k)", source))?,
-            q_u,
-        )
+        .mul_mat(k_for_ac, q_u)
         .map_err(|source| map_err("ggml_mul_mat(attn_ac)", source))?;
+    let r_for_bd = if config.f16_activations {
+        graph
+            .cast_to_f16(r)
+            .map_err(|source| map_err("ggml_cast_f16(attn_r)", source))?
+    } else {
+        graph
+            .cont(r)
+            .map_err(|source| map_err("ggml_cont(attn_r)", source))?
+    };
+    let q_v = if config.f16_activations {
+        graph
+            .cast_to_f16(q_v)
+            .map_err(|source| map_err("ggml_cast_f16(attn_q_v)", source))?
+    } else {
+        q_v
+    };
     let bd_raw = graph
-        .mul_mat(
-            graph
-                .cont(r)
-                .map_err(|source| map_err("ggml_cont(attn_r)", source))?,
-            q_v,
-        )
+        .mul_mat(r_for_bd, q_v)
         .map_err(|source| map_err("ggml_mul_mat(attn_bd_raw)", source))?;
     let bd = graph
         .view_3d(
@@ -333,6 +376,13 @@ where
         },
         map_err,
     )?;
+    let v_heads = if config.f16_activations {
+        graph
+            .cast_to_f16(v_heads)
+            .map_err(|source| map_err("ggml_cast_f16(attn_v)", source))?
+    } else {
+        v_heads
+    };
     let mut attn_out = attention_context_from_probs(
         graph,
         v_heads,
@@ -348,6 +398,22 @@ where
         },
         map_err,
     )?;
+    // `f16_activations`: only cast this mul_mat rhs to F16 when
+    // `attn_out_weight` (the mul_mat lhs) is itself F16. Metal ships
+    // `kernel_mul_mm_{q8_0,q4_K}_f16` (wide rhs, ne11 > 8) but has no
+    // `kernel_mul_mv_*_f16` (narrow rhs, ne11 <= 8, i.e. short/streaming
+    // windows) -- a quantized weight with an F16 rhs on a narrow window
+    // dispatches into a missing pipeline and crashes. When the weight is
+    // quantized this falls back to the unchanged F32 path.
+    let attn_out_f16 =
+        config.f16_activations && graph.tensor_type(weights.attn_out_weight) == GGML_TYPE_F16;
+    attn_out = if attn_out_f16 {
+        graph
+            .cast_to_f16(attn_out)
+            .map_err(|source| map_err("ggml_cast_f16(attn_ctx_merge)", source))?
+    } else {
+        attn_out
+    };
     attn_out = graph
         .mul_mat(weights.attn_out_weight, attn_out)
         .map_err(|source| map_err("ggml_mul_mat(attn_out)", source))?;
@@ -383,6 +449,12 @@ where
     conv = graph
         .add(conv, weights.conv_pw1_bias)
         .map_err(|source| map_err("ggml_add(conv_pw1_bias)", source))?;
+    // NOTE: `conv_view_row_stride`/`conv_plane_stride` below are byte
+    // strides sized for f32 elements -- the `f16_activations` cast for the
+    // GLU main/gate split is deliberately applied *after* this view/cont
+    // split (once each half is a fresh, densely-packed f32 tensor), not
+    // before it, so these strides never need to track a variable element
+    // width.
     let conv_view_row_stride = d_model * std::mem::size_of::<f32>();
     let conv_plane_stride = (d_model * 2) * std::mem::size_of::<f32>();
     let conv_main = graph
@@ -407,12 +479,29 @@ where
             d_model * std::mem::size_of::<f32>(),
         )
         .map_err(|source| map_err("ggml_view_3d(conv_gate)", source))?;
-    let conv_main = graph
-        .cont(conv_main)
-        .map_err(|source| map_err("ggml_cont(conv_main)", source))?;
-    let conv_gate = graph
-        .cont(conv_gate)
-        .map_err(|source| map_err("ggml_cont(conv_gate)", source))?;
+    // `f16_activations` (default off): the GLU gate math (sigmoid + mul)
+    // below lives entirely between the pw1 mul_mat above and the pw2
+    // mul_mat further down (both always output/consume via f32 or f16 mats
+    // regardless), so making these `cont`s produce F16 instead of F32 is
+    // pure bandwidth with zero extra graph nodes versus the disabled path.
+    let conv_main = if config.f16_activations {
+        graph
+            .cast_to_f16(conv_main)
+            .map_err(|source| map_err("ggml_cast_f16(conv_main)", source))?
+    } else {
+        graph
+            .cont(conv_main)
+            .map_err(|source| map_err("ggml_cont(conv_main)", source))?
+    };
+    let conv_gate = if config.f16_activations {
+        graph
+            .cast_to_f16(conv_gate)
+            .map_err(|source| map_err("ggml_cast_f16(conv_gate)", source))?
+    } else {
+        graph
+            .cont(conv_gate)
+            .map_err(|source| map_err("ggml_cont(conv_gate)", source))?
+    };
     let conv_main = graph
         .reshape_2d(conv_main, d_model, frame_count)
         .map_err(|source| map_err("ggml_reshape_2d(conv_main)", source))?;
@@ -434,9 +523,20 @@ where
     conv = graph
         .transpose(conv)
         .map_err(|source| map_err("ggml_transpose(conv_glu)", source))?;
-    conv = graph
-        .cont(conv)
-        .map_err(|source| map_err("ggml_cont(conv_glu_t)", source))?;
+    // `conv_2d_dw`'s `data` input guard is deliberately left F32-only (its
+    // Metal F16 support is unverified and out of scope for this
+    // experiment), so round-trip back to F32 here regardless of
+    // `f16_activations` -- zero extra nodes either way, this `cont` already
+    // existed.
+    conv = if config.f16_activations {
+        graph
+            .cast_to_f32(conv)
+            .map_err(|source| map_err("ggml_cast_f32(conv_glu_t)", source))?
+    } else {
+        graph
+            .cont(conv)
+            .map_err(|source| map_err("ggml_cont(conv_glu_t)", source))?
+    };
     let conv_4d = graph
         .reshape_4d(conv, frame_count, 1, d_model, 1)
         .map_err(|source| map_err("ggml_reshape_4d(conv_in_4d)", source))?;
@@ -446,12 +546,42 @@ where
     conv = graph
         .permute(conv, 1, 2, 0, 3)
         .map_err(|source| map_err("ggml_permute(conv_dw_out)", source))?;
-    conv = graph
-        .cont(conv)
-        .map_err(|source| map_err("ggml_cont(conv_dw_out)", source))?;
+    // `f16_activations`: the bias-add + SiLU below feed straight into the
+    // pw2 mul_mat rhs, so only make this `cont` produce F16 (instead of F32)
+    // when `conv_pw2_weight` (the mul_mat lhs) is itself F16. Metal ships
+    // `kernel_mul_mm_{q8_0,q4_K}_f16` (wide rhs, ne11 > 8) but has no
+    // `kernel_mul_mv_*_f16` (narrow rhs, ne11 <= 8, i.e. short/streaming
+    // windows) -- a quantized weight with an F16 rhs on a narrow window
+    // dispatches into a missing pipeline and crashes. When the weight is
+    // quantized, this whole tail (cast, bias, SiLU) falls back to the
+    // unchanged F32 path.
+    let conv_pw2_f16 =
+        config.f16_activations && graph.tensor_type(weights.conv_pw2_weight) == GGML_TYPE_F16;
+    conv = if conv_pw2_f16 {
+        graph
+            .cast_to_f16(conv)
+            .map_err(|source| map_err("ggml_cast_f16(conv_dw_out)", source))?
+    } else {
+        graph
+            .cont(conv)
+            .map_err(|source| map_err("ggml_cont(conv_dw_out)", source))?
+    };
     let conv_dw_bias = graph
         .reshape_4d(weights.conv_dw_bias, d_model, 1, 1, 1)
         .map_err(|source| map_err("ggml_reshape_4d(conv_dw_bias)", source))?;
+    // `conv_dw_bias` is a small (d_model-element) F32 static tensor; the
+    // relaxed `add` guard requires matching types, so cast it to F16 too
+    // when the gated `conv` operand is F16 (mirroring `conv_pw2_f16` above).
+    // Cheapest option here: this tensor is orders of magnitude smaller than
+    // `conv` itself, so casting it beats keeping the whole conv/bias-add/SiLU
+    // chain in F32.
+    let conv_dw_bias = if conv_pw2_f16 {
+        graph
+            .cast_to_f16(conv_dw_bias)
+            .map_err(|source| map_err("ggml_cast_f16(conv_dw_bias)", source))?
+    } else {
+        conv_dw_bias
+    };
     let pw2 = graph
         .reshape_2d(weights.conv_pw2_weight, d_model, d_model)
         .map_err(|source| map_err("ggml_reshape_2d(conv_pw2_weight)", source))?;

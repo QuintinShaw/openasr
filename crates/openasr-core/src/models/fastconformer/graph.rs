@@ -496,6 +496,11 @@ pub(crate) struct FastConformerStackConfig {
     pub conv_kernel: usize,
     pub subsampling_channels: usize,
     pub scale_input: bool,
+    /// Experiment (default false): cast selected mul_mat-adjacent
+    /// activations in each conformer block to F16. See
+    /// `nn::encoder::ConformerBlockConfig::f16_activations`. Every caller of
+    /// `build_conformer_stack` must set this explicitly.
+    pub f16_activations: bool,
 }
 
 /// Output of the shared subsampling + conformer stack: the last block's
@@ -710,6 +715,7 @@ pub(crate) fn build_conformer_stack<'a, E: FastConformerGraphError>(
         rel_shift_nb1: (2 * frame - 2) * element,
         rel_shift_nb2: (2 * frame - 1) * frame * element,
         rel_shift_offset: (frame - 1) * element,
+        f16_activations: config.f16_activations,
     };
     let pos_enc = pos_t;
     for handles in layers {

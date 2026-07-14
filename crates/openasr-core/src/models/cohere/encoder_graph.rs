@@ -1192,6 +1192,9 @@ fn run_encoder_layer<'a>(
         rel_shift_nb1,
         rel_shift_nb2,
         rel_shift_offset,
+        // cohere-transcribe keeps the byte-identical F32 path; the F16
+        // activation experiment is parakeet-tdt-only for now.
+        f16_activations: false,
     };
     let weights = ConformerBlockWeights {
         ff1_norm_weight: layer.ff1_norm_weight,

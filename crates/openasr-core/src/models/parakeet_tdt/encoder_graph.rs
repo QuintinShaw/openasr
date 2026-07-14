@@ -11,7 +11,9 @@ use crate::ggml_runtime::{GgmlCpuGraphError, GgmlStaticTensor, WeightSlot};
 use crate::models::fastconformer::{
     self, FastConformerEncoderCore, FastConformerGraphError, FastConformerStackConfig,
 };
-use crate::models::parakeet_tdt::graph_config::parakeet_tdt_encoder_graph_config;
+use crate::models::parakeet_tdt::graph_config::{
+    parakeet_tdt_encoder_f16_activations_enabled, parakeet_tdt_encoder_graph_config,
+};
 
 use super::encoder_weights::ParakeetTdtEncoderWeights;
 use super::runtime_contract::ParakeetTdtExecutionMetadata;
@@ -63,6 +65,9 @@ pub(crate) struct ParakeetTdtEncoderGraph {
     core: FastConformerEncoderCore,
     enc_proj_weight: WeightSlot,
     enc_proj_bias: GgmlStaticTensor,
+    /// Metal-only experiment (default false); see
+    /// `parakeet_tdt_encoder_f16_activations_enabled`.
+    f16_activations: bool,
 }
 
 impl ParakeetTdtEncoderGraph {
@@ -72,6 +77,7 @@ impl ParakeetTdtEncoderGraph {
         runtime_path: Option<&Path>,
     ) -> Result<Self, ParakeetTdtEncoderError> {
         let config = parakeet_tdt_encoder_graph_config();
+        let f16_activations = parakeet_tdt_encoder_f16_activations_enabled(config.backend);
         let (core, (enc_proj_weight, enc_proj_bias)) = FastConformerEncoderCore::build(
             config,
             PARAKEET_TDT_ENCODER_GRAPH_CONTEXT_BYTES,
@@ -94,6 +100,7 @@ impl ParakeetTdtEncoderGraph {
             core,
             enc_proj_weight,
             enc_proj_bias,
+            f16_activations,
         })
     }
 
@@ -118,6 +125,7 @@ impl ParakeetTdtEncoderGraph {
                 // Metadata-driven: parakeet-ctc's HF checkpoint scales, v3's
                 // does NOT (the HF conversion folded NeMo's xscaling away).
                 scale_input: metadata.scale_input,
+                f16_activations: self.f16_activations,
             },
             mel.n_mels,
             mel.n_frames,

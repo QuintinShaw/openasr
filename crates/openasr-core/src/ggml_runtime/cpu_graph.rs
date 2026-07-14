@@ -1930,8 +1930,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         rhs: GgmlCpuTensor<'a>,
     ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
         self.ensure_can_extend_graph("ggml_add")?;
-        self.ensure_tensor_type(lhs, ffi::GGML_TYPE_F32, "ggml_add lhs")?;
-        self.ensure_tensor_type(rhs, ffi::GGML_TYPE_F32, "ggml_add rhs")?;
+        self.ensure_tensor_types_match_f32_or_f16(lhs, rhs, "ggml_add")?;
         let can_repeat = unsafe { ffi::ggml_can_repeat(rhs.raw.as_ptr(), lhs.raw.as_ptr()) };
         if !can_repeat {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -1969,8 +1968,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         rhs: GgmlCpuTensor<'a>,
     ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
         self.ensure_can_extend_graph("ggml_mul")?;
-        self.ensure_tensor_type(lhs, ffi::GGML_TYPE_F32, "ggml_mul lhs")?;
-        self.ensure_tensor_type(rhs, ffi::GGML_TYPE_F32, "ggml_mul rhs")?;
+        self.ensure_tensor_types_match_f32_or_f16(lhs, rhs, "ggml_mul")?;
         let can_repeat = unsafe { ffi::ggml_can_repeat(rhs.raw.as_ptr(), lhs.raw.as_ptr()) };
         if !can_repeat {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -2186,7 +2184,11 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         scalar: f32,
     ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
         self.ensure_can_extend_graph("ggml_scale")?;
-        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_scale input")?;
+        self.ensure_tensor_type_in(
+            input,
+            &[ffi::GGML_TYPE_F32, ffi::GGML_TYPE_F16],
+            "ggml_scale input",
+        )?;
         self.ensure_tensor_contiguous(input, "ggml_scale")?;
         let raw = unsafe { ffi::ggml_scale(self.context.as_ptr(), input.raw.as_ptr(), scalar) };
         self.new_tensor_checked(raw, "ggml_scale")
@@ -2571,7 +2573,11 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         input: GgmlCpuTensor<'a>,
     ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
         self.ensure_can_extend_graph("ggml_sigmoid")?;
-        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_sigmoid input")?;
+        self.ensure_tensor_type_in(
+            input,
+            &[ffi::GGML_TYPE_F32, ffi::GGML_TYPE_F16],
+            "ggml_sigmoid input",
+        )?;
         let raw = unsafe { ffi::ggml_sigmoid(self.context.as_ptr(), input.raw.as_ptr()) };
         self.new_tensor_checked(raw, "ggml_sigmoid")
     }
@@ -2604,7 +2610,11 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         input: GgmlCpuTensor<'a>,
     ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
         self.ensure_can_extend_graph("ggml_silu")?;
-        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_silu input")?;
+        self.ensure_tensor_type_in(
+            input,
+            &[ffi::GGML_TYPE_F32, ffi::GGML_TYPE_F16],
+            "ggml_silu input",
+        )?;
         let raw = unsafe { ffi::ggml_silu(self.context.as_ptr(), input.raw.as_ptr()) };
         self.new_tensor_checked(raw, "ggml_silu")
     }
@@ -2640,6 +2650,18 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         input: GgmlCpuTensor<'a>,
     ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
         self.cast(input, ffi::GGML_TYPE_F16)
+    }
+
+    /// `cast` specialized to an F32 target: the round-trip counterpart to
+    /// [`cast_to_f16`], for callers (e.g. the experimental
+    /// `f16_activations` conformer-block path) that need to bring an F16
+    /// bandwidth leaf back to F32 before an op whose type guard is not
+    /// relaxed (e.g. `conv_2d_dw`'s `data` input).
+    pub(crate) fn cast_to_f32(
+        &self,
+        input: GgmlCpuTensor<'a>,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.cast(input, ffi::GGML_TYPE_F32)
     }
 
     pub(crate) fn cont(
@@ -4150,7 +4172,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         unsafe { *(tensor.raw.as_ptr() as *const ffi::GgmlTensorLayoutPrefix) }
     }
 
-    fn tensor_type(&self, tensor: GgmlCpuTensor<'a>) -> i32 {
+    pub(crate) fn tensor_type(&self, tensor: GgmlCpuTensor<'a>) -> i32 {
         self.tensor_layout_prefix(tensor).type_
     }
 
@@ -4215,14 +4237,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 reason: match step {
                     "ggml_mul_mat lhs" => "ggml_mul_mat lhs must be f32",
                     "ggml_mul_mat rhs" => "ggml_mul_mat rhs must be f32",
-                    "ggml_add lhs" => "ggml_add lhs must be f32",
-                    "ggml_add rhs" => "ggml_add rhs must be f32",
                     "ggml_add_inplace lhs" => "ggml_add_inplace lhs must be f32",
                     "ggml_add_inplace rhs" => "ggml_add_inplace rhs must be f32",
                     "ggml_sub lhs" => "ggml_sub lhs must be f32",
                     "ggml_sub rhs" => "ggml_sub rhs must be f32",
-                    "ggml_mul lhs" => "ggml_mul lhs must be f32",
-                    "ggml_mul rhs" => "ggml_mul rhs must be f32",
                     "ggml_mul_inplace lhs" => "ggml_mul_inplace lhs must be f32",
                     "ggml_mul_inplace rhs" => "ggml_mul_inplace rhs must be f32",
                     "ggml_div lhs" => "ggml_div lhs must be f32",
@@ -4230,7 +4248,6 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     "ggml_sqr input" => "ggml_sqr input must be f32",
                     "ggml_sqrt input" => "ggml_sqrt input must be f32",
                     "ggml_log input" => "ggml_log input must be f32",
-                    "ggml_scale input" => "ggml_scale input must be f32",
                     "ggml_sum input" => "ggml_sum input must be f32",
                     "ggml_sum_rows input" => "ggml_sum_rows input must be f32",
                     "ggml_mean input" => "ggml_mean input must be f32",
@@ -4238,7 +4255,6 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     "ggml_rms_norm input" => "ggml_rms_norm input must be f32",
                     "ggml_softplus input" => "ggml_softplus input must be f32",
                     "ggml_exp input" => "ggml_exp input must be f32",
-                    "ggml_silu input" => "ggml_silu input must be f32",
                     "ggml_repeat input" => "ggml_repeat input must be f32",
                     "ggml_repeat target" => "ggml_repeat target must be f32",
                     "ggml_repeat_4d input" => "ggml_repeat_4d input must be f32",
@@ -4287,7 +4303,40 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 "ggml_permute input" => "ggml_permute input type is unsupported",
                 "ggml_cast input" => "ggml_cast input type is unsupported",
                 "ggml_set_rows dst" => "ggml_set_rows dst must be f16 or f32",
+                "ggml_scale input" => "ggml_scale input must be f16 or f32",
+                "ggml_sigmoid input" => "ggml_sigmoid input must be f16 or f32",
+                "ggml_silu input" => "ggml_silu input must be f16 or f32",
                 _ => "operation input type is unsupported",
+            },
+        })
+    }
+
+    /// Binary elementwise op guard for wrappers relaxed to accept F16
+    /// activations (the `f16_activations` conformer-block experiment):
+    /// `lhs`/`rhs` must be the *same* element type, both F32 or both F16.
+    /// This matches the vendored ggml Metal patch's ADD/SUB/MUL/DIV
+    /// requirement that src0/src1/dst share one type -- unlike `mul_mat`,
+    /// which legitimately mixes lhs/rhs types (e.g. a quantized weight
+    /// against an F32 activation), these are true elementwise ops with no
+    /// dequantize-on-read path, so a mixed F32/F16 pair would silently read
+    /// the wrong bit width on one side.
+    fn ensure_tensor_types_match_f32_or_f16(
+        &self,
+        lhs: GgmlCpuTensor<'a>,
+        rhs: GgmlCpuTensor<'a>,
+        step: &'static str,
+    ) -> Result<(), GgmlCpuGraphError> {
+        let lhs_type = self.tensor_type(lhs);
+        let rhs_type = self.tensor_type(rhs);
+        let lhs_supported = matches!(lhs_type, ffi::GGML_TYPE_F32 | ffi::GGML_TYPE_F16);
+        if lhs_supported && lhs_type == rhs_type {
+            return Ok(());
+        }
+        Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: match step {
+                "ggml_add" => "ggml_add lhs/rhs must both be f32 or both be f16",
+                "ggml_mul" => "ggml_mul lhs/rhs must both be f32 or both be f16",
+                _ => "operation lhs/rhs must both be f32 or both be f16",
             },
         })
     }
@@ -5163,7 +5212,8 @@ unsafe fn write_tensor_data(
 #[cfg(test)]
 mod tests {
     use crate::ggml_runtime::{
-        GgufTensorMetadata, GgufWeightTensorElementType, GgufWeightTensorPayload, ffi,
+        GgufTensorMetadata, GgufWeightTensorElementType, GgufWeightTensorPayload,
+        GgufWriteTensorType, ffi, quantize_f32_to_ggml_tensor_data,
     };
     use crate::nn::half::f32_to_f16_bits as f32_to_f16_bits_for_test;
 
@@ -5890,6 +5940,147 @@ mod tests {
             .compute_output_f32(output_f32, 2)
             .expect("graph should compute with f16 rhs input");
         assert_eq!(output, vec![2.0, 3.0]);
+    }
+
+    #[test]
+    // Probes the LIVE Metal GPU (~20s/process backend init) to validate a
+    // combination the `f16_activations` conformer-block experiment newly
+    // relies on, and that no existing test exercised: a quantized (Q8_0)
+    // `mul_mat` lhs paired with an F16 rhs (`mul_mat`'s rhs guard already
+    // allowed F16 -- see `ensure_tensor_type_in` -- but nothing had run that
+    // combination through real Metal compute). Compares against the same
+    // Q8_0 lhs with an F32 rhs holding the identical source values.
+    //
+    // IMPORTANT / found-by-this-test hazard: ggml's Metal dispatch picks
+    // between two different kernel families depending on rhs width
+    // (`ggml-metal-ops.cpp`, `ne00 >= 64 && ne11 > 8` routes to the
+    // matrix-matrix "mm" kernel; narrower shapes route to the
+    // matrix-vector "mv" kernel). The vendored Metal shader source
+    // (`ggml-metal.metal`) instantiates `kernel_mul_mm_q8_0_f16` but has
+    // **no** `kernel_mul_mv_q8_0_f16` at all -- only `..._q8_0_f32`. An
+    // earlier version of this test used a narrow rhs (ne11=1) and this
+    // reliably **SIGSEGV'd the whole test process** (pipeline compile
+    // failure surfaced as a null-pipeline dereference, not a catchable
+    // Rust error) -- do not narrow these dims back down; a crashing
+    // `#[test]` aborts the entire binary, ignored or not. This test
+    // therefore deliberately keeps the rhs wide enough (ne00=64, ne11=16)
+    // to force the mm path, which the F16-activation encoder mul_mats
+    // (attn_out_weight, conv_pw2_weight against a many-frame rhs) will
+    // realistically hit -- but any caller that can end up with a
+    // Q8_0/Q4_K-weight mul_mat whose rhs has few columns (e.g. a very
+    // short utterance's post-subsampling frame count) would hit the
+    // crashing mv path instead. See the task writeup for what this
+    // implies for the experiment's safe scope.
+    #[ignore = "probes live Metal (~20s); Metal-host-only -- run via --run-ignored"]
+    fn metal_quantized_lhs_mul_mat_matches_between_f16_and_f32_rhs() {
+        let config = GgmlCpuGraphConfig {
+            backend: GgmlCpuGraphBackend::Metal,
+            ..GgmlCpuGraphConfig::conservative_default()
+        };
+        let mut runner = GgmlCpuGraphRunner::new(config).expect("metal runner should initialize");
+        let mut arena = runner
+            .start_static_tensor_arena(config.context_bytes)
+            .expect("static tensor arena should initialize");
+
+        // lhs: [k=64 (two Q8_0 blocks), m=4] quantized weight with varied,
+        // non-trivial values so a wrong-lane or wrong-scale dequant would
+        // show up as a mismatch, not be masked by an all-zeros pass. k=64
+        // and rhs width n=16 below are chosen to satisfy
+        // `ggml-metal-ops.cpp`'s `ne00 >= 64 && ne11 > 8` mm-path gate --
+        // see the crash note above for why the dims must stay in this
+        // range.
+        const K: usize = 64;
+        const M: usize = 4;
+        const N: usize = 16;
+        let lhs_values: Vec<f32> = (0..K * M).map(|i| ((i % 13) as f32 - 6.0) * 0.37).collect();
+        let lhs_bytes = quantize_f32_to_ggml_tensor_data(
+            GgufWriteTensorType::Q8_0,
+            &[K as u64, M as u64],
+            &lhs_values,
+        )
+        .expect("q8_0 quantization should succeed");
+        let lhs_metadata = test_tensor_metadata(
+            "test.lhs.q8_0",
+            &[K as u64, M as u64],
+            ffi::GGML_TYPE_Q8_0,
+            "q8_0",
+            lhs_bytes.len() as u64,
+        );
+        let lhs_payload = GgufWeightTensorPayload {
+            metadata: &lhs_metadata,
+            bytes: &lhs_bytes,
+            dims: vec![K, M],
+            num_elements: K * M,
+            element_type: GgufWeightTensorElementType::RawGgml {
+                ggml_type: ffi::GGML_TYPE_Q8_0,
+            },
+        };
+        let lhs = arena
+            .new_tensor_from_weight_payload(&lhs_payload)
+            .expect("q8_0 lhs tensor should allocate");
+        arena
+            .set_weight_tensor_from_payload(lhs, &lhs_payload)
+            .expect("q8_0 lhs upload should succeed");
+
+        let rhs_values: Vec<f32> = (0..K * N).map(|i| ((i % 9) as f32 - 4.0) * 0.21).collect();
+
+        let mut graph = runner.start_graph();
+        let rhs_f32 = graph
+            .new_tensor_2d_f32(K, N, "rhs_f32")
+            .expect("f32 rhs should allocate");
+        let rhs_f16 = graph
+            .new_tensor_2d_f16(K, N, "rhs_f16")
+            .expect("f16 rhs should allocate");
+        graph.set_input(rhs_f32).expect("rhs_f32 set_input");
+        graph.set_input(rhs_f16).expect("rhs_f16 set_input");
+
+        let lhs_graph = arena.graph_tensor(lhs);
+        let out_f32_rhs = graph
+            .mul_mat(lhs_graph, rhs_f32)
+            .expect("q8_0 x f32 mul_mat should build on metal");
+        let out_f16_rhs = graph
+            .mul_mat(lhs_graph, rhs_f16)
+            .expect("q8_0 x f16 mul_mat should build on metal");
+        graph
+            .set_output(out_f32_rhs)
+            .expect("f32-rhs output should be markable");
+        graph
+            .set_output(out_f16_rhs)
+            .expect("f16-rhs output should be markable");
+
+        graph
+            .set_f32_slice(rhs_f32, &rhs_values, "rhs_f32")
+            .expect("rhs_f32 upload should succeed");
+        let rhs_f16_bits: Vec<u16> = rhs_values
+            .iter()
+            .copied()
+            .map(f32_to_f16_bits_for_test)
+            .collect();
+        graph
+            .set_f16_bits_slice(rhs_f16, &rhs_f16_bits, "rhs_f16")
+            .expect("rhs_f16 upload should succeed");
+
+        let outputs = graph
+            .compute_outputs_f32(&[(out_f32_rhs, M * N), (out_f16_rhs, M * N)])
+            .expect("metal q8_0 mul_mat with f16 and f32 rhs should both compute");
+        let (f32_rhs_result, f16_rhs_result) = (&outputs[0], &outputs[1]);
+
+        // F16 carries ~3 decimal digits of precision; a relative tolerance
+        // of 1e-2 sits comfortably above F16 rounding noise for this
+        // K=64-term dot product while still catching a systematically wrong
+        // result (e.g. the rhs being read at the wrong element width).
+        for (i, (f32_value, f16_value)) in f32_rhs_result.iter().zip(f16_rhs_result).enumerate() {
+            assert!(
+                f32_value.is_finite() && f16_value.is_finite(),
+                "output[{i}] must be finite: f32_rhs={f32_value} f16_rhs={f16_value}"
+            );
+            let scale = f32_value.abs().max(1.0);
+            assert!(
+                (f32_value - f16_value).abs() <= scale * 1e-2,
+                "q8_0 lhs x f16 rhs diverged from q8_0 lhs x f32 rhs at output[{i}]: \
+                 f32_rhs={f32_value} f16_rhs={f16_value}"
+            );
+        }
     }
 
     #[test]
