@@ -1,4 +1,5 @@
 mod atomic_file;
+mod backends_manifest_security;
 mod catalog_security;
 mod catalog_series;
 mod http;
@@ -72,6 +73,13 @@ pub use audio::{
     AudioInputError, AudioInputInfo, AudioInputIssue, AudioPreparationError,
     AudioPreparationOptions, PreparedAudioInput, prepare_audio_input, probe_audio_input,
     probe_wav_duration, recognized_audio_extensions, validate_audio_input,
+};
+pub use backends_manifest_security::{
+    BACKENDS_MANIFEST_PRODUCTION_KEY_ID, BACKENDS_MANIFEST_SIGNATURE_ALGORITHM,
+    BACKENDS_MANIFEST_SIGNATURE_FILE_NAME, BACKENDS_MANIFEST_SIGNATURE_SCHEMA_VERSION,
+    BackendsManifestSecurityError, BackendsManifestSignature, BackendsManifestSignatureValue,
+    VerifiedBackendsManifestSignature, render_backends_manifest_signature,
+    verify_backends_manifest_signature,
 };
 pub use batch::{
     BatchError, BatchFailure, BatchInput, BatchItem, BatchOutput, BatchSummary, batch_output_path,

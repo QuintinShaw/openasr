@@ -272,6 +272,33 @@ pub(crate) enum Command {
     /// embedded catalog matches a copied catalog resource.
     #[command(name = "catalog-fingerprint", hide = true)]
     CatalogFingerprint,
+    /// Internal helper: sign a release `backends-manifest.json` (the
+    /// per-release index of downloadable Windows GPU-kernel sidecars) with
+    /// the SAME production signing key and trust root as the model catalog.
+    /// Signing stays local -- run this with
+    /// `OPENASR_CATALOG_SIGNING_KEY_SEED_HEX` set to the real production
+    /// seed, never in CI. See
+    /// `tooling/release-manifest/backends_manifest.py` for generating the
+    /// unsigned manifest this command signs.
+    #[command(name = "__openasr-sign-backends-manifest", hide = true)]
+    SignBackendsManifest {
+        /// backends-manifest.json file to sign.
+        manifest: PathBuf,
+        /// Output backends-manifest.signature.json path.
+        #[arg(long)]
+        out: PathBuf,
+        /// The canonical URL this manifest will be served from, e.g.
+        /// `https://dl.openasr.org/core/v0.1.10/backends-manifest.json`.
+        #[arg(long)]
+        manifest_url: String,
+        /// Signature key id. Defaults to the production catalog key id
+        /// (`openasr-catalog-v1`) -- this manifest has no local-dev key.
+        #[arg(long, default_value = "openasr-catalog-v1")]
+        key_id: String,
+        /// Print the derived public key for the env signing seed and exit.
+        #[arg(long)]
+        print_public_key: bool,
+    },
     /// Transcribe one or more audio files (or directories of audio).
     #[command(visible_alias = "t")]
     Transcribe {
