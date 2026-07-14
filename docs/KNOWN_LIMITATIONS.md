@@ -92,10 +92,23 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   prefers CPU decoder). It matches current correctness/perf evidence and is not yet
   generalized into a model-agnostic runtime tuning layer.
 - System-audio capture now has native smoke backends on macOS, Windows, and
-  Linux, but Windows remains all-system WASAPI loopback rather than per-process
-  capture, Linux depends on `pactl`/`parec` monitor-source capture, and
-  Windows/Linux real playback smoke still needs to be executed on those OS
-  sessions.
+  Linux. Windows additionally supports per-process loopback capture
+  (`run_process_loopback_capture`, via `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`)
+  alongside its existing all-system WASAPI loopback path; this requires
+  Windows 10 2004 (build 19041) or later and is capability-gated by
+  `process_loopback_support()`, which performs a real runtime activation
+  probe (not an OS-version heuristic, so it cannot be fooled by application
+  compatibility shims) and fails closed to "unsupported" on older systems.
+  `list_candidate_processes()` enumerates pid + executable name via a
+  Toolhelp32 snapshot for callers building a process picker. macOS and Linux
+  do not implement per-process capture yet -- both report it as `unsupported`
+  through the same capability probe rather than emulating it or silently
+  falling back to all-system capture; macOS keeps its Core Audio process-tap
+  all-system path and Linux keeps its `pactl`/`parec` monitor-source capture.
+  Windows real playback smoke (both all-system and per-process) has been
+  executed on a real Windows 11 session; Linux real playback smoke still
+  needs to be executed on a Linux session. Per-process capture has no desktop
+  UI wiring yet -- it is a library-level API only.
 - `serve` is single-model: it runs the one pack resolved at launch
   (`--model-pack` / an installed `--model`). There is no per-request lazy model
   loading or an `openasr ps`-style multi-model runner yet -- restart `serve` to
