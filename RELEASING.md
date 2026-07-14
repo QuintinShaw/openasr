@@ -106,3 +106,22 @@ upload, and completeness-gate logic without mutating the release's assets
 (the completeness check still runs and will fail loudly if that release is
 genuinely incomplete -- that failure is expected and informative, not a bug
 in the dry run).
+
+## Homebrew tap
+
+`release-core.yml`'s final job, `update-homebrew-tap`, bumps
+`Formula/openasr.rb` in [`QuintinShaw/homebrew-tap`](https://github.com/QuintinShaw/homebrew-tap)
+(version + per-target sha256 for `macos-arm64`, `linux-x86_64`, `linux-arm64`,
+read from the just-published release's `SHA256SUMS`) and pushes straight to
+that repo's `main`. It uses `scripts/update-homebrew-formula.py`, which fails
+closed if the formula's shape does not match what it expects (e.g. a target's
+`url` line has no corresponding `--sha256` given), rather than risk writing a
+formula with a stale hash paired with the new version.
+
+This needs a `HOMEBREW_TAP_TOKEN` repository secret: a **fine-grained GitHub
+PAT** scoped to the `QuintinShaw/homebrew-tap` repository only, with
+**Contents: Read and write** permission (nothing else). If the secret is not
+set, the job prints a `::notice::` and skips -- the release itself still
+succeeds and stays green; the tap formula just does not get bumped for that
+release (bump it manually by re-running the `update-homebrew-tap` job, or by
+hand, once the secret exists).
