@@ -13,7 +13,7 @@
 
 [Website](https://openasr.org) · [Documentation](docs/DOCS_INDEX.md) · [License](LICENSE)
 
-<img src="https://openasr.org/assets/openasr-desktop-preview-en-final.jpg" alt="OpenASR Desktop App" width="720" />
+<img src="https://openasr.org/assets/openasr-desktop-preview-en.gif" alt="OpenASR Desktop App" width="720" />
 
 <sub>Pre-v1 — under active development. CLI flags, API surface, and pack format may change between 0.x releases.</sub>
 

@@ -13,7 +13,7 @@
 
 [官网](https://openasr.org) · [文档](docs/DOCS_INDEX.md) · [License](LICENSE)
 
-<img src="https://openasr.org/assets/openasr-desktop-preview-zh-final.jpg" alt="OpenASR 桌面应用" width="720" />
+<img src="https://openasr.org/assets/openasr-desktop-preview-zh.gif" alt="OpenASR 桌面应用" width="720" />
 
 <sub>v1 之前的早期阶段,正在活跃开发中。0.x 版本间的命令行参数、API 和包格式可能调整。</sub>
 
