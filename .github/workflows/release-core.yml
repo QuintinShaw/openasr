@@ -290,3 +290,82 @@ jobs:
           python3 scripts/splice-install-verify.py current-body.md install-verify.md > new-body.md
 
           gh release edit "$tag" --notes-file new-body.md
+
+  update-homebrew-tap:
+    name: Update Homebrew tap formula
+    # Needs the full asset matrix (binaries), not just the core build job's
+    # macOS arm64 + Linux x86_64 -- the formula also ships a Linux arm64
+    # target, which only release-binaries.yml's matrix produces.
+    needs: [resolve, release, binaries]
+    if: needs.resolve.outputs.should_release == 'true' && success()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check for tap credentials
+        id: check
+        run: |
+          if [ -n "${{ secrets.HOMEBREW_TAP_TOKEN }}" ]; then
+            echo "has_token=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "has_token=false" >> "${GITHUB_OUTPUT}"
+            # ::notice, not ::error/::warning -- a maintainer who has not set
+            # up the tap yet should see a green release, not a red one, for a
+            # step that is inherently optional infrastructure.
+            echo "::notice::HOMEBREW_TAP_TOKEN secret not set -- skipping Homebrew tap formula update. See RELEASING.md for the fine-grained PAT this needs."
+          fi
+      - name: Checkout quintinshaw/homebrew-tap
+        if: steps.check.outputs.has_token == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: QuintinShaw/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - name: Compute per-target sha256 from the release's SHA256SUMS
+        if: steps.check.outputs.has_token == 'true'
+        id: sums
+        run: |
+          set -euo pipefail
+          tag="${{ needs.resolve.outputs.tag }}"
+          version="${{ needs.resolve.outputs.version }}"
+          curl -fsSL -o SHA256SUMS \
+            "https://github.com/${{ github.repository }}/releases/download/${tag}/SHA256SUMS"
+
+          sha_for() {
+            grep -F " openasr-${version}-$1.tar.gz" SHA256SUMS | awk '{print $1}'
+          }
+          for target in macos-arm64 linux-x86_64 linux-arm64; do
+            sha="$(sha_for "$target")"
+            if [ -z "$sha" ]; then
+              echo "::error::no SHA256SUMS entry for openasr-${version}-${target}.tar.gz -- did release-binaries.yml ship that target?"
+              exit 1
+            fi
+            echo "${target}=${sha}" >> shas.env
+          done
+          cat shas.env
+      - name: Update Formula/openasr.rb
+        if: steps.check.outputs.has_token == 'true'
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS='=' read -r target sha; do
+            args+=(--sha256 "${target}=${sha}")
+          done < shas.env
+          python3 scripts/update-homebrew-formula.py \
+            homebrew-tap/Formula/openasr.rb "${{ needs.resolve.outputs.version }}" \
+            "${args[@]}"
+      - name: Commit and push
+        if: steps.check.outputs.has_token == 'true'
+        run: |
+          set -euo pipefail
+          cd homebrew-tap
+          if git diff --quiet; then
+            echo "formula already up to date -- nothing to commit"
+            exit 0
+          fi
+          git config user.name "openasr-release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git add Formula/openasr.rb
+          git commit -m "openasr ${{ needs.resolve.outputs.tag }}"
+          git push origin main
