@@ -31,7 +31,8 @@ use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CFStri
 use objc2_foundation::{NSArray, NSNumber, NSString, NSUUID};
 
 use crate::{
-    CaptureBackendError, SystemAudioSupport,
+    CandidateProcess, CaptureBackendError, ProcessLoopbackMode, ProcessLoopbackSupport,
+    SystemAudioSupport,
     pcm::{Pcm16FrameChunker, TARGET_SAMPLE_RATE_HZ},
 };
 
@@ -119,6 +120,46 @@ pub fn run_loopback_capture(
     ))?;
 
     Ok("Capture stopped".to_string())
+}
+
+/// Per-process loopback capture is not implemented on macOS: the Core Audio
+/// process tap this backend uses (`AudioHardwareCreateProcessTap`) already
+/// captures a single process's audio when constructed with a specific PID
+/// instead of `initMonoGlobalTapButExcludeProcesses`, but wiring that up is
+/// separate scope from the Windows per-process work this module was written
+/// for. Fail closed rather than pretending support exists.
+pub fn process_loopback_support() -> ProcessLoopbackSupport {
+    ProcessLoopbackSupport {
+        supported: false,
+        detail: "macOS per-process loopback capture is not implemented; use the all-system Core Audio process tap via run_loopback_capture instead."
+            .to_string(),
+        platform: "macos".to_string(),
+    }
+}
+
+pub fn list_candidate_processes() -> Result<Vec<CandidateProcess>, CaptureBackendError> {
+    Err(CaptureBackendError {
+        code: "unsupported",
+        message:
+            "Process enumeration for per-process loopback capture is not implemented on macOS."
+                .to_string(),
+        diagnostic: "list_candidate_processes has no macOS backend yet.".to_string(),
+    })
+}
+
+pub fn run_process_loopback_capture(
+    _process_id: u32,
+    _mode: ProcessLoopbackMode,
+    _stop: Arc<AtomicBool>,
+    _on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
+    _on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+) -> Result<String, CaptureBackendError> {
+    Err(CaptureBackendError {
+        code: "unsupported",
+        message: "Per-process loopback capture is not implemented on macOS.".to_string(),
+        diagnostic: "run_process_loopback_capture has no macOS backend yet; use run_loopback_capture for all-system Core Audio process-tap capture."
+            .to_string(),
+    })
 }
 
 struct MacOsCaptureSession {

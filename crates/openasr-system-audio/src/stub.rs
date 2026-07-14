@@ -1,6 +1,9 @@
 use std::sync::{Arc, atomic::AtomicBool};
 
-use crate::{CaptureBackendError, SystemAudioSupport};
+use crate::{
+    CandidateProcess, CaptureBackendError, ProcessLoopbackMode, ProcessLoopbackSupport,
+    SystemAudioSupport,
+};
 
 pub fn support_status() -> SystemAudioSupport {
     SystemAudioSupport {
@@ -19,6 +22,36 @@ pub fn run_loopback_capture(
     Err(CaptureBackendError {
         code: "unsupported",
         message: "System-audio smoke capture is not implemented on this platform.".to_string(),
+        diagnostic: unsupported_detail(),
+    })
+}
+
+pub fn process_loopback_support() -> ProcessLoopbackSupport {
+    ProcessLoopbackSupport {
+        supported: false,
+        detail: unsupported_detail(),
+        platform: std::env::consts::OS.to_string(),
+    }
+}
+
+pub fn list_candidate_processes() -> Result<Vec<CandidateProcess>, CaptureBackendError> {
+    Err(CaptureBackendError {
+        code: "unsupported",
+        message: "Process enumeration is not implemented on this platform.".to_string(),
+        diagnostic: unsupported_detail(),
+    })
+}
+
+pub fn run_process_loopback_capture(
+    _process_id: u32,
+    _mode: ProcessLoopbackMode,
+    _stop: Arc<AtomicBool>,
+    _on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
+    _on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+) -> Result<String, CaptureBackendError> {
+    Err(CaptureBackendError {
+        code: "unsupported",
+        message: "Per-process loopback capture is not implemented on this platform.".to_string(),
         diagnostic: unsupported_detail(),
     })
 }

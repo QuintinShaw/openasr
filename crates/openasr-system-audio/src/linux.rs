@@ -8,7 +8,8 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::{
-    CaptureBackendError, SystemAudioSupport,
+    CandidateProcess, CaptureBackendError, ProcessLoopbackMode, ProcessLoopbackSupport,
+    SystemAudioSupport,
     pcm::{Pcm16FrameChunker, TARGET_CHANNELS, TARGET_SAMPLE_RATE_HZ},
 };
 
@@ -139,6 +140,45 @@ pub fn run_loopback_capture(
     ))?;
 
     Ok("Capture stopped".to_string())
+}
+
+/// Per-process loopback capture is not implemented on Linux: PulseAudio/
+/// PipeWire expose per-application streams through `pactl`/session APIs
+/// distinct from the monitor-source capture this backend uses, and wiring
+/// that up is separate scope from the Windows per-process work this module
+/// was written for. Fail closed rather than pretending support exists.
+pub fn process_loopback_support() -> ProcessLoopbackSupport {
+    ProcessLoopbackSupport {
+        supported: false,
+        detail: "Linux per-process loopback capture is not implemented; use the default sink monitor via run_loopback_capture instead."
+            .to_string(),
+        platform: "linux".to_string(),
+    }
+}
+
+pub fn list_candidate_processes() -> Result<Vec<CandidateProcess>, CaptureBackendError> {
+    Err(CaptureBackendError {
+        code: "unsupported",
+        message:
+            "Process enumeration for per-process loopback capture is not implemented on Linux."
+                .to_string(),
+        diagnostic: "list_candidate_processes has no Linux backend yet.".to_string(),
+    })
+}
+
+pub fn run_process_loopback_capture(
+    _process_id: u32,
+    _mode: ProcessLoopbackMode,
+    _stop: Arc<AtomicBool>,
+    _on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
+    _on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+) -> Result<String, CaptureBackendError> {
+    Err(CaptureBackendError {
+        code: "unsupported",
+        message: "Per-process loopback capture is not implemented on Linux.".to_string(),
+        diagnostic: "run_process_loopback_capture has no Linux backend yet; use run_loopback_capture for default-sink monitor capture."
+            .to_string(),
+    })
 }
 
 fn ensure_linux_tools() -> Result<(), CaptureBackendError> {
