@@ -2187,8 +2187,16 @@ fn pull_paths(home: &Path, target: &PullTarget) -> Result<PullPaths, PullError> 
     })
 }
 
+/// The single resolution point every model-pack read/write path in this file
+/// funnels through -- see `crate::config::models_dir`'s doc comment for the
+/// full env/config/default priority. Loads `config.json` fresh on each call
+/// (a small local file) rather than threading a loaded `OpenAsrConfig`
+/// through every `home`-taking function in this module's public API; a
+/// missing or unreadable config just falls back to the default `<home>/models`
+/// root, matching this function's pre-override behavior.
 fn models_root(home: &Path) -> PathBuf {
-    home.join("models")
+    let config = crate::config::load_config(home).unwrap_or_default();
+    crate::config::models_dir(home, &config)
 }
 
 fn ensure_https_url(url: &str) -> Result<(), PullError> {

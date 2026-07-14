@@ -1,7 +1,9 @@
 //! Generic resolution of an installed optional capability-pack file (a
 //! `.oasr`/`.safetensors` support model that augments a family's own decode
 //! path, e.g. the WeSpeaker speaker-embedder or the Qwen3-ForcedAligner
-//! word-timestamp refiner) from `openasr_home()/models/<dir>/`. Extracted from
+//! word-timestamp refiner) from the resolved model-pack storage root (see
+//! `config::models_dir` -- honors an `OPENASR_MODELS_DIR`/`config.models_dir`
+//! override, defaulting to `openasr_home()/models/<dir>/`). Extracted from
 //! `diarize::pack` so a second capability-pack family (forced alignment) does
 //! not duplicate the same env-override + directory-scan logic -- infrastructure
 //! that decides where an installed pack lives stays model-agnostic; only the
@@ -23,7 +25,8 @@ pub(crate) fn resolve_installed_capability_pack(
         }
     }
     let home = crate::openasr_home().ok()?;
-    find_pack(&home.join("models"), dir_substr)
+    let config = crate::config::load_config(&home).unwrap_or_default();
+    find_pack(&crate::config::models_dir(&home, &config), dir_substr)
 }
 
 /// Whether `path` is a GGUF (`.oasr`) pack, by sniffing the 4-byte magic rather

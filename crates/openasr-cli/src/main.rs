@@ -18,7 +18,7 @@ use openasr_core::{
     WhisperLocalSourceImportRequest, atomic_write_text, config_path,
     convert_local_cohere_source_to_runtime_pack, convert_local_qwen_source_to_runtime_pack,
     convert_local_whisper_hf_source_to_runtime_pack, derive_catalog_public_key_hex,
-    discover_batch_inputs, embedded_catalog_fingerprint, load_config, openasr_home,
+    discover_batch_inputs, embedded_catalog_fingerprint, load_config, models_dir, openasr_home,
     parse_model_catalog, parse_model_ref, render_batch_summary, render_benchmark,
     render_catalog_signature_manifest, resolve_registry_model_ref, resolve_runtime_model_ref,
     runtime_registry, save_config, validate_local_native_model_pack_path,
@@ -588,6 +588,7 @@ fn doctor() -> Result<()> {
     println!();
     println!("OpenASR home: {}", home.display());
     println!("Config file: {}", config_file.display());
+    println!("Models directory: {}", models_dir(&home, &config).display());
     println!("Model registry: ok ({} models)", cards.len());
     println!(
         "Default model: {} ({})",

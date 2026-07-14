@@ -1729,6 +1729,68 @@ fn pull_overwrites_truncated_pack_with_installed_record() {
     assert_eq!(list_installed_packs(temp.path()).unwrap().len(), 1);
 }
 
+/// `config.json`'s `models_dir` field must be the single thing that decides
+/// where a pack lands and where `list_installed_packs` looks for it -- a
+/// redirected home must land the pack entirely outside `<home>/models` and
+/// still be found by the same reference.
+#[test]
+fn config_models_dir_redirects_pull_and_list() {
+    let home = tempfile::tempdir().unwrap();
+    let redirected = tempfile::tempdir().unwrap();
+    crate::config::save_config(
+        home.path(),
+        &crate::config::OpenAsrConfig {
+            models_dir: Some(redirected.path().to_path_buf()),
+            ..crate::config::OpenAsrConfig::default()
+        },
+    )
+    .unwrap();
+
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: bytes.clone(),
+    }]);
+
+    let installed = pull_model_pack_with_client(
+        &resolved,
+        home.path(),
+        &mut client,
+        PullOptions::default(),
+        |_| {},
+    )
+    .unwrap();
+
+    assert!(
+        installed.path.starts_with(redirected.path()),
+        "pack should land under the redirected models_dir, got {}",
+        installed.path.display()
+    );
+    assert!(
+        !home.path().join("models").exists(),
+        "the default models/ dir under home must stay untouched when models_dir is redirected"
+    );
+
+    let packs = list_installed_packs(home.path()).unwrap();
+    assert_eq!(packs.len(), 1);
+    assert_eq!(packs[0].pull, installed.pull);
+
+    // OPENASR_MODELS_DIR env still wins over the config field.
+    let env_redirected = tempfile::tempdir().unwrap();
+    // SAFETY: test-only, single-threaded env mutation guarded by serial test
+    // execution within this process is not guaranteed by cargo test, but this
+    // matches the existing `OPENASR_HOME`-mutating tests elsewhere in this
+    // file/crate that accept the same caveat.
+    unsafe { std::env::set_var(crate::config::OPENASR_MODELS_DIR_ENV, env_redirected.path()) };
+    let env_resolved = list_installed_packs(home.path()).unwrap();
+    unsafe { std::env::remove_var(crate::config::OPENASR_MODELS_DIR_ENV) };
+    assert!(
+        env_resolved.is_empty(),
+        "OPENASR_MODELS_DIR must take priority over config.models_dir"
+    );
+}
+
 #[test]
 fn pull_checks_available_space_before_download() {
     let bytes = tiny_pack_bytes();
