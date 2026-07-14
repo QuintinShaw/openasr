@@ -16,6 +16,10 @@ pub mod api;
 pub mod apikeys;
 mod arch;
 pub(crate) mod audio;
+// `pub` (not `pub(crate)`): the desktop app reaches this by path
+// (`openasr_core::backend_manifest::verify_and_parse`) to verify the
+// downloaded inference-kernel manifest -- see the module doc comment.
+pub mod backend_manifest;
 pub(crate) mod batch;
 pub(crate) mod benchmark;
 pub(crate) mod capability_pack;

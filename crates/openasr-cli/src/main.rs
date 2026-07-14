@@ -1613,4 +1613,62 @@ mod tests {
         assert!(language_mode_label(Some(FixedMultilingual)).starts_with("fixed_multilingual"));
         assert_eq!(language_mode_label(None), "unspecified");
     }
+
+    /// Desktop-sidecar contract: `apps/desktop/src-tauri/src/sidecar.rs` spawns
+    /// this binary as `openasr serve --backend native --parent-pid <pid> ...`
+    /// (see `openasr-app` `sidecar.rs`'s `Command::new(..).args([...])`). Both
+    /// flags are `hide = true` in `cli_args.rs` because they are launch-detail
+    /// only, never meant for interactive use -- but "hidden from `--help`" must
+    /// never come to mean "safe to rename or remove". This test locks the two
+    /// flags' presence and shape (long names, hyphenated `--parent-pid`, an
+    /// accepted `native`/`mock` value for `--backend`, a `u32` for
+    /// `--parent-pid`) so a future "clean up hidden flags" pass fails CI here
+    /// instead of silently breaking every desktop build's ability to launch and
+    /// supervise its sidecar.
+    #[test]
+    fn serve_accepts_desktop_sidecar_contract_flags() {
+        let cli = Cli::try_parse_from([
+            "openasr",
+            "serve",
+            "--backend",
+            "native",
+            "--parent-pid",
+            "4321",
+        ])
+        .expect("serve must keep accepting --backend and --parent-pid for the desktop sidecar");
+
+        let Command::Serve {
+            backend,
+            parent_pid,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+
+        assert_eq!(backend, Some(BackendKind::Native));
+        assert_eq!(parent_pid, Some(4321));
+    }
+
+    #[test]
+    fn serve_still_works_without_the_desktop_sidecar_flags() {
+        // Both flags are optional launch details for interactive/manual use
+        // (e.g. `openasr serve` from a terminal); they must stay optional so
+        // this contract test only pins their *presence and shape*, not that
+        // every caller supplies them.
+        let cli = Cli::try_parse_from(["openasr", "serve"])
+            .expect("serve must remain usable without the desktop-only flags");
+
+        let Command::Serve {
+            backend,
+            parent_pid,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+
+        assert_eq!(backend, None);
+        assert_eq!(parent_pid, None);
+    }
 }
