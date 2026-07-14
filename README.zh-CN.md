@@ -129,3 +129,13 @@ openasr pull whisper-small    # 安装一个试试
 [Apache License 2.0](LICENSE),详见 [NOTICE](NOTICE)。
 
 ggml 推理后端为 MIT 许可。模型包各自遵循上游许可证(MIT / Apache-2.0)。致谢完整列表见 [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md)。
+
+## 找到我们
+
+OpenASR 还在早期，「早鸟营」微信群是离我们最近的地方——聊用法、反馈问题、第一时间拿到新版本。
+
+<p align="center">
+  <img src="https://openasr.org/assets/wechat-group.png" width="240" alt="OpenASR 早鸟营微信群二维码">
+</p>
+
+<sub>二维码每几天更新一次。如果扫码显示过期，来 [Issues](../../issues) 说一声，我们会尽快换新。</sub>
