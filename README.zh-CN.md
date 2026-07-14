@@ -56,7 +56,13 @@
 ### CLI 快速上手
 
 ```bash
-# 从 Releases 页面下载预编译二进制
+# 方式一: Homebrew (macOS / Linux)
+brew install quintinshaw/tap/openasr
+
+# 方式二: 一行安装脚本 (macOS / Linux)
+curl -fsSL https://dl.openasr.org/install.sh | sh
+
+# 方式三: 从 Releases 页面下载预编译二进制
 # https://github.com/QuintinShaw/openasr/releases
 
 # 转写一个文件 (首次运行会提示下载默认模型,需要你确认)
