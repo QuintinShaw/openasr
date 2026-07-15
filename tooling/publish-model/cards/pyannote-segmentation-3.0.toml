@@ -34,14 +34,14 @@ is inherited from and identical to the upstream model (MIT).
 """
 
 [prose_locales."zh-CN"]
-tagline = "pyannote segmentation-3.0 — 面向 OpenASR 说话人分离的说话人切换与重叠感知语音分割模型"
+tagline = "pyannote segmentation-3.0 — 能感知说话人切换和多人重叠的语音分割模型，为 OpenASR 说话人分离而生"
 
 highlights = [
-  "✂️ **说话人切换感知分割** — PyanNet（SincNet + BiLSTM）配合 powerset 输出头，最多可检测 3 位同时发言的说话人，包括重叠语音",
-  "🤝 **提升 `--diarize` 效果** — 与 WeSpeaker 说话人嵌入包搭配安装后，用精细的说话人切换边界替代粗粒度的 VAD 切片",
-  "🔒 **只做说话人分离，不做身份识别** — 匿名的会话内标签，所有数据都不离开本机",
-  "🎯 **逐比特一致打包** — 单一 raw-f32 版本；纯 Rust 前向计算与上游 ONNX 输出的 logits 一致（最大绝对误差 ~7e-5）",
-  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
+  "✂️ **感知说话人切换的分割** — 最多可同时检测 3 位说话人，包括多人重叠说话的场景",
+  "🤝 **提升 `--diarize` 分离效果** — 搭配 WeSpeaker 声纹模型一起安装，用精细的说话人切换边界替代粗略的语音片段划分",
+  "🔒 **只分离说话人，不识别身份** — 只给匿名编号，所有数据都留在你的电脑上",
+  "🎯 **精度严格校验** — 单一 raw-f32 版本，纯 Rust 计算与上游原版输出高度一致（最大绝对误差 ~7e-5）",
+  "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，运行时无需 Python，CPU 和 GPU 都做了极致性能优化",
 ]
 
 source_sha256 = "8ca415fe0b786411857ee0c5c7d96491d1872e0b416d05a7523b876e342d44ca"

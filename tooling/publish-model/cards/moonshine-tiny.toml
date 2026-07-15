@@ -34,14 +34,14 @@ Manjunath Kudlur, Guy Nicholson, James Wang, and Pete Warden — for releasing t
 """
 
 [prose_locales."zh-CN"]
-tagline = "专为实时端侧转写打造的 27M 参数超轻量英语语音识别模型"
+tagline = "超轻量 27M 参数英语语音识别，专为实时本地转写打造"
 
 highlights = [
-  "🪶 **仅 27M 参数** — Moonshine 系列中最小的模型，专为内存和算力受限的边缘硬件设计",
-  "⚡ **实时端侧运行** — 由 Useful Sensors 打造，适用于低成本设备上的实时转写与语音指令",
-  "🎯 **同体积中的高准确率** — 在标准英语基准测试中优于同等规模的语音识别系统（据 Moonshine 论文）",
-  "🗣️ **英语语音转文本** — 序列到序列模型，基于 200K 小时音频训练",
-  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
+  "🪶 **仅 27M 参数** — Moonshine 系列中最小的模型，内存和算力占用极低，适合资源有限的设备",
+  "⚡ **实时本地运行** — 由 Useful Sensors 打造，在低成本设备上也能流畅做实时转写和语音指令",
+  "🎯 **小身材大准头** — 在标准英语测试中打赢了同等体积的语音识别模型（据 Moonshine 论文）",
+  "🗣️ **英语语音转文字** — 基于 200K 小时音频数据训练而成",
+  "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，运行时无需 Python，CPU 和 GPU 都做了极致性能优化",
 ]
 
 source_sha256 = "8e6ea0ed5ef749fc89b5f04371f9daeef4d2cecb231b22384033fdcbec443bac"

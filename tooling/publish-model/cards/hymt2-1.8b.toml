@@ -31,14 +31,14 @@ the only modification is packaging metadata, recorded in the embedded `NOTICE.op
 """
 
 [prose_locales."zh-CN"]
-tagline = "Hy-MT2 1.8B 中译英翻译模型 — 为 OpenASR 实时字幕提供逐句翻译，完全本地运行"
+tagline = "Hy-MT2 1.8B 中译英翻译模型 — 为 OpenASR 实时字幕逐句翻译，完全在本地运行"
 
 highlights = [
-  "🌐 **实时中译英字幕翻译** — 驱动 OpenASR 实验性的逐句重译功能，与实时中文语音识别并行运行",
-  "⚡ **热会话逐句延迟在几百毫秒量级** — 前缀 KV-cache 复用让预热后的逐句重译在 Apple Silicon CPU 上保持快速",
-  "📦 **与上游权重逐字节一致** — Q4_K_M GGUF 张量数据在固定版本下原样重新打包，sha256 与来源信息内嵌在包内",
-  "🧾 **内置许可证与 NOTICE 声明** — 上游 Apache-2.0 的 LICENSE.txt 以及 OpenASR 修改声明 NOTICE 都保留在包的元数据中",
-  "🎯 **一致性校验后打包** — 发布前需确认贪婪解码 token ID 与 llama.cpp 在同一 prompt 下完全一致",
+  "🌐 **实时中译英字幕翻译** — 驱动 OpenASR 的实验性逐句重译功能，与实时中文语音识别同步运行",
+  "⚡ **热会话延迟仅几百毫秒** — 会话预热后复用之前的计算缓存，逐句重译在 Apple Silicon CPU 上飞快",
+  "📦 **模型文件与原版一模一样** — Q4_K_M GGUF 格式的数据在固定版本下原封不动打包，sha256 校验和来源信息都内嵌其中",
+  "🧾 **内置许可证与声明** — 原始 Apache-2.0 LICENSE.txt 和 OpenASR 修改声明 NOTICE 都保存在包中",
+  "🎯 **一致性校验后发布** — 发布前确认模型输出与 llama.cpp 在同一输入下完全一致",
 ]
 
 source_sha256 = "6b7a69ef07e04b0d2767e7d490c78fd982e1e22ea3862bb6f07f9993ecd60ba0"

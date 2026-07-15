@@ -74,14 +74,14 @@ FunAudioLLM 与 FunASR 团队所有；许可证继承上游
 """
 
 [prose_locales."zh-CN"]
-tagline = "FunAudioLLM 出品的高速多语言语音识别 — 非自回归 SenseVoice，面向中文、粤语、英语、日语、韩语优化"
+tagline = "FunAudioLLM 出品的高速多语言语音识别 — SenseVoice，为中文、粤语、英语、日语、韩语精心调优"
 
 highlights = [
-  "🌏 **多语言、中文优先** — 高精度普通话、粤语、英语、日语、韩语，并支持自动语种识别",
-  "⚡ **非自回归高速推理** — 端到端架构，上游实测 10 秒音频约 70 ms，比 Whisper-Large 快 15 倍",
-  "🀄 **中文基准表现突出** — 超过 400,000 小时语音训练；上游报告在 AISHELL 与 WenetSpeech 上中文、粤语准确率优于 Whisper",
-  "🪶 **小巧本地化** — small 检查点完全离线转写，从 130 MB 的 q4_k 到全保真 fp16",
-  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
+  "🌏 **多语言，中文优先** — 普通话、粤语、英语、日语、韩语高精度识别，自动判断语种",
+  "⚡ **极速转写** — 据官方实测，10 秒音频仅需约 70 毫秒处理，比 Whisper-Large 快 15 倍",
+  "🀄 **中文基准表现突出** — 超 400,000 小时语音训练，据官方测试在 AISHELL 和 WenetSpeech 上中文、粤语准确率优于 Whisper",
+  "🪶 **小巧且完全离线** — 最小仅 130 MB 的 q4_k 版本，也有全精度 fp16 版本可选，全程无需联网",
+  "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，运行时无需 Python，CPU 和 GPU 都做了极致性能优化",
 ]
 
 source_sha256 = "9d740e66df2b33cb66b409fc8fe25de52268e57d1d36c5e723c237de46c9025d"

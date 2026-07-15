@@ -31,13 +31,13 @@ adds quantized builds for local runtime use.
 """
 
 [prose_locales."zh-CN"]
-tagline = "基于裁剪版 large-v3 打造的快速多语言 Whisper 模型"
+tagline = "Whisper large-v3 的提速精简版，多语言识别飞快"
 
 highlights = [
-  "⚡ **Turbo 解码器** — 将 Whisper large-v3 的解码器层数从 32 层裁剪到 4 层，大幅提升生成速度",
-  "🌍 **多语言语音识别** — 支持多种语言转写，并可将语音翻译为英语",
-  "🎙️ **零样本鲁棒性** — 继承 Whisper 大规模弱监督训练，在嘈杂场景下依然稳健",
-  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
+  "⚡ **Turbo 提速** — 把 large-v3 内部从 32 层精简到 4 层，转写速度大幅提升",
+  "🌍 **多语言识别** — 能转写多种语言，还能把语音直接翻译成英语",
+  "🎙️ **天生抗噪** — 继承 Whisper 海量语音训练的底子，嘈杂环境也能稳定识别",
+  "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，无需安装 Python，专为 CPU 和 GPU 深度优化",
 ]
 
 source_sha256 = "a76ca849200c165fb8642ee8b219786c78e8f3d2ab8bee2f247fd2ffcf789b03"

@@ -104,14 +104,14 @@ OpenASR 仅进行格式转换、量化、运行时校验和本地推理适配。
 """
 
 [prose_locales."zh-CN"]
-tagline = "覆盖 40 种语言的多语种语音识别（base 档）— 紧凑的 140M 参数 WeNet/ESPnet E-Branchformer（CTC + 注意力）"
+tagline = "覆盖 40 种语言的多语种语音识别，入门档 — 仅 140M 参数，小巧省资源"
 
 highlights = [
-  "🌏 **40 种语言，base 档** — 与 Dolphin Small 相同的多语种 E-Branchformer 覆盖（南亚、东南亚、中亚/突厥语系、中文/粤语），体积小得多",
-  "🪶 **140M 参数** — 宽度约为 `small` 检查点的三分之一（d_model 512 对 768，层数更少），small 档过重时可换取更省内存、更快的 CPU 解码",
-  "🧩 **联合 CTC + 注意力** — 与 Dolphin 家族一致的 E-Branchformer 编码器 + Transformer 解码器配方，配合 CTC/attention 重打分，运行时形状参数与全家族共享同一份契约",
-  "🐬 **SentencePiece BPE 词表** — 40 种语言共享同一子词词表（不同于 cn-dialect 家族的固定字符词表）",
-  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化",
+  "🌏 **40 种语言，入门档** — 与 Dolphin Small 覆盖相同的语种范围（南亚、东南亚、中亚／突厥语系、中文／粤语），但体积小得多",
+  "🪶 **140M 参数** — 体积约为 `small` 档的三分之一（内部宽度 512 对 768），内存占用更低、CPU 转写更快，轻量任务不必动用大模型",
+  "🧩 **双路交叉校验** — 内置两套识别机制互相比对结果，与 Dolphin 全系列共享同一套运行验证标准",
+  "🐬 **40 种语言共享词表** — 所有语种使用同一套词表（不同于中文方言系列的逐字词表），天然适合多语种混说",
+  "🦀 **OpenASR 原生运行** — `.oasr` 格式无需安装 Python，在 CPU 和 GPU 上都有极致性能优化",
 ]
 
 source_sha256 = "db3c5473b1127493aae9c237482170c1de350ae10f8e02c3338a4e1ddd133569"
