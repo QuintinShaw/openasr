@@ -266,6 +266,11 @@ jobs:
     uses: ./.github/workflows/release-binaries.yml
     with:
       ref: ${{ needs.resolve.outputs.tag }}
+    # Reusable workflows do NOT see the caller's repository secrets unless
+    # they are passed explicitly; without this the called workflow's Windows
+    # legs read empty AZURE_* secrets and fail closed at their "refuse to
+    # ship an unsigned Windows release binary" gate.
+    secrets: inherit
 
   finalize-notes:
     name: Finalize Install & Verify with real assets
