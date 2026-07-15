@@ -69,22 +69,53 @@ python3 tooling/release-manifest/b2_sync.py sync --version 0.1.10 \
   dist/backends-manifest.signature.json
 ```
 
-This is deliberately **NOT wired into any GitHub Actions workflow yet**. That
-is a credential/scope decision, not a technical blocker:
+This is deliberately **NOT wired into any GitHub Actions workflow**. Publish
+is always a local, human-run step:
 
-- It is unconfirmed whether core's release assets should share the
-  `openasr-releases` B2 bucket (and its credentials) with the desktop
-  installers, or use a separate bucket/prefix-scoped key. Whoever owns the B2
-  account needs to decide and, if sharing, mint a key scoped to `core/*` (B2
-  application keys support per-prefix scoping) rather than reusing the
-  desktop key wholesale.
+- **Decided**: core's release assets share the SAME `openasr-releases` B2
+  bucket the desktop installers already publish to, under a `core/v<version>/`
+  key prefix (`B2_BUCKET` defaults to `openasr-releases`; override only if the
+  bucket is ever split). Credentials (`B2_APPLICATION_KEY_ID` /
+  `B2_APPLICATION_KEY`) stay out of CI -- this sync always runs from a
+  maintainer's machine using the same local env vars desktop releases use, not
+  a repo secret.
 - `openasr-app`'s own `release-desktop.yml` only runs this kind of publish
   from a `workflow_dispatch` with an explicit `publish: true` input, gated by
   repo secrets on the app repo -- i.e. even there, publishing to
   dl.openasr.org is a deliberate, per-run opt-in, not a side effect of every
-  green build. The same posture should carry over here once wired in: an
-  explicit, opt-in step or dispatch input, not an automatic push-tag action.
+  green build. Core follows the same posture, taken one step further: not
+  even a gated dispatch, just a local script run after the maintainer has
+  reviewed the release.
 - Publishing to a public, production distribution endpoint is a
-  release/deploy decision this script does not make on its own -- wiring it
-  into CI (which secrets, which trigger, which bucket/prefix) needs an
-  explicit go-ahead before it runs unattended.
+  release/deploy decision this script does not make on its own. If core
+  releases ever need CI-driven publish, that is a separate, explicit
+  go-ahead (which secrets, which trigger) -- not a default.
+
+## Post-release checklist (local, after `release-binaries.yml` finishes)
+
+Run all three steps from a maintainer machine; none of this runs in CI.
+
+1. **Sign the manifest and attach it to the GitHub release** -- see
+   "Signing" above (`__openasr-sign-backends-manifest`, production
+   `OPENASR_CATALOG_SIGNING_KEY_SEED_HEX`, then
+   `gh release upload v<version> backends-manifest.signature.json --clobber`).
+2. **Sync to dl.openasr.org** -- see "dl.openasr.org sync" above
+   (`b2_sync.py sync --version <version>`, uploading the Windows backend-kernel
+   archives plus `backends-manifest.json` and
+   `backends-manifest.signature.json` to `core/v<version>/` in the shared
+   `openasr-releases` B2 bucket, using local `B2_S3_ENDPOINT` /
+   `B2_APPLICATION_KEY_ID` / `B2_APPLICATION_KEY` env vars -- never repo
+   secrets).
+3. **Spot-check one signed exe with `signtool`** -- pick one of the archives
+   just uploaded (rotate which GPU leg you check across releases) and confirm
+   the Azure Trusted Signing signature is intact and trusted end to end:
+
+   ```powershell
+   Expand-Archive dist\openasr-<version>-windows-x86_64-vulkan.zip -DestinationPath tmp-verify
+   signtool verify /pa /v tmp-verify\openasr.exe
+   ```
+
+   `/pa` uses the default authenticode policy (what Windows actually enforces
+   at launch); a clean run prints a chain up to a trusted root with no
+   warnings. Treat any failure as release-blocking -- it means the archive a
+   user downloads would fail Windows' own signature check.
