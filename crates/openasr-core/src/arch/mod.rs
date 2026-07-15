@@ -250,6 +250,23 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     pub executor_component_id: &'static str,
     pub execution_capability: GgmlExecutionCapability,
     pub prefer_cpu_decoder_for_multichunk_metal: bool,
+    /// Whether Auto execution may select a GPU-class backend automatically
+    /// when one is available. This can only ever pin Auto to CPU -- it never
+    /// overrides an explicit `execution_target=accelerated` (or `cpu`)
+    /// request, which always gets exactly what it asked for via
+    /// `GgmlCpuGraphConfig::resolve_family_runtime_backend`. False only for
+    /// the two families with a measured Auto-mode GPU regression at their
+    /// normal (non-`accelerated`) workload size: dolphin's whole pipeline
+    /// (`models::dolphin::executor::dolphin_runtime_backend`) and
+    /// xasr-zipformer's streaming encoder
+    /// (`models::xasr_zipformer::graph_config::encoder_gpu_enabled`) -- see
+    /// those functions' doc comments for the measured evidence. Any
+    /// provenance/telemetry label reporting the backend a request actually
+    /// ran on must resolve through the same function with this same flag,
+    /// not recompute generically (a generic recompute is what produced a
+    /// `core.native.backend:metal` label on a dolphin Auto request that in
+    /// fact ran entirely on CPU).
+    pub auto_gpu_enabled: bool,
     /// Whether this family's own decode loop can emit diarization tokens (the
     /// cohere token-stream is the only builtin case today). The single
     /// declaration of this architecture-level capability fact -- runtime
@@ -342,6 +359,22 @@ pub(crate) fn emits_punctuation_for_model_architecture(model_architecture: &str)
     OpenAsrArchitectureRegistry::with_builtins()
         .find_by_model_architecture(model_architecture)
         .and_then(|descriptor| descriptor.emits_punctuation)
+}
+
+/// Whether a builtin family's Auto execution may select a GPU-class backend
+/// automatically (see [`OpenAsrArchitectureDescriptor::auto_gpu_enabled`]),
+/// looked up by GGUF `model_architecture`. An unrecognized architecture
+/// defaults to `true` (the majority behavior: Auto uses GPU when available)
+/// rather than silently pinning an unknown family to CPU. This is the
+/// accessor a provenance/telemetry label must call -- with the result fed
+/// into `GgmlCpuGraphConfig::resolve_family_runtime_backend` -- so the
+/// reported backend can never drift from what the family's own executor
+/// actually decided.
+pub(crate) fn family_auto_gpu_enabled_for_model_architecture(model_architecture: &str) -> bool {
+    OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(model_architecture)
+        .map(|descriptor| descriptor.auto_gpu_enabled)
+        .unwrap_or(true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -938,6 +971,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: true,
+        auto_gpu_enabled: true,
         self_diarizes: true,
         emits_punctuation: Some(true),
         hparam_schema: COHERE_TRANSCRIBE_HPARAM_SCHEMA,
@@ -977,6 +1011,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: WHISPER_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        auto_gpu_enabled: true,
         self_diarizes: false,
         emits_punctuation: Some(true),
         hparam_schema: WHISPER_HPARAM_SCHEMA,
@@ -1009,6 +1044,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: QWEN3_ASR_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::NativeGraphLoweringV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        auto_gpu_enabled: true,
         self_diarizes: false,
         emits_punctuation: Some(true),
         hparam_schema: QWEN3_ASR_HPARAM_SCHEMA,
@@ -1046,6 +1082,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: PARAKEET_CTC_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        auto_gpu_enabled: true,
         self_diarizes: false,
         // Character/BPE CTC: whether an imported checkpoint's vocab includes
         // punctuation depends on that specific checkpoint's training corpus,
@@ -1091,6 +1128,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: PARAKEET_TDT_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        auto_gpu_enabled: true,
         self_diarizes: false,
         // Verified on the imported pack: trained on transcripts that preserve
         // punctuation and capitalization (mirrors `_catalog.py`'s
@@ -1124,6 +1162,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        auto_gpu_enabled: true,
         self_diarizes: false,
         // Character CTC: same BYO-checkpoint reasoning as parakeet-ctc above.
         emits_punctuation: None,
@@ -1160,6 +1199,11 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        // Measured on the M1 host: every Metal configuration loses to CPU for
+        // this streaming encoder's chunked workload (the per-chunk graph is
+        // too small to amortize GPU dispatch) -- see
+        // `xasr_zipformer::graph_config::encoder_gpu_enabled`.
+        auto_gpu_enabled: false,
         self_diarizes: false,
         emits_punctuation: Some(true),
         hparam_schema: XASR_ZIPFORMER_HPARAM_SCHEMA,
@@ -1187,6 +1231,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: MOONSHINE_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        auto_gpu_enabled: true,
         self_diarizes: false,
         emits_punctuation: Some(true),
         hparam_schema: MOONSHINE_HPARAM_SCHEMA,
@@ -1222,6 +1267,11 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: DOLPHIN_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        // Fail-closed to the golden, parity-validated CPU path: Metal is
+        // faster on this pipeline (AB-measured) but its fp16 numerics are not
+        // golden-validated (parity gate is CPU bit-exact), so Auto stays on
+        // CPU -- see `dolphin::executor::dolphin_runtime_backend`.
+        auto_gpu_enabled: false,
         self_diarizes: false,
         // DataoceanAI's cn-dialect-small training corpus is transcribed
         // without punctuation and the model has no punctuation-prediction
@@ -1254,6 +1304,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: SENSEVOICE_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        auto_gpu_enabled: true,
         self_diarizes: false,
         emits_punctuation: Some(true),
         hparam_schema: SENSEVOICE_HPARAM_SCHEMA,
@@ -1292,6 +1343,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: FIRERED_AED_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        auto_gpu_enabled: true,
         self_diarizes: false,
         // The reference tokenizer's dict.txt has no punctuation/<space>
         // entries (char + SPM vocab trained on unpunctuated Mandarin ASR
@@ -1370,6 +1422,58 @@ mod tests {
             assert_eq!(
                 emits_punctuation_for_model_architecture(model_architecture),
                 emits_punctuation,
+                "'{model_architecture}' accessor must match the descriptor field"
+            );
+            seen.insert(model_architecture);
+        }
+
+        assert_eq!(
+            seen.len(),
+            registry.descriptors().len(),
+            "expectation table must cover every builtin architecture, no more, no less"
+        );
+    }
+
+    /// Pins `auto_gpu_enabled` per builtin architecture -- dolphin and
+    /// xasr-zipformer are the only two builtins whose Auto default is gated
+    /// to CPU (a measured Auto-mode GPU regression at their normal chunk
+    /// size, not a correctness limit; see the field doc and the two
+    /// executors' own doc comments). Every other builtin lets Auto pick a
+    /// GPU-class backend automatically when available, matching how
+    /// `resolve_runtime_backend` behaves generically. A silent flip of this
+    /// table for any of the two gated families would either quietly start
+    /// running an unvalidated GPU path by default (dolphin) or regress Auto
+    /// throughput (xasr-zipformer); for any other family it would silently
+    /// start denying Auto users a GPU their hardware supports.
+    #[test]
+    fn builtin_architectures_declare_auto_gpu_enabled() {
+        let expected: &[(&str, bool)] = &[
+            (COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, true),
+            (WHISPER_GGML_ARCHITECTURE_ID, true),
+            (QWEN3_ASR_GGML_ARCHITECTURE_ID, true),
+            (PARAKEET_CTC_GGML_ARCHITECTURE_ID, true),
+            (PARAKEET_TDT_GGML_ARCHITECTURE_ID, true),
+            (WAV2VEC2_CTC_GGML_ARCHITECTURE_ID, true),
+            (XASR_ZIPFORMER_GGML_ARCHITECTURE_ID, false),
+            (MOONSHINE_GGML_ARCHITECTURE_ID, true),
+            (DOLPHIN_GGML_ARCHITECTURE_ID, false),
+            (SENSEVOICE_GGML_ARCHITECTURE_ID, true),
+            (FIRERED_AED_GGML_ARCHITECTURE_ID, true),
+        ];
+        let registry = OpenAsrArchitectureRegistry::with_builtins();
+        let mut seen = std::collections::BTreeSet::new();
+
+        for (model_architecture, auto_gpu_enabled) in expected.iter().copied() {
+            let descriptor = registry
+                .find_by_model_architecture(model_architecture)
+                .unwrap_or_else(|| panic!("missing builtin architecture '{model_architecture}'"));
+            assert_eq!(
+                descriptor.auto_gpu_enabled, auto_gpu_enabled,
+                "'{model_architecture}' auto_gpu_enabled mismatch"
+            );
+            assert_eq!(
+                family_auto_gpu_enabled_for_model_architecture(model_architecture),
+                auto_gpu_enabled,
                 "'{model_architecture}' accessor must match the descriptor field"
             );
             seen.insert(model_architecture);

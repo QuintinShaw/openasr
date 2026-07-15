@@ -1,7 +1,4 @@
-use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphThreadingWorkload,
-    RequestBackendPreference, request_backend_override,
-};
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphThreadingWorkload};
 use crate::models::graph_runtime_config::{
     ModelMetalRuntimeOverrides, configure_model_runtime_graph_config_from_env,
     has_explicit_thread_override,
@@ -23,11 +20,13 @@ const FULL_ENCODER_GRAPH_SIZE: usize = 65_536;
 /// graph is too small to amortize GPU dispatch). Users on stronger GPUs can
 /// force it with execution_target=accelerated, and what runs is what was
 /// requested — no silent downgrade.
+///
+/// Delegates to the shared `resolve_family_runtime_backend` gate (declared via
+/// this architecture's `auto_gpu_enabled = false`) rather than hand-rolling
+/// the override check, so any provenance label resolving through the same
+/// gate can never drift from what this function actually decided.
 fn encoder_gpu_enabled() -> bool {
-    matches!(
-        request_backend_override(),
-        Some(RequestBackendPreference::Accelerated)
-    )
+    GgmlCpuGraphConfig::resolve_family_runtime_backend(false).is_gpu_class()
 }
 
 pub(crate) fn xasr_zipformer_encoder_graph_config() -> GgmlCpuGraphConfig {
