@@ -35,7 +35,28 @@ impl LongFormVadProvider for EnergyLongFormVadProvider {
         let threshold = options.vad.threshold.clamp(0.0, 1.0);
         let noise_floor = percentile(&frame_rms, 0.20);
         let speech_peak = percentile(&frame_rms, 0.95).max(noise_floor);
-        let gate = noise_floor + (speech_peak - noise_floor) * threshold;
+        let relative_gate = noise_floor + (speech_peak - noise_floor) * threshold;
+        // The relative gate is anchored to *this clip's own* 95th-percentile peak,
+        // so a loud opening section inflates `speech_peak` and can drag the gate
+        // above quieter speech later in the same recording -- observed in
+        // production to silently drop an entire trailing utterance: a loud
+        // Chinese opener (~-25 dBFS) pushed the gate to -34.2 dBFS, just above a
+        // quieter English tail peaking at -34.6 dBFS, so the tail was never
+        // detected as speech and never reached the decoder (see the long-form
+        // code-switch investigation). Cap the gate at the module's existing
+        // "definitely not silence" floor -- `energy_silence_threshold_db`
+        // (-38 dBFS default), the same line `estimate_elision_penalty`,
+        // `estimate_gap_edge_penalty`, `choose_forced_cut`, and
+        // `subdivide_processed_spans_silence_aware` in `slicing.rs` already use to
+        // decide a span is non-silent -- rather than a second, independently
+        // tuned constant. This keeps one shared definition of "silence" across
+        // the whole longform pipeline and, on the repro numbers above, is low
+        // enough (-38 < -34.6) that the dropped English tail passes the gate.
+        // VAD/energy slicing is a performance optimization, not a content
+        // filter: a frame louder than the shared silence floor must never be
+        // gated out purely because something else in the clip was louder still.
+        let absolute_floor = 10.0_f32.powf(options.energy_silence_threshold_db / 20.0);
+        let gate = relative_gate.min(absolute_floor);
         let min_speech_frames = duration_ms_to_frames(
             options.vad.min_speech_duration_ms as usize,
             DEFAULT_FRAME_MS,
@@ -195,5 +216,41 @@ mod tests {
             .compute_speech_slices(&vec![0.0; 16_000], 16_000, &options)
             .expect("vad");
         assert!(slices.is_empty());
+    }
+
+    /// Reproduces the code-switch long-form bug at unit scale: a loud opener
+    /// followed by true silence followed by a much quieter (but still clearly
+    /// audible, above the -38 dBFS absolute floor) tail. Without the absolute
+    /// floor, `speech_peak` is pinned to the loud opener, the relative gate
+    /// sits at half that peak (0.25 amplitude), and the 0.02-amplitude tail
+    /// (-33.9 dBFS) never crosses it -- exactly how the English tail in the
+    /// original recording (peaking at -34.6 dBFS against a gate of -34.2 dBFS)
+    /// was silently dropped. With the floor capping the gate at
+    /// `energy_silence_threshold_db` (-38 dBFS, amplitude ~0.0126), the tail
+    /// clears the gate and is detected as its own speech region.
+    #[test]
+    fn absolute_floor_prevents_loud_opening_from_masking_quiet_tail() {
+        let provider = EnergyLongFormVadProvider;
+        let options = LongFormOptions::default();
+        let mut samples = vec![0.5_f32; 16_000]; // 1s loud opener
+        samples.extend(vec![0.0_f32; 16_000 * 3]); // 3s true silence
+        samples.extend(vec![0.02_f32; 16_000]); // 1s quiet-but-audible tail
+        let slices = provider
+            .compute_speech_slices(&samples, 16_000, &options)
+            .expect("vad");
+        assert_eq!(
+            slices.len(),
+            2,
+            "expected the quiet tail to be detected as its own speech region: {slices:?}"
+        );
+        let tail = &slices[1];
+        assert!(
+            tail.start_sample >= 16_000 * 4,
+            "tail slice should start at or after the silence gap: {tail:?}"
+        );
+        assert!(
+            tail.end_sample <= samples.len(),
+            "tail slice should not run past the audio: {tail:?}"
+        );
     }
 }
