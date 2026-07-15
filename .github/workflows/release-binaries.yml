@@ -677,9 +677,13 @@ jobs:
           cp docs/FAQ.md docs/KNOWN_LIMITATIONS.md "$dist_dir/docs/"
           tar -czf "dist/${archive}.${{ matrix.archive_ext }}" -C dist "${archive}"
 
-      - name: Package archive
+      - name: Stage archive contents
         if: runner.os == 'Windows' && env.LEG_SELECTED == 'true'
         shell: pwsh
+        # Split out of the old single "Package archive" step so Authenticode
+        # signing (below) can run on the staged, unzipped files -- signing
+        # has to happen before Compress-Archive, not after, or the exe/dll
+        # bytes inside the shipped zip would stay unsigned.
         run: |
           $ErrorActionPreference = "Stop"
           $archive = "openasr-$env:OPENASR_VERSION-${{ matrix.asset }}"
@@ -727,17 +731,104 @@ jobs:
           Copy-Item README.md,LICENSE "$distDir\"
           Copy-Item model-registry "$distDir\model-registry" -Recurse
           Copy-Item docs\FAQ.md,docs\KNOWN_LIMITATIONS.md "$distDir\docs\"
+          Add-Content $env:GITHUB_ENV "DIST_DIR=$distDir"
+          Add-Content $env:GITHUB_ENV "ARCHIVE_NAME=$archive"
+
+      - name: Resolve Windows binaries to sign
+        if: runner.os == 'Windows' && env.LEG_SELECTED == 'true'
+        shell: pwsh
+        # Only files we actually build ourselves: openasr.exe, plus the CPU
+        # leg's own ggml*.dll (compiled from the vendored submodule by this
+        # same job, not a third-party redistributable). Deliberately excludes
+        # the vendor GPU runtime DLLs staged above (NVIDIA cudart64_*/
+        # cublas64_*/cublasLt64_*, AMD amdhip64_*/libhipblas_*/rocblas_*/
+        # libhipblaslt_*) -- those already carry NVIDIA's/AMD's own
+        # Authenticode signatures and are not ours to re-sign.
+        run: |
+          $ErrorActionPreference = "Stop"
+          $signTargets = @((Resolve-Path "$env:DIST_DIR\${{ matrix.binary_name }}").Path)
+          $ggmlDlls = Get-ChildItem "$env:DIST_DIR" -Filter "ggml*.dll" -ErrorAction SilentlyContinue
+          if ($ggmlDlls) { $signTargets += $ggmlDlls.FullName }
+          Write-Host "files to sign ($($signTargets.Count)):"
+          $signTargets | ForEach-Object { Write-Host " - $_" }
+          Add-Content $env:GITHUB_ENV "SIGN_FILES<<SIGN_FILES_EOF"
+          Add-Content $env:GITHUB_ENV ($signTargets -join "`n")
+          Add-Content $env:GITHUB_ENV "SIGN_FILES_EOF"
+
+      - name: Check Trusted Signing credentials
+        if: runner.os == 'Windows' && env.LEG_SELECTED == 'true'
+        id: signing-check
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        # This workflow has no `pull_request` trigger (see the trigger
+        # comment at the top of this file), so a fork PR never reaches this
+        # job with -- or without -- secrets. Every run that gets here is a
+        # real tag push, release-core.yml's workflow_call, or a maintainer's
+        # workflow_dispatch, all of which do have repo secrets. The only
+        # legitimate no-secrets case is a maintainer smoke-testing build/
+        # package logic via workflow_dispatch with dry_run=true before the
+        # Azure Trusted Signing secrets are configured -- see the fail-closed
+        # step below.
+        run: |
+          set -euo pipefail
+          if [ -n "${AZURE_TENANT_ID:-}" ] && [ -n "${AZURE_CLIENT_ID:-}" ] && [ -n "${AZURE_CLIENT_SECRET:-}" ]; then
+            echo "have_secrets=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_secrets=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Refuse to ship an unsigned Windows release binary
+        if: runner.os == 'Windows' && env.LEG_SELECTED == 'true' && steps.signing-check.outputs.have_secrets != 'true' && github.event.inputs.dry_run != 'true'
+        shell: bash
+        run: |
+          echo "::error::AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_CLIENT_SECRET are not set -- refusing to package an unsigned Windows release binary. Configure the Azure Trusted Signing service principal secrets (see openasr-app's apps/desktop/SIGNING-WINDOWS.md for the account/profile this reuses), or re-run this workflow_dispatch with dry_run=true to build without signing for local debugging only." >&2
+          exit 1
+
+      # Azure Trusted Signing (Artifact Signing): same account/certificate
+      # profile as the OpenASR Desktop Windows installer (openasr-sign /
+      # openasr-codesign, publisher "Caelum Inc.") -- see openasr-app's
+      # apps/desktop/SIGNING-WINDOWS.md for the account itself. The service
+      # principal behind these secrets needs the "Artifact Signing
+      # Certificate Profile Signer" role on that account (see this repo's
+      # docs/RELEASING.md); it may be a different App Registration than the
+      # desktop repo's, but must be granted the same role on the same
+      # account/profile.
+      - name: Sign Windows binaries (Azure Trusted Signing)
+        if: runner.os == 'Windows' && env.LEG_SELECTED == 'true' && steps.signing-check.outputs.have_secrets == 'true'
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: openasr-sign
+          certificate-profile-name: openasr-codesign
+          files: ${{ env.SIGN_FILES }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Package archive
+        if: runner.os == 'Windows' && env.LEG_SELECTED == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
           # Smoke the binary from the staged dist dir (NOT target/release,
           # whose build.rs-seeded DLLs would mask a packaging gap), so a broken
           # archive fails here before it ships. The CUDA/HIP exes cannot
           # launch without a matching GPU driver, so they are exempt
           # (validated on hardware). A cross leg (rust_target set) builds a
           # foreign-arch exe the runner cannot execute, so it is exempt too.
+          # Running this AFTER signing also verifies signing did not corrupt
+          # the binary.
           if ("${{ matrix.features }}" -ne "cuda" -and "${{ matrix.features }}" -ne "hip" -and "${{ matrix.rust_target }}" -eq "") {
-            & "$distDir\${{ matrix.binary_name }}" --version
+            & "$env:DIST_DIR\${{ matrix.binary_name }}" --version
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
-          Compress-Archive -Path "$distDir" -DestinationPath "dist\$archive.${{ matrix.archive_ext }}" -Force
+          Compress-Archive -Path "$env:DIST_DIR" -DestinationPath "dist\$env:ARCHIVE_NAME.${{ matrix.archive_ext }}" -Force
 
       # Covers every leg that reaches this point, including `experimental:
       # true` ones (windows-arm64, musl) -- they still ship a release asset,
@@ -846,6 +937,16 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
+      # Checked out FIRST, before anything is downloaded/generated into the
+      # workspace: actions/checkout defaults to `clean: true` (`git clean
+      # -ffdx`), which would otherwise wipe the untracked staging/dist
+      # directories the later steps populate. Only needed for the
+      # backends-manifest step below (version + source commit), but harmless
+      # for every other run, so it stays unconditional here rather than
+      # threading the `only_target` skip condition through step ordering.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - name: Download archives
         uses: actions/download-artifact@v8
         with:
@@ -864,6 +965,41 @@ jobs:
         with:
           name: SHA256SUMS
           path: dist/SHA256SUMS
+          if-no-files-found: error
+
+      # UNSIGNED backends-manifest.json: the per-release index the desktop
+      # app uses to download a switchable Windows GPU-kernel sidecar
+      # (vulkan/cuda/hip) at runtime. Only hashes/sizes already-public
+      # archives -- no secret involved, so (unlike signing) this is safe to
+      # run in CI. Skipped on a single-leg `only_target` dispatch (same gate
+      # `verify-completeness` uses below): that run intentionally produces
+      # only one archive, not the full Windows GPU trio this needs.
+      - name: Generate backends-manifest.json (unsigned)
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == ''
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
+          commit="$(git rev-parse HEAD)"
+          python3 tooling/release-manifest/backends_manifest.py generate \
+            --version "$version" --source-commit "$commit" \
+            --dist-dir dist --out dist/backends-manifest.json
+          cat dist/backends-manifest.json
+      # NOT uploaded pre-signed: `backends-manifest.signature.json` is a
+      # separate, maintainer-run LOCAL step (the Ed25519 signing seed never
+      # enters CI -- same policy as the model catalog, see
+      # tooling/publish-model/scripts/publish_catalog.sh). After this
+      # workflow finishes, sign and attach the signature with:
+      #   OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<real seed> \
+      #     cargo run -p openasr-cli -- __openasr-sign-backends-manifest \
+      #       backends-manifest.json --out backends-manifest.signature.json \
+      #       --manifest-url https://dl.openasr.org/core/v<version>/backends-manifest.json
+      #   gh release upload v<version> backends-manifest.signature.json --clobber
+      - name: Upload backends-manifest.json
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: backends-manifest
+          path: dist/backends-manifest.json
           if-no-files-found: error
 
   upload-to-release:
@@ -921,7 +1057,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "release: ${{ steps.tag.outputs.tag }}"
-          find staging -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' -o -name 'SHA256SUMS' \) -print | sort
+          find staging -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' -o -name 'SHA256SUMS' -o -name 'backends-manifest.json' \) -print | sort
 
       - name: Upload assets to release
         if: steps.tag.outputs.tag != '' && github.event.inputs.dry_run != 'true'
@@ -935,10 +1071,11 @@ jobs:
             exit 1
           fi
           # nullglob so a pattern with no matches (e.g. no *.sha256 sidecars
-          # if the xcframework leg did not run) drops out of the arg list
+          # if the xcframework leg did not run, or no backends-manifest.json
+          # on a single-leg `only_target` dispatch) drops out of the arg list
           # instead of being passed to `gh` as a literal, unmatched path.
           shopt -s nullglob
-          assets=(staging/*.tar.gz staging/*.zip staging/*.sha256 staging/SHA256SUMS)
+          assets=(staging/*.tar.gz staging/*.zip staging/*.sha256 staging/SHA256SUMS staging/backends-manifest.json)
           # --clobber so a re-run (retrying a flaky leg) replaces stale assets
           # instead of failing on "asset already exists".
           gh release upload "$tag" "${assets[@]}" \

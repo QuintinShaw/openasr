@@ -19,10 +19,11 @@ use openasr_core::{
     convert_local_cohere_source_to_runtime_pack, convert_local_qwen_source_to_runtime_pack,
     convert_local_whisper_hf_source_to_runtime_pack, derive_catalog_public_key_hex,
     discover_batch_inputs, embedded_catalog_fingerprint, load_config, models_dir, openasr_home,
-    parse_model_catalog, parse_model_ref, render_batch_summary, render_benchmark,
-    render_catalog_signature_manifest, resolve_registry_model_ref, resolve_runtime_model_ref,
-    runtime_registry, save_config, validate_local_native_model_pack_path,
-    verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
+    parse_model_catalog, parse_model_ref, render_backends_manifest_signature, render_batch_summary,
+    render_benchmark, render_catalog_signature_manifest, resolve_registry_model_ref,
+    resolve_runtime_model_ref, runtime_registry, save_config,
+    validate_local_native_model_pack_path, verify_catalog_signature_manifest,
+    verify_local_catalog_signature_manifest,
 };
 
 mod bench_suite_cli;
@@ -177,6 +178,19 @@ async fn run() -> Result<()> {
             print_public_key,
         ),
         Command::CatalogFingerprint => catalog_fingerprint_command(),
+        Command::SignBackendsManifest {
+            manifest,
+            out,
+            manifest_url,
+            key_id,
+            print_public_key,
+        } => sign_backends_manifest_command(
+            &manifest,
+            &out,
+            &manifest_url,
+            &key_id,
+            print_public_key,
+        ),
         Command::Transcribe {
             inputs,
             formats,
@@ -536,6 +550,64 @@ fn sign_catalog_manifest_command(
         )
     })?;
     println!("Wrote catalog signature manifest: {}", out.display());
+    Ok(())
+}
+
+fn sign_backends_manifest_command(
+    manifest: &Path,
+    out: &Path,
+    manifest_url: &str,
+    key_id: &str,
+    print_public_key: bool,
+) -> Result<()> {
+    // Deliberately the SAME env var (and therefore the SAME signing seed) as
+    // `sign_catalog_manifest_command` -- see backends_manifest_security's
+    // module doc for why this manifest reuses the catalog's key/trust root
+    // instead of minting a second one.
+    let signing_key_seed_hex =
+        env::var(OPENASR_CATALOG_SIGNING_KEY_SEED_HEX).with_context(|| {
+            format!(
+                "{OPENASR_CATALOG_SIGNING_KEY_SEED_HEX} must be set to a 32-byte hex Ed25519 seed"
+            )
+        })?;
+
+    if print_public_key {
+        let public_key = derive_catalog_public_key_hex(&signing_key_seed_hex)
+            .context("Could not derive backends-manifest signature public key")?;
+        println!("{public_key}");
+        return Ok(());
+    }
+
+    let manifest_contents = fs::read_to_string(manifest).with_context(|| {
+        format!(
+            "Could not read backends-manifest JSON '{}'",
+            manifest.display()
+        )
+    })?;
+
+    let signature = render_backends_manifest_signature(
+        &manifest_contents,
+        manifest_url,
+        key_id,
+        &signing_key_seed_hex,
+    )
+    .context("Could not render backends-manifest signature")?;
+    openasr_core::verify_backends_manifest_signature(&manifest_contents, &signature, manifest_url)
+        .context(
+            "Rendered backends-manifest signature did not verify against the production trust root",
+        )?;
+
+    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create output directory '{}'", parent.display()))?;
+    }
+    atomic_write_text(out, &signature).with_context(|| {
+        format!(
+            "Could not write backends-manifest signature '{}'",
+            out.display()
+        )
+    })?;
+    println!("Wrote backends-manifest signature: {}", out.display());
     Ok(())
 }
 
@@ -1612,5 +1684,63 @@ mod tests {
         assert!(language_mode_label(Some(FixedMonolingual)).starts_with("fixed_monolingual"));
         assert!(language_mode_label(Some(FixedMultilingual)).starts_with("fixed_multilingual"));
         assert_eq!(language_mode_label(None), "unspecified");
+    }
+
+    /// Desktop-sidecar contract: `apps/desktop/src-tauri/src/sidecar.rs` spawns
+    /// this binary as `openasr serve --backend native --parent-pid <pid> ...`
+    /// (see `openasr-app` `sidecar.rs`'s `Command::new(..).args([...])`). Both
+    /// flags are `hide = true` in `cli_args.rs` because they are launch-detail
+    /// only, never meant for interactive use -- but "hidden from `--help`" must
+    /// never come to mean "safe to rename or remove". This test locks the two
+    /// flags' presence and shape (long names, hyphenated `--parent-pid`, an
+    /// accepted `native`/`mock` value for `--backend`, a `u32` for
+    /// `--parent-pid`) so a future "clean up hidden flags" pass fails CI here
+    /// instead of silently breaking every desktop build's ability to launch and
+    /// supervise its sidecar.
+    #[test]
+    fn serve_accepts_desktop_sidecar_contract_flags() {
+        let cli = Cli::try_parse_from([
+            "openasr",
+            "serve",
+            "--backend",
+            "native",
+            "--parent-pid",
+            "4321",
+        ])
+        .expect("serve must keep accepting --backend and --parent-pid for the desktop sidecar");
+
+        let Command::Serve {
+            backend,
+            parent_pid,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+
+        assert_eq!(backend, Some(BackendKind::Native));
+        assert_eq!(parent_pid, Some(4321));
+    }
+
+    #[test]
+    fn serve_still_works_without_the_desktop_sidecar_flags() {
+        // Both flags are optional launch details for interactive/manual use
+        // (e.g. `openasr serve` from a terminal); they must stay optional so
+        // this contract test only pins their *presence and shape*, not that
+        // every caller supplies them.
+        let cli = Cli::try_parse_from(["openasr", "serve"])
+            .expect("serve must remain usable without the desktop-only flags");
+
+        let Command::Serve {
+            backend,
+            parent_pid,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+
+        assert_eq!(backend, None);
+        assert_eq!(parent_pid, None);
     }
 }
