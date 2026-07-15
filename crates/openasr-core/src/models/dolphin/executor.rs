@@ -24,7 +24,6 @@ use crate::arch::DOLPHIN_GGML_ADAPTER_ID;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgufMetadata, GgufOwnedWeightTensorPayload,
     GgufTensorDataReadError, GgufTensorDataReader, GgufWeightTensorElementType,
-    RequestBackendPreference, request_backend_override,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
@@ -226,15 +225,14 @@ pub(crate) struct DolphinPipelineOutput {
 /// and reproduces the golden transcript on the clip. Metal stays an opt-in rather
 /// than the default only because its fp16 numerics are not golden-validated
 /// (the parity gate is CPU bit-exact); it is the recommended accelerated path.
+///
+/// Delegates to the shared `resolve_family_runtime_backend` gate (declared via
+/// this architecture's `auto_gpu_enabled = false`, see `arch::mod` /
+/// `BUILTIN_ARCHITECTURE_DESCRIPTORS`) rather than hand-rolling the override
+/// check, so any provenance label resolving through the same gate can never
+/// drift from what this function actually decided.
 fn dolphin_runtime_backend() -> GgmlCpuGraphBackend {
-    if matches!(
-        request_backend_override(),
-        Some(RequestBackendPreference::Accelerated)
-    ) {
-        GgmlCpuGraphConfig::resolve_runtime_backend()
-    } else {
-        GgmlCpuGraphBackend::Cpu
-    }
+    GgmlCpuGraphConfig::resolve_family_runtime_backend(false)
 }
 
 /// Runtime weights for one pack, shared behind an `Arc` so the process-level pool

@@ -97,12 +97,23 @@ pub(crate) fn gpu_stage_enabled_for_backend(
 ) -> bool {
     let gpu_raw = std::env::var(gpu_env).ok();
     let legacy_metal_raw = legacy_metal_env.and_then(|name| std::env::var(name).ok());
+    // An explicit `execution_target=accelerated` request always wins over a
+    // stage's tuned Auto-mode default -- these per-stage knobs (encoder
+    // prelude, decoder, ...) exist to keep Auto from picking a GPU path that
+    // measured worse for that specific op mix, not to second-guess a user who
+    // explicitly asked for acceleration. An explicit env var still wins over
+    // this (an operator-set kill switch is a deployment decision, not the
+    // engine choosing on the user's behalf), so only the *default* shifts.
+    let explicit_accelerated = matches!(
+        crate::ggml_runtime::request_backend_override(),
+        Some(crate::ggml_runtime::RequestBackendPreference::Accelerated)
+    );
     gpu_stage_enabled_for_backend_raw(
         backend,
         gpu_raw.as_deref(),
-        default_gpu_enabled,
+        default_gpu_enabled || explicit_accelerated,
         legacy_metal_raw.as_deref(),
-        default_metal_enabled,
+        default_metal_enabled || explicit_accelerated,
     )
 }
 
@@ -278,6 +289,38 @@ mod tests {
             true,
         ));
     }
+
+    /// Regression for a stage gate whose tuned Auto default disables a
+    /// backend (`default_gpu_enabled = false`, e.g. a hypothetical future
+    /// per-stage knob tuned off by default on some host class): with no env
+    /// var set, an explicit `execution_target=accelerated` request must
+    /// still enable the stage, not silently inherit the Auto-tuned default.
+    /// None of today's builtin stage gates actually reach this path in the
+    /// common (env-unset) case -- they all default enabled -- but every
+    /// gate goes through this one function, so this pins the override
+    /// priority for the whole class rather than per family.
+    #[test]
+    fn explicit_accelerated_overrides_a_stage_gate_disabled_by_default() {
+        use crate::ggml_runtime::{RequestBackendPreference, install_request_backend_override};
+
+        assert!(!gpu_stage_enabled_for_backend(
+            GgmlCpuGraphBackend::Metal,
+            "OPENASR_TEST_STAGE_ENABLE_GPU_NEVER_SET",
+            false,
+            Some("OPENASR_TEST_STAGE_ENABLE_METAL_NEVER_SET"),
+            false,
+        ));
+
+        let _guard = install_request_backend_override(Some(RequestBackendPreference::Accelerated));
+        assert!(gpu_stage_enabled_for_backend(
+            GgmlCpuGraphBackend::Metal,
+            "OPENASR_TEST_STAGE_ENABLE_GPU_NEVER_SET",
+            false,
+            Some("OPENASR_TEST_STAGE_ENABLE_METAL_NEVER_SET"),
+            false,
+        ));
+    }
+
     #[test]
     fn request_backend_override_forces_resolution() {
         use crate::ggml_runtime::{

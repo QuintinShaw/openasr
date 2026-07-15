@@ -272,6 +272,37 @@ impl GgmlCpuGraphConfig {
         }
     }
 
+    /// Single choke point for "should this family run on GPU": every family
+    /// whose Auto default is gated (rather than always following
+    /// `resolve_runtime_backend()` unconditionally) must resolve its backend
+    /// through this function instead of hand-rolling the override check
+    /// (dolphin's `dolphin_runtime_backend` and xasr-zipformer's
+    /// `encoder_gpu_enabled` are the two builtin cases -- see their doc
+    /// comments for the measured Auto-mode evidence behind `auto_gpu_enabled
+    /// = false`). `auto_gpu_enabled` is a pure Auto-mode default: it can only
+    /// ever pin Auto to CPU, never override an explicit per-request
+    /// preference. A request that explicitly asked for `CpuOnly` or
+    /// `Accelerated` always gets what it asked for via
+    /// `resolve_runtime_backend()`, matching the product rule that hardware
+    /// selection is the engine's call only in Auto -- an explicit user choice
+    /// always wins, even where auto-mode would have picked differently.
+    ///
+    /// This is also the function any provenance/telemetry label reporting
+    /// "which backend actually ran" for such a family must call (with the
+    /// same `auto_gpu_enabled` the family itself used) instead of
+    /// `resolve_runtime_backend()` directly -- calling the generic resolver
+    /// for a gated family's provenance label reports what Auto would
+    /// generically pick, not what the family actually decided, which is
+    /// exactly the kind of drift that produced a `core.native.backend:metal`
+    /// label on a request that in fact ran entirely on CPU.
+    pub fn resolve_family_runtime_backend(auto_gpu_enabled: bool) -> GgmlCpuGraphBackend {
+        if auto_gpu_enabled || request_backend_override().is_some() {
+            Self::resolve_runtime_backend()
+        } else {
+            GgmlCpuGraphBackend::Cpu
+        }
+    }
+
     pub(crate) fn resolve_backend_name_for(
         backend: GgmlCpuGraphBackend,
     ) -> Result<String, GgmlCpuGraphError> {
@@ -5222,6 +5253,55 @@ mod tests {
             "probe: resolve_runtime_backend={:?}",
             GgmlCpuGraphConfig::resolve_runtime_backend()
         );
+    }
+
+    #[test]
+    fn resolve_family_runtime_backend_gates_auto_but_never_explicit() {
+        use super::{RequestBackendPreference, install_request_backend_override};
+
+        // No per-request preference installed (Auto): a family that declares
+        // `auto_gpu_enabled = false` must stay pinned to CPU...
+        assert_eq!(
+            GgmlCpuGraphConfig::resolve_family_runtime_backend(false),
+            GgmlCpuGraphBackend::Cpu
+        );
+        // ...while a family that allows Auto to pick GPU automatically just
+        // gets whatever the generic resolver would have picked anyway.
+        assert_eq!(
+            GgmlCpuGraphConfig::resolve_family_runtime_backend(true),
+            GgmlCpuGraphConfig::resolve_runtime_backend()
+        );
+
+        // An explicit CpuOnly preference is honored regardless of the gate.
+        {
+            let _guard = install_request_backend_override(Some(RequestBackendPreference::CpuOnly));
+            assert_eq!(
+                GgmlCpuGraphConfig::resolve_family_runtime_backend(false),
+                GgmlCpuGraphBackend::Cpu
+            );
+            assert_eq!(
+                GgmlCpuGraphConfig::resolve_family_runtime_backend(true),
+                GgmlCpuGraphBackend::Cpu
+            );
+        }
+
+        // An explicit Accelerated preference always wins, even for a family
+        // whose Auto default is gated to CPU -- the gate can only ever pin
+        // Auto, never override an explicit per-request choice.
+        {
+            let _guard =
+                install_request_backend_override(Some(RequestBackendPreference::Accelerated));
+            let expected = GgmlCpuGraphConfig::resolve_runtime_backend();
+            assert!(expected.is_gpu_class());
+            assert_eq!(
+                GgmlCpuGraphConfig::resolve_family_runtime_backend(false),
+                expected
+            );
+            assert_eq!(
+                GgmlCpuGraphConfig::resolve_family_runtime_backend(true),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -899,6 +899,12 @@ fn run_native_transcription_impl(
     // resolve_runtime_backend(), which consults this override.
     let _backend_guard =
         install_request_backend_override(backend_preference.request_backend_override());
+    // This family's Auto-mode GPU capability, so the provenance backend label
+    // below resolves through the same family-aware gate the family's own
+    // executor used (see `native_runtime_backend_label`'s doc comment).
+    let auto_gpu_enabled = crate::arch::family_auto_gpu_enabled_for_model_architecture(
+        selected_family.model_architecture,
+    );
     let mut longform_metadata: Option<TranscriptionLongFormMetadata> = None;
     if run_longform {
         let (vad_provider, vad_engine_label) = resolve_longform_vad_provider(&longform_options)?;
@@ -953,6 +959,7 @@ fn run_native_transcription_impl(
                     slice_kind_summary,
                     timeline_kind,
                     &longform_provenance,
+                    auto_gpu_enabled,
                 )),
                 language: reported_language.clone(),
             });
@@ -1114,6 +1121,7 @@ fn run_native_transcription_impl(
                 slice_kind_summary,
                 timeline_kind,
                 &longform_provenance,
+                auto_gpu_enabled,
             );
             if !ran_any_slice && suppressed_slice_count > 0 {
                 let fallback_options = request_options.clone();
@@ -1151,6 +1159,7 @@ fn run_native_transcription_impl(
             slice_kind_summary,
             timeline_kind,
             &longform_provenance,
+            auto_gpu_enabled,
         ));
     }
 
@@ -1798,6 +1807,7 @@ fn build_longform_metadata(
     slice_kind_summary: &'static str,
     timeline_kind: &'static str,
     extra_provenance: &[String],
+    auto_gpu_enabled: bool,
 ) -> TranscriptionLongFormMetadata {
     let mode = match options.mode {
         LongFormMode::Off => "off",
@@ -1810,7 +1820,10 @@ fn build_longform_metadata(
         format!("core.longform.plan:{mode}"),
         format!("core.longform.slice-kind:{slice_kind_summary}"),
         format!("core.longform.timeline:{timeline_kind}"),
-        format!("core.native.backend:{}", native_runtime_backend_label()),
+        format!(
+            "core.native.backend:{}",
+            native_runtime_backend_label(auto_gpu_enabled)
+        ),
         "core.longform.assembler".to_string(),
         "core.native.ggml".to_string(),
     ];
@@ -1846,14 +1859,6 @@ fn summarize_slice_kinds(slices: &[crate::AudioSlice]) -> &'static str {
         "full"
     } else {
         "unknown"
-    }
-}
-
-fn native_runtime_backend_label() -> &'static str {
-    match GgmlCpuGraphConfig::resolve_runtime_backend() {
-        GgmlCpuGraphBackend::Cpu => "cpu",
-        GgmlCpuGraphBackend::Metal => "metal",
-        GgmlCpuGraphBackend::Gpu => "gpu",
     }
 }
 
@@ -1998,6 +2003,24 @@ fn prefers_cpu_decoder_for_multichunk_metal(model_architecture: &str) -> bool {
         .is_some_and(|descriptor| descriptor.prefer_cpu_decoder_for_multichunk_metal)
 }
 
+/// The `core.native.backend` provenance label always resolves through the
+/// same family-aware gate the family's own executor used
+/// (`GgmlCpuGraphConfig::resolve_family_runtime_backend`), keyed by this
+/// family's `auto_gpu_enabled` capability declaration. It must never call
+/// `GgmlCpuGraphConfig::resolve_runtime_backend()` directly for this purpose:
+/// that generic resolver reports what Auto would pick for a family with no
+/// gate, which drifts from reality for a family like dolphin or
+/// xasr-zipformer that pins Auto to CPU -- exactly the bug that produced a
+/// `core.native.backend:metal` label on a dolphin Auto request that in fact
+/// ran entirely on CPU.
+fn native_runtime_backend_label(auto_gpu_enabled: bool) -> &'static str {
+    match GgmlCpuGraphConfig::resolve_family_runtime_backend(auto_gpu_enabled) {
+        GgmlCpuGraphBackend::Cpu => "cpu",
+        GgmlCpuGraphBackend::Metal => "metal",
+        GgmlCpuGraphBackend::Gpu => "gpu",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2011,6 +2034,70 @@ mod tests {
     // run test functions across threads within one process, so serialize with
     // a lock rather than relying on scheduling luck.
     static PROGRESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn family_auto_gpu_enabled_lookup_matches_dolphin_and_xasr_gates() {
+        // Regression pin for the two builtin families whose Auto default is
+        // gated to CPU (see `auto_gpu_enabled`'s doc comment); every other
+        // builtin lets Auto pick GPU automatically.
+        assert!(
+            !crate::arch::family_auto_gpu_enabled_for_model_architecture(
+                crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID
+            )
+        );
+        assert!(
+            !crate::arch::family_auto_gpu_enabled_for_model_architecture(
+                crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID
+            )
+        );
+        assert!(crate::arch::family_auto_gpu_enabled_for_model_architecture(
+            crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID
+        ));
+        // An unrecognized architecture defaults to the majority behavior
+        // (Auto may use GPU) rather than silently pinning an unknown family
+        // to CPU.
+        assert!(crate::arch::family_auto_gpu_enabled_for_model_architecture(
+            "not-a-real-architecture"
+        ));
+    }
+
+    /// Regression for the dolphin-plus-Auto provenance mislabel: the
+    /// `core.native.backend` label must resolve through the same
+    /// family-aware gate the family's own executor used
+    /// (`GgmlCpuGraphConfig::resolve_family_runtime_backend`), not recompute
+    /// generically. Before this fix, `native_runtime_backend_label` called
+    /// `GgmlCpuGraphConfig::resolve_runtime_backend()` directly, which on a
+    /// host with a GPU device reports "metal" for an Auto dolphin request
+    /// that in fact ran entirely on CPU (dolphin pins Auto to CPU; see
+    /// `dolphin::executor::dolphin_runtime_backend`).
+    #[test]
+    fn native_runtime_backend_label_reflects_family_auto_gate_not_generic_resolver() {
+        use crate::ggml_runtime::{RequestBackendPreference, install_request_backend_override};
+
+        // Auto, family gate disabled (dolphin/xasr-zipformer shape): must
+        // report "cpu" regardless of what the generic resolver would pick.
+        assert_eq!(native_runtime_backend_label(false), "cpu");
+
+        // Auto, family gate enabled (every other builtin's shape): reports
+        // exactly what the generic resolver picks -- unchanged behavior.
+        let generic_auto_label = match GgmlCpuGraphConfig::resolve_runtime_backend() {
+            GgmlCpuGraphBackend::Cpu => "cpu",
+            GgmlCpuGraphBackend::Metal => "metal",
+            GgmlCpuGraphBackend::Gpu => "gpu",
+        };
+        assert_eq!(native_runtime_backend_label(true), generic_auto_label);
+
+        // An explicit accelerated request always reports the accelerated
+        // backend, even for a family whose Auto default is gated to CPU --
+        // the gate never overrides an explicit per-request choice.
+        {
+            let _guard =
+                install_request_backend_override(Some(RequestBackendPreference::Accelerated));
+            let label = native_runtime_backend_label(false);
+            assert!(label == "metal" || label == "gpu", "got {label}");
+            assert_eq!(label, native_runtime_backend_label(true));
+        }
+    }
 
     #[test]
     fn native_progress_is_monotonic_across_phases_and_clears() {
