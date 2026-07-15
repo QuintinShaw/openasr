@@ -31,13 +31,13 @@ weights into `.oasr` packages and adds quantized builds for local runtime use.
 """
 
 [prose_locales."zh-CN"]
-tagline = "OpenAI 最高精度的 Whisper 模型，v3 large 版本"
+tagline = "OpenAI 准确率最高的 Whisper，v3 完整版"
 
 highlights = [
-  "🎧 **多语言语音识别** — 支持广泛的语言转写，并可将语音翻译为英语",
-  "🏆 **1.55B 参数** — 完整尺寸的 Whisper，OpenAI 精度最高的版本",
-  "🔁 **v3 版本改进** — 在更大、更多样的语料上训练，使用 128 维梅尔频谱以提升鲁棒性",
-  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 Apple Silicon 优化",
+  "🎧 **多语言识别** — 支持转写多种语言，还能把语音直接翻译成英语",
+  "🏆 **1.55B 参数** — Whisper 满血版，OpenAI 出品的最高精度版本",
+  "🔁 **v3 版本升级** — 训练数据更大更丰富，采用 128 频段音频分析，各种场景下都更稳",
+  "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，无需安装 Python，专为 CPU 和 Apple Silicon 优化",
 ]
 
 source_sha256 = "4f970e3f0aef525c94cc0281135cafa915713c250cdf1b88e658db498402d951"

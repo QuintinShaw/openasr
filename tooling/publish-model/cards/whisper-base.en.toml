@@ -30,13 +30,13 @@ weights into `.oasr` packages and adds quantized builds for local runtime use.
 """
 
 [prose_locales."zh-CN"]
-tagline = "紧凑的纯英语 Whisper 模型，快速完成英语转写"
+tagline = "小巧的纯英语 Whisper，转写英语又快又好"
 
 highlights = [
-  "🇬🇧 **仅支持英语** — 专注英语场景，通常比同尺寸的多语言模型在英语上更准确",
-  "🪶 **74M 参数** — 体积小、速度快，相比 tiny.en 有明显提升",
-  "🌐 **弱监督规模训练** — 使用 Whisper 680k 小时标注语音语料训练",
-  "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 Apple Silicon 优化",
+  "🇬🇧 **英语专精** — 只做英语一件事，同等体积下比多语言版识别英语通常更准",
+  "🪶 **74M 参数** — 体积小、速度快，比 tiny.en 准确率明显更高",
+  "🌐 **海量语音训练** — 基于 Whisper 680k 小时语音数据训练，底子扎实",
+  "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，无需安装 Python，专为 CPU 和 Apple Silicon 优化",
 ]
 
 source_sha256 = "7f5652e651a9d4861ac16ae49d8d7d62649a5263eb4bb089033de1de4023a701"
