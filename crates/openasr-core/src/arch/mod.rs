@@ -273,17 +273,19 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     /// overrides an explicit `execution_target=accelerated` (or `cpu`)
     /// request, which always gets exactly what it asked for via
     /// `GgmlCpuGraphConfig::resolve_family_runtime_backend`. False only for
-    /// the two families with a measured Auto-mode GPU regression at their
-    /// normal (non-`accelerated`) workload size: dolphin's whole pipeline
-    /// (`models::dolphin::executor::dolphin_runtime_backend`) and
     /// xasr-zipformer's streaming encoder
-    /// (`models::xasr_zipformer::graph_config::encoder_gpu_enabled`) -- see
-    /// those functions' doc comments for the measured evidence. Any
+    /// (`models::xasr_zipformer::graph_config::encoder_gpu_enabled`), the one
+    /// family with a measured Auto-mode GPU regression at its normal
+    /// (non-`accelerated`) chunk size -- see that function's doc comment for
+    /// the measured evidence. (Dolphin was gated too until its encoder + CTC
+    /// head weights moved into a Metal-offloadable static arena; Metal then
+    /// beat CPU end-to-end, so its Auto default is now GPU -- see
+    /// `models::dolphin::executor::dolphin_runtime_backend`.) Any
     /// provenance/telemetry label reporting the backend a request actually
     /// ran on must resolve through the same function with this same flag,
     /// not recompute generically (a generic recompute is what produced a
-    /// `core.native.backend:metal` label on a dolphin Auto request that in
-    /// fact ran entirely on CPU).
+    /// `core.native.backend:metal` label on a gated-family Auto request that
+    /// in fact ran entirely on CPU).
     pub auto_gpu_enabled: bool,
     /// Whether this family's own decode loop can emit diarization tokens (the
     /// cohere token-stream is the only builtin case today). The single
@@ -1305,11 +1307,18 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: DOLPHIN_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        // Fail-closed to the golden, parity-validated CPU path: Metal is
-        // faster on this pipeline (AB-measured) but its fp16 numerics are not
-        // golden-validated (parity gate is CPU bit-exact), so Auto stays on
-        // CPU -- see `dolphin::executor::dolphin_runtime_backend`.
-        auto_gpu_enabled: false,
+        // Auto prefers the accelerator: once the E-Branchformer encoder + CTC
+        // head weights live in a WEIGHTS-usage static arena (so the ggml
+        // scheduler offloads them to Metal instead of pinning the whole encoder
+        // to the CPU), Metal beats CPU end-to-end on Apple Silicon (AB-measured,
+        // warm best-of-N on M1). The gate only ever picks the accelerator when
+        // one is actually present (`runtime_gpu_is_available`), so non-Metal
+        // hosts still resolve to CPU, and an explicit `--execution-target
+        // cpu` request always wins -- see
+        // `dolphin::executor::dolphin_runtime_backend`. fp16 Metal numerics
+        // reproduce the golden transcript on the parity clip (CPU stays the
+        // bit-exact reference gate).
+        auto_gpu_enabled: true,
         self_diarizes: false,
         // DataoceanAI's cn-dialect-small training corpus is transcribed
         // without punctuation and the model has no punctuation-prediction
@@ -1514,17 +1523,17 @@ mod tests {
         );
     }
 
-    /// Pins `auto_gpu_enabled` per builtin architecture -- dolphin and
-    /// xasr-zipformer are the only two builtins whose Auto default is gated
-    /// to CPU (a measured Auto-mode GPU regression at their normal chunk
-    /// size, not a correctness limit; see the field doc and the two
-    /// executors' own doc comments). Every other builtin lets Auto pick a
-    /// GPU-class backend automatically when available, matching how
-    /// `resolve_runtime_backend` behaves generically. A silent flip of this
-    /// table for any of the two gated families would either quietly start
-    /// running an unvalidated GPU path by default (dolphin) or regress Auto
-    /// throughput (xasr-zipformer); for any other family it would silently
-    /// start denying Auto users a GPU their hardware supports.
+    /// Pins `auto_gpu_enabled` per builtin architecture -- xasr-zipformer is
+    /// the only builtin whose Auto default is still gated to CPU (a measured
+    /// Auto-mode GPU regression at its normal chunk size, not a correctness
+    /// limit; see the field doc and that executor's own doc comment). Every
+    /// other builtin -- dolphin now included, after its encoder + CTC head
+    /// weights moved into a Metal-offloadable static arena and Metal beat CPU
+    /// end-to-end -- lets Auto pick a GPU-class backend automatically when
+    /// available, matching how `resolve_runtime_backend` behaves generically.
+    /// A silent flip of this table would either regress Auto throughput for
+    /// xasr-zipformer, or silently deny Auto users a GPU their hardware
+    /// supports for any GPU-enabled family.
     #[test]
     fn builtin_architectures_declare_auto_gpu_enabled() {
         let expected: &[(&str, bool)] = &[
@@ -1536,7 +1545,7 @@ mod tests {
             (WAV2VEC2_CTC_GGML_ARCHITECTURE_ID, true),
             (XASR_ZIPFORMER_GGML_ARCHITECTURE_ID, false),
             (MOONSHINE_GGML_ARCHITECTURE_ID, true),
-            (DOLPHIN_GGML_ARCHITECTURE_ID, false),
+            (DOLPHIN_GGML_ARCHITECTURE_ID, true),
             (SENSEVOICE_GGML_ARCHITECTURE_ID, true),
             (FIRERED_AED_GGML_ARCHITECTURE_ID, true),
             (FIRERED_LLM_GGML_ARCHITECTURE_ID, true),
