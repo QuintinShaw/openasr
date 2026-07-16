@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlStaticTensor, GgmlStaticTensorArena,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
@@ -313,19 +313,49 @@ struct EncoderWeights<'a> {
     after_norm_b: GgmlCpuTensor<'a>,
 }
 
-/// Pending f32 weight upload: `(tensor, source-slice, static-label)`.
-type Upload<'a, 'p> = (GgmlCpuTensor<'a>, &'p [f32], &'static str);
-/// Pending native (quantized / f16) weight upload: `(tensor, raw-bytes,
-/// ggml-type, static-label)`.
-type NativeUpload<'a, 'p> = (GgmlCpuTensor<'a>, &'p [u8], i32, &'static str);
+/// Static-arena tensor count for [`GgmlCpuGraphConfig::metadata_context_bytes`].
+/// Per E-Branchformer block, `build_block_weights` allocates 41 weight tensors
+/// (macaron FFN norm+w1+w2 = 6, MHA norm = 2, rel-pos attention q/k/v/pos/out +
+/// pos_bias_u/v = 11, cgMLP norm = 2, cgMLP proj1/csgu-norm/csgu-conv/proj2 = 8,
+/// fusion conv + merge proj = 4, final FFN norm+w1+w2 = 6, block final norm = 2);
+/// the fixed set is the embed stem (2 convs + out = 6 tensors), the after_norm
+/// pair (2), and the position table (1).
+const DOLPHIN_ENCODER_ARENA_TENSORS_PER_BLOCK: usize = 41;
+const DOLPHIN_ENCODER_ARENA_FIXED_TENSORS: usize = 9;
 
-struct WeightBuilder<'a, 'p> {
-    provider: &'p dyn DolphinWeightProvider,
-    uploads: Vec<Upload<'a, 'p>>,
-    native_uploads: Vec<NativeUpload<'a, 'p>>,
+fn dolphin_encoder_arena_context_bytes(num_blocks: usize) -> usize {
+    let tensor_count = DOLPHIN_ENCODER_ARENA_FIXED_TENSORS
+        .saturating_add(DOLPHIN_ENCODER_ARENA_TENSORS_PER_BLOCK.saturating_mul(num_blocks));
+    GgmlCpuGraphConfig::metadata_context_bytes(tensor_count)
 }
 
-impl<'a, 'p> WeightBuilder<'a, 'p> {
+/// Pending f32 weight upload into the static arena: `(handle, source-slice,
+/// static-label)`.
+type Upload<'p> = (GgmlStaticTensor, &'p [f32], &'static str);
+/// Pending native (quantized / f16) weight upload: `(handle, raw-bytes,
+/// static-label)`.
+type NativeUpload<'p> = (GgmlStaticTensor, &'p [u8], &'static str);
+
+/// Allocates every encoder weight into the runtime's persistent
+/// [`GgmlStaticTensorArena`] (a `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` backend
+/// buffer) rather than as per-call transient graph leaves. This is what lets the
+/// ggml multi-backend scheduler offload the encoder's matmuls to an accelerator:
+/// the scheduler only considers an op for `op_offload` when its weight `src`
+/// lives in a WEIGHTS-usage buffer, which the old per-call graph-input weights
+/// were not, so the whole E-Branchformer (the FLOPs-heavy stage) was pinned to
+/// the CPU even under an explicit Metal backend. Mirrors the sibling
+/// `decoder_graph::StaticWeightBuilder` and `sensevoice::SenseVoiceEncoderGraph`
+/// exactly: allocate every tensor first (the arena's first upload freezes
+/// further creation), then upload once. Weight placement changes no value the
+/// graph computes, so the encoder output stays golden-identical -- only the
+/// backend each op runs on changes.
+struct WeightBuilder<'p> {
+    provider: &'p dyn DolphinWeightProvider,
+    uploads: Vec<Upload<'p>>,
+    native_uploads: Vec<NativeUpload<'p>>,
+}
+
+impl<'p> WeightBuilder<'p> {
     fn new(provider: &'p dyn DolphinWeightProvider) -> Self {
         Self {
             provider,
@@ -352,18 +382,18 @@ impl<'a, 'p> WeightBuilder<'a, 'p> {
     }
 
     /// A 1-D weight (bias / norm gamma-beta / packed pos bias).
-    fn w1(
+    fn w1<'a>(
         &mut self,
-        graph: &GgmlCpuGraphBuilder<'a>,
+        arena: &GgmlStaticTensorArena,
         name: &str,
         len: usize,
     ) -> Result<GgmlCpuTensor<'a>, DolphinEncoderError> {
         let data = self.fetch(name, len)?;
-        let tensor = graph
+        let handle = arena
             .new_tensor_1d_f32(len, "dolphin_weight")
             .map_err(ggml_err("weight_alloc_1d"))?;
-        self.uploads.push((tensor, data, "dolphin_weight"));
-        Ok(tensor)
+        self.uploads.push((handle, data, "dolphin_weight"));
+        Ok(arena.graph_tensor(handle))
     }
 
     /// A 2-D `.weight` matmul operand bound as ggml `[ne0=in, ne1=out]` for
@@ -374,33 +404,33 @@ impl<'a, 'p> WeightBuilder<'a, 'p> {
     /// blow-up). Otherwise (the raw-safetensors parity provider) it falls back to
     /// the f32 bind. Both stored layouts (fp16's `[out, in]`, quant's reversed
     /// `[in, out]`) share the same in-innermost byte order, so uploading raw into
-    /// the `[ne0=in, ne1=out]` graph tensor is order-preserving in either case.
-    fn w2(
+    /// the `[ne0=in, ne1=out]` arena tensor is order-preserving in either case.
+    fn w2<'a>(
         &mut self,
-        graph: &GgmlCpuGraphBuilder<'a>,
+        arena: &GgmlStaticTensorArena,
         name: &str,
         ne0: usize,
         ne1: usize,
     ) -> Result<GgmlCpuTensor<'a>, DolphinEncoderError> {
         if let Some(native) = self.provider.native_weight(name) {
-            let tensor = graph
+            let handle = arena
                 .new_matmul_weight_2d_typed(ne0, ne1, native.ggml_type, "dolphin_weight")
                 .map_err(ggml_err("weight_alloc_2d_native"))?;
             self.native_uploads
-                .push((tensor, native.bytes, native.ggml_type, "dolphin_weight"));
-            return Ok(tensor);
+                .push((handle, native.bytes, "dolphin_weight"));
+            return Ok(arena.graph_tensor(handle));
         }
         let data = self.fetch(name, ne0 * ne1)?;
-        let tensor = graph
+        let handle = arena
             .new_tensor_2d_f32(ne0, ne1, "dolphin_weight")
             .map_err(ggml_err("weight_alloc_2d"))?;
-        self.uploads.push((tensor, data, "dolphin_weight"));
-        Ok(tensor)
+        self.uploads.push((handle, data, "dolphin_weight"));
+        Ok(arena.graph_tensor(handle))
     }
 
-    fn w4(
+    fn w4<'a>(
         &mut self,
-        graph: &GgmlCpuGraphBuilder<'a>,
+        arena: &GgmlStaticTensorArena,
         name: &str,
         ne0: usize,
         ne1: usize,
@@ -408,17 +438,17 @@ impl<'a, 'p> WeightBuilder<'a, 'p> {
         ne3: usize,
     ) -> Result<GgmlCpuTensor<'a>, DolphinEncoderError> {
         let data = self.fetch(name, ne0 * ne1 * ne2 * ne3)?;
-        let tensor = graph
+        let handle = arena
             .new_tensor_4d_f32(ne0, ne1, ne2, ne3, "dolphin_weight")
             .map_err(ggml_err("weight_alloc_4d"))?;
-        self.uploads.push((tensor, data, "dolphin_weight"));
-        Ok(tensor)
+        self.uploads.push((handle, data, "dolphin_weight"));
+        Ok(arena.graph_tensor(handle))
     }
 
     /// The first `frames` rows of the `[1, max_len, d_model]` position table.
-    fn pos_slice(
+    fn pos_slice<'a>(
         &mut self,
-        graph: &GgmlCpuGraphBuilder<'a>,
+        arena: &GgmlStaticTensorArena,
         name: &str,
         d_model: usize,
         frames: usize,
@@ -426,28 +456,47 @@ impl<'a, 'p> WeightBuilder<'a, 'p> {
     ) -> Result<GgmlCpuTensor<'a>, DolphinEncoderError> {
         let full = self.fetch(name, d_model * max_len)?;
         let slice = &full[..d_model * frames];
-        let tensor = graph
+        let handle = arena
             .new_tensor_2d_f32(d_model, frames, "dolphin_weight")
             .map_err(ggml_err("weight_alloc_pos"))?;
-        self.uploads.push((tensor, slice, "dolphin_weight"));
-        Ok(tensor)
+        self.uploads.push((handle, slice, "dolphin_weight"));
+        Ok(arena.graph_tensor(handle))
+    }
+
+    /// Upload every collected weight into the arena's backend buffer exactly
+    /// once (the first upload allocates the buffer and freezes further tensor
+    /// creation). Native (quantized / f16) rank-2 `.weight` operands upload
+    /// their raw block bytes verbatim so they stay quantized in the buffer;
+    /// everything else uploads dequantized f32.
+    fn upload(&self, arena: &mut GgmlStaticTensorArena) -> Result<(), DolphinEncoderError> {
+        for (handle, data, name) in &self.uploads {
+            arena
+                .set_f32_slice(*handle, data, name)
+                .map_err(ggml_err("upload_weight"))?;
+        }
+        for (handle, bytes, name) in &self.native_uploads {
+            arena
+                .set_bytes_slice(*handle, bytes, name)
+                .map_err(ggml_err("upload_weight_native"))?;
+        }
+        Ok(())
     }
 }
 
 fn build_embed_weights<'a, 'p>(
-    graph: &GgmlCpuGraphBuilder<'a>,
-    builder: &mut WeightBuilder<'a, 'p>,
+    arena: &GgmlStaticTensorArena,
+    builder: &mut WeightBuilder<'p>,
     config: &DolphinEncoderConfig,
 ) -> Result<EmbedWeights<'a>, DolphinEncoderError> {
     let d = config.d_model;
     let flat = d * subsample_width(config.feature_dim);
     Ok(EmbedWeights {
-        conv0_w: builder.w4(graph, "encoder.embed.conv.0.weight", 3, 3, 1, d)?,
-        conv0_b: builder.w4(graph, "encoder.embed.conv.0.bias", 1, 1, d, 1)?,
-        conv1_w: builder.w4(graph, "encoder.embed.conv.2.weight", 3, 3, d, d)?,
-        conv1_b: builder.w4(graph, "encoder.embed.conv.2.bias", 1, 1, d, 1)?,
-        out_w: builder.w2(graph, "encoder.embed.out.0.weight", flat, d)?,
-        out_b: builder.w1(graph, "encoder.embed.out.0.bias", d)?,
+        conv0_w: builder.w4(arena, "encoder.embed.conv.0.weight", 3, 3, 1, d)?,
+        conv0_b: builder.w4(arena, "encoder.embed.conv.0.bias", 1, 1, d, 1)?,
+        conv1_w: builder.w4(arena, "encoder.embed.conv.2.weight", 3, 3, d, d)?,
+        conv1_b: builder.w4(arena, "encoder.embed.conv.2.bias", 1, 1, d, 1)?,
+        out_w: builder.w2(arena, "encoder.embed.out.0.weight", flat, d)?,
+        out_b: builder.w1(arena, "encoder.embed.out.0.bias", d)?,
     })
 }
 
@@ -481,8 +530,8 @@ fn dolphin_relative_positional_table(d_model: usize, frames: usize) -> Option<Ve
 }
 
 fn build_block_weights<'a, 'p>(
-    graph: &GgmlCpuGraphBuilder<'a>,
-    builder: &mut WeightBuilder<'a, 'p>,
+    arena: &GgmlStaticTensorArena,
+    builder: &mut WeightBuilder<'p>,
     config: &DolphinEncoderConfig,
     index: usize,
 ) -> Result<BlockWeights<'a>, DolphinEncoderError> {
@@ -494,47 +543,47 @@ fn build_block_weights<'a, 'p>(
     let mk = config.merge_kernel;
     let p = |suffix: &str| format!("encoder.encoders.{index}.{suffix}");
     Ok(BlockWeights {
-        ff_macaron_norm_w: builder.w1(graph, &p("norm_ff_macaron.weight"), d)?,
-        ff_macaron_norm_b: builder.w1(graph, &p("norm_ff_macaron.bias"), d)?,
-        ff_macaron_w1_w: builder.w2(graph, &p("feed_forward_macaron.w_1.weight"), d, ffn)?,
-        ff_macaron_w1_b: builder.w1(graph, &p("feed_forward_macaron.w_1.bias"), ffn)?,
-        ff_macaron_w2_w: builder.w2(graph, &p("feed_forward_macaron.w_2.weight"), ffn, d)?,
-        ff_macaron_w2_b: builder.w1(graph, &p("feed_forward_macaron.w_2.bias"), d)?,
-        norm_mha_w: builder.w1(graph, &p("norm_mha.weight"), d)?,
-        norm_mha_b: builder.w1(graph, &p("norm_mha.bias"), d)?,
-        q_w: builder.w2(graph, &p("attn.linear_q.weight"), d, d)?,
-        q_b: builder.w1(graph, &p("attn.linear_q.bias"), d)?,
-        k_w: builder.w2(graph, &p("attn.linear_k.weight"), d, d)?,
-        k_b: builder.w1(graph, &p("attn.linear_k.bias"), d)?,
-        v_w: builder.w2(graph, &p("attn.linear_v.weight"), d, d)?,
-        v_b: builder.w1(graph, &p("attn.linear_v.bias"), d)?,
-        pos_w: builder.w2(graph, &p("attn.linear_pos.weight"), d, d)?,
-        pos_bias_u: builder.w1(graph, &p("attn.pos_bias_u"), d)?,
-        pos_bias_v: builder.w1(graph, &p("attn.pos_bias_v"), d)?,
-        out_w: builder.w2(graph, &p("attn.linear_out.weight"), d, d)?,
-        out_b: builder.w1(graph, &p("attn.linear_out.bias"), d)?,
-        norm_mlp_w: builder.w1(graph, &p("norm_mlp.weight"), d)?,
-        norm_mlp_b: builder.w1(graph, &p("norm_mlp.bias"), d)?,
-        cproj1_w: builder.w2(graph, &p("cgmlp.channel_proj1.0.weight"), d, cg)?,
-        cproj1_b: builder.w1(graph, &p("cgmlp.channel_proj1.0.bias"), cg)?,
-        csgu_norm_w: builder.w1(graph, &p("cgmlp.csgu.norm.weight"), cg_half)?,
-        csgu_norm_b: builder.w1(graph, &p("cgmlp.csgu.norm.bias"), cg_half)?,
-        csgu_conv_w: builder.w4(graph, &p("cgmlp.csgu.conv.weight"), ck, 1, 1, cg_half)?,
-        csgu_conv_b: builder.w1(graph, &p("cgmlp.csgu.conv.bias"), cg_half)?,
-        cproj2_w: builder.w2(graph, &p("cgmlp.channel_proj2.weight"), cg_half, d)?,
-        cproj2_b: builder.w1(graph, &p("cgmlp.channel_proj2.bias"), d)?,
-        fusion_conv_w: builder.w4(graph, &p("depthwise_conv_fusion.weight"), mk, 1, 1, d + d)?,
-        fusion_conv_b: builder.w1(graph, &p("depthwise_conv_fusion.bias"), d + d)?,
-        merge_w: builder.w2(graph, &p("merge_proj.weight"), d + d, d)?,
-        merge_b: builder.w1(graph, &p("merge_proj.bias"), d)?,
-        norm_ff_w: builder.w1(graph, &p("norm_ff.weight"), d)?,
-        norm_ff_b: builder.w1(graph, &p("norm_ff.bias"), d)?,
-        ff_w1_w: builder.w2(graph, &p("feed_forward.w_1.weight"), d, ffn)?,
-        ff_w1_b: builder.w1(graph, &p("feed_forward.w_1.bias"), ffn)?,
-        ff_w2_w: builder.w2(graph, &p("feed_forward.w_2.weight"), ffn, d)?,
-        ff_w2_b: builder.w1(graph, &p("feed_forward.w_2.bias"), d)?,
-        norm_final_w: builder.w1(graph, &p("norm_final.weight"), d)?,
-        norm_final_b: builder.w1(graph, &p("norm_final.bias"), d)?,
+        ff_macaron_norm_w: builder.w1(arena, &p("norm_ff_macaron.weight"), d)?,
+        ff_macaron_norm_b: builder.w1(arena, &p("norm_ff_macaron.bias"), d)?,
+        ff_macaron_w1_w: builder.w2(arena, &p("feed_forward_macaron.w_1.weight"), d, ffn)?,
+        ff_macaron_w1_b: builder.w1(arena, &p("feed_forward_macaron.w_1.bias"), ffn)?,
+        ff_macaron_w2_w: builder.w2(arena, &p("feed_forward_macaron.w_2.weight"), ffn, d)?,
+        ff_macaron_w2_b: builder.w1(arena, &p("feed_forward_macaron.w_2.bias"), d)?,
+        norm_mha_w: builder.w1(arena, &p("norm_mha.weight"), d)?,
+        norm_mha_b: builder.w1(arena, &p("norm_mha.bias"), d)?,
+        q_w: builder.w2(arena, &p("attn.linear_q.weight"), d, d)?,
+        q_b: builder.w1(arena, &p("attn.linear_q.bias"), d)?,
+        k_w: builder.w2(arena, &p("attn.linear_k.weight"), d, d)?,
+        k_b: builder.w1(arena, &p("attn.linear_k.bias"), d)?,
+        v_w: builder.w2(arena, &p("attn.linear_v.weight"), d, d)?,
+        v_b: builder.w1(arena, &p("attn.linear_v.bias"), d)?,
+        pos_w: builder.w2(arena, &p("attn.linear_pos.weight"), d, d)?,
+        pos_bias_u: builder.w1(arena, &p("attn.pos_bias_u"), d)?,
+        pos_bias_v: builder.w1(arena, &p("attn.pos_bias_v"), d)?,
+        out_w: builder.w2(arena, &p("attn.linear_out.weight"), d, d)?,
+        out_b: builder.w1(arena, &p("attn.linear_out.bias"), d)?,
+        norm_mlp_w: builder.w1(arena, &p("norm_mlp.weight"), d)?,
+        norm_mlp_b: builder.w1(arena, &p("norm_mlp.bias"), d)?,
+        cproj1_w: builder.w2(arena, &p("cgmlp.channel_proj1.0.weight"), d, cg)?,
+        cproj1_b: builder.w1(arena, &p("cgmlp.channel_proj1.0.bias"), cg)?,
+        csgu_norm_w: builder.w1(arena, &p("cgmlp.csgu.norm.weight"), cg_half)?,
+        csgu_norm_b: builder.w1(arena, &p("cgmlp.csgu.norm.bias"), cg_half)?,
+        csgu_conv_w: builder.w4(arena, &p("cgmlp.csgu.conv.weight"), ck, 1, 1, cg_half)?,
+        csgu_conv_b: builder.w1(arena, &p("cgmlp.csgu.conv.bias"), cg_half)?,
+        cproj2_w: builder.w2(arena, &p("cgmlp.channel_proj2.weight"), cg_half, d)?,
+        cproj2_b: builder.w1(arena, &p("cgmlp.channel_proj2.bias"), d)?,
+        fusion_conv_w: builder.w4(arena, &p("depthwise_conv_fusion.weight"), mk, 1, 1, d + d)?,
+        fusion_conv_b: builder.w1(arena, &p("depthwise_conv_fusion.bias"), d + d)?,
+        merge_w: builder.w2(arena, &p("merge_proj.weight"), d + d, d)?,
+        merge_b: builder.w1(arena, &p("merge_proj.bias"), d)?,
+        norm_ff_w: builder.w1(arena, &p("norm_ff.weight"), d)?,
+        norm_ff_b: builder.w1(arena, &p("norm_ff.bias"), d)?,
+        ff_w1_w: builder.w2(arena, &p("feed_forward.w_1.weight"), d, ffn)?,
+        ff_w1_b: builder.w1(arena, &p("feed_forward.w_1.bias"), ffn)?,
+        ff_w2_w: builder.w2(arena, &p("feed_forward.w_2.weight"), ffn, d)?,
+        ff_w2_b: builder.w1(arena, &p("feed_forward.w_2.bias"), d)?,
+        norm_final_w: builder.w1(arena, &p("norm_final.weight"), d)?,
+        norm_final_b: builder.w1(arena, &p("norm_final.bias"), d)?,
     })
 }
 
@@ -1070,17 +1119,28 @@ pub(crate) fn encode(
         use_scheduler: true,
     };
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
-    let mut graph = runner.start_graph();
+    // Persistent weight arena (a WEIGHTS-usage backend buffer). Placing every
+    // encoder weight here -- instead of the per-call transient graph leaves the
+    // pre-arena encoder used -- is what lets the ggml multi-backend scheduler
+    // offload the E-Branchformer's matmuls to an accelerator (see
+    // `WeightBuilder`). Mirrors `decoder_graph::DolphinDecoderRescoreRuntime` and
+    // the sibling `sensevoice`/`cohere`/`moonshine` encoders. The arena is an
+    // owned value carrying a raw pointer into the runner's backend, so it and the
+    // per-call graph (a `&mut runner` borrow) coexist; `runner` outlives it.
+    let arena = runner
+        .start_static_tensor_arena(dolphin_encoder_arena_context_bytes(config.num_blocks))
+        .map_err(ggml_err("static_tensor_arena"))?;
 
-    // Phase A: create every weight tensor (must precede the first buffer alloc).
+    // Phase A: allocate every weight tensor in the arena (allocation must precede
+    // the arena's first upload, which freezes further creation).
     let mut builder = WeightBuilder::new(provider);
-    let embed = build_embed_weights(&graph, &mut builder, config)?;
+    let embed = build_embed_weights(&arena, &mut builder, config)?;
     let mut blocks = Vec::with_capacity(config.num_blocks);
     for index in 0..config.num_blocks {
-        blocks.push(build_block_weights(&graph, &mut builder, config, index)?);
+        blocks.push(build_block_weights(&arena, &mut builder, config, index)?);
     }
-    let after_norm_w = builder.w1(&graph, "encoder.after_norm.weight", config.d_model)?;
-    let after_norm_b = builder.w1(&graph, "encoder.after_norm.bias", config.d_model)?;
+    let after_norm_w = builder.w1(&arena, "encoder.after_norm.weight", config.d_model)?;
+    let after_norm_b = builder.w1(&arena, "encoder.after_norm.bias", config.d_model)?;
     let weights = EncoderWeights {
         embed,
         blocks,
@@ -1088,32 +1148,32 @@ pub(crate) fn encode(
         after_norm_b,
     };
 
-    // The encoder's relative-position table: a baked-table slice for
-    // `CnDialect` (via the provider, like every other weight), or a table
-    // computed fresh for this request's `frames` for `Multilingual` (never
-    // baked -- see `dolphin_relative_positional_table`). The latter is
-    // uploaded like `input` below (an owned buffer kept alive for the whole
-    // call), not through `WeightBuilder` (which only holds provider-borrowed
-    // slices).
+    // The encoder's relative-position table: a baked-table slice for `CnDialect`
+    // (via the provider, like every other weight), or a table computed fresh for
+    // this request's `frames` for `Multilingual` (never baked -- see
+    // `dolphin_relative_positional_table`). Both live in the arena (constant for
+    // the whole call); the computed one is uploaded separately below since it is
+    // an owned buffer, not a provider-borrowed slice `WeightBuilder` can hold.
     let is_multilingual = matches!(
         config.language_scheme,
         super::package_import::DolphinLanguageScheme::Multilingual
     );
-    let mut computed_pos_table: Option<Vec<f32>> = None;
+    let mut computed_pos: Option<(GgmlStaticTensor, Vec<f32>)> = None;
     let pos_emb = if is_multilingual {
         let table = dolphin_relative_positional_table(config.d_model, frames).ok_or_else(|| {
             DolphinEncoderError::Shape {
                 reason: "relative position table size overflow".to_string(),
             }
         })?;
-        let tensor = graph
+        let handle = arena
             .new_tensor_2d_f32(config.d_model, 2 * frames - 1, "dolphin_rel_pos")
             .map_err(ggml_err("weight_alloc_relpos"))?;
-        computed_pos_table = Some(table);
+        let tensor = arena.graph_tensor(handle);
+        computed_pos = Some((handle, table));
         tensor
     } else {
         builder.pos_slice(
-            &graph,
+            &arena,
             "encoder.embed.pos_enc.pe",
             config.d_model,
             frames,
@@ -1121,11 +1181,24 @@ pub(crate) fn encode(
         )?
     };
 
+    // Phase B: upload every weight (+ the computed rel-pos table) into the arena
+    // backend buffer exactly once. This freezes the arena.
+    let mut arena = arena;
+    builder.upload(&mut arena)?;
+    if let Some((handle, table)) = &computed_pos {
+        arena
+            .set_f32_slice(*handle, table, "dolphin_rel_pos")
+            .map_err(ggml_err("upload_rel_pos"))?;
+    }
+
+    // Phase C: build the per-call forward graph. Only the audio features are a
+    // genuine per-call graph input; every weight and the position table are
+    // already resident in the arena's backend buffer.
+    let mut graph = runner.start_graph();
     let input = graph
         .new_tensor_2d_f32(feat, frames_in, "dolphin_features")
         .map_err(ggml_err("input_alloc"))?;
 
-    // Phase B: build the forward graph and collect the taps.
     let (after_subsample, frames_check) =
         subsample(&graph, input, &weights.embed, config, frames_in)?;
     if frames_check != frames {
@@ -1162,30 +1235,13 @@ pub(crate) fn encode(
     for tap in &taps {
         graph.set_output(*tap).map_err(ggml_err("set_output"))?;
     }
-    // Every tensor this graph uploads to (rather than computes) must be
-    // flagged `set_input`: unlike firered/moonshine/cohere, dolphin has no
-    // persistent weight arena -- every weight (and the audio features / the
-    // relative-position table) is a fresh leaf tensor in this per-call graph
-    // with no buffer of its own yet, so without the flag the scheduler's
-    // backend-assignment pass has no rule to place it on and aborts.
+    // Only the audio-feature leaf is a fresh per-call graph tensor with no buffer
+    // of its own; the weights and position table are arena-resident (their
+    // backend buffer is already allocated), so -- like the decoder's arena path
+    // -- they need no `set_input`.
     graph
         .set_input(input)
         .map_err(ggml_err("mark_input(features)"))?;
-    if is_multilingual {
-        graph
-            .set_input(pos_emb)
-            .map_err(ggml_err("mark_input(rel_pos)"))?;
-    }
-    for (tensor, _, _) in &builder.uploads {
-        graph
-            .set_input(*tensor)
-            .map_err(ggml_err("mark_input(weight)"))?;
-    }
-    for (tensor, _, _, _) in &builder.native_uploads {
-        graph
-            .set_input(*tensor)
-            .map_err(ggml_err("mark_input(weight_native)"))?;
-    }
     // Allocate the forward graph through the scheduler's gallocr for
     // liveness-based buffer reuse before uploading inputs -- every tap above
     // is already marked as an output, so gallocr keeps each one's buffer
@@ -1194,27 +1250,10 @@ pub(crate) fn encode(
         .prepare_outputs_for_upload(&taps)
         .map_err(ggml_err("prepare_outputs"))?;
 
-    // Phase C: upload inputs + weights, then compute. Native (quantized/f16)
-    // rank-2 `.weight` operands upload their raw block bytes verbatim so they stay
-    // quantized in the backend buffer; everything else uploads dequantized f32.
+    // Phase D: upload the audio features, then compute.
     graph
         .set_f32_slice(input, features, "dolphin_features")
         .map_err(ggml_err("upload_features"))?;
-    if let Some(table) = &computed_pos_table {
-        graph
-            .set_f32_slice(pos_emb, table, "dolphin_rel_pos")
-            .map_err(ggml_err("upload_rel_pos"))?;
-    }
-    for (tensor, data, name) in &builder.uploads {
-        graph
-            .set_f32_slice(*tensor, data, name)
-            .map_err(ggml_err("upload_weight"))?;
-    }
-    for (tensor, bytes, ggml_type, name) in &builder.native_uploads {
-        graph
-            .set_matmul_weight_bytes(*tensor, bytes, *ggml_type, name)
-            .map_err(ggml_err("upload_weight_native"))?;
-    }
 
     let expected = frames * config.d_model;
     let output_specs: Vec<(GgmlCpuTensor, usize)> =

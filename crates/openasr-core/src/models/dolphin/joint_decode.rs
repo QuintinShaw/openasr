@@ -199,27 +199,58 @@ fn compute_ctc_log_probs(
     };
     let ggml = |stage: &'static str| move |source| DolphinJointDecodeError::Ggml { stage, source };
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml("runner_init"))?;
-    let mut graph = runner.start_graph();
+
+    // Persistent weight arena (a WEIGHTS-usage backend buffer): the CTC head's
+    // `ctc.ctc_lo.weight` matmul operand + bias live here so the ggml
+    // multi-backend scheduler can offload the projection to an accelerator, the
+    // same reason the encoder/decoder weights are arena-resident. Binding them as
+    // per-call transient graph leaves (the pre-arena path) pinned this matmul to
+    // the CPU even under an explicit Metal backend. Only `encoder_out` is a
+    // genuine per-call graph input. Weight placement changes no computed value,
+    // so the CTC log-probs stay golden-identical.
+    let arena = runner
+        .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(2))
+        .map_err(ggml("static_tensor_arena"))?;
 
     // Weight `[vocab, d_model]` binds as ggml `[ne0=d_model, ne1=vocab]` so
     // `mul_mat(weight, enc)` projects each frame to the vocab logits. When the
     // provider keeps it quantized/f16, it binds at the stored ggml type and the
     // raw block bytes are uploaded verbatim (stays quantized in the buffer);
     // otherwise it binds f32.
-    let weight_tensor = match native_weight {
-        Some(native) => graph
+    let weight_handle = match native_weight {
+        Some(native) => arena
             .new_matmul_weight_2d_typed(d_model, vocab, native.ggml_type, "dolphin_ctc_weight")
             .map_err(ggml("weight_alloc_native"))?,
-        None => graph
+        None => arena
             .new_tensor_2d_f32(d_model, vocab, "dolphin_ctc_weight")
             .map_err(ggml("weight_alloc"))?,
     };
-    let bias_tensor = graph
+    let bias_handle = arena
         .new_tensor_1d_f32(vocab, "dolphin_ctc_bias")
         .map_err(ggml("bias_alloc"))?;
+
+    // Upload the weight + bias into the arena backend buffer exactly once (the
+    // first upload freezes further tensor creation).
+    let mut arena = arena;
+    match (native_weight, weight) {
+        (Some(native), _) => arena
+            .set_bytes_slice(weight_handle, native.bytes, "dolphin_ctc_weight")
+            .map_err(ggml("upload_weight_native"))?,
+        (None, Some(weight)) => arena
+            .set_f32_slice(weight_handle, weight, "dolphin_ctc_weight")
+            .map_err(ggml("upload_weight"))?,
+        (None, None) => unreachable!("ctc weight is fetched f32 when not native"),
+    }
+    arena
+        .set_f32_slice(bias_handle, bias, "dolphin_ctc_bias")
+        .map_err(ggml("upload_bias"))?;
+
+    let mut graph = runner.start_graph();
     let encoder_tensor = graph
         .new_tensor_2d_f32(d_model, frames, "dolphin_ctc_encoder_out")
         .map_err(ggml("encoder_alloc"))?;
+    let weight_tensor = arena.graph_tensor(weight_handle);
+    let bias_tensor = arena.graph_tensor(bias_handle);
 
     let logits = graph
         .mul_mat(weight_tensor, encoder_tensor)
@@ -228,16 +259,10 @@ fn compute_ctc_log_probs(
         .add(logits, bias_tensor)
         .map_err(ggml("ctc_bias_add"))?;
     graph.set_output(logits).map_err(ggml("set_output"))?;
-    // Every tensor this graph uploads to (rather than computes) must be
-    // flagged `set_input`: it is a fresh leaf tensor in this per-call graph
-    // with no buffer yet, so without the flag the scheduler's
-    // backend-assignment pass has no rule to place it on and aborts.
-    graph
-        .set_input(weight_tensor)
-        .map_err(ggml("mark_input(weight)"))?;
-    graph
-        .set_input(bias_tensor)
-        .map_err(ggml("mark_input(bias)"))?;
+    // Only `encoder_out` is a fresh per-call graph leaf with no buffer of its
+    // own; the weight + bias are arena-resident (backend buffer already
+    // allocated), so -- like the encoder/decoder arena paths -- they need no
+    // `set_input`.
     graph
         .set_input(encoder_tensor)
         .map_err(ggml("mark_input(encoder_out)"))?;
@@ -248,23 +273,6 @@ fn compute_ctc_log_probs(
         .prepare_outputs_for_upload(&[logits])
         .map_err(ggml("prepare_outputs"))?;
 
-    match (native_weight, weight) {
-        (Some(native), _) => graph
-            .set_matmul_weight_bytes(
-                weight_tensor,
-                native.bytes,
-                native.ggml_type,
-                "dolphin_ctc_weight",
-            )
-            .map_err(ggml("upload_weight_native"))?,
-        (None, Some(weight)) => graph
-            .set_f32_slice(weight_tensor, weight, "dolphin_ctc_weight")
-            .map_err(ggml("upload_weight"))?,
-        (None, None) => unreachable!("ctc weight is fetched f32 when not native"),
-    }
-    graph
-        .set_f32_slice(bias_tensor, bias, "dolphin_ctc_bias")
-        .map_err(ggml("upload_bias"))?;
     graph
         .set_f32_slice(encoder_tensor, encoder_out, "dolphin_ctc_encoder_out")
         .map_err(ggml("upload_encoder"))?;
