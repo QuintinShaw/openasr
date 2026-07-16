@@ -2412,6 +2412,75 @@ fn expected_mock_rendered_transcription(
 }
 
 #[tokio::test]
+async fn health_catalog_degraded_is_null_with_no_recorded_status() {
+    // A fresh $OPENASR_HOME with no catalog load recorded (or the most recent
+    // load used the primary source) reads `catalog_degraded: null` -- the
+    // common case.
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = openasr_server::DistributionRuntime {
+        openasr_home: Some(temp.path().join("home")),
+        catalog_url: None,
+        catalog_local_override: None,
+    };
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        distribution,
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(parsed["catalog_degraded"].is_null());
+}
+
+#[tokio::test]
+async fn health_surfaces_catalog_degraded_reason_when_recorded() {
+    // /health reads the SAME degraded-status marker the catalog loaders
+    // write when they fall back to a cache/embedded tier (see
+    // docs/CATALOG_COMPATIBILITY.md) -- this pins the shell-facing surface
+    // half of that contract without needing to reproduce a real fallback.
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    openasr_core::record_catalog_degraded(&home, "embedded", "network unreachable; using embedded");
+    let distribution = openasr_server::DistributionRuntime {
+        openasr_home: Some(home),
+        catalog_url: None,
+        catalog_local_override: None,
+    };
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        distribution,
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        parsed["catalog_degraded"],
+        serde_json::json!("network unreachable; using embedded")
+    );
+}
+
+#[tokio::test]
 async fn health_returns_identity_json_without_instance_token() {
     let app = with_server_instance_token_env(None, openasr_server::app);
     let response = app
@@ -2440,10 +2509,11 @@ async fn health_returns_identity_json_without_instance_token() {
     );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        9,
+        10,
         "status/server_version/pid/instance_token/model_installed/model_resident \
-         plus the 0.1.14 additive native_active_count/idle_seconds and the 0.1.15 \
-         additive abandoned_worker_count debug fields"
+         plus the 0.1.14 additive native_active_count/idle_seconds, the 0.1.15 \
+         additive abandoned_worker_count debug field, and the 0.1.16 additive \
+         catalog_degraded field"
     );
 }
 
@@ -2478,10 +2548,11 @@ async fn health_echoes_launch_instance_token_without_env() {
     );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        9,
+        10,
         "status/server_version/pid/instance_token/model_installed/model_resident \
-         plus the 0.1.14 additive native_active_count/idle_seconds and the 0.1.15 \
-         additive abandoned_worker_count debug fields"
+         plus the 0.1.14 additive native_active_count/idle_seconds, the 0.1.15 \
+         additive abandoned_worker_count debug field, and the 0.1.16 additive \
+         catalog_degraded field"
     );
 }
 
@@ -2518,10 +2589,11 @@ async fn health_prefers_env_instance_token_over_launch_option() {
     );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        9,
+        10,
         "status/server_version/pid/instance_token/model_installed/model_resident \
-         plus the 0.1.14 additive native_active_count/idle_seconds and the 0.1.15 \
-         additive abandoned_worker_count debug fields"
+         plus the 0.1.14 additive native_active_count/idle_seconds, the 0.1.15 \
+         additive abandoned_worker_count debug field, and the 0.1.16 additive \
+         catalog_degraded field"
     );
 }
 

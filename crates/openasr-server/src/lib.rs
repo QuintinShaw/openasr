@@ -1768,6 +1768,7 @@ fn load_persisted_pull_jobs(runtime: &DistributionRuntime) -> HashMap<String, Pu
 async fn health(
     State(runtime): State<ServerRuntime>,
     Extension(identity): Extension<ServerHealthIdentity>,
+    Extension(distribution): Extension<DistributionContext>,
 ) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
@@ -1779,7 +1780,18 @@ async fn health(
         native_active_count: idle_activity::native_activity_active_count() as u64,
         idle_seconds: idle_activity::native_activity_idle_seconds(Instant::now()),
         abandoned_worker_count: realtime::abandoned_stuck_worker_count() as u64,
+        catalog_degraded: catalog_degraded_reason(&distribution),
     })
+}
+
+/// Best-effort read of the current "catalog degraded" status for `/health`.
+/// Never fails the response -- an unresolvable `$OPENASR_HOME` or a
+/// stale/missing status file both read as "not degraded" (`None`) rather than
+/// an error, since this is a diagnostic surface, not a trust decision (see
+/// `openasr_core::read_catalog_degraded_status`).
+fn catalog_degraded_reason(distribution: &DistributionContext) -> Option<String> {
+    let home = distribution.openasr_home().ok()?;
+    openasr_core::read_catalog_degraded_status(home).map(|status| status.reason)
 }
 
 async fn models(State(runtime): State<ServerRuntime>) -> Result<Json<ModelsResponse>, ApiError> {
@@ -1979,6 +1991,20 @@ struct HealthResponse {
     /// watch for that condition. Reads `0` on the mock backend. Additive:
     /// absent in the pre-0.1.15 contract.
     abandoned_worker_count: u64,
+    /// `Some(reason)` when the model catalog most recently loaded on this
+    /// machine came from a degraded tier (the on-disk signed cache, or the
+    /// embedded offline snapshot) rather than a freshly verified primary
+    /// source -- e.g. the primary catalog fetch/bundled resource failed, or a
+    /// boot-local candidate's epoch sat below this machine's recorded
+    /// anti-rollback floor. `reason` is the human-readable cause, for
+    /// operator/shell diagnostics. `None` means either the last load used the
+    /// primary source, or no catalog load has recorded a status yet (e.g. a
+    /// backend that never touches the catalog). Best-effort: a stale/missing
+    /// status file reads as `None`, never as an error -- see
+    /// `openasr_core::read_catalog_degraded_status` and
+    /// `docs/CATALOG_COMPATIBILITY.md`. Additive: absent in the pre-0.1.16
+    /// contract.
+    catalog_degraded: Option<String>,
 }
 
 #[derive(Serialize)]

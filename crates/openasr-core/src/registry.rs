@@ -319,6 +319,14 @@ pub enum CatalogModelKind {
     AsrModel,
     CapabilityPack,
     TranslationModel,
+    /// A `kind` value this build does not recognize (a future catalog epoch
+    /// introducing a new model kind). `#[serde(other)]` routes any
+    /// unrecognized wire string here instead of failing the whole catalog
+    /// parse; a model in this state is dropped from the loaded catalog by
+    /// [`filter_forward_compatible_catalog`] (hidden, not rejected) with a
+    /// one-line diagnostic -- see `docs/CATALOG_COMPATIBILITY.md`.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Wire tags for a model's source-language parameter policy, reusing verbatim
@@ -343,6 +351,12 @@ pub enum CatalogLanguageMode {
     /// Intrinsically a fixed multilingual set with no per-request selection
     /// (X-ASR zh-en).
     FixedMultilingual,
+    /// A `language_mode` value this build does not recognize. Purely
+    /// descriptive metadata (never gates pull/dispatch), so an unrecognized
+    /// value is tolerated in place rather than failing the catalog parse --
+    /// see `docs/CATALOG_COMPATIBILITY.md`.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,6 +383,16 @@ pub enum CatalogCapabilityRole {
     /// `emits_punctuation == Some(false)`; never re-punctuates a punctuating
     /// family.
     PunctuationRestorer,
+    /// A `capability.role` value this build does not recognize (a future
+    /// capability-pack role). `#[serde(other)]` routes any unrecognized wire
+    /// string here instead of failing the whole catalog parse; a
+    /// capability-pack model in this state is dropped by
+    /// [`filter_forward_compatible_catalog`] -- an unrecognized role means
+    /// this build cannot safely wire the pack into any feature, so hiding it
+    /// (not just failing to match a feature filter) avoids advertising a
+    /// pack it cannot actually use.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,6 +401,15 @@ pub enum LicenseClass {
     Permissive,
     Noncommercial,
     Gated,
+    /// A `license_class` value this build does not recognize (a future
+    /// licensing tier). `#[serde(other)]` routes any unrecognized wire string
+    /// here instead of failing the whole catalog parse; a model in this state
+    /// is dropped by [`filter_forward_compatible_catalog`] -- license class
+    /// can gate what a client is allowed to show/download, so an
+    /// unrecognized value must hide the model rather than silently pull it
+    /// under an unknown compliance posture.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Whether the running build can use a catalog model, derived from its
@@ -647,6 +680,15 @@ pub enum CatalogBackendFileRole {
     /// An archive (zip) whose contents are extracted (post sha256 + signature
     /// verify) into `extract_subdir` — e.g. the rocBLAS Tensile `library/` set.
     Archive,
+    /// A `role` value this build does not recognize (a future backend-pack
+    /// file role). `#[serde(other)]` routes any unrecognized wire string here
+    /// instead of failing the whole catalog parse; a backend pack carrying a
+    /// file in this state is dropped whole by
+    /// [`filter_forward_compatible_catalog`] -- staging or extracting a file
+    /// under a role this build cannot interpret is unsafe, so the entire pack
+    /// (not just the one file) is hidden.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -656,6 +698,12 @@ pub enum CatalogBackendVendor {
     Vulkan,
     Hip,
     Cuda,
+    /// A `vendor` value this build does not recognize (a future GPU backend).
+    /// `#[serde(other)]` routes any unrecognized wire string here instead of
+    /// failing the whole catalog parse; a backend pack in this state is
+    /// dropped by [`filter_forward_compatible_catalog`].
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -852,6 +900,10 @@ pub enum CatalogError {
         catalog_source: String,
         message: String,
     },
+    #[error(
+        "Catalog '{catalog_source}' verified under the production signing key but contains staged (public: false) entries, which the production endpoint never serves; refusing to use it as the production catalog"
+    )]
+    UnexpectedStagedEntries { catalog_source: String },
     #[error("Invalid model catalog: {0}")]
     InvalidCatalog(String),
     #[error(
@@ -1008,10 +1060,35 @@ pub fn load_model_catalog(
     match read_catalog_source(source) {
         Ok(contents) => match read_and_verify_catalog_manifest(source, home, &contents) {
             Ok(verified) => {
-                let catalog = parse_model_catalog(&contents, source)?;
-                cache_catalog(home, &cache_path, &contents)?;
-                cache_catalog_security(home, &verified.manifest_contents, &verified.signature)?;
-                Ok(catalog)
+                match parse_and_check_production_catalog(source, &contents, &verified.signature) {
+                    Ok(catalog) => {
+                        // This tier (network fetch / explicit catalog_url
+                        // override) always runs the STRICT
+                        // `enforce_catalog_epoch_for_verified` (inside
+                        // `read_and_verify_catalog_manifest` above) -- there is
+                        // no below-floor outcome to reach here, so the floor
+                        // always advances on success.
+                        persist_catalog_cache(
+                            home,
+                            &cache_path,
+                            &contents,
+                            &verified.manifest_contents,
+                            &verified.signature,
+                            true,
+                        );
+                        catalog_security::clear_catalog_degraded(home);
+                        Ok(catalog)
+                    }
+                    // Parse/validate (or the staged-entries check above) failed
+                    // even though the signature verified: fall through to the
+                    // same cache/embedded degrade chain as a transport/signature
+                    // failure, rather than hard-failing the whole load. See
+                    // docs/CATALOG_COMPATIBILITY.md's "fallback chain" section --
+                    // this is the fix for the incident where a signature-valid
+                    // but structurally-wrong cached payload bricked the daemon
+                    // with no fallback attempted.
+                    Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
+                }
             }
             Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
         },
@@ -1019,47 +1096,100 @@ pub fn load_model_catalog(
     }
 }
 
-/// Loads a LOCAL catalog file directly from `path`, verifying its adjacent
-/// `catalog.signature.json` sidecar against `expected_catalog_url` -- which is
-/// deliberately NOT required to be a `file://`/path form of `path` itself.
+/// Parses `contents` and, for a catalog verified under the PRODUCTION signing
+/// key (see [`catalog_security::participates_in_epoch_floor`]), additionally
+/// refuses one specific data anomaly: a payload that carries any staged
+/// (`public: false`) entry. The production `catalog.openasr.org` endpoint --
+/// and therefore the on-disk cache of what that endpoint served -- only ever
+/// serves the public projection (`catalog.public.json`, the same artifact
+/// embedded in the binary); a production-key-verified payload that ALSO
+/// carries staged entries is not what that identity is supposed to produce.
+/// It is validly signed (no signature/epoch violation), so this is a DATA
+/// anomaly, not a security violation -- most likely a stray copy of the
+/// internal, full `model-registry/catalog.json` (which intentionally carries
+/// staged entries for repo-checkout dev preview, see
+/// [`preview_local_catalog_file_with_identity`]) that ended up in the
+/// runtime's `$OPENASR_HOME/catalog.json` cache -- exactly what happened in
+/// the incident `docs/CATALOG_COMPATIBILITY.md` documents. Refusing to use it
+/// here routes the caller into the normal cache/embedded fallback chain
+/// rather than serving unreleased models under the production identity.
 ///
-/// This exists for exactly one caller: the CLI's "run from a repo checkout"
-/// dev convenience that auto-discovers `model-registry/catalog.json` relative
-/// to the current directory / build tree with no `OPENASR_CATALOG_URL`
-/// override set (see `openasr-cli`'s `catalog_cli::load_cli_model_catalog`).
-/// That file and its committed sidecar ARE the pre-deployment source of truth
-/// for the canonical [`DEFAULT_CATALOG_URL`] identity -- the same relationship
-/// [`load_embedded_signed_catalog`] has to the binary's embedded snapshot.
+/// A local-dev-key-verified payload is exempt: dev preview intentionally
+/// carries staged entries under a non-production identity, by design.
+fn parse_and_check_production_catalog(
+    source: &str,
+    contents: &str,
+    verified: &catalog_security::VerifiedCatalogSignature,
+) -> Result<ModelCatalog, CatalogError> {
+    let catalog = parse_model_catalog(contents, source)?;
+    if catalog_security::participates_in_epoch_floor(&verified.key_id)
+        && catalog.models.iter().any(|model| !model.public)
+    {
+        return Err(CatalogError::UnexpectedStagedEntries {
+            catalog_source: source.to_string(),
+        });
+    }
+    Ok(catalog)
+}
+
+/// Best-effort persist of a freshly verified+parsed catalog to the shared
+/// on-disk cache (`$OPENASR_HOME/catalog.json` + its signature/epoch
+/// sidecars) -- called only AFTER the catalog has fully verified and parsed
+/// successfully (see [`parse_model_catalog`]'s doc comment for the "verify
+/// before persist" invariant this preserves). A write failure here does NOT
+/// fail the caller's load: the catalog is already verified and safe to serve
+/// for THIS call; only a later restart without network would notice the
+/// stale/absent cache, which is strictly better than throwing away a good,
+/// already-verified in-memory result over a transient disk-write hiccup.
 ///
-/// The trust roots are chosen from `expected_catalog_url` itself, through the
-/// same [`catalog_security::classify_catalog_identity`] used for every other
-/// source (see [`verify_catalog_manifest_for_source`]): when the caller
-/// asserts the canonical production (`https://`) identity -- as the repo
-/// auto-discovery of `model-registry/catalog.json` does -- ONLY the
-/// production key verifies, exactly like a real HTTPS/cached/embedded
-/// production catalog. The committed `model-registry/catalog.signature.json`
-/// is production-signed, so this is zero-impact for the real, deployed pair.
-/// The widely-known public local-dev key is accepted only when
-/// `expected_catalog_url` is itself a non-production (local) identity -- i.e.
-/// an explicit `--catalog-url file://...`/`OPENASR_CATALOG_URL` override,
-/// which goes through [`load_model_catalog`], not this function. A local-dev
-/// key bound to the production identity must never be treated as a stand-in
-/// for the real production catalog (that would let a malicious CWD override
-/// what a careless `cd`-and-run sees as the canonical model list/pull
-/// targets); see `registry/tests/catalog.rs`'s
-/// `local_catalog_auto_discovery_rejects_dev_key_bound_to_production_identity`.
-///
-/// Runs the same anti-rollback epoch floor as every other source, scoped to
-/// `openasr_home` -- see [`load_embedded_signed_catalog`]'s doc comment for
-/// why that is a freshness floor, not a confidentiality mechanism -- except
-/// that a local-dev-key verification never touches that floor at all (see
-/// [`catalog_security::participates_in_epoch_floor`]).
-pub fn load_local_catalog_file_with_identity(
+/// `advance_epoch_floor` must be `false` for a BOOT-LOCAL candidate accepted
+/// via [`catalog_security::BootEpochOutcome::BelowFloor`] (see
+/// [`load_local_catalog_file_with_identity`]): the content is still cached
+/// normally (it is otherwise fully valid), but the recorded epoch floor must
+/// never be pulled DOWN to a below-floor candidate's own (lower) epoch --
+/// that would be a genuine floor rollback, the exact thing the floor exists
+/// to prevent, not just "don't brick the boot".
+fn persist_catalog_cache(
+    home: &Path,
+    cache_path: &Path,
+    contents: &str,
+    manifest_contents: &str,
+    verified: &catalog_security::VerifiedCatalogSignature,
+    advance_epoch_floor: bool,
+) {
+    if let Err(error) = cache_catalog(home, cache_path, contents) {
+        eprintln!("openasr: warning: could not persist model catalog cache: {error}");
+        return;
+    }
+    if let Err(error) =
+        cache_catalog_security(home, manifest_contents, verified, advance_epoch_floor)
+    {
+        eprintln!("openasr: warning: could not persist model catalog signature cache: {error}");
+    }
+}
+
+/// Result of reading, verifying, and parsing a local catalog file, shared by
+/// [`load_local_catalog_file_with_identity`] and
+/// [`preview_local_catalog_file_with_identity`] so the two differ only in
+/// whether they persist to the shared cache and whether they fall back on
+/// failure -- see each function's doc comment.
+struct LocalCatalogFileLoad {
+    catalog: ModelCatalog,
+    contents: String,
+    manifest_contents: String,
+    verified: catalog_security::VerifiedCatalogSignature,
+    /// `Some(reason)` when the catalog's epoch is below this machine's
+    /// recorded floor but every other check passed -- see
+    /// [`catalog_security::enforce_boot_catalog_epoch_for_verified`]. `None`
+    /// means fully current.
+    degraded_reason: Option<String>,
+}
+
+fn read_and_verify_local_catalog_file(
     path: &Path,
     expected_catalog_url: &str,
-    openasr_home: impl AsRef<Path>,
-) -> Result<ModelCatalog, CatalogError> {
-    let home = openasr_home.as_ref();
+    home: &Path,
+) -> Result<LocalCatalogFileLoad, CatalogError> {
     let source_label = path.display().to_string();
     let contents = fs::read_to_string(path).map_err(|error| CatalogError::ReadCatalog {
         catalog_source: source_label.clone(),
@@ -1080,17 +1210,137 @@ pub fn load_local_catalog_file_with_identity(
                 catalog_source: source_label.clone(),
                 message: error.to_string(),
             })?;
-    catalog_security::enforce_catalog_epoch_for_verified(home, &verified).map_err(|error| {
-        CatalogError::CatalogSecurity {
-            catalog_source: source_label.clone(),
-            message: error.to_string(),
+    // Boot-local candidate: an epoch-floor rollback degrades rather than
+    // fails closed -- see `enforce_boot_catalog_epoch_for_verified`'s doc
+    // comment for why (a reinstalled older release, or dev-tool epoch-marker
+    // pollution on this machine, not a remote rollback attack). Any OTHER
+    // verification failure (signature, structure) still fails closed.
+    let degraded_reason = match catalog_security::enforce_boot_catalog_epoch_for_verified(
+        home, &verified,
+    ) {
+        Ok(catalog_security::BootEpochOutcome::Current) => None,
+        Ok(catalog_security::BootEpochOutcome::BelowFloor { floor }) => Some(format!(
+            "local catalog '{source_label}' epoch {} is below the epoch floor {floor} recorded on this machine; loading it anyway as a degraded boot candidate rather than refusing to start (see docs/CATALOG_COMPATIBILITY.md)",
+            verified.catalog_epoch
+        )),
+        Err(error) => {
+            return Err(CatalogError::CatalogSecurity {
+                catalog_source: source_label.clone(),
+                message: error.to_string(),
+            });
         }
-    })?;
+    };
     let catalog = parse_model_catalog(&contents, &source_label)?;
+    Ok(LocalCatalogFileLoad {
+        catalog,
+        contents,
+        manifest_contents,
+        verified,
+        degraded_reason,
+    })
+}
+
+/// Loads a LOCAL catalog file directly from `path`, verifying its adjacent
+/// `catalog.signature.json` sidecar against `expected_catalog_url` -- which is
+/// deliberately NOT required to be a `file://`/path form of `path` itself.
+///
+/// This exists for exactly one caller: `openasr-cli`'s (and
+/// `openasr-server`'s) `OPENASR_CATALOG_FILE`/`OPENASR_CATALOG_IDENTITY`
+/// startup resolution, i.e. a desktop-bundled, production-signed
+/// `catalog.json` copied to `Contents/Resources/catalog.json` -- see
+/// [`resolve_local_catalog_env_override`]. (The CLI's OTHER local-file
+/// caller, the repo-checkout dev-preview auto-discovery, uses
+/// [`preview_local_catalog_file_with_identity`] instead -- it must never
+/// persist the repo's full, staged-entries-including catalog into the same
+/// shared cache this function writes.)
+///
+/// The trust roots are chosen from `expected_catalog_url` itself, through the
+/// same [`catalog_security::classify_catalog_identity`] used for every other
+/// source (see [`verify_catalog_manifest_for_source`]): when the caller
+/// asserts the canonical production (`https://`) identity -- as the desktop
+/// bundled-catalog resolution does -- ONLY the production key verifies,
+/// exactly like a real HTTPS/cached/embedded production catalog. The public
+/// local-dev key is accepted only when `expected_catalog_url` is itself a
+/// non-production (local) identity -- i.e. an explicit
+/// `--catalog-url file://...`/`OPENASR_CATALOG_URL` override, which goes
+/// through [`load_model_catalog`], not this function. A local-dev key bound
+/// to the production identity must never be treated as a stand-in for the
+/// real production catalog; see `registry/tests/catalog.rs`'s
+/// `local_catalog_auto_discovery_rejects_dev_key_bound_to_production_identity`.
+///
+/// On any failure (read, signature, non-rollback epoch, parse/validate), this
+/// falls back through the same on-disk-cache -> embedded chain as
+/// [`load_model_catalog`] (see [`load_cached_signed_catalog`]) instead of
+/// failing the whole load -- this is the desktop's actual `openasr serve`
+/// startup path, so a corrupted/incompatible bundled resource must degrade,
+/// not brick the daemon.
+pub fn load_local_catalog_file_with_identity(
+    path: &Path,
+    expected_catalog_url: &str,
+    openasr_home: impl AsRef<Path>,
+) -> Result<ModelCatalog, CatalogError> {
+    let home = openasr_home.as_ref();
     let cache_path = default_catalog_cache_path(home);
-    cache_catalog(home, &cache_path, &contents)?;
-    cache_catalog_security(home, &manifest_contents, &verified)?;
-    Ok(catalog)
+    match read_and_verify_local_catalog_file(path, expected_catalog_url, home) {
+        Ok(load) => {
+            // A below-floor boot candidate is cached normally (it is
+            // otherwise fully valid) but must NOT advance the recorded epoch
+            // floor down to its own lower epoch -- see
+            // `persist_catalog_cache`'s doc comment.
+            persist_catalog_cache(
+                home,
+                &cache_path,
+                &load.contents,
+                &load.manifest_contents,
+                &load.verified,
+                load.degraded_reason.is_none(),
+            );
+            match &load.degraded_reason {
+                Some(reason) => {
+                    eprintln!("openasr: warning: {reason}");
+                    catalog_security::record_catalog_degraded(home, "local", reason);
+                }
+                None => catalog_security::clear_catalog_degraded(home),
+            }
+            Ok(load.catalog)
+        }
+        Err(error) => load_cached_signed_catalog(expected_catalog_url, home, &cache_path, error),
+    }
+}
+
+/// Read-only preview of a local catalog file for the CLI's repo-checkout
+/// dev-preview auto-discovery (`openasr-cli`'s `catalog_cli::load_cli_model_catalog`,
+/// which auto-discovers `model-registry/catalog.json` relative to the current
+/// directory / build tree when no `OPENASR_CATALOG_URL`/`OPENASR_CATALOG_FILE`
+/// override is set). Verifies and parses exactly like
+/// [`load_local_catalog_file_with_identity`] (including the same boot-local
+/// epoch-floor degrade), but:
+///
+/// - Never writes to the shared `$OPENASR_HOME/catalog.json` cache (or its
+///   signature/epoch sidecars). The repo's full `model-registry/catalog.json`
+///   intentionally carries staged (`public: false`) pre-release entries so a
+///   contributor can preview an unreleased model locally; persisting that
+///   into the same cache a REAL installed OpenASR binary reads as its offline
+///   fallback would contaminate it with unreleased-model data -- this is the
+///   exact mechanism that produced a stale/incompatible cached catalog on a
+///   contributor's machine (see `docs/CATALOG_COMPATIBILITY.md`). A plain
+///   `cargo run -p openasr-cli -- doctor` from a checkout gains nothing from
+///   caching this file (it is re-read fresh from the repo tree every run), so
+///   there is no functional tradeoff in never writing it.
+/// - Never falls back to a cached/embedded catalog on failure: a broken local
+///   edit should surface its real error directly to the contributor
+///   previewing it, not be silently masked by an unrelated older catalog.
+pub fn preview_local_catalog_file_with_identity(
+    path: &Path,
+    expected_catalog_url: &str,
+    openasr_home: impl AsRef<Path>,
+) -> Result<ModelCatalog, CatalogError> {
+    let home = openasr_home.as_ref();
+    let load = read_and_verify_local_catalog_file(path, expected_catalog_url, home)?;
+    if let Some(reason) = &load.degraded_reason {
+        eprintln!("openasr: warning: {reason}");
+    }
+    Ok(load.catalog)
 }
 
 /// `OPENASR_CATALOG_FILE` env var name; paired with
@@ -1229,14 +1479,104 @@ pub fn resolve_runtime_catalog(
     }
 }
 
+/// Parse + validate a catalog document, tolerating forward-compatible data the
+/// wire format allows a future catalog epoch to carry:
+///
+/// - Any string in `languages` (no enum, never validated/filtered here) --
+///   an unrecognized recognition/dialect code just displays as its raw code.
+/// - An unrecognized `kind` / `license_class` / capability `role` / backend
+///   `vendor` / backend file `role`: the affected model or backend is hidden
+///   (dropped) rather than failing the whole parse -- see
+///   [`filter_forward_compatible_catalog`].
+/// - Any JSON object key this build's structs don't declare: `ModelCatalog`
+///   and `CatalogModel` carry no `#[serde(deny_unknown_fields)]`, so serde
+///   already ignores an unrecognized field.
+///
+/// Still fails closed (`Err`) for a genuinely broken/incompatible document:
+/// malformed JSON, a missing *required* field, an unsupported
+/// `schema_version`, or a structurally invalid entry that survives filtering
+/// (bad hex digest, URL not pinned to `hf_repo`/`hf_revision`, ...) --
+/// `validate_model_catalog` below is unchanged for those. See
+/// `docs/CATALOG_COMPATIBILITY.md` for the full contract and
+/// `registry::load_model_catalog` for how a caller that gets `Err` here
+/// degrades to a cached/embedded catalog instead of failing to start.
 pub fn parse_model_catalog(contents: &str, source: &str) -> Result<ModelCatalog, CatalogError> {
-    let catalog: ModelCatalog =
+    let mut catalog: ModelCatalog =
         serde_json::from_str(contents).map_err(|source_error| CatalogError::ParseCatalog {
             catalog_source: source.to_string(),
             source_error,
         })?;
+    for note in filter_forward_compatible_catalog(&mut catalog) {
+        eprintln!("openasr: {note}");
+    }
     validate_model_catalog(&catalog)?;
     Ok(catalog)
+}
+
+/// Drops catalog entries this build cannot safely interpret rather than
+/// failing the whole catalog parse over one entry from a newer catalog epoch:
+/// a model whose `kind`, `license_class`, or (for a `capability-pack`)
+/// capability `role` deserialized to the tolerant `Unknown` catch-all (see
+/// each enum's `#[serde(other)]` variant), or a backend pack whose `vendor`
+/// or any file's `role` did the same. `license_class` and capability `role`
+/// can gate what a client is allowed to show/download/stage, so "hide" (not
+/// "show with a guessed value") is the only safe degrade.
+///
+/// Returns one human-readable note per dropped entry for the caller to log;
+/// never panics. Deliberately does NOT touch `languages` -- a plain
+/// `Vec<String>`, any code (including one this build has no curated label
+/// for) is always tolerated and displayed as-is, no filtering needed. See
+/// `docs/CATALOG_COMPATIBILITY.md`.
+fn filter_forward_compatible_catalog(catalog: &mut ModelCatalog) -> Vec<String> {
+    let mut notes = Vec::new();
+    catalog.models.retain(|model| {
+        if model.kind == CatalogModelKind::Unknown {
+            notes.push(format!(
+                "catalog: hiding model '{}': unrecognized kind (needs a newer OpenASR build)",
+                model.id
+            ));
+            return false;
+        }
+        if model.license_class == LicenseClass::Unknown {
+            notes.push(format!(
+                "catalog: hiding model '{}': unrecognized license_class (needs a newer OpenASR build)",
+                model.id
+            ));
+            return false;
+        }
+        if let Some(capability) = &model.capability
+            && capability.role == CatalogCapabilityRole::Unknown
+        {
+            notes.push(format!(
+                "catalog: hiding model '{}': unrecognized capability role (needs a newer OpenASR build)",
+                model.id
+            ));
+            return false;
+        }
+        true
+    });
+    catalog.backends.retain(|backend| {
+        if backend.vendor == CatalogBackendVendor::Unknown {
+            notes.push(format!(
+                "catalog: hiding backend '{}': unrecognized vendor (needs a newer OpenASR build)",
+                backend.id
+            ));
+            return false;
+        }
+        if backend
+            .files
+            .iter()
+            .any(|file| file.role == CatalogBackendFileRole::Unknown)
+        {
+            notes.push(format!(
+                "catalog: hiding backend '{}': unrecognized file role (needs a newer OpenASR build)",
+                backend.id
+            ));
+            return false;
+        }
+        true
+    });
+    notes
 }
 
 pub fn resolve_catalog_pull(
@@ -1634,6 +1974,12 @@ fn read_and_verify_catalog_manifest(
     })
 }
 
+/// Degrade tier for [`load_model_catalog`]/[`load_local_catalog_file_with_identity`]
+/// once their primary source fails: tries the on-disk signed cache, then the
+/// embedded snapshot, recording [`catalog_security::record_catalog_degraded`]
+/// (with a clear stderr line) on whichever tier actually succeeds, so the
+/// daemon still starts instead of bricking on a bad primary source -- see
+/// `docs/CATALOG_COMPATIBILITY.md`'s "fallback chain" section.
 fn load_cached_signed_catalog(
     source: &str,
     home: &Path,
@@ -1641,7 +1987,15 @@ fn load_cached_signed_catalog(
     error: CatalogError,
 ) -> Result<ModelCatalog, CatalogError> {
     match load_signed_catalog_from_cache(source, home, cache_path, &error) {
-        Ok(catalog) => Ok(catalog),
+        Ok(catalog) => {
+            let reason = format!(
+                "using the on-disk cached catalog at '{}' because the primary source failed: {error}",
+                cache_path.display()
+            );
+            eprintln!("openasr: warning: {reason}");
+            catalog_security::record_catalog_degraded(home, "cache", &reason);
+            Ok(catalog)
+        }
         Err(cache_error) => {
             // Final tier: the signed catalog snapshot compiled into the binary, so
             // a fresh *offline* install with no network and no on-disk cache still
@@ -1651,6 +2005,11 @@ fn load_cached_signed_catalog(
             if source == DEFAULT_CATALOG_URL
                 && let Ok(catalog) = load_embedded_signed_catalog(home)
             {
+                let reason = format!(
+                    "using the embedded offline catalog because neither the primary source nor the on-disk cache were usable: {cache_error}"
+                );
+                eprintln!("openasr: warning: {reason}");
+                catalog_security::record_catalog_degraded(home, "embedded", &reason);
                 return Ok(catalog);
             }
             Err(cache_error)
@@ -1672,16 +2031,27 @@ fn load_signed_catalog_from_cache(
                 cache_path.display()
             ),
         })?;
-    read_and_verify_cached_catalog_manifest(source, home, &cached, error)?;
-    parse_model_catalog(&cached, &cache_path.display().to_string())
+    let verified = read_and_verify_cached_catalog_manifest(source, home, &cached, error)?;
+    parse_and_check_production_catalog(&cache_path.display().to_string(), &cached, &verified)
+        .map_err(|parse_error| CatalogError::CatalogSecurity {
+            catalog_source: source.to_string(),
+            message: format!("{error}; cached catalog rejected: {parse_error}"),
+        })
 }
 
 /// Load the signed catalog snapshot embedded in the binary at build time. Used as
 /// the last-resort offline fallback (after the network source and the on-disk
 /// cache) so a device that has never been online still sees the model list. The
-/// embedded bytes are signature-verified against the canonical [`DEFAULT_CATALOG_URL`]
-/// and run through the same epoch-rollback guard as any other source, so a stale
-/// snapshot can never downgrade a newer catalog the device already cached.
+/// embedded bytes are signature-verified against the canonical [`DEFAULT_CATALOG_URL`].
+///
+/// The embedded snapshot is a BOOT-LOCAL candidate (see
+/// [`catalog_security::enforce_boot_catalog_epoch_for_verified`]): if its
+/// epoch sits below this machine's recorded floor -- e.g. an older release
+/// reinstalled over a newer one -- it degrades (records
+/// [`catalog_security::record_catalog_degraded`], logs a warning) rather than
+/// failing closed, so this last-resort tier can never itself brick the
+/// daemon. Any OTHER verification failure (signature, structure) still fails
+/// closed.
 ///
 /// Also the CLI's network-free source for advertised model metadata (the
 /// `openasr show` language block and the `transcribe --language` pre-check): those
@@ -1697,12 +2067,23 @@ pub fn load_embedded_signed_catalog(home: &Path) -> Result<ModelCatalog, Catalog
         catalog_source: DEFAULT_CATALOG_URL.to_string(),
         message: format!("embedded catalog rejected: {error}"),
     })?;
-    catalog_security::enforce_catalog_epoch_for_verified(home, &verified).map_err(|error| {
-        CatalogError::CatalogSecurity {
-            catalog_source: DEFAULT_CATALOG_URL.to_string(),
-            message: format!("embedded catalog rejected: {error}"),
+    match catalog_security::enforce_boot_catalog_epoch_for_verified(home, &verified) {
+        Ok(catalog_security::BootEpochOutcome::Current) => {}
+        Ok(catalog_security::BootEpochOutcome::BelowFloor { floor }) => {
+            let reason = format!(
+                "embedded catalog epoch {} is below the epoch floor {floor} recorded on this machine; using it anyway as a degraded boot candidate rather than refusing to start (see docs/CATALOG_COMPATIBILITY.md)",
+                verified.catalog_epoch
+            );
+            eprintln!("openasr: warning: {reason}");
+            catalog_security::record_catalog_degraded(home, "embedded", &reason);
         }
-    })?;
+        Err(error) => {
+            return Err(CatalogError::CatalogSecurity {
+                catalog_source: DEFAULT_CATALOG_URL.to_string(),
+                message: format!("embedded catalog rejected: {error}"),
+            });
+        }
+    }
     parse_model_catalog(EMBEDDED_CATALOG_JSON, "<embedded catalog>")
 }
 
@@ -1726,12 +2107,19 @@ pub fn embedded_catalog_fingerprint() -> Result<(String, u64), CatalogError> {
     Ok((verified.catalog_sha256, verified.catalog_epoch))
 }
 
+/// Verifies the on-disk signed cache's manifest and returns the verified
+/// signature (so the caller can additionally run
+/// [`parse_and_check_production_catalog`]'s staged-entries guard). Kept
+/// STRICT on the epoch floor (unlike the boot-local candidates) -- the cache
+/// mirrors what a REMOTE fetch previously verified and recorded, the same
+/// trust tier a network source gets, not a locally-reinstalled build's own
+/// baked-in snapshot.
 fn read_and_verify_cached_catalog_manifest(
     source: &str,
     home: &Path,
     cached: &str,
     original_error: &CatalogError,
-) -> Result<(), CatalogError> {
+) -> Result<catalog_security::VerifiedCatalogSignature, CatalogError> {
     let manifest_path = catalog_security::default_catalog_signature_cache_path(home);
     let manifest_contents =
         fs::read_to_string(&manifest_path).map_err(|cache_error| CatalogError::ReadCatalog {
@@ -1752,7 +2140,8 @@ fn read_and_verify_cached_catalog_manifest(
             catalog_source: source.to_string(),
             message: format!("{original_error}; cached catalog rejected: {error}"),
         }
-    })
+    })?;
+    Ok(verified)
 }
 
 fn cache_catalog(home: &Path, cache_path: &Path, contents: &str) -> Result<(), CatalogError> {
@@ -1768,10 +2157,14 @@ fn cache_catalog(home: &Path, cache_path: &Path, contents: &str) -> Result<(), C
     })
 }
 
+/// `advance_epoch_floor` is `false` only for a boot-local candidate accepted
+/// below the recorded floor (see [`persist_catalog_cache`]'s doc comment) --
+/// every other caller passes `true`.
 fn cache_catalog_security(
     home: &Path,
     manifest_contents: &str,
     verified: &catalog_security::VerifiedCatalogSignature,
+    advance_epoch_floor: bool,
 ) -> Result<(), CatalogError> {
     catalog_security::cache_catalog_manifest(home, manifest_contents).map_err(|error| {
         CatalogError::CatalogSecurity {
@@ -1781,6 +2174,9 @@ fn cache_catalog_security(
             message: error.to_string(),
         }
     })?;
+    if !advance_epoch_floor {
+        return Ok(());
+    }
     // Gated by `participates_in_epoch_floor`: a local-dev-key-verified catalog
     // must never advance the shared production anti-rollback floor (see the
     // doc comment on that function for the persistent DoS this closes).
@@ -2019,6 +2415,17 @@ fn validate_catalog_backend(backend: &CatalogBackend) -> Result<(), CatalogError
                     )));
                 }
             }
+            // Unreachable in the normal `parse_model_catalog` pipeline:
+            // `filter_forward_compatible_catalog` drops a backend carrying an
+            // unrecognized file role before this validation runs. Kept as a
+            // typed error (not a panic) in case a future caller invokes this
+            // validation directly on an unfiltered catalog.
+            CatalogBackendFileRole::Unknown => {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "backend '{}' file '{}' has an unrecognized role",
+                    backend.id, file.filename
+                )));
+            }
         }
     }
     Ok(())
@@ -2055,6 +2462,15 @@ fn validate_catalog_model_kind(model: &CatalogModel) -> Result<(), CatalogError>
             )))
         }
         (CatalogModelKind::TranslationModel, None) => validate_translation_metadata(model),
+        // Unreachable in the normal `parse_model_catalog` pipeline:
+        // `filter_forward_compatible_catalog` drops a model with an
+        // unrecognized `kind` before this validation runs. Kept as a typed
+        // error (not a panic) in case a future caller invokes this
+        // validation directly on an unfiltered catalog.
+        (CatalogModelKind::Unknown, _) => Err(CatalogError::InvalidCatalog(format!(
+            "model '{}' has an unrecognized kind",
+            model.id
+        ))),
     }
 }
 

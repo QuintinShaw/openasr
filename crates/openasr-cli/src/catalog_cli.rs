@@ -6,7 +6,8 @@ use std::{
 use anyhow::{Context, Result};
 use openasr_core::{
     ModelCatalog, OPENASR_CATALOG_FILE_ENV_VAR, default_catalog_url,
-    load_local_catalog_file_with_identity, load_model_catalog, resolve_local_catalog_env_override,
+    load_local_catalog_file_with_identity, load_model_catalog,
+    preview_local_catalog_file_with_identity, resolve_local_catalog_env_override,
 };
 
 const OPENASR_CATALOG_URL: &str = "OPENASR_CATALOG_URL";
@@ -64,9 +65,16 @@ pub(super) fn load_cli_model_catalog(openasr_home: &Path) -> Result<Option<Model
             // uncommitted catalog edits with the dev key instead, use an
             // explicit `OPENASR_CATALOG_URL=file://<path>` override (which
             // goes through `load_model_catalog`, verified against that
-            // literal `file://` identity, not this one). See
-            // `load_local_catalog_file_with_identity`.
-            return load_local_catalog_file_with_identity(
+            // literal `file://` identity, not this one).
+            //
+            // Uses `preview_local_catalog_file_with_identity`, NOT
+            // `load_local_catalog_file_with_identity`: this repo file
+            // intentionally carries staged (unreleased) entries for local
+            // preview, and must never be cached into `$OPENASR_HOME`'s shared
+            // `catalog.json` -- that would contaminate the same cache a REAL
+            // installed OpenASR binary reads as its offline fallback with
+            // unreleased-model data (see `docs/CATALOG_COMPATIBILITY.md`).
+            return preview_local_catalog_file_with_identity(
                 &path,
                 default_catalog_url(),
                 openasr_home,

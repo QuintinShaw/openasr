@@ -57,4 +57,20 @@ idle_seconds: number,
  * watch for that condition. Reads `0` on the mock backend. Additive:
  * absent in the pre-0.1.15 contract.
  */
-abandoned_worker_count: number, };
+abandoned_worker_count: number, 
+/**
+ * `Some(reason)` when the model catalog most recently loaded on this
+ * machine came from a degraded tier (the on-disk signed cache, or the
+ * embedded offline snapshot) rather than a freshly verified primary
+ * source -- e.g. the primary catalog fetch/bundled resource failed, or a
+ * boot-local candidate's epoch sat below this machine's recorded
+ * anti-rollback floor. `reason` is the human-readable cause, for
+ * operator/shell diagnostics. `None` means either the last load used the
+ * primary source, or no catalog load has recorded a status yet (e.g. a
+ * backend that never touches the catalog). Best-effort: a stale/missing
+ * status file reads as `None`, never as an error -- see
+ * `openasr_core::read_catalog_degraded_status` and
+ * `docs/CATALOG_COMPATIBILITY.md`. Additive: absent in the pre-0.1.16
+ * contract.
+ */
+catalog_degraded: string | null, };
