@@ -441,7 +441,7 @@ where
         .reshape_4d(conv, frame_count, 1, d_model, 1)
         .map_err(|source| map_err("ggml_reshape_4d(conv_in_4d)", source))?;
     let mut conv = graph
-        .conv_2d_dw(dw_weight, conv_4d, 1, 1, (conv_kernel - 1) / 2, 0, 1, 1)
+        .depthwise_conv_2d(dw_weight, conv_4d, 1, 1, (conv_kernel - 1) / 2, 0, 1, 1)
         .map_err(|source| map_err("ggml_conv_2d_dw(conv_dw)", source))?;
     conv = graph
         .permute(conv, 1, 2, 0, 3)
@@ -972,7 +972,7 @@ where
         .reshape_4d(v_t, frame_count, 1, d_model, 1)
         .map_err(|source| map_err("ggml_reshape_4d(sanm_fsmn_in)", source))?;
     let mut fsmn = graph
-        .conv_2d_dw(dw_weight, v_4d, 1, 1, (config.fsmn_kernel - 1) / 2, 0, 1, 1)
+        .depthwise_conv_2d(dw_weight, v_4d, 1, 1, (config.fsmn_kernel - 1) / 2, 0, 1, 1)
         .map_err(|source| map_err("ggml_conv_2d_dw(sanm_fsmn)", source))?;
     fsmn = graph
         .permute(fsmn, 1, 2, 0, 3)

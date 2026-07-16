@@ -467,17 +467,6 @@ unsafe extern "C" {
         d0: c_int,
         d1: c_int,
     ) -> GgmlTensorRaw;
-    pub(crate) fn ggml_conv_2d_dw(
-        ctx: GgmlContextRaw,
-        a: GgmlTensorRaw,
-        b: GgmlTensorRaw,
-        s0: c_int,
-        s1: c_int,
-        p0: c_int,
-        p1: c_int,
-        d0: c_int,
-        d1: c_int,
-    ) -> GgmlTensorRaw;
     pub(crate) fn ggml_conv_2d_dw_direct(
         ctx: GgmlContextRaw,
         a: GgmlTensorRaw,
