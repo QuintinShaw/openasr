@@ -8,6 +8,7 @@
 
 use std::time::Instant;
 
+use crate::ggml_runtime::install_request_backend_override;
 use crate::models::ctc_greedy_decode::CtcGreedyDecodeResult;
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrPreparedAudio,
@@ -74,6 +75,14 @@ where
     let partial_executor = executor.clone();
     let partial_transcribe = Box::new(move |audio: &GgmlAsrPreparedAudio| {
         let _thread_override = install_request_inference_threads_override(inference_threads);
+        // Same as the seq2seq incremental driver: this closure calls the
+        // per-family decode fn directly instead of going through
+        // GgmlAsrExecutionDispatch::execute, so the request's
+        // backend_preference must be installed here or an explicit
+        // CpuOnly/Accelerated choice is silently dropped for streaming
+        // partials.
+        let _backend_override =
+            install_request_backend_override(backend_preference.request_backend_override());
         partial_decode(&partial_executor, &make_request(audio))
     });
 
@@ -93,6 +102,8 @@ where
     };
     let final_transcribe = Box::new(move |audio: &GgmlAsrPreparedAudio| {
         let _thread_override = install_request_inference_threads_override(inference_threads);
+        let _backend_override =
+            install_request_backend_override(backend_preference.request_backend_override());
         final_decode(&final_executor, &make_final_request(audio)).map(|result| result.transcription)
     });
 
@@ -303,6 +314,8 @@ impl GgmlAsrStreamingTranscriptDriver for CtcWindowedStreamingTranscriptDriver {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use crate::{RealtimeAudioFormat, RealtimeAudioFrame};
 
@@ -394,5 +407,99 @@ mod tests {
             }
             other => panic!("expected final, got {other:?}"),
         }
+    }
+
+    /// Regression test for the same streaming backend-override bypass fixed
+    /// in `incremental_streaming_driver.rs`: `build_ctc_streaming_driver`'s
+    /// `partial_transcribe`/`final_transcribe` closures call the family's
+    /// decode fns directly, not through `GgmlAsrExecutionDispatch::execute`,
+    /// so they must install `request.backend_preference` themselves or an
+    /// explicit choice is silently dropped for CTC (parakeet/wav2vec2)
+    /// streaming.
+    #[test]
+    fn ctc_streaming_closures_install_request_backend_override() {
+        use crate::ggml_runtime::{
+            GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference,
+        };
+        use std::path::PathBuf;
+
+        fn session_request(
+            backend_preference: crate::GgmlAsrBackendPreference,
+        ) -> GgmlAsrStreamingSessionRequest {
+            GgmlAsrStreamingSessionRequest {
+                runtime_source_path: PathBuf::from("/tmp/openasr-missing-runtime.gguf"),
+                runtime_source_preflight: None,
+                selected_family: crate::wav2vec2_ctc_runtime_descriptor_v1(),
+                request_options: crate::GgmlAsrExecutionOptions::default(),
+                configured_diarize: false,
+                backend_preference,
+                session_context: crate::NativeAsrSessionContext::new(
+                    "rt_ctc_backend_override_test",
+                ),
+                session_config: crate::NativeAsrStreamingSessionConfig::new()
+                    .with_partial_results(true)
+                    .into(),
+            }
+        }
+
+        // Drives one warm-up partial decode through the real
+        // `build_ctc_streaming_driver` closure and records what the decode
+        // fn observed via the thread-local override, plus what a gated
+        // family's `resolve_family_runtime_backend` would resolve to at that
+        // instant.
+        fn observed_backend_during_partial_decode(
+            backend_preference: crate::GgmlAsrBackendPreference,
+        ) -> (Option<RequestBackendPreference>, GgmlCpuGraphBackend) {
+            let request = session_request(backend_preference);
+            let observed: Arc<
+                Mutex<Option<(Option<RequestBackendPreference>, GgmlCpuGraphBackend)>>,
+            > = Arc::new(Mutex::new(None));
+            let observed_for_decode = Arc::clone(&observed);
+            let mut driver = build_ctc_streaming_driver(
+                (),
+                "ctc-backend-override-test-executor",
+                crate::WAV2VEC2_CTC_GGML_ADAPTER_ID,
+                &request,
+                crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT,
+                move |_executor: &(), _request: &GgmlAsrExecutionRequest| {
+                    *observed_for_decode.lock().unwrap() = Some((
+                        crate::ggml_runtime::request_backend_override(),
+                        GgmlCpuGraphConfig::resolve_family_runtime_backend(false),
+                    ));
+                    Ok(ctc_result("", 0))
+                },
+                move |_executor: &(), _request: &GgmlAsrExecutionRequest| {
+                    Ok(GgmlAsrExecutionResult {
+                        transcription: Transcription {
+                            text: String::new(),
+                            segments: Vec::new(),
+                            longform: None,
+                            language: None,
+                        },
+                        carry_context: None,
+                    })
+                },
+            );
+            driver.warm_up().expect("warm up should decode once");
+            observed
+                .lock()
+                .unwrap()
+                .take()
+                .expect("partial decode closure should have run")
+        }
+
+        // Auto: no override installed, so a gated family stays pinned to CPU.
+        let (auto_override, auto_backend) =
+            observed_backend_during_partial_decode(crate::GgmlAsrBackendPreference::Auto);
+        assert_eq!(auto_override, None);
+        assert_eq!(auto_backend, GgmlCpuGraphBackend::Cpu);
+
+        // Explicit Accelerated: the partial_transcribe closure must install
+        // the override itself, so a gated family's resolver sees Accelerated
+        // instead of silently falling back to CPU.
+        let (accel_override, accel_backend) =
+            observed_backend_during_partial_decode(crate::GgmlAsrBackendPreference::Accelerated);
+        assert_eq!(accel_override, Some(RequestBackendPreference::Accelerated));
+        assert_ne!(accel_backend, GgmlCpuGraphBackend::Cpu);
     }
 }
