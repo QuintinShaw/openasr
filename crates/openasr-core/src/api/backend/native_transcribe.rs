@@ -2037,19 +2037,19 @@ mod tests {
 
     #[test]
     fn family_auto_gpu_enabled_lookup_matches_dolphin_and_xasr_gates() {
-        // Regression pin for the two builtin families whose Auto default is
-        // gated to CPU (see `auto_gpu_enabled`'s doc comment); every other
-        // builtin lets Auto pick GPU automatically.
-        assert!(
-            !crate::arch::family_auto_gpu_enabled_for_model_architecture(
-                crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID
-            )
-        );
+        // Regression pin: xasr-zipformer is the one builtin family whose Auto
+        // default is still gated to CPU (see `auto_gpu_enabled`'s doc comment);
+        // every other builtin -- dolphin now included, after its encoder + CTC
+        // head weights moved into a Metal-offloadable arena and Metal beat CPU
+        // -- lets Auto pick GPU automatically.
         assert!(
             !crate::arch::family_auto_gpu_enabled_for_model_architecture(
                 crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID
             )
         );
+        assert!(crate::arch::family_auto_gpu_enabled_for_model_architecture(
+            crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID
+        ));
         assert!(crate::arch::family_auto_gpu_enabled_for_model_architecture(
             crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID
         ));
@@ -2061,20 +2061,20 @@ mod tests {
         ));
     }
 
-    /// Regression for the dolphin-plus-Auto provenance mislabel: the
+    /// Regression for the gated-family-plus-Auto provenance mislabel: the
     /// `core.native.backend` label must resolve through the same
     /// family-aware gate the family's own executor used
     /// (`GgmlCpuGraphConfig::resolve_family_runtime_backend`), not recompute
     /// generically. Before this fix, `native_runtime_backend_label` called
     /// `GgmlCpuGraphConfig::resolve_runtime_backend()` directly, which on a
-    /// host with a GPU device reports "metal" for an Auto dolphin request
-    /// that in fact ran entirely on CPU (dolphin pins Auto to CPU; see
-    /// `dolphin::executor::dolphin_runtime_backend`).
+    /// host with a GPU device reports "metal" for an Auto request from a
+    /// CPU-gated family (xasr-zipformer today) that in fact ran entirely on
+    /// CPU; see `xasr_zipformer::graph_config::encoder_gpu_enabled`.
     #[test]
     fn native_runtime_backend_label_reflects_family_auto_gate_not_generic_resolver() {
         use crate::ggml_runtime::{RequestBackendPreference, install_request_backend_override};
 
-        // Auto, family gate disabled (dolphin/xasr-zipformer shape): must
+        // Auto, family gate disabled (xasr-zipformer shape): must
         // report "cpu" regardless of what the generic resolver would pick.
         assert_eq!(native_runtime_backend_label(false), "cpu");
 

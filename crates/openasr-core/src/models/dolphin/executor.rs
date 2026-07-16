@@ -211,28 +211,29 @@ pub(crate) struct DolphinPipelineOutput {
     pub resolved_language: String,
 }
 
-/// Resolve the ggml backend for a Dolphin request. Fail-closed to the golden,
-/// parity-validated CPU path; a GPU backend engages only when the request
-/// explicitly asks for accelerated execution (`--execution-target accelerated`,
-/// which the bench-suite maps `OPENASR_GGML_BACKEND=metal` onto), never on the
-/// Auto default. Mirrors the xasr encoder policy so what runs is what was asked
-/// for, with no silent downgrade.
+/// Resolve the ggml backend for a Dolphin request. Auto prefers the
+/// accelerator: on a GPU-capable host (Metal on Apple Silicon) the Auto default
+/// resolves to that accelerator, and only fails closed to the golden,
+/// parity-validated CPU path when no accelerator is present. An explicit
+/// `--execution-target cpu` always wins (the gate only ever pins Auto, never
+/// overrides an explicit preference).
 ///
-/// Perf note (AB-measured on M1, best-of-5, 2.38 s Sichuan clip; see
-/// `perf/PERFORMANCE.md`): unlike xasr's chunked encoder -- where every Metal
-/// config loses to CPU -- this 0.4B E-Branchformer is wide enough per step that
-/// Metal is ~1.45x FASTER (RTF 0.47 vs CPU 0.68, warm) at comparable peak RSS,
-/// and reproduces the golden transcript on the clip. Metal stays an opt-in rather
-/// than the default only because its fp16 numerics are not golden-validated
-/// (the parity gate is CPU bit-exact); it is the recommended accelerated path.
+/// Perf note (AB-measured on M1, warm best-of-N, isolated host; see the
+/// `encoder_graph`/`joint_decode` static-arena change): with the E-Branchformer
+/// encoder + CTC head weights resident in a WEIGHTS-usage arena, the ggml
+/// scheduler offloads the whole encoder to Metal (previously it pinned the
+/// ~1348-op encoder to the CPU, a net GPU loss). Metal then beats CPU on both a
+/// 3 s and an 18 s clip (RTF 0.126 vs 0.174, and 0.081 vs 0.103) and reproduces
+/// the golden transcript. CPU stays the bit-exact parity reference, so it
+/// remains the honest fallback where no accelerator exists.
 ///
 /// Delegates to the shared `resolve_family_runtime_backend` gate (declared via
-/// this architecture's `auto_gpu_enabled = false`, see `arch::mod` /
+/// this architecture's `auto_gpu_enabled = true`, see `arch::mod` /
 /// `BUILTIN_ARCHITECTURE_DESCRIPTORS`) rather than hand-rolling the override
 /// check, so any provenance label resolving through the same gate can never
 /// drift from what this function actually decided.
 fn dolphin_runtime_backend() -> GgmlCpuGraphBackend {
-    GgmlCpuGraphConfig::resolve_family_runtime_backend(false)
+    GgmlCpuGraphConfig::resolve_family_runtime_backend(true)
 }
 
 /// Runtime weights for one pack, shared behind an `Arc` so the process-level pool
