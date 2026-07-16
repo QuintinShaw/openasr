@@ -199,6 +199,54 @@ class MetadataTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# tokenizer baking (vocab.json + merges.txt + added_tokens_decoder)
+# ---------------------------------------------------------------------------
+
+class TokenizerLoadTest(unittest.TestCase):
+    def _write_tokenizer_fixture(self, root: Path):
+        (root / "vocab.json").write_text(json.dumps({"a": 0, "b": 1, "ab": 2}))
+        (root / "merges.txt").write_text("#version: fake\na b\n")
+        (root / "tokenizer_config.json").write_text(json.dumps({
+            "added_tokens_decoder": {
+                "3": {"content": "<|endoftext|>"},
+                "5": {"content": "<|im_start|>"},
+            }
+        }))
+
+    def test_load_vocab_tokens_orders_by_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._write_tokenizer_fixture(root)
+            tokens = C.load_vocab_tokens(root)
+            self.assertEqual(tokens, ["a", "b", "ab"])
+
+    def test_load_merges_strips_comments_and_blank_lines(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._write_tokenizer_fixture(root)
+            self.assertEqual(C.load_merges(root), ["a b"])
+
+    def test_patch_added_tokens_extends_and_fills_gap(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._write_tokenizer_fixture(root)
+            tokens = C.patch_added_tokens(root, ["a", "b", "ab"])
+            # id 3 (<|endoftext|>) and id 5 (<|im_start|>) patched in; id 4
+            # (the gap) becomes an empty placeholder.
+            self.assertEqual(tokens, ["a", "b", "ab", "<|endoftext|>", "", "<|im_start|>"])
+
+    def test_load_tokenizer_pads_to_vocab_size(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._write_tokenizer_fixture(root)
+            tokens, merges = C.load_tokenizer(root, vocab_size=10)
+            self.assertEqual(len(tokens), 10)
+            self.assertEqual(tokens[:6], ["a", "b", "ab", "<|endoftext|>", "", "<|im_start|>"])
+            self.assertEqual(tokens[6:], [""] * 4)
+            self.assertEqual(merges, ["a b"])
+
+
+# ---------------------------------------------------------------------------
 # full tiny synthetic round-trip
 # ---------------------------------------------------------------------------
 
@@ -326,6 +374,25 @@ def _write_tiny_sources(root: Path):
     tok["decoder.layer_norm.weight"] = r(D)
     tok["decoder.layers.0.fc1.weight"] = r(EFF, D)
     save_file(tok, str(tok_dir / "model.safetensors"))
+
+    # Tiny tokenizer fixture (vocab_size=32 to match main_cfg above): a
+    # handful of real vocab entries plus the ChatML/audio special tokens
+    # patched in via added_tokens_decoder, padded to 32 by load_tokenizer.
+    (main_dir / "vocab.json").write_text(json.dumps({
+        "a": 0, "b": 1, "ab": 2, "user": 3, "assistant": 4,
+    }))
+    (main_dir / "merges.txt").write_text("#version\na b\n")
+    (main_dir / "tokenizer_config.json").write_text(json.dumps({
+        "added_tokens_decoder": {
+            "5": {"content": "<|endoftext|>"},
+            "6": {"content": "<|im_start|>"},
+            "7": {"content": "<|im_end|>"},
+            "17": {"content": "<|sosp|>"},
+            "18": {"content": "<|eosp|>"},
+            "19": {"content": "<|empty|>"},
+        }
+    }))
+
     return main_dir, tok_dir / "model.safetensors", main, tok
 
 
@@ -406,6 +473,15 @@ class RoundTripTest(unittest.TestCase):
             self.assertIn(f"audiotok.blk.{skip_id - 1}.ffn_norm.weight", names)
             self.assertIn(f"audiotok.blk.{block_count - 1}.ffn_norm.weight", names)
 
+            # tokenizer baked from the tiny vocab.json/merges.txt/tokenizer_config.json fixture
+            self.assertEqual(_kv_str(reader, "tokenizer.ggml.model"), "gpt2")
+            tokens = _kv_str_array(reader, "tokenizer.ggml.tokens")
+            self.assertEqual(len(tokens), 32)  # padded to main_cfg's vocab_size
+            self.assertEqual(tokens[:8], ["a", "b", "ab", "user", "assistant",
+                                           "<|endoftext|>", "<|im_start|>", "<|im_end|>"])
+            self.assertEqual(tokens[17:20], ["<|sosp|>", "<|eosp|>", "<|empty|>"])
+            self.assertEqual(_kv_str_array(reader, "tokenizer.ggml.merges"), ["a b"])
+
     def test_fp16_pack_has_no_quantized_tensors(self):
         import gguf
 
@@ -429,6 +505,21 @@ def _tensor_data(reader, name):
 def _kv_u32(reader, key):
     field = reader.get_field(key)
     return int(field.parts[field.data[-1]][0])
+
+
+def _kv_str(reader, key):
+    field = reader.get_field(key)
+    part = field.parts[field.data[-1]]
+    return bytes(part).decode("utf-8") if not isinstance(part, str) else part
+
+
+def _kv_str_array(reader, key):
+    field = reader.get_field(key)
+    out = []
+    for idx in field.data:
+        part = field.parts[idx]
+        out.append(bytes(part).decode("utf-8") if not isinstance(part, str) else part)
+    return out
 
 
 if __name__ == "__main__":

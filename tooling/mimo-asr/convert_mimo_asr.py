@@ -405,6 +405,8 @@ def build_metadata(
     tok: TokHParams,
     model_id: str,
     quant_label: str,
+    tokens: Optional[list[str]] = None,
+    merges: Optional[list[str]] = None,
 ) -> list[MetaItem]:
     m: list[MetaItem] = []
 
@@ -413,6 +415,7 @@ def build_metadata(
     def f(k, v): m.append(MetaItem(k, "f32", float(v)))
     def b(k, v): m.append(MetaItem(k, "bool", bool(v)))
     def ua(k, v): m.append(MetaItem(k, "u32_array", [int(x) for x in v]))
+    def sa(k, v): m.append(MetaItem(k, "str_array", list(v)))
 
     # openasr envelope
     s("openasr.package.version", PACKAGE_VERSION)
@@ -422,6 +425,16 @@ def build_metadata(
     s("openasr.audio.frontend", AUDIO_FRONTEND)
     s("openasr.decode.policy", DECODE_POLICY)
     s("openasr.pack.quant", quant_label)
+
+    # tokenizer (gpt2-style byte-level BPE, the official Qwen2 vocab this
+    # checkpoint fine-tunes on top of -- P2.1 originally shipped this pack
+    # without a baked tokenizer; the P2.2 runtime needs it to build the
+    # ChatML/<|sosp|>/<|eosp|> prompt and decode generated tokens back to
+    # text). Mirrors firered-llm's package_import tokenizer-baking keys.
+    if tokens is not None and merges is not None:
+        s("tokenizer.ggml.model", "gpt2")
+        sa("tokenizer.ggml.tokens", tokens)
+        sa("tokenizer.ggml.merges", merges)
 
     # backbone (36L Qwen2, GQA, qkv-bias, no qk-norm)
     u("mimo.llm.block_count", main.num_hidden_layers)
@@ -534,6 +547,61 @@ def mel_filters_and_window(tok: TokHParams) -> tuple[np.ndarray, np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
+# tokenizer (vocab.json + merges.txt + added tokens -- gpt2-style byte-level
+# BPE, the official Qwen2 tokenizer this checkpoint reuses verbatim plus its
+# own extra special tokens). Mirrors firered_llm::package_import's
+# load_vocab_tokens / load_merges / patch_added_tokens (Rust) one-for-one.
+# ---------------------------------------------------------------------------
+
+def load_vocab_tokens(main_dir: Path) -> list[str]:
+    vocab_path = main_dir / "vocab.json"
+    vocab: dict[str, int] = json.loads(vocab_path.read_text(encoding="utf-8"))
+    if not vocab:
+        raise ConversionError(f"{vocab_path} is empty")
+    max_id = max(vocab.values())
+    tokens = [""] * (max_id + 1)
+    for token, token_id in vocab.items():
+        tokens[token_id] = token
+    return tokens
+
+
+def load_merges(main_dir: Path) -> list[str]:
+    merges_path = main_dir / "merges.txt"
+    if not merges_path.exists():
+        return []
+    lines = merges_path.read_text(encoding="utf-8").splitlines()
+    return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+
+
+def patch_added_tokens(main_dir: Path, tokens: list[str]) -> list[str]:
+    cfg_path = main_dir / "tokenizer_config.json"
+    if not cfg_path.exists():
+        return tokens
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    added = cfg.get("added_tokens_decoder", {})
+    tokens = list(tokens)
+    for token_id_str, entry in added.items():
+        token_id = int(token_id_str)
+        if token_id >= len(tokens):
+            tokens.extend([""] * (token_id + 1 - len(tokens)))
+        tokens[token_id] = entry["content"]
+    return tokens
+
+
+def load_tokenizer(main_dir: Path, vocab_size: int) -> tuple[list[str], list[str]]:
+    """Load+patch the full tokenizer vocab (padded up to ``vocab_size`` with
+    empty placeholder entries for the small tail of reserved-but-unused ids
+    the official Qwen2 tokenizer pads to alignment, matching
+    firered_llm::package_import's `if tokens.len() < vocab_size { resize }`)."""
+    tokens = load_vocab_tokens(main_dir)
+    tokens = patch_added_tokens(main_dir, tokens)
+    if len(tokens) < vocab_size:
+        tokens.extend([""] * (vocab_size - len(tokens)))
+    merges = load_merges(main_dir)
+    return tokens, merges
+
+
+# ---------------------------------------------------------------------------
 # source iteration (streaming, one tensor at a time)
 # ---------------------------------------------------------------------------
 
@@ -598,8 +666,21 @@ def write_pack(
     main = MainHParams.from_config(main_cfg)
     tok = TokHParams.from_config(tok_cfg)
 
+    tokens: Optional[list[str]] = None
+    merges: Optional[list[str]] = None
+    if (main_dir / "vocab.json").exists():
+        tokens, merges = load_tokenizer(main_dir, main.vocab_size)
+        if verbose:
+            print(f"[tokenizer] {len(tokens)} tokens, {len(merges)} merges", flush=True)
+    elif verbose:
+        print(
+            f"[tokenizer] no vocab.json under {main_dir}, skipping tokenizer.ggml.* bake "
+            "(pack will not be runnable by the P2.2 executor)",
+            flush=True,
+        )
+
     writer = gguf.GGUFWriter(str(out_path), ARCH, use_temp_file=True)
-    apply_metadata(writer, build_metadata(main, tok, model_id, quant_label))
+    apply_metadata(writer, build_metadata(main, tok, model_id, quant_label, tokens, merges))
 
     type_counts = {"q8_0": 0, "f16": 0, "f32": 0}
     seen: set[str] = set()

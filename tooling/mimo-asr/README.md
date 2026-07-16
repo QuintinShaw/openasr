@@ -24,6 +24,13 @@ python3 convert_mimo_asr.py \
 
 `--quant q8_0` / `--quant fp16` selects a subset (default: both).
 
+If `--main-dir` contains `vocab.json` + `merges.txt` (+ optionally
+`tokenizer_config.json`'s `added_tokens_decoder`), the converter bakes
+`tokenizer.ggml.{model,tokens,merges}` (gpt2-style byte-level BPE) into the
+pack -- required for the P2.2 runtime to build the ChatML/`<|sosp|>`/`<|eosp|>`
+prompt and decode generated tokens. Missing these files only skips the bake
+(with a warning); a pack built without them is not runnable by the executor.
+
 ## Tensor layout & metadata
 
 See `GGUF_MANIFEST.md` for the full tensor-name list, ggml shapes, per-tensor
