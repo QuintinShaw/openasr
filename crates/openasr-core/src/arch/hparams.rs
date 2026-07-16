@@ -211,6 +211,38 @@ pub(crate) static FIRERED_AED_HPARAM_SCHEMA: &[&str] = &[
     "firered.pad_token_id",
 ];
 
+// ── firered-llm (FireRedTeam/FireRedASR2-LLM, Conformer+Adapter+Qwen2) ───────
+// Keys mirror `models::firered_llm::runtime_contract`'s three parsers
+// (encoder subset reuses firered-aed's own `firered.encoder.*` schema -- see
+// that module's doc comment for why the full firered-aed schema above is NOT
+// reused as-is: this family has no AED decoder branch).
+pub(crate) static FIRERED_LLM_HPARAM_SCHEMA: &[&str] = &[
+    "firered.encoder.n_layers",
+    "firered.encoder.d_model",
+    "firered.encoder.n_heads",
+    "firered.encoder.head_dim",
+    "firered.encoder.ffn_dim",
+    "firered.encoder.conv_kernel",
+    "firered.encoder.subsample_channels",
+    "firered.encoder.subsample_out_dim",
+    "firered.encoder.feature_dim",
+    "firered.encoder.pe_len",
+    "firered_llm.adapter.downsample_rate",
+    "firered_llm.adapter.llm_dim",
+    "firered_llm.llm.n_layers",
+    "firered_llm.llm.d_model",
+    "firered_llm.llm.n_heads",
+    "firered_llm.llm.n_kv_heads",
+    "firered_llm.llm.head_dim",
+    "firered_llm.llm.ffn_dim",
+    "firered_llm.llm.vocab_size",
+    "firered_llm.llm.max_positions",
+    "firered_llm.llm.chatml_im_start_token_id",
+    "firered_llm.llm.chatml_im_end_token_id",
+    "firered_llm.llm.endoftext_token_id",
+    "firered_llm.llm.speech_token_id",
+];
+
 // ── wav2vec2-ctc (facebook/wav2vec2-base-960h) hparam schema ─────────────────
 pub(crate) static WAV2VEC2_CTC_HPARAM_SCHEMA: &[&str] = &[
     "wav2vec2.n_layers",

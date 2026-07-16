@@ -20,8 +20,14 @@
 //!   decode-policy registration do not exist yet -- a pack produced by this
 //!   importer is not yet runnable by `openasr transcribe`.
 
+mod adapter_graph;
+mod decode_prompt;
+pub(crate) mod executor;
+mod llm_transformer;
 pub mod package_import;
+pub(crate) mod runtime_contract;
 pub(crate) mod tensor_names;
+mod tokenizer;
 
 pub use package_import::{
     FireRedLlmImportRequest, FireRedLlmImportResult, FireRedLlmQuantizationMode,

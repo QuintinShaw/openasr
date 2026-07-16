@@ -107,29 +107,45 @@ pub(crate) fn load_qwen3_token_embedding_table_from_reader(
     reader: &GgufTensorDataReader,
     metadata: Qwen3AsrExecutionMetadata,
 ) -> Result<Qwen3AsrTokenEmbeddingTable, Qwen3AsrTokenEmbeddingError> {
-    let tensor = reader
-        .tensor_index()
-        .get(TOKEN_EMBEDDING_TENSOR_NAME)
-        .ok_or_else(|| Qwen3AsrTokenEmbeddingError::InvalidTensorShape {
-            tensor_name: TOKEN_EMBEDDING_TENSOR_NAME,
+    load_token_embedding_table_from_reader_with_tensor_name(
+        reader,
+        TOKEN_EMBEDDING_TENSOR_NAME,
+        metadata.llm_d_model,
+        metadata.vocab_size,
+    )
+}
+
+/// Like [`load_qwen3_token_embedding_table_from_reader`] but decoupled from
+/// `Qwen3AsrExecutionMetadata` and qwen's own tensor name, so a sibling
+/// family (e.g. firered-llm's `llm.tok_emb.weight`) can reuse the same
+/// row-gather table -- looking up embedding rows by token id has no
+/// Qwen2/Qwen3-specific shape.
+pub(crate) fn load_token_embedding_table_from_reader_with_tensor_name(
+    reader: &GgufTensorDataReader,
+    tensor_name: &'static str,
+    d_model: usize,
+    vocab_size: usize,
+) -> Result<Qwen3AsrTokenEmbeddingTable, Qwen3AsrTokenEmbeddingError> {
+    let tensor = reader.tensor_index().get(tensor_name).ok_or_else(|| {
+        Qwen3AsrTokenEmbeddingError::InvalidTensorShape {
+            tensor_name,
             shape: "[]".to_string(),
             reason: "tensor is missing from GGUF tensor index".to_string(),
-        })?;
+        }
+    })?;
     let dims = tensor.dims.clone();
     if dims.len() != 2 {
         return Err(Qwen3AsrTokenEmbeddingError::InvalidTensorShape {
-            tensor_name: TOKEN_EMBEDDING_TENSOR_NAME,
+            tensor_name,
             shape: render_shape(&dims),
             reason: "expected rank-2 matrix".to_string(),
         });
     }
-    let d_model = metadata.llm_d_model;
-    let vocab_size = metadata.vocab_size;
     let output_major_vocab_layout = dims[0] == d_model as u64 && dims[1] == vocab_size as u64;
     let input_major_hidden_layout = dims[0] == vocab_size as u64 && dims[1] == d_model as u64;
     if !output_major_vocab_layout && !input_major_hidden_layout {
         return Err(Qwen3AsrTokenEmbeddingError::InvalidTensorShape {
-            tensor_name: TOKEN_EMBEDDING_TENSOR_NAME,
+            tensor_name,
             shape: render_shape(&dims),
             reason: format!("expected [{d_model} x {vocab_size}] or [{vocab_size} x {d_model}]"),
         });
@@ -137,7 +153,7 @@ pub(crate) fn load_qwen3_token_embedding_table_from_reader(
 
     let storage = if tensor.ggml_type == GGML_TYPE_F16 {
         let values = reader
-            .host_tensor_f16_bits_copy_by_name(TOKEN_EMBEDDING_TENSOR_NAME, &dims)
+            .host_tensor_f16_bits_copy_by_name(tensor_name, &dims)
             .map_err(map_tensor_read_error)?;
         if output_major_vocab_layout {
             TokenEmbeddingStorage::F16Token(values)
@@ -146,7 +162,7 @@ pub(crate) fn load_qwen3_token_embedding_table_from_reader(
         }
     } else {
         let values = reader
-            .host_tensor_f32_copy_dequantized_by_name(TOKEN_EMBEDDING_TENSOR_NAME, &dims)
+            .host_tensor_f32_copy_dequantized_by_name(tensor_name, &dims)
             .map_err(map_tensor_read_error)?;
         if values.iter().any(|value| !value.is_finite()) {
             return Err(Qwen3AsrTokenEmbeddingError::NonFiniteValues);

@@ -1004,15 +1004,29 @@ pub(crate) struct LlmLoraSlot<'a> {
 }
 
 /// Per-block graph weights, submodule order: attn-norm → fused-or-split QKV →
-/// q/k-norm → out-proj → ffn-norm → gate/up/down. `qkv_weight` present ⇒ fused
-/// path (single `mul_mat` + `view_2d` split); absent ⇒ three separate `mul_mat`.
-/// The fused-vs-split decision is already resolved (fail-closed) by the caller.
+/// (optional bias) → (optional q/k-norm) → out-proj → ffn-norm → gate/up/down.
+/// `qkv_weight` present ⇒ fused path (single `mul_mat` + `view_2d` split);
+/// absent ⇒ three separate `mul_mat`. The fused-vs-split decision is already
+/// resolved (fail-closed) by the caller.
 ///
 /// LoRA slots are optional and default to `None`. When ANY of `q_lora`,
 /// `k_lora`, `v_lora` is `Some`, the QKV projection uses the SPLIT path
 /// regardless of `qkv_weight`, so each projection can be individually adapted.
 /// Consumers that leave all slots `None` produce a byte-identical graph to the
 /// pre-LoRA code path.
+///
+/// `q_norm_weight`/`k_norm_weight` are `Option` because not every decoder-only
+/// LLM family applies QK-norm (Qwen3 does; Qwen2 does not) -- `None` skips the
+/// RMS-norm step entirely rather than normalizing against a substitute weight.
+/// `q_bias`/`k_bias`/`v_bias` are `Option` for the mirror-image reason (Qwen2
+/// has per-projection attention biases; Qwen3 does not). A bias is only ever
+/// applied against the SPLIT-path (non-fused) q/k/v projection output, so a
+/// consumer that wants bias support must also leave `qkv_weight` `None`
+/// (matching the LoRA convention above) -- this keeps every bias-add operating
+/// on a contiguous `mul_mat` output, never a strided fused-QKV view. Consumers
+/// that leave `q_norm_weight`/`k_norm_weight` `Some` and every bias `None`
+/// (Qwen3's shape) produce a byte-identical graph to the pre-parameterization
+/// code path.
 #[derive(Clone, Copy)]
 pub(crate) struct LlmLayerWeights<'a> {
     pub attn_norm_weight: GgmlCpuTensor<'a>,
@@ -1020,8 +1034,11 @@ pub(crate) struct LlmLayerWeights<'a> {
     pub q_weight: GgmlCpuTensor<'a>,
     pub k_weight: GgmlCpuTensor<'a>,
     pub v_weight: GgmlCpuTensor<'a>,
-    pub q_norm_weight: GgmlCpuTensor<'a>,
-    pub k_norm_weight: GgmlCpuTensor<'a>,
+    pub q_bias: Option<GgmlCpuTensor<'a>>,
+    pub k_bias: Option<GgmlCpuTensor<'a>>,
+    pub v_bias: Option<GgmlCpuTensor<'a>>,
+    pub q_norm_weight: Option<GgmlCpuTensor<'a>>,
+    pub k_norm_weight: Option<GgmlCpuTensor<'a>>,
     pub output_weight: GgmlCpuTensor<'a>,
     pub ffn_norm_weight: GgmlCpuTensor<'a>,
     pub ffn_gate_weight: GgmlCpuTensor<'a>,
@@ -1492,6 +1509,16 @@ where
         RMS_NORM_STEPS,
         map_err,
     )?;
+    let any_qkv_bias =
+        weights.q_bias.is_some() || weights.k_bias.is_some() || weights.v_bias.is_some();
+    if any_qkv_bias && weights.qkv_weight.is_some() {
+        return Err(map_err(
+            "llm_qkv_bias_requires_split_path",
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "qkv bias requires the split (non-fused) QKV projection path",
+            },
+        ));
+    }
     let (q, k, v) = build_projected_qkv(
         graph,
         normed,
@@ -1508,6 +1535,24 @@ where
         output_tokens,
         map_err,
     )?;
+    let q = match weights.q_bias {
+        Some(bias) => graph
+            .add(q, bias)
+            .map_err(|source| map_err("llm_q_bias_add", source))?,
+        None => q,
+    };
+    let k = match weights.k_bias {
+        Some(bias) => graph
+            .add(k, bias)
+            .map_err(|source| map_err("llm_k_bias_add", source))?,
+        None => k,
+    };
+    let v = match weights.v_bias {
+        Some(bias) => graph
+            .add(v, bias)
+            .map_err(|source| map_err("llm_v_bias_add", source))?,
+        None => v,
+    };
     let q = graph
         .reshape_3d(q, head_dim, config.q_heads, output_tokens)
         .map_err(|source| map_err("llm_q_reshape3d", source))?;
@@ -1517,22 +1562,28 @@ where
     let v = graph
         .reshape_3d(v, head_dim, config.kv_heads, output_tokens)
         .map_err(|source| map_err("llm_v_reshape3d", source))?;
-    let q = apply_rms_norm(
-        graph,
-        q,
-        config.rms_norm_epsilon,
-        weights.q_norm_weight,
-        RMS_NORM_STEPS,
-        map_err,
-    )?;
-    let k = apply_rms_norm(
-        graph,
-        k,
-        config.rms_norm_epsilon,
-        weights.k_norm_weight,
-        RMS_NORM_STEPS,
-        map_err,
-    )?;
+    let q = match weights.q_norm_weight {
+        Some(norm) => apply_rms_norm(
+            graph,
+            q,
+            config.rms_norm_epsilon,
+            norm,
+            RMS_NORM_STEPS,
+            map_err,
+        )?,
+        None => q,
+    };
+    let k = match weights.k_norm_weight {
+        Some(norm) => apply_rms_norm(
+            graph,
+            k,
+            config.rms_norm_epsilon,
+            norm,
+            RMS_NORM_STEPS,
+            map_err,
+        )?,
+        None => k,
+    };
     let q = graph
         .rope_ext(q, kv.positions, config.rope)
         .map_err(|source| map_err("llm_rope_q", source))?;
@@ -2659,8 +2710,11 @@ mod tests {
                 q_weight: q,
                 k_weight: k,
                 v_weight: v,
-                q_norm_weight: norm,
-                k_norm_weight: norm,
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
+                q_norm_weight: Some(norm),
+                k_norm_weight: Some(norm),
                 output_weight: output,
                 ffn_norm_weight: norm,
                 ffn_gate_weight: ffn,
@@ -2827,8 +2881,11 @@ mod tests {
                 q_weight: q,
                 k_weight: k,
                 v_weight: v,
-                q_norm_weight: norm,
-                k_norm_weight: norm,
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
+                q_norm_weight: Some(norm),
+                k_norm_weight: Some(norm),
                 output_weight: output,
                 ffn_norm_weight: norm,
                 ffn_gate_weight: ffn,

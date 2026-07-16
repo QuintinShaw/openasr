@@ -241,9 +241,34 @@ pub(crate) fn load_qwen3_llm_logits_head_from_reader_with_output_tensor(
     output_weight_tensor_name: &'static str,
     rms_norm_epsilon: f32,
 ) -> Result<Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError> {
+    load_llm_logits_head_from_reader_with_tensor_names(
+        reader,
+        metadata.llm_d_model,
+        metadata.vocab_size,
+        OUTPUT_NORM_WEIGHT_TENSOR_NAME,
+        output_weight_tensor_name,
+        rms_norm_epsilon,
+    )
+}
+
+/// Like [`load_qwen3_llm_logits_head_from_reader_with_output_tensor`] but
+/// decoupled from `Qwen3AsrExecutionMetadata` and qwen's own tensor-naming
+/// scheme, so a sibling family (e.g. firered-llm's `llm.out_norm.weight` /
+/// `llm.lm_head.weight`) can reuse the same RMSNorm+matmul(+optional fused
+/// device top-1) logits-head machinery without any Qwen2/Qwen3-specific
+/// assumption -- this stage of the pipeline (final hidden -> logits/top-1) is
+/// identical across every qwen-family decoder-only LLM.
+pub(crate) fn load_llm_logits_head_from_reader_with_tensor_names(
+    reader: &GgufTensorDataReader,
+    d_model: usize,
+    vocab_size: usize,
+    output_norm_weight_tensor_name: &'static str,
+    output_weight_tensor_name: &'static str,
+    rms_norm_epsilon: f32,
+) -> Result<Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError> {
     if !rms_norm_epsilon.is_finite() || rms_norm_epsilon <= 0.0 {
         return Err(Qwen3AsrLlmLogitsHeadError::InvalidTensorShape {
-            tensor_name: OUTPUT_NORM_WEIGHT_TENSOR_NAME,
+            tensor_name: output_norm_weight_tensor_name,
             shape: "[]".to_string(),
             reason: format!("rms_norm_epsilon={rms_norm_epsilon} must be finite and positive"),
         });
@@ -264,12 +289,10 @@ pub(crate) fn load_qwen3_llm_logits_head_from_reader_with_output_tensor(
             reason: "expected rank-2 matrix".to_string(),
         });
     }
-    let d_model = metadata.llm_d_model;
-    let vocab_size = metadata.vocab_size;
     let output_weight_layout =
         resolve_output_weight_layout(&output_weight_dims, d_model, vocab_size)?;
     let output_norm_weight = reader
-        .host_tensor_f32_copy_dequantized_by_name(OUTPUT_NORM_WEIGHT_TENSOR_NAME, &[d_model as u64])
+        .host_tensor_f32_copy_dequantized_by_name(output_norm_weight_tensor_name, &[d_model as u64])
         .map_err(map_tensor_read_error)?;
     if output_norm_weight.iter().any(|value| !value.is_finite()) {
         return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);

@@ -20,10 +20,10 @@ use block_stack::{
 use hparams::{
     COHERE_TRANSCRIBE_DECODER_LAYERS_KEY, COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY,
     COHERE_TRANSCRIBE_HPARAM_SCHEMA, DOLPHIN_HPARAM_SCHEMA, FIRERED_AED_HPARAM_SCHEMA,
-    MOONSHINE_HPARAM_SCHEMA, PARAKEET_CTC_HPARAM_SCHEMA, PARAKEET_TDT_HPARAM_SCHEMA,
-    QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA, QWEN3_AUDIO_LAYERS_KEY,
-    QWEN3_LLM_LAYERS_KEY, SENSEVOICE_HPARAM_SCHEMA, WAV2VEC2_CTC_HPARAM_SCHEMA,
-    WHISPER_HPARAM_SCHEMA, XASR_ZIPFORMER_HPARAM_SCHEMA,
+    FIRERED_LLM_HPARAM_SCHEMA, MOONSHINE_HPARAM_SCHEMA, PARAKEET_CTC_HPARAM_SCHEMA,
+    PARAKEET_TDT_HPARAM_SCHEMA, QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA,
+    QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY, SENSEVOICE_HPARAM_SCHEMA,
+    WAV2VEC2_CTC_HPARAM_SCHEMA, WHISPER_HPARAM_SCHEMA, XASR_ZIPFORMER_HPARAM_SCHEMA,
 };
 
 pub(crate) const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
@@ -156,24 +156,18 @@ pub(crate) const FIRERED_AED_EXECUTOR_COMPONENT_ID: &str = "firered-aed.ggml-exe
 // (independently-trained weights, NOT byte-identical to firered-aed-l-v2 --
 // see scratchpad/fr2/T1-findings.md S3, joint finetune not frozen-encoder
 // reuse) + a 2x frame-stacking Adapter (2 Linear + ReLU) + a LoRA-merged
-// Qwen2-7B-Instruct decoder, Apache-2.0). Component ids are defined ahead of
-// the full architecture-descriptor entry (the sensevoice/parakeet S2->S4
-// staging precedent): the T2 importer (`models::firered_llm::package_import`)
-// writes them as pack metadata now; the LLM-transformer parameterization
-// (Qwen2 qkv-bias/no-QK-norm), the dedicated executor, and the decode-policy
-// registry entry land in a later stage.
+// Qwen2-7B-Instruct decoder, Apache-2.0). Like firered-aed, decode runs on a
+// hand-written dedicated executor (block_stack: None) -- the Conformer
+// encoder + Qwen2 decoder shapes are family-specific, not composer block
+// kinds -- registered in `BUILTIN_COMPONENT_DESCRIPTORS` /
+// `BUILTIN_ARCHITECTURE_DESCRIPTORS` below.
 pub(crate) const FIRERED_LLM_GGML_ARCHITECTURE_ID: &str = "firered-llm-conformer-adapter-qwen2";
+pub(crate) const FIRERED_LLM_GGML_ADAPTER_ID: &str = "ggml-family-firered-llm-runtime-v1";
 pub(crate) const FIRERED_LLM_MODEL_FAMILY: &str = "firered2-llm";
 pub(crate) const FIRERED_LLM_AUDIO_FRONTEND_ID: &str = "firered-llm.fbank80.16khz.mono.v0";
 pub(crate) const FIRERED_LLM_TOKENIZER_ID: &str = "firered-llm.qwen2-bpe.v0";
 pub(crate) const FIRERED_LLM_DECODE_POLICY_ID: &str = "firered-llm.greedy.seq2seq.v0";
-// Reserved for the runtime-tensor-contract + executor stage (T3/T4): not
-// wired into `BUILTIN_COMPONENT_DESCRIPTORS`/`BUILTIN_ARCHITECTURE_DESCRIPTORS`
-// yet because that requires the Qwen2-parameterized transformer and the
-// dedicated executor, neither of which exist yet. Not dead -- reserved.
-#[allow(dead_code)]
 pub(crate) const FIRERED_LLM_RUNTIME_TENSOR_CONTRACT_ID: &str = "firered-llm.runtime-tensors.v0";
-#[allow(dead_code)]
 pub(crate) const FIRERED_LLM_EXECUTOR_COMPONENT_ID: &str = "firered-llm.ggml-executor.v0";
 
 // hymt2 (Tencent Hunyuan-MT2 subtitle translation, hunyuan-dense decoder-only
@@ -977,6 +971,26 @@ const BUILTIN_COMPONENT_DESCRIPTORS: &[OpenAsrComponentDescriptor] = &[
         kind: OpenAsrComponentKind::Executor,
         id: FIRERED_AED_EXECUTOR_COMPONENT_ID,
     },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
+        id: FIRERED_LLM_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: FIRERED_LLM_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: FIRERED_LLM_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: FIRERED_LLM_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: FIRERED_LLM_EXECUTOR_COMPONENT_ID,
+    },
 ];
 
 const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
@@ -1392,6 +1406,47 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
         },
     },
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &[FIRERED_LLM_GGML_ARCHITECTURE_ID, "firered2-llm"],
+        model_family: FIRERED_LLM_MODEL_FAMILY,
+        model_architecture: FIRERED_LLM_GGML_ARCHITECTURE_ID,
+        adapter_id: FIRERED_LLM_GGML_ADAPTER_ID,
+        // No language-selection prompt token and no decode-time detection:
+        // the Qwen2 BPE vocab covers Mandarin + English (the upstream ASR
+        // finetune's training languages), same shape as firered-aed.
+        language_family_hint: LanguageFamilyHint::FixedMultilingual {
+            languages: &["zh", "en"],
+        },
+        audio_frontend_id: FIRERED_LLM_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: FIRERED_LLM_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: FIRERED_LLM_TOKENIZER_ID,
+        decode_policy_id: FIRERED_LLM_DECODE_POLICY_ID,
+        executor_component_id: FIRERED_LLM_EXECUTOR_COMPONENT_ID,
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        auto_gpu_enabled: true,
+        self_diarizes: false,
+        // Qwen2's ChatML decode is a plain transcription completion -- no
+        // learned punctuation-suppression behavior has been characterized
+        // for this family yet (unlike firered-aed's punctuation-free
+        // char+SPM vocab); leave unclaimed rather than assert an unverified
+        // capability.
+        emits_punctuation: None,
+        hparam_schema: FIRERED_LLM_HPARAM_SCHEMA,
+        // Conformer encoder + Qwen2 decoder-only decode both stay on the
+        // dedicated executor (neither shape is a composer block kind), so no
+        // data-driven block-stack descriptor.
+        block_stack: None,
+        // Same Conformer encoder shape as firered-aed (full self-attention
+        // over the whole chunk, quadratic in chunk length -- issue #68), plus
+        // the upstream's own explicit 40s HARD cap (not just guidance --
+        // `FireRedLlmGgmlExecutor` fails closed above it). 30s stays
+        // comfortably under both that hard cap and firered-aed's own
+        // guidance-based ceiling.
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+            max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
+        },
+    },
 ];
 
 #[cfg(test)]
@@ -1427,6 +1482,7 @@ mod tests {
             (DOLPHIN_GGML_ARCHITECTURE_ID, false, Some(false)),
             (SENSEVOICE_GGML_ARCHITECTURE_ID, false, Some(true)),
             (FIRERED_AED_GGML_ARCHITECTURE_ID, false, Some(false)),
+            (FIRERED_LLM_GGML_ARCHITECTURE_ID, false, None),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
         let mut seen = std::collections::BTreeSet::new();
@@ -1483,6 +1539,7 @@ mod tests {
             (DOLPHIN_GGML_ARCHITECTURE_ID, false),
             (SENSEVOICE_GGML_ARCHITECTURE_ID, true),
             (FIRERED_AED_GGML_ARCHITECTURE_ID, true),
+            (FIRERED_LLM_GGML_ARCHITECTURE_ID, true),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
         let mut seen = std::collections::BTreeSet::new();
@@ -1580,6 +1637,12 @@ mod tests {
             ),
             (
                 FIRERED_AED_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                    max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
+                },
+            ),
+            (
+                FIRERED_LLM_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                     max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                 },
