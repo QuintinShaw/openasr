@@ -134,7 +134,8 @@ fn bundled_catalog_language_labels_match_rust_display_table() {
     let labels = &catalog.language_labels;
 
     // Exactly the curated set: Sinitic base codes + every registered dialect.
-    let mut expected_codes: Vec<String> = vec!["zh".into(), "yue".into(), "wuu".into()];
+    let mut expected_codes: Vec<String> =
+        vec!["zh".into(), "yue".into(), "wuu".into(), "nan".into()];
     expected_codes.extend(REGISTERED_DIALECT_CODES.iter().map(|code| code.to_string()));
     expected_codes.sort_unstable();
     expected_codes.dedup();

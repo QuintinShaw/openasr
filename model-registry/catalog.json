@@ -34,6 +34,7 @@
         "ko",
         "mk",
         "ms",
+        "nan",
         "nl",
         "pl",
         "pt",
@@ -43,7 +44,28 @@
         "th",
         "tr",
         "vi",
-        "zh"
+        "wuu",
+        "yue",
+        "zh",
+        "zh-anhui",
+        "zh-dongbei",
+        "zh-fujian",
+        "zh-gansu",
+        "zh-guizhou",
+        "zh-hebei",
+        "zh-henan",
+        "zh-hubei",
+        "zh-hunan",
+        "zh-jiangxi",
+        "zh-ningxia",
+        "zh-shaanxi",
+        "zh-shandong",
+        "zh-shanghai",
+        "zh-shanxi",
+        "zh-sichuan",
+        "zh-tianjin",
+        "zh-yunnan",
+        "zh-zhejiang"
       ],
       "vendor": "Qwen",
       "license": "Apache-2.0",
@@ -273,7 +295,28 @@
       "size": "l",
       "languages": [
         "en",
-        "zh"
+        "nan",
+        "wuu",
+        "yue",
+        "zh",
+        "zh-anhui",
+        "zh-dongbei",
+        "zh-fujian",
+        "zh-gansu",
+        "zh-guizhou",
+        "zh-hebei",
+        "zh-henan",
+        "zh-hubei",
+        "zh-hunan",
+        "zh-jiangxi",
+        "zh-ningxia",
+        "zh-shaanxi",
+        "zh-shandong",
+        "zh-shanghai",
+        "zh-shanxi",
+        "zh-sichuan",
+        "zh-tianjin",
+        "zh-yunnan"
       ],
       "vendor": "FireRedTeam",
       "license": "Apache-2.0",
@@ -622,6 +665,7 @@
         "ko",
         "mk",
         "ms",
+        "nan",
         "nl",
         "pl",
         "pt",
@@ -631,7 +675,28 @@
         "th",
         "tr",
         "vi",
-        "zh"
+        "wuu",
+        "yue",
+        "zh",
+        "zh-anhui",
+        "zh-dongbei",
+        "zh-fujian",
+        "zh-gansu",
+        "zh-guizhou",
+        "zh-hebei",
+        "zh-henan",
+        "zh-hubei",
+        "zh-hunan",
+        "zh-jiangxi",
+        "zh-ningxia",
+        "zh-shaanxi",
+        "zh-shandong",
+        "zh-shanghai",
+        "zh-shanxi",
+        "zh-sichuan",
+        "zh-tianjin",
+        "zh-yunnan",
+        "zh-zhejiang"
       ],
       "vendor": "Qwen",
       "license": "Apache-2.0",
@@ -3386,6 +3451,10 @@
     }
   ],
   "language_labels": {
+    "nan": {
+      "en": "Min Nan Chinese",
+      "zh-CN": "\u95fd\u5357\u8bed"
+    },
     "wuu": {
       "en": "Wu Chinese",
       "zh-CN": "\u5434\u8bed"
@@ -3402,21 +3471,49 @@
       "en": "Chinese (Anhui)",
       "zh-CN": "\u4e2d\u6587\uff08\u5b89\u5fbd\u8bdd\uff09"
     },
+    "zh-dongbei": {
+      "en": "Chinese (Northeastern)",
+      "zh-CN": "\u4e2d\u6587\uff08\u4e1c\u5317\u8bdd\uff09"
+    },
+    "zh-fujian": {
+      "en": "Chinese (Fujian)",
+      "zh-CN": "\u4e2d\u6587\uff08\u798f\u5efa\u8bdd\uff09"
+    },
+    "zh-gansu": {
+      "en": "Chinese (Gansu)",
+      "zh-CN": "\u4e2d\u6587\uff08\u7518\u8083\u8bdd\uff09"
+    },
     "zh-guangdong": {
       "en": "Chinese (Guangdong)",
       "zh-CN": "\u4e2d\u6587\uff08\u5e7f\u4e1c\u8bdd\uff09"
+    },
+    "zh-guizhou": {
+      "en": "Chinese (Guizhou)",
+      "zh-CN": "\u4e2d\u6587\uff08\u8d35\u5dde\u8bdd\uff09"
     },
     "zh-hebei": {
       "en": "Chinese (Hebei)",
       "zh-CN": "\u4e2d\u6587\uff08\u6cb3\u5317\u8bdd\uff09"
     },
+    "zh-henan": {
+      "en": "Chinese (Henan)",
+      "zh-CN": "\u4e2d\u6587\uff08\u6cb3\u5357\u8bdd\uff09"
+    },
     "zh-hubei": {
       "en": "Chinese (Hubei)",
       "zh-CN": "\u4e2d\u6587\uff08\u6e56\u5317\u8bdd\uff09"
     },
+    "zh-hunan": {
+      "en": "Chinese (Hunan)",
+      "zh-CN": "\u4e2d\u6587\uff08\u6e56\u5357\u8bdd\uff09"
+    },
     "zh-jiangsu": {
       "en": "Chinese (Jiangsu)",
       "zh-CN": "\u4e2d\u6587\uff08\u6c5f\u82cf\u8bdd\uff09"
+    },
+    "zh-jiangxi": {
+      "en": "Chinese (Jiangxi)",
+      "zh-CN": "\u4e2d\u6587\uff08\u6c5f\u897f\u8bdd\uff09"
     },
     "zh-ningxia": {
       "en": "Chinese (Ningxia)",
@@ -3449,6 +3546,14 @@
     "zh-tw": {
       "en": "Chinese (Taiwan)",
       "zh-CN": "\u4e2d\u6587\uff08\u53f0\u6e7e\uff09"
+    },
+    "zh-yunnan": {
+      "en": "Chinese (Yunnan)",
+      "zh-CN": "\u4e2d\u6587\uff08\u4e91\u5357\u8bdd\uff09"
+    },
+    "zh-zhejiang": {
+      "en": "Chinese (Zhejiang)",
+      "zh-CN": "\u4e2d\u6587\uff08\u6d59\u6c5f\u8bdd\uff09"
     }
   }
 }

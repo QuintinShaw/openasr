@@ -13,6 +13,24 @@ display_name = "Qwen3-ASR 1.7B"
 license_name = "Apache-2.0"
 license_source = "https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/main/LICENSE"
 license_class = "permissive"
+# Explicit override: the family default (LANG_BY_FAMILY["qwen"]) folds all
+# Chinese dialects into "zh". Qwen3-ASR's own model card enumerates 22 Chinese
+# dialects (same 0.6B/1.7B checkpoint family), so this model is dialect-
+# capable (see DIALECT_CAPABLE_FAMILIES) and lists the family's 29 base
+# languages plus every registered dialect it supports. zh-shanghai is listed
+# on the strength of Qwen's own "Wu dialects" claim (the card's Wu-language
+# coverage is presumed to include Shanghainese, its most prominent variety;
+# not independently benchmark-verified per-city the way arXiv:2603.10420
+# verifies FireRedASR2's dialects).
+languages = [
+    "ar", "cs", "da", "de", "el", "en", "es", "fa", "fi", "fil", "fr", "hi",
+    "hu", "id", "it", "ja", "ko", "mk", "ms", "nan", "nl", "pl", "pt", "ro",
+    "ru", "sv", "th", "tr", "vi", "wuu", "yue", "zh", "zh-anhui", "zh-dongbei",
+    "zh-fujian", "zh-gansu", "zh-guizhou", "zh-hebei", "zh-henan", "zh-hubei",
+    "zh-hunan", "zh-jiangxi", "zh-ningxia", "zh-shaanxi", "zh-shandong",
+    "zh-shanghai", "zh-shanxi", "zh-sichuan", "zh-tianjin", "zh-yunnan",
+    "zh-zhejiang",
+]
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
 sort_weight = 920
@@ -29,6 +47,17 @@ display_name = "Qwen3-ASR 0.6B"
 license_name = "Apache-2.0"
 license_source = "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/blob/main/LICENSE"
 license_class = "permissive"
+# Same explicit dialect override as qwen3-asr-1.7b above (identical 22-dialect
+# card claim, same 0.6B/1.7B checkpoint family) -- see that entry's note.
+languages = [
+    "ar", "cs", "da", "de", "el", "en", "es", "fa", "fi", "fil", "fr", "hi",
+    "hu", "id", "it", "ja", "ko", "mk", "ms", "nan", "nl", "pl", "pt", "ro",
+    "ru", "sv", "th", "tr", "vi", "wuu", "yue", "zh", "zh-anhui", "zh-dongbei",
+    "zh-fujian", "zh-gansu", "zh-guizhou", "zh-hebei", "zh-henan", "zh-hubei",
+    "zh-hunan", "zh-jiangxi", "zh-ningxia", "zh-shaanxi", "zh-shandong",
+    "zh-shanghai", "zh-shanxi", "zh-sichuan", "zh-tianjin", "zh-yunnan",
+    "zh-zhejiang",
+]
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
 sort_weight = 900
@@ -547,6 +576,21 @@ display_name = "FireRedASR2 AED-L"
 license_name = "Apache-2.0"
 license_source = "https://huggingface.co/FireRedTeam/FireRedASR2-AED/blob/main/README.md"
 license_class = "permissive"
+# Explicit override: the family default (LANG_BY_FAMILY["firered-aed"]) folds
+# all Chinese dialects into "zh". FireRedASR2's own README lists 20+ Chinese
+# dialects and arXiv:2603.10420 Table 2 benchmarks this AED checkpoint on 19
+# public dialect/accent test sets (Sichuan x4, Shanghai, Henan, Hunan, Wuhan,
+# Tianjin, ...), so this model is dialect-capable (see
+# DIALECT_CAPABLE_FAMILIES) and lists every registered dialect it was tested
+# on. The paper's "Liaoning" test set is a Northeastern-Mandarin variety and
+# is normalized to the registered zh-dongbei code rather than added as a
+# separate zh-liaoning code.
+languages = [
+    "en", "nan", "wuu", "yue", "zh", "zh-anhui", "zh-dongbei", "zh-fujian",
+    "zh-gansu", "zh-guizhou", "zh-hebei", "zh-henan", "zh-hubei", "zh-hunan",
+    "zh-jiangxi", "zh-ningxia", "zh-shaanxi", "zh-shandong", "zh-shanghai",
+    "zh-shanxi", "zh-sichuan", "zh-tianjin", "zh-yunnan",
+]
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q4_k"
 sort_weight = 912

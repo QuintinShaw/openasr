@@ -27,7 +27,7 @@ const DOLPHIN_NOTIMESTAMP_TOKEN: &str = "<notimestamp>";
 pub(crate) const DOLPHIN_DEFAULT_LANGUAGE_CODE: &str = "zh";
 
 /// Map a normalized recognition code to its Dolphin `<REGION>` vocab token. The
-/// keys are exactly Phase 1's `REGISTERED_DIALECT_CODES` plus the bare `zh`
+/// keys are exactly `DOLPHIN_CN_DIALECT_CODES` (below) plus the bare `zh`
 /// default; a test below pins the two lists together so the executor honors
 /// precisely the codes the signed catalog advertises (no lies in the picker).
 /// Returns `None` for any other code, which the builder turns into a fail-closed
@@ -298,6 +298,36 @@ pub(crate) fn build_dolphin_multilingual_decode_prefix(
     })
 }
 
+/// The exact set of Chinese-dialect recognition codes the `dolphin-cn-dialect-*`
+/// pack family can actually select via a `<REGION>` prompt token -- i.e. the
+/// domain of `dolphin_region_token_for_code` above. Distinct from (and a
+/// strict subset of) the model-agnostic `REGISTERED_DIALECT_CODES` in
+/// `crate::models::language`, which is now a cross-family typo-guard union:
+/// FireRedASR2 (`firered-aed`) and Qwen3-ASR (`qwen`) also advertise
+/// registered dialect codes for their own benchmark-verified recognition
+/// coverage (see `DIALECT_CAPABLE_FAMILIES` in `_catalog.py`), not a
+/// selectable prompt, so the global registry has grown codes this family's
+/// vocab has no `<REGION>` token for. This module's producer-side import
+/// guard and tests pin against THIS list, not the global one, so a future
+/// cross-family dialect addition can never make Dolphin's own picker
+/// advertise a region it cannot honor. Kept sorted + de-duplicated; pinned to
+/// `dolphin_region_token_for_code` by a test below.
+pub(crate) const DOLPHIN_CN_DIALECT_CODES: &[&str] = &[
+    "zh-anhui",
+    "zh-guangdong",
+    "zh-hebei",
+    "zh-hubei",
+    "zh-jiangsu",
+    "zh-ningxia",
+    "zh-shaanxi",
+    "zh-shandong",
+    "zh-shanghai",
+    "zh-shanxi",
+    "zh-sichuan",
+    "zh-tianjin",
+    "zh-tw",
+];
+
 /// The 40 codes `dolphin-small`/`dolphin-base` advertise as their catalog
 /// `languages` override (see `tooling/publish-model/models-core.toml`), kept
 /// in sync by hand with that TOML list -- there is no single Rust source of
@@ -323,7 +353,6 @@ fn token_id_for_content(vocab: &[String], content: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::language::REGISTERED_DIALECT_CODES;
 
     /// Synthetic vocab mirroring the real `units.txt` special-token block: ids
     /// 0..=35 are the exact control/language/region tokens, 36..=108 are reserved
@@ -470,12 +499,33 @@ mod tests {
     }
 
     #[test]
-    fn region_map_covers_exactly_the_registered_dialect_codes() {
-        // Every advertised dialect code must resolve to a region token, and that
-        // token must exist in the real special-token block -- otherwise the picker
-        // would advertise a code the executor cannot honor.
+    fn dolphin_cn_dialect_codes_are_a_sorted_registered_subset() {
+        // DOLPHIN_CN_DIALECT_CODES must itself be sorted + de-duplicated, and
+        // every code it lists must also be a member of the model-agnostic
+        // `REGISTERED_DIALECT_CODES` (this family's codes are a subset of the
+        // global registry, never codes the global typo-guard doesn't know).
+        let mut sorted = DOLPHIN_CN_DIALECT_CODES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.as_slice(), DOLPHIN_CN_DIALECT_CODES);
+        for &code in DOLPHIN_CN_DIALECT_CODES {
+            assert!(
+                crate::models::language::REGISTERED_DIALECT_CODES.contains(&code),
+                "'{code}' is in DOLPHIN_CN_DIALECT_CODES but not the global REGISTERED_DIALECT_CODES"
+            );
+        }
+    }
+
+    #[test]
+    fn region_map_covers_exactly_dolphins_own_dialect_codes() {
+        // Every code THIS family advertises must resolve to a region token, and
+        // that token must exist in the real special-token block -- otherwise the
+        // picker would advertise a code the executor cannot honor. Pinned against
+        // `DOLPHIN_CN_DIALECT_CODES` (this family's own capability), not the
+        // model-agnostic `REGISTERED_DIALECT_CODES` union -- see that constant's
+        // doc comment for why the two lists diverge.
         let vocab = dolphin_special_vocab();
-        for &code in REGISTERED_DIALECT_CODES {
+        for &code in DOLPHIN_CN_DIALECT_CODES {
             let region = dolphin_region_token_for_code(code)
                 .unwrap_or_else(|| panic!("registered dialect code '{code}' has no region token"));
             assert!(
@@ -547,7 +597,7 @@ mod tests {
         // Every language the catalog advertises for dolphin-small/dolphin-base
         // must resolve to a `<lang><region>` pair, and the full prefix must
         // build against a vocab carrying every one of those tokens -- the
-        // producer-side guard mirroring `region_map_covers_exactly_the_registered_dialect_codes`.
+        // producer-side guard mirroring `region_map_covers_exactly_dolphins_own_dialect_codes`.
         let vocab = dolphin_multilingual_vocab();
         for &code in DOLPHIN_MULTILINGUAL_CATALOG_LANGUAGES {
             dolphin_multilingual_lang_region_for_code(code)

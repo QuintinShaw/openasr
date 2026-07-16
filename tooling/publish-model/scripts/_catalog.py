@@ -92,10 +92,17 @@ QUANT_METADATA = {
 # REGISTERED_DIALECT_CODES exactly.
 REGISTERED_DIALECT_CODES = [
     "zh-anhui",
+    "zh-dongbei",
+    "zh-fujian",
+    "zh-gansu",
     "zh-guangdong",
+    "zh-guizhou",
     "zh-hebei",
+    "zh-henan",
     "zh-hubei",
+    "zh-hunan",
     "zh-jiangsu",
+    "zh-jiangxi",
     "zh-ningxia",
     "zh-shaanxi",
     "zh-shandong",
@@ -104,6 +111,8 @@ REGISTERED_DIALECT_CODES = [
     "zh-sichuan",
     "zh-tianjin",
     "zh-tw",
+    "zh-yunnan",
+    "zh-zhejiang",
 ]
 
 # code -> (English, Simplified-Chinese) display label. The Sinitic base codes
@@ -113,6 +122,7 @@ LANGUAGE_DISPLAY_LABELS = {
     "zh": ("Chinese", "中文"),
     "yue": ("Cantonese", "粤语"),
     "wuu": ("Wu Chinese", "吴语"),
+    "nan": ("Min Nan Chinese", "闽南语"),
     "zh-anhui": ("Chinese (Anhui)", "中文（安徽话）"),
     "zh-guangdong": ("Chinese (Guangdong)", "中文（广东话）"),
     "zh-hebei": ("Chinese (Hebei)", "中文（河北话）"),
@@ -126,13 +136,32 @@ LANGUAGE_DISPLAY_LABELS = {
     "zh-sichuan": ("Chinese (Sichuanese)", "中文（四川话）"),
     "zh-tianjin": ("Chinese (Tianjin)", "中文（天津话）"),
     "zh-tw": ("Chinese (Taiwan)", "中文（台湾）"),
+    "zh-henan": ("Chinese (Henan)", "中文（河南话）"),
+    "zh-hunan": ("Chinese (Hunan)", "中文（湖南话）"),
+    "zh-jiangxi": ("Chinese (Jiangxi)", "中文（江西话）"),
+    "zh-fujian": ("Chinese (Fujian)", "中文（福建话）"),
+    "zh-gansu": ("Chinese (Gansu)", "中文（甘肃话）"),
+    "zh-guizhou": ("Chinese (Guizhou)", "中文（贵州话）"),
+    "zh-yunnan": ("Chinese (Yunnan)", "中文（云南话）"),
+    "zh-dongbei": ("Chinese (Northeastern)", "中文（东北话）"),
+    "zh-zhejiang": ("Chinese (Zhejiang)", "中文（浙江话）"),
 }
 
-# Families whose executor ships a concrete code->prompt map and MAY therefore
-# enumerate dialect recognition codes in `languages` (selective dialect
-# collapse). Every other family collapses regional dialects into the base
-# language (`zh`), so a stray dialect code fails loudly instead of shipping.
-DIALECT_CAPABLE_FAMILIES = {"dolphin"}
+# Families that MAY enumerate dialect recognition codes in `languages`
+# (selective dialect collapse). Every other family collapses regional dialects
+# into the base language (`zh`), so a stray dialect code fails loudly instead
+# of shipping. Two distinct routes earn membership here:
+#  - dolphin: its executor ships a concrete code->prompt map, so a dialect
+#    code is actually SELECTABLE per request.
+#  - firered-aed / qwen: not selectable (firered-aed is a fixed bilingual
+#    vocab with no language prompt; qwen self-detects and rejects an explicit
+#    hint), but each has upstream-published, benchmark-verified per-dialect
+#    recognition coverage (FireRedASR2 README + arXiv:2603.10420 Table 2's 19
+#    dialect test sets; Qwen3-ASR's 22-dialect enumeration), so the dialect
+#    codes describe RECOGNIZED capability rather than a selectable parameter
+#    -- the same "recognizes whatever it hears" semantics FixedMultilingual
+#    families like parakeet-tdt already use for their base language list.
+DIALECT_CAPABLE_FAMILIES = {"dolphin", "firered-aed", "qwen"}
 
 # Shape of a recognition-language code: a lowercase ISO 639 base (2-3 letters)
 # with an OPTIONAL single `-region` subtag. Deliberately broader than the
@@ -187,6 +216,33 @@ def language_labels_wire() -> dict:
     }
 
 
+# The exact set of Chinese-dialect codes the `dolphin-cn-dialect-*` pack
+# family can actually SELECT via its `<REGION>` prompt token (the domain of
+# `dolphin_region_token_for_code` in crate::models::dolphin::language -- Rust
+# mirror, kept in sync by hand). Distinct from (and a strict subset of) the
+# model-agnostic REGISTERED_DIALECT_CODES above, which is now a cross-family
+# typo-guard union: firered-aed and qwen also register dialect codes for
+# their own benchmark-verified (not selectable) recognition coverage, so the
+# global registry has grown codes Dolphin's own vocab has no region token
+# for. LANG_BY_FAMILY["dolphin"] must be built from THIS list, never the
+# global one, or a future cross-family dialect addition would silently make
+# Dolphin's family default advertise a region it cannot honor.
+DOLPHIN_CN_DIALECT_CODES = [
+    "zh-anhui",
+    "zh-guangdong",
+    "zh-hebei",
+    "zh-hubei",
+    "zh-jiangsu",
+    "zh-ningxia",
+    "zh-shaanxi",
+    "zh-shandong",
+    "zh-shanghai",
+    "zh-shanxi",
+    "zh-sichuan",
+    "zh-tianjin",
+    "zh-tw",
+]
+
 # Per-family list of the natural languages a model officially supports, as
 # ISO 639-1 two-letter codes (ISO 639-3 where no 639-1 code exists), sorted.
 # RULE (SELECTIVE dialect collapse): by DEFAULT list LANGUAGES ONLY, NOT
@@ -194,9 +250,9 @@ def language_labels_wire() -> dict:
 # Min and regional dialects fold into "zh"), English is "en" (US/UK not split),
 # and a card advertising "30 languages and 22 Chinese dialects" yields the 30
 # languages with the dialects folded into "zh". EXCEPTION: a dialect-capable
-# family (DIALECT_CAPABLE_FAMILIES -- one whose executor ships a code->prompt
-# map, i.e. Dolphin) MAY enumerate REGISTERED_DIALECT_CODES (`zh-sichuan`, ...)
-# as selectable source languages alongside the base `zh`. If a model supports N
+# family (DIALECT_CAPABLE_FAMILIES -- see its own doc comment for the two ways
+# a family earns membership) MAY enumerate REGISTERED_DIALECT_CODES
+# (`zh-sichuan`, ...) alongside the base `zh`. If a model supports N
 # languages, list all N. See SKILL.md.
 LANG_BY_FAMILY = {
     # Qwen3-ASR card lists 30 languages; Cantonese folds into zh -> 29 ISO langs.
@@ -228,8 +284,10 @@ LANG_BY_FAMILY = {
     # Dolphin cn-dialect small: Mandarin + 22 Chinese dialects (Sichuan, Wu,
     # Minnan, ...). Dolphin is dialect-capable (its executor ships a
     # code->region-prompt map), so it advertises the base `zh` plus every
-    # registered province dialect code as selectable source languages.
-    "dolphin": sorted(["zh", *REGISTERED_DIALECT_CODES]),
+    # dialect code ITS OWN region-prompt map supports as selectable source
+    # languages -- DOLPHIN_CN_DIALECT_CODES, not the (now broader, cross-
+    # family) REGISTERED_DIALECT_CODES.
+    "dolphin": sorted(["zh", *DOLPHIN_CN_DIALECT_CODES]),
     "moonshine": ["en"],
     "parakeet": ["en"],
     # parakeet-tdt-0.6b-v3 card: 25 European languages (bg hr cs da nl en et fi
