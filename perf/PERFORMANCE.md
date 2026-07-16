@@ -66,52 +66,44 @@ The two gating entries in the committed baseline are `whisper-tiny-en-q8` and
 
 ## Dolphin: CPU vs Metal (AB-measured on M1)
 
-The committed `dolphin-cn-dialect-small-fp16` baseline is the **CPU** default (the
-golden, parity-validated path). CPU-vs-Metal x with/without cross-request weight
-reuse was AB-measured on the 2.38 s Sichuan clip (M1, best-of-5); all four configs
-reproduce the golden transcript exactly (CER 0.0000):
+Dolphin's Auto default is **Metal** on a GPU-capable Apple Silicon host (fail-closed
+to CPU where no accelerator exists). This became the default once the
+E-Branchformer encoder + CTC head weights moved into a WEIGHTS-usage static arena:
+before that, the ggml scheduler only offloads an op whose weight `src` lives in a
+`GGML_BACKEND_BUFFER_USAGE_WEIGHTS` buffer, so the whole ~1348-op encoder plus the
+CTC projection stayed pinned to the CPU under an explicit Metal backend while only
+the small decoder rescoring graphs ran on Metal -- a net GPU loss. With the weights
+arena-resident, `GGML_SCHED_DEBUG=2` shows zero CPU compute splits: the encoder, the
+CTC head, and all 10 decoder rescoring graphs run on Metal.
 
-| Backend | Weight reuse | RTF | Peak RSS |
+Warm best-of-6 compute, isolated host (M1), q8_0, identical golden transcript on
+every cell:
+
+| Audio | Backend | RTF (before arena) | RTF (after arena) |
 | --- | --- | ---: | ---: |
-| CPU | cold (reload/dequant each request) | 0.34 | ~1.88 GB |
-| CPU | warm (pooled weights) | **0.29** | ~1.88 GB |
-| Metal | cold | 0.32 | ~1.78 GB |
-| Metal | warm (pooled weights) | **0.29** | ~1.78 GB |
+| 3 s  | CPU   | 0.180 | 0.174 |
+| 3 s  | Metal | 0.244 | **0.126** |
+| 18 s | CPU   | 0.171 | 0.157 |
+| 18 s | Metal | 0.334 | **0.081** |
 
-**Re-measured post-#P5/#P6** (attention-rescoring build-once/run-many decoder
-weights + gated encoder taps; release, best-of-5, same clip/host as above). The
-previous rows in this table (CPU 0.89/0.72, Metal 0.67/0.48, ~3.4-3.7 GB) predate
-both fixes: every one of the CTC n-best's `DOLPHIN_BEAM_SIZE=10` rescoring calls
-used to rebuild the whole decoder graph and re-upload all ~200 decoder weight
-tensors from scratch, and the encoder unconditionally materialized every
-per-block hidden state as an extra f32 graph output. Removing that per-hypothesis
-rebuild/re-upload (P5) plus gating the encoder's per-block taps off in production
-(P6) cuts RTF by roughly half-to-2/3 and peak RSS by close to 2x across every
-cell, dominating the older cross-request `DOLPHIN_WEIGHTS_POOL` reuse effect below.
+Findings, all measured (not assumed):
 
-Findings, both measured (not assumed):
+1. **The arena reverses the GPU deficit.** Before, Metal lost to CPU (1.35x slower
+   at 3 s, 2.07x at 18 s). After, Metal beats CPU on both lengths (1.38x faster at
+   3 s, 1.27x at 18 s) and Metal's own compute drops 1.9x/2.6x. CPU is unchanged --
+   weight placement does not alter the CPU path (`dolphin_encoder_parity` stays
+   bit-exact).
+2. **Margin is honest, not huge.** On a clean host the M1 CPU is strong, so the GPU
+   win is ~1.3x rather than a landslide; it is consistently positive across both
+   lengths. Peak RSS is also lower on Metal (quantized weights stay quantized in the
+   WEIGHTS buffer rather than a dequantized graph-input blow-up).
 
-1. **Reuse still helps, but far less than before.** The executor still pools the
-   dequantized f32 weights per pack (`DOLPHIN_WEIGHTS_POOL`) across *requests*,
-   so cold vs warm still shows a small gap (0.34 -> 0.29 CPU, 0.32 -> 0.29 Metal).
-   That gap used to be much larger because the old per-hypothesis decoder rebuild
-   dwarfed the one-time pack-load cost it was hiding; now that the rescore loop
-   itself is build-once/run-many, cross-request reuse is a minor tail rather than
-   the dominant lever.
-2. **CPU and Metal are now close, not a clear Metal win.** The previous "Metal
-   WINS here" conclusion was measured when the decoder rebuilt its whole graph
-   (weights included) 10x per utterance -- wide enough per rebuild to amortize
-   GPU dispatch. With the rebuild/re-upload gone, the two backends land within
-   noise of each other on this clip (warm RTF 0.29 both). Re-validate on a longer
-   clip before leaning on a backend recommendation from this table alone.
-
-**Default = CPU** anyway: the parity gate is CPU bit-exact and Metal's fp16
-numerics are not golden-validated (identical transcript on this clip is evidence,
-not a guarantee across GPUs/audio). Metal remains an **opt-in** via
-`--execution-target accelerated` / `OPENASR_GGML_BACKEND=metal`; the executor
-fail-closes to CPU on the Auto default and engages Metal only on an explicit
-accelerated request. Harness: the `dolphin_perf_ab` ignored test
-(`OPENASR_DOLPHIN_AB_BACKEND`/`_REUSE`/`_RUNS`).
+**Default = Metal on Apple Silicon**, CPU elsewhere: the Auto gate
+(`auto_gpu_enabled = true`) only ever selects an accelerator that is actually
+present (`runtime_gpu_is_available`), and an explicit `--execution-target cpu`
+always wins. CPU stays the bit-exact parity reference -- Metal fp16 reproduces the
+golden transcript on the parity clip but is not itself the golden gate. Harness: the
+`dolphin_perf_ab` ignored test (`OPENASR_DOLPHIN_AB_BACKEND`/`_REUSE`/`_RUNS`).
 
 ## Caveats
 
