@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod backend;
 pub mod buffer;
+pub mod capture;
 pub mod events;
 pub mod history;
 pub mod session;
@@ -20,6 +21,10 @@ pub use backend::{
 pub use buffer::{
     BufferedUtterance, RealtimeBuffer, RealtimeBufferConfig, RealtimeBufferError,
     RealtimeUtteranceEndReason,
+};
+pub use capture::{
+    CaptureBackpressureQueue, CaptureEngine, CaptureEngineError, CaptureInputFormat,
+    CapturePushOutcome, CaptureSample,
 };
 pub use events::{
     RealtimeAudioInputEvent, RealtimeErrorCode, RealtimeErrorEvent, RealtimeEvent,

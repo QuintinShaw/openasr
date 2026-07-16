@@ -20,13 +20,19 @@ download. SDK consumers bring and manage their own `.oasr` packs -- OpenASR's
 "no silent download" product boundary (see `AGENTS.md`) is a CLI/server
 concern; an embedded SDK has no business reaching the network on its own.
 
-**CPU-only v1.** `crates/openasr-core/build.rs` already builds ggml Metal
-sources into the iOS/macOS static libs (inherited from the CLI/desktop build),
-but the GPU backend is unevaluated on real iOS/macOS SDK integration --
-Metal-on-M1 was already found to regress vs. CPU for this engine's decode
-shape in desktop benchmarking (see `perf/PERFORMANCE.md`), and mobile GPU
-acceleration needs its own on-device measurement before being recommended
-here. Treat the SDK as CPU-only until a real-device benchmark says otherwise.
+**CPU-only v1, and iOS Metal is not wired up at all yet.** `crates/openasr-core/build.rs`
+gates the `GGML_METAL`/`GGML_METAL_EMBED_LIBRARY` cmake flags on
+`target.contains("apple-darwin")`, i.e. **macOS only** -- `aarch64-apple-ios`
+and `aarch64-apple-ios-sim` do not match that check, so the `ios-arm64` and
+`ios-arm64-simulator` xcframework slices are built **CPU/NEON-only**, with no
+Metal backend compiled in at all. The `macos-arm64` slice does get the same
+Metal build the CLI/desktop build already produces, but it is unevaluated on
+real SDK integration -- Metal-on-M1 was already found to regress vs. CPU for
+this engine's decode shape in desktop benchmarking (see
+`perf/PERFORMANCE.md`), and mobile GPU acceleration needs its own on-device
+measurement before being recommended here. Treat the whole SDK as CPU-only
+until a real-device benchmark says otherwise; wiring up an iOS Metal build is
+unstarted, follow-up work.
 
 **License**: Apache-2.0, same as the rest of this open-core repository (see
 `LICENSE`, `NOTICE`). No additional restriction applies to the xcframework

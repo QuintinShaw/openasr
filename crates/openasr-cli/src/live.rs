@@ -2364,146 +2364,38 @@ fn escape_markdown_text(text: &str) -> String {
     escaped
 }
 
+/// Thin cpal-facing wrapper around the shared, platform-agnostic
+/// `openasr_core::realtime::CaptureEngine` (resample/downmix/frame). The CLI
+/// owns the OS audio API (cpal device selection, stream lifecycle); the
+/// actual PCM normalization logic lives once in `openasr-core` so the
+/// desktop live path and the (open-core, cross-repo) mobile capture engine
+/// never drift.
 #[derive(Debug)]
 struct LiveAudioNormalizer {
-    input_sample_rate_hz: u32,
-    input_channels: u16,
-    frame_duration_ms: u32,
-    frame_sample_count: usize,
-    pending_output: Vec<i16>,
-    resample_input: Vec<f32>,
-    resample_pos: f64,
-    resample_step: f64,
-    next_seq: u64,
-    next_start_ms: u64,
+    engine: openasr_core::CaptureEngine,
 }
 
 impl LiveAudioNormalizer {
     fn new(input_sample_rate_hz: u32, input_channels: u16, frame_duration_ms: u32) -> Result<Self> {
-        if input_sample_rate_hz == 0 {
-            bail!("Input sample rate must be greater than 0.");
-        }
-        if input_channels == 0 {
-            bail!("Input channel count must be greater than 0.");
-        }
-        let frame_sample_count = RealtimeAudioFormat::pcm16_mono_16khz()
-            .sample_count_for_duration_ms(frame_duration_ms)?;
-        Ok(Self {
-            input_sample_rate_hz,
-            input_channels,
-            frame_duration_ms,
-            frame_sample_count,
-            pending_output: Vec::new(),
-            resample_input: Vec::new(),
-            resample_pos: 0.0,
-            resample_step: input_sample_rate_hz as f64
-                / openasr_core::DEFAULT_REALTIME_SAMPLE_RATE_HZ as f64,
-            next_seq: 1,
-            next_start_ms: 0,
-        })
+        let input = openasr_core::CaptureInputFormat::new(input_sample_rate_hz, input_channels)?;
+        let engine = openasr_core::CaptureEngine::new(input, frame_duration_ms)?;
+        Ok(Self { engine })
     }
 
     fn push_f32_interleaved(&mut self, samples: &[f32]) -> Result<Vec<RealtimeAudioFrame>> {
-        let mono = downmix_interleaved(samples, self.input_channels, |sample| {
-            sample.clamp(-1.0, 1.0)
-        })?;
-        self.push_mono_f32(&mono)
+        Ok(self.engine.push_f32_interleaved(samples)?)
     }
 
     fn push_i16_interleaved(&mut self, samples: &[i16]) -> Result<Vec<RealtimeAudioFrame>> {
-        let mono = downmix_interleaved(samples, self.input_channels, |sample| {
-            sample as f32 / 32768.0
-        })?;
-        self.push_mono_f32(&mono)
+        Ok(self.engine.push_i16_interleaved(samples)?)
     }
 
     fn push_u16_interleaved(&mut self, samples: &[u16]) -> Result<Vec<RealtimeAudioFrame>> {
-        let mono = downmix_interleaved(samples, self.input_channels, |sample| {
-            (sample as f32 - 32768.0) / 32768.0
-        })?;
-        self.push_mono_f32(&mono)
-    }
-
-    fn push_mono_f32(&mut self, mono: &[f32]) -> Result<Vec<RealtimeAudioFrame>> {
-        let mut pcm16 =
-            if self.input_sample_rate_hz == openasr_core::DEFAULT_REALTIME_SAMPLE_RATE_HZ {
-                mono.iter().map(|sample| f32_to_i16(*sample)).collect()
-            } else {
-                self.resample_to_pcm16(mono)
-            };
-        self.pending_output.append(&mut pcm16);
-        self.drain_frames()
-    }
-
-    fn resample_to_pcm16(&mut self, mono: &[f32]) -> Vec<i16> {
-        self.resample_input.extend_from_slice(mono);
-        let mut output = Vec::new();
-        while self.resample_pos + 1.0 < self.resample_input.len() as f64 {
-            let index = self.resample_pos.floor() as usize;
-            let fraction = (self.resample_pos - index as f64) as f32;
-            let a = self.resample_input[index];
-            let b = self.resample_input[index + 1];
-            output.push(f32_to_i16(a + (b - a) * fraction));
-            self.resample_pos += self.resample_step;
-        }
-        let consumed = self.resample_pos.floor() as usize;
-        if consumed > 0 {
-            self.resample_input.drain(0..consumed);
-            self.resample_pos -= consumed as f64;
-        }
-        output
-    }
-
-    fn drain_frames(&mut self) -> Result<Vec<RealtimeAudioFrame>> {
-        let mut frames = Vec::new();
-        while self.pending_output.len() >= self.frame_sample_count {
-            let samples = self
-                .pending_output
-                .drain(0..self.frame_sample_count)
-                .collect::<Vec<_>>();
-            let frame = RealtimeAudioFrame::new(
-                self.next_seq,
-                self.next_start_ms,
-                RealtimeAudioFormat::pcm16_mono_16khz(),
-                samples,
-            )?;
-            self.next_seq += 1;
-            self.next_start_ms += u64::from(self.frame_duration_ms);
-            frames.push(frame);
-        }
-        Ok(frames)
+        Ok(self.engine.push_u16_interleaved(samples)?)
     }
 
     fn next_frame_start_ms(&self) -> u64 {
-        self.next_start_ms
-    }
-}
-
-fn downmix_interleaved<T: Copy>(
-    samples: &[T],
-    channels: u16,
-    convert: impl Fn(T) -> f32,
-) -> Result<Vec<f32>> {
-    let channels = channels as usize;
-    if !samples.len().is_multiple_of(channels) {
-        bail!(
-            "Captured interleaved audio chunk had {} samples, which is not divisible by {} channel(s).",
-            samples.len(),
-            channels
-        );
-    }
-    Ok(samples
-        .chunks_exact(channels)
-        .map(|frame| frame.iter().copied().map(&convert).sum::<f32>() / channels as f32)
-        .collect())
-}
-
-fn f32_to_i16(sample: f32) -> i16 {
-    let clamped = sample.clamp(-1.0, 1.0);
-    if clamped >= 0.0 {
-        (clamped * i16::MAX as f32).round() as i16
-    } else {
-        (clamped * 32768.0).round() as i16
+        self.engine.next_frame_start_ms()
     }
 }
 
