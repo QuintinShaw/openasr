@@ -661,7 +661,15 @@ fn doctor() -> Result<()> {
     println!("OpenASR home: {}", home.display());
     println!("Config file: {}", config_file.display());
     println!("Models directory: {}", models_dir(&home, &config).display());
-    println!("Model registry: ok ({} models)", cards.len());
+    match openasr_core::read_catalog_degraded_status(&home) {
+        Some(status) => println!(
+            "Model registry: degraded, serving the {} catalog ({} models) -- {}",
+            status.tier,
+            cards.len(),
+            status.reason
+        ),
+        None => println!("Model registry: ok ({} models)", cards.len()),
+    }
     println!(
         "Default model: {} ({})",
         default_model,
@@ -948,7 +956,10 @@ fn language_mode_label(mode: Option<openasr_core::CatalogLanguageMode>) -> &'sta
         Some(SpecifyOnly) => "specify_only (set --language; the default is used when unset)",
         Some(FixedMonolingual) => "fixed_monolingual (one fixed language)",
         Some(FixedMultilingual) => "fixed_multilingual (built-in set; --language is rejected)",
-        None => "unspecified",
+        // A future language_mode value this build does not recognize:
+        // descriptive-only, so degrade to the same label as "unspecified"
+        // rather than erroring.
+        Some(openasr_core::CatalogLanguageMode::Unknown) | None => "unspecified",
     }
 }
 

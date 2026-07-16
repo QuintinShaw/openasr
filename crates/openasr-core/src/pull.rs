@@ -3187,22 +3187,42 @@ pub struct InstalledBackend {
     pub installed_at_unix_seconds: u64,
 }
 
-fn backend_vendor_dirname(vendor: CatalogBackendVendor) -> &'static str {
-    match vendor {
+/// Fail-closed, not a panic: `filter_forward_compatible_catalog` already drops
+/// a backend pack whose `vendor` this build does not recognize before it can
+/// reach pull resolution, but this is trust-boundary code parsing signed-yet-
+/// external data, so an `Unknown` reaching here (a filtering bug, or a caller
+/// that built a `ResolvedCatalogBackendPull` some other way) must return a
+/// typed error rather than panic or silently guess a directory.
+fn backend_vendor_dirname(vendor: CatalogBackendVendor) -> Result<&'static str, PullError> {
+    Ok(match vendor {
         CatalogBackendVendor::Cpu => "cpu",
         CatalogBackendVendor::Vulkan => "vulkan",
         CatalogBackendVendor::Hip => "hip",
         CatalogBackendVendor::Cuda => "cuda",
-    }
+        CatalogBackendVendor::Unknown => {
+            return Err(PullError::InvalidTarget {
+                field: "backend.vendor",
+                reason: "backend pack vendor is not recognized by this build".to_string(),
+            });
+        }
+    })
 }
 
-fn backend_file_format(role: CatalogBackendFileRole) -> BackendFileFormat {
-    match role {
+/// See [`backend_vendor_dirname`]'s doc comment: same fail-closed contract for
+/// an unrecognized backend file `role`.
+fn backend_file_format(role: CatalogBackendFileRole) -> Result<BackendFileFormat, PullError> {
+    Ok(match role {
         CatalogBackendFileRole::Plugin | CatalogBackendFileRole::Runtime => {
             BackendFileFormat::NativeLibrary
         }
         CatalogBackendFileRole::Archive => BackendFileFormat::ZipArchive,
-    }
+        CatalogBackendFileRole::Unknown => {
+            return Err(PullError::InvalidTarget {
+                field: "backend.files[].role",
+                reason: "backend pack file role is not recognized by this build".to_string(),
+            });
+        }
+    })
 }
 
 /// Download, verify, and install a resolved backend plugin pack into
@@ -3231,7 +3251,7 @@ fn install_backend_pack_with_client<C: DownloadClient>(
     client: &mut C,
     mut progress: impl FnMut(PullProgress),
 ) -> Result<InstalledBackend, PullError> {
-    let vendor = backend_vendor_dirname(resolved.vendor);
+    let vendor = backend_vendor_dirname(resolved.vendor)?;
     // Defense in depth (the catalog is signed, but never join an unvalidated
     // component): the version must be a single safe path segment.
     if resolved.version.is_empty()
@@ -3277,7 +3297,7 @@ fn install_backend_pack_with_client<C: DownloadClient>(
     for file in &resolved.files {
         let dest = dir.join(&file.filename);
         download_backend_file(client, file, &dest, &mut progress)?;
-        preflight_backend_file(&dest, backend_file_format(file.role))?;
+        preflight_backend_file(&dest, backend_file_format(file.role)?)?;
         if file.role == CatalogBackendFileRole::Archive {
             let subdir = file.extract_subdir.as_deref().unwrap_or("");
             extract_backend_archive(&dest, &dir, subdir)?;

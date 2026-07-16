@@ -388,6 +388,173 @@ fn catalog_kind_matrix_controls_market_listing() {
     );
 }
 
+// ---- forward-compatible catalog loading: unknown taxonomy values hide the
+// affected entry instead of rejecting the whole catalog; unknown language
+// codes are always tolerated verbatim. See docs/CATALOG_COMPATIBILITY.md.
+
+#[test]
+fn filter_hides_model_with_unrecognized_kind_but_keeps_the_rest() {
+    let mut catalog = alias_contract_catalog();
+    catalog.models[0].kind = CatalogModelKind::Unknown;
+    let hidden_id = catalog.models[0].id.clone();
+    let kept_ids: Vec<_> = catalog.models[1..]
+        .iter()
+        .map(|model| model.id.clone())
+        .collect();
+
+    let notes = super::filter_forward_compatible_catalog(&mut catalog);
+
+    assert!(!catalog.models.iter().any(|model| model.id == hidden_id));
+    for id in kept_ids {
+        assert!(catalog.models.iter().any(|model| model.id == id));
+    }
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains(&hidden_id) && note.contains("kind")),
+        "{notes:?}"
+    );
+    // The rest of the catalog still loads and validates.
+    super::validate_model_catalog(&catalog).unwrap();
+}
+
+#[test]
+fn filter_hides_model_with_unrecognized_license_class_but_keeps_the_rest() {
+    let mut catalog = alias_contract_catalog();
+    catalog.models[1].license_class = LicenseClass::Unknown;
+    let hidden_id = catalog.models[1].id.clone();
+
+    let notes = super::filter_forward_compatible_catalog(&mut catalog);
+
+    assert!(!catalog.models.iter().any(|model| model.id == hidden_id));
+    assert_eq!(catalog.models.len(), 2);
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains(&hidden_id) && note.contains("license_class")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn filter_hides_capability_pack_with_unrecognized_role_but_keeps_asr_models() {
+    let mut catalog = alias_contract_catalog();
+    catalog.models.push(capability_pack_model(
+        "future-embedder",
+        CatalogCapabilityRole::Unknown,
+    ));
+
+    let notes = super::filter_forward_compatible_catalog(&mut catalog);
+
+    assert!(
+        !catalog
+            .models
+            .iter()
+            .any(|model| model.id == "future-embedder")
+    );
+    assert_eq!(catalog.models.len(), 3);
+    assert!(notes.iter().any(|note| note.contains("future-embedder")));
+    // Every ASR model from the original fixture survived untouched.
+    for id in ["qwen3-asr-0.6b", "qwen3-asr-1.7b", "whisper-small"] {
+        assert!(catalog.models.iter().any(|model| model.id == id));
+    }
+}
+
+#[test]
+fn filter_never_touches_unrecognized_language_codes() {
+    // Unlike kind/license_class/capability role, `languages` is a plain
+    // Vec<String> with no enum -- a code this build has never heard of must
+    // survive filtering untouched (it is a data anomaly for NOTHING to
+    // filter; display falls back to the raw code elsewhere).
+    let mut catalog = alias_contract_catalog();
+    catalog.models[0]
+        .languages
+        .push("zh-mars-colony".to_string());
+
+    let notes = super::filter_forward_compatible_catalog(&mut catalog);
+
+    assert!(notes.is_empty());
+    assert_eq!(catalog.models.len(), 3);
+    assert!(
+        catalog.models[0]
+            .languages
+            .contains(&"zh-mars-colony".to_string())
+    );
+}
+
+#[test]
+fn catalog_parser_accepts_unknown_top_level_and_model_fields() {
+    // Forward compat for unrecognized JSON keys: neither `ModelCatalog` nor
+    // `CatalogModel` declare `#[serde(deny_unknown_fields)]`, so a future
+    // field this build doesn't know about must be silently ignored, not
+    // reject the catalog.
+    let mut value: serde_json::Value = serde_json::from_str(&catalog_json()).unwrap();
+    value["a_future_top_level_field"] = serde_json::json!("unexpected");
+    value["models"][0]["a_future_model_field"] = serde_json::json!({"nested": true});
+    let contents = serde_json::to_string(&value).unwrap();
+
+    let catalog = parse_model_catalog(&contents, "fixture")
+        .expect("unrecognized fields must be ignored, not fail the parse");
+    assert_eq!(catalog.models.len(), 2);
+}
+
+#[test]
+fn catalog_parser_hides_unrecognized_model_kind_via_full_parse_pipeline() {
+    // End-to-end: an unrecognized `kind` string in the wire JSON must not
+    // fail `parse_model_catalog` at all -- the model is silently dropped and
+    // the rest of the catalog parses and validates normally. Before this fix,
+    // `serde_json::from_str::<ModelCatalog>` errored on the very first
+    // unrecognized enum string, rejecting the ENTIRE catalog.
+    let contents = catalog_json().replacen(
+        "\"kind\": \"asr-model\",",
+        "\"kind\": \"future-model-kind\",",
+        1,
+    );
+
+    let catalog = parse_model_catalog(&contents, "fixture")
+        .expect("an unrecognized model kind must hide that model, not fail the whole parse");
+    assert_eq!(catalog.models.len(), 1);
+    assert_eq!(catalog.models[0].id, "moonshine-base");
+}
+
+#[test]
+fn catalog_parser_hides_backend_with_unrecognized_vendor_via_full_parse_pipeline() {
+    let backends = format!(
+        "{},\n{}",
+        valid_hip_backend_json(),
+        valid_hip_backend_json()
+            .replace(
+                "\"id\": \"hip-radeon\"",
+                "\"id\": \"future-vendor-backend\""
+            )
+            .replace("\"vendor\": \"hip\"", "\"vendor\": \"future-vendor\"")
+    );
+    let contents = catalog_json_with_backends(&backends);
+
+    let catalog = parse_model_catalog(&contents, "fixture")
+        .expect("an unrecognized backend vendor must hide that backend, not fail the whole parse");
+    assert_eq!(catalog.backends.len(), 1);
+    assert_eq!(catalog.backends[0].id, "hip-radeon");
+}
+
+#[test]
+fn catalog_parser_hides_backend_with_unrecognized_file_role_via_full_parse_pipeline() {
+    let backends = format!(
+        "{},\n{}",
+        valid_hip_backend_json(),
+        valid_hip_backend_json()
+            .replace("\"id\": \"hip-radeon\"", "\"id\": \"future-role-backend\"")
+            .replace("\"role\": \"archive\"", "\"role\": \"future-file-role\"")
+    );
+    let contents = catalog_json_with_backends(&backends);
+
+    let catalog = parse_model_catalog(&contents, "fixture").expect(
+        "an unrecognized backend file role must hide the whole pack, not fail the whole parse",
+    );
+    assert_eq!(catalog.backends.len(), 1);
+    assert_eq!(catalog.backends[0].id, "hip-radeon");
+}
+
 #[test]
 fn catalog_translation_model_requires_translation_metadata() {
     let mut catalog = alias_contract_catalog();
@@ -1147,7 +1314,7 @@ fn local_dev_catalog_epoch_never_advances_or_is_blocked_by_the_shared_production
 
 #[test]
 fn local_catalog_auto_discovery_rejects_dev_key_bound_to_production_identity() {
-    // S1 regression guard: `load_local_catalog_file_with_identity` is the
+    // S1 regression guard: `preview_local_catalog_file_with_identity` is the
     // repo-checkout auto-discovery path, always called with the canonical
     // production `DEFAULT_CATALOG_URL` identity (see `catalog_cli.rs`). A
     // dev-key-signed manifest bound to that SAME identity must be rejected --
@@ -1175,7 +1342,7 @@ fn local_catalog_auto_discovery_rejects_dev_key_bound_to_production_identity() {
     )
     .unwrap();
 
-    let error = load_local_catalog_file_with_identity(&catalog_path, DEFAULT_CATALOG_URL, &home)
+    let error = preview_local_catalog_file_with_identity(&catalog_path, DEFAULT_CATALOG_URL, &home)
         .unwrap_err()
         .to_string();
     assert!(
@@ -1189,9 +1356,9 @@ fn local_catalog_auto_discovery_accepts_the_real_production_signed_catalog() {
     // Zero-impact check for the S1 fix: the committed, production-signed
     // model-registry/catalog.json + catalog.signature.json pair -- exactly
     // what the CLI's repo-checkout auto-discovery loads via
-    // `load_local_catalog_file_with_identity` -- must still verify once trust
-    // roots for the production identity are scoped to the production key
-    // only.
+    // `preview_local_catalog_file_with_identity` -- must still verify once
+    // trust roots for the production identity are scoped to the production
+    // key only.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry");
     let temp = tempfile::tempdir().unwrap();
     let catalog_path = temp.path().join("catalog.json");
@@ -1203,9 +1370,39 @@ fn local_catalog_auto_discovery_accepts_the_real_production_signed_catalog() {
     )
     .unwrap();
 
-    let catalog = load_local_catalog_file_with_identity(&catalog_path, DEFAULT_CATALOG_URL, &home)
-        .expect("the real committed production catalog + signature must still verify");
+    let catalog =
+        preview_local_catalog_file_with_identity(&catalog_path, DEFAULT_CATALOG_URL, &home)
+            .expect("the real committed production catalog + signature must still verify");
     assert!(!catalog.models.is_empty());
+}
+
+#[test]
+fn preview_local_catalog_file_never_writes_the_shared_cache() {
+    // The fix for the cache-pollution incident: the repo-checkout dev-preview
+    // path must never persist into `$OPENASR_HOME/catalog.json` (or its
+    // signature/epoch sidecars) -- that shared cache is what a REAL installed
+    // OpenASR binary reads as its offline fallback, and the repo's full
+    // catalog.json intentionally carries staged (unreleased) entries. See
+    // docs/CATALOG_COMPATIBILITY.md.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry");
+    let temp = tempfile::tempdir().unwrap();
+    let catalog_path = temp.path().join("catalog.json");
+    let home = temp.path().join("home");
+    fs::copy(root.join("catalog.json"), &catalog_path).unwrap();
+    fs::copy(
+        root.join(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        catalog_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+    )
+    .unwrap();
+
+    let catalog =
+        preview_local_catalog_file_with_identity(&catalog_path, DEFAULT_CATALOG_URL, &home)
+            .expect("the real committed production catalog + signature must still verify");
+    assert!(!catalog.models.is_empty());
+    assert!(
+        !home.exists(),
+        "preview must never create/write $OPENASR_HOME at all"
+    );
 }
 
 #[test]
@@ -1601,9 +1798,17 @@ fn signed_cache_miss_does_not_substitute_embedded_for_custom_source() {
 }
 
 #[test]
-fn embedded_catalog_rejected_on_epoch_rollback() {
-    // Anti-rollback: a recorded epoch newer than the embedded snapshot's makes the
-    // embedded fallback fail closed rather than downgrade an already-seen catalog.
+fn embedded_catalog_degrades_instead_of_bricking_on_epoch_rollback() {
+    // Scenario A (docs/CATALOG_COMPATIBILITY.md's "epoch floor at boot"): this
+    // machine's recorded floor sits above the embedded snapshot's own epoch --
+    // e.g. an older release reinstalled over a newer one, or (the actual
+    // forensic root cause of the 2026-07-16 incident) a dev/test tool
+    // populating $OPENASR_HOME/catalog.epoch from an unrelated, newer catalog
+    // snapshot. The embedded snapshot is the LAST-RESORT boot candidate, so it
+    // must still load in a degraded state, never brick the daemon over a
+    // purely local epoch-marker mismatch. Before this fix, this exact
+    // scenario made `load_embedded_signed_catalog` fail closed with nothing
+    // left to serve.
     let home = tempfile::tempdir().unwrap();
     let verified = crate::catalog_security::verify_catalog_signature_manifest(
         super::EMBEDDED_CATALOG_JSON,
@@ -1612,10 +1817,216 @@ fn embedded_catalog_rejected_on_epoch_rollback() {
     )
     .expect("embedded manifest verifies");
     crate::catalog_security::record_catalog_epoch(home.path(), verified.catalog_epoch + 1).unwrap();
-    let error = super::load_embedded_signed_catalog(home.path())
+
+    let catalog = super::load_embedded_signed_catalog(home.path())
+        .expect("a boot-local candidate below the recorded floor must degrade, not fail closed");
+    assert!(!catalog.models.is_empty());
+
+    let status = crate::catalog_security::read_catalog_degraded_status(home.path())
+        .expect("degraded status must be recorded so /health and doctor can surface it");
+    assert_eq!(status.tier, "embedded");
+    assert!(status.reason.contains("epoch"), "{}", status.reason);
+
+    // The floor itself must NOT move backward: a later, genuinely fresher
+    // network catalog is still held to the real (unmoved) floor -- the fix is
+    // "don't brick the boot", not "relax the anti-rollback guarantee".
+    assert_eq!(
+        crate::catalog_security::read_catalog_epoch(
+            &crate::catalog_security::default_catalog_epoch_path(home.path())
+        )
+        .unwrap(),
+        Some(verified.catalog_epoch + 1)
+    );
+}
+
+#[test]
+fn bundled_local_catalog_degrades_instead_of_bricking_on_epoch_rollback() {
+    // Scenario B: the same "boot-local candidate below floor" case, but for
+    // `load_local_catalog_file_with_identity` -- the desktop's
+    // `OPENASR_CATALOG_FILE`/`OPENASR_CATALOG_IDENTITY` bundled-catalog
+    // startup path (`openasr serve`'s actual entrypoint). Uses the REAL
+    // committed, production-signed `model-registry/catalog.json` + its real
+    // epoch (no forged signature needed): inflating the recorded floor beyond
+    // it reproduces the same forensic root cause as scenario A.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry");
+    let temp = tempfile::tempdir().unwrap();
+    let catalog_path = temp.path().join("catalog.json");
+    let home = temp.path().join("home");
+    fs::copy(root.join("catalog.json"), &catalog_path).unwrap();
+    fs::copy(
+        root.join(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+        catalog_path.with_file_name(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+    )
+    .unwrap();
+    let real_epoch: u64 = fs::read_to_string(root.join(catalog_security::CATALOG_EPOCH_FILE_NAME))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    fs::create_dir_all(&home).unwrap();
+    catalog_security::record_catalog_epoch(&home, real_epoch + 1000).unwrap();
+
+    let catalog = load_local_catalog_file_with_identity(&catalog_path, DEFAULT_CATALOG_URL, &home)
+        .expect("a boot-local candidate below the recorded floor must degrade, not fail closed");
+    assert!(!catalog.models.is_empty());
+
+    let status = catalog_security::read_catalog_degraded_status(&home)
+        .expect("degraded status must be recorded so /health and doctor can surface it");
+    assert_eq!(status.tier, "local");
+
+    // Degrade is about the epoch floor only, not distrust of the content: the
+    // catalog is otherwise fully valid, so it is still cached normally.
+    assert!(default_catalog_cache_path(&home).exists());
+
+    // The floor itself must not move backward.
+    assert_eq!(
+        catalog_security::read_catalog_epoch(&catalog_security::default_catalog_epoch_path(&home))
+            .unwrap(),
+        Some(real_epoch + 1000)
+    );
+}
+
+// ---- 2026-07-16 incident regression matrix: the exact repo catalog.json +
+// signature from the epoch that traces to the cache-pollution incident (see
+// docs/CATALOG_COMPATIBILITY.md), plus the corrected root-cause scenario
+// (a full, non-public catalog projection ending up in the shared cache).
+
+fn incident_fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("tests/fixtures/catalog_incident/{name}"))
+}
+
+#[test]
+fn incident_full_catalog_sample_loads_and_firered_dialect_coverage_is_visible() {
+    // Regardless of the historical failure mechanism, this build must parse
+    // this exact catalog sample successfully -- every model visible,
+    // including firered-aed-l-v2 with its full (then-new) dialect code list,
+    // and an unknown-code filter must never fire on plain `languages` codes.
+    let contents = fs::read_to_string(incident_fixture_path("full_catalog.json")).unwrap();
+    let catalog = parse_model_catalog(&contents, "incident-fixture")
+        .expect("this build must load the incident catalog sample successfully");
+    assert_eq!(catalog.models.len(), 27);
+
+    let firered = catalog
+        .models
+        .iter()
+        .find(|model| model.id == "firered-aed-l-v2")
+        .expect("firered-aed-l-v2 must be present and visible");
+    for code in ["nan", "zh-henan", "zh-hunan", "zh-jiangxi"] {
+        assert!(
+            firered.languages.contains(&code.to_string()),
+            "missing {code} in {:?}",
+            firered.languages
+        );
+    }
+
+    let qwen = catalog
+        .models
+        .iter()
+        .find(|model| model.id == "qwen3-asr-1.7b")
+        .expect("qwen3-asr-1.7b must be present and visible");
+    assert!(qwen.languages.contains(&"zh-zhejiang".to_string()));
+}
+
+#[test]
+fn incident_public_catalog_projection_signature_verifies_under_production_identity() {
+    // The public projection (what catalog.openasr.org actually serves and the
+    // binary embeds) from the same incident epoch must verify and parse
+    // cleanly -- the security/signing side of this epoch was never in
+    // question, only client-side resilience to it.
+    let contents = fs::read_to_string(incident_fixture_path("public_catalog.json")).unwrap();
+    let manifest =
+        fs::read_to_string(incident_fixture_path("public_catalog.signature.json")).unwrap();
+    let verified = catalog_security::verify_catalog_signature_manifest(
+        &contents,
+        &manifest,
+        DEFAULT_CATALOG_URL,
+    )
+    .expect("the incident epoch's public projection must verify under the production key");
+    assert_eq!(verified.catalog_epoch, 2026071601);
+
+    let catalog = parse_model_catalog(&contents, "incident-fixture-public").unwrap();
+    assert!(catalog.models.iter().all(|model| model.public));
+}
+
+#[test]
+fn cache_polluted_with_full_non_public_catalog_degrades_to_embedded_instead_of_bricking() {
+    // The corrected 2026-07-16 incident narrative: $OPENASR_HOME/catalog.json
+    // (+ its signature sidecar) ended up holding the repo's FULL, non-public
+    // catalog projection -- which intentionally carries staged entries for
+    // local dev preview (see `preview_local_catalog_file_with_identity`'s doc
+    // comment) -- instead of the public projection the production endpoint
+    // actually serves. It is validly signed under the production key (no
+    // signature/epoch violation, so this is a DATA anomaly, not a security
+    // one): the cache tier must refuse to trust it as the production catalog
+    // and degrade to the embedded snapshot, not brick the daemon and not
+    // silently serve unreleased models.
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    fs::copy(
+        incident_fixture_path("full_catalog.json"),
+        default_catalog_cache_path(&home),
+    )
+    .unwrap();
+    fs::copy(
+        incident_fixture_path("full_catalog.signature.json"),
+        catalog_security::default_catalog_signature_cache_path(&home),
+    )
+    .unwrap();
+    // Deliberately no epoch marker seeded: this test isolates the
+    // staged-entries anomaly from the separate epoch-floor scenarios (A/B/C
+    // above); the embedded snapshot in THIS build already carries this same
+    // (or a newer) epoch, so no rollback interaction is exercised here.
+
+    let network_error = CatalogError::ReadCatalog {
+        catalog_source: DEFAULT_CATALOG_URL.to_string(),
+        message: "offline".to_string(),
+    };
+    let catalog = super::load_cached_signed_catalog(
+        DEFAULT_CATALOG_URL,
+        &home,
+        &default_catalog_cache_path(&home),
+        network_error,
+    )
+    .expect("a polluted cache must degrade to the embedded catalog, not brick the daemon");
+    // The EMBEDDED catalog is what's actually served -- it must contain no
+    // staged entries (unlike the polluted cache).
+    assert!(catalog.models.iter().all(|model| model.public));
+
+    let status = catalog_security::read_catalog_degraded_status(&home)
+        .expect("degraded status must be recorded so /health and doctor can surface it");
+    assert_eq!(status.tier, "embedded");
+    assert!(status.reason.contains("staged"), "{}", status.reason);
+}
+
+#[test]
+fn parse_and_check_production_catalog_rejects_staged_entries_under_production_key() {
+    let mut catalog = alias_contract_catalog();
+    catalog.models[0].public = false;
+    let contents = serde_json::to_string(&catalog).unwrap();
+    let production = catalog_security::VerifiedCatalogSignature {
+        catalog_epoch: 1,
+        catalog_sha256: "0".repeat(64),
+        key_id: catalog_security::CATALOG_SIGNATURE_KEY_ID.to_string(),
+    };
+
+    let error = super::parse_and_check_production_catalog("fixture", &contents, &production)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("embedded catalog rejected"), "{error}");
+    assert!(error.contains("staged"), "{error}");
+
+    // The exact same payload verified under the LOCAL DEV key is exempt --
+    // dev preview intentionally carries staged entries under a non-production
+    // identity (see `preview_local_catalog_file_with_identity`).
+    let dev = catalog_security::VerifiedCatalogSignature {
+        catalog_epoch: 1,
+        catalog_sha256: "0".repeat(64),
+        key_id: catalog_security::CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID.to_string(),
+    };
+    super::parse_and_check_production_catalog("fixture", &contents, &dev)
+        .expect("a dev-key-verified payload may carry staged entries");
 }
 
 #[test]

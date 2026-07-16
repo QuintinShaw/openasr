@@ -96,12 +96,14 @@ pub use benchmark::{
     render_suite_json, render_suite_markdown,
 };
 pub use catalog_security::{
-    CATALOG_EPOCH_FILE_NAME, CATALOG_SIGNATURE_ALGORITHM, CATALOG_SIGNATURE_FILE_NAME,
-    CATALOG_SIGNATURE_KEY_ID, CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID, CATALOG_SIGNATURE_SCHEMA_VERSION,
-    CatalogSecurityError, CatalogSignature, CatalogSignatureManifest,
-    LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX, VerifiedCatalogSignature, catalog_signature_source,
-    default_catalog_epoch_path, default_catalog_signature_cache_path,
-    derive_catalog_public_key_hex, render_catalog_signature_manifest,
+    CATALOG_DEGRADED_MARKER_FILE_NAME, CATALOG_EPOCH_FILE_NAME, CATALOG_SIGNATURE_ALGORITHM,
+    CATALOG_SIGNATURE_FILE_NAME, CATALOG_SIGNATURE_KEY_ID, CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
+    CATALOG_SIGNATURE_SCHEMA_VERSION, CatalogDegradedStatus, CatalogSecurityError,
+    CatalogSignature, CatalogSignatureManifest, LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
+    VerifiedCatalogSignature, catalog_signature_source, clear_catalog_degraded,
+    default_catalog_degraded_marker_path, default_catalog_epoch_path,
+    default_catalog_signature_cache_path, derive_catalog_public_key_hex,
+    read_catalog_degraded_status, record_catalog_degraded, render_catalog_signature_manifest,
     verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
 };
 pub use metrics::{
@@ -308,10 +310,10 @@ pub use registry::{
     load_embedded_signed_catalog, load_local_catalog_file_with_identity, load_model_catalog,
     load_registry, model_cards_from_catalog, model_reference_matches_resolved_source,
     model_refs_match_with_optional_tag_alias, parse_model_catalog, parse_model_ref,
-    recommend_catalog_quant, resolve_catalog_backend_pull, resolve_catalog_pull,
-    resolve_catalog_pull_with_profile, resolve_local_catalog_env_override,
-    resolve_registry_model_ref, resolve_runtime_catalog, resolve_runtime_model_ref,
-    runtime_registry,
+    preview_local_catalog_file_with_identity, recommend_catalog_quant,
+    resolve_catalog_backend_pull, resolve_catalog_pull, resolve_catalog_pull_with_profile,
+    resolve_local_catalog_env_override, resolve_registry_model_ref, resolve_runtime_catalog,
+    resolve_runtime_model_ref, runtime_registry,
 };
 pub use remote_compute::{
     certificate_fingerprint_sha256, pairing_safety_code_for_certificate_fingerprint,

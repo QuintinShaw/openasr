@@ -163,6 +163,67 @@ pub fn default_catalog_epoch_path(openasr_home: impl AsRef<Path>) -> PathBuf {
     openasr_home.as_ref().join(CATALOG_EPOCH_FILE_NAME)
 }
 
+/// Filename for the best-effort "catalog degraded" status marker -- see
+/// [`CatalogDegradedStatus`].
+pub const CATALOG_DEGRADED_MARKER_FILE_NAME: &str = "catalog.degraded.json";
+
+pub fn default_catalog_degraded_marker_path(openasr_home: impl AsRef<Path>) -> PathBuf {
+    openasr_home
+        .as_ref()
+        .join(CATALOG_DEGRADED_MARKER_FILE_NAME)
+}
+
+/// Records that the runtime is currently serving a catalog from a fallback
+/// tier (the on-disk signed cache or the embedded snapshot) rather than a
+/// freshly loaded and verified primary source (network fetch, or the
+/// explicit local/bundled catalog file). Read by `openasr doctor` and the
+/// server's `/health` so an operator can see "catalog degraded" instead of
+/// silently running on stale data with no visible signal -- see
+/// `docs/CATALOG_COMPATIBILITY.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogDegradedStatus {
+    /// Which fallback tier is currently serving: `"cache"` or `"embedded"`.
+    pub tier: String,
+    /// Human-readable reason the primary source could not be used (the
+    /// original load error's `Display` text), for operator diagnostics.
+    pub reason: String,
+}
+
+/// Best-effort: persist [`CatalogDegradedStatus`] so a later `/health`/`doctor`
+/// call can surface it. Never fails the caller -- a write failure here only
+/// makes the status surface stale, it must never turn into a catalog-load
+/// failure (the catalog itself already loaded fine from the fallback tier).
+pub fn record_catalog_degraded(openasr_home: &Path, tier: &str, reason: &str) {
+    let status = CatalogDegradedStatus {
+        tier: tier.to_string(),
+        reason: reason.to_string(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&status) {
+        let _ = atomic_file::write_file_atomically(
+            &default_catalog_degraded_marker_path(openasr_home),
+            json.as_bytes(),
+        );
+    }
+}
+
+/// Best-effort: clear the degraded marker after a fresh primary-source load
+/// succeeds. Never fails the caller; a missing file is not an error.
+pub fn clear_catalog_degraded(openasr_home: &Path) {
+    let _ = fs::remove_file(default_catalog_degraded_marker_path(openasr_home));
+}
+
+/// Reads the current degraded-catalog status, if any. `None` means the last
+/// load used the primary source, or no load has recorded a status yet.
+/// Never errors -- this is a best-effort status read for a health surface,
+/// not a trust decision, so a corrupt/unreadable marker degrades to "unknown"
+/// (treated as not-degraded) rather than propagating an error.
+pub fn read_catalog_degraded_status(
+    openasr_home: impl AsRef<Path>,
+) -> Option<CatalogDegradedStatus> {
+    let contents = fs::read_to_string(default_catalog_degraded_marker_path(openasr_home)).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
 pub fn catalog_signature_source(catalog_source: &str) -> String {
     if let Some(path) = catalog_source.strip_prefix("file://") {
         return format!(
@@ -397,6 +458,61 @@ pub(crate) fn record_catalog_epoch_for_verified(
         return Ok(());
     }
     record_catalog_epoch(openasr_home, verified.catalog_epoch)
+}
+
+/// Outcome of [`enforce_boot_catalog_epoch_for_verified`]: whether a BOOT-LOCAL
+/// catalog candidate (the embedded snapshot, or an explicit local/bundled
+/// catalog file) cleared the anti-rollback epoch floor, or sits below it but
+/// is otherwise fully verified and usable as a last-resort degraded boot
+/// candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootEpochOutcome {
+    /// At or above the recorded floor (or the key does not participate in the
+    /// floor): fully current, no degrade.
+    Current,
+    /// Below the recorded floor, but signature/structure verification
+    /// otherwise passed. See [`enforce_boot_catalog_epoch_for_verified`]'s doc
+    /// comment for why this is not fail-closed for a boot-local candidate.
+    BelowFloor { floor: u64 },
+}
+
+/// Enforces the anti-rollback epoch floor for a BOOT-LOCAL catalog candidate
+/// -- the embedded snapshot ([`crate::load_embedded_signed_catalog`]) or an
+/// explicit local/bundled catalog file
+/// ([`crate::load_local_catalog_file_with_identity`]) -- as opposed to a
+/// REMOTE (network) fetch, which always stays fail-closed on a rollback via
+/// [`enforce_catalog_epoch_for_verified`] (that is the real attack surface:
+/// a compromised/malicious catalog server replaying a stale catalog).
+///
+/// A boot-local candidate legitimately CAN sit below a floor this same
+/// machine previously recorded, with no attack involved: an older release
+/// reinstalled over a newer one (its embedded epoch predates what the newer
+/// build fetched and recorded), or a dev-tool/test that populated
+/// `$OPENASR_HOME/catalog.epoch` from an unrelated newer catalog snapshot.
+/// Refusing to start the daemon at all over a purely local epoch-marker
+/// mismatch has no compensating security benefit -- the floor's job is to
+/// stop a remote replay, not to gate whether this device's own local
+/// candidates may boot. So: if every other check (signature, structure)
+/// passes and only the epoch floor rejects, this returns
+/// `Ok(BootEpochOutcome::BelowFloor)` instead of an error, and the floor is
+/// NOT advanced (the caller must not call [`record_catalog_epoch_for_verified`]
+/// for a `BelowFloor` outcome) -- so a later, genuinely fresher network
+/// catalog is still held to the real (unmoved) floor. See
+/// `docs/CATALOG_COMPATIBILITY.md`'s "epoch floor at boot" section.
+pub(crate) fn enforce_boot_catalog_epoch_for_verified(
+    openasr_home: &Path,
+    verified: &VerifiedCatalogSignature,
+) -> Result<BootEpochOutcome, CatalogSecurityError> {
+    if !participates_in_epoch_floor(&verified.key_id) {
+        return Ok(BootEpochOutcome::Current);
+    }
+    match enforce_catalog_epoch(openasr_home, verified.catalog_epoch) {
+        Ok(()) => Ok(BootEpochOutcome::Current),
+        Err(CatalogSecurityError::EpochRollback { stored, .. }) => {
+            Ok(BootEpochOutcome::BelowFloor { floor: stored })
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Classifies a catalog `catalog_url`/identity into the two trust domains a
@@ -831,6 +947,43 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("rollback"), "{error}");
+    }
+
+    #[test]
+    fn boot_epoch_degrades_below_floor_while_strict_enforcement_stays_fail_closed() {
+        // Scenario C (docs/CATALOG_COMPATIBILITY.md's "epoch floor at boot"):
+        // pins the core behavioral distinction the boot-path fix rests on, for
+        // the SAME (production-key, below-floor) verified signature --
+        // `enforce_catalog_epoch_for_verified` (the network fetch and on-disk
+        // signed-cache trust tiers, `registry::read_and_verify_catalog_manifest`
+        // / `registry::read_and_verify_cached_catalog_manifest`) stays
+        // fail-closed, because a REMOTE source rejecting a rollback IS the
+        // real attack surface (a compromised/malicious catalog server
+        // replaying a stale catalog) -- while
+        // `enforce_boot_catalog_epoch_for_verified` (the embedded snapshot and
+        // an explicit local/bundled catalog file -- boot-local candidates
+        // with no remote replay involved) degrades instead of erroring.
+        let temp = tempfile::tempdir().unwrap();
+        record_catalog_epoch(temp.path(), 10).unwrap();
+        let low = VerifiedCatalogSignature {
+            catalog_epoch: 9,
+            catalog_sha256: "0".repeat(64),
+            key_id: CATALOG_SIGNATURE_KEY_ID.to_string(),
+        };
+
+        let error = enforce_catalog_epoch_for_verified(temp.path(), &low)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rollback"), "{error}");
+
+        let outcome = enforce_boot_catalog_epoch_for_verified(temp.path(), &low).unwrap();
+        assert_eq!(outcome, BootEpochOutcome::BelowFloor { floor: 10 });
+
+        // Neither call advances (or otherwise disturbs) the recorded floor.
+        assert_eq!(
+            read_catalog_epoch(&default_catalog_epoch_path(temp.path())).unwrap(),
+            Some(10)
+        );
     }
 
     #[test]
