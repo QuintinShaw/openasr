@@ -599,6 +599,109 @@ impl WhisperEncoderPreludeRunner for WhisperCpuEncoderPreludeComputeRunnerV0 {
                     reason: format!("could not initialize ggml cpu graph runner: {error}"),
                 },
             )?;
+        // Conv-stem weight bytes are constant per pack; resolve and encode them
+        // up front so they can live in a WEIGHTS-usage arena (below) instead of
+        // per-call graph-input leaves. ggml's scheduler only offloads a conv/
+        // matmul when its weight `src` lives in a WEIGHTS buffer, so the two
+        // conv_1d ops used to pin the prelude to the CPU even on a Metal backend.
+        // Mel and the run-length positional slice stay genuine graph inputs.
+        let encoder_tensor_index = build_encoder_tensor_index(encoder_weights);
+        let conv1_weight =
+            lookup_encoder_tensor_for_prelude(&encoder_tensor_index, &plan.conv1.weight_name)?;
+        let conv1_bias =
+            lookup_encoder_tensor_for_prelude(&encoder_tensor_index, &plan.conv1.bias_name)?;
+        let conv2_weight =
+            lookup_encoder_tensor_for_prelude(&encoder_tensor_index, &plan.conv2.weight_name)?;
+        let conv2_bias =
+            lookup_encoder_tensor_for_prelude(&encoder_tensor_index, &plan.conv2.bias_name)?;
+        let positional_embedding = lookup_encoder_tensor_for_prelude(
+            &encoder_tensor_index,
+            &plan.positional_embedding.tensor_name,
+        )?;
+
+        let conv1_weight_bits = encode_prelude_conv_weight_f16_bits(conv1_weight, &plan.conv1)?;
+        let conv1_bias_f32 = encoder_tensor_tail_f32_values(conv1_bias, plan.conv1.out_channels)
+            .map_err(|reason| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed { reason })?;
+        let conv2_weight_bits = encode_prelude_conv_weight_f16_bits(conv2_weight, &plan.conv2)?;
+        let conv2_bias_f32 = encoder_tensor_tail_f32_values(conv2_bias, plan.conv2.out_channels)
+            .map_err(|reason| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed { reason })?;
+        let positional_f32 = slice_encoder_positional_embedding_for_prelude(
+            positional_embedding,
+            plan.output_frames,
+            plan.output_hidden_size,
+        )?;
+
+        // Conv-stem weights resident in the arena's WEIGHTS-usage backend buffer
+        // (mirrors the dolphin/cohere encoders). Allocate then upload once; the
+        // uploaded bytes are identical to the previous per-call graph inputs, so
+        // the prelude output is unchanged -- only the buffer each conv op reads
+        // its weight from moves off the compute graph.
+        let mut arena = runner
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(8))
+            .map_err(|error| map_graph_error("static_tensor_arena", error))?;
+        let conv1_w_static = arena
+            .new_tensor_3d_f16(
+                plan.conv1.kernel_size,
+                plan.conv1.in_channels,
+                plan.conv1.out_channels,
+                "conv1_w",
+            )
+            .map_err(|error| map_graph_error("ggml_new_tensor_3d_f16(conv1_w)", error))?;
+        let conv1_b_static = arena
+            .new_tensor_2d_f32(1, plan.conv1.out_channels, "conv1_b")
+            .map_err(|error| map_graph_error("ggml_new_tensor_2d(conv1_b)", error))?;
+        let conv2_w_static = arena
+            .new_tensor_3d_f16(
+                plan.conv2.kernel_size,
+                plan.conv2.in_channels,
+                plan.conv2.out_channels,
+                "conv2_w",
+            )
+            .map_err(|error| map_graph_error("ggml_new_tensor_3d_f16(conv2_w)", error))?;
+        let conv2_b_static = arena
+            .new_tensor_2d_f32(1, plan.conv2.out_channels, "conv2_b")
+            .map_err(|error| map_graph_error("ggml_new_tensor_2d(conv2_b)", error))?;
+        arena
+            .set_f16_bits_slice(conv1_w_static, conv1_weight_bits.as_ref(), "conv1_w")
+            .map_err(
+                |error| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed {
+                    reason: format!(
+                        "could not upload conv1 weight '{}' into prelude arena: {error}",
+                        plan.conv1.weight_name
+                    ),
+                },
+            )?;
+        arena
+            .set_f32_slice(conv1_b_static, conv1_bias_f32.as_ref(), "conv1_b")
+            .map_err(
+                |error| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed {
+                    reason: format!(
+                        "could not upload conv1 bias '{}' into prelude arena: {error}",
+                        plan.conv1.bias_name
+                    ),
+                },
+            )?;
+        arena
+            .set_f16_bits_slice(conv2_w_static, conv2_weight_bits.as_ref(), "conv2_w")
+            .map_err(
+                |error| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed {
+                    reason: format!(
+                        "could not upload conv2 weight '{}' into prelude arena: {error}",
+                        plan.conv2.weight_name
+                    ),
+                },
+            )?;
+        arena
+            .set_f32_slice(conv2_b_static, conv2_bias_f32.as_ref(), "conv2_b")
+            .map_err(
+                |error| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed {
+                    reason: format!(
+                        "could not upload conv2 bias '{}' into prelude arena: {error}",
+                        plan.conv2.bias_name
+                    ),
+                },
+            )?;
+
         let mut graph = runner.start_graph();
 
         let mel = graph
@@ -608,28 +711,6 @@ impl WhisperEncoderPreludeRunner for WhisperCpuEncoderPreludeComputeRunnerV0 {
                 "mel",
             )
             .map_err(|error| map_graph_error("ggml_new_tensor_2d(mel)", error))?;
-        let conv1_w = graph
-            .new_tensor_3d_f16(
-                plan.conv1.kernel_size,
-                plan.conv1.in_channels,
-                plan.conv1.out_channels,
-                "conv1_w",
-            )
-            .map_err(|error| map_graph_error("ggml_new_tensor_3d_f16(conv1_w)", error))?;
-        let conv1_b = graph
-            .new_tensor_2d_f32(1, plan.conv1.out_channels, "conv1_b")
-            .map_err(|error| map_graph_error("ggml_new_tensor_2d(conv1_b)", error))?;
-        let conv2_w = graph
-            .new_tensor_3d_f16(
-                plan.conv2.kernel_size,
-                plan.conv2.in_channels,
-                plan.conv2.out_channels,
-                "conv2_w",
-            )
-            .map_err(|error| map_graph_error("ggml_new_tensor_3d_f16(conv2_w)", error))?;
-        let conv2_b = graph
-            .new_tensor_2d_f32(1, plan.conv2.out_channels, "conv2_b")
-            .map_err(|error| map_graph_error("ggml_new_tensor_2d(conv2_b)", error))?;
         let positional = graph
             .new_tensor_2d_f32(
                 plan.output_hidden_size,
@@ -642,20 +723,13 @@ impl WhisperEncoderPreludeRunner for WhisperCpuEncoderPreludeComputeRunnerV0 {
             .set_input(mel)
             .map_err(|error| map_graph_error("ggml_set_input(mel)", error))?;
         graph
-            .set_input(conv1_w)
-            .map_err(|error| map_graph_error("ggml_set_input(conv1_w)", error))?;
-        graph
-            .set_input(conv1_b)
-            .map_err(|error| map_graph_error("ggml_set_input(conv1_b)", error))?;
-        graph
-            .set_input(conv2_w)
-            .map_err(|error| map_graph_error("ggml_set_input(conv2_w)", error))?;
-        graph
-            .set_input(conv2_b)
-            .map_err(|error| map_graph_error("ggml_set_input(conv2_b)", error))?;
-        graph
             .set_input(positional)
             .map_err(|error| map_graph_error("ggml_set_input(encoder_positional)", error))?;
+
+        let conv1_w = arena.graph_tensor(conv1_w_static);
+        let conv1_b = arena.graph_tensor(conv1_b_static);
+        let conv2_w = arena.graph_tensor(conv2_w_static);
+        let conv2_b = arena.graph_tensor(conv2_b_static);
 
         let conv1 = apply_conv_1d_bias_activation(
             &graph,
@@ -707,77 +781,13 @@ impl WhisperEncoderPreludeRunner for WhisperCpuEncoderPreludeComputeRunnerV0 {
             .set_output(prelude_output)
             .map_err(|error| map_graph_error("ggml_set_output(encoder_prelude)", error))?;
 
+        // Only the genuine per-call inputs are uploaded into the compute graph;
+        // the conv-stem weights already reside in the arena's WEIGHTS buffer.
         graph
             .set_f32_slice(mel, &mel_input.values_f32, "mel")
             .map_err(
                 |error| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed {
                     reason: format!("could not upload mel feature input: {error}"),
-                },
-            )?;
-        let encoder_tensor_index = build_encoder_tensor_index(encoder_weights);
-        let conv1_weight =
-            lookup_encoder_tensor_for_prelude(&encoder_tensor_index, &plan.conv1.weight_name)?;
-        let conv1_bias =
-            lookup_encoder_tensor_for_prelude(&encoder_tensor_index, &plan.conv1.bias_name)?;
-        let conv2_weight =
-            lookup_encoder_tensor_for_prelude(&encoder_tensor_index, &plan.conv2.weight_name)?;
-        let conv2_bias =
-            lookup_encoder_tensor_for_prelude(&encoder_tensor_index, &plan.conv2.bias_name)?;
-        let positional_embedding = lookup_encoder_tensor_for_prelude(
-            &encoder_tensor_index,
-            &plan.positional_embedding.tensor_name,
-        )?;
-
-        let conv1_weight_bits = encode_prelude_conv_weight_f16_bits(conv1_weight, &plan.conv1)?;
-        let conv1_bias_f32 = encoder_tensor_tail_f32_values(conv1_bias, plan.conv1.out_channels)
-            .map_err(|reason| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed { reason })?;
-        let conv2_weight_bits = encode_prelude_conv_weight_f16_bits(conv2_weight, &plan.conv2)?;
-        let conv2_bias_f32 = encoder_tensor_tail_f32_values(conv2_bias, plan.conv2.out_channels)
-            .map_err(|reason| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed { reason })?;
-        let positional_f32 = slice_encoder_positional_embedding_for_prelude(
-            positional_embedding,
-            plan.output_frames,
-            plan.output_hidden_size,
-        )?;
-
-        graph
-            .set_f16_bits_slice(conv1_w, conv1_weight_bits.as_ref(), "conv1_w")
-            .map_err(
-                |error| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed {
-                    reason: format!(
-                        "could not upload conv1 weight '{}' for prelude compute: {error}",
-                        plan.conv1.weight_name
-                    ),
-                },
-            )?;
-        graph
-            .set_f32_slice(conv1_b, conv1_bias_f32.as_ref(), "conv1_b")
-            .map_err(
-                |error| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed {
-                    reason: format!(
-                        "could not upload conv1 bias '{}' for prelude compute: {error}",
-                        plan.conv1.bias_name
-                    ),
-                },
-            )?;
-        graph
-            .set_f16_bits_slice(conv2_w, conv2_weight_bits.as_ref(), "conv2_w")
-            .map_err(
-                |error| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed {
-                    reason: format!(
-                        "could not upload conv2 weight '{}' for prelude compute: {error}",
-                        plan.conv2.weight_name
-                    ),
-                },
-            )?;
-        graph
-            .set_f32_slice(conv2_b, conv2_bias_f32.as_ref(), "conv2_b")
-            .map_err(
-                |error| WhisperGgmlExecutorError::EncoderPreludeExecutionFailed {
-                    reason: format!(
-                        "could not upload conv2 bias '{}' for prelude compute: {error}",
-                        plan.conv2.bias_name
-                    ),
                 },
             )?;
         graph
