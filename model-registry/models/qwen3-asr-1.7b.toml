@@ -1,7 +1,7 @@
 id = "qwen3-asr-1.7b"
 default_variant = "published"
 display_name = "Qwen3-ASR 1.7B (OpenASR pack)"
-languages = ["ar", "cs", "da", "de", "el", "en", "es", "fa", "fi", "fil", "fr", "hi", "hu", "id", "it", "ja", "ko", "mk", "ms", "nl", "pl", "pt", "ro", "ru", "sv", "th", "tr", "vi", "zh"]
+languages = ["ar", "cs", "da", "de", "el", "en", "es", "fa", "fi", "fil", "fr", "hi", "hu", "id", "it", "ja", "ko", "mk", "ms", "nan", "nl", "pl", "pt", "ro", "ru", "sv", "th", "tr", "vi", "wuu", "yue", "zh", "zh-anhui", "zh-dongbei", "zh-fujian", "zh-gansu", "zh-guizhou", "zh-hebei", "zh-henan", "zh-hubei", "zh-hunan", "zh-jiangxi", "zh-ningxia", "zh-shaanxi", "zh-shandong", "zh-shanghai", "zh-shanxi", "zh-sichuan", "zh-tianjin", "zh-yunnan", "zh-zhejiang"]
 size = "1.7b"
 license = "Apache-2.0"
 source = "Published OpenASR packs: https://huggingface.co/OpenASR/qwen3-asr-1.7b"

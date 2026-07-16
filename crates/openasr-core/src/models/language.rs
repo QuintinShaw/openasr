@@ -252,6 +252,7 @@ pub(crate) fn language_display_label(code: &str) -> Option<LanguageDisplayLabel>
         "zh" => ("Chinese", "中文"),
         "yue" => ("Cantonese", "粤语"),
         "wuu" => ("Wu Chinese", "吴语"),
+        "nan" => ("Min Nan Chinese", "闽南语"),
         "zh-sichuan" => ("Chinese (Sichuanese)", "中文（四川话）"),
         "zh-shanghai" => ("Chinese (Shanghainese)", "中文（上海话）"),
         "zh-guangdong" => ("Chinese (Guangdong)", "中文（广东话）"),
@@ -265,24 +266,43 @@ pub(crate) fn language_display_label(code: &str) -> Option<LanguageDisplayLabel>
         "zh-tianjin" => ("Chinese (Tianjin)", "中文（天津话）"),
         "zh-ningxia" => ("Chinese (Ningxia)", "中文（宁夏话）"),
         "zh-tw" => ("Chinese (Taiwan)", "中文（台湾）"),
+        "zh-henan" => ("Chinese (Henan)", "中文（河南话）"),
+        "zh-hunan" => ("Chinese (Hunan)", "中文（湖南话）"),
+        "zh-jiangxi" => ("Chinese (Jiangxi)", "中文（江西话）"),
+        "zh-fujian" => ("Chinese (Fujian)", "中文（福建话）"),
+        "zh-gansu" => ("Chinese (Gansu)", "中文（甘肃话）"),
+        "zh-guizhou" => ("Chinese (Guizhou)", "中文（贵州话）"),
+        "zh-yunnan" => ("Chinese (Yunnan)", "中文（云南话）"),
+        "zh-dongbei" => ("Chinese (Northeastern)", "中文（东北话）"),
+        "zh-zhejiang" => ("Chinese (Zhejiang)", "中文（浙江话）"),
         _ => return None,
     };
     Some(LanguageDisplayLabel { en, zh_cn })
 }
 
 /// The explicit set of registered dialect recognition codes: base-language codes
-/// carrying a `-region` subtag that a model may advertise as a selectable source
-/// language (currently the Chinese province tags Dolphin recognizes). The
+/// carrying a `-region` subtag that a model may advertise -- either as a
+/// selectable source language (Dolphin's `<REGION>` prompt tokens; see
+/// `DOLPHIN_CN_DIALECT_CODES` in `models::dolphin::language` for exactly which
+/// of these its own vocab can select) or as benchmark-verified recognized
+/// coverage for a fixed/auto-detecting family (FireRedASR2, Qwen3-ASR). The
 /// languages validator accepts a `-region` code ONLY if it appears here, so a typo
 /// like `zh-sichaun` fails loudly instead of shipping in a signed catalog. Kept
 /// sorted + de-duplicated, and pinned to `language_display_label` by a test below.
 #[cfg_attr(not(test), allow(dead_code))] // Consumed by the catalog/executor phases.
 pub(crate) const REGISTERED_DIALECT_CODES: &[&str] = &[
     "zh-anhui",
+    "zh-dongbei",
+    "zh-fujian",
+    "zh-gansu",
     "zh-guangdong",
+    "zh-guizhou",
     "zh-hebei",
+    "zh-henan",
     "zh-hubei",
+    "zh-hunan",
     "zh-jiangsu",
+    "zh-jiangxi",
     "zh-ningxia",
     "zh-shaanxi",
     "zh-shandong",
@@ -291,6 +311,8 @@ pub(crate) const REGISTERED_DIALECT_CODES: &[&str] = &[
     "zh-sichuan",
     "zh-tianjin",
     "zh-tw",
+    "zh-yunnan",
+    "zh-zhejiang",
 ];
 
 /// Validate a single advertised recognition-language code. Deliberately distinct

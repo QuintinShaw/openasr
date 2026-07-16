@@ -58,11 +58,11 @@ use crate::ggml_runtime::{
 };
 use crate::models::audio_frontend::mel::{FilterbankConfig, MelPointOrder, MelScale, filterbank};
 use crate::models::dolphin::language::{
-    DOLPHIN_DEFAULT_LANGUAGE_CODE, DOLPHIN_MULTILINGUAL_CATALOG_LANGUAGES,
-    build_dolphin_decode_prefix, build_dolphin_multilingual_decode_prefix,
+    DOLPHIN_CN_DIALECT_CODES, DOLPHIN_DEFAULT_LANGUAGE_CODE,
+    DOLPHIN_MULTILINGUAL_CATALOG_LANGUAGES, build_dolphin_decode_prefix,
+    build_dolphin_multilingual_decode_prefix,
 };
 use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
-use crate::models::language::REGISTERED_DIALECT_CODES;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f32, encode_f16_bits_le,
     validate_error, validate_output_pack_extension,
@@ -283,19 +283,22 @@ fn read_units_txt(path: &std::path::Path) -> Result<Vec<String>, LocalSourceImpo
     Ok(tokens)
 }
 
-/// Fail closed unless every advertised dialect recognition code (Phase 1's
-/// `REGISTERED_DIALECT_CODES` plus the bare `zh` default) builds a full decode
+/// Fail closed unless every advertised dialect recognition code
+/// (`DOLPHIN_CN_DIALECT_CODES` plus the bare `zh` default) builds a full decode
 /// prefix against the shipped vocab -- i.e. its `<REGION>` token and the shared
 /// `<sos>/<zh>/<asr>/<notimestamp>` control tokens are all present. This is the
 /// producer-side guard for the CRITICAL invariant that the picker never advertises
 /// a region the executor cannot honor: if a future checkpoint's `units.txt` drops
 /// a region token, the import fails here rather than shipping a pack whose picker
 /// lies. It runs on the full baked vocab (no single region is baked as *the*
-/// default; the region is selected per request at decode time).
+/// default; the region is selected per request at decode time). Checked against
+/// this family's OWN dialect-code list, not the model-agnostic
+/// `REGISTERED_DIALECT_CODES` union -- see `DOLPHIN_CN_DIALECT_CODES`'s doc
+/// comment for why the two lists diverge.
 fn assert_every_advertised_dialect_code_resolves(
     vocab_tokens: &[String],
 ) -> Result<(), LocalSourceImportError> {
-    for &code in REGISTERED_DIALECT_CODES
+    for &code in DOLPHIN_CN_DIALECT_CODES
         .iter()
         .chain(std::iter::once(&DOLPHIN_DEFAULT_LANGUAGE_CODE))
     {
@@ -992,13 +995,14 @@ mod tests {
     }
 
     /// The full special-token block every advertised dialect code needs
-    /// (control tokens + one `<REGION>` token per registered code plus `<CN>`).
+    /// (control tokens + one `<REGION>` token per this family's dialect code
+    /// plus `<CN>`).
     fn vocab_with_all_dialect_tokens() -> Vec<String> {
         let mut tokens: Vec<String> = ["<sos>", "<eos>", "<asr>", "<zh>", "<notimestamp>", "<CN>"]
             .iter()
             .map(|token| token.to_string())
             .collect();
-        for &code in REGISTERED_DIALECT_CODES {
+        for &code in DOLPHIN_CN_DIALECT_CODES {
             let region = crate::models::dolphin::language::dolphin_region_token_for_code(code)
                 .expect("registered code maps to a region token");
             tokens.push(region.to_string());

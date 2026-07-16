@@ -5,6 +5,7 @@ import unittest
 from datetime import date, timedelta
 
 from _catalog import (
+    DOLPHIN_CN_DIALECT_CODES,
     LANGUAGE_DISPLAY_LABELS,
     LANG_BY_FAMILY,
     REGISTERED_DIALECT_CODES,
@@ -352,15 +353,26 @@ class RecognitionLanguageValidatorTest(unittest.TestCase):
     def test_selective_collapse_blocks_dialect_on_non_dialect_family(self) -> None:
         # A non-dialect-capable family may not enumerate dialect codes.
         with self.assertRaisesRegex(KeyError, "not dialect-capable"):
-            validate_recognition_languages("qwen3-asr-1.7b", "qwen", ["zh", "zh-sichuan"])
-        # Dolphin (dialect-capable) may.
+            validate_recognition_languages("cohere-transcribe", "cohere", ["zh", "zh-sichuan"])
+        # Dolphin (dialect-capable via a code->prompt map) may.
         validate_recognition_languages(
             "dolphin-cn-dialect-small", "dolphin", ["zh", "zh-sichuan"]
         )
+        # firered-aed and qwen (dialect-capable via benchmark-verified
+        # recognition coverage, not a selectable prompt -- see
+        # DIALECT_CAPABLE_FAMILIES's doc comment) may too.
+        validate_recognition_languages(
+            "firered-aed-l-v2", "firered-aed", ["en", "zh", "zh-sichuan"]
+        )
+        validate_recognition_languages("qwen3-asr-1.7b", "qwen", ["zh", "zh-sichuan"])
 
-    def test_dolphin_family_advertises_base_plus_registered_dialects(self) -> None:
-        expected = sorted(["zh", *REGISTERED_DIALECT_CODES])
+    def test_dolphin_family_advertises_base_plus_its_own_dialect_codes(self) -> None:
+        # Dolphin's family default is built from DOLPHIN_CN_DIALECT_CODES (its
+        # own region-prompt capability), not the broader cross-family
+        # REGISTERED_DIALECT_CODES -- see that constant's doc comment.
+        expected = sorted(["zh", *DOLPHIN_CN_DIALECT_CODES])
         self.assertEqual(LANG_BY_FAMILY["dolphin"], expected)
+        self.assertLess(set(DOLPHIN_CN_DIALECT_CODES), set(REGISTERED_DIALECT_CODES))
         # Resolving through the public seam validates + returns the same set.
         resolved = languages_for_model({"id": "dolphin-cn-dialect-small", "family": "dolphin"})
         self.assertEqual(resolved, expected)

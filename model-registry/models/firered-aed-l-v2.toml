@@ -1,7 +1,7 @@
 id = "firered-aed-l-v2"
 default_variant = "published"
 display_name = "FireRedASR2 AED-L (OpenASR pack)"
-languages = ["en", "zh"]
+languages = ["en", "nan", "wuu", "yue", "zh", "zh-anhui", "zh-dongbei", "zh-fujian", "zh-gansu", "zh-guizhou", "zh-hebei", "zh-henan", "zh-hubei", "zh-hunan", "zh-jiangxi", "zh-ningxia", "zh-shaanxi", "zh-shandong", "zh-shanghai", "zh-shanxi", "zh-sichuan", "zh-tianjin", "zh-yunnan"]
 size = "l"
 license = "Apache-2.0"
 source = "Published OpenASR packs: https://huggingface.co/OpenASR/firered-aed-l-v2"
