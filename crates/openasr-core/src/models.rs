@@ -32,6 +32,7 @@ pub(crate) mod kaldi_fbank;
 pub(crate) mod language;
 pub(crate) mod local_source_import;
 pub(crate) mod lora_adapter;
+pub(crate) mod mimo_asr;
 pub mod moonshine;
 pub mod oasr_metadata;
 pub mod pack_quant;

@@ -941,6 +941,31 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
                 )
             })
         }
+        crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID => {
+            crate::models::mimo_asr::runtime_contract::parse_mimo_llm_metadata(&metadata)
+                .map(|_| ())
+                .and_then(|()| {
+                    crate::models::mimo_asr::runtime_contract::parse_mimo_inlocal_metadata(&metadata)
+                        .map(|_| ())
+                })
+                .and_then(|()| {
+                    crate::models::mimo_asr::runtime_contract::parse_mimo_audiotok_metadata(&metadata)
+                        .map(|_| ())
+                })
+                .and_then(|()| {
+                    crate::models::mimo_asr::runtime_contract::parse_mimo_mel_metadata(&metadata)
+                        .map(|_| ())
+                })
+                .and_then(|()| {
+                    crate::models::mimo_asr::runtime_contract::parse_mimo_special_tokens(&metadata)
+                        .map(|_| ())
+                })
+                .map_err(|error| {
+                    format!(
+                        "mimo-asr runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
+                    )
+                })
+        }
         // No dedicated required-metadata parser for this architecture (yet):
         // stay Ok() here, same as before this check existed. The executor
         // still fails closed at first load if the pack is incomplete.

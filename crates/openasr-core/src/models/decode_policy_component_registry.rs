@@ -226,6 +226,29 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         ctc_blank_token_id: None,
     },
     BuiltinDecodePolicyComponentDescriptor {
+        // Source of truth is `crate::arch` (same staging precedent as
+        // firered-aed above): mimo-asr has no crate-root re-export.
+        decode_policy_id: crate::arch::MIMO_ASR_DECODE_POLICY_ID,
+        execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
+        // Strips the audio-boundary/speech-slot placeholder tokens
+        // (`<|sosp|>`/`<|eosp|>`/`<|empty|>`/`<|eot|>`/`<|eostm|>`) inside
+        // `MimoAsrTokenizer::decode_text_token_ids` itself, so the driver's
+        // own postprocess stays Identity (mirrors firered-llm's shape: the
+        // eot token is supplied per-request via `eot_token_id`, not a
+        // registry-level stop-token-kind).
+        seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
+        seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
+        // The executor's own 30s-per-chunk hard cap means every chunk is a
+        // fresh ChatML turn -- the conservative longform profile is the
+        // structural fix for the #60 long-audio repetition failure mode,
+        // same reasoning as firered-aed/firered-llm.
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
+        ctc_blank_token_id: None,
+    },
+    BuiltinDecodePolicyComponentDescriptor {
         // hymt2 is an auxiliary translation family (no arch-registry entry, no
         // crate-root re-export); its runtime resolves this descriptor directly
         // by policy id. Source of truth for the id is `crate::arch`.
@@ -870,10 +893,10 @@ mod tests {
             checked += 1;
         }
         // cohere-transcribe + whisper + qwen3-asr + moonshine + firered-aed +
-        // firered-llm.
+        // firered-llm + mimo-asr.
         assert_eq!(
-            checked, 6,
-            "expected exactly 6 greedy-seq2seq architectures to resolve"
+            checked, 7,
+            "expected exactly 7 greedy-seq2seq architectures to resolve"
         );
     }
 
