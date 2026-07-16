@@ -48,6 +48,8 @@ jobs:
       - run: cargo fmt --check
       - name: Catalog drift gate
         run: tooling/publish-model/scripts/regenerate_all.sh --check
+      - name: Install python test dependencies
+        run: python3 -m pip install --user numpy
       - name: Python helper gates
         run: |
           python3 -m unittest discover -s tooling/publish-model/scripts -p '*_test.py'
