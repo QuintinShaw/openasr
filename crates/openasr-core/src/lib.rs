@@ -172,6 +172,10 @@ pub use models::{
         FireRedAedImportRequest, FireRedAedImportResult, FireRedAedQuantizationMode,
         convert_local_firered_aed_source_to_runtime_pack,
     },
+    firered_llm::{
+        FireRedLlmImportRequest, FireRedLlmImportResult, FireRedLlmQuantizationMode,
+        convert_local_firered_llm_source_to_runtime_pack,
+    },
     firered_punc::package_import::{
         FireRedPuncImportRequest, FireRedPuncImportResult, FireRedPuncQuantizationMode,
         convert_local_firered_punc_source_to_runtime_pack,

@@ -12,6 +12,7 @@ pub(crate) mod dolphin;
 pub(crate) mod executor_component_registry;
 pub(crate) mod fastconformer;
 pub(crate) mod firered_aed;
+pub(crate) mod firered_llm;
 pub(crate) mod firered_punc;
 pub(crate) mod frame_sync_streaming_driver;
 pub(crate) mod frontend_component_registry;

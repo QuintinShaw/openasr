@@ -152,6 +152,30 @@ pub(crate) const FIRERED_AED_DECODE_POLICY_ID: &str = "firered-aed.greedy.seq2se
 pub(crate) const FIRERED_AED_RUNTIME_TENSOR_CONTRACT_ID: &str = "firered-aed.runtime-tensors.v0";
 pub(crate) const FIRERED_AED_EXECUTOR_COMPONENT_ID: &str = "firered-aed.ggml-executor.v0";
 
+// firered-llm (FireRedTeam/FireRedASR2-LLM: the firered-aed Conformer encoder
+// (independently-trained weights, NOT byte-identical to firered-aed-l-v2 --
+// see scratchpad/fr2/T1-findings.md S3, joint finetune not frozen-encoder
+// reuse) + a 2x frame-stacking Adapter (2 Linear + ReLU) + a LoRA-merged
+// Qwen2-7B-Instruct decoder, Apache-2.0). Component ids are defined ahead of
+// the full architecture-descriptor entry (the sensevoice/parakeet S2->S4
+// staging precedent): the T2 importer (`models::firered_llm::package_import`)
+// writes them as pack metadata now; the LLM-transformer parameterization
+// (Qwen2 qkv-bias/no-QK-norm), the dedicated executor, and the decode-policy
+// registry entry land in a later stage.
+pub(crate) const FIRERED_LLM_GGML_ARCHITECTURE_ID: &str = "firered-llm-conformer-adapter-qwen2";
+pub(crate) const FIRERED_LLM_MODEL_FAMILY: &str = "firered2-llm";
+pub(crate) const FIRERED_LLM_AUDIO_FRONTEND_ID: &str = "firered-llm.fbank80.16khz.mono.v0";
+pub(crate) const FIRERED_LLM_TOKENIZER_ID: &str = "firered-llm.qwen2-bpe.v0";
+pub(crate) const FIRERED_LLM_DECODE_POLICY_ID: &str = "firered-llm.greedy.seq2seq.v0";
+// Reserved for the runtime-tensor-contract + executor stage (T3/T4): not
+// wired into `BUILTIN_COMPONENT_DESCRIPTORS`/`BUILTIN_ARCHITECTURE_DESCRIPTORS`
+// yet because that requires the Qwen2-parameterized transformer and the
+// dedicated executor, neither of which exist yet. Not dead -- reserved.
+#[allow(dead_code)]
+pub(crate) const FIRERED_LLM_RUNTIME_TENSOR_CONTRACT_ID: &str = "firered-llm.runtime-tensors.v0";
+#[allow(dead_code)]
+pub(crate) const FIRERED_LLM_EXECUTOR_COMPONENT_ID: &str = "firered-llm.ggml-executor.v0";
+
 // hymt2 (Tencent Hunyuan-MT2 subtitle translation, hunyuan-dense decoder-only
 // LLM). An auxiliary text-to-text family, NOT an ASR architecture: it is
 // dispatched through `models::aux_pack_registry` / the translation routes, so
