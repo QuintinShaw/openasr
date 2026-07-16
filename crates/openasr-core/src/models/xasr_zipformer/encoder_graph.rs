@@ -29,7 +29,7 @@ use super::runtime_contract::XasrZipformerExecutionMetadata;
 use super::weights::StoredLinear;
 use crate::ggml_runtime::{
     GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlPersistentGraphSession,
+    GgmlPersistentGraphSession, GgmlStaticTensor, GgmlStaticTensorArena,
 };
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
@@ -173,6 +173,13 @@ pub(crate) struct XasrZipformerEncoderGraph {
     // full-encoder persistent session's prepared (frozen) graph buffer between
     // chunk computes.
     embed_ggml_runner: RefCell<Option<GgmlCpuGraphRunner>>,
+    // Model-lifetime residency for the stack/layer 2-D matmul weights (see
+    // `XasrEncoderWeightArena`). Built once from `ggml_runner`, independent of
+    // `full_encoder_reuse` rebuilds.
+    weight_arena: RefCell<Option<XasrEncoderWeightArena>>,
+    // Model-lifetime residency for the encoder-embed `out` weight (see
+    // `XasrEncoderEmbedWeightArena`). Built once from `embed_ggml_runner`.
+    embed_weight_arena: RefCell<Option<XasrEncoderEmbedWeightArena>>,
     // The OS thread the ggml runners above were last built on. Their GPU-class
     // backend guards are non-owning views into that thread's thread-local
     // backend cache, so when a pooled runtime migrates to another decode worker
@@ -205,6 +212,8 @@ impl XasrZipformerEncoderGraph {
             full_encoder_reuse: RefCell::new(None),
             ggml_runner: RefCell::new(None),
             embed_ggml_runner: RefCell::new(None),
+            weight_arena: RefCell::new(None),
+            embed_weight_arena: RefCell::new(None),
             bound_thread: Cell::new(None),
         })
     }
@@ -223,6 +232,8 @@ impl XasrZipformerEncoderGraph {
             full_encoder_reuse: RefCell::new(None),
             ggml_runner: RefCell::new(None),
             embed_ggml_runner: RefCell::new(None),
+            weight_arena: RefCell::new(None),
+            embed_weight_arena: RefCell::new(None),
             bound_thread: Cell::new(None),
         })
     }
@@ -241,6 +252,8 @@ impl XasrZipformerEncoderGraph {
             full_encoder_reuse: RefCell::new(None),
             ggml_runner: RefCell::new(None),
             embed_ggml_runner: RefCell::new(None),
+            weight_arena: RefCell::new(None),
+            embed_weight_arena: RefCell::new(None),
             bound_thread: Cell::new(None),
         })
     }
@@ -316,15 +329,21 @@ impl XasrZipformerEncoderGraph {
     /// [`thread_moved_since_bind`] for the pooled-runtime migration this guards.
     ///
     /// Clears in field-declaration order: `full_encoder_reuse` holds raw backend
-    /// pointers into `ggml_runner`, so it is dropped first. The runners are pure
-    /// graph builders -- per-utterance encoder cache state lives in the caller's
-    /// `XasrEncoderChunkState`, not here -- so a rebuild only re-pays the graph
-    /// warm-up, never loses decode state.
+    /// pointers into `ggml_runner`, so it is dropped first. `weight_arena` and
+    /// `embed_weight_arena` are cleared alongside their owning runners for the
+    /// same reason -- each arena's backend buffer is a non-owning view into the
+    /// runner's backend, so it cannot outlive the runner it was built from. The
+    /// runners are pure graph builders -- per-utterance encoder cache state
+    /// lives in the caller's `XasrEncoderChunkState`, not here -- so a rebuild
+    /// only re-pays the graph warm-up (and the arena's one-time weight upload),
+    /// never loses decode state.
     fn rebind_ggml_runners_to_current_thread(&self) {
         if thread_moved_since_bind(&self.bound_thread, std::thread::current().id()) {
             *self.full_encoder_reuse.borrow_mut() = None;
             *self.ggml_runner.borrow_mut() = None;
+            *self.weight_arena.borrow_mut() = None;
             *self.embed_ggml_runner.borrow_mut() = None;
+            *self.embed_weight_arena.borrow_mut() = None;
         }
     }
 
@@ -389,11 +408,19 @@ impl XasrZipformerEncoderGraph {
         // full-encoder persistent session's runner so it cannot invalidate the
         // prepared graph's frozen buffers.
         let mut runner_slot = self.embed_ggml_runner.borrow_mut();
+        let mut arena_slot = self.embed_weight_arena.borrow_mut();
         if runner_slot.is_none() {
-            *runner_slot = Some(map_ggml_stage(
-                "encoder_embed_runner_init",
-                GgmlCpuGraphRunner::new(config),
+            let runner =
+                map_ggml_stage("encoder_embed_runner_init", GgmlCpuGraphRunner::new(config))?;
+            // Built once, alongside the runner: residency for `out`'s 2-D
+            // matmul weight so it lands in a WEIGHTS-usage buffer instead of
+            // being re-uploaded into the rebuild-every-chunk graph's compute
+            // buffer (see `XasrEncoderEmbedWeightArena`).
+            *arena_slot = Some(map_ggml_stage(
+                "encoder_embed_weight_arena_init",
+                build_xasr_embed_weight_arena(&runner, &self.weights.embed),
             )?);
+            *runner_slot = Some(runner);
             xasr_encoder_profile_log(
                 "encoder_graph_runner_init",
                 runner_profile,
@@ -417,6 +444,12 @@ impl XasrZipformerEncoderGraph {
             .ok_or_else(|| XasrEncoderGraphError::Shape {
                 reason: "GGML encoder embed runner cache was not initialized".to_string(),
             })?;
+        let embed_weight_arena =
+            arena_slot
+                .as_ref()
+                .ok_or_else(|| XasrEncoderGraphError::Shape {
+                    reason: "GGML encoder embed weight arena was not initialized".to_string(),
+                })?;
         let build_profile = xasr_encoder_profile_start();
         let mut graph = runner.start_graph();
         let binding = map_ggml_stage(
@@ -426,6 +459,7 @@ impl XasrZipformerEncoderGraph {
                 &self.weights.embed,
                 input.frames,
                 input.feature_dim,
+                embed_weight_arena,
             ),
         )?;
         binding.set_inputs(&mut graph)?;
@@ -621,17 +655,32 @@ impl XasrZipformerEncoderGraph {
                 reason: "GGML stack0 backend requires a graph config".to_string(),
             })?;
         let mut runner_slot = self.ggml_runner.borrow_mut();
+        let mut arena_slot = self.weight_arena.borrow_mut();
         if runner_slot.is_none() {
-            *runner_slot = Some(map_ggml_stage(
-                "stack0_runner_init",
-                GgmlCpuGraphRunner::new(config),
+            let runner = map_ggml_stage("stack0_runner_init", GgmlCpuGraphRunner::new(config))?;
+            *arena_slot = Some(map_ggml_stage(
+                "stack0_weight_arena_init",
+                build_xasr_weight_arena(&runner, &self.weights),
             )?);
+            *runner_slot = Some(runner);
         }
         let runner = runner_slot
             .as_mut()
             .ok_or_else(|| XasrEncoderGraphError::Shape {
                 reason: "GGML stack0 runner cache was not initialized".to_string(),
             })?;
+        let weight_arena = arena_slot
+            .as_ref()
+            .ok_or_else(|| XasrEncoderGraphError::Shape {
+                reason: "GGML stack0 weight arena was not initialized".to_string(),
+            })?;
+        let stack_arena =
+            weight_arena
+                .stacks
+                .get(stack.stack)
+                .ok_or_else(|| XasrEncoderGraphError::Shape {
+                    reason: format!("weight arena missing stack{}", stack.stack),
+                })?;
         let mut graph = runner.start_graph();
         let input = map_ggml_stage(
             "stack0_input_alloc",
@@ -641,7 +690,15 @@ impl XasrZipformerEncoderGraph {
 
         let mut state = input;
         let mut bindings = Vec::with_capacity(stack.layers.len());
-        for layer in &stack.layers {
+        for (layer_index, layer) in stack.layers.iter().enumerate() {
+            let layer_arena = stack_arena.layers.get(layer_index).ok_or_else(|| {
+                XasrEncoderGraphError::Shape {
+                    reason: format!(
+                        "weight arena missing stack{} layer{layer_index}",
+                        stack.stack
+                    ),
+                }
+            })?;
             let binding = map_ggml_stage(
                 "stack0_layer_alloc",
                 XasrZipformerLayerGraphBinding::new(
@@ -652,6 +709,7 @@ impl XasrZipformerEncoderGraph {
                     self.metadata.left_context_len[0],
                     self.metadata.num_heads[0],
                     self.metadata.query_head_dims[0],
+                    layer_arena,
                 ),
             )?;
             binding.set_inputs(&mut graph)?;
@@ -805,6 +863,17 @@ impl XasrZipformerEncoderGraph {
             .ok_or_else(|| XasrEncoderGraphError::Shape {
                 reason: "GGML full encoder runner cache was not initialized".to_string(),
             })?;
+        // This branch (capture_caches=false, no persistent session) is
+        // dev/incremental-construction scaffolding, not reachable from the
+        // production streaming path (which always requests capture_caches=true
+        // and returns above via `encode_from_embed_rows_ggml_full_reused`), so
+        // a request-scoped arena here is sufficient: it satisfies the same
+        // WEIGHTS-usage residency contract as the layer binding now requires,
+        // without wiring this rarely-used path into `self.weight_arena`.
+        let weight_arena = map_ggml_stage(
+            "full_encoder_dev_weight_arena_init",
+            build_xasr_weight_arena(runner, &self.weights),
+        )?;
         let build_profile = xasr_encoder_profile_start();
         let mut graph = runner.start_graph();
         let input = map_ggml_stage(
@@ -880,6 +949,15 @@ impl XasrZipformerEncoderGraph {
                 };
 
             for (layer_index, layer) in stack.layers.iter().enumerate() {
+                let layer_arena = weight_arena
+                    .stacks
+                    .get(stack_index)
+                    .and_then(|stack_arena| stack_arena.layers.get(layer_index))
+                    .ok_or_else(|| XasrEncoderGraphError::Shape {
+                        reason: format!(
+                            "weight arena missing stack{stack_index} layer{layer_index}"
+                        ),
+                    })?;
                 let binding = map_ggml_stage(
                     "full_encoder_layer_alloc",
                     XasrZipformerLayerGraphBinding::new(
@@ -890,6 +968,7 @@ impl XasrZipformerEncoderGraph {
                         self.metadata.left_context_len[stack_index],
                         self.metadata.num_heads[stack_index],
                         self.metadata.query_head_dims[stack_index],
+                        layer_arena,
                     ),
                 )?;
                 binding.set_inputs(&mut graph)?;
@@ -1140,11 +1219,20 @@ impl XasrZipformerEncoderGraph {
             if needs_rebuild {
                 let runner_profile = xasr_encoder_profile_start();
                 let mut runner_slot = self.ggml_runner.borrow_mut();
+                let mut arena_slot = self.weight_arena.borrow_mut();
                 if runner_slot.is_none() {
-                    *runner_slot = Some(map_ggml_stage(
+                    let runner = map_ggml_stage(
                         "full_encoder_runner_init",
                         GgmlCpuGraphRunner::new(config),
+                    )?;
+                    // Built once, alongside the runner, independent of how many
+                    // times the session below gets rebuilt for geometry changes
+                    // (see `XasrEncoderWeightArena`'s doc comment).
+                    *arena_slot = Some(map_ggml_stage(
+                        "full_encoder_weight_arena_init",
+                        build_xasr_weight_arena(&runner, &self.weights),
                     )?);
+                    *runner_slot = Some(runner);
                     xasr_encoder_profile_log(
                         "encoder_graph_runner_init",
                         runner_profile,
@@ -1168,6 +1256,13 @@ impl XasrZipformerEncoderGraph {
                     .ok_or_else(|| XasrEncoderGraphError::Shape {
                         reason: "GGML full encoder runner cache was not initialized".to_string(),
                     })?;
+                let weight_arena =
+                    arena_slot
+                        .as_ref()
+                        .ok_or_else(|| XasrEncoderGraphError::Shape {
+                            reason: "GGML full encoder weight arena was not initialized"
+                                .to_string(),
+                        })?;
                 let build_profile = xasr_encoder_profile_start();
                 let mut session = map_ggml_stage(
                     "full_encoder_persistent_session",
@@ -1185,6 +1280,7 @@ impl XasrZipformerEncoderGraph {
                     frames,
                     dim,
                     valid_left_context,
+                    weight_arena,
                 )?;
                 let output_specs = full_encoder_output_specs(&plan, true)?;
                 // Build the forward cgraph and allocate the backend buffer ONCE here.
@@ -1335,6 +1431,7 @@ impl XasrZipformerEncoderGraph {
         frames: usize,
         dim: usize,
         valid_left_context: usize,
+        weight_arena: &XasrEncoderWeightArena,
     ) -> Result<XasrFullEncoderGraphPlan<'a>, XasrEncoderGraphError> {
         let mut trunk_frames = frames;
         let mut trunk_dim = dim;
@@ -1402,6 +1499,15 @@ impl XasrZipformerEncoderGraph {
                 };
 
             for (layer_index, layer) in stack.layers.iter().enumerate() {
+                let layer_arena = weight_arena
+                    .stacks
+                    .get(stack_index)
+                    .and_then(|stack_arena| stack_arena.layers.get(layer_index))
+                    .ok_or_else(|| XasrEncoderGraphError::Shape {
+                        reason: format!(
+                            "weight arena missing stack{stack_index} layer{layer_index}"
+                        ),
+                    })?;
                 let binding = map_ggml_stage(
                     "full_encoder_layer_alloc",
                     XasrZipformerLayerGraphBinding::new(
@@ -1412,6 +1518,7 @@ impl XasrZipformerEncoderGraph {
                         self.metadata.left_context_len[stack_index],
                         self.metadata.num_heads[stack_index],
                         self.metadata.query_head_dims[stack_index],
+                        layer_arena,
                     ),
                 )?;
                 binding.set_persistent_inputs(graph)?;
@@ -2038,6 +2145,7 @@ impl<'a> XasrEncoderEmbedGraphBinding<'a> {
         weights: &XasrEncoderEmbedWeights,
         input_frames: usize,
         feature_dim: usize,
+        weight_arena: &XasrEncoderEmbedWeightArena,
     ) -> Result<Self, GgmlCpuGraphError> {
         let shape = encoder_embed_graph_shape(weights, input_frames, feature_dim)?;
         let features = graph.new_tensor_2d_f32(feature_dim, input_frames, "xasr_embed_features")?;
@@ -2080,11 +2188,10 @@ impl<'a> XasrEncoderEmbedGraphBinding<'a> {
                 weights.convnext_pointwise2.bias.len(),
                 "xasr_embed_cnx_p2_b",
             )?,
-            out_weight: allocate_stored_linear_weight_tensor(
-                graph,
-                &weights.out.weight,
-                "xasr_embed_out_w",
-            )?,
+            // `out` is a 2-D matmul weight resident in the model-lifetime
+            // arena (WEIGHTS-usage buffer), not this rebuild-every-chunk
+            // graph's compute buffer; see `XasrEncoderEmbedWeightArena`.
+            out_weight: weight_arena.out_weight.as_graph_tensor(),
             out_bias: graph.new_tensor_1d_f32(weights.out.bias.len(), "xasr_embed_out_b")?,
             out_norm_bias: graph
                 .new_tensor_1d_f32(weights.out_norm_bias.len(), "xasr_embed_out_norm_b")?,
@@ -2119,7 +2226,10 @@ impl<'a> XasrEncoderEmbedGraphBinding<'a> {
             embed.convnext_pointwise1_bias,
             embed.convnext_pointwise2_weight,
             embed.convnext_pointwise2_bias,
-            embed.out_weight,
+            // `out_weight` is intentionally excluded: it lives in the
+            // model-lifetime weight arena (WEIGHTS-usage buffer), not this
+            // graph's compute buffer, so it must not be marked as a
+            // per-chunk graph input.
             embed.out_bias,
             embed.out_norm_bias,
             embed.swoosh_r_offset,
@@ -2190,7 +2300,15 @@ impl<'a> XasrEncoderEmbedGraphBinding<'a> {
             tensors.convnext_pointwise2_bias,
             &weights.convnext_pointwise2,
         )?;
-        upload_linear_with_bias_tensors(graph, tensors.out_weight, tensors.out_bias, &weights.out)?;
+        // `out_weight` already resides in the model-lifetime weight arena
+        // (uploaded once at construction); only its bias needs a per-chunk
+        // upload here.
+        upload_f32(
+            graph,
+            tensors.out_bias,
+            &weights.out.bias,
+            "xasr_embed_out_b",
+        )?;
         upload_f32(
             graph,
             tensors.out_norm_bias,
@@ -2336,6 +2454,392 @@ struct XasrOutCombinerGraphUpload<'a> {
     scale: GgmlCpuTensor<'a>,
 }
 
+/// Context bytes for the Zipformer weight arena's ggml metadata (tensor
+/// struct headers only -- the context is `no_alloc`, so this does not size
+/// the actual weight data; that lives in the arena's WEIGHTS-usage backend
+/// buffer, sized automatically from the tensors created below). Generously
+/// sized for the ~20 stacks/layers this model ships with.
+const XASR_WEIGHT_ARENA_CONTEXT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Residency for the Zipformer encoder's 2-D matmul weights (the dominant
+/// compute cost): feed-forward/self-attention/nonlin-attention/convolution
+/// in_proj+out_proj matrices and the relative-position linear. Allocated
+/// once, in a WEIGHTS-usage backend buffer separate from any per-chunk
+/// graph, so `ggml_backend_sched` can offload the encoder's `mul_mat` ops to
+/// Metal/GPU instead of pinning the whole encoder to CPU (a src tensor is
+/// only offload-eligible when its buffer usage is WEIGHTS). Biases, norms,
+/// conv kernels, and per-chunk derived tensors (attention masks, positional
+/// encodings, streaming caches, chunkwise conv scale) are intentionally NOT
+/// moved here: their values depend on runtime chunk geometry
+/// (frames/valid_left_context), not just the model weights, so they keep
+/// using the existing per-session upload path unchanged.
+struct XasrEncoderWeightArena {
+    // Keeps the WEIGHTS-usage backend buffer alive for the life of the
+    // encoder; graph tensors below reference it by raw pointer.
+    _arena: GgmlStaticTensorArena,
+    stacks: Vec<XasrStackWeightArena>,
+}
+
+#[derive(Debug, Clone)]
+struct XasrStackWeightArena {
+    layers: Vec<XasrLayerWeightArenaTensors>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct XasrLayerWeightArenaTensors {
+    feed_forward1_in_weight: GgmlStaticTensor,
+    feed_forward1_out_weight: GgmlStaticTensor,
+    feed_forward2_in_weight: GgmlStaticTensor,
+    feed_forward2_out_weight: GgmlStaticTensor,
+    feed_forward3_in_weight: GgmlStaticTensor,
+    feed_forward3_out_weight: GgmlStaticTensor,
+    attn_in_weight: GgmlStaticTensor,
+    attn_pos_weight: GgmlStaticTensor,
+    self1_in_weight: GgmlStaticTensor,
+    self1_out_weight: GgmlStaticTensor,
+    self2_in_weight: GgmlStaticTensor,
+    self2_out_weight: GgmlStaticTensor,
+    nonlin_in_weight: GgmlStaticTensor,
+    nonlin_out_weight: GgmlStaticTensor,
+    conv1_in_weight: GgmlStaticTensor,
+    conv1_out_weight: GgmlStaticTensor,
+    conv2_in_weight: GgmlStaticTensor,
+    conv2_out_weight: GgmlStaticTensor,
+}
+
+/// Allocate a rank-2 `.weight` `mul_mat` operand in the arena. When the
+/// weight carries a native (quantized / f16) payload it is allocated at
+/// that stored ggml type via `new_matmul_weight_2d_typed` (gated to
+/// CPU-supported types for a direct GPU backend), so the weight stays
+/// quantized in the arena's backend buffer and feeds `mul_mat`'s
+/// quantized/f16 lhs path directly. Without a native payload (f32 test
+/// graphs / dequantized providers) it falls back to an f32 tensor.
+fn arena_stored_linear_weight_tensor(
+    arena: &GgmlStaticTensorArena,
+    weight: &StoredLinear,
+    name: &'static str,
+) -> Result<GgmlStaticTensor, GgmlCpuGraphError> {
+    match &weight.native {
+        Some(payload) => arena.new_matmul_weight_2d_typed(
+            weight.input_dim,
+            weight.output_dim,
+            payload.element_type.ggml_type(),
+            name,
+        ),
+        None => arena.new_tensor_2d_f32(weight.input_dim, weight.output_dim, name),
+    }
+}
+
+fn arena_linear_weight_tensor(
+    arena: &GgmlStaticTensorArena,
+    weights: &XasrLinearWithBias,
+    name: &'static str,
+) -> Result<GgmlStaticTensor, GgmlCpuGraphError> {
+    arena_stored_linear_weight_tensor(arena, &weights.weight, name)
+}
+
+fn allocate_layer_weight_arena_tensors(
+    arena: &GgmlStaticTensorArena,
+    layer: &XasrEncoderLayerWeights,
+) -> Result<XasrLayerWeightArenaTensors, GgmlCpuGraphError> {
+    Ok(XasrLayerWeightArenaTensors {
+        feed_forward1_in_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.feed_forward1.in_proj,
+            "xasr_arena_ff1_in_w",
+        )?,
+        feed_forward1_out_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.feed_forward1.out_proj,
+            "xasr_arena_ff1_out_w",
+        )?,
+        feed_forward2_in_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.feed_forward2.in_proj,
+            "xasr_arena_ff2_in_w",
+        )?,
+        feed_forward2_out_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.feed_forward2.out_proj,
+            "xasr_arena_ff2_out_w",
+        )?,
+        feed_forward3_in_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.feed_forward3.in_proj,
+            "xasr_arena_ff3_in_w",
+        )?,
+        feed_forward3_out_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.feed_forward3.out_proj,
+            "xasr_arena_ff3_out_w",
+        )?,
+        attn_in_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.self_attn_weights.in_proj,
+            "xasr_arena_attn_in_w",
+        )?,
+        attn_pos_weight: arena_stored_linear_weight_tensor(
+            arena,
+            &layer.self_attn_weights.linear_pos,
+            "xasr_arena_attn_pos_w",
+        )?,
+        self1_in_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.self_attn1.in_proj,
+            "xasr_arena_self1_in_w",
+        )?,
+        self1_out_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.self_attn1.out_proj,
+            "xasr_arena_self1_out_w",
+        )?,
+        self2_in_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.self_attn2.in_proj,
+            "xasr_arena_self2_in_w",
+        )?,
+        self2_out_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.self_attn2.out_proj,
+            "xasr_arena_self2_out_w",
+        )?,
+        nonlin_in_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.nonlin_attention.in_proj,
+            "xasr_arena_nonlin_in_w",
+        )?,
+        nonlin_out_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.nonlin_attention.out_proj,
+            "xasr_arena_nonlin_out_w",
+        )?,
+        conv1_in_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.conv_module1.in_proj,
+            "xasr_arena_conv1_in_w",
+        )?,
+        conv1_out_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.conv_module1.out_proj,
+            "xasr_arena_conv1_out_w",
+        )?,
+        conv2_in_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.conv_module2.in_proj,
+            "xasr_arena_conv2_in_w",
+        )?,
+        conv2_out_weight: arena_linear_weight_tensor(
+            arena,
+            &layer.conv_module2.out_proj,
+            "xasr_arena_conv2_out_w",
+        )?,
+    })
+}
+
+/// Upload a rank-2 `.weight` `mul_mat` operand into the arena's backend
+/// buffer. A native (quantized / f16) weight uploads its raw ggml block bytes
+/// verbatim (kept quantized, no dequant-to-f32 blow-up); a dequantized weight
+/// uploads its f32 `values`.
+fn upload_arena_stored_linear_weight(
+    arena: &mut GgmlStaticTensorArena,
+    tensor: GgmlStaticTensor,
+    weight: &StoredLinear,
+    name: &'static str,
+) -> Result<(), GgmlCpuGraphError> {
+    match &weight.native {
+        Some(payload) => arena.set_bytes_slice(tensor, payload.bytes(), name),
+        None => arena.set_f32_slice(tensor, &weight.values, name),
+    }
+}
+
+fn upload_arena_linear_weight(
+    arena: &mut GgmlStaticTensorArena,
+    tensor: GgmlStaticTensor,
+    weights: &XasrLinearWithBias,
+    name: &'static str,
+) -> Result<(), GgmlCpuGraphError> {
+    upload_arena_stored_linear_weight(arena, tensor, &weights.weight, name)
+}
+
+fn upload_layer_weight_arena_tensors(
+    arena: &mut GgmlStaticTensorArena,
+    layer: &XasrEncoderLayerWeights,
+    tensors: &XasrLayerWeightArenaTensors,
+) -> Result<(), GgmlCpuGraphError> {
+    upload_arena_linear_weight(
+        arena,
+        tensors.feed_forward1_in_weight,
+        &layer.feed_forward1.in_proj,
+        "xasr_arena_ff1_in_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.feed_forward1_out_weight,
+        &layer.feed_forward1.out_proj,
+        "xasr_arena_ff1_out_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.feed_forward2_in_weight,
+        &layer.feed_forward2.in_proj,
+        "xasr_arena_ff2_in_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.feed_forward2_out_weight,
+        &layer.feed_forward2.out_proj,
+        "xasr_arena_ff2_out_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.feed_forward3_in_weight,
+        &layer.feed_forward3.in_proj,
+        "xasr_arena_ff3_in_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.feed_forward3_out_weight,
+        &layer.feed_forward3.out_proj,
+        "xasr_arena_ff3_out_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.attn_in_weight,
+        &layer.self_attn_weights.in_proj,
+        "xasr_arena_attn_in_w",
+    )?;
+    upload_arena_stored_linear_weight(
+        arena,
+        tensors.attn_pos_weight,
+        &layer.self_attn_weights.linear_pos,
+        "xasr_arena_attn_pos_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.self1_in_weight,
+        &layer.self_attn1.in_proj,
+        "xasr_arena_self1_in_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.self1_out_weight,
+        &layer.self_attn1.out_proj,
+        "xasr_arena_self1_out_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.self2_in_weight,
+        &layer.self_attn2.in_proj,
+        "xasr_arena_self2_in_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.self2_out_weight,
+        &layer.self_attn2.out_proj,
+        "xasr_arena_self2_out_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.nonlin_in_weight,
+        &layer.nonlin_attention.in_proj,
+        "xasr_arena_nonlin_in_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.nonlin_out_weight,
+        &layer.nonlin_attention.out_proj,
+        "xasr_arena_nonlin_out_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.conv1_in_weight,
+        &layer.conv_module1.in_proj,
+        "xasr_arena_conv1_in_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.conv1_out_weight,
+        &layer.conv_module1.out_proj,
+        "xasr_arena_conv1_out_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.conv2_in_weight,
+        &layer.conv_module2.in_proj,
+        "xasr_arena_conv2_in_w",
+    )?;
+    upload_arena_linear_weight(
+        arena,
+        tensors.conv2_out_weight,
+        &layer.conv_module2.out_proj,
+        "xasr_arena_conv2_out_w",
+    )
+}
+
+/// Builds the model-lifetime weight arena for all stacks/layers. Must be
+/// called exactly once per `GgmlCpuGraphRunner` (its backend buffer freezes
+/// after the first upload), independent of how many times the caller's
+/// per-chunk graph/session gets rebuilt for geometry changes.
+fn build_xasr_weight_arena(
+    runner: &GgmlCpuGraphRunner,
+    weights: &XasrEncoderWeights,
+) -> Result<XasrEncoderWeightArena, GgmlCpuGraphError> {
+    let arena = runner.start_static_tensor_arena(XASR_WEIGHT_ARENA_CONTEXT_BYTES)?;
+    let mut stacks = Vec::with_capacity(weights.stacks.len());
+    for stack in &weights.stacks {
+        let mut layers = Vec::with_capacity(stack.layers.len());
+        for layer in &stack.layers {
+            layers.push(allocate_layer_weight_arena_tensors(&arena, layer)?);
+        }
+        stacks.push(XasrStackWeightArena { layers });
+    }
+
+    let mut arena = arena;
+    for (stack, stack_arena) in weights.stacks.iter().zip(&stacks) {
+        for (layer, layer_tensors) in stack.layers.iter().zip(&stack_arena.layers) {
+            upload_layer_weight_arena_tensors(&mut arena, layer, layer_tensors)?;
+        }
+    }
+
+    Ok(XasrEncoderWeightArena {
+        _arena: arena,
+        stacks,
+    })
+}
+
+/// Residency for the encoder-embed's single 2-D matmul weight (`out`, the
+/// projection from the stacked conv-subsampling features into the first
+/// Zipformer stack's model dimension). The embed graph rebuilds its forward
+/// graph every chunk (see `embed_ggml_runner`'s doc comment), so without
+/// this arena `out`'s weight would be re-uploaded into a non-WEIGHTS
+/// compute buffer every chunk, same defect as the per-layer weights above.
+/// The embed's conv front-end stays on the existing per-chunk upload path:
+/// small parameter count, and conv ops offload to GPU poorly regardless of
+/// buffer placement.
+struct XasrEncoderEmbedWeightArena {
+    _arena: GgmlStaticTensorArena,
+    out_weight: GgmlStaticTensor,
+}
+
+fn build_xasr_embed_weight_arena(
+    runner: &GgmlCpuGraphRunner,
+    weights: &XasrEncoderEmbedWeights,
+) -> Result<XasrEncoderEmbedWeightArena, GgmlCpuGraphError> {
+    let arena = runner.start_static_tensor_arena(XASR_WEIGHT_ARENA_CONTEXT_BYTES)?;
+    let out_weight = arena_linear_weight_tensor(&arena, &weights.out, "xasr_arena_embed_out_w")?;
+    let mut arena = arena;
+    upload_arena_linear_weight(
+        &mut arena,
+        out_weight,
+        &weights.out,
+        "xasr_arena_embed_out_w",
+    )?;
+    Ok(XasrEncoderEmbedWeightArena {
+        _arena: arena,
+        out_weight,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 struct XasrZipformerLayerGraphBinding<'a> {
     tensors: XasrZipformerLayerGraphTensors<'a>,
@@ -2351,6 +2855,7 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
         left_context_len: usize,
         num_heads: usize,
         query_head_dim: usize,
+        weight_arena: &XasrLayerWeightArenaTensors,
     ) -> Result<Self, GgmlCpuGraphError> {
         let query_dim =
             num_heads
@@ -2391,7 +2896,12 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
 
         let tensors = XasrZipformerLayerGraphTensors {
             layer_head: XasrLayerHeadGraphTensors {
-                feed_forward1: allocate_feed_forward_tensors(graph, &layer.feed_forward1)?,
+                feed_forward1: allocate_feed_forward_tensors(
+                    graph,
+                    &layer.feed_forward1,
+                    weight_arena.feed_forward1_in_weight,
+                    weight_arena.feed_forward1_out_weight,
+                )?,
                 attention_weights: XasrSelfAttentionWeightsGraphTensors {
                     cache: graph.new_tensor_2d_f32(
                         query_dim,
@@ -2404,42 +2914,31 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                         rel_len,
                         "xasr_stack0_attn_pos",
                     )?,
-                    in_proj_weight: allocate_linear_weight_tensor(
-                        graph,
-                        &attn.in_proj,
-                        "xasr_stack0_attn_in_w",
-                    )?,
+                    // in_proj/linear_pos weights come from the model-lifetime
+                    // weight arena (WEIGHTS-usage buffer); see
+                    // `XasrLayerWeightArenaTensors`.
+                    in_proj_weight: weight_arena.attn_in_weight.as_graph_tensor(),
                     in_proj_bias: allocate_linear_bias_tensor(
                         graph,
                         &attn.in_proj,
                         "xasr_stack0_attn_in_b",
                     )?,
-                    linear_pos_weight: allocate_stored_linear_weight_tensor(
-                        graph,
-                        &attn.linear_pos,
-                        "xasr_stack0_attn_pos_w",
-                    )?,
+                    linear_pos_weight: weight_arena.attn_pos_weight.as_graph_tensor(),
                 },
                 nonlin_cache: graph.new_tensor_2d_f32(
                     nonlin_hidden_dim,
                     left_context_len,
                     "xasr_stack0_nonlin_cache",
                 )?,
-                nonlin_in_proj_weight: allocate_linear_weight_tensor(
-                    graph,
-                    &layer.nonlin_attention.in_proj,
-                    "xasr_stack0_nonlin_in_w",
-                )?,
+                // in_proj/out_proj weights come from the model-lifetime weight
+                // arena (WEIGHTS-usage buffer); see `XasrLayerWeightArenaTensors`.
+                nonlin_in_proj_weight: weight_arena.nonlin_in_weight.as_graph_tensor(),
                 nonlin_in_proj_bias: allocate_linear_bias_tensor(
                     graph,
                     &layer.nonlin_attention.in_proj,
                     "xasr_stack0_nonlin_in_b",
                 )?,
-                nonlin_out_proj_weight: allocate_linear_weight_tensor(
-                    graph,
-                    &layer.nonlin_attention.out_proj,
-                    "xasr_stack0_nonlin_out_w",
-                )?,
+                nonlin_out_proj_weight: weight_arena.nonlin_out_weight.as_graph_tensor(),
                 nonlin_out_proj_bias: allocate_linear_bias_tensor(
                     graph,
                     &layer.nonlin_attention.out_proj,
@@ -2450,21 +2949,13 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                     left_context_len,
                     "xasr_stack0_self1_cache",
                 )?,
-                self1_in_proj_weight: allocate_linear_weight_tensor(
-                    graph,
-                    &layer.self_attn1.in_proj,
-                    "xasr_stack0_self1_in_w",
-                )?,
+                self1_in_proj_weight: weight_arena.self1_in_weight.as_graph_tensor(),
                 self1_in_proj_bias: allocate_linear_bias_tensor(
                     graph,
                     &layer.self_attn1.in_proj,
                     "xasr_stack0_self1_in_b",
                 )?,
-                self1_out_proj_weight: allocate_linear_weight_tensor(
-                    graph,
-                    &layer.self_attn1.out_proj,
-                    "xasr_stack0_self1_out_w",
-                )?,
+                self1_out_proj_weight: weight_arena.self1_out_weight.as_graph_tensor(),
                 self1_out_proj_bias: allocate_linear_bias_tensor(
                     graph,
                     &layer.self_attn1.out_proj,
@@ -2476,8 +2967,15 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                     dim,
                     frames,
                     conv1_cache_len,
+                    weight_arena.conv1_in_weight,
+                    weight_arena.conv1_out_weight,
                 )?,
-                feed_forward2: allocate_feed_forward_tensors(graph, &layer.feed_forward2)?,
+                feed_forward2: allocate_feed_forward_tensors(
+                    graph,
+                    &layer.feed_forward2,
+                    weight_arena.feed_forward2_in_weight,
+                    weight_arena.feed_forward2_out_weight,
+                )?,
                 bypass_mid_scale: graph.new_tensor_1d_f32(dim, "xasr_stack0_bypass_mid_scale")?,
             },
             self2_cache: graph.new_tensor_2d_f32(
@@ -2485,21 +2983,15 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                 left_context_len,
                 "xasr_stack0_self2_cache",
             )?,
-            self2_in_proj_weight: allocate_linear_weight_tensor(
-                graph,
-                &layer.self_attn2.in_proj,
-                "xasr_stack0_self2_in_w",
-            )?,
+            // in_proj/out_proj weights come from the model-lifetime weight
+            // arena (WEIGHTS-usage buffer); see `XasrLayerWeightArenaTensors`.
+            self2_in_proj_weight: weight_arena.self2_in_weight.as_graph_tensor(),
             self2_in_proj_bias: allocate_linear_bias_tensor(
                 graph,
                 &layer.self_attn2.in_proj,
                 "xasr_stack0_self2_in_b",
             )?,
-            self2_out_proj_weight: allocate_linear_weight_tensor(
-                graph,
-                &layer.self_attn2.out_proj,
-                "xasr_stack0_self2_out_w",
-            )?,
+            self2_out_proj_weight: weight_arena.self2_out_weight.as_graph_tensor(),
             self2_out_proj_bias: allocate_linear_bias_tensor(
                 graph,
                 &layer.self_attn2.out_proj,
@@ -2512,8 +3004,15 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                     dim,
                     frames,
                     conv2_cache_len,
+                    weight_arena.conv2_in_weight,
+                    weight_arena.conv2_out_weight,
                 )?,
-                feed_forward3: allocate_feed_forward_tensors(graph, &layer.feed_forward3)?,
+                feed_forward3: allocate_feed_forward_tensors(
+                    graph,
+                    &layer.feed_forward3,
+                    weight_arena.feed_forward3_in_weight,
+                    weight_arena.feed_forward3_out_weight,
+                )?,
                 norm_bias: graph.new_tensor_1d_f32(dim, "xasr_stack0_norm_bias")?,
                 bypass_scale: graph.new_tensor_1d_f32(dim, "xasr_stack0_bypass_scale")?,
             },
@@ -2580,68 +3079,55 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
         let conv1 = head.conv_module1;
         let tail = tensors.layer_tail;
         let conv2 = tail.conv_module2;
+        // The 2-D matmul weight tensors (in_proj/out_proj/linear_pos) are
+        // intentionally excluded here: they resolve to tensors owned by the
+        // model-lifetime `XasrEncoderWeightArena`, not this graph, so they
+        // must not be marked as per-chunk graph inputs (they are never
+        // reset/re-uploaded through this graph builder).
         for tensor in [
-            head.feed_forward1.in_proj_weight,
             head.feed_forward1.in_proj_bias,
-            head.feed_forward1.out_proj_weight,
             head.feed_forward1.out_proj_bias,
             head.feed_forward1.swoosh_l_offset,
             head.feed_forward1.swoosh_l_shift,
             attn.cache,
             attn.mask,
             attn.pos_embedding,
-            attn.in_proj_weight,
             attn.in_proj_bias,
-            attn.linear_pos_weight,
             head.nonlin_cache,
-            head.nonlin_in_proj_weight,
             head.nonlin_in_proj_bias,
-            head.nonlin_out_proj_weight,
             head.nonlin_out_proj_bias,
             head.self1_cache,
-            head.self1_in_proj_weight,
             head.self1_in_proj_bias,
-            head.self1_out_proj_weight,
             head.self1_out_proj_bias,
             conv1.cache,
-            conv1.in_proj_weight,
             conv1.in_proj_bias,
             conv1.causal_kernel,
             conv1.causal_bias,
             conv1.chunk_kernel,
             conv1.chunk_bias,
             conv1.chunk_scale,
-            conv1.out_proj_weight,
             conv1.out_proj_bias,
             conv1.swoosh_r_offset,
             conv1.swoosh_r_shift,
-            head.feed_forward2.in_proj_weight,
             head.feed_forward2.in_proj_bias,
-            head.feed_forward2.out_proj_weight,
             head.feed_forward2.out_proj_bias,
             head.feed_forward2.swoosh_l_offset,
             head.feed_forward2.swoosh_l_shift,
             head.bypass_mid_scale,
             tensors.self2_cache,
-            tensors.self2_in_proj_weight,
             tensors.self2_in_proj_bias,
-            tensors.self2_out_proj_weight,
             tensors.self2_out_proj_bias,
             conv2.cache,
-            conv2.in_proj_weight,
             conv2.in_proj_bias,
             conv2.causal_kernel,
             conv2.causal_bias,
             conv2.chunk_kernel,
             conv2.chunk_bias,
             conv2.chunk_scale,
-            conv2.out_proj_weight,
             conv2.out_proj_bias,
             conv2.swoosh_r_offset,
             conv2.swoosh_r_shift,
-            tail.feed_forward3.in_proj_weight,
             tail.feed_forward3.in_proj_bias,
-            tail.feed_forward3.out_proj_weight,
             tail.feed_forward3.out_proj_bias,
             tail.feed_forward3.swoosh_l_offset,
             tail.feed_forward3.swoosh_l_shift,
@@ -2663,62 +3149,47 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
         let conv1 = head.conv_module1;
         let tail = tensors.layer_tail;
         let conv2 = tail.conv_module2;
+        // See `for_each_input_tensor`: the 2-D matmul weight tensors are
+        // excluded, since they are arena-resident and never allocated in
+        // this graph's own compute buffer (nothing to keep alive here).
         for tensor in [
-            head.feed_forward1.in_proj_weight,
             head.feed_forward1.in_proj_bias,
-            head.feed_forward1.out_proj_weight,
             head.feed_forward1.out_proj_bias,
             head.feed_forward1.swoosh_l_offset,
             head.feed_forward1.swoosh_l_shift,
             attn.mask,
             attn.pos_embedding,
-            attn.in_proj_weight,
             attn.in_proj_bias,
-            attn.linear_pos_weight,
-            head.nonlin_in_proj_weight,
             head.nonlin_in_proj_bias,
-            head.nonlin_out_proj_weight,
             head.nonlin_out_proj_bias,
-            head.self1_in_proj_weight,
             head.self1_in_proj_bias,
-            head.self1_out_proj_weight,
             head.self1_out_proj_bias,
-            conv1.in_proj_weight,
             conv1.in_proj_bias,
             conv1.causal_kernel,
             conv1.causal_bias,
             conv1.chunk_kernel,
             conv1.chunk_bias,
             conv1.chunk_scale,
-            conv1.out_proj_weight,
             conv1.out_proj_bias,
             conv1.swoosh_r_offset,
             conv1.swoosh_r_shift,
-            head.feed_forward2.in_proj_weight,
             head.feed_forward2.in_proj_bias,
-            head.feed_forward2.out_proj_weight,
             head.feed_forward2.out_proj_bias,
             head.feed_forward2.swoosh_l_offset,
             head.feed_forward2.swoosh_l_shift,
             head.bypass_mid_scale,
-            tensors.self2_in_proj_weight,
             tensors.self2_in_proj_bias,
-            tensors.self2_out_proj_weight,
             tensors.self2_out_proj_bias,
-            conv2.in_proj_weight,
             conv2.in_proj_bias,
             conv2.causal_kernel,
             conv2.causal_bias,
             conv2.chunk_kernel,
             conv2.chunk_bias,
             conv2.chunk_scale,
-            conv2.out_proj_weight,
             conv2.out_proj_bias,
             conv2.swoosh_r_offset,
             conv2.swoosh_r_shift,
-            tail.feed_forward3.in_proj_weight,
             tail.feed_forward3.in_proj_bias,
-            tail.feed_forward3.out_proj_weight,
             tail.feed_forward3.out_proj_bias,
             tail.feed_forward3.swoosh_l_offset,
             tail.feed_forward3.swoosh_l_shift,
@@ -2757,17 +3228,19 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
             cache.map(|cache| cache.cached_nonlin_attention.as_slice()),
             "xasr_stack0_nonlin_cache",
         )?;
-        upload_linear_with_bias_tensors(
+        // in_proj/out_proj weights are arena-resident (uploaded once at
+        // construction); only their biases need a per-session upload here.
+        upload_f32(
             graph,
-            head.nonlin_in_proj_weight,
             head.nonlin_in_proj_bias,
-            &layer.nonlin_attention.in_proj,
+            &layer.nonlin_attention.in_proj.bias,
+            "xasr_stack0_nonlin_in_b",
         )?;
-        upload_linear_with_bias_tensors(
+        upload_f32(
             graph,
-            head.nonlin_out_proj_weight,
             head.nonlin_out_proj_bias,
-            &layer.nonlin_attention.out_proj,
+            &layer.nonlin_attention.out_proj.bias,
+            "xasr_stack0_nonlin_out_b",
         )?;
         upload_cache_or_zero(
             graph,
@@ -2776,17 +3249,19 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
             cache.map(|cache| cache.cached_val1.as_slice()),
             "xasr_stack0_self1_cache",
         )?;
-        upload_linear_with_bias_tensors(
+        // in_proj/out_proj weights are arena-resident (uploaded once at
+        // construction); only their biases need a per-session upload here.
+        upload_f32(
             graph,
-            head.self1_in_proj_weight,
             head.self1_in_proj_bias,
-            &layer.self_attn1.in_proj,
+            &layer.self_attn1.in_proj.bias,
+            "xasr_stack0_self1_in_b",
         )?;
-        upload_linear_with_bias_tensors(
+        upload_f32(
             graph,
-            head.self1_out_proj_weight,
             head.self1_out_proj_bias,
-            &layer.self_attn1.out_proj,
+            &layer.self_attn1.out_proj.bias,
+            "xasr_stack0_self1_out_b",
         )?;
         upload_convolution_module_tensors(
             graph,
@@ -2811,17 +3286,19 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
             cache.map(|cache| cache.cached_val2.as_slice()),
             "xasr_stack0_self2_cache",
         )?;
-        upload_linear_with_bias_tensors(
+        // in_proj/out_proj weights are arena-resident (uploaded once at
+        // construction); only their biases need a per-session upload here.
+        upload_f32(
             graph,
-            tensors.self2_in_proj_weight,
             tensors.self2_in_proj_bias,
-            &layer.self_attn2.in_proj,
+            &layer.self_attn2.in_proj.bias,
+            "xasr_stack0_self2_in_b",
         )?;
-        upload_linear_with_bias_tensors(
+        upload_f32(
             graph,
-            tensors.self2_out_proj_weight,
             tensors.self2_out_proj_bias,
-            &layer.self_attn2.out_proj,
+            &layer.self_attn2.out_proj.bias,
+            "xasr_stack0_self2_out_b",
         )?;
         upload_convolution_module_tensors(
             graph,
@@ -2908,11 +3385,15 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
 fn allocate_feed_forward_tensors<'a>(
     graph: &mut GgmlCpuGraphBuilder<'a>,
     weights: &XasrLinearPairWeights,
+    in_proj_weight: GgmlStaticTensor,
+    out_proj_weight: GgmlStaticTensor,
 ) -> Result<XasrFeedForwardGraphTensors<'a>, GgmlCpuGraphError> {
     Ok(XasrFeedForwardGraphTensors {
-        in_proj_weight: allocate_linear_weight_tensor(graph, &weights.in_proj, "xasr_ff_in_w")?,
+        // in_proj/out_proj weights come from the model-lifetime weight arena
+        // (WEIGHTS-usage buffer); see `XasrLayerWeightArenaTensors`.
+        in_proj_weight: in_proj_weight.as_graph_tensor(),
         in_proj_bias: allocate_linear_bias_tensor(graph, &weights.in_proj, "xasr_ff_in_b")?,
-        out_proj_weight: allocate_linear_weight_tensor(graph, &weights.out_proj, "xasr_ff_out_w")?,
+        out_proj_weight: out_proj_weight.as_graph_tensor(),
         out_proj_bias: allocate_linear_bias_tensor(graph, &weights.out_proj, "xasr_ff_out_b")?,
         swoosh_l_offset: graph.new_tensor_1d_f32(1, "xasr_ff_swoosh_l_offset")?,
         swoosh_l_shift: graph.new_tensor_1d_f32(1, "xasr_ff_swoosh_l_shift")?,
@@ -2925,10 +3406,14 @@ fn allocate_convolution_module_tensors<'a>(
     dim: usize,
     frames: usize,
     cache_len: usize,
+    in_proj_weight: GgmlStaticTensor,
+    out_proj_weight: GgmlStaticTensor,
 ) -> Result<XasrConvolutionModuleGraphTensors<'a>, GgmlCpuGraphError> {
     Ok(XasrConvolutionModuleGraphTensors {
         cache: graph.new_tensor_2d_f32(cache_len, dim, "xasr_conv_cache")?,
-        in_proj_weight: allocate_linear_weight_tensor(graph, &weights.in_proj, "xasr_conv_in_w")?,
+        // in_proj/out_proj weights come from the model-lifetime weight arena
+        // (WEIGHTS-usage buffer); see `XasrLayerWeightArenaTensors`.
+        in_proj_weight: in_proj_weight.as_graph_tensor(),
         in_proj_bias: allocate_linear_bias_tensor(graph, &weights.in_proj, "xasr_conv_in_b")?,
         causal_kernel: graph.new_tensor_3d_f32(
             conv1d_kernel_len(weights)?,
@@ -2945,71 +3430,11 @@ fn allocate_convolution_module_tensors<'a>(
         )?,
         chunk_bias: graph.new_tensor_1d_f32(dim, "xasr_conv_chunk_b")?,
         chunk_scale: graph.new_tensor_2d_f32(frames, dim, "xasr_conv_chunk_scale")?,
-        out_proj_weight: allocate_linear_weight_tensor(
-            graph,
-            &weights.out_proj,
-            "xasr_conv_out_w",
-        )?,
+        out_proj_weight: out_proj_weight.as_graph_tensor(),
         out_proj_bias: allocate_linear_bias_tensor(graph, &weights.out_proj, "xasr_conv_out_b")?,
         swoosh_r_offset: graph.new_tensor_1d_f32(1, "xasr_conv_swoosh_r_offset")?,
         swoosh_r_shift: graph.new_tensor_1d_f32(1, "xasr_conv_swoosh_r_shift")?,
     })
-}
-
-fn allocate_linear_weight_tensor<'a>(
-    graph: &mut GgmlCpuGraphBuilder<'a>,
-    weights: &XasrLinearWithBias,
-    name: &'static str,
-) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
-    allocate_stored_linear_weight_tensor(graph, &weights.weight, name)
-}
-
-/// Allocate the ggml tensor for a rank-2 `.weight` `mul_mat` operand. When the
-/// weight carries a native (quantized / f16) payload it is allocated at that
-/// stored ggml type via `new_matmul_weight_2d_typed` -- gated to CPU-supported
-/// types for a direct GPU backend -- so the weight stays quantized in the backend
-/// buffer and feeds `mul_mat`'s quantized/f16 lhs path directly. Without a native
-/// payload (f32 test graphs / dequantized providers) it falls back to an f32
-/// tensor. The stored layout is `[ne0=in, ne1=out]` (the importer already reversed
-/// HF `[out, in]`), so the raw block bytes upload order-preserving.
-fn allocate_stored_linear_weight_tensor<'a>(
-    graph: &mut GgmlCpuGraphBuilder<'a>,
-    weight: &StoredLinear,
-    name: &'static str,
-) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
-    match &weight.native {
-        Some(payload) => graph.new_matmul_weight_2d_typed(
-            weight.input_dim,
-            weight.output_dim,
-            payload.element_type.ggml_type(),
-            name,
-        ),
-        None => graph.new_tensor_2d_f32(weight.input_dim, weight.output_dim, name),
-    }
-}
-
-/// Upload a rank-2 `.weight` `mul_mat` operand. A native (quantized / f16) weight
-/// uploads its raw ggml block bytes verbatim (kept quantized in the backend
-/// buffer, no dequant-to-f32 blow-up); a dequantized weight uploads its f32
-/// `values`.
-fn upload_stored_linear_weight_tensor<'a>(
-    graph: &mut GgmlCpuGraphBuilder<'a>,
-    tensor: GgmlCpuTensor<'a>,
-    weight: &StoredLinear,
-    name: &'static str,
-) -> Result<(), XasrEncoderGraphError> {
-    match &weight.native {
-        Some(payload) => map_ggml_stage(
-            "stack0_layer_upload",
-            graph.set_matmul_weight_bytes(
-                tensor,
-                payload.bytes(),
-                payload.element_type.ggml_type(),
-                name,
-            ),
-        ),
-        None => upload_f32(graph, tensor, &weight.values, name),
-    }
 }
 
 fn allocate_linear_bias_tensor<'a>(
@@ -3176,17 +3601,13 @@ fn upload_attention_weights_tensors<'a>(
         &pos_embedding,
         "xasr_stack0_attn_pos",
     )?;
-    upload_linear_with_bias_tensors(
+    // in_proj/linear_pos weights are arena-resident (uploaded once at
+    // construction); only in_proj's bias needs a per-session upload here.
+    upload_f32(
         graph,
-        tensors.in_proj_weight,
         tensors.in_proj_bias,
-        &weights.in_proj,
-    )?;
-    upload_stored_linear_weight_tensor(
-        graph,
-        tensors.linear_pos_weight,
-        &weights.linear_pos,
-        "xasr_stack0_attn_pos_w",
+        &weights.in_proj.bias,
+        "xasr_stack0_attn_in_b",
     )
 }
 
@@ -3211,11 +3632,13 @@ fn upload_convolution_module_tensors<'a>(
         cache,
         "xasr_conv_cache",
     )?;
-    upload_linear_with_bias_tensors(
+    // in_proj/out_proj weights are arena-resident (uploaded once at
+    // construction); only their biases need a per-session upload here.
+    upload_f32(
         graph,
-        tensors.in_proj_weight,
         tensors.in_proj_bias,
-        &weights.in_proj,
+        &weights.in_proj.bias,
+        "xasr_conv_in_b",
     )?;
     upload_f32(
         graph,
@@ -3248,11 +3671,11 @@ fn upload_convolution_module_tensors<'a>(
         &chunk_scale,
         "xasr_conv_chunk_scale",
     )?;
-    upload_linear_with_bias_tensors(
+    upload_f32(
         graph,
-        tensors.out_proj_weight,
         tensors.out_proj_bias,
-        &weights.out_proj,
+        &weights.out_proj.bias,
+        "xasr_conv_out_b",
     )?;
     upload_f32(
         graph,
@@ -3273,17 +3696,19 @@ fn upload_feed_forward_tensors<'a>(
     tensors: XasrFeedForwardGraphTensors<'a>,
     weights: &XasrLinearPairWeights,
 ) -> Result<(), XasrEncoderGraphError> {
-    upload_linear_with_bias_tensors(
+    // in_proj/out_proj weights are arena-resident (uploaded once at
+    // construction); only their biases need a per-session upload here.
+    upload_f32(
         graph,
-        tensors.in_proj_weight,
         tensors.in_proj_bias,
-        &weights.in_proj,
+        &weights.in_proj.bias,
+        "xasr_ff_in_b",
     )?;
-    upload_linear_with_bias_tensors(
+    upload_f32(
         graph,
-        tensors.out_proj_weight,
         tensors.out_proj_bias,
-        &weights.out_proj,
+        &weights.out_proj.bias,
+        "xasr_ff_out_b",
     )?;
     upload_f32(
         graph,
@@ -3297,21 +3722,6 @@ fn upload_feed_forward_tensors<'a>(
         &[SWOOSH_L_SHIFT],
         "xasr_ff_swoosh_l_shift",
     )
-}
-
-fn upload_linear_with_bias_tensors<'a>(
-    graph: &mut GgmlCpuGraphBuilder<'a>,
-    weight_tensor: GgmlCpuTensor<'a>,
-    bias_tensor: GgmlCpuTensor<'a>,
-    weights: &XasrLinearWithBias,
-) -> Result<(), XasrEncoderGraphError> {
-    upload_stored_linear_weight_tensor(
-        graph,
-        weight_tensor,
-        &weights.weight,
-        "xasr_linear_weight",
-    )?;
-    upload_f32(graph, bias_tensor, &weights.bias, "xasr_linear_bias")
 }
 
 fn upload_conv2d_tensors<'a>(
