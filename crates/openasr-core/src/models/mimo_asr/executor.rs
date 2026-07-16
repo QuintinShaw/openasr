@@ -46,7 +46,7 @@ use super::input_local_graph::{
 };
 use super::llm_transformer::MimoLlmDecoderRuntime;
 use super::mel_frontend::{
-    load_mimo_mel_frontend_plan_from_reader, mimo_mel_features_from_samples,
+    load_mimo_mel_frontend_plan_from_reader, mimo_mel_features_from_samples, resample_mono,
 };
 use super::runtime_contract::{
     parse_mimo_audiotok_metadata, parse_mimo_inlocal_metadata, parse_mimo_llm_metadata,
@@ -239,11 +239,23 @@ impl MimoAsrGgmlExecutor {
                     reason: error.to_string(),
                 }
             })?;
-        let mel_features = mimo_mel_features_from_samples(samples, &mel_plan).map_err(|error| {
+        // The OpenASR pipeline delivers 16kHz mono to every executor, but
+        // MiMo's audio tokenizer (and its baked mel filterbank/window) is
+        // trained at 24kHz -- resample up before the mel front-end, matching
+        // the reference `preprocess_input`'s own resample-to-tokenizer-rate.
+        let input_rate = request.prepared_audio.sample_rate_hz;
+        let target_rate = mel_plan.sample_rate_hz as u32;
+        let resampled = resample_mono(samples, input_rate, target_rate).ok_or(
             MimoAsrExecutorError::MelFrontendFailed {
-                reason: error.to_string(),
-            }
-        })?;
+                reason: format!("failed to resample {input_rate}Hz -> {target_rate}Hz"),
+            },
+        )?;
+        let mel_features =
+            mimo_mel_features_from_samples(&resampled, &mel_plan).map_err(|error| {
+                MimoAsrExecutorError::MelFrontendFailed {
+                    reason: error.to_string(),
+                }
+            })?;
 
         let runtime_path = preflight.runtime_source.path();
         let mut encoder_runtime =
@@ -387,7 +399,7 @@ impl MimoAsrGgmlExecutor {
             reason: error.to_string(),
         })?;
 
-        let text = result.text.trim().to_string();
+        let text = strip_mimo_language_tags(&result.text);
         let transcription = Transcription {
             segments: vec![Segment {
                 start: 0.0,
@@ -415,6 +427,27 @@ fn map_registry_error(
     Seq2SeqGreedyDecodeError::DecoderStepFailed {
         reason: error.to_string(),
     }
+}
+
+/// Strip the `<chinese>`/`<english>` language-detection tags MiMo auto-emits
+/// as leading text under this family's automatic-language ASR mode.
+///
+/// We build the decode prompt without an explicit `audio_tag` (see
+/// [`super::decode_prompt`]), i.e. the reference's auto mode, so the model
+/// self-emits the detected language as a leading `<chinese>`/`<english>` marker
+/// (analogous to Whisper's `<|zh|>` tag). These are ordinary decoded *text* --
+/// not vocab special tokens -- so [`super::tokenizer::MimoAsrTokenizer::decode_text_token_ids`]'s
+/// special-token filter never removes them. The reference
+/// `mimo_audio.py::asr_sft` strips them from the returned transcript as a final
+/// per-utterance postprocess step (`result.replace('<chinese>', '')
+/// .replace('<english>', '').strip()`); this mirrors that exactly, applied to
+/// each single-utterance result *before* any longform segment join, so both the
+/// direct and longform paths match the reference's user-visible output.
+fn strip_mimo_language_tags(text: &str) -> String {
+    text.replace("<chinese>", "")
+        .replace("<english>", "")
+        .trim()
+        .to_string()
 }
 
 impl GgmlAsrExecutor for MimoAsrGgmlExecutor {
@@ -470,6 +503,26 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn strip_mimo_language_tags_matches_reference_asr_sft_postprocess() {
+        // Leading auto-tag (the common single-utterance case) is removed and
+        // the exposed leading space trimmed.
+        assert_eq!(
+            strip_mimo_language_tags("<chinese> 今天天气非常好。"),
+            "今天天气非常好。"
+        );
+        assert_eq!(
+            strip_mimo_language_tags("<english> And so, my fellow Americans."),
+            "And so, my fellow Americans."
+        );
+        // Global replace (mirrors Python `str.replace`): every occurrence goes,
+        // and `.trim()` only touches the ends -- an interior tag leaves the
+        // surrounding spaces exactly as the reference's `.strip()` would.
+        assert_eq!(strip_mimo_language_tags("a <chinese> b"), "a  b");
+        // No tag -> only the outer trim applies (a plain no-op replace).
+        assert_eq!(strip_mimo_language_tags("  hello  "), "hello");
+    }
+
     /// Real converted dev pack from P2.1+P2.2 (`tooling/mimo-asr/convert_mimo_asr.py`),
     /// NOT committed to the repo (dev-only artifact, same convention as
     /// firered2-llm's own `tmp-weights/fr2/out/firered2-llm-q8_0.oasr`).
@@ -479,12 +532,56 @@ mod tests {
         )
     }
 
+    // Pinned to the real dev-pack decode (q8_0, `OPENASR_GGML_BACKEND=cpu` --
+    // CPU is the deterministic reference backend; the default Metal backend's
+    // memory fit for this family's ~8B combined weights on a 16GB
+    // unified-memory Mac is unverified, see this module's e2e report). JFK is
+    // word-for-word correct; the Mandarin sentence is sentence-correct
+    // (matches firered-llm/firered-aed's own `zh_sample.wav` reference
+    // meaning, with MiMo additionally emitting punctuation).
+    //
+    // These are the post-`strip_mimo_language_tags` transcripts: the raw decode
+    // leads with the model's auto `<chinese>`/`<english>` language marker (see
+    // that function's doc comment), which the executor strips per-utterance to
+    // match the reference `mimo_audio.py::asr_sft`. `concat!` keeps the literals
+    // robust to line wrapping (a trailing-`\` continuation would silently eat a
+    // significant leading space on the next line).
+    //
+    // Confirmed byte-for-byte against a clean-window re-run of these tests
+    // against the real pack (all three asserted equal below).
+    const GOLDEN_JFK_TEXT: &str = concat!(
+        "And so, my fellow Americans, ask not what your country can do for you. ",
+        "Ask what you can do for your country.",
+    );
+
+    const GOLDEN_ZH_TEXT: &str = concat!(
+        "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，",
+        "听说那里的麻婆豆腐特别正宗。周末的时候，我通常会读书或者看一部电影放松一下。",
+    );
+
+    // Code-switch coverage: `en_zh_mixed.wav` is first 5s of jfk.wav + first
+    // 8s of zh_sample.wav concatenated (see firered-llm's identical fixture
+    // doc comment), a single <=40s utterance -- both languages' tokenizer/
+    // decode paths run in one prefill+decode call, no longform slicing
+    // involved. The transcript correctly switches languages mid-utterance
+    // and both halves truncate exactly where their source clip was cut
+    // (English stops at "ask not", the Mandarin half at the truncated word
+    // "新[开]"). Post-strip like the single-language goldens above.
+    const GOLDEN_EN_ZH_MIXED_TEXT: &str = concat!(
+        "And so, my fellow Americans, ask not. ",
+        "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新",
+    );
+
     fn jfk_wav_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav")
     }
 
     fn zh_wav_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/zh_sample.wav")
+    }
+
+    fn en_zh_mixed_wav_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/en_zh_mixed.wav")
     }
 
     fn transcribe_with_dev_pack(wav_path: PathBuf) -> Option<(String, std::time::Duration, f32)> {
@@ -528,10 +625,10 @@ mod tests {
             return;
         };
         eprintln!(
-            "mimo-asr e2e [jfk.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s text={text:?}",
+            "mimo-asr e2e [jfk.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
-        assert!(!text.is_empty());
+        assert_eq!(text, GOLDEN_JFK_TEXT);
     }
 
     #[test]
@@ -543,9 +640,30 @@ mod tests {
             return;
         };
         eprintln!(
-            "mimo-asr e2e [zh_sample.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s text={text:?}",
+            "mimo-asr e2e [zh_sample.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
-        assert!(!text.is_empty());
+        assert_eq!(text, GOLDEN_ZH_TEXT);
+    }
+
+    // Code-switch coverage: a single <=40s utterance mixing both languages
+    // (no longform slicing involved), reusing the same `en_zh_mixed.wav`
+    // fixture firered-llm's own golden test built (first 5s of jfk.wav +
+    // first 8s of zh_sample.wav) so both families exercise identical
+    // code-switch audio.
+    #[test]
+    #[ignore = "requires the private ~9.6GB dev-only mimo-v2.5-asr-q8_0.oasr pack; \
+                OPENASR_GGML_BACKEND=cpu recommended"]
+    fn golden_diff_end_to_end_transcribe_en_zh_mixed_wav() {
+        let Some((text, elapsed, audio_duration_seconds)) =
+            transcribe_with_dev_pack(en_zh_mixed_wav_path())
+        else {
+            return;
+        };
+        eprintln!(
+            "mimo-asr e2e [en_zh_mixed.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
+            elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
+        );
+        assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);
     }
 }

@@ -507,6 +507,8 @@ def build_metadata(
 
 
 def apply_metadata(writer, items: list[MetaItem]) -> None:
+    import gguf
+
     for it in items:
         if it.kind == "str":
             writer.add_string(it.key, it.value)
@@ -517,7 +519,19 @@ def apply_metadata(writer, items: list[MetaItem]) -> None:
         elif it.kind == "bool":
             writer.add_bool(it.key, it.value)
         elif it.kind == "u32_array":
-            writer.add_array(it.key, it.value)
+            # gguf's add_array infers the element type from the first Python
+            # int, which it maps to *INT32* -- but these are semantically
+            # unsigned counts (codebook/vocab sizes) and the runtime reads them
+            # through an unsigned-array accessor. Force the UINT32 sub-type so
+            # the on-disk type matches the intent (and what the Rust
+            # importers' own u32-array packs emit) instead of a signed array
+            # the reader would reject.
+            writer.add_key_value(
+                it.key,
+                [int(v) for v in it.value],
+                gguf.GGUFValueType.ARRAY,
+                sub_type=gguf.GGUFValueType.UINT32,
+            )
         elif it.kind == "str_array":
             writer.add_array(it.key, it.value)
         else:

@@ -8,10 +8,14 @@
 //! recomputing (so filter construction can never drift between the converter
 //! and the runtime).
 
+use rubato::{FftFixedIn, Resampler};
 use thiserror::Error;
 
 use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
 use crate::models::audio_frontend::{PadMode, StftFramer};
+
+const RESAMPLE_CHUNK_FRAMES: usize = 4096;
+const RESAMPLE_SUB_CHUNKS: usize = 2;
 
 use super::runtime_contract::MimoMelMetadata;
 use super::tensor_names::{AUDIOTOK_MEL_FILTERS, AUDIOTOK_MEL_WINDOW};
@@ -28,6 +32,58 @@ pub(crate) enum MimoMelFrontendError {
     InvalidAudioSamples,
     #[error("mimo-asr mel frontend produced zero frames")]
     NoFrames,
+}
+
+/// Resample mono `input` from `from_hz` to `to_hz` with the same pure-Rust FFT
+/// resampler (`rubato::FftFixedIn`) `audio::symphonia_decode`'s own
+/// 16kHz-target path uses, flushing the resampler's internal delay at the end
+/// so no trailing audio is dropped. The whole OpenASR pipeline delivers 16kHz
+/// mono to every executor, but MiMo's audio tokenizer is trained at 24kHz
+/// (`mimo.mel.sample_rate`), so this family resamples up before its mel
+/// front-end -- mirroring the reference `mimo_audio.py::preprocess_input`'s
+/// own `resample_audio_if_needed(wav, sr)` to the tokenizer's sampling rate.
+pub(crate) fn resample_mono(input: &[f32], from_hz: u32, to_hz: u32) -> Option<Vec<f32>> {
+    if from_hz == to_hz {
+        return Some(input.to_vec());
+    }
+    if input.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut resampler = FftFixedIn::<f32>::new(
+        from_hz as usize,
+        to_hz as usize,
+        RESAMPLE_CHUNK_FRAMES,
+        RESAMPLE_SUB_CHUNKS,
+        1,
+    )
+    .ok()?;
+    let mut output: Vec<f32> = Vec::with_capacity(
+        input.len() * to_hz as usize / from_hz.max(1) as usize + RESAMPLE_CHUNK_FRAMES,
+    );
+    let mut position = 0usize;
+    let mut input_buffer = resampler.input_buffer_allocate(true);
+    let mut output_buffer = resampler.output_buffer_allocate(true);
+    while position + RESAMPLE_CHUNK_FRAMES <= input.len() {
+        input_buffer[0].copy_from_slice(&input[position..position + RESAMPLE_CHUNK_FRAMES]);
+        let (_, out_len) = resampler
+            .process_into_buffer(&input_buffer, &mut output_buffer, None)
+            .ok()?;
+        output.extend_from_slice(&output_buffer[0][..out_len]);
+        position += RESAMPLE_CHUNK_FRAMES;
+    }
+    if position < input.len() {
+        let remainder = [input[position..].to_vec()];
+        let (_, out_len) = resampler
+            .process_partial_into_buffer(Some(&remainder), &mut output_buffer, None)
+            .ok()?;
+        output.extend_from_slice(&output_buffer[0][..out_len]);
+    } else {
+        let (_, out_len) = resampler
+            .process_partial_into_buffer(Option::<&[Vec<f32>]>::None, &mut output_buffer, None)
+            .ok()?;
+        output.extend_from_slice(&output_buffer[0][..out_len]);
+    }
+    Some(output)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +225,32 @@ mod tests {
                 .iter()
                 .all(|value| (*value - expected_floor).abs() < 1e-6)
         );
+    }
+
+    #[test]
+    fn resample_16k_to_24k_scales_frame_count_by_ratio() {
+        // 10 seconds of 16kHz -> ~10 seconds of 24kHz (3/2 ratio). The
+        // chunked FFT resampler's tail flush can emit up to about one
+        // input-domain `RESAMPLE_CHUNK_FRAMES` worth of extra output at the
+        // end (its internal group-delay drain), so this allows the same
+        // absolute slack `audio::symphonia_decode`'s own
+        // `resample_preserves_frame_count_ratio` test tolerates for the
+        // identical chunking pattern, scaled to the output rate.
+        let input = vec![0.0_f32; 160_000];
+        let out = resample_mono(&input, 16_000, 24_000).expect("resample");
+        let expected = input.len() * 24_000 / 16_000;
+        let tolerance = RESAMPLE_CHUNK_FRAMES * 24_000 / 16_000;
+        assert!(
+            out.len().abs_diff(expected) <= tolerance,
+            "expected ~{expected} samples (+/-{tolerance}), got {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn resample_same_rate_is_identity() {
+        let input = vec![0.1_f32, -0.2, 0.3];
+        assert_eq!(resample_mono(&input, 16_000, 16_000).unwrap(), input);
     }
 
     #[test]

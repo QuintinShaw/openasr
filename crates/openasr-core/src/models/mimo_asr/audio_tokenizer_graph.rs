@@ -167,7 +167,11 @@ impl MimoAudiotokEncoderRuntime {
                 "audiotok_conv1_w",
             )
             .map_err(|source| build_err("audiotok_conv1_w", source))?;
-        let conv1_bias = new_vector(&arena, d_model, "audiotok_conv1_b")?;
+        // Conv biases are `[1, out_channels]` (not `[out_channels]`): ggml
+        // conv_1d output is `[out_time, out_channels]` (time on ne0), so the
+        // per-channel bias must broadcast over ne0=time -- exactly the shape
+        // whisper's own conv bias uses (`new_tensor_2d_f32(1, out_channels)`).
+        let conv1_bias = new_channel_bias(&arena, d_model, "audiotok_conv1_b")?;
         let conv2_weight = arena
             .new_tensor_3d_typed(
                 metadata.conv_kernel_size,
@@ -177,7 +181,7 @@ impl MimoAudiotokEncoderRuntime {
                 "audiotok_conv2_w",
             )
             .map_err(|source| build_err("audiotok_conv2_w", source))?;
-        let conv2_bias = new_vector(&arena, d_model, "audiotok_conv2_b")?;
+        let conv2_bias = new_channel_bias(&arena, d_model, "audiotok_conv2_b")?;
         let norm_weight = new_vector(&arena, d_model, "audiotok_norm_w")?;
         let norm_bias = new_vector(&arena, d_model, "audiotok_norm_b")?;
         let down_sample_weight = arena
@@ -187,7 +191,7 @@ impl MimoAudiotokEncoderRuntime {
         // dedicated always-zero vector rather than reuse another tensor
         // scaled by zero, so the graph's bias-add is a plain, self-explanatory
         // no-op tensor instead of a scale-trick.
-        let down_sample_zero_bias = new_vector(&arena, d_model, "audiotok_ds_zero_b")?;
+        let down_sample_zero_bias = new_channel_bias(&arena, d_model, "audiotok_ds_zero_b")?;
         let down_sample_norm_weight = new_vector(&arena, d_model, "audiotok_ds_norm_w")?;
         let down_sample_norm_bias = new_vector(&arena, d_model, "audiotok_ds_norm_b")?;
 
@@ -826,6 +830,18 @@ fn new_vector(
 ) -> Result<GgmlStaticTensor, MimoAudiotokEncoderError> {
     arena
         .new_tensor_1d_f32(len, name)
+        .map_err(|source| MimoAudiotokEncoderError::GraphBuildFailed { step: name, source })
+}
+
+/// A `[1, channels]` per-channel conv bias (ne0=1 so it broadcasts over the
+/// conv output's ne0=time axis; see `new`'s conv-bias doc comment).
+fn new_channel_bias(
+    arena: &GgmlStaticTensorArena,
+    channels: usize,
+    name: &'static str,
+) -> Result<GgmlStaticTensor, MimoAudiotokEncoderError> {
+    arena
+        .new_tensor_2d_f32(1, channels, name)
         .map_err(|source| MimoAudiotokEncoderError::GraphBuildFailed { step: name, source })
 }
 

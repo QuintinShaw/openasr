@@ -77,7 +77,7 @@ pub(crate) fn encode_rvq_codes(
     frame_count: usize,
 ) -> Result<Vec<Vec<u32>>, MimoRvqError> {
     let d_model = codebooks.d_model;
-    let expected_len = frame_count.checked_mul(d_model).unwrap_or(usize::MAX);
+    let expected_len = frame_count.saturating_mul(d_model);
     if hidden_rows.len() != expected_len {
         return Err(MimoRvqError::InvalidHiddenRowsShape {
             frame_count,
@@ -90,11 +90,11 @@ pub(crate) fn encode_rvq_codes(
     let mut residual = vec![0.0_f32; d_model];
     for frame_idx in 0..frame_count {
         residual.copy_from_slice(&hidden_rows[frame_idx * d_model..(frame_idx + 1) * d_model]);
-        for level in 0..rvq_packed {
+        for (level, code_slot) in codes[frame_idx].iter_mut().enumerate() {
             let table = &codebooks.levels[level];
             let vocab_size = codebooks.vocab_sizes[level];
             let (best_idx, best_row) = nearest_code(&residual, table, vocab_size, d_model);
-            codes[frame_idx][level] = best_idx as u32;
+            *code_slot = best_idx as u32;
             for (r, c) in residual.iter_mut().zip(best_row.iter()) {
                 *r -= *c;
             }
