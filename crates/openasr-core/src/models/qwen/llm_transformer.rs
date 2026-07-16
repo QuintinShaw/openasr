@@ -172,6 +172,17 @@ pub(crate) struct Qwen3AsrLlmLayerAttentionProjectionGeneric {
     attn_k_name: String,
     attn_v_name: String,
     attn_output_name: String,
+    /// Native (zero-copy-bindable) pack names for gate/up/down, needed at
+    /// `Qwen3AsrLlmWholeDecoderGraphExecutor` construction time to re-bind
+    /// these tensors zero-copy from a freshly-reopened `GgmlLoadedWeightContext`
+    /// (see `bind_or_arena_llm`). Their host payload is dropped after load
+    /// (`dropped_projection_payload`), so the pack name is the ONLY way to
+    /// find them again -- callers must not fall back to a family-fixed
+    /// naming scheme (e.g. qwen3-asr's own `blk.N.*`) here, or a differently-
+    /// named family's pack (e.g. firered-llm's `llm.blk.N.*`) fails to bind.
+    ffn_gate_name: String,
+    ffn_up_name: String,
+    ffn_down_name: String,
     attn_norm_weight: Vec<f32>,
     q_weight: DenseProjectionWeight,
     k_weight: DenseProjectionWeight,
@@ -1538,7 +1549,13 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         // the arena's backend buffer, after which no new tensors may be created.
         for (layer_index, projection) in projections.iter().enumerate() {
             let Qwen3AsrLlmLayerAttentionProjection::Generic(inner) = projection;
-            let names = llm_layer_tensor_names(layer_index);
+            // Zero-copy re-bind names MUST come from the loaded projection's own
+            // recorded pack names (`inner.attn_output_name`/`ffn_*_name`), not a
+            // family-fixed scheme like `llm_layer_tensor_names` -- the latter only
+            // happens to match qwen3-asr's own `blk.N.*` on-disk names and silently
+            // fails to bind a differently-prefixed family's pack (e.g. firered-llm's
+            // `llm.blk.N.*`) with "host payload was dropped", since these tensors'
+            // host bytes are dropped after load and only re-derivable by name.
             let (mut handles, layer_dims, fused_qkv) = allocate_decode_layer_tensors(
                 &mut arena,
                 loaded.as_ref(),
@@ -1557,10 +1574,10 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 &inner.ffn_gate_weight,
                 &inner.ffn_up_weight,
                 &inner.ffn_down_weight,
-                &names.attn_output_weight,
-                &names.ffn_gate_weight,
-                &names.ffn_up_weight,
-                &names.ffn_down_weight,
+                &inner.attn_output_name,
+                &inner.ffn_gate_name,
+                &inner.ffn_up_name,
+                &inner.ffn_down_name,
             )?;
             // Allocate LoRA slots for this layer (if an adapter is active).
             handles.lora =
@@ -3867,6 +3884,9 @@ pub(crate) fn load_qwen_family_llm_layer_attention_projection_generic(
         attn_k_name: names.attn_k_name,
         attn_v_name: names.attn_v_name,
         attn_output_name: names.attn_output_name,
+        ffn_gate_name: names.ffn_gate_name,
+        ffn_up_name: names.ffn_up_name,
+        ffn_down_name: names.ffn_down_name,
         attn_norm_weight,
         q_weight,
         k_weight,

@@ -666,6 +666,61 @@ fn transcribe_mock_formats_match_core_renderers() {
     }
 }
 
+// T5 (FireRedASR2-LLM real end-to-end + golden): the only golden case that
+// needs the FULL longform/auto-VAD slicing orchestrator (input >40s, over
+// this family's upstream single-utterance cap), so unlike the family's other
+// golden_diff cases (`firered_llm::executor::tests`, which call the
+// low-level `FireRedLlmGgmlExecutor` directly and can't exercise longform),
+// this one drives the real `openasr` binary -- the actual user-facing path.
+// `fixtures/longform_en_zh.wav` is 5 concatenated jfk.wav/zh_sample.wav clips
+// (EN/ZH/EN/ZH/EN, ~69s) built purely from this repo's own already-committed
+// fixtures (ffmpeg concat, no new audio content). Pinned against
+// `OPENASR_GGML_BACKEND=cpu` (Metal currently OOMs this family's 7B decoder
+// on a 16GB unified-memory Mac, see the T5 report); the auto energy-VAD
+// slicer picked 3 chunks here, whose seams show as the two small stray-token
+// artifacts in the golden ("我 我" and an extra "中") -- both present in the
+// real committed pack's output, not smoothed over.
+fn firered_llm_dev_pack_path() -> PathBuf {
+    PathBuf::from("/Volumes/QuintinDocument/openasr-dev/tmp-weights/fr2/out/firered2-llm-q8_0.oasr")
+}
+
+const FIRERED_LLM_GOLDEN_LONGFORM_EN_ZH_TEXT: &str = "and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗中 周末的时候我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country";
+
+#[test]
+#[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; runs the real \
+            longform-chunked CLI transcribe path on a ~69s fixture, OPENASR_GGML_BACKEND=cpu \
+            (~30 minutes wall clock at this family's current CPU-decode RTF -- see the T5 report)"]
+fn firered_llm_golden_diff_longform_cli_transcribe_matches_reference_decode() {
+    let pack_path = firered_llm_dev_pack_path();
+    if !pack_path.exists() {
+        eprintln!("skipping: {} not present", pack_path.display());
+        return;
+    }
+    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/longform_en_zh.wav")
+        .canonicalize()
+        .expect("longform_en_zh.wav fixture must exist");
+
+    let assert = openasr()
+        .env("OPENASR_GGML_BACKEND", "cpu")
+        .args([
+            "transcribe",
+            &input.display().to_string(),
+            "--model-pack",
+            &pack_path.display().to_string(),
+            "--format",
+            "text",
+        ])
+        .assert()
+        .success();
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    assert_eq!(
+        output.trim_end(),
+        FIRERED_LLM_GOLDEN_LONGFORM_EN_ZH_TEXT,
+        "unexpected longform CLI transcript"
+    );
+}
+
 #[test]
 fn transcribe_native_requires_local_model_pack_path() {
     let input = temp_input_wav();

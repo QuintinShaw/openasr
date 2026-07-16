@@ -443,8 +443,27 @@ mod tests {
     /// (matches firered-aed's own dev-pack test convention) rather than
     /// gating CI on a multi-GB private artifact.
     fn dev_pack_path() -> PathBuf {
-        PathBuf::from("/Volumes/QuintinDocument/openasr-dev/tmp-weights/fr2/out/firered2-llm-q8_0.oasr")
+        PathBuf::from(
+            "/Volumes/QuintinDocument/openasr-dev/tmp-weights/fr2/out/firered2-llm-q8_0.oasr",
+        )
     }
+
+    // Pinned to the real T5 dev-pack decode (q8_0, this repo's `OPENASR_GGML_BACKEND=cpu`
+    // -- CPU is the deterministic reference backend; Metal currently OOMs this
+    // family's 7B decoder on a 16GB unified-memory Mac, see the T5 report). JFK
+    // is word-for-word correct; the Mandarin sentence is the same non-copyrighted
+    // `say -v Tingting` synthesis firered-aed's own golden uses (see that
+    // family's `zh_sample.wav` doc comment).
+    const GOLDEN_JFK_TEXT: &str = "and so my fellow americans ask not what your country can do \
+        for you ask what you can do for your country";
+
+    const GOLDEN_ZH_TEXT: &str = "今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的\
+        川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下";
+
+    // Code-switch coverage (first 5s of jfk.wav + first 8s of zh_sample.wav,
+    // single <=40s utterance, no longform slicing involved): both languages'
+    // ChatML/tokenizer/decode paths share one prefill+decode call here.
+    const GOLDEN_EN_ZH_MIXED_TEXT: &str = "and so my fellow americans ask not 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开";
 
     fn jfk_wav_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav")
@@ -452,6 +471,10 @@ mod tests {
 
     fn zh_wav_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/zh_sample.wav")
+    }
+
+    fn en_zh_mixed_wav_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/en_zh_mixed.wav")
     }
 
     fn transcribe_with_dev_pack(wav_path: PathBuf) -> Option<(String, std::time::Duration, f32)> {
@@ -484,35 +507,61 @@ mod tests {
         Some((result.transcription.text, elapsed, audio_duration_seconds))
     }
 
-    // Stage-4 first end-to-end run: NOT YET establishing a pinned golden
-    // transcript (unlike firered-aed's `GOLDEN_JFK_TEXT`/`GOLDEN_ZH_TEXT`,
-    // which were pinned against an upstream PyTorch reference decode). This
-    // repo session could not safely run this test to completion: the ~8.3GB
-    // q8_0 pack plus the ~1GB materialized token-embedding table pushed
-    // measured system free memory well below a safe margin on the shared
-    // development machine (other agents' concurrent cargo builds were
-    // competing for the same 16GB, `vm_stat`/`top` showed <600MB unused
-    // physical memory immediately before this was written -- see the T4
-    // completion report). Running it once with headroom to spare will print
-    // the transcript, RTF, and elapsed time to stderr; a human should read
-    // that output, judge Mandarin sentence correctness / JFK word-for-word
-    // accuracy, and only then promote this into a real
-    // `assert_eq!(text, GOLDEN_..._TEXT)` golden-diff test.
+    // T5: promoted from the Stage-4 "prints transcript for manual judgement"
+    // probe once a human read the printed transcripts and confirmed JFK is
+    // word-for-word correct and the Mandarin sentence is coherent (see the T5
+    // report's parity + e2e sections) -- mirrors firered-aed's own
+    // `golden_diff_end_to_end_transcribe_matches_reference_pytorch_decode_on_*`
+    // promotion history. RTF/elapsed are still logged to stderr (not asserted:
+    // wall-clock varies with shared-machine load) so a maintainer re-running
+    // this locally still gets the performance signal the old probe printed.
     #[test]
-    #[ignore = "requires the private ~8.3GB dev-only firered2-llm-q8_0.oasr pack and >10GB free \
-                RAM headroom; not run in the authoring session due to shared-machine memory \
-                pressure -- see this module's doc comment"]
-    fn first_end_to_end_transcribe_prints_transcript_rtf_and_memory_for_manual_judgement() {
-        for (label, path) in [("jfk.wav", jfk_wav_path()), ("zh_sample.wav", zh_wav_path())] {
-            let Some((text, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack(path)
-            else {
-                return;
-            };
-            let rtf = elapsed.as_secs_f32() / audio_duration_seconds.max(0.001);
-            eprintln!(
-                "firered-llm e2e [{label}]: rtf={rtf:.3} elapsed={elapsed:?} \
-                 audio_duration={audio_duration_seconds:.2}s\ntranscript: {text}"
-            );
-        }
+    #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; \
+                OPENASR_GGML_BACKEND=cpu (Metal currently OOMs this family's 7B decoder \
+                on a 16GB unified-memory Mac -- see the T5 report)"]
+    fn golden_diff_end_to_end_transcribe_matches_reference_decode_on_jfk_wav() {
+        let Some((text, elapsed, audio_duration_seconds)) =
+            transcribe_with_dev_pack(jfk_wav_path())
+        else {
+            return;
+        };
+        eprintln!(
+            "firered-llm e2e [jfk.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
+            elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
+        );
+        assert_eq!(text, GOLDEN_JFK_TEXT);
+    }
+
+    #[test]
+    #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; \
+                OPENASR_GGML_BACKEND=cpu (Metal currently OOMs this family's 7B decoder \
+                on a 16GB unified-memory Mac -- see the T5 report)"]
+    fn golden_diff_end_to_end_transcribe_matches_reference_decode_on_zh_sample_wav() {
+        let Some((text, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack(zh_wav_path())
+        else {
+            return;
+        };
+        eprintln!(
+            "firered-llm e2e [zh_sample.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
+            elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
+        );
+        assert_eq!(text, GOLDEN_ZH_TEXT);
+    }
+
+    #[test]
+    #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; \
+                OPENASR_GGML_BACKEND=cpu (Metal currently OOMs this family's 7B decoder \
+                on a 16GB unified-memory Mac -- see the T5 report)"]
+    fn golden_diff_end_to_end_transcribe_matches_reference_decode_on_en_zh_mixed_wav() {
+        let Some((text, elapsed, audio_duration_seconds)) =
+            transcribe_with_dev_pack(en_zh_mixed_wav_path())
+        else {
+            return;
+        };
+        eprintln!(
+            "firered-llm e2e [en_zh_mixed.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
+            elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
+        );
+        assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);
     }
 }

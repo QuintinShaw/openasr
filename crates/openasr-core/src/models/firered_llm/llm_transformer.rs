@@ -318,3 +318,263 @@ fn map_tensor_read_error(error: GgufTensorDataReadError) -> FireRedLlmDecoderErr
         reason: error.to_string(),
     }
 }
+
+/// T5 (per-segment numeric parity against an independent PyTorch reference):
+/// dumps embedding / single-decoder-block / final_norm+lm_head outputs on
+/// fixed synthetic inputs to flat files that
+/// `scratchpad/fr2-t5-parity/compare_parity.py` reads and diffs against a
+/// from-scratch `transformers.Qwen2DecoderLayer` / manual embedding-gather /
+/// RMSNorm+matmul reference built from the same merged safetensors the `.oasr`
+/// pack was converted from. Deliberately tests the REAL production load path
+/// (`Qwen3AsrLlmWholeDecoderGraphExecutor`, `Qwen3AsrLlmLogitsHead`,
+/// `Qwen3AsrTokenEmbeddingTable`) against the real q8_0 dev pack, not a
+/// hand-rolled parallel implementation -- this is what caught the
+/// zero-copy-bind tensor-naming bug this module's history fixed (see
+/// `new_with_adapter`'s doc comment on `inner.attn_output_name`/`ffn_*_name`).
+#[cfg(test)]
+mod parity_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::models::runtime_contract::ScalarMetadataView;
+
+    fn dev_pack_path() -> PathBuf {
+        PathBuf::from(
+            "/Volumes/QuintinDocument/openasr-dev/tmp-weights/fr2/out/firered2-llm-q8_0.oasr",
+        )
+    }
+
+    fn dump_dir() -> PathBuf {
+        PathBuf::from(
+            "/private/tmp/claude-501/-Volumes-QuintinDocument-openasr-dev/08bbaa3c-ccc3-4b2d-af9e-1e3a449e3d8d/scratchpad/fr2-t5-parity",
+        )
+    }
+
+    /// Deterministic pseudo-random f32 generator (xorshift64*, no external
+    /// `rand` dependency needed for a test-only fixture) -- values scaled to a
+    /// modest range so summed multi-layer activations stay well clear of f16/
+    /// q8_0 dynamic-range edge cases that would make the parity check about
+    /// quantization noise rather than wiring correctness.
+    fn deterministic_f32_vec(seed: u64, len: usize) -> Vec<f32> {
+        let mut state = seed ^ 0x9E3779B97F4A7C15;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // top 24 bits -> uniform in [-1, 1)
+            let unit = ((state >> 40) as u32 & 0x00FF_FFFF) as f32 / 16_777_216.0;
+            out.push(unit * 2.0 - 1.0);
+        }
+        out
+    }
+
+    fn write_f32_dump(dir: &Path, name: &str, values: &[f32]) {
+        fs::create_dir_all(dir).expect("create dump dir");
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(dir.join(format!("{name}.f32le")), bytes)
+            .unwrap_or_else(|error| panic!("write dump {name}: {error}"));
+    }
+
+    fn write_json_dump(dir: &Path, name: &str, json: &serde_json::Value) {
+        fs::create_dir_all(dir).expect("create dump dir");
+        fs::write(
+            dir.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(json).expect("serialize json dump"),
+        )
+        .unwrap_or_else(|error| panic!("write json dump {name}: {error}"));
+    }
+
+    /// Load ONE decoder layer's projections directly by real layer index (not
+    /// via `FireRedLlmDecoderRuntime::new`'s all-28-layers loop), so a
+    /// single-layer `Qwen3AsrLlmWholeDecoderGraphExecutor` can be built and
+    /// run in isolation -- this is what makes block-1 / block-14 / block-28
+    /// (real indices 0/13/27) independently testable segments rather than
+    /// only observable as one opaque 28-layer stack output.
+    fn load_one_layer_projection(
+        reader: &crate::ggml_runtime::GgufTensorDataReader,
+        metadata: &FireRedLlmDecoderMetadata,
+        layer_index: usize,
+    ) -> Qwen3AsrLlmLayerAttentionProjection {
+        let names = qwen2_llm_layer_tensor_names(layer_index);
+        let generic = load_qwen_family_llm_layer_attention_projection_generic(
+            reader,
+            QwenFamilyLlmLayerTensorNames {
+                attn_norm_name: names.attn_norm_weight,
+                attn_q_name: names.attn_q_weight,
+                attn_k_name: names.attn_k_weight,
+                attn_v_name: names.attn_v_weight,
+                attn_output_name: names.attn_out_weight,
+                q_norm_name: None,
+                k_norm_name: None,
+                q_bias_name: Some(names.attn_q_bias),
+                k_bias_name: Some(names.attn_k_bias),
+                v_bias_name: Some(names.attn_v_bias),
+                ffn_norm_name: names.ffn_norm_weight,
+                ffn_gate_name: names.ffn_gate_weight,
+                ffn_up_name: names.ffn_up_weight,
+                ffn_down_name: names.ffn_down_weight,
+            },
+            metadata.d_model,
+            metadata.n_heads,
+            metadata.n_kv_heads,
+            metadata.head_dim,
+            false,
+        )
+        .unwrap_or_else(|error| panic!("load layer {layer_index} projection: {error}"));
+        Qwen3AsrLlmLayerAttentionProjection::Generic(generic)
+    }
+
+    /// Dump one decoder block's isolated 3-position causal-prefill forward
+    /// (real positions 0/1/2, real RoPE theta, real GQA/bias wiring) on a
+    /// fixed synthetic hidden-state input -- independent of every other layer
+    /// and of the token embedding table, so a mismatch localizes to this one
+    /// block.
+    fn dump_one_block_segment(
+        reader: &crate::ggml_runtime::GgufTensorDataReader,
+        pack_path: &Path,
+        metadata: &FireRedLlmDecoderMetadata,
+        layer_index: usize,
+        segment_name: &str,
+        dir: &Path,
+    ) {
+        let token_count = 3usize;
+        let input = deterministic_f32_vec(
+            0xB10C_0000 + layer_index as u64,
+            token_count * metadata.d_model,
+        );
+        let projection = load_one_layer_projection(reader, metadata, layer_index);
+        let mut executor =
+            Qwen3AsrLlmWholeDecoderGraphExecutor::new(&[projection], Some(pack_path))
+                .unwrap_or_else(|error| panic!("{segment_name} single-layer executor: {error}"));
+        let step = executor
+            .run_prefill(&input, token_count, FIRERED_LLM_ROPE_THETA)
+            .unwrap_or_else(|error| panic!("{segment_name} prefill: {error}"));
+
+        write_f32_dump(dir, &format!("{segment_name}_input"), &input);
+        write_f32_dump(dir, &format!("{segment_name}_output"), &step.hidden);
+        write_json_dump(
+            dir,
+            &format!("{segment_name}_meta"),
+            &serde_json::json!({
+                "real_layer_index": layer_index,
+                "token_count": token_count,
+                "d_model": metadata.d_model,
+                "n_heads": metadata.n_heads,
+                "n_kv_heads": metadata.n_kv_heads,
+                "head_dim": metadata.head_dim,
+                "rope_theta": FIRERED_LLM_ROPE_THETA,
+                "rms_norm_epsilon": FIRERED_LLM_RMS_NORM_EPSILON,
+            }),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; dumps fixed-input \
+                per-segment outputs to scratchpad/fr2-t5-parity for compare_parity.py to diff \
+                against an independent PyTorch reference -- see this module's parity_tests doc"]
+    fn dump_parity_segments_for_python_reference_comparison() {
+        let pack_path = dev_pack_path();
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return;
+        }
+        let dir = dump_dir();
+
+        let gguf_metadata =
+            crate::ggml_runtime::read_gguf_metadata(&pack_path).expect("read gguf metadata");
+        let decoder_metadata =
+            super::super::runtime_contract::parse_firered_llm_decoder_metadata(&gguf_metadata)
+                .expect("parse decoder metadata");
+        eprintln!("decoder_metadata = {decoder_metadata:?}");
+        write_json_dump(
+            &dir,
+            "manifest",
+            &serde_json::json!({
+                "n_layers": decoder_metadata.n_layers,
+                "d_model": decoder_metadata.d_model,
+                "n_heads": decoder_metadata.n_heads,
+                "n_kv_heads": decoder_metadata.n_kv_heads,
+                "head_dim": decoder_metadata.head_dim,
+                "vocab_size": decoder_metadata.vocab_size,
+                "block_segments": ["block0", "block13", "block27"],
+                "block_real_layer_indices": [0, 13, decoder_metadata.n_layers - 1],
+            }),
+        );
+
+        let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(&pack_path)
+            .expect("open gguf tensor reader");
+
+        // --- Segment: embedding gather ---
+        let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
+            &reader,
+            LLM_TOKEN_EMBD_WEIGHT,
+            decoder_metadata.d_model,
+            decoder_metadata.vocab_size,
+        )
+        .expect("load token embedding table");
+        let embedding_token_ids: Vec<u32> = vec![0, 1000, 50_000, 100_000, 151_643, 151_646];
+        let embedding_rows = token_embedding
+            .gather_rows(&embedding_token_ids)
+            .expect("gather embedding rows");
+        write_json_dump(
+            &dir,
+            "embedding_token_ids",
+            &serde_json::json!({ "token_ids": embedding_token_ids }),
+        );
+        write_f32_dump(&dir, "embedding_output", &embedding_rows);
+
+        // --- Segments: block 0 (first), block 13 (14th), block 27 (last) ---
+        dump_one_block_segment(&reader, &pack_path, &decoder_metadata, 0, "block0", &dir);
+        dump_one_block_segment(&reader, &pack_path, &decoder_metadata, 13, "block13", &dir);
+        dump_one_block_segment(
+            &reader,
+            &pack_path,
+            &decoder_metadata,
+            decoder_metadata.n_layers - 1,
+            "block27",
+            &dir,
+        );
+
+        // --- Segment: final_norm -> lm_head (fused; the only exposed API) ---
+        let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
+            &reader,
+            decoder_metadata.d_model,
+            decoder_metadata.vocab_size,
+            LLM_OUTPUT_NORM_WEIGHT,
+            LLM_OUTPUT_WEIGHT,
+            FIRERED_LLM_RMS_NORM_EPSILON,
+        )
+        .expect("load logits head");
+        let final_hidden = deterministic_f32_vec(0xF14A_1000, decoder_metadata.d_model);
+        let logits = logits_head
+            .compute_logits_for_last_hidden(&final_hidden)
+            .expect("compute final logits");
+        write_f32_dump(&dir, "final_norm_lm_head_input", &final_hidden);
+        write_f32_dump(&dir, "final_norm_lm_head_output", &logits);
+
+        eprintln!("dumped parity segments to {}", dir.display());
+    }
+
+    #[test]
+    #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; construction-only \
+                smoke check for the zero-copy tensor-name wiring this module's history fixed"]
+    fn probe_decoder_runtime_construction_against_real_pack() {
+        let pack_path = dev_pack_path();
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return;
+        }
+        let metadata = crate::ggml_runtime::read_gguf_metadata(&pack_path).expect("read metadata");
+        let _ = metadata.get_string_scalar("firered_llm.llm.n_layers");
+        let decoder_metadata =
+            super::super::runtime_contract::parse_firered_llm_decoder_metadata(&metadata)
+                .expect("parse decoder metadata");
+        FireRedLlmDecoderRuntime::new(&pack_path, decoder_metadata)
+            .expect("decoder runtime constructs against the real pack");
+    }
+}
