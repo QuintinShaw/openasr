@@ -12,6 +12,13 @@
 //! argmax loop (the repo's `model-integration-shared-driver` invariant, see
 //! `AGENTS.md`).
 
+// Module-wide (not narrowed to individual items): matches every other model
+// family's dedicated executor in this crate (e.g. `firered_aed::executor`).
+// `FireRedLlmGgmlExecutor` is reached only through the registries in
+// `executor_component_registry.rs` / `builtin_execution_dispatch.rs` and its
+// error variants only through `#[cfg(test)]` fixtures, both invisible to
+// per-item `dead_code` analysis. Narrowing this file alone would diverge from
+// the established per-family convention without a matching crate-wide pass.
 #![allow(dead_code)]
 
 use thiserror::Error;
@@ -434,10 +441,10 @@ mod tests {
     use super::*;
 
     /// Points at the real converted pack from T2
-    /// (`scratchpad/fr2/T2-report.md`), an ~8.3GB q8_0 `.oasr` NOT committed
+    /// (`scratchpad/fr2/T2-report.md`), an ~8.9GB q8_0 `.oasr` NOT committed
     /// to the repo (dev-only artifact, same convention as firered-aed's own
     /// `tmp/firered-out/firered-aed-l-fp16.oasr` golden pack). Loading it
-    /// mmaps + touches most of an 8.3GB file plus materializes the ~1GB f16
+    /// mmaps + touches most of an 8.9GB file plus materializes the ~1GB f16
     /// token-embedding table -- a real memory commitment, not a network
     /// fetch, so this stays `#[ignore]`d and skips silently when absent
     /// (matches firered-aed's own dev-pack test convention) rather than

@@ -809,10 +809,9 @@ pub(crate) enum ImportCommand {
         quantization: ImportFireredAedQuantization,
     },
     /// Import one local FireRedASR2-LLM (Conformer encoder + Adapter + LoRA-merged Qwen2-7B-Instruct) source into one runtime pack file (`.oasr`).
-    /// Stage status: this produces a well-formed pack (every tensor + hparam
-    /// metadata a runtime executor will need), but the family's LLM
-    /// transformer/executor/decode-policy do not exist yet -- the resulting
-    /// `.oasr` is not yet runnable by `openasr transcribe`.
+    /// The resulting pack is runnable by `openasr transcribe`: the family has
+    /// a dedicated ggml executor and decode policy built on the shared
+    /// greedy seq2seq decode driver.
     #[command(name = "firered-llm")]
     FireredLlm {
         /// Directory containing model.safetensors (pt_to_safetensors.py output over model.pth.tar's model_state_dict) and cmvn.txt (firered_llm_cmvn_ark_to_txt.py output).

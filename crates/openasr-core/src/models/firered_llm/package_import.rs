@@ -39,17 +39,23 @@
 //! encoder's own weights from the LLM checkpoint's `model.pth.tar`; it never
 //! links to an already-published firered-aed pack.
 //!
-//! **Stage status** (see `crate::arch::mod`'s `firered-llm` component-id
-//! block for the staging precedent this follows): this importer is complete
-//! and produces a well-formed GGUF with every tensor + hparam metadata a
-//! runtime executor will need. What does NOT exist yet: the Qwen2
-//! `llm_transformer` parameterization (qwen3's transformer has QK-norm and no
-//! qkv-bias; Qwen2 is the opposite -- see the tensor map below, which already
-//! carries `attn_{q,k,v}.bias` and omits any `attn_{q,k}_norm`), the Adapter
-//! ggml graph, the dedicated executor, and the `firered-llm.greedy.seq2seq.v0`
-//! decode-policy registration. A pack produced by this importer is not yet
+//! **Stage status**: this importer produces a well-formed GGUF with every
+//! tensor + hparam metadata the runtime needs, and the family is fully wired
+//! for execution -- the Qwen2-parameterized `llm_transformer` (qwen3's
+//! transformer has QK-norm and no qkv-bias; Qwen2 is the opposite -- see the
+//! tensor map below, which carries `attn_{q,k,v}.bias` and omits any
+//! `attn_{q,k}_norm`), the Adapter ggml graph, the dedicated executor
+//! (`executor::FireRedLlmGgmlExecutor`), and the `firered-llm.greedy.seq2seq.v0`
+//! decode-policy registration all exist. A pack produced by this importer is
 //! runnable by `openasr transcribe`.
 
+// Module-wide (not narrowed to individual items): matches every other model
+// family's importer in this crate (e.g. `firered_aed::package_import`) --
+// most of this module's public surface is exercised only from `#[cfg(test)]`
+// round-trip tests and the CLI's `model-pack import` dispatch, both of which
+// are invisible to `dead_code` analysis per-item. Narrowing this to a smaller
+// item list here alone would diverge from the established per-family
+// convention without a matching crate-wide pass.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};

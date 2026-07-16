@@ -16,9 +16,9 @@
 //!   metadata a runtime executor will need).
 //! - The Qwen2-parameterized LLM transformer (qwen3-asr's `llm_transformer`
 //!   has QK-norm and no qkv-bias; Qwen2 needs the opposite), the Adapter ggml
-//!   graph, the dedicated executor, and the `firered-llm.greedy.seq2seq.v0`
-//!   decode-policy registration do not exist yet -- a pack produced by this
-//!   importer is not yet runnable by `openasr transcribe`.
+//!   graph, the dedicated executor ([`executor::FireRedLlmGgmlExecutor`]), and
+//!   the `firered-llm.greedy.seq2seq.v0` decode-policy registration all exist
+//!   -- a pack produced by this importer is runnable by `openasr transcribe`.
 
 mod adapter_graph;
 mod decode_prompt;

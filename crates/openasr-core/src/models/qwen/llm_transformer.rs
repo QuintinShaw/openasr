@@ -1180,16 +1180,30 @@ fn bind_or_arena_llm(
 ///
 /// This must run during Pass 1 (before any upload), because allocating tensors
 /// after the first upload freezes the backend buffer.
+///
+/// Target names come from the caller (the loaded projection's own recorded
+/// pack names), not a family-fixed scheme -- the same "callers own their
+/// family's tensor-naming scheme" rule `allocate_decode_layer_tensors` follows
+/// for the zero-copy re-bind names above. `llm_layer_tensor_names(layer_index)`
+/// only matches qwen3-asr's own `blk.N.*` on-disk names; a differently-prefixed
+/// family's pack (e.g. firered-llm's `llm.blk.N.*`) would silently look up the
+/// wrong LoRA target and drop the adapter for that tensor.
+#[allow(clippy::too_many_arguments)]
 fn allocate_layer_lora_slots(
     arena: &GgmlStaticTensorArena,
-    layer_index: usize,
     adapter: Option<&QwenLoraAdapter>,
+    attn_q_name: &str,
+    attn_k_name: &str,
+    attn_v_name: &str,
+    attn_output_name: &str,
+    ffn_gate_name: &str,
+    ffn_up_name: &str,
+    ffn_down_name: &str,
     pending_uploads: &mut Vec<(GgmlStaticTensor, Vec<f32>, &'static str)>,
 ) -> Result<QwenLayerLoraSlots, GgmlCpuGraphError> {
     let Some(adapter) = adapter else {
         return Ok(QwenLayerLoraSlots::default());
     };
-    let names = super::tensor_names::llm_layer_tensor_names(layer_index);
     let mut slots = QwenLayerLoraSlots::default();
     // Allocate one LoRA slot for `target_name`, pushing the upload payload.
     let mut maybe_slot =
@@ -1202,13 +1216,13 @@ fn allocate_layer_lora_slots(
             pending_uploads.push((slot.b_scaled, target.b_scaled_values.clone(), "qwen_lora_b"));
             Ok(Some(slot))
         };
-    slots.attn_q = maybe_slot(&names.attn_q_weight)?;
-    slots.attn_k = maybe_slot(&names.attn_k_weight)?;
-    slots.attn_v = maybe_slot(&names.attn_v_weight)?;
-    slots.attn_output = maybe_slot(&names.attn_output_weight)?;
-    slots.ffn_gate = maybe_slot(&names.ffn_gate_weight)?;
-    slots.ffn_up = maybe_slot(&names.ffn_up_weight)?;
-    slots.ffn_down = maybe_slot(&names.ffn_down_weight)?;
+    slots.attn_q = maybe_slot(attn_q_name)?;
+    slots.attn_k = maybe_slot(attn_k_name)?;
+    slots.attn_v = maybe_slot(attn_v_name)?;
+    slots.attn_output = maybe_slot(attn_output_name)?;
+    slots.ffn_gate = maybe_slot(ffn_gate_name)?;
+    slots.ffn_up = maybe_slot(ffn_up_name)?;
+    slots.ffn_down = maybe_slot(ffn_down_name)?;
     Ok(slots)
 }
 
@@ -1547,7 +1561,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         let mut dims: Option<Qwen3AsrLlmDecodeDims> = None;
         // Pass 1: allocate ALL layers' tensors first — the first upload freezes
         // the arena's backend buffer, after which no new tensors may be created.
-        for (layer_index, projection) in projections.iter().enumerate() {
+        for projection in projections.iter() {
             let Qwen3AsrLlmLayerAttentionProjection::Generic(inner) = projection;
             // Zero-copy re-bind names MUST come from the loaded projection's own
             // recorded pack names (`inner.attn_output_name`/`ffn_*_name`), not a
@@ -1580,8 +1594,21 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 &inner.ffn_down_name,
             )?;
             // Allocate LoRA slots for this layer (if an adapter is active).
-            handles.lora =
-                allocate_layer_lora_slots(&arena, layer_index, adapter, &mut pending_lora_uploads)?;
+            // Sourced from `inner`'s own recorded pack names -- see
+            // `allocate_layer_lora_slots`'s doc comment for why a family-fixed
+            // naming scheme must not be substituted here.
+            handles.lora = allocate_layer_lora_slots(
+                &arena,
+                adapter,
+                &inner.attn_q_name,
+                &inner.attn_k_name,
+                &inner.attn_v_name,
+                &inner.attn_output_name,
+                &inner.ffn_gate_name,
+                &inner.ffn_up_name,
+                &inner.ffn_down_name,
+                &mut pending_lora_uploads,
+            )?;
             match dims {
                 None => {
                     dims = Some(layer_dims);
