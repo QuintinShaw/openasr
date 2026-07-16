@@ -71,6 +71,7 @@ pub(crate) enum DedicatedRuntimeTensorContractFamily {
     Moonshine,
     SenseVoice,
     FireRedAed,
+    FireRedLlm,
 }
 
 impl DedicatedRuntimeTensorContractFamily {
@@ -83,6 +84,7 @@ impl DedicatedRuntimeTensorContractFamily {
             Self::Moonshine => "moonshine",
             Self::SenseVoice => "sensevoice",
             Self::FireRedAed => "firered-aed",
+            Self::FireRedLlm => "firered-llm",
         }
     }
 }
@@ -246,6 +248,9 @@ fn dedicated_runtime_tensor_contract_family(
         }
         crate::arch::FIRERED_AED_RUNTIME_TENSOR_CONTRACT_ID => {
             Some(DedicatedRuntimeTensorContractFamily::FireRedAed)
+        }
+        crate::arch::FIRERED_LLM_RUNTIME_TENSOR_CONTRACT_ID => {
+            Some(DedicatedRuntimeTensorContractFamily::FireRedLlm)
         }
         _ => None,
     }

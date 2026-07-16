@@ -205,6 +205,27 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         ctc_blank_token_id: None,
     },
     BuiltinDecodePolicyComponentDescriptor {
+        // Source of truth is `crate::arch` (same staging precedent as firered-aed
+        // above): firered-llm has no crate-root re-export.
+        decode_policy_id: crate::arch::FIRERED_LLM_DECODE_POLICY_ID,
+        execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
+        seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        // The eot token (ChatML `<|im_end|>`) is supplied per-request via
+        // `BuiltinSeq2SeqDecodePolicyConfigInput.eot_token_id`; unlike qwen3-asr's
+        // audio-boundary marker, firered-llm's prompt has no extra stop token
+        // beyond eot.
+        seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
+        seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
+        // Mirrors firered-aed: the upstream 40s hard cap means every chunk is
+        // short and each chunk is a fresh ChatML turn -- the conservative
+        // longform profile is the structural fix for the #60 long-audio
+        // repetition failure mode, same reasoning as firered-aed.
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
+        ctc_blank_token_id: None,
+    },
+    BuiltinDecodePolicyComponentDescriptor {
         // hymt2 is an auxiliary translation family (no arch-registry entry, no
         // crate-root re-export); its runtime resolves this descriptor directly
         // by policy id. Source of truth for the id is `crate::arch`.
@@ -848,10 +869,11 @@ mod tests {
             );
             checked += 1;
         }
-        // cohere-transcribe + whisper + qwen3-asr + moonshine + firered-aed.
+        // cohere-transcribe + whisper + qwen3-asr + moonshine + firered-aed +
+        // firered-llm.
         assert_eq!(
-            checked, 5,
-            "expected exactly 5 greedy-seq2seq architectures to resolve"
+            checked, 6,
+            "expected exactly 6 greedy-seq2seq architectures to resolve"
         );
     }
 

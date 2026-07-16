@@ -117,6 +117,21 @@ fn import_command(command: ImportCommand) -> Result<()> {
         } => {
             import_firered_aed_local_command(&source_root, &output_root, &package_id, quantization)
         }
+        ImportCommand::FireredLlm {
+            encoder_adapter_source_root,
+            qwen2_merged_safetensors_path,
+            qwen2_metadata_source_root,
+            output_root,
+            package_id,
+            quantization,
+        } => import_firered_llm_local_command(
+            &encoder_adapter_source_root,
+            &qwen2_merged_safetensors_path,
+            &qwen2_metadata_source_root,
+            &output_root,
+            &package_id,
+            quantization,
+        ),
         ImportCommand::FireredPunc {
             source_safetensors,
             vocab_txt,
@@ -339,6 +354,42 @@ fn import_firered_aed_local_command(
     println!(
         "Imported FireRedASR-AED local source into runtime pack:\n- source: {}\n- output: {}\n- tensor_count: {}\n- vocab_size: {}",
         source_root.display(),
+        result.output_path.display(),
+        result.tensor_count,
+        result.vocab_size
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn import_firered_llm_local_command(
+    encoder_adapter_source_root: &Path,
+    qwen2_merged_safetensors_path: &Path,
+    qwen2_metadata_source_root: &Path,
+    output_root: &Path,
+    package_id: &str,
+    quantization: ImportFireredLlmQuantization,
+) -> Result<()> {
+    let request = openasr_core::FireRedLlmImportRequest {
+        encoder_adapter_source_root: encoder_adapter_source_root.to_path_buf(),
+        qwen2_merged_safetensors_path: qwen2_merged_safetensors_path.to_path_buf(),
+        qwen2_metadata_source_root: qwen2_metadata_source_root.to_path_buf(),
+        output_root: output_root.to_path_buf(),
+        model_id: package_id.to_string(),
+        quantization: match quantization {
+            ImportFireredLlmQuantization::Fp16 => openasr_core::FireRedLlmQuantizationMode::Fp16,
+            ImportFireredLlmQuantization::Q8_0 => openasr_core::FireRedLlmQuantizationMode::Q8_0,
+            ImportFireredLlmQuantization::Q4_K => openasr_core::FireRedLlmQuantizationMode::Q4_K,
+        },
+    };
+
+    ensure_ggml_package_output_suffix(output_root)?;
+    let result = openasr_core::convert_local_firered_llm_source_to_runtime_pack(&request)
+        .map_err(anyhow::Error::new)?;
+    println!(
+        "Imported FireRedASR2-LLM local source into runtime pack:\n- encoder/adapter source: {}\n- qwen2 merged source: {}\n- output: {}\n- tensor_count: {}\n- vocab_size: {}",
+        encoder_adapter_source_root.display(),
+        qwen2_merged_safetensors_path.display(),
         result.output_path.display(),
         result.tensor_count,
         result.vocab_size

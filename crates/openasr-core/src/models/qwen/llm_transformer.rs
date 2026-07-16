@@ -164,11 +164,25 @@ pub(crate) enum Qwen3AsrLlmLayerAttentionProjection {
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3AsrLlmLayerAttentionProjectionGeneric {
     d_model: usize,
+    /// Explicit head width, since it can no longer always be inferred from
+    /// `q_norm_weight.len()` (Qwen2-shaped projections have none).
+    head_dim: usize,
     attn_norm_name: String,
     attn_q_name: String,
     attn_k_name: String,
     attn_v_name: String,
     attn_output_name: String,
+    /// Native (zero-copy-bindable) pack names for gate/up/down, needed at
+    /// `Qwen3AsrLlmWholeDecoderGraphExecutor` construction time to re-bind
+    /// these tensors zero-copy from a freshly-reopened `GgmlLoadedWeightContext`
+    /// (see `bind_or_arena_llm`). Their host payload is dropped after load
+    /// (`dropped_projection_payload`), so the pack name is the ONLY way to
+    /// find them again -- callers must not fall back to a family-fixed
+    /// naming scheme (e.g. qwen3-asr's own `blk.N.*`) here, or a differently-
+    /// named family's pack (e.g. firered-llm's `llm.blk.N.*`) fails to bind.
+    ffn_gate_name: String,
+    ffn_up_name: String,
+    ffn_down_name: String,
     attn_norm_weight: Vec<f32>,
     q_weight: DenseProjectionWeight,
     k_weight: DenseProjectionWeight,
@@ -178,8 +192,18 @@ pub(crate) struct Qwen3AsrLlmLayerAttentionProjectionGeneric {
     ffn_gate_weight: DenseProjectionWeight,
     ffn_up_weight: DenseProjectionWeight,
     ffn_down_weight: DenseProjectionWeight,
+    /// Empty ⇒ no QK-norm (Qwen2's shape); non-empty (== `head_dim`) ⇒
+    /// QK-norm applied (Qwen3's shape). Both must agree (both empty or both
+    /// `head_dim`-wide) -- validated at load time.
     q_norm_weight: Vec<f32>,
     k_norm_weight: Vec<f32>,
+    /// Empty ⇒ no attention bias (Qwen3's shape); non-empty ⇒ bias applied
+    /// (Qwen2's shape). Independent of the QK-norm flag above -- the two
+    /// axes happen to be inverted between Qwen2 and Qwen3 but are not
+    /// coupled in the representation.
+    q_bias: Vec<f32>,
+    k_bias: Vec<f32>,
+    v_bias: Vec<f32>,
 }
 
 #[allow(dead_code)]
@@ -784,9 +808,16 @@ struct Qwen3AsrLlmLayerWeightHandles {
     q_weight: GgmlStaticTensor,
     k_weight: GgmlStaticTensor,
     v_weight: GgmlStaticTensor,
+    /// `Some` only for a Qwen2-shaped projection (attention bias); Qwen3-ASR
+    /// leaves these `None`.
+    q_bias: Option<GgmlStaticTensor>,
+    k_bias: Option<GgmlStaticTensor>,
+    v_bias: Option<GgmlStaticTensor>,
     output_weight: LlmWeightHandle,
-    q_norm_weight: GgmlStaticTensor,
-    k_norm_weight: GgmlStaticTensor,
+    /// `None` only for a Qwen2-shaped projection (no QK-norm); Qwen3-ASR
+    /// always populates these.
+    q_norm_weight: Option<GgmlStaticTensor>,
+    k_norm_weight: Option<GgmlStaticTensor>,
     ffn_norm_weight: GgmlStaticTensor,
     gate_weight: LlmWeightHandle,
     up_weight: LlmWeightHandle,
@@ -871,8 +902,11 @@ fn qwen_llm_layer_weights_with_lora<'a>(
         q_weight: layer.q_weight.as_graph_tensor(),
         k_weight: layer.k_weight.as_graph_tensor(),
         v_weight: layer.v_weight.as_graph_tensor(),
-        q_norm_weight: arena.graph_tensor(layer.q_norm_weight),
-        k_norm_weight: arena.graph_tensor(layer.k_norm_weight),
+        q_bias: layer.q_bias.map(|t| arena.graph_tensor(t)),
+        k_bias: layer.k_bias.map(|t| arena.graph_tensor(t)),
+        v_bias: layer.v_bias.map(|t| arena.graph_tensor(t)),
+        q_norm_weight: layer.q_norm_weight.map(|t| arena.graph_tensor(t)),
+        k_norm_weight: layer.k_norm_weight.map(|t| arena.graph_tensor(t)),
         output_weight: layer.output_weight.as_graph_tensor(arena),
         ffn_norm_weight: arena.graph_tensor(layer.ffn_norm_weight),
         ffn_gate_weight: layer.gate_weight.as_graph_tensor(arena),
@@ -911,19 +945,33 @@ pub(crate) struct Qwen3AsrLlmWholeStepTop1Output {
 #[allow(clippy::too_many_arguments)]
 fn allocate_decode_layer_tensors(
     arena: &mut GgmlStaticTensorArena,
-    layer_index: usize,
     loaded: Option<&crate::ggml_runtime::GgmlLoadedWeightContext>,
     attn_norm_weight: &[f32],
     q_weight: &DenseProjectionWeight,
     k_weight: &DenseProjectionWeight,
     v_weight: &DenseProjectionWeight,
+    // Empty ⇒ no bias (Qwen3's shape); non-empty ⇒ bias applied (Qwen2's shape).
+    q_bias: &[f32],
+    k_bias: &[f32],
+    v_bias: &[f32],
     output_weight: &DenseProjectionWeight,
+    // Empty ⇒ no QK-norm (Qwen2's shape); non-empty ⇒ QK-norm applied
+    // (Qwen3's shape). `head_dim` is always required explicitly since it can
+    // no longer be inferred from `q_norm_weight.len()` when norm is disabled.
     q_norm_weight: &[f32],
     k_norm_weight: &[f32],
+    head_dim: usize,
     ffn_norm_weight: &[f32],
     ffn_gate_weight: &DenseProjectionWeight,
     ffn_up_weight: &DenseProjectionWeight,
     ffn_down_weight: &DenseProjectionWeight,
+    // Native (zero-copy-bindable) tensor names for output/gate/up/down --
+    // callers own their family's tensor-naming scheme (qwen's `blk.N.*` vs
+    // firered-llm's `llm.blk.N.*`), this function stays name-agnostic.
+    output_weight_tensor_name: &str,
+    ffn_gate_tensor_name: &str,
+    ffn_up_tensor_name: &str,
+    ffn_down_tensor_name: &str,
 ) -> Result<
     (
         Qwen3AsrLlmLayerWeightHandles,
@@ -938,9 +986,15 @@ fn allocate_decode_layer_tensors(
             reason: "decode layer norm weight width mismatch",
         });
     }
-    if q_norm_weight.is_empty() || q_norm_weight.len() != k_norm_weight.len() {
+    let has_qk_norm = !q_norm_weight.is_empty() || !k_norm_weight.is_empty();
+    if has_qk_norm && (q_norm_weight.len() != head_dim || k_norm_weight.len() != head_dim) {
         return Err(GgmlCpuGraphError::UnsupportedInputs {
             reason: "decode layer q/k norm width mismatch",
+        });
+    }
+    if head_dim == 0 {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "decode layer head_dim must be positive",
         });
     }
     if q_weight.input_width != d_model
@@ -953,7 +1007,6 @@ fn allocate_decode_layer_tensors(
             reason: "decode layer input width mismatch",
         });
     }
-    let head_dim = q_norm_weight.len();
     if !q_weight.output_width.is_multiple_of(head_dim)
         || !k_weight.output_width.is_multiple_of(head_dim)
         || !v_weight.output_width.is_multiple_of(head_dim)
@@ -961,6 +1014,16 @@ fn allocate_decode_layer_tensors(
     {
         return Err(GgmlCpuGraphError::UnsupportedInputs {
             reason: "decode layer q/k/v head shape mismatch",
+        });
+    }
+    let has_qkv_bias = !q_bias.is_empty() || !k_bias.is_empty() || !v_bias.is_empty();
+    if has_qkv_bias
+        && (q_bias.len() != q_weight.output_width
+            || k_bias.len() != k_weight.output_width
+            || v_bias.len() != v_weight.output_width)
+    {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "decode layer q/k/v bias width mismatch",
         });
     }
     if output_weight.input_width != q_weight.output_width
@@ -980,12 +1043,32 @@ fn allocate_decode_layer_tensors(
             reason: "decode layer q/kv head ratio mismatch",
         });
     }
+    // Bias forces the split (non-fused) QKV path (see `nn::decoder::LlmLayerWeights`'
+    // doc comment) -- never build a fused-QKV synthetic tensor when bias is present.
+    let allow_fused_qkv = !has_qkv_bias;
 
     let attn_norm = arena.new_tensor_2d_f32(d_model, 1, "qwen_llm_decode_attn_norm_weight")?;
-    let q_norm = arena.new_tensor_2d_f32(head_dim, 1, "qwen_llm_decode_q_norm_weight")?;
-    let k_norm = arena.new_tensor_2d_f32(head_dim, 1, "qwen_llm_decode_k_norm_weight")?;
+    let q_norm = has_qk_norm
+        .then(|| arena.new_tensor_2d_f32(head_dim, 1, "qwen_llm_decode_q_norm_weight"))
+        .transpose()?;
+    let k_norm = has_qk_norm
+        .then(|| arena.new_tensor_2d_f32(head_dim, 1, "qwen_llm_decode_k_norm_weight"))
+        .transpose()?;
+    let q_bias_tensor = has_qkv_bias
+        .then(|| arena.new_tensor_2d_f32(q_weight.output_width, 1, "qwen_llm_decode_q_bias"))
+        .transpose()?;
+    let k_bias_tensor = has_qkv_bias
+        .then(|| arena.new_tensor_2d_f32(k_weight.output_width, 1, "qwen_llm_decode_k_bias"))
+        .transpose()?;
+    let v_bias_tensor = has_qkv_bias
+        .then(|| arena.new_tensor_2d_f32(v_weight.output_width, 1, "qwen_llm_decode_v_bias"))
+        .transpose()?;
     let ffn_norm = arena.new_tensor_2d_f32(d_model, 1, "qwen_llm_decode_ffn_norm_weight")?;
-    let fused_qkv_weight = FusedQkvProjectionWeight::new(q_weight, k_weight, v_weight)?;
+    let fused_qkv_weight = if allow_fused_qkv {
+        FusedQkvProjectionWeight::new(q_weight, k_weight, v_weight)?
+    } else {
+        None
+    };
     let qkv_weight_tensor = fused_qkv_weight
         .as_ref()
         .map(|weight| new_fused_qkv_tensor_in_arena(arena, weight, "qwen_llm_decode_qkv_weight"))
@@ -1000,33 +1083,32 @@ fn allocate_decode_layer_tensors(
     // (native q8/f16, no arena copy); else allocate an arena tensor. These four
     // are unentangled with the fused-QKV path. q/k/v stay arena (they feed the
     // fused-QKV synthetic tensor, which has no on-disk counterpart).
-    let names = llm_layer_tensor_names(layer_index);
     let output_weight_tensor = bind_or_arena_llm(
         arena,
         loaded,
         output_weight,
-        &names.attn_output_weight,
+        output_weight_tensor_name,
         "qwen_llm_decode_output_weight",
     )?;
     let gate_weight_tensor = bind_or_arena_llm(
         arena,
         loaded,
         ffn_gate_weight,
-        &names.ffn_gate_weight,
+        ffn_gate_tensor_name,
         "qwen_llm_decode_gate_weight",
     )?;
     let up_weight_tensor = bind_or_arena_llm(
         arena,
         loaded,
         ffn_up_weight,
-        &names.ffn_up_weight,
+        ffn_up_tensor_name,
         "qwen_llm_decode_up_weight",
     )?;
     let down_weight_tensor = bind_or_arena_llm(
         arena,
         loaded,
         ffn_down_weight,
-        &names.ffn_down_weight,
+        ffn_down_tensor_name,
         "qwen_llm_decode_down_weight",
     )?;
 
@@ -1037,6 +1119,9 @@ fn allocate_decode_layer_tensors(
             q_weight: q_weight_tensor,
             k_weight: k_weight_tensor,
             v_weight: v_weight_tensor,
+            q_bias: q_bias_tensor,
+            k_bias: k_bias_tensor,
+            v_bias: v_bias_tensor,
             output_weight: output_weight_tensor,
             q_norm_weight: q_norm,
             k_norm_weight: k_norm,
@@ -1095,16 +1180,30 @@ fn bind_or_arena_llm(
 ///
 /// This must run during Pass 1 (before any upload), because allocating tensors
 /// after the first upload freezes the backend buffer.
+///
+/// Target names come from the caller (the loaded projection's own recorded
+/// pack names), not a family-fixed scheme -- the same "callers own their
+/// family's tensor-naming scheme" rule `allocate_decode_layer_tensors` follows
+/// for the zero-copy re-bind names above. `llm_layer_tensor_names(layer_index)`
+/// only matches qwen3-asr's own `blk.N.*` on-disk names; a differently-prefixed
+/// family's pack (e.g. firered-llm's `llm.blk.N.*`) would silently look up the
+/// wrong LoRA target and drop the adapter for that tensor.
+#[allow(clippy::too_many_arguments)]
 fn allocate_layer_lora_slots(
     arena: &GgmlStaticTensorArena,
-    layer_index: usize,
     adapter: Option<&QwenLoraAdapter>,
+    attn_q_name: &str,
+    attn_k_name: &str,
+    attn_v_name: &str,
+    attn_output_name: &str,
+    ffn_gate_name: &str,
+    ffn_up_name: &str,
+    ffn_down_name: &str,
     pending_uploads: &mut Vec<(GgmlStaticTensor, Vec<f32>, &'static str)>,
 ) -> Result<QwenLayerLoraSlots, GgmlCpuGraphError> {
     let Some(adapter) = adapter else {
         return Ok(QwenLayerLoraSlots::default());
     };
-    let names = super::tensor_names::llm_layer_tensor_names(layer_index);
     let mut slots = QwenLayerLoraSlots::default();
     // Allocate one LoRA slot for `target_name`, pushing the upload payload.
     let mut maybe_slot =
@@ -1117,13 +1216,13 @@ fn allocate_layer_lora_slots(
             pending_uploads.push((slot.b_scaled, target.b_scaled_values.clone(), "qwen_lora_b"));
             Ok(Some(slot))
         };
-    slots.attn_q = maybe_slot(&names.attn_q_weight)?;
-    slots.attn_k = maybe_slot(&names.attn_k_weight)?;
-    slots.attn_v = maybe_slot(&names.attn_v_weight)?;
-    slots.attn_output = maybe_slot(&names.attn_output_weight)?;
-    slots.ffn_gate = maybe_slot(&names.ffn_gate_weight)?;
-    slots.ffn_up = maybe_slot(&names.ffn_up_weight)?;
-    slots.ffn_down = maybe_slot(&names.ffn_down_weight)?;
+    slots.attn_q = maybe_slot(attn_q_name)?;
+    slots.attn_k = maybe_slot(attn_k_name)?;
+    slots.attn_v = maybe_slot(attn_v_name)?;
+    slots.attn_output = maybe_slot(attn_output_name)?;
+    slots.ffn_gate = maybe_slot(ffn_gate_name)?;
+    slots.ffn_up = maybe_slot(ffn_up_name)?;
+    slots.ffn_down = maybe_slot(ffn_down_name)?;
     Ok(slots)
 }
 
@@ -1251,6 +1350,9 @@ fn upload_decode_layer_weights(
     q_weight: &DenseProjectionWeight,
     k_weight: &DenseProjectionWeight,
     v_weight: &DenseProjectionWeight,
+    q_bias: &[f32],
+    k_bias: &[f32],
+    v_bias: &[f32],
     output_weight: &DenseProjectionWeight,
     q_norm_weight: &[f32],
     k_norm_weight: &[f32],
@@ -1264,16 +1366,21 @@ fn upload_decode_layer_weights(
         attn_norm_weight,
         "qwen_llm_decode_attn_norm_weight",
     )?;
-    arena.set_f32_slice(
-        handles.q_norm_weight,
-        q_norm_weight,
-        "qwen_llm_decode_q_norm_weight",
-    )?;
-    arena.set_f32_slice(
-        handles.k_norm_weight,
-        k_norm_weight,
-        "qwen_llm_decode_k_norm_weight",
-    )?;
+    if let Some(tensor) = handles.q_norm_weight {
+        arena.set_f32_slice(tensor, q_norm_weight, "qwen_llm_decode_q_norm_weight")?;
+    }
+    if let Some(tensor) = handles.k_norm_weight {
+        arena.set_f32_slice(tensor, k_norm_weight, "qwen_llm_decode_k_norm_weight")?;
+    }
+    if let Some(tensor) = handles.q_bias {
+        arena.set_f32_slice(tensor, q_bias, "qwen_llm_decode_q_bias")?;
+    }
+    if let Some(tensor) = handles.k_bias {
+        arena.set_f32_slice(tensor, k_bias, "qwen_llm_decode_k_bias")?;
+    }
+    if let Some(tensor) = handles.v_bias {
+        arena.set_f32_slice(tensor, v_bias, "qwen_llm_decode_v_bias")?;
+    }
     arena.set_f32_slice(
         handles.ffn_norm_weight,
         ffn_norm_weight,
@@ -1454,27 +1561,54 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         let mut dims: Option<Qwen3AsrLlmDecodeDims> = None;
         // Pass 1: allocate ALL layers' tensors first — the first upload freezes
         // the arena's backend buffer, after which no new tensors may be created.
-        for (layer_index, projection) in projections.iter().enumerate() {
+        for projection in projections.iter() {
             let Qwen3AsrLlmLayerAttentionProjection::Generic(inner) = projection;
+            // Zero-copy re-bind names MUST come from the loaded projection's own
+            // recorded pack names (`inner.attn_output_name`/`ffn_*_name`), not a
+            // family-fixed scheme like `llm_layer_tensor_names` -- the latter only
+            // happens to match qwen3-asr's own `blk.N.*` on-disk names and silently
+            // fails to bind a differently-prefixed family's pack (e.g. firered-llm's
+            // `llm.blk.N.*`) with "host payload was dropped", since these tensors'
+            // host bytes are dropped after load and only re-derivable by name.
             let (mut handles, layer_dims, fused_qkv) = allocate_decode_layer_tensors(
                 &mut arena,
-                layer_index,
                 loaded.as_ref(),
                 &inner.attn_norm_weight,
                 &inner.q_weight,
                 &inner.k_weight,
                 &inner.v_weight,
+                &inner.q_bias,
+                &inner.k_bias,
+                &inner.v_bias,
                 &inner.attn_output_weight,
                 &inner.q_norm_weight,
                 &inner.k_norm_weight,
+                inner.head_dim,
                 &inner.ffn_norm_weight,
                 &inner.ffn_gate_weight,
                 &inner.ffn_up_weight,
                 &inner.ffn_down_weight,
+                &inner.attn_output_name,
+                &inner.ffn_gate_name,
+                &inner.ffn_up_name,
+                &inner.ffn_down_name,
             )?;
             // Allocate LoRA slots for this layer (if an adapter is active).
-            handles.lora =
-                allocate_layer_lora_slots(&arena, layer_index, adapter, &mut pending_lora_uploads)?;
+            // Sourced from `inner`'s own recorded pack names -- see
+            // `allocate_layer_lora_slots`'s doc comment for why a family-fixed
+            // naming scheme must not be substituted here.
+            handles.lora = allocate_layer_lora_slots(
+                &arena,
+                adapter,
+                &inner.attn_q_name,
+                &inner.attn_k_name,
+                &inner.attn_v_name,
+                &inner.attn_output_name,
+                &inner.ffn_gate_name,
+                &inner.ffn_up_name,
+                &inner.ffn_down_name,
+                &mut pending_lora_uploads,
+            )?;
             match dims {
                 None => {
                     dims = Some(layer_dims);
@@ -1510,6 +1644,9 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 &inner.q_weight,
                 &inner.k_weight,
                 &inner.v_weight,
+                &inner.q_bias,
+                &inner.k_bias,
+                &inner.v_bias,
                 &inner.attn_output_weight,
                 &inner.q_norm_weight,
                 &inner.k_norm_weight,
@@ -3610,46 +3747,105 @@ fn load_qwen3_llm_layer_attention_projection_generic(
     layer_index: usize,
     materialize_qkv: bool,
 ) -> Result<Qwen3AsrLlmLayerAttentionProjectionGeneric, Qwen3AsrLlmTransformerError> {
-    let d_model = metadata.llm_d_model;
     let names = llm_layer_tensor_names(layer_index);
-    let attn_norm_name = names.attn_norm_weight;
-    let attn_q_name = names.attn_q_weight;
-    let attn_k_name = names.attn_k_weight;
-    let attn_v_name = names.attn_v_weight;
-    let attn_output_name = names.attn_output_weight;
-    let q_norm_name = names.attn_q_norm_weight;
-    let k_norm_name = names.attn_k_norm_weight;
-    let ffn_norm_name = names.ffn_norm_weight;
-    let ffn_gate_name = names.ffn_gate_weight;
-    let ffn_up_name = names.ffn_up_weight;
-    let ffn_down_name = names.ffn_down_weight;
+    load_qwen_family_llm_layer_attention_projection_generic(
+        reader,
+        QwenFamilyLlmLayerTensorNames {
+            attn_norm_name: names.attn_norm_weight,
+            attn_q_name: names.attn_q_weight,
+            attn_k_name: names.attn_k_weight,
+            attn_v_name: names.attn_v_weight,
+            attn_output_name: names.attn_output_weight,
+            // Qwen3-ASR always has QK-norm and never has attention bias.
+            q_norm_name: Some(names.attn_q_norm_weight),
+            k_norm_name: Some(names.attn_k_norm_weight),
+            q_bias_name: None,
+            k_bias_name: None,
+            v_bias_name: None,
+            ffn_norm_name: names.ffn_norm_weight,
+            ffn_gate_name: names.ffn_gate_weight,
+            ffn_up_name: names.ffn_up_weight,
+            ffn_down_name: names.ffn_down_weight,
+        },
+        metadata.llm_d_model,
+        metadata.llm_heads,
+        metadata.llm_kv_heads,
+        metadata.llm_head_dim,
+        materialize_qkv,
+    )
+}
 
-    let attn_norm_weight = load_vector_weight(reader, &attn_norm_name, d_model)?;
-    let q_norm_weight = load_non_empty_vector_weight(reader, &q_norm_name)?;
-    let k_norm_weight = load_non_empty_vector_weight(reader, &k_norm_name)?;
-    let q_output_width = projection_output_width(metadata.llm_heads, metadata.llm_head_dim)?;
-    let kv_output_width = projection_output_width(metadata.llm_kv_heads, metadata.llm_head_dim)?;
+/// Tensor names for one decoder layer, resolved by the caller's family-specific
+/// naming scheme (qwen3-asr's `blk.N.*` vs firered-llm's `llm.blk.N.*`) --
+/// this loader stays name-agnostic. `q_norm_name`/`k_norm_name` are `Some`
+/// IFF the family applies QK-norm (Qwen3's shape); `*_bias_name` are `Some`
+/// IFF the family has attention bias (Qwen2's shape, the inverse of Qwen3).
+pub(crate) struct QwenFamilyLlmLayerTensorNames {
+    pub attn_norm_name: String,
+    pub attn_q_name: String,
+    pub attn_k_name: String,
+    pub attn_v_name: String,
+    pub attn_output_name: String,
+    pub q_norm_name: Option<String>,
+    pub k_norm_name: Option<String>,
+    pub q_bias_name: Option<String>,
+    pub k_bias_name: Option<String>,
+    pub v_bias_name: Option<String>,
+    pub ffn_norm_name: String,
+    pub ffn_gate_name: String,
+    pub ffn_up_name: String,
+    pub ffn_down_name: String,
+}
+
+/// Load one decoder-only LLM layer's projections from `reader`, parameterized
+/// over the two axes that differ between Qwen2 and Qwen3 (QK-norm,
+/// attention bias) via `names`' `Option` fields, rather than hard-coding
+/// either family's shape. Shared by qwen3-asr
+/// (`load_qwen3_llm_layer_attention_projection_generic`, always QK-norm, never
+/// bias) and firered-llm (always bias, never QK-norm -- see
+/// `models::firered_llm::llm_transformer`).
+pub(crate) fn load_qwen_family_llm_layer_attention_projection_generic(
+    reader: &GgufTensorDataReader,
+    names: QwenFamilyLlmLayerTensorNames,
+    d_model: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    materialize_qkv: bool,
+) -> Result<Qwen3AsrLlmLayerAttentionProjectionGeneric, Qwen3AsrLlmTransformerError> {
+    let attn_norm_weight = load_vector_weight(reader, &names.attn_norm_name, d_model)?;
+    let q_norm_weight = match &names.q_norm_name {
+        Some(name) => load_non_empty_vector_weight(reader, name)?,
+        None => Vec::new(),
+    };
+    let k_norm_weight = match &names.k_norm_name {
+        Some(name) => load_non_empty_vector_weight(reader, name)?,
+        None => Vec::new(),
+    };
+    let q_output_width = projection_output_width(n_heads, head_dim)?;
+    let kv_output_width = projection_output_width(n_kv_heads, head_dim)?;
     // q is non-square under GQA, so its storage orientation is unambiguous;
     // load it with explicit geometry and reuse its resolved layout for the
     // (possibly square) k/v projections. This guarantees q/k/v share one
     // orientation, so the fused-QKV builder never sees a mixed raw/dense state.
     let q_weight = load_projection_weight_with_input_output(
         reader,
-        &attn_q_name,
+        &names.attn_q_name,
         d_model,
         q_output_width,
         materialize_qkv,
     )?;
     // Fail closed on stale packs that stored projections in PyTorch [out,in]
-    // order. Correct qwen packs follow the ggml [in,out] convention, under which
-    // the non-square GQA q-projection resolves to OutputByInput. A q resolving to
-    // InputByOutput means the dims were written reversed by an older importer,
-    // which would otherwise silently produce garbage tokens rather than fail.
+    // order. Correct qwen-family packs follow the ggml [in,out] convention,
+    // under which the non-square GQA q-projection resolves to
+    // OutputByInput. A q resolving to InputByOutput means the dims were
+    // written reversed by an older importer, which would otherwise silently
+    // produce garbage tokens rather than fail.
     if q_weight.layout != DenseProjectionLayout::OutputByInput {
         return Err(Qwen3AsrLlmTransformerError::InvalidTensorShape {
-            tensor_name: attn_q_name.clone(),
+            tensor_name: names.attn_q_name.clone(),
             shape: format!("[output={q_output_width}, input={d_model}]"),
-            reason: "qwen3 projection weights must use the ggml [in, out] dim order; \
+            reason: "qwen-family projection weights must use the ggml [in, out] dim order; \
                      this pack stores them as [out, in], which indicates it was built by \
                      an older importer — re-pack from source with the current build"
                 .to_string(),
@@ -3657,7 +3853,7 @@ fn load_qwen3_llm_layer_attention_projection_generic(
     }
     let k_weight = load_projection_weight_with_layout(
         reader,
-        &attn_k_name,
+        &names.attn_k_name,
         d_model,
         kv_output_width,
         q_weight.layout,
@@ -3665,22 +3861,34 @@ fn load_qwen3_llm_layer_attention_projection_generic(
     )?;
     let v_weight = load_projection_weight_with_layout(
         reader,
-        &attn_v_name,
+        &names.attn_v_name,
         d_model,
         kv_output_width,
         q_weight.layout,
         materialize_qkv,
     )?;
+    let q_bias = match &names.q_bias_name {
+        Some(name) => load_vector_weight(reader, name, q_weight.output_width)?,
+        None => Vec::new(),
+    };
+    let k_bias = match &names.k_bias_name {
+        Some(name) => load_vector_weight(reader, name, k_weight.output_width)?,
+        None => Vec::new(),
+    };
+    let v_bias = match &names.v_bias_name {
+        Some(name) => load_vector_weight(reader, name, v_weight.output_width)?,
+        None => Vec::new(),
+    };
     let attn_output_weight = load_projection_weight_with_input_output(
         reader,
-        &attn_output_name,
+        &names.attn_output_name,
         q_weight.output_width,
         d_model,
         false,
     )?;
-    let ffn_norm_weight = load_vector_weight(reader, &ffn_norm_name, d_model)?;
-    let ffn_gate_weight = load_projection_weight(reader, &ffn_gate_name, d_model)?;
-    let ffn_up_weight = load_projection_weight(reader, &ffn_up_name, d_model)?;
+    let ffn_norm_weight = load_vector_weight(reader, &names.ffn_norm_name, d_model)?;
+    let ffn_gate_weight = load_projection_weight(reader, &names.ffn_gate_name, d_model)?;
+    let ffn_up_weight = load_projection_weight(reader, &names.ffn_up_name, d_model)?;
     if ffn_gate_weight.output_width != ffn_up_weight.output_width {
         return Err(Qwen3AsrLlmTransformerError::FfnProjectionWidthMismatch {
             gate_width: ffn_gate_weight.output_width,
@@ -3689,7 +3897,7 @@ fn load_qwen3_llm_layer_attention_projection_generic(
     }
     let ffn_down_weight = load_projection_weight_with_input_output(
         reader,
-        &ffn_down_name,
+        &names.ffn_down_name,
         ffn_gate_weight.output_width,
         d_model,
         false,
@@ -3697,11 +3905,15 @@ fn load_qwen3_llm_layer_attention_projection_generic(
 
     Ok(Qwen3AsrLlmLayerAttentionProjectionGeneric {
         d_model,
-        attn_norm_name,
-        attn_q_name,
-        attn_k_name,
-        attn_v_name,
-        attn_output_name,
+        head_dim,
+        attn_norm_name: names.attn_norm_name,
+        attn_q_name: names.attn_q_name,
+        attn_k_name: names.attn_k_name,
+        attn_v_name: names.attn_v_name,
+        attn_output_name: names.attn_output_name,
+        ffn_gate_name: names.ffn_gate_name,
+        ffn_up_name: names.ffn_up_name,
+        ffn_down_name: names.ffn_down_name,
         attn_norm_weight,
         q_weight,
         k_weight,
@@ -3717,6 +3929,9 @@ fn load_qwen3_llm_layer_attention_projection_generic(
         ffn_down_weight: dropped_projection_payload(ffn_down_weight),
         q_norm_weight,
         k_norm_weight,
+        q_bias,
+        k_bias,
+        v_bias,
     })
 }
 

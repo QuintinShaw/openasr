@@ -808,6 +808,27 @@ pub(crate) enum ImportCommand {
         #[arg(long, value_enum, default_value_t = ImportFireredAedQuantization::Fp16)]
         quantization: ImportFireredAedQuantization,
     },
+    /// Import one local FireRedASR2-LLM (Conformer encoder + Adapter + LoRA-merged Qwen2-7B-Instruct) source into one runtime pack file (`.oasr`).
+    /// The resulting pack is runnable by `openasr transcribe`: the family has
+    /// a dedicated ggml executor and decode policy built on the shared
+    /// greedy seq2seq decode driver.
+    #[command(name = "firered-llm")]
+    FireredLlm {
+        /// Directory containing model.safetensors (pt_to_safetensors.py output over model.pth.tar's model_state_dict) and cmvn.txt (firered_llm_cmvn_ark_to_txt.py output).
+        encoder_adapter_source_root: PathBuf,
+        /// The LoRA-merged Qwen2 safetensors file (firered_llm_merge_lora.py's --out).
+        qwen2_merged_safetensors_path: PathBuf,
+        /// Directory containing the official Qwen2-7B-Instruct config.json, vocab.json, merges.txt, and tokenizer_config.json.
+        qwen2_metadata_source_root: PathBuf,
+        /// Output path for one runtime pack file (`.oasr`).
+        output_root: PathBuf,
+        /// Model id written to pack metadata (openasr.model.id).
+        #[arg(long)]
+        package_id: String,
+        /// Runtime tensor quantization for GGUF-backed `.oasr` output (encoder conv kernels/norms/CMVN and LLM biases/norms always stay f16/f32).
+        #[arg(long, value_enum, default_value_t = ImportFireredLlmQuantization::Fp16)]
+        quantization: ImportFireredLlmQuantization,
+    },
     /// Import a local FireRedPunc (chinese-lert-base BERT + 5-class head) source into one punctuation runtime pack file (`.oasr`).
     #[command(name = "firered-punc")]
     FireredPunc {
@@ -1021,6 +1042,14 @@ pub(crate) enum ImportDolphinQuantization {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[allow(non_camel_case_types)]
 pub(crate) enum ImportFireredAedQuantization {
+    Fp16,
+    Q8_0,
+    Q4_K,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[allow(non_camel_case_types)]
+pub(crate) enum ImportFireredLlmQuantization {
     Fp16,
     Q8_0,
     Q4_K,

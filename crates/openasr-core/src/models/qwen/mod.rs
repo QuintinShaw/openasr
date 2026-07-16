@@ -25,6 +25,7 @@ mod tokenizer;
 pub(crate) use audio_encoder::{
     Qwen3AsrAudioEncoderWeights, load_qwen3_audio_encoder_weights_from_reader,
 };
+pub(crate) use decode_prompt::Qwen3AsrDecodePrompt;
 pub use forced_aligner_import::{
     QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID, QWEN3_FORCED_ALIGNER_MODEL_FAMILY,
     Qwen3ForcedAlignerLocalSourceError, Qwen3ForcedAlignerLocalSourceImportRequest,
@@ -39,12 +40,14 @@ pub(crate) use ggml_executor::Qwen3AsrGgmlExecutor;
 pub(crate) use kv_cache::Qwen3AsrLayerKvCacheState;
 pub(crate) use llm_transformer::{
     Qwen3AsrLlmLayerAttentionProjection, Qwen3AsrLlmWholeDecoderGraphExecutor,
-    Qwen3AsrLlmWholeStepOutput, Qwen3AsrLlmWholeStepTop1Output, even_prefill_chunk_len,
+    Qwen3AsrLlmWholeStepOutput, Qwen3AsrLlmWholeStepTop1Output, QwenFamilyLlmLayerTensorNames,
+    even_prefill_chunk_len, load_qwen_family_llm_layer_attention_projection_generic,
     load_qwen3_llm_attention_projections_from_reader,
     load_qwen3_llm_attention_projections_from_reader_with_materialized_qkv,
 };
 pub(crate) use logits_head::{
-    Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead, load_qwen3_llm_logits_head_from_reader,
+    Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead,
+    load_llm_logits_head_from_reader_with_tensor_names, load_qwen3_llm_logits_head_from_reader,
     load_qwen3_llm_logits_head_from_reader_with_output_tensor,
 };
 pub use package_import::{
@@ -55,8 +58,12 @@ pub use package_import::{
 pub(crate) use prepared_runtime::{
     Qwen3AsrPreparedRuntime, Qwen3AsrPreparedRuntimeError, build_qwen_prepared_runtime,
 };
+pub(crate) use prompt_embedding::{
+    Qwen3AsrPromptEmbeddings, build_qwen3_prompt_embeddings_with_audio_splice,
+};
 pub(crate) use token_embedding::{
     Qwen3AsrTokenEmbeddingTable, load_qwen3_token_embedding_table_from_reader,
+    load_token_embedding_table_from_reader_with_tensor_name,
 };
 pub(crate) use tokenizer::Qwen3AsrTokenizer;
 
