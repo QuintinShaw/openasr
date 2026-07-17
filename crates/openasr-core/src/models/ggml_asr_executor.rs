@@ -141,6 +141,19 @@ pub struct GgmlAsrExecutionRequest {
     pub selected_family: GgmlFamilyAdapterDescriptor,
     pub prepared_audio: GgmlAsrPreparedAudio,
     pub request_options: GgmlAsrExecutionOptions,
+    /// Carried on the request but never read directly by an executor's
+    /// `execute()` -- backend resolution goes through the thread-local
+    /// override (`ggml_runtime::{install_request_backend_override,
+    /// request_backend_override}`), which `resolve_runtime_backend` /
+    /// `resolve_family_runtime_backend` consult. Any code path that builds a
+    /// request and drives a decode call WITHOUT going through
+    /// `GgmlAsrExecutionDispatch::execute` (which installs the override at
+    /// the top of that function) MUST call
+    /// `install_request_backend_override(backend_preference.request_backend_override())`
+    /// itself before decoding, or this field is silently inert and an
+    /// explicit CpuOnly/Accelerated choice never reaches the resolver -- see
+    /// the streaming closures in `incremental_streaming_driver.rs` and
+    /// `ctc_streaming_driver.rs` for the pattern.
     pub backend_preference: GgmlAsrBackendPreference,
 }
 
