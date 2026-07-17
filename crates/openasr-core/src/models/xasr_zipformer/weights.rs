@@ -94,6 +94,12 @@ impl StoredLinear {
                 output.len()
             ));
         }
+        if self.native.is_some() && self.values.is_empty() {
+            return Err(format!(
+                "linear '{}' is native-only; no dequantized values for CPU matvec",
+                self.name
+            ));
+        }
         for (out_idx, out) in output.iter_mut().enumerate() {
             let row = &self.values[out_idx * self.input_dim..(out_idx + 1) * self.input_dim];
             *out = dot_f32(input, row) + bias.map_or(0.0, |bias| bias[out_idx]);
