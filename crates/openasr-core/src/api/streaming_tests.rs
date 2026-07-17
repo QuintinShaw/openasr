@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
+use crate::models::ggml_streaming_audio::GgmlStreamingAudioBuffer;
 use crate::realtime::{
     RealtimeEventEnvelope, RealtimeEventId, RealtimeSessionId, RealtimeTranscriptEvent,
     RealtimeTranscriptFinal, RealtimeTranscriptPartial, TranscriptSegmentId, TranscriptUtteranceId,
@@ -128,6 +129,78 @@ impl NativeAsrSession for FakeStreamingSession {
     }
 }
 
+/// A streaming session that validates the fed frame stream against the SAME
+/// monotonic frame timeline the real native drivers use
+/// ([`GgmlStreamingAudioBuffer`], whose `push_frame` rejects a non-contiguous or
+/// repeated `seq`/`start_ms`), while otherwise revealing words like
+/// [`FakeStreamingSession`]. It can also inject a single transient
+/// `poll_events` error to model a recoverable mid-stream decode failure -- the
+/// case where the in-process feed's frame counter must not silently desync from
+/// what has already been pushed.
+struct SeqTrackingSession {
+    inner: FakeStreamingSession,
+    buffer: GgmlStreamingAudioBuffer,
+    /// 1-based index of the `poll_events` call that should return a transient
+    /// error (mirroring a real decode that fails once and is retried).
+    poll_error_on_call: Option<usize>,
+    poll_calls: usize,
+}
+
+fn seq_tracking(sentence: &'static str, poll_error_on_call: Option<usize>) -> SeqTrackingSession {
+    SeqTrackingSession {
+        inner: FakeStreamingSession::new(sentence),
+        buffer: GgmlStreamingAudioBuffer::default(),
+        poll_error_on_call,
+        poll_calls: 0,
+    }
+}
+
+impl NativeAsrSession for SeqTrackingSession {
+    fn session_id(&self) -> &str {
+        self.inner.session_id()
+    }
+
+    fn push_audio(
+        &mut self,
+        frame: RealtimeAudioFrame,
+    ) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
+        // Fail closed exactly like the real driver if the frame stream is not
+        // contiguous -- this is the guard the on-device "frame sequence jumped"
+        // error came from.
+        self.buffer
+            .push_frame(frame.clone())
+            .map_err(|error| NativeAsrError::SessionFailed {
+                message: error.to_string(),
+            })?;
+        self.inner.push_audio(frame)
+    }
+
+    fn poll_events(&mut self) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
+        self.poll_calls += 1;
+        if Some(self.poll_calls) == self.poll_error_on_call {
+            return Err(NativeAsrError::SessionFailed {
+                message: "transient decode failure".to_string(),
+            });
+        }
+        self.inner.poll_events()
+    }
+
+    fn finalize_utterance(&mut self) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
+        // A hard boundary rebaselines the frame timeline in the real driver
+        // (`reset_utterance` clears the buffer), so mirror that here.
+        self.buffer.clear();
+        self.inner.finalize_utterance()
+    }
+
+    fn finish(&mut self) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
+        self.inner.finish()
+    }
+
+    fn cancel(&mut self) -> Result<Vec<RealtimeEventEnvelope>, NativeAsrError> {
+        self.inner.cancel()
+    }
+}
+
 fn transcript_envelope(event: RealtimeTranscriptEvent) -> RealtimeEventEnvelope {
     RealtimeEventEnvelope {
         event_type: "transcript",
@@ -238,6 +311,94 @@ fn tail_audio_is_flushed_on_finish() {
     // finish() pads and flushes the tail, then finalizes.
     let transcription = session.finish().unwrap();
     assert!(!transcription.text.is_empty());
+}
+
+#[test]
+fn transient_poll_error_does_not_desync_frame_sequence() {
+    // The default poll cadence (200 ms) polls every 10 frames; make the first
+    // poll -- which fires right after the 10th frame is pushed -- fail once,
+    // modelling a recoverable mid-stream decode error. An embedder that logs
+    // the error and keeps feeding (an iOS mic loop) must not then trip the
+    // driver's monotonic frame-sequence guard on the next frame.
+    let cfg = StreamingConfig {
+        vad: None,
+        ..Default::default()
+    };
+    let session = seq_tracking("alpha beta gamma delta epsilon zeta eta theta", Some(1));
+    let mut streaming = StreamingSession::from_native_session(Box::new(session), &cfg).unwrap();
+
+    let mut errors = Vec::new();
+    for _ in 0..25 {
+        if let Err(error) = streaming.feed(&frame_samples(0.3)) {
+            errors.push(error.to_string());
+        }
+    }
+
+    // Exactly the one injected transient error surfaces (feed is fail-closed
+    // and propagates it); because the frame counter advanced in lockstep with
+    // the push that already committed the frame's seq, no later frame reused a
+    // seq, so the "frame sequence jumped" guard never fires.
+    assert_eq!(errors.len(), 1, "unexpected extra errors: {errors:?}");
+    assert!(
+        errors[0].contains("transient decode failure"),
+        "unexpected first error: {errors:?}"
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("frame sequence jumped")),
+        "frame sequence desynced after a recoverable poll error: {errors:?}"
+    );
+}
+
+#[test]
+fn irregular_chunk_feed_keeps_frame_sequence_and_matches_whole_feed() {
+    // ~13 frames of audio whose length is NOT a multiple of the 20 ms frame, so
+    // `finish` pads a final partial frame -- the real mic-capture shape (a
+    // sub-frame tail). Fed once whole, then again in irregular small chunks
+    // (including sub-frame chunks), both through a session that validates the
+    // frame stream against the real monotonic timeline.
+    let total = FRAME_SAMPLES * 12 + 100;
+    let pcm: Vec<f32> = (0..total)
+        .map(|index| ((index % 7) as f32) / 10.0 - 0.3)
+        .collect();
+    let sentence =
+        "one two three four five six seven eight nine ten eleven twelve thirteen fourteen";
+    let cfg = StreamingConfig {
+        vad: None,
+        ..Default::default()
+    };
+
+    // Reference: a single whole-buffer feed.
+    let mut whole =
+        StreamingSession::from_native_session(Box::new(seq_tracking(sentence, None)), &cfg)
+            .unwrap();
+    whole.feed(&pcm).expect("whole feed must not error");
+    let whole_final = whole.finish().unwrap();
+
+    // Irregular chunking: varied sizes, several below one frame, so frames
+    // straddle chunk boundaries and a sub-frame tail is left for `finish`.
+    let chunk_sizes = [7usize, 1, 320, 640, 13, 900, 2, 321, 5];
+    let mut irregular =
+        StreamingSession::from_native_session(Box::new(seq_tracking(sentence, None)), &cfg)
+            .unwrap();
+    let mut offset = 0;
+    let mut size_index = 0;
+    while offset < pcm.len() {
+        let size = chunk_sizes[size_index % chunk_sizes.len()].min(pcm.len() - offset);
+        size_index += 1;
+        // A seq/start-ms discontinuity would fail here with "frame sequence
+        // jumped" / "frame start time jumped".
+        irregular
+            .feed(&pcm[offset..offset + size])
+            .expect("irregular chunk feed must not error");
+        offset += size;
+    }
+    let irregular_final = irregular.finish().unwrap();
+
+    // Same total audio -> same frame count -> same revealed transcript.
+    assert!(!whole_final.text.is_empty());
+    assert_eq!(irregular_final.text, whole_final.text);
 }
 
 #[test]
