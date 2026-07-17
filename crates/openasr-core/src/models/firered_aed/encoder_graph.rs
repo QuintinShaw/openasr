@@ -679,7 +679,7 @@ fn firered_conformer_block<'a>(
         .reshape_4d(conv, n_frames, 1, dw_channels, 1)
         .map_err(|source| map_err("ggml_reshape_4d(conv_in_4d)", source))?;
     let mut conv = graph
-        .conv_2d_dw(dw_weight, conv_4d, 1, 1, (conv_kernel - 1) / 2, 0, 1, 1)
+        .depthwise_conv_2d(dw_weight, conv_4d, 1, 1, (conv_kernel - 1) / 2, 0, 1, 1)
         .map_err(|source| map_err("ggml_conv_2d_dw(conv_dw)", source))?;
     conv = graph
         .permute(conv, 1, 2, 0, 3)

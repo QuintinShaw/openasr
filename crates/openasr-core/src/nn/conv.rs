@@ -124,7 +124,7 @@ where
     F: Fn(&'static str, GgmlCpuGraphError) -> E + Copy,
 {
     let conv = graph
-        .conv_2d_dw(
+        .depthwise_conv_2d(
             weight,
             input,
             params.stride_x,

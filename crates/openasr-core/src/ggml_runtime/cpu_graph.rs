@@ -3325,66 +3325,6 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.new_tensor_checked(raw, "ggml_conv_2d")
     }
 
-    /// Whether this builder's compute backend is GPU-class (Metal/GPU). Graph
-    /// construction uses this to pick backend-appropriate ops (e.g. the
-    /// im2col-based `conv_2d_dw` on GPU, which is Metal-native, vs the fused
-    /// `conv_2d_dw_direct` on CPU, which the Metal backend has no kernel for).
-    pub(crate) fn backend_is_gpu_class(&self) -> bool {
-        self.backend_kind.is_gpu_class()
-    }
-
-    pub(crate) fn conv_2d_dw(
-        &self,
-        kernel: GgmlCpuTensor<'a>,
-        data: GgmlCpuTensor<'a>,
-        stride0: usize,
-        stride1: usize,
-        padding0: usize,
-        padding1: usize,
-        dilation0: usize,
-        dilation1: usize,
-    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
-        self.ensure_can_extend_graph("ggml_conv_2d_dw")?;
-        self.ensure_tensor_type(kernel, ffi::GGML_TYPE_F16, "ggml_conv_2d_dw kernel")?;
-        self.ensure_tensor_type(data, ffi::GGML_TYPE_F32, "ggml_conv_2d_dw data")?;
-        let stride0 = i32::try_from(stride0).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-            reason: "conv stride exceeds ggml int boundary",
-        })?;
-        let stride1 = i32::try_from(stride1).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-            reason: "conv stride exceeds ggml int boundary",
-        })?;
-        let padding0 =
-            i32::try_from(padding0).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-                reason: "conv padding exceeds ggml int boundary",
-            })?;
-        let padding1 =
-            i32::try_from(padding1).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-                reason: "conv padding exceeds ggml int boundary",
-            })?;
-        let dilation0 =
-            i32::try_from(dilation0).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-                reason: "conv dilation exceeds ggml int boundary",
-            })?;
-        let dilation1 =
-            i32::try_from(dilation1).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-                reason: "conv dilation exceeds ggml int boundary",
-            })?;
-        let raw = unsafe {
-            ffi::ggml_conv_2d_dw(
-                self.context.as_ptr(),
-                kernel.raw.as_ptr(),
-                data.raw.as_ptr(),
-                stride0,
-                stride1,
-                padding0,
-                padding1,
-                dilation0,
-                dilation1,
-            )
-        };
-        self.new_tensor_checked(raw, "ggml_conv_2d_dw")
-    }
-
     pub(crate) fn conv_2d_dw_direct(
         &self,
         kernel: GgmlCpuTensor<'a>,
@@ -3441,11 +3381,11 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.new_tensor_checked(raw, "ggml_conv_2d_dw_direct")
     }
 
-    /// Backend-appropriate depthwise 2D conv. On CPU this is the fused
-    /// `conv_2d_dw_direct` (accepts an F32 kernel). On a GPU-class backend the
-    /// Metal backend has no CONV_2D_DW kernel, so this routes to the im2col-based
-    /// `conv_2d_dw` (IM2COL + MUL_MAT, all Metal-native) — which requires an F16
-    /// kernel, so the F32 kernel is cast first. Callers stay backend-agnostic.
+    /// Depthwise 2D conv via the fused `GGML_OP_CONV_2D_DW` op
+    /// (`ggml_conv_2d_dw_direct`). The Metal backend has a native CONV_2D_DW kernel
+    /// (F16 or F32 kernel weights), so this is a single direct op on every backend
+    /// -- no F32->F16 cast and no IM2COL + MUL_MAT expansion. Callers stay
+    /// backend-agnostic.
     pub(crate) fn depthwise_conv_2d(
         &self,
         kernel: GgmlCpuTensor<'a>,
@@ -3457,16 +3397,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         dilation0: usize,
         dilation1: usize,
     ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
-        if self.backend_is_gpu_class() {
-            let kernel_f16 = self.cast(kernel, ffi::GGML_TYPE_F16)?;
-            self.conv_2d_dw(
-                kernel_f16, data, stride0, stride1, padding0, padding1, dilation0, dilation1,
-            )
-        } else {
-            self.conv_2d_dw_direct(
-                kernel, data, stride0, stride1, padding0, padding1, dilation0, dilation1,
-            )
-        }
+        self.conv_2d_dw_direct(
+            kernel, data, stride0, stride1, padding0, padding1, dilation0, dilation1,
+        )
     }
 
     #[cfg(test)]
@@ -6435,7 +6368,7 @@ mod tests {
         graph.set_input(input).expect("input should be input");
 
         let dw = graph
-            .conv_2d_dw(kernel, input, 1, 1, 0, 0, 1, 1)
+            .depthwise_conv_2d(kernel, input, 1, 1, 0, 0, 1, 1)
             .expect("depthwise conv should build");
         let dw_direct = graph
             .conv_2d_dw_direct(kernel, input, 1, 1, 0, 0, 1, 1)
@@ -6465,6 +6398,56 @@ mod tests {
         assert_eq!(outputs[0], vec![2.0, 4.0, 6.0, 8.0]);
         assert!(outputs[0].iter().all(|value| value.is_finite()));
         assert!(outputs[1].iter().all(|value| value.is_finite()));
+    }
+
+    /// `depthwise_conv_2d` routes to the fused `GGML_OP_CONV_2D_DW` op on every
+    /// backend, including Metal (which gained a native CONV_2D_DW kernel upstream).
+    /// This runs the same tiny depthwise conv on a real Metal runner and checks it
+    /// matches the CPU reference, exercising the native Metal kernel path rather
+    /// than the retired IM2COL + MUL_MAT detour. Skips on hosts without a Metal GPU.
+    #[test]
+    fn depthwise_conv_2d_executes_on_metal_backend() {
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.backend = GgmlCpuGraphBackend::Metal;
+        let mut runner = match GgmlCpuGraphRunner::new(config) {
+            Ok(runner) => runner,
+            Err(error) => {
+                eprintln!(
+                    "depthwise_conv_2d_executes_on_metal_backend: Metal unavailable ({error}) - skipping"
+                );
+                return;
+            }
+        };
+        let mut graph = runner.start_graph();
+        let kernel = graph
+            .new_tensor_4d_typed(1, 1, 1, 1, ffi::GGML_TYPE_F16, "kernel")
+            .expect("kernel allocation should succeed");
+        let input = graph
+            .new_tensor_4d_f32(2, 2, 1, 1, "input")
+            .expect("input allocation should succeed");
+        graph.set_input(kernel).expect("kernel should be input");
+        graph.set_input(input).expect("input should be input");
+
+        let dw = graph
+            .depthwise_conv_2d(kernel, input, 1, 1, 0, 0, 1, 1)
+            .expect("depthwise conv should build");
+        let dw_output = graph
+            .new_tensor_4d_f32(2, 2, 1, 1, "dw_output")
+            .expect("dw output buffer should allocate");
+        let dw = graph
+            .cpy(dw, dw_output)
+            .expect("dw copy to f32 output should build");
+
+        graph
+            .set_f16_bits_slice(kernel, &[0x4000], "kernel")
+            .expect("kernel upload should succeed");
+        graph
+            .set_f32_slice(input, &[1.0, 2.0, 3.0, 4.0], "input")
+            .expect("input upload should succeed");
+        let outputs = graph
+            .compute_outputs_f32(&[(dw, 4)])
+            .expect("depthwise conv should compute on the metal backend");
+        assert_eq!(outputs[0], vec![2.0, 4.0, 6.0, 8.0]);
     }
 
     /// `group_norm` with `n_groups == n_channels` (per-channel instance norm),
