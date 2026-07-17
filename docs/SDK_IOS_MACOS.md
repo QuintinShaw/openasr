@@ -10,15 +10,21 @@ plus a generated header, not a Rust-shaped API.
 
 - Version query.
 - Load a local `.oasr` model pack path -> opaque handle.
-- Transcribe one whole in-memory 16 kHz mono PCM buffer (`f32` or `i16`) ->
-  text, optional per-segment timestamps, detected/requested language.
+- **Batch**: transcribe one whole in-memory 16 kHz mono PCM buffer (`f32` or
+  `i16`) -> text, optional per-segment timestamps, detected/requested language.
+- **Streaming**: open a live session, feed 16 kHz mono `f32` PCM chunks, receive
+  incremental partial/committed transcript events, then finish for the assembled
+  final transcript (`openasr_streaming_*`). This is the in-process,
+  transport-free path an iOS app uses for live captioning -- iOS cannot spawn the
+  desktop realtime server, so it links the same
+  `openasr_core::StreamingSession` engine directly.
 - Error codes + last-error text; every call is panic-safe (no unwind crosses
   the FFI boundary; see `crates/openasr-ffi/src/lib.rs` module docs).
 
-**Not in v1**: streaming/live dictation, the local HTTP server, or model
-download. SDK consumers bring and manage their own `.oasr` packs -- OpenASR's
-"no silent download" product boundary (see `AGENTS.md`) is a CLI/server
-concern; an embedded SDK has no business reaching the network on its own.
+**Not in v1**: the local HTTP server, or model download. SDK consumers bring and
+manage their own `.oasr` packs -- OpenASR's "no silent download" product boundary
+(see `AGENTS.md`) is a CLI/server concern; an embedded SDK has no business
+reaching the network on its own.
 
 **CPU-only v1, and iOS Metal is not wired up at all yet.** `crates/openasr-core/build.rs`
 gates the `GGML_METAL`/`GGML_METAL_EMBED_LIBRARY` cmake flags on
@@ -136,6 +142,62 @@ for (uintptr_t i = 0; i < openasr_result_segment_count(result); i++) {
 
 openasr_result_free(result);
 openasr_model_close(model);
+```
+
+### Streaming (live captioning)
+
+The streaming surface is a separate session type -- not the batch
+`OpenAsrModel` -- because it holds live decoder state across chunks. Shape (see
+the header for the full accessor set and ownership rules):
+
+```c
+// Open / drive / finish a live session. finish() consumes the session and
+// returns the final transcript as an OpenAsrResult (read with the same
+// openasr_result_* accessors as the batch path).
+OpenAsrStatus openasr_streaming_session_open(const char *path,
+                                             const OpenAsrStreamingConfig *config,  // NULL = defaults
+                                             OpenAsrStreamingSession **out_session);
+OpenAsrStatus openasr_streaming_feed(OpenAsrStreamingSession *session,
+                                     const float *pcm, uintptr_t pcm_len_samples,  // 16 kHz mono f32
+                                     OpenAsrStreamingEvents **out_events);
+OpenAsrStatus openasr_streaming_finish(OpenAsrStreamingSession *session, OpenAsrResult **out_result);
+void openasr_streaming_free(OpenAsrStreamingSession *session);   // abort without finishing
+
+// Read one feed()'s events by index (whisper.cpp-style accessors again).
+uintptr_t                 openasr_streaming_events_count(const OpenAsrStreamingEvents *events);
+OpenAsrStreamingEventKind openasr_streaming_event_kind(const OpenAsrStreamingEvents *events, uintptr_t i);
+const char               *openasr_streaming_event_text(const OpenAsrStreamingEvents *events, uintptr_t i);
+const char               *openasr_streaming_event_segment_id(const OpenAsrStreamingEvents *events, uintptr_t i);
+uint64_t                  openasr_streaming_event_start_ms(const OpenAsrStreamingEvents *events, uintptr_t i);
+void                      openasr_streaming_events_free(OpenAsrStreamingEvents *events);
+```
+
+```c
+OpenAsrStreamingSession *session = NULL;
+if (openasr_streaming_session_open("/path/to/model.oasr", NULL, &session) != OPEN_ASR_STATUS_OK) {
+    fprintf(stderr, "open failed: %s\n", openasr_last_error_message());
+    return 1;
+}
+
+// Feed captured audio as it arrives (any chunk length):
+while (capturing) {
+    OpenAsrStreamingEvents *events = NULL;
+    if (openasr_streaming_feed(session, chunk_f32, chunk_len, &events) != OPEN_ASR_STATUS_OK) break;
+    for (uintptr_t i = 0; i < openasr_streaming_events_count(events); i++) {
+        printf("%s: %s\n",
+               openasr_streaming_event_kind(events, i) == OPEN_ASR_STREAMING_EVENT_KIND_COMMITTED
+                   ? "final" : "partial",
+               openasr_streaming_event_text(events, i));
+    }
+    openasr_streaming_events_free(events);
+}
+
+OpenAsrResult *final = NULL;
+if (openasr_streaming_finish(session, &final) == OPEN_ASR_STATUS_OK) {   // consumes session
+    printf("%s\n", openasr_result_text(final));
+    openasr_result_free(final);
+}
+// session is already freed by finish(); on an error path use openasr_streaming_free(session) instead.
 ```
 
 ### Swift bridging (minimal sketch)

@@ -1,12 +1,21 @@
 //! C ABI for embedding the OpenASR engine in iOS/macOS apps (see
 //! `scripts/build-xcframework.sh` and `docs/SDK_IOS_MACOS.md`).
 //!
-//! Deliberately minimal for v1: load a local `.oasr` pack, transcribe one
-//! whole in-memory 16 kHz mono PCM buffer (f32 or i16), get back text plus
-//! optional segment timestamps. No streaming, no dictation, no server, no
-//! model download -- SDK consumers manage their own model distribution (the
-//! product's "no silent download" boundary is a CLI/server concern, not an
-//! SDK one; see `AGENTS.md`).
+//! Two entry points, both fed the caller's own local `.oasr` pack:
+//!
+//! - **Batch**: load a pack, transcribe one whole in-memory 16 kHz mono PCM
+//!   buffer (f32 or i16), get back text plus optional segment timestamps
+//!   (`openasr_model_open` / `openasr_transcribe_pcm` / `openasr_result_*`).
+//! - **Streaming**: open a live session, feed 16 kHz mono f32 PCM chunks and
+//!   receive incremental partial/committed transcript events, then finish for
+//!   the assembled final transcript (`openasr_streaming_*`). This is the
+//!   in-process, transport-free path an iOS app uses for live captioning --
+//!   iOS cannot spawn the desktop realtime server, so it links the same
+//!   `openasr_core::StreamingSession` engine directly.
+//!
+//! No server, no model download -- SDK consumers manage their own model
+//! distribution (the product's "no silent download" boundary is a CLI/server
+//! concern, not an SDK one; see `AGENTS.md`).
 //!
 //! The API shape follows whisper.cpp's C API convention: opaque handles plus
 //! index-based accessor functions for the result
@@ -34,7 +43,8 @@ use std::path::PathBuf;
 use std::ptr;
 
 use openasr_core::{
-    NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend, Transcription, TranscriptionBackend,
+    NATIVE_RUNTIME_MODEL_ID_AUTO, NativeAsrHardwareTarget, NativeBackend, StreamingConfig,
+    StreamingEvent, StreamingEventKind, StreamingSession, Transcription, TranscriptionBackend,
     TranscriptionRequest, validate_local_native_model_pack_path,
 };
 
@@ -132,6 +142,111 @@ pub struct OpenAsrResult {
     text: CString,
     language: Option<CString>,
     segments: Vec<OwnedSegment>,
+}
+
+/// Hardware target for a streaming session's decode, mirroring
+/// [`openasr_core::NativeAsrHardwareTarget`]. `Auto` lets the runtime choose;
+/// on iOS/macOS only `Auto`, `Cpu`, `Accelerated`, and `AppleSilicon` are
+/// meaningful (the SDK is CPU-only today -- see `docs/SDK_IOS_MACOS.md`), but
+/// the full set is mapped so the contract does not silently drop a value.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAsrHardwareTarget {
+    Auto = 0,
+    Cpu = 1,
+    Accelerated = 2,
+    AppleSilicon = 3,
+    NvidiaCuda = 4,
+    AmdGpu = 5,
+    IntelCpu = 6,
+    IntelGpu = 7,
+}
+
+impl From<OpenAsrHardwareTarget> for NativeAsrHardwareTarget {
+    fn from(target: OpenAsrHardwareTarget) -> Self {
+        match target {
+            OpenAsrHardwareTarget::Auto => NativeAsrHardwareTarget::Auto,
+            OpenAsrHardwareTarget::Cpu => NativeAsrHardwareTarget::Cpu,
+            OpenAsrHardwareTarget::Accelerated => NativeAsrHardwareTarget::Accelerated,
+            OpenAsrHardwareTarget::AppleSilicon => NativeAsrHardwareTarget::AppleSilicon,
+            OpenAsrHardwareTarget::NvidiaCuda => NativeAsrHardwareTarget::NvidiaCuda,
+            OpenAsrHardwareTarget::AmdGpu => NativeAsrHardwareTarget::AmdGpu,
+            OpenAsrHardwareTarget::IntelCpu => NativeAsrHardwareTarget::IntelCpu,
+            OpenAsrHardwareTarget::IntelGpu => NativeAsrHardwareTarget::IntelGpu,
+        }
+    }
+}
+
+/// The kind of an incremental streaming transcript event, mirroring
+/// [`openasr_core::StreamingEventKind`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAsrStreamingEventKind {
+    /// A mutable in-progress hypothesis for the active utterance, superseded by
+    /// later events carrying the same segment id.
+    Partial = 0,
+    /// A settled segment, emitted at a VAD speech pause or at `finish`.
+    Committed = 1,
+    /// A post-final correction to an already-committed segment.
+    Revision = 2,
+}
+
+/// Configuration for [`openasr_streaming_session_open`]. Pass a null pointer to
+/// use the engine defaults (partial results on, word timestamps off, VAD on,
+/// auto hardware, default poll cadence). All fields are plain C values so the
+/// struct is a valid `#[repr(C)]` type; `language` is an optional borrowed C
+/// string (null = auto-detect), read only during the open call.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OpenAsrStreamingConfig {
+    /// Emit mutable `Partial` events as audio arrives.
+    pub partial_results: bool,
+    /// Attach per-word timings to events when the family supports them.
+    pub word_timestamps: bool,
+    /// Run an energy VAD that commits a segment at each speech pause. When
+    /// false, the whole stream is one utterance finalized only at `finish`.
+    pub enable_vad: bool,
+    /// Optional decode language hint (e.g. "en"), or null to auto-detect. Only
+    /// borrowed for the duration of the open call.
+    pub language: *const c_char,
+    /// Hardware target for the decode session.
+    pub hardware_target: OpenAsrHardwareTarget,
+    /// Inference thread cap; `0` uses the per-family default.
+    pub inference_threads: u16,
+    /// New audio (ms) to accumulate before polling the engine for a partial
+    /// re-decode; `0` uses the engine default. Values below the 20 ms frame
+    /// size are clamped up by the engine.
+    pub partial_poll_interval_ms: u64,
+}
+
+/// Opaque handle to an in-process streaming transcription session over a local
+/// `.oasr` pack. Created with [`openasr_streaming_session_open`], driven with
+/// [`openasr_streaming_feed`], and consumed by [`openasr_streaming_finish`]
+/// (which returns the final transcript and frees the session) or discarded with
+/// [`openasr_streaming_free`].
+pub struct OpenAsrStreamingSession {
+    inner: StreamingSession,
+}
+
+/// One incremental transcript event, owning C-string copies of its text fields.
+struct OwnedStreamingEvent {
+    kind: OpenAsrStreamingEventKind,
+    utterance_id: CString,
+    segment_id: CString,
+    revision: u64,
+    text: CString,
+    start_ms: u64,
+    end_ms: u64,
+    language: Option<CString>,
+}
+
+/// Opaque batch of streaming events produced by one [`openasr_streaming_feed`]
+/// call. Read it through the `openasr_streaming_event_*` accessors, then free
+/// it with [`openasr_streaming_events_free`]. Mirrors [`OpenAsrResult`]: the
+/// events own Rust-side strings that are not a valid C value type, so they are
+/// read by index rather than returned as a raw struct array.
+pub struct OpenAsrStreamingEvents {
+    events: Vec<OwnedStreamingEvent>,
 }
 
 /// Returns the engine version (the workspace product version), as a static,
@@ -444,6 +559,366 @@ pub unsafe extern "C" fn openasr_result_segment_text(
         .unwrap_or(ptr::null())
 }
 
+/// Opens an in-process streaming transcription session over the local `.oasr`
+/// pack at `path` and writes an opaque handle through `out_session`. Fails
+/// closed -- with [`OpenAsrStatus::ModelLoadFailed`] and no handle written --
+/// if the path is missing, not UTF-8, or not a pack a native model family
+/// recognizes / can stream. Never touches the network.
+///
+/// Pass a null `config` to use the engine defaults; otherwise `config` is read
+/// (and its `language`, if non-null, borrowed) only for the duration of this
+/// call.
+///
+/// # Safety
+/// `path` must be a valid, NUL-terminated UTF-8 C string. `config`, if
+/// non-null, must point to a valid [`OpenAsrStreamingConfig`] whose `language`
+/// is null or a valid NUL-terminated UTF-8 C string. `out_session` must be a
+/// valid, non-null pointer to a `*mut OpenAsrStreamingSession` the caller owns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_session_open(
+    path: *const c_char,
+    config: *const OpenAsrStreamingConfig,
+    out_session: *mut *mut OpenAsrStreamingSession,
+) -> OpenAsrStatus {
+    catch(OpenAsrStatus::ModelLoadFailed, || {
+        if out_session.is_null() {
+            set_last_error("openasr_streaming_session_open: out_session must not be null");
+            return OpenAsrStatus::InvalidArgument;
+        }
+        // SAFETY: caller contract requires `out_session` to be a valid pointer.
+        unsafe {
+            *out_session = ptr::null_mut();
+        }
+        let path = match unsafe { c_str_to_path(path) } {
+            Ok(path) => path,
+            Err(status) => return status,
+        };
+        let cfg = match unsafe { streaming_config_from_c(config) } {
+            Ok(cfg) => cfg,
+            Err(status) => return status,
+        };
+        match StreamingSession::new(&path, cfg) {
+            Ok(session) => {
+                let handle = Box::new(OpenAsrStreamingSession { inner: session });
+                // SAFETY: checked non-null above.
+                unsafe {
+                    *out_session = Box::into_raw(handle);
+                }
+                OpenAsrStatus::Ok
+            }
+            Err(error) => {
+                set_last_error(format!("openasr_streaming_session_open: {error}"));
+                OpenAsrStatus::ModelLoadFailed
+            }
+        }
+    })
+}
+
+/// Feeds a chunk of 16 kHz mono `f32` PCM (any length, including zero) into an
+/// open streaming session and writes the incremental events it produced through
+/// `out_events`: `Partial`s for the active utterance and a `Committed` event
+/// whenever a VAD speech pause closes one. An empty chunk is accepted and yields
+/// an empty (non-null) event batch. Read the batch with the
+/// `openasr_streaming_event_*` accessors, then free it with
+/// [`openasr_streaming_events_free`].
+///
+/// # Safety
+/// `session` must be a live handle from [`openasr_streaming_session_open`] (not
+/// yet finished/freed). `pcm` must point to at least `pcm_len_samples` `f32`
+/// samples (may be null only when `pcm_len_samples` is 0). `out_events` must be
+/// a valid, non-null pointer to a `*mut OpenAsrStreamingEvents` the caller owns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_feed(
+    session: *mut OpenAsrStreamingSession,
+    pcm: *const f32,
+    pcm_len_samples: usize,
+    out_events: *mut *mut OpenAsrStreamingEvents,
+) -> OpenAsrStatus {
+    catch(OpenAsrStatus::TranscribeFailed, || {
+        if out_events.is_null() {
+            set_last_error("openasr_streaming_feed: out_events must not be null");
+            return OpenAsrStatus::InvalidArgument;
+        }
+        // SAFETY: caller contract requires `out_events` to be a valid pointer.
+        unsafe {
+            *out_events = ptr::null_mut();
+        }
+        if session.is_null() {
+            set_last_error("openasr_streaming_feed: session handle must not be null");
+            return OpenAsrStatus::InvalidArgument;
+        }
+        if pcm.is_null() && pcm_len_samples > 0 {
+            set_last_error("openasr_streaming_feed: pcm must not be null when non-empty");
+            return OpenAsrStatus::InvalidArgument;
+        }
+        // SAFETY: `pcm` points at `pcm_len_samples` f32 samples per the safety
+        // contract; the empty case uses a valid dangling-free slice so
+        // `from_raw_parts` is never called with a null base pointer.
+        let samples: &[f32] = if pcm_len_samples == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(pcm, pcm_len_samples) }
+        };
+        // SAFETY: `session` was checked non-null above and, per the safety
+        // contract, is a live handle from `openasr_streaming_session_open`.
+        let session_ref = unsafe { &mut *session };
+        match session_ref.inner.feed(samples) {
+            Ok(events) => {
+                let batch = Box::new(OpenAsrStreamingEvents {
+                    events: events.into_iter().map(owned_streaming_event).collect(),
+                });
+                // SAFETY: checked non-null above.
+                unsafe {
+                    *out_events = Box::into_raw(batch);
+                }
+                OpenAsrStatus::Ok
+            }
+            Err(error) => {
+                set_last_error(format!("openasr_streaming_feed: {error}"));
+                OpenAsrStatus::TranscribeFailed
+            }
+        }
+    })
+}
+
+/// Finishes a streaming session: drains any buffered tail audio, finalizes the
+/// active utterance, and writes the assembled final [`OpenAsrResult`] (with
+/// per-segment timestamps) through `out_result`. This **consumes** `session`:
+/// whether it succeeds or fails, the handle is freed and must not be reused or
+/// passed to [`openasr_streaming_free`]. Read the result with the
+/// `openasr_result_*` accessors and free it with [`openasr_result_free`].
+///
+/// # Safety
+/// `session` must be a live handle from [`openasr_streaming_session_open`] that
+/// has not already been finished or freed. `out_result` must be a valid,
+/// non-null pointer to a `*mut OpenAsrResult` the caller owns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_finish(
+    session: *mut OpenAsrStreamingSession,
+    out_result: *mut *mut OpenAsrResult,
+) -> OpenAsrStatus {
+    catch(OpenAsrStatus::TranscribeFailed, || {
+        if out_result.is_null() {
+            set_last_error("openasr_streaming_finish: out_result must not be null");
+            return OpenAsrStatus::InvalidArgument;
+        }
+        // SAFETY: caller contract requires `out_result` to be a valid pointer.
+        unsafe {
+            *out_result = ptr::null_mut();
+        }
+        if session.is_null() {
+            set_last_error("openasr_streaming_finish: session handle must not be null");
+            return OpenAsrStatus::InvalidArgument;
+        }
+        // SAFETY: caller contract requires this came from `Box::into_raw` in
+        // `openasr_streaming_session_open` and has not been finished/freed.
+        // `finish` consumes the session, so ownership is taken back here and the
+        // box is dropped exactly once regardless of the decode outcome.
+        let handle = unsafe { Box::from_raw(session) };
+        match handle.inner.finish() {
+            Ok(transcription) => {
+                let result = Box::new(build_result(transcription, true));
+                // SAFETY: checked non-null above.
+                unsafe {
+                    *out_result = Box::into_raw(result);
+                }
+                OpenAsrStatus::Ok
+            }
+            Err(error) => {
+                set_last_error(format!("openasr_streaming_finish: {error}"));
+                OpenAsrStatus::TranscribeFailed
+            }
+        }
+    })
+}
+
+/// Frees a streaming session without finishing it (aborts the stream). Null is
+/// accepted and is a no-op. Do not call this on a handle already consumed by
+/// [`openasr_streaming_finish`].
+///
+/// # Safety
+/// `session`, if non-null, must be a live handle from
+/// [`openasr_streaming_session_open`] that has not been finished or freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_free(session: *mut OpenAsrStreamingSession) {
+    let _ = catch(OpenAsrStatus::Ok, || {
+        if !session.is_null() {
+            // SAFETY: caller contract requires this came from `Box::into_raw`
+            // in `openasr_streaming_session_open` and is not double-freed.
+            drop(unsafe { Box::from_raw(session) });
+        }
+        OpenAsrStatus::Ok
+    });
+}
+
+/// Returns the number of events in `events` (`0` if `events` is null).
+///
+/// # Safety
+/// `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_events_count(
+    events: *const OpenAsrStreamingEvents,
+) -> usize {
+    if events.is_null() {
+        return 0;
+    }
+    // SAFETY: caller contract requires a live handle.
+    unsafe { (*events).events.len() }
+}
+
+/// Returns event `index`'s kind, or [`OpenAsrStreamingEventKind::Partial`] if
+/// `events` is null or `index` is out of range (gate reads on
+/// [`openasr_streaming_events_count`]).
+///
+/// # Safety
+/// `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_event_kind(
+    events: *const OpenAsrStreamingEvents,
+    index: usize,
+) -> OpenAsrStreamingEventKind {
+    if events.is_null() {
+        return OpenAsrStreamingEventKind::Partial;
+    }
+    // SAFETY: caller contract requires a live handle; `get` bounds-checks `index`.
+    unsafe { (&*events).events.get(index) }
+        .map(|event| event.kind)
+        .unwrap_or(OpenAsrStreamingEventKind::Partial)
+}
+
+/// Returns event `index`'s text (UTF-8, NUL-terminated), or null if `events` is
+/// null or `index` is out of range. Valid until `events` is freed.
+///
+/// # Safety
+/// `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_event_text(
+    events: *const OpenAsrStreamingEvents,
+    index: usize,
+) -> *const c_char {
+    // SAFETY: caller contract requires a live handle from openasr_streaming_feed.
+    unsafe { streaming_event_cstr(events, index, |event| Some(&event.text)) }
+}
+
+/// Returns event `index`'s utterance id (UTF-8, NUL-terminated), or null if
+/// `events` is null or `index` is out of range. Valid until `events` is freed.
+///
+/// # Safety
+/// `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_event_utterance_id(
+    events: *const OpenAsrStreamingEvents,
+    index: usize,
+) -> *const c_char {
+    // SAFETY: caller contract requires a live handle from openasr_streaming_feed.
+    unsafe { streaming_event_cstr(events, index, |event| Some(&event.utterance_id)) }
+}
+
+/// Returns event `index`'s segment id (UTF-8, NUL-terminated), or null if
+/// `events` is null or `index` is out of range. Valid until `events` is freed.
+///
+/// # Safety
+/// `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_event_segment_id(
+    events: *const OpenAsrStreamingEvents,
+    index: usize,
+) -> *const c_char {
+    // SAFETY: caller contract requires a live handle from openasr_streaming_feed.
+    unsafe { streaming_event_cstr(events, index, |event| Some(&event.segment_id)) }
+}
+
+/// Returns event `index`'s detected language tag (e.g. "en"), UTF-8 and
+/// NUL-terminated, or null if `events` is null, `index` is out of range, or the
+/// family reported no language. Valid until `events` is freed.
+///
+/// # Safety
+/// `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_event_language(
+    events: *const OpenAsrStreamingEvents,
+    index: usize,
+) -> *const c_char {
+    // SAFETY: caller contract requires a live handle from openasr_streaming_feed.
+    unsafe { streaming_event_cstr(events, index, |event| event.language.as_ref()) }
+}
+
+/// Returns event `index`'s monotonic revision number (higher supersedes lower
+/// for the same segment id), or `0` if `events` is null or `index` is out of
+/// range.
+///
+/// # Safety
+/// `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_event_revision(
+    events: *const OpenAsrStreamingEvents,
+    index: usize,
+) -> u64 {
+    if events.is_null() {
+        return 0;
+    }
+    // SAFETY: caller contract requires a live handle; `get` bounds-checks `index`.
+    unsafe { (&*events).events.get(index) }
+        .map(|event| event.revision)
+        .unwrap_or(0)
+}
+
+/// Returns event `index`'s start time in milliseconds, or `0` if `events` is
+/// null or `index` is out of range.
+///
+/// # Safety
+/// `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_event_start_ms(
+    events: *const OpenAsrStreamingEvents,
+    index: usize,
+) -> u64 {
+    if events.is_null() {
+        return 0;
+    }
+    // SAFETY: caller contract requires a live handle; `get` bounds-checks `index`.
+    unsafe { (&*events).events.get(index) }
+        .map(|event| event.start_ms)
+        .unwrap_or(0)
+}
+
+/// Returns event `index`'s end time in milliseconds, or `0` if `events` is null
+/// or `index` is out of range.
+///
+/// # Safety
+/// `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_event_end_ms(
+    events: *const OpenAsrStreamingEvents,
+    index: usize,
+) -> u64 {
+    if events.is_null() {
+        return 0;
+    }
+    // SAFETY: caller contract requires a live handle; `get` bounds-checks `index`.
+    unsafe { (&*events).events.get(index) }
+        .map(|event| event.end_ms)
+        .unwrap_or(0)
+}
+
+/// Frees an event batch returned by [`openasr_streaming_feed`]. Null is accepted
+/// and is a no-op.
+///
+/// # Safety
+/// `events`, if non-null, must have been previously returned by
+/// [`openasr_streaming_feed`] and not already freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_events_free(events: *mut OpenAsrStreamingEvents) {
+    let _ = catch(OpenAsrStatus::Ok, || {
+        if !events.is_null() {
+            // SAFETY: caller contract requires this came from `Box::into_raw`
+            // in `openasr_streaming_feed` and is not double-freed.
+            drop(unsafe { Box::from_raw(events) });
+        }
+        OpenAsrStatus::Ok
+    });
+}
+
 /// Returns the last error message set on the calling thread by a failing
 /// `openasr_*` call, or null if none is set / the last call succeeded. Valid
 /// until the next `openasr_*` call on the same thread; copy it out if you
@@ -549,6 +1024,96 @@ fn build_result(transcription: Transcription, with_segments: bool) -> OpenAsrRes
         language,
         segments,
     }
+}
+
+/// Builds a [`StreamingConfig`] from the optional C config. A null pointer
+/// yields the engine defaults; a non-null pointer overrides only the fields it
+/// carries (its `language`, if non-null, is borrowed for this call).
+///
+/// # Safety
+/// `config`, if non-null, must point to a valid [`OpenAsrStreamingConfig`]
+/// whose `language` is null or a valid NUL-terminated C string.
+unsafe fn streaming_config_from_c(
+    config: *const OpenAsrStreamingConfig,
+) -> Result<StreamingConfig, OpenAsrStatus> {
+    let mut cfg = StreamingConfig::default();
+    if config.is_null() {
+        return Ok(cfg);
+    }
+    // SAFETY: caller contract requires a valid pointer when non-null.
+    let raw = unsafe { &*config };
+    cfg.partial_results = raw.partial_results;
+    cfg.word_timestamps = raw.word_timestamps;
+    // `StreamingConfig::default()` already enables VAD; only clear it when the
+    // caller opts out (whole stream treated as a single utterance).
+    if !raw.enable_vad {
+        cfg.vad = None;
+    }
+    cfg.language = if raw.language.is_null() {
+        None
+    } else {
+        // SAFETY: caller contract requires a valid NUL-terminated C string when
+        // `language` is non-null.
+        let c_str = unsafe { CStr::from_ptr(raw.language) };
+        match c_str.to_str() {
+            Ok(text) if !text.is_empty() => Some(text.to_string()),
+            Ok(_) => None,
+            Err(error) => {
+                set_last_error(format!(
+                    "openasr_streaming_session_open: language is not valid UTF-8: {error}"
+                ));
+                return Err(OpenAsrStatus::InvalidArgument);
+            }
+        }
+    };
+    cfg.hardware_target = raw.hardware_target.into();
+    cfg.inference_threads = if raw.inference_threads == 0 {
+        None
+    } else {
+        Some(raw.inference_threads)
+    };
+    if raw.partial_poll_interval_ms != 0 {
+        cfg.partial_poll_interval_ms = raw.partial_poll_interval_ms;
+    }
+    Ok(cfg)
+}
+
+fn owned_streaming_event(event: StreamingEvent) -> OwnedStreamingEvent {
+    OwnedStreamingEvent {
+        kind: match event.kind {
+            StreamingEventKind::Partial => OpenAsrStreamingEventKind::Partial,
+            StreamingEventKind::Committed => OpenAsrStreamingEventKind::Committed,
+            StreamingEventKind::Revision => OpenAsrStreamingEventKind::Revision,
+        },
+        utterance_id: cstring_lossy(event.utterance_id),
+        segment_id: cstring_lossy(event.segment_id),
+        revision: event.revision,
+        text: cstring_lossy(event.text),
+        start_ms: event.start_ms,
+        end_ms: event.end_ms,
+        language: event.language.map(cstring_lossy),
+    }
+}
+
+/// Shared body for the string-returning streaming-event accessors: fail closed
+/// to null on a null handle or an out-of-range index, otherwise hand back a
+/// borrowed pointer valid until the batch is freed.
+///
+/// # Safety
+/// `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+unsafe fn streaming_event_cstr(
+    events: *const OpenAsrStreamingEvents,
+    index: usize,
+    select: impl FnOnce(&OwnedStreamingEvent) -> Option<&CString>,
+) -> *const c_char {
+    if events.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: caller contract requires a live handle; `get` bounds-checks `index`.
+    unsafe { (&*events).events.get(index) }
+        .and_then(select)
+        .map(|value| value.as_ptr())
+        .unwrap_or(ptr::null())
 }
 
 #[cfg(test)]
@@ -759,6 +1324,284 @@ mod tests {
             assert_eq!(openasr_result_segment_end(result, 0), 1.0);
             let segment_text = CStr::from_ptr(openasr_result_segment_text(result, 0));
             assert_eq!(segment_text.to_str().unwrap(), "hello world");
+            openasr_result_free(result);
+        }
+    }
+
+    fn sample_streaming_event(kind: StreamingEventKind, text: &str) -> StreamingEvent {
+        StreamingEvent {
+            kind,
+            utterance_id: "utt_000001".to_string(),
+            segment_id: "seg_000001".to_string(),
+            revision: 3,
+            text: text.to_string(),
+            start_ms: 100,
+            end_ms: 900,
+            words: Vec::new(),
+            language: Some("en".to_string()),
+        }
+    }
+
+    #[test]
+    fn streaming_session_open_rejects_null_out_param() {
+        let path = StdCString::new("/nonexistent/model.oasr").unwrap();
+        // SAFETY: valid C string; the null `out_session` is the case under test.
+        let status =
+            unsafe { openasr_streaming_session_open(path.as_ptr(), ptr::null(), ptr::null_mut()) };
+        assert_eq!(status, OpenAsrStatus::InvalidArgument);
+        assert!(last_error().contains("out_session"));
+    }
+
+    #[test]
+    fn streaming_session_open_fails_closed_on_missing_pack() {
+        let path = StdCString::new("/nonexistent/does-not-exist.oasr").unwrap();
+        let mut session: *mut OpenAsrStreamingSession = ptr::null_mut();
+        // SAFETY: valid C string, null config (defaults), valid out pointer.
+        let status =
+            unsafe { openasr_streaming_session_open(path.as_ptr(), ptr::null(), &mut session) };
+        assert_eq!(status, OpenAsrStatus::ModelLoadFailed);
+        assert!(session.is_null());
+        assert!(!last_error().is_empty());
+    }
+
+    #[test]
+    fn streaming_feed_rejects_null_session_and_out() {
+        let samples = [0.0_f32; 320];
+        let mut events: *mut OpenAsrStreamingEvents = ptr::null_mut();
+        // SAFETY: null session with a valid out pointer is the case under test.
+        let status = unsafe {
+            openasr_streaming_feed(
+                ptr::null_mut(),
+                samples.as_ptr(),
+                samples.len(),
+                &mut events,
+            )
+        };
+        assert_eq!(status, OpenAsrStatus::InvalidArgument);
+        assert!(events.is_null());
+
+        // SAFETY: null out pointer is separately rejected before any deref.
+        let status = unsafe {
+            openasr_streaming_feed(
+                ptr::null_mut(),
+                samples.as_ptr(),
+                samples.len(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, OpenAsrStatus::InvalidArgument);
+    }
+
+    #[test]
+    fn streaming_finish_rejects_null_session_and_out() {
+        let mut result: *mut OpenAsrResult = ptr::null_mut();
+        // SAFETY: null session with a valid out pointer is the case under test.
+        let status = unsafe { openasr_streaming_finish(ptr::null_mut(), &mut result) };
+        assert_eq!(status, OpenAsrStatus::InvalidArgument);
+        assert!(result.is_null());
+
+        // SAFETY: null out pointer is separately rejected before any deref.
+        let status = unsafe { openasr_streaming_finish(ptr::null_mut(), ptr::null_mut()) };
+        assert_eq!(status, OpenAsrStatus::InvalidArgument);
+    }
+
+    #[test]
+    fn streaming_free_and_events_free_accept_null() {
+        // SAFETY: null is an explicitly documented no-op for both.
+        unsafe {
+            openasr_streaming_free(ptr::null_mut());
+            openasr_streaming_events_free(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn streaming_event_accessors_fail_closed_on_null_batch() {
+        // SAFETY: null `events` is the documented fail-closed case for every
+        // accessor below.
+        unsafe {
+            assert_eq!(openasr_streaming_events_count(ptr::null()), 0);
+            assert_eq!(
+                openasr_streaming_event_kind(ptr::null(), 0),
+                OpenAsrStreamingEventKind::Partial
+            );
+            assert!(openasr_streaming_event_text(ptr::null(), 0).is_null());
+            assert!(openasr_streaming_event_utterance_id(ptr::null(), 0).is_null());
+            assert!(openasr_streaming_event_segment_id(ptr::null(), 0).is_null());
+            assert!(openasr_streaming_event_language(ptr::null(), 0).is_null());
+            assert_eq!(openasr_streaming_event_revision(ptr::null(), 0), 0);
+            assert_eq!(openasr_streaming_event_start_ms(ptr::null(), 0), 0);
+            assert_eq!(openasr_streaming_event_end_ms(ptr::null(), 0), 0);
+        }
+    }
+
+    #[test]
+    fn streaming_events_roundtrip_through_accessors() {
+        let batch = Box::into_raw(Box::new(OpenAsrStreamingEvents {
+            events: vec![
+                owned_streaming_event(sample_streaming_event(StreamingEventKind::Partial, "hello")),
+                owned_streaming_event(sample_streaming_event(
+                    StreamingEventKind::Committed,
+                    "hello world",
+                )),
+            ],
+        }));
+        // SAFETY: `batch` came from `Box::into_raw` above and is freed at the
+        // end of this test.
+        unsafe {
+            assert_eq!(openasr_streaming_events_count(batch), 2);
+
+            assert_eq!(
+                openasr_streaming_event_kind(batch, 0),
+                OpenAsrStreamingEventKind::Partial
+            );
+            assert_eq!(
+                CStr::from_ptr(openasr_streaming_event_text(batch, 0))
+                    .to_str()
+                    .unwrap(),
+                "hello"
+            );
+
+            assert_eq!(
+                openasr_streaming_event_kind(batch, 1),
+                OpenAsrStreamingEventKind::Committed
+            );
+            assert_eq!(
+                CStr::from_ptr(openasr_streaming_event_text(batch, 1))
+                    .to_str()
+                    .unwrap(),
+                "hello world"
+            );
+            assert_eq!(
+                CStr::from_ptr(openasr_streaming_event_utterance_id(batch, 1))
+                    .to_str()
+                    .unwrap(),
+                "utt_000001"
+            );
+            assert_eq!(
+                CStr::from_ptr(openasr_streaming_event_segment_id(batch, 1))
+                    .to_str()
+                    .unwrap(),
+                "seg_000001"
+            );
+            assert_eq!(
+                CStr::from_ptr(openasr_streaming_event_language(batch, 1))
+                    .to_str()
+                    .unwrap(),
+                "en"
+            );
+            assert_eq!(openasr_streaming_event_revision(batch, 1), 3);
+            assert_eq!(openasr_streaming_event_start_ms(batch, 1), 100);
+            assert_eq!(openasr_streaming_event_end_ms(batch, 1), 900);
+
+            // Out-of-range index fails closed rather than reading OOB.
+            assert!(openasr_streaming_event_text(batch, 5).is_null());
+            assert_eq!(openasr_streaming_event_revision(batch, 5), 0);
+
+            openasr_streaming_events_free(batch);
+        }
+    }
+
+    #[test]
+    fn streaming_config_from_c_null_is_defaults() {
+        // SAFETY: a null config pointer is the documented "use defaults" case.
+        let cfg = unsafe { streaming_config_from_c(ptr::null()) }.unwrap();
+        let default = StreamingConfig::default();
+        assert_eq!(cfg.partial_results, default.partial_results);
+        assert_eq!(cfg.word_timestamps, default.word_timestamps);
+        assert!(cfg.vad.is_some());
+        assert!(cfg.language.is_none());
+    }
+
+    #[test]
+    fn streaming_config_from_c_applies_overrides() {
+        let language = StdCString::new("es").unwrap();
+        let raw = OpenAsrStreamingConfig {
+            partial_results: false,
+            word_timestamps: true,
+            enable_vad: false,
+            language: language.as_ptr(),
+            hardware_target: OpenAsrHardwareTarget::Cpu,
+            inference_threads: 4,
+            partial_poll_interval_ms: 250,
+        };
+        // SAFETY: `raw` is a valid config with a valid, live `language` C string.
+        let cfg = unsafe { streaming_config_from_c(&raw) }.unwrap();
+        assert!(!cfg.partial_results);
+        assert!(cfg.word_timestamps);
+        assert!(cfg.vad.is_none());
+        assert_eq!(cfg.language.as_deref(), Some("es"));
+        assert_eq!(cfg.hardware_target, NativeAsrHardwareTarget::Cpu);
+        assert_eq!(cfg.inference_threads, Some(4));
+        assert_eq!(cfg.partial_poll_interval_ms, 250);
+    }
+
+    /// End-to-end C-ABI roundtrip against a real `.oasr` pack: open a session,
+    /// feed synthetic PCM in chunks, drain events through the accessors, finish,
+    /// read the transcript, and free everything -- asserting only that the C
+    /// plumbing does not crash, leak, or fail (transcript quality is covered by
+    /// `openasr-core`'s `streaming_matches_batch_transcribe`). Ignored by
+    /// default because it needs model weights + a compiled ggml backend, which
+    /// the weight-free default suite must not require. Run manually:
+    ///
+    /// ```text
+    /// OPENASR_TEST_STREAMING_PACK=/path/to/moonshine-tiny-q8_0.oasr \
+    ///   cargo test -p openasr-ffi streaming_c_abi_roundtrip -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires a real .oasr pack via OPENASR_TEST_STREAMING_PACK"]
+    fn streaming_c_abi_roundtrip() {
+        let pack = std::env::var("OPENASR_TEST_STREAMING_PACK")
+            .expect("set OPENASR_TEST_STREAMING_PACK to a local .oasr pack");
+        let pack_c = StdCString::new(pack).unwrap();
+
+        let cfg = OpenAsrStreamingConfig {
+            partial_results: true,
+            word_timestamps: false,
+            enable_vad: false,
+            language: ptr::null(),
+            hardware_target: OpenAsrHardwareTarget::Cpu,
+            inference_threads: 0,
+            partial_poll_interval_ms: 0,
+        };
+
+        let mut session: *mut OpenAsrStreamingSession = ptr::null_mut();
+        // SAFETY: valid pack C string, valid config, valid out pointer.
+        let status = unsafe { openasr_streaming_session_open(pack_c.as_ptr(), &cfg, &mut session) };
+        assert_eq!(status, OpenAsrStatus::Ok, "open: {}", last_error());
+        assert!(!session.is_null());
+
+        // ~2s of a low-amplitude 440 Hz tone at 16 kHz, fed in 100 ms chunks.
+        let total: Vec<f32> = (0..32_000)
+            .map(|n| 0.1 * (2.0 * std::f32::consts::PI * 440.0 * n as f32 / 16_000.0).sin())
+            .collect();
+        for chunk in total.chunks(1_600) {
+            let mut events: *mut OpenAsrStreamingEvents = ptr::null_mut();
+            // SAFETY: live session, valid chunk pointer/len, valid out pointer.
+            let status = unsafe {
+                openasr_streaming_feed(session, chunk.as_ptr(), chunk.len(), &mut events)
+            };
+            assert_eq!(status, OpenAsrStatus::Ok, "feed: {}", last_error());
+            assert!(!events.is_null());
+            // SAFETY: `events` is a live batch; drain then free it.
+            unsafe {
+                for i in 0..openasr_streaming_events_count(events) {
+                    let _ = openasr_streaming_event_kind(events, i);
+                    let _ = openasr_streaming_event_text(events, i);
+                }
+                openasr_streaming_events_free(events);
+            }
+        }
+
+        let mut result: *mut OpenAsrResult = ptr::null_mut();
+        // SAFETY: live session (consumed here), valid out pointer.
+        let status = unsafe { openasr_streaming_finish(session, &mut result) };
+        assert_eq!(status, OpenAsrStatus::Ok, "finish: {}", last_error());
+        assert!(!result.is_null());
+        // SAFETY: `result` is a live handle from finish; read then free it.
+        unsafe {
+            let text_ptr = openasr_result_text(result);
+            assert!(!text_ptr.is_null());
+            let _ = CStr::from_ptr(text_ptr).to_str().unwrap();
             openasr_result_free(result);
         }
     }
