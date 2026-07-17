@@ -72,6 +72,7 @@ pub use api::native::{
     NativeAsrRuntimeReadiness, NativeAsrSession, NativeAsrSessionContext,
     NativeAsrStreamingSessionConfig, NativeAsrTensorLayoutRef, load_native_wav_16khz_mono_f32_v0,
 };
+pub use api::streaming::{StreamingConfig, StreamingEvent, StreamingEventKind, StreamingSession};
 pub use atomic_file::write_owner_only_file_atomically;
 pub use audio::{
     AudioInputError, AudioInputInfo, AudioInputIssue, AudioPreparationError,
