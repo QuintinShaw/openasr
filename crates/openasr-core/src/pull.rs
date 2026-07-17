@@ -709,11 +709,33 @@ pub fn remove_model_pack(
     let Some(pack) = find_installed_pack(home.as_ref(), reference)? else {
         return Ok(None);
     };
-    if let Some(parent) = pack.path.parent() {
-        fs::remove_dir_all(parent).map_err(|source| PullError::Io {
-            path: parent.to_path_buf(),
+    if let Some(quant_dir) = pack.path.parent() {
+        fs::remove_dir_all(quant_dir).map_err(|source| PullError::Io {
+            path: quant_dir.to_path_buf(),
             source,
         })?;
+        // The quant dir just removed lives at <models>/<model_id>/<quant>/. If
+        // that was the only installed quant, <models>/<model_id>/ is now an
+        // empty leftover; clean it up too. `remove_dir` only ever deletes an
+        // *empty* directory, so a sibling quant (or any other file a caller
+        // left behind) is never touched -- we just swallow the "not empty"
+        // and "already gone" outcomes as expected, non-error states.
+        if let Some(model_dir) = quant_dir.parent() {
+            match fs::remove_dir(model_dir) {
+                Ok(()) => {}
+                Err(source)
+                    if matches!(
+                        source.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(source) => {
+                    return Err(PullError::Io {
+                        path: model_dir.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+        }
     }
     Ok(Some(pack))
 }

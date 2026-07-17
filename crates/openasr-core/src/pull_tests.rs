@@ -1895,6 +1895,102 @@ fn remove_model_pack_deletes_installed_quant() {
 }
 
 #[test]
+fn remove_model_pack_deletes_empty_model_dir() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: bytes,
+    }]);
+    let installed = pull_model_pack_with_client(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::default(),
+        |_| {},
+    )
+    .unwrap();
+    let model_dir = temp.path().join("models").join(&installed.model_id);
+    assert!(
+        model_dir.exists(),
+        "fixture setup: model dir must exist before removal"
+    );
+
+    remove_model_pack(temp.path(), "moonshine-tiny:q8")
+        .unwrap()
+        .unwrap();
+
+    // Removing the only installed quant must also clean up the now-empty
+    // <models>/<model_id>/ directory, not just the <quant>/ subdirectory --
+    // otherwise uninstall leaves a stale empty `models/<id>/` behind.
+    assert!(
+        !model_dir.exists(),
+        "empty model dir must be removed once its last quant is uninstalled"
+    );
+}
+
+#[test]
+fn remove_model_pack_keeps_model_dir_when_sibling_quant_remains() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let model_dir = home.join("models").join("moonshine-tiny");
+
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: bytes.clone(),
+    }]);
+    let first =
+        pull_model_pack_with_client(&resolved, home, &mut client, PullOptions::default(), |_| {})
+            .unwrap();
+
+    // A second quant for the same model, written directly so the test does
+    // not need a second distinct catalog/download fixture.
+    let second_quant_dir = model_dir.join("q4_k");
+    fs::create_dir_all(&second_quant_dir).unwrap();
+    let second_path = second_quant_dir.join("moonshine-tiny-q4_k.oasr");
+    fs::write(&second_path, &bytes).unwrap();
+    let second_pack = InstalledPack {
+        model_id: "moonshine-tiny".to_string(),
+        display_name: first.display_name.clone(),
+        quant: "q4_k".to_string(),
+        suffix: "q4".to_string(),
+        pull: "moonshine-tiny:q4".to_string(),
+        filename: "moonshine-tiny-q4_k.oasr".to_string(),
+        path: second_path.clone(),
+        url: first.url.clone(),
+        hf_revision: first.hf_revision.clone(),
+        sha256: sha256_hex(&bytes),
+        size_bytes: bytes.len() as u64,
+        installed_at_unix_seconds: 1,
+        source: None,
+    };
+    let json = serde_json::to_string_pretty(&second_pack).unwrap();
+    fs::write(second_quant_dir.join("installed.json"), format!("{json}\n")).unwrap();
+
+    let removed = remove_model_pack(home, "moonshine-tiny:q8")
+        .unwrap()
+        .unwrap();
+    assert_eq!(removed.pull, first.pull);
+
+    // The sibling q4_k quant is a different, still-installed pack: removing
+    // q8 must not touch it or the shared model dir that contains it.
+    assert!(
+        model_dir.exists(),
+        "model dir must survive: a sibling quant is still installed"
+    );
+    assert!(
+        second_path.exists(),
+        "sibling quant file must not be touched"
+    );
+    let remaining = list_installed_packs(home).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].pull, "moonshine-tiny:q4");
+}
+
+#[test]
 fn resolve_installed_pack_reference_matches_quant_aliases() {
     let bytes = tiny_pack_bytes();
     let resolved = resolved_for(&bytes);
