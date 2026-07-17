@@ -301,6 +301,21 @@ impl StreamingSession {
         // own `min_partial_interval` throttles further; polling more often just
         // wastes a re-decode.
         let pushed = self.session.push_audio(frame)?;
+        // Advance the frame counters in lockstep with the push that just
+        // committed this frame to the driver's monotonic frame timeline --
+        // BEFORE the fallible poll / finalize / split calls below. The driver
+        // records `seq` (and rejects any non-contiguous or repeated seq) the
+        // instant `push_audio` accepts the frame; if a later poll/finalize
+        // decode errors and the embedder keeps feeding (an iOS mic loop that
+        // logs the decode error and pushes the next chunk rather than tearing
+        // the session down), advancing `next_seq` only at the end of the
+        // function would leave it un-incremented, so the next frame would
+        // reuse this seq and trip the driver's "frame sequence jumped" guard.
+        // The desktop/server path is immune because its `CaptureEngine`
+        // numbers frames when it produces them, independently of poll/finalize
+        // outcome; this keeps the in-process feed to the same contract.
+        self.next_seq += 1;
+        self.next_start_ms += FRAME_DURATION_MS as u64;
         self.emit(&pushed, out);
         self.samples_since_poll += FRAME_SAMPLES;
         if self.samples_since_poll >= self.poll_interval_samples {
@@ -330,8 +345,6 @@ impl StreamingSession {
             }
         }
 
-        self.next_seq += 1;
-        self.next_start_ms += FRAME_DURATION_MS as u64;
         Ok(())
     }
 
