@@ -64,6 +64,44 @@ typedef enum OpenAsrPcmFormat {
 } OpenAsrPcmFormat;
 
 /**
+ * Hardware target for a streaming session's decode, mirroring
+ * [`openasr_core::NativeAsrHardwareTarget`]. `Auto` lets the runtime choose;
+ * on iOS/macOS only `Auto`, `Cpu`, `Accelerated`, and `AppleSilicon` are
+ * meaningful (the SDK is CPU-only today -- see `docs/SDK_IOS_MACOS.md`), but
+ * the full set is mapped so the contract does not silently drop a value.
+ */
+typedef enum OpenAsrHardwareTarget {
+  OPEN_ASR_HARDWARE_TARGET_AUTO = 0,
+  OPEN_ASR_HARDWARE_TARGET_CPU = 1,
+  OPEN_ASR_HARDWARE_TARGET_ACCELERATED = 2,
+  OPEN_ASR_HARDWARE_TARGET_APPLE_SILICON = 3,
+  OPEN_ASR_HARDWARE_TARGET_NVIDIA_CUDA = 4,
+  OPEN_ASR_HARDWARE_TARGET_AMD_GPU = 5,
+  OPEN_ASR_HARDWARE_TARGET_INTEL_CPU = 6,
+  OPEN_ASR_HARDWARE_TARGET_INTEL_GPU = 7,
+} OpenAsrHardwareTarget;
+
+/**
+ * The kind of an incremental streaming transcript event, mirroring
+ * [`openasr_core::StreamingEventKind`].
+ */
+typedef enum OpenAsrStreamingEventKind {
+  /**
+   * A mutable in-progress hypothesis for the active utterance, superseded by
+   * later events carrying the same segment id.
+   */
+  OPEN_ASR_STREAMING_EVENT_KIND_PARTIAL = 0,
+  /**
+   * A settled segment, emitted at a VAD speech pause or at `finish`.
+   */
+  OPEN_ASR_STREAMING_EVENT_KIND_COMMITTED = 1,
+  /**
+   * A post-final correction to an already-committed segment.
+   */
+  OPEN_ASR_STREAMING_EVENT_KIND_REVISION = 2,
+} OpenAsrStreamingEventKind;
+
+/**
  * Opaque handle to a validated local `.oasr` model pack path. Obtained from
  * [`openasr_model_open`], released with [`openasr_model_close`].
  *
@@ -80,6 +118,66 @@ typedef struct OpenAsrModel OpenAsrModel;
  * through `openasr_result_*` accessor functions.
  */
 typedef struct OpenAsrResult OpenAsrResult;
+
+/**
+ * Opaque batch of streaming events produced by one [`openasr_streaming_feed`]
+ * call. Read it through the `openasr_streaming_event_*` accessors, then free
+ * it with [`openasr_streaming_events_free`]. Mirrors [`OpenAsrResult`]: the
+ * events own Rust-side strings that are not a valid C value type, so they are
+ * read by index rather than returned as a raw struct array.
+ */
+typedef struct OpenAsrStreamingEvents OpenAsrStreamingEvents;
+
+/**
+ * Opaque handle to an in-process streaming transcription session over a local
+ * `.oasr` pack. Created with [`openasr_streaming_session_open`], driven with
+ * [`openasr_streaming_feed`], and consumed by [`openasr_streaming_finish`]
+ * (which returns the final transcript and frees the session) or discarded with
+ * [`openasr_streaming_free`].
+ */
+typedef struct OpenAsrStreamingSession OpenAsrStreamingSession;
+
+/**
+ * Configuration for [`openasr_streaming_session_open`]. Pass a null pointer to
+ * use the engine defaults (partial results on, word timestamps off, VAD on,
+ * auto hardware, default poll cadence). All fields are plain C values so the
+ * struct is a valid `#[repr(C)]` type; `language` is an optional borrowed C
+ * string (null = auto-detect), read only during the open call.
+ */
+typedef struct OpenAsrStreamingConfig {
+  /**
+   * Emit mutable `Partial` events as audio arrives.
+   */
+  bool partial_results;
+  /**
+   * Attach per-word timings to events when the family supports them.
+   */
+  bool word_timestamps;
+  /**
+   * Run an energy VAD that commits a segment at each speech pause. When
+   * false, the whole stream is one utterance finalized only at `finish`.
+   */
+  bool enable_vad;
+  /**
+   * Optional decode language hint (e.g. "en"), or null to auto-detect. Only
+   * borrowed for the duration of the open call.
+   */
+  const char *language;
+  /**
+   * Hardware target for the decode session.
+   */
+  enum OpenAsrHardwareTarget hardware_target;
+  /**
+   * Inference thread cap; `0` uses the per-family default.
+   */
+  uint16_t inference_threads;
+  /**
+   * New audio (ms) to accumulate before polling the engine for a partial
+   * re-decode; `0` uses the engine default. Values below the 20 ms frame
+   * size are clamped up by the engine.
+   */
+  uint64_t partial_poll_interval_ms;
+} OpenAsrStreamingConfig;
 
 #ifdef __cplusplus
 extern "C" {
@@ -200,6 +298,175 @@ float openasr_result_segment_end(const struct OpenAsrResult *result, uintptr_t i
  * `result`, if non-null, must be a live handle from [`openasr_transcribe_pcm`].
  */
 const char *openasr_result_segment_text(const struct OpenAsrResult *result, uintptr_t index);
+
+/**
+ * Opens an in-process streaming transcription session over the local `.oasr`
+ * pack at `path` and writes an opaque handle through `out_session`. Fails
+ * closed -- with [`OpenAsrStatus::ModelLoadFailed`] and no handle written --
+ * if the path is missing, not UTF-8, or not a pack a native model family
+ * recognizes / can stream. Never touches the network.
+ *
+ * Pass a null `config` to use the engine defaults; otherwise `config` is read
+ * (and its `language`, if non-null, borrowed) only for the duration of this
+ * call.
+ *
+ * # Safety
+ * `path` must be a valid, NUL-terminated UTF-8 C string. `config`, if
+ * non-null, must point to a valid [`OpenAsrStreamingConfig`] whose `language`
+ * is null or a valid NUL-terminated UTF-8 C string. `out_session` must be a
+ * valid, non-null pointer to a `*mut OpenAsrStreamingSession` the caller owns.
+ */
+enum OpenAsrStatus openasr_streaming_session_open(const char *path,
+                                                  const struct OpenAsrStreamingConfig *config,
+                                                  struct OpenAsrStreamingSession **out_session);
+
+/**
+ * Feeds a chunk of 16 kHz mono `f32` PCM (any length, including zero) into an
+ * open streaming session and writes the incremental events it produced through
+ * `out_events`: `Partial`s for the active utterance and a `Committed` event
+ * whenever a VAD speech pause closes one. An empty chunk is accepted and yields
+ * an empty (non-null) event batch. Read the batch with the
+ * `openasr_streaming_event_*` accessors, then free it with
+ * [`openasr_streaming_events_free`].
+ *
+ * # Safety
+ * `session` must be a live handle from [`openasr_streaming_session_open`] (not
+ * yet finished/freed). `pcm` must point to at least `pcm_len_samples` `f32`
+ * samples (may be null only when `pcm_len_samples` is 0). `out_events` must be
+ * a valid, non-null pointer to a `*mut OpenAsrStreamingEvents` the caller owns.
+ */
+enum OpenAsrStatus openasr_streaming_feed(struct OpenAsrStreamingSession *session,
+                                          const float *pcm,
+                                          uintptr_t pcm_len_samples,
+                                          struct OpenAsrStreamingEvents **out_events);
+
+/**
+ * Finishes a streaming session: drains any buffered tail audio, finalizes the
+ * active utterance, and writes the assembled final [`OpenAsrResult`] (with
+ * per-segment timestamps) through `out_result`. This **consumes** `session`:
+ * whether it succeeds or fails, the handle is freed and must not be reused or
+ * passed to [`openasr_streaming_free`]. Read the result with the
+ * `openasr_result_*` accessors and free it with [`openasr_result_free`].
+ *
+ * # Safety
+ * `session` must be a live handle from [`openasr_streaming_session_open`] that
+ * has not already been finished or freed. `out_result` must be a valid,
+ * non-null pointer to a `*mut OpenAsrResult` the caller owns.
+ */
+enum OpenAsrStatus openasr_streaming_finish(struct OpenAsrStreamingSession *session,
+                                            struct OpenAsrResult **out_result);
+
+/**
+ * Frees a streaming session without finishing it (aborts the stream). Null is
+ * accepted and is a no-op. Do not call this on a handle already consumed by
+ * [`openasr_streaming_finish`].
+ *
+ * # Safety
+ * `session`, if non-null, must be a live handle from
+ * [`openasr_streaming_session_open`] that has not been finished or freed.
+ */
+void openasr_streaming_free(struct OpenAsrStreamingSession *session);
+
+/**
+ * Returns the number of events in `events` (`0` if `events` is null).
+ *
+ * # Safety
+ * `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+ */
+uintptr_t openasr_streaming_events_count(const struct OpenAsrStreamingEvents *events);
+
+/**
+ * Returns event `index`'s kind, or [`OpenAsrStreamingEventKind::Partial`] if
+ * `events` is null or `index` is out of range (gate reads on
+ * [`openasr_streaming_events_count`]).
+ *
+ * # Safety
+ * `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+ */
+enum OpenAsrStreamingEventKind openasr_streaming_event_kind(const struct OpenAsrStreamingEvents *events,
+                                                            uintptr_t index);
+
+/**
+ * Returns event `index`'s text (UTF-8, NUL-terminated), or null if `events` is
+ * null or `index` is out of range. Valid until `events` is freed.
+ *
+ * # Safety
+ * `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+ */
+const char *openasr_streaming_event_text(const struct OpenAsrStreamingEvents *events,
+                                         uintptr_t index);
+
+/**
+ * Returns event `index`'s utterance id (UTF-8, NUL-terminated), or null if
+ * `events` is null or `index` is out of range. Valid until `events` is freed.
+ *
+ * # Safety
+ * `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+ */
+const char *openasr_streaming_event_utterance_id(const struct OpenAsrStreamingEvents *events,
+                                                 uintptr_t index);
+
+/**
+ * Returns event `index`'s segment id (UTF-8, NUL-terminated), or null if
+ * `events` is null or `index` is out of range. Valid until `events` is freed.
+ *
+ * # Safety
+ * `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+ */
+const char *openasr_streaming_event_segment_id(const struct OpenAsrStreamingEvents *events,
+                                               uintptr_t index);
+
+/**
+ * Returns event `index`'s detected language tag (e.g. "en"), UTF-8 and
+ * NUL-terminated, or null if `events` is null, `index` is out of range, or the
+ * family reported no language. Valid until `events` is freed.
+ *
+ * # Safety
+ * `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+ */
+const char *openasr_streaming_event_language(const struct OpenAsrStreamingEvents *events,
+                                             uintptr_t index);
+
+/**
+ * Returns event `index`'s monotonic revision number (higher supersedes lower
+ * for the same segment id), or `0` if `events` is null or `index` is out of
+ * range.
+ *
+ * # Safety
+ * `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+ */
+uint64_t openasr_streaming_event_revision(const struct OpenAsrStreamingEvents *events,
+                                          uintptr_t index);
+
+/**
+ * Returns event `index`'s start time in milliseconds, or `0` if `events` is
+ * null or `index` is out of range.
+ *
+ * # Safety
+ * `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+ */
+uint64_t openasr_streaming_event_start_ms(const struct OpenAsrStreamingEvents *events,
+                                          uintptr_t index);
+
+/**
+ * Returns event `index`'s end time in milliseconds, or `0` if `events` is null
+ * or `index` is out of range.
+ *
+ * # Safety
+ * `events`, if non-null, must be a live handle from [`openasr_streaming_feed`].
+ */
+uint64_t openasr_streaming_event_end_ms(const struct OpenAsrStreamingEvents *events,
+                                        uintptr_t index);
+
+/**
+ * Frees an event batch returned by [`openasr_streaming_feed`]. Null is accepted
+ * and is a no-op.
+ *
+ * # Safety
+ * `events`, if non-null, must have been previously returned by
+ * [`openasr_streaming_feed`] and not already freed.
+ */
+void openasr_streaming_events_free(struct OpenAsrStreamingEvents *events);
 
 /**
  * Returns the last error message set on the calling thread by a failing
