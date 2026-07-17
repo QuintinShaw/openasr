@@ -18,13 +18,28 @@ plus a generated header, not a Rust-shaped API.
   transport-free path an iOS app uses for live captioning -- iOS cannot spawn the
   desktop realtime server, so it links the same
   `openasr_core::StreamingSession` engine directly.
+- **Model market**: fetch and verify the signed model catalog, then (under
+  explicit consent) download + sha256-verify + install a model pack, list
+  installed packs, and remove one (`openasr_catalog_*` / `openasr_pull_model` /
+  `openasr_install_local_pack` / `openasr_list_installed_json` /
+  `openasr_remove_model`). This is the on-device equivalent of `openasr pull`,
+  for a native app that has no CLI or local server to lean on.
 - Error codes + last-error text; every call is panic-safe (no unwind crosses
   the FFI boundary; see `crates/openasr-ffi/src/lib.rs` module docs).
 
-**Not in v1**: the local HTTP server, or model download. SDK consumers bring and
-manage their own `.oasr` packs -- OpenASR's "no silent download" product boundary
-(see `AGENTS.md`) is a CLI/server concern; an embedded SDK has no business
-reaching the network on its own.
+**Not in v1**: the local HTTP server. SDK consumers can still bring and manage
+their own `.oasr` packs directly (`openasr_model_open`), but the market API above
+also lets an app fetch the signed catalog and pull packs itself.
+
+**"No silent download" still holds.** The market API never touches the network
+on its own: fetching the catalog and pulling a model are each an *explicit* call
+the app makes -- the catalog fetch to render its market UI, the pull only after
+showing the user the model/quant/size/host/license and getting consent. There is
+no auto-install path and no transcription path that can trigger a download, and
+the download's URL + sha256 come from the in-core verified catalog (the app only
+passes a `model:quant` reference), so an app cannot redirect the fetch or bypass
+the digest check. All catalog/pack signature verification stays in `openasr-core`
+(see `AGENTS.md`), exactly as the CLI does it.
 
 **CPU-only v1, and iOS Metal is not wired up at all yet.** `crates/openasr-core/build.rs`
 gates the `GGML_METAL`/`GGML_METAL_EMBED_LIBRARY` cmake flags on
@@ -199,6 +214,50 @@ if (openasr_streaming_finish(session, &final) == OPEN_ASR_STATUS_OK) {   // cons
 }
 // session is already freed by finish(); on an error path use openasr_streaming_free(session) instead.
 ```
+
+### Model market (catalog + pull / install / remove)
+
+The market surface lets a native app show a catalog of downloadable models and
+install them on device, with the same trust boundary the CLI enforces. The app
+supplies its own sandbox directory as the OpenASR home (the iOS equivalent of
+`OPENASR_HOME`); packs install under `<home>/models/...`. Shape (see the header
+for full ownership rules):
+
+```c
+// Fetch + verify the signed catalog (NULL url = the built-in production endpoint).
+OpenAsrStatus openasr_catalog_fetch(const char *catalog_url, const char *home_dir,
+                                    OpenAsrCatalog **out_catalog);
+const char   *openasr_catalog_json(const OpenAsrCatalog *catalog);  // verified catalog, borrowed
+void          openasr_catalog_free(OpenAsrCatalog *catalog);
+
+// Download + sha256-verify + install a model (after showing consent). NULL quant
+// = device-recommended; NULL source = automatic chain; callbacks may be NULL.
+OpenAsrStatus openasr_pull_model(const OpenAsrCatalog *catalog,
+                                 const char *reference, const char *quant, const char *source,
+                                 bool accept_license, const char *home_dir,
+                                 OpenAsrPullProgressCallback progress_cb, void *progress_user_data,
+                                 OpenAsrPullCancelCallback cancel_cb, void *cancel_user_data,
+                                 char **out_installed_json);   // free with openasr_string_free
+
+// Verify + install a .oasr the app already has on disk (sha256/size must match catalog).
+OpenAsrStatus openasr_install_local_pack(const OpenAsrCatalog *catalog, const char *oasr_path,
+                                         const char *home_dir,
+                                         OpenAsrPullProgressCallback progress_cb, void *progress_user_data,
+                                         char **out_installed_json);
+
+OpenAsrStatus openasr_list_installed_json(const char *home_dir, char **out_json);  // JSON array
+OpenAsrStatus openasr_remove_model(const char *home_dir, const char *reference, bool *out_removed);
+void          openasr_string_free(char *string);   // free out_*_json strings only
+```
+
+Typical flow: `openasr_catalog_fetch` -> parse `openasr_catalog_json` to render
+the market and the per-model download disclosure (size, host, license) -> on the
+user's tap, `openasr_pull_model(catalog, "moonshine-tiny", NULL, ...)` with a
+progress callback and a cancel flag -> the installed pack's `path` (from
+`out_installed_json` or `openasr_list_installed_json`) is what you hand to
+`openasr_model_open` / `openasr_streaming_session_open`. Run the pull off the main
+thread: it blocks for the whole download, invoking the progress/cancel callbacks
+synchronously on that same thread.
 
 ### Swift bridging (minimal sketch)
 
