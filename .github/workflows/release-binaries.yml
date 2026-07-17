@@ -74,6 +74,24 @@ jobs:
       # AMD HIP SDK "PRO Edition" silent-installer release train, matched to
       # llama.cpp's current Windows HIP release job.
       HIPSDK_INSTALLER_VERSION: 26.Q1
+      # Windows Vulkan loader (vulkan-1.dll) redistributable, bundled into the
+      # windows-x86_64-vulkan CLI zip -- see the "Stage Vulkan loader" step
+      # below for why (#132: STATUS_DLL_NOT_FOUND on machines with no GPU
+      # driver). This is a *runtime redistributable* pin, independent of
+      # VULKAN_VERSION above (that one pins the *build-time* SDK used to
+      # compile/link openasr.exe). Kept in lockstep with openasr-app's
+      # apps/desktop/scripts/stage-vulkan-loader.mjs, which pins the identical
+      # version + both hashes for the desktop sidecar bundle -- bump all three
+      # together in both repos, cross-checked against LunarG's own published
+      # hash at https://vulkan.lunarg.com/sdk/sha/<version>/windows/VulkanRT-X64-<version>-Components.zip.json.
+      VULKAN_LOADER_VERSION: 1.4.350.0
+      # sha256 of the downloaded vulkan-runtime-components.zip archive.
+      VULKAN_LOADER_ARCHIVE_SHA256: 23ce69f32cef3e2799617e2b1776cd0c71030d23a91f8375821cc40d76b185b9
+      # sha256 of x64/vulkan-1.dll extracted from that archive -- a second,
+      # independent pin so a change in the archive's internal layout (wrong
+      # file extracted) is caught even though the archive-level hash above
+      # already matched.
+      VULKAN_LOADER_DLL_SHA256: 0419974f00e82a3d619077ba414da265a774f8db9d45ad93bc1843f44b2c2c1f
       # Single-leg validation gate. jobs.<job_id>.if cannot see the `matrix`
       # context (only jobs.<job_id>.steps[*].if can), so the only_target
       # filter is computed once here (job-level `env:` can see `matrix`, same
@@ -734,6 +752,123 @@ jobs:
           Add-Content $env:GITHUB_ENV "DIST_DIR=$distDir"
           Add-Content $env:GITHUB_ENV "ARCHIVE_NAME=$archive"
 
+      # Cache the downloaded LunarG archive across runs (retries, re-dispatch)
+      # so the ~19MB fetch only happens once per pinned VULKAN_LOADER_VERSION,
+      # not once per run -- same idea as the "Cache AMD HIP SDK install" step
+      # above. The staging step below still re-verifies the hash on every run
+      # regardless of cache hit, so a stale/corrupted cache entry can never
+      # silently pass.
+      - name: Cache Vulkan loader redistributable
+        if: matrix.features == 'vulkan' && runner.os == 'Windows' && env.LEG_SELECTED == 'true'
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}\vulkan-runtime-components.zip
+          key: vulkan-loader-${{ env.VULKAN_LOADER_VERSION }}
+
+      - name: Stage Vulkan loader (LunarG VulkanRT redistributable)
+        if: matrix.features == 'vulkan' && runner.os == 'Windows' && env.LEG_SELECTED == 'true'
+        shell: pwsh
+        # openasr.exe's PE import table names vulkan-1.dll (ggml-vulkan links
+        # Vulkan::Vulkan, the SYSTEM Vulkan loader import lib) -- the loader
+        # itself is a thin, GPU-vendor-agnostic dispatch shim that does NOT
+        # require a GPU or driver to LOAD, only to enumerate a device later.
+        # But the OS module loader resolves every PE import before main()
+        # runs at all, before openasr-core's HardwareFallbackPolicy ever gets
+        # a chance to fall back to CPU. A machine with no GPU driver installed
+        # (a clean Windows install, a VM) typically has no vulkan-1.dll
+        # anywhere on its DLL search path either (a driver install is what
+        # normally puts it there), so the exe dies at load time with
+        # STATUS_DLL_NOT_FOUND (0xC0000135) before any CPU fallback can run
+        # -- see #132.
+        #
+        # Fix: LunarG's Windows Vulkan Runtime redistributable ships the SAME
+        # vulkan-1.dll every GPU driver installs, under a license (Apache-2.0
+        # governs the loader itself; see VulkanRT-License.txt inside the
+        # archive) that explicitly permits redistribution, entirely
+        # independent of any GPU driver. Staging a pinned, hash-verified copy
+        # beside openasr.exe means the loader ALWAYS resolves (Windows
+        # searches the application directory before anything else on the
+        # default DLL search path), so a missing/absent GPU driver degrades
+        # exactly the way the original design intended: the loader loads
+        # fine, enumerates zero devices, and HardwareFallbackPolicy falls
+        # back to CPU in Rust -- never a DLL-load failure.
+        #
+        # Mirrors openasr-app's apps/desktop/scripts/stage-vulkan-loader.mjs
+        # (identical version pin + identical two-layer hash verification) for
+        # the desktop sidecar bundle. Fail-closed throughout: a download
+        # failure, a hash mismatch at either layer, or a missing extracted
+        # file all throw -- there is no silent fallback to an unverified DLL.
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archivePath = Join-Path $env:RUNNER_TEMP "vulkan-runtime-components.zip"
+
+          function Get-Sha256Hex($path) {
+            (Get-FileHash -Path $path -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+
+          $needDownload = $true
+          if (Test-Path $archivePath) {
+            if ((Get-Sha256Hex $archivePath) -eq $env:VULKAN_LOADER_ARCHIVE_SHA256) {
+              Write-Host "stage-vulkan-loader: reusing cached $archivePath (sha256 verified)."
+              $needDownload = $false
+            } else {
+              Write-Host "stage-vulkan-loader: cached $archivePath failed sha256 verification -- re-downloading."
+              Remove-Item -Force $archivePath
+            }
+          }
+          if ($needDownload) {
+            $url = "https://sdk.lunarg.com/sdk/download/$env:VULKAN_LOADER_VERSION/windows/vulkan-runtime-components.zip"
+            Write-Host "stage-vulkan-loader: downloading $url ..."
+            curl.exe --fail --location --retry 3 --output $archivePath $url
+            if ($LASTEXITCODE -ne 0) { Write-Error "download failed (curl exit $LASTEXITCODE)"; exit 1 }
+          }
+
+          $actualArchiveSha = Get-Sha256Hex $archivePath
+          if ($actualArchiveSha -ne $env:VULKAN_LOADER_ARCHIVE_SHA256) {
+            Write-Error ("sha256 mismatch for Vulkan runtime archive: expected $env:VULKAN_LOADER_ARCHIVE_SHA256, got $actualArchiveSha. " +
+              "Refusing to stage an unverified Vulkan runtime archive -- if LunarG genuinely rotated this release's bytes, re-pin " +
+              "VULKAN_LOADER_ARCHIVE_SHA256 (and VULKAN_LOADER_DLL_SHA256) here AND in openasr-app's stage-vulkan-loader.mjs, " +
+              "cross-checked against https://vulkan.lunarg.com/sdk/sha/$env:VULKAN_LOADER_VERSION/windows/VulkanRT-X64-$env:VULKAN_LOADER_VERSION-Components.zip.json.")
+            exit 1
+          }
+
+          $extractDir = Join-Path $env:RUNNER_TEMP "vulkan-runtime-components-extracted"
+          if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+          Expand-Archive -Path $archivePath -DestinationPath $extractDir -Force
+
+          # The zip's top-level folder name is version-specific
+          # (VulkanRT-X64-<version>-Components\x64\vulkan-1.dll), so search by
+          # filename instead of hardcoding it.
+          $dll = Get-ChildItem -Path $extractDir -Recurse -Filter "vulkan-1.dll" |
+            Where-Object { $_.FullName -like "*\x64\*" } | Select-Object -First 1
+          if (-not $dll) {
+            Write-Error "vulkan-1.dll not found under $extractDir\*\x64 -- archive layout may have changed."
+            exit 1
+          }
+
+          $actualDllSha = Get-Sha256Hex $dll.FullName
+          if ($actualDllSha -ne $env:VULKAN_LOADER_DLL_SHA256) {
+            Write-Error ("Extracted vulkan-1.dll sha256 $actualDllSha does not match the pinned $env:VULKAN_LOADER_DLL_SHA256. " +
+              "The archive's own sha256 already verified against LunarG's published hash, so this means the archive's internal " +
+              "layout changed (wrong file extracted) -- refusing to stage an unverified DLL.")
+            exit 1
+          }
+
+          Copy-Item $dll.FullName (Join-Path $env:DIST_DIR "vulkan-1.dll") -Force
+          Write-Host "stage-vulkan-loader: staged $(Join-Path $env:DIST_DIR 'vulkan-1.dll') (Vulkan runtime $env:VULKAN_LOADER_VERSION, sha256 $actualDllSha)."
+
+          # Ship the loader's own upstream license text verbatim (from the
+          # same downloaded, hash-verified archive -- not hand-transcribed)
+          # so the Apache-2.0-licensed redistributable carries its required
+          # attribution inside the zip, same as README.md/LICENSE above.
+          $licenseSrc = Get-ChildItem -Path $extractDir -Recurse -Filter "VulkanRT-License.txt" | Select-Object -First 1
+          if (-not $licenseSrc) {
+            Write-Error "VulkanRT-License.txt not found in the Vulkan runtime archive -- archive layout may have changed."
+            exit 1
+          }
+          Copy-Item $licenseSrc.FullName (Join-Path $env:DIST_DIR "VULKAN-LOADER-LICENSE.txt") -Force
+          Write-Host "stage-vulkan-loader: staged VULKAN-LOADER-LICENSE.txt from the archive's own VulkanRT-License.txt."
+
       - name: Resolve Windows binaries to sign
         if: runner.os == 'Windows' && env.LEG_SELECTED == 'true'
         shell: pwsh
@@ -742,8 +877,11 @@ jobs:
         # same job, not a third-party redistributable). Deliberately excludes
         # the vendor GPU runtime DLLs staged above (NVIDIA cudart64_*/
         # cublas64_*/cublasLt64_*, AMD amdhip64_*/libhipblas_*/rocblas_*/
-        # libhipblaslt_*) -- those already carry NVIDIA's/AMD's own
-        # Authenticode signatures and are not ours to re-sign.
+        # libhipblaslt_*, LunarG's vulkan-1.dll) -- those are third-party
+        # redistributables (some already carrying the vendor's own Authenticode
+        # signature) and are not ours to re-sign. vulkan-1.dll does not match
+        # the "ggml*.dll" filter below, so it is excluded automatically; this
+        # comment just makes that exclusion explicit for the reader.
         run: |
           $ErrorActionPreference = "Stop"
           $signTargets = @((Resolve-Path "$env:DIST_DIR\${{ matrix.binary_name }}").Path)
