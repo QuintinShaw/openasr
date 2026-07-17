@@ -27,6 +27,10 @@ use crate::NativeAsrError;
 use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::FIRERED_LLM_DECODE_POLICY_ID;
+use crate::ggml_runtime::{
+    GgmlCpuGraphConfig, RequestBackendOverrideGuard, RequestBackendPreference,
+    install_request_backend_override, request_backend_override,
+};
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
     BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
@@ -34,8 +38,9 @@ use crate::models::decode_policy_component_registry::{
 use crate::models::firered_aed::encoder_graph::FireRedEncoderGraphRuntime;
 use crate::models::firered_aed::frontend::{FireRedFbankFrontend, apply_cmvn};
 use crate::models::ggml_asr_executor::{
-    GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
-    GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
+    GgmlAsrBackendPreference, GgmlAsrExecutionError, GgmlAsrExecutionRequest,
+    GgmlAsrExecutionResult, GgmlAsrExecutor, GgmlAsrStreamingExecutor,
+    GgmlAsrStreamingSessionRequest,
 };
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
@@ -297,12 +302,29 @@ impl FireRedLlmGgmlExecutor {
                 reason: error.to_string(),
             })?;
 
+        // Pin the memory-dominant 7B decoder to a backend that fits this host
+        // (see `resolve_decoder_backend_override`). Held for the whole decode so
+        // the graph runner built here -- and reused every step -- stays on the
+        // chosen backend; the encoder/adapter above already ran and are
+        // unaffected.
+        let _decoder_backend_override =
+            resolve_decoder_backend_override(runtime_path, request.backend_preference);
         let mut decoder =
             FireRedLlmDecoderRuntime::new(runtime_path, decoder_metadata).map_err(|error| {
                 FireRedLlmExecutorError::DecoderFailed {
                     reason: error.to_string(),
                 }
             })?;
+        // Opt-in perf diagnostic (mirrors the qwen `OPENASR_HYMT2_PROFILE`
+        // backend log line): confirms which backend the 7B Qwen2 decoder graph
+        // actually resolved to (Metal vs CPU) without asserting a host-dependent
+        // timing number in shipping code.
+        if std::env::var_os("OPENASR_FIRERED_LLM_PROFILE").is_some() {
+            eprintln!(
+                "OPENASR_FIRERED_LLM_PROFILE decoder_backend={}",
+                decoder.backend_label()
+            );
+        }
         let token_rows_len = decode_prompt.token_ids.len() * decoder_metadata.d_model;
         let mut token_rows = Vec::with_capacity(token_rows_len);
         for &token_id in &decode_prompt.token_ids {
@@ -387,6 +409,73 @@ fn map_registry_error(
     }
 }
 
+/// Decide which backend the 7B Qwen2 decoder stage should build on, and return
+/// an override guard (kept alive across the decoder's construction + decode)
+/// that pins it there.
+///
+/// The decoder is the memory-dominant stage: at fp16/q8_0 its weights plus the
+/// f16 embedding, the growing KV cache and the ggml compute buffers overrun a
+/// small unified-memory GPU working set, so a Metal command buffer fails with
+/// `kIOGPUCommandBufferCallbackErrorOutOfMemory` partway through decode (M1/16GB
+/// measured: q8_0 OOMs, q4_k -- ~4.9GB peak RSS -- fits comfortably). Rather
+/// than let Auto crash mid-decode or silently fall back to a 30x-slower path, we
+/// pick the backend up front:
+///
+/// - An explicit `Accelerated`/`CpuOnly` request always wins (the product rule
+///   that a user's explicit hardware choice is never second-guessed) -- we just
+///   honor it, which also makes the request preference authoritative on the
+///   direct-`execute` path that does not go through the dispatch wrapper.
+/// - Under `Auto`, follow the process/env default, but if the pack cannot fit
+///   this host (a conservative `pack_bytes * 2 <= total_RAM` unified-memory
+///   budget: weights resident on the GPU plus comparable headroom for the host
+///   embedding, KV, compute buffers and the OS) and the default would be a
+///   GPU-class backend, fall the decoder back to CPU and print a one-line
+///   not-real-time notice instead of OOM-ing.
+///
+/// Returns `None` when no override is needed (Auto that fits / already CPU).
+fn resolve_decoder_backend_override(
+    runtime_path: &std::path::Path,
+    backend_preference: GgmlAsrBackendPreference,
+) -> Option<RequestBackendOverrideGuard> {
+    match backend_preference {
+        GgmlAsrBackendPreference::CpuOnly => Some(install_request_backend_override(Some(
+            RequestBackendPreference::CpuOnly,
+        ))),
+        GgmlAsrBackendPreference::Accelerated => Some(install_request_backend_override(Some(
+            RequestBackendPreference::Accelerated,
+        ))),
+        GgmlAsrBackendPreference::Auto => {
+            // An explicit accelerate request installed upstream still wins.
+            if matches!(
+                request_backend_override(),
+                Some(RequestBackendPreference::Accelerated)
+            ) {
+                return None;
+            }
+            if !GgmlCpuGraphConfig::resolve_runtime_backend().is_gpu_class() {
+                return None;
+            }
+            // Unknown RAM -> trust the default rather than force CPU.
+            let total_ram = crate::host::host_total_memory_bytes()?;
+            let pack_bytes = std::fs::metadata(runtime_path).ok()?.len();
+            if pack_bytes.saturating_mul(2) <= total_ram {
+                return None;
+            }
+            eprintln!(
+                "openasr: the FireRedASR2-LLM 7B decoder pack ({:.1} GB) does not fit this host's \
+                 GPU memory budget ({:.1} GB RAM); running the decoder on CPU (transcription will \
+                 be slower than real time). Install a lower-quant pack (q4_k) for GPU-accelerated \
+                 decode.",
+                pack_bytes as f64 / 1.0e9,
+                total_ram as f64 / 1.0e9,
+            );
+            Some(install_request_backend_override(Some(
+                RequestBackendPreference::CpuOnly,
+            )))
+        }
+    }
+}
+
 impl GgmlAsrExecutor for FireRedLlmGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         FIRERED_LLM_EXECUTOR_ID
@@ -435,7 +524,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudio};
+    use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
     use crate::models::ggml_family_registry::firered_llm_runtime_descriptor_v1;
 
     use super::*;
@@ -455,12 +544,16 @@ mod tests {
         )
     }
 
-    // Pinned to the real T5 dev-pack decode (q8_0, this repo's `OPENASR_GGML_BACKEND=cpu`
-    // -- CPU is the deterministic reference backend; Metal currently OOMs this
-    // family's 7B decoder on a 16GB unified-memory Mac, see the T5 report). JFK
-    // is word-for-word correct; the Mandarin sentence is the same non-copyrighted
-    // `say -v Tingting` synthesis firered-aed's own golden uses (see that
-    // family's `zh_sample.wav` doc comment).
+    // Pinned to the real dev-pack decode. CPU is the deterministic reference
+    // backend, so these goldens request `CpuOnly`; the decode is byte-identical
+    // on Metal (verified against the q4_k pack on an M1: Metal:MTL0 vs Cpu:CPU
+    // produce the same transcript). The q4_k pack fits Metal comfortably (~4.9GB
+    // peak RSS on a 16GB Mac); only the larger fp16/q8_0 packs overrun a small
+    // unified-memory GPU, which `resolve_decoder_backend_override` now handles by
+    // falling the decoder back to CPU under Auto. JFK is word-for-word correct;
+    // the Mandarin sentence is the same non-copyrighted `say -v Tingting`
+    // synthesis firered-aed's own golden uses (see that family's `zh_sample.wav`
+    // doc comment).
     const GOLDEN_JFK_TEXT: &str = "and so my fellow americans ask not what your country can do \
         for you ask what you can do for your country";
 
@@ -485,7 +578,14 @@ mod tests {
     }
 
     fn transcribe_with_dev_pack(wav_path: PathBuf) -> Option<(String, std::time::Duration, f32)> {
-        let pack_path = dev_pack_path();
+        transcribe_with_pack(dev_pack_path(), wav_path, GgmlAsrBackendPreference::CpuOnly)
+    }
+
+    fn transcribe_with_pack(
+        pack_path: PathBuf,
+        wav_path: PathBuf,
+        backend_preference: GgmlAsrBackendPreference,
+    ) -> Option<(String, std::time::Duration, f32)> {
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
             return None;
@@ -504,7 +604,7 @@ mod tests {
             selected_family: firered_llm_runtime_descriptor_v1(),
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
-            backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            backend_preference,
         };
 
         let executor = FireRedLlmGgmlExecutor;
@@ -512,6 +612,50 @@ mod tests {
         let result = executor.execute(&request).expect("firered-llm transcribe");
         let elapsed = started_at.elapsed();
         Some((result.transcription.text, elapsed, audio_duration_seconds))
+    }
+
+    /// M1 CPU-vs-Metal RTF + peak-RSS AB harness for the FireRedASR2-LLM 7B
+    /// decoder across quant rungs. One config per invocation (env-selected) so
+    /// `peak_rss_bytes` (process-global `ru_maxrss` high-water) stays isolated;
+    /// prints a machine-greppable `FR2_LLM_AB ...` line. Never asserts a timing
+    /// number (host-dependent) -- it only measures. Mirrors dolphin's
+    /// `dolphin_perf_ab`.
+    ///
+    /// Env: `OPENASR_FR2_AB_BACKEND=cpu|metal|auto` (default auto),
+    /// `OPENASR_FR2_AB_QUANT=q4_k|q8_0|fp16` (default q4_k),
+    /// `OPENASR_FR2_AB_CLIP=<wav path>` (default fixtures/zh_sample.wav).
+    /// Set `OPENASR_FIRERED_LLM_PROFILE=1` too to also log the resolved
+    /// decoder backend.
+    #[test]
+    #[ignore = "perf AB harness: requires the private dev-only firered2-llm-<quant>.oasr packs \
+                under tmp-weights/fr2/out; env-selected backend/quant, prints FR2_LLM_AB + peak RSS"]
+    fn firered_llm_perf_ab() {
+        let quant = std::env::var("OPENASR_FR2_AB_QUANT").unwrap_or_else(|_| "q4_k".to_string());
+        let pack_path = PathBuf::from(format!(
+            "/Volumes/QuintinDocument/openasr-dev/tmp-weights/fr2/out/firered2-llm-{quant}.oasr"
+        ));
+        let backend = match std::env::var("OPENASR_FR2_AB_BACKEND").as_deref() {
+            Ok("cpu") => GgmlAsrBackendPreference::CpuOnly,
+            Ok("metal") | Ok("gpu") => GgmlAsrBackendPreference::Accelerated,
+            _ => GgmlAsrBackendPreference::Auto,
+        };
+        let clip = std::env::var("OPENASR_FR2_AB_CLIP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| zh_wav_path());
+
+        let Some((text, elapsed, audio_duration_seconds)) =
+            transcribe_with_pack(pack_path, clip, backend)
+        else {
+            return;
+        };
+        let rtf = elapsed.as_secs_f32() / audio_duration_seconds.max(0.001);
+        let peak_rss_mb = crate::metrics::peak_rss_bytes()
+            .map(|bytes| bytes as f64 / 1.0e6)
+            .unwrap_or(0.0);
+        eprintln!(
+            "FR2_LLM_AB quant={quant} backend={backend:?} audio={audio_duration_seconds:.2}s \
+             elapsed={elapsed:?} RTF={rtf:.3} peak_rss={peak_rss_mb:.0}MB text={text}"
+        );
     }
 
     // T5: promoted from the Stage-4 "prints transcript for manual judgement"
@@ -523,9 +667,10 @@ mod tests {
     // wall-clock varies with shared-machine load) so a maintainer re-running
     // this locally still gets the performance signal the old probe printed.
     #[test]
-    #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; \
-                OPENASR_GGML_BACKEND=cpu (Metal currently OOMs this family's 7B decoder \
-                on a 16GB unified-memory Mac -- see the T5 report)"]
+    #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; runs the \
+                deterministic CPU reference decode (requested via CpuOnly; q8_0 overruns a 16GB \
+                Mac's GPU so Auto falls it back to CPU anyway -- q4_k fits Metal, see \
+                firered_llm_perf_ab)"]
     fn golden_diff_end_to_end_transcribe_matches_reference_decode_on_jfk_wav() {
         let Some((text, elapsed, audio_duration_seconds)) =
             transcribe_with_dev_pack(jfk_wav_path())
@@ -540,9 +685,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; \
-                OPENASR_GGML_BACKEND=cpu (Metal currently OOMs this family's 7B decoder \
-                on a 16GB unified-memory Mac -- see the T5 report)"]
+    #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; runs the \
+                deterministic CPU reference decode (requested via CpuOnly; q8_0 overruns a 16GB \
+                Mac's GPU so Auto falls it back to CPU anyway -- q4_k fits Metal, see \
+                firered_llm_perf_ab)"]
     fn golden_diff_end_to_end_transcribe_matches_reference_decode_on_zh_sample_wav() {
         let Some((text, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack(zh_wav_path())
         else {
@@ -556,9 +702,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; \
-                OPENASR_GGML_BACKEND=cpu (Metal currently OOMs this family's 7B decoder \
-                on a 16GB unified-memory Mac -- see the T5 report)"]
+    #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; runs the \
+                deterministic CPU reference decode (requested via CpuOnly; q8_0 overruns a 16GB \
+                Mac's GPU so Auto falls it back to CPU anyway -- q4_k fits Metal, see \
+                firered_llm_perf_ab)"]
     fn golden_diff_end_to_end_transcribe_matches_reference_decode_on_en_zh_mixed_wav() {
         let Some((text, elapsed, audio_duration_seconds)) =
             transcribe_with_dev_pack(en_zh_mixed_wav_path())

@@ -154,6 +154,14 @@ impl FireRedLlmDecoderRuntime {
         })
     }
 
+    /// `"<backend-kind>:<ggml backend name>"` for the Qwen2 decoder graph
+    /// (e.g. `Metal:Metal` or `Cpu:CPU`), for perf diagnostics -- surfaced
+    /// through the executor's `OPENASR_FIRERED_LLM_PROFILE` log line so a
+    /// maintainer can confirm which backend the 7B decoder actually ran on.
+    pub(crate) fn backend_label(&self) -> String {
+        self.whole_decoder.backend_label()
+    }
+
     pub(crate) fn new_kv_caches(&self) -> Vec<Qwen3AsrLayerKvCacheState> {
         (0..self.metadata.n_layers)
             .map(|_| {
