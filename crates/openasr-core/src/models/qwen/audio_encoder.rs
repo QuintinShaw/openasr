@@ -4,7 +4,8 @@ use std::time::Instant;
 use thiserror::Error;
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedWeightContext, env_var_truthy,
+    GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
+    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, env_var_truthy,
 };
 use crate::nn::conv::{
     Conv2dParams, ConvActivation, ConvBlockSteps, apply_conv_2d_bias_activation,
@@ -201,16 +202,37 @@ impl Qwen3AsrAudioEncoderRuntime {
         let mask = vec![0.0_f32; mask_len];
 
         let loaded = self.loaded.as_ref();
+
+        // Resident encoder weights (conv stem, every 1D norm/bias, and any 2D
+        // projection the runtime pack did not materialize for a zero-copy bind)
+        // live in a WEIGHTS-usage arena buffer instead of per-call graph-input
+        // leaves. ggml's multi-backend scheduler only offloads an op to the
+        // accelerator when its weight `src` is in a WEIGHTS-usage buffer, so the
+        // conv stem and its norms used to pin the encoder front to the CPU even
+        // under an explicit Metal backend (the 2D matmul projections already bind
+        // zero-copy from the mmap'd pack, `loaded`). Only the mel input and the
+        // per-chunk-derived positional/mask tensors stay genuine graph inputs.
+        // Mirrors the sibling dolphin/cohere/xasr encoders; the uploaded byte
+        // content and op order are unchanged, so the output stays golden.
+        let mut arena = self
+            .runner
+            .start_static_tensor_arena(qwen_audio_encoder_arena_context_bytes(weights))
+            .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
+                step: "static_tensor_arena",
+                source,
+            })?;
+        let resident = build_qwen_audio_resident_weights(&mut arena, weights, loaded)?;
+
         let mut graph = self.runner.start_graph();
 
         encode_qwen3_audio_embeddings_with_graph(
             &mut graph,
+            &resident,
             weights,
             metadata,
             &chunked_mel,
             &positional,
             &mask,
-            loaded,
             profile_started,
         )
     }
@@ -218,14 +240,19 @@ impl Qwen3AsrAudioEncoderRuntime {
 
 fn encode_qwen3_audio_embeddings_with_graph<'a>(
     graph: &mut crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
+    resident: &QwenAudioResidentTensors<'a>,
     weights: &Qwen3AsrAudioEncoderWeights,
     metadata: Qwen3AsrExecutionMetadata,
     chunked_mel: &ChunkedMelInput,
     positional: &[f32],
     mask: &[f32],
-    loaded: Option<&GgmlLoadedWeightContext>,
     profile_started: Option<Instant>,
 ) -> Result<Qwen3AsrAudioEncoderOutput, Qwen3AsrAudioEncoderError> {
+    // Per-call graph inputs: the mel features plus the per-chunk-derived
+    // positional embedding and attention mask. Every weight is already resident
+    // in the arena's WEIGHTS-usage buffer (see
+    // `build_qwen_audio_resident_weights`), so weights carry no `set_input` and
+    // are referenced through `resident`.
     let mel = graph
         .new_tensor_4d_f32(
             chunked_mel.chunk_frames,
@@ -238,25 +265,6 @@ fn encode_qwen3_audio_embeddings_with_graph<'a>(
             step: "ggml_new_tensor_4d(mel)",
             source,
         })?;
-    let conv1_weight = new_tensor_4d_from_dims(graph, &weights.conv1_weight, "conv1_weight")?;
-    let conv1_bias = new_tensor_1d_from_dims(graph, &weights.conv1_bias, "conv1_bias")?;
-    let conv2_weight = new_tensor_4d_from_dims(graph, &weights.conv2_weight, "conv2_weight")?;
-    let conv2_bias = new_tensor_1d_from_dims(graph, &weights.conv2_bias, "conv2_bias")?;
-    let conv3_weight = new_tensor_4d_from_dims(graph, &weights.conv3_weight, "conv3_weight")?;
-    let conv3_bias = new_tensor_1d_from_dims(graph, &weights.conv3_bias, "conv3_bias")?;
-    let mut front_pending: Vec<(GgmlCpuTensor, &F32Tensor)> = Vec::new();
-    let conv_out_weight = bind_or_arena_2d(
-        graph,
-        loaded,
-        &weights.conv_out_weight,
-        "conv_out_weight",
-        &mut front_pending,
-    )?;
-    let conv_out_bias = weights
-        .conv_out_bias
-        .as_ref()
-        .map(|tensor| new_tensor_1d_from_dims(graph, tensor, "conv_out_bias"))
-        .transpose()?;
     let positional_tensor = graph
         .new_tensor_3d_f32(
             metadata.audio_d_model,
@@ -278,102 +286,29 @@ fn encode_qwen3_audio_embeddings_with_graph<'a>(
             step: "ggml_new_tensor_2d(mask)",
             source,
         })?;
-
-    graph
-        .set_input(mel)
-        .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
-            step: "ggml_set_input(mel)",
-            source,
-        })?;
-    for tensor in [
-        conv1_weight,
-        conv1_bias,
-        conv2_weight,
-        conv2_bias,
-        conv3_weight,
-        conv3_bias,
-        positional_tensor,
-        mask_tensor,
-    ] {
+    for tensor in [mel, positional_tensor, mask_tensor] {
         graph
             .set_input(tensor)
             .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
-                step: "ggml_set_input(audio_weight)",
-                source,
-            })?;
-    }
-    if let Some(tensor) = conv_out_bias {
-        graph
-            .set_input(tensor)
-            .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
-                step: "ggml_set_input(conv_out_bias)",
-                source,
-            })?;
-    }
-    for (tensor, _) in &front_pending {
-        graph
-            .set_input(*tensor)
-            .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
-                step: "ggml_set_input(audio_front_weight)",
+                step: "ggml_set_input(audio_input)",
                 source,
             })?;
     }
 
-    let mut layer_inputs = Vec::with_capacity(weights.layers.len());
-    // Arena tensors (1D biases/norms always; 2D weights only when NOT bound
-    // zero-copy) that still need set_input + an f32 upload. Bound weights carry
-    // their mmap'd data already, so they are omitted from both.
-    let mut layer_pending: Vec<(GgmlCpuTensor, &F32Tensor)> = Vec::new();
-    for (layer_idx, layer) in weights.layers.iter().enumerate() {
-        let (tensors, pending) = build_audio_layer_tensors(graph, loaded, layer)?;
-        for (tensor, _) in &pending {
-            graph.set_input(*tensor).map_err(|source| {
-                Qwen3AsrAudioEncoderError::GraphBuildFailed {
-                    step: "ggml_set_input(audio_layer)",
-                    source,
-                }
-            })?;
-        }
-        layer_pending.extend(pending);
-        layer_inputs.push((layer_idx, tensors));
-    }
-
-    let ln_post_weight =
-        new_tensor_1d_from_dims(graph, &weights.ln_post_weight, "audio_ln_post_weight")?;
-    let ln_post_bias = new_tensor_1d_from_dims(graph, &weights.ln_post_bias, "audio_ln_post_bias")?;
-    let mut output_pending: Vec<(GgmlCpuTensor, &F32Tensor)> = Vec::new();
-    let proj1_weight = bind_or_arena_2d(
-        graph,
-        loaded,
-        &weights.proj1_weight,
-        "audio_proj1_weight",
-        &mut output_pending,
-    )?;
-    let proj1_bias = new_tensor_1d_from_dims(graph, &weights.proj1_bias, "audio_proj1_bias")?;
-    let proj2_weight = bind_or_arena_2d(
-        graph,
-        loaded,
-        &weights.proj2_weight,
-        "audio_proj2_weight",
-        &mut output_pending,
-    )?;
-    let proj2_bias = new_tensor_1d_from_dims(graph, &weights.proj2_bias, "audio_proj2_bias")?;
-    for tensor in [ln_post_weight, ln_post_bias, proj1_bias, proj2_bias] {
-        graph
-            .set_input(tensor)
-            .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
-                step: "ggml_set_input(audio_output_head)",
-                source,
-            })?;
-    }
-    for (tensor, _) in &output_pending {
-        graph
-            .set_input(*tensor)
-            .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
-                step: "ggml_set_input(audio_output_head_weight)",
-                source,
-            })?;
-    }
+    let conv1_weight = resident.conv1_weight;
+    let conv1_bias = resident.conv1_bias;
+    let conv2_weight = resident.conv2_weight;
+    let conv2_bias = resident.conv2_bias;
+    let conv3_weight = resident.conv3_weight;
+    let conv3_bias = resident.conv3_bias;
+    let conv_out_weight = resident.conv_out_weight;
+    let conv_out_bias = resident.conv_out_bias;
+    let ln_post_weight = resident.ln_post_weight;
+    let ln_post_bias = resident.ln_post_bias;
+    let proj1_weight = resident.proj1_weight;
+    let proj1_bias = resident.proj1_bias;
+    let proj2_weight = resident.proj2_weight;
+    let proj2_bias = resident.proj2_bias;
 
     let map_graph_error =
         |step, source| Qwen3AsrAudioEncoderError::GraphBuildFailed { step, source };
@@ -511,7 +446,7 @@ fn encode_qwen3_audio_embeddings_with_graph<'a>(
     state = compose_transformer_encoder_layer_stack(
         graph,
         state,
-        &layer_inputs,
+        &resident.layers,
         head_dim,
         metadata.audio_heads,
         chunked_mel.row_count,
@@ -590,23 +525,14 @@ fn encode_qwen3_audio_embeddings_with_graph<'a>(
             source,
         })?;
 
+    // Only the genuine per-call inputs are uploaded here; every weight already
+    // resides in the arena's WEIGHTS-usage buffer (uploaded once in
+    // `build_qwen_audio_resident_weights`).
     graph
         .set_f32_slice(mel, &chunked_mel.values, "qwen_audio_mel")
         .map_err(|source| Qwen3AsrAudioEncoderError::GraphExecutionFailed {
             reason: format!("could not upload mel features: {source}"),
         })?;
-    upload_f32_tensor(graph, conv1_weight, &weights.conv1_weight)?;
-    upload_f32_tensor(graph, conv1_bias, &weights.conv1_bias)?;
-    upload_f32_tensor(graph, conv2_weight, &weights.conv2_weight)?;
-    upload_f32_tensor(graph, conv2_bias, &weights.conv2_bias)?;
-    upload_f32_tensor(graph, conv3_weight, &weights.conv3_weight)?;
-    upload_f32_tensor(graph, conv3_bias, &weights.conv3_bias)?;
-    for (tensor, values) in &front_pending {
-        upload_f32_tensor(graph, *tensor, values)?;
-    }
-    if let Some((tensor, values)) = conv_out_bias.zip(weights.conv_out_bias.as_ref()) {
-        upload_f32_tensor(graph, tensor, values)?;
-    }
     graph
         .set_f32_slice(positional_tensor, positional, "audio_positional")
         .map_err(|source| Qwen3AsrAudioEncoderError::GraphExecutionFailed {
@@ -617,16 +543,6 @@ fn encode_qwen3_audio_embeddings_with_graph<'a>(
         .map_err(|source| Qwen3AsrAudioEncoderError::GraphExecutionFailed {
             reason: format!("could not upload attention mask: {source}"),
         })?;
-    for (tensor, values) in &layer_pending {
-        upload_f32_tensor(graph, *tensor, values)?;
-    }
-    upload_f32_tensor(graph, ln_post_weight, &weights.ln_post_weight)?;
-    upload_f32_tensor(graph, ln_post_bias, &weights.ln_post_bias)?;
-    for (tensor, values) in &output_pending {
-        upload_f32_tensor(graph, *tensor, values)?;
-    }
-    upload_f32_tensor(graph, proj1_bias, &weights.proj1_bias)?;
-    upload_f32_tensor(graph, proj2_bias, &weights.proj2_bias)?;
 
     let compute_started = profile_started.map(|_| Instant::now());
     let values = graph
@@ -948,7 +864,7 @@ pub(crate) fn load_qwen3_audio_encoder_weights_from_reader(
 /// Walk the qwen audio transformer encoder layer stack, emitting one
 /// `nn::encoder::transformer_layer` block per resident layer and chaining
 /// `state` through them. This is the TransformerEncoderLayer-stage assembly
-/// (P4 data-driven): the layer COUNT comes from `layer_inputs` (built from the
+/// (P4 data-driven): the layer COUNT comes from `layers` (built from the
 /// `qwen3-asr.audio.n_layers` hparam) and the block KIND is `transformer_layer`
 /// (the descriptor's `TransformerEncoderLayer`). The encoder mirror of the
 /// LlmDecoder composer (S2); the emitted op sequence is unchanged.
@@ -956,17 +872,16 @@ pub(crate) fn load_qwen3_audio_encoder_weights_from_reader(
 fn compose_transformer_encoder_layer_stack<'a>(
     graph: &mut crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
     mut state: crate::ggml_runtime::GgmlCpuTensor<'a>,
-    layer_inputs: &[(usize, AudioLayerGraphTensors<'a>)],
+    layers: &[AudioLayerGraphTensors<'a>],
     head_dim: usize,
     attention_heads: usize,
     token_count: usize,
     mask: crate::ggml_runtime::GgmlCpuTensor<'a>,
     use_flash_attention: bool,
 ) -> Result<crate::ggml_runtime::GgmlCpuTensor<'a>, Qwen3AsrAudioEncoderError> {
-    for (layer_idx, tensors) in layer_inputs {
+    for tensors in layers {
         state = run_audio_encoder_layer(
             graph,
-            *layer_idx,
             state,
             head_dim,
             attention_heads,
@@ -982,7 +897,6 @@ fn compose_transformer_encoder_layer_stack<'a>(
 #[allow(clippy::too_many_arguments)]
 fn run_audio_encoder_layer<'a>(
     graph: &mut crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
-    layer_idx: usize,
     state: crate::ggml_runtime::GgmlCpuTensor<'a>,
     head_dim: usize,
     attention_heads: usize,
@@ -991,7 +905,6 @@ fn run_audio_encoder_layer<'a>(
     use_flash_attention: bool,
     tensors: &AudioLayerGraphTensors<'a>,
 ) -> Result<crate::ggml_runtime::GgmlCpuTensor<'a>, Qwen3AsrAudioEncoderError> {
-    let _ = layer_idx;
     transformer_layer(
         graph,
         state,
@@ -1026,216 +939,302 @@ fn run_audio_encoder_layer<'a>(
     )
 }
 
-/// Build one audio layer's graph tensors. The 2D projection weights
-/// (`attn_{q,k,v,out}`, `ffn_{up,down}`) bind zero-copy from `loaded` (mmap'd
-/// pack, native q8/f16) — no f32 dequant/upload; everything else falls back to
-/// an f32 arena tensor. Returns the tensors plus the arena tensors still
-/// needing set_input + an f32 upload (1D always; 2D only when unbound). This is
-/// the audio-encoder analogue of cohere's `loaded_or_static`.
+/// Resident audio-encoder weight tensors, all living in the arena's
+/// WEIGHTS-usage backend buffer (the 2D projections either bound zero-copy from
+/// the mmap'd pack or, when the pack did not materialize them, f32-uploaded into
+/// the same arena). Only the per-call mel/positional/mask leaves are graph
+/// inputs; every field here is offload-eligible for the ggml scheduler.
+struct QwenAudioResidentTensors<'a> {
+    conv1_weight: GgmlCpuTensor<'a>,
+    conv1_bias: GgmlCpuTensor<'a>,
+    conv2_weight: GgmlCpuTensor<'a>,
+    conv2_bias: GgmlCpuTensor<'a>,
+    conv3_weight: GgmlCpuTensor<'a>,
+    conv3_bias: GgmlCpuTensor<'a>,
+    conv_out_weight: GgmlCpuTensor<'a>,
+    conv_out_bias: Option<GgmlCpuTensor<'a>>,
+    ln_post_weight: GgmlCpuTensor<'a>,
+    ln_post_bias: GgmlCpuTensor<'a>,
+    proj1_weight: GgmlCpuTensor<'a>,
+    proj1_bias: GgmlCpuTensor<'a>,
+    proj2_weight: GgmlCpuTensor<'a>,
+    proj2_bias: GgmlCpuTensor<'a>,
+    layers: Vec<AudioLayerGraphTensors<'a>>,
+}
+
+/// Upper bound on the arena's metadata context: the fixed conv stem / output
+/// head tensors plus the worst-case per-layer tensor count (10 x 1D norm/bias
+/// that always land in the arena + up to 6 x 2D projection when the pack did not
+/// materialize them for a zero-copy bind). Over-counting only sizes the (cheap)
+/// tensor-overhead context; the real weight bytes land in a separately sized
+/// backend buffer.
+fn qwen_audio_encoder_arena_context_bytes(weights: &Qwen3AsrAudioEncoderWeights) -> usize {
+    const FIXED_TENSORS: usize = 16;
+    const MAX_TENSORS_PER_LAYER: usize = 16;
+    let count =
+        FIXED_TENSORS.saturating_add(MAX_TENSORS_PER_LAYER.saturating_mul(weights.layers.len()));
+    GgmlCpuGraphConfig::metadata_context_bytes(count)
+}
+
+/// Collects `(arena handle, host f32 slice, label)` uploads while every arena
+/// tensor is allocated, then flushes them once. Allocation MUST precede the
+/// arena's first upload (the first `set_f32_slice` freezes further creation),
+/// so callers allocate every tensor first and call [`Self::upload`] last. This
+/// is the qwen audio-encoder analogue of dolphin's `WeightBuilder`.
+struct QwenAudioArenaBuilder<'w> {
+    uploads: Vec<(GgmlStaticTensor, &'w [f32], &'static str)>,
+}
+
+impl<'w> QwenAudioArenaBuilder<'w> {
+    fn new() -> Self {
+        Self {
+            uploads: Vec::new(),
+        }
+    }
+
+    /// A 1D norm/bias: always an f32 arena tensor.
+    fn arena_1d<'a>(
+        &mut self,
+        arena: &GgmlStaticTensorArena,
+        tensor: &'w F32Tensor,
+        step: &'static str,
+    ) -> Result<GgmlCpuTensor<'a>, Qwen3AsrAudioEncoderError> {
+        if tensor.dims.len() != 1 {
+            return Err(Qwen3AsrAudioEncoderError::InvalidTensorShape {
+                tensor_name: tensor.name.clone(),
+                shape: render_shape(&tensor.dims),
+                reason: "expected rank-1 tensor".to_string(),
+            });
+        }
+        let handle = arena
+            .new_tensor_1d_f32(tensor.dims[0] as usize, step)
+            .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed { step, source })?;
+        self.uploads.push((handle, &tensor.values, step));
+        Ok(arena.graph_tensor(handle))
+    }
+
+    /// A rank-4 conv kernel: always an f32 arena tensor.
+    fn arena_4d<'a>(
+        &mut self,
+        arena: &GgmlStaticTensorArena,
+        tensor: &'w F32Tensor,
+        step: &'static str,
+    ) -> Result<GgmlCpuTensor<'a>, Qwen3AsrAudioEncoderError> {
+        if tensor.dims.len() != 4 {
+            return Err(Qwen3AsrAudioEncoderError::InvalidTensorShape {
+                tensor_name: tensor.name.clone(),
+                shape: render_shape(&tensor.dims),
+                reason: "expected rank-4 tensor".to_string(),
+            });
+        }
+        let handle = arena
+            .new_tensor_4d_f32(
+                tensor.dims[0] as usize,
+                tensor.dims[1] as usize,
+                tensor.dims[2] as usize,
+                tensor.dims[3] as usize,
+                step,
+            )
+            .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed { step, source })?;
+        self.uploads.push((handle, &tensor.values, step));
+        Ok(arena.graph_tensor(handle))
+    }
+
+    /// A 2D projection: bound zero-copy from the mmap'd pack (`loaded`, native
+    /// q8/f16) when present; otherwise f32-uploaded into the arena. Fails closed
+    /// if the weight is neither bound nor f32-materialized (1b drops the host
+    /// f32 for bound weights, so an unbound+empty one means the pack lacks it --
+    /// better to error than bind an empty buffer). The audio-encoder analogue of
+    /// cohere's `loaded_or_static`.
+    fn loaded_or_arena_2d<'a>(
+        &mut self,
+        arena: &GgmlStaticTensorArena,
+        loaded: Option<&GgmlLoadedWeightContext>,
+        tensor: &'w F32Tensor,
+        step: &'static str,
+    ) -> Result<GgmlCpuTensor<'a>, Qwen3AsrAudioEncoderError> {
+        if let Some(loaded_tensor) = loaded.and_then(|context| context.tensor(&tensor.name)) {
+            return Ok(loaded_tensor.as_graph_tensor());
+        }
+        if tensor.values.is_empty() {
+            return Err(Qwen3AsrAudioEncoderError::InvalidTensorShape {
+                tensor_name: tensor.name.clone(),
+                shape: render_shape(&tensor.dims),
+                reason: "2D weight is neither bound zero-copy nor f32-materialized".to_string(),
+            });
+        }
+        if tensor.dims.len() != 2 {
+            return Err(Qwen3AsrAudioEncoderError::InvalidTensorShape {
+                tensor_name: tensor.name.clone(),
+                shape: render_shape(&tensor.dims),
+                reason: "expected rank-2 tensor".to_string(),
+            });
+        }
+        let handle = arena
+            .new_tensor_2d_f32(tensor.dims[0] as usize, tensor.dims[1] as usize, step)
+            .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed { step, source })?;
+        self.uploads.push((handle, &tensor.values, step));
+        Ok(arena.graph_tensor(handle))
+    }
+
+    /// Flush every collected f32 upload into the arena's backend buffer. The
+    /// first upload allocates the buffer and freezes further tensor creation, so
+    /// this runs after all allocation.
+    fn upload(self, arena: &mut GgmlStaticTensorArena) -> Result<(), Qwen3AsrAudioEncoderError> {
+        for (handle, values, step) in self.uploads {
+            arena
+                .set_f32_slice(handle, values, step)
+                .map_err(|source| Qwen3AsrAudioEncoderError::GraphExecutionFailed {
+                    reason: format!("could not upload arena weight '{step}': {source}"),
+                })?;
+        }
+        Ok(())
+    }
+}
+
+/// Allocate every resident encoder weight in the arena and upload it once,
+/// returning the graph-tensor handles the forward graph references. The conv
+/// stem and all 1D norms/biases f32-upload into the WEIGHTS-usage arena buffer;
+/// the 2D projections bind zero-copy from the mmap'd pack when present (only
+/// falling back to an arena upload when the pack did not materialize them). This
+/// is what lets the ggml scheduler offload the encoder front instead of pinning
+/// it to the CPU. Mirrors dolphin's `WeightBuilder` two-phase (alloc-all, then
+/// upload-once) build.
+fn build_qwen_audio_resident_weights<'a>(
+    arena: &mut GgmlStaticTensorArena,
+    weights: &Qwen3AsrAudioEncoderWeights,
+    loaded: Option<&GgmlLoadedWeightContext>,
+) -> Result<QwenAudioResidentTensors<'a>, Qwen3AsrAudioEncoderError> {
+    let mut builder = QwenAudioArenaBuilder::new();
+
+    let conv1_weight = builder.arena_4d(arena, &weights.conv1_weight, "conv1_weight")?;
+    let conv1_bias = builder.arena_1d(arena, &weights.conv1_bias, "conv1_bias")?;
+    let conv2_weight = builder.arena_4d(arena, &weights.conv2_weight, "conv2_weight")?;
+    let conv2_bias = builder.arena_1d(arena, &weights.conv2_bias, "conv2_bias")?;
+    let conv3_weight = builder.arena_4d(arena, &weights.conv3_weight, "conv3_weight")?;
+    let conv3_bias = builder.arena_1d(arena, &weights.conv3_bias, "conv3_bias")?;
+    let conv_out_weight =
+        builder.loaded_or_arena_2d(arena, loaded, &weights.conv_out_weight, "conv_out_weight")?;
+    let conv_out_bias = weights
+        .conv_out_bias
+        .as_ref()
+        .map(|tensor| builder.arena_1d(arena, tensor, "conv_out_bias"))
+        .transpose()?;
+    let ln_post_weight =
+        builder.arena_1d(arena, &weights.ln_post_weight, "audio_ln_post_weight")?;
+    let ln_post_bias = builder.arena_1d(arena, &weights.ln_post_bias, "audio_ln_post_bias")?;
+    let proj1_weight =
+        builder.loaded_or_arena_2d(arena, loaded, &weights.proj1_weight, "audio_proj1_weight")?;
+    let proj1_bias = builder.arena_1d(arena, &weights.proj1_bias, "audio_proj1_bias")?;
+    let proj2_weight =
+        builder.loaded_or_arena_2d(arena, loaded, &weights.proj2_weight, "audio_proj2_weight")?;
+    let proj2_bias = builder.arena_1d(arena, &weights.proj2_bias, "audio_proj2_bias")?;
+
+    let mut layers = Vec::with_capacity(weights.layers.len());
+    for layer in &weights.layers {
+        layers.push(build_audio_layer_tensors(
+            arena,
+            &mut builder,
+            loaded,
+            layer,
+        )?);
+    }
+
+    builder.upload(arena)?;
+
+    Ok(QwenAudioResidentTensors {
+        conv1_weight,
+        conv1_bias,
+        conv2_weight,
+        conv2_bias,
+        conv3_weight,
+        conv3_bias,
+        conv_out_weight,
+        conv_out_bias,
+        ln_post_weight,
+        ln_post_bias,
+        proj1_weight,
+        proj1_bias,
+        proj2_weight,
+        proj2_bias,
+        layers,
+    })
+}
+
+/// Build one audio layer's arena-resident graph tensors. The 2D projection
+/// weights (`attn_{q,k,v,out}`, `ffn_{up,down}`) bind zero-copy from `loaded`
+/// (mmap'd pack, native q8/f16) when present; everything else (norms/biases, and
+/// any unmaterialized projection) f32-uploads into the arena. All handles are
+/// collected into `builder` and uploaded once by the caller.
 fn build_audio_layer_tensors<'a, 'w>(
-    graph: &crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
+    arena: &GgmlStaticTensorArena,
+    builder: &mut QwenAudioArenaBuilder<'w>,
     loaded: Option<&GgmlLoadedWeightContext>,
     layer: &'w AudioLayerWeights,
-) -> Result<
-    (
-        AudioLayerGraphTensors<'a>,
-        Vec<(GgmlCpuTensor<'a>, &'w F32Tensor)>,
-    ),
-    Qwen3AsrAudioEncoderError,
-> {
-    let mut pending: Vec<(GgmlCpuTensor<'a>, &'w F32Tensor)> = Vec::new();
-
-    let attn_norm_weight =
-        new_tensor_1d_from_dims(graph, &layer.attn_norm_weight, "audio_attn_norm_weight")?;
-    pending.push((attn_norm_weight, &layer.attn_norm_weight));
-    let attn_norm_bias =
-        new_tensor_1d_from_dims(graph, &layer.attn_norm_bias, "audio_attn_norm_bias")?;
-    pending.push((attn_norm_bias, &layer.attn_norm_bias));
-    let attn_q_weight = bind_or_arena_2d(
-        graph,
-        loaded,
-        &layer.attn_q_weight,
-        "audio_attn_q_weight",
-        &mut pending,
-    )?;
-    let attn_q_bias = new_tensor_1d_from_dims(graph, &layer.attn_q_bias, "audio_attn_q_bias")?;
-    pending.push((attn_q_bias, &layer.attn_q_bias));
-    let attn_k_weight = bind_or_arena_2d(
-        graph,
-        loaded,
-        &layer.attn_k_weight,
-        "audio_attn_k_weight",
-        &mut pending,
-    )?;
-    let attn_k_bias = new_tensor_1d_from_dims(graph, &layer.attn_k_bias, "audio_attn_k_bias")?;
-    pending.push((attn_k_bias, &layer.attn_k_bias));
-    let attn_v_weight = bind_or_arena_2d(
-        graph,
-        loaded,
-        &layer.attn_v_weight,
-        "audio_attn_v_weight",
-        &mut pending,
-    )?;
-    let attn_v_bias = new_tensor_1d_from_dims(graph, &layer.attn_v_bias, "audio_attn_v_bias")?;
-    pending.push((attn_v_bias, &layer.attn_v_bias));
-    let attn_out_weight = bind_or_arena_2d(
-        graph,
-        loaded,
-        &layer.attn_out_weight,
-        "audio_attn_out_weight",
-        &mut pending,
-    )?;
-    let attn_out_bias =
-        new_tensor_1d_from_dims(graph, &layer.attn_out_bias, "audio_attn_out_bias")?;
-    pending.push((attn_out_bias, &layer.attn_out_bias));
-    let ffn_norm_weight =
-        new_tensor_1d_from_dims(graph, &layer.ffn_norm_weight, "audio_ffn_norm_weight")?;
-    pending.push((ffn_norm_weight, &layer.ffn_norm_weight));
-    let ffn_norm_bias =
-        new_tensor_1d_from_dims(graph, &layer.ffn_norm_bias, "audio_ffn_norm_bias")?;
-    pending.push((ffn_norm_bias, &layer.ffn_norm_bias));
-    let ffn_up_weight = bind_or_arena_2d(
-        graph,
-        loaded,
-        &layer.ffn_up_weight,
-        "audio_ffn_up_weight",
-        &mut pending,
-    )?;
-    let ffn_up_bias = new_tensor_1d_from_dims(graph, &layer.ffn_up_bias, "audio_ffn_up_bias")?;
-    pending.push((ffn_up_bias, &layer.ffn_up_bias));
-    let ffn_down_weight = bind_or_arena_2d(
-        graph,
-        loaded,
-        &layer.ffn_down_weight,
-        "audio_ffn_down_weight",
-        &mut pending,
-    )?;
-    let ffn_down_bias =
-        new_tensor_1d_from_dims(graph, &layer.ffn_down_bias, "audio_ffn_down_bias")?;
-    pending.push((ffn_down_bias, &layer.ffn_down_bias));
-
-    let tensors = AudioLayerGraphTensors {
-        attn_norm_weight,
-        attn_norm_bias,
-        attn_q_weight,
-        attn_q_bias,
-        attn_k_weight,
-        attn_k_bias,
-        attn_v_weight,
-        attn_v_bias,
-        attn_out_weight,
-        attn_out_bias,
-        ffn_norm_weight,
-        ffn_norm_bias,
-        ffn_up_weight,
-        ffn_up_bias,
-        ffn_down_weight,
-        ffn_down_bias,
-    };
-    Ok((tensors, pending))
-}
-
-/// Bind a 2D weight zero-copy from `loaded` (mmap'd pack, native type) when
-/// present; otherwise create an f32 arena tensor and record it in `pending` for
-/// set_input + upload. Fails closed if the weight is neither bound nor
-/// f32-materialized (1b drops f32 for these, so an unbound one means the pack
-/// lacks it — better to error than upload an empty buffer).
-fn bind_or_arena_2d<'a, 'w>(
-    graph: &crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
-    loaded: Option<&GgmlLoadedWeightContext>,
-    weight: &'w F32Tensor,
-    step: &'static str,
-    pending: &mut Vec<(GgmlCpuTensor<'a>, &'w F32Tensor)>,
-) -> Result<GgmlCpuTensor<'a>, Qwen3AsrAudioEncoderError> {
-    if let Some(loaded_tensor) = loaded.and_then(|context| context.tensor(&weight.name)) {
-        return Ok(loaded_tensor.as_graph_tensor());
-    }
-    if weight.values.is_empty() {
-        return Err(Qwen3AsrAudioEncoderError::InvalidTensorShape {
-            tensor_name: weight.name.clone(),
-            shape: render_shape(&weight.dims),
-            reason: "2D weight is neither bound zero-copy nor f32-materialized".to_string(),
-        });
-    }
-    let tensor = new_tensor_2d_from_dims(graph, weight, step)?;
-    pending.push((tensor, weight));
-    Ok(tensor)
-}
-
-fn upload_f32_tensor<'a>(
-    graph: &mut crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
-    tensor: crate::ggml_runtime::GgmlCpuTensor<'a>,
-    values: &F32Tensor,
-) -> Result<(), Qwen3AsrAudioEncoderError> {
-    graph
-        .set_f32_slice(tensor, &values.values, "audio_weight")
-        .map_err(|source| Qwen3AsrAudioEncoderError::GraphExecutionFailed {
-            reason: format!("could not upload tensor '{}': {source}", values.name),
-        })
-}
-
-fn new_tensor_1d_from_dims<'a>(
-    graph: &crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
-    tensor: &F32Tensor,
-    step: &'static str,
-) -> Result<crate::ggml_runtime::GgmlCpuTensor<'a>, Qwen3AsrAudioEncoderError> {
-    if tensor.dims.len() != 1 {
-        return Err(Qwen3AsrAudioEncoderError::InvalidTensorShape {
-            tensor_name: tensor.name.clone(),
-            shape: render_shape(&tensor.dims),
-            reason: "expected rank-1 tensor".to_string(),
-        });
-    }
-    graph
-        .new_tensor_1d_f32(tensor.dims[0] as usize, step)
-        .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed { step, source })
-}
-
-fn new_tensor_2d_from_dims<'a>(
-    graph: &crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
-    tensor: &F32Tensor,
-    step: &'static str,
-) -> Result<crate::ggml_runtime::GgmlCpuTensor<'a>, Qwen3AsrAudioEncoderError> {
-    if tensor.dims.len() != 2 {
-        return Err(Qwen3AsrAudioEncoderError::InvalidTensorShape {
-            tensor_name: tensor.name.clone(),
-            shape: render_shape(&tensor.dims),
-            reason: "expected rank-2 tensor".to_string(),
-        });
-    }
-    graph
-        .new_tensor_2d_f32(tensor.dims[0] as usize, tensor.dims[1] as usize, step)
-        .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed { step, source })
-}
-
-fn new_tensor_4d_from_dims<'a>(
-    graph: &crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
-    tensor: &F32Tensor,
-    step: &'static str,
-) -> Result<crate::ggml_runtime::GgmlCpuTensor<'a>, Qwen3AsrAudioEncoderError> {
-    if tensor.dims.len() != 4 {
-        return Err(Qwen3AsrAudioEncoderError::InvalidTensorShape {
-            tensor_name: tensor.name.clone(),
-            shape: render_shape(&tensor.dims),
-            reason: "expected rank-4 tensor".to_string(),
-        });
-    }
-    graph
-        .new_tensor_4d_f32(
-            tensor.dims[0] as usize,
-            tensor.dims[1] as usize,
-            tensor.dims[2] as usize,
-            tensor.dims[3] as usize,
-            step,
-        )
-        .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed { step, source })
+) -> Result<AudioLayerGraphTensors<'a>, Qwen3AsrAudioEncoderError> {
+    Ok(AudioLayerGraphTensors {
+        attn_norm_weight: builder.arena_1d(
+            arena,
+            &layer.attn_norm_weight,
+            "audio_attn_norm_weight",
+        )?,
+        attn_norm_bias: builder.arena_1d(arena, &layer.attn_norm_bias, "audio_attn_norm_bias")?,
+        attn_q_weight: builder.loaded_or_arena_2d(
+            arena,
+            loaded,
+            &layer.attn_q_weight,
+            "audio_attn_q_weight",
+        )?,
+        attn_q_bias: builder.arena_1d(arena, &layer.attn_q_bias, "audio_attn_q_bias")?,
+        attn_k_weight: builder.loaded_or_arena_2d(
+            arena,
+            loaded,
+            &layer.attn_k_weight,
+            "audio_attn_k_weight",
+        )?,
+        attn_k_bias: builder.arena_1d(arena, &layer.attn_k_bias, "audio_attn_k_bias")?,
+        attn_v_weight: builder.loaded_or_arena_2d(
+            arena,
+            loaded,
+            &layer.attn_v_weight,
+            "audio_attn_v_weight",
+        )?,
+        attn_v_bias: builder.arena_1d(arena, &layer.attn_v_bias, "audio_attn_v_bias")?,
+        attn_out_weight: builder.loaded_or_arena_2d(
+            arena,
+            loaded,
+            &layer.attn_out_weight,
+            "audio_attn_out_weight",
+        )?,
+        attn_out_bias: builder.arena_1d(arena, &layer.attn_out_bias, "audio_attn_out_bias")?,
+        ffn_norm_weight: builder.arena_1d(
+            arena,
+            &layer.ffn_norm_weight,
+            "audio_ffn_norm_weight",
+        )?,
+        ffn_norm_bias: builder.arena_1d(arena, &layer.ffn_norm_bias, "audio_ffn_norm_bias")?,
+        ffn_up_weight: builder.loaded_or_arena_2d(
+            arena,
+            loaded,
+            &layer.ffn_up_weight,
+            "audio_ffn_up_weight",
+        )?,
+        ffn_up_bias: builder.arena_1d(arena, &layer.ffn_up_bias, "audio_ffn_up_bias")?,
+        ffn_down_weight: builder.loaded_or_arena_2d(
+            arena,
+            loaded,
+            &layer.ffn_down_weight,
+            "audio_ffn_down_weight",
+        )?,
+        ffn_down_bias: builder.arena_1d(arena, &layer.ffn_down_bias, "audio_ffn_down_bias")?,
+    })
 }
 
 /// Build a metadata-only `F32Tensor` (name + dims, NO f32 values) for a weight
 /// that `encode_…` binds zero-copy from the mmap'd pack (goals 7+8 Step 1b).
 /// Skips the host f32 dequant entirely — the ~1.2 GB resident-memory win. The
 /// dims (from the tensor index) still satisfy the shape validators; an empty
-/// `values` is the signal `bind_or_arena_2d` fails closed on if it isn't bound.
+/// `values` is the signal `loaded_or_arena_2d` fails closed on if it isn't bound.
 fn load_tensor_meta_only(tensor: &GgufTensorMetadata) -> F32Tensor {
     F32Tensor {
         name: tensor.name.clone(),
