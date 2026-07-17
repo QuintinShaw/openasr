@@ -47,6 +47,26 @@ typedef enum OpenAsrStatus {
    * normal operation; it indicates an engine bug.
    */
   OPEN_ASR_STATUS_INTERNAL_PANIC = 5,
+  /**
+   * The signed model catalog could not be fetched, verified, parsed, or
+   * (for a pull) the requested model/quant could not be resolved from it.
+   * The catalog is loaded through the same fail-closed signature pipeline
+   * the CLI uses; a bad signature, epoch rollback, or unknown reference all
+   * land here rather than producing an unverified result.
+   */
+  OPEN_ASR_STATUS_CATALOG_FAILED = 6,
+  /**
+   * A model-pack pull or local-pack install failed: a network/transport
+   * error, a size/sha256 mismatch against the signed catalog, a failed
+   * GGUF/runtime preflight, a gated license not accepted, or an install I/O
+   * error. Never a partially-installed or unverified pack.
+   */
+  OPEN_ASR_STATUS_PULL_FAILED = 7,
+  /**
+   * A pull was stopped because the caller's cancel callback returned true.
+   * Any partial download is cleaned up; nothing is installed.
+   */
+  OPEN_ASR_STATUS_PULL_CANCELED = 8,
 } OpenAsrStatus;
 
 /**
@@ -100,6 +120,49 @@ typedef enum OpenAsrStreamingEventKind {
    */
   OPEN_ASR_STREAMING_EVENT_KIND_REVISION = 2,
 } OpenAsrStreamingEventKind;
+
+/**
+ * The stage a [`openasr_pull_model`] / [`openasr_install_local_pack`] progress
+ * callback is reporting, mirroring [`openasr_core::PullProgress`].
+ */
+typedef enum OpenAsrPullPhase {
+  /**
+   * The requested pack was already installed and verified on disk; no
+   * download happened. `bytes_done` / `bytes_total` are 0.
+   */
+  OPEN_ASR_PULL_PHASE_USING_INSTALLED = 0,
+  /**
+   * The download is starting (or resuming). `bytes_done` is the resume
+   * offset (0 for a fresh download); `bytes_total` is the full pack size.
+   */
+  OPEN_ASR_PULL_PHASE_STARTED = 1,
+  /**
+   * Download progress. `bytes_done` of `bytes_total` bytes fetched.
+   */
+  OPEN_ASR_PULL_PHASE_DOWNLOADING = 2,
+  /**
+   * The full pack is downloaded and its sha256 is being verified against the
+   * catalog-pinned digest. `bytes_done` is bytes hashed; `bytes_total` is 0.
+   */
+  OPEN_ASR_PULL_PHASE_VERIFYING = 3,
+  /**
+   * The verified pack has been installed. `bytes_done` / `bytes_total` are 0.
+   */
+  OPEN_ASR_PULL_PHASE_INSTALLED = 4,
+} OpenAsrPullPhase;
+
+/**
+ * Opaque handle to a fetched-and-verified model catalog. Obtained from
+ * [`openasr_catalog_fetch`], read as JSON with [`openasr_catalog_json`], passed
+ * to [`openasr_pull_model`] / [`openasr_install_local_pack`] as the verified
+ * source of every model/quant/url/sha the pull may resolve, and released with
+ * [`openasr_catalog_free`].
+ *
+ * The catalog JSON is serialized once, at fetch time, from the verified +
+ * forward-compatibility-filtered [`ModelCatalog`], so [`openasr_catalog_json`]
+ * can hand back a borrowed pointer with no per-call allocation.
+ */
+typedef struct OpenAsrCatalog OpenAsrCatalog;
 
 /**
  * Opaque handle to a validated local `.oasr` model pack path. Obtained from
@@ -178,6 +241,27 @@ typedef struct OpenAsrStreamingConfig {
    */
   uint64_t partial_poll_interval_ms;
 } OpenAsrStreamingConfig;
+
+/**
+ * Progress callback for a pull/install. Invoked synchronously on the calling
+ * thread (the thread that called [`openasr_pull_model`] /
+ * [`openasr_install_local_pack`]), so `user_data` need not be thread-safe. Pass
+ * a null function pointer to receive no progress. The callback must not unwind
+ * (a panic across it is undefined behavior); do the app-side marshalling to
+ * another thread inside it, not around it.
+ */
+typedef void (*OpenAsrPullProgressCallback)(void *user_data,
+                                            enum OpenAsrPullPhase phase,
+                                            uint64_t bytes_done,
+                                            uint64_t bytes_total);
+
+/**
+ * Cancellation callback for a pull. Polled synchronously on the calling thread
+ * while the download runs; return `true` to cancel (the partial download is
+ * cleaned up and [`OpenAsrStatus::PullCanceled`] is returned). Pass a null
+ * function pointer to never cancel. Must not unwind.
+ */
+typedef bool (*OpenAsrPullCancelCallback)(void *user_data);
 
 #ifdef __cplusplus
 extern "C" {
@@ -475,6 +559,166 @@ void openasr_streaming_events_free(struct OpenAsrStreamingEvents *events);
  * need it longer. Never freed by the caller.
  */
 const char *openasr_last_error_message(void);
+
+/**
+ * Fetches and verifies the signed model catalog, writing an opaque handle
+ * through `out_catalog`. `catalog_url` is optional: null uses the built-in
+ * production endpoint (the normal case); a non-null override is still held to
+ * the same fail-closed signature/epoch pipeline. `home_dir` is the app's
+ * OpenASR home (its sandbox directory), used for the verified catalog /
+ * signature / epoch cache and as the offline fallback source.
+ *
+ * Fails closed with [`OpenAsrStatus::CatalogFailed`] and no handle if the
+ * catalog cannot be fetched, its signature does not verify, the epoch rolled
+ * back, or it does not parse. Network access happens only inside this explicit
+ * call.
+ *
+ * # Safety
+ * `catalog_url`, if non-null, must be a valid NUL-terminated UTF-8 C string.
+ * `home_dir` must be a valid, non-empty, NUL-terminated UTF-8 C string.
+ * `out_catalog` must be a valid, non-null pointer to a `*mut OpenAsrCatalog`
+ * the caller owns.
+ */
+enum OpenAsrStatus openasr_catalog_fetch(const char *catalog_url,
+                                         const char *home_dir,
+                                         struct OpenAsrCatalog **out_catalog);
+
+/**
+ * Returns the verified catalog as a UTF-8, NUL-terminated JSON string (the
+ * serialized [`ModelCatalog`]: models with their quants, sizes, sha256s,
+ * languages, licenses, perf, etc.). Valid until `catalog` is freed; null only
+ * if `catalog` is null. The app renders its market UI and its pull-consent
+ * disclosure (model, quant, size, host, license) from this data.
+ *
+ * # Safety
+ * `catalog`, if non-null, must be a live handle from [`openasr_catalog_fetch`].
+ */
+const char *openasr_catalog_json(const struct OpenAsrCatalog *catalog);
+
+/**
+ * Frees a catalog handle returned by [`openasr_catalog_fetch`]. Null is
+ * accepted and is a no-op.
+ *
+ * # Safety
+ * `catalog`, if non-null, must be a handle previously returned by
+ * [`openasr_catalog_fetch`] and not already freed.
+ */
+void openasr_catalog_free(struct OpenAsrCatalog *catalog);
+
+/**
+ * Downloads, verifies, and installs the model pack identified by `reference`
+ * (a catalog id or `id:quant`) after the app has obtained the user's consent.
+ * This is the app-side equivalent of `openasr pull`: it resolves `reference`
+ * against the verified `catalog`, streams the download from the catalog-pinned
+ * url over https, checks the sha256 against the catalog digest, runs the
+ * GGUF/runtime preflight, and installs atomically under `<home_dir>/models`.
+ *
+ * - `quant` is optional (null): with no quant pinned in `reference` or `quant`,
+ *   the largest quant that fits this device's memory budget is chosen (an
+ *   explicit `:quant` / `quant` always wins).
+ * - `source` is optional (null): null uses the automatic download-source chain;
+ *   otherwise one of `"hf"`, `"hf-mirror"`, `"weights"`, or `"auto"`.
+ * - `accept_license` must be true to pull a gated-license model; a gated model
+ *   pulled without it fails closed with [`OpenAsrStatus::PullFailed`], so
+ *   consent cannot silently become a license bypass (mirrors the CLI's
+ *   `--accept-license`).
+ * - `progress_cb` / `cancel_cb` (both optional) are invoked synchronously on
+ *   this thread; return `true` from `cancel_cb` to abort.
+ * - `out_installed_json`, if non-null, receives a freshly-allocated
+ *   UTF-8/NUL-terminated JSON object describing the installed pack (pull id,
+ *   path, quant, size, sha256, ...). Free it with [`openasr_string_free`].
+ *
+ * Returns [`OpenAsrStatus::Ok`] on a verified install, [`OpenAsrStatus::PullCanceled`]
+ * if `cancel_cb` aborted it, [`OpenAsrStatus::CatalogFailed`] if `reference`
+ * could not be resolved, or [`OpenAsrStatus::PullFailed`] for a download /
+ * verification / license / install failure. Never installs an unverified pack.
+ *
+ * # Safety
+ * `catalog` must be a live handle from [`openasr_catalog_fetch`]. `reference`
+ * and `home_dir` must be valid, non-empty, NUL-terminated UTF-8 C strings.
+ * `quant` / `source`, if non-null, must be valid NUL-terminated UTF-8 C
+ * strings. The callbacks, if non-null, must be valid function pointers that do
+ * not unwind. `out_installed_json`, if non-null, must point to a writable
+ * `*mut c_char` the caller owns.
+ */
+enum OpenAsrStatus openasr_pull_model(const struct OpenAsrCatalog *catalog,
+                                      const char *reference,
+                                      const char *quant,
+                                      const char *source,
+                                      bool accept_license,
+                                      const char *home_dir,
+                                      OpenAsrPullProgressCallback progress_cb,
+                                      void *progress_user_data,
+                                      OpenAsrPullCancelCallback cancel_cb,
+                                      void *cancel_user_data,
+                                      char **out_installed_json);
+
+/**
+ * Verifies and installs a `.oasr` pack the app already has on disk (e.g. one
+ * side-loaded or copied into the app) without downloading it. The pack's
+ * sha256/size must match an entry in the verified `catalog`, or the call fails
+ * closed with [`OpenAsrStatus::PullFailed`] -- so a hand-supplied file cannot be
+ * installed as a model the catalog never vouched for.
+ *
+ * `oasr_path` is the local pack path; `home_dir` is the app's OpenASR home.
+ * `progress_cb` (optional) reports the verify/install phases. `out_installed_json`,
+ * if non-null, receives a JSON object for the installed pack (free with
+ * [`openasr_string_free`]).
+ *
+ * # Safety
+ * `catalog` must be a live handle from [`openasr_catalog_fetch`]. `oasr_path`
+ * and `home_dir` must be valid, non-empty, NUL-terminated UTF-8 C strings.
+ * `progress_cb`, if non-null, must be a valid non-unwinding function pointer.
+ * `out_installed_json`, if non-null, must point to a writable `*mut c_char`.
+ */
+enum OpenAsrStatus openasr_install_local_pack(const struct OpenAsrCatalog *catalog,
+                                              const char *oasr_path,
+                                              const char *home_dir,
+                                              OpenAsrPullProgressCallback progress_cb,
+                                              void *progress_user_data,
+                                              char **out_installed_json);
+
+/**
+ * Lists the installed model packs under `home_dir`, writing a
+ * freshly-allocated UTF-8/NUL-terminated JSON array (one object per installed
+ * pack: pull id, path, model id, quant, size, sha256, ...) through `out_json`.
+ * An empty install set yields `"[]"`, not null. Free the string with
+ * [`openasr_string_free`]. Never touches the network.
+ *
+ * # Safety
+ * `home_dir` must be a valid, non-empty, NUL-terminated UTF-8 C string.
+ * `out_json` must be a valid, non-null pointer to a `*mut c_char` the caller
+ * owns.
+ */
+enum OpenAsrStatus openasr_list_installed_json(const char *home_dir, char **out_json);
+
+/**
+ * Removes an installed model pack (by `reference`, a pull id or `id:quant`)
+ * from under `home_dir`. `out_removed`, if non-null, is set to true when a pack
+ * was found and removed, false when nothing matched. Removing a non-existent
+ * pack is not an error (`out_removed = false`, status [`OpenAsrStatus::Ok`]).
+ *
+ * # Safety
+ * `reference` and `home_dir` must be valid, non-empty, NUL-terminated UTF-8 C
+ * strings. `out_removed`, if non-null, must point to a writable `bool` the
+ * caller owns.
+ */
+enum OpenAsrStatus openasr_remove_model(const char *home_dir,
+                                        const char *reference,
+                                        bool *out_removed);
+
+/**
+ * Frees a string returned through an `out_*_json` out-parameter by
+ * [`openasr_pull_model`], [`openasr_install_local_pack`], or
+ * [`openasr_list_installed_json`]. Null is accepted and is a no-op. Do not call
+ * this on [`openasr_catalog_json`]'s return value (that is owned by the catalog
+ * handle) or on [`openasr_last_error_message`]'s.
+ *
+ * # Safety
+ * `string`, if non-null, must be a pointer previously produced by one of the
+ * `out_*_json` out-parameters above and not already freed.
+ */
+void openasr_string_free(char *string);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -48,11 +48,17 @@ use openasr_core::{
     TranscriptionRequest, validate_local_native_model_pack_path,
 };
 
+/// Model-market C ABI: fetch/verify the signed catalog, pull (download +
+/// sha256-verify + install) a model pack under explicit consent, list installed
+/// packs, and remove one. See the module for how it keeps the "no silent
+/// download" and "verification stays in the open core" boundaries.
+mod market;
+
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
-fn set_last_error(message: impl Into<String>) {
+pub(crate) fn set_last_error(message: impl Into<String>) {
     let message = message.into();
     // A NUL byte inside the error text would make `CString::new` fail; that
     // can only happen for pathological upstream error strings, so fall back
@@ -69,7 +75,7 @@ fn clear_last_error() {
 
 /// Replaces embedded NUL bytes (which cannot appear in a C string) with a
 /// space instead of dropping content the engine already produced.
-fn cstring_lossy(text: String) -> CString {
+pub(crate) fn cstring_lossy(text: String) -> CString {
     CString::new(text).unwrap_or_else(|error| {
         let sanitized: Vec<u8> = error
             .into_vec()
@@ -106,6 +112,20 @@ pub enum OpenAsrStatus {
     /// instead of unwinding into the caller. This should not happen in
     /// normal operation; it indicates an engine bug.
     InternalPanic = 5,
+    /// The signed model catalog could not be fetched, verified, parsed, or
+    /// (for a pull) the requested model/quant could not be resolved from it.
+    /// The catalog is loaded through the same fail-closed signature pipeline
+    /// the CLI uses; a bad signature, epoch rollback, or unknown reference all
+    /// land here rather than producing an unverified result.
+    CatalogFailed = 6,
+    /// A model-pack pull or local-pack install failed: a network/transport
+    /// error, a size/sha256 mismatch against the signed catalog, a failed
+    /// GGUF/runtime preflight, a gated license not accepted, or an install I/O
+    /// error. Never a partially-installed or unverified pack.
+    PullFailed = 7,
+    /// A pull was stopped because the caller's cancel callback returned true.
+    /// Any partial download is cleaned up; nothing is installed.
+    PullCanceled = 8,
 }
 
 /// PCM sample encoding accepted by [`openasr_transcribe_pcm`].
@@ -935,7 +955,10 @@ pub extern "C" fn openasr_last_error_message() -> *const c_char {
 
 /// Runs `body`, catching any panic and converting it to `panic_status` plus a
 /// last-error message instead of unwinding across the FFI boundary.
-fn catch(panic_status: OpenAsrStatus, body: impl FnOnce() -> OpenAsrStatus) -> OpenAsrStatus {
+pub(crate) fn catch(
+    panic_status: OpenAsrStatus,
+    body: impl FnOnce() -> OpenAsrStatus,
+) -> OpenAsrStatus {
     match panic::catch_unwind(AssertUnwindSafe(body)) {
         Ok(status) => {
             if status == OpenAsrStatus::Ok {
@@ -963,7 +986,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// # Safety
 /// `path` must be a valid, NUL-terminated C string (or null).
-unsafe fn c_str_to_path(path: *const c_char) -> Result<PathBuf, OpenAsrStatus> {
+pub(crate) unsafe fn c_str_to_path(path: *const c_char) -> Result<PathBuf, OpenAsrStatus> {
     if path.is_null() {
         set_last_error("path argument must not be null");
         return Err(OpenAsrStatus::InvalidArgument);
