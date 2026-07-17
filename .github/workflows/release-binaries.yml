@@ -934,6 +934,22 @@ jobs:
       # docs/RELEASING.md); it may be a different App Registration than the
       # desktop repo's, but must be granted the same role on the same
       # account/profile.
+      # GitHub's windows runner image stopped shipping a pre-registered PSGallery
+      # PowerShell repository (surfaced alongside the Node 20 -> 24 default bump),
+      # so azure/trusted-signing-action's internal `Install-Module TrustedSigning
+      # -Repository PSGallery` fails with "Unable to find repository 'PSGallery'".
+      # Re-register and trust it (non-interactive) before the signing action runs.
+      - name: Ensure PSGallery is registered (runner image workaround)
+        if: runner.os == 'Windows' && env.LEG_SELECTED == 'true' && steps.signing-check.outputs.have_secrets == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+            Register-PSRepository -Default
+          }
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Get-PSRepository | Format-Table -AutoSize
+
       - name: Sign Windows binaries (Azure Trusted Signing)
         if: runner.os == 'Windows' && env.LEG_SELECTED == 'true' && steps.signing-check.outputs.have_secrets == 'true'
         uses: azure/trusted-signing-action@v0
