@@ -273,13 +273,14 @@ impl GgmlCpuGraphConfig {
     }
 
     /// Single choke point for "should this family run on GPU": every family
-    /// whose Auto default is gated (rather than always following
+    /// whose Auto default can be gated (rather than always following
     /// `resolve_runtime_backend()` unconditionally) must resolve its backend
     /// through this function instead of hand-rolling the override check
     /// (dolphin's `dolphin_runtime_backend` and xasr-zipformer's
-    /// `encoder_gpu_enabled` are the two builtin cases -- see their doc
-    /// comments for the measured Auto-mode evidence behind `auto_gpu_enabled
-    /// = false`). `auto_gpu_enabled` is a pure Auto-mode default: it can only
+    /// `encoder_gpu_enabled` are the two builtin cases that route through
+    /// this gate -- see their doc comments for the history of when each was
+    /// `auto_gpu_enabled = false` and the measured evidence for flipping to
+    /// `true`). `auto_gpu_enabled` is a pure Auto-mode default: it can only
     /// ever pin Auto to CPU, never override an explicit per-request
     /// preference. A request that explicitly asked for `CpuOnly` or
     /// `Accelerated` always gets what it asked for via
