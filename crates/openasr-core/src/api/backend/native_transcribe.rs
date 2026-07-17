@@ -2009,10 +2009,10 @@ fn prefers_cpu_decoder_for_multichunk_metal(model_architecture: &str) -> bool {
 /// family's `auto_gpu_enabled` capability declaration. It must never call
 /// `GgmlCpuGraphConfig::resolve_runtime_backend()` directly for this purpose:
 /// that generic resolver reports what Auto would pick for a family with no
-/// gate, which drifts from reality for a family like dolphin or
-/// xasr-zipformer that pins Auto to CPU -- exactly the bug that produced a
+/// gate, which drifts from reality for any family whose `auto_gpu_enabled`
+/// is `false` and pins Auto to CPU -- exactly the bug that produced a
 /// `core.native.backend:metal` label on a dolphin Auto request that in fact
-/// ran entirely on CPU.
+/// ran entirely on CPU (before dolphin's own gate flipped to GPU-enabled).
 fn native_runtime_backend_label(auto_gpu_enabled: bool) -> &'static str {
     match GgmlCpuGraphConfig::resolve_family_runtime_backend(auto_gpu_enabled) {
         GgmlCpuGraphBackend::Cpu => "cpu",
@@ -2037,16 +2037,15 @@ mod tests {
 
     #[test]
     fn family_auto_gpu_enabled_lookup_matches_dolphin_and_xasr_gates() {
-        // Regression pin: xasr-zipformer is the one builtin family whose Auto
-        // default is still gated to CPU (see `auto_gpu_enabled`'s doc comment);
-        // every other builtin -- dolphin now included, after its encoder + CTC
-        // head weights moved into a Metal-offloadable arena and Metal beat CPU
-        // -- lets Auto pick GPU automatically.
-        assert!(
-            !crate::arch::family_auto_gpu_enabled_for_model_architecture(
-                crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID
-            )
-        );
+        // Regression pin: every builtin family now lets Auto pick GPU
+        // automatically. Both dolphin and xasr-zipformer were gated to CPU at
+        // one point (each had an Auto-mode GPU regression caused by its
+        // encoder weights not actually landing on the GPU buffer) and both
+        // flipped to GPU-enabled once their respective weight-placement fixes
+        // let the encoder truly offload and Metal beat CPU end-to-end.
+        assert!(crate::arch::family_auto_gpu_enabled_for_model_architecture(
+            crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID
+        ));
         assert!(crate::arch::family_auto_gpu_enabled_for_model_architecture(
             crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID
         ));

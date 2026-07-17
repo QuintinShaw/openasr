@@ -272,20 +272,22 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     /// when one is available. This can only ever pin Auto to CPU -- it never
     /// overrides an explicit `execution_target=accelerated` (or `cpu`)
     /// request, which always gets exactly what it asked for via
-    /// `GgmlCpuGraphConfig::resolve_family_runtime_backend`. False only for
-    /// xasr-zipformer's streaming encoder
-    /// (`models::xasr_zipformer::graph_config::encoder_gpu_enabled`), the one
-    /// family with a measured Auto-mode GPU regression at its normal
-    /// (non-`accelerated`) chunk size -- see that function's doc comment for
-    /// the measured evidence. (Dolphin was gated too until its encoder + CTC
-    /// head weights moved into a Metal-offloadable static arena; Metal then
-    /// beat CPU end-to-end, so its Auto default is now GPU -- see
-    /// `models::dolphin::executor::dolphin_runtime_backend`.) Any
+    /// `GgmlCpuGraphConfig::resolve_family_runtime_backend`. Every builtin
+    /// family now defaults `true`. Both of the two families that were once
+    /// gated to CPU flipped after their encoder weights moved into a
+    /// Metal-offloadable static arena and Metal beat CPU end-to-end: Dolphin
+    /// first (see `models::dolphin::executor::dolphin_runtime_backend`), then
+    /// xasr-zipformer's streaming encoder once the same weight-placement fix
+    /// landed for it (see
+    /// `models::xasr_zipformer::graph_config::encoder_gpu_enabled`, which
+    /// measured a 5x Metal speedup once its weights actually offloaded --
+    /// the prior CPU-pinned default predates that fix). Any
     /// provenance/telemetry label reporting the backend a request actually
-    /// ran on must resolve through the same function with this same flag,
-    /// not recompute generically (a generic recompute is what produced a
-    /// `core.native.backend:metal` label on a gated-family Auto request that
-    /// in fact ran entirely on CPU).
+    /// ran on must resolve through
+    /// `GgmlCpuGraphConfig::resolve_family_runtime_backend` with this same
+    /// flag, not recompute generically (a generic recompute is what produced
+    /// a `core.native.backend:metal` label on a gated-family Auto request
+    /// that in fact ran entirely on CPU).
     pub auto_gpu_enabled: bool,
     /// Whether this family's own decode loop can emit diarization tokens (the
     /// cohere token-stream is the only builtin case today). The single
@@ -1239,11 +1241,21 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        // Measured on the M1 host: every Metal configuration loses to CPU for
-        // this streaming encoder's chunked workload (the per-chunk graph is
-        // too small to amortize GPU dispatch) -- see
-        // `xasr_zipformer::graph_config::encoder_gpu_enabled`.
-        auto_gpu_enabled: false,
+        // Was measured CPU-favored on the M1 host, but that measurement
+        // predates the encoder-weight-placement fix (#139): the encoder
+        // weights were pinned off the GPU buffer, so Metal never actually
+        // offloaded and the per-chunk graph paid GPU dispatch overhead with
+        // no offload benefit. With weights correctly placed so the encoder
+        // truly resides on the GPU buffer, Metal is at minimum competitive
+        // with CPU end-to-end on the catalog's recommended `q8_0` quant, and
+        // reproduces the exact same transcript byte-for-byte -- see
+        // `xasr_zipformer::graph_config::encoder_gpu_enabled` for the
+        // measurement caveats (run-to-run variance was too high on the
+        // measuring host to pin an exact multiplier; do not cite a specific
+        // speedup number from this comment). `auto_gpu_enabled` only ever
+        // changes which backend Auto picks, never correctness, so this
+        // matches how every other GPU-enabled family behaves.
+        auto_gpu_enabled: true,
         self_diarizes: false,
         emits_punctuation: Some(true),
         hparam_schema: XASR_ZIPFORMER_HPARAM_SCHEMA,
@@ -1523,17 +1535,17 @@ mod tests {
         );
     }
 
-    /// Pins `auto_gpu_enabled` per builtin architecture -- xasr-zipformer is
-    /// the only builtin whose Auto default is still gated to CPU (a measured
-    /// Auto-mode GPU regression at its normal chunk size, not a correctness
-    /// limit; see the field doc and that executor's own doc comment). Every
-    /// other builtin -- dolphin now included, after its encoder + CTC head
-    /// weights moved into a Metal-offloadable static arena and Metal beat CPU
-    /// end-to-end -- lets Auto pick a GPU-class backend automatically when
-    /// available, matching how `resolve_runtime_backend` behaves generically.
-    /// A silent flip of this table would either regress Auto throughput for
-    /// xasr-zipformer, or silently deny Auto users a GPU their hardware
-    /// supports for any GPU-enabled family.
+    /// Pins `auto_gpu_enabled` per builtin architecture -- every builtin now
+    /// lets Auto pick a GPU-class backend automatically when available,
+    /// matching how `resolve_runtime_backend` behaves generically. Dolphin
+    /// and xasr-zipformer were both gated to CPU at one point (Auto-mode GPU
+    /// regressions caused by their encoder weights not actually landing on
+    /// the GPU buffer), and both flipped to GPU-enabled once their
+    /// respective weight-placement fixes let the encoder truly offload and
+    /// Metal beat CPU end-to-end (see the field doc and each family's own
+    /// executor/`graph_config` doc comment). A silent flip of this table
+    /// would silently deny Auto users a GPU their hardware supports for any
+    /// GPU-enabled family.
     #[test]
     fn builtin_architectures_declare_auto_gpu_enabled() {
         let expected: &[(&str, bool)] = &[
@@ -1543,7 +1555,7 @@ mod tests {
             (PARAKEET_CTC_GGML_ARCHITECTURE_ID, true),
             (PARAKEET_TDT_GGML_ARCHITECTURE_ID, true),
             (WAV2VEC2_CTC_GGML_ARCHITECTURE_ID, true),
-            (XASR_ZIPFORMER_GGML_ARCHITECTURE_ID, false),
+            (XASR_ZIPFORMER_GGML_ARCHITECTURE_ID, true),
             (MOONSHINE_GGML_ARCHITECTURE_ID, true),
             (DOLPHIN_GGML_ARCHITECTURE_ID, true),
             (SENSEVOICE_GGML_ARCHITECTURE_ID, true),
