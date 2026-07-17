@@ -47,7 +47,7 @@
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlStaticTensor, GgmlStaticTensorArena,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
@@ -399,67 +399,107 @@ pub(crate) fn tokenize_hotword_phrase(vocab: &[String], phrase: &str) -> Vec<u32
 
 // --- Stage 2: ggml biasing fusion -------------------------------------------
 
-/// A rank-2 `.weight` matmul operand, bound at its pack-native ggml type
-/// (quantized/f16) when the provider keeps it that way, else f32 -- the same
-/// policy `encoder_graph`/`joint_decode` use for every other family matmul
-/// weight.
-enum PendingWeightUpload<'p> {
-    Native { bytes: &'p [u8], ggml_type: i32 },
-    F32(&'p [f32]),
-}
+/// Arena tensor count for [`GgmlCpuGraphConfig::metadata_context_bytes`]: the
+/// biasing fusion has a fixed (non-per-layer) weight set --
+/// `linear_q`/`linear_k`/`linear_v`/`linear_out` (weight+bias each) +
+/// `combiner` (weight+bias) + `norm_aft_combiner` (weight+bias) == 12 tensors.
+const HOTWORD_BIASING_ARENA_TENSORS: usize = 12;
 
-fn bind_matmul_weight<'a, 'p>(
-    graph: &GgmlCpuGraphBuilder<'a>,
+/// Pending f32 weight upload into the static arena: `(handle, source-slice,
+/// static-label)`.
+type Upload<'p> = (GgmlStaticTensor, &'p [f32], &'static str);
+/// Pending native (quantized / f16) weight upload: `(handle, raw-bytes,
+/// static-label)`.
+type NativeUpload<'p> = (GgmlStaticTensor, &'p [u8], &'static str);
+
+/// Allocates the biasing fusion's weights into the runtime's persistent
+/// [`GgmlStaticTensorArena`] (a `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` backend
+/// buffer) rather than as per-call transient graph leaves. This is what lets
+/// the ggml multi-backend scheduler offload the fusion's matmuls to an
+/// accelerator: the scheduler only considers an op for `op_offload` when its
+/// weight `src` lives in a WEIGHTS-usage buffer, which the old per-call
+/// graph-input weights were not, so this graph was pinned to the CPU even
+/// under an explicit Metal backend (unlike the encoder/CTC head, which already
+/// moved -- see `encoder_graph::WeightBuilder` / `joint_decode`'s CTC arena).
+/// Mirrors those exactly: allocate every tensor first (the arena's first
+/// upload freezes further creation), then upload once. Weight placement
+/// changes no value the graph computes, so the fused output stays
+/// golden-identical -- only the backend each op runs on changes.
+struct WeightBuilder<'p> {
     provider: &'p dyn DolphinWeightProvider,
-    name: &str,
-    ne0: usize,
-    ne1: usize,
-) -> Result<(GgmlCpuTensor<'a>, PendingWeightUpload<'p>), DolphinHotwordError> {
-    if let Some(native) = provider.native_weight(name) {
-        let tensor = graph
-            .new_matmul_weight_2d_typed(ne0, ne1, native.ggml_type, "dolphin_hotword_weight")
-            .map_err(ggml_err("weight_alloc_native"))?;
-        return Ok((
-            tensor,
-            PendingWeightUpload::Native {
-                bytes: native.bytes,
-                ggml_type: native.ggml_type,
-            },
-        ));
-    }
-    let data = fetch(provider, name, ne0 * ne1)?;
-    let tensor = graph
-        .new_tensor_2d_f32(ne0, ne1, "dolphin_hotword_weight")
-        .map_err(ggml_err("weight_alloc"))?;
-    Ok((tensor, PendingWeightUpload::F32(data)))
+    uploads: Vec<Upload<'p>>,
+    native_uploads: Vec<NativeUpload<'p>>,
 }
 
-fn upload_matmul_weight<'a>(
-    graph: &mut GgmlCpuGraphBuilder<'a>,
-    tensor: GgmlCpuTensor<'a>,
-    upload: PendingWeightUpload<'_>,
-) -> Result<(), DolphinHotwordError> {
-    match upload {
-        PendingWeightUpload::Native { bytes, ggml_type } => graph
-            .set_matmul_weight_bytes(tensor, bytes, ggml_type, "dolphin_hotword_weight")
-            .map_err(ggml_err("upload_weight_native")),
-        PendingWeightUpload::F32(data) => graph
-            .set_f32_slice(tensor, data, "dolphin_hotword_weight")
-            .map_err(ggml_err("upload_weight")),
+impl<'p> WeightBuilder<'p> {
+    fn new(provider: &'p dyn DolphinWeightProvider) -> Self {
+        Self {
+            provider,
+            uploads: Vec::new(),
+            native_uploads: Vec::new(),
+        }
     }
-}
 
-fn bind_bias_1d<'a, 'p>(
-    graph: &GgmlCpuGraphBuilder<'a>,
-    provider: &'p dyn DolphinWeightProvider,
-    name: &str,
-    len: usize,
-) -> Result<(GgmlCpuTensor<'a>, &'p [f32]), DolphinHotwordError> {
-    let data = fetch(provider, name, len)?;
-    let tensor = graph
-        .new_tensor_1d_f32(len, "dolphin_hotword_bias")
-        .map_err(ggml_err("bias_alloc"))?;
-    Ok((tensor, data))
+    /// A 1-D weight (bias / LayerNorm gamma-beta).
+    fn w1(
+        &mut self,
+        arena: &GgmlStaticTensorArena,
+        name: &str,
+        len: usize,
+    ) -> Result<GgmlStaticTensor, DolphinHotwordError> {
+        let data = fetch(self.provider, name, len)?;
+        let tensor = arena
+            .new_tensor_1d_f32(len, "dolphin_hotword_weight")
+            .map_err(ggml_err("weight_alloc_1d"))?;
+        self.uploads.push((tensor, data, "dolphin_hotword_weight"));
+        Ok(tensor)
+    }
+
+    /// A rank-2 `.weight` matmul operand, bound at its pack-native ggml type
+    /// (quantized/f16) when the provider keeps it that way, else f32 -- the
+    /// same policy `encoder_graph`/`joint_decode` use for every other family
+    /// matmul weight.
+    fn w2(
+        &mut self,
+        arena: &GgmlStaticTensorArena,
+        name: &str,
+        ne0: usize,
+        ne1: usize,
+    ) -> Result<GgmlStaticTensor, DolphinHotwordError> {
+        if let Some(native) = self.provider.native_weight(name) {
+            let tensor = arena
+                .new_matmul_weight_2d_typed(ne0, ne1, native.ggml_type, "dolphin_hotword_weight")
+                .map_err(ggml_err("weight_alloc_2d_native"))?;
+            self.native_uploads
+                .push((tensor, native.bytes, "dolphin_hotword_weight"));
+            return Ok(tensor);
+        }
+        let data = fetch(self.provider, name, ne0 * ne1)?;
+        let tensor = arena
+            .new_tensor_2d_f32(ne0, ne1, "dolphin_hotword_weight")
+            .map_err(ggml_err("weight_alloc_2d"))?;
+        self.uploads.push((tensor, data, "dolphin_hotword_weight"));
+        Ok(tensor)
+    }
+
+    /// Upload every collected weight into the arena's backend buffer exactly
+    /// once (the first upload allocates the buffer and freezes further tensor
+    /// creation). Native (quantized / f16) rank-2 `.weight` operands upload
+    /// their raw block bytes verbatim so they stay quantized in the buffer;
+    /// everything else uploads dequantized f32.
+    fn upload(&self, arena: &mut GgmlStaticTensorArena) -> Result<(), DolphinHotwordError> {
+        for (tensor, data, name) in &self.uploads {
+            arena
+                .set_f32_slice(*tensor, data, name)
+                .map_err(ggml_err("upload_weight"))?;
+        }
+        for (tensor, bytes, name) in &self.native_uploads {
+            arena
+                .set_bytes_slice(*tensor, bytes, name)
+                .map_err(ggml_err("upload_weight_native"))?;
+        }
+        Ok(())
+    }
 }
 
 fn linear<'a>(
@@ -525,73 +565,63 @@ pub(crate) fn apply_hotword_deep_biasing(
         use_scheduler: true,
     };
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
-    let mut graph = runner.start_graph();
 
-    // Phase A: declare every weight tensor before the first buffer alloc.
-    let (q_w, q_w_up) = bind_matmul_weight(
-        &graph,
-        provider,
-        "context_module.biasing_layer.linear_q.weight",
-        d,
-        d,
-    )?;
-    let (q_b, q_b_data) = bind_bias_1d(
-        &graph,
-        provider,
-        "context_module.biasing_layer.linear_q.bias",
-        d,
-    )?;
-    let (k_w, k_w_up) = bind_matmul_weight(
-        &graph,
-        provider,
-        "context_module.biasing_layer.linear_k.weight",
-        d,
-        d,
-    )?;
-    let (k_b, k_b_data) = bind_bias_1d(
-        &graph,
-        provider,
-        "context_module.biasing_layer.linear_k.bias",
-        d,
-    )?;
-    let (v_w, v_w_up) = bind_matmul_weight(
-        &graph,
-        provider,
-        "context_module.biasing_layer.linear_v.weight",
-        d,
-        d,
-    )?;
-    let (v_b, v_b_data) = bind_bias_1d(
-        &graph,
-        provider,
-        "context_module.biasing_layer.linear_v.bias",
-        d,
-    )?;
-    let (out_w, out_w_up) = bind_matmul_weight(
-        &graph,
-        provider,
+    // Persistent weight arena (a WEIGHTS-usage backend buffer). Placing every
+    // biasing-fusion weight here -- instead of the per-call transient graph
+    // leaves this used before -- is what lets the ggml multi-backend scheduler
+    // offload the fusion's matmuls to an accelerator (see `WeightBuilder`).
+    // Mirrors `encoder_graph::WeightBuilder` and `joint_decode`'s CTC-head
+    // arena. The arena is an owned value carrying a raw pointer into the
+    // runner's backend, so it and the per-call graph (a `&mut runner` borrow)
+    // coexist; `runner` outlives it.
+    let arena = runner
+        .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
+            HOTWORD_BIASING_ARENA_TENSORS,
+        ))
+        .map_err(ggml_err("static_tensor_arena"))?;
+
+    // Phase A: allocate every weight tensor in the arena (allocation must
+    // precede the arena's first upload, which freezes further creation).
+    let mut builder = WeightBuilder::new(provider);
+    let q_w = builder.w2(&arena, "context_module.biasing_layer.linear_q.weight", d, d)?;
+    let q_b = builder.w1(&arena, "context_module.biasing_layer.linear_q.bias", d)?;
+    let k_w = builder.w2(&arena, "context_module.biasing_layer.linear_k.weight", d, d)?;
+    let k_b = builder.w1(&arena, "context_module.biasing_layer.linear_k.bias", d)?;
+    let v_w = builder.w2(&arena, "context_module.biasing_layer.linear_v.weight", d, d)?;
+    let v_b = builder.w1(&arena, "context_module.biasing_layer.linear_v.bias", d)?;
+    let out_w = builder.w2(
+        &arena,
         "context_module.biasing_layer.linear_out.weight",
         d,
         d,
     )?;
-    let (out_b, out_b_data) = bind_bias_1d(
-        &graph,
-        provider,
-        "context_module.biasing_layer.linear_out.bias",
-        d,
-    )?;
-    let (combiner_w, combiner_w_up) =
-        bind_matmul_weight(&graph, provider, "context_module.combiner.weight", d, d)?;
-    let (combiner_b, combiner_b_data) =
-        bind_bias_1d(&graph, provider, "context_module.combiner.bias", d)?;
-    let (norm_w, norm_w_data) = bind_bias_1d(
-        &graph,
-        provider,
-        "context_module.norm_aft_combiner.weight",
-        d,
-    )?;
-    let (norm_b, norm_b_data) =
-        bind_bias_1d(&graph, provider, "context_module.norm_aft_combiner.bias", d)?;
+    let out_b = builder.w1(&arena, "context_module.biasing_layer.linear_out.bias", d)?;
+    let combiner_w = builder.w2(&arena, "context_module.combiner.weight", d, d)?;
+    let combiner_b = builder.w1(&arena, "context_module.combiner.bias", d)?;
+    let norm_w = builder.w1(&arena, "context_module.norm_aft_combiner.weight", d)?;
+    let norm_b = builder.w1(&arena, "context_module.norm_aft_combiner.bias", d)?;
+
+    // Phase B: upload every weight into the arena backend buffer exactly once.
+    // This freezes the arena.
+    let mut arena = arena;
+    builder.upload(&mut arena)?;
+
+    // Phase C: build the per-call forward graph. Only `encoder_out` and
+    // `context_emb` are genuine per-call graph inputs; every weight is already
+    // resident in the arena's backend buffer.
+    let mut graph = runner.start_graph();
+    let q_w = arena.graph_tensor(q_w);
+    let q_b = arena.graph_tensor(q_b);
+    let k_w = arena.graph_tensor(k_w);
+    let k_b = arena.graph_tensor(k_b);
+    let v_w = arena.graph_tensor(v_w);
+    let v_b = arena.graph_tensor(v_b);
+    let out_w = arena.graph_tensor(out_w);
+    let out_b = arena.graph_tensor(out_b);
+    let combiner_w = arena.graph_tensor(combiner_w);
+    let combiner_b = arena.graph_tensor(combiner_b);
+    let norm_w = arena.graph_tensor(norm_w);
+    let norm_b = arena.graph_tensor(norm_b);
 
     let encoder_tensor = graph
         .new_tensor_2d_f32(d, frames, "dolphin_hotword_encoder_out")
@@ -600,7 +630,7 @@ pub(crate) fn apply_hotword_deep_biasing(
         .new_tensor_2d_f32(d, rows, "dolphin_hotword_context_emb")
         .map_err(ggml_err("context_alloc"))?;
 
-    // Phase B: forward graph.
+    // Phase D: forward graph.
     let q = linear(&graph, q_w, encoder_tensor, q_b, "hotword_q")?;
     let k = linear(&graph, k_w, context_tensor, k_b, "hotword_k")?;
     let v = linear(&graph, v_w, context_tensor, v_b, "hotword_v")?;
@@ -694,26 +724,11 @@ pub(crate) fn apply_hotword_deep_biasing(
         |s, source| DolphinHotwordError::Ggml { stage: s, source },
     )?;
     graph.set_output(output).map_err(ggml_err("set_output"))?;
-    // Every tensor this graph uploads to (rather than computes) must be
-    // flagged `set_input`: each is a fresh leaf tensor in this per-call graph
-    // with no buffer yet, so without the flag the scheduler's
-    // backend-assignment pass has no rule to place it on and aborts.
-    for tensor in [
-        encoder_tensor,
-        context_tensor,
-        q_w,
-        q_b,
-        k_w,
-        k_b,
-        v_w,
-        v_b,
-        out_w,
-        out_b,
-        combiner_w,
-        combiner_b,
-        norm_w,
-        norm_b,
-    ] {
+    // Only `encoder_out`/`context_emb` are fresh per-call graph leaves with no
+    // buffer of their own; the weights are arena-resident (their backend
+    // buffer is already allocated), so -- like the encoder/CTC-head arena
+    // paths -- they need no `set_input`.
+    for tensor in [encoder_tensor, context_tensor] {
         graph
             .set_input(tensor)
             .map_err(ggml_err("mark_input(hotword_tensor)"))?;
@@ -725,39 +740,13 @@ pub(crate) fn apply_hotword_deep_biasing(
         .prepare_outputs_for_upload(&[output])
         .map_err(ggml_err("prepare_outputs"))?;
 
-    // Phase C: upload inputs + weights, then compute.
+    // Phase E: upload the two genuine per-call inputs, then compute.
     graph
         .set_f32_slice(encoder_tensor, encoder_out, "dolphin_hotword_encoder_out")
         .map_err(ggml_err("upload_encoder"))?;
     graph
         .set_f32_slice(context_tensor, context_emb, "dolphin_hotword_context_emb")
         .map_err(ggml_err("upload_context"))?;
-    upload_matmul_weight(&mut graph, q_w, q_w_up)?;
-    graph
-        .set_f32_slice(q_b, q_b_data, "dolphin_hotword_bias")
-        .map_err(ggml_err("upload_bias"))?;
-    upload_matmul_weight(&mut graph, k_w, k_w_up)?;
-    graph
-        .set_f32_slice(k_b, k_b_data, "dolphin_hotword_bias")
-        .map_err(ggml_err("upload_bias"))?;
-    upload_matmul_weight(&mut graph, v_w, v_w_up)?;
-    graph
-        .set_f32_slice(v_b, v_b_data, "dolphin_hotword_bias")
-        .map_err(ggml_err("upload_bias"))?;
-    upload_matmul_weight(&mut graph, out_w, out_w_up)?;
-    graph
-        .set_f32_slice(out_b, out_b_data, "dolphin_hotword_bias")
-        .map_err(ggml_err("upload_bias"))?;
-    upload_matmul_weight(&mut graph, combiner_w, combiner_w_up)?;
-    graph
-        .set_f32_slice(combiner_b, combiner_b_data, "dolphin_hotword_bias")
-        .map_err(ggml_err("upload_bias"))?;
-    graph
-        .set_f32_slice(norm_w, norm_w_data, "dolphin_hotword_bias")
-        .map_err(ggml_err("upload_bias"))?;
-    graph
-        .set_f32_slice(norm_b, norm_b_data, "dolphin_hotword_bias")
-        .map_err(ggml_err("upload_bias"))?;
 
     graph
         .compute_output_f32(output, frames * d)
