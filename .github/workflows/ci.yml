@@ -48,6 +48,8 @@ jobs:
       - run: cargo fmt --check
       - name: Catalog drift gate
         run: tooling/publish-model/scripts/regenerate_all.sh --check
+      - name: GPU weight placement gate
+        run: scripts/gpu-weight-placement-gate.sh
       - name: Install python test dependencies
         run: python3 -m pip install --user numpy
       - name: Python helper gates

@@ -145,6 +145,17 @@ to the bench-suite (`perf/suite.toml`) and freeze its first transcript as the
 reference. Then run the [keep-quantized self-check](#self-check-after-publishing)
 on the rendered card.
 
+**Byte-identity is necessary but not sufficient.** A golden/parity fixture
+proves the *numbers* are right; it says nothing about which backend actually
+computed them, because ggml produces the same output on CPU or GPU. Run the
+[GPU weight placement gate](design/gpu-weight-placement.md) as well --
+`scripts/gpu-weight-placement-gate.sh` plus a one-shot `GGML_SCHED_DEBUG=2`
+real forward pass -- so a new encoder/decoder that quietly uploads its weights
+per-request (and is therefore pinned to CPU under any GPU backend) doesn't
+pass review on golden-diff output alone. This is exactly how Dolphin's and
+X-ASR/Zipformer's encoders shipped GPU-invisible despite passing golden/parity
+(#131/#115).
+
 ## Runtime contract: keep quantized weights quantized
 
 **Hard requirement.** A quantized `.oasr` pack MUST feed its weights to ggml

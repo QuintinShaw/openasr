@@ -147,7 +147,26 @@ constant. **Do not** declare the same capability as a separate literal in the
 catalog card, a client-side table, and the executor -- three places drift the
 way capabilities and decode logic drifted before.
 
-### 8. Progress, history, cancel
+### 8. GPU weight placement
+
+A new encoder/decoder's persistent 2D matmul weights MUST bind through
+`load_gguf_weight_context` (zero-copy, native quantized type) and its 1D
+norm/bias tensors through `GgmlStaticTensorArena` -- both land in a
+`GGML_BACKEND_BUFFER_USAGE_WEIGHTS` buffer, which is the only thing the ggml
+scheduler will offload to a GPU backend. `runner.start_graph()` + an upload
+call (`uploads.push` / `pending_uploads.push` / `.upload(...)`) is for genuine
+per-request input (features, token ids, step state) only -- **never** for
+persistent model weights; using it for weights pins the whole subgraph to CPU
+regardless of the configured backend, and byte-identical golden/parity output
+gives zero signal that this happened (short fixtures produce the same numbers
+on CPU or GPU). See [GPU weight placement](gpu-weight-placement.md) for the
+full defect writeup (this is exactly what Dolphin's and X-ASR/Zipformer's
+encoders got wrong, #131/#115) and the two-part gate: the static
+`scripts/gpu-weight-placement-gate.sh` plus a one-shot
+`GGML_SCHED_DEBUG=2` real forward pass proving the encoder's splits actually
+land on the GPU backend.
+
+### 9. Progress, history, cancel
 
 Long-running transcription progress, history reporting, and cancel/pause
 semantics run through the shared driver plumbing a new family's executor and
@@ -193,6 +212,15 @@ with a one-line structural justification for going another way):
       or a client-side table.
 - [ ] Encoder/decoder stack composes over `nn::{attn, ffn, norm, conv}`; any
       bypass has a structural reason stated in the PR description.
+- [ ] GPU weight placement (see [GPU weight placement](gpu-weight-placement.md)):
+      `scripts/gpu-weight-placement-gate.sh` shows no new finding for this
+      family, and a one-shot `GGML_SCHED_DEBUG=2 GGML_DEBUG=1
+      OPENASR_GGML_BACKEND=<gpu backend>` real forward pass (pasted into the PR)
+      shows the encoder's/decoder's matmul splits on the GPU backend, not
+      `CPU`. Byte-identical golden/parity output on a short fixture is **not**
+      evidence of this -- it is identical whether the subgraph ran on CPU or
+      GPU (this is exactly how Dolphin's and X-ASR/Zipformer's encoders
+      shipped CPU-pinned despite passing review, #131/#115).
 - [ ] Progress/cancel/history reuse the shared driver plumbing; no new
       single-vs-batch or file-vs-realtime second path.
 - [ ] If extending or refactoring an existing family: byte-identity is proven
