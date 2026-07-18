@@ -1,24 +1,106 @@
-# Per-model card prose for openasr/mimo-v2.5-asr.
-#
-# PLACEHOLDER: every user-facing marketing string below is intentionally set to
-# "TODO-COPY". Final prose (tagline/highlights/intro/acknowledgement, and any
-# zh-CN locale block) is authored separately and must not be drafted here. Fill
-# these in before the model is flipped public (--public requires a non-empty
-# tagline + intro; see _manifest.validate_public_prose). Keep every factual
-# claim to what the upstream XiaomiMiMo/MiMo-V2.5-ASR (and
-# XiaomiMiMo/MiMo-Audio-Tokenizer) model cards actually state; the upstream
-# license is MIT.
+# Per-model card prose for openasr/mimo-v2.5-asr. Distilled from the upstream
+# XiaomiMiMo/MiMo-V2.5-ASR and XiaomiMiMo/MiMo-Audio-Tokenizer Hugging Face model
+# cards and Xiaomi's own published MiMo-V2.5-ASR benchmark tables
+# (mimo.xiaomi.com/mimo-v2-5-asr). Upstream license = MIT. This repo distributes
+# only the q4_k quantization tier -- do not imply fp16/q8_0 tiers are available.
+# OpenASR's catalog entry for this model covers English (en), Cantonese (yue),
+# and Mandarin Chinese (zh); the upstream base model's broader dialect training
+# (Wu, Hokkien, Sichuanese) is noted for context only and is not a claim about
+# languages this pack ships. Re-verify against upstream if the checkpoint changes.
 
-tagline = "TODO-COPY"
+tagline = "Xiaomi MiMo's end-to-end 8B speech model — state-of-the-art Mandarin, English, and Cantonese recognition, fully on-device"
+tagline_zh = "小米 MiMo 端到端语音大模型——普通话、英语、粤语高精度识别，全程设备端运行"
 
 highlights = [
-  "TODO-COPY",
+  "🥇 **State-of-the-art Mandarin accuracy** — 2.52% CER on AiShell-2 and 2.41% on Fleurs-Zh, leading both FunASR-1.5 and Seed-ASR 2.0 on both benchmarks (Xiaomi's published MiMo-V2.5-ASR benchmark results)",
+  "🇬🇧 **Strong English recognition** — 5.73% average WER across eight Open ASR Leaderboard test sets, including 1.45% WER on LibriSpeech-Clean (Xiaomi's published MiMo-V2.5-ASR benchmark results)",
+  "🗣️ **Cantonese and dialect depth** — 3.28% CER on Fleurs-Yue for Cantonese; the underlying model is also trained on Wu, Hokkien, and Sichuanese dialects (Xiaomi's published MiMo-V2.5-ASR benchmark results; huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
+  "🔀 **Seamless Mandarin-English code-switching** — transcribes mixed-language speech with no language tags required (huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
+  "✍️ **Native punctuation from prosody** — generates punctuation directly from speech rhythm and semantics, delivering ready-to-use transcripts with no post-processing needed (huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
+  "🏗️ **1.2B audio tokenizer + 8B decoder pipeline** — a residual vector quantization tokenizer trained on 10 million hours of audio compresses speech at 25 Hz into discrete tokens, fed into an 8B-parameter transformer decoder with Flash Attention support (huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer; huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
+]
+
+highlights_zh = [
+  "🥇 **普通话识别精度领先** — AiShell-2 字错率 2.52%、Fleurs-Zh 字错率 2.41%，在两项基准上均超越 FunASR-1.5 与 Seed-ASR 2.0（小米官方 MiMo-V2.5-ASR 评测数据）",
+  "🇬🇧 **英语识别表现出色** — Open ASR Leaderboard 八项测试集平均词错率 5.73%，其中 LibriSpeech-Clean 低至 1.45%（小米官方 MiMo-V2.5-ASR 评测数据）",
+  "🗣️ **粤语及方言基础** — Fleurs-Yue 粤语测试集字错率 3.28%；底层模型训练涵盖吴语、闽南语、四川话等多种方言（小米官方评测数据；huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR）",
+  "🔀 **中英混合无缝识别** — 中英文随意切换的语音片段可直接转录，无需指定语言标签（huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR）",
+  "✍️ **基于韵律的原生标点** — 从语音节奏与语义中直接生成标点符号，转录结果开箱即用（huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR）",
+  "🏗️ **1.2B 音频编码器 + 8B 解码器** — 基于残差向量量化的音频编码器在千万小时语料上从零训练，以 25 Hz 频率将音频压缩为离散 token，再交由 8B 参数 Transformer 解码器完成文本生成（huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer；huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR）",
 ]
 
 intro = """
-TODO-COPY
+MiMo-V2.5-ASR is a state-of-the-art end-to-end automatic speech recognition model developed by
+the Xiaomi MiMo team. Audio first passes through the **MiMo-Audio-Tokenizer**, a 1.2B-parameter
+transformer operating at 25 Hz that uses an eight-layer residual vector quantization (RVQ) stack
+to produce 200 discrete tokens per second; a patch encoder then aggregates four consecutive time
+steps into a single patch, downsampling the sequence to a compact 6.25 Hz representation. The
+tokenizer was trained from scratch on a 10-million-hour corpus, jointly optimizing semantic and
+reconstruction objectives (huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer). Those tokens feed an
+**8B-parameter transformer decoder** with Flash Attention support, trained through large-scale
+mid-training, high-quality supervised fine-tuning, and a novel reinforcement-learning algorithm
+(huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR). On Xiaomi's published benchmarks the model achieves
+**2.52% CER on AiShell-2** and **2.41% on Fleurs-Zh** for Mandarin -- leading both FunASR-1.5 and
+Seed-ASR 2.0 -- alongside **5.73% average WER** across eight English Open ASR Leaderboard test
+sets with **1.45% on LibriSpeech-Clean**. For Cantonese, the model scores **3.28% CER on
+Fleurs-Yue** and **7.21% CER** on a second Cantonese test set (Xiaomi's published MiMo-V2.5-ASR
+benchmark results). It handles code-switched Mandarin-English speech without language tags,
+generates punctuation natively from prosody and semantics, and is designed for noisy,
+multi-speaker, and overlapping-conversation scenarios. This OpenASR pack ships the **q4_k** build
+under an **MIT** license inherited from the upstream model, running entirely on-device via the
+`.oasr` format -- no cloud upload, no Python at inference time. OpenASR's catalog entry supports
+**English, Cantonese, and Mandarin Chinese**; the base model's broader dialect training on Wu,
+Hokkien, and Sichuanese provides additional architectural depth but those dialects are not
+shipped as supported languages in this pack.
+"""
+
+intro_zh = """
+MiMo-V2.5-ASR 是小米 MiMo 团队打造的端到端自动语音识别模型，采用音频编码器与大语言模型解码器的
+双阶段架构。音频信号首先由 **MiMo-Audio-Tokenizer** 处理——这是一个 1.2B 参数的 Transformer，
+以 25 Hz 频率运行，内含八层残差向量量化（RVQ）模块，每秒输出 200 个离散 token；patch 编码器将
+连续四个时间步聚合为一个 patch，将序列降采样至 6.25 Hz 的紧凑表示。该编码器在一千万小时的音频
+语料上从零训练，联合优化语义与重建目标（huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer）。离散
+token 随后送入支持 Flash Attention 的 **8B 参数 Transformer 解码器**，经大规模中间训练、高质量
+监督微调及创新强化学习算法训练（huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR）。在小米官方发布的评测
+中，模型普通话识别达到 **AiShell-2 字错率 2.52%**、**Fleurs-Zh 字错率 2.41%**，均领先 FunASR-1.5
+与 Seed-ASR 2.0；英语识别在 Open ASR Leaderboard 八项测试集上取得**平均词错率 5.73%**，
+**LibriSpeech-Clean 低至 1.45%**；粤语方面，**Fleurs-Yue 字错率 3.28%**，另一粤语测试集字错率
+**7.21%**（小米官方 MiMo-V2.5-ASR 评测数据）。模型支持中英混合语音的无标签转录、从韵律和语义自动
+生成标点，并针对噪声环境、多说话人及语音重叠场景做了专门优化。本 OpenASR 包发布 **q4_k** 量化
+版本，许可证为 **MIT**（继承自上游模型），以 `.oasr` 格式在设备端完整运行，音频数据不上传云端。
+OpenASR 目录中本模型的支持语言为**英语、粤语和普通话**；底层模型在吴语、闽南语、四川话等方言上
+亦有训练基础，但本包未将其列为正式支持语言。
 """
 
 acknowledgement = """
-TODO-COPY
+This pack is a redistribution of **MiMo-V2.5-ASR** and its companion **MiMo-Audio-Tokenizer**,
+created and released by the **Xiaomi MiMo team**
+([XiaomiMiMo/MiMo-V2.5-ASR](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR),
+[XiaomiMiMo/MiMo-Audio-Tokenizer](https://huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer)). All
+credit for the architecture, training, and weights belongs to the Xiaomi MiMo team; the license
+is inherited from and identical to the upstream models (**MIT**, as declared on both upstream
+model cards). Thank you to the Xiaomi MiMo team for releasing their work openly. OpenASR only
+performs format conversion, quantization, runtime verification, and local-inference adaptation.
 """
+
+acknowledgement_zh = """
+本包是 **MiMo-V2.5-ASR** 及配套 **MiMo-Audio-Tokenizer** 的再分发版本，由**小米 MiMo 团队**研发
+并开源（[XiaomiMiMo/MiMo-V2.5-ASR](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)、
+[XiaomiMiMo/MiMo-Audio-Tokenizer](https://huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer)）。
+模型架构设计、训练流程及权重的全部成果归属小米 MiMo 团队；许可证继承自上游模型，与其完全一致
+（**MIT**，如两个上游模型卡所声明）。感谢小米 MiMo 团队的开放贡献。OpenASR 仅进行了格式转换、
+量化、运行时验证及本地推理适配，未参与模型训练。
+"""
+
+[prose_locales."zh-CN"]
+tagline = "小米 MiMo 8B 参数语音大模型——中英粤三语离线识别，开口就能记"
+
+highlights = [
+  "🥇 **中文听写拉满** — AiShell-2 只有 2.52% 字错率、Fleurs-Zh 仅 2.41%，把 FunASR-1.5 和 Seed-ASR 2.0 都甩在身后（小米官方 MiMo-V2.5-ASR 评测）",
+  "🇬🇧 **英语同样能打** — Open ASR Leaderboard 八项均分 5.73% 词错率，LibriSpeech-Clean 更是低到 1.45%（小米官方 MiMo-V2.5-ASR 评测数据）",
+  "🗣️ **粤语在线** — Fleurs-Yue 粤语字错率 3.28%，底层模型还练过吴语、闽南语、四川话（小米官方 MiMo-V2.5-ASR 评测数据；huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR）",
+  "🔀 **中英夹杂随便说** — 会议、日常对话自由混用中英文，不用选语言，模型自动分清楚（huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR）",
+  "✍️ **标点自己就带上了** — 根据你说话的语气和上下文直接输出标点，转出来就是能用的文本（huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR）",
+  "🏗️ **1.2B 音频编码器 + 8B 解码器** — 编码器拿 10 百万小时的海量音频喂出来的，以 25 Hz 把语音压成离散 token，再交给 8B 参数的大解码器搞定识别（huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer；huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR）",
+]
+source_sha256 = "021da46c71fdc6f6848f822037dc8482863cb7a4b5c6be87d754f404b5ceb2e5"

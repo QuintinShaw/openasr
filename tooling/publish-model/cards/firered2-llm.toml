@@ -1,25 +1,88 @@
-# Per-model card prose for openasr/firered2-llm.
-#
-# PLACEHOLDER: every user-facing marketing string below is intentionally set to
-# "TODO-COPY". Final prose (tagline/highlights/intro/acknowledgement, and any
-# zh-CN locale block) is authored separately and must not be drafted here. Fill
-# these in before the model is flipped public (--public requires a non-empty
-# tagline + intro; see _manifest.validate_public_prose). Keep every factual
-# claim to what the upstream FireRedTeam/FireRedASR2-LLM model card and the
-# FireRedASR2S technical report (arXiv:2603.10420) actually state; do not
-# conflate FireRedASR2-LLM's numbers with the smaller AED member
-# (firered-aed-l-v2), a different, smaller model.
+# Per-model card prose for openasr/firered2-llm. Distilled from the upstream
+# FireRedTeam/FireRedASR2-LLM Hugging Face model card and the FireRedASR2S
+# technical report (arXiv:2603.10420 abstract). Upstream license = Apache-2.0.
+# This repo distributes only the q4_k quantization tier -- do not imply
+# fp16/q8_0 tiers are available. CRITICAL: FireRedASR2-LLM (Encoder-Adapter-LLM,
+# 8B+ params, 2.89% avg Mandarin CER / 11.55% avg dialect CER) is a different,
+# larger, stronger model than the already-published firered-aed-l-v2
+# (FireRedASR2-AED, 1.1B params, 3.05%/11.67% avg CER) -- never conflate the two
+# or swap their numbers. Re-verify against upstream if the checkpoint changes.
 
-tagline = "TODO-COPY"
+tagline = "FireRedTeam's LLM-backbone Mandarin-first bilingual ASR — 8B+ parameters engineered for state-of-the-art Chinese and dialect accuracy"
+tagline_zh = "FireRedTeam 大语言模型驱动的中文语音识别旗舰 — 8B+ 参数，普通话与方言准确率双项领先"
 
 highlights = [
-  "TODO-COPY",
+  "🥇 **Best-in-class Mandarin accuracy** — 2.89% average CER across four public Mandarin benchmarks, outperforming Doubao-ASR (3.69%), Qwen3-ASR (3.76%), and Fun-ASR (4.16%) on the same comparison table (arXiv:2603.10420; FireRedTeam's FireRedASR2-LLM model card)",
+  "🗣️ **Leading dialect and accent coverage** — 11.55% average CER across 19 public Chinese dialect/accent benchmarks, ahead of Doubao-ASR (15.39%) and Qwen3-ASR (11.85%) (arXiv:2603.10420; FireRedTeam's FireRedASR2-LLM model card)",
+  "🇨🇳🇬🇧 **Bilingual Mandarin + English** — one 8B+ parameter checkpoint handles both languages, as demonstrated in the upstream model card's bilingual examples (FireRedTeam's FireRedASR2-LLM model card)",
+  "🧠 **LLM-scale decoder backbone** — Encoder-Adapter-LLM architecture at 8B+ parameters, the bigger and more accurate sibling of the already-available firered-aed-l-v2 (1.1B AED, 3.05%/11.67% avg CER) (FireRedTeam's FireRedASR2-LLM model card)",
+  "🔒 **Fully local, q4_k build** — runs 100% on-device via OpenASR's .oasr runtime with no cloud upload, under the Apache-2.0 license inherited from upstream (FireRedTeam's FireRedASR2-LLM model card)",
+]
+
+highlights_zh = [
+  "🥇 **普通话识别精度领先** — 4 项公开普通话基准平均字错率仅 2.89%，优于 Doubao-ASR（3.69%）、Qwen3-ASR（3.76%）及 Fun-ASR（4.16%）（arXiv:2603.10420；FireRedTeam FireRedASR2-LLM 模型卡）",
+  "🗣️ **广泛的方言与口音覆盖** — 19 项公开中文方言/口音基准平均字错率 11.55%，领先于 Doubao-ASR（15.39%）和 Qwen3-ASR（11.85%）（arXiv:2603.10420；FireRedTeam FireRedASR2-LLM 模型卡）",
+  "🇨🇳🇬🇧 **中英双语一体** — 单一 8B+ 参数模型同时支持普通话与英语识别，上游模型卡展示了双语使用示例（FireRedTeam FireRedASR2-LLM 模型卡）",
+  "🧠 **LLM 级解码器架构** — 采用 Encoder-Adapter-LLM 框架，参数规模 8B+，是已上架的 firered-aed-l-v2（1.1B 参数 AED 架构，平均字错率 3.05%/11.67%）的大参数高精度升级版（FireRedTeam FireRedASR2-LLM 模型卡）",
+  "🔒 **全程本地推理** — 以 q4_k 量化精度打包为 .oasr 格式，在 OpenASR 引擎中 100% 本地运行，无需上传云端，继承上游 Apache-2.0 开源协议（FireRedTeam FireRedASR2-LLM 模型卡）",
 ]
 
 intro = """
-TODO-COPY
+FireRedASR2-LLM is the Encoder-Adapter-LLM member of **FireRedASR2**, the successor to
+FireRedTeam's open-source industrial-grade **FireRedASR** speech-recognition family, released as
+part of the **FireRedASR2S** all-in-one ASR system. At 8B+ parameters with an LLM-scale decoder
+backbone, it is the bigger and more accurate sibling of the already-available
+**firered-aed-l-v2** (FireRedASR2-AED, a 1.1B-parameter attention encoder-decoder reporting
+3.05%/11.67% avg CER). The FireRedASR2S technical report (arXiv:2603.10420) and the upstream model
+card both report **2.89% average Character Error Rate** across four public Mandarin benchmarks
+and **11.55% average CER** across 19 public Chinese dialect/accent benchmarks -- outperforming
+Doubao-ASR (3.69%/15.39%), Qwen3-ASR (3.76%/11.85%), and Fun-ASR (4.16%/12.76%) on the paper's own
+comparison table. These numbers belong to FireRedASR2-LLM and should not be confused with the
+smaller firered-aed-l-v2's 3.05%/11.67% figures. The model is bilingual (Mandarin Chinese and
+English). This OpenASR pack distributes the q4_k quantization build, repackaged as an `.oasr`
+pack that runs natively in the OpenASR runtime -- fully local, no Python at inference time, no
+cloud upload. Licensed under Apache-2.0, inherited from the upstream release.
+"""
+
+intro_zh = """
+FireRedASR2-LLM 是 **FireRedASR2** 语音识别家族中基于大语言模型的旗舰成员，隶属于 FireRedTeam
+开源发布的 **FireRedASR2S** 一站式语音识别系统。它采用 **Encoder-Adapter-LLM** 架构，参数规模
+超过 8B，是本站已收录的 **firered-aed-l-v2**（FireRedASR2-AED，1.1B 参数注意力编码器-解码器，
+平均普通话字错率 3.05%、方言字错率 11.67%）的大参数升级版本。据 FireRedASR2S 技术报告
+（arXiv:2603.10420）及上游模型卡公布的数据，FireRedASR2-LLM 在 4 项公开普通话基准上取得
+**2.89% 平均字错率**，在 19 项公开中文方言/口音基准上取得 **11.55% 平均字错率**，在论文同一
+对比表中优于 Doubao-ASR（3.69%/15.39%）、Qwen3-ASR（3.76%/11.85%）和 Fun-ASR（4.16%/12.76%）。
+以上数据均为 FireRedASR2-LLM 自身的评测结果，请勿与较小的 firered-aed-l-v2（3.05%/11.67%）混淆。
+该模型支持中英双语识别。本 OpenASR 包以 q4_k 量化精度发布，封装为 `.oasr` 格式在 OpenASR 引擎中
+原生运行 -- 全程本地推理，无需 Python 环境，数据不离开设备。许可协议为 Apache-2.0，继承自上游发布。
 """
 
 acknowledgement = """
-TODO-COPY
+This pack is a redistribution of **FireRedASR2-LLM**, created and released by **FireRedTeam**
+([FireRedTeam/FireRedASR2-LLM](https://huggingface.co/FireRedTeam/FireRedASR2-LLM),
+[FireRedTeam/FireRedASR2S](https://github.com/FireRedTeam/FireRedASR2S)). All credit for the
+architecture, training, and weights belongs to FireRedTeam; the license is inherited from and
+identical to the upstream model (**Apache-2.0**, as declared on the upstream model card). Thank
+you to FireRedTeam for releasing their work openly. OpenASR only performs format conversion,
+quantization, runtime verification, and local-inference adaptation.
 """
+
+acknowledgement_zh = """
+本模型包是对 **FireRedASR2-LLM** 的重新封装与分发，原始模型由 **FireRedTeam** 创建并开源发布
+（[FireRedTeam/FireRedASR2-LLM](https://huggingface.co/FireRedTeam/FireRedASR2-LLM)，
+[FireRedTeam/FireRedASR2S](https://github.com/FireRedTeam/FireRedASR2S)）。模型架构、训练及权重
+的全部功劳归属 FireRedTeam；许可协议与上游完全一致（**Apache-2.0**，以上游模型卡声明为准）。
+感谢 FireRedTeam 的开源贡献。OpenASR 仅负责格式转换、量化、运行时验证及本地推理适配。
+"""
+
+[prose_locales."zh-CN"]
+tagline = "8B+ 大模型加持的语音识别 — 普通话和方言都能精准拿捏"
+
+highlights = [
+  "🥇 **普通话字错率低至 2.89%** — 四大公开评测均值，把 Doubao-ASR（3.69%）、Qwen3-ASR（3.76%）和 Fun-ASR（4.16%）统统甩在身后（arXiv:2603.10420；FireRedTeam FireRedASR2-LLM 模型卡）",
+  "🗣️ **19 种方言口音通通拿下** — 平均字错率 11.55%，Doubao-ASR 15.39%、Qwen3-ASR 11.85% 都不在话下（arXiv:2603.10420；FireRedTeam FireRedASR2-LLM 模型卡）",
+  "🇨🇳🇬🇧 **中英双语一把抓** — 一个 8B+ 参数的模型同时搞定普通话和英语，不用切换、不用下两份，省心到家（FireRedTeam FireRedASR2-LLM 模型卡）",
+  "🧠 **LLM 级别的大模型解码骨架** — 8B+ 参数 Encoder-Adapter-LLM 架构，是已上架的 firered-aed-l-v2（1.1B AED，均值字错率 3.05%/11.67%）的大号进化体，精度更上一层楼（FireRedTeam FireRedASR2-LLM 模型卡）",
+  "🔒 **100% 本地跑，数据不出门** — q4_k 量化 .oasr 包，OpenASR 引擎直接加载，Apache-2.0 开源协议放心用（FireRedTeam FireRedASR2-LLM 模型卡）",
+]
+source_sha256 = "d99128c653c588e44d162138836712907a7305a49c50d4e10a0a4619eb99579d"
