@@ -332,6 +332,50 @@ fn set_get_unset_supported_keys() {
 }
 
 #[test]
+fn download_source_accepts_china_and_global_and_unsets_to_auto() {
+    let mut config = OpenAsrConfig::default();
+    let registry = registry();
+
+    config
+        .set(ConfigKey::DownloadSource, "china", &registry)
+        .unwrap();
+    assert_eq!(
+        config.download_source,
+        DownloadSourcePref::auto_region(true)
+    );
+    assert_eq!(
+        config.get(ConfigKey::DownloadSource).as_deref(),
+        Some("china")
+    );
+
+    config
+        .set(ConfigKey::DownloadSource, "global", &registry)
+        .unwrap();
+    assert_eq!(
+        config.download_source,
+        DownloadSourcePref::auto_region(false)
+    );
+    assert_eq!(
+        config.get(ConfigKey::DownloadSource).as_deref(),
+        Some("global")
+    );
+
+    config.unset(ConfigKey::DownloadSource);
+    assert_eq!(config.download_source, DownloadSourcePref::Auto);
+}
+
+#[test]
+fn download_source_rejects_unknown_value() {
+    let mut config = OpenAsrConfig::default();
+    let error = config
+        .set(ConfigKey::DownloadSource, "modelscope", &registry())
+        .unwrap_err();
+    assert!(
+        matches!(error, ConfigError::UnsupportedDownloadSource(value) if value == "modelscope")
+    );
+}
+
+#[test]
 fn unknown_key_returns_friendly_error() {
     let error = "missing.key".parse::<ConfigKey>().unwrap_err().to_string();
     assert!(error.contains("Unknown config key 'missing.key'"));

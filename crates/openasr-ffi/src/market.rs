@@ -215,7 +215,10 @@ pub unsafe extern "C" fn openasr_catalog_free(catalog: *mut OpenAsrCatalog) {
 ///   the largest quant that fits this device's memory budget is chosen (an
 ///   explicit `:quant` / `quant` always wins).
 /// - `source` is optional (null): null uses the automatic download-source chain;
-///   otherwise one of `"hf"`, `"hf-mirror"`, `"weights"`, or `"auto"`.
+///   otherwise one of `"hf"`, `"hf-mirror"`, `"weights"`, `"auto"`, `"china"`, or
+///   `"global"`. `"china"`/`"global"` pin the region-aware chain's direction
+///   explicitly (for callers, like the desktop app, that judge the region
+///   themselves) instead of `"auto"` judging it from locale/timezone.
 /// - `accept_license` must be true to pull a gated-license model; a gated model
 ///   pulled without it fails closed with [`OpenAsrStatus::PullFailed`], so
 ///   consent cannot silently become a license bypass (mirrors the CLI's
