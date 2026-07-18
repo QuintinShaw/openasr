@@ -339,6 +339,13 @@ pub(crate) fn is_operator_only_path(method: &axum::http::Method, path: &str) -> 
     if path == "/v1/models/default" {
         return method != Method::GET; // set-default (POST/PUT); GET is informational
     }
+    if path == "/v1/models/pulls" {
+        // Unlike a single-job GET (which requires already knowing the job
+        // id), this lists every in-flight job across the operator's daemon
+        // -- broader exposure, so it stays behind the operator token like
+        // the other bulk operator-local reads (history, config, speakers).
+        return true;
+    }
     if path.starts_with("/v1/models/pull/") {
         return method == Method::POST; // cancel / pause / resume; GET status stays open
     }

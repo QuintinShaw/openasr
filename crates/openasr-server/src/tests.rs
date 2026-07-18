@@ -1433,6 +1433,10 @@ fn operator_only_paths_cover_history_config_and_model_mutations() {
         &Method::POST,
         "/v1/models/pull/job1/cancel"
     ));
+    // Listing every in-flight job is broader exposure than a single-job GET
+    // (which requires already knowing the job id), so it stays operator-only
+    // even though the underlying handler is a GET.
+    assert!(is_operator_only_path(&Method::GET, "/v1/models/pulls"));
     // Open to paired compute clients:
     assert!(!is_operator_only_path(&Method::GET, "/v1/models/default"));
     assert!(!is_operator_only_path(&Method::GET, "/v1/models"));
@@ -2016,6 +2020,76 @@ fn pull_job_reuses_existing_nonterminal_snapshot_for_same_pull() {
         .unwrap();
 
     assert_eq!(reused.job_id, "pull-existing");
+}
+
+#[tokio::test]
+async fn list_pull_jobs_returns_empty_list_when_no_jobs_exist() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+
+    let response = list_pull_jobs(Extension(distribution)).await;
+
+    assert!(response.0.jobs.is_empty());
+}
+
+#[tokio::test]
+async fn list_pull_jobs_surfaces_persisted_nonterminal_jobs_after_restart_without_side_effects() {
+    let temp = tempfile::tempdir().unwrap();
+    let resolved = resolved_pull_fixture();
+    let pulls_dir = temp.path().join("pulls");
+    std::fs::create_dir_all(&pulls_dir).unwrap();
+
+    // A prior daemon process was killed mid-download and had persisted this
+    // job to disk before exiting (mirrors what `persist_snapshot` writes).
+    let mut downloading = PullJobSnapshot::queued("pull-inflight".to_string(), &resolved, None);
+    downloading.state = PullJobState::Downloading;
+    downloading.bytes_done = 1;
+    downloading.bytes_total = resolved.size_bytes;
+    std::fs::write(
+        pulls_dir.join("pull-inflight.json"),
+        serde_json::to_vec_pretty(&downloading).unwrap(),
+    )
+    .unwrap();
+
+    // A job that already finished before the restart must not resurface.
+    let mut completed = PullJobSnapshot::queued("pull-done".to_string(), &resolved, None);
+    completed.state = PullJobState::Completed;
+    std::fs::write(
+        pulls_dir.join("pull-done.json"),
+        serde_json::to_vec_pretty(&completed).unwrap(),
+    )
+    .unwrap();
+
+    // Fresh `DistributionContext::new` is what happens when the daemon
+    // restarts: it reads `~/.openasr/pulls/*.json` synchronously at
+    // construction time, before any request has been served.
+    let distribution = distribution_context_for_test(temp.path());
+
+    let response = list_pull_jobs(Extension(distribution.clone())).await;
+    let jobs = response.0.jobs;
+
+    assert_eq!(jobs.len(), 1, "only the non-terminal job should be listed");
+    assert_eq!(jobs[0].job_id, "pull-inflight");
+    // `load_persisted_pull_jobs` normalizes a restart-resumable job that still
+    // has a resolved spec back to `Queued` (in-process progress state like
+    // the EMA speed and last-progress timestamp cannot have survived the
+    // restart), so that is the state the listing endpoint must surface.
+    assert_eq!(jobs[0].state, PullJobState::Queued);
+
+    // Calling the endpoint must not itself start or resume anything: no
+    // restart-resume worker was spawned and no job was registered active.
+    // Querying is not pulling.
+    assert!(
+        !distribution
+            .jobs
+            .restart_resumes_started
+            .load(Ordering::SeqCst),
+        "listing jobs must not trigger the restart-resume worker"
+    );
+    assert!(
+        distribution.jobs.active.lock().unwrap().is_empty(),
+        "listing jobs must not register/spawn any active pull job"
+    );
 }
 
 #[test]

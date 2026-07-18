@@ -152,6 +152,7 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         )
         .route("/v1/models/{id}", delete(delete_model))
         .route("/v1/models/{id}/pull", post(start_pull_job))
+        .route("/v1/models/pulls", get(list_pull_jobs))
         .route("/v1/models/pull/{job_id}", get(pull_job))
         .route("/v1/models/pull/{job_id}/events", get(pull_job_events))
         .route("/v1/models/pull/{job_id}/cancel", post(cancel_pull_job))
@@ -1519,6 +1520,23 @@ impl DistributionContext {
             .filter(|snapshot| snapshot.state.is_restart_resumable())
             .cloned()
             .collect()
+    }
+
+    /// All jobs not yet in a terminal state, sorted by `job_id` for a stable
+    /// listing order. Read-only: does not touch the restart-resume worker or
+    /// persisted files, so calling it has no side effects on job state.
+    fn nonterminal_snapshots(&self) -> Vec<PullJobSnapshot> {
+        let mut snapshots: Vec<PullJobSnapshot> = self
+            .jobs
+            .snapshots
+            .lock()
+            .expect("pull job snapshots mutex poisoned")
+            .values()
+            .filter(|snapshot| !snapshot.state.is_terminal())
+            .cloned()
+            .collect();
+        snapshots.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+        snapshots
     }
 
     fn ensure_restart_resumes_started(&self) {

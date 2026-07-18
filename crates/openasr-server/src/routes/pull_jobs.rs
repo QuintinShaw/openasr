@@ -397,6 +397,29 @@ pub(crate) async fn pull_job(
     Ok(Json(snapshot))
 }
 
+/// Lists currently non-terminal pull jobs so a client that lost its in-memory
+/// job list (the desktop shell after a daemon restart kills and relaunches
+/// the process) can rediscover in-flight downloads. Deliberately does **not**
+/// call `ensure_restart_resumes_started`: this is a pure read of whatever
+/// state `DistributionContext::new` already loaded from
+/// `~/.openasr/pulls/*.json` at startup (restart-resumable jobs are
+/// normalized to `Queued` synchronously at load time, before any request
+/// arrives), so listing jobs can never itself start or resume a download --
+/// the server-never-pulls-on-a-query invariant holds even for the very first
+/// request after a restart.
+pub(crate) async fn list_pull_jobs(
+    Extension(distribution): Extension<DistributionContext>,
+) -> Json<PullJobsListResponse> {
+    Json(PullJobsListResponse {
+        jobs: distribution.nonterminal_snapshots(),
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PullJobsListResponse {
+    pub(crate) jobs: Vec<PullJobSnapshot>,
+}
+
 pub(crate) async fn pull_job_events(
     AxumPath(job_id): AxumPath<String>,
     Extension(distribution): Extension<DistributionContext>,

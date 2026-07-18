@@ -115,7 +115,10 @@ The same core pull engine backs three surfaces:
 
 - CLI: `openasr pull <id>:<quant>` (or a bare `<id>` for the recommended quant).
 - Daemon: `POST /v1/models/{id}/pull`, `GET /v1/models/pull/{job_id}`, and the
-  pull SSE endpoint.
+  pull SSE endpoint. `GET /v1/models/pulls` (operator-only) lists all
+  currently non-terminal jobs -- read-only, so a client that lost its
+  in-memory job list (e.g. the desktop shell after a daemon restart) can
+  rediscover in-flight downloads without re-triggering them.
 - Desktop: the Models page installs through the local daemon, never from the
   webview.
 
