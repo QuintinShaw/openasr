@@ -52,6 +52,14 @@ credits the people who built the original.
   bilingual, plus Chinese dialects; Conformer encoder + Transformer decoder
   attention-based encoder-decoder; original weights:
   <https://huggingface.co/FireRedTeam/FireRedASR2-AED>).
+- FireRedASR2-LLM (FireRedTeam, Apache-2.0) --
+  <https://huggingface.co/OpenASR/firered2-llm> (Mandarin + English bilingual;
+  Conformer encoder + adapter + Qwen2 LLM decoder; original weights:
+  <https://huggingface.co/FireRedTeam/FireRedASR2-LLM>).
+- MiMo-V2.5-ASR (Xiaomi MiMo team, MIT) --
+  <https://huggingface.co/OpenASR/mimo-v2.5-asr> (Mandarin Chinese, English,
+  and Cantonese; 1.2B RVQ tokenizer + 8B Qwen2 decoder; original weights:
+  <https://huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR>).
 - Qwen3-ForcedAligner 0.6B (Alibaba Qwen team, Apache-2.0) --
   <https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B> (optional word-level
   timestamp refinement via `--word-timestamps=aligned`; OpenASR pack staged,

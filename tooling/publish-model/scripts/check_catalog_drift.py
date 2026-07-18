@@ -44,6 +44,8 @@ FAMILY_DOC_KEYWORDS = {
     "wav2vec2": "wav2vec2",
     "sensevoice": "sensevoice",
     "firered-aed": "firered",
+    "firered2-llm": "fireredasr2-llm",
+    "mimo-asr": "mimo",
 }
 
 WORD_TO_NUMBER = {
@@ -60,6 +62,14 @@ WORD_TO_NUMBER = {
     "ten": 10,
     "eleven": 11,
     "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
 }
 
 # Matches phrasing like "eight model families" / "Eight native families" /

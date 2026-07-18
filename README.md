@@ -45,7 +45,7 @@ No terminal needed. Install the app, drop in an audio file, and get your transcr
 
 **Private.** Your audio never leaves your machine. No uploads, no cloud processing, no telemetry. The engine either produces a real transcript or tells you why it can't — it never silently reaches for the internet.
 
-**Broad.** 26 models across 11 families — Whisper, Qwen3-ASR, Parakeet, SenseVoice, FireRed, Dolphin, Moonshine, and more. Pick the one that fits your language and workload. All run through one binary on CPU and Apple Metal.
+**Broad.** 28 models across 13 families — Whisper, Qwen3-ASR, Parakeet, SenseVoice, FireRed, Dolphin, Moonshine, and more. Pick the one that fits your language and workload. All run through one binary on CPU and Apple Metal.
 
 **Open.** The engine is Apache-2.0. Models ship under their own permissive licenses. Every model download is verified against a signed catalog before it runs.
 
@@ -100,7 +100,7 @@ Requires Rust (pinned via `rust-toolchain.toml`), CMake, and a C/C++ toolchain. 
 
 ## Models
 
-26 models across 11 families, from tiny English-only models that run faster than real-time to large multilingual models covering 100+ languages. Browse them at [openasr.org/models](https://openasr.org/models/) or from the CLI:
+28 models across 13 families, from tiny English-only models that run faster than real-time to large multilingual models covering 100+ languages. Browse them at [openasr.org/models](https://openasr.org/models/) or from the CLI:
 
 ```bash
 openasr search            # browse available models

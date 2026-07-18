@@ -1,0 +1,10 @@
+id = "firered2-llm"
+default_variant = "published"
+display_name = "FireRedASR2 LLM (OpenASR pack)"
+languages = ["en", "zh"]
+size = "8b"
+license = "Apache-2.0"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/firered2-llm"
+
+[variant]
+quantization = "q4_k"

@@ -214,6 +214,12 @@ def build_catalog_model(model: str, entry: dict, args: argparse.Namespace) -> di
     registry_id = entry["registry_id"]
     hf_repo = read_resolved_repo(model, entry, args.hf_repo)
     hf_revision = read_hf_revision(model, args.hf_revision)
+    # min_cli_version resolution order: explicit --min-cli-version flag wins, then
+    # the per-model models-core.toml `min_cli_version` (so the version contract is
+    # captured in source and survives a plain regenerate), then the DEFAULT floor.
+    min_cli_version = (
+        args.min_cli_version or entry.get("min_cli_version") or DEFAULT_MIN_CLI_VERSION
+    )
     metrics = load_required_json(work_root(model) / "metrics.json")
     prose = read_prose(model)
     if args.public:
@@ -261,7 +267,7 @@ def build_catalog_model(model: str, entry: dict, args: argparse.Namespace) -> di
         "hf_repo": hf_repo,
         "hf_revision": hf_revision,
         "public": bool(args.public),
-        "min_cli_version": args.min_cli_version,
+        "min_cli_version": min_cli_version,
         "recommended_quant": recommended,
         "pull_recommended": f"{registry_id}:{recommended_suffix}",
         "prose": prose_block(prose),
@@ -364,7 +370,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--public", action="store_true")
     parser.add_argument("--public-namespace", default=DEFAULT_PUBLIC_NAMESPACE)
     parser.add_argument("--public-gate-timeout", type=float, default=60.0)
-    parser.add_argument("--min-cli-version", default=DEFAULT_MIN_CLI_VERSION)
+    parser.add_argument("--min-cli-version", default=None)
     parser.add_argument(
         "--catalog",
         type=Path,

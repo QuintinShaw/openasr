@@ -1,0 +1,10 @@
+id = "mimo-v2.5-asr"
+default_variant = "published"
+display_name = "MiMo-V2.5-ASR (OpenASR pack)"
+languages = ["en", "yue", "zh"]
+size = "8b"
+license = "MIT"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/mimo-v2.5-asr"
+
+[variant]
+quantization = "q4_k"

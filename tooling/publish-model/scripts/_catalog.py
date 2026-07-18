@@ -305,15 +305,15 @@ LANG_BY_FAMILY = {
     # FixedMultilingual { languages: &["zh", "en"] } in
     # ggml_family_adapter.rs / arch/mod.rs).
     "firered-aed": ["en", "zh"],
-    # NOTE: the firered2-llm and mimo-asr families are deliberately NOT listed
-    # here yet. They are staged private (public:false) for the 0.1.17 assembly,
-    # so their models-core.toml entries carry an EXPLICIT `languages` list
-    # instead (from each family's FixedMultilingual arch descriptor). Adding a
-    # family here grows len(LANG_BY_FAMILY), which the drift gate cross-checks
-    # against the user-facing "N model families" doc counts (README/ARCHITECTURE/
-    # FAQ) -- a public-count bump that belongs with the eventual --public flip
-    # and its copy pass, not this private-staging step. Add these two here (and
-    # bump the doc counts) when the models are flipped public.
+    # FireRedASR2-LLM: fixed bilingual Mandarin + English Qwen2 BPE vocab, no
+    # language-selection prompt token (FixedMultilingual { languages:
+    # &["zh", "en"] } arch descriptor).
+    "firered2-llm": ["en", "zh"],
+    # MiMo-V2.5-ASR: fixed Mandarin + English + Cantonese Qwen2 BPE vocab, no
+    # language-selection prompt token (FixedMultilingual { languages:
+    # &["zh", "en", "yue"] } arch descriptor). "yue" is a base ISO 639-3 code
+    # (Cantonese), not a dialect subtag.
+    "mimo-asr": ["en", "yue", "zh"],
 }
 
 # Per-family source-language parameter policy for the catalog's `language_mode`

@@ -11,14 +11,15 @@ runs native ggml-backed model packs offline.
 
 ## What native model families run today?
 
-Eleven, dispatched by a data-driven architecture registry (`arch/`): Whisper,
+Thirteen, dispatched by a data-driven architecture registry (`arch/`): Whisper,
 Cohere Transcribe, Qwen3-ASR, Parakeet-CTC, Parakeet-TDT (25 European
 languages), wav2vec2-CTC (incl. data2vec), Moonshine, Dolphin (Chinese
-dialects), SenseVoice (zh/yue/en/ja/ko), FireRedASR-AED (Mandarin + English
-bilingual), and X-ASR (Zipformer). They run local
-offline transcription on CPU and Metal lanes. See
-[Known Limitations](KNOWN_LIMITATIONS.md) for per-family streaming and
-word-timestamp support, and the per-model cards under
+dialects), SenseVoice (zh/yue/en/ja/ko), MiMo-V2.5-ASR (zh/en/yue; RVQ
+tokenizer + Qwen2 decoder), FireRedASR-AED (Mandarin + English bilingual),
+FireRedASR2-LLM (Mandarin + English bilingual; Encoder-Adapter-LLM), and
+X-ASR (Zipformer). They run local offline transcription on CPU and Metal
+lanes. See [Known Limitations](KNOWN_LIMITATIONS.md) for per-family
+streaming and word-timestamp support, and the per-model cards under
 [`model-registry/models/`](../model-registry/models/) for quant tiers.
 
 ## What backends are active right now?

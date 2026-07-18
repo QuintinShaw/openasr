@@ -606,10 +606,9 @@ min_core_version = "0.1.9"
 # Qwen2 BPE vocab with no language-selection prompt token (FixedMultilingual).
 # Only the q4_k pack ships: on Metal the fp16/q8_0 7B decoder OOMs this M1's
 # working-set ceiling (see the perf commit that guards it), and q4_k is the one
-# quant benchmarked at RTF < 1 on Metal. Staged to a PRIVATE HF repo; the
-# catalog entry stays public:false (published without --public) until a
-# deliberate later flip. min_core_version pinned to the 0.1.17 release that
-# first ships the runtime.
+# quant benchmarked at RTF < 1 on Metal. Published to a PUBLIC HF repo and
+# listed public in the 0.1.17 catalog flip. min_core_version / min_cli_version
+# pinned to the 0.1.17 release that first ships the runtime.
 ["firered2-llm"]
 family = "firered2-llm"
 hf_repo = "OpenASR/firered2-llm"
@@ -622,8 +621,8 @@ display_name = "FireRedASR2 LLM"
 license_name = "Apache-2.0"
 license_source = "https://huggingface.co/FireRedTeam/FireRedASR2-LLM"
 license_class = "permissive"
-# Explicit list (family not yet in LANG_BY_FAMILY -- staged private; see that
-# table's note). Bilingual Mandarin + English, mirroring the Qwen2 BPE decoder's
+# Explicit per-model list, kept in lockstep with LANG_BY_FAMILY["firered2-llm"]:
+# bilingual Mandarin + English, mirroring the Qwen2 BPE decoder's
 # FixedMultilingual { languages: &["zh", "en"] } arch descriptor.
 languages = ["en", "zh"]
 quants = ["q4_k"]
@@ -631,6 +630,7 @@ recommended_quant = "q4_k"
 sort_weight = 916
 upstream_release_date = "2026-02-12"
 min_core_version = "0.1.17"
+min_cli_version = "0.1.17"
 
 # MiMo-V2.5-ASR (Xiaomi MiMo-Audio-Tokenizer encoder + 8-level RVQ + input-local
 # transformer feeding a 36L Qwen2 decoder backbone). Its own runtime family/
@@ -640,9 +640,9 @@ min_core_version = "0.1.17"
 # `<chinese>`/`<english>` auto-emitted language markers before returning text.
 # Only the q4_k pack ships: the fp16/q8_0 packs OOM Metal's working-set ceiling
 # on this M1 (same class as firered2-llm above), and q4_k is the one quant
-# benchmarked at RTF < 1 on Metal. MIT-licensed upstream. Staged to a PRIVATE HF
-# repo; the catalog entry stays public:false until a deliberate later flip.
-# min_core_version pinned to the 0.1.17 release that first ships the runtime.
+# benchmarked at RTF < 1 on Metal. MIT-licensed upstream. Published to a PUBLIC
+# HF repo and listed public in the 0.1.17 catalog flip. min_core_version /
+# min_cli_version pinned to the 0.1.17 release that first ships the runtime.
 ["mimo-v2.5-asr"]
 family = "mimo-asr"
 hf_repo = "OpenASR/mimo-v2.5-asr"
@@ -655,14 +655,16 @@ display_name = "MiMo-V2.5-ASR"
 license_name = "MIT"
 license_source = "https://huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR/blob/main/README.md"
 license_class = "permissive"
-# Explicit list (family not yet in LANG_BY_FAMILY -- staged private; see that
-# table's note). Mandarin + English + Cantonese, mirroring the Qwen2 BPE
-# decoder's FixedMultilingual { languages: &["zh", "en", "yue"] } arch
-# descriptor. "yue" is a base ISO 639-3 code (Cantonese), not a dialect subtag.
+# Explicit per-model list, kept in lockstep with LANG_BY_FAMILY["mimo-asr"]:
+# Mandarin + English + Cantonese, mirroring the Qwen2 BPE decoder's
+# FixedMultilingual { languages: &["zh", "en", "yue"] } arch descriptor. "yue"
+# is a base ISO 639-3 code (Cantonese), not a dialect subtag.
 languages = ["en", "yue", "zh"]
 quants = ["q4_k"]
 recommended_quant = "q4_k"
 sort_weight = 914
+min_core_version = "0.1.17"
+min_cli_version = "0.1.17"
 
 # Qwen3-ForcedAligner-0.6B: a capability pack for the `word-timestamps`
 # feature (`--word-timestamps=aligned`), mirroring the wespeaker/pyannote
