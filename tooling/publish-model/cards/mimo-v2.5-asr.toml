@@ -1,0 +1,24 @@
+# Per-model card prose for openasr/mimo-v2.5-asr.
+#
+# PLACEHOLDER: every user-facing marketing string below is intentionally set to
+# "TODO-COPY". Final prose (tagline/highlights/intro/acknowledgement, and any
+# zh-CN locale block) is authored separately and must not be drafted here. Fill
+# these in before the model is flipped public (--public requires a non-empty
+# tagline + intro; see _manifest.validate_public_prose). Keep every factual
+# claim to what the upstream XiaomiMiMo/MiMo-V2.5-ASR (and
+# XiaomiMiMo/MiMo-Audio-Tokenizer) model cards actually state; the upstream
+# license is MIT.
+
+tagline = "TODO-COPY"
+
+highlights = [
+  "TODO-COPY",
+]
+
+intro = """
+TODO-COPY
+"""
+
+acknowledgement = """
+TODO-COPY
+"""

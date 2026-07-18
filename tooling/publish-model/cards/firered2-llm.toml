@@ -1,0 +1,25 @@
+# Per-model card prose for openasr/firered2-llm.
+#
+# PLACEHOLDER: every user-facing marketing string below is intentionally set to
+# "TODO-COPY". Final prose (tagline/highlights/intro/acknowledgement, and any
+# zh-CN locale block) is authored separately and must not be drafted here. Fill
+# these in before the model is flipped public (--public requires a non-empty
+# tagline + intro; see _manifest.validate_public_prose). Keep every factual
+# claim to what the upstream FireRedTeam/FireRedASR2-LLM model card and the
+# FireRedASR2S technical report (arXiv:2603.10420) actually state; do not
+# conflate FireRedASR2-LLM's numbers with the smaller AED member
+# (firered-aed-l-v2), a different, smaller model.
+
+tagline = "TODO-COPY"
+
+highlights = [
+  "TODO-COPY",
+]
+
+intro = """
+TODO-COPY
+"""
+
+acknowledgement = """
+TODO-COPY
+"""

@@ -305,6 +305,15 @@ LANG_BY_FAMILY = {
     # FixedMultilingual { languages: &["zh", "en"] } in
     # ggml_family_adapter.rs / arch/mod.rs).
     "firered-aed": ["en", "zh"],
+    # NOTE: the firered2-llm and mimo-asr families are deliberately NOT listed
+    # here yet. They are staged private (public:false) for the 0.1.17 assembly,
+    # so their models-core.toml entries carry an EXPLICIT `languages` list
+    # instead (from each family's FixedMultilingual arch descriptor). Adding a
+    # family here grows len(LANG_BY_FAMILY), which the drift gate cross-checks
+    # against the user-facing "N model families" doc counts (README/ARCHITECTURE/
+    # FAQ) -- a public-count bump that belongs with the eventual --public flip
+    # and its copy pass, not this private-staging step. Add these two here (and
+    # bump the doc counts) when the models are flipped public.
 }
 
 # Per-family source-language parameter policy for the catalog's `language_mode`
@@ -351,6 +360,12 @@ LANGUAGE_MODE_BY_FAMILY = {
     # FireRedASR-AED: FixedMultilingual -- fixed zh+en char/SPM vocab, no
     # per-request language selection or decode-time LID token at all.
     "firered-aed": "fixed_multilingual",
+    # FireRedASR2-LLM / MiMo-V2.5-ASR: FixedMultilingual -- the Qwen2 BPE decoder
+    # has no language-selection prompt token and no decode-time LID token, so
+    # neither exposes a per-request source-language axis (mirrors the
+    # FixedMultilingual LanguageFamilyHint on both arch descriptors).
+    "firered2-llm": "fixed_multilingual",
+    "mimo-asr": "fixed_multilingual",
 }
 
 # SpecifyOnly's conditioned default, mirroring the `default_language` literal
@@ -469,6 +484,13 @@ PUNCTUATION_BY_FAMILY = {
     # corpora), so the raw decode is honestly punctuation-free (verified on
     # the golden-diff fixture transcript).
     "firered-aed": False,
+    # firered2-llm / mimo-asr: their Qwen2 ChatML decode is a plain
+    # transcription completion with no characterized punctuation-suppression
+    # behavior yet (arch descriptors declare emits_punctuation: None -- see
+    # arch/mod.rs). None means "unclaimed": the catalog omits the field rather
+    # than assert an unverified True/False (mirrors Option<bool>::None).
+    "firered2-llm": None,
+    "mimo-asr": None,
 }
 
 
@@ -485,13 +507,19 @@ def punctuation_for_model(entry: dict) -> dict:
         return {}
 
     family = entry["family"]
-    emits_punctuation = PUNCTUATION_BY_FAMILY.get(family)
-    if emits_punctuation is None:
+    if family not in PUNCTUATION_BY_FAMILY:
         known = ", ".join(sorted(PUNCTUATION_BY_FAMILY))
         raise KeyError(
             f"model '{entry.get('id', '?')}' family '{family}' has no emits_punctuation "
             f"mapping. Known families: {known}"
         )
+    emits_punctuation = PUNCTUATION_BY_FAMILY[family]
+    # A mapped None mirrors the arch descriptor's Option<bool>::None ("this
+    # family's punctuation behavior is unclaimed"): omit the catalog field
+    # entirely rather than assert an unverified value. Distinct from an ABSENT
+    # family, which is a typo/onboarding gap and still fails loudly above.
+    if emits_punctuation is None:
+        return {}
     return {"emits_punctuation": emits_punctuation}
 
 

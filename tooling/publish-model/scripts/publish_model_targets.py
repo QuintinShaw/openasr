@@ -73,6 +73,8 @@ RELEASE_LANE_MODELS = (
     "firered-aed-l-v2",
     "qwen3-forced-aligner-0.6b",
     "firered-punc",
+    "firered2-llm",
+    "mimo-v2.5-asr",
 )
 GGUF_GENERAL_ARCHITECTURE_KEY = b"general.architecture"
 

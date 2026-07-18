@@ -180,6 +180,40 @@ upstream_repo = "FireRedTeam/FireRedASR2-AED"
 source_revision = "2304afed56eacfee6256dee5937ed22ffa0b64ec"
 needs_license_flags = false
 
+# FireRedASR2-LLM: imported via the public `openasr model-pack import
+# firered-llm` subcommand (import_firered_llm_local_command in
+# model_pack_cli.rs), from a LoRA-merged Qwen2-7B-Instruct safetensors
+# (firered_llm_merge_lora.py) + cmvn.txt (firered_llm_cmvn_ark_to_txt.py) + the
+# conformer encoder safetensors. Like the firered-aed/dolphin importers it bakes
+# license metadata from models-core rather than taking CLI license flags
+# (needs_license_flags = false). source_revision left at the branch tip:
+# upstream FireRedASR2-LLM publishes no pinned release tag, mirroring how
+# qwen3-forced-aligner tracks "main".
+["firered2-llm"]
+import_subcommand = "import firered-llm"
+upstream_repo = "FireRedTeam/FireRedASR2-LLM"
+source_revision = "main"
+needs_license_flags = false
+
+# MiMo-V2.5-ASR: NOT wired to a public `openasr model-pack import` subcommand.
+# It is converted by the standalone tooling/mimo-asr/convert_mimo_asr.py script
+# (two source repos: XiaomiMiMo/MiMo-V2.5-ASR main model + the
+# XiaomiMiMo/MiMo-Audio-Tokenizer encoder), same "converted outside publish.sh's
+# import step" situation as qwen3-forced-aligner-0.6b. The publish pipeline
+# therefore cannot run its import step for this model; the pack's result sidecar
+# (sha256/size) is instead recorded via materialize_result_sidecars.py against
+# the already-built .oasr, and metrics.json is materialized from the recorded
+# bench run -- both feeding _manifest.py exactly as an imported model's would.
+# import_subcommand is descriptive only (render_card.py's card prose is the sole
+# consumer); no publish helper executes it. upstream_repo names the main model
+# (its owner becomes the catalog `vendor`); the audio-tokenizer repo is a
+# build-time dependency of the converter, not a separate publish target.
+["mimo-v2.5-asr"]
+import_subcommand = "convert via tooling/mimo-asr/convert_mimo_asr.py (no model-pack import subcommand)"
+upstream_repo = "XiaomiMiMo/MiMo-V2.5-ASR"
+source_revision = "main"
+needs_license_flags = false
+
 # Qwen3-ForcedAligner-0.6B: shares its thinker (audio encoder + LM) tensor
 # layout byte-for-byte with qwen3-asr (see
 # crates/openasr-core/src/models/qwen/forced_aligner_import.rs); only the
