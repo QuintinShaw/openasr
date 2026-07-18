@@ -35,7 +35,26 @@ pub(crate) struct PullJobSnapshot {
     pub(crate) last_progress_at_unix_millis: Option<u128>,
     #[serde(skip)]
     pub(crate) last_bytes_done: Option<u64>,
+    /// Exponential-moving-average of `speed_bps` (bytes/sec), carried across
+    /// `Downloading` progress ticks. The instantaneous delta-bytes/delta-time
+    /// speed is jittery -- persistence happens on an irregular cadence (byte
+    /// threshold OR time threshold, whichever fires first), so consecutive
+    /// sample windows vary widely in length and a single noisy window can
+    /// swing the raw speed by a large factor. Smoothing here (rather than
+    /// only in the frontend) means every consumer of the snapshot -- HTTP
+    /// poll, SSE stream, persisted-to-disk state -- sees the same stable
+    /// number. Not serialized: it is reconstructible from history and is
+    /// process-local smoothing state, not job identity.
+    #[serde(skip)]
+    pub(crate) smoothed_speed_bps: Option<u64>,
 }
+
+/// EMA weight applied to each new instantaneous speed sample. Lower = smoother
+/// but slower to track real speed changes. Chosen below the frontend's
+/// SPEED_EMA_ALPHA (0.35) since the server smooths first: stacking two EMAs at
+/// the same weight would double-lag without adding stability, and the server
+/// output is what SSE/poll clients and the frontend build on.
+const PULL_PROGRESS_SPEED_EMA_ALPHA: f64 = 0.25;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PullJobResolvedSpec {
@@ -126,6 +145,7 @@ impl PullJobSnapshot {
             control_requested: None,
             last_progress_at_unix_millis: None,
             last_bytes_done: None,
+            smoothed_speed_bps: None,
         }
     }
 
@@ -153,16 +173,18 @@ impl PullJobSnapshot {
             control_requested: None,
             last_progress_at_unix_millis: None,
             last_bytes_done: None,
+            smoothed_speed_bps: None,
         }
     }
 
-    fn apply_progress(&mut self, progress: PullProgress) {
+    pub(crate) fn apply_progress(&mut self, progress: PullProgress) {
         match progress {
             PullProgress::UsingInstalled { path } => {
                 self.state = PullJobState::AlreadyInstalled;
                 self.control_requested = None;
                 self.bytes_done = self.bytes_total;
                 self.speed_bps = None;
+                self.smoothed_speed_bps = None;
                 self.eta_s = Some(0);
                 self.installed_path = Some(path);
             }
@@ -175,6 +197,7 @@ impl PullJobSnapshot {
                 self.bytes_total = bytes_total;
                 self.bytes_done = resume_from;
                 self.speed_bps = None;
+                self.smoothed_speed_bps = None;
                 self.eta_s = None;
                 self.last_progress_at_unix_millis = Some(unix_millis_now());
                 self.last_bytes_done = Some(resume_from);
@@ -190,9 +213,20 @@ impl PullJobSnapshot {
                     let elapsed_ms = now.saturating_sub(last_at);
                     let delta_bytes = bytes_done.saturating_sub(last_bytes);
                     if elapsed_ms > 0 && delta_bytes > 0 {
-                        let speed = ((delta_bytes as u128) * 1000 / elapsed_ms) as u64;
-                        self.speed_bps = Some(speed);
-                        self.eta_s = eta_seconds(bytes_done, bytes_total, speed);
+                        let instant_speed = ((delta_bytes as u128) * 1000 / elapsed_ms) as u64;
+                        let smoothed = match self.smoothed_speed_bps {
+                            // First sample: no prior average to blend with, so
+                            // seed the EMA directly rather than starting from
+                            // zero (which would otherwise bias the first few
+                            // displayed speeds low).
+                            None => instant_speed,
+                            Some(prev) => {
+                                ema_blend(instant_speed, prev, PULL_PROGRESS_SPEED_EMA_ALPHA)
+                            }
+                        };
+                        self.smoothed_speed_bps = Some(smoothed);
+                        self.speed_bps = Some(smoothed);
+                        self.eta_s = eta_seconds(bytes_done, bytes_total, smoothed);
                     }
                 }
                 self.state = PullJobState::Downloading;
@@ -207,6 +241,7 @@ impl PullJobSnapshot {
                 self.control_requested = None;
                 self.bytes_done = bytes_done.min(self.bytes_total);
                 self.speed_bps = None;
+                self.smoothed_speed_bps = None;
                 self.eta_s = Some(0);
             }
             PullProgress::Installed { path } => {
@@ -214,6 +249,7 @@ impl PullJobSnapshot {
                 self.control_requested = None;
                 self.bytes_done = self.bytes_total;
                 self.speed_bps = None;
+                self.smoothed_speed_bps = None;
                 self.eta_s = Some(0);
                 self.installed_path = Some(path);
             }
@@ -233,6 +269,17 @@ pub(crate) fn unix_seconds_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+/// Blend a new instantaneous sample into a running average:
+/// `alpha * instant + (1 - alpha) * prev`. `alpha` in `[0, 1]`; higher tracks
+/// the instantaneous value more closely, lower smooths harder. Kept as a
+/// standalone `u64` helper (rather than inlined) so the blending arithmetic
+/// has one place to reason about rounding/precision and is directly
+/// unit-testable independent of `apply_progress`'s state threading.
+pub(crate) fn ema_blend(instant: u64, prev: u64, alpha: f64) -> u64 {
+    let blended = alpha * instant as f64 + (1.0 - alpha) * prev as f64;
+    blended.round().max(0.0) as u64
 }
 
 pub(crate) fn eta_seconds(bytes_done: u64, bytes_total: u64, speed_bps: u64) -> Option<u64> {

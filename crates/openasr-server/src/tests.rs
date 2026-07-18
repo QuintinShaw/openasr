@@ -1774,6 +1774,95 @@ fn eta_seconds_rounds_up_remaining_download_time() {
 }
 
 #[test]
+fn pull_progress_speed_is_smoothed_across_jittery_samples() {
+    // Persistence fires on "累计 >=8MB OR distance >=1s from last point, first
+    // to trigger", so consecutive sample windows vary widely in duration and
+    // byte count even for a steady underlying transfer rate. That variance
+    // alone makes the raw delta-bytes/delta-time speed swing wildly between
+    // ticks. This drives `apply_progress` through such a jittery sequence and
+    // asserts the EMA-smoothed `speed_bps` the snapshot exposes has much
+    // lower variance than the instantaneous speed each tick implies.
+    let resolved = resolved_pull_fixture();
+    let bytes_total = 200 * 1024 * 1024;
+    let mut snapshot = PullJobSnapshot::queued("pull-smooth-test".to_string(), &resolved, None);
+    snapshot.apply_progress(PullProgress::DownloadStarted {
+        bytes_total,
+        resume_from: 0,
+    });
+
+    // (elapsed_ms, delta_bytes) ticks: a download effectively steady around
+    // ~10 MB/s, but sampled on an irregular cadence so short/low-delta and
+    // long/high-delta windows alternate -- exactly what production jitter
+    // looks like.
+    let ticks: &[(u128, u64)] = &[
+        (1000, 10 * 1024 * 1024),
+        (100, 500 * 1024),
+        (2000, 30 * 1024 * 1024),
+        (200, 4 * 1024 * 1024),
+        (1500, 12 * 1024 * 1024),
+        (50, 100 * 1024),
+        (1000, 11 * 1024 * 1024),
+        (2500, 20 * 1024 * 1024),
+    ];
+
+    let mut bytes_done = 0_u64;
+    let mut instant_speeds = Vec::new();
+    let mut smoothed_speeds = Vec::new();
+
+    for &(elapsed_ms, delta_bytes) in ticks {
+        bytes_done += delta_bytes;
+        // Back-date the last-progress timestamp so `apply_progress` (which
+        // stamps "now" internally) observes the simulated elapsed time,
+        // without needing a real sleep.
+        let now = unix_millis_now();
+        snapshot.last_progress_at_unix_millis = Some(now.saturating_sub(elapsed_ms));
+        instant_speeds.push(((delta_bytes as u128) * 1000 / elapsed_ms) as u64);
+        snapshot.apply_progress(PullProgress::Downloading {
+            bytes_done,
+            bytes_total,
+        });
+        smoothed_speeds.push(
+            snapshot
+                .speed_bps
+                .expect("speed_bps should be set after a progress tick"),
+        );
+    }
+
+    fn variance(values: &[u64]) -> f64 {
+        let mean = values.iter().sum::<u64>() as f64 / values.len() as f64;
+        values
+            .iter()
+            .map(|&value| {
+                let diff = value as f64 - mean;
+                diff * diff
+            })
+            .sum::<f64>()
+            / values.len() as f64
+    }
+
+    let instant_variance = variance(&instant_speeds);
+    let smoothed_variance = variance(&smoothed_speeds);
+    assert!(
+        smoothed_variance < instant_variance * 0.5,
+        "expected EMA-smoothed speed variance ({smoothed_variance}) to be well below \
+         instantaneous speed variance ({instant_variance}); instant={instant_speeds:?} \
+         smoothed={smoothed_speeds:?}"
+    );
+}
+
+#[test]
+fn ema_blend_seeds_from_instant_and_decays_toward_new_samples() {
+    // alpha weight applied to the new sample: blend should sit strictly
+    // between prev and instant for a mid-range alpha, and hit the endpoints
+    // for alpha = 0.0 / 1.0.
+    assert_eq!(ema_blend(100, 200, 0.0), 200); // alpha=0: ignore new sample
+    assert_eq!(ema_blend(100, 200, 1.0), 100); // alpha=1: ignore history
+    let blended = ema_blend(100, 200, 0.25);
+    assert_eq!(blended, 175); // 0.25*100 + 0.75*200 = 175
+    assert!(blended > 100 && blended < 200);
+}
+
+#[test]
 fn pull_progress_persistence_is_throttled_between_boundaries() {
     let mut last_bytes = 0;
     let mut last_at = Instant::now();
