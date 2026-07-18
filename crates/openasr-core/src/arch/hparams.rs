@@ -243,6 +243,61 @@ pub(crate) static FIRERED_LLM_HPARAM_SCHEMA: &[&str] = &[
     "firered_llm.llm.speech_token_id",
 ];
 
+// ── mimo-asr (XiaomiMiMo/MiMo-V2.5-ASR + MiMo-Audio-Tokenizer) hparam schema ─
+// Keys mirror `models::mimo_asr::runtime_contract`'s parsers. Deliberately
+// checks only the top-level presence gate (block counts + special-token ids);
+// the parsers themselves enforce the finer cross-field invariants (skip_layer_id
+// range, qkv_bias/qk_norm shape, head_dim*n_heads==d_model, ...).
+pub(crate) static MIMO_ASR_HPARAM_SCHEMA: &[&str] = &[
+    "mimo.llm.block_count",
+    "mimo.llm.embedding_length",
+    "mimo.llm.attention.head_count",
+    "mimo.llm.attention.head_count_kv",
+    "mimo.llm.attention.key_length",
+    "mimo.llm.feed_forward_length",
+    "mimo.llm.vocab_size",
+    "mimo.llm.context_length",
+    "mimo.llm.attention.layer_norm_rms_epsilon",
+    "mimo.llm.rope.freq_base",
+    "mimo.llm.attention.qkv_bias",
+    "mimo.llm.attention.qk_norm",
+    "mimo.audio.channels",
+    "mimo.audio.group_size",
+    "mimo.inlocal.block_count",
+    "mimo.inlocal.embedding_length",
+    "mimo.inlocal.attention.head_count",
+    "mimo.inlocal.attention.head_dim",
+    "mimo.inlocal.feed_forward_length",
+    "mimo.inlocal.full_attention",
+    "mimo.inlocal.rope.freq_base",
+    "mimo.tok.block_count",
+    "mimo.tok.embedding_length",
+    "mimo.tok.attention.head_count",
+    "mimo.tok.feed_forward_length",
+    "mimo.tok.encoder.skip_layer_id",
+    "mimo.tok.conv.kernel_size",
+    "mimo.tok.conv1.stride",
+    "mimo.tok.conv2.stride",
+    "mimo.tok.down_sample.stride",
+    "mimo.tok.rope.freq_base",
+    "mimo.tok.rvq.num_quantizers_packed",
+    "mimo.tok.rvq.codebook_sizes",
+    "mimo.mel.sample_rate",
+    "mimo.mel.n_fft",
+    "mimo.mel.hop_length",
+    "mimo.mel.win_length",
+    "mimo.mel.n_mels",
+    "mimo.mel.log_clip",
+    "mimo.special.eos_id",
+    "mimo.special.im_start_id",
+    "mimo.special.im_end_id",
+    "mimo.special.sosp_id",
+    "mimo.special.eosp_id",
+    "mimo.special.empty_id",
+    "mimo.special.eot_id",
+    "mimo.special.eostm_id",
+];
+
 // ── wav2vec2-ctc (facebook/wav2vec2-base-960h) hparam schema ─────────────────
 pub(crate) static WAV2VEC2_CTC_HPARAM_SCHEMA: &[&str] = &[
     "wav2vec2.n_layers",

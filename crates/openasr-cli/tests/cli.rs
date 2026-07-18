@@ -721,6 +721,97 @@ fn firered_llm_golden_diff_longform_cli_transcribe_matches_reference_decode() {
     );
 }
 
+// MiMo-V2.5-ASR P2.2: the only golden case that needs the FULL longform/
+// auto-VAD slicing orchestrator (input >60s, over this family's upstream
+// single-utterance cap), so unlike the family's other golden_diff cases
+// (`mimo_asr::executor::tests`, which call the low-level
+// `MimoAsrGgmlExecutor` directly and can't exercise longform), this one
+// drives the real `openasr` binary -- the actual user-facing path. Mirrors
+// firered-llm's identical `firered_llm_golden_diff_longform_cli_transcribe_
+// matches_reference_decode` test (same `longform_en_zh.wav` fixture: 5
+// concatenated jfk.wav/zh_sample.wav clips, EN/ZH/EN/ZH/EN, ~69s, built
+// purely from this repo's own already-committed fixtures, no new audio
+// content). Pinned against `OPENASR_GGML_BACKEND=cpu` (Metal memory fit for
+// this family's ~8B combined weights on a 16GB unified-memory Mac is
+// unverified, see this module's e2e report).
+fn mimo_asr_dev_pack_path() -> PathBuf {
+    PathBuf::from(
+        "/Volumes/QuintinDocument/openasr-dev/tmp-weights/mimo/out/mimo-v2.5-asr-q8_0.oasr",
+    )
+}
+
+// The auto energy-VAD slicer picked 3 chunks for this ~69s fixture (same
+// chunk count firered-llm's own longform golden found for the identical
+// fixture). Each chunk decodes independently and, like every transcript from
+// this family, leads with the model's auto `<chinese>`/`<english>` language
+// marker -- which the runtime now strips per-utterance to match the reference
+// `mimo_audio.py::asr_sft` (see `strip_mimo_language_tags`), so no `<chinese>`
+// survives into the assembled longform text. All 5 source segments
+// (EN/ZH/EN/ZH/EN) are present, in order, with no dropped audio; the assembler
+// joins the (already tag-stripped, trimmed) chunk texts with a single space
+// (`longform::assembler` `.join(" ")`), so the two chunk seams surface as a
+// join space -- and the first seam additionally shows a single duplicated "我"
+// (the VAD overlap re-transcribing the boundary word), the same class of seam
+// artifact firered-llm's own longform golden documents.
+//
+// `concat!` keeps the literal robust to line wrapping: a trailing-`\`
+// continuation eats leading whitespace on the next line, which silently
+// dropped a significant space at the "我 我通常" seam in this const's first
+// (buggy) form.
+//
+// Confirmed byte-for-byte against a clean-window re-run of this test against
+// the real pack (asserted equal below).
+const GOLDEN_MIMO_LONGFORM_EN_ZH_TEXT: &str = concat!(
+    "And so, my fellow Americans, ask not what your country can do for you. ",
+    "Ask what you can do for your country.",
+    "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，",
+    "听说那里的麻婆豆腐特别正宗。周末的时候，我 我通常会读书或者看一部电影放松一下。",
+    "And so, my fellow Americans, ask not what your country can do for you, ",
+    "ask what you can do for your country.",
+    "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，",
+    "听说那里的麻婆豆腐特别正宗。 ",
+    "周末的时候，我通常会读书或者看一部电影放松一下。",
+    "And so, my fellow Americans, ask not what your country can do for you. ",
+    "Ask what you can do for your country.",
+);
+
+#[test]
+#[ignore = "requires the private ~9.6GB dev-only mimo-v2.5-asr-q8_0.oasr pack; runs the real \
+            longform-chunked CLI transcribe path on a ~69s fixture, OPENASR_GGML_BACKEND=cpu \
+            (~38 minutes wall clock at this family's current CPU-decode RTF -- 3 chunk \
+            decodes, see this test's doc comment)"]
+fn mimo_asr_golden_diff_longform_cli_transcribe_matches_reference_decode() {
+    let pack_path = mimo_asr_dev_pack_path();
+    if !pack_path.exists() {
+        eprintln!("skipping: {} not present", pack_path.display());
+        return;
+    }
+    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/longform_en_zh.wav")
+        .canonicalize()
+        .expect("longform_en_zh.wav fixture must exist");
+
+    let assert = openasr()
+        .env("OPENASR_GGML_BACKEND", "cpu")
+        .args([
+            "transcribe",
+            &input.display().to_string(),
+            "--model-pack",
+            &pack_path.display().to_string(),
+            "--format",
+            "text",
+        ])
+        .assert()
+        .success();
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    eprintln!("mimo-asr longform CLI transcript: {output:?}");
+    assert_eq!(
+        output.trim_end(),
+        GOLDEN_MIMO_LONGFORM_EN_ZH_TEXT,
+        "unexpected longform CLI transcript"
+    );
+}
+
 #[test]
 fn transcribe_native_requires_local_model_pack_path() {
     let input = temp_input_wav();

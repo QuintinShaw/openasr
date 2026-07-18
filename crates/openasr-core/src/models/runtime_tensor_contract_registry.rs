@@ -72,6 +72,7 @@ pub(crate) enum DedicatedRuntimeTensorContractFamily {
     SenseVoice,
     FireRedAed,
     FireRedLlm,
+    MimoAsr,
 }
 
 impl DedicatedRuntimeTensorContractFamily {
@@ -85,6 +86,7 @@ impl DedicatedRuntimeTensorContractFamily {
             Self::SenseVoice => "sensevoice",
             Self::FireRedAed => "firered-aed",
             Self::FireRedLlm => "firered-llm",
+            Self::MimoAsr => "mimo-asr",
         }
     }
 }
@@ -251,6 +253,9 @@ fn dedicated_runtime_tensor_contract_family(
         }
         crate::arch::FIRERED_LLM_RUNTIME_TENSOR_CONTRACT_ID => {
             Some(DedicatedRuntimeTensorContractFamily::FireRedLlm)
+        }
+        crate::arch::MIMO_ASR_RUNTIME_TENSOR_CONTRACT_ID => {
+            Some(DedicatedRuntimeTensorContractFamily::MimoAsr)
         }
         _ => None,
     }

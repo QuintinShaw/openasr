@@ -20,10 +20,11 @@ use block_stack::{
 use hparams::{
     COHERE_TRANSCRIBE_DECODER_LAYERS_KEY, COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY,
     COHERE_TRANSCRIBE_HPARAM_SCHEMA, DOLPHIN_HPARAM_SCHEMA, FIRERED_AED_HPARAM_SCHEMA,
-    FIRERED_LLM_HPARAM_SCHEMA, MOONSHINE_HPARAM_SCHEMA, PARAKEET_CTC_HPARAM_SCHEMA,
-    PARAKEET_TDT_HPARAM_SCHEMA, QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA,
-    QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY, SENSEVOICE_HPARAM_SCHEMA,
-    WAV2VEC2_CTC_HPARAM_SCHEMA, WHISPER_HPARAM_SCHEMA, XASR_ZIPFORMER_HPARAM_SCHEMA,
+    FIRERED_LLM_HPARAM_SCHEMA, MIMO_ASR_HPARAM_SCHEMA, MOONSHINE_HPARAM_SCHEMA,
+    PARAKEET_CTC_HPARAM_SCHEMA, PARAKEET_TDT_HPARAM_SCHEMA, QWEN3_ARCHITECTURE_VALUE,
+    QWEN3_ASR_HPARAM_SCHEMA, QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY,
+    SENSEVOICE_HPARAM_SCHEMA, WAV2VEC2_CTC_HPARAM_SCHEMA, WHISPER_HPARAM_SCHEMA,
+    XASR_ZIPFORMER_HPARAM_SCHEMA,
 };
 
 pub(crate) const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
@@ -169,6 +170,21 @@ pub(crate) const FIRERED_LLM_TOKENIZER_ID: &str = "firered-llm.qwen2-bpe.v0";
 pub(crate) const FIRERED_LLM_DECODE_POLICY_ID: &str = "firered-llm.greedy.seq2seq.v0";
 pub(crate) const FIRERED_LLM_RUNTIME_TENSOR_CONTRACT_ID: &str = "firered-llm.runtime-tensors.v0";
 pub(crate) const FIRERED_LLM_EXECUTOR_COMPONENT_ID: &str = "firered-llm.ggml-executor.v0";
+
+// mimo-asr (XiaomiMiMo/MiMo-V2.5-ASR + XiaomiMiMo/MiMo-Audio-Tokenizer: a 32L
+// rope audio-tokenizer encoder + RVQ encode + 6L bidirectional input-local
+// transformer feeding a 36L Qwen2 backbone, MIT). Every stage (skip@L3 conv
+// stem, RVQ residual quantization, per-group input-local batching) is
+// family-specific, so like firered-aed/firered-llm it stays on a
+// hand-written dedicated executor (block_stack: None).
+pub(crate) const MIMO_ASR_GGML_ARCHITECTURE_ID: &str = "mimo-asr";
+pub(crate) const MIMO_ASR_GGML_ADAPTER_ID: &str = "ggml-family-mimo-asr-runtime-v1";
+pub(crate) const MIMO_ASR_MODEL_FAMILY: &str = "mimo-asr";
+pub(crate) const MIMO_ASR_AUDIO_FRONTEND_ID: &str = "mimo-tokenizer-rvq-v0";
+pub(crate) const MIMO_ASR_TOKENIZER_ID: &str = "mimo-asr.gpt2-bpe.v0";
+pub(crate) const MIMO_ASR_DECODE_POLICY_ID: &str = "mimo-asr.greedy.seq2seq.v0";
+pub(crate) const MIMO_ASR_RUNTIME_TENSOR_CONTRACT_ID: &str = "mimo-asr.runtime-tensors.v0";
+pub(crate) const MIMO_ASR_EXECUTOR_COMPONENT_ID: &str = "mimo-asr.ggml-executor.v0";
 
 // hymt2 (Tencent Hunyuan-MT2 subtitle translation, hunyuan-dense decoder-only
 // LLM). An auxiliary text-to-text family, NOT an ASR architecture: it is
@@ -995,6 +1011,26 @@ const BUILTIN_COMPONENT_DESCRIPTORS: &[OpenAsrComponentDescriptor] = &[
         kind: OpenAsrComponentKind::Executor,
         id: FIRERED_LLM_EXECUTOR_COMPONENT_ID,
     },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
+        id: MIMO_ASR_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: MIMO_ASR_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: MIMO_ASR_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: MIMO_ASR_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: MIMO_ASR_EXECUTOR_COMPONENT_ID,
+    },
 ];
 
 const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
@@ -1468,6 +1504,43 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
         },
     },
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &[MIMO_ASR_GGML_ARCHITECTURE_ID],
+        model_family: MIMO_ASR_MODEL_FAMILY,
+        model_architecture: MIMO_ASR_GGML_ARCHITECTURE_ID,
+        adapter_id: MIMO_ASR_GGML_ADAPTER_ID,
+        // No language-selection prompt token and no decode-time detection:
+        // the Qwen2 BPE vocab covers the upstream's trained languages
+        // (Mandarin, English, Cantonese + regional dialects per its README).
+        language_family_hint: LanguageFamilyHint::FixedMultilingual {
+            languages: &["zh", "en", "yue"],
+        },
+        audio_frontend_id: MIMO_ASR_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: MIMO_ASR_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: MIMO_ASR_TOKENIZER_ID,
+        decode_policy_id: MIMO_ASR_DECODE_POLICY_ID,
+        executor_component_id: MIMO_ASR_EXECUTOR_COMPONENT_ID,
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        auto_gpu_enabled: true,
+        self_diarizes: false,
+        // No characterized punctuation behavior for this family yet (unlike
+        // firered-aed's punctuation-free vocab) -- leave unclaimed rather
+        // than assert an unverified capability.
+        emits_punctuation: None,
+        hparam_schema: MIMO_ASR_HPARAM_SCHEMA,
+        // Audio-tokenizer encoder + RVQ + input-local + Qwen2 decode all stay
+        // on the dedicated executor (none of these stages is a composer
+        // block kind), so no data-driven block-stack descriptor.
+        block_stack: None,
+        // The 32L rope audio-tokenizer encoder is full self-attention over
+        // the whole chunk: quadratic in chunk length. The executor's own
+        // 30s-per-chunk hard cap (mirroring the reference `preprocess_input`'s
+        // 30s re-chunking) keeps this well inside the shared default.
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+            max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
+        },
+    },
 ];
 
 #[cfg(test)]
@@ -1504,6 +1577,7 @@ mod tests {
             (SENSEVOICE_GGML_ARCHITECTURE_ID, false, Some(true)),
             (FIRERED_AED_GGML_ARCHITECTURE_ID, false, Some(false)),
             (FIRERED_LLM_GGML_ARCHITECTURE_ID, false, None),
+            (MIMO_ASR_GGML_ARCHITECTURE_ID, false, None),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
         let mut seen = std::collections::BTreeSet::new();
@@ -1561,6 +1635,7 @@ mod tests {
             (SENSEVOICE_GGML_ARCHITECTURE_ID, true),
             (FIRERED_AED_GGML_ARCHITECTURE_ID, true),
             (FIRERED_LLM_GGML_ARCHITECTURE_ID, true),
+            (MIMO_ASR_GGML_ARCHITECTURE_ID, true),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
         let mut seen = std::collections::BTreeSet::new();
@@ -1664,6 +1739,12 @@ mod tests {
             ),
             (
                 FIRERED_LLM_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                    max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
+                },
+            ),
+            (
+                MIMO_ASR_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                     max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                 },
