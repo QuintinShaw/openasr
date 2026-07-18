@@ -55,10 +55,21 @@ impl DownloadSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum DownloadSourcePref {
+    /// Region-aware chain, region judged locally by [`locale_prefers_china_sources`]
+    /// (CLI/server without a desktop front end -- there is no other region signal).
     #[default]
     Auto,
     Pinned {
         source: DownloadSource,
+    },
+    /// Region-aware chain with the region explicitly supplied by the caller
+    /// instead of judged from locale/timezone. Exists for the desktop app,
+    /// which performs its own single-point China detection (language OR
+    /// timezone) in the frontend and hands the boolean result down here --
+    /// core never re-derives the region for this variant, it just orders the
+    /// same three-source chain [`auto_source_chain`] would for that verdict.
+    AutoRegion {
+        prefer_china: bool,
     },
 }
 
@@ -67,10 +78,22 @@ impl DownloadSourcePref {
         Self::Pinned { source }
     }
 
+    pub fn auto_region(prefer_china: bool) -> Self {
+        Self::AutoRegion { prefer_china }
+    }
+
     pub fn parse_env_value(value: &str) -> Option<Self> {
         let value = value.trim();
         if value.eq_ignore_ascii_case("auto") {
             return Some(Self::Auto);
+        }
+        if value.eq_ignore_ascii_case("china") {
+            return Some(Self::AutoRegion { prefer_china: true });
+        }
+        if value.eq_ignore_ascii_case("global") {
+            return Some(Self::AutoRegion {
+                prefer_china: false,
+            });
         }
         DownloadSource::parse(value).map(Self::pinned)
     }
@@ -80,6 +103,7 @@ pub fn resolve_chain(pref: &DownloadSourcePref) -> Vec<DownloadSource> {
     match pref {
         DownloadSourcePref::Pinned { source } => vec![*source],
         DownloadSourcePref::Auto => auto_source_chain(locale_prefers_china_sources()),
+        DownloadSourcePref::AutoRegion { prefer_china } => auto_source_chain(*prefer_china),
     }
 }
 
@@ -267,6 +291,86 @@ mod tests {
         assert_eq!(
             auto_source_chain(true).first(),
             Some(&DownloadSource::Weights)
+        );
+    }
+
+    #[test]
+    fn auto_region_pref_orders_by_the_supplied_flag_not_locale() {
+        // AutoRegion is the desktop-driven variant: the region verdict is
+        // supplied explicitly, so it must match `auto_source_chain` for that
+        // verdict regardless of what the process locale/timezone would say.
+        assert_eq!(
+            resolve_chain(&DownloadSourcePref::auto_region(true)),
+            auto_source_chain(true)
+        );
+        assert_eq!(
+            resolve_chain(&DownloadSourcePref::auto_region(false)),
+            auto_source_chain(false)
+        );
+    }
+
+    #[test]
+    fn parses_china_and_global_env_values_as_auto_region() {
+        assert_eq!(
+            DownloadSourcePref::parse_env_value("china"),
+            Some(DownloadSourcePref::auto_region(true))
+        );
+        assert_eq!(
+            DownloadSourcePref::parse_env_value("CHINA"),
+            Some(DownloadSourcePref::auto_region(true))
+        );
+        assert_eq!(
+            DownloadSourcePref::parse_env_value("global"),
+            Some(DownloadSourcePref::auto_region(false))
+        );
+        assert_eq!(
+            DownloadSourcePref::parse_env_value(" global "),
+            Some(DownloadSourcePref::auto_region(false))
+        );
+    }
+
+    #[test]
+    fn auto_region_pref_serde_round_trips_and_uses_tagged_shape() {
+        let china = DownloadSourcePref::auto_region(true);
+        let json = serde_json::to_value(&china).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"mode": "auto_region", "prefer_china": true})
+        );
+        assert_eq!(
+            serde_json::from_value::<DownloadSourcePref>(json).unwrap(),
+            china
+        );
+
+        let global = DownloadSourcePref::auto_region(false);
+        let json = serde_json::to_value(&global).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"mode": "auto_region", "prefer_china": false})
+        );
+        assert_eq!(
+            serde_json::from_value::<DownloadSourcePref>(json).unwrap(),
+            global
+        );
+    }
+
+    #[test]
+    fn legacy_auto_and_pinned_json_still_deserialize_after_adding_auto_region() {
+        // Forward-compat precedent in this codebase (see `HistoryRetentionPolicy`
+        // in config.rs) is: old values keep parsing, unrecognized new values are
+        // an explicit hard parse error rather than a silent fallback. Adding the
+        // `auto_region` variant must not disturb the two pre-existing wire shapes.
+        assert_eq!(
+            serde_json::from_value::<DownloadSourcePref>(serde_json::json!({"mode": "auto"}))
+                .unwrap(),
+            DownloadSourcePref::Auto
+        );
+        assert_eq!(
+            serde_json::from_value::<DownloadSourcePref>(
+                serde_json::json!({"mode": "pinned", "source": "hf-mirror"})
+            )
+            .unwrap(),
+            DownloadSourcePref::pinned(DownloadSource::HfMirror)
         );
     }
 

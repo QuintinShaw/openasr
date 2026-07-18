@@ -194,8 +194,13 @@ pub(crate) enum Command {
         /// Override the model catalog URL or local catalog path.
         #[arg(long)]
         catalog_url: Option<String>,
-        /// Download source: auto, hf, hf-mirror, or weights.
-        #[arg(long, value_parser = ["auto", "hf", "hf-mirror", "weights"])]
+        /// Download source: auto, china, global, hf, hf-mirror, or weights.
+        /// `china`/`global` pin the region-aware chain's direction explicitly
+        /// instead of judging it from locale/timezone (see `auto`).
+        #[arg(
+            long,
+            value_parser = ["auto", "china", "global", "hf", "hf-mirror", "weights"]
+        )]
         source: Option<String>,
         /// Acknowledge the model license when the catalog requires it.
         #[arg(long)]

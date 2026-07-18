@@ -275,7 +275,9 @@ pub enum ConfigError {
     UnknownKey(String),
     #[error("Unsupported backend '{0}'. Use one of: {backends}.", backends = BackendKind::SELECTABLE.join(", "))]
     UnsupportedBackend(String),
-    #[error("Unsupported download source '{0}'. Use one of: auto, hf, hf-mirror, weights.")]
+    #[error(
+        "Unsupported download source '{0}'. Use one of: auto, china, global, hf, hf-mirror, weights."
+    )]
     UnsupportedDownloadSource(String),
     #[error(
         "Backend '{0}' cannot be persisted as default_backend.\nUse `default_backend=mock` and pass `--backend native` explicitly when you need local GGUF runtime execution with fail-closed behavior."
@@ -655,6 +657,9 @@ fn render_download_source_pref(pref: &DownloadSourcePref) -> String {
     match pref {
         DownloadSourcePref::Auto => "auto".to_string(),
         DownloadSourcePref::Pinned { source } => source.as_env_value().to_string(),
+        DownloadSourcePref::AutoRegion { prefer_china } => {
+            if *prefer_china { "china" } else { "global" }.to_string()
+        }
     }
 }
 

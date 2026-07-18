@@ -879,6 +879,165 @@ fn pinned_source_does_not_fallback_after_sha_mismatch() {
 }
 
 #[test]
+fn pull_falls_back_to_hf_mirror_after_weights_404() {
+    // weights.openasr.org only proxies the OpenASR/* org; a file outside that
+    // scope 404s there even though it exists on the other sources. The chain
+    // must fall through to hf-mirror instead of hard-failing the whole pull.
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 404,
+            body: b"not found".to_vec(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: bytes,
+        },
+    ]);
+
+    let installed = pull_model_pack_with_client_sources_and_cancel(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::default(),
+        &[DownloadSource::Weights, DownloadSource::HfMirror],
+        None,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap();
+
+    assert_eq!(installed.pull, "moonshine-tiny:q8");
+    assert_eq!(
+        client.urls(),
+        vec![
+            "https://weights.openasr.org/OpenASR/moonshine-tiny/resolve/0123456789abcdef0123456789abcdef01234567/moonshine-tiny-q8_0.oasr".to_string(),
+            "https://hf-mirror.com/OpenASR/moonshine-tiny/resolve/0123456789abcdef0123456789abcdef01234567/moonshine-tiny-q8_0.oasr".to_string(),
+        ]
+    );
+    let paths = paths_for(temp.path(), &resolved);
+    assert!(paths.final_path.exists());
+    assert!(!paths.partial_path.exists());
+}
+
+#[test]
+fn pull_falls_back_to_next_source_after_403_forbidden() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 403,
+            body: b"forbidden".to_vec(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: bytes,
+        },
+    ]);
+
+    let installed = pull_model_pack_with_client_sources_and_cancel(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::default(),
+        &[DownloadSource::Hf, DownloadSource::HfMirror],
+        None,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap();
+
+    assert_eq!(installed.pull, "moonshine-tiny:q8");
+    assert_eq!(
+        client.urls(),
+        vec![
+            resolved.url.clone(),
+            "https://hf-mirror.com/OpenASR/moonshine-tiny/resolve/0123456789abcdef0123456789abcdef01234567/moonshine-tiny-q8_0.oasr".to_string(),
+        ]
+    );
+    let paths = paths_for(temp.path(), &resolved);
+    assert!(paths.final_path.exists());
+    assert!(!paths.partial_path.exists());
+}
+
+#[test]
+fn pull_does_not_fallback_after_400_bad_request() {
+    // 400 is a malformed request, not a per-source availability gap -- it
+    // would recur identically against every source, so the chain must not
+    // spend the remaining sources retrying it.
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 400,
+        body: b"bad request".to_vec(),
+    }]);
+
+    let error = pull_model_pack_with_client_sources_and_cancel(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::default(),
+        &[DownloadSource::Hf, DownloadSource::HfMirror],
+        None,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PullError::UnexpectedStatus { status: 400, .. }
+    ));
+    assert_eq!(client.urls(), vec![resolved.url.clone()]);
+    let paths = paths_for(temp.path(), &resolved);
+    assert!(!paths.final_path.exists());
+    assert!(!paths.partial_path.exists());
+}
+
+#[test]
+fn pull_does_not_fallback_after_401_unauthorized() {
+    // 401 means the underlying (possibly gated) resource needs credentials
+    // this pull does not have; switching mirrors cannot supply the missing
+    // bearer token, so the chain must not burn the remaining sources on it.
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 401,
+        body: b"unauthorized".to_vec(),
+    }]);
+
+    let error = pull_model_pack_with_client_sources_and_cancel(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::default(),
+        &[DownloadSource::Hf, DownloadSource::HfMirror],
+        None,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PullError::UnexpectedStatus { status: 401, .. }
+    ));
+    assert_eq!(client.urls(), vec![resolved.url.clone()]);
+    let paths = paths_for(temp.path(), &resolved);
+    assert!(!paths.final_path.exists());
+    assert!(!paths.partial_path.exists());
+}
+
+#[test]
 fn pull_cancel_cleans_partial_download() {
     let bytes = tiny_pack_bytes();
     let resolved = resolved_for(&bytes);

@@ -3024,6 +3024,10 @@ fn is_retryable_download_error(error: &PullError) -> bool {
         | PullError::EtagChanged { .. }
         | PullError::SegmentSizeMismatch { .. }
         | PullError::SegmentRangeMismatch { .. } => true,
+        // Only 5xx here: a 4xx from the currently open source is not a
+        // transient fault of *this* request, so retrying the same source
+        // again would just repeat it (see `is_source_fallback_error`, which
+        // moves to the *next* source instead for the 403/404 case).
         PullError::UnexpectedStatus { status, .. } => *status >= 500,
         _ => false,
     }
@@ -3042,7 +3046,21 @@ fn is_source_fallback_error(error: &PullError) -> bool {
         | PullError::EtagChanged { .. }
         | PullError::SegmentSizeMismatch { .. }
         | PullError::SegmentRangeMismatch { .. } => true,
-        PullError::UnexpectedStatus { status, .. } => *status >= 500,
+        // 5xx: this source's own infra failed -- try the next one. 403/404:
+        // this source does not have (or will not serve) the requested object,
+        // which is a per-source availability gap, not a global failure -- e.g.
+        // weights.openasr.org only proxies the `OpenASR/*` org and 404s for
+        // anything outside it, so the chain must be able to fall through to
+        // hf-mirror/hf instead of hard-failing the whole pull. 400/401 are
+        // deliberately NOT included: 400 is a malformed request that would
+        // recur identically against every source in the chain, and 401 means
+        // the underlying (possibly gated) resource requires credentials this
+        // pull does not have -- switching mirrors cannot supply the missing
+        // bearer token, so falling through would just fail three times instead
+        // of once.
+        PullError::UnexpectedStatus { status, .. } => {
+            *status >= 500 || *status == 403 || *status == 404
+        }
         _ => false,
     }
 }
