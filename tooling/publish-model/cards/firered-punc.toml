@@ -4,10 +4,8 @@
 # architecture state; re-verify against the upstream card when the upstream
 # weights change.
 #
-# STAGING NOTE (not public): this is a NEW capability-pack catalog entry --
-# there is no prior public listing for this model. Published to a PRIVATE HF
-# repo only; the catalog entry stays public:false until a deliberate later
-# --public flip (same convention as the diarization / forced-aligner packs).
+# NOTE: this is a capability-pack, not an ASR model -- see the intro below for
+# how it plugs into an unpunctuated family's finalize-only post-process.
 
 tagline = "Chinese punctuation restoration for OpenASR -- a BERT token classifier that adds full-width marks to unpunctuated transcripts, fully on-device"
 tagline_zh = "为 OpenASR 提供中文标点恢复 — 基于 BERT 逐词分类器，为无标点转写补回全角标点，全程在设备本地运行"
@@ -50,9 +48,9 @@ OpenASR runtime -- no Python at inference, all decoding local. It ships in **fp1
 **Not a standalone transcription model.** This pack cannot transcribe audio by itself; it is an
 opt-in post-process applied to an unpunctuated ASR model's output.
 
-**Verification status:** this is a brand-new catalog entry (no prior public listing). Local
-verification covers exact per-token label parity against the upstream PyTorch forward across a
-set of Chinese golden sentences (all four punctuation classes plus the no-mark class).
+**Verification:** local verification covers exact per-token label parity against the upstream
+PyTorch forward across a set of Chinese golden sentences (all four punctuation classes plus the
+no-mark class).
 """
 
 intro_zh = """
@@ -72,8 +70,8 @@ FireRedPunc 是 **FireRedTeam** 推出的**标点预测**模型，属于 FireRed
 
 **不是独立的转写模型。** 本模型包本身无法转写音频；它是应用于无标点 ASR 模型输出的可选后处理步骤。
 
-**验证状态:** 这是一个全新的 catalog 条目（此前没有公开上架记录）。本地验证覆盖了在一组中文黄金句
-（涵盖全部四种标点类别以及无标点类别）上，与上游 PyTorch 前向逐词标签完全一致的对齐检查。
+**验证:** 本地对齐检查确认，在一组中文黄金句（覆盖全部四种标点类别及无标点类别）上，逐词标签
+输出与上游 PyTorch 前向结果完全一致。
 """
 
 acknowledgement = """

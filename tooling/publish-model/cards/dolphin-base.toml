@@ -3,13 +3,13 @@
 # kept to what the upstream repo and architecture state; re-verify against the
 # upstream card when the upstream weights change.
 #
-# STAGING NOTE (not public): this is the multilingual Dolphin tier, published
-# to a PRIVATE HF repo only. Local sanity checking so far used a Mandarin clip
-# (this family's `en` support is out of scope -- `en` is not in the advertised
-# language list, so the shared JFK ruler is out-of-distribution and only used
-# for the standard cross-quant drift signal). q4_k is dropped from this pack's
-# quants: it showed an ~8.8% CER drift versus fp16 on the sanity clip (see
-# below); dolphin-small's q4_k is clean at 0.0 drift and is unaffected.
+# NOTE: this is the multilingual Dolphin tier. Local sanity checking so far
+# used a Mandarin clip (this family's `en` support is out of scope -- `en` is
+# not in the advertised language list, so the shared JFK ruler is
+# out-of-distribution and only used for the standard cross-quant drift
+# signal). q4_k is dropped from this pack's quants: it showed an ~8.8% CER
+# drift versus fp16 on the sanity clip (see below); dolphin-small's q4_k is
+# clean at 0.0 drift and is unaffected.
 
 tagline = "Multilingual speech recognition across 40 languages, base tier -- a compact 140M WeNet/ESPnet E-Branchformer (CTC + attention)"
 tagline_zh = "覆盖 40 种语言的多语种语音识别（base 档）— 紧凑的 140M 参数 WeNet/ESPnet E-Branchformer（CTC + 注意力）"
@@ -51,16 +51,16 @@ checkpoint collapses this product's own Chinese-dialect granularity into a singl
 dedicated `dolphin-cn-dialect-small`/`-base` packs cover per-dialect prompting). This OpenASR
 repo repackages the weights as `.oasr` packs that run natively in the OpenASR runtime -- no
 Python at inference, all decoding local. It ships in **fp16** (maximum fidelity) and **q8_0**
-(recommended) builds. **q4_k** is not offered for this pack (see verification status below).
+(recommended) builds. **q4_k** is not offered for this pack (see verification notes below).
 
 **Note:** this model does not emit punctuation. Its upstream training corpus is transcribed
 without punctuation marks, so the decoder never predicts a punctuation token -- there is no
 setting to enable it. Transcripts are plain, unpunctuated text by design.
 
-**Verification status:** this pack is staged in a private repo, not yet publicly listed. Local
-verification so far covers Mandarin (`zh`) sanity-checked against the upstream architecture and
-bit-stable at fp16/q8_0. q4_k showed an ~8.8% CER drift versus fp16 on the sanity clip and is
-dropped from this pack's quants (dolphin-small's q4_k is clean at 0.0 drift and is unaffected).
+**Verification notes:** local verification so far covers Mandarin (`zh`), sanity-checked against
+the upstream architecture and bit-stable at fp16/q8_0. `q4_k` showed ~8.8% CER drift versus fp16
+on the sanity clip and is therefore dropped from this pack's quants. dolphin-small's `q4_k` is
+clean at 0.0 drift and is unaffected.
 """
 
 intro_zh = """
@@ -74,14 +74,14 @@ small 档的三分之一——在不需要 small 档准确度余量的部署场�
 
 这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理，不会把音频上传到
 云端。提供 `fp16`（最高保真）、`q8_0`（推荐）两种量化版本；本包不提供 `q4_k`（原因见下方验证
-状态）。
+情况）。
 
 **说明:** 该模型不输出标点符号。其上游训练语料的转写不含标点，解码器从不预测标点符号——
 没有可开启的开关。转写结果按设计是不含标点的纯文本。
 
-**验证状态:** 本模型包目前仅暂存于私有仓库，尚未公开上架。目前本地验证覆盖普通话（`zh`），
-已对照上游架构做过合理性检查，fp16/q8_0 逐位稳定；q4_k 在合理性样本上相较 fp16 有约 8.8%
-的 CER 漂移，因此本包不提供 q4_k（dolphin-small 的 q4_k 干净、漂移为 0.0，不受影响）。
+**验证情况:** 本地验证覆盖普通话（`zh`），已对照上游架构做过合理性检查，fp16/q8_0 逐位
+稳定。`q4_k` 在合理性样本上相较 fp16 有约 8.8% 的 CER 漂移，因此本包不提供 `q4_k`。
+dolphin-small 的 `q4_k` 干净、漂移为 0.0，不受影响。
 """
 
 acknowledgement = """

@@ -291,8 +291,13 @@ upstream_release_date = "2026-05-13"
 # Needs both the dim-derivation import generalization AND the new multilingual
 # BPE tokenizer / two-level language-region prompt landing in this same change.
 # Multilingual espnet front-end support (commit 91fc3d3) only lands in 0.1.9,
-# not 0.1.8, so pin the runtime floor there.
+# not 0.1.8, so pin the runtime floor there. min_cli_version mirrors this: the
+# published catalog entry has always shipped 0.1.9 here (set explicitly at
+# publish time); pinning it in source too keeps a plain regenerate_all.sh
+# reproducing the same floor instead of silently regressing to the 0.1.0
+# catalog default.
 min_core_version = "0.1.9"
+min_cli_version = "0.1.9"
 
 # Flipped public 2026-07-08 alongside dolphin-small, same 0.1.9 batch.
 ["dolphin-base"]
@@ -317,8 +322,13 @@ quants = ["fp16", "q8_0"]
 recommended_quant = "q8_0"
 upstream_release_date = "2026-05-13"
 # Multilingual espnet front-end support (commit 91fc3d3) only lands in 0.1.9,
-# not 0.1.8, so pin the runtime floor there.
+# not 0.1.8, so pin the runtime floor there. min_cli_version mirrors this: the
+# published catalog entry has always shipped 0.1.9 here (set explicitly at
+# publish time); pinning it in source too keeps a plain regenerate_all.sh
+# reproducing the same floor instead of silently regressing to the 0.1.0
+# catalog default.
 min_core_version = "0.1.9"
+min_cli_version = "0.1.9"
 
 # SenseVoiceSmall (FunASR SAN-M/DFSMN encoder + CTC head): multilingual
 # zh/yue/en/ja/ko with model-side language id. Published PUBLIC to
@@ -711,9 +721,8 @@ role = "forced-aligner"
 # classifier (upstream FireRedTeam/FireRedPunc) that adds Chinese full-width
 # marks to an unpunctuated family's transcript in a finalize-only post-process.
 # Not an ASR model. Chinese-only by construction (the released label set is the
-# 5 classes none/，。？！). Staged to a PRIVATE HF repo; the catalog entry stays
-# public:false (published without --public) until a deliberate later flip, like
-# the diarization/forced-aligner capability packs above.
+# 5 classes none/，。？！). Published public, like the dolphin multilingual
+# tiers above.
 ["firered-punc"]
 kind = "capability-pack"
 family = "firered-punc"
@@ -732,7 +741,12 @@ languages = ["zh"]
 quants = ["fp16"]
 recommended_quant = "fp16"
 upstream_release_date = "2026-02-12"
+# min_cli_version mirrors min_core_version: the published catalog entry has
+# always shipped 0.1.11 here (set explicitly at publish time); pinning it in
+# source too keeps a plain regenerate_all.sh reproducing the same floor
+# instead of silently regressing it to the 0.1.0 catalog default.
 min_core_version = "0.1.11"
+min_cli_version = "0.1.11"
 
 ["firered-punc".capability]
 feature = "punctuation"
