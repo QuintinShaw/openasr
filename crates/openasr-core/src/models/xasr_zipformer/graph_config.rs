@@ -14,33 +14,41 @@ use crate::models::graph_runtime_config::{
 /// [`GgmlCpuGraphConfig::metadata_context_bytes`]), OOM'd CPU transcription.
 const FULL_ENCODER_GRAPH_SIZE: usize = 65_536;
 
-/// Auto prefers the accelerator: on a GPU-capable host (Metal on Apple
-/// Silicon, HIP/CUDA elsewhere) the Auto default resolves to that
-/// accelerator, and only falls back to CPU when no accelerator is present.
-/// An explicit execution_target=cpu always wins (the gate only ever pins
-/// Auto, never overrides an explicit preference).
+/// Auto prefers the accelerator on the generic GPU lane (HIP/CUDA/Vulkan),
+/// and only falls back to CPU when no accelerator is present or the request
+/// targets Apple Silicon Metal specifically (see below). An explicit
+/// `execution_target=cpu` or `=accelerated` always wins (the gate only ever
+/// pins Auto, never overrides an explicit preference).
 ///
 /// The earlier CPU-pinned Auto default predates the encoder-weight-placement
 /// fix (#139): the streaming encoder's weights were pinned off the GPU
 /// buffer, so a Metal request never actually offloaded the encoder and paid
 /// GPU dispatch overhead on a per-chunk graph too small to amortize it -- a
 /// net loss measured on the M1 host. With weights correctly placed so the
-/// encoder truly resides on the GPU buffer, re-measurement end-to-end (both
-/// an 11s and a 69s clip, the catalog's recommended `q8_0` quant, several
-/// runs each) put Metal at parity-to-faster than CPU -- but with enough
-/// run-to-run spread on the measuring host (a confirmed concurrent Time
-/// Machine backup during part of this measurement) that no specific
-/// multiplier should be cited from this comment; treat "competitive with
-/// CPU, not a regression" as the load-bearing claim, not a number.
-/// `auto_gpu_enabled` only ever changes which backend Auto picks, never
-/// correctness: output stays byte-identical between CPU and Metal.
+/// encoder truly resides on the GPU buffer, a first re-measurement put Metal
+/// at parity-to-faster than CPU, but a later, cleaner platform audit found
+/// Metal itself still 1.97x *slower* than CPU end-to-end (dispatch-bound: a
+/// 29-frame chunk graph rebuilt/dispatched every hop is too small to amortize
+/// Metal's per-dispatch overhead) while the generic GPU lane was never
+/// re-measured to regress. `auto_gpu_policy = ExceptMetal` reflects that:
+/// Auto now falls back to CPU on Apple Silicon Metal specifically while
+/// leaving CUDA/HIP/Vulkan untouched (this remains the *final* form for the
+/// streaming path -- unlike moonshine's decode-graph fix, there's no known
+/// architectural fix for a chunk graph this small being dispatch-bound on
+/// Metal). An explicit `--backend metal` request still gets Metal. Backend
+/// choice only ever changes which backend Auto picks, never correctness:
+/// output stays byte-identical between CPU and Metal.
 ///
 /// Delegates to the shared `resolve_family_runtime_backend` gate (declared via
-/// this architecture's `auto_gpu_enabled = true`) rather than hand-rolling
-/// the override check, so any provenance label resolving through the same
-/// gate can never drift from what this function actually decided.
+/// this architecture's `auto_gpu_policy = ExceptMetal`) rather than
+/// hand-rolling the override check, so any provenance label resolving
+/// through the same gate can never drift from what this function actually
+/// decided.
 fn encoder_gpu_enabled() -> bool {
-    GgmlCpuGraphConfig::resolve_family_runtime_backend(true).is_gpu_class()
+    GgmlCpuGraphConfig::resolve_family_runtime_backend(
+        crate::ggml_runtime::AutoGpuPolicy::ExceptMetal,
+    )
+    .is_gpu_class()
 }
 
 pub(crate) fn xasr_zipformer_encoder_graph_config() -> GgmlCpuGraphConfig {

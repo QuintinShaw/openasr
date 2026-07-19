@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn ctc_streaming_closures_install_request_backend_override() {
         use crate::ggml_runtime::{
-            GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference,
+            AutoGpuPolicy, GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference,
         };
         use std::path::PathBuf;
 
@@ -464,7 +464,7 @@ mod tests {
                 move |_executor: &(), _request: &GgmlAsrExecutionRequest| {
                     *observed_for_decode.lock().unwrap() = Some((
                         crate::ggml_runtime::request_backend_override(),
-                        GgmlCpuGraphConfig::resolve_family_runtime_backend(false),
+                        GgmlCpuGraphConfig::resolve_family_runtime_backend(AutoGpuPolicy::Never),
                     ));
                     Ok(ctc_result("", 0))
                 },

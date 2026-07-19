@@ -902,7 +902,7 @@ fn run_native_transcription_impl(
     // This family's Auto-mode GPU capability, so the provenance backend label
     // below resolves through the same family-aware gate the family's own
     // executor used (see `native_runtime_backend_label`'s doc comment).
-    let auto_gpu_enabled = crate::arch::family_auto_gpu_enabled_for_model_architecture(
+    let auto_gpu_policy = crate::arch::family_auto_gpu_policy_for_model_architecture(
         selected_family.model_architecture,
     );
     let mut longform_metadata: Option<TranscriptionLongFormMetadata> = None;
@@ -959,7 +959,7 @@ fn run_native_transcription_impl(
                     slice_kind_summary,
                     timeline_kind,
                     &longform_provenance,
-                    auto_gpu_enabled,
+                    auto_gpu_policy,
                 )),
                 language: reported_language.clone(),
             });
@@ -1121,7 +1121,7 @@ fn run_native_transcription_impl(
                 slice_kind_summary,
                 timeline_kind,
                 &longform_provenance,
-                auto_gpu_enabled,
+                auto_gpu_policy,
             );
             if !ran_any_slice && suppressed_slice_count > 0 {
                 let fallback_options = request_options.clone();
@@ -1159,7 +1159,7 @@ fn run_native_transcription_impl(
             slice_kind_summary,
             timeline_kind,
             &longform_provenance,
-            auto_gpu_enabled,
+            auto_gpu_policy,
         ));
     }
 
@@ -1807,7 +1807,7 @@ fn build_longform_metadata(
     slice_kind_summary: &'static str,
     timeline_kind: &'static str,
     extra_provenance: &[String],
-    auto_gpu_enabled: bool,
+    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
 ) -> TranscriptionLongFormMetadata {
     let mode = match options.mode {
         LongFormMode::Off => "off",
@@ -1822,7 +1822,7 @@ fn build_longform_metadata(
         format!("core.longform.timeline:{timeline_kind}"),
         format!(
             "core.native.backend:{}",
-            native_runtime_backend_label(auto_gpu_enabled)
+            native_runtime_backend_label(auto_gpu_policy)
         ),
         "core.longform.assembler".to_string(),
         "core.native.ggml".to_string(),
@@ -2006,15 +2006,18 @@ fn prefers_cpu_decoder_for_multichunk_metal(model_architecture: &str) -> bool {
 /// The `core.native.backend` provenance label always resolves through the
 /// same family-aware gate the family's own executor used
 /// (`GgmlCpuGraphConfig::resolve_family_runtime_backend`), keyed by this
-/// family's `auto_gpu_enabled` capability declaration. It must never call
+/// family's `auto_gpu_policy` capability declaration. It must never call
 /// `GgmlCpuGraphConfig::resolve_runtime_backend()` directly for this purpose:
 /// that generic resolver reports what Auto would pick for a family with no
-/// gate, which drifts from reality for any family whose `auto_gpu_enabled`
-/// is `false` and pins Auto to CPU -- exactly the bug that produced a
-/// `core.native.backend:metal` label on a dolphin Auto request that in fact
-/// ran entirely on CPU (before dolphin's own gate flipped to GPU-enabled).
-fn native_runtime_backend_label(auto_gpu_enabled: bool) -> &'static str {
-    match GgmlCpuGraphConfig::resolve_family_runtime_backend(auto_gpu_enabled) {
+/// gate, which drifts from reality for any family whose policy pins (or
+/// platform-scopes) Auto away from a backend -- exactly the bug that
+/// produced a `core.native.backend:metal` label on a dolphin Auto request
+/// that in fact ran entirely on CPU (before dolphin's own gate flipped to
+/// GPU-enabled).
+fn native_runtime_backend_label(
+    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
+) -> &'static str {
+    match GgmlCpuGraphConfig::resolve_family_runtime_backend(auto_gpu_policy) {
         GgmlCpuGraphBackend::Cpu => "cpu",
         GgmlCpuGraphBackend::Metal => "metal",
         GgmlCpuGraphBackend::Gpu => "gpu",
@@ -2036,28 +2039,42 @@ mod tests {
     static PROGRESS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn family_auto_gpu_enabled_lookup_matches_dolphin_and_xasr_gates() {
-        // Regression pin: every builtin family now lets Auto pick GPU
-        // automatically. Both dolphin and xasr-zipformer were gated to CPU at
-        // one point (each had an Auto-mode GPU regression caused by its
-        // encoder weights not actually landing on the GPU buffer) and both
-        // flipped to GPU-enabled once their respective weight-placement fixes
-        // let the encoder truly offload and Metal beat CPU end-to-end.
-        assert!(crate::arch::family_auto_gpu_enabled_for_model_architecture(
-            crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID
-        ));
-        assert!(crate::arch::family_auto_gpu_enabled_for_model_architecture(
-            crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID
-        ));
-        assert!(crate::arch::family_auto_gpu_enabled_for_model_architecture(
-            crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID
-        ));
+    fn family_auto_gpu_policy_lookup_matches_dolphin_and_xasr_gates() {
+        use crate::ggml_runtime::AutoGpuPolicy;
+
+        // Regression pin: dolphin lets Auto pick any GPU-class backend
+        // (it flipped from CPU-pinned once its encoder weight-placement fix
+        // let Metal truly offload and beat CPU end-to-end). xasr-zipformer is
+        // `ExceptMetal`: Auto still prefers the generic GPU lane but falls
+        // back to CPU on Apple Silicon Metal specifically per the platform
+        // performance audit. qwen measured a similar Metal slowdown but is
+        // deliberately left `AllBackends` pending a dedicated follow-up (see
+        // `models::qwen::graph_config`).
+        assert_eq!(
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID
+            ),
+            AutoGpuPolicy::ExceptMetal
+        );
+        assert_eq!(
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID
+            ),
+            AutoGpuPolicy::AllBackends
+        );
+        assert_eq!(
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID
+            ),
+            AutoGpuPolicy::AllBackends
+        );
         // An unrecognized architecture defaults to the majority behavior
-        // (Auto may use GPU) rather than silently pinning an unknown family
-        // to CPU.
-        assert!(crate::arch::family_auto_gpu_enabled_for_model_architecture(
-            "not-a-real-architecture"
-        ));
+        // (Auto may use any GPU backend) rather than silently pinning an
+        // unknown family to CPU.
+        assert_eq!(
+            crate::arch::family_auto_gpu_policy_for_model_architecture("not-a-real-architecture"),
+            AutoGpuPolicy::AllBackends
+        );
     }
 
     /// Regression for the gated-family-plus-Auto provenance mislabel: the
@@ -2071,20 +2088,36 @@ mod tests {
     /// CPU; see `xasr_zipformer::graph_config::encoder_gpu_enabled`.
     #[test]
     fn native_runtime_backend_label_reflects_family_auto_gate_not_generic_resolver() {
-        use crate::ggml_runtime::{RequestBackendPreference, install_request_backend_override};
+        use crate::ggml_runtime::{
+            AutoGpuPolicy, RequestBackendPreference, install_request_backend_override,
+        };
 
-        // Auto, family gate disabled (xasr-zipformer shape): must
-        // report "cpu" regardless of what the generic resolver would pick.
-        assert_eq!(native_runtime_backend_label(false), "cpu");
+        // Auto, family gate fully disabled (`Never` shape): must report
+        // "cpu" regardless of what the generic resolver would pick.
+        assert_eq!(native_runtime_backend_label(AutoGpuPolicy::Never), "cpu");
 
-        // Auto, family gate enabled (every other builtin's shape): reports
-        // exactly what the generic resolver picks -- unchanged behavior.
+        // Auto, family gate enabled (`AllBackends` shape, every builtin
+        // family but the three `ExceptMetal` ones): reports exactly what the
+        // generic resolver picks -- unchanged behavior.
         let generic_auto_label = match GgmlCpuGraphConfig::resolve_runtime_backend() {
             GgmlCpuGraphBackend::Cpu => "cpu",
             GgmlCpuGraphBackend::Metal => "metal",
             GgmlCpuGraphBackend::Gpu => "gpu",
         };
-        assert_eq!(native_runtime_backend_label(true), generic_auto_label);
+        assert_eq!(
+            native_runtime_backend_label(AutoGpuPolicy::AllBackends),
+            generic_auto_label
+        );
+
+        // `ExceptMetal`: reports "cpu" if and only if the generic resolver
+        // would have picked Metal specifically; never touches a resolved
+        // Cpu or generic Gpu (CUDA/HIP/Vulkan) pick.
+        let except_metal_label = native_runtime_backend_label(AutoGpuPolicy::ExceptMetal);
+        if generic_auto_label == "metal" {
+            assert_eq!(except_metal_label, "cpu");
+        } else {
+            assert_eq!(except_metal_label, generic_auto_label);
+        }
 
         // An explicit accelerated request always reports the accelerated
         // backend, even for a family whose Auto default is gated to CPU --
@@ -2092,9 +2125,16 @@ mod tests {
         {
             let _guard =
                 install_request_backend_override(Some(RequestBackendPreference::Accelerated));
-            let label = native_runtime_backend_label(false);
+            let label = native_runtime_backend_label(AutoGpuPolicy::Never);
             assert!(label == "metal" || label == "gpu", "got {label}");
-            assert_eq!(label, native_runtime_backend_label(true));
+            assert_eq!(
+                label,
+                native_runtime_backend_label(AutoGpuPolicy::AllBackends)
+            );
+            assert_eq!(
+                label,
+                native_runtime_backend_label(AutoGpuPolicy::ExceptMetal)
+            );
         }
     }
 

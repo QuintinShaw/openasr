@@ -228,12 +228,14 @@ pub(crate) struct DolphinPipelineOutput {
 /// remains the honest fallback where no accelerator exists.
 ///
 /// Delegates to the shared `resolve_family_runtime_backend` gate (declared via
-/// this architecture's `auto_gpu_enabled = true`, see `arch::mod` /
+/// this architecture's `auto_gpu_policy = AllBackends`, see `arch::mod` /
 /// `BUILTIN_ARCHITECTURE_DESCRIPTORS`) rather than hand-rolling the override
 /// check, so any provenance label resolving through the same gate can never
 /// drift from what this function actually decided.
 fn dolphin_runtime_backend() -> GgmlCpuGraphBackend {
-    GgmlCpuGraphConfig::resolve_family_runtime_backend(true)
+    GgmlCpuGraphConfig::resolve_family_runtime_backend(
+        crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+    )
 }
 
 /// Runtime weights for one pack, shared behind an `Arc` so the process-level pool
