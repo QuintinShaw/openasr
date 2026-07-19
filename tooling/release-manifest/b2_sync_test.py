@@ -16,6 +16,7 @@ from b2_sync import (
     sha256_hex,
     sign_request,
     sync_files,
+    sync_vendor_files,
 )
 
 # AWS's own published worked example for SigV4 header-based auth (GET Object,
@@ -256,6 +257,66 @@ class SyncFilesTest(unittest.TestCase):
         client, _ = _fake_client()
         with self.assertRaises(B2SyncError):
             sync_files(client, "0.1.10", [self.dist_dir / "does-not-exist.zip"])
+
+
+class SyncVendorFilesTest(unittest.TestCase):
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dist_dir = Path(self._tmp.name)
+
+    def _write(self, name: str, content: bytes):
+        path = self.dist_dir / name
+        path.write_bytes(content)
+        return path
+
+    def test_uploads_under_content_addressed_vendor_prefix_not_a_version(self) -> None:
+        client, transport = _fake_client()
+        content = b"fake-cuda-runtime-bytes"
+        sha256 = hashlib.sha256(content).hexdigest()
+        path = self._write(f"openasr-vendor-cuda-runtime-{sha256[:12]}.zip", content)
+
+        urls = sync_vendor_files(client, [path])
+
+        expected_key = f"core/vendor/{sha256}/{path.name}"
+        self.assertEqual(urls, [f"https://dl.openasr.org/{expected_key}"])
+        self.assertIn(expected_key, transport.objects)
+        self.assertEqual(transport.objects[expected_key], content)
+
+    def test_idempotent_reupload_of_identical_bytes_is_a_no_op(self) -> None:
+        client, transport = _fake_client()
+        path = self._write("openasr-vendor-rocm-runtime-aaaaaaaaaaaa.zip", b"same-vendor-bytes")
+        sync_vendor_files(client, [path])
+        put_count_after_first = sum(1 for method, _ in transport.requests if method == "PUT")
+
+        sync_vendor_files(client, [path])
+        put_count_after_second = sum(1 for method, _ in transport.requests if method == "PUT")
+
+        self.assertEqual(put_count_after_first, 1)
+        self.assertEqual(put_count_after_second, 1)  # no second PUT: same bytes, same content-addressed key
+
+    def test_two_different_vendor_archives_land_at_two_different_keys(self) -> None:
+        # Distinct content addresses to distinct keys -- there is no shared
+        # "current version" key for two different vendor archives to collide
+        # under, unlike sync_files' per-version prefix.
+        client, transport = _fake_client()
+        cuda_path = self._write("openasr-vendor-cuda-runtime-000000000000.zip", b"cuda-bytes")
+        rocm_path = self._write("openasr-vendor-rocm-runtime-000000000000.zip", b"rocm-bytes")
+
+        sync_vendor_files(client, [cuda_path, rocm_path])
+
+        cuda_sha = hashlib.sha256(b"cuda-bytes").hexdigest()
+        rocm_sha = hashlib.sha256(b"rocm-bytes").hexdigest()
+        self.assertIn(f"core/vendor/{cuda_sha}/{cuda_path.name}", transport.objects)
+        self.assertIn(f"core/vendor/{rocm_sha}/{rocm_path.name}", transport.objects)
+
+    def test_missing_local_file_fails_loudly(self) -> None:
+        client, _ = _fake_client()
+        with self.assertRaises(B2SyncError):
+            sync_vendor_files(client, [self.dist_dir / "does-not-exist.zip"])
 
 
 if __name__ == "__main__":
