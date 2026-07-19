@@ -23,6 +23,21 @@ use tower::ServiceExt;
 const SERVER_INSTANCE_TOKEN_ENV: &str = "OPENASR_SERVER_INSTANCE_TOKEN";
 const LIVE_PULL_FIXTURE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The product default `dictation_shortcut` for the host this test binary is
+/// compiled for -- mirrors openasr-core's `default_dictation_shortcut()`
+/// `#[cfg]` split (Ctrl+Win on Windows, Option alone elsewhere), so the
+/// fresh-config assertion below tracks the real default on every platform
+/// instead of a single hardcoded string.
+#[cfg(windows)]
+fn expected_default_dictation_shortcut() -> &'static str {
+    "LControl+LCommand"
+}
+
+#[cfg(not(windows))]
+fn expected_default_dictation_shortcut() -> &'static str {
+    "Alt"
+}
+
 fn sample_wav_bytes() -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
     std::fs::read(path).unwrap()
@@ -615,9 +630,13 @@ async fn config_endpoint_roundtrips_versioned_preferences() {
         document["preferences"]["version"],
         openasr_core::config::PREFERENCES_SCHEMA_VERSION
     );
-    // Fresh-config product defaults surfaced to the desktop: Option (⌥) alone,
-    // push-to-talk on. These are what a cleared-state first launch shows.
-    assert_eq!(document["preferences"]["dictation_shortcut"], "Alt");
+    // Fresh-config product defaults surfaced to the desktop: Option (⌥) alone
+    // on macOS/Linux, Ctrl+Win on Windows, push-to-talk on. These are what a
+    // cleared-state first launch shows.
+    assert_eq!(
+        document["preferences"]["dictation_shortcut"],
+        expected_default_dictation_shortcut()
+    );
     assert_eq!(document["preferences"]["push_to_talk"], true);
     assert_eq!(document["preferences"]["word_timestamps"], false);
 
