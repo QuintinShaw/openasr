@@ -117,6 +117,20 @@ jobs:
     # renames the asset, never the build feature flag); gnu libc is the
     # unsuffixed default, musl would carry `-musl`.
     #
+    # Windows-kernel-dist v2: the two Windows GPU legs (cuda, hip) carry an
+    # extra `-sidecar` asset suffix (`windows-x86_64-cuda-sidecar`,
+    # `windows-x86_64-rocm-sidecar`) -- their vendor GPU runtime DLLs (NVIDIA
+    # cudart/cuBLAS, AMD rocBLAS/hipBLAS) are staged and packaged SEPARATELY
+    # as a large, content-addressed `openasr-vendor-<cuda|rocm>-runtime-<sha12>.zip`
+    # archive (see the "Stage archive contents"/"Build deterministic vendor
+    # archive" steps below and `docs/backend-kernels.md`'s schema v2 section),
+    # so the per-release "sidecar" archive this asset name lands on is just
+    # `openasr.exe` + docs -- small enough that later core releases only ever
+    # re-download this part, reusing a cached vendor layer. The Windows Vulkan
+    # and CPU legs, and every Linux GPU leg, stay self-contained (no `-sidecar`
+    # suffix, no vendor split) -- schema v2's `backends-manifest.json` is
+    # Windows-only (see that doc's "only windows-x86_64 exists today" note).
+    #
     # NOTE: jobs.verify-completeness below hardcodes this same asset/ext list
     # (TARGETS, now friendly asset names) to assert the release ends up with
     # every archive. Keep both in sync when adding/removing a leg. The
@@ -171,7 +185,7 @@ jobs:
             timeout: 120
           - os: windows-latest
             target: x86_64-pc-windows-msvc-cuda
-            asset: windows-x86_64-cuda
+            asset: windows-x86_64-cuda-sidecar
             binary_name: openasr.exe
             archive_ext: zip
             features: cuda
@@ -183,7 +197,9 @@ jobs:
           # but still dynamically loads the ROCm runtime/BLAS DLLs staged
           # below, so it cannot launch on this GPU-less, driver-less runner
           # any more than the CUDA leg can; build + package only.
-          # Asset is `-rocm` (not `-hip`) to match the Linux AMD leg's name.
+          # Asset is `-rocm` (not `-hip`) to match the Linux AMD leg's name,
+          # plus the `-sidecar` suffix (see the "Windows-kernel-dist v2"
+          # comment above).
           # Pinned to windows-2022 like llama.cpp's HIP release job:
           # windows-latest's VS 2026 STL declares the C99 floating
           # comparison macros (isgreater & co.) in a way ROCm clang's HIP
@@ -192,7 +208,7 @@ jobs:
           # so the device compile only works against the VS 2022 STL.
           - os: windows-2022
             target: x86_64-pc-windows-msvc-hip
-            asset: windows-x86_64-rocm
+            asset: windows-x86_64-rocm-sidecar
             binary_name: openasr.exe
             archive_ext: zip
             features: hip
@@ -717,6 +733,21 @@ jobs:
           # macOS/Linux stay statically linked, so this only matches on the
           # Windows CPU build.
           Get-ChildItem "$env:RELEASE_DIR" -Filter "ggml*.dll" | Copy-Item -Destination "$distDir\"
+          # Windows-kernel-dist v2: the vendor GPU runtime DLLs (NVIDIA cudart/
+          # cuBLAS, AMD rocBLAS/hipBLAS) are staged into a SEPARATE directory
+          # from $distDir (the small, per-release "sidecar" archive), so they
+          # can ship as their own large, content-addressed `vendor_layers`
+          # archive instead -- see the "Build deterministic vendor archive"
+          # step below and `docs/backend-kernels.md`'s schema v2 section. This
+          # is the split half of the fix for the old resolve_selected_kernel_
+          # binary staleness bug: keeping the vendor layer cached and
+          # version-independent means a core upgrade only re-downloads the
+          # tiny sidecar, not the whole multi-hundred-MB GPU runtime again.
+          if ("${{ matrix.features }}" -eq "cuda" -or "${{ matrix.features }}" -eq "hip") {
+            $vendorDir = "dist\$archive-vendor"
+            New-Item -ItemType Directory -Force -Path $vendorDir | Out-Null
+            Add-Content $env:GITHUB_ENV "VENDOR_DIR=$vendorDir"
+          }
           if ("${{ matrix.features }}" -eq "cuda") {
             # The CUDA exe dynamically links the CUDA runtime; ship NVIDIA's
             # redistributable runtime DLLs so end users only need a GPU driver
@@ -724,7 +755,8 @@ jobs:
             $cudaDlls = Get-ChildItem (Join-Path $env:CUDA_PATH "bin") -Recurse -File |
               Where-Object { $_.Name -match '^(cudart64|cublas64|cublasLt64)_.*\.dll$' }
             if (-not $cudaDlls) { Write-Error "no CUDA runtime DLLs found under $env:CUDA_PATH\bin" }
-            $cudaDlls | Copy-Item -Destination "$distDir\"
+            $cudaDlls | Copy-Item -Destination $vendorDir
+            Add-Content $env:GITHUB_ENV "VENDOR_LAYER_KEY=cuda-runtime"
           }
           if ("${{ matrix.features }}" -eq "hip") {
             # The HIP exe dynamically links the ROCm runtime + BLAS; ship AMD's
@@ -737,14 +769,15 @@ jobs:
             $hipDlls = Get-ChildItem $hipBin -File |
               Where-Object { $_.Name -match '^(amdhip64|libhipblas|rocblas|libhipblaslt)(_\d+)?\.dll$' }
             if (-not $hipDlls) { Write-Error "no HIP runtime DLLs found under $hipBin" }
-            $hipDlls | Copy-Item -Destination "$distDir\"
-            New-Item -ItemType Directory -Force -Path "$distDir\rocblas\library" | Out-Null
-            Copy-Item (Join-Path $hipBin "rocblas\library\*") "$distDir\rocblas\library\"
+            $hipDlls | Copy-Item -Destination $vendorDir
+            New-Item -ItemType Directory -Force -Path "$vendorDir\rocblas\library" | Out-Null
+            Copy-Item (Join-Path $hipBin "rocblas\library\*") "$vendorDir\rocblas\library\"
             $hipbltLibrary = Join-Path $hipBin "hipblaslt\library"
             if (Test-Path $hipbltLibrary) {
-              New-Item -ItemType Directory -Force -Path "$distDir\hipblaslt\library" | Out-Null
-              Copy-Item (Join-Path $hipbltLibrary "*") "$distDir\hipblaslt\library\"
+              New-Item -ItemType Directory -Force -Path "$vendorDir\hipblaslt\library" | Out-Null
+              Copy-Item (Join-Path $hipbltLibrary "*") "$vendorDir\hipblaslt\library\"
             }
+            Add-Content $env:GITHUB_ENV "VENDOR_LAYER_KEY=rocm-runtime"
           }
           Copy-Item README.md,LICENSE "$distDir\"
           Copy-Item model-registry "$distDir\model-registry" -Recurse
@@ -875,13 +908,16 @@ jobs:
         # Only files we actually build ourselves: openasr.exe, plus the CPU
         # leg's own ggml*.dll (compiled from the vendored submodule by this
         # same job, not a third-party redistributable). Deliberately excludes
-        # the vendor GPU runtime DLLs staged above (NVIDIA cudart64_*/
-        # cublas64_*/cublasLt64_*, AMD amdhip64_*/libhipblas_*/rocblas_*/
-        # libhipblaslt_*, LunarG's vulkan-1.dll) -- those are third-party
-        # redistributables (some already carrying the vendor's own Authenticode
-        # signature) and are not ours to re-sign. vulkan-1.dll does not match
-        # the "ggml*.dll" filter below, so it is excluded automatically; this
-        # comment just makes that exclusion explicit for the reader.
+        # the vendor GPU runtime DLLs (NVIDIA cudart64_*/cublas64_*/
+        # cublasLt64_*, AMD amdhip64_*/libhipblas_*/rocblas_*/libhipblaslt_*,
+        # LunarG's vulkan-1.dll) -- those are third-party redistributables
+        # (some already carrying the vendor's own Authenticode signature) and
+        # are not ours to re-sign. Windows-kernel-dist v2 stages the cuda/hip
+        # vendor DLLs into $env:VENDOR_DIR, a directory this step never scans
+        # (only $env:DIST_DIR), so they are excluded structurally, not just by
+        # the "ggml*.dll" filter below; vulkan-1.dll (staged directly into
+        # $env:DIST_DIR, since vulkan stays self-contained) still relies on
+        # not matching that filter, same as before.
         run: |
           $ErrorActionPreference = "Stop"
           $signTargets = @((Resolve-Path "$env:DIST_DIR\${{ matrix.binary_name }}").Path)
@@ -984,6 +1020,34 @@ jobs:
           }
           Compress-Archive -Path "$env:DIST_DIR" -DestinationPath "dist\$env:ARCHIVE_NAME.${{ matrix.archive_ext }}" -Force
 
+      # Windows-kernel-dist v2: package the vendor GPU runtime DLLs staged
+      # into $env:VENDOR_DIR (cuda/hip only) as their own archive, named after
+      # (and deduped by) its own sha256 -- see
+      # tooling/release-manifest/deterministic_zip.py's module doc for why
+      # this can't reuse PowerShell's Compress-Archive (not byte-deterministic,
+      # which would defeat the whole point of a content-addressed archive).
+      # `shell: bash` (Git Bash, already used by other cross-OS steps in this
+      # same job) keeps the sha12-slicing/renaming logic identical to how a
+      # maintainer would reproduce this locally, instead of PowerShell string
+      # ops. Runs on the runner's preinstalled python3 (falls back to `python`
+      # if the image ever drops the python3 alias).
+      - name: Build deterministic vendor archive (cuda/hip)
+        if: runner.os == 'Windows' && (matrix.features == 'cuda' || matrix.features == 'hip') && env.LEG_SELECTED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_bin="python3"
+          command -v python3 >/dev/null 2>&1 || python_bin="python"
+          raw_zip="${RUNNER_TEMP}/vendor-${{ matrix.features }}-raw.zip"
+          "$python_bin" tooling/release-manifest/deterministic_zip.py create "$raw_zip" "$VENDOR_DIR"
+          sha256="$("$python_bin" -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$raw_zip")"
+          short_hash="${sha256:0:12}"
+          final_name="openasr-vendor-${VENDOR_LAYER_KEY}-${short_hash}.zip"
+          mkdir -p dist
+          cp "$raw_zip" "dist/${final_name}"
+          echo "VENDOR_ASSET_NAME=${final_name}" >> "$GITHUB_ENV"
+          echo "staged dist/${final_name} (vendor layer '${VENDOR_LAYER_KEY}', sha256 ${sha256})"
+
       # Covers every leg that reaches this point, including `experimental:
       # true` ones (windows-arm64, musl) -- they still ship a release asset,
       # so they still get provenance. Only the packaged archive is attested,
@@ -994,12 +1058,43 @@ jobs:
         with:
           subject-path: dist/openasr-${{ env.OPENASR_VERSION }}-${{ matrix.asset }}.${{ matrix.archive_ext }}
 
+      # The vendor archive is also a shipped release asset (schema v2's
+      # `vendor_layers`), so it gets the same provenance attestation as the
+      # sidecar archive above -- only runs when the previous step actually
+      # produced one (cuda/hip legs).
+      - name: Attest build provenance (vendor archive)
+        if: env.LEG_SELECTED == 'true' && env.VENDOR_ASSET_NAME != ''
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/${{ env.VENDOR_ASSET_NAME }}
+
+      # Bundles the sidecar archive path with the vendor archive path (cuda/
+      # hip only) into one multi-line env var, so "Upload archive" below has a
+      # single code path shared by every leg instead of a conditional `path:`
+      # (actions/upload-artifact's glob resolution does not behave well with a
+      # blank pattern line, which a naive `${{ env.X || '' }}` substitution
+      # would produce on non-GPU legs).
+      - name: Resolve upload paths
+        if: env.LEG_SELECTED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths="dist/openasr-${OPENASR_VERSION}-${{ matrix.asset }}.${{ matrix.archive_ext }}"
+          if [ -n "${VENDOR_ASSET_NAME:-}" ]; then
+            paths="${paths}"$'\n'"dist/${VENDOR_ASSET_NAME}"
+          fi
+          {
+            echo "UPLOAD_PATHS<<UPLOAD_PATHS_EOF"
+            echo "$paths"
+            echo "UPLOAD_PATHS_EOF"
+          } >> "$GITHUB_ENV"
+
       - name: Upload archive
         if: env.LEG_SELECTED == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: openasr-${{ matrix.target }}
-          path: dist/openasr-${{ env.OPENASR_VERSION }}-${{ matrix.asset }}.${{ matrix.archive_ext }}
+          path: ${{ env.UPLOAD_PATHS }}
           if-no-files-found: error
 
   xcframework:
@@ -1121,13 +1216,16 @@ jobs:
           path: dist/SHA256SUMS
           if-no-files-found: error
 
-      # UNSIGNED backends-manifest.json: the per-release index the desktop
-      # app uses to download a switchable Windows GPU-kernel sidecar
-      # (vulkan/cuda/hip) at runtime. Only hashes/sizes already-public
-      # archives -- no secret involved, so (unlike signing) this is safe to
-      # run in CI. Skipped on a single-leg `only_target` dispatch (same gate
-      # `verify-completeness` uses below): that run intentionally produces
-      # only one archive, not the full Windows GPU trio this needs.
+      # UNSIGNED backends-manifest.json (schema_version: 2): the per-release
+      # index the desktop app uses to download a switchable Windows GPU-kernel
+      # sidecar (vulkan/cuda/hip) at runtime, plus (for cuda/hip) the separate
+      # content-addressed `vendor_layers` archive each sidecar's `vendor_layer`
+      # field points at -- see `docs/backend-kernels.md`'s schema v2 section.
+      # Only hashes/sizes already-public archives -- no secret involved, so
+      # (unlike signing) this is safe to run in CI. Skipped on a single-leg
+      # `only_target` dispatch (same gate `verify-completeness` uses below):
+      # that run intentionally produces only one archive, not the full
+      # Windows GPU sidecar+vendor set this needs.
       - name: Generate backends-manifest.json (unsigned)
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == ''
         run: |
@@ -1284,8 +1382,8 @@ jobs:
             "macos-arm64:tar.gz"
             "windows-x86_64:zip"
             "windows-x86_64-vulkan:zip"
-            "windows-x86_64-cuda:zip"
-            "windows-x86_64-rocm:zip"
+            "windows-x86_64-cuda-sidecar:zip"
+            "windows-x86_64-rocm-sidecar:zip"
             "linux-x86_64-vulkan:tar.gz"
             "linux-x86_64-cuda:tar.gz"
             "linux-x86_64-rocm:tar.gz"
@@ -1322,3 +1420,20 @@ jobs:
             exit 1
           fi
           echo "release ${tag} has all $(wc -l < "$expected_file" | tr -d ' ') expected assets."
+
+          # Windows-kernel-dist v2 vendor_layers archives: these are named
+          # openasr-vendor-<layer>-<sha12>.zip, content-addressed by their own
+          # sha256, so (unlike every asset above) the exact filename cannot be
+          # hardcoded into TARGETS -- check by glob pattern instead. Every
+          # release that ships a cuda-sidecar/rocm-sidecar archive above must
+          # also ship the vendor layer archive that entry's `vendor_layer`
+          # field points at (see backends_manifest.py's BACKENDS mapping), or
+          # the desktop app's kernel switch would download a sidecar it can
+          # never actually launch.
+          for vendor_key in cuda-runtime rocm-runtime; do
+            if ! grep -Eq "^openasr-vendor-${vendor_key}-[0-9a-f]{12,}\.zip\$" "$actual_file"; then
+              echo "::error::release ${tag} is missing an openasr-vendor-${vendor_key}-<sha12>.zip vendor archive asset"
+              exit 1
+            fi
+          done
+          echo "release ${tag} also has both expected vendor_layers archives (cuda-runtime, rocm-runtime)."

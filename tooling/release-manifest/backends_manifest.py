@@ -7,11 +7,21 @@
 
 `backends-manifest.json` is the per-release index the desktop app reads to
 download a switchable Windows GPU-kernel sidecar (vulkan / cuda / hip) at
-runtime, without shipping every backend in the base install. This script only
-ASSEMBLES the manifest from already-built release archives (reads bytes,
-computes sha256 + size) -- it never touches signing key material. Signing is a
-separate, LOCAL-ONLY step (never run in CI), exactly like
-`tooling/publish-model/scripts/publish_catalog.sh` signs the model catalog:
+runtime, without shipping every backend in the base install. Produces
+`schema_version: 2` (see `crates/openasr-core/src/backend_manifest.rs`'s
+module doc and `docs/backend-kernels.md`): `cuda`/`hip` ship as a small
+per-release "sidecar" archive (just `openasr.exe` + its own build artifacts)
+that references a separate, large, content-addressed `vendor_layers` entry
+(the NVIDIA/AMD redistributable runtime DLLs), which release-binaries.yml
+stages independently and this script only locates + hashes -- it never builds
+either archive itself. `vulkan` stays self-contained (no vendor layer,
+identical shape to a v1 manifest's `vulkan` entry).
+
+This script only ASSEMBLES the manifest from already-built release archives
+(reads bytes, computes sha256 + size) -- it never touches signing key
+material. Signing is a separate, LOCAL-ONLY step (never run in CI), exactly
+like `tooling/publish-model/scripts/publish_catalog.sh` signs the model
+catalog:
 
   cd <repo root>
   OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<real production seed> \\
@@ -32,7 +42,7 @@ import re
 import sys
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PLATFORM = "windows-x86_64"
 DEFAULT_BASE_URL = "https://dl.openasr.org/core"
 DEFAULT_REPO = "QuintinShaw/openasr"
@@ -42,23 +52,39 @@ COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
 # backend key (matches the Cargo feature name, e.g. `hip`) -> the friendly
 # asset-name suffix release-binaries.yml packages it under (matches the
 # `asset:` field in that workflow's matrix -- `hip`'s asset is named `rocm`
-# for cross-platform consistency; see that file's matrix comment) and the PE
+# for cross-platform consistency; see that file's matrix comment), the PE
 # import-table substring(s) the desktop app's runtime backend probe looks for
 # (case-insensitive prefix match against openasr.exe's import table -- any
-# one hit is sufficient).
+# one hit is sufficient), and (v2) the `vendor_layer` key this backend's
+# sidecar archive depends on -- `None` for a self-contained backend (vulkan
+# stays self-contained: the Vulkan loader redistributable is small enough to
+# ship inline, unlike NVIDIA's/AMD's multi-hundred-MB runtimes).
 BACKENDS: dict[str, dict[str, object]] = {
     "vulkan": {
         "asset_suffix": "vulkan",
         "pe_import_markers": ["vulkan-1.dll"],
+        "vendor_layer": None,
     },
     "cuda": {
         "asset_suffix": "cuda",
         "pe_import_markers": ["cublas64_"],
+        "vendor_layer": "cuda-runtime",
     },
     "hip": {
         "asset_suffix": "rocm",
         "pe_import_markers": ["amdhip64_"],
+        "vendor_layer": "rocm-runtime",
     },
+}
+
+# vendor_layer key -> human-readable build toolchain identifier carried in
+# the manifest for traceability only (not used in any verification
+# decision). Keyed independently of BACKENDS since a vendor layer is a
+# core-version- (and, in principle, backend-count-) independent concept; see
+# `VendorLayer` in `crates/openasr-core/src/backend_manifest.rs`.
+VENDOR_LAYER_TOOLCHAINS: dict[str, str] = {
+    "cuda-runtime": "cuda-13.0",
+    "rocm-runtime": "rocm-7.2",
 }
 
 
@@ -76,7 +102,16 @@ def sha256_and_size(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def asset_filename(version: str, asset_suffix: str) -> str:
+def asset_filename(version: str, backend: str) -> str:
+    """The sidecar (small, per-release) archive filename for `backend`. A
+    backend with a `vendor_layer` (cuda/hip) gets a `-sidecar` suffix so it is
+    visually distinct from the (large, content-addressed) vendor archive its
+    manifest entry points at; a self-contained backend (vulkan) keeps the
+    plain v1-shaped name."""
+    spec = BACKENDS[backend]
+    asset_suffix = spec["asset_suffix"]
+    if spec.get("vendor_layer"):
+        return f"openasr-{version}-{PLATFORM}-{asset_suffix}-sidecar.zip"
     return f"openasr-{version}-{PLATFORM}-{asset_suffix}.zip"
 
 
@@ -84,8 +119,7 @@ def backend_entry(
     version: str, backend: str, dist_dir: Path, base_url: str, repo: str
 ) -> dict[str, object]:
     spec = BACKENDS[backend]
-    asset_suffix = spec["asset_suffix"]
-    filename = asset_filename(version, asset_suffix)  # type: ignore[arg-type]
+    filename = asset_filename(version, backend)
     path = dist_dir / filename
     if not path.is_file():
         raise BackendsManifestError(
@@ -94,7 +128,7 @@ def backend_entry(
     sha256, size_bytes = sha256_and_size(path)
     if size_bytes == 0:
         raise BackendsManifestError(f"backend '{backend}': archive is empty: {path}")
-    return {
+    entry: dict[str, object] = {
         "asset": filename,
         "size_bytes": size_bytes,
         "sha256": sha256,
@@ -103,6 +137,60 @@ def backend_entry(
             f"https://github.com/{repo}/releases/download/v{version}/{filename}",
         ],
         "pe_import_markers": list(spec["pe_import_markers"]),  # type: ignore[arg-type]
+    }
+    vendor_layer = spec.get("vendor_layer")
+    if vendor_layer:
+        entry["vendor_layer"] = vendor_layer
+    return entry
+
+
+def vendor_layer_entry(
+    vendor_key: str, version: str, dist_dir: Path, base_url: str, repo: str
+) -> dict[str, object]:
+    """Locate the already-built, content-addressed vendor archive for
+    `vendor_key` (e.g. `"cuda-runtime"`) under `dist_dir` -- release-binaries.yml
+    stages it as `openasr-vendor-<vendor_key>-<sha12>.zip`, where `<sha12>` is
+    the first 12 hex chars of the archive's own sha256 (computed once the
+    deterministic zip is built; see that workflow's "Stage archive contents"
+    step) -- hash it, and assemble its manifest entry. Fails loudly if the
+    archive is missing, ambiguous, or its filename's short hash does not
+    actually prefix the freshly computed sha256 (a staging bug that would
+    otherwise silently ship a mislabeled/stale vendor archive under a
+    content-addressed name other code trusts at face value)."""
+    matches = sorted(dist_dir.glob(f"openasr-vendor-{vendor_key}-*.zip"))
+    if not matches:
+        raise BackendsManifestError(
+            f"vendor layer '{vendor_key}': expected archive not found under {dist_dir} "
+            f"(glob 'openasr-vendor-{vendor_key}-*.zip')"
+        )
+    if len(matches) > 1:
+        raise BackendsManifestError(
+            f"vendor layer '{vendor_key}': multiple candidate archives found: "
+            f"{[path.name for path in matches]}"
+        )
+    path = matches[0]
+    sha256, size_bytes = sha256_and_size(path)
+    if size_bytes == 0:
+        raise BackendsManifestError(f"vendor layer '{vendor_key}': archive is empty: {path}")
+
+    short_hash = path.name.removeprefix(f"openasr-vendor-{vendor_key}-").removesuffix(".zip")
+    if not short_hash or not sha256.startswith(short_hash.lower()):
+        raise BackendsManifestError(
+            f"vendor layer '{vendor_key}': filename {path.name} embeds short hash "
+            f"'{short_hash}' that does not prefix-match its actual sha256 {sha256} -- "
+            "refusing a mislabeled vendor archive (content-addressed dedup depends on "
+            "this being honest)"
+        )
+
+    return {
+        "sha256": sha256,
+        "asset": path.name,
+        "size_bytes": size_bytes,
+        "urls": [
+            f"{base_url}/vendor/{sha256}/{path.name}",
+            f"https://github.com/{repo}/releases/download/v{version}/{path.name}",
+        ],
+        "toolchain": VENDOR_LAYER_TOOLCHAINS[vendor_key],
     }
 
 
@@ -137,16 +225,35 @@ def build_manifest(
         for backend in selected
     }
 
-    return {
+    # Only assemble a vendor_layers entry for a layer some SELECTED backend
+    # actually references (e.g. `--backend vulkan` alone needs none at all;
+    # a single-leg `only_target` dry-run should not demand a vendor archive
+    # for a backend that was not built this run).
+    needed_vendor_layers = sorted(
+        {
+            spec["vendor_layer"]  # type: ignore[index]
+            for backend, spec in BACKENDS.items()
+            if backend in selected and spec.get("vendor_layer")
+        }
+    )
+    vendor_layers = {
+        key: vendor_layer_entry(key, version, dist_dir, base_url, repo)
+        for key in needed_vendor_layers
+    }
+
+    manifest: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "core_version": version,
         "source_commit": source_commit.lower(),
-        "platforms": {
-            PLATFORM: {
-                "backends": {backend: entries[backend] for backend in selected},
-            },
+    }
+    if vendor_layers:
+        manifest["vendor_layers"] = vendor_layers
+    manifest["platforms"] = {
+        PLATFORM: {
+            "backends": {backend: entries[backend] for backend in selected},
         },
     }
+    return manifest
 
 
 def manifest_url_for(version: str, base_url: str = DEFAULT_BASE_URL) -> str:
@@ -170,7 +277,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--dist-dir",
         required=True,
         type=Path,
-        help="Directory containing the built openasr-<version>-windows-x86_64-{vulkan,cuda,rocm}.zip archives",
+        help=(
+            "Directory containing the built openasr-<version>-windows-x86_64-vulkan.zip, "
+            "-{cuda,rocm}-sidecar.zip, and openasr-vendor-{cuda,rocm}-runtime-<sha12>.zip archives"
+        ),
     )
     generate.add_argument("--out", required=True, type=Path, help="Output backends-manifest.json path")
     generate.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Primary CDN base URL (default: %(default)s)")
