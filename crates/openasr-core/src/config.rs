@@ -663,10 +663,31 @@ fn render_download_source_pref(pref: &DownloadSourcePref) -> String {
     }
 }
 
-/// The product default dictation trigger: Option (macOS ⌥) alone, held or tapped
-/// per the push-to-talk mode. This is the single source of truth for the
-/// first-launch shortcut; the desktop frontend's `DEFAULT_DESKTOP_PREFERENCES`
-/// only mirrors it as an offline fallback (`"Alt"` <-> `["⌥"]`).
+/// The product default dictation trigger, held or tapped per the push-to-talk
+/// mode. This is the single source of truth for the first-launch shortcut;
+/// the desktop frontend's `DEFAULT_DESKTOP_PREFERENCES` only mirrors it as an
+/// offline fallback.
+///
+/// macOS/Linux: Option alone (`"Alt"` <-> `["⌥"]`). Windows ships a LEFT
+/// Ctrl+LEFT Win chord instead (`"LControl+LCommand"` <-> `["L⌃", "L⌘"]` on
+/// the desktop frontend) -- bare Alt collides there with the native
+/// Alt-menu-mode (WM_SYSKEYDOWN) and Win-key Start-Menu quirks that can steal
+/// window focus mid-press (see the desktop's dictation_hotkey.rs /
+/// ShortcutRecorder). It is pinned to the LEFT side of each key specifically
+/// (not the unsided `"Control+Command"`, which matched either side and was
+/// the default through 2026-07): the right Ctrl/Win keys stay completely free
+/// for their normal OS/IME use. `"LCommand"` here is the LITERAL Windows key
+/// (left side), not the cross-platform `"CommandOrControl"` alias -- the two
+/// must never be conflated, or a recorded Win key silently resolves back to
+/// Ctrl on Windows. See dictation_hotkey.rs's `FLAG_L*`/`MOD_*_L` side bits
+/// and `mods_satisfy` for how a sided token is matched at runtime; a legacy
+/// persisted `"Control+Command"` config keeps matching either side unchanged.
+#[cfg(windows)]
+fn default_dictation_shortcut() -> Option<String> {
+    Some("LControl+LCommand".to_string())
+}
+
+#[cfg(not(windows))]
 fn default_dictation_shortcut() -> Option<String> {
     Some("Alt".to_string())
 }

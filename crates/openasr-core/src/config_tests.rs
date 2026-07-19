@@ -1,5 +1,20 @@
 use super::*;
 
+/// The product default `dictation_shortcut` for the host the test suite is
+/// compiled for -- mirrors `default_dictation_shortcut()`'s own `#[cfg]`
+/// split so these tests assert the SAME per-platform default the function
+/// actually returns, not a single hardcoded value that would false-fail on
+/// whichever platform did not get the hardcoded string.
+#[cfg(windows)]
+fn expected_default_dictation_shortcut() -> &'static str {
+    "LControl+LCommand"
+}
+
+#[cfg(not(windows))]
+fn expected_default_dictation_shortcut() -> &'static str {
+    "Alt"
+}
+
 fn registry() -> Vec<ModelCard> {
     vec![
         crate::registry::test_model_card("qwen3-asr-0.6b"),
@@ -130,12 +145,13 @@ fn missing_config_file_returns_default_config_document_preferences() {
     assert_eq!(document.preferences.hotwords, Vec::<String>::new());
     assert_eq!(document.preferences.theme, AppearanceTheme::System);
     assert_eq!(document.preferences.density, AppearanceDensity::Comfortable);
-    // Product default: Option (⌥) alone, push-to-talk on. A fresh install (no
-    // config file) must land on these; the desktop first-launch experience
-    // reads them straight through /v1/config.
+    // Product default: Option (⌥) alone on macOS/Linux, Ctrl+Win on Windows
+    // (see default_dictation_shortcut's doc comment), push-to-talk on. A fresh
+    // install (no config file) must land on these; the desktop first-launch
+    // experience reads them straight through /v1/config.
     assert_eq!(
         document.preferences.dictation_shortcut.as_deref(),
-        Some("Alt")
+        Some(expected_default_dictation_shortcut())
     );
     assert!(document.preferences.push_to_talk);
     assert_eq!(document.preferences.inference_threads, None);
@@ -150,7 +166,7 @@ fn preferences_missing_dictation_fields_fall_back_to_product_defaults() {
         serde_json::from_str(r#"{ "config": {}, "preferences": { "language": "en" } }"#).unwrap();
     assert_eq!(
         document.preferences.dictation_shortcut.as_deref(),
-        Some("Alt")
+        Some(expected_default_dictation_shortcut())
     );
     assert!(document.preferences.push_to_talk);
 }
