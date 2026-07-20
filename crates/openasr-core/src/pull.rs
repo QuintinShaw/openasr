@@ -1459,6 +1459,12 @@ fn download_parallel_attempt<C: DownloadClient + ?Sized>(
         .collect();
 
     if missing.is_empty() {
+        // A prior run already fetched every segment; this attempt only verifies.
+        // Signal `Verifying` before the full-file hash for the same reason as the
+        // completion paths below.
+        progress(PullProgress::Verifying {
+            bytes_done: target.size_bytes,
+        });
         let (actual_size, sha256) = file_size_and_sha256(&paths.partial_path)?;
         return Ok(ParallelAttemptOutcome::Completed(DownloadedPartial {
             bytes_done: actual_size,
@@ -1606,6 +1612,13 @@ fn download_parallel_attempt<C: DownloadClient + ?Sized>(
         .filter(|index| *index != probe_index)
         .collect();
     if remaining.is_empty() {
+        // Only the probe segment was missing and it just finished: the download
+        // is complete. Same rationale as the main-loop completion below -- signal
+        // `Verifying` before the full-file hash so the UI leaves the download
+        // phase rather than freezing at 100%.
+        progress(PullProgress::Verifying {
+            bytes_done: target.size_bytes,
+        });
         sync_partial_file(&paths.partial_path)?;
         let (actual_size, sha256) = file_size_and_sha256(&paths.partial_path)?;
         let _ = fs::remove_file(&paths.partial_segments_meta_path);
@@ -1722,6 +1735,16 @@ fn download_parallel_attempt<C: DownloadClient + ?Sized>(
         });
     }
 
+    // Every segment is on disk; the download is done. The integrity gate below
+    // rereads and hashes the whole (up to multi-GB) file, which on a large pack
+    // takes seconds with no byte progress to report. Signal `Verifying` first so
+    // consumers leave the "downloading" phase instead of appearing frozen at
+    // 100% while the hash runs (the single-stream path hashes incrementally as
+    // it downloads and so never needs this). `verify_partial_and_install` emits
+    // `Verifying` again after this returns; the repeat is idempotent.
+    progress(PullProgress::Verifying {
+        bytes_done: target.size_bytes,
+    });
     sync_partial_file(&paths.partial_path)?;
     let (actual_size, sha256) = file_size_and_sha256(&paths.partial_path)?;
     let _ = fs::remove_file(&paths.partial_segments_meta_path);

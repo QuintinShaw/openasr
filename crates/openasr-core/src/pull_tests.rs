@@ -2806,6 +2806,81 @@ fn parallel_download_splits_into_segments_and_reassembles_correctly() {
 }
 
 #[test]
+fn parallel_download_emits_verifying_after_segments_before_hash() {
+    // Guards the progress-phase fix: once the chunked path has every segment on
+    // disk it rereads and hashes the whole file, which is silent (no byte
+    // progress) and can take seconds on a multi-GB pack. The download path must
+    // emit `Verifying` before that hash so the UI leaves the "downloading" phase
+    // instead of freezing at 100%. Observable proxy: a clean chunked pull emits
+    // `Verifying` twice -- once from the chunked completion (pre-hash) and once
+    // from `verify_partial_and_install` -- versus once without the fix, and every
+    // `Downloading` event precedes the first `Verifying`.
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let segment_bytes = small_segment_bytes(bytes.len(), 5);
+    assert!(
+        segment_count(bytes.len() as u64, segment_bytes) >= 2,
+        "fixture too small to exercise chunking"
+    );
+
+    let server = RangeServerClient::new(bytes.clone());
+    let (mut probe_client, factory) = parallel_probe_and_factory(&server);
+    let parallel = ParallelDownloadConfig {
+        connections: 4,
+        factory: &*factory,
+    };
+
+    let phases = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let phases_sink = phases.clone();
+    let installed = pull_model_pack_with_client_parallel(
+        &resolved,
+        temp.path(),
+        &mut probe_client,
+        parallel_test_options(segment_bytes),
+        parallel,
+        move |event| {
+            let name = match event {
+                PullProgress::UsingInstalled { .. } => "using_installed",
+                PullProgress::DownloadStarted { .. } => "download_started",
+                PullProgress::Downloading { .. } => "downloading",
+                PullProgress::Verifying { .. } => "verifying",
+                PullProgress::Installed { .. } => "installed",
+            };
+            phases_sink.lock().unwrap().push(name);
+        },
+        || false,
+        || false,
+    )
+    .unwrap();
+    assert_eq!(installed.pull, "moonshine-tiny:q8");
+
+    let phases = phases.lock().unwrap().clone();
+    let first_verifying = phases
+        .iter()
+        .position(|phase| *phase == "verifying")
+        .expect("a chunked pull must emit Verifying");
+    let last_downloading = phases.iter().rposition(|phase| *phase == "downloading");
+    if let Some(last_downloading) = last_downloading {
+        assert!(
+            last_downloading < first_verifying,
+            "every Downloading event must precede the first Verifying: {phases:?}"
+        );
+    }
+    assert_eq!(
+        phases.iter().filter(|phase| **phase == "verifying").count(),
+        2,
+        "chunked download must signal Verifying before its own hash (plus the \
+         install-time verify): {phases:?}"
+    );
+    assert_eq!(
+        phases.last().copied(),
+        Some("installed"),
+        "the terminal event must be Installed: {phases:?}"
+    );
+}
+
+#[test]
 fn parallel_download_falls_back_to_sequential_when_source_ignores_range() {
     let bytes = tiny_pack_bytes();
     let resolved = resolved_for(&bytes);
