@@ -2071,3 +2071,101 @@ fn doctor_marks_unknown_saved_default_backend_as_unknown() {
         .success()
         .stdout(predicate::str::contains("Default backend: mokk (unknown)"));
 }
+
+// `__openasr-verify-backends-manifest` is the read-only counterpart to
+// `__openasr-sign-backends-manifest`, used as a post-release CI probe (see
+// tooling/release-manifest/README.md's "Signing" section and
+// .github/workflows/release-binaries.yml's verify-backends-manifest-signature
+// job). It has no local-dev key -- verification is hardcoded to the real
+// production trust root -- so these tests can only exercise the fail-closed
+// paths (a valid production signature can't be minted without the real seed,
+// which never lives in this repo or CI).
+
+fn write_probe_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, contents).expect("write probe fixture file");
+    path
+}
+
+#[test]
+fn verify_backends_manifest_rejects_a_missing_signature_file() {
+    let home = temp_home();
+    let manifest = write_probe_file(
+        home.path(),
+        "backends-manifest.json",
+        r#"{"schema_version":2,"core_version":"0.1.20"}"#,
+    );
+
+    openasr()
+        .arg("__openasr-verify-backends-manifest")
+        .arg(&manifest)
+        .arg("--signature")
+        .arg(home.path().join("backends-manifest.signature.json"))
+        .arg("--manifest-url")
+        .arg("https://dl.openasr.org/core/v0.1.20/backends-manifest.json")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Could not read backends-manifest signature",
+        ));
+}
+
+#[test]
+fn verify_backends_manifest_rejects_a_malformed_signature_file() {
+    let home = temp_home();
+    let manifest = write_probe_file(
+        home.path(),
+        "backends-manifest.json",
+        r#"{"schema_version":2,"core_version":"0.1.20"}"#,
+    );
+    let signature = write_probe_file(home.path(), "backends-manifest.signature.json", "not json");
+
+    openasr()
+        .arg("__openasr-verify-backends-manifest")
+        .arg(&manifest)
+        .arg("--signature")
+        .arg(&signature)
+        .arg("--manifest-url")
+        .arg("https://dl.openasr.org/core/v0.1.20/backends-manifest.json")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "did not verify against the production trust root",
+        ));
+}
+
+#[test]
+fn verify_backends_manifest_rejects_a_signature_bound_to_a_different_url() {
+    let home = temp_home();
+    let manifest = write_probe_file(
+        home.path(),
+        "backends-manifest.json",
+        r#"{"schema_version":2,"core_version":"0.1.20"}"#,
+    );
+    // Well-formed shape but signed (nonsense value) for a different manifest
+    // URL than the one this probe expects -- must be rejected as a URL
+    // mismatch before any crypto check even runs, exactly the class of bug
+    // #145 fixed on the desktop fetch side.
+    let signature = write_probe_file(
+        home.path(),
+        "backends-manifest.signature.json",
+        &format!(
+            r#"{{"schema_version":1,"manifest_url":"https://dl.openasr.org/core/v9.9.9/backends-manifest.json","manifest_sha256":"{}","signature":{{"algorithm":"ed25519","key_id":"openasr-catalog-v1","value":"{}"}}}}"#,
+            "0".repeat(64),
+            "0".repeat(128)
+        ),
+    );
+
+    openasr()
+        .arg("__openasr-verify-backends-manifest")
+        .arg(&manifest)
+        .arg("--signature")
+        .arg(&signature)
+        .arg("--manifest-url")
+        .arg("https://dl.openasr.org/core/v0.1.20/backends-manifest.json")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "did not verify against the production trust root",
+        ));
+}

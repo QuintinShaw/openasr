@@ -1437,3 +1437,97 @@ jobs:
             fi
           done
           echo "release ${tag} also has both expected vendor_layers archives (cuda-runtime, rocm-runtime)."
+
+  verify-backends-manifest-signature:
+    name: Verify backends-manifest signature (post-release probe)
+    needs: upload-to-release
+    # Read-only fixed-it-forward guard for the exact gap that shipped core
+    # 0.1.16-0.1.19 with a never-signed backends-manifest.json: the Ed25519
+    # signing seed is LOCAL ONLY (tooling/release-manifest/README.md
+    # "Signing" -- never enters CI, same as the model catalog), so this job
+    # only GETs the already-published `backends-manifest.json` +
+    # `backends-manifest.signature.json` release assets and verifies the
+    # signature against openasr-core's built-in production trust root. It
+    # never signs, never touches the seed, never writes a release asset.
+    #
+    # Timing: the LOCAL signing step is a maintainer action that happens
+    # AFTER this whole workflow finishes (see the "Post-release checklist" in
+    # tooling/release-manifest/README.md), so gate this to `workflow_dispatch`
+    # only -- on the automatic push-tag/workflow_call trigger that creates the
+    # release, the signature cannot exist yet, and probing then would make
+    # this job structurally red on every fresh release instead of catching a
+    # forgotten signing step. Re-run this workflow via `workflow_dispatch`
+    # with `ref: v<version>` (optionally `only_target` set to any already-green
+    # leg, to skip rebuilding the whole matrix) as the last item of the
+    # post-release checklist to get a real red/green signal here.
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.upload-to-release.outputs.tag != '' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Resolve workspace version
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
+          if [ -z "${version}" ]; then
+            echo "could not read workspace version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "OPENASR_VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - name: Download backends-manifest + signature from the release
+        run: |
+          set -euo pipefail
+          tag="${{ needs.upload-to-release.outputs.tag }}"
+          mkdir -p manifest-probe
+          if ! gh release download "$tag" --repo "${{ github.repository }}" \
+              -p backends-manifest.json -p backends-manifest.signature.json \
+              -D manifest-probe --clobber; then
+            echo "::error::backends-manifest signature missing for release ${tag} -- did you forget the LOCAL-only signing step (tooling/release-manifest/README.md 'Signing': __openasr-sign-backends-manifest, then 'gh release upload ${tag} backends-manifest.signature.json')? Do not ship this release until it is signed."
+            exit 1
+          fi
+          if [ ! -s manifest-probe/backends-manifest.json ] || [ ! -s manifest-probe/backends-manifest.signature.json ]; then
+            echo "::error::backends-manifest.json and/or backends-manifest.signature.json are not attached to release ${tag} -- run the LOCAL-only signing step and 'gh release upload' before shipping."
+            exit 1
+          fi
+
+      - name: Install Linux audio build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: verify-backends-manifest-signature
+
+      # Reuses openasr-core's own verify_backends_manifest_signature (the
+      # SAME function the desktop app calls, hardcoded to the real
+      # production trust root) via the __openasr-verify-backends-manifest
+      # CLI probe -- no crypto or trust-root duplication here. --manifest-url
+      # MUST be the canonical dl.openasr.org URL (what the signature is
+      # actually bound to, per canonical_manifest_url), regardless of the
+      # fact this step fetched the bytes from GitHub Releases, not
+      # dl.openasr.org itself (mirrors the multi-mirror fix for #145).
+      - name: Verify signature against the production trust root
+        run: |
+          set -euo pipefail
+          tag="${{ needs.upload-to-release.outputs.tag }}"
+          expected_url="https://dl.openasr.org/core/v${OPENASR_VERSION}/backends-manifest.json"
+          if ! cargo run --quiet -p openasr-cli -- __openasr-verify-backends-manifest \
+              manifest-probe/backends-manifest.json \
+              --signature manifest-probe/backends-manifest.signature.json \
+              --manifest-url "$expected_url"; then
+            echo "::error::backends-manifest signature for release ${tag} does not verify (missing/invalid/wrong URL) -- do not ship this release until it is re-signed. See tooling/release-manifest/README.md 'Signing'."
+            exit 1
+          fi
+          echo "backends-manifest signature for ${tag} verifies against ${expected_url}."
