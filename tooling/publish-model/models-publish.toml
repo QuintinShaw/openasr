@@ -232,8 +232,7 @@ needs_license_flags = false
 # FireRedPunc punctuation capability pack. Imported via the public
 # `openasr model-pack import firered-punc` subcommand from the upstream
 # model.pth.tar (chinese-lert-base BERT + 5-class head) normalized to
-# safetensors by pt_to_safetensors.py. Staged to a private HF repo; the
-# catalog entry stays public:false until a deliberate later --public flip.
+# safetensors by pt_to_safetensors.py.
 ["firered-punc"]
 import_subcommand = "import firered-punc"
 upstream_repo = "FireRedTeam/FireRedPunc"
