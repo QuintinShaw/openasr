@@ -637,7 +637,7 @@ license_class = "permissive"
 languages = ["en", "zh"]
 quants = ["q4_k"]
 recommended_quant = "q4_k"
-sort_weight = 916
+sort_weight = 890
 upstream_release_date = "2026-02-12"
 min_core_version = "0.1.17"
 min_cli_version = "0.1.17"
@@ -672,7 +672,7 @@ license_class = "permissive"
 languages = ["en", "yue", "zh"]
 quants = ["q4_k"]
 recommended_quant = "q4_k"
-sort_weight = 914
+sort_weight = 888
 min_core_version = "0.1.17"
 min_cli_version = "0.1.17"
 

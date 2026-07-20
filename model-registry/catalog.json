@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-19T02:03:57+00:00",
+  "generated_at": "2026-07-20T22:36:24+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -157,79 +157,6 @@
       "upstream_release_date": "2026-01-28"
     },
     {
-      "id": "firered2-llm",
-      "kind": "asr-model",
-      "display_name": "FireRedASR2 LLM",
-      "family": "firered2-llm",
-      "aliases": [
-        "firered-llm",
-        "firered2"
-      ],
-      "pull_alias": "firered2-llm",
-      "size": "8b",
-      "languages": [
-        "en",
-        "zh"
-      ],
-      "vendor": "FireRedTeam",
-      "license": "Apache-2.0",
-      "license_url": "https://huggingface.co/FireRedTeam/FireRedASR2-LLM",
-      "license_class": "permissive",
-      "hf_repo": "OpenASR/firered2-llm",
-      "hf_revision": "96cb7c5d2c03935351e160094b438e44c1acc19f",
-      "public": true,
-      "min_cli_version": "0.1.17",
-      "recommended_quant": "q4_k",
-      "pull_recommended": "firered2-llm:q4",
-      "prose": {
-        "tagline": "FireRedTeam's LLM-backbone Mandarin-first bilingual ASR \u2014 8B+ parameters engineered for state-of-the-art Chinese and dialect accuracy",
-        "overview": [
-          "FireRedASR2-LLM is the Encoder-Adapter-LLM member of **FireRedASR2**, the successor to\nFireRedTeam's open-source industrial-grade **FireRedASR** speech-recognition family, released as\npart of the **FireRedASR2S** all-in-one ASR system. At 8B+ parameters with an LLM-scale decoder\nbackbone, it is the bigger and more accurate sibling of the already-available\n**firered-aed-l-v2** (FireRedASR2-AED, a 1.1B-parameter attention encoder-decoder reporting\n3.05%/11.67% avg CER). The FireRedASR2S technical report (arXiv:2603.10420) and the upstream model\ncard both report **2.89% average Character Error Rate** across four public Mandarin benchmarks\nand **11.55% average CER** across 19 public Chinese dialect/accent benchmarks -- outperforming\nDoubao-ASR (3.69%/15.39%), Qwen3-ASR (3.76%/11.85%), and Fun-ASR (4.16%/12.76%) on the paper's own\ncomparison table. These numbers belong to FireRedASR2-LLM and should not be confused with the\nsmaller firered-aed-l-v2's 3.05%/11.67% figures. The model is bilingual (Mandarin Chinese and\nEnglish). This OpenASR pack distributes the q4_k quantization build, repackaged as an `.oasr`\npack that runs natively in the OpenASR runtime -- fully local, no Python at inference time, no\ncloud upload. Licensed under Apache-2.0, inherited from the upstream release."
-        ],
-        "highlights": [
-          "\ud83e\udd47 **Best-in-class Mandarin accuracy** \u2014 2.89% average CER across four public Mandarin benchmarks, outperforming Doubao-ASR (3.69%), Qwen3-ASR (3.76%), and Fun-ASR (4.16%) on the same comparison table (arXiv:2603.10420; FireRedTeam's FireRedASR2-LLM model card)",
-          "\ud83d\udde3\ufe0f **Leading dialect and accent coverage** \u2014 11.55% average CER across 19 public Chinese dialect/accent benchmarks, ahead of Doubao-ASR (15.39%) and Qwen3-ASR (11.85%) (arXiv:2603.10420; FireRedTeam's FireRedASR2-LLM model card)",
-          "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **Bilingual Mandarin + English** \u2014 one 8B+ parameter checkpoint handles both languages, as demonstrated in the upstream model card's bilingual examples (FireRedTeam's FireRedASR2-LLM model card)",
-          "\ud83e\udde0 **LLM-scale decoder backbone** \u2014 Encoder-Adapter-LLM architecture at 8B+ parameters, the bigger and more accurate sibling of the already-available firered-aed-l-v2 (1.1B AED, 3.05%/11.67% avg CER) (FireRedTeam's FireRedASR2-LLM model card)",
-          "\ud83d\udd12 **Fully local, q4_k build** \u2014 runs 100% on-device via OpenASR's .oasr runtime with no cloud upload, under the Apache-2.0 license inherited from upstream (FireRedTeam's FireRedASR2-LLM model card)"
-        ]
-      },
-      "quants": [
-        {
-          "quant": "q4_k",
-          "suffix": "q4",
-          "pull": "firered2-llm:q4",
-          "filename": "firered2-llm-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/firered2-llm/resolve/96cb7c5d2c03935351e160094b438e44c1acc19f/firered2-llm-q4_k.oasr",
-          "sha256": "872aed2e43e25fee29f6195d8a92ac9223939bddf1f4e66cde46da9d152f17de",
-          "size_bytes": 4732546720,
-          "recommended": true,
-          "perf": {
-            "rtf_cpu": 1.9775892917272728,
-            "rtf_metal": 0.9289458977272728,
-            "peak_rss_bytes": 6711148544,
-            "jfk_wer_vs_fp16": 0.0
-          }
-        }
-      ],
-      "language_mode": "fixed_multilingual",
-      "sort_weight": 916,
-      "prose_locales": {
-        "zh-CN": {
-          "tagline": "8B+ \u5927\u6a21\u578b\u52a0\u6301\u7684\u8bed\u97f3\u8bc6\u522b \u2014 \u666e\u901a\u8bdd\u548c\u65b9\u8a00\u90fd\u80fd\u7cbe\u51c6\u62ff\u634f",
-          "highlights": [
-            "\ud83e\udd47 **\u666e\u901a\u8bdd\u5b57\u9519\u7387\u4f4e\u81f3 2.89%** \u2014 \u56db\u5927\u516c\u5f00\u8bc4\u6d4b\u5747\u503c\uff0c\u628a Doubao-ASR\uff083.69%\uff09\u3001Qwen3-ASR\uff083.76%\uff09\u548c Fun-ASR\uff084.16%\uff09\u7edf\u7edf\u7529\u5728\u8eab\u540e\uff08arXiv:2603.10420\uff1bFireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09",
-            "\ud83d\udde3\ufe0f **19 \u79cd\u65b9\u8a00\u53e3\u97f3\u901a\u901a\u62ff\u4e0b** \u2014 \u5e73\u5747\u5b57\u9519\u7387 11.55%\uff0cDoubao-ASR 15.39%\u3001Qwen3-ASR 11.85% \u90fd\u4e0d\u5728\u8bdd\u4e0b\uff08arXiv:2603.10420\uff1bFireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09",
-            "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **\u4e2d\u82f1\u53cc\u8bed\u4e00\u628a\u6293** \u2014 \u4e00\u4e2a 8B+ \u53c2\u6570\u7684\u6a21\u578b\u540c\u65f6\u641e\u5b9a\u666e\u901a\u8bdd\u548c\u82f1\u8bed\uff0c\u4e0d\u7528\u5207\u6362\u3001\u4e0d\u7528\u4e0b\u4e24\u4efd\uff0c\u7701\u5fc3\u5230\u5bb6\uff08FireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09",
-            "\ud83e\udde0 **LLM \u7ea7\u522b\u7684\u5927\u6a21\u578b\u89e3\u7801\u9aa8\u67b6** \u2014 8B+ \u53c2\u6570 Encoder-Adapter-LLM \u67b6\u6784\uff0c\u662f\u5df2\u4e0a\u67b6\u7684 firered-aed-l-v2\uff081.1B AED\uff0c\u5747\u503c\u5b57\u9519\u7387 3.05%/11.67%\uff09\u7684\u5927\u53f7\u8fdb\u5316\u4f53\uff0c\u7cbe\u5ea6\u66f4\u4e0a\u4e00\u5c42\u697c\uff08FireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09",
-            "\ud83d\udd12 **100% \u672c\u5730\u8dd1\uff0c\u6570\u636e\u4e0d\u51fa\u95e8** \u2014 q4_k \u91cf\u5316 .oasr \u5305\uff0cOpenASR \u5f15\u64ce\u76f4\u63a5\u52a0\u8f7d\uff0cApache-2.0 \u5f00\u6e90\u534f\u8bae\u653e\u5fc3\u7528\uff08FireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09"
-          ]
-        }
-      },
-      "upstream_release_date": "2026-02-12",
-      "min_core_version": "0.1.17"
-    },
-    {
       "id": "parakeet-tdt-0.6b-v3",
       "kind": "asr-model",
       "display_name": "Parakeet TDT 0.6B v3",
@@ -353,81 +280,6 @@
       },
       "upstream_release_date": "2025-08-14",
       "min_core_version": "0.1.9"
-    },
-    {
-      "id": "mimo-v2.5-asr",
-      "kind": "asr-model",
-      "display_name": "MiMo-V2.5-ASR",
-      "family": "mimo-asr",
-      "aliases": [
-        "mimo",
-        "mimo-v2.5"
-      ],
-      "pull_alias": "mimo-v2.5-asr",
-      "size": "8b",
-      "languages": [
-        "en",
-        "yue",
-        "zh"
-      ],
-      "vendor": "XiaomiMiMo",
-      "license": "MIT",
-      "license_url": "https://huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR/blob/main/README.md",
-      "license_class": "permissive",
-      "hf_repo": "OpenASR/mimo-v2.5-asr",
-      "hf_revision": "d555242ba962b3cda675789e0a4a0e9e87d7c947",
-      "public": true,
-      "min_cli_version": "0.1.17",
-      "recommended_quant": "q4_k",
-      "pull_recommended": "mimo-v2.5-asr:q4",
-      "prose": {
-        "tagline": "Xiaomi MiMo's end-to-end 8B speech model \u2014 state-of-the-art Mandarin, English, and Cantonese recognition, fully on-device",
-        "overview": [
-          "MiMo-V2.5-ASR is a state-of-the-art end-to-end automatic speech recognition model developed by\nthe Xiaomi MiMo team. Audio first passes through the **MiMo-Audio-Tokenizer**, a 1.2B-parameter\ntransformer operating at 25 Hz that uses an eight-layer residual vector quantization (RVQ) stack\nto produce 200 discrete tokens per second; a patch encoder then aggregates four consecutive time\nsteps into a single patch, downsampling the sequence to a compact 6.25 Hz representation. The\ntokenizer was trained from scratch on a 10-million-hour corpus, jointly optimizing semantic and\nreconstruction objectives (huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer). Those tokens feed an\n**8B-parameter transformer decoder** with Flash Attention support, trained through large-scale\nmid-training, high-quality supervised fine-tuning, and a novel reinforcement-learning algorithm\n(huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR). On Xiaomi's published benchmarks the model achieves\n**2.52% CER on AiShell-2** and **2.41% on Fleurs-Zh** for Mandarin -- leading both FunASR-1.5 and\nSeed-ASR 2.0 -- alongside **5.73% average WER** across eight English Open ASR Leaderboard test\nsets with **1.45% on LibriSpeech-Clean**. For Cantonese, the model scores **3.28% CER on\nFleurs-Yue** and **7.21% CER** on a second Cantonese test set (Xiaomi's published MiMo-V2.5-ASR\nbenchmark results). It handles code-switched Mandarin-English speech without language tags,\ngenerates punctuation natively from prosody and semantics, and is designed for noisy,\nmulti-speaker, and overlapping-conversation scenarios. This OpenASR pack ships the **q4_k** build\nunder an **MIT** license inherited from the upstream model, running entirely on-device via the\n`.oasr` format -- no cloud upload, no Python at inference time. OpenASR's catalog entry supports\n**English, Cantonese, and Mandarin Chinese**; the base model's broader dialect training on Wu,\nHokkien, and Sichuanese provides additional architectural depth but those dialects are not\nshipped as supported languages in this pack."
-        ],
-        "highlights": [
-          "\ud83e\udd47 **State-of-the-art Mandarin accuracy** \u2014 2.52% CER on AiShell-2 and 2.41% on Fleurs-Zh, leading both FunASR-1.5 and Seed-ASR 2.0 on both benchmarks (Xiaomi's published MiMo-V2.5-ASR benchmark results)",
-          "\ud83c\uddec\ud83c\udde7 **Strong English recognition** \u2014 5.73% average WER across eight Open ASR Leaderboard test sets, including 1.45% WER on LibriSpeech-Clean (Xiaomi's published MiMo-V2.5-ASR benchmark results)",
-          "\ud83d\udde3\ufe0f **Cantonese and dialect depth** \u2014 3.28% CER on Fleurs-Yue for Cantonese; the underlying model is also trained on Wu, Hokkien, and Sichuanese dialects (Xiaomi's published MiMo-V2.5-ASR benchmark results; huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
-          "\ud83d\udd00 **Seamless Mandarin-English code-switching** \u2014 transcribes mixed-language speech with no language tags required (huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
-          "\u270d\ufe0f **Native punctuation from prosody** \u2014 generates punctuation directly from speech rhythm and semantics, delivering ready-to-use transcripts with no post-processing needed (huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
-          "\ud83c\udfd7\ufe0f **1.2B audio tokenizer + 8B decoder pipeline** \u2014 a residual vector quantization tokenizer trained on 10 million hours of audio compresses speech at 25 Hz into discrete tokens, fed into an 8B-parameter transformer decoder with Flash Attention support (huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer; huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)"
-        ]
-      },
-      "quants": [
-        {
-          "quant": "q4_k",
-          "suffix": "q4",
-          "pull": "mimo-v2.5-asr:q4",
-          "filename": "mimo-v2.5-asr-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/mimo-v2.5-asr/resolve/d555242ba962b3cda675789e0a4a0e9e87d7c947/mimo-v2.5-asr-q4_k.oasr",
-          "sha256": "06c080a4fe040f18b374e740627911877b38af123c0085b912a9d2a941442b4c",
-          "size_bytes": 5828003840,
-          "recommended": true,
-          "perf": {
-            "rtf_cpu": 1.8838515985454547,
-            "rtf_metal": 0.8432398258181819,
-            "peak_rss_bytes": 8172355584,
-            "jfk_wer_vs_fp16": 0.0
-          }
-        }
-      ],
-      "language_mode": "fixed_multilingual",
-      "sort_weight": 914,
-      "prose_locales": {
-        "zh-CN": {
-          "tagline": "\u5c0f\u7c73 MiMo 8B \u53c2\u6570\u8bed\u97f3\u5927\u6a21\u578b\u2014\u2014\u4e2d\u82f1\u7ca4\u4e09\u8bed\u79bb\u7ebf\u8bc6\u522b\uff0c\u5f00\u53e3\u5c31\u80fd\u8bb0",
-          "highlights": [
-            "\ud83e\udd47 **\u4e2d\u6587\u542c\u5199\u62c9\u6ee1** \u2014 AiShell-2 \u53ea\u6709 2.52% \u5b57\u9519\u7387\u3001Fleurs-Zh \u4ec5 2.41%\uff0c\u628a FunASR-1.5 \u548c Seed-ASR 2.0 \u90fd\u7529\u5728\u8eab\u540e\uff08\u5c0f\u7c73\u5b98\u65b9 MiMo-V2.5-ASR \u8bc4\u6d4b\uff09",
-            "\ud83c\uddec\ud83c\udde7 **\u82f1\u8bed\u540c\u6837\u80fd\u6253** \u2014 Open ASR Leaderboard \u516b\u9879\u5747\u5206 5.73% \u8bcd\u9519\u7387\uff0cLibriSpeech-Clean \u66f4\u662f\u4f4e\u5230 1.45%\uff08\u5c0f\u7c73\u5b98\u65b9 MiMo-V2.5-ASR \u8bc4\u6d4b\u6570\u636e\uff09",
-            "\ud83d\udde3\ufe0f **\u7ca4\u8bed\u5728\u7ebf** \u2014 Fleurs-Yue \u7ca4\u8bed\u5b57\u9519\u7387 3.28%\uff0c\u5e95\u5c42\u6a21\u578b\u8fd8\u7ec3\u8fc7\u5434\u8bed\u3001\u95fd\u5357\u8bed\u3001\u56db\u5ddd\u8bdd\uff08\u5c0f\u7c73\u5b98\u65b9 MiMo-V2.5-ASR \u8bc4\u6d4b\u6570\u636e\uff1bhuggingface.co/XiaomiMiMo/MiMo-V2.5-ASR\uff09",
-            "\ud83d\udd00 **\u4e2d\u82f1\u5939\u6742\u968f\u4fbf\u8bf4** \u2014 \u4f1a\u8bae\u3001\u65e5\u5e38\u5bf9\u8bdd\u81ea\u7531\u6df7\u7528\u4e2d\u82f1\u6587\uff0c\u4e0d\u7528\u9009\u8bed\u8a00\uff0c\u6a21\u578b\u81ea\u52a8\u5206\u6e05\u695a\uff08huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR\uff09",
-            "\u270d\ufe0f **\u6807\u70b9\u81ea\u5df1\u5c31\u5e26\u4e0a\u4e86** \u2014 \u6839\u636e\u4f60\u8bf4\u8bdd\u7684\u8bed\u6c14\u548c\u4e0a\u4e0b\u6587\u76f4\u63a5\u8f93\u51fa\u6807\u70b9\uff0c\u8f6c\u51fa\u6765\u5c31\u662f\u80fd\u7528\u7684\u6587\u672c\uff08huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR\uff09",
-            "\ud83c\udfd7\ufe0f **1.2B \u97f3\u9891\u7f16\u7801\u5668 + 8B \u89e3\u7801\u5668** \u2014 \u7f16\u7801\u5668\u62ff 10 \u767e\u4e07\u5c0f\u65f6\u7684\u6d77\u91cf\u97f3\u9891\u5582\u51fa\u6765\u7684\uff0c\u4ee5 25 Hz \u628a\u8bed\u97f3\u538b\u6210\u79bb\u6563 token\uff0c\u518d\u4ea4\u7ed9 8B \u53c2\u6570\u7684\u5927\u89e3\u7801\u5668\u641e\u5b9a\u8bc6\u522b\uff08huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer\uff1bhuggingface.co/XiaomiMiMo/MiMo-V2.5-ASR\uff09"
-          ]
-        }
-      },
-      "min_core_version": "0.1.17"
     },
     {
       "id": "firered-aed-l-v2",
@@ -1043,6 +895,154 @@
       },
       "upstream_release_date": "2024-07-04",
       "min_core_version": "0.1.5"
+    },
+    {
+      "id": "firered2-llm",
+      "kind": "asr-model",
+      "display_name": "FireRedASR2 LLM",
+      "family": "firered2-llm",
+      "aliases": [
+        "firered-llm",
+        "firered2"
+      ],
+      "pull_alias": "firered2-llm",
+      "size": "8b",
+      "languages": [
+        "en",
+        "zh"
+      ],
+      "vendor": "FireRedTeam",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/FireRedTeam/FireRedASR2-LLM",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/firered2-llm",
+      "hf_revision": "96cb7c5d2c03935351e160094b438e44c1acc19f",
+      "public": true,
+      "min_cli_version": "0.1.17",
+      "recommended_quant": "q4_k",
+      "pull_recommended": "firered2-llm:q4",
+      "prose": {
+        "tagline": "FireRedTeam's LLM-backbone Mandarin-first bilingual ASR \u2014 8B+ parameters engineered for state-of-the-art Chinese and dialect accuracy",
+        "overview": [
+          "FireRedASR2-LLM is the Encoder-Adapter-LLM member of **FireRedASR2**, the successor to\nFireRedTeam's open-source industrial-grade **FireRedASR** speech-recognition family, released as\npart of the **FireRedASR2S** all-in-one ASR system. At 8B+ parameters with an LLM-scale decoder\nbackbone, it is the bigger and more accurate sibling of the already-available\n**firered-aed-l-v2** (FireRedASR2-AED, a 1.1B-parameter attention encoder-decoder reporting\n3.05%/11.67% avg CER). The FireRedASR2S technical report (arXiv:2603.10420) and the upstream model\ncard both report **2.89% average Character Error Rate** across four public Mandarin benchmarks\nand **11.55% average CER** across 19 public Chinese dialect/accent benchmarks -- outperforming\nDoubao-ASR (3.69%/15.39%), Qwen3-ASR (3.76%/11.85%), and Fun-ASR (4.16%/12.76%) on the paper's own\ncomparison table. These numbers belong to FireRedASR2-LLM and should not be confused with the\nsmaller firered-aed-l-v2's 3.05%/11.67% figures. The model is bilingual (Mandarin Chinese and\nEnglish). This OpenASR pack distributes the q4_k quantization build, repackaged as an `.oasr`\npack that runs natively in the OpenASR runtime -- fully local, no Python at inference time, no\ncloud upload. Licensed under Apache-2.0, inherited from the upstream release."
+        ],
+        "highlights": [
+          "\ud83e\udd47 **Best-in-class Mandarin accuracy** \u2014 2.89% average CER across four public Mandarin benchmarks, outperforming Doubao-ASR (3.69%), Qwen3-ASR (3.76%), and Fun-ASR (4.16%) on the same comparison table (arXiv:2603.10420; FireRedTeam's FireRedASR2-LLM model card)",
+          "\ud83d\udde3\ufe0f **Leading dialect and accent coverage** \u2014 11.55% average CER across 19 public Chinese dialect/accent benchmarks, ahead of Doubao-ASR (15.39%) and Qwen3-ASR (11.85%) (arXiv:2603.10420; FireRedTeam's FireRedASR2-LLM model card)",
+          "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **Bilingual Mandarin + English** \u2014 one 8B+ parameter checkpoint handles both languages, as demonstrated in the upstream model card's bilingual examples (FireRedTeam's FireRedASR2-LLM model card)",
+          "\ud83e\udde0 **LLM-scale decoder backbone** \u2014 Encoder-Adapter-LLM architecture at 8B+ parameters, the bigger and more accurate sibling of the already-available firered-aed-l-v2 (1.1B AED, 3.05%/11.67% avg CER) (FireRedTeam's FireRedASR2-LLM model card)",
+          "\ud83d\udd12 **Fully local, q4_k build** \u2014 runs 100% on-device via OpenASR's .oasr runtime with no cloud upload, under the Apache-2.0 license inherited from upstream (FireRedTeam's FireRedASR2-LLM model card)"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "firered2-llm:q4",
+          "filename": "firered2-llm-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/firered2-llm/resolve/96cb7c5d2c03935351e160094b438e44c1acc19f/firered2-llm-q4_k.oasr",
+          "sha256": "872aed2e43e25fee29f6195d8a92ac9223939bddf1f4e66cde46da9d152f17de",
+          "size_bytes": 4732546720,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 1.9775892917272728,
+            "rtf_metal": 0.9289458977272728,
+            "peak_rss_bytes": 6711148544,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ],
+      "language_mode": "fixed_multilingual",
+      "sort_weight": 890,
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "8B+ \u5927\u6a21\u578b\u52a0\u6301\u7684\u8bed\u97f3\u8bc6\u522b \u2014 \u666e\u901a\u8bdd\u548c\u65b9\u8a00\u90fd\u80fd\u7cbe\u51c6\u62ff\u634f",
+          "highlights": [
+            "\ud83e\udd47 **\u666e\u901a\u8bdd\u5b57\u9519\u7387\u4f4e\u81f3 2.89%** \u2014 \u56db\u5927\u516c\u5f00\u8bc4\u6d4b\u5747\u503c\uff0c\u628a Doubao-ASR\uff083.69%\uff09\u3001Qwen3-ASR\uff083.76%\uff09\u548c Fun-ASR\uff084.16%\uff09\u7edf\u7edf\u7529\u5728\u8eab\u540e\uff08arXiv:2603.10420\uff1bFireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09",
+            "\ud83d\udde3\ufe0f **19 \u79cd\u65b9\u8a00\u53e3\u97f3\u901a\u901a\u62ff\u4e0b** \u2014 \u5e73\u5747\u5b57\u9519\u7387 11.55%\uff0cDoubao-ASR 15.39%\u3001Qwen3-ASR 11.85% \u90fd\u4e0d\u5728\u8bdd\u4e0b\uff08arXiv:2603.10420\uff1bFireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09",
+            "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **\u4e2d\u82f1\u53cc\u8bed\u4e00\u628a\u6293** \u2014 \u4e00\u4e2a 8B+ \u53c2\u6570\u7684\u6a21\u578b\u540c\u65f6\u641e\u5b9a\u666e\u901a\u8bdd\u548c\u82f1\u8bed\uff0c\u4e0d\u7528\u5207\u6362\u3001\u4e0d\u7528\u4e0b\u4e24\u4efd\uff0c\u7701\u5fc3\u5230\u5bb6\uff08FireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09",
+            "\ud83e\udde0 **LLM \u7ea7\u522b\u7684\u5927\u6a21\u578b\u89e3\u7801\u9aa8\u67b6** \u2014 8B+ \u53c2\u6570 Encoder-Adapter-LLM \u67b6\u6784\uff0c\u662f\u5df2\u4e0a\u67b6\u7684 firered-aed-l-v2\uff081.1B AED\uff0c\u5747\u503c\u5b57\u9519\u7387 3.05%/11.67%\uff09\u7684\u5927\u53f7\u8fdb\u5316\u4f53\uff0c\u7cbe\u5ea6\u66f4\u4e0a\u4e00\u5c42\u697c\uff08FireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09",
+            "\ud83d\udd12 **100% \u672c\u5730\u8dd1\uff0c\u6570\u636e\u4e0d\u51fa\u95e8** \u2014 q4_k \u91cf\u5316 .oasr \u5305\uff0cOpenASR \u5f15\u64ce\u76f4\u63a5\u52a0\u8f7d\uff0cApache-2.0 \u5f00\u6e90\u534f\u8bae\u653e\u5fc3\u7528\uff08FireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09"
+          ]
+        }
+      },
+      "upstream_release_date": "2026-02-12",
+      "min_core_version": "0.1.17"
+    },
+    {
+      "id": "mimo-v2.5-asr",
+      "kind": "asr-model",
+      "display_name": "MiMo-V2.5-ASR",
+      "family": "mimo-asr",
+      "aliases": [
+        "mimo",
+        "mimo-v2.5"
+      ],
+      "pull_alias": "mimo-v2.5-asr",
+      "size": "8b",
+      "languages": [
+        "en",
+        "yue",
+        "zh"
+      ],
+      "vendor": "XiaomiMiMo",
+      "license": "MIT",
+      "license_url": "https://huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR/blob/main/README.md",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/mimo-v2.5-asr",
+      "hf_revision": "d555242ba962b3cda675789e0a4a0e9e87d7c947",
+      "public": true,
+      "min_cli_version": "0.1.17",
+      "recommended_quant": "q4_k",
+      "pull_recommended": "mimo-v2.5-asr:q4",
+      "prose": {
+        "tagline": "Xiaomi MiMo's end-to-end 8B speech model \u2014 state-of-the-art Mandarin, English, and Cantonese recognition, fully on-device",
+        "overview": [
+          "MiMo-V2.5-ASR is a state-of-the-art end-to-end automatic speech recognition model developed by\nthe Xiaomi MiMo team. Audio first passes through the **MiMo-Audio-Tokenizer**, a 1.2B-parameter\ntransformer operating at 25 Hz that uses an eight-layer residual vector quantization (RVQ) stack\nto produce 200 discrete tokens per second; a patch encoder then aggregates four consecutive time\nsteps into a single patch, downsampling the sequence to a compact 6.25 Hz representation. The\ntokenizer was trained from scratch on a 10-million-hour corpus, jointly optimizing semantic and\nreconstruction objectives (huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer). Those tokens feed an\n**8B-parameter transformer decoder** with Flash Attention support, trained through large-scale\nmid-training, high-quality supervised fine-tuning, and a novel reinforcement-learning algorithm\n(huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR). On Xiaomi's published benchmarks the model achieves\n**2.52% CER on AiShell-2** and **2.41% on Fleurs-Zh** for Mandarin -- leading both FunASR-1.5 and\nSeed-ASR 2.0 -- alongside **5.73% average WER** across eight English Open ASR Leaderboard test\nsets with **1.45% on LibriSpeech-Clean**. For Cantonese, the model scores **3.28% CER on\nFleurs-Yue** and **7.21% CER** on a second Cantonese test set (Xiaomi's published MiMo-V2.5-ASR\nbenchmark results). It handles code-switched Mandarin-English speech without language tags,\ngenerates punctuation natively from prosody and semantics, and is designed for noisy,\nmulti-speaker, and overlapping-conversation scenarios. This OpenASR pack ships the **q4_k** build\nunder an **MIT** license inherited from the upstream model, running entirely on-device via the\n`.oasr` format -- no cloud upload, no Python at inference time. OpenASR's catalog entry supports\n**English, Cantonese, and Mandarin Chinese**; the base model's broader dialect training on Wu,\nHokkien, and Sichuanese provides additional architectural depth but those dialects are not\nshipped as supported languages in this pack."
+        ],
+        "highlights": [
+          "\ud83e\udd47 **State-of-the-art Mandarin accuracy** \u2014 2.52% CER on AiShell-2 and 2.41% on Fleurs-Zh, leading both FunASR-1.5 and Seed-ASR 2.0 on both benchmarks (Xiaomi's published MiMo-V2.5-ASR benchmark results)",
+          "\ud83c\uddec\ud83c\udde7 **Strong English recognition** \u2014 5.73% average WER across eight Open ASR Leaderboard test sets, including 1.45% WER on LibriSpeech-Clean (Xiaomi's published MiMo-V2.5-ASR benchmark results)",
+          "\ud83d\udde3\ufe0f **Cantonese and dialect depth** \u2014 3.28% CER on Fleurs-Yue for Cantonese; the underlying model is also trained on Wu, Hokkien, and Sichuanese dialects (Xiaomi's published MiMo-V2.5-ASR benchmark results; huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
+          "\ud83d\udd00 **Seamless Mandarin-English code-switching** \u2014 transcribes mixed-language speech with no language tags required (huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
+          "\u270d\ufe0f **Native punctuation from prosody** \u2014 generates punctuation directly from speech rhythm and semantics, delivering ready-to-use transcripts with no post-processing needed (huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
+          "\ud83c\udfd7\ufe0f **1.2B audio tokenizer + 8B decoder pipeline** \u2014 a residual vector quantization tokenizer trained on 10 million hours of audio compresses speech at 25 Hz into discrete tokens, fed into an 8B-parameter transformer decoder with Flash Attention support (huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer; huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "mimo-v2.5-asr:q4",
+          "filename": "mimo-v2.5-asr-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/mimo-v2.5-asr/resolve/d555242ba962b3cda675789e0a4a0e9e87d7c947/mimo-v2.5-asr-q4_k.oasr",
+          "sha256": "06c080a4fe040f18b374e740627911877b38af123c0085b912a9d2a941442b4c",
+          "size_bytes": 5828003840,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 1.8838515985454547,
+            "rtf_metal": 0.8432398258181819,
+            "peak_rss_bytes": 8172355584,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ],
+      "language_mode": "fixed_multilingual",
+      "sort_weight": 888,
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u5c0f\u7c73 MiMo 8B \u53c2\u6570\u8bed\u97f3\u5927\u6a21\u578b\u2014\u2014\u4e2d\u82f1\u7ca4\u4e09\u8bed\u79bb\u7ebf\u8bc6\u522b\uff0c\u5f00\u53e3\u5c31\u80fd\u8bb0",
+          "highlights": [
+            "\ud83e\udd47 **\u4e2d\u6587\u542c\u5199\u62c9\u6ee1** \u2014 AiShell-2 \u53ea\u6709 2.52% \u5b57\u9519\u7387\u3001Fleurs-Zh \u4ec5 2.41%\uff0c\u628a FunASR-1.5 \u548c Seed-ASR 2.0 \u90fd\u7529\u5728\u8eab\u540e\uff08\u5c0f\u7c73\u5b98\u65b9 MiMo-V2.5-ASR \u8bc4\u6d4b\uff09",
+            "\ud83c\uddec\ud83c\udde7 **\u82f1\u8bed\u540c\u6837\u80fd\u6253** \u2014 Open ASR Leaderboard \u516b\u9879\u5747\u5206 5.73% \u8bcd\u9519\u7387\uff0cLibriSpeech-Clean \u66f4\u662f\u4f4e\u5230 1.45%\uff08\u5c0f\u7c73\u5b98\u65b9 MiMo-V2.5-ASR \u8bc4\u6d4b\u6570\u636e\uff09",
+            "\ud83d\udde3\ufe0f **\u7ca4\u8bed\u5728\u7ebf** \u2014 Fleurs-Yue \u7ca4\u8bed\u5b57\u9519\u7387 3.28%\uff0c\u5e95\u5c42\u6a21\u578b\u8fd8\u7ec3\u8fc7\u5434\u8bed\u3001\u95fd\u5357\u8bed\u3001\u56db\u5ddd\u8bdd\uff08\u5c0f\u7c73\u5b98\u65b9 MiMo-V2.5-ASR \u8bc4\u6d4b\u6570\u636e\uff1bhuggingface.co/XiaomiMiMo/MiMo-V2.5-ASR\uff09",
+            "\ud83d\udd00 **\u4e2d\u82f1\u5939\u6742\u968f\u4fbf\u8bf4** \u2014 \u4f1a\u8bae\u3001\u65e5\u5e38\u5bf9\u8bdd\u81ea\u7531\u6df7\u7528\u4e2d\u82f1\u6587\uff0c\u4e0d\u7528\u9009\u8bed\u8a00\uff0c\u6a21\u578b\u81ea\u52a8\u5206\u6e05\u695a\uff08huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR\uff09",
+            "\u270d\ufe0f **\u6807\u70b9\u81ea\u5df1\u5c31\u5e26\u4e0a\u4e86** \u2014 \u6839\u636e\u4f60\u8bf4\u8bdd\u7684\u8bed\u6c14\u548c\u4e0a\u4e0b\u6587\u76f4\u63a5\u8f93\u51fa\u6807\u70b9\uff0c\u8f6c\u51fa\u6765\u5c31\u662f\u80fd\u7528\u7684\u6587\u672c\uff08huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR\uff09",
+            "\ud83c\udfd7\ufe0f **1.2B \u97f3\u9891\u7f16\u7801\u5668 + 8B \u89e3\u7801\u5668** \u2014 \u7f16\u7801\u5668\u62ff 10 \u767e\u4e07\u5c0f\u65f6\u7684\u6d77\u91cf\u97f3\u9891\u5582\u51fa\u6765\u7684\uff0c\u4ee5 25 Hz \u628a\u8bed\u97f3\u538b\u6210\u79bb\u6563 token\uff0c\u518d\u4ea4\u7ed9 8B \u53c2\u6570\u7684\u5927\u89e3\u7801\u5668\u641e\u5b9a\u8bc6\u522b\uff08huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer\uff1bhuggingface.co/XiaomiMiMo/MiMo-V2.5-ASR\uff09"
+          ]
+        }
+      },
+      "min_core_version": "0.1.17"
     },
     {
       "id": "dolphin-base",
