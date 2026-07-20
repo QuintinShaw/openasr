@@ -99,7 +99,7 @@ Findings, all measured (not assumed):
    WEIGHTS buffer rather than a dequantized graph-input blow-up).
 
 **Default = Metal on Apple Silicon**, CPU elsewhere: the Auto gate
-(`auto_gpu_enabled = true`) only ever selects an accelerator that is actually
+(`auto_gpu_policy = AutoGpuPolicy::AllBackends`) only ever selects an accelerator that is actually
 present (`runtime_gpu_is_available`), and an explicit `--execution-target cpu`
 always wins. CPU stays the bit-exact parity reference -- Metal fp16 reproduces the
 golden transcript on the parity clip but is not itself the golden gate. Harness: the

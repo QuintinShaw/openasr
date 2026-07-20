@@ -4,6 +4,7 @@ pub(crate) mod shape_orchestrator;
 
 use std::collections::BTreeMap;
 
+use crate::ggml_runtime::AutoGpuPolicy;
 use crate::models::ggml_family_adapter::{
     GGML_TOKENIZER_ID_KEY, GgmlExecutionCapability, GgmlFamilyAdapterDescriptor, LanguageFamilyHint,
 };
@@ -284,27 +285,38 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     pub executor_component_id: &'static str,
     pub execution_capability: GgmlExecutionCapability,
     pub prefer_cpu_decoder_for_multichunk_metal: bool,
-    /// Whether Auto execution may select a GPU-class backend automatically
-    /// when one is available. This can only ever pin Auto to CPU -- it never
-    /// overrides an explicit `execution_target=accelerated` (or `cpu`)
-    /// request, which always gets exactly what it asked for via
-    /// `GgmlCpuGraphConfig::resolve_family_runtime_backend`. Every builtin
-    /// family now defaults `true`. Both of the two families that were once
-    /// gated to CPU flipped after their encoder weights moved into a
-    /// Metal-offloadable static arena and Metal beat CPU end-to-end: Dolphin
-    /// first (see `models::dolphin::executor::dolphin_runtime_backend`), then
+    /// Which GPU-class backend(s) Auto execution may select automatically
+    /// when available (see [`crate::ggml_runtime::AutoGpuPolicy`]). This can
+    /// only ever pin Auto to CPU -- it never overrides an explicit
+    /// `execution_target=accelerated` (or `cpu`) request, which always gets
+    /// exactly what it asked for via
+    /// `GgmlCpuGraphConfig::resolve_family_runtime_backend`.
+    ///
+    /// Most builtins default `AllBackends` (the old blanket `true`). Two
+    /// families flipped from CPU-pinned to `AllBackends` after their encoder
+    /// weights moved into a Metal-offloadable static arena and Metal beat CPU
+    /// end-to-end: Dolphin first (see
+    /// `models::dolphin::executor::dolphin_runtime_backend`), then
     /// xasr-zipformer's streaming encoder once the same weight-placement fix
-    /// landed for it (see
-    /// `models::xasr_zipformer::graph_config::encoder_gpu_enabled`, which
-    /// measured a 5x Metal speedup once its weights actually offloaded --
-    /// the prior CPU-pinned default predates that fix). Any
-    /// provenance/telemetry label reporting the backend a request actually
-    /// ran on must resolve through
-    /// `GgmlCpuGraphConfig::resolve_family_runtime_backend` with this same
-    /// flag, not recompute generically (a generic recompute is what produced
-    /// a `core.native.backend:metal` label on a gated-family Auto request
-    /// that in fact ran entirely on CPU).
-    pub auto_gpu_enabled: bool,
+    /// landed for it. A later, cleaner platform audit found xasr-zipformer's
+    /// streaming encoder itself dispatch-bound and net-slower on Apple
+    /// Silicon Metal specifically (a 29-frame chunk graph too small to
+    /// amortize Metal's per-dispatch overhead) -- see
+    /// `models::xasr_zipformer::graph_config::encoder_gpu_enabled` -- so it
+    /// is now the sole builtin `ExceptMetal`. That same audit also measured a
+    /// Metal slowdown for qwen and moonshine, but neither is gated: qwen's
+    /// looks like a fixed size x quant platform trade-off rather than a code
+    /// bug, and that read is left to a dedicated follow-up before being baked
+    /// into the default (see `models::qwen::graph_config`); moonshine's had
+    /// an actual architectural fix applied instead of being gated around
+    /// (decoder scheduler-off activates the reusable incremental decode
+    /// graph, see `models::moonshine::graph_config`). Any provenance/telemetry
+    /// label reporting the backend a request actually ran on must resolve
+    /// through `GgmlCpuGraphConfig::resolve_family_runtime_backend` with this
+    /// same policy, not recompute generically (a generic recompute is what
+    /// produced a `core.native.backend:metal` label on a gated-family Auto
+    /// request that in fact ran entirely on CPU).
+    pub auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
     /// Whether this family's own decode loop can emit diarization tokens (the
     /// cohere token-stream is the only builtin case today). The single
     /// declaration of this architecture-level capability fact -- runtime
@@ -399,20 +411,23 @@ pub(crate) fn emits_punctuation_for_model_architecture(model_architecture: &str)
         .and_then(|descriptor| descriptor.emits_punctuation)
 }
 
-/// Whether a builtin family's Auto execution may select a GPU-class backend
-/// automatically (see [`OpenAsrArchitectureDescriptor::auto_gpu_enabled`]),
-/// looked up by GGUF `model_architecture`. An unrecognized architecture
-/// defaults to `true` (the majority behavior: Auto uses GPU when available)
-/// rather than silently pinning an unknown family to CPU. This is the
-/// accessor a provenance/telemetry label must call -- with the result fed
-/// into `GgmlCpuGraphConfig::resolve_family_runtime_backend` -- so the
+/// Which GPU-class backend(s) a builtin family's Auto execution may select
+/// automatically (see
+/// [`OpenAsrArchitectureDescriptor::auto_gpu_policy`]), looked up by GGUF
+/// `model_architecture`. An unrecognized architecture defaults to
+/// `AutoGpuPolicy::AllBackends` (the majority behavior: Auto uses GPU when
+/// available) rather than silently pinning an unknown family to CPU. This is
+/// the accessor a provenance/telemetry label must call -- with the result
+/// fed into `GgmlCpuGraphConfig::resolve_family_runtime_backend` -- so the
 /// reported backend can never drift from what the family's own executor
 /// actually decided.
-pub(crate) fn family_auto_gpu_enabled_for_model_architecture(model_architecture: &str) -> bool {
+pub(crate) fn family_auto_gpu_policy_for_model_architecture(
+    model_architecture: &str,
+) -> crate::ggml_runtime::AutoGpuPolicy {
     OpenAsrArchitectureRegistry::with_builtins()
         .find_by_model_architecture(model_architecture)
-        .map(|descriptor| descriptor.auto_gpu_enabled)
-        .unwrap_or(true)
+        .map(|descriptor| descriptor.auto_gpu_policy)
+        .unwrap_or(crate::ggml_runtime::AutoGpuPolicy::AllBackends)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1049,7 +1064,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: true,
-        auto_gpu_enabled: true,
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
         self_diarizes: true,
         emits_punctuation: Some(true),
         hparam_schema: COHERE_TRANSCRIBE_HPARAM_SCHEMA,
@@ -1089,7 +1104,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: WHISPER_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        auto_gpu_enabled: true,
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
         self_diarizes: false,
         emits_punctuation: Some(true),
         hparam_schema: WHISPER_HPARAM_SCHEMA,
@@ -1122,7 +1137,15 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: QWEN3_ASR_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::NativeGraphLoweringV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        auto_gpu_enabled: true,
+        // Left un-gated (`AllBackends`) for now: the measured 1.71x Metal
+        // slowdown at qwen's recommended 1.7B @ q8_0 config looks like a
+        // fixed size x quant platform trade-off rather than a qwen-specific
+        // bug (see `models::qwen::graph_config`'s doc comment), but that
+        // read is not yet confirmed by a dedicated follow-up investigation,
+        // so it is deliberately not baked into the default here. Flip to
+        // `ExceptMetal` once that follow-up lands (one-line change, the gate
+        // machinery already exists).
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
         self_diarizes: false,
         emits_punctuation: Some(true),
         hparam_schema: QWEN3_ASR_HPARAM_SCHEMA,
@@ -1160,7 +1183,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: PARAKEET_CTC_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        auto_gpu_enabled: true,
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
         self_diarizes: false,
         // Character/BPE CTC: whether an imported checkpoint's vocab includes
         // punctuation depends on that specific checkpoint's training corpus,
@@ -1206,7 +1229,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: PARAKEET_TDT_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        auto_gpu_enabled: true,
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
         self_diarizes: false,
         // Verified on the imported pack: trained on transcripts that preserve
         // punctuation and capitalization (mirrors `_catalog.py`'s
@@ -1240,7 +1263,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        auto_gpu_enabled: true,
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
         self_diarizes: false,
         // Character CTC: same BYO-checkpoint reasoning as parakeet-ctc above.
         emits_punctuation: None,
@@ -1282,16 +1305,19 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // weights were pinned off the GPU buffer, so Metal never actually
         // offloaded and the per-chunk graph paid GPU dispatch overhead with
         // no offload benefit. With weights correctly placed so the encoder
-        // truly resides on the GPU buffer, Metal is at minimum competitive
-        // with CPU end-to-end on the catalog's recommended `q8_0` quant, and
-        // reproduces the exact same transcript byte-for-byte -- see
-        // `xasr_zipformer::graph_config::encoder_gpu_enabled` for the
-        // measurement caveats (run-to-run variance was too high on the
-        // measuring host to pin an exact multiplier; do not cite a specific
-        // speedup number from this comment). `auto_gpu_enabled` only ever
-        // changes which backend Auto picks, never correctness, so this
-        // matches how every other GPU-enabled family behaves.
-        auto_gpu_enabled: true,
+        // truly resides on the GPU buffer, a first re-measurement found
+        // Metal at minimum competitive with CPU end-to-end, but a later,
+        // cleaner platform audit found Metal itself still net-slower
+        // end-to-end on Apple Silicon specifically (dispatch-bound: a
+        // 29-frame chunk graph too small to amortize per-dispatch overhead)
+        // -- see `xasr_zipformer::graph_config::encoder_gpu_enabled`.
+        // `auto_gpu_policy` only ever changes which backend Auto picks,
+        // never correctness (output stays byte-identical), so this is
+        // `ExceptMetal`: Auto still prefers the generic GPU lane
+        // (CUDA/HIP/Vulkan) where it was never measured to regress, and
+        // falls back to CPU on Metal specifically. An explicit `--backend
+        // metal` request still gets Metal.
+        auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
         self_diarizes: false,
         emits_punctuation: Some(true),
         hparam_schema: XASR_ZIPFORMER_HPARAM_SCHEMA,
@@ -1319,7 +1345,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: MOONSHINE_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        auto_gpu_enabled: true,
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
         self_diarizes: false,
         emits_punctuation: Some(true),
         hparam_schema: MOONSHINE_HPARAM_SCHEMA,
@@ -1366,7 +1392,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // `dolphin::executor::dolphin_runtime_backend`. fp16 Metal numerics
         // reproduce the golden transcript on the parity clip (CPU stays the
         // bit-exact reference gate).
-        auto_gpu_enabled: true,
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
         self_diarizes: false,
         // DataoceanAI's cn-dialect-small training corpus is transcribed
         // without punctuation and the model has no punctuation-prediction
@@ -1399,7 +1425,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: SENSEVOICE_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        auto_gpu_enabled: true,
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
         self_diarizes: false,
         emits_punctuation: Some(true),
         hparam_schema: SENSEVOICE_HPARAM_SCHEMA,
@@ -1438,7 +1464,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: FIRERED_AED_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        auto_gpu_enabled: true,
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
         self_diarizes: false,
         // The reference tokenizer's dict.txt has no punctuation/<space>
         // entries (char + SPM vocab trained on unpunctuated Mandarin ASR
@@ -1481,7 +1507,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: FIRERED_LLM_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        auto_gpu_enabled: true,
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
         self_diarizes: false,
         // Qwen2's ChatML decode is a plain transcription completion -- no
         // learned punctuation-suppression behavior has been characterized
@@ -1522,7 +1548,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: MIMO_ASR_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        auto_gpu_enabled: true,
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
         self_diarizes: false,
         // No characterized punctuation behavior for this family yet (unlike
         // firered-aed's punctuation-free vocab) -- leave unclaimed rather
@@ -1609,48 +1635,75 @@ mod tests {
         );
     }
 
-    /// Pins `auto_gpu_enabled` per builtin architecture -- every builtin now
-    /// lets Auto pick a GPU-class backend automatically when available,
-    /// matching how `resolve_runtime_backend` behaves generically. Dolphin
-    /// and xasr-zipformer were both gated to CPU at one point (Auto-mode GPU
-    /// regressions caused by their encoder weights not actually landing on
-    /// the GPU buffer), and both flipped to GPU-enabled once their
-    /// respective weight-placement fixes let the encoder truly offload and
-    /// Metal beat CPU end-to-end (see the field doc and each family's own
-    /// executor/`graph_config` doc comment). A silent flip of this table
-    /// would silently deny Auto users a GPU their hardware supports for any
-    /// GPU-enabled family.
+    /// Pins `auto_gpu_policy` per builtin architecture. Most builtins let
+    /// Auto pick any GPU-class backend automatically when available
+    /// (`AllBackends`), matching how `resolve_runtime_backend` behaves
+    /// generically. xasr-zipformer alone is `ExceptMetal` -- Auto still
+    /// prefers the generic GPU lane (CUDA/HIP/Vulkan) but falls back to CPU
+    /// on Apple Silicon Metal specifically, per a platform-specific
+    /// performance audit that found its streaming chunk graph dispatch-bound
+    /// and net-slower on Metal (an explicit `--backend metal` request is
+    /// unaffected). Two other families measured a similar Metal slowdown but
+    /// are deliberately NOT gated this round: qwen (the slowdown looks like a
+    /// fixed size x quant platform trade-off, not a qwen-specific bug --
+    /// mimo/firered-llm share qwen's exact decode driver and measure faster
+    /// on Metal at their 8B @ q4_k config -- but that read awaits a dedicated
+    /// follow-up before it's baked into the default; see
+    /// `models::qwen::graph_config`) and moonshine (this audit found and
+    /// applied an actual architectural fix -- decoder scheduler-off to
+    /// activate the reusable incremental decode graph, see
+    /// `models::moonshine::graph_config` -- rather than gating around the
+    /// problem). See the field doc and each family's own executor/
+    /// `graph_config` doc comment for detail. A silent flip of this table
+    /// would silently deny Auto users a GPU their hardware supports (or
+    /// silently regress them onto a Metal path known to be slower), for any
+    /// family.
     #[test]
-    fn builtin_architectures_declare_auto_gpu_enabled() {
-        let expected: &[(&str, bool)] = &[
-            (COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, true),
-            (WHISPER_GGML_ARCHITECTURE_ID, true),
-            (QWEN3_ASR_GGML_ARCHITECTURE_ID, true),
-            (PARAKEET_CTC_GGML_ARCHITECTURE_ID, true),
-            (PARAKEET_TDT_GGML_ARCHITECTURE_ID, true),
-            (WAV2VEC2_CTC_GGML_ARCHITECTURE_ID, true),
-            (XASR_ZIPFORMER_GGML_ARCHITECTURE_ID, true),
-            (MOONSHINE_GGML_ARCHITECTURE_ID, true),
-            (DOLPHIN_GGML_ARCHITECTURE_ID, true),
-            (SENSEVOICE_GGML_ARCHITECTURE_ID, true),
-            (FIRERED_AED_GGML_ARCHITECTURE_ID, true),
-            (FIRERED_LLM_GGML_ARCHITECTURE_ID, true),
-            (MIMO_ASR_GGML_ARCHITECTURE_ID, true),
+    fn builtin_architectures_declare_auto_gpu_policy() {
+        let expected: &[(&str, AutoGpuPolicy)] = &[
+            (
+                COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                AutoGpuPolicy::AllBackends,
+            ),
+            (WHISPER_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
+            (QWEN3_ASR_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
+            (
+                PARAKEET_CTC_GGML_ARCHITECTURE_ID,
+                AutoGpuPolicy::AllBackends,
+            ),
+            (
+                PARAKEET_TDT_GGML_ARCHITECTURE_ID,
+                AutoGpuPolicy::AllBackends,
+            ),
+            (
+                WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
+                AutoGpuPolicy::AllBackends,
+            ),
+            (
+                XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+                AutoGpuPolicy::ExceptMetal,
+            ),
+            (MOONSHINE_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
+            (DOLPHIN_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
+            (SENSEVOICE_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
+            (FIRERED_AED_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
+            (FIRERED_LLM_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
+            (MIMO_ASR_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
         let mut seen = std::collections::BTreeSet::new();
 
-        for (model_architecture, auto_gpu_enabled) in expected.iter().copied() {
+        for (model_architecture, auto_gpu_policy) in expected.iter().copied() {
             let descriptor = registry
                 .find_by_model_architecture(model_architecture)
                 .unwrap_or_else(|| panic!("missing builtin architecture '{model_architecture}'"));
             assert_eq!(
-                descriptor.auto_gpu_enabled, auto_gpu_enabled,
-                "'{model_architecture}' auto_gpu_enabled mismatch"
+                descriptor.auto_gpu_policy, auto_gpu_policy,
+                "'{model_architecture}' auto_gpu_policy mismatch"
             );
             assert_eq!(
-                family_auto_gpu_enabled_for_model_architecture(model_architecture),
-                auto_gpu_enabled,
+                family_auto_gpu_policy_for_model_architecture(model_architecture),
+                auto_gpu_policy,
                 "'{model_architecture}' accessor must match the descriptor field"
             );
             seen.insert(model_architecture);
@@ -1661,6 +1714,54 @@ mod tests {
             registry.descriptors().len(),
             "expectation table must cover every builtin architecture, no more, no less"
         );
+    }
+
+    /// Regression for the platform-scoping guarantee itself: `ExceptMetal`
+    /// families must gate Auto to CPU on Metal while leaving a resolved
+    /// generic-GPU-lane pick (CUDA/HIP/Vulkan) or CPU pick untouched, and an
+    /// explicit `execution_target=accelerated`/`=cpu` request must always
+    /// win regardless of the family's policy.
+    #[test]
+    fn except_metal_family_gates_only_apple_silicon_metal() {
+        use crate::ggml_runtime::{
+            GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference,
+            install_request_backend_override,
+        };
+
+        let model_architecture = XASR_ZIPFORMER_GGML_ARCHITECTURE_ID;
+        let policy = family_auto_gpu_policy_for_model_architecture(model_architecture);
+        assert_eq!(policy, AutoGpuPolicy::ExceptMetal);
+
+        // Auto: gated to CPU only if the generic resolver would have picked
+        // Metal specifically.
+        let resolved = GgmlCpuGraphConfig::resolve_runtime_backend();
+        let gated = GgmlCpuGraphConfig::resolve_family_runtime_backend(policy);
+        if matches!(resolved, GgmlCpuGraphBackend::Metal) {
+            assert_eq!(gated, GgmlCpuGraphBackend::Cpu);
+        } else {
+            assert_eq!(gated, resolved);
+        }
+        assert_ne!(gated, GgmlCpuGraphBackend::Metal);
+
+        // An explicit accelerated request always wins, even on Metal.
+        {
+            let _guard =
+                install_request_backend_override(Some(RequestBackendPreference::Accelerated));
+            let expected = GgmlCpuGraphConfig::resolve_runtime_backend();
+            assert_eq!(
+                GgmlCpuGraphConfig::resolve_family_runtime_backend(policy),
+                expected
+            );
+        }
+
+        // An explicit CPU-only request always wins too.
+        {
+            let _guard = install_request_backend_override(Some(RequestBackendPreference::CpuOnly));
+            assert_eq!(
+                GgmlCpuGraphConfig::resolve_family_runtime_backend(policy),
+                GgmlCpuGraphBackend::Cpu
+            );
+        }
     }
 
     /// Pins `encoder_attention_span` per builtin architecture -- the single

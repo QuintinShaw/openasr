@@ -68,6 +68,30 @@ pub enum GgmlCpuGraphBackend {
     Gpu,
 }
 
+/// Per-family Auto-mode GPU policy: which GPU-class backend(s) Auto is
+/// allowed to pick automatically for this family. `backend == Metal` is
+/// exactly "Apple Silicon Metal" (see `default_gpu_backend_for_target`), so
+/// `ExceptMetal` precisely targets the M-series measurements without ever
+/// touching the discrete-GPU lane (CUDA/HIP/Vulkan), which no family here has
+/// been measured to regress on.
+///
+/// Like the `bool` this replaces, a policy can only ever pin Auto to CPU; it
+/// never overrides an explicit per-request `execution_target` preference
+/// (see [`GgmlCpuGraphConfig::resolve_family_runtime_backend`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AutoGpuPolicy {
+    /// Auto may use any available GPU-class backend (Metal, or the generic
+    /// CUDA/HIP/Vulkan lane). Equivalent to the old `auto_gpu_enabled = true`.
+    #[default]
+    AllBackends,
+    /// Auto may use the generic GPU lane (CUDA/HIP/Vulkan) but falls back to
+    /// CPU on Apple Silicon Metal specifically.
+    ExceptMetal,
+    /// Auto never picks a GPU-class backend for this family. Equivalent to
+    /// the old `auto_gpu_enabled = false`.
+    Never,
+}
+
 impl GgmlCpuGraphBackend {
     /// GPU-class backends (Metal and the generic discrete-GPU lane:
     /// HIP/CUDA/Vulkan), as opposed to the CPU backend.
@@ -184,7 +208,21 @@ impl GgmlCpuGraphConfig {
     }
 
     pub fn runtime_default() -> Self {
-        let backend = Self::resolve_runtime_backend();
+        Self::runtime_default_for_backend(Self::resolve_runtime_backend())
+    }
+
+    /// Same defaults as [`Self::runtime_default`] but for a family whose Auto
+    /// backend selection is gated by an [`AutoGpuPolicy`] (see
+    /// [`Self::resolve_family_runtime_backend`]) rather than following
+    /// `resolve_runtime_backend()` unconditionally. Families that build their
+    /// base config from `GgmlCpuGraphConfig::default()`/`runtime_default()`
+    /// bypass the family gate entirely (those always resolve the generic
+    /// backend); a gated family must start from this instead.
+    pub fn gated_runtime_default(policy: AutoGpuPolicy) -> Self {
+        Self::runtime_default_for_backend(Self::resolve_family_runtime_backend(policy))
+    }
+
+    fn runtime_default_for_backend(backend: GgmlCpuGraphBackend) -> Self {
         Self {
             context_bytes: DEFAULT_CONTEXT_BYTES,
             graph_size: DEFAULT_GRAPH_SIZE,
@@ -276,13 +314,13 @@ impl GgmlCpuGraphConfig {
     /// whose Auto default can be gated (rather than always following
     /// `resolve_runtime_backend()` unconditionally) must resolve its backend
     /// through this function instead of hand-rolling the override check
-    /// (dolphin's `dolphin_runtime_backend` and xasr-zipformer's
-    /// `encoder_gpu_enabled` are the two builtin cases that route through
-    /// this gate -- see their doc comments for the history of when each was
-    /// `auto_gpu_enabled = false` and the measured evidence for flipping to
-    /// `true`). `auto_gpu_enabled` is a pure Auto-mode default: it can only
-    /// ever pin Auto to CPU, never override an explicit per-request
-    /// preference. A request that explicitly asked for `CpuOnly` or
+    /// (dolphin's `dolphin_runtime_backend`, xasr-zipformer's
+    /// `encoder_gpu_enabled`, qwen's and moonshine's `*_runtime_graph_config`
+    /// are the builtin cases that route through this gate -- see their doc
+    /// comments for the per-family policy and its evidence). The
+    /// [`AutoGpuPolicy`] is a pure Auto-mode default: it can only ever pin
+    /// Auto to CPU, never override an explicit per-request preference. A
+    /// request that explicitly asked for `CpuOnly` or
     /// `Accelerated` always gets what it asked for via
     /// `resolve_runtime_backend()`, matching the product rule that hardware
     /// selection is the engine's call only in Auto -- an explicit user choice
@@ -290,17 +328,31 @@ impl GgmlCpuGraphConfig {
     ///
     /// This is also the function any provenance/telemetry label reporting
     /// "which backend actually ran" for such a family must call (with the
-    /// same `auto_gpu_enabled` the family itself used) instead of
+    /// same [`AutoGpuPolicy`] the family itself used) instead of
     /// `resolve_runtime_backend()` directly -- calling the generic resolver
     /// for a gated family's provenance label reports what Auto would
     /// generically pick, not what the family actually decided, which is
     /// exactly the kind of drift that produced a `core.native.backend:metal`
     /// label on a request that in fact ran entirely on CPU.
-    pub fn resolve_family_runtime_backend(auto_gpu_enabled: bool) -> GgmlCpuGraphBackend {
-        if auto_gpu_enabled || request_backend_override().is_some() {
-            Self::resolve_runtime_backend()
-        } else {
+    ///
+    /// `policy` is a pure Auto-mode default: an explicit per-request
+    /// preference (`RequestBackendPreference::CpuOnly` /
+    /// `::Accelerated`) always wins over it, matching the product rule that
+    /// hardware selection is the engine's call only in Auto.
+    pub fn resolve_family_runtime_backend(policy: AutoGpuPolicy) -> GgmlCpuGraphBackend {
+        if request_backend_override().is_some() {
+            return Self::resolve_runtime_backend();
+        }
+        let resolved = Self::resolve_runtime_backend();
+        let gate_to_cpu = match policy {
+            AutoGpuPolicy::AllBackends => false,
+            AutoGpuPolicy::Never => resolved.is_gpu_class(),
+            AutoGpuPolicy::ExceptMetal => matches!(resolved, GgmlCpuGraphBackend::Metal),
+        };
+        if gate_to_cpu {
             GgmlCpuGraphBackend::Cpu
+        } else {
+            resolved
         }
     }
 
@@ -5093,10 +5145,10 @@ mod tests {
     use crate::nn::half::f32_to_f16_bits as f32_to_f16_bits_for_test;
 
     use super::{
-        GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy,
-        GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlRopeExtParams,
-        METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS, flash_attn_ext_head_dim_supported_on_backend,
-        runtime_gpu_is_available,
+        AutoGpuPolicy, GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig,
+        GgmlCpuGraphCpuAcceleratorPolicy, GgmlCpuGraphError, GgmlCpuGraphRunner,
+        GgmlCpuGraphThreadingWorkload, GgmlRopeExtParams, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
+        flash_attn_ext_head_dim_supported_on_backend, runtime_gpu_is_available,
     };
 
     fn softplus_reference(value: f32) -> f32 {
@@ -5154,15 +5206,15 @@ mod tests {
         use super::{RequestBackendPreference, install_request_backend_override};
 
         // No per-request preference installed (Auto): a family that declares
-        // `auto_gpu_enabled = false` must stay pinned to CPU...
+        // `AutoGpuPolicy::Never` must stay pinned to CPU...
         assert_eq!(
-            GgmlCpuGraphConfig::resolve_family_runtime_backend(false),
+            GgmlCpuGraphConfig::resolve_family_runtime_backend(AutoGpuPolicy::Never),
             GgmlCpuGraphBackend::Cpu
         );
-        // ...while a family that allows Auto to pick GPU automatically just
+        // ...while a family that allows Auto to pick any GPU backend just
         // gets whatever the generic resolver would have picked anyway.
         assert_eq!(
-            GgmlCpuGraphConfig::resolve_family_runtime_backend(true),
+            GgmlCpuGraphConfig::resolve_family_runtime_backend(AutoGpuPolicy::AllBackends),
             GgmlCpuGraphConfig::resolve_runtime_backend()
         );
 
@@ -5170,11 +5222,11 @@ mod tests {
         {
             let _guard = install_request_backend_override(Some(RequestBackendPreference::CpuOnly));
             assert_eq!(
-                GgmlCpuGraphConfig::resolve_family_runtime_backend(false),
+                GgmlCpuGraphConfig::resolve_family_runtime_backend(AutoGpuPolicy::Never),
                 GgmlCpuGraphBackend::Cpu
             );
             assert_eq!(
-                GgmlCpuGraphConfig::resolve_family_runtime_backend(true),
+                GgmlCpuGraphConfig::resolve_family_runtime_backend(AutoGpuPolicy::AllBackends),
                 GgmlCpuGraphBackend::Cpu
             );
         }
@@ -5188,12 +5240,53 @@ mod tests {
             let expected = GgmlCpuGraphConfig::resolve_runtime_backend();
             assert!(expected.is_gpu_class());
             assert_eq!(
-                GgmlCpuGraphConfig::resolve_family_runtime_backend(false),
+                GgmlCpuGraphConfig::resolve_family_runtime_backend(AutoGpuPolicy::Never),
                 expected
             );
             assert_eq!(
-                GgmlCpuGraphConfig::resolve_family_runtime_backend(true),
+                GgmlCpuGraphConfig::resolve_family_runtime_backend(AutoGpuPolicy::AllBackends),
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_family_runtime_backend_except_metal_gates_only_metal() {
+        use super::{RequestBackendPreference, install_request_backend_override};
+
+        // Auto (no explicit preference): ExceptMetal only pins Metal to CPU;
+        // it must never touch a resolved CPU or the generic Gpu (CUDA/HIP/
+        // Vulkan) lane, since only Metal has been measured to regress.
+        match GgmlCpuGraphConfig::resolve_runtime_backend() {
+            GgmlCpuGraphBackend::Metal => assert_eq!(
+                GgmlCpuGraphConfig::resolve_family_runtime_backend(AutoGpuPolicy::ExceptMetal),
+                GgmlCpuGraphBackend::Cpu
+            ),
+            other => assert_eq!(
+                GgmlCpuGraphConfig::resolve_family_runtime_backend(AutoGpuPolicy::ExceptMetal),
+                other
+            ),
+        }
+
+        // An explicit Accelerated preference always wins over ExceptMetal too
+        // -- the gate can only ever pin Auto, never an explicit request.
+        {
+            let _guard =
+                install_request_backend_override(Some(RequestBackendPreference::Accelerated));
+            let expected = GgmlCpuGraphConfig::resolve_runtime_backend();
+            assert!(expected.is_gpu_class());
+            assert_eq!(
+                GgmlCpuGraphConfig::resolve_family_runtime_backend(AutoGpuPolicy::ExceptMetal),
+                expected
+            );
+        }
+
+        // An explicit CpuOnly preference is honored regardless of the gate.
+        {
+            let _guard = install_request_backend_override(Some(RequestBackendPreference::CpuOnly));
+            assert_eq!(
+                GgmlCpuGraphConfig::resolve_family_runtime_backend(AutoGpuPolicy::ExceptMetal),
+                GgmlCpuGraphBackend::Cpu
             );
         }
     }

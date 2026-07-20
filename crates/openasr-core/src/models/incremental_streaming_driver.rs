@@ -212,7 +212,7 @@ where
             // (already threaded into every rebuilt request below) is silently
             // never read by `resolve_runtime_backend`/`resolve_family_runtime_backend`
             // and an explicit Accelerated choice would decode on CPU for any
-            // `auto_gpu_enabled = false` family.
+            // gated (`AutoGpuPolicy::Never`/`ExceptMetal`) family.
             let _backend_override =
                 install_request_backend_override(backend_preference.request_backend_override());
             decode(&executor, &make_request(audio, partial_prompt))
@@ -1600,12 +1600,12 @@ mod tests {
     /// the fix only the thread-count override was installed here, so an
     /// explicit `Accelerated` streaming request never reached
     /// `resolve_family_runtime_backend`/`resolve_runtime_backend` and a gated
-    /// family (dolphin, `auto_gpu_enabled = false`) silently decoded on CPU
-    /// even with GPU explicitly selected.
+    /// family (dolphin, `auto_gpu_policy = AutoGpuPolicy::Never` at the time)
+    /// silently decoded on CPU even with GPU explicitly selected.
     #[test]
     fn streaming_transcribe_closure_installs_request_backend_override() {
         use crate::ggml_runtime::{
-            GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference,
+            AutoGpuPolicy, GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference,
         };
         use std::path::PathBuf;
 
@@ -1630,8 +1630,7 @@ mod tests {
         // closure and records what the decode fn observed via the
         // thread-local override -- the exact mechanism a gated family's
         // `resolve_family_runtime_backend` reads -- plus what that resolver
-        // itself would return for a gated family (`auto_gpu_enabled = false`)
-        // at that instant.
+        // itself would return for a gated family at that instant.
         fn observed_backend_during_decode(
             backend_preference: crate::GgmlAsrBackendPreference,
         ) -> (Option<RequestBackendPreference>, GgmlCpuGraphBackend) {
@@ -1649,7 +1648,7 @@ mod tests {
                 move |_executor: &(), _request: &GgmlAsrExecutionRequest| {
                     *observed_for_decode.lock().unwrap() = Some((
                         crate::ggml_runtime::request_backend_override(),
-                        GgmlCpuGraphConfig::resolve_family_runtime_backend(false),
+                        GgmlCpuGraphConfig::resolve_family_runtime_backend(AutoGpuPolicy::Never),
                     ));
                     Ok(GgmlAsrExecutionResult {
                         transcription: transcription(""),

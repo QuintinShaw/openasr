@@ -22,7 +22,7 @@ pub use backend::{
     ggml_native_build_enabled, ggml_runtime_info,
 };
 pub use cpu_graph::{
-    GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError,
+    AutoGpuPolicy, GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, RequestBackendOverrideGuard,
     RequestBackendPreference, install_request_backend_override, request_backend_override,
 };

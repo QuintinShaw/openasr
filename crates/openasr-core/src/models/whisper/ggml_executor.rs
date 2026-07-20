@@ -121,7 +121,9 @@ use super::mel::{
 use super::runtime_contract::{WhisperGgmlExecutionMetadata, validate_whisper_execution_metadata};
 use super::{
     WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
-    greedy_decode::{WhisperGreedyDecodeError, run_whisper_greedy_decode_loop},
+    greedy_decode::{
+        WhisperGreedyDecodeError, WhisperGreedyDecodeResult, run_whisper_greedy_decode_loop,
+    },
     tokenizer::{WhisperPrefixError, WhisperPrefixSpec, WhisperTokenizer},
 };
 use crate::models::decode_policy_component_registry::{
@@ -5254,6 +5256,56 @@ fn run_whisper_decode_loop(
             );
             decode
         }
+        // Hitting the token budget without EOT degrades to the generated
+        // prefix (mirrors cohere/moonshine/qwen, see
+        // `qwen::ggml_executor::Qwen3AsrGgmlExecutorError` and
+        // `moonshine::decoder_graph::run_moonshine_greedy_decode_loop`'s
+        // callers) instead of failing the whole call. This case is reached
+        // by ill-conditioned OOD decode (e.g. a language mismatch driving a
+        // non-terminating greedy trajectory) more easily on one ggml backend
+        // than another -- both backends are equally exposed to it in
+        // principle, it is just easier to trigger on Metal in practice (see
+        // the platform-audit doc for why: near-tied argmax logits are prone
+        // to ULP-level cross-backend flips). It is a genuine decode-quality
+        // problem (the model ran out of budget still uncertain what to say
+        // next), not a backend bug, so the honest response is to hand back
+        // whatever was actually transcribed rather than raise a hard,
+        // fail-closed transcription error for an otherwise-successful
+        // decode run. The "degraded" trace tag (distinct from both "ok" and
+        // "err") keeps this outcome visible rather than silently folding it
+        // into a normal completion.
+        Err(WhisperGreedyDecodeError::EotNotReachedBeforeMaxTokens {
+            generated_tokens,
+            generated_probabilities,
+            max_generated_tokens,
+        }) => {
+            decode_loop_span.finish_with_extra(
+                "degraded-max-tokens-cap",
+                &format!(
+                    "steps_executed={} generated_tokens={} max_generated_tokens={max_generated_tokens}",
+                    step_runner.decode_steps_completed,
+                    generated_tokens.len(),
+                ),
+            );
+            // Same visibility contract as the shared degenerate-ngram guard's
+            // own `eprintln!` (`seq2seq_greedy_decode::run_seq2seq_greedy_decode_loop_v0`):
+            // a real field occurrence should be observable in stderr, not
+            // silently folded into a normal completion.
+            eprintln!(
+                "openasr_whisper_ggml_executor stage=decode_loop event=max_tokens_cap_degraded status=partial-returned max_generated_tokens={max_generated_tokens} generated_tokens={}",
+                generated_tokens.len(),
+            );
+            let text = decode_text_token_ids(&generated_tokens)
+                .map_err(map_greedy_decode_error)
+                .map_err(|error| {
+                    decorate_decoder_boundary_error(error, &prelude_summary, &encoder_summary)
+                })?;
+            WhisperGreedyDecodeResult {
+                text,
+                generated_tokens,
+                generated_probabilities,
+            }
+        }
         Err(error) => {
             decode_loop_span.finish_with_extra(
                 "err",
@@ -5330,6 +5382,7 @@ fn map_greedy_decode_error(error: WhisperGreedyDecodeError) -> WhisperGgmlExecut
     match error {
         WhisperGreedyDecodeError::EotNotReachedBeforeMaxTokens {
             max_generated_tokens,
+            ..
         } => WhisperGgmlExecutorError::DecoderNoEotBeforeMaxTokens {
             max_generated_tokens,
         },

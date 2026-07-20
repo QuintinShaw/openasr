@@ -17,7 +17,7 @@ pub(crate) struct WhisperGreedyDecodeResult {
     pub text: String,
 }
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, PartialEq)]
 pub(crate) enum WhisperGreedyDecodeError {
     #[error("whisper greedy decode requires at least one initial prompt token")]
     EmptyInitialPrompt,
@@ -46,7 +46,16 @@ pub(crate) enum WhisperGreedyDecodeError {
         vocab_size: usize,
     },
     #[error("whisper greedy decode reached max_generated_tokens={max_generated_tokens} before EOT")]
-    EotNotReachedBeforeMaxTokens { max_generated_tokens: usize },
+    EotNotReachedBeforeMaxTokens {
+        max_generated_tokens: usize,
+        /// Parallel to `generated_probabilities`. Preserved (not dropped)
+        /// through the shared-error round trip so a caller can degrade to
+        /// this partial prefix instead of failing the whole decode -- the
+        /// same "no-EOT partial" pattern cohere/moonshine/qwen already use
+        /// (see `ggml_executor::whisper_greedy_decode_output_or_partial`).
+        generated_tokens: Vec<u32>,
+        generated_probabilities: Vec<f32>,
+    },
     #[error("whisper greedy decode decoder step failed: {reason}")]
     DecoderStepFailed { reason: String },
     #[error("whisper greedy decode tokenizer decode failed: {reason}")]
@@ -113,10 +122,12 @@ fn map_whisper_error_to_shared(error: WhisperGreedyDecodeError) -> Seq2SeqGreedy
         },
         WhisperGreedyDecodeError::EotNotReachedBeforeMaxTokens {
             max_generated_tokens,
+            generated_tokens,
+            generated_probabilities,
         } => Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {
             max_generated_tokens,
-            generated_tokens: Vec::new(),
-            generated_probabilities: Vec::new(),
+            generated_tokens,
+            generated_probabilities,
         },
         WhisperGreedyDecodeError::DecoderStepFailed { reason } => {
             Seq2SeqGreedyDecodeError::DecoderStepFailed { reason }
@@ -162,9 +173,12 @@ fn map_shared_error(error: Seq2SeqGreedyDecodeError) -> WhisperGreedyDecodeError
         },
         Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {
             max_generated_tokens,
-            ..
+            generated_tokens,
+            generated_probabilities,
         } => WhisperGreedyDecodeError::EotNotReachedBeforeMaxTokens {
             max_generated_tokens,
+            generated_tokens,
+            generated_probabilities,
         },
         Seq2SeqGreedyDecodeError::DecoderStepFailed { reason } => {
             WhisperGreedyDecodeError::DecoderStepFailed { reason }
@@ -339,9 +353,29 @@ mod tests {
         )
         .expect_err("no EOT should fail closed");
 
-        assert!(matches!(
-            error,
-            WhisperGreedyDecodeError::EotNotReachedBeforeMaxTokens { .. }
-        ));
+        // Regression: this error must carry the actually-generated partial
+        // prefix, not silently drop it. Before this fix,
+        // `map_shared_error` discarded the shared driver's
+        // `generated_tokens`/`generated_probabilities` with a `..` pattern
+        // (the field didn't even exist on `WhisperGreedyDecodeError` yet),
+        // so a caller had no partial output to degrade to and had to
+        // hard-fail the whole transcription on any max-tokens-cap runaway
+        // (e.g. an OOD decode with no `--language` hint). The executor layer
+        // (`ggml_executor::run_whisper_decode_loop`) now degrades this exact
+        // case to the generated prefix instead of erroring the call, mirroring
+        // cohere/moonshine/qwen -- this test pins that the data survives the
+        // round trip so that degrade path has something to degrade to.
+        match error {
+            WhisperGreedyDecodeError::EotNotReachedBeforeMaxTokens {
+                max_generated_tokens,
+                generated_tokens,
+                generated_probabilities,
+            } => {
+                assert_eq!(max_generated_tokens, 3);
+                assert_eq!(generated_tokens, vec![1, 2, 3]);
+                assert_eq!(generated_probabilities.len(), generated_tokens.len());
+            }
+            other => panic!("expected EotNotReachedBeforeMaxTokens, got {other:?}"),
+        }
     }
 }
