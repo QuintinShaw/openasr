@@ -3016,6 +3016,123 @@ fn parallel_download_cancel_deletes_partial_and_allows_clean_restart() {
     assert_eq!(fs::read(&paths.final_path).unwrap(), bytes);
 }
 
+/// Reader that trips a shared cancel flag on its first `read` and records how
+/// many times it is read, so a test can prove the chunked probe segment stops
+/// reading the moment the pull is canceled instead of streaming the whole (up
+/// to 64 MiB) probe segment first.
+struct ProbeCancelReader {
+    inner: Cursor<Vec<u8>>,
+    reads: Arc<AtomicUsize>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Read for ProbeCancelReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.cancel.store(true, Ordering::SeqCst);
+        self.inner.read(buf)
+    }
+}
+
+/// Serves every bounded Range request with a `ProbeCancelReader`, so the very
+/// first byte of the synchronous probe segment cancels the pull.
+#[derive(Clone)]
+struct ProbeCancelClient {
+    bytes: Arc<Vec<u8>>,
+    reads: Arc<AtomicUsize>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl DownloadClient for ProbeCancelClient {
+    fn open(
+        &mut self,
+        _url: &str,
+        range: Option<ByteRange>,
+    ) -> Result<DownloadResponse, PullError> {
+        let total = self.bytes.len() as u64;
+        let range = range.expect("parallel probe issues a bounded range");
+        let end = range
+            .end
+            .unwrap_or(total.saturating_sub(1))
+            .min(total.saturating_sub(1));
+        let start = range.start.min(end);
+        let slice = self.bytes[start as usize..=end as usize].to_vec();
+        Ok(DownloadResponse {
+            status: 206,
+            content_length: Some(slice.len() as u64),
+            content_range: Some(format!("bytes {start}-{end}/{total}")),
+            etag: Some("etag-a".to_string()),
+            reader: Box::new(ProbeCancelReader {
+                inner: Cursor::new(slice),
+                reads: self.reads.clone(),
+                cancel: self.cancel.clone(),
+            }),
+        })
+    }
+}
+
+#[test]
+fn parallel_download_cancel_during_probe_stops_without_reading_whole_segment() {
+    // A probe segment larger than one `DOWNLOAD_BUFFER_BYTES` (64 KiB) read:
+    // if the probe write ignored cancellation it would read the segment in
+    // several chunks before noticing, so `reads > 1` would betray the old
+    // "download the whole probe segment first" behavior. Bytes are arbitrary
+    // (never verified/installed: the pull is canceled first).
+    let segment_bytes = 96 * 1024_u64;
+    let bytes = vec![7_u8; (segment_bytes as usize) * 3 + 17];
+    let resolved = resolved_for(&bytes);
+    assert!(
+        parallel_download_eligible(
+            &PullTarget::from_resolved(&resolved).unwrap(),
+            4,
+            segment_bytes,
+        ),
+        "fixture must exercise the chunked path"
+    );
+    let temp = tempfile::tempdir().unwrap();
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let mut probe_client = ProbeCancelClient {
+        bytes: Arc::new(bytes.clone()),
+        reads: reads.clone(),
+        cancel: cancel.clone(),
+    };
+    let factory_client = probe_client.clone();
+    let factory: Box<dyn Fn() -> Result<BoxedDownloadClient, PullError>> =
+        Box::new(move || Ok(Box::new(factory_client.clone()) as BoxedDownloadClient));
+    let parallel = ParallelDownloadConfig {
+        connections: 4,
+        factory: &*factory,
+    };
+
+    let cancel_predicate = cancel.clone();
+    let error = pull_model_pack_with_client_parallel(
+        &resolved,
+        temp.path(),
+        &mut probe_client,
+        parallel_test_options(segment_bytes),
+        parallel,
+        |_| {},
+        move || cancel_predicate.load(Ordering::SeqCst),
+        || false,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, PullError::Canceled { .. }));
+    // The probe write must abort after the first read that tripped the cancel,
+    // never streaming the rest of the 96 KiB probe segment.
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "probe segment kept reading after cancellation was requested"
+    );
+    let paths = paths_for(temp.path(), &resolved);
+    assert!(!paths.partial_path.exists());
+    assert!(!paths.partial_segments_meta_path.exists());
+    assert!(!paths.final_path.exists());
+}
+
 #[test]
 fn parallel_download_sha_mismatch_deletes_partial() {
     let bytes = tiny_pack_bytes();

@@ -2022,6 +2022,44 @@ fn pull_job_reuses_existing_nonterminal_snapshot_for_same_pull() {
     assert_eq!(reused.job_id, "pull-existing");
 }
 
+#[test]
+fn nonterminal_snapshot_for_pull_skips_a_job_being_canceled() {
+    // A job with a pending cancel is not yet terminal (its worker unwinds
+    // asynchronously), but re-pulling the same pack while it drains must NOT
+    // coalesce into that dying job -- otherwise the user's "download again"
+    // silently attaches to a job on its way to `Canceled` and no new download
+    // starts until the cancel fully settles. The re-pull must see "no live job
+    // for this pack" so `start_pull_job` mints a fresh one instead.
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+    let resolved = resolved_pull_fixture();
+
+    let mut canceling = PullJobSnapshot::queued("pull-canceling".to_string(), &resolved, None);
+    canceling.state = PullJobState::Downloading;
+    canceling.control_requested = Some(PullControlRequest::Cancel);
+    distribution.insert_job(canceling).unwrap();
+
+    assert!(
+        distribution
+            .nonterminal_snapshot_for_pull(&resolved)
+            .is_none(),
+        "a cancel-in-flight job must not be reused for a fresh pull"
+    );
+
+    // A still-live (non-canceling) download for the same pack is still reused.
+    let mut downloading = PullJobSnapshot::queued("pull-live".to_string(), &resolved, None);
+    downloading.state = PullJobState::Downloading;
+    distribution.insert_job(downloading).unwrap();
+
+    assert_eq!(
+        distribution
+            .nonterminal_snapshot_for_pull(&resolved)
+            .unwrap()
+            .job_id,
+        "pull-live"
+    );
+}
+
 #[tokio::test]
 async fn list_pull_jobs_returns_empty_list_when_no_jobs_exist() {
     let temp = tempfile::tempdir().unwrap();

@@ -1562,8 +1562,30 @@ fn download_parallel_attempt<C: DownloadClient + ?Sized>(
                     bytes_total: target.size_bytes,
                 });
             },
-            None,
+            &|| should_cancel() || should_pause(),
         )?;
+        // The probe segment downloads synchronously on this orchestrating
+        // thread, before any worker thread exists to poll the controls, so it
+        // must honor cancel/pause itself -- otherwise a cancel issued while the
+        // probe is in flight would not take effect until the whole (up to
+        // 64 MiB) probe segment finished, stranding the pull in `Downloading`
+        // for seconds. `write_segment_body` stops early on the predicate above,
+        // leaving a short segment, so these checks must come before the
+        // size-mismatch check below (an intentional stop is not a mismatch).
+        if should_cancel() {
+            cleanup_partial(paths);
+            return Err(PullError::Canceled {
+                reference: target.pull.clone(),
+            });
+        }
+        if should_pause() {
+            // Keep the partial file and segment bitmap (segment not marked
+            // done) so a later resume re-probes and refetches this segment
+            // cleanly, exactly like a pause caught by the worker loop below.
+            return Err(PullError::Paused {
+                reference: target.pull.clone(),
+            });
+        }
         let expected = probe_end - probe_start + 1;
         if written != expected {
             cleanup_partial(paths);
@@ -1726,11 +1748,15 @@ fn sync_partial_file(path: &Path) -> Result<(), PullError> {
 /// Stream `reader` (already capped to the segment's expected length by the
 /// caller's use of `.take`, applied inside this function) into `file` at
 /// `[start, end_inclusive]`, calling `on_progress` with each chunk's byte
-/// count as it's written. Stops early (without error) if `abort` is set,
-/// leaving the segment's on-disk bytes incomplete but never marked done by
-/// the caller. Shared by the synchronous probe-segment write (main thread,
-/// `abort: None`) and every worker's per-segment fetch
-/// (`fetch_segment_once`), so both paths write segments identically.
+/// count as it's written. Stops early (without error) as soon as `should_abort`
+/// returns true, leaving the segment's on-disk bytes incomplete but never
+/// marked done by the caller. Checked once per buffer read so a stop request
+/// is honored within a single `DOWNLOAD_BUFFER_BYTES` chunk rather than only
+/// after the whole (up to 64 MiB) segment finishes. Shared by the synchronous
+/// probe-segment write (main thread, whose predicate polls the pull's
+/// cancel/pause controls directly) and every worker's per-segment fetch
+/// (`fetch_segment_once`, whose predicate reads the shared `abort` flag), so
+/// both paths write segments identically and stop identically.
 fn write_segment_body(
     file: &mut File,
     path_for_errors: &Path,
@@ -1738,7 +1764,7 @@ fn write_segment_body(
     end_inclusive: u64,
     reader: Box<dyn Read>,
     mut on_progress: impl FnMut(u64),
-    abort: Option<&AtomicBool>,
+    should_abort: &dyn Fn() -> bool,
 ) -> Result<u64, PullError> {
     file.seek(SeekFrom::Start(start))
         .map_err(|source| PullError::Io {
@@ -1750,7 +1776,7 @@ fn write_segment_body(
     let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
     let mut written = 0_u64;
     loop {
-        if abort.is_some_and(|abort| abort.load(Ordering::SeqCst)) {
+        if should_abort() {
             break;
         }
         let read = reader.read(&mut buffer).map_err(|source| PullError::Io {
@@ -1933,7 +1959,7 @@ fn fetch_segment_once(
         |delta| {
             let _ = sender.send(SegmentEvent::Progress(delta));
         },
-        Some(abort),
+        &|| abort.load(Ordering::SeqCst),
     )?;
     if abort.load(Ordering::SeqCst) {
         return Ok(false);

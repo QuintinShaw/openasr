@@ -1499,6 +1499,16 @@ impl DistributionContext {
             .values()
             .filter(|snapshot| {
                 !snapshot.state.is_terminal()
+                    // A job with a pending cancel is on its way to a terminal
+                    // `Canceled` state (the worker unwinds asynchronously). It
+                    // must not be handed back as the live job for a fresh pull
+                    // of the same pack: doing so silently coalesces the user's
+                    // "download again" into the dying job, so no new download
+                    // ever starts until the cancel fully settles. Excluding it
+                    // here lets `start_pull_job` mint a new job instead (which
+                    // then queues on the same pull lock the canceling job still
+                    // holds, and proceeds once it releases).
+                    && snapshot.control_requested != Some(PullControlRequest::Cancel)
                     && snapshot.model_id == resolved.model_id
                     && snapshot.quant == resolved.quant
                     && snapshot.pull == resolved.pull
