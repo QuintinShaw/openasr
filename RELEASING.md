@@ -107,6 +107,60 @@ upload, and completeness-gate logic without mutating the release's assets
 genuinely incomplete -- that failure is expected and informative, not a bug
 in the dry run).
 
+## Backends-manifest signing (REQUIRED, LOCAL ONLY -- not optional)
+
+Every release that ships a Windows GPU-kernel `backends-manifest.json`
+(schema v2 -- see `tooling/release-manifest/README.md`) is **not complete**
+until that manifest is signed and the signature is verified against the
+actual published release asset. This is the exact gap that shipped core
+0.1.16-0.1.19 with a never-signed manifest: the signing seed
+(`OPENASR_CATALOG_SIGNING_KEY_SEED_HEX`) is LOCAL ONLY and must never enter
+CI, so it cannot be automated away -- but "a maintainer must remember to run
+three commands afterwards" is exactly the kind of step that gets forgotten.
+
+**The primary gate is a single atomic script, not a checklist:**
+
+```bash
+OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<real production seed> \
+  scripts/sign-and-verify-backends-manifest.sh vX.Y.Z
+```
+
+Run this once `release-binaries.yml` has finished and its `checksums` job has
+attached the unsigned `backends-manifest.json` to the release. The script:
+
+1. downloads the unsigned manifest from the release and signs it with
+   `__openasr-sign-backends-manifest`;
+2. uploads `backends-manifest.signature.json` to the release (and, only if
+   `B2_S3_ENDPOINT`/`B2_APPLICATION_KEY_ID`/`B2_APPLICATION_KEY` are already
+   set in the environment, best-effort syncs both files to
+   dl.openasr.org -- that sync is documented as optional in
+   `tooling/release-manifest/README.md` and never blocks this script);
+3. **re-downloads** the manifest + signature it just published (not the
+   local copies) and self-verifies them with
+   `__openasr-verify-backends-manifest` against the production trust root.
+
+Any of the three steps failing aborts immediately with a `SIGNING/VERIFY
+FAILED for vX.Y.Z` banner and a non-zero exit. Treat that exactly like a
+failed test: **the release is not signed and must not be announced or
+shipped until the script exits 0 with `SIGNED-AND-VERIFIED`.** Do not fall
+back to running the old individual `gh`/`cargo run` commands by hand except
+to debug why the script itself failed.
+
+This step cannot be folded into `scripts/bump-version.sh` (that script runs
+*before* the tag is pushed and before CI has built the release archives the
+manifest is generated from -- the unsigned `backends-manifest.json` does not
+exist yet at that point). It is, by construction, the last step of a
+release.
+
+CI also runs a **secondary safety net** -- `release-binaries.yml`'s
+`verify-backends-manifest-signature` job (`workflow_dispatch` only, since the
+signature cannot exist until after this local script has run). It performs
+the exact same re-download-and-verify check `sign-and-verify-backends-manifest.sh`
+already does. Treat a red run there as confirmation the local step above was
+skipped, not as the primary way this gets caught -- the local script above
+is the primary gate; CI's job is a fallback in case a release ever gets
+announced without it having been run.
+
 ## Homebrew tap
 
 `release-core.yml`'s final job, `update-homebrew-tap`, bumps

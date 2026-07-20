@@ -43,11 +43,29 @@ Exactly like the model catalog
 seed for `backends-manifest.signature.json` never enters CI. It reuses the
 SAME production key/trust root as the catalog
 (`openasr-catalog-v1` -- see `crates/openasr-core/src/backends_manifest_security.rs`
-for why one keypair covers both). After a release finishes:
+for why one keypair covers both).
+
+**Run the one atomic script** (see `RELEASING.md`'s "Backends-manifest
+signing" section for the full contract) instead of the individual commands
+below by hand:
 
 ```bash
-# Download the CI-generated unsigned manifest from the release, or from the
-# `backends-manifest` workflow artifact.
+OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<real production seed> \
+  scripts/sign-and-verify-backends-manifest.sh v<version>
+```
+
+It downloads the unsigned manifest from the release, signs it, uploads the
+signature, then re-downloads and re-verifies the published pair against the
+production trust root -- aborting loudly (`SIGNING/VERIFY FAILED`) on the
+first failure instead of leaving the release half-signed. This replaces the
+three manual commands that used to live here (download / sign / upload),
+which is exactly the multi-step-that-gets-forgotten shape that shipped core
+0.1.16-0.1.19 with a never-signed manifest.
+
+Under the hood, step 1 is still `__openasr-sign-backends-manifest`, run
+equivalently to:
+
+```bash
 gh release download v<version> -p backends-manifest.json -O backends-manifest.json
 
 OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<real production seed> \
@@ -61,7 +79,8 @@ gh release upload v<version> backends-manifest.signature.json --clobber
 `__openasr-sign-backends-manifest` self-verifies the signature it just
 produced against the production trust root before writing it out, so signing
 with anything other than the real production seed fails loudly instead of
-silently writing an unverifiable signature.
+silently writing an unverifiable signature. Only fall back to running these
+individual commands by hand to debug a failure of the script itself.
 
 **`--manifest-url` must be the CANONICAL URL** -- exactly what
 `openasr_core::backend_manifest::canonical_manifest_url(core_version)` returns
@@ -145,10 +164,12 @@ is always a local, human-run step:
 
 Run all three steps from a maintainer machine; none of this runs in CI.
 
-1. **Sign the manifest and attach it to the GitHub release** -- see
-   "Signing" above (`__openasr-sign-backends-manifest`, production
-   `OPENASR_CATALOG_SIGNING_KEY_SEED_HEX`, then
-   `gh release upload v<version> backends-manifest.signature.json --clobber`).
+1. **Sign the manifest, attach it to the GitHub release, and self-verify** --
+   run `OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<production seed>
+   scripts/sign-and-verify-backends-manifest.sh v<version>` (see "Signing"
+   above and `RELEASING.md`). This step is REQUIRED and not optional: the
+   release is not signed until this script prints `SIGNED-AND-VERIFIED` and
+   exits 0.
 2. **Sync to dl.openasr.org** -- see "dl.openasr.org sync" above
    (`b2_sync.py sync --version <version>`, uploading the Windows sidecar
    archives -- `-vulkan`, `-cuda-sidecar`, `-rocm-sidecar` -- plus
@@ -158,6 +179,9 @@ Run all three steps from a maintainer machine; none of this runs in CI.
    -- never repo secrets). `sync-vendor` for the vendor_layers archives is
    OPTIONAL (see above) and not part of this release-blocking checklist --
    GitHub Releases (already populated by `release-binaries.yml`) is enough.
+   (Step 1's script already best-effort syncs just the manifest + signature
+   pair if the same B2 env vars happen to be set when it runs; this step is
+   still needed for the sidecar archives regardless.)
 3. **Spot-check one signed exe with `signtool`** -- pick one of the archives
    just uploaded (rotate which GPU leg you check across releases) and confirm
    the Azure Trusted Signing signature is intact and trusted end to end:
