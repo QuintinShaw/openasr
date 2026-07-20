@@ -24,13 +24,16 @@
 #     repo secret. See tooling/publish-model/scripts/publish_catalog.sh for
 #     the sibling process that uses the same seed for the model catalog.
 #
-# Optional environment (best-effort dl.openasr.org mirror sync -- see
-# tooling/release-manifest/README.md's "dl.openasr.org sync" section; this is
-# a documented OPTIONAL CDN-fronting step, not release-blocking, so its
-# absence does not fail this script):
-#   B2_S3_ENDPOINT, B2_APPLICATION_KEY_ID, B2_APPLICATION_KEY
+# This script does NOT sync anything to dl.openasr.org/B2 -- that is
+# `tooling/release-manifest/b2_sync.py`'s job alone (single authoritative
+# entry point for B2 sync, including this signature file). Run
+# `python3 tooling/release-manifest/b2_sync.py sync --version <version>
+# backends-manifest.json backends-manifest.signature.json [...]` AFTER this
+# script succeeds -- see RELEASING.md and tooling/release-manifest/README.md's
+# "dl.openasr.org sync" section for the full command (it also syncs the
+# Windows sidecar archives, which this script never touches).
 #
-# Requires: gh (authenticated), cargo, python3 (only if B2 env vars are set).
+# Requires: gh (authenticated), cargo.
 
 set -euo pipefail
 
@@ -132,17 +135,10 @@ echo "==> [2/3] uploading backends-manifest.signature.json to release ${tag}"
 if ! gh release upload "$tag" "${workdir}/backends-manifest.signature.json" --clobber; then
   fail "gh release upload of backends-manifest.signature.json failed."
 fi
-
-if [ -n "${B2_S3_ENDPOINT:-}" ] && [ -n "${B2_APPLICATION_KEY_ID:-}" ] && [ -n "${B2_APPLICATION_KEY:-}" ]; then
-  echo "==> [2/3] B2/dl.openasr.org env vars present -- syncing manifest + signature"
-  if ! python3 tooling/release-manifest/b2_sync.py sync --version "$version" \
-      "${workdir}/backends-manifest.json" \
-      "${workdir}/backends-manifest.signature.json"; then
-    fail "b2_sync.py sync failed for backends-manifest.json/.signature.json -- release asset upload already succeeded (GitHub Releases still serves it), but dl.openasr.org is out of sync. Re-run 'python3 tooling/release-manifest/b2_sync.py sync --version ${version} <files>' once fixed."
-  fi
-else
-  echo "==> [2/3] B2_S3_ENDPOINT/B2_APPLICATION_KEY_ID/B2_APPLICATION_KEY not all set -- skipping dl.openasr.org sync (documented as OPTIONAL, not release-blocking; see tooling/release-manifest/README.md)."
-fi
+# dl.openasr.org/B2 sync is deliberately NOT done here -- that is
+# tooling/release-manifest/b2_sync.py's sole job (single authoritative sync
+# entry point, covering this signature file too). Run it as the next step;
+# see RELEASING.md.
 
 # --- Step 3: verify against what is ACTUALLY published -------------------
 # Re-download fresh (do not reuse the local files we just signed/uploaded)

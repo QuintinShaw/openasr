@@ -130,11 +130,7 @@ attached the unsigned `backends-manifest.json` to the release. The script:
 
 1. downloads the unsigned manifest from the release and signs it with
    `__openasr-sign-backends-manifest`;
-2. uploads `backends-manifest.signature.json` to the release (and, only if
-   `B2_S3_ENDPOINT`/`B2_APPLICATION_KEY_ID`/`B2_APPLICATION_KEY` are already
-   set in the environment, best-effort syncs both files to
-   dl.openasr.org -- that sync is documented as optional in
-   `tooling/release-manifest/README.md` and never blocks this script);
+2. uploads `backends-manifest.signature.json` to the release;
 3. **re-downloads** the manifest + signature it just published (not the
    local copies) and self-verifies them with
    `__openasr-verify-backends-manifest` against the production trust root.
@@ -145,6 +141,34 @@ failed test: **the release is not signed and must not be announced or
 shipped until the script exits 0 with `SIGNED-AND-VERIFIED`.** Do not fall
 back to running the old individual `gh`/`cargo run` commands by hand except
 to debug why the script itself failed.
+
+**This script never touches dl.openasr.org/B2.** That sync has exactly one
+authoritative entry point, `tooling/release-manifest/b2_sync.py`, and it
+already covers the signature file -- `b2_sync.py sync` is a generic
+per-file uploader (keys by `core/v<version>/<basename>`), not a manifest-only
+tool, so passing it `backends-manifest.signature.json` alongside
+`backends-manifest.json` and the Windows sidecar archives works today. Run
+the two steps in this order:
+
+```bash
+# 1. Sign, publish to the GitHub release, and self-verify (REQUIRED, this section):
+OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<real production seed> \
+  scripts/sign-and-verify-backends-manifest.sh vX.Y.Z
+
+# 2. Sync to dl.openasr.org (OPTIONAL CDN-fronting step -- see
+#    tooling/release-manifest/README.md's "dl.openasr.org sync"; download the
+#    two files back from the release first, since step 1 does not leave them
+#    on disk):
+gh release download vX.Y.Z -p backends-manifest.json -p backends-manifest.signature.json
+python3 tooling/release-manifest/b2_sync.py sync --version X.Y.Z \
+  backends-manifest.json backends-manifest.signature.json \
+  <windows-sidecar-archives...>
+```
+
+Step 1 (signing) is release-blocking. Step 2 (B2 sync) stays what it has
+always been: optional, local, and never release-blocking -- GitHub Releases
+alone is a fully usable distribution point (see `tooling/release-manifest/README.md`'s
+"dl.openasr.org sync" section for why).
 
 This step cannot be folded into `scripts/bump-version.sh` (that script runs
 *before* the tag is pushed and before CI has built the release archives the

@@ -179,9 +179,9 @@ Run all three steps from a maintainer machine; none of this runs in CI.
    -- never repo secrets). `sync-vendor` for the vendor_layers archives is
    OPTIONAL (see above) and not part of this release-blocking checklist --
    GitHub Releases (already populated by `release-binaries.yml`) is enough.
-   (Step 1's script already best-effort syncs just the manifest + signature
-   pair if the same B2 env vars happen to be set when it runs; this step is
-   still needed for the sidecar archives regardless.)
+   `b2_sync.py` is the ONLY thing that syncs to B2/dl.openasr.org -- step 1's
+   script deliberately does not touch B2 at all, so run this step after step
+   1 if dl.openasr.org mirroring is wanted for this release.
 3. **Spot-check one signed exe with `signtool`** -- pick one of the archives
    just uploaded (rotate which GPU leg you check across releases) and confirm
    the Azure Trusted Signing signature is intact and trusted end to end:
