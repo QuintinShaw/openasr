@@ -107,6 +107,84 @@ upload, and completeness-gate logic without mutating the release's assets
 genuinely incomplete -- that failure is expected and informative, not a bug
 in the dry run).
 
+## Backends-manifest signing (REQUIRED, LOCAL ONLY -- not optional)
+
+Every release that ships a Windows GPU-kernel `backends-manifest.json`
+(schema v2 -- see `tooling/release-manifest/README.md`) is **not complete**
+until that manifest is signed and the signature is verified against the
+actual published release asset. This is the exact gap that shipped core
+0.1.16-0.1.19 with a never-signed manifest: the signing seed
+(`OPENASR_CATALOG_SIGNING_KEY_SEED_HEX`) is LOCAL ONLY and must never enter
+CI, so it cannot be automated away -- but "a maintainer must remember to run
+three commands afterwards" is exactly the kind of step that gets forgotten.
+
+**The primary gate is a single atomic script, not a checklist:**
+
+```bash
+OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<real production seed> \
+  scripts/sign-and-verify-backends-manifest.sh vX.Y.Z
+```
+
+Run this once `release-binaries.yml` has finished and its `checksums` job has
+attached the unsigned `backends-manifest.json` to the release. The script:
+
+1. downloads the unsigned manifest from the release and signs it with
+   `__openasr-sign-backends-manifest`;
+2. uploads `backends-manifest.signature.json` to the release;
+3. **re-downloads** the manifest + signature it just published (not the
+   local copies) and self-verifies them with
+   `__openasr-verify-backends-manifest` against the production trust root.
+
+Any of the three steps failing aborts immediately with a `SIGNING/VERIFY
+FAILED for vX.Y.Z` banner and a non-zero exit. Treat that exactly like a
+failed test: **the release is not signed and must not be announced or
+shipped until the script exits 0 with `SIGNED-AND-VERIFIED`.** Do not fall
+back to running the old individual `gh`/`cargo run` commands by hand except
+to debug why the script itself failed.
+
+**This script never touches dl.openasr.org/B2.** That sync has exactly one
+authoritative entry point, `tooling/release-manifest/b2_sync.py`, and it
+already covers the signature file -- `b2_sync.py sync` is a generic
+per-file uploader (keys by `core/v<version>/<basename>`), not a manifest-only
+tool, so passing it `backends-manifest.signature.json` alongside
+`backends-manifest.json` and the Windows sidecar archives works today. Run
+the two steps in this order:
+
+```bash
+# 1. Sign, publish to the GitHub release, and self-verify (REQUIRED, this section):
+OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<real production seed> \
+  scripts/sign-and-verify-backends-manifest.sh vX.Y.Z
+
+# 2. Sync to dl.openasr.org (OPTIONAL CDN-fronting step -- see
+#    tooling/release-manifest/README.md's "dl.openasr.org sync"; download the
+#    two files back from the release first, since step 1 does not leave them
+#    on disk):
+gh release download vX.Y.Z -p backends-manifest.json -p backends-manifest.signature.json
+python3 tooling/release-manifest/b2_sync.py sync --version X.Y.Z \
+  backends-manifest.json backends-manifest.signature.json \
+  <windows-sidecar-archives...>
+```
+
+Step 1 (signing) is release-blocking. Step 2 (B2 sync) stays what it has
+always been: optional, local, and never release-blocking -- GitHub Releases
+alone is a fully usable distribution point (see `tooling/release-manifest/README.md`'s
+"dl.openasr.org sync" section for why).
+
+This step cannot be folded into `scripts/bump-version.sh` (that script runs
+*before* the tag is pushed and before CI has built the release archives the
+manifest is generated from -- the unsigned `backends-manifest.json` does not
+exist yet at that point). It is, by construction, the last step of a
+release.
+
+CI also runs a **secondary safety net** -- `release-binaries.yml`'s
+`verify-backends-manifest-signature` job (`workflow_dispatch` only, since the
+signature cannot exist until after this local script has run). It performs
+the exact same re-download-and-verify check `sign-and-verify-backends-manifest.sh`
+already does. Treat a red run there as confirmation the local step above was
+skipped, not as the primary way this gets caught -- the local script above
+is the primary gate; CI's job is a fallback in case a release ever gets
+announced without it having been run.
+
 ## Homebrew tap
 
 `release-core.yml`'s final job, `update-homebrew-tap`, bumps

@@ -304,6 +304,28 @@ pub(crate) enum Command {
         #[arg(long)]
         print_public_key: bool,
     },
+    /// Internal helper: read-only verification of an already-signed
+    /// `backends-manifest.json` + `backends-manifest.signature.json` pair
+    /// against the production trust root. Does not sign anything and needs no
+    /// signing seed -- safe to run in CI. Exits non-zero (with a typed error
+    /// message) if the signature file is missing, malformed, bound to a
+    /// different `--manifest-url`, or fails Ed25519 verification. Used as a
+    /// post-release CI probe to catch the LOCAL-only signing step being
+    /// forgotten (see `tooling/release-manifest/README.md`'s "Signing"
+    /// section).
+    #[command(name = "__openasr-verify-backends-manifest", hide = true)]
+    VerifyBackendsManifest {
+        /// backends-manifest.json file to verify.
+        manifest: PathBuf,
+        /// backends-manifest.signature.json sidecar to verify.
+        #[arg(long)]
+        signature: PathBuf,
+        /// The canonical URL the signature must be bound to, e.g.
+        /// `https://dl.openasr.org/core/v0.1.20/backends-manifest.json`
+        /// (`openasr_core::backend_manifest::canonical_manifest_url`).
+        #[arg(long)]
+        manifest_url: String,
+    },
     /// Transcribe one or more audio files (or directories of audio).
     #[command(visible_alias = "t")]
     Transcribe {

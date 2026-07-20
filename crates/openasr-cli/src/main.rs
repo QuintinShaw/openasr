@@ -191,6 +191,11 @@ async fn run() -> Result<()> {
             &key_id,
             print_public_key,
         ),
+        Command::VerifyBackendsManifest {
+            manifest,
+            signature,
+            manifest_url,
+        } => verify_backends_manifest_command(&manifest, &signature, &manifest_url),
         Command::Transcribe {
             inputs,
             formats,
@@ -608,6 +613,48 @@ fn sign_backends_manifest_command(
         )
     })?;
     println!("Wrote backends-manifest signature: {}", out.display());
+    Ok(())
+}
+
+/// Read-only counterpart to `sign_backends_manifest_command`: verifies an
+/// already-signed `backends-manifest.json` + `.signature.json` pair against
+/// the production trust root. Needs no signing seed and touches no
+/// filesystem beyond reading the two inputs -- safe to run in CI as a
+/// post-release probe for the LOCAL-only signing step being forgotten.
+fn verify_backends_manifest_command(
+    manifest: &Path,
+    signature: &Path,
+    manifest_url: &str,
+) -> Result<()> {
+    let manifest_contents = fs::read_to_string(manifest).with_context(|| {
+        format!(
+            "Could not read backends-manifest JSON '{}'",
+            manifest.display()
+        )
+    })?;
+    let signature_contents = fs::read_to_string(signature).with_context(|| {
+        format!(
+            "Could not read backends-manifest signature '{}'",
+            signature.display()
+        )
+    })?;
+
+    let verified = openasr_core::verify_backends_manifest_signature(
+        &manifest_contents,
+        &signature_contents,
+        manifest_url,
+    )
+    .context("backends-manifest signature did not verify against the production trust root")?;
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "verified": true,
+            "manifest_url": manifest_url,
+            "manifest_sha256": verified.manifest_sha256,
+            "key_id": verified.key_id,
+        })
+    );
     Ok(())
 }
 
