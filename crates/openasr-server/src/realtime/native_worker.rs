@@ -959,10 +959,85 @@ pub(crate) fn warm_up_native_streaming_session_once(
 /// `WARMED_AT_GENERATION` gate in `warm_up_native_streaming_session_once`);
 /// every later attach on that thread reuses the now-warm state, until an
 /// `idle_unload` eviction bumps the generation and forces a re-warm.
+///
+/// After the streaming worker warms, this also runs
+/// [`warm_up_default_native_offline_path`] -- the same idea applied to the
+/// separate *offline* (file-transcription: `/v1/audio/transcriptions`,
+/// desktop file import, CLI file transcribe) execution dispatch, which had no
+/// boot warm-up of its own and so paid a full cold build on the first file
+/// transcription after every daemon start. Both warm-ups run in this one
+/// spawned task, offline strictly after streaming (not as a second
+/// concurrently-spawned task), so they do not both build/upload Metal
+/// pipelines for the same model pack at once and double the boot-time GPU
+/// queue pressure. For the families whose executor is a process-wide shared
+/// singleton across both dispatches (qwen / cohere / whisper / moonshine --
+/// see `models::executor_component_registry`), the offline warm-up here
+/// mostly reuses the prepared runtime the streaming warm-up above just built
+/// rather than loading the model weights a second time.
 pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime) {
     tokio::spawn(async move {
-        warm_up_default_native_streaming_worker(runtime).await;
+        warm_up_default_native_streaming_worker(runtime.clone()).await;
+        warm_up_default_native_offline_path(runtime).await;
     });
+}
+
+/// Silence length used to prime the offline dispatch at boot: long enough for
+/// every family's audio front end to run its normal feature-extraction /
+/// chunking path once, short enough that the warm-up itself adds negligible
+/// boot time. Not tied to any product silence-detection threshold.
+pub(crate) const BOOT_OFFLINE_WARMUP_SILENCE_MS: usize = 300;
+
+/// Warms the daemon's default bound native model pack for the *offline*
+/// (file-transcription) execution dispatch in the background -- the
+/// `native_transcribe.rs` counterpart of
+/// `warm_up_default_native_streaming_worker` above, for the separate
+/// `NATIVE_GGML_EXECUTION_DISPATCH` offline dispatch (distinct from the
+/// streaming dispatch this module warms: `unload_idle_native_offline_runtime_caches`
+/// / `unload_idle_native_streaming_runtime_caches` evict them independently).
+/// Runs one real (synthetic, silent) file transcription through the exact
+/// same `transcribe_with_runtime` path a real `/v1/audio/transcriptions`
+/// request takes, so it exercises real model resolution, executor dispatch,
+/// and (for a native-graph-lowering family) graph/Metal-pipeline build --
+/// not a hand-rolled shortcut that could drift from the real request path.
+/// Fire-and-forget: any failure here (bad pack, no adapter, temp-file I/O
+/// error, ...) is swallowed silently -- a real file-transcription request
+/// still fails closed with a proper error through the normal request path.
+pub(crate) async fn warm_up_default_native_offline_path(runtime: ServerRuntime) {
+    if runtime.backend != openasr_core::BackendKind::Native {
+        return;
+    }
+    if runtime.model_pack_path.is_none() {
+        // Fresh install / no model installed yet: nothing to warm. A bound
+        // pack arrives on a future restart, same as the streaming warm-up.
+        return;
+    }
+    let Ok(Ok(temp_wav)) = tokio::task::spawn_blocking(write_boot_offline_warmup_silence_wav).await
+    else {
+        return;
+    };
+    // `NATIVE_RUNTIME_MODEL_ID_AUTO` accepts whatever model pack is actually
+    // bound at `runtime.model_pack_path` without requiring this warm-up to
+    // know the real catalog id -- the same idiom the CLI's benchmark-suite
+    // path uses for an unattended run against the bound pack.
+    let request = openasr_core::TranscriptionRequest::new(
+        temp_wav.path(),
+        openasr_core::NATIVE_RUNTIME_MODEL_ID_AUTO,
+    );
+    let _ = crate::routes::transcription::transcribe_with_runtime(runtime, request, None).await;
+}
+
+/// Writes `BOOT_OFFLINE_WARMUP_SILENCE_MS` of 16kHz mono silence to a fresh
+/// temp WAV file, reusing the same PCM16/16kHz/mono writer the realtime
+/// backend-job path uses for its own temp utterance files.
+pub(crate) fn write_boot_offline_warmup_silence_wav() -> std::io::Result<tempfile::NamedTempFile> {
+    let mut file = tempfile::Builder::new()
+        .prefix("openasr-boot-offline-warmup-")
+        .suffix(".wav")
+        .tempfile()?;
+    let samples = vec![0i16; BOOT_OFFLINE_WARMUP_SILENCE_MS * 16];
+    write_pcm16_mono_16khz_wav(file.as_file_mut(), &samples)?;
+    file.as_file_mut().flush()?;
+    Ok(file)
 }
 
 async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {

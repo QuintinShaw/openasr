@@ -2108,6 +2108,121 @@ async fn boot_native_warmup_leaves_the_worker_thread_warm_for_the_next_real_atta
     real_session.finish("client_closed", true).await.unwrap();
 }
 
+#[test]
+fn boot_offline_warmup_silence_wav_is_valid_pcm16_silence_of_the_configured_length() {
+    // `write_boot_offline_warmup_silence_wav` is what primes the offline
+    // (file-transcription) dispatch at boot -- verify it actually writes a
+    // well-formed, silent, 16kHz mono PCM16 WAV of the configured length
+    // rather than relying on the real decode path to notice a malformed file.
+    let file = native_worker::write_boot_offline_warmup_silence_wav()
+        .expect("writing the boot offline warm-up silence WAV must succeed");
+    let bytes = fs::read(file.path()).expect("read back the written WAV");
+    assert_eq!(&bytes[0..4], b"RIFF");
+    assert_eq!(&bytes[8..12], b"WAVE");
+    let channels = u16::from_le_bytes([bytes[22], bytes[23]]);
+    let sample_rate = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+    let bits_per_sample = u16::from_le_bytes([bytes[34], bytes[35]]);
+    assert_eq!(channels, 1);
+    assert_eq!(sample_rate, 16_000);
+    assert_eq!(bits_per_sample, 16);
+    let data = &bytes[44..];
+    let expected_samples = native_worker::BOOT_OFFLINE_WARMUP_SILENCE_MS * 16;
+    assert_eq!(data.len(), expected_samples * 2);
+    assert!(
+        data.iter().all(|byte| *byte == 0),
+        "warm-up audio must be silence, not arbitrary/uninitialized samples"
+    );
+}
+
+#[tokio::test]
+async fn boot_native_offline_warmup_is_a_noop_without_a_bound_model_pack() {
+    // Mirrors the streaming boot warm-up's "fresh install, nothing bound yet"
+    // fallback: a daemon with no native model pack bound has nothing to warm
+    // on the offline dispatch either, and must return without attempting a
+    // decode (which would otherwise fail on the missing path).
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: None,
+    };
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        native_worker::warm_up_default_native_offline_path(runtime),
+    )
+    .await
+    .expect("no-bound-pack warm-up must return promptly, not hang");
+}
+
+#[tokio::test]
+async fn boot_native_offline_warmup_does_not_block_a_concurrent_task() {
+    // The offline counterpart of
+    // `boot_native_warmup_runs_in_background_without_blocking_a_concurrent_task`:
+    // spawning the offline warm-up must hand control back immediately, and a
+    // concurrent tokio task must not be starved while the warm-up's
+    // `spawn_blocking` WAV write and (fail-closed, since this model pack path
+    // does not exist on disk) decode attempt are in flight.
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(std::path::PathBuf::from(
+            "/nonexistent/boot-offline-warmup-test.oasr",
+        )),
+    };
+
+    let spawn_started = Instant::now();
+    let warmup_handle = tokio::spawn(native_worker::warm_up_default_native_offline_path(runtime));
+    assert!(
+        spawn_started.elapsed() < Duration::from_millis(100),
+        "spawning the offline boot warm-up must not itself block"
+    );
+
+    tokio::time::timeout(Duration::from_millis(200), async { 1 + 1 })
+        .await
+        .expect("a concurrent tokio task must not be starved by the offline warm-up");
+
+    tokio::time::timeout(Duration::from_secs(5), warmup_handle)
+        .await
+        .expect("offline warm-up must finish promptly against a missing model pack")
+        .expect("offline warm-up task must not panic");
+}
+
+#[tokio::test]
+async fn health_answers_immediately_while_boot_offline_warmup_runs() {
+    use tower::ServiceExt;
+
+    // The literal /health acceptance for the offline warm-up, mirroring
+    // `health_answers_immediately_while_boot_warmup_is_artificially_slow`:
+    // spawning `spawn_boot_native_warmup` (which now also runs the offline
+    // warm-up after the streaming one) must never gate a real /health
+    // request through the router.
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(std::path::PathBuf::from(
+            "/nonexistent/boot-offline-warmup-health-test.oasr",
+        )),
+    };
+    native_worker::spawn_boot_native_warmup(runtime.clone());
+
+    let app = crate::app_with_runtime(runtime);
+    let response = tokio::time::timeout(
+        Duration::from_millis(200),
+        app.oneshot(
+            axum::http::Request::builder()
+                .uri("/health")
+                .body(axum::body::Body::empty())
+                .expect("build health request"),
+        ),
+    )
+    .await
+    .expect("/health must answer while the boot warm-up sequence is still running")
+    .expect("/health request must succeed");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+}
+
 #[tokio::test]
 async fn native_streaming_warm_up_stays_once_across_reattach_without_an_idle_unload() {
     // Companion to the generation-bump regression test below: two separate

@@ -1382,9 +1382,16 @@ fn shared_native_ggml_execution_dispatch() -> &'static GgmlAsrExecutionDispatch 
 }
 
 /// Idle-unload for the offline (file-transcription) dispatch. Deliberately
-/// uses `get()`, not `get_or_init` -- a daemon that never served a file
-/// transcription has nothing resident here, and this must not be the thing
-/// that first builds the dispatch.
+/// uses `get()`, not `get_or_init` -- this must not be the thing that first
+/// builds the dispatch. In practice a daemon with a bound native model pack
+/// builds and warms this at boot (see
+/// `openasr_server::realtime::native_worker::spawn_boot_native_warmup`, which
+/// warms the streaming dispatch and then runs one synthetic silent file
+/// transcription through this offline dispatch), so it is usually already
+/// resident by the time this is reached; a fresh install with no model bound
+/// yet, or a build where the boot warm-up itself failed, still has nothing
+/// resident here, and this function must stay a safe no-op in that case
+/// rather than triggering a cold build of its own.
 pub(crate) fn unload_idle_native_offline_runtime_caches() {
     if let Some(dispatch) = NATIVE_GGML_EXECUTION_DISPATCH.get() {
         dispatch.unload_all();
