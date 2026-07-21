@@ -31,6 +31,7 @@ from _catalog import (
 )
 from _file_loaders import atomic_write_json, load_required_json, load_toml
 from _pathlib_helpers import repo_root
+from audit_form import AuditFormError, validate_family_audit_form
 from public_gate import DEFAULT_PUBLIC_NAMESPACE, PublicGateError, validate_public_model
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -317,6 +318,19 @@ def ensure_release_public_allowed(model: str, entry: dict, public: bool) -> None
         )
 
 
+def ensure_release_audit_form(model: str, entry: dict, public: bool, *, audit_dir: Path | None = None) -> None:
+    """`--public` entries require a completed release audit form for the
+    model's family (docs/model-audits/<family>.md; see audit_form.py for the
+    fail-closed checks and the pre-policy grandfather set).
+    """
+    if not public:
+        return
+    try:
+        validate_family_audit_form(entry.get("family"), audit_dir=audit_dir)
+    except AuditFormError as error:
+        raise SystemExit(f"{model}: release-audit gate failed: {error}") from None
+
+
 def load_catalog(path: Path) -> dict:
     if not path.exists():
         return {
@@ -385,6 +399,7 @@ def main(argv: list[str]) -> int:
     if args.model not in catalog_entries:
         raise SystemExit(f"unknown model '{args.model}'")
     ensure_release_public_allowed(args.model, catalog_entries[args.model], args.public)
+    ensure_release_audit_form(args.model, catalog_entries[args.model], args.public)
     model_entry = build_catalog_model(args.model, catalog_entries[args.model], args)
     if args.public:
         try:
