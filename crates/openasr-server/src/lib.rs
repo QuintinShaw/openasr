@@ -228,6 +228,18 @@ pub async fn serve_with_launch_options(
     // must keep working unmodified.
     let boot_started = Instant::now();
     let mut stage_started = boot_started;
+    // Device/backend metadata only (name, kind, memory, buffer alignment) --
+    // never model, audio, or file-path data -- so a Vulkan/Metal/CPU
+    // misdetection or misalignment (see issues #153/#154/#155) is visible
+    // from `daemon.log` alone, without relying on the reporter's own
+    // "backend used" field.
+    openasr_core::stage_timing::log_event(
+        "server_boot",
+        format_args!(
+            "stage=ggml_backend {}",
+            openasr_core::ggml_runtime_boot_summary(&openasr_core::ggml_runtime_info())
+        ),
+    );
     validate_listen_security(addr, &launch_options)?;
     openasr_core::stage_timing::log_stage(
         "server_boot",

@@ -136,9 +136,10 @@ pub use ggml_runtime::{
     GgmlRuntimeSourcePathError, GgufCParserSandboxError, GgufHostTensorPayload, GgufMetadata,
     GgufMetadataReadError, GgufMetadataValue, GgufTensorDataReadError, GgufTensorDataReader,
     GgufTensorIndex, GgufTensorIndexReadError, GgufTensorMetadata, OPENASR_RUNTIME_PACK_EXTENSION,
-    ggml_available_devices, ggml_hip_tuning_summary, ggml_native_build_enabled, ggml_runtime_info,
-    has_openasr_runtime_pack_extension, probe_ggml_package_model_identity, probe_ggml_package_path,
-    read_gguf_metadata, read_gguf_metadata_from_runtime_source, read_gguf_tensor_index,
+    ggml_available_devices, ggml_hip_tuning_summary, ggml_native_build_enabled,
+    ggml_runtime_boot_summary, ggml_runtime_info, has_openasr_runtime_pack_extension,
+    probe_ggml_package_model_identity, probe_ggml_package_path, read_gguf_metadata,
+    read_gguf_metadata_from_runtime_source, read_gguf_tensor_index,
     read_gguf_tensor_index_from_runtime_source, render_gguf_c_parser_sandbox_child_output,
     validate_ggml_runtime_source_path,
 };

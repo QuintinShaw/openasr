@@ -23,6 +23,16 @@ pub struct GgmlBackendDevice {
     pub description: String,
     pub kind: GgmlBackendKind,
     pub memory: Option<GgmlDeviceMemory>,
+    /// Buffer-type-reported allocation alignment in bytes for this device
+    /// (`ggml_backend_buft_get_alignment` on the device's default buffer
+    /// type). Backend-agnostic: this is the same generic ggml call for every
+    /// backend, it just happens to surface each backend's own notion of
+    /// alignment -- for Vulkan specifically it is
+    /// `VkPhysicalDeviceLimits::minStorageBufferOffsetAlignment`. Surfaced so
+    /// a misaligned-buffer crash report (see issues #153/#154/#155) can be
+    /// diagnosed from the boot log alone instead of asking the reporter to
+    /// re-run with a debug build.
+    pub buffer_alignment: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +147,7 @@ impl GgmlBackendDevice {
             description: description.to_string(),
             kind,
             memory,
+            buffer_alignment: None,
         }
     }
 }
@@ -361,6 +372,47 @@ pub fn ggml_runtime_info() -> GgmlRuntimeInfo {
     }
 }
 
+/// One-line, no-user-data summary of the detected ggml backend(s)/device(s)
+/// for daemon boot logs (see `server_boot` stage in
+/// `crates/openasr-server/src/lib.rs`). Only backend/device metadata -- name,
+/// kind, memory, buffer alignment -- never model, audio, or file-path data,
+/// matching the no-telemetry / local-log-only posture (written to stderr,
+/// never transmitted). Added after issues #153/#154/#155 (Vulkan crash
+/// reports) where the reporter's misfiled "backend used" field left the
+/// actually-selected backend and device unknown; this makes it recoverable
+/// from `daemon.log` alone.
+pub fn ggml_runtime_boot_summary(info: &GgmlRuntimeInfo) -> String {
+    let best = info.best_backend_name.as_deref().unwrap_or("unavailable");
+    let mut summary = format!("best_backend={best} cpu_backend={}", info.cpu_backend_name);
+    if info.devices.is_empty() {
+        summary.push_str(" devices=none");
+        return summary;
+    }
+    let devices = info
+        .devices
+        .iter()
+        .map(|device| {
+            let mem = device
+                .memory
+                .map(|memory| format!(" mem_total_mib={}", memory.total_bytes / (1024 * 1024)))
+                .unwrap_or_default();
+            let alignment = device
+                .buffer_alignment
+                .map(|alignment| format!(" alignment_bytes={alignment}"))
+                .unwrap_or_default();
+            format!(
+                "{{name={:?} kind={:?}{mem}{alignment}}}",
+                device.name, device.kind
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    summary.push_str(" devices=[");
+    summary.push_str(&devices);
+    summary.push(']');
+    summary
+}
+
 pub fn ggml_available_devices() -> Vec<GgmlBackendDevice> {
     ensure_backends_loaded();
     let count = unsafe { ffi::ggml_backend_dev_count() };
@@ -382,6 +434,14 @@ pub fn ggml_available_devices() -> Vec<GgmlBackendDevice> {
             free_bytes,
             total_bytes,
         });
+        // Generic across every backend (CPU/Metal/Vulkan/...): each backend's
+        // buffer type reports its own alignment through this one ggml call,
+        // so no backend-specific branching is needed here. On Vulkan this is
+        // `minStorageBufferOffsetAlignment`.
+        let buffer_alignment = unsafe {
+            let buft = ffi::ggml_backend_dev_buffer_type(raw.as_ptr());
+            (!buft.is_null()).then(|| ffi::ggml_backend_buft_get_alignment(buft))
+        };
 
         devices.push(GgmlBackendDevice {
             raw,
@@ -389,6 +449,7 @@ pub fn ggml_available_devices() -> Vec<GgmlBackendDevice> {
             description: unsafe { cstr_lossy(ffi::ggml_backend_dev_description(raw.as_ptr())) },
             kind,
             memory,
+            buffer_alignment,
         });
     }
 
@@ -512,6 +573,54 @@ mod tests {
     fn cpu_backend_initializes() {
         let backend = GgmlBackend::cpu().expect("cpu backend");
         assert!(!backend.name().is_empty());
+    }
+
+    #[test]
+    fn boot_summary_includes_device_name_kind_and_alignment_when_present() {
+        let info = GgmlRuntimeInfo {
+            cpu_backend_name: "CPU".to_string(),
+            best_backend_name: Some("Vulkan0".to_string()),
+            metal_backend_name: None,
+            devices: vec![GgmlBackendDevice {
+                raw: NonNull::dangling(),
+                name: "NVIDIA GeForce RTX 4070".to_string(),
+                description: "NVIDIA GeForce RTX 4070 (Vulkan)".to_string(),
+                kind: GgmlBackendKind::Gpu,
+                memory: Some(GgmlDeviceMemory {
+                    free_bytes: 8 * 1024 * 1024 * 1024,
+                    total_bytes: 12 * 1024 * 1024 * 1024,
+                }),
+                buffer_alignment: Some(16),
+            }],
+            cpu_features: GgmlCpuFeatures::default(),
+        };
+
+        let summary = ggml_runtime_boot_summary(&info);
+
+        assert!(summary.contains("best_backend=Vulkan0"));
+        assert!(summary.contains("cpu_backend=CPU"));
+        assert!(summary.contains("NVIDIA GeForce RTX 4070"));
+        assert!(summary.contains("kind=Gpu"));
+        assert!(summary.contains("mem_total_mib=12288"));
+        assert!(summary.contains("alignment_bytes=16"));
+    }
+
+    #[test]
+    fn boot_summary_reports_no_devices_without_panicking() {
+        let info = GgmlRuntimeInfo {
+            cpu_backend_name: "CPU".to_string(),
+            best_backend_name: None,
+            metal_backend_name: None,
+            devices: vec![],
+            cpu_features: GgmlCpuFeatures::default(),
+        };
+
+        let summary = ggml_runtime_boot_summary(&info);
+
+        assert_eq!(
+            summary,
+            "best_backend=unavailable cpu_backend=CPU devices=none"
+        );
     }
 
     #[test]
