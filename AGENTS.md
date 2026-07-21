@@ -102,6 +102,11 @@ cargo test -p openasr-core bundled_catalog_signature_verifies_committed_catalog_
 Keep claims tied to executed checks — do not assert performance/quality wins the
 harness has not produced.
 
+New model family releases REQUIRE a completed audit form at
+`docs/model-audits/<family>.md` (copy [docs/model-audits/TEMPLATE.md](docs/model-audits/TEMPLATE.md))
+before entering the release flow; `tooling/publish-model/scripts/_manifest.py
+--public` fails closed on a missing or half-filled form.
+
 ## Artifact & safety policy
 
 Never add or commit: model weights, runtime binaries, downloaded caches/temp
