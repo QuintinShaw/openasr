@@ -29,6 +29,15 @@ use super::tensor_names::{
     LLM_OUTPUT_NORM_WEIGHT, LLM_TOKEN_EMBD_WEIGHT, moss_llm_layer_tensor_names,
 };
 
+/// Host-path prefill segment width (see [`MossTdDecoderRuntime::prefill`]). A
+/// prompt longer than this is fed to the decoder in segments of this many
+/// tokens so the attention working set stays `chunk x total` instead of
+/// `total x total`. Chosen above every sub-40s clip's prompt length so short
+/// audio (jfk/en_zh and the 40s regression clip) keeps the byte-for-byte
+/// single-shot path, while a multi-minute prompt still splits into a handful of
+/// segments that fit a modest memory budget.
+const MOSS_TD_PREFILL_CHUNK_TOKENS: usize = 512;
+
 #[derive(Debug, Error)]
 pub(crate) enum MossTdDecoderError {
     #[error("moss-transcribe-diarize decoder tensor read failed: {reason}")]
@@ -184,28 +193,99 @@ impl MossTdDecoderRuntime {
     /// Run the entire ChatML+audio prompt as one causal prefill pass, seeding
     /// `layer_kv_caches` with every prompt token's K/V, and return the logits
     /// row for the token immediately following the prompt.
+    ///
+    /// A single-shot prefill graph materializes a `token_count x token_count`
+    /// attention working set, which for a multi-minute clip's few-thousand-token
+    /// prompt is the dominant memory spike (measured: it is what pushes a
+    /// 3-minute decode past a 6 GB budget, while the encoder itself peaks around
+    /// 3 GB). On the host path this splits the prompt into
+    /// `MOSS_TD_PREFILL_CHUNK_TOKENS`-token segments fed in KV order, so the
+    /// attention working set stays `chunk x total` instead of `total x total`.
+    /// Numerically identical to the single-shot pass -- causal attention over
+    /// the same KV history, just in segments (mirrors qwen3-asr's own
+    /// `ggml_executor` prefill-chunking). Prompts at or below the chunk size
+    /// (every sub-40s clip, including jfk/en_zh) take the single-shot path
+    /// unchanged, and the GPU path (`safe_host_cache_prefill_chunk_size_for`
+    /// returns `None`) is likewise left single-shot.
     pub(crate) fn prefill(
         &mut self,
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
     ) -> Result<Vec<f32>, MossTdDecoderError> {
         let token_count = prompt_embeddings.token_count;
-        let step = self
+        let host_chunked = self
             .whole_decoder
-            .run_prefill(
-                &prompt_embeddings.token_major_values,
-                token_count,
-                MOSS_TD_ROPE_THETA,
-            )
-            .map_err(|error| MossTdDecoderError::GraphFailed {
-                reason: error.to_string(),
-            })?;
-        let final_hidden = self.write_prefill_outputs(0, token_count, &step, layer_kv_caches)?;
+            .safe_host_cache_prefill_chunk_size_for(token_count)
+            .is_some();
+        let final_hidden = if host_chunked && token_count > MOSS_TD_PREFILL_CHUNK_TOKENS {
+            self.prefill_chunked(prompt_embeddings, layer_kv_caches)?
+        } else {
+            let step = self
+                .whole_decoder
+                .run_prefill(
+                    &prompt_embeddings.token_major_values,
+                    token_count,
+                    MOSS_TD_ROPE_THETA,
+                )
+                .map_err(|error| MossTdDecoderError::GraphFailed {
+                    reason: error.to_string(),
+                })?;
+            self.write_prefill_outputs(0, token_count, &step, layer_kv_caches)?
+        };
         self.logits_head
             .compute_logits_for_last_hidden(&final_hidden)
             .map_err(|error| MossTdDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             })
+    }
+
+    /// Segmented prefill (see [`Self::prefill`]): feed the prompt to the decoder
+    /// in `MOSS_TD_PREFILL_CHUNK_TOKENS`-token segments, each attending to the
+    /// KV history the prior segments wrote, and return the final segment's last
+    /// hidden state. Every segment's K/V is written into `layer_kv_caches`
+    /// before the next segment runs, exactly reproducing the single-shot pass's
+    /// KV order.
+    fn prefill_chunked(
+        &mut self,
+        prompt_embeddings: &Qwen3AsrPromptEmbeddings,
+        layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+    ) -> Result<Vec<f32>, MossTdDecoderError> {
+        let token_count = prompt_embeddings.token_count;
+        let hidden_size = self.metadata.d_model;
+        let mut position_offset = 0usize;
+        let mut final_hidden: Option<Vec<f32>> = None;
+        while position_offset < token_count {
+            let chunk_len = (token_count - position_offset).min(MOSS_TD_PREFILL_CHUNK_TOKENS);
+            let hidden_start = position_offset
+                .checked_mul(hidden_size)
+                .ok_or(MossTdDecoderError::EmptyPrefillOutput)?;
+            let hidden_end = position_offset
+                .checked_add(chunk_len)
+                .and_then(|end| end.checked_mul(hidden_size))
+                .ok_or(MossTdDecoderError::EmptyPrefillOutput)?;
+            let total_token_count = position_offset + chunk_len;
+            let chunk_values = prompt_embeddings
+                .token_major_values
+                .get(hidden_start..hidden_end)
+                .ok_or(MossTdDecoderError::EmptyPrefillOutput)?;
+            let step = self
+                .whole_decoder
+                .run_prefill_chunk(
+                    chunk_values,
+                    chunk_len,
+                    position_offset,
+                    total_token_count,
+                    layer_kv_caches,
+                    MOSS_TD_ROPE_THETA,
+                )
+                .map_err(|error| MossTdDecoderError::GraphFailed {
+                    reason: error.to_string(),
+                })?;
+            final_hidden =
+                Some(self.write_prefill_outputs(position_offset, chunk_len, &step, layer_kv_caches)?);
+            position_offset = total_token_count;
+        }
+        final_hidden.ok_or(MossTdDecoderError::EmptyPrefillOutput)
     }
 
     /// Run one incremental decode step for `token_id` at `cache_position`,
