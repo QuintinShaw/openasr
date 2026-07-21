@@ -455,3 +455,127 @@ impl GgmlAsrStreamingExecutor for MossTdGgmlExecutor {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    use crate::ggml_runtime::install_request_backend_override;
+    use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudio};
+    use crate::models::ggml_family_registry::moss_transcribe_diarize_runtime_descriptor_v1;
+
+    use super::*;
+
+    /// Real converted dev pack (fp16), NOT committed -- same dev-only-artifact
+    /// convention as `decode_prompt`'s own `dev_pack_path` and mimo-asr's
+    /// `mimo-v2.5-asr-q8_0.oasr`.
+    fn dev_pack_path() -> PathBuf {
+        PathBuf::from(
+            "/Volumes/QuintinDocument/openasr-dev/tmp/moss-td/moss-transcribe-diarize-fp16.oasr",
+        )
+    }
+
+    fn dev_sample_path(name: &str) -> PathBuf {
+        PathBuf::from("/Volumes/QuintinDocument/openasr-dev/tmp/moss-td/samples").join(name)
+    }
+
+    // Pinned to the real dev-pack CPU decode (fp16, backend forced to CPU
+    // below). Confirmed byte-for-byte equal to the HF fp32 reference stack's
+    // golden (`tmp/moss-td/golden/{jfk,en_zh_mixed}.json`'s `text`) -- the
+    // fp16-vs-fp32 numeric gap did not perturb the text OR the emitted time
+    // anchors for these clips (both matched to the hundredth of a second).
+    const GOLDEN_JFK_TEXT: &str = concat!(
+        "[0.28][S01] And so, my fellow Americans,[2.32][3.22][S01] ask not what your ",
+        "country can do for you,[7.71][8.12][S01] ask what you can do for your country.[10.59]",
+    );
+
+    // Code-switch coverage: `en_zh_mixed.wav` mixes English then Mandarin in a
+    // single utterance, exercising both tokenizer/decode paths plus a second
+    // speaker label (`[S02]`) in one prefill+decode. Byte-for-byte equal to the
+    // HF golden `en_zh_mixed.json`'s `text`.
+    const GOLDEN_EN_ZH_MIXED_TEXT: &str = concat!(
+        "[0.27][S01]And so, my fellow Americans,[2.34][3.21][S01]ask not.",
+        "[4.44][4.94][S02]今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去伊加新[12.88]",
+    );
+
+    fn transcribe_with_dev_pack(wav_path: PathBuf) -> Option<(String, std::time::Duration, f32)> {
+        let pack_path = dev_pack_path();
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return None;
+        }
+        if !wav_path.exists() {
+            eprintln!("skipping: {} not present", wav_path.display());
+            return None;
+        }
+        // Force CPU. This family's Metal path has two open defects (encoder
+        // numeric divergence -> empty-shell output, and a per-step wired-memory
+        // blow-up -- see the `arch` descriptor's `auto_gpu_policy` note), so the
+        // reference decode is CPU-only. `backend_preference` alone is inert on a
+        // direct `execute()` (it is only consulted via the thread-local override
+        // -- see `GgmlAsrExecutionRequest::backend_preference`'s doc), so install
+        // the override explicitly rather than relying on the ambient backend.
+        let backend_preference = GgmlAsrBackendPreference::CpuOnly;
+        // Hold the RAII guard for the whole decode: it restores the previous
+        // thread-local override on drop at the end of this function, after
+        // `execute()` below has run entirely on CPU.
+        let _backend_override_guard =
+            install_request_backend_override(backend_preference.request_backend_override());
+
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            wav_path,
+            "moss-td e2e test",
+            "moss-td e2e test",
+        )
+        .expect("load wav fixture");
+        let audio_duration_seconds = samples.len() as f32 / 16_000.0;
+
+        let request = GgmlAsrExecutionRequest {
+            runtime_source_path: pack_path,
+            runtime_source_preflight: None,
+            selected_family: moss_transcribe_diarize_runtime_descriptor_v1(),
+            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            request_options: Default::default(),
+            backend_preference,
+        };
+
+        let executor = MossTdGgmlExecutor;
+        let started_at = Instant::now();
+        let result = executor.execute(&request).expect("moss-td transcribe");
+        let elapsed = started_at.elapsed();
+        Some((result.transcription.text, elapsed, audio_duration_seconds))
+    }
+
+    #[test]
+    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
+                and tmp/moss-td/samples/*.wav; CPU-only (Metal path has known defects)"]
+    fn golden_diff_end_to_end_transcribe_jfk_wav() {
+        let Some((text, elapsed, audio_duration_seconds)) =
+            transcribe_with_dev_pack(dev_sample_path("jfk.wav"))
+        else {
+            return;
+        };
+        eprintln!(
+            "moss-td e2e [jfk.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
+            elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
+        );
+        assert_eq!(text, GOLDEN_JFK_TEXT);
+    }
+
+    #[test]
+    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
+                and tmp/moss-td/samples/*.wav; CPU-only (Metal path has known defects)"]
+    fn golden_diff_end_to_end_transcribe_en_zh_mixed_wav() {
+        let Some((text, elapsed, audio_duration_seconds)) =
+            transcribe_with_dev_pack(dev_sample_path("en_zh_mixed.wav"))
+        else {
+            return;
+        };
+        eprintln!(
+            "moss-td e2e [en_zh_mixed.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
+            elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
+        );
+        assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);
+    }
+}
