@@ -19,7 +19,7 @@ pub(crate) use backend::ensure_backends_loaded;
 pub use backend::{
     GgmlBackend, GgmlBackendDevice, GgmlBackendKind, GgmlCpuFeatures, GgmlDeviceMemory,
     GgmlRuntimeError, GgmlRuntimeInfo, ggml_available_devices, ggml_hip_tuning_summary,
-    ggml_native_build_enabled, ggml_runtime_info,
+    ggml_native_build_enabled, ggml_runtime_boot_summary, ggml_runtime_info,
 };
 pub use cpu_graph::{
     AutoGpuPolicy, GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError,

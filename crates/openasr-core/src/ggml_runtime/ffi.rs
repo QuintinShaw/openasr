@@ -184,6 +184,10 @@ unsafe extern "C" {
         device: GgmlBackendDevRaw,
         props: *mut GgmlBackendDevProps,
     );
+    pub(crate) fn ggml_backend_dev_buffer_type(
+        device: GgmlBackendDevRaw,
+    ) -> GgmlBackendBufferTypeRaw;
+    pub(crate) fn ggml_backend_buft_get_alignment(buft: GgmlBackendBufferTypeRaw) -> usize;
     pub(crate) fn ggml_backend_dev_init(
         device: GgmlBackendDevRaw,
         params: *const c_char,

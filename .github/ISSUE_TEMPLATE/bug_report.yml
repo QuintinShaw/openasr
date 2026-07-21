@@ -29,6 +29,20 @@ body:
       placeholder: "rustc 1.86.0"
     validations:
       required: false
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU model and graphics driver version
+      description: |
+        Required for any crash, hang, or backend/Vulkan/Metal issue. If your report is
+        unrelated to GPU/backend behavior (e.g. a docs typo), type "N/A".
+        Windows: Settings -> System -> Display -> Advanced display, or Device Manager ->
+        Display adapters -> right-click your GPU -> Properties -> Driver tab.
+        macOS: Apple menu -> About This Mac -> More Info -> System Report -> Graphics/Displays.
+        Linux: `vulkaninfo --summary` or `glxinfo -B`.
+      placeholder: "NVIDIA GeForce RTX 4070, driver 566.14 (Vulkan)"
+    validations:
+      required: true
   - type: textarea
     id: command
     attributes:
@@ -71,10 +85,15 @@ body:
     id: backend
     attributes:
       label: Backend used
+      description: >-
+        OpenASR's default is native (real ggml transcription). Only pick "mock" if
+        you explicitly passed --backend mock (a deterministic stub used for CI/plumbing,
+        never real audio). If you did not pass --backend yourself, pick the first option.
       options:
-        - mock
-        - native
-        - not sure
+        - "Not sure / did not pass --backend (this is native, the default)"
+        - "native (default, real transcription)"
+        - "mock (explicit --backend mock flag only)"
+      default: 0
     validations:
       required: true
   - type: textarea
