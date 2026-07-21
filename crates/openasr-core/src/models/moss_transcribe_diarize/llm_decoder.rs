@@ -191,28 +191,55 @@ impl MossTdDecoderRuntime {
     }
 
     /// Run the entire ChatML+audio prompt as one causal prefill pass, seeding
-    /// `layer_kv_caches` with every prompt token's K/V, and return the logits
-    /// row for the token immediately following the prompt.
+    /// the decoder's KV history with every prompt token's K/V, and return the
+    /// logits row for the token immediately following the prompt.
     ///
-    /// A single-shot prefill graph materializes a `token_count x token_count`
-    /// attention working set, which for a multi-minute clip's few-thousand-token
-    /// prompt is the dominant memory spike (measured: it is what pushes a
-    /// 3-minute decode past a 6 GB budget, while the encoder itself peaks around
-    /// 3 GB). On the host path this splits the prompt into
-    /// `MOSS_TD_PREFILL_CHUNK_TOKENS`-token segments fed in KV order, so the
-    /// attention working set stays `chunk x total` instead of `total x total`.
-    /// Numerically identical to the single-shot pass -- causal attention over
-    /// the same KV history, just in segments (mirrors qwen3-asr's own
-    /// `ggml_executor` prefill-chunking). Prompts at or below the chunk size
-    /// (every sub-40s clip, including jfk/en_zh) take the single-shot path
-    /// unchanged, and the GPU path (`safe_host_cache_prefill_chunk_size_for`
-    /// returns `None`) is likewise left single-shot.
+    /// Three paths, all numerically equivalent (causal attention over the same
+    /// KV order):
+    /// - Metal/single-GPU reuse: `run_prefill_auto_last_hidden` seeds the
+    ///   persistent decode graph's resident-KV arena in one batched compute so
+    ///   `decode_step`'s reused graph can attend over the prompt (see the branch
+    ///   below).
+    /// - Host path, long prompt: split into `MOSS_TD_PREFILL_CHUNK_TOKENS`-token
+    ///   segments fed in KV order, so the single-shot graph's
+    ///   `token_count x token_count` attention working set stays `chunk x total`
+    ///   -- a secondary memory lever for multi-minute clips (mirrors qwen3-asr's
+    ///   own `ggml_executor` prefill-chunking).
+    /// - Host path, short prompt (every sub-40s clip, incl. jfk/en_zh): a single
+    ///   bulk `run_prefill`.
     pub(crate) fn prefill(
         &mut self,
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
     ) -> Result<Vec<f32>, MossTdDecoderError> {
         let token_count = prompt_embeddings.token_count;
+        // On a backend with persistent decode-graph reuse (Metal/single-GPU),
+        // seed the resident-KV arena in one batched compute instead of the bulk
+        // host-cache `run_prefill` below. `decode_step` reuses that same
+        // persistent graph and can only see a prompt token's K/V if the prompt
+        // flowed through it too (see `run_prefill_auto_last_hidden`'s doc), so
+        // mixing bulk prefill with reuse decode would attend over an empty KV
+        // history for the whole prompt span. Returns `None` on the host/CPU
+        // path, which falls through to the chunked/single-shot prefill.
+        if let Some(final_hidden) = self
+            .whole_decoder
+            .run_prefill_auto_last_hidden(
+                &prompt_embeddings.token_major_values,
+                token_count,
+                layer_kv_caches,
+                MOSS_TD_ROPE_THETA,
+            )
+            .map_err(|error| MossTdDecoderError::GraphFailed {
+                reason: error.to_string(),
+            })?
+        {
+            return self
+                .logits_head
+                .compute_logits_for_last_hidden(&final_hidden)
+                .map_err(|error| MossTdDecoderError::LogitsHeadFailed {
+                    reason: error.to_string(),
+                });
+        }
         let host_chunked = self
             .whole_decoder
             .safe_host_cache_prefill_chunk_size_for(token_count)
@@ -302,9 +329,16 @@ impl MossTdDecoderRuntime {
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
     ) -> Result<Vec<f32>, MossTdDecoderError> {
         let hidden = self.gather_token_embedding(token_id)?;
+        // `run_step_auto` transparently reuses the persistent decode graph on
+        // the Metal/single-GPU lane (avoiding the per-token graph rebuild whose
+        // growing-KV re-upload exhausts the Metal command buffer on long
+        // decodes); CPU stays on the per-token `run_step` rebuild, byte-
+        // identical to before. The host KV write below keeps the host cache in
+        // sync for the CPU path and is a harmless no-op-equivalent on the
+        // reuse path (whose KV lives resident in the decode graph's arena).
         let step = self
             .whole_decoder
-            .run_step(&hidden, cache_position, layer_kv_caches, MOSS_TD_ROPE_THETA)
+            .run_step_auto(&hidden, cache_position, layer_kv_caches, MOSS_TD_ROPE_THETA)
             .map_err(|error| MossTdDecoderError::GraphFailed {
                 reason: error.to_string(),
             })?;
