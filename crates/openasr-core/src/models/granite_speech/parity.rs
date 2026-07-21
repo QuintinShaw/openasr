@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ggml_runtime::GgmlCpuGraphBackend;
 
+use super::decoder_graph::{GraniteSpeechDecoderConfig, prefill_logits};
 use super::encoder_graph::{GraniteSpeechEncoderConfig, encode};
 use super::qformer::{GraniteSpeechProjectorConfig, project};
 
@@ -259,5 +260,127 @@ fn granite_speech_projector_parity() {
     assert!(
         m < 1.0e-2,
         "projector_out max abs diff {m:.3e} exceeds the 1e-2 parity bound"
+    );
+}
+
+/// Little-endian `<i8` (int64) npy reader, for `decoder_input_ids.npy`.
+fn load_npy_i64(path: &Path) -> (Vec<usize>, Vec<i64>) {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    assert_eq!(&bytes[..6], b"\x93NUMPY", "npy magic");
+    let major = bytes[6];
+    let header_len = if major == 1 {
+        u16::from_le_bytes(bytes[8..10].try_into().unwrap()) as usize
+    } else {
+        u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize
+    };
+    let header_start = if major == 1 { 10 } else { 12 };
+    let header = std::str::from_utf8(&bytes[header_start..header_start + header_len])
+        .expect("npy header utf8");
+    assert!(header.contains("'<i8'"), "expected <i8 npy, got {header}");
+    assert!(
+        header.contains("'fortran_order': False"),
+        "expected C order"
+    );
+
+    let shape_start = header.find("'shape':").expect("shape key");
+    let paren = header[shape_start..].find('(').unwrap() + shape_start;
+    let close = header[paren..].find(')').unwrap() + paren;
+    let shape: Vec<usize> = header[paren + 1..close]
+        .split(',')
+        .filter_map(|s| s.trim().parse::<usize>().ok())
+        .collect();
+
+    let data_start = header_start + header_len;
+    let values: Vec<i64> = bytes[data_start..]
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    (shape, values)
+}
+
+fn top_k_indices(values: &[f32], k: usize) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..values.len()).collect();
+    idx.sort_by(|&a, &b| values[b].partial_cmp(&values[a]).unwrap());
+    idx.truncate(k);
+    idx
+}
+
+#[test]
+#[ignore = "requires local 4.6GB granite-speech-4.1-2b weights + golden fixtures under tmp/ (not committed)"]
+fn granite_speech_decoder_prefill_parity() {
+    let weights_dir = weights_root();
+    if !weights_dir.join("model.safetensors.index.json").exists() {
+        eprintln!("skip: {weights_dir:?} not present");
+        return;
+    }
+    let golden = golden_root();
+
+    let weights = load_safetensors_prefixed(&weights_dir, "language_model.");
+    let (ids_shape, ids_i64) = load_npy_i64(&golden.join("decoder_input_ids.npy"));
+    assert_eq!(ids_shape.len(), 2, "expected (1,T), got {ids_shape:?}");
+    let n_tokens = ids_shape[1];
+    let token_ids: Vec<u32> = ids_i64.iter().map(|&id| id as u32).collect();
+
+    let config = GraniteSpeechDecoderConfig::granite_speech_4_1_2b();
+    let output = prefill_logits(&config, &weights, &token_ids, GgmlCpuGraphBackend::Cpu)
+        .expect("prefill_logits");
+
+    println!("== Granite Speech decoder prefill parity ==");
+    println!(
+        "n_tokens {n_tokens} -> logits [n_tokens, {}]",
+        output.vocab_size
+    );
+
+    let (hidden_shape, golden_hidden) = load_npy_f32(&golden.join("decoder_hidden_out.npy"));
+    assert_eq!(
+        hidden_shape,
+        vec![1, n_tokens, config.hidden_size],
+        "golden hidden shape"
+    );
+    let (m_hidden, mean_hidden) = diff(&output.hidden_out, &golden_hidden);
+    let rel_hidden = relative_max_diff(&output.hidden_out, &golden_hidden);
+    println!("hidden_out: max {m_hidden:.3e}  mean {mean_hidden:.3e}  rel {rel_hidden:.3e}");
+
+    let (logits_shape, golden_logits) = load_npy_f32(&golden.join("decoder_logits.npy"));
+    assert_eq!(
+        logits_shape,
+        vec![1, n_tokens, config.vocab_size],
+        "golden logits shape"
+    );
+    let (m_logits, mean_logits) = diff(&output.logits, &golden_logits);
+    let rel_logits = relative_max_diff(&output.logits, &golden_logits);
+    println!("logits:     max {m_logits:.3e}  mean {mean_logits:.3e}  rel {rel_logits:.3e}");
+
+    // Last-position top-10 by argmax-set agreement (order-sensitive logit
+    // differences at the ~1e-3 scale can swap near-tied ranks without
+    // reflecting a real divergence; the set match is the honest gate here).
+    let last_start = (n_tokens - 1) * config.vocab_size;
+    let actual_last = &output.logits[last_start..last_start + config.vocab_size];
+    let golden_last = &golden_logits[last_start..last_start + config.vocab_size];
+    let actual_top10 = top_k_indices(actual_last, 10);
+    let golden_top10 = top_k_indices(golden_last, 10);
+    println!("last-position actual top10: {actual_top10:?}");
+    println!("last-position golden top10: {golden_top10:?}");
+    assert_eq!(
+        actual_top10[0], golden_top10[0],
+        "argmax token mismatch: actual {} vs golden {}",
+        actual_top10[0], golden_top10[0]
+    );
+    let overlap = actual_top10
+        .iter()
+        .filter(|id| golden_top10.contains(id))
+        .count();
+    assert!(
+        overlap >= 9,
+        "top10 overlap only {overlap}/10 (actual {actual_top10:?} vs golden {golden_top10:?})"
+    );
+
+    assert!(
+        m_hidden < 1.0e-2,
+        "hidden_out max abs diff {m_hidden:.3e} exceeds the 1e-2 parity bound"
+    );
+    assert!(
+        m_logits < 5.0e-2,
+        "logits max abs diff {m_logits:.3e} exceeds the 5e-2 parity bound"
     );
 }

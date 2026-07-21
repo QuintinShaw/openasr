@@ -18,6 +18,7 @@
 //! registration, and end-to-end golden are a separate follow-up pass -- see
 //! `docs` note in `encoder_graph.rs` on the long-audio context-window bound.
 
+pub(crate) mod decoder_graph;
 pub(crate) mod encoder_graph;
 pub mod package_import;
 pub(crate) mod qformer;
