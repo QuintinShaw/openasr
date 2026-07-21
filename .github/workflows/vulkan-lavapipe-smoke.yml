@@ -1,23 +1,22 @@
 name: Vulkan lavapipe smoke
 
-# Throwaway smoke CI for the fix/vulkan-misalign investigation (issues
-# #153/#154/#155): builds openasr-core with --features vulkan and runs one
-# ignored, synthetic (weight-free) unit test on Mesa's lavapipe software
-# Vulkan ICD, to get an objective red-before/green-after signal for the
-# ggml_vk_tensor_subbuffer misalignment abort without needing real Vulkan
-# hardware.
+# Standing Vulkan regression smoke (origin: issues #153/#154/#155): builds
+# openasr-core with --features vulkan and runs ignored, synthetic
+# (weight-free) unit tests on Mesa's lavapipe software Vulkan ICD, catching
+# ggml_vk_tensor_subbuffer misalignment aborts (and future Vulkan-path
+# regressions of the same class) without real Vulkan hardware.
 #
-# Deliberately NOT wired to any push/pull_request trigger on other branches
-# (this workflow only exists on test/vulkan-lavapipe). When the underlying
-# fix lands on main, prefer workflow_dispatch + a nightly cron over
-# re-running this on every push -- the lavapipe/Vulkan SDK install and full
-# ggml-vulkan build add several minutes per run that a Vulkan-specific
-# regression does not need on the common path.
+# Deliberately NOT wired to push/pull_request: the lavapipe/Vulkan SDK
+# install and full ggml-vulkan build add several minutes per run that a
+# Vulkan-specific regression does not need on the common path. Nightly cron
+# plus manual dispatch keeps the signal without taxing every PR. Honest
+# coverage note: lavapipe's minStorageBufferOffsetAlignment is 16 bytes;
+# 64-byte-only misalignment shapes (Intel hardware) can still slip past --
+# real-hardware validation stays part of the release process.
 on:
   workflow_dispatch: {}
-  push:
-    branches:
-      - test/vulkan-lavapipe
+  schedule:
+    - cron: "17 19 * * *"  # nightly, 19:17 UTC (03:17 Beijing)
 
 permissions:
   contents: read
