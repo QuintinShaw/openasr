@@ -28,6 +28,7 @@
 //!     the layer stack (applied by the caller, not this module);
 //!   - `logits_scaling` (`8.0`) *divides* the final `lm_head` logits (also the
 //!     caller's job, see `prefill_logits`).
+//!
 //! Granite also has no QK-norm (`nn::decoder`'s `q_norm_weight`/
 //! `k_norm_weight` would both be `None` here, same as Qwen2's shape) and no
 //! attention/MLP biases. Extending the shared `LlmLayerConfig`/`LlmLayerWeights`
