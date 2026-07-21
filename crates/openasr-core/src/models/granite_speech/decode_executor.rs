@@ -33,7 +33,8 @@ use crate::models::seq2seq_greedy_decode::{
 };
 
 use super::decoder_graph::{
-    GraniteSpeechDecoderConfig, GraniteSpeechDecoderWeightProvider, prefill_logits,
+    GraniteSpeechDecoderConfig, GraniteSpeechDecoderWeightProvider, embed_token_row,
+    prefill_logits, prefill_logits_from_embeddings,
 };
 
 pub(crate) struct GraniteSpeechDecodeStepExecutor<'p> {
@@ -70,6 +71,81 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechDecodeStepExecutor<'_> {
             .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                 reason: format!("granite-speech decoder step {}: {error}", input.step_index),
             })?;
+
+        let vocab_size = output.vocab_size;
+        let last_start = (output.n_tokens - 1) * vocab_size;
+        let logits = output.logits[last_start..last_start + vocab_size].to_vec();
+
+        Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+            logits,
+            greedy_token_hint: None,
+        })
+    }
+}
+
+/// Same recompute-per-step approach as [`GraniteSpeechDecodeStepExecutor`],
+/// but for a prompt containing a spliced-in audio embedding sequence (see
+/// `prompt::build_audio_prompt_embeddings`): the fixed prompt prefix's
+/// embeddings (audio + text) are precomputed once at construction; each step
+/// re-embeds only the newly generated (always plain-text) tokens and
+/// concatenates them onto the stored prefix before calling
+/// `prefill_logits_from_embeddings`. `input.initial_prompt_tokens` must be
+/// the exact token-id sequence `initial_prompt_embeddings` was built from
+/// (used for its length, and so the shared driver's phrase-bias/stop-token
+/// bookkeeping still sees real token ids) -- this executor never re-derives
+/// embeddings from it.
+pub(crate) struct GraniteSpeechAudioDecodeStepExecutor<'p> {
+    config: GraniteSpeechDecoderConfig,
+    provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+    backend: GgmlCpuGraphBackend,
+    initial_prompt_embeddings: Vec<f32>,
+}
+
+impl<'p> GraniteSpeechAudioDecodeStepExecutor<'p> {
+    pub(crate) fn new(
+        config: GraniteSpeechDecoderConfig,
+        provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+        backend: GgmlCpuGraphBackend,
+        initial_prompt_embeddings: Vec<f32>,
+    ) -> Self {
+        Self {
+            config,
+            provider,
+            backend,
+            initial_prompt_embeddings,
+        }
+    }
+}
+
+impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechAudioDecodeStepExecutor<'_> {
+    fn decode_step_logits(
+        &mut self,
+        input: Seq2SeqGreedyDecodeStepInput<'_>,
+    ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError> {
+        let map_err = |error: super::decoder_graph::GraniteSpeechDecoderError| {
+            Seq2SeqGreedyDecodeError::DecoderStepFailed {
+                reason: format!(
+                    "granite-speech audio decoder step {}: {error}",
+                    input.step_index
+                ),
+            }
+        };
+
+        let n_tokens = input.initial_prompt_tokens.len() + input.generated_tokens.len();
+        let mut embeddings = self.initial_prompt_embeddings.clone();
+        for &token_id in input.generated_tokens {
+            let row = embed_token_row(&self.config, self.provider, token_id).map_err(map_err)?;
+            embeddings.extend_from_slice(row);
+        }
+
+        let output = prefill_logits_from_embeddings(
+            &self.config,
+            self.provider,
+            &embeddings,
+            n_tokens,
+            self.backend,
+        )
+        .map_err(map_err)?;
 
         let vocab_size = output.vocab_size;
         let last_start = (output.n_tokens - 1) * vocab_size;
@@ -229,6 +305,149 @@ mod tests {
         assert_eq!(
             result.generated_tokens, golden_u32,
             "greedy-decoded token sequence must match the HF reference exactly"
+        );
+    }
+
+    /// Full audio-to-text pipeline: frontend -> encoder -> Q-Former projector
+    /// -> audio-splice prompt assembly -> greedy decode through the shared
+    /// driver -> BPE text decode. Compares the final transcribed text against
+    /// the official llama.cpp reference (see the granite-speech integration
+    /// notes: en_short.wav -> "the quick brown fox jumps over the lazy dog
+    /// near the old bridge"). `#[ignore]`: needs the local 4.6GB checkpoint.
+    #[test]
+    #[ignore = "requires local 4.6GB granite-speech-4.1-2b weights under tmp/ (not committed)"]
+    fn granite_speech_end_to_end_transcribes_en_short() {
+        let source_root = PathBuf::from(SOURCE_ROOT);
+        if !source_root.join("model.safetensors.index.json").exists() {
+            eprintln!("skip: {SOURCE_ROOT} not present");
+            return;
+        }
+
+        let wav_path = PathBuf::from(
+            "/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/samples/en_short.wav",
+        );
+        let wav_bytes = std::fs::read(&wav_path).expect("read en_short.wav");
+        // Minimal PCM16LE mono WAV reader (same convention as parity.rs's).
+        let mut cursor = 12usize;
+        let mut data_offset = None;
+        let mut data_len = 0usize;
+        while cursor + 8 <= wav_bytes.len() {
+            let chunk_id = &wav_bytes[cursor..cursor + 4];
+            let chunk_len =
+                u32::from_le_bytes(wav_bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+            if chunk_id == b"data" {
+                data_offset = Some(cursor + 8);
+                data_len = chunk_len;
+                break;
+            }
+            cursor += 8 + chunk_len + (chunk_len % 2);
+        }
+        let data_offset = data_offset.expect("wav data chunk");
+        let samples: Vec<f32> = wav_bytes[data_offset..data_offset + data_len]
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as f32 / 32768.0)
+            .collect();
+
+        let frontend = super::super::frontend::GraniteSpeechMelFrontend::new();
+        let (features, frames) = frontend.extract(&samples).expect("frontend");
+
+        let encoder_weights = load_safetensors_prefixed(&source_root, "encoder.");
+        let encoder_config =
+            super::super::encoder_graph::GraniteSpeechEncoderConfig::granite_speech_4_1_2b();
+        let encoder_output = super::super::encoder_graph::encode(
+            &encoder_config,
+            &encoder_weights,
+            &features,
+            frames,
+            GgmlCpuGraphBackend::Cpu,
+            false,
+        )
+        .expect("encode");
+
+        let projector_weights = load_safetensors_prefixed(&source_root, "projector.");
+        let projector_config =
+            super::super::qformer::GraniteSpeechProjectorConfig::granite_speech_4_1_2b();
+        let projector_output = super::super::qformer::project(
+            &projector_config,
+            &projector_weights,
+            &encoder_output.encoder_out,
+            encoder_output.frames,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("project");
+
+        let decoder_weights = load_safetensors_prefixed(&source_root, "language_model.");
+        let decoder_config = GraniteSpeechDecoderConfig::granite_speech_4_1_2b();
+
+        let tokenizer =
+            super::super::tokenizer::GraniteSpeechTokenizer::from_source_files(&source_root)
+                .expect("tokenizer");
+
+        let prompt_text = format!(
+            "USER: {}can you transcribe the speech into a written format?\n ASSISTANT:",
+            super::super::prompt::GRANITE_SPEECH_AUDIO_TOKEN
+        );
+        let (prompt_token_ids, prompt_embeddings) =
+            super::super::prompt::build_audio_prompt_embeddings(
+                &decoder_config,
+                &decoder_weights,
+                &tokenizer,
+                &prompt_text,
+                &projector_output.projected,
+                projector_output.tokens,
+            )
+            .expect("build prompt");
+
+        let eot_token_id = 100_257u32;
+        let decode_config = Seq2SeqGreedyDecodeConfig {
+            initial_prompt_tokens: prompt_token_ids,
+            eot_token_id,
+            stop_token_ids: vec![],
+            vocab_size: decoder_config.vocab_size,
+            max_generated_tokens: 40,
+            suppress_first_step_token_ids: vec![],
+            suppress_token_ids: vec![],
+            phrase_biases: vec![],
+        };
+
+        let mut executor = GraniteSpeechAudioDecodeStepExecutor::new(
+            decoder_config,
+            &decoder_weights,
+            GgmlCpuGraphBackend::Cpu,
+            prompt_embeddings,
+        );
+
+        let decode_text_token_ids =
+            |token_ids: &[u32]| -> Result<String, Seq2SeqGreedyDecodeError> {
+                tokenizer.decode_text_token_ids(token_ids).map_err(|error| {
+                    Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
+                        reason: error.to_string(),
+                    }
+                })
+            };
+
+        let result = run_seq2seq_greedy_decode_loop_with_adapter_v0(
+            &decode_config,
+            &mut executor,
+            &decode_text_token_ids,
+            |error| error,
+            |error| error,
+            &|text| text,
+            &mut |_step, _token, _eot| {},
+            &mut |_step, _logits| {},
+        )
+        .expect("greedy decode");
+
+        println!("== Granite Speech end-to-end (en_short.wav) ==");
+        println!("transcribed text: {:?}", result.text);
+        println!(
+            "expected (llama.cpp Q8 reference): \"the quick brown fox jumps over the lazy dog near the old bridge\""
+        );
+
+        assert_eq!(
+            result.text.trim(),
+            "the quick brown fox jumps over the lazy dog near the old bridge",
+            "end-to-end transcription must match the llama.cpp Q8 reference text"
         );
     }
 }

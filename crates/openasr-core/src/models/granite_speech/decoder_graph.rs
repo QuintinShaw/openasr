@@ -142,7 +142,6 @@ struct DecoderLayerWeights<'a> {
 }
 
 struct DecoderWeights<'a> {
-    embed_tokens: GgmlCpuTensor<'a>,
     layers: Vec<DecoderLayerWeights<'a>>,
     final_norm_w: GgmlCpuTensor<'a>,
     lm_head_w: GgmlCpuTensor<'a>,
@@ -366,28 +365,90 @@ pub(crate) struct GraniteSpeechDecoderPrefillOutput {
     pub logits: Vec<f32>,
 }
 
+/// Look up one row of `language_model.model.embed_tokens.weight` (the raw,
+/// un-scaled embedding table -- `embedding_multiplier` is applied once, to
+/// the whole assembled sequence, by `prefill_logits_from_embeddings`, not
+/// here). Exposed so `prompt.rs` can build the audio-spliced embedding
+/// sequence (`get_merged_audio_embeddings`'s text-token half) on the host,
+/// the same table `prefill_logits` itself gathers from.
+pub(crate) fn embed_token_row<'p>(
+    config: &GraniteSpeechDecoderConfig,
+    provider: &'p dyn GraniteSpeechDecoderWeightProvider,
+    token_id: u32,
+) -> Result<&'p [f32], GraniteSpeechDecoderError> {
+    let table = provider
+        .tensor("language_model.model.embed_tokens.weight")
+        .ok_or_else(|| GraniteSpeechDecoderError::MissingWeight {
+            name: "language_model.model.embed_tokens.weight".to_string(),
+        })?;
+    let expected = config.hidden_size * config.vocab_size;
+    if table.len() != expected {
+        return Err(GraniteSpeechDecoderError::WeightLen {
+            name: "language_model.model.embed_tokens.weight".to_string(),
+            expected,
+            actual: table.len(),
+        });
+    }
+    if token_id as usize >= config.vocab_size {
+        return Err(GraniteSpeechDecoderError::Shape {
+            reason: format!(
+                "token id {token_id} exceeds vocab_size {}",
+                config.vocab_size
+            ),
+        });
+    }
+    let start = token_id as usize * config.hidden_size;
+    Ok(&table[start..start + config.hidden_size])
+}
+
 /// One-shot prefill forward: embeds `token_ids` (scaled by
 /// `embedding_multiplier`), runs the full decoder stack with a causal mask,
 /// and returns hidden states + logits for every position. No KV-cache -- see
-/// module doc.
+/// module doc. Implemented as a host-side embedding-table gather (bit-identical
+/// to an in-graph `get_rows`) followed by `prefill_logits_from_embeddings`, so
+/// text-only and audio-spliced prompts (`prompt.rs`) share one graph builder.
 pub(crate) fn prefill_logits(
     config: &GraniteSpeechDecoderConfig,
     provider: &dyn GraniteSpeechDecoderWeightProvider,
     token_ids: &[u32],
     backend: GgmlCpuGraphBackend,
 ) -> Result<GraniteSpeechDecoderPrefillOutput, GraniteSpeechDecoderError> {
-    let n_tokens = token_ids.len();
-    if n_tokens == 0 {
+    if token_ids.is_empty() {
         return Err(GraniteSpeechDecoderError::Shape {
             reason: "token_ids must be non-empty".to_string(),
         });
     }
+    let mut embeddings = Vec::with_capacity(token_ids.len() * config.hidden_size);
     for &id in token_ids {
-        if id as usize >= config.vocab_size {
-            return Err(GraniteSpeechDecoderError::Shape {
-                reason: format!("token id {id} exceeds vocab_size {}", config.vocab_size),
-            });
-        }
+        embeddings.extend_from_slice(embed_token_row(config, provider, id)?);
+    }
+    prefill_logits_from_embeddings(config, provider, &embeddings, token_ids.len(), backend)
+}
+
+/// Same forward as [`prefill_logits`], but takes an already-assembled
+/// `[n_tokens, hidden_size]` embedding sequence directly (pre-`embedding_multiplier`,
+/// post any audio splice -- see `prompt.rs::build_audio_prompt_embeddings`,
+/// which mirrors HF's `GraniteSpeechModel.get_merged_audio_embeddings`).
+pub(crate) fn prefill_logits_from_embeddings(
+    config: &GraniteSpeechDecoderConfig,
+    provider: &dyn GraniteSpeechDecoderWeightProvider,
+    embeddings: &[f32],
+    n_tokens: usize,
+    backend: GgmlCpuGraphBackend,
+) -> Result<GraniteSpeechDecoderPrefillOutput, GraniteSpeechDecoderError> {
+    if n_tokens == 0 {
+        return Err(GraniteSpeechDecoderError::Shape {
+            reason: "n_tokens must be non-zero".to_string(),
+        });
+    }
+    if embeddings.len() != n_tokens * config.hidden_size {
+        return Err(GraniteSpeechDecoderError::Shape {
+            reason: format!(
+                "embeddings has {} values, expected {n_tokens}x{}",
+                embeddings.len(),
+                config.hidden_size
+            ),
+        });
     }
 
     let graph_config = GgmlCpuGraphConfig {
@@ -408,12 +469,6 @@ pub(crate) fn prefill_logits(
         .map_err(ggml_err("static_tensor_arena"))?;
 
     let mut builder = WeightBuilder::new(provider);
-    let embed_tokens = builder.w2(
-        &arena,
-        "language_model.model.embed_tokens.weight",
-        config.hidden_size,
-        config.vocab_size,
-    )?;
     let mut layers = Vec::with_capacity(config.num_layers);
     for index in 0..config.num_layers {
         layers.push(build_layer_weights(&arena, &mut builder, config, index)?);
@@ -453,25 +508,24 @@ pub(crate) fn prefill_logits(
         .map_err(ggml_err("upload_mask"))?;
 
     let weights = DecoderWeights {
-        embed_tokens,
         layers,
         final_norm_w,
         lm_head_w,
     };
 
     let mut graph = runner.start_graph();
-    let token_ids_i32: Vec<i32> = token_ids.iter().map(|&id| id as i32).collect();
-    let token_id_tensor = graph
-        .new_tensor_1d_i32(n_tokens, "granite_speech_decoder_token_ids")
+    let embed_tensor = graph
+        .new_tensor_2d_f32(
+            config.hidden_size,
+            n_tokens,
+            "granite_speech_decoder_embeds",
+        )
         .map_err(ggml_err("input_alloc"))?;
     let positions_graph = arena.graph_tensor(positions_handle);
     let mask_graph = arena.graph_tensor(mask_handle);
 
-    let embeds = graph
-        .get_rows(weights.embed_tokens, token_id_tensor)
-        .map_err(ggml_err("embed_lookup"))?;
     let mut hidden = graph
-        .scale(embeds, config.embedding_multiplier)
+        .scale(embed_tensor, config.embedding_multiplier)
         .map_err(ggml_err("embed_scale"))?;
 
     let rope = GgmlRopeExtParams::qwen_neox(config.head_dim, n_tokens, config.rope_theta)
@@ -502,18 +556,14 @@ pub(crate) fn prefill_logits(
         .set_output(logits)
         .map_err(ggml_err("set_output_logits"))?;
     graph
-        .set_input(token_id_tensor)
-        .map_err(ggml_err("mark_input(token_ids)"))?;
+        .set_input(embed_tensor)
+        .map_err(ggml_err("mark_input(embeddings)"))?;
     graph
         .prepare_outputs_for_upload(&[hidden_out, logits])
         .map_err(ggml_err("prepare_outputs"))?;
     graph
-        .set_i32_slice(
-            token_id_tensor,
-            &token_ids_i32,
-            "granite_speech_decoder_token_ids",
-        )
-        .map_err(ggml_err("upload_token_ids"))?;
+        .set_f32_slice(embed_tensor, embeddings, "granite_speech_decoder_embeds")
+        .map_err(ggml_err("upload_embeddings"))?;
 
     let mut outputs = graph
         .compute_outputs_f32(&[

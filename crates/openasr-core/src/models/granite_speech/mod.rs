@@ -23,6 +23,7 @@ pub(crate) mod decoder_graph;
 pub(crate) mod encoder_graph;
 pub(crate) mod frontend;
 pub mod package_import;
+pub(crate) mod prompt;
 pub(crate) mod qformer;
 pub(crate) mod tokenizer;
 
