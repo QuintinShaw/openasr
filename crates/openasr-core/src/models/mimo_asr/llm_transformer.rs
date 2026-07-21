@@ -4,9 +4,10 @@
 //! for) and drives them through `qwen::Qwen3AsrLlmWholeDecoderGraphExecutor`
 //! for prefill + single-token decode, exactly mirroring
 //! `firered_llm::llm_transformer`'s shape (see that module's doc comment for
-//! why GPU/HIP prefill-chunk tuning is deliberately not replicated here: this
-//! is a correctness-first CPU/Metal path, matching the P2.0-established
-//! device-fit expectations for this family's ~8B decoder).
+//! why GPU/HIP prefill-chunk tuning is deliberately not replicated here, and
+//! for why decode DOES go through `run_step_auto`'s persistent-graph reuse on
+//! Metal/single-GPU: this ~8B decoder has the same host-graph-construction-
+//! bound decode profile as firered2-llm).
 
 use thiserror::Error;
 
@@ -162,12 +163,40 @@ impl MimoLlmDecoderRuntime {
             })
     }
 
+    /// On a backend that supports persistent decode-graph reuse (Metal/
+    /// single-GPU), this runs the prompt through
+    /// `run_prefill_auto_last_hidden` instead of the bulk `run_prefill`
+    /// below: `decode_step` reuses that same persistent graph, and it can
+    /// only see a prompt token's K/V if the prompt flowed through it too
+    /// (see that method's doc comment) -- prefilling in bulk and decoding
+    /// via reuse would silently attend over an empty KV history for the
+    /// whole prompt span. See `firered_llm::llm_transformer::prefill`'s
+    /// identical structure (both drive the same shared executor).
     pub(crate) fn prefill(
         &mut self,
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
     ) -> Result<Vec<f32>, MimoLlmDecoderError> {
         let token_count = prompt_embeddings.token_count;
+        if let Some(final_hidden) = self
+            .whole_decoder
+            .run_prefill_auto_last_hidden(
+                &prompt_embeddings.token_major_values,
+                token_count,
+                layer_kv_caches,
+                self.metadata.rope_theta,
+            )
+            .map_err(|error| MimoLlmDecoderError::GraphFailed {
+                reason: error.to_string(),
+            })?
+        {
+            return self
+                .logits_head
+                .compute_logits_for_last_hidden(&final_hidden)
+                .map_err(|error| MimoLlmDecoderError::LogitsHeadFailed {
+                    reason: error.to_string(),
+                });
+        }
         let step = self
             .whole_decoder
             .run_prefill(
@@ -193,9 +222,13 @@ impl MimoLlmDecoderRuntime {
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
     ) -> Result<Vec<f32>, MimoLlmDecoderError> {
         let hidden = self.gather_token_embedding(token_id)?;
+        // `run_step_auto` transparently reuses the persistent decode graph on
+        // the Metal/single-GPU lane (see `Qwen3AsrLlmWholeDecoderGraphExecutor
+        // ::run_step_auto`'s doc comment); CPU stays on the per-token rebuild
+        // path exactly as before.
         let step = self
             .whole_decoder
-            .run_step(
+            .run_step_auto(
                 &hidden,
                 cache_position,
                 layer_kv_caches,
@@ -248,6 +281,11 @@ impl MimoLlmDecoderRuntime {
     }
 }
 
+/// `layer_kv` is empty whenever the step came from the persistent reuse
+/// graph (`run_step_auto`'s reused path): that graph's KV lives resident
+/// device-side and is never read back to the host, so there is nothing to
+/// write and this is a deliberate no-op -- not a mismatch. See
+/// `firered_llm::llm_transformer::write_layer_kv`'s identical doc comment.
 fn write_layer_kv(
     position_offset: usize,
     token_count: usize,
@@ -255,6 +293,9 @@ fn write_layer_kv(
     kv_row_width: usize,
     layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
 ) -> Result<(), MimoLlmDecoderError> {
+    if layer_kv.is_empty() {
+        return Ok(());
+    }
     if layer_kv.len() != layer_kv_caches.len() {
         return Err(MimoLlmDecoderError::KvCacheFailed {
             reason: "layer-KV count mismatch".to_string(),

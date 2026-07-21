@@ -11,14 +11,23 @@
 //! `qwen::ggml_executor`'s own prefill/decode loop does.
 //!
 //! Deliberately does NOT replicate qwen's HIP/discrete-GPU prefill-chunk
-//! tuning or persistent-graph-session reuse (`qwen::llm_transformer`'s
-//! `safe_*_prefill_chunk_size_for` / `Qwen3AsrLlmWholeDecoderGraphExecutor`'s
-//! GPU-reuse path): those exist to squeeze ROCm/CUDA decode latency for a
-//! shipped, GPU-tuned family. FireRedASR2-LLM's stage-4 goal is a correct,
-//! single-shot CPU/Metal transcription path (the upstream 40s hard cap keeps
-//! prompts short -- well under any chunking threshold), so this module always
-//! runs the plain (build-graph-per-token) path. Re-add GPU chunk tuning here
-//! if/when this family ships a GPU-accelerated build.
+//! tuning (`qwen::llm_transformer`'s `safe_*_prefill_chunk_size_for`): that
+//! exists to squeeze ROCm/CUDA prefill latency for a shipped, GPU-tuned
+//! family, and FireRedASR2-LLM's stage-4 goal is a correct, single-shot
+//! CPU/Metal transcription path (the upstream 40s hard cap keeps prompts
+//! short -- well under any chunking threshold), so prefill always runs the
+//! plain per-chunk path here.
+//!
+//! Single-token decode, however, DOES go through
+//! `Qwen3AsrLlmWholeDecoderGraphExecutor::run_step_auto`, which transparently
+//! reuses the persistent decode graph on the Metal/single-GPU lane: an 8B,
+//! 28-layer decoder rebuilding its whole graph every token makes host graph
+//! construction (CPU-bound) dominate over Metal compute, starving the GPU
+//! (low utilization, one CPU core pegged). That is a generic property of any
+//! large LLM-decoder-stage family driving this shared executor, not a
+//! qwen-specific GPU tuning knob, so it is on by default here exactly as it
+//! is for qwen (see `run_step_auto`'s doc comment for the CPU-vs-GPU
+//! eligibility rule).
 
 use thiserror::Error;
 
@@ -185,17 +194,46 @@ impl FireRedLlmDecoderRuntime {
             })
     }
 
-    /// Run the entire ChatML+speech prompt as one causal prefill pass,
-    /// seeding `layer_kv_caches` with every prompt token's K/V, and return the
-    /// logits row for the token immediately following the prompt (i.e. the
-    /// first generated token's distribution) -- mirrors
-    /// `qwen::ggml_executor`'s `write_prefill_step_outputs_and_compute_last_logits`.
+    /// Run the entire ChatML+speech prompt as one causal prefill, seeding
+    /// `layer_kv_caches` with every prompt token's K/V (unless the
+    /// graph-reuse path handles it, see below), and return the logits row
+    /// for the token immediately following the prompt (i.e. the first
+    /// generated token's distribution) -- mirrors `qwen::ggml_executor`'s
+    /// `write_prefill_step_outputs_and_compute_last_logits`.
+    ///
+    /// On a backend that supports persistent decode-graph reuse (Metal/
+    /// single-GPU), this runs the prompt through
+    /// `run_prefill_auto_last_hidden` instead of the bulk `run_prefill`
+    /// below: `decode_step` reuses that same persistent graph, and it can
+    /// only see a prompt token's K/V if the prompt flowed through it too
+    /// (see that method's doc comment) -- prefilling in bulk and decoding
+    /// via reuse would silently attend over an empty KV history for the
+    /// whole prompt span.
     pub(crate) fn prefill(
         &mut self,
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
     ) -> Result<Vec<f32>, FireRedLlmDecoderError> {
         let token_count = prompt_embeddings.token_count;
+        if let Some(final_hidden) = self
+            .whole_decoder
+            .run_prefill_auto_last_hidden(
+                &prompt_embeddings.token_major_values,
+                token_count,
+                layer_kv_caches,
+                FIRERED_LLM_ROPE_THETA,
+            )
+            .map_err(|error| FireRedLlmDecoderError::GraphFailed {
+                reason: error.to_string(),
+            })?
+        {
+            return self
+                .logits_head
+                .compute_logits_for_last_hidden(&final_hidden)
+                .map_err(|error| FireRedLlmDecoderError::LogitsHeadFailed {
+                    reason: error.to_string(),
+                });
+        }
         let step = self
             .whole_decoder
             .run_prefill(
@@ -224,9 +262,13 @@ impl FireRedLlmDecoderRuntime {
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
     ) -> Result<Vec<f32>, FireRedLlmDecoderError> {
         let hidden = self.gather_token_embedding(token_id)?;
+        // `run_step_auto` transparently reuses the persistent decode graph on
+        // the Metal/single-GPU lane (see `Qwen3AsrLlmWholeDecoderGraphExecutor
+        // ::run_step_auto`'s doc comment); CPU stays on the per-token rebuild
+        // path exactly as before.
         let step = self
             .whole_decoder
-            .run_step(
+            .run_step_auto(
                 &hidden,
                 cache_position,
                 layer_kv_caches,
@@ -286,6 +328,14 @@ impl FireRedLlmDecoderRuntime {
 /// so this is a small parallel copy rather than a cross-module reuse --
 /// unlike the executor/loader machinery above, this is a ~15-line loop, not
 /// worth threading a new pub(crate) export through for).
+///
+/// `layer_kv` is empty whenever the step came from the persistent reuse
+/// graph (`run_step_auto`'s reused path): that graph's KV lives resident
+/// device-side and is never read back to the host (see
+/// `Qwen3AsrLlmWholeDecoderGraphExecutor::run_step_reused`'s doc comment), so
+/// there is nothing to write and this is a deliberate no-op -- not a
+/// mismatch -- exactly like `qwen::ggml_executor::run_llm_layers_with_kv`'s
+/// own (unconditional, non-validating) write loop over the same empty case.
 fn write_layer_kv(
     position_offset: usize,
     token_count: usize,
@@ -293,6 +343,9 @@ fn write_layer_kv(
     kv_row_width: usize,
     layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
 ) -> Result<(), FireRedLlmDecoderError> {
+    if layer_kv.is_empty() {
+        return Ok(());
+    }
     if layer_kv.len() != layer_kv_caches.len() {
         return Err(FireRedLlmDecoderError::KvCacheFailed {
             reason: "layer-KV count mismatch".to_string(),
