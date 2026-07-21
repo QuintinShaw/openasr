@@ -23,7 +23,7 @@ use crate::models::qwen::{
 };
 
 use super::runtime_contract::{
-    MOSS_TD_RMS_NORM_EPSILON, MOSS_TD_ROPE_THETA, MossTdDecoderMetadata,
+    MOSS_TD_RMS_NORM_EPSILON, MOSS_TD_ROPE_THETA, MossTdDecoderMetadata, moss_td_kv_cache_positions,
 };
 use super::tensor_names::{
     LLM_OUTPUT_NORM_WEIGHT, LLM_TOKEN_EMBD_WEIGHT, moss_llm_layer_tensor_names,
@@ -152,10 +152,17 @@ impl MossTdDecoderRuntime {
     }
 
     pub(crate) fn new_kv_caches(&self) -> Vec<Qwen3AsrLayerKvCacheState> {
+        // Clamp the RoPE context limit (`max_positions`, up to 131072) down to
+        // the KV-cache preallocation cap: `Qwen3AsrLayerKvCacheState::new`
+        // eagerly allocates the full `max_positions` span on first write, so an
+        // uncapped 131072 reserves ~30 GB across the 28 layers (see
+        // `moss_td_kv_cache_positions`). This makes packs built before the cap
+        // (131072 baked into the GGUF) allocate the same ~1.9 GB as fresh ones.
+        let cache_positions = moss_td_kv_cache_positions(self.metadata.max_positions);
         (0..self.metadata.n_layers)
             .map(|_| {
                 Qwen3AsrLayerKvCacheState::new(
-                    self.metadata.max_positions,
+                    cache_positions,
                     self.metadata.n_kv_heads,
                     self.metadata.head_dim,
                 )

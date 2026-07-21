@@ -38,6 +38,35 @@ pub(crate) const MOSS_TD_RMS_NORM_EPSILON: f32 = 1e-6;
 /// RMSNorm epsilon, verified against the real checkpoint's `config.json`.
 pub(crate) const MOSS_TD_ADAPTOR_NORM_EPSILON: f32 = 1e-6;
 
+/// KV-cache preallocation cap for this family's Qwen3 decoder.
+///
+/// The checkpoint's `text_config.max_position_embeddings` is 131072 -- the
+/// decoder's *RoPE context limit*, NOT a sane KV-cache capacity. But
+/// `Qwen3AsrLayerKvCacheState` eagerly allocates `max_positions * n_kv_heads *
+/// head_dim` f32 for K and V on first write, so feeding 131072 straight through
+/// reserves ~30 GB of address space (28 layers x 2 x 131072 x 8 x 128 x 4 B).
+/// That reservation is lazy-zeroed and harmless on the CPU backend (only the
+/// touched prefix is resident), but the Metal backend physically wires the
+/// buffers and exhausts a 16 GB machine. Cap the preallocation at a pragmatic
+/// ASR context length -- 8192 mirrors qwen3-asr's own audio-encoder value -- so
+/// real utterances (audio tokens + prompt + generated tokens) stay comfortably
+/// under it while the reservation drops to ~1.9 GB. A sequence longer than the
+/// cap fails closed at the cache's own bounds check, never by over-allocating.
+///
+/// Lesson, recorded so it does not recur: `max_position_embeddings` is an
+/// attention/positional-encoding ceiling, not a working-set size; the two must
+/// not be conflated when sizing runtime buffers.
+pub(crate) const MOSS_TD_MAX_KV_CACHE_POSITIONS: usize = 8192;
+
+/// Clamp a decoder `max_positions` value (which may be the raw RoPE context
+/// limit) to the KV-cache preallocation cap. Both the runtime decoder
+/// (`llm_decoder::new_kv_caches`) and the pack importer
+/// (`package_import`) route through this so a pack built before the cap (with
+/// 131072 baked in) and a freshly built pack allocate identically.
+pub(crate) fn moss_td_kv_cache_positions(max_positions: usize) -> usize {
+    max_positions.min(MOSS_TD_MAX_KV_CACHE_POSITIONS)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MossTdEncoderMetadata {
     pub n_layers: usize,
@@ -264,5 +293,18 @@ mod tests {
         let mut metadata = full_metadata();
         metadata.insert(LLM_AUDIO_PAD_TOKEN_ID_KEY.to_string(), "999999".to_string());
         assert!(parse_decoder_metadata(&metadata).is_err());
+    }
+
+    #[test]
+    fn kv_cache_positions_caps_the_rope_context_limit() {
+        // A pack with the raw RoPE ceiling (131072) baked in clamps down to the
+        // pragmatic cap, so the KV cache preallocates ~1.9 GB, not ~30 GB.
+        assert_eq!(
+            moss_td_kv_cache_positions(131_072),
+            MOSS_TD_MAX_KV_CACHE_POSITIONS
+        );
+        assert_eq!(moss_td_kv_cache_positions(8_192), 8_192);
+        // A short-enough value passes through untouched.
+        assert_eq!(moss_td_kv_cache_positions(300), 300);
     }
 }

@@ -80,6 +80,7 @@ use crate::models::oasr_metadata::{
 };
 use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
 
+use super::runtime_contract::moss_td_kv_cache_positions;
 use super::tensor_names::{
     ADAPTOR_LINEAR1_BIAS, ADAPTOR_LINEAR1_WEIGHT, ADAPTOR_LINEAR2_BIAS, ADAPTOR_LINEAR2_WEIGHT,
     ADAPTOR_NORM_BIAS, ADAPTOR_NORM_WEIGHT, ENC_CONV1_BIAS, ENC_CONV1_WEIGHT, ENC_CONV2_BIAS,
@@ -1030,9 +1031,15 @@ fn moss_td_runtime_gguf_metadata(
         .u32("moss_td.llm.n_kv_heads", text.num_key_value_heads as u32)
         .u32("moss_td.llm.head_dim", text.head_dim as u32)
         .u32("moss_td.llm.vocab_size", tokens.len() as u32)
+        // Write a pragmatic KV-cache capacity, NOT the raw RoPE context limit
+        // (`max_position_embeddings` = 131072). The runtime caps this again on
+        // load (`llm_decoder::new_kv_caches`), so this keeps freshly built packs
+        // self-describing with the same value the runtime will use, rather than
+        // baking in a 131072 that would (uncapped) reserve ~30 GB of KV cache.
+        // See `runtime_contract::moss_td_kv_cache_positions`.
         .u32(
             "moss_td.llm.max_positions",
-            text.max_position_embeddings as u32,
+            moss_td_kv_cache_positions(text.max_position_embeddings) as u32,
         )
         .u32("moss_td.llm.audio_start_token_id", audio_token_ids.start)
         .u32("moss_td.llm.audio_end_token_id", audio_token_ids.end)
