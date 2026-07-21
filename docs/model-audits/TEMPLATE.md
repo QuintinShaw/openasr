@@ -93,11 +93,11 @@ see `docs/design/gpu-weight-placement.md`).
 
 | Backend | Supported? | Golden-verified? | Utilization measured? | Justification + unlock plan if unsupported |
 | --- | --- | --- | --- | --- |
-| CPU | <!-- TODO:fill --> | | | |
-| Metal | <!-- TODO:fill --> | | | |
-| CUDA | <!-- TODO:fill --> | | | |
-| Vulkan | <!-- TODO:fill --> | | | |
-| HIP | <!-- TODO:fill --> | | | |
+| CPU | <!-- TODO:fill --> | <!-- TODO:fill --> | <!-- TODO:fill --> | |
+| Metal | <!-- TODO:fill --> | <!-- TODO:fill --> | <!-- TODO:fill --> | |
+| CUDA | <!-- TODO:fill --> | <!-- TODO:fill --> | <!-- TODO:fill --> | |
+| Vulkan | <!-- TODO:fill --> | <!-- TODO:fill --> | <!-- TODO:fill --> | |
+| HIP | <!-- TODO:fill --> | <!-- TODO:fill --> | <!-- TODO:fill --> | |
 
 ## 8. Correctness & quality
 
@@ -113,6 +113,7 @@ see `docs/design/gpu-weight-placement.md`).
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
 | Max audio length / context budget derived and over-limit behavior fails closed | <!-- TODO:fill --> | |
+| Streaming first-token latency floor documented (chunk accumulation math; streaming families, otherwise Not applicable) | <!-- TODO:fill --> | |
 | KV growth rate per audio second known | <!-- TODO:fill --> | |
 | Metal wired-memory profile captured | <!-- TODO:fill --> | |
 | Multi-session scaling behavior known (server concurrency) | <!-- TODO:fill --> | |
