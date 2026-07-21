@@ -292,4 +292,64 @@ mod tests {
         MossTdTokenizer::from_gguf_metadata(&GgufMetadata::from_values_for_test(values))
             .expect("tokenizer")
     }
+
+    /// Real converted dev pack (see `package_import`'s own
+    /// `golden_diff_converted_pack_tensors_match_source_checkpoint_bit_for_bit`
+    /// for the tensor-parity half of this pack's provenance), NOT committed
+    /// to the repo -- same dev-only-artifact convention as
+    /// `mimo_asr::executor::tests::dev_pack_path`.
+    fn dev_pack_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(
+            "/Volumes/QuintinDocument/openasr-dev/tmp/moss-td/moss-transcribe-diarize-fp16.oasr",
+        )
+    }
+
+    /// Regression test for the `models::gpt2_bpe` pretokenizer fix: builds
+    /// the real jfk.wav decode prompt against the real converted pack's real
+    /// vocab/merges and asserts it matches
+    /// `tmp/moss-td/golden/jfk.json`'s real `prompt_input_ids` token-for-
+    /// token (227 tokens: 14-token ChatML prefix + audio-start + 141-token
+    /// audio span + audio-end + 70-token instruction/ChatML suffix). Before
+    /// the pretokenizer fix this diverged at the instruction text's first
+    /// `"[S01]"` marker (index 22 of the suffix span: an anomalous merged
+    /// `"[S"` token instead of separate `"["`/`"S"` tokens).
+    #[test]
+    fn builds_the_real_golden_jfk_prompt_token_for_token() {
+        let pack_path = dev_pack_path();
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return;
+        }
+        let metadata = crate::ggml_runtime::read_gguf_metadata(&pack_path).expect("read metadata");
+        let tokenizer = MossTdTokenizer::from_gguf_metadata(&metadata).expect("tokenizer");
+        // jfk.wav is 11.0s @ 12.5 audio tokens/sec = 138 audio tokens (the
+        // real checkpoint's own `get_audio_features` output length,
+        // independently verified against the real encoder+adaptor forward
+        // pass -- see this module's own executor-level diagnostics).
+        let prompt = build_moss_td_decode_prompt(&tokenizer, 138).expect("prompt");
+        let golden_prompt_input_ids: Vec<u32> = vec![
+            151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198,
+            151669, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671,
+            151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671,
+            151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671,
+            151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671,
+            151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671,
+            151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 20, 151671, 151671,
+            151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671,
+            151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671,
+            151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671,
+            151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671,
+            151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671,
+            151671, 151671, 151671, 151671, 151671, 16, 15, 151671, 151671, 151671, 151671, 151671,
+            151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151671, 151670, 198,
+            14880, 44063, 111268, 46670, 61443, 17714, 108704, 3837, 73157, 104383, 58362, 23031,
+            71618, 26606, 20450, 111420, 33108, 104283, 17340, 72640, 9909, 58, 50, 15, 16, 60,
+            5373, 58, 50, 15, 17, 60, 5373, 58, 50, 15, 18, 60, 1940, 7552, 111749, 3837, 110644,
+            17714, 110019, 105761, 43815, 90395, 18493, 37474, 100072, 111066, 80565, 20450,
+            111420, 3837, 23031, 104542, 117932, 75882, 37474, 105761, 101121, 1773, 151645, 198,
+            151644, 77091, 198,
+        ];
+        assert_eq!(prompt.token_ids.len(), golden_prompt_input_ids.len());
+        assert_eq!(prompt.token_ids, golden_prompt_input_ids);
+    }
 }
