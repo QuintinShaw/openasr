@@ -140,11 +140,18 @@ impl MimoLlmDecoderRuntime {
         })
     }
 
-    pub(crate) fn new_kv_caches(&self) -> Vec<Qwen3AsrLayerKvCacheState> {
+    /// `capacity` should be the request-sized bound (prompt tokens + the
+    /// generation budget), NOT the model's native `max_positions`: see
+    /// `firered_llm::llm_transformer::FireRedLlmDecoderRuntime::new_kv_caches`'s
+    /// doc comment (both families drive the same shared executor, and the
+    /// same measured regression applies here) -- `capacity` becomes the
+    /// persistent reuse graph's fixed attention span on Metal/GPU, which is a
+    /// per-token compute cost there, not just a host allocation ceiling.
+    pub(crate) fn new_kv_caches(&self, capacity: usize) -> Vec<Qwen3AsrLayerKvCacheState> {
         (0..self.metadata.n_layers)
             .map(|_| {
                 Qwen3AsrLayerKvCacheState::new(
-                    self.metadata.max_positions,
+                    capacity,
                     self.metadata.n_kv_heads,
                     self.metadata.head_dim,
                 )

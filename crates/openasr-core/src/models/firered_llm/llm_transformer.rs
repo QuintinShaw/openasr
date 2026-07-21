@@ -171,11 +171,25 @@ impl FireRedLlmDecoderRuntime {
         self.whole_decoder.backend_label()
     }
 
-    pub(crate) fn new_kv_caches(&self) -> Vec<Qwen3AsrLayerKvCacheState> {
+    /// `capacity` should be the request-sized bound (prompt tokens + the
+    /// generation budget), NOT the model's native `max_positions` (32768 for
+    /// the Qwen2-7B decoder): `capacity` becomes the persistent reuse
+    /// graph's fixed attention span on Metal/GPU (`run_step_auto` sizes it
+    /// from this cache's `max_positions()`), and that span is a per-token
+    /// COMPUTE cost there, not just a host allocation ceiling -- attending
+    /// over the model's full native context on every token of a
+    /// several-hundred-token ASR utterance is >100x more attention work than
+    /// the utterance needs, and made decode+prefill both regress when a
+    /// prior version of this method sized it to `self.metadata.max_positions`
+    /// unconditionally (measured: prefill 151 tokens 8.4s -> 19.0s, decode
+    /// ~15.8s -> ~25.2s on an M1). Mirrors
+    /// `qwen::ggml_executor`'s own `decode_prompt.token_ids.len()
+    /// .saturating_add(decode_config.max_generated_tokens)` sizing.
+    pub(crate) fn new_kv_caches(&self, capacity: usize) -> Vec<Qwen3AsrLayerKvCacheState> {
         (0..self.metadata.n_layers)
             .map(|_| {
                 Qwen3AsrLayerKvCacheState::new(
-                    self.metadata.max_positions,
+                    capacity,
                     self.metadata.n_kv_heads,
                     self.metadata.head_dim,
                 )

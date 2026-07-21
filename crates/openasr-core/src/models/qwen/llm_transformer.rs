@@ -1953,18 +1953,22 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     /// bulk `run_prefill` cannot be mixed for one utterance, because the
     /// persistent resident-KV graph `run_step_auto` builds on its first call
     /// is zero-initialized and only ever gets a prompt token's real K/V by
-    /// that token flowing through `run_step_auto` itself (`set_rows` writes
-    /// accumulate per call) -- a prompt prefilled instead through the bulk
-    /// host-cache `run_prefill` never touches that graph, so decode would
-    /// resume attending over a KV history that was never populated for the
-    /// prompt span. So on the graph-reuse-capable path this runs the prompt
-    /// serially, ONE TOKEN AT A TIME through `run_step_auto`, exactly
-    /// mirroring `qwen::ggml_executor`'s own
-    /// `prefill_prompt_serial_and_compute_last_logits` gate
-    /// (`safe_host_cache_prefill_chunk_size_for` returning `None` on
-    /// GPU-class backends routes qwen through the identical serial path) --
-    /// the one-time graph build happens on the first prompt token and every
-    /// remaining prompt token plus every decode token afterwards reuses it.
+    /// that token flowing through the SAME resident arena -- a prompt
+    /// prefilled instead through the bulk host-cache `run_prefill` never
+    /// touches that arena, so decode would resume attending over a KV
+    /// history that was never populated for the prompt span.
+    ///
+    /// This seeds the resident arena via `run_prefill_into_reused_batched`
+    /// (`n_seq=1`): ONE graph build plus ONE batched compute over the whole
+    /// prompt, exactly like bulk `run_prefill`'s own single-shot efficiency,
+    /// except its `set_rows` writes land in the persistent resident arena
+    /// instead of a growing/host-cache graph. An earlier version of this
+    /// method instead replayed the prompt token-by-token through
+    /// `run_step_auto`: correct, but serializing what is otherwise one wide
+    /// batched matmul into N narrow batch-1 matmuls (plus N Metal dispatches)
+    /// measured slower than bulk prefill outright on an M1 (151 tokens: 8.4s
+    /// bulk vs 14.6-19.0s serialized) -- a real loss, not merely "no gain",
+    /// so it was replaced with this batched seeding instead.
     /// Returns `None` when the backend does not support graph reuse, so the
     /// caller falls back to its own bulk `run_prefill` + host-cache KV write.
     pub(crate) fn run_prefill_auto_last_hidden(
@@ -1974,24 +1978,21 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         layer_caches: &[Qwen3AsrLayerKvCacheState],
         rope_theta: f32,
     ) -> Result<Option<Vec<f32>>, GgmlCpuGraphError> {
-        if !self.supports_graph_reuse() {
+        let Some(max_positions) = layer_caches
+            .first()
+            .map(Qwen3AsrLayerKvCacheState::max_positions)
+            .filter(|_| self.supports_graph_reuse())
+        else {
             return Ok(None);
-        }
-        let d_model = self.dims.d_model;
-        let mut last_hidden = None;
-        for position in 0..token_count {
-            let start = position * d_model;
-            let end = start + d_model;
-            let hidden_in =
-                token_major_values
-                    .get(start..end)
-                    .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-                        reason: "whole-decoder prefill token slice out of bounds",
-                    })?;
-            let step = self.run_step_auto(hidden_in, position, layer_caches, rope_theta)?;
-            last_hidden = Some(step.hidden);
-        }
-        Ok(last_hidden)
+        };
+        let step = self.run_prefill_into_reused_batched(
+            token_major_values,
+            token_count,
+            1,
+            max_positions,
+            rope_theta,
+        )?;
+        Ok(Some(step.hidden))
     }
 
     pub(crate) fn run_step_top1(
