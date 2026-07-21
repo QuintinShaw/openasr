@@ -325,7 +325,9 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     /// Silicon Metal specifically (a 29-frame chunk graph too small to
     /// amortize Metal's per-dispatch overhead) -- see
     /// `models::xasr_zipformer::graph_config::encoder_gpu_enabled` -- so it
-    /// is now the sole builtin `ExceptMetal`. That same audit also measured a
+    /// was for a time the sole builtin `ExceptMetal`; moss-transcribe-diarize
+    /// later joined it (Metal encoder-numeric divergence + per-step wired-memory
+    /// blow-up, documented on that descriptor). That same audit also measured a
     /// Metal slowdown for qwen and moonshine, but neither is gated: qwen's
     /// looks like a fixed size x quant platform trade-off rather than a code
     /// bug, and that read is left to a dedicated follow-up before being baked
@@ -1629,11 +1631,23 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: MOSS_TD_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        // Perf/backend tuning is explicitly out of scope for this stage (see
-        // `models::moss_transcribe_diarize::mod`'s stage-status note) --
-        // start un-gated like every other family's initial landing, revisit
-        // once a real Metal-vs-CPU measurement exists.
-        auto_gpu_policy: AutoGpuPolicy::AllBackends,
+        // Auto is pinned OFF Metal for this family until two Metal-specific
+        // defects are fixed (both measured on an M1, CPU parity confirmed; each
+        // is its own follow-up, out of scope for this landing):
+        //   1. Encoder numeric divergence: the Whisper encoder's deep layers
+        //      decorrelate on Metal (final-layer cosine ~0.20 vs the fp32 CPU
+        //      reference, which matches), collapsing decoding to an empty
+        //      `[..][S01][..]` shell. CPU produces the correct transcript.
+        //   2. Memory blow-up: the per-token decode rebuilds the whole 28-layer
+        //      ggml graph each step; on Metal the wired working set exhausts a
+        //      16 GB machine, while the same run peaks ~2.8 GB on CPU. (The KV
+        //      over-allocation half of this is already fixed via
+        //      `runtime_contract::moss_td_kv_cache_positions`; the remaining
+        //      per-step graph/wired behavior is Metal-only and still open.)
+        // `ExceptMetal` only steers Auto to CPU; an explicit
+        // `execution_target=accelerated` still gets Metal (and both defects),
+        // by design. Revisit -> `AllBackends` once 1 and 2 land.
+        auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
         // The model is trained to emit `[S01]`/`[S02]`/... speaker labels
         // directly in its transcript text (see `decode_prompt`'s fixed
         // instruction), so this family diarizes itself -- there is no
@@ -1780,7 +1794,10 @@ mod tests {
             (FIRERED_AED_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
             (FIRERED_LLM_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
             (MIMO_ASR_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
-            (MOSS_TD_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
+            // Pinned off Metal until the family's Metal encoder-numeric and
+            // wired-memory defects are fixed (see the descriptor's
+            // `auto_gpu_policy` note).
+            (MOSS_TD_GGML_ARCHITECTURE_ID, AutoGpuPolicy::ExceptMetal),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
         let mut seen = std::collections::BTreeSet::new();
