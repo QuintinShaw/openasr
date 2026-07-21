@@ -249,6 +249,38 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         ctc_blank_token_id: None,
     },
     BuiltinDecodePolicyComponentDescriptor {
+        // Source of truth is `crate::arch` (same staging precedent as
+        // firered-aed above): moss-transcribe-diarize has no crate-root
+        // re-export.
+        decode_policy_id: crate::arch::MOSS_TD_DECODE_POLICY_ID,
+        execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
+        // eot (ChatML `<|im_end|>`) is supplied per-request via
+        // `BuiltinSeq2SeqDecodePolicyConfigInput.eot_token_id`; the audio-span
+        // placeholder/marker tokens are never emitted by the LLM itself (they
+        // only ever appear in the PROMPT, spliced in by the executor), so
+        // there is nothing else to strip -- Identity postprocess, same shape
+        // as firered-llm/mimo-asr.
+        seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
+        seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
+        // This family's executor already folds arbitrarily long audio into
+        // ONE prompt/decode (chunked encoder concatenation, see
+        // `executor.rs`), so it never runs multiple ChatML-turn "chunks" the
+        // way firered-llm/mimo-asr's 30-40s hard caps do, and its encoder is
+        // `FixedWindow` (Whisper-Medium), not one of the small-context plain
+        // `<sos>`-prompted AED decoders `ConservativeSeq2SeqV1` guards
+        // against repeating on long pause-free audio -- same shape as
+        // `whisper` itself, which also pairs `FixedWindow` with `Default`
+        // (see that entry above). `ConservativeSeq2SeqV1` would additionally
+        // clamp the shared native longform slicer's chunk length even though
+        // this family's dedicated executor never consults it, so `Default`
+        // is the honest choice, not just an equivalent one.
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        longform_profile: BuiltinDecodePolicyLongformProfile::Default,
+        ctc_blank_token_id: None,
+    },
+    BuiltinDecodePolicyComponentDescriptor {
         // hymt2 is an auxiliary translation family (no arch-registry entry, no
         // crate-root re-export); its runtime resolves this descriptor directly
         // by policy id. Source of truth for the id is `crate::arch`.
@@ -893,9 +925,9 @@ mod tests {
             checked += 1;
         }
         // cohere-transcribe + whisper + qwen3-asr + moonshine + firered-aed +
-        // firered-llm + mimo-asr.
+        // firered-llm + mimo-asr + moss-transcribe-diarize.
         assert_eq!(
-            checked, 7,
+            checked, 8,
             "expected exactly 7 greedy-seq2seq architectures to resolve"
         );
     }

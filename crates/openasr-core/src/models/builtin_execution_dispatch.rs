@@ -17,6 +17,7 @@ use super::firered_llm::executor::FireRedLlmGgmlExecutor;
 use super::ggml_composed_executor::ComposedGgmlAsrExecutor;
 use super::ggml_family_adapter::GgmlExecutionCapability;
 use super::mimo_asr::executor::MimoAsrGgmlExecutor;
+use super::moss_transcribe_diarize::executor::MossTdGgmlExecutor;
 use super::parakeet_ctc::executor::ParakeetCtcGgmlExecutor;
 use super::parakeet_tdt::executor::ParakeetTdtGgmlExecutor;
 use super::sensevoice::executor::SenseVoiceGgmlExecutor;
@@ -203,6 +204,14 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
         )
         .with_streaming_partial_granularity_for_adapter(
             crate::arch::MIMO_ASR_GGML_ADAPTER_ID,
+            StreamingPartialGranularity::Buffered,
+        )
+        .with_streaming_executor_for_adapter(
+            crate::arch::MOSS_TD_GGML_ADAPTER_ID,
+            Arc::new(MossTdGgmlExecutor),
+        )
+        .with_streaming_partial_granularity_for_adapter(
+            crate::arch::MOSS_TD_GGML_ADAPTER_ID,
             StreamingPartialGranularity::Buffered,
         )
         .with_streaming_executor_for_adapter(

@@ -243,6 +243,30 @@ pub(crate) static FIRERED_LLM_HPARAM_SCHEMA: &[&str] = &[
     "firered_llm.llm.speech_token_id",
 ];
 
+// Keys mirror `models::moss_transcribe_diarize::runtime_contract`'s three
+// parsers.
+pub(crate) static MOSS_TD_HPARAM_SCHEMA: &[&str] = &[
+    "moss_td.encoder.n_layers",
+    "moss_td.encoder.d_model",
+    "moss_td.encoder.n_heads",
+    "moss_td.encoder.ffn_dim",
+    "moss_td.encoder.n_mels",
+    "moss_td.encoder.max_source_positions",
+    "moss_td.adaptor.merge_size",
+    "moss_td.adaptor.input_dim",
+    "moss_td.llm.n_layers",
+    "moss_td.llm.d_model",
+    "moss_td.llm.ffn_dim",
+    "moss_td.llm.n_heads",
+    "moss_td.llm.n_kv_heads",
+    "moss_td.llm.head_dim",
+    "moss_td.llm.vocab_size",
+    "moss_td.llm.max_positions",
+    "moss_td.llm.audio_start_token_id",
+    "moss_td.llm.audio_end_token_id",
+    "moss_td.llm.audio_pad_token_id",
+];
+
 // ── mimo-asr (XiaomiMiMo/MiMo-V2.5-ASR + MiMo-Audio-Tokenizer) hparam schema ─
 // Keys mirror `models::mimo_asr::runtime_contract`'s parsers. Deliberately
 // checks only the top-level presence gate (block counts + special-token ids);

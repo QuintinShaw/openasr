@@ -299,6 +299,13 @@ pub fn mimo_asr_runtime_descriptor_v1() -> GgmlFamilyAdapterDescriptor {
         .ggml_family_adapter_descriptor()
 }
 
+pub fn moss_transcribe_diarize_runtime_descriptor_v1() -> GgmlFamilyAdapterDescriptor {
+    OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID)
+        .expect("builtin moss-transcribe-diarize architecture must exist")
+        .ggml_family_adapter_descriptor()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

@@ -16,15 +16,24 @@
 //! implemented; a pack produced by this importer is not yet runnable by
 //! `openasr transcribe`.
 
+mod adaptor_graph;
+mod decode_prompt;
+mod encoder_graph;
+pub(crate) mod executor;
+mod graph_config;
+mod llm_decoder;
 pub(crate) mod package_import;
+mod prompt_embedding;
+pub(crate) mod runtime_contract;
 pub(crate) mod tensor_names;
+mod tokenizer;
 
 // Not yet consumed by any CLI/tooling entry point (see the module doc above
-// for stage status) -- re-exported now so the runtime-wiring follow-up and a
-// future CLI `model-pack import` case can reach these without touching this
-// file again. Matches every other family module's `pub use` shape in this
-// crate (e.g. `firered_llm`, `mimo_asr`), which stay unused the same way
-// until their own executor/CLI wiring lands.
+// for stage status) -- re-exported now so a future CLI `model-pack import`
+// case can reach these without touching this file again. Matches every
+// other family module's `pub use` shape in this crate (e.g. `firered_llm`,
+// `mimo_asr`), which stay unused the same way until their own CLI wiring
+// lands.
 #[allow(unused_imports)]
 pub use package_import::{
     MossTdImportRequest, MossTdImportResult, MossTdQuantizationMode,

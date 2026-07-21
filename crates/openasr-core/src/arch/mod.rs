@@ -22,10 +22,10 @@ use hparams::{
     COHERE_TRANSCRIBE_DECODER_LAYERS_KEY, COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY,
     COHERE_TRANSCRIBE_HPARAM_SCHEMA, DOLPHIN_HPARAM_SCHEMA, FIRERED_AED_HPARAM_SCHEMA,
     FIRERED_LLM_HPARAM_SCHEMA, MIMO_ASR_HPARAM_SCHEMA, MOONSHINE_HPARAM_SCHEMA,
-    PARAKEET_CTC_HPARAM_SCHEMA, PARAKEET_TDT_HPARAM_SCHEMA, QWEN3_ARCHITECTURE_VALUE,
-    QWEN3_ASR_HPARAM_SCHEMA, QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY,
-    SENSEVOICE_HPARAM_SCHEMA, WAV2VEC2_CTC_HPARAM_SCHEMA, WHISPER_HPARAM_SCHEMA,
-    XASR_ZIPFORMER_HPARAM_SCHEMA,
+    MOSS_TD_HPARAM_SCHEMA, PARAKEET_CTC_HPARAM_SCHEMA, PARAKEET_TDT_HPARAM_SCHEMA,
+    QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA, QWEN3_AUDIO_LAYERS_KEY,
+    QWEN3_LLM_LAYERS_KEY, SENSEVOICE_HPARAM_SCHEMA, WAV2VEC2_CTC_HPARAM_SCHEMA,
+    WHISPER_HPARAM_SCHEMA, XASR_ZIPFORMER_HPARAM_SCHEMA,
 };
 
 pub(crate) const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
@@ -186,6 +186,28 @@ pub(crate) const MIMO_ASR_TOKENIZER_ID: &str = "mimo-asr.gpt2-bpe.v0";
 pub(crate) const MIMO_ASR_DECODE_POLICY_ID: &str = "mimo-asr.greedy.seq2seq.v0";
 pub(crate) const MIMO_ASR_RUNTIME_TENSOR_CONTRACT_ID: &str = "mimo-asr.runtime-tensors.v0";
 pub(crate) const MIMO_ASR_EXECUTOR_COMPONENT_ID: &str = "mimo-asr.ggml-executor.v0";
+
+// moss-transcribe-diarize (OpenMOSS/MOSS-Transcribe-Diarize, 0.9B): a
+// Whisper-Medium-architecture audio encoder (standard HF `WhisperEncoder`,
+// reuses the shared `crate::nn::encoder::transformer_layer` "Whisper /
+// Qwen-audio encoder shape" primitive `qwen::audio_encoder` also builds on)
+// + a pure-reshape 4x time-merge + `VQAdaptor` (a plain 3-layer MLP+LayerNorm
+// despite the name -- no VQ codebook) + a genuinely Qwen3-0.6B-parameterized
+// decoder (QK-norm, no attention bias, GQA, tied embeddings), reusing
+// `qwen`'s family-agnostic decoder machinery byte-for-byte (see
+// `models::moss_transcribe_diarize::llm_decoder`'s module doc). Like
+// firered-llm/mimo-asr, decode runs on a hand-written dedicated executor
+// (block_stack: None) -- registered in `BUILTIN_COMPONENT_DESCRIPTORS` /
+// `BUILTIN_ARCHITECTURE_DESCRIPTORS` below.
+pub(crate) const MOSS_TD_GGML_ARCHITECTURE_ID: &str = "moss-transcribe-diarize-whisper-qwen3";
+pub(crate) const MOSS_TD_GGML_ADAPTER_ID: &str = "ggml-family-moss-transcribe-diarize-runtime-v1";
+pub(crate) const MOSS_TD_MODEL_FAMILY: &str = "moss-transcribe-diarize";
+pub(crate) const MOSS_TD_AUDIO_FRONTEND_ID: &str = "moss-transcribe-diarize.fbank80.16khz.mono.v0";
+pub(crate) const MOSS_TD_TOKENIZER_ID: &str = "moss-transcribe-diarize.qwen3-bpe.v0";
+pub(crate) const MOSS_TD_DECODE_POLICY_ID: &str = "moss-transcribe-diarize.greedy.seq2seq.v0";
+pub(crate) const MOSS_TD_RUNTIME_TENSOR_CONTRACT_ID: &str =
+    "moss-transcribe-diarize.runtime-tensors.v0";
+pub(crate) const MOSS_TD_EXECUTOR_COMPONENT_ID: &str = "moss-transcribe-diarize.ggml-executor.v0";
 
 // hymt2 (Tencent Hunyuan-MT2 subtitle translation, hunyuan-dense decoder-only
 // LLM). An auxiliary text-to-text family, NOT an ASR architecture: it is
@@ -1046,6 +1068,26 @@ const BUILTIN_COMPONENT_DESCRIPTORS: &[OpenAsrComponentDescriptor] = &[
         kind: OpenAsrComponentKind::Executor,
         id: MIMO_ASR_EXECUTOR_COMPONENT_ID,
     },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
+        id: MOSS_TD_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: MOSS_TD_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: MOSS_TD_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: MOSS_TD_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: MOSS_TD_EXECUTOR_COMPONENT_ID,
+    },
 ];
 
 const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
@@ -1567,6 +1609,54 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
         },
     },
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &[MOSS_TD_GGML_ARCHITECTURE_ID],
+        model_family: MOSS_TD_MODEL_FAMILY,
+        model_architecture: MOSS_TD_GGML_ARCHITECTURE_ID,
+        adapter_id: MOSS_TD_GGML_ADAPTER_ID,
+        // The Qwen3 decoder auto-detects/produces the transcript language
+        // through free-text instruction-following (no dedicated language
+        // token in its vocab, same shape as qwen3-asr) -- until prompt-level
+        // language conditioning is wired and verified against a real pack, an
+        // explicit hint is rejected (not faked) rather than silently ignored.
+        language_family_hint: LanguageFamilyHint::SelfDetectsRejectsHint {
+            reject_reason: "MOSS-Transcribe-Diarize auto-detects the source language via its Qwen3 decoder and does not accept an explicit selection; use a multilingual Whisper pack to force or report a language.",
+        },
+        audio_frontend_id: MOSS_TD_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: MOSS_TD_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: MOSS_TD_TOKENIZER_ID,
+        decode_policy_id: MOSS_TD_DECODE_POLICY_ID,
+        executor_component_id: MOSS_TD_EXECUTOR_COMPONENT_ID,
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        // Perf/backend tuning is explicitly out of scope for this stage (see
+        // `models::moss_transcribe_diarize::mod`'s stage-status note) --
+        // start un-gated like every other family's initial landing, revisit
+        // once a real Metal-vs-CPU measurement exists.
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
+        // The model is trained to emit `[S01]`/`[S02]`/... speaker labels
+        // directly in its transcript text (see `decode_prompt`'s fixed
+        // instruction), so this family diarizes itself -- there is no
+        // separate diarization pass to compose.
+        self_diarizes: true,
+        // The fixed instruction asks for full punctuation-bearing prose
+        // segments; no characterized counter-example has been observed yet,
+        // but this has not been verified against enough real transcripts to
+        // assert as a capability -- leave unclaimed rather than guess.
+        emits_punctuation: None,
+        hparam_schema: MOSS_TD_HPARAM_SCHEMA,
+        // Whisper encoder + Qwen3 decoder-only decode both stay on the
+        // dedicated executor (neither shape is a composer block kind), so no
+        // data-driven block-stack descriptor.
+        block_stack: None,
+        // Whisper's own architecture-fixed 30s log-mel window: the encoder
+        // never attends past its own fixed 1500-position chunk no matter how
+        // long the total requested audio is (the executor loops the encoder
+        // over independent 30s windows and concatenates -- see `executor.rs`'s
+        // module doc), so this needs no additional longform safety cap --
+        // same classification as `whisper` itself.
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::FixedWindow,
+    },
 ];
 
 #[cfg(test)]
@@ -1604,6 +1694,7 @@ mod tests {
             (FIRERED_AED_GGML_ARCHITECTURE_ID, false, Some(false)),
             (FIRERED_LLM_GGML_ARCHITECTURE_ID, false, None),
             (MIMO_ASR_GGML_ARCHITECTURE_ID, false, None),
+            (MOSS_TD_GGML_ARCHITECTURE_ID, true, None),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
         let mut seen = std::collections::BTreeSet::new();
@@ -1689,6 +1780,7 @@ mod tests {
             (FIRERED_AED_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
             (FIRERED_LLM_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
             (MIMO_ASR_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
+            (MOSS_TD_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
         let mut seen = std::collections::BTreeSet::new();
@@ -1849,6 +1941,10 @@ mod tests {
                 OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                     max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                 },
+            ),
+            (
+                MOSS_TD_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::FixedWindow,
             ),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();

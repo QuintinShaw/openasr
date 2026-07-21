@@ -88,14 +88,10 @@ use super::tensor_names::{
     moss_llm_layer_tensor_names,
 };
 
-pub(crate) const MOSS_TD_MODEL_FAMILY: &str = "moss-transcribe-diarize";
-pub(crate) const MOSS_TD_GGML_ARCHITECTURE_ID: &str = "moss-transcribe-diarize-whisper-qwen3";
-/// Not yet registered in `arch/mod.rs` (see this module's doc comment) --
-/// kept here as the value this importer stamps into the pack so the runtime
-/// wiring stage can adopt it verbatim without an on-disk format change.
-pub(crate) const MOSS_TD_AUDIO_FRONTEND_ID: &str = "moss-transcribe-diarize.fbank80.16khz.mono.v0";
-pub(crate) const MOSS_TD_TOKENIZER_ID: &str = "moss-transcribe-diarize.qwen3-bpe.v0";
-pub(crate) const MOSS_TD_DECODE_POLICY_ID: &str = "moss-transcribe-diarize.greedy.seq2seq.v0";
+use crate::arch::{
+    MOSS_TD_AUDIO_FRONTEND_ID, MOSS_TD_DECODE_POLICY_ID, MOSS_TD_GGML_ARCHITECTURE_ID,
+    MOSS_TD_MODEL_FAMILY, MOSS_TD_TOKENIZER_ID,
+};
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_VOCAB_JSON: &str = "vocab.json";
