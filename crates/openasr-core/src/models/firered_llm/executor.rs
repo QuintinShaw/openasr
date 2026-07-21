@@ -55,7 +55,7 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
 
-use super::adapter_graph::{load_firered_llm_adapter_weights_from_reader, run_firered_llm_adapter};
+use super::adapter_graph::FireRedLlmAdapterGraphRuntime;
 use super::decode_prompt::build_firered_llm_decode_prompt;
 use super::llm_transformer::FireRedLlmDecoderRuntime;
 use super::runtime_contract::{
@@ -277,25 +277,36 @@ impl FireRedLlmGgmlExecutor {
                 reason: error.to_string(),
             })?;
 
-        let adapter_weights = load_firered_llm_adapter_weights_from_reader(
-            &reader,
-            encoder_metadata.d_model,
-            adapter_metadata.downsample_rate,
-            adapter_metadata.llm_dim,
-        )
-        .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
-            reason: error.to_string(),
-        })?;
-        let (speech_rows, speech_frame_count) = run_firered_llm_adapter(
-            &adapter_weights,
-            &encoder_output.rows,
-            encoder_output.frame_count,
-            encoder_metadata.d_model,
-            adapter_metadata.downsample_rate,
-        )
-        .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
-            reason: error.to_string(),
-        })?;
+        let adapter_profile_started_at = std::time::Instant::now();
+        let mut adapter_runtime =
+            FireRedLlmAdapterGraphRuntime::new(runtime_path).map_err(|error| {
+                FireRedLlmExecutorError::AdapterGraphFailed {
+                    reason: error.to_string(),
+                }
+            })?;
+        let (speech_rows, speech_frame_count) = adapter_runtime
+            .run(
+                &encoder_output.rows,
+                encoder_output.frame_count,
+                encoder_metadata.d_model,
+                adapter_metadata.downsample_rate,
+                adapter_metadata.llm_dim,
+            )
+            .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
+                reason: error.to_string(),
+            })?;
+        // Opt-in perf diagnostic, same gate/shape as the decoder_backend line
+        // below (mirrors the qwen `OPENASR_HYMT2_PROFILE` precedent): the
+        // adapter stage regressed to 2868ms/18.4% of `execute` on the naive
+        // scalar-dequant host implementation this ggml graph replaced (see
+        // this module's doc comment), so it earns the same always-available
+        // (opt-in) timing visibility as the decoder backend choice.
+        if std::env::var_os("OPENASR_FIRERED_LLM_PROFILE").is_some() {
+            eprintln!(
+                "OPENASR_FIRERED_LLM_PROFILE stage=adapter ms={:.2}",
+                adapter_profile_started_at.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         let decode_prompt = build_firered_llm_decode_prompt(&tokenizer, speech_frame_count)
             .map_err(|error| FireRedLlmExecutorError::DecodePromptFailed {
