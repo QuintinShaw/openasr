@@ -1,0 +1,30 @@
+//! IBM Granite Speech 4.1 (`ibm-granite/granite-speech-4.1-2b`) model family.
+//!
+//! Architecture (verified against the HF `GraniteSpeechForConditionalGeneration`
+//! source and cross-checked against upstream llama.cpp's `granite-speech.cpp`
+//! ggml graph, since llama.cpp is a reference implementation only, not an
+//! OpenASR upstream):
+//!   16-layer Conformer CTC encoder (Shaw relative-position self-attention,
+//!   4-second block-local attention windows, GLU + depthwise-conv module,
+//!   self-conditioned CTC tap after layer 8) -> BLIP-2 Q-Former projector
+//!   (window_size=15, downsample_rate=5, 2 cross-attention layers) -> Granite
+//!   dense decoder-only LLM (GQA + RoPE + SwiGLU, with the four Granite scaling
+//!   scalars: attention/embedding/residual multipliers + logits scaling).
+//!
+//! This pass ships the encoder + projector numeric core only (validated by the
+//! `parity` dev harness against an HF `transformers` fp32 reference) and the
+//! safetensors -> `.oasr` converter for all three weight segments (encoder,
+//! projector, decoder). The decoder ggml graph, shared greedy-decode-driver
+//! registration, and end-to-end golden are a separate follow-up pass -- see
+//! `docs` note in `encoder_graph.rs` on the long-audio context-window bound.
+
+pub(crate) mod encoder_graph;
+pub mod package_import;
+pub(crate) mod qformer;
+
+#[cfg(test)]
+mod parity;
+
+/// Crate-internal model-family + architecture ids.
+pub(crate) const GRANITE_SPEECH_MODEL_FAMILY: &str = "granite-speech";
+pub(crate) const GRANITE_SPEECH_GGML_ARCHITECTURE_ID: &str = "granite-speech";
