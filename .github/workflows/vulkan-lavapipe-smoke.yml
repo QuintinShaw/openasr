@@ -87,6 +87,16 @@ jobs:
       - name: Run the Vulkan lavapipe attention-offset smoke test
         env:
           RUST_BACKTRACE: "1"
+          # ggml-vulkan's default device enumeration only auto-selects
+          # discrete/integrated GPUs and explicitly refuses to fall back to a
+          # CPU-type Vulkan device ("If only CPU devices are available,
+          # return without devices" in ggml-vulkan.cpp) -- and lavapipe
+          # reports VkPhysicalDeviceType::eCpu. GGML_VK_VISIBLE_DEVICES is
+          # ggml-vulkan's CUDA_VISIBLE_DEVICES-style override: when set, it
+          # takes the listed device indices as-is with no GPU-type filter,
+          # which is the only way to get ggml-vulkan to actually pick up
+          # lavapipe (device index 0 -- the sole ICD registered in this job).
+          GGML_VK_VISIBLE_DEVICES: "0"
         run: |
           cargo test -p openasr-core --features vulkan --lib \
             models::xasr_zipformer::encoder_graph::tests::xasr_attention_weighted_values_vulkan_head_offset_smoke \
