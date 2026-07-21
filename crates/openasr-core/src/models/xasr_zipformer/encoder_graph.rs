@@ -5696,7 +5696,8 @@ fn apply_linear_graph<'a>(
 mod tests {
     use super::*;
     use crate::ggml_runtime::{
-        GgmlCpuGraphConfig, GgmlCpuGraphRunner, GgufTensorDataReader, read_gguf_metadata,
+        GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphRunner, GgufTensorDataReader,
+        read_gguf_metadata,
     };
     use crate::models::xasr_zipformer::encoder_ops::{
         SWOOSH_L_OFFSET, SWOOSH_L_SHIFT, SWOOSH_R_OFFSET, SWOOSH_R_SHIFT, bias_norm_last_dim,
@@ -5820,6 +5821,100 @@ mod tests {
             .expect_err("shape mismatch must fail");
 
         assert!(error.to_string().contains("expected 2x80=160"));
+    }
+
+    /// Vulkan lavapipe smoke test for issues #153/#154/#155: the per-head
+    /// slice of `attention_weights` in `apply_attention_weighted_values_graph`
+    /// sits at a data-dependent byte offset
+    /// `head * frames * k_len * size_of::<f32>()`, which is not generally a
+    /// multiple of the Vulkan backend's `minStorageBufferOffsetAlignment`.
+    /// `ggml_vk_tensor_subbuffer` (ggml-vulkan.cpp) hard-`GGML_ASSERT`s that
+    /// offset is aligned unless the caller opts into `allow_misalign`, so an
+    /// unaligned view fed straight into `mul_mat` aborts the whole process on
+    /// real hardware (Intel Arc/iGPU, 64B alignment) -- and is reproducible on
+    /// Mesa's software `lavapipe` ICD too, whose reported alignment is 16B.
+    ///
+    /// Shape: 2 heads, `frames=3`, `left_context_len=2` => `k_len=5`, so
+    /// `frames*k_len=15` is odd. Head 1's byte offset into the base
+    /// `attention_weights` tensor is `15 * size_of::<f32>() = 60` bytes.
+    /// `60 % 16 == 12`, `60 % 32 == 28`, and `60 % 64 == 60` -- all nonzero,
+    /// so this offset is misaligned under every alignment granularity ggml-
+    /// vulkan is known to report (16B lavapipe, 32B/64B real GPUs), without
+    /// relying on the exact value of any single device's
+    /// `minStorageBufferOffsetAlignment`.
+    ///
+    /// This is a process-abort bug: before the `graph.cont(attn_head)` fix,
+    /// the GGML_ASSERT above kills the test process outright (not a
+    /// catchable Rust panic), so this step shows up as a hard CI failure
+    /// rather than a normal `assert_eq!` failure. Requires an accelerated
+    /// (Vulkan) ggml backend to actually exercise the Vulkan matmul path, so
+    /// it is `#[ignore]`d by default and run explicitly by the lavapipe
+    /// smoke CI job on a build with `--features vulkan`.
+    #[test]
+    #[ignore = "requires an accelerated Vulkan ggml backend; run explicitly via the lavapipe smoke CI job"]
+    fn xasr_attention_weighted_values_vulkan_head_offset_smoke() {
+        let shape = XasrAttentionWeightedValuesGraphShape {
+            frames: 3,
+            left_context_len: 2,
+            num_heads: 2,
+            value_dim: 4,
+        };
+        let k_len = shape.left_context_len + shape.frames;
+
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.backend = GgmlCpuGraphBackend::Gpu;
+        config.context_bytes = 16 * 1024 * 1024;
+        config.graph_size = 2_048;
+        let mut runner = GgmlCpuGraphRunner::new(config)
+            .expect("accelerated (Vulkan) ggml backend should initialize on the smoke runner");
+
+        let mut graph = runner.start_graph();
+        let values = graph
+            .new_tensor_2d_f32(shape.value_dim, k_len, "attn_smoke_values")
+            .expect("values tensor allocation should succeed");
+        let attention_weights = graph
+            .new_tensor_2d_f32(k_len, shape.frames * shape.num_heads, "attn_smoke_weights")
+            .expect("attention weights tensor allocation should succeed");
+        graph
+            .set_input(values)
+            .expect("set_input values should succeed");
+        graph
+            .set_input(attention_weights)
+            .expect("set_input attention weights should succeed");
+
+        let output =
+            apply_attention_weighted_values_graph(&graph, values, attention_weights, shape)
+                .expect("attention weighted values graph should build");
+        graph
+            .set_output(output)
+            .expect("set_output should succeed");
+
+        let values_data = vec![0.5_f32; shape.value_dim * k_len];
+        let attn_data = vec![0.1_f32; k_len * shape.frames * shape.num_heads];
+        graph
+            .set_f32_slice(values, &values_data, "attn_smoke_values")
+            .expect("values upload should succeed");
+        graph
+            .set_f32_slice(attention_weights, &attn_data, "attn_smoke_weights")
+            .expect("attention weights upload should succeed");
+
+        // Before the fix, this call aborts the process inside ggml-vulkan's
+        // GGML_ASSERT when it schedules head 1's misaligned view onto the
+        // Vulkan matmul path. Returning normally (with finite output values)
+        // is the smoke assertion -- the CI job's pass/fail signal is this
+        // test step's own exit code, since a GGML_ASSERT abort never reaches
+        // a catchable Result/panic.
+        let actual = graph
+            .compute_outputs_f32(&[(output, shape.value_dim * shape.frames)])
+            .expect("attention weighted values graph should compute on the Vulkan backend");
+
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].len(), shape.value_dim * shape.frames);
+        assert!(
+            actual[0].iter().all(|value| value.is_finite()),
+            "attention weighted values output must be finite: {:?}",
+            actual[0]
+        );
     }
 
     #[test]
