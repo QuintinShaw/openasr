@@ -5885,9 +5885,7 @@ mod tests {
         let output =
             apply_attention_weighted_values_graph(&graph, values, attention_weights, shape)
                 .expect("attention weighted values graph should build");
-        graph
-            .set_output(output)
-            .expect("set_output should succeed");
+        graph.set_output(output).expect("set_output should succeed");
 
         let values_data = vec![0.5_f32; shape.value_dim * k_len];
         let attn_data = vec![0.1_f32; k_len * shape.frames * shape.num_heads];
