@@ -4987,6 +4987,12 @@ fn apply_attention_weighted_values_graph<'a>(
             attn_head_stride,
             attn_offset,
         )?;
+        // Per-head slice of the attention weights sits at a data-dependent byte
+        // offset (head * frames * k_len * elt), which is generally not a multiple
+        // of a storage-buffer offset alignment. The Vulkan matmul path requires
+        // aligned source offsets, so materialize a contiguous copy before mul_mat
+        // to keep this graph backend-agnostic.
+        let attn_head = graph.cont(attn_head)?;
         let attended = graph.mul_mat(values_head, attn_head)?;
         head_outputs.push(graph.cont(attended)?);
     }
