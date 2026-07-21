@@ -16,6 +16,7 @@ use crate::ggml_runtime::GgmlCpuGraphBackend;
 
 use super::decoder_graph::{GraniteSpeechDecoderConfig, prefill_logits};
 use super::encoder_graph::{GraniteSpeechEncoderConfig, encode};
+use super::frontend::GraniteSpeechMelFrontend;
 use super::qformer::{GraniteSpeechProjectorConfig, project};
 
 const WEIGHTS_ROOT: &str =
@@ -382,5 +383,74 @@ fn granite_speech_decoder_prefill_parity() {
     assert!(
         m_logits < 5.0e-2,
         "logits max abs diff {m_logits:.3e} exceeds the 5e-2 parity bound"
+    );
+}
+
+/// Minimal PCM16LE mono WAV reader (44-byte canonical header), for the
+/// frontend parity sample only -- not a general-purpose loader (the crate's
+/// `audio::prepare`/`symphonia_decode` own that job for the real pipeline).
+fn load_wav_pcm16_mono_f32(path: &Path) -> Vec<f32> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    assert_eq!(&bytes[0..4], b"RIFF", "expected RIFF wav");
+    assert_eq!(&bytes[8..12], b"WAVE", "expected WAVE wav");
+    // Walk chunks to find "data" (canonical 44-byte header assumed absent
+    // any extra chunks, which is what ffmpeg's pcm_s16le writer emits).
+    let mut cursor = 12usize;
+    let mut data_offset = None;
+    let mut data_len = 0usize;
+    while cursor + 8 <= bytes.len() {
+        let chunk_id = &bytes[cursor..cursor + 4];
+        let chunk_len =
+            u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        if chunk_id == b"data" {
+            data_offset = Some(cursor + 8);
+            data_len = chunk_len;
+            break;
+        }
+        cursor += 8 + chunk_len + (chunk_len % 2);
+    }
+    let data_offset = data_offset.expect("wav data chunk");
+    bytes[data_offset..data_offset + data_len]
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as f32 / 32768.0)
+        .collect()
+}
+
+#[test]
+fn granite_speech_frontend_parity() {
+    let golden = golden_root();
+    let sample_path =
+        PathBuf::from("/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/samples/en_short.wav");
+    let golden_path = golden.join("en_short_input_features.npy");
+    if !sample_path.exists() || !golden_path.exists() {
+        eprintln!("skip: {sample_path:?} or {golden_path:?} not present");
+        return;
+    }
+
+    let samples = load_wav_pcm16_mono_f32(&sample_path);
+    let frontend = GraniteSpeechMelFrontend::new();
+    let (actual, frames) = frontend.extract(&samples).expect("extract");
+
+    let (golden_shape, golden_features) = load_npy_f32(&golden_path);
+    assert_eq!(
+        golden_shape.len(),
+        3,
+        "expected (1,T,160), got {golden_shape:?}"
+    );
+    assert_eq!(frames, golden_shape[1], "frame count mismatch");
+    assert_eq!(
+        actual.len(),
+        golden_features.len(),
+        "element count mismatch"
+    );
+
+    let (m, mean) = diff(&actual, &golden_features);
+    let rel = relative_max_diff(&actual, &golden_features);
+    println!("== Granite Speech mel frontend parity ==");
+    println!("frames {frames}: max {m:.3e}  mean {mean:.3e}  rel {rel:.3e}");
+
+    assert!(
+        m < 1.0e-2,
+        "input_features max abs diff {m:.3e} exceeds the 1e-2 parity bound"
     );
 }
