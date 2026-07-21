@@ -1914,6 +1914,87 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         })
     }
 
+    /// Single-token decode step that transparently prefers the persistent
+    /// reuse graph (`run_step_reused`) whenever the backend supports it
+    /// (`supports_graph_reuse`, GPU-only single-backend lane), falling back to
+    /// the plain per-token graph build (`run_step`) everywhere else --
+    /// byte-identical output either way. This is the one family-agnostic
+    /// entry point every LLM-decoder-stage family driving this executor
+    /// should call instead of `run_step` directly, so a new family gets the
+    /// Metal/GPU graph-reuse speedup for free without re-deriving the
+    /// reuse-eligibility branch itself.
+    pub(crate) fn run_step_auto(
+        &mut self,
+        hidden: &[f32],
+        cache_position: usize,
+        layer_caches: &[Qwen3AsrLayerKvCacheState],
+        rope_theta: f32,
+    ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
+        let reuse_max_positions = layer_caches
+            .first()
+            .map(Qwen3AsrLayerKvCacheState::max_positions)
+            .filter(|_| self.supports_graph_reuse());
+        if let Some(max_positions) = reuse_max_positions {
+            self.run_step_reused(
+                hidden,
+                cache_position,
+                layer_caches,
+                rope_theta,
+                max_positions,
+            )
+        } else {
+            self.run_step(hidden, cache_position, layer_caches, rope_theta)
+        }
+    }
+
+    /// Prompt prefill for families that keep the plain "whole prompt as one
+    /// `run_prefill` call" CPU path (no HIP/GPU chunk tuning) but still want
+    /// `run_step_auto`'s Metal/GPU decode-graph reuse: `run_step_auto` and
+    /// bulk `run_prefill` cannot be mixed for one utterance, because the
+    /// persistent resident-KV graph `run_step_auto` builds on its first call
+    /// is zero-initialized and only ever gets a prompt token's real K/V by
+    /// that token flowing through the SAME resident arena -- a prompt
+    /// prefilled instead through the bulk host-cache `run_prefill` never
+    /// touches that arena, so decode would resume attending over a KV
+    /// history that was never populated for the prompt span.
+    ///
+    /// This seeds the resident arena via `run_prefill_into_reused_batched`
+    /// (`n_seq=1`): ONE graph build plus ONE batched compute over the whole
+    /// prompt, exactly like bulk `run_prefill`'s own single-shot efficiency,
+    /// except its `set_rows` writes land in the persistent resident arena
+    /// instead of a growing/host-cache graph. An earlier version of this
+    /// method instead replayed the prompt token-by-token through
+    /// `run_step_auto`: correct, but serializing what is otherwise one wide
+    /// batched matmul into N narrow batch-1 matmuls (plus N Metal dispatches)
+    /// measured slower than bulk prefill outright on an M1 (151 tokens: 8.4s
+    /// bulk vs 14.6-19.0s serialized) -- a real loss, not merely "no gain",
+    /// so it was replaced with this batched seeding instead.
+    /// Returns `None` when the backend does not support graph reuse, so the
+    /// caller falls back to its own bulk `run_prefill` + host-cache KV write.
+    pub(crate) fn run_prefill_auto_last_hidden(
+        &mut self,
+        token_major_values: &[f32],
+        token_count: usize,
+        layer_caches: &[Qwen3AsrLayerKvCacheState],
+        rope_theta: f32,
+    ) -> Result<Option<Vec<f32>>, GgmlCpuGraphError> {
+        let Some(max_positions) = layer_caches
+            .first()
+            .map(Qwen3AsrLayerKvCacheState::max_positions)
+            .filter(|_| self.supports_graph_reuse())
+        else {
+            return Ok(None);
+        };
+        let step = self.run_prefill_into_reused_batched(
+            token_major_values,
+            token_count,
+            1,
+            max_positions,
+            rope_theta,
+        )?;
+        Ok(Some(step.hidden))
+    }
+
     pub(crate) fn run_step_top1(
         &mut self,
         hidden: &[f32],

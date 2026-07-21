@@ -345,7 +345,16 @@ impl FireRedLlmGgmlExecutor {
             reason: error.to_string(),
         })?;
 
-        let layer_kv_caches = decoder.new_kv_caches();
+        // Request-sized, not the decoder's native 32768-token context: see
+        // `FireRedLlmDecoderRuntime::new_kv_caches`'s doc comment for why the
+        // fixed reuse-graph span this sizes must stay tight to what this
+        // utterance actually needs.
+        let layer_kv_caches = decoder.new_kv_caches(
+            decode_prompt
+                .token_ids
+                .len()
+                .saturating_add(FIRERED_LLM_MAX_GENERATED_TOKENS),
+        );
         let mut step_executor = FireRedLlmGreedyStepExecutor {
             decoder: &mut decoder,
             layer_kv_caches,

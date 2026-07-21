@@ -1289,34 +1289,17 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
         } else {
             None
         };
-        // Reuse the built decode graph across tokens only on the direct single-GPU
-        // lane (`is_gpu_class && !scheduler`). CPU compute and multi-backend
-        // scheduler paths rebuild the growing-KV graph each token because their
-        // in-place-KV reuse path is not byte-identical.
-        let reuse_max_positions = self
-            .layer_kv_caches
-            .first()
-            .map(|cache| cache.max_positions())
-            .filter(|_| self.whole_decoder.supports_graph_reuse());
-        let step = if let Some(max_positions) = reuse_max_positions {
-            self.whole_decoder
-                .run_step_reused(
-                    &hidden,
-                    cache_position,
-                    &self.layer_kv_caches,
-                    1_000_000.0,
-                    max_positions,
-                )
-                .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                    reason: error.to_string(),
-                })?
-        } else {
-            self.whole_decoder
-                .run_step(&hidden, cache_position, &self.layer_kv_caches, 1_000_000.0)
-                .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                    reason: error.to_string(),
-                })?
-        };
+        // `run_step_auto` reuses the built decode graph across tokens only on
+        // the direct single-GPU lane (`is_gpu_class && !scheduler`). CPU
+        // compute and multi-backend scheduler paths rebuild the growing-KV
+        // graph each token because their in-place-KV reuse path is not
+        // byte-identical -- see `supports_graph_reuse`'s doc comment.
+        let step = self
+            .whole_decoder
+            .run_step_auto(&hidden, cache_position, &self.layer_kv_caches, 1_000_000.0)
+            .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                reason: error.to_string(),
+            })?;
         for (layer_index, (projected_k, projected_v)) in step.layer_kv.iter().enumerate() {
             self.layer_kv_caches[layer_index]
                 .write(cache_position, projected_k, projected_v)
