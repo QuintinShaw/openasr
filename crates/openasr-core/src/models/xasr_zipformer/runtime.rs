@@ -315,6 +315,30 @@ impl XasrZipformerPreparedRuntime {
         XasrChunkedDecodeState::new(self.decoder.initial_context())
     }
 
+    /// Feature-frame count the very first streaming chunk needs before
+    /// [`Self::decode_available_chunks`] will process it (`first_chunk` skips
+    /// the steady-state `remaining <= WARMUP_FRAMES` early-out, but still
+    /// requires the full `chunk_hop + WARMUP_FRAMES` window for a non-final
+    /// push). Exposed so a driver can size a streaming warm-up's silence
+    /// buffer to clear this threshold without duplicating the arithmetic
+    /// here.
+    pub(super) fn first_chunk_input_frames(&self) -> Result<usize, String> {
+        self.metadata
+            .decode_chunk_len
+            .checked_add(XASR_ZIPFORMER_STREAMING_WARMUP_FRAMES)
+            .ok_or_else(|| "xasr chunk frame count overflows".to_string())
+    }
+
+    /// Test-only: whether the full-encoder GGML runner (the lazily built,
+    /// process-lifetime resident graph -- see `encoder_graph_runner_init` in
+    /// `encoder_graph.rs`) has already been initialized. Lets a warm-up test
+    /// assert the expensive first-encode cost already happened, instead of
+    /// scraping `OPENASR_XASR_PROFILE` log lines.
+    #[cfg(test)]
+    pub(super) fn encoder_runner_is_initialized(&self) -> bool {
+        self.encoder.full_encoder_runner_is_initialized()
+    }
+
     pub(super) fn decode_available_chunks(
         &mut self,
         state: &mut XasrChunkedDecodeState,

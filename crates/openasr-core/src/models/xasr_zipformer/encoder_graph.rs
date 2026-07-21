@@ -199,6 +199,14 @@ impl std::fmt::Debug for XasrZipformerEncoderGraph {
 }
 
 impl XasrZipformerEncoderGraph {
+    /// Test-only: whether the full-encoder GGML runner (populated once by
+    /// `encode_from_embed_rows_ggml_full_reused`'s `encoder_graph_runner_init`
+    /// stage, see below) has already been built.
+    #[cfg(test)]
+    pub(super) fn full_encoder_runner_is_initialized(&self) -> bool {
+        self.ggml_runner.borrow().is_some()
+    }
+
     pub(crate) fn new_reference(
         metadata: XasrZipformerExecutionMetadata,
         weights: XasrEncoderWeights,

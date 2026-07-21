@@ -27,6 +27,16 @@ pub(crate) trait IncrementalAudioDecoder: Send {
     fn rebase_after_soft_split(&mut self) -> Result<(), GgmlAsrExecutionError> {
         Ok(())
     }
+
+    /// Runs whatever real decode work would otherwise land on the first
+    /// production chunk (paying its lazy graph/runner init up front), then
+    /// restores the decoder to the exact state [`Self::reset`] produces --
+    /// silence fed here must never bleed into the next real utterance. The
+    /// default no-op keeps decoders that have nothing to warm (stateless,
+    /// re-transcribe-per-window families) trivially correct.
+    fn warm_up(&mut self) -> Result<(), GgmlAsrExecutionError> {
+        Ok(())
+    }
 }
 
 pub(crate) struct FrameSyncStreamingTranscriptDriver<D>
@@ -184,6 +194,15 @@ where
         Ok(self.emit_accumulated(false).into_iter().collect())
     }
 
+    fn warm_up(&mut self) -> Result<(), GgmlAsrExecutionError> {
+        // Delegates straight to the decoder: warm-up never touches this
+        // driver's own transcript state (accumulated_text/timeline/revision
+        // counters), only `push_audio`/`finish_updates`/`reset_utterance` do.
+        // The decoder contract requires it leave itself exactly as `reset`
+        // would, so nothing here needs cleanup either.
+        self.decoder.warm_up()
+    }
+
     fn reset_utterance(&mut self) -> Result<(), GgmlAsrExecutionError> {
         self.reset_current_utterance();
         Ok(())
@@ -239,6 +258,7 @@ mod tests {
         finish_delta: &'static str,
         reset_count: usize,
         rebase_count: usize,
+        warm_up_count: usize,
     }
 
     impl ScriptDecoder {
@@ -251,6 +271,7 @@ mod tests {
                 finish_delta,
                 reset_count: 0,
                 rebase_count: 0,
+                warm_up_count: 0,
             }
         }
     }
@@ -263,6 +284,11 @@ mod tests {
 
         fn finish(&mut self) -> Result<String, GgmlAsrExecutionError> {
             Ok(self.finish_delta.to_string())
+        }
+
+        fn warm_up(&mut self) -> Result<(), GgmlAsrExecutionError> {
+            self.warm_up_count += 1;
+            Ok(())
         }
 
         fn reset(&mut self) {
@@ -386,5 +412,35 @@ mod tests {
         assert_eq!(second_update.revision, 11);
         assert_eq!(second_update.utterance_id.0, "utt_script_000002");
         assert_eq!(second_update.segment_id.0, "seg_script_000002");
+    }
+
+    #[test]
+    fn warm_up_delegates_to_the_decoder_without_touching_driver_state() {
+        let decoder = ScriptDecoder::new(["hel", "lo"], "!");
+        let mut driver = FrameSyncStreamingTranscriptDriver::new(
+            "script-frame-sync",
+            "script-adapter",
+            "utt_script",
+            "seg_script",
+            1,
+            decoder,
+        );
+
+        driver.warm_up().unwrap();
+        driver.warm_up().unwrap();
+        assert_eq!(driver.decoder.warm_up_count, 2);
+        // Warm-up must not have advanced revision/utterance/segment identity
+        // or accumulated any text -- the first real push must behave exactly
+        // as if warm_up had never been called.
+        assert_eq!(driver.next_revision, 1);
+        assert_eq!(driver.utterance_id, "utt_script");
+        assert_eq!(driver.segment_id, "seg_script");
+        assert!(driver.accumulated_text.is_empty());
+
+        let first = driver.push_audio(frame(1, 0)).unwrap();
+        let first_update = update_text(&first[0]);
+        assert_eq!(first_update.text, "hel");
+        assert_eq!(first_update.revision, 1);
+        assert_eq!(first_update.utterance_id.0, "utt_script");
     }
 }

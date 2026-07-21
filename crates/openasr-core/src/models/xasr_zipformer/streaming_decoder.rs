@@ -4,7 +4,8 @@ use crate::models::graph_runtime_config::install_request_inference_threads_overr
 
 use super::frontend::{
     XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES, XASR_N_MELS, XasrFbankFeatures, XasrFbankFrontend,
-    clean_frame_count_for_samples, earliest_sample_needed_for_frame, total_frame_count_for_samples,
+    clean_frame_count_for_samples, earliest_sample_needed_for_frame,
+    samples_needed_for_clean_frame_count, total_frame_count_for_samples,
 };
 use super::runtime::{PooledRuntime, XasrChunkedDecodeState};
 use super::tokenizer::XasrStreamingDetokenizer;
@@ -219,6 +220,37 @@ impl IncrementalAudioDecoder for XasrIncrementalDecoder {
         self.rebase_decode_baseline();
         Ok(())
     }
+
+    /// Runs one real encoder chunk over silence so the lazily built GGML
+    /// runner/weight-arena residency (`encoder_graph_runner_init`, ~300ms on
+    /// CPU/Metal alike) lands here instead of on the first real audio a user
+    /// speaks. Feeds exactly the first-chunk threshold
+    /// (`first_chunk_input_frames`, 61 clean fbank frames = 9880 samples for
+    /// the shipped decode_chunk_len=48 pack) through the same
+    /// `accept_samples` -> `process_available_chunks` path real audio takes,
+    /// so the warmed shape (frames/dim/valid_left_context) exactly matches
+    /// what the real first chunk will request -- `full_encoder_reuse` then
+    /// hits its cached session instead of rebuilding it too.
+    ///
+    /// `self.reset()` afterwards is the exact same reset `reset_utterance`
+    /// uses in production (VAD segment restarts): it clears every field this
+    /// warm-up touched (audio/features/detokenizer/decoded_tokens) and
+    /// rebuilds `decode_state` via `runtime.new_decode_state()`, so the
+    /// silence never leaks into the accumulated text, cache, or timestamps of
+    /// the session's first real utterance. It deliberately does NOT touch
+    /// `self.runtime`'s lazily initialized GGML runners/weight arenas --
+    /// those are process/runtime-lifetime residency, not per-utterance state,
+    /// and staying warm across the reset is the entire point.
+    fn warm_up(&mut self) -> Result<(), GgmlAsrExecutionError> {
+        let target_frames = self
+            .runtime
+            .first_chunk_input_frames()
+            .map_err(|error| self.failed(error))?;
+        let silence = vec![0.0f32; samples_needed_for_clean_frame_count(target_frames)];
+        self.accept_samples(&silence)?;
+        self.reset();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +398,144 @@ mod tests {
             "feature prefix was not drained: dropped={} resident={}",
             decoder.dropped_frames,
             decoder.features.n_frames
+        );
+    }
+
+    fn xasr_streaming_request() -> GgmlAsrStreamingSessionRequest {
+        GgmlAsrStreamingSessionRequest {
+            runtime_source_path: std::path::PathBuf::new(),
+            runtime_source_preflight: None,
+            selected_family: crate::xasr_zipformer_runtime_descriptor_v1(),
+            request_options: crate::GgmlAsrExecutionOptions::default(),
+            configured_diarize: false,
+            backend_preference: crate::GgmlAsrBackendPreference::CpuOnly,
+            session_context: crate::NativeAsrSessionContext::new("rt_xasr_streaming_warmup"),
+            session_config: crate::NativeAsrStreamingSessionConfig::new()
+                .with_partial_results(true)
+                .into(),
+        }
+    }
+
+    #[test]
+    #[ignore = "host-local: requires the X-ASR q8_0 pack under tmp/xasr-test/out"]
+    fn warm_up_initializes_the_encoder_runner_and_resets_decoder_state() {
+        let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/xasr-test/out/xasr-zh-en-onnx-q8_0.oasr");
+        if !pack.exists() {
+            eprintln!("skipping: xasr q8_0 pack absent at {}", pack.display());
+            return;
+        }
+        let mut request = xasr_streaming_request();
+        request.runtime_source_path = pack;
+        let runtime =
+            super::super::runtime::checkout_prepared_runtime(&request.runtime_source_path)
+                .expect("streaming runtime");
+        let mut decoder = XasrIncrementalDecoder::new(
+            &request,
+            crate::arch::XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID,
+            crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
+            runtime,
+        );
+
+        assert!(
+            !decoder.runtime.encoder_runner_is_initialized(),
+            "runner must be cold before warm_up"
+        );
+        let started = std::time::Instant::now();
+        decoder
+            .warm_up()
+            .expect("warm up should decode a real chunk");
+        let warm_up_elapsed = started.elapsed();
+        eprintln!("xasr streaming warm_up elapsed={warm_up_elapsed:?}");
+
+        // The expensive lazy runner/weight-arena init must have already
+        // happened -- the first real accept_samples call therefore cannot
+        // pay it again.
+        assert!(
+            decoder.runtime.encoder_runner_is_initialized(),
+            "warm_up must force the encoder_graph_runner_init lazy init"
+        );
+        // Warm-up's silence must not leak: every field `reset` clears must be
+        // back to exactly its fresh-decoder value.
+        assert!(decoder.audio.is_empty(), "audio buffer must be empty");
+        assert_eq!(decoder.dropped_samples, 0);
+        assert_eq!(decoder.features.n_frames, 0, "feature cache must be empty");
+        assert_eq!(decoder.dropped_frames, 0);
+        assert_eq!(decoder.decoded_tokens, 0);
+        assert!(
+            decoder.detokenizer.text().is_empty(),
+            "detokenizer state must be empty"
+        );
+
+        // A second warm_up must be a cheap no-op relative to the first (the
+        // runner stays resident): generous bound just guards against a
+        // regression that silently re-pays the init.
+        let second_started = std::time::Instant::now();
+        decoder
+            .warm_up()
+            .expect("second warm up should also succeed");
+        let second_elapsed = second_started.elapsed();
+        eprintln!("xasr streaming second warm_up elapsed={second_elapsed:?}");
+        assert!(
+            second_elapsed < warm_up_elapsed,
+            "second warm_up ({second_elapsed:?}) should be faster than the cold first \
+             one ({warm_up_elapsed:?}) now that the runner is resident"
+        );
+    }
+
+    #[test]
+    #[ignore = "host-local: requires the X-ASR q8_0 pack under tmp/xasr-test/out"]
+    fn warm_up_does_not_change_subsequent_transcription_of_real_speech() {
+        let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/xasr-test/out/xasr-zh-en-onnx-q8_0.oasr");
+        if !pack.exists() {
+            eprintln!("skipping: xasr q8_0 pack absent at {}", pack.display());
+            return;
+        }
+        let wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/jfk.wav")
+            .canonicalize()
+            .expect("sample wav fixture path must exist");
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            wav,
+            "xasr streaming warm up parity test",
+            "xasr streaming warm up parity test",
+        )
+        .expect("sample wav should load");
+
+        let mut request = xasr_streaming_request();
+        request.runtime_source_path = pack;
+
+        let transcribe = |warm_up: bool| -> String {
+            let runtime =
+                super::super::runtime::checkout_prepared_runtime(&request.runtime_source_path)
+                    .expect("streaming runtime");
+            let mut decoder = XasrIncrementalDecoder::new(
+                &request,
+                crate::arch::XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID,
+                crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
+                runtime,
+            );
+            if warm_up {
+                decoder.warm_up().expect("warm up before real audio");
+            }
+            let mut text = String::new();
+            for chunk in samples.chunks(320) {
+                text.push_str(&decoder.accept_samples(chunk).expect("stream chunk"));
+            }
+            text.push_str(&decoder.finish().expect("stream finish"));
+            text
+        };
+
+        let without_warm_up = transcribe(false);
+        let with_warm_up = transcribe(true);
+
+        assert!(!without_warm_up.trim().is_empty());
+        // Golden: warm-up's silence must be fully invisible to the very next
+        // utterance -- byte-for-byte, not just "close enough".
+        assert_eq!(
+            with_warm_up, without_warm_up,
+            "warm_up must not change the transcript of the real audio that follows it"
         );
     }
 }

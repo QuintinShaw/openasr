@@ -255,6 +255,19 @@ pub(crate) fn clean_frame_count_for_samples(num_samples: usize) -> usize {
     }
 }
 
+/// Inverse of [`clean_frame_count_for_samples`]: the minimum sample count that
+/// makes `target_frames` clean (reflection-free) frames available. Used to
+/// size a streaming warm-up's silence buffer so it clears a family's first
+/// chunk threshold (`decode_chunk_len + streaming warm-up frames`) without
+/// hand-computing the frame-shift arithmetic at each call site.
+pub(crate) fn samples_needed_for_clean_frame_count(target_frames: usize) -> usize {
+    if target_frames == 0 {
+        return 0;
+    }
+    let right_edge_samples = FRAME_LENGTH - (FRAME_LENGTH / 2 - FRAME_SHIFT / 2);
+    right_edge_samples + (target_frames - 1) * FRAME_SHIFT
+}
+
 fn snip_edges_false_frame_count(num_samples: usize) -> usize {
     if num_samples == 0 {
         return 0;
@@ -303,6 +316,22 @@ mod tests {
         assert_eq!(clean_frame_count_for_samples(279), 0);
         assert_eq!(clean_frame_count_for_samples(280), 1);
         assert_eq!(clean_frame_count_for_samples(440), 2);
+    }
+
+    #[test]
+    fn samples_needed_for_clean_frame_count_round_trips() {
+        assert_eq!(samples_needed_for_clean_frame_count(0), 0);
+        for target_frames in [1, 2, 13, 48, 61, 100] {
+            let samples = samples_needed_for_clean_frame_count(target_frames);
+            assert_eq!(clean_frame_count_for_samples(samples), target_frames);
+            // The exact minimum: one sample fewer must fall short.
+            assert!(clean_frame_count_for_samples(samples - 1) < target_frames);
+        }
+        // The documented X-ASR first-chunk threshold (decode_chunk_len=48 +
+        // 13 streaming warm-up frames = 61 clean frames) is exactly 9880
+        // samples at 16 kHz -- the number the streaming warm-up feature
+        // relies on to size its silence buffer.
+        assert_eq!(samples_needed_for_clean_frame_count(61), 9_880);
     }
 
     #[test]
