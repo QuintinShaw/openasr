@@ -23,7 +23,6 @@ use thiserror::Error;
 
 use crate::NativeAsrError;
 use crate::api::backend::{Segment, Transcription};
-use crate::ggml_runtime::GgmlCpuGraphRunner;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
     run_builtin_seq2seq_decode_policy,
@@ -46,7 +45,7 @@ use crate::models::whisper::whisper_log_mel_spectrogram_16khz_mono_v0;
 use super::adaptor_graph::{load_moss_adaptor_weights_from_reader, run_moss_adaptor};
 use super::decode_prompt::build_moss_td_decode_prompt;
 use super::encoder_graph::{
-    MossEncoderConfig, load_moss_encoder_weights_from_reader, run_moss_encoder_chunk,
+    MossEncoderConfig, MossEncoderRuntime, load_moss_encoder_weights_from_reader,
 };
 use super::graph_config::moss_td_encoder_graph_config;
 use super::llm_decoder::MossTdDecoderRuntime;
@@ -253,12 +252,17 @@ impl MossTdGgmlExecutor {
         // Upstream `_compute_audio_token_length`'s stride: hop_length * the
         // Whisper conv stem's 2x stride * audio_merge_size.
         let token_stride = HOP_LENGTH * WHISPER_ENCODER_CONV_STRIDE * adaptor_metadata.merge_size;
-        let mut encoder_runner =
-            GgmlCpuGraphRunner::new(moss_td_encoder_graph_config()).map_err(|error| {
-                MossTdExecutorError::EncoderFailed {
-                    reason: format!("could not initialize encoder graph runner: {error}"),
-                }
-            })?;
+        // Built once and reused across every chunk in the loop below: the
+        // loaded-weight context mmaps the whole pack once, and the six 2D
+        // projection weights per layer bind zero-copy from it on every
+        // `encode()` call (see `encoder_graph`'s module doc).
+        let mut encoder_runtime = MossEncoderRuntime::new(
+            moss_td_encoder_graph_config(),
+            Some(preflight.runtime_source.path()),
+        )
+        .map_err(|error| MossTdExecutorError::EncoderFailed {
+            reason: format!("could not initialize encoder runtime: {error}"),
+        })?;
 
         let mut concatenated_rows: Vec<f32> = Vec::new();
         let mut total_frames = 0usize;
@@ -271,16 +275,16 @@ impl MossTdGgmlExecutor {
             .map_err(|error| MossTdExecutorError::FrontendFailed {
                 reason: error.to_string(),
             })?;
-            let encoder_out = run_moss_encoder_chunk(
-                &mut encoder_runner,
-                &encoder_weights,
-                encoder_config,
-                mel.data(),
-                MEL_TARGET_FRAMES,
-            )
-            .map_err(|error| MossTdExecutorError::EncoderFailed {
-                reason: error.to_string(),
-            })?;
+            let encoder_out = encoder_runtime
+                .encode(
+                    &encoder_weights,
+                    encoder_config,
+                    mel.data(),
+                    MEL_TARGET_FRAMES,
+                )
+                .map_err(|error| MossTdExecutorError::EncoderFailed {
+                    reason: error.to_string(),
+                })?;
             let token_length = (chunk.len() - 1) / token_stride.max(1) + 1;
             let keep_frames = (token_length * adaptor_metadata.merge_size)
                 .min(encoder_metadata.max_source_positions);
@@ -515,11 +519,18 @@ mod tests {
         PathBuf::from("/Volumes/QuintinDocument/openasr-dev/tmp/moss-td/samples").join(name)
     }
 
-    // Pinned to the real dev-pack CPU decode (fp16, backend forced to CPU
-    // below). Confirmed byte-for-byte equal to the HF fp32 reference stack's
-    // golden (`tmp/moss-td/golden/{jfk,en_zh_mixed}.json`'s `text`) -- the
-    // fp16-vs-fp32 numeric gap did not perturb the text OR the emitted time
-    // anchors for these clips (both matched to the hundredth of a second).
+    // Pinned to the real dev-pack CPU decode (backend forced to CPU below).
+    // The encoder binds its 2D projection weights zero-copy as native f16 and
+    // runs flash attention (see `encoder_graph`), so this decode path is f16
+    // weights + flash, NOT the f32-naive path -- do not assert flash == naive or
+    // f16 == f32 bit-for-bit. What IS asserted, matching the reference-platform
+    // golden policy: the transcript is text-level identical to the HF fp32
+    // reference (`tmp/moss-td/golden/*.json`'s `text`), including speaker labels,
+    // and every emitted time anchor is within 0.05s of it. In practice jfk and
+    // the 3-minute aishell clip come out byte-for-byte equal to the HF golden
+    // (time anchors included); en_zh_mixed matches the HF text exactly with two
+    // anchors shifted by 0.02s ([2.34]->[2.32], [4.94]->[4.96]), the f16+flash
+    // numeric delta.
     const GOLDEN_JFK_TEXT: &str = concat!(
         "[0.28][S01] And so, my fellow Americans,[2.32][3.22][S01] ask not what your ",
         "country can do for you,[7.71][8.12][S01] ask what you can do for your country.[10.59]",
@@ -527,11 +538,12 @@ mod tests {
 
     // Code-switch coverage: `en_zh_mixed.wav` mixes English then Mandarin in a
     // single utterance, exercising both tokenizer/decode paths plus a second
-    // speaker label (`[S02]`) in one prefill+decode. Byte-for-byte equal to the
-    // HF golden `en_zh_mixed.json`'s `text`.
+    // speaker label (`[S02]`) in one prefill+decode. Text identical to the HF
+    // golden `en_zh_mixed.json`'s `text`; two time anchors sit 0.02s off (see the
+    // pinning note above).
     const GOLDEN_EN_ZH_MIXED_TEXT: &str = concat!(
-        "[0.27][S01]And so, my fellow Americans,[2.34][3.21][S01]ask not.",
-        "[4.44][4.94][S02]今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去伊加新[12.88]",
+        "[0.27][S01]And so, my fellow Americans,[2.32][3.21][S01]ask not.",
+        "[4.44][4.96][S02]今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去伊加新[12.88]",
     );
 
     fn transcribe_with_dev_pack(wav_path: PathBuf) -> Option<(String, std::time::Duration, f32)> {

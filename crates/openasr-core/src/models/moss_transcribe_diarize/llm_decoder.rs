@@ -281,8 +281,12 @@ impl MossTdDecoderRuntime {
                 .map_err(|error| MossTdDecoderError::GraphFailed {
                     reason: error.to_string(),
                 })?;
-            final_hidden =
-                Some(self.write_prefill_outputs(position_offset, chunk_len, &step, layer_kv_caches)?);
+            final_hidden = Some(self.write_prefill_outputs(
+                position_offset,
+                chunk_len,
+                &step,
+                layer_kv_caches,
+            )?);
             position_offset = total_token_count;
         }
         final_hidden.ok_or(MossTdDecoderError::EmptyPrefillOutput)
