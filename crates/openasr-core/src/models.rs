@@ -34,6 +34,7 @@ pub(crate) mod local_source_import;
 pub(crate) mod lora_adapter;
 pub(crate) mod mimo_asr;
 pub mod moonshine;
+pub(crate) mod moss_transcribe_diarize;
 pub mod oasr_metadata;
 pub mod pack_quant;
 pub(crate) mod parakeet_ctc;
