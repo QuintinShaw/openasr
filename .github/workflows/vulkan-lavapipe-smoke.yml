@@ -1,0 +1,93 @@
+name: Vulkan lavapipe smoke
+
+# Throwaway smoke CI for the fix/vulkan-misalign investigation (issues
+# #153/#154/#155): builds openasr-core with --features vulkan and runs one
+# ignored, synthetic (weight-free) unit test on Mesa's lavapipe software
+# Vulkan ICD, to get an objective red-before/green-after signal for the
+# ggml_vk_tensor_subbuffer misalignment abort without needing real Vulkan
+# hardware.
+#
+# Deliberately NOT wired to any push/pull_request trigger on other branches
+# (this workflow only exists on test/vulkan-lavapipe). When the underlying
+# fix lands on main, prefer workflow_dispatch + a nightly cron over
+# re-running this on every push -- the lavapipe/Vulkan SDK install and full
+# ggml-vulkan build add several minutes per run that a Vulkan-specific
+# regression does not need on the common path.
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - test/vulkan-lavapipe
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vulkan-lavapipe-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lavapipe-smoke:
+    name: xasr attention-weighted-values Vulkan smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install Linux audio build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Install Linux Vulkan SDK + lavapipe software ICD
+        # Same recipe as the linux-x86_64-vulkan leg in release-binaries.yml:
+        # vulkan-sdk gives cmake's FindVulkan the loader/headers/glslc
+        # ggml-vulkan needs to build; mesa-vulkan-drivers ships Mesa's
+        # llvmpipe-backed "lavapipe" ICD, a CPU-emulated Vulkan device this
+        # GPU-less runner can actually enumerate and dispatch compute to.
+        run: |
+          set -euo pipefail
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          sudo apt-get install -y vulkan-sdk mesa-vulkan-drivers
+
+      - name: Point the Vulkan loader at lavapipe
+        # Mesa installs the lavapipe ICD manifest under
+        # /usr/share/vulkan/icd.d/; the loader would find it there anyway,
+        # but pin VK_ICD_FILENAMES explicitly so this job never silently
+        # picks up some other ICD (or none) and instead fails closed with a
+        # clear error if the manifest ever moves.
+        run: |
+          set -euo pipefail
+          icd="$(find /usr/share/vulkan/icd.d -iname 'lvp_icd*.json' | head -n1)"
+          if [ -z "$icd" ]; then
+            echo "no lavapipe ICD manifest found under /usr/share/vulkan/icd.d" >&2
+            find /usr/share/vulkan/icd.d -maxdepth 1 -type f >&2 || true
+            exit 1
+          fi
+          echo "found lavapipe ICD: $icd"
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+
+      - name: vulkaninfo summary (confirm lavapipe device is enumerable)
+        run: vulkaninfo --summary
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: vulkan-lavapipe-smoke
+
+      # Debug (not release) build: this job checks that the Vulkan matmul
+      # path runs without aborting, not its speed, so an optimized build
+      # would only add compile time for no signal gained.
+      - name: Build openasr-core test binary (vulkan feature)
+        run: cargo test -p openasr-core --features vulkan --lib --no-run
+
+      - name: Run the Vulkan lavapipe attention-offset smoke test
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo test -p openasr-core --features vulkan --lib \
+            models::xasr_zipformer::encoder_graph::tests::xasr_attention_weighted_values_vulkan_head_offset_smoke \
+            -- --exact --ignored --nocapture
