@@ -52,8 +52,8 @@ use super::graph_config::moss_td_encoder_graph_config;
 use super::llm_decoder::MossTdDecoderRuntime;
 use super::prompt_embedding::build_moss_td_prompt_embeddings_with_audio_splice;
 use super::runtime_contract::{
-    MOSS_TD_ADAPTOR_NORM_EPSILON, parse_adaptor_metadata, parse_decoder_metadata,
-    parse_encoder_metadata,
+    MOSS_TD_ADAPTOR_NORM_EPSILON, moss_td_kv_cache_positions, parse_adaptor_metadata,
+    parse_decoder_metadata, parse_encoder_metadata,
 };
 use super::tokenizer::MossTdTokenizer;
 
@@ -73,6 +73,11 @@ const HOP_LENGTH: usize = 160;
 /// `tmp/moss-td/golden/*.json`'s `max_new_tokens`). Only the fail-closed
 /// backstop against a runaway (non-terminating) decode.
 const MOSS_TD_MAX_GENERATED_TOKENS: usize = 4096;
+/// Audio tokens per second the adaptor emits (`audio_tokens_per_second` in
+/// `processing_moss_transcribe_diarize.py`, same value `decode_prompt`'s marker
+/// cadence uses). Only used to render the `AudioExceedsContext` limit as an
+/// approximate minutes figure; not part of any decode math.
+const AUDIO_TOKENS_PER_SECOND_FOR_LIMIT: f32 = 12.5;
 
 #[derive(Debug, Error)]
 enum MossTdExecutorError {
@@ -89,6 +94,16 @@ enum MossTdExecutorError {
     TokenizerBuildFailed { reason: String },
     #[error("moss-transcribe-diarize requires non-empty audio")]
     EmptyAudio,
+    #[error(
+        "moss-transcribe-diarize audio is too long: its {prompt_tokens}-token audio prompt \
+         needs at least one free position within the {kv_capacity}-position decoder context \
+         (about {max_minutes:.0} min of audio); split the input into shorter files"
+    )]
+    AudioExceedsContext {
+        prompt_tokens: usize,
+        kv_capacity: usize,
+        max_minutes: f32,
+    },
     #[error("moss-transcribe-diarize mel frontend failed: {reason}")]
     FrontendFailed { reason: String },
     #[error("moss-transcribe-diarize encoder failed: {reason}")]
@@ -298,6 +313,26 @@ impl MossTdGgmlExecutor {
                     reason: error.to_string(),
                 }
             })?;
+
+        // Fail closed up front when the whole-audio prompt cannot fit the
+        // decoder's KV context. This family ingests the full audio in one
+        // decode (native longform slicing is disabled for it, see the
+        // decode-policy `SelfChunkingExecutorV1`), so a very long file grows
+        // the prompt until it exceeds the KV-cache capacity. `kv_capacity`
+        // positions (~one every 12.5 audio tokens/sec plus the fixed template
+        // and generated tokens) works out to roughly 7-10 minutes of audio;
+        // beyond that, fail with a clear message instead of a cryptic mid-
+        // decode KV-bounds error (or worse, silent truncation).
+        let kv_capacity = moss_td_kv_cache_positions(decoder_metadata.max_positions);
+        if decode_prompt.token_ids.len() >= kv_capacity {
+            let max_minutes =
+                (kv_capacity as f32 / AUDIO_TOKENS_PER_SECOND_FOR_LIMIT / 60.0).max(0.0);
+            return Err(MossTdExecutorError::AudioExceedsContext {
+                prompt_tokens: decode_prompt.token_ids.len(),
+                kv_capacity,
+                max_minutes,
+            });
+        }
 
         let runtime_path = preflight.runtime_source.path();
         let mut decoder =

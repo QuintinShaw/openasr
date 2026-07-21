@@ -23,6 +23,17 @@ pub(crate) enum BuiltinDecodePolicyLongformPromptCarryMode {
 pub(crate) enum BuiltinDecodePolicyLongformProfile {
     Default,
     ConservativeSeq2SeqV1,
+    /// The family's dedicated executor ingests the FULL audio in a single
+    /// decode (it does its own internal 30s-window encoder chunking and folds
+    /// every chunk into ONE prompt with globally continuous time anchors --
+    /// see `moss_transcribe_diarize::executor`). The shared native longform
+    /// slicer must NOT run for such a family: slicing the audio into VAD
+    /// windows and decoding each independently would restart the model's time
+    /// anchors at zero per window (chunk-aligned timestamp resets) and defeat
+    /// the whole-audio design. `resolve_native_longform_policy_for_backend`
+    /// forces `LongFormMode::Off` for this profile, even for an explicit
+    /// longform request, because the executor never consults longform options.
+    SelfChunkingExecutorV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,20 +275,18 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
-        // This family's executor already folds arbitrarily long audio into
-        // ONE prompt/decode (chunked encoder concatenation, see
-        // `executor.rs`), so it never runs multiple ChatML-turn "chunks" the
-        // way firered-llm/mimo-asr's 30-40s hard caps do, and its encoder is
-        // `FixedWindow` (Whisper-Medium), not one of the small-context plain
-        // `<sos>`-prompted AED decoders `ConservativeSeq2SeqV1` guards
-        // against repeating on long pause-free audio -- same shape as
-        // `whisper` itself, which also pairs `FixedWindow` with `Default`
-        // (see that entry above). `ConservativeSeq2SeqV1` would additionally
-        // clamp the shared native longform slicer's chunk length even though
-        // this family's dedicated executor never consults it, so `Default`
-        // is the honest choice, not just an equivalent one.
+        // This family's executor folds arbitrarily long audio into ONE
+        // prompt/decode (chunked encoder concatenation with globally
+        // continuous time anchors, see `executor.rs`), so the shared native
+        // longform slicer must NOT run: slicing into VAD windows and decoding
+        // each independently restarts the time anchors at zero per window
+        // (chunk-aligned timestamp resets). `SelfChunkingExecutorV1` forces
+        // `LongFormMode::Off` so the full audio reaches the executor in a
+        // single decode. (This differs from `whisper`, whose 30s executor
+        // genuinely needs the native slicer for long audio, and from
+        // firered-llm/mimo-asr, whose executors cap at 30-40s per ChatML turn.)
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
-        longform_profile: BuiltinDecodePolicyLongformProfile::Default,
+        longform_profile: BuiltinDecodePolicyLongformProfile::SelfChunkingExecutorV1,
         ctc_blank_token_id: None,
     },
     BuiltinDecodePolicyComponentDescriptor {

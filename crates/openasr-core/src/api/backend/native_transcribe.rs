@@ -1439,6 +1439,19 @@ fn resolve_native_longform_policy_for_backend(
         }
     };
     let mut provenance = Vec::new();
+    // A self-chunking family (its dedicated executor ingests the full audio in
+    // one decode with globally continuous time anchors) must never be sliced by
+    // the native longform slicer -- per-window decoding would restart its time
+    // anchors at zero. Force Off even for an explicit longform request, since
+    // the executor never consults longform options.
+    if architecture_executor_consumes_full_audio(model_architecture)
+        && !matches!(options.mode, LongFormMode::Off)
+    {
+        provenance.push(format!(
+            "native longform disabled: '{model_architecture}' executor consumes the full audio in one decode"
+        ));
+        options.mode = LongFormMode::Off;
+    }
     if !matches!(options.mode, LongFormMode::Off) {
         apply_longform_safety_policy(model_architecture, &mut options, &mut provenance);
     }
@@ -1446,6 +1459,19 @@ fn resolve_native_longform_policy_for_backend(
         options,
         provenance,
     }
+}
+
+/// True when the architecture's dedicated executor ingests arbitrarily long
+/// audio in a single decode (its own internal window chunking), so the shared
+/// native longform slicer must stay off. Driven by the decode-policy descriptor
+/// (`BuiltinDecodePolicyLongformProfile::SelfChunkingExecutorV1`) so the fact
+/// lives with the family's other decode semantics, not as a magic string here.
+fn architecture_executor_consumes_full_audio(model_architecture: &str) -> bool {
+    resolve_builtin_decode_policy_for_architecture(model_architecture)
+        .map(|policy| {
+            policy.longform_profile == BuiltinDecodePolicyLongformProfile::SelfChunkingExecutorV1
+        })
+        .unwrap_or(false)
 }
 
 /// Applies every family-specific longform safety cap for `model_architecture`.
@@ -2583,6 +2609,32 @@ mod tests {
         let resolution =
             resolve_native_longform_policy_for_backend(None, 120.0, "", GgmlCpuGraphBackend::Cpu);
         assert_eq!(resolution.options.mode, LongFormMode::Auto);
+    }
+
+    #[test]
+    fn self_chunking_family_forces_longform_off_even_for_long_audio() {
+        // moss-transcribe-diarize ingests the full audio in one decode
+        // (`SelfChunkingExecutorV1`); the native slicer must stay off so its
+        // global time anchors are not restarted per VAD window.
+        let implicit = resolve_native_longform_policy_for_backend(
+            None,
+            180.0,
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(implicit.options.mode, LongFormMode::Off);
+        // Even an explicit longform request is overridden (the executor never
+        // consults longform options).
+        let explicit = resolve_native_longform_policy_for_backend(
+            Some(&crate::LongFormOptions {
+                mode: LongFormMode::Energy,
+                ..crate::LongFormOptions::default()
+            }),
+            180.0,
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(explicit.options.mode, LongFormMode::Off);
     }
 
     #[test]
