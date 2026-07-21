@@ -308,26 +308,8 @@ mod tests {
         );
     }
 
-    /// Full audio-to-text pipeline: frontend -> encoder -> Q-Former projector
-    /// -> audio-splice prompt assembly -> greedy decode through the shared
-    /// driver -> BPE text decode. Compares the final transcribed text against
-    /// the official llama.cpp reference (see the granite-speech integration
-    /// notes: en_short.wav -> "the quick brown fox jumps over the lazy dog
-    /// near the old bridge"). `#[ignore]`: needs the local 4.6GB checkpoint.
-    #[test]
-    #[ignore = "requires local 4.6GB granite-speech-4.1-2b weights under tmp/ (not committed)"]
-    fn granite_speech_end_to_end_transcribes_en_short() {
-        let source_root = PathBuf::from(SOURCE_ROOT);
-        if !source_root.join("model.safetensors.index.json").exists() {
-            eprintln!("skip: {SOURCE_ROOT} not present");
-            return;
-        }
-
-        let wav_path = PathBuf::from(
-            "/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/samples/en_short.wav",
-        );
-        let wav_bytes = std::fs::read(&wav_path).expect("read en_short.wav");
-        // Minimal PCM16LE mono WAV reader (same convention as parity.rs's).
+    fn load_wav_pcm16_mono_f32(path: &Path) -> Vec<f32> {
+        let wav_bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
         let mut cursor = 12usize;
         let mut data_offset = None;
         let mut data_len = 0usize;
@@ -343,15 +325,29 @@ mod tests {
             cursor += 8 + chunk_len + (chunk_len % 2);
         }
         let data_offset = data_offset.expect("wav data chunk");
-        let samples: Vec<f32> = wav_bytes[data_offset..data_offset + data_len]
+        wav_bytes[data_offset..data_offset + data_len]
             .chunks_exact(2)
             .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as f32 / 32768.0)
-            .collect();
+            .collect()
+    }
+
+    /// Full audio-to-text pipeline: frontend -> encoder -> Q-Former projector
+    /// -> audio-splice prompt assembly -> greedy decode through the shared
+    /// driver -> BPE text decode. `question` is the ASR instruction text
+    /// (optionally with a `Keywords: ...` suffix for KWB, matching the HF
+    /// model card's documented prompt format).
+    fn transcribe_wav(
+        source_root: &Path,
+        wav_path: &Path,
+        question: &str,
+        max_generated_tokens: usize,
+    ) -> String {
+        let samples = load_wav_pcm16_mono_f32(wav_path);
 
         let frontend = super::super::frontend::GraniteSpeechMelFrontend::new();
         let (features, frames) = frontend.extract(&samples).expect("frontend");
 
-        let encoder_weights = load_safetensors_prefixed(&source_root, "encoder.");
+        let encoder_weights = load_safetensors_prefixed(source_root, "encoder.");
         let encoder_config =
             super::super::encoder_graph::GraniteSpeechEncoderConfig::granite_speech_4_1_2b();
         let encoder_output = super::super::encoder_graph::encode(
@@ -364,7 +360,7 @@ mod tests {
         )
         .expect("encode");
 
-        let projector_weights = load_safetensors_prefixed(&source_root, "projector.");
+        let projector_weights = load_safetensors_prefixed(source_root, "projector.");
         let projector_config =
             super::super::qformer::GraniteSpeechProjectorConfig::granite_speech_4_1_2b();
         let projector_output = super::super::qformer::project(
@@ -376,15 +372,15 @@ mod tests {
         )
         .expect("project");
 
-        let decoder_weights = load_safetensors_prefixed(&source_root, "language_model.");
+        let decoder_weights = load_safetensors_prefixed(source_root, "language_model.");
         let decoder_config = GraniteSpeechDecoderConfig::granite_speech_4_1_2b();
 
         let tokenizer =
-            super::super::tokenizer::GraniteSpeechTokenizer::from_source_files(&source_root)
+            super::super::tokenizer::GraniteSpeechTokenizer::from_source_files(source_root)
                 .expect("tokenizer");
 
         let prompt_text = format!(
-            "USER: {}can you transcribe the speech into a written format?\n ASSISTANT:",
+            "USER: {}{question}\n ASSISTANT:",
             super::super::prompt::GRANITE_SPEECH_AUDIO_TOKEN
         );
         let (prompt_token_ids, prompt_embeddings) =
@@ -404,7 +400,7 @@ mod tests {
             eot_token_id,
             stop_token_ids: vec![],
             vocab_size: decoder_config.vocab_size,
-            max_generated_tokens: 40,
+            max_generated_tokens,
             suppress_first_step_token_ids: vec![],
             suppress_token_ids: vec![],
             phrase_biases: vec![],
@@ -438,16 +434,107 @@ mod tests {
         )
         .expect("greedy decode");
 
+        result.text.trim().to_string()
+    }
+
+    /// Compares the final transcribed text against the official llama.cpp
+    /// reference (see the granite-speech integration notes): en_short.wav ->
+    /// "the quick brown fox jumps over the lazy dog near the old bridge".
+    /// `#[ignore]`: needs the local 4.6GB checkpoint.
+    #[test]
+    #[ignore = "requires local 4.6GB granite-speech-4.1-2b weights under tmp/ (not committed)"]
+    fn granite_speech_end_to_end_transcribes_en_short() {
+        let source_root = PathBuf::from(SOURCE_ROOT);
+        if !source_root.join("model.safetensors.index.json").exists() {
+            eprintln!("skip: {SOURCE_ROOT} not present");
+            return;
+        }
+        let wav_path = PathBuf::from(
+            "/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/samples/en_short.wav",
+        );
+        let text = transcribe_wav(
+            &source_root,
+            &wav_path,
+            "can you transcribe the speech into a written format?",
+            40,
+        );
         println!("== Granite Speech end-to-end (en_short.wav) ==");
-        println!("transcribed text: {:?}", result.text);
-        println!(
-            "expected (llama.cpp Q8 reference): \"the quick brown fox jumps over the lazy dog near the old bridge\""
+        println!("transcribed text: {text:?}");
+        assert_eq!(
+            text, "the quick brown fox jumps over the lazy dog near the old bridge",
+            "end-to-end transcription must match the llama.cpp Q8 reference text"
+        );
+    }
+
+    /// Japanese sample (kanji + katakana): ja_short.wav -> llama.cpp reference
+    /// "東京タワーの近くにあるカフェでコーヒーを飲みながら新聞を読みました"
+    /// (Q8 reference dropped the input's punctuation; text otherwise exact).
+    #[test]
+    #[ignore = "requires local 4.6GB granite-speech-4.1-2b weights under tmp/ (not committed)"]
+    fn granite_speech_end_to_end_transcribes_ja_short() {
+        let source_root = PathBuf::from(SOURCE_ROOT);
+        if !source_root.join("model.safetensors.index.json").exists() {
+            eprintln!("skip: {SOURCE_ROOT} not present");
+            return;
+        }
+        let wav_path = PathBuf::from(
+            "/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/samples/ja_short.wav",
+        );
+        let text = transcribe_wav(
+            &source_root,
+            &wav_path,
+            "can you transcribe the speech into a written format?",
+            60,
+        );
+        println!("== Granite Speech end-to-end (ja_short.wav) ==");
+        println!("transcribed text: {text:?}");
+        assert_eq!(
+            text, "東京タワーの近くにあるカフェでコーヒーを飲みながら新聞を読みました",
+            "end-to-end Japanese transcription must match the llama.cpp Q8 reference text"
+        );
+    }
+
+    /// Keyword-list-biasing (KWB) pair: kwb_test.wav, "Xiomara Okonkwo-Yeltsin"
+    /// / "Zylenthrax". Without the `Keywords:` prompt suffix the name garbles
+    /// (matches the llama.cpp reference exactly); with it, the name comes out
+    /// right -- reproducing the "add keywords -> name corrects" behavior the
+    /// coordinator asked to confirm.
+    #[test]
+    #[ignore = "requires local 4.6GB granite-speech-4.1-2b weights under tmp/ (not committed)"]
+    fn granite_speech_keyword_list_biasing_corrects_name() {
+        let source_root = PathBuf::from(SOURCE_ROOT);
+        if !source_root.join("model.safetensors.index.json").exists() {
+            eprintln!("skip: {SOURCE_ROOT} not present");
+            return;
+        }
+        let wav_path = PathBuf::from(
+            "/Volumes/QuintinDocument/openasr-dev/tmp/granite-work/samples/kwb_test.wav",
         );
 
+        let without_kwb = transcribe_wav(
+            &source_root,
+            &wav_path,
+            "transcribe the speech to text.",
+            40,
+        );
+        println!("== Granite Speech KWB pair (kwb_test.wav) ==");
+        println!("without Keywords: {without_kwb:?}");
         assert_eq!(
-            result.text.trim(),
-            "the quick brown fox jumps over the lazy dog near the old bridge",
-            "end-to-end transcription must match the llama.cpp Q8 reference text"
+            without_kwb,
+            "please schedule a meeting with ceo mara akonkwoyeltsin about the xylenthrax project",
+            "no-KWB baseline must match the llama.cpp Q8 reference text"
+        );
+
+        let with_kwb = transcribe_wav(
+            &source_root,
+            &wav_path,
+            "transcribe the speech to text. Keywords: Xiomara Okonkwo-Yeltsin, Zylenthrax",
+            40,
+        );
+        println!("with Keywords:    {with_kwb:?}");
+        assert!(
+            with_kwb.contains("xiomara okonkwo-yeltsin"),
+            "KWB prompt must correct the garbled name (got {with_kwb:?})"
         );
     }
 }
