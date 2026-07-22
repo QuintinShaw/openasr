@@ -51,7 +51,6 @@ PRE_AUDIT_FAMILIES = frozenset(
         "dolphin",
         "firered-aed",
         "firered-punc",
-        "firered2-llm",
         "hymt2",
         "mimo-asr",
         "moonshine",
