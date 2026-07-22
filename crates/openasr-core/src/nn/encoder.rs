@@ -1128,6 +1128,65 @@ mod tests {
     use super::*;
     use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphRunner};
 
+    /// Regression pin from the 2026-07-23 firered-aed v2 bisection
+    /// (`crates/openasr-core/src/models/firered_aed/encoder_graph.rs`
+    /// `parity_tests` doc, evidence chain step 2): this table was one of the
+    /// suspects for the v2 encoder residual (a relative-position-encoding
+    /// detail specific to the v2 checkpoint's `pe_maxlen`/window/sign
+    /// convention), ruled out by comparing the full 549x1280 table this
+    /// function produces (T=275) against the official
+    /// `RelPositionalEncoding(1280, max_len=5000).forward` for the same T --
+    /// max diff 3.0e-5 over 702,720 values, pure fp32 noise. Pinned here as
+    /// first-row (relative position T-1=274) / middle-row (relative position
+    /// 0) / last-row (relative position -(T-1)=-274) first-8 values so a
+    /// future regression in this shared helper doesn't silently reopen that
+    /// question for firered-aed (parakeet-ctc/cohere also depend on this
+    /// function, but only firered-aed's residual investigation needed this
+    /// exact pin).
+    #[test]
+    fn relative_positional_encoding_matches_python_reference_for_firered_aed_v2_shape() {
+        let values = build_relative_positional_encoding(1280, 275, || "overflow").unwrap();
+        assert_eq!(values.len(), 549 * 1280);
+
+        let row = |idx: usize| &values[idx * 1280..idx * 1280 + 8];
+        let first_row_expected = [
+            -0.629_911_4_f32,
+            -0.776_667,
+            -0.091_786_35,
+            0.995_778_74,
+            0.723_826_35,
+            -0.689_982_24,
+            -0.995_081_3,
+            0.099_061_38,
+        ];
+        let middle_row_expected = [0.0_f32, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+        let last_row_expected = [
+            0.629_911_4_f32,
+            -0.776_667,
+            0.091_786_35,
+            0.995_778_74,
+            -0.723_826_35,
+            -0.689_982_24,
+            0.995_081_3,
+            0.099_061_38,
+        ];
+
+        for (row_idx, expected) in [
+            (0_usize, first_row_expected),
+            (274, middle_row_expected),
+            (548, last_row_expected),
+        ] {
+            for (col, &expected_value) in expected.iter().enumerate() {
+                let actual = row(row_idx)[col];
+                let diff = (actual - expected_value).abs();
+                assert!(
+                    diff < 1e-4,
+                    "row {row_idx} col {col}: actual={actual} expected={expected_value} diff={diff}"
+                );
+            }
+        }
+    }
+
     // Mirrors the tiny fixed-size harness `nn/decoder.rs` uses for its shared
     // seq2seq block tests (HIDDEN=4, HEAD_DIM=2, HEADS=2): small enough to hand
     // -verify, big enough to actually exercise 2 attention heads.
