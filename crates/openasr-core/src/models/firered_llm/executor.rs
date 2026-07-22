@@ -486,6 +486,11 @@ impl FireRedLlmGgmlExecutor {
             |error: Seq2SeqGreedyDecodeError| error,
             map_registry_error,
         );
+        // Session/slice is done: release the CPU per-token grow-to-fit step
+        // buffer before the decoder goes back into the cross-chunk cache, so
+        // it stays scoped to this decode and never rides along as a
+        // process-resident allocation on the cached decoder.
+        decoder.release_session_scoped_buffers();
         // Return the resident decoder to the cache for the next chunk /
         // execute() regardless of decode outcome -- its weights + reuse graph
         // stay valid either way (mirrors qwen's `store_cached_whole_decoder`

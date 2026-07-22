@@ -23,6 +23,44 @@ pub(crate) struct GgmlTensorLayoutPrefix {
     pub nb: [usize; GGML_MAX_DIMS],
 }
 
+pub(crate) const GGML_MAX_SRC: usize = 10;
+pub(crate) const GGML_MAX_OP_PARAMS_I32: usize = 16;
+
+/// Mirrors `struct ggml_tensor` (ggml.h) far enough to reach the `view_src`
+/// and `data` fields the CPU step-buffer grow-to-fit reuse needs to inspect
+/// (see `bind_unallocated_context_tensors` in cpu_graph.rs), extending the
+/// `type_`/`buffer`/`ne`/`nb` prefix `GgmlTensorLayoutPrefix` already reads.
+/// `#[repr(C)]` with matching field types/order reproduces the C compiler's
+/// layout, so this must be kept in lockstep with the vendored ggml.h if the
+/// submodule pin ever changes tensor struct fields ahead of `data`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct GgmlTensorAllocPrefix {
+    pub type_: c_int,
+    pub buffer: *mut c_void,
+    pub ne: [i64; GGML_MAX_DIMS],
+    pub nb: [usize; GGML_MAX_DIMS],
+    pub op: c_int,
+    pub op_params: [i32; GGML_MAX_OP_PARAMS_I32],
+    pub flags: i32,
+    pub src: [*mut c_void; GGML_MAX_SRC],
+    pub view_src: *mut c_void,
+    pub view_offs: usize,
+    pub data: *mut c_void,
+}
+
+/// Mirrors `struct ggml_tallocr` (ggml-alloc.h), a stable public ggml struct
+/// (not an internal implementation detail) exposing the bump-allocator ggml
+/// itself uses to bind tensors into an already-allocated backend buffer.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct GgmlTallocr {
+    pub buffer: GgmlBackendBufferRaw,
+    pub base: *mut c_void,
+    pub alignment: usize,
+    pub offset: usize,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct GgufInitParams {
@@ -168,6 +206,28 @@ unsafe extern "C" {
         ctx: GgmlContextRaw,
         backend: GgmlBackendRaw,
     ) -> GgmlBackendBufferRaw;
+    // Read-only sizing query for the CPU step-buffer pool's grow-to-fit check:
+    // computes what `ggml_backend_alloc_ctx_tensors_from_buft` would allocate
+    // for `ctx`'s currently-unallocated tensors without allocating anything.
+    pub(crate) fn ggml_backend_alloc_ctx_tensors_from_buft_size(
+        ctx: GgmlContextRaw,
+        buft: GgmlBackendBufferTypeRaw,
+    ) -> usize;
+    pub(crate) fn ggml_backend_get_default_buffer_type(
+        backend: GgmlBackendRaw,
+    ) -> GgmlBackendBufferTypeRaw;
+    pub(crate) fn ggml_backend_buft_alloc_buffer(
+        buft: GgmlBackendBufferTypeRaw,
+        size: usize,
+    ) -> GgmlBackendBufferRaw;
+    pub(crate) fn ggml_backend_buffer_get_size(buffer: GgmlBackendBufferRaw) -> usize;
+    // Tensor allocator (ggml-alloc.h): binds tensors into an already-allocated
+    // buffer -- the primitive `ggml_backend_alloc_ctx_tensors` itself uses,
+    // exposed here to bind the CPU step pool's *reused* buffer without
+    // allocating a fresh one every step.
+    pub(crate) fn ggml_tallocr_new(buffer: GgmlBackendBufferRaw) -> GgmlTallocr;
+    pub(crate) fn ggml_tallocr_alloc(talloc: *mut GgmlTallocr, tensor: GgmlTensorRaw) -> c_int;
+    pub(crate) fn ggml_backend_view_init(tensor: GgmlTensorRaw) -> c_int;
     pub(crate) fn ggml_backend_get_device(backend: GgmlBackendRaw) -> GgmlBackendDevRaw;
 
     pub(crate) fn ggml_backend_dev_count() -> usize;

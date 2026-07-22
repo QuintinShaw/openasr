@@ -1677,6 +1677,18 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         self.layers.len()
     }
 
+    /// Releases the CPU per-token grow-to-fit step buffer this decoder's
+    /// runner accumulated over the just-finished decode session/slice (see
+    /// `GgmlCpuGraphRunner::release_cpu_step_buffer_pool`). Callers that cache
+    /// this executor across sessions (qwen's `store_cached_whole_decoder`,
+    /// mimo/firered2's decoder-runtime caches) MUST call this before storing
+    /// it back so the buffer stays session-scoped instead of riding along
+    /// with the cached decoder indefinitely. A no-op on Metal/GPU or when no
+    /// CPU step ever ran.
+    pub(crate) fn release_session_scoped_buffers(&mut self) {
+        self.runner.release_cpu_step_buffer_pool();
+    }
+
     /// `"<kind>:<ggml backend name>"`, for perf diagnostics (e.g. the
     /// `OPENASR_HYMT2_PROFILE` runtime-backend log line).
     pub(crate) fn backend_label(&self) -> String {

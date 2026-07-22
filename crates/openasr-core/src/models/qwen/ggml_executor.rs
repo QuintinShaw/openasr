@@ -591,6 +591,11 @@ impl Qwen3AsrGgmlExecutor {
             &decode_text_token_ids,
         );
         qwen_decode_profile_log_opt("greedy_decode_loop", greedy_decode_started_at);
+        // Session/slice is done: release the CPU per-token grow-to-fit step
+        // buffer before the decoder goes back into the cross-chunk cache, so
+        // it stays scoped to this decode and never rides along as a
+        // process-resident allocation on the cached decoder.
+        step_executor.whole_decoder.release_session_scoped_buffers();
         // Return the resident whole-decoder to the cache for the next chunk /
         // execute(); its weights + reuse graph stay valid regardless of outcome.
         let store_decoder_started_at = qwen_decode_profile_start();
@@ -1795,5 +1800,70 @@ mod tests {
             }
             other => panic!("unexpected error {other:?}"),
         }
+    }
+
+    /// Real-pack end-to-end AB harness for the qwen3-asr LLM decoder, mirroring
+    /// firered2-llm's `firered_llm_perf_ab`: drives the actual `execute()` path
+    /// (not a synthetic tiny fixture) against a real `.oasr` pack + wav clip so
+    /// a maintainer can confirm the CPU decode still produces the same
+    /// transcript across a change to the decode graph/buffer machinery. Never
+    /// asserts a timing number (host-dependent) -- prints RTF + text so two
+    /// runs (e.g. before/after a `cpu_graph.rs` change, same pack + same
+    /// backend) can be diffed by eye.
+    ///
+    /// Env: `OPENASR_QWEN3_AB_PACK=<path to .oasr>` (required -- no committed
+    /// dev pack), `OPENASR_QWEN3_AB_BACKEND=cpu|metal|auto` (default cpu, since
+    /// this exists to pin the CPU decode path), `OPENASR_QWEN3_AB_CLIP=<wav
+    /// path>` (default fixtures/jfk.wav).
+    #[test]
+    #[ignore = "real-pack AB harness: requires OPENASR_QWEN3_AB_PACK pointed at a real \
+                qwen3-asr .oasr (no dev pack committed); prints the decoded text + RTF for \
+                before/after comparison, does not assert a pinned golden"]
+    fn qwen3_asr_real_pack_ab() {
+        let Some(pack_path) = std::env::var_os("OPENASR_QWEN3_AB_PACK").map(PathBuf::from) else {
+            eprintln!("skipping: OPENASR_QWEN3_AB_PACK not set");
+            return;
+        };
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return;
+        }
+        let backend_preference = match std::env::var("OPENASR_QWEN3_AB_BACKEND").as_deref() {
+            Ok("metal") | Ok("gpu") => GgmlAsrBackendPreference::Accelerated,
+            Ok("auto") => GgmlAsrBackendPreference::Auto,
+            _ => GgmlAsrBackendPreference::CpuOnly,
+        };
+        let clip = std::env::var("OPENASR_QWEN3_AB_CLIP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav")
+            });
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            clip,
+            "qwen3-asr real-pack AB",
+            "qwen3-asr real-pack AB",
+        )
+        .expect("load wav fixture");
+        let audio_duration_seconds = samples.len() as f32 / 16_000.0;
+
+        let request = GgmlAsrExecutionRequest {
+            runtime_source_path: pack_path,
+            runtime_source_preflight: None,
+            selected_family: qwen3_asr_runtime_descriptor_v1(),
+            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            request_options: GgmlAsrExecutionOptions::default(),
+            backend_preference,
+        };
+
+        let executor = Qwen3AsrGgmlExecutor::default();
+        let started_at = std::time::Instant::now();
+        let result = executor.execute(&request).expect("qwen3-asr transcribe");
+        let elapsed = started_at.elapsed();
+        let rtf = elapsed.as_secs_f32() / audio_duration_seconds.max(0.001);
+        eprintln!(
+            "QWEN3_ASR_AB backend={backend_preference:?} audio={audio_duration_seconds:.2}s \
+             elapsed={elapsed:?} RTF={rtf:.3} text={}",
+            result.transcription.text
+        );
     }
 }

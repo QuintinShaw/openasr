@@ -904,6 +904,60 @@ pub struct GgmlCpuGraphRunner {
     _scheduler_accel_backends: Vec<GgmlBackendGuard>,
     _scheduler_cpu_fallback: Option<GgmlBackendGuard>,
     scheduler: Option<GgmlBackendSchedulerGuard>,
+    /// Grow-to-fit backend buffer reused across `start_graph()` calls for the
+    /// CPU, no-scheduler per-token decode path (see `GgmlCpuStepBufferPool`).
+    /// Session-scoped: callers that cache this runner across decode sessions
+    /// MUST call `release_cpu_step_buffer_pool` when a session/slice ends.
+    cpu_step_buffer_pool: GgmlCpuStepBufferPool,
+}
+
+/// Session-scoped grow-to-fit backend buffer for the CPU per-token decode
+/// step graph (`GgmlCpuGraphRunner::start_graph`, no scheduler).
+///
+/// Before this pool, every token allocated a brand-new `ggml_backend_buffer`
+/// sized to that step's (KV-history-dependent, monotonically growing) tensor
+/// footprint and freed it right after compute -- O(tokens) variable-size
+/// malloc/free churn that fragments the allocator and drives up process
+/// footprint over a long decode (measured +3.47GiB over a 5-minute firered2
+/// CPU decode). This pool instead keeps one buffer for the whole session and
+/// only grows it (by doubling) when a step needs more than it currently
+/// holds, cutting allocation count to O(log steps). Growing never needs to
+/// preserve old contents: this buffer only ever holds the *current* step's
+/// graph tensors (inputs/intermediates/outputs), which are fully consumed
+/// (uploaded from / read out to the caller) before the next step's
+/// `ggml_reset` wipes the context and rebuilds fresh tensors -- unlike a KV
+/// cache buffer, nothing here needs to survive a grow.
+///
+/// transcribe.cpp's `causal_lm.cpp` (`kv_init`/`kv_init_batched`, checked
+/// against transcribe.cpp@b6a6aca) reserves its KV-cache buffer ONCE, sized
+/// to the session's known max context, and never reallocates it -- a stronger
+/// guarantee than doubling growth, but one that only works there because a KV
+/// tensor's size is a closed-form function of known dims. This per-token
+/// COMPUTE buffer's size instead depends on the whole per-token graph's
+/// tensor layout, which is not knowable without either measuring it per step
+/// (what this pool does, via `ggml_backend_alloc_ctx_tensors_from_buft_size`)
+/// or building a synthetic worst-case-position probe graph purely to
+/// pre-reserve it -- judged too invasive to replicate safely across three
+/// families' graph-building code for this fix. Doubling growth is the
+/// general "shrink an unbounded per-step allocation count" shape transcribe.cpp's
+/// convention inspired here, adapted to a buffer that cannot be sized by a
+/// simple formula the way a KV cache can.
+///
+/// Must be released (`GgmlCpuGraphRunner::release_cpu_step_buffer_pool`) at
+/// session end -- the runner itself may be cached and reused across decode
+/// sessions/idle-unload, but this buffer must not become process-resident.
+struct GgmlCpuStepBufferPool {
+    buffer: Option<GgmlBackendBufferGuard>,
+    capacity_bytes: usize,
+}
+
+impl GgmlCpuStepBufferPool {
+    const fn new() -> Self {
+        Self {
+            buffer: None,
+            capacity_bytes: 0,
+        }
+    }
 }
 
 pub(crate) struct GgmlStaticTensorArena {
@@ -961,6 +1015,18 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     scheduler: Option<NonNull<c_void>>,
     graph_size: usize,
     buffer: Option<GgmlBackendBufferGuard>,
+    /// `Some` only for plain `start_graph()` builders on the CPU backend with
+    /// no scheduler -- the per-token rebuild path this pool targets. `None`
+    /// for persistent-graph-session builders (which already allocate once and
+    /// keep that single buffer for the session) and for scheduler-driven
+    /// backends (Metal/GPU), which already get grow-to-fit allocation from
+    /// the scheduler's own internal `ggml_gallocr`.
+    step_buffer_pool: Option<&'a mut GgmlCpuStepBufferPool>,
+    /// True once this builder has bound its tensors to backend memory (either
+    /// via `buffer` or via `step_buffer_pool`) -- no further tensor creation
+    /// is allowed past this point. Tracked separately from `buffer` because
+    /// the pool path binds tensors without populating `buffer`.
+    frozen: bool,
     prepared_graph: Option<NonNull<c_void>>,
     side_effect_roots: Vec<NonNull<c_void>>,
     _runner_borrow: PhantomData<&'a mut GgmlCpuGraphRunner>,
@@ -1064,6 +1130,7 @@ impl GgmlCpuGraphRunner {
             _scheduler_accel_backends: scheduler_accel_backends,
             _scheduler_cpu_fallback: scheduler_cpu_fallback,
             scheduler,
+            cpu_step_buffer_pool: GgmlCpuStepBufferPool::new(),
         })
     }
 
@@ -1092,17 +1159,39 @@ impl GgmlCpuGraphRunner {
 
     pub(crate) fn start_graph(&mut self) -> GgmlCpuGraphBuilder<'_> {
         unsafe { ffi::ggml_reset(self.context.raw.as_ptr()) };
+        let scheduler = self.scheduler.as_ref().map(|scheduler| scheduler.raw);
+        // Grow-to-fit CPU step buffer only applies to the plain per-token
+        // rebuild path (no scheduler); Metal/GPU already get the equivalent
+        // behavior from the scheduler's own `ggml_gallocr`.
+        let step_buffer_pool = (scheduler.is_none()
+            && matches!(self.backend_kind, GgmlCpuGraphBackend::Cpu))
+        .then_some(&mut self.cpu_step_buffer_pool);
         GgmlCpuGraphBuilder {
             context: self.context.raw,
             backend: self.backend.raw,
             backend_kind: self.backend_kind,
-            scheduler: self.scheduler.as_ref().map(|scheduler| scheduler.raw),
+            scheduler,
             graph_size: self.graph_size,
             buffer: None,
+            step_buffer_pool,
+            frozen: false,
             prepared_graph: None,
             side_effect_roots: Vec::new(),
             _runner_borrow: PhantomData,
         }
+    }
+
+    /// Releases the CPU per-token grow-to-fit step buffer at decode-session
+    /// end. Safe to call even when nothing was ever allocated (e.g. a Metal
+    /// or scheduler-backed runner, or a session that made no CPU `start_graph`
+    /// calls). Callers that cache/reuse this runner across sessions (e.g. the
+    /// qwen/mimo/firered2 whole-decoder caches keyed in their `ggml_executor`
+    /// modules) MUST call this once their step loop for a session/slice is
+    /// done, before the runner goes back into the cache -- otherwise the
+    /// grown buffer would outlive the session it grew for and become a
+    /// process-resident allocation instead.
+    pub(crate) fn release_cpu_step_buffer_pool(&mut self) {
+        self.cpu_step_buffer_pool = GgmlCpuStepBufferPool::new();
     }
 
     pub(crate) fn start_static_tensor_arena(
@@ -1141,6 +1230,11 @@ impl GgmlCpuGraphRunner {
             scheduler: self.scheduler.as_ref().map(|scheduler| scheduler.raw),
             graph_size: self.graph_size,
             buffer: None,
+            // A persistent session already allocates its buffer once (via
+            // `ensure_backend_buffer`) and keeps it for the session's whole
+            // lifetime, so it does not need the step pool's grow-to-fit reuse.
+            step_buffer_pool: None,
+            frozen: false,
             prepared_graph: None,
             side_effect_roots: Vec::new(),
             _runner_borrow: PhantomData,
@@ -4106,13 +4200,18 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     }
 
     fn ensure_backend_buffer(&mut self) -> Result<(), GgmlCpuGraphError> {
-        if self.buffer.is_none() {
-            if self.scheduler.is_some() && self.prepared_graph.is_some() {
-                return Ok(());
-            }
-            let buffer = GgmlBackendBufferGuard::allocate(self.context, self.backend)?;
-            self.buffer = Some(buffer);
+        if self.frozen {
+            return Ok(());
         }
+        self.frozen = true;
+        if self.scheduler.is_some() && self.prepared_graph.is_some() {
+            return Ok(());
+        }
+        if let Some(pool) = self.step_buffer_pool.as_deref_mut() {
+            return bind_ctx_tensors_grow_to_fit(self.context, self.backend, pool);
+        }
+        let buffer = GgmlBackendBufferGuard::allocate(self.context, self.backend)?;
+        self.buffer = Some(buffer);
         Ok(())
     }
 
@@ -4141,7 +4240,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     }
 
     fn ensure_can_extend_graph(&self, step: &'static str) -> Result<(), GgmlCpuGraphError> {
-        if self.buffer.is_some() {
+        if self.frozen {
             return Err(GgmlCpuGraphError::GraphFrozenAfterAllocation { step });
         }
         Ok(())
@@ -5078,6 +5177,100 @@ fn ensure_backend_device_present(backend: NonNull<c_void>) -> Result<(), GgmlCpu
     }
 }
 
+/// Binds every not-yet-allocated tensor in `context` to backend memory,
+/// reusing `pool`'s existing buffer when it already has enough capacity for
+/// this step and only growing (by doubling) it when the step needs more. This
+/// is the CPU per-token `ensure_backend_buffer` path's grow-to-fit
+/// replacement for always calling `ggml_backend_alloc_ctx_tensors` (which
+/// allocates a brand-new buffer, sized exactly for this step, every time).
+///
+/// Scoped by the caller to `GgmlCpuGraphBackend::Cpu` with no scheduler: the
+/// CPU buffer type's `get_max_size` is unbounded (see ggml-backend.cpp), so a
+/// single buffer can always hold the whole step -- the multi-buffer chunking
+/// `ggml_backend_alloc_ctx_tensors_from_buft_impl` performs for buffer types
+/// with a bounded `max_size` does not apply here and is intentionally not
+/// replicated.
+fn bind_ctx_tensors_grow_to_fit(
+    context: NonNull<c_void>,
+    backend: NonNull<c_void>,
+    pool: &mut GgmlCpuStepBufferPool,
+) -> Result<(), GgmlCpuGraphError> {
+    ensure_backend_device_present(backend)?;
+    let buft = unsafe { ffi::ggml_backend_get_default_buffer_type(backend.as_ptr()) };
+    let Some(buft) = NonNull::new(buft) else {
+        return Err(GgmlCpuGraphError::BackendBufferAllocationFailed {
+            backend: backend_name(backend),
+        });
+    };
+    let required = unsafe {
+        ffi::ggml_backend_alloc_ctx_tensors_from_buft_size(context.as_ptr(), buft.as_ptr())
+    };
+    if required == 0 {
+        // Nothing new to bind this step (e.g. a graph whose only roots are
+        // already-allocated side effects) -- leave any pooled buffer as-is.
+        return Ok(());
+    }
+    if pool.capacity_bytes < required {
+        // Doubling growth amortizes the allocation count to O(log steps)
+        // across a session whose required size grows step over step, instead
+        // of the O(steps) alloc+free churn this pool replaces.
+        let new_capacity = required.max(pool.capacity_bytes.saturating_mul(2));
+        let buffer = GgmlBackendBufferGuard::allocate_sized(buft, new_capacity)?;
+        // ggml may round `new_capacity` up internally (allocator alignment);
+        // track what it actually committed so a later step's capacity check
+        // never reuses a buffer smaller than ggml believes it allocated.
+        pool.capacity_bytes =
+            unsafe { ffi::ggml_backend_buffer_get_size(buffer.raw.as_ptr()) }.max(new_capacity);
+        pool.buffer = Some(buffer);
+    }
+    let buffer = pool
+        .buffer
+        .as_ref()
+        .expect("capacity_bytes > 0 implies buffer is populated");
+    bind_unallocated_context_tensors(context, buffer.raw)
+}
+
+/// Walks every tensor in `context` in declaration order and binds the ones
+/// ggml has not already allocated (fresh leaves) or view-initialized (fresh
+/// views) into `buffer`. Mirrors the four-way dispatch
+/// `ggml_backend_alloc_ctx_tensors_from_buft_impl`'s `alloc_tensor_range`
+/// helper (ggml-alloc.c) performs when it builds a brand-new buffer; the only
+/// difference here is `buffer` may already be resident from a prior step, so
+/// tensors bind at fresh offsets within it via a new `ggml_tallocr` rather
+/// than the range always starting on freshly mapped memory.
+fn bind_unallocated_context_tensors(
+    context: NonNull<c_void>,
+    buffer: NonNull<c_void>,
+) -> Result<(), GgmlCpuGraphError> {
+    let mut tallocr = unsafe { ffi::ggml_tallocr_new(buffer.as_ptr()) };
+    let mut tensor_raw = unsafe { ffi::ggml_get_first_tensor(context.as_ptr()) };
+    while let Some(tensor) = NonNull::new(tensor_raw) {
+        let layout = unsafe { *(tensor.as_ptr() as *const ffi::GgmlTensorAllocPrefix) };
+        let status = if layout.data.is_null() {
+            if layout.view_src.is_null() {
+                unsafe { ffi::ggml_tallocr_alloc(&mut tallocr, tensor.as_ptr()) }
+            } else if layout.buffer.is_null() {
+                unsafe { ffi::ggml_backend_view_init(tensor.as_ptr()) }
+            } else {
+                ffi::GGML_STATUS_SUCCESS
+            }
+        } else if !layout.view_src.is_null() && layout.buffer.is_null() {
+            // View of a tensor that is itself already allocated (e.g. a
+            // zero-copy-bound weight from `GgmlLoadedWeightContext`).
+            unsafe { ffi::ggml_backend_view_init(tensor.as_ptr()) }
+        } else {
+            ffi::GGML_STATUS_SUCCESS
+        };
+        if status != ffi::GGML_STATUS_SUCCESS {
+            return Err(GgmlCpuGraphError::BackendBufferAllocationFailed {
+                backend: "cpu-step-buffer-pool".to_string(),
+            });
+        }
+        tensor_raw = unsafe { ffi::ggml_get_next_tensor(context.as_ptr(), tensor.as_ptr()) };
+    }
+    Ok(())
+}
+
 fn backend_name(backend: NonNull<c_void>) -> String {
     let raw_name = unsafe { ffi::ggml_backend_name(backend.as_ptr()) };
     cstr_lossy(raw_name)
@@ -5176,6 +5369,20 @@ impl GgmlBackendBufferGuard {
     fn from_raw(raw: NonNull<c_void>, usage: c_int) -> Self {
         unsafe { ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), usage) };
         Self { raw }
+    }
+
+    /// Allocates an empty buffer of exactly `size` bytes from `buft`, with no
+    /// tensors bound yet -- used by the CPU step-buffer pool to grow to a
+    /// chosen capacity; tensors are bound into it afterwards via
+    /// `ggml_tallocr`. Mirrors `alloc_tensor_range` (ggml-alloc.c), the same
+    /// call `ggml_backend_alloc_ctx_tensors` itself makes internally.
+    fn allocate_sized(buft: NonNull<c_void>, size: usize) -> Result<Self, GgmlCpuGraphError> {
+        let raw = unsafe { ffi::ggml_backend_buft_alloc_buffer(buft.as_ptr(), size) };
+        NonNull::new(raw).map(|raw| Self { raw }).ok_or_else(|| {
+            GgmlCpuGraphError::BackendBufferAllocationFailed {
+                backend: "cpu-step-buffer-pool".to_string(),
+            }
+        })
     }
 }
 
@@ -5799,6 +6006,141 @@ mod tests {
             .compute_add_f32(&[1.0, 2.5, -3.0], &[4.0, -0.5, 7.0])
             .expect("tiny add graph should compute");
         assert_eq!(output, vec![5.0, 2.0, 4.0]);
+    }
+
+    // Coverage for the CPU per-token step-buffer pool (`GgmlCpuStepBufferPool`
+    // / `bind_ctx_tensors_grow_to_fit`): a step whose required size fits the
+    // current capacity must reuse the same backend buffer object (no
+    // alloc/free), a step that needs more must grow it, and releasing the
+    // pool must return it to a fresh, empty state.
+    mod cpu_step_buffer_pool {
+        use super::*;
+
+        fn cpu_no_scheduler_runner() -> GgmlCpuGraphRunner {
+            GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+                .expect("cpu graph runner should initialize")
+        }
+
+        fn pool_buffer_ptr(
+            runner: &GgmlCpuGraphRunner,
+        ) -> Option<std::ptr::NonNull<std::ffi::c_void>> {
+            runner
+                .cpu_step_buffer_pool
+                .buffer
+                .as_ref()
+                .map(|buffer| buffer.raw)
+        }
+
+        #[test]
+        fn a_step_within_capacity_reuses_the_same_buffer_object() {
+            let mut runner = cpu_no_scheduler_runner();
+            runner
+                .compute_add_f32(&[1.0, 2.0, 3.0, 4.0], &[1.0, 1.0, 1.0, 1.0])
+                .expect("first (smaller) step should compute");
+            let first_capacity = runner.cpu_step_buffer_pool.capacity_bytes;
+            let first_buffer_ptr = pool_buffer_ptr(&runner);
+            assert!(first_capacity > 0, "first step should have allocated");
+
+            // Same length again: required size is identical, so this must
+            // reuse the pooled buffer rather than reallocate.
+            let output = runner
+                .compute_add_f32(&[5.0, 6.0, 7.0, 8.0], &[1.0, 1.0, 1.0, 1.0])
+                .expect("second (same-size) step should compute");
+            assert_eq!(output, vec![6.0, 7.0, 8.0, 9.0]);
+            assert_eq!(
+                runner.cpu_step_buffer_pool.capacity_bytes, first_capacity,
+                "same-size step must not grow the pool"
+            );
+            assert_eq!(
+                pool_buffer_ptr(&runner),
+                first_buffer_ptr,
+                "same-size step must reuse the same buffer object, not reallocate"
+            );
+        }
+
+        #[test]
+        fn a_step_exceeding_capacity_grows_the_buffer() {
+            let mut runner = cpu_no_scheduler_runner();
+            runner
+                .compute_add_f32(&[1.0, 2.0], &[1.0, 1.0])
+                .expect("first (smaller) step should compute");
+            let first_capacity = runner.cpu_step_buffer_pool.capacity_bytes;
+            let first_buffer_ptr = pool_buffer_ptr(&runner);
+
+            // A much larger step must not fit the tiny first allocation, so
+            // the pool must grow (and rebind to a new, bigger buffer object).
+            let big_lhs = vec![1.0_f32; 4096];
+            let big_rhs = vec![2.0_f32; 4096];
+            let output = runner
+                .compute_add_f32(&big_lhs, &big_rhs)
+                .expect("larger step should compute");
+            assert_eq!(output, vec![3.0_f32; 4096]);
+            assert!(
+                runner.cpu_step_buffer_pool.capacity_bytes > first_capacity,
+                "larger step must grow the pool's capacity"
+            );
+            assert_ne!(
+                pool_buffer_ptr(&runner),
+                first_buffer_ptr,
+                "growing must rebind to a new buffer object"
+            );
+
+            // A subsequent step back down to a small size must reuse the
+            // now-larger pooled buffer rather than shrinking/reallocating.
+            let grown_capacity = runner.cpu_step_buffer_pool.capacity_bytes;
+            let grown_buffer_ptr = pool_buffer_ptr(&runner);
+            runner
+                .compute_add_f32(&[9.0, 9.0], &[1.0, 1.0])
+                .expect("small step after growth should compute");
+            assert_eq!(runner.cpu_step_buffer_pool.capacity_bytes, grown_capacity);
+            assert_eq!(pool_buffer_ptr(&runner), grown_buffer_ptr);
+        }
+
+        #[test]
+        fn release_at_session_end_frees_the_pool_instead_of_staying_resident() {
+            let mut runner = cpu_no_scheduler_runner();
+            runner
+                .compute_add_f32(&[1.0, 2.0, 3.0], &[1.0, 1.0, 1.0])
+                .expect("step should compute");
+            assert!(runner.cpu_step_buffer_pool.capacity_bytes > 0);
+            assert!(pool_buffer_ptr(&runner).is_some());
+
+            runner.release_cpu_step_buffer_pool();
+
+            assert_eq!(runner.cpu_step_buffer_pool.capacity_bytes, 0);
+            assert!(pool_buffer_ptr(&runner).is_none());
+
+            // The runner must still be usable afterwards (a later session
+            // simply re-grows the pool from empty).
+            let output = runner
+                .compute_add_f32(&[4.0, 5.0], &[1.0, 1.0])
+                .expect("step after release should still compute");
+            assert_eq!(output, vec![5.0, 6.0]);
+            assert!(runner.cpu_step_buffer_pool.capacity_bytes > 0);
+        }
+
+        #[test]
+        fn metal_or_gpu_backends_never_engage_the_cpu_step_pool() {
+            // The pool is only wired up for the CPU, no-scheduler path; a
+            // Metal/GPU-configured runner's `start_graph()` must leave
+            // `cpu_step_buffer_pool` untouched even after computing, so this
+            // reuse logic can never interact with the already-correct
+            // scheduler-driven (`ggml_gallocr`-backed) allocation those
+            // backends use.
+            let Ok(mut runner) = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig {
+                context_bytes: GgmlCpuGraphConfig::conservative_default().context_bytes,
+                graph_size: GgmlCpuGraphConfig::conservative_default().graph_size,
+                n_threads: None,
+                backend: GgmlCpuGraphBackend::Metal,
+                use_scheduler: false,
+            }) else {
+                // No Metal device on this host/CI runner: nothing to assert.
+                return;
+            };
+            let _ = runner.compute_add_f32(&[1.0, 2.0], &[1.0, 1.0]);
+            assert_eq!(runner.cpu_step_buffer_pool.capacity_bytes, 0);
+            assert!(pool_buffer_ptr(&runner).is_none());
+        }
     }
 
     #[test]

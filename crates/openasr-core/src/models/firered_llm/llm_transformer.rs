@@ -171,6 +171,16 @@ impl FireRedLlmDecoderRuntime {
         self.whole_decoder.backend_label()
     }
 
+    /// Releases the CPU per-token grow-to-fit step buffer this decoder's
+    /// runner accumulated over the just-finished decode session/slice.
+    /// `store_cached_decoder_runtime`'s caller MUST call this before storing
+    /// the decoder back into the cross-chunk cache, so the buffer stays
+    /// scoped to one session/slice instead of living on indefinitely with the
+    /// cached decoder. A no-op on Metal/GPU or when no CPU step ever ran.
+    pub(crate) fn release_session_scoped_buffers(&mut self) {
+        self.whole_decoder.release_session_scoped_buffers();
+    }
+
     /// `capacity` should be the request-sized bound (prompt tokens + the
     /// generation budget), NOT the model's native `max_positions` (32768 for
     /// the Qwen2-7B decoder): `capacity` becomes the persistent reuse
