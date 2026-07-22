@@ -71,9 +71,9 @@ pub(crate) fn prepare_external_input(
     }
 
     // In-process decode is the default main path for every other recognized
-    // format (m4a/AAC-LC/ALAC, mp4, qta, mp3, flac, ogg/vorbis, mkv/webm
-    // vorbis). It only ever falls through (never a hard error) when the
-    // container/codec is not supported (e.g. HE-AAC, Opus in any container),
+    // format (m4a/AAC-LC/ALAC, mp4, qta, mp3, flac, ogg vorbis/opus, mkv/webm
+    // vorbis/opus). It only ever falls through (never a hard error) when the
+    // container/codec is not supported (e.g. HE-AAC, Opus multistream >2ch),
     // the file is malformed, or -- a third-party demuxer bug on adversarial
     // input -- the underlying symphonia call panicked (caught and downgraded
     // by `try_symphonia_prepare`, per the panic-free trust-boundary invariant
@@ -339,10 +339,27 @@ fn resolve_conversion_tool(
 /// A short extra sentence for error messages describing what's known about
 /// why the in-process decode didn't handle this file; empty string (no extra
 /// sentence) when nothing more specific than "unsupported" is known.
+/// The codecs the in-process decode path handles, named in user-facing error
+/// text. Kept in one place so the "supported vs detected" sentence below
+/// cannot drift from what `symphonia_decode` + `opus_decode` actually decode.
+/// AAC here means AAC-LC/ALAC-in-m4a: HE-AAC is detected as "AAC" by the
+/// probe yet deliberately falls back (see `is_unsupported_aac_extension`),
+/// which is exactly what the "supports AAC-LC ... but not AAC in-process"
+/// sentence then tells the user.
+const IN_PROCESS_CODECS: &str = "AAC-LC, ALAC, FLAC, MP3, Opus, PCM/WAV, and Vorbis";
+
 fn codec_note(diagnostic: &Diagnostic) -> String {
     match diagnostic {
+        // The in-process path *does* decode Opus, so a fallback that still
+        // carries the "Opus" label is a file the built-in decoder cannot
+        // handle (multistream >2ch, or a corrupt stream the demuxer accepted
+        // but libopus could not) -- say that instead of the generic
+        // "supports Opus ... but not Opus" contradiction.
+        Diagnostic::Codec(label) if label == "Opus" => {
+            "\nDetected audio codec: Opus. OpenASR's built-in decoder handles mono/stereo Opus, but this file could not be decoded in-process (it may use more than 2 channels, or the stream may be corrupt).".to_string()
+        }
         Diagnostic::Codec(label) => format!(
-            "\nDetected audio codec: {label}. OpenASR's built-in decoder supports AAC, ALAC, FLAC, MP3, PCM/WAV, and Vorbis, but not {label} in-process."
+            "\nDetected audio codec: {label}. OpenASR's built-in decoder supports {IN_PROCESS_CODECS}, but not {label} in-process."
         ),
         Diagnostic::ParserPanicked => {
             "\nOpenASR's built-in parser hit an internal error while inspecting this file. This looks like a malformed or corrupted container (or an edge case the parser doesn't handle), not merely an unsupported codec.".to_string()
@@ -353,12 +370,18 @@ fn codec_note(diagnostic: &Diagnostic) -> String {
 
 fn missing_converter_hint(diagnostic: &Diagnostic) -> String {
     let codec_phrase = match diagnostic {
+        // See `codec_note`'s matching arm: a fallback carrying the "Opus"
+        // label is a file the built-in Opus decoder cannot handle, not a
+        // generally unsupported format.
+        Diagnostic::Codec(label) if label == "Opus" => {
+            "this Opus file (it may use more than 2 channels, or the stream may be corrupt)".to_string()
+        }
         Diagnostic::Codec(label) => format!("this format ({label})"),
         Diagnostic::ParserPanicked => {
             "this file (its container looks malformed or corrupted, or hits an edge case the bundled parser doesn't handle)".to_string()
         }
         Diagnostic::Unknown => {
-            "this format (e.g. HE-AAC, Opus, or an unrecognized WebM track)".to_string()
+            "this format (e.g. HE-AAC or an unrecognized WebM track)".to_string()
         }
     };
     #[cfg(target_os = "macos")]

@@ -321,9 +321,9 @@ fn symphonia_in_memory_decode_never_writes_a_temp_wav_to_disk() {
     assert!(prepared.is_converted());
 }
 
-/// `tests/fixtures/*.{m4a,mp3,flac,ogg,webm,qta}` are all synthesized, not
-/// recorded audio, so they can be regenerated if a fixture is lost or a new
-/// one is needed. Recipe (from a 0.5s 440 Hz mono/stereo sine `source.wav`
+/// `tests/fixtures/*.{m4a,mp3,flac,ogg,opus,webm,qta}` are all synthesized,
+/// not recorded audio, so they can be regenerated if a fixture is lost or a
+/// new one is needed. Recipe (from a 0.5s 440 Hz mono/stereo sine `source.wav`
 /// generated via `ffmpeg -f lavfi -i "sine=frequency=440:duration=0.5" -ar
 /// 16000 -ac <1|2> source.wav`):
 ///
@@ -331,6 +331,8 @@ fn symphonia_in_memory_decode_never_writes_a_temp_wav_to_disk() {
 /// ffmpeg -i source.wav -c:a alac tone_mono_alac.m4a
 /// ffmpeg -i source_stereo.wav -c:a vorbis -strict -2 -ac 2 tone_stereo.webm
 /// ffmpeg -i source.wav -c:a libopus tone_mono_opus.webm
+/// ffmpeg -i source.wav -c:a libopus tone_opus.ogg
+/// ffmpeg -i source.wav -c:a libopus tone.opus
 /// ```
 ///
 /// `malformed_vint_zero.webm` is not synthesized audio at all -- see
@@ -462,39 +464,12 @@ fn malformed_webm_falls_back_to_typed_error_instead_of_panicking() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
-fn webm_opus_names_the_codec_when_afconvert_also_cannot_open_it() {
-    // symphonia can demux the webm container (mkv feature) but has no Opus
-    // decoder, so this falls to afconvert -- which cannot parse WebM/Matroska
-    // at all (unlike a bare Opus-in-Ogg file, see the ogg/opus test below).
-    // The resulting error must name the detected codec rather than reading
-    // like the file is simply corrupt.
-    let error = prepare_native_conversion(&crate_fixture("tone_mono_opus.webm")).unwrap_err();
-
-    let message = error.to_string();
-    assert!(
-        matches!(error, AudioPreparationError::ConversionFailed { tool, .. } if tool == "afconvert")
-    );
-    assert!(
-        message.contains("Detected audio codec: Opus"),
-        "error should name the detected codec: {message}"
-    );
-}
-
-#[test]
-#[cfg(not(target_os = "macos"))]
-fn webm_opus_names_the_codec_in_the_missing_ffmpeg_hint() {
-    // On a non-macOS host with no ffmpeg configured, there is no afconvert
-    // fallback either: the `MissingFfmpeg` hint itself must name the detected
-    // codec instead of a generic "this format" placeholder.
-    let error = prepare_native_conversion(&crate_fixture("tone_mono_opus.webm")).unwrap_err();
-
-    let message = error.to_string();
-    assert!(matches!(error, AudioPreparationError::MissingFfmpeg { .. }));
-    assert!(
-        message.contains("Opus"),
-        "missing-ffmpeg hint should name the detected codec: {message}"
-    );
+fn symphonia_decodes_webm_opus_in_process() {
+    // The mkv/webm demuxer surfaces the Opus packets and the bundled libopus
+    // decodes them in-process -- no ffmpeg/afconvert fallback involved.
+    let prepared = prepare_native_conversion(&crate_fixture("tone_mono_opus.webm"))
+        .expect("webm/opus should decode via the in-process symphonia + libopus path");
+    assert_decoded_opus_tone(&prepared);
 }
 
 #[test]
@@ -519,14 +494,176 @@ fn he_aac_falls_back_to_afconvert_when_symphonia_cannot_decode_it() {
 }
 
 #[test]
+fn symphonia_decodes_opus_in_ogg_in_process() {
+    // A real Opus-in-Ogg file decodes entirely in-process (symphonia ogg
+    // demuxer + bundled libopus), with the RFC 7845 pre-skip removed and the
+    // Ogg granule end-trim applied.
+    let prepared = prepare_native_conversion(&crate_fixture("tone_opus.ogg"))
+        .expect("ogg/opus should decode via the in-process symphonia + libopus path");
+    assert_decoded_opus_tone(&prepared);
+}
+
+#[test]
+fn symphonia_decodes_bare_opus_file_in_process() {
+    // `.opus` is the conventional extension for a bare Ogg-Opus file; it must
+    // be recognized and take the same in-process path.
+    let prepared = prepare_native_conversion(&crate_fixture("tone.opus"))
+        .expect(".opus should decode via the in-process symphonia + libopus path");
+    assert_decoded_opus_tone(&prepared);
+}
+
+#[test]
+fn opus_extension_is_recognized() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("voice.opus");
+    fs::write(&input, b"not a real ogg stream").unwrap();
+
+    let info = probe_audio_input(&input).unwrap();
+
+    assert_eq!(info.extension.as_deref(), Some("opus"));
+    assert!(info.recognized_extension);
+    assert!(info.issues.is_empty());
+}
+
+/// Writes a copy of the `tone.opus` fixture cut off mid-stream (60%) and
+/// returns the path plus the guard that keeps the temp dir alive.
+fn write_truncated_opus_fixture() -> (tempfile::TempDir, PathBuf) {
+    let full = fs::read(crate_fixture("tone.opus")).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("truncated.opus");
+    fs::write(&path, &full[..full.len() * 3 / 5]).unwrap();
+    (temp, path)
+}
+
+/// A file cut off mid-stream must fail closed, never panic or fabricate
+/// audio. Symphonia's ogg demuxer needs the complete stream (a truncated
+/// file already fails its probe), so the in-process path hands this to the
+/// external converter chain. On macOS that means afconvert, which exits 0
+/// but writes an *empty* WAV for a truncated Ogg-Opus stream (a CoreAudio
+/// leniency quirk -- no samples, no fabricated audio) or fails with a typed
+/// conversion error; both outcomes are acceptable here.
+#[test]
+#[cfg(target_os = "macos")]
+fn truncated_opus_is_handled_without_panicking() {
+    let (_temp, path) = write_truncated_opus_fixture();
+
+    match prepare_native_conversion(&path) {
+        Ok(_) | Err(AudioPreparationError::ConversionFailed { .. }) => {}
+        Err(error) => panic!("truncated opus must fail closed with a typed error: {error}"),
+    }
+}
+
+/// The non-macOS counterpart: with no ffmpeg configured and no afconvert
+/// fallback, the typed `MissingFfmpeg` surfaces instead of a panic.
+#[test]
 #[cfg(not(target_os = "macos"))]
-fn opus_in_ogg_is_unsupported_by_symphonia_and_requires_ffmpeg() {
-    // The enabled symphonia features intentionally exclude an Opus decoder
-    // (see Cargo.toml), so a real Opus-in-Ogg file must fall back to an
-    // external converter instead of silently mis-decoding, and this host has
-    // neither ffmpeg configured nor (being non-macOS) an afconvert fallback.
-    let error = prepare_native_conversion(&crate_fixture("tone_opus.ogg")).unwrap_err();
-    assert!(matches!(error, AudioPreparationError::MissingFfmpeg { .. }));
+fn truncated_opus_is_handled_without_panicking() {
+    let (_temp, path) = write_truncated_opus_fixture();
+
+    let error = prepare_native_conversion(&path).unwrap_err();
+    assert!(
+        matches!(error, AudioPreparationError::MissingFfmpeg { .. }),
+        "truncated opus must fail closed with a typed error: {error}"
+    );
+}
+
+/// Corrupt Opus bytes must fail closed with a typed error (never a panic,
+/// never fabricated audio): on macOS the fallback reaches afconvert, which
+/// cannot open the corrupt stream; elsewhere there is no converter at all and
+/// the typed `MissingFfmpeg` surfaces. Either way the error is precise.
+#[test]
+#[cfg(target_os = "macos")]
+fn corrupt_opus_fails_closed_with_a_typed_error() {
+    assert_corrupt_opus_is_typed_error(corrupt_opus_head_bytes());
+    assert_corrupt_opus_is_typed_error(garbage_bytes());
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn corrupt_opus_fails_closed_with_a_typed_error() {
+    assert_corrupt_opus_is_typed_error(corrupt_opus_head_bytes());
+    assert_corrupt_opus_is_typed_error(garbage_bytes());
+}
+
+fn assert_corrupt_opus_is_typed_error(bytes: Vec<u8>) {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("corrupt.opus");
+    fs::write(&path, &bytes).unwrap();
+
+    let error = prepare_native_conversion(&path).unwrap_err();
+    let message = error.to_string();
+
+    #[cfg(target_os = "macos")]
+    assert!(
+        matches!(&error, AudioPreparationError::ConversionFailed { tool, .. } if tool == "afconvert"),
+        "corrupt opus must fail closed through the external converter: {message}"
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        matches!(&error, AudioPreparationError::MissingFfmpeg { .. }),
+        "corrupt opus must fail closed with a typed error: {message}"
+    );
+}
+
+/// The real `tone.opus` fixture with its `OpusHead` magic scrambled: the Ogg
+/// container still parses, but the Opus stream can no longer be identified.
+fn corrupt_opus_head_bytes() -> Vec<u8> {
+    let mut bytes = fs::read(crate_fixture("tone.opus")).unwrap();
+    let magic = bytes
+        .windows(8)
+        .position(|window| window == b"OpusHead")
+        .expect("the fixture must contain an OpusHead packet");
+    bytes[magic] = b'X';
+    bytes
+}
+
+fn garbage_bytes() -> Vec<u8> {
+    vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33]
+}
+
+/// Asserts `prepared` is the in-process decode of one of the 0.5 s 440 Hz
+/// mono Opus tone fixtures: in-memory samples (no temp WAV round trip), about
+/// 0.5 s at 16 kHz, non-silent, with the true source format (48 kHz -- Opus
+/// always decodes at 48 kHz -- mono) reported for diagnostics. Tolerances,
+/// not exact sample counts: encoder padding, the pre-skip trim, and the
+/// resampler's group delay all move the count by small amounts (#176).
+fn assert_decoded_opus_tone(prepared: &PreparedAudioInput) {
+    assert!(prepared.is_converted());
+    assert!(
+        prepared.temp_dir.is_none(),
+        "the in-process opus decode path must not create a temp dir"
+    );
+    let samples = prepared
+        .samples()
+        .expect("in-process opus decode should hand back in-memory samples");
+
+    // 0.5 s of content: exactly 24,000 samples at the decoder's 48 kHz --
+    // pinned pre-resample by `opus_tone_decodes_to_the_exact_rfc7845_sample_
+    // count` -- resampled to ~8,000 at 16 kHz. The slack here is only the
+    // FFT resampler's group delay (~2%, shared by every format this module
+    // resamples, pulls the Ogg/WebM counts short) plus at most one packet
+    // (~120 ms, pushes the webm count long: its millisecond timecodes skip
+    // the Ogg end-trim); the *decode* length itself is exact and asserted
+    // at 48 kHz.
+    let expected = 8_000_usize;
+    assert!(
+        samples.len().abs_diff(expected) <= 1_000,
+        "expected ~{expected} samples, got {}",
+        samples.len()
+    );
+
+    // lavfi's `sine` source defaults to amplitude 1/8, so the tone's RMS is
+    // ~0.088 (verified against ffmpeg's own decode of the same fixture); the
+    // range only has to prove the audio is real, not silent or clipped.
+    let rms =
+        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt();
+    assert!(
+        (0.03..=0.3).contains(&rms),
+        "decoded tone should be audible, not silent or clipped: RMS {rms}"
+    );
+
+    assert_eq!(prepared.original().sample_rate_hz, Some(48_000));
+    assert_eq!(prepared.original().channels, Some(1));
 }
 
 #[test]

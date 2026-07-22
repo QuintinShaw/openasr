@@ -50,11 +50,19 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # ogg/vorbis, mkv/webm containers, ALAC, wav): no default-features -- only the
 # demuxers/decoders this workspace actually decodes are enabled, to keep the
 # dependency tree and release binary small (see
-# crates/openasr-core/src/audio/symphonia_decode.rs). Notably absent: an
-# `opus` feature -- symphonia has never shipped an Opus decoder (still true as
-# of 0.6.0), so `.opus`/opus-in-ogg/opus-in-webm always fall through to the
-# external ffmpeg/afconvert conversion chain regardless of what's enabled here.
+# crates/openasr-core/src/audio/symphonia_decode.rs). Symphonia has never
+# shipped an Opus decoder (still true as of 0.6.0): its ogg/mkv demuxers still
+# surface Opus packets, which are decoded in-process by the bundled libopus
+# below (see crates/openasr-core/src/audio/opus_decode.rs).
 symphonia = { version = "0.5.4", default-features = false, features = ["isomp4", "aac", "mp3", "flac", "ogg", "vorbis", "wav", "pcm", "mkv", "alac"] }
+# Opus packet decoding for the in-process audio path (see audio/opus_decode.rs
+# in openasr-core). libopus itself (BSD-3-Clause) is not vendored into this
+# repository: libopus_sys carries the libopus source inside its crates.io
+# package, and `bundled` forces that vendored copy to be compiled from source
+# with cmake/cc (already required by this workspace's ggml build) instead of
+# probing for a system libopus -- so every build gets the same statically
+# linked decoder and the release binary needs no external libopus at runtime.
+libopus_sys = { version = "0.4.0", features = ["static", "bundled"] }
 # Pure-Rust resampler used to bring decoded symphonia audio to the 16 kHz mono
 # PCM the ASR pipeline expects.
 rubato = "0.15"

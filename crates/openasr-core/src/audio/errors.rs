@@ -50,11 +50,12 @@ pub enum AudioPreparationError {
         tool: String,
         status: String,
         stderr: String,
-        /// Filled in when symphonia's demuxer could name the audio codec
-        /// even though no decoder for it is linked in (e.g. Opus): gives the
-        /// user a precise "which codec" answer instead of a bare tool
-        /// failure, so a truly-unsupported codec doesn't read like a corrupt
-        /// file. Rendered as an extra sentence when present, otherwise empty.
+        /// Filled in when the demuxer could name the audio codec even though
+        /// the in-process path did not decode it (e.g. HE-AAC, or an Opus
+        /// file the built-in Opus decoder cannot handle): gives the user a
+        /// precise "which codec" answer instead of a bare tool failure, so a
+        /// truly-unsupported codec doesn't read like a corrupt file. Rendered
+        /// as an extra sentence when present, otherwise empty.
         codec_note: String,
     },
     #[error(
