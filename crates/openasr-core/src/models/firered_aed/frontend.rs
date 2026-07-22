@@ -180,4 +180,53 @@ mod tests {
         let mut feats = vec![0.0; 4];
         assert!(apply_cmvn(&mut feats, 2, &[0.0], &[1.0, 1.0]).is_err());
     }
+
+    // Weight-free, committable regression net for the fbank math itself
+    // (windowing / FFT / mel filterbank / log-energy): the two tests above
+    // only feed a constant-DC signal, which is degenerate -- pre-emphasis and
+    // the FFT collapse it to (near-)zero magnitude in every bin except the
+    // log-energy floor, so a bug in the mel filterbank weights or the window
+    // function would not move the output at all. A synthetic 440 Hz sine
+    // (generated in-code, no fixture file, no model weights) actually
+    // exercises the frequency response, so a SHA-256 pin over the computed
+    // pre-CMVN log-mel values catches silent drift in the shared
+    // `kaldi_fbank` engine or this family's `FRONTEND_CONFIG` without ever
+    // needing a committed `.oasr` pack.
+    fn synthetic_sine_wave_samples(duration_seconds: f32, frequency_hz: f32) -> Vec<f32> {
+        let n = (SAMPLE_RATE_HZ as f32 * duration_seconds) as usize;
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / SAMPLE_RATE_HZ as f32;
+                0.5 * (2.0 * std::f32::consts::PI * frequency_hz * t).sin()
+            })
+            .collect()
+    }
+
+    fn sha256_f32_le(values: &[f32]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for value in values {
+            hasher.update(value.to_le_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    const GOLDEN_FIRERED_FBANK_440HZ_SINE_SHA256: &str =
+        "01f3d6d729de5703297275d8fb96280354214bde032eb4cfb783e1a1464dad25";
+
+    #[test]
+    fn golden_diff_fbank_matches_pinned_hash_for_synthetic_440hz_sine() {
+        let samples = synthetic_sine_wave_samples(1.0, 440.0);
+        let features = FireRedFbankFrontend::new()
+            .compute(&samples)
+            .expect("fbank");
+        assert_eq!(features.n_mels, 80);
+        assert_eq!(features.n_frames, 98);
+        assert!(features.data.iter().all(|v| v.is_finite()));
+        let digest = sha256_f32_le(&features.data);
+        assert_eq!(
+            digest, GOLDEN_FIRERED_FBANK_440HZ_SINE_SHA256,
+            "fbank output for the synthetic 440 Hz sine drifted from the pinned golden hash"
+        );
+    }
 }
