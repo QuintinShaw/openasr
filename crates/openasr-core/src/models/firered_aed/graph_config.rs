@@ -8,10 +8,22 @@
 //! mirrors the cohere/moonshine template -- dynamic backend resolution via
 //! [`configure_model_runtime_graph_config_from_env`] (Metal auto-selected
 //! through `GgmlCpuGraphConfig::resolve_runtime_backend()`), with an explicit
-//! per-stage opt-out that falls back to CPU. Unlike cohere, firered-aed never
-//! does multi-chunk longform batching (the executor is single-segment plain
-//! transcription -- see `executor.rs` module docs), so there is no
-//! `prefer_cpu_backend` request-level override to thread through here.
+//! per-stage opt-out that falls back to CPU.
+//!
+//! Note this is narrower than it may read: firered-aed's own executor never
+//! batches *multiple* longform slices into one graph call the way cohere's
+//! `batched_decode` can (each call here still encodes/decodes exactly one
+//! window -- see `executor.rs` module docs), so there is no
+//! `prefer_cpu_backend` request-level override to thread through here. That
+//! is NOT the same claim as "firered-aed has no longform support" (issue
+//! #158's actual bug, and easy to misread this comment as): the *outer*
+//! per-file longform slicer in `native_transcribe` is architecture-agnostic
+//! and already calls this executor once per slice for every builtin family,
+//! firered-aed included, with its window length capped to this
+//! architecture's declared `GlobalQuadratic` safety ceiling (issue #68's
+//! `encoder_attention_span`) and, defensively, to the encoder's baked
+//! rel-pos-table capacity (`FireRedAedExecutionMetadata::encoder_max_frames`,
+//! enforced in `executor.rs`).
 
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphThreadingWorkload};
 use crate::models::graph_runtime_config::{
