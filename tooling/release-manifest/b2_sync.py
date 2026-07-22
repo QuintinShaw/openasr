@@ -37,6 +37,16 @@ Both subcommands use THE SAME environment variable names as
   B2_BUCKET             Default: openasr-releases
   B2_S3_REGION          Override if it cannot be inferred from B2_S3_ENDPOINT.
 
+Credential source: these write credentials live ONLY in
+`~/.openasr/b2-release.env` (chmod 600, outside the repo). `source` that file
+in the shell that runs this script, e.g. `source ~/.openasr/b2-release.env`
+immediately before the command. Do NOT export them from a long-lived shell
+profile (~/.zshrc, ~/.bashrc, ...): a release-bucket write key must not be
+inherited by every terminal process. They are also never CI secrets /
+repository variables / workflow literals for this script -- core's B2 sync is
+a local, human-run step (see README). Missing vars fail closed below with a
+message pointing at the `source` step.
+
 Immutability, same policy as the desktop publish script: before uploading a
 key, HEAD it. If an object already exists there with a DIFFERENT sha256, this
 aborts rather than silently overwriting a shipped release asset -- bump the
@@ -193,12 +203,18 @@ class B2Credentials:
         secret_access_key = env.get("B2_APPLICATION_KEY")
         if not endpoint:
             raise B2SyncError(
-                "B2_S3_ENDPOINT is not set. The bucket's region/cluster is not known until it's "
-                "created; set this to the bucket's S3-compatible endpoint, e.g. "
-                "https://s3.us-east-005.backblazeb2.com."
+                "B2_S3_ENDPOINT is not set. These B2 write credentials are kept only in "
+                "~/.openasr/b2-release.env (not in any shell profile and not in CI); run "
+                "`source ~/.openasr/b2-release.env` in this shell and retry. The endpoint is "
+                "the bucket's S3-compatible URL, e.g. https://s3.us-east-005.backblazeb2.com "
+                "(the region/cluster is not known until the bucket is created)."
             )
         if not access_key_id or not secret_access_key:
-            raise B2SyncError("B2_APPLICATION_KEY_ID and B2_APPLICATION_KEY must both be set to sync.")
+            raise B2SyncError(
+                "B2_APPLICATION_KEY_ID and B2_APPLICATION_KEY must both be set to sync. They "
+                "live only in ~/.openasr/b2-release.env; run `source ~/.openasr/b2-release.env` "
+                "in this shell and retry (do not export them from ~/.zshrc or any login profile)."
+            )
         return cls(
             endpoint=endpoint,
             access_key_id=access_key_id,

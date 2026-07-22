@@ -107,10 +107,15 @@ plus `release-publish.mjs`'s upload-with-immutability-check logic --
 cross-validated against AWS's published SigV4 worked example in
 `b2_sync_test.py`, no network required to test.
 
+The B2 write credentials are kept **only** in `~/.openasr/b2-release.env`
+(chmod 600, outside the repo) -- never in `~/.zshrc` / `~/.bashrc` or any
+long-lived shell profile (a release-bucket write key must not be inherited by
+every terminal process), and never as a CI secret / repository variable /
+workflow literal for this script (core's sync is a local, human-run step).
+`source` that file in the shell that runs the sync, then run the command:
+
 ```bash
-export B2_S3_ENDPOINT=https://s3.us-east-005.backblazeb2.com   # confirm the real value with whoever owns the B2 account
-export B2_APPLICATION_KEY_ID=...
-export B2_APPLICATION_KEY=...                                   # never logged
+source ~/.openasr/b2-release.env   # provides B2_S3_ENDPOINT / B2_APPLICATION_KEY_ID / B2_APPLICATION_KEY (and optional B2_BUCKET / B2_S3_REGION); never logged
 
 python3 tooling/release-manifest/b2_sync.py sync --version 0.1.20 \
   dist/openasr-0.1.20-windows-x86_64-vulkan.zip \
@@ -146,8 +151,9 @@ is always a local, human-run step:
   key prefix (`B2_BUCKET` defaults to `openasr-releases`; override only if the
   bucket is ever split). Credentials (`B2_APPLICATION_KEY_ID` /
   `B2_APPLICATION_KEY`) stay out of CI -- this sync always runs from a
-  maintainer's machine using the same local env vars desktop releases use, not
-  a repo secret.
+  maintainer's machine, with the B2 vars provided by `source
+  ~/.openasr/b2-release.env` in that shell (the same credential file desktop
+  releases use), not a repo secret and not a long-lived shell-profile export.
 - `openasr-app`'s own `release-desktop.yml` only runs this kind of publish
   from a `workflow_dispatch` with an explicit `publish: true` input, gated by
   repo secrets on the app repo -- i.e. even there, publishing to
@@ -174,9 +180,10 @@ Run all three steps from a maintainer machine; none of this runs in CI.
    (`b2_sync.py sync --version <version>`, uploading the Windows sidecar
    archives -- `-vulkan`, `-cuda-sidecar`, `-rocm-sidecar` -- plus
    `backends-manifest.json` and `backends-manifest.signature.json` to
-   `core/v<version>/` in the shared `openasr-releases` B2 bucket, using local
-   `B2_S3_ENDPOINT` / `B2_APPLICATION_KEY_ID` / `B2_APPLICATION_KEY` env vars
-   -- never repo secrets). `sync-vendor` for the vendor_layers archives is
+   `core/v<version>/` in the shared `openasr-releases` B2 bucket. The B2 vars
+   (`B2_S3_ENDPOINT` / `B2_APPLICATION_KEY_ID` / `B2_APPLICATION_KEY`) come
+   from `source ~/.openasr/b2-release.env` in the running shell -- never repo
+   secrets, never a shell-profile export). `sync-vendor` for the vendor_layers archives is
    OPTIONAL (see above) and not part of this release-blocking checklist --
    GitHub Releases (already populated by `release-binaries.yml`) is enough.
    `b2_sync.py` is the ONLY thing that syncs to B2/dl.openasr.org -- step 1's
