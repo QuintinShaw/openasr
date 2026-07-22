@@ -301,6 +301,11 @@ pub struct NativeAsrOfflineRequest {
     /// carries through to.
     pub source_sample_rate_hz: Option<u32>,
     pub source_channels: Option<u16>,
+    /// The source file's container/codec extension, same
+    /// "probed/known, never fabricated" contract as
+    /// [`crate::TranscriptionRequest::source_container`], which this carries
+    /// through to.
+    pub source_container: Option<String>,
 }
 
 impl NativeAsrOfflineRequest {
@@ -313,6 +318,7 @@ impl NativeAsrOfflineRequest {
             source: RequestSource::default(),
             source_sample_rate_hz: None,
             source_channels: None,
+            source_container: None,
         }
     }
 
@@ -346,6 +352,14 @@ impl NativeAsrOfflineRequest {
     ) -> Self {
         self.source_sample_rate_hz = sample_rate_hz;
         self.source_channels = channels;
+        self
+    }
+
+    /// Sets the source file's container/codec extension. Pass the raw
+    /// extension (e.g. `"m4a"`) or `None` when genuinely unknown -- never
+    /// the file name.
+    pub fn with_source_container(mut self, container: Option<String>) -> Self {
+        self.source_container = container;
         self
     }
 }

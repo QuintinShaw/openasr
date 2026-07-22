@@ -1188,7 +1188,7 @@ fn run_native_transcription_impl(
         &quant_tag_for_log(requested_model_id, runtime_source.path()),
         native_runtime_backend_label(auto_gpu_policy),
         audio_duration_seconds,
-        input_container_tag(&request.input_path),
+        request.source_container.as_deref(),
         request.source_sample_rate_hz,
         request.source_channels,
     );
@@ -2420,16 +2420,6 @@ fn quant_tag_for_log(requested_model_id: &str, runtime_pack_path: &Path) -> Stri
         Some(tag) => crate::canonical_quant_tag(tag).to_string(),
         None => "unknown".to_string(),
     }
-}
-
-/// Codec/container tag for the `stage=request_context` log line: the input
-/// path's extension only (e.g. `"wav"`, `"mp3"`) -- never the file name or
-/// any other path component, per this module's privacy contract.
-fn input_container_tag(input_path: &Path) -> &str {
-    input_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("unknown")
 }
 
 #[cfg(test)]

@@ -1229,6 +1229,7 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
             prepared.original().sample_rate_hz,
             prepared.original().channels,
         )
+        .with_source_container(prepared.original().extension.clone())
         .with_model_pack_path(prepared_run.model_source.model_pack_path)
         // OADP Phase 0: the adapter rides the request options into the native
         // executor (the OPENASR_ADAPTER env var stays a server-side surface;

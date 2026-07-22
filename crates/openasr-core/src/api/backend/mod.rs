@@ -396,6 +396,13 @@ pub struct TranscriptionRequest {
     /// [`crate::api::backend::request_context`]'s honesty contract.
     pub source_sample_rate_hz: Option<u32>,
     pub source_channels: Option<u16>,
+    /// The *source* file's container/codec extension (e.g. `"m4a"`,
+    /// `"mp3"`), lowercased, with no leading dot -- before any conversion
+    /// this pipeline performs to reach the normalized WAV it actually
+    /// decodes. Same honesty contract as `source_sample_rate_hz`: `None` when
+    /// genuinely unknown, never guessed, and never the *file name* or any
+    /// other path component -- extension only.
+    pub source_container: Option<String>,
 }
 
 impl TranscriptionRequest {
@@ -421,6 +428,7 @@ impl TranscriptionRequest {
             source: RequestSource::default(),
             source_sample_rate_hz: None,
             source_channels: None,
+            source_container: None,
         }
     }
 
@@ -440,6 +448,15 @@ impl TranscriptionRequest {
     ) -> Self {
         self.source_sample_rate_hz = sample_rate_hz;
         self.source_channels = channels;
+        self
+    }
+
+    /// Sets the source file's container/codec extension for the
+    /// `stage=request_context` log line. Pass the raw extension (e.g.
+    /// `"m4a"`) or `None` when genuinely unknown -- never the file name; see
+    /// this field's doc comment.
+    pub fn with_source_container(mut self, container: Option<String>) -> Self {
+        self.source_container = container;
         self
     }
 

@@ -1384,7 +1384,12 @@ pub(crate) async fn transcribe_with_runtime(
                 .with_source_audio_format(
                     prepared.original().sample_rate_hz,
                     prepared.original().channels,
-                );
+                )
+                // Extension only, off the upload's own temp file (which
+                // preserves the client's original extension via
+                // `safe_extension_suffix` -- see `ingest_field` above); never
+                // the client-supplied file name/stem itself.
+                .with_source_container(prepared.original().extension.clone());
             let executor = NativeBackendExecutor;
             let mut transcription = NativeAsrExecutor::transcribe(
                 &executor,

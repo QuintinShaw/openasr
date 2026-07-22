@@ -1116,10 +1116,12 @@ impl LiveTranscriptionWorker {
                     TranscriptionRequest::new(job.temp_wav.path(), job.model_id)
                         .with_source(openasr_core::RequestSource::CliLive)
                         // Not a normalization-pipeline guess: `write_temp_utterance_wav`
-                        // above always writes PCM16 mono 16 kHz -- this *is* the
-                        // mic capture's real captured format, unlike an uploaded file
-                        // whose source format is unknown until probed/decoded.
+                        // above always writes PCM16 mono 16 kHz WAV -- this *is*
+                        // the mic capture's real captured format/container,
+                        // unlike an uploaded file whose source format is
+                        // unknown until probed/decoded.
                         .with_source_audio_format(Some(16_000), Some(1))
+                        .with_source_container(Some("wav".to_string()))
                         .with_model_pack_path(
                             job.model_pack_path.or_else(|| model_pack_path.clone()),
                         )
