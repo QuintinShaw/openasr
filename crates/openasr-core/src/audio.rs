@@ -39,7 +39,7 @@ pub fn prepare_audio_input(
             let prepared_path = info.path.clone();
             Ok(PreparedAudioInput {
                 original: info,
-                prepared_path,
+                samples: types::PreparedAudioSamples::Path(prepared_path),
                 temp_dir: None,
             })
         }

@@ -556,6 +556,7 @@ fn native_offline_request_to_transcription_request(
         .with_source(request.source)
         .with_source_audio_format(request.source_sample_rate_hz, request.source_channels)
         .with_source_container(request.source_container)
+        .with_prepared_samples(request.prepared_samples)
 }
 
 fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {

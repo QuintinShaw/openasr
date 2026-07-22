@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, path::Path, sync::OnceLock, time::Instant};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 use crate::NATIVE_RUNTIME_MODEL_ID_AUTO;
 use crate::api::audio_io::load_wav_16khz_mono_f32_v0;
@@ -810,6 +815,7 @@ fn run_native_transcription_fallible(
     // rather than running uncounted.
     let _progress = NativeProgressGuard::new();
     let input_path = request.input_path.clone();
+    let prepared_samples = request.prepared_samples.clone();
     let language_hint = request.language.clone();
     let model_pack_path = request.model_pack_path.clone();
     let punctuate = request.punctuate;
@@ -836,6 +842,7 @@ fn run_native_transcription_fallible(
         refine_transcription_word_timestamps_with_forced_aligner(
             transcription,
             &input_path,
+            prepared_samples.as_ref(),
             language_hint.as_deref(),
         )
     } else {
@@ -921,28 +928,48 @@ fn punctuate_transcription_segments(
     transcription
 }
 
-/// Re-decodes `input_path` and calls the installed Qwen3-ForcedAligner pack
-/// once over the whole finished transcript, then reassigns each segment's
-/// `words` from the aligner's own per-word spans (dropping the family's
-/// approximate per-word confidence -- the aligner does not produce one; never
-/// inventing a value is preferred to fabricating one). Segments/text/speaker
-/// attribution from the ordinary decode path are left untouched; only `words`
-/// changes.
-fn refine_transcription_word_timestamps_with_forced_aligner(
-    mut transcription: Transcription,
+/// Returns `request`'s audio as 16 kHz mono f32 samples, preferring
+/// `prepared_samples` -- already resident in memory when
+/// `prepare_audio_input`'s in-process symphonia decode path produced them
+/// (see `crate::audio::PreparedAudioInput::samples`) -- over re-reading
+/// `input_path` from disk. The WAV-passthrough and external ffmpeg/afconvert
+/// conversion paths leave `prepared_samples` unset, so this falls back to the
+/// WAV load exactly as before for those.
+fn resolve_prepared_audio_samples(
     input_path: &Path,
-    language_hint: Option<&str>,
-) -> Result<Transcription, BackendError> {
-    let pack_path = forced_aligner_pack::resolve_forced_aligner_pack_path()
-        .ok_or(BackendError::WordTimestampAlignmentPackMissing { backend: "native" })?;
-    let prepared_audio = load_wav_16khz_mono_f32_v0(
+    prepared_samples: Option<&Arc<[f32]>>,
+) -> Result<Vec<f32>, crate::NativeAsrError> {
+    if let Some(samples) = prepared_samples {
+        return Ok(samples.to_vec());
+    }
+    load_wav_16khz_mono_f32_v0(
         input_path,
         "Native ASR Core backend",
         "Native ASR Core backend",
     )
-    .map_err(|error| BackendError::NativeUnsupportedInputFormat {
-        reason: error.to_string(),
-    })?;
+}
+
+/// Re-decodes `input_path` (or reuses `prepared_samples` when already
+/// resident in memory) and calls the installed Qwen3-ForcedAligner pack once
+/// over the whole finished transcript, then reassigns each segment's `words`
+/// from the aligner's own per-word spans (dropping the family's approximate
+/// per-word confidence -- the aligner does not produce one; never inventing a
+/// value is preferred to fabricating one). Segments/text/speaker attribution
+/// from the ordinary decode path are left untouched; only `words` changes.
+fn refine_transcription_word_timestamps_with_forced_aligner(
+    mut transcription: Transcription,
+    input_path: &Path,
+    prepared_samples: Option<&Arc<[f32]>>,
+    language_hint: Option<&str>,
+) -> Result<Transcription, BackendError> {
+    let pack_path = forced_aligner_pack::resolve_forced_aligner_pack_path()
+        .ok_or(BackendError::WordTimestampAlignmentPackMissing { backend: "native" })?;
+    let prepared_audio =
+        resolve_prepared_audio_samples(input_path, prepared_samples).map_err(|error| {
+            BackendError::NativeUnsupportedInputFormat {
+                reason: error.to_string(),
+            }
+        })?;
     let language = transcription
         .language
         .clone()
@@ -1084,14 +1111,11 @@ fn run_native_transcription_impl(
         model_resolve_started.elapsed(),
     );
     let audio_prep_started = Instant::now();
-    let prepared_audio = load_wav_16khz_mono_f32_v0(
-        &request.input_path,
-        "Native ASR Core backend",
-        "Native ASR Core backend",
-    )
-    .map_err(|error| BackendError::NativeUnsupportedInputFormat {
-        reason: error.to_string(),
-    })?;
+    let prepared_audio =
+        resolve_prepared_audio_samples(&request.input_path, request.prepared_samples.as_ref())
+            .map_err(|error| BackendError::NativeUnsupportedInputFormat {
+                reason: error.to_string(),
+            })?;
     crate::stage_timing::log_stage(
         "native_transcribe",
         "audio_prep",

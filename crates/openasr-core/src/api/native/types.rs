@@ -1,4 +1,4 @@
-use std::{fmt, path::PathBuf};
+use std::{fmt, path::PathBuf, sync::Arc};
 
 use crate::realtime::RealtimeSessionId;
 use crate::{LongFormOptions, PhraseBiasConfig, RequestSource, TranscriptionTask};
@@ -306,6 +306,11 @@ pub struct NativeAsrOfflineRequest {
     /// [`crate::TranscriptionRequest::source_container`], which this carries
     /// through to.
     pub source_container: Option<String>,
+    /// Ready-to-decode 16 kHz mono f32 samples already resident in memory --
+    /// same "prefer this over re-reading `input_path`" contract as
+    /// [`crate::TranscriptionRequest::prepared_samples`], which this carries
+    /// through to via `native_offline_request_to_transcription_request`.
+    pub prepared_samples: Option<Arc<[f32]>>,
 }
 
 impl NativeAsrOfflineRequest {
@@ -319,7 +324,15 @@ impl NativeAsrOfflineRequest {
             source_sample_rate_hz: None,
             source_channels: None,
             source_container: None,
+            prepared_samples: None,
         }
+    }
+
+    /// Attaches in-memory samples so the native backend can skip re-reading
+    /// `input_path` from disk -- see the field's doc comment.
+    pub fn with_prepared_samples(mut self, prepared_samples: Option<Arc<[f32]>>) -> Self {
+        self.prepared_samples = prepared_samples;
+        self
     }
 
     pub fn with_options(mut self, options: NativeAsrRequestOptions) -> Self {

@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::BackendKind;
 
@@ -86,23 +89,91 @@ impl AudioPreparationOptions {
     }
 }
 
+/// The decoded/prepared audio a [`PreparedAudioInput`] hands to downstream
+/// consumers. The WAV-passthrough and external ffmpeg/afconvert conversion
+/// paths (`audio::prepare`) still route through a real file on disk -- either
+/// the untouched original or the external tool's output -- because that is
+/// the cheapest or only option there. The in-process symphonia decode path
+/// (the default for m4a/mp3/flac/ogg/webm/non-conformant wav) instead hands
+/// back the fully-decoded 16 kHz mono f32 samples it already has resident in
+/// memory, so callers never have to write them to a temporary WAV and
+/// immediately re-read + re-parse it back into the exact same samples.
+#[derive(Debug)]
+pub(crate) enum PreparedAudioSamples {
+    Path(PathBuf),
+    InMemory(Arc<[f32]>),
+}
+
 #[derive(Debug)]
 pub struct PreparedAudioInput {
     pub(crate) original: AudioInputInfo,
-    pub(crate) prepared_path: PathBuf,
+    pub(crate) samples: PreparedAudioSamples,
     pub(crate) temp_dir: Option<tempfile::TempDir>,
 }
 
 impl PreparedAudioInput {
+    /// A path identifying this prepared input: the real WAV to read bytes
+    /// from for the WAV-passthrough and external-conversion paths (see
+    /// [`Self::samples`]), or -- for the in-process symphonia decode path,
+    /// which writes nothing to disk -- the *original* source file, purely
+    /// for display/logging. Callers that need the decoded audio itself
+    /// should prefer [`Self::samples`] and only fall back to reading this
+    /// path when it returns `None`.
     pub fn path(&self) -> &Path {
-        &self.prepared_path
+        match &self.samples {
+            PreparedAudioSamples::Path(path) => path,
+            PreparedAudioSamples::InMemory(_) => &self.original.path,
+        }
     }
 
     pub fn original(&self) -> &AudioInputInfo {
         &self.original
     }
 
+    /// Ready-to-decode 16 kHz mono f32 samples already resident in memory,
+    /// when the in-process symphonia decode path produced them directly.
+    /// `None` for the WAV-passthrough and external ffmpeg/afconvert
+    /// conversion paths, which hand back a file via [`Self::path`] instead.
+    pub fn samples(&self) -> Option<&[f32]> {
+        match &self.samples {
+            PreparedAudioSamples::InMemory(samples) => Some(samples),
+            PreparedAudioSamples::Path(_) => None,
+        }
+    }
+
+    /// Cheap `Arc` clone of [`Self::samples`], for attaching to a
+    /// [`crate::TranscriptionRequest`]/`NativeAsrOfflineRequest` so the
+    /// native backend can decode straight from memory instead of re-reading
+    /// [`Self::path`] from disk.
+    pub fn shared_samples(&self) -> Option<Arc<[f32]>> {
+        match &self.samples {
+            PreparedAudioSamples::InMemory(samples) => Some(Arc::clone(samples)),
+            PreparedAudioSamples::Path(_) => None,
+        }
+    }
+
     pub fn is_converted(&self) -> bool {
-        self.temp_dir.is_some()
+        self.temp_dir.is_some() || matches!(self.samples, PreparedAudioSamples::InMemory(_))
+    }
+
+    /// Best-effort duration of the prepared audio in seconds. Prefers the
+    /// cheap probed source-file duration (wav's fmt/data chunk sizes,
+    /// `original().duration_seconds`); falls back to counting the in-memory
+    /// samples for the symphonia decode path, or re-probing the prepared WAV
+    /// on disk for the external-conversion path. `None` only when nothing
+    /// here can determine it (e.g. an unrecognized-extension passthrough).
+    pub fn duration_seconds(&self) -> Option<f64> {
+        if let Some(duration) = self.original.duration_seconds {
+            return Some(duration);
+        }
+        match &self.samples {
+            PreparedAudioSamples::InMemory(samples) => Some(
+                samples.len() as f64 / f64::from(super::symphonia_decode::TARGET_SAMPLE_RATE_HZ),
+            ),
+            PreparedAudioSamples::Path(path) if self.temp_dir.is_some() => {
+                super::probe_wav_duration(path)
+            }
+            PreparedAudioSamples::Path(_) => None,
+        }
     }
 }

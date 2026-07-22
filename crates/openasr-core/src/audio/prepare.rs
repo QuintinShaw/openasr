@@ -4,23 +4,30 @@ use crate::{
     BackendKind,
     audio::{
         AudioInputInfo, AudioPreparationError, AudioPreparationOptions, PreparedAudioInput,
-        RECOGNIZED_EXTENSIONS, decode, symphonia_decode,
+        RECOGNIZED_EXTENSIONS, decode, symphonia_decode, types::PreparedAudioSamples,
     },
 };
 
 const CONVERSION_STDERR_LIMIT: usize = 800;
+
+/// A pass-through `PreparedAudioInput` that hands back `info`'s own path
+/// unmodified (the WAV-passthrough branches below): no conversion, no temp
+/// dir, no in-memory samples.
+fn passthrough(info: AudioInputInfo) -> PreparedAudioInput {
+    let prepared_path = info.path.clone();
+    PreparedAudioInput {
+        original: info,
+        samples: PreparedAudioSamples::Path(prepared_path),
+        temp_dir: None,
+    }
+}
 
 pub(crate) fn prepare_external_input(
     info: AudioInputInfo,
     options: &AudioPreparationOptions,
 ) -> Result<PreparedAudioInput, AudioPreparationError> {
     if options.backend == BackendKind::Native && !options.native_non_wav_requires_conversion {
-        let prepared_path = info.path.clone();
-        return Ok(PreparedAudioInput {
-            original: info,
-            prepared_path,
-            temp_dir: None,
-        });
+        return Ok(passthrough(info));
     }
 
     let is_wav = info.extension.as_deref() == Some("wav");
@@ -28,12 +35,7 @@ pub(crate) fn prepare_external_input(
         // Already matches the 16 kHz mono PCM16/float32 shape the rest of the
         // pipeline expects: pass it through untouched (cheap, and preserves
         // today's behavior for already-conformant recordings).
-        let prepared_path = info.path.clone();
-        return Ok(PreparedAudioInput {
-            original: info,
-            prepared_path,
-            temp_dir: None,
-        });
+        return Ok(passthrough(info));
     }
     if is_wav && !options.ffmpeg_bin_explicit {
         // Non-conformant (other sample rate, stereo, ...) and no explicit
@@ -49,12 +51,7 @@ pub(crate) fn prepare_external_input(
         // preserve today's leniency and pass the original bytes through
         // untouched rather than hard-failing here -- downstream rejects it
         // with a precise WAV-format error if it truly isn't valid input.
-        let prepared_path = info.path.clone();
-        return Ok(PreparedAudioInput {
-            original: info,
-            prepared_path,
-            temp_dir: None,
-        });
+        return Ok(passthrough(info));
     }
     // A non-conformant wav with an *explicit* ffmpeg configured falls through
     // to the general external-tool conversion below instead of returning here,
@@ -133,7 +130,7 @@ pub(crate) fn prepare_external_input(
     match fs::metadata(&prepared_path) {
         Ok(metadata) if metadata.is_file() => Ok(PreparedAudioInput {
             original: info,
-            prepared_path,
+            samples: PreparedAudioSamples::Path(prepared_path),
             temp_dir: Some(temp_dir),
         }),
         _ => Err(AudioPreparationError::PreparedFileMissing {
@@ -153,7 +150,7 @@ fn wav_is_already_conformant(path: &std::path::Path) -> bool {
 
 /// Outcome of [`try_symphonia_prepare`].
 enum SymphoniaAttempt {
-    /// Decoded and written to a temporary WAV; ready to use.
+    /// Decoded straight to memory; ready to use.
     Prepared(PreparedAudioInput),
     /// Not decodable in-process; fall back to the external converter chain.
     /// `codec_label` is the codec name the demuxer identified, if any (see
@@ -170,30 +167,27 @@ enum SymphoniaAttempt {
 /// Tries the in-process symphonia decode path for `info`. Never a hard error
 /// on an unsupported/malformed/panicking input -- the caller falls back to
 /// the external converter chain in every such case (see [`SymphoniaAttempt`]).
+///
+/// On success the decoded samples stay resident in memory
+/// (`PreparedAudioSamples::InMemory`) instead of being encoded to a WAV,
+/// written to a temp file, and immediately re-read + re-parsed back into the
+/// exact same samples by the downstream consumer -- the write-then-reread
+/// round trip this used to always pay for every non-WAV (and non-conformant
+/// WAV) input.
 fn try_symphonia_prepare(info: &AudioInputInfo) -> Result<SymphoniaAttempt, AudioPreparationError> {
-    let (wav_bytes, source_format) = match symphonia_decode::try_decode_to_pcm16_mono_16k_wav(
-        &info.path,
-        info.extension.as_deref(),
-    ) {
-        symphonia_decode::SymphoniaOutcome::Decoded(bytes, source_format) => (bytes, source_format),
-        symphonia_decode::SymphoniaOutcome::Unsupported { codec_label } => {
-            return Ok(SymphoniaAttempt::NotHandled { codec_label });
-        }
-        symphonia_decode::SymphoniaOutcome::ParserPanicked => {
-            return Ok(SymphoniaAttempt::ParserPanicked);
-        }
-    };
-
-    let temp_dir = tempfile::Builder::new()
-        .prefix("openasr-audio-")
-        .tempdir()
-        .map_err(|source| AudioPreparationError::TempDir { source })?;
-    let prepared_path = temp_dir.path().join("prepared.wav");
-    fs::write(&prepared_path, &wav_bytes).map_err(|_source| {
-        AudioPreparationError::PreparedFileMissing {
-            path: prepared_path.clone(),
-        }
-    })?;
+    let (samples, source_format) =
+        match symphonia_decode::try_decode_to_pcm16_mono_16k(&info.path, info.extension.as_deref())
+        {
+            symphonia_decode::SymphoniaOutcome::Decoded(samples, source_format) => {
+                (samples, source_format)
+            }
+            symphonia_decode::SymphoniaOutcome::Unsupported { codec_label } => {
+                return Ok(SymphoniaAttempt::NotHandled { codec_label });
+            }
+            symphonia_decode::SymphoniaOutcome::ParserPanicked => {
+                return Ok(SymphoniaAttempt::ParserPanicked);
+            }
+        };
 
     // The probe stage (`probe::probe_audio_details`) only reads source
     // format off WAV's fmt chunk; for the non-wav formats that land here it
@@ -205,8 +199,8 @@ fn try_symphonia_prepare(info: &AudioInputInfo) -> Result<SymphoniaAttempt, Audi
 
     Ok(SymphoniaAttempt::Prepared(PreparedAudioInput {
         original,
-        prepared_path,
-        temp_dir: Some(temp_dir),
+        samples: PreparedAudioSamples::InMemory(samples.into()),
+        temp_dir: None,
     }))
 }
 

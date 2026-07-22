@@ -298,10 +298,27 @@ fn native_m4a_input_converts_via_afconvert_without_ffmpeg() {
     )
     .expect("decoding a real m4a without ffmpeg configured should succeed");
 
+    assert_prepared_16k_mono_audio(&prepared);
+}
+
+/// The in-process symphonia decode path (the one this m4a/AAC-LC fixture
+/// takes, see the test above) hands back samples already resident in memory
+/// instead of writing a prepared WAV to a temp dir and immediately
+/// re-reading it back -- assert both halves of that contract directly.
+#[test]
+fn symphonia_in_memory_decode_never_writes_a_temp_wav_to_disk() {
+    let prepared = prepare_native_conversion(&crate_fixture("tone_mono.m4a"))
+        .expect("m4a/AAC-LC should decode via the in-process symphonia path");
+
+    assert!(
+        prepared.temp_dir.is_none(),
+        "the in-memory decode path must not create a temp dir"
+    );
+    let samples = prepared
+        .samples()
+        .expect("in-process symphonia decode should hand back in-memory samples");
+    assert!(!samples.is_empty());
     assert!(prepared.is_converted());
-    let bytes = fs::read(prepared.path()).unwrap();
-    assert_eq!(&bytes[0..4], b"RIFF");
-    assert_eq!(&bytes[8..12], b"WAVE");
 }
 
 /// `tests/fixtures/*.{m4a,mp3,flac,ogg,webm,qta}` are all synthesized, not
@@ -333,13 +350,23 @@ fn prepare_native_conversion(path: &Path) -> Result<PreparedAudioInput, AudioPre
     )
 }
 
-fn assert_prepared_16k_mono_wav(prepared: &PreparedAudioInput) {
+/// Asserts `prepared` is a converted, non-empty 16 kHz mono decode,
+/// regardless of which conversion path produced it: the in-process symphonia
+/// path hands back samples already resident in memory
+/// ([`PreparedAudioInput::samples`]), while the external ffmpeg/afconvert
+/// conversion path still writes a real prepared WAV to disk.
+fn assert_prepared_16k_mono_audio(prepared: &PreparedAudioInput) {
     assert!(prepared.is_converted());
-    let bytes = fs::read(prepared.path()).unwrap();
-    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(prepared.path(), "test", "test")
-        .expect("prepared output must be a valid 16 kHz mono WAV");
-    assert_eq!(&bytes[0..4], b"RIFF");
-    assert_eq!(&bytes[8..12], b"WAVE");
+    let samples: Vec<f32> = match prepared.samples() {
+        Some(samples) => samples.to_vec(),
+        None => {
+            let bytes = fs::read(prepared.path()).unwrap();
+            assert_eq!(&bytes[0..4], b"RIFF");
+            assert_eq!(&bytes[8..12], b"WAVE");
+            crate::api::audio_io::load_wav_16khz_mono_f32_v0(prepared.path(), "test", "test")
+                .expect("prepared output must be a valid 16 kHz mono WAV")
+        }
+    };
     assert!(!samples.is_empty());
 }
 
@@ -347,49 +374,49 @@ fn assert_prepared_16k_mono_wav(prepared: &PreparedAudioInput) {
 fn symphonia_decodes_m4a_aac_lc_in_process() {
     let prepared = prepare_native_conversion(&crate_fixture("tone_mono.m4a"))
         .expect("m4a/AAC-LC should decode via the in-process symphonia path");
-    assert_prepared_16k_mono_wav(&prepared);
+    assert_prepared_16k_mono_audio(&prepared);
 }
 
 #[test]
 fn symphonia_decodes_qta_container_in_process() {
     let prepared = prepare_native_conversion(&crate_fixture("tone_mono.qta"))
         .expect(".qta (mov/m4a container) should decode via the in-process symphonia path");
-    assert_prepared_16k_mono_wav(&prepared);
+    assert_prepared_16k_mono_audio(&prepared);
 }
 
 #[test]
 fn symphonia_decodes_mp3_in_process() {
     let prepared = prepare_native_conversion(&crate_fixture("tone_mono.mp3"))
         .expect("mp3 should decode via the in-process symphonia path");
-    assert_prepared_16k_mono_wav(&prepared);
+    assert_prepared_16k_mono_audio(&prepared);
 }
 
 #[test]
 fn symphonia_decodes_flac_in_process() {
     let prepared = prepare_native_conversion(&crate_fixture("tone_mono.flac"))
         .expect("flac should decode via the in-process symphonia path");
-    assert_prepared_16k_mono_wav(&prepared);
+    assert_prepared_16k_mono_audio(&prepared);
 }
 
 #[test]
 fn symphonia_decodes_ogg_vorbis_in_process() {
     let prepared = prepare_native_conversion(&crate_fixture("tone_stereo.ogg"))
         .expect("ogg/vorbis should decode (and downmix) via the in-process symphonia path");
-    assert_prepared_16k_mono_wav(&prepared);
+    assert_prepared_16k_mono_audio(&prepared);
 }
 
 #[test]
 fn symphonia_decodes_webm_vorbis_in_process() {
     let prepared = prepare_native_conversion(&crate_fixture("tone_stereo.webm"))
         .expect("webm/vorbis should decode via the in-process symphonia mkv path");
-    assert_prepared_16k_mono_wav(&prepared);
+    assert_prepared_16k_mono_audio(&prepared);
 }
 
 #[test]
 fn symphonia_decodes_m4a_alac_in_process() {
     let prepared = prepare_native_conversion(&crate_fixture("tone_mono_alac.m4a"))
         .expect("m4a/ALAC should decode via the in-process symphonia alac path");
-    assert_prepared_16k_mono_wav(&prepared);
+    assert_prepared_16k_mono_audio(&prepared);
 }
 
 #[test]
@@ -476,7 +503,7 @@ fn symphonia_decodes_and_resamples_non_conformant_wav() {
     // and resampled via the same symphonia path as the other formats.
     let prepared = prepare_native_conversion(&crate_fixture("tone_stereo_44100.wav"))
         .expect("non-conformant wav should decode via the in-process symphonia path");
-    assert_prepared_16k_mono_wav(&prepared);
+    assert_prepared_16k_mono_audio(&prepared);
 }
 
 #[test]
@@ -488,7 +515,7 @@ fn he_aac_falls_back_to_afconvert_when_symphonia_cannot_decode_it() {
     // silently emitting bandwidth-limited audio.
     let prepared = prepare_native_conversion(&crate_fixture("tone_heaac.m4a"))
         .expect("HE-AAC should fall back to afconvert and still succeed");
-    assert_prepared_16k_mono_wav(&prepared);
+    assert_prepared_16k_mono_audio(&prepared);
 }
 
 #[test]

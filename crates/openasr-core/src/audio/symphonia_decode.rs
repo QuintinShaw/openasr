@@ -48,7 +48,7 @@ use symphonia::core::{
     probe::Hint,
 };
 
-const TARGET_SAMPLE_RATE: u32 = 16_000;
+pub(crate) const TARGET_SAMPLE_RATE_HZ: u32 = 16_000;
 // FFT resampler chunk size: large enough to amortize FFT overhead, small
 // enough to keep peak memory low for long recordings.
 const RESAMPLE_CHUNK_FRAMES: usize = 4096;
@@ -67,10 +67,12 @@ pub(crate) struct DecodedAudioSourceFormat {
 
 /// Result of attempting the in-process symphonia decode path.
 pub(crate) enum SymphoniaOutcome {
-    /// Decoded successfully: ready-to-use 16 kHz mono PCM16 WAV bytes, plus
-    /// the file's true source format (sample rate/channels, before this
-    /// module's downmix/resample) for diagnostics.
-    Decoded(Vec<u8>, DecodedAudioSourceFormat),
+    /// Decoded successfully: ready-to-use 16 kHz mono f32 samples, plus the
+    /// file's true source format (sample rate/channels, before this module's
+    /// downmix/resample) for diagnostics. Callers hand these samples
+    /// straight to the rest of the pipeline in memory -- no WAV encode, disk
+    /// write, or re-read/re-parse round trip.
+    Decoded(Vec<f32>, DecodedAudioSourceFormat),
     /// Not decodable in-process (unsupported codec, malformed stream, or an
     /// otherwise-empty result) -- fall back to the external converter chain.
     /// `codec_label` is populated whenever the demuxer identified the track's
@@ -85,11 +87,11 @@ pub(crate) enum SymphoniaOutcome {
     ParserPanicked,
 }
 
-/// Attempt to decode `path` to a 16 kHz mono PCM16 WAV entirely in-process.
+/// Attempt to decode `path` to 16 kHz mono f32 samples entirely in-process.
 /// Never panics, even on adversarial input (see module docs): a panic inside
 /// the underlying symphonia demuxer/decoder is caught and reported as
 /// [`SymphoniaOutcome::ParserPanicked`].
-pub(crate) fn try_decode_to_pcm16_mono_16k_wav(
+pub(crate) fn try_decode_to_pcm16_mono_16k(
     path: &Path,
     extension: Option<&str>,
 ) -> SymphoniaOutcome {
@@ -118,7 +120,7 @@ pub(crate) fn try_decode_to_pcm16_mono_16k_wav(
         sample_rate_hz: mono.sample_rate,
         channels: mono.channels,
     };
-    let resampled = if mono.sample_rate == TARGET_SAMPLE_RATE {
+    let resampled = if mono.sample_rate == TARGET_SAMPLE_RATE_HZ {
         mono.samples
     } else {
         match resample_mono_to_16k(&mono.samples, mono.sample_rate) {
@@ -130,7 +132,7 @@ pub(crate) fn try_decode_to_pcm16_mono_16k_wav(
             }
         }
     };
-    SymphoniaOutcome::Decoded(encode_pcm16_mono_16k_wav(&resampled), source_format)
+    SymphoniaOutcome::Decoded(resampled, source_format)
 }
 
 /// Result of [`probe_codec_label`]: names the codec of a file's first real
@@ -155,7 +157,7 @@ pub(crate) enum ProbeOutcome {
 /// letting callers report a precise "this codec is unsupported" error instead
 /// of an opaque conversion failure. Never panics (see module docs).
 pub(crate) fn probe_codec_label(path: &Path, extension: Option<&str>) -> ProbeOutcome {
-    // Same `UnwindSafe` reasoning as `try_decode_to_pcm16_mono_16k_wav` above:
+    // Same `UnwindSafe` reasoning as `try_decode_to_pcm16_mono_16k` above:
     // both captured arguments are plain shared references with no interior
     // mutability.
     match catch_unwind(|| probe_codec_label_inner(path, extension)) {
@@ -219,7 +221,7 @@ struct DecodedMono {
 /// so a caller reporting a failed decode doesn't need to re-open and re-probe
 /// the file just to name the codec (see `codec_label` on the returned
 /// struct). Never itself panics on symphonia's behalf -- run this through
-/// `catch_unwind` (as `try_decode_to_pcm16_mono_16k_wav` does), not directly.
+/// `catch_unwind` (as `try_decode_to_pcm16_mono_16k` does), not directly.
 struct DecodeAttempt {
     /// Populated as soon as a real (non-null) track is found, even if
     /// decoding it then fails -- see [`codec_type_label`].
@@ -406,7 +408,7 @@ where
 fn resample_mono_to_16k(input: &[f32], input_rate: u32) -> Option<Vec<f32>> {
     let mut resampler = FftFixedIn::<f32>::new(
         input_rate as usize,
-        TARGET_SAMPLE_RATE as usize,
+        TARGET_SAMPLE_RATE_HZ as usize,
         RESAMPLE_CHUNK_FRAMES,
         RESAMPLE_SUB_CHUNKS,
         1,
@@ -414,7 +416,7 @@ fn resample_mono_to_16k(input: &[f32], input_rate: u32) -> Option<Vec<f32>> {
     .ok()?;
 
     let mut output: Vec<f32> = Vec::with_capacity(
-        input.len() * TARGET_SAMPLE_RATE as usize / input_rate.max(1) as usize
+        input.len() * TARGET_SAMPLE_RATE_HZ as usize / input_rate.max(1) as usize
             + RESAMPLE_CHUNK_FRAMES,
     );
     let mut position = 0usize;
@@ -455,51 +457,9 @@ fn resample_mono_to_16k(input: &[f32], input_rate: u32) -> Option<Vec<f32>> {
     Some(output)
 }
 
-/// Encodes mono f32 samples (expected in `[-1.0, 1.0]`) as a canonical PCM16
-/// mono 16 kHz WAV file, matching the format `api::audio_io` expects.
-fn encode_pcm16_mono_16k_wav(samples: &[f32]) -> Vec<u8> {
-    let data_size = (samples.len() * 2) as u32;
-    let mut bytes = Vec::with_capacity(44 + data_size as usize);
-    bytes.extend_from_slice(b"RIFF");
-    bytes.extend_from_slice(&(36 + data_size).to_le_bytes());
-    bytes.extend_from_slice(b"WAVE");
-    bytes.extend_from_slice(b"fmt ");
-    bytes.extend_from_slice(&16_u32.to_le_bytes());
-    bytes.extend_from_slice(&1_u16.to_le_bytes()); // PCM
-    bytes.extend_from_slice(&1_u16.to_le_bytes()); // mono
-    bytes.extend_from_slice(&TARGET_SAMPLE_RATE.to_le_bytes());
-    let byte_rate = TARGET_SAMPLE_RATE * 2;
-    bytes.extend_from_slice(&byte_rate.to_le_bytes());
-    bytes.extend_from_slice(&2_u16.to_le_bytes()); // block align
-    bytes.extend_from_slice(&16_u16.to_le_bytes()); // bits per sample
-    bytes.extend_from_slice(b"data");
-    bytes.extend_from_slice(&data_size.to_le_bytes());
-    for &sample in samples {
-        let clamped = sample.clamp(-1.0, 1.0);
-        let quantized = (clamped * i16::MAX as f32).round() as i16;
-        bytes.extend_from_slice(&quantized.to_le_bytes());
-    }
-    bytes
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wav_encoder_round_trips_through_audio_io_reader() {
-        let samples = vec![0.0_f32, 0.5, -0.5, 1.0, -1.0];
-        let bytes = encode_pcm16_mono_16k_wav(&samples);
-
-        let parsed =
-            crate::api::audio_io::load_wav_16khz_mono_f32_v0(write_temp(&bytes), "test", "test")
-                .unwrap();
-
-        assert_eq!(parsed.len(), samples.len());
-        for (expected, actual) in samples.iter().zip(parsed.iter()) {
-            assert!((expected - actual).abs() < 0.001, "{expected} vs {actual}");
-        }
-    }
 
     #[test]
     fn resample_preserves_frame_count_ratio() {
@@ -517,13 +477,6 @@ mod tests {
             "expected ~{expected} samples, got {}",
             output.len()
         );
-    }
-
-    fn write_temp(bytes: &[u8]) -> std::path::PathBuf {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.keep().join("out.wav");
-        std::fs::write(&path, bytes).unwrap();
-        path
     }
 
     /// A minimal webm/mkv EBML header whose size vint is the single byte
@@ -552,7 +505,7 @@ mod tests {
         // must now report `ParserPanicked` and let the caller fall back to
         // the external converter chain instead of crashing the process.
         assert!(matches!(
-            try_decode_to_pcm16_mono_16k_wav(&path, Some("webm")),
+            try_decode_to_pcm16_mono_16k(&path, Some("webm")),
             SymphoniaOutcome::ParserPanicked
         ));
         assert!(matches!(

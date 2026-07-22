@@ -1256,7 +1256,8 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
         .with_word_timestamps_refine(matches!(
             options.word_timestamps_mode,
             Some(WordTimestampsMode::Aligned)
-        ));
+        ))
+        .with_prepared_samples(prepared.shared_samples());
     let transcription =
         transcribe_with_backend(prepared_run.backend_kind, request).map_err(|error| {
             consent::CliExit::new(consent::ExitCode::RuntimeFailed, error.to_string())
