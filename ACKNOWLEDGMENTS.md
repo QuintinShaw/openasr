@@ -103,6 +103,10 @@ credit all the same:
   behind our from-scratch fbank frontends. <https://github.com/pytorch/audio>
 - **CrispASR** — we studied its Qwen ASR GGUF implementation while designing our
   own Qwen family runtime. <https://github.com/CrispStrobe/CrispASR>
+- **transcribe.cpp** — its convention of reserving a decode session's KV-cache
+  buffer once instead of reallocating per step inspired the CPU per-token
+  decode step buffer's own reuse-instead-of-reallocate-every-step pool.
+  <https://github.com/handy-computer/transcribe.cpp>
 - **Handy** — side-by-side comparison with Handy's push-to-talk dictation shaped
   our desktop insertion and recording-stop behavior.
   <https://github.com/cjpais/Handy>
