@@ -1,7 +1,7 @@
 use std::{fmt, path::PathBuf};
 
 use crate::realtime::RealtimeSessionId;
-use crate::{LongFormOptions, PhraseBiasConfig, TranscriptionTask};
+use crate::{LongFormOptions, PhraseBiasConfig, RequestSource, TranscriptionTask};
 
 macro_rules! impl_enum_str_display {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
@@ -288,6 +288,24 @@ pub struct NativeAsrOfflineRequest {
     pub options: NativeAsrRequestOptions,
     pub longform: Option<LongFormOptions>,
     pub display_file_name: Option<String>,
+    /// Which call path built this request -- carried through to
+    /// [`crate::TranscriptionRequest::source`] by
+    /// `native_offline_request_to_transcription_request` for the
+    /// `stage=request_context` `daemon.log` line. Defaults to
+    /// [`RequestSource::Unspecified`]; callers set it via [`Self::with_source`].
+    pub source: RequestSource,
+    /// The *source* audio's real sample rate/channel count, before this
+    /// crate's normalization pipeline resamples/downmixes -- same
+    /// "probed/known, never fabricated" contract as
+    /// [`crate::TranscriptionRequest::source_sample_rate_hz`], which this
+    /// carries through to.
+    pub source_sample_rate_hz: Option<u32>,
+    pub source_channels: Option<u16>,
+    /// The source file's container/codec extension, same
+    /// "probed/known, never fabricated" contract as
+    /// [`crate::TranscriptionRequest::source_container`], which this carries
+    /// through to.
+    pub source_container: Option<String>,
 }
 
 impl NativeAsrOfflineRequest {
@@ -297,6 +315,10 @@ impl NativeAsrOfflineRequest {
             options: NativeAsrRequestOptions::default(),
             longform: None,
             display_file_name: None,
+            source: RequestSource::default(),
+            source_sample_rate_hz: None,
+            source_channels: None,
+            source_container: None,
         }
     }
 
@@ -312,6 +334,32 @@ impl NativeAsrOfflineRequest {
 
     pub fn with_display_file_name(mut self, display_file_name: Option<String>) -> Self {
         self.display_file_name = display_file_name;
+        self
+    }
+
+    pub fn with_source(mut self, source: RequestSource) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Sets the source audio's real sample rate/channel count. Pass `None`
+    /// for either when it is genuinely unknown -- never a normalization
+    /// constant; see this field's doc comment.
+    pub fn with_source_audio_format(
+        mut self,
+        sample_rate_hz: Option<u32>,
+        channels: Option<u16>,
+    ) -> Self {
+        self.source_sample_rate_hz = sample_rate_hz;
+        self.source_channels = channels;
+        self
+    }
+
+    /// Sets the source file's container/codec extension. Pass the raw
+    /// extension (e.g. `"m4a"`) or `None` when genuinely unknown -- never
+    /// the file name.
+    pub fn with_source_container(mut self, container: Option<String>) -> Self {
+        self.source_container = container;
         self
     }
 }

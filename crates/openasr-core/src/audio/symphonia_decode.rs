@@ -30,6 +30,17 @@ const TARGET_SAMPLE_RATE: u32 = 16_000;
 const RESAMPLE_CHUNK_FRAMES: usize = 4096;
 const RESAMPLE_SUB_CHUNKS: usize = 2;
 
+/// The decoded file's *source* format, before this module's mono-downmix and
+/// 16 kHz resample -- e.g. `{ sample_rate_hz: 44100, channels: 2 }` for a
+/// typical music-app m4a export. Surfaced so callers (see
+/// `prepare::try_symphonia_prepare`) can report the true source format for
+/// diagnostics without a second, separate probe of the same file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecodedAudioSourceFormat {
+    pub(crate) sample_rate_hz: u32,
+    pub(crate) channels: u16,
+}
+
 /// Attempt to decode `path` to a 16 kHz mono PCM16 WAV entirely in-process.
 /// Returns `None` (never an error) if the container/codec is not supported
 /// by the enabled symphonia features, or if decoding otherwise fails --
@@ -37,22 +48,31 @@ const RESAMPLE_SUB_CHUNKS: usize = 2;
 pub(crate) fn try_decode_to_pcm16_mono_16k_wav(
     path: &Path,
     extension: Option<&str>,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, DecodedAudioSourceFormat)> {
     let mono = decode_to_mono_f32(path, extension)?;
     if mono.samples.is_empty() {
         return None;
     }
+    let source_format = DecodedAudioSourceFormat {
+        sample_rate_hz: mono.sample_rate,
+        channels: mono.channels,
+    };
     let resampled = if mono.sample_rate == TARGET_SAMPLE_RATE {
         mono.samples
     } else {
         resample_mono_to_16k(&mono.samples, mono.sample_rate)?
     };
-    Some(encode_pcm16_mono_16k_wav(&resampled))
+    Some((encode_pcm16_mono_16k_wav(&resampled), source_format))
 }
 
 struct DecodedMono {
     samples: Vec<f32>,
     sample_rate: u32,
+    /// The source track's channel count *before* this function's mono
+    /// downmix (which always collapses to 1) -- captured from the first
+    /// successfully decoded packet's `AudioBufferRef::spec()`, same as
+    /// `sample_rate` below.
+    channels: u16,
 }
 
 fn decode_to_mono_f32(path: &Path, extension: Option<&str>) -> Option<DecodedMono> {
@@ -92,6 +112,7 @@ fn decode_to_mono_f32(path: &Path, extension: Option<&str>) -> Option<DecodedMon
 
     let mut samples: Vec<f32> = Vec::new();
     let mut sample_rate: Option<u32> = None;
+    let mut channels: Option<u16> = None;
 
     loop {
         let packet = match format.next_packet() {
@@ -109,8 +130,9 @@ fn decode_to_mono_f32(path: &Path, extension: Option<&str>) -> Option<DecodedMon
 
         match decoder.decode(&packet) {
             Ok(decoded) => {
-                let rate = decoded.spec().rate;
-                sample_rate.get_or_insert(rate);
+                let spec = decoded.spec();
+                sample_rate.get_or_insert(spec.rate);
+                channels.get_or_insert(spec.channels.count() as u16);
                 push_downmixed_samples(&decoded, &mut samples);
             }
             // A single corrupt/undecodable packet does not doom the whole
@@ -128,10 +150,15 @@ fn decode_to_mono_f32(path: &Path, extension: Option<&str>) -> Option<DecodedMon
     if sample_rate == 0 {
         return None;
     }
+    // `.max(1)` mirrors `push_downmixed_samples`'s own floor: a spec reporting
+    // zero channels is nonsensical, so treat it the same as "unknown" rather
+    // than surfacing an impossible `0` in a diagnostics field.
+    let channels = channels.unwrap_or(1).max(1);
 
     Some(DecodedMono {
         samples,
         sample_rate,
+        channels,
     })
 }
 

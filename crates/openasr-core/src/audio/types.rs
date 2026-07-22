@@ -15,6 +15,17 @@ pub struct AudioInputInfo {
     pub extension: Option<String>,
     pub recognized_extension: bool,
     pub duration_seconds: Option<f64>,
+    /// The *source* file's sample rate in Hz, before any resampling this
+    /// crate's normalization pipeline applies -- e.g. `8000` for a phone-call
+    /// recording or `44100`/`48000` for a typical music-app export. `None`
+    /// when the source rate could not be determined (an unrecognized
+    /// extension, or a format this crate does not decode in-process --
+    /// callers must not fabricate a value in that case; see
+    /// `crate::api::backend::request_context`'s privacy/honesty contract).
+    pub sample_rate_hz: Option<u32>,
+    /// The source file's channel count, before this pipeline's mono downmix.
+    /// Same "probed, never fabricated" contract as `sample_rate_hz`.
+    pub channels: Option<u16>,
     pub issues: Vec<AudioInputIssue>,
 }
 

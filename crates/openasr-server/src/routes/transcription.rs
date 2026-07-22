@@ -284,6 +284,11 @@ async fn run_offline_transcription(
     if let Some(task) = task_override {
         parsed.request.task = Some(task);
     }
+    parsed.request.source = if task_override == Some(TranscriptionTask::Translate) {
+        openasr_core::RequestSource::ServerTranslate
+    } else {
+        openasr_core::RequestSource::ServerTranscribe
+    };
     let history_request = parsed.request.clone();
     if runtime.backend == BackendKind::Native {
         validate_native_request_model(&runtime, &parsed.request.model_id)
@@ -1368,7 +1373,23 @@ pub(crate) async fn transcribe_with_runtime(
                         .with_word_timestamps_refine(request.word_timestamps_refine),
                 )
                 .with_longform(request.longform.clone())
-                .with_display_file_name(request.display_file_name.clone());
+                .with_display_file_name(request.display_file_name.clone())
+                .with_source(request.source)
+                // The source audio's real format for the `stage=request_context`
+                // log line -- `prepared.original()` is the pre-normalization
+                // probe (WAV fmt chunk) or decode (other recognized formats)
+                // result; `None` when this pipeline could not determine it
+                // (unrecognized extension, or a format only the external
+                // ffmpeg/afconvert fallback handles).
+                .with_source_audio_format(
+                    prepared.original().sample_rate_hz,
+                    prepared.original().channels,
+                )
+                // Extension only, off the upload's own temp file (which
+                // preserves the client's original extension via
+                // `safe_extension_suffix` -- see `ingest_field` above); never
+                // the client-supplied file name/stem itself.
+                .with_source_container(prepared.original().extension.clone());
             let executor = NativeBackendExecutor;
             let mut transcription = NativeAsrExecutor::transcribe(
                 &executor,

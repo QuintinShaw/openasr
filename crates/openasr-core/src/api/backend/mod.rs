@@ -7,6 +7,7 @@ use crate::models::language::LanguageMode;
 
 mod mock;
 mod native;
+mod request_context;
 
 pub use mock::transcribe_with_mock_backend;
 pub use native::{
@@ -19,6 +20,10 @@ pub use native::{
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,
     resolve_local_native_runtime_model_identity, unload_idle_native_model_runtime_caches,
     validate_local_native_model_pack_path, validate_native_runtime_model_pack_contract,
+};
+pub use request_context::{
+    FailureCategory, RequestSource, format_failure_context_line, format_request_context_line,
+    log_failure_context, log_request_context,
 };
 
 pub const NATIVE_RUNTIME_MODEL_ID_AUTO: &str = "__openasr_native_runtime_model_id_auto__";
@@ -373,6 +378,31 @@ pub struct TranscriptionRequest {
     /// preference toggle), not the primary gate. Never triggers a download --
     /// same fail-closed contract as `word_timestamps_refine`.
     pub punctuate: bool,
+    /// Which call path built this request (CLI transcribe/live, server
+    /// transcribe/translate/realtime) -- diagnostics only, logged verbatim
+    /// into the `stage=request_context` `daemon.log` line so a bug report is
+    /// self-describing. Defaults to [`RequestSource::Unspecified`]; real
+    /// entry points set it via [`Self::with_source`].
+    pub source: RequestSource,
+    /// The *source* audio's real sample rate/channel count (before this
+    /// crate's normalization pipeline resamples/downmixes to 16 kHz mono) --
+    /// diagnostics only, logged verbatim into the `stage=request_context`
+    /// line. `None` when the caller has no source format to report (a
+    /// synthesized-format realtime utterance request sets these explicitly to
+    /// its true captured format instead of leaving them `None`; a file
+    /// request sets them from [`crate::audio::AudioInputInfo`] once
+    /// `prepare_audio_input` has probed/decoded the file). Never a
+    /// normalization-pipeline constant -- see
+    /// [`crate::api::backend::request_context`]'s honesty contract.
+    pub source_sample_rate_hz: Option<u32>,
+    pub source_channels: Option<u16>,
+    /// The *source* file's container/codec extension (e.g. `"m4a"`,
+    /// `"mp3"`), lowercased, with no leading dot -- before any conversion
+    /// this pipeline performs to reach the normalized WAV it actually
+    /// decodes. Same honesty contract as `source_sample_rate_hz`: `None` when
+    /// genuinely unknown, never guessed, and never the *file name* or any
+    /// other path component -- extension only.
+    pub source_container: Option<String>,
 }
 
 impl TranscriptionRequest {
@@ -395,7 +425,39 @@ impl TranscriptionRequest {
             diarize: false,
             diarize_speakers: None,
             punctuate: true,
+            source: RequestSource::default(),
+            source_sample_rate_hz: None,
+            source_channels: None,
+            source_container: None,
         }
+    }
+
+    pub fn with_source(mut self, source: RequestSource) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Sets the source audio's real sample rate/channel count for the
+    /// `stage=request_context` log line. Pass `None` for either when it is
+    /// genuinely unknown -- never a normalization constant; see this field's
+    /// doc comment.
+    pub fn with_source_audio_format(
+        mut self,
+        sample_rate_hz: Option<u32>,
+        channels: Option<u16>,
+    ) -> Self {
+        self.source_sample_rate_hz = sample_rate_hz;
+        self.source_channels = channels;
+        self
+    }
+
+    /// Sets the source file's container/codec extension for the
+    /// `stage=request_context` log line. Pass the raw extension (e.g.
+    /// `"m4a"`) or `None` when genuinely unknown -- never the file name; see
+    /// this field's doc comment.
+    pub fn with_source_container(mut self, container: Option<String>) -> Self {
+        self.source_container = container;
+        self
     }
 
     pub fn with_language(mut self, language: Option<String>) -> Self {

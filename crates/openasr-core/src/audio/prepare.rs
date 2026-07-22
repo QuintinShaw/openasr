@@ -138,7 +138,7 @@ fn wav_is_already_conformant(path: &std::path::Path) -> bool {
 fn try_symphonia_prepare(
     info: &AudioInputInfo,
 ) -> Result<Option<PreparedAudioInput>, AudioPreparationError> {
-    let Some(wav_bytes) =
+    let Some((wav_bytes, source_format)) =
         symphonia_decode::try_decode_to_pcm16_mono_16k_wav(&info.path, info.extension.as_deref())
     else {
         return Ok(None);
@@ -155,8 +155,16 @@ fn try_symphonia_prepare(
         }
     })?;
 
+    // The probe stage (`probe::probe_audio_details`) only reads source
+    // format off WAV's fmt chunk; for the non-wav formats that land here it
+    // could not have known this yet, so fill it in now from the decode that
+    // just ran -- the true source format, not a second separate probe.
+    let mut original = info.clone();
+    original.sample_rate_hz = Some(source_format.sample_rate_hz);
+    original.channels = Some(source_format.channels);
+
     Ok(Some(PreparedAudioInput {
-        original: info.clone(),
+        original,
         prepared_path,
         temp_dir: Some(temp_dir),
     }))

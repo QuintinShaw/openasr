@@ -553,6 +553,9 @@ fn native_offline_request_to_transcription_request(
         .with_diarization(request.options.diarize)
         .with_longform(request.longform)
         .with_display_file_name(request.display_file_name)
+        .with_source(request.source)
+        .with_source_audio_format(request.source_sample_rate_hz, request.source_channels)
+        .with_source_container(request.source_container)
 }
 
 fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {

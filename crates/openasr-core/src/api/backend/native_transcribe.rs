@@ -28,6 +28,8 @@ use crate::{
     GgmlFamilyRegistrySelectionError, OasrV1MetadataError, parse_model_ref,
 };
 
+use crate::api::backend::{FailureCategory, log_failure_context, log_request_context};
+
 use super::{BackendError, Transcription, TranscriptionRequest};
 use crate::Segment;
 use crate::WordTimestamp;
@@ -745,7 +747,57 @@ struct NativeLongformPolicyResolution {
 /// state that function computes. Punctuation runs before the forced-aligner
 /// refine so the aligner (and every other downstream consumer) sees the
 /// punctuated text.
+/// Thin wrapper over [`run_native_transcription_fallible`] that adds exactly
+/// one thing: a `stage=transcribe_failure` `daemon.log` line on the `Err`
+/// path, carrying the failure's category and the process's current
+/// available-memory (and, if applicable, VRAM) reading. Kept as a separate
+/// wrapper rather than folding the logging into the fallible function itself
+/// so every one of that function's many early-return `?` sites (model
+/// resolve, audio prep, capability rejection, decode dispatch, ...) is
+/// covered by one log site instead of needing its own.
 pub(super) fn run_native_transcription(
+    request: TranscriptionRequest,
+) -> Result<Transcription, BackendError> {
+    run_native_transcription_fallible(request).inspect_err(|error| {
+        log_failure_context(classify_backend_error_for_failure_log(error));
+    })
+}
+
+/// Coarse [`FailureCategory`] bucket for a `BackendError`, reusing its
+/// existing variants (and, for the variants that flatten internal detail
+/// into a `NativeFailClosed` reason string, the same allocation-failure
+/// marker-text sniffing `gpu_buffer_allocation_failure_backend` already
+/// relies on above) rather than introducing a second, parallel error
+/// taxonomy just for logging.
+fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCategory {
+    match error {
+        BackendError::NativeUnsupportedInputFormat { .. } => FailureCategory::AudioIo,
+        BackendError::NativeModelPackPathRequired
+        | BackendError::NativeModelPackPathRejected { .. }
+        | BackendError::NativeModelSelectionMismatch { .. } => FailureCategory::ModelResolve,
+        BackendError::DiarizationNotSupported { .. }
+        | BackendError::DiarizeSpeakersRequiresDiarization
+        | BackendError::PhraseBiasNotSupported { .. }
+        | BackendError::AdapterNotSupported { .. }
+        | BackendError::PhraseBiasUnsupportedByModel { .. }
+        | BackendError::RequestOptionUnsupportedByModel { .. }
+        | BackendError::WordTimestampAlignmentRequiresWordTimestamps
+        | BackendError::WordTimestampAlignmentPackMissing { .. } => {
+            FailureCategory::UnsupportedCapability
+        }
+        BackendError::TranscriptionCanceled => FailureCategory::Canceled,
+        BackendError::ServeBatchUnavailable { .. } => FailureCategory::Transient,
+        BackendError::NativeFailClosed { .. }
+            if gpu_buffer_allocation_failure_backend(error).is_some() =>
+        {
+            FailureCategory::Alloc
+        }
+        BackendError::NativeFailClosed { .. }
+        | BackendError::WordTimestampAlignmentFailed { .. } => FailureCategory::Decode,
+    }
+}
+
+fn run_native_transcription_fallible(
     request: TranscriptionRequest,
 ) -> Result<Transcription, BackendError> {
     let refine = request.word_timestamps_refine;
@@ -1123,6 +1175,22 @@ fn run_native_transcription_impl(
     // executor used (see `native_runtime_backend_label`'s doc comment).
     let auto_gpu_policy = crate::arch::family_auto_gpu_policy_for_model_architecture(
         selected_family.model_architecture,
+    );
+    // Per-request diagnostics line (source/model/quant/backend/audio shape) --
+    // logged once here, after model resolution and audio prep have both
+    // succeeded and the backend label is resolvable, and before decode
+    // dispatch. Deliberately excludes `request.input_path`/
+    // `request.display_file_name` and any decoded/transcribed text: see
+    // `request_context`'s module doc for the privacy contract.
+    log_request_context(
+        request.source,
+        requested_model_id,
+        &quant_tag_for_log(requested_model_id, runtime_source.path()),
+        native_runtime_backend_label(auto_gpu_policy),
+        audio_duration_seconds,
+        request.source_container.as_deref(),
+        request.source_sample_rate_hz,
+        request.source_channels,
     );
     let mut longform_metadata: Option<TranscriptionLongFormMetadata> = None;
     if run_longform {
@@ -2329,6 +2397,28 @@ fn native_runtime_backend_label(
         GgmlCpuGraphBackend::Cpu => "cpu",
         GgmlCpuGraphBackend::Metal => "metal",
         GgmlCpuGraphBackend::Gpu => "gpu",
+    }
+}
+
+/// Best-effort quant tag for the `stage=request_context` log line: installed
+/// packs live at `<home>/models/<model>/<quant>/<model>-<quant>.oasr` (see
+/// `pull.rs`'s `InstalledPack` layout), so the runtime pack path's *parent
+/// directory name* already is the quant tag -- no second GGUF/metadata read
+/// needed. Falls back to the tag parsed off the request's own model ref
+/// (`family:quant`) for a pack laid out outside that convention (e.g.
+/// `--model-pack` pointed at an arbitrary file), and finally to `"unknown"`
+/// rather than fabricating a value.
+fn quant_tag_for_log(requested_model_id: &str, runtime_pack_path: &Path) -> String {
+    let from_parent_dir = runtime_pack_path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str());
+    let from_request_tag = parse_model_ref(requested_model_id)
+        .ok()
+        .and_then(|reference| reference.tag);
+    match from_parent_dir.or(from_request_tag.as_deref()) {
+        Some(tag) => crate::canonical_quant_tag(tag).to_string(),
+        None => "unknown".to_string(),
     }
 }
 
