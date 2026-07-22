@@ -1255,6 +1255,11 @@ async fn run_realtime_backend_job(runtime: ServerRuntime, job: BackendJob) -> Ba
     let response_language = job.language.clone();
     let request = openasr_core::TranscriptionRequest::new(job.temp_wav.path(), job.model_id)
         .with_source(openasr_core::RequestSource::ServerRealtime)
+        // Not a normalization-pipeline guess: `write_temp_utterance_wav`
+        // (see `realtime/mod.rs`) always writes PCM16 mono 16 kHz -- this is
+        // the realtime session's real fixed capture format, unlike an
+        // uploaded file whose source format is unknown until probed/decoded.
+        .with_source_audio_format(Some(16_000), Some(1))
         .with_language(job.language)
         .with_task(job.task)
         .with_prompt(job.prompt)

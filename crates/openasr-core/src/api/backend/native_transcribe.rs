@@ -1189,8 +1189,8 @@ fn run_native_transcription_impl(
         native_runtime_backend_label(auto_gpu_policy),
         audio_duration_seconds,
         input_container_tag(&request.input_path),
-        16_000,
-        1,
+        request.source_sample_rate_hz,
+        request.source_channels,
     );
     let mut longform_metadata: Option<TranscriptionLongFormMetadata> = None;
     if run_longform {

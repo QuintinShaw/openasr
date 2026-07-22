@@ -384,6 +384,18 @@ pub struct TranscriptionRequest {
     /// self-describing. Defaults to [`RequestSource::Unspecified`]; real
     /// entry points set it via [`Self::with_source`].
     pub source: RequestSource,
+    /// The *source* audio's real sample rate/channel count (before this
+    /// crate's normalization pipeline resamples/downmixes to 16 kHz mono) --
+    /// diagnostics only, logged verbatim into the `stage=request_context`
+    /// line. `None` when the caller has no source format to report (a
+    /// synthesized-format realtime utterance request sets these explicitly to
+    /// its true captured format instead of leaving them `None`; a file
+    /// request sets them from [`crate::audio::AudioInputInfo`] once
+    /// `prepare_audio_input` has probed/decoded the file). Never a
+    /// normalization-pipeline constant -- see
+    /// [`crate::api::backend::request_context`]'s honesty contract.
+    pub source_sample_rate_hz: Option<u32>,
+    pub source_channels: Option<u16>,
 }
 
 impl TranscriptionRequest {
@@ -407,11 +419,27 @@ impl TranscriptionRequest {
             diarize_speakers: None,
             punctuate: true,
             source: RequestSource::default(),
+            source_sample_rate_hz: None,
+            source_channels: None,
         }
     }
 
     pub fn with_source(mut self, source: RequestSource) -> Self {
         self.source = source;
+        self
+    }
+
+    /// Sets the source audio's real sample rate/channel count for the
+    /// `stage=request_context` log line. Pass `None` for either when it is
+    /// genuinely unknown -- never a normalization constant; see this field's
+    /// doc comment.
+    pub fn with_source_audio_format(
+        mut self,
+        sample_rate_hz: Option<u32>,
+        channels: Option<u16>,
+    ) -> Self {
+        self.source_sample_rate_hz = sample_rate_hz;
+        self.source_channels = channels;
         self
     }
 

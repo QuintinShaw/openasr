@@ -68,6 +68,12 @@ impl RequestSource {
 /// `"whisper-small"`), never a file path; `quant_tag` and `backend_label` are
 /// short fixed-vocabulary tokens (`"q4_k"`, `"metal"`, ...); `container` is a
 /// codec/extension tag (e.g. `"wav"`), not a file name.
+///
+/// `sample_rate_hz`/`channels` are the *source* audio's real format (before
+/// this crate's normalization pipeline resamples/downmixes), not the
+/// normalized-pipeline constants -- print `"unknown"` (matching
+/// [`format_failure_context_line`]'s degrade style) rather than a fabricated
+/// number when the caller could not determine them.
 #[allow(clippy::too_many_arguments)]
 pub fn format_request_context_line(
     source: RequestSource,
@@ -76,9 +82,11 @@ pub fn format_request_context_line(
     backend_label: &str,
     audio_duration_seconds: f32,
     container: &str,
-    sample_rate_hz: u32,
-    channels: u16,
+    sample_rate_hz: Option<u32>,
+    channels: Option<u16>,
 ) -> String {
+    let sample_rate_hz = sample_rate_hz.map_or_else(|| "unknown".to_string(), |hz| hz.to_string());
+    let channels = channels.map_or_else(|| "unknown".to_string(), |count| count.to_string());
     format!(
         "stage=request_context source={} model={model_id} quant={quant_tag} backend={backend_label} audio_duration_s={audio_duration_seconds:.2} container={container} sample_rate_hz={sample_rate_hz} channels={channels}",
         source.as_log_label(),
@@ -97,8 +105,8 @@ pub fn log_request_context(
     backend_label: &str,
     audio_duration_seconds: f32,
     container: &str,
-    sample_rate_hz: u32,
-    channels: u16,
+    sample_rate_hz: Option<u32>,
+    channels: Option<u16>,
 ) {
     stage_timing::log_event(
         "native_transcribe",
@@ -240,8 +248,8 @@ mod tests {
             "metal",
             12.34,
             "wav",
-            16_000,
-            1,
+            Some(16_000),
+            Some(1),
         );
         // Regression guard for the privacy contract: no field named
         // path/file/input in the formatted line, and no path separators that
@@ -260,6 +268,47 @@ mod tests {
         assert!(line.contains("container=wav"));
         assert!(line.contains("sample_rate_hz=16000"));
         assert!(line.contains("channels=1"));
+    }
+
+    #[test]
+    fn request_context_line_reports_the_true_source_format_not_a_normalized_constant() {
+        // Regression guard for the field's honesty contract: a non-16 kHz,
+        // non-mono source (e.g. a 44.1 kHz stereo m4a export) must show up as
+        // its own real numbers, not silently collapse to the normalization
+        // pipeline's 16000/1 constants.
+        let line = format_request_context_line(
+            RequestSource::ServerTranscribe,
+            "whisper-small",
+            "q4_k",
+            "metal",
+            12.34,
+            "m4a",
+            Some(44_100),
+            Some(2),
+        );
+        assert!(line.contains("sample_rate_hz=44100"));
+        assert!(line.contains("channels=2"));
+        assert!(!line.contains("sample_rate_hz=16000"));
+        assert!(!line.contains("channels=1"));
+    }
+
+    #[test]
+    fn request_context_line_degrades_to_unknown_when_source_format_is_unavailable() {
+        // Honesty contract, the other direction: a caller with no probed
+        // source format passes `None`, which must render as `unknown`, never
+        // a fabricated/default number.
+        let line = format_request_context_line(
+            RequestSource::CliTranscribe,
+            "whisper-small",
+            "q4_k",
+            "cpu",
+            5.0,
+            "wav",
+            None,
+            None,
+        );
+        assert!(line.contains("sample_rate_hz=unknown"));
+        assert!(line.contains("channels=unknown"));
     }
 
     #[test]

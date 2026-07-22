@@ -1373,7 +1373,18 @@ pub(crate) async fn transcribe_with_runtime(
                         .with_word_timestamps_refine(request.word_timestamps_refine),
                 )
                 .with_longform(request.longform.clone())
-                .with_display_file_name(request.display_file_name.clone());
+                .with_display_file_name(request.display_file_name.clone())
+                .with_source(request.source)
+                // The source audio's real format for the `stage=request_context`
+                // log line -- `prepared.original()` is the pre-normalization
+                // probe (WAV fmt chunk) or decode (other recognized formats)
+                // result; `None` when this pipeline could not determine it
+                // (unrecognized extension, or a format only the external
+                // ffmpeg/afconvert fallback handles).
+                .with_source_audio_format(
+                    prepared.original().sample_rate_hz,
+                    prepared.original().channels,
+                );
             let executor = NativeBackendExecutor;
             let mut transcription = NativeAsrExecutor::transcribe(
                 &executor,
