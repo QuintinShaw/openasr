@@ -240,6 +240,16 @@ pub async fn serve_with_launch_options(
             openasr_core::ggml_runtime_boot_summary(&openasr_core::ggml_runtime_info())
         ),
     );
+    // Host system facts (OS/CPU/RAM) -- diagnostics only, no user data -- so a
+    // bug report's `daemon.log` + the desktop's `desktop.log` are enough to
+    // triage without asking the reporter for their OS/CPU/RAM by hand.
+    openasr_core::stage_timing::log_event(
+        "server_boot",
+        format_args!(
+            "stage=host_system {}",
+            openasr_core::host_system_boot_summary()
+        ),
+    );
     validate_listen_security(addr, &launch_options)?;
     openasr_core::stage_timing::log_stage(
         "server_boot",

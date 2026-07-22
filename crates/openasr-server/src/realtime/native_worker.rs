@@ -1254,6 +1254,7 @@ async fn run_realtime_backend_job(runtime: ServerRuntime, job: BackendJob) -> Ba
     // only source. Capture it before job.language is moved into the builder.
     let response_language = job.language.clone();
     let request = openasr_core::TranscriptionRequest::new(job.temp_wav.path(), job.model_id)
+        .with_source(openasr_core::RequestSource::ServerRealtime)
         .with_language(job.language)
         .with_task(job.task)
         .with_prompt(job.prompt)

@@ -1224,6 +1224,7 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
     print_audio_preparation_notes(&prepared);
 
     let request = TranscriptionRequest::new(prepared.path(), prepared_run.model_source.model_id)
+        .with_source(openasr_core::RequestSource::CliTranscribe)
         .with_model_pack_path(prepared_run.model_source.model_pack_path)
         // OADP Phase 0: the adapter rides the request options into the native
         // executor (the OPENASR_ADAPTER env var stays a server-side surface;

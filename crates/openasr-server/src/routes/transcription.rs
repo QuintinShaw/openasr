@@ -284,6 +284,11 @@ async fn run_offline_transcription(
     if let Some(task) = task_override {
         parsed.request.task = Some(task);
     }
+    parsed.request.source = if task_override == Some(TranscriptionTask::Translate) {
+        openasr_core::RequestSource::ServerTranslate
+    } else {
+        openasr_core::RequestSource::ServerTranscribe
+    };
     let history_request = parsed.request.clone();
     if runtime.backend == BackendKind::Native {
         validate_native_request_model(&runtime, &parsed.request.model_id)

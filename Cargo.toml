@@ -35,7 +35,7 @@ cpal = { version = "0.17.3", default-features = false }
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
 futures-util = "0.3"
 libc = "0.2"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_System_ProcessStatus", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_System_ProcessStatus", "Win32_Storage_FileSystem", "Win32_System_Registry"] }
 matrixmultiply = "0.3"
 memmap2 = "0.9"
 metal = "0.33"

@@ -53,11 +53,12 @@ pub mod testing;
 pub(crate) mod translation;
 
 pub use api::backend::{
-    ActiveTranscriptionControlGuard, BackendError, BackendKind, ExecutionTarget,
+    ActiveTranscriptionControlGuard, BackendError, BackendKind, ExecutionTarget, FailureCategory,
     NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend, NativeBackendExecutor, NativeRuntimeModelAdapter,
     NativeRuntimeModelIdSource, NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
-    Segment, SliceBoundaryControl, Transcription, TranscriptionBackend, TranscriptionControl,
-    TranscriptionRequest, TranscriptionTask, WordTimestamp, add_segment_word_timestamps,
+    RequestSource, Segment, SliceBoundaryControl, Transcription, TranscriptionBackend,
+    TranscriptionControl, TranscriptionRequest, TranscriptionTask, WordTimestamp,
+    add_segment_word_timestamps, format_failure_context_line, format_request_context_line,
     install_active_transcription_control, native_adapter_supports_source_language_hint,
     native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
     native_runtime_realtime_capabilities_for_path,
@@ -144,7 +145,10 @@ pub use ggml_runtime::{
     validate_ggml_runtime_source_path,
 };
 pub use home::{OpenAsrHomeError, openasr_home, resolve_openasr_home};
-pub use host::{host_quant_recommendation_profile, host_total_memory_bytes};
+pub use host::{
+    host_available_memory_bytes, host_cpu_model, host_os_name_and_version,
+    host_quant_recommendation_profile, host_system_boot_summary, host_total_memory_bytes,
+};
 pub use hotword::{
     DEFAULT_PHRASE_BIAS_BOOST, MAX_PHRASE_BIAS_BOOST, MAX_PHRASE_BIAS_ENTRIES,
     MAX_PHRASE_BIAS_PHRASE_CHARS, MAX_PHRASE_BIAS_TOTAL_CHARS, PhraseBiasConfig, PhraseBiasEntry,

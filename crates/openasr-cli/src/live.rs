@@ -1114,6 +1114,7 @@ impl LiveTranscriptionWorker {
                 let result = transcribe_with_backend(
                     backend,
                     TranscriptionRequest::new(job.temp_wav.path(), job.model_id)
+                        .with_source(openasr_core::RequestSource::CliLive)
                         .with_model_pack_path(
                             job.model_pack_path.or_else(|| model_pack_path.clone()),
                         )
