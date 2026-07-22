@@ -435,6 +435,225 @@ fn run_dispatch_once_with_progress(
     Ok(result)
 }
 
+/// Number of consecutive slices that must each hit a GPU-class compute-buffer
+/// allocation failure before the rest of the request stops even trying the
+/// GPU (issue #158): one slice's allocation failing under transient VRAM
+/// pressure is worth an immediate CPU retry, but if the *next* slice also
+/// fails the same way, the pressure is sustained rather than a one-off blip,
+/// so re-attempting the GPU on every remaining slice would just re-pay the
+/// same failed-allocation cost for no benefit.
+const GPU_ALLOCATION_FALLBACK_STREAK_LIMIT: usize = 2;
+
+/// Per-request state for the generic GPU-class allocation-failure fallback.
+/// Lives for the duration of one `run_native_transcription` call (one per
+/// longform slice loop, or one throwaway instance for the single-pass path).
+#[derive(Debug, Default)]
+struct GpuAllocationFallbackTracker {
+    consecutive_fallbacks: usize,
+    forced_cpu_for_rest: bool,
+}
+
+impl GpuAllocationFallbackTracker {
+    /// The backend preference to actually dispatch this attempt with. Forces
+    /// `CpuOnly` once the streak limit has tripped; otherwise passes
+    /// `requested` through unchanged so every slice still gets its own first
+    /// try at the requested backend (GPU pressure may be transient) until the
+    /// streak proves it is not.
+    fn effective_preference(
+        &self,
+        requested: GgmlAsrBackendPreference,
+    ) -> GgmlAsrBackendPreference {
+        if self.forced_cpu_for_rest && !matches!(requested, GgmlAsrBackendPreference::CpuOnly) {
+            GgmlAsrBackendPreference::CpuOnly
+        } else {
+            requested
+        }
+    }
+
+    /// Records the outcome of one attempt at `attempted` (the *effective*
+    /// preference actually dispatched, not necessarily the caller's original
+    /// request). An explicit `CpuOnly` attempt never participates in the
+    /// streak: there is no lower backend to fall back to, so a CPU failure is
+    /// a real capacity error, not a signal that GPU is under pressure.
+    fn record(&mut self, attempted: GgmlAsrBackendPreference, degraded: bool) {
+        if matches!(attempted, GgmlAsrBackendPreference::CpuOnly) {
+            return;
+        }
+        if degraded {
+            self.consecutive_fallbacks += 1;
+            if self.consecutive_fallbacks >= GPU_ALLOCATION_FALLBACK_STREAK_LIMIT {
+                self.forced_cpu_for_rest = true;
+            }
+        } else {
+            self.consecutive_fallbacks = 0;
+        }
+    }
+}
+
+/// Why a slice's result came from CPU instead of the requested GPU-class
+/// backend. Threaded into the longform provenance / degraded-result
+/// diagnostics rather than silently folded into a normal completion (mirrors
+/// the whisper max-tokens-cap "degraded" trace tag precedent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SliceGpuFallback {
+    /// This slice's own allocation failed on `original_backend` and was
+    /// retried on CPU.
+    AllocationFailure { original_backend: String },
+    /// The GPU was skipped entirely for this slice because the previous
+    /// `GPU_ALLOCATION_FALLBACK_STREAK_LIMIT` slices already fell back.
+    SkippedAfterStreak,
+}
+
+impl SliceGpuFallback {
+    fn log_reason(&self) -> &'static str {
+        match self {
+            Self::AllocationFailure { .. } => "allocation_failure",
+            Self::SkippedAfterStreak => "previous_slices_exhausted_gpu",
+        }
+    }
+}
+
+/// Recognizes `GgmlCpuGraphError::BackendBufferAllocationFailed`'s Display
+/// text after it has been flattened into a `BackendError::NativeFailClosed`
+/// reason string, and extracts the backend name it names.
+///
+/// This matches on message text rather than downcasting a preserved error
+/// source chain because most model families already flatten their internal
+/// decode-pipeline errors to a plain `String` well before the error reaches
+/// this generic dispatch boundary (e.g. `dolphin::executor`'s `execute` uses
+/// a `fail: impl Fn(String) -> GgmlAsrExecutionError` closure fed by
+/// `error.to_string()` at each internal call site) -- by the time a slice's
+/// dispatch fails here, there is no live source chain left to downcast.
+/// Threading a structured error through every family's internal pipeline
+/// just for this one classification would be exactly the kind of invasive,
+/// family-specific plumbing change `AGENTS.md` asks generic infrastructure
+/// changes to avoid. The marker text comes from this crate's own
+/// `#[error(...)]` message (`GgmlCpuGraphError::BackendBufferAllocationFailed`
+/// in `ggml_runtime::cpu_graph`), not an external dependency, so it is stable
+/// under our own control.
+fn gpu_buffer_allocation_failure_backend(error: &BackendError) -> Option<&str> {
+    let BackendError::NativeFailClosed { reason } = error else {
+        return None;
+    };
+    const MARKER: &str = "compute buffer allocation failed (backend: ";
+    let start = reason.find(MARKER)? + MARKER.len();
+    let end = start + reason[start..].find(')')?;
+    Some(&reason[start..end])
+}
+
+/// Runs one slice's decode, transparently retrying on CPU if the requested
+/// GPU-class backend's compute-buffer allocation fails for that slice.
+///
+/// Issue #158: an ~8GB Vulkan/Metal device's small per-slice compute buffer
+/// can OOM on one slice of a long-form request while every other slice
+/// succeeds (e.g. concurrent VRAM pressure from resident model weights and
+/// warmup buffers) -- failing the *whole* request over one slice's
+/// allocation is strictly worse than falling that one slice back to CPU.
+/// Later slices still try the requested backend first (the pressure may have
+/// been transient), unless the fallback streak limit has tripped (see
+/// [`GpuAllocationFallbackTracker`]).
+///
+/// An explicit `CpuOnly` request never retries: there is no lower backend
+/// to fall back to, so a CPU allocation failure is a real, unrecoverable
+/// capacity error and must fail closed as before. An explicit `Accelerated`
+/// request *does* retry -- the caller asked for speed, but handing back a
+/// slower, correct CPU result beats failing the whole transcription outright
+/// when the GPU genuinely cannot fit this slice; the degraded flag returned
+/// here keeps that substitution visible to the caller rather than silently
+/// invisible. Only `BackendBufferAllocationFailed` triggers this; every
+/// other error class fails closed exactly as before.
+#[allow(clippy::too_many_arguments)]
+fn run_dispatch_once_with_progress_and_gpu_fallback(
+    dispatch: &GgmlAsrExecutionDispatch,
+    runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
+    selected_family: &GgmlFamilyAdapterDescriptor,
+    chunk: Vec<f32>,
+    request_options: GgmlAsrExecutionOptions,
+    backend_preference: GgmlAsrBackendPreference,
+    decode_progress: &mut DecodeProgress,
+    slice_samples: u64,
+    slice_label: &str,
+    tracker: &mut GpuAllocationFallbackTracker,
+) -> Result<(GgmlAsrExecutionResult, Option<SliceGpuFallback>), BackendError> {
+    let effective_preference = tracker.effective_preference(backend_preference);
+    if effective_preference != backend_preference {
+        let fallback = SliceGpuFallback::SkippedAfterStreak;
+        crate::stage_timing::log_detail_event(
+            "native_transcribe",
+            format_args!(
+                "stage=gpu_alloc_fallback event=skip_gpu slice={slice_label} reason={}",
+                fallback.log_reason()
+            ),
+        );
+        let result = run_dispatch_once_with_progress(
+            dispatch,
+            runtime_preflight,
+            selected_family,
+            chunk,
+            request_options,
+            effective_preference,
+            decode_progress,
+            slice_samples,
+        )?;
+        tracker.record(effective_preference, true);
+        return Ok((result, Some(fallback)));
+    }
+
+    match run_dispatch_once_with_progress(
+        dispatch,
+        runtime_preflight,
+        selected_family,
+        chunk.clone(),
+        request_options.clone(),
+        effective_preference,
+        decode_progress,
+        slice_samples,
+    ) {
+        Ok(result) => {
+            tracker.record(effective_preference, false);
+            Ok((result, None))
+        }
+        Err(error) => {
+            // An already-CPU attempt has no lower backend to retry against: a
+            // `BackendBufferAllocationFailed` here is a real, unrecoverable
+            // capacity error, not a signal to fall further back. Must not
+            // recurse into another CPU attempt.
+            if matches!(effective_preference, GgmlAsrBackendPreference::CpuOnly) {
+                return Err(error);
+            }
+            let Some(backend) = gpu_buffer_allocation_failure_backend(&error) else {
+                // Not a GPU allocation failure: fails closed exactly as before,
+                // no retry, no streak bookkeeping (this attempt was never a
+                // GPU-fallback-eligible outcome).
+                return Err(error);
+            };
+            let backend = backend.to_string();
+            let fallback = SliceGpuFallback::AllocationFailure {
+                original_backend: backend.clone(),
+            };
+            crate::stage_timing::log_detail_event(
+                "native_transcribe",
+                format_args!(
+                    "stage=gpu_alloc_fallback event=retry_on_cpu slice={slice_label} backend={backend} reason={}",
+                    fallback.log_reason()
+                ),
+            );
+            let result = run_dispatch_once_with_progress(
+                dispatch,
+                runtime_preflight,
+                selected_family,
+                chunk,
+                request_options,
+                GgmlAsrBackendPreference::CpuOnly,
+                decode_progress,
+                slice_samples,
+            )?;
+            tracker.record(effective_preference, true);
+            Ok((result, Some(fallback)))
+        }
+    }
+}
+
 /// RAII reset for the global progress slot: clears it on normal completion, an early
 /// `?` return, or a panic, so a stale fraction never leaks into the next run. Created
 /// once per `run_native_transcription` so its lifetime spans decode, assembly, and
@@ -999,6 +1218,11 @@ fn run_native_transcription_impl(
             let transcription_control =
                 super::transcription_control::current_transcription_control();
             let mut slice_index = 0usize;
+            // Issue #158: per-slice GPU-class compute-buffer allocation
+            // fallback state, persisted across the whole slice loop (see
+            // `GpuAllocationFallbackTracker` / `run_dispatch_once_with_progress_and_gpu_fallback`).
+            let mut gpu_fallback_tracker = GpuAllocationFallbackTracker::default();
+            let mut degraded_slice_fallbacks: Vec<(usize, SliceGpuFallback)> = Vec::new();
             for slice in plan.slices {
                 if let Some(control) = &transcription_control
                     && control.wait_at_slice_boundary()
@@ -1049,16 +1273,22 @@ fn run_native_transcription_impl(
                 }
                 slice_index += 1;
                 let slice_decode_started = Instant::now();
-                let result = run_dispatch_once_with_progress(
-                    dispatch,
-                    &runtime_preflight,
-                    &selected_family,
-                    chunk,
-                    slice_options,
-                    backend_preference,
-                    &mut decode_progress,
-                    slice_samples,
-                )?;
+                let (result, slice_gpu_fallback) =
+                    run_dispatch_once_with_progress_and_gpu_fallback(
+                        dispatch,
+                        &runtime_preflight,
+                        &selected_family,
+                        chunk,
+                        slice_options,
+                        backend_preference,
+                        &mut decode_progress,
+                        slice_samples,
+                        &format!("index={slice_index}"),
+                        &mut gpu_fallback_tracker,
+                    )?;
+                if let Some(fallback) = slice_gpu_fallback {
+                    degraded_slice_fallbacks.push((slice_index, fallback));
+                }
                 // OPENASR_TIMING=1 detail: per-longform-slice decode time.
                 // Coarse by default (only the whole-request `inference` stage
                 // is logged unconditionally) since a long recording can chunk
@@ -1108,6 +1338,40 @@ fn run_native_transcription_impl(
             // Decode done; the merge/resegment tail below runs uncounted otherwise,
             // which is where the bar used to sit frozen at the last slice count.
             publish_assemble_progress(with_align);
+            // Issue #158: surface any per-slice GPU-allocation-failure fallback in
+            // the run's existing provenance channel (mirrors the
+            // `cohere-metal-multichunk-prefer-cpu-decoder` tag above for a similar
+            // "backend behaved differently than the naive default" case) rather
+            // than silently returning a result whose degraded slices are invisible
+            // to the caller.
+            if !degraded_slice_fallbacks.is_empty() {
+                let retried_indices: Vec<String> = degraded_slice_fallbacks
+                    .iter()
+                    .filter(|(_, fallback)| {
+                        matches!(fallback, SliceGpuFallback::AllocationFailure { .. })
+                    })
+                    .map(|(index, _)| index.to_string())
+                    .collect();
+                let skipped_indices: Vec<String> = degraded_slice_fallbacks
+                    .iter()
+                    .filter(|(_, fallback)| {
+                        matches!(fallback, SliceGpuFallback::SkippedAfterStreak)
+                    })
+                    .map(|(index, _)| index.to_string())
+                    .collect();
+                if !retried_indices.is_empty() {
+                    longform_provenance.push(format!(
+                        "core.native.backend.gpu-alloc-fallback:retried-on-cpu,slices={}",
+                        retried_indices.join(";")
+                    ));
+                }
+                if !skipped_indices.is_empty() {
+                    longform_provenance.push(format!(
+                        "core.native.backend.gpu-alloc-fallback:skipped-gpu-after-streak,slices={}",
+                        skipped_indices.join(";")
+                    ));
+                }
+            }
             let (assembled, assemble_stats) = assembler.into_parts();
             let run_metadata = build_longform_metadata(
                 &longform_options,
@@ -1174,7 +1438,13 @@ fn run_native_transcription_impl(
     let single_pass_total_samples = prepared_audio.len() as u64;
     let mut single_pass_decode_progress =
         DecodeProgress::begin(single_pass_total_samples, request.word_timestamps_refine);
-    let transcription = run_dispatch_once_with_progress(
+    // Issue #158: a fresh, one-shot tracker -- a single-pass request has
+    // exactly one dispatch attempt, so the streak-limit skip path can never
+    // trip here, but the same GPU-allocation-failure retry still applies
+    // (short audio, or a longform plan that collapsed to one slice, can still
+    // land on a GPU-class backend with no VRAM headroom for it).
+    let mut single_pass_gpu_fallback_tracker = GpuAllocationFallbackTracker::default();
+    let (transcription, single_pass_fallback) = run_dispatch_once_with_progress_and_gpu_fallback(
         dispatch,
         &runtime_preflight,
         &selected_family,
@@ -1183,7 +1453,19 @@ fn run_native_transcription_impl(
         backend_preference,
         &mut single_pass_decode_progress,
         single_pass_total_samples,
+        "single-pass",
+        &mut single_pass_gpu_fallback_tracker,
     )?;
+    if single_pass_fallback.is_some() {
+        let tag = "core.native.backend.gpu-alloc-fallback:retried-on-cpu,slices=single-pass";
+        // No longform run at all (plain short-audio decode) leaves nowhere to
+        // stamp this: the structured log line from
+        // `run_dispatch_once_with_progress_and_gpu_fallback` is this path's
+        // only degraded-result diagnostic in that case.
+        if let Some(metadata) = longform_metadata.as_mut() {
+            metadata.provenance.push(tag.to_string());
+        }
+    }
     Ok(finalize_native_transcription(
         transcription.into_transcription(),
         audio_duration_seconds,
@@ -2053,6 +2335,7 @@ fn native_runtime_backend_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GgmlAsrExecutor;
     use std::sync::Mutex;
 
     // The tests in this module that exercise `native_transcription_progress`
@@ -3327,5 +3610,402 @@ mod tests {
         // Explicit opt-out short-circuits before any pack resolution too.
         let unchanged = apply_punctuation_stage_if_applicable(transcription.clone(), None, false);
         assert_eq!(unchanged, transcription);
+    }
+
+    // -- issue #158: per-slice GPU-class compute-buffer allocation fallback --
+
+    #[test]
+    fn gpu_buffer_allocation_failure_backend_extracts_name_from_nested_reason() {
+        // The marker text is nested inside outer wrapping (executor id, adapter
+        // id, family-specific "graph construction failed at ..." context) the
+        // way it really arrives after `dispatch_error_to_backend`, not a bare
+        // top-level message -- this must still find it.
+        let error = BackendError::NativeFailClosed {
+            reason: "ggml executor 'firered-aed-ggml-executor-v1' failed for adapter \
+                     'ggml-family-firered-aed-runtime-v1': firered-aed encoder graph \
+                     construction failed at 'encoder_forward': compute buffer allocation \
+                     failed (backend: Vulkan0)"
+                .to_string(),
+        };
+        assert_eq!(
+            gpu_buffer_allocation_failure_backend(&error),
+            Some("Vulkan0")
+        );
+    }
+
+    #[test]
+    fn gpu_buffer_allocation_failure_backend_ignores_unrelated_errors() {
+        let unrelated = BackendError::NativeFailClosed {
+            reason: "ggml executor 'whisper-ggml-executor-v1' failed for adapter 'x': \
+                     tensor 'encoder.blocks.0.attn.weight' is missing from context"
+                .to_string(),
+        };
+        assert_eq!(gpu_buffer_allocation_failure_backend(&unrelated), None);
+
+        let other_variant = BackendError::ServeBatchUnavailable {
+            reason: "compute buffer allocation failed (backend: Metal)".to_string(),
+            retryable: true,
+        };
+        assert_eq!(
+            gpu_buffer_allocation_failure_backend(&other_variant),
+            None,
+            "only NativeFailClosed carries a classifiable ggml-graph reason"
+        );
+    }
+
+    #[test]
+    fn gpu_allocation_fallback_tracker_trips_after_streak_limit_and_resets_on_success() {
+        let mut tracker = GpuAllocationFallbackTracker::default();
+        assert_eq!(
+            tracker.effective_preference(GgmlAsrBackendPreference::Auto),
+            GgmlAsrBackendPreference::Auto
+        );
+
+        // First fallback: still under the limit, GPU still tried next time.
+        tracker.record(GgmlAsrBackendPreference::Auto, true);
+        assert_eq!(
+            tracker.effective_preference(GgmlAsrBackendPreference::Auto),
+            GgmlAsrBackendPreference::Auto
+        );
+
+        // Second consecutive fallback trips the streak: forced CPU from here on.
+        tracker.record(GgmlAsrBackendPreference::Auto, true);
+        assert_eq!(
+            tracker.effective_preference(GgmlAsrBackendPreference::Auto),
+            GgmlAsrBackendPreference::CpuOnly
+        );
+        assert_eq!(
+            tracker.effective_preference(GgmlAsrBackendPreference::Accelerated),
+            GgmlAsrBackendPreference::CpuOnly
+        );
+
+        // A fresh tracker resets on a successful GPU attempt in between two
+        // fallbacks -- the streak counts *consecutive* fallbacks only.
+        let mut tracker = GpuAllocationFallbackTracker::default();
+        tracker.record(GgmlAsrBackendPreference::Auto, true);
+        tracker.record(GgmlAsrBackendPreference::Auto, false);
+        tracker.record(GgmlAsrBackendPreference::Auto, true);
+        assert_eq!(
+            tracker.effective_preference(GgmlAsrBackendPreference::Auto),
+            GgmlAsrBackendPreference::Auto,
+            "a successful attempt in between resets the streak"
+        );
+    }
+
+    #[test]
+    fn gpu_allocation_fallback_tracker_never_forces_cpu_from_an_explicit_cpu_only_attempt() {
+        // An explicit CpuOnly attempt has no lower backend to fall back to, so
+        // its own failure is a real capacity error, not GPU-pressure signal --
+        // it must never participate in (or be forced further by) the streak.
+        let mut tracker = GpuAllocationFallbackTracker::default();
+        tracker.record(GgmlAsrBackendPreference::CpuOnly, true);
+        tracker.record(GgmlAsrBackendPreference::CpuOnly, true);
+        tracker.record(GgmlAsrBackendPreference::CpuOnly, true);
+        assert_eq!(
+            tracker.effective_preference(GgmlAsrBackendPreference::Auto),
+            GgmlAsrBackendPreference::Auto
+        );
+    }
+
+    /// A stub `GgmlAsrExecutor` for the GPU-fallback wrapper tests: records
+    /// every `backend_preference` it was invoked with, and fails with a
+    /// configurable error whenever the request does *not* ask for `CpuOnly`
+    /// (mimicking a GPU-class compute-buffer allocation that fails no matter
+    /// how many times it is retried on the same backend, but always succeeds
+    /// once actually run on CPU -- the real-world shape of issue #158).
+    struct GpuAllocFallbackStubExecutor {
+        calls: Mutex<Vec<GgmlAsrBackendPreference>>,
+        gpu_failure_reason: String,
+    }
+
+    impl GpuAllocFallbackStubExecutor {
+        fn new(gpu_failure_reason: impl Into<String>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                gpu_failure_reason: gpu_failure_reason.into(),
+            }
+        }
+
+        fn calls_snapshot(&self) -> Vec<GgmlAsrBackendPreference> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl GgmlAsrExecutor for GpuAllocFallbackStubExecutor {
+        fn executor_id(&self) -> &'static str {
+            "gpu-alloc-fallback-stub"
+        }
+
+        fn supports_phrase_bias(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: &GgmlAsrExecutionRequest,
+        ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+            self.calls.lock().unwrap().push(request.backend_preference);
+            if matches!(
+                request.backend_preference,
+                GgmlAsrBackendPreference::CpuOnly
+            ) {
+                return Ok(GgmlAsrExecutionResult {
+                    transcription: Transcription {
+                        text: "ok-on-cpu".to_string(),
+                        segments: Vec::new(),
+                        longform: None,
+                        language: None,
+                    },
+                    carry_context: None,
+                });
+            }
+            Err(GgmlAsrExecutionError::ExecutorFailed {
+                executor_id: "gpu-alloc-fallback-stub",
+                adapter_id: request.selected_family.adapter_id,
+                reason: self.gpu_failure_reason.clone(),
+            })
+        }
+    }
+
+    /// A stub whose executor always fails, regardless of backend preference,
+    /// with a non-allocation error -- for the "other errors never retry" test.
+    struct AlwaysFailsUnrelatedStubExecutor {
+        calls: Mutex<usize>,
+    }
+
+    impl GgmlAsrExecutor for AlwaysFailsUnrelatedStubExecutor {
+        fn executor_id(&self) -> &'static str {
+            "always-fails-unrelated-stub"
+        }
+
+        fn supports_phrase_bias(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: &GgmlAsrExecutionRequest,
+        ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+            *self.calls.lock().unwrap() += 1;
+            Err(GgmlAsrExecutionError::ExecutorFailed {
+                executor_id: "always-fails-unrelated-stub",
+                adapter_id: request.selected_family.adapter_id,
+                reason: "tensor 'x' is missing from context".to_string(),
+            })
+        }
+    }
+
+    fn tiny_whisper_preflight(dir: &Path) -> GgmlAsrRuntimeSourcePreflight {
+        let pack_path = dir.join("whisper.oasr");
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            GENERAL_ARCHITECTURE_KEY.to_string(),
+            crate::arch::WHISPER_GGML_ARCHITECTURE_ID.to_string(),
+        );
+        crate::testing::write_tiny_gguf_runtime_source(
+            &pack_path,
+            &crate::testing::TinyGgufFixtureSpec::new(metadata),
+        )
+        .expect("write tiny whisper fixture");
+        let runtime_source = crate::ggml_runtime::validate_ggml_runtime_source_path(&pack_path)
+            .expect("validate tiny fixture path");
+        load_runtime_source_metadata_and_tensor_index_from_source(&runtime_source)
+            .expect("load tiny fixture preflight")
+    }
+
+    fn gpu_fallback_test_fixture(
+        dir: &Path,
+        executor: std::sync::Arc<dyn GgmlAsrExecutor>,
+    ) -> (
+        GgmlAsrExecutionDispatch,
+        GgmlAsrRuntimeSourcePreflight,
+        GgmlFamilyAdapterDescriptor,
+    ) {
+        let preflight = tiny_whisper_preflight(dir);
+        let dispatch = GgmlAsrExecutionDispatch::default().with_whisper_non_streaming_cpu(executor);
+        (dispatch, preflight, crate::whisper_runtime_descriptor_v1())
+    }
+
+    #[test]
+    fn slice_dispatch_retries_gpu_allocation_failure_on_cpu_and_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = std::sync::Arc::new(GpuAllocFallbackStubExecutor::new(
+            "compute buffer allocation failed (backend: Vulkan0)",
+        ));
+        let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor.clone());
+        let mut decode_progress = DecodeProgress::begin(1_000, false);
+        let mut tracker = GpuAllocationFallbackTracker::default();
+
+        let (result, fallback) = run_dispatch_once_with_progress_and_gpu_fallback(
+            &dispatch,
+            &preflight,
+            &family,
+            vec![0.0; 1_000],
+            GgmlAsrExecutionOptions::default(),
+            GgmlAsrBackendPreference::Auto,
+            &mut decode_progress,
+            1_000,
+            "index=1",
+            &mut tracker,
+        )
+        .expect("should recover via CPU retry rather than failing the slice");
+
+        assert_eq!(result.transcription.text, "ok-on-cpu");
+        assert_eq!(
+            fallback,
+            Some(SliceGpuFallback::AllocationFailure {
+                original_backend: "Vulkan0".to_string()
+            })
+        );
+        assert_eq!(
+            executor.calls_snapshot(),
+            vec![
+                GgmlAsrBackendPreference::Auto,
+                GgmlAsrBackendPreference::CpuOnly
+            ],
+            "exactly one GPU attempt, then exactly one CPU retry"
+        );
+    }
+
+    #[test]
+    fn slice_dispatch_does_not_retry_a_non_allocation_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = std::sync::Arc::new(AlwaysFailsUnrelatedStubExecutor {
+            calls: Mutex::new(0),
+        });
+        let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor.clone());
+        let mut decode_progress = DecodeProgress::begin(1_000, false);
+        let mut tracker = GpuAllocationFallbackTracker::default();
+
+        let error = run_dispatch_once_with_progress_and_gpu_fallback(
+            &dispatch,
+            &preflight,
+            &family,
+            vec![0.0; 1_000],
+            GgmlAsrExecutionOptions::default(),
+            GgmlAsrBackendPreference::Auto,
+            &mut decode_progress,
+            1_000,
+            "index=1",
+            &mut tracker,
+        )
+        .expect_err("a non-allocation failure must fail closed, not retry");
+
+        assert!(
+            error.to_string().contains("tensor 'x' is missing"),
+            "original error must propagate unchanged: {error}"
+        );
+        assert_eq!(
+            *executor.calls.lock().unwrap(),
+            1,
+            "no retry attempt for an error class other than the GPU allocation failure"
+        );
+    }
+
+    #[test]
+    fn slice_dispatch_does_not_recurse_when_an_explicit_cpu_only_request_fails() {
+        // No lower-level backend exists below CPU: a CpuOnly request that
+        // itself hits `BackendBufferAllocationFailed` must fail closed exactly
+        // like any other CPU error, not loop back into itself.
+        let dir = tempfile::tempdir().unwrap();
+        // `GpuAllocFallbackStubExecutor` only fails when *not* CpuOnly, so a
+        // dedicated stub is needed here to simulate a CPU-side allocation
+        // failure specifically.
+        struct AlwaysFailsCpuAllocExecutor {
+            calls: Mutex<usize>,
+        }
+        impl GgmlAsrExecutor for AlwaysFailsCpuAllocExecutor {
+            fn executor_id(&self) -> &'static str {
+                "always-fails-cpu-alloc-stub"
+            }
+            fn supports_phrase_bias(&self) -> bool {
+                true
+            }
+            fn execute(
+                &self,
+                request: &GgmlAsrExecutionRequest,
+            ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+                *self.calls.lock().unwrap() += 1;
+                Err(GgmlAsrExecutionError::ExecutorFailed {
+                    executor_id: "always-fails-cpu-alloc-stub",
+                    adapter_id: request.selected_family.adapter_id,
+                    reason: "compute buffer allocation failed (backend: CPU)".to_string(),
+                })
+            }
+        }
+        let cpu_executor = std::sync::Arc::new(AlwaysFailsCpuAllocExecutor {
+            calls: Mutex::new(0),
+        });
+        let (dispatch, preflight, family) =
+            gpu_fallback_test_fixture(dir.path(), cpu_executor.clone());
+        let mut decode_progress = DecodeProgress::begin(1_000, false);
+        let mut tracker = GpuAllocationFallbackTracker::default();
+
+        let error = run_dispatch_once_with_progress_and_gpu_fallback(
+            &dispatch,
+            &preflight,
+            &family,
+            vec![0.0; 1_000],
+            GgmlAsrExecutionOptions::default(),
+            GgmlAsrBackendPreference::CpuOnly,
+            &mut decode_progress,
+            1_000,
+            "index=1",
+            &mut tracker,
+        )
+        .expect_err("an explicit CpuOnly allocation failure must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("compute buffer allocation failed")
+        );
+        assert_eq!(
+            *cpu_executor.calls.lock().unwrap(),
+            1,
+            "a CpuOnly request must never be retried -- there is no lower backend"
+        );
+    }
+
+    #[test]
+    fn slice_dispatch_switches_to_cpu_only_after_two_consecutive_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = std::sync::Arc::new(GpuAllocFallbackStubExecutor::new(
+            "compute buffer allocation failed (backend: Vulkan0)",
+        ));
+        let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor.clone());
+        let mut decode_progress = DecodeProgress::begin(3_000, false);
+        let mut tracker = GpuAllocationFallbackTracker::default();
+
+        for slice_index in 1..=3 {
+            let (_result, fallback) = run_dispatch_once_with_progress_and_gpu_fallback(
+                &dispatch,
+                &preflight,
+                &family,
+                vec![0.0; 1_000],
+                GgmlAsrExecutionOptions::default(),
+                GgmlAsrBackendPreference::Auto,
+                &mut decode_progress,
+                1_000,
+                &format!("index={slice_index}"),
+                &mut tracker,
+            )
+            .expect("every slice recovers via CPU");
+            assert!(fallback.is_some(), "slice {slice_index} should be degraded");
+        }
+
+        // Slices 1 and 2 each got their own GPU attempt (and failed) before the
+        // CPU retry; slice 3's streak already tripped, so it must go straight
+        // to CPU with no third GPU attempt at all.
+        assert_eq!(
+            executor.calls_snapshot(),
+            vec![
+                GgmlAsrBackendPreference::Auto,
+                GgmlAsrBackendPreference::CpuOnly,
+                GgmlAsrBackendPreference::Auto,
+                GgmlAsrBackendPreference::CpuOnly,
+                GgmlAsrBackendPreference::CpuOnly,
+            ]
+        );
     }
 }
