@@ -5,24 +5,31 @@
 //! same ones `qwen::tokenizer::Qwen3AsrTokenizer` wraps) verbatim -- this is a
 //! stock GPT2-style tokenizer, no family-specific merge/byte-mapping logic.
 //!
-//! Scope note: this loads directly from the HF source's `vocab.json` /
-//! `merges.txt` (a dev/test-only constructor, `from_source_files`), NOT from
-//! `.oasr` GGUF metadata the way `Qwen3AsrTokenizer::from_gguf_metadata` does.
-//! The converter (`package_import.rs`) does not yet write
-//! `tokenizer.ggml.tokens`/`tokenizer.ggml.merges` into the pack, so there is
-//! no GGUF-backed constructor yet; adding one is mechanical (mirror
-//! `Qwen3AsrTokenizer::from_gguf_metadata`) once the converter carries the
-//! vocab, and is tracked as a follow-up alongside the decode executor's
-//! GGUF-backed weight provider.
+//! `from_source_files` (dev/test constructor, reads `vocab.json`/
+//! `merges.txt` directly from an HF source tree) and `from_gguf_metadata`
+//! (production constructor, reads the same `tokenizer.ggml.tokens`/
+//! `tokenizer.ggml.merges` keys `package_import.rs` now writes into the
+//! `.oasr` pack -- mirrors `Qwen3AsrTokenizer::from_gguf_metadata` exactly,
+//! since both wrap the same stock GPT2-BPE shape) produce byte-identical
+//! tokenizers for the same checkpoint.
 
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::NativeAsrError;
+use crate::ggml_runtime::GgufMetadata;
 use crate::models::gpt2_bpe::{
     build_merge_rank, build_token_to_id, encode_prompt_text, token_to_bytes,
 };
+use crate::models::oasr_metadata::{required_metadata_string, required_metadata_string_array};
+
+const GRANITE_SPEECH_TOKENIZER_FAMILY: &str = "granite-speech";
+const TOKENIZER_GGML_MODEL_KEY: &str = "tokenizer.ggml.model";
+const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
+const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
+const TOKENIZER_GGML_MERGES_KEY: &str = "tokenizer.ggml.merges";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GraniteSpeechTokenizerError {
@@ -126,6 +133,52 @@ impl GraniteSpeechTokenizer {
             .map(str::to_string)
             .collect();
         let merge_rank = build_merge_rank(&merges);
+
+        Ok(Self {
+            id_to_token,
+            token_to_id,
+            merge_rank,
+        })
+    }
+
+    /// Production constructor: reads `tokenizer.ggml.tokens`/
+    /// `tokenizer.ggml.merges` from a `.oasr` pack's GGUF metadata (written
+    /// by `package_import.rs`'s `granite_speech_runtime_gguf_metadata`).
+    pub(crate) fn from_gguf_metadata(metadata: &GgufMetadata) -> Result<Self, NativeAsrError> {
+        let tokenizer_model = required_metadata_string(
+            metadata,
+            TOKENIZER_GGML_MODEL_KEY,
+            GRANITE_SPEECH_TOKENIZER_FAMILY,
+        )?;
+        if !tokenizer_model.eq_ignore_ascii_case(TOKENIZER_GGML_MODEL_VALUE_GPT2) {
+            return Err(NativeAsrError::UnsupportedModelPack {
+                reason: format!(
+                    "granite-speech GGUF tokenizer key '{TOKENIZER_GGML_MODEL_KEY}' must be \
+                     '{TOKENIZER_GGML_MODEL_VALUE_GPT2}', got '{tokenizer_model}'"
+                ),
+            });
+        }
+        let tokens = required_metadata_string_array(
+            metadata,
+            TOKENIZER_GGML_TOKENS_KEY,
+            GRANITE_SPEECH_TOKENIZER_FAMILY,
+        )?;
+        if tokens.is_empty() {
+            return Err(NativeAsrError::UnsupportedModelPack {
+                reason: format!(
+                    "granite-speech GGUF tokenizer key '{TOKENIZER_GGML_TOKENS_KEY}' cannot be empty"
+                ),
+            });
+        }
+        let merges = required_metadata_string_array(
+            metadata,
+            TOKENIZER_GGML_MERGES_KEY,
+            GRANITE_SPEECH_TOKENIZER_FAMILY,
+        )?;
+
+        let token_to_id = build_token_to_id(tokens, GRANITE_SPEECH_TOKENIZER_FAMILY)?;
+        let id_to_token = tokens.iter().map(|token| Some(token.clone())).collect();
+        let merge_rank = build_merge_rank(merges);
 
         Ok(Self {
             id_to_token,

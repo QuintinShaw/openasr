@@ -46,6 +46,7 @@ use crate::models::local_source_import::{
 use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, insert_metadata,
+    insert_metadata_string_array,
 };
 use crate::models::pack_quant::PackQuant;
 use crate::nn::half::f32_to_f16_bits;
@@ -54,6 +55,16 @@ use super::{GRANITE_SPEECH_GGML_ARCHITECTURE_ID, GRANITE_SPEECH_MODEL_FAMILY};
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_INDEX_JSON: &str = "model.safetensors.index.json";
+const SOURCE_VOCAB_JSON: &str = "vocab.json";
+const SOURCE_ADDED_TOKENS_JSON: &str = "added_tokens.json";
+const SOURCE_MERGES_TXT: &str = "merges.txt";
+
+/// `tokenizer.ggml.*` metadata keys (mirrors `qwen::package_import`'s
+/// constants of the same name -- both write the same stock GPT2-BPE shape).
+pub(crate) const TOKENIZER_GGML_MODEL_KEY: &str = "tokenizer.ggml.model";
+pub(crate) const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
+pub(crate) const TOKENIZER_GGML_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
+pub(crate) const TOKENIZER_GGML_MERGES_KEY: &str = "tokenizer.ggml.merges";
 
 pub type GraniteSpeechQuantizationMode = PackQuant;
 
@@ -275,9 +286,70 @@ fn build_runtime_tensors(
     Ok(out)
 }
 
+/// Dense `[0..vocab_size)` token array: `vocab.json` (token -> id) reversed
+/// into id order, with `added_tokens.json` (the `<|audio|>` placeholder and
+/// any other tokens outside the base BPE vocab) filling in the remaining
+/// slots up to `vocab_size`. Mirrors `tokenizer::GraniteSpeechTokenizer::
+/// from_source_files`'s loading logic exactly (that constructor stays the
+/// dev/test path reading these same two files directly; this is the
+/// production path baking the same array into the pack).
+fn load_granite_speech_vocab_tokens(
+    source_root: &Path,
+    vocab_size: usize,
+) -> Result<Vec<String>, LocalSourceImportError> {
+    let vocab: BTreeMap<String, u32> = read_source_json_file(source_root, SOURCE_VOCAB_JSON)?;
+    let mut tokens = vec![None::<String>; vocab_size];
+    for (token, id) in vocab {
+        if let Some(slot) = tokens.get_mut(id as usize) {
+            *slot = Some(token);
+        }
+    }
+    let added_path = source_root.join(SOURCE_ADDED_TOKENS_JSON);
+    let added_tokens: Option<BTreeMap<String, u32>> = std::fs::read(&added_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    if let Some(added) = added_tokens {
+        for (token, id) in added {
+            if let Some(slot) = tokens.get_mut(id as usize) {
+                *slot = Some(token);
+            }
+        }
+    }
+    tokens
+        .into_iter()
+        .enumerate()
+        .map(|(id, token)| {
+            token.ok_or_else(|| {
+                validate_error(format!(
+                    "granite-speech tokenizer is missing token for id {id}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn load_granite_speech_merges(source_root: &Path) -> Result<Vec<String>, LocalSourceImportError> {
+    let path = source_root.join(SOURCE_MERGES_TXT);
+    let bytes =
+        crate::models::local_source_import::read_source_file_bytes(source_root, SOURCE_MERGES_TXT)?;
+    let text = std::str::from_utf8(&bytes).map_err(|error| {
+        validate_error(format!(
+            "granite-speech merges.txt is not valid UTF-8 ({}): {error}",
+            path.display()
+        ))
+    })?;
+    Ok(text
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 fn granite_speech_runtime_gguf_metadata(
     config: &GraniteSpeechConfigJson,
     request: &GraniteSpeechImportRequest,
+    vocab_tokens: &[String],
+    merges: &[String],
 ) -> BTreeMap<String, GgufWriteValue> {
     let mut metadata = BTreeMap::new();
     insert_metadata(
@@ -466,6 +538,14 @@ fn granite_speech_runtime_gguf_metadata(
         t.logits_scaling,
     );
 
+    insert_metadata(
+        &mut metadata,
+        TOKENIZER_GGML_MODEL_KEY,
+        TOKENIZER_GGML_MODEL_VALUE_GPT2,
+    );
+    insert_metadata_string_array(&mut metadata, TOKENIZER_GGML_TOKENS_KEY, vocab_tokens);
+    insert_metadata_string_array(&mut metadata, TOKENIZER_GGML_MERGES_KEY, merges);
+
     metadata
 }
 
@@ -478,7 +558,10 @@ pub fn convert_local_granite_speech_source_to_runtime_pack(
     let source = ShardedSafetensors::open(&request.source_root)?;
 
     let tensors = build_runtime_tensors(&source)?;
-    let metadata = granite_speech_runtime_gguf_metadata(&config, request);
+    let vocab_tokens =
+        load_granite_speech_vocab_tokens(&request.source_root, config.text_config.vocab_size)?;
+    let merges = load_granite_speech_merges(&request.source_root)?;
+    let metadata = granite_speech_runtime_gguf_metadata(&config, request, &vocab_tokens, &merges);
 
     write_gguf_file_v0(&request.output_root, &metadata, &tensors).map_err(|error| {
         validate_error(format!(
@@ -594,5 +677,35 @@ mod tests {
                 "'{name}' max absolute diff (near-zero elements) {max_abs_small:.3e} exceeds {abs_tol:.3e}"
             );
         }
+
+        // Tokenizer metadata: the GGUF-backed constructor must produce the
+        // same encode/decode behavior as the dev/test source-files
+        // constructor for the same checkpoint (both build the same dense
+        // token array + merge list, just from different files).
+        let gguf_metadata =
+            crate::ggml_runtime::read_gguf_metadata(&output_root).expect("gguf metadata");
+        let gguf_tokenizer =
+            super::super::tokenizer::GraniteSpeechTokenizer::from_gguf_metadata(&gguf_metadata)
+                .expect("tokenizer from gguf metadata");
+        let source_tokenizer =
+            super::super::tokenizer::GraniteSpeechTokenizer::from_source_files(&source_root)
+                .expect("tokenizer from source files");
+        let text = "The quick brown fox jumps over the lazy dog.";
+        let gguf_ids = gguf_tokenizer
+            .encode_prompt_text(text)
+            .expect("gguf encode");
+        let source_ids = source_tokenizer
+            .encode_prompt_text(text)
+            .expect("source encode");
+        assert_eq!(
+            gguf_ids, source_ids,
+            "gguf and source-files tokenizers must encode identically"
+        );
+        assert_eq!(
+            gguf_tokenizer
+                .decode_text_token_ids(&gguf_ids)
+                .expect("gguf decode"),
+            text
+        );
     }
 }

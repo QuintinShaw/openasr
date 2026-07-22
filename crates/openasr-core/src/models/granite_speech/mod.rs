@@ -25,6 +25,7 @@ pub(crate) mod frontend;
 pub mod package_import;
 pub(crate) mod prompt;
 pub(crate) mod qformer;
+pub(crate) mod runtime_provider;
 pub(crate) mod tokenizer;
 
 #[cfg(test)]
