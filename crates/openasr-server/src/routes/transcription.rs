@@ -1391,7 +1391,13 @@ pub(crate) async fn transcribe_with_runtime(
                 // preserves the client's original extension via
                 // `safe_extension_suffix` -- see `ingest_field` above); never
                 // the client-supplied file name/stem itself.
-                .with_source_container(prepared.original().extension.clone());
+                .with_source_container(prepared.original().extension.clone())
+                // Lets the native backend decode straight from the in-process
+                // symphonia decode's in-memory samples (uploads are almost
+                // always a non-WAV/non-conformant container) instead of
+                // re-reading `input_path` from disk -- see
+                // `PreparedAudioInput::shared_samples`.
+                .with_prepared_samples(prepared.shared_samples());
             let executor = NativeBackendExecutor;
             let mut transcription = NativeAsrExecutor::transcribe(
                 &executor,

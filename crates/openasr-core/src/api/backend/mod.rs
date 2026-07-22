@@ -1,4 +1,4 @@
-use std::{fmt, str::FromStr};
+use std::{fmt, str::FromStr, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -403,6 +403,17 @@ pub struct TranscriptionRequest {
     /// genuinely unknown, never guessed, and never the *file name* or any
     /// other path component -- extension only.
     pub source_container: Option<String>,
+    /// Ready-to-decode 16 kHz mono f32 samples already resident in memory,
+    /// set when `prepare_audio_input`'s in-process symphonia decode path
+    /// produced them directly (see `crate::audio::PreparedAudioInput::
+    /// shared_samples`). When `Some`, the native backend decodes straight
+    /// from these samples instead of re-reading `input_path` from disk --
+    /// `input_path` is still populated in that case (for display/logging and
+    /// the mock backend's placeholder text), it just is not the actual
+    /// decode source. `None` for the WAV-passthrough and external
+    /// ffmpeg/afconvert conversion paths, and for any caller that built this
+    /// request without going through `prepare_audio_input` at all.
+    pub prepared_samples: Option<Arc<Vec<f32>>>,
 }
 
 impl TranscriptionRequest {
@@ -429,7 +440,15 @@ impl TranscriptionRequest {
             source_sample_rate_hz: None,
             source_channels: None,
             source_container: None,
+            prepared_samples: None,
         }
+    }
+
+    /// Attaches in-memory samples so the native backend can skip re-reading
+    /// `input_path` from disk -- see the field's doc comment.
+    pub fn with_prepared_samples(mut self, prepared_samples: Option<Arc<Vec<f32>>>) -> Self {
+        self.prepared_samples = prepared_samples;
+        self
     }
 
     pub fn with_source(mut self, source: RequestSource) -> Self {

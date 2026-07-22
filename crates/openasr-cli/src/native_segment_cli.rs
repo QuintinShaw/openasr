@@ -134,7 +134,8 @@ pub(super) fn transcribe_batch_item(
                 .map(str::to_string),
         )
         .with_diarization(context.diarize)
-        .with_diarize_speakers(context.speakers);
+        .with_diarize_speakers(context.speakers)
+        .with_prepared_samples(prepared.shared_samples());
     let transcription = transcribe_with_backend(context.backend_kind, request)?;
     let written = write_rendered_formats(
         &transcription,
@@ -222,17 +223,13 @@ pub(super) fn run_benchmark(
             // word-timestamp alignment, neither of which this request enables
             // either) and would silently skew the real-time factor for an
             // unpunctuated model with the FireRedPunc pack installed.
-            .with_punctuation(false);
+            .with_punctuation(false)
+            .with_prepared_samples(prepared.shared_samples());
     let started = Instant::now();
     let transcription = transcribe_with_backend(prepared_run.backend_kind, request)?;
     let elapsed = started.elapsed();
 
-    let audio_duration_seconds = prepared.original().duration_seconds.or_else(|| {
-        prepared
-            .is_converted()
-            .then(|| openasr_core::probe_wav_duration(prepared.path()))
-            .flatten()
-    });
+    let audio_duration_seconds = prepared.duration_seconds();
     let real_time_factor = audio_duration_seconds
         .filter(|duration| *duration > 0.0)
         .map(|duration| elapsed.as_secs_f64() / duration);
@@ -1142,7 +1139,12 @@ pub(super) fn print_audio_input_notes(info: &AudioInputInfo) {
 }
 
 pub(super) fn print_audio_preparation_notes(prepared: &PreparedAudioInput) {
-    if prepared.is_converted() {
+    if prepared.samples().is_some() {
+        eprintln!(
+            "Note: decoded {} to 16 kHz mono in memory for the selected backend.",
+            prepared.original().path.display()
+        );
+    } else if prepared.is_converted() {
         eprintln!(
             "Note: prepared {} as temporary 16 kHz mono PCM WAV for the selected backend.",
             prepared.original().path.display()

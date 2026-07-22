@@ -397,6 +397,18 @@ fn prepare_input_file_samples_pcm16_mono_16khz(
             .with_ffmpeg_bin_explicit(options.runtime_paths.ffmpeg_bin.is_some())
             .with_native_non_wav_conversion(true),
     )?;
+    // The in-process symphonia decode path hands back f32 samples already
+    // resident in memory (see `PreparedAudioInput::samples`): convert those
+    // straight to i16 instead of writing a prepared WAV to disk and
+    // re-reading it back through `hound`. The WAV-passthrough and external
+    // ffmpeg/afconvert conversion paths still hand back a real file, which
+    // `hound` reads exactly as before.
+    if let Some(samples) = prepared.samples() {
+        return Ok(samples
+            .iter()
+            .map(|&sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
+            .collect());
+    }
     let mut reader = hound::WavReader::open(prepared.path()).with_context(|| {
         format!(
             "Could not open prepared WAV audio at {}",
