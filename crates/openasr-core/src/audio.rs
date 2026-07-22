@@ -1,5 +1,6 @@
 mod decode;
 mod errors;
+mod opus_decode;
 mod prepare;
 mod probe;
 mod symphonia_decode;

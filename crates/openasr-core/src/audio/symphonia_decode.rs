@@ -1,18 +1,21 @@
-//! In-process audio decoding via symphonia (pure Rust, no external process).
+//! In-process audio decoding via symphonia (pure Rust, no external process),
+//! plus bundled-libopus decoding for Opus.
 //!
 //! This is the default decode path for `prepare_audio_input`: m4a/AAC-LC/ALAC
-//! (isomp4, including the `.qta` QuickTime container), mp3, flac, ogg/vorbis,
-//! mkv/webm (vorbis track only -- see below), and non-conformant wav all
+//! (isomp4, including the `.qta` QuickTime container), mp3, flac, ogg (vorbis
+//! or opus), mkv/webm (vorbis or opus track), and non-conformant wav all
 //! decode here without shelling out to ffmpeg or afconvert. Anything this
-//! module cannot decode (HE-AAC, Opus in any container, corrupt files,
+//! module cannot decode (HE-AAC, Opus multistream >2ch, corrupt files,
 //! containers/codecs outside the enabled symphonia features) reports
 //! [`SymphoniaOutcome::Unsupported`] (never a hard error) so the caller falls
 //! back to the existing external converter chain.
 //!
-//! Opus is the big absence: symphonia has never shipped an Opus decoder (still
-//! true as of 0.6.0), so `.opus` files, and Opus tracks inside `.ogg`/`.webm`,
-//! always fall through regardless of which demuxer/codec features are
-//! enabled here. [`SymphoniaOutcome::Unsupported`] carries a `codec_label`
+//! Opus is decoded by [`opus_decode`] (bundled libopus), not by symphonia --
+//! symphonia has never shipped an Opus decoder (still true as of 0.6.0), but
+//! its ogg/mkv demuxers surface Opus packets just fine, so this module demuxes
+//! the container and hands the packets to the libopus decoder, which applies
+//! the RFC 7845 pre-skip/output-gain/end-trim semantics (see `opus_decode`'s
+//! module docs). [`SymphoniaOutcome::Unsupported`] carries a `codec_label`
 //! when the demuxer could name the codec anyway, so callers can still tell
 //! the user *which* codec was the problem instead of a bare failure.
 //!
@@ -42,11 +45,14 @@ use symphonia::core::{
         CODEC_TYPE_OPUS, CODEC_TYPE_VORBIS, CodecType, DecoderOptions,
     },
     errors::Error as SymphoniaError,
-    formats::FormatOptions,
+    formats::{FormatOptions, FormatReader},
     io::MediaSourceStream,
     meta::MetadataOptions,
     probe::Hint,
+    units::TimeBase,
 };
+
+use super::opus_decode;
 
 pub(crate) const TARGET_SAMPLE_RATE_HZ: u32 = 16_000;
 // FFT resampler chunk size: large enough to amortize FFT overhead, small
@@ -152,10 +158,10 @@ pub(crate) enum ProbeOutcome {
 /// Probes `path` far enough to name the audio codec of its first real track,
 /// without requiring a decoder for that codec to be compiled in. Symphonia's
 /// codec type registry (`CODEC_TYPE_*`) is populated by every demuxer
-/// regardless of which decoder features this build enables, so this can
-/// identify e.g. Opus in a container symphonia can parse but not decode --
-/// letting callers report a precise "this codec is unsupported" error instead
-/// of an opaque conversion failure. Never panics (see module docs).
+/// regardless of which decoder features this build enables, so this can name
+/// codecs the in-process decode path does not handle (e.g. HE-AAC) -- letting
+/// callers report a precise "this codec is unsupported" error instead of an
+/// opaque conversion failure. Never panics (see module docs).
 pub(crate) fn probe_codec_label(path: &Path, extension: Option<&str>) -> ProbeOutcome {
     // Same `UnwindSafe` reasoning as `try_decode_to_pcm16_mono_16k` above:
     // both captured arguments are plain shared references with no interior
@@ -271,6 +277,24 @@ fn decode_to_mono_f32(
         return None;
     }
 
+    // Symphonia has no Opus decoder: demux the packets here and decode them
+    // with the bundled libopus instead (see `opus_decode`'s module docs for
+    // the RFC 7845 pre-skip/gain/end-trim handling). Ogg's 1/48000 track time
+    // base makes packet timestamps granule positions (which enables the
+    // end-trim); mkv/webm timecodes are not sample counts, so the flag stays
+    // false there.
+    if track.codec_params.codec == CODEC_TYPE_OPUS {
+        let extra_data = track.codec_params.extra_data.clone();
+        let timestamps_are_samples = track.codec_params.time_base
+            == Some(TimeBase::new(1, opus_decode::OPUS_DECODE_RATE_HZ));
+        return decode_opus_track(
+            &mut format,
+            track_id,
+            extra_data.as_deref(),
+            timestamps_are_samples,
+        );
+    }
+
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .ok()?;
@@ -324,6 +348,52 @@ fn decode_to_mono_f32(
         samples,
         sample_rate,
         channels,
+    })
+}
+
+/// Demuxes `format`'s packets for `track_id` and decodes them with the
+/// bundled libopus (`opus_decode`), returning 48 kHz mono samples the
+/// caller's resample step then brings to 16 kHz like any other source rate.
+/// `None` (-> `Unsupported` -> external fallback) on a missing/undecodable
+/// `OpusHead`, a fatal decoder error mid-stream, or a stream that produced no
+/// audio. Runs inside the same `catch_unwind` guard as the rest of this
+/// module (via `decode_attempt`), so a panic anywhere in the libopus glue
+/// surfaces as `ParserPanicked`, never a process crash.
+fn decode_opus_track(
+    format: &mut Box<dyn FormatReader>,
+    track_id: u32,
+    extra_data: Option<&[u8]>,
+    timestamps_are_samples: bool,
+) -> Option<DecodedMono> {
+    let mut stream = opus_decode::OpusStream::new(extra_data, timestamps_are_samples)?;
+    loop {
+        // Same packet-iteration and error policy as the symphonia decoder
+        // loop above: EOF / ResetRequired end the stream (keeping whatever
+        // decoded so far), anything else fails the stream closed; a corrupt
+        // individual packet is skipped inside `push_packet` itself.
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(error)) if error.kind() == ErrorKind::UnexpectedEof => {
+                break;
+            }
+            Err(SymphoniaError::ResetRequired) => break,
+            Err(_) => return None,
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        if !stream.push_packet(&packet.data, packet.ts()) {
+            return None;
+        }
+    }
+
+    let decoded = stream.finish()?;
+    Some(DecodedMono {
+        samples: decoded.samples,
+        sample_rate: opus_decode::OPUS_DECODE_RATE_HZ,
+        channels: decoded.channels,
     })
 }
 

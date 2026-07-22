@@ -11,15 +11,17 @@ use crate::BackendKind;
 // the extension).
 //
 // Every extension here is *reachable*, not necessarily decodable in-process:
-// `webm` in particular is a container, not a codec, and most real-world
-// `.webm`/`.ogg` audio uses Opus, which symphonia has never shipped a decoder
-// for (still true as of symphonia 0.6). Those files fall through to the
-// external ffmpeg/afconvert conversion chain in `prepare.rs` -- with ffmpeg
-// on PATH they still transcribe; without it, the error names the detected
-// codec instead of pretending the file is corrupt (see
+// `webm` in particular is a container, not a codec. Opus -- the most common
+// codec inside `.opus`/`.ogg`/`.webm` audio -- decodes in-process through the
+// bundled libopus (see `audio/opus_decode`); anything the in-process path
+// still cannot handle (HE-AAC, Opus multistream >2ch, ...) falls through to
+// the external ffmpeg/afconvert conversion chain in `prepare.rs` -- with
+// ffmpeg on PATH it still transcribes; without it, the error names the
+// detected codec instead of pretending the file is corrupt (see
 // `symphonia_decode::probe_codec_label` and `prepare::codec_note`).
-pub(crate) const RECOGNIZED_EXTENSIONS: &[&str] =
-    &["wav", "mp3", "mp4", "m4a", "webm", "flac", "ogg", "qta"];
+pub(crate) const RECOGNIZED_EXTENSIONS: &[&str] = &[
+    "wav", "mp3", "mp4", "m4a", "webm", "flac", "ogg", "opus", "qta",
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioInputInfo {

@@ -1240,6 +1240,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libopus_sys"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b71d4755aa6b983b59a3d70d49f0ef928dca8fb5303df2e907e15a40595d0f3"
+dependencies = [
+ "cmake",
+ "log",
+ "pkg-config",
+]
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.38.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1642,6 +1653,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.3.4",
  "libc",
+ "libopus_sys",
  "matrixmultiply",
  "memmap2",
  "metal",
