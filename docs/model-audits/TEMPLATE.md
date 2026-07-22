@@ -24,7 +24,7 @@
   justification AND the unlock condition (what measurement, upstream change,
   or milestone flips it to Supported).
 
-Replace every `<!-- TODO:fill -->` marker; the release gate rejects any
+Replace every `TODO:fill` HTML-comment marker; the release gate rejects any
 leftover marker. Do not delete or rename the ten numbered section headings; the
 gate checks all ten. Keep entries terse -- one form should take an afternoon,
 not a week. The goal is that every release ships in its best known state, with
@@ -56,6 +56,7 @@ every consciously skipped optimization on the record.
 | mmap weight loading | <!-- TODO:fill --> | |
 | Resident pool reuse across requests (weights stay resident) | <!-- TODO:fill --> | |
 | View contiguity tradeoffs audited (`cont`/copy nodes justified) | <!-- TODO:fill --> | |
+| Peak RSS/VRAM per shipped quant measured (quiet host) and reconciled against the weights+KV+activations budget; unexplained excess blocks release; catalog RAM requirement matches the measured peak | <!-- TODO:fill --> | |
 
 ## 4. Decode algorithms
 
@@ -104,6 +105,7 @@ see `docs/design/gpu-weight-placement.md`).
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
 | WER vs fp16 measured for every shipped quant tier | <!-- TODO:fill --> | |
+| Model ref alias forms resolve identically everywhere (bare family / `family:canonical` / every `quant_tag_cases.json` alias accepted by CLI and server match logic; covered by the catalog-wide alias matrix test) | <!-- TODO:fill --> | |
 | Golden coverage includes long audio AND a cross-backend parity fixture | <!-- TODO:fill --> | |
 | Official decode parameters honored (suppression, stop tokens, upstream reference settings) | <!-- TODO:fill --> | |
 | Long-audio degradation checked (repetition, drift, truncation) | <!-- TODO:fill --> | |
