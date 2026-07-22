@@ -1,29 +1,42 @@
-//! `GgmlAsrExecutor` implementation for granite-speech: file-transcribe only
-//! (no streaming), wiring the already-validated pipeline (`frontend` ->
-//! `encoder_graph` -> `qformer` -> `prompt` -> `decode_executor` -> shared
-//! greedy-decode driver -> `tokenizer`) against a real `.oasr` pack via
-//! `runtime_provider::load_tensors_from_oasr_pack`.
+//! `GgmlAsrExecutor` implementation for granite-speech, wiring the already-
+//! validated pipeline (`frontend` -> `encoder_graph` -> `qformer` -> `prompt`
+//! -> `decode_executor` -> shared greedy-decode driver -> `tokenizer`)
+//! against a real `.oasr` pack via `runtime_provider::load_tensors_from_oasr_pack`.
 //!
-//! Registry status (see the family's `mod.rs` doc): this executor exists and
-//! compiles, but is **not yet wired** into `arch::mod`'s
-//! `OpenAsrArchitectureRegistry` / `ggml_family_registry`'s execution
-//! dispatch, `executor_component_registry`, `runtime_tensor_contract_registry`,
-//! `frontend_component_registry`, or `tokenizer_component_registry` -- each of
-//! those is a shared, multi-family file, and getting a new entry right in all
-//! of them (aliases, hparam schema, tensor-contract validation, capability
-//! flags, decode-policy resolution) is real, separate scope from the
-//! executor itself. `GRANITE_SPEECH_GGML_ADAPTER_ID` below is this family's
-//! intended id for that follow-up wiring, not yet referenced anywhere else.
+//! Registry status: wired into `arch::mod`'s `OpenAsrArchitectureRegistry`
+//! (architecture descriptor + component descriptors), `executor_component_registry`,
+//! `decode_policy_component_registry`, and `runtime_tensor_contract_registry`
+//! (see `runtime_contract.rs` for the metadata parsers those two validate
+//! against). No dedicated `frontend_component_registry`/
+//! `tokenizer_component_registry` entry exists in this codebase shape --
+//! frontend/tokenizer selection for a dedicated (non-composed) executor
+//! family is the executor's own job (this file constructs
+//! `GraniteSpeechMelFrontend`/`GraniteSpeechTokenizer` directly), the same
+//! precedent `firered_llm`/`mimo_asr`/`moss_transcribe_diarize` follow.
+//!
+//! Streaming: this pass was scoped "file-transcribe only, no streaming", but
+//! `builtin_execution_dispatch::build_builtin_ggml_streaming_execution_dispatch`
+//! has a fail-closed completeness gate that rejects its ENTIRE dispatch (for
+//! every family, not just this one) if any registered architecture has no
+//! streaming executor at all -- discovered by a workspace-wide test failure
+//! across unrelated families after this one's architecture descriptor
+//! landed, not a granite-speech-specific test. `GgmlAsrStreamingExecutor`
+//! below is therefore a required registration, not scope creep: it reuses
+//! the exact same offline `execute_inner` through the shared buffered
+//! snapshot streaming driver (`build_seq2seq_streaming_session`, matching
+//! moonshine/qwen's own precedent for a family with no incremental decode
+//! session yet) -- no new streaming-specific logic, and no claim of
+//! streaming-tuned latency.
 
 #![allow(dead_code)]
 
 use thiserror::Error;
 
 use super::decode_executor::GraniteSpeechAudioDecodeStepExecutor;
-use super::decoder_graph::GraniteSpeechDecoderConfig;
-use super::encoder_graph::GraniteSpeechEncoderConfig;
 use super::prompt::{GRANITE_SPEECH_AUDIO_TOKEN, build_audio_prompt_embeddings};
-use super::qformer::GraniteSpeechProjectorConfig;
+use super::runtime_contract::{
+    parse_decoder_metadata, parse_encoder_metadata, parse_projector_metadata,
+};
 use super::runtime_provider::load_tensors_from_oasr_pack;
 use super::tokenizer::GraniteSpeechTokenizer;
 use crate::api::backend::{Segment, Transcription};
@@ -37,7 +50,8 @@ use crate::models::seq2seq_greedy_decode::{
     run_seq2seq_greedy_decode_loop_with_adapter_v0,
 };
 
-pub(crate) const GRANITE_SPEECH_GGML_ADAPTER_ID: &str = "ggml-family-granite-speech-runtime-v1";
+use crate::arch::GRANITE_SPEECH_GGML_ADAPTER_ID;
+
 const GRANITE_SPEECH_EXECUTOR_ID: &str = "granite-speech-ggml-executor-v1";
 const GRANITE_SPEECH_EOT_TOKEN_ID: u32 = 100_257;
 const GRANITE_SPEECH_DEFAULT_QUESTION: &str =
@@ -55,6 +69,8 @@ enum GraniteSpeechGgmlExecutorError {
     RuntimePreflightFailed { reason: String },
     #[error("granite-speech ggml executor frontend failed: {reason}")]
     FrontendFailed { reason: String },
+    #[error("granite-speech ggml executor metadata contract failed: {reason}")]
+    MetadataFailed { reason: String },
     #[error("granite-speech ggml executor encoder failed: {reason}")]
     EncoderFailed { reason: String },
     #[error("granite-speech ggml executor projector failed: {reason}")]
@@ -101,13 +117,33 @@ impl GraniteSpeechGgmlExecutor {
 
         let backend = GgmlCpuGraphConfig::resolve_runtime_backend();
 
+        let metadata = read_gguf_metadata(pack_path).map_err(|error| {
+            GraniteSpeechGgmlExecutorError::MetadataFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let encoder_config = parse_encoder_metadata(&metadata).map_err(|error| {
+            GraniteSpeechGgmlExecutorError::MetadataFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let projector_config = parse_projector_metadata(&metadata).map_err(|error| {
+            GraniteSpeechGgmlExecutorError::MetadataFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let decoder_config = parse_decoder_metadata(&metadata).map_err(|error| {
+            GraniteSpeechGgmlExecutorError::MetadataFailed {
+                reason: error.to_string(),
+            }
+        })?;
+
         let encoder_weights =
             load_tensors_from_oasr_pack(pack_path, "encoder.").map_err(|error| {
                 GraniteSpeechGgmlExecutorError::EncoderFailed {
                     reason: error.to_string(),
                 }
             })?;
-        let encoder_config = GraniteSpeechEncoderConfig::granite_speech_4_1_2b();
         let encoder_output = super::encoder_graph::encode(
             &encoder_config,
             &encoder_weights,
@@ -126,7 +162,6 @@ impl GraniteSpeechGgmlExecutor {
                     reason: error.to_string(),
                 }
             })?;
-        let projector_config = GraniteSpeechProjectorConfig::granite_speech_4_1_2b();
         let projector_output = super::qformer::project(
             &projector_config,
             &projector_weights,
@@ -144,13 +179,7 @@ impl GraniteSpeechGgmlExecutor {
                     reason: error.to_string(),
                 }
             })?;
-        let decoder_config = GraniteSpeechDecoderConfig::granite_speech_4_1_2b();
 
-        let metadata = read_gguf_metadata(pack_path).map_err(|error| {
-            GraniteSpeechGgmlExecutorError::TokenizerFailed {
-                reason: error.to_string(),
-            }
-        })?;
         let tokenizer = GraniteSpeechTokenizer::from_gguf_metadata(&metadata).map_err(|error| {
             GraniteSpeechGgmlExecutorError::TokenizerFailed {
                 reason: error.to_string(),
@@ -277,10 +306,64 @@ impl GgmlAsrExecutor for GraniteSpeechGgmlExecutor {
         request: &GgmlAsrExecutionRequest,
     ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
         self.execute_inner(request)
-            .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
-                executor_id: GgmlAsrExecutor::executor_id(self),
-                adapter_id: request.selected_family.adapter_id,
-                reason: error.to_string(),
-            })
+            .map_err(|error| granite_speech_execute_error_to_ggml(self, error, request))
+    }
+}
+
+fn granite_speech_execute_error_to_ggml(
+    executor: &GraniteSpeechGgmlExecutor,
+    error: GraniteSpeechGgmlExecutorError,
+    request: &GgmlAsrExecutionRequest,
+) -> GgmlAsrExecutionError {
+    GgmlAsrExecutionError::ExecutorFailed {
+        executor_id: GgmlAsrExecutor::executor_id(executor),
+        adapter_id: request.selected_family.adapter_id,
+        reason: error.to_string(),
+    }
+}
+
+impl GraniteSpeechGgmlExecutor {
+    /// Streaming decode: re-runs the SAME offline pipeline (`execute_inner`)
+    /// against the growing/windowed audio buffer the shared streaming driver
+    /// hands it -- there is no incremental KV-cache session to plug in yet
+    /// (see `decode_executor.rs`'s O(n^2) recompute-per-step note), so every
+    /// partial re-does frontend + encoder + Q-Former + a full prefill-style
+    /// decode from scratch. This is registered to satisfy the codebase's
+    /// fail-closed streaming-completeness gate
+    /// (`builtin_execution_dispatch::build_builtin_ggml_streaming_execution_dispatch`
+    /// rejects the WHOLE dispatch, for every family, if any registered
+    /// architecture has no streaming executor at all) -- it is correctness-
+    /// only, not a real-time-tuned streaming path. The FINAL transcript stays
+    /// byte-identical to `execute()`.
+    fn execute_streaming(
+        &self,
+        request: &GgmlAsrExecutionRequest,
+    ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+        self.execute_inner(request)
+            .map_err(|error| granite_speech_execute_error_to_ggml(self, error, request))
+    }
+}
+
+const GRANITE_SPEECH_STREAMING_EXECUTOR_ID: &str =
+    "granite-speech-ggml-snapshot-streaming-executor-v1";
+
+impl crate::models::ggml_asr_executor::GgmlAsrStreamingExecutor for GraniteSpeechGgmlExecutor {
+    fn executor_id(&self) -> &'static str {
+        GRANITE_SPEECH_STREAMING_EXECUTOR_ID
+    }
+
+    fn start_streaming_session(
+        &self,
+        request: &crate::models::ggml_asr_executor::GgmlAsrStreamingSessionRequest,
+    ) -> Result<Box<dyn crate::NativeAsrSession>, GgmlAsrExecutionError> {
+        crate::models::incremental_streaming_driver::build_seq2seq_streaming_session(
+            *self,
+            GRANITE_SPEECH_STREAMING_EXECUTOR_ID,
+            GRANITE_SPEECH_GGML_ADAPTER_ID,
+            "granite-speech",
+            request,
+            crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_HEAVY_SEQ2SEQ,
+            GraniteSpeechGgmlExecutor::execute_streaming,
+        )
     }
 }

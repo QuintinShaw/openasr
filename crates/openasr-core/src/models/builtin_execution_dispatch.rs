@@ -17,6 +17,7 @@ use super::firered_llm::executor::FireRedLlmGgmlExecutor;
 use super::ggml_asr_executor::GgmlAsrStreamingExecutor;
 use super::ggml_composed_executor::ComposedGgmlAsrExecutor;
 use super::ggml_family_adapter::GgmlExecutionCapability;
+use super::granite_speech::executor::GraniteSpeechGgmlExecutor;
 use super::mimo_asr::executor::MimoAsrGgmlExecutor;
 use super::moss_transcribe_diarize::executor::MossTdGgmlExecutor;
 use super::parakeet_ctc::executor::ParakeetCtcGgmlExecutor;
@@ -156,6 +157,9 @@ fn builtin_streaming_executor_for_architecture(
         }
         crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID => {
             Some(Arc::new(MossTdGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID => {
+            Some(Arc::new(GraniteSpeechGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
         }
         crate::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID => {
             Some(Arc::new(XasrZipformerGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
