@@ -1,15 +1,25 @@
-# firered2-llm reference dumper
+# firered2 reference dumper
 
 Runs the **official** FireRedASR2S python reference implementation
-(FireRedTeam/FireRedASR2-LLM, Encoder-Adapter-LLM) stage-by-stage on a real
-fixture wav and dumps every intermediate activation to an `.npz` file, so the
-ggml side (`crates/openasr-core/src/models/firered_llm`) can be diffed
-against ground truth. This is the family's "reference dumper" required by
+stage-by-stage on a real fixture wav and dumps every intermediate activation,
+so the ggml side can be diffed against ground truth. This directory covers
+two related but separately-shaped model families:
+
+- `dump_reference.py`: FireRedTeam/FireRedASR2-LLM (Encoder-Adapter-LLM),
+  dumping to a single `.npz` (see "firered2-llm" below).
+- `dump_aed_encoder.py`: FireRedTeam/FireRedASR2-AED (Attention-based
+  Encoder-Decoder), dumping the Conformer encoder's subsample stem + 16 block
+  outputs (+ optional intra-block taps) as raw f32 files (see "firered2-aed"
+  below).
+
+Both are the family's "reference dumper" required by
 [`docs/model-audits/TEMPLATE.md`](../../docs/model-audits/TEMPLATE.md)
 section 10 ("Reference dumper exists for this family").
 
 Nothing here is vendored into the repo: no third-party code, no weights, no
 dump output. All of that lives outside the tracked tree (see below).
+
+## firered2-llm (`dump_reference.py`)
 
 ## What it dumps
 
@@ -153,3 +163,83 @@ access required. They do **not** exercise the real encoder/adapter/LLM
 forward passes end-to-end (that needs the real weights and repo clone above)
 -- treat a real `--stage all` run against `fixtures/jfk.wav` as the
 end-to-end check.
+
+## firered2-aed (`dump_aed_encoder.py`)
+
+Reference dumper for FireRedTeam/FireRedASR2-AED's Conformer encoder --
+backs `crates/openasr-core/src/models/firered_aed/encoder_graph.rs`'s
+`parity_tests` module (see that module's doc comment for the full evidence
+chain this tool produced). Unlike firered2-llm, AED ships its own
+`model.pth.tar` with `args` + `model_state_dict` bundled together (see
+`fireredasr2s/fireredasr2/asr.py`'s `load_fireredasr_aed_model`), so this is a
+separate, smaller script rather than another `--stage` on `dump_reference.py`.
+
+### Checkpoint layout
+
+```text
+<weights-dir>/
+  model.pth.tar   # encoder + decoder + ctc state dict, plus "args" (architecture)
+  cmvn.ark        # kaldi global CMVN stats
+```
+
+Download: <https://huggingface.co/FireRedTeam/FireRedASR2-AED> (public,
+non-gated; `model.pth.tar` is ~4.4 GB). Verify the LFS sha256 the HF API
+reports for `model.pth.tar` against the downloaded file before trusting it.
+
+### Usage
+
+```bash
+cd tooling/firered2-reference-dumper
+python3 dump_aed_encoder.py \
+  --fireredasr2s-repo /path/to/fr2-refcode \
+  --weights-dir /path/to/firered-aed-v2-weights \
+  --wav ../../fixtures/jfk.wav
+```
+
+Prints `frame0_first8` plus frame/hidden shapes. Additional flags for the
+bisection workflow below:
+
+- `--fp16-weights`: round-trips every loaded encoder weight tensor through
+  `w.half().float()` before running the forward pass (activations stay fp32
+  throughout). Isolates "is the residual against our fp16 `.oasr` pack
+  actually caused by weight storage precision" from everything else --
+  compare this run's output to the plain fp32 run's.
+- `--dump-layers-dir DIR`: dumps `subsample_out.f32` (post subsample-stem,
+  pre-block) and `block_00.f32`..`block_15.f32` (each Conformer block's final
+  output) as row-major little-endian f32 files, `[frame_count, d_model]`.
+  Pairs with the Rust-side `#[cfg(test)]` `encode_with_layer_taps` in
+  `encoder_graph.rs` (`dump_encoder_layer_taps_for_v2_bisection`, itself
+  `#[ignore]`d) -- run both against the same wav/checkpoint and diff the
+  matching files to find which block first diverges.
+- `--tap-layer-idx N`: additionally dumps `tap_ffn1_out.f32` /
+  `tap_attn_out.f32` / `tap_conv_out.f32` / `tap_ffn2_out.f32` /
+  `tap_block_out.f32` -- the four intra-block sub-steps of block `N` (plus
+  its own final output), for narrowing a layer-level divergence down to a
+  specific sub-operation (attention vs conv vs FFN vs the block's own
+  LayerNorm). Manually re-runs `ConformerEncoder.forward`/
+  `RelPosEmbConformerBlock.forward` instead of registering forward hooks on
+  `block.ffn1`/`block.ffn2` directly -- those submodules' raw output is NOT
+  what the block actually carries forward (the block macaron-reweights them,
+  `0.5*x + 0.5*self.ffn1(x)`, and `ffn1(x)` already folds in its own internal
+  residual), so a naive hook on them silently captures the wrong value.
+
+Both flags are independent of the headline `frame0_first8` print, which
+always comes from a normal, untouched `encoder(feat, length)` call.
+
+### Rust-side gotcha this workflow surfaced
+
+`encode_with_layer_taps`'s first version requested many intermediate tensors
+via `compute_outputs_f32` without calling `graph.set_output()` on them first.
+`ggml_build_forward_expand` (what `prepare_outputs_for_upload` calls under the
+hood) adds a tensor as a graph root, but does NOT mark it with the
+`GGML_TENSOR_FLAG_OUTPUT` the scheduler's liveness-based buffer allocator
+(gallocr) needs to know a tensor must survive past its last in-graph
+consumer. Without that flag, gallocr freely recycled an early tap's buffer
+for a later tensor's storage once nothing in the graph still read from it --
+so the readback saw whatever later computation had overwritten it with,
+producing wild, structurally-nonsensical values (max diffs in the hundreds,
+alternating block-to-block) that looked like a catastrophic correctness bug
+but were actually a diagnostic-harness bug. Every additional tap tensor in
+`encode_with_layer_taps` MUST get its own `graph.set_output()` call before
+`prepare_outputs_for_upload`, exactly like the single-output production
+`encode_firered_aed_audio_embeddings` already does for its one output.
