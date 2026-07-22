@@ -78,7 +78,7 @@ every consciously skipped optimization on the record.
 
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
-| Metal command batching + wired memory budget respected | Supported | Deliberate budget gate: `resolve_decoder_backend_override` keeps the decoder off Metal when `pack_bytes * 2 > total_RAM` (`executor.rs:421-486`). Decoder-stage placement under Auto is under active A/B (whole-decoder CPU vs Metal; prefill favors Metal 42 vs 59 ms/prompt-tok, decode favors CPU 88 vs 129 ms/tok) -- verdict pending, current shipped behavior unchanged. |
+| Metal command batching + wired memory budget respected | Supported | Deliberate budget gate: `resolve_decoder_backend_override` keeps the decoder off Metal when `pack_bytes * 2 > total_RAM` (`executor.rs:421-486`). Whole-decoder-on-CPU under Auto was A/B'd clean (2026-07-22) and REJECTED: jfk median 12.30s (Metal) vs 22.38s (CPU, +82%); zh_sample flat within noise. Metal decoder stays; revisit only via per-stage split (shared-executor rework). |
 | CPU thread pool sized for P/E cores | Supported | Shared `adaptive_thread_count_for_available` policy (`cpu_graph.rs:257-289`) by workload class and backend type; no family override needed. |
 | Accelerate/BLAS used where it wins | Supported | Generic BLAS backend wiring (`cpu_graph.rs:4844-4852`), inherited via the shared CPU graph path. |
 
@@ -157,3 +157,4 @@ dead). Add family-specific verdicts with the measurement behind each; write
 | HIP prefill-chunk tuning replication | Deliberately skipped: 40s cap keeps prompts short; qwen's discrete-GPU prefill-chunk tuning judged not worth replicating (`llm_transformer.rs:13-19`) | 2026-07 (code-in) |
 | Per-stage backend split inside one executor instance (prefill Metal + decode CPU) | Blocked without double-loading 4.7GB weights (shared executor binds weights to one backend at construction); double-load proven unsafe on 16GB (swap abort). Revisit only with a shared-executor multi-backend rework. | 2026-07-22 |
 | Noisy-host benchmarking | "31% win" and "mimo regression" both proved to be shared-host load artifacts; every number in this form must carry commit + idle-state disclosure | 2026-07-22 |
+| Whole-decoder-on-CPU under Auto | Rejected by clean A/B: jfk +82% slower, zh flat (median of 3, idle-rate disclosed, `tmp/fr2-measure/ab2_*.log`). Per-token stage math (decode CPU 88 vs Metal 129 ms/tok) does not survive end-to-end because the prefill loss dominates; break-even needs >~63 output tokens AND longer clips than 18s. Commit 343a959 archived unmerged. | 2026-07-22 |
