@@ -463,6 +463,225 @@ impl MossEncoderRuntime {
     }
 }
 
+/// Test-only twin of [`MossEncoderRuntime::encode`] for the CPU-vs-Metal
+/// numeric-divergence bisection (see `parity_tests` below): builds the
+/// identical graph but taps every layer's final output (post-`transformer_layer`,
+/// pre-final-norm) plus the subsample stem's output and the post-final-norm
+/// `encoder_out`, so a caller can run this once per backend and diff layer by
+/// layer to find the first one that decorrelates. Mirrors firered-aed's
+/// `encode_with_layer_taps` (`models/firered_aed/encoder_graph.rs`).
+#[cfg(test)]
+pub(crate) fn encode_with_layer_taps(
+    runner: &mut GgmlCpuGraphRunner,
+    loaded: Option<&GgmlLoadedWeightContext>,
+    weights: &MossEncoderWeights,
+    config: MossEncoderConfig,
+    mel: &[f32],
+    mel_frames: usize,
+) -> Result<MossEncoderTapDump, MossEncoderError> {
+    let expected_mel_len = config.n_mels * mel_frames;
+    if mel.len() != expected_mel_len {
+        return Err(MossEncoderError::InvalidMelInputLength {
+            found: mel.len(),
+            expected: expected_mel_len,
+            n_mels: config.n_mels,
+            frames: mel_frames,
+        });
+    }
+    if config.n_heads == 0 || !config.d_model.is_multiple_of(config.n_heads) {
+        return Err(MossEncoderError::GraphExecution {
+            reason: format!(
+                "d_model {} is not a multiple of n_heads {}",
+                config.d_model, config.n_heads
+            ),
+        });
+    }
+    let head_dim = config.d_model / config.n_heads;
+    let output_frames = config.max_source_positions;
+
+    let mut arena = runner
+        .start_static_tensor_arena(moss_encoder_arena_context_bytes(weights))
+        .map_err(|source| map_graph_error("static_tensor_arena", source))?;
+    let resident = build_moss_encoder_resident_weights(&mut arena, weights, config, loaded)?;
+
+    let mut graph = runner.start_graph();
+
+    let mel_tensor = graph
+        .new_tensor_2d_f32(mel_frames, config.n_mels, "moss_enc_mel")
+        .map_err(|source| map_graph_error("ggml_new_tensor_2d(mel)", source))?;
+    graph
+        .set_input(mel_tensor)
+        .map_err(|source| map_graph_error("ggml_set_input(mel)", source))?;
+    let mask = graph
+        .new_tensor_2d_f32(output_frames, output_frames, "moss_enc_mask")
+        .map_err(|source| map_graph_error("ggml_new_tensor_2d(mask)", source))?;
+    graph
+        .set_input(mask)
+        .map_err(|source| map_graph_error("ggml_set_input(mask)", source))?;
+
+    let conv1 = apply_conv_1d_bias_activation(
+        &graph,
+        resident.conv1_weight,
+        mel_tensor,
+        resident.conv1_bias,
+        Conv1dParams {
+            stride: CONV1_STRIDE,
+            padding: CONV_PADDING,
+            dilation: CONV_DILATION,
+        },
+        ConvActivation::Gelu,
+        ConvBlockSteps {
+            conv: "ggml_conv_1d(conv1)",
+            bias: "ggml_add(conv1_bias)",
+            activation: "ggml_gelu(conv1)",
+        },
+        map_graph_error,
+    )?;
+    let conv2 = apply_conv_1d_bias_activation(
+        &graph,
+        resident.conv2_weight,
+        conv1,
+        resident.conv2_bias,
+        Conv1dParams {
+            stride: CONV2_STRIDE,
+            padding: CONV_PADDING,
+            dilation: CONV_DILATION,
+        },
+        ConvActivation::Gelu,
+        ConvBlockSteps {
+            conv: "ggml_conv_1d(conv2)",
+            bias: "ggml_add(conv2_bias)",
+            activation: "ggml_gelu(conv2)",
+        },
+        map_graph_error,
+    )?;
+    let conv2 = graph
+        .permute(conv2, 1, 0, 2, 3)
+        .map_err(|source| map_graph_error("ggml_permute(conv2)", source))?;
+    let conv2 = graph
+        .cont(conv2)
+        .map_err(|source| map_graph_error("ggml_cont(conv2)", source))?;
+    let mut state = graph
+        .add(conv2, resident.pos_embd)
+        .map_err(|source| map_graph_error("ggml_add(pos_embd)", source))?;
+    let subsample_out = state;
+
+    let mut layer_outputs = Vec::with_capacity(resident.layers.len());
+    for tensors in &resident.layers {
+        state = transformer_layer(
+            &mut graph,
+            state,
+            mask,
+            TransformerEncoderConfig {
+                head_dim,
+                attention_heads: config.n_heads,
+                token_count: output_frames,
+                layer_norm_epsilon: MOSS_ENCODER_LAYER_NORM_EPSILON,
+                ffn_activation: crate::nn::ffn::FeedForwardActivation::Gelu,
+                use_flash_attention: true,
+            },
+            TransformerEncoderLayerWeights {
+                attn_norm_weight: tensors.attn_norm_weight,
+                attn_norm_bias: tensors.attn_norm_bias,
+                attn_q_weight: tensors.attn_q_weight,
+                attn_q_bias: tensors.attn_q_bias,
+                attn_k_weight: tensors.attn_k_weight,
+                attn_k_bias: tensors.attn_k_bias,
+                attn_v_weight: tensors.attn_v_weight,
+                attn_v_bias: tensors.attn_v_bias,
+                attn_out_weight: tensors.attn_out_weight,
+                attn_out_bias: tensors.attn_out_bias,
+                ffn_norm_weight: tensors.ffn_norm_weight,
+                ffn_norm_bias: tensors.ffn_norm_bias,
+                ffn_up_weight: tensors.ffn_up_weight,
+                ffn_up_bias: tensors.ffn_up_bias,
+                ffn_down_weight: tensors.ffn_down_weight,
+                ffn_down_bias: tensors.ffn_down_bias,
+            },
+            map_graph_error,
+        )?;
+        layer_outputs.push(state);
+    }
+
+    let encoder_out = crate::nn::norm::apply_affine_layer_norm(
+        &graph,
+        state,
+        MOSS_ENCODER_LAYER_NORM_EPSILON,
+        resident.out_norm_weight,
+        resident.out_norm_bias,
+        crate::nn::norm::AffineLayerNormSteps {
+            norm: "ggml_norm(out_norm)",
+            scale: "out_norm",
+            bias: "out_norm",
+        },
+        map_graph_error,
+    )?;
+
+    let mut all_outputs = vec![subsample_out];
+    all_outputs.extend(layer_outputs.iter().copied());
+    all_outputs.push(encoder_out);
+    // Every tap must be marked `ggml_set_output` -- see firered-aed's
+    // `encode_with_layer_taps` module doc for why (gallocr buffer-reuse
+    // otherwise silently recycles a tap's buffer for a later tensor).
+    for &tensor in &all_outputs {
+        graph
+            .set_output(tensor)
+            .map_err(|source| map_graph_error("ggml_set_output(encoder_tap)", source))?;
+    }
+
+    graph
+        .prepare_outputs_for_upload(&all_outputs)
+        .map_err(|source| map_graph_error("ggml_prepare_outputs(encoder_taps)", source))?;
+
+    graph
+        .set_f32_slice(mel_tensor, mel, "moss_enc_mel")
+        .map_err(|source| MossEncoderError::GraphExecution {
+            reason: format!("could not upload mel features: {source}"),
+        })?;
+    let mask_zeros = vec![0.0_f32; output_frames * output_frames];
+    graph
+        .set_f32_slice(mask, &mask_zeros, "moss_enc_mask")
+        .map_err(|source| MossEncoderError::GraphExecution {
+            reason: format!("could not upload attention mask: {source}"),
+        })?;
+
+    let expected_len = output_frames * config.d_model;
+    let requests: Vec<(crate::ggml_runtime::GgmlCpuTensor<'_>, usize)> =
+        all_outputs.iter().map(|&t| (t, expected_len)).collect();
+    let mut computed = graph.compute_outputs_f32(&requests).map_err(|source| {
+        MossEncoderError::GraphExecution {
+            reason: format!("encoder taps graph compute failed: {source}"),
+        }
+    })?;
+
+    let mut iter = computed.drain(..);
+    let subsample_rows = iter.next().expect("subsample_out present");
+    let layer_rows: Vec<Vec<f32>> = (0..layer_outputs.len())
+        .map(|_| iter.next().expect("layer output present"))
+        .collect();
+    let encoder_out_rows = iter.next().expect("encoder_out present");
+
+    Ok(MossEncoderTapDump {
+        d_model: config.d_model,
+        subsample_rows,
+        layer_rows,
+        encoder_out_rows,
+    })
+}
+
+/// Test-only bisection dump: subsample-stem output, every layer's final
+/// output (post-`transformer_layer`, pre-final-norm), and the final
+/// post-final-norm `encoder_out` -- all row-major `[frame][d_model]` f32.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct MossEncoderTapDump {
+    pub d_model: usize,
+    pub subsample_rows: Vec<f32>,
+    /// `layer_rows[i]` is transformer layer `i`'s final output (0-indexed).
+    pub layer_rows: Vec<Vec<f32>>,
+    pub encoder_out_rows: Vec<f32>,
+}
+
 /// Resident encoder graph tensors for one transformer layer, all living in
 /// the arena's WEIGHTS-usage backend buffer (the six 2D projections either
 /// bound zero-copy from the mmap'd pack or, when unbound, arena-f32-uploaded
@@ -779,4 +998,250 @@ fn build_moss_encoder_resident_weights<'a>(
         out_norm_bias,
         layers,
     })
+}
+
+#[cfg(test)]
+mod parity_tests {
+    //! CPU-vs-Metal numeric-divergence bisection for the "encoder decorrelates
+    //! on Metal" defect (`arch/mod.rs`'s `MOSS_TD_GGML_ARCHITECTURE_ID`
+    //! `auto_gpu_policy: ExceptMetal` doc comment, defect 1 of 2). Dev-only:
+    //! needs the real ~1.8 GB `moss-transcribe-diarize-fp16.oasr` pack (never
+    //! committed) and a real Metal device, so every test here is `#[ignore]`d
+    //! and points at the pack through an env var rather than a fixed path.
+    //!
+    //! Methodology mirrors firered-aed's CPU-vs-PyTorch bisection
+    //! (`models/firered_aed/encoder_graph.rs`'s `parity_tests` module doc):
+    //! run the identical graph through [`encode_with_layer_taps`] once per
+    //! backend on the same input, then compare every tap with a
+    //! mean-per-frame cosine similarity (mirrors
+    //! `xasr_zipformer::encoder_graph`'s `xasr_mean_frame_cosine_similarity` --
+    //! a single degraded frame pulls this metric down without a spread-evenly
+    //! algorithmic bug being able to hide behind one bad frame dominating a
+    //! whole-tensor max-diff).
+    use super::*;
+    use crate::ggml_runtime::{
+        GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgufTensorDataReader, read_gguf_metadata,
+    };
+    use crate::models::moss_transcribe_diarize::runtime_contract::parse_encoder_metadata;
+    use crate::models::whisper::whisper_log_mel_spectrogram_16khz_mono_v0;
+
+    const REAL_PACK_ENV: &str = "OPENASR_MOSS_TD_ENCODER_REAL_PACK";
+    /// `WhisperFeatureExtractor`'s target frame count for one 30s chunk
+    /// (mirrors `executor.rs`'s `MEL_TARGET_FRAMES`; not exported from there
+    /// since that module keeps it private).
+    const MEL_TARGET_FRAMES: usize = 3000;
+
+    fn real_pack_path() -> std::path::PathBuf {
+        std::env::var_os(REAL_PACK_ENV)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("{REAL_PACK_ENV} must point to a moss-transcribe-diarize .oasr pack")
+            })
+    }
+
+    fn dev_wav_path() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav")
+    }
+
+    /// Cosine similarity between two equal-length vectors, treated as a
+    /// single flattened point in R^n.
+    fn cosine_similarity(actual: &[f32], expected: &[f32]) -> f64 {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "cosine_similarity length mismatch"
+        );
+        let dot: f64 = actual
+            .iter()
+            .zip(expected)
+            .map(|(a, b)| f64::from(*a) * f64::from(*b))
+            .sum();
+        let norm_a: f64 = actual.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+        let norm_b: f64 = expected.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+        if norm_a <= 0.0 || norm_b <= 0.0 {
+            return if norm_a == norm_b { 1.0 } else { 0.0 };
+        }
+        dot / (norm_a.sqrt() * norm_b.sqrt())
+    }
+
+    /// Mean cosine similarity across every `dim`-wide row (mirrors
+    /// `xasr_zipformer::encoder_graph`'s `xasr_mean_frame_cosine_similarity`).
+    fn mean_frame_cosine_similarity(actual: &[f32], expected: &[f32], dim: usize) -> f64 {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "mean_frame_cosine_similarity length mismatch"
+        );
+        assert_eq!(actual.len() % dim, 0, "tap length not a multiple of dim");
+        let frames = actual.len() / dim;
+        assert!(frames > 0, "tap has no frames");
+        let sum: f64 = (0..frames)
+            .map(|f| {
+                let lo = f * dim;
+                let hi = lo + dim;
+                cosine_similarity(&actual[lo..hi], &expected[lo..hi])
+            })
+            .sum();
+        sum / frames as f64
+    }
+
+    fn max_abs_diff(actual: &[f32], expected: &[f32]) -> f32 {
+        actual
+            .iter()
+            .zip(expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// Runs the tapped encoder graph once on the requested backend against
+    /// the real pack + a real 30s chunk of `fixtures/jfk.wav`.
+    fn run_tapped_encoder(backend: GgmlCpuGraphBackend) -> MossEncoderTapDump {
+        let pack_path = real_pack_path();
+        let metadata_view = read_gguf_metadata(&pack_path).expect("read gguf metadata");
+        let encoder_metadata =
+            parse_encoder_metadata(&metadata_view).expect("parse moss encoder metadata");
+        let config = MossEncoderConfig {
+            n_layers: encoder_metadata.n_layers,
+            d_model: encoder_metadata.d_model,
+            n_heads: encoder_metadata.n_heads,
+            n_mels: encoder_metadata.n_mels,
+            max_source_positions: encoder_metadata.max_source_positions,
+        };
+
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            dev_wav_path(),
+            "moss encoder metal parity test",
+            "moss encoder metal parity test",
+        )
+        .expect("load jfk.wav");
+        let chunk = &samples[..samples.len().min(480_000)];
+        let mel =
+            whisper_log_mel_spectrogram_16khz_mono_v0(chunk, config.n_mels, MEL_TARGET_FRAMES)
+                .expect("compute mel");
+
+        let reader = GgufTensorDataReader::from_path(&pack_path).expect("open tensor reader");
+        let weights =
+            load_moss_encoder_weights_from_reader(&reader, config).expect("load encoder weights");
+
+        // Route through the same `moss_td_encoder_graph_config()` the real
+        // executor uses (not a bare `GgmlCpuGraphConfig::default()` with only
+        // `.backend` overwritten): `configure_model_runtime_graph_config`
+        // only forces `n_threads=1`/`use_scheduler=true` when the config's
+        // backend is ALREADY `Metal` at build time (see
+        // `models/graph_runtime_config.rs`), so overwriting `.backend` on an
+        // already-built CPU-default config silently keeps CPU's
+        // thread/scheduler pairing under a Metal backend tag -- not the real
+        // production Metal path. Driving backend selection through the
+        // `OPENASR_GGML_BACKEND` env var before the config is built (exactly
+        // how `resolve_runtime_backend` is meant to be steered) is the only
+        // way to get the correctly-paired settings for each backend. Safe
+        // here only because this manual harness runs single-threaded
+        // (`--test-threads=1`, enforced by the `#[ignore]` message).
+        let env_value = match backend {
+            GgmlCpuGraphBackend::Cpu => "cpu",
+            GgmlCpuGraphBackend::Metal => "metal",
+            GgmlCpuGraphBackend::Gpu => "gpu",
+        };
+        // SAFETY: this harness is documented `--test-threads=1`-only (see the
+        // `#[ignore]` messages on its two callers), so no concurrent test
+        // observes this process-global env var mid-mutation.
+        unsafe {
+            std::env::set_var(GgmlCpuGraphConfig::BACKEND_ENV, env_value);
+        }
+        let mut graph_config =
+            crate::models::moss_transcribe_diarize::graph_config::moss_td_encoder_graph_config();
+        unsafe {
+            std::env::remove_var(GgmlCpuGraphConfig::BACKEND_ENV);
+        }
+        assert_eq!(
+            graph_config.backend,
+            backend,
+            "moss_td_encoder_graph_config did not resolve the requested backend from {}",
+            GgmlCpuGraphConfig::BACKEND_ENV
+        );
+        graph_config.graph_size = graph_config.graph_size.max(16_384);
+        graph_config.context_bytes =
+            graph_config
+                .context_bytes
+                .max(GgmlCpuGraphConfig::metadata_context_bytes(
+                    graph_config.graph_size,
+                ));
+
+        let mut runner = GgmlCpuGraphRunner::new(graph_config).expect("build graph runner");
+        let loaded = runner
+            .load_gguf_weight_context(&pack_path)
+            .expect("load gguf weight context");
+
+        encode_with_layer_taps(
+            &mut runner,
+            Some(&loaded),
+            &weights,
+            config,
+            mel.data(),
+            MEL_TARGET_FRAMES,
+        )
+        .expect("encode_with_layer_taps")
+    }
+
+    /// Layer-by-layer CPU-vs-Metal bisection: prints a cosine/max-abs-diff
+    /// table for the subsample stem + every transformer layer + the final
+    /// `encoder_out`, so the first layer that decorrelates is visible by eye.
+    /// `--nocapture` only, not a pass/fail gate by itself -- see
+    /// `metal_encoder_matches_cpu_reference` below for the actual assertion.
+    #[test]
+    #[ignore = "manual real-pack Metal bisection harness: set OPENASR_MOSS_TD_ENCODER_REAL_PACK to the real moss-transcribe-diarize .oasr pack; requires a Metal device"]
+    fn dump_cpu_vs_metal_layer_cosine_table() {
+        let cpu = run_tapped_encoder(GgmlCpuGraphBackend::Cpu);
+        let metal = run_tapped_encoder(GgmlCpuGraphBackend::Metal);
+
+        assert_eq!(cpu.d_model, metal.d_model);
+        assert_eq!(cpu.layer_rows.len(), metal.layer_rows.len());
+        let dim = cpu.d_model;
+
+        let subsample_cosine =
+            mean_frame_cosine_similarity(&metal.subsample_rows, &cpu.subsample_rows, dim);
+        eprintln!(
+            "moss encoder cpu-vs-metal subsample: cosine={subsample_cosine:.6} max_abs_diff={:.6}",
+            max_abs_diff(&metal.subsample_rows, &cpu.subsample_rows)
+        );
+
+        for (idx, (metal_rows, cpu_rows)) in metal
+            .layer_rows
+            .iter()
+            .zip(cpu.layer_rows.iter())
+            .enumerate()
+        {
+            let cosine = mean_frame_cosine_similarity(metal_rows, cpu_rows, dim);
+            eprintln!(
+                "moss encoder cpu-vs-metal layer[{idx:02}]: cosine={cosine:.6} max_abs_diff={:.6}",
+                max_abs_diff(metal_rows, cpu_rows)
+            );
+        }
+
+        let final_cosine =
+            mean_frame_cosine_similarity(&metal.encoder_out_rows, &cpu.encoder_out_rows, dim);
+        eprintln!(
+            "moss encoder cpu-vs-metal encoder_out: cosine={final_cosine:.6} max_abs_diff={:.6}",
+            max_abs_diff(&metal.encoder_out_rows, &cpu.encoder_out_rows)
+        );
+    }
+
+    /// The actual regression gate this defect's fix must satisfy (see
+    /// `arch/mod.rs`'s `ExceptMetal` doc comment): once fixed, flip
+    /// `auto_gpu_policy` back to `AllBackends` and un-ignore this test.
+    #[test]
+    #[ignore = "manual real-pack Metal harness: set OPENASR_MOSS_TD_ENCODER_REAL_PACK to the real moss-transcribe-diarize .oasr pack; requires a Metal device -- currently expected to FAIL until the Metal encoder divergence defect is fixed"]
+    fn metal_encoder_matches_cpu_reference() {
+        let cpu = run_tapped_encoder(GgmlCpuGraphBackend::Cpu);
+        let metal = run_tapped_encoder(GgmlCpuGraphBackend::Metal);
+        let dim = cpu.d_model;
+        let cosine =
+            mean_frame_cosine_similarity(&metal.encoder_out_rows, &cpu.encoder_out_rows, dim);
+        assert!(
+            cosine > 0.999,
+            "moss encoder_out cpu-vs-metal cosine too low: {cosine:.6} (see arch/mod.rs's \
+             ExceptMetal doc comment; run dump_cpu_vs_metal_layer_cosine_table for the per-layer \
+             breakdown)"
+        );
+    }
 }
