@@ -1,0 +1,162 @@
+# Model release audit: firered-aed
+
+> **Policy.** Should-support items MUST be `Supported`; anything else requires a
+> detailed justification and an explicit unlock condition. This form ships with
+> the model release. A family without a completed form does not enter the
+> release flow: `tooling/publish-model/scripts/_manifest.py --public` fails
+> closed on a missing or half-filled form.
+
+| Field | Value |
+| --- | --- |
+| Family (`models-core.toml` `family`) | firered-aed |
+| Models covered | firered-aed-l-v2 (FireRedASR2-AED, 1.1B Conformer encoder + Transformer decoder AED; fp16 / q8_0 / q4_k). Upstream v1 FireRedASR-AED-L never shipped; the catalog entry is the v2 checkpoint on the byte-identical architecture. |
+| Auditor / date | Quintin (with agent-collected evidence) / 2026-07-22, IN PROGRESS. **Backfill audit**: this family has been public since 0.1.9 (`catalog.json` `public: true`), so this form is a retroactive completion certificate, not a pre-release gate. Static-only pass; every timing/memory/utilization cell is Deferred pending a quiet-window measurement window. |
+| Core version + commit audited | main `7fae6af` (static audit). Family launched at `min_core_version` 0.1.9; longform/PE-cap defense-in-depth is issues #68/#158. |
+| Bench hardware | Apple M1, 16GB, macOS (reference host). No fresh measurement taken in this pass -- catalog perf fields exist (see sections 3/8) but their capture commit/host/quiet-state are undocumented and are treated as unverified here. |
+
+**How to fill.** Status is exactly one of:
+
+- `Supported` -- implemented and verified for this family in this repo. Cite
+  the evidence (test name, bench run, code path).
+- `Not applicable` -- architecturally impossible or meaningless for this
+  family. Say why, so nobody re-derives it.
+- `Deferred` -- applicable but intentionally not done yet. Give the detailed
+  justification AND the unlock condition (what measurement, upstream change,
+  or milestone flips it to Supported).
+
+Replace every `TODO:fill` HTML-comment marker; the release gate rejects any
+leftover marker. Do not delete or rename the ten numbered section headings; the
+gate checks all ten. Keep entries terse -- one form should take an afternoon,
+not a week. The goal is that every release ships in its best known state, with
+every consciously skipped optimization on the record.
+
+## 1. Graph & scheduling
+
+| Item | Status | Justification / evidence (+ unlock condition if not Supported) |
+| --- | --- | --- |
+| Graph reuse / persistent session (no per-request graph rebuild) | Supported | Thread-local `BoundedRuntimeCache` for encoder and decoder keyed on (canonical pack path, backend) and (path, backend, encoder frame count) respectively (`executor.rs:66-129` as of `7fae6af`): a second same-thread transcription on the same pack skips re-loading the GGUF weight context for both stages. The decoder key includes encoder frame count because the cross-KV arena is sized per utterance (`decoder_graph.rs:126-203`), mirroring cohere's `CohereDecoderRuntimeCacheKey`. Note: the *forward graph itself* is rebuilt fresh per encoder pass and per decode step by design (small 1.1B model, no fixed-span reused-graph like cohere serve-batch) -- what is reused is the mmap'd weight context, not the node graph. |
+| Op fusion opportunities reviewed (norm+matmul, QKV, rope, ...) | Supported | Reviewed; largely structurally blocked. Encoder attention CANNOT fuse QKV: firered normalizes q/k/v through three *independent* LayerNorms of the same input (`encoder_graph.rs:426-473`), so there is no single pre-attn projection to fuse. Decoder rides the shared `nn::decoder::seq2seq_layer` block (`decoder_graph.rs:453-461`), inheriting whatever fusion that composer carries. No RoPE (encoder uses Transformer-XL rel-pos tables, decoder uses baked absolute sinusoidal PE). No firered-specific op stitching added. |
+| Batching / serve-batch path | Deferred | No `firered_aed` consumer of `seq2seq_serve_batch.rs` (only cohere/qwen have one); each executor call encodes/decodes exactly one window (`executor.rs:8-9` module doc). Unlock: implement a firered serve-batch decoder runtime after the shared serve-batch engine is promoted out of its env gate (same pillar-2 dependency as firered2-llm's row). |
+| Encode-decode pipelining | Not applicable | Single-shot per window: frontend -> encoder (one graph) -> cross-KV precompute -> autoregressive decode is one pass per window, no chunk stream to overlap. Long audio is sliced upstream by the architecture-agnostic longform planner (issue #68), each slice <= the 30s `GlobalQuadratic` cap, and this executor runs once per slice. |
+| Arena / gallocr reuse across steps (no per-step allocator churn) | Supported | Every graph (encoder forward, cross-KV precompute, each decode step) is allocated through the scheduler's gallocr via `prepare_outputs_for_upload` BEFORE input upload, so liveness-based buffer reuse collapses per-layer intermediates to the working-set peak instead of one allocation per non-view tensor (`encoder_graph.rs:330-338`, `decoder_graph.rs:279-295,488-495`). The persistent self-KV / cross-KV tensors live in a dedicated static arena buffer (`decoder_graph.rs:144-189`), not re-allocated per step. |
+
+## 2. Precision & quantization
+
+| Item | Status | Justification / evidence (+ unlock condition if not Supported) |
+| --- | --- | --- |
+| KV cache quantization | Supported | Decoder self-attention KV is already f16, not f32: `new_tensor_3d_f16(head_dim, decoder_pe_len, n_heads)` per layer (`decoder_graph.rs:164-179`). Cross-attention KV is f32 (`decoder_graph.rs:156-161`) -- deliberate: it is computed once per utterance from the encoder output and read every decode step, so precision there directly gates transcript fidelity and the byte size is request-bounded (~4.1 MB/audio-sec, section 9). Further quantizing self-KV below f16 is not warranted at this model size (self-KV static footprint is ~410 MB at the 5000-token capacity, section 9) and would need the shared qwen-family KV-quant infra; no family-local change is possible. |
+| Activation precision policy chosen deliberately (f32 vs f16) | Supported | Deliberate f32 activations. Repo-wide verdict (2026-07-14, M1): F16 activation gave zero encoder win and cast economics lock the trunk; inherited here (same Conformer-encoder compute shape as firered2-llm). Recorded in Known dead ends. |
+| Keep-quantized matmul (native Q blocks bound, no load-time dequant; RAM orders q4 < q8 < fp16) | Supported | Weights load via `load_gguf_weight_context` (mmap-backed `GgmlLoadedWeightContext`) and bind straight into `mul_mat` as graph tensors (`encoder_graph.rs:113-118,308,466-473`; `decoder_graph.rs:139-142,483`); no load-time f32 dequant of the weight matrices. The ONLY explicit f32 dequant is the two 80-element CMVN frontend vectors (`executor.rs:200-209`, `host_tensor_f32_copy_dequantized_by_name`), which is negligible. Shipped pack sizes confirm the RAM ordering: fp16 2.35 GB > q8_0 1.28 GB > q4_k 709 MB (`catalog.json` `size_bytes`). |
+| Quant tiers complete (q4_k / q8_0 / fp16) | Supported | All three tiers ship (`models-core.toml:561,608` `quants = ["fp16", "q8_0", "q4_k"]`; three `.oasr` files in HF `OpenASR/firered-aed-l-v2` rev `dc176bb`, all three in `catalog.json`). Unlike firered2-llm (8B, q4_k-only on 16GB), this 1.1B model fits every tier on the reference host, so no tier is exported to a bigger-host unlock. recommended_quant = q4_k. |
+
+## 3. Memory & data movement
+
+| Item | Status | Justification / evidence (+ unlock condition if not Supported) |
+| --- | --- | --- |
+| mmap weight loading | Supported | `load_gguf_weight_context` -> mmap-backed host-ptr ggml buffers, shared with every builtin family (`encoder_graph.rs:115-117`, `decoder_graph.rs:139-141`). |
+| Resident pool reuse across requests (weights stay resident) | Supported | Thread-local encoder + decoder runtime caches keep the mmap'd weight context resident across transcriptions (`executor.rs:66-129`), removing the per-request GGUF reload. Caveat inherited from the shared design: the cache key is path+backend (encoder) / path+backend+frame-count (decoder), i.e. path-only content identity with no fingerprint -- same pre-existing cross-family risk noted on qwen/firered2-llm; a content-fingerprint key is a shared follow-up, not a firered-local fix. The `second_same_thread_transcribe_is_faster_than_first...` test (`executor.rs:438-482`, `#[ignore]`, dev pack) is the executable record of the speedup. |
+| View contiguity tradeoffs audited (`cont`/copy nodes justified) | Deferred | Every `cont`/`permute` in the encoder carries a justifying comment tied to the upstream layout (rel-pos shift `encoder_graph.rs:557-574`, GLU split `:645-667`, depthwise-conv NCHW dance `:689-709`), and the decoder's single `cont` is the last-token view (`decoder_graph.rs:578-590`). But no dedicated offset-view / fusible-copy sweep has been run against this hand-written Conformer -- the conv module and rel-pos shift are the likeliest sources of an avoidable full-buffer copy. Unlock: one contiguity/offset-view sweep of `firered_aed::encoder_graph` (method per the xasr/Vulkan misalign case). |
+| Peak RSS/VRAM per shipped quant measured (quiet host) and reconciled against the weights+KV+activations budget; unexplained excess blocks release; catalog RAM requirement matches the measured peak | Deferred | `catalog.json` ships `peak_rss_bytes` per tier (fp16 4.74 GB / q8_0 4.35 GB / q4_k 4.10 GB) but with NO recorded capture commit/host/quiet-state, so it is treated as unverified (same stale-catalog risk that bit firered2-llm). Static budget I CAN derive at `7fae6af`: weights = pack size (0.71-2.35 GB); decoder self-KV static f16 = head_dim 64 x pe_len 5000 x n_heads 20 x 2 bytes x 2 (k+v) x 16 layers = ~410 MB allocated up front regardless of utterance; cross-KV f32 = d_model 1280 x encoder_frames x 2 (k+v) x 16 layers x 4 bytes (~122 MB at the 30s / ~750-frame cap); encoder activations are the O(n^2) rel-pos term (section 9, same class as firered2-llm but at 20 heads x 64 dim x <=750 frames, much smaller). The catalog's ~4-4.7 GB peaks sit well above weights+KV, consistent with the encoder O(n^2) working set, but the excess is NOT reconciled to a formula in this pass. Unlock: quiet-window peak-RSS matrix (3 runs/cell, fp16/q8_0/q4_k x CPU/Metal x jfk/long), reconcile against the budget above, then either confirm or refresh `catalog.json` peak_rss_bytes. |
+
+## 4. Decode algorithms
+
+| Item | Status | Justification / evidence (+ unlock condition if not Supported) |
+| --- | --- | --- |
+| Greedy logits shortcuts (argmax path skips needless softmax/sort work) | Supported | Shared driver: single-pass `argmax_index`, softmax computed once post-argmax for confidence only, no top-k sort on the 7832 vocab (`seq2seq_greedy_decode.rs`, same path firered2-llm cites). firered supplies `greedy_token_hint: None` (no device-side argmax), so the shared host argmax owns it (`decoder_graph.rs:534-554`). |
+| Speculative decode: per-family verdict recorded (do it, defer it, or dead) | Deferred | Not evaluated. This is a fast 1.1B AED where per-token decode is cheap and the model is already q4_k-small; a draft model's economics are far weaker than the 8B firered2-llm case, and the qwen 0.6B "dead" verdict does not directly transfer either (different vocab/architecture). Unlock: only if a decode-share profile (section 3 measurement) shows decode dominating wall time on output-dense audio -- otherwise leave dead. |
+| CTC blank-skip fast path (CTC families; otherwise Not applicable) | Not applicable | Pure autoregressive attention decode (`firered-aed.greedy.seq2seq.v0`, `decode_policy_component_registry.rs:206-217`, `ctc_blank_token_id: None`). The upstream FireRedASR2-AED checkpoint DOES carry a post-hoc CTC branch, but this importer intentionally does not carry it (`models-core.toml:568-571`) -- so there is no CTC head in the pack and no blank-skip to implement. (Note: the CrispASR peer decodes THROUGH that CTC head -- see section 10.) |
+| Decode guards are zero-cost on the hot path (degenerate-loop guard etc.) | Supported | firered routes through the shared driver (`run_builtin_seq2seq_decode_policy` -> `run_seq2seq_greedy_decode_loop_v0`, `decoder_graph.rs:641-704`) exactly to inherit the degenerate n-gram-repeat guard for free (issue #60, the hand-rolled firered loop is what originally caused the long-audio repetition). The guard scans token-id history tail only, no logits access; firered declares no phrase bias, no suppression, no extra stop tokens (`decode_policy_component_registry.rs:210-216`, all `None`), so the policy config is a plain `<sos>`-prompted greedy decode to `<eos>`. |
+
+## 5. Frontend & IO
+
+| Item | Status | Justification / evidence (+ unlock condition if not Supported) |
+| --- | --- | --- |
+| Mel/fbank frontend SIMD + parallelized | Supported | Shared kaldi fbank engine (`crate::models::kaldi_fbank`, FFT via SIMD `realfft`), the same 80-bin/25ms/10ms/dither-0 config dolphin and sensevoice use (`frontend.rs:18-37`). Frame loop is single-threaded; at this model's cost that is the right call (encoder+decoder dominate; the fbank share is negligible, same finding as the sibling families). Unlock to revisit only if a stage profile shows fbank as a real share. |
+| Zero-copy audio path (no avoidable resample/copy hops) | Deferred | Inherits the shared `PreparedAudioInput` path (`executor.rs:211` reads `prepared_audio.samples_f32`). Direct 16kHz-mono-WAV is clean; the known cross-family gap is that any NON-WAV input decodes+resamples to in-memory f32 then writes a temp WAV that is re-read and re-parsed (the double full-buffer disk round trip firered2-llm's audit flagged, `audio/prepare.rs`). Not firered-local. Unlock: the shared in-memory-samples variant on `PreparedAudioInput` (same fix dispatched for the firered2-llm audit). |
+| VAD cost measured and accounted | Not applicable | No VAD in this family's decode path (grep: firered-aed executor has zero VAD references; the `firered_stream` VAD under `diarize/` is an unrelated component). Longform handling is upstream slicing at the 30s cap, not VAD. |
+
+## 6. Platform-specific
+
+| Item | Status | Justification / evidence (+ unlock condition if not Supported) |
+| --- | --- | --- |
+| Metal command batching + wired memory budget respected | Supported | Dynamic backend resolution mirrors the cohere/moonshine template: encoder and decoder each resolve Metal via `configure_model_runtime_graph_config_from_env` with a per-stage env opt-out to CPU (`graph_config.rs:42-119`); `auto_gpu_policy: AllBackends` (`arch/mod.rs`), GPU default-on for both stages (`graph_config.rs` tests `:125-141`). CPU-vs-Metal transcripts are documented byte-identical on real packs (`graph_config.rs:5-8`, `decoder_graph.rs:18-21`). No `prefer_cpu_decoder_for_multichunk_metal` (false in the descriptor) because firered never batches multiple slices into one graph call. |
+| CPU thread pool sized for P/E cores | Supported | `resolve_runtime_thread_count_for(backend, workload_class)` per stage (`graph_config.rs:68-73,92-97`, EncoderPrelude vs Decoder workload classes), honoring an explicit thread override; no family override needed. |
+| Accelerate/BLAS used where it wins | Supported | Inherited via the shared CPU graph path (generic BLAS backend wiring in `cpu_graph.rs`); no firered-specific opt-out. |
+
+## 7. Backend coverage matrix
+
+Every cell must be answered. An unsupported backend is acceptable ONLY with a
+justification and an unlock plan -- "nobody tried" is not a justification.
+Golden-verified means byte/parity fixtures pass ON that backend;
+utilization-measured means the GPU weight placement gate (or an equivalent
+profile) proved the compute actually runs there (golden output alone cannot,
+see `docs/design/gpu-weight-placement.md`).
+
+| Backend | Supported? | Golden-verified? | Utilization measured? | Justification + unlock plan if unsupported |
+| --- | --- | --- | --- | --- |
+| CPU | Yes | Dev-only (not CI-gated) | No | Parity established during the port: encoder frame0 matches reference PyTorch to tolerance (`encoder_graph.rs:872-947`), end-to-end jfk/zh transcripts match the reference decode (`executor.rs:413-429`). BUT all of these are `#[ignore]` and require the private dev-only `firered-aed-l-fp16.oasr` pack, so NOTHING firered-specific runs in `cargo nextest run --workspace`. Unlock (should-do, not backend exclusion): land a committed small-fixture golden that runs in CI, the way the sibling families have committed goldens. Utilization: CPU is the compute by construction; no separate profile needed, but a stage-cost profile is the same quiet-window unlock as section 3. |
+| Metal | Yes | Dev-only (not CI-gated) | No | Byte-parity vs CPU documented on real packs (`graph_config.rs:5-11`); default-on. Same #[ignore]/private-pack limitation as CPU -- the parity is dev-verified, not CI-committed. Utilization: no GPU weight-placement gate captured for firered-aed. Unlock: run the weight-placement gate (or an equivalent profile) on a Metal host to prove encoder+decoder compute actually lands on Metal, plus the committed-golden unlock above. |
+| CUDA | Untested | No | No | No family-level exclusion (shared graph path, no family-specific kernels). No CUDA host available. Unlock: community / Windows-CUDA-release-leg run of a firered golden + a utilization profile. |
+| Vulkan | Untested | No | No | Same as CUDA; the shared Vulkan path carries the xasr-class offset-view hardening. Unlock: run on an AMD/Intel Vulkan host (user's Windows/AMD machine). |
+| HIP | Untested | No | No | Shared per-chunk path; no HIP host. Unlock: HIP host validation. |
+
+## 8. Correctness & quality
+
+| Item | Status | Justification / evidence (+ unlock condition if not Supported) |
+| --- | --- | --- |
+| WER vs fp16 measured for every shipped quant tier | Deferred | `catalog.json` records `jfk_wer_vs_fp16: 0.0` for all three tiers, but (a) it is a single-utterance jfk point, not a dataset WER, and (b) its capture commit/host is undocumented, so it is treated as unverified (same stale-catalog risk as firered2-llm). Unlock: measure q8_0 and q4_k WER against the fp16 pack on a real Mandarin+English dataset at `7fae6af`, refresh catalog perf in the same pass. |
+| Model ref alias forms resolve identically everywhere (bare family / `family:canonical` / every `quant_tag_cases.json` alias accepted by CLI and server match logic; covered by the catalog-wide alias matrix test) | Supported | firered-aed-l-v2 aliases (`firered-aed`, `firered`, `firered-aed-v2`, `firered-aed-l-v2`, `:q4`/`:q8`/`:fp16`) are in the bundled catalog (`catalog.json:288-296,330,348-408`) and are walked by the catalog-wide `native_quant_alias_catalog_matrix` test (PR #171) that asserts every model x quant x alias form matches identically across CLI and server. No firered-aed ids on the pre-fix red list (they were already canonical). |
+| Golden coverage includes long audio AND a cross-backend parity fixture | Deferred | The goldens exist in code (en jfk + zh sample end-to-end `executor.rs:413-429`; encoder frame0 parity `encoder_graph.rs:872-947`; CPU-vs-Metal byte parity is documented) but are ALL `#[ignore]` and gated on the private `firered-aed-l-fp16.oasr` pack, so none run in CI, and there is no committed long-audio golden. "Long audio" past 30s is upstream longform slicing by design (each slice <= the `GlobalQuadratic` cap, fail-closed past the PE table), covered by the generic longform tests, but the firered-specific decode is unverified in CI. Unlock: commit a small-fixture CI golden (both a short clip and a multi-slice long clip) plus a committed CPU/Metal parity spot-check, the way the sibling families ship theirs. |
+| Official decode parameters honored (suppression, stop tokens, upstream reference settings) | Supported | Greedy AED to `<eos>` with no suppression and no extra stop tokens (`decode_policy_component_registry.rs:210-216`), matching the upstream `FireRedASR` AED greedy path (single `<sos>`-prompted argmax decode, `<eos>` stop). SOS/EOS/PAD ids are validated against vocab from pack metadata (`runtime_contract.rs:132-143`). NOTE for peer bench: the upstream published CER numbers use beam search (beam=3), which is out of scope by the repo-wide single shared greedy-driver invariant -- quality comparisons must re-run the reference at matched greedy settings, not reuse published beam-search CER. Repetition control is structural (shared degenerate n-gram guard), not logit scaling. |
+| Long-audio degradation checked (repetition, drift, truncation) | Supported | Two structural guards: (1) the shared degenerate n-gram-repeat guard via the shared driver (issue #60, the fix for firered's original long-audio repetition); (2) a hard PE-capacity fail-closed -- a window past the pack's rel-pos-table capacity (~200s at `pe_len=9999`) returns typed `AudioWindowTooLong` before the encoder graph is built (`executor.rs:237-262`, defense-in-depth for issue #158), with the outer 30s longform cap normally keeping windows far inside that. No silent truncation. The oversized-window fail-closed has an executable test (`executor.rs:494-523`, `#[ignore]`/dev-pack). |
+
+## 9. Resource limits & fail-closed
+
+| Item | Status | Justification / evidence (+ unlock condition if not Supported) |
+| --- | --- | --- |
+| Max audio length / context budget derived and over-limit behavior fails closed | Supported | Two nested caps: outer longform slicer caps every window at the 30s `GlobalQuadratic` `max_safe_chunk_seconds` (`arch/mod.rs:1490`, issue #68); inner executor rejects any window predicted past the encoder's baked rel-pos-table capacity (`encoder_max_frames = pe_len.div_ceil(2)` = 5000 frames ~= 200s) with typed `AudioWindowTooLong` before graph build (`executor.rs:237-262`, `runtime_contract.rs:52-57`). Decoder context is bounded by `decoder_pe_len` (5000) with a typed over-context error (`decoder_graph.rs:310-317`). Upstream guidance is 60s-warn/200s-error; the descriptor deliberately uses the tighter 30s default for RAM margin and cross-family consistency (`arch/mod.rs:236-259` doc). |
+| Streaming first-token latency floor documented (chunk accumulation math; streaming families, otherwise Not applicable) | Deferred | The family registers a snapshot-based streaming session (`STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT`, `executor.rs:328-347`), so streaming IS applicable, but the first-token floor (snapshot cadence + encoder+prefill cost) is not derived/documented. Unlock: derive from snapshot cadence and a measured encoder+prefill cost once the section-3 quiet-window numbers exist. |
+| KV growth rate per audio second known | Supported | Derived at `7fae6af` from metadata: cross-KV (f32) grows with encoder frames = audio seconds: d_model 1280 x 2 (k+v) x 16 layers x 4 bytes = 163,840 bytes per encoder frame x ~25 frames/sec ~= 4.1 MB per audio-second (bounded to ~122 MB at the 30s cap). Self-KV (f16) grows per generated token, not per audio-second, and is allocated up front at the full 5000-token capacity = head_dim 64 x 5000 x n_heads 20 x 2 bytes x 2 (k+v) x 16 layers ~= 410 MB fixed. |
+| Metal wired-memory profile captured | Deferred | Not captured in this pass (no measurement taken). Unlock: quiet-window RSS/wired sampling on Metal for each tier, folded into the section-3 measurement matrix. |
+| Multi-session scaling behavior known (server concurrency) | Deferred | No per-model admission control: each concurrent request constructs its own encoder+decoder runtime (~0.7-2.4 GB weights + ~0.5 GB KV each), so concurrent OOM on a small host is a real, undocumented risk (same shape as firered2-llm, smaller magnitude). Unlock: per-model concurrency cap or serialization in the server (shared pre-GA concern). |
+| Energy footprint noted (battery-relevant platforms) | Deferred | Not measured (needs a `powermetrics` window). Unlock: one measured transcription with energy sampling during a maintenance window. |
+
+## 10. Engineering completeness
+
+| Item | Status | Justification / evidence (+ unlock condition if not Supported) |
+| --- | --- | --- |
+| `warm_up` is a real implementation, not a stub | Supported | Streaming path uses the shared `decode_warm_up_silence` (real silent decode) via `build_seq2seq_streaming_session` (`executor.rs:333-346`), the same real warm-up the sibling seq2seq families use. |
+| Reference dumper exists for this family | Supported | Dev-only reference harness `tmp/firered-ref-src/run_ref.py` runs the actual FireRedASR-AED-L `model.pth.tar` and produced the committed golden constants: encoder `enc_outputs.shape == [1, 275, 1280]` + frame0 first-8 values (`encoder_graph.rs:844-948`) and the end-to-end jfk/zh reference transcripts (`executor.rs:358-371`). Caveat: it is a dev-machine harness, not a committed in-tree tool like `tooling/firered2-reference-dumper/`; the values it produced are pinned in-tree, the script is not. Unlock (nice-to-have): commit an equivalent dumper for reproducibility. |
+| Registry / catalog / docs wired (MODEL_ONBOARDING checklist done) | Supported | Arch descriptor (`arch/mod.rs:1494-...`), decode-policy descriptor (`decode_policy_component_registry.rs:203-217`), executor dispatch (`builtin_execution_dispatch.rs:15,187`), hparam schema (`hparams.rs:191-214`), family registry (`ggml_family_registry.rs:281-286`), registry toml (`model-registry/models/firered-aed-l-v2.toml`), catalog entry with full prose/highlights/zh-CN locale (`catalog.json:285-...`) all present and consistent. Shipped since 0.1.9. |
+| Peer benchmark recorded (table below, all fields) | Deferred | Peer determined: CrispASR (CrispStrobe/CrispASR) ships `FireRedTeam/FireRedASR2-AED` as GGUF at the SAME three quant tiers (`references/CrispASR/hf_readmes/firered-asr2-aed-GGUF.md`; f16 2.3 GB / q8_0 1.4 GB / q4_k 919 MB, ~matching our 2.35/1.28/0.71 GB). transcribe.cpp carries no firered AED (grep: none); sherpa-onnx is not in the local references tree. CRITICAL decode-path caveat: CrispASR decodes through the model's CTC head ("CTC decoding is used; beam search decoder not yet implemented"), while OpenASR decodes through the AED attention decoder (the CTC branch is intentionally not carried) -- so a head-to-head is same-checkpoint but different decode algorithm, and speed/quality must both be read with that caveat. A fair run also requires a quiet window (section 3 measurement is not done). Unlock: build CrispASR firered-asr2-aed on the reference host and record both stacks on the same audio in the same window, noting the CTC-vs-AED decode-path difference. |
+
+### Peer benchmark record
+
+Record enough that anyone can re-run this comparison later. "Faster than X" is
+not auditable without the exact peer version, model build, audio, and machine.
+
+| Field | Value |
+| --- | --- |
+| Peer project (name + commit or version) | CrispASR (github.com/CrispStrobe/CrispASR). DEFERRED: exact commit pending the reference-host build. transcribe.cpp does not carry firered AED; sherpa-onnx not in local references. |
+| Peer model + quant build | `FireRedTeam/FireRedASR2-AED` GGUF (f16 / q8_0 / q4_k), CrispASR HF repo `firered-asr2-aed*.gguf`. DECODE-PATH CAVEAT: CrispASR decodes via the CTC head; OpenASR decodes via the AED attention decoder -- not the same decode algorithm. |
+| Peer program version | pending the reference-host build |
+| Test audio (file, duration, language) | pending the quiet-window run (use a matched Mandarin + English set; note beam-vs-greedy for any quality read) |
+| Machine (chip, RAM, OS) | pending -- reference host is Apple M1 16GB, but no measurement taken in this pass |
+| Peer numbers (RTF / peak memory / utilization) | pending the quiet-window run |
+| OpenASR numbers (RTF / peak memory / utilization) | pending the quiet-window run. `catalog.json` carries shipped fields (q4_k rtf_cpu 0.384 / rtf_metal 0.307 / peak_rss 4.10 GB; q8_0 0.355 / 0.345 / 4.35 GB; fp16 0.395 / 0.787 / 4.74 GB) but their capture commit/host/quiet-state are undocumented -- re-measure alongside the peer on the same host for a valid comparison. |
+
+## Known dead ends (do not re-litigate)
+
+Verdicts that apply to this family, so future work does not re-run dead
+investigations. Repo-wide precedents to inherit where relevant: F16 activation
+on Apple M1 (encoder-only gave zero win, cast economics lock the trunk;
+verdict 2026-07-14); qwen speculative decode (acceptance alpha ~= 0.05, judged
+dead). Add family-specific verdicts with the measurement behind each; write
+"None yet" if the family has none.
+
+| Dead end | Verdict / evidence | Date |
+| --- | --- | --- |
+| Reusing the shared `nn::encoder::conformer_block` composer | Rejected structurally: firered normalizes q/k/v with three independent LayerNorms and has zero attention/conv biases, whereas the shared block assumes one shared pre-attn norm and biased projections -- reusing it would silently compute the wrong math. Encoder is hand-written from `nn::attn`/`nn::norm`/`nn::conv` primitives instead (`encoder_graph.rs:12-22`). | 2026-07 (code-in) |
+| QKV projection fusion in the encoder | Not applicable, not a missed optimization: the three independent q/k/v LayerNorms mean there is no single projection to fuse (`encoder_graph.rs:426-473`). | 2026-07 (code-in) |
+| Hand-rolled firered argmax decode loop | Dead: a hand-rolled loop is exactly what caused the long-audio repetition (issue #60); firered must route through the shared seq2seq greedy driver to inherit the degenerate n-gram guard (`decoder_graph.rs:641-704`, AGENTS.md "One greedy decode driver" invariant). | 2026-07 (issue #60) |
+| Carrying the upstream CTC branch | Deliberately not carried by the importer (`models-core.toml:568-571`): no timestamp feature in this family yet, and the AED attention decode is the quality path. This is why "CTC blank-skip" is Not applicable here (and why the CrispASR peer -- which decodes CTC -- is not a same-algorithm comparison). | 2026-07 (code-in) |
