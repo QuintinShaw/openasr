@@ -6,7 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ggml_runtime::{
-    GgmlBackendKind, GgmlCpuGraphBackend, GgmlDeviceMemory, ggml_available_devices,
+    GgmlBackendKind, GgmlCpuGraphBackend, GgmlDeviceMemory, accelerated_device_rank,
+    ggml_available_devices,
 };
 use crate::models::seq2seq_greedy_decode::{
     MAX_CONSECUTIVE_NGRAM_REPEATS, MAX_REPEAT_NGRAM, Seq2SeqGreedyDecodeConfig,
@@ -427,7 +428,15 @@ fn selected_gpu_memory_sample() -> Option<ServeBatchGpuMemorySample> {
 fn selected_gpu_memory_sample_from_device_infos(
     devices: &[(String, GgmlBackendKind, Option<GgmlDeviceMemory>)],
 ) -> Option<ServeBatchGpuMemorySample> {
-    let (name, kind, memory) = devices.iter().find(|(_, kind, _)| kind.is_gpu())?;
+    // Same discrete-over-integrated preference as `init_gpu_backend` /
+    // `preferred_accelerated_device`: on a hybrid-graphics host the VRAM cap
+    // must be sized off the discrete GPU actually selected for inference, not
+    // whichever device the registry happens to enumerate first (which could
+    // be a small-memory integrated GPU).
+    let (name, kind, memory) = devices
+        .iter()
+        .filter(|(_, kind, _)| kind.is_gpu())
+        .min_by_key(|(_, kind, _)| accelerated_device_rank(*kind))?;
     memory.map(|memory| ServeBatchGpuMemorySample {
         device_name: name.clone(),
         device_kind: *kind,
@@ -847,6 +856,37 @@ mod tests {
 
         assert_eq!(sample.device_name, "first-gpu");
         assert_eq!(sample.memory.free_bytes, 4 * MIB_BYTES);
+    }
+
+    #[test]
+    fn serve_batch_vram_sample_prefers_discrete_gpu_over_integrated() {
+        // Optimus-style host: the integrated GPU enumerates first but must
+        // not be the one the VRAM cap is sized against.
+        let devices = vec![
+            (
+                "integrated".to_string(),
+                GgmlBackendKind::IntegratedGpu,
+                Some(GgmlDeviceMemory {
+                    free_bytes: 512 * MIB_BYTES,
+                    total_bytes: 1024 * MIB_BYTES,
+                }),
+            ),
+            (
+                "discrete".to_string(),
+                GgmlBackendKind::Gpu,
+                Some(GgmlDeviceMemory {
+                    free_bytes: 8 * 1024 * MIB_BYTES,
+                    total_bytes: 12 * 1024 * MIB_BYTES,
+                }),
+            ),
+        ];
+
+        let sample =
+            selected_gpu_memory_sample_from_device_infos(&devices).expect("gpu memory sample");
+
+        assert_eq!(sample.device_name, "discrete");
+        assert_eq!(sample.device_kind, GgmlBackendKind::Gpu);
+        assert_eq!(sample.memory.free_bytes, 8 * 1024 * MIB_BYTES);
     }
 
     #[test]

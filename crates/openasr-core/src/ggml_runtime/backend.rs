@@ -221,6 +221,47 @@ impl GgmlBackendKind {
     }
 }
 
+/// Priority for picking among several simultaneously-available accelerated
+/// devices (the Optimus/hybrid-graphics case: a Vulkan-capable laptop
+/// enumerates both its Intel integrated GPU and its NVIDIA/AMD discrete GPU
+/// as separate devices through the same backend). Lower ranks first.
+///
+/// A discrete GPU (`Gpu`, `ggml`'s `VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU` on
+/// the Vulkan backend) has its own VRAM and is essentially always the
+/// faster, less contended choice, so it ranks first. An `Accelerator`
+/// (NPU-class device) also has dedicated silicon and ranks second. An
+/// integrated GPU (`IntegratedGpu`) shares system RAM and memory bandwidth
+/// with the CPU and ranks last among the "accelerated" kinds -- it should
+/// only be picked when nothing better is present. Devices that tie on rank
+/// (e.g. two discrete GPUs) keep the registry's original enumeration order:
+/// we have no other signal to break that tie, and
+/// [`preferred_accelerated_device`] relies on `Iterator::min_by_key`
+/// returning the first minimal element to preserve it.
+pub(crate) fn accelerated_device_rank(kind: GgmlBackendKind) -> u8 {
+    match kind {
+        GgmlBackendKind::Gpu => 0,
+        GgmlBackendKind::Accelerator => 1,
+        GgmlBackendKind::IntegratedGpu => 2,
+        _ => 3,
+    }
+}
+
+/// Pick the device to prefer when more than one accelerated device is
+/// available, per [`accelerated_device_rank`]. `is_accelerated` lets each
+/// caller keep its own notion of "counts as an accelerated device" (some
+/// only want `Gpu`/`IntegratedGpu`, `init_gpu_backend` also folds in
+/// `Accelerator`), while the tie-break/ranking logic stays in one place so
+/// device selection can never drift from the diagnostics that describe it.
+pub(crate) fn preferred_accelerated_device(
+    devices: &[GgmlBackendDevice],
+    is_accelerated: impl Fn(GgmlBackendKind) -> bool,
+) -> Option<&GgmlBackendDevice> {
+    devices
+        .iter()
+        .filter(|device| is_accelerated(device.kind))
+        .min_by_key(|device| accelerated_device_rank(device.kind))
+}
+
 /// Register backend plugin DLLs once per process before the first registry
 /// query. Under `GGML_BACKEND_DL` the static `GGML_USE_*` backend registration
 /// is compiled out, so without this the registry is empty and every
@@ -381,6 +422,14 @@ pub fn ggml_runtime_info() -> GgmlRuntimeInfo {
 /// reports) where the reporter's misfiled "backend used" field left the
 /// actually-selected backend and device unknown; this makes it recoverable
 /// from `daemon.log` alone.
+///
+/// When more than one accelerated-kind device is present (an Optimus/hybrid-
+/// graphics host exposing both an integrated and a discrete GPU through the
+/// same Vulkan backend), the summary also appends
+/// `gpu_selection=discrete_over_integrated` naming the device
+/// [`preferred_accelerated_device`] picked and why -- so a "wrong GPU used"
+/// report is diagnosable from the boot log alone (see the discrete-GPU
+/// preference fix that added this).
 pub fn ggml_runtime_boot_summary(info: &GgmlRuntimeInfo) -> String {
     let best = info.best_backend_name.as_deref().unwrap_or("unavailable");
     let mut summary = format!("best_backend={best} cpu_backend={}", info.cpu_backend_name);
@@ -410,6 +459,21 @@ pub fn ggml_runtime_boot_summary(info: &GgmlRuntimeInfo) -> String {
     summary.push_str(" devices=[");
     summary.push_str(&devices);
     summary.push(']');
+
+    let accelerated_kinds = info
+        .devices
+        .iter()
+        .filter(|device| device.kind.is_gpu())
+        .count();
+    if accelerated_kinds > 1
+        && let Some(preferred) =
+            preferred_accelerated_device(&info.devices, GgmlBackendKind::is_gpu)
+    {
+        summary.push_str(&format!(
+            " gpu_selection={{picked={:?} kind={:?} rule=discrete_over_integrated}}",
+            preferred.name, preferred.kind
+        ));
+    }
     summary
 }
 
@@ -521,9 +585,7 @@ pub fn ggml_hip_tuning_summary() -> Option<&'static str> {
 }
 
 fn best_device_name(devices: &[GgmlBackendDevice]) -> Option<String> {
-    devices
-        .iter()
-        .find(|device| device.kind.is_gpu())
+    preferred_accelerated_device(devices, GgmlBackendKind::is_gpu)
         .or_else(|| {
             devices
                 .iter()
@@ -534,10 +596,7 @@ fn best_device_name(devices: &[GgmlBackendDevice]) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn metal_device_name(devices: &[GgmlBackendDevice]) -> Option<String> {
-    devices
-        .iter()
-        .find(|device| device.kind.is_gpu())
-        .map(|device| device.name.clone())
+    preferred_accelerated_device(devices, GgmlBackendKind::is_gpu).map(|device| device.name.clone())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -621,6 +680,96 @@ mod tests {
             summary,
             "best_backend=unavailable cpu_backend=CPU devices=none"
         );
+    }
+
+    fn test_device(name: &str, kind: GgmlBackendKind) -> GgmlBackendDevice {
+        GgmlBackendDevice::for_test(name, name, kind, None)
+    }
+
+    #[test]
+    fn preferred_accelerated_device_picks_discrete_over_integrated() {
+        // The Optimus/hybrid-graphics case (issue: "double GPU picks the
+        // wrong one"): an Intel integrated GPU enumerated ahead of the
+        // NVIDIA discrete GPU must still yield the discrete GPU.
+        let devices = vec![
+            test_device("Vulkan0", GgmlBackendKind::IntegratedGpu),
+            test_device("Vulkan1", GgmlBackendKind::Gpu),
+        ];
+        let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
+            .expect("a device is picked");
+        assert_eq!(picked.name, "Vulkan1");
+        assert_eq!(picked.kind, GgmlBackendKind::Gpu);
+    }
+
+    #[test]
+    fn preferred_accelerated_device_falls_back_to_integrated_when_no_discrete_present() {
+        let devices = vec![test_device("Vulkan0", GgmlBackendKind::IntegratedGpu)];
+        let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
+            .expect("integrated GPU is picked");
+        assert_eq!(picked.name, "Vulkan0");
+    }
+
+    #[test]
+    fn preferred_accelerated_device_picks_discrete_when_only_discrete_present() {
+        let devices = vec![test_device("Vulkan0", GgmlBackendKind::Gpu)];
+        let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
+            .expect("discrete GPU is picked");
+        assert_eq!(picked.name, "Vulkan0");
+    }
+
+    #[test]
+    fn preferred_accelerated_device_keeps_enumeration_order_between_two_discrete_gpus() {
+        // No further signal to break the tie between two discrete GPUs; the
+        // first one the registry enumerated is kept (matches
+        // `Iterator::min_by_key`'s documented first-minimum behavior).
+        let devices = vec![
+            test_device("Vulkan0", GgmlBackendKind::Gpu),
+            test_device("Vulkan1", GgmlBackendKind::Gpu),
+        ];
+        let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
+            .expect("a discrete GPU is picked");
+        assert_eq!(picked.name, "Vulkan0");
+    }
+
+    #[test]
+    fn preferred_accelerated_device_none_when_no_accelerated_device_present() {
+        let devices = vec![test_device("CPU", GgmlBackendKind::Cpu)];
+        assert!(preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu).is_none());
+    }
+
+    #[test]
+    fn best_device_name_prefers_discrete_gpu_on_hybrid_graphics_host() {
+        let devices = vec![
+            test_device("Vulkan0", GgmlBackendKind::IntegratedGpu),
+            test_device("Vulkan1", GgmlBackendKind::Gpu),
+        ];
+        assert_eq!(best_device_name(&devices).as_deref(), Some("Vulkan1"));
+    }
+
+    #[test]
+    fn boot_summary_reports_gpu_selection_only_with_multiple_accelerated_devices() {
+        let single = GgmlRuntimeInfo {
+            cpu_backend_name: "CPU".to_string(),
+            best_backend_name: Some("Vulkan0".to_string()),
+            metal_backend_name: None,
+            devices: vec![test_device("Vulkan0", GgmlBackendKind::Gpu)],
+            cpu_features: GgmlCpuFeatures::default(),
+        };
+        assert!(!ggml_runtime_boot_summary(&single).contains("gpu_selection="));
+
+        let hybrid = GgmlRuntimeInfo {
+            cpu_backend_name: "CPU".to_string(),
+            best_backend_name: Some("Vulkan1".to_string()),
+            metal_backend_name: None,
+            devices: vec![
+                test_device("Vulkan0", GgmlBackendKind::IntegratedGpu),
+                test_device("Vulkan1", GgmlBackendKind::Gpu),
+            ],
+            cpu_features: GgmlCpuFeatures::default(),
+        };
+        let summary = ggml_runtime_boot_summary(&hybrid);
+        assert!(summary.contains("gpu_selection={picked=\"Vulkan1\" kind=Gpu"));
+        assert!(summary.contains("rule=discrete_over_integrated"));
     }
 
     #[test]
