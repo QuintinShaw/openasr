@@ -51,8 +51,8 @@ pub use native_model_id::{
     NativeRuntimeModelIdSource, NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
 };
 pub use native_transcribe::{
-    NativeTranscriptionPhase, NativeTranscriptionProgress, native_runtime_model_refs_match,
-    native_transcription_progress,
+    NativeTranscriptionPhase, NativeTranscriptionProgress, describe_native_runtime_model_mismatch,
+    native_runtime_model_refs_match, native_transcription_progress,
 };
 pub use transcription_control::{
     ActiveTranscriptionControlGuard, SliceBoundaryControl, TranscriptionControl,

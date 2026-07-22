@@ -9,6 +9,7 @@
     { "input": "q4_k_m", "canonical": "q4_k" },
     { "input": "q3", "canonical": "q3_k" },
     { "input": "q3_k", "canonical": "q3_k" },
+    { "input": "q4km", "canonical": "q4_k" },
     { "input": "fp16", "canonical": "fp16" },
     { "input": " fp16 ", "canonical": "fp16" },
     { "input": "f32", "canonical": "f32" },

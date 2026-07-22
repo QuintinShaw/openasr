@@ -2033,7 +2033,7 @@ pub fn native_runtime_model_refs_match(requested: &str, runtime_source_id: &str)
     let Ok(requested_ref) = parse_model_ref(requested) else {
         return false;
     };
-    let Ok(runtime_ref) = parse_model_ref(runtime_source_id) else {
+    let Some(runtime_ref) = parse_native_runtime_source_ref(runtime_source_id) else {
         return false;
     };
     if requested_ref.family != runtime_ref.family {
@@ -2046,6 +2046,62 @@ pub fn native_runtime_model_refs_match(requested: &str, runtime_source_id: &str)
         (Some(_), None) => true,
         _ => false,
     }
+}
+
+/// Renders a diagnostic string for a native model mismatch error: the
+/// requested ref's normalized `family:canonical_quant` form (when parseable)
+/// and the loaded runtime source id's normalized form, computed with the same
+/// legacy-hyphen-aware parsing `native_runtime_model_refs_match` uses. Lets an
+/// operator see *why* two apparently-similar ids failed to match (a genuinely
+/// different family, vs. an unrecognized quant alias spelling) instead of
+/// only the raw strings, which are often identical-looking after truncation
+/// or already differ only in a quant suffix that a human cannot canonicalize
+/// by eye.
+pub fn describe_native_runtime_model_mismatch(requested: &str, runtime_source_id: &str) -> String {
+    let requested_normalized = parse_model_ref(requested.trim())
+        .map(|r| normalized_model_ref_display(&r))
+        .unwrap_or_else(|_| requested.trim().to_string());
+    let runtime_normalized = parse_native_runtime_source_ref(runtime_source_id.trim())
+        .map(|r| normalized_model_ref_display(&r))
+        .unwrap_or_else(|| runtime_source_id.trim().to_string());
+    format!(
+        "requested model normalizes to '{requested_normalized}', loaded native runtime source normalizes to '{runtime_normalized}'"
+    )
+}
+
+fn normalized_model_ref_display(model_ref: &crate::registry::ModelRef) -> String {
+    match &model_ref.tag {
+        Some(tag) => format!("{}:{}", model_ref.family, crate::canonical_quant_tag(tag)),
+        None => model_ref.family.clone(),
+    }
+}
+
+/// Parses a native runtime pack's source id for matching purposes.
+///
+/// Prefers the standard `family:quant` colon form used everywhere else in the
+/// catalog/registry contract. Falls back to splitting a legacy hyphen-joined
+/// `family-quant` id when the trailing hyphen segment is a recognized quant
+/// alias token (`crate::registry::is_recognized_quant_alias_token`, the same
+/// table `canonical_quant_tag` uses -- no separate mapping is maintained
+/// here). That hyphen form is not the catalog convention, but it is what an
+/// older conversion tool (`tooling/mimo-asr/convert_mimo_asr.py`, fixed to
+/// emit colon-joined ids going forward) baked into `openasr.model.id`
+/// metadata for already-published packs; this keeps those packs matchable
+/// without requiring every shipped asset to be reconverted and republished.
+fn parse_native_runtime_source_ref(runtime_source_id: &str) -> Option<crate::registry::ModelRef> {
+    let parsed = parse_model_ref(runtime_source_id).ok()?;
+    if parsed.tag.is_some() {
+        return Some(parsed);
+    }
+    if let Some((family, tag)) = parsed.family.rsplit_once('-').filter(|(family, alias)| {
+        !family.is_empty() && crate::registry::is_recognized_quant_alias_token(alias)
+    }) {
+        return Some(crate::registry::ModelRef {
+            family: family.to_string(),
+            tag: Some(tag.to_string()),
+        });
+    }
+    Some(parsed)
 }
 
 fn map_family_selection_error(error: GgmlFamilyRegistrySelectionError) -> BackendError {
@@ -2967,6 +3023,65 @@ mod tests {
         assert!(!native_runtime_model_refs_match(
             "qwen3-asr-1.7b:q8",
             "qwen3-asr-0.6b:q8_0"
+        ));
+    }
+
+    // Regression guard for the reported bug: a runtime source id whose
+    // `openasr.model.id` was baked by an older mimo-asr conversion tool as
+    // `family-quant` (hyphen-joined) instead of the catalog's `family:quant`
+    // colon convention must still match a colon-form request naming any
+    // recognized alias of that quant. Fixed forward in
+    // tooling/mimo-asr/convert_mimo_asr.py, but already-published packs still
+    // carry the old metadata, so the matcher must tolerate it.
+    #[test]
+    fn native_runtime_model_refs_match_legacy_hyphen_joined_runtime_source_id() {
+        assert!(native_runtime_model_refs_match(
+            "mimo-v2.5-asr:q4",
+            "mimo-v2.5-asr-q4_k"
+        ));
+        assert!(native_runtime_model_refs_match(
+            "mimo-v2.5-asr:q4_k",
+            "mimo-v2.5-asr-q4_k"
+        ));
+        assert!(native_runtime_model_refs_match(
+            "mimo-v2.5-asr:q8_0",
+            "mimo-v2.5-asr-q8_0"
+        ));
+        // Different quant on each side: still a mismatch even through the
+        // legacy hyphen fallback (fail-closed, not a blanket bare-family pass).
+        assert!(!native_runtime_model_refs_match(
+            "mimo-v2.5-asr:q8_0",
+            "mimo-v2.5-asr-q4_k"
+        ));
+        // Different family: the hyphen split must not make an unrelated
+        // family with a coincidentally quant-alias-shaped suffix match.
+        assert!(!native_runtime_model_refs_match(
+            "mimo-v2.5-asr:q4",
+            "some-other-family-q4_k"
+        ));
+        // A genuinely single-word family with no quant suffix at all must
+        // stay a bare-id match (no accidental split).
+        assert!(native_runtime_model_refs_match(
+            "whisper-runtime:q8_0",
+            "whisper-runtime"
+        ));
+    }
+
+    // The catalog's own product suffix for Hy-MT2's mixed Q4_K_M pack is
+    // "q4km" (tooling/publish-model/scripts/_catalog.py QUANT_METADATA), which
+    // is exactly what a user copies from `pull_recommended` /
+    // `openasr pull hymt2-1.8b:q4km`. `canonical_quant_tag` must recognize it
+    // as an alias of q4_k so a request using it matches a runtime source
+    // tagged with any other spelling of the same quant.
+    #[test]
+    fn native_runtime_model_refs_match_catalog_q4km_product_suffix_alias() {
+        assert!(native_runtime_model_refs_match(
+            "hymt2-1.8b:q4km",
+            "hymt2-1.8b:q4_k"
+        ));
+        assert!(native_runtime_model_refs_match(
+            "hymt2-1.8b:q4_k_m",
+            "hymt2-1.8b:q4km"
         ));
     }
 

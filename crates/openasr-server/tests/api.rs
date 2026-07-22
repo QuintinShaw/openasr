@@ -4319,6 +4319,42 @@ async fn transcriptions_with_native_backend_model_mismatch_returns_bad_request()
     let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
     let body = String::from_utf8_lossy(&bytes);
     assert!(body.contains("does not match server native local runtime source id"));
+    // The error must be diagnosable without a human canonicalizing quant
+    // aliases by eye: it names both sides' normalized form.
+    assert!(body.contains("requested model normalizes to 'not-whisper-runtime'"));
+    assert!(body.contains("loaded native runtime source normalizes to 'whisper-runtime'"));
+}
+
+#[tokio::test]
+async fn transcriptions_with_native_backend_accepts_quant_alias_against_legacy_hyphen_joined_metadata_id()
+ {
+    // Regression test for the reported bug: a real already-published pack
+    // (mimo-v2.5-asr) has its `openasr.model.id` metadata baked by an older
+    // conversion tool as `family-quant` (hyphen-joined) instead of the
+    // catalog's `family:quant` colon convention. A request using any
+    // recognized quant alias (`:q4`, the desktop UI's literal request) must
+    // still resolve to that pack instead of a spurious 400.
+    let temp = tempfile::tempdir().unwrap();
+    let pack_root = temp.path().join("mimo-v2.5-asr-q4_k.oasr");
+    write_whisper_oasr_v1_fixture(&pack_root, "mimo-v2.5-asr-q4_k");
+    let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_root.clone()),
+    });
+    let wav_bytes = sample_wav_bytes();
+    let request = multipart_request("mimo-v2.5-asr:q4", "sample.wav", &wav_bytes);
+    let response = app.oneshot(request).await.unwrap();
+
+    // Must clear the model-identity gate (whatever happens next in actual
+    // native dispatch against a stand-in whisper fixture is not this test's
+    // concern -- only that the mismatch rejection this bug caused is gone).
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(!body.contains("does not match server native local runtime source id"));
+    assert!(!body.contains("retired legacy metadata id"));
 }
 
 #[tokio::test]
@@ -4768,4 +4804,191 @@ async fn models_with_native_backend_and_no_pack_lists_empty_instead_of_erroring(
     let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
     let parsed: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(parsed["data"].as_array().unwrap().len(), 0);
+}
+
+// ── Full bundled-catalog x quant-alias matrix for native model matching ─────
+//
+// Regression net for the `mimo-v2.5-asr:q4` alias-matching bug: instead of
+// hand-writing one assertion per family (which only ever covers the families
+// someone remembered to write a test for), this walks the bundled catalog
+// (`model-registry/catalog.json`, the same file the daemon ships) and, for
+// every model x every quant variant it declares, exercises every legal
+// reference form (bare id, `id:<catalog suffix>`, `id:<catalog quant label>`,
+// `id:<canonical tag>`, and every other recognized alias sharing that
+// canonical tag) against both a colon-tagged and a bare native runtime source
+// id. Any newly onboarded catalog model is covered automatically -- no
+// per-family test to remember to add. Pure id-matching logic: no weights, no
+// backend, no network.
+mod native_quant_alias_catalog_matrix {
+    use openasr_core::{canonical_quant_tag, native_runtime_model_refs_match};
+    use serde_json::Value;
+
+    // The full set of alternate spellings recognized by `canonical_quant_tag`
+    // (crates/openasr-core/src/registry.rs `QUANT_ALIAS_GROUPS`), grouped by
+    // the canonical tag they collapse onto. Kept here only to *generate test
+    // inputs* (never to reimplement the alias decision) -- the assertions all
+    // go back through `canonical_quant_tag` / `native_runtime_model_refs_match`
+    // themselves, so this table drifting from the real one would only ever
+    // make the matrix *weaker*, never spuriously fail.
+    const ALL_ALIAS_SPELLINGS: &[&str] = &[
+        "q8", "q8_0", "q4", "q4_k", "q4_k_m", "q4km", "q3", "q3_k", "fp16",
+    ];
+
+    fn bundled_catalog() -> Value {
+        let raw = include_str!("../../../model-registry/catalog.json");
+        serde_json::from_str(raw).expect("bundled catalog.json parses")
+    }
+
+    struct QuantCase {
+        model_id: String,
+        // Every legal request-side tag for this quant variant: the catalog's
+        // own "quant" and "suffix" spellings plus every other recognized
+        // alias sharing the same canonical target.
+        request_tags: Vec<String>,
+        canonical_tag: String,
+    }
+
+    fn catalog_quant_cases(catalog: &Value) -> Vec<QuantCase> {
+        let mut cases = Vec::new();
+        for model in catalog["models"].as_array().expect("models array") {
+            let model_id = model["id"].as_str().expect("model id").to_string();
+            let quants = match model["quants"].as_array() {
+                Some(quants) => quants,
+                None => continue,
+            };
+            for quant in quants {
+                let quant_label = quant["quant"].as_str().expect("quant label");
+                let suffix = quant["suffix"].as_str().expect("quant suffix");
+                let canonical_tag = canonical_quant_tag(quant_label).to_string();
+
+                let mut request_tags: Vec<String> = vec![
+                    quant_label.to_string(),
+                    suffix.to_string(),
+                    canonical_tag.clone(),
+                ];
+                for alias in ALL_ALIAS_SPELLINGS {
+                    if canonical_quant_tag(alias) == canonical_tag {
+                        request_tags.push(alias.to_string());
+                    }
+                }
+                request_tags.sort();
+                request_tags.dedup();
+
+                cases.push(QuantCase {
+                    model_id: model_id.clone(),
+                    request_tags,
+                    canonical_tag,
+                });
+            }
+        }
+        cases
+    }
+
+    #[test]
+    fn every_catalog_model_quant_alias_form_matches_its_own_tagged_and_bare_runtime_source_id() {
+        let catalog = bundled_catalog();
+        let cases = catalog_quant_cases(&catalog);
+        assert!(
+            cases.len() >= 40,
+            "expected broad catalog coverage, got {} (model-registry/catalog.json shrank or failed to parse?)",
+            cases.len()
+        );
+
+        let mut failures = Vec::new();
+        for case in &cases {
+            let tagged_runtime_source_id = format!("{}:{}", case.model_id, case.canonical_tag);
+            let bare_runtime_source_id = case.model_id.clone();
+
+            for tag in &case.request_tags {
+                let requested = format!("{}:{}", case.model_id, tag);
+
+                if !native_runtime_model_refs_match(&requested, &tagged_runtime_source_id) {
+                    failures.push(format!(
+                        "{requested} vs tagged runtime source {tagged_runtime_source_id}: expected match"
+                    ));
+                }
+                // Bare-id contract: a quant-pinned request must also match a
+                // pack whose metadata carries no quant tag at all (the common
+                // real-world case -- most families burn no quant into
+                // `openasr.model.id`).
+                if !native_runtime_model_refs_match(&requested, &bare_runtime_source_id) {
+                    failures.push(format!(
+                        "{requested} vs bare runtime source {bare_runtime_source_id}: expected match (bare-id contract)"
+                    ));
+                }
+            }
+
+            // A bare request matches a bare runtime source id exactly...
+            if !native_runtime_model_refs_match(&case.model_id, &bare_runtime_source_id) {
+                failures.push(format!(
+                    "{} vs bare runtime source {bare_runtime_source_id}: expected match",
+                    case.model_id
+                ));
+            }
+            // ...but must NOT match a quant-tagged one: an unpinned request
+            // naming a family with a quant-pinned pack loaded is ambiguous
+            // about which quant it means, so this stays a refusal by design,
+            // not a bug.
+            if native_runtime_model_refs_match(&case.model_id, &tagged_runtime_source_id) {
+                failures.push(format!(
+                    "{} vs tagged runtime source {tagged_runtime_source_id}: expected NO match (bare request against a quant-pinned pack is ambiguous)",
+                    case.model_id
+                ));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "quant-alias matrix regressions ({} of {} cases affected):\n{}",
+            failures.len(),
+            cases.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn cross_family_and_cross_quant_requests_still_fail_closed() {
+        let catalog = bundled_catalog();
+        let cases = catalog_quant_cases(&catalog);
+
+        // Cross-family: no two distinct catalog model ids may spuriously
+        // match each other, even when one is a quant-pinned request.
+        let mut sampled_families: Vec<&str> = Vec::new();
+        for case in &cases {
+            if !sampled_families.contains(&case.model_id.as_str()) {
+                sampled_families.push(&case.model_id);
+            }
+        }
+        assert!(
+            sampled_families.len() >= 10,
+            "expected multiple distinct catalog families to sample"
+        );
+        for window in sampled_families.windows(2) {
+            let (a, b) = (window[0], window[1]);
+            assert!(
+                !native_runtime_model_refs_match(&format!("{a}:q8"), &format!("{b}:q8_0")),
+                "{a}:q8 must not match unrelated family runtime source {b}:q8_0"
+            );
+        }
+
+        // Cross-quant, same family: a model with more than one quant variant
+        // must fail closed when the request pins a different quant than the
+        // loaded tagged pack.
+        for case in &cases {
+            for other in &cases {
+                if other.model_id == case.model_id && other.canonical_tag != case.canonical_tag {
+                    let requested = format!("{}:{}", case.model_id, case.canonical_tag);
+                    let other_tagged_runtime_source_id =
+                        format!("{}:{}", other.model_id, other.canonical_tag);
+                    assert!(
+                        !native_runtime_model_refs_match(
+                            &requested,
+                            &other_tagged_runtime_source_id
+                        ),
+                        "{requested} must not match a differently-quantized loaded pack {other_tagged_runtime_source_id}"
+                    );
+                }
+            }
+        }
+    }
 }
