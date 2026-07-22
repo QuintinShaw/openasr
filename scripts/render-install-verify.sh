@@ -53,6 +53,12 @@ label_for_target() {
 }
 
 echo "<!-- install-verify:start -->"
+echo "> [!NOTE]"
+echo "> **This release is the OpenASR engine and command-line tool.** Looking for"
+echo "> the desktop app (dictation, live captions, GUI)? Download it from"
+echo "> [openasr.org/download](https://openasr.org/download) or the"
+echo "> [\`desktop-vX.Y.Z\` releases](https://github.com/${repo}/releases?q=desktop&expanded=true)."
+echo
 echo "## Install & Verify"
 echo
 echo "Download the archive for your platform from the assets below, extract it,"
