@@ -10,7 +10,8 @@ use std::{
     marker::PhantomData,
     path::Path,
     ptr::{self, NonNull},
-    sync::OnceLock,
+    sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use memmap2::Mmap;
@@ -496,27 +497,180 @@ impl GgmlCpuGraphConfig {
     }
 }
 
-fn runtime_gpu_is_available() -> bool {
-    static HAS_GPU: OnceLock<bool> = OnceLock::new();
-    *HAS_GPU.get_or_init(|| {
-        // Register plugin backends before the first registry query — under
-        // GGML_BACKEND_DL the registry is otherwise empty and this OnceLock would
-        // cache "no GPU" forever.
-        ensure_backends_loaded();
-        let best_backend_is_gpu = NonNull::new(unsafe { ffi::ggml_backend_init_best() })
-            .map(|raw| {
-                let name = backend_name(raw).to_ascii_lowercase();
-                unsafe { ffi::ggml_backend_free(raw.as_ptr()) };
-                backend_name_is_accelerated(&name)
-            })
-            .unwrap_or(false);
-        if best_backend_is_gpu {
-            return true;
+/// Outcome of one completed (non-panicking) GPU probe. Deliberately distinct
+/// from "the probe attempt panicked" (see [`GpuProbeCache::get_or_probe`]):
+/// `Detected`/`NotDetected` both mean the registry introspection ran to
+/// completion and is trustworthy, whereas a panicked attempt learned nothing
+/// and must never be conflated with a confirmed `NotDetected`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuProbeOutcome {
+    Detected,
+    NotDetected,
+}
+
+impl GpuProbeOutcome {
+    fn from_detected(detected: bool) -> Self {
+        if detected {
+            Self::Detected
+        } else {
+            Self::NotDetected
         }
-        ggml_available_devices()
-            .into_iter()
-            .any(|device| backend_kind_is_accelerated(device.kind))
-    })
+    }
+
+    fn is_detected(self) -> bool {
+        matches!(self, Self::Detected)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Detected => "detected",
+            Self::NotDetected => "not_detected",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GpuProbeState {
+    outcome: GpuProbeOutcome,
+    checked_at: Instant,
+}
+
+/// How long a *negative* ("no GPU") probe result is trusted before the next
+/// caller re-probes instead of reusing it. A confirmed `Detected` result never
+/// expires -- once the registry has genuinely reported an accelerated backend
+/// it stays reportable for the rest of the process, so there is no transient
+/// failure mode to guard against on that side. A `NotDetected` result has no
+/// such guarantee: `ggml_backend_init_best`/the device registry give no error
+/// code, so a transient hiccup (a GPU backend plugin dlopen failing under
+/// host memory/FD pressure, a Metal device momentarily refusing to allocate)
+/// surfaces through the exact same "no accelerated backend" shape as a
+/// genuinely GPU-less host. Since the two are indistinguishable at this API
+/// boundary, `NotDetected` is treated as provisional and bounded to this TTL
+/// rather than cached forever -- this is what turns "one bad probe silently
+/// degrades the rest of the process to CPU" into "one bad probe silently
+/// degrades the process for at most this long", matching the timeout-style
+/// TTLs already used elsewhere in this crate (e.g. `pull.rs`'s
+/// `HTTP_STALL_TIMEOUT`) rather than inventing a new caching idiom.
+const GPU_PROBE_NEGATIVE_TTL: Duration = Duration::from_secs(30);
+
+/// Single-slot cache for a GPU-availability probe, generic over the probe
+/// closure so it is unit-testable without touching the real ggml FFI or the
+/// process-global cache other tests/production code share. See
+/// [`GPU_PROBE_NEGATIVE_TTL`] for the caching asymmetry rationale.
+struct GpuProbeCache {
+    state: Mutex<Option<GpuProbeState>>,
+}
+
+impl GpuProbeCache {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+        }
+    }
+
+    /// Returns whether a GPU is available, running `probe` only when there is
+    /// no cached state or a cached `NotDetected` has aged past
+    /// `GPU_PROBE_NEGATIVE_TTL`. `probe` is run behind `catch_unwind`: if it
+    /// panics (rather than returning a clean `bool`), that attempt taught us
+    /// nothing, so the cache is left untouched (a poisoned lock from a panic
+    /// mid-probe is likewise treated as "no verdict yet", not as a negative)
+    /// and the very next call retries from scratch -- a failed probe is never
+    /// allowed to calcify into a permanent false. Every completed probe
+    /// (detected, not detected, or failed) logs one line via
+    /// `stage_timing::log_event`, matching the `server_boot`
+    /// `stage=ggml_backend` line's style, so an Auto request silently landing
+    /// on CPU is now visible in the daemon log instead of invisible.
+    fn get_or_probe(&self, probe: impl FnOnce() -> bool + std::panic::UnwindSafe) -> bool {
+        let now = Instant::now();
+        if let Some(state) = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let still_trusted = state.outcome.is_detected()
+                || now.duration_since(state.checked_at) < GPU_PROBE_NEGATIVE_TTL;
+            if still_trusted {
+                return state.outcome.is_detected();
+            }
+        }
+
+        match std::panic::catch_unwind(probe) {
+            Ok(detected) => {
+                let outcome = GpuProbeOutcome::from_detected(detected);
+                crate::stage_timing::log_event("gpu_probe", gpu_probe_log_message(outcome));
+                *self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(GpuProbeState {
+                    outcome,
+                    checked_at: now,
+                });
+                detected
+            }
+            Err(_panic_payload) => {
+                // Deliberately do not write to `self.state`: a panicked probe
+                // leaves whatever was cached before untouched (falling back to
+                // it below if present) so a single bad attempt never poisons
+                // the outcome for callers after it, and the very next call
+                // re-probes rather than inheriting this failure.
+                crate::stage_timing::log_event("gpu_probe", gpu_probe_failed_log_message());
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .map(|state| state.outcome.is_detected())
+                    .unwrap_or(false)
+            }
+        }
+    }
+}
+
+fn gpu_probe_log_message(outcome: GpuProbeOutcome) -> String {
+    format!(
+        "stage=detect result={} cache={}",
+        outcome.as_str(),
+        if outcome.is_detected() {
+            "permanent"
+        } else {
+            "ttl_30s"
+        }
+    )
+}
+
+fn gpu_probe_failed_log_message() -> &'static str {
+    "stage=detect result=probe_failed cache=none (retrying on next call)"
+}
+
+static GPU_PROBE_CACHE: GpuProbeCache = GpuProbeCache::new();
+
+fn runtime_gpu_is_available() -> bool {
+    GPU_PROBE_CACHE.get_or_probe(detect_gpu_available)
+}
+
+/// The actual ggml registry introspection `runtime_gpu_is_available` caches.
+/// Pulled into its own function (rather than inlined into the probe closure
+/// at the call site) purely so its FFI calls read the same as before this
+/// change; the caching/logging/failure semantics all live in
+/// [`GpuProbeCache`].
+fn detect_gpu_available() -> bool {
+    // Register plugin backends before the first registry query — under
+    // GGML_BACKEND_DL the registry is otherwise empty and a stale cache would
+    // read as "no GPU" forever.
+    ensure_backends_loaded();
+    let best_backend_is_gpu = NonNull::new(unsafe { ffi::ggml_backend_init_best() })
+        .map(|raw| {
+            let name = backend_name(raw).to_ascii_lowercase();
+            unsafe { ffi::ggml_backend_free(raw.as_ptr()) };
+            backend_name_is_accelerated(&name)
+        })
+        .unwrap_or(false);
+    if best_backend_is_gpu {
+        return true;
+    }
+    ggml_available_devices()
+        .into_iter()
+        .any(|device| backend_kind_is_accelerated(device.kind))
 }
 
 fn is_generic_gpu_backend_alias(value: &str) -> bool {
@@ -5145,10 +5299,12 @@ mod tests {
     use crate::nn::half::f32_to_f16_bits as f32_to_f16_bits_for_test;
 
     use super::{
-        AutoGpuPolicy, GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig,
-        GgmlCpuGraphCpuAcceleratorPolicy, GgmlCpuGraphError, GgmlCpuGraphRunner,
-        GgmlCpuGraphThreadingWorkload, GgmlRopeExtParams, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
-        flash_attn_ext_head_dim_supported_on_backend, runtime_gpu_is_available,
+        AutoGpuPolicy, GPU_PROBE_NEGATIVE_TTL, GgmlCpuBinaryOp, GgmlCpuGraphBackend,
+        GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy, GgmlCpuGraphError,
+        GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlRopeExtParams, GpuProbeCache,
+        GpuProbeOutcome, GpuProbeState, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
+        flash_attn_ext_head_dim_supported_on_backend, gpu_probe_failed_log_message,
+        gpu_probe_log_message, runtime_gpu_is_available,
     };
 
     fn softplus_reference(value: f32) -> f32 {
@@ -5199,6 +5355,154 @@ mod tests {
             "probe: resolve_runtime_backend={:?}",
             GgmlCpuGraphConfig::resolve_runtime_backend()
         );
+    }
+
+    // Regression coverage for the GPU-probe caching bug: a transient probe
+    // failure under host load must never calcify into a permanent "no GPU"
+    // verdict, and a confirmed negative must not be re-probed on every call.
+    // These construct a fresh `GpuProbeCache` per test (rather than driving
+    // the real process-global `GPU_PROBE_CACHE` through `runtime_gpu_is_available`)
+    // so they never touch live ggml FFI/hardware state and stay deterministic
+    // regardless of the host's actual GPU.
+    mod gpu_probe_cache {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn a_panicking_probe_is_not_cached_and_the_next_call_reprobes_cleanly() {
+            let cache = GpuProbeCache::new();
+            let call_count = AtomicUsize::new(0);
+
+            // First attempt: the probe panics (simulating whatever transient
+            // failure mode a real overloaded host hits -- a dlopen failing, a
+            // GPU device momentarily refusing to initialize, etc). This must
+            // not be cached as "no GPU".
+            let previous_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {})); // silence expected panic noise
+            let first = cache.get_or_probe(|| {
+                call_count.fetch_add(1, Ordering::SeqCst);
+                panic!("simulated transient probe failure");
+            });
+            std::panic::set_hook(previous_hook);
+            assert!(
+                !first,
+                "a failed probe must report unavailable, not crash the caller"
+            );
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+            // Second attempt: the probe now succeeds and finds a GPU. Because
+            // the first (failed) attempt must not have been cached, this call
+            // has to actually invoke the probe again rather than reusing a
+            // stale cached `false`.
+            let second = cache.get_or_probe(|| {
+                call_count.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+            assert!(
+                second,
+                "a GPU must become visible on the very next call after a failed probe, \
+                 proving the failure was not cached"
+            );
+            assert_eq!(
+                call_count.load(Ordering::SeqCst),
+                2,
+                "the second call must have re-run the probe, not reused a cached failure"
+            );
+        }
+
+        #[test]
+        fn a_confirmed_negative_is_cached_and_not_reprobed_within_the_ttl() {
+            let cache = GpuProbeCache::new();
+            let call_count = AtomicUsize::new(0);
+            let probe = || {
+                call_count.fetch_add(1, Ordering::SeqCst);
+                false
+            };
+
+            assert!(!cache.get_or_probe(probe));
+            assert!(!cache.get_or_probe(probe));
+            assert!(!cache.get_or_probe(probe));
+
+            assert_eq!(
+                call_count.load(Ordering::SeqCst),
+                1,
+                "a confirmed 'no GPU' must be cached and not re-probed on every call"
+            );
+        }
+
+        #[test]
+        fn a_confirmed_negative_is_reprobed_once_the_ttl_has_elapsed() {
+            let cache = GpuProbeCache::new();
+            // Seed the cache directly with a `NotDetected` result whose
+            // `checked_at` is already older than the negative TTL, rather
+            // than sleeping in the test -- exercises the exact same
+            // "stale negative" branch `get_or_probe` checks without making
+            // this test slow or flaky.
+            *cache.state.lock().unwrap() = Some(GpuProbeState {
+                outcome: GpuProbeOutcome::NotDetected,
+                checked_at: Instant::now() - GPU_PROBE_NEGATIVE_TTL - Duration::from_secs(1),
+            });
+
+            let call_count = AtomicUsize::new(0);
+            let detected = cache.get_or_probe(|| {
+                call_count.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+
+            assert!(
+                detected,
+                "an expired negative result must trigger a fresh probe"
+            );
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn a_confirmed_positive_is_never_reprobed() {
+            let cache = GpuProbeCache::new();
+            let call_count = AtomicUsize::new(0);
+            let probe = || {
+                call_count.fetch_add(1, Ordering::SeqCst);
+                true
+            };
+
+            assert!(cache.get_or_probe(probe));
+            // Even artificially aging the cached entry well past the negative
+            // TTL must not trigger a re-probe: a confirmed `Detected` result
+            // has no expiry (see `GPU_PROBE_NEGATIVE_TTL`'s doc comment).
+            {
+                let mut guard = cache.state.lock().unwrap();
+                if let Some(state) = guard.as_mut() {
+                    state.checked_at = Instant::now() - GPU_PROBE_NEGATIVE_TTL * 100;
+                }
+            }
+            assert!(cache.get_or_probe(probe));
+
+            assert_eq!(
+                call_count.load(Ordering::SeqCst),
+                1,
+                "a confirmed GPU detection must never be re-probed, regardless of age"
+            );
+        }
+
+        #[test]
+        fn every_completed_probe_outcome_produces_a_non_empty_log_line() {
+            // These are the exact message-building helpers `get_or_probe` feeds
+            // to `stage_timing::log_event` -- asserting on their content is
+            // this crate's established way of testing a log line's existence
+            // (see `stage_timing::tests::log_event_and_log_stage_do_not_panic`)
+            // without capturing process stderr.
+            let detected_message = gpu_probe_log_message(GpuProbeOutcome::Detected);
+            assert!(detected_message.contains("result=detected"));
+            assert!(detected_message.contains("permanent"));
+
+            let not_detected_message = gpu_probe_log_message(GpuProbeOutcome::NotDetected);
+            assert!(not_detected_message.contains("result=not_detected"));
+            assert!(not_detected_message.contains("ttl_30s"));
+
+            let failed_message = gpu_probe_failed_log_message();
+            assert!(failed_message.contains("result=probe_failed"));
+        }
     }
 
     #[test]
