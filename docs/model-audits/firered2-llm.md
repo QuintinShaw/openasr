@@ -125,7 +125,7 @@ see `docs/design/gpu-weight-placement.md`).
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
 | `warm_up` is a real implementation, not a stub | Supported | Streaming path uses shared `decode_warm_up_silence` (real silent decode) via the incremental driver (`incremental_streaming_driver.rs:786-789`). |
-| Reference dumper exists for this family | Deferred | Only the one-shot T5 `parity_tests` scratchpad dump exists (`llm_transformer.rs:397-655`); no standing `tools/reference_backends/`-style dumper. Unlock: extract the parity dump into a standard per-family dumper (program-wide tooling item). |
+| Reference dumper exists for this family | Supported | `tooling/firered2-reference-dumper/` (PR #167, merged `c2c32c3`): runs the official FireRedASR2S modules (pin `4e7d9aa`) per stage (fbank -> encoder x16 -> adapter -> LLM prefill + greedy), memory-bounded via meta-device layer streaming. Verified on jfk.wav: adapter official-fp32 vs shipped fp16 pack max_abs_diff 5.76e-4; LLM stage decodes an exact prefix of the committed ggml golden. Adversarially reviewed (independent byte-identical re-run of the adapter number). |
 | Registry / catalog / docs wired (MODEL_ONBOARDING checklist done) | Supported | Arch descriptor, executor/decode-policy registries, dispatch, registry toml, catalog entry + card all present (verified per-file in the static audit). |
 | Peer benchmark recorded (table below, all fields) | Deferred | Peer determined: official PyTorch stack `FireRedTeam/FireRedASR2S@4e7d9aa` (sherpa-onnx ships only the CTC/AED variants; CrispASR/transcribe.cpp do not list the LLM variant). Run pending -- exclusive measurement window required. |
 
