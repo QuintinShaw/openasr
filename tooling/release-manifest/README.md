@@ -180,11 +180,12 @@ Run all three steps from a maintainer machine; none of this runs in CI.
    (`b2_sync.py sync --version <version>`, uploading the Windows sidecar
    archives -- `-vulkan`, `-cuda-sidecar`, `-rocm-sidecar` -- plus
    `backends-manifest.json` and `backends-manifest.signature.json` to
-   `core/v<version>/` in the shared `openasr-releases` B2 bucket. The B2 vars
-   (`B2_S3_ENDPOINT` / `B2_APPLICATION_KEY_ID` / `B2_APPLICATION_KEY`) come
-   from `source ~/.openasr/b2-release.env` in the running shell -- never repo
-   secrets, never a shell-profile export). `sync-vendor` for the vendor_layers archives is
-   OPTIONAL (see above) and not part of this release-blocking checklist --
+   `core/v<version>/` in the shared `openasr-releases` B2 bucket). The B2
+   vars (`B2_S3_ENDPOINT` / `B2_APPLICATION_KEY_ID` / `B2_APPLICATION_KEY`)
+   come from `source ~/.openasr/b2-release.env` in the running shell -- never
+   repo secrets, never a shell-profile export. `sync-vendor` for the
+   vendor_layers archives is OPTIONAL (see above) and not part of this
+   release-blocking checklist --
    GitHub Releases (already populated by `release-binaries.yml`) is enough.
    `b2_sync.py` is the ONLY thing that syncs to B2/dl.openasr.org -- step 1's
    script deliberately does not touch B2 at all, so run this step after step

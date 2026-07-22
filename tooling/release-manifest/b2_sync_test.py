@@ -154,6 +154,61 @@ class RegionFromEndpointTest(unittest.TestCase):
             region_from_endpoint("https://example.com", None)
 
 
+# Complete, obviously-fake credential set for the from_env tests below. Every
+# case passes an explicit env dict, so these never read or mutate the real
+# os.environ.
+_COMPLETE_ENV = {
+    "B2_S3_ENDPOINT": "https://s3.us-east-005.backblazeb2.com",
+    "B2_APPLICATION_KEY_ID": "fake-key-id",
+    "B2_APPLICATION_KEY": "fake-secret",
+}
+
+
+class FromEnvCredentialGateTest(unittest.TestCase):
+    """B2Credentials.from_env must fail closed on incomplete credentials."""
+
+    def test_missing_endpoint_raises(self) -> None:
+        env = {name: value for name, value in _COMPLETE_ENV.items() if name != "B2_S3_ENDPOINT"}
+        with self.assertRaises(B2SyncError) as ctx:
+            B2Credentials.from_env(env=env)
+        self.assertIn("source ~/.openasr/b2-release.env", str(ctx.exception))
+
+    def test_missing_application_key_id_raises(self) -> None:
+        env = {
+            name: value for name, value in _COMPLETE_ENV.items() if name != "B2_APPLICATION_KEY_ID"
+        }
+        with self.assertRaises(B2SyncError) as ctx:
+            B2Credentials.from_env(env=env)
+        message = str(ctx.exception)
+        self.assertIn("must both be set", message)
+        self.assertIn("source ~/.openasr/b2-release.env", message)
+
+    def test_missing_application_key_raises(self) -> None:
+        env = {name: value for name, value in _COMPLETE_ENV.items() if name != "B2_APPLICATION_KEY"}
+        with self.assertRaises(B2SyncError) as ctx:
+            B2Credentials.from_env(env=env)
+        message = str(ctx.exception)
+        self.assertIn("must both be set", message)
+        self.assertIn("source ~/.openasr/b2-release.env", message)
+
+    def test_empty_string_values_raise(self) -> None:
+        for unset in _COMPLETE_ENV:
+            with self.subTest(unset=unset):
+                env = dict(_COMPLETE_ENV)
+                env[unset] = ""
+                with self.assertRaises(B2SyncError):
+                    B2Credentials.from_env(env=env)
+
+    def test_complete_env_builds_credentials_with_optional_overrides(self) -> None:
+        env = dict(_COMPLETE_ENV, B2_BUCKET="other-bucket", B2_S3_REGION="us-east-005")
+        credentials = B2Credentials.from_env(env=env)
+        self.assertEqual(credentials.endpoint, _COMPLETE_ENV["B2_S3_ENDPOINT"])
+        self.assertEqual(credentials.access_key_id, _COMPLETE_ENV["B2_APPLICATION_KEY_ID"])
+        self.assertEqual(credentials.secret_access_key, _COMPLETE_ENV["B2_APPLICATION_KEY"])
+        self.assertEqual(credentials.bucket, "other-bucket")
+        self.assertEqual(credentials.region, "us-east-005")
+
+
 class DecideImmutabilityActionTest(unittest.TestCase):
     def test_put_when_nothing_remote(self) -> None:
         self.assertEqual(decide_immutability_action(None, 10, "abc"), "put")
