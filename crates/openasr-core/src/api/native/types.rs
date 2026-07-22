@@ -310,7 +310,7 @@ pub struct NativeAsrOfflineRequest {
     /// same "prefer this over re-reading `input_path`" contract as
     /// [`crate::TranscriptionRequest::prepared_samples`], which this carries
     /// through to via `native_offline_request_to_transcription_request`.
-    pub prepared_samples: Option<Arc<[f32]>>,
+    pub prepared_samples: Option<Arc<Vec<f32>>>,
 }
 
 impl NativeAsrOfflineRequest {
@@ -330,7 +330,7 @@ impl NativeAsrOfflineRequest {
 
     /// Attaches in-memory samples so the native backend can skip re-reading
     /// `input_path` from disk -- see the field's doc comment.
-    pub fn with_prepared_samples(mut self, prepared_samples: Option<Arc<[f32]>>) -> Self {
+    pub fn with_prepared_samples(mut self, prepared_samples: Option<Arc<Vec<f32>>>) -> Self {
         self.prepared_samples = prepared_samples;
         self
     }

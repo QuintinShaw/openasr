@@ -17,8 +17,7 @@ use openasr_core::{
     BackendKind, ExecutionTarget, NATIVE_RUNTIME_MODEL_ID_AUTO, SuiteBaseline, SuiteConfig,
     SuiteEntry, SuiteEntryMetrics, TranscriptionRequest, check_quant_ordering, check_vs_cpp,
     compare_to_baseline, load_config, openasr_home, peak_rss_bytes, prepare_audio_input,
-    probe_wav_duration, render_suite_json, render_suite_markdown,
-    validate_local_native_model_pack_path, wer_counts,
+    render_suite_json, render_suite_markdown, validate_local_native_model_pack_path, wer_counts,
 };
 
 use crate::cli_args::BenchSuiteCommandOptions;
@@ -183,10 +182,7 @@ fn run_entry(
     )
     .with_context(|| format!("Could not prepare audio: {}", entry.audio_path.display()))?;
 
-    let audio_seconds = prepared
-        .original()
-        .duration_seconds
-        .or_else(|| probe_wav_duration(prepared.path()));
+    let audio_seconds = prepared.duration_seconds();
     let reference = resolve_reference(entry)?;
 
     // Best-of-N: keep the fastest wall-clock sample so a single noisy run
@@ -213,7 +209,8 @@ fn run_entry(
             // The perf suite measures ASR decode RTF/RSS; an optional
             // post-process stage running when a FireRedPunc pack happens to be
             // installed would skew both, so it stays off for every entry.
-            .with_punctuation(false);
+            .with_punctuation(false)
+            .with_prepared_samples(prepared.shared_samples());
         configure_native_cpu_inference_threads();
         let started = Instant::now();
         let transcription = transcribe_with_backend(BackendKind::Native, request)?;
@@ -245,8 +242,19 @@ fn run_entry(
         .map(|seconds| elapsed.as_secs_f64() / seconds);
 
     // "Beat comparable open source": time the same-model whisper.cpp baseline.
+    // whisper.cpp is an external process that needs a real WAV file path --
+    // it cannot take the in-memory samples the symphonia decode path now
+    // hands back for non-WAV/non-conformant-WAV entries (`prepared.path()`
+    // there is only the *original* source file, not a WAV; see
+    // `PreparedAudioInput::path`'s doc comment). Every entry in
+    // `perf/suite.toml` today is already a conformant WAV (the passthrough
+    // path, always a real file), so this only ever skips the comparison for a
+    // hypothetical future non-WAV entry rather than handing whisper.cpp a
+    // path it cannot read.
     let cpp_best_ms = match (&entry.cpp_binary, &entry.cpp_model) {
-        (Some(binary), Some(model)) if binary.exists() && model.exists() => {
+        (Some(binary), Some(model))
+            if binary.exists() && model.exists() && prepared.samples().is_none() =>
+        {
             time_whisper_cpp(binary, model, prepared.path(), runs.max(1))
         }
         _ => None,

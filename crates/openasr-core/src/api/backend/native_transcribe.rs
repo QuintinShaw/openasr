@@ -815,7 +815,14 @@ fn run_native_transcription_fallible(
     // rather than running uncounted.
     let _progress = NativeProgressGuard::new();
     let input_path = request.input_path.clone();
-    let prepared_samples = request.prepared_samples.clone();
+    // Only clone the in-memory samples' `Arc` when the (opt-in, uncommon)
+    // forced-aligner refine stage will actually need to re-read them after
+    // the main decode below has consumed `request`: cloning unconditionally
+    // would keep a second strong reference alive for the whole decode,
+    // permanently defeating the zero-copy `Arc::try_unwrap` reclaim in
+    // `resolve_prepared_audio_samples` (see its doc comment) for every
+    // request, not just refine ones.
+    let prepared_samples_for_refine = refine.then(|| request.prepared_samples.clone()).flatten();
     let language_hint = request.language.clone();
     let model_pack_path = request.model_pack_path.clone();
     let punctuate = request.punctuate;
@@ -842,7 +849,7 @@ fn run_native_transcription_fallible(
         refine_transcription_word_timestamps_with_forced_aligner(
             transcription,
             &input_path,
-            prepared_samples.as_ref(),
+            prepared_samples_for_refine,
             language_hint.as_deref(),
         )
     } else {
@@ -928,19 +935,29 @@ fn punctuate_transcription_segments(
     transcription
 }
 
-/// Returns `request`'s audio as 16 kHz mono f32 samples, preferring
+/// Returns the audio at `input_path` as 16 kHz mono f32 samples, preferring
 /// `prepared_samples` -- already resident in memory when
 /// `prepare_audio_input`'s in-process symphonia decode path produced them
 /// (see `crate::audio::PreparedAudioInput::samples`) -- over re-reading
 /// `input_path` from disk. The WAV-passthrough and external ffmpeg/afconvert
 /// conversion paths leave `prepared_samples` unset, so this falls back to the
 /// WAV load exactly as before for those.
+///
+/// Takes `prepared_samples` by value (not by reference) so that when the
+/// caller passes its *only* remaining `Arc` handle, `Arc::try_unwrap` below
+/// reclaims the underlying `Vec<f32>` with zero copy instead of cloning it
+/// out from behind a shared reference -- avoiding the double-memory window
+/// (the `Arc`'s buffer plus a freshly cloned `Vec` of the same audio) this
+/// would otherwise cost for the whole decode. Only falls back to an actual
+/// clone when another reference is still alive (the opt-in forced-aligner
+/// refine path, which legitimately needs the samples a second time after the
+/// main decode has consumed them -- see `run_native_transcription_fallible`).
 fn resolve_prepared_audio_samples(
     input_path: &Path,
-    prepared_samples: Option<&Arc<[f32]>>,
+    prepared_samples: Option<Arc<Vec<f32>>>,
 ) -> Result<Vec<f32>, crate::NativeAsrError> {
     if let Some(samples) = prepared_samples {
-        return Ok(samples.to_vec());
+        return Ok(Arc::try_unwrap(samples).unwrap_or_else(|shared| (*shared).clone()));
     }
     load_wav_16khz_mono_f32_v0(
         input_path,
@@ -959,7 +976,7 @@ fn resolve_prepared_audio_samples(
 fn refine_transcription_word_timestamps_with_forced_aligner(
     mut transcription: Transcription,
     input_path: &Path,
-    prepared_samples: Option<&Arc<[f32]>>,
+    prepared_samples: Option<Arc<Vec<f32>>>,
     language_hint: Option<&str>,
 ) -> Result<Transcription, BackendError> {
     let pack_path = forced_aligner_pack::resolve_forced_aligner_pack_path()
@@ -1020,8 +1037,15 @@ fn assign_aligned_words_to_segments(segments: &mut [Segment], items: &[ForcedAli
 }
 
 fn run_native_transcription_impl(
-    request: TranscriptionRequest,
+    mut request: TranscriptionRequest,
 ) -> Result<Transcription, BackendError> {
+    // Taken up front (before `requested_model_id` below borrows `request` for
+    // the rest of this function): leaves `request.prepared_samples` as
+    // `None` and hands `resolve_prepared_audio_samples` the only `Arc`
+    // strong reference in the common (non-refine) case, so it can reclaim
+    // the underlying `Vec<f32>` with zero copy instead of cloning it -- see
+    // that function's doc comment.
+    let prepared_samples = request.prepared_samples.take();
     let model_resolve_started = Instant::now();
     let requested_model_id = normalize_and_validate_model_id(&request)?;
     let model_pack_path = request
@@ -1111,11 +1135,10 @@ fn run_native_transcription_impl(
         model_resolve_started.elapsed(),
     );
     let audio_prep_started = Instant::now();
-    let prepared_audio =
-        resolve_prepared_audio_samples(&request.input_path, request.prepared_samples.as_ref())
-            .map_err(|error| BackendError::NativeUnsupportedInputFormat {
-                reason: error.to_string(),
-            })?;
+    let prepared_audio = resolve_prepared_audio_samples(&request.input_path, prepared_samples)
+        .map_err(|error| BackendError::NativeUnsupportedInputFormat {
+            reason: error.to_string(),
+        })?;
     crate::stage_timing::log_stage(
         "native_transcribe",
         "audio_prep",

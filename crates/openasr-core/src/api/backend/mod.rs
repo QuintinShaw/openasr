@@ -413,7 +413,7 @@ pub struct TranscriptionRequest {
     /// decode source. `None` for the WAV-passthrough and external
     /// ffmpeg/afconvert conversion paths, and for any caller that built this
     /// request without going through `prepare_audio_input` at all.
-    pub prepared_samples: Option<Arc<[f32]>>,
+    pub prepared_samples: Option<Arc<Vec<f32>>>,
 }
 
 impl TranscriptionRequest {
@@ -446,7 +446,7 @@ impl TranscriptionRequest {
 
     /// Attaches in-memory samples so the native backend can skip re-reading
     /// `input_path` from disk -- see the field's doc comment.
-    pub fn with_prepared_samples(mut self, prepared_samples: Option<Arc<[f32]>>) -> Self {
+    pub fn with_prepared_samples(mut self, prepared_samples: Option<Arc<Vec<f32>>>) -> Self {
         self.prepared_samples = prepared_samples;
         self
     }

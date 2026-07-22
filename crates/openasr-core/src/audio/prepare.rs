@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, path::PathBuf, process::Command, sync::Arc};
 
 use crate::{
     BackendKind,
@@ -199,7 +199,10 @@ fn try_symphonia_prepare(info: &AudioInputInfo) -> Result<SymphoniaAttempt, Audi
 
     Ok(SymphoniaAttempt::Prepared(PreparedAudioInput {
         original,
-        samples: PreparedAudioSamples::InMemory(samples.into()),
+        // `Arc::new` (not `.into()`/`Arc::from`): wraps the already-allocated
+        // `Vec<f32>` in a new refcount header without copying its samples --
+        // see `PreparedAudioSamples`'s doc comment for why this matters.
+        samples: PreparedAudioSamples::InMemory(Arc::new(samples)),
         temp_dir: None,
     }))
 }

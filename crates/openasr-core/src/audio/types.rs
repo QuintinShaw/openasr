@@ -98,10 +98,19 @@ impl AudioPreparationOptions {
 /// back the fully-decoded 16 kHz mono f32 samples it already has resident in
 /// memory, so callers never have to write them to a temporary WAV and
 /// immediately re-read + re-parse it back into the exact same samples.
+///
+/// Deliberately `Arc<Vec<f32>>`, not `Arc<[f32]>`: wrapping the already-owned
+/// `Vec<f32>` the symphonia decode produced is a plain pointer move (`Arc::new`
+/// only allocates the small refcount header), whereas `Arc<[f32]>::from(vec)`
+/// would copy every sample into a new combined allocation. It also lets the
+/// sole consumer (`native_transcribe::resolve_prepared_audio_samples`) reclaim
+/// the exact same `Vec<f32>` via `Arc::try_unwrap` with zero copy whenever it
+/// is the last handle, instead of always cloning the samples out from behind
+/// a shared reference.
 #[derive(Debug)]
 pub(crate) enum PreparedAudioSamples {
     Path(PathBuf),
-    InMemory(Arc<[f32]>),
+    InMemory(Arc<Vec<f32>>),
 }
 
 #[derive(Debug)]
@@ -136,16 +145,17 @@ impl PreparedAudioInput {
     /// conversion paths, which hand back a file via [`Self::path`] instead.
     pub fn samples(&self) -> Option<&[f32]> {
         match &self.samples {
-            PreparedAudioSamples::InMemory(samples) => Some(samples),
+            PreparedAudioSamples::InMemory(samples) => Some(samples.as_slice()),
             PreparedAudioSamples::Path(_) => None,
         }
     }
 
-    /// Cheap `Arc` clone of [`Self::samples`], for attaching to a
+    /// Cheap `Arc` clone (a refcount bump, not a data copy) of
+    /// [`Self::samples`], for attaching to a
     /// [`crate::TranscriptionRequest`]/`NativeAsrOfflineRequest` so the
     /// native backend can decode straight from memory instead of re-reading
     /// [`Self::path`] from disk.
-    pub fn shared_samples(&self) -> Option<Arc<[f32]>> {
+    pub fn shared_samples(&self) -> Option<Arc<Vec<f32>>> {
         match &self.samples {
             PreparedAudioSamples::InMemory(samples) => Some(Arc::clone(samples)),
             PreparedAudioSamples::Path(_) => None,
