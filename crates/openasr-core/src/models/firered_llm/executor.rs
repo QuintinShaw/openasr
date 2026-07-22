@@ -21,6 +21,10 @@
 // the established per-family convention without a matching crate-wide pass.
 #![allow(dead_code)]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 use crate::NativeAsrError;
@@ -28,7 +32,7 @@ use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::FIRERED_LLM_DECODE_POLICY_ID;
 use crate::ggml_runtime::{
-    GgmlCpuGraphConfig, RequestBackendOverrideGuard, RequestBackendPreference,
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendOverrideGuard, RequestBackendPreference,
     install_request_backend_override, request_backend_override,
 };
 use crate::models::decode_policy_component_registry::{
@@ -54,6 +58,9 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
+use crate::models::thread_local_runtime_cache::{
+    canonical_runtime_cache_path, current_unload_generation, take_generation_tagged,
+};
 
 use super::adapter_graph::FireRedLlmAdapterGraphRuntime;
 use super::decode_prompt::build_firered_llm_decode_prompt;
@@ -63,6 +70,61 @@ use super::runtime_contract::{
     parse_firered_llm_encoder_metadata,
 };
 use super::tokenizer::FireRedLlmTokenizer;
+
+/// Resident decoder cache (mirrors qwen's `QWEN_WHOLE_DECODER_BY_KEY` design
+/// S4, `models::qwen::ggml_executor`): `FireRedLlmDecoderRuntime` owns the
+/// Qwen2 whole-decoder graph runner, its device-uploaded layer weights, the
+/// logits head, and the token-embedding table -- all identical across every
+/// `execute()` call against the same pack on the same backend. Without this,
+/// every request paid a full decoder-runtime rebuild (~1.8-2.0s measured,
+/// `docs/model-audits/firered2-llm.md` SS3) purely to re-derive state that
+/// does not change between requests. Keyed by (pack path, backend): unlike
+/// qwen this family has no LoRA/adapter input, so the key omits qwen's third
+/// (adapter fingerprint) component.
+///
+/// This reuses the same session/model split transcribe.cpp uses for its own
+/// Qwen-family LLM decoder (`references/transcribe.cpp@b6a6acad`,
+/// `src/arch/qwen3_asr/model.cpp`: weights load once into `transcribe_model`,
+/// a session's KV cache grows-to-fit and is reused across `run()` calls
+/// instead of being rebuilt) -- transcribe.cpp keeps the resident state in a
+/// caller-owned session object rather than a thread-local cache; this crate's
+/// dispatch is a stateless `&self` executor called per request, so the
+/// thread-local + generation-tag mechanism below is what plays that role
+/// here.
+///
+/// A plain `HashMap` (not the shared bounded LRU): the key does not explode
+/// per audio chunk (one entry is built and reused across a whole longform
+/// run for a given pack), so there is no unbounded-growth hazard to bound.
+/// Entries are tagged with the idle-unload generation they were built under
+/// (`thread_local_runtime_cache`): the `idle_unload` reaper cannot reach this
+/// TLS from its own thread, so `take_cached_decoder_runtime` discards any
+/// decoder built before the last unload instead of handing it back out --
+/// this is how the resident 8B decoder becomes evictable under memory
+/// pressure without a bespoke eviction policy.
+type FireRedLlmDecoderCacheKey = (PathBuf, GgmlCpuGraphBackend);
+
+thread_local! {
+    static FIRERED_LLM_DECODER_BY_KEY: RefCell<HashMap<FireRedLlmDecoderCacheKey, (u64, FireRedLlmDecoderRuntime)>> =
+        RefCell::new(HashMap::new());
+}
+
+fn take_cached_decoder_runtime(
+    key: &FireRedLlmDecoderCacheKey,
+    unload_generation: u64,
+) -> Option<FireRedLlmDecoderRuntime> {
+    FIRERED_LLM_DECODER_BY_KEY
+        .with(|cache| take_generation_tagged(&mut cache.borrow_mut(), key, unload_generation))
+}
+
+fn store_cached_decoder_runtime(
+    key: FireRedLlmDecoderCacheKey,
+    unload_generation: u64,
+    decoder: FireRedLlmDecoderRuntime,
+) {
+    FIRERED_LLM_DECODER_BY_KEY.with(|cache| {
+        cache.borrow_mut().insert(key, (unload_generation, decoder));
+    });
+}
 
 const FIRERED_LLM_EXECUTOR_ID: &str = "firered-llm-ggml-executor-v1";
 const FIRERED_LLM_STREAMING_EXECUTOR_ID: &str = "firered-llm-ggml-snapshot-streaming-executor-v1";
@@ -320,17 +382,46 @@ impl FireRedLlmGgmlExecutor {
         // unaffected.
         let _decoder_backend_override =
             resolve_decoder_backend_override(runtime_path, request.backend_preference);
-        let mut decoder =
-            FireRedLlmDecoderRuntime::new(runtime_path, decoder_metadata).map_err(|error| {
-                FireRedLlmExecutorError::DecoderFailed {
-                    reason: error.to_string(),
+        // Resolved AFTER installing the override guard, so the cache key
+        // reflects the backend the decoder actually builds on (matches
+        // qwen's `WholeDecoderCacheKey` ordering).
+        let decoder_cache_key: FireRedLlmDecoderCacheKey = (
+            canonical_runtime_cache_path(runtime_path),
+            GgmlCpuGraphConfig::resolve_runtime_backend(),
+        );
+        // Sampled before the cache take and reused for the store-back below:
+        // if the idle-unload reaper bumps the generation while this decode is
+        // in flight, the decoder goes back tagged with the pre-unload
+        // generation and the *next* take discards it, so an unload can never
+        // be lost to an overlapping decode (mirrors qwen's
+        // `ggml_executor::execute_inner`).
+        let unload_generation = current_unload_generation();
+        let firered_llm_profile_enabled = std::env::var_os("OPENASR_FIRERED_LLM_PROFILE").is_some();
+        let mut decoder = match take_cached_decoder_runtime(&decoder_cache_key, unload_generation) {
+            // Resident hit: layer weights already uploaded to the device and
+            // the reuse graph already built -- skip the ~1.8-2.0s rebuild.
+            Some(decoder) => {
+                if firered_llm_profile_enabled {
+                    eprintln!("OPENASR_FIRERED_LLM_PROFILE stage=decoder_cache_hit");
                 }
-            })?;
+                decoder
+            }
+            None => {
+                let decoder = FireRedLlmDecoderRuntime::new(runtime_path, decoder_metadata)
+                    .map_err(|error| FireRedLlmExecutorError::DecoderFailed {
+                        reason: error.to_string(),
+                    })?;
+                if firered_llm_profile_enabled {
+                    eprintln!("OPENASR_FIRERED_LLM_PROFILE stage=decoder_cache_miss_init");
+                }
+                decoder
+            }
+        };
         // Opt-in perf diagnostic (mirrors the qwen `OPENASR_HYMT2_PROFILE`
         // backend log line): confirms which backend the 7B Qwen2 decoder graph
         // actually resolved to (Metal vs CPU) without asserting a host-dependent
         // timing number in shipping code.
-        if std::env::var_os("OPENASR_FIRERED_LLM_PROFILE").is_some() {
+        if firered_llm_profile_enabled {
             eprintln!(
                 "OPENASR_FIRERED_LLM_PROFILE decoder_backend={}",
                 decoder.backend_label()
@@ -378,7 +469,7 @@ impl FireRedLlmGgmlExecutor {
             vocab_size: decoder_metadata.vocab_size,
             max_generated_tokens: FIRERED_LLM_MAX_GENERATED_TOKENS,
         };
-        let result = run_builtin_seq2seq_decode_policy(
+        let decode_result = run_builtin_seq2seq_decode_policy(
             FIRERED_LLM_DECODE_POLICY_ID,
             &config,
             &NoPhraseBiasTokenSource,
@@ -394,10 +485,18 @@ impl FireRedLlmGgmlExecutor {
             |error: Seq2SeqGreedyDecodeError| error,
             |error: Seq2SeqGreedyDecodeError| error,
             map_registry_error,
-        )
-        .map_err(|error| FireRedLlmExecutorError::GreedyDecodeFailed {
-            reason: error.to_string(),
-        })?;
+        );
+        // Return the resident decoder to the cache for the next chunk /
+        // execute() regardless of decode outcome -- its weights + reuse graph
+        // stay valid either way (mirrors qwen's `store_cached_whole_decoder`
+        // call site). `step_executor` is not used again after this point, so
+        // its `&mut decoder` borrow ends here under NLL and `decoder` (owned
+        // locally) is free to move into the cache.
+        store_cached_decoder_runtime(decoder_cache_key, unload_generation, decoder);
+        let result =
+            decode_result.map_err(|error| FireRedLlmExecutorError::GreedyDecodeFailed {
+                reason: error.to_string(),
+            })?;
 
         let text = result.text.trim().to_string();
         let transcription = Transcription {
@@ -737,5 +836,37 @@ mod tests {
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
         assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);
+    }
+
+    /// Resident decoder cache regression: calling `execute()` twice in a row
+    /// on the same thread (same pack + backend) must hit the thread-local
+    /// `FIRERED_LLM_DECODER_BY_KEY` cache on the second call and still
+    /// produce a byte-identical transcript to the first call and to the
+    /// dedicated single-call goldens above -- the resident decoder carries no
+    /// per-request state across calls that could leak into a later
+    /// transcript. Run with `OPENASR_FIRERED_LLM_PROFILE=1 cargo test ...
+    /// -- --ignored --nocapture` to also see the
+    /// `stage=decoder_cache_miss_init` / `stage=decoder_cache_hit` lines this
+    /// test exercises but does not itself assert on (stderr capture of a
+    /// specific line is not a stable test signal; the byte-identical output
+    /// plus the manual profile run together are the evidence this cache is
+    /// wired correctly).
+    #[test]
+    #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; see \
+                golden_diff_end_to_end_transcribe_matches_reference_decode_on_jfk_wav for why \
+                CpuOnly is the deterministic reference backend here"]
+    fn resident_decoder_cache_reuse_across_consecutive_calls_stays_byte_identical() {
+        let Some((first_text, _, _)) = transcribe_with_dev_pack(jfk_wav_path()) else {
+            return;
+        };
+        let Some((second_text, _, _)) = transcribe_with_dev_pack(jfk_wav_path()) else {
+            return;
+        };
+        assert_eq!(first_text, GOLDEN_JFK_TEXT);
+        assert_eq!(
+            second_text, GOLDEN_JFK_TEXT,
+            "second execute() (a resident-decoder cache hit) must match the first \
+             (cache-miss/build) call byte-for-byte"
+        );
     }
 }
