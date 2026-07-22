@@ -128,7 +128,7 @@ see `docs/design/gpu-weight-placement.md`).
 | `warm_up` is a real implementation, not a stub | Supported | Streaming path uses shared `decode_warm_up_silence` (real silent decode) via the incremental driver (`incremental_streaming_driver.rs:786-789`). |
 | Reference dumper exists for this family | Supported | `tooling/firered2-reference-dumper/` (PR #167, merged `c2c32c3`): runs the official FireRedASR2S modules (pin `4e7d9aa`) per stage (fbank -> encoder x16 -> adapter -> LLM prefill + greedy), memory-bounded via meta-device layer streaming. Verified on jfk.wav: adapter official-fp32 vs shipped fp16 pack max_abs_diff 5.76e-4; LLM stage decodes an exact prefix of the committed ggml golden. Adversarially reviewed (independent byte-identical re-run of the adapter number). |
 | Registry / catalog / docs wired (MODEL_ONBOARDING checklist done) | Supported | Arch descriptor, executor/decode-policy registries, dispatch, registry toml, catalog entry + card all present (verified per-file in the static audit). |
-| Peer benchmark recorded (table below, all fields) | Deferred | Peer determined: official PyTorch stack `FireRedTeam/FireRedASR2S@4e7d9aa` (sherpa-onnx ships only the CTC/AED variants; CrispASR/transcribe.cpp do not list the LLM variant). Run pending -- exclusive measurement window required. |
+| Peer benchmark recorded (table below, all fields) | Deferred | Peer determined: official PyTorch stack `FireRedTeam/FireRedASR2S@4e7d9aa` (sherpa-onnx ships only the CTC/AED variants; CrispASR/transcribe.cpp do not list the LLM variant). Hardware-locked: fair peer run requires a 32GB+ host (see Peer benchmark record table). |
 
 ### Peer benchmark record
 
@@ -137,13 +137,13 @@ not auditable without the exact peer version, model build, audio, and machine.
 
 | Field | Value |
 | --- | --- |
-| Peer project (name + commit or version) | FireRedTeam/FireRedASR2S @ 4e7d9aaf (official PyTorch stack) -- run pending <!-- TODO:fill --> |
-| Peer model + quant build | <!-- TODO:fill --> |
-| Peer program version | <!-- TODO:fill --> |
-| Test audio (file, duration, language) | <!-- TODO:fill --> |
-| Machine (chip, RAM, OS) | <!-- TODO:fill --> |
-| Peer numbers (RTF / peak memory / utilization) | <!-- TODO:fill --> |
-| OpenASR numbers (RTF / peak memory / utilization) | <!-- TODO:fill --> |
+| Peer project (name + commit or version) | FireRedTeam/FireRedASR2S @ 4e7d9aa (official PyTorch stack; sherpa-onnx ships only CTC/AED variants, CrispASR/transcribe.cpp do not carry the LLM variant). DEFERRED: a fair peer speed run cannot execute on the 16GB M1 reference host -- official fp16 weights (~16GB) exceed unified memory and the layer-streaming loader used for parity dumps is not a fair speed baseline. Unlock: 32GB+ host (same unlock as the quant-tier row). Quality comparisons must re-run the reference at its published recipe (beam=3, repetition_penalty=3.0), not reuse published WER against our greedy. |
+| Peer model + quant build | pending the 32GB+ host run |
+| Peer program version | pending the 32GB+ host run |
+| Test audio (file, duration, language) | pending the 32GB+ host run |
+| Machine (chip, RAM, OS) | pending the 32GB+ host run |
+| Peer numbers (RTF / peak memory / utilization) | pending the 32GB+ host run |
+| OpenASR numbers (RTF / peak memory / utilization) | pending the 32GB+ host run (fresh clean-window numbers exist at dae714d: rtf_cpu 0.905 / rtf_metal 0.535 warm, peaks in section 3 -- re-measure alongside the peer on the same host for a valid comparison) |
 
 ## Known dead ends (do not re-litigate)
 
