@@ -78,7 +78,7 @@ python3 dump_reference.py \
   --fireredasr2s-repo /path/to/fr2-refcode \
   --weights-dir /path/to/firered2-llm-weights \
   --oasr-pack /path/to/firered2-llm-fp16.oasr \
-  --llm-decode-steps 4
+  --llm-decode-steps 6
 ```
 
 `--stage` accepts `fbank`, `encoder`, `adapter`, `llm`, or `all` (default);

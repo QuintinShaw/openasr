@@ -491,7 +491,6 @@ def run_llm(streaming_model: StreamingQwen2, tokenizer, speech_features_np: np.n
         )
     hook.remove()
 
-    last_hidden = out.logits  # placeholder to appease linters; unused directly
     prefill_last_hidden = captured["pre_final_norm_last"]
     first_logits = out.logits[0, -1].detach().to(torch.float32).numpy().copy()
 
