@@ -56,6 +56,7 @@ every consciously skipped optimization on the record.
 | mmap weight loading | <!-- TODO:fill --> | |
 | Resident pool reuse across requests (weights stay resident) | <!-- TODO:fill --> | |
 | View contiguity tradeoffs audited (`cont`/copy nodes justified) | <!-- TODO:fill --> | |
+| Peak RSS/VRAM per shipped quant measured (quiet host) and reconciled against the weights+KV+activations budget; unexplained excess blocks release; catalog RAM requirement matches the measured peak | <!-- TODO:fill --> | |
 
 ## 4. Decode algorithms
 

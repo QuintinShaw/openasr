@@ -56,6 +56,7 @@ every consciously skipped optimization on the record.
 | mmap weight loading | Supported | `GgufTensorDataReader::from_path` -> `Mmap::map` -> host-ptr-backed ggml buffers (`gguf_tensor_data.rs:197-226`, `cpu_graph.rs:1084-1132`). |
 | Resident pool reuse across requests (weights stay resident) | Deferred | `FireRedLlmGgmlExecutor` builds the decoder runtime per `execute()` (no `unload_idle_state` override); decoder graph/runtime construction measured at ~1.8-2.0s per request (amortized only by OS page cache). Unlock: resident executor cache keyed like the streaming worker pool; needs an idle/memory eviction policy for an 8B resident. |
 | View contiguity tradeoffs audited (`cont`/copy nodes justified) | Deferred | Adapter is now a ggml graph with plain contiguous matmuls (PR #156); the shared qwen decoder graph has not had a dedicated offset-view sweep. Unlock: one cross-family contiguity sweep of `qwen` shared executor (covers qwen3/mimo/firered2 in one pass), method per the Vulkan misalign case. |
+| Peak RSS/VRAM per shipped quant measured (quiet host) and reconciled against the weights+KV+activations budget; unexplained excess blocks release; catalog RAM requirement matches the measured peak | <!-- TODO:fill --> | Pending a quiet-window peak-RSS profile of q4_k (budget: ~4.7GB weights + ~117MB KV at cap + activations); must reconcile with the catalog RAM hint before this form closes. |
 
 ## 4. Decode algorithms
 
