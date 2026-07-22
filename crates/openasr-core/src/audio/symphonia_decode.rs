@@ -280,9 +280,10 @@ fn decode_to_mono_f32(
     // Symphonia has no Opus decoder: demux the packets here and decode them
     // with the bundled libopus instead (see `opus_decode`'s module docs for
     // the RFC 7845 pre-skip/gain/end-trim handling). Ogg's 1/48000 track time
-    // base makes packet timestamps granule positions (which enables the
-    // end-trim); mkv/webm timecodes are not sample counts, so the flag stays
-    // false there.
+    // base makes packet timestamps 48 kHz sample positions (packet starts,
+    // back-derived from the page granule), which together with each packet's
+    // duration enables the end-trim; mkv/webm timecodes are not sample
+    // counts, so the flag stays false there.
     if track.codec_params.codec == CODEC_TYPE_OPUS {
         let extra_data = track.codec_params.extra_data.clone();
         let timestamps_are_samples = track.codec_params.time_base
@@ -384,7 +385,7 @@ fn decode_opus_track(
             continue;
         }
 
-        if !stream.push_packet(&packet.data, packet.ts()) {
+        if !stream.push_packet(&packet.data, packet.ts(), packet.dur()) {
             return None;
         }
     }
@@ -529,6 +530,8 @@ fn resample_mono_to_16k(input: &[f32], input_rate: u32) -> Option<Vec<f32>> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
@@ -582,5 +585,174 @@ mod tests {
             probe_codec_label(&path, Some("webm")),
             ProbeOutcome::ParserPanicked
         ));
+    }
+
+    fn opus_tone_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone.opus")
+    }
+
+    fn decode_opus_fixture(path: &Path) -> DecodedMono {
+        let mut codec_label = None;
+        decode_to_mono_f32(path, Some("opus"), &mut codec_label)
+            .expect("the tone.opus fixture must decode in-process")
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    /// The RFC 7845 sample-count contract for `tone.opus` (a 0.5 s source):
+    /// the final granule is 24,312 samples at 48 kHz (24,000 of content plus
+    /// the 312-sample pre-skip), so after discarding the pre-skip and
+    /// end-trimming to the granule the decode must be *exactly* 24,000
+    /// samples. A regression in either the pre-skip discard or the end-trim
+    /// (e.g. mistaking the last packet's *start* timestamp for the granule,
+    /// which over-trims a whole packet) moves this count and fails here.
+    #[test]
+    fn opus_tone_decodes_to_the_exact_rfc7845_sample_count() {
+        let decoded = decode_opus_fixture(&opus_tone_fixture());
+
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 1);
+        assert_eq!(
+            decoded.samples.len(),
+            24_000,
+            "pre-skip discard + end-trim must leave exactly the 0.5 s of content"
+        );
+    }
+
+    /// Decodes `tone.opus` the way a reference implementation would (ffmpeg
+    /// links libopus for Ogg-Opus decode) and compares sample-for-sample at
+    /// 48 kHz: the in-process decode must match it, and the lengths must be
+    /// equal (both remove the RFC 7845 pre-skip). Runs only where ffmpeg is
+    /// available; hosts without it print a note and pass vacuously rather
+    /// than fail on a missing tool.
+    #[test]
+    fn opus_tone_matches_the_ffmpeg_reference_decode_sample_for_sample() {
+        let ffmpeg_available = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !ffmpeg_available {
+            eprintln!("ffmpeg not on PATH; skipping the reference-decode comparison");
+            return;
+        }
+        let fixture = opus_tone_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let reference_path = dir.path().join("reference.f32");
+        let status = std::process::Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-y")
+            .arg("-i")
+            .arg(&fixture)
+            .arg("-f")
+            .arg("f32le")
+            .arg("-ac")
+            .arg("1")
+            .arg("-ar")
+            .arg("48000")
+            .arg(&reference_path)
+            .status()
+            .expect("ffmpeg must run");
+        assert!(status.success(), "ffmpeg must decode the fixture");
+        let raw = std::fs::read(&reference_path).unwrap();
+        let reference: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+
+        let decoded = decode_opus_fixture(&fixture);
+
+        assert_eq!(
+            decoded.samples.len(),
+            reference.len(),
+            "both decodes must apply the same RFC 7845 pre-skip/end-trim"
+        );
+        let max_diff = decoded
+            .samples
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        // Bit-identical in practice (same libopus, deterministic decode);
+        // the epsilon only guards against future libopus float-path drift.
+        assert!(
+            max_diff <= 1e-6,
+            "in-process decode must match the ffmpeg/libopus reference: max diff {max_diff}"
+        );
+    }
+
+    /// Rewrites the Q7.8 output-gain field of the fixture's `OpusHead` and
+    /// recomputes that page's Ogg CRC-32 (direct polynomial 0x04c11db7, init
+    /// 0, no reflection or final XOR, stored little-endian at page offset
+    /// 22), yielding a valid Ogg-Opus file whose header requests +6 dB.
+    fn opus_fixture_with_output_gain(gain_q78: i16) -> (tempfile::TempDir, PathBuf) {
+        let mut bytes = std::fs::read(opus_tone_fixture()).unwrap();
+        let head = bytes
+            .windows(8)
+            .position(|window| window == b"OpusHead")
+            .expect("the fixture must contain an OpusHead packet");
+        bytes[head + 16..head + 18].copy_from_slice(&gain_q78.to_le_bytes());
+
+        let page = bytes[..head]
+            .windows(4)
+            .rposition(|window| window == b"OggS")
+            .expect("the OpusHead packet must sit inside an Ogg page");
+        let segments = bytes[page + 26] as usize;
+        let payload: usize = bytes[page + 27..page + 27 + segments]
+            .iter()
+            .map(|&lacing| lacing as usize)
+            .sum();
+        let page_end = page + 27 + segments + payload;
+
+        bytes[page + 22..page + 26].copy_from_slice(&[0, 0, 0, 0]);
+        let crc = ogg_page_crc32(&bytes[page..page_end]);
+        bytes[page + 22..page + 26].copy_from_slice(&crc.to_le_bytes());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gain.opus");
+        std::fs::write(&path, &bytes).unwrap();
+        (dir, path)
+    }
+
+    fn ogg_page_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0u32;
+        for &byte in bytes {
+            crc ^= u32::from(byte) << 24;
+            for _ in 0..8 {
+                crc = if crc & 0x8000_0000 != 0 {
+                    (crc << 1) ^ 0x04c1_1db7
+                } else {
+                    crc << 1
+                };
+            }
+        }
+        crc
+    }
+
+    /// The OpusHead output-gain field must actually reach the decoded audio:
+    /// a header requesting +6 dB (Q7.8 1536) is applied inside libopus via
+    /// OPUS_SET_GAIN, so the decoded RMS must scale by ~10^(6/20) while the
+    /// sample count stays identical (gain never changes duration).
+    #[test]
+    fn opus_output_gain_is_applied_to_the_decoded_samples() {
+        let baseline = decode_opus_fixture(&opus_tone_fixture());
+
+        let (_dir, path) = opus_fixture_with_output_gain(1536); // +6 dB in Q7.8
+        let boosted = decode_opus_fixture(&path);
+
+        assert_eq!(
+            boosted.samples.len(),
+            baseline.samples.len(),
+            "output gain must not change the decoded length"
+        );
+        let expected_ratio = 10f32.powf(6.0 / 20.0);
+        let ratio = rms(&boosted.samples) / rms(&baseline.samples);
+        assert!(
+            (ratio - expected_ratio).abs() < expected_ratio * 0.05,
+            "a +6 dB OpusHead gain must scale the audio ~{expected_ratio}x, got {ratio}x"
+        );
     }
 }

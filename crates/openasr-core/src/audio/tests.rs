@@ -637,10 +637,17 @@ fn assert_decoded_opus_tone(prepared: &PreparedAudioInput) {
         .samples()
         .expect("in-process opus decode should hand back in-memory samples");
 
-    // 0.5 s at 16 kHz ~= 8000 samples; allow generous slack (0.25 s..0.75 s).
+    // 0.5 s of content: exactly 24,000 samples at the decoder's 48 kHz --
+    // pinned pre-resample by `opus_tone_decodes_to_the_exact_rfc7845_sample_
+    // count` -- resampled to ~8,000 at 16 kHz. The slack here is only the
+    // FFT resampler's group delay (~2%, shared by every format this module
+    // resamples, pulls the Ogg/WebM counts short) plus at most one packet
+    // (~120 ms, pushes the webm count long: its millisecond timecodes skip
+    // the Ogg end-trim); the *decode* length itself is exact and asserted
+    // at 48 kHz.
     let expected = 8_000_usize;
     assert!(
-        samples.len().abs_diff(expected) <= 4_000,
+        samples.len().abs_diff(expected) <= 1_000,
         "expected ~{expected} samples, got {}",
         samples.len()
     );

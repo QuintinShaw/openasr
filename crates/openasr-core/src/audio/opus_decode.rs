@@ -18,13 +18,18 @@
 //! - Pre-skip samples (48 kHz) are discarded from the start of the decoded
 //!   stream, exactly as the RFC requires of playback.
 //! - Output gain (Q7.8 dB) is applied inside libopus via `OPUS_SET_GAIN`.
-//! - Ogg end-trimming: the final packet's granule position (symphonia exposes
-//!   it as the packet timestamp when the track's time base is 1/48000) bounds
-//!   the total output length, so the encoder's final-packet padding is
-//!   removed. Containers whose timestamps are not 48 kHz sample counts (e.g.
-//!   mkv/webm's millisecond timecodes) skip this trim; at most one packet's
-//!   worth (~120 ms) of trailing padding remains, which the ASR pipeline
-//!   downstream does not care about.
+//! - Ogg end-trimming: symphonia's Ogg packet timestamp is the packet *start*
+//!   (back-derived from the page granule), so the stream's end position is
+//!   estimated as the final packet's start plus its TOC-derived duration.
+//!   For well-formed Ogg this equals the granule position exactly, removing
+//!   the encoder's final-packet padding; symphonia also folds codec delays
+//!   into those back-derived timestamps, which can overshoot the true
+//!   granule on some files -- so the trim is capped at one packet, and at
+//!   most one packet's worth (~120 ms) of trailing padding ever remains.
+//!   Containers whose timestamps are not 48 kHz sample counts (e.g.
+//!   mkv/webm's millisecond timecodes) skip this trim entirely and carry at
+//!   most that same ~120 ms of trailing padding -- the ASR pipeline
+//!   downstream does not care about either.
 //! - libopus always outputs 48 kHz; the 48k->16k resample happens in the
 //!   caller like any other decoded source rate.
 //!
@@ -152,6 +157,13 @@ impl OpusDecoderHandle {
     /// stereo) to `out`. Returns the number of decoded *frames* (per
     /// channel), or the kind of failure seen.
     fn decode_packet(&mut self, packet: &[u8], channels: u16, out: &mut Vec<f32>) -> PacketDecode {
+        // Zero-length packets are not decodable audio, and handing len==0 to
+        // opus_decode_float would trip libopus's packet-loss-concealment
+        // path and *synthesize* ~120 ms of extrapolated samples -- fabricated
+        // audio, the exact opposite of fail-closed. Skip them as corrupt.
+        if packet.is_empty() {
+            return PacketDecode::Corrupt;
+        }
         // A valid Opus packet is far smaller than i32::MAX (the codec caps a
         // packet at ~61 KB); anything larger is demuxer garbage and cannot be
         // a real packet.
@@ -267,12 +279,15 @@ impl OpusStream {
     }
 
     /// Decodes one packet, applying the pre-skip discard and the mono
-    /// downmix on the fly. `end_ts` is the packet's end timestamp from the
-    /// demuxer (symphonia's `Packet::ts`); `u64::MAX` is symphonia's
-    /// unknown-timestamp sentinel and is ignored. Returns `false` only on a
-    /// fatal decoder error, in which case the stream must fail closed;
-    /// corrupt individual packets are skipped.
-    pub(crate) fn push_packet(&mut self, packet: &[u8], end_ts: u64) -> bool {
+    /// downmix on the fly. `start_ts` is the packet's *start* timestamp from
+    /// the demuxer (symphonia's `Packet::ts`; for Ogg this is the page
+    /// granule back-derived per packet) and `packet_dur` its duration in the
+    /// same units -- the packet occupies `start_ts..start_ts + packet_dur`,
+    /// so their sum is the end position used for the RFC 7845 end-trim.
+    /// `u64::MAX` is symphonia's unknown-timestamp sentinel and is ignored.
+    /// Returns `false` only on a fatal decoder error, in which case the
+    /// stream must fail closed; corrupt individual packets are skipped.
+    pub(crate) fn push_packet(&mut self, packet: &[u8], start_ts: u64, packet_dur: u64) -> bool {
         self.scratch.clear();
         match self
             .decoder
@@ -286,10 +301,15 @@ impl OpusStream {
                 self.push_downmixed(dropped, frames);
             }
         }
-        // Granule positions accumulate across the stream, so the latest valid
-        // one seen is the final end position.
-        if self.timestamps_are_samples && end_ts != u64::MAX {
-            self.end_position = Some(end_ts);
+        // End positions grow monotonically through the stream, so the largest
+        // valid one seen is the final end position (for a well-formed Ogg
+        // stream, the last packet's start+dur equals the final page granule).
+        if self.timestamps_are_samples && start_ts != u64::MAX {
+            let candidate = start_ts.saturating_add(packet_dur);
+            self.end_position = Some(
+                self.end_position
+                    .map_or(candidate, |known| known.max(candidate)),
+            );
         }
         true
     }
@@ -315,15 +335,26 @@ impl OpusStream {
 
     /// Consumes the stream and returns the finished mono samples, applying
     /// the Ogg end-trim (RFC 7845 section 4.5): when the container reported
-    /// sample-accurate timestamps, the final granule position bounds the
-    /// output length and the encoder's final-packet padding is cut. `None`
-    /// when the stream decoded to nothing usable.
+    /// sample-accurate timestamps, the final end position (last packet's
+    /// start plus duration -- the granule, for well-formed Ogg) bounds the
+    /// output length and the encoder's final-packet padding is cut.
+    ///
+    /// The trim is capped at one packet: symphonia folds codec delays into
+    /// the timestamps it back-derives from the page granules, which can
+    /// overshoot the true granule on some files (leaving <= one packet of
+    /// padding in, which the ASR pipeline downstream does not care about);
+    /// capping guarantees an undershoot can never remove more than one
+    /// packet of real audio either way. `None` when the stream decoded to
+    /// nothing usable.
     pub(crate) fn finish(mut self) -> Option<OpusDecodedMono> {
-        if let Some(granule) = self.end_position
-            && let Some(expected) = granule.checked_sub(self.pre_skip_total)
-            && self.samples.len() as u64 > expected
+        if let Some(end) = self.end_position
+            && let Some(expected) = end.checked_sub(self.pre_skip_total)
+            && (self.samples.len() as u64) > expected
         {
-            self.samples.truncate(expected as usize);
+            let trimmed = self.samples.len() as u64 - expected;
+            if trimmed <= MAX_FRAME_SAMPLES_PER_CHANNEL as u64 {
+                self.samples.truncate(expected as usize);
+            }
         }
         if self.samples.is_empty() {
             return None;
@@ -395,8 +426,20 @@ mod tests {
         // Corrupt packets are skipped (recoverable), not fatal -- the stream
         // simply decodes to nothing and `finish` reports no usable audio
         // instead of panicking or fabricating samples.
-        assert!(stream.push_packet(b"not an opus packet at all", u64::MAX));
-        assert!(stream.push_packet(&[0xFF; 64], u64::MAX));
+        assert!(stream.push_packet(b"not an opus packet at all", u64::MAX, 0));
+        assert!(stream.push_packet(&[0xFF; 64], u64::MAX, 0));
+        assert!(stream.finish().is_none());
+    }
+
+    #[test]
+    fn empty_packets_are_skipped_not_concealed() {
+        let mut stream = OpusStream::new(Some(&opus_head_mono()), true)
+            .expect("decoder creation must succeed for a well-formed header");
+
+        // A zero-length packet must be skipped as corrupt: feeding len==0 to
+        // libopus would trigger its packet-loss-concealment path and append
+        // ~120 ms of fabricated audio to the output.
+        assert!(stream.push_packet(b"", u64::MAX, 0));
         assert!(stream.finish().is_none());
     }
 
