@@ -23,6 +23,17 @@ pub(crate) enum BuiltinDecodePolicyLongformPromptCarryMode {
 pub(crate) enum BuiltinDecodePolicyLongformProfile {
     Default,
     ConservativeSeq2SeqV1,
+    /// The family's dedicated executor ingests the FULL audio in a single
+    /// decode (it does its own internal 30s-window encoder chunking and folds
+    /// every chunk into ONE prompt with globally continuous time anchors --
+    /// see `moss_transcribe_diarize::executor`). The shared native longform
+    /// slicer must NOT run for such a family: slicing the audio into VAD
+    /// windows and decoding each independently would restart the model's time
+    /// anchors at zero per window (chunk-aligned timestamp resets) and defeat
+    /// the whole-audio design. `resolve_native_longform_policy_for_backend`
+    /// forces `LongFormMode::Off` for this profile, even for an explicit
+    /// longform request, because the executor never consults longform options.
+    SelfChunkingExecutorV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,6 +257,36 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         // same reasoning as firered-aed/firered-llm.
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
         longform_profile: BuiltinDecodePolicyLongformProfile::ConservativeSeq2SeqV1,
+        ctc_blank_token_id: None,
+    },
+    BuiltinDecodePolicyComponentDescriptor {
+        // Source of truth is `crate::arch` (same staging precedent as
+        // firered-aed above): moss-transcribe-diarize has no crate-root
+        // re-export.
+        decode_policy_id: crate::arch::MOSS_TD_DECODE_POLICY_ID,
+        execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
+        // eot (ChatML `<|im_end|>`) is supplied per-request via
+        // `BuiltinSeq2SeqDecodePolicyConfigInput.eot_token_id`; the audio-span
+        // placeholder/marker tokens are never emitted by the LLM itself (they
+        // only ever appear in the PROMPT, spliced in by the executor), so
+        // there is nothing else to strip -- Identity postprocess, same shape
+        // as firered-llm/mimo-asr.
+        seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
+        seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
+        // This family's executor folds arbitrarily long audio into ONE
+        // prompt/decode (chunked encoder concatenation with globally
+        // continuous time anchors, see `executor.rs`), so the shared native
+        // longform slicer must NOT run: slicing into VAD windows and decoding
+        // each independently restarts the time anchors at zero per window
+        // (chunk-aligned timestamp resets). `SelfChunkingExecutorV1` forces
+        // `LongFormMode::Off` so the full audio reaches the executor in a
+        // single decode. (This differs from `whisper`, whose 30s executor
+        // genuinely needs the native slicer for long audio, and from
+        // firered-llm/mimo-asr, whose executors cap at 30-40s per ChatML turn.)
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        longform_profile: BuiltinDecodePolicyLongformProfile::SelfChunkingExecutorV1,
         ctc_blank_token_id: None,
     },
     BuiltinDecodePolicyComponentDescriptor {
@@ -893,9 +934,9 @@ mod tests {
             checked += 1;
         }
         // cohere-transcribe + whisper + qwen3-asr + moonshine + firered-aed +
-        // firered-llm + mimo-asr.
+        // firered-llm + mimo-asr + moss-transcribe-diarize.
         assert_eq!(
-            checked, 7,
+            checked, 8,
             "expected exactly 7 greedy-seq2seq architectures to resolve"
         );
     }

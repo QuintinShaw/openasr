@@ -966,6 +966,27 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
                     )
                 })
         }
+        crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID => {
+            crate::models::moss_transcribe_diarize::runtime_contract::parse_encoder_metadata(&metadata)
+                .map(|_| ())
+                .and_then(|()| {
+                    crate::models::moss_transcribe_diarize::runtime_contract::parse_adaptor_metadata(
+                        &metadata,
+                    )
+                    .map(|_| ())
+                })
+                .and_then(|()| {
+                    crate::models::moss_transcribe_diarize::runtime_contract::parse_decoder_metadata(
+                        &metadata,
+                    )
+                    .map(|_| ())
+                })
+                .map_err(|error| {
+                    format!(
+                        "moss-transcribe-diarize runtime metadata contract validation failed: {error} ({RUNTIME_CONTRACT_OUTDATED_PACK_HINT})"
+                    )
+                })
+        }
         // No dedicated required-metadata parser for this architecture (yet):
         // stay Ok() here, same as before this check existed. The executor
         // still fails closed at first load if the pack is incomplete.

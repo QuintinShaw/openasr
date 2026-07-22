@@ -73,6 +73,7 @@ pub(crate) enum DedicatedRuntimeTensorContractFamily {
     FireRedAed,
     FireRedLlm,
     MimoAsr,
+    MossTd,
 }
 
 impl DedicatedRuntimeTensorContractFamily {
@@ -87,6 +88,7 @@ impl DedicatedRuntimeTensorContractFamily {
             Self::FireRedAed => "firered-aed",
             Self::FireRedLlm => "firered-llm",
             Self::MimoAsr => "mimo-asr",
+            Self::MossTd => "moss-transcribe-diarize",
         }
     }
 }
@@ -256,6 +258,9 @@ fn dedicated_runtime_tensor_contract_family(
         }
         crate::arch::MIMO_ASR_RUNTIME_TENSOR_CONTRACT_ID => {
             Some(DedicatedRuntimeTensorContractFamily::MimoAsr)
+        }
+        crate::arch::MOSS_TD_RUNTIME_TENSOR_CONTRACT_ID => {
+            Some(DedicatedRuntimeTensorContractFamily::MossTd)
         }
         _ => None,
     }
