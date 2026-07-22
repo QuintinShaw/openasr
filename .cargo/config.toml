@@ -8,7 +8,8 @@
 # Scope: this applies to processes CARGO spawns (cargo test / nextest / cargo
 # run). The shipped release binary (run directly, and what the bench-suite
 # times) is UNAFFECTED and still defaults to Metal-when-available. CI runs on
-# Linux ARM64 (no Metal) so it already used CPU — this just matches it locally.
+# Linux x86_64 (`ubuntu-latest`, no Metal) so it already used CPU — this just
+# matches it locally.
 [env]
 OPENASR_GGML_BACKEND = { value = "cpu", force = false }
 # ts-rs (realtime wire-type TS codegen, see crates/openasr-core/tests/realtime_wire_bindings.rs)

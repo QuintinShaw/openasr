@@ -812,6 +812,73 @@ fn mimo_asr_golden_diff_longform_cli_transcribe_matches_reference_decode() {
     );
 }
 
+// firered-aed longform golden: firered-aed's other golden_diff cases
+// (`firered_aed::executor::tests`) call the low-level `FireRedAedGgmlExecutor`
+// directly on the single-utterance `jfk.wav`/`zh_sample.wav` fixtures and
+// never exercise the longform/auto-VAD slicing orchestrator, so unlike those,
+// this one drives the real `openasr` binary on `fixtures/longform_en_zh.wav`
+// (same already-committed ~69s, 5-clip EN/ZH/EN/ZH/EN fixture the
+// firered-llm and mimo-asr longform goldens use) to pin the actual
+// user-facing multi-slice path. firered-aed's `GlobalQuadratic` encoder caps
+// the longform chunk length to the shared 30s default (see
+// `encoder_attention_span_caps_every_builtin_architecture_on_the_production_path`
+// in `native_transcribe.rs`), so this 69s input forces the auto energy-VAD
+// slicer to split -- confirmed 3 chunks via `--format verbose_json`'s
+// `longform.chunk_count`. Pinned against `OPENASR_GGML_BACKEND=cpu`. The two
+// chunk seams show up as the golden's two textual artifacts: a duplicated "我"
+// at the first seam (VAD overlap re-transcribing the boundary word) and a
+// missing space between "COUNTRY" and "今天" / "ANDSO" run together at chunk
+// boundaries where the assembler's join lands between two tokens with no SPM
+// space marker between them -- both present in the real committed pack's
+// output, not smoothed over.
+fn firered_aed_dev_pack_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/firered-out/firered-aed-l-fp16.oasr")
+}
+
+const GOLDEN_FIRERED_AED_LONGFORM_EN_ZH_TEXT: &str = concat!(
+    "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO ",
+    "FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 我通常会读书或者看一部电影放松一下 ",
+    "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO ",
+    "FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗 周末的时候我通常会读书或者看一部电影放松一下 ",
+    "ANDSO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR ",
+    "YOUR COUNTRY",
+);
+
+#[test]
+#[ignore = "requires the private dev-only firered-aed-l-fp16.oasr pack; runs the real \
+            longform-chunked CLI transcribe path on a ~69s fixture, OPENASR_GGML_BACKEND=cpu"]
+fn firered_aed_golden_diff_longform_cli_transcribe_matches_reference_decode() {
+    let pack_path = firered_aed_dev_pack_path();
+    if !pack_path.exists() {
+        eprintln!("skipping: {} not present", pack_path.display());
+        return;
+    }
+    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/longform_en_zh.wav")
+        .canonicalize()
+        .expect("longform_en_zh.wav fixture must exist");
+
+    let assert = openasr()
+        .env("OPENASR_GGML_BACKEND", "cpu")
+        .args([
+            "transcribe",
+            &input.display().to_string(),
+            "--model-pack",
+            &pack_path.display().to_string(),
+            "--format",
+            "text",
+        ])
+        .assert()
+        .success();
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    eprintln!("firered-aed longform CLI transcript: {output:?}");
+    assert_eq!(
+        output.trim_end(),
+        GOLDEN_FIRERED_AED_LONGFORM_EN_ZH_TEXT,
+        "unexpected longform CLI transcript"
+    );
+}
+
 #[test]
 fn transcribe_native_requires_local_model_pack_path() {
     let input = temp_input_wav();
