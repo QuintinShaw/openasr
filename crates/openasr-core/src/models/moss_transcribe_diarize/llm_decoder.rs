@@ -331,11 +331,14 @@ impl MossTdDecoderRuntime {
         let hidden = self.gather_token_embedding(token_id)?;
         // `run_step_auto` transparently reuses the persistent decode graph on
         // the Metal/single-GPU lane (avoiding the per-token graph rebuild whose
-        // growing-KV re-upload exhausts the Metal command buffer on long
-        // decodes); CPU stays on the per-token `run_step` rebuild, byte-
-        // identical to before. The host KV write below keeps the host cache in
-        // sync for the CPU path and is a harmless no-op-equivalent on the
-        // reuse path (whose KV lives resident in the decode graph's arena).
+        // growing-KV re-upload and re-allocation is what exhausts Metal's
+        // wired memory over a long decode); CPU stays on the per-token
+        // `run_step` rebuild, byte-identical to before. The host KV write
+        // below keeps the host cache in sync for the CPU (and any non-reuse)
+        // path; on the reuse path `step.layer_kv` comes back empty by design
+        // (see `write_layer_kv`'s doc) and the write below is a real no-op,
+        // not merely a harmless-looking one -- `write_layer_kv` must treat an
+        // empty slice as intentional rather than a count-mismatch error.
         let step = self
             .whole_decoder
             .run_step_auto(&hidden, cache_position, layer_kv_caches, MOSS_TD_ROPE_THETA)
@@ -393,6 +396,22 @@ fn write_layer_kv(
     kv_row_width: usize,
     layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
 ) -> Result<(), MossTdDecoderError> {
+    // `run_step_reused` (the Metal/single-GPU decode-graph-reuse path) returns
+    // an intentionally EMPTY `layer_kv`: its K/V lives resident in the
+    // persistent decode graph's device-side arena, never read back to the
+    // host, so there is nothing to mirror into `layer_kv_caches` -- exactly
+    // mirroring qwen3-asr's own decode step, whose `step.layer_kv.iter()`
+    // loop (`qwen::ggml_executor`'s `decode_step`) simply iterates zero times
+    // on that path instead of asserting a count. Treating empty as a no-op
+    // here (rather than failing the strict count check below) is what makes
+    // `decode_step`'s call into this function byte-for-byte the same
+    // reuse-tolerant contract; every OTHER caller (prefill, and decode's own
+    // non-reuse `run_step` rebuild) always produces one entry per layer, so a
+    // non-empty-but-wrong count still fails closed instead of silently
+    // dropping/misaligning KV writes.
+    if layer_kv.is_empty() {
+        return Ok(());
+    }
     if layer_kv.len() != layer_kv_caches.len() {
         return Err(MossTdDecoderError::KvCacheFailed {
             reason: "layer-KV count mismatch".to_string(),

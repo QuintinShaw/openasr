@@ -1631,22 +1631,31 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         executor_component_id: MOSS_TD_EXECUTOR_COMPONENT_ID,
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        // Auto is pinned OFF Metal for this family until two Metal-specific
-        // defects are fixed (both measured on an M1, CPU parity confirmed; each
-        // is its own follow-up, out of scope for this landing):
+        // Auto is pinned OFF Metal for this family until its Metal-specific
+        // defect is fixed (measured on an M1, CPU parity confirmed; its own
+        // follow-up, out of scope for this landing):
         //   1. Encoder numeric divergence: the Whisper encoder's deep layers
         //      decorrelate on Metal (final-layer cosine ~0.20 vs the fp32 CPU
         //      reference, which matches), collapsing decoding to an empty
         //      `[..][S01][..]` shell. CPU produces the correct transcript.
-        //   2. Memory blow-up: the per-token decode rebuilds the whole 28-layer
-        //      ggml graph each step; on Metal the wired working set exhausts a
-        //      16 GB machine, while the same run peaks ~2.8 GB on CPU. (The KV
-        //      over-allocation half of this is already fixed via
-        //      `runtime_contract::moss_td_kv_cache_positions`; the remaining
-        //      per-step graph/wired behavior is Metal-only and still open.)
+        // A second defect that used to live here -- the per-token decode
+        // rebuilding the whole 28-layer ggml graph each step and exhausting
+        // Metal's wired working set -- is fixed: `llm_decoder`'s decode step
+        // already called the shared executor's `run_step_auto`, which reuses
+        // a persistent decode graph on Metal (`supports_graph_reuse`), but
+        // the KV-cache write-back after it unconditionally asserted a
+        // full per-layer K/V count, which the reuse path legitimately never
+        // produces (its K/V stays resident in the decode graph's own arena),
+        // so every Metal decode step failed closed on that mismatch before
+        // the reuse graph could actually amortize anything. `write_layer_kv`
+        // now treats an empty layer-KV slice as the reuse path's no-op
+        // contract instead of a count error (see its doc comment) --
+        // measured end-to-end on the real dev pack: decode now builds the
+        // reused graph once and revisits it every subsequent token instead of
+        // rebuilding, with no other per-step allocation growth.
         // `ExceptMetal` only steers Auto to CPU; an explicit
-        // `execution_target=accelerated` still gets Metal (and both defects),
-        // by design. Revisit -> `AllBackends` once 1 and 2 land.
+        // `execution_target=accelerated` still gets Metal (and the remaining
+        // encoder defect), by design. Revisit -> `AllBackends` once 1 lands.
         auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
         // The model is trained to emit `[S01]`/`[S02]`/... speaker labels
         // directly in its transcript text (see `decode_prompt`'s fixed
