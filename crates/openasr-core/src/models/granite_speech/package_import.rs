@@ -39,11 +39,13 @@ use crate::ggml_runtime::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, read_gguf_tensor_index,
     write_gguf_file_v0,
 };
+use crate::models::ggml_family_adapter::GGML_TOKENIZER_ID_KEY;
 use crate::models::local_source_import::{
     LocalSourceImportError, SafetensorsFile, decode_safetensors_payload_as_f32, encode_f16_bits_le,
     read_source_json_file, validate_error, validate_output_pack_extension,
 };
 use crate::models::oasr_metadata::{
+    OASR_METADATA_KEY_AUDIO_FRONTEND, OASR_METADATA_KEY_DECODE_POLICY,
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, insert_metadata,
     insert_metadata_string_array,
@@ -51,7 +53,10 @@ use crate::models::oasr_metadata::{
 use crate::models::pack_quant::PackQuant;
 use crate::nn::half::f32_to_f16_bits;
 
-use crate::arch::{GRANITE_SPEECH_GGML_ARCHITECTURE_ID, GRANITE_SPEECH_MODEL_FAMILY};
+use crate::arch::{
+    GRANITE_SPEECH_AUDIO_FRONTEND_ID, GRANITE_SPEECH_DECODE_POLICY_ID,
+    GRANITE_SPEECH_GGML_ARCHITECTURE_ID, GRANITE_SPEECH_MODEL_FAMILY, GRANITE_SPEECH_TOKENIZER_ID,
+};
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_INDEX_JSON: &str = "model.safetensors.index.json";
@@ -368,6 +373,21 @@ fn granite_speech_runtime_gguf_metadata(
         GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
     );
     insert_metadata(&mut metadata, "openasr.model.id", request.model_id.as_str());
+    insert_metadata(
+        &mut metadata,
+        OASR_METADATA_KEY_AUDIO_FRONTEND,
+        GRANITE_SPEECH_AUDIO_FRONTEND_ID,
+    );
+    insert_metadata(
+        &mut metadata,
+        OASR_METADATA_KEY_DECODE_POLICY,
+        GRANITE_SPEECH_DECODE_POLICY_ID,
+    );
+    insert_metadata(
+        &mut metadata,
+        GGML_TOKENIZER_ID_KEY,
+        GRANITE_SPEECH_TOKENIZER_ID,
+    );
     insert_metadata(
         &mut metadata,
         "granite_speech.audio_token_index",
