@@ -598,4 +598,56 @@ mod tests {
             "expected a PE-capacity typed error, got: {message}"
         );
     }
+
+    /// Regression for a REJECTed earlier version of this fix that made this
+    /// case fail closed: `segment_mode=off` (a real, user-reachable CLI/server
+    /// path -- `native_segment_cli.rs`'s `NativeSegmentMode::Off` /
+    /// `transcription.rs`'s equivalent) sends the WHOLE audio window straight
+    /// to the executor with no longform chunking at all, so a >32s clip
+    /// legitimately presents an encoder frame count past this pack's
+    /// chunk-cap cross-KV capacity while still being well under its
+    /// PE-table ceiling. Before this fix (still exact-per-call allocation)
+    /// this simply worked; the cross-KV capacity refactor must not turn that
+    /// into a hard failure -- growing the cache to fit must produce the
+    /// EXACT same transcript as `origin/main` (verified by hand for this
+    /// specific pack/clip; see the PR description for the recorded baseline).
+    #[test]
+    #[ignore = "requires the private dev-only firered-aed-l-v2-q4_k.oasr pack; see module docs"]
+    fn mode_off_single_window_past_chunk_cap_grows_and_matches_baseline() {
+        let pack_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/firered-out/firered-aed-l-v2-q4_k.oasr");
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return;
+        }
+        let wav_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/mode-off-regression/longform_en_zh_45s.wav");
+        if !wav_path.exists() {
+            eprintln!("skipping: {} not present", wav_path.display());
+            return;
+        }
+        // Recorded on `origin/main` (pre-capacity-refactor, exact-per-call
+        // cross-KV allocation) with the same pack/clip via a temporary
+        // baseline test, not committed.
+        const BASELINE_TEXT: &str = "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下 AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭晚上我们还计划去一家新开的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下 AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园";
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            wav_path,
+            "firered-aed mode=off grow test",
+            "firered-aed mode=off grow test",
+        )
+        .expect("load wav fixture");
+        let request = GgmlAsrExecutionRequest {
+            runtime_source_path: pack_path,
+            runtime_source_preflight: None,
+            selected_family: firered_aed_runtime_descriptor_v1(),
+            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            request_options: Default::default(),
+            backend_preference: GgmlAsrBackendPreference::CpuOnly,
+        };
+        let executor = FireRedAedGgmlExecutor;
+        let result = executor
+            .execute(&request)
+            .expect("mode=off single-window transcribe must succeed, not fail closed");
+        assert_eq!(result.transcription.text, BASELINE_TEXT);
+    }
 }

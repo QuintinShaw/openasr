@@ -1188,4 +1188,51 @@ mod tests {
             );
         });
     }
+
+    /// Regression for a REJECTed earlier version of this fix that made this
+    /// case fail closed: `segment_mode=off` (a real, user-reachable CLI/server
+    /// path) sends the WHOLE audio window straight to the executor with no
+    /// longform chunking at all, so a >32s clip legitimately presents an
+    /// encoder frame count past this pack's chunk-cap cross-KV capacity.
+    /// Before this fix (still exact-per-call allocation) this simply worked;
+    /// the cross-KV capacity refactor must not turn that into a hard failure
+    /// -- growing the cache to fit must produce the EXACT same transcript as
+    /// `origin/main` (verified by hand for this specific pack/clip; see the
+    /// PR description for the recorded baseline).
+    #[test]
+    #[ignore = "requires the private dev-only cohere-transcribe-03-2026-q4_k.oasr pack; see module docs"]
+    fn mode_off_single_window_past_chunk_cap_grows_and_matches_baseline() {
+        let pack_path = cohere_dev_pack_path();
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return;
+        }
+        let wav_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/mode-off-regression/longform_en_zh_45s.wav");
+        if !wav_path.exists() {
+            eprintln!("skipping: {} not present", wav_path.display());
+            return;
+        }
+        // Recorded on `origin/main` (pre-capacity-refactor, exact-per-call
+        // cross-KV allocation) with the same pack/clip via a temporary
+        // baseline test, not committed.
+        const BASELINE_TEXT: &str = "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country. And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country. And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.";
+        with_forced_cpu_backend_for_test(|| {
+            let executor = CohereTranscribeGgmlExecutor::default();
+            let mut request = runtime_ready_request(pack_path);
+            request.prepared_audio = GgmlAsrPreparedAudio::mono_16khz(
+                crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+                    wav_path,
+                    "cohere mode=off grow test",
+                    "cohere mode=off grow test",
+                )
+                .expect("load wav fixture"),
+            );
+            request.backend_preference = GgmlAsrBackendPreference::CpuOnly;
+            let result = executor
+                .execute(&request)
+                .expect("mode=off single-window transcribe must succeed, not fail closed");
+            assert_eq!(result.transcription.text, BASELINE_TEXT);
+        });
+    }
 }

@@ -458,10 +458,22 @@ pub(crate) struct CohereDecoderGraphRuntime {
     cross_layers: Vec<CohereDecoderCrossCacheLayerRuntime>,
     self_kv_layers: Vec<CohereDecoderSelfKvLayerRuntime>,
     /// Allocated column count of every `cross_layers[i].{key,value}` tensor
-    /// (see [`cohere_decoder_cross_capacity_frames`]); fixed for this
-    /// runtime's lifetime. Equals the exact per-utterance frame count on the
-    /// batched (`n_seq > 1`) serve-batch path (unchanged pre-existing sizing).
+    /// (see [`cohere_decoder_cross_capacity_frames`]). Grows (never shrinks)
+    /// via [`Self::grow_cross_capacity`] when a chunk exceeds it. Equals the
+    /// exact per-utterance frame count on the batched (`n_seq > 1`)
+    /// serve-batch path (unchanged pre-existing sizing; never observed to
+    /// grow there in practice since a cached batched runtime's jobs are
+    /// already grouped by equal frame count).
     cross_capacity_frames: usize,
+    /// Owned clone of the decoder weights, kept around ONLY so
+    /// [`Self::grow_cross_capacity`] can rebuild the arena (which re-uploads
+    /// every weight tensor into it, not just the cross-KV cache) without the
+    /// caller re-supplying them. Cheap to clone: the pack-native tensors are
+    /// `Arc<Mmap>`-backed (see `CohereOwnedGgmlWeightPayload`); only tensors
+    /// requiring host-side dequantization at load time carry an eagerly
+    /// materialized `Vec<f32>`, and even those only get cloned on a (rare)
+    /// grow, not per chunk.
+    decoder_weights: CohereTranscribeDecoderWeights,
     /// The active cross-frame-count [`Self::reuse`]'s persistent graph was
     /// last built for (0 if never built). `compute_reused_incremental_step_logits`
     /// compares this against the current `cross_layers[0].frame_count` and
@@ -542,12 +554,13 @@ struct CohereDecoderCrossCacheLayerRuntime {
 }
 
 /// Extra headroom (beyond the architecture's declared safe chunk length)
-/// folded into the single-sequence cross-KV capacity below, purely to absorb
-/// chunk-boundary rounding in an upstream caller (VAD snapping, sample-count
-/// truncation) -- never load-bearing for correctness, since
-/// [`CohereDecoderGraphRuntime::populate_cross_attention_cache_slot`] still
-/// fails closed (never silently truncates or overruns the arena) if a chunk
-/// ever arrives past the resulting capacity.
+/// folded into the single-sequence cross-KV capacity below, purely to reduce
+/// how often a chunk-boundary rounding in an upstream caller (VAD snapping,
+/// sample-count truncation) triggers
+/// [`CohereDecoderGraphRuntime::grow_cross_capacity`] -- never load-bearing
+/// for correctness: a chunk past this capacity still grows the cache to fit
+/// rather than silently truncating, overrunning the arena, or being
+/// rejected.
 const COHERE_DECODER_CROSS_CAPACITY_MARGIN_SECONDS: f32 = 2.0;
 
 /// Predict the pre-subsampling mel frame count for `duration_seconds` of this
@@ -692,294 +705,371 @@ impl CohereDecoderGraphRuntime {
                 source,
             }
         })?;
-        let mut arena = runner
-            .start_static_tensor_arena(config.context_bytes)
-            .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
-                step: "static_tensor_arena",
-                source,
-            })?;
-
-        let token_embedding =
-            new_embedding_tensor_in_arena(&arena, &decoder_weights.token_embedding, "dec_emb")?;
-        let positional_embedding = new_embedding_tensor_in_arena(
-            &arena,
-            &decoder_weights.positional_embedding,
-            "dec_pos",
+        let arena_state = build_cohere_decoder_arena_state(
+            &runner,
+            persistent_graph_context_bytes,
+            decoder_weights,
+            metadata,
+            cross_hidden_size,
+            cross_alloc_frames,
+            n_seq,
         )?;
-        let emb_ln_weight =
-            new_vector_tensor_in_arena(&arena, decoder_weights.emb_ln_weight.len, "dec_emb_ln_w")?;
-        let emb_ln_bias =
-            new_vector_tensor_in_arena(&arena, decoder_weights.emb_ln_bias.len, "dec_emb_ln_b")?;
-        let out_ln_weight =
-            new_vector_tensor_in_arena(&arena, decoder_weights.out_ln_weight.len, "dec_out_ln_w")?;
-        let out_ln_bias =
-            new_vector_tensor_in_arena(&arena, decoder_weights.out_ln_bias.len, "dec_out_ln_b")?;
-        let output_head_weight = new_projection_tensor_in_arena(
-            &arena,
-            &decoder_weights.output_head_weight,
-            "dec_head",
-        )?;
-        let output_head_bias =
-            new_vector_tensor_in_arena(&arena, decoder_weights.output_head_bias.len, "dec_head_b")?;
-
-        let mut layers = Vec::with_capacity(decoder_weights.layers.len());
-        let mut cross_layers = Vec::with_capacity(decoder_weights.layers.len());
-        let mut self_kv_layers = Vec::with_capacity(decoder_weights.layers.len());
-        for layer in &decoder_weights.layers {
-            let runtime = CohereDecoderLayerRuntime {
-                attn_ln_weight: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.attn_ln_weight.len,
-                    "dec_attn_ln_w",
-                )?,
-                attn_ln_bias: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.attn_ln_bias.len,
-                    "dec_attn_ln_b",
-                )?,
-                attn_q_weight: new_projection_tensor_in_arena(
-                    &arena,
-                    &layer.attn_q_weight,
-                    "dec_attn_q_w",
-                )?,
-                attn_q_bias: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.attn_q_bias.len,
-                    "dec_attn_q_b",
-                )?,
-                attn_k_weight: new_projection_tensor_in_arena(
-                    &arena,
-                    &layer.attn_k_weight,
-                    "dec_attn_k_w",
-                )?,
-                attn_k_bias: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.attn_k_bias.len,
-                    "dec_attn_k_b",
-                )?,
-                attn_v_weight: new_projection_tensor_in_arena(
-                    &arena,
-                    &layer.attn_v_weight,
-                    "dec_attn_v_w",
-                )?,
-                attn_v_bias: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.attn_v_bias.len,
-                    "dec_attn_v_b",
-                )?,
-                attn_o_weight: new_projection_tensor_in_arena(
-                    &arena,
-                    &layer.attn_o_weight,
-                    "dec_attn_o_w",
-                )?,
-                attn_o_bias: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.attn_o_bias.len,
-                    "dec_attn_o_b",
-                )?,
-                cross_ln_weight: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.cross_ln_weight.len,
-                    "dec_cross_ln_w",
-                )?,
-                cross_ln_bias: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.cross_ln_bias.len,
-                    "dec_cross_ln_b",
-                )?,
-                cross_k_weight: new_projection_tensor_in_arena(
-                    &arena,
-                    &layer.cross_k_weight,
-                    "dec_cross_k_w",
-                )?,
-                cross_k_bias: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.cross_k_bias.len,
-                    "dec_cross_k_b",
-                )?,
-                cross_v_weight: new_projection_tensor_in_arena(
-                    &arena,
-                    &layer.cross_v_weight,
-                    "dec_cross_v_w",
-                )?,
-                cross_v_bias: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.cross_v_bias.len,
-                    "dec_cross_v_b",
-                )?,
-                cross_q_weight: new_projection_tensor_in_arena(
-                    &arena,
-                    &layer.cross_q_weight,
-                    "dec_cross_q_w",
-                )?,
-                cross_q_bias: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.cross_q_bias.len,
-                    "dec_cross_q_b",
-                )?,
-                cross_o_weight: new_projection_tensor_in_arena(
-                    &arena,
-                    &layer.cross_o_weight,
-                    "dec_cross_o_w",
-                )?,
-                cross_o_bias: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.cross_o_bias.len,
-                    "dec_cross_o_b",
-                )?,
-                ffn_ln_weight: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.ffn_ln_weight.len,
-                    "dec_ffn_ln_w",
-                )?,
-                ffn_ln_bias: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.ffn_ln_bias.len,
-                    "dec_ffn_ln_b",
-                )?,
-                ffn_up_weight: new_projection_tensor_in_arena(
-                    &arena,
-                    &layer.ffn_up_weight,
-                    "dec_ffn_up_w",
-                )?,
-                ffn_up_bias: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.ffn_up_bias.len,
-                    "dec_ffn_up_b",
-                )?,
-                ffn_down_weight: new_projection_tensor_in_arena(
-                    &arena,
-                    &layer.ffn_down_weight,
-                    "dec_ffn_down_w",
-                )?,
-                ffn_down_bias: new_vector_tensor_in_arena(
-                    &arena,
-                    layer.ffn_down_bias.len,
-                    "dec_ffn_down_b",
-                )?,
-            };
-            layers.push(runtime);
-            cross_layers.push(CohereDecoderCrossCacheLayerRuntime {
-                key: new_persistent_cross_cache_tensor_in_arena(
-                    &arena,
-                    cross_hidden_size,
-                    cross_alloc_frames,
-                    n_seq,
-                    "dec_cross_k_cache",
-                )?,
-                value: new_persistent_cross_cache_tensor_in_arena(
-                    &arena,
-                    cross_hidden_size,
-                    cross_alloc_frames,
-                    n_seq,
-                    "dec_cross_v_cache",
-                )?,
-                // Placeholder until the first `populate_cross_attention_cache[_slot]`
-                // call sets this to the actual current-utterance frame count;
-                // never read before that (mirrors firered-aed's `0`-init, but
-                // this arm keeps parity with the pre-existing invariant that
-                // `frame_count` is always `<=` the tensor's real column count).
-                frame_count: cross_alloc_frames,
-                hidden_size: cross_hidden_size,
-            });
-            self_kv_layers.push(CohereDecoderSelfKvLayerRuntime {
-                key: new_persistent_self_kv_tensor_in_arena(
-                    &arena,
-                    metadata.decoder_head_dim,
-                    metadata.decoder_max_context,
-                    metadata.decoder_heads,
-                    n_seq,
-                    "dec_self_k_cache",
-                )?,
-                value: new_persistent_self_kv_tensor_in_arena(
-                    &arena,
-                    metadata.decoder_head_dim,
-                    metadata.decoder_max_context,
-                    metadata.decoder_heads,
-                    n_seq,
-                    "dec_self_v_cache",
-                )?,
-                max_positions: metadata.decoder_max_context,
-            });
-        }
-
-        upload_embedding_to_arena(
-            &mut arena,
-            token_embedding,
-            &decoder_weights.token_embedding,
-            "dec_emb",
-        )?;
-        upload_embedding_to_arena(
-            &mut arena,
-            positional_embedding,
-            &decoder_weights.positional_embedding,
-            "dec_pos",
-        )?;
-        upload_vector_to_arena(
-            &mut arena,
-            emb_ln_weight,
-            &decoder_weights.emb_ln_weight,
-            "dec_emb_ln_w",
-        )?;
-        upload_vector_to_arena(
-            &mut arena,
-            emb_ln_bias,
-            &decoder_weights.emb_ln_bias,
-            "dec_emb_ln_b",
-        )?;
-        upload_vector_to_arena(
-            &mut arena,
-            out_ln_weight,
-            &decoder_weights.out_ln_weight,
-            "dec_out_ln_w",
-        )?;
-        upload_vector_to_arena(
-            &mut arena,
-            out_ln_bias,
-            &decoder_weights.out_ln_bias,
-            "dec_out_ln_b",
-        )?;
-        upload_projection_to_arena(
-            &mut arena,
-            output_head_weight,
-            &decoder_weights.output_head_weight,
-            "dec_head",
-        )?;
-        upload_vector_to_arena(
-            &mut arena,
-            output_head_bias,
-            &decoder_weights.output_head_bias,
-            "dec_head_b",
-        )?;
-        for (layer_idx, (runtime, layer)) in layers.iter().zip(&decoder_weights.layers).enumerate()
-        {
-            upload_decoder_layer_to_arena(&mut arena, runtime, layer, layer_idx)?;
-        }
 
         Ok(Self {
             reuse: None,
             metadata,
             runner,
             persistent_graph_context_bytes,
-            arena,
-            token_embedding,
-            positional_embedding,
-            emb_ln_weight,
-            emb_ln_bias,
-            out_ln_weight,
-            out_ln_bias,
-            output_head_weight,
-            output_head_bias,
-            layers,
-            cross_layers,
-            self_kv_layers,
+            arena: arena_state.arena,
+            token_embedding: arena_state.token_embedding,
+            positional_embedding: arena_state.positional_embedding,
+            emb_ln_weight: arena_state.emb_ln_weight,
+            emb_ln_bias: arena_state.emb_ln_bias,
+            out_ln_weight: arena_state.out_ln_weight,
+            out_ln_bias: arena_state.out_ln_bias,
+            output_head_weight: arena_state.output_head_weight,
+            output_head_bias: arena_state.output_head_bias,
+            layers: arena_state.layers,
+            cross_layers: arena_state.cross_layers,
+            self_kv_layers: arena_state.self_kv_layers,
             cross_capacity_frames: cross_alloc_frames,
+            decoder_weights: decoder_weights.clone(),
             reuse_cross_frame_count: 0,
             cached_positions: 0,
             n_seq,
         })
     }
 
+    /// Grow-to-fit: rebuilds the ENTIRE arena (every decoder weight tensor
+    /// plus cross-KV/self-KV caches -- this pack's weights are uploaded
+    /// directly into the arena, unlike firered-aed's, so there is no
+    /// weights-only-arena split to exploit here) at
+    /// `max(needed_frames, 2x current capacity)`. Only reachable when a
+    /// caller presents a chunk past `cross_capacity_frames` -- normal
+    /// VAD/longform chunks never do, since the shared longform safety policy
+    /// already caps every chunk at (or under) the capacity this runtime was
+    /// built with; this exists for callers that legitimately bypass longform
+    /// with a larger single window (e.g. `segment_mode=off`). Drops
+    /// [`Self::reuse`] unconditionally: the persistent GPU reuse graph holds
+    /// raw pointers into the OLD arena's tensors, which this call is about to
+    /// free -- `reuse_cross_frame_count`'s mismatch-triggered rebuild alone
+    /// is not enough here (that logic assumes the arena itself is stable and
+    /// only the active frame count within it moved), so the next Metal decode
+    /// call rebuilds a fresh reuse graph against the new arena instead of
+    /// dereferencing freed memory.
+    fn grow_cross_capacity(&mut self, needed_frames: usize) -> Result<(), CohereDecoderGraphError> {
+        let new_capacity = needed_frames.max(self.cross_capacity_frames.saturating_mul(2));
+        let cross_hidden_size = self.metadata.decoder_d_model;
+        let arena_state = build_cohere_decoder_arena_state(
+            &self.runner,
+            self.persistent_graph_context_bytes,
+            &self.decoder_weights,
+            self.metadata,
+            cross_hidden_size,
+            new_capacity,
+            self.n_seq,
+        )?;
+        self.reuse = None;
+        self.reuse_cross_frame_count = 0;
+        self.arena = arena_state.arena;
+        self.token_embedding = arena_state.token_embedding;
+        self.positional_embedding = arena_state.positional_embedding;
+        self.emb_ln_weight = arena_state.emb_ln_weight;
+        self.emb_ln_bias = arena_state.emb_ln_bias;
+        self.out_ln_weight = arena_state.out_ln_weight;
+        self.out_ln_bias = arena_state.out_ln_bias;
+        self.output_head_weight = arena_state.output_head_weight;
+        self.output_head_bias = arena_state.output_head_bias;
+        self.layers = arena_state.layers;
+        self.cross_layers = arena_state.cross_layers;
+        self.self_kv_layers = arena_state.self_kv_layers;
+        self.cross_capacity_frames = new_capacity;
+        Ok(())
+    }
+}
+
+/// Bundle of everything [`build_cohere_decoder_arena_state`] allocates
+/// directly in a fresh arena: every decoder weight tensor plus the
+/// cross-KV/self-KV caches. Factored out of
+/// [`CohereDecoderGraphRuntime::new_with_n_seq`] so
+/// [`CohereDecoderGraphRuntime::grow_cross_capacity`] can rebuild the same
+/// state at a larger cross-KV capacity without duplicating this ~250-line
+/// tensor-declaration + upload sequence.
+struct CohereDecoderArenaState {
+    arena: GgmlStaticTensorArena,
+    token_embedding: GgmlStaticTensor,
+    positional_embedding: GgmlStaticTensor,
+    emb_ln_weight: GgmlStaticTensor,
+    emb_ln_bias: GgmlStaticTensor,
+    out_ln_weight: GgmlStaticTensor,
+    out_ln_bias: GgmlStaticTensor,
+    output_head_weight: GgmlStaticTensor,
+    output_head_bias: GgmlStaticTensor,
+    layers: Vec<CohereDecoderLayerRuntime>,
+    cross_layers: Vec<CohereDecoderCrossCacheLayerRuntime>,
+    self_kv_layers: Vec<CohereDecoderSelfKvLayerRuntime>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_cohere_decoder_arena_state(
+    runner: &GgmlCpuGraphRunner,
+    context_bytes: usize,
+    decoder_weights: &CohereTranscribeDecoderWeights,
+    metadata: CohereTranscribeExecutionMetadata,
+    cross_hidden_size: usize,
+    cross_alloc_frames: usize,
+    n_seq: usize,
+) -> Result<CohereDecoderArenaState, CohereDecoderGraphError> {
+    let mut arena = runner
+        .start_static_tensor_arena(context_bytes)
+        .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
+            step: "static_tensor_arena",
+            source,
+        })?;
+
+    let token_embedding =
+        new_embedding_tensor_in_arena(&arena, &decoder_weights.token_embedding, "dec_emb")?;
+    let positional_embedding =
+        new_embedding_tensor_in_arena(&arena, &decoder_weights.positional_embedding, "dec_pos")?;
+    let emb_ln_weight =
+        new_vector_tensor_in_arena(&arena, decoder_weights.emb_ln_weight.len, "dec_emb_ln_w")?;
+    let emb_ln_bias =
+        new_vector_tensor_in_arena(&arena, decoder_weights.emb_ln_bias.len, "dec_emb_ln_b")?;
+    let out_ln_weight =
+        new_vector_tensor_in_arena(&arena, decoder_weights.out_ln_weight.len, "dec_out_ln_w")?;
+    let out_ln_bias =
+        new_vector_tensor_in_arena(&arena, decoder_weights.out_ln_bias.len, "dec_out_ln_b")?;
+    let output_head_weight =
+        new_projection_tensor_in_arena(&arena, &decoder_weights.output_head_weight, "dec_head")?;
+    let output_head_bias =
+        new_vector_tensor_in_arena(&arena, decoder_weights.output_head_bias.len, "dec_head_b")?;
+
+    let mut layers = Vec::with_capacity(decoder_weights.layers.len());
+    let mut cross_layers = Vec::with_capacity(decoder_weights.layers.len());
+    let mut self_kv_layers = Vec::with_capacity(decoder_weights.layers.len());
+    for layer in &decoder_weights.layers {
+        let runtime = CohereDecoderLayerRuntime {
+            attn_ln_weight: new_vector_tensor_in_arena(
+                &arena,
+                layer.attn_ln_weight.len,
+                "dec_attn_ln_w",
+            )?,
+            attn_ln_bias: new_vector_tensor_in_arena(
+                &arena,
+                layer.attn_ln_bias.len,
+                "dec_attn_ln_b",
+            )?,
+            attn_q_weight: new_projection_tensor_in_arena(
+                &arena,
+                &layer.attn_q_weight,
+                "dec_attn_q_w",
+            )?,
+            attn_q_bias: new_vector_tensor_in_arena(&arena, layer.attn_q_bias.len, "dec_attn_q_b")?,
+            attn_k_weight: new_projection_tensor_in_arena(
+                &arena,
+                &layer.attn_k_weight,
+                "dec_attn_k_w",
+            )?,
+            attn_k_bias: new_vector_tensor_in_arena(&arena, layer.attn_k_bias.len, "dec_attn_k_b")?,
+            attn_v_weight: new_projection_tensor_in_arena(
+                &arena,
+                &layer.attn_v_weight,
+                "dec_attn_v_w",
+            )?,
+            attn_v_bias: new_vector_tensor_in_arena(&arena, layer.attn_v_bias.len, "dec_attn_v_b")?,
+            attn_o_weight: new_projection_tensor_in_arena(
+                &arena,
+                &layer.attn_o_weight,
+                "dec_attn_o_w",
+            )?,
+            attn_o_bias: new_vector_tensor_in_arena(&arena, layer.attn_o_bias.len, "dec_attn_o_b")?,
+            cross_ln_weight: new_vector_tensor_in_arena(
+                &arena,
+                layer.cross_ln_weight.len,
+                "dec_cross_ln_w",
+            )?,
+            cross_ln_bias: new_vector_tensor_in_arena(
+                &arena,
+                layer.cross_ln_bias.len,
+                "dec_cross_ln_b",
+            )?,
+            cross_k_weight: new_projection_tensor_in_arena(
+                &arena,
+                &layer.cross_k_weight,
+                "dec_cross_k_w",
+            )?,
+            cross_k_bias: new_vector_tensor_in_arena(
+                &arena,
+                layer.cross_k_bias.len,
+                "dec_cross_k_b",
+            )?,
+            cross_v_weight: new_projection_tensor_in_arena(
+                &arena,
+                &layer.cross_v_weight,
+                "dec_cross_v_w",
+            )?,
+            cross_v_bias: new_vector_tensor_in_arena(
+                &arena,
+                layer.cross_v_bias.len,
+                "dec_cross_v_b",
+            )?,
+            cross_q_weight: new_projection_tensor_in_arena(
+                &arena,
+                &layer.cross_q_weight,
+                "dec_cross_q_w",
+            )?,
+            cross_q_bias: new_vector_tensor_in_arena(
+                &arena,
+                layer.cross_q_bias.len,
+                "dec_cross_q_b",
+            )?,
+            cross_o_weight: new_projection_tensor_in_arena(
+                &arena,
+                &layer.cross_o_weight,
+                "dec_cross_o_w",
+            )?,
+            cross_o_bias: new_vector_tensor_in_arena(
+                &arena,
+                layer.cross_o_bias.len,
+                "dec_cross_o_b",
+            )?,
+            ffn_ln_weight: new_vector_tensor_in_arena(
+                &arena,
+                layer.ffn_ln_weight.len,
+                "dec_ffn_ln_w",
+            )?,
+            ffn_ln_bias: new_vector_tensor_in_arena(&arena, layer.ffn_ln_bias.len, "dec_ffn_ln_b")?,
+            ffn_up_weight: new_projection_tensor_in_arena(
+                &arena,
+                &layer.ffn_up_weight,
+                "dec_ffn_up_w",
+            )?,
+            ffn_up_bias: new_vector_tensor_in_arena(&arena, layer.ffn_up_bias.len, "dec_ffn_up_b")?,
+            ffn_down_weight: new_projection_tensor_in_arena(
+                &arena,
+                &layer.ffn_down_weight,
+                "dec_ffn_down_w",
+            )?,
+            ffn_down_bias: new_vector_tensor_in_arena(
+                &arena,
+                layer.ffn_down_bias.len,
+                "dec_ffn_down_b",
+            )?,
+        };
+        layers.push(runtime);
+        cross_layers.push(CohereDecoderCrossCacheLayerRuntime {
+            key: new_persistent_cross_cache_tensor_in_arena(
+                &arena,
+                cross_hidden_size,
+                cross_alloc_frames,
+                n_seq,
+                "dec_cross_k_cache",
+            )?,
+            value: new_persistent_cross_cache_tensor_in_arena(
+                &arena,
+                cross_hidden_size,
+                cross_alloc_frames,
+                n_seq,
+                "dec_cross_v_cache",
+            )?,
+            // Placeholder until the first `populate_cross_attention_cache[_slot]`
+            // call sets this to the actual current-utterance frame count;
+            // never read before that (mirrors firered-aed's `0`-init, but
+            // this arm keeps parity with the pre-existing invariant that
+            // `frame_count` is always `<=` the tensor's real column count).
+            frame_count: cross_alloc_frames,
+            hidden_size: cross_hidden_size,
+        });
+        self_kv_layers.push(CohereDecoderSelfKvLayerRuntime {
+            key: new_persistent_self_kv_tensor_in_arena(
+                &arena,
+                metadata.decoder_head_dim,
+                metadata.decoder_max_context,
+                metadata.decoder_heads,
+                n_seq,
+                "dec_self_k_cache",
+            )?,
+            value: new_persistent_self_kv_tensor_in_arena(
+                &arena,
+                metadata.decoder_head_dim,
+                metadata.decoder_max_context,
+                metadata.decoder_heads,
+                n_seq,
+                "dec_self_v_cache",
+            )?,
+            max_positions: metadata.decoder_max_context,
+        });
+    }
+
+    upload_embedding_to_arena(
+        &mut arena,
+        token_embedding,
+        &decoder_weights.token_embedding,
+        "dec_emb",
+    )?;
+    upload_embedding_to_arena(
+        &mut arena,
+        positional_embedding,
+        &decoder_weights.positional_embedding,
+        "dec_pos",
+    )?;
+    upload_vector_to_arena(
+        &mut arena,
+        emb_ln_weight,
+        &decoder_weights.emb_ln_weight,
+        "dec_emb_ln_w",
+    )?;
+    upload_vector_to_arena(
+        &mut arena,
+        emb_ln_bias,
+        &decoder_weights.emb_ln_bias,
+        "dec_emb_ln_b",
+    )?;
+    upload_vector_to_arena(
+        &mut arena,
+        out_ln_weight,
+        &decoder_weights.out_ln_weight,
+        "dec_out_ln_w",
+    )?;
+    upload_vector_to_arena(
+        &mut arena,
+        out_ln_bias,
+        &decoder_weights.out_ln_bias,
+        "dec_out_ln_b",
+    )?;
+    upload_projection_to_arena(
+        &mut arena,
+        output_head_weight,
+        &decoder_weights.output_head_weight,
+        "dec_head",
+    )?;
+    upload_vector_to_arena(
+        &mut arena,
+        output_head_bias,
+        &decoder_weights.output_head_bias,
+        "dec_head_b",
+    )?;
+    for (layer_idx, (runtime, layer)) in layers.iter().zip(&decoder_weights.layers).enumerate() {
+        upload_decoder_layer_to_arena(&mut arena, runtime, layer, layer_idx)?;
+    }
+
+    Ok(CohereDecoderArenaState {
+        arena,
+        token_embedding,
+        positional_embedding,
+        emb_ln_weight,
+        emb_ln_bias,
+        out_ln_weight,
+        out_ln_bias,
+        output_head_weight,
+        output_head_bias,
+        layers,
+        cross_layers,
+        self_kv_layers,
+    })
+}
+
+impl CohereDecoderGraphRuntime {
     pub(super) fn populate_cross_attention_cache(
         &mut self,
         encoder_output: &CohereTranscribeEncoderOutput,
@@ -1013,14 +1103,7 @@ impl CohereDecoderGraphRuntime {
             self.layers.len(),
         )?;
         if encoder_output.frame_count > self.cross_capacity_frames {
-            return Err(CohereDecoderGraphError::InvalidInput {
-                reason: format!(
-                    "encoder frame count {} exceeds this runtime's cross-KV cache capacity of {} \
-                     frames (architecture chunk-cap sizing); this should never happen on the \
-                     normal longform-capped request path",
-                    encoder_output.frame_count, self.cross_capacity_frames
-                ),
-            });
+            self.grow_cross_capacity(encoder_output.frame_count)?;
         }
         let expected = encoder_output
             .frame_count
@@ -3499,6 +3582,104 @@ mod tests {
 
             assert_eq!(logits.len(), metadata.vocab_size);
             assert!(logits.iter().all(|value| value.is_finite()));
+        });
+    }
+
+    /// Structural regression for a REJECTed earlier version of this fix that
+    /// made an over-capacity chunk fail closed: `populate_cross_attention_cache`
+    /// must grow the cross-KV cache to fit (never error, never silently
+    /// truncate) when a chunk's actual frame count exceeds the runtime's
+    /// current `cross_capacity_frames`, and the grown runtime must go on to
+    /// decode successfully at the new size.
+    #[test]
+    fn populate_cross_attention_cache_grows_capacity_instead_of_erroring() {
+        with_forced_cpu_backend_for_test(|| {
+            let (_runtime_path, preflight) = write_runtime_ready_preflight();
+            let metadata =
+                super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+                    &preflight.metadata,
+                )
+                .expect("parse metadata");
+            let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("reader");
+            let decoder_weights =
+                super::super::decoder_weights::load_cohere_transcribe_decoder_weights_from_reader(
+                    &reader, metadata,
+                )
+                .expect("decoder weights");
+            let small_encoder_output = sample_encoder_output(metadata);
+            let mut runtime = CohereDecoderGraphRuntime::new(
+                &decoder_weights,
+                metadata,
+                small_encoder_output.frame_count,
+                small_encoder_output.hidden_size,
+                false,
+            )
+            .expect("decoder runtime");
+            let initial_capacity = runtime.cross_capacity_frames;
+            assert!(
+                initial_capacity >= small_encoder_output.frame_count,
+                "construction must allocate at least the chunk-cap capacity"
+            );
+
+            // A chunk comfortably past the runtime's current capacity --
+            // exactly the `segment_mode=off` shape (a single window longer
+            // than the architecture's chunk-cap ceiling).
+            let big_frame_count = initial_capacity + 64;
+            let mut rows = Vec::with_capacity(big_frame_count * metadata.decoder_d_model);
+            for frame_idx in 0..big_frame_count {
+                for hidden_idx in 0..metadata.decoder_d_model {
+                    rows.push(
+                        ((frame_idx * metadata.decoder_d_model + hidden_idx) as f32 * 0.03125)
+                            .sin(),
+                    );
+                }
+            }
+            let big_encoder_output = CohereTranscribeEncoderOutput {
+                frame_count: big_frame_count,
+                hidden_size: metadata.decoder_d_model,
+                rows,
+            };
+
+            runtime
+                .populate_cross_attention_cache(&big_encoder_output)
+                .expect("populate must grow to fit, not error");
+            assert!(
+                runtime.cross_capacity_frames >= big_frame_count,
+                "capacity must have grown to at least the requested frame count: capacity={} needed={big_frame_count}",
+                runtime.cross_capacity_frames
+            );
+            assert!(
+                runtime.cross_capacity_frames > initial_capacity,
+                "capacity must actually have grown from its initial value"
+            );
+
+            let tokenizer = super::super::tokenizer::CohereTranscribeTokenizer::from_gguf_metadata(
+                &preflight.metadata,
+            )
+            .expect("tokenizer");
+            let prompt = super::super::prompt::build_cohere_transcribe_decode_prompt(
+                &tokenizer,
+                metadata.decoder_start_token_id,
+                Some("en"),
+                &GgmlAsrExecutionOptions::default(),
+            )
+            .expect("prompt");
+            let logits = runtime
+                .compute_step_logits(&prompt.token_ids)
+                .expect("step logits after grow");
+            assert_eq!(logits.len(), metadata.vocab_size);
+            assert!(logits.iter().all(|value| value.is_finite()));
+
+            // A subsequent SMALLER chunk must still work against the (now
+            // larger) grown capacity -- growth never shrinks back.
+            runtime
+                .populate_cross_attention_cache(&small_encoder_output)
+                .expect("populate a smaller chunk after growth must still succeed");
+            assert_eq!(
+                runtime.cross_capacity_frames,
+                runtime.cross_capacity_frames.max(big_frame_count),
+                "capacity must not shrink back down for a smaller subsequent chunk"
+            );
         });
     }
 
