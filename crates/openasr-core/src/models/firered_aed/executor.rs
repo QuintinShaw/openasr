@@ -71,12 +71,16 @@ thread_local! {
 }
 
 type FireRedAedEncoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
-/// (canonical pack path, backend, encoder frame count). The decoder's
-/// cross-KV cache is allocated at a fixed size for the current utterance's
-/// encoder frame count (see [`FireRedDecoderGraphRuntime::new`]), so a cached
-/// runtime is only reusable across calls that share the same frame count --
-/// mirrors cohere's `CohereDecoderRuntimeCacheKey` precedent.
-type FireRedAedDecoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend, usize);
+/// (canonical pack path, backend). The decoder's cross-KV cache is now
+/// allocated ONCE per pack at this architecture's chunk-cap capacity (see
+/// [`FireRedDecoderGraphRuntime::new`] / `firered_decoder_cross_capacity_frames`),
+/// not at any one utterance's exact encoder frame count -- so a cached
+/// runtime is reusable across every VAD/longform chunk regardless of that
+/// chunk's actual frame count (as long as it fits the capacity, which the
+/// shared longform safety policy already guarantees). Frame count therefore
+/// no longer belongs in this key (see issue tracking the VAD 0%-cache-hit
+/// regression this fixes).
+type FireRedAedDecoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
 
 fn encode_with_cached_runtime(
     runtime_path: &Path,
@@ -110,18 +114,18 @@ fn decode_with_cached_runtime(
     let key = (
         canonical_runtime_cache_path(runtime_path),
         firered_decoder_graph_config().backend,
-        encoder_frame_count,
     );
     with_thread_local_cached_mut_by_key(
         &FIRERED_AED_DECODER_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || FireRedDecoderGraphRuntime::new(runtime_path, metadata, encoder_frame_count),
+        || FireRedDecoderGraphRuntime::new(runtime_path, metadata),
         |runtime| {
             run_firered_aed_decoder_greedy_with_runtime(
                 runtime,
                 metadata,
                 encoder_rows,
+                encoder_frame_count,
                 &decode_text,
             )
         },
@@ -478,6 +482,79 @@ mod tests {
         assert!(
             second_elapsed < first_elapsed,
             "expected cached (second) transcribe to be faster: first={first_elapsed:?} second={second_elapsed:?}"
+        );
+    }
+
+    /// Structural regression test for the VAD/longform 0%-cache-hit bug this
+    /// module fixes: chunks with DIFFERENT encoder frame counts on the same
+    /// thread must still land in the SAME decoder cache slot, because the
+    /// cross-KV cache is now allocated once at this pack's chunk-cap capacity
+    /// (issue tracking the VAD longform 0%-cache-hit regression) rather than
+    /// exactly at each chunk's frame count. `jfk.wav` and `zh_sample.wav` are
+    /// different durations (and firered's char+SPM tokenizer makes their
+    /// encoder frame counts essentially certain to differ), so this is a real
+    /// cross-frame-count reuse, not a same-length coincidence.
+    #[test]
+    #[ignore = "requires the private dev-only firered-aed-l-fp16.oasr pack; see module docs"]
+    fn differently_sized_chunks_reuse_the_same_decoder_runtime_cache_slot() {
+        let pack_path = dev_pack_path();
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return;
+        }
+        let build_request = |wav_path: PathBuf| {
+            let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+                wav_path,
+                "firered-aed cache-reuse test",
+                "firered-aed cache-reuse test",
+            )
+            .expect("load wav fixture");
+            GgmlAsrExecutionRequest {
+                runtime_source_path: pack_path.clone(),
+                runtime_source_preflight: None,
+                selected_family: firered_aed_runtime_descriptor_v1(),
+                prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+                request_options: Default::default(),
+                backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            }
+        };
+        let executor = FireRedAedGgmlExecutor;
+
+        let decoder_cache_len =
+            || FIRERED_AED_DECODER_RUNTIME_BY_KEY.with(|cache| cache.borrow().len());
+        let encoder_cache_len =
+            || FIRERED_AED_ENCODER_RUNTIME_BY_KEY.with(|cache| cache.borrow().len());
+        assert_eq!(decoder_cache_len(), 0, "cache must start empty");
+
+        let jfk = executor
+            .execute(&build_request(jfk_wav_path()))
+            .expect("firered-aed transcribe jfk.wav");
+        assert_eq!(jfk.transcription.text, GOLDEN_JFK_TEXT);
+        eprintln!(
+            "firered-aed cache slots after chunk 1: decoder={} encoder={}",
+            decoder_cache_len(),
+            encoder_cache_len()
+        );
+        assert_eq!(decoder_cache_len(), 1, "first chunk must build one slot");
+
+        let zh = executor
+            .execute(&build_request(zh_wav_path()))
+            .expect("firered-aed transcribe zh_sample.wav");
+        assert_eq!(zh.transcription.text, GOLDEN_ZH_TEXT);
+        eprintln!(
+            "firered-aed cache slots after chunk 2 (different frame count): decoder={} encoder={}",
+            decoder_cache_len(),
+            encoder_cache_len()
+        );
+        assert_eq!(
+            decoder_cache_len(),
+            1,
+            "a differently-sized second chunk must reuse the SAME decoder cache slot, not mint a second one"
+        );
+        assert_eq!(
+            encoder_cache_len(),
+            1,
+            "encoder cache was already frame-count-agnostic"
         );
     }
 

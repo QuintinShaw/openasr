@@ -67,7 +67,15 @@ thread_local! {
 }
 
 type CohereEncoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
-type CohereDecoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend, usize, usize);
+/// (canonical pack path, backend). Used to be `(path, backend, frame_count,
+/// hidden_size)`: the decoder's cross-KV cache is now allocated ONCE per pack
+/// at this architecture's chunk-cap capacity (see
+/// `CohereDecoderGraphRuntime::new` / `cohere_decoder_cross_capacity_frames`),
+/// not at any one utterance's exact encoder frame count, so a cached runtime
+/// is reusable across every VAD/longform chunk regardless of its actual frame
+/// count. `hidden_size` was always redundant too -- it is a pack-constant
+/// (`metadata.decoder_d_model`), never a per-utterance value.
+type CohereDecoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
 
 #[derive(Debug, Error)]
 enum CohereTranscribeGgmlExecutorError {
@@ -431,12 +439,7 @@ fn decode_with_cached_cohere_decoder_runtime(
     audio_duration_seconds: f32,
 ) -> Result<super::decoder_graph::CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
     let decoder_backend = cohere_decoder_graph_config(prefer_cpu_backend).backend;
-    let key = (
-        canonical_runtime_cache_path(runtime_path),
-        decoder_backend,
-        encoder_output.frame_count,
-        encoder_output.hidden_size,
-    );
+    let key = (canonical_runtime_cache_path(runtime_path), decoder_backend);
     with_thread_local_cached_mut_by_key(
         &COHERE_DECODER_RUNTIME_BY_KEY,
         key,
@@ -1111,6 +1114,77 @@ mod tests {
                     .segments
                     .windows(2)
                     .all(|pair| pair[0].end <= pair[1].start)
+            );
+        });
+    }
+
+    // Pinned to the reference decode of `fixtures/jfk.wav` on the real,
+    // private dev-only `cohere-transcribe-03-2026-q4_k.oasr` pack (same
+    // before/after text on `origin/main` and on this cross-KV capacity
+    // refactor -- verified manually; not re-asserted per CI run since the
+    // pack is a non-committed dev artifact, mirroring firered-aed's
+    // `GOLDEN_JFK_TEXT` convention).
+    const COHERE_GOLDEN_JFK_TEXT: &str = "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.";
+
+    fn cohere_dev_pack_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/cohere-out/cohere-transcribe-03-2026-q4_k.oasr")
+    }
+
+    /// Structural regression test for the VAD/longform 0%-cache-hit bug this
+    /// module fixes (mirrors firered-aed's committed
+    /// `differently_sized_chunks_reuse_the_same_decoder_runtime_cache_slot`):
+    /// two CPU-decoder chunks with different encoder frame counts on the same
+    /// thread must land in the SAME decoder cache slot, because the cross-KV
+    /// cache is now allocated once at this pack's chunk-cap capacity rather
+    /// than exactly at each chunk's frame count.
+    #[test]
+    #[ignore = "requires the private dev-only cohere-transcribe-03-2026-q4_k.oasr pack; see module docs"]
+    fn differently_sized_chunks_reuse_the_same_decoder_runtime_cache_slot() {
+        let pack_path = cohere_dev_pack_path();
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return;
+        }
+        with_forced_cpu_backend_for_test(|| {
+            let executor = CohereTranscribeGgmlExecutor::default();
+            let decoder_cache_len =
+                || COHERE_DECODER_RUNTIME_BY_KEY.with(|cache| cache.borrow().len());
+            assert_eq!(decoder_cache_len(), 0, "cache must start empty");
+
+            let mut req_jfk = runtime_ready_request(pack_path.clone());
+            req_jfk.backend_preference = GgmlAsrBackendPreference::CpuOnly;
+            let jfk = executor.execute(&req_jfk).expect("jfk transcribe");
+            assert_eq!(jfk.transcription.text, COHERE_GOLDEN_JFK_TEXT);
+            eprintln!("cohere cache slots after chunk 1: {}", decoder_cache_len());
+            assert_eq!(decoder_cache_len(), 1, "first chunk must build one slot");
+
+            let zh_samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/zh_sample.wav"),
+                "cohere cache-reuse test",
+                "cohere cache-reuse test",
+            )
+            .expect("load zh_sample.wav");
+            let req_zh = GgmlAsrExecutionRequest {
+                runtime_source_path: pack_path,
+                runtime_source_preflight: None,
+                selected_family: cohere_transcribe_runtime_descriptor_v1(),
+                prepared_audio: GgmlAsrPreparedAudio::mono_16khz(zh_samples),
+                request_options: Default::default(),
+                backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            };
+            // Content/language mismatch (zh_sample.wav vs cohere's English-first
+            // prompt) is irrelevant here -- only decode-succeeds + cache-slot
+            // count matter for this structural check.
+            executor.execute(&req_zh).expect("zh transcribe");
+            eprintln!(
+                "cohere cache slots after chunk 2 (different frame count): {}",
+                decoder_cache_len()
+            );
+            assert_eq!(
+                decoder_cache_len(),
+                1,
+                "a differently-sized second chunk must reuse the SAME decoder cache slot, not mint a second one"
             );
         });
     }

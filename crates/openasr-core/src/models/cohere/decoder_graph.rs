@@ -457,6 +457,19 @@ pub(crate) struct CohereDecoderGraphRuntime {
     layers: Vec<CohereDecoderLayerRuntime>,
     cross_layers: Vec<CohereDecoderCrossCacheLayerRuntime>,
     self_kv_layers: Vec<CohereDecoderSelfKvLayerRuntime>,
+    /// Allocated column count of every `cross_layers[i].{key,value}` tensor
+    /// (see [`cohere_decoder_cross_capacity_frames`]); fixed for this
+    /// runtime's lifetime. Equals the exact per-utterance frame count on the
+    /// batched (`n_seq > 1`) serve-batch path (unchanged pre-existing sizing).
+    cross_capacity_frames: usize,
+    /// The active cross-frame-count [`Self::reuse`]'s persistent graph was
+    /// last built for (0 if never built). `compute_reused_incremental_step_logits`
+    /// compares this against the current `cross_layers[0].frame_count` and
+    /// rebuilds the (cheap, metadata-only) reusable graph whenever a
+    /// differently-sized chunk swaps in, since `build_reusable_decode_graph`
+    /// bakes the cross-attention view's frame count into the persistent
+    /// graph's topology at build time.
+    reuse_cross_frame_count: usize,
     cached_positions: usize,
     n_seq: usize,
 }
@@ -517,8 +530,64 @@ struct CohereDecoderSelfKvLayerRuntime {
 struct CohereDecoderCrossCacheLayerRuntime {
     key: GgmlStaticTensor,
     value: GgmlStaticTensor,
+    /// The CURRENT utterance's actual encoder frame count -- mutable, updated
+    /// on every [`CohereDecoderGraphRuntime::populate_cross_attention_cache_slot`]
+    /// call for the single-sequence (`n_seq == 1`) path (see
+    /// [`cohere_decoder_cross_capacity_frames`]). Always `<=` the tensor's
+    /// allocated column count. For the batched serve-batch path (`n_seq > 1`)
+    /// this stays equal to the allocation size, matching the pre-existing
+    /// (unchanged) behavior there.
     frame_count: usize,
     hidden_size: usize,
+}
+
+/// Extra headroom (beyond the architecture's declared safe chunk length)
+/// folded into the single-sequence cross-KV capacity below, purely to absorb
+/// chunk-boundary rounding in an upstream caller (VAD snapping, sample-count
+/// truncation) -- never load-bearing for correctness, since
+/// [`CohereDecoderGraphRuntime::populate_cross_attention_cache_slot`] still
+/// fails closed (never silently truncates or overruns the arena) if a chunk
+/// ever arrives past the resulting capacity.
+const COHERE_DECODER_CROSS_CAPACITY_MARGIN_SECONDS: f32 = 2.0;
+
+/// Predict the pre-subsampling mel frame count for `duration_seconds` of this
+/// pack's configured audio (`metadata.sample_rate_hz`/`hop_length`), matching
+/// the `ZeroCenter`-padded STFT framing `cohere_transcribe_features_from_samples`
+/// runs (`n_frames = samples / hop_length`, after that framer's own `-1`
+/// trailing-frame drop; see `frontend.rs`).
+fn cohere_mel_frames_for_seconds(
+    duration_seconds: f32,
+    metadata: CohereTranscribeExecutionMetadata,
+) -> usize {
+    let samples = (duration_seconds.max(0.0) * metadata.sample_rate_hz as f32) as usize;
+    samples / metadata.hop_length.max(1)
+}
+
+/// Single-sequence (`n_seq == 1`) cross-attention KV cache capacity, in
+/// post-subsampling encoder frames: the decoder's cross-KV cache for the
+/// thread-local-cached single-utterance path is now allocated ONCE per pack
+/// at this size (issue #68's `GlobalQuadratic` chunk ceiling +
+/// [`COHERE_DECODER_CROSS_CAPACITY_MARGIN_SECONDS`] margin) instead of
+/// exactly matching each utterance's actual encoder frame count. Every
+/// VAD/longform chunk for this architecture -- which the shared longform
+/// safety policy already caps at `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS` -- then
+/// reuses the SAME decoder runtime (thread-local cache keyed only by pack
+/// path + backend, no more per-frame-count fan-out) instead of rebuilding the
+/// whole GGUF weight context and cross-KV arena per differing chunk length.
+/// Not applied to the batched serve-batch path (`n_seq > 1`), which keeps its
+/// pre-existing exact-sized allocation (out of scope for the VAD/longform
+/// cache-hit fix this sizes). Reserve-once sizing follows the same convention
+/// as `references/transcribe.cpp@b6a6aca`'s `causal_lm.cpp` KV-cache init
+/// (`kv_init`: reserve at a known max, never reallocate per step) -- see
+/// `GgmlCpuStepBufferPool`'s doc in `ggml_runtime/cpu_graph.rs` for the
+/// sibling citation and `ACKNOWLEDGMENTS.md`.
+fn cohere_decoder_cross_capacity_frames(metadata: CohereTranscribeExecutionMetadata) -> usize {
+    let chunk_seconds = crate::arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS
+        + COHERE_DECODER_CROSS_CAPACITY_MARGIN_SECONDS;
+    let mel_frames = cohere_mel_frames_for_seconds(chunk_seconds, metadata);
+    super::encoder_graph::predicted_encoder_time_frames(mel_frames)
+        .map(|frames| frames.max(1))
+        .unwrap_or(1)
 }
 
 struct CohereDecoderGraphStepExecutor<'a> {
@@ -596,6 +665,17 @@ impl CohereDecoderGraphRuntime {
             metadata,
             decoder_weights.layers.len(),
         )?;
+        // Single-sequence runtimes (the thread-local-cached VAD/longform decode
+        // path) allocate the cross-KV cache at this pack's chunk-cap capacity,
+        // not at `cross_frame_count` (whichever utterance happened to trigger
+        // this cache-miss build) -- see `cohere_decoder_cross_capacity_frames`.
+        // The batched serve-batch path (`n_seq > 1`) keeps its pre-existing
+        // exact-sized allocation untouched (out of scope here).
+        let cross_alloc_frames = if n_seq == 1 {
+            cohere_decoder_cross_capacity_frames(metadata)
+        } else {
+            cross_frame_count
+        };
 
         let mut config = cohere_decoder_graph_config(prefer_cpu_backend);
         config.graph_size = config.graph_size.max(COHERE_DECODER_GRAPH_SIZE_FLOOR);
@@ -783,18 +863,23 @@ impl CohereDecoderGraphRuntime {
                 key: new_persistent_cross_cache_tensor_in_arena(
                     &arena,
                     cross_hidden_size,
-                    cross_frame_count,
+                    cross_alloc_frames,
                     n_seq,
                     "dec_cross_k_cache",
                 )?,
                 value: new_persistent_cross_cache_tensor_in_arena(
                     &arena,
                     cross_hidden_size,
-                    cross_frame_count,
+                    cross_alloc_frames,
                     n_seq,
                     "dec_cross_v_cache",
                 )?,
-                frame_count: cross_frame_count,
+                // Placeholder until the first `populate_cross_attention_cache[_slot]`
+                // call sets this to the actual current-utterance frame count;
+                // never read before that (mirrors firered-aed's `0`-init, but
+                // this arm keeps parity with the pre-existing invariant that
+                // `frame_count` is always `<=` the tensor's real column count).
+                frame_count: cross_alloc_frames,
                 hidden_size: cross_hidden_size,
             });
             self_kv_layers.push(CohereDecoderSelfKvLayerRuntime {
@@ -888,6 +973,8 @@ impl CohereDecoderGraphRuntime {
             layers,
             cross_layers,
             self_kv_layers,
+            cross_capacity_frames: cross_alloc_frames,
+            reuse_cross_frame_count: 0,
             cached_positions: 0,
             n_seq,
         })
@@ -925,6 +1012,16 @@ impl CohereDecoderGraphRuntime {
             self.metadata,
             self.layers.len(),
         )?;
+        if encoder_output.frame_count > self.cross_capacity_frames {
+            return Err(CohereDecoderGraphError::InvalidInput {
+                reason: format!(
+                    "encoder frame count {} exceeds this runtime's cross-KV cache capacity of {} \
+                     frames (architecture chunk-cap sizing); this should never happen on the \
+                     normal longform-capped request path",
+                    encoder_output.frame_count, self.cross_capacity_frames
+                ),
+            });
+        }
         let expected = encoder_output
             .frame_count
             .checked_mul(encoder_output.hidden_size)
@@ -971,7 +1068,6 @@ impl CohereDecoderGraphRuntime {
                 self.arena.graph_tensor(cross_runtime.key),
                 encoder_output.hidden_size,
                 encoder_output.frame_count,
-                self.n_seq,
                 slot_index,
                 "ggml_view_2d(dec_cross_k_cache_slot)",
             )?;
@@ -1000,7 +1096,6 @@ impl CohereDecoderGraphRuntime {
                 self.arena.graph_tensor(cross_runtime.value),
                 encoder_output.hidden_size,
                 encoder_output.frame_count,
-                self.n_seq,
                 slot_index,
                 "ggml_view_2d(dec_cross_v_cache_slot)",
             )?;
@@ -1040,7 +1135,16 @@ impl CohereDecoderGraphRuntime {
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_compute(decoder_cross_cache)",
                 source,
-            })
+            })?;
+        // Record the ACTUAL frame count this call just populated so the
+        // cross-attention view in `compute_step_logits` / the persistent
+        // reuse graph reads back exactly that many columns, not the (possibly
+        // larger) allocated capacity. Every layer shares the same value by
+        // construction (one `encoder_output` per call).
+        for cross_runtime in &mut self.cross_layers {
+            cross_runtime.frame_count = encoder_output.frame_count;
+        }
+        Ok(())
     }
 
     pub(super) fn compute_step_logits(
@@ -1417,11 +1521,23 @@ impl CohereDecoderGraphRuntime {
         let total_tokens = position
             .checked_add(1)
             .ok_or(CohereDecoderGraphError::ShapeOverflow)?;
+        // A cross-frame-count change also forces a rebuild: `build_reusable_decode_graph`
+        // bakes the current `cross_layers[0].frame_count` into the persistent
+        // graph's cross-attention view topology, so a same-shaped-otherwise
+        // graph built for a different (earlier) chunk's frame count would
+        // silently attend over the wrong span for this one.
+        let active_cross_frame_count = self
+            .cross_layers
+            .first()
+            .map(|layer| layer.frame_count)
+            .unwrap_or(0);
         let needs_build = self
             .reuse
             .as_ref()
             .map(|reuse| {
-                reuse.max_positions != self.metadata.decoder_max_context || reuse.n_seq != 1
+                reuse.max_positions != self.metadata.decoder_max_context
+                    || reuse.n_seq != 1
+                    || self.reuse_cross_frame_count != active_cross_frame_count
             })
             .unwrap_or(true);
         if needs_build {
@@ -1541,12 +1657,18 @@ impl CohereDecoderGraphRuntime {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let active_cross_frame_count = self
+            .cross_layers
+            .first()
+            .map(|layer| layer.frame_count)
+            .unwrap_or(0);
         let needs_build = self
             .reuse
             .as_ref()
             .map(|reuse| {
                 reuse.max_positions != self.metadata.decoder_max_context
                     || reuse.n_seq != self.n_seq
+                    || self.reuse_cross_frame_count != active_cross_frame_count
             })
             .unwrap_or(true);
         if needs_build {
@@ -1838,6 +1960,11 @@ impl CohereDecoderGraphRuntime {
         let hidden = self.metadata.decoder_d_model;
         let max_context = self.metadata.decoder_max_context;
         let n_seq = self.n_seq;
+        let active_cross_frame_count = self
+            .cross_layers
+            .first()
+            .map(|layer| layer.frame_count)
+            .unwrap_or(0);
         let mut session = self
             .runner
             .start_persistent_graph_session(self.persistent_graph_context_bytes)
@@ -2022,6 +2149,7 @@ impl CohereDecoderGraphRuntime {
             attention_mask,
             logits,
         ));
+        self.reuse_cross_frame_count = active_cross_frame_count;
         Ok(())
     }
 }
@@ -2935,13 +3063,16 @@ fn cross_cache_slot_target<'a>(
     cache: crate::ggml_runtime::GgmlCpuTensor<'a>,
     hidden_size: usize,
     frame_count: usize,
-    n_seq: usize,
     slot_index: usize,
     step: &'static str,
 ) -> Result<crate::ggml_runtime::GgmlCpuTensor<'a>, CohereDecoderGraphError> {
-    if n_seq == 1 {
-        return Ok(cache);
-    }
+    // No `n_seq == 1` shortcut returning `cache` unchanged: `cache` may now be
+    // allocated at a capacity larger than `frame_count` (see
+    // `cohere_decoder_cross_capacity_frames`), so every write must target a
+    // contiguous-prefix VIEW of exactly `frame_count` columns -- for `n_seq ==
+    // 1` that is `slot_index == 0` with `offset == 0`, identical to the old
+    // no-op shortcut whenever `frame_count` happens to equal the tensor's
+    // full allocated size.
     let row_stride = hidden_size
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or(CohereDecoderGraphError::ShapeOverflow)?;

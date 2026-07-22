@@ -57,18 +57,20 @@ pub(crate) fn take_generation_tagged<K: Eq + Hash, V>(
 }
 
 /// Default per-key entry cap for the model runtime caches keyed by
-/// `with_thread_local_cached_mut_by_key`. Small on purpose: long-form
-/// transcription of a single audio file can mint many distinct cache keys
-/// (e.g. firered-aed keys on `(path, backend, encoder_frame_count)`, and a
-/// 10s-chunked long clip commonly produces a dozen-plus distinct frame
-/// counts), and each cached runtime can own hundreds of MB of ggml graph
-/// context. Without a bound the per-thread cache grows without limit for the
-/// life of the thread -- this is the root cause of the multi-GB memory
-/// "roller coaster" during long-audio daemon transcription (issue tracked as
-/// the daemon long-audio OOM). 4 keeps the common case (a handful of chunk
-/// sizes, e.g. one steady-state frame count plus a shorter tail chunk) warm
-/// while capping worst-case resident runtimes for a pathological key
-/// explosion.
+/// `with_thread_local_cached_mut_by_key`. Small on purpose: some callers can
+/// still mint more than one distinct cache key per pack (e.g. distinct
+/// backends, or the CPU/GPU decoder-preference split), and each cached
+/// runtime can own hundreds of MB of ggml graph context. Firered-aed's and
+/// cohere-transcribe's single-sequence decoder runtimes used to key on
+/// `(path, backend, encoder_frame_count[, hidden_size])` -- a VAD/longform
+/// clip commonly produces a dozen-plus distinct frame counts, so this bound
+/// was previously the only thing standing between that and unbounded
+/// per-thread growth (root cause of the multi-GB memory "roller coaster"
+/// during long-audio daemon transcription). Both now allocate their cross-KV
+/// cache at a fixed chunk-cap capacity instead and key only on `(path,
+/// backend)`, so a VAD/longform run stays on ONE cache slot regardless of how
+/// many distinct chunk lengths it produces; this cap remains as a general
+/// safety bound for any caller (or future family) that still varies its key.
 pub(crate) const DEFAULT_RUNTIME_CACHE_CAPACITY: usize = 4;
 
 /// A small bounded LRU cache: at most `max_entries` `(key, value)` pairs are
