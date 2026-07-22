@@ -72,7 +72,7 @@ every consciously skipped optimization on the record.
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
 | Mel/fbank frontend SIMD + parallelized | Supported | Shared kaldi fbank engine; FFT via `realfft` (SIMD). Frame loop is single-threaded, and that is the right call here: measured share is 0.3% of execute (2.1ms Metal / 4.8ms CPU on jfk). Parallelizing it buys nothing for this family. |
-| Zero-copy audio path (no avoidable resample/copy hops) | Deferred | Copy-hop count from wav decode to fbank not yet audited for this family. Unlock: one pass over `load_wav_16khz_mono_f32_v0` -> frontend chain; expected small (frontend total is 0.3% of wall). |
+| Zero-copy audio path (no avoidable resample/copy hops) | Deferred | Audited end-to-end (2026-07-22). Direct 16kHz-mono-WAV input (`api/audio_io.rs:5` -> `models/kaldi_fbank.rs:115`) is 2 necessary full-buffer hops (disk read, byte->f32 parse); the fbank frame loop reuses per-frame buffers. However any non-WAV input decodes+resamples to in-memory f32/16k (`audio/symphonia_decode.rs:236,406`) then quantizes f32->i16, `fs::write`s a temp WAV (`audio/prepare.rs:192`) that is immediately re-read and re-parsed back to f32 -- an avoidable double full-buffer disk round trip existing only to satisfy `PreparedAudioInput`'s path-only contract (shared path, all families affected). Unlock: in-memory samples variant on `PreparedAudioInput` skipping the write/read/re-parse (fix dispatched). |
 | VAD cost measured and accounted | Not applicable | No VAD in this family's path (grep: zero references); 40s single-shot with upstream longform slicing instead. |
 
 ## 6. Platform-specific
