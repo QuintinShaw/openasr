@@ -13,7 +13,7 @@
 
 use serde::Serialize;
 
-use crate::ggml_runtime::{GgmlBackendKind, GgmlRuntimeInfo};
+use crate::ggml_runtime::{GgmlBackendKind, GgmlRuntimeInfo, preferred_accelerated_device};
 
 const BYTES_PER_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
@@ -50,11 +50,11 @@ pub struct ComputeDevice {
 /// `Auto` + `CPU`.
 pub fn compute_devices_from_runtime(runtime: &GgmlRuntimeInfo) -> Vec<ComputeDevice> {
     let cpu_name = cpu_device_name(runtime);
-    let accelerated = runtime
-        .devices
-        .iter()
-        .find(|device| device.kind.is_gpu())
-        .map(|device| {
+    // On a hybrid-graphics host (Optimus-style: an integrated + a discrete
+    // GPU both surfaced by the same Vulkan backend), prefer the discrete GPU
+    // -- see `preferred_accelerated_device`'s doc comment for the ranking.
+    let accelerated =
+        preferred_accelerated_device(&runtime.devices, GgmlBackendKind::is_gpu).map(|device| {
             let name = non_empty_device_label(&device.description, &device.name, "Accelerated");
             ComputeDevice {
                 id: "accelerated".to_string(),
@@ -225,6 +225,43 @@ mod tests {
         // Auto mirrors the accelerated device's label so the picker's default
         // reads as the GPU, not a bare "CPU".
         assert_eq!(devices[0].name, "NVIDIA GeForce RTX 4070");
+    }
+
+    #[test]
+    fn hybrid_graphics_runtime_surfaces_discrete_gpu_not_integrated() {
+        // Optimus-style laptop: Intel UHD (integrated) enumerates before the
+        // NVIDIA discrete GPU. The picker's "accelerated" entry (and Auto,
+        // which mirrors it) must still be the discrete GPU, not whichever
+        // device the registry happened to list first.
+        let runtime = runtime_with(
+            vec![
+                GgmlBackendDevice::for_test("CPU", "Intel Core i7", GgmlBackendKind::Cpu, None),
+                GgmlBackendDevice::for_test(
+                    "Vulkan0",
+                    "Intel(R) UHD Graphics 630",
+                    GgmlBackendKind::IntegratedGpu,
+                    None,
+                ),
+                GgmlBackendDevice::for_test(
+                    "Vulkan1",
+                    "NVIDIA GeForce RTX 4070",
+                    GgmlBackendKind::Gpu,
+                    Some(GgmlDeviceMemory {
+                        free_bytes: 8 * 1024 * 1024 * 1024,
+                        total_bytes: 12 * 1024 * 1024 * 1024,
+                    }),
+                ),
+            ],
+            "Intel Core i7",
+        );
+        let devices = compute_devices_from_runtime(&runtime);
+        let accelerated = devices.iter().find(|d| d.id == "accelerated").unwrap();
+        assert_eq!(accelerated.name, "NVIDIA GeForce RTX 4070");
+        assert_eq!(accelerated.meta, "GPU backend");
+        assert_eq!(
+            devices[0].name, "NVIDIA GeForce RTX 4070",
+            "Auto mirrors it"
+        );
     }
 
     #[test]

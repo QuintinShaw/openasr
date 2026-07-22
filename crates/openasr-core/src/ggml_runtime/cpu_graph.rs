@@ -20,7 +20,7 @@ use thiserror::Error;
 use super::ffi;
 use super::{
     GgmlBackendKind, GgmlRuntimeError, GgufTensorDataReader, GgufWeightTensorPayload,
-    ensure_backends_loaded, ggml_available_devices,
+    accelerated_device_rank, ensure_backends_loaded, ggml_available_devices,
 };
 
 const F32_WIDTH_BYTES: usize = std::mem::size_of::<f32>();
@@ -4962,10 +4962,21 @@ impl GgmlBackendGuard {
     }
 
     fn init_gpu_backend() -> Result<NonNull<c_void>, GgmlCpuGraphError> {
-        for device in ggml_available_devices()
+        // Rank candidates so a hybrid-graphics host (Optimus-style laptop
+        // exposing both an Intel integrated GPU and an NVIDIA/AMD discrete GPU
+        // through the same Vulkan backend) tries the discrete GPU first,
+        // falling through to lower-ranked devices only if a higher-ranked one
+        // fails to initialize -- see `accelerated_device_rank`. A plain
+        // registry-order scan here (the previous behavior) picked whichever
+        // device the platform/driver happened to enumerate first, which on
+        // several reported Optimus setups was the integrated GPU, leaving the
+        // discrete GPU idle even though it is almost always the better choice.
+        let mut candidates: Vec<_> = ggml_available_devices()
             .into_iter()
             .filter(|device| backend_kind_is_accelerated(device.kind))
-        {
+            .collect();
+        candidates.sort_by_key(|device| accelerated_device_rank(device.kind));
+        for device in candidates {
             match device.initialize() {
                 Ok(backend) => return Ok(backend.into_raw()),
                 Err(GgmlRuntimeError::BackendUnavailable(_)) => continue,
