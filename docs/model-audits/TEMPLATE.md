@@ -24,7 +24,7 @@
   justification AND the unlock condition (what measurement, upstream change,
   or milestone flips it to Supported).
 
-Replace every `<!-- TODO:fill -->` marker; the release gate rejects any
+Replace every `TODO:fill` HTML-comment marker; the release gate rejects any
 leftover marker. Do not delete or rename the ten numbered section headings; the
 gate checks all ten. Keep entries terse -- one form should take an afternoon,
 not a week. The goal is that every release ships in its best known state, with

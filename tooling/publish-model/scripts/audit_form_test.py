@@ -30,6 +30,19 @@ class AuditFormTemplateTest(unittest.TestCase):
             self.assertIn(section, text)
         self.assertIn(audit_form.FILL_SENTINEL, text)
 
+    def test_template_mentions_the_fill_marker_only_at_fill_sites(self) -> None:
+        """The gate counts raw FILL_SENTINEL occurrences, so the template's
+        prose must never spell the marker out verbatim (e.g. inside backticks
+        in the how-to paragraph): a contributor who keeps the instructions and
+        fills every real site would otherwise fail the gate forever. Fill
+        sites are table rows (contain '|') or the title line ('# ')."""
+        for line in TEMPLATE_PATH.read_text().splitlines():
+            if audit_form.FILL_SENTINEL in line:
+                self.assertTrue(
+                    "|" in line or line.startswith("# "),
+                    f"template prose spells out the fill marker verbatim: {line!r}",
+                )
+
 
 class ValidateFamilyAuditFormTest(unittest.TestCase):
     def test_missing_form_fails_closed_for_a_new_family(self) -> None:
