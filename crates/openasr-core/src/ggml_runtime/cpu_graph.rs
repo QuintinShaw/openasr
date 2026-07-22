@@ -797,8 +797,16 @@ pub enum GgmlCpuGraphError {
     TensorAllocationFailed { tensor: &'static str },
     #[error("ggml cpu graph construction failed at '{step}'")]
     GraphBuildFailed { step: &'static str },
-    #[error("ggml cpu graph backend buffer allocation failed")]
-    BackendBufferAllocationFailed,
+    /// Backend-agnostic wording deliberately avoids "cpu graph backend" (an
+    /// internal ggml scheduler-plumbing term, not a statement about which
+    /// physical device ran out of memory): `backend` names the actual device
+    /// (e.g. "Vulkan0", "Metal", "CPU") the allocation targeted, so a
+    /// downstream translation layer or user-facing error can say plainly
+    /// which backend was out of memory instead of surfacing ggml jargon
+    /// (issue #158's report showed a Vulkan OOM misread as a generic "cpu
+    /// graph backend" failure).
+    #[error("compute buffer allocation failed (backend: {backend})")]
+    BackendBufferAllocationFailed { backend: String },
     #[error(
         "ggml cpu graph backend has no device (backend outlived the thread-local \
          backend that owns it); refusing to allocate against a dangling backend"
@@ -5130,9 +5138,11 @@ impl GgmlBackendBufferGuard {
         ensure_backend_device_present(backend)?;
         let raw =
             unsafe { ffi::ggml_backend_alloc_ctx_tensors(context.as_ptr(), backend.as_ptr()) };
-        NonNull::new(raw)
-            .map(|raw| Self { raw })
-            .ok_or(GgmlCpuGraphError::BackendBufferAllocationFailed)
+        NonNull::new(raw).map(|raw| Self { raw }).ok_or_else(|| {
+            GgmlCpuGraphError::BackendBufferAllocationFailed {
+                backend: backend_name(backend),
+            }
+        })
     }
 
     fn allocate_with_usage(
@@ -5144,7 +5154,9 @@ impl GgmlBackendBufferGuard {
         let raw =
             unsafe { ffi::ggml_backend_alloc_ctx_tensors(context.as_ptr(), backend.as_ptr()) };
         let Some(raw) = NonNull::new(raw) else {
-            return Err(GgmlCpuGraphError::BackendBufferAllocationFailed);
+            return Err(GgmlCpuGraphError::BackendBufferAllocationFailed {
+                backend: backend_name(backend),
+            });
         };
         unsafe { ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), usage) };
         Ok(Self { raw })

@@ -139,6 +139,25 @@ impl FireRedEncoderGraphRuntime {
     }
 }
 
+/// Post-subsampling encoder time-frame count the 2x Conv2d(k3,s2) stem
+/// produces for `n_frames` raw (pre-context-pad) fbank frames -- the same
+/// time-axis arithmetic `encode_firered_aed_audio_embeddings` runs, factored
+/// out so a caller can predict the frame count a window will encode to
+/// *before* building the graph (see `FireRedAedGgmlExecutor`'s PE-capacity
+/// preflight check, which must reject an oversized window with a typed error
+/// rather than let it reach `ggml_prepare_outputs` and fail on an opaque
+/// allocation error).
+pub(crate) fn predicted_encoder_time_frames(n_frames: usize) -> Result<usize, FireRedEncoderError> {
+    if n_frames == 0 {
+        return Err(FireRedEncoderError::EmptyInput);
+    }
+    let padded_frames = n_frames
+        .checked_add(SUBSAMPLE_CONTEXT_PAD_FRAMES)
+        .ok_or(FireRedEncoderError::ShapeOverflow)?;
+    let conv1_time = conv_out_dim(padded_frames, 3, 2)?;
+    conv_out_dim(conv1_time, 3, 2)
+}
+
 /// Run the full encoder forward pass in a single ggml graph (no incremental
 /// reuse -- matches cohere's/parakeet's single-shot encoder shape) against an
 /// already-loaded runner/weights pair.
@@ -167,13 +186,11 @@ fn encode_firered_aed_audio_embeddings(
     padded[..cmvn_features.len()].copy_from_slice(cmvn_features);
 
     let conv1_freq = conv_out_dim(feature_dim, 3, 2)?;
-    let conv1_time = conv_out_dim(padded_frames, 3, 2)?;
     let conv2_freq = conv_out_dim(conv1_freq, 3, 2)?;
-    let conv2_time = conv_out_dim(conv1_time, 3, 2)?;
     if conv2_freq * metadata.subsample_channels != metadata.subsample_out_dim {
         return Err(FireRedEncoderError::ShapeOverflow);
     }
-    let frame_count = conv2_time;
+    let frame_count = predicted_encoder_time_frames(n_frames)?;
     // Valid (unpadded) frame count: computed from the ORIGINAL (pre-context-pad)
     // frame count via the same subsampling arithmetic the upstream uses for
     // `input_lengths` (`(L-3)//2+1` twice) -- NOT from `padded_frames`. Frames
@@ -776,6 +793,52 @@ fn firered_conformer_block<'a>(
         },
         map_err,
     )
+}
+
+#[cfg(test)]
+mod frame_count_tests {
+    use super::predicted_encoder_time_frames;
+
+    #[test]
+    fn zero_frames_is_empty_input_error() {
+        assert!(matches!(
+            predicted_encoder_time_frames(0),
+            Err(super::FireRedEncoderError::EmptyInput)
+        ));
+    }
+
+    #[test]
+    fn matches_the_inline_arithmetic_encode_used_before_extraction() {
+        // Same conv_out_dim(conv_out_dim(n+6,3,2),3,2) the encoder forward
+        // itself runs; regression-pins the extraction in
+        // `predicted_encoder_time_frames` against silent drift.
+        for n_frames in [1usize, 10, 273, 1000, 20_000] {
+            let padded = n_frames + 6;
+            let conv1 = (padded - 3) / 2 + 1;
+            let expected = (conv1 - 3) / 2 + 1;
+            assert_eq!(
+                predicted_encoder_time_frames(n_frames).unwrap(),
+                expected,
+                "mismatch for n_frames={n_frames}"
+            );
+        }
+    }
+
+    /// A 210s window (16 kHz mono, 10ms fbank hop) predicts an encoder frame
+    /// count comfortably past the `pe_len=9999` -> 5000-frame capacity
+    /// (~200s) declared in `runtime_contract`'s parsed-metadata test --
+    /// this is the exact shape `FireRedAedGgmlExecutor::execute_inner`'s
+    /// PE-capacity preflight check (issue #158) must catch before ever
+    /// building the encoder graph.
+    #[test]
+    fn oversized_window_predicts_past_pe_capacity() {
+        let raw_fbank_frames = 210 * 100; // 10ms hop => 100 frames/sec
+        let predicted = predicted_encoder_time_frames(raw_fbank_frames).unwrap();
+        assert!(
+            predicted > 5000,
+            "expected a 210s window to predict past the 5000-frame PE capacity, got {predicted}"
+        );
+    }
 }
 
 #[cfg(test)]

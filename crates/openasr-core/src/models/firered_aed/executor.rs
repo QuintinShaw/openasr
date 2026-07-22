@@ -1,9 +1,21 @@
 //! firered-aed dedicated executor (Stage 4): fbank+CMVN [`frontend`] -> the
 //! parity-verified Conformer [`encoder_graph`] -> greedy attention
 //! [`decoder_graph`] -> char+SPM [`tokenizer`] detokenize. No CTC branch, no
-//! phrase bias (pure autoregressive attention decode), single-segment plain
-//! transcription. The executor fails closed with typed errors on a bad pack
-//! and never fabricates a transcript.
+//! phrase bias (pure autoregressive attention decode). The executor fails
+//! closed with typed errors on a bad pack and never fabricates a transcript.
+//!
+//! Each call here encodes/decodes exactly one audio window ("single-segment"
+//! in that sense -- there is no internal multi-slice batching, unlike
+//! cohere's `batched_decode`). Long-file transcription is NOT single-shot,
+//! though: the architecture-agnostic longform slicer in
+//! `api::backend::native_transcribe` calls this executor once per slice for
+//! every builtin family, firered-aed included, with each window pre-capped to
+//! this architecture's `GlobalQuadratic` safety ceiling (issue #68) -- well
+//! under the encoder's PE-table capacity. `execute_inner` still checks that
+//! capacity itself and fails closed with a typed error if a window ever
+//! arrives oversized (issue #158's defense-in-depth: a caller that bypasses
+//! longform, or a future regression in the slicing wiring, must not reach an
+//! opaque graph-allocation failure or a silently degraded transcript).
 //!
 //! [`frontend`]: super::frontend
 //! [`encoder_graph`]: super::encoder_graph
@@ -37,7 +49,9 @@ use crate::models::thread_local_runtime_cache::{
 use super::decoder_graph::{
     FireRedDecoderGraphRuntime, run_firered_aed_decoder_greedy_with_runtime,
 };
-use super::encoder_graph::{FireRedEncoderGraphRuntime, FireRedEncoderOutput};
+use super::encoder_graph::{
+    FireRedEncoderGraphRuntime, FireRedEncoderOutput, predicted_encoder_time_frames,
+};
 use super::frontend::{FireRedFbankFrontend, apply_cmvn};
 use super::graph_config::{firered_decoder_graph_config, firered_encoder_graph_config};
 use super::runtime_contract::{FireRedAedExecutionMetadata, parse_firered_aed_execution_metadata};
@@ -135,6 +149,12 @@ enum FireRedAedExecutorError {
     EncoderFailed { reason: String },
     #[error("firered-aed decoder failed: {reason}")]
     DecoderFailed { reason: String },
+    #[error("firered-aed audio window ({window_seconds:.1}s) is too long for this pack: {reason}")]
+    AudioWindowTooLong { window_seconds: f32, reason: String },
+}
+
+fn window_seconds(n_samples: usize, sample_rate_hz: u32) -> f32 {
+    n_samples as f32 / sample_rate_hz.max(1) as f32
 }
 
 #[derive(Debug, Default, Clone)]
@@ -201,6 +221,45 @@ impl FireRedAedGgmlExecutor {
                 reason: error.to_string(),
             },
         )?;
+
+        // Defense in depth (issue #158): the generic longform slicer in
+        // `native_transcribe` already caps every window at this architecture's
+        // declared `GlobalQuadratic` safety ceiling (issue #68), which is well
+        // inside the encoder's baked rel-pos-table capacity below -- so this
+        // should never trip in the normal request path. But this executor is
+        // also reachable directly (a caller that skips longform, a future
+        // regression in the slicing wiring, an oversized fixed/manual chunk
+        // request), and a window past the PE table's capacity is a quality/
+        // correctness problem even when it happens to fit in memory: reject it
+        // with a typed, actionable error up front rather than let a caller
+        // silently degrade or hit an opaque graph-allocation failure deep in
+        // `encoder_graph`.
+        let predicted_encoder_frames =
+            predicted_encoder_time_frames(features.n_frames).map_err(|error| {
+                FireRedAedExecutorError::AudioWindowTooLong {
+                    window_seconds: window_seconds(
+                        samples.len(),
+                        request.prepared_audio.sample_rate_hz,
+                    ),
+                    reason: error.to_string(),
+                }
+            })?;
+        let max_encoder_frames = metadata.encoder_max_frames();
+        if predicted_encoder_frames > max_encoder_frames {
+            return Err(FireRedAedExecutorError::AudioWindowTooLong {
+                window_seconds: window_seconds(
+                    samples.len(),
+                    request.prepared_audio.sample_rate_hz,
+                ),
+                reason: format!(
+                    "encoder frame count {predicted_encoder_frames} exceeds this pack's \
+                     positional-encoding capacity of {max_encoder_frames} frames \
+                     (~{:.0}s at 25 fps); this window should already be capped by \
+                     longform slicing before reaching the executor",
+                    max_encoder_frames as f32 / 25.0
+                ),
+            });
+        }
 
         let runtime_path = preflight.runtime_source.path();
         let encoder_output =
@@ -419,6 +478,47 @@ mod tests {
         assert!(
             second_elapsed < first_elapsed,
             "expected cached (second) transcribe to be faster: first={first_elapsed:?} second={second_elapsed:?}"
+        );
+    }
+
+    /// Issue #158 defense-in-depth: a single window past the pack's
+    /// PE-table capacity (~200s for this dev pack's `pe_len=9999`) must fail
+    /// closed with a typed `AudioWindowTooLong` error instead of reaching
+    /// `encoder_graph`'s allocation and either OOM-ing or (on a machine with
+    /// enough memory to actually build the graph) silently degrading past
+    /// the model's trained/positional-encoding range. This should never
+    /// happen on the real request path (the outer longform slicer already
+    /// caps every window to the architecture's 30s safety ceiling), so this
+    /// constructs an oversized window directly against the executor,
+    /// bypassing the slicer, to prove the guard is load-bearing on its own.
+    #[test]
+    #[ignore = "requires the private dev-only firered-aed-l-fp16.oasr pack; see module docs"]
+    fn oversized_window_fails_closed_with_typed_error_instead_of_reaching_the_encoder_graph() {
+        let pack_path = dev_pack_path();
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return;
+        }
+        // 210s of silence at 16 kHz: cheap to construct, and content does not
+        // matter -- the guard trips on shape (predicted encoder frame count)
+        // before any real encoding is attempted.
+        let samples = vec![0.0_f32; 210 * 16_000];
+        let request = GgmlAsrExecutionRequest {
+            runtime_source_path: pack_path,
+            runtime_source_preflight: None,
+            selected_family: firered_aed_runtime_descriptor_v1(),
+            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            request_options: Default::default(),
+            backend_preference: GgmlAsrBackendPreference::CpuOnly,
+        };
+        let executor = FireRedAedGgmlExecutor;
+        let error = executor
+            .execute(&request)
+            .expect_err("a 210s window must fail closed, not transcribe");
+        let message = error.to_string();
+        assert!(
+            message.contains("too long") || message.contains("positional-encoding capacity"),
+            "expected a PE-capacity typed error, got: {message}"
         );
     }
 }
