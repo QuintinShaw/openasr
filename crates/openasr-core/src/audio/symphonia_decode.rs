@@ -1,20 +1,29 @@
 //! In-process audio decoding via symphonia (pure Rust, no external process).
 //!
-//! This is the default decode path for `prepare_audio_input`: m4a/AAC-LC
+//! This is the default decode path for `prepare_audio_input`: m4a/AAC-LC/ALAC
 //! (isomp4, including the `.qta` QuickTime container), mp3, flac, ogg/vorbis,
-//! and non-conformant wav all decode here without shelling out to ffmpeg or
-//! afconvert. Anything this module cannot decode (HE-AAC, Opus, corrupt
-//! files, containers/codecs outside the enabled symphonia features) returns
-//! `None` so the caller falls back to the existing external converter chain
-//! -- this module never produces a hard error, only "handled" or "not
-//! handled".
+//! mkv/webm (vorbis track only -- see below), and non-conformant wav all
+//! decode here without shelling out to ffmpeg or afconvert. Anything this
+//! module cannot decode (HE-AAC, Opus in any container, corrupt files,
+//! containers/codecs outside the enabled symphonia features) returns `None`
+//! so the caller falls back to the existing external converter chain -- this
+//! module never produces a hard error, only "handled" or "not handled".
+//!
+//! Opus is the big absence: symphonia has never shipped an Opus decoder (still
+//! true as of 0.6.0), so `.opus` files, and Opus tracks inside `.ogg`/`.webm`,
+//! always fall through regardless of which demuxer/codec features are
+//! enabled here. `probe_codec_label` below exists so callers can still tell
+//! the user *which* codec was the problem instead of a bare failure.
 
 use std::{fs::File, io::ErrorKind};
 
 use rubato::{FftFixedIn, Resampler};
 use symphonia::core::{
     audio::{AudioBufferRef, Signal},
-    codecs::{CODEC_TYPE_AAC, CODEC_TYPE_NULL, CodecType, DecoderOptions},
+    codecs::{
+        CODEC_TYPE_AAC, CODEC_TYPE_ALAC, CODEC_TYPE_FLAC, CODEC_TYPE_MP3, CODEC_TYPE_NULL,
+        CODEC_TYPE_OPUS, CODEC_TYPE_VORBIS, CodecType, DecoderOptions,
+    },
     errors::Error as SymphoniaError,
     formats::FormatOptions,
     io::MediaSourceStream,
@@ -73,6 +82,55 @@ struct DecodedMono {
     /// successfully decoded packet's `AudioBufferRef::spec()`, same as
     /// `sample_rate` below.
     channels: u16,
+}
+
+/// Probes `path` far enough to name the audio codec of its first real track,
+/// without requiring a decoder for that codec to be compiled in. Symphonia's
+/// codec type registry (`CODEC_TYPE_*`) is populated by every demuxer
+/// regardless of which decoder features this build enables, so this can
+/// identify e.g. Opus in a container symphonia can parse but not decode --
+/// letting callers report a precise "this codec is unsupported" error instead
+/// of an opaque conversion failure. Returns `None` if the container itself
+/// cannot be probed (unrecognized/corrupt bytes), which is not this
+/// function's concern to diagnose.
+pub(crate) fn probe_codec_label(path: &std::path::Path, extension: Option<&str>) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(extension) = extension {
+        hint.with_extension(extension);
+    }
+
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .ok()?;
+    let track = probed
+        .format
+        .tracks()
+        .iter()
+        .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)?;
+
+    Some(codec_type_label(track.codec_params.codec))
+}
+
+/// Human-readable name for the codecs symphonia's format registry can
+/// identify, whether or not this build links a decoder for them.
+fn codec_type_label(codec: CodecType) -> String {
+    match codec {
+        CODEC_TYPE_OPUS => "Opus".to_string(),
+        CODEC_TYPE_VORBIS => "Vorbis".to_string(),
+        CODEC_TYPE_AAC => "AAC".to_string(),
+        CODEC_TYPE_MP3 => "MP3".to_string(),
+        CODEC_TYPE_FLAC => "FLAC".to_string(),
+        CODEC_TYPE_ALAC => "ALAC".to_string(),
+        other => format!("codec {other}"),
+    }
 }
 
 fn decode_to_mono_f32(path: &Path, extension: Option<&str>) -> Option<DecodedMono> {

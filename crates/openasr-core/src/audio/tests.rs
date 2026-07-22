@@ -363,6 +363,56 @@ fn symphonia_decodes_ogg_vorbis_in_process() {
 }
 
 #[test]
+fn symphonia_decodes_webm_vorbis_in_process() {
+    let prepared = prepare_native_conversion(&crate_fixture("tone_stereo.webm"))
+        .expect("webm/vorbis should decode via the in-process symphonia mkv path");
+    assert_prepared_16k_mono_wav(&prepared);
+}
+
+#[test]
+fn symphonia_decodes_m4a_alac_in_process() {
+    let prepared = prepare_native_conversion(&crate_fixture("tone_mono_alac.m4a"))
+        .expect("m4a/ALAC should decode via the in-process symphonia alac path");
+    assert_prepared_16k_mono_wav(&prepared);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn webm_opus_names_the_codec_when_afconvert_also_cannot_open_it() {
+    // symphonia can demux the webm container (mkv feature) but has no Opus
+    // decoder, so this falls to afconvert -- which cannot parse WebM/Matroska
+    // at all (unlike a bare Opus-in-Ogg file, see the ogg/opus test below).
+    // The resulting error must name the detected codec rather than reading
+    // like the file is simply corrupt.
+    let error = prepare_native_conversion(&crate_fixture("tone_mono_opus.webm")).unwrap_err();
+
+    let message = error.to_string();
+    assert!(
+        matches!(error, AudioPreparationError::ConversionFailed { tool, .. } if tool == "afconvert")
+    );
+    assert!(
+        message.contains("Detected audio codec: Opus"),
+        "error should name the detected codec: {message}"
+    );
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn webm_opus_names_the_codec_in_the_missing_ffmpeg_hint() {
+    // On a non-macOS host with no ffmpeg configured, there is no afconvert
+    // fallback either: the `MissingFfmpeg` hint itself must name the detected
+    // codec instead of a generic "this format" placeholder.
+    let error = prepare_native_conversion(&crate_fixture("tone_mono_opus.webm")).unwrap_err();
+
+    let message = error.to_string();
+    assert!(matches!(error, AudioPreparationError::MissingFfmpeg { .. }));
+    assert!(
+        message.contains("Opus"),
+        "missing-ffmpeg hint should name the detected codec: {message}"
+    );
+}
+
+#[test]
 fn symphonia_decodes_and_resamples_non_conformant_wav() {
     // A real (non-16k-mono) wav is not passed through blindly: it is decoded
     // and resampled via the same symphonia path as the other formats.

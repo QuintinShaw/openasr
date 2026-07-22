@@ -43,13 +43,19 @@ pub enum AudioPreparationError {
     )]
     TempDir { source: std::io::Error },
     #[error(
-        "Could not convert input audio for the {backend} backend with {tool} (status {status}).\nOpenASR prepares recognized non-WAV inputs as temporary 16 kHz mono PCM WAV for non-mock backends. Check that your local {tool} can decode this container/codec, pass a different --ffmpeg-bin, or convert the file to WAV yourself.{stderr}"
+        "Could not convert input audio for the {backend} backend with {tool} (status {status}).{codec_note}\nOpenASR prepares recognized non-WAV inputs as temporary 16 kHz mono PCM WAV for non-mock backends. Check that your local {tool} can decode this container/codec, pass a different --ffmpeg-bin, or convert the file to WAV yourself.{stderr}"
     )]
     ConversionFailed {
         backend: BackendKind,
         tool: String,
         status: String,
         stderr: String,
+        /// Filled in when symphonia's demuxer could name the audio codec
+        /// even though no decoder for it is linked in (e.g. Opus): gives the
+        /// user a precise "which codec" answer instead of a bare tool
+        /// failure, so a truly-unsupported codec doesn't read like a corrupt
+        /// file. Rendered as an extra sentence when present, otherwise empty.
+        codec_note: String,
     },
     #[error(
         "Could not run {tool}: {path}\nPlease check that the file exists and is executable, or configure ffmpeg with --ffmpeg-bin, OPENASR_FFMPEG_BIN, or `openasr config set media.ffmpeg_bin`. Details: {source}"

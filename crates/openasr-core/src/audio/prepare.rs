@@ -72,19 +72,26 @@ pub(crate) fn prepare_external_input(
     }
 
     // In-process decode is the default main path for every other recognized
-    // format (m4a/AAC-LC, mp4, qta, mp3, flac, ogg/vorbis). It only ever
-    // returns `None` (never a hard error) when the container/codec is not
-    // supported (e.g. HE-AAC, Opus, webm) or the file is malformed, in which
-    // case control falls through to the external ffmpeg/afconvert chain
-    // below exactly as before. An explicitly configured ffmpeg binary is an
-    // escape hatch that always wins, so it is checked first.
+    // format (m4a/AAC-LC/ALAC, mp4, qta, mp3, flac, ogg/vorbis, mkv/webm
+    // vorbis). It only ever returns `None` (never a hard error) when the
+    // container/codec is not supported (e.g. HE-AAC, Opus in any container)
+    // or the file is malformed, in which case control falls through to the
+    // external ffmpeg/afconvert chain below exactly as before. An explicitly
+    // configured ffmpeg binary is an escape hatch that always wins, so it is
+    // checked first.
     if !options.ffmpeg_bin_explicit
         && let Some(prepared) = try_symphonia_prepare(&info)?
     {
         return Ok(prepared);
     }
 
-    let tool = resolve_conversion_tool(options)?;
+    // Symphonia's demuxer can often name the codec (e.g. "Opus") even when it
+    // has no decoder linked in for it -- surface that in the error below
+    // instead of leaving the user staring at a bare external-tool failure
+    // that reads like the file is corrupt.
+    let codec_label = symphonia_decode::probe_codec_label(&info.path, info.extension.as_deref());
+
+    let tool = resolve_conversion_tool(options, codec_label.as_deref())?;
     let temp_dir = tempfile::Builder::new()
         .prefix("openasr-audio-")
         .tempdir()
@@ -108,6 +115,7 @@ pub(crate) fn prepare_external_input(
                 |code| code.to_string(),
             ),
             stderr: format_stderr_suffix(tool.label(), &String::from_utf8_lossy(&output.stderr)),
+            codec_note: codec_note(codec_label.as_deref()),
         });
     }
 
@@ -248,6 +256,7 @@ const MACOS_AFCONVERT_PATH: &str = "/usr/bin/afconvert";
 
 fn resolve_conversion_tool(
     options: &AudioPreparationOptions,
+    codec_label: Option<&str>,
 ) -> Result<ConversionTool, AudioPreparationError> {
     if let Some(path) = options.ffmpeg_bin.clone() {
         if path.components().count() == 1 {
@@ -269,20 +278,38 @@ fn resolve_conversion_tool(
 
     Err(AudioPreparationError::MissingFfmpeg {
         backend: options.backend,
-        hint: missing_converter_hint(),
+        hint: missing_converter_hint(codec_label),
     })
 }
 
-fn missing_converter_hint() -> String {
+/// A short "detected codec: X" sentence for error messages, when symphonia's
+/// demuxer could name the codec; empty string (no extra sentence) otherwise.
+fn codec_note(codec_label: Option<&str>) -> String {
+    match codec_label {
+        Some(label) => format!(
+            "\nDetected audio codec: {label}. OpenASR's built-in decoder supports AAC, ALAC, FLAC, MP3, PCM/WAV, and Vorbis, but not {label} in-process."
+        ),
+        None => String::new(),
+    }
+}
+
+fn missing_converter_hint(codec_label: Option<&str>) -> String {
+    let codec_phrase = codec_label
+        .map(|label| format!("this format ({label})"))
+        .unwrap_or_else(|| {
+            "this format (e.g. HE-AAC, Opus, or an unrecognized WebM track)".to_string()
+        });
     #[cfg(target_os = "macos")]
     {
         format!(
-            "OpenASR's built-in decoder does not support this format (e.g. HE-AAC, Opus, or WebM); it needs ffmpeg. Install ffmpeg and add it to PATH, pass --ffmpeg-bin /path/to/ffmpeg, set OPENASR_FFMPEG_BIN, run `openasr config set media.ffmpeg_bin /path/to/ffmpeg`, or restore {MACOS_AFCONVERT_PATH} (OpenASR falls back to it automatically when ffmpeg is not configured, but it cannot decode every codec either -- install ffmpeg for full format support)."
+            "OpenASR's built-in decoder does not support {codec_phrase}; it needs ffmpeg. Install ffmpeg and add it to PATH, pass --ffmpeg-bin /path/to/ffmpeg, set OPENASR_FFMPEG_BIN, run `openasr config set media.ffmpeg_bin /path/to/ffmpeg`, or restore {MACOS_AFCONVERT_PATH} (OpenASR falls back to it automatically when ffmpeg is not configured, but it cannot decode every codec either -- install ffmpeg for full format support)."
         )
     }
     #[cfg(not(target_os = "macos"))]
     {
-        "OpenASR's built-in decoder does not support this format (e.g. HE-AAC, Opus, or WebM); it needs ffmpeg. Install ffmpeg and add it to PATH, pass --ffmpeg-bin /path/to/ffmpeg, set OPENASR_FFMPEG_BIN, or run `openasr config set media.ffmpeg_bin /path/to/ffmpeg`.".to_string()
+        format!(
+            "OpenASR's built-in decoder does not support {codec_phrase}; it needs ffmpeg. Install ffmpeg and add it to PATH, pass --ffmpeg-bin /path/to/ffmpeg, set OPENASR_FFMPEG_BIN, or run `openasr config set media.ffmpeg_bin /path/to/ffmpeg`."
+        )
     }
 }
 
