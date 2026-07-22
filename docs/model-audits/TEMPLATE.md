@@ -105,6 +105,7 @@ see `docs/design/gpu-weight-placement.md`).
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
 | WER vs fp16 measured for every shipped quant tier | <!-- TODO:fill --> | |
+| Model ref alias forms resolve identically everywhere (bare family / `family:canonical` / every `quant_tag_cases.json` alias accepted by CLI and server match logic; covered by the catalog-wide alias matrix test) | <!-- TODO:fill --> | |
 | Golden coverage includes long audio AND a cross-backend parity fixture | <!-- TODO:fill --> | |
 | Official decode parameters honored (suppression, stop tokens, upstream reference settings) | <!-- TODO:fill --> | |
 | Long-audio degradation checked (repetition, drift, truncation) | <!-- TODO:fill --> | |
