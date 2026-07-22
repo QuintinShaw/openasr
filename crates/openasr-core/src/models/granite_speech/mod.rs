@@ -21,6 +21,7 @@
 pub(crate) mod decode_executor;
 pub(crate) mod decoder_graph;
 pub(crate) mod encoder_graph;
+pub(crate) mod executor;
 pub(crate) mod frontend;
 pub mod package_import;
 pub(crate) mod prompt;
