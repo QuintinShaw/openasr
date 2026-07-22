@@ -579,9 +579,7 @@ impl CohereTranscribeEncoderGraphRuntime {
         let subsampled_freq = conv_out_dim(metadata.n_mels, 3, 2, 1)?;
         let subsampled_freq = conv_out_dim(subsampled_freq, 3, 2, 1)?;
         let subsampled_freq = conv_out_dim(subsampled_freq, 3, 2, 1)?;
-        let subsampled_frames = conv_out_dim(mel_features.n_frames, 3, 2, 1)?;
-        let subsampled_frames = conv_out_dim(subsampled_frames, 3, 2, 1)?;
-        let subsampled_frames = conv_out_dim(subsampled_frames, 3, 2, 1)?;
+        let subsampled_frames = predicted_encoder_time_frames(mel_features.n_frames)?;
         let positional = build_relative_positional_encoding(
             metadata.encoder_d_model,
             subsampled_frames,
@@ -1260,6 +1258,20 @@ fn conv_out_dim(
         .and_then(|value| value.checked_div(stride))
         .and_then(|value| value.checked_add(1))
         .ok_or(CohereTranscribeEncoderError::ShapeOverflow)
+}
+
+/// Post-subsampling encoder time-frame count the 3x Conv(k3,s2,p1) stem
+/// produces for `mel_frames` mel frames -- the same time-axis arithmetic
+/// [`CohereTranscribeEncoderGraphRuntime::encode`] runs, factored out (like
+/// firered-aed's `predicted_encoder_time_frames`) so a caller can predict the
+/// frame count a given audio duration will encode to without duplicating this
+/// arithmetic (see [`super::decoder_graph`]'s cross-KV capacity sizing).
+pub(crate) fn predicted_encoder_time_frames(
+    mel_frames: usize,
+) -> Result<usize, CohereTranscribeEncoderError> {
+    let frames = conv_out_dim(mel_frames, 3, 2, 1)?;
+    let frames = conv_out_dim(frames, 3, 2, 1)?;
+    conv_out_dim(frames, 3, 2, 1)
 }
 
 fn validate_mel_features(

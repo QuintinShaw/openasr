@@ -71,12 +71,16 @@ thread_local! {
 }
 
 type FireRedAedEncoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
-/// (canonical pack path, backend, encoder frame count). The decoder's
-/// cross-KV cache is allocated at a fixed size for the current utterance's
-/// encoder frame count (see [`FireRedDecoderGraphRuntime::new`]), so a cached
-/// runtime is only reusable across calls that share the same frame count --
-/// mirrors cohere's `CohereDecoderRuntimeCacheKey` precedent.
-type FireRedAedDecoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend, usize);
+/// (canonical pack path, backend). The decoder's cross-KV cache is now
+/// allocated ONCE per pack at this architecture's chunk-cap capacity (see
+/// [`FireRedDecoderGraphRuntime::new`] / `firered_decoder_cross_capacity_frames`),
+/// not at any one utterance's exact encoder frame count -- so a cached
+/// runtime is reusable across every VAD/longform chunk regardless of that
+/// chunk's actual frame count (as long as it fits the capacity, which the
+/// shared longform safety policy already guarantees). Frame count therefore
+/// no longer belongs in this key (see issue tracking the VAD 0%-cache-hit
+/// regression this fixes).
+type FireRedAedDecoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
 
 fn encode_with_cached_runtime(
     runtime_path: &Path,
@@ -110,18 +114,18 @@ fn decode_with_cached_runtime(
     let key = (
         canonical_runtime_cache_path(runtime_path),
         firered_decoder_graph_config().backend,
-        encoder_frame_count,
     );
     with_thread_local_cached_mut_by_key(
         &FIRERED_AED_DECODER_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || FireRedDecoderGraphRuntime::new(runtime_path, metadata, encoder_frame_count),
+        || FireRedDecoderGraphRuntime::new(runtime_path, metadata),
         |runtime| {
             run_firered_aed_decoder_greedy_with_runtime(
                 runtime,
                 metadata,
                 encoder_rows,
+                encoder_frame_count,
                 &decode_text,
             )
         },
@@ -481,6 +485,79 @@ mod tests {
         );
     }
 
+    /// Structural regression test for the VAD/longform 0%-cache-hit bug this
+    /// module fixes: chunks with DIFFERENT encoder frame counts on the same
+    /// thread must still land in the SAME decoder cache slot, because the
+    /// cross-KV cache is now allocated once at this pack's chunk-cap capacity
+    /// (issue tracking the VAD longform 0%-cache-hit regression) rather than
+    /// exactly at each chunk's frame count. `jfk.wav` and `zh_sample.wav` are
+    /// different durations (and firered's char+SPM tokenizer makes their
+    /// encoder frame counts essentially certain to differ), so this is a real
+    /// cross-frame-count reuse, not a same-length coincidence.
+    #[test]
+    #[ignore = "requires the private dev-only firered-aed-l-fp16.oasr pack; see module docs"]
+    fn differently_sized_chunks_reuse_the_same_decoder_runtime_cache_slot() {
+        let pack_path = dev_pack_path();
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return;
+        }
+        let build_request = |wav_path: PathBuf| {
+            let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+                wav_path,
+                "firered-aed cache-reuse test",
+                "firered-aed cache-reuse test",
+            )
+            .expect("load wav fixture");
+            GgmlAsrExecutionRequest {
+                runtime_source_path: pack_path.clone(),
+                runtime_source_preflight: None,
+                selected_family: firered_aed_runtime_descriptor_v1(),
+                prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+                request_options: Default::default(),
+                backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            }
+        };
+        let executor = FireRedAedGgmlExecutor;
+
+        let decoder_cache_len =
+            || FIRERED_AED_DECODER_RUNTIME_BY_KEY.with(|cache| cache.borrow().len());
+        let encoder_cache_len =
+            || FIRERED_AED_ENCODER_RUNTIME_BY_KEY.with(|cache| cache.borrow().len());
+        assert_eq!(decoder_cache_len(), 0, "cache must start empty");
+
+        let jfk = executor
+            .execute(&build_request(jfk_wav_path()))
+            .expect("firered-aed transcribe jfk.wav");
+        assert_eq!(jfk.transcription.text, GOLDEN_JFK_TEXT);
+        eprintln!(
+            "firered-aed cache slots after chunk 1: decoder={} encoder={}",
+            decoder_cache_len(),
+            encoder_cache_len()
+        );
+        assert_eq!(decoder_cache_len(), 1, "first chunk must build one slot");
+
+        let zh = executor
+            .execute(&build_request(zh_wav_path()))
+            .expect("firered-aed transcribe zh_sample.wav");
+        assert_eq!(zh.transcription.text, GOLDEN_ZH_TEXT);
+        eprintln!(
+            "firered-aed cache slots after chunk 2 (different frame count): decoder={} encoder={}",
+            decoder_cache_len(),
+            encoder_cache_len()
+        );
+        assert_eq!(
+            decoder_cache_len(),
+            1,
+            "a differently-sized second chunk must reuse the SAME decoder cache slot, not mint a second one"
+        );
+        assert_eq!(
+            encoder_cache_len(),
+            1,
+            "encoder cache was already frame-count-agnostic"
+        );
+    }
+
     /// Issue #158 defense-in-depth: a single window past the pack's
     /// PE-table capacity (~200s for this dev pack's `pe_len=9999`) must fail
     /// closed with a typed `AudioWindowTooLong` error instead of reaching
@@ -520,5 +597,57 @@ mod tests {
             message.contains("too long") || message.contains("positional-encoding capacity"),
             "expected a PE-capacity typed error, got: {message}"
         );
+    }
+
+    /// Regression for a REJECTed earlier version of this fix that made this
+    /// case fail closed: `segment_mode=off` (a real, user-reachable CLI/server
+    /// path -- `native_segment_cli.rs`'s `NativeSegmentMode::Off` /
+    /// `transcription.rs`'s equivalent) sends the WHOLE audio window straight
+    /// to the executor with no longform chunking at all, so a >32s clip
+    /// legitimately presents an encoder frame count past this pack's
+    /// chunk-cap cross-KV capacity while still being well under its
+    /// PE-table ceiling. Before this fix (still exact-per-call allocation)
+    /// this simply worked; the cross-KV capacity refactor must not turn that
+    /// into a hard failure -- growing the cache to fit must produce the
+    /// EXACT same transcript as `origin/main` (verified by hand for this
+    /// specific pack/clip; see the PR description for the recorded baseline).
+    #[test]
+    #[ignore = "requires the private dev-only firered-aed-l-v2-q4_k.oasr pack; see module docs"]
+    fn mode_off_single_window_past_chunk_cap_grows_and_matches_baseline() {
+        let pack_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/firered-out/firered-aed-l-v2-q4_k.oasr");
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return;
+        }
+        let wav_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/mode-off-regression/longform_en_zh_45s.wav");
+        if !wav_path.exists() {
+            eprintln!("skipping: {} not present", wav_path.display());
+            return;
+        }
+        // Recorded on `origin/main` (pre-capacity-refactor, exact-per-call
+        // cross-KV allocation) with the same pack/clip via a temporary
+        // baseline test, not committed.
+        const BASELINE_TEXT: &str = "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下 AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭晚上我们还计划去一家新开的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下 AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园";
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            wav_path,
+            "firered-aed mode=off grow test",
+            "firered-aed mode=off grow test",
+        )
+        .expect("load wav fixture");
+        let request = GgmlAsrExecutionRequest {
+            runtime_source_path: pack_path,
+            runtime_source_preflight: None,
+            selected_family: firered_aed_runtime_descriptor_v1(),
+            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            request_options: Default::default(),
+            backend_preference: GgmlAsrBackendPreference::CpuOnly,
+        };
+        let executor = FireRedAedGgmlExecutor;
+        let result = executor
+            .execute(&request)
+            .expect("mode=off single-window transcribe must succeed, not fail closed");
+        assert_eq!(result.transcription.text, BASELINE_TEXT);
     }
 }
