@@ -6,6 +6,15 @@ use crate::BackendKind;
 // container (ffmpeg's `mov,mp4,m4a,3gp,3g2,mj2` demuxer probes and decodes it
 // like any other MOV/M4A file, no special handling needed beyond recognizing
 // the extension).
+//
+// Every extension here is *reachable*, not necessarily decodable in-process:
+// `webm` in particular is a container, not a codec, and most real-world
+// `.webm`/`.ogg` audio uses Opus, which symphonia has never shipped a decoder
+// for (still true as of symphonia 0.6). Those files fall through to the
+// external ffmpeg/afconvert conversion chain in `prepare.rs` -- with ffmpeg
+// on PATH they still transcribe; without it, the error names the detected
+// codec instead of pretending the file is corrupt (see
+// `symphonia_decode::probe_codec_label` and `prepare::codec_note`).
 pub(crate) const RECOGNIZED_EXTENSIONS: &[&str] =
     &["wav", "mp3", "mp4", "m4a", "webm", "flac", "ogg", "qta"];
 

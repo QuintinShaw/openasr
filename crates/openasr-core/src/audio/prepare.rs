@@ -39,14 +39,16 @@ pub(crate) fn prepare_external_input(
         // Non-conformant (other sample rate, stereo, ...) and no explicit
         // ffmpeg was requested: decode via the same in-process symphonia path
         // as the other formats below.
-        if let Some(prepared) = try_symphonia_prepare(&info)? {
+        if let SymphoniaAttempt::Prepared(prepared) = try_symphonia_prepare(&info)? {
             return Ok(prepared);
         }
         // Symphonia could not parse this as a wav at all (corrupt/foreign
-        // bytes with a `.wav` extension): preserve today's leniency and pass
-        // the original bytes through untouched rather than hard-failing here
-        // -- downstream rejects it with a precise WAV-format error if it
-        // truly isn't valid input.
+        // bytes with a `.wav` extension, or -- per the trust-boundary
+        // invariant in AGENTS.md -- a third-party demuxer panic on malformed
+        // bytes that `try_symphonia_prepare` already caught and downgraded):
+        // preserve today's leniency and pass the original bytes through
+        // untouched rather than hard-failing here -- downstream rejects it
+        // with a precise WAV-format error if it truly isn't valid input.
         let prepared_path = info.path.clone();
         return Ok(PreparedAudioInput {
             original: info,
@@ -72,19 +74,35 @@ pub(crate) fn prepare_external_input(
     }
 
     // In-process decode is the default main path for every other recognized
-    // format (m4a/AAC-LC, mp4, qta, mp3, flac, ogg/vorbis). It only ever
-    // returns `None` (never a hard error) when the container/codec is not
-    // supported (e.g. HE-AAC, Opus, webm) or the file is malformed, in which
-    // case control falls through to the external ffmpeg/afconvert chain
-    // below exactly as before. An explicitly configured ffmpeg binary is an
-    // escape hatch that always wins, so it is checked first.
-    if !options.ffmpeg_bin_explicit
-        && let Some(prepared) = try_symphonia_prepare(&info)?
-    {
-        return Ok(prepared);
-    }
+    // format (m4a/AAC-LC/ALAC, mp4, qta, mp3, flac, ogg/vorbis, mkv/webm
+    // vorbis). It only ever falls through (never a hard error) when the
+    // container/codec is not supported (e.g. HE-AAC, Opus in any container),
+    // the file is malformed, or -- a third-party demuxer bug on adversarial
+    // input -- the underlying symphonia call panicked (caught and downgraded
+    // by `try_symphonia_prepare`, per the panic-free trust-boundary invariant
+    // in AGENTS.md); in all three cases control falls through to the external
+    // ffmpeg/afconvert chain below exactly as before. An explicitly
+    // configured ffmpeg binary is an escape hatch that always wins, so it is
+    // checked first.
+    let diagnostic = if !options.ffmpeg_bin_explicit {
+        match try_symphonia_prepare(&info)? {
+            SymphoniaAttempt::Prepared(prepared) => return Ok(prepared),
+            SymphoniaAttempt::NotHandled { codec_label } => Diagnostic::from(codec_label),
+            SymphoniaAttempt::ParserPanicked => Diagnostic::ParserPanicked,
+        }
+    } else {
+        // The explicit-ffmpeg escape hatch skips the in-process decode
+        // attempt entirely, so this is the only symphonia probe on this
+        // path -- still worth doing purely for the diagnostic codec name in
+        // case the configured ffmpeg also fails to convert the file.
+        match symphonia_decode::probe_codec_label(&info.path, info.extension.as_deref()) {
+            symphonia_decode::ProbeOutcome::Codec(label) => Diagnostic::Codec(label),
+            symphonia_decode::ProbeOutcome::Unknown => Diagnostic::Unknown,
+            symphonia_decode::ProbeOutcome::ParserPanicked => Diagnostic::ParserPanicked,
+        }
+    };
 
-    let tool = resolve_conversion_tool(options)?;
+    let tool = resolve_conversion_tool(options, &diagnostic)?;
     let temp_dir = tempfile::Builder::new()
         .prefix("openasr-audio-")
         .tempdir()
@@ -108,6 +126,7 @@ pub(crate) fn prepare_external_input(
                 |code| code.to_string(),
             ),
             stderr: format_stderr_suffix(tool.label(), &String::from_utf8_lossy(&output.stderr)),
+            codec_note: codec_note(&diagnostic),
         });
     }
 
@@ -132,16 +151,37 @@ fn wav_is_already_conformant(path: &std::path::Path) -> bool {
     )
 }
 
-/// Tries the in-process symphonia decode path for `info`. Returns `Ok(None)`
-/// (never a hard error) when the format/codec is unsupported or decoding
-/// otherwise fails, so the caller falls back to the external converter chain.
-fn try_symphonia_prepare(
-    info: &AudioInputInfo,
-) -> Result<Option<PreparedAudioInput>, AudioPreparationError> {
-    let Some((wav_bytes, source_format)) =
-        symphonia_decode::try_decode_to_pcm16_mono_16k_wav(&info.path, info.extension.as_deref())
-    else {
-        return Ok(None);
+/// Outcome of [`try_symphonia_prepare`].
+enum SymphoniaAttempt {
+    /// Decoded and written to a temporary WAV; ready to use.
+    Prepared(PreparedAudioInput),
+    /// Not decodable in-process; fall back to the external converter chain.
+    /// `codec_label` is the codec name the demuxer identified, if any (see
+    /// `symphonia_decode::SymphoniaOutcome::Unsupported`).
+    NotHandled { codec_label: Option<String> },
+    /// The underlying symphonia demuxer/decoder panicked on this input (a
+    /// third-party bug on adversarial bytes, e.g. `symphonia-format-mkv`'s
+    /// vint underflow -- see `symphonia_decode`'s module docs). Already
+    /// caught there; callers must not treat this as a hard error, only as a
+    /// reason to fall back, same as `NotHandled`.
+    ParserPanicked,
+}
+
+/// Tries the in-process symphonia decode path for `info`. Never a hard error
+/// on an unsupported/malformed/panicking input -- the caller falls back to
+/// the external converter chain in every such case (see [`SymphoniaAttempt`]).
+fn try_symphonia_prepare(info: &AudioInputInfo) -> Result<SymphoniaAttempt, AudioPreparationError> {
+    let (wav_bytes, source_format) = match symphonia_decode::try_decode_to_pcm16_mono_16k_wav(
+        &info.path,
+        info.extension.as_deref(),
+    ) {
+        symphonia_decode::SymphoniaOutcome::Decoded(bytes, source_format) => (bytes, source_format),
+        symphonia_decode::SymphoniaOutcome::Unsupported { codec_label } => {
+            return Ok(SymphoniaAttempt::NotHandled { codec_label });
+        }
+        symphonia_decode::SymphoniaOutcome::ParserPanicked => {
+            return Ok(SymphoniaAttempt::ParserPanicked);
+        }
     };
 
     let temp_dir = tempfile::Builder::new()
@@ -163,11 +203,36 @@ fn try_symphonia_prepare(
     original.sample_rate_hz = Some(source_format.sample_rate_hz);
     original.channels = Some(source_format.channels);
 
-    Ok(Some(PreparedAudioInput {
+    Ok(SymphoniaAttempt::Prepared(PreparedAudioInput {
         original,
         prepared_path,
         temp_dir: Some(temp_dir),
     }))
+}
+
+/// What (if anything) is known about why the in-process symphonia path
+/// didn't produce a result, for building the error message if the external
+/// converter subsequently also fails.
+enum Diagnostic {
+    /// The demuxer identified the codec (whether or not a decoder for it is
+    /// linked in).
+    Codec(String),
+    /// Nothing more specific than "not handled" is known.
+    Unknown,
+    /// The symphonia demuxer/decoder itself panicked on this input; see
+    /// `symphonia_decode`'s module docs. Distinguished from `Unknown` so the
+    /// error can say "internal parser error" instead of implying an
+    /// unsupported-but-well-formed codec.
+    ParserPanicked,
+}
+
+impl From<Option<String>> for Diagnostic {
+    fn from(codec_label: Option<String>) -> Self {
+        match codec_label {
+            Some(label) => Self::Codec(label),
+            None => Self::Unknown,
+        }
+    }
 }
 
 /// An external tool used to convert a non-WAV input into a 16 kHz mono PCM16
@@ -248,6 +313,7 @@ const MACOS_AFCONVERT_PATH: &str = "/usr/bin/afconvert";
 
 fn resolve_conversion_tool(
     options: &AudioPreparationOptions,
+    diagnostic: &Diagnostic,
 ) -> Result<ConversionTool, AudioPreparationError> {
     if let Some(path) = options.ffmpeg_bin.clone() {
         if path.components().count() == 1 {
@@ -269,20 +335,46 @@ fn resolve_conversion_tool(
 
     Err(AudioPreparationError::MissingFfmpeg {
         backend: options.backend,
-        hint: missing_converter_hint(),
+        hint: missing_converter_hint(diagnostic),
     })
 }
 
-fn missing_converter_hint() -> String {
+/// A short extra sentence for error messages describing what's known about
+/// why the in-process decode didn't handle this file; empty string (no extra
+/// sentence) when nothing more specific than "unsupported" is known.
+fn codec_note(diagnostic: &Diagnostic) -> String {
+    match diagnostic {
+        Diagnostic::Codec(label) => format!(
+            "\nDetected audio codec: {label}. OpenASR's built-in decoder supports AAC, ALAC, FLAC, MP3, PCM/WAV, and Vorbis, but not {label} in-process."
+        ),
+        Diagnostic::ParserPanicked => {
+            "\nOpenASR's built-in parser hit an internal error while inspecting this file. This looks like a malformed or corrupted container (or an edge case the parser doesn't handle), not merely an unsupported codec.".to_string()
+        }
+        Diagnostic::Unknown => String::new(),
+    }
+}
+
+fn missing_converter_hint(diagnostic: &Diagnostic) -> String {
+    let codec_phrase = match diagnostic {
+        Diagnostic::Codec(label) => format!("this format ({label})"),
+        Diagnostic::ParserPanicked => {
+            "this file (its container looks malformed or corrupted, or hits an edge case the bundled parser doesn't handle)".to_string()
+        }
+        Diagnostic::Unknown => {
+            "this format (e.g. HE-AAC, Opus, or an unrecognized WebM track)".to_string()
+        }
+    };
     #[cfg(target_os = "macos")]
     {
         format!(
-            "OpenASR's built-in decoder does not support this format (e.g. HE-AAC, Opus, or WebM); it needs ffmpeg. Install ffmpeg and add it to PATH, pass --ffmpeg-bin /path/to/ffmpeg, set OPENASR_FFMPEG_BIN, run `openasr config set media.ffmpeg_bin /path/to/ffmpeg`, or restore {MACOS_AFCONVERT_PATH} (OpenASR falls back to it automatically when ffmpeg is not configured, but it cannot decode every codec either -- install ffmpeg for full format support)."
+            "OpenASR's built-in decoder does not support {codec_phrase}; it needs ffmpeg. Install ffmpeg and add it to PATH, pass --ffmpeg-bin /path/to/ffmpeg, set OPENASR_FFMPEG_BIN, run `openasr config set media.ffmpeg_bin /path/to/ffmpeg`, or restore {MACOS_AFCONVERT_PATH} (OpenASR falls back to it automatically when ffmpeg is not configured, but it cannot decode every codec either -- install ffmpeg for full format support)."
         )
     }
     #[cfg(not(target_os = "macos"))]
     {
-        "OpenASR's built-in decoder does not support this format (e.g. HE-AAC, Opus, or WebM); it needs ffmpeg. Install ffmpeg and add it to PATH, pass --ffmpeg-bin /path/to/ffmpeg, set OPENASR_FFMPEG_BIN, or run `openasr config set media.ffmpeg_bin /path/to/ffmpeg`.".to_string()
+        format!(
+            "OpenASR's built-in decoder does not support {codec_phrase}; it needs ffmpeg. Install ffmpeg and add it to PATH, pass --ffmpeg-bin /path/to/ffmpeg, set OPENASR_FFMPEG_BIN, or run `openasr config set media.ffmpeg_bin /path/to/ffmpeg`."
+        )
     }
 }
 
