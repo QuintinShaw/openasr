@@ -304,6 +304,22 @@ fn native_m4a_input_converts_via_afconvert_without_ffmpeg() {
     assert_eq!(&bytes[8..12], b"WAVE");
 }
 
+/// `tests/fixtures/*.{m4a,mp3,flac,ogg,webm,qta}` are all synthesized, not
+/// recorded audio, so they can be regenerated if a fixture is lost or a new
+/// one is needed. Recipe (from a 0.5s 440 Hz mono/stereo sine `source.wav`
+/// generated via `ffmpeg -f lavfi -i "sine=frequency=440:duration=0.5" -ar
+/// 16000 -ac <1|2> source.wav`):
+///
+/// ```text
+/// ffmpeg -i source.wav -c:a alac tone_mono_alac.m4a
+/// ffmpeg -i source_stereo.wav -c:a vorbis -strict -2 -ac 2 tone_stereo.webm
+/// ffmpeg -i source.wav -c:a libopus tone_mono_opus.webm
+/// ```
+///
+/// `malformed_vint_zero.webm` is not synthesized audio at all -- see
+/// `symphonia_decode::tests::malformed_webm_vint_zero_bytes` for its exact
+/// (adversarial, hand-crafted) bytes and why they trigger a third-party
+/// demuxer bug.
 fn crate_fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -374,6 +390,48 @@ fn symphonia_decodes_m4a_alac_in_process() {
     let prepared = prepare_native_conversion(&crate_fixture("tone_mono_alac.m4a"))
         .expect("m4a/ALAC should decode via the in-process symphonia alac path");
     assert_prepared_16k_mono_wav(&prepared);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn malformed_webm_falls_back_to_typed_error_instead_of_panicking() {
+    // `malformed_vint_zero.webm` is a 16-byte fixture (the minimum symphonia's
+    // probe needs to recognize the mkv/webm marker at all) whose EBML header
+    // size field is the single byte `0x00`. `symphonia-format-mkv 0.5.5`'s
+    // vint reader computes `7 - byte.leading_zeros()` without checking that
+    // `leading_zeros() <= 7`, so this underflows and panics in a
+    // debug/overflow-checked build (verified via a standalone repro against
+    // the crate directly). This is exactly the kind of untrusted, arbitrary
+    // upload webm is a reachable surface for, so the panic-free trust-
+    // boundary invariant in AGENTS.md requires it be caught and turned into a
+    // typed error, not crash the process or be misreported as a corrupt file.
+    let error = prepare_native_conversion(&crate_fixture("malformed_vint_zero.webm")).unwrap_err();
+
+    let message = error.to_string();
+    assert!(
+        matches!(error, AudioPreparationError::ConversionFailed { tool, .. } if tool == "afconvert")
+    );
+    assert!(
+        message.contains("internal error while inspecting this file"),
+        "error should report a parser-internal-error, not a bare tool failure: {message}"
+    );
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn malformed_webm_falls_back_to_typed_error_instead_of_panicking() {
+    // See the macOS counterpart above for the vint-underflow panic this
+    // guards against. Without ffmpeg configured and no afconvert fallback,
+    // this must land on `MissingFfmpeg` (not a panic), with the hint naming
+    // the parser-internal-error condition.
+    let error = prepare_native_conversion(&crate_fixture("malformed_vint_zero.webm")).unwrap_err();
+
+    let message = error.to_string();
+    assert!(matches!(error, AudioPreparationError::MissingFfmpeg { .. }));
+    assert!(
+        message.contains("malformed or corrupted"),
+        "missing-ffmpeg hint should report the parser-internal-error condition: {message}"
+    );
 }
 
 #[test]

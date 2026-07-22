@@ -5,17 +5,34 @@
 //! mkv/webm (vorbis track only -- see below), and non-conformant wav all
 //! decode here without shelling out to ffmpeg or afconvert. Anything this
 //! module cannot decode (HE-AAC, Opus in any container, corrupt files,
-//! containers/codecs outside the enabled symphonia features) returns `None`
-//! so the caller falls back to the existing external converter chain -- this
-//! module never produces a hard error, only "handled" or "not handled".
+//! containers/codecs outside the enabled symphonia features) reports
+//! [`SymphoniaOutcome::Unsupported`] (never a hard error) so the caller falls
+//! back to the existing external converter chain.
 //!
 //! Opus is the big absence: symphonia has never shipped an Opus decoder (still
 //! true as of 0.6.0), so `.opus` files, and Opus tracks inside `.ogg`/`.webm`,
 //! always fall through regardless of which demuxer/codec features are
-//! enabled here. `probe_codec_label` below exists so callers can still tell
+//! enabled here. [`SymphoniaOutcome::Unsupported`] carries a `codec_label`
+//! when the demuxer could name the codec anyway, so callers can still tell
 //! the user *which* codec was the problem instead of a bare failure.
+//!
+//! # Untrusted input and third-party demuxer bugs
+//!
+//! `path` is arbitrary user-supplied bytes reaching a third-party demuxer
+//! (symphonia's format readers, including `symphonia-format-mkv`), which is
+//! outside this workspace's control and not guaranteed panic-free on
+//! malformed input -- e.g. a webm/mkv file whose first EBML element-size byte
+//! is `0x00` currently triggers a `debug_assert`-style subtract-overflow
+//! panic in `symphonia-format-mkv 0.5.5`'s vint reader (`ebml.rs`), since it
+//! computes `7 - byte.leading_zeros()` without checking that
+//! `leading_zeros() <= 7`. Per `AGENTS.md`'s trust-boundary invariant
+//! ("panic-free on untrusted input"), every symphonia entry point below runs
+//! inside [`std::panic::catch_unwind`] and turns a caught panic into
+//! [`SymphoniaOutcome::ParserPanicked`] / [`ProbeOutcome::ParserPanicked`],
+//! which callers report as a typed "internal parser error" rather than
+//! letting the process crash or misreporting the file as corrupt.
 
-use std::{fs::File, io::ErrorKind};
+use std::{fs::File, io::ErrorKind, panic::catch_unwind, path::Path};
 
 use rubato::{FftFixedIn, Resampler};
 use symphonia::core::{
@@ -30,8 +47,6 @@ use symphonia::core::{
     meta::MetadataOptions,
     probe::Hint,
 };
-
-use std::path::Path;
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 // FFT resampler chunk size: large enough to amortize FFT overhead, small
@@ -50,17 +65,54 @@ pub(crate) struct DecodedAudioSourceFormat {
     pub(crate) channels: u16,
 }
 
+/// Result of attempting the in-process symphonia decode path.
+pub(crate) enum SymphoniaOutcome {
+    /// Decoded successfully: ready-to-use 16 kHz mono PCM16 WAV bytes, plus
+    /// the file's true source format (sample rate/channels, before this
+    /// module's downmix/resample) for diagnostics.
+    Decoded(Vec<u8>, DecodedAudioSourceFormat),
+    /// Not decodable in-process (unsupported codec, malformed stream, or an
+    /// otherwise-empty result) -- fall back to the external converter chain.
+    /// `codec_label` is populated whenever the demuxer identified the track's
+    /// codec before decoding failed (see [`codec_type_label`]), even though
+    /// no decoder for it is linked into this build.
+    Unsupported { codec_label: Option<String> },
+    /// The symphonia demuxer/decoder itself panicked on this input (a
+    /// third-party bug hit via malformed/adversarial bytes -- see the module
+    /// docs). Callers must treat this exactly like `Unsupported` for control
+    /// flow (fall back to the external converter) but should report it as an
+    /// internal parser error rather than an unsupported codec.
+    ParserPanicked,
+}
+
 /// Attempt to decode `path` to a 16 kHz mono PCM16 WAV entirely in-process.
-/// Returns `None` (never an error) if the container/codec is not supported
-/// by the enabled symphonia features, or if decoding otherwise fails --
-/// callers should fall back to an external converter in that case.
+/// Never panics, even on adversarial input (see module docs): a panic inside
+/// the underlying symphonia demuxer/decoder is caught and reported as
+/// [`SymphoniaOutcome::ParserPanicked`].
 pub(crate) fn try_decode_to_pcm16_mono_16k_wav(
     path: &Path,
     extension: Option<&str>,
-) -> Option<(Vec<u8>, DecodedAudioSourceFormat)> {
-    let mono = decode_to_mono_f32(path, extension)?;
+) -> SymphoniaOutcome {
+    // `path: &Path` and `extension: Option<&str>` are plain shared references
+    // to data with no interior mutability, so this closure's captured
+    // environment is `UnwindSafe` on its own merits -- no `AssertUnwindSafe`
+    // needed. `decode_attempt` also allocates and owns all of its mutable
+    // state (the symphonia reader, decoder, sample buffer) locally, so
+    // nothing mutable crosses the unwind boundary either way.
+    let attempt = match catch_unwind(|| decode_attempt(path, extension)) {
+        Ok(attempt) => attempt,
+        Err(_) => return SymphoniaOutcome::ParserPanicked,
+    };
+
+    let Some(mono) = attempt.mono else {
+        return SymphoniaOutcome::Unsupported {
+            codec_label: attempt.codec_label,
+        };
+    };
     if mono.samples.is_empty() {
-        return None;
+        return SymphoniaOutcome::Unsupported {
+            codec_label: attempt.codec_label,
+        };
     }
     let source_format = DecodedAudioSourceFormat {
         sample_rate_hz: mono.sample_rate,
@@ -69,19 +121,30 @@ pub(crate) fn try_decode_to_pcm16_mono_16k_wav(
     let resampled = if mono.sample_rate == TARGET_SAMPLE_RATE {
         mono.samples
     } else {
-        resample_mono_to_16k(&mono.samples, mono.sample_rate)?
+        match resample_mono_to_16k(&mono.samples, mono.sample_rate) {
+            Some(resampled) => resampled,
+            None => {
+                return SymphoniaOutcome::Unsupported {
+                    codec_label: attempt.codec_label,
+                };
+            }
+        }
     };
-    Some((encode_pcm16_mono_16k_wav(&resampled), source_format))
+    SymphoniaOutcome::Decoded(encode_pcm16_mono_16k_wav(&resampled), source_format)
 }
 
-struct DecodedMono {
-    samples: Vec<f32>,
-    sample_rate: u32,
-    /// The source track's channel count *before* this function's mono
-    /// downmix (which always collapses to 1) -- captured from the first
-    /// successfully decoded packet's `AudioBufferRef::spec()`, same as
-    /// `sample_rate` below.
-    channels: u16,
+/// Result of [`probe_codec_label`]: names the codec of a file's first real
+/// track without requiring a decoder for it, for building diagnostic
+/// messages when the in-process decode path was never attempted (the
+/// explicit-ffmpeg escape hatch bypasses it entirely -- see `prepare.rs`).
+pub(crate) enum ProbeOutcome {
+    /// The demuxer identified the track's codec.
+    Codec(String),
+    /// The container itself could not be probed (unrecognized/corrupt
+    /// bytes), which is not this function's concern to diagnose.
+    Unknown,
+    /// The symphonia probe panicked on this input; see the module docs.
+    ParserPanicked,
 }
 
 /// Probes `path` far enough to name the audio codec of its first real track,
@@ -90,10 +153,19 @@ struct DecodedMono {
 /// regardless of which decoder features this build enables, so this can
 /// identify e.g. Opus in a container symphonia can parse but not decode --
 /// letting callers report a precise "this codec is unsupported" error instead
-/// of an opaque conversion failure. Returns `None` if the container itself
-/// cannot be probed (unrecognized/corrupt bytes), which is not this
-/// function's concern to diagnose.
-pub(crate) fn probe_codec_label(path: &std::path::Path, extension: Option<&str>) -> Option<String> {
+/// of an opaque conversion failure. Never panics (see module docs).
+pub(crate) fn probe_codec_label(path: &Path, extension: Option<&str>) -> ProbeOutcome {
+    // Same `UnwindSafe` reasoning as `try_decode_to_pcm16_mono_16k_wav` above:
+    // both captured arguments are plain shared references with no interior
+    // mutability.
+    match catch_unwind(|| probe_codec_label_inner(path, extension)) {
+        Ok(Some(label)) => ProbeOutcome::Codec(label),
+        Ok(None) => ProbeOutcome::Unknown,
+        Err(_) => ProbeOutcome::ParserPanicked,
+    }
+}
+
+fn probe_codec_label_inner(path: &Path, extension: Option<&str>) -> Option<String> {
     let file = File::open(path).ok()?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -133,7 +205,39 @@ fn codec_type_label(codec: CodecType) -> String {
     }
 }
 
-fn decode_to_mono_f32(path: &Path, extension: Option<&str>) -> Option<DecodedMono> {
+struct DecodedMono {
+    samples: Vec<f32>,
+    sample_rate: u32,
+    /// The source track's channel count *before* this function's mono
+    /// downmix (which always collapses to 1) -- captured from the first
+    /// successfully decoded packet's `AudioBufferRef::spec()`, same as
+    /// `sample_rate` above.
+    channels: u16,
+}
+
+/// Combines demuxing, codec identification, and decoding into a single pass
+/// so a caller reporting a failed decode doesn't need to re-open and re-probe
+/// the file just to name the codec (see `codec_label` on the returned
+/// struct). Never itself panics on symphonia's behalf -- run this through
+/// `catch_unwind` (as `try_decode_to_pcm16_mono_16k_wav` does), not directly.
+struct DecodeAttempt {
+    /// Populated as soon as a real (non-null) track is found, even if
+    /// decoding it then fails -- see [`codec_type_label`].
+    codec_label: Option<String>,
+    mono: Option<DecodedMono>,
+}
+
+fn decode_attempt(path: &Path, extension: Option<&str>) -> DecodeAttempt {
+    let mut codec_label = None;
+    let mono = decode_to_mono_f32(path, extension, &mut codec_label);
+    DecodeAttempt { codec_label, mono }
+}
+
+fn decode_to_mono_f32(
+    path: &Path,
+    extension: Option<&str>,
+    codec_label: &mut Option<String>,
+) -> Option<DecodedMono> {
     let file = File::open(path).ok()?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -157,6 +261,7 @@ fn decode_to_mono_f32(path: &Path, extension: Option<&str>) -> Option<DecodedMon
         .iter()
         .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)?;
     let track_id = track.id;
+    *codec_label = Some(codec_type_label(track.codec_params.codec));
 
     if let Some(extra_data) = track.codec_params.extra_data.as_deref()
         && is_unsupported_aac_extension(&track.codec_params.codec, extra_data)
@@ -419,5 +524,40 @@ mod tests {
         let path = dir.keep().join("out.wav");
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    /// A minimal webm/mkv EBML header whose size vint is the single byte
+    /// `0x00`: `symphonia-format-mkv 0.5.5`'s `read_vint` computes
+    /// `7 - byte.leading_zeros()` without checking that `leading_zeros() <=
+    /// 7`, so `leading_zeros(0x00) == 8` underflows that subtraction and
+    /// panics (`attempt to subtract with overflow`) in a debug/overflow-
+    /// checked build. The probe needs a 16-byte window to recognize the
+    /// container at all (see `symphonia_core::probe::Probe::next`), hence
+    /// the trailing padding -- this is the smallest input that reaches the
+    /// buggy line.
+    fn malformed_webm_vint_zero_bytes() -> Vec<u8> {
+        let mut bytes = vec![0x1A, 0x45, 0xDF, 0xA3, 0x00];
+        bytes.extend(std::iter::repeat_n(0xAA, 11));
+        bytes
+    }
+
+    #[test]
+    fn malformed_webm_vint_underflow_is_caught_not_panicked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed.webm");
+        std::fs::write(&path, malformed_webm_vint_zero_bytes()).unwrap();
+
+        // Before the `catch_unwind` guard, this call panicked (verified via a
+        // standalone repro against symphonia-format-mkv 0.5.5 directly); it
+        // must now report `ParserPanicked` and let the caller fall back to
+        // the external converter chain instead of crashing the process.
+        assert!(matches!(
+            try_decode_to_pcm16_mono_16k_wav(&path, Some("webm")),
+            SymphoniaOutcome::ParserPanicked
+        ));
+        assert!(matches!(
+            probe_codec_label(&path, Some("webm")),
+            ProbeOutcome::ParserPanicked
+        ));
     }
 }
