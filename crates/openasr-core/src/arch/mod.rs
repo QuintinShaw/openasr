@@ -22,8 +22,9 @@ use block_stack::{
 use hparams::{
     COHERE_TRANSCRIBE_DECODER_LAYERS_KEY, COHERE_TRANSCRIBE_ENCODER_LAYERS_KEY,
     COHERE_TRANSCRIBE_HPARAM_SCHEMA, DOLPHIN_HPARAM_SCHEMA, FIRERED_AED_HPARAM_SCHEMA,
-    FIRERED_LLM_HPARAM_SCHEMA, MIMO_ASR_HPARAM_SCHEMA, MOONSHINE_HPARAM_SCHEMA,
-    MOSS_TD_HPARAM_SCHEMA, PARAKEET_CTC_HPARAM_SCHEMA, PARAKEET_TDT_HPARAM_SCHEMA,
+    FIRERED_LLM_HPARAM_SCHEMA, GRANITE_SPEECH_HPARAM_SCHEMA, MIMO_ASR_HPARAM_SCHEMA,
+    MOONSHINE_HPARAM_SCHEMA, MOSS_TD_HPARAM_SCHEMA, PARAKEET_CTC_HPARAM_SCHEMA,
+    PARAKEET_TDT_HPARAM_SCHEMA,
     QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA, QWEN3_AUDIO_LAYERS_KEY,
     QWEN3_LLM_LAYERS_KEY, SENSEVOICE_HPARAM_SCHEMA, WAV2VEC2_CTC_HPARAM_SCHEMA,
     WHISPER_HPARAM_SCHEMA, XASR_ZIPFORMER_HPARAM_SCHEMA,
@@ -209,6 +210,27 @@ pub(crate) const MOSS_TD_DECODE_POLICY_ID: &str = "moss-transcribe-diarize.greed
 pub(crate) const MOSS_TD_RUNTIME_TENSOR_CONTRACT_ID: &str =
     "moss-transcribe-diarize.runtime-tensors.v0";
 pub(crate) const MOSS_TD_EXECUTOR_COMPONENT_ID: &str = "moss-transcribe-diarize.ggml-executor.v0";
+
+// granite-speech (ibm-granite/granite-speech-4.1-2b, Apache-2.0): a 16-layer
+// Conformer CTC encoder (Shaw relative-position block-local attention,
+// self-conditioned CTC mid-layer tap) + a BLIP-2 Q-Former window projector
+// (new component -- see `models::granite_speech::qformer`'s module doc on why
+// it stays family-local for now) + a dense Granite decoder-only LLM (GQA,
+// RoPE, SwiGLU, RMSNorm, plus four Granite-specific scaling scalars --
+// attention/embedding/residual multipliers and logits scaling -- modeled
+// faithfully rather than folded into the shared qwen decoder stack, see
+// `models::granite_speech::decoder_graph`'s module doc). Like firered-aed/
+// firered-llm/mimo-asr, none of the three stages are composer block kinds,
+// so this stays on a hand-written dedicated executor (block_stack: None).
+pub(crate) const GRANITE_SPEECH_GGML_ARCHITECTURE_ID: &str = "granite-speech";
+pub(crate) const GRANITE_SPEECH_GGML_ADAPTER_ID: &str = "ggml-family-granite-speech-runtime-v1";
+pub(crate) const GRANITE_SPEECH_MODEL_FAMILY: &str = "granite-speech";
+pub(crate) const GRANITE_SPEECH_AUDIO_FRONTEND_ID: &str = "granite-speech.mel80x2.16khz.mono.v0";
+pub(crate) const GRANITE_SPEECH_TOKENIZER_ID: &str = "granite-speech.gpt2-bpe.v0";
+pub(crate) const GRANITE_SPEECH_DECODE_POLICY_ID: &str = "granite-speech.greedy.seq2seq.v0";
+pub(crate) const GRANITE_SPEECH_RUNTIME_TENSOR_CONTRACT_ID: &str =
+    "granite-speech.runtime-tensors.v0";
+pub(crate) const GRANITE_SPEECH_EXECUTOR_COMPONENT_ID: &str = "granite-speech.ggml-executor.v0";
 
 // hymt2 (Tencent Hunyuan-MT2 subtitle translation, hunyuan-dense decoder-only
 // LLM). An auxiliary text-to-text family, NOT an ASR architecture: it is
@@ -1303,6 +1325,26 @@ const BUILTIN_COMPONENT_DESCRIPTORS: &[OpenAsrComponentDescriptor] = &[
         kind: OpenAsrComponentKind::Executor,
         id: MOSS_TD_EXECUTOR_COMPONENT_ID,
     },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::AudioFrontend,
+        id: GRANITE_SPEECH_AUDIO_FRONTEND_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::DecodePolicy,
+        id: GRANITE_SPEECH_DECODE_POLICY_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::RuntimeTensorContract,
+        id: GRANITE_SPEECH_RUNTIME_TENSOR_CONTRACT_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Tokenizer,
+        id: GRANITE_SPEECH_TOKENIZER_ID,
+    },
+    OpenAsrComponentDescriptor {
+        kind: OpenAsrComponentKind::Executor,
+        id: GRANITE_SPEECH_EXECUTOR_COMPONENT_ID,
+    },
 ];
 
 const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
@@ -2162,6 +2204,93 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // same classification as `whisper` itself.
         encoder_attention_span: OpenAsrEncoderAttentionSpan::FixedWindow,
     },
+    OpenAsrArchitectureDescriptor {
+        runtime_architecture_aliases: &[GRANITE_SPEECH_GGML_ARCHITECTURE_ID],
+        model_family: GRANITE_SPEECH_MODEL_FAMILY,
+        model_architecture: GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+        adapter_id: GRANITE_SPEECH_GGML_ADAPTER_ID,
+        // The Granite decoder auto-detects/produces the transcript language
+        // through free-text instruction-following (no dedicated language
+        // token; the model card documents multilingual prompts working
+        // without a language selector) -- same shape as qwen3-asr/moss-td:
+        // reject an explicit hint rather than silently ignore it.
+        language_family_hint: LanguageFamilyHint::SelfDetectsRejectsHint {
+            reject_reason: "Granite Speech auto-detects the source language through free-text prompting and does not accept an explicit selection.",
+        },
+        audio_frontend_id: GRANITE_SPEECH_AUDIO_FRONTEND_ID,
+        runtime_tensor_contract_id: GRANITE_SPEECH_RUNTIME_TENSOR_CONTRACT_ID,
+        tokenizer_id: GRANITE_SPEECH_TOKENIZER_ID,
+        decode_policy_id: GRANITE_SPEECH_DECODE_POLICY_ID,
+        executor_component_id: GRANITE_SPEECH_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "granite-speech",
+            // Native keyword biasing via the prompt convention (see
+            // `granite_speech::executor::supports_phrase_bias` and the
+            // keyword-list end-to-end coverage), not the shared decode-time
+            // logit-boost path; the family declares its own true.
+            supports_phrase_bias: true,
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            // Greedy decode rides the one shared seq2seq driver via the
+            // decode-policy registry (see AGENTS.md's single-driver invariant);
+            // this family provides a `Seq2SeqGreedyDecodeStepExecutor` and a
+            // `GRANITE_SPEECH_DECODE_POLICY_ID` descriptor rather than a
+            // hand-rolled argmax loop.
+            shared_decode_driver: OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy,
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_granite_speech_source_to_runtime_pack",
+            },
+            reference_dumper_source: None,
+        },
+        execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+        prefer_cpu_decoder_for_multichunk_metal: false,
+        // Perf/backend tuning is out of scope for this landing (the decoder
+        // is still the O(n^2) recompute-per-step prefill executor, see
+        // `decode_executor.rs`'s module doc) -- start un-gated like every
+        // other family's initial landing, revisit once a real measurement
+        // exists.
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
+        // Granite Speech emits plain transcripts with no in-decoder speaker
+        // markup, so speaker structure comes from the shared external
+        // segmenter pass, same as every other non-diarizing family here.
+        speaker_segmentation: SpeakerSegmentationSource::External,
+        // External families ride the shared generic longform window (slices
+        // are never their own speaker scope). This is not the whole-recording
+        // single-prompt `ScopedSlices` case (only moss-transcribe-diarize is),
+        // so no integral window is declared or consumed here.
+        longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
+        // The projected audio tokens splice into the Granite decoder prompt,
+        // but a single decode only ever sees one shared-window slice (this is
+        // `SharedWindow`, not the whole-recording integral `ScopedSlices`
+        // case), and the decoder declares no max-position/context pack key, so
+        // there is no KV integral figure to derive without a pack revision
+        // this landing does not need -- the shared window is what bounds the
+        // audio per decode. Same shape as firered-aed/moonshine above.
+        // (Promoting this to a `Derived` decoder-context model is deferred to
+        // the capacity-derivation follow-up.)
+        capacity_model: CapacityModelDeclaration::BoundedElsewhere {
+            by: "shared-window slice; no decoder max-position pack key to derive from",
+        },
+        // The model card documents punctuation/truecasing as a real,
+        // evaluated capability (a documented prompt variant + reported PER/
+        // Cap-F1 metrics), and the family's own end-to-end golden samples
+        // come out correctly punctuated -- unlike `MIMO_ASR`'s "not
+        // characterized yet" case above, this one has been observed.
+        emits_punctuation: Some(true),
+        hparam_schema: GRANITE_SPEECH_HPARAM_SCHEMA,
+        // Conformer encoder + Q-Former projector + Granite decoder all stay
+        // on the dedicated executor (none of the three is a composer block
+        // kind), so no data-driven block-stack descriptor.
+        block_stack: None,
+        // The Conformer encoder's self-attention is local to non-overlapping
+        // `context_size=200`-frame blocks (Shaw relative-position attention),
+        // never global over the whole utterance -- memory is bounded per
+        // block regardless of total audio length, matching `LocalChunked`
+        // exactly (see `encoder_graph.rs`'s module doc). This is a real,
+        // verified difference from every other family's classification here:
+        // it is neither `whisper`'s architecture-fixed 30s window nor a
+        // quadratic-over-the-whole-chunk encoder.
+        encoder_attention_span: OpenAsrEncoderAttentionSpan::LocalChunked,
+    },
 ];
 
 #[cfg(test)]
@@ -2263,6 +2392,11 @@ mod tests {
                 MOSS_TD_GGML_ARCHITECTURE_ID,
                 SpeakerSegmentationSource::InDecoder,
                 None,
+            ),
+            (
+                GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
             ),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
@@ -2565,6 +2699,10 @@ mod tests {
             // Post-#212 quiet-window A/B: true accelerated Metal is faster
             // than CPU; Auto may select Metal (see descriptor note).
             (MOSS_TD_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
+            (
+                GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+                AutoGpuPolicy::AllBackends,
+            ),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
         let mut seen = std::collections::BTreeSet::new();
@@ -2727,6 +2865,10 @@ mod tests {
             (
                 MOSS_TD_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::FixedWindow,
+            ),
+            (
+                GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::LocalChunked,
             ),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();

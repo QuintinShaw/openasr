@@ -277,6 +277,35 @@ const BUILTIN_DECODE_POLICY_COMPONENTS: &[BuiltinDecodePolicyComponentDescriptor
         ctc_blank_token_id: None,
     },
     BuiltinDecodePolicyComponentDescriptor {
+        // Source of truth is `crate::arch` (same staging precedent as
+        // mimo-asr above): granite-speech has no crate-root re-export.
+        decode_policy_id: crate::arch::GRANITE_SPEECH_DECODE_POLICY_ID,
+        execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
+        // eot (`<|end_of_text|>`) is supplied per-request via
+        // `BuiltinSeq2SeqDecodePolicyConfigInput.eot_token_id`; the audio
+        // placeholder token is never emitted by the LLM itself (it only ever
+        // appears in the prompt, spliced in by the executor before decode
+        // starts), so there is nothing else to strip -- Identity postprocess,
+        // same shape as firered-llm/mimo-asr/moss-transcribe-diarize.
+        seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
+        seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
+        // This family's executor assembles the audio splice ONCE (the whole
+        // Conformer-encoded + Q-Former-projected utterance goes into a
+        // single prompt, see `prompt.rs`) and decodes it in one pass -- it
+        // never re-embeds audio across multiple fresh ChatML-style turns the
+        // way firered-llm/mimo-asr's per-chunk hard caps do, and its encoder
+        // is `LocalChunked` (Conformer block-attention), not one of the
+        // small-context plain-prompted AED decoders `ConservativeSeq2SeqV1`
+        // guards against repeating on long pause-free audio -- same
+        // reasoning as `whisper`/`moss-transcribe-diarize` pairing
+        // `FixedWindow`/`Default` above.
+        longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
+        longform_profile: BuiltinDecodePolicyLongformProfile::Default,
+        ctc_blank_token_id: None,
+    },
+    BuiltinDecodePolicyComponentDescriptor {
         // hymt2 is an auxiliary translation family (no arch-registry entry, no
         // crate-root re-export); its runtime resolves this descriptor directly
         // by policy id. Source of truth for the id is `crate::arch`.

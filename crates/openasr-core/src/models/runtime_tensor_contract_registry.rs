@@ -74,6 +74,7 @@ pub(crate) enum DedicatedRuntimeTensorContractFamily {
     FireRedLlm,
     MimoAsr,
     MossTd,
+    GraniteSpeech,
 }
 
 impl DedicatedRuntimeTensorContractFamily {
@@ -89,6 +90,7 @@ impl DedicatedRuntimeTensorContractFamily {
             Self::FireRedLlm => "firered-llm",
             Self::MimoAsr => "mimo-asr",
             Self::MossTd => "moss-transcribe-diarize",
+            Self::GraniteSpeech => "granite-speech",
         }
     }
 }
@@ -261,6 +263,9 @@ fn dedicated_runtime_tensor_contract_family(
         }
         crate::arch::MOSS_TD_RUNTIME_TENSOR_CONTRACT_ID => {
             Some(DedicatedRuntimeTensorContractFamily::MossTd)
+        }
+        crate::arch::GRANITE_SPEECH_RUNTIME_TENSOR_CONTRACT_ID => {
+            Some(DedicatedRuntimeTensorContractFamily::GraniteSpeech)
         }
         _ => None,
     }

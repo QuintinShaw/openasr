@@ -26,12 +26,18 @@ pub(crate) mod frontend;
 pub mod package_import;
 pub(crate) mod prompt;
 pub(crate) mod qformer;
+pub(crate) mod runtime_contract;
 pub(crate) mod runtime_provider;
 pub(crate) mod tokenizer;
 
 #[cfg(test)]
 mod parity;
 
-/// Crate-internal model-family + architecture ids.
-pub(crate) const GRANITE_SPEECH_MODEL_FAMILY: &str = "granite-speech";
-pub(crate) const GRANITE_SPEECH_GGML_ARCHITECTURE_ID: &str = "granite-speech";
+// Force-linked pack-import surface: the architecture integration descriptor
+// names this convert symbol, and `models::pack_import_surface` proves it stays
+// linked. Re-exported at the module root to match every other family's shape.
+pub use package_import::convert_local_granite_speech_source_to_runtime_pack;
+
+// Model-family + architecture ids live in `crate::arch` (see
+// `GRANITE_SPEECH_MODEL_FAMILY`/`GRANITE_SPEECH_GGML_ARCHITECTURE_ID` there),
+// the single source of truth every builtin registry resolves against.

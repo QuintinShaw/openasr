@@ -51,7 +51,7 @@ use crate::models::oasr_metadata::{
 use crate::models::pack_quant::PackQuant;
 use crate::nn::half::f32_to_f16_bits;
 
-use super::{GRANITE_SPEECH_GGML_ARCHITECTURE_ID, GRANITE_SPEECH_MODEL_FAMILY};
+use crate::arch::{GRANITE_SPEECH_GGML_ARCHITECTURE_ID, GRANITE_SPEECH_MODEL_FAMILY};
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_INDEX_JSON: &str = "model.safetensors.index.json";
@@ -488,6 +488,18 @@ fn granite_speech_runtime_gguf_metadata(
         &mut metadata,
         "granite_speech.decoder.num_attention_heads",
         t.num_attention_heads as u32,
+    );
+    // HF's `GraniteAttention` reads an explicit `head_dim` config key when
+    // present, falling back to `hidden_size / num_attention_heads` only when
+    // absent (see `modeling_granite.py`); write the resolved value explicitly
+    // rather than have the runtime re-derive it, so a future checkpoint that
+    // *does* set `head_dim` separately from `hidden_size/num_heads` (the
+    // qwen3-in-moss precedent for this exact class of bug) is not silently
+    // computed wrong.
+    insert_metadata(
+        &mut metadata,
+        "granite_speech.decoder.head_dim",
+        (t.hidden_size / t.num_attention_heads.max(1)) as u32,
     );
     insert_metadata(
         &mut metadata,

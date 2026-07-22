@@ -74,6 +74,10 @@ pub(crate) fn linked_core_pack_import_symbols() -> BTreeMap<&'static str, usize>
             "convert_local_moss_transcribe_diarize_source_to_runtime_pack",
             crate::models::moss_transcribe_diarize::convert_local_moss_transcribe_diarize_source_to_runtime_pack,
         ),
+        link_symbol(
+            "convert_local_granite_speech_source_to_runtime_pack",
+            crate::models::granite_speech::convert_local_granite_speech_source_to_runtime_pack,
+        ),
     ]
     .into_iter()
     .collect()
