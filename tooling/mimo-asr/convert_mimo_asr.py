@@ -771,7 +771,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         # canonical quant label for tensor policy is q8_0/f16 style; pack name uses q8_0/fp16
         policy_label = "q8_0" if q == "q8_0" else "fp16"
         out_path = args.out_dir / f"{args.package_id}-{q}.oasr"
-        model_id = f"{args.package_id}-{q}"
+        # Catalog convention is colon-joined `family:quant` (see model-registry
+        # pull ids and tooling/publish-model's f"{registry_id}:{suffix}"); a
+        # hyphen-joined id here used to make openasr.model.id unparseable as
+        # `family:quant`, so the server's native runtime matcher fell back to
+        # treating the whole hyphenated string as an unrecognized bare family
+        # id and rejected every valid `mimo-v2.5-asr:<quant-alias>` request.
+        model_id = f"{args.package_id}:{q}"
         print(f"[convert] {q} -> {out_path}", flush=True)
         res = write_pack(args.main_dir, args.tokenizer, out_path, policy_label, model_id)
         print(f"[done] {q}: {res['tensor_count']} tensors, "

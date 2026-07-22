@@ -990,15 +990,43 @@ pub fn default_catalog_url() -> &'static str {
     DEFAULT_CATALOG_URL
 }
 
+// Single source of truth for which alternate spellings collapse onto the same
+// canonical quant tag. `canonical_quant_tag` and `is_recognized_quant_alias_token`
+// both derive from this one table so a native-runtime legacy-source-id matcher
+// (or any other alias-aware comparison) can never drift from the canonicalizer
+// by maintaining a second copy of the mapping.
 // PARITY: must match the desktop TypeScript client's `canonicalQuantTag` exactly.
+const QUANT_ALIAS_GROUPS: &[(&[&str], &str)] = &[
+    (&["q8", "q8_0"], "q8_0"),
+    // "q4km" is the catalog product suffix for mixed Q4_K_M packs (Hy-MT2);
+    // see tooling/publish-model/scripts/_catalog.py's QUANT_METADATA table.
+    (&["q4", "q4_k", "q4_k_m", "q4km"], "q4_k"),
+    (&["q3", "q3_k"], "q3_k"),
+    (&["fp16"], "fp16"),
+];
+
 pub fn canonical_quant_tag(tag: &str) -> &str {
-    match tag.trim() {
-        "q8" | "q8_0" => "q8_0",
-        "q4" | "q4_k" | "q4_k_m" => "q4_k",
-        "q3" | "q3_k" => "q3_k",
-        "fp16" => "fp16",
-        other => other,
+    let trimmed = tag.trim();
+    for (aliases, canonical) in QUANT_ALIAS_GROUPS {
+        if aliases.contains(&trimmed) {
+            return canonical;
+        }
     }
+    trimmed
+}
+
+/// True when `tag` (after trimming) is one of the recognized alternate
+/// spellings in [`QUANT_ALIAS_GROUPS`] -- i.e. a token `canonical_quant_tag`
+/// actually translates, as opposed to an already-canonical or unrecognized tag
+/// that merely passes through unchanged. Used to recognize a legacy
+/// hyphen-joined native runtime source id (`family-<alias>`, baked into
+/// already-published packs by an older conversion tool) as carrying a quant
+/// suffix, without maintaining a second copy of the alias table.
+pub(crate) fn is_recognized_quant_alias_token(tag: &str) -> bool {
+    let trimmed = tag.trim();
+    QUANT_ALIAS_GROUPS
+        .iter()
+        .any(|(aliases, _)| aliases.contains(&trimmed))
 }
 
 // PARITY: keep in lockstep with the desktop TypeScript client's `recommendedQuantForDevice`.

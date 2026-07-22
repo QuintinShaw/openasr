@@ -916,8 +916,10 @@ pub(crate) fn validate_native_request_model(
         | NativeRuntimeModelIdSource::RuntimeSourcePathStemFallback => {
             if !native_model_refs_match(model, &identity.model_id) {
                 return Err(format!(
-                    "Model '{}' does not match server native local runtime source id '{}'.",
-                    model, identity.model_id
+                    "Model '{}' does not match server native local runtime source id '{}' ({}).",
+                    model,
+                    identity.model_id,
+                    openasr_core::describe_native_runtime_model_mismatch(model, &identity.model_id)
                 ));
             }
             Ok(())
