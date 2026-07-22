@@ -1026,6 +1026,14 @@ mod parity_tests {
     use crate::models::whisper::whisper_log_mel_spectrogram_16khz_mono_v0;
 
     const REAL_PACK_ENV: &str = "OPENASR_MOSS_TD_ENCODER_REAL_PACK";
+    /// Optional override for the harness input wav (defaults to
+    /// `fixtures/jfk.wav`); lets the same bisection run on longer/harder
+    /// audio without touching the harness.
+    const REAL_WAV_ENV: &str = "OPENASR_MOSS_TD_ENCODER_REAL_WAV";
+    /// Optional 16 kHz-second offset of the 30s chunk window cut from the
+    /// harness wav (defaults to 0): the encoder is a fixed 30s-chunk graph,
+    /// so "long audio" coverage means different 30s windows of a long file.
+    const CHUNK_OFFSET_ENV: &str = "OPENASR_MOSS_TD_ENCODER_CHUNK_OFFSET_SECS";
     /// `WhisperFeatureExtractor`'s target frame count for one 30s chunk
     /// (mirrors `executor.rs`'s `MEL_TARGET_FRAMES`; not exported from there
     /// since that module keeps it private).
@@ -1040,7 +1048,10 @@ mod parity_tests {
     }
 
     fn dev_wav_path() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav")
+        match std::env::var_os(REAL_WAV_ENV) {
+            Some(raw) if !raw.is_empty() => std::path::PathBuf::from(raw),
+            _ => Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav"),
+        }
     }
 
     /// Cosine similarity between two equal-length vectors, treated as a
@@ -1108,13 +1119,24 @@ mod parity_tests {
             max_source_positions: encoder_metadata.max_source_positions,
         };
 
+        let wav_path = dev_wav_path();
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
-            dev_wav_path(),
+            wav_path.clone(),
             "moss encoder metal parity test",
             "moss encoder metal parity test",
         )
-        .expect("load jfk.wav");
-        let chunk = &samples[..samples.len().min(480_000)];
+        .expect("load harness wav");
+        let offset_secs: usize = std::env::var(CHUNK_OFFSET_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+            .unwrap_or(0);
+        let start = (offset_secs * 16_000).min(samples.len());
+        let chunk = &samples[start..samples.len().min(start + 480_000)];
+        eprintln!(
+            "moss encoder harness input: {} (chunk offset {offset_secs}s, {} samples)",
+            wav_path.display(),
+            chunk.len()
+        );
         let mel =
             whisper_log_mel_spectrogram_16khz_mono_v0(chunk, config.n_mels, MEL_TARGET_FRAMES)
                 .expect("compute mel");
@@ -1148,6 +1170,19 @@ mod parity_tests {
         unsafe {
             std::env::set_var(GgmlCpuGraphConfig::BACKEND_ENV, env_value);
         }
+        // The family's `ExceptMetal` gate (`graph_config.rs`) downgrades an
+        // Auto-resolved Metal -- including one steered by `BACKEND_ENV` above
+        // -- to CPU, so env-var steering alone can never reach the Metal leg.
+        // Install an explicit `Accelerated` request override for that leg:
+        // the documented production path the gate always honors
+        // (`resolve_family_runtime_backend` doc comment -- an explicit
+        // per-request preference wins over any Auto-mode gate), i.e. exactly
+        // what an `execution_target=accelerated` request runs in production.
+        let _accelerated_override = (backend == GgmlCpuGraphBackend::Metal).then(|| {
+            crate::ggml_runtime::install_request_backend_override(Some(
+                crate::ggml_runtime::RequestBackendPreference::Accelerated,
+            ))
+        });
         let mut graph_config =
             crate::models::moss_transcribe_diarize::graph_config::moss_td_encoder_graph_config();
         unsafe {
