@@ -434,6 +434,16 @@ impl SpeakerProfileMatcher {
         // equality is the closest identity proxy available today. An empty
         // name carries no identity signal, so it never merges with another
         // empty name -- each such profile stays its own singleton group.
+        //
+        // Known tradeoff of the name proxy: two DIFFERENT real people who
+        // happen to be enrolled under the exact same display name (e.g. two
+        // people named "Zhang Wei") are merged into a single identity group,
+        // so the margin gate silently stops comparing them against each
+        // other at all for that pair -- the disambiguation this gate exists
+        // for is skipped, not just weakened. This is intentionally accepted
+        // rather than solved here: fixing it requires a stable per-person id
+        // that the store does not have. Uniquely-named profiles (the
+        // product's expected usage) are unaffected.
         let mut groups: Vec<IdentityGroup> = Vec::new();
         for profile in &self.profiles {
             if profile.embedding.len() != embedding.dim() {
