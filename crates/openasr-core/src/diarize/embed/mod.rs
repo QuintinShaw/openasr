@@ -1,14 +1,18 @@
 //! Speaker embedding.
 //!
-//! Pure-Rust WeSpeaker ResNet34 embeddings for clustering and enrollment.
-//! Weights are loaded from pulled/local `.oasr` packs and are not vendored.
+//! Two embedders coexist during the ReDimNet2-B6 migration: the ggml-graph
+//! ReDimNet2-B6 (192-d, Chinese-enhanced) and the legacy pure-Rust WeSpeaker
+//! ResNet34 (256-d). Runtime selection (`pack::shared_embedder`) prefers
+//! ReDimNet2 whenever its pack is installed and falls back to WeSpeaker
+//! otherwise; removing WeSpeaker is a later, separately approved step. Weights
+//! for both are loaded from pulled/local `.oasr` packs and are not vendored.
 
 mod fbank;
 pub(crate) mod ops;
 mod pack;
-// ReDimNet2-B6 embedder (192-d, ggml graph). Front end + structural constants
-// only for now; backbone bring-up is staged (see `redimnet::mod` docs). Not yet
-// wired into runtime embedder resolution -- WeSpeaker stays the sole embedder.
+// ReDimNet2-B6 embedder (192-d, ggml graph). See `redimnet::mod` docs for the
+// bring-up status; `RedimNet2Embedder` below wires it into the `SpeakerEmbedder`
+// trait and `pack::shared_embedder` runtime selection.
 mod redimnet;
 pub(crate) mod weights;
 mod wespeaker;
@@ -22,9 +26,11 @@ pub use pack::{
 
 use thiserror::Error;
 
-use super::calibration::{SpeakerCalibrationProfile, WESPEAKER_CALIBRATION};
+use super::calibration::{REDIMNET_CALIBRATION, SpeakerCalibrationProfile, WESPEAKER_CALIBRATION};
 use super::contract::SpeakerEmbedding;
 use fbank::Fbank;
+use redimnet::backbone::RedimNet2Model;
+use redimnet::frontend::RedimNetFrontend;
 use wespeaker::WeSpeakerResNet34Model;
 
 /// Sample rate the embedder requires.
@@ -117,5 +123,60 @@ impl SpeakerEmbedder for WeSpeakerEmbedder {
 
     fn calibration_profile(&self) -> SpeakerCalibrationProfile {
         WESPEAKER_CALIBRATION
+    }
+}
+
+/// ReDimNet2-B6 embedder: `TFMelBanks` front end + ggml-graph backbone,
+/// Chinese-enhanced (vb2+vox2+cnc2) checkpoint. `embedding_dim() == 192`,
+/// distinct cosine space from `WeSpeakerEmbedder` (256-d) -- never compare
+/// embeddings across the two; `SpeakerProfile::is_compatible_with` (keyed on
+/// `embedding_dim` + `pack_fingerprint`) is what stops that at the enrollment
+/// layer.
+pub struct RedimNet2Embedder {
+    model: RedimNet2Model,
+    frontend: RedimNetFrontend,
+}
+
+impl RedimNet2Embedder {
+    pub fn from_oasr(path: &std::path::Path) -> Result<Self, EmbedError> {
+        let model =
+            RedimNet2Model::from_oasr(path).map_err(|e| EmbedError::Unavailable(e.to_string()))?;
+        Ok(Self {
+            model,
+            frontend: RedimNetFrontend::new(),
+        })
+    }
+
+    /// Human-readable identifier for this embedder's embedding space; see
+    /// `pack::REDIMNET_EMBEDDING_SPACE_VERSION` for what changes it (and, more
+    /// importantly, what does not -- the actual compatibility gate is the pack
+    /// content fingerprint, not this label).
+    pub fn embedding_space_version(&self) -> &'static str {
+        pack::REDIMNET_EMBEDDING_SPACE_VERSION
+    }
+}
+
+impl SpeakerEmbedder for RedimNet2Embedder {
+    fn embed(&self, samples: &[f32], sample_rate_hz: u32) -> Result<SpeakerEmbedding, EmbedError> {
+        if sample_rate_hz != SAMPLE_RATE_HZ {
+            return Err(EmbedError::UnsupportedSampleRate(sample_rate_hz));
+        }
+        let (features, frames) = self.frontend.forward(samples);
+        if frames == 0 {
+            return Err(EmbedError::TooShort);
+        }
+        let raw = self
+            .model
+            .forward(&features, frames)
+            .map_err(|e| EmbedError::Unavailable(e.to_string()))?;
+        Ok(SpeakerEmbedding::l2_normalized(raw))
+    }
+
+    fn embedding_dim(&self) -> usize {
+        self.model.embedding_dim()
+    }
+
+    fn calibration_profile(&self) -> SpeakerCalibrationProfile {
+        REDIMNET_CALIBRATION
     }
 }
