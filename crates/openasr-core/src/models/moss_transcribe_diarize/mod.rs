@@ -8,13 +8,20 @@
 //! this family does not parse or structure them (that is a product-layer
 //! concern, out of scope for the core engine).
 //!
-//! Stage status: only the checkpoint-to-GGUF importer
-//! ([`package_import`]) exists so far -- see that module's doc comment for
-//! the full tensor-mapping contract and exactly what is and is not wired up
-//! yet. The ggml execution graph (Whisper encoder reuse, the adaptor
-//! bridge, Qwen3 decoder reuse, decode-policy registration) has not been
-//! implemented; a pack produced by this importer is not yet runnable by
-//! `openasr transcribe`.
+//! Stage status: the checkpoint-to-GGUF importer ([`package_import`]) and the
+//! full ggml execution graph (Whisper encoder reuse via [`encoder_graph`],
+//! the [`adaptor_graph`] bridge, Qwen3 decoder reuse via [`llm_decoder`], and
+//! decode-policy/executor/tensor-contract registration in [`executor`] and
+//! `arch/mod.rs`) are both implemented and registered as a builtin
+//! architecture -- a pack produced by this importer runs end-to-end through
+//! `openasr transcribe --model-pack <pack>` (CPU; the Metal path has a known
+//! encoder-numerics defect, see the arch descriptor's `auto_gpu_policy`
+//! doc). What is NOT yet wired: a public `openasr model-pack import`
+//! subcommand (the importer above is reachable only from Rust/tests, same
+//! pre-CLI-wiring stage `qwen3-forced-aligner` was at) and publication to
+//! the model catalog/registry (see `tooling/publish-model/models-core.toml`'s
+//! `moss-transcribe-diarize` entry, staged `release_public` but not yet
+//! public).
 
 mod adaptor_graph;
 mod decode_prompt;

@@ -314,6 +314,11 @@ LANG_BY_FAMILY = {
     # &["zh", "en", "yue"] } arch descriptor). "yue" is a base ISO 639-3 code
     # (Cantonese), not a dialect subtag.
     "mimo-asr": ["en", "yue", "zh"],
+    # moss-transcribe-diarize is intentionally NOT listed here (its entry
+    # carries an explicit `languages` override instead) so the user-facing "N
+    # model families" doc counts (check_family_count_strings) do not move
+    # before this family's public flip -- same staging convention used for
+    # firered2-llm/mimo-asr in c847ae2.
 }
 
 # Per-family source-language parameter policy for the catalog's `language_mode`
@@ -366,6 +371,10 @@ LANGUAGE_MODE_BY_FAMILY = {
     # FixedMultilingual LanguageFamilyHint on both arch descriptors).
     "firered2-llm": "fixed_multilingual",
     "mimo-asr": "fixed_multilingual",
+    # MOSS-Transcribe-Diarize: SelfDetectsRejectsHint -- the Qwen3-style
+    # decoder auto-detects/produces the transcript language through free-text
+    # instruction-following (no dedicated language token), same shape as qwen.
+    "moss-transcribe-diarize": "detect_implicit",
 }
 
 # SpecifyOnly's conditioned default, mirroring the `default_language` literal
@@ -491,6 +500,11 @@ PUNCTUATION_BY_FAMILY = {
     # than assert an unverified True/False (mirrors Option<bool>::None).
     "firered2-llm": None,
     "mimo-asr": None,
+    # moss-transcribe-diarize: the fixed instruction prompts for full
+    # punctuation-bearing prose, but this has not been verified against
+    # enough real transcripts to assert as a capability yet (arch descriptor
+    # declares emits_punctuation: None -- see arch/mod.rs) -- unclaimed.
+    "moss-transcribe-diarize": None,
 }
 
 

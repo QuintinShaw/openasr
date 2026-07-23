@@ -75,6 +75,7 @@ RELEASE_LANE_MODELS = (
     "firered-punc",
     "firered2-llm",
     "mimo-v2.5-asr",
+    "moss-transcribe-diarize",
 )
 GGUF_GENERAL_ARCHITECTURE_KEY = b"general.architecture"
 
