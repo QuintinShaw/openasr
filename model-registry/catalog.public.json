@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-20T22:36:24+00:00",
+  "generated_at": "2026-07-23T03:17:46+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -352,9 +352,9 @@
           "size_bytes": 2345595360,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.3950785113636363,
-            "rtf_metal": 0.7874602424545455,
-            "peak_rss_bytes": 4739596288,
+            "rtf_cpu": 0.1545,
+            "rtf_metal": 0.1291,
+            "peak_rss_bytes": 2552299520,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -368,9 +368,9 @@
           "size_bytes": 1277697376,
           "recommended": false,
           "perf": {
-            "rtf_cpu": 0.3554502461818182,
-            "rtf_metal": 0.3453623030909091,
-            "peak_rss_bytes": 4348919808,
+            "rtf_cpu": 0.1373,
+            "rtf_metal": 0.1073,
+            "peak_rss_bytes": 1484587008,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -384,9 +384,9 @@
           "size_bytes": 708540896,
           "recommended": true,
           "perf": {
-            "rtf_cpu": 0.38383374618181815,
-            "rtf_metal": 0.30726010227272726,
-            "peak_rss_bytes": 4095672320,
+            "rtf_cpu": 0.1355,
+            "rtf_metal": 0.1027,
+            "peak_rss_bytes": 914341888,
             "jfk_wer_vs_fp16": 0.0
           }
         }
@@ -945,9 +945,9 @@
           "size_bytes": 4732546720,
           "recommended": true,
           "perf": {
-            "rtf_cpu": 1.9775892917272728,
-            "rtf_metal": 0.9289458977272728,
-            "peak_rss_bytes": 6711148544,
+            "rtf_cpu": 0.905,
+            "rtf_metal": 0.535,
+            "peak_rss_bytes": 9425879040,
             "jfk_wer_vs_fp16": 0.0
           }
         }
