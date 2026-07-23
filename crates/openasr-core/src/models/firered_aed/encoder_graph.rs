@@ -527,7 +527,7 @@ fn firered_conformer_block<'a>(
         k,
         attention_layout,
         STANDARD_HEAD_PERMUTE_AXES,
-        true,
+        false,
         AttentionReshapeSteps {
             reshape: "ggml_reshape_3d(attn_k)",
             permute: "ggml_permute(attn_k)",
@@ -543,7 +543,7 @@ fn firered_conformer_block<'a>(
             ..attention_layout
         },
         STANDARD_HEAD_PERMUTE_AXES,
-        true,
+        false,
         AttentionReshapeSteps {
             reshape: "ggml_reshape_3d(attn_r)",
             permute: "ggml_permute(attn_r)",
