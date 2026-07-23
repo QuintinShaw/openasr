@@ -1032,4 +1032,44 @@ mod tests {
             }
         );
     }
+
+    /// Pins the exact behavior a ReDimNet2-B6 cutover relies on: a voiceprint
+    /// registered under the legacy 256-dim WeSpeaker embedder must never be
+    /// silently reused once the active embedder resolves to the 192-dim
+    /// ReDimNet2 pack -- it needs explicit re-registration, not a dimension
+    /// mismatch crash or (worse) a wrong-space cosine comparison.
+    #[test]
+    fn old_wespeaker_profile_is_incompatible_with_new_redimnet_embedder() {
+        let legacy_wespeaker_profile = profile(
+            "vp_aaaaaaaaaaaaaaaa",
+            256,
+            "sha256:wespeaker-resnet34-pack",
+            vec![0.1; 256],
+        );
+        let active_redimnet_identity = identity(192, "sha256:redimnet2-b6-pack");
+
+        assert!(
+            !legacy_wespeaker_profile.is_compatible_with(&active_redimnet_identity),
+            "a 256-dim WeSpeaker profile must not be treated as compatible with a 192-dim ReDimNet2 identity"
+        );
+        assert_eq!(
+            legacy_wespeaker_profile.compatibility_status(&active_redimnet_identity),
+            ProfileCompatibility::Incompatible {
+                reason: "embedding dimension mismatch: profile has 256, active embedder has 192"
+                    .to_string()
+            },
+            "the reason must name both dimensions so a user/operator understands \
+             re-registration (not a bug) is required"
+        );
+
+        let mut store = VoiceprintStore::default();
+        store.add_profile(legacy_wespeaker_profile);
+        assert!(
+            store
+                .compatible_profiles(&active_redimnet_identity)
+                .is_empty(),
+            "the voiceprint store must drop the incompatible profile rather than \
+             attempt a cross-embedding-space comparison"
+        );
+    }
 }
