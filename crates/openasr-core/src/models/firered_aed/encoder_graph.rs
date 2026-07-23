@@ -522,12 +522,17 @@ fn firered_conformer_block<'a>(
         },
         map_err,
     )?;
+    // No `ggml_cont` on `k_heads`/`r_heads`: both feed `mul_mat` as src0 (the
+    // `attn_ac`/`attn_bd_raw` score matmuls below), which only requires its src0
+    // contiguous on the first (head) dim -- already satisfied by the permuted
+    // reshape view, the same strided-src0 form `q_u`/`q_v` above already use. The
+    // extra materialization was pure copy work (~11.5 MB/layer transient).
     let k_heads = reshape_projection_to_attention_heads(
         graph,
         k,
         attention_layout,
         STANDARD_HEAD_PERMUTE_AXES,
-        true,
+        false,
         AttentionReshapeSteps {
             reshape: "ggml_reshape_3d(attn_k)",
             permute: "ggml_permute(attn_k)",
@@ -543,7 +548,7 @@ fn firered_conformer_block<'a>(
             ..attention_layout
         },
         STANDARD_HEAD_PERMUTE_AXES,
-        true,
+        false,
         AttentionReshapeSteps {
             reshape: "ggml_reshape_3d(attn_r)",
             permute: "ggml_permute(attn_r)",
