@@ -586,12 +586,16 @@ fn firered_conformer_block<'a>(
     let scores = graph
         .soft_max(scores)
         .map_err(|source| map_err("ggml_soft_max(attn_scores)", source))?;
+    // No `ggml_cont` here: `attention_context_from_probs` immediately re-permutes
+    // this tensor (its own `value_permute` step) before the value_cont that
+    // materializes it, so the two permutes compose into one and only the final
+    // `ggml_cont` needs to run.
     let v_heads = reshape_projection_to_attention_heads(
         graph,
         v,
         attention_layout,
         STANDARD_HEAD_PERMUTE_AXES,
-        true,
+        false,
         AttentionReshapeSteps {
             reshape: "ggml_reshape_3d(attn_v)",
             permute: "ggml_permute(attn_v)",
@@ -659,12 +663,10 @@ fn firered_conformer_block<'a>(
             glu_half_width * element,
         )
         .map_err(|source| map_err("ggml_view_2d(conv_gate)", source))?;
-    let conv_main = graph
-        .cont(conv_main)
-        .map_err(|source| map_err("ggml_cont(conv_main)", source))?;
-    let conv_gate = graph
-        .cont(conv_gate)
-        .map_err(|source| map_err("ggml_cont(conv_gate)", source))?;
+    // No `ggml_cont` needed for either GLU half: `ggml_sigmoid` is elementwise and
+    // only requires `is_contiguous_rows` (satisfied here since nb0 on both views is
+    // still the element size), and `ggml_mul` accepts a strided src0 against a
+    // freshly-allocated (contiguous) dst.
     conv = graph
         .mul(
             conv_main,
