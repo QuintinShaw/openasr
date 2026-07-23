@@ -229,6 +229,7 @@ fn bundled_registry_ordering_is_deterministic() {
             "hymt2-1.8b",
             "mimo-v2.5-asr",
             "moonshine-tiny",
+            "moss-transcribe-diarize",
             "parakeet-tdt-0.6b-v3",
             "pyannote-segmentation-3.0",
             "qwen3-asr-1.7b",

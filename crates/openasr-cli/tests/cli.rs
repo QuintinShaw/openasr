@@ -879,6 +879,81 @@ fn firered_aed_golden_diff_longform_cli_transcribe_matches_reference_decode() {
     );
 }
 
+// moss-transcribe-diarize longform golden: this family's other golden_diff
+// cases (`moss_transcribe_diarize::executor::tests`) call the low-level
+// `MossTdGgmlExecutor` directly on single-utterance fixtures and never
+// exercise the longform/auto-VAD slicing orchestrator, so unlike those, this
+// one drives the real `openasr` binary on `fixtures/longform_en_zh.wav` (same
+// already-committed ~69s, 5-clip EN/ZH/EN/ZH/EN fixture the firered-llm/
+// mimo-asr/firered-aed longform goldens use) to pin the actual user-facing
+// multi-slice path. moss-transcribe-diarize's `FixedWindow` encoder span
+// (Whisper's own architecture-fixed 30s log-mel window) means the executor
+// loops the encoder over independent windows and concatenates, same as
+// `whisper` itself -- unlike the other three families' longform goldens, this
+// fixture's assembled transcript shows no chunk-seam artifacts (no duplicated
+// word, no missing inter-token space): each of the three encoder passes ends
+// on a clean sentence boundary for this particular fixture. The family's own
+// `[start][Sxx]text[end]` tagged output (self_diarizes = true) comes through
+// unmodified in the assembled text -- core does not parse or restructure
+// those tags (see the family's module doc comment). Pinned against
+// `OPENASR_GGML_BACKEND=cpu` (this family's Metal path has a known encoder
+// numerics defect, see the arch descriptor's `auto_gpu_policy` doc).
+fn moss_transcribe_diarize_dev_pack_path() -> PathBuf {
+    PathBuf::from(
+        "/Volumes/QuintinDocument/openasr-dev/tmp/moss-td/moss-transcribe-diarize-fp16.oasr",
+    )
+}
+
+const GOLDEN_MOSS_TRANSCRIBE_DIARIZE_LONGFORM_EN_ZH_TEXT: &str = concat!(
+    "[0.27][S01]And so, my fellow Americans,[2.34][3.21][S01]ask not[4.44][5.31][S01]what your ",
+    "country can do for you,[7.64][8.11][S01]ask what you can do for your country.",
+    "[10.54][10.94][S02]今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的",
+    "川菜馆吃饭，听说那里的麻婆豆腐特别正宗。周末的时候，我通常会读书或者看一部电影放松一下。",
+    "[29.14][29.41][S01]And so, my fellow Americans,[31.54][32.34][S01]ask not",
+    "[33.64][34.44][S01]what your country can do for you,[36.84][37.24][S01]ask what you can ",
+    "do for your country.",
+    "[39.74][40.11][S02]今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的",
+    "川菜馆吃饭，听说那里的麻婆豆腐特别正宗。周末的时候，我通常会读书或者看一部电影放松一下。",
+    "[58.34][58.61][S01]And so, my fellow Americans,[60.64][61.54][S01]ask not",
+    "[62.84][63.64][S01]what your country can do for you,[66.04][66.44][S01]ask what you can ",
+    "do for your country.[68.94]",
+);
+
+#[test]
+#[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack; runs the real \
+            longform-chunked CLI transcribe path on a ~69s fixture, OPENASR_GGML_BACKEND=cpu"]
+fn moss_transcribe_diarize_golden_diff_longform_cli_transcribe_matches_reference_decode() {
+    let pack_path = moss_transcribe_diarize_dev_pack_path();
+    if !pack_path.exists() {
+        eprintln!("skipping: {} not present", pack_path.display());
+        return;
+    }
+    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/longform_en_zh.wav")
+        .canonicalize()
+        .expect("longform_en_zh.wav fixture must exist");
+
+    let assert = openasr()
+        .env("OPENASR_GGML_BACKEND", "cpu")
+        .args([
+            "transcribe",
+            &input.display().to_string(),
+            "--model-pack",
+            &pack_path.display().to_string(),
+            "--format",
+            "text",
+        ])
+        .assert()
+        .success();
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    eprintln!("moss-transcribe-diarize longform CLI transcript: {output:?}");
+    assert_eq!(
+        output.trim_end(),
+        GOLDEN_MOSS_TRANSCRIBE_DIARIZE_LONGFORM_EN_ZH_TEXT,
+        "unexpected longform CLI transcript"
+    );
+}
+
 #[test]
 fn transcribe_native_requires_local_model_pack_path() {
     let input = temp_input_wav();

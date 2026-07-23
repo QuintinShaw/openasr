@@ -238,3 +238,13 @@ import_subcommand = "import firered-punc"
 upstream_repo = "FireRedTeam/FireRedPunc"
 source_revision = "e448fd967f44182a1c323cc30f5d89f2400c28da"
 needs_license_flags = false
+
+# MOSS-Transcribe-Diarize: not yet wired to a public `openasr model-pack
+# import` subcommand (the crate-internal importer
+# `moss_transcribe_diarize::package_import` exists but has no CLI entry
+# point yet, same pre-CLI-wiring stage qwen3-forced-aligner-0.6b was at).
+["moss-transcribe-diarize"]
+import_subcommand = "not yet a public model-pack import subcommand"
+upstream_repo = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
+source_revision = "main"
+needs_license_flags = false

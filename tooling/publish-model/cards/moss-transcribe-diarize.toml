@@ -1,0 +1,26 @@
+# Per-model card prose for openasr/moss-transcribe-diarize.
+#
+# PLACEHOLDER: every user-facing marketing string below is intentionally set to
+# "TODO-COPY". Final prose (tagline/highlights/intro/acknowledgement, and any
+# zh-CN locale block) is authored separately and must not be drafted here. Fill
+# these in before the model is flipped public (--public requires a non-empty
+# tagline + intro; see _manifest.validate_public_prose). Keep every factual
+# claim to what the upstream OpenMOSS-Team/MOSS-Transcribe-Diarize model card
+# actually states (0.9B joint transcription + diarization model, Whisper-Medium
+# encoder + Qwen3-0.6B-style decoder, `[start][Sxx]text[end]` output format);
+# do not conflate it with the larger "MOSS-Transcribe-Diarize Pro" variant the
+# upstream card mentions as API-only and not part of this pack.
+
+tagline = "TODO-COPY"
+
+highlights = [
+  "TODO-COPY",
+]
+
+intro = """
+TODO-COPY
+"""
+
+acknowledgement = """
+TODO-COPY
+"""

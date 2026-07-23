@@ -751,3 +751,46 @@ min_cli_version = "0.1.11"
 ["firered-punc".capability]
 feature = "punctuation"
 role = "punctuation-restorer"
+
+# MOSS-Transcribe-Diarize (OpenMOSS-Team/MOSS-Transcribe-Diarize, 0.9B): a
+# Whisper-Medium-configuration audio encoder + a small MLP/LayerNorm adaptor
+# bridge feeding a Qwen3-0.6B-style decoder. Its own runtime family/
+# architecture (`moss-transcribe-diarize` in arch/mod.rs). The decoder emits
+# `[start][Sxx]text[end]` transcript text directly (self_diarizes = true in
+# the arch descriptor) via free-text instruction-following, with no
+# language-selection prompt token (LanguageFamilyHint::SelfDetectsRejectsHint,
+# same shape as qwen3-asr) -- language_mode is therefore "detect_implicit".
+# Staged PRIVATE like firered2-llm/mimo-asr were in c847ae2: release_public
+# only gates the eventual `--public` flip (which also needs a completed
+# docs/model-audits/moss-transcribe-diarize.md form -- see _manifest.py's
+# ensure_release_audit_form); the catalog entry itself stays absent until a
+# deliberate later publish step, so this staging is not itself a release.
+["moss-transcribe-diarize"]
+family = "moss-transcribe-diarize"
+hf_repo = "OpenASR/moss-transcribe-diarize"
+release_public = true
+size = "0.9b"
+registry_id = "moss-transcribe-diarize"
+display_name = "MOSS-Transcribe-Diarize"
+license_name = "Apache-2.0"
+license_source = "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/blob/main/LICENSE"
+license_class = "permissive"
+aliases = ["moss", "moss-td"]
+pull_alias = "moss-transcribe-diarize"
+# Explicit override, deliberately conservative: the upstream model card only
+# claims "50+ languages" without enumerating them. The only languages with a
+# concrete upstream evidentiary source are (a) Mandarin Chinese, from the
+# model's own primary objective-evaluation benchmarks (AISHELL-4, Alimeeting
+# -- both Mandarin meeting corpora) and this repo's own dev-pack golden
+# transcripts, and (b) the 14 languages the upstream README names by name for
+# the model's 1st-place 2nd MLC-SLM Challenge result (English, French,
+# German, Italian, Portuguese, Spanish, Japanese, Korean, Russian, Thai,
+# Vietnamese, Tagalog, Urdu, Turkish). Do not expand this list to the
+# unenumerated "50+" claim without a concrete per-language source.
+languages = [
+    "de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "th", "tl", "tr",
+    "ur", "vi", "zh",
+]
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q8_0"
+upstream_release_date = "2026-07-09"
