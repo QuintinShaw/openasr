@@ -37,6 +37,23 @@ pub enum RequestSource {
     /// finalized utterance. Covers both the desktop's dictation and
     /// live-captions features -- see the type-level doc above.
     ServerRealtime,
+    /// `openasr bench-suite` (CLI, `crates/openasr-cli/src/bench_suite_cli.rs`),
+    /// the committed performance regression gate that replays `perf/suite.toml`
+    /// through the real native backend. Distinct from `CliTranscribe` even
+    /// though `transcribe --benchmark` also measures timing: that flag is a
+    /// mode of the interactive `transcribe` command (see
+    /// `crates/openasr-cli/src/native_segment_cli.rs::run_benchmark`, which
+    /// logs `CliTranscribe`), while `bench-suite` is a separate, CI/perf-only
+    /// subcommand a human never runs to get a transcript.
+    CliBenchSuite,
+    /// `openasr_transcribe_pcm` (the `openasr-ffi` C ABI, embedded in a host
+    /// app such as the iOS app via the xcframework -- see
+    /// `crates/openasr-ffi/src/lib.rs`). The C ABI carries no field
+    /// distinguishing which host feature/screen made the call, so every FFI
+    /// caller logs this one label -- the same "can't observe a finer
+    /// distinction, so don't fabricate one" tradeoff `ServerRealtime` makes
+    /// for its two desktop features.
+    Ffi,
     /// The request was built without an explicit source (a test helper, or a
     /// caller that has not been updated yet). Never intentionally emitted by
     /// a real entry point; exists so adding this field did not require
@@ -54,6 +71,8 @@ impl RequestSource {
             Self::ServerTranscribe => "server_transcribe",
             Self::ServerTranslate => "server_translate",
             Self::ServerRealtime => "server_realtime",
+            Self::CliBenchSuite => "cli_bench_suite",
+            Self::Ffi => "ffi",
             Self::Unspecified => "unspecified",
         }
     }
@@ -351,6 +370,8 @@ mod tests {
             RequestSource::ServerTranscribe,
             RequestSource::ServerTranslate,
             RequestSource::ServerRealtime,
+            RequestSource::CliBenchSuite,
+            RequestSource::Ffi,
             RequestSource::Unspecified,
         ];
         let mut labels: Vec<&'static str> =
@@ -359,6 +380,35 @@ mod tests {
         labels.sort_unstable();
         labels.dedup();
         assert_eq!(labels.len(), original_len, "duplicate RequestSource labels");
+    }
+
+    #[test]
+    fn cli_bench_suite_source_label_is_distinct_from_cli_transcribe() {
+        // Regression guard for the two CLI timing paths' distinction: `openasr
+        // bench-suite` (the CI/perf regression gate) must never collapse to
+        // the same label as `transcribe --benchmark`, or a `daemon.log`
+        // reader could not tell a human-triggered benchmark run from the
+        // committed perf gate replaying `perf/suite.toml`.
+        assert_ne!(
+            RequestSource::CliBenchSuite.as_log_label(),
+            RequestSource::CliTranscribe.as_log_label()
+        );
+        assert_eq!(
+            RequestSource::CliBenchSuite.as_log_label(),
+            "cli_bench_suite"
+        );
+    }
+
+    #[test]
+    fn ffi_source_label_is_distinct_from_unspecified() {
+        // Regression guard: the FFI entry point's label is a real,
+        // intentional source (not a placeholder for "caller not wired yet"),
+        // so it must never collide with `Unspecified`'s label.
+        assert_ne!(
+            RequestSource::Ffi.as_log_label(),
+            RequestSource::Unspecified.as_log_label()
+        );
+        assert_eq!(RequestSource::Ffi.as_log_label(), "ffi");
     }
 
     #[test]

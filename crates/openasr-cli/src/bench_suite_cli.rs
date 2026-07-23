@@ -158,6 +158,27 @@ fn bench_execution_target() -> Option<ExecutionTarget> {
     }
 }
 
+/// Builds one suite entry's [`TranscriptionRequest`]. Split out from
+/// [`run_entry`] so the `RequestSource` wiring is unit-testable without a
+/// real model pack.
+fn suite_entry_transcription_request(
+    entry: &SuiteEntry,
+    validated_pack: &Path,
+    prepared: &openasr_core::PreparedAudioInput,
+) -> TranscriptionRequest {
+    TranscriptionRequest::new(prepared.path(), NATIVE_RUNTIME_MODEL_ID_AUTO)
+        .with_source(openasr_core::RequestSource::CliBenchSuite)
+        .with_model_pack_path(Some(validated_pack.to_path_buf()))
+        .with_language(entry.language.clone())
+        .with_task(entry.task)
+        .with_execution_target(bench_execution_target())
+        // The perf suite measures ASR decode RTF/RSS; an optional
+        // post-process stage running when a FireRedPunc pack happens to be
+        // installed would skew both, so it stays off for every entry.
+        .with_punctuation(false)
+        .with_prepared_samples(prepared.shared_samples())
+}
+
 fn run_entry(
     entry: &SuiteEntry,
     ffmpeg_bin: Option<PathBuf>,
@@ -201,16 +222,7 @@ fn run_entry(
     let mut transcription_text = String::new();
     let mut segment_count = 0;
     for run_index in 0..runs.max(1) {
-        let request = TranscriptionRequest::new(prepared.path(), NATIVE_RUNTIME_MODEL_ID_AUTO)
-            .with_model_pack_path(Some(validated_pack.clone()))
-            .with_language(entry.language.clone())
-            .with_task(entry.task)
-            .with_execution_target(bench_execution_target())
-            // The perf suite measures ASR decode RTF/RSS; an optional
-            // post-process stage running when a FireRedPunc pack happens to be
-            // installed would skew both, so it stays off for every entry.
-            .with_punctuation(false)
-            .with_prepared_samples(prepared.shared_samples());
+        let request = suite_entry_transcription_request(entry, &validated_pack, &prepared);
         configure_native_cpu_inference_threads();
         let started = Instant::now();
         let transcription = transcribe_with_backend(BackendKind::Native, request)?;
@@ -496,4 +508,53 @@ fn host_note() -> String {
 
 fn host_slug() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_wav_fixture_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/jfk.wav")
+            .canonicalize()
+            .expect("sample wav fixture path must exist")
+    }
+
+    fn sample_suite_entry() -> SuiteEntry {
+        SuiteEntry {
+            id: "test-entry".to_string(),
+            family: "whisper".to_string(),
+            quant: "q4_k".to_string(),
+            pack_path: PathBuf::from("/nonexistent/pack.oasr"),
+            audio_path: sample_wav_fixture_path(),
+            language: None,
+            task: None,
+            reference: None,
+            reference_text_path: None,
+            optional: true,
+            gating: None,
+            ordering_group: None,
+            cpp_binary: None,
+            cpp_model: None,
+        }
+    }
+
+    // Regression guard for the `openasr bench-suite` entry point: its
+    // `TranscriptionRequest` must log `RequestSource::CliBenchSuite`, distinct
+    // from `transcribe --benchmark`'s `CliTranscribe` -- see
+    // `RequestSource::CliBenchSuite`'s doc comment for why the two CLI timing
+    // paths must not collapse to the same `daemon.log` label.
+    #[test]
+    fn suite_entry_transcription_request_labels_source_as_cli_bench_suite() {
+        let entry = sample_suite_entry();
+        let prepared = prepare_audio_input(
+            &entry.audio_path,
+            &audio_preparation_options(BackendKind::Native, None, false),
+        )
+        .expect("fixture wav must prepare");
+        let validated_pack = PathBuf::from("/nonexistent/pack.oasr");
+        let request = suite_entry_transcription_request(&entry, &validated_pack, &prepared);
+        assert_eq!(request.source, openasr_core::RequestSource::CliBenchSuite);
+    }
 }
