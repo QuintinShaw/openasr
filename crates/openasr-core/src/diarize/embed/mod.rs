@@ -6,6 +6,10 @@
 mod fbank;
 pub(crate) mod ops;
 mod pack;
+// ReDimNet2-B6 embedder (192-d, ggml graph). Front end + structural constants
+// only for now; backbone bring-up is staged (see `redimnet::mod` docs). Not yet
+// wired into runtime embedder resolution -- WeSpeaker stays the sole embedder.
+mod redimnet;
 pub(crate) mod weights;
 mod wespeaker;
 
