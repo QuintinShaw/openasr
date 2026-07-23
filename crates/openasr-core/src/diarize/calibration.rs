@@ -102,11 +102,15 @@ pub(crate) const WESPEAKER_CALIBRATION: SpeakerCalibrationProfile = SpeakerCalib
 /// across enrolled-library sizes of 5/10/20/40 speakers and 5-20 s enrollment
 /// clips (`tmp/voiceid-eval/results/{summary_metrics,threshold_curves,
 /// margin_distributions}.csv`, not checked into this repo). Headline findings:
-/// - A cosine match threshold of 0.55 keeps FAR at 0-1.3% with 98.7-100% hit
-///   rate across 5-20 speaker libraries (`threshold_curves.csv`); a 20-speaker
-///   library shows roughly an order of magnitude more false accepts than a
-///   5-speaker library at the same threshold, so 0.55 is the floor, not a
-///   number to relax as libraries grow.
+/// - A cosine match threshold of 0.55 keeps FAR at 0-1.5% with 99.4-100% hit
+///   rate across 5-20 speaker libraries (`threshold_curves.csv`, worst case
+///   is the 20-speaker `multi3_12s` config at FAR 1.53% / hit 99.76%); a
+///   20-speaker library shows roughly an order of magnitude more false
+///   accepts than a 5-speaker library at the same threshold, so 0.55 is the
+///   floor, not a number to relax as libraries grow. Per-scenario thresholds
+///   that hit the tighter FAR < 1% bar range 0.43-0.57
+///   (`summary_metrics.csv` `rec_threshold_far_lt_1pct`); 0.55 is a
+///   reasonable single cutover value but is not FAR < 1% for every scenario.
 /// - The top1-vs-top2 similarity margin cleanly separates registered speakers
 ///   from strangers: enrolled-speaker margins have p10 > 0.3, impostor margins
 ///   have p90 < 0.17, so >= 0.15 margin is a reasonable "safe to display a
