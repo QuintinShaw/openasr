@@ -1,6 +1,6 @@
 use std::{
     cell::Cell,
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     io::{self, Cursor, Read, Write},
     net::TcpListener,
@@ -1546,6 +1546,57 @@ fn pull_retries_low_speed_body_and_restarts_safely() {
 
     assert_eq!(installed.pull, "moonshine-tiny:q8");
     assert_eq!(client.ranges(), vec![None, None]);
+}
+
+#[test]
+fn segment_low_speed_window_trips_when_a_window_clears_without_the_byte_floor() {
+    // `Duration::ZERO` makes every `observe` call judge its window
+    // immediately (matches the same zero-timeout trick the whole-file
+    // `pull_retries_low_speed_body_and_restarts_safely` test above uses),
+    // so this is deterministic without any real sleep.
+    let options = PullOptions {
+        segment_low_speed_timeout: Duration::ZERO,
+        segment_low_speed_min_bytes: 10,
+        ..PullOptions::default()
+    };
+    let mut window = SegmentLowSpeedWindow::new(&options);
+    assert!(
+        window.observe(1),
+        "1 byte is below the 10-byte floor and the window already elapsed"
+    );
+}
+
+#[test]
+fn segment_low_speed_window_disabled_when_min_bytes_is_zero() {
+    let options = PullOptions {
+        segment_low_speed_timeout: Duration::ZERO,
+        segment_low_speed_min_bytes: 0,
+        ..PullOptions::default()
+    };
+    let mut window = SegmentLowSpeedWindow::new(&options);
+    assert!(!window.observe(0));
+    assert!(!window.observe(1));
+}
+
+#[test]
+fn segment_low_speed_window_resets_after_a_window_clears_the_floor() {
+    // A segment that starts out fast and later degrades must still be
+    // caught: clearing the floor once must reset the window rather than
+    // permanently disabling the guard for the rest of the segment.
+    let options = PullOptions {
+        segment_low_speed_timeout: Duration::ZERO,
+        segment_low_speed_min_bytes: 5,
+        ..PullOptions::default()
+    };
+    let mut window = SegmentLowSpeedWindow::new(&options);
+    assert!(
+        !window.observe(5),
+        "5 bytes clears the 5-byte floor; must reset, not trip"
+    );
+    assert!(
+        window.observe(1),
+        "the next window starts fresh at 0 bytes, so 1 byte must trip again"
+    );
 }
 
 #[test]
@@ -3246,6 +3297,330 @@ fn parallel_download_sha_mismatch_deletes_partial() {
     assert!(!paths.partial_path.exists());
     assert!(!paths.partial_segments_meta_path.exists());
     assert!(!paths.final_path.exists());
+}
+
+/// Yields exactly one byte per `read()` call, regardless of the caller's
+/// buffer size -- used to guarantee the very first chunk `write_segment_body`
+/// observes is smaller than any realistic low-speed floor, without depending
+/// on real wall-clock timing (paired with `segment_low_speed_timeout:
+/// Duration::ZERO` in the tests below, which makes `SegmentLowSpeedWindow`
+/// judge the very first observed chunk instead of waiting out a real window).
+struct OneByteAtATimeReader {
+    remaining: VecDeque<u8>,
+}
+
+impl OneByteAtATimeReader {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            remaining: bytes.into(),
+        }
+    }
+}
+
+impl Read for OneByteAtATimeReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.remaining.pop_front() {
+            Some(byte) => {
+                buf[0] = byte;
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    }
+}
+
+/// A `RangeServerClient`-alike whose responses for one specific segment
+/// (`flaky_start`) trickle one byte at a time -- tripping a zero-timeout
+/// `SegmentLowSpeedWindow` on the very first chunk -- while every other
+/// segment (and, if `always_flaky` is `false`, every attempt after the
+/// first on the flaky segment too) is served normally in one read. Models
+/// "one connection to this source is bad; a fresh one for the same range is
+/// fine" without needing a real slow socket.
+#[derive(Clone)]
+struct FlakySegmentRangeClient {
+    bytes: Arc<Vec<u8>>,
+    attempts_by_start: Arc<Mutex<HashMap<u64, usize>>>,
+    flaky_start: u64,
+    always_flaky: bool,
+}
+
+impl FlakySegmentRangeClient {
+    fn new(bytes: Vec<u8>, flaky_start: u64, always_flaky: bool) -> Self {
+        Self {
+            bytes: Arc::new(bytes),
+            attempts_by_start: Arc::new(Mutex::new(HashMap::new())),
+            flaky_start,
+            always_flaky,
+        }
+    }
+
+    fn attempts_on_flaky_segment(&self) -> usize {
+        self.attempts_by_start
+            .lock()
+            .unwrap()
+            .get(&self.flaky_start)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+impl DownloadClient for FlakySegmentRangeClient {
+    fn open(
+        &mut self,
+        _url: &str,
+        range: Option<ByteRange>,
+    ) -> Result<DownloadResponse, PullError> {
+        let range = range.expect("the segmented download path always sends a bounded Range");
+        let start = range.start;
+        let end = range.end.expect("segment fetches always bound the end");
+        let total = self.bytes.len() as u64;
+        let slice = self.bytes[start as usize..=end as usize].to_vec();
+        let attempt = {
+            let mut attempts = self.attempts_by_start.lock().unwrap();
+            let counter = attempts.entry(start).or_insert(0);
+            *counter += 1;
+            *counter
+        };
+        let is_flaky_now = start == self.flaky_start && (self.always_flaky || attempt == 1);
+        let reader: Box<dyn Read> = if is_flaky_now {
+            Box::new(OneByteAtATimeReader::new(slice))
+        } else {
+            Box::new(Cursor::new(slice))
+        };
+        Ok(DownloadResponse {
+            status: 206,
+            content_length: Some(end - start + 1),
+            content_range: Some(format!("bytes {start}-{end}/{total}")),
+            etag: Some("etag-a".to_string()),
+            reader,
+        })
+    }
+}
+
+/// Builds the `PullTarget`/`PullPaths` pair `download_parallel_attempt` needs,
+/// without going through the outer `download_with_retries` retry loop (whose
+/// real `std::thread::sleep` backoff would make a deliberately-exhausted
+/// low-speed test slow for no reason -- these tests call the segmented
+/// attempt directly so the requeue/cap logic under test is exercised without
+/// any unrelated timing).
+fn parallel_attempt_paths(home: &Path, resolved: &ResolvedCatalogPull) -> (PullTarget, PullPaths) {
+    let target = PullTarget::from_resolved(resolved).unwrap();
+    let paths = pull_paths(home, &target).unwrap();
+    ensure_storage_dir_within_root(home, &paths).unwrap();
+    (target, paths)
+}
+
+#[test]
+fn parallel_download_low_speed_segment_requeues_onto_fresh_connection_and_recovers() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let segment_bytes = small_segment_bytes(bytes.len(), 4);
+    let total_segments = segment_count(bytes.len() as u64, segment_bytes);
+    assert!(
+        total_segments >= 3,
+        "fixture too small to give the flaky segment (index 1, not the probe) \
+         siblings to run alongside"
+    );
+    // Index 1, not 0: segment 0 is always the synchronous probe segment, and
+    // this test targets the worker-queue requeue path in `run_segment_worker`
+    // specifically (the probe has its own low-speed retry loop, covered by
+    // the probe-path test below).
+    let (flaky_start, _) = segment_range(1, bytes.len() as u64, segment_bytes);
+
+    let mut probe_client = FlakySegmentRangeClient::new(bytes.clone(), flaky_start, false);
+    let factory_client = probe_client.clone();
+    let factory: Box<dyn Fn() -> Result<BoxedDownloadClient, PullError>> =
+        Box::new(move || Ok(Box::new(factory_client.clone()) as BoxedDownloadClient));
+    let parallel = ParallelDownloadConfig {
+        connections: 4,
+        factory: &*factory,
+    };
+
+    let options = PullOptions {
+        segment_low_speed_timeout: Duration::ZERO,
+        segment_low_speed_min_bytes: 2,
+        ..parallel_test_options(segment_bytes)
+    };
+
+    let progress_events = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
+    let progress_sink = progress_events.clone();
+    let (target, paths) = parallel_attempt_paths(temp.path(), &resolved);
+
+    let outcome = download_parallel_attempt(
+        &target,
+        &paths,
+        &mut probe_client,
+        &parallel,
+        segment_bytes,
+        &options,
+        &mut |event| {
+            if let PullProgress::Downloading {
+                bytes_done,
+                bytes_total,
+            } = event
+            {
+                progress_sink
+                    .lock()
+                    .unwrap()
+                    .push((bytes_done, bytes_total));
+            }
+        },
+        &|| false,
+        &|| false,
+    )
+    .unwrap();
+
+    let downloaded = match outcome {
+        ParallelAttemptOutcome::Completed(downloaded) => downloaded,
+        ParallelAttemptOutcome::RangeNotSupported => {
+            panic!("this mock always honors Range with 206")
+        }
+    };
+    assert_eq!(downloaded.bytes_done, bytes.len() as u64);
+    assert_eq!(downloaded.sha256, sha256_hex(&bytes));
+    assert_eq!(fs::read(&paths.partial_path).unwrap(), bytes);
+
+    // Exactly one abandoned attempt, then one successful retry -- proof the
+    // segment was requeued and refetched (on what this mock models as a
+    // fresh connection) rather than either silently corrupting the file or
+    // hanging on the first bad connection.
+    assert_eq!(probe_client.attempts_on_flaky_segment(), 2);
+
+    // The low-speed rollback must keep `bytes_done` from ever being reported
+    // past the true total: without it, the abandoned attempt's partial bytes
+    // would still be counted once the retry re-downloads the same range from
+    // scratch, double-counting them.
+    for (bytes_done, bytes_total) in progress_events.lock().unwrap().iter().copied() {
+        assert!(
+            bytes_done <= bytes_total,
+            "progress double-counted: reported {bytes_done} of {bytes_total} total bytes"
+        );
+    }
+}
+
+#[test]
+fn parallel_download_probe_segment_low_speed_retries_in_place_and_recovers() {
+    // Same recovery contract as the worker-side test above, but for the
+    // probe segment (always index 0), which runs synchronously before any
+    // worker thread exists and so has its own retry loop in
+    // `download_parallel_attempt` instead of the shared work queue.
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let segment_bytes = small_segment_bytes(bytes.len(), 4);
+    let (flaky_start, _) = segment_range(0, bytes.len() as u64, segment_bytes);
+
+    let mut probe_client = FlakySegmentRangeClient::new(bytes.clone(), flaky_start, false);
+    let factory_client = probe_client.clone();
+    let factory: Box<dyn Fn() -> Result<BoxedDownloadClient, PullError>> =
+        Box::new(move || Ok(Box::new(factory_client.clone()) as BoxedDownloadClient));
+    let parallel = ParallelDownloadConfig {
+        connections: 4,
+        factory: &*factory,
+    };
+
+    let options = PullOptions {
+        segment_low_speed_timeout: Duration::ZERO,
+        segment_low_speed_min_bytes: 2,
+        ..parallel_test_options(segment_bytes)
+    };
+    let (target, paths) = parallel_attempt_paths(temp.path(), &resolved);
+
+    let outcome = download_parallel_attempt(
+        &target,
+        &paths,
+        &mut probe_client,
+        &parallel,
+        segment_bytes,
+        &options,
+        &mut |_| {},
+        &|| false,
+        &|| false,
+    )
+    .unwrap();
+
+    match outcome {
+        ParallelAttemptOutcome::Completed(downloaded) => {
+            assert_eq!(downloaded.sha256, sha256_hex(&bytes));
+        }
+        ParallelAttemptOutcome::RangeNotSupported => {
+            panic!("this mock always honors Range with 206")
+        }
+    }
+    assert_eq!(probe_client.attempts_on_flaky_segment(), 2);
+}
+
+#[test]
+fn parallel_download_low_speed_segment_gives_up_after_max_abandons() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let segment_bytes = small_segment_bytes(bytes.len(), 4);
+    let total_segments = segment_count(bytes.len() as u64, segment_bytes);
+    assert!(
+        total_segments >= 3,
+        "fixture too small to give the flaky segment (index 1) siblings"
+    );
+    let (flaky_start, flaky_end) = segment_range(1, bytes.len() as u64, segment_bytes);
+
+    // `always_flaky: true` -- this segment never recovers, no matter how
+    // many fresh connections it gets, exercising the bounded give-up path.
+    let mut probe_client = FlakySegmentRangeClient::new(bytes.clone(), flaky_start, true);
+    let factory_client = probe_client.clone();
+    let factory: Box<dyn Fn() -> Result<BoxedDownloadClient, PullError>> =
+        Box::new(move || Ok(Box::new(factory_client.clone()) as BoxedDownloadClient));
+    let parallel = ParallelDownloadConfig {
+        connections: 4,
+        factory: &*factory,
+    };
+
+    let options = PullOptions {
+        segment_low_speed_timeout: Duration::ZERO,
+        segment_low_speed_min_bytes: 2,
+        ..parallel_test_options(segment_bytes)
+    };
+    let (target, paths) = parallel_attempt_paths(temp.path(), &resolved);
+
+    let error = download_parallel_attempt(
+        &target,
+        &paths,
+        &mut probe_client,
+        &parallel,
+        segment_bytes,
+        &options,
+        &mut |_| {},
+        &|| false,
+        &|| false,
+    )
+    .unwrap_err();
+
+    match error {
+        PullError::SegmentLowSpeed {
+            start,
+            end,
+            attempts,
+            ..
+        } => {
+            assert_eq!(start, flaky_start);
+            assert_eq!(end, flaky_end);
+            // One attempt is not itself a retry, plus SEGMENT_MAX_RETRIES
+            // requeue-and-retry rounds before giving up -- the same total
+            // attempt budget every other segment failure mode gets.
+            assert_eq!(attempts, SEGMENT_MAX_RETRIES + 1);
+        }
+        other => panic!("expected PullError::SegmentLowSpeed, got {other:?}"),
+    }
+    // This is a retryable, source-fallback-eligible error, exactly like the
+    // other segment failure modes -- `download_with_retries`'s outer loop
+    // (untouched by this change) is what actually retries the whole attempt
+    // or falls back to the next mirror.
+    assert!(is_retryable_download_error(&error));
+    assert!(is_source_fallback_error(&error));
+    assert_eq!(
+        probe_client.attempts_on_flaky_segment(),
+        SEGMENT_MAX_RETRIES + 1
+    );
 }
 
 /// Regression guard: `reqwest::blocking::ClientBuilder::timeout` defaults to
