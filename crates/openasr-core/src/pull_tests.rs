@@ -1548,54 +1548,184 @@ fn pull_retries_low_speed_body_and_restarts_safely() {
     assert_eq!(client.ranges(), vec![None, None]);
 }
 
-#[test]
-fn segment_low_speed_window_trips_when_a_window_clears_without_the_byte_floor() {
-    // `Duration::ZERO` makes every `observe` call judge its window
-    // immediately (matches the same zero-timeout trick the whole-file
-    // `pull_retries_low_speed_body_and_restarts_safely` test above uses),
-    // so this is deterministic without any real sleep.
-    let options = PullOptions {
+/// Default `PullOptions` low-speed knobs, but with a zero window timeout so
+/// `SegmentLowSpeedWindow::observe` judges its window on the very first call
+/// regardless of real elapsed time (matches the same trick the whole-file
+/// `pull_retries_low_speed_body_and_restarts_safely` test above uses). Safe
+/// here specifically because `observe` compares raw per-window *byte counts*,
+/// never a computed bytes/sec rate, so there is no division-by-elapsed-time
+/// to make unstable.
+fn zero_window_options() -> PullOptions {
+    PullOptions {
         segment_low_speed_timeout: Duration::ZERO,
-        segment_low_speed_min_bytes: 10,
         ..PullOptions::default()
-    };
-    let mut window = SegmentLowSpeedWindow::new(&options);
-    assert!(
-        window.observe(1),
-        "1 byte is below the 10-byte floor and the window already elapsed"
+    }
+}
+
+/// Feeds `samples` into a reference (each one both consulted as history and
+/// then recorded), so a test can cheaply establish "this session has already
+/// seen these per-window byte counts" before evaluating the sample under
+/// test in isolation.
+fn reference_with_history(samples: &[u64]) -> SegmentThroughputReference {
+    let reference = SegmentThroughputReference::new();
+    for sample in samples {
+        reference.record(*sample);
+    }
+    reference
+}
+
+#[test]
+fn segment_throughput_reference_is_cold_below_the_minimum_sample_count() {
+    let reference = SegmentThroughputReference::new();
+    assert_eq!(reference.median(), None, "no samples yet: cold start");
+    reference.record(1_000_000);
+    reference.record(1_000_000);
+    assert_eq!(
+        reference.median(),
+        None,
+        "still below SEGMENT_LOW_SPEED_MIN_REFERENCE_SAMPLES"
+    );
+    reference.record(1_000_000);
+    assert_eq!(
+        reference.median(),
+        Some(1_000_000),
+        "the Nth sample must cross the cold-start threshold"
     );
 }
 
 #[test]
-fn segment_low_speed_window_disabled_when_min_bytes_is_zero() {
-    let options = PullOptions {
-        segment_low_speed_timeout: Duration::ZERO,
-        segment_low_speed_min_bytes: 0,
-        ..PullOptions::default()
-    };
-    let mut window = SegmentLowSpeedWindow::new(&options);
-    assert!(!window.observe(0));
-    assert!(!window.observe(1));
+fn segment_low_speed_window_never_trips_during_cold_start() {
+    // Fewer than `SEGMENT_LOW_SPEED_MIN_REFERENCE_SAMPLES` samples exist, so
+    // there is no reference yet to be an outlier against -- even a session's
+    // very first, objectively tiny window must never be judged low-speed.
+    let reference = reference_with_history(&[1_000_000, 1_000_000]);
+    let cooldown_slot = Mutex::new(None);
+    let options = zero_window_options();
+    let mut window = SegmentLowSpeedWindow::new(&options, &reference, &cooldown_slot, false);
+    assert!(
+        !window.observe(1),
+        "cold start (fewer than the minimum reference samples) must never trip"
+    );
 }
 
 #[test]
-fn segment_low_speed_window_resets_after_a_window_clears_the_floor() {
-    // A segment that starts out fast and later degrades must still be
-    // caught: clearing the floor once must reset the window rather than
-    // permanently disabling the guard for the rest of the segment.
-    let options = PullOptions {
-        segment_low_speed_timeout: Duration::ZERO,
-        segment_low_speed_min_bytes: 5,
-        ..PullOptions::default()
-    };
-    let mut window = SegmentLowSpeedWindow::new(&options);
+fn segment_low_speed_window_trips_on_a_relative_outlier_matching_the_reported_case() {
+    // Models the reported real-world failure: the bulk of the download ran
+    // fast (here, a 10 MB/window reference -- comparable to a healthy several
+    // MB/s connection), then a lone tail segment lands on a degraded
+    // connection running at a small fraction of that.
+    let reference = reference_with_history(&[10_000_000, 10_000_000, 10_000_000, 10_000_000]);
+    let cooldown_slot = Mutex::new(None);
+    let options = zero_window_options();
+    let mut window = SegmentLowSpeedWindow::new(&options, &reference, &cooldown_slot, false);
+    // Well under 15% of the 10 MB reference AND under the absolute floor.
     assert!(
-        !window.observe(5),
-        "5 bytes clears the 5-byte floor; must reset, not trip"
+        window.observe(1_000_000),
+        "1 MB against a 10 MB reference is both a relative outlier and below \
+         the absolute floor -- must trip"
     );
+}
+
+#[test]
+fn segment_low_speed_window_never_trips_in_a_uniformly_slow_session() {
+    // Every window in this session reads about the same (a real, working,
+    // if modest ~200 KB/s-class connection): no segment is an outlier
+    // relative to its own siblings, so the ratio test alone must never fire,
+    // regardless of how small the absolute numbers are. This is the "慢但能成"
+    // contract: a uniformly slow network must never be turned into a
+    // deterministic failure by this guard.
+    let uniform_window_bytes = 200_000_u64;
+    let reference = reference_with_history(&[
+        uniform_window_bytes,
+        uniform_window_bytes,
+        uniform_window_bytes,
+        uniform_window_bytes,
+    ]);
+    let cooldown_slot = Mutex::new(None);
+    let options = zero_window_options();
+    let mut window = SegmentLowSpeedWindow::new(&options, &reference, &cooldown_slot, false);
     assert!(
-        window.observe(1),
-        "the next window starts fresh at 0 bytes, so 1 byte must trip again"
+        !window.observe(uniform_window_bytes),
+        "a segment performing exactly like its siblings must never be an outlier"
+    );
+}
+
+#[test]
+fn segment_low_speed_window_absolute_floor_protects_a_merely_modest_speed_in_a_fast_session() {
+    // A segment reading ~400 KB/s-equivalent worth of bytes in one window is
+    // a real, working connection -- just not this unusually fast session's
+    // best. The ratio alone would flag it (well under 15% of a very high
+    // reference), but the absolute floor must still protect it from being
+    // needlessly abandoned.
+    let fast_reference_window_bytes = 150_000_000_u64; // ~10 MB/s-class
+    let reference = reference_with_history(&[
+        fast_reference_window_bytes,
+        fast_reference_window_bytes,
+        fast_reference_window_bytes,
+    ]);
+    let modest_but_real_window_bytes = 6_000_000_u64; // ~400 KB/s over the 15s window
+    assert!(
+        modest_but_real_window_bytes > SEGMENT_LOW_SPEED_ABSOLUTE_FLOOR_BYTES,
+        "fixture must sit above the absolute floor to exercise its protection"
+    );
+    let cooldown_slot = Mutex::new(None);
+    let options = zero_window_options();
+    let mut window = SegmentLowSpeedWindow::new(&options, &reference, &cooldown_slot, false);
+    assert!(
+        !window.observe(modest_but_real_window_bytes),
+        "above the absolute floor must never trip, no matter how fast the reference is"
+    );
+}
+
+#[test]
+fn segment_low_speed_window_reflects_the_sessions_historical_median_for_a_lone_tail_segment() {
+    // Once every other segment has completed, the reference is entirely this
+    // session's *history* (nothing else is in flight to compare against) --
+    // exactly the "one straggler segment left" case from the report. This
+    // test only asserts that history alone (no live siblings) is sufficient
+    // for the guard to keep working, by feeding a fast history and then
+    // evaluating a slow lone window against it.
+    let reference = reference_with_history(&[8_000_000, 8_000_000, 8_000_000, 8_000_000]);
+    let cooldown_slot = Mutex::new(None);
+    let options = zero_window_options();
+    let mut window = SegmentLowSpeedWindow::new(&options, &reference, &cooldown_slot, false);
+    assert!(
+        window.observe(90_000),
+        "a lone straggler window judged purely against session history must still trip"
+    );
+}
+
+#[test]
+fn segment_low_speed_window_cooldown_suppresses_a_thrashing_retrip() {
+    // Hysteresis: once tripped, the same segment index must not immediately
+    // re-trip on its very next window even if that window is also still an
+    // outlier -- this damps requeue churn for a segment sitting right at the
+    // boundary instead of burning through reconnects one window apart.
+    let reference = reference_with_history(&[10_000_000, 10_000_000, 10_000_000, 10_000_000]);
+    let cooldown_slot = Mutex::new(None);
+    let options = zero_window_options();
+    let mut first = SegmentLowSpeedWindow::new(&options, &reference, &cooldown_slot, false);
+    assert!(first.observe(1_000_000), "first window: a genuine outlier");
+    let mut second = SegmentLowSpeedWindow::new(&options, &reference, &cooldown_slot, false);
+    assert!(
+        !second.observe(1_000_000),
+        "still within the cooldown since the first trip: must be suppressed"
+    );
+}
+
+#[test]
+fn segment_low_speed_window_disabled_flag_never_trips_regardless_of_speed() {
+    // Once a segment has exhausted its reconnect budget, evaluation is
+    // disabled for its final attempt: the worst case must degrade to
+    // "let it finish", never a hard failure, no matter how extreme the
+    // outlier looks.
+    let reference = reference_with_history(&[10_000_000, 10_000_000, 10_000_000, 10_000_000]);
+    let cooldown_slot = Mutex::new(None);
+    let options = zero_window_options();
+    let mut window = SegmentLowSpeedWindow::new(&options, &reference, &cooldown_slot, true);
+    assert!(
+        !window.observe(1),
+        "disabled must never trip, even for a single byte against a 10 MB reference"
     );
 }
 
@@ -3329,18 +3459,22 @@ impl Read for OneByteAtATimeReader {
     }
 }
 
-/// A `RangeServerClient`-alike whose responses for one specific segment
-/// (`flaky_start`) trickle one byte at a time -- tripping a zero-timeout
-/// `SegmentLowSpeedWindow` on the very first chunk -- while every other
-/// segment (and, if `always_flaky` is `false`, every attempt after the
-/// first on the flaky segment too) is served normally in one read. Models
-/// "one connection to this source is bad; a fresh one for the same range is
-/// fine" without needing a real slow socket.
+/// A `RangeServerClient`-alike whose responses trickle one byte at a time
+/// for whichever segment(s) `flaky_start` selects -- tripping a zero-timeout
+/// `SegmentLowSpeedWindow` window on the very first chunk of that segment --
+/// while every other segment (and, if `always_flaky` is `false`, every
+/// attempt after the first on the flaky segment too) is served normally in
+/// one read. Models "one connection to this source is bad; a fresh one for
+/// the same range is fine" without needing a real slow socket.
+///
+/// `flaky_start: None` makes *every* segment trickle uniformly instead of
+/// singling one out -- used to model a session where the whole network is
+/// slow, not just one connection.
 #[derive(Clone)]
 struct FlakySegmentRangeClient {
     bytes: Arc<Vec<u8>>,
     attempts_by_start: Arc<Mutex<HashMap<u64, usize>>>,
-    flaky_start: u64,
+    flaky_start: Option<u64>,
     always_flaky: bool,
 }
 
@@ -3349,18 +3483,44 @@ impl FlakySegmentRangeClient {
         Self {
             bytes: Arc::new(bytes),
             attempts_by_start: Arc::new(Mutex::new(HashMap::new())),
-            flaky_start,
+            flaky_start: Some(flaky_start),
             always_flaky,
         }
     }
 
-    fn attempts_on_flaky_segment(&self) -> usize {
+    /// Every segment trickles on every attempt: models a uniformly slow
+    /// session (see the type's doc comment).
+    fn new_uniformly_slow(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Arc::new(bytes),
+            attempts_by_start: Arc::new(Mutex::new(HashMap::new())),
+            flaky_start: None,
+            always_flaky: true,
+        }
+    }
+
+    fn attempts_for(&self, start: u64) -> usize {
         self.attempts_by_start
             .lock()
             .unwrap()
-            .get(&self.flaky_start)
+            .get(&start)
             .copied()
             .unwrap_or(0)
+    }
+
+    fn attempts_on_flaky_segment(&self) -> usize {
+        let flaky_start = self
+            .flaky_start
+            .expect("attempts_on_flaky_segment requires a single flaky_start");
+        self.attempts_for(flaky_start)
+    }
+
+    fn every_recorded_segment_attempted_exactly_once(&self) -> bool {
+        self.attempts_by_start
+            .lock()
+            .unwrap()
+            .values()
+            .all(|count| *count == 1)
     }
 }
 
@@ -3381,7 +3541,10 @@ impl DownloadClient for FlakySegmentRangeClient {
             *counter += 1;
             *counter
         };
-        let is_flaky_now = start == self.flaky_start && (self.always_flaky || attempt == 1);
+        let is_flaky_now = match self.flaky_start {
+            None => true,
+            Some(flaky_start) => start == flaky_start && (self.always_flaky || attempt == 1),
+        };
         let reader: Box<dyn Read> = if is_flaky_now {
             Box::new(OneByteAtATimeReader::new(slice))
         } else {
@@ -3410,38 +3573,54 @@ fn parallel_attempt_paths(home: &Path, resolved: &ResolvedCatalogPull) -> (PullT
     (target, paths)
 }
 
+/// `connections: 1` makes the single worker drain the shared queue strictly
+/// in ascending index order (FIFO, one segment at a time) -- these tests
+/// need that determinism to control exactly how many reference samples
+/// exist by the time a particular segment is evaluated, which a real
+/// multi-connection race wouldn't guarantee.
+fn single_worker_parallel_config(
+    factory: &dyn Fn() -> Result<BoxedDownloadClient, PullError>,
+) -> ParallelDownloadConfig<'_> {
+    ParallelDownloadConfig {
+        connections: 1,
+        factory,
+    }
+}
+
+fn low_speed_test_options(segment_bytes: u64) -> PullOptions {
+    // Duration::ZERO: see `zero_window_options` above -- makes every
+    // `observe` call judge its window (here, one buffer read) immediately.
+    PullOptions {
+        segment_low_speed_timeout: Duration::ZERO,
+        ..parallel_test_options(segment_bytes)
+    }
+}
+
 #[test]
 fn parallel_download_low_speed_segment_requeues_onto_fresh_connection_and_recovers() {
     let bytes = tiny_pack_bytes();
     let resolved = resolved_for(&bytes);
     let temp = tempfile::tempdir().unwrap();
-    let segment_bytes = small_segment_bytes(bytes.len(), 4);
+    let segment_bytes = small_segment_bytes(bytes.len(), 5);
     let total_segments = segment_count(bytes.len() as u64, segment_bytes);
     assert!(
-        total_segments >= 3,
-        "fixture too small to give the flaky segment (index 1, not the probe) \
-         siblings to run alongside"
+        total_segments >= 5,
+        "fixture too small: need the probe plus 3 normal siblings to warm the \
+         reference before the flaky (last) segment is evaluated"
     );
-    // Index 1, not 0: segment 0 is always the synchronous probe segment, and
-    // this test targets the worker-queue requeue path in `run_segment_worker`
-    // specifically (the probe has its own low-speed retry loop, covered by
-    // the probe-path test below).
-    let (flaky_start, _) = segment_range(1, bytes.len() as u64, segment_bytes);
+    // The *last* index, fetched last by a single sequential worker: by the
+    // time it's evaluated, the probe (index 0) plus every other worker
+    // segment before it have already recorded their (normal-speed) windows,
+    // satisfying SEGMENT_LOW_SPEED_MIN_REFERENCE_SAMPLES -- exactly the
+    // reported "lone tail straggler after a fast bulk" scenario.
+    let (flaky_start, _) = segment_range(total_segments - 1, bytes.len() as u64, segment_bytes);
 
     let mut probe_client = FlakySegmentRangeClient::new(bytes.clone(), flaky_start, false);
     let factory_client = probe_client.clone();
     let factory: Box<dyn Fn() -> Result<BoxedDownloadClient, PullError>> =
         Box::new(move || Ok(Box::new(factory_client.clone()) as BoxedDownloadClient));
-    let parallel = ParallelDownloadConfig {
-        connections: 4,
-        factory: &*factory,
-    };
-
-    let options = PullOptions {
-        segment_low_speed_timeout: Duration::ZERO,
-        segment_low_speed_min_bytes: 2,
-        ..parallel_test_options(segment_bytes)
-    };
+    let parallel = single_worker_parallel_config(&*factory);
+    let options = low_speed_test_options(segment_bytes);
 
     let progress_events = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
     let progress_sink = progress_events.clone();
@@ -3500,31 +3679,94 @@ fn parallel_download_low_speed_segment_requeues_onto_fresh_connection_and_recove
 }
 
 #[test]
-fn parallel_download_probe_segment_low_speed_retries_in_place_and_recovers() {
-    // Same recovery contract as the worker-side test above, but for the
-    // probe segment (always index 0), which runs synchronously before any
-    // worker thread exists and so has its own retry loop in
-    // `download_parallel_attempt` instead of the shared work queue.
+fn parallel_download_low_speed_segment_gives_up_after_max_abandons_and_still_completes() {
+    // The worst case after exhausting the reconnect budget must be identical
+    // to not having this guard at all: the download still succeeds, just
+    // slower for this one segment, never a hard failure.
     let bytes = tiny_pack_bytes();
     let resolved = resolved_for(&bytes);
     let temp = tempfile::tempdir().unwrap();
-    let segment_bytes = small_segment_bytes(bytes.len(), 4);
-    let (flaky_start, _) = segment_range(0, bytes.len() as u64, segment_bytes);
+    let segment_bytes = small_segment_bytes(bytes.len(), 5);
+    let total_segments = segment_count(bytes.len() as u64, segment_bytes);
+    assert!(
+        total_segments >= 5,
+        "fixture too small to warm the reference"
+    );
+    let (flaky_start, _) = segment_range(total_segments - 1, bytes.len() as u64, segment_bytes);
 
-    let mut probe_client = FlakySegmentRangeClient::new(bytes.clone(), flaky_start, false);
+    // `always_flaky: true` -- this segment never recovers, no matter how
+    // many fresh connections it gets, exercising the bounded degrade-and-
+    // finish path.
+    let mut probe_client = FlakySegmentRangeClient::new(bytes.clone(), flaky_start, true);
     let factory_client = probe_client.clone();
     let factory: Box<dyn Fn() -> Result<BoxedDownloadClient, PullError>> =
         Box::new(move || Ok(Box::new(factory_client.clone()) as BoxedDownloadClient));
-    let parallel = ParallelDownloadConfig {
-        connections: 4,
-        factory: &*factory,
-    };
-
+    let parallel = single_worker_parallel_config(&*factory);
+    // Cooldown disabled: this test isolates the abandon-count cap from the
+    // separate hysteresis behavior (covered by
+    // `segment_low_speed_window_cooldown_suppresses_a_thrashing_retrip`).
+    // With the default cooldown active, this mock's near-instant retry would
+    // itself fall inside the cooldown window and never re-trip -- which
+    // would still finish successfully, but wouldn't be exercising the cap.
     let options = PullOptions {
-        segment_low_speed_timeout: Duration::ZERO,
-        segment_low_speed_min_bytes: 2,
-        ..parallel_test_options(segment_bytes)
+        segment_low_speed_cooldown: Duration::ZERO,
+        ..low_speed_test_options(segment_bytes)
     };
+    let (target, paths) = parallel_attempt_paths(temp.path(), &resolved);
+
+    let outcome = download_parallel_attempt(
+        &target,
+        &paths,
+        &mut probe_client,
+        &parallel,
+        segment_bytes,
+        &options,
+        &mut |_| {},
+        &|| false,
+        &|| false,
+    )
+    .unwrap();
+
+    let downloaded = match outcome {
+        ParallelAttemptOutcome::Completed(downloaded) => downloaded,
+        ParallelAttemptOutcome::RangeNotSupported => {
+            panic!("this mock always honors Range with 206")
+        }
+    };
+    assert_eq!(downloaded.sha256, sha256_hex(&bytes));
+    assert_eq!(fs::read(&paths.partial_path).unwrap(), bytes);
+
+    // SEGMENT_MAX_RETRIES abandon-and-requeue rounds, then one final attempt
+    // with the guard disabled that's simply allowed to trickle to
+    // completion -- never a `PullError` (that variant no longer exists).
+    assert_eq!(
+        probe_client.attempts_on_flaky_segment(),
+        SEGMENT_MAX_RETRIES + 1
+    );
+}
+
+#[test]
+fn parallel_download_cold_start_never_flags_an_early_trickling_segment() {
+    // The segment fetched immediately after the probe has, at most, one
+    // prior sample (the probe's own) -- below
+    // SEGMENT_LOW_SPEED_MIN_REFERENCE_SAMPLES, so it must never be judged
+    // low-speed no matter how slowly it trickles. This is the same
+    // cold-start contract as the pure unit test above, exercised end to end
+    // through the real mock transport.
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let segment_bytes = small_segment_bytes(bytes.len(), 5);
+    let total_segments = segment_count(bytes.len() as u64, segment_bytes);
+    assert!(total_segments >= 5, "fixture too small");
+    let (flaky_start, _) = segment_range(1, bytes.len() as u64, segment_bytes);
+
+    let mut probe_client = FlakySegmentRangeClient::new(bytes.clone(), flaky_start, true);
+    let factory_client = probe_client.clone();
+    let factory: Box<dyn Fn() -> Result<BoxedDownloadClient, PullError>> =
+        Box::new(move || Ok(Box::new(factory_client.clone()) as BoxedDownloadClient));
+    let parallel = single_worker_parallel_config(&*factory);
+    let options = low_speed_test_options(segment_bytes);
     let (target, paths) = parallel_attempt_paths(temp.path(), &resolved);
 
     let outcome = download_parallel_attempt(
@@ -3548,25 +3790,25 @@ fn parallel_download_probe_segment_low_speed_retries_in_place_and_recovers() {
             panic!("this mock always honors Range with 206")
         }
     }
-    assert_eq!(probe_client.attempts_on_flaky_segment(), 2);
+    // Never requeued: cold start suppressed every evaluation of this segment.
+    assert_eq!(probe_client.attempts_on_flaky_segment(), 1);
 }
 
 #[test]
-fn parallel_download_low_speed_segment_gives_up_after_max_abandons() {
+fn parallel_download_uniformly_slow_session_completes_without_any_requeue() {
+    // The "慢但能成" contract end to end: every segment (including the
+    // probe) trickles uniformly, so no segment is ever an outlier relative
+    // to its own siblings -- the ratio test alone must never fire, and the
+    // whole download must still succeed without a single requeue, exactly
+    // like it would have before this guard existed.
     let bytes = tiny_pack_bytes();
     let resolved = resolved_for(&bytes);
     let temp = tempfile::tempdir().unwrap();
-    let segment_bytes = small_segment_bytes(bytes.len(), 4);
+    let segment_bytes = small_segment_bytes(bytes.len(), 5);
     let total_segments = segment_count(bytes.len() as u64, segment_bytes);
-    assert!(
-        total_segments >= 3,
-        "fixture too small to give the flaky segment (index 1) siblings"
-    );
-    let (flaky_start, flaky_end) = segment_range(1, bytes.len() as u64, segment_bytes);
+    assert!(total_segments >= 5, "fixture too small");
 
-    // `always_flaky: true` -- this segment never recovers, no matter how
-    // many fresh connections it gets, exercising the bounded give-up path.
-    let mut probe_client = FlakySegmentRangeClient::new(bytes.clone(), flaky_start, true);
+    let mut probe_client = FlakySegmentRangeClient::new_uniformly_slow(bytes.clone());
     let factory_client = probe_client.clone();
     let factory: Box<dyn Fn() -> Result<BoxedDownloadClient, PullError>> =
         Box::new(move || Ok(Box::new(factory_client.clone()) as BoxedDownloadClient));
@@ -3574,15 +3816,10 @@ fn parallel_download_low_speed_segment_gives_up_after_max_abandons() {
         connections: 4,
         factory: &*factory,
     };
-
-    let options = PullOptions {
-        segment_low_speed_timeout: Duration::ZERO,
-        segment_low_speed_min_bytes: 2,
-        ..parallel_test_options(segment_bytes)
-    };
+    let options = low_speed_test_options(segment_bytes);
     let (target, paths) = parallel_attempt_paths(temp.path(), &resolved);
 
-    let error = download_parallel_attempt(
+    let outcome = download_parallel_attempt(
         &target,
         &paths,
         &mut probe_client,
@@ -3593,33 +3830,19 @@ fn parallel_download_low_speed_segment_gives_up_after_max_abandons() {
         &|| false,
         &|| false,
     )
-    .unwrap_err();
+    .unwrap();
 
-    match error {
-        PullError::SegmentLowSpeed {
-            start,
-            end,
-            attempts,
-            ..
-        } => {
-            assert_eq!(start, flaky_start);
-            assert_eq!(end, flaky_end);
-            // One attempt is not itself a retry, plus SEGMENT_MAX_RETRIES
-            // requeue-and-retry rounds before giving up -- the same total
-            // attempt budget every other segment failure mode gets.
-            assert_eq!(attempts, SEGMENT_MAX_RETRIES + 1);
+    match outcome {
+        ParallelAttemptOutcome::Completed(downloaded) => {
+            assert_eq!(downloaded.sha256, sha256_hex(&bytes));
         }
-        other => panic!("expected PullError::SegmentLowSpeed, got {other:?}"),
+        ParallelAttemptOutcome::RangeNotSupported => {
+            panic!("this mock always honors Range with 206")
+        }
     }
-    // This is a retryable, source-fallback-eligible error, exactly like the
-    // other segment failure modes -- `download_with_retries`'s outer loop
-    // (untouched by this change) is what actually retries the whole attempt
-    // or falls back to the next mirror.
-    assert!(is_retryable_download_error(&error));
-    assert!(is_source_fallback_error(&error));
-    assert_eq!(
-        probe_client.attempts_on_flaky_segment(),
-        SEGMENT_MAX_RETRIES + 1
+    assert!(
+        probe_client.every_recorded_segment_attempted_exactly_once(),
+        "a uniformly slow session must never trigger a single requeue"
     );
 }
 

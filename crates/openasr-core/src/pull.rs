@@ -64,26 +64,57 @@ const PULL_CONNECTIONS_ENV_VAR: &str = "OPENASR_PULL_CONNECTIONS";
 /// persistently broken likely reflects a source-wide problem the outer loop
 /// is already positioned to retry or fall back away from.
 const SEGMENT_MAX_RETRIES: usize = 3;
-/// Per-segment low-speed floor for the concurrent chunked-download path.
-/// Deliberately shorter and stricter than the whole-file
-/// `DOWNLOAD_LOW_SPEED_*` pair used by the single-stream path: that guard is
-/// tuned to catch only a connection that is *effectively dead* (its 60s / 64
-/// KiB pair is a floor of roughly 1 KB/s), because abandoning it discards the
-/// whole download so far. A segment fetch has no such cost -- the other
-/// segments already on disk or in flight are untouched -- so it can afford to
-/// give up on a merely *slow* connection and try a fresh one instead of
-/// riding it out. 15s / 3 MiB is a ~205 KB/s floor, chosen to actually catch
-/// the reported real-world failure mode: a lone tail segment stuck on one
-/// degraded connection at ~90 KB/s, which would otherwise take the full 64
-/// MiB segment (~12 minutes) to finish with nothing else to fall back on.
-/// Reconnecting is cheap here (see `fetch_segment_with_retries` and the
-/// requeue-to-tail handling in `run_segment_worker`), and CDNs commonly
-/// resolve a degraded edge by simply routing a new connection differently,
-/// so this floor favors giving a fresh connection a chance over waiting out
-/// a bad one. Exposed via `PullOptions` (like the whole-file pair) so tests
-/// can force a deterministic trip.
+/// Window length for the per-segment low-speed guard's rolling check (see
+/// `SegmentLowSpeedWindow`). Shorter than the whole-file single-stream guard
+/// (60s): abandoning a segment only discards that segment's in-flight bytes,
+/// not the whole download, so it can afford to reevaluate more often.
 const SEGMENT_LOW_SPEED_TIMEOUT: Duration = Duration::from_secs(15);
-const SEGMENT_LOW_SPEED_MIN_BYTES: u64 = 3 * 1024 * 1024;
+/// Outlier threshold for the per-segment low-speed guard: a segment is only
+/// a candidate for abandonment once a window reads under this fraction of
+/// the download session's own current reference throughput (see
+/// `SegmentThroughputReference`). This is a *relative* judgment, not a fixed
+/// floor -- a session where every connection tops out around, say, 200 KB/s
+/// (a real, working, if modest network) must never trip this guard just
+/// because 200 KB/s is a small number in absolute terms: no segment in that
+/// session is an outlier relative to the others, so the ratio test alone
+/// already never fires. Picked from a defensible "meaningfully behind its
+/// siblings" range (roughly a seventh to a tenth of the reference) and
+/// biased toward the lenient end to keep false positives rare.
+const SEGMENT_LOW_SPEED_RELATIVE_RATIO: f64 = 0.15;
+/// Second half of the low-speed AND, in absolute terms: bytes expected
+/// within one `SEGMENT_LOW_SPEED_TIMEOUT` window, roughly a 273 KB/s floor.
+/// Without this, the relative test alone could abandon a segment that's
+/// merely somewhat slower than an *unusually fast* reference (say 300-400
+/// KB/s in a session whose other segments hit several MB/s) even though
+/// that speed is still a perfectly normal, working connection -- just not
+/// this session's best. Requiring both conditions means only a segment that
+/// is genuinely slow in real terms *and* a clear outlier among its own
+/// siblings gets abandoned; this is what actually catches the reported
+/// failure mode (a lone tail segment at ~90 KB/s while the rest of the
+/// download ran at several MB/s) without ever penalizing a uniformly slow
+/// session.
+const SEGMENT_LOW_SPEED_ABSOLUTE_FLOOR_BYTES: u64 = 4 * 1024 * 1024;
+/// Cooldown after a segment is abandoned for low speed, before it's eligible
+/// to be judged low-speed again: twice the window length, so a freshly
+/// reconnected attempt gets at least two full observation windows before
+/// being re-evaluated. Without this, a segment sitting right at the ratio
+/// boundary could thrash -- reconnect, immediately look slow again next
+/// window, reconnect again -- burning through `SEGMENT_MAX_RETRIES` on
+/// connection churn instead of giving each fresh connection a fair chance.
+const SEGMENT_LOW_SPEED_COOLDOWN: Duration = Duration::from_secs(30);
+/// Minimum recorded windows before the session reference is trusted enough
+/// to judge outliers against. Below this, a single (possibly unlucky) early
+/// sample would effectively become "the reference", which can never
+/// correctly identify an outlier -- it would just compare a segment against
+/// itself. `SegmentThroughputReference::median` returns `None` (never judge
+/// low-speed yet) until this many samples exist, which is also what keeps a
+/// download's very first segments from ever being penalized cold.
+const SEGMENT_LOW_SPEED_MIN_REFERENCE_SAMPLES: usize = 3;
+/// Bounds how many recent per-window byte counts the session reference
+/// keeps: large enough for a stable median, small enough that the reference
+/// tracks *current* conditions on a long, many-segment download rather than
+/// staying anchored to however the first few segments happened to perform.
+const SEGMENT_LOW_SPEED_REFERENCE_CAPACITY: usize = 64;
 /// Discriminator stamped into the segmented-download partial-meta file so a
 /// resume never misreads a legacy (pre-chunking) `PartialMeta` -- or a future
 /// incompatible format -- as a valid segment bitmap. Bumping the segment size
@@ -248,15 +279,6 @@ pub enum PullError {
         "Concurrent chunk fetch for '{url}' returned a Content-Range starting at a different offset than requested"
     )]
     SegmentRangeMismatch { url: String },
-    #[error(
-        "Concurrent chunk fetch for '{url}' segment [{start}-{end}] stayed below the per-segment low-speed floor across {attempts} connection attempts; giving up on this segment"
-    )]
-    SegmentLowSpeed {
-        url: String,
-        start: u64,
-        end: u64,
-        attempts: usize,
-    },
     #[error("Downloaded pack failed Rust-only GGUF preflight for '{path}': {reason}")]
     GgufPreflight { path: PathBuf, reason: String },
     #[error("Downloaded backend file failed binary preflight for '{path}': {reason}")]
@@ -322,13 +344,16 @@ struct PullOptions {
     available_space_override: Option<u64>,
     low_speed_timeout: Duration,
     low_speed_min_bytes: u64,
-    /// Per-segment low-speed floor for the concurrent chunked-download path;
-    /// see `SEGMENT_LOW_SPEED_TIMEOUT`/`SEGMENT_LOW_SPEED_MIN_BYTES` for the
-    /// production defaults and the rationale for why they're stricter than
-    /// the whole-file pair above. Overridable (like that pair) so tests can
+    /// Relative per-segment low-speed guard for the concurrent
+    /// chunked-download path; see `SEGMENT_LOW_SPEED_TIMEOUT` and friends for
+    /// the production defaults and the rationale for judging a segment
+    /// against this download session's own throughput rather than a fixed
+    /// floor. All overridable (like the whole-file pair above) so tests can
     /// force a deterministic trip without waiting out a real window.
     segment_low_speed_timeout: Duration,
-    segment_low_speed_min_bytes: u64,
+    segment_low_speed_relative_ratio: f64,
+    segment_low_speed_absolute_floor_bytes: u64,
+    segment_low_speed_cooldown: Duration,
     /// Test-only override for `DOWNLOAD_SEGMENT_BYTES`, so unit tests can
     /// exercise multi-segment concurrent download logic (splitting, resume
     /// bitmap, ETag invalidation, ...) against small in-memory fixtures
@@ -344,7 +369,9 @@ impl PullOptions {
             low_speed_timeout: DOWNLOAD_LOW_SPEED_TIMEOUT,
             low_speed_min_bytes: DOWNLOAD_LOW_SPEED_MIN_BYTES,
             segment_low_speed_timeout: SEGMENT_LOW_SPEED_TIMEOUT,
-            segment_low_speed_min_bytes: SEGMENT_LOW_SPEED_MIN_BYTES,
+            segment_low_speed_relative_ratio: SEGMENT_LOW_SPEED_RELATIVE_RATIO,
+            segment_low_speed_absolute_floor_bytes: SEGMENT_LOW_SPEED_ABSOLUTE_FLOOR_BYTES,
+            segment_low_speed_cooldown: SEGMENT_LOW_SPEED_COOLDOWN,
             parallel_segment_bytes_override: None,
         }
     }
@@ -1524,6 +1551,19 @@ fn download_parallel_attempt<C: DownloadClient + ?Sized>(
         options.clone(),
     )?;
 
+    // Shared low-speed guard state for this attempt, used by both the probe
+    // (below) and every worker spawned later: one session-wide throughput
+    // reference (see `SegmentThroughputReference`), one low-speed abandon
+    // counter per segment index (a segment can be requeued and picked up by
+    // a *different* worker than the one that abandoned it, so this can't
+    // live in any single worker's local state), and one cooldown timestamp
+    // per segment index (see `SEGMENT_LOW_SPEED_COOLDOWN`).
+    let throughput_reference = Arc::new(SegmentThroughputReference::new());
+    let low_speed_abandon_counts: Arc<Vec<AtomicUsize>> =
+        Arc::new((0..total_segments).map(|_| AtomicUsize::new(0)).collect());
+    let low_speed_cooldowns: Arc<Vec<Mutex<Option<Instant>>>> =
+        Arc::new((0..total_segments).map(|_| Mutex::new(None)).collect());
+
     // Probe the first still-missing segment with a real, bounded Range
     // request before committing to concurrency. A single request both (a)
     // confirms the source honors Range (206) rather than ignoring it (200 --
@@ -1610,11 +1650,21 @@ fn download_parallel_attempt<C: DownloadClient + ?Sized>(
         // shared queue to requeue into here (there's exactly one prober), so
         // a low-speed trip just re-opens a fresh request for the same range
         // and retries in place, bounded by the same `SEGMENT_MAX_RETRIES` cap
-        // every other segment failure mode uses.
+        // every other segment failure mode uses -- past that cap, evaluation
+        // is disabled and the probe simply finishes on its current
+        // connection (see `SegmentLowSpeedWindow::disabled`), never a hard
+        // failure.
         let mut probe_reader = probe_response.reader;
-        let mut probe_attempts = 1_usize;
+        let mut probe_abandon_count = 0_usize;
+        let probe_cooldown = &low_speed_cooldowns[probe_index];
         let written = loop {
-            let mut low_speed = SegmentLowSpeedWindow::new(options);
+            let disabled = probe_abandon_count >= SEGMENT_MAX_RETRIES;
+            let mut low_speed = SegmentLowSpeedWindow::new(
+                options,
+                &throughput_reference,
+                probe_cooldown,
+                disabled,
+            );
             let outcome = write_segment_body(
                 &mut file,
                 &paths.partial_path,
@@ -1658,14 +1708,14 @@ fn download_parallel_attempt<C: DownloadClient + ?Sized>(
                         bytes_done,
                         bytes_total: target.size_bytes,
                     });
-                    if probe_attempts > SEGMENT_MAX_RETRIES {
-                        cleanup_partial(paths);
-                        return Err(PullError::SegmentLowSpeed {
-                            url: target.url.clone(),
-                            start: probe_start,
-                            end: probe_end,
-                            attempts: probe_attempts,
-                        });
+                    probe_abandon_count += 1;
+                    if probe_abandon_count == SEGMENT_MAX_RETRIES {
+                        eprintln!(
+                            "openasr: warning: probe segment [{probe_start}-{probe_end}] for \
+                             '{}' stayed a relative low-speed outlier after {probe_abandon_count} \
+                             reconnect attempts; accepting it on its current connection",
+                            target.url
+                        );
                     }
                     let retry_response = probe_client.open(
                         &target.url,
@@ -1678,7 +1728,6 @@ fn download_parallel_attempt<C: DownloadClient + ?Sized>(
                         });
                     }
                     probe_reader = retry_response.reader;
-                    probe_attempts += 1;
                 }
             }
         };
@@ -1721,14 +1770,6 @@ fn download_parallel_attempt<C: DownloadClient + ?Sized>(
     let remaining_count = remaining.len();
     let queue = Arc::new(Mutex::new(remaining));
     let abort = Arc::new(AtomicBool::new(false));
-    // One low-speed abandon counter per segment index, shared across every
-    // worker: a segment can be requeued and picked up by a *different*
-    // worker than the one that abandoned it, so the retry cap has to live
-    // outside any single worker's local state (unlike the generic
-    // `SEGMENT_MAX_RETRIES` loop in `fetch_segment_with_retries`, which stays
-    // on one worker/connection because it isn't requeuing).
-    let low_speed_abandon_counts: Arc<Vec<AtomicUsize>> =
-        Arc::new((0..total_segments).map(|_| AtomicUsize::new(0)).collect());
     let (sender, receiver) = mpsc::channel::<SegmentEvent>();
     // No lock needed yet: no worker thread exists before the spawn loop
     // below, so `remaining_count` (captured before `remaining` moved into
@@ -1746,6 +1787,8 @@ fn download_parallel_attempt<C: DownloadClient + ?Sized>(
         let worker_reference_etag = reference_etag.clone();
         let worker_options = options.clone();
         let worker_low_speed_abandon_counts = low_speed_abandon_counts.clone();
+        let worker_throughput_reference = throughput_reference.clone();
+        let worker_low_speed_cooldowns = low_speed_cooldowns.clone();
         handles.push(std::thread::spawn(move || {
             run_segment_worker(
                 worker_client,
@@ -1759,6 +1802,8 @@ fn download_parallel_attempt<C: DownloadClient + ?Sized>(
                 worker_reference_etag,
                 worker_options,
                 worker_low_speed_abandon_counts,
+                worker_throughput_reference,
+                worker_low_speed_cooldowns,
             );
         }));
     }
@@ -2004,10 +2049,11 @@ enum SegmentFetchOutcome {
 /// next `client.open()` call for it (by this worker or another, once its
 /// current segment finishes) starts a genuinely fresh connection rather than
 /// riding out the same degraded one. `low_speed_abandon_counts` bounds how
-/// many times any single segment index can be abandoned this way before it
-/// falls through to the same fail-closed path every other segment failure
-/// mode uses (`PullError::SegmentLowSpeed`, retried at the whole-attempt
-/// level by `download_with_retries` like any other retryable pull error).
+/// many times any single segment index can be abandoned this way; past
+/// `SEGMENT_MAX_RETRIES`, the *next* attempt on that index is constructed
+/// with its low-speed guard disabled (see `SegmentLowSpeedWindow::disabled`),
+/// so it can no longer trip -- the worst case degrades to "just let it
+/// finish on whatever connection it's on", never a hard failure.
 #[allow(clippy::too_many_arguments)]
 fn run_segment_worker(
     mut client: BoxedDownloadClient,
@@ -2021,6 +2067,8 @@ fn run_segment_worker(
     reference_etag: Option<String>,
     options: PullOptions,
     low_speed_abandon_counts: Arc<Vec<AtomicUsize>>,
+    throughput_reference: Arc<SegmentThroughputReference>,
+    low_speed_cooldowns: Arc<Vec<Mutex<Option<Instant>>>>,
 ) {
     let mut file = match OpenOptions::new().write(true).open(&path) {
         Ok(file) => file,
@@ -2044,6 +2092,11 @@ fn run_segment_worker(
             }
         };
         let (start, end) = segment_range(index, size_bytes, segment_bytes);
+        // SeqCst: read-then-later-write of this same counter happens across
+        // worker threads, so ordering must be total, not just
+        // per-worker-relative.
+        let disabled =
+            low_speed_abandon_counts[index].load(Ordering::SeqCst) >= SEGMENT_MAX_RETRIES;
         match fetch_segment_with_retries(
             client.as_mut(),
             &mut file,
@@ -2055,6 +2108,9 @@ fn run_segment_worker(
             &abort,
             &sender,
             &options,
+            &throughput_reference,
+            &low_speed_cooldowns[index],
+            disabled,
         ) {
             Ok(SegmentFetchOutcome::Done) => {
                 if sender.send(SegmentEvent::Done(index)).is_err() {
@@ -2069,18 +2125,13 @@ fn run_segment_worker(
                 {
                     return;
                 }
-                // SeqCst: every worker reads-then-writes this same counter,
-                // so ordering must be total across threads, not just
-                // per-worker-relative -- the usual case for a shared cap.
                 let attempts = low_speed_abandon_counts[index].fetch_add(1, Ordering::SeqCst) + 1;
-                if attempts > SEGMENT_MAX_RETRIES {
-                    let _ = sender.send(SegmentEvent::Failed(PullError::SegmentLowSpeed {
-                        url: url.clone(),
-                        start,
-                        end,
-                        attempts,
-                    }));
-                    return;
+                if attempts == SEGMENT_MAX_RETRIES {
+                    eprintln!(
+                        "openasr: warning: segment [{start}-{end}] for '{url}' stayed a \
+                         relative low-speed outlier after {attempts} reconnect attempts; \
+                         accepting it on its current connection"
+                    );
                 }
                 // Back of the queue, not the front: give any segments still
                 // untouched a chance first, so a persistently bad source
@@ -2115,6 +2166,9 @@ fn fetch_segment_with_retries(
     abort: &AtomicBool,
     sender: &mpsc::Sender<SegmentEvent>,
     options: &PullOptions,
+    throughput_reference: &SegmentThroughputReference,
+    cooldown_slot: &Mutex<Option<Instant>>,
+    low_speed_disabled: bool,
 ) -> Result<SegmentFetchOutcome, PullError> {
     let mut attempt = 0_usize;
     loop {
@@ -2132,6 +2186,9 @@ fn fetch_segment_with_retries(
             abort,
             sender,
             options,
+            throughput_reference,
+            cooldown_slot,
+            low_speed_disabled,
         ) {
             Ok(outcome) => return Ok(outcome),
             Err(error) if attempt < SEGMENT_MAX_RETRIES && is_retryable_download_error(&error) => {
@@ -2155,6 +2212,9 @@ fn fetch_segment_once(
     abort: &AtomicBool,
     sender: &mpsc::Sender<SegmentEvent>,
     options: &PullOptions,
+    throughput_reference: &SegmentThroughputReference,
+    cooldown_slot: &Mutex<Option<Instant>>,
+    low_speed_disabled: bool,
 ) -> Result<SegmentFetchOutcome, PullError> {
     let response = client.open(url, Some(ByteRange::bounded(start, end)))?;
     if response.status != 206 {
@@ -2182,7 +2242,12 @@ fn fetch_segment_once(
             url: url.to_string(),
         });
     }
-    let mut low_speed = SegmentLowSpeedWindow::new(options);
+    let mut low_speed = SegmentLowSpeedWindow::new(
+        options,
+        throughput_reference,
+        cooldown_slot,
+        low_speed_disabled,
+    );
     let write_outcome = write_segment_body(
         file,
         path,
@@ -2713,48 +2778,148 @@ impl LowSpeedWindow {
 /// the whole-file guard's job is "fail the pull with a typed error", while
 /// this one's job is "tell the caller whether to give up on *this attempt*"
 /// -- the caller (`write_segment_body`) then decides whether that means
-/// requeuing the segment for a fresh connection or, past
-/// `SEGMENT_MAX_RETRIES`, surfacing `PullError::SegmentLowSpeed`. Sharing one
-/// type across both call shapes would need the error-vs-bool branching to
-/// live inside the window itself, which is more indirection than the two
-/// call sites justify.
-struct SegmentLowSpeedWindow {
+/// requeuing the segment for a fresh connection. Unlike the whole-file guard,
+/// abandoning a segment is never a hard failure: past `SEGMENT_MAX_RETRIES`,
+/// further evaluation is simply disabled for that segment's final attempt
+/// (see `disabled`), so the worst case is identical to not having this guard
+/// at all -- the segment just finishes on whatever connection it's on.
+///
+/// Session-wide shared state, cloned/threaded into every worker and the
+/// probe:
+/// - [`SegmentThroughputReference`] -- the rolling median every segment is
+///   judged against (see its doc comment for why this is relative, not an
+///   absolute floor).
+/// - `cooldown_slot` -- this specific segment index's last-trip timestamp,
+///   damping requeue churn for a segment sitting right at the outlier
+///   boundary (see `SEGMENT_LOW_SPEED_COOLDOWN`).
+struct SegmentLowSpeedWindow<'a> {
     started_at: Instant,
     bytes_read: u64,
     timeout: Duration,
-    min_bytes: u64,
+    reference: &'a SegmentThroughputReference,
+    cooldown_slot: &'a Mutex<Option<Instant>>,
+    relative_ratio: f64,
+    absolute_floor_bytes: u64,
+    cooldown: Duration,
+    /// Set once this segment index has already been abandoned
+    /// `SEGMENT_MAX_RETRIES` times: this attempt is its last chance, so
+    /// evaluation is skipped entirely and it's simply allowed to finish
+    /// (see `download_parallel_attempt`'s degrade-and-log handling).
+    disabled: bool,
 }
 
-impl SegmentLowSpeedWindow {
-    fn new(options: &PullOptions) -> Self {
+impl<'a> SegmentLowSpeedWindow<'a> {
+    fn new(
+        options: &PullOptions,
+        reference: &'a SegmentThroughputReference,
+        cooldown_slot: &'a Mutex<Option<Instant>>,
+        disabled: bool,
+    ) -> Self {
         Self {
             started_at: Instant::now(),
             bytes_read: 0,
             timeout: options.segment_low_speed_timeout,
-            min_bytes: options.segment_low_speed_min_bytes,
+            reference,
+            cooldown_slot,
+            relative_ratio: options.segment_low_speed_relative_ratio,
+            absolute_floor_bytes: options.segment_low_speed_absolute_floor_bytes,
+            cooldown: options.segment_low_speed_cooldown,
+            disabled,
         }
     }
 
-    /// Rolling-window check: returns `true` once a full `timeout` window has
-    /// elapsed without `min_bytes` worth of reads landing in it. Resets the
-    /// window on every window that *does* clear the floor, so a segment that
-    /// starts fast and later degrades is still caught rather than being
-    /// judged once over its whole lifetime. `min_bytes == 0` disables the
-    /// guard entirely (matches `LowSpeedWindow::observe`'s escape hatch).
+    /// Rolling-window check: once a full `timeout` window elapses, records
+    /// its byte count into the shared reference and decides whether this
+    /// window was a low-speed outlier (see `SegmentThroughputReference` and
+    /// the module-level constants for the two-part AND condition). Resets on
+    /// every window regardless of the outcome, so a segment that starts fast
+    /// and later degrades is still caught (or one that recovers stops being
+    /// flagged). `disabled` skips everything -- this segment already used up
+    /// its reconnect budget, so its last attempt is allowed to run to
+    /// completion unconditionally.
+    ///
+    /// Note this compares raw per-window *byte counts*, never a computed
+    /// bytes/sec rate: every window shares the same configured `timeout`, so
+    /// byte counts are already directly comparable as a throughput proxy,
+    /// without ever dividing by a measured elapsed time (which would be
+    /// unstable for very short or test-forced windows).
     fn observe(&mut self, bytes_read: u64) -> bool {
-        if self.min_bytes == 0 {
+        if self.disabled {
             return false;
         }
         self.bytes_read = self.bytes_read.saturating_add(bytes_read);
         if self.started_at.elapsed() < self.timeout {
             return false;
         }
-        if self.bytes_read < self.min_bytes {
-            return true;
-        }
+        let window_bytes = self.bytes_read;
         self.started_at = Instant::now();
         self.bytes_read = 0;
-        false
+        // Compare against the reference as it stood *before* this window is
+        // folded in, so a slow window never gets to (even slightly) pull
+        // down the baseline it is itself being judged against.
+        let median = self.reference.median();
+        self.reference.record(window_bytes);
+        let Some(median) = median else {
+            return false; // cold start: no reference yet, never judge
+        };
+        let relative_floor = (median as f64 * self.relative_ratio) as u64;
+        let is_outlier = window_bytes < relative_floor && window_bytes < self.absolute_floor_bytes;
+        if !is_outlier {
+            return false;
+        }
+        let mut cooldown_slot = self.cooldown_slot.lock().unwrap();
+        let now = Instant::now();
+        if let Some(last_trip) = *cooldown_slot
+            && now.duration_since(last_trip) < self.cooldown
+        {
+            return false; // still cooling down from the last trip
+        }
+        *cooldown_slot = Some(now);
+        true
+    }
+}
+
+/// Session-wide reference for the concurrent chunked-download path's
+/// relative low-speed guard: a bounded rolling window of per-segment-window
+/// byte counts (see [`SegmentLowSpeedWindow`]), shared across every worker
+/// and the probe so a segment is judged against what *this* download
+/// session is actually achieving right now -- never a fixed absolute number,
+/// which would misjudge a uniformly slow-but-working network as broken (see
+/// `SEGMENT_LOW_SPEED_RELATIVE_RATIO`'s doc comment for the full rationale).
+struct SegmentThroughputReference {
+    samples: Mutex<VecDeque<u64>>,
+}
+
+impl SegmentThroughputReference {
+    fn new() -> Self {
+        Self {
+            samples: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// The median of every recorded window's byte count. Requires at least
+    /// `SEGMENT_LOW_SPEED_MIN_REFERENCE_SAMPLES` samples; `None` (fewer than
+    /// that) means "cold start: never judge a segment low-speed yet" -- see
+    /// that constant's doc comment for why.
+    fn median(&self) -> Option<u64> {
+        let samples = self.samples.lock().unwrap();
+        if samples.len() < SEGMENT_LOW_SPEED_MIN_REFERENCE_SAMPLES {
+            return None;
+        }
+        let mut sorted: Vec<u64> = samples.iter().copied().collect();
+        sorted.sort_unstable();
+        Some(sorted[sorted.len() / 2])
+    }
+
+    /// Records one window's byte count, bounding the reference to the most
+    /// recent `SEGMENT_LOW_SPEED_REFERENCE_CAPACITY` samples (see that
+    /// constant's doc comment).
+    fn record(&self, bytes_in_window: u64) {
+        let mut samples = self.samples.lock().unwrap();
+        samples.push_back(bytes_in_window);
+        while samples.len() > SEGMENT_LOW_SPEED_REFERENCE_CAPACITY {
+            samples.pop_front();
+        }
     }
 }
 
@@ -3339,8 +3504,7 @@ fn is_retryable_download_error(error: &PullError) -> bool {
         | PullError::SizeMismatch { .. }
         | PullError::EtagChanged { .. }
         | PullError::SegmentSizeMismatch { .. }
-        | PullError::SegmentRangeMismatch { .. }
-        | PullError::SegmentLowSpeed { .. } => true,
+        | PullError::SegmentRangeMismatch { .. } => true,
         // Only 5xx here: a 4xx from the currently open source is not a
         // transient fault of *this* request, so retrying the same source
         // again would just repeat it (see `is_source_fallback_error`, which
@@ -3362,8 +3526,7 @@ fn is_source_fallback_error(error: &PullError) -> bool {
         | PullError::RuntimeValidation { .. }
         | PullError::EtagChanged { .. }
         | PullError::SegmentSizeMismatch { .. }
-        | PullError::SegmentRangeMismatch { .. }
-        | PullError::SegmentLowSpeed { .. } => true,
+        | PullError::SegmentRangeMismatch { .. } => true,
         // 5xx: this source's own infra failed -- try the next one. 403/404:
         // this source does not have (or will not serve) the requested object,
         // which is a per-source availability gap, not a global failure -- e.g.
