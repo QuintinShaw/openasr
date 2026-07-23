@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-23T03:17:46+00:00",
+  "generated_at": "2026-07-23T03:30:00+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -354,7 +354,7 @@
           "perf": {
             "rtf_cpu": 0.1545,
             "rtf_metal": 0.1291,
-            "peak_rss_bytes": 2552299520,
+            "peak_rss_bytes": 2550841344,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -370,7 +370,7 @@
           "perf": {
             "rtf_cpu": 0.1373,
             "rtf_metal": 0.1073,
-            "peak_rss_bytes": 1484587008,
+            "peak_rss_bytes": 1482899456,
             "jfk_wer_vs_fp16": 0.0
           }
         },
@@ -386,7 +386,7 @@
           "perf": {
             "rtf_cpu": 0.1355,
             "rtf_metal": 0.1027,
-            "peak_rss_bytes": 914341888,
+            "peak_rss_bytes": 913948672,
             "jfk_wer_vs_fp16": 0.0
           }
         }
@@ -947,7 +947,7 @@
           "perf": {
             "rtf_cpu": 0.905,
             "rtf_metal": 0.535,
-            "peak_rss_bytes": 9425879040,
+            "peak_rss_bytes": 8776024064,
             "jfk_wer_vs_fp16": 0.0
           }
         }
