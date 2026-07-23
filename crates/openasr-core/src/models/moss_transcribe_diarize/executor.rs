@@ -547,6 +547,25 @@ mod tests {
     );
 
     fn transcribe_with_dev_pack(wav_path: PathBuf) -> Option<(String, std::time::Duration, f32)> {
+        // Force CPU. This family's Metal path has two open defects (encoder
+        // numeric divergence -> empty-shell output, and a per-step wired-memory
+        // blow-up -- see the `arch` descriptor's `auto_gpu_policy` note), so the
+        // reference decode is CPU-only.
+        transcribe_with_dev_pack_backend(wav_path, GgmlAsrBackendPreference::CpuOnly)
+    }
+
+    /// Same dev-pack e2e path as [`transcribe_with_dev_pack`], but lets the
+    /// caller pick the backend preference -- used by the `_accelerated`
+    /// variants below to drive an explicit `execution_target=accelerated`
+    /// request end to end (encoder AND decode), the same override an
+    /// `Accelerated` request installs in production (see
+    /// `GgmlAsrBackendPreference::request_backend_override`'s doc and
+    /// `graph_config.rs`'s note that an explicit request always wins over
+    /// the family's `ExceptMetal` Auto gate).
+    fn transcribe_with_dev_pack_backend(
+        wav_path: PathBuf,
+        backend_preference: GgmlAsrBackendPreference,
+    ) -> Option<(String, std::time::Duration, f32)> {
         let pack_path = dev_pack_path();
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
@@ -556,17 +575,12 @@ mod tests {
             eprintln!("skipping: {} not present", wav_path.display());
             return None;
         }
-        // Force CPU. This family's Metal path has two open defects (encoder
-        // numeric divergence -> empty-shell output, and a per-step wired-memory
-        // blow-up -- see the `arch` descriptor's `auto_gpu_policy` note), so the
-        // reference decode is CPU-only. `backend_preference` alone is inert on a
-        // direct `execute()` (it is only consulted via the thread-local override
-        // -- see `GgmlAsrExecutionRequest::backend_preference`'s doc), so install
-        // the override explicitly rather than relying on the ambient backend.
-        let backend_preference = GgmlAsrBackendPreference::CpuOnly;
+        // `backend_preference` alone is inert on a direct `execute()` (it is
+        // only consulted via the thread-local override -- see
+        // `GgmlAsrExecutionRequest::backend_preference`'s doc), so install the
+        // override explicitly rather than relying on the ambient backend.
         // Hold the RAII guard for the whole decode: it restores the previous
-        // thread-local override on drop at the end of this function, after
-        // `execute()` below has run entirely on CPU.
+        // thread-local override on drop at the end of this function.
         let _backend_override_guard =
             install_request_backend_override(backend_preference.request_backend_override());
 
@@ -592,6 +606,90 @@ mod tests {
         let result = executor.execute(&request).expect("moss-td transcribe");
         let elapsed = started_at.elapsed();
         Some((result.transcription.text, elapsed, audio_duration_seconds))
+    }
+
+    /// Splits a moss-td transcript into (a) its "skeleton" -- every literal
+    /// character with each numeric time-anchor token's digits blanked out to
+    /// `[]` (leaving non-numeric bracketed tokens like `[S01]` untouched) --
+    /// and (b) the anchors' parsed float values in order. Used by
+    /// [`assert_transcript_matches_golden_within_anchor_tolerance`] to split
+    /// "does the text/structure match" from "do the anchors match" into two
+    /// independently-checked layers.
+    fn parse_transcript_skeleton_and_anchors(text: &str) -> (String, Vec<f32>) {
+        let mut skeleton = String::with_capacity(text.len());
+        let mut anchors = Vec::new();
+        let mut rest = text;
+        while let Some(open_rel) = rest.find('[') {
+            skeleton.push_str(&rest[..open_rel]);
+            let after_open = &rest[open_rel + 1..];
+            let Some(close_rel) = after_open.find(']') else {
+                // Unterminated '[': copy the rest verbatim and stop.
+                skeleton.push_str(&rest[open_rel..]);
+                rest = "";
+                break;
+            };
+            let inner = &after_open[..close_rel];
+            if let Ok(value) = inner.trim().parse::<f32>() {
+                anchors.push(value);
+                skeleton.push_str("[]");
+            } else {
+                skeleton.push('[');
+                skeleton.push_str(inner);
+                skeleton.push(']');
+            }
+            rest = &after_open[close_rel + 1..];
+        }
+        skeleton.push_str(rest);
+        (skeleton, anchors)
+    }
+
+    /// Two-layer transcript comparison for the accelerated e2e smoke tests:
+    /// (1) text, punctuation, speaker labels, and anchor count/order must
+    /// match the CPU golden byte-for-byte (asserted via the anchor-blanked
+    /// "skeleton"); (2) each numeric time-anchor's value only needs to be
+    /// within `tolerance_secs` of the golden's, not bit-identical.
+    ///
+    /// Rationale for tolerating (2) rather than requiring (1)'s strictness
+    /// there too: this repo's own firered-aed encoder parity investigation
+    /// (`firered_aed::encoder_graph::parity_tests`, see its `dump_...`
+    /// harness doc comment) already concluded that cross-backend/cross-
+    /// implementation fp32 bit-identical output is not a goal this runtime
+    /// has ever held anywhere -- ggml's vs another implementation's non-
+    /// bit-identical fp32 reduction order routinely produces small absolute
+    /// diffs at numerically delicate positions without either side being
+    /// wrong. Time anchors here are exactly such a floating-point-derived
+    /// value (not a token id), and the measured 0.02s CPU-vs-accelerated
+    /// divergence on `en_zh_mixed.wav` lands the accelerated run on the same
+    /// values as the HF fp32 reference (see that test's comment) -- i.e.
+    /// both sides are plausible fp32 outcomes, not a defect on either one.
+    fn assert_transcript_matches_golden_within_anchor_tolerance(
+        actual: &str,
+        golden: &str,
+        tolerance_secs: f32,
+    ) {
+        let (actual_skeleton, actual_anchors) = parse_transcript_skeleton_and_anchors(actual);
+        let (golden_skeleton, golden_anchors) = parse_transcript_skeleton_and_anchors(golden);
+        assert_eq!(
+            actual_skeleton, golden_skeleton,
+            "transcript text/punctuation/speaker-labels/anchor-count-and-order diverged from \
+             the CPU golden (strict layer -- anchor *values* are compared separately with \
+             tolerance, this only checks everything else)"
+        );
+        assert_eq!(
+            actual_anchors.len(),
+            golden_anchors.len(),
+            "anchor count mismatch (should already have failed the skeleton check above)"
+        );
+        for (idx, (actual_anchor, golden_anchor)) in
+            actual_anchors.iter().zip(golden_anchors.iter()).enumerate()
+        {
+            let diff = (actual_anchor - golden_anchor).abs();
+            assert!(
+                diff <= tolerance_secs,
+                "anchor[{idx}] exceeds tolerance: actual={actual_anchor} golden={golden_anchor} \
+                 diff={diff:.4}s (tolerance={tolerance_secs}s)"
+            );
+        }
     }
 
     #[test]
@@ -624,5 +722,101 @@ mod tests {
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
         assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);
+    }
+
+    /// Time anchors are floating-point-derived (see
+    /// `assert_transcript_matches_golden_within_anchor_tolerance`'s doc
+    /// comment for why exact cross-backend anchor equality is not the
+    /// right bar); 0.03s covers the largest measured CPU-vs-accelerated
+    /// anchor divergence on these clips (0.02s on `en_zh_mixed.wav`,
+    /// direction-flipped relative to the CPU golden -- see below) with a
+    /// small margin, while still catching anything structurally different
+    /// (a wrong anchor would fail the strict skeleton check first anyway).
+    const ACCELERATED_ANCHOR_TOLERANCE_SECS: f32 = 0.03;
+
+    // Explicit `execution_target=accelerated` e2e smoke: an explicit
+    // `Accelerated` request installs the same thread-local override
+    // `graph_config.rs` documents as always winning over this family's
+    // `ExceptMetal` Auto gate, so the encoder graph builds on Metal instead
+    // of being downgraded to CPU (the gate only ever pins what *Auto*
+    // resolves to -- see `encoder_graph_config_honors_explicit_accelerated_
+    // request` in `graph_config.rs`). Decode already runs on Metal under
+    // Auto today (the shared qwen decode path is `AllBackends`, and #180
+    // fixed its reuse-path graph so Metal decode reuses its graph), so this
+    // is the full accelerated-request path: Metal encoder + Metal decode,
+    // diffed against the same CPU golden the two tests above pin, via
+    // `assert_transcript_matches_golden_within_anchor_tolerance` (strict on
+    // text/punctuation/speaker-labels/anchor-count-and-order, tolerant only
+    // on each anchor's numeric value).
+    //
+    // jfk.wav: byte-for-byte identical to the CPU golden, anchors included
+    // (diff = 0.0 on every anchor).
+    #[test]
+    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
+                and tmp/moss-td/samples/*.wav; drives an explicit accelerated request \
+                (Metal encoder + Metal decode) and needs a Metal device"]
+    fn golden_diff_end_to_end_transcribe_jfk_wav_accelerated() {
+        let Some((text, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
+            dev_sample_path("jfk.wav"),
+            GgmlAsrBackendPreference::Accelerated,
+        ) else {
+            return;
+        };
+        eprintln!(
+            "moss-td e2e accelerated [jfk.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
+            elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
+        );
+        assert_transcript_matches_golden_within_anchor_tolerance(
+            &text,
+            GOLDEN_JFK_TEXT,
+            ACCELERATED_ANCHOR_TOLERANCE_SECS,
+        );
+    }
+
+    // MEASURED ANCHOR DIVERGENCE (within tolerance, not a defect): unlike
+    // jfk.wav above, this clip's accelerated (Metal encoder + Metal decode)
+    // transcript is not byte-identical to the CPU golden. Measured output:
+    //
+    //   "...Americans,[2.34][3.21][S01]ask not....[4.44][4.94][S02]..."
+    //
+    // vs. `GOLDEN_EN_ZH_MIXED_TEXT`:
+    //
+    //   "...Americans,[2.32][3.21][S01]ask not....[4.44][4.96][S02]..."
+    //
+    // The only differing characters are two digits inside two numeric
+    // time-anchor tokens ([2.34] vs [2.32], [4.94] vs [4.96], both a 0.02s
+    // shift) -- every word, punctuation mark, speaker label, and the other
+    // two anchors are identical, so the strict skeleton layer of
+    // `assert_transcript_matches_golden_within_anchor_tolerance` passes and
+    // only the anchor-tolerance layer is exercised here. Notably,
+    // [2.34]/[4.94] are the same values the top-of-file
+    // `golden_diff_end_to_end_transcribe_en_zh_mixed_wav` comment records
+    // for the *HF fp32 reference* (before its own documented 0.02s CPU
+    // f16+flash shift to [2.32]/[4.96]) -- i.e. the accelerated path's
+    // anchors land on the fp32 reference's values, not the CPU-forced
+    // golden's. Both are plausible fp32 outcomes of a numerically delicate
+    // computation (see `ACCELERATED_ANCHOR_TOLERANCE_SECS`'s doc comment
+    // and the firered-aed parity precedent it cites) -- neither is "the
+    // bug".
+    #[test]
+    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
+                and tmp/moss-td/samples/*.wav; drives an explicit accelerated request \
+                (Metal encoder + Metal decode) and needs a Metal device"]
+    fn golden_diff_end_to_end_transcribe_en_zh_mixed_wav_accelerated() {
+        let Some((text, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
+            dev_sample_path("en_zh_mixed.wav"),
+            GgmlAsrBackendPreference::Accelerated,
+        ) else {
+            return;
+        };
+        eprintln!(
+            "moss-td e2e accelerated [en_zh_mixed.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
+            elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
+        );
+        assert_transcript_matches_golden_within_anchor_tolerance(
+            &text,
+            GOLDEN_EN_ZH_MIXED_TEXT,
+            ACCELERATED_ANCHOR_TOLERANCE_SECS,
+        );
     }
 }
