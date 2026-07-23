@@ -22,7 +22,7 @@
 use thiserror::Error;
 
 use crate::NativeAsrError;
-use crate::api::backend::{Segment, Transcription};
+use crate::api::backend::Transcription;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
     run_builtin_seq2seq_decode_policy,
@@ -414,27 +414,13 @@ impl MossTdGgmlExecutor {
 
         let text = result.text.trim().to_string();
         // Parse the model's own inline `[start][end][SNN]` markup into real
-        // speaker segments (see `speaker_segments`'s module doc for the
-        // grammar and fail-closed policy). Both a parse error and a
-        // well-formed-but-empty result (no speaker tags at all) degrade the
-        // same way: keep the single, speaker-less segment carrying the
-        // untouched raw text rather than fabricate structure this decode did
-        // not actually assert. `text` itself is never rewritten either way.
-        let segments = match super::speaker_segments::parse_moss_td_speaker_segments(
-            &text,
-            audio_duration_seconds,
-        ) {
-            Ok(segments) if !segments.is_empty() => segments,
-            _ => vec![Segment {
-                start: 0.0,
-                end: audio_duration_seconds.max(0.0),
-                text: text.clone(),
-                speaker: None,
-                speaker_label: None,
-                speaker_profile_id: None,
-                words: Vec::new(),
-            }],
-        };
+        // speaker segments, degrading fail-closed to the single speaker-less
+        // segment carrying the untouched raw text when the tag stream is
+        // malformed or empty (see `speaker_segments`'s module doc for the
+        // grammar, the fail-closed policy, and the degrade shape's tests).
+        // `text` itself is never rewritten either way.
+        let segments =
+            super::speaker_segments::moss_td_segments_or_degrade(&text, audio_duration_seconds);
         let transcription = Transcription {
             segments,
             text,
@@ -517,6 +503,8 @@ mod tests {
     use crate::ggml_runtime::install_request_backend_override;
     use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudio};
     use crate::models::ggml_family_registry::moss_transcribe_diarize_runtime_descriptor_v1;
+
+    use crate::api::backend::Segment;
 
     use super::super::speaker_segments::parse_moss_td_speaker_segments;
     use super::*;

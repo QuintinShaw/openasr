@@ -20,6 +20,35 @@
 //! "in-decoder self-diarization tags" as two producers of one interface
 //! without reshaping either family's output again.
 //!
+//! That future two-producer interface will, however, want fields neither
+//! source populates today: a per-turn confidence (cf.
+//! [`crate::api::backend::WordTimestamp::confidence`], already an `Option`) and
+//! an `overlap` flag (cf. [`crate::diarize::contract::SpeakerTurn::overlap`],
+//! which the VAD path sets but this in-decoder path has no signal for).
+//! [`Segment`] carries neither, and moss-td asserts neither, so nothing is lost
+//! now -- but a `DiarizerBackend` extraction that wants to keep the VAD path's
+//! overlap/confidence must grow [`Segment`] additively (a new
+//! `Option`/`#[serde(default)]` field) rather than reshape it. Flagged here so
+//! that growth stays a conscious additive step, not a breaking change.
+//!
+//! # Tags are ordinary characters: an inherent ambiguity
+//!
+//! Because moss-td's `[t]`/`[Sxx]` markers are ordinary transcript characters
+//! rather than reserved control tokens, this parser cannot tell a structural
+//! tag apart from transcript content that merely *looks* like one. If the
+//! decoded text itself contains a bracketed number (say the model wrote
+//! `meeting at [3.30] pm`) that span is consumed as a time anchor and the
+//! segment splits there; a bracketed `[Sxx]` sitting inside content is likewise
+//! read as a speaker change and absorbed. This is unavoidable given the format
+//! and is deliberately accepted: the worst case is a mis-split or an absorbed
+//! bracket, never a panic and never a dropped transcript -- and if such a stray
+//! bracket makes time run backwards or strands text before an anchor, the
+//! fail-closed policy below degrades the whole decode back to the untouched raw
+//! text. The reference decode does not emit bracketed numerics as free text, so
+//! this stays a theoretical edge, but callers must treat the segment overlay as
+//! best-effort structure over a plain-text signal, not a guaranteed lossless
+//! parse of arbitrary transcript content.
+//!
 //! # Grammar
 //!
 //! Observed from the reference HF decode (`docs/model-audits/
@@ -223,6 +252,29 @@ pub(crate) fn parse_moss_td_speaker_segments(
     Ok(segments)
 }
 
+/// The executor's segment-overlay decision, centralized next to the parser it
+/// guards instead of inlined in `executor.rs`. Returns the parsed per-speaker
+/// segments when the decode's tag stream is well formed AND carried at least
+/// one attributable turn; otherwise -- a typed parse error, or a well-formed
+/// stream with no speaker tags/text at all -- returns the single, speaker-less
+/// segment carrying the untouched raw `text` (tags included, verbatim), i.e.
+/// the exact shape that existed before inline-tag structuring. Structure is
+/// never fabricated for a decode that did not assert it.
+pub(crate) fn moss_td_segments_or_degrade(text: &str, audio_duration_seconds: f32) -> Vec<Segment> {
+    match parse_moss_td_speaker_segments(text, audio_duration_seconds) {
+        Ok(segments) if !segments.is_empty() => segments,
+        _ => vec![Segment {
+            start: 0.0,
+            end: audio_duration_seconds.max(0.0),
+            text: text.to_string(),
+            speaker: None,
+            speaker_label: None,
+            speaker_profile_id: None,
+            words: Vec::new(),
+        }],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +384,68 @@ mod tests {
         let error = parse_moss_td_speaker_segments("[0.0]hello[1.0]", 5.0)
             .expect_err("text before the first speaker tag must fail closed");
         assert_eq!(error, MossTdSpeakerSegmentParseError::TextBeforeSpeaker);
+    }
+
+    /// The degrade shape the executor keeps for a malformed decode: exactly one
+    /// speaker-less segment spanning the whole clip, carrying the raw text
+    /// verbatim with its tags still in it -- never empty, never rewritten. This
+    /// is the verbose_json/SRT/VTT overlay-withheld case (a single unattributed
+    /// cue), asserted here so it cannot silently regress into an empty segment
+    /// list or a stripped transcript.
+    #[test]
+    fn malformed_decode_degrades_to_one_raw_speaker_less_segment() {
+        // Time runs backwards -> a typed parse error -> degrade.
+        let raw = "[2.0][S01]hi[1.0][S01]bye";
+        let segments = moss_td_segments_or_degrade(raw, 5.0);
+        assert_eq!(
+            segments,
+            vec![Segment {
+                start: 0.0,
+                end: 5.0,
+                text: raw.to_string(),
+                speaker: None,
+                speaker_label: None,
+                speaker_profile_id: None,
+                words: Vec::new(),
+            }]
+        );
+    }
+
+    /// A well-formed decode that simply carried no speaker tags/text degrades
+    /// the same way (single speaker-less segment), not to an empty list.
+    #[test]
+    fn tag_skeleton_with_no_text_degrades_to_one_speaker_less_segment() {
+        let raw = "[0.0][1.0][2.0]";
+        let segments = moss_td_segments_or_degrade(raw, 4.0);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].speaker, None);
+        assert_eq!(segments[0].text, raw);
+        assert_eq!(segments[0].start, 0.0);
+        assert_eq!(segments[0].end, 4.0);
+    }
+
+    /// A well-formed decode keeps its structured per-speaker turns (the happy
+    /// path the degrade helper must NOT swallow).
+    #[test]
+    fn well_formed_decode_keeps_structured_segments() {
+        let segments = moss_td_segments_or_degrade("[0.0][S01]hello[1.0][2.0][S02]world[3.0]", 3.0);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].speaker.as_deref(), Some("SPEAKER_01"));
+        assert_eq!(segments[1].speaker.as_deref(), Some("SPEAKER_02"));
+    }
+
+    /// Documented inherent ambiguity (see the module doc's "Tags are ordinary
+    /// characters" section): a bracketed numeric that is really transcript
+    /// content is indistinguishable from a time anchor and splits the segment.
+    /// Pinned so the behavior is a conscious, reviewed contract rather than a
+    /// surprise -- the fail-closed worst case is a mis-split, never a panic.
+    #[test]
+    fn bracketed_numeric_content_is_consumed_as_an_anchor_by_design() {
+        let segments = parse_moss_td_speaker_segments("[0.0][S01]meeting at [3.30] pm[5.0]", 6.0)
+            .expect("well-formed once the stray bracket is read as an anchor");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].text, "meeting at");
+        assert_eq!(segments[0].end, 3.30);
+        assert_eq!(segments[1].text, "pm");
     }
 }
