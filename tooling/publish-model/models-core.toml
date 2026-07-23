@@ -794,3 +794,4 @@ languages = [
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
 upstream_release_date = "2026-07-09"
+min_core_version = "0.1.24"

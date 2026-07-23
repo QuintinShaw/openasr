@@ -1,26 +1,51 @@
-# Per-model card prose for openasr/moss-transcribe-diarize.
-#
-# PLACEHOLDER: every user-facing marketing string below is intentionally set to
-# "TODO-COPY". Final prose (tagline/highlights/intro/acknowledgement, and any
-# zh-CN locale block) is authored separately and must not be drafted here. Fill
-# these in before the model is flipped public (--public requires a non-empty
-# tagline + intro; see _manifest.validate_public_prose). Keep every factual
-# claim to what the upstream OpenMOSS-Team/MOSS-Transcribe-Diarize model card
-# actually states (0.9B joint transcription + diarization model, Whisper-Medium
-# encoder + Qwen3-0.6B-style decoder, `[start][Sxx]text[end]` output format);
-# do not conflate it with the larger "MOSS-Transcribe-Diarize Pro" variant the
-# upstream card mentions as API-only and not part of this pack.
+# Per-model card prose for openasr/moss-transcribe-diarize. Distilled from the
+# upstream OpenMOSS-Team/MOSS-Transcribe-Diarize Hugging Face model card and
+# this repo's own frozen-eval-v1 measurements (docs/model-audits/
+# moss-transcribe-diarize.md section 8: zh CER 2.52% / en WER 2.23% on the
+# fp16 tier). Upstream license = Apache-2.0. Keep every factual claim to what
+# those two sources state (0.9B joint transcription + diarization model,
+# Whisper-Medium-configuration encoder + Qwen3-0.6B-style decoder,
+# `[start][Sxx]text[end]` output format); do not conflate it with the larger
+# "MOSS-Transcribe-Diarize Pro" variant the upstream card mentions as
+# API-only and not part of this pack. Re-verify against upstream if the
+# checkpoint changes.
 
-tagline = "TODO-COPY"
+tagline = "Joint transcription and speaker diarization in a single 0.9B-parameter model — know who said what, and when"
 
 highlights = [
-  "TODO-COPY",
+  "🎯 **Transcription + speaker identification in one pass** — a single inference run produces both the transcript and per-speaker timestamps, no separate pipeline needed",
+  "📊 **Verified accuracy: 2.52% CER (Chinese), 2.23% WER (English)** — benchmarked by OpenASR on frozen evaluation datasets, not upstream-reported numbers",
+  "🌐 **Chinese and English first, 15+ additional languages** — optimized for Mandarin and English with broad multilingual coverage built in",
+  "📦 **Three quantization tiers: fp16 / q8_0 / q4_k** — delivered in OpenASR's native .oasr format for CPU inference, choose the precision-to-size tradeoff that fits your hardware",
 ]
 
 intro = """
-TODO-COPY
+MOSS-Transcribe-Diarize is a 0.9B-parameter joint speech-recognition and speaker-diarization
+model from the OpenMOSS team. Its architecture pairs a Whisper-Medium-scale audio encoder with a
+lightweight MLP/LayerNorm adapter feeding into a Qwen3-0.6B-scale decoder, enabling the model to
+transcribe speech and attribute each segment to its speaker with start/end timestamps in a single
+forward pass. Language coverage centers on Chinese and English, with support for 15 additional
+languages. OpenASR distributes this model in three quantization tiers -- fp16, q8_0, and q4_k --
+packaged in the native `.oasr` runtime format for CPU-based local inference.
 """
 
 acknowledgement = """
-TODO-COPY
+This pack is a redistribution of **MOSS-Transcribe-Diarize**, created and released by
+**OpenMOSS-Team**
+([OpenMOSS-Team/MOSS-Transcribe-Diarize](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize))
+under the [Apache License 2.0](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/blob/main/LICENSE).
+OpenASR performs format conversion, quantization, runtime validation, and local-inference
+adaptation only; all model weights and training are the work of the original authors. Thank you
+to the OpenMOSS team for releasing their work openly.
 """
+
+[prose_locales."zh-CN"]
+tagline = "转写文字的同时自动分清是谁在说话——0.9B 参数，一次推理全搞定"
+
+highlights = [
+  "🎯 **转写和区分讲话人一步到位** — 跑一次就能同时出文字、标出是谁在说话以及每段话的起止时间，不需要拼接多个工具",
+  "📊 **实测精度：中文字错率 2.52%，英文词错率 2.23%** — 由 OpenASR 在固定评测集上实测，不是上游自报数据",
+  "🌐 **中英文为主，另外覆盖 15 种语言** — 针对普通话和英文做了重点优化，同时内置多语言支持",
+  "📦 **fp16 / q8_0 / q4_k 三档量化可选** — 使用 OpenASR 原生 .oasr 格式，CPU 本地推理，按自己的硬件条件选择精度和体积的平衡点",
+]
+source_sha256 = "cb8630bfe7bcf00f5d5ce423a7b334176fff7760930d6c142dada5f89ff74ae2"
