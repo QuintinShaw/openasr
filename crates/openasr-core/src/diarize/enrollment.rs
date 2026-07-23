@@ -307,6 +307,16 @@ pub struct SpeakerProfileMatcher {
     profiles: Vec<SpeakerProfile>,
 }
 
+/// Per-identity best candidate, used to group same-person enrollment samples
+/// before ranking (see `SpeakerProfileMatcher::best_match_with_policy`).
+struct IdentityGroup {
+    /// `None` for an empty-name profile, which never groups with anything
+    /// (including another empty-name profile) -- see
+    /// `SpeakerProfileMatcher::best_match_with_policy`.
+    name: Option<String>,
+    candidate: SpeakerProfileMatch,
+}
+
 impl SpeakerProfileMatcher {
     pub fn load_for_identity(
         path: &Path,
@@ -334,10 +344,39 @@ impl SpeakerProfileMatcher {
         self.best_match_with_policy(embedding, 0.0, 0.0, 0.0)
     }
 
+    /// Batch voice-match with the second-stage top1-vs-top2 confidence gate:
+    /// even a profile that clears its own `match_similarity` floor is not
+    /// returned unless its person also leads every other *identity's* best
+    /// similarity by at least `margin`. `margin` should come from the active
+    /// embedder's `SpeakerCalibrationProfile::enrollment_match_margin` so the
+    /// gate is calibrated per cosine space (see that field's doc comment for
+    /// why WeSpeaker and ReDimNet2 use different values).
+    ///
+    /// Ranking is per-identity, not per-profile (see
+    /// `best_match_with_policy`): a person's own extra enrollment samples
+    /// reinforce their own candidacy and are never their own runner-up. A
+    /// library with only one compatible identity has no *other* identity to
+    /// measure a margin against, so this always falls through to the plain
+    /// `match_similarity` gate in that case: the margin exists to stop a
+    /// "which registered speaker is this" mix-up between two-or-more
+    /// different registered voices, a risk that does not exist with a single
+    /// identity, and the primary threshold has already done the acceptance
+    /// work.
+    pub fn best_match_with_margin(
+        &self,
+        embedding: &SpeakerEmbedding,
+        margin: f32,
+    ) -> Option<SpeakerProfileMatch> {
+        self.best_match_with_policy(embedding, 0.0, margin, 0.0)
+    }
+
     /// A conservative realtime anchor match. The per-profile threshold remains
     /// the user-visible match floor, but streaming identity anchoring needs a
     /// higher floor plus a runner-up margin before it creates/reuses a
-    /// profile-owned session speaker.
+    /// profile-owned session speaker. Like `best_match_with_margin`, the
+    /// runner-up is the best *other identity*'s similarity (see
+    /// `best_match_with_policy`), so a person's own multiple enrollment
+    /// samples never compete with each other for this gate.
     pub fn strong_unambiguous_match(
         &self,
         embedding: &SpeakerEmbedding,
@@ -387,8 +426,25 @@ impl SpeakerProfileMatcher {
         margin: f32,
         threshold_tolerance: f32,
     ) -> Option<SpeakerProfileMatch> {
-        let mut best: Option<SpeakerProfileMatch> = None;
-        let mut runner_up_similarity: Option<f32> = None;
+        // Rank by identity, not by individual profile: two enrollment samples
+        // for the same person must reinforce each other (the better of the
+        // two represents that person), never compete as rival candidates for
+        // the runner-up margin below. `SpeakerProfile` has no stable
+        // person-id yet (a plausible future schema evolution); exact name
+        // equality is the closest identity proxy available today. An empty
+        // name carries no identity signal, so it never merges with another
+        // empty name -- each such profile stays its own singleton group.
+        //
+        // Known tradeoff of the name proxy: two DIFFERENT real people who
+        // happen to be enrolled under the exact same display name (e.g. two
+        // people named "Zhang Wei") are merged into a single identity group,
+        // so the margin gate silently stops comparing them against each
+        // other at all for that pair -- the disambiguation this gate exists
+        // for is skipped, not just weakened. This is intentionally accepted
+        // rather than solved here: fixing it requires a stable per-person id
+        // that the store does not have. Uniquely-named profiles (the
+        // product's expected usage) are unaffected.
+        let mut groups: Vec<IdentityGroup> = Vec::new();
         for profile in &self.profiles {
             if profile.embedding.len() != embedding.dim() {
                 continue;
@@ -403,12 +459,43 @@ impl SpeakerProfileMatcher {
                 threshold,
                 runner_up_similarity: None,
             };
+
+            if profile.name.is_empty() {
+                groups.push(IdentityGroup {
+                    name: None,
+                    candidate,
+                });
+                continue;
+            }
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.name.as_deref() == Some(profile.name.as_str()))
+            {
+                if candidate.similarity > group.candidate.similarity {
+                    group.candidate = candidate;
+                }
+            } else {
+                groups.push(IdentityGroup {
+                    name: Some(profile.name.clone()),
+                    candidate,
+                });
+            }
+        }
+
+        // Now rank each identity's best candidate against every other
+        // identity's best candidate: the margin gate below compares across
+        // groups, so a person's own extra samples can never be their own
+        // runner-up.
+        let mut best: Option<SpeakerProfileMatch> = None;
+        let mut runner_up_similarity: Option<f32> = None;
+        for group in groups {
+            let candidate = group.candidate;
             match &best {
-                Some(current) if similarity <= current.similarity => {
+                Some(current) if candidate.similarity <= current.similarity => {
                     runner_up_similarity = Some(
                         runner_up_similarity
-                            .map(|runner_up| runner_up.max(similarity))
-                            .unwrap_or(similarity),
+                            .map(|runner_up| runner_up.max(candidate.similarity))
+                            .unwrap_or(candidate.similarity),
                     );
                 }
                 Some(current) => {
@@ -858,10 +945,24 @@ mod tests {
         );
     }
 
+    /// Default-identity helper for tests that don't care about
+    /// cross-identity ranking (e.g. dimension/pack compatibility filtering).
+    /// Tests that exercise the margin gate's identity grouping must use
+    /// `named_profile` and pick distinct names for distinct people.
     fn profile(id: &str, dim: usize, fingerprint: &str, embedding: Vec<f32>) -> SpeakerProfile {
+        named_profile(id, "Alice", dim, fingerprint, embedding)
+    }
+
+    fn named_profile(
+        id: &str,
+        name: &str,
+        dim: usize,
+        fingerprint: &str,
+        embedding: Vec<f32>,
+    ) -> SpeakerProfile {
         SpeakerProfile {
             id: id.to_string(),
-            name: "Alice".to_string(),
+            name: name.to_string(),
             created_at: "2026-06-11T00:00:00.000Z".to_string(),
             updated_at: "2026-06-11T00:00:00.000Z".to_string(),
             sample_seconds: 5.2,
@@ -1027,27 +1128,89 @@ mod tests {
             "streaming anchors require the higher anchor floor"
         );
 
+        // Two different people (Alice, Bob) whose stored samples are near
+        // tied against this embedding: genuinely ambiguous, must not anchor.
         let ambiguous = SpeakerProfileMatcher::from_profiles(vec![
-            profile("vp_aaaaaaaaaaaaaaaa", 2, "sha256:active", vec![1.0, 0.0]),
-            profile("vp_bbbbbbbbbbbbbbbb", 2, "sha256:active", vec![0.96, 0.28]),
+            named_profile(
+                "vp_aaaaaaaaaaaaaaaa",
+                "Alice",
+                2,
+                "sha256:active",
+                vec![1.0, 0.0],
+            ),
+            named_profile(
+                "vp_bbbbbbbbbbbbbbbb",
+                "Bob",
+                2,
+                "sha256:active",
+                vec![0.96, 0.28],
+            ),
         ]);
         let embedding = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
         assert!(
             ambiguous
                 .strong_unambiguous_match(&embedding, 0.85, 0.08)
                 .is_none(),
-            "near-tied profiles are not unambiguous enough to anchor"
+            "near-tied profiles from two different people are not unambiguous enough to anchor"
         );
 
+        // Two different people, clearly separated: anchors on Alice.
         let clear = SpeakerProfileMatcher::from_profiles(vec![
-            profile("vp_aaaaaaaaaaaaaaaa", 2, "sha256:active", vec![1.0, 0.0]),
-            profile("vp_bbbbbbbbbbbbbbbb", 2, "sha256:active", vec![0.0, 1.0]),
+            named_profile(
+                "vp_aaaaaaaaaaaaaaaa",
+                "Alice",
+                2,
+                "sha256:active",
+                vec![1.0, 0.0],
+            ),
+            named_profile(
+                "vp_bbbbbbbbbbbbbbbb",
+                "Bob",
+                2,
+                "sha256:active",
+                vec![0.0, 1.0],
+            ),
         ]);
         let matched = clear
             .strong_unambiguous_match(&embedding, 0.85, 0.08)
             .expect("clear high-confidence profile match");
         assert_eq!(matched.profile_id, "vp_aaaaaaaaaaaaaaaa");
         assert_eq!(matched.runner_up_similarity, Some(0.0));
+    }
+
+    /// Regression for the shared ranking logic `strong_unambiguous_match`
+    /// (streaming's anchor gate): a single person's own second enrollment
+    /// sample must never stand in as their own runner-up. Alice's second
+    /// sample is deliberately near-tied against her first (0.95 vs. 1.0
+    /// cosine to the embedding) -- naive per-profile ranking would compute a
+    /// 0.05 margin and reject as "ambiguous", but the true runner-up is the
+    /// stranger Bob at 0.0 similarity, so the real margin is 1.0 and the
+    /// anchor must fire.
+    #[test]
+    fn strong_unambiguous_match_treats_same_person_samples_as_reinforcing_not_competing() {
+        let matcher = SpeakerProfileMatcher::from_profiles(vec![
+            named_profile("vp_alice_1", "Alice", 2, "sha256:active", vec![1.0, 0.0]),
+            named_profile(
+                "vp_alice_2",
+                "Alice",
+                2,
+                "sha256:active",
+                vec![0.95, 0.312_249_9],
+            ),
+            named_profile("vp_bob", "Bob", 2, "sha256:active", vec![0.0, 1.0]),
+        ]);
+        let embedding = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
+
+        let matched = matcher
+            .strong_unambiguous_match(&embedding, 0.85, 0.08)
+            .expect("Alice's own second sample must not be treated as her own competing runner-up");
+        assert_eq!(matched.profile_id, "vp_alice_1");
+        assert_eq!(matched.name, "Alice");
+        assert_eq!(
+            matched.runner_up_similarity,
+            Some(0.0),
+            "the true runner-up is the stranger Bob, not Alice's own second sample"
+        );
     }
 
     #[test]
@@ -1075,6 +1238,207 @@ mod tests {
                 .strong_unambiguous_match_with_tolerance(&below_tolerance, 0.85, 0.08, 0.01)
                 .is_none(),
             "tolerance is bounded and does not lower the anchor floor broadly"
+        );
+    }
+
+    /// Two different people (Alice, Bob) with only a 0.1 top1-vs-top2 margin
+    /// between their identities: both clear the profile's own
+    /// `match_similarity` floor (0.5), but the ReDimNet2 margin gate (0.15,
+    /// see `REDIMNET_CALIBRATION::enrollment_match_margin`) requires more
+    /// separation between two different registered voices before a name is
+    /// confidently attached.
+    #[test]
+    fn batch_match_with_margin_rejects_top1_when_margin_is_insufficient() {
+        let matcher = SpeakerProfileMatcher::from_profiles(vec![
+            named_profile("vp_alice", "Alice", 2, "sha256:active", vec![1.0, 0.0]),
+            named_profile("vp_bob", "Bob", 2, "sha256:active", vec![0.9, 0.435_889_9]),
+        ]);
+        let embedding = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
+
+        assert!(
+            matcher.best_match(&embedding).is_some(),
+            "the plain match policy (margin = 0.0) still honors the profile threshold"
+        );
+        assert!(
+            matcher
+                .best_match_with_margin(
+                    &embedding,
+                    crate::diarize::calibration::REDIMNET_CALIBRATION.enrollment_match_margin,
+                )
+                .is_none(),
+            "a 0.1 margin between two different people does not clear the calibrated 0.15 gate"
+        );
+    }
+
+    /// Same shape as the rejection case above, but with Bob's identity far
+    /// enough behind Alice's (0.3 margin) to clear the calibrated gate.
+    #[test]
+    fn batch_match_with_margin_accepts_top1_when_margin_is_sufficient() {
+        let matcher = SpeakerProfileMatcher::from_profiles(vec![
+            named_profile("vp_alice", "Alice", 2, "sha256:active", vec![1.0, 0.0]),
+            named_profile("vp_bob", "Bob", 2, "sha256:active", vec![0.7, 0.714_142_8]),
+        ]);
+        let embedding = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
+
+        let matched = matcher
+            .best_match_with_margin(
+                &embedding,
+                crate::diarize::calibration::REDIMNET_CALIBRATION.enrollment_match_margin,
+            )
+            .expect("a 0.3 margin between two different people clears the calibrated 0.15 gate");
+        assert_eq!(matched.profile_id, "vp_alice");
+        assert_eq!(matched.name, "Alice");
+    }
+
+    /// The reviewed structural fix: ranking is per-identity (name-grouped),
+    /// not per-profile, so a person's own extra enrollment samples reinforce
+    /// their own candidacy rather than compete as their own runner-up. Alice
+    /// has two samples, one near-tied against the other (1.0 vs. 0.95 cosine
+    /// to the embedding) -- naive per-profile ranking would see that 0.95 as
+    /// Alice's own top2 and compute an insufficient 0.05 margin, wrongly
+    /// rejecting a recording that is unambiguously Alice. The real runner-up
+    /// is the stranger Bob at 0.0 similarity, so the true margin is 1.0.
+    #[test]
+    fn batch_match_with_margin_same_person_multiple_samples_are_not_mutually_exclusive() {
+        let matcher = SpeakerProfileMatcher::from_profiles(vec![
+            named_profile("vp_alice_1", "Alice", 2, "sha256:active", vec![1.0, 0.0]),
+            named_profile(
+                "vp_alice_2",
+                "Alice",
+                2,
+                "sha256:active",
+                vec![0.95, 0.312_249_9],
+            ),
+            named_profile("vp_bob", "Bob", 2, "sha256:active", vec![0.0, 1.0]),
+        ]);
+        let embedding = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
+
+        let matched = matcher
+            .best_match_with_margin(
+                &embedding,
+                crate::diarize::calibration::REDIMNET_CALIBRATION.enrollment_match_margin,
+            )
+            .expect("Alice's own second sample must not be mistaken for a competing runner-up");
+        assert_eq!(matched.profile_id, "vp_alice_1");
+        assert_eq!(matched.name, "Alice");
+        assert_eq!(
+            matched.runner_up_similarity,
+            Some(0.0),
+            "the true runner-up is the stranger Bob, not Alice's own second sample"
+        );
+    }
+
+    /// A library with a single compatible *profile* has no runner-up to
+    /// measure a margin against, so the margin gate must not block it -- the
+    /// margin exists to disambiguate between two-or-more different
+    /// registered voices, a risk that cannot arise with one candidate.
+    #[test]
+    fn batch_match_with_margin_auto_passes_a_single_candidate_library() {
+        let matcher = SpeakerProfileMatcher::from_profiles(vec![profile(
+            "vp_aaaaaaaaaaaaaaaa",
+            2,
+            "sha256:active",
+            vec![1.0, 0.0],
+        )]);
+        let embedding = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
+
+        let matched = matcher
+            .best_match_with_margin(
+                &embedding,
+                crate::diarize::calibration::REDIMNET_CALIBRATION.enrollment_match_margin,
+            )
+            .expect("a single compatible profile has no runner-up, so the margin gate never fires");
+        assert_eq!(matched.profile_id, "vp_aaaaaaaaaaaaaaaa");
+    }
+
+    /// Same as the single-*profile* case above, but for a single *identity*
+    /// with two enrollment samples and nothing else in the library: still no
+    /// other identity to compare against, so the gate must still auto-pass
+    /// (distinguishes "single profile" from "single identity" now that
+    /// ranking groups by identity).
+    #[test]
+    fn batch_match_with_margin_auto_passes_a_single_identity_with_multiple_samples() {
+        let matcher = SpeakerProfileMatcher::from_profiles(vec![
+            named_profile("vp_alice_1", "Alice", 2, "sha256:active", vec![1.0, 0.0]),
+            named_profile(
+                "vp_alice_2",
+                "Alice",
+                2,
+                "sha256:active",
+                vec![0.95, 0.312_249_9],
+            ),
+        ]);
+        let embedding = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
+
+        let matched = matcher
+            .best_match_with_margin(
+                &embedding,
+                crate::diarize::calibration::REDIMNET_CALIBRATION.enrollment_match_margin,
+            )
+            .expect(
+                "a single identity (two samples, no other registered person) has no \
+                 other-identity runner-up, so the margin gate never fires",
+            );
+        assert_eq!(matched.profile_id, "vp_alice_1");
+    }
+
+    /// An empty name carries no identity signal, so it must never merge with
+    /// another empty name -- two anonymous-named profiles still compete for
+    /// the margin gate exactly like two different identified people would.
+    #[test]
+    fn batch_match_with_margin_empty_names_never_merge_into_one_identity() {
+        let matcher = SpeakerProfileMatcher::from_profiles(vec![
+            named_profile("vp_unnamed_1", "", 2, "sha256:active", vec![1.0, 0.0]),
+            named_profile(
+                "vp_unnamed_2",
+                "",
+                2,
+                "sha256:active",
+                vec![0.9, 0.435_889_9],
+            ),
+        ]);
+        let embedding = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
+
+        assert!(
+            matcher
+                .best_match_with_margin(
+                    &embedding,
+                    crate::diarize::calibration::REDIMNET_CALIBRATION.enrollment_match_margin,
+                )
+                .is_none(),
+            "two empty-name profiles must still compete for the margin gate, not merge \
+             into a false single identity"
+        );
+    }
+
+    /// Regression pin: WeSpeaker's `enrollment_match_margin` is 0.0 (the
+    /// batch matcher's margin gate was hardcoded to 0.0 -- effectively off --
+    /// before this field existed), so wiring the margin gate through
+    /// `best_match_with_margin` must not change WeSpeaker's batch match
+    /// behavior at all versus the pre-existing `best_match`, including for
+    /// two different people near-tied against each other.
+    #[test]
+    fn wespeaker_batch_match_behavior_is_unchanged_by_margin_gate() {
+        assert_eq!(
+            crate::diarize::calibration::WESPEAKER_CALIBRATION.enrollment_match_margin,
+            0.0
+        );
+
+        let matcher = SpeakerProfileMatcher::from_profiles(vec![
+            named_profile("vp_alice", "Alice", 2, "sha256:active", vec![1.0, 0.0]),
+            named_profile("vp_bob", "Bob", 2, "sha256:active", vec![0.96, 0.28]),
+        ]);
+        let embedding = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
+
+        let before = matcher.best_match(&embedding);
+        let after = matcher.best_match_with_margin(
+            &embedding,
+            crate::diarize::calibration::WESPEAKER_CALIBRATION.enrollment_match_margin,
+        );
+        assert_eq!(before, after);
+        assert!(
+            after.is_some(),
+            "wespeaker's 0.0 margin must not reject a near-tied top1"
         );
     }
 

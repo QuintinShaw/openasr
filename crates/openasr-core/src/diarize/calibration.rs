@@ -12,6 +12,16 @@ pub struct SpeakerCalibrationProfile {
     /// space, used when the caller does not supply an explicit override. See
     /// `enrollment::DEFAULT_MATCH_SIMILARITY` for how this is consumed.
     pub(crate) enrollment_default_match_similarity: f32,
+    /// Second-stage confidence gate for batch voice-match: the minimum
+    /// top1-vs-top2 cosine-similarity margin required, on top of clearing
+    /// `enrollment_default_match_similarity` (or an explicit
+    /// `match_similarity` override), before a display name is attached to a
+    /// diarized speaker. See
+    /// `SpeakerProfileMatcher::best_match_with_margin` for how this is
+    /// consumed; a library with a single compatible profile has no runner-up
+    /// to measure a margin against and always clears this gate (see that
+    /// method's doc comment).
+    pub(crate) enrollment_match_margin: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -91,6 +101,14 @@ pub(crate) const WESPEAKER_CALIBRATION: SpeakerCalibrationProfile = SpeakerCalib
         speaker_change_max_cosine: 0.42,
     },
     enrollment_default_match_similarity: 0.5,
+    // Not calibrated: this legacy WeSpeaker cosine space never had a
+    // top1-vs-top2 margin eval run against it, and the batch matcher's
+    // margin gate was hardcoded to 0.0 (effectively off) before this field
+    // existed. Keep it 0.0 so WeSpeaker's batch match behavior is unchanged
+    // by adding the gate; see `enrollment.rs`'s
+    // `wespeaker_batch_match_behavior_is_unchanged_by_margin_gate` regression
+    // test.
+    enrollment_match_margin: 0.0,
 };
 
 /// ReDimNet2-B6 calibration (192-dim cosine space), distinct from
@@ -114,10 +132,9 @@ pub(crate) const WESPEAKER_CALIBRATION: SpeakerCalibrationProfile = SpeakerCalib
 /// - The top1-vs-top2 similarity margin cleanly separates registered speakers
 ///   from strangers: enrolled-speaker margins have p10 > 0.3, impostor margins
 ///   have p90 < 0.17, so >= 0.15 margin is a reasonable "safe to display a
-///   name with high confidence" bar (`margin_distributions.csv`). Nothing in
-///   this crate currently gates the batch match on a runner-up margin (see
-///   `SpeakerProfileMatcher::best_match`, margin = 0.0) -- that is a
-///   deliberately separate change, not folded into this calibration pass.
+///   name with high confidence" bar (`margin_distributions.csv`). This is
+///   `enrollment_match_margin` below, consumed by the batch matcher via
+///   `SpeakerProfileMatcher::best_match_with_margin`.
 ///
 /// Caveat: the eval is a clean, single-speaker-per-file, native-microphone
 /// read-speech corpus (LibriSpeech). It calibrates the acoustic same/
@@ -187,6 +204,14 @@ pub(crate) const REDIMNET_CALIBRATION: SpeakerCalibrationProfile = SpeakerCalibr
     // WeSpeaker's unrelated 0.5 default -- the two embedders' cosine spaces
     // are not comparable, see module doc.
     enrollment_default_match_similarity: 0.55,
+    // Measured: the same LibriSpeech eval's top1-vs-top2 cosine-similarity
+    // margin distributions cleanly separate registered speakers (margin p10
+    // > 0.3) from strangers (margin p90 < 0.17); >= 0.15 is a safe
+    // "confident enough to display a name" bar with headroom on both sides
+    // (`tmp/voiceid-eval/results/margin_distributions.csv`, not checked into
+    // this repo). This lands the margin gate the module doc above flagged as
+    // a deliberately separate change.
+    enrollment_match_margin: 0.15,
 };
 
 #[cfg(test)]
@@ -217,6 +242,7 @@ mod tests {
             REDIMNET_CALIBRATION.enrollment_default_match_similarity,
             0.55
         );
+        assert_eq!(REDIMNET_CALIBRATION.enrollment_match_margin, 0.15);
         assert_ne!(
             REDIMNET_CALIBRATION.clustering.plain_merge_threshold,
             WESPEAKER_CALIBRATION.clustering.plain_merge_threshold,
@@ -231,6 +257,11 @@ mod tests {
             REDIMNET_CALIBRATION.enrollment_default_match_similarity,
             WESPEAKER_CALIBRATION.enrollment_default_match_similarity,
             "redimnet calibration must not be copied verbatim from wespeaker's tuned values"
+        );
+        assert_ne!(
+            REDIMNET_CALIBRATION.enrollment_match_margin,
+            WESPEAKER_CALIBRATION.enrollment_match_margin,
+            "redimnet's measured margin gate must not be copied onto wespeaker's uncalibrated space"
         );
     }
 
@@ -355,5 +386,6 @@ mod tests {
             WESPEAKER_CALIBRATION.enrollment_default_match_similarity,
             0.5
         );
+        assert_eq!(WESPEAKER_CALIBRATION.enrollment_match_margin, 0.0);
     }
 }
