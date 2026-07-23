@@ -13,18 +13,25 @@
 //!     cosine vs the golden embeddings is > 0.9999 for all three fixture
 //!     samples (`#[ignore]`d parity tests in `backbone::tests`, gated on the
 //!     local `redimnet2-spike` assets).
-//!   * [ ] `SpeakerEmbedder` impl + runtime pack resolution + calibration.
+//!   * [x] `SpeakerEmbedder` impl (`backbone::RedimNet2Model` +
+//!     `super::RedimNet2Embedder`), runtime pack resolution
+//!     (`OPENASR_REDIMNET_PACK` / installed-dir hint, `super::pack`), and a
+//!     dedicated calibration profile (`REDIMNET_CALIBRATION`).
 //!
-//! The `SpeakerEmbedder` trait is deliberately **not** implemented yet and no
-//! runtime resolution path selects this embedder: wiring a half-built forward
-//! pass into the fail-closed diarize dispatch would risk fabricating embeddings.
-//! WeSpeaker stays the sole runtime embedder until this lands. See
+//! ReDimNet2 and WeSpeaker now coexist at runtime: `super::pack::shared_embedder`
+//! resolves ReDimNet2 first and only falls back to WeSpeaker when no ReDimNet2
+//! pack is installed. Removing WeSpeaker entirely is a later, separately
+//! approved step (HANDOFF.md plan item 6) -- not attempted here. See
 //! `docs/design/redimnet2-b6-embedder.md` (backbone plan + golden anchors) and
-//! `HANDOFF.md` (remaining plan: `SpeakerEmbedder`, calibration, catalog entry).
+//! `HANDOFF.md` (remaining plan: catalog entry, shipping-quant pack).
 
-// The backbone graph is exercised by its own `#[cfg(test)]` parity harness,
-// not yet by any runtime dispatch path (no `SpeakerEmbedder` impl exists
-// yet), so its public surface is otherwise dead in a plain lib build.
+// A handful of `config`/`frontend` items (e.g. `StageConfig::{sf,st}`,
+// `RedimNetFrontend::n_mels`) are checkpoint-structural fields kept for
+// parity-table readability and cross-checking against the checkpoint (see
+// `docs/design/redimnet2-b6-embedder.md` "per-stage hard-coded dims") even
+// though the current graph builder derives its shapes from the pack's own
+// tensor shapes instead of reading them back. `backbone` itself has no
+// remaining dead code now that `RedimNet2Model` wires the full forward path.
 #![allow(dead_code)]
 
 pub(crate) mod backbone;

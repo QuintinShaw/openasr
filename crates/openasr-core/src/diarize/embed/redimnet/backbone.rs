@@ -6,9 +6,7 @@
 //! pack via `diarize::embed::weights::Weights::from_oasr`. See
 //! `docs/design/redimnet2-b6-embedder.md` and `HANDOFF.md` for the staged
 //! bring-up plan and golden anchors this module's tests pin against.
-#![allow(dead_code)]
 
-#[cfg(test)]
 use crate::ggml_runtime::GgmlCpuGraphRunner;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuTensor, GgmlStaticTensor,
@@ -917,6 +915,75 @@ pub(crate) fn arena_context_bytes() -> usize {
     // in the backend buffer); 1<<16 tensors is far more than the backbone's
     // actual count (a few thousand across 6 stages + stem + heads).
     GgmlCpuGraphConfig::metadata_context_bytes(1usize << 16)
+}
+
+/// Runtime entry point for the `SpeakerEmbedder` trait impl
+/// (`super::super::RedimNet2Embedder`): owns the pack's parsed weights and
+/// runs the full backbone forward on demand.
+///
+/// Mirrors the ASR families' pack-to-graph convention (e.g.
+/// `models::dolphin::executor::encode_dolphin_encoder_from_pack`): the parsed
+/// `Weights` are held across calls (avoids re-reading/re-parsing the `.oasr`
+/// file from disk on every embed), but the ggml runner/arena/graph are
+/// rebuilt fresh per call -- the same shape as every `#[ignore]`d parity test
+/// in this module's `run_forward`. Caching the arena/graph across calls is a
+/// later perf optimization (HANDOFF.md plan item 5), not attempted here.
+pub(crate) struct RedimNet2Model {
+    weights: Weights,
+}
+
+impl RedimNet2Model {
+    pub(crate) fn from_oasr(path: &std::path::Path) -> Result<Self, RedimNetBackboneError> {
+        let weights = Weights::from_oasr(path)?;
+        Ok(Self { weights })
+    }
+
+    pub(crate) fn embedding_dim(&self) -> usize {
+        config::EMBED_DIM
+    }
+
+    /// Runs `stem -> ... -> linear` on `feats` (the front end's
+    /// `[mel*frames+frame]` flat buffer, matching `RedimNetFrontend::forward`'s
+    /// output layout verbatim) and returns the raw (pre-L2-normalize) 192-d
+    /// embedding. Callers needing a normalized embedding (the `SpeakerEmbedder`
+    /// trait contract) normalize on top, same as `WeSpeakerEmbedder`.
+    pub(crate) fn forward(
+        &self,
+        feats: &[f32],
+        frames: usize,
+    ) -> Result<Vec<f32>, RedimNetBackboneError> {
+        if frames < config::TIME_STRIDE {
+            return Err(shape_err(format!(
+                "redimnet backbone needs at least {} frames (TIME_STRIDE) to produce any output, got {frames}",
+                config::TIME_STRIDE
+            )));
+        }
+        if feats.len() != frames * config::F {
+            return Err(shape_err(format!(
+                "redimnet backbone expected {} spec values for {frames} frames at {} mel bins, got {}",
+                frames * config::F,
+                config::F,
+                feats.len()
+            )));
+        }
+
+        let mut runner = GgmlCpuGraphRunner::new(runner_config())?;
+        let arena = runner.start_static_tensor_arena(arena_context_bytes())?;
+        let mut builder = WBuilder::new(&self.weights);
+        let w = load_weights(&mut builder, &arena)?;
+        let mut arena = arena;
+        builder.upload(&mut arena)?;
+
+        let mut graph = runner.start_graph();
+        let spec = graph.new_tensor_2d_f32(frames, config::F, "redimnet_spec_input")?;
+        let taps = forward(&mut graph, spec, frames, &w)?;
+        graph.set_input(spec)?;
+        graph.set_output(taps.embedding)?;
+        graph.prepare_outputs_for_upload(&[taps.embedding])?;
+        graph.set_f32_slice(spec, feats, "redimnet_spec_input")?;
+        let embedding = graph.compute_output_f32(taps.embedding, config::EMBED_DIM)?;
+        Ok(embedding)
+    }
 }
 
 #[cfg(test)]
