@@ -174,6 +174,7 @@ pub fn plan_longform_slices(
                 total_samples,
                 sample_rate_hz,
                 options.padding_seconds,
+                options.max_chunk_seconds,
             );
         }
     }
@@ -237,13 +238,33 @@ fn plan_fixed_slices(
     let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz);
     let overlap_samples = seconds_to_samples(options.overlap_seconds, sample_rate_hz);
     let min_chunk_samples = seconds_to_samples(options.min_chunk_seconds, sample_rate_hz);
+    // The true ceiling a chunk may never cross -- same `max_chunk_seconds`
+    // reading the energy/VAD planners already bound their forced cuts to
+    // (`extend_energy_slices_for_span`'s `hard_end`,
+    // `extend_vad_slices_for_span`'s `hard_end`). `options.max_chunk_seconds`
+    // is what `apply_encoder_attention_span_longform_safety_policy` clamps
+    // down to a `GlobalQuadratic` architecture's declared safe span (and, for
+    // families whose dedicated executor also fails closed above that same
+    // span with no extra margin, e.g. `mimo_asr`, it clamps to *exactly* the
+    // executor's hard per-chunk cap). Merging a short tail into the previous
+    // chunk below must never be allowed to push that chunk past this ceiling
+    // -- doing so silently produced an over-cap slice that the mimo-asr /
+    // firered-llm executors then rejected with a fail-closed 400 (a 30.2s
+    // clip: one 30.0s chunk plus a 0.2s tail below `min_chunk_seconds`
+    // merged straight into the 30.0s chunk, exceeding mimo-asr's 30.0s cap
+    // with zero headroom).
+    let max_chunk_samples =
+        seconds_to_samples(options.max_chunk_seconds, sample_rate_hz).max(chunk_samples);
     let step = chunk_samples.saturating_sub(overlap_samples).max(1);
     let mut start = 0usize;
     let mut slices: Vec<AudioSlice> = Vec::new();
     while start < total_samples {
         let end = (start + chunk_samples).min(total_samples);
-        if end.saturating_sub(start) < min_chunk_samples && !slices.is_empty() {
-            let last = slices.last_mut().expect("non-empty");
+        if end.saturating_sub(start) < min_chunk_samples
+            && let Some(last) = slices.last()
+            && total_samples.saturating_sub(last.content_start_sample) <= max_chunk_samples
+        {
+            let last = slices.last_mut().expect("checked Some above");
             last.content_end_sample = total_samples;
             break;
         }
@@ -886,6 +907,7 @@ fn build_auto_plan_candidate(
         total_samples,
         sample_rate_hz,
         options.padding_seconds,
+        options.max_chunk_seconds,
     );
     let short_slice_penalty = estimate_short_slice_penalty(&layout.slices, sample_rate_hz, options);
     let boundary_penalty = estimate_boundary_penalty(samples, &layout, sample_rate_hz, options);
@@ -1499,6 +1521,7 @@ fn estimate_layout_processed_samples(
     total_samples: usize,
     sample_rate_hz: u32,
     padding_seconds: f32,
+    max_chunk_seconds: f32,
 ) -> usize {
     if let Some(processed_audio) = layout.processed_audio.as_ref() {
         return processed_audio.len();
@@ -1514,6 +1537,7 @@ fn estimate_layout_processed_samples(
             total_samples,
             sample_rate_hz,
             padding_seconds,
+            max_chunk_seconds,
         );
         estimated.iter().map(AudioSlice::duration_samples).sum()
     }
@@ -1626,6 +1650,13 @@ fn pack_processed_spans_into_windows(
     }
     let target_chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz).max(1);
     let min_chunk_samples = seconds_to_samples(options.min_chunk_seconds, sample_rate_hz).max(1);
+    // The hard ceiling: unlike `target_chunk_samples` (a soft target the loop
+    // below normally cuts at once `current_len >= min_chunk_samples`), this
+    // must never be crossed regardless of how small `current_len` still is --
+    // mirrors the same `max_chunk_samples` ceiling `subdivide_processed_spans_silence_aware`
+    // just bounded the individual subdivided spans by.
+    let max_chunk_samples =
+        seconds_to_samples(options.max_chunk_seconds, sample_rate_hz).max(target_chunk_samples);
     let overlap_samples = seconds_to_samples(options.overlap_seconds, sample_rate_hz)
         .min(target_chunk_samples.saturating_sub(1));
     // A single processed span longer than one chunk (a continuous-speech region
@@ -1642,7 +1673,9 @@ fn pack_processed_spans_into_windows(
         let prospective_end = span.end_sample;
         let prospective_len = prospective_end.saturating_sub(current_start);
         let current_len = current_end.saturating_sub(current_start);
-        if prospective_len > target_chunk_samples && current_len >= min_chunk_samples {
+        if prospective_len > target_chunk_samples
+            && (current_len >= min_chunk_samples || prospective_len > max_chunk_samples)
+        {
             windows.push(LongFormVadSlice {
                 start_sample: current_start,
                 end_sample: current_end,
@@ -1916,14 +1949,34 @@ fn apply_padding(
     total_samples: usize,
     sample_rate_hz: u32,
     padding_seconds: f32,
+    max_chunk_seconds: f32,
 ) {
     if slices.is_empty() {
         return;
     }
     let pad = seconds_to_samples(padding_seconds, sample_rate_hz);
+    // The true ceiling the *padded* window (what actually gets fed to the
+    // executor -- `AudioSlice::duration_samples`, not the narrower `content_*`
+    // range) may never cross. Every content-producing planner already bounds
+    // its `content_end_sample` by this same `max_chunk_seconds` (see
+    // `extend_energy_slices_for_span` / `extend_vad_slices_for_span` /
+    // `plan_fixed_slices`'s `hard_end`/`max_chunk_samples`), but padding used
+    // to add a flat `padding_seconds` on top unconditionally: a chunk whose
+    // content already sat at (or right up against) the cap got pushed past
+    // it by padding alone, reproducing the exact "30.2s exceeds the 30s
+    // per-chunk cap" shape (a 30.0s content chunk plus 0.25s padding,
+    // clamped by `total_samples` down to a 0.2s overshoot when little audio
+    // remained past it) even after the content-side merge bug is fixed.
+    // Shrink padding, never content, to keep the fed window inside the cap.
+    let max_chunk_samples = seconds_to_samples(max_chunk_seconds, sample_rate_hz).max(1);
     for slice in slices.iter_mut() {
-        slice.start_sample = slice.content_start_sample.saturating_sub(pad);
-        slice.end_sample = (slice.content_end_sample + pad).min(total_samples);
+        let content_len = slice
+            .content_end_sample
+            .saturating_sub(slice.content_start_sample);
+        let pad_budget = max_chunk_samples.saturating_sub(content_len);
+        let side_pad = pad.min(pad_budget / 2);
+        slice.start_sample = slice.content_start_sample.saturating_sub(side_pad);
+        slice.end_sample = (slice.content_end_sample + side_pad).min(total_samples);
     }
 }
 
@@ -3595,7 +3648,7 @@ mod tests {
             selection_provenance: Vec::new(),
         };
 
-        let estimated = estimate_layout_processed_samples(&layout, 16_000 * 40, 16_000, 0.0);
+        let estimated = estimate_layout_processed_samples(&layout, 16_000 * 40, 16_000, 0.0, 120.0);
         assert_eq!(estimated, 16_000 * 40 + 16_000 / 2);
     }
 
@@ -3760,5 +3813,82 @@ mod tests {
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].content_start_sample, 0);
         assert_eq!(slices[0].content_end_sample, samples.len());
+    }
+
+    /// Regression for the mimo-asr/firered-llm "30.2s per-chunk cap" bug: a
+    /// `GlobalQuadratic` family whose dedicated executor fails closed at
+    /// exactly its declared `max_safe_chunk_seconds` (zero extra margin, the
+    /// `mimo_asr` shape) gets `chunk_seconds == max_chunk_seconds == 30.0`
+    /// from `apply_encoder_attention_span_longform_safety_policy`. Before the
+    /// fix, `plan_fixed_slices` merged any tail shorter than
+    /// `min_chunk_seconds` (default 1.0s) straight into the previous 30.0s
+    /// chunk with no cap check, so a 30.2s clip (30.0s chunk + a 0.2s tail)
+    /// produced a single 30.2s slice -- past the 30.0s executor cap with zero
+    /// tolerance. Matrix covers the exact reported duration (30.2s) plus its
+    /// neighbors: comfortably under cap (29.9s), exactly at cap (30.0s), and
+    /// a case requiring a real second chunk regardless (60.0s).
+    #[test]
+    fn fixed_mode_never_exceeds_zero_margin_family_chunk_cap() {
+        let sample_rate_hz = 16_000u32;
+        let max_chunk_seconds = 30.0f32;
+        for total_seconds in [29.9f32, 30.0, 30.2, 60.0] {
+            let mut options = options_with_mode(LongFormMode::Fixed);
+            options.chunk_seconds = max_chunk_seconds;
+            options.max_chunk_seconds = max_chunk_seconds;
+            let total_samples = (total_seconds * sample_rate_hz as f32).round() as usize;
+            let samples = tone(total_samples);
+            let plan = plan_longform_slices(&samples, sample_rate_hz, &options, None).unwrap();
+            let max_chunk_samples = (max_chunk_seconds * sample_rate_hz as f32).round() as usize;
+            for slice in &plan.slices {
+                assert!(
+                    slice.duration_samples() <= max_chunk_samples,
+                    "total_seconds={total_seconds}: slice {slice:?} exceeds the \
+                     {max_chunk_seconds}s zero-margin cap"
+                );
+            }
+            // Full coverage must still hold: nothing gets silently dropped by
+            // refusing to merge the short tail into the previous chunk.
+            assert_eq!(
+                plan.slices
+                    .last()
+                    .expect("non-empty plan")
+                    .content_end_sample,
+                total_samples,
+                "total_seconds={total_seconds}: plan must still cover the full clip"
+            );
+        }
+    }
+
+    /// Same zero-margin family shape, but through `LongFormMode::Auto`'s
+    /// multi-candidate selection: a continuous, pause-free 30.2s tone (no
+    /// clean silence point for the energy/VAD planners to land on) is exactly
+    /// the shape that let the defective `Fixed` candidate look best (full
+    /// coverage, single chunk, no wasted overlap) and win selection, handing
+    /// the mimo-asr executor an over-cap slice.
+    #[test]
+    fn auto_mode_never_exceeds_zero_margin_family_chunk_cap_on_pauseless_audio() {
+        let sample_rate_hz = 16_000u32;
+        let max_chunk_seconds = 30.0f32;
+        let mut options = options_with_mode(LongFormMode::Auto);
+        options.chunk_seconds = max_chunk_seconds;
+        options.max_chunk_seconds = max_chunk_seconds;
+        let total_samples = (30.2f32 * sample_rate_hz as f32).round() as usize;
+        let samples = tone(total_samples);
+        let plan = plan_longform_slices(&samples, sample_rate_hz, &options, None).unwrap();
+        let max_chunk_samples = (max_chunk_seconds * sample_rate_hz as f32).round() as usize;
+        for slice in &plan.slices {
+            assert!(
+                slice.duration_samples() <= max_chunk_samples,
+                "auto-selected slice {slice:?} exceeds the {max_chunk_seconds}s zero-margin cap"
+            );
+        }
+        assert_eq!(
+            plan.slices
+                .last()
+                .expect("non-empty plan")
+                .content_end_sample,
+            total_samples,
+            "auto-selected plan must still cover the full clip"
+        );
     }
 }
