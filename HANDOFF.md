@@ -1,86 +1,99 @@
-# ReDimNet2-B6 embedder -- stage-3 handoff
+# ReDimNet2-B6 embedder -- stage-4 handoff
 
 Branch `feat/redimnet2-b6-embedder`. Stage-1/2 assets (specs, golden `.npy`,
 weights) live under `/Volumes/QuintinDocument/openasr-dev/tmp/redimnet2-spike/`.
 This handoff records exactly what is done and the precise remaining plan.
 **Delete this file before the PR is marked ready** (it is a working note).
 
-## Done (backbone, this session -- each step golden-pinned, all green)
+## Done (backbone, stage-3 session -- each step golden-pinned, all green)
 
-- **Full backbone ggml graph** (`crates/openasr-core/src/diarize/embed/redimnet/
-  backbone.rs` + `ops.rs`): `stem -> stage0..5 -> fin_wght1d -> head -> fin_to2d
-  -> ASTP pool -> BatchNorm -> linear -> 192-d embedding`, built on the shared
-  `GgmlCpuGraphRunner`/`GgmlStaticTensorArena` (same pattern as
-  `models::dolphin::encoder_graph`). Loads the f32 `.oasr` pack via
-  `diarize::embed::weights::Weights::from_oasr`; weight tensor names read
-  verbatim from the pack (`backbone.*`/`pool.*`/`bn.*`/`linear.*`), with the
-  down-conv's `groups` derived by introspecting the pack's own kernel shape
-  (`cin_running / cin_per_group`) rather than recomputing `gcd` by hand.
-- **Parity tests** (`backbone::tests`, all `#[ignore]`, gated on the local
-  `redimnet2-spike` assets, **all green**):
-  - `stem_parity_jfk` -- `01_outputs_1d` (stem: conv -> LN -> to1d -> gnorm).
-  - `stage_parity_jfk` -- `02..07_outputs_1d` (stage0..5), each depending on
-    every previously-verified stage via `weigth1d` aggregation.
-  - `fin_and_head_parity_jfk` -- `fin_wght1d`, `99_backbone_2d_output`,
-    `a0_pre_pool_flattened`.
-  - `full_pipeline_cosine_gate` -- `a1_post_pool`/`a2_post_bn`/
-    `a3_final_embedding`, plus the end-to-end cosine gate: **jfk/zh_sample/
-    en_zh_mixed all show cosine 1.000000 vs the golden embeddings** (well
-    above the > 0.9999 target).
-  - `to1d_matches_hand_derived_frequency_major_formula` -- a synthetic
-    (no-pack-needed) unit test pinning `to1d`'s `ne` derivation directly.
+See the stage-3 section of this file's prior revision (git history on this
+branch) for the full backbone bring-up narrative and the two real ggml bugs
+found via the parity harness (gallocr view-of-output corruption;
+`to1d` vs the plain-reshape pre-pool flatten). Summary: full backbone graph
+(`redimnet/backbone.rs` + `ops.rs`) reproduces the golden embeddings at
+cosine 1.000000 for jfk/zh_sample/en_zh_mixed, all parity tests green.
+
+## Done (SpeakerEmbedder wiring, this session -- all green)
+
+- **`RedimNet2Model`** (`redimnet/backbone.rs`): owns the parsed `.oasr`
+  `Weights` across calls; `forward(feats, frames)` rebuilds a fresh
+  `GgmlCpuGraphRunner`/arena/graph per call (same shape as every parity
+  test's `run_forward`) and returns the raw (pre-L2-normalize) 192-d
+  embedding. Caching the arena/graph across calls is a later perf pass
+  (plan item 5 below), not attempted here.
+- **`RedimNet2Embedder`** (`embed/mod.rs`): implements `SpeakerEmbedder`
+  (same trait as `WeSpeakerEmbedder`) -- `TFMelBanks` front end -> backbone
+  -> `SpeakerEmbedding::l2_normalized`. `embedding_dim() == 192`.
+  `embedding_space_version()` returns the pinned label
+  `"redimnet2-b6-cn-v1"` (`pack::REDIMNET_EMBEDDING_SPACE_VERSION`) --
+  documentation/audit metadata only; the real compatibility gate stays the
+  pack content fingerprint (sha256) via `SpeakerEmbedderIdentity`.
+- **`REDIMNET_CALIBRATION`** (`calibration.rs`): a distinct 192-dim cosine
+  calibration profile, every threshold marked `TODO(voice-id-eval)` --
+  conservative placeholders, not copied from `WESPEAKER_CALIBRATION`, pending
+  a real LibriSpeech/AISHELL-4 calibration pass (separate in-flight task).
+- **Runtime selection** (`embed/pack.rs`): `choose_embedder_pack` is the one
+  pure selection rule -- ReDimNet2 wins whenever `OPENASR_REDIMNET_PACK` /
+  the installed `redimnet*` dir resolves, WeSpeaker is used only as a
+  fallback, neither present resolves to `None` (fail-closed, no panic).
+  `shared_embedder`/`shared_embedder_identity`/`embedder_pack_installed` are
+  unchanged call sites for every existing consumer (`enrollment.rs`,
+  `streaming.rs`, `vbx/mod.rs`, `native_transcribe.rs`) -- only the pack
+  resolved underneath changed. WeSpeaker is untouched and still fully
+  functional as the fallback; removing it is plan item 6 below, not done.
+- **Tests, all green**:
+  - `pack::tests` -- 4-case selection matrix (both present / redimnet only /
+    wespeaker only / neither) against the pure `choose_embedder_pack`, plus
+    the `REDIMNET_EMBEDDING_SPACE_VERSION` pin.
+  - `calibration::tests::redimnet_calibration_profile_is_pinned_and_distinct_from_wespeaker`
+    -- pins the placeholder values and asserts they are not copies of
+    WeSpeaker's tuned thresholds.
+  - `enrollment::tests::old_wespeaker_profile_is_incompatible_with_new_redimnet_embedder`
+    -- pins that a legacy 256-dim WeSpeaker profile is rejected by a 192-dim
+    ReDimNet2 identity, with a readable `compatibility_status` reason, and
+    that `VoiceprintStore::compatible_profiles` drops it rather than risk a
+    cross-embedding-space comparison.
+  - `embed::tests::redimnet_embedder_matches_python_reference_e2e_jfk`
+    (`#[ignore]`, needs the local `redimnet2-spike` pack) -- the first test
+    to exercise the full `SpeakerEmbedder` trait path end to end (raw
+    `fixtures/jfk.wav` -> front end -> backbone -> L2-normalize), not just
+    the backbone with a pre-dumped front-end tensor. Cosine vs
+    `embeddings_b6/jfk.npy` = 1.00000024 (clamped near 1).
 - Verification run: `cargo fmt --check`, `cargo clippy -p openasr-core --lib
-  --tests -- -D warnings` (clean), `cargo test -p openasr-core --lib diarize::`
-  (148 passed, 0 failed, no regressions in the rest of `diarize::`).
+  --tests -- -D warnings` (clean), `cargo test -p openasr-core --lib
+  diarize::` (155 passed, 0 failed, up from 148 -- no regressions), plus the
+  `#[ignore]`d redimnet suite against the real f32 pack (6 passed: frontend
+  parity, all backbone stage/full-pipeline parity, and the new e2e trait
+  test).
 
-### Two real bugs found and fixed via the parity harness (read before touching `ops.rs`)
+## Remaining plan (post-wiring; not started)
 
-1. **Gallocr view-of-output-tensor corruption.** `to1d`/`to2d`/`group_norm_1d`
-   (and any future op) must defensively `cont()` a tensor *before* taking any
-   view of it (`permute`/`transpose`/`reshape` are all views in ggml) if that
-   tensor might *also* be independently marked `set_output` (a parity tap, or
-   any other long-lived read). The backend scheduler's gallocr does **not**
-   protect a view's underlying source buffer purely because a view of it (or
-   the tensor itself) carries the output flag -- it silently recycled the
-   buffer once the view had been consumed, corrupting every later read of the
-   supposedly-still-needed tensor. Root-caused by bisection: `run_stem` alone
-   matched the golden bit-for-bit, but the identical computation, once more
-   graph was built *after* it in the same call (even just `+stage0`), read
-   back corrupted. Every 2D<->1D boundary op in `ops.rs` now `cont()`s its
-   input defensively; keep doing this for any new op that takes a view of a
-   caller-supplied tensor.
-2. **`to1d` is not the final pre-pool flatten.** `ReDimNet2Wrap.forward`'s
-   `out.reshape(bs, C*F, T)` (right before `pool`) is a **plain torch
-   reshape** (`c*F+f`, C-major/F-minor), not `to1d`'s frequency-major merge
-   (`f*C+c`) used everywhere else in the backbone. Reusing `to1d` there
-   silently flattened in the wrong order (values fine, order wrong) -- fixed
-   by adding a dedicated `ops::flatten_backbone_output` for exactly this one
-   call site. If a new "flatten a 2D backbone output to 1D" call site shows up,
-   check which torch op it actually mirrors before assuming it's `to1d`.
-
-## Remaining plan (post-backbone; not started)
-
-1. **`SpeakerEmbedder` impl** on a `RedimNet2Embedder` (`embedding_dim` 192),
-   wiring `backbone::forward` behind the trait. L2-normalize the final
-   embedding (not yet done in `backbone::forward` -- the golden comparison
-   used raw pre-normalize vectors since cosine is scale-invariant; confirm
-   whether the production trait needs an explicit normalize step or whether
-   callers normalize downstream, matching `WeSpeaker`'s convention).
-2. **`REDIMNET_CALIBRATION` profile** (192-dim cosine space, distinct from
-   `WESPEAKER_CALIBRATION` -- must be measured against real enrollment data,
-   not copied).
-3. **Runtime pack resolution** (`OPENASR_REDIMNET_PACK` env + installed-dir
-   hint), mirroring `pack.rs`'s existing WeSpeaker resolution path.
-4. **Catalog/registry entry** + model card + `docs/model-audits/
+1. **Catalog/registry entry** + model card + `docs/model-audits/
    redimnet2-b6.md` (new-family release gate; `tooling/publish-model/scripts/
-   _manifest.py --public` fails closed without a completed form).
-5. **Shipping pack + quantization**: convert the final release pack at the
+   _manifest.py --public` fails closed without a completed form). Out of
+   scope for this stage per the task brief ("不接 dispatch 之外的产品面
+   (catalog/上架另案)").
+2. **Real calibration**: replace every `TODO(voice-id-eval)` threshold in
+   `REDIMNET_CALIBRATION` once the LibriSpeech/AISHELL-4 same-speaker/
+   cross-speaker cosine distribution is measured (separate task in flight).
+3. **Shipping pack + quantization**: convert the final release pack at the
    chosen quant (f16/q8_0), re-run the parity gate against it (the f32 pack
    was the only fixture used so far), then benchmark RTF/RAM (separate,
-   measurement-isolated session).
-6. Not in scope for any of the above: `SpeakerEmbedder`/dispatch wiring must
-   not touch `WeSpeaker` (untouched, remains the sole runtime embedder until
-   this whole plan lands and is explicitly approved for cutover).
+   measurement-isolated session) and revisit whether `RedimNet2Model::forward`
+   should cache its arena/graph across calls instead of rebuilding per embed.
+4. **Enrollment UX for the WeSpeaker -> ReDimNet2 cutover**: once a user's
+   active embedder identity flips from WeSpeaker to ReDimNet2 (installing the
+   new pack), their old voiceprints become incompatible by design (see the
+   `is_compatible_with` test above) and need re-registration. No UI/CLI
+   surface for "your voiceprints are stale, re-register" exists yet --
+   `compatibility_status`'s reason string is the only current signal,
+   surfaced wherever a caller already reads it.
+5. **Remove WeSpeaker** (explicit product decision, not started): once
+   ReDimNet2 has shipped and been validated in the field, WeSpeaker's pack,
+   pure-Rust model, and `WESPEAKER_CALIBRATION` can be deleted and
+   `choose_embedder_pack`'s fallback branch removed. Not attempted in this
+   PR by design.
 
 ## Reference pointers (still accurate)
 
