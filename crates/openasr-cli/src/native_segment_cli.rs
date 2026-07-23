@@ -122,20 +122,7 @@ pub(super) fn transcribe_batch_item(
     )?;
     print_audio_input_notes(prepared.original());
     print_audio_preparation_notes(&prepared);
-    let request = TranscriptionRequest::new(prepared.path(), context.model_id)
-        .with_model_pack_path(context.model_pack_path.clone())
-        .with_language(context.language.clone())
-        .with_task(context.task)
-        .with_longform(context.longform.clone())
-        .with_display_file_name(
-            input_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_string),
-        )
-        .with_diarization(context.diarize)
-        .with_diarize_speakers(context.speakers)
-        .with_prepared_samples(prepared.shared_samples());
+    let request = batch_item_transcription_request(input_path, context, &prepared);
     let transcription = transcribe_with_backend(context.backend_kind, request)?;
     let written = write_rendered_formats(
         &transcription,
@@ -151,6 +138,35 @@ pub(super) fn transcribe_batch_item(
             .next()
             .unwrap_or_else(|| context.output_dir.to_path_buf()),
     })
+}
+
+/// Builds one batch item's [`TranscriptionRequest`]. Split out from
+/// [`transcribe_batch_item`] so the `RequestSource` wiring is unit-testable
+/// without a real model pack (`prepared_run.backend_kind`'s decode path is not
+/// exercised here).
+fn batch_item_transcription_request(
+    input_path: &Path,
+    context: &BatchRunContext<'_>,
+    prepared: &openasr_core::PreparedAudioInput,
+) -> TranscriptionRequest {
+    TranscriptionRequest::new(prepared.path(), context.model_id)
+        // Per-file item of a multi-input `openasr transcribe` run (directory
+        // or several explicit files) -- same command/source as the
+        // single-input path in `main.rs`, just batched.
+        .with_source(openasr_core::RequestSource::CliTranscribe)
+        .with_model_pack_path(context.model_pack_path.clone())
+        .with_language(context.language.clone())
+        .with_task(context.task)
+        .with_longform(context.longform.clone())
+        .with_display_file_name(
+            input_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string),
+        )
+        .with_diarization(context.diarize)
+        .with_diarize_speakers(context.speakers)
+        .with_prepared_samples(prepared.shared_samples())
 }
 
 pub(super) fn ensure_batch_output_dir(output_dir: &Path) -> Result<()> {
@@ -209,22 +225,7 @@ pub(super) fn run_benchmark(
     } else {
         None
     };
-    let request =
-        TranscriptionRequest::new(prepared.path(), prepared_run.model_source.model_id.clone())
-            .with_model_pack_path(prepared_run.model_source.model_pack_path.clone())
-            .with_longform(longform)
-            .with_display_file_name(
-                file.file_name()
-                    .and_then(|name| name.to_str())
-                    .map(str::to_string),
-            )
-            // `--benchmark` measures plain ASR decode timing; punctuation
-            // restoration is an optional post-process (like diarization and
-            // word-timestamp alignment, neither of which this request enables
-            // either) and would silently skew the real-time factor for an
-            // unpunctuated model with the FireRedPunc pack installed.
-            .with_punctuation(false)
-            .with_prepared_samples(prepared.shared_samples());
+    let request = benchmark_transcription_request(prepared_run, file, longform, &prepared);
     let started = Instant::now();
     let transcription = transcribe_with_backend(prepared_run.backend_kind, request)?;
     let elapsed = started.elapsed();
@@ -255,6 +256,37 @@ pub(super) fn run_benchmark(
         render_benchmark(&result, bench_format).context("Could not render benchmark output")?;
     write_rendered_output(&rendered, output)?;
     Ok(())
+}
+
+/// Builds `transcribe --benchmark`'s [`TranscriptionRequest`]. Split out from
+/// [`run_benchmark`] so the `RequestSource` wiring is unit-testable without a
+/// real model pack.
+fn benchmark_transcription_request(
+    prepared_run: &PreparedBackendRun,
+    file: &Path,
+    longform: Option<openasr_core::LongFormOptions>,
+    prepared: &openasr_core::PreparedAudioInput,
+) -> TranscriptionRequest {
+    TranscriptionRequest::new(prepared.path(), prepared_run.model_source.model_id.clone())
+        // `transcribe --benchmark` is a mode of the interactive `transcribe`
+        // command, not the separate `bench-suite` CI/perf gate (which logs
+        // `RequestSource::CliBenchSuite` instead) -- see that variant's doc
+        // comment for the distinction.
+        .with_source(openasr_core::RequestSource::CliTranscribe)
+        .with_model_pack_path(prepared_run.model_source.model_pack_path.clone())
+        .with_longform(longform)
+        .with_display_file_name(
+            file.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string),
+        )
+        // `--benchmark` measures plain ASR decode timing; punctuation
+        // restoration is an optional post-process (like diarization and
+        // word-timestamp alignment, neither of which this request enables
+        // either) and would silently skew the real-time factor for an
+        // unpunctuated model with the FireRedPunc pack installed.
+        .with_punctuation(false)
+        .with_prepared_samples(prepared.shared_samples())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1248,6 +1280,72 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use tower::ServiceExt;
+
+    fn sample_wav_fixture_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/jfk.wav")
+            .canonicalize()
+            .expect("sample wav fixture path must exist")
+    }
+
+    fn sample_prepared_audio() -> openasr_core::PreparedAudioInput {
+        openasr_core::prepare_audio_input(
+            sample_wav_fixture_path(),
+            &audio_preparation_options(BackendKind::Native, None, false),
+        )
+        .expect("fixture wav must prepare")
+    }
+
+    // Regression guard for the batch (`transcribe --output <dir>` on a
+    // directory/multiple files) entry point: it must log the same
+    // `RequestSource::CliTranscribe` as the single-input path in `main.rs`,
+    // since both are the same `transcribe` command.
+    #[test]
+    fn batch_item_transcription_request_labels_source_as_cli_transcribe() {
+        let prepared = sample_prepared_audio();
+        let output_dir = PathBuf::from("/tmp/openasr-test-output");
+        let context = BatchRunContext {
+            output_dir: &output_dir,
+            formats: &[ResponseFormat::Text],
+            model_id: "whisper-small",
+            model_pack_path: None,
+            backend_kind: BackendKind::Native,
+            ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
+            longform: None,
+            diarize: false,
+            speakers: None,
+            language: None,
+            task: None,
+        };
+        let request =
+            batch_item_transcription_request(&sample_wav_fixture_path(), &context, &prepared);
+        assert_eq!(request.source, openasr_core::RequestSource::CliTranscribe);
+    }
+
+    // Regression guard for `transcribe --benchmark`: it must log
+    // `RequestSource::CliTranscribe`, not the separate `bench-suite` gate's
+    // `CliBenchSuite` -- the two must stay distinguishable in `daemon.log`.
+    #[test]
+    fn benchmark_transcription_request_labels_source_as_cli_transcribe() {
+        let prepared = sample_prepared_audio();
+        let prepared_run = PreparedBackendRun {
+            backend_kind: BackendKind::Native,
+            model_source: ResolvedModelSource {
+                model_id: "whisper-small".to_string(),
+                model_pack_path: None,
+            },
+            ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
+        };
+        let request = benchmark_transcription_request(
+            &prepared_run,
+            &sample_wav_fixture_path(),
+            None,
+            &prepared,
+        );
+        assert_eq!(request.source, openasr_core::RequestSource::CliTranscribe);
+    }
 
     struct EnvVarRestore {
         name: &'static str,

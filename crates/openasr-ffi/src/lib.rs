@@ -352,6 +352,20 @@ pub unsafe extern "C" fn openasr_model_close(model: *mut OpenAsrModel) {
 /// buffer. Read the result with the `openasr_result_*` accessors, then free it
 /// with [`openasr_result_free`].
 ///
+/// Builds the [`TranscriptionRequest`] for one `openasr_transcribe_pcm` call.
+/// Split out from that function so the `RequestSource` wiring is
+/// unit-testable without a real model pack (this never touches the
+/// filesystem or a backend).
+fn ffi_transcription_request(staging_path: PathBuf, pack_path: PathBuf) -> TranscriptionRequest {
+    TranscriptionRequest::new(staging_path, NATIVE_RUNTIME_MODEL_ID_AUTO)
+        // The C ABI carries no field distinguishing which host feature called
+        // in, so every embedder logs this one label -- see
+        // `RequestSource::Ffi`'s doc comment.
+        .with_source(openasr_core::RequestSource::Ffi)
+        .with_model_pack_path(Some(pack_path))
+        .with_word_timestamps(false)
+}
+
 /// # Safety
 /// `model` must be a live handle from [`openasr_model_open`]. `pcm` must
 /// point to at least `pcm_len_samples` samples of the given `format` (4 bytes
@@ -438,9 +452,7 @@ pub unsafe extern "C" fn openasr_transcribe_pcm(
             return OpenAsrStatus::IoError;
         }
 
-        let request = TranscriptionRequest::new(staging_path, NATIVE_RUNTIME_MODEL_ID_AUTO)
-            .with_model_pack_path(Some(model_ref.pack_path.clone()))
-            .with_word_timestamps(false);
+        let request = ffi_transcription_request(staging_path, model_ref.pack_path.clone());
 
         match NativeBackend.transcribe(request) {
             Ok(transcription) => {
@@ -1154,6 +1166,20 @@ mod tests {
         unsafe { CStr::from_ptr(ptr) }
             .to_string_lossy()
             .into_owned()
+    }
+
+    // Regression guard for the FFI entry point: the request built from a
+    // `openasr_transcribe_pcm` call must log `RequestSource::Ffi`, not
+    // `Unspecified` -- see that variant's doc comment for why the C ABI
+    // still gets an intentional, non-default label despite carrying no
+    // finer-grained caller context.
+    #[test]
+    fn ffi_transcription_request_labels_source_as_ffi() {
+        let request = ffi_transcription_request(
+            PathBuf::from("/tmp/openasr-ffi-staging.wav"),
+            PathBuf::from("/nonexistent/model.oasr"),
+        );
+        assert_eq!(request.source, openasr_core::RequestSource::Ffi);
     }
 
     #[test]
