@@ -7,6 +7,11 @@
 pub struct SpeakerCalibrationProfile {
     pub(crate) clustering: ClusteringCalibrationProfile,
     pub(crate) streaming: StreamingCalibrationProfile,
+    /// Default cosine-similarity floor for a newly enrolled voice-match
+    /// profile (`SpeakerProfile::match_similarity`) in this embedder's cosine
+    /// space, used when the caller does not supply an explicit override. See
+    /// `enrollment::DEFAULT_MATCH_SIMILARITY` for how this is consumed.
+    pub(crate) enrollment_default_match_similarity: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,51 +90,99 @@ pub(crate) const WESPEAKER_CALIBRATION: SpeakerCalibrationProfile = SpeakerCalib
         native_profile_anchor_similarity: 0.50,
         speaker_change_max_cosine: 0.42,
     },
+    enrollment_default_match_similarity: 0.5,
 };
 
 /// ReDimNet2-B6 calibration (192-dim cosine space), distinct from
 /// `WESPEAKER_CALIBRATION` -- the two embedders' cosine distributions are not
 /// comparable, so nothing here is copied from the WeSpeaker profile above.
 ///
-/// TODO(voice-id-eval): every threshold below is a conservative placeholder,
-/// not yet measured against real enrollment data. A separate task is
-/// producing a LibriSpeech/AISHELL-4 same-speaker/cross-speaker cosine
-/// distribution to calibrate these for real; until that lands, values are
-/// picked to fail toward "no match" (stricter than a tuned profile would be)
-/// rather than risk false speaker merges.
+/// The batch-pipeline (clustering) thresholds below are derived from a real
+/// voice-id evaluation: LibriSpeech `test-clean`, 40 speakers, 42,960 trials
+/// across enrolled-library sizes of 5/10/20/40 speakers and 5-20 s enrollment
+/// clips (`tmp/voiceid-eval/results/{summary_metrics,threshold_curves,
+/// margin_distributions}.csv`, not checked into this repo). Headline findings:
+/// - A cosine match threshold of 0.55 keeps FAR at 0-1.3% with 98.7-100% hit
+///   rate across 5-20 speaker libraries (`threshold_curves.csv`); a 20-speaker
+///   library shows roughly an order of magnitude more false accepts than a
+///   5-speaker library at the same threshold, so 0.55 is the floor, not a
+///   number to relax as libraries grow.
+/// - The top1-vs-top2 similarity margin cleanly separates registered speakers
+///   from strangers: enrolled-speaker margins have p10 > 0.3, impostor margins
+///   have p90 < 0.17, so >= 0.15 margin is a reasonable "safe to display a
+///   name with high confidence" bar (`margin_distributions.csv`). Nothing in
+///   this crate currently gates the batch match on a runner-up margin (see
+///   `SpeakerProfileMatcher::best_match`, margin = 0.0) -- that is a
+///   deliberately separate change, not folded into this calibration pass.
+///
+/// Caveat: the eval is a clean, single-speaker-per-file, native-microphone
+/// read-speech corpus (LibriSpeech). It calibrates the acoustic same/
+/// different-speaker cosine floor well but says nothing about cross-device
+/// recording conditions, noisy/far-field capture, or multi-speaker
+/// segmentation quality; those need a dedicated Challenge Set pass before the
+/// thresholds below can be trusted outside this scenario.
+///
+/// This version ships batch file-transcription support for ReDimNet2 only;
+/// the streaming (realtime) fields further down have no equivalent streaming
+/// trial data yet and stay conservative TODO placeholders.
 pub(crate) const REDIMNET_CALIBRATION: SpeakerCalibrationProfile = SpeakerCalibrationProfile {
     clustering: ClusteringCalibrationProfile {
-        // TODO(voice-id-eval): placeholder, needs real calibration.
-        plain_merge_threshold: 0.50,
-        // TODO(voice-id-eval): placeholder, needs real calibration.
-        context_auto_merge_threshold: 0.75,
+        // Measured: LibriSpeech eval's 0.55 cosine main match threshold,
+        // expressed as `1 - cosine` dissimilarity (0.45). Clean read-speech
+        // only; see module-level caveat above.
+        plain_merge_threshold: 0.45,
+        // Not independently measured -- no multi-speaker segmentation corpus
+        // in the LibriSpeech eval to calibrate the context-assisted merge
+        // gate. Extrapolated by applying WeSpeaker's own
+        // context_auto_merge_threshold / plain_merge_threshold ratio
+        // (0.73 / 0.43 ~= 1.70) to the measured plain threshold above
+        // (0.45 * 1.70 ~= 0.76). Needs a real multi-speaker meeting-style
+        // corpus (e.g. AISHELL-4) before this can be called calibrated.
+        context_auto_merge_threshold: 0.76,
         dense_context_min_embeddings: 30,
-        // TODO(voice-id-eval): placeholder, needs real calibration.
-        dense_context_merge_threshold: 0.50,
+        // Same reasoning as `plain_merge_threshold`: WeSpeaker keeps this
+        // equal to its plain threshold, and the measured 0.55 main match
+        // threshold gives no separate signal for dense-meeting behavior.
+        dense_context_merge_threshold: 0.45,
         context_gap: Some(ContextGapCalibrationProfile {
             min_gap: 0.05,
             max_speakers: 4,
             fallback_speakers: 3,
         }),
     },
+    // Streaming (realtime registry consolidation) is out of scope for this
+    // calibration pass: the LibriSpeech eval only exercised batch-style
+    // enrollment/matching trials, not the incremental same-turn-vs-new-turn
+    // decisions streaming makes. Values below stay the original conservative,
+    // fail-toward-"no match" placeholders (distinct from WeSpeaker's tuned
+    // numbers) until a dedicated streaming/Challenge Set pass calibrates them
+    // for real; this crate does not ship streaming support for ReDimNet2 yet.
     streaming: StreamingCalibrationProfile {
-        // TODO(voice-id-eval): placeholder, needs real calibration.
+        // TODO(voice-id-eval): placeholder, needs streaming/Challenge Set calibration.
         match_similarity: 0.60,
-        // TODO(voice-id-eval): placeholder, needs real calibration.
+        // TODO(voice-id-eval): placeholder, needs streaming/Challenge Set calibration.
         strong_existing_match_similarity: 0.70,
-        // TODO(voice-id-eval): placeholder, needs real calibration.
+        // TODO(voice-id-eval): placeholder, needs streaming/Challenge Set calibration.
         relaxed_match_similarity: 0.40,
+        // TODO(voice-id-eval): placeholder, needs streaming/Challenge Set calibration.
         relaxed_match_margin: 0.20,
+        // TODO(voice-id-eval): placeholder, needs streaming/Challenge Set calibration.
         relaxed_reuse_max_weight: 3.0,
-        // TODO(voice-id-eval): placeholder, needs real calibration.
+        // TODO(voice-id-eval): placeholder, needs streaming/Challenge Set calibration.
         new_speaker_max_existing_similarity: 0.50,
-        // TODO(voice-id-eval): placeholder, needs real calibration.
+        // TODO(voice-id-eval): placeholder, needs streaming/Challenge Set calibration.
         profile_anchor_similarity: 0.80,
-        // TODO(voice-id-eval): placeholder, needs real calibration.
+        // TODO(voice-id-eval): placeholder, needs streaming/Challenge Set calibration.
         native_profile_anchor_similarity: 0.55,
-        // TODO(voice-id-eval): placeholder, needs real calibration.
+        // TODO(voice-id-eval): placeholder, needs streaming/Challenge Set calibration.
         speaker_change_max_cosine: 0.45,
     },
+    // Measured: LibriSpeech eval's 0.55 cosine main match threshold. This is
+    // the default floor for a newly enrolled `SpeakerProfile` in ReDimNet2's
+    // cosine space (batch file-transcription enrollment/matching), up from
+    // WeSpeaker's unrelated 0.5 default -- the two embedders' cosine spaces
+    // are not comparable, see module doc.
+    enrollment_default_match_similarity: 0.55,
 };
 
 #[cfg(test)]
@@ -138,10 +191,16 @@ mod tests {
 
     #[test]
     fn redimnet_calibration_profile_is_pinned_and_distinct_from_wespeaker() {
-        assert_eq!(REDIMNET_CALIBRATION.clustering.plain_merge_threshold, 0.50);
+        assert_eq!(REDIMNET_CALIBRATION.clustering.plain_merge_threshold, 0.45);
         assert_eq!(
             REDIMNET_CALIBRATION.clustering.context_auto_merge_threshold,
-            0.75
+            0.76
+        );
+        assert_eq!(
+            REDIMNET_CALIBRATION
+                .clustering
+                .dense_context_merge_threshold,
+            0.45
         );
         assert_eq!(REDIMNET_CALIBRATION.streaming.match_similarity, 0.60);
         assert_eq!(
@@ -149,6 +208,10 @@ mod tests {
                 .streaming
                 .strong_existing_match_similarity,
             0.70
+        );
+        assert_eq!(
+            REDIMNET_CALIBRATION.enrollment_default_match_similarity,
+            0.55
         );
         assert_ne!(
             REDIMNET_CALIBRATION.clustering.plain_merge_threshold,
@@ -159,6 +222,64 @@ mod tests {
             REDIMNET_CALIBRATION.streaming.match_similarity,
             WESPEAKER_CALIBRATION.streaming.match_similarity,
             "redimnet calibration must not be copied verbatim from wespeaker's tuned values"
+        );
+        assert_ne!(
+            REDIMNET_CALIBRATION.enrollment_default_match_similarity,
+            WESPEAKER_CALIBRATION.enrollment_default_match_similarity,
+            "redimnet calibration must not be copied verbatim from wespeaker's tuned values"
+        );
+    }
+
+    /// The clustering thresholds must stay internally consistent with the
+    /// measured 0.55 cosine main match threshold: `plain_merge_threshold` and
+    /// `dense_context_merge_threshold` are both `1 - 0.55` dissimilarity, and
+    /// the context-assisted threshold must loosen (not tighten) relative to
+    /// the plain one, matching WeSpeaker's own merge-threshold ordering.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn redimnet_clustering_thresholds_are_self_consistent_with_measured_main_threshold() {
+        const MEASURED_MAIN_MATCH_COSINE: f32 = 0.55;
+        let expected_dissimilarity = 1.0 - MEASURED_MAIN_MATCH_COSINE;
+        assert!(
+            (REDIMNET_CALIBRATION.clustering.plain_merge_threshold - expected_dissimilarity).abs()
+                < 1e-6
+        );
+        assert_eq!(
+            REDIMNET_CALIBRATION.clustering.plain_merge_threshold,
+            REDIMNET_CALIBRATION
+                .clustering
+                .dense_context_merge_threshold,
+            "dense-context merge threshold should match the plain threshold, as in WeSpeaker's profile"
+        );
+        assert!(
+            REDIMNET_CALIBRATION.clustering.context_auto_merge_threshold
+                > REDIMNET_CALIBRATION.clustering.plain_merge_threshold,
+            "context-assisted merging must stay looser than the acoustic-only floor"
+        );
+        assert!(
+            (REDIMNET_CALIBRATION.enrollment_default_match_similarity - MEASURED_MAIN_MATCH_COSINE)
+                .abs()
+                < 1e-6,
+            "enrollment default should track the measured main match threshold"
+        );
+    }
+
+    /// The per-embedder enrollment default must actually diverge: WeSpeaker
+    /// keeps its historical 0.5 default (`enrollment::DEFAULT_MATCH_SIMILARITY`)
+    /// while ReDimNet2 uses the measured 0.55 floor.
+    #[test]
+    fn enrollment_default_match_similarity_is_embedder_specific() {
+        assert_eq!(
+            WESPEAKER_CALIBRATION.enrollment_default_match_similarity,
+            0.5
+        );
+        assert_eq!(
+            REDIMNET_CALIBRATION.enrollment_default_match_similarity,
+            0.55
+        );
+        assert_ne!(
+            WESPEAKER_CALIBRATION.enrollment_default_match_similarity,
+            REDIMNET_CALIBRATION.enrollment_default_match_similarity
         );
     }
 
@@ -225,6 +346,10 @@ mod tests {
         assert_eq!(
             WESPEAKER_CALIBRATION.streaming.speaker_change_max_cosine,
             0.42
+        );
+        assert_eq!(
+            WESPEAKER_CALIBRATION.enrollment_default_match_similarity,
+            0.5
         );
     }
 }
