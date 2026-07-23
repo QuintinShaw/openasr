@@ -248,11 +248,16 @@ fn plan_fixed_slices(
     // span with no extra margin, e.g. `mimo_asr`, it clamps to *exactly* the
     // executor's hard per-chunk cap). Merging a short tail into the previous
     // chunk below must never be allowed to push that chunk past this ceiling
-    // -- doing so silently produced an over-cap slice that the mimo-asr /
-    // firered-llm executors then rejected with a fail-closed 400 (a 30.2s
-    // clip: one 30.0s chunk plus a 0.2s tail below `min_chunk_seconds`
-    // merged straight into the 30.0s chunk, exceeding mimo-asr's 30.0s cap
-    // with zero headroom).
+    // -- doing so silently produced an over-cap slice that mimo-asr's
+    // executor then rejected with a fail-closed 400 (a 30.2s clip: one 30.0s
+    // chunk plus a 0.2s tail below `min_chunk_seconds` merged straight into
+    // the 30.0s chunk, exceeding mimo-asr's 30.0s cap with zero headroom).
+    // firered-llm shares this same encoder-attention-span clamp (also 30.0s)
+    // but keeps 10s of margin below its own executor's separate 40.0s hard
+    // cap, so this exact 30.2s shape would not have tripped its fail-closed
+    // check -- it is bound here anyway because the ceiling this clamps to is
+    // the encoder-memory guidance span, not just "whatever the executor
+    // happens to still tolerate".
     let max_chunk_samples =
         seconds_to_samples(options.max_chunk_seconds, sample_rate_hz).max(chunk_samples);
     let step = chunk_samples.saturating_sub(overlap_samples).max(1);
