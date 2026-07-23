@@ -2772,9 +2772,11 @@ impl LowSpeedWindow {
 }
 
 /// Per-segment counterpart to [`LowSpeedWindow`], used by the concurrent
-/// chunked-download path (see `SEGMENT_LOW_SPEED_TIMEOUT` /
-/// `SEGMENT_LOW_SPEED_MIN_BYTES` for why it's a stricter floor). Deliberately
-/// a separate, smaller type rather than a generalization of `LowSpeedWindow`:
+/// chunked-download path (see `SEGMENT_LOW_SPEED_TIMEOUT`,
+/// `SEGMENT_LOW_SPEED_RELATIVE_RATIO`, and
+/// `SEGMENT_LOW_SPEED_ABSOLUTE_FLOOR_BYTES` for the relative-judgment
+/// rationale). Deliberately a separate, smaller type rather than a
+/// generalization of `LowSpeedWindow`:
 /// the whole-file guard's job is "fail the pull with a typed error", while
 /// this one's job is "tell the caller whether to give up on *this attempt*"
 /// -- the caller (`write_segment_body`) then decides whether that means
