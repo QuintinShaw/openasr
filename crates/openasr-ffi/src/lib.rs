@@ -344,14 +344,6 @@ pub unsafe extern "C" fn openasr_model_close(model: *mut OpenAsrModel) {
     });
 }
 
-/// Transcribes one whole in-memory 16 kHz mono PCM buffer and writes a result
-/// through `out_result`. `pcm_len_samples` counts samples (not bytes/frames).
-/// Only mono 16 kHz input is accepted in v1 -- resampling/downmixing is the
-/// caller's responsibility; anything else fails closed with
-/// [`OpenAsrStatus::InvalidArgument`] rather than silently reinterpreting the
-/// buffer. Read the result with the `openasr_result_*` accessors, then free it
-/// with [`openasr_result_free`].
-///
 /// Builds the [`TranscriptionRequest`] for one `openasr_transcribe_pcm` call.
 /// Split out from that function so the `RequestSource` wiring is
 /// unit-testable without a real model pack (this never touches the
@@ -366,6 +358,14 @@ fn ffi_transcription_request(staging_path: PathBuf, pack_path: PathBuf) -> Trans
         .with_word_timestamps(false)
 }
 
+/// Transcribes one whole in-memory 16 kHz mono PCM buffer and writes a result
+/// through `out_result`. `pcm_len_samples` counts samples (not bytes/frames).
+/// Only mono 16 kHz input is accepted in v1 -- resampling/downmixing is the
+/// caller's responsibility; anything else fails closed with
+/// [`OpenAsrStatus::InvalidArgument`] rather than silently reinterpreting the
+/// buffer. Read the result with the `openasr_result_*` accessors, then free it
+/// with [`openasr_result_free`].
+///
 /// # Safety
 /// `model` must be a live handle from [`openasr_model_open`]. `pcm` must
 /// point to at least `pcm_len_samples` samples of the given `format` (4 bytes
