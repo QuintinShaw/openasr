@@ -5,8 +5,13 @@
 //! vector-quantization codebook in this checkpoint), and a Qwen3-0.6B
 //! decoder. `[S01]`-style speaker labels and inline timestamps are ordinary
 //! BPE tokens the Qwen3 decoder emits freely as part of its transcript text;
-//! this family does not parse or structure them (that is a product-layer
-//! concern, out of scope for the core engine).
+//! [`speaker_segments`] parses that markup, fail-closed, into the shared
+//! `Segment` speaker-turn shape so `verbose_json`/SRT/VTT get real per-speaker
+//! segments (see its module doc for the grammar and the fail-closed policy).
+//! The executor's top-level `Transcription::text` stays the raw, tag-included
+//! decode -- unlike cohere, whose diarization markers are non-printing
+//! special tokens, moss-td's tags are literal characters, so stripping them
+//! from the plain/CLI text output would rewrite what the model actually said.
 //!
 //! Stage status: the checkpoint-to-GGUF importer ([`package_import`]) and the
 //! full ggml execution graph (Whisper encoder reuse via [`encoder_graph`],
@@ -32,6 +37,7 @@ mod llm_decoder;
 pub(crate) mod package_import;
 mod prompt_embedding;
 pub(crate) mod runtime_contract;
+mod speaker_segments;
 pub(crate) mod tensor_names;
 mod tokenizer;
 

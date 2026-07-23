@@ -413,8 +413,19 @@ impl MossTdGgmlExecutor {
         })?;
 
         let text = result.text.trim().to_string();
-        let transcription = Transcription {
-            segments: vec![Segment {
+        // Parse the model's own inline `[start][end][SNN]` markup into real
+        // speaker segments (see `speaker_segments`'s module doc for the
+        // grammar and fail-closed policy). Both a parse error and a
+        // well-formed-but-empty result (no speaker tags at all) degrade the
+        // same way: keep the single, speaker-less segment carrying the
+        // untouched raw text rather than fabricate structure this decode did
+        // not actually assert. `text` itself is never rewritten either way.
+        let segments = match super::speaker_segments::parse_moss_td_speaker_segments(
+            &text,
+            audio_duration_seconds,
+        ) {
+            Ok(segments) if !segments.is_empty() => segments,
+            _ => vec![Segment {
                 start: 0.0,
                 end: audio_duration_seconds.max(0.0),
                 text: text.clone(),
@@ -423,6 +434,9 @@ impl MossTdGgmlExecutor {
                 speaker_profile_id: None,
                 words: Vec::new(),
             }],
+        };
+        let transcription = Transcription {
+            segments,
             text,
             longform: None,
             language: None,
@@ -504,6 +518,7 @@ mod tests {
     use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudio};
     use crate::models::ggml_family_registry::moss_transcribe_diarize_runtime_descriptor_v1;
 
+    use super::super::speaker_segments::parse_moss_td_speaker_segments;
     use super::*;
 
     /// Real converted dev pack (fp16), NOT committed -- same dev-only-artifact
@@ -606,6 +621,43 @@ mod tests {
         let result = executor.execute(&request).expect("moss-td transcribe");
         let elapsed = started_at.elapsed();
         Some((result.transcription.text, elapsed, audio_duration_seconds))
+    }
+
+    /// Same dev-pack e2e path as [`transcribe_with_dev_pack`], but returns the
+    /// full [`Segment`] list instead of only the flat text -- used to check
+    /// that the real decode's speaker/time-anchor markup round-trips through
+    /// `speaker_segments::parse_moss_td_speaker_segments` (as wired into the
+    /// executor) into the same structure the golden `[Sxx]`/`[t]` tags encode.
+    fn transcribe_with_dev_pack_segments(wav_path: PathBuf) -> Option<Vec<Segment>> {
+        let pack_path = dev_pack_path();
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return None;
+        }
+        if !wav_path.exists() {
+            eprintln!("skipping: {} not present", wav_path.display());
+            return None;
+        }
+        let _backend_override_guard = install_request_backend_override(
+            GgmlAsrBackendPreference::CpuOnly.request_backend_override(),
+        );
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            wav_path,
+            "moss-td e2e test",
+            "moss-td e2e test",
+        )
+        .expect("load wav fixture");
+        let request = GgmlAsrExecutionRequest {
+            runtime_source_path: pack_path,
+            runtime_source_preflight: None,
+            selected_family: moss_transcribe_diarize_runtime_descriptor_v1(),
+            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
+            request_options: Default::default(),
+            backend_preference: GgmlAsrBackendPreference::CpuOnly,
+        };
+        let executor = MossTdGgmlExecutor;
+        let result = executor.execute(&request).expect("moss-td transcribe");
+        Some(result.transcription.segments)
     }
 
     /// Splits a moss-td transcript into (a) its "skeleton" -- every literal
@@ -722,6 +774,103 @@ mod tests {
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
         assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);
+    }
+
+    #[test]
+    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
+                and tmp/moss-td/samples/*.wav; CPU-only (Metal path has known defects)"]
+    fn golden_diff_end_to_end_transcribe_jfk_wav_speaker_segments() {
+        let Some(segments) = transcribe_with_dev_pack_segments(dev_sample_path("jfk.wav")) else {
+            return;
+        };
+        // Same three speaker turns the flat-text golden's `[Sxx]`/`[t]` tags
+        // encode (see `golden_diff_end_to_end_transcribe_jfk_wav` and
+        // `GOLDEN_JFK_TEXT`) -- this asserts the executor's real dev-pack
+        // decode round-trips through `speaker_segments` into that same
+        // structure, not just that the flat string matches.
+        let expected = parse_moss_td_speaker_segments(GOLDEN_JFK_TEXT, 10.59)
+            .expect("golden text itself must parse");
+        assert_eq!(segments, expected);
+    }
+
+    #[test]
+    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
+                and tmp/moss-td/samples/*.wav; CPU-only (Metal path has known defects)"]
+    fn golden_diff_end_to_end_transcribe_en_zh_mixed_wav_speaker_segments() {
+        let Some(segments) = transcribe_with_dev_pack_segments(dev_sample_path("en_zh_mixed.wav"))
+        else {
+            return;
+        };
+        let expected = parse_moss_td_speaker_segments(GOLDEN_EN_ZH_MIXED_TEXT, 12.88)
+            .expect("golden text itself must parse");
+        assert_eq!(segments, expected);
+    }
+
+    /// Snapshot of the shape `speaker_segments` produces for the two golden
+    /// transcripts pinned above, independent of any dev-pack decode -- pins
+    /// the exact segment count/speaker-label/start/end/text tuple this PR's
+    /// parser derives from the reference HF text, so a future edit to the
+    /// grammar (e.g. changing how a back-to-back closing/opening anchor pair
+    /// is split) shows up as a diff here even without the private pack.
+    #[test]
+    fn snapshot_jfk_and_en_zh_mixed_golden_speaker_segments() {
+        let jfk = parse_moss_td_speaker_segments(GOLDEN_JFK_TEXT, 10.59).expect("jfk parses");
+        let jfk_snapshot: Vec<(&str, f32, f32, &str)> = jfk
+            .iter()
+            .map(|segment| {
+                (
+                    segment.speaker.as_deref().unwrap_or(""),
+                    segment.start,
+                    segment.end,
+                    segment.text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            jfk_snapshot,
+            vec![
+                ("SPEAKER_01", 0.28, 2.32, "And so, my fellow Americans,"),
+                (
+                    "SPEAKER_01",
+                    3.22,
+                    7.71,
+                    "ask not what your country can do for you,"
+                ),
+                (
+                    "SPEAKER_01",
+                    8.12,
+                    10.59,
+                    "ask what you can do for your country."
+                ),
+            ]
+        );
+
+        let en_zh_mixed =
+            parse_moss_td_speaker_segments(GOLDEN_EN_ZH_MIXED_TEXT, 12.88).expect("parses");
+        let en_zh_mixed_snapshot: Vec<(&str, f32, f32, &str)> = en_zh_mixed
+            .iter()
+            .map(|segment| {
+                (
+                    segment.speaker.as_deref().unwrap_or(""),
+                    segment.start,
+                    segment.end,
+                    segment.text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            en_zh_mixed_snapshot,
+            vec![
+                ("SPEAKER_01", 0.27, 2.32, "And so, my fellow Americans,"),
+                ("SPEAKER_01", 3.21, 4.44, "ask not."),
+                (
+                    "SPEAKER_02",
+                    4.96,
+                    12.88,
+                    "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去伊加新"
+                ),
+            ]
+        );
     }
 
     /// Time anchors are floating-point-derived (see
