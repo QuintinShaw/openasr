@@ -547,6 +547,25 @@ mod tests {
     );
 
     fn transcribe_with_dev_pack(wav_path: PathBuf) -> Option<(String, std::time::Duration, f32)> {
+        // Force CPU. This family's Metal path has two open defects (encoder
+        // numeric divergence -> empty-shell output, and a per-step wired-memory
+        // blow-up -- see the `arch` descriptor's `auto_gpu_policy` note), so the
+        // reference decode is CPU-only.
+        transcribe_with_dev_pack_backend(wav_path, GgmlAsrBackendPreference::CpuOnly)
+    }
+
+    /// Same dev-pack e2e path as [`transcribe_with_dev_pack`], but lets the
+    /// caller pick the backend preference -- used by the `_accelerated`
+    /// variants below to drive an explicit `execution_target=accelerated`
+    /// request end to end (encoder AND decode), the same override an
+    /// `Accelerated` request installs in production (see
+    /// `GgmlAsrBackendPreference::request_backend_override`'s doc and
+    /// `graph_config.rs`'s note that an explicit request always wins over
+    /// the family's `ExceptMetal` Auto gate).
+    fn transcribe_with_dev_pack_backend(
+        wav_path: PathBuf,
+        backend_preference: GgmlAsrBackendPreference,
+    ) -> Option<(String, std::time::Duration, f32)> {
         let pack_path = dev_pack_path();
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
@@ -556,17 +575,12 @@ mod tests {
             eprintln!("skipping: {} not present", wav_path.display());
             return None;
         }
-        // Force CPU. This family's Metal path has two open defects (encoder
-        // numeric divergence -> empty-shell output, and a per-step wired-memory
-        // blow-up -- see the `arch` descriptor's `auto_gpu_policy` note), so the
-        // reference decode is CPU-only. `backend_preference` alone is inert on a
-        // direct `execute()` (it is only consulted via the thread-local override
-        // -- see `GgmlAsrExecutionRequest::backend_preference`'s doc), so install
-        // the override explicitly rather than relying on the ambient backend.
-        let backend_preference = GgmlAsrBackendPreference::CpuOnly;
+        // `backend_preference` alone is inert on a direct `execute()` (it is
+        // only consulted via the thread-local override -- see
+        // `GgmlAsrExecutionRequest::backend_preference`'s doc), so install the
+        // override explicitly rather than relying on the ambient backend.
         // Hold the RAII guard for the whole decode: it restores the previous
-        // thread-local override on drop at the end of this function, after
-        // `execute()` below has run entirely on CPU.
+        // thread-local override on drop at the end of this function.
         let _backend_override_guard =
             install_request_backend_override(backend_preference.request_backend_override());
 
@@ -621,6 +635,85 @@ mod tests {
         };
         eprintln!(
             "moss-td e2e [en_zh_mixed.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
+            elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
+        );
+        assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);
+    }
+
+    // Explicit `execution_target=accelerated` e2e smoke: an explicit
+    // `Accelerated` request installs the same thread-local override
+    // `graph_config.rs` documents as always winning over this family's
+    // `ExceptMetal` Auto gate, so the encoder graph builds on Metal instead
+    // of being downgraded to CPU (the gate only ever pins what *Auto*
+    // resolves to -- see `encoder_graph_config_honors_explicit_accelerated_
+    // request` in `graph_config.rs`). Decode already runs on Metal under
+    // Auto today (the shared qwen decode path is `AllBackends`, and #180
+    // fixed its reuse-path graph so Metal decode reuses its graph), so this
+    // is the full accelerated-request path: Metal encoder + Metal decode,
+    // text-diffed against the same CPU golden the two tests above pin.
+    //
+    // jfk.wav: byte-for-byte identical to the CPU golden (see below).
+    // en_zh_mixed.wav does NOT come out byte-identical -- see that test's
+    // own comment for the measured divergence; do not read this comment as
+    // claiming both clips match.
+    #[test]
+    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
+                and tmp/moss-td/samples/*.wav; drives an explicit accelerated request \
+                (Metal encoder + Metal decode) and needs a Metal device"]
+    fn golden_diff_end_to_end_transcribe_jfk_wav_accelerated() {
+        let Some((text, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
+            dev_sample_path("jfk.wav"),
+            GgmlAsrBackendPreference::Accelerated,
+        ) else {
+            return;
+        };
+        eprintln!(
+            "moss-td e2e accelerated [jfk.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
+            elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
+        );
+        assert_eq!(text, GOLDEN_JFK_TEXT);
+    }
+
+    // KNOWN DIVERGENCE (measured, not yet resolved): unlike jfk.wav above,
+    // this clip's accelerated (Metal encoder + Metal decode) transcript is
+    // NOT byte-identical to the CPU golden. Measured output:
+    //
+    //   "...Americans,[2.34][3.21][S01]ask not....[4.44][4.94][S02]..."
+    //
+    // vs. `GOLDEN_EN_ZH_MIXED_TEXT`:
+    //
+    //   "...Americans,[2.32][3.21][S01]ask not....[4.44][4.96][S02]..."
+    //
+    // The only differing characters are two digits inside two numeric
+    // time-anchor tokens ([2.34] vs [2.32], [4.94] vs [4.96], both a 0.02s
+    // shift) -- every word, punctuation mark, speaker label, and the other
+    // two anchors are identical. Notably, [2.34]/[4.94] are the same values
+    // the top-of-file `golden_diff_end_to_end_transcribe_en_zh_mixed_wav`
+    // comment records for the *HF fp32 reference* (before its own
+    // documented 0.02s CPU f16+flash shift to [2.32]/[4.96]) -- i.e. the
+    // accelerated path's anchors land on the fp32 reference's values, not
+    // the CPU-forced golden's. This looks like the same order-of-magnitude
+    // f16/flash-attention numeric sensitivity already documented for this
+    // family, now manifesting as a direction-flipped rounding at a
+    // boundary-adjacent frame under Metal specifically, rather than a
+    // structural/word-level defect. Left failing (not force-passed, not
+    // reconciled into a second golden) pending a maintainer decision --
+    // see the PR this test shipped in.
+    #[test]
+    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
+                and tmp/moss-td/samples/*.wav; drives an explicit accelerated request \
+                (Metal encoder + Metal decode) and needs a Metal device -- currently \
+                FAILS: two time-anchor digits differ from the CPU golden by 0.02s, see \
+                the comment above for the measured diff"]
+    fn golden_diff_end_to_end_transcribe_en_zh_mixed_wav_accelerated() {
+        let Some((text, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
+            dev_sample_path("en_zh_mixed.wav"),
+            GgmlAsrBackendPreference::Accelerated,
+        ) else {
+            return;
+        };
+        eprintln!(
+            "moss-td e2e accelerated [en_zh_mixed.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
         assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);

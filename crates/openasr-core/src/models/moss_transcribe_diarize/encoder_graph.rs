@@ -1264,8 +1264,49 @@ mod parity_tests {
     /// The actual regression gate this defect's fix must satisfy (see
     /// `arch/mod.rs`'s `ExceptMetal` doc comment): once fixed, flip
     /// `auto_gpu_policy` back to `AllBackends` and un-ignore this test.
+    ///
+    /// Status: the Metal leg is now reachable (previously it silently
+    /// downgraded to CPU under the family's own `ExceptMetal` gate even when
+    /// driven via `BACKEND_ENV`, so it never actually ran on Metal -- fixed
+    /// by installing an explicit `Accelerated` request override, see this
+    /// module's `run_tapped_encoder`) and currently PASSES on this host: on
+    /// `fixtures/jfk.wav`'s 30s chunk, `encoder_out` cosine = 0.999542
+    /// (threshold 0.999); the per-layer breakdown from
+    /// `dump_cpu_vs_metal_layer_cosine_table` shows layer 7 onward carrying
+    /// a large but cosine-preserving `max_abs_diff` (a few late-layer
+    /// activations grow to a magnitude in the single digits, then a shared
+    /// scale factor keeps direction -- hence cosine, not max-abs-diff, is
+    /// the pass/fail metric here) and layer 23 is the sharpest single-layer
+    /// drop (cosine 0.999128) before recovering slightly at `encoder_out`.
+    ///
+    /// This does NOT flip `auto_gpu_policy` to `AllBackends` on its own --
+    /// that is a separate, explicitly user-gated decision (this pass is one
+    /// data point: one host, one 30s clip; the `en_zh_mixed`-clip e2e smoke
+    /// in `executor.rs` found a small but real divergence at the decoded-
+    /// text level on a different clip, so do not read this test alone as
+    /// "Metal is safe to default to").
+    ///
+    /// Kept `#[ignore]` regardless of the above: it needs a private,
+    /// uncommitted dev-only `.oasr` pack (`real_pack_path` panics without
+    /// `OPENASR_MOSS_TD_ENCODER_REAL_PACK` set) and a real Metal device,
+    /// neither of which CI has -- there is no small synthetic fixture this
+    /// could run against instead (the encoder graph needs real converted
+    /// checkpoint weights, not a hand-built tensor). Run locally with:
+    ///
+    /// ```text
+    /// OPENASR_MOSS_TD_ENCODER_REAL_PACK=/path/to/moss-transcribe-diarize-fp16.oasr \
+    ///   cargo test -p openasr-core --lib \
+    ///   moss_transcribe_diarize::encoder_graph::parity_tests::metal_encoder_matches_cpu_reference \
+    ///   -- --ignored --nocapture
+    /// ```
+    ///
+    /// Add `OPENASR_MOSS_TD_ENCODER_REAL_WAV=/path/to/clip.wav` (and
+    /// optionally `OPENASR_MOSS_TD_ENCODER_CHUNK_OFFSET_SECS=<secs>`) to
+    /// retest against a different clip or a later 30s window of a long one.
     #[test]
-    #[ignore = "manual real-pack Metal harness: set OPENASR_MOSS_TD_ENCODER_REAL_PACK to the real moss-transcribe-diarize .oasr pack; requires a Metal device -- currently expected to FAIL until the Metal encoder divergence defect is fixed"]
+    #[ignore = "requires a private dev-only moss-transcribe-diarize .oasr pack via \
+                OPENASR_MOSS_TD_ENCODER_REAL_PACK and a real Metal device -- see the doc \
+                comment above for current pass/fail status and the local run command"]
     fn metal_encoder_matches_cpu_reference() {
         let cpu = run_tapped_encoder(GgmlCpuGraphBackend::Cpu);
         let metal = run_tapped_encoder(GgmlCpuGraphBackend::Metal);
