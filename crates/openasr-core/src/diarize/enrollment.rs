@@ -22,7 +22,12 @@ use super::embed::{EmbedError, SpeakerEmbedder, SpeakerEmbedderIdentity, shared_
 /// CLI. The REST API accepts any non-empty display name.
 pub const DEFAULT_ENROLLED_NAME: &str = "SPEAKER_ME";
 /// Default cosine-similarity floor for matching a diarized speaker to a stored
-/// voice-match profile.
+/// voice-match profile, in the legacy WeSpeaker cosine space. Kept as the
+/// WeSpeaker-specific constant it always was; the actual default applied at
+/// enrollment time is per-embedder (see
+/// `SpeakerCalibrationProfile::enrollment_default_match_similarity` and
+/// `create_profile_from_samples_with_embedder_and_seconds`), since ReDimNet2
+/// and WeSpeaker cosine spaces are not comparable.
 pub const DEFAULT_MATCH_SIMILARITY: f32 = 0.5;
 /// Version of the on-disk multi-profile voiceprint store.
 pub const VOICEPRINT_STORE_VERSION: u32 = 1;
@@ -511,8 +516,9 @@ fn create_profile_from_samples_with_embedder_and_seconds(
     identity: &SpeakerEmbedderIdentity,
 ) -> Result<SpeakerProfile, SpeakerEnrollmentError> {
     let name = normalize_profile_name(name.into())?;
-    let match_similarity =
-        validate_match_similarity(match_similarity.unwrap_or(DEFAULT_MATCH_SIMILARITY))?;
+    let match_similarity = validate_match_similarity(
+        match_similarity.unwrap_or_else(|| default_match_similarity_for(embedder)),
+    )?;
     let embedding = embedding_from_enrollment_audio(embedder, samples)?;
     Ok(profile_from_embedding(
         name,
@@ -692,6 +698,17 @@ fn validate_profile_id(id: &str) -> Result<(), VoiceprintStoreError> {
     }
 }
 
+/// The cosine-similarity floor applied to a newly enrolled `SpeakerProfile`
+/// when the caller does not supply an explicit `--match-similarity` override.
+/// Sourced from the active embedder's own calibration profile so ReDimNet2
+/// and WeSpeaker enrollments never share a threshold across their
+/// (non-comparable) cosine spaces.
+fn default_match_similarity_for(embedder: &dyn SpeakerEmbedder) -> f32 {
+    embedder
+        .calibration_profile()
+        .enrollment_default_match_similarity
+}
+
 fn validate_match_similarity(value: f32) -> Result<f32, VoiceprintStoreError> {
     if (0.0..=1.0).contains(&value) {
         Ok(value)
@@ -799,6 +816,46 @@ mod tests {
             embedding_dim: dim,
             pack_fingerprint: fingerprint.to_string(),
         }
+    }
+
+    /// Trait-default calibration (WeSpeaker), standing in for the real
+    /// `WeSpeakerEmbedder` without needing loaded weights.
+    struct StubWeSpeakerEmbedder;
+    impl SpeakerEmbedder for StubWeSpeakerEmbedder {
+        fn embed(&self, _samples: &[f32], _sr: u32) -> Result<SpeakerEmbedding, EmbedError> {
+            unimplemented!("not needed for calibration-default tests")
+        }
+        fn embedding_dim(&self) -> usize {
+            256
+        }
+    }
+
+    /// Overrides `calibration_profile` the same way `RedimNet2Embedder` does,
+    /// standing in for it without needing loaded weights.
+    struct StubRedimNetEmbedder;
+    impl SpeakerEmbedder for StubRedimNetEmbedder {
+        fn embed(&self, _samples: &[f32], _sr: u32) -> Result<SpeakerEmbedding, EmbedError> {
+            unimplemented!("not needed for calibration-default tests")
+        }
+        fn embedding_dim(&self) -> usize {
+            192
+        }
+        fn calibration_profile(&self) -> crate::diarize::calibration::SpeakerCalibrationProfile {
+            crate::diarize::calibration::REDIMNET_CALIBRATION
+        }
+    }
+
+    #[test]
+    fn default_match_similarity_is_embedder_specific() {
+        assert_eq!(
+            default_match_similarity_for(&StubWeSpeakerEmbedder),
+            DEFAULT_MATCH_SIMILARITY
+        );
+        assert_eq!(default_match_similarity_for(&StubRedimNetEmbedder), 0.55);
+        assert_ne!(
+            default_match_similarity_for(&StubWeSpeakerEmbedder),
+            default_match_similarity_for(&StubRedimNetEmbedder)
+        );
     }
 
     fn profile(id: &str, dim: usize, fingerprint: &str, embedding: Vec<f32>) -> SpeakerProfile {
