@@ -334,6 +334,28 @@ impl SpeakerProfileMatcher {
         self.best_match_with_policy(embedding, 0.0, 0.0, 0.0)
     }
 
+    /// Batch voice-match with the second-stage top1-vs-top2 confidence gate:
+    /// even a profile that clears its own `match_similarity` floor is not
+    /// returned unless it also leads every other compatible profile's
+    /// similarity by at least `margin`. `margin` should come from the active
+    /// embedder's `SpeakerCalibrationProfile::enrollment_match_margin` so the
+    /// gate is calibrated per cosine space (see that field's doc comment for
+    /// why WeSpeaker and ReDimNet2 use different values).
+    ///
+    /// A library with only one compatible profile has no runner-up to measure
+    /// a margin against, so this always falls through to the plain
+    /// `match_similarity` gate in that case: the margin exists to stop a
+    /// "which registered speaker is this" mix-up between two-or-more similar
+    /// voices, a risk that does not exist with a single candidate, and the
+    /// primary threshold has already done the acceptance work.
+    pub fn best_match_with_margin(
+        &self,
+        embedding: &SpeakerEmbedding,
+        margin: f32,
+    ) -> Option<SpeakerProfileMatch> {
+        self.best_match_with_policy(embedding, 0.0, margin, 0.0)
+    }
+
     /// A conservative realtime anchor match. The per-profile threshold remains
     /// the user-visible match floor, but streaming identity anchoring needs a
     /// higher floor plus a runner-up margin before it creates/reuses a
@@ -1075,6 +1097,115 @@ mod tests {
                 .strong_unambiguous_match_with_tolerance(&below_tolerance, 0.85, 0.08, 0.01)
                 .is_none(),
             "tolerance is bounded and does not lower the anchor floor broadly"
+        );
+    }
+
+    /// Two compatible profiles with only a 0.1 top1-vs-top2 margin: both clear
+    /// the profile's own `match_similarity` floor (0.5), but the ReDimNet2
+    /// margin gate (0.15, see `REDIMNET_CALIBRATION::enrollment_match_margin`)
+    /// requires more separation before a name is confidently attached.
+    #[test]
+    fn batch_match_with_margin_rejects_top1_when_margin_is_insufficient() {
+        let matcher = SpeakerProfileMatcher::from_profiles(vec![
+            profile("vp_aaaaaaaaaaaaaaaa", 2, "sha256:active", vec![1.0, 0.0]),
+            profile(
+                "vp_bbbbbbbbbbbbbbbb",
+                2,
+                "sha256:active",
+                vec![0.9, 0.435_889_9],
+            ),
+        ]);
+        let embedding = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
+
+        assert!(
+            matcher.best_match(&embedding).is_some(),
+            "the plain match policy (margin = 0.0) still honors the profile threshold"
+        );
+        assert!(
+            matcher
+                .best_match_with_margin(
+                    &embedding,
+                    crate::diarize::calibration::REDIMNET_CALIBRATION.enrollment_match_margin,
+                )
+                .is_none(),
+            "a 0.1 margin does not clear the calibrated 0.15 ReDimNet2 confidence gate"
+        );
+    }
+
+    /// Same shape as the rejection case above, but with the runner-up far
+    /// enough behind (0.3 margin) to clear the calibrated gate.
+    #[test]
+    fn batch_match_with_margin_accepts_top1_when_margin_is_sufficient() {
+        let matcher = SpeakerProfileMatcher::from_profiles(vec![
+            profile("vp_aaaaaaaaaaaaaaaa", 2, "sha256:active", vec![1.0, 0.0]),
+            profile(
+                "vp_bbbbbbbbbbbbbbbb",
+                2,
+                "sha256:active",
+                vec![0.7, 0.714_142_8],
+            ),
+        ]);
+        let embedding = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
+
+        let matched = matcher
+            .best_match_with_margin(
+                &embedding,
+                crate::diarize::calibration::REDIMNET_CALIBRATION.enrollment_match_margin,
+            )
+            .expect("a 0.3 margin clears the calibrated 0.15 gate");
+        assert_eq!(matched.profile_id, "vp_aaaaaaaaaaaaaaaa");
+    }
+
+    /// A library with a single compatible profile has no runner-up to measure
+    /// a margin against, so the margin gate must not block it -- the margin
+    /// exists to disambiguate between two-or-more similar registered voices,
+    /// a risk that cannot arise with one candidate.
+    #[test]
+    fn batch_match_with_margin_auto_passes_a_single_candidate_library() {
+        let matcher = SpeakerProfileMatcher::from_profiles(vec![profile(
+            "vp_aaaaaaaaaaaaaaaa",
+            2,
+            "sha256:active",
+            vec![1.0, 0.0],
+        )]);
+        let embedding = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
+
+        let matched = matcher
+            .best_match_with_margin(
+                &embedding,
+                crate::diarize::calibration::REDIMNET_CALIBRATION.enrollment_match_margin,
+            )
+            .expect("a single compatible profile has no runner-up, so the margin gate never fires");
+        assert_eq!(matched.profile_id, "vp_aaaaaaaaaaaaaaaa");
+    }
+
+    /// Regression pin: WeSpeaker's `enrollment_match_margin` is 0.0 (the
+    /// batch matcher's margin gate was hardcoded to 0.0 -- effectively off --
+    /// before this field existed), so wiring the margin gate through
+    /// `best_match_with_margin` must not change WeSpeaker's batch match
+    /// behavior at all versus the pre-existing `best_match`.
+    #[test]
+    fn wespeaker_batch_match_behavior_is_unchanged_by_margin_gate() {
+        assert_eq!(
+            crate::diarize::calibration::WESPEAKER_CALIBRATION.enrollment_match_margin,
+            0.0
+        );
+
+        let matcher = SpeakerProfileMatcher::from_profiles(vec![
+            profile("vp_aaaaaaaaaaaaaaaa", 2, "sha256:active", vec![1.0, 0.0]),
+            profile("vp_bbbbbbbbbbbbbbbb", 2, "sha256:active", vec![0.96, 0.28]),
+        ]);
+        let embedding = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
+
+        let before = matcher.best_match(&embedding);
+        let after = matcher.best_match_with_margin(
+            &embedding,
+            crate::diarize::calibration::WESPEAKER_CALIBRATION.enrollment_match_margin,
+        );
+        assert_eq!(before, after);
+        assert!(
+            after.is_some(),
+            "wespeaker's 0.0 margin must not reject a near-tied top1"
         );
     }
 

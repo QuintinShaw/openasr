@@ -1710,6 +1710,7 @@ fn compute_speaker_attribution(
         }
     }
     let matcher = crate::diarize::enrollment::load_compatible_profile_matcher_for_active_embedder();
+    let match_margin = embedder.calibration_profile().enrollment_match_margin;
     let identities: BTreeMap<
         crate::diarize::contract::SpeakerId,
         crate::diarize::enrollment::SpeakerDisplayAssignment,
@@ -1717,15 +1718,17 @@ fn compute_speaker_attribution(
         .centroids
         .iter()
         .filter_map(|(speaker_id, embedding)| {
-            matcher.best_match(embedding).map(|profile_match| {
-                (
-                    *speaker_id,
-                    crate::diarize::enrollment::SpeakerDisplayAssignment::from_match(
+            matcher
+                .best_match_with_margin(embedding, match_margin)
+                .map(|profile_match| {
+                    (
                         *speaker_id,
-                        profile_match,
-                    ),
-                )
-            })
+                        crate::diarize::enrollment::SpeakerDisplayAssignment::from_match(
+                            *speaker_id,
+                            profile_match,
+                        ),
+                    )
+                })
         })
         .collect();
     if diarize_debug {
