@@ -748,9 +748,9 @@ fn view_last_token_state<'a>(
     hidden: usize,
     prefix_len: usize,
 ) -> Result<GgmlCpuTensor<'a>, FireRedDecoderError> {
-    let contiguous_state = graph
-        .cont(state)
-        .map_err(|source| map_err("last_token_cont", source))?;
+    // No `ggml_cont` needed: `state` is the output of the final affine
+    // layer_norm (an `ggml_add` of scale and bias), which is always a freshly
+    // allocated contiguous tensor, so `ggml_view_2d` can slice it directly.
     let row_stride = hidden
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or(FireRedDecoderError::ShapeOverflow)?;
@@ -759,7 +759,7 @@ fn view_last_token_state<'a>(
         .and_then(|index| index.checked_mul(row_stride))
         .ok_or(FireRedDecoderError::ShapeOverflow)?;
     graph
-        .view_2d(contiguous_state, hidden, 1, row_stride, offset)
+        .view_2d(state, hidden, 1, row_stride, offset)
         .map_err(|source| map_err("last_token_view", source))
 }
 
