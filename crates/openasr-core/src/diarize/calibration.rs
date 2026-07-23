@@ -87,9 +87,80 @@ pub(crate) const WESPEAKER_CALIBRATION: SpeakerCalibrationProfile = SpeakerCalib
     },
 };
 
+/// ReDimNet2-B6 calibration (192-dim cosine space), distinct from
+/// `WESPEAKER_CALIBRATION` -- the two embedders' cosine distributions are not
+/// comparable, so nothing here is copied from the WeSpeaker profile above.
+///
+/// TODO(voice-id-eval): every threshold below is a conservative placeholder,
+/// not yet measured against real enrollment data. A separate task is
+/// producing a LibriSpeech/AISHELL-4 same-speaker/cross-speaker cosine
+/// distribution to calibrate these for real; until that lands, values are
+/// picked to fail toward "no match" (stricter than a tuned profile would be)
+/// rather than risk false speaker merges.
+pub(crate) const REDIMNET_CALIBRATION: SpeakerCalibrationProfile = SpeakerCalibrationProfile {
+    clustering: ClusteringCalibrationProfile {
+        // TODO(voice-id-eval): placeholder, needs real calibration.
+        plain_merge_threshold: 0.50,
+        // TODO(voice-id-eval): placeholder, needs real calibration.
+        context_auto_merge_threshold: 0.75,
+        dense_context_min_embeddings: 30,
+        // TODO(voice-id-eval): placeholder, needs real calibration.
+        dense_context_merge_threshold: 0.50,
+        context_gap: Some(ContextGapCalibrationProfile {
+            min_gap: 0.05,
+            max_speakers: 4,
+            fallback_speakers: 3,
+        }),
+    },
+    streaming: StreamingCalibrationProfile {
+        // TODO(voice-id-eval): placeholder, needs real calibration.
+        match_similarity: 0.60,
+        // TODO(voice-id-eval): placeholder, needs real calibration.
+        strong_existing_match_similarity: 0.70,
+        // TODO(voice-id-eval): placeholder, needs real calibration.
+        relaxed_match_similarity: 0.40,
+        relaxed_match_margin: 0.20,
+        relaxed_reuse_max_weight: 3.0,
+        // TODO(voice-id-eval): placeholder, needs real calibration.
+        new_speaker_max_existing_similarity: 0.50,
+        // TODO(voice-id-eval): placeholder, needs real calibration.
+        profile_anchor_similarity: 0.80,
+        // TODO(voice-id-eval): placeholder, needs real calibration.
+        native_profile_anchor_similarity: 0.55,
+        // TODO(voice-id-eval): placeholder, needs real calibration.
+        speaker_change_max_cosine: 0.45,
+    },
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redimnet_calibration_profile_is_pinned_and_distinct_from_wespeaker() {
+        assert_eq!(REDIMNET_CALIBRATION.clustering.plain_merge_threshold, 0.50);
+        assert_eq!(
+            REDIMNET_CALIBRATION.clustering.context_auto_merge_threshold,
+            0.75
+        );
+        assert_eq!(REDIMNET_CALIBRATION.streaming.match_similarity, 0.60);
+        assert_eq!(
+            REDIMNET_CALIBRATION
+                .streaming
+                .strong_existing_match_similarity,
+            0.70
+        );
+        assert_ne!(
+            REDIMNET_CALIBRATION.clustering.plain_merge_threshold,
+            WESPEAKER_CALIBRATION.clustering.plain_merge_threshold,
+            "redimnet calibration must not be copied verbatim from wespeaker's tuned values"
+        );
+        assert_ne!(
+            REDIMNET_CALIBRATION.streaming.match_similarity,
+            WESPEAKER_CALIBRATION.streaming.match_similarity,
+            "redimnet calibration must not be copied verbatim from wespeaker's tuned values"
+        );
+    }
 
     #[test]
     fn wespeaker_calibration_profile_is_pinned() {

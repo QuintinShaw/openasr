@@ -69,6 +69,10 @@ credits the people who built the original.
 
 - pyannote segmentation — <https://huggingface.co/OpenASR/pyannote-segmentation-3.0>
 - WeSpeaker speaker embedder — <https://huggingface.co/OpenASR/wespeaker-voxceleb-resnet34-lm>
+- ReDimNet2-B6 speaker embedder (PalabraAI, MIT) --
+  <https://github.com/PalabraAI/redimnet2> (192-d ggml-graph embedder,
+  reimplemented from the upstream `b6-vb2+vox2+cnc2_v0-lm.pt` checkpoint;
+  OpenASR pack staged, not yet public).
 - FireRedVAD Stream-VAD (FireRedTeam, Apache-2.0) — the sole voice-activity
   detection engine, backing realtime endpointing, long-form speech slicing, and
   diarization — see [NOTICE](NOTICE).
