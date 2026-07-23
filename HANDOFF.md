@@ -1,103 +1,98 @@
-# ReDimNet2-B6 embedder -- stage-2 handoff
+# ReDimNet2-B6 embedder -- stage-3 handoff
 
-Branch `feat/redimnet2-b6-embedder`. Stage-1 assets (specs, golden `.npy`,
+Branch `feat/redimnet2-b6-embedder`. Stage-1/2 assets (specs, golden `.npy`,
 weights) live under `/Volumes/QuintinDocument/openasr-dev/tmp/redimnet2-spike/`.
 This handoff records exactly what is done and the precise remaining plan.
 **Delete this file before the PR is marked ready** (it is a working note).
 
-## Done this session (each step verified)
+## Done (backbone, this session -- each step golden-pinned, all green)
 
-- **Architecture defined**: `docs/design/redimnet2-b6-embedder.md` (5 decisions
-  + full upstream forward reference + backbone plan + risks).
-- **Converter**: `tooling/redimnet2/convert_redimnet2.py` (torch `.pt` -> GGUF
-  `.oasr`, standard ggml `ne` order, drops `spec.*` + `num_batches_tracked`,
-  per-tensor f32/f16/q8_0). Unit test `convert_redimnet2_test.py` -- **9 tests
-  green**. Real run: 739 tensors kept / 82 dropped -> 50 MB f32 pack at
-  `tmp/redimnet2-spike/redimnet2-b6-f32.oasr` (also usable as the backbone
-  parity fixture).
-- **Front end**: `crates/openasr-core/src/diarize/embed/redimnet/frontend.rs`
-  (TFMelBanks port, pure Rust). Parity vs `frontend_dump/*.npy` -- **green**:
-  kernels/mel-matrix ~1e-13 / exactly 0; preemph exactly 0; mel_linear mean
-  ~7e-6; CMN mean ~7e-7 (gates: preemph max<1e-4, mel mean<1e-3, cmn mean<1e-4).
-- **Structural constants**: `redimnet/config.rs` (per-stage dims, self-checked
-  against checkpoint shapes by a unit test -- green).
-- **Module wired**: `redimnet` added to `embed/mod.rs` (compiles; `#![allow(
-  dead_code)]` until the backbone consumes it). `cargo fmt` + `cargo clippy
-  --all-targets -D warnings` **clean**.
+- **Full backbone ggml graph** (`crates/openasr-core/src/diarize/embed/redimnet/
+  backbone.rs` + `ops.rs`): `stem -> stage0..5 -> fin_wght1d -> head -> fin_to2d
+  -> ASTP pool -> BatchNorm -> linear -> 192-d embedding`, built on the shared
+  `GgmlCpuGraphRunner`/`GgmlStaticTensorArena` (same pattern as
+  `models::dolphin::encoder_graph`). Loads the f32 `.oasr` pack via
+  `diarize::embed::weights::Weights::from_oasr`; weight tensor names read
+  verbatim from the pack (`backbone.*`/`pool.*`/`bn.*`/`linear.*`), with the
+  down-conv's `groups` derived by introspecting the pack's own kernel shape
+  (`cin_running / cin_per_group`) rather than recomputing `gcd` by hand.
+- **Parity tests** (`backbone::tests`, all `#[ignore]`, gated on the local
+  `redimnet2-spike` assets, **all green**):
+  - `stem_parity_jfk` -- `01_outputs_1d` (stem: conv -> LN -> to1d -> gnorm).
+  - `stage_parity_jfk` -- `02..07_outputs_1d` (stage0..5), each depending on
+    every previously-verified stage via `weigth1d` aggregation.
+  - `fin_and_head_parity_jfk` -- `fin_wght1d`, `99_backbone_2d_output`,
+    `a0_pre_pool_flattened`.
+  - `full_pipeline_cosine_gate` -- `a1_post_pool`/`a2_post_bn`/
+    `a3_final_embedding`, plus the end-to-end cosine gate: **jfk/zh_sample/
+    en_zh_mixed all show cosine 1.000000 vs the golden embeddings** (well
+    above the > 0.9999 target).
+  - `to1d_matches_hand_derived_frequency_major_formula` -- a synthetic
+    (no-pack-needed) unit test pinning `to1d`'s `ne` derivation directly.
+- Verification run: `cargo fmt --check`, `cargo clippy -p openasr-core --lib
+  --tests -- -D warnings` (clean), `cargo test -p openasr-core --lib diarize::`
+  (148 passed, 0 failed, no regressions in the rest of `diarize::`).
 
-Not started: the backbone ggml graph, ASTP pool/BN/linear, the `SpeakerEmbedder`
-impl, runtime pack resolution, calibration profile, catalog/registry entry,
-audit form. WeSpeaker is untouched and remains the sole runtime embedder.
+### Two real bugs found and fixed via the parity harness (read before touching `ops.rs`)
 
-## Remaining plan (staged, golden-pinned)
+1. **Gallocr view-of-output-tensor corruption.** `to1d`/`to2d`/`group_norm_1d`
+   (and any future op) must defensively `cont()` a tensor *before* taking any
+   view of it (`permute`/`transpose`/`reshape` are all views in ggml) if that
+   tensor might *also* be independently marked `set_output` (a parity tap, or
+   any other long-lived read). The backend scheduler's gallocr does **not**
+   protect a view's underlying source buffer purely because a view of it (or
+   the tensor itself) carries the output flag -- it silently recycled the
+   buffer once the view had been consumed, corrupting every later read of the
+   supposedly-still-needed tensor. Root-caused by bisection: `run_stem` alone
+   matched the golden bit-for-bit, but the identical computation, once more
+   graph was built *after* it in the same call (even just `+stage0`), read
+   back corrupted. Every 2D<->1D boundary op in `ops.rs` now `cont()`s its
+   input defensively; keep doing this for any new op that takes a view of a
+   caller-supplied tensor.
+2. **`to1d` is not the final pre-pool flatten.** `ReDimNet2Wrap.forward`'s
+   `out.reshape(bs, C*F, T)` (right before `pool`) is a **plain torch
+   reshape** (`c*F+f`, C-major/F-minor), not `to1d`'s frequency-major merge
+   (`f*C+c`) used everywhere else in the backbone. Reusing `to1d` there
+   silently flattened in the wrong order (values fine, order wrong) -- fixed
+   by adding a dedicated `ops::flatten_backbone_output` for exactly this one
+   call site. If a new "flatten a 2D backbone output to 1D" call site shows up,
+   check which torch op it actually mirrors before assuming it's `to1d`.
 
-Golden anchors in `tmp/redimnet2-spike/stage_dump_b6_jfk/` (jfk.wav, 176000
-samples). Reference source in `tmp/redimnet2-spike/repo/redimnet2/`:
-`redimnet2.py` (build/forward, read), `layers/blocks.py` (ConvBlock2d,
-TimeContextBlock1d -- **read next**), `layers/resblocks.py`, `layers/attention.py`
-(wav2vec2 attention), `layers/convnext.py`, `layers/poolings.py` (ASTP),
-`layers/redim_structural.py` (to1d/to2d/weigth1d -- already read; `to1d` =
-`permute(0,2,1,3).reshape(bs,c*f,t)`, `to2d` = inverse).
+## Remaining plan (post-backbone; not started)
 
-Build the backbone as `redimnet/backbone.rs` mirroring
-`models/dolphin/encoder_graph.rs` (arena weight upload, `start_graph`,
-`set_input`, `compute_output_f32`). Load weights with
-`diarize::embed::weights::Weights::from_oasr` on the f32 pack (flat f32 in ggml
-memory order -> upload verbatim into graph tensors with matching `ne` dims). Add
-a `#[ignore]` parity test per step. Tolerance 1e-3 max abs (cumulative f32).
+1. **`SpeakerEmbedder` impl** on a `RedimNet2Embedder` (`embedding_dim` 192),
+   wiring `backbone::forward` behind the trait. L2-normalize the final
+   embedding (not yet done in `backbone::forward` -- the golden comparison
+   used raw pre-normalize vectors since cosine is scale-invariant; confirm
+   whether the production trait needs an explicit normalize step or whether
+   callers normalize downstream, matching `WeSpeaker`'s convention).
+2. **`REDIMNET_CALIBRATION` profile** (192-dim cosine space, distinct from
+   `WESPEAKER_CALIBRATION` -- must be measured against real enrollment data,
+   not copied).
+3. **Runtime pack resolution** (`OPENASR_REDIMNET_PACK` env + installed-dir
+   hint), mirroring `pack.rs`'s existing WeSpeaker resolution path.
+4. **Catalog/registry entry** + model card + `docs/model-audits/
+   redimnet2-b6.md` (new-family release gate; `tooling/publish-model/scripts/
+   _manifest.py --public` fails closed without a completed form).
+5. **Shipping pack + quantization**: convert the final release pack at the
+   chosen quant (f16/q8_0), re-run the parity gate against it (the f32 pack
+   was the only fixture used so far), then benchmark RTF/RAM (separate,
+   measurement-isolated session).
+6. Not in scope for any of the above: `SpeakerEmbedder`/dispatch wiring must
+   not touch `WeSpeaker` (untouched, remains the sole runtime embedder until
+   this whole plan lands and is explicitly approved for cutover).
 
-1. **Stem** -> `01_outputs_1d.npy (4608,1096)`. Ops: `conv_2d` (1->64, 3x3, pad
-   'same'=1) + bias; LayerNorm channels-first over the 64-channel axis
-   (`stem.1`, eps 1e-6); `to1d` (permute `(c,f,t)->(c*f,t)`, frequency-major
-   flatten -- derive the ggml permute/cont carefully, risk #1); GroupNorm(64,
-   4608) (`stem_gnorm`). Input = `00_spec_output` truncated to T multiple of 4.
-2. **Stage 0** (sf1,st1,3 blocks,exp3,red64) -> `02_outputs_1d`. `weigth1d`
-   agg(N=1) -> `to2d(f=72,c=64)` -> down-conv `stage0.2 (192,1,1,1)`... note
-   `stage0.2.weight (192,1,1,1)` = grouped 1x1 (groups=gcd(64,192)=64) up to 192;
-   3x `ConvBlock2d` (depthwise conv1 3x3 + conv1pw 1x1 + bn1 + ReLU, ditto conv2,
-   residual+ReLU) at 192ch; 1x1+BN `stage0.6` (192->64); `to1d`;
-   `TimeContextBlock1d` `stage0.8` (red_dim_conv 4608->72+BN, 4 dwconvs
-   k=7/19/31/59 +BN+pwconv1, attention block hidden72, exp_dim_conv 72->4608);
-   Upsample(st=1)=noop; GroupNorm `stage0.10`.
-3. **Stages 1..5** -> `03..07_outputs_1d`. Same recipe at each running `(c,f)`
-   from `config::STAGES`; strided down-conv `(sf,st)` with kernel `(sf,stt)`
-   where `stt` is the cumulative time stride at that stage (see `redimnet2.py`
-   build: `kernel_size=(sf,stt)`, `stride=(sf,stt)`), `groups=gcd(c, sf*c*exp)`.
-   Watch the Upsample(stt) that restores T after time-strided stages (2 and 4).
-4. **fin_wght1d** -> `08_outputs_1d`. `weigth1d(N=7)` softmax-weighted sum of the
-   7 collected `(4608,1096)` maps.
-5. **head + fin_to2d** -> `99_backbone_2d_output (224,9,1096)` and
-   `a0_pre_pool_flattened (2016,1096)`. `fin_to2d` reshapes `(4608,T)` at final
-   `(c=512? no: c*f=4608 with c=512,f=9 -> 512*9=4608)` to `(512,9,T)`; `head`
-   Conv2d(512->224,1x1); flatten `(224*9=2016,T)`.
-   NOTE: after stage5 running `c=512,f=9`; `to2d` uses those, so `fin_to2d`
-   is `to2d(f=9,c=512)`. Verify the 4608 flatten is frequency-major.
-6. **ASTP pool -> BN -> linear** -> `a1_post_pool (4032,)`, `a2_post_bn`,
-   `a3_final_embedding (192,)`. ASTP with `global_context_att`: concat
-   `[x, mean_T, std_T]` (2016->6048), `pool.linear1 (6048->128)` -> tanh ->
-   `pool.linear2 (128->2016)` -> softmax over T -> attentive mean+std -> 4032;
-   `bn (4032)`; `linear (4032->192)`. Then L2-normalize.
-7. **End-to-end cosine gate**: jfk/zh/en_zh embedding vs `embeddings_b6/*.npy`
-   cosine > 0.9999. B6 reference cosines (sanity): jfk-split 0.8288, zh vs
-   en_zh (same speaker) 0.9725, cross-speaker ~ -0.02.
+## Reference pointers (still accurate)
 
-## Then (post-backbone, separate steps)
-
-- `SpeakerEmbedder` impl on a `RedimNet2Embedder` (embedding_dim 192), a
-  `REDIMNET_CALIBRATION` profile (192-d cosine space -- must be measured, not
-  copied from WeSpeaker), and runtime pack resolution
-  (`OPENASR_REDIMNET_PACK` + installed-dir hint) mirroring `pack.rs`.
-- Catalog/registry entry + model card + `docs/model-audits/redimnet2-b6.md`
-  (new-family release gate).
-- Convert final shipping pack at the chosen quant; benchmark RTF/RAM (separate,
-  measurement-isolated).
-
-## Gotchas captured
-
-- `to1d`/`to2d` are frequency-major (`permute(0,2,1,3)`); the 4608 flatten
-  order matters -- pin against `01_outputs_1d` first.
-- Down-conv is **grouped** (`groups=gcd`); ConvBlock2d conv1/conv2 are
-  **depthwise** (weight `(C,1,3,3)`) followed by pointwise `conv?pw (C,C,1,1)`.
-- BatchNorm is applied explicitly (not folded in the pack).
-- `conv_exp` can be < 1 (stages 4/5): `block_channels = round(c*conv_exp)`.
-- Frontend constants are recomputed in Rust; do not expect `spec.*` in the pack.
+- Design doc: `docs/design/redimnet2-b6-embedder.md` (decisions + architecture
+  reference + risks). Read before making any structural change here.
+- Upstream reference: `tmp/redimnet2-spike/repo/redimnet2/` (`redimnet2.py`,
+  `layers/{blocks,resblocks,attention,convnext,poolings,redim_structural,
+  layernorm}.py`).
+- Structural facts: `tmp/redimnet2-spike/B6_STRUCTURE_SPEC.md` (per-stage
+  dims, B3-vs-B6 diffs).
+- Golden anchors: `tmp/redimnet2-spike/stage_dump_b6_jfk/` (13 `.npy`),
+  `tmp/redimnet2-spike/embeddings_b6/` (3 fixture-sample final embeddings),
+  `tmp/redimnet2-spike/frontend_dump/` (front-end intermediate tensors, used
+  as the backbone's `spec` input for all three samples in the parity tests).
+- f32 pack fixture: `tmp/redimnet2-spike/redimnet2-b6-f32.oasr`.
