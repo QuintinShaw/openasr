@@ -170,10 +170,26 @@ def build_tensor_plan(
     return plan
 
 
-def write_pack(out_path: Path, plan: list[tuple[str, "np.ndarray", str]]) -> None:
+def write_pack(
+    out_path: Path,
+    plan: list[tuple[str, "np.ndarray", str]],
+    *,
+    model_id: str = "redimnet2-b6-cn",
+    quant: str = "f16",
+) -> None:
     import gguf
 
     writer = gguf.GGUFWriter(str(out_path), ARCH, use_temp_file=True)
+
+    # Required by pull/install preflight (`openasr.package.version = "1"`).
+    # Without this key the pack verifies as bare GGUF but fails closed on
+    # `openasr pull` / desktop local import / catalog install.
+    writer.add_string("openasr.package.version", "1")
+    writer.add_string("openasr.model.family", "redimnet2")
+    writer.add_string("openasr.model.architecture", ARCH)
+    writer.add_string("openasr.model.id", model_id)
+    quant_label = {"f16": "fp16", "f32": "f32", "q8_0": "q8_0"}.get(quant, quant)
+    writer.add_string("openasr.quantization", quant_label)
 
     cfg = B6_MODEL_CONFIG
     writer.add_uint32("redimnet2.embed_dim", cfg["embed_dim"])
@@ -209,10 +225,12 @@ def write_pack(out_path: Path, plan: list[tuple[str, "np.ndarray", str]]) -> Non
     writer.close()
 
 
-def convert(in_path: Path, out_path: Path, quant: str) -> int:
+def convert(
+    in_path: Path, out_path: Path, quant: str, model_id: str = "redimnet2-b6-cn"
+) -> int:
     state = load_state_dict(in_path)
     plan = build_tensor_plan(state, quant)
-    write_pack(out_path, plan)
+    write_pack(out_path, plan, model_id=model_id, quant=quant)
     kept = len(plan)
     dropped = len(state) - kept
     print(f"wrote {out_path} : {kept} tensors ({dropped} dropped), quant={quant}")
