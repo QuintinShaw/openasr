@@ -1035,16 +1035,71 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
                 ),
             });
         }
+        // Prefer the shared resident-KV bulk seed used by mimo/firered/moss.
+        // On single-GPU backends (CUDA/Metal/HIP) this is one batched prefill
+        // into the same arena `run_step_auto` will reuse for decode — avoiding
+        // both the historical serial host-step storm and the host-cache/reuse
+        // mix-up. Discrete-GPU wide steps fail closed to non-flash attention
+        // inside the shared executor (see llm_prefill_uses_flash_attention).
+        let resident_started_at = qwen_decode_profile_start();
+        if let Some(final_hidden) = self
+            .whole_decoder
+            .run_prefill_auto_last_hidden(
+                &self.prefill_input.token_major_embeddings,
+                token_count,
+                &self.layer_kv_caches,
+                1_000_000.0,
+            )
+            .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                reason: error.to_string(),
+            })?
+        {
+            self.cache_prompt_tokens = token_count;
+            qwen_decode_profile_log_opt("prefill_prompt_resident_bulk", resident_started_at);
+            let result = self
+                .logits_head
+                .compute_logits_for_last_hidden(&final_hidden)
+                .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                    reason: error.to_string(),
+                });
+            qwen_decode_profile_log_opt("prefill_prompt_total", profile_started_at);
+            return result;
+        }
         let Some(chunk_size) = self
             .whole_decoder
             .safe_host_cache_prefill_chunk_size_for(token_count)
         else {
-            let result = self.prefill_prompt_serial_and_compute_last_logits();
+            // No multi-query host-cache width (typically native GQA off). Full
+            // bulk host prefill is still correct under the fail-closed flash
+            // policy and matches mimo/firered's non-reuse fallback — prefer it
+            // over the historical serial launch storm.
+            let result = self.prefill_prompt_bulk_host_and_compute_last_logits();
             qwen_decode_profile_log_opt("prefill_prompt_total", profile_started_at);
             return result;
         };
         let result = self.prefill_prompt_chunked_and_compute_last_logits(chunk_size);
         qwen_decode_profile_log_opt("prefill_prompt_total", profile_started_at);
+        result
+    }
+
+    fn prefill_prompt_bulk_host_and_compute_last_logits(
+        &mut self,
+    ) -> Result<Vec<f32>, Qwen3AsrGreedyDecodeError> {
+        let profile_started_at = qwen_decode_profile_start();
+        let token_count = self.prefill_input.token_count;
+        let step = self
+            .whole_decoder
+            .run_prefill(
+                &self.prefill_input.token_major_embeddings,
+                token_count,
+                1_000_000.0,
+            )
+            .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                reason: error.to_string(),
+            })?;
+        qwen_decode_profile_log_prefill_chunk(0, token_count, profile_started_at);
+        let result = self.write_prefill_step_outputs_and_compute_last_logits(token_count, step);
+        qwen_decode_profile_log_opt("prefill_prompt_bulk_host", profile_started_at);
         result
     }
 
@@ -1141,32 +1196,6 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
         result
     }
 
-    fn prefill_prompt_serial_and_compute_last_logits(
-        &mut self,
-    ) -> Result<Vec<f32>, Qwen3AsrGreedyDecodeError> {
-        let profile_started_at = qwen_decode_profile_start();
-        let token_count = self.prefill_input.token_count;
-        let mut final_hidden = None;
-        for token_position in 0..token_count {
-            let hidden = self.prefill_prompt_hidden_at(token_position)?;
-            let hidden = self.run_llm_layers_with_kv(hidden, token_position)?;
-            final_hidden = Some(hidden);
-        }
-        self.cache_prompt_tokens = token_count;
-        let result = self
-            .logits_head
-            .compute_logits_for_last_hidden(&final_hidden.ok_or_else(|| {
-                Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                    reason: "qwen3-asr prefill produced no final hidden state".to_string(),
-                }
-            })?)
-            .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                reason: error.to_string(),
-            });
-        qwen_decode_profile_log_opt("prefill_prompt_serial", profile_started_at);
-        result
-    }
-
     fn write_prefill_step_outputs_and_compute_last_logits(
         &mut self,
         token_count: usize,
@@ -1252,30 +1281,6 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
             })?
             .to_vec();
         Ok(final_hidden)
-    }
-
-    fn prefill_prompt_hidden_at(
-        &self,
-        token_position: usize,
-    ) -> Result<Vec<f32>, Qwen3AsrGreedyDecodeError> {
-        let hidden_size = self.prefill_input.hidden_size;
-        let start = token_position.checked_mul(hidden_size).ok_or_else(|| {
-            Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                reason: "qwen3-asr prefill hidden-state indexing overflowed".to_string(),
-            }
-        })?;
-        let end = start.checked_add(hidden_size).ok_or_else(|| {
-            Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                reason: "qwen3-asr prefill hidden-state indexing overflowed".to_string(),
-            }
-        })?;
-        self.prefill_input
-            .token_major_embeddings
-            .get(start..end)
-            .ok_or_else(|| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                reason: "qwen3-asr prefill hidden-state slice is out of bounds".to_string(),
-            })
-            .map(<[f32]>::to_vec)
     }
 
     fn run_llm_layers_with_kv(

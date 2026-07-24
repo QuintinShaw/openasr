@@ -40,21 +40,29 @@ const QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES: usize = 768 * 1024 * 1024;
 // behavior; keep it unless every backend's GQA path is verified.
 const QWEN3_LLM_NATIVE_GQA_ENV: &str = "OPENASR_QWEN_LLM_NATIVE_GQA";
 const QWEN3_LLM_CPU_SAFE_PREFILL_QUERY_TOKENS: usize = 8;
+/// Conservative single-query width kept for backends that have not been
+/// validated for multi-query host-cache prefill (legacy default). Discrete
+/// GPU (CUDA/HIP/Vulkan) no longer uses this once the non-flash wide path is
+/// selected — see `qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name`.
 const QWEN3_LLM_GPU_SAFE_PREFILL_QUERY_TOKENS: usize = 1;
-const QWEN3_LLM_HIP_SAFE_PREFILL_QUERY_TOKENS: usize = 2;
-const QWEN3_LLM_HIP_SHORT_PREFILL_QUERY_TOKENS: usize = 8;
-const QWEN3_LLM_HIP_SHORT_PREFILL_MAX_TOKENS: usize = 32;
-/// Prefill chunk for HIP-like backends past the 32-token flash window. Chunks
-/// in this range bypass the buggy flash MMA/TILE kernel (the graph swaps to the
-/// unfused `llm_naive_masked_attention` path when `n_query > 2` and
-/// `n_kv > 32`), so correctness no longer bounds the width — but performance
-/// does: ggml's HIP `mul_mat` only takes the fast mmvq vector kernels for
-/// `n_query <= 8` and beyond that switches to MMQ, which is pathologically slow
-/// on RDNA4 Windows (measured on gfx1200: 8-token chunks decode at ~3 ms/token
-/// while 16/32/64-token chunks blow up to seconds per chunk). Keep the chunk at
-/// the mmvq ceiling; do not widen without re-measuring an offset>0 chunk on a
-/// HIP host.
-const QWEN3_LLM_HIP_NONFLASH_PREFILL_QUERY_TOKENS: usize = 8;
+/// Flash VEC kernel is trusted at `n_query <= 2` on every backend (see
+/// `fattn.cu` `Q->ne[1] <= 2`). Above this, discrete-GPU flash MMA/TILE must
+/// not be used for long KV spans.
+const QWEN3_LLM_FLASH_SAFE_PREFILL_QUERY_TOKENS: usize = 2;
+const QWEN3_LLM_FLASH_SAFE_PREFILL_MAX_KV_TOKENS: usize = 32;
+const QWEN3_LLM_DISCRETE_GPU_SHORT_PREFILL_QUERY_TOKENS: usize = 8;
+/// Prefill chunk for discrete-GPU backends (CUDA/HIP/Vulkan) past the 32-token
+/// flash window. Chunks in this range bypass the buggy flash MMA/TILE kernel
+/// (the graph swaps to the unfused `llm_naive_masked_attention` path when
+/// `n_query > 2` and `n_kv > 32`), so correctness no longer bounds the width —
+/// but performance still does on HIP: ggml's HIP `mul_mat` only takes the fast
+/// mmvq vector kernels for `n_query <= 8` and beyond that switches to MMQ,
+/// which is pathologically slow on RDNA4 Windows (measured on gfx1200: 8-token
+/// chunks decode at ~3 ms/token while 16/32/64-token chunks blow up to seconds
+/// per chunk). Keep the shared discrete-GPU host-cache chunk at the mmvq
+/// ceiling so HIP stays fast; CUDA bulk resident prefill uses a separate
+/// wider path (`run_prefill_into_reused_batched`) and is not limited by this.
+const QWEN3_LLM_DISCRETE_GPU_NONFLASH_PREFILL_QUERY_TOKENS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Qwen3AsrLlmAttentionCoreOutput {
@@ -1771,13 +1779,11 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     /// kernel mis-handles the per-query causal mask + GQA when `n_kv > 32` AND
     /// `n_query > 2`. `n_query <= 2` routes to the correct VEC kernel
     /// (`fattn.cu` `Q->ne[1] <= 2`), and `n_kv <= 32` fits a single K-tile and is
-    /// correct at any chunk. On HIP-like backends, chunks that would trip the
-    /// kernel bug now run through the unfused `llm_naive_masked_attention` graph
-    /// instead of the fused kernel (`llm_prefill_uses_flash_attention`), so the
-    /// chunk can be wide: HIP = 8 for prompts <= 32 tokens (flash, single
-    /// K-tile), 64 beyond (non-flash). CPU = 8 (flash, correct everywhere);
-    /// generic GPU (Vulkan/CUDA/unknown) = 1 (conservative, not yet
-    /// per-backend gated or non-flash validated).
+    /// correct at any chunk. Discrete-GPU backends (CUDA/HIP/Vulkan) that would
+    /// trip the kernel bug now run through the unfused
+    /// `llm_naive_masked_attention` graph instead of the fused kernel
+    /// (`llm_prefill_uses_flash_attention`), so the host-cache chunk can be
+    /// wide (8). CPU/Metal keep flash at width 8 (trusted at every span).
     pub(crate) fn safe_multi_query_prefill_chunk_size_for(
         &self,
         token_count: usize,
@@ -1796,39 +1802,28 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
 
     /// Chunk width for prefill that reads/writes the host KV cache mid-prompt
     /// (`prefill_tokens_at_offset_*`). Historically `None` on every GPU-class
-    /// backend (forcing the ~50 ms/token serial host-step path); HIP-like
-    /// backends now chunk like the full-prompt path because the non-flash
-    /// attention graph is width-safe there. Generic GPU stays serial until the
-    /// non-flash path is validated per backend.
+    /// backend (forcing the ~50 ms/token serial host-step path). Discrete GPU
+    /// backends now share the multi-query policy because wide steps are routed
+    /// through the non-flash attention graph (`llm_prefill_uses_flash_attention`)
+    /// and are width-safe. Callers that also decode via resident-graph reuse
+    /// must still seed that arena from the same path (prefer
+    /// `run_prefill_auto_last_hidden`); host-cache chunking alone does not
+    /// populate the reuse arena.
     pub(crate) fn safe_host_cache_prefill_chunk_size_for(
         &self,
         token_count: usize,
     ) -> Option<usize> {
-        if self.runner.backend_kind().is_gpu_class()
-            && !qwen_llm_backend_is_hip_like(self.runner.backend_name())
-        {
-            return None;
-        }
         self.safe_multi_query_prefill_chunk_size_for(token_count)
     }
 
     /// Decide fused-flash vs unfused attention for a prefill graph step.
-    /// Flash everywhere it is numerically trusted: single/double-query steps
-    /// (VEC kernel), short KV spans (single K-tile), CPU/Metal, and non-HIP
-    /// GPUs (their chunk policy never produces wide queries). Only the exact
-    /// combination the HIP MMA/TILE kernel mis-handles — `n_query > 2` with
-    /// `n_kv > 32` on a HIP-like backend — swaps to
-    /// `llm_naive_masked_attention`.
+    /// See `qwen_llm_prefill_uses_flash_attention_for_backend`.
     fn llm_prefill_uses_flash_attention(&self, token_count: usize, kv_span: usize) -> bool {
-        if token_count <= QWEN3_LLM_HIP_SAFE_PREFILL_QUERY_TOKENS
-            || kv_span <= QWEN3_LLM_HIP_SHORT_PREFILL_MAX_TOKENS
-        {
-            return true;
-        }
-        if !self.runner.backend_kind().is_gpu_class() {
-            return true;
-        }
-        !qwen_llm_backend_is_hip_like(self.runner.backend_name())
+        qwen_llm_prefill_uses_flash_attention_for_backend(
+            self.runner.backend_kind(),
+            token_count,
+            kv_span,
+        )
     }
 
     /// True when prefill chunk widths must stay even on this backend.
@@ -4891,20 +4886,45 @@ fn render_shape(shape: &[u64]) -> String {
     format!("[{parts}]")
 }
 
+/// Flash everywhere it is numerically trusted: single/double-query steps
+/// (VEC kernel), short KV spans (single K-tile), and CPU/Metal at every
+/// width. Discrete GPU (`GgmlCpuGraphBackend::Gpu`: CUDA/HIP/Vulkan) is
+/// fail-closed: the flash MMA/TILE kernel mis-handles per-query causal
+/// mask + GQA when `n_query > 2` and `n_kv > 32`, so that combination
+/// always swaps to `llm_naive_masked_attention`. Do not re-enable wide
+/// flash on discrete GPU without a per-backend golden that covers
+/// `n_query > 2 && n_kv > 32` with native GQA.
+fn qwen_llm_prefill_uses_flash_attention_for_backend(
+    backend: GgmlCpuGraphBackend,
+    token_count: usize,
+    kv_span: usize,
+) -> bool {
+    if token_count <= QWEN3_LLM_FLASH_SAFE_PREFILL_QUERY_TOKENS
+        || kv_span <= QWEN3_LLM_FLASH_SAFE_PREFILL_MAX_KV_TOKENS
+    {
+        return true;
+    }
+    // Metal + CPU: flash trusted at every validated width.
+    // Discrete GPU lane: non-flash for the wide multi-query / long-KV case.
+    !matches!(backend, GgmlCpuGraphBackend::Gpu)
+}
+
 fn qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(
     backend_name: &str,
     token_count: usize,
 ) -> usize {
-    if qwen_llm_backend_is_hip_like(backend_name) {
-        // HIP-like backends are no longer bound by the flash MMA/TILE kernel
-        // limits for wide prefill: any chunk that would trip the kernel bug
-        // (n_query > 2 with n_kv > 32) is routed to the unfused
-        // `llm_naive_masked_attention` path instead (see
-        // `llm_prefill_uses_flash_attention`), which is correct at any width.
-        if token_count <= QWEN3_LLM_HIP_SHORT_PREFILL_MAX_TOKENS {
-            return QWEN3_LLM_HIP_SHORT_PREFILL_QUERY_TOKENS;
+    // Discrete GPU backends share the non-flash-backed wide host-cache chunk
+    // policy. Flash MMA/TILE is fail-closed for `n_query > 2 && n_kv > 32` on
+    // the whole `GgmlCpuGraphBackend::Gpu` lane (see
+    // `llm_prefill_uses_flash_attention`), so CUDA/HIP/Vulkan can all use the
+    // same width-safe chunk without re-entering the historical serial path.
+    // Metal keeps flash at every width and is selected by backend kind, not
+    // by this name helper's discrete-GPU branch.
+    if qwen_llm_backend_is_discrete_gpu_like(backend_name) {
+        if token_count <= QWEN3_LLM_FLASH_SAFE_PREFILL_MAX_KV_TOKENS {
+            return QWEN3_LLM_DISCRETE_GPU_SHORT_PREFILL_QUERY_TOKENS;
         }
-        return QWEN3_LLM_HIP_NONFLASH_PREFILL_QUERY_TOKENS;
+        return QWEN3_LLM_DISCRETE_GPU_NONFLASH_PREFILL_QUERY_TOKENS;
     }
     QWEN3_LLM_GPU_SAFE_PREFILL_QUERY_TOKENS
 }
@@ -4912,6 +4932,25 @@ fn qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(
 fn qwen_llm_backend_is_hip_like(backend_name: &str) -> bool {
     let backend_name = backend_name.to_ascii_lowercase();
     backend_name.contains("hip") || backend_name.contains("rocm")
+}
+
+fn qwen_llm_backend_is_cuda_like(backend_name: &str) -> bool {
+    let backend_name = backend_name.to_ascii_lowercase();
+    backend_name.contains("cuda") || backend_name.contains("nvidia")
+}
+
+fn qwen_llm_backend_is_vulkan_like(backend_name: &str) -> bool {
+    backend_name.to_ascii_lowercase().contains("vulkan")
+}
+
+/// Name-level discrete-GPU detector used by the host-cache chunk policy when
+/// only the ggml backend display name is available (HIP0/CUDA0/Vulkan0/...).
+/// Metal is intentionally excluded: it is a separate backend kind with a
+/// trusted flash path and does not need the non-flash width ceiling.
+fn qwen_llm_backend_is_discrete_gpu_like(backend_name: &str) -> bool {
+    qwen_llm_backend_is_hip_like(backend_name)
+        || qwen_llm_backend_is_cuda_like(backend_name)
+        || qwen_llm_backend_is_vulkan_like(backend_name)
 }
 
 /// Next chunk width for a prefill loop whose backend reports
@@ -5005,24 +5044,32 @@ mod tests {
     }
 
     #[test]
-    fn qwen_llm_gpu_prefill_chunk_policy_widens_only_hip_like_backends() {
-        assert_eq!(
-            qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name("HIP0", 8),
-            QWEN3_LLM_HIP_SHORT_PREFILL_QUERY_TOKENS
-        );
-        assert_eq!(
-            qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name("HIP0", 32),
-            QWEN3_LLM_HIP_SHORT_PREFILL_QUERY_TOKENS
-        );
-        assert_eq!(
-            qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name("HIP0", 33),
-            QWEN3_LLM_HIP_NONFLASH_PREFILL_QUERY_TOKENS
-        );
-        assert_eq!(
-            qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name("ROCm0", 128),
-            QWEN3_LLM_HIP_NONFLASH_PREFILL_QUERY_TOKENS
-        );
-        for backend_name in ["Vulkan0", "CUDA0", "Metal", "GPU", ""] {
+    fn qwen_llm_gpu_prefill_chunk_policy_widens_discrete_gpu_backends() {
+        for backend_name in ["HIP0", "ROCm0", "CUDA0", "cuda:0", "Vulkan0", "NVIDIA"] {
+            assert_eq!(
+                qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(backend_name, 8),
+                QWEN3_LLM_DISCRETE_GPU_SHORT_PREFILL_QUERY_TOKENS,
+                "backend_name={backend_name} short prompt"
+            );
+            assert_eq!(
+                qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(backend_name, 32),
+                QWEN3_LLM_DISCRETE_GPU_SHORT_PREFILL_QUERY_TOKENS,
+                "backend_name={backend_name} flash-tile boundary"
+            );
+            assert_eq!(
+                qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(backend_name, 33),
+                QWEN3_LLM_DISCRETE_GPU_NONFLASH_PREFILL_QUERY_TOKENS,
+                "backend_name={backend_name} non-flash window"
+            );
+            assert_eq!(
+                qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(backend_name, 128),
+                QWEN3_LLM_DISCRETE_GPU_NONFLASH_PREFILL_QUERY_TOKENS,
+                "backend_name={backend_name} long prompt"
+            );
+        }
+        // Metal / unknown names stay on the conservative single-query host
+        // width; Metal bulk prefill goes through resident reuse instead.
+        for backend_name in ["Metal", "GPU", ""] {
             for token_count in [8, 32, 128] {
                 assert_eq!(
                     qwen_llm_safe_gpu_prefill_query_tokens_for_backend_name(
@@ -5034,6 +5081,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn qwen_llm_prefill_flash_policy_is_fail_closed_on_discrete_gpu() {
+        // Wide multi-query + long KV must never select flash on discrete GPU.
+        assert!(qwen_llm_prefill_uses_flash_attention_for_backend(
+            GgmlCpuGraphBackend::Gpu,
+            /*token_count=*/ 1,
+            /*kv_span=*/ 128
+        ));
+        assert!(qwen_llm_prefill_uses_flash_attention_for_backend(
+            GgmlCpuGraphBackend::Gpu,
+            /*token_count=*/ 2,
+            /*kv_span=*/ 128
+        ));
+        assert!(qwen_llm_prefill_uses_flash_attention_for_backend(
+            GgmlCpuGraphBackend::Gpu,
+            /*token_count=*/ 8,
+            /*kv_span=*/ 32
+        ));
+        assert!(!qwen_llm_prefill_uses_flash_attention_for_backend(
+            GgmlCpuGraphBackend::Gpu,
+            /*token_count=*/ 8,
+            /*kv_span=*/ 33
+        ));
+        assert!(!qwen_llm_prefill_uses_flash_attention_for_backend(
+            GgmlCpuGraphBackend::Gpu,
+            /*token_count=*/ 256,
+            /*kv_span=*/ 512
+        ));
+        // Metal/CPU remain flash-trusted past the discrete-GPU fail-closed window.
+        assert!(qwen_llm_prefill_uses_flash_attention_for_backend(
+            GgmlCpuGraphBackend::Metal,
+            /*token_count=*/ 256,
+            /*kv_span=*/ 512
+        ));
+        assert!(qwen_llm_prefill_uses_flash_attention_for_backend(
+            GgmlCpuGraphBackend::Cpu,
+            /*token_count=*/ 256,
+            /*kv_span=*/ 512
+        ));
     }
 
     #[test]
