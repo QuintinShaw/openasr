@@ -478,6 +478,9 @@ impl Qwen3AsrGgmlExecutor {
                     text_postprocess_kind: decode_policy.seq2seq_text_postprocess_kind,
                     word_timestamps: request.request_options.word_timestamps,
                     audio_duration_seconds: audio_duration_seconds(&request.prepared_audio),
+                    // Owner-thread prefill cannot see this thread's TLS control;
+                    // snapshot the Arc so chunk-boundary polls observe cancel.
+                    control: crate::api::backend::current_transcription_control(),
                 },
             )
             .map_err(|error| match error.unavailable_retryable() {
