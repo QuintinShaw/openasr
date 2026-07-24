@@ -26,7 +26,7 @@
 <p><strong>macOS</strong> (Apple Silicon) · <strong>Windows</strong> (x64, Windows 10+) · Linux 桌面版开发中</p>
 </div>
 
-不需要命令行,不需要配环境。安装应用,拖入音频文件,转写结果直接出来——全程离线,音频不出你的电脑。
+不需要命令行,不需要配环境。安装应用,拖入音频文件,转写结果直接出来——默认全程本地运行。
 
 > 本仓库是桌面应用背后的 Apache-2.0 开源核心:Rust 命令行工具 + 本地 OpenAI 兼容 HTTP API + ggml 推理引擎。桌面应用在同一个引擎之上套了原生图形界面,没有任何隐藏的网络通道。
 
@@ -43,11 +43,11 @@
 
 ## 为什么选 OpenASR
 
-**隐私。** 音频不出你的电脑。没有上传,没有云端处理,没有遥测——一个字节都不会偷偷发出去。引擎要么给你一份真实的转写结果,要么明确告诉你哪里出了问题。
+**隐私。** 默认本地模式下,音频留在你的设备上。远程算力仅在你显式配对并启用后可用,详见 [SECURITY.md](SECURITY.md#local-first-security-notes)。没有遥测、没有静默上传、没有静默联网回退。引擎要么给你一份真实的转写结果,要么明确告诉你哪里出了问题。
 
 **广度。** 11 个模型家族、26 个公开模型——Whisper、Qwen3-ASR、Parakeet、SenseVoice、FireRed、Dolphin、Moonshine……选对模型比选对工具更重要,而 OpenASR 把它们统一到一个运行时里,CPU 和 Apple Metal 都能跑。
 
-**开源。** 引擎代码 Apache-2.0,模型各自持有宽松许可(MIT / Apache-2.0)。每次模型下载都经过签名目录的完整性校验,装到本地的就是发布者打包的原件。
+**开源。** 引擎代码 Apache-2.0。每个模型包的许可证以 registry 条目和 pack metadata 为准。每次模型下载都经过签名目录的完整性校验,装到本地的就是发布者打包的原件。
 
 ---
 
@@ -128,7 +128,7 @@ openasr pull whisper-small    # 安装一个试试
 
 [Apache License 2.0](LICENSE),详见 [NOTICE](NOTICE)。
 
-ggml 推理后端为 MIT 许可。模型包各自遵循上游许可证(MIT / Apache-2.0)。致谢完整列表见 [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md)。
+ggml 推理后端为 MIT 许可。每个模型包的许可证以 registry 条目和 pack metadata 为准;可能包含 Apache-2.0、MIT、CC-BY、FunASR 或其他上游条款。这不是穷尽保证。致谢完整列表见 [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md)。
 
 ## 找到我们
 
