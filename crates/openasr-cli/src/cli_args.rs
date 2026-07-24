@@ -1,5 +1,6 @@
 use std::{
     net::SocketAddr,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
 };
 
@@ -589,6 +590,14 @@ pub(crate) enum Command {
         /// Local `.oasr` runtime pack file for native backend transcription.
         #[arg(long)]
         model_pack: Option<PathBuf>,
+        /// Maximum concurrent native sessions for one resolved model. Keep the
+        /// default unless this host has enough memory for concurrent runtimes.
+        #[arg(
+            long,
+            env = "OPENASR_MAX_NATIVE_SESSIONS_PER_MODEL",
+            default_value_t = NonZeroUsize::new(1).expect("one is non-zero")
+        )]
+        max_native_sessions_per_model: NonZeroUsize,
         /// Pid of the process that launched this daemon (e.g. a desktop app's
         /// supervisor). While set, this process watches that pid and exits
         /// shortly after it disappears -- including an ungraceful death (a

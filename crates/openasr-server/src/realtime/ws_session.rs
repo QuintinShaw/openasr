@@ -2,10 +2,13 @@
 //!
 //! Pure code-motion from `realtime.rs`; no behavior changes.
 
+use crate::ModelSessionPermit;
+
 use super::*;
 
 pub(crate) struct WsSession {
     pub(crate) runtime: ServerRuntime,
+    pub(crate) model_admission: ModelSessionAdmission,
     pub(crate) distribution: DistributionContext,
     pub(crate) session_id: RealtimeSessionId,
     /// The single connection-lifetime sequencer. Every envelope leaving this
@@ -623,12 +626,19 @@ impl WsSession {
         distribution: DistributionContext,
         event_sender: mpsc::Sender<RealtimeEventEnvelope>,
     ) -> Self {
-        Self::new_with_history(runtime, distribution, event_sender, true)
+        Self::new_with_history(
+            runtime,
+            distribution,
+            ModelSessionAdmission::default(),
+            event_sender,
+            true,
+        )
     }
 
     pub(crate) fn new_with_history(
         runtime: ServerRuntime,
         distribution: DistributionContext,
+        model_admission: ModelSessionAdmission,
         event_sender: mpsc::Sender<RealtimeEventEnvelope>,
         record_history: bool,
     ) -> Self {
@@ -637,6 +647,7 @@ impl WsSession {
         let session_id = next_session_id("rt_ws");
         Self {
             runtime,
+            model_admission,
             distribution,
             sequencer: RealtimeEventSequencer::new(session_id.clone()),
             emitted_event_ids: std::collections::HashMap::new(),
@@ -1586,6 +1597,34 @@ impl WsSession {
             .await?;
             return Err(());
         };
+        let model_session_key = match native_model_session_key(&self.runtime) {
+            Ok(key) => key,
+            Err(error) => {
+                self.emit_error(
+                    RealtimeErrorCode::StartupConfigError,
+                    &error.to_string(),
+                    false,
+                )
+                .await?;
+                return Err(());
+            }
+        };
+        let model_session_permit = match self.model_admission.try_acquire(model_session_key) {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.emit_error(
+                    RealtimeErrorCode::BackendNotReady,
+                    &format!(
+                        "Model '{}' is at its concurrent native session limit ({}). Retry when an existing session finishes, or increase --max-native-sessions-per-model if this host has enough memory.",
+                        error.model_identity,
+                        error.limit,
+                    ),
+                    true,
+                )
+                .await?;
+                return Err(());
+            }
+        };
         let model_pack =
             NativeAsrModelPackRef::new(model_id, adapter.model_family(), model_pack_path);
         let context = NativeAsrSessionContext::from_realtime_session_id(self.session_id.clone());
@@ -1645,13 +1684,14 @@ impl WsSession {
         // The session moves onto its own decode thread; the WS task queues audio
         // and drains outcomes separately so a slow partial decode never blocks
         // socket ingest for this session.
-        self.attach_native_streaming_session(
+        self.attach_native_streaming_session_admitted(
             NativeStreamingWorkerKey::new(
                 model_pack.root.clone(),
                 hardware_target,
                 self.inference_threads,
             ),
             session,
+            model_session_permit,
         )
         .await
         .map_err(|message| {
@@ -1663,12 +1703,26 @@ impl WsSession {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn attach_native_streaming_session(
         &mut self,
         key: NativeStreamingWorkerKey,
         session: Box<dyn NativeAsrSession>,
     ) -> Result<(), String> {
         self.native_streaming = Some(NativeStreamingDecodeWorker::attach(key, session).await?);
+        Ok(())
+    }
+
+    async fn attach_native_streaming_session_admitted(
+        &mut self,
+        key: NativeStreamingWorkerKey,
+        session: Box<dyn NativeAsrSession>,
+        model_session_permit: ModelSessionPermit,
+    ) -> Result<(), String> {
+        self.native_streaming = Some(
+            NativeStreamingDecodeWorker::attach_admitted(key, session, Some(model_session_permit))
+                .await?,
+        );
         Ok(())
     }
 
@@ -2824,6 +2878,7 @@ impl WsSession {
         let work_item = RealtimeBackendWorkItem {
             session_key: self.session_id.0.clone(),
             job,
+            model_admission: self.model_admission.clone(),
             result_sender,
             cancelled: Arc::clone(&self.backend_cancelled),
         };

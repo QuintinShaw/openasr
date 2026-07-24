@@ -29,19 +29,30 @@ pub(crate) async fn transcriptions(
     headers: HeaderMap,
     Extension(auth): Extension<ServerAuth>,
     Extension(distribution): Extension<DistributionContext>,
+    Extension(model_admission): Extension<ModelSessionAdmission>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Response, ApiError> {
     if query.stream.unwrap_or(false) {
         return crate::realtime::stream_transcription(
             runtime,
             distribution,
+            model_admission,
             multipart,
             !is_remote_compute_client_request(&headers, &auth),
         )
         .await;
     }
 
-    run_offline_transcription(runtime, headers, auth, distribution, multipart, None).await
+    run_offline_transcription(
+        runtime,
+        headers,
+        auth,
+        distribution,
+        model_admission,
+        multipart,
+        None,
+    )
+    .await
 }
 
 /// OpenAI-compatible `/v1/audio/translations`: always X->English translation.
@@ -53,6 +64,7 @@ pub(crate) async fn translations(
     headers: HeaderMap,
     Extension(auth): Extension<ServerAuth>,
     Extension(distribution): Extension<DistributionContext>,
+    Extension(model_admission): Extension<ModelSessionAdmission>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Response, ApiError> {
     run_offline_transcription(
@@ -60,6 +72,7 @@ pub(crate) async fn translations(
         headers,
         auth,
         distribution,
+        model_admission,
         multipart,
         Some(TranscriptionTask::Translate),
     )
@@ -243,6 +256,7 @@ async fn run_offline_transcription(
     headers: HeaderMap,
     auth: ServerAuth,
     distribution: DistributionContext,
+    model_admission: ModelSessionAdmission,
     multipart: Result<Multipart, MultipartRejection>,
     task_override: Option<TranscriptionTask>,
 ) -> Result<Response, ApiError> {
@@ -315,30 +329,36 @@ async fn run_offline_transcription(
         ActiveTranscriptionCleanup::new(distribution.clone(), id.clone(), Arc::clone(control))
     });
     let control_handle = control.as_ref().map(|(_, control)| Arc::clone(control));
-    let transcription =
-        match transcribe_with_runtime(runtime, parsed.request, control_handle.clone()).await {
-            Ok(transcription) => {
-                if let Some(cleanup) = control_cleanup.as_mut() {
-                    cleanup.disarm();
-                }
-                transcription
+    let transcription = match transcribe_with_runtime(
+        runtime,
+        parsed.request,
+        control_handle.clone(),
+        model_admission,
+    )
+    .await
+    {
+        Ok(transcription) => {
+            if let Some(cleanup) = control_cleanup.as_mut() {
+                cleanup.disarm();
             }
-            Err(error) => {
-                if let Some(cleanup) = control_cleanup.as_mut() {
-                    cleanup.disarm();
-                }
-                // A cancel surfaces from core as a generic fail-closed error (the
-                // typed cancel is flattened through the NativeAsrError layer), so
-                // consult the control to report it honestly as a 409 canceled result
-                // rather than a 400 fail-closed refusal.
-                if control_handle.is_some_and(|control| control.is_canceled()) {
-                    return Err(ApiError::Backend(
-                        openasr_core::BackendError::TranscriptionCanceled,
-                    ));
-                }
-                return Err(error);
+            transcription
+        }
+        Err(error) => {
+            if let Some(cleanup) = control_cleanup.as_mut() {
+                cleanup.disarm();
             }
-        };
+            // A cancel surfaces from core as a generic fail-closed error (the
+            // typed cancel is flattened through the NativeAsrError layer), so
+            // consult the control to report it honestly as a 409 canceled result
+            // rather than a 400 fail-closed refusal.
+            if control_handle.is_some_and(|control| control.is_canceled()) {
+                return Err(ApiError::Backend(
+                    openasr_core::BackendError::TranscriptionCanceled,
+                ));
+            }
+            return Err(error);
+        }
+    };
     let rendered = render_transcription(&transcription, parsed.response_format)
         .map_err(ApiError::Serialize)?;
     // History is a best-effort audit side-write: a successful transcription must
@@ -933,6 +953,35 @@ fn native_model_refs_match(requested: &str, runtime_source_id: &str) -> bool {
     openasr_core::native_runtime_model_refs_match(requested, runtime_source_id)
 }
 
+/// Stable identity for the actual native runtime that will execute requests.
+///
+/// It intentionally ignores the client-supplied model spelling: aliases and a
+/// bare runtime metadata id must all share one capacity slot. The identity comes
+/// from the validated runtime pack, never from an unbounded request value.
+pub(crate) fn native_model_session_key(runtime: &ServerRuntime) -> Result<String, ApiError> {
+    let model_pack_path = runtime.model_pack_path.as_deref().ok_or_else(|| {
+        ApiError::Backend(openasr_core::BackendError::NativeModelPackPathRequired)
+    })?;
+    let pack_root = openasr_core::validate_local_native_model_pack_path(model_pack_path)
+        .map_err(ApiError::Backend)?;
+    let identity = validate_native_runtime_pack(&pack_root).map_err(ApiError::Backend)?;
+    let model_ref = parse_model_ref(&identity.model_id).map_err(|error| {
+        ApiError::Backend(openasr_core::BackendError::NativeFailClosed {
+            reason: format!(
+                "could not canonicalize native runtime model identity '{}': {error}",
+                identity.model_id
+            ),
+        })
+    })?;
+    let quant = model_ref
+        .tag
+        .as_deref()
+        .map(openasr_core::canonical_quant_tag)
+        .map(|tag| format!(":{tag}"))
+        .unwrap_or_default();
+    Ok(format!("native:{}{quant}", model_ref.family))
+}
+
 // Bare ids of models that are *live* in the current catalog must never be
 // listed here: a native pack legitimately carries its bare family id as
 // metadata (packs burn no quant tag into `openasr.model.id` -- the "bare id
@@ -1294,6 +1343,7 @@ pub(crate) async fn transcribe_with_runtime(
     runtime: ServerRuntime,
     request: TranscriptionRequest,
     control: Option<Arc<openasr_core::TranscriptionControl>>,
+    model_admission: ModelSessionAdmission,
 ) -> Result<openasr_core::Transcription, ApiError> {
     match runtime.backend {
         BackendKind::Mock => {
@@ -1317,26 +1367,38 @@ pub(crate) async fn transcribe_with_runtime(
             }
             Ok(transcription)
         }
-        BackendKind::Native => tokio::task::spawn_blocking(move || {
-            // Marks this offline (file-transcription / realtime-per-utterance
-            // backend-job) decode as active for the whole synchronous run, so
-            // the idle_unload reaper never evicts the model runtime cache out
-            // from under it; dropped (any exit path) once the decode returns.
-            let _activity_guard = NativeActivityGuard::enter();
-            // Bind the pause/cancel control to this decode thread for the whole
-            // synchronous run so the long-form slice loop can observe it; the
-            // guard clears the binding on any exit. `None` (no control requested)
-            // leaves the decode byte-identical to before.
-            let _control_guard = control.map(openasr_core::install_active_transcription_control);
-            let model_pack_path = runtime.model_pack_path.clone().ok_or_else(|| {
-                TranscriptionRuntimeError::Backend(
-                    openasr_core::BackendError::NativeModelPackPathRejected {
-                        reason: "native backend requires an explicit local .oasr runtime pack path"
-                            .to_string(),
-                    },
-                )
-            })?;
-            let adapter =
+        BackendKind::Native => {
+            let model_session_key = native_model_session_key(&runtime)?;
+            let model_session_permit = model_admission
+                .try_acquire(model_session_key)
+                .map_err(ApiError::ModelSessionCapacity)?;
+            tokio::task::spawn_blocking(move || {
+                // This permit is deliberately owned by the blocking task rather
+                // than its async caller. Dropping an HTTP/SSE future detaches a
+                // spawned blocking task, but must not admit a second heavy decode
+                // while the first one still owns model execution resources.
+                let _model_session_permit = model_session_permit;
+                // Marks this offline (file-transcription / realtime-per-utterance
+                // backend-job) decode as active for the whole synchronous run, so
+                // the idle_unload reaper never evicts the model runtime cache out
+                // from under it; dropped (any exit path) once the decode returns.
+                let _activity_guard = NativeActivityGuard::enter();
+                // Bind the pause/cancel control to this decode thread for the whole
+                // synchronous run so the long-form slice loop can observe it; the
+                // guard clears the binding on any exit. `None` (no control requested)
+                // leaves the decode byte-identical to before.
+                let _control_guard =
+                    control.map(openasr_core::install_active_transcription_control);
+                let model_pack_path = runtime.model_pack_path.clone().ok_or_else(|| {
+                    TranscriptionRuntimeError::Backend(
+                        openasr_core::BackendError::NativeModelPackPathRejected {
+                            reason:
+                                "native backend requires an explicit local .oasr runtime pack path"
+                                    .to_string(),
+                        },
+                    )
+                })?;
+                let adapter =
                 native_runtime_model_adapter_for_path(&model_pack_path).ok_or_else(|| {
                     TranscriptionRuntimeError::Backend(
                         openasr_core::BackendError::NativeFailClosed {
@@ -1347,81 +1409,82 @@ pub(crate) async fn transcribe_with_runtime(
                         },
                     )
                 })?;
-            let prepared = prepare_audio_input(
-                &request.input_path,
-                &AudioPreparationOptions::new(runtime.backend)
-                    .with_ffmpeg_bin(runtime.ffmpeg_bin.clone())
-                    .with_ffmpeg_bin_explicit(runtime.ffmpeg_bin_explicit)
-                    .with_native_non_wav_conversion(true),
-            )
-            .map_err(TranscriptionRuntimeError::AudioPreparation)?;
-            let mut request = request;
-            request.input_path = prepared.path().to_path_buf();
-            let word_timestamps = request.word_timestamps;
-            let model_pack = NativeAsrModelPackRef::new(
-                request.model_id.clone(),
-                adapter.model_family(),
-                model_pack_path,
-            );
-            let offline_request = NativeAsrOfflineRequest::new(request.input_path.clone())
-                .with_options(
-                    NativeAsrRequestOptions::new()
-                        .with_language(request.language.clone())
-                        .with_prompt(request.prompt.clone())
-                        .with_phrase_bias(request.phrase_bias.clone())
-                        .with_inference_threads(request.inference_threads)
-                        .with_diarization(request.diarize)
-                        .with_word_timestamps(request.word_timestamps)
-                        .with_word_timestamps_refine(request.word_timestamps_refine),
+                let prepared = prepare_audio_input(
+                    &request.input_path,
+                    &AudioPreparationOptions::new(runtime.backend)
+                        .with_ffmpeg_bin(runtime.ffmpeg_bin.clone())
+                        .with_ffmpeg_bin_explicit(runtime.ffmpeg_bin_explicit)
+                        .with_native_non_wav_conversion(true),
                 )
-                .with_longform(request.longform.clone())
-                .with_display_file_name(request.display_file_name.clone())
-                .with_source(request.source)
-                // The source audio's real format for the `stage=request_context`
-                // log line -- `prepared.original()` is the pre-normalization
-                // probe (WAV fmt chunk) or decode (other recognized formats)
-                // result; `None` when this pipeline could not determine it
-                // (unrecognized extension, or a format only the external
-                // ffmpeg/afconvert fallback handles).
-                .with_source_audio_format(
-                    prepared.original().sample_rate_hz,
-                    prepared.original().channels,
+                .map_err(TranscriptionRuntimeError::AudioPreparation)?;
+                let mut request = request;
+                request.input_path = prepared.path().to_path_buf();
+                let word_timestamps = request.word_timestamps;
+                let model_pack = NativeAsrModelPackRef::new(
+                    request.model_id.clone(),
+                    adapter.model_family(),
+                    model_pack_path,
+                );
+                let offline_request = NativeAsrOfflineRequest::new(request.input_path.clone())
+                    .with_options(
+                        NativeAsrRequestOptions::new()
+                            .with_language(request.language.clone())
+                            .with_prompt(request.prompt.clone())
+                            .with_phrase_bias(request.phrase_bias.clone())
+                            .with_inference_threads(request.inference_threads)
+                            .with_diarization(request.diarize)
+                            .with_word_timestamps(request.word_timestamps)
+                            .with_word_timestamps_refine(request.word_timestamps_refine),
+                    )
+                    .with_longform(request.longform.clone())
+                    .with_display_file_name(request.display_file_name.clone())
+                    .with_source(request.source)
+                    // The source audio's real format for the `stage=request_context`
+                    // log line -- `prepared.original()` is the pre-normalization
+                    // probe (WAV fmt chunk) or decode (other recognized formats)
+                    // result; `None` when this pipeline could not determine it
+                    // (unrecognized extension, or a format only the external
+                    // ffmpeg/afconvert fallback handles).
+                    .with_source_audio_format(
+                        prepared.original().sample_rate_hz,
+                        prepared.original().channels,
+                    )
+                    // Extension only, off the upload's own temp file (which
+                    // preserves the client's original extension via
+                    // `safe_extension_suffix` -- see `ingest_field` above); never
+                    // the client-supplied file name/stem itself.
+                    .with_source_container(prepared.original().extension.clone())
+                    // Lets the native backend decode straight from the in-process
+                    // symphonia decode's in-memory samples (uploads are almost
+                    // always a non-WAV/non-conformant container) instead of
+                    // re-reading `input_path` from disk -- see
+                    // `PreparedAudioInput::shared_samples`.
+                    .with_prepared_samples(prepared.shared_samples());
+                let executor = NativeBackendExecutor;
+                let mut transcription = NativeAsrExecutor::transcribe(
+                    &executor,
+                    &adapter,
+                    &model_pack,
+                    native_hardware_target_from_execution_target(request.execution_target),
+                    offline_request,
                 )
-                // Extension only, off the upload's own temp file (which
-                // preserves the client's original extension via
-                // `safe_extension_suffix` -- see `ingest_field` above); never
-                // the client-supplied file name/stem itself.
-                .with_source_container(prepared.original().extension.clone())
-                // Lets the native backend decode straight from the in-process
-                // symphonia decode's in-memory samples (uploads are almost
-                // always a non-WAV/non-conformant container) instead of
-                // re-reading `input_path` from disk -- see
-                // `PreparedAudioInput::shared_samples`.
-                .with_prepared_samples(prepared.shared_samples());
-            let executor = NativeBackendExecutor;
-            let mut transcription = NativeAsrExecutor::transcribe(
-                &executor,
-                &adapter,
-                &model_pack,
-                native_hardware_target_from_execution_target(request.execution_target),
-                offline_request,
-            )
-            .map_err(native_asr_error_to_backend)
-            .map_err(TranscriptionRuntimeError::Backend)?;
-            // The decode above only returns `Ok` after the model runtime is
-            // built (or reused) and actually ran, so this is the resident
-            // signal `/health`'s `model_resident` field reads -- see
-            // `idle_activity::native_model_is_resident`.
-            crate::idle_activity::mark_native_model_warm();
-            if word_timestamps {
-                add_segment_word_timestamps(&mut transcription);
-            }
-            drop(prepared);
-            Ok::<_, TranscriptionRuntimeError>(transcription)
-        })
-        .await
-        .map_err(ApiError::BackendJoin)?
-        .map_err(ApiError::from),
+                .map_err(native_asr_error_to_backend)
+                .map_err(TranscriptionRuntimeError::Backend)?;
+                // The decode above only returns `Ok` after the model runtime is
+                // built (or reused) and actually ran, so this is the resident
+                // signal `/health`'s `model_resident` field reads -- see
+                // `idle_activity::native_model_is_resident`.
+                crate::idle_activity::mark_native_model_warm();
+                if word_timestamps {
+                    add_segment_word_timestamps(&mut transcription);
+                }
+                drop(prepared);
+                Ok::<_, TranscriptionRuntimeError>(transcription)
+            })
+            .await
+            .map_err(ApiError::BackendJoin)?
+            .map_err(ApiError::from)
+        }
     }
 }
 

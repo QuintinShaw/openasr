@@ -346,6 +346,7 @@ fn work_item_for_test(session_key: &str, id: &str) -> RealtimeBackendWorkItem {
     RealtimeBackendWorkItem {
         session_key: session_key.to_string(),
         job: backend_job_for_test(id),
+        model_admission: crate::ModelSessionAdmission::default(),
         result_sender,
         cancelled: Arc::new(AtomicBool::new(false)),
     }
@@ -2353,6 +2354,7 @@ async fn failed_native_streaming_attach_send_retires_the_activity_guard() {
             outcomes: outcome_tx,
             finalize_requested: Arc::new(AtomicBool::new(false)),
             token,
+            model_session_permit: None,
         })
         .await;
     assert!(
@@ -4729,8 +4731,13 @@ async fn remote_compute_websocket_session_does_not_record_server_history() {
         catalog_local_override: None,
     });
     let (event_sender, _event_receiver) = mpsc::channel(8);
-    let mut session =
-        WsSession::new_with_history(ServerRuntime::default(), distribution, event_sender, false);
+    let mut session = WsSession::new_with_history(
+        ServerRuntime::default(),
+        distribution,
+        crate::ModelSessionAdmission::default(),
+        event_sender,
+        false,
+    );
     let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
         "test_session",
         "whisper-large-v3-turbo",

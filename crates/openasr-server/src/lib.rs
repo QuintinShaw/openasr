@@ -1,8 +1,12 @@
 mod idle_activity;
+mod model_admission;
 mod realtime;
 mod routes;
 
 pub(crate) use idle_activity::{NativeActivityGuard, spawn_idle_unload_reaper};
+pub(crate) use model_admission::{
+    ModelSessionAdmission, ModelSessionAdmissionError, ModelSessionPermit,
+};
 pub(crate) use routes::config::*;
 pub(crate) use routes::history::*;
 pub(crate) use routes::models_api::*;
@@ -20,6 +24,7 @@ use std::{
     fs,
     io::Write,
     net::SocketAddr,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -126,6 +131,11 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
     let distribution = DistributionContext::new(distribution_runtime);
     distribution.ensure_restart_resumes_started();
     let auth = launch_options.auth.clone();
+    let model_admission = ModelSessionAdmission::new(
+        launch_options
+            .max_concurrent_native_sessions_per_model
+            .unwrap_or_else(|| NonZeroUsize::new(1).expect("one is non-zero")),
+    );
     let health_identity = ServerHealthIdentity::from_launch_options(launch_options);
     Router::new()
         .route("/health", get(health))
@@ -204,6 +214,7 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         ))
         .layer(Extension(auth))
         .layer(Extension(health_identity))
+        .layer(Extension(model_admission))
         .layer(Extension(distribution))
         .layer(DefaultBodyLimit::max(MAX_TRANSCRIPTION_UPLOAD_BYTES))
         .with_state(runtime)
@@ -747,6 +758,9 @@ pub struct ServerLaunchOptions {
     /// (the default, and what `never` resolves to) never spawns the reaper,
     /// matching every existing caller/test that does not set this.
     pub idle_unload_after: Option<Duration>,
+    /// Maximum concurrent native executions for one resolved runtime model.
+    /// `None` keeps the conservative default of one session per model.
+    pub max_concurrent_native_sessions_per_model: Option<NonZeroUsize>,
     /// Where to persist (and load back) the self-signed TLS private key +
     /// certificate across restarts -- see
     /// `load_or_generate_self_signed_tls_identity`. `None` keeps the
@@ -2256,6 +2270,7 @@ pub(crate) enum ApiError {
     Multipart(axum::extract::multipart::MultipartError),
     AudioPreparation(AudioPreparationError),
     Backend(openasr_core::BackendError),
+    ModelSessionCapacity(ModelSessionAdmissionError),
     BackendJoin(tokio::task::JoinError),
     Pull(PullError),
     Registry(openasr_core::RegistryError),
@@ -2311,6 +2326,11 @@ impl std::fmt::Display for ApiError {
                 )
             }
             Self::Backend(error) => write!(f, "Could not transcribe audio: {error}"),
+            Self::ModelSessionCapacity(error) => write!(
+                f,
+                "Model '{}' is at its concurrent native session limit ({}). Retry when an existing request finishes, or increase --max-native-sessions-per-model if this host has enough memory.",
+                error.model_identity, error.limit,
+            ),
             Self::BackendJoin(error) => {
                 write!(
                     f,
@@ -2387,6 +2407,13 @@ impl IntoResponse for ApiError {
             Self::AudioPreparation(error) => (
                 StatusCode::BAD_REQUEST,
                 format!("Could not prepare uploaded audio for transcription: {error}"),
+            ),
+            Self::ModelSessionCapacity(error) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Model '{}' is at its concurrent native session limit ({}). Retry when an existing request finishes, or increase --max-native-sessions-per-model if this host has enough memory.",
+                    error.model_identity, error.limit,
+                ),
             ),
             Self::Backend(error) => {
                 let status = match &error {
@@ -2543,6 +2570,26 @@ struct ErrorBody {
 #[cfg(test)]
 #[path = "http_wire_bindings_test.rs"]
 mod http_wire_bindings_test;
+
+#[cfg(test)]
+mod model_session_capacity_error_tests {
+    use std::num::NonZeroUsize;
+
+    use axum::response::IntoResponse;
+
+    use super::{ApiError, ModelSessionAdmissionError, StatusCode};
+
+    #[test]
+    fn model_session_capacity_is_a_retryable_http_overload() {
+        let response = ApiError::ModelSessionCapacity(ModelSessionAdmissionError {
+            model_identity: "native:whisper-small@pack-a".to_string(),
+            limit: NonZeroUsize::new(1).unwrap(),
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+}
 
 #[cfg(test)]
 #[path = "tests.rs"]

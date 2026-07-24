@@ -13,6 +13,8 @@ use std::{
 
 use tokio::sync::mpsc;
 
+use crate::ModelSessionPermit;
+
 use super::*;
 
 pub(crate) struct BackendJob {
@@ -352,6 +354,10 @@ pub(crate) enum NativeStreamingWorkerMessage {
         /// against it; the WS session and any external supervisor hold their
         /// own clones of the same `Arc<AttachToken>`.
         token: Arc<AttachToken>,
+        /// The model-capacity permit. The worker owns it until this attached
+        /// session has actually returned, including after the WS transport has
+        /// disconnected, so a detached blocking decode cannot be overlapped.
+        model_session_permit: Option<ModelSessionPermit>,
     },
 }
 
@@ -385,6 +391,14 @@ impl NativeStreamingDecodeWorker {
         key: NativeStreamingWorkerKey,
         session: Box<dyn NativeAsrSession>,
     ) -> Result<Self, String> {
+        Self::attach_admitted(key, session, None).await
+    }
+
+    pub(crate) async fn attach_admitted(
+        key: NativeStreamingWorkerKey,
+        session: Box<dyn NativeAsrSession>,
+        model_session_permit: Option<ModelSessionPermit>,
+    ) -> Result<Self, String> {
         let (command_tx, command_rx) = mpsc::channel::<NativeStreamingCommandEnvelope>(
             NATIVE_STREAMING_COMMAND_QUEUE_CAPACITY,
         );
@@ -414,6 +428,7 @@ impl NativeStreamingDecodeWorker {
                 outcomes: outcome_tx,
                 finalize_requested: Arc::clone(&finalize_requested),
                 token: Arc::clone(&token),
+                model_session_permit,
             })
             .await
         {
@@ -766,7 +781,12 @@ pub(crate) fn spawn_native_streaming_worker(
                         outcomes,
                         finalize_requested,
                         token,
+                        model_session_permit,
                     } => {
+                        // Keep the capacity permit owned by this worker thread
+                        // until `run_native_streaming_session_on_worker` returns.
+                        // A disconnected WS cannot release it early.
+                        let _model_session_permit = model_session_permit;
                         // Record this attach as the current occupant only now,
                         // as the thread actually begins driving it -- so
                         // external supervisors always act on the attach that
@@ -1083,6 +1103,7 @@ impl RealtimeBackendWorkerKey {
 pub(crate) struct RealtimeBackendWorkItem {
     pub(crate) session_key: String,
     pub(crate) job: BackendJob,
+    pub(crate) model_admission: ModelSessionAdmission,
     pub(crate) result_sender: mpsc::Sender<BackendResult>,
     pub(crate) cancelled: Arc<AtomicBool>,
 }
@@ -1238,7 +1259,7 @@ pub(crate) fn launch_realtime_backend_work_item(
     tokio::spawn(async move {
         let cancelled = Arc::clone(&item.cancelled);
         let result_sender = item.result_sender.clone();
-        let result = run_realtime_backend_job(runtime, item.job).await;
+        let result = run_realtime_backend_job(runtime, item.job, item.model_admission).await;
         if !cancelled.load(Ordering::Relaxed) {
             let _ = result_sender.send(result).await;
         }
@@ -1248,7 +1269,11 @@ pub(crate) fn launch_realtime_backend_work_item(
     });
 }
 
-async fn run_realtime_backend_job(runtime: ServerRuntime, job: BackendJob) -> BackendResult {
+async fn run_realtime_backend_job(
+    runtime: ServerRuntime,
+    job: BackendJob,
+    model_admission: ModelSessionAdmission,
+) -> BackendResult {
     // Echo the requested language into the final realtime result; the core
     // Transcription carries no detected language, so the request value is the
     // only source. Capture it before job.language is moved into the builder.
@@ -1270,7 +1295,7 @@ async fn run_realtime_backend_job(runtime: ServerRuntime, job: BackendJob) -> Ba
         .with_execution_target(job.execution_target)
         .with_word_timestamps(job.word_timestamps)
         .with_display_file_name(Some(job.display_name));
-    match transcribe_with_runtime(runtime, request, None).await {
+    match transcribe_with_runtime(runtime, request, None, model_admission).await {
         Ok(transcription) => {
             let words = realtime_words_from_transcription(&transcription);
             BackendResult::Final(BackendSuccess {

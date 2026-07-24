@@ -2232,7 +2232,7 @@ async fn native_transcribe_stays_fail_closed_with_local_pack_only_validation() {
         model_pack_path: Some(pack_root),
     };
     let request = TranscriptionRequest::new(sample_wav, "whisper-large-v3-turbo");
-    let error = transcribe_with_runtime(runtime, request, None)
+    let error = transcribe_with_runtime(runtime, request, None, ModelSessionAdmission::default())
         .await
         .unwrap_err();
     let rendered = error.to_string();

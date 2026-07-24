@@ -526,6 +526,7 @@ pub(super) async fn serve(
     backend_kind: Option<BackendKind>,
     runtime_paths: RuntimePathOverrides,
     model_pack: Option<&Path>,
+    max_native_sessions_per_model: std::num::NonZeroUsize,
     security: ServeSecurityOptions,
 ) -> Result<()> {
     let home = openasr_home()?;
@@ -595,6 +596,7 @@ pub(super) async fn serve(
     // `idle_unload` lives on `Preferences`, on the same document already
     // loaded above as `config_document` -- no second read needed.
     launch_options.idle_unload_after = config_document.preferences.idle_unload.idle_threshold();
+    launch_options.max_concurrent_native_sessions_per_model = Some(max_native_sessions_per_model);
     openasr_server::serve_with_launch_options(
         addr,
         openasr_server::ServerRuntime {

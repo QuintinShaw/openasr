@@ -54,11 +54,12 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
-    ApiError, DistributionContext, HYMT2_TRANSLATION_MODEL_ID, ServerAuth, ServerRuntime,
-    TranslationPackSelection, is_remote_compute_client_request,
-    native_hardware_target_from_execution_target, parse_transcription_multipart,
-    realtime_capabilities_for_runtime_and_distribution, record_file_transcription_history,
-    resolve_translation_pack_selection, transcribe_with_runtime, translation_model_ref_supported,
+    ApiError, DistributionContext, HYMT2_TRANSLATION_MODEL_ID, ModelSessionAdmission, ServerAuth,
+    ServerRuntime, TranslationPackSelection, is_remote_compute_client_request,
+    native_hardware_target_from_execution_target, native_model_session_key,
+    parse_transcription_multipart, realtime_capabilities_for_runtime_and_distribution,
+    record_file_transcription_history, resolve_translation_pack_selection, transcribe_with_runtime,
+    translation_model_ref_supported,
 };
 
 mod native_worker;
@@ -139,6 +140,7 @@ static NATIVE_STREAMING_WORKER_REAPER_STARTED: OnceLock<()> = OnceLock::new();
 pub(crate) async fn websocket(
     State(runtime): State<ServerRuntime>,
     axum::Extension(distribution): axum::Extension<DistributionContext>,
+    axum::Extension(model_admission): axum::Extension<ModelSessionAdmission>,
     axum::Extension(auth): axum::Extension<ServerAuth>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
@@ -148,12 +150,21 @@ pub(crate) async fn websocket(
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
         .write_buffer_size(MAX_WS_MESSAGE_BYTES)
         .max_write_buffer_size(MAX_WS_MESSAGE_BYTES * 2)
-        .on_upgrade(move |socket| handle_websocket(socket, runtime, distribution, record_history))
+        .on_upgrade(move |socket| {
+            handle_websocket(
+                socket,
+                runtime,
+                distribution,
+                model_admission,
+                record_history,
+            )
+        })
 }
 
 pub(crate) async fn stream_transcription(
     runtime: ServerRuntime,
     distribution: DistributionContext,
+    model_admission: ModelSessionAdmission,
     multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
     record_history: bool,
 ) -> Result<Response, ApiError> {
@@ -194,7 +205,7 @@ pub(crate) async fn stream_transcription(
             send_sse(&sender, started).await;
         }
 
-        match transcribe_with_runtime(runtime, request, None).await {
+        match transcribe_with_runtime(runtime, request, None, model_admission).await {
             Ok(transcription) => {
                 let end_ms = transcription_end_ms(&transcription);
                 let history_transcription = transcription.clone();
@@ -358,6 +369,7 @@ async fn handle_websocket(
     socket: WebSocket,
     runtime: ServerRuntime,
     distribution: DistributionContext,
+    model_admission: ModelSessionAdmission,
     record_history: bool,
 ) {
     let (mut socket_sender, mut socket_receiver) = socket.split();
@@ -389,8 +401,13 @@ async fn handle_websocket(
         let _ = socket_sender.send(ws_close(close_code)).await;
     });
 
-    let mut session =
-        WsSession::new_with_history(runtime, distribution, event_sender, record_history);
+    let mut session = WsSession::new_with_history(
+        runtime,
+        distribution,
+        model_admission,
+        event_sender,
+        record_history,
+    );
     if session.emit_capabilities().await.is_err() {
         return;
     }
@@ -887,6 +904,7 @@ fn resolve_model(
 
 fn realtime_error_code_for_api_error(error: &ApiError) -> RealtimeErrorCode {
     match error {
+        ApiError::ModelSessionCapacity(_) => RealtimeErrorCode::BackendNotReady,
         ApiError::Backend(_) | ApiError::BackendJoin(_) => RealtimeErrorCode::BackendCrashed,
         ApiError::AudioPreparation(_) => RealtimeErrorCode::UnsupportedAudioFormat,
         _ => RealtimeErrorCode::StartupConfigError,

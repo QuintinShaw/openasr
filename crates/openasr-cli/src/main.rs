@@ -340,6 +340,7 @@ async fn run() -> Result<()> {
             backend,
             ffmpeg_bin,
             model_pack,
+            max_native_sessions_per_model,
             parent_pid,
         } => {
             if let Some(parent_pid) = parent_pid {
@@ -351,6 +352,7 @@ async fn run() -> Result<()> {
                 backend,
                 RuntimePathOverrides { ffmpeg_bin },
                 model_pack.as_deref(),
+                max_native_sessions_per_model,
                 ServeSecurityOptions {
                     tls_self_signed,
                     tls_sans,
@@ -1776,6 +1778,7 @@ mod tests {
 
         let Command::Serve {
             backend,
+            max_native_sessions_per_model,
             parent_pid,
             ..
         } = cli.command
@@ -1784,7 +1787,16 @@ mod tests {
         };
 
         assert_eq!(backend, Some(BackendKind::Native));
+        assert_eq!(max_native_sessions_per_model.get(), 1);
         assert_eq!(parent_pid, Some(4321));
+    }
+
+    #[test]
+    fn serve_rejects_zero_native_sessions_per_model() {
+        assert!(
+            Cli::try_parse_from(["openasr", "serve", "--max-native-sessions-per-model", "0",])
+                .is_err()
+        );
     }
 
     #[test]
@@ -1798,6 +1810,7 @@ mod tests {
 
         let Command::Serve {
             backend,
+            max_native_sessions_per_model,
             parent_pid,
             ..
         } = cli.command
@@ -1806,6 +1819,7 @@ mod tests {
         };
 
         assert_eq!(backend, None);
+        assert_eq!(max_native_sessions_per_model.get(), 1);
         assert_eq!(parent_pid, None);
     }
 }
