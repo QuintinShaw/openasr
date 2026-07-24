@@ -83,6 +83,7 @@ mod tests {
         let error = backend.transcribe(request).unwrap_err().to_string();
 
         assert!(error.contains("speaker-embedder pack"));
+        assert!(error.contains("redimnet2-b6-cn"));
         assert!(error.contains("mock backend"));
         assert!(error.contains("omit --diarize / diarize=true"));
     }

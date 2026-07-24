@@ -667,12 +667,12 @@ fn native_phrase_bias_capability_for_adapter(
 }
 
 /// Reason reported when neither a self-diarizing pack nor the model-agnostic
-/// VAD + active speaker-embedder path is installed.
+/// VAD + ReDimNet2-B6 (`redimnet2-b6-cn`) path is installed.
 pub(crate) const NATIVE_DIARIZATION_UNAVAILABLE_REASON: &str = "Diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn) or a self-diarizing model pack; install one or omit diarize=true.";
 
 /// Diarization capability for a runtime pack: supported when the model
 /// self-diarizes (e.g. the cohere token-stream) or the model-agnostic
-/// VAD + active speaker-embedder path is installed for this process.
+/// VAD + ReDimNet2-B6 path is installed for this process.
 fn native_diarization_capability_for_adapter(
     adapter: Option<&NativeRuntimeModelAdapter>,
 ) -> BackendFeatureCapability {
@@ -2402,6 +2402,7 @@ mod tests {
             let error = backend.transcribe(request).unwrap_err().to_string();
 
             assert!(error.contains("speaker-embedder pack"));
+            assert!(error.contains("redimnet2-b6-cn"));
             assert!(error.contains("native backend"));
         });
     }
@@ -2626,7 +2627,8 @@ mod tests {
             capabilities
                 .diarization
                 .reason
-                .is_some_and(|reason| reason.contains("speaker-embedder pack"))
+                .is_some_and(|reason| reason.contains("speaker-embedder pack")
+                    && reason.contains("redimnet2-b6-cn"))
         );
     }
 

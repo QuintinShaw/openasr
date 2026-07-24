@@ -261,11 +261,11 @@ impl RealtimeBackendCapabilities {
 
 /// Realtime diarization capability for a session mode, derived fresh on every
 /// call: the streaming diarizer labels utterances inside the session loop, so
-/// it is model-agnostic and needs only the installed active speaker-embedder
-/// pack. The file-per-utterance path diarizes the buffered utterance audio;
-/// true-streaming sessions retain a bounded speech-gated copy of each
-/// utterance for the same purpose. Presence-only probe; pack load failures
-/// still fail closed at session configure time.
+/// it is model-agnostic and needs only the installed ReDimNet2-B6
+/// (`redimnet2-b6-cn`) pack. The file-per-utterance path diarizes the buffered
+/// utterance audio; true-streaming sessions retain a bounded speech-gated copy
+/// of each utterance for the same purpose. Presence-only probe; pack load
+/// failures still fail closed at session configure time.
 pub fn realtime_diarization_capability(mode: RealtimeBackendMode) -> BackendFeatureCapability {
     match mode {
         RealtimeBackendMode::Unsupported => realtime_diarization_unprobed(),
@@ -274,7 +274,7 @@ pub fn realtime_diarization_capability(mode: RealtimeBackendMode) -> BackendFeat
                 BackendFeatureCapability::supported()
             } else {
                 BackendFeatureCapability::reject_request(
-                    "Realtime diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install it or omit diarize=true.",
+                    crate::diarize::embed::REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON,
                 )
             }
         }
@@ -285,7 +285,7 @@ pub fn realtime_diarization_capability(mode: RealtimeBackendMode) -> BackendFeat
 /// constructors overwrite it via [`realtime_diarization_capability`].
 const fn realtime_diarization_unprobed() -> BackendFeatureCapability {
     BackendFeatureCapability::reject_request(
-        "Realtime diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install it or omit diarize=true.",
+        crate::diarize::embed::REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON,
     )
 }
 
@@ -345,14 +345,16 @@ mod tests {
         assert!(
             fallback
                 .reason
-                .is_some_and(|reason| reason.contains("speaker-embedder pack"))
+                .is_some_and(|reason| reason.contains("speaker-embedder pack")
+                    && reason.contains("redimnet2-b6-cn"))
         );
         let streaming = realtime_diarization_capability(RealtimeBackendMode::TrueStreaming);
         assert!(!streaming.supported);
         assert!(
             streaming
                 .reason
-                .is_some_and(|reason| reason.contains("speaker-embedder pack"))
+                .is_some_and(|reason| reason.contains("speaker-embedder pack")
+                    && reason.contains("redimnet2-b6-cn"))
         );
 
         let install_dir = temp.path().join("models/redimnet2-b6-cn/fp16");

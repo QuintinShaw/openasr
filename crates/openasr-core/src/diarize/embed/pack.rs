@@ -16,6 +16,26 @@ static SHARED_EMBEDDER: OnceLock<SharedEmbedderState> = OnceLock::new();
 const REDIMNET_PACK_ENV: &str = "OPENASR_REDIMNET_PACK";
 const REDIMNET_INSTALLED_DIR_HINT: &str = "redimnet";
 
+/// Catalog / pull id of the only supported speaker-embedder pack.
+pub const SPEAKER_EMBEDDER_PACK_ID: &str = "redimnet2-b6-cn";
+
+/// User-facing label for the only supported speaker-embedder pack.
+pub const SPEAKER_EMBEDDER_PACK_LABEL: &str =
+    "ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn)";
+
+/// Fail-closed reason when Voice ID enrollment cannot resolve the pack.
+pub const VOICE_ID_EMBEDDER_PACK_MISSING_REASON: &str = "creating a voice id requires the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install the pack first";
+
+/// Fail-closed reason when legacy voice-match enrollment cannot resolve the pack.
+pub const VOICE_MATCH_EMBEDDER_PACK_MISSING_REASON: &str = "creating a voice match profile requires the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install the pack first";
+
+/// Fail-closed reason when diarize was accepted by capability probe but the pack
+/// then failed to load (path present, weights unusable).
+pub const DIARIZATION_EMBEDDER_LOAD_FAILED_REASON: &str = "Diarization was requested but the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn) could not be loaded.";
+
+/// Fail-closed reason when realtime diarize is requested without the pack.
+pub const REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON: &str = "Realtime diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install it or omit diarize=true.";
+
 /// Human-readable label for ReDimNet2-B6's embedding space (documentation /
 /// audit metadata only). The actual runtime compatibility gate is the pack's
 /// content fingerprint (`SpeakerEmbedderIdentity::pack_fingerprint`, a sha256
@@ -114,5 +134,34 @@ mod tests {
     fn redimnet_pack_env_name_is_stable() {
         assert_eq!(REDIMNET_PACK_ENV, "OPENASR_REDIMNET_PACK");
         assert_eq!(REDIMNET_INSTALLED_DIR_HINT, "redimnet");
+    }
+
+    #[test]
+    fn missing_embedder_reasons_name_redimnet2_b6_cn() {
+        assert_eq!(SPEAKER_EMBEDDER_PACK_ID, "redimnet2-b6-cn");
+        for reason in [
+            VOICE_ID_EMBEDDER_PACK_MISSING_REASON,
+            VOICE_MATCH_EMBEDDER_PACK_MISSING_REASON,
+            DIARIZATION_EMBEDDER_LOAD_FAILED_REASON,
+            REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON,
+            SPEAKER_EMBEDDER_PACK_LABEL,
+        ] {
+            assert!(
+                reason.contains(SPEAKER_EMBEDDER_PACK_ID),
+                "reason must name the install id: {reason}"
+            );
+            assert!(
+                reason.contains("ReDimNet2-B6"),
+                "reason must name the pack family: {reason}"
+            );
+            assert!(
+                !reason.to_ascii_lowercase().contains("wespeaker"),
+                "reason must not mention WeSpeaker: {reason}"
+            );
+            assert!(
+                !reason.contains("active speaker-embedder"),
+                "reason must not use the retired dual-path wording: {reason}"
+            );
+        }
     }
 }

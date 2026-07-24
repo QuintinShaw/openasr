@@ -1441,7 +1441,7 @@ impl LivePipeline {
         let streaming_diarizer = if config.diarize {
             Some(
                 openasr_core::diarize::streaming::StreamingDiarizer::shared(16_000).context(
-                    "Live diarization was requested but the active speaker-embedder pack could not be loaded.",
+                    openasr_core::diarize::embed::DIARIZATION_EMBEDDER_LOAD_FAILED_REASON,
                 )?,
             )
         } else {

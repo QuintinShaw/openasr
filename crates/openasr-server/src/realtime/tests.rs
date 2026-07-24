@@ -3595,6 +3595,7 @@ async fn session_start_rejects_diarize_without_embedder_pack() {
         RealtimeEvent::Error(RealtimeErrorEvent { code, message, .. }) => {
             assert_eq!(*code, RealtimeErrorCode::StartupConfigError);
             assert!(message.contains("speaker-embedder pack"));
+            assert!(message.contains("redimnet2-b6-cn"));
         }
         other => panic!("expected startup config error, got {other:?}"),
     }
@@ -4584,6 +4585,7 @@ async fn session_start_rejects_diarize_when_embedder_pack_fails_to_load() {
         RealtimeEvent::Error(RealtimeErrorEvent { code, message, .. }) => {
             assert_eq!(*code, RealtimeErrorCode::StartupConfigError);
             assert!(message.contains("could not be loaded"));
+            assert!(message.contains("redimnet2-b6-cn"));
         }
         other => panic!("expected startup config error, got {other:?}"),
     }

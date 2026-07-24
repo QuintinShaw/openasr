@@ -2236,6 +2236,12 @@ async fn speaker_enrollment_routes_reject_short_silent_and_missing_pack() {
                 .unwrap()
                 .contains("speaker-embedder pack")
         );
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("redimnet2-b6-cn")
+        );
     })
     .await;
 }
@@ -4511,6 +4517,7 @@ async fn transcriptions_with_native_backend_and_diarize_returns_bad_request() {
     let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
     let body = String::from_utf8_lossy(&bytes);
     assert!(body.contains("speaker-embedder pack"));
+    assert!(body.contains("redimnet2-b6-cn"));
 }
 
 #[tokio::test]

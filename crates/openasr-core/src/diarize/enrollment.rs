@@ -128,9 +128,7 @@ pub enum SpeakerEnrollmentError {
         "enrollment audio is too short: need at least {required:.1} seconds of speech, got {actual:.2}"
     )]
     TooShortSpeech { required: f32, actual: f32 },
-    #[error(
-        "creating a voice match profile requires the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install the pack first"
-    )]
+    #[error("{}", crate::diarize::embed::VOICE_MATCH_EMBEDDER_PACK_MISSING_REASON)]
     EmbedderPackMissing,
     #[error("could not embed enrollment audio: {0}")]
     Embed(EmbedError),

@@ -437,16 +437,14 @@ fn active_embedder_and_identity() -> Result<
 > {
     let embedder = openasr_core::diarize::embed::shared_embedder().ok_or_else(|| {
         ApiError::BadRequest(
-            "creating a voice id requires the active speaker-embedder pack; install the pack first"
-                .into(),
+            openasr_core::diarize::embed::VOICE_ID_EMBEDDER_PACK_MISSING_REASON.into(),
         )
     })?;
     let identity = openasr_core::diarize::embed::shared_embedder_identity()
         .cloned()
         .ok_or_else(|| {
             ApiError::BadRequest(
-                "creating a voice id requires the active speaker-embedder pack; install the pack first"
-                    .into(),
+                openasr_core::diarize::embed::VOICE_ID_EMBEDDER_PACK_MISSING_REASON.into(),
             )
         })?;
     Ok((embedder, identity))

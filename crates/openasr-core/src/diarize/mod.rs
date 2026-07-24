@@ -9,11 +9,10 @@
 //! diarization pipeline (interval contract, speaker segmentation/embedding,
 //! clustering, and attribution) under this module.
 
-/// Whether the model-agnostic VAD + speaker-embedder diarization path can run:
-/// the active speaker-embedder pack is installed (the Stream-VAD VAD is
-/// vendored and always available). This is a presence-only probe for
-/// capability reporting; a pack that fails to load still fails closed at
-/// request time.
+/// Whether the model-agnostic VAD + ReDimNet2-B6 diarization path can run:
+/// the `redimnet2-b6-cn` pack is installed (the Stream-VAD VAD is vendored and
+/// always available). This is a presence-only probe for capability reporting;
+/// a pack that fails to load still fails closed at request time.
 pub fn vad_diarization_available() -> bool {
     embed::embedder_pack_installed()
 }

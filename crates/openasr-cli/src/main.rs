@@ -835,7 +835,7 @@ fn enroll_speaker(input: &Path, name: &str, match_similarity: Option<f32>) -> Re
     }
     if match_similarity.is_some() {
         eprintln!(
-            "note: --match-similarity is ignored for Voice ID v2; matching uses the active embedder calibration."
+            "note: --match-similarity is ignored for Voice ID v2; matching uses the ReDimNet2-B6 embedder calibration."
         );
     }
     let home = openasr_core::openasr_home()
@@ -844,14 +844,17 @@ fn enroll_speaker(input: &Path, name: &str, match_similarity: Option<f32>) -> Re
         .map_err(|reason| anyhow::anyhow!("Could not open Voice ID store: {reason}."))?;
     let embedder = openasr_core::diarize::embed::shared_embedder().ok_or_else(|| {
         anyhow::anyhow!(
-            "Could not create speaker voice match: the active speaker-embedder pack is missing.\nInstall redimnet2-b6-cn first."
+            "Could not create speaker voice match: {}\nInstall {} first.",
+            openasr_core::diarize::embed::SPEAKER_EMBEDDER_PACK_LABEL,
+            openasr_core::diarize::embed::SPEAKER_EMBEDDER_PACK_ID,
         )
     })?;
     let identity = openasr_core::diarize::embed::shared_embedder_identity()
         .cloned()
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "Could not create speaker voice match: the active speaker-embedder pack is missing."
+                "Could not create speaker voice match: {} is missing.",
+                openasr_core::diarize::embed::SPEAKER_EMBEDDER_PACK_LABEL,
             )
         })?;
     let pcm = openasr_core::load_native_wav_16khz_mono_f32_v0(

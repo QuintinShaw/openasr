@@ -1028,7 +1028,7 @@ impl WsSession {
             let Some(diarizer) = self.build_streaming_diarizer(16_000) else {
                 self.emit_error(
                     RealtimeErrorCode::StartupConfigError,
-                    "Realtime diarization was requested but the active speaker-embedder pack could not be loaded.",
+                    openasr_core::diarize::embed::DIARIZATION_EMBEDDER_LOAD_FAILED_REASON,
                     false,
                 )
                 .await?;

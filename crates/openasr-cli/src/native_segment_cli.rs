@@ -897,7 +897,7 @@ fn diarization_supported(backend: BackendKind, model_pack_path: Option<&Path>) -
                 .diarization
                 .supported
         }
-        // The VAD + active speaker-embedder diarization path is model-agnostic,
+        // The VAD + ReDimNet2-B6 diarization path is model-agnostic,
         // so without a resolved pack path the native answer is exactly "is it installed".
         (BackendKind::Native, None) => openasr_core::diarize::vad_diarization_available(),
         _ => {
@@ -1644,17 +1644,16 @@ mod tests {
     fn diarization_cli_uses_backend_capabilities() {
         let _guard = env_lock();
         let temp = tempfile::tempdir().unwrap();
-        // Isolate the model-agnostic VAD + speaker-embedder probe from the host
+        // Isolate the model-agnostic VAD + ReDimNet2-B6 probe from the host
         // machine's installed packs so the fail-closed expectations are hermetic.
-        let _campplus_pack = EnvVarRestore::remove("OPENASR_CAMPPLUS_PACK");
         let _redimnet_pack = EnvVarRestore::remove("OPENASR_REDIMNET_PACK");
-        let _speaker_embedder = EnvVarRestore::remove("OPENASR_SPEAKER_EMBEDDER");
         let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
 
         let error = ensure_diarization_supported(BackendKind::Mock, None, true)
             .expect_err("mock diarization should fail closed")
             .to_string();
         assert!(error.contains("speaker-embedder pack"));
+        assert!(error.contains("redimnet2-b6-cn"));
         assert!(error.contains(backend_name(BackendKind::Mock)));
 
         let base_runtime_path = temp.path().join("cohere-base.oasr");
@@ -1668,6 +1667,7 @@ mod tests {
                 .expect_err("base native pack must keep diarization fail-closed")
                 .to_string();
         assert!(error.contains("speaker-embedder pack"));
+        assert!(error.contains("redimnet2-b6-cn"));
         assert!(error.contains(backend_name(BackendKind::Native)));
 
         // Installing the ReDimNet2-B6 embedder pack enables the model-agnostic

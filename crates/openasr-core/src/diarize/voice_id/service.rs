@@ -27,9 +27,7 @@ pub enum VoiceIdServiceError {
     Quality(#[from] QualityError),
     #[error("speaker enrollment requires a 16 kHz mono PCM16 WAV: {0}")]
     InvalidAudio(String),
-    #[error(
-        "creating a voice id requires the active speaker-embedder pack; install the pack first"
-    )]
+    #[error("{}", crate::diarize::embed::VOICE_ID_EMBEDDER_PACK_MISSING_REASON)]
     EmbedderPackMissing,
     #[error("could not embed enrollment audio: {0}")]
     Embed(#[from] EmbedError),

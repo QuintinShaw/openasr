@@ -1097,7 +1097,7 @@ fn run_native_transcription_impl(
         request.phrase_bias.as_ref(),
     )?;
     // Diarization is supported when the model self-diarizes (e.g. cohere) or the
-    // model-agnostic neural VAD + active speaker-embedder pack is available.
+    // model-agnostic neural VAD + ReDimNet2-B6 pack is available.
     let model_self_diarizes = super::native_runtime_metadata_supports_diarization(
         &runtime_preflight.metadata,
         selected_family.self_diarizes,
