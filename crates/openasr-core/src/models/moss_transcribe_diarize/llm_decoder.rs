@@ -160,6 +160,17 @@ impl MossTdDecoderRuntime {
         self.whole_decoder.backend_label()
     }
 
+    /// Frees this decoder's per-token grow-to-fit host step buffer. Call
+    /// after every decode, right before this runtime goes back into
+    /// `executor.rs`'s thread-local resident cache -- without it, a session-
+    /// scoped allocation sized for one utterance would otherwise ride along
+    /// on the cached runtime into the next, unrelated request. Mirrors
+    /// `qwen::ggml_executor`'s identical call around its own resident
+    /// whole-decoder cache.
+    pub(crate) fn release_session_scoped_buffers(&mut self) {
+        self.whole_decoder.release_session_scoped_buffers();
+    }
+
     pub(crate) fn new_kv_caches(&self) -> Vec<Qwen3AsrLayerKvCacheState> {
         // Clamp the RoPE context limit (`max_positions`, up to 131072) down to
         // the KV-cache preallocation cap: `Qwen3AsrLayerKvCacheState::new`

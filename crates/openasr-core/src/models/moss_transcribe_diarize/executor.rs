@@ -19,10 +19,14 @@
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+
 use thiserror::Error;
 
 use crate::NativeAsrError;
 use crate::api::backend::Transcription;
+use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
     run_builtin_seq2seq_decode_policy,
@@ -40,19 +44,21 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
+use crate::models::thread_local_runtime_cache::{
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
+    with_thread_local_cached_mut_by_key,
+};
 use crate::models::whisper::whisper_log_mel_spectrogram_16khz_mono_v0;
 
 use super::adaptor_graph::{load_moss_adaptor_weights_from_reader, run_moss_adaptor};
 use super::decode_prompt::build_moss_td_decode_prompt;
-use super::encoder_graph::{
-    MossEncoderConfig, MossEncoderRuntime, load_moss_encoder_weights_from_reader,
-};
-use super::graph_config::moss_td_encoder_graph_config;
+use super::encoder_graph::{MossEncoderConfig, MossEncoderRuntime};
+use super::graph_config::{moss_td_encoder_graph_config, moss_td_runtime_graph_config};
 use super::llm_decoder::MossTdDecoderRuntime;
 use super::prompt_embedding::build_moss_td_prompt_embeddings_with_audio_splice;
 use super::runtime_contract::{
-    MOSS_TD_ADAPTOR_NORM_EPSILON, moss_td_kv_cache_positions, parse_adaptor_metadata,
-    parse_decoder_metadata, parse_encoder_metadata,
+    MOSS_TD_ADAPTOR_NORM_EPSILON, MossTdDecoderMetadata, moss_td_kv_cache_positions,
+    parse_adaptor_metadata, parse_decoder_metadata, parse_encoder_metadata,
 };
 use super::tokenizer::MossTdTokenizer;
 
@@ -177,6 +183,358 @@ impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
     }
 }
 
+/// Thread-local resident cache for the family's two heavy per-pack runtimes
+/// (the Whisper-Medium-style [`MossEncoderRuntime`] and the Qwen3
+/// [`MossTdDecoderRuntime`]), keyed by `(canonical pack path, resolved
+/// backend)`. Mirrors `firered_aed::executor`'s
+/// `FIRERED_AED_ENCODER_RUNTIME_BY_KEY`/`FIRERED_AED_DECODER_RUNTIME_BY_KEY`
+/// exactly -- same shared `BoundedRuntimeCache` + `with_thread_local_cached_mut_by_key`
+/// machinery, same key shape, same lazy idle-unload-generation eviction. Before
+/// this, every `execute()` rebuilt both runtimes from scratch: re-mmapped the
+/// pack, re-read every encoder tensor off disk, and re-uploaded every decoder
+/// layer's weights, on every single call (including every chunk of the same
+/// longform request).
+type MossTdEncoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
+type MossTdDecoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
+
+thread_local! {
+    static MOSS_TD_ENCODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<MossTdEncoderRuntimeCacheKey, MossEncoderRuntime>> =
+        RefCell::new(BoundedRuntimeCache::new());
+    static MOSS_TD_DECODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<MossTdDecoderRuntimeCacheKey, MossTdDecoderRuntime>> =
+        RefCell::new(BoundedRuntimeCache::new());
+}
+
+// Test-only build counters, incremented from inside the two caches' `build`
+// closures below -- lets a same-thread test pin "a second call reuses the
+// cached runtime" as a structural fact (build count stays 1 across two
+// calls) rather than inferring cache-hit behavior from wall-clock timing.
+#[cfg(test)]
+thread_local! {
+    static MOSS_TD_ENCODER_RUNTIME_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MOSS_TD_DECODER_RUNTIME_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_moss_td_runtime_build_counts_for_test() {
+    MOSS_TD_ENCODER_RUNTIME_BUILD_COUNT.with(|count| count.set(0));
+    MOSS_TD_DECODER_RUNTIME_BUILD_COUNT.with(|count| count.set(0));
+}
+
+/// `(encoder builds, decoder builds)` recorded on the calling thread since
+/// the last [`reset_moss_td_runtime_build_counts_for_test`].
+#[cfg(test)]
+fn moss_td_runtime_build_counts_for_test() -> (usize, usize) {
+    (
+        MOSS_TD_ENCODER_RUNTIME_BUILD_COUNT.with(std::cell::Cell::get),
+        MOSS_TD_DECODER_RUNTIME_BUILD_COUNT.with(std::cell::Cell::get),
+    )
+}
+
+/// Upstream `_compute_audio_token_length`'s per-chunk audio-token count: how
+/// many post-merge adaptor tokens one Whisper-encoder chunk of `chunk_samples`
+/// raw 16kHz samples produces, given `token_stride` (`hop_length` * the
+/// Whisper conv stem's 2x stride * the adaptor's merge size). Pure integer
+/// arithmetic with no model-pack dependency -- factored out of the encode
+/// loop below so the slice-planning math can be pinned by a weight-free unit
+/// test (`moss_td_chunk_frame_math_tests`) that runs in every default
+/// `cargo nextest run`, unlike the family's real end-to-end `golden_diff_*`
+/// tests, which need the private dev-only fp16 pack and stay `#[ignore]`d
+/// (same artifact-policy constraint every other builtin family's CI golden
+/// coverage works around -- see e.g. firered-aed's weight-free frontend
+/// golden).
+fn moss_td_chunk_token_length(chunk_samples: usize, token_stride: usize) -> usize {
+    (chunk_samples - 1) / token_stride.max(1) + 1
+}
+
+/// This chunk's post-merge encoder frames actually kept: `token_length` audio
+/// tokens each span `merge_size` pre-merge encoder frames, capped at the
+/// encoder's `max_source_positions` (a full un-trimmed 30s chunk can never
+/// legitimately need more than that many frames kept).
+fn moss_td_chunk_keep_frames(
+    token_length: usize,
+    merge_size: usize,
+    max_source_positions: usize,
+) -> usize {
+    (token_length * merge_size).min(max_source_positions)
+}
+
+/// Upstream's `time_merge` truncation: the total kept frames across every
+/// chunk, rounded down to the nearest full `merge_size` group. In practice
+/// every chunk's `moss_td_chunk_keep_frames` result is already a multiple of
+/// `merge_size` (either `token_length * merge_size` directly, or the
+/// `max_source_positions` cap, which is itself merge-size-aligned for every
+/// real checkpoint), so summing them keeps the running total aligned too --
+/// this is a no-op guard against that invariant, not a silent frame drop.
+fn moss_td_aligned_frame_count(total_frames: usize, merge_size: usize) -> usize {
+    let merge_size = merge_size.max(1);
+    (total_frames / merge_size) * merge_size
+}
+
+/// Weight-free, always-on coverage for the executor's chunk/slice-planning
+/// arithmetic: pure integer math with no model pack involved, so (unlike the
+/// family's `golden_diff_*` end-to-end tests below, which need the private
+/// dev-only fp16 pack and stay `#[ignore]`d) these run in every default
+/// `cargo nextest run --workspace`. Constants are pinned against the real
+/// checkpoint's shape (`runtime_contract::tests::parses_adaptor_metadata_matching_real_checkpoint`'s
+/// `merge_size == 4`, `package_import`'s `audio_merge_size: 4`, and
+/// `parses_encoder_metadata_matching_real_checkpoint`'s
+/// `max_source_positions == 1500` -- the standard Whisper-Medium 30s ->
+/// 1500-frame shape).
+#[cfg(test)]
+mod moss_td_chunk_frame_math_tests {
+    use super::*;
+
+    const MERGE_SIZE: usize = 4;
+    const MAX_SOURCE_POSITIONS: usize = 1500;
+    const TOKEN_STRIDE: usize = HOP_LENGTH * WHISPER_ENCODER_CONV_STRIDE * MERGE_SIZE;
+
+    #[test]
+    fn token_stride_matches_the_real_checkpoints_merge_size() {
+        assert_eq!(TOKEN_STRIDE, 1_280);
+    }
+
+    #[test]
+    fn short_clip_single_partial_chunk_keeps_the_expected_frame_count() {
+        // A ~10s clip (jfk.wav-shaped): one partial 30s chunk, well under
+        // `CHUNK_SAMPLES`, never hits the `max_source_positions` cap.
+        let chunk_samples = 160_000; // 10s @ 16kHz
+        let token_length = moss_td_chunk_token_length(chunk_samples, TOKEN_STRIDE);
+        assert_eq!(token_length, 125);
+        let keep_frames = moss_td_chunk_keep_frames(token_length, MERGE_SIZE, MAX_SOURCE_POSITIONS);
+        assert_eq!(keep_frames, 500);
+    }
+
+    #[test]
+    fn full_chunk_saturates_max_source_positions_without_truncating() {
+        // A full un-trimmed 30s chunk (`CHUNK_SAMPLES`) always keeps exactly
+        // `max_source_positions` frames -- the encoder always outputs that
+        // many for a full chunk, so the `.min()` cap lands exactly on it
+        // rather than truncating away real content.
+        let token_length = moss_td_chunk_token_length(CHUNK_SAMPLES, TOKEN_STRIDE);
+        assert_eq!(token_length, 375);
+        let keep_frames = moss_td_chunk_keep_frames(token_length, MERGE_SIZE, MAX_SOURCE_POSITIONS);
+        assert_eq!(keep_frames, MAX_SOURCE_POSITIONS);
+    }
+
+    #[test]
+    fn multi_chunk_long_file_sums_every_chunks_kept_frames() {
+        // A ~76s file (longform-shaped, like the other builtin families'
+        // committed `fixtures/longform_en_zh.wav` golden): splits into three
+        // `CHUNK_SAMPLES`-bounded chunks -- two full 30s chunks plus a ~16s
+        // tail -- exercising the same multi-chunk accumulation the
+        // executor's real encode loop runs across every chunk of a longform
+        // request, all the way through the final merge-size-alignment
+        // truncation, without needing a real pack/weights.
+        let chunk_lens = [CHUNK_SAMPLES, CHUNK_SAMPLES, 256_000];
+        let mut total_frames = 0usize;
+        for &chunk_samples in &chunk_lens {
+            let token_length = moss_td_chunk_token_length(chunk_samples, TOKEN_STRIDE);
+            total_frames +=
+                moss_td_chunk_keep_frames(token_length, MERGE_SIZE, MAX_SOURCE_POSITIONS);
+        }
+        assert_eq!(total_frames, 1_500 + 1_500 + 800);
+        // Every chunk's kept-frame count is already a multiple of
+        // `MERGE_SIZE`, so the running total across all three chunks stays
+        // aligned and the final truncation is a no-op (see
+        // `moss_td_aligned_frame_count`'s doc comment).
+        assert_eq!(
+            moss_td_aligned_frame_count(total_frames, MERGE_SIZE),
+            total_frames
+        );
+    }
+
+    #[test]
+    fn aligned_frame_count_truncates_a_synthetic_misaligned_total() {
+        // Real per-chunk totals are always already merge-size-aligned (see
+        // the test above), so this never fires in production -- but the
+        // truncation function itself must still behave correctly as
+        // defense-in-depth if that invariant is ever violated by a future
+        // change.
+        assert_eq!(moss_td_aligned_frame_count(3_803, MERGE_SIZE), 3_800);
+        assert_eq!(moss_td_aligned_frame_count(3_800, MERGE_SIZE), 3_800);
+    }
+}
+
+/// Encodes every 30s chunk of `samples` against the cached, resident encoder
+/// runtime for this pack+backend, returning the concatenated (already
+/// merge-size-aligned) encoder rows and the number of kept frames -- the same
+/// computation the executor's per-chunk loop always did, just routed through
+/// the shared resident-runtime cache instead of building a fresh
+/// [`MossEncoderRuntime`] (and re-reading every encoder tensor from disk) on
+/// every call.
+fn encode_moss_td_chunks_with_cached_runtime(
+    runtime_path: &Path,
+    encoder_config: MossEncoderConfig,
+    merge_size: usize,
+    samples: &[f32],
+) -> Result<(Vec<f32>, usize), MossTdExecutorError> {
+    let key = (
+        canonical_runtime_cache_path(runtime_path),
+        moss_td_encoder_graph_config().backend,
+    );
+    // Upstream `_compute_audio_token_length`'s stride: hop_length * the
+    // Whisper conv stem's 2x stride * audio_merge_size.
+    let token_stride = HOP_LENGTH * WHISPER_ENCODER_CONV_STRIDE * merge_size;
+    with_thread_local_cached_mut_by_key(
+        &MOSS_TD_ENCODER_RUNTIME_BY_KEY,
+        key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
+        || {
+            #[cfg(test)]
+            MOSS_TD_ENCODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
+            MossEncoderRuntime::new(runtime_path, encoder_config).map_err(|error| {
+                MossTdExecutorError::EncoderFailed {
+                    reason: format!("could not initialize encoder runtime: {error}"),
+                }
+            })
+        },
+        |runtime| {
+            let mut concatenated_rows: Vec<f32> = Vec::new();
+            let mut total_frames = 0usize;
+            for chunk in samples.chunks(CHUNK_SAMPLES) {
+                let mel = whisper_log_mel_spectrogram_16khz_mono_v0(
+                    chunk,
+                    encoder_config.n_mels,
+                    MEL_TARGET_FRAMES,
+                )
+                .map_err(|error| MossTdExecutorError::FrontendFailed {
+                    reason: error.to_string(),
+                })?;
+                let encoder_out = runtime
+                    .encode(encoder_config, mel.data(), MEL_TARGET_FRAMES)
+                    .map_err(|error| MossTdExecutorError::EncoderFailed {
+                        reason: error.to_string(),
+                    })?;
+                let token_length = moss_td_chunk_token_length(chunk.len(), token_stride);
+                let keep_frames = moss_td_chunk_keep_frames(
+                    token_length,
+                    merge_size,
+                    encoder_config.max_source_positions,
+                );
+                let keep_values = keep_frames * encoder_config.d_model;
+                concatenated_rows.extend_from_slice(&encoder_out[..keep_values]);
+                total_frames += keep_frames;
+            }
+            Ok((concatenated_rows, total_frames))
+        },
+    )
+}
+
+/// Runs the ChatML+audio-splice prompt embedding through the cached, resident
+/// decoder runtime for this pack+backend: prefill, then the shared greedy
+/// decode driver through to `<|im_end|>` (or the fail-closed token budget),
+/// returning the trimmed decode text. Mirrors `firered_aed::executor`'s
+/// `decode_with_cached_runtime`: the runtime (loaded weights + the Qwen
+/// decode graph's reuse machinery) stays resident across calls, while every
+/// per-utterance KV cache is still allocated fresh right here
+/// (`MossTdDecoderRuntime::new_kv_caches`) -- unlike firered-aed's decoder,
+/// this family's `MossTdDecoderRuntime` carries no cross-request KV state of
+/// its own between calls, so no cache-reset step is needed before reuse.
+fn run_moss_td_decoder_with_cached_runtime(
+    runtime_path: &Path,
+    decoder_metadata: MossTdDecoderMetadata,
+    decode_prompt_token_ids: &[u32],
+    audio_pad_positions: &[usize],
+    audio_rows: &[f32],
+    tokenizer: &MossTdTokenizer,
+) -> Result<String, MossTdExecutorError> {
+    let key = (
+        canonical_runtime_cache_path(runtime_path),
+        moss_td_runtime_graph_config().backend,
+    );
+    with_thread_local_cached_mut_by_key(
+        &MOSS_TD_DECODER_RUNTIME_BY_KEY,
+        key,
+        DEFAULT_RUNTIME_CACHE_CAPACITY,
+        || {
+            #[cfg(test)]
+            MOSS_TD_DECODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
+            MossTdDecoderRuntime::new(runtime_path, decoder_metadata).map_err(|error| {
+                MossTdExecutorError::DecoderFailed {
+                    reason: error.to_string(),
+                }
+            })
+        },
+        |decoder| {
+            if std::env::var_os("OPENASR_MOSS_TD_PROFILE").is_some() {
+                eprintln!(
+                    "OPENASR_MOSS_TD_PROFILE decoder_backend={}",
+                    decoder.backend_label()
+                );
+            }
+
+            let token_rows_len = decode_prompt_token_ids.len() * decoder_metadata.d_model;
+            let mut token_rows = Vec::with_capacity(token_rows_len);
+            for &token_id in decode_prompt_token_ids {
+                let row = decoder.gather_token_embedding(token_id).map_err(|error| {
+                    MossTdExecutorError::DecoderFailed {
+                        reason: error.to_string(),
+                    }
+                })?;
+                token_rows.extend_from_slice(&row);
+            }
+            let spliced = build_moss_td_prompt_embeddings_with_audio_splice(
+                decode_prompt_token_ids.len(),
+                audio_pad_positions,
+                decoder_metadata.d_model,
+                &token_rows,
+                audio_rows,
+            )
+            .map_err(|error| MossTdExecutorError::PromptEmbeddingFailed {
+                reason: error.to_string(),
+            })?;
+            let prompt_embeddings = Qwen3AsrPromptEmbeddings {
+                hidden_size: spliced.hidden_size,
+                token_count: spliced.token_count,
+                token_major_values: spliced.token_major_values,
+            };
+
+            let layer_kv_caches = decoder.new_kv_caches();
+            let mut step_executor = MossTdGreedyStepExecutor {
+                decoder,
+                layer_kv_caches,
+                prompt_embeddings: Some(prompt_embeddings),
+                cache_prompt_tokens: 0,
+            };
+            let config = BuiltinSeq2SeqDecodePolicyConfigInput {
+                initial_prompt_tokens: decode_prompt_token_ids.to_vec(),
+                eot_token_id: tokenizer.im_end_token_id,
+                vocab_size: decoder_metadata.vocab_size,
+                max_generated_tokens: MOSS_TD_MAX_GENERATED_TOKENS,
+            };
+            let result = run_builtin_seq2seq_decode_policy(
+                crate::arch::MOSS_TD_DECODE_POLICY_ID,
+                &config,
+                tokenizer,
+                None,
+                &mut step_executor,
+                &|token_ids: &[u32]| {
+                    tokenizer.decode_text_token_ids(token_ids).map_err(|error| {
+                        Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
+                            reason: error.to_string(),
+                        }
+                    })
+                },
+                |error: Seq2SeqGreedyDecodeError| error,
+                |error: Seq2SeqGreedyDecodeError| error,
+                map_registry_error,
+            );
+            // Release this request's per-token grow-to-fit host buffer before
+            // the runtime goes back into the cache (mirrors qwen3-asr's
+            // `ggml_executor`'s `release_session_scoped_buffers` call around
+            // its own resident whole-decoder cache) -- unconditionally, on
+            // both the success and failure paths, so a failed decode never
+            // leaves a session-scoped allocation riding along on the cached
+            // runtime.
+            step_executor.decoder.release_session_scoped_buffers();
+            let result = result.map_err(|error| MossTdExecutorError::GreedyDecodeFailed {
+                reason: error.to_string(),
+            })?;
+            Ok(result.text.trim().to_string())
+        },
+    )
+}
+
 impl MossTdGgmlExecutor {
     fn execute_inner(
         &self,
@@ -234,10 +592,6 @@ impl MossTdGgmlExecutor {
             n_mels: encoder_metadata.n_mels,
             max_source_positions: encoder_metadata.max_source_positions,
         };
-        let encoder_weights = load_moss_encoder_weights_from_reader(&reader, encoder_config)
-            .map_err(|error| MossTdExecutorError::EncoderFailed {
-                reason: error.to_string(),
-            })?;
         let adaptor_weights = load_moss_adaptor_weights_from_reader(
             &reader,
             encoder_metadata.d_model,
@@ -249,55 +603,18 @@ impl MossTdGgmlExecutor {
             reason: error.to_string(),
         })?;
 
-        // Upstream `_compute_audio_token_length`'s stride: hop_length * the
-        // Whisper conv stem's 2x stride * audio_merge_size.
-        let token_stride = HOP_LENGTH * WHISPER_ENCODER_CONV_STRIDE * adaptor_metadata.merge_size;
-        // Built once and reused across every chunk in the loop below: the
-        // loaded-weight context mmaps the whole pack once, and the six 2D
-        // projection weights per layer bind zero-copy from it on every
-        // `encode()` call (see `encoder_graph`'s module doc).
-        let mut encoder_runtime = MossEncoderRuntime::new(
-            moss_td_encoder_graph_config(),
-            Some(preflight.runtime_source.path()),
-        )
-        .map_err(|error| MossTdExecutorError::EncoderFailed {
-            reason: format!("could not initialize encoder runtime: {error}"),
-        })?;
-
-        let mut concatenated_rows: Vec<f32> = Vec::new();
-        let mut total_frames = 0usize;
-        for chunk in samples.chunks(CHUNK_SAMPLES) {
-            let mel = whisper_log_mel_spectrogram_16khz_mono_v0(
-                chunk,
-                encoder_metadata.n_mels,
-                MEL_TARGET_FRAMES,
-            )
-            .map_err(|error| MossTdExecutorError::FrontendFailed {
-                reason: error.to_string(),
-            })?;
-            let encoder_out = encoder_runtime
-                .encode(
-                    &encoder_weights,
-                    encoder_config,
-                    mel.data(),
-                    MEL_TARGET_FRAMES,
-                )
-                .map_err(|error| MossTdExecutorError::EncoderFailed {
-                    reason: error.to_string(),
-                })?;
-            let token_length = (chunk.len() - 1) / token_stride.max(1) + 1;
-            let keep_frames = (token_length * adaptor_metadata.merge_size)
-                .min(encoder_metadata.max_source_positions);
-            let keep_values = keep_frames * encoder_metadata.d_model;
-            concatenated_rows.extend_from_slice(&encoder_out[..keep_values]);
-            total_frames += keep_frames;
-        }
-        // Upstream's `time_merge` truncates any remainder below a full
-        // merge-size group; concatenating already-merge-size-aligned
-        // per-chunk lengths (see above) means the total is already aligned,
-        // so this is a no-op guard, not a silent frame drop.
-        let aligned_frames =
-            (total_frames / adaptor_metadata.merge_size) * adaptor_metadata.merge_size;
+        // Routed through the resident, thread-local encoder-runtime cache
+        // (mirrors `firered_aed::executor`'s cached encoder): the loaded
+        // weights + mmap'd zero-copy context stay resident across calls to
+        // this pack+backend instead of being rebuilt from scratch on every
+        // `execute()`.
+        let (mut concatenated_rows, total_frames) = encode_moss_td_chunks_with_cached_runtime(
+            preflight.runtime_source.path(),
+            encoder_config,
+            adaptor_metadata.merge_size,
+            samples,
+        )?;
+        let aligned_frames = moss_td_aligned_frame_count(total_frames, adaptor_metadata.merge_size);
         concatenated_rows.truncate(aligned_frames * encoder_metadata.d_model);
 
         let (audio_rows, audio_token_count) = run_moss_adaptor(
@@ -338,81 +655,20 @@ impl MossTdGgmlExecutor {
             });
         }
 
+        // Routed through the resident, thread-local decoder-runtime cache
+        // (mirrors `firered_aed::executor`'s cached decoder): the loaded
+        // decoder weights + reuse-graph machinery stay resident across calls
+        // to this pack+backend, while the KV cache for this one utterance is
+        // still allocated fresh inside the helper.
         let runtime_path = preflight.runtime_source.path();
-        let mut decoder =
-            MossTdDecoderRuntime::new(runtime_path, decoder_metadata).map_err(|error| {
-                MossTdExecutorError::DecoderFailed {
-                    reason: error.to_string(),
-                }
-            })?;
-        if std::env::var_os("OPENASR_MOSS_TD_PROFILE").is_some() {
-            eprintln!(
-                "OPENASR_MOSS_TD_PROFILE decoder_backend={}",
-                decoder.backend_label()
-            );
-        }
-
-        let token_rows_len = decode_prompt.token_ids.len() * decoder_metadata.d_model;
-        let mut token_rows = Vec::with_capacity(token_rows_len);
-        for &token_id in &decode_prompt.token_ids {
-            let row = decoder.gather_token_embedding(token_id).map_err(|error| {
-                MossTdExecutorError::DecoderFailed {
-                    reason: error.to_string(),
-                }
-            })?;
-            token_rows.extend_from_slice(&row);
-        }
-        let spliced = build_moss_td_prompt_embeddings_with_audio_splice(
-            decode_prompt.token_ids.len(),
+        let text = run_moss_td_decoder_with_cached_runtime(
+            runtime_path,
+            decoder_metadata,
+            &decode_prompt.token_ids,
             &decode_prompt.audio_pad_positions,
-            decoder_metadata.d_model,
-            &token_rows,
             &audio_rows,
-        )
-        .map_err(|error| MossTdExecutorError::PromptEmbeddingFailed {
-            reason: error.to_string(),
-        })?;
-        let prompt_embeddings = Qwen3AsrPromptEmbeddings {
-            hidden_size: spliced.hidden_size,
-            token_count: spliced.token_count,
-            token_major_values: spliced.token_major_values,
-        };
-
-        let layer_kv_caches = decoder.new_kv_caches();
-        let mut step_executor = MossTdGreedyStepExecutor {
-            decoder: &mut decoder,
-            layer_kv_caches,
-            prompt_embeddings: Some(prompt_embeddings),
-            cache_prompt_tokens: 0,
-        };
-        let config = BuiltinSeq2SeqDecodePolicyConfigInput {
-            initial_prompt_tokens: decode_prompt.token_ids.clone(),
-            eot_token_id: tokenizer.im_end_token_id,
-            vocab_size: decoder_metadata.vocab_size,
-            max_generated_tokens: MOSS_TD_MAX_GENERATED_TOKENS,
-        };
-        let result = run_builtin_seq2seq_decode_policy(
-            crate::arch::MOSS_TD_DECODE_POLICY_ID,
-            &config,
             &tokenizer,
-            None,
-            &mut step_executor,
-            &|token_ids: &[u32]| {
-                tokenizer.decode_text_token_ids(token_ids).map_err(|error| {
-                    Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
-                        reason: error.to_string(),
-                    }
-                })
-            },
-            |error: Seq2SeqGreedyDecodeError| error,
-            |error: Seq2SeqGreedyDecodeError| error,
-            map_registry_error,
-        )
-        .map_err(|error| MossTdExecutorError::GreedyDecodeFailed {
-            reason: error.to_string(),
-        })?;
-
-        let text = result.text.trim().to_string();
+        )?;
         // Parse the model's own inline `[start][end][SNN]` markup into real
         // speaker segments, degrading fail-closed to the single speaker-less
         // segment carrying the untouched raw text when the tag stream is
@@ -748,6 +1004,50 @@ mod tests {
         assert_eq!(text, GOLDEN_JFK_TEXT);
     }
 
+    /// Pins the resident-runtime cache's two contracts introduced by this
+    /// PR: (1) a second `execute()` on the same thread against the same pack
+    /// reuses both the cached encoder and decoder runtimes rather than
+    /// rebuilding them (asserted structurally via the build counters, not by
+    /// timing -- see `moss_td_runtime_build_counts_for_test`'s doc comment),
+    /// and (2) reuse changes nothing observable: the second call's transcript
+    /// is byte-for-byte identical to the first (and to `GOLDEN_JFK_TEXT`).
+    #[test]
+    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
+                and tmp/moss-td/samples/*.wav; CPU-only (Metal path has known defects)"]
+    fn resident_runtime_cache_hits_on_a_second_transcribe_call_for_the_same_pack() {
+        reset_moss_td_runtime_build_counts_for_test();
+        let Some((first_text, _, _)) = transcribe_with_dev_pack(dev_sample_path("jfk.wav")) else {
+            return;
+        };
+        assert_eq!(first_text, GOLDEN_JFK_TEXT);
+        let (encoder_builds, decoder_builds) = moss_td_runtime_build_counts_for_test();
+        assert_eq!(
+            encoder_builds, 1,
+            "first call must build the encoder runtime exactly once"
+        );
+        assert_eq!(
+            decoder_builds, 1,
+            "first call must build the decoder runtime exactly once"
+        );
+
+        let Some((second_text, _, _)) = transcribe_with_dev_pack(dev_sample_path("jfk.wav")) else {
+            return;
+        };
+        assert_eq!(
+            second_text, first_text,
+            "reusing the cached runtimes must not change the decode"
+        );
+        let (encoder_builds, decoder_builds) = moss_td_runtime_build_counts_for_test();
+        assert_eq!(
+            encoder_builds, 1,
+            "second call must hit the cached encoder runtime, not rebuild it"
+        );
+        assert_eq!(
+            decoder_builds, 1,
+            "second call must hit the cached decoder runtime, not rebuild it"
+        );
+    }
+
     #[test]
     #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
                 and tmp/moss-td/samples/*.wav; CPU-only (Metal path has known defects)"]
@@ -856,6 +1156,70 @@ mod tests {
                     4.96,
                     12.88,
                     "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去伊加新"
+                ),
+            ]
+        );
+    }
+
+    /// Synthetic (not a real decode) multi-chunk-duration transcript: every
+    /// anchor above sits well inside `executor.rs`'s first 30s encoder chunk
+    /// (`CHUNK_SAMPLES`), so `snapshot_jfk_and_en_zh_mixed_golden_speaker_segments`
+    /// never exercises `speaker_segments` against text spanning more than one
+    /// chunk's worth of audio duration. This transcript's anchors straddle
+    /// two `CHUNK_SAMPLES` boundaries (30s and 60s) across three speaker
+    /// turns and a language switch, covering the shape a real multi-chunk
+    /// longform decode would produce -- text parsing itself is chunk-count-
+    /// agnostic (it runs once over the final concatenated decode, same as
+    /// for a single-chunk clip), so this is a scale/structure regression
+    /// check on the parser, not a claim that this exact text was ever
+    /// decoded from real audio.
+    const SYNTHETIC_MULTI_CHUNK_TEXT: &str = concat!(
+        "[0.50][S01] Good morning everyone, let's get started.[29.80][31.20][S01] ",
+        "First, a quick recap of last week's numbers.[58.90][61.40][S02] 谢谢，我来补充一下财务方面的情况。",
+        "[92.15][93.00][S01] Great, let's move to questions then.[110.75]",
+    );
+
+    #[test]
+    fn synthetic_multi_chunk_duration_transcript_parses_into_structured_segments() {
+        let segments = parse_moss_td_speaker_segments(SYNTHETIC_MULTI_CHUNK_TEXT, 110.75)
+            .expect("synthetic multi-chunk transcript parses");
+        let snapshot: Vec<(&str, f32, f32, &str)> = segments
+            .iter()
+            .map(|segment| {
+                (
+                    segment.speaker.as_deref().unwrap_or(""),
+                    segment.start,
+                    segment.end,
+                    segment.text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            snapshot,
+            vec![
+                (
+                    "SPEAKER_01",
+                    0.50,
+                    29.80,
+                    "Good morning everyone, let's get started."
+                ),
+                (
+                    "SPEAKER_01",
+                    31.20,
+                    58.90,
+                    "First, a quick recap of last week's numbers."
+                ),
+                (
+                    "SPEAKER_02",
+                    61.40,
+                    92.15,
+                    "谢谢，我来补充一下财务方面的情况。"
+                ),
+                (
+                    "SPEAKER_01",
+                    93.00,
+                    110.75,
+                    "Great, let's move to questions then."
                 ),
             ]
         );
