@@ -8,9 +8,9 @@ use thiserror::Error;
 use std::sync::Arc;
 
 use super::batched_decode::{
-    CohereServeBatchConfig, CohereServeBatchConfigFromEnv, CohereServeBatchJob,
+    CohereServeBatchConfig, CohereServeBatchConfigFromPolicy, CohereServeBatchJob,
     cohere_serve_batch_decode_config, cohere_serve_batch_text_postprocess_kind,
-    submit_cohere_serve_batch_job,
+    shutdown_cohere_serve_batch_engines, submit_cohere_serve_batch_job,
 };
 use super::decoder_graph::{
     CohereDecoderGraphError, CohereDecoderGraphRuntime,
@@ -286,11 +286,8 @@ impl CohereTranscribeGgmlExecutor {
             .request_options
             .prefer_cpu_decoder_for_multichunk_metal;
         let audio_duration = audio_duration_seconds(&request.prepared_audio);
-        let serve_batch_config = CohereServeBatchConfig::from_env().map_err(|error| {
-            CohereTranscribeGgmlExecutorError::DecoderFailed {
-                reason: error.to_string(),
-            }
-        })?;
+        let serve_batch_config =
+            CohereServeBatchConfig::from_server_policy(request.request_options.serve_batch);
         let decoder_config = cohere_decoder_graph_config(prefer_cpu_decoder);
         let can_use_serve_batch = !skip_serve_batch
             && decoder_config.backend.is_gpu_class()
@@ -313,6 +310,13 @@ impl CohereTranscribeGgmlExecutor {
                 serve_batch_config,
                 CohereServeBatchJob {
                     runtime_cache_path: canonical_runtime_cache_path(runtime_path),
+                    build_identity:
+                        crate::models::ggml_asr_executor::serve_batch_build_identity_for_request(
+                            &request.request_options,
+                            "cohere",
+                            decoder_config.backend,
+                            runtime_path,
+                        ),
                     backend: decoder_config.backend,
                     uses_scheduler: decoder_config.use_scheduler,
                     decoder_weights: prepared_runtime.decoder_weights.clone(),
@@ -488,6 +492,7 @@ impl GgmlAsrExecutor for CohereTranscribeGgmlExecutor {
     }
 
     fn unload_idle_state(&self) {
+        shutdown_cohere_serve_batch_engines();
         self.runtime_cache_by_path.clear();
     }
 }
@@ -542,6 +547,7 @@ impl GgmlAsrStreamingExecutor for CohereTranscribeGgmlExecutor {
     }
 
     fn unload_idle_state(&self) {
+        shutdown_cohere_serve_batch_engines();
         self.runtime_cache_by_path.clear();
     }
 }

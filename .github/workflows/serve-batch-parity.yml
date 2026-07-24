@@ -11,7 +11,9 @@ name: Serve-batch real-pack parity
 
 on:
   workflow_dispatch:
-  # Post-merge backstop on main, not a PR gate.
+  pull_request:
+    branches: [main]
+  # Post-merge backstop on main.
   push:
     branches: [main]
 

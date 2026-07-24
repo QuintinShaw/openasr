@@ -289,6 +289,14 @@ async fn run_offline_transcription(
     } else {
         openasr_core::RequestSource::ServerTranscribe
     };
+    if runtime.backend == BackendKind::Native {
+        parsed.request.serve_batch_max_native_sessions = Some(
+            runtime
+                .native_execution
+                .max_concurrent_sessions_per_model()
+                .get(),
+        );
+    }
     let history_request = parsed.request.clone();
     if runtime.backend == BackendKind::Native {
         validate_native_request_model(&runtime, &parsed.request.model_id)

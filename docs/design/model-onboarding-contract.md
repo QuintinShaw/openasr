@@ -74,9 +74,12 @@ checklist).
   `crates/openasr-core/src/models/seq2seq_greedy_decode.rs`).
 - CTC / non-autoregressive families use
   `crates/openasr-core/src/models/ctc_greedy_decode.rs`'s `ctc_greedy_decode`.
-- Batched serving goes through the shared serve-batch path
-  (`crates/openasr-core/src/models/serve_batch_env.rs`), not a per-family batch
-  loop.
+- Eligible batched serving goes through the shared serve-batch policy and owner
+  path (`crates/openasr-core/src/models/serve_batch_env.rs` and
+  `seq2seq_serve_batch.rs`), not a per-family batch loop. Eligibility and the
+  effective width are server-owned: the native session admission limit is the
+  only operator input, while CPU, scheduler-backed, adapter, and non-enabled
+  families explicitly remain serial.
 
 **Do not** hand-write a `for`/`while` + argmax step loop that bypasses these.
 A hand-rolled loop is exactly what caused issue #60: it misses the shared

@@ -192,7 +192,9 @@ pub use models::{
         GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
         GgmlAsrExecutionOptions, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
         GgmlAsrPreparedAudio, GgmlAsrRuntimeSourcePreflight, GgmlAsrStreamingExecutor,
-        GgmlAsrStreamingSessionConfig, GgmlAsrStreamingSessionRequest, StreamingPartialGranularity,
+        GgmlAsrStreamingSessionConfig, GgmlAsrStreamingSessionRequest, RuntimeBuildIdentity,
+        RuntimeBuildIdentitySource, StreamingPartialGranularity, bump_runtime_build_generation,
+        current_runtime_build_generation,
     },
     ggml_family_adapter::{
         GGML_TOKENIZER_ID_KEY, GgmlAdapterMetadataSource, GgmlExecutionCapability,

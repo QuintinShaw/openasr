@@ -86,7 +86,7 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
   -F file=@audio.wav -F model=qwen3-asr-0.6b
 ```
 
-Drop-in compatible with OpenAI SDKs (`base_url="http://127.0.0.1:8080/v1"`). See [Agent Integration](docs/AGENT_INTEGRATION.md) for API key setup and agent workflows.
+Drop-in compatible with OpenAI SDKs (`base_url="http://127.0.0.1:8080/v1"`). Offline native requests are serial by default. Operators can set `--max-native-sessions-per-model N`; `N` is both the admission limit and, for eligible direct-GPU Cohere, Moonshine, Qwen, and Whisper jobs, the source for an internal batch width capped at 8. CPU, scheduler, adapter, realtime, FireRed-AED, and FireRed2 paths remain serial; translations follow the offline policy. See [Agent Integration](docs/AGENT_INTEGRATION.md) for API key setup and agent workflows.
 
 ### Building from source
 

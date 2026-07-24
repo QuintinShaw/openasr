@@ -1200,6 +1200,8 @@ fn build_whisper_carry_prompt_token_ids_keeps_last_longform_tail() {
         longform: Some(crate::LongFormOptions::default()),
         longform_chunk_count_hint: None,
         prefer_cpu_decoder_for_multichunk_metal: false,
+        serve_batch: crate::models::serve_batch_env::ServeBatchPolicy::serial(),
+        runtime_build_identity: None,
         adapter_path: None,
     };
 

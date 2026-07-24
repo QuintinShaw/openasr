@@ -27,18 +27,18 @@ use crate::models::seq2seq_greedy_decode::{
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
-    OwnerAliveGuard, ServeBatchEnvError, serve_batch_bucket_width,
-    serve_batch_collect_window_from_env, serve_batch_compact_active_slots,
-    serve_batch_drain_compatible_batch, serve_batch_estimate_llm_kv_slot_bytes,
-    serve_batch_max_from_env, serve_batch_owner_alive, serve_batch_select_and_apply_greedy_step,
-    serve_batch_submit_with_timeout, serve_batch_trace_enabled, serve_batch_vram_capped_max_batch,
+    OwnerAliveGuard, SERVE_BATCH_COLLECT_WINDOW, ServeBatchPolicy, serve_batch_bucket_width,
+    serve_batch_compact_active_slots, serve_batch_drain_compatible_batch,
+    serve_batch_estimate_llm_kv_slot_bytes, serve_batch_owner_alive,
+    serve_batch_select_and_apply_greedy_step, serve_batch_submit_with_timeout,
+    serve_batch_trace_enabled, serve_batch_vram_capped_max_batch,
 };
 use crate::nn::decoder::reusable_decode_graph_supported;
 use crate::{GgmlAsrExecutionResult, Segment, Transcription};
 
 const QWEN_SERVE_BATCH_MAX_BATCH_LIMIT: usize = 8;
+#[cfg(test)]
 const QWEN_SERVE_BATCH_QUEUE_CAPACITY: usize = 4;
-const QWEN_SERVE_BATCH_COLLECT_WINDOW: Duration = Duration::from_millis(2);
 const QWEN_SERVE_BATCH_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 const QWEN_SERVE_BATCH_REPLY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const QWEN_ROPE_THETA: f32 = 1_000_000.0;
@@ -61,6 +61,7 @@ pub(super) struct Qwen3AsrServeBatchConfig {
 pub(super) struct Qwen3AsrServeBatchJob {
     pub runtime_source_path: PathBuf,
     pub runtime_cache_path: PathBuf,
+    pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub metadata: Qwen3AsrExecutionMetadata,
     pub tokenizer: Option<Qwen3AsrTokenizer>,
@@ -76,7 +77,8 @@ pub(super) struct Qwen3AsrServeBatchJob {
 
 #[derive(Debug, Error)]
 pub(super) enum Qwen3AsrServeBatchError {
-    #[error("qwen serve batch env {env} must be an integer in 0..={max}, got '{raw}'")]
+    #[cfg(test)]
+    #[error("qwen serve batch test env {env} must be an integer in 0..={max}, got '{raw}'")]
     InvalidEnv {
         env: &'static str,
         raw: String,
@@ -118,7 +120,7 @@ impl Qwen3AsrServeBatchError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Qwen3AsrServeBatchEngineKey {
-    runtime_cache_path: PathBuf,
+    build_identity: crate::RuntimeBuildIdentity,
     backend: GgmlCpuGraphBackend,
     max_batch: usize,
 }
@@ -167,20 +169,39 @@ struct Qwen3AsrBatchSlot {
 }
 
 impl Qwen3AsrServeBatchConfig {
+    pub(super) fn from_policy(policy: ServeBatchPolicy) -> Option<Self> {
+        policy.enabled().then_some(Self {
+            max_batch: policy
+                .max_native_sessions
+                .min(QWEN_SERVE_BATCH_MAX_BATCH_LIMIT),
+            queue_capacity: policy.max_native_sessions,
+            collect_window: SERVE_BATCH_COLLECT_WINDOW,
+            send_timeout: QWEN_SERVE_BATCH_SEND_TIMEOUT,
+            reply_timeout: QWEN_SERVE_BATCH_REPLY_TIMEOUT,
+            trace_batches: serve_batch_trace_enabled(),
+        })
+    }
+
+    #[cfg(test)]
     pub(super) fn from_env() -> Result<Option<Self>, Qwen3AsrServeBatchError> {
-        let Some(max_batch) = serve_batch_max_from_env(QWEN_SERVE_BATCH_MAX_BATCH_LIMIT)
-            .map_err(Qwen3AsrServeBatchError::from)?
+        let Some(max_batch) = crate::models::serve_batch_env::serve_batch_max_from_env(
+            QWEN_SERVE_BATCH_MAX_BATCH_LIMIT,
+        )
+        .map_err(|error| Qwen3AsrServeBatchError::InvalidEnv {
+            env: error.env,
+            raw: error.raw,
+            max: error.max,
+        })?
         else {
             return Ok(None);
         };
         Ok(Some(Self {
             max_batch,
-            queue_capacity: QWEN_SERVE_BATCH_QUEUE_CAPACITY,
-            collect_window: serve_batch_collect_window_from_env(QWEN_SERVE_BATCH_COLLECT_WINDOW)
-                .map_err(Qwen3AsrServeBatchError::from)?,
+            queue_capacity: max_batch,
+            collect_window: SERVE_BATCH_COLLECT_WINDOW,
             send_timeout: QWEN_SERVE_BATCH_SEND_TIMEOUT,
             reply_timeout: QWEN_SERVE_BATCH_REPLY_TIMEOUT,
-            trace_batches: serve_batch_trace_enabled(),
+            trace_batches: false,
         }))
     }
 
@@ -201,19 +222,18 @@ impl Qwen3AsrServeBatchConfig {
             self.max_batch,
             backend,
             qwen_serve_batch_vram_slot_bytes(job),
-        )
-        .map_err(Qwen3AsrServeBatchError::from)?;
+        );
         Ok(Self { max_batch, ..self })
     }
 }
 
-impl From<ServeBatchEnvError> for Qwen3AsrServeBatchError {
-    fn from(error: ServeBatchEnvError) -> Self {
-        Self::InvalidEnv {
-            env: error.env,
-            raw: error.raw,
-            max: error.max,
-        }
+pub(super) fn shutdown_qwen_serve_batch_engines() {
+    let _ = crate::bump_runtime_build_generation();
+    let Some(registry) = QWEN_SERVE_BATCH_ENGINES.get() else {
+        return;
+    };
+    if let Ok(mut engines) = registry.lock() {
+        engines.clear();
     }
 }
 
@@ -223,7 +243,7 @@ pub(super) fn submit_qwen_serve_batch_job(
 ) -> Result<GgmlAsrExecutionResult, Qwen3AsrServeBatchError> {
     let config = config.validate_for_job(&job)?;
     let key = Qwen3AsrServeBatchEngineKey {
-        runtime_cache_path: job.runtime_cache_path.clone(),
+        build_identity: job.build_identity.clone(),
         backend: job.backend,
         max_batch: config.max_batch,
     };
@@ -318,7 +338,10 @@ fn qwen_owner_thread_loop(
             &receiver,
             config.max_batch,
             config.collect_window,
-            |_, _| true,
+            |first, next| {
+                first.job.build_identity == next.job.build_identity
+                    && first.job.runtime_cache_path == next.job.runtime_cache_path
+            },
         ) else {
             break;
         };
@@ -2297,6 +2320,12 @@ mod tests {
         Qwen3AsrServeBatchJob {
             runtime_source_path: fixture.runtime_path.clone(),
             runtime_cache_path: fixture.runtime_path.clone(),
+            build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
+                None,
+                "qwen:test",
+                "adapter=none",
+                crate::RuntimeBuildIdentity::provisional_content_id_for_path(&fixture.runtime_path),
+            ),
             backend: GgmlCpuGraphConfig::resolve_runtime_backend(),
             metadata: fixture.metadata,
             tokenizer: None,

@@ -15,22 +15,138 @@ use crate::models::seq2seq_greedy_decode::{
     select_seq2seq_greedy_step_token,
 };
 
-pub(crate) const OPENASR_SERVE_BATCH_ENV: &str = "OPENASR_SERVE_BATCH";
-pub(crate) const OPENASR_SERVE_BATCH_TRACE_ENV: &str = "OPENASR_SERVE_BATCH_TRACE";
-pub(crate) const OPENASR_SERVE_BATCH_COLLECT_MS_ENV: &str = "OPENASR_SERVE_BATCH_COLLECT_MS";
-pub(crate) const OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_ENV: &str =
-    "OPENASR_SERVE_BATCH_VRAM_RESERVE_MB";
+/// Server-owned batch execution policy carried with an offline native request.
+///
+/// The server admission limit is the sole operator-facing source. A width of one
+/// preserves the serial executor path; eligible families narrow a larger width
+/// further for their family and runtime safety limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServeBatchPolicy {
+    pub max_native_sessions: usize,
+}
 
-const OPENASR_SERVE_BATCH_COLLECT_MS_LIMIT: usize = 100;
-const OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_DEFAULT: usize = 1024;
-const OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_LIMIT: usize = 1024 * 1024;
+impl ServeBatchPolicy {
+    pub(crate) const fn serial() -> Self {
+        Self {
+            max_native_sessions: 1,
+        }
+    }
+
+    pub(crate) const fn enabled(self) -> bool {
+        self.max_native_sessions > 1
+    }
+}
+
+impl Default for ServeBatchPolicy {
+    fn default() -> Self {
+        Self::serial()
+    }
+}
+
+/// The bounded collection delay is an internal scheduling constant, not an
+/// operator environment surface.
+pub(crate) const SERVE_BATCH_COLLECT_WINDOW: Duration = Duration::from_millis(2);
+const SERVE_BATCH_VRAM_RESERVE_MB: usize = 1024;
 const MIB_BYTES: usize = 1024 * 1024;
 
+#[cfg(test)]
+pub(crate) const OPENASR_SERVE_BATCH_ENV: &str = "OPENASR_SERVE_BATCH";
+#[cfg(test)]
+const OPENASR_SERVE_BATCH_COLLECT_MS_ENV: &str = "OPENASR_SERVE_BATCH_COLLECT_MS";
+#[cfg(test)]
+const OPENASR_SERVE_BATCH_TRACE_ENV: &str = "OPENASR_SERVE_BATCH_TRACE";
+#[cfg(test)]
+const OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_ENV: &str = "OPENASR_SERVE_BATCH_VRAM_RESERVE_MB";
+#[cfg(test)]
+const OPENASR_SERVE_BATCH_COLLECT_MS_LIMIT: usize = 100;
+#[cfg(test)]
+const OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_DEFAULT: usize = 1024;
+#[cfg(test)]
+const OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_LIMIT: usize = 1024 * 1024;
+
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServeBatchEnvError {
     pub env: &'static str,
     pub raw: String,
     pub max: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn serve_batch_max_from_env(
+    max_limit: usize,
+) -> Result<Option<usize>, ServeBatchEnvError> {
+    let Some(raw) = std::env::var_os(OPENASR_SERVE_BATCH_ENV) else {
+        return Ok(None);
+    };
+    let raw = raw.to_string_lossy().trim().to_string();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let max_batch = raw.parse::<usize>().map_err(|_| ServeBatchEnvError {
+        env: OPENASR_SERVE_BATCH_ENV,
+        raw: raw.clone(),
+        max: max_limit,
+    })?;
+    if max_batch <= 1 {
+        return Ok(None);
+    }
+    if max_batch > max_limit {
+        return Err(ServeBatchEnvError {
+            env: OPENASR_SERVE_BATCH_ENV,
+            raw,
+            max: max_limit,
+        });
+    }
+    Ok(Some(max_batch))
+}
+
+#[cfg(test)]
+fn serve_batch_collect_window_from_env(default: Duration) -> Result<Duration, ServeBatchEnvError> {
+    let Some(raw) = std::env::var_os(OPENASR_SERVE_BATCH_COLLECT_MS_ENV) else {
+        return Ok(default);
+    };
+    let raw = raw.to_string_lossy().trim().to_string();
+    if raw.is_empty() {
+        return Ok(default);
+    }
+    let value = raw.parse::<usize>().map_err(|_| ServeBatchEnvError {
+        env: OPENASR_SERVE_BATCH_COLLECT_MS_ENV,
+        raw: raw.clone(),
+        max: OPENASR_SERVE_BATCH_COLLECT_MS_LIMIT,
+    })?;
+    if value > OPENASR_SERVE_BATCH_COLLECT_MS_LIMIT {
+        return Err(ServeBatchEnvError {
+            env: OPENASR_SERVE_BATCH_COLLECT_MS_ENV,
+            raw,
+            max: OPENASR_SERVE_BATCH_COLLECT_MS_LIMIT,
+        });
+    }
+    Ok(Duration::from_millis(value as u64))
+}
+
+#[cfg(test)]
+fn serve_batch_vram_reserve_mb_from_env() -> Result<usize, ServeBatchEnvError> {
+    let Some(raw) = std::env::var_os(OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_ENV) else {
+        return Ok(OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_DEFAULT);
+    };
+    let raw = raw.to_string_lossy().trim().to_string();
+    if raw.is_empty() {
+        return Ok(OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_DEFAULT);
+    }
+    let value = raw.parse::<usize>().map_err(|_| ServeBatchEnvError {
+        env: OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_ENV,
+        raw: raw.clone(),
+        max: OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_LIMIT,
+    })?;
+    if value > OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_LIMIT {
+        return Err(ServeBatchEnvError {
+            env: OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_ENV,
+            raw,
+            max: OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_LIMIT,
+        });
+    }
+    Ok(value)
 }
 
 /// Liveness flag for a serve-batch owner thread. Each engine keeps a clone of
@@ -152,61 +268,8 @@ pub(crate) fn serve_batch_select_and_apply_greedy_step(
     Ok(())
 }
 
-pub(crate) fn serve_batch_max_from_env(
-    max_limit: usize,
-) -> Result<Option<usize>, ServeBatchEnvError> {
-    let Some(raw) = std::env::var_os(OPENASR_SERVE_BATCH_ENV) else {
-        return Ok(None);
-    };
-    let raw = raw.to_string_lossy().trim().to_string();
-    if raw.is_empty() {
-        return Ok(None);
-    }
-    let max_batch = raw.parse::<usize>().map_err(|_| ServeBatchEnvError {
-        env: OPENASR_SERVE_BATCH_ENV,
-        raw: raw.clone(),
-        max: max_limit,
-    })?;
-    if max_batch <= 1 {
-        return Ok(None);
-    }
-    if max_batch > max_limit {
-        return Err(ServeBatchEnvError {
-            env: OPENASR_SERVE_BATCH_ENV,
-            raw,
-            max: max_limit,
-        });
-    }
-    Ok(Some(max_batch))
-}
-
-pub(crate) fn serve_batch_collect_window_from_env(
-    default: Duration,
-) -> Result<Duration, ServeBatchEnvError> {
-    let Some(raw) = std::env::var_os(OPENASR_SERVE_BATCH_COLLECT_MS_ENV) else {
-        return Ok(default);
-    };
-    let raw = raw.to_string_lossy().trim().to_string();
-    if raw.is_empty() {
-        return Ok(default);
-    }
-    let collect_ms = raw.parse::<usize>().map_err(|_| ServeBatchEnvError {
-        env: OPENASR_SERVE_BATCH_COLLECT_MS_ENV,
-        raw: raw.clone(),
-        max: OPENASR_SERVE_BATCH_COLLECT_MS_LIMIT,
-    })?;
-    if collect_ms > OPENASR_SERVE_BATCH_COLLECT_MS_LIMIT {
-        return Err(ServeBatchEnvError {
-            env: OPENASR_SERVE_BATCH_COLLECT_MS_ENV,
-            raw,
-            max: OPENASR_SERVE_BATCH_COLLECT_MS_LIMIT,
-        });
-    }
-    Ok(Duration::from_millis(collect_ms as u64))
-}
-
 pub(crate) fn serve_batch_trace_enabled() -> bool {
-    std::env::var_os(OPENASR_SERVE_BATCH_TRACE_ENV)
+    std::env::var_os("OPENASR_SERVE_BATCH_TRACE")
         .map(|value| {
             let value = value.to_string_lossy();
             !(value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false"))
@@ -218,23 +281,22 @@ pub(crate) fn serve_batch_vram_capped_max_batch(
     requested_max_batch: usize,
     backend: GgmlCpuGraphBackend,
     estimated_slot_bytes: usize,
-) -> Result<usize, ServeBatchEnvError> {
+) -> usize {
     if !backend.is_gpu_class() || requested_max_batch <= 2 || estimated_slot_bytes == 0 {
-        return Ok(requested_max_batch);
+        return requested_max_batch;
     }
-    let reserve_mb = serve_batch_vram_reserve_mb_from_env()?;
     let Some(sample) = selected_gpu_memory_sample() else {
         trace_serve_batch_vram_cap_unavailable(backend, requested_max_batch, estimated_slot_bytes);
-        return Ok(requested_max_batch);
+        return requested_max_batch;
     };
     let decision = serve_batch_vram_cap_decision_for_memory(
         requested_max_batch,
         estimated_slot_bytes,
         sample.memory.free_bytes,
-        reserve_mb.saturating_mul(MIB_BYTES),
+        SERVE_BATCH_VRAM_RESERVE_MB.saturating_mul(MIB_BYTES),
     );
     trace_serve_batch_vram_cap_decision(backend, &sample, &decision);
-    Ok(decision.capped_max_batch)
+    decision.capped_max_batch
 }
 
 pub(crate) fn serve_batch_bucket_width(active_count: usize, max_batch: usize) -> usize {
@@ -377,29 +439,6 @@ pub(crate) fn serve_batch_estimate_seq2seq_slot_bytes(
     self_kv.saturating_add(cross_kv)
 }
 
-fn serve_batch_vram_reserve_mb_from_env() -> Result<usize, ServeBatchEnvError> {
-    let Some(raw) = std::env::var_os(OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_ENV) else {
-        return Ok(OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_DEFAULT);
-    };
-    let raw = raw.to_string_lossy().trim().to_string();
-    if raw.is_empty() {
-        return Ok(OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_DEFAULT);
-    }
-    let reserve_mb = raw.parse::<usize>().map_err(|_| ServeBatchEnvError {
-        env: OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_ENV,
-        raw: raw.clone(),
-        max: OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_LIMIT,
-    })?;
-    if reserve_mb > OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_LIMIT {
-        return Err(ServeBatchEnvError {
-            env: OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_ENV,
-            raw,
-            max: OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_LIMIT,
-        });
-    }
-    Ok(reserve_mb)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServeBatchGpuMemorySample {
     device_name: String,
@@ -451,11 +490,11 @@ fn serve_batch_vram_cap_decision_for_memory(
     reserve_bytes: usize,
 ) -> ServeBatchVramCapDecision {
     let usable_bytes = free_bytes.saturating_sub(reserve_bytes);
-    let capped_max_batch = if requested_max_batch <= 2 || estimated_slot_bytes == 0 {
+    let capped_max_batch = if requested_max_batch <= 1 || estimated_slot_bytes == 0 {
         requested_max_batch
     } else {
         let slots = usable_bytes / estimated_slot_bytes;
-        requested_max_batch.min(slots.max(2))
+        requested_max_batch.min(slots).max(1)
     };
     ServeBatchVramCapDecision {
         requested_max_batch,
@@ -548,6 +587,31 @@ pub(crate) fn with_serve_batch_env_lock<T>(run: impl FnOnce() -> T) -> T {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn server_policy_enables_only_above_one_native_session() {
+        assert_eq!(ServeBatchPolicy::default(), ServeBatchPolicy::serial());
+        assert!(!ServeBatchPolicy::serial().enabled());
+        assert!(
+            ServeBatchPolicy {
+                max_native_sessions: 2
+            }
+            .enabled()
+        );
+    }
+
+    #[test]
+    fn vram_cap_can_fall_back_to_serial_width() {
+        assert_eq!(
+            serve_batch_vram_capped_max_batch_for_memory(
+                8,
+                512 * MIB_BYTES,
+                1024 * MIB_BYTES,
+                1024 * MIB_BYTES
+            ),
+            1
+        );
+    }
 
     fn one_hot_logits(vocab_size: usize, index: usize) -> Vec<f32> {
         let mut logits = vec![-1000.0_f32; vocab_size];
@@ -797,11 +861,11 @@ mod tests {
         );
         assert_eq!(
             serve_batch_vram_capped_max_batch_for_memory(8, 512, 1500, 1024),
-            2
+            1
         );
         assert_eq!(
             serve_batch_vram_capped_max_batch_for_memory(2, 512, 1500, 1024),
-            2
+            1
         );
     }
 

@@ -590,8 +590,10 @@ pub(crate) enum Command {
         /// Local `.oasr` runtime pack file for native backend transcription.
         #[arg(long)]
         model_pack: Option<PathBuf>,
-        /// Maximum concurrent native sessions for one resolved model. Keep the
-        /// default unless this host has enough memory for concurrent runtimes.
+        /// Maximum admitted native sessions for one resolved model. `1` keeps
+        /// offline decoding serial; eligible direct-GPU families batch admitted
+        /// jobs internally up to width 8, while larger values continue in
+        /// multiple batches. Keep the default unless the host has capacity.
         #[arg(
             long,
             env = "OPENASR_MAX_NATIVE_SESSIONS_PER_MODEL",
