@@ -60,13 +60,18 @@ pub(crate) fn materialize_builtin_executors_by_model_architecture()
     Ok(executors_by_model_architecture)
 }
 
+/// Phrase-bias capability for a builtin architecture.
+///
+/// Authoritative source is the architecture integration descriptor
+/// (`descriptor.integration.supports_phrase_bias`). Executor trait methods remain
+/// implementation details and are audited against this value so a hand-edited
+/// executor cannot silently disagree with the product capability surface.
 pub(crate) fn builtin_executor_supports_phrase_bias_for_model_architecture(
     model_architecture: &str,
 ) -> Option<bool> {
-    materialize_builtin_executors_by_model_architecture()
-        .ok()?
-        .get(model_architecture)
-        .map(|executor| executor.supports_phrase_bias())
+    OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(model_architecture)
+        .map(|descriptor| descriptor.integration.supports_phrase_bias)
 }
 
 fn materialize_builtin_executor_component(
@@ -209,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_executor_phrase_bias_matches_architecture_manifest() {
+    fn builtin_executor_phrase_bias_matches_architecture_integration_descriptor() {
         let executors =
             materialize_builtin_executors_by_model_architecture().expect("executor map");
 
@@ -226,7 +231,7 @@ mod tests {
             assert_eq!(
                 executor.supports_phrase_bias(),
                 descriptor.integration.supports_phrase_bias,
-                "family '{}' ({}) executor phrase-bias capability disagrees with its architecture manifest",
+                "family '{}' ({}) executor phrase-bias implementation disagrees with its architecture integration descriptor",
                 descriptor.model_family,
                 descriptor.model_architecture
             );
@@ -235,7 +240,7 @@ mod tests {
                     descriptor.model_architecture
                 ),
                 Some(descriptor.integration.supports_phrase_bias),
-                "family '{}' ({}) registry lookup must expose the manifest capability",
+                "family '{}' ({}) capability lookup must derive from the architecture integration descriptor",
                 descriptor.model_family,
                 descriptor.model_architecture
             );

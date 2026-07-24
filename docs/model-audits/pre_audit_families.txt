@@ -1,0 +1,19 @@
+# Catalog family ids exempt from the missing release-audit-form check.
+# Single source of truth for tooling/publish-model/scripts/audit_form.py and
+# the native-family integration audit. This set only shrinks: remove a family
+# when its docs/model-audits/<family>.md form lands. Never add new families.
+cohere
+dolphin
+firered-aed
+firered-punc
+hymt2
+mimo-asr
+moonshine
+parakeet-tdt
+pyannote-segmentation
+qwen
+qwen3-forced-aligner
+sensevoice
+wespeaker
+whisper
+xasr-zipformer

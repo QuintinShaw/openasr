@@ -367,18 +367,10 @@ pub trait GgmlAsrStreamingExecutor: Send + Sync {
     fn unload_idle_state(&self) {}
 }
 
-/// Partial-result granularity of a registered streaming executor. This is a
-/// generic infrastructure property (how partials are produced), not a
-/// per-model semantic: `FrameSync` executors append fixed low-latency chunks
-/// and never revise already-emitted text; `Buffered` executors re-decode a
-/// growing/windowed audio buffer and may revise prior partials. Only the
-/// registration site (`build_builtin_ggml_streaming_execution_dispatch`)
-/// knows which family is which.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamingPartialGranularity {
-    FrameSync,
-    Buffered,
-}
+/// Partial-result granularity of a registered streaming executor. Declared on
+/// the architecture integration descriptor and derived into this dispatch at
+/// builtin registration time -- see [`crate::arch::StreamingPartialGranularity`].
+pub use crate::arch::StreamingPartialGranularity;
 
 #[derive(Default)]
 pub struct GgmlAsrExecutionDispatch {
@@ -548,14 +540,26 @@ impl GgmlAsrExecutionDispatch {
     /// rather than assume low-latency partials.
     pub fn is_frame_sync_for(&self, descriptor: &GgmlFamilyAdapterDescriptor) -> bool {
         matches!(
-            self.streaming_partial_granularity_by_adapter_id
-                .get(descriptor.adapter_id),
-            Some(StreamingPartialGranularity::FrameSync)
-        ) || matches!(
-            self.streaming_partial_granularity_by_capability
-                .get(capability_label(descriptor.execution_capability)),
+            self.streaming_partial_granularity_for(descriptor),
             Some(StreamingPartialGranularity::FrameSync)
         )
+    }
+
+    /// Returns the partial-result granularity registered for `descriptor`, if
+    /// any. Builtin construction derives this from the architecture integration
+    /// descriptor; unregistered families yield `None`.
+    pub fn streaming_partial_granularity_for(
+        &self,
+        descriptor: &GgmlFamilyAdapterDescriptor,
+    ) -> Option<StreamingPartialGranularity> {
+        self.streaming_partial_granularity_by_adapter_id
+            .get(descriptor.adapter_id)
+            .copied()
+            .or_else(|| {
+                self.streaming_partial_granularity_by_capability
+                    .get(capability_label(descriptor.execution_capability))
+                    .copied()
+            })
     }
 
     /// Idle-unload: evicts every registered executor's process-lifetime

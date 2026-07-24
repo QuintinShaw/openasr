@@ -140,15 +140,17 @@ fn native_runtime_streaming_capabilities_for_descriptor(
 
 /// Phrase-bias capability for one runtime pack.
 ///
-/// This is family/architecture-level (`builtin_executor_supports_phrase_bias_for_model_architecture`)
-/// for every architecture except Dolphin, where the deep-biasing `context_module.*`
-/// weights are only present on some packs within the family (the multi-lingual
-/// `small`/`base` catalog tiers never trained them) -- reporting the family-wide
-/// `true` there let requests reach `hotword_context.rs`, which then hard-fails
-/// with a `MissingWeight` error instead of a clean, pre-decode capability
-/// rejection. Dolphin therefore probes the pack's own GGUF tensor index for the
+/// This is family/architecture-level
+/// (`builtin_executor_supports_phrase_bias_for_model_architecture`, derived
+/// from the architecture integration descriptor) for every architecture except
+/// Dolphin, where the deep-biasing `context_module.*` weights are only present
+/// on some packs within the family (the multi-lingual `small`/`base` catalog
+/// tiers never trained them) -- reporting the family-wide `true` there let
+/// requests reach `hotword_context.rs`, which then hard-fails with a
+/// `MissingWeight` error instead of a clean, pre-decode capability rejection.
+/// Dolphin therefore probes the pack's own GGUF tensor index for the
 /// context-module tensor rather than trusting the architecture constant; every
-/// other family keeps the prior architecture-level answer since their executors
+/// other family keeps the architecture-level answer since their executors
 /// require the family's tensors unconditionally.
 fn native_runtime_descriptor_supports_phrase_bias(
     descriptor: &GgmlFamilyAdapterDescriptor,

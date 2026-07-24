@@ -292,35 +292,54 @@ pub(crate) enum OpenAsrEncoderAttentionSpan {
     LocalChunked,
 }
 
+/// Partial-result granularity of a family's streaming executor. Infrastructure
+/// property (how partials are produced), not a per-model semantic: `FrameSync`
+/// appends fixed low-latency chunks and never revises already-emitted text;
+/// `Buffered` re-decodes a growing/windowed buffer and may revise prior
+/// partials. Declared once on the architecture integration descriptor and
+/// derived into the streaming dispatch at build time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpenAsrStreamingPartialGranularity {
-    Buffered,
+pub enum StreamingPartialGranularity {
     FrameSync,
+    Buffered,
 }
 
+/// Whether this family's greedy decode must ride a shared driver registry
+/// entry (`decode_policy_component_registry`) or intentionally uses a
+/// dedicated non-shared loop (transducer / attention-rescoring / ...).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpenAsrAuditFormRequirement {
-    /// The family predates the release-audit program. A future public model
-    /// release still passes through the publishing gate, which owns the
-    /// migration from this explicit exemption to a checked audit form.
-    LegacyExempt,
-    Required {
-        relative_path: &'static str,
-    },
+pub(crate) enum OpenAsrSharedDecodeDriver {
+    SharedSeq2SeqGreedy,
+    SharedCtcGreedy,
+    Dedicated,
+}
+
+/// Pack-import surface for one native family. File existence alone is not
+/// enough: `CoreConvert` symbols must be force-linked by
+/// `models::pack_import_surface`, and `ExternalTooling` paths must resolve
+/// under the repo root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAsrPackImportSurface {
+    CoreConvert { symbol: &'static str },
+    ExternalTooling { relative_path: &'static str },
 }
 
 /// Static integration obligations for one native family.
 ///
-/// This belongs to the architecture descriptor rather than another family
-/// list: adding a dispatchable architecture must make every applicable
-/// integration decision explicit, while optional development tooling stays
-/// absent instead of acquiring a placeholder implementation.
+/// Authoritative runtime facts (phrase-bias capability, streaming partial
+/// granularity, shared-decode driver class) live here and are *derived into*
+/// dispatch/capability paths. Optional tooling stays optional (`None`) rather
+/// than forcing a placeholder implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OpenAsrFamilyIntegrationDescriptor {
+    /// Publish-catalog family id (may differ from `model_family`, e.g. `cohere`
+    /// vs `cohere-transcribe`). Used to join the shared pre-audit family list
+    /// and the `docs/model-audits/<id>.md` form path.
+    pub catalog_family_id: &'static str,
     pub supports_phrase_bias: bool,
-    pub streaming_partial_granularity: OpenAsrStreamingPartialGranularity,
-    pub pack_importer_source: &'static str,
-    pub audit_form: OpenAsrAuditFormRequirement,
+    pub streaming_partial_granularity: StreamingPartialGranularity,
+    pub shared_decode_driver: OpenAsrSharedDecodeDriver,
+    pub pack_import: OpenAsrPackImportSurface,
     pub reference_dumper_source: Option<&'static str>,
 }
 
@@ -1140,10 +1159,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         decode_policy_id: COHERE_TRANSCRIBE_DECODE_POLICY_ID,
         executor_component_id: COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID,
         integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "cohere",
             supports_phrase_bias: true,
-            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
-            pack_importer_source: "crates/openasr-core/src/models/cohere/package_import.rs",
-            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy,
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_cohere_source_to_runtime_pack",
+            },
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
@@ -1187,10 +1209,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         decode_policy_id: WHISPER_DECODE_POLICY_ID,
         executor_component_id: WHISPER_EXECUTOR_COMPONENT_ID,
         integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "whisper",
             supports_phrase_bias: true,
-            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
-            pack_importer_source: "crates/openasr-core/src/models/whisper/package_import.rs",
-            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy,
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_whisper_hf_source_to_runtime_pack",
+            },
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
@@ -1227,10 +1252,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         decode_policy_id: QWEN3_ASR_DECODE_POLICY_ID,
         executor_component_id: QWEN3_ASR_EXECUTOR_COMPONENT_ID,
         integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "qwen",
             supports_phrase_bias: true,
-            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
-            pack_importer_source: "crates/openasr-core/src/models/qwen/package_import.rs",
-            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy,
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_qwen_source_to_runtime_pack",
+            },
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::NativeGraphLoweringV1,
@@ -1280,10 +1308,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         decode_policy_id: PARAKEET_CTC_DECODE_POLICY_ID,
         executor_component_id: PARAKEET_CTC_EXECUTOR_COMPONENT_ID,
         integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "parakeet",
             supports_phrase_bias: true,
-            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
-            pack_importer_source: "crates/openasr-core/src/models/parakeet_ctc/package_import.rs",
-            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::SharedCtcGreedy,
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_parakeet_ctc_source_to_runtime_pack",
+            },
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
@@ -1333,10 +1364,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         decode_policy_id: PARAKEET_TDT_DECODE_POLICY_ID,
         executor_component_id: PARAKEET_TDT_EXECUTOR_COMPONENT_ID,
         integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "parakeet-tdt",
             supports_phrase_bias: false,
-            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
-            pack_importer_source: "crates/openasr-core/src/models/parakeet_tdt/package_import.rs",
-            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::Dedicated,
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_parakeet_tdt_source_to_runtime_pack",
+            },
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
@@ -1374,10 +1408,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         decode_policy_id: WAV2VEC2_CTC_DECODE_POLICY_ID,
         executor_component_id: WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
         integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "wav2vec2",
             supports_phrase_bias: true,
-            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
-            pack_importer_source: "crates/openasr-core/src/models/wav2vec2_ctc/package_import.rs",
-            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::SharedCtcGreedy,
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_wav2vec2_ctc_source_to_runtime_pack",
+            },
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
@@ -1418,10 +1455,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         decode_policy_id: XASR_ZIPFORMER_DECODE_POLICY_ID,
         executor_component_id: XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
         integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "xasr-zipformer",
             supports_phrase_bias: false,
-            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::FrameSync,
-            pack_importer_source: "crates/openasr-core/src/models/xasr_zipformer/package_import.rs",
-            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            streaming_partial_granularity: StreamingPartialGranularity::FrameSync,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::Dedicated,
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_xasr_zipformer_source_to_runtime_pack",
+            },
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
@@ -1470,10 +1510,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         decode_policy_id: MOONSHINE_DECODE_POLICY_ID,
         executor_component_id: MOONSHINE_EXECUTOR_COMPONENT_ID,
         integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "moonshine",
             supports_phrase_bias: true,
-            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
-            pack_importer_source: "crates/openasr-core/src/models/moonshine/package_import.rs",
-            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy,
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_moonshine_source_to_runtime_pack",
+            },
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
@@ -1513,10 +1556,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         decode_policy_id: DOLPHIN_DECODE_POLICY_ID,
         executor_component_id: DOLPHIN_EXECUTOR_COMPONENT_ID,
         integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "dolphin",
             supports_phrase_bias: true,
-            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
-            pack_importer_source: "crates/openasr-core/src/models/dolphin/package_import.rs",
-            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::Dedicated,
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_dolphin_wenet_source_to_runtime_pack",
+            },
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
@@ -1564,10 +1610,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         decode_policy_id: SENSEVOICE_DECODE_POLICY_ID,
         executor_component_id: SENSEVOICE_EXECUTOR_COMPONENT_ID,
         integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "sensevoice",
             supports_phrase_bias: true,
-            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
-            pack_importer_source: "crates/openasr-core/src/models/sensevoice/package_import.rs",
-            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::SharedCtcGreedy,
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_sensevoice_source_to_runtime_pack",
+            },
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
@@ -1610,11 +1659,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         decode_policy_id: FIRERED_AED_DECODE_POLICY_ID,
         executor_component_id: FIRERED_AED_EXECUTOR_COMPONENT_ID,
         integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "firered-aed",
             supports_phrase_bias: false,
-            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
-            pack_importer_source: "crates/openasr-core/src/models/firered_aed/package_import.rs",
-            audit_form: OpenAsrAuditFormRequirement::Required {
-                relative_path: "docs/model-audits/firered-aed.md",
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy,
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_firered_aed_source_to_runtime_pack",
             },
             reference_dumper_source: Some("tooling/firered2-reference-dumper/dump_aed_encoder.py"),
         },
@@ -1662,11 +1712,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         decode_policy_id: FIRERED_LLM_DECODE_POLICY_ID,
         executor_component_id: FIRERED_LLM_EXECUTOR_COMPONENT_ID,
         integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "firered2-llm",
             supports_phrase_bias: false,
-            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
-            pack_importer_source: "crates/openasr-core/src/models/firered_llm/package_import.rs",
-            audit_form: OpenAsrAuditFormRequirement::Required {
-                relative_path: "docs/model-audits/firered2-llm.md",
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy,
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_firered_llm_source_to_runtime_pack",
             },
             reference_dumper_source: Some("tooling/firered2-reference-dumper/dump_reference.py"),
         },
@@ -1712,10 +1763,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         decode_policy_id: MIMO_ASR_DECODE_POLICY_ID,
         executor_component_id: MIMO_ASR_EXECUTOR_COMPONENT_ID,
         integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "mimo-asr",
             supports_phrase_bias: false,
-            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
-            pack_importer_source: "tooling/mimo-asr/convert_mimo_asr.py",
-            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy,
+            pack_import: OpenAsrPackImportSurface::ExternalTooling {
+                relative_path: "tooling/mimo-asr/convert_mimo_asr.py",
+            },
             reference_dumper_source: None,
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
@@ -1758,11 +1812,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         decode_policy_id: MOSS_TD_DECODE_POLICY_ID,
         executor_component_id: MOSS_TD_EXECUTOR_COMPONENT_ID,
         integration: OpenAsrFamilyIntegrationDescriptor {
+            catalog_family_id: "moss-transcribe-diarize",
             supports_phrase_bias: false,
-            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
-            pack_importer_source: "crates/openasr-core/src/models/moss_transcribe_diarize/package_import.rs",
-            audit_form: OpenAsrAuditFormRequirement::Required {
-                relative_path: "docs/model-audits/moss-transcribe-diarize.md",
+            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            shared_decode_driver: OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy,
+            pack_import: OpenAsrPackImportSurface::CoreConvert {
+                symbol: "convert_local_moss_transcribe_diarize_source_to_runtime_pack",
             },
             reference_dumper_source: Some("tooling/moss-reference-dumper/dump_golden.py"),
         },
@@ -1831,44 +1886,9 @@ mod tests {
     }
 
     #[test]
-    fn native_family_integration_manifest_references_existing_tooling() {
-        let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .expect("repository root");
-        for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
-            assert!(
-                !descriptor.integration.pack_importer_source.is_empty(),
-                "native family '{}' must declare its pack importer source",
-                descriptor.model_family
-            );
-            assert!(
-                repository_root
-                    .join(descriptor.integration.pack_importer_source)
-                    .is_file(),
-                "native family '{}' pack importer source '{}' is missing",
-                descriptor.model_family,
-                descriptor.integration.pack_importer_source
-            );
-            if let Some(source) = descriptor.integration.reference_dumper_source {
-                assert!(
-                    repository_root.join(source).is_file(),
-                    "native family '{}' reference dumper source '{}' is missing",
-                    descriptor.model_family,
-                    source
-                );
-            }
-            if let OpenAsrAuditFormRequirement::Required { relative_path } =
-                descriptor.integration.audit_form
-            {
-                assert!(
-                    repository_root.join(relative_path).is_file(),
-                    "native family '{}' requires audit form '{}' but it is missing",
-                    descriptor.model_family,
-                    relative_path
-                );
-            }
-        }
+    fn native_family_integration_audit_covers_builtins() {
+        crate::models::family_integration_audit::audit_builtin_native_family_integrations()
+            .expect("builtin native families must satisfy the integration audit");
     }
 
     /// Pins `self_diarizes` and `emits_punctuation` per builtin architecture --

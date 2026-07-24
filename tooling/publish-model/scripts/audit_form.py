@@ -43,27 +43,21 @@ REQUIRED_SECTIONS = (
 
 # Families already public before the audit-form policy (2026-07). They are
 # exempt from the missing-form check until backfilled on the rolling audit
-# matrix; a form that DOES exist for them is still validated. Remove a family
-# from this set when its form lands -- the set only shrinks, never grows.
-PRE_AUDIT_FAMILIES = frozenset(
-    {
-        "cohere",
-        "dolphin",
-        "firered-aed",
-        "firered-punc",
-        "hymt2",
-        "mimo-asr",
-        "moonshine",
-        "parakeet-tdt",
-        "pyannote-segmentation",
-        "qwen",
-        "qwen3-forced-aligner",
-        "sensevoice",
-        "wespeaker",
-        "whisper",
-        "xasr-zipformer",
-    }
-)
+# matrix; a form that DOES exist for them is still validated. The set lives in
+# docs/model-audits/pre_audit_families.txt (shared with the Rust native-family
+# integration audit) and only shrinks -- never add new families there.
+def _load_pre_audit_families() -> frozenset[str]:
+    path = repo_root(Path(__file__).resolve().parent) / AUDIT_DIR_RELATIVE / "pre_audit_families.txt"
+    families: set[str] = set()
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        families.add(line)
+    return frozenset(families)
+
+
+PRE_AUDIT_FAMILIES = _load_pre_audit_families()
 
 
 class AuditFormError(RuntimeError):

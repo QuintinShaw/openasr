@@ -907,29 +907,57 @@ mod tests {
     }
 
     #[test]
-    fn all_seq2seq_greedy_arch_decode_policies_resolve() {
-        // Half-connect guard: every architecture whose decode policy id is a
-        // greedy-seq2seq shape MUST have a matching execution descriptor here. A
-        // new seq2seq family that registers `*.greedy.seq2seq.*` in the arch
-        // registry but forgets the execution descriptor trips this test instead
-        // of silently failing at decode time.
+    fn all_shared_decode_driver_families_resolve_from_integration_descriptor() {
+        // Half-connect guard driven by the architecture integration descriptor
+        // (not by decode-policy id substring matching): AED/autoregressive
+        // families declare SharedSeq2SeqGreedy, CTC collapse families declare
+        // SharedCtcGreedy, and dedicated loops must stay off this registry.
+        use crate::arch::OpenAsrSharedDecodeDriver;
         for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
-            if !descriptor.decode_policy_id.contains(".greedy.seq2seq.") {
-                continue;
+            match descriptor.integration.shared_decode_driver {
+                OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy => {
+                    let policy = resolve_builtin_decode_policy(descriptor.decode_policy_id)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "shared seq2seq family '{}' policy '{}' missing: {error}",
+                                descriptor.model_family, descriptor.decode_policy_id
+                            )
+                        });
+                    assert_eq!(
+                        policy.execution_kind,
+                        BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
+                        "family '{}'",
+                        descriptor.model_family
+                    );
+                }
+                OpenAsrSharedDecodeDriver::SharedCtcGreedy => {
+                    let policy = resolve_builtin_decode_policy(descriptor.decode_policy_id)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "shared CTC family '{}' policy '{}' missing: {error}",
+                                descriptor.model_family, descriptor.decode_policy_id
+                            )
+                        });
+                    assert_eq!(
+                        policy.execution_kind,
+                        BuiltinDecodePolicyExecutionKind::CtcGreedyV0,
+                        "family '{}'",
+                        descriptor.model_family
+                    );
+                    assert!(
+                        policy.ctc_blank_token_id.is_some(),
+                        "family '{}' CTC policy must declare blank token id",
+                        descriptor.model_family
+                    );
+                }
+                OpenAsrSharedDecodeDriver::Dedicated => {
+                    assert!(
+                        resolve_builtin_decode_policy(descriptor.decode_policy_id).is_err(),
+                        "dedicated family '{}' must not register on the shared decode driver",
+                        descriptor.model_family
+                    );
+                }
             }
-            let policy = resolve_builtin_decode_policy(descriptor.decode_policy_id)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "seq2seq-greedy decode policy '{}' for architecture '{}' is not registered: {error}",
-                        descriptor.decode_policy_id, descriptor.model_architecture
-                    )
-                });
-            assert_eq!(
-                policy.execution_kind,
-                BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
-                "decode policy '{}' must be Seq2SeqGreedyV0",
-                descriptor.decode_policy_id
-            );
         }
     }
 

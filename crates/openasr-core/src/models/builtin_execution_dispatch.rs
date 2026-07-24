@@ -4,10 +4,7 @@ use thiserror::Error;
 
 use crate::GgmlAsrExecutionDispatch;
 use crate::StreamingPartialGranularity;
-use crate::arch::{
-    OpenAsrArchitectureRegistry, OpenAsrArchitectureRegistryError,
-    OpenAsrStreamingPartialGranularity,
-};
+use crate::arch::{OpenAsrArchitectureRegistry, OpenAsrArchitectureRegistryError};
 
 use super::dolphin::executor::DolphinGgmlExecutor;
 use super::executor_component_registry::{
@@ -17,6 +14,7 @@ use super::executor_component_registry::{
 };
 use super::firered_aed::executor::FireRedAedGgmlExecutor;
 use super::firered_llm::executor::FireRedLlmGgmlExecutor;
+use super::ggml_asr_executor::GgmlAsrStreamingExecutor;
 use super::ggml_composed_executor::ComposedGgmlAsrExecutor;
 use super::ggml_family_adapter::GgmlExecutionCapability;
 use super::mimo_asr::executor::MimoAsrGgmlExecutor;
@@ -43,12 +41,19 @@ pub(crate) enum BuiltinGgmlExecutionDispatchError {
     )]
     MissingStreamingExecutor { model_architecture: &'static str },
     #[error(
-        "builtin streaming dispatch partial granularity disagrees with the architecture manifest for '{model_architecture}': expected {expected:?}"
+        "builtin streaming dispatch partial granularity disagrees with the architecture integration descriptor for '{model_architecture}': expected {expected:?}, actual {actual:?}"
     )]
     StreamingGranularityMismatch {
         model_architecture: &'static str,
-        expected: OpenAsrStreamingPartialGranularity,
+        expected: StreamingPartialGranularity,
+        actual: StreamingPartialGranularity,
     },
+    #[error(
+        "builtin streaming dispatch is missing partial granularity derived from the architecture integration descriptor for '{model_architecture}'"
+    )]
+    MissingStreamingGranularity { model_architecture: &'static str },
+    #[error("native family integration audit failed: {reason}")]
+    FamilyIntegrationIncomplete { reason: String },
     #[error("builtin architecture registry failed validation: {error:?}")]
     ArchitectureRegistryInvalid {
         error: OpenAsrArchitectureRegistryError,
@@ -61,6 +66,14 @@ pub(crate) fn build_builtin_ggml_execution_dispatch()
     registry.validate_references().map_err(|error| {
         BuiltinGgmlExecutionDispatchError::ArchitectureRegistryInvalid { error }
     })?;
+    // Touch the force-linked pack-import table so convert entries stay reachable
+    // from a non-test production path (half-wiring a deleted convert fails compile).
+    let _pack_imports = crate::models::pack_import_surface::linked_core_pack_import_symbols();
+    crate::models::family_integration_audit::audit_builtin_native_family_integrations().map_err(
+        |error| BuiltinGgmlExecutionDispatchError::FamilyIntegrationIncomplete {
+            reason: error.to_string(),
+        },
+    )?;
 
     let mut dispatch = GgmlAsrExecutionDispatch::default();
     let executors_by_model_architecture = materialize_builtin_executors_by_model_architecture()
@@ -101,6 +114,56 @@ pub(crate) fn build_builtin_ggml_execution_dispatch()
     Ok(dispatch)
 }
 
+fn builtin_streaming_executor_for_architecture(
+    model_architecture: &str,
+) -> Option<Arc<dyn GgmlAsrStreamingExecutor>> {
+    match model_architecture {
+        crate::QWEN3_ASR_GGML_ARCHITECTURE_ID => {
+            Some(shared_qwen3_asr_executor() as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::WHISPER_GGML_ARCHITECTURE_ID => {
+            Some(shared_whisper_executor() as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID => {
+            Some(shared_cohere_transcribe_executor() as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::MOONSHINE_GGML_ARCHITECTURE_ID => {
+            Some(shared_moonshine_executor() as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::PARAKEET_CTC_GGML_ARCHITECTURE_ID => {
+            Some(Arc::new(ParakeetCtcGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::PARAKEET_TDT_GGML_ARCHITECTURE_ID => {
+            Some(Arc::new(ParakeetTdtGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID => {
+            Some(Arc::new(SenseVoiceGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID => {
+            Some(Arc::new(Wav2Vec2CtcGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID => {
+            Some(Arc::new(DolphinGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID => {
+            Some(Arc::new(FireRedAedGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID => {
+            Some(Arc::new(FireRedLlmGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID => {
+            Some(Arc::new(MimoAsrGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID => {
+            Some(Arc::new(MossTdGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        crate::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID => {
+            Some(Arc::new(XasrZipformerGgmlExecutor) as Arc<dyn GgmlAsrStreamingExecutor>)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
 -> Result<GgmlAsrExecutionDispatch, BuiltinGgmlExecutionDispatchError> {
     let registry = OpenAsrArchitectureRegistry::with_builtins();
@@ -108,130 +171,27 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
         BuiltinGgmlExecutionDispatchError::ArchitectureRegistryInvalid { error }
     })?;
 
-    // Streaming executors must be registered explicitly by a family-level
-    // implementation. The offline executor registry is intentionally not reused
-    // here, so metadata alone cannot turn an offline decoder into a claimed
-    // realtime/partial runtime.
-    //
-    // Each adapter also declares its partial-result granularity here: the
-    // registration site is the only place that knows whether a family's
-    // streaming session is the frame-sync append-only driver (never revises
-    // emitted text) or a buffered/windowed re-decode driver (may revise).
-    // Only xasr-zipformer runs the frame-sync driver today; every other
-    // family re-decodes a growing or windowed buffer.
-    let dispatch = GgmlAsrExecutionDispatch::default()
-        .with_streaming_executor_for_adapter(
-            crate::QWEN3_ASR_GGML_ADAPTER_ID,
-            shared_qwen3_asr_executor(),
-        )
-        .with_streaming_partial_granularity_for_adapter(
-            crate::QWEN3_ASR_GGML_ADAPTER_ID,
-            StreamingPartialGranularity::Buffered,
-        )
-        .with_streaming_executor_for_adapter(
-            crate::WHISPER_GGML_ADAPTER_ID,
-            shared_whisper_executor(),
-        )
-        .with_streaming_partial_granularity_for_adapter(
-            crate::WHISPER_GGML_ADAPTER_ID,
-            StreamingPartialGranularity::Buffered,
-        )
-        .with_streaming_executor_for_adapter(
-            crate::COHERE_TRANSCRIBE_GGML_ADAPTER_ID,
-            shared_cohere_transcribe_executor(),
-        )
-        .with_streaming_partial_granularity_for_adapter(
-            crate::COHERE_TRANSCRIBE_GGML_ADAPTER_ID,
-            StreamingPartialGranularity::Buffered,
-        )
-        .with_streaming_executor_for_adapter(
-            crate::MOONSHINE_GGML_ADAPTER_ID,
-            shared_moonshine_executor(),
-        )
-        .with_streaming_partial_granularity_for_adapter(
-            crate::MOONSHINE_GGML_ADAPTER_ID,
-            StreamingPartialGranularity::Buffered,
-        )
-        .with_streaming_executor_for_adapter(
-            crate::PARAKEET_CTC_GGML_ADAPTER_ID,
-            Arc::new(ParakeetCtcGgmlExecutor),
-        )
-        .with_streaming_partial_granularity_for_adapter(
-            crate::PARAKEET_CTC_GGML_ADAPTER_ID,
-            StreamingPartialGranularity::Buffered,
-        )
-        .with_streaming_executor_for_adapter(
-            crate::PARAKEET_TDT_GGML_ADAPTER_ID,
-            Arc::new(ParakeetTdtGgmlExecutor),
-        )
-        .with_streaming_partial_granularity_for_adapter(
-            crate::PARAKEET_TDT_GGML_ADAPTER_ID,
-            StreamingPartialGranularity::Buffered,
-        )
-        .with_streaming_executor_for_adapter(
-            crate::arch::SENSEVOICE_GGML_ADAPTER_ID,
-            Arc::new(SenseVoiceGgmlExecutor),
-        )
-        .with_streaming_partial_granularity_for_adapter(
-            crate::arch::SENSEVOICE_GGML_ADAPTER_ID,
-            StreamingPartialGranularity::Buffered,
-        )
-        .with_streaming_executor_for_adapter(
-            crate::WAV2VEC2_CTC_GGML_ADAPTER_ID,
-            Arc::new(Wav2Vec2CtcGgmlExecutor),
-        )
-        .with_streaming_partial_granularity_for_adapter(
-            crate::WAV2VEC2_CTC_GGML_ADAPTER_ID,
-            StreamingPartialGranularity::Buffered,
-        )
-        .with_streaming_executor_for_adapter(
-            crate::arch::DOLPHIN_GGML_ADAPTER_ID,
-            Arc::new(DolphinGgmlExecutor),
-        )
-        .with_streaming_partial_granularity_for_adapter(
-            crate::arch::DOLPHIN_GGML_ADAPTER_ID,
-            StreamingPartialGranularity::Buffered,
-        )
-        .with_streaming_executor_for_adapter(
-            crate::arch::FIRERED_AED_GGML_ADAPTER_ID,
-            Arc::new(FireRedAedGgmlExecutor),
-        )
-        .with_streaming_partial_granularity_for_adapter(
-            crate::arch::FIRERED_AED_GGML_ADAPTER_ID,
-            StreamingPartialGranularity::Buffered,
-        )
-        .with_streaming_executor_for_adapter(
-            crate::arch::FIRERED_LLM_GGML_ADAPTER_ID,
-            Arc::new(FireRedLlmGgmlExecutor),
-        )
-        .with_streaming_partial_granularity_for_adapter(
-            crate::arch::FIRERED_LLM_GGML_ADAPTER_ID,
-            StreamingPartialGranularity::Buffered,
-        )
-        .with_streaming_executor_for_adapter(
-            crate::arch::MIMO_ASR_GGML_ADAPTER_ID,
-            Arc::new(MimoAsrGgmlExecutor),
-        )
-        .with_streaming_partial_granularity_for_adapter(
-            crate::arch::MIMO_ASR_GGML_ADAPTER_ID,
-            StreamingPartialGranularity::Buffered,
-        )
-        .with_streaming_executor_for_adapter(
-            crate::arch::MOSS_TD_GGML_ADAPTER_ID,
-            Arc::new(MossTdGgmlExecutor),
-        )
-        .with_streaming_partial_granularity_for_adapter(
-            crate::arch::MOSS_TD_GGML_ADAPTER_ID,
-            StreamingPartialGranularity::Buffered,
-        )
-        .with_streaming_executor_for_adapter(
-            crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
-            Arc::new(XasrZipformerGgmlExecutor),
-        )
-        .with_streaming_partial_granularity_for_adapter(
-            crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
-            StreamingPartialGranularity::FrameSync,
-        );
+    // Streaming executors remain family-implemented, but partial-result
+    // granularity is derived from the architecture integration descriptor
+    // (single source) rather than hand-written a second time here.
+    let mut dispatch = GgmlAsrExecutionDispatch::default();
+    for architecture in registry.descriptors() {
+        let Some(executor) =
+            builtin_streaming_executor_for_architecture(architecture.model_architecture)
+        else {
+            return Err(
+                BuiltinGgmlExecutionDispatchError::MissingStreamingExecutor {
+                    model_architecture: architecture.model_architecture,
+                },
+            );
+        };
+        dispatch = dispatch
+            .with_streaming_executor_for_adapter(architecture.adapter_id, executor)
+            .with_streaming_partial_granularity_for_adapter(
+                architecture.adapter_id,
+                architecture.integration.streaming_partial_granularity,
+            );
+    }
 
     // Fail-fast completeness gate: realtime driver selection is descriptor-driven
     // (see `native_runtime_streaming_capabilities_for_descriptor`). A registered
@@ -252,16 +212,20 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
         let architecture = registry
             .find_by_model_architecture(descriptor.model_architecture)
             .expect("family registry is derived from architecture registry");
-        let is_frame_sync = dispatch.is_frame_sync_for(descriptor);
-        let manifest_declares_frame_sync = matches!(
-            architecture.integration.streaming_partial_granularity,
-            OpenAsrStreamingPartialGranularity::FrameSync
-        );
-        if is_frame_sync != manifest_declares_frame_sync {
+        let expected = architecture.integration.streaming_partial_granularity;
+        let Some(actual) = dispatch.streaming_partial_granularity_for(descriptor) else {
+            return Err(
+                BuiltinGgmlExecutionDispatchError::MissingStreamingGranularity {
+                    model_architecture: descriptor.model_architecture,
+                },
+            );
+        };
+        if actual != expected {
             return Err(
                 BuiltinGgmlExecutionDispatchError::StreamingGranularityMismatch {
                     model_architecture: descriptor.model_architecture,
-                    expected: architecture.integration.streaming_partial_granularity,
+                    expected,
+                    actual,
                 },
             );
         }
@@ -272,6 +236,7 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     use super::*;
@@ -445,27 +410,38 @@ mod tests {
     }
 
     #[test]
-    fn builtin_streaming_dispatch_declares_xasr_as_the_only_frame_sync_family() {
+    fn builtin_streaming_frame_sync_set_matches_architecture_integration_manifest() {
         let dispatch =
             build_builtin_ggml_streaming_execution_dispatch().expect("builtin streaming dispatch");
-        let buffered_descriptors = [
-            qwen3_asr_runtime_descriptor_v1(),
-            whisper_runtime_descriptor_v1(),
-            crate::cohere_transcribe_runtime_descriptor_v1(),
-            crate::moonshine_runtime_descriptor_v1(),
-            parakeet_ctc_runtime_descriptor_v1(),
-            wav2vec2_ctc_runtime_descriptor_v1(),
-            crate::sensevoice_runtime_descriptor_v1(),
-            crate::dolphin_runtime_descriptor_v1(),
-        ];
-        for descriptor in &buffered_descriptors {
-            assert!(
-                !dispatch.is_frame_sync_for(descriptor),
-                "{} should be buffered, not frame-sync",
+        let architecture_registry = OpenAsrArchitectureRegistry::with_builtins();
+        let family_registry =
+            crate::models::ggml_family_registry::GgmlFamilyRegistry::with_builtin_adapters();
+
+        let mut manifest_frame_sync = BTreeSet::new();
+        let mut dispatch_frame_sync = BTreeSet::new();
+        for descriptor in family_registry.descriptors() {
+            let architecture = architecture_registry
+                .find_by_model_architecture(descriptor.model_architecture)
+                .expect("family registry is derived from architecture registry");
+            if architecture.integration.streaming_partial_granularity
+                == StreamingPartialGranularity::FrameSync
+            {
+                manifest_frame_sync.insert(descriptor.model_architecture);
+            }
+            if dispatch.is_frame_sync_for(descriptor) {
+                dispatch_frame_sync.insert(descriptor.model_architecture);
+            }
+            assert_eq!(
+                dispatch.streaming_partial_granularity_for(descriptor),
+                Some(architecture.integration.streaming_partial_granularity),
+                "family '{}' streaming granularity must be derived from its architecture integration descriptor",
                 descriptor.adapter_id
             );
         }
-        assert!(dispatch.is_frame_sync_for(&xasr_zipformer_runtime_descriptor_v1()));
+        assert_eq!(
+            manifest_frame_sync, dispatch_frame_sync,
+            "FrameSync architecture set must equal the streaming dispatch FrameSync set"
+        );
     }
 
     #[test]
@@ -489,12 +465,9 @@ mod tests {
                 .find_by_model_architecture(descriptor.model_architecture)
                 .expect("family registry is derived from architecture registry");
             assert_eq!(
-                dispatch.is_frame_sync_for(descriptor),
-                matches!(
-                    architecture.integration.streaming_partial_granularity,
-                    OpenAsrStreamingPartialGranularity::FrameSync
-                ),
-                "family '{}' ({}) streaming partial granularity disagrees with its architecture manifest",
+                dispatch.streaming_partial_granularity_for(descriptor),
+                Some(architecture.integration.streaming_partial_granularity),
+                "family '{}' ({}) streaming partial granularity must come from its architecture integration descriptor",
                 descriptor.adapter_id,
                 descriptor.model_architecture,
             );
