@@ -38,3 +38,4 @@ pub mod segment;
 pub mod streaming;
 pub mod vad;
 pub(crate) mod vbx;
+pub mod voice_id;

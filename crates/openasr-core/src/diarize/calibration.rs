@@ -3,6 +3,12 @@
 //! Batch clustering and streaming registry gates stay in one profile so runtime
 //! code consumes calibrated thresholds without embedding model conditionals.
 
+/// Stable calibration identity for WeSpeaker's cosine space. Bump when any
+/// threshold that participates in Voice ID matching changes.
+pub const WESPEAKER_CALIBRATION_VERSION: &str = "wespeaker-cal-v1";
+/// Stable calibration identity for ReDimNet2-B6's cosine space.
+pub const REDIMNET_CALIBRATION_VERSION: &str = "redimnet2-b6-cal-v1";
+
 #[derive(Debug, Clone, Copy)]
 pub struct SpeakerCalibrationProfile {
     pub(crate) clustering: ClusteringCalibrationProfile,
@@ -22,6 +28,18 @@ pub struct SpeakerCalibrationProfile {
     /// to measure a margin against and always clears this gate (see that
     /// method's doc comment).
     pub(crate) enrollment_match_margin: f32,
+}
+
+impl SpeakerCalibrationProfile {
+    /// Default accept threshold for Voice ID person matching in this space.
+    pub fn voice_id_accept_threshold(&self) -> f32 {
+        self.enrollment_default_match_similarity
+    }
+
+    /// Person-level top1-vs-top2 margin for Voice ID matching.
+    pub fn voice_id_margin(&self) -> f32 {
+        self.enrollment_match_margin
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
