@@ -427,6 +427,15 @@ impl Qwen3AsrGgmlExecutor {
             validate_stacks_started_at,
         );
         let serve_batch_graph_config = super::graph_config::qwen_runtime_graph_config();
+        // An active LoRA adapter (request --adapter or the OPENASR_ADAPTER env
+        // fallback) must never take the serve-batch lane: the batch worker resolves
+        // weights before this point and has no adapter plumbing, so it would
+        // silently run on base weights. Resolve the active source up front and fail
+        // closed onto the serial lane below, matching moonshine's adapter bypass.
+        let adapter_active = crate::adapter_pack::active_adapter_path(
+            request.request_options.adapter_path.as_deref(),
+        )
+        .is_some();
         if let Some(serve_batch_config) =
             Qwen3AsrServeBatchConfig::from_policy(request.request_options.serve_batch)
                 // Serve-batch needs the unified GPU lane on the direct reusable graph.
@@ -435,8 +444,12 @@ impl Qwen3AsrGgmlExecutor {
                 // stay serial without claiming batch width.
                 .filter(|_| {
                     // Streaming bypasses the batch worker so live sessions stay on the
-                    // direct greedy loop below.
+                    // direct greedy loop below; an active adapter bypasses it too
+                    // (see adapter_active above).
+                    // TODO(serve-batch): plumb LoRA adapters through the batch worker
+                    // so adapter-bearing requests can share the batched GPU lane.
                     !skip_serve_batch
+                        && !adapter_active
                         && serve_batch_graph_config.backend.is_gpu_class()
                         && !serve_batch_graph_config.use_scheduler
                 })

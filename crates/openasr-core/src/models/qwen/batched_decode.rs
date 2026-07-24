@@ -2363,21 +2363,10 @@ mod tests {
         let token_major_embeddings = token_embedding_table
             .gather_rows(prompt_tokens)
             .expect("qwen prompt embeddings");
-        let position_ids = (0..token_count)
-            .map(|idx| i32::try_from(idx).expect("position id"))
-            .collect::<Vec<_>>();
-        let mut causal_mask = vec![-1.0e30_f32; token_count * token_count];
-        for query_idx in 0..token_count {
-            for key_idx in 0..=query_idx {
-                causal_mask[query_idx * token_count + key_idx] = 0.0;
-            }
-        }
         Qwen3AsrLlmPrefillInput {
             token_count,
             hidden_size,
             token_major_embeddings,
-            position_ids,
-            causal_mask,
         }
     }
 
