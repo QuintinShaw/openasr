@@ -18,7 +18,7 @@ use crate::nn::ffn::FeedForwardActivation;
 use crate::{GgufTensorDataReadError, GgufTensorDataReader, GgufTensorMetadata};
 
 use super::frontend::Qwen3AsrMelFeatures;
-use super::graph_config::qwen_runtime_graph_config;
+use super::graph_config::qwen_encoder_graph_config;
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 
 /// Env flag to emit a per-chunk audio-encoder timing split. `setup_us` covers
@@ -166,7 +166,9 @@ pub(crate) struct Qwen3AsrAudioEncoderRuntime {
 
 impl Qwen3AsrAudioEncoderRuntime {
     pub(crate) fn new(runtime_path: Option<&Path>) -> Result<Self, Qwen3AsrAudioEncoderError> {
-        let mut config = qwen_runtime_graph_config();
+        // See `qwen_encoder_graph_config` for the `EncoderPrelude` threading
+        // tier rationale.
+        let mut config = qwen_encoder_graph_config();
         config.context_bytes = QWEN3_AUDIO_GRAPH_CONTEXT_BYTES;
         let runner = GgmlCpuGraphRunner::new(config).map_err(|source| {
             Qwen3AsrAudioEncoderError::GraphBuildFailed {

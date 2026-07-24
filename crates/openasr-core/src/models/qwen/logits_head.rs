@@ -11,7 +11,7 @@ use crate::models::thread_local_runtime_cache::{
     with_thread_local_cached_mut_by_key,
 };
 
-use super::graph_config::qwen_runtime_graph_config;
+use super::graph_config::{qwen_decoder_graph_config, qwen_runtime_graph_config};
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::tensor_names::{
     OUTPUT_NORM_WEIGHT as OUTPUT_NORM_WEIGHT_TENSOR_NAME,
@@ -451,7 +451,16 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
             });
         }
 
-        let mut config = qwen_runtime_graph_config();
+        // Norm + a single [1, d_model] x [d_model, vocab_size] projection per
+        // call -- a thin, memory-bandwidth-bound matrix-vector product with
+        // one output row, run once per decode step at the same cadence as
+        // the whole-decoder executor this feeds (thousands of decode-step
+        // calls dominating over a handful of prefill chunks). Little
+        // row-level parallelism to hand out per call regardless of thread
+        // count, so this takes the `Decoder` tier from
+        // `qwen_decoder_graph_config` on its own merits (there is no
+        // separate firered-aed logits-head module to mirror here).
+        let mut config = qwen_decoder_graph_config();
         config.context_bytes = QWEN3_LLM_LOGITS_GRAPH_CONTEXT_BYTES;
         let runner = GgmlCpuGraphRunner::new(config)?;
         let mut arena = runner.start_static_tensor_arena(config.context_bytes)?;

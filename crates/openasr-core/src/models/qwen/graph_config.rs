@@ -1,8 +1,9 @@
-use crate::ggml_runtime::GgmlCpuGraphConfig;
+use crate::ggml_runtime::{GgmlCpuGraphConfig, GgmlCpuGraphThreadingWorkload};
 #[cfg(test)]
 use crate::models::graph_runtime_config::configure_model_runtime_graph_config;
 use crate::models::graph_runtime_config::{
     ModelMetalRuntimeOverrides, configure_model_runtime_graph_config_from_env,
+    has_explicit_thread_override,
 };
 
 /// qwen is NOT gated (`AutoGpuPolicy::AllBackends`, see `arch::mod`) as of
@@ -26,6 +27,51 @@ pub(crate) fn qwen_runtime_graph_config() -> GgmlCpuGraphConfig {
             default_n_threads_when_unset: Some(1),
         },
     )
+}
+
+/// Graph config for the audio-encoder runner. The encoder runs the whole
+/// utterance's conformer stack as one graph call with wide per-layer
+/// parallelism (many independent frames / attention heads) -- the same shape
+/// as firered-aed's encoder, which is why it takes the same `EncoderPrelude`
+/// tier (see `firered_aed::graph_config::firered_encoder_graph_config` for
+/// the precedent this mirrors). Unlike the decode path below, there is no
+/// per-token reuse here: one call per chunk, so maximizing threads for that
+/// one call is a clear win, not a per-step overhead trade-off.
+pub(crate) fn qwen_encoder_graph_config() -> GgmlCpuGraphConfig {
+    let mut config = qwen_runtime_graph_config();
+    if !has_explicit_thread_override() {
+        config.n_threads = GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
+            config.backend,
+            GgmlCpuGraphThreadingWorkload::EncoderPrelude,
+        );
+    }
+    config
+}
+
+/// Graph config for the LLM decode-path runners (the whole-decoder executor
+/// and the logits head that feeds off it). Both are resident graphs reused
+/// across the whole pack lifetime, dominated by thousands of single-token
+/// autoregressive decode-step calls versus a handful of larger prefill
+/// chunks; per-token graphs have little row-level parallelism to hand out
+/// regardless of thread count. This takes the `Decoder` tier, mirroring
+/// firered-aed's decoder graph
+/// (`firered_aed::graph_config::firered_decoder_graph_config`) and
+/// deliberately requesting fewer threads than `Default` to cut thread-pool
+/// wake/join overhead on the dominant small-graph call instead of
+/// over-provisioning threads the per-token op mix cannot use. mimo-asr,
+/// firered2-llm, moss-transcribe-diarize, and hymt2 all construct their
+/// whole-decoder executor through
+/// `Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head`,
+/// so they inherit this tier automatically.
+pub(crate) fn qwen_decoder_graph_config() -> GgmlCpuGraphConfig {
+    let mut config = qwen_runtime_graph_config();
+    if !has_explicit_thread_override() {
+        config.n_threads = GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
+            config.backend,
+            GgmlCpuGraphThreadingWorkload::Decoder,
+        );
+    }
+    config
 }
 
 #[cfg(test)]
