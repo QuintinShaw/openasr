@@ -735,16 +735,14 @@ fn pull_target_from_local_oasr_pack(
         },
     };
 
-    if let Some(stem) = stem {
-        // Filename `family-q8_0.oasr` when metadata only carries the family.
-        if quant_hint.is_none()
-            && let Some((family, quant_token)) = split_family_and_trailing_quant_token(stem)
-        {
-            if model_id == family || model_id == stem {
-                model_id = family;
-                quant_hint = Some(quant_token);
-            }
-        }
+    // Filename `family-q8_0.oasr` when metadata only carries the family.
+    if quant_hint.is_none()
+        && let Some(stem) = stem
+        && let Some((family, quant_token)) = split_family_and_trailing_quant_token(stem)
+        && (model_id == family || model_id == stem)
+    {
+        model_id = family;
+        quant_hint = Some(quant_token);
     }
 
     let quant_from_metadata = crate::read_gguf_metadata(source_path)
