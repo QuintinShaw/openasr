@@ -13,7 +13,7 @@ use crate::ggml_runtime::{
     env_toggle_with_raw,
 };
 
-use super::graph_config::qwen_runtime_graph_config;
+use super::graph_config::qwen_decoder_graph_config;
 use super::kv_cache::Qwen3AsrLayerKvCacheState;
 use super::logits_head::{
     Qwen3AsrLlmFusedLogitsHeadSpec, first_max_argmax_reverse_indices,
@@ -1544,7 +1544,16 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 reason: "whole-decoder rms norm epsilon must be finite and positive",
             });
         }
-        let mut config = qwen_runtime_graph_config();
+        // This single resident graph is reused across the whole pack lifetime
+        // for both prompt-prefill chunks and single-token autoregressive
+        // decode steps (`ggml_executor`'s `QWEN_WHOLE_DECODER_BY_KEY` cache);
+        // `n_threads` is fixed once here at construction, so one tier has to
+        // be picked for the whole executor rather than per call. mimo-asr,
+        // firered2-llm, moss-transcribe-diarize, and hymt2 all construct this
+        // executor through `new_with_rms_norm_epsilon_and_fused_logits_head`
+        // too, so they inherit the `Decoder` tier below automatically. See
+        // `qwen_decoder_graph_config` for the tier rationale.
+        let mut config = qwen_decoder_graph_config();
         config.context_bytes = QWEN3_LLM_WHOLE_DECODE_GRAPH_CONTEXT_BYTES;
         let use_native_gqa = qwen_llm_resolve_use_native_gqa(config.backend);
         let runner = GgmlCpuGraphRunner::new(config)?;
