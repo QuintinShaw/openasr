@@ -14,15 +14,16 @@ instead of a history untangle.
 
 The current local patch stack (oldest first):
 
-1. Expose GGUF tensor dimension accessors (`gguf_get_tensor_n_dims`) -- used by
-   the Rust GGUF tensor index.
-2. backend-dl: open plugins with `LOAD_WITH_ALTERED_SEARCH_PATH` on Windows.
-3. Filter `GGML_LOG_LEVEL_DEBUG` spam unless `GGML_DEBUG` / `OPENASR_GGML_DEBUG`.
-4. Persist the Metal pipeline cache (MTLBinaryArchive serialised to disk for
+1. backend-dl: open plugins with `LOAD_WITH_ALTERED_SEARCH_PATH` on Windows.
+2. Filter `GGML_LOG_LEVEL_DEBUG` spam unless `GGML_DEBUG` / `OPENASR_GGML_DEBUG`.
+3. Persist the Metal pipeline cache (MTLBinaryArchive serialised to disk for
    faster cold start).
-5. Isolate that Metal pipeline cache under an `openasr/` cache subdir.
-6. Default Metal residency sets off unless the device exposes the tensor API
+4. Isolate that Metal pipeline cache under an `openasr/` cache subdir.
+5. Default Metal residency sets off unless the device exposes the tensor API
    (`GGML_METAL_RESIDENCY_ENABLE` / `GGML_METAL_NO_RESIDENCY` override).
+
+GGUF tensor shapes use upstream `gguf_get_tensor_ne`; do not restore local
+per-dimension accessors.
 
 Deliberately **not** carried on the pin:
 

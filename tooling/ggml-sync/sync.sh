@@ -92,7 +92,10 @@ base="$(git_sub merge-base "${target_sha}" "${pin}")"
 # The OpenASR-local stack = non-merge commits reachable from the current pin but
 # not from its clean upstream base. On a clean pin this is exactly the reviewed
 # patch stack, oldest first.
-mapfile -t patches < <(git_sub log --reverse --no-merges --format='%H' "${base}..${pin}")
+patches=()
+while IFS= read -r sha; do
+  patches+=("${sha}")
+done < <(git_sub log --reverse --no-merges --format='%H' "${base}..${pin}")
 
 echo
 echo "current pin:   ${pin}"

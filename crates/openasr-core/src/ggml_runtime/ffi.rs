@@ -600,8 +600,7 @@ unsafe extern "C" {
     pub(crate) fn gguf_get_n_tensors(ctx: *const c_void) -> i64;
     pub(crate) fn gguf_get_tensor_offset(ctx: *const c_void, tensor_id: i64) -> usize;
     pub(crate) fn gguf_get_tensor_name(ctx: *const c_void, tensor_id: i64) -> *const c_char;
-    pub(crate) fn gguf_get_tensor_n_dims(ctx: *const c_void, tensor_id: i64) -> u32;
-    pub(crate) fn gguf_get_tensor_dim(ctx: *const c_void, tensor_id: i64, dim: c_int) -> i64;
+    pub(crate) fn gguf_get_tensor_ne(ctx: *const c_void, tensor_id: i64) -> *const i64;
     pub(crate) fn gguf_get_tensor_type(ctx: *const c_void, tensor_id: i64) -> c_int;
     pub(crate) fn gguf_get_tensor_size(ctx: *const c_void, tensor_id: i64) -> usize;
     pub(crate) fn ggml_type_name(type_: c_int) -> *const c_char;
