@@ -8,6 +8,7 @@ mod gguf_metadata;
 mod gguf_tensor_data;
 mod gguf_tensor_index;
 mod gguf_write;
+mod kv_element;
 mod package_probe;
 mod runtime_source;
 
@@ -55,6 +56,9 @@ pub(crate) use gguf_write::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
     write_gguf_file_v0,
 };
+pub(crate) use kv_element::GgmlKvElementType;
+#[cfg(test)]
+pub(crate) use kv_element::dequantize_q8_0_rows;
 pub use package_probe::{
     GgmlPackageExtensionHint, GgmlPackageFormat, GgmlPackageModelIdentityProbe, GgmlPackageProbe,
     GgmlPackageProbeError, OPENASR_RUNTIME_PACK_EXTENSION, has_openasr_runtime_pack_extension,

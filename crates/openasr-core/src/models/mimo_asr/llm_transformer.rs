@@ -148,13 +148,18 @@ impl MimoLlmDecoderRuntime {
     /// persistent reuse graph's fixed attention span on Metal/GPU, which is a
     /// per-token compute cost there, not just a host allocation ceiling.
     pub(crate) fn new_kv_caches(&self, capacity: usize) -> Vec<Qwen3AsrLayerKvCacheState> {
+        let host = self.whole_decoder.kv_cache_spec().host;
         (0..self.metadata.n_layers)
             .map(|_| {
-                Qwen3AsrLayerKvCacheState::new(
+                Qwen3AsrLayerKvCacheState::new_with_element_type(
                     capacity,
                     self.metadata.n_kv_heads,
                     self.metadata.head_dim,
+                    host,
                 )
+                .unwrap_or_else(|reason| {
+                    panic!("shared LLM KV cache geometry rejected host type: {reason}")
+                })
             })
             .collect()
     }

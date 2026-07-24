@@ -196,13 +196,18 @@ impl FireRedLlmDecoderRuntime {
     /// `qwen::ggml_executor`'s own `decode_prompt.token_ids.len()
     /// .saturating_add(decode_config.max_generated_tokens)` sizing.
     pub(crate) fn new_kv_caches(&self, capacity: usize) -> Vec<Qwen3AsrLayerKvCacheState> {
+        let host = self.whole_decoder.kv_cache_spec().host;
         (0..self.metadata.n_layers)
             .map(|_| {
-                Qwen3AsrLayerKvCacheState::new(
+                Qwen3AsrLayerKvCacheState::new_with_element_type(
                     capacity,
                     self.metadata.n_kv_heads,
                     self.metadata.head_dim,
+                    host,
                 )
+                .unwrap_or_else(|reason| {
+                    panic!("shared LLM KV cache geometry rejected host type: {reason}")
+                })
             })
             .collect()
     }

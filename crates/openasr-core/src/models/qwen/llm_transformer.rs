@@ -8,9 +8,9 @@ use std::fmt;
 use thiserror::Error;
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlRopeExtParams,
-    GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader,
-    env_toggle_with_raw,
+    GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlKvElementType,
+    GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError,
+    GgufTensorDataReader, env_toggle_with_raw,
 };
 
 use super::graph_config::qwen_decoder_graph_config;
@@ -23,9 +23,10 @@ use super::lora::{QwenLayerLoraSlots, QwenLoraAdapter, new_qwen_lora_slot};
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::tensor_names::llm_layer_tensor_names;
 use crate::nn::decoder::{
-    LlmDecoderStackConfig, LlmDecoderStackInputs, LlmLayerWeights, LlmResidentKvArena,
-    LlmReusableDecodeGraph, allocate_zeroed_llm_resident_kv_arena,
-    build_fixed_kv_attention_mask_bits, build_fixed_kv_attention_mask_bits_for_query_rows,
+    LlmDecoderStackConfig, LlmDecoderStackInputs, LlmKvCachePolicy, LlmKvCacheSpec,
+    LlmLayerWeights, LlmResidentKvArena, LlmReusableDecodeGraph,
+    allocate_zeroed_llm_resident_kv_arena, build_fixed_kv_attention_mask_bits,
+    build_fixed_kv_attention_mask_bits_for_query_rows,
     build_fixed_kv_attention_mask_bits_for_sequences, compose_llm_decoder_layer_stack,
     reusable_decode_graph_supported_for_runner,
 };
@@ -853,6 +854,7 @@ fn qwen_llm_stack_config(
     token_count: usize,
     n_seq: usize,
     use_flash_attention: bool,
+    kv_cache_spec: LlmKvCacheSpec,
 ) -> LlmDecoderStackConfig {
     LlmDecoderStackConfig {
         d_model: dims.d_model,
@@ -874,6 +876,7 @@ fn qwen_llm_stack_config(
         // serve needs n_seq > 1 support in the unfused head-expansion path.
         use_native_gqa: use_native_gqa || n_seq > 1,
         use_flash_attention,
+        kv_cache_spec,
     }
 }
 
@@ -1467,6 +1470,7 @@ pub(crate) struct Qwen3AsrLlmWholeDecoderGraphExecutor {
     dims: Qwen3AsrLlmDecodeDims,
     use_native_gqa: bool,
     rms_norm_epsilon: f32,
+    kv_cache_spec: LlmKvCacheSpec,
 }
 
 impl fmt::Debug for Qwen3AsrLlmWholeDecoderGraphExecutor {
@@ -1679,11 +1683,36 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             dims,
             use_native_gqa,
             rms_norm_epsilon,
+            kv_cache_spec: LlmKvCacheSpec::DEFAULT,
         })
     }
 
     pub(crate) fn layer_count(&self) -> usize {
         self.layers.len()
+    }
+
+    pub(crate) fn kv_cache_spec(&self) -> LlmKvCacheSpec {
+        self.kv_cache_spec
+    }
+
+    /// Internal execution option for phase-1 Q8 KV. Not a public env gate.
+    /// Validates geometry against the decoder head_dim; backend/GQA/flash checks
+    /// still happen when the graph is composed for a concrete backend path.
+    #[allow(dead_code)]
+    pub(crate) fn set_kv_cache_policy(
+        &mut self,
+        policy: LlmKvCachePolicy,
+    ) -> Result<(), GgmlCpuGraphError> {
+        let spec = policy.to_spec();
+        if let Err(_reason) = spec.validate_geometry(self.dims.head_dim) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "llm KV cache policy is incompatible with decoder head_dim",
+            });
+        }
+        // Drop any resident reuse graph built under the previous element type.
+        self.reuse = None;
+        self.kv_cache_spec = spec;
+        Ok(())
     }
 
     /// Releases the CPU per-token grow-to-fit step buffer this decoder's
@@ -1876,6 +1905,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 1,
                 1,
                 true,
+                self.kv_cache_spec,
             ),
             LlmDecoderStackInputs {
                 state: hidden_tensor,
@@ -2081,6 +2111,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 1,
                 1,
                 true,
+                self.kv_cache_spec,
             ),
             LlmDecoderStackInputs {
                 state: hidden_tensor,
@@ -2491,6 +2522,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                     token_count,
                     n_seq,
                     use_flash_attention,
+                    self.kv_cache_spec,
                 ),
                 LlmDecoderStackInputs {
                     state: hidden_tensor,
@@ -2714,6 +2746,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 token_count,
                 n_seq,
                 use_flash_attention,
+                self.kv_cache_spec,
             ),
             LlmDecoderStackInputs {
                 state: hidden_tensor,
@@ -2752,20 +2785,56 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         )?;
         graph.set_f16_bits_slice(attention_mask, &mask_bits, "qwen_llm_prefill_self_mask")?;
         for (layer_index, (key_history, value_history)) in kv_inputs.into_iter().enumerate() {
-            let (key_values, value_values) = qwen_prefill_history_inputs_for_layer(
-                dims,
-                total_token_count,
-                n_seq,
-                layer_index,
-                position_offset,
-                layer_caches_by_sequence,
-            )?;
-            graph.set_f32_slice(key_history, &key_values, "qwen_llm_prefill_key_history")?;
-            graph.set_f32_slice(
-                value_history,
-                &value_values,
-                "qwen_llm_prefill_value_history",
-            )?;
+            match self.kv_cache_spec.host {
+                GgmlKvElementType::F32 => {
+                    let (key_values, value_values) = qwen_prefill_history_inputs_for_layer(
+                        dims,
+                        total_token_count,
+                        n_seq,
+                        layer_index,
+                        position_offset,
+                        layer_caches_by_sequence,
+                    )?;
+                    graph.set_f32_slice(
+                        key_history,
+                        &key_values,
+                        "qwen_llm_prefill_key_history",
+                    )?;
+                    graph.set_f32_slice(
+                        value_history,
+                        &value_values,
+                        "qwen_llm_prefill_value_history",
+                    )?;
+                }
+                GgmlKvElementType::Q8_0 => {
+                    // Host q8_0 stores packed rows; upload them directly into the
+                    // matching q8_0 history tensors without a full f32 staging buffer.
+                    if n_seq != 1 || layer_caches_by_sequence.len() != 1 {
+                        return Err(GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "q8_0 host prefill history upload currently supports n_seq=1",
+                        });
+                    }
+                    let cache = layer_caches_by_sequence[0].get(layer_index).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "q8_0 host prefill history layer/cache count mismatch",
+                        },
+                    )?;
+                    cache.upload_history_prefix_to_fixed_span_graph(
+                        &mut graph,
+                        key_history,
+                        value_history,
+                        position_offset,
+                        total_token_count,
+                        "qwen_llm_prefill_key_history",
+                        "qwen_llm_prefill_value_history",
+                    )?;
+                }
+                GgmlKvElementType::F16 => {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "host prefill history upload rejects f16 storage",
+                    });
+                }
+            }
         }
 
         let mut requested: Vec<(GgmlCpuTensor, usize)> =
@@ -2870,6 +2939,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 dims.kv_heads,
                 n_seq,
                 "qwen_llm_resident_kv",
+                self.kv_cache_spec,
             )?;
 
             let mut session = self
@@ -2899,6 +2969,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                     1,
                     n_seq,
                     true,
+                    self.kv_cache_spec,
                 ),
                 LlmDecoderStackInputs {
                     state: hidden_tensor,
@@ -3106,6 +3177,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             slot_index,
             cache_position,
             layer_kv,
+            self.kv_cache_spec.resident,
         )
     }
 
@@ -3138,6 +3210,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             max_positions,
             dims.kv_heads,
             slot_index,
+            self.kv_cache_spec.resident,
         )
     }
 
@@ -3164,6 +3237,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             dims.kv_heads,
             n_seq,
             "qwen_llm_resident_kv",
+            self.kv_cache_spec,
         )?;
         if let Some((prefix_lengths, seed_layers)) = seed {
             seed_qwen_batched_resident_kv_arena(
@@ -3173,6 +3247,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 dims.kv_heads,
                 prefix_lengths,
                 seed_layers,
+                self.kv_cache_spec.resident,
             )?;
         }
 
@@ -3203,6 +3278,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 1,
                 n_seq,
                 true,
+                self.kv_cache_spec,
             ),
             LlmDecoderStackInputs {
                 state: hidden_tensor,
@@ -3529,6 +3605,11 @@ fn qwen_prefill_history_inputs_for_layer(
                 .ok_or(GgmlCpuGraphError::UnsupportedInputs {
                     reason: "whole-decoder prefill history layer/cache count mismatch",
                 })?;
+        if !matches!(cache.element_type(), GgmlKvElementType::F32) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder f32 prefill history helper requires host f32 KV",
+            });
+        }
         let history =
             cache
                 .full_history_storage()
@@ -3545,6 +3626,16 @@ fn qwen_prefill_history_inputs_for_layer(
                 reason: "whole-decoder prefill history requested unwritten prefix",
             });
         }
+        let keys = history
+            .keys_f32
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder prefill history missing f32 keys",
+            })?;
+        let values = history
+            .values_f32
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder prefill history missing f32 values",
+            })?;
         let source_head_stride = history.max_positions.checked_mul(dims.head_dim).ok_or(
             GgmlCpuGraphError::UnsupportedInputs {
                 reason: "whole-decoder prefill history source stride overflow",
@@ -3580,10 +3671,9 @@ fn qwen_prefill_history_inputs_for_layer(
                     reason: "whole-decoder prefill history target end overflow",
                 },
             )?;
-            key_values[target_start..target_end]
-                .copy_from_slice(&history.keys[source_start..source_end]);
+            key_values[target_start..target_end].copy_from_slice(&keys[source_start..source_end]);
             value_values[target_start..target_end]
-                .copy_from_slice(&history.values[source_start..source_end]);
+                .copy_from_slice(&values[source_start..source_end]);
         }
     }
     Ok((key_values, value_values))
@@ -3596,6 +3686,7 @@ fn seed_qwen_batched_resident_kv_arena(
     kv_heads: usize,
     prefix_lengths: &[usize],
     layer_kv_by_sequence: &[&[Qwen3AsrLayerKvCacheState]],
+    resident_element_type: GgmlKvElementType,
 ) -> Result<(), GgmlCpuGraphError> {
     if prefix_lengths.is_empty() {
         return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -3616,66 +3707,180 @@ fn seed_qwen_batched_resident_kv_arena(
             reason: "batched resident KV seed layer count mismatch",
         });
     }
+    let host_type = layer_kv_by_sequence
+        .first()
+        .and_then(|layers| layers.first())
+        .map(|cache| cache.element_type())
+        .unwrap_or(GgmlKvElementType::F32);
+    if layer_kv_by_sequence
+        .iter()
+        .any(|layers| layers.iter().any(|cache| cache.element_type() != host_type))
+    {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "batched resident KV seed host element type mismatch",
+        });
+    }
+    match (host_type, resident_element_type) {
+        (GgmlKvElementType::F32, GgmlKvElementType::F16) => {}
+        (GgmlKvElementType::Q8_0, GgmlKvElementType::Q8_0) => {}
+        _ => {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "batched resident KV seed host/resident element type pair unsupported",
+            });
+        }
+    }
     let plane_elems = qwen_resident_kv_plane_elems(head_dim, max_positions, kv_heads)?;
+    let plane_nbytes = host_type
+        .plane_nbytes(head_dim, max_positions, kv_heads)
+        .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+            reason: "batched resident KV seed plane byte size overflow",
+        })?;
     let tensor_elems = plane_elems.checked_mul(prefix_lengths.len()).ok_or(
         GgmlCpuGraphError::UnsupportedInputs {
             reason: "batched resident KV seed tensor size overflow",
         },
     )?;
+    let tensor_nbytes = plane_nbytes.checked_mul(prefix_lengths.len()).ok_or(
+        GgmlCpuGraphError::UnsupportedInputs {
+            reason: "batched resident KV seed tensor byte size overflow",
+        },
+    )?;
 
     for layer_index in 0..layer_count {
-        let mut key_planes = vec![0.0_f32; tensor_elems];
-        let mut value_planes = vec![0.0_f32; tensor_elems];
-        for (sequence_index, sequence_layers) in layer_kv_by_sequence.iter().enumerate() {
-            let history = sequence_layers[layer_index]
-                .full_history_storage()
-                .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "batched resident KV seed host cache storage invalid",
-                })?;
-            if history.head_dim != head_dim
-                || history.max_positions != max_positions
-                || history.kv_heads != kv_heads
-            {
+        match host_type {
+            GgmlKvElementType::F32 => {
+                let mut key_planes = vec![0.0_f32; tensor_elems];
+                let mut value_planes = vec![0.0_f32; tensor_elems];
+                for (sequence_index, sequence_layers) in layer_kv_by_sequence.iter().enumerate() {
+                    let history = sequence_layers[layer_index]
+                        .full_history_storage()
+                        .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV seed host cache storage invalid",
+                        })?;
+                    if history.head_dim != head_dim
+                        || history.max_positions != max_positions
+                        || history.kv_heads != kv_heads
+                    {
+                        return Err(GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV seed host cache shape mismatch",
+                        });
+                    }
+                    if history.written_positions != prefix_lengths[sequence_index] {
+                        return Err(GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV seed written prefix mismatch",
+                        });
+                    }
+                    let keys = history
+                        .keys_f32
+                        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV seed missing f32 keys",
+                        })?;
+                    let values =
+                        history
+                            .values_f32
+                            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                                reason: "batched resident KV seed missing f32 values",
+                            })?;
+                    if keys.len() != plane_elems || values.len() != plane_elems {
+                        return Err(GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV seed host cache plane length mismatch",
+                        });
+                    }
+                    let plane_start = sequence_index.checked_mul(plane_elems).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV seed plane offset overflow",
+                        },
+                    )?;
+                    let plane_end = plane_start.checked_add(plane_elems).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV seed plane offset overflow",
+                        },
+                    )?;
+                    key_planes[plane_start..plane_end].copy_from_slice(keys);
+                    value_planes[plane_start..plane_end].copy_from_slice(values);
+                }
+                let layer = resident_kv_arena.layers[layer_index];
+                // Default path: host f32 -> resident f16.
+                resident_kv_arena.arena.set_f16_bits_slice(
+                    layer.key,
+                    &f32_slice_to_f16_bits(&key_planes),
+                    "qwen_llm_resident_kv_seed_key",
+                )?;
+                resident_kv_arena.arena.set_f16_bits_slice(
+                    layer.value,
+                    &f32_slice_to_f16_bits(&value_planes),
+                    "qwen_llm_resident_kv_seed_value",
+                )?;
+            }
+            GgmlKvElementType::Q8_0 => {
+                let mut key_planes = vec![0_u8; tensor_nbytes];
+                let mut value_planes = vec![0_u8; tensor_nbytes];
+                for (sequence_index, sequence_layers) in layer_kv_by_sequence.iter().enumerate() {
+                    let history = sequence_layers[layer_index]
+                        .full_history_storage()
+                        .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 seed host cache storage invalid",
+                        })?;
+                    if history.head_dim != head_dim
+                        || history.max_positions != max_positions
+                        || history.kv_heads != kv_heads
+                    {
+                        return Err(GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 seed host cache shape mismatch",
+                        });
+                    }
+                    if history.written_positions != prefix_lengths[sequence_index] {
+                        return Err(GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 seed written prefix mismatch",
+                        });
+                    }
+                    let keys = history
+                        .keys_q8
+                        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 seed missing q8 keys",
+                        })?;
+                    let values = history
+                        .values_q8
+                        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 seed missing q8 values",
+                        })?;
+                    if keys.len() != plane_nbytes || values.len() != plane_nbytes {
+                        return Err(GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 seed host cache plane length mismatch",
+                        });
+                    }
+                    let plane_start = sequence_index.checked_mul(plane_nbytes).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 seed plane offset overflow",
+                        },
+                    )?;
+                    let plane_end = plane_start.checked_add(plane_nbytes).ok_or(
+                        GgmlCpuGraphError::UnsupportedInputs {
+                            reason: "batched resident KV q8 seed plane offset overflow",
+                        },
+                    )?;
+                    key_planes[plane_start..plane_end].copy_from_slice(keys);
+                    value_planes[plane_start..plane_end].copy_from_slice(values);
+                }
+                let layer = resident_kv_arena.layers[layer_index];
+                // Direct packed q8_0 upload: no full f32 staging.
+                resident_kv_arena.arena.set_bytes_slice(
+                    layer.key,
+                    &key_planes,
+                    "qwen_llm_resident_kv_seed_key",
+                )?;
+                resident_kv_arena.arena.set_bytes_slice(
+                    layer.value,
+                    &value_planes,
+                    "qwen_llm_resident_kv_seed_value",
+                )?;
+            }
+            GgmlKvElementType::F16 => {
                 return Err(GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "batched resident KV seed host cache shape mismatch",
+                    reason: "batched resident KV seed rejects host f16 storage",
                 });
             }
-            if history.written_positions != prefix_lengths[sequence_index] {
-                return Err(GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "batched resident KV seed written prefix mismatch",
-                });
-            }
-            if history.keys.len() != plane_elems || history.values.len() != plane_elems {
-                return Err(GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "batched resident KV seed host cache plane length mismatch",
-                });
-            }
-            let plane_start = sequence_index.checked_mul(plane_elems).ok_or(
-                GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "batched resident KV seed plane offset overflow",
-                },
-            )?;
-            let plane_end = plane_start.checked_add(plane_elems).ok_or(
-                GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "batched resident KV seed plane offset overflow",
-                },
-            )?;
-            key_planes[plane_start..plane_end].copy_from_slice(history.keys);
-            value_planes[plane_start..plane_end].copy_from_slice(history.values);
         }
-        let layer = resident_kv_arena.layers[layer_index];
-        // The resident arena is f16: convert the f32 host planes once at seed
-        // time (set_rows performs the same cast for rows written in-graph).
-        resident_kv_arena.arena.set_f16_bits_slice(
-            layer.key,
-            &f32_slice_to_f16_bits(&key_planes),
-            "qwen_llm_resident_kv_seed_key",
-        )?;
-        resident_kv_arena.arena.set_f16_bits_slice(
-            layer.value,
-            &f32_slice_to_f16_bits(&value_planes),
-            "qwen_llm_resident_kv_seed_value",
-        )?;
     }
     Ok(())
 }
@@ -3741,59 +3946,148 @@ fn seed_qwen_batched_resident_kv_slot(
     slot_index: usize,
     cache_position: usize,
     layer_kv: &[Qwen3AsrLayerKvCacheState],
+    resident_element_type: GgmlKvElementType,
 ) -> Result<(), GgmlCpuGraphError> {
     if layer_kv.len() != resident_kv_arena.layers.len() {
         return Err(GgmlCpuGraphError::UnsupportedInputs {
             reason: "batched resident KV slot seed layer count mismatch",
         });
     }
-    let plane_elems = qwen_resident_kv_plane_elems(head_dim, max_positions, kv_heads)?;
-    let plane_offset =
-        slot_index
-            .checked_mul(plane_elems)
-            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "batched resident KV slot seed offset overflow",
-            })?;
-    for (layer_index, cache) in layer_kv.iter().enumerate() {
-        let history =
-            cache
-                .full_history_storage()
-                .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "batched resident KV slot seed host cache storage invalid",
-                })?;
-        if history.head_dim != head_dim
-            || history.max_positions != max_positions
-            || history.kv_heads != kv_heads
-        {
-            return Err(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "batched resident KV slot seed host cache shape mismatch",
-            });
-        }
-        if history.written_positions != cache_position {
-            return Err(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "batched resident KV slot seed written prefix mismatch",
-            });
-        }
-        if history.keys.len() != plane_elems || history.values.len() != plane_elems {
-            return Err(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "batched resident KV slot seed host cache plane length mismatch",
-            });
-        }
-        let layer = resident_kv_arena.layers[layer_index];
-        resident_kv_arena.arena.set_f16_bits_slice_with_offset(
-            layer.key,
-            plane_offset,
-            &f32_slice_to_f16_bits(history.keys),
-            "qwen_llm_resident_kv_slot_seed_key",
-        )?;
-        resident_kv_arena.arena.set_f16_bits_slice_with_offset(
-            layer.value,
-            plane_offset,
-            &f32_slice_to_f16_bits(history.values),
-            "qwen_llm_resident_kv_slot_seed_value",
-        )?;
+    let host_type = layer_kv
+        .first()
+        .map(|cache| cache.element_type())
+        .unwrap_or(GgmlKvElementType::F32);
+    if layer_kv
+        .iter()
+        .any(|cache| cache.element_type() != host_type)
+    {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "batched resident KV slot seed host element type mismatch",
+        });
     }
-    Ok(())
+    match (host_type, resident_element_type) {
+        (GgmlKvElementType::F32, GgmlKvElementType::F16) => {
+            let plane_elems = qwen_resident_kv_plane_elems(head_dim, max_positions, kv_heads)?;
+            let plane_offset = slot_index.checked_mul(plane_elems).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "batched resident KV slot seed offset overflow",
+                },
+            )?;
+            for (layer_index, cache) in layer_kv.iter().enumerate() {
+                let history = cache.full_history_storage().map_err(|_| {
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV slot seed host cache storage invalid",
+                    }
+                })?;
+                if history.head_dim != head_dim
+                    || history.max_positions != max_positions
+                    || history.kv_heads != kv_heads
+                {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV slot seed host cache shape mismatch",
+                    });
+                }
+                if history.written_positions != cache_position {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV slot seed written prefix mismatch",
+                    });
+                }
+                let keys = history
+                    .keys_f32
+                    .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV slot seed missing f32 keys",
+                    })?;
+                let values = history
+                    .values_f32
+                    .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV slot seed missing f32 values",
+                    })?;
+                if keys.len() != plane_elems || values.len() != plane_elems {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV slot seed host cache plane length mismatch",
+                    });
+                }
+                let layer = resident_kv_arena.layers[layer_index];
+                resident_kv_arena.arena.set_f16_bits_slice_with_offset(
+                    layer.key,
+                    plane_offset,
+                    &f32_slice_to_f16_bits(keys),
+                    "qwen_llm_resident_kv_slot_seed_key",
+                )?;
+                resident_kv_arena.arena.set_f16_bits_slice_with_offset(
+                    layer.value,
+                    plane_offset,
+                    &f32_slice_to_f16_bits(values),
+                    "qwen_llm_resident_kv_slot_seed_value",
+                )?;
+            }
+            Ok(())
+        }
+        (GgmlKvElementType::Q8_0, GgmlKvElementType::Q8_0) => {
+            let plane_nbytes = GgmlKvElementType::Q8_0
+                .plane_nbytes(head_dim, max_positions, kv_heads)
+                .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "batched resident KV q8 slot plane size overflow",
+                })?;
+            let plane_offset = slot_index.checked_mul(plane_nbytes).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "batched resident KV q8 slot seed offset overflow",
+                },
+            )?;
+            for (layer_index, cache) in layer_kv.iter().enumerate() {
+                let history = cache.full_history_storage().map_err(|_| {
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV q8 slot seed host cache storage invalid",
+                    }
+                })?;
+                if history.head_dim != head_dim
+                    || history.max_positions != max_positions
+                    || history.kv_heads != kv_heads
+                {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV q8 slot seed host cache shape mismatch",
+                    });
+                }
+                if history.written_positions != cache_position {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV q8 slot seed written prefix mismatch",
+                    });
+                }
+                let keys = history
+                    .keys_q8
+                    .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV q8 slot seed missing q8 keys",
+                    })?;
+                let values = history
+                    .values_q8
+                    .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV q8 slot seed missing q8 values",
+                    })?;
+                if keys.len() != plane_nbytes || values.len() != plane_nbytes {
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "batched resident KV q8 slot seed host cache plane length mismatch",
+                    });
+                }
+                let layer = resident_kv_arena.layers[layer_index];
+                resident_kv_arena.arena.set_bytes_slice_with_offset(
+                    layer.key,
+                    plane_offset,
+                    keys,
+                    "qwen_llm_resident_kv_slot_seed_key",
+                )?;
+                resident_kv_arena.arena.set_bytes_slice_with_offset(
+                    layer.value,
+                    plane_offset,
+                    values,
+                    "qwen_llm_resident_kv_slot_seed_value",
+                )?;
+            }
+            Ok(())
+        }
+        _ => Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "batched resident KV slot seed host/resident element type pair unsupported",
+        }),
+    }
 }
 
 #[allow(dead_code)]
@@ -3803,23 +4097,28 @@ fn zero_qwen_batched_resident_kv_slot(
     max_positions: usize,
     kv_heads: usize,
     slot_index: usize,
+    resident_element_type: GgmlKvElementType,
 ) -> Result<(), GgmlCpuGraphError> {
-    let plane_elems = qwen_resident_kv_plane_elems(head_dim, max_positions, kv_heads)?;
+    let plane_nbytes = resident_element_type
+        .plane_nbytes(head_dim, max_positions, kv_heads)
+        .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+            reason: "batched resident KV slot zero plane size overflow",
+        })?;
     let plane_offset =
         slot_index
-            .checked_mul(plane_elems)
+            .checked_mul(plane_nbytes)
             .ok_or(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "batched resident KV slot zero offset overflow",
             })?;
-    let zeros = vec![0_u16; plane_elems];
+    let zeros = vec![0_u8; plane_nbytes];
     for layer in &resident_kv_arena.layers {
-        resident_kv_arena.arena.set_f16_bits_slice_with_offset(
+        resident_kv_arena.arena.set_bytes_slice_with_offset(
             layer.key,
             plane_offset,
             &zeros,
             "qwen_llm_resident_kv_slot_zero_key",
         )?;
-        resident_kv_arena.arena.set_f16_bits_slice_with_offset(
+        resident_kv_arena.arena.set_bytes_slice_with_offset(
             layer.value,
             plane_offset,
             &zeros,
@@ -5011,6 +5310,7 @@ mod tests {
             1,
             2,
             "test_qwen_seed_kv",
+            LlmKvCacheSpec::DEFAULT,
         )
         .expect("resident kv arena should allocate");
         let mut seq0 = Qwen3AsrLayerKvCacheState::new(3, 1, 2);
@@ -5025,8 +5325,16 @@ mod tests {
         let seq1_layers = vec![seq1];
         let seeds: [&[Qwen3AsrLayerKvCacheState]; 2] = [&seq0_layers, &seq1_layers];
 
-        seed_qwen_batched_resident_kv_arena(&mut resident, 2, 3, 1, &[2, 1], &seeds)
-            .expect("seed should upload");
+        seed_qwen_batched_resident_kv_arena(
+            &mut resident,
+            2,
+            3,
+            1,
+            &[2, 1],
+            &seeds,
+            LlmKvCacheSpec::DEFAULT.resident,
+        )
+        .expect("seed should upload");
 
         let layer = resident.layers[0];
         let key_values = resident
@@ -5064,6 +5372,7 @@ mod tests {
             1,
             2,
             "test_qwen_slot_seed_kv",
+            LlmKvCacheSpec::DEFAULT,
         )
         .expect("resident kv arena should allocate");
         let mut seq1 = Qwen3AsrLayerKvCacheState::new(3, 1, 2);
@@ -5073,8 +5382,17 @@ mod tests {
             .expect("seq1 row1");
         let seq1_layers = vec![seq1];
 
-        seed_qwen_batched_resident_kv_slot(&mut resident, 2, 3, 1, 1, 2, &seq1_layers)
-            .expect("slot seed should upload");
+        seed_qwen_batched_resident_kv_slot(
+            &mut resident,
+            2,
+            3,
+            1,
+            1,
+            2,
+            &seq1_layers,
+            LlmKvCacheSpec::DEFAULT.resident,
+        )
+        .expect("slot seed should upload");
 
         let layer = resident.layers[0];
         let key_values = resident
@@ -5096,8 +5414,15 @@ mod tests {
             ])
         );
 
-        zero_qwen_batched_resident_kv_slot(&mut resident, 2, 3, 1, 1)
-            .expect("slot zero should upload");
+        zero_qwen_batched_resident_kv_slot(
+            &mut resident,
+            2,
+            3,
+            1,
+            1,
+            LlmKvCacheSpec::DEFAULT.resident,
+        )
+        .expect("slot zero should upload");
         let key_values = resident
             .arena
             .read_f16_bits_slice(layer.key, 12)
@@ -5123,6 +5448,7 @@ mod tests {
             1,
             1,
             "test_qwen_seed_kv",
+            LlmKvCacheSpec::DEFAULT,
         )
         .expect("resident kv arena should allocate");
         let mut seq0 = Qwen3AsrLayerKvCacheState::new(3, 1, 2);
@@ -5131,8 +5457,16 @@ mod tests {
         let seq0_layers = vec![seq0];
         let seeds: [&[Qwen3AsrLayerKvCacheState]; 1] = [&seq0_layers];
 
-        let error = seed_qwen_batched_resident_kv_arena(&mut resident, 2, 3, 1, &[2], &seeds)
-            .expect_err("prefix mismatch must fail closed");
+        let error = seed_qwen_batched_resident_kv_arena(
+            &mut resident,
+            2,
+            3,
+            1,
+            &[2],
+            &seeds,
+            LlmKvCacheSpec::DEFAULT.resident,
+        )
+        .expect_err("prefix mismatch must fail closed");
         assert!(matches!(
             error,
             GgmlCpuGraphError::UnsupportedInputs {
@@ -5670,9 +6004,13 @@ mod tests {
         let history = cache.full_history_storage().expect("serial history");
         assert!(position < history.written_positions, "unwritten serial row");
         assert_eq!(history.kv_heads * history.head_dim, kv_width);
+        assert!(
+            matches!(history.element_type, GgmlKvElementType::F32),
+            "serial_layer_kv_row helper is f32-only"
+        );
         let storage = match kind {
-            KvRowKind::Key => history.keys,
-            KvRowKind::Value => history.values,
+            KvRowKind::Key => history.keys_f32.expect("f32 keys"),
+            KvRowKind::Value => history.values_f32.expect("f32 values"),
         };
         let mut row = Vec::with_capacity(kv_width);
         for kv_head in 0..history.kv_heads {

@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlKvElementType, GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor,
+    GgmlStaticTensorArena,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, STANDARD_HEAD_PERMUTE_AXES,
@@ -47,6 +48,103 @@ pub(crate) fn reusable_decode_graph_supported(
 
 pub(crate) fn reusable_decode_graph_supported_for_runner(runner: &GgmlCpuGraphRunner) -> bool {
     reusable_decode_graph_supported(runner.backend_kind(), runner.uses_scheduler())
+}
+
+/// Internal execution policy for Qwen-family LLM KV caches.
+///
+/// Not a public env gate and not a pack/catalog quant tag. Default preserves the
+/// existing host-F32 / resident-F16 byte path. `Q8_0` opts into the phase-1
+/// shared quantized path (CPU/Metal, native-GQA, flash-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[allow(dead_code)]
+pub(crate) enum LlmKvCachePolicy {
+    #[default]
+    Default,
+    Q8_0,
+}
+
+#[allow(dead_code)]
+impl LlmKvCachePolicy {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Q8_0 => "q8_0",
+        }
+    }
+
+    pub(crate) const fn to_spec(self) -> LlmKvCacheSpec {
+        match self {
+            Self::Default => LlmKvCacheSpec::DEFAULT,
+            Self::Q8_0 => LlmKvCacheSpec::Q8_0,
+        }
+    }
+}
+
+/// Shared host + resident KV element-type pair for all Qwen-shaped decoders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct LlmKvCacheSpec {
+    pub host: GgmlKvElementType,
+    pub resident: GgmlKvElementType,
+}
+
+impl LlmKvCacheSpec {
+    pub(crate) const DEFAULT: Self = Self {
+        host: GgmlKvElementType::F32,
+        resident: GgmlKvElementType::F16,
+    };
+
+    pub(crate) const Q8_0: Self = Self {
+        host: GgmlKvElementType::Q8_0,
+        resident: GgmlKvElementType::Q8_0,
+    };
+
+    pub(crate) fn validate_geometry(self, head_dim: usize) -> Result<(), String> {
+        self.host.validate_head_dim(head_dim)?;
+        self.resident.validate_head_dim(head_dim)?;
+        Ok(())
+    }
+
+    /// Phase-1 Q8 is CPU/Metal + native-GQA + flash-only. Default is always OK.
+    pub(crate) fn validate_execution(
+        self,
+        backend: GgmlCpuGraphBackend,
+        head_dim: usize,
+        use_native_gqa: bool,
+        use_flash_attention: bool,
+    ) -> Result<(), String> {
+        self.validate_geometry(head_dim)?;
+        let uses_q8 = matches!(self.host, GgmlKvElementType::Q8_0)
+            || matches!(self.resident, GgmlKvElementType::Q8_0);
+        if !uses_q8 {
+            return Ok(());
+        }
+        if !matches!(self.host, GgmlKvElementType::Q8_0)
+            || !matches!(self.resident, GgmlKvElementType::Q8_0)
+        {
+            return Err(
+                "phase-1 q8_0 KV requires host and resident element types to both be q8_0"
+                    .to_string(),
+            );
+        }
+        if !self.host.supports_backend(backend) || !self.resident.supports_backend(backend) {
+            return Err(format!(
+                "phase-1 q8_0 KV is only supported on CPU/Metal (backend={backend:?})"
+            ));
+        }
+        if !use_native_gqa {
+            return Err(
+                "phase-1 q8_0 KV requires native GQA flash attention (manual GQA expand is unsupported)"
+                    .to_string(),
+            );
+        }
+        if !use_flash_attention {
+            return Err(
+                "phase-1 q8_0 KV requires flash_attn_ext (naive attention path is unsupported)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Scalar/shape knobs for one seq2seq (cross-attending) decoder block.
@@ -1103,6 +1201,8 @@ pub(crate) struct LlmDecoderStackConfig {
     pub use_native_gqa: bool,
     /// See `LlmLayerConfig::use_flash_attention`.
     pub use_flash_attention: bool,
+    /// Host/resident KV element types for this stack composition.
+    pub kv_cache_spec: LlmKvCacheSpec,
 }
 
 /// Per-step inputs for one composition of an LLM decoder layer stack.
@@ -1834,6 +1934,23 @@ where
             },
         ));
     }
+    if let Err(reason) = config.kv_cache_spec.validate_execution(
+        graph.backend_kind(),
+        config.head_dim,
+        config.use_native_gqa,
+        config.use_flash_attention,
+    ) {
+        // Map dynamic validation into the shared static contract bucket. The
+        // full reason is preserved via a fixed classifier so callers stay on
+        // the existing error type without silent fallback.
+        let _ = reason;
+        return Err(map_err(
+            "llm_decoder_stack_kv_cache_spec",
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "llm decoder KV cache spec is unsupported for this backend/attention mode",
+            },
+        ));
+    }
 
     let mut state = inputs.state;
     let mut kv_inputs = Vec::with_capacity(layer_count);
@@ -1842,21 +1959,24 @@ where
         let (key_history, value_history) = match resident_kv {
             Some(resident) => resident[layer_index],
             None => {
+                let host_type = config.kv_cache_spec.host.ggml_type();
                 let key_history = graph
-                    .new_tensor_4d_f32(
+                    .new_tensor_4d_typed(
                         config.head_dim,
                         inputs.kv_span,
                         config.kv_heads,
                         config.n_seq,
+                        host_type,
                         inputs.key_history_name,
                     )
                     .map_err(|source| map_err("llm_decoder_stack_key_history", source))?;
                 let value_history = graph
-                    .new_tensor_4d_f32(
+                    .new_tensor_4d_typed(
                         config.head_dim,
                         inputs.kv_span,
                         config.kv_heads,
                         config.n_seq,
+                        host_type,
                         inputs.value_history_name,
                     )
                     .map_err(|source| map_err("llm_decoder_stack_value_history", source))?;
@@ -1915,11 +2035,12 @@ where
     })
 }
 
-/// Allocate a zero-filled resident KV cache arena. The cache element type is
-/// always f16: it halves the arena footprint and the attention K/V read
-/// bandwidth; `set_rows` casts the f32 projection rows on write and both
-/// `flash_attn_ext` and `mul_mat` consume f16 K/V natively, so the decode
-/// graph shape is unchanged.
+/// Allocate a zero-filled resident KV cache arena.
+///
+/// Default spec keeps the historical f16 resident path (set_rows casts f32
+/// projection rows on write; flash_attn_ext / mul_mat consume f16 natively).
+/// Opt-in q8_0 allocates native ggml q8_0 tensors and relies on set_rows +
+/// flash_attn_ext to quantize/consume them without a full f32 staging buffer.
 pub(crate) fn allocate_zeroed_llm_resident_kv_arena(
     runner: &GgmlCpuGraphRunner,
     context_bytes: usize,
@@ -1929,39 +2050,72 @@ pub(crate) fn allocate_zeroed_llm_resident_kv_arena(
     kv_heads: usize,
     n_seq: usize,
     tensor_name_prefix: &str,
+    kv_cache_spec: LlmKvCacheSpec,
 ) -> Result<LlmResidentKvArena, GgmlCpuGraphError> {
     if n_seq == 0 {
         return Err(GgmlCpuGraphError::UnsupportedInputs {
             reason: "resident KV n_seq must be positive",
         });
     }
+    if let Err(_reason) = kv_cache_spec.validate_geometry(head_dim) {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "resident KV element type is incompatible with head_dim",
+        });
+    }
+    if !kv_cache_spec
+        .resident
+        .supports_backend(runner.backend_kind())
+    {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "resident KV element type is unsupported on this backend",
+        });
+    }
     let mut arena = runner.start_static_tensor_arena(context_bytes)?;
     let mut layers = Vec::with_capacity(layer_count);
+    let resident_type = kv_cache_spec.resident.ggml_type();
     for layer_idx in 0..layer_count {
         let key_name = Box::leak(format!("{tensor_name_prefix}_key_{layer_idx}").into_boxed_str())
             as &'static str;
         let value_name =
             Box::leak(format!("{tensor_name_prefix}_value_{layer_idx}").into_boxed_str())
                 as &'static str;
-        let key = arena.new_tensor_4d_f16(head_dim, max_positions, kv_heads, n_seq, key_name)?;
-        let value =
-            arena.new_tensor_4d_f16(head_dim, max_positions, kv_heads, n_seq, value_name)?;
+        let key = arena.new_tensor_4d_typed(
+            head_dim,
+            max_positions,
+            kv_heads,
+            n_seq,
+            resident_type,
+            key_name,
+        )?;
+        let value = arena.new_tensor_4d_typed(
+            head_dim,
+            max_positions,
+            kv_heads,
+            n_seq,
+            resident_type,
+            value_name,
+        )?;
         layers.push(LlmResidentKvLayer { key, value });
     }
     arena.allocate_backend_buffer()?;
-    let kv_elems = head_dim
-        .checked_mul(max_positions)
-        .and_then(|n| n.checked_mul(kv_heads))
-        .and_then(|n| n.checked_mul(n_seq))
-        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-            reason: "resident KV element count overflow",
+    let plane_nbytes = kv_cache_spec
+        .resident
+        .plane_nbytes(head_dim, max_positions, kv_heads)
+        .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+            reason: "resident KV plane byte count overflow",
         })?;
-    // Zero-fill so masked (unwritten) positions never feed NaN/inf into
-    // flash-attn; the f16 bit pattern for zero is zero.
-    let kv_zero = vec![0_u16; kv_elems];
+    let tensor_nbytes =
+        plane_nbytes
+            .checked_mul(n_seq)
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "resident KV tensor byte count overflow",
+            })?;
+    // Zero-fill so masked (unwritten) positions never feed garbage into
+    // attention. For f16/q8_0 the all-zero bit pattern dequantizes to zero.
+    let kv_zero = vec![0_u8; tensor_nbytes];
     for layer in &layers {
-        arena.set_f16_bits_slice(layer.key, &kv_zero, "resident_kv_key")?;
-        arena.set_f16_bits_slice(layer.value, &kv_zero, "resident_kv_value")?;
+        arena.set_bytes_slice(layer.key, &kv_zero, "resident_kv_key")?;
+        arena.set_bytes_slice(layer.value, &kv_zero, "resident_kv_value")?;
     }
     Ok(LlmResidentKvArena { arena, layers })
 }
@@ -2605,6 +2759,7 @@ mod tests {
                 rope: GgmlRopeExtParams::qwen_neox(1, 1, 10_000.0).expect("rope params"),
                 use_native_gqa: true,
                 use_flash_attention: true,
+                kv_cache_spec: LlmKvCacheSpec::DEFAULT,
             },
             LlmDecoderStackInputs {
                 state,
@@ -2673,6 +2828,7 @@ mod tests {
                 rope: GgmlRopeExtParams::qwen_neox(2, 3, 10_000.0).expect("rope params"),
                 use_native_gqa: false,
                 use_flash_attention: true,
+                kv_cache_spec: LlmKvCacheSpec::DEFAULT,
             },
             LlmDecoderStackInputs {
                 state,
@@ -2844,6 +3000,7 @@ mod tests {
                     .expect("rope params"),
                 use_native_gqa: true,
                 use_flash_attention: true,
+                kv_cache_spec: LlmKvCacheSpec::DEFAULT,
             },
             LlmDecoderStackInputs {
                 state,
@@ -3133,6 +3290,7 @@ mod tests {
             1,
             1,
             "test_resident_kv",
+            LlmKvCacheSpec::DEFAULT,
         )
         .expect("resident KV arena should allocate");
 
@@ -3167,5 +3325,65 @@ mod tests {
                 reason: "fixed KV attention mask token count exceeds max positions"
             }
         ));
+    }
+
+    #[test]
+    fn llm_kv_cache_policy_default_and_q8_specs() {
+        assert_eq!(LlmKvCachePolicy::Default.as_str(), "default");
+        assert_eq!(LlmKvCachePolicy::Q8_0.as_str(), "q8_0");
+        assert_eq!(LlmKvCachePolicy::Default.to_spec(), LlmKvCacheSpec::DEFAULT);
+        assert_eq!(LlmKvCachePolicy::Q8_0.to_spec(), LlmKvCacheSpec::Q8_0);
+        assert_eq!(LlmKvCacheSpec::DEFAULT.host, GgmlKvElementType::F32);
+        assert_eq!(LlmKvCacheSpec::DEFAULT.resident, GgmlKvElementType::F16);
+        assert_eq!(LlmKvCacheSpec::Q8_0.host, GgmlKvElementType::Q8_0);
+        assert_eq!(LlmKvCacheSpec::Q8_0.resident, GgmlKvElementType::Q8_0);
+    }
+
+    #[test]
+    fn llm_kv_cache_spec_q8_requires_native_gqa_flash_on_cpu_metal() {
+        let spec = LlmKvCacheSpec::Q8_0;
+        spec.validate_execution(GgmlCpuGraphBackend::Cpu, 128, true, true)
+            .expect("cpu native gqa flash q8");
+        spec.validate_execution(GgmlCpuGraphBackend::Metal, 128, true, true)
+            .expect("metal native gqa flash q8");
+        assert!(
+            spec.validate_execution(GgmlCpuGraphBackend::Gpu, 128, true, true)
+                .unwrap_err()
+                .contains("CPU/Metal")
+        );
+        assert!(
+            spec.validate_execution(GgmlCpuGraphBackend::Cpu, 128, false, true)
+                .unwrap_err()
+                .contains("native GQA")
+        );
+        assert!(
+            spec.validate_execution(GgmlCpuGraphBackend::Cpu, 128, true, false)
+                .unwrap_err()
+                .contains("flash_attn_ext")
+        );
+        assert!(
+            spec.validate_execution(GgmlCpuGraphBackend::Cpu, 40, true, true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resident_kv_arena_allocates_q8_layers() {
+        let runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let resident = allocate_zeroed_llm_resident_kv_arena(
+            &runner,
+            GgmlCpuGraphConfig::default().context_bytes,
+            2,
+            64,
+            4,
+            1,
+            1,
+            "test_resident_kv_q8",
+            LlmKvCacheSpec::Q8_0,
+        )
+        .expect("q8 resident KV arena should allocate");
+        assert_eq!(resident.layers.len(), 2);
+        assert_eq!(resident.graph_tensors().len(), 2);
     }
 }

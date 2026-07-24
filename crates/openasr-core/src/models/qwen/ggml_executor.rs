@@ -553,14 +553,18 @@ impl Qwen3AsrGgmlExecutor {
         let kv_cache_started_at = qwen_decode_profile_start();
         let layer_kv_caches = (0..metadata.llm_layers)
             .map(|_| {
-                Qwen3AsrLayerKvCacheState::new(
+                Qwen3AsrLayerKvCacheState::new_with_element_type(
                     decode_prompt
                         .token_ids
                         .len()
                         .saturating_add(decode_config.max_generated_tokens),
                     metadata.llm_kv_heads,
                     metadata.llm_head_dim,
+                    whole_decoder.kv_cache_spec().host,
                 )
+                .unwrap_or_else(|reason| {
+                    panic!("shared LLM KV cache geometry rejected host type: {reason}")
+                })
             })
             .collect();
         qwen_decode_profile_log_opt("layer_kv_cache_alloc", kv_cache_started_at);

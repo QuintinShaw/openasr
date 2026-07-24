@@ -1844,6 +1844,24 @@ impl GgmlStaticTensorArena {
         )
     }
 
+    pub(crate) fn set_bytes_slice_with_offset(
+        &mut self,
+        tensor: GgmlStaticTensor,
+        offset_bytes: usize,
+        values: &[u8],
+        tensor_name: &'static str,
+    ) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_backend_buffer()?;
+        self.write_tensor_bytes_checked(
+            tensor,
+            values.as_ptr().cast::<c_void>(),
+            offset_bytes,
+            values.len(),
+            tensor_name,
+            true,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn read_f16_bits_slice(
         &self,
@@ -2814,12 +2832,12 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.ensure_tensor_type(q, ffi::GGML_TYPE_F32, "ggml_flash_attn_ext q")?;
         self.ensure_tensor_type_in(
             k,
-            &[ffi::GGML_TYPE_F16, ffi::GGML_TYPE_F32],
+            &[ffi::GGML_TYPE_F16, ffi::GGML_TYPE_F32, ffi::GGML_TYPE_Q8_0],
             "ggml_flash_attn_ext k",
         )?;
         self.ensure_tensor_type_in(
             v,
-            &[ffi::GGML_TYPE_F16, ffi::GGML_TYPE_F32],
+            &[ffi::GGML_TYPE_F16, ffi::GGML_TYPE_F32, ffi::GGML_TYPE_Q8_0],
             "ggml_flash_attn_ext v",
         )?;
         if self.tensor_type(k) != self.tensor_type(v) {
@@ -2827,6 +2845,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 reason: "ggml_flash_attn_ext requires matching k/v tensor types",
             });
         }
+        self.ensure_kv_element_type_supported_on_backend(
+            self.tensor_type(k),
+            "ggml_flash_attn_ext",
+        )?;
         self.ensure_tensor_contiguous_rows(q, "ggml_flash_attn_ext q")?;
         self.ensure_tensor_contiguous_rows(k, "ggml_flash_attn_ext k")?;
         self.ensure_tensor_contiguous_rows(v, "ggml_flash_attn_ext v")?;
@@ -3415,9 +3437,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.ensure_can_extend_graph("ggml_set_rows")?;
         self.ensure_tensor_type_in(
             dst,
-            &[ffi::GGML_TYPE_F16, ffi::GGML_TYPE_F32],
+            &[ffi::GGML_TYPE_F16, ffi::GGML_TYPE_F32, ffi::GGML_TYPE_Q8_0],
             "ggml_set_rows dst",
         )?;
+        self.ensure_kv_element_type_supported_on_backend(self.tensor_type(dst), "ggml_set_rows")?;
         self.ensure_tensor_type(src, ffi::GGML_TYPE_F32, "ggml_set_rows src")?;
         self.ensure_tensor_type(row_indices, ffi::GGML_TYPE_I32, "ggml_set_rows indices")?;
         self.ensure_tensor_rowwise_contiguous(src, "ggml_set_rows src")?;
@@ -3912,6 +3935,23 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             tensor,
             values.as_ptr().cast::<c_void>(),
             0,
+            values.len(),
+            tensor_name,
+        )
+    }
+
+    pub(crate) fn set_bytes_slice_with_offset(
+        &mut self,
+        tensor: GgmlCpuTensor<'a>,
+        offset_bytes: usize,
+        values: &[u8],
+        tensor_name: &'static str,
+    ) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_backend_buffer()?;
+        self.write_tensor_bytes_checked(
+            tensor,
+            values.as_ptr().cast::<c_void>(),
+            offset_bytes,
             values.len(),
             tensor_name,
         )
@@ -4532,8 +4572,8 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 "ggml_mul_mat lhs" => "ggml_mul_mat lhs must be f16/f32/q4_0/q8_0/q4_k",
                 "ggml_mul_mat rhs" => "ggml_mul_mat rhs must be f16 or f32",
                 "ggml_soft_max_ext mask" => "ggml_soft_max_ext mask must be f16 or f32",
-                "ggml_flash_attn_ext k" => "ggml_flash_attn_ext k must be f16 or f32",
-                "ggml_flash_attn_ext v" => "ggml_flash_attn_ext v must be f16 or f32",
+                "ggml_flash_attn_ext k" => "ggml_flash_attn_ext k must be f16, f32, or q8_0",
+                "ggml_flash_attn_ext v" => "ggml_flash_attn_ext v must be f16, f32, or q8_0",
                 "ggml_get_rows embeddings" => "ggml_get_rows embeddings must be f16 or f32",
                 "ggml_view_1d input" => "ggml_view_1d input type is unsupported",
                 "ggml_view_2d input" => "ggml_view_2d input type is unsupported",
@@ -4541,8 +4581,38 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 "ggml_view_4d input" => "ggml_view_4d input type is unsupported",
                 "ggml_permute input" => "ggml_permute input type is unsupported",
                 "ggml_cast input" => "ggml_cast input type is unsupported",
-                "ggml_set_rows dst" => "ggml_set_rows dst must be f16 or f32",
+                "ggml_set_rows dst" => "ggml_set_rows dst must be f16, f32, or q8_0",
                 _ => "operation input type is unsupported",
+            },
+        })
+    }
+
+    /// Phase-1 Q8 KV is fail-closed outside CPU/Metal. F16/F32 keep the existing
+    /// multi-backend surface; unknown types are rejected by the caller's type list.
+    fn ensure_kv_element_type_supported_on_backend(
+        &self,
+        type_: i32,
+        op: &'static str,
+    ) -> Result<(), GgmlCpuGraphError> {
+        if type_ != ffi::GGML_TYPE_Q8_0 {
+            return Ok(());
+        }
+        let backend = self.backend_kind();
+        if matches!(
+            backend,
+            GgmlCpuGraphBackend::Cpu | GgmlCpuGraphBackend::Metal
+        ) {
+            return Ok(());
+        }
+        Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: match op {
+                "ggml_flash_attn_ext" => {
+                    "ggml_flash_attn_ext q8_0 KV is only supported on CPU/Metal in phase 1"
+                }
+                "ggml_set_rows" => {
+                    "ggml_set_rows q8_0 KV is only supported on CPU/Metal in phase 1"
+                }
+                _ => "q8_0 KV is only supported on CPU/Metal in phase 1",
             },
         })
     }
@@ -7652,6 +7722,89 @@ mod tests {
             .compute_output_f32(output, 8)
             .expect("kv cache graph should compute");
         assert_eq!(output, vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn set_rows_and_flash_attn_accept_q8_0_kv_on_cpu() {
+        // Tiny native-GQA-shaped flash path: q heads=2, kv heads=1, head_dim=32.
+        const HEAD_DIM: usize = 32;
+        const KV_SPAN: usize = 2;
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let mut arena = runner
+            .start_static_tensor_arena(GgmlCpuGraphConfig::default().context_bytes)
+            .expect("static arena should initialize");
+        let key = arena
+            .new_tensor_4d_typed(HEAD_DIM, KV_SPAN, 1, 1, ffi::GGML_TYPE_Q8_0, "q8_k")
+            .expect("q8 key");
+        let value = arena
+            .new_tensor_4d_typed(HEAD_DIM, KV_SPAN, 1, 1, ffi::GGML_TYPE_Q8_0, "q8_v")
+            .expect("q8 value");
+        let zero =
+            vec![
+                0_u8;
+                unsafe { ffi::ggml_row_size(ffi::GGML_TYPE_Q8_0, HEAD_DIM as i64) * KV_SPAN }
+            ];
+        arena.set_bytes_slice(key, &zero, "q8_k").expect("zero key");
+        arena
+            .set_bytes_slice(value, &zero, "q8_v")
+            .expect("zero value");
+
+        let mut graph = runner.start_graph();
+        let q = graph.new_tensor_4d_f32(HEAD_DIM, 1, 2, 1, "q").expect("q");
+        let src_k = graph
+            .new_tensor_4d_f32(HEAD_DIM, 1, 1, 1, "src_k")
+            .expect("src_k");
+        let src_v = graph
+            .new_tensor_4d_f32(HEAD_DIM, 1, 1, 1, "src_v")
+            .expect("src_v");
+        let rows = graph.new_tensor_1d_i32(1, "rows").expect("rows");
+        graph.set_input(q).expect("q input");
+        graph.set_input(src_k).expect("src_k input");
+        graph.set_input(src_v).expect("src_v input");
+        graph.set_input(rows).expect("rows input");
+
+        let key_t = arena.graph_tensor(key);
+        let value_t = arena.graph_tensor(value);
+        let write_k = graph.set_rows(key_t, src_k, rows).expect("set_rows q8 k");
+        let write_v = graph.set_rows(value_t, src_v, rows).expect("set_rows q8 v");
+        graph.add_side_effect_root(write_k).expect("k side effect");
+        graph.add_side_effect_root(write_v).expect("v side effect");
+        let attended = graph
+            .flash_attn_ext(
+                q,
+                key_t,
+                value_t,
+                None,
+                1.0 / (HEAD_DIM as f32).sqrt(),
+                0.0,
+                0.0,
+            )
+            .expect("flash_attn q8");
+        graph.set_output(attended).expect("output");
+
+        let mut q_vals = vec![0.0_f32; HEAD_DIM * 2];
+        let mut kv_vals = vec![0.0_f32; HEAD_DIM];
+        for i in 0..HEAD_DIM {
+            q_vals[i] = 0.01 * (i as f32);
+            q_vals[HEAD_DIM + i] = -0.01 * (i as f32);
+            kv_vals[i] = 0.02 * (i as f32) - 0.3;
+        }
+        graph.set_f32_slice(q, &q_vals, "q").expect("q upload");
+        graph
+            .set_f32_slice(src_k, &kv_vals, "src_k")
+            .expect("src_k upload");
+        graph
+            .set_f32_slice(src_v, &kv_vals, "src_v")
+            .expect("src_v upload");
+        graph
+            .set_i32_slice(rows, &[0], "rows")
+            .expect("rows upload");
+        let output = graph
+            .compute_output_f32(attended, HEAD_DIM * 2)
+            .expect("q8 flash path should compute");
+        assert!(output.iter().all(|v| v.is_finite()));
+        assert!(output.iter().any(|v| *v != 0.0));
     }
 
     #[test]

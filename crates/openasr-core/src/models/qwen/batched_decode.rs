@@ -2609,8 +2609,10 @@ mod tests {
             assert_eq!(snapshot.value_width, 4);
             let history = layer.full_history_storage().expect("history");
             assert_eq!(history.written_positions, 1);
-            assert!(history.keys.iter().all(|&value| value == 0.0));
-            assert!(history.values.iter().all(|&value| value == 0.0));
+            let keys = history.keys_f32.expect("f32 keys");
+            let values = history.values_f32.expect("f32 values");
+            assert!(keys.iter().all(|&value| value == 0.0));
+            assert!(values.iter().all(|&value| value == 0.0));
         }
     }
 

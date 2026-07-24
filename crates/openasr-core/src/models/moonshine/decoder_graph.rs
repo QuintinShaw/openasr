@@ -476,6 +476,7 @@ impl MoonshineDecoderGraphRuntime {
                 self.metadata.n_heads,
                 self.n_seq,
                 "moonshine_decoder_resident_kv",
+                crate::nn::decoder::LlmKvCacheSpec::DEFAULT,
             )
             .map_err(build_err("moonshine_resident_self_kv"))?,
         );
