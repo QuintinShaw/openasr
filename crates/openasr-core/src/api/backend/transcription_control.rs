@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn no_control_path_leaves_job_cancel_idle() {
         // Bit-identical CLI path: without install_active_transcription_control,
-        // the abort trampoline data is null and always returns false.
+        // abort callback data is null and backends clear the callback entirely.
         assert!(thread_job_cancel_flag_data().is_null());
         assert!(!thread_job_cancel_requested());
         let orphan = TranscriptionControl::new();

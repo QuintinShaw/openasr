@@ -52,8 +52,10 @@ pub(crate) fn disarm_thread_job_cancel_flag_if_current(
 }
 
 /// Raw `abort_callback` data pointer for backends on this thread: `Arc::as_ptr`
-/// of the armed job cancel atomic, or null when no control is installed (CLI /
-/// no-control path stays bit-identical: trampoline always false).
+/// of the armed job cancel atomic, or null when no control is installed.
+///
+/// Backend arm paths treat null as "clear the callback entirely" so the CLI /
+/// no-control path stays bit-identical to pre-L2 (no per-node abort poll).
 ///
 /// SAFETY for consumers: the pointer remains valid while the corresponding
 /// [`Arc`] is held in this thread's slot and/or by the install guard that armed
@@ -70,9 +72,10 @@ pub(crate) fn thread_job_cancel_flag_data() -> *mut c_void {
 
 /// Wait-free cancel check used by the ggml abort trampoline.
 ///
-/// `data` is either null (no job / disarmed) or `Arc::as_ptr` of the job's
+/// `data` is either null (defensive; production installs a null *callback* when
+/// disarmed, so the trampoline is not invoked) or `Arc::as_ptr` of the job's
 /// [`AtomicBool`]. Pause never writes that atomic, so pause cannot trip abort.
-/// Panic-free for use under `catch_unwind` in the C trampoline.
+/// Panic-free (null check + atomic load) for direct use from `extern "C"`.
 #[inline]
 pub(crate) fn cancel_flag_requested_from_data(data: *mut c_void) -> bool {
     if data.is_null() {

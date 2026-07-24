@@ -5295,8 +5295,8 @@ impl GgmlBackendGuard {
             ffi::ggml_backend_init_by_type(ffi::GGML_BACKEND_DEVICE_TYPE_CPU, std::ptr::null())
         };
         let raw = NonNull::new(raw).ok_or(GgmlCpuGraphError::CpuBackendUnavailable)?;
-        // Abort callback data is this thread's per-job cancel atomic (or null).
-        // Safe to install once per backend lifetime -- including free_on_drop CPU.
+        // Arm abort_callback only when this thread has a job cancel flag; otherwise
+        // clear it so the no-control path stays bit-identical to pre-L2.
         arm_backend_abort_callback(raw);
         Ok(Self {
             raw,
@@ -5342,8 +5342,8 @@ impl GgmlBackendGuard {
     /// `init` on first use. The cached entry owns the backend for the thread's
     /// lifetime; handed-out guards never free it (`free_on_drop=false`).
     ///
-    /// Abort callback is re-armed on every handout with this thread's current
-    /// per-job cancel atomic (or null). Install/Drop of the transcription
+    /// Abort callback is re-armed (or cleared) on every handout from this
+    /// thread's current per-job cancel flag. Install/Drop of the transcription
     /// control guard also bulk-rearms the whole cache so a pooled worker never
     /// keeps a previous job's data pointer across jobs.
     fn cached_backend(
@@ -5351,8 +5351,8 @@ impl GgmlBackendGuard {
         init: impl FnOnce() -> Result<NonNull<c_void>, GgmlCpuGraphError>,
     ) -> Result<Self, GgmlCpuGraphError> {
         if let Some(raw) = Self::cached_backend_lookup(&key) {
-            // Re-arm on handout so a backend created under a prior job (or none)
-            // picks up the active job's cancel pointer before graph compute.
+            // Re-arm or clear on handout so a backend created under a prior job
+            // (or none) matches the active job's cancel state before compute.
             arm_backend_abort_callback(raw);
             return Ok(Self {
                 raw,
@@ -5560,35 +5560,42 @@ fn map_compute_status(status: c_int) -> Result<(), GgmlCpuGraphError> {
     }
 }
 
-/// ggml abort_callback trampoline. `data` is either null or `Arc::as_ptr` of the
-/// job's cancel [`AtomicBool`]. Wait-free load; pause is intentionally ignored
-/// (pause stays L0 slice-boundary only). Must not unwind across the FFI boundary.
+/// ggml abort_callback trampoline. `data` is `Arc::as_ptr` of the job's cancel
+/// [`AtomicBool`] (never null when installed -- see [`arm_backend_abort_callback`]).
+/// Wait-free load; pause is intentionally ignored (pause stays L0 slice-boundary
+/// only). Body is panic-free (null-check + `AtomicBool::load`); no `catch_unwind`
+/// on the per-node CPU hot path.
 unsafe extern "C" fn openasr_ggml_abort_trampoline(data: *mut c_void) -> bool {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        super::cancel_flag_requested_from_data(data)
-    }))
-    .unwrap_or(false)
+    super::cancel_flag_requested_from_data(data)
 }
 
-/// Install this thread's current per-job cancel pointer as abort_callback data
-/// on `backend`. Null data when no transcription control is armed.
+/// Arm or clear this backend's abort_callback from the thread's current job
+/// cancel flag.
+///
+/// - **Flag armed** (`thread_job_cancel_flag_data` non-null): install the
+///   trampoline with that pointer as callback data so ggml worker threads
+///   observe cancel wait-free.
+/// - **No control / disarmed** (null data): install a **null callback**. The
+///   no-control CLI/test path must stay bit-identical to pre-L2 (no per-node
+///   abort poll). Always-on trampolines that return false are not free and are
+///   not the no-control contract.
 fn arm_backend_abort_callback(backend: NonNull<c_void>) {
-    backend_set_abort_callback(
-        backend,
-        Some(openasr_ggml_abort_trampoline),
-        super::thread_job_cancel_flag_data(),
-    );
+    let data = super::thread_job_cancel_flag_data();
+    if data.is_null() {
+        backend_set_abort_callback(backend, None, std::ptr::null_mut());
+    } else {
+        backend_set_abort_callback(backend, Some(openasr_ggml_abort_trampoline), data);
+    }
 }
 
 /// Re-arm every backend cached on this worker thread with the current per-job
-/// cancel data pointer (or null after disarm). Called from transcription-control
-/// install/Drop so pooled threads never leave a previous job's pointer installed
-/// on long-lived Metal/GPU cache entries.
+/// cancel callback (or clear the callback after disarm). Called from
+/// transcription-control install/Drop so pooled threads never leave a previous
+/// job's data pointer installed on long-lived Metal/GPU cache entries.
 pub(crate) fn arm_thread_local_backends_abort_callback() {
-    let data = super::thread_job_cancel_flag_data();
     THREAD_BACKEND_CACHE_BY_KIND.with(|cache| {
         for cached in cache.borrow().values() {
-            backend_set_abort_callback(cached.raw, Some(openasr_ggml_abort_trampoline), data);
+            arm_backend_abort_callback(cached.raw);
         }
     });
 }
@@ -6090,17 +6097,14 @@ mod tests {
     }
 
     #[test]
-    fn cpu_backend_installs_abort_callback_without_forcing_abort() {
-        // Installing the trampoline with cancel=false / null data must leave a
-        // trivial graph compute path as SUCCESS (Metal/CPU). No control installed
-        // => abort data is null => callback always returns false.
+    fn cpu_backend_no_control_path_clears_abort_callback() {
+        // No control installed => abort data is null => arm must clear the
+        // callback (bit-identical to pre-L2), not install a always-false stub.
         assert!(
             crate::ggml_runtime::thread_job_cancel_flag_data().is_null(),
             "no-control path must keep abort data null"
         );
         let backend = super::GgmlBackendGuard::cpu().expect("cpu backend");
-        // backend_set_abort_callback is already invoked by GgmlBackendGuard::cpu;
-        // re-arming is idempotent and must not panic / abort the process.
         super::arm_backend_abort_callback(backend.raw);
         assert!(
             !crate::ggml_runtime::cancel_flag_requested_from_data(std::ptr::null_mut()),
@@ -6119,7 +6123,7 @@ mod tests {
         let data_a = Arc::as_ptr(&flag_a) as *mut std::ffi::c_void;
         let data_b = Arc::as_ptr(&flag_b) as *mut std::ffi::c_void;
 
-        // SAFETY: trampoline is panic-catching and only loads the AtomicBool.
+        // SAFETY: trampoline only null-checks and loads the AtomicBool.
         let abort_a = unsafe { super::openasr_ggml_abort_trampoline(data_a) };
         let abort_b = unsafe { super::openasr_ggml_abort_trampoline(data_b) };
         let abort_null = unsafe { super::openasr_ggml_abort_trampoline(std::ptr::null_mut()) };
@@ -6133,6 +6137,56 @@ mod tests {
         // B's pointer is independent -- already true; A becoming true does not
         // change how B is read (distinct heap atomics, no global slot).
         assert!(unsafe { super::openasr_ggml_abort_trampoline(data_b) });
+    }
+
+    #[test]
+    fn graph_compute_with_cancel_flag_false_stays_finite() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Armed cancel=false must still produce correct finite graph outputs.
+        // This is the production server path under an installed control that has
+        // not been canceled; regressions here surface as non-finite logits.
+        let flag = Arc::new(AtomicBool::new(false));
+        let previous = crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&flag)));
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let output = runner
+            .compute_add_f32(&[1.0, 2.5, -3.0, 8.0], &[4.0, -0.5, 7.0, 1.25])
+            .expect("cancel=false graph must compute successfully");
+        assert_eq!(output, vec![5.0, 2.0, 4.0, 9.25]);
+        assert!(
+            output.iter().all(|v| v.is_finite()),
+            "cancel=false must keep outputs finite"
+        );
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "compute must not flip the cancel flag"
+        );
+        assert!(crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&flag, previous));
+        crate::ggml_runtime::arm_thread_local_backends_abort_callback();
+    }
+
+    #[test]
+    fn graph_compute_with_cancel_flag_true_returns_aborted() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        // Sticky cancel=true must surface as typed Aborted, not a silent
+        // SUCCESS with garbage tensors and not a bare ComputeFailed.
+        let flag = Arc::new(AtomicBool::new(true));
+        let previous = crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&flag)));
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let err = runner
+            .compute_add_f32(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0])
+            .expect_err("cancel=true must fail closed");
+        assert!(
+            matches!(err, GgmlCpuGraphError::Aborted),
+            "cancel=true must map to Aborted, got {err:?}"
+        );
+        assert!(crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&flag, previous));
+        crate::ggml_runtime::arm_thread_local_backends_abort_callback();
     }
 
     #[test]
