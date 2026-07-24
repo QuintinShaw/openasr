@@ -1039,12 +1039,17 @@ mod tests {
         }
     }
 
-    /// Spike scratch assets (golden `.npy` dumps + the f32 pack fixture), not
-    /// committed; every parity test here is `#[ignore]` and skips if absent.
-    const SPIKE_ROOT: &str = "/Volumes/QuintinDocument/openasr-dev/tmp/redimnet2-spike";
-
     fn spike_root() -> PathBuf {
-        PathBuf::from(SPIKE_ROOT)
+        match crate::testing::external_test_fixture_path(
+            "OPENASR_REDIMNET_SPIKE_ROOT",
+            "ReDimNet parity fixture directory",
+        ) {
+            Ok(path) => path,
+            Err(skip) => {
+                eprintln!("skipping: {skip}");
+                PathBuf::new()
+            }
+        }
     }
 
     fn f32_pack_path() -> PathBuf {

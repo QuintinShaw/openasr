@@ -79,10 +79,10 @@ jobs:
       # below for why (#132: STATUS_DLL_NOT_FOUND on machines with no GPU
       # driver). This is a *runtime redistributable* pin, independent of
       # VULKAN_VERSION above (that one pins the *build-time* SDK used to
-      # compile/link openasr.exe). Kept in lockstep with openasr-app's
-      # apps/desktop/scripts/stage-vulkan-loader.mjs, which pins the identical
+      # compile/link openasr.exe). Kept in lockstep with the desktop product's
+      # Vulkan loader staging script, which pins the identical
       # version + both hashes for the desktop sidecar bundle -- bump all three
-      # together in both repos, cross-checked against LunarG's own published
+      # together in both places, cross-checked against LunarG's own published
       # hash at https://vulkan.lunarg.com/sdk/sha/<version>/windows/VulkanRT-X64-<version>-Components.zip.json.
       VULKAN_LOADER_VERSION: 1.4.350.0
       # sha256 of the downloaded vulkan-runtime-components.zip archive.
@@ -826,7 +826,7 @@ jobs:
         # fine, enumerates zero devices, and HardwareFallbackPolicy falls
         # back to CPU in Rust -- never a DLL-load failure.
         #
-        # Mirrors openasr-app's apps/desktop/scripts/stage-vulkan-loader.mjs
+        # Mirrors the desktop product's Vulkan loader staging script
         # (identical version pin + identical two-layer hash verification) for
         # the desktop sidecar bundle. Fail-closed throughout: a download
         # failure, a hash mismatch at either layer, or a missing extracted
@@ -860,7 +860,7 @@ jobs:
           if ($actualArchiveSha -ne $env:VULKAN_LOADER_ARCHIVE_SHA256) {
             Write-Error ("sha256 mismatch for Vulkan runtime archive: expected $env:VULKAN_LOADER_ARCHIVE_SHA256, got $actualArchiveSha. " +
               "Refusing to stage an unverified Vulkan runtime archive -- if LunarG genuinely rotated this release's bytes, re-pin " +
-              "VULKAN_LOADER_ARCHIVE_SHA256 (and VULKAN_LOADER_DLL_SHA256) here AND in openasr-app's stage-vulkan-loader.mjs, " +
+              "VULKAN_LOADER_ARCHIVE_SHA256 (and VULKAN_LOADER_DLL_SHA256) here AND in the desktop product's Vulkan loader staging script, " +
               "cross-checked against https://vulkan.lunarg.com/sdk/sha/$env:VULKAN_LOADER_VERSION/windows/VulkanRT-X64-$env:VULKAN_LOADER_VERSION-Components.zip.json.")
             exit 1
           }
@@ -958,17 +958,17 @@ jobs:
         if: runner.os == 'Windows' && env.LEG_SELECTED == 'true' && steps.signing-check.outputs.have_secrets != 'true' && github.event.inputs.dry_run != 'true'
         shell: bash
         run: |
-          echo "::error::AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_CLIENT_SECRET are not set -- refusing to package an unsigned Windows release binary. Configure the Azure Trusted Signing service principal secrets (see openasr-app's apps/desktop/SIGNING-WINDOWS.md for the account/profile this reuses), or re-run this workflow_dispatch with dry_run=true to build without signing for local debugging only." >&2
+          echo "::error::AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_CLIENT_SECRET are not set -- refusing to package an unsigned Windows release binary. Configure the Azure Trusted Signing service principal secrets (see the desktop product's Windows signing docs for the account/profile this reuses), or re-run this workflow_dispatch with dry_run=true to build without signing for local debugging only." >&2
           exit 1
 
       # Azure Trusted Signing (Artifact Signing): same account/certificate
       # profile as the OpenASR Desktop Windows installer (openasr-sign /
-      # openasr-codesign, publisher "Caelum Inc.") -- see openasr-app's
-      # apps/desktop/SIGNING-WINDOWS.md for the account itself. The service
+      # openasr-codesign, publisher "Caelum Inc.") -- see the desktop product's
+      # Windows signing docs for the account itself. The service
       # principal behind these secrets needs the "Artifact Signing
       # Certificate Profile Signer" role on that account (see this repo's
       # docs/RELEASING.md); it may be a different App Registration than the
-      # desktop repo's, but must be granted the same role on the same
+      # desktop product's, but must be granted the same role on the same
       # account/profile.
       # GitHub's windows runner image stopped shipping a pre-registered PSGallery
       # PowerShell repository (surfaced alongside the Node 20 -> 24 default bump),

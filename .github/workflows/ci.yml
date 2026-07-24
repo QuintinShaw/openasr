@@ -52,6 +52,8 @@ jobs:
         run: scripts/gpu-weight-placement-gate.sh
       - name: Install python test dependencies
         run: python3 -m pip install --user numpy
+      - name: Public source hygiene gate
+        run: python3 tooling/check_public_source_hygiene.py
       - name: Python helper gates
         run: |
           python3 -m unittest discover -s tooling/publish-model/scripts -p '*_test.py'

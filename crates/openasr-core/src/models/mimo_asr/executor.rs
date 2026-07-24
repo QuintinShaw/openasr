@@ -533,10 +533,17 @@ mod tests {
     /// Real converted dev pack from P2.1+P2.2 (`tooling/mimo-asr/convert_mimo_asr.py`),
     /// NOT committed to the repo (dev-only artifact, same convention as
     /// firered2-llm's own `tmp-weights/fr2/out/firered2-llm-q8_0.oasr`).
-    fn dev_pack_path() -> PathBuf {
-        PathBuf::from(
-            "/Volumes/QuintinDocument/openasr-dev/tmp-weights/mimo/out/mimo-v2.5-asr-q8_0.oasr",
-        )
+    fn dev_pack_path() -> Option<PathBuf> {
+        match crate::testing::external_test_fixture_path(
+            "OPENASR_MIMO_ASR_PACK",
+            "MiMo ASR .oasr pack",
+        ) {
+            Ok(path) => Some(path),
+            Err(skip) => {
+                eprintln!("skipping: {skip}");
+                None
+            }
+        }
     }
 
     // Pinned to the real dev-pack decode (q8_0, `OPENASR_GGML_BACKEND=cpu` --
@@ -592,7 +599,7 @@ mod tests {
     }
 
     fn transcribe_with_dev_pack(wav_path: PathBuf) -> Option<(String, std::time::Duration, f32)> {
-        let pack_path = dev_pack_path();
+        let pack_path = dev_pack_path()?;
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
             return None;

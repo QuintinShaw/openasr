@@ -3,7 +3,7 @@ use std::sync::{Mutex, OnceLock};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::models::ggml_asr_executor::GgmlAsrPreparedAudio;
@@ -60,6 +60,53 @@ const WHISPER_REQUIRED_TENSOR_ANCHORS_FOR_SKELETON: &[&str] = &[
     "model.decoder.layers.0.self_attn.q_proj.weight",
     "model.decoder.layers.0.encoder_attn.q_proj.weight",
 ];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExternalTestFixtureError {
+    Unset { env_var: String, purpose: String },
+    Missing { env_var: String, path: PathBuf },
+}
+
+impl std::fmt::Display for ExternalTestFixtureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unset { env_var, purpose } => write!(
+                formatter,
+                "set {env_var} to the local {purpose} path to run this opt-in test"
+            ),
+            Self::Missing { env_var, path } => write!(
+                formatter,
+                "{env_var} points to missing external test fixture {}",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Resolves an opt-in fixture that is deliberately not tracked in this repository.
+///
+/// Tests that use this helper must report the returned error and skip rather than
+/// guessing a workstation-specific location or reading a user's home directory.
+pub fn external_test_fixture_path(
+    env_var: &str,
+    purpose: &str,
+) -> Result<PathBuf, ExternalTestFixtureError> {
+    let Some(value) = std::env::var_os(env_var) else {
+        return Err(ExternalTestFixtureError::Unset {
+            env_var: env_var.to_string(),
+            purpose: purpose.to_string(),
+        });
+    };
+    let path = PathBuf::from(value);
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(ExternalTestFixtureError::Missing {
+            env_var: env_var.to_string(),
+            path,
+        })
+    }
+}
 
 #[cfg(test)]
 pub(crate) fn with_forced_cpu_backend_for_test<T>(run: impl FnOnce() -> T) -> T {
@@ -1882,6 +1929,19 @@ mod tests {
     use crate::{read_gguf_metadata, read_gguf_tensor_index};
     use std::fs;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn external_fixture_path_reports_missing_fixture() {
+        let path = PathBuf::from("definitely-not-an-openasr-fixture");
+        assert_eq!(
+            external_test_fixture_path("OPENASR_TEST_MISSING_FIXTURE", "fixture"),
+            Err(ExternalTestFixtureError::Unset {
+                env_var: "OPENASR_TEST_MISSING_FIXTURE".to_string(),
+                purpose: "fixture".to_string(),
+            })
+        );
+        assert!(!path.exists(), "test fixture name must remain absent");
+    }
 
     #[test]
     fn whisper_graph_ready_fixture_includes_anchor_and_binding_tensors() {

@@ -1753,9 +1753,9 @@ mod tests {
         assert_eq!(language_mode_label(None), "unspecified");
     }
 
-    /// Desktop-sidecar contract: `apps/desktop/src-tauri/src/sidecar.rs` spawns
-    /// this binary as `openasr serve --backend native --parent-pid <pid> ...`
-    /// (see `openasr-app` `sidecar.rs`'s `Command::new(..).args([...])`). Both
+    /// Desktop-sidecar contract: the desktop sidecar spawns
+    /// this binary as `openasr serve --backend native --parent-pid <pid> ...`.
+    /// Both
     /// flags are `hide = true` in `cli_args.rs` because they are launch-detail
     /// only, never meant for interactive use -- but "hidden from `--help`" must
     /// never come to mean "safe to rename or remove". This test locks the two

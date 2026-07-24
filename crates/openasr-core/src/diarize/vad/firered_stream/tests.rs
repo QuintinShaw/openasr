@@ -156,9 +156,16 @@ fn provider_rejects_wrong_sample_rate() {
 #[test]
 #[ignore = "host-local: requires tmp/audio/clips/black_cat_poe_ty_5min.wav"]
 fn benchmark_forward_pass_rtf_on_real_5min_recording() {
-    let path = std::path::PathBuf::from(
-        "/Volumes/QuintinDocument/openasr-dev/openasr-legacy/tmp/audio/clips/black_cat_poe_ty_5min.wav",
-    );
+    let path = match crate::testing::external_test_fixture_path(
+        "OPENASR_FIRERED_STREAM_VAD_BENCH_AUDIO",
+        "Stream-VAD benchmark audio fixture",
+    ) {
+        Ok(path) => path,
+        Err(skip) => {
+            eprintln!("skipping: {skip}");
+            return;
+        }
+    };
     let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
         &path,
         "Stream-VAD RTF benchmark",

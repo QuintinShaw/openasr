@@ -265,10 +265,17 @@ mod tests {
         parse_firered_llm_adapter_metadata, parse_firered_llm_encoder_metadata,
     };
 
-    fn dev_pack_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(
-            "/Volumes/QuintinDocument/openasr-dev/tmp-weights/fr2/out/firered2-llm-q4_k.oasr",
-        )
+    fn dev_pack_path() -> Option<std::path::PathBuf> {
+        match crate::testing::external_test_fixture_path(
+            "OPENASR_FIRERED_LLM_Q4_PACK",
+            "FireRed2 LLM q4 .oasr pack",
+        ) {
+            Ok(path) => Some(path),
+            Err(skip) => {
+                eprintln!("skipping: {skip}");
+                None
+            }
+        }
     }
 
     fn jfk_wav_path() -> std::path::PathBuf {
@@ -334,7 +341,9 @@ mod tests {
     #[ignore = "requires the private ~4.7GB dev-only firered2-llm-q4_k.oasr pack; numeric parity \
                 against the removed scalar host implementation on the real jfk.wav utterance"]
     fn ggml_graph_adapter_matches_reference_scalar_implementation_on_jfk_wav() {
-        let pack_path = dev_pack_path();
+        let Some(pack_path) = dev_pack_path() else {
+            return;
+        };
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
             return;

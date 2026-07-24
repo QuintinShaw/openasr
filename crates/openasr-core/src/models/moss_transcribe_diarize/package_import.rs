@@ -1200,13 +1200,20 @@ mod tests {
     // real-dev-pack test in this crate, e.g. `firered_llm::executor`'s
     // `dev_pack_path()`). Skips silently when absent so this stays runnable
     // without the multi-GB download.
-    fn dev_checkpoint_root() -> PathBuf {
-        PathBuf::from("/Volumes/QuintinDocument/openasr-dev/tmp/moss-td/model")
+    fn dev_checkpoint_root() -> Option<PathBuf> {
+        crate::testing::external_test_fixture_path(
+            "OPENASR_MOSS_TRANSCRIBE_DIARIZE_SOURCE",
+            "MOSS Transcribe Diarize source checkpoint directory",
+        )
+        .inspect_err(|skip| eprintln!("skipping: {skip}"))
+        .ok()
     }
 
     #[test]
     fn golden_diff_converted_pack_tensors_match_source_checkpoint_bit_for_bit() {
-        let source_root = dev_checkpoint_root();
+        let Some(source_root) = dev_checkpoint_root() else {
+            return;
+        };
         if !source_root.exists() {
             eprintln!("skipping: {} not present", source_root.display());
             return;

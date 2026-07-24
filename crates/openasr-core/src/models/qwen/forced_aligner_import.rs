@@ -515,8 +515,16 @@ mod tests {
     /// safetensors tensor 1:1, plus the two synthesized frontend tensors.
     #[test]
     fn forced_aligner_conversion_produces_tensor_parity_with_source_checkpoint() {
-        let source_root =
-            PathBuf::from("/Volumes/QuintinDocument/hf-cache/qwen3-forced-aligner-0.6b");
+        let source_root = match crate::testing::external_test_fixture_path(
+            "OPENASR_QWEN_FORCED_ALIGNER_SOURCE",
+            "Qwen forced-aligner source checkpoint directory",
+        ) {
+            Ok(path) => path,
+            Err(skip) => {
+                eprintln!("skipping: {skip}");
+                return;
+            }
+        };
         if !source_root.exists() {
             eprintln!(
                 "skipping: {} not present (Stage 0 reference download is dev-machine only)",

@@ -2,8 +2,7 @@
 //! daemon/server/CLI logs.
 //!
 //! `daemon.log` (stdout+stderr of `openasr serve`, captured by the desktop
-//! sidecar -- see `openasr-app/apps/desktop/src-tauri/src/sidecar.rs`) had no
-//! timestamps at all: server boot, model-pack loading, and realtime warm-up
+//! sidecar) had no timestamps at all: server boot, model-pack loading, and realtime warm-up
 //! were each a plain `println!`/`eprintln!` with no timing, so diagnosing how
 //! long any of it took meant guessing from wall-clock reads of unrelated
 //! surrounding events. This module is the single place that formats a dual

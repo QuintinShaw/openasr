@@ -694,15 +694,19 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
 
-    const FIXTURE_ROOT: &str =
-        "/Volumes/QuintinDocument/openasr-dev/openasr/tmp/publish/dolphin-cn-dialect-small";
+    fn root() -> Option<PathBuf> {
+        match crate::testing::external_test_fixture_path(
+            "OPENASR_DOLPHIN_PARITY_ROOT",
+            "Dolphin parity fixture directory",
+        ) {
+            Ok(path) => Some(path),
+            Err(skip) => {
+                eprintln!("skipping: {skip}");
+                None
+            }
+        }
+    }
 
-    /// Pin the importer's `DolphinLanguageScheme::label()` writer against this
-    /// module's `parse_dolphin_language_scheme_value` reader: every scheme must
-    /// round-trip label -> parse -> the same scheme, so the two literal sets
-    /// (write side here, read side in `package_import.rs`) cannot silently drift
-    /// apart. Also pins the backward-compat default (missing key -> CnDialect)
-    /// and the fail-closed rejection of an unrecognized value.
     #[test]
     fn language_scheme_label_round_trips_through_the_executor_parser() {
         for scheme in [
@@ -728,7 +732,6 @@ mod tests {
             "an unrecognized scheme value must fail closed rather than silently default"
         );
     }
-
     /// Golden `attention_rescoring` transcript (manifest `text_nospecial`): the
     /// model's own joint-decode output for the Sichuan clip. This is the parity
     /// target -- the human ground-truth WSC transcript differs by one homophone
@@ -738,10 +741,6 @@ mod tests {
     const REFERENCE_WSC_TEXT: &str = "学校河底下好多那种野生枸杞";
     /// Reference CTC greedy transcript (manifest `ctc_greedy_search.text`).
     const REFERENCE_CTC_GREEDY_TEXT: &str = "学校火底下好多那种野生枸杞";
-
-    fn root() -> PathBuf {
-        PathBuf::from(FIXTURE_ROOT)
-    }
 
     // --- minimal little-endian f32 .npy reader (mirrors parity.rs) -------------
     fn load_npy_f32(path: &Path) -> (Vec<usize>, Vec<f32>) {
@@ -947,7 +946,9 @@ mod tests {
     #[test]
     #[ignore = "requires local Dolphin checkpoint + golden under tmp/publish (not committed)"]
     fn dolphin_encoder_from_pack_parity() {
-        let root = root();
+        let Some(root) = root() else {
+            return;
+        };
         if ensure_dolphin_pack(&root, DolphinQuantizationMode::Fp16).is_none() {
             eprintln!("skip: dolphin checkpoint/units not present under {root:?}");
             return;
@@ -1037,7 +1038,9 @@ mod tests {
     #[ignore = "perf AB harness: requires local Dolphin checkpoint + golden clip under tmp/publish"]
     fn dolphin_perf_ab() {
         use std::time::{Duration, Instant};
-        let root = root();
+        let Some(root) = root() else {
+            return;
+        };
         let clip = root.join("golden/clip_sichuan.wav");
         // Quant rung under test (fp16 golden by default); the driver script sweeps
         // fp16/q8_0/q4_k so each is measured in its own process (isolated peak RSS).
@@ -1137,7 +1140,9 @@ mod tests {
     #[test]
     #[ignore = "requires local Dolphin checkpoint + golden clip under tmp/publish (not committed)"]
     fn dolphin_joint_decode_end_to_end() {
-        let root = root();
+        let Some(root) = root() else {
+            return;
+        };
         let clip = root.join("golden/clip_sichuan.wav");
         let Some(pack) = ensure_dolphin_pack(&root, DolphinQuantizationMode::Fp16) else {
             eprintln!("skip: dolphin checkpoint/units not present under {root:?}");
@@ -1307,7 +1312,9 @@ mod tests {
     #[test]
     #[ignore = "requires local Dolphin checkpoint + golden clip under tmp/publish (not committed)"]
     fn dolphin_hotword_flips_recognition_error() {
-        let root = root();
+        let Some(root) = root() else {
+            return;
+        };
         let clip = root.join("golden/clip_sichuan.wav");
         let Some(pack) = ensure_dolphin_pack(&root, DolphinQuantizationMode::Fp16) else {
             eprintln!("skip: dolphin checkpoint/units not present under {root:?}");

@@ -768,14 +768,26 @@ mod tests {
     /// Real converted dev pack (fp16), NOT committed -- same dev-only-artifact
     /// convention as `decode_prompt`'s own `dev_pack_path` and mimo-asr's
     /// `mimo-v2.5-asr-q8_0.oasr`.
-    fn dev_pack_path() -> PathBuf {
-        PathBuf::from(
-            "/Volumes/QuintinDocument/openasr-dev/tmp/moss-td/moss-transcribe-diarize-fp16.oasr",
+    fn dev_pack_path() -> Option<PathBuf> {
+        crate::testing::external_test_fixture_path(
+            "OPENASR_MOSS_TRANSCRIBE_DIARIZE_PACK",
+            "MOSS Transcribe Diarize .oasr pack",
         )
+        .inspect_err(|skip| eprintln!("skipping: {skip}"))
+        .ok()
     }
 
     fn dev_sample_path(name: &str) -> PathBuf {
-        PathBuf::from("/Volumes/QuintinDocument/openasr-dev/tmp/moss-td/samples").join(name)
+        match crate::testing::external_test_fixture_path(
+            "OPENASR_MOSS_TRANSCRIBE_DIARIZE_SAMPLES",
+            "MOSS Transcribe Diarize sample directory",
+        ) {
+            Ok(path) => path.join(name),
+            Err(skip) => {
+                eprintln!("skipping: {skip}");
+                PathBuf::new()
+            }
+        }
     }
 
     // Pinned to the real dev-pack CPU decode (backend forced to CPU below).
@@ -825,7 +837,7 @@ mod tests {
         wav_path: PathBuf,
         backend_preference: GgmlAsrBackendPreference,
     ) -> Option<(String, std::time::Duration, f32)> {
-        let pack_path = dev_pack_path();
+        let pack_path = dev_pack_path()?;
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
             return None;
@@ -873,7 +885,7 @@ mod tests {
     /// `speaker_segments::parse_moss_td_speaker_segments` (as wired into the
     /// executor) into the same structure the golden `[Sxx]`/`[t]` tags encode.
     fn transcribe_with_dev_pack_segments(wav_path: PathBuf) -> Option<Vec<Segment>> {
-        let pack_path = dev_pack_path();
+        let pack_path = dev_pack_path()?;
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
             return None;
