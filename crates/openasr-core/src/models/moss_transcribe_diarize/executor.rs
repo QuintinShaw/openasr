@@ -489,7 +489,15 @@ fn run_moss_td_decoder_with_cached_runtime(
                 token_major_values: spliced.token_major_values,
             };
 
-            let layer_kv_caches = decoder.new_kv_caches();
+            // Request-sized, not the checkpoint's native 131072-token RoPE
+            // context: see `MossTdDecoderRuntime::new_kv_caches`'s doc comment
+            // for why the fixed reuse-graph span this sizes must stay tight
+            // to what this utterance actually needs.
+            let layer_kv_caches = decoder.new_kv_caches(
+                spliced
+                    .token_count
+                    .saturating_add(MOSS_TD_MAX_GENERATED_TOKENS),
+            );
             let mut step_executor = MossTdGreedyStepExecutor {
                 decoder,
                 layer_kv_caches,
