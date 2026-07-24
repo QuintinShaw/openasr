@@ -524,9 +524,10 @@ mod tests {
             );
             return;
         }
-        let output_dir = std::env::temp_dir().join("openasr-forced-aligner-stage1-test");
-        let _ = std::fs::create_dir_all(&output_dir);
-        let output_root = output_dir.join("qwen3-forced-aligner-0.6b-fp16.oasr");
+        let output_dir = tempfile::tempdir().expect("unique forced-aligner test tempdir");
+        let output_root = output_dir
+            .path()
+            .join("qwen3-forced-aligner-0.6b-fp16.oasr");
 
         let request = Qwen3ForcedAlignerLocalSourceImportRequest {
             source_root: source_root.clone(),

@@ -11,7 +11,8 @@ use super::audio_encoder::{
     Qwen3AsrAudioEncoderError, Qwen3AsrAudioEncoderRuntime, Qwen3AsrAudioEncoderWeights,
 };
 use super::batched_decode::{
-    Qwen3AsrServeBatchConfig, Qwen3AsrServeBatchJob, submit_qwen_serve_batch_job,
+    Qwen3AsrServeBatchConfig, Qwen3AsrServeBatchJob, shutdown_qwen_serve_batch_engines,
+    submit_qwen_serve_batch_job,
 };
 use super::decode_prompt::{Qwen3AsrDecodePromptError, build_qwen3_decode_prompt};
 use super::frontend::{
@@ -424,21 +425,19 @@ impl Qwen3AsrGgmlExecutor {
             validate_stacks_started_at,
         );
         let serve_batch_graph_config = super::graph_config::qwen_runtime_graph_config();
-        if let Some(serve_batch_config) = Qwen3AsrServeBatchConfig::from_env()
-            .map_err(|error| Qwen3AsrGgmlExecutorError::GreedyDecodeFailed {
-                reason: error.to_string(),
-            })?
-            // Serve-batch needs the unified GPU lane on the direct reusable graph.
-            // Fall through to direct decode on CPU / scheduler-backed nodes instead
-            // of hard-failing with UnsupportedBackend, so a globally-set
-            // OPENASR_SERVE_BATCH degrades gracefully (mirrors whisper's gate).
-            .filter(|_| {
-                // Streaming bypasses the batch worker so live sessions stay on the
-                // direct greedy loop below.
-                !skip_serve_batch
-                    && serve_batch_graph_config.backend.is_gpu_class()
-                    && !serve_batch_graph_config.use_scheduler
-            })
+        if let Some(serve_batch_config) =
+            Qwen3AsrServeBatchConfig::from_policy(request.request_options.serve_batch)
+                // Serve-batch needs the unified GPU lane on the direct reusable graph.
+                // Fall through to direct decode on CPU / scheduler-backed nodes instead
+                // of hard-failing with UnsupportedBackend, so ineligible lanes
+                // stay serial without claiming batch width.
+                .filter(|_| {
+                    // Streaming bypasses the batch worker so live sessions stay on the
+                    // direct greedy loop below.
+                    !skip_serve_batch
+                        && serve_batch_graph_config.backend.is_gpu_class()
+                        && !serve_batch_graph_config.use_scheduler
+                })
         {
             let serve_batch_started_at = qwen_decode_profile_start();
             let decode_policy = resolve_builtin_decode_policy(crate::QWEN3_ASR_DECODE_POLICY_ID)
@@ -459,6 +458,13 @@ impl Qwen3AsrGgmlExecutor {
                 Qwen3AsrServeBatchJob {
                     runtime_source_path: request.runtime_source_path.clone(),
                     runtime_cache_path,
+                    build_identity:
+                        crate::models::ggml_asr_executor::serve_batch_build_identity_for_request(
+                            &request.request_options,
+                            "qwen",
+                            GgmlCpuGraphConfig::resolve_runtime_backend(),
+                            &request.runtime_source_path,
+                        ),
                     backend: GgmlCpuGraphConfig::resolve_runtime_backend(),
                     metadata,
                     tokenizer: tokenizer.cloned(),
@@ -1359,6 +1365,7 @@ impl GgmlAsrExecutor for Qwen3AsrGgmlExecutor {
     }
 
     fn unload_idle_state(&self) {
+        shutdown_qwen_serve_batch_engines();
         self.runtime_cache_by_path.clear();
     }
 }
@@ -1412,6 +1419,7 @@ impl GgmlAsrStreamingExecutor for Qwen3AsrGgmlExecutor {
     }
 
     fn unload_idle_state(&self) {
+        shutdown_qwen_serve_batch_engines();
         self.runtime_cache_by_path.clear();
     }
 }

@@ -19,10 +19,9 @@ use std::time::Duration;
 
 use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::serve_batch_env::{
-    OwnerAliveGuard, serve_batch_bucket_width, serve_batch_collect_window_from_env,
-    serve_batch_compact_active_slots, serve_batch_drain_compatible_batch, serve_batch_max_from_env,
-    serve_batch_owner_alive, serve_batch_submit_with_timeout, serve_batch_trace_enabled,
-    serve_batch_vram_capped_max_batch,
+    OwnerAliveGuard, SERVE_BATCH_COLLECT_WINDOW, ServeBatchPolicy, serve_batch_bucket_width,
+    serve_batch_compact_active_slots, serve_batch_drain_compatible_batch, serve_batch_owner_alive,
+    serve_batch_submit_with_timeout, serve_batch_trace_enabled, serve_batch_vram_capped_max_batch,
 };
 use crate::nn::decoder::reusable_decode_graph_supported;
 
@@ -76,8 +75,8 @@ pub(crate) trait Seq2SeqServeBatchFamily: Sized + 'static {
     type EngineKey: Clone + Eq + std::hash::Hash;
 
     const THREAD_NAME_PREFIX: &'static str;
-    /// Upper bound for the `OPENASR_SERVE_BATCH` env max-batch (all three
-    /// families use 8). Consumed by the generic `ServeBatchConfig::from_env`.
+    /// Upper bound for eligible family batch width (all four families use 8).
+    /// Consumed by `ServeBatchConfig::from_policy`.
     const MAX_BATCH_LIMIT: usize;
     fn engine_key(job: &Self::Job, max_batch: usize) -> Self::EngineKey;
     /// The backend recorded in an engine key, used only to reproduce the owner
@@ -132,7 +131,8 @@ pub(crate) trait Seq2SeqServeBatchFamily: Sized + 'static {
 
     // Engine/registry/config error constructors (Wave B). Each family binds these
     // to its existing `*ServeBatchError` variant constructors; no new error enum.
-    fn invalid_env(env: &'static str, raw: String, max: usize) -> Self::Error;
+    #[cfg(test)]
+    fn invalid_test_env(env: &'static str, raw: String, max: usize) -> Self::Error;
     fn invalid_enabled_batch(max_batch: usize) -> Self::Error;
     fn unsupported_backend(backend: GgmlCpuGraphBackend) -> Self::Error;
     fn registry_poisoned() -> Self::Error;
@@ -912,8 +912,6 @@ fn format_error<F: Seq2SeqServeBatchFamily>(error: F::Error) -> String {
 // generic-over-`F` static) plus a thin `submit_*_serve_batch_job`.
 // ===========================================================================
 
-const SERVE_BATCH_QUEUE_CAPACITY: usize = 4;
-const SERVE_BATCH_COLLECT_WINDOW: Duration = Duration::from_millis(2);
 const SERVE_BATCH_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 const SERVE_BATCH_REPLY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -932,28 +930,38 @@ pub(crate) struct ServeBatchConfig {
 }
 
 impl ServeBatchConfig {
-    /// Reads `OPENASR_SERVE_BATCH` (+ collect-window / trace env). Returns
-    /// `Ok(None)` when serve-batch is disabled (unset / `<= 1`), mirroring the
-    /// previous per-family `from_env`. The env max-batch limit comes from
-    /// `F::MAX_BATCH_LIMIT`; env-parse failures map through `F::invalid_env`.
-    /// Deliberately NOT named `from_env`: each family exposes a thin
-    /// `*ServeBatchConfig::from_env()` (a per-module extension trait) that calls
-    /// this, and an inherent `from_env` here would shadow that trait method and
-    /// break type inference at the `ggml_executor` call sites.
-    pub(crate) fn read_env<F: Seq2SeqServeBatchFamily>() -> Result<Option<Self>, F::Error> {
+    /// Resolves an eligible family's internal batch width from the server's
+    /// admission limit. The limit is also the queue capacity: permits remain
+    /// held from admission until the owner replies, so every admitted engine
+    /// job always has a queue slot even when `N > family_batch_cap`.
+    pub(crate) fn from_policy<F: Seq2SeqServeBatchFamily>(
+        policy: ServeBatchPolicy,
+    ) -> Option<Self> {
+        policy.enabled().then_some(Self {
+            max_batch: policy.max_native_sessions.min(F::MAX_BATCH_LIMIT),
+            queue_capacity: policy.max_native_sessions,
+            collect_window: SERVE_BATCH_COLLECT_WINDOW,
+            send_timeout: SERVE_BATCH_SEND_TIMEOUT,
+            reply_timeout: SERVE_BATCH_REPLY_TIMEOUT,
+            trace_batches: serve_batch_trace_enabled(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_env<F: Seq2SeqServeBatchFamily>() -> Result<Option<Self>, F::Error> {
         let Some(max_batch) =
-            serve_batch_max_from_env(F::MAX_BATCH_LIMIT).map_err(map_env_error::<F>)?
+            crate::models::serve_batch_env::serve_batch_max_from_env(F::MAX_BATCH_LIMIT)
+                .map_err(|error| F::invalid_test_env(error.env, error.raw, error.max))?
         else {
             return Ok(None);
         };
         Ok(Some(Self {
             max_batch,
-            queue_capacity: SERVE_BATCH_QUEUE_CAPACITY,
-            collect_window: serve_batch_collect_window_from_env(SERVE_BATCH_COLLECT_WINDOW)
-                .map_err(map_env_error::<F>)?,
+            queue_capacity: max_batch,
+            collect_window: SERVE_BATCH_COLLECT_WINDOW,
             send_timeout: SERVE_BATCH_SEND_TIMEOUT,
             reply_timeout: SERVE_BATCH_REPLY_TIMEOUT,
-            trace_batches: serve_batch_trace_enabled(),
+            trace_batches: false,
         }))
     }
 
@@ -975,8 +983,7 @@ impl ServeBatchConfig {
             return Err(F::unsupported_backend(backend));
         }
         let max_batch =
-            serve_batch_vram_capped_max_batch(self.max_batch, backend, F::vram_slot_bytes(job))
-                .map_err(map_env_error::<F>)?;
+            serve_batch_vram_capped_max_batch(self.max_batch, backend, F::vram_slot_bytes(job));
         let max_batch = F::effective_max_batch_after_vram_cap(max_batch, job)?;
         Ok(Self { max_batch, ..self })
     }
@@ -1093,8 +1100,18 @@ where
     Ok(engine)
 }
 
-fn map_env_error<F: Seq2SeqServeBatchFamily>(
-    error: crate::models::serve_batch_env::ServeBatchEnvError,
-) -> F::Error {
-    F::invalid_env(error.env, error.raw, error.max)
+/// Removes every idle-owner registry reference. Once the last submitter drops
+/// its `Arc`, the sender disconnects; the owner finishes its current batch,
+/// drains deferred replies through the ordinary loop, then exits. Idle unload
+/// calls this only after native activity reaches zero, so it never abandons an
+/// admitted request or releases its server permit early.
+pub(crate) fn shutdown_and_remove_serve_batch_engines<F: Seq2SeqServeBatchFamily>(
+    registry: &OnceLock<Mutex<HashMap<F::EngineKey, Arc<ServeBatchEngine<F>>>>>,
+) {
+    let Some(registry) = registry.get() else {
+        return;
+    };
+    if let Ok(mut engines) = registry.lock() {
+        engines.clear();
+    }
 }

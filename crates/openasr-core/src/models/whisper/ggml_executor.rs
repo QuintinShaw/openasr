@@ -63,8 +63,9 @@ use crate::{
 use crate::{GgufTensorIndexReadError, read_gguf_tensor_index_from_runtime_source};
 
 use super::batched_decode::{
-    WhisperServeBatchConfig, WhisperServeBatchConfigFromEnv, WhisperServeBatchJob,
-    submit_whisper_serve_batch_job, whisper_serve_batch_decode_config,
+    WhisperServeBatchConfig, WhisperServeBatchConfigFromPolicy, WhisperServeBatchJob,
+    shutdown_whisper_serve_batch_engines, submit_whisper_serve_batch_job,
+    whisper_serve_batch_decode_config,
 };
 use super::execution_policy::{
     whisper_decoder_cross_flash_attention_enabled, whisper_decoder_self_flash_attention_enabled,
@@ -3067,6 +3068,7 @@ impl GgmlAsrExecutor for WhisperGgmlExecutor {
     }
 
     fn unload_idle_state(&self) {
+        shutdown_whisper_serve_batch_engines();
         self.runtime_cache_by_path.clear();
     }
 }
@@ -3187,6 +3189,7 @@ impl GgmlAsrStreamingExecutor for WhisperGgmlExecutor {
     }
 
     fn unload_idle_state(&self) {
+        shutdown_whisper_serve_batch_engines();
         self.runtime_cache_by_path.clear();
     }
 }
@@ -3720,11 +3723,8 @@ fn execute_whisper_with_prepared_runtime(
             output_hidden_f32, ..
         } => output_hidden_f32.as_slice(),
     };
-    let serve_batch_config = WhisperServeBatchConfig::from_env().map_err(|error| {
-        WhisperGgmlExecutorError::DecoderGraphExecutionFailed {
-            reason: error.to_string(),
-        }
-    })?;
+    let serve_batch_config =
+        WhisperServeBatchConfig::from_server_policy(request_options.serve_batch);
     let decoder_graph_config = whisper_decoder_graph_config();
     let can_use_serve_batch = !skip_serve_batch
         && whisper_can_use_serve_batch(
@@ -3775,6 +3775,13 @@ fn execute_whisper_with_prepared_runtime(
             serve_batch_config,
             WhisperServeBatchJob {
                 runtime_cache_path: canonical_runtime_cache_path(runtime_source.path()),
+                build_identity:
+                    crate::models::ggml_asr_executor::serve_batch_build_identity_for_request(
+                        request_options,
+                        "whisper",
+                        decoder_graph_config.backend,
+                        runtime_source.path(),
+                    ),
                 backend: decoder_graph_config.backend,
                 uses_scheduler: decoder_graph_config.use_scheduler,
                 execution: runtime.execution.clone(),

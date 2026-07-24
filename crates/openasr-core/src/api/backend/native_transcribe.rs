@@ -1176,6 +1176,9 @@ fn run_native_transcription_impl(
     );
     request_options.task = request.task.unwrap_or_default();
     request_options.inference_threads = request.inference_threads.map(usize::from);
+    request_options.serve_batch = crate::models::serve_batch_env::ServeBatchPolicy {
+        max_native_sessions: request.serve_batch_max_native_sessions.unwrap_or(1).max(1),
+    };
     // VAD diarization needs word anchors to split multi-speaker transcript
     // segments at speaker-turn boundaries (X-ASR batch emits one monolithic
     // segment for the whole file). For most native families word timings are

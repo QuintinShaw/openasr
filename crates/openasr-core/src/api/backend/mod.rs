@@ -354,6 +354,9 @@ pub struct TranscriptionRequest {
     pub phrase_bias: Option<PhraseBiasConfig>,
     pub inference_threads: Option<u16>,
     pub execution_target: Option<ExecutionTarget>,
+    /// Server-owned upper bound for concurrent native sessions of this model.
+    /// `None` keeps non-server callers serial.
+    pub serve_batch_max_native_sessions: Option<usize>,
     pub word_timestamps: bool,
     /// Opt-in refinement tier (`--word-timestamps=aligned` / API
     /// `word_timestamps_mode=aligned`): after the family's own decode produces
@@ -429,6 +432,7 @@ impl TranscriptionRequest {
             phrase_bias: None,
             inference_threads: None,
             execution_target: None,
+            serve_batch_max_native_sessions: None,
             word_timestamps: false,
             word_timestamps_refine: false,
             longform: None,
@@ -506,6 +510,14 @@ impl TranscriptionRequest {
 
     pub fn with_execution_target(mut self, execution_target: Option<ExecutionTarget>) -> Self {
         self.execution_target = execution_target;
+        self
+    }
+
+    pub fn with_serve_batch_max_native_sessions(
+        mut self,
+        max_native_sessions: Option<usize>,
+    ) -> Self {
+        self.serve_batch_max_native_sessions = max_native_sessions;
         self
     }
 

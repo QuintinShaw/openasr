@@ -54,6 +54,18 @@ so an agent (or a script) can hardcode the base URL instead of discovering it.
 This is independent of the desktop app's sidecar, which negotiates its own
 port via a local handshake file and is unaffected by this default.
 
+### Native concurrency
+
+`--max-native-sessions-per-model N` is the single server-side concurrency control
+for a resolved native model. The default `N=1` is serial. For eligible offline
+Cohere, Moonshine, Qwen, and Whisper direct-GPU requests, the server keeps the
+admission permit through queueing and reply, and derives an internal width no
+larger than `min(N, 8, runtime-safe width)`. Values above eight admit more work
+but are processed in multiple batches. CPU, scheduler-backed, adapter, realtime,
+FireRed-AED, and FireRed2 requests use serial execution; translations use the
+same offline admission policy. Queue/full errors are retryable `429`; a stopped
+or timed-out batch owner returns `503`.
+
 ### Loopback trust and API keys
 
 Loopback (`127.0.0.1`) callers are trusted by default: no `Authorization`

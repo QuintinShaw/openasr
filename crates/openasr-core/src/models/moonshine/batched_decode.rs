@@ -20,11 +20,12 @@ use crate::models::seq2seq_greedy_decode::{
 use crate::models::seq2seq_serve_batch::{Envelope, OwnerThreadState};
 use crate::models::seq2seq_serve_batch::{
     Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig, ServeBatchEngine,
-    serve_batch_engine_for_key,
+    serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
-    serve_batch_estimate_seq2seq_slot_bytes, serve_batch_select_and_apply_greedy_step,
+    ServeBatchPolicy, serve_batch_estimate_seq2seq_slot_bytes,
+    serve_batch_select_and_apply_greedy_step,
 };
 use crate::{Segment, Transcription};
 
@@ -49,22 +50,28 @@ static MOONSHINE_SERVE_BATCH_ENGINES: OnceLock<
 /// struct-literal construction keep compiling unchanged.
 pub(super) type MoonshineServeBatchConfig = ServeBatchConfig;
 
-/// Lets `MoonshineServeBatchConfig::from_env()` resolve to the generic
-/// `ServeBatchConfig::from_env::<MoonshineFamily>()` without a turbofish at the
-/// call site. Scoped per family module so the method name is unambiguous.
-pub(super) trait MoonshineServeBatchConfigFromEnv: Sized {
+/// Resolves the shared server policy without exposing the generic family marker.
+pub(super) trait MoonshineServeBatchConfigFromPolicy: Sized {
+    fn from_server_policy(policy: ServeBatchPolicy) -> Option<Self>;
+    #[cfg(test)]
     fn from_env() -> Result<Option<Self>, MoonshineServeBatchError>;
 }
 
-impl MoonshineServeBatchConfigFromEnv for MoonshineServeBatchConfig {
+impl MoonshineServeBatchConfigFromPolicy for MoonshineServeBatchConfig {
+    fn from_server_policy(policy: ServeBatchPolicy) -> Option<Self> {
+        ServeBatchConfig::from_policy::<MoonshineFamily>(policy)
+    }
+
+    #[cfg(test)]
     fn from_env() -> Result<Option<Self>, MoonshineServeBatchError> {
-        ServeBatchConfig::read_env::<MoonshineFamily>()
+        ServeBatchConfig::from_test_env::<MoonshineFamily>()
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct MoonshineServeBatchJob {
     pub runtime_cache_path: PathBuf,
+    pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub uses_scheduler: bool,
     pub prepared_runtime: Arc<MoonshinePreparedRuntime>,
@@ -76,7 +83,8 @@ pub(crate) struct MoonshineServeBatchJob {
 
 #[derive(Debug, Error)]
 pub(crate) enum MoonshineServeBatchError {
-    #[error("moonshine serve batch env {env} must be an integer in 0..={max}, got '{raw}'")]
+    #[cfg(test)]
+    #[error("moonshine serve batch test env {env} must be an integer in 0..={max}, got '{raw}'")]
     InvalidEnv {
         env: &'static str,
         raw: String,
@@ -118,7 +126,7 @@ impl MoonshineServeBatchError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct MoonshineServeBatchEngineKey {
-    runtime_cache_path: PathBuf,
+    build_identity: crate::RuntimeBuildIdentity,
     backend: GgmlCpuGraphBackend,
     frame_count: usize,
     hidden_size: usize,
@@ -148,6 +156,11 @@ pub(super) fn submit_moonshine_serve_batch_job(
     let config = config.validate_for_job::<MoonshineFamily>(&job)?;
     let key = MoonshineFamily::engine_key(&job, config.max_batch);
     serve_batch_engine_for_key(&MOONSHINE_SERVE_BATCH_ENGINES, key, config)?.submit(job)
+}
+
+pub(super) fn shutdown_moonshine_serve_batch_engines() {
+    let _ = crate::bump_runtime_build_generation();
+    shutdown_and_remove_serve_batch_engines(&MOONSHINE_SERVE_BATCH_ENGINES);
 }
 
 fn moonshine_serve_batch_vram_slot_bytes(job: &MoonshineServeBatchJob) -> usize {
@@ -249,7 +262,7 @@ impl Seq2SeqServeBatchFamily for MoonshineFamily {
 
     fn engine_key(job: &Self::Job, max_batch: usize) -> Self::EngineKey {
         MoonshineServeBatchEngineKey {
-            runtime_cache_path: job.runtime_cache_path.clone(),
+            build_identity: job.build_identity.clone(),
             backend: job.backend,
             frame_count: job.encoder_output.frame_count,
             hidden_size: job.encoder_output.hidden_size,
@@ -364,7 +377,8 @@ impl Seq2SeqServeBatchFamily for MoonshineFamily {
         MoonshineServeBatchError::OwnerFailed { reason }
     }
 
-    fn invalid_env(env: &'static str, raw: String, max: usize) -> Self::Error {
+    #[cfg(test)]
+    fn invalid_test_env(env: &'static str, raw: String, max: usize) -> Self::Error {
         MoonshineServeBatchError::InvalidEnv { env, raw, max }
     }
 
@@ -399,7 +413,9 @@ impl Seq2SeqServeBatchFamily for MoonshineFamily {
 
 impl MoonshineServeBatchJob {
     fn can_batch_with(&self, other: &Self) -> bool {
-        self.decode_config.initial_prompt_tokens == other.decode_config.initial_prompt_tokens
+        self.build_identity == other.build_identity
+            && self.runtime_cache_path == other.runtime_cache_path
+            && self.decode_config.initial_prompt_tokens == other.decode_config.initial_prompt_tokens
             && self.decode_config.eot_token_id == other.decode_config.eot_token_id
             && self.decode_config.vocab_size == other.decode_config.vocab_size
             && self.prepared_runtime.metadata.decoder_max_context
@@ -835,6 +851,12 @@ mod tests {
         };
         MoonshineServeBatchJob {
             runtime_cache_path: runtime_path.to_path_buf(),
+            build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
+                None,
+                "moonshine:test",
+                "adapter=none",
+                crate::RuntimeBuildIdentity::provisional_content_id_for_path(runtime_path),
+            ),
             backend,
             uses_scheduler,
             prepared_runtime,
@@ -996,6 +1018,12 @@ mod tests {
             };
             MoonshineServeBatchJob {
                 runtime_cache_path: runtime_path.to_path_buf(),
+                build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
+                    None,
+                    "moonshine:test",
+                    "adapter=none",
+                    crate::RuntimeBuildIdentity::provisional_content_id_for_path(&runtime_path),
+                ),
                 backend: runtime_config.backend,
                 uses_scheduler: runtime_config.use_scheduler,
                 prepared_runtime: Arc::clone(&prepared_runtime),

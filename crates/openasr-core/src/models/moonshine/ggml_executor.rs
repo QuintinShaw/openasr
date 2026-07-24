@@ -5,8 +5,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use super::batched_decode::{
-    MoonshineServeBatchConfig, MoonshineServeBatchConfigFromEnv, MoonshineServeBatchJob,
-    moonshine_serve_batch_decode_config, submit_moonshine_serve_batch_job,
+    MoonshineServeBatchConfig, MoonshineServeBatchConfigFromPolicy, MoonshineServeBatchJob,
+    moonshine_serve_batch_decode_config, shutdown_moonshine_serve_batch_engines,
+    submit_moonshine_serve_batch_job,
 };
 use super::decoder_graph::{MoonshineDecoderGraphError, run_moonshine_decoder_short_form};
 use super::encoder_graph::{
@@ -130,11 +131,8 @@ impl MoonshineGgmlExecutor {
         .map_err(map_encoder_error)?;
 
         let audio_duration = audio_duration_seconds(&request.prepared_audio);
-        let serve_batch_config = MoonshineServeBatchConfig::from_env().map_err(|error| {
-            MoonshineGgmlExecutorError::DecoderFailed {
-                reason: error.to_string(),
-            }
-        })?;
+        let serve_batch_config =
+            MoonshineServeBatchConfig::from_server_policy(request.request_options.serve_batch);
         let decoder_config = moonshine_decoder_graph_config(false);
         let can_use_serve_batch = can_use_moonshine_serve_batch(
             skip_serve_batch,
@@ -153,32 +151,39 @@ impl MoonshineGgmlExecutor {
                     reason: error.to_string(),
                 })?;
                 submit_moonshine_serve_batch_job(
-                    serve_batch_config,
-                    MoonshineServeBatchJob {
-                        runtime_cache_path: canonical_runtime_cache_path(
+                serve_batch_config,
+                MoonshineServeBatchJob {
+                    runtime_cache_path: canonical_runtime_cache_path(
+                        preflight.runtime_source.path(),
+                    ),
+                    build_identity:
+                        crate::models::ggml_asr_executor::serve_batch_build_identity_for_request(
+                            &request.request_options,
+                            "moonshine",
+                            decoder_config.backend,
                             preflight.runtime_source.path(),
                         ),
-                        backend: decoder_config.backend,
-                        uses_scheduler: decoder_config.use_scheduler,
-                        prepared_runtime: Arc::clone(&prepared_runtime),
-                        // Moved (not cloned): this branch is the last use of
-                        // `encoder_output` -- the `else` branch below only
-                        // borrows it, and nothing reads it after the if/else.
-                        encoder_output,
-                        decode_config,
-                        word_timestamps: request.request_options.word_timestamps,
-                        audio_duration_seconds: audio_duration,
-                    },
-                )
-                .map_err(|error| match error.unavailable_retryable() {
-                    Some(retryable) => MoonshineGgmlExecutorError::ServeBatchUnavailable {
-                        reason: error.to_string(),
-                        retryable,
-                    },
-                    None => MoonshineGgmlExecutorError::DecoderFailed {
-                        reason: error.to_string(),
-                    },
-                })?
+                    backend: decoder_config.backend,
+                    uses_scheduler: decoder_config.use_scheduler,
+                    prepared_runtime: Arc::clone(&prepared_runtime),
+                    // Moved (not cloned): this branch is the last use of
+                    // `encoder_output` -- the `else` branch below only
+                    // borrows it, and nothing reads it after the if/else.
+                    encoder_output,
+                    decode_config,
+                    word_timestamps: request.request_options.word_timestamps,
+                    audio_duration_seconds: audio_duration,
+                },
+            )
+            .map_err(|error| match error.unavailable_retryable() {
+                Some(retryable) => MoonshineGgmlExecutorError::ServeBatchUnavailable {
+                    reason: error.to_string(),
+                    retryable,
+                },
+                None => MoonshineGgmlExecutorError::DecoderFailed {
+                    reason: error.to_string(),
+                },
+            })?
             } else {
                 run_moonshine_decoder_short_form(
                     &prepared_runtime.decoder_weights,
@@ -285,6 +290,7 @@ impl GgmlAsrExecutor for MoonshineGgmlExecutor {
     }
 
     fn unload_idle_state(&self) {
+        shutdown_moonshine_serve_batch_engines();
         self.runtime_cache_by_path.clear();
     }
 }
@@ -339,6 +345,7 @@ impl GgmlAsrStreamingExecutor for MoonshineGgmlExecutor {
     }
 
     fn unload_idle_state(&self) {
+        shutdown_moonshine_serve_batch_engines();
         self.runtime_cache_by_path.clear();
     }
 }

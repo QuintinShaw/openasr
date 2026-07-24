@@ -36,6 +36,122 @@ impl GgmlAsrBackendPreference {
     }
 }
 
+/// Stable cache/engine identity for reusable native runtime state.
+///
+/// The pack resolver owns the content proof (`pack_content_id`). This crate
+/// never invents a file hash: until the verified pack-content coordinator lands
+/// (#38), callers may pass an explicit verified id, a test fake id, or the
+/// provisional `unverified:{path}` binding produced by
+/// [`RuntimeBuildIdentity::resolve_for_request`]. Path alone is never a cache
+/// key without the surrounding route/options/generation fields.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RuntimeBuildIdentity {
+    /// Immutable content identity from the verified pack resolver (or an
+    /// explicit provisional/fake binding while that resolver is unfinished).
+    pub pack_content_id: String,
+    /// Resolved execution route (family + backend lane) that owns the reusable
+    /// graph shape.
+    pub route: String,
+    /// Adapter/options fingerprint that changes the lowered graph without
+    /// changing pack bytes (for example an active `.oadp` adapter path).
+    pub options_fingerprint: String,
+    /// Invalidation generation from the runtime owner. Idle unload and model
+    /// reload bump this even when pack bytes and route are unchanged.
+    pub generation: u64,
+}
+
+static RUNTIME_BUILD_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Current process-wide runtime-build generation observed by cache keys.
+pub fn current_runtime_build_generation() -> u64 {
+    RUNTIME_BUILD_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Bumps the process-wide runtime-build generation and returns the new value.
+/// Idle unload / invalidation seams call this before dropping cached engines so
+/// a later same-path request cannot silently reuse a drained owner.
+pub fn bump_runtime_build_generation() -> u64 {
+    RUNTIME_BUILD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+impl RuntimeBuildIdentity {
+    pub fn new(
+        pack_content_id: impl Into<String>,
+        route: impl Into<String>,
+        options_fingerprint: impl Into<String>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            pack_content_id: pack_content_id.into(),
+            route: route.into(),
+            options_fingerprint: options_fingerprint.into(),
+            generation,
+        }
+    }
+
+    /// Builds the effective identity for one offline request.
+    ///
+    /// Prefer an explicit verified/fake content id from the request when present.
+    /// Otherwise bind a provisional `unverified:{canonical-path}` content id so
+    /// the engine key still carries route/options/generation and never collapses
+    /// to path-only equality. The eventual pack-content coordinator replaces the
+    /// content-id source without changing this seam.
+    pub fn resolve_for_request(
+        request_identity: Option<&RuntimeBuildIdentity>,
+        route: impl Into<String>,
+        options_fingerprint: impl Into<String>,
+        provisional_content_id: impl Into<String>,
+    ) -> Self {
+        let route = route.into();
+        let options_fingerprint = options_fingerprint.into();
+        match request_identity {
+            Some(identity) => Self {
+                pack_content_id: identity.pack_content_id.clone(),
+                route,
+                options_fingerprint,
+                generation: identity.generation,
+            },
+            None => Self {
+                pack_content_id: provisional_content_id.into(),
+                route,
+                options_fingerprint,
+                generation: current_runtime_build_generation(),
+            },
+        }
+    }
+
+    pub fn provisional_content_id_for_path(path: &std::path::Path) -> String {
+        format!("unverified:{}", path.display())
+    }
+}
+
+/// Builds the effective serve-batch / runtime-cache identity for one request.
+pub(crate) fn serve_batch_build_identity_for_request(
+    options: &GgmlAsrExecutionOptions,
+    family: &str,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    runtime_path: &std::path::Path,
+) -> RuntimeBuildIdentity {
+    let options_fingerprint = match options.adapter_path.as_ref() {
+        Some(path) => format!("adapter={}", path.display()),
+        None => "adapter=none".to_string(),
+    };
+    RuntimeBuildIdentity::resolve_for_request(
+        options.runtime_build_identity.as_ref(),
+        format!("{family}:{backend:?}"),
+        options_fingerprint,
+        RuntimeBuildIdentity::provisional_content_id_for_path(runtime_path),
+    )
+}
+
+/// Supplies a verified runtime identity to cache-owning execution components.
+/// The pack resolver owns the content proof; consumers only carry it through
+/// keys and invalidate on a generation change.
+pub trait RuntimeBuildIdentitySource {
+    fn runtime_build_identity(&self) -> Option<RuntimeBuildIdentity>;
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GgmlAsrPreparedAudio {
     pub sample_rate_hz: u32,
@@ -86,13 +202,27 @@ pub struct GgmlAsrExecutionOptions {
     pub longform: Option<LongFormOptions>,
     pub longform_chunk_count_hint: Option<usize>,
     /// Set from the architecture descriptor when the arch signals that multi-chunk
-    /// longform on Metal should prefer the CPU decoder path.  Avoids per-executor
+    /// longform on Metal should prefer the CPU decoder path. Avoids per-executor
     /// re-derivation of this policy flag.
     pub prefer_cpu_decoder_for_multichunk_metal: bool,
+    /// Server-owned offline batching policy. The CLI and every non-server call
+    /// retain `serial`; only the server derives this from its native-session
+    /// admission limit.
+    pub(crate) serve_batch: crate::models::serve_batch_env::ServeBatchPolicy,
+    /// Verified cache identity for reusable native runtime state. Absent until
+    /// the pack-content resolver supplies one; executors must not substitute a
+    /// path-only identity.
+    pub runtime_build_identity: Option<RuntimeBuildIdentity>,
     /// OADP Phase 0: request-level `.oadp` adapter pack path (CLI `--adapter`
     /// plumbs it here). `None` falls back to the server-side `OPENASR_ADAPTER`
     /// process environment variable.
     pub adapter_path: Option<PathBuf>,
+}
+
+impl RuntimeBuildIdentitySource for GgmlAsrExecutionOptions {
+    fn runtime_build_identity(&self) -> Option<RuntimeBuildIdentity> {
+        self.runtime_build_identity.clone()
+    }
 }
 
 impl GgmlAsrExecutionOptions {
@@ -123,6 +253,8 @@ impl GgmlAsrExecutionOptions {
             longform,
             longform_chunk_count_hint: None,
             prefer_cpu_decoder_for_multichunk_metal: false,
+            serve_batch: crate::models::serve_batch_env::ServeBatchPolicy::serial(),
+            runtime_build_identity: None,
             adapter_path: None,
         }
     }
@@ -612,6 +744,62 @@ mod tests {
     use crate::models::ggml_family_registry::QWEN3_ASR_GGML_ADAPTER_ID;
     use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
     use crate::{qwen3_asr_runtime_descriptor_v1, whisper_runtime_descriptor_v1};
+
+    #[test]
+    fn runtime_build_identity_separates_same_route_content_replacements() {
+        let route = "whisper:metal:base";
+        let options = "adapter=none";
+        let first = RuntimeBuildIdentity::new("verified-content-a", route, options, 7);
+        let replacement = RuntimeBuildIdentity::new("verified-content-b", route, options, 7);
+        assert_ne!(
+            first, replacement,
+            "same path/route must not reuse replacement content"
+        );
+        assert_ne!(
+            first,
+            RuntimeBuildIdentity::new("verified-content-a", route, options, 8),
+            "invalidation generation must rebuild the engine"
+        );
+        assert_ne!(
+            first,
+            RuntimeBuildIdentity::new("verified-content-a", route, "adapter=/tmp/a.oadp", 7),
+            "adapter/options fingerprint must rebuild the engine"
+        );
+        let before = current_runtime_build_generation();
+        let after = bump_runtime_build_generation();
+        assert!(after > before);
+    }
+
+    #[test]
+    fn runtime_build_identity_resolve_prefers_verified_content_over_path_binding() {
+        let verified = RuntimeBuildIdentity::new("verified-content-a", "old", "old", 3);
+        let resolved = RuntimeBuildIdentity::resolve_for_request(
+            Some(&verified),
+            "whisper:gpu",
+            "adapter=none",
+            RuntimeBuildIdentity::provisional_content_id_for_path(std::path::Path::new(
+                "/same/path.oasr",
+            )),
+        );
+        assert_eq!(resolved.pack_content_id, "verified-content-a");
+        assert_eq!(resolved.route, "whisper:gpu");
+        assert_eq!(resolved.options_fingerprint, "adapter=none");
+        assert_eq!(resolved.generation, 3);
+
+        let provisional = RuntimeBuildIdentity::resolve_for_request(
+            None,
+            "whisper:gpu",
+            "adapter=none",
+            RuntimeBuildIdentity::provisional_content_id_for_path(std::path::Path::new(
+                "/same/path.oasr",
+            )),
+        );
+        assert_eq!(provisional.pack_content_id, "unverified:/same/path.oasr");
+        assert_ne!(
+            RuntimeBuildIdentity::new("verified-content-b", "whisper:gpu", "adapter=none", 3),
+            RuntimeBuildIdentity::new("verified-content-a", "whisper:gpu", "adapter=none", 3),
+        );
+    }
 
     fn whisper_request(backend_preference: GgmlAsrBackendPreference) -> GgmlAsrExecutionRequest {
         GgmlAsrExecutionRequest {

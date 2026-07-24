@@ -2277,12 +2277,14 @@ async fn native_audio_preparation_does_not_consume_model_capacity() {
     };
     let request_runtime = runtime.clone();
     let request = TranscriptionRequest::new(input_path, "whisper-large-v3-turbo");
-    let runtime_handle = tokio::runtime::Handle::current();
-    let request_task = tokio::task::spawn_blocking(move || {
-        runtime_handle.block_on(transcribe_with_runtime(request_runtime, request, None))
-    });
+    // Drive the native path as an async task. Nesting `spawn_blocking` +
+    // `block_on` here starves the blocking pool under a full nextest run
+    // (the native path already uses `spawn_blocking` for preparation), so the
+    // converter never starts within the wait window.
+    let request_task =
+        tokio::spawn(async move { transcribe_with_runtime(request_runtime, request, None).await });
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while !started_path.exists() {
         assert!(
             tokio::time::Instant::now() < deadline,

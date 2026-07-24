@@ -36,11 +36,12 @@ use crate::models::seq2seq_greedy_decode::{
 use crate::models::seq2seq_serve_batch::{Envelope, OwnerThreadState};
 use crate::models::seq2seq_serve_batch::{
     Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig, ServeBatchEngine,
-    serve_batch_engine_for_key,
+    serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
-    serve_batch_estimate_seq2seq_slot_bytes, serve_batch_select_and_apply_greedy_step,
+    ServeBatchPolicy, serve_batch_estimate_seq2seq_slot_bytes,
+    serve_batch_select_and_apply_greedy_step,
 };
 
 const WHISPER_SERVE_BATCH_MAX_BATCH_LIMIT: usize = 8;
@@ -54,22 +55,28 @@ static WHISPER_SERVE_BATCH_ENGINES: OnceLock<
 /// unchanged.
 pub(super) type WhisperServeBatchConfig = ServeBatchConfig;
 
-/// Lets `WhisperServeBatchConfig::from_env()` resolve to the generic
-/// `ServeBatchConfig::from_env::<WhisperFamily>()` without a turbofish at the
-/// call site. Scoped per family module so the method name is unambiguous.
-pub(super) trait WhisperServeBatchConfigFromEnv: Sized {
+/// Resolves the shared server policy without exposing the generic family marker.
+pub(super) trait WhisperServeBatchConfigFromPolicy: Sized {
+    fn from_server_policy(policy: ServeBatchPolicy) -> Option<Self>;
+    #[cfg(test)]
     fn from_env() -> Result<Option<Self>, WhisperServeBatchError>;
 }
 
-impl WhisperServeBatchConfigFromEnv for WhisperServeBatchConfig {
+impl WhisperServeBatchConfigFromPolicy for WhisperServeBatchConfig {
+    fn from_server_policy(policy: ServeBatchPolicy) -> Option<Self> {
+        ServeBatchConfig::from_policy::<WhisperFamily>(policy)
+    }
+
+    #[cfg(test)]
     fn from_env() -> Result<Option<Self>, WhisperServeBatchError> {
-        ServeBatchConfig::read_env::<WhisperFamily>()
+        ServeBatchConfig::from_test_env::<WhisperFamily>()
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct WhisperServeBatchJob {
     pub runtime_cache_path: PathBuf,
+    pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub uses_scheduler: bool,
     pub execution: WhisperGgmlExecutionMetadata,
@@ -86,7 +93,8 @@ pub(crate) struct WhisperServeBatchJob {
 
 #[derive(Debug, Error)]
 pub(crate) enum WhisperServeBatchError {
-    #[error("whisper serve batch env {env} must be an integer in 0..={max}, got '{raw}'")]
+    #[cfg(test)]
+    #[error("whisper serve batch test env {env} must be an integer in 0..={max}, got '{raw}'")]
     InvalidEnv {
         env: &'static str,
         raw: String,
@@ -128,7 +136,7 @@ impl WhisperServeBatchError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct WhisperServeBatchEngineKey {
-    runtime_cache_path: PathBuf,
+    build_identity: crate::RuntimeBuildIdentity,
     backend: GgmlCpuGraphBackend,
     frame_count: usize,
     hidden_size: usize,
@@ -172,6 +180,11 @@ pub(super) fn submit_whisper_serve_batch_job(
     let config = config.validate_for_job::<WhisperFamily>(&job)?;
     let key = WhisperFamily::engine_key(&job, config.max_batch);
     serve_batch_engine_for_key(&WHISPER_SERVE_BATCH_ENGINES, key, config)?.submit(job)
+}
+
+pub(super) fn shutdown_whisper_serve_batch_engines() {
+    let _ = crate::bump_runtime_build_generation();
+    shutdown_and_remove_serve_batch_engines(&WHISPER_SERVE_BATCH_ENGINES);
 }
 
 fn whisper_serve_batch_vram_slot_bytes(job: &WhisperServeBatchJob) -> usize {
@@ -395,7 +408,7 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
 
     fn engine_key(job: &Self::Job, max_batch: usize) -> Self::EngineKey {
         WhisperServeBatchEngineKey {
-            runtime_cache_path: job.runtime_cache_path.clone(),
+            build_identity: job.build_identity.clone(),
             backend: job.backend,
             frame_count: job.encoder_frames,
             hidden_size: job.encoder_hidden_size,
@@ -556,7 +569,8 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
         WhisperServeBatchError::OwnerFailed { reason }
     }
 
-    fn invalid_env(env: &'static str, raw: String, max: usize) -> Self::Error {
+    #[cfg(test)]
+    fn invalid_test_env(env: &'static str, raw: String, max: usize) -> Self::Error {
         WhisperServeBatchError::InvalidEnv { env, raw, max }
     }
 
@@ -591,10 +605,13 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
 
 impl WhisperServeBatchJob {
     fn can_batch_with(&self, other: &Self) -> bool {
-        whisper_serve_decode_configs_can_share_fixed_bucket(
-            &self.decode_config,
-            &other.decode_config,
-        ) && self.execution == other.execution
+        self.build_identity == other.build_identity
+            && self.runtime_cache_path == other.runtime_cache_path
+            && whisper_serve_decode_configs_can_share_fixed_bucket(
+                &self.decode_config,
+                &other.decode_config,
+            )
+            && self.execution == other.execution
     }
 }
 
@@ -1085,6 +1102,12 @@ mod tests {
             sample_encoder_hidden(&execution, encoder_phase);
         WhisperServeBatchJob {
             runtime_cache_path: runtime_path.to_path_buf(),
+            build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
+                None,
+                "whisper:test",
+                "adapter=none",
+                crate::RuntimeBuildIdentity::provisional_content_id_for_path(runtime_path),
+            ),
             backend,
             uses_scheduler,
             execution,
