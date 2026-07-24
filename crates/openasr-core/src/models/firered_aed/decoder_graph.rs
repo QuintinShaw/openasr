@@ -865,6 +865,13 @@ pub(crate) fn run_firered_aed_decoder_greedy_with_runtime(
                 generated_probabilities: Vec::new(),
             }
         }
+        // Preserve the stable cancel marker so native/server boundaries can
+        // rewrite to `BackendError::TranscriptionCanceled`.
+        Err(Seq2SeqGreedyDecodeError::Canceled) => {
+            return Err(FireRedDecoderError::InvalidInput {
+                reason: Seq2SeqGreedyDecodeError::Canceled.to_string(),
+            });
+        }
         Err(error) => {
             return Err(FireRedDecoderError::InvalidInput {
                 reason: error.to_string(),

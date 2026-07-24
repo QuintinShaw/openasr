@@ -639,6 +639,13 @@ impl Qwen3AsrGgmlExecutor {
                     .to_string();
                 (text, generated_tokens, generated_probabilities)
             }
+            // Preserve typed cancel identity through the stringified executor
+            // boundary via the stable "canceled by transcription control" marker.
+            Err(Qwen3AsrGreedyDecodeError::Canceled) => {
+                return Err(Qwen3AsrGgmlExecutorError::GreedyDecodeFailed {
+                    reason: Qwen3AsrGreedyDecodeError::Canceled.to_string(),
+                });
+            }
             Err(error) => {
                 return Err(Qwen3AsrGgmlExecutorError::GreedyDecodeFailed {
                     reason: error.to_string(),

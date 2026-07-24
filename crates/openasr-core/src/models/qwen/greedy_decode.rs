@@ -58,6 +58,8 @@ pub(crate) enum Qwen3AsrGreedyDecodeError {
     DecoderStepFailed { reason: String },
     #[error("qwen3-asr greedy decode tokenizer decode failed: {reason}")]
     TokenizerDecodeFailed { reason: String },
+    #[error("qwen3-asr greedy decode canceled by transcription control")]
+    Canceled,
 }
 
 pub(crate) fn run_qwen3_greedy_decode_loop(
@@ -133,6 +135,7 @@ fn map_qwen_error_to_shared(error: Qwen3AsrGreedyDecodeError) -> Seq2SeqGreedyDe
         Qwen3AsrGreedyDecodeError::TokenizerDecodeFailed { reason } => {
             Seq2SeqGreedyDecodeError::TokenizerDecodeFailed { reason }
         }
+        Qwen3AsrGreedyDecodeError::Canceled => Seq2SeqGreedyDecodeError::Canceled,
     }
 }
 
@@ -184,6 +187,7 @@ fn map_shared_error(error: Seq2SeqGreedyDecodeError) -> Qwen3AsrGreedyDecodeErro
         Seq2SeqGreedyDecodeError::TokenizerDecodeFailed { reason } => {
             Qwen3AsrGreedyDecodeError::TokenizerDecodeFailed { reason }
         }
+        Seq2SeqGreedyDecodeError::Canceled => Qwen3AsrGreedyDecodeError::Canceled,
     }
 }
 

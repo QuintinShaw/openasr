@@ -5395,6 +5395,11 @@ fn map_greedy_decode_error(error: WhisperGreedyDecodeError) -> WhisperGgmlExecut
         } => WhisperGgmlExecutorError::DecoderNoEotBeforeMaxTokens {
             max_generated_tokens,
         },
+        // Keep the stable cancel marker in the reason string so
+        // `dispatch_error_to_backend` can rewrite to TranscriptionCanceled.
+        WhisperGreedyDecodeError::Canceled => WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
+            reason: WhisperGreedyDecodeError::Canceled.to_string(),
+        },
         WhisperGreedyDecodeError::TokenizerDecodeFailed { .. }
         | WhisperGreedyDecodeError::SelectedTokenOutOfVocab { .. }
         | WhisperGreedyDecodeError::EmptyInitialPrompt

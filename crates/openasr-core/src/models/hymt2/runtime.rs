@@ -1650,20 +1650,25 @@ impl Seq2SeqGreedyDecodeStepExecutor for Hymt2SharedGreedyStepExecutor<'_> {
 /// outcome when the decode reaches its output budget
 /// (`max_output_tokens_for_source_tokens`) before a stop token -- the caller
 /// degrades to the generated prefix instead of failing the clause.
+/// `Canceled` is the L1 cooperative cancel from the shared greedy driver.
 enum Hymt2SharedDecodeError {
     Truncated { generated_tokens: Vec<u32> },
+    Canceled,
     Runtime(Hymt2RuntimeError),
 }
 
 fn map_hymt2_family_error_to_shared(error: Hymt2SharedDecodeError) -> Seq2SeqGreedyDecodeError {
-    Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
-        reason: match error {
-            Hymt2SharedDecodeError::Runtime(error) => error.to_string(),
-            // Unreachable: the token-decoder closure only fails with Runtime.
-            Hymt2SharedDecodeError::Truncated { .. } => {
-                "Hy-MT2 token decoder reported truncation".to_string()
-            }
+    match error {
+        Hymt2SharedDecodeError::Canceled => Seq2SeqGreedyDecodeError::Canceled,
+        Hymt2SharedDecodeError::Runtime(error) => Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
+            reason: error.to_string(),
         },
+        // Unreachable: the token-decoder closure only fails with Runtime.
+        Hymt2SharedDecodeError::Truncated { .. } => {
+            Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
+                reason: "Hy-MT2 token decoder reported truncation".to_string(),
+            }
+        }
     }
 }
 
@@ -1672,6 +1677,7 @@ fn map_shared_error_to_hymt2(error: Seq2SeqGreedyDecodeError) -> Hymt2SharedDeco
         Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {
             generated_tokens, ..
         } => Hymt2SharedDecodeError::Truncated { generated_tokens },
+        Seq2SeqGreedyDecodeError::Canceled => Hymt2SharedDecodeError::Canceled,
         other => Hymt2SharedDecodeError::Runtime(Hymt2RuntimeError::Decode {
             reason: other.to_string(),
         }),
@@ -1737,6 +1743,11 @@ fn run_hymt2_shared_greedy_decode(
                 .to_string();
             Ok((generated_tokens, text))
         }
+        Err(Hymt2SharedDecodeError::Canceled) => Err(Hymt2RuntimeError::Decode {
+            // Stable marker consumed by `dispatch_error_to_backend` so cancel
+            // becomes `BackendError::TranscriptionCanceled` end-to-end.
+            reason: Seq2SeqGreedyDecodeError::Canceled.to_string(),
+        }),
         Err(Hymt2SharedDecodeError::Runtime(error)) => Err(error),
     }
 }

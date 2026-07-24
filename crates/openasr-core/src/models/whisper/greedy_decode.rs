@@ -60,6 +60,8 @@ pub(crate) enum WhisperGreedyDecodeError {
     DecoderStepFailed { reason: String },
     #[error("whisper greedy decode tokenizer decode failed: {reason}")]
     TokenizerDecodeFailed { reason: String },
+    #[error("whisper greedy decode canceled by transcription control")]
+    Canceled,
 }
 
 pub(crate) fn run_whisper_greedy_decode_loop(
@@ -135,6 +137,7 @@ fn map_whisper_error_to_shared(error: WhisperGreedyDecodeError) -> Seq2SeqGreedy
         WhisperGreedyDecodeError::TokenizerDecodeFailed { reason } => {
             Seq2SeqGreedyDecodeError::TokenizerDecodeFailed { reason }
         }
+        WhisperGreedyDecodeError::Canceled => Seq2SeqGreedyDecodeError::Canceled,
     }
 }
 
@@ -186,6 +189,7 @@ fn map_shared_error(error: Seq2SeqGreedyDecodeError) -> WhisperGreedyDecodeError
         Seq2SeqGreedyDecodeError::TokenizerDecodeFailed { reason } => {
             WhisperGreedyDecodeError::TokenizerDecodeFailed { reason }
         }
+        Seq2SeqGreedyDecodeError::Canceled => WhisperGreedyDecodeError::Canceled,
     }
 }
 

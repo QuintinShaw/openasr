@@ -1330,10 +1330,12 @@ fn run_native_transcription_impl(
             // In-session pause/cancel control for this in-flight transcription,
             // bound to this decode thread by the caller (see
             // `install_active_transcription_control`). Checked at each slice
-            // boundary: a cancel unwinds cleanly with `TranscriptionCanceled`
+            // boundary (L0): a cancel unwinds cleanly with `TranscriptionCanceled`
             // (dropping the assembler and progress guard), and a pause blocks the
-            // worker here until resume or cancel. Absent (CLI / no control
-            // registered) leaves the decode byte-identical to before.
+            // worker here until resume or cancel. The shared seq2seq greedy driver
+            // also polls cancel at each token step (L1) so cancel does not wait
+            // for the end of a long slice. Absent (CLI / no control registered)
+            // leaves the decode byte-identical to before.
             let transcription_control =
                 super::transcription_control::current_transcription_control();
             let mut slice_index = 0usize;
@@ -2191,6 +2193,18 @@ fn map_family_selection_error(error: GgmlFamilyRegistrySelectionError) -> Backen
 }
 
 fn dispatch_error_to_backend(error: GgmlAsrExecutionError) -> BackendError {
+    // L1 cooperative cancel (token-loop) and L0 slice cancel both leave the
+    // active control flagged. Prefer the typed cancel surface over a generic
+    // fail-closed reason so CLI/native and server agree on
+    // `BackendError::TranscriptionCanceled` (HTTP 409). Also recognize the
+    // stable cancel marker embedded in family executor reason strings in case
+    // the thread-local control was already cleared by an outer guard.
+    if super::transcription_control::current_transcription_control()
+        .is_some_and(|control| control.is_canceled())
+        || is_cooperative_cancel_reason(&error.to_string())
+    {
+        return BackendError::TranscriptionCanceled;
+    }
     match error {
         GgmlAsrExecutionError::ExecutorUnavailable { .. } => BackendError::NativeFailClosed {
             reason: format!(
@@ -2220,6 +2234,14 @@ fn dispatch_error_to_backend(error: GgmlAsrExecutionError) -> BackendError {
             }
         }
     }
+}
+
+/// Stable substring shared by `Seq2SeqGreedyDecodeError::Canceled` and the
+/// family greedy bridges (`"... canceled by transcription control"`). Used as
+/// a belt-and-suspenders signal when the active control handle is no longer
+/// bound on this thread.
+fn is_cooperative_cancel_reason(reason: &str) -> bool {
+    reason.contains("canceled by transcription control")
 }
 
 fn run_dispatch_once(

@@ -10,6 +10,7 @@ mod native;
 mod request_context;
 
 pub use mock::transcribe_with_mock_backend;
+pub(crate) use native::current_transcription_control;
 pub use native::{
     ActiveTranscriptionControlGuard, NativeBackend, NativeBackendExecutor,
     NativeRuntimeModelAdapter, NativeRuntimeModelIdSource, NativeRuntimeModelIdentity,
@@ -877,7 +878,7 @@ pub enum BackendError {
     )]
     ServeBatchUnavailable { reason: String, retryable: bool },
     #[error(
-        "Native ASR Core transcription was canceled at a slice boundary before completion.\nThe already-decoded portion was discarded; no partial transcript is returned."
+        "Native ASR Core transcription was canceled before completion.\nThe already-decoded portion was discarded; no partial transcript is returned."
     )]
     TranscriptionCanceled,
     #[error(

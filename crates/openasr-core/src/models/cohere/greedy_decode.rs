@@ -58,6 +58,8 @@ pub(crate) enum CohereTranscribeGreedyDecodeError {
     DecoderStepFailed { reason: String },
     #[error("cohere-transcribe greedy decode tokenizer decode failed: {reason}")]
     TokenizerDecodeFailed { reason: String },
+    #[error("cohere-transcribe greedy decode canceled by transcription control")]
+    Canceled,
 }
 
 pub(crate) fn run_cohere_transcribe_greedy_decode_loop(
@@ -135,6 +137,7 @@ fn map_cohere_error_to_shared(
         CohereTranscribeGreedyDecodeError::TokenizerDecodeFailed { reason } => {
             Seq2SeqGreedyDecodeError::TokenizerDecodeFailed { reason }
         }
+        CohereTranscribeGreedyDecodeError::Canceled => Seq2SeqGreedyDecodeError::Canceled,
     }
 }
 
@@ -186,6 +189,7 @@ fn map_shared_error(error: Seq2SeqGreedyDecodeError) -> CohereTranscribeGreedyDe
         Seq2SeqGreedyDecodeError::TokenizerDecodeFailed { reason } => {
             CohereTranscribeGreedyDecodeError::TokenizerDecodeFailed { reason }
         }
+        Seq2SeqGreedyDecodeError::Canceled => CohereTranscribeGreedyDecodeError::Canceled,
     }
 }
 

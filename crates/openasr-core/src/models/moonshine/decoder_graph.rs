@@ -224,6 +224,13 @@ fn run_moonshine_decoder_short_form_with_runtime(
             generated_tokens,
             generated_probabilities,
         },
+        // Preserve the stable cancel marker so native/server boundaries can
+        // rewrite to `BackendError::TranscriptionCanceled`.
+        Err(Seq2SeqGreedyDecodeError::Canceled) => {
+            return Err(MoonshineDecoderGraphError::InvalidInput {
+                reason: Seq2SeqGreedyDecodeError::Canceled.to_string(),
+            });
+        }
         Err(error) => {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: error.to_string(),

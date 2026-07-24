@@ -58,6 +58,10 @@ pub use transcription_control::{
     ActiveTranscriptionControlGuard, SliceBoundaryControl, TranscriptionControl,
     install_active_transcription_control,
 };
+// Used by the shared seq2seq greedy driver (L1 cooperative cancel) and any other
+// crate-internal decode loop that must observe in-flight cancel without a
+// threaded handle. Not part of the public API surface.
+pub(crate) use transcription_control::current_transcription_control;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NativeBackend;

@@ -159,6 +159,15 @@ pub(crate) enum Seq2SeqGreedyDecodeError {
     DecoderStepFailed { reason: String },
     #[error("seq2seq greedy decode tokenizer decode failed: {reason}")]
     TokenizerDecodeFailed { reason: String },
+    /// Cooperative cancel observed at a token-step boundary via the active
+    /// [`crate::api::backend::TranscriptionControl`]. Distinct from a
+    /// graph/compute failure so callers can map it to
+    /// [`crate::BackendError::TranscriptionCanceled`] rather than a generic
+    /// fail-closed refusal. Pause is intentionally NOT handled here -- pause
+    /// still only blocks at the long-form slice boundary (L0) so a live
+    /// decode does not hold GPU/CPU arenas mid-utterance.
+    #[error("seq2seq greedy decode canceled by transcription control")]
+    Canceled,
 }
 
 pub(crate) trait Seq2SeqGreedyDecodeStepExecutor {
@@ -249,6 +258,16 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
     let mut reached_eot = false;
 
     for step_index in 0..config.max_generated_tokens {
+        // L1 cooperative cancel: poll the active transcription control before
+        // each decoder step so cancel lands at a token boundary instead of
+        // waiting for the long-form slice boundary (L0). Pause is not blocked
+        // here -- holding the decode mid-token with live arenas is unsafe /
+        // wasteful; pause stays L0-only.
+        if crate::api::backend::current_transcription_control()
+            .is_some_and(|control| control.is_canceled())
+        {
+            return Err(Seq2SeqGreedyDecodeError::Canceled);
+        }
         let step_input = Seq2SeqGreedyDecodeStepInput {
             initial_prompt_tokens: &config.initial_prompt_tokens,
             generated_tokens: &generated,
@@ -1339,5 +1358,169 @@ mod tests {
         assert_eq!(output.text, "gu");
         // Tripped at the 4th identical token (steps 0..=3), so no further steps.
         assert_eq!(step_executor.logits_calls, 4);
+    }
+
+    /// Step executor that emits a non-stop token every call and records how many
+    /// times the driver entered `decode_step_logits`. Used to prove L1 cancel
+    /// aborts at a token boundary well before `max_generated_tokens`.
+    struct CountingNonStopStepExecutor {
+        vocab_size: usize,
+        token_id: u32,
+        logits_calls: usize,
+    }
+
+    impl Seq2SeqGreedyDecodeStepExecutor for CountingNonStopStepExecutor {
+        fn decode_step_logits(
+            &mut self,
+            _input: Seq2SeqGreedyDecodeStepInput<'_>,
+        ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError> {
+            self.logits_calls = self.logits_calls.saturating_add(1);
+            let token_idx = usize::try_from(self.token_id).expect("token fits usize");
+            let mut logits = vec![-1000.0_f32; self.vocab_size];
+            logits[token_idx] = 1000.0;
+            Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits,
+                greedy_token_hint: None,
+            })
+        }
+    }
+
+    #[test]
+    fn seq2seq_greedy_decode_cancels_at_token_boundary_when_control_requests_cancel() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+        use std::time::Duration;
+
+        use crate::api::backend::{TranscriptionControl, install_active_transcription_control};
+
+        let max_generated_tokens = 64usize;
+        let cancel_after_steps = 3usize;
+        let steps_seen = Arc::new(AtomicUsize::new(0));
+        let control = Arc::new(TranscriptionControl::new());
+
+        let worker_control = Arc::clone(&control);
+        let worker_steps = Arc::clone(&steps_seen);
+        let worker = thread::spawn(move || {
+            let _guard = install_active_transcription_control(worker_control);
+            let mut step_executor = CountingNonStopStepExecutor {
+                vocab_size: 16,
+                token_id: 1,
+                logits_calls: 0,
+            };
+            // Wrap the counting executor so each successful step publishes the
+            // observed call count to the shared atomic (the cancel thread
+            // waits on that signal).
+            struct PublishingExecutor<'a> {
+                inner: &'a mut CountingNonStopStepExecutor,
+                steps_seen: &'a AtomicUsize,
+            }
+            impl Seq2SeqGreedyDecodeStepExecutor for PublishingExecutor<'_> {
+                fn decode_step_logits(
+                    &mut self,
+                    input: Seq2SeqGreedyDecodeStepInput<'_>,
+                ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError>
+                {
+                    let out = self.inner.decode_step_logits(input)?;
+                    self.steps_seen
+                        .store(self.inner.logits_calls, Ordering::SeqCst);
+                    // Give the canceler a window to observe progress without
+                    // racing past the whole token budget on a fast host.
+                    thread::sleep(Duration::from_millis(5));
+                    Ok(out)
+                }
+            }
+            let mut publisher = PublishingExecutor {
+                inner: &mut step_executor,
+                steps_seen: worker_steps.as_ref(),
+            };
+            let token_decoder = SyntheticTokenDecoder {
+                table: BTreeMap::from([(1, "a")]),
+            };
+            let config = Seq2SeqGreedyDecodeConfig {
+                initial_prompt_tokens: vec![42],
+                eot_token_id: 7,
+                stop_token_ids: Vec::new(),
+                vocab_size: 16,
+                max_generated_tokens,
+                suppress_first_step_token_ids: Vec::new(),
+                suppress_token_ids: Vec::new(),
+                phrase_biases: Vec::new(),
+            };
+            let mut no_token_trace = |_: usize, _: u32, _: bool| {};
+            let mut no_topk_trace = |_: usize, _: &[f32]| {};
+            let result = run_seq2seq_greedy_decode_loop_v0(
+                &config,
+                &mut publisher,
+                &token_decoder,
+                &mut no_token_trace,
+                &mut no_topk_trace,
+            );
+            (result, step_executor.logits_calls)
+        });
+
+        // Wait until the decode has entered a few steps, then cancel.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while steps_seen.load(Ordering::SeqCst) < cancel_after_steps {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decode never reached {cancel_after_steps} steps before cancel"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        control.request_cancel();
+
+        let (result, logits_calls) = worker.join().expect("decode worker");
+        assert_eq!(
+            result,
+            Err(Seq2SeqGreedyDecodeError::Canceled),
+            "active cancel must surface as typed Canceled"
+        );
+        assert!(
+            logits_calls < max_generated_tokens,
+            "cancel must abort well before the token budget: logits_calls={logits_calls} max={max_generated_tokens}"
+        );
+        // Poll is before each step, so after cancel the next loop iteration
+        // returns without another decode_step_logits. Bound is loose so a slow
+        // scheduler that lets a few extra steps slip through still passes.
+        assert!(
+            logits_calls < max_generated_tokens / 2,
+            "expected early abort, got logits_calls={logits_calls}"
+        );
+    }
+
+    #[test]
+    fn seq2seq_greedy_decode_without_control_is_unchanged() {
+        // Sanity: with no control installed the loop still runs to EOT as before.
+        let mut step_executor = SyntheticStepExecutor {
+            vocab_size: 16,
+            sequence: vec![1, 2, 7],
+            logits_calls: 0,
+        };
+        let token_decoder = SyntheticTokenDecoder {
+            table: BTreeMap::from([(1, "hel"), (2, "lo")]),
+        };
+        let config = Seq2SeqGreedyDecodeConfig {
+            initial_prompt_tokens: vec![42],
+            eot_token_id: 7,
+            stop_token_ids: Vec::new(),
+            vocab_size: 16,
+            max_generated_tokens: 8,
+            suppress_first_step_token_ids: Vec::new(),
+            suppress_token_ids: Vec::new(),
+            phrase_biases: Vec::new(),
+        };
+        let mut no_token_trace = |_: usize, _: u32, _: bool| {};
+        let mut no_topk_trace = |_: usize, _: &[f32]| {};
+        let output = run_seq2seq_greedy_decode_loop_v0(
+            &config,
+            &mut step_executor,
+            &token_decoder,
+            &mut no_token_trace,
+            &mut no_topk_trace,
+        )
+        .expect("no-control path stays successful");
+        assert_eq!(output.text, "hello");
+        assert_eq!(step_executor.logits_calls, 3);
     }
 }
