@@ -96,10 +96,11 @@ packs and public product guarantees are still pending — see
 
 ## Is diarization available?
 
-Yes, opt-in via `--diarize` (and the API `diarize` flag). It uses pure-Rust
-ReDimNet2-B6 speaker-embedding and pyannote segmentation capability packs (pulled or
+Yes, opt-in via `--diarize` (and the API `diarize` flag). It uses the
+ReDimNet2-B6 speaker-embedding pack (ggml-graph `.oasr`) and the optional
+pyannote segmentation capability pack (pulled or
 installed on demand) to attribute anonymous `SPEAKER_NN` labels onto any model's
-transcript; without the required capability pack the request fails closed rather
+transcript; without the required ReDimNet2-B6 pack the request fails closed rather
 than fabricating speakers.
 
 ## Does the server keep the model resident in RAM forever?

@@ -164,12 +164,4 @@ impl Weights {
             .map(|t| t.shape.as_slice())
             .ok_or_else(|| WeightsError::Missing(name.to_string()))
     }
-
-    pub(crate) fn contains(&self, name: &str) -> bool {
-        self.tensors.contains_key(name)
-    }
-
-    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
-        self.tensors.keys().map(String::as_str)
-    }
 }

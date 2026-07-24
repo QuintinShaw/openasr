@@ -1,9 +1,11 @@
 //! ReDimNet2-B6 speaker embedder (192-d), ggml-graph backend.
 //!
 //! This is the Chinese-enhanced ReDimNet2-B6 embedder from PalabraAI/redimnet2
-//! (MIT). Unlike the legacy pure-Rust ReDimNet2-B6 ResNet34 (`super::redimnet`),
-//! ReDimNet2 executes through a **ggml graph** (ggml-only invariant) fed from a
-//! `.oasr` GGUF pack produced by `tooling/redimnet2/convert_redimnet2.py`.
+//! (MIT). It is the **only** supported speaker-embedding path in OpenASR:
+//! inference runs through a **ggml graph** (ggml-only invariant) fed from a
+//! `.oasr` GGUF pack produced by `tooling/redimnet2/convert_redimnet2.py`. When
+//! the pack is missing, diarization and Voice ID fail closed rather than
+//! falling back to any other embedder.
 //!
 //! Bring-up status (staged, each step golden-pinned before the next):
 //!   * [x] Front end (`frontend`): TFMelBanks port, parity vs `frontend_dump/`.
@@ -18,12 +20,8 @@
 //!     (`OPENASR_REDIMNET_PACK` / installed-dir hint, `super::pack`), and a
 //!     dedicated calibration profile (`REDIMNET_CALIBRATION`).
 //!
-//! ReDimNet2 and ReDimNet2-B6 now coexist at runtime: `super::pack::shared_embedder`
-//! resolves ReDimNet2 first and only falls back to ReDimNet2-B6 when no ReDimNet2
-//! pack is installed. Removing ReDimNet2-B6 entirely is a later, separately
-//! approved step (HANDOFF.md plan item 6) -- not attempted here. See
-//! `docs/design/redimnet2-b6-embedder.md` (backbone plan + golden anchors) and
-//! `HANDOFF.md` (remaining plan: catalog entry, shipping-quant pack).
+//! See `docs/design/redimnet2-b6-embedder.md` for the backbone plan and golden
+//! anchors.
 
 // A handful of `config`/`frontend` items (e.g. `StageConfig::{sf,st}`,
 // `RedimNetFrontend::n_mels`) are checkpoint-structural fields kept for
