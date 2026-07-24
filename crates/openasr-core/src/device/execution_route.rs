@@ -1,8 +1,9 @@
 //! Request-level execution route foundation.
 //!
 //! Public request surfaces stay coarse (`ExecutionTarget::{Auto,Cpu,Accelerated}`).
-//! This module adds the internal exact-route vocabulary that cache, worker, and
-//! admission isolation must share before any product UI exposes GPU0/GPU1 picks.
+//! This module adds the internal exact-route vocabulary that backend-handle cache
+//! and streaming-worker isolation share before any product UI exposes GPU0/GPU1
+//! picks.
 //!
 //! Correct abstraction:
 //! - [`ResolvedExecutionRoute`] = logical `(provider, stable_id)` plus optional
@@ -10,6 +11,11 @@
 //! - Exact resolution is typed fail-closed: no silent card swap, no CPU fallback
 //! - Metal devices are enumerable but [`DeviceAddressability::NotExactlyAddressable`]
 //!   because ggml Metal still initializes via `MTLCreateSystemDefaultDevice` only
+//! - Admission capacity stays **per model identity** (route does not split slots).
+//!   Route identity isolates thread-local ggml backend handles and streaming
+//!   workers only. Family prepared-runtime caches and serve-batch engine keys are
+//!   still coarse `(path, backend)` -- not route-isolated -- until a follow-up
+//!   runtime-cache coordinator lands (hard gate before public Exact).
 
 use std::fmt;
 
@@ -87,6 +93,11 @@ impl fmt::Display for ExecutionProvider {
 /// `domain:bus:device.function` (e.g. `0000:c1:00.0`). CUDA/HIP always aim to
 /// provide this; Vulkan does when the instance exposes the PCI bus id; Metal
 /// never does.
+///
+/// Normalization is intentionally weak today: trim + ASCII lower-case only.
+/// A full PCI BDF grammar validator is a known follow-up (see
+/// `docs/KNOWN_LIMITATIONS.md`); callers must not treat this type as proof of
+/// a well-formed BDF string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PhysicalResourceKey(String);
 
@@ -148,12 +159,15 @@ impl RouteDeviceKind {
     }
 }
 
-/// Logical route identity used for cache / worker / admission isolation.
+/// Logical route identity used for backend-handle cache and streaming-worker
+/// isolation (not admission capacity -- see [`admission_identity_for_route`]).
 ///
 /// `(provider, stable_id)` is always present. [`PhysicalResourceKey`] is layered
-/// on when ggml supplies a PCI-style `device_id`. Registry ordinal is retained
-/// only as a fail-closed disambiguator when two same-provider devices would
-/// otherwise collapse to one isolation key.
+/// on when ggml supplies a PCI-style `device_id`. `registry_ordinal` is retained
+/// so init-time device matching can disambiguate inventory rows when PCI ids are
+/// absent; it is intentionally **not** part of [`Self::isolation_key`] /
+/// [`Self::cache_key`] so a stable device keeps its key across harmless
+/// re-enumeration order shifts when `stable_id` (and PCI when present) identify it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResolvedExecutionRoute {
     pub provider: ExecutionProvider,
@@ -165,9 +179,10 @@ pub struct ResolvedExecutionRoute {
 }
 
 impl ResolvedExecutionRoute {
-    /// Isolation key shared by backend cache, streaming worker keys, and model
-    /// admission slots. Exact and preferred-accelerated routes that resolve to
-    /// the same device must produce the same key.
+    /// Isolation key shared by the thread-local ggml backend-handle cache and
+    /// streaming worker keys. Exact and preferred-accelerated routes that resolve
+    /// to the same device must produce the same key. Admission capacity does
+    /// **not** use this key (see [`admission_identity_for_route`]).
     pub fn isolation_key(&self) -> String {
         match self.addressability.physical_key() {
             Some(physical) => format!(
@@ -180,9 +195,8 @@ impl ResolvedExecutionRoute {
         }
     }
 
-    /// Backend-cache key: provider + stable_id, plus physical key when present.
-    /// Ordinal is intentionally excluded so a stable device keeps its cache
-    /// entry across harmless re-enumeration order shifts when identity is known.
+    /// Backend-handle cache key: provider + stable_id, plus physical key when
+    /// present. Ordinal is intentionally excluded (see struct docs).
     pub fn cache_key(&self) -> ExecutionRouteCacheKey {
         ExecutionRouteCacheKey {
             provider: self.provider,
@@ -293,6 +307,42 @@ impl ExecutionRouteError {
         Self::InitFailed {
             detail: detail.into(),
         }
+    }
+
+    /// Recover a typed route error from a coarse string that embedded this
+    /// error's Display text (family executors historically stringify
+    /// `GgmlCpuGraphError` before it reaches `dispatch_error_to_backend`).
+    ///
+    /// Matches the stable thiserror messages below; keep those strings in sync
+    /// if the `#[error(...)]` text on this enum changes.
+    pub fn from_embedded_message(message: &str) -> Option<Self> {
+        const NOT_FOUND: &str = "requested execution device was not found: ";
+        const NOT_ADDRESSABLE: &str = "requested execution device is not exactly addressable: ";
+        const INIT_FAILED: &str = "requested execution device failed to initialize: ";
+        const ACCEL_UNAVAILABLE: &str = "no accelerated execution device is available";
+
+        if let Some(detail) = message
+            .rfind(NOT_FOUND)
+            .map(|idx| &message[idx + NOT_FOUND.len()..])
+        {
+            return Some(Self::device_not_found(detail.trim()));
+        }
+        if let Some(detail) = message
+            .rfind(NOT_ADDRESSABLE)
+            .map(|idx| &message[idx + NOT_ADDRESSABLE.len()..])
+        {
+            return Some(Self::not_addressable(detail.trim()));
+        }
+        if let Some(detail) = message
+            .rfind(INIT_FAILED)
+            .map(|idx| &message[idx + INIT_FAILED.len()..])
+        {
+            return Some(Self::init_failed(detail.trim()));
+        }
+        if message.contains(ACCEL_UNAVAILABLE) {
+            return Some(Self::AcceleratedUnavailable);
+        }
+        None
     }
 }
 
@@ -423,17 +473,33 @@ fn resolve_auto_route(
 fn resolve_preferred_accelerated_route(
     inventory: &[EnumeratedComputeDevice],
 ) -> Result<ResolvedExecutionRoute, ExecutionRouteError> {
-    inventory
-        .iter()
-        .filter(|device| device.kind == RouteDeviceKind::Accelerated)
-        .min_by_key(|device| {
-            (
-                crate::ggml_runtime::accelerated_device_rank(device.ggml_kind),
-                device.registry_ordinal,
-            )
-        })
+    ranked_preferred_accelerated_devices(inventory)
+        .into_iter()
+        .next()
         .map(EnumeratedComputeDevice::to_resolved_route)
         .ok_or(ExecutionRouteError::AcceleratedUnavailable)
+}
+
+/// Preferred accelerated candidates in Optimus-aware rank order
+/// (discrete GPU before iGPU / accelerator), then registry ordinal.
+///
+/// Used by route resolve and by preferred/Auto GPU backend init so discrete
+/// init failure can fall through to the next ranked device **under that
+/// device's own cache key**.
+pub fn ranked_preferred_accelerated_devices(
+    inventory: &[EnumeratedComputeDevice],
+) -> Vec<&EnumeratedComputeDevice> {
+    let mut devices: Vec<&EnumeratedComputeDevice> = inventory
+        .iter()
+        .filter(|device| device.kind == RouteDeviceKind::Accelerated)
+        .collect();
+    devices.sort_by_key(|device| {
+        (
+            crate::ggml_runtime::accelerated_device_rank(device.ggml_kind),
+            device.registry_ordinal,
+        )
+    });
+    devices
 }
 
 fn resolve_exact_route(
@@ -472,6 +538,19 @@ fn resolve_exact_route(
                 .join(", ")
         ))),
         [device] => {
+            // CPU is selected only by the coarse `cpu` target, never Exact pin.
+            if device.provider == ExecutionProvider::Cpu {
+                return Err(ExecutionRouteError::not_addressable(format!(
+                    "provider=cpu stable_id={} reason={}",
+                    device.stable_id,
+                    match &device.addressability {
+                        DeviceAddressability::NotExactlyAddressable { reason } => *reason,
+                        DeviceAddressability::ExactlyAddressable { .. } => {
+                            "CPU is selected by the coarse cpu target, not by Exact device pin"
+                        }
+                    }
+                )));
+            }
             // Metal (and other not-exactly-addressable providers) may match by
             // stable_id in inventory, but Exact must still fail closed.
             if device.provider == ExecutionProvider::Metal
@@ -492,10 +571,10 @@ fn resolve_exact_route(
             }
             // Stable-id Exact on CUDA/HIP/Vulkan is allowed even when PCI id is
             // missing: the stable ggml name is still a concrete device pin and
-            // must not silently retarget another card.
+            // must not silently retarget another card. Non-exact providers
+            // (Accelerator/Unknown/...) stay fail-closed here.
             if matches!(selector, ExactDeviceSelector::StableId { .. })
                 && !device.provider.supports_exact_selection()
-                && device.provider != ExecutionProvider::Cpu
             {
                 return Err(ExecutionRouteError::not_addressable(format!(
                     "provider={} does not support Exact selection (stable_id={})",
@@ -516,15 +595,20 @@ fn resolve_exact_route(
     }
 }
 
-/// Admission / capacity slot identity: model pack identity plus resolved route.
+/// Admission / capacity slot identity for native model sessions.
+///
+/// Foundation invariant: capacity is **per model identity only**. The optional
+/// `route` argument is accepted so call sites can pass the resolved route they
+/// already have for worker/backend-handle isolation, but it must not split the
+/// global per-model slot (CPU and accelerated/Exact requests for the same model
+/// share one capacity unit). Route isolation belongs to backend-handle cache and
+/// streaming workers via [`worker_route_isolation_key`] / [`ResolvedExecutionRoute::cache_key`].
 pub fn admission_identity_for_route(
     model_identity: &str,
     route: Option<&ResolvedExecutionRoute>,
 ) -> String {
-    match route {
-        Some(route) => format!("{model_identity}|route={}", route.isolation_key()),
-        None => model_identity.to_string(),
-    }
+    let _ = route;
+    model_identity.to_string()
 }
 
 /// Worker-key route component. Coarse targets keep their public spelling when no
@@ -674,19 +758,85 @@ mod tests {
     }
 
     #[test]
-    fn admission_and_worker_keys_include_resolved_route() {
-        let route =
+    fn admission_stays_per_model_while_worker_keys_include_route() {
+        let accelerated =
             resolve_execution_route(&ExecutionRouteRequest::Accelerated, &hybrid_inventory())
                 .unwrap();
+        let cpu =
+            resolve_execution_route(&ExecutionRouteRequest::Cpu, &hybrid_inventory()).unwrap();
+        // Capacity is global per model: CPU and accelerated must share one slot.
         assert_eq!(
-            admission_identity_for_route("native:whisper@pack", Some(&route)),
-            "native:whisper@pack|route=vulkan/Vulkan1/pci:0000:01:00.0"
+            admission_identity_for_route("native:whisper@pack", Some(&accelerated)),
+            "native:whisper@pack"
         );
         assert_eq!(
-            worker_route_isolation_key("accelerated", Some(&route)),
+            admission_identity_for_route("native:whisper@pack", Some(&cpu)),
+            admission_identity_for_route("native:whisper@pack", Some(&accelerated))
+        );
+        assert_eq!(
+            admission_identity_for_route("native:whisper@pack", None),
+            "native:whisper@pack"
+        );
+        // Workers still isolate by concrete device.
+        assert_eq!(
+            worker_route_isolation_key("accelerated", Some(&accelerated)),
             "vulkan/Vulkan1/pci:0000:01:00.0"
         );
+        assert_ne!(
+            worker_route_isolation_key("accelerated", Some(&accelerated)),
+            worker_route_isolation_key("cpu", Some(&cpu))
+        );
         assert_eq!(worker_route_isolation_key("cpu", None), "cpu");
+    }
+
+    #[test]
+    fn cpu_stable_id_exact_is_not_addressable() {
+        let inventory = hybrid_inventory();
+        let error = resolve_execution_route(
+            &ExecutionRouteRequest::Exact(ExactDeviceSelector::StableId {
+                provider: Some(ExecutionProvider::Cpu),
+                stable_id: "CPU".to_string(),
+            }),
+            &inventory,
+        )
+        .expect_err("cpu exact");
+        assert!(matches!(error, ExecutionRouteError::NotAddressable { .. }));
+    }
+
+    #[test]
+    fn preferred_accelerated_rank_orders_discrete_before_integrated() {
+        let inventory = hybrid_inventory();
+        let ranked = ranked_preferred_accelerated_devices(&inventory);
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|device| device.stable_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Vulkan1", "Vulkan0"]
+        );
+        // Fallthrough cache keys must be the actual candidate's key, never the
+        // preferred route's key reused for a lower-ranked device.
+        assert_ne!(
+            ranked[0].to_resolved_route().cache_key(),
+            ranked[1].to_resolved_route().cache_key()
+        );
+    }
+
+    #[test]
+    fn embedded_route_error_message_recovers_typed_variant() {
+        let source =
+            ExecutionRouteError::init_failed("provider=cuda stable_id=CUDA0 backend=CUDA0");
+        let wrapped = format!("could not initialize ggml cpu graph runner: {source}");
+        assert_eq!(
+            ExecutionRouteError::from_embedded_message(&wrapped),
+            Some(source)
+        );
+        assert_eq!(
+            ExecutionRouteError::from_embedded_message(
+                "ggml executor failed: no accelerated execution device is available"
+            ),
+            Some(ExecutionRouteError::AcceleratedUnavailable)
+        );
     }
 
     #[test]

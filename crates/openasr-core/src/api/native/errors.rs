@@ -54,6 +54,10 @@ impl NativeAsrError {
         }
     }
 
+    /// Production mapping used when a native session/stream hits a typed
+    /// execution-route failure (Exact miss / not-addressable / init failed /
+    /// accelerated unavailable). Keep in lockstep with
+    /// [`crate::BackendError::from_execution_route_error`].
     pub fn from_execution_route_error(error: ExecutionRouteError) -> Self {
         match error {
             ExecutionRouteError::DeviceNotFound { detail } => {

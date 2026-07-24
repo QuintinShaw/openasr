@@ -36,9 +36,11 @@ These were prior roadmap goals and are now shipped on the native runtime path:
   (`auto`/`cpu`/`accelerated`) through preferences, file transcription, remote
   file transcription, realtime, and dictation. Internal runtime foundations now
   resolve those coarse targets onto a typed execution route
-  (`provider` + `stable_id` + optional PCI `device_id`) so backend cache, worker,
-  and admission isolation can pin a concrete device. Public Exact GPU0/GPU1
-  selection is intentionally not a product surface yet: Metal remains
+  (`provider` + `stable_id` + optional PCI `device_id`) so the thread-local
+  ggml backend-handle cache and streaming workers can pin a concrete device.
+  Admission capacity remains per-model (not per-route). Family prepared-runtime
+  caches and serve-batch engine keys are still coarse `(path, backend)` and are
+  a hard gate before any public Exact GPU0/GPU1 surface. Metal remains
   not-exactly-addressable (`MTLCreateSystemDefaultDevice` only), and Exact
   requests fail closed rather than falling back to another card or CPU.
 - Desktop remote compute has secure HTTPS/WSS client/server plumbing with

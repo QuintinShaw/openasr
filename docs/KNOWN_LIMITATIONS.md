@@ -80,12 +80,22 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   device. There is no public per-provider/per-device pinning surface such as
   `gpu0`. Internally the runtime can resolve a concrete execution route
   (`provider` + ggml stable device name + optional PCI `device_id` from CUDA/HIP,
-  and from Vulkan when available) for cache/worker/admission isolation. Exact
-  device pins are fail-closed: missing devices, init failures, and Metal (which
-  still initializes only via `MTLCreateSystemDefaultDevice`) return typed
+  and from Vulkan when available). What is route-isolated today:
+  - thread-local ggml **backend-handle** cache (Exact pin never shares a handle;
+    preferred/Auto may Optimus-fall through discrete -> iGPU but always caches
+    under the device that actually initialized)
+  - streaming **worker** keys
+  What is intentionally **not** route-isolated yet (hard gate before public Exact):
+  - family prepared-runtime caches remain coarse `(path, backend)`
+  - serve-batch engine keys do not include route
+  - **admission capacity stays per model identity** (CPU and accelerated share one
+    slot for the same model; route does not multiply capacity)
+  Exact device pins are fail-closed: missing devices, init failures, Metal
+  (still `MTLCreateSystemDefaultDevice` only), and CPU StableId Exact return typed
   not-found / not-addressable / init-failed errors instead of silently swapping
   cards or falling back to CPU. Unavailable coarse `accelerated` targets still
-  fail closed.
+  fail closed. Physical PCI keys are normalized (trim + lower-case) only; full
+  BDF grammar validation is a follow-up.
 - No public reproducible real-backend benchmark or long-audio stability evidence
   is published. The performance harness, regression gates, and competitive
   comparisons are internal (see [Performance](../perf/PERFORMANCE.md)); no claim of

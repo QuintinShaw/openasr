@@ -1193,10 +1193,11 @@ impl ServerRuntime {
     /// Acquires the server-wide native execution permit for the validated
     /// runtime pack. Every ggml ASR execution path enters through this method.
     ///
-    /// When `route` is `Some`, the admission slot is isolated by the resolved
-    /// execution route (provider + stable device identity) so two Exact/preferred
-    /// GPU pins never share one capacity slot. `None` keeps the historical
-    /// model-only key used by coarse paths that have not resolved a device yet.
+    /// Admission capacity is **per model identity only**. The optional `route`
+    /// is forwarded for API symmetry with worker/backend-handle isolation but
+    /// does not split the slot: CPU and accelerated/Exact requests for the same
+    /// model share one capacity unit. Route identity isolates streaming workers
+    /// and thread-local ggml backend handles instead.
     pub(crate) fn acquire_native_execution(
         &self,
         route: Option<&openasr_core::ResolvedExecutionRoute>,

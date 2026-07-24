@@ -2198,9 +2198,25 @@ fn dispatch_error_to_backend(error: GgmlAsrExecutionError) -> BackendError {
         GgmlAsrExecutionError::ServeBatchUnavailable { reason, retryable } => {
             BackendError::ServeBatchUnavailable { reason, retryable }
         }
-        other => BackendError::NativeFailClosed {
-            reason: other.to_string(),
-        },
+        GgmlAsrExecutionError::ExecutionRoute(error) => {
+            BackendError::from_execution_route_error(error)
+        }
+        other => {
+            // Family executors historically stringify `GgmlCpuGraphError` into
+            // `ExecutorFailed.reason`. Recover the typed route failure when the
+            // Display text still embeds it so Exact/init failures stay
+            // `ExecutionDevice*` end-to-end.
+            if let Some(route_error) =
+                crate::device::execution_route::ExecutionRouteError::from_embedded_message(
+                    &other.to_string(),
+                )
+            {
+                return BackendError::from_execution_route_error(route_error);
+            }
+            BackendError::NativeFailClosed {
+                reason: other.to_string(),
+            }
+        }
     }
 }
 

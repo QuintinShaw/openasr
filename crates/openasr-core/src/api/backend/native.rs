@@ -441,11 +441,9 @@ fn native_ggml_backend_preference_from_hardware_target(
             if has_accelerated_device {
                 Ok(GgmlAsrBackendPreference::Accelerated)
             } else {
-                Err(NativeAsrError::SessionFailed {
-                    message: format!(
-                        "hardware target '{target}' was requested, but no ggml GPU device is available"
-                    ),
-                })
+                Err(NativeAsrError::from_execution_route_error(
+                    crate::device::execution_route::ExecutionRouteError::AcceleratedUnavailable,
+                ))
             }
         }
         NativeAsrHardwareTarget::IntelNpu => {
@@ -515,9 +513,21 @@ fn native_ggml_streaming_error_to_asr(
                 backend: adapter_id.to_string(),
             }
         }
-        other => NativeAsrError::SessionFailed {
-            message: format!("native ggml streaming session failed: {other}"),
-        },
+        GgmlAsrExecutionError::ExecutionRoute(error) => {
+            NativeAsrError::from_execution_route_error(error)
+        }
+        other => {
+            if let Some(route_error) =
+                crate::device::execution_route::ExecutionRouteError::from_embedded_message(
+                    &other.to_string(),
+                )
+            {
+                return NativeAsrError::from_execution_route_error(route_error);
+            }
+            NativeAsrError::SessionFailed {
+                message: format!("native ggml streaming session failed: {other}"),
+            }
+        }
     }
 }
 

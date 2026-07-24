@@ -553,6 +553,11 @@ pub enum GgmlAsrExecutionError {
         model_family: &'static str,
         adapter_path: String,
     },
+    /// Typed Exact/preferred device failure from graph backend init. Kept as a
+    /// first-class variant so `dispatch_error_to_backend` can surface
+    /// `BackendError::ExecutionDevice*` without string recovery.
+    #[error(transparent)]
+    ExecutionRoute(#[from] crate::device::execution_route::ExecutionRouteError),
     /// A transient serve-batch failure (queue saturation / owner gone / GPU step
     /// hung) carried out of the executor so the backend can map it to a retryable
     /// HTTP status instead of a generic 500. `retryable == true` => queue full
@@ -571,6 +576,24 @@ impl GgmlAsrExecutionError {
             executor_id,
             adapter_id,
             reason: reason.into(),
+        }
+    }
+
+    /// Preserve typed route failures from graph init; stringify everything else.
+    /// Prefer this at family `GgmlCpuGraphError` boundaries so dispatch does not
+    /// need Display recovery. Covered by unit tests; production call sites migrate
+    /// family-by-family.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_ggml_cpu_graph_error(
+        executor_id: &'static str,
+        adapter_id: &'static str,
+        error: crate::ggml_runtime::GgmlCpuGraphError,
+    ) -> Self {
+        match error {
+            crate::ggml_runtime::GgmlCpuGraphError::ExecutionRoute(error) => {
+                Self::ExecutionRoute(error)
+            }
+            other => Self::executor_failed(executor_id, adapter_id, other.to_string()),
         }
     }
 }
@@ -1533,5 +1556,33 @@ mod tests {
                 .to_string()
                 .contains(missing_path.display().to_string().as_str())
         );
+    }
+
+    #[test]
+    fn from_ggml_cpu_graph_error_preserves_execution_route() {
+        use crate::device::execution_route::ExecutionRouteError;
+        use crate::ggml_runtime::GgmlCpuGraphError;
+
+        let route_error = ExecutionRouteError::init_failed("provider=cuda stable_id=CUDA0");
+        let mapped = GgmlAsrExecutionError::from_ggml_cpu_graph_error(
+            "test-executor",
+            "test-adapter",
+            GgmlCpuGraphError::ExecutionRoute(route_error.clone()),
+        );
+        assert_eq!(mapped, GgmlAsrExecutionError::ExecutionRoute(route_error));
+
+        let other = GgmlAsrExecutionError::from_ggml_cpu_graph_error(
+            "test-executor",
+            "test-adapter",
+            GgmlCpuGraphError::CpuBackendUnavailable,
+        );
+        assert!(matches!(
+            other,
+            GgmlAsrExecutionError::ExecutorFailed {
+                executor_id: "test-executor",
+                adapter_id: "test-adapter",
+                ..
+            }
+        ));
     }
 }

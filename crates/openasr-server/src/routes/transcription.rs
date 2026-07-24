@@ -1590,23 +1590,7 @@ pub(crate) fn resolve_execution_route_for_target(
 pub(crate) fn backend_error_from_execution_route(
     error: openasr_core::ExecutionRouteError,
 ) -> openasr_core::BackendError {
-    match error {
-        openasr_core::ExecutionRouteError::DeviceNotFound { detail } => {
-            openasr_core::BackendError::ExecutionDeviceNotFound { detail }
-        }
-        openasr_core::ExecutionRouteError::NotAddressable { detail } => {
-            openasr_core::BackendError::ExecutionDeviceNotAddressable { detail }
-        }
-        openasr_core::ExecutionRouteError::InitFailed { detail } => {
-            openasr_core::BackendError::ExecutionDeviceInitFailed { detail }
-        }
-        openasr_core::ExecutionRouteError::AcceleratedUnavailable => {
-            openasr_core::BackendError::NativeFailClosed {
-                reason: "execution_target=accelerated was requested, but no ggml GPU device is available."
-                    .to_string(),
-            }
-        }
-    }
+    openasr_core::BackendError::from_execution_route_error(error)
 }
 
 fn native_asr_error_to_backend(error: NativeAsrError) -> openasr_core::BackendError {

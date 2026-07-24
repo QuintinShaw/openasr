@@ -20,11 +20,12 @@ use thiserror::Error;
 use super::ffi;
 use super::{
     GgmlBackendKind, GgmlRuntimeError, GgufTensorDataReader, GgufWeightTensorPayload,
-    accelerated_device_rank, ensure_backends_loaded, ggml_available_devices,
+    ensure_backends_loaded, ggml_available_devices,
 };
 use crate::device::execution_route::{
     ExecutionProvider, ExecutionRouteCacheKey, ExecutionRouteError, ExecutionRouteRequest,
-    ResolvedExecutionRoute, enumerate_compute_devices_from_ggml, resolve_execution_route,
+    ResolvedExecutionRoute, enumerate_compute_devices_from_ggml,
+    ranked_preferred_accelerated_devices, resolve_execution_route,
 };
 
 const F32_WIDTH_BYTES: usize = std::mem::size_of::<f32>();
@@ -5265,11 +5266,13 @@ struct GgmlBackendSchedulerGuard {
 /// GPU-class backends are expensive to initialize (device enumeration + driver
 /// context creation) and are safe to keep resident for the thread's lifetime,
 /// so they are cached per-thread per resolved route and handed out with
-/// `free_on_drop=false` (the cached entry owns the single instance). Metal had
-/// this since inception; the discrete-GPU lane (HIP/CUDA/Vulkan) now shares the
-/// same path keyed by [`ExecutionRouteCacheKey`] (provider + stable_id [+ PCI])
-/// so two Exact pins never share one backend handle. The CPU backend is cheap
-/// and is intentionally not cached.
+/// `free_on_drop=false` (the cached entry owns the single instance).
+///
+/// Invariant: a cache entry's [`CachedBackendKey`] is always the route of the
+/// device that was actually initialized. Preferred/Auto may Optimus-fall
+/// through discrete -> iGPU, but each successful init is inserted under that
+/// device's own key -- never under a preferred route key while holding a
+/// different card. Exact never falls through.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum CachedBackendKey {
     /// System-default Metal device (not exactly addressable).
@@ -5305,43 +5308,6 @@ impl GgmlBackendGuard {
     }
 
     fn gpu() -> Result<Self, GgmlCpuGraphError> {
-        let (cache_key, init_route) = Self::resolve_gpu_cache_target()?;
-        Self::cached_backend(cache_key, move || {
-            Self::init_gpu_backend_for_route(init_route)
-        })
-    }
-
-    /// Return a thread-local cached backend of `key`, initializing it once via
-    /// `init` on first use. The cached entry owns the backend for the thread's
-    /// lifetime; handed-out guards never free it (`free_on_drop=false`).
-    fn cached_backend(
-        key: CachedBackendKey,
-        init: impl FnOnce() -> Result<NonNull<c_void>, GgmlCpuGraphError>,
-    ) -> Result<Self, GgmlCpuGraphError> {
-        if let Some(raw) =
-            THREAD_BACKEND_CACHE_BY_KIND.with(|cache| cache.borrow().get(&key).map(|g| g.raw))
-        {
-            return Ok(Self {
-                raw,
-                free_on_drop: false,
-            });
-        }
-        let raw = init()?;
-        THREAD_BACKEND_CACHE_BY_KIND.with(|cache| {
-            cache
-                .borrow_mut()
-                .insert(key, GgmlCachedBackendGuard { raw })
-        });
-        Ok(Self {
-            raw,
-            free_on_drop: false,
-        })
-    }
-
-    /// Decide which resolved GPU route this request must initialize, and the
-    /// cache key that isolates it from other devices on the same thread.
-    fn resolve_gpu_cache_target()
-    -> Result<(CachedBackendKey, Option<ResolvedExecutionRoute>), GgmlCpuGraphError> {
         match request_backend_override() {
             Some(RequestBackendPreference::Exact(route)) => {
                 if route.provider == ExecutionProvider::Metal {
@@ -5352,25 +5318,16 @@ impl GgmlBackendGuard {
                         )),
                     ));
                 }
-                Ok((CachedBackendKey::Route(route.cache_key()), Some(route)))
+                // Exact: pin one device, fail closed on miss/init failure, key
+                // is exactly that route (no fallthrough, no key drift).
+                Self::cached_backend(CachedBackendKey::Route(route.cache_key()), move || {
+                    Self::init_exact_gpu_backend(&route)
+                })
             }
             Some(RequestBackendPreference::Accelerated) | None => {
-                let inventory = enumerate_compute_devices_from_ggml(&ggml_available_devices());
-                match resolve_execution_route(&ExecutionRouteRequest::Accelerated, &inventory) {
-                    Ok(route) => Ok((CachedBackendKey::Route(route.cache_key()), Some(route))),
-                    // Fall through to ranked init without a pinned route key when
-                    // inventory is empty; init_gpu_backend_for_route(None) keeps
-                    // the previous preferred-device scan + typed unavailable error.
-                    Err(ExecutionRouteError::AcceleratedUnavailable) => Ok((
-                        CachedBackendKey::Route(ExecutionRouteCacheKey {
-                            provider: ExecutionProvider::Unknown,
-                            stable_id: "accelerated".to_string(),
-                            physical_key: None,
-                        }),
-                        None,
-                    )),
-                    Err(error) => Err(GgmlCpuGraphError::ExecutionRoute(error)),
-                }
+                // Preferred/Auto GPU lane: ranked Optimus fallthrough with
+                // per-candidate cache keys (see preferred_gpu_backend).
+                Self::preferred_gpu_backend()
             }
             Some(RequestBackendPreference::CpuOnly) => Err(GgmlCpuGraphError::ExecutionRoute(
                 ExecutionRouteError::device_not_found(
@@ -5378,6 +5335,86 @@ impl GgmlBackendGuard {
                 ),
             )),
         }
+    }
+
+    /// Return a thread-local cached backend of `key`, initializing it once via
+    /// `init` on first use. The cached entry owns the backend for the thread's
+    /// lifetime; handed-out guards never free it (`free_on_drop=false`).
+    fn cached_backend(
+        key: CachedBackendKey,
+        init: impl FnOnce() -> Result<NonNull<c_void>, GgmlCpuGraphError>,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        if let Some(raw) = Self::cached_backend_lookup(&key) {
+            return Ok(Self {
+                raw,
+                free_on_drop: false,
+            });
+        }
+        let raw = init()?;
+        Self::cached_backend_insert(key, raw);
+        Ok(Self {
+            raw,
+            free_on_drop: false,
+        })
+    }
+
+    fn cached_backend_lookup(key: &CachedBackendKey) -> Option<NonNull<c_void>> {
+        THREAD_BACKEND_CACHE_BY_KIND.with(|cache| cache.borrow().get(key).map(|g| g.raw))
+    }
+
+    fn cached_backend_insert(key: CachedBackendKey, raw: NonNull<c_void>) {
+        THREAD_BACKEND_CACHE_BY_KIND.with(|cache| {
+            cache
+                .borrow_mut()
+                .insert(key, GgmlCachedBackendGuard { raw })
+        });
+    }
+
+    /// Preferred/Auto GPU init with Optimus-aware ranked fallthrough.
+    ///
+    /// Invariant: the thread-local cache key is always the route of the device
+    /// that actually initialized. If discrete GPU init fails, the next ranked
+    /// candidate (e.g. iGPU) is tried and -- on success -- cached under *its*
+    /// key, never under the preferred discrete key. Empty inventory or total
+    /// init failure is typed fail-closed (no `init_best` retarget into a fake
+    /// `unknown/accelerated` key).
+    fn preferred_gpu_backend() -> Result<Self, GgmlCpuGraphError> {
+        let devices = ggml_available_devices();
+        let inventory = enumerate_compute_devices_from_ggml(&devices);
+        let ranked = ranked_preferred_accelerated_devices(&inventory);
+        if ranked.is_empty() {
+            return Err(GgmlCpuGraphError::ExecutionRoute(
+                ExecutionRouteError::AcceleratedUnavailable,
+            ));
+        }
+
+        let mut last_init_error: Option<GgmlCpuGraphError> = None;
+        for candidate in ranked {
+            let route = candidate.to_resolved_route();
+            let key = CachedBackendKey::Route(route.cache_key());
+            if let Some(raw) = Self::cached_backend_lookup(&key) {
+                return Ok(Self {
+                    raw,
+                    free_on_drop: false,
+                });
+            }
+            match Self::init_route_gpu_device(&devices, &route) {
+                Ok(raw) => {
+                    Self::cached_backend_insert(key, raw);
+                    return Ok(Self {
+                        raw,
+                        free_on_drop: false,
+                    });
+                }
+                Err(error) => {
+                    last_init_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_init_error.unwrap_or(GgmlCpuGraphError::ExecutionRoute(
+            ExecutionRouteError::AcceleratedUnavailable,
+        )))
     }
 
     fn accelerators(
@@ -5427,76 +5464,39 @@ impl GgmlBackendGuard {
         Ok(raw)
     }
 
-    fn init_gpu_backend_for_route(
-        route: Option<ResolvedExecutionRoute>,
+    /// Exact pin: one inventory row only. Find miss -> DeviceNotFound.
+    /// Initialize failure -> InitFailed. Never tries another card.
+    fn init_exact_gpu_backend(
+        route: &ResolvedExecutionRoute,
     ) -> Result<NonNull<c_void>, GgmlCpuGraphError> {
         let devices = ggml_available_devices();
-        if let Some(route) = route.as_ref() {
-            // Exact (and preferred-accelerated once resolved) pin one inventory
-            // row. Fail closed: never silently retarget another card or CPU.
-            if let Some(device) = find_ggml_device_for_route(&devices, route) {
-                return match device.initialize() {
-                    Ok(backend) => Ok(backend.into_raw()),
-                    Err(GgmlRuntimeError::BackendUnavailable(name)) => {
-                        Err(GgmlCpuGraphError::ExecutionRoute(
-                            ExecutionRouteError::init_failed(format!(
-                                "provider={} stable_id={} backend={name}",
-                                route.provider.as_str(),
-                                route.stable_id
-                            )),
-                        ))
-                    }
-                };
-            }
-            if matches!(
-                request_backend_override(),
-                Some(RequestBackendPreference::Exact(_))
-            ) {
-                return Err(GgmlCpuGraphError::ExecutionRoute(
-                    ExecutionRouteError::device_not_found(format!(
-                        "provider={} stable_id={} isolation_key={}",
-                        route.provider.as_str(),
-                        route.stable_id,
-                        route.isolation_key()
-                    )),
-                ));
-            }
-            // Preferred accelerated resolved to a route that disappeared between
-            // resolve and init: fall through to ranked scan below.
-        }
+        Self::init_route_gpu_device(&devices, route)
+    }
 
-        // Rank candidates so a hybrid-graphics host (Optimus-style laptop
-        // exposing both an Intel integrated GPU and an NVIDIA/AMD discrete GPU
-        // through the same Vulkan backend) tries the discrete GPU first,
-        // falling through to lower-ranked devices only if a higher-ranked one
-        // fails to initialize -- see `accelerated_device_rank`. Exact requests
-        // never reach this fallback.
-        let mut candidates: Vec<_> = devices
-            .into_iter()
-            .filter(|device| backend_kind_is_accelerated(device.kind))
-            .collect();
-        candidates.sort_by_key(|device| accelerated_device_rank(device.kind));
-        for device in candidates {
-            match device.initialize() {
-                Ok(backend) => return Ok(backend.into_raw()),
-                Err(GgmlRuntimeError::BackendUnavailable(_)) => continue,
-            }
-        }
-
-        let raw = unsafe { ffi::ggml_backend_init_best() };
-        let Some(raw) = NonNull::new(raw) else {
-            return Err(GgmlCpuGraphError::GpuBackendUnavailable {
-                actual_backend: "<none>".to_string(),
-            });
+    fn init_route_gpu_device(
+        devices: &[super::GgmlBackendDevice],
+        route: &ResolvedExecutionRoute,
+    ) -> Result<NonNull<c_void>, GgmlCpuGraphError> {
+        let Some(device) = find_ggml_device_for_route(devices, route) else {
+            return Err(GgmlCpuGraphError::ExecutionRoute(
+                ExecutionRouteError::device_not_found(format!(
+                    "provider={} stable_id={} isolation_key={}",
+                    route.provider.as_str(),
+                    route.stable_id,
+                    route.isolation_key()
+                )),
+            ));
         };
-        let name = backend_name(raw);
-        if !backend_name_is_accelerated(&name) {
-            unsafe { ffi::ggml_backend_free(raw.as_ptr()) };
-            return Err(GgmlCpuGraphError::GpuBackendUnavailable {
-                actual_backend: name,
-            });
+        match device.initialize() {
+            Ok(backend) => Ok(backend.into_raw()),
+            Err(GgmlRuntimeError::BackendUnavailable(name)) => Err(
+                GgmlCpuGraphError::ExecutionRoute(ExecutionRouteError::init_failed(format!(
+                    "provider={} stable_id={} backend={name}",
+                    route.provider.as_str(),
+                    route.stable_id
+                ))),
+            ),
         }
-        Ok(raw)
     }
 
     fn set_n_threads(&mut self, n_threads: usize) -> Result<(), GgmlCpuGraphError> {
