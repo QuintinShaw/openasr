@@ -2330,6 +2330,10 @@ fn verify_partial_and_install(
     // it up here too so it cannot outlive the `.partial` file it describes.
     let _ = fs::remove_file(&paths.partial_segments_meta_path);
     let pack = write_installed_record(target, paths)?;
+    // Same-path pack replace must miss every resident runtime cache. Content ids
+    // already diverge when bytes change; bumping the unified epoch also drops
+    // TLS / process-pool entries that were keyed before the install completed.
+    let _ = crate::models::runtime_cache_coordinator::invalidate_after_pack_install_or_replace();
     progress(PullProgress::Installed {
         path: pack.path.clone(),
     });

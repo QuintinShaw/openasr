@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::NativeAsrSession;
@@ -277,37 +277,68 @@ impl super::runtime_contract::DolphinPositionTableSource for DolphinRuntimeWeigh
     }
 }
 
-/// Process-level pool of runtime weights keyed by pack path. Building the pool
-/// (dequantizing the f32 vectors + mmapping the native weight blocks) costs ~0.4 s
-/// (18% of the single-utterance wall on M1); caching it lets warm calls skip the
-/// reload and reuse the same immutable table, mirroring the xasr process runtime
-/// pool. Keyed by path only: the native payloads carry the shared pack mmap and the
-/// f32 vectors are backend-independent, so CPU and Metal runs share one entry.
-static DOLPHIN_WEIGHTS_POOL: OnceLock<Mutex<HashMap<PathBuf, Arc<DolphinRuntimeWeights>>>> =
-    OnceLock::new();
+/// Process-level pool of runtime weights keyed by pack content id + coordinator
+/// epoch. Building the pool (dequantizing the f32 vectors + mmapping the native
+/// weight blocks) costs ~0.4 s (18% of the single-utterance wall on M1); caching
+/// it lets warm calls skip the reload and reuse the same immutable table,
+/// mirroring the xasr process runtime pool.
+///
+/// Content-addressed (never bare path): same-path byte replacement must miss
+/// without waiting for idle unload. Epoch is part of the key so an idle-unload
+/// generation bump alone also misses, even if a stale entry somehow lingered.
+/// Native payloads carry the shared pack mmap and the f32 vectors are
+/// backend-independent, so CPU and Metal runs share one entry.
+static DOLPHIN_WEIGHTS_POOL: OnceLock<
+    Mutex<
+        HashMap<
+            crate::models::runtime_cache_coordinator::PackContentEpochKey,
+            Arc<DolphinRuntimeWeights>,
+        >,
+    >,
+> = OnceLock::new();
+
+/// Drop every pooled Dolphin weight table. Called from
+/// [`DolphinGgmlExecutor::unload_idle_state`] so idle unload actually frees the
+/// process-level resident state (the trait default is a no-op).
+pub(crate) fn clear_dolphin_weights_pool() {
+    if let Some(pool) = DOLPHIN_WEIGHTS_POOL.get()
+        && let Ok(mut guard) = pool.lock()
+    {
+        guard.clear();
+    }
+}
 
 /// Fetch the pack's runtime weights from the pool, building them (via the
 /// already-resolved `reader`) and caching on a miss. The build runs outside the
 /// pool lock so concurrent first callers for distinct packs don't serialize.
+///
+/// When the pack cannot be content-hashed, the build still runs once but is
+/// **not** inserted -- path-only keys are a hard NO-GO.
 pub(crate) fn cached_dolphin_runtime_weights(
-    cache_key: &Path,
+    runtime_path: &Path,
     reader: &GgufTensorDataReader,
 ) -> Result<Arc<DolphinRuntimeWeights>, String> {
-    let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(weights) = pool
-        .lock()
-        .expect("dolphin weights pool lock")
-        .get(cache_key)
-    {
-        return Ok(weights.clone());
+    use crate::models::runtime_cache_coordinator::PackContentEpochKey;
+
+    let cache_key = PackContentEpochKey::try_for_runtime_path(runtime_path);
+    if let Some(ref key) = cache_key {
+        let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(weights) = pool.lock().expect("dolphin weights pool lock").get(key) {
+            return Ok(weights.clone());
+        }
     }
+
     let weights = Arc::new(
         load_dolphin_runtime_weights_from_pack(reader)
             .map_err(|error| format!("dolphin runtime weight load failed: {error}"))?,
     );
-    pool.lock()
-        .expect("dolphin weights pool lock")
-        .insert(cache_key.to_path_buf(), weights.clone());
+
+    if let Some(key) = cache_key {
+        let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
+        pool.lock()
+            .expect("dolphin weights pool lock")
+            .insert(key, weights.clone());
+    }
     Ok(weights)
 }
 
@@ -632,6 +663,15 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
             carry_context: None,
         })
     }
+
+    /// The process-level `DOLPHIN_WEIGHTS_POOL` is this family's only resident
+    /// state outside a live request. Without an explicit unload hook the trait
+    /// default no-op would leave every pooled weight table resident for the rest
+    /// of the process lifetime (and same-path content replacement would keep
+    /// serving the pre-replace table until something else happened to clear it).
+    fn unload_idle_state(&self) {
+        clear_dolphin_weights_pool();
+    }
 }
 
 const DOLPHIN_STREAMING_EXECUTOR_ID: &str = "dolphin-ggml-snapshot-streaming-executor-v1";
@@ -639,6 +679,10 @@ const DOLPHIN_STREAMING_EXECUTOR_ID: &str = "dolphin-ggml-snapshot-streaming-exe
 impl GgmlAsrStreamingExecutor for DolphinGgmlExecutor {
     fn executor_id(&self) -> &'static str {
         DOLPHIN_STREAMING_EXECUTOR_ID
+    }
+
+    fn unload_idle_state(&self) {
+        clear_dolphin_weights_pool();
     }
 
     fn start_streaming_session(
@@ -692,9 +736,83 @@ mod tests {
         DolphinImportRequest, DolphinQuantizationMode,
         convert_local_dolphin_wenet_source_to_runtime_pack,
     };
+    use crate::models::runtime_cache_coordinator::{
+        PackContentEpochKey, bump_runtime_build_generation, pack_content_id_for_runtime_path,
+    };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
+
+    fn dolphin_pool_len() -> usize {
+        DOLPHIN_WEIGHTS_POOL
+            .get()
+            .and_then(|pool| pool.lock().ok().map(|guard| guard.len()))
+            .unwrap_or(0)
+    }
+
+    fn dolphin_pool_contains(key: &PackContentEpochKey) -> bool {
+        DOLPHIN_WEIGHTS_POOL
+            .get()
+            .and_then(|pool| pool.lock().ok().map(|guard| guard.contains_key(key)))
+            .unwrap_or(false)
+    }
+
+    /// Same-path A/B content swap must not hit the previous weight table. Uses a
+    /// minimal GGUF so the pool insert path is exercised without a full Dolphin
+    /// checkpoint (load may fail on missing tensors; we only need the content-key
+    /// lookup/miss behavior, so we seed the pool map directly with Arc placeholders).
+    #[test]
+    fn dolphin_weights_pool_keys_by_content_id_not_path() {
+        clear_dolphin_weights_pool();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("same-path.oasr");
+        std::fs::write(&path, b"dolphin-content-a").expect("write a");
+        let key_a = PackContentEpochKey::try_for_runtime_path(&path).expect("cacheable a");
+        std::fs::write(&path, b"dolphin-content-b-different").expect("write b");
+        let key_b = PackContentEpochKey::try_for_runtime_path(&path).expect("cacheable b");
+        assert_ne!(key_a.pack_content_id, key_b.pack_content_id);
+        assert_ne!(key_a, key_b);
+
+        let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let mut guard = pool.lock().expect("lock");
+            guard.insert(key_a.clone(), Arc::new(DolphinRuntimeWeights::default()));
+        }
+        assert!(dolphin_pool_contains(&key_a));
+        assert!(!dolphin_pool_contains(&key_b));
+
+        // Idle unload must drop the pool entirely.
+        clear_dolphin_weights_pool();
+        assert_eq!(dolphin_pool_len(), 0);
+        assert!(!dolphin_pool_contains(&key_a));
+
+        // Epoch bump alone changes the key even for unchanged bytes.
+        std::fs::write(&path, b"dolphin-content-stable").expect("write stable");
+        let before = PackContentEpochKey::try_for_runtime_path(&path).expect("before");
+        let _ = bump_runtime_build_generation();
+        let after = PackContentEpochKey::try_for_runtime_path(&path).expect("after");
+        assert_eq!(before.pack_content_id, after.pack_content_id);
+        assert_ne!(before.generation, after.generation);
+        let _ = pack_content_id_for_runtime_path(&path);
+    }
+
+    #[test]
+    fn dolphin_unload_idle_state_clears_weights_pool() {
+        clear_dolphin_weights_pool();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("pool.oasr");
+        std::fs::write(&path, b"dolphin-pool-seed").expect("write");
+        let key = PackContentEpochKey::try_for_runtime_path(&path).expect("cacheable");
+        let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
+        pool.lock()
+            .expect("lock")
+            .insert(key.clone(), Arc::new(DolphinRuntimeWeights::default()));
+        assert_eq!(dolphin_pool_len(), 1);
+
+        <DolphinGgmlExecutor as GgmlAsrExecutor>::unload_idle_state(&DolphinGgmlExecutor);
+        assert_eq!(dolphin_pool_len(), 0);
+        assert!(!dolphin_pool_contains(&key));
+    }
 
     fn root() -> Option<PathBuf> {
         match crate::testing::external_test_fixture_path(

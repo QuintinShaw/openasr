@@ -40,8 +40,8 @@ impl GgmlAsrBackendPreference {
 ///
 /// `pack_content_id` is a content proof, never a bare path. Production resolves
 /// it from the installed-pack registry sha when available, otherwise from a
-/// full-file sha256 of the runtime pack bytes. The pack-content coordinator
-/// (#38) may later replace the binding source without changing this seam.
+/// full-file sha256 of the runtime pack bytes via
+/// [`crate::models::runtime_cache_coordinator`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RuntimeBuildIdentity {
     /// Content identity: `sha256:<hex>` for real pack bytes, or an explicit
@@ -53,25 +53,16 @@ pub struct RuntimeBuildIdentity {
     /// Adapter/options fingerprint that changes the lowered graph without
     /// changing pack bytes (for example an active `.oadp` adapter path).
     pub options_fingerprint: String,
-    /// Invalidation generation from the runtime owner. Idle unload and model
-    /// reload bump this even when pack bytes and route are unchanged.
+    /// Invalidation generation from the runtime cache coordinator. Idle unload,
+    /// serve-batch owner shutdown, and pack replace bump this even when pack
+    /// bytes and route are unchanged.
     pub generation: u64,
 }
 
-static RUNTIME_BUILD_GENERATION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Current process-wide runtime-build generation observed by cache keys.
-pub fn current_runtime_build_generation() -> u64 {
-    RUNTIME_BUILD_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Bumps the process-wide runtime-build generation and returns the new value.
-/// Idle unload / invalidation seams call this before dropping cached engines so
-/// a later same-path request cannot silently reuse a drained owner.
-pub fn bump_runtime_build_generation() -> u64 {
-    RUNTIME_BUILD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
-}
+pub use crate::models::runtime_cache_coordinator::{
+    bump_runtime_build_generation, current_runtime_build_generation,
+    pack_content_id_for_runtime_path,
+};
 
 impl RuntimeBuildIdentity {
     pub fn new(
@@ -119,115 +110,8 @@ impl RuntimeBuildIdentity {
 
     /// Formats a content id from a lowercase hex sha256 digest.
     pub fn content_id_from_sha256_hex(sha256_hex: &str) -> String {
-        format!("sha256:{sha256_hex}")
+        crate::models::runtime_cache_coordinator::content_id_from_sha256_hex(sha256_hex)
     }
-}
-
-/// Resolves a stable pack content id for `runtime_path`.
-///
-/// Preference order:
-/// 1. Installed-pack registry entry whose path matches (uses the pull-verified
-///    sha256 already on disk).
-/// 2. Full-file sha256 of the runtime pack bytes.
-///
-/// Path alone is never returned. Results are memoized by canonical path + size +
-/// mtime so repeated requests against an unchanged pack do not re-hash multi-GB
-/// weights; different bytes at the same path always miss the memo and re-hash.
-pub fn pack_content_id_for_runtime_path(runtime_path: &std::path::Path) -> String {
-    let canonical =
-        std::fs::canonicalize(runtime_path).unwrap_or_else(|_| runtime_path.to_path_buf());
-    if let Some(installed_sha) = installed_pack_sha256_for_path(&canonical) {
-        return RuntimeBuildIdentity::content_id_from_sha256_hex(&installed_sha);
-    }
-    match file_metadata_key(&canonical) {
-        Some(meta_key) => cached_or_hash_pack_content_id(&canonical, meta_key),
-        None => match sha256_hex_file(&canonical) {
-            Ok(hex) => RuntimeBuildIdentity::content_id_from_sha256_hex(&hex),
-            Err(_) => {
-                // Unreadable path: fail closed to a unique non-path content token
-                // that still cannot collide with a real sha256 content id.
-                format!(
-                    "unreadable:{}:{}",
-                    canonical.display(),
-                    current_runtime_build_generation()
-                )
-            }
-        },
-    }
-}
-
-fn installed_pack_sha256_for_path(canonical_path: &std::path::Path) -> Option<String> {
-    let home = crate::openasr_home().ok()?;
-    let packs = crate::list_installed_packs(home).ok()?;
-    packs.into_iter().find_map(|pack| {
-        let pack_path = std::fs::canonicalize(&pack.path).unwrap_or(pack.path);
-        (pack_path == canonical_path && !pack.sha256.is_empty()).then_some(pack.sha256)
-    })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct PackMetaKey {
-    len: u64,
-    modified_secs: u64,
-}
-
-fn file_metadata_key(path: &std::path::Path) -> Option<PackMetaKey> {
-    let meta = std::fs::metadata(path).ok()?;
-    let modified_secs = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some(PackMetaKey {
-        len: meta.len(),
-        modified_secs,
-    })
-}
-
-fn cached_or_hash_pack_content_id(path: &std::path::Path, meta_key: PackMetaKey) -> String {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-
-    static CACHE: OnceLock<Mutex<HashMap<std::path::PathBuf, (PackMetaKey, String)>>> =
-        OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock()
-        && let Some((cached_meta, content_id)) = guard.get(path)
-        && *cached_meta == meta_key
-    {
-        return content_id.clone();
-    }
-
-    let content_id = match sha256_hex_file(path) {
-        Ok(hex) => RuntimeBuildIdentity::content_id_from_sha256_hex(&hex),
-        Err(_) => format!(
-            "unreadable:{}:{}",
-            path.display(),
-            current_runtime_build_generation()
-        ),
-    };
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(path.to_path_buf(), (meta_key, content_id.clone()));
-    }
-    content_id
-}
-
-fn sha256_hex_file(path: &std::path::Path) -> std::io::Result<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Builds the effective serve-batch / runtime-cache identity for one request.

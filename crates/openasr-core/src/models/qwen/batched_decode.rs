@@ -226,7 +226,7 @@ impl Qwen3AsrServeBatchConfig {
 }
 
 pub(super) fn shutdown_qwen_serve_batch_engines() {
-    let _ = crate::bump_runtime_build_generation();
+    let _ = crate::models::runtime_cache_coordinator::bump_serve_batch_owner_shutdown_generation();
     let Some(registry) = QWEN_SERVE_BATCH_ENGINES.get() else {
         return;
     };

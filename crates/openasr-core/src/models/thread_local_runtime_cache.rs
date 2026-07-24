@@ -2,42 +2,31 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::LocalKey;
 
 pub(crate) fn canonical_runtime_cache_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Process-wide generation of native idle-unload sweeps, bumped once per
-/// successful `unload_idle_native_model_runtime_caches` call.
-///
-/// The thread-local runtime caches in this module (and the per-family caches
-/// built on it) live in the TLS of whatever worker thread ran the model --
-/// typically a reused `spawn_blocking` thread -- so the idle-unload reaper,
-/// which runs on a different thread, cannot drop them directly. Instead each
-/// cache records the generation it was last synced at and discards its
-/// resident runtimes the next time its owning thread touches it after the
-/// generation has moved on. Release is therefore *lazy*: a runtime pinned in
-/// a thread that never runs that model family again stays resident until the
-/// thread itself exits (for tokio's blocking pool, after its keep-alive
-/// expiry) -- but it can never be handed out as a cache hit again.
-static RUNTIME_CACHE_UNLOAD_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-/// Current idle-unload generation. `Relaxed` is sufficient: this is a coarse
-/// "has an unload happened since this cache was filled" signal, not a
-/// synchronization primitive.
-pub(crate) fn current_unload_generation() -> u64 {
-    RUNTIME_CACHE_UNLOAD_GENERATION.load(Ordering::Relaxed)
-}
-
-/// Marks one idle-unload sweep. Called by
-/// `unload_idle_native_model_runtime_caches` after the process-lifetime
-/// dispatch caches have been dropped, so the thread-local caches follow suit
-/// on their owning threads' next use.
-pub(crate) fn bump_unload_generation() {
-    RUNTIME_CACHE_UNLOAD_GENERATION.fetch_add(1, Ordering::Relaxed);
-}
+// Idle-unload generation is the unified runtime-cache coordinator epoch.
+// Historical dual counters (`RUNTIME_CACHE_UNLOAD_GENERATION` here and
+// `RUNTIME_BUILD_GENERATION` on serve-batch keys) collapsed into one clock so
+// TLS maps, prepared caches, process pools, and serve-batch engines all observe
+// the same invalidation.
+//
+// The thread-local runtime caches in this module (and the per-family caches
+// built on it) live in the TLS of whatever worker thread ran the model --
+// typically a reused `spawn_blocking` thread -- so the idle-unload reaper,
+// which runs on a different thread, cannot drop them directly. Instead each
+// cache records the generation it was last synced at and discards its
+// resident runtimes the next time its owning thread touches it after the
+// generation has moved on. Release is therefore *lazy*: a runtime pinned in
+// a thread that never runs that model family again stays resident until the
+// thread itself exits (for tokio's blocking pool, after its keep-alive
+// expiry) -- but it can never be handed out as a cache hit again.
+pub(crate) use crate::models::runtime_cache_coordinator::{
+    bump_unload_generation, current_unload_generation,
+};
 
 /// Removes and returns the entry for `key` from a map of
 /// `(unload generation, runtime)` pairs, discarding every entry (the

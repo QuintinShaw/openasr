@@ -46,6 +46,7 @@ pub(crate) mod prepared_runtime_cache;
 pub(crate) mod pyannote;
 pub mod qwen;
 pub(crate) mod runtime_asset_bootstrap;
+pub(crate) mod runtime_cache_coordinator;
 pub(crate) mod runtime_component_bootstrap;
 pub(crate) mod runtime_contract;
 pub(crate) mod runtime_preflight;
