@@ -2149,6 +2149,43 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         })
     }
 
+    /// Compute a fused device-side top-1 token from an already-materialized
+    /// decoder hidden row. This avoids allocating a separate full-vocabulary
+    /// logits executor after a resident prefill graph has populated its KV.
+    pub(crate) fn fused_logits_top1_from_hidden(
+        &mut self,
+        hidden: &[f32],
+    ) -> Result<Option<u32>, GgmlCpuGraphError> {
+        let Some(fused_logits_head) = self.fused_logits_head.as_ref() else {
+            return Ok(None);
+        };
+        if hidden.len() != self.dims.d_model {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder fused top1 hidden width mismatch",
+            });
+        }
+        let mut graph = self.runner.start_graph();
+        let hidden_tensor =
+            graph.new_tensor_2d_f32(self.dims.d_model, 1, "qwen_llm_fused_logits_hidden")?;
+        graph.set_input(hidden_tensor)?;
+        let top1 =
+            build_fused_logits_top1(&self.arena, fused_logits_head, &mut graph, hidden_tensor, 1)?;
+        graph.set_output(top1)?;
+        graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_fused_logits_hidden")?;
+        let token_id = graph
+            .compute_output_i32(top1, 1)?
+            .first()
+            .copied()
+            .ok_or(GgmlCpuGraphError::OutputByteSizeMismatch {
+                expected: std::mem::size_of::<i32>(),
+                actual: 0,
+            })
+            .and_then(|token_id| {
+                validate_fused_top1_token_id(token_id, fused_logits_head.vocab_size)
+            })?;
+        Ok(Some(token_id))
+    }
+
     /// Run an entire prompt prefix as one causal multi-query LLM graph. This is
     /// the prefill counterpart to `run_step`: K/V for all prompt rows are written
     /// by one `set_rows` call per layer, guarded by a `[kv, query, 1, 1]` causal
