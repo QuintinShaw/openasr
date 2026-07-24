@@ -13,6 +13,8 @@ use std::{
 
 use tokio::sync::mpsc;
 
+use crate::ModelSessionPermit;
+
 use super::*;
 
 pub(crate) struct BackendJob {
@@ -44,7 +46,7 @@ pub(crate) struct BackendSuccess {
 
 pub(crate) enum BackendResult {
     Final(BackendSuccess),
-    Error(String),
+    Error(ApiError),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -352,6 +354,10 @@ pub(crate) enum NativeStreamingWorkerMessage {
         /// against it; the WS session and any external supervisor hold their
         /// own clones of the same `Arc<AttachToken>`.
         token: Arc<AttachToken>,
+        /// The model-capacity permit. The worker owns it until this attached
+        /// session has actually returned, including after the WS transport has
+        /// disconnected, so a detached blocking decode cannot be overlapped.
+        model_session_permit: Option<ModelSessionPermit>,
     },
 }
 
@@ -381,9 +387,18 @@ pub(crate) struct NativeStreamingDecodeWorker {
 }
 
 impl NativeStreamingDecodeWorker {
+    #[cfg(test)]
     pub(crate) async fn attach(
         key: NativeStreamingWorkerKey,
         session: Box<dyn NativeAsrSession>,
+    ) -> Result<Self, String> {
+        Self::attach_admitted(key, session, None).await
+    }
+
+    pub(crate) async fn attach_admitted(
+        key: NativeStreamingWorkerKey,
+        session: Box<dyn NativeAsrSession>,
+        model_session_permit: Option<ModelSessionPermit>,
     ) -> Result<Self, String> {
         let (command_tx, command_rx) = mpsc::channel::<NativeStreamingCommandEnvelope>(
             NATIVE_STREAMING_COMMAND_QUEUE_CAPACITY,
@@ -414,6 +429,7 @@ impl NativeStreamingDecodeWorker {
                 outcomes: outcome_tx,
                 finalize_requested: Arc::clone(&finalize_requested),
                 token: Arc::clone(&token),
+                model_session_permit,
             })
             .await
         {
@@ -766,7 +782,12 @@ pub(crate) fn spawn_native_streaming_worker(
                         outcomes,
                         finalize_requested,
                         token,
+                        model_session_permit,
                     } => {
+                        // Keep the capacity permit owned by this worker thread
+                        // until `run_native_streaming_session_on_worker` returns.
+                        // A disconnected WS cannot release it early.
+                        let _model_session_permit = model_session_permit;
                         // Record this attach as the current occupant only now,
                         // as the thread actually begins driving it -- so
                         // external supervisors always act on the attach that
@@ -965,13 +986,18 @@ pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime) {
     });
 }
 
-async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {
+pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {
     if runtime.backend != openasr_core::BackendKind::Native {
         return;
     }
     let Some(model_pack_path) = runtime.model_pack_path.clone() else {
         // Fresh install / no model installed yet: nothing to warm. The daemon
         // still serves `/health`; a bound pack arrives on a future restart.
+        return;
+    };
+    // Warmup is opportunistic. It must not queue behind an active request or
+    // allocate a second runtime; a real request owns the capacity slot first.
+    let Ok(model_session_permit) = runtime.acquire_native_execution() else {
         return;
     };
     let Some(adapter) = openasr_core::native_runtime_model_adapter_for_path(&model_pack_path)
@@ -1016,7 +1042,7 @@ async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {
     };
     let key =
         NativeStreamingWorkerKey::new(model_pack.root.clone(), hardware_target, inference_threads);
-    attach_and_run_boot_warmup(key, session).await;
+    attach_and_run_boot_warmup(key, session, Some(model_session_permit)).await;
 }
 
 /// The generic (session-agnostic) half of the boot warm-up: attach `session`
@@ -1030,8 +1056,11 @@ async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {
 pub(crate) async fn attach_and_run_boot_warmup(
     key: NativeStreamingWorkerKey,
     session: Box<dyn NativeAsrSession>,
+    model_session_permit: Option<ModelSessionPermit>,
 ) {
-    let Ok(mut worker) = NativeStreamingDecodeWorker::attach(key, session).await else {
+    let Ok(mut worker) =
+        NativeStreamingDecodeWorker::attach_admitted(key, session, model_session_permit).await
+    else {
         return;
     };
     let envelope = NativeStreamingCommandEnvelope {
@@ -1283,8 +1312,6 @@ async fn run_realtime_backend_job(runtime: ServerRuntime, job: BackendJob) -> Ba
                 words,
             })
         }
-        Err(error) => BackendResult::Error(format!(
-            "Could not transcribe completed realtime utterance: {error}"
-        )),
+        Err(error) => BackendResult::Error(error),
     }
 }

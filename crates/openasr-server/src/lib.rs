@@ -1,8 +1,11 @@
 mod idle_activity;
+mod model_admission;
 mod realtime;
 mod routes;
 
 pub(crate) use idle_activity::{NativeActivityGuard, spawn_idle_unload_reaper};
+pub use model_admission::NativeExecutionSupervisor;
+pub(crate) use model_admission::{ModelSessionAdmissionError, ModelSessionPermit};
 pub(crate) use routes::config::*;
 pub(crate) use routes::history::*;
 pub(crate) use routes::models_api::*;
@@ -1162,6 +1165,9 @@ fn resolve_instance_token(launch_option: Option<String>) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerRuntime {
     pub backend: BackendKind,
+    /// Process-wide native execution supervisor shared by every server entry
+    /// point that can allocate or run a ggml model runtime.
+    pub native_execution: NativeExecutionSupervisor,
     pub ffmpeg_bin: Option<std::path::PathBuf>,
     /// Whether `ffmpeg_bin` came from an explicit operator choice (CLI flag,
     /// env var, or config) rather than PATH auto-discovery -- see
@@ -1175,6 +1181,7 @@ impl Default for ServerRuntime {
     fn default() -> Self {
         Self {
             backend: BackendKind::Mock,
+            native_execution: NativeExecutionSupervisor::default(),
             ffmpeg_bin: None,
             ffmpeg_bin_explicit: false,
             model_pack_path: None,
@@ -1183,6 +1190,15 @@ impl Default for ServerRuntime {
 }
 
 impl ServerRuntime {
+    /// Acquires the server-wide native execution permit for the validated
+    /// runtime pack. Every ggml ASR execution path enters through this method.
+    pub(crate) fn acquire_native_execution(&self) -> Result<ModelSessionPermit, ApiError> {
+        let model_identity = native_model_session_key(self)?;
+        self.native_execution
+            .try_acquire(model_identity)
+            .map_err(ApiError::ModelSessionCapacity)
+    }
+
     /// Validates the runtime is *safe to serve with*, not that a model is
     /// installed: no model bound at all (`model_pack_path: None`) is a normal
     /// state for a fresh install with zero pulled models, and the daemon must
@@ -2256,6 +2272,7 @@ pub(crate) enum ApiError {
     Multipart(axum::extract::multipart::MultipartError),
     AudioPreparation(AudioPreparationError),
     Backend(openasr_core::BackendError),
+    ModelSessionCapacity(ModelSessionAdmissionError),
     BackendJoin(tokio::task::JoinError),
     Pull(PullError),
     Registry(openasr_core::RegistryError),
@@ -2311,6 +2328,11 @@ impl std::fmt::Display for ApiError {
                 )
             }
             Self::Backend(error) => write!(f, "Could not transcribe audio: {error}"),
+            Self::ModelSessionCapacity(error) => write!(
+                f,
+                "Model '{}' is at its concurrent native session limit ({}). Retry when an existing request finishes, or increase --max-native-sessions-per-model if this host has enough memory.",
+                error.model_identity, error.limit,
+            ),
             Self::BackendJoin(error) => {
                 write!(
                     f,
@@ -2387,6 +2409,13 @@ impl IntoResponse for ApiError {
             Self::AudioPreparation(error) => (
                 StatusCode::BAD_REQUEST,
                 format!("Could not prepare uploaded audio for transcription: {error}"),
+            ),
+            Self::ModelSessionCapacity(error) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Model '{}' is at its concurrent native session limit ({}). Retry when an existing request finishes, or increase --max-native-sessions-per-model if this host has enough memory.",
+                    error.model_identity, error.limit,
+                ),
             ),
             Self::Backend(error) => {
                 let status = match &error {
@@ -2543,6 +2572,26 @@ struct ErrorBody {
 #[cfg(test)]
 #[path = "http_wire_bindings_test.rs"]
 mod http_wire_bindings_test;
+
+#[cfg(test)]
+mod model_session_capacity_error_tests {
+    use std::num::NonZeroUsize;
+
+    use axum::response::IntoResponse;
+
+    use super::{ApiError, ModelSessionAdmissionError, StatusCode};
+
+    #[test]
+    fn model_session_capacity_is_a_retryable_http_overload() {
+        let response = ApiError::ModelSessionCapacity(ModelSessionAdmissionError {
+            model_identity: "native:whisper-small@pack-a".to_string(),
+            limit: NonZeroUsize::new(1).unwrap(),
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+}
 
 #[cfg(test)]
 #[path = "tests.rs"]

@@ -1,9 +1,9 @@
 //! Unit tests for the realtime module. Pure code-motion from `realtime.rs`.
 
-use std::{collections::BTreeMap, fs, sync::OnceLock};
+use std::{collections::BTreeMap, fs, num::NonZeroUsize, sync::OnceLock};
 
 use super::*;
-use crate::PairingCredentialState;
+use crate::{NativeExecutionSupervisor, PairingCredentialState};
 
 fn test_distribution() -> DistributionContext {
     let temp = tempfile::tempdir().unwrap();
@@ -1984,7 +1984,7 @@ async fn boot_native_warmup_runs_in_background_without_blocking_a_concurrent_tas
     let key = test_native_streaming_worker_key("boot-warmup-nonblocking");
 
     let spawn_started = Instant::now();
-    let warmup_handle = tokio::spawn(attach_and_run_boot_warmup(key, session));
+    let warmup_handle = tokio::spawn(attach_and_run_boot_warmup(key, session, None));
     assert!(
         spawn_started.elapsed() < Duration::from_millis(100),
         "spawning the boot warm-up must not itself block"
@@ -2008,6 +2008,40 @@ async fn boot_native_warmup_runs_in_background_without_blocking_a_concurrent_tas
 }
 
 #[tokio::test]
+async fn boot_native_warmup_skips_when_the_runtime_slot_is_occupied() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_path = temp.path().join("boot-warmup-capacity-skip.oasr");
+    write_xasr_streaming_fixture_pack(&pack_path, "boot-warmup-capacity-skip");
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap()),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_path),
+    };
+    let occupied_slot = runtime
+        .acquire_native_execution()
+        .expect("fixture runtime must admit the active native session");
+
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        warm_up_default_native_streaming_worker(runtime.clone()),
+    )
+    .await
+    .expect("boot warm-up must skip instead of waiting for a busy model slot");
+
+    assert!(
+        runtime.acquire_native_execution().is_err(),
+        "the only capacity slot must still belong to the active native session"
+    );
+    drop(occupied_slot);
+    assert!(
+        runtime.acquire_native_execution().is_ok(),
+        "skipped boot warm-up must not retain a capacity permit"
+    );
+}
+
+#[tokio::test]
 async fn health_answers_immediately_while_boot_warmup_is_artificially_slow() {
     use tower::ServiceExt;
 
@@ -2023,7 +2057,7 @@ async fn health_answers_immediately_while_boot_warmup_is_artificially_slow() {
     });
     let key = test_native_streaming_worker_key("health-vs-slow-warmup");
     let warmup_started = Instant::now();
-    let warmup_handle = tokio::spawn(attach_and_run_boot_warmup(key, session));
+    let warmup_handle = tokio::spawn(attach_and_run_boot_warmup(key, session, None));
 
     let app = crate::app_with_runtime(ServerRuntime::default());
     let response = tokio::time::timeout(
@@ -2072,7 +2106,7 @@ async fn boot_native_warmup_leaves_the_worker_thread_warm_for_the_next_real_atta
         warm_sleep: Duration::from_millis(50),
         warm_calls: Arc::clone(&warm_calls),
     });
-    attach_and_run_boot_warmup(key.clone(), boot_session).await;
+    attach_and_run_boot_warmup(key.clone(), boot_session, None).await;
     assert_eq!(warm_calls.load(Ordering::Acquire), 1);
 
     let (event_sender, _event_receiver) = mpsc::channel(8);
@@ -2353,6 +2387,7 @@ async fn failed_native_streaming_attach_send_retires_the_activity_guard() {
             outcomes: outcome_tx,
             finalize_requested: Arc::new(AtomicBool::new(false)),
             token,
+            model_session_permit: None,
         })
         .await;
     assert!(
@@ -2641,6 +2676,7 @@ async fn native_realtime_server_smoke_with_real_qwen_pack() {
     let (event_sender, mut event_receiver) = mpsc::channel(512);
     let runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
@@ -3023,6 +3059,7 @@ async fn session_capabilities_event_reports_frame_sync_only_for_xasr_zipformer()
     write_xasr_streaming_fixture_pack(&xasr_path, "xasr-zipformer-capability-test");
     let xasr_runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(xasr_path),
@@ -3042,6 +3079,7 @@ async fn session_capabilities_event_reports_frame_sync_only_for_xasr_zipformer()
     write_qwen_streaming_fixture_pack(&qwen_path, "qwen-capability-test");
     let qwen_runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(qwen_path),
@@ -3150,7 +3188,11 @@ async fn finish_discards_later_backend_finals_after_backend_error() {
     let (result_sender, result_receiver) = mpsc::channel(2);
     session.backend_results = Some(result_receiver);
     result_sender
-        .send(BackendResult::Error("backend failed".to_string()))
+        .send(BackendResult::Error(ApiError::Backend(
+            openasr_core::BackendError::NativeFailClosed {
+                reason: "backend failed".to_string(),
+            },
+        )))
         .await
         .unwrap();
     result_sender
@@ -3202,7 +3244,11 @@ async fn finish_remembers_backend_error_seen_before_shutdown() {
 
     assert!(
         session
-            .apply_backend_result(BackendResult::Error("backend failed".to_string()))
+            .apply_backend_result(BackendResult::Error(ApiError::Backend(
+                openasr_core::BackendError::NativeFailClosed {
+                    reason: "backend failed".to_string(),
+                }
+            )))
             .await
             .is_err()
     );
@@ -3236,6 +3282,73 @@ async fn finish_remembers_backend_error_seen_before_shutdown() {
         event_types,
         vec!["error", "audio.input.stopped", "session.closed"]
     );
+}
+
+#[tokio::test]
+async fn fallback_capacity_rejection_is_backend_not_ready_and_recoverable() {
+    let temp = tempfile::tempdir().unwrap();
+    let model_id = "xasr-fallback-capacity";
+    let pack_path = temp.path().join("xasr-fallback-capacity.oasr");
+    write_xasr_streaming_fixture_pack(&pack_path, model_id);
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap()),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_path),
+    };
+    let occupied_slot = runtime
+        .acquire_native_execution()
+        .expect("fixture runtime must admit the occupied native session");
+    let (event_sender, mut event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(runtime, test_distribution(), event_sender);
+    let session_id = session.session_id.0.clone();
+    session.controller = Some(started_controller(&session_id, model_id));
+    session.spawn_backend_worker();
+
+    session
+        .queue_utterance(BufferedUtterance {
+            utterance_id: TranscriptUtteranceId("utt_fallback_capacity".to_string()),
+            start_ms: 0,
+            end_ms: 20,
+            frames: vec![frame(1, 0, 1000)],
+            reason: RealtimeUtteranceEndReason::VadStop,
+        })
+        .await
+        .expect("fallback job submission must succeed before backend admission");
+    assert_eq!(session.pending_backend_jobs, 1);
+
+    let result = tokio::time::timeout(Duration::from_secs(1), session.recv_backend_result())
+        .await
+        .expect("realtime worker must report the capacity rejection")
+        .expect("realtime worker result channel must remain open");
+    assert!(matches!(
+        result,
+        BackendResult::Error(ApiError::ModelSessionCapacity(_))
+    ));
+    assert!(
+        session.apply_backend_result(result).await.is_ok(),
+        "capacity exhaustion must not fail the realtime fallback session"
+    );
+    assert_eq!(session.pending_backend_jobs, 0);
+    assert!(!session.backend_failed);
+    assert!(!session.backend_cancelled.load(Ordering::Relaxed));
+    assert!(!session.closed);
+
+    let event = event_receiver
+        .recv()
+        .await
+        .expect("capacity exhaustion must emit a realtime error event");
+    assert_eq!(event.event_type, "error");
+    assert!(matches!(
+        event.event,
+        RealtimeEvent::Error(RealtimeErrorEvent {
+            code: RealtimeErrorCode::BackendNotReady,
+            recoverable: true,
+            ..
+        })
+    ));
+    drop(occupied_slot);
 }
 
 #[tokio::test]
@@ -3305,6 +3418,7 @@ async fn session_start_rejects_xasr_hotwords_from_active_native_capabilities() {
     write_xasr_streaming_fixture_pack(&pack_path, model_id);
     let runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
@@ -3347,6 +3461,7 @@ async fn session_start_accepts_hotwords_for_supporting_native_model() {
     write_moonshine_streaming_fixture_pack(&pack_path, model_id);
     let runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
@@ -3386,6 +3501,7 @@ async fn native_streaming_configured_event_preserves_diarize_request() {
     let _wespeaker = EnvVarGuard::set("OPENASR_WESPEAKER_PACK", &wespeaker);
     let runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
@@ -3464,6 +3580,51 @@ async fn session_start_rejects_diarize_without_embedder_pack() {
             assert!(message.contains("speaker-embedder pack"));
         }
         other => panic!("expected startup config error, got {other:?}"),
+    }
+}
+
+#[test]
+fn hymt2_translation_worker_permit_lives_until_worker_exits() {
+    let supervisor = NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap());
+    let model_identity = format!("hymt2:{HYMT2_TRANSLATION_MODEL_ID}");
+    let permit = supervisor
+        .try_acquire(model_identity.clone())
+        .expect("translation worker must acquire its model slot");
+    let (initialized_sender, initialized_receiver) = std::sync::mpsc::channel();
+
+    let translation = WsSession::spawn_admitted_hymt2_translation_worker(permit, move || {
+        initialized_sender
+            .send(())
+            .expect("test must observe translation worker initialization");
+        Ok(move |_request: TranslationRequest| {
+            Ok(TranslationWorkerOutput {
+                text: "translated".to_string(),
+                timings: openasr_core::TranslationTimings::default(),
+            })
+        })
+    });
+
+    initialized_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("translation worker must initialize");
+    assert!(
+        supervisor.try_acquire(model_identity.clone()).is_err(),
+        "the worker must retain its Hy-MT2 permit while it remains alive"
+    );
+
+    drop(translation);
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Ok(permit) = supervisor.try_acquire(model_identity.clone()) {
+            drop(permit);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker exit must release the Hy-MT2 permit"
+        );
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 

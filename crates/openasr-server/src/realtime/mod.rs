@@ -296,7 +296,7 @@ pub(crate) async fn stream_transcription(
                     RealtimeErrorEvent {
                         code: realtime_error_code_for_api_error(&error),
                         message: error.to_string(),
-                        recoverable: false,
+                        recoverable: matches!(error, ApiError::ModelSessionCapacity(_)),
                     },
                     timestamp_now(),
                 ) {
@@ -448,7 +448,9 @@ async fn handle_websocket(
                         result_timeout.as_secs()
                     );
                     let _ = session
-                        .apply_backend_result(BackendResult::Error(message))
+                        .apply_backend_result(BackendResult::Error(ApiError::Backend(
+                            openasr_core::BackendError::NativeFailClosed { reason: message },
+                        )))
                         .await;
                     break;
                 }
@@ -887,6 +889,7 @@ fn resolve_model(
 
 fn realtime_error_code_for_api_error(error: &ApiError) -> RealtimeErrorCode {
     match error {
+        ApiError::ModelSessionCapacity(_) => RealtimeErrorCode::BackendNotReady,
         ApiError::Backend(_) | ApiError::BackendJoin(_) => RealtimeErrorCode::BackendCrashed,
         ApiError::AudioPreparation(_) => RealtimeErrorCode::UnsupportedAudioFormat,
         _ => RealtimeErrorCode::StartupConfigError,

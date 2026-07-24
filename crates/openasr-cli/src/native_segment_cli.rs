@@ -526,6 +526,7 @@ pub(super) async fn serve(
     backend_kind: Option<BackendKind>,
     runtime_paths: RuntimePathOverrides,
     model_pack: Option<&Path>,
+    max_native_sessions_per_model: std::num::NonZeroUsize,
     security: ServeSecurityOptions,
 ) -> Result<()> {
     let home = openasr_home()?;
@@ -599,6 +600,9 @@ pub(super) async fn serve(
         addr,
         openasr_server::ServerRuntime {
             backend,
+            native_execution: openasr_server::NativeExecutionSupervisor::new(
+                max_native_sessions_per_model,
+            ),
             ffmpeg_bin,
             ffmpeg_bin_explicit,
             model_pack_path: model_source.model_pack_path,

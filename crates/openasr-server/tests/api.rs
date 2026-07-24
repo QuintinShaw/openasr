@@ -934,6 +934,7 @@ async fn capabilities_endpoint_reflects_active_xasr_phrase_bias_capability() {
     write_xasr_gguf_runtime_source(&pack_root, "xasr-capability");
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
@@ -1036,6 +1037,7 @@ async fn native_transcription_without_installed_model_fails_closed_and_never_dow
     let app = openasr_server::app_with_runtime_and_distribution(
         openasr_server::ServerRuntime {
             backend: openasr_core::BackendKind::Native,
+            native_execution: openasr_server::NativeExecutionSupervisor::default(),
             ffmpeg_bin: None,
             ffmpeg_bin_explicit: false,
             model_pack_path: None,
@@ -1094,6 +1096,7 @@ async fn daemon_starts_and_reports_ready_with_zero_models_installed() {
     std::fs::create_dir_all(&home).unwrap();
     let runtime = openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: None,
@@ -1165,6 +1168,7 @@ async fn health_reports_model_bound_but_not_resident_before_any_load() {
     write_mock_gguf_runtime_source(&pack_root, None);
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
@@ -2278,6 +2282,7 @@ fn native_server_runtime_with_no_model_pack_is_accepted_at_startup_validation() 
     // transcription-request time, not a reason to refuse to serve at all.
     openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: None,
@@ -2293,6 +2298,7 @@ fn native_server_runtime_falls_back_to_path_stem_when_metadata_model_id_is_retir
     write_mock_gguf_runtime_source(&pack_root, Some("whisper-tiny:q4_0"));
     openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
@@ -2308,6 +2314,7 @@ fn native_server_runtime_falls_back_to_path_stem_when_metadata_model_id_is_inval
     write_mock_gguf_runtime_source(&pack_root, Some("bad::id"));
     openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
@@ -2323,6 +2330,7 @@ fn native_server_runtime_rejects_reserved_oasr_container_magic() {
     write_reserved_oasr_runtime_source(&pack_root);
     let error = openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
@@ -4250,6 +4258,7 @@ async fn transcriptions_with_native_backend_fail_closed() {
     write_whisper_oasr_v1_fixture(&pack_root, "whisper-runtime");
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root.clone()),
@@ -4272,6 +4281,7 @@ async fn transcriptions_with_native_xasr_hotword_returns_model_unsupported_error
     write_xasr_gguf_runtime_source(&pack_root, model_id);
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
@@ -4303,6 +4313,7 @@ async fn transcriptions_with_native_backend_model_mismatch_returns_bad_request()
     write_whisper_oasr_v1_fixture(&pack_root, "whisper-runtime");
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root.clone()),
@@ -4339,6 +4350,7 @@ async fn transcriptions_with_native_backend_accepts_quant_alias_against_legacy_h
     write_whisper_oasr_v1_fixture(&pack_root, "mimo-v2.5-asr-q4_k");
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root.clone()),
@@ -4368,6 +4380,7 @@ async fn transcriptions_with_native_backend_and_diarize_returns_bad_request() {
     write_whisper_oasr_v1_fixture(&pack_root, "whisper-runtime");
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root.clone()),
@@ -4386,6 +4399,7 @@ async fn transcriptions_with_native_backend_and_diarize_returns_bad_request() {
 async fn transcriptions_with_native_backend_reject_retired_legacy_model_alias() {
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: None,
@@ -4414,6 +4428,7 @@ async fn transcriptions_with_native_backend_accepts_live_catalog_family_bare_met
     write_whisper_oasr_v1_fixture(&pack_root, "whisper-large-v3-turbo");
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root.clone()),
@@ -4436,6 +4451,7 @@ async fn stream_transcriptions_with_native_backend_reject_empty_model_form_value
     write_mock_gguf_runtime_source(&pack_root, Some("native-pack"));
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
@@ -4461,6 +4477,7 @@ async fn stream_transcriptions_with_native_backend_reject_empty_model_form_value
 async fn stream_transcriptions_with_mock_backend_emits_protocol_events() {
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Mock,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: None,
@@ -4501,6 +4518,7 @@ async fn stream_transcription_succeeds_when_history_cannot_be_recorded() {
     let app = openasr_server::app_with_runtime_and_distribution(
         openasr_server::ServerRuntime {
             backend: openasr_core::BackendKind::Mock,
+            native_execution: openasr_server::NativeExecutionSupervisor::default(),
             ffmpeg_bin: None,
             ffmpeg_bin_explicit: false,
             model_pack_path: None,
@@ -4538,6 +4556,7 @@ async fn static_bearer_remote_compute_stream_transcription_records_server_histor
     let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
         openasr_server::ServerRuntime {
             backend: openasr_core::BackendKind::Mock,
+            native_execution: openasr_server::NativeExecutionSupervisor::default(),
             ffmpeg_bin: None,
             ffmpeg_bin_explicit: false,
             model_pack_path: None,
@@ -4601,6 +4620,7 @@ async fn stream_transcriptions_with_native_backend_reject_srt_response_format() 
     write_mock_gguf_runtime_source(&pack_root, Some("native-pack"));
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
@@ -4629,6 +4649,7 @@ async fn stream_transcriptions_with_native_backend_reject_model_mismatch() {
     write_mock_gguf_runtime_source(&pack_root, Some("native-pack"));
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
@@ -4659,6 +4680,7 @@ async fn stream_transcriptions_with_native_xasr_hotword_emits_model_unsupported_
     write_xasr_gguf_runtime_source(&pack_root, model_id);
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
@@ -4696,6 +4718,7 @@ async fn stream_transcriptions_with_native_xasr_hotword_emits_model_unsupported_
 async fn stream_transcriptions_with_native_backend_reject_missing_model_pack_path() {
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: None,
@@ -4731,6 +4754,7 @@ async fn transcriptions_with_native_backend_srt_stays_fail_closed_for_unexecutab
     write_mock_gguf_runtime_source(&pack_root, Some("native-pack"));
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root.clone()),
@@ -4759,6 +4783,7 @@ async fn models_with_native_backend_lists_loaded_local_pack_id() {
     write_mock_gguf_runtime_source(&pack_root, Some("native-pack"));
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
@@ -4786,6 +4811,7 @@ async fn models_with_native_backend_and_no_pack_lists_empty_instead_of_erroring(
     // closed the way an actual transcription request does.
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: None,
