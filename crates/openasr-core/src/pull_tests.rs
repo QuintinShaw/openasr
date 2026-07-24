@@ -672,6 +672,8 @@ fn install_catalog_model_pack_from_path_accepts_uncatalogued_pack_via_filename_i
     assert_eq!(canonical_quant_tag(&installed.quant), "q8_0");
     assert_eq!(installed.pull, "moonshine-tiny:q8");
     assert_eq!(installed.source.as_deref(), Some("local"));
+    assert_eq!(installed.url, "");
+    assert_eq!(installed.hf_revision, "local");
     assert_eq!(installed.sha256, sha256_hex(&bytes));
     assert_eq!(installed.size_bytes, bytes.len() as u64);
     assert_eq!(list_installed_packs(temp.path()).unwrap().len(), 1);

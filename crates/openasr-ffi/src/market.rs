@@ -25,10 +25,11 @@
 //!   [`openasr_core::PullModelPackRequest`], which enforces https-only URLs,
 //!   streams a sha256 checked against the catalog-pinned digest, runs the GGUF /
 //!   runtime preflight, and installs atomically. [`openasr_install_local_pack`]
-//!   installs a user-provided `.oasr` (catalog digest match when present; otherwise pack-intrinsic identity + runtime preflight)
-//!   before installing. The app never gets to hand over a URL or a hash -- only a
-//!   catalog reference (`model:quant`), so it cannot redirect the download or
-//!   bypass the digest check.
+//!   installs a user-provided `.oasr`: prefers a unique public-catalog
+//!   sha256/size match when present, otherwise pack-intrinsic identity, always
+//!   gated by runtime preflight. Network pulls still take only a catalog
+//!   reference (`model:quant`) so the app cannot redirect the download or
+//!   bypass the catalog-pinned digest.
 //!
 //! The app supplies its own sandbox directory as the OpenASR home (the iOS
 //! equivalent of `OPENASR_HOME`); packs install under `<home>/models/...`, and
@@ -342,11 +343,16 @@ pub unsafe extern "C" fn openasr_pull_model(
     })
 }
 
-/// Verifies and installs a `.oasr` pack the app already has on disk (e.g. one
-/// side-loaded or copied into the app) without downloading it. The pack's
-/// Prefer a unique public-catalog digest match; otherwise install from pack identity + preflight
-/// closed with [`OpenAsrStatus::PullFailed`] -- so a hand-supplied file cannot be
-/// installed as a model the catalog never vouched for.
+/// Installs a `.oasr` pack the app already has on disk (side-loaded or copied)
+/// without downloading it.
+///
+/// Resolution: if the file's sha256+size matches exactly one **public** catalog
+/// quant, that catalog identity is used; otherwise the pack is installed from
+/// pack/filename identity. In both cases the shared runtime preflight
+/// (GGUF structure + native pack contract) must pass, or the call fails closed
+/// with [`OpenAsrStatus::PullFailed`]. Uncatalogued packs are allowed for
+/// operator sideload (e.g. HF-published models not yet in the signed public
+/// catalog); integrity is the file digest + preflight, not catalog vouching.
 ///
 /// `oasr_path` is the local pack path; `home_dir` is the app's OpenASR home.
 /// `progress_cb` (optional) reports the verify/install phases. `out_installed_json`,
