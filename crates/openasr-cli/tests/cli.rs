@@ -740,30 +740,14 @@ fn mimo_asr_dev_pack_path() -> PathBuf {
     )
 }
 
-// The auto energy-VAD slicer picked 3 chunks for this ~69s fixture (same
-// chunk count firered-llm's own longform golden found for the identical
-// fixture). Each chunk decodes independently and, like every transcript from
-// this family, leads with the model's auto `<chinese>`/`<english>` language
-// marker -- which the runtime now strips per-utterance to match the reference
-// `mimo_audio.py::asr_sft` (see `strip_mimo_language_tags`), so no `<chinese>`
-// survives into the assembled longform text. All 5 source segments
-// (EN/ZH/EN/ZH/EN) are present, in order, with no dropped audio; the assembler
-// joins the (already tag-stripped, trimmed) chunk texts with a single space
-// (`longform::assembler` `.join(" ")`), so the two chunk seams surface as a
-// join space -- and the first seam additionally shows a single duplicated "我"
-// (the VAD overlap re-transcribing the boundary word), the same class of seam
-// artifact firered-llm's own longform golden documents.
-//
-// `concat!` keeps the literal robust to line wrapping: a trailing-`\`
-// continuation eats leading whitespace on the next line, which silently
-// dropped a significant space at the "我 我通常" seam in this const's first
-// (buggy) form.
-//
-// Confirmed byte-for-byte against a clean-window re-run of this test against
-// the real pack (asserted equal below).
+// The longform assembler joins retained, trimmed segment texts with one space.
+// The spaces inside this `concat!` are therefore golden bytes. The same
+// family's single-utterance EN->ZH golden
+// (`mimo_asr::executor::tests::golden_diff_end_to_end_transcribe_en_zh_mixed_wav`)
+// also asserts the EN->ZH space.
 const GOLDEN_MIMO_LONGFORM_EN_ZH_TEXT: &str = concat!(
     "And so, my fellow Americans, ask not what your country can do for you. ",
-    "Ask what you can do for your country.",
+    "Ask what you can do for your country. ",
     "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，",
     "听说那里的麻婆豆腐特别正宗。周末的时候，我 我通常会读书或者看一部电影放松一下。",
     "And so, my fellow Americans, ask not what your country can do for you, ",
