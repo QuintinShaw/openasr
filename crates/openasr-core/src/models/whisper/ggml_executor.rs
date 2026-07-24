@@ -20,7 +20,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,7 +38,8 @@ use crate::models::incremental_streaming_driver::{
 use crate::models::prepared_runtime_cache::PreparedRuntimeCache;
 use crate::models::runtime_contract::MetadataContractError;
 use crate::models::thread_local_runtime_cache::{
-    UnloadGenerationGated, canonical_runtime_cache_path,
+    RuntimeCachePathIdentity, UnloadGenerationGated, canonical_runtime_cache_path,
+    runtime_cache_path_identity,
 };
 use crate::models::tokenizer_component_registry::materialize_builtin_tokenizer_for_architecture;
 use crate::nn::attn::{
@@ -320,8 +321,12 @@ struct WhisperDecoderPersistentStaticSession {
     plan: WhisperDecoderGraphPlan,
 }
 
-type WhisperEncoderPersistentSessionKey = (PathBuf, GgmlCpuGraphBackend);
-type WhisperDecoderPersistentSessionKey = (PathBuf, GgmlCpuGraphBackend);
+/// (pack path identity: canonical path + content fingerprint, backend). The
+/// content fingerprint ([`runtime_cache_path_identity`]) keeps an in-place
+/// pack replacement at the same path from reusing a persistent session whose
+/// resident weights came from the old bytes.
+type WhisperEncoderPersistentSessionKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+type WhisperDecoderPersistentSessionKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
 
 thread_local! {
     // Gated on the idle-unload generation: these sessions pin the resident
@@ -3379,7 +3384,7 @@ fn take_whisper_encoder_persistent_static_session(
         sessions
             .borrow_mut()
             .synced()
-            .remove(&(canonical_runtime_cache_path(runtime_path), backend))
+            .remove(&(runtime_cache_path_identity(runtime_path), backend))
     })
 }
 
@@ -3389,7 +3394,7 @@ fn store_whisper_encoder_persistent_static_session(
 ) {
     WHISPER_ENCODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
         let key = (
-            canonical_runtime_cache_path(runtime_path),
+            runtime_cache_path_identity(runtime_path),
             session.graph_config.backend,
         );
         sessions.borrow_mut().synced().insert(key, session);
@@ -3562,7 +3567,7 @@ fn take_or_build_whisper_decoder_persistent_static_session(
     let runtime_path = runtime_source.path();
     let graph_config = whisper_decoder_graph_config();
     let key = (
-        canonical_runtime_cache_path(runtime_path),
+        runtime_cache_path_identity(runtime_path),
         graph_config.backend,
     );
     WHISPER_DECODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
@@ -3603,7 +3608,7 @@ fn store_whisper_decoder_persistent_static_session(
         let mut sessions = sessions.borrow_mut();
         let sessions = sessions.synced();
         let key = (
-            canonical_runtime_cache_path(runtime_path),
+            runtime_cache_path_identity(runtime_path),
             session.graph_config.backend,
         );
         let pool = sessions.entry(key).or_default();

@@ -1,11 +1,16 @@
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufMetadata, GgufTensorDataReader};
-use crate::models::thread_local_runtime_cache::canonical_runtime_cache_path;
+use crate::models::thread_local_runtime_cache::{
+    RuntimeCachePathIdentity, runtime_cache_path_identity,
+};
 
 use super::decoder::XasrDecoder;
 use super::encoder_graph::{
@@ -28,10 +33,13 @@ const XASR_ZIPFORMER_STREAMING_WARMUP_FRAMES: usize = 13;
 const XASR_PROFILE_ENV: &str = "OPENASR_XASR_PROFILE";
 const MAX_IDLE_RUNTIMES_PER_KEY: usize = 2;
 
-/// Pool key: pack path + the backend the runtime's prepared encoder graph was
-/// built for. CPU and Metal runtimes must never conflate — a checkout for an
-/// accelerated session must not receive a CPU-frozen runtime (or vice versa).
-type RuntimePoolKey = (PathBuf, GgmlCpuGraphBackend);
+/// Pool key: pack path identity (canonical path + content fingerprint) + the
+/// backend the runtime's prepared encoder graph was built for. CPU and Metal
+/// runtimes must never conflate -- a checkout for an accelerated session must
+/// not receive a CPU-frozen runtime (or vice versa). The content fingerprint
+/// ([`runtime_cache_path_identity`]) keeps an in-place pack replacement at the
+/// same path from checking out a runtime built from the old bytes.
+type RuntimePoolKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
 type RuntimePool = HashMap<RuntimePoolKey, Vec<SendableRuntime>>;
 
 static XASR_PROCESS_RUNTIME_POOL: OnceLock<Mutex<RuntimePool>> = OnceLock::new();
@@ -177,7 +185,7 @@ impl Drop for PooledRuntime {
 
 pub(super) fn checkout_prepared_runtime(pack_path: &Path) -> Result<PooledRuntime, String> {
     let backend = xasr_zipformer_encoder_graph_config().backend;
-    let key = (canonical_runtime_cache_path(pack_path), backend);
+    let key = (runtime_cache_path_identity(pack_path), backend);
     if let Some(runtime) = runtime_pool()
         .lock()
         .map_err(|_| "xasr runtime pool lock poisoned".to_string())?
@@ -610,7 +618,7 @@ mod tests {
         };
 
         let key = (
-            canonical_runtime_cache_path(&pack),
+            runtime_cache_path_identity(&pack),
             xasr_zipformer_encoder_graph_config().backend,
         );
 

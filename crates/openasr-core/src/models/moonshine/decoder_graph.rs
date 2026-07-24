@@ -1,8 +1,7 @@
-use std::{
-    cell::RefCell,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{cell::RefCell, path::Path, sync::Arc};
+
+#[cfg(test)]
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -22,8 +21,8 @@ use crate::models::seq2seq_greedy_decode::{
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
-    with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
+    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
 };
 use crate::nn::decoder::{
     LlmResidentKvArena, Seq2SeqReusableDecodeGraph, allocate_zeroed_llm_resident_kv_arena,
@@ -52,11 +51,15 @@ const MOONSHINE_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 /// `16_384` headroom (`moonshine_encoder_graph_config`).
 const MOONSHINE_DECODER_GRAPH_SIZE_FLOOR: usize = 16_384;
 
-/// (canonical pack path, backend, cross frame count, adapter fingerprint).
-/// The adapter fingerprint MUST stay in this key: the runtime owns prepared
-/// cgraphs with the adapter tensors baked in, so reuse keyed only on the base
-/// pack would serve stale adapter graphs (correctness bug).
-type MoonshineDecoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend, usize, String);
+/// (pack path identity: canonical path + content fingerprint, backend, cross
+/// frame count, adapter fingerprint). The content fingerprint
+/// ([`runtime_cache_path_identity`]) keeps an in-place pack replacement at the
+/// same path from reusing a runtime built from the old bytes. The adapter
+/// fingerprint MUST stay in this key: the runtime owns prepared cgraphs with
+/// the adapter tensors baked in, so reuse keyed only on the base pack would
+/// serve stale adapter graphs (correctness bug).
+type MoonshineDecoderRuntimeCacheKey =
+    (RuntimeCachePathIdentity, GgmlCpuGraphBackend, usize, String);
 
 thread_local! {
     static MOONSHINE_DECODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<MoonshineDecoderRuntimeCacheKey, MoonshineDecoderGraphRuntime>> =
@@ -159,7 +162,7 @@ fn moonshine_decoder_runtime_cache_key(
     adapter: Option<&MoonshineLoraAdapter>,
 ) -> MoonshineDecoderRuntimeCacheKey {
     (
-        canonical_runtime_cache_path(runtime_path),
+        runtime_cache_path_identity(runtime_path),
         moonshine_decoder_graph_config(prefer_cpu_backend).backend,
         cross_frame_count,
         moonshine_adapter_cache_fingerprint(adapter),

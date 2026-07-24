@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::PhraseBiasConfig;
 use crate::WAV2VEC2_CTC_DECODE_POLICY_ID;
@@ -28,8 +28,8 @@ use crate::models::ggml_asr_executor::{
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
-    with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
+    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
 };
 use crate::{NativeAsrSession, WAV2VEC2_CTC_GGML_ADAPTER_ID};
 
@@ -42,7 +42,7 @@ use super::runtime_contract::{
 };
 use super::tokenizer::Wav2Vec2Tokenizer;
 
-type Wav2Vec2RuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
+type Wav2Vec2RuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
 
 thread_local! {
     static WAV2VEC2_CTC_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<Wav2Vec2RuntimeCacheKey, Wav2Vec2CtcPreparedRuntime>> =
@@ -124,7 +124,7 @@ fn transcribe_wav2vec2_ctc_pcm_cached(
     word_timestamps: bool,
 ) -> Result<Wav2Vec2CtcTranscription, String> {
     let backend = wav2vec2_ctc_encoder_graph_config().backend;
-    let key = (canonical_runtime_cache_path(pack_path), backend);
+    let key = (runtime_cache_path_identity(pack_path), backend);
     with_thread_local_cached_mut_by_key(
         &WAV2VEC2_CTC_RUNTIME_BY_KEY,
         key,
@@ -140,7 +140,7 @@ fn decode_wav2vec2_ctc_pcm_cached(
     phrase_bias: Option<&PhraseBiasConfig>,
 ) -> Result<CtcGreedyDecodeResult, String> {
     let backend = wav2vec2_ctc_encoder_graph_config().backend;
-    let key = (canonical_runtime_cache_path(pack_path), backend);
+    let key = (runtime_cache_path_identity(pack_path), backend);
     with_thread_local_cached_mut_by_key(
         &WAV2VEC2_CTC_RUNTIME_BY_KEY,
         key,

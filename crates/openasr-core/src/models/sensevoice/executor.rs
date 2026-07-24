@@ -2,7 +2,7 @@
 //! splice -> SAN-M encoder graph -> CTC greedy decode -> tag-prefix strip.
 //!
 //! Mirrors `parakeet_ctc::executor` (prepared-runtime cache keyed by
-//! `(canonical path, backend)`, shared CTC decode policy, snapshot/incremental
+//! `(pack path identity, backend)`, shared CTC decode policy, snapshot/incremental
 //! streaming driver). SenseVoice-specific: the request language selects the
 //! 4-token prompt fail-closed (`language::build_sensevoice_prompt`), and the
 //! decoded text's leading `<|lang|><|emotion|><|event|><|itn|>` tags are parsed
@@ -16,7 +16,10 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+#[cfg(test)]
+use std::path::PathBuf;
 
 use crate::PhraseBiasConfig;
 use crate::arch::block_stack::{OpenAsrBlockKind, OpenAsrOrchestrationShape};
@@ -37,8 +40,8 @@ use crate::models::ggml_asr_executor::{
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
-    with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
+    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
 };
 use crate::{NativeAsrSession, SENSEVOICE_GGML_ADAPTER_ID};
 
@@ -50,7 +53,7 @@ use super::runtime_contract::{SenseVoiceExecutionMetadata, parse_sensevoice_exec
 use super::tokenizer::SenseVoiceTokenizer;
 use super::{SenseVoiceTagShadow, strip_sensevoice_tag_prefix};
 
-type SenseVoiceRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
+type SenseVoiceRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
 
 thread_local! {
     static SENSEVOICE_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<SenseVoiceRuntimeCacheKey, SenseVoicePreparedRuntime>> =
@@ -258,7 +261,7 @@ fn decode_sensevoice_pcm_cached(
     phrase_bias: Option<&PhraseBiasConfig>,
 ) -> Result<CtcGreedyDecodeResult, String> {
     let backend = super::graph_config::sensevoice_encoder_graph_config().backend;
-    let key = (canonical_runtime_cache_path(pack_path), backend);
+    let key = (runtime_cache_path_identity(pack_path), backend);
     with_thread_local_cached_mut_by_key(
         &SENSEVOICE_RUNTIME_BY_KEY,
         key,
@@ -275,7 +278,7 @@ fn transcribe_sensevoice_pcm_cached(
     phrase_bias: Option<&PhraseBiasConfig>,
 ) -> Result<SenseVoiceTranscription, String> {
     let backend = super::graph_config::sensevoice_encoder_graph_config().backend;
-    let key = (canonical_runtime_cache_path(pack_path), backend);
+    let key = (runtime_cache_path_identity(pack_path), backend);
     with_thread_local_cached_mut_by_key(
         &SENSEVOICE_RUNTIME_BY_KEY,
         key,

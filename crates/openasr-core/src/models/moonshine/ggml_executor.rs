@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -35,8 +35,8 @@ use crate::models::incremental_streaming_driver::{
 };
 use crate::models::prepared_runtime_cache::PreparedRuntimeCache;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
-    with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
+    canonical_runtime_cache_path, runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
 };
 
 const MOONSHINE_EXECUTOR_ID: &str = "moonshine-ggml-executor-v1";
@@ -47,11 +47,14 @@ thread_local! {
         RefCell::new(BoundedRuntimeCache::new());
 }
 
-/// (canonical pack path, backend, adapter fingerprint). The adapter
-/// fingerprint MUST stay in this key — prepared encoder graphs embed the
+/// (pack path identity: canonical path + content fingerprint, backend,
+/// adapter fingerprint). The content fingerprint
+/// ([`runtime_cache_path_identity`]) keeps an in-place pack replacement at the
+/// same path from reusing a runtime built from the old bytes. The adapter
+/// fingerprint MUST stay in this key -- prepared encoder graphs embed the
 /// adapter tensors, so reuse keyed only on the base pack would be a
 /// correctness bug.
-type MoonshineEncoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend, String);
+type MoonshineEncoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend, String);
 
 #[derive(Debug, Error)]
 enum MoonshineGgmlExecutorError {
@@ -251,7 +254,7 @@ fn encode_with_cached_runtime(
 ) -> Result<MoonshineEncoderOutput, MoonshineEncoderError> {
     let encoder_backend = moonshine_encoder_graph_config().backend;
     let key = (
-        canonical_runtime_cache_path(runtime_path),
+        runtime_cache_path_identity(runtime_path),
         encoder_backend,
         moonshine_adapter_cache_fingerprint(adapter),
     );

@@ -1,4 +1,4 @@
-use std::{cell::RefCell, fmt, path::PathBuf};
+use std::{cell::RefCell, fmt};
 
 use thiserror::Error;
 
@@ -7,8 +7,8 @@ use crate::ggml_runtime::{
     GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader, env_toggle_with_raw,
 };
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
-    with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
+    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
 };
 
 use super::graph_config::{qwen_decoder_graph_config, qwen_runtime_graph_config};
@@ -21,11 +21,13 @@ const DEFAULT_RMS_NORM_EPSILON: f32 = 1e-6;
 const QWEN3_LLM_LOGITS_GRAPH_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
 const OPENASR_QWEN3_LLM_LOGITS_GGML_ENV: &str = "OPENASR_QWEN3_LLM_LOGITS_GGML";
 
-/// (canonical pack path, backend): identifies the resident fused logits-head
-/// graph executor for a loaded pack, mirroring the `(PathBuf,
-/// GgmlCpuGraphBackend)` key convention used by the qwen audio-encoder and
-/// firered-aed encoder/decoder runtime caches.
-type QwenLogitsHeadExecutorCacheKey = (PathBuf, GgmlCpuGraphBackend);
+/// (pack path identity: canonical path + content fingerprint, backend):
+/// identifies the resident fused logits-head graph executor for a loaded pack,
+/// mirroring the `(RuntimeCachePathIdentity, GgmlCpuGraphBackend)` key
+/// convention used by the qwen audio-encoder and firered-aed encoder/decoder
+/// runtime caches. The fingerprint keeps an in-place pack replacement at the
+/// same path from reusing an executor built from the old bytes.
+type QwenLogitsHeadExecutorCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
 
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3AsrLlmLogitsHead {
@@ -332,7 +334,7 @@ pub(crate) fn load_llm_logits_head_from_reader_with_tensor_names(
         output_weight_layout,
         ggml_executor_cache_key: raw_output_weight.as_ref().map(|_| {
             (
-                canonical_runtime_cache_path(reader.tensor_index().path()),
+                runtime_cache_path_identity(reader.tensor_index().path()),
                 qwen_runtime_graph_config().backend,
             )
         }),
@@ -693,6 +695,8 @@ fn resolve_output_weight_layout(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
@@ -835,7 +839,13 @@ mod tests {
 
     fn ggml_logits_head_test_cache_key(id: usize) -> QwenLogitsHeadExecutorCacheKey {
         (
-            PathBuf::from(format!("/tmp/openasr-test-logits-head-cache-{id}.gguf")),
+            // Test-only identity: the fake path does not exist, so a stable
+            // fixture fingerprint stands in for the content fingerprint the
+            // production path (`runtime_cache_path_identity`) would compute.
+            RuntimeCachePathIdentity {
+                path: PathBuf::from(format!("/tmp/openasr-test-logits-head-cache-{id}.gguf")),
+                fingerprint: format!("test:logits-head-{id}"),
+            },
             GgmlCpuGraphBackend::Cpu,
         )
     }

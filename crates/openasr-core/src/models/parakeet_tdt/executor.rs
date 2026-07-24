@@ -2,7 +2,7 @@
 //! joint encoder projection) -> host TDT greedy decode -> detokenize.
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::api::backend::WordTimestamp;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
@@ -15,8 +15,8 @@ use crate::models::incremental_streaming_driver::{
 };
 use crate::models::parakeet_ctc::frontend::ParakeetFrontend;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
-    with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
+    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
 };
 use crate::{NativeAsrSession, PARAKEET_TDT_GGML_ADAPTER_ID};
 
@@ -33,7 +33,7 @@ use super::runtime_contract::{
 };
 use super::tokenizer::ParakeetTdtTokenizer;
 
-type ParakeetTdtRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
+type ParakeetTdtRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
 
 thread_local! {
     static PARAKEET_TDT_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<ParakeetTdtRuntimeCacheKey, ParakeetTdtPreparedRuntime>> =
@@ -133,14 +133,17 @@ impl ParakeetTdtPreparedRuntime {
 }
 
 /// Transcribe 16 kHz mono f32 PCM through a cached prepared runtime keyed by
-/// `(canonical pack path, backend)`.
+/// `(pack path identity: canonical path + content fingerprint, backend)`. The
+/// content fingerprint ([`runtime_cache_path_identity`]) keeps an in-place
+/// pack replacement at the same path from reusing a runtime built from the
+/// old bytes.
 pub(crate) fn transcribe_parakeet_tdt_pcm_cached(
     samples: &[f32],
     pack_path: &Path,
     word_timestamps: bool,
 ) -> Result<ParakeetTdtTranscription, String> {
     let backend = parakeet_tdt_encoder_graph_config().backend;
-    let key = (canonical_runtime_cache_path(pack_path), backend);
+    let key = (runtime_cache_path_identity(pack_path), backend);
     with_thread_local_cached_mut_by_key(
         &PARAKEET_TDT_RUNTIME_BY_KEY,
         key,

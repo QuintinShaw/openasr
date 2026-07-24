@@ -1322,6 +1322,11 @@ fn decoder_quantized_tensor_with_empty_bytes_fails_closed() {
 fn encoder_persistent_session_cache_is_backend_scoped() {
     let temp = tempfile::tempdir().expect("tempdir");
     let runtime_path = temp.path().join("whisper-backend-scope.gguf");
+    // The pack file must exist: cache keys carry the pack content
+    // fingerprint, and an unreadable pack fails closed (a session stored
+    // under it must never be handed back out), so store + take only observe
+    // the same key against a readable path.
+    std::fs::write(&runtime_path, b"whisper-backend-scope-fixture").expect("write fixture pack");
     let cpu_config = GgmlCpuGraphConfig::conservative_default();
     let session = WhisperEncoderPersistentStaticSession {
         runner: GgmlCpuGraphRunner::new(cpu_config).expect("runner"),

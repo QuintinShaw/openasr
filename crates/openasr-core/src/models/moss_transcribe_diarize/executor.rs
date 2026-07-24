@@ -20,7 +20,7 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use thiserror::Error;
 
@@ -45,8 +45,8 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
-    with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
+    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
 };
 use crate::models::whisper::whisper_log_mel_spectrogram_16khz_mono_v0;
 
@@ -218,8 +218,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
 /// pack, re-read every encoder tensor off disk, and re-uploaded every decoder
 /// layer's weights, on every single call (including every chunk of the same
 /// longform request).
-type MossTdEncoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
-type MossTdDecoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
+/// Keyed by (pack path identity: canonical path + content fingerprint,
+/// backend); the content fingerprint ([`runtime_cache_path_identity`]) keeps
+/// an in-place pack replacement at the same path from reusing a runtime whose
+/// mmapped weights came from the old bytes.
+type MossTdEncoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+type MossTdDecoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
 
 thread_local! {
     static MOSS_TD_ENCODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<MossTdEncoderRuntimeCacheKey, MossEncoderRuntime>> =
@@ -435,7 +439,7 @@ fn encode_moss_td_chunks_with_cached_runtime(
     samples: &[f32],
 ) -> Result<(Vec<f32>, usize), MossTdExecutorError> {
     let key = (
-        canonical_runtime_cache_path(runtime_path),
+        runtime_cache_path_identity(runtime_path),
         moss_td_encoder_graph_config().backend,
     );
     // Upstream `_compute_audio_token_length`'s stride: hop_length * the
@@ -507,7 +511,7 @@ fn run_moss_td_decoder_with_cached_runtime(
     tokenizer: &MossTdTokenizer,
 ) -> Result<String, MossTdExecutorError> {
     let key = (
-        canonical_runtime_cache_path(runtime_path),
+        runtime_cache_path_identity(runtime_path),
         moss_td_runtime_graph_config().backend,
     );
     with_thread_local_cached_mut_by_key(

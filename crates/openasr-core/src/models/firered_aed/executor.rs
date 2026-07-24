@@ -25,7 +25,7 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use thiserror::Error;
 
@@ -42,8 +42,8 @@ use crate::models::incremental_streaming_driver::{
 };
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
-    with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
+    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
 };
 
 use super::decoder_graph::{
@@ -70,8 +70,11 @@ thread_local! {
         RefCell::new(BoundedRuntimeCache::new());
 }
 
-type FireRedAedEncoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
-/// (canonical pack path, backend). The decoder's cross-KV cache is now
+type FireRedAedEncoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+/// (pack path identity: canonical path + content fingerprint, backend). The
+/// content fingerprint ([`runtime_cache_path_identity`]) keeps an in-place
+/// pack replacement at the same path from reusing a runtime built from the
+/// old bytes. The decoder's cross-KV cache is now
 /// allocated ONCE per pack at this architecture's chunk-cap capacity (see
 /// [`FireRedDecoderGraphRuntime::new`] / `firered_decoder_cross_capacity_frames`),
 /// not at any one utterance's exact encoder frame count -- so a cached
@@ -80,7 +83,7 @@ type FireRedAedEncoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
 /// shared longform safety policy already guarantees). Frame count therefore
 /// no longer belongs in this key (see issue tracking the VAD 0%-cache-hit
 /// regression this fixes).
-type FireRedAedDecoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
+type FireRedAedDecoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
 
 fn encode_with_cached_runtime(
     runtime_path: &Path,
@@ -89,7 +92,7 @@ fn encode_with_cached_runtime(
     n_frames: usize,
 ) -> Result<FireRedEncoderOutput, super::encoder_graph::FireRedEncoderError> {
     let key = (
-        canonical_runtime_cache_path(runtime_path),
+        runtime_cache_path_identity(runtime_path),
         firered_encoder_graph_config().backend,
     );
     with_thread_local_cached_mut_by_key(
@@ -112,7 +115,7 @@ fn decode_with_cached_runtime(
     super::decoder_graph::FireRedDecoderError,
 > {
     let key = (
-        canonical_runtime_cache_path(runtime_path),
+        runtime_cache_path_identity(runtime_path),
         firered_decoder_graph_config().backend,
     );
     with_thread_local_cached_mut_by_key(

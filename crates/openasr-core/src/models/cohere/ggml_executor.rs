@@ -1,9 +1,11 @@
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use thiserror::Error;
 
+#[cfg(test)]
+use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -49,8 +51,8 @@ use crate::models::runtime_prepared_registry::{
     BuiltinPreparedRuntimeCache, BuiltinPreparedRuntimeRegistryError,
 };
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
-    with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
+    canonical_runtime_cache_path, runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
 };
 
 const COHERE_EXECUTOR_ID: &str = "cohere-transcribe-ggml-executor-v1";
@@ -66,8 +68,11 @@ thread_local! {
         RefCell::new(BoundedRuntimeCache::new());
 }
 
-type CohereEncoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
-/// (canonical pack path, backend). Used to be `(path, backend, frame_count,
+type CohereEncoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+/// (pack path identity: canonical path + content fingerprint, backend). The
+/// content fingerprint ([`runtime_cache_path_identity`]) keeps an in-place
+/// pack replacement at the same path from reusing a runtime built from the
+/// old bytes. Used to be `(path, backend, frame_count,
 /// hidden_size)`: the decoder's cross-KV cache is now allocated ONCE per pack
 /// at this architecture's chunk-cap capacity (see
 /// `CohereDecoderGraphRuntime::new` / `cohere_decoder_cross_capacity_frames`),
@@ -75,7 +80,7 @@ type CohereEncoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
 /// is reusable across every VAD/longform chunk regardless of its actual frame
 /// count. `hidden_size` was always redundant too -- it is a pack-constant
 /// (`metadata.decoder_d_model`), never a per-utterance value.
-type CohereDecoderRuntimeCacheKey = (PathBuf, GgmlCpuGraphBackend);
+type CohereDecoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
 
 #[derive(Debug, Error)]
 enum CohereTranscribeGgmlExecutorError {
@@ -412,7 +417,7 @@ fn encode_with_cached_cohere_encoder_runtime(
     features: &CohereTranscribeMelFeatures,
 ) -> Result<super::encoder_graph::CohereTranscribeEncoderOutput, CohereTranscribeEncoderError> {
     let encoder_backend = cohere_encoder_graph_config().backend;
-    let key = (canonical_runtime_cache_path(runtime_path), encoder_backend);
+    let key = (runtime_cache_path_identity(runtime_path), encoder_backend);
     with_thread_local_cached_mut_by_key(
         &COHERE_ENCODER_RUNTIME_BY_KEY,
         key,
@@ -443,7 +448,7 @@ fn decode_with_cached_cohere_decoder_runtime(
     audio_duration_seconds: f32,
 ) -> Result<super::decoder_graph::CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
     let decoder_backend = cohere_decoder_graph_config(prefer_cpu_backend).backend;
-    let key = (canonical_runtime_cache_path(runtime_path), decoder_backend);
+    let key = (runtime_cache_path_identity(runtime_path), decoder_backend);
     with_thread_local_cached_mut_by_key(
         &COHERE_DECODER_RUNTIME_BY_KEY,
         key,

@@ -23,7 +23,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -59,7 +58,8 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
 use crate::models::thread_local_runtime_cache::{
-    canonical_runtime_cache_path, current_unload_generation, take_generation_tagged,
+    RuntimeCachePathIdentity, current_unload_generation, runtime_cache_path_identity,
+    take_generation_tagged,
 };
 
 use super::adapter_graph::FireRedLlmAdapterGraphRuntime;
@@ -80,7 +80,11 @@ use super::tokenizer::FireRedLlmTokenizer;
 /// `docs/model-audits/firered2-llm.md` SS3) purely to re-derive state that
 /// does not change between requests. Keyed by (pack path, backend): unlike
 /// qwen this family has no LoRA/adapter input, so the key omits qwen's third
-/// (adapter fingerprint) component.
+/// (adapter fingerprint) component. The path half is a
+/// [`RuntimeCachePathIdentity`] (canonical path + pack content fingerprint):
+/// an in-place `.oasr` replacement at the same path fingerprints differently,
+/// so the next lookup misses and rebuilds instead of reusing a decoder whose
+/// device-uploaded weights came from the old bytes.
 ///
 /// This reuses the same session/model split transcribe.cpp uses for its own
 /// Qwen-family LLM decoder (`references/transcribe.cpp@b6a6acad`,
@@ -101,7 +105,7 @@ use super::tokenizer::FireRedLlmTokenizer;
 /// decoder built before the last unload instead of handing it back out --
 /// this is how the resident 8B decoder becomes evictable under memory
 /// pressure without a bespoke eviction policy.
-type FireRedLlmDecoderCacheKey = (PathBuf, GgmlCpuGraphBackend);
+type FireRedLlmDecoderCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
 
 thread_local! {
     static FIRERED_LLM_DECODER_BY_KEY: RefCell<HashMap<FireRedLlmDecoderCacheKey, (u64, FireRedLlmDecoderRuntime)>> =
@@ -386,7 +390,7 @@ impl FireRedLlmGgmlExecutor {
         // reflects the backend the decoder actually builds on (matches
         // qwen's `WholeDecoderCacheKey` ordering).
         let decoder_cache_key: FireRedLlmDecoderCacheKey = (
-            canonical_runtime_cache_path(runtime_path),
+            runtime_cache_path_identity(runtime_path),
             GgmlCpuGraphConfig::resolve_runtime_backend(),
         );
         // Sampled before the cache take and reused for the store-back below:

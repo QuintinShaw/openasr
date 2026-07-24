@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -58,8 +57,9 @@ use crate::models::seq2seq_greedy_decode::{
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, canonical_runtime_cache_path,
-    current_unload_generation, take_generation_tagged, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
+    current_unload_generation, runtime_cache_path_identity, take_generation_tagged,
+    with_thread_local_cached_mut_by_key,
 };
 use crate::{
     GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
@@ -79,16 +79,21 @@ use crate::models::runtime_prepared_registry::build_builtin_prepared_runtime;
 /// are identical across every `execute()` for the same pack. Without this, the
 /// longform path rebuilt the decoder and re-uploaded every layer's weights to
 /// the GPU on every chunk (the "~1GB re-upload per chunk" cost). Keyed by
-/// (pack path, backend, adapter fingerprint) so a CPU-validate then GPU-run in
-/// the same process does not reuse a backend-mismatched decoder, and a run with
-/// an adapter does not reuse a graph built without one (correctness: the LoRA
-/// tensors are baked into the arena at construction time).
-type WholeDecoderCacheKey = (PathBuf, GgmlCpuGraphBackend, String);
-type AudioEncoderCacheKey = (PathBuf, GgmlCpuGraphBackend);
+/// (pack path identity, backend, adapter fingerprint) so a CPU-validate then
+/// GPU-run in the same process does not reuse a backend-mismatched decoder,
+/// and a run with an adapter does not reuse a graph built without one
+/// (correctness: the LoRA tensors are baked into the arena at construction
+/// time). The path identity is the canonical path PLUS the pack content
+/// fingerprint ([`runtime_cache_path_identity`]): an in-place `.oasr`
+/// replacement at the same path fingerprints differently, so the next lookup
+/// misses and rebuilds instead of reusing a decoder whose device-uploaded
+/// weights came from the old bytes.
+type WholeDecoderCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend, String);
+type AudioEncoderCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
 
 thread_local! {
     // Kept as a plain `HashMap` (not the shared bounded LRU): keyed by
-    // (pack path, backend, adapter fingerprint), which does not explode
+    // (pack path identity, backend, adapter fingerprint), which does not explode
     // per audio chunk the way a frame-count-keyed cache does -- one entry is
     // built and reused across the whole longform run for a given pack, so
     // there is no unbounded-growth hazard to bound here. Entries are tagged
@@ -349,9 +354,14 @@ impl Qwen3AsrGgmlExecutor {
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, Qwen3AsrGgmlExecutorError> {
         let profile_started_at = qwen_decode_profile_start();
-        let runtime_cache_path = canonical_runtime_cache_path(&request.runtime_source_path);
+        // Canonical path + pack content fingerprint: both cache keys below
+        // carry the fingerprint so an in-place pack replacement misses.
+        let runtime_cache_identity = runtime_cache_path_identity(&request.runtime_source_path);
+        // The serve-batch owner loads the pack itself; it needs the path, not
+        // the fingerprint.
+        let runtime_cache_path = runtime_cache_identity.path.clone();
         let audio_encoder_cache_key: AudioEncoderCacheKey = (
-            runtime_cache_path.clone(),
+            runtime_cache_identity.clone(),
             GgmlCpuGraphConfig::resolve_runtime_backend(),
         );
         let audio_encoder_started_at = qwen_decode_profile_start();
@@ -517,7 +527,7 @@ impl Qwen3AsrGgmlExecutor {
         )?;
         let adapter_fingerprint = qwen_adapter_cache_fingerprint(adapter.as_deref());
         let decoder_cache_key: WholeDecoderCacheKey = (
-            runtime_cache_path,
+            runtime_cache_identity,
             GgmlCpuGraphConfig::resolve_runtime_backend(),
             adapter_fingerprint,
         );
