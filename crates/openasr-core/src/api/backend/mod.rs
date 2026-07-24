@@ -862,6 +862,12 @@ pub enum BackendError {
         "Native ASR Core transcription stayed fail-closed after local runtime source validation/dispatch: {reason}\nNo partial transcript was emitted."
     )]
     NativeFailClosed { reason: String },
+    #[error("Native ASR execution device was not found: {detail}")]
+    ExecutionDeviceNotFound { detail: String },
+    #[error("Native ASR execution device is not exactly addressable: {detail}")]
+    ExecutionDeviceNotAddressable { detail: String },
+    #[error("Native ASR execution device failed to initialize: {detail}")]
+    ExecutionDeviceInitFailed { detail: String },
     #[error(
         "Native ASR Core serve-batch decode is temporarily unavailable: {reason}\nThis is a transient condition; retry the request."
     )]

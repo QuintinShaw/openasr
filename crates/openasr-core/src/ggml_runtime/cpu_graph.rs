@@ -22,6 +22,10 @@ use super::{
     GgmlBackendKind, GgmlRuntimeError, GgufTensorDataReader, GgufWeightTensorPayload,
     accelerated_device_rank, ensure_backends_loaded, ggml_available_devices,
 };
+use crate::device::execution_route::{
+    ExecutionProvider, ExecutionRouteCacheKey, ExecutionRouteError, ExecutionRouteRequest,
+    ResolvedExecutionRoute, enumerate_compute_devices_from_ggml, resolve_execution_route,
+};
 
 const F32_WIDTH_BYTES: usize = std::mem::size_of::<f32>();
 const F16_WIDTH_BYTES: usize = std::mem::size_of::<u16>();
@@ -131,20 +135,24 @@ impl Default for GgmlCpuGraphConfig {
 /// Per-request execution-backend preference, installed thread-locally for the
 /// duration of a decode (same idiom as the inference-threads override).
 /// `GgmlCpuGraphConfig::resolve_runtime_backend` consults it BEFORE the env,
-/// so every downstream backend decision — graph configs, runtime cache keys,
-/// serve-batch job snapshots, telemetry labels — follows the request instead
+/// so every downstream backend decision - graph configs, runtime cache keys,
+/// serve-batch job snapshots, telemetry labels - follows the request instead
 /// of the process-global default. Values that cross threads (e.g. qwen
 /// serve-batch jobs) materialize the backend on the submitting thread, so the
 /// override propagates with the job.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Exact` carries a fully resolved route and is fail-closed: init must use
+/// that device only (no card swap, no CPU fallback).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RequestBackendPreference {
     CpuOnly,
     Accelerated,
+    Exact(ResolvedExecutionRoute),
 }
 
 thread_local! {
-    static REQUEST_BACKEND_PREFERENCE: std::cell::Cell<Option<RequestBackendPreference>> =
-        const { std::cell::Cell::new(None) };
+    static REQUEST_BACKEND_PREFERENCE: RefCell<Option<RequestBackendPreference>> =
+        const { RefCell::new(None) };
 }
 
 pub struct RequestBackendOverrideGuard {
@@ -153,7 +161,9 @@ pub struct RequestBackendOverrideGuard {
 
 impl Drop for RequestBackendOverrideGuard {
     fn drop(&mut self) {
-        REQUEST_BACKEND_PREFERENCE.with(|preference| preference.set(self.previous));
+        REQUEST_BACKEND_PREFERENCE.with(|preference| {
+            *preference.borrow_mut() = self.previous.take();
+        });
     }
 }
 
@@ -162,15 +172,32 @@ pub fn install_request_backend_override(
     preference: Option<RequestBackendPreference>,
 ) -> RequestBackendOverrideGuard {
     let previous = REQUEST_BACKEND_PREFERENCE.with(|cell| {
-        let previous = cell.get();
-        cell.set(preference);
+        let previous = cell.borrow().clone();
+        *cell.borrow_mut() = preference;
         previous
     });
     RequestBackendOverrideGuard { previous }
 }
 
 pub fn request_backend_override() -> Option<RequestBackendPreference> {
-    REQUEST_BACKEND_PREFERENCE.with(std::cell::Cell::get)
+    REQUEST_BACKEND_PREFERENCE.with(|cell| cell.borrow().clone())
+}
+
+/// Resolve the request-level route for the current preference against live ggml
+/// devices. Used by admission/worker key construction and by GPU backend init.
+pub fn resolve_request_execution_route(
+    preference: Option<&RequestBackendPreference>,
+) -> Result<Option<ResolvedExecutionRoute>, ExecutionRouteError> {
+    let request = match preference {
+        None => return Ok(None),
+        Some(RequestBackendPreference::CpuOnly) => ExecutionRouteRequest::Cpu,
+        Some(RequestBackendPreference::Accelerated) => ExecutionRouteRequest::Accelerated,
+        Some(RequestBackendPreference::Exact(route)) => {
+            return Ok(Some(route.clone()));
+        }
+    };
+    let inventory = enumerate_compute_devices_from_ggml(&ggml_available_devices());
+    resolve_execution_route(&request, &inventory).map(Some)
 }
 
 impl GgmlCpuGraphConfig {
@@ -307,6 +334,15 @@ impl GgmlCpuGraphConfig {
         match request_backend_override() {
             Some(RequestBackendPreference::CpuOnly) => GgmlCpuGraphBackend::Cpu,
             Some(RequestBackendPreference::Accelerated) => Self::default_gpu_backend(),
+            Some(RequestBackendPreference::Exact(route)) => match route.provider {
+                ExecutionProvider::Cpu => GgmlCpuGraphBackend::Cpu,
+                ExecutionProvider::Metal => GgmlCpuGraphBackend::Metal,
+                ExecutionProvider::Cuda
+                | ExecutionProvider::Hip
+                | ExecutionProvider::Vulkan
+                | ExecutionProvider::Accelerator
+                | ExecutionProvider::Unknown => GgmlCpuGraphBackend::Gpu,
+            },
             None => Self::parse_backend_env(std::env::var(Self::BACKEND_ENV).ok().as_deref()),
         }
     }
@@ -687,6 +723,29 @@ fn backend_kind_is_accelerated(kind: GgmlBackendKind) -> bool {
     )
 }
 
+fn find_ggml_device_for_route<'a>(
+    devices: &'a [super::GgmlBackendDevice],
+    route: &ResolvedExecutionRoute,
+) -> Option<&'a super::GgmlBackendDevice> {
+    let inventory = enumerate_compute_devices_from_ggml(devices);
+    let matched = inventory.iter().find(|device| {
+        device.provider == route.provider
+            && device.stable_id == route.stable_id
+            && match (
+                device.addressability.physical_key(),
+                route.addressability.physical_key(),
+            ) {
+                (Some(left), Some(right)) => left == right,
+                (None, None) => {
+                    device.registry_ordinal == route.registry_ordinal
+                        || device.stable_id == route.stable_id
+                }
+                _ => false,
+            }
+    })?;
+    devices.get(matched.registry_ordinal)
+}
+
 fn backend_name_is_accelerated(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name.contains("metal")
@@ -789,6 +848,8 @@ pub enum GgmlCpuGraphError {
     MetalBackendUnavailable { actual_backend: String },
     #[error("ggml gpu backend is unavailable (actual backend: {actual_backend})")]
     GpuBackendUnavailable { actual_backend: String },
+    #[error(transparent)]
+    ExecutionRoute(#[from] ExecutionRouteError),
     #[error("ggml cpu graph only supports add in this version, got {operation:?}")]
     UnsupportedOperation { operation: GgmlCpuBinaryOp },
     #[error("ggml cpu graph input tensors are unsupported: {reason}")]
@@ -5203,19 +5264,22 @@ struct GgmlBackendSchedulerGuard {
 
 /// GPU-class backends are expensive to initialize (device enumeration + driver
 /// context creation) and are safe to keep resident for the thread's lifetime,
-/// so they are cached per-thread per-kind and handed out with
+/// so they are cached per-thread per resolved route and handed out with
 /// `free_on_drop=false` (the cached entry owns the single instance). Metal had
 /// this since inception; the discrete-GPU lane (HIP/CUDA/Vulkan) now shares the
-/// exact same path so it stops paying `ggml_backend_dev_init`/free on every
-/// `execute()`. The CPU backend is cheap and is intentionally not cached.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum CachedBackendKind {
+/// same path keyed by [`ExecutionRouteCacheKey`] (provider + stable_id [+ PCI])
+/// so two Exact pins never share one backend handle. The CPU backend is cheap
+/// and is intentionally not cached.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum CachedBackendKey {
+    /// System-default Metal device (not exactly addressable).
     Metal,
-    Gpu,
+    /// Discrete / Vulkan / CUDA / HIP device keyed by resolved route identity.
+    Route(ExecutionRouteCacheKey),
 }
 
 thread_local! {
-    static THREAD_BACKEND_CACHE_BY_KIND: RefCell<HashMap<CachedBackendKind, GgmlCachedBackendGuard>> =
+    static THREAD_BACKEND_CACHE_BY_KIND: RefCell<HashMap<CachedBackendKey, GgmlCachedBackendGuard>> =
         RefCell::new(HashMap::new());
 }
 
@@ -5237,22 +5301,25 @@ impl GgmlBackendGuard {
     }
 
     fn metal() -> Result<Self, GgmlCpuGraphError> {
-        Self::cached_backend(CachedBackendKind::Metal, Self::init_metal_backend)
+        Self::cached_backend(CachedBackendKey::Metal, Self::init_metal_backend)
     }
 
     fn gpu() -> Result<Self, GgmlCpuGraphError> {
-        Self::cached_backend(CachedBackendKind::Gpu, Self::init_gpu_backend)
+        let (cache_key, init_route) = Self::resolve_gpu_cache_target()?;
+        Self::cached_backend(cache_key, move || {
+            Self::init_gpu_backend_for_route(init_route)
+        })
     }
 
-    /// Return a thread-local cached backend of `kind`, initializing it once via
+    /// Return a thread-local cached backend of `key`, initializing it once via
     /// `init` on first use. The cached entry owns the backend for the thread's
     /// lifetime; handed-out guards never free it (`free_on_drop=false`).
     fn cached_backend(
-        kind: CachedBackendKind,
+        key: CachedBackendKey,
         init: impl FnOnce() -> Result<NonNull<c_void>, GgmlCpuGraphError>,
     ) -> Result<Self, GgmlCpuGraphError> {
         if let Some(raw) =
-            THREAD_BACKEND_CACHE_BY_KIND.with(|cache| cache.borrow().get(&kind).map(|g| g.raw))
+            THREAD_BACKEND_CACHE_BY_KIND.with(|cache| cache.borrow().get(&key).map(|g| g.raw))
         {
             return Ok(Self {
                 raw,
@@ -5263,12 +5330,54 @@ impl GgmlBackendGuard {
         THREAD_BACKEND_CACHE_BY_KIND.with(|cache| {
             cache
                 .borrow_mut()
-                .insert(kind, GgmlCachedBackendGuard { raw })
+                .insert(key, GgmlCachedBackendGuard { raw })
         });
         Ok(Self {
             raw,
             free_on_drop: false,
         })
+    }
+
+    /// Decide which resolved GPU route this request must initialize, and the
+    /// cache key that isolates it from other devices on the same thread.
+    fn resolve_gpu_cache_target()
+    -> Result<(CachedBackendKey, Option<ResolvedExecutionRoute>), GgmlCpuGraphError> {
+        match request_backend_override() {
+            Some(RequestBackendPreference::Exact(route)) => {
+                if route.provider == ExecutionProvider::Metal {
+                    return Err(GgmlCpuGraphError::ExecutionRoute(
+                        ExecutionRouteError::not_addressable(format!(
+                            "provider=metal stable_id={} reason=Metal is not exactly addressable",
+                            route.stable_id
+                        )),
+                    ));
+                }
+                Ok((CachedBackendKey::Route(route.cache_key()), Some(route)))
+            }
+            Some(RequestBackendPreference::Accelerated) | None => {
+                let inventory = enumerate_compute_devices_from_ggml(&ggml_available_devices());
+                match resolve_execution_route(&ExecutionRouteRequest::Accelerated, &inventory) {
+                    Ok(route) => Ok((CachedBackendKey::Route(route.cache_key()), Some(route))),
+                    // Fall through to ranked init without a pinned route key when
+                    // inventory is empty; init_gpu_backend_for_route(None) keeps
+                    // the previous preferred-device scan + typed unavailable error.
+                    Err(ExecutionRouteError::AcceleratedUnavailable) => Ok((
+                        CachedBackendKey::Route(ExecutionRouteCacheKey {
+                            provider: ExecutionProvider::Unknown,
+                            stable_id: "accelerated".to_string(),
+                            physical_key: None,
+                        }),
+                        None,
+                    )),
+                    Err(error) => Err(GgmlCpuGraphError::ExecutionRoute(error)),
+                }
+            }
+            Some(RequestBackendPreference::CpuOnly) => Err(GgmlCpuGraphError::ExecutionRoute(
+                ExecutionRouteError::device_not_found(
+                    "internal: gpu backend requested under CpuOnly preference",
+                ),
+            )),
+        }
     }
 
     fn accelerators(
@@ -5318,17 +5427,51 @@ impl GgmlBackendGuard {
         Ok(raw)
     }
 
-    fn init_gpu_backend() -> Result<NonNull<c_void>, GgmlCpuGraphError> {
+    fn init_gpu_backend_for_route(
+        route: Option<ResolvedExecutionRoute>,
+    ) -> Result<NonNull<c_void>, GgmlCpuGraphError> {
+        let devices = ggml_available_devices();
+        if let Some(route) = route.as_ref() {
+            // Exact (and preferred-accelerated once resolved) pin one inventory
+            // row. Fail closed: never silently retarget another card or CPU.
+            if let Some(device) = find_ggml_device_for_route(&devices, route) {
+                return match device.initialize() {
+                    Ok(backend) => Ok(backend.into_raw()),
+                    Err(GgmlRuntimeError::BackendUnavailable(name)) => {
+                        Err(GgmlCpuGraphError::ExecutionRoute(
+                            ExecutionRouteError::init_failed(format!(
+                                "provider={} stable_id={} backend={name}",
+                                route.provider.as_str(),
+                                route.stable_id
+                            )),
+                        ))
+                    }
+                };
+            }
+            if matches!(
+                request_backend_override(),
+                Some(RequestBackendPreference::Exact(_))
+            ) {
+                return Err(GgmlCpuGraphError::ExecutionRoute(
+                    ExecutionRouteError::device_not_found(format!(
+                        "provider={} stable_id={} isolation_key={}",
+                        route.provider.as_str(),
+                        route.stable_id,
+                        route.isolation_key()
+                    )),
+                ));
+            }
+            // Preferred accelerated resolved to a route that disappeared between
+            // resolve and init: fall through to ranked scan below.
+        }
+
         // Rank candidates so a hybrid-graphics host (Optimus-style laptop
         // exposing both an Intel integrated GPU and an NVIDIA/AMD discrete GPU
         // through the same Vulkan backend) tries the discrete GPU first,
         // falling through to lower-ranked devices only if a higher-ranked one
-        // fails to initialize -- see `accelerated_device_rank`. A plain
-        // registry-order scan here (the previous behavior) picked whichever
-        // device the platform/driver happened to enumerate first, which on
-        // several reported Optimus setups was the integrated GPU, leaving the
-        // discrete GPU idle even though it is almost always the better choice.
-        let mut candidates: Vec<_> = ggml_available_devices()
+        // fails to initialize -- see `accelerated_device_rank`. Exact requests
+        // never reach this fallback.
+        let mut candidates: Vec<_> = devices
             .into_iter()
             .filter(|device| backend_kind_is_accelerated(device.kind))
             .collect();

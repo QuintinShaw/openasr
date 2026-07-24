@@ -787,9 +787,10 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
         | BackendError::PhraseBiasUnsupportedByModel { .. }
         | BackendError::RequestOptionUnsupportedByModel { .. }
         | BackendError::WordTimestampAlignmentRequiresWordTimestamps
-        | BackendError::WordTimestampAlignmentPackMissing { .. } => {
-            FailureCategory::UnsupportedCapability
-        }
+        | BackendError::WordTimestampAlignmentPackMissing { .. }
+        | BackendError::ExecutionDeviceNotFound { .. }
+        | BackendError::ExecutionDeviceNotAddressable { .. }
+        | BackendError::ExecutionDeviceInitFailed { .. } => FailureCategory::UnsupportedCapability,
         BackendError::TranscriptionCanceled => FailureCategory::Canceled,
         BackendError::ServeBatchUnavailable { .. } => FailureCategory::Transient,
         BackendError::NativeFailClosed { .. }

@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 use super::{NativeAsrHardwareTarget, NativeAsrRuntimeReadiness};
+use crate::device::execution_route::ExecutionRouteError;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum NativeAsrError {
@@ -21,6 +22,12 @@ pub enum NativeAsrError {
         adapter: String,
         model_family: String,
     },
+    #[error("Native ASR execution device was not found: {detail}.")]
+    ExecutionDeviceNotFound { detail: String },
+    #[error("Native ASR execution device is not exactly addressable: {detail}.")]
+    ExecutionDeviceNotAddressable { detail: String },
+    #[error("Native ASR execution device failed to initialize: {detail}.")]
+    ExecutionDeviceInitFailed { detail: String },
     #[error("Native ASR session is closed.")]
     SessionClosed,
     #[error("Native ASR session failed: {message}.")]
@@ -44,6 +51,23 @@ impl NativeAsrError {
                 "Native ASR session backpressure exceeded: {}",
                 message.into()
             ),
+        }
+    }
+
+    pub fn from_execution_route_error(error: ExecutionRouteError) -> Self {
+        match error {
+            ExecutionRouteError::DeviceNotFound { detail } => {
+                Self::ExecutionDeviceNotFound { detail }
+            }
+            ExecutionRouteError::NotAddressable { detail } => {
+                Self::ExecutionDeviceNotAddressable { detail }
+            }
+            ExecutionRouteError::InitFailed { detail } => {
+                Self::ExecutionDeviceInitFailed { detail }
+            }
+            ExecutionRouteError::AcceleratedUnavailable => Self::ProviderUnavailable {
+                provider: "accelerated".to_string(),
+            },
         }
     }
 }

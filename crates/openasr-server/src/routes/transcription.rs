@@ -1446,7 +1446,10 @@ pub(crate) async fn transcribe_with_runtime(
                         .with_native_non_wav_conversion(true),
                 )
                 .map_err(ApiError::AudioPreparation)?;
-                let model_session_permit = runtime.acquire_native_execution()?;
+                let resolved_route = resolve_execution_route_for_target(request.execution_target)
+                    .map_err(ApiError::Backend)?;
+                let model_session_permit =
+                    runtime.acquire_native_execution(resolved_route.as_ref())?;
                 run_admitted_native_transcription(model_session_permit, move || {
                     // Marks this offline (file-transcription / realtime-per-utterance
                     // backend-job) decode as active for the whole synchronous run, so
@@ -1561,6 +1564,51 @@ pub(crate) fn native_hardware_target_from_execution_target(
     }
 }
 
+/// Resolve the request-level execution route used for admission / worker
+/// isolation. Public surfaces still only accept auto/cpu/accelerated; this
+/// maps those coarse targets onto the internal route vocabulary without
+/// exposing Exact device pins yet.
+pub(crate) fn resolve_execution_route_for_target(
+    target: Option<ExecutionTarget>,
+) -> Result<Option<openasr_core::ResolvedExecutionRoute>, openasr_core::BackendError> {
+    let request =
+        openasr_core::ExecutionRouteRequest::from_execution_target(target.unwrap_or_default());
+    let inventory =
+        openasr_core::enumerate_compute_devices_from_ggml(&openasr_core::ggml_available_devices());
+    match openasr_core::resolve_execution_route(&request, &inventory) {
+        Ok(route) => Ok(Some(route)),
+        Err(openasr_core::ExecutionRouteError::AcceleratedUnavailable) => {
+            // Coarse accelerated requests still fail closed later at backend
+            // preference conversion; admission keeps the model-only key so a
+            // missing GPU does not invent a fake device slot.
+            Ok(None)
+        }
+        Err(error) => Err(backend_error_from_execution_route(error)),
+    }
+}
+
+pub(crate) fn backend_error_from_execution_route(
+    error: openasr_core::ExecutionRouteError,
+) -> openasr_core::BackendError {
+    match error {
+        openasr_core::ExecutionRouteError::DeviceNotFound { detail } => {
+            openasr_core::BackendError::ExecutionDeviceNotFound { detail }
+        }
+        openasr_core::ExecutionRouteError::NotAddressable { detail } => {
+            openasr_core::BackendError::ExecutionDeviceNotAddressable { detail }
+        }
+        openasr_core::ExecutionRouteError::InitFailed { detail } => {
+            openasr_core::BackendError::ExecutionDeviceInitFailed { detail }
+        }
+        openasr_core::ExecutionRouteError::AcceleratedUnavailable => {
+            openasr_core::BackendError::NativeFailClosed {
+                reason: "execution_target=accelerated was requested, but no ggml GPU device is available."
+                    .to_string(),
+            }
+        }
+    }
+}
+
 fn native_asr_error_to_backend(error: NativeAsrError) -> openasr_core::BackendError {
     match error {
         NativeAsrError::PhraseBiasUnsupportedByModel {
@@ -1570,6 +1618,15 @@ fn native_asr_error_to_backend(error: NativeAsrError) -> openasr_core::BackendEr
             adapter,
             model_family,
         },
+        NativeAsrError::ExecutionDeviceNotFound { detail } => {
+            openasr_core::BackendError::ExecutionDeviceNotFound { detail }
+        }
+        NativeAsrError::ExecutionDeviceNotAddressable { detail } => {
+            openasr_core::BackendError::ExecutionDeviceNotAddressable { detail }
+        }
+        NativeAsrError::ExecutionDeviceInitFailed { detail } => {
+            openasr_core::BackendError::ExecutionDeviceInitFailed { detail }
+        }
         error => openasr_core::BackendError::NativeFailClosed {
             reason: error.to_string(),
         },

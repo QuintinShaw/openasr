@@ -2020,7 +2020,7 @@ async fn boot_native_warmup_skips_when_the_runtime_slot_is_occupied() {
         model_pack_path: Some(pack_path),
     };
     let occupied_slot = runtime
-        .acquire_native_execution()
+        .acquire_native_execution(None)
         .expect("fixture runtime must admit the active native session");
 
     tokio::time::timeout(
@@ -2031,12 +2031,12 @@ async fn boot_native_warmup_skips_when_the_runtime_slot_is_occupied() {
     .expect("boot warm-up must skip instead of waiting for a busy model slot");
 
     assert!(
-        runtime.acquire_native_execution().is_err(),
+        runtime.acquire_native_execution(None).is_err(),
         "the only capacity slot must still belong to the active native session"
     );
     drop(occupied_slot);
     assert!(
-        runtime.acquire_native_execution().is_ok(),
+        runtime.acquire_native_execution(None).is_ok(),
         "skipped boot warm-up must not retain a capacity permit"
     );
 }
@@ -3297,8 +3297,15 @@ async fn fallback_capacity_rejection_is_backend_not_ready_and_recoverable() {
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
     };
+    let occupied_route = crate::routes::transcription::resolve_execution_route_for_target(None)
+        .expect("fixture route resolve must succeed")
+        .or_else(|| {
+            // CPU-only hosts still need a concrete isolation key that matches
+            // the Auto resolve path used by the fallback backend job.
+            Some(openasr_core::ResolvedExecutionRoute::cpu())
+        });
     let occupied_slot = runtime
-        .acquire_native_execution()
+        .acquire_native_execution(occupied_route.as_ref())
         .expect("fixture runtime must admit the occupied native session");
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(runtime, test_distribution(), event_sender);

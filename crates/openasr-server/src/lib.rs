@@ -1192,10 +1192,19 @@ impl Default for ServerRuntime {
 impl ServerRuntime {
     /// Acquires the server-wide native execution permit for the validated
     /// runtime pack. Every ggml ASR execution path enters through this method.
-    pub(crate) fn acquire_native_execution(&self) -> Result<ModelSessionPermit, ApiError> {
+    ///
+    /// When `route` is `Some`, the admission slot is isolated by the resolved
+    /// execution route (provider + stable device identity) so two Exact/preferred
+    /// GPU pins never share one capacity slot. `None` keeps the historical
+    /// model-only key used by coarse paths that have not resolved a device yet.
+    pub(crate) fn acquire_native_execution(
+        &self,
+        route: Option<&openasr_core::ResolvedExecutionRoute>,
+    ) -> Result<ModelSessionPermit, ApiError> {
         let model_identity = native_model_session_key(self)?;
+        let identity = openasr_core::admission_identity_for_route(&model_identity, route);
         self.native_execution
-            .try_acquire(model_identity)
+            .try_acquire(identity)
             .map_err(ApiError::ModelSessionCapacity)
     }
 
@@ -2432,10 +2441,13 @@ impl IntoResponse for ApiError {
                     | openasr_core::BackendError::WordTimestampAlignmentRequiresWordTimestamps
                     | openasr_core::BackendError::WordTimestampAlignmentPackMissing { .. }
                     | openasr_core::BackendError::WordTimestampAlignmentFailed { .. }
+                    | openasr_core::BackendError::ExecutionDeviceNotFound { .. }
+                    | openasr_core::BackendError::ExecutionDeviceNotAddressable { .. }
+                    | openasr_core::BackendError::ExecutionDeviceInitFailed { .. }
                     | openasr_core::BackendError::NativeFailClosed { .. } => {
                         // Native backend "fail-closed" is a deliberate, client-facing
                         // refusal (unexecutable/unsupported request or unusable pack),
-                        // not a server fault — genuine internal panics surface via
+                        // not a server fault -- genuine internal panics surface via
                         // BackendJoin. Classify it as 400, matching the fail-closed
                         // contract the api.rs native tests assert.
                         StatusCode::BAD_REQUEST

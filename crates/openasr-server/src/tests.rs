@@ -2294,7 +2294,7 @@ async fn native_audio_preparation_does_not_consume_model_capacity() {
     }
 
     let permit = runtime
-        .acquire_native_execution()
+        .acquire_native_execution(None)
         .expect("audio-only preparation must not consume native model capacity");
     drop(permit);
     std::fs::write(&release_path, b"release").unwrap();

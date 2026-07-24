@@ -33,6 +33,13 @@ pub struct GgmlBackendDevice {
     /// diagnosed from the boot log alone instead of asking the reporter to
     /// re-run with a debug build.
     pub buffer_alignment: Option<usize>,
+    /// Optional stable physical identity from `ggml_backend_dev_props.device_id`.
+    /// For PCI devices ggml documents this as lower-case
+    /// `domain:bus:device.function` (e.g. `0000:c1:00.0`). CUDA/HIP populate it;
+    /// Vulkan does when the instance exposes a PCI bus id; Metal leaves it
+    /// null (system-default device only). Consumed by execution-route Exact
+    /// resolution and cache/worker isolation keys.
+    pub device_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +148,19 @@ impl GgmlBackendDevice {
         kind: GgmlBackendKind,
         memory: Option<GgmlDeviceMemory>,
     ) -> Self {
+        Self::for_test_with_device_id(name, description, kind, memory, None)
+    }
+
+    /// Test helper that also sets ggml `device_id` (PCI BDF when simulating
+    /// CUDA/HIP/Vulkan identity).
+    #[cfg(test)]
+    pub(crate) fn for_test_with_device_id(
+        name: &str,
+        description: &str,
+        kind: GgmlBackendKind,
+        memory: Option<GgmlDeviceMemory>,
+        device_id: Option<&str>,
+    ) -> Self {
         Self {
             raw: NonNull::dangling(),
             name: name.to_string(),
@@ -148,6 +168,7 @@ impl GgmlBackendDevice {
             kind,
             memory,
             buffer_alignment: None,
+            device_id: device_id.map(str::to_string),
         }
     }
 }
@@ -507,6 +528,22 @@ pub fn ggml_available_devices() -> Vec<GgmlBackendDevice> {
             (!buft.is_null()).then(|| ffi::ggml_backend_buft_get_alignment(buft))
         };
 
+        let device_id = {
+            let mut props = ffi::GgmlBackendDevProps {
+                name: ptr::null(),
+                description: ptr::null(),
+                memory_free: 0,
+                memory_total: 0,
+                type_: 0,
+                device_id: ptr::null(),
+                caps: ffi::GgmlBackendDevCaps::default(),
+            };
+            unsafe { ffi::ggml_backend_dev_get_props(raw.as_ptr(), &mut props) };
+            let raw_id = unsafe { cstr_lossy(props.device_id) };
+            let trimmed = raw_id.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        };
+
         devices.push(GgmlBackendDevice {
             raw,
             name: unsafe { cstr_lossy(ffi::ggml_backend_dev_name(raw.as_ptr())) },
@@ -514,6 +551,7 @@ pub fn ggml_available_devices() -> Vec<GgmlBackendDevice> {
             kind,
             memory,
             buffer_alignment,
+            device_id,
         });
     }
 
@@ -650,6 +688,7 @@ mod tests {
                     total_bytes: 12 * 1024 * 1024 * 1024,
                 }),
                 buffer_alignment: Some(16),
+                device_id: Some("0000:01:00.0".to_string()),
             }],
             cpu_features: GgmlCpuFeatures::default(),
         };

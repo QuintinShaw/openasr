@@ -126,6 +126,12 @@ pub use device::capabilities::{
 pub use device::compute_devices::{
     ComputeDevice, compute_devices_from_runtime, default_execution_target,
 };
+pub use device::execution_route::{
+    DeviceAddressability, EnumeratedComputeDevice, ExactDeviceSelector, ExecutionProvider,
+    ExecutionRouteCacheKey, ExecutionRouteError, ExecutionRouteRequest, PhysicalResourceKey,
+    ResolvedExecutionRoute, RouteDeviceKind, admission_identity_for_route,
+    enumerate_compute_devices_from_ggml, resolve_execution_route, worker_route_isolation_key,
+};
 pub use device::types::{CapabilityClass, DeviceCapabilities};
 pub use download_source::{DownloadSource, DownloadSourcePref, resolve_chain};
 pub use format::{ResponseFormat, render_transcription};
@@ -142,7 +148,7 @@ pub use ggml_runtime::{
     probe_ggml_package_model_identity, probe_ggml_package_path, read_gguf_metadata,
     read_gguf_metadata_from_runtime_source, read_gguf_tensor_index,
     read_gguf_tensor_index_from_runtime_source, render_gguf_c_parser_sandbox_child_output,
-    validate_ggml_runtime_source_path,
+    resolve_request_execution_route, validate_ggml_runtime_source_path,
 };
 pub use home::{OpenAsrHomeError, openasr_home, resolve_openasr_home};
 pub use host::{

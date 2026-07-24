@@ -53,22 +53,41 @@ pub(crate) enum BackendResult {
 pub(crate) struct NativeStreamingWorkerKey {
     pub(crate) model_pack_path: PathBuf,
     pub(crate) hardware_target: String,
+    /// Resolved execution-route isolation key (provider/stable_id[/pci:...]).
+    /// Coarse targets without a resolved device keep the public spelling
+    /// (`auto`/`cpu`/`accelerated`) so existing single-device hosts behave as
+    /// before; Exact / preferred-accelerated pins isolate per device.
+    pub(crate) execution_route_key: String,
     pub(crate) inference_threads: Option<u16>,
 }
 
 impl NativeStreamingWorkerKey {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
         model_pack_path: impl Into<PathBuf>,
         hardware_target: openasr_core::NativeAsrHardwareTarget,
+        inference_threads: Option<u16>,
+    ) -> Self {
+        Self::with_route(model_pack_path, hardware_target, None, inference_threads)
+    }
+
+    pub(crate) fn with_route(
+        model_pack_path: impl Into<PathBuf>,
+        hardware_target: openasr_core::NativeAsrHardwareTarget,
+        resolved_route: Option<&openasr_core::ResolvedExecutionRoute>,
         inference_threads: Option<u16>,
     ) -> Self {
         let model_pack_path = model_pack_path.into();
         let model_pack_path = model_pack_path
             .canonicalize()
             .unwrap_or_else(|_| model_pack_path.clone());
+        let hardware_target = hardware_target.to_string();
+        let execution_route_key =
+            openasr_core::worker_route_isolation_key(&hardware_target, resolved_route);
         Self {
             model_pack_path,
-            hardware_target: hardware_target.to_string(),
+            hardware_target,
+            execution_route_key,
             inference_threads,
         }
     }
@@ -527,10 +546,11 @@ pub(crate) fn native_streaming_worker_for_key(
             openasr_core::stage_timing::log_event(
                 "native_streaming_watchdog",
                 format_args!(
-                    "model_pack_path={} hardware_target={} inference_threads={:?} \
+                    "model_pack_path={} hardware_target={} execution_route_key={} inference_threads={:?} \
                      reason=same_key_preemption_client_disconnected action=abandon_occupant",
                     key.model_pack_path.display(),
                     key.hardware_target,
+                    key.execution_route_key,
                     key.inference_threads,
                 ),
             );
@@ -736,10 +756,11 @@ pub(crate) fn abandon_stuck_native_streaming_worker(
     openasr_core::stage_timing::log_event(
         "native_streaming_watchdog",
         format_args!(
-            "model_pack_path={} hardware_target={} inference_threads={:?} reason={reason} \
+            "model_pack_path={} hardware_target={} execution_route_key={} inference_threads={:?} reason={reason} \
              action=abandon_worker abandoned_workers={abandoned_count}",
             key.model_pack_path.display(),
             key.hardware_target,
+            key.execution_route_key,
             key.inference_threads,
         ),
     );
@@ -997,7 +1018,19 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
     };
     // Warmup is opportunistic. It must not queue behind an active request or
     // allocate a second runtime; a real request owns the capacity slot first.
-    let Ok(model_session_permit) = runtime.acquire_native_execution() else {
+    let preferences_home = openasr_core::openasr_home().ok();
+    let inference_threads = preferences_home
+        .as_deref()
+        .and_then(realtime_inference_threads_preference);
+    let execution_target_preference = preferences_home
+        .as_deref()
+        .and_then(realtime_execution_target_preference);
+    let resolved_route = crate::routes::transcription::resolve_execution_route_for_target(
+        execution_target_preference,
+    )
+    .ok()
+    .flatten();
+    let Ok(model_session_permit) = runtime.acquire_native_execution(resolved_route.as_ref()) else {
         return;
     };
     let Some(adapter) = openasr_core::native_runtime_model_adapter_for_path(&model_pack_path)
@@ -1016,13 +1049,6 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
     // `openasr_home()` resolution failing here (unreadable env, race) just
     // means "no preference found" -- same graceful fallback to defaults the
     // request-time paths use.
-    let preferences_home = openasr_core::openasr_home().ok();
-    let inference_threads = preferences_home
-        .as_deref()
-        .and_then(realtime_inference_threads_preference);
-    let execution_target_preference = preferences_home
-        .as_deref()
-        .and_then(realtime_execution_target_preference);
     let options = NativeAsrRequestOptions::new().with_inference_threads(inference_threads);
     let session_config = NativeAsrStreamingSessionConfig::new()
         .with_audio_format(RealtimeAudioFormat::pcm16_mono_16khz());
@@ -1040,8 +1066,12 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
         Ok(session) => session,
         Err(_) => return,
     };
-    let key =
-        NativeStreamingWorkerKey::new(model_pack.root.clone(), hardware_target, inference_threads);
+    let key = NativeStreamingWorkerKey::with_route(
+        model_pack.root.clone(),
+        hardware_target,
+        resolved_route.as_ref(),
+        inference_threads,
+    );
     attach_and_run_boot_warmup(key, session, Some(model_session_permit)).await;
 }
 

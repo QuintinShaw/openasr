@@ -77,9 +77,15 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   by the aligner's output, never segment text or speaker attribution.
 - Hardware execution target selection is generic: Desktop/server requests support
   `auto`, `cpu`, and `accelerated` when the native runtime reports an accelerated
-  device. There is no per-provider/per-device pinning surface such as `gpu0`,
-  and unavailable accelerated targets still fail closed or collapse back to
-  supported choices as appropriate.
+  device. There is no public per-provider/per-device pinning surface such as
+  `gpu0`. Internally the runtime can resolve a concrete execution route
+  (`provider` + ggml stable device name + optional PCI `device_id` from CUDA/HIP,
+  and from Vulkan when available) for cache/worker/admission isolation. Exact
+  device pins are fail-closed: missing devices, init failures, and Metal (which
+  still initializes only via `MTLCreateSystemDefaultDevice`) return typed
+  not-found / not-addressable / init-failed errors instead of silently swapping
+  cards or falling back to CPU. Unavailable coarse `accelerated` targets still
+  fail closed.
 - No public reproducible real-backend benchmark or long-audio stability evidence
   is published. The performance harness, regression gates, and competitive
   comparisons are internal (see [Performance](../perf/PERFORMANCE.md)); no claim of

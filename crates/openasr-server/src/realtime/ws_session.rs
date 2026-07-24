@@ -1630,7 +1630,24 @@ impl WsSession {
             .await?;
             return Err(());
         };
-        let model_session_permit = match self.runtime.acquire_native_execution() {
+        let resolved_route = match crate::routes::transcription::resolve_execution_route_for_target(
+            self.execution_target,
+        ) {
+            Ok(route) => route,
+            Err(error) => {
+                self.emit_error(
+                    RealtimeErrorCode::StartupConfigError,
+                    &format!("Could not resolve native execution route: {error}"),
+                    false,
+                )
+                .await?;
+                return Err(());
+            }
+        };
+        let model_session_permit = match self
+            .runtime
+            .acquire_native_execution(resolved_route.as_ref())
+        {
             Ok(permit) => permit,
             Err(error) => {
                 let recoverable = matches!(error, ApiError::ModelSessionCapacity(_));
@@ -1700,9 +1717,10 @@ impl WsSession {
         // and drains outcomes separately so a slow partial decode never blocks
         // socket ingest for this session.
         self.attach_native_streaming_session_admitted(
-            NativeStreamingWorkerKey::new(
+            NativeStreamingWorkerKey::with_route(
                 model_pack.root.clone(),
                 hardware_target,
+                resolved_route.as_ref(),
                 self.inference_threads,
             ),
             session,
