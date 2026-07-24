@@ -242,28 +242,36 @@ pub(crate) fn load_moss_encoder_weights_from_reader(
     })
 }
 
-/// Owns the encoder's graph runner plus the optional zero-copy weight
-/// context; both are expensive to rebuild per chunk (the loaded-weight
-/// context mmaps the whole pack), so callers build one runtime and call
-/// [`Self::encode`] once per 30s chunk. Mirrors
-/// `qwen::audio_encoder::Qwen3AsrAudioEncoderRuntime`.
+/// Owns the encoder's graph runner, the optional zero-copy weight context,
+/// and the fully-loaded [`MossEncoderWeights`]; all three are expensive to
+/// rebuild per chunk (the loaded-weight context mmaps the whole pack, and
+/// loading the weights reads every small tensor off disk), so callers build
+/// one runtime (typically via the thread-local resident cache in
+/// `executor.rs`, mirroring `firered_aed::executor`'s
+/// `FireRedEncoderGraphRuntime`) and call [`Self::encode`] once per 30s
+/// chunk. Mirrors `qwen::audio_encoder::Qwen3AsrAudioEncoderRuntime`.
 pub(crate) struct MossEncoderRuntime {
     runner: GgmlCpuGraphRunner,
     loaded: Option<GgmlLoadedWeightContext>,
+    weights: MossEncoderWeights,
 }
 
 impl MossEncoderRuntime {
     pub(crate) fn new(
-        graph_config: GgmlCpuGraphConfig,
-        runtime_path: Option<&Path>,
+        runtime_path: &Path,
+        config: MossEncoderConfig,
     ) -> Result<Self, MossEncoderError> {
+        let graph_config = super::graph_config::moss_td_encoder_graph_config();
         let runner = GgmlCpuGraphRunner::new(graph_config)
             .map_err(|source| map_graph_error("runner_init", source))?;
-        // `None` (no path) only happens off the production executor path; the
-        // only real caller (`executor.rs`) always resolves a concrete pack
-        // path through preflight first.
-        let loaded = runtime_path.and_then(|path| runner.load_gguf_weight_context(path).ok());
-        Ok(Self { runner, loaded })
+        let loaded = runner.load_gguf_weight_context(runtime_path).ok();
+        let reader = GgufTensorDataReader::from_path(runtime_path)?;
+        let weights = load_moss_encoder_weights_from_reader(&reader, config)?;
+        Ok(Self {
+            runner,
+            loaded,
+            weights,
+        })
     }
 
     /// Run one 30s-chunk forward pass: `mel` is `[n_mels, mel_frames]`
@@ -277,11 +285,11 @@ impl MossEncoderRuntime {
     /// d_model` values.
     pub(crate) fn encode(
         &mut self,
-        weights: &MossEncoderWeights,
         config: MossEncoderConfig,
         mel: &[f32],
         mel_frames: usize,
     ) -> Result<Vec<f32>, MossEncoderError> {
+        let weights = &self.weights;
         let expected_mel_len = config.n_mels * mel_frames;
         if mel.len() != expected_mel_len {
             return Err(MossEncoderError::InvalidMelInputLength {
