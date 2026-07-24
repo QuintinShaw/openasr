@@ -35,12 +35,28 @@ pub(super) fn inherited_speaker_profile_id(
         .or(previous_speaker_profile_id)
 }
 
+pub(super) fn inherited_speaker_person_id(
+    update: &TranscriptUpdate,
+    previous: Option<String>,
+) -> Option<String> {
+    update.speaker_person_id.clone().or(previous)
+}
+
+pub(super) fn inherited_speaker_snapshot_label(
+    update: &TranscriptUpdate,
+    previous: Option<String>,
+) -> Option<String> {
+    update.speaker_snapshot_label.clone().or(previous)
+}
+
 pub(super) fn to_partial_event(
     update: TranscriptUpdate,
     language: Option<String>,
     speaker: Option<String>,
     speaker_label: Option<String>,
     speaker_profile_id: Option<String>,
+    speaker_person_id: Option<String>,
+    speaker_snapshot_label: Option<String>,
 ) -> RealtimeTranscriptEvent {
     to_update_event(
         update,
@@ -49,6 +65,8 @@ pub(super) fn to_partial_event(
         speaker,
         speaker_label,
         speaker_profile_id,
+        speaker_person_id,
+        speaker_snapshot_label,
     )
 }
 
@@ -58,6 +76,8 @@ pub(super) fn to_final_event(
     speaker: Option<String>,
     speaker_label: Option<String>,
     speaker_profile_id: Option<String>,
+    speaker_person_id: Option<String>,
+    speaker_snapshot_label: Option<String>,
 ) -> RealtimeTranscriptEvent {
     to_update_event(
         update,
@@ -66,6 +86,8 @@ pub(super) fn to_final_event(
         speaker,
         speaker_label,
         speaker_profile_id,
+        speaker_person_id,
+        speaker_snapshot_label,
     )
 }
 
@@ -76,6 +98,8 @@ fn to_update_event(
     speaker: Option<String>,
     speaker_label: Option<String>,
     speaker_profile_id: Option<String>,
+    speaker_person_id: Option<String>,
+    speaker_snapshot_label: Option<String>,
 ) -> RealtimeTranscriptEvent {
     let TranscriptUpdate {
         utterance_id,
@@ -101,6 +125,8 @@ fn to_update_event(
             speaker,
             speaker_label,
             speaker_profile_id,
+            speaker_person_id,
+            speaker_snapshot_label,
         })
     } else {
         RealtimeTranscriptEvent::Partial(RealtimeTranscriptPartial {
@@ -116,6 +142,8 @@ fn to_update_event(
             speaker,
             speaker_label,
             speaker_profile_id,
+            speaker_person_id,
+            speaker_snapshot_label,
         })
     }
 }
@@ -128,9 +156,13 @@ pub(super) fn to_revision_event(
     previous_speaker: Option<String>,
     previous_speaker_label: Option<String>,
     previous_speaker_profile_id: Option<String>,
+    previous_speaker_person_id: Option<String>,
+    previous_speaker_snapshot_label: Option<String>,
 ) -> (
     RealtimeTranscriptEvent,
     Option<RealtimeEventId>,
+    Option<String>,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -146,6 +178,9 @@ pub(super) fn to_revision_event(
     let speaker_label = inherited_speaker_label(&update, previous_speaker_label);
     let speaker_profile_id =
         inherited_speaker_profile_id(&update, previous_speaker_profile_id);
+    let speaker_person_id = inherited_speaker_person_id(&update, previous_speaker_person_id);
+    let speaker_snapshot_label =
+        inherited_speaker_snapshot_label(&update, previous_speaker_snapshot_label);
 
     (
         RealtimeTranscriptEvent::Revision(RealtimeTranscriptRevision {
@@ -163,12 +198,16 @@ pub(super) fn to_revision_event(
             speaker: speaker.clone(),
             speaker_label: speaker_label.clone(),
             speaker_profile_id: speaker_profile_id.clone(),
+            speaker_person_id: speaker_person_id.clone(),
+            speaker_snapshot_label: speaker_snapshot_label.clone(),
         }),
         final_event_id,
         language,
         speaker,
         speaker_label,
         speaker_profile_id,
+        speaker_person_id,
+        speaker_snapshot_label,
     )
 }
 
@@ -181,6 +220,8 @@ pub(super) fn segment_state(
     speaker: Option<String>,
     speaker_label: Option<String>,
     speaker_profile_id: Option<String>,
+    speaker_person_id: Option<String>,
+    speaker_snapshot_label: Option<String>,
 ) -> TranscriptSegmentState {
     TranscriptSegmentState {
         revision,
@@ -191,5 +232,7 @@ pub(super) fn segment_state(
         speaker,
         speaker_label,
         speaker_profile_id,
+        speaker_person_id,
+        speaker_snapshot_label,
     }
 }

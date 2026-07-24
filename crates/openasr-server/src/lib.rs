@@ -14,6 +14,7 @@ pub(crate) use routes::pull_jobs::*;
 pub(crate) use routes::speakers::*;
 pub(crate) use routes::transcription::*;
 pub(crate) use routes::translation::*;
+pub(crate) use routes::voice_id::*;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -145,6 +146,24 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
             patch(rename_speaker).delete(delete_speaker),
         )
         .route("/v1/speakers/{id}/reenroll", post(reenroll_speaker))
+        .route(
+            "/v1/voice-id/persons",
+            get(list_persons).post(enroll_person),
+        )
+        .route(
+            "/v1/voice-id/persons/{person_id}",
+            get(get_person).patch(patch_person).delete(delete_person),
+        )
+        .route("/v1/voice-id/persons/{person_id}/samples", post(add_sample))
+        .route(
+            "/v1/voice-id/persons/{person_id}/consent/revoke",
+            post(revoke_consent),
+        )
+        .route(
+            "/v1/voice-id/samples/{sample_id}",
+            patch(patch_sample).delete(delete_sample),
+        )
+        .route("/v1/voice-id/export", post(export_metadata))
         .route("/v1/models/local", get(local_models))
         .route("/v1/models/local/import", post(import_local_model))
         .route(
@@ -2272,6 +2291,7 @@ struct DefaultModelResponse {
 pub(crate) enum ApiError {
     BadRequest(String),
     NotFound(String),
+    Conflict(String),
     Catalog(CatalogError),
     Config(openasr_core::ConfigError),
     Format(String),
@@ -2324,6 +2344,7 @@ impl std::fmt::Display for ApiError {
         match self {
             Self::BadRequest(message) | Self::Format(message) => f.write_str(message),
             Self::NotFound(message) => f.write_str(message),
+            Self::Conflict(message) => f.write_str(message),
             Self::Catalog(error) => write!(f, "Could not load model catalog: {error}"),
             Self::Config(error) => write!(f, "Could not read or update OpenASR config: {error}"),
             Self::Home(error) => write!(f, "Could not resolve OpenASR home: {error}"),
@@ -2368,6 +2389,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             Self::BadRequest(message) | Self::Format(message) => (StatusCode::BAD_REQUEST, message),
             Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
+            Self::Conflict(message) => (StatusCode::CONFLICT, message),
             Self::Catalog(error) => {
                 let status = if matches!(
                     &error,

@@ -94,6 +94,8 @@ impl TranscriptAssembler {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             });
             transcript.time_domain = SegmentTimeDomain::RelativeToSliceContent;
@@ -203,6 +205,8 @@ impl TranscriptAssembler {
             speaker: segment.speaker.clone(),
             speaker_label: segment.speaker_label.clone(),
             speaker_profile_id: segment.speaker_profile_id.clone(),
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words,
         }
     }
@@ -439,6 +443,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: vec![WordTimestamp {
                     word: "hello".to_string(),
                     start: 0.1,
@@ -471,6 +477,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             }],
             time_domain: SegmentTimeDomain::AbsoluteOriginal,
@@ -485,6 +493,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             }],
             time_domain: SegmentTimeDomain::AbsoluteOriginal,
@@ -512,6 +522,8 @@ mod tests {
                     speaker: None,
                     speaker_label: None,
                     speaker_profile_id: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
                     words: vec![
                         WordTimestamp {
                             word: "hello".to_string(),
@@ -534,6 +546,8 @@ mod tests {
                     speaker: None,
                     speaker_label: None,
                     speaker_profile_id: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
                     words: vec![
                         WordTimestamp {
                             word: "from".to_string(),
@@ -604,6 +618,8 @@ mod tests {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words,
         }
     }
@@ -841,6 +857,8 @@ mod tests {
                     speaker: None,
                     speaker_label: None,
                     speaker_profile_id: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
                     words: Vec::new(),
                 },
                 Segment {
@@ -850,6 +868,8 @@ mod tests {
                     speaker: None,
                     speaker_label: None,
                     speaker_profile_id: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
                     words: Vec::new(),
                 },
             ],

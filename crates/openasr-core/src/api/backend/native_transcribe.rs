@@ -2399,6 +2399,8 @@ fn normalize_transcription_segments(
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: Vec::new(),
         }];
         return transcription;
@@ -2434,6 +2436,8 @@ fn normalize_transcription_segments(
             speaker: segment.speaker,
             speaker_label: segment.speaker_label,
             speaker_profile_id: segment.speaker_profile_id,
+            speaker_person_id: segment.speaker_person_id,
+            speaker_snapshot_label: segment.speaker_snapshot_label,
             words: segment.words,
         });
         previous_end = end;
@@ -2453,6 +2457,8 @@ fn normalize_transcription_segments(
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: Vec::new(),
         }];
         return transcription;
@@ -3499,6 +3505,8 @@ mod tests {
                         speaker: None,
                         speaker_label: None,
                         speaker_profile_id: None,
+                        speaker_person_id: None,
+                        speaker_snapshot_label: None,
                         words: Vec::new(),
                     },
                     Segment {
@@ -3508,6 +3516,8 @@ mod tests {
                         speaker: None,
                         speaker_label: None,
                         speaker_profile_id: None,
+                        speaker_person_id: None,
+                        speaker_snapshot_label: None,
                         words: Vec::new(),
                     },
                 ],
@@ -3534,6 +3544,8 @@ mod tests {
                     speaker: None,
                     speaker_label: None,
                     speaker_profile_id: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
                     words: Vec::new(),
                 }],
                 longform: None,
@@ -3558,6 +3570,8 @@ mod tests {
                     speaker: None,
                     speaker_label: None,
                     speaker_profile_id: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
                     words: Vec::new(),
                 }],
                 longform: None,
@@ -3746,6 +3760,8 @@ mod tests {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: vec![WordTimestamp {
                 word: text.to_string(),
                 start,
@@ -3874,6 +3890,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             }],
             longform: None,

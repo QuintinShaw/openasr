@@ -334,7 +334,10 @@ pub(crate) fn is_operator_only_path(method: &axum::http::Method, path: &str) -> 
         return true; // get / put operator config
     }
     if path == "/v1/speakers" || path.starts_with("/v1/speakers/") {
-        return true; // operator-local voice-match profiles
+        return true; // operator-local voice-match profiles (legacy)
+    }
+    if path == "/v1/voice-id" || path.starts_with("/v1/voice-id/") {
+        return true; // operator-local Voice ID v2
     }
     if path == "/v1/models/default" {
         return method != Method::GET; // set-default (POST/PUT); GET is informational

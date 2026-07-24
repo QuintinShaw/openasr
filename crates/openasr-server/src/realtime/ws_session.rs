@@ -224,6 +224,8 @@ struct FinalTranscriptSnapshot {
     speaker: Option<String>,
     speaker_label: Option<String>,
     speaker_profile_id: Option<String>,
+    speaker_person_id: Option<String>,
+    speaker_snapshot_label: Option<String>,
 }
 
 /// Upper bound on retained per-utterance speech for native true-streaming
@@ -355,6 +357,8 @@ fn snapshot_final_transcript(envelope: &RealtimeEventEnvelope) -> Option<FinalTr
         speaker: event.speaker.clone(),
         speaker_label: event.speaker_label.clone(),
         speaker_profile_id: event.speaker_profile_id.clone(),
+        speaker_person_id: event.speaker_person_id.clone(),
+        speaker_snapshot_label: event.speaker_snapshot_label.clone(),
     })
 }
 
@@ -2166,6 +2170,8 @@ impl WsSession {
             speaker: snapshot.speaker.clone(),
             speaker_label: snapshot.speaker_label.clone(),
             speaker_profile_id: snapshot.speaker_profile_id.clone(),
+            speaker_person_id: snapshot.speaker_person_id.clone(),
+            speaker_snapshot_label: snapshot.speaker_snapshot_label.clone(),
         };
         self.emit_local_transcript_event(RealtimeTranscriptEvent::Revision(trimmed))
             .await?;
@@ -2184,6 +2190,8 @@ impl WsSession {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
         };
         let moved_client_id = self
             .emit_local_transcript_event(RealtimeTranscriptEvent::Final(moved))
@@ -2216,14 +2224,20 @@ impl WsSession {
         assignment: &openasr_core::diarize::enrollment::SpeakerDisplayAssignment,
         reason: &str,
     ) -> Result<(), ()> {
-        let (speaker_label, speaker_profile_id) = if assignment.speaker_profile_id.is_some() {
-            (
-                Some(assignment.speaker_label.clone()),
-                assignment.speaker_profile_id.clone(),
-            )
-        } else {
-            (None, None)
-        };
+        let (speaker_label, speaker_profile_id, speaker_person_id, speaker_snapshot_label) =
+            if assignment.speaker_profile_id.is_some() || assignment.speaker_person_id.is_some() {
+                (
+                    Some(assignment.speaker_label.clone()),
+                    assignment.speaker_profile_id.clone(),
+                    assignment.speaker_person_id.clone(),
+                    assignment
+                        .speaker_snapshot_label
+                        .clone()
+                        .or_else(|| Some(assignment.speaker.clone())),
+                )
+            } else {
+                (None, None, None, None)
+            };
         let revision = RealtimeTranscriptRevision {
             utterance_id: record.utterance_id,
             segment_id: record.segment_id,
@@ -2239,6 +2253,8 @@ impl WsSession {
             speaker: Some(assignment.speaker.clone()),
             speaker_label,
             speaker_profile_id,
+            speaker_person_id,
+            speaker_snapshot_label,
         };
         self.emit_local_transcript_event(RealtimeTranscriptEvent::Revision(revision))
             .await
@@ -2551,27 +2567,38 @@ impl WsSession {
         if let Some(assignment) = assignment
             && let RealtimeEvent::Transcript(transcript) = &mut envelope.event
         {
-            let (speaker_slot, label_slot, profile_slot) = match transcript {
-                RealtimeTranscriptEvent::Partial(event) => (
-                    &mut event.speaker,
-                    &mut event.speaker_label,
-                    &mut event.speaker_profile_id,
-                ),
-                RealtimeTranscriptEvent::Final(event) => (
-                    &mut event.speaker,
-                    &mut event.speaker_label,
-                    &mut event.speaker_profile_id,
-                ),
-                RealtimeTranscriptEvent::Revision(event) => (
-                    &mut event.speaker,
-                    &mut event.speaker_label,
-                    &mut event.speaker_profile_id,
-                ),
-            };
-            *speaker_slot = Some(assignment.speaker);
-            if assignment.speaker_profile_id.is_some() {
+            let (speaker_slot, label_slot, profile_slot, person_slot, snapshot_slot) =
+                match transcript {
+                    RealtimeTranscriptEvent::Partial(event) => (
+                        &mut event.speaker,
+                        &mut event.speaker_label,
+                        &mut event.speaker_profile_id,
+                        &mut event.speaker_person_id,
+                        &mut event.speaker_snapshot_label,
+                    ),
+                    RealtimeTranscriptEvent::Final(event) => (
+                        &mut event.speaker,
+                        &mut event.speaker_label,
+                        &mut event.speaker_profile_id,
+                        &mut event.speaker_person_id,
+                        &mut event.speaker_snapshot_label,
+                    ),
+                    RealtimeTranscriptEvent::Revision(event) => (
+                        &mut event.speaker,
+                        &mut event.speaker_label,
+                        &mut event.speaker_profile_id,
+                        &mut event.speaker_person_id,
+                        &mut event.speaker_snapshot_label,
+                    ),
+                };
+            *speaker_slot = Some(assignment.speaker.clone());
+            if assignment.speaker_profile_id.is_some() || assignment.speaker_person_id.is_some() {
                 *label_slot = Some(assignment.speaker_label);
                 *profile_slot = assignment.speaker_profile_id;
+                *person_slot = assignment.speaker_person_id;
+                *snapshot_slot = assignment
+                    .speaker_snapshot_label
+                    .or(Some(assignment.speaker));
             }
         }
         consumed_queued_label
@@ -2973,19 +3000,30 @@ impl WsSession {
                 let controller = self.controller.as_mut().expect("controller exists");
                 let history_text = result.text.trim().to_string();
                 let history_end_ms = result.end_ms;
-                let (speaker, speaker_label, speaker_profile_id) = speaker_assignment
+                let (
+                    speaker,
+                    speaker_label,
+                    speaker_profile_id,
+                    speaker_person_id,
+                    speaker_snapshot_label,
+                ) = speaker_assignment
                     .map(|assignment| {
-                        let speaker_label = assignment
-                            .speaker_profile_id
-                            .is_some()
-                            .then_some(assignment.speaker_label);
+                        let matched = assignment.speaker_profile_id.is_some()
+                            || assignment.speaker_person_id.is_some();
+                        let speaker_label = matched.then_some(assignment.speaker_label.clone());
+                        let snapshot = assignment
+                            .speaker_snapshot_label
+                            .clone()
+                            .or_else(|| matched.then_some(assignment.speaker.clone()));
                         (
                             Some(assignment.speaker),
                             speaker_label,
                             assignment.speaker_profile_id,
+                            assignment.speaker_person_id,
+                            snapshot,
                         )
                     })
-                    .unwrap_or((None, None, None));
+                    .unwrap_or((None, None, None, None, None));
                 let update = TranscriptUpdate {
                     utterance_id: result.utterance_id,
                     segment_id: result.segment_id,
@@ -2997,6 +3035,8 @@ impl WsSession {
                     speaker,
                     speaker_label,
                     speaker_profile_id,
+                    speaker_person_id,
+                    speaker_snapshot_label,
                     words: result.words,
                     revises_event_id: None,
                 };

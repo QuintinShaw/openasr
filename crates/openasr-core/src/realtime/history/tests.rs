@@ -20,6 +20,8 @@ mod tests {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
         }
     }
 
@@ -53,6 +55,8 @@ mod tests {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
         };
         let result = history.apply_revision(&revision, Some("evt_2".to_string()), Some(4));
         assert_eq!(result, RealtimeHistoryApplyResult::Applied);
@@ -104,6 +108,8 @@ mod tests {
                 speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             },
             Some("evt_2".to_string()),
             Some(11),
@@ -161,6 +167,8 @@ mod tests {
                 speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             },
             Some("evt_2".to_string()),
             Some(2),
@@ -179,6 +187,8 @@ mod tests {
                 speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             },
             Some("evt_1".to_string()),
             Some(1),
@@ -210,6 +220,8 @@ mod tests {
                 speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             },
             None,
             None,

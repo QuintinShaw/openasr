@@ -16,6 +16,15 @@ speaker: string | null,
 speaker_label: string | null, 
 /**
  * Voice-match profile id (`vp_*`) when the utterance matched an enrolled
- * profile. This is not an authentication claim.
+ * profile. This is not an authentication claim. Deprecated in favor of
+ * `speaker_person_id`.
  */
-speaker_profile_id: string | null, };
+speaker_profile_id: string | null, 
+/**
+ * Stable Voice ID person id when a v2 match was accepted.
+ */
+speaker_person_id: string | null, 
+/**
+ * Display name frozen at assignment time (survives later renames/deletes).
+ */
+speaker_snapshot_label: string | null, };

@@ -128,10 +128,14 @@ fn apply_speaker(
         segment.speaker = Some(assignment.speaker.clone());
         segment.speaker_label = Some(assignment.speaker_label.clone());
         segment.speaker_profile_id = assignment.speaker_profile_id.clone();
+        segment.speaker_person_id = assignment.speaker_person_id.clone();
+        segment.speaker_snapshot_label = assignment.speaker_snapshot_label.clone();
     } else {
         segment.speaker = Some(speaker.label());
         segment.speaker_label = None;
         segment.speaker_profile_id = None;
+        segment.speaker_person_id = None;
+        segment.speaker_snapshot_label = None;
     }
 }
 
@@ -235,6 +239,8 @@ fn split_segment_at_turn_boundaries(
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words,
             },
         });
@@ -436,6 +442,8 @@ mod tests {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: Vec::new(),
         }
     }
@@ -457,6 +465,8 @@ mod tests {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words,
         }
     }
@@ -499,6 +509,8 @@ mod tests {
                 speaker: "Alice".to_string(),
                 speaker_label: "SPEAKER_01".to_string(),
                 speaker_profile_id: Some("vp_aaaaaaaaaaaaaaaa".to_string()),
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
             },
         );
         let segs = assign_speakers(&turns, vec![seg(0.0, 1.5), seg(2.5, 4.0)], &identities);
@@ -745,6 +757,8 @@ mod tests {
                 speaker: "Alice".to_string(),
                 speaker_label: "SPEAKER_00".to_string(),
                 speaker_profile_id: Some("vp_bbbbbbbbbbbbbbbb".to_string()),
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
             },
         );
         let segment = worded_seg(

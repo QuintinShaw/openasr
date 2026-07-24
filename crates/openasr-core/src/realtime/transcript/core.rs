@@ -32,6 +32,8 @@ pub struct TranscriptUpdate {
     pub speaker: Option<String>,
     pub speaker_label: Option<String>,
     pub speaker_profile_id: Option<String>,
+    pub speaker_person_id: Option<String>,
+    pub speaker_snapshot_label: Option<String>,
     pub words: Vec<RealtimeTranscriptWord>,
     pub revises_event_id: Option<RealtimeEventId>,
 }
@@ -56,6 +58,8 @@ impl TranscriptUpdate {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: Vec::new(),
             revises_event_id: None,
         }
@@ -80,6 +84,22 @@ impl TranscriptUpdate {
         self.speaker = speaker;
         self.speaker_label = speaker_label;
         self.speaker_profile_id = speaker_profile_id;
+        self
+    }
+
+    pub fn with_voice_id_identity(
+        mut self,
+        speaker: Option<String>,
+        speaker_label: Option<String>,
+        speaker_profile_id: Option<String>,
+        speaker_person_id: Option<String>,
+        speaker_snapshot_label: Option<String>,
+    ) -> Self {
+        self.speaker = speaker;
+        self.speaker_label = speaker_label;
+        self.speaker_profile_id = speaker_profile_id;
+        self.speaker_person_id = speaker_person_id;
+        self.speaker_snapshot_label = speaker_snapshot_label;
         self
     }
 
@@ -126,6 +146,8 @@ pub(super) struct TranscriptSegmentState {
     speaker: Option<String>,
     speaker_label: Option<String>,
     speaker_profile_id: Option<String>,
+    speaker_person_id: Option<String>,
+    speaker_snapshot_label: Option<String>,
 }
 
 impl Default for TranscriptLifecycle {
@@ -203,6 +225,8 @@ impl TranscriptLifecycle {
                     state.speaker.clone(),
                     state.speaker_label.clone(),
                     state.speaker_profile_id.clone(),
+                    state.speaker_person_id.clone(),
+                    state.speaker_snapshot_label.clone(),
                 );
             }
         }
@@ -230,6 +254,18 @@ impl TranscriptLifecycle {
                 .as_ref()
                 .and_then(|state| state.speaker_profile_id.clone()),
         );
+        let speaker_person_id = transcript_state::inherited_speaker_person_id(
+            &update,
+            previous_state
+                .as_ref()
+                .and_then(|state| state.speaker_person_id.clone()),
+        );
+        let speaker_snapshot_label = transcript_state::inherited_speaker_snapshot_label(
+            &update,
+            previous_state
+                .as_ref()
+                .and_then(|state| state.speaker_snapshot_label.clone()),
+        );
 
         let state = transcript_state::segment_state(
             update.revision,
@@ -240,6 +276,8 @@ impl TranscriptLifecycle {
             speaker.clone(),
             speaker_label.clone(),
             speaker_profile_id.clone(),
+            speaker_person_id.clone(),
+            speaker_snapshot_label.clone(),
         );
         self.segments.insert(key, state);
         if final_update {
@@ -249,6 +287,8 @@ impl TranscriptLifecycle {
                 speaker,
                 speaker_label,
                 speaker_profile_id,
+                speaker_person_id,
+                speaker_snapshot_label,
             ))
         } else {
             TranscriptLifecycleResult::Event(transcript_state::to_partial_event(
@@ -257,6 +297,8 @@ impl TranscriptLifecycle {
                 speaker,
                 speaker_label,
                 speaker_profile_id,
+                speaker_person_id,
+                speaker_snapshot_label,
             ))
         }
     }
@@ -269,19 +311,31 @@ impl TranscriptLifecycle {
         previous_speaker: Option<String>,
         previous_speaker_label: Option<String>,
         previous_speaker_profile_id: Option<String>,
+        previous_speaker_person_id: Option<String>,
+        previous_speaker_snapshot_label: Option<String>,
     ) -> TranscriptLifecycleResult {
         match self.policy {
             TranscriptRevisionPolicy::ExplicitPostFinalRevision => {
                 let key = (update.utterance_id.clone(), update.segment_id.clone());
-                let (event, final_event_id, language, speaker, speaker_label, speaker_profile_id) =
-                    transcript_state::to_revision_event(
-                        update.clone(),
-                        recorded_final_event_id,
-                        previous_language,
-                        previous_speaker,
-                        previous_speaker_label,
-                        previous_speaker_profile_id,
-                    );
+                let (
+                    event,
+                    final_event_id,
+                    language,
+                    speaker,
+                    speaker_label,
+                    speaker_profile_id,
+                    speaker_person_id,
+                    speaker_snapshot_label,
+                ) = transcript_state::to_revision_event(
+                    update.clone(),
+                    recorded_final_event_id,
+                    previous_language,
+                    previous_speaker,
+                    previous_speaker_label,
+                    previous_speaker_profile_id,
+                    previous_speaker_person_id,
+                    previous_speaker_snapshot_label,
+                );
                 self.segments.insert(
                     key,
                     transcript_state::segment_state(
@@ -293,6 +347,8 @@ impl TranscriptLifecycle {
                         speaker.clone(),
                         speaker_label.clone(),
                         speaker_profile_id.clone(),
+                        speaker_person_id.clone(),
+                        speaker_snapshot_label.clone(),
                     ),
                 );
                 TranscriptLifecycleResult::Event(event)

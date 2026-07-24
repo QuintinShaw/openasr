@@ -43,6 +43,10 @@ struct JsonSegment<'a> {
     speaker_label: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     speaker_profile_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speaker_person_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speaker_snapshot_label: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     words: Vec<JsonWord<'a>>,
 }
@@ -77,6 +81,8 @@ fn json_segments(transcription: &Transcription, with_ids: bool) -> Vec<JsonSegme
             speaker: segment.speaker.as_deref(),
             speaker_label: segment.speaker_label.as_deref(),
             speaker_profile_id: segment.speaker_profile_id.as_deref(),
+            speaker_person_id: segment.speaker_person_id.as_deref(),
+            speaker_snapshot_label: segment.speaker_snapshot_label.as_deref(),
             words: segment
                 .words
                 .iter()

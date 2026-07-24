@@ -97,19 +97,16 @@ pub(crate) async fn delete_speaker(
 }
 
 pub(crate) async fn reenroll_speaker(
-    Extension(distribution): Extension<DistributionContext>,
-    AxumPath(id): AxumPath<String>,
+    Extension(_distribution): Extension<DistributionContext>,
+    AxumPath(_id): AxumPath<String>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Json<SpeakerProfileView>, ApiError> {
-    let parsed = parse_speaker_enrollment_multipart(multipart, false).await?;
-    let path = speaker_store_path(&distribution)?;
-    let profile = openasr_core::diarize::enrollment::replace_profile_embedding_from_wav_file(
-        &path,
-        &id,
-        parsed.wav_path.as_ref(),
-    )
-    .map_err(enrollment_error)?;
-    Ok(Json(profile_view_with_active_compatibility(&profile)))
+    // Consume multipart so clients do not hang, then reject: multi-sample
+    // Voice ID persons must add samples via /v1/voice-id, not overwrite.
+    let _ = parse_speaker_enrollment_multipart(multipart, false).await?;
+    Err(ApiError::BadRequest(
+        "reenroll is not supported for Voice ID v2 multi-sample persons; POST /v1/voice-id/persons/{id}/samples to add a sample or DELETE a sample and re-add".into(),
+    ))
 }
 
 struct ParsedSpeakerEnrollment {

@@ -279,6 +279,10 @@ pub struct SpeakerDisplayAssignment {
     pub speaker: String,
     pub speaker_label: String,
     pub speaker_profile_id: Option<String>,
+    /// Stable Voice ID person id when a v2 match was accepted.
+    pub speaker_person_id: Option<String>,
+    /// Display name frozen at assignment time for history.
+    pub speaker_snapshot_label: Option<String>,
 }
 
 impl SpeakerDisplayAssignment {
@@ -289,15 +293,32 @@ impl SpeakerDisplayAssignment {
             speaker: speaker_label.clone(),
             speaker_label,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
         }
     }
 
     pub fn from_match(speaker_id: SpeakerId, profile_match: SpeakerProfileMatch) -> Self {
         Self {
             speaker_id,
-            speaker: profile_match.name,
+            speaker: profile_match.name.clone(),
             speaker_label: speaker_id.label(),
             speaker_profile_id: Some(profile_match.profile_id),
+            speaker_person_id: None,
+            speaker_snapshot_label: Some(profile_match.name),
+        }
+    }
+
+    pub fn from_voice_id_assignment(
+        assignment: crate::diarize::voice_id::VoiceIdAssignment,
+    ) -> Self {
+        Self {
+            speaker_id: assignment.speaker_id,
+            speaker: assignment.speaker,
+            speaker_label: assignment.speaker_label,
+            speaker_profile_id: assignment.speaker_profile_id,
+            speaker_person_id: assignment.speaker_person_id,
+            speaker_snapshot_label: assignment.speaker_snapshot_label,
         }
     }
 }

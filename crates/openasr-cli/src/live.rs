@@ -1873,19 +1873,25 @@ impl LivePipeline {
         } else {
             self.pending_utterance_speakers.remove(&result.utterance_id)
         };
-        let (speaker, speaker_label, speaker_profile_id) = speaker_assignment
-            .map(|assignment| {
-                let speaker_label = assignment
-                    .speaker_profile_id
-                    .is_some()
-                    .then_some(assignment.speaker_label);
-                (
-                    Some(assignment.speaker),
-                    speaker_label,
-                    assignment.speaker_profile_id,
-                )
-            })
-            .unwrap_or((None, None, None));
+        let (speaker, speaker_label, speaker_profile_id, speaker_person_id, speaker_snapshot_label) =
+            speaker_assignment
+                .map(|assignment| {
+                    let matched = assignment.speaker_profile_id.is_some()
+                        || assignment.speaker_person_id.is_some();
+                    let speaker_label = matched.then_some(assignment.speaker_label.clone());
+                    let snapshot = assignment
+                        .speaker_snapshot_label
+                        .clone()
+                        .or_else(|| matched.then_some(assignment.speaker.clone()));
+                    (
+                        Some(assignment.speaker),
+                        speaker_label,
+                        assignment.speaker_profile_id,
+                        assignment.speaker_person_id,
+                        snapshot,
+                    )
+                })
+                .unwrap_or((None, None, None, None, None));
         let update = TranscriptUpdate {
             utterance_id: result.utterance_id.clone(),
             segment_id: result.segment_id,
@@ -1897,6 +1903,8 @@ impl LivePipeline {
             speaker,
             speaker_label,
             speaker_profile_id,
+            speaker_person_id,
+            speaker_snapshot_label,
             words: Vec::new(),
             revises_event_id: None,
         };
@@ -3018,6 +3026,8 @@ mod tests {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: Vec::new(),
         };
         let partial_envelope = pipeline
@@ -3039,6 +3049,8 @@ mod tests {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: Vec::new(),
         };
         let first_envelope = pipeline
@@ -3059,6 +3071,8 @@ mod tests {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: Vec::new(),
         };
         let second_envelope = pipeline
@@ -3084,6 +3098,8 @@ mod tests {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: Vec::new(),
         };
         let revision_envelope = pipeline
@@ -3126,6 +3142,8 @@ mod tests {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: Vec::new(),
         };
         let envelope = pipeline
@@ -3169,6 +3187,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             };
             let envelope = pipeline
@@ -3266,6 +3286,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             },
             Some("evt_1".to_string()),
@@ -3311,6 +3333,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             },
             Some("evt_2".to_string()),
@@ -3353,6 +3377,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             },
             Some("evt_3".to_string()),
@@ -3398,6 +3424,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             },
             Some("evt_1".to_string()),
@@ -3440,6 +3468,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             },
             Some("evt_1".to_string()),
@@ -3483,6 +3513,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             },
             Some("evt_1".to_string()),
@@ -3536,6 +3568,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             },
             Some("evt_1".to_string()),
@@ -3582,6 +3616,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             },
             Some("evt_1".to_string()),
@@ -3645,6 +3681,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             },
             Some("evt_1".to_string()),
@@ -3696,6 +3734,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             },
             Some("evt_1".to_string()),
@@ -3756,6 +3796,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             },
             Some("evt_1".to_string()),
@@ -3813,6 +3855,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             },
             Some("evt_1".to_string()),

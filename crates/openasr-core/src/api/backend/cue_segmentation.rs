@@ -93,6 +93,8 @@ fn segment_into_cues(segment: Segment) -> Vec<Segment> {
             speaker: segment.speaker.clone(),
             speaker_label: segment.speaker_label.clone(),
             speaker_profile_id: segment.speaker_profile_id.clone(),
+            speaker_person_id: segment.speaker_person_id.clone(),
+            speaker_snapshot_label: segment.speaker_snapshot_label.clone(),
             words,
         });
     }
@@ -407,6 +409,8 @@ mod tests {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words,
         }
     }

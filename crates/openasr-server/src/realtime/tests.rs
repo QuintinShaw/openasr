@@ -420,6 +420,8 @@ impl NativeAsrSession for TestServerNativeSession {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
             },
         )))
     }
@@ -443,6 +445,8 @@ impl NativeAsrSession for TestServerNativeSession {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
             },
         )))
     }
@@ -682,6 +686,8 @@ impl NativeAsrSession for MultiFinalizeNativeSession {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
             },
         )))
     }
@@ -707,6 +713,8 @@ impl NativeAsrSession for MultiFinalizeNativeSession {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
             },
         ));
         self.utterance_index = self.utterance_index.saturating_add(1);
@@ -1654,6 +1662,8 @@ fn realtime_words_from_transcription_maps_seconds_to_milliseconds() {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: vec![
                 WordTimestamp {
                     word: "hello".to_string(),
@@ -3674,6 +3684,8 @@ fn transcript_partial_text(text: &str, revision: u64, end_ms: u64) -> RealtimeTr
         speaker: None,
         speaker_label: None,
         speaker_profile_id: None,
+        speaker_person_id: None,
+        speaker_snapshot_label: None,
     })
 }
 
@@ -3691,6 +3703,8 @@ fn transcript_final_text(text: &str, revision: u64, end_ms: u64) -> RealtimeTran
         speaker: None,
         speaker_label: None,
         speaker_profile_id: None,
+        speaker_person_id: None,
+        speaker_snapshot_label: None,
     })
 }
 
@@ -3710,6 +3724,8 @@ fn transcript_revision_text(text: &str, revision: u64, end_ms: u64) -> RealtimeT
         speaker: None,
         speaker_label: None,
         speaker_profile_id: None,
+        speaker_person_id: None,
+        speaker_snapshot_label: None,
     })
 }
 
@@ -4946,6 +4962,8 @@ fn native_transcript_final_envelope_with_text(
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
         },
     ));
     RealtimeEventEnvelope {
@@ -4998,6 +5016,8 @@ fn matched_assignment() -> openasr_core::diarize::enrollment::SpeakerDisplayAssi
         speaker: "Alice".to_string(),
         speaker_label: "SPEAKER_00".to_string(),
         speaker_profile_id: Some("vp_aaaaaaaaaaaaaaaa".to_string()),
+        speaker_person_id: None,
+        speaker_snapshot_label: None,
     }
 }
 
@@ -5490,6 +5510,8 @@ fn native_final_envelope_with(
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
         },
     ));
     RealtimeEventEnvelope {

@@ -283,9 +283,16 @@ pub struct RealtimeTranscriptPartial {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
     /// Voice-match profile id (`vp_*`) when the utterance matched an enrolled
-    /// profile. This is not an authentication claim.
+    /// profile. This is not an authentication claim. Deprecated in favor of
+    /// `speaker_person_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_profile_id: Option<String>,
+    /// Stable Voice ID person id when a v2 match was accepted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_person_id: Option<String>,
+    /// Display name frozen at assignment time (survives later renames/deletes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_snapshot_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -312,9 +319,14 @@ pub struct RealtimeTranscriptFinal {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
     /// Voice-match profile id (`vp_*`) when the utterance matched an enrolled
-    /// profile. This is not an authentication claim.
+    /// profile. This is not an authentication claim. Deprecated in favor of
+    /// `speaker_person_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_person_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_snapshot_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -344,9 +356,14 @@ pub struct RealtimeTranscriptRevision {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
     /// Voice-match profile id (`vp_*`) when the utterance matched an enrolled
-    /// profile. This is not an authentication claim.
+    /// profile. This is not an authentication claim. Deprecated in favor of
+    /// `speaker_person_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_person_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_snapshot_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -610,6 +627,8 @@ mod tests {
                     speaker: None,
                     speaker_label: None,
                     speaker_profile_id: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
                 },
             )),
             "2026-05-09T00:00:00Z",
@@ -661,6 +680,8 @@ mod tests {
                     speaker: None,
                     speaker_label: None,
                     speaker_profile_id: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
                 },
             )),
             "2026-05-09T00:00:02Z",
@@ -771,6 +792,8 @@ mod tests {
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
         };
 
         let value = serde_json::to_value(event).unwrap();

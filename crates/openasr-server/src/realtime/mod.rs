@@ -210,6 +210,8 @@ pub(crate) async fn stream_transcription(
                     speaker: None,
                     speaker_label: None,
                     speaker_profile_id: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
                     words,
                     revises_event_id: None,
                 };

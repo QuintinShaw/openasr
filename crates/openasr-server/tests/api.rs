@@ -2239,7 +2239,7 @@ async fn speaker_enrollment_routes_reject_short_silent_and_missing_pack() {
 }
 
 #[tokio::test]
-async fn speaker_reenroll_fails_closed_when_embedder_pack_is_missing() {
+async fn speaker_reenroll_rejects_legacy_overwrite_path() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let id = write_voiceprint_store(&home);
@@ -2264,11 +2264,11 @@ async fn speaker_reenroll_fails_closed_when_embedder_pack_is_missing() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
+        let message = json["error"]["message"].as_str().unwrap();
         assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("speaker-embedder pack")
+            message.contains("reenroll is not supported")
+                || message.contains("/v1/voice-id/persons"),
+            "unexpected reenroll rejection message: {message}"
         );
     })
     .await;
