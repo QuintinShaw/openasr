@@ -292,6 +292,38 @@ pub(crate) enum OpenAsrEncoderAttentionSpan {
     LocalChunked,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAsrStreamingPartialGranularity {
+    Buffered,
+    FrameSync,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAsrAuditFormRequirement {
+    /// The family predates the release-audit program. A future public model
+    /// release still passes through the publishing gate, which owns the
+    /// migration from this explicit exemption to a checked audit form.
+    LegacyExempt,
+    Required {
+        relative_path: &'static str,
+    },
+}
+
+/// Static integration obligations for one native family.
+///
+/// This belongs to the architecture descriptor rather than another family
+/// list: adding a dispatchable architecture must make every applicable
+/// integration decision explicit, while optional development tooling stays
+/// absent instead of acquiring a placeholder implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenAsrFamilyIntegrationDescriptor {
+    pub supports_phrase_bias: bool,
+    pub streaming_partial_granularity: OpenAsrStreamingPartialGranularity,
+    pub pack_importer_source: &'static str,
+    pub audit_form: OpenAsrAuditFormRequirement,
+    pub reference_dumper_source: Option<&'static str>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct OpenAsrArchitectureDescriptor {
     pub runtime_architecture_aliases: &'static [&'static str],
@@ -305,6 +337,7 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     pub tokenizer_id: &'static str,
     pub decode_policy_id: &'static str,
     pub executor_component_id: &'static str,
+    pub integration: OpenAsrFamilyIntegrationDescriptor,
     pub execution_capability: GgmlExecutionCapability,
     pub prefer_cpu_decoder_for_multichunk_metal: bool,
     /// Which GPU-class backend(s) Auto execution may select automatically
@@ -1106,6 +1139,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: COHERE_TRANSCRIBE_TOKENIZER_ID,
         decode_policy_id: COHERE_TRANSCRIBE_DECODE_POLICY_ID,
         executor_component_id: COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            supports_phrase_bias: true,
+            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
+            pack_importer_source: "crates/openasr-core/src/models/cohere/package_import.rs",
+            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            reference_dumper_source: None,
+        },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: true,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
@@ -1146,6 +1186,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: WHISPER_TOKENIZER_ID,
         decode_policy_id: WHISPER_DECODE_POLICY_ID,
         executor_component_id: WHISPER_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            supports_phrase_bias: true,
+            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
+            pack_importer_source: "crates/openasr-core/src/models/whisper/package_import.rs",
+            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            reference_dumper_source: None,
+        },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
@@ -1179,6 +1226,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: QWEN3_ASR_TOKENIZER_ID,
         decode_policy_id: QWEN3_ASR_DECODE_POLICY_ID,
         executor_component_id: QWEN3_ASR_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            supports_phrase_bias: true,
+            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
+            pack_importer_source: "crates/openasr-core/src/models/qwen/package_import.rs",
+            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            reference_dumper_source: None,
+        },
         execution_capability: GgmlExecutionCapability::NativeGraphLoweringV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         // Left un-gated (`AllBackends`) for now: the measured 1.71x Metal
@@ -1225,6 +1279,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: PARAKEET_CTC_TOKENIZER_ID,
         decode_policy_id: PARAKEET_CTC_DECODE_POLICY_ID,
         executor_component_id: PARAKEET_CTC_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            supports_phrase_bias: true,
+            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
+            pack_importer_source: "crates/openasr-core/src/models/parakeet_ctc/package_import.rs",
+            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            reference_dumper_source: None,
+        },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
@@ -1271,6 +1332,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: PARAKEET_TDT_TOKENIZER_ID,
         decode_policy_id: PARAKEET_TDT_DECODE_POLICY_ID,
         executor_component_id: PARAKEET_TDT_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            supports_phrase_bias: false,
+            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
+            pack_importer_source: "crates/openasr-core/src/models/parakeet_tdt/package_import.rs",
+            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            reference_dumper_source: None,
+        },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
@@ -1305,6 +1373,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: WAV2VEC2_CTC_TOKENIZER_ID,
         decode_policy_id: WAV2VEC2_CTC_DECODE_POLICY_ID,
         executor_component_id: WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            supports_phrase_bias: true,
+            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
+            pack_importer_source: "crates/openasr-core/src/models/wav2vec2_ctc/package_import.rs",
+            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            reference_dumper_source: None,
+        },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
@@ -1342,6 +1417,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: XASR_ZIPFORMER_TOKENIZER_ID,
         decode_policy_id: XASR_ZIPFORMER_DECODE_POLICY_ID,
         executor_component_id: XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            supports_phrase_bias: false,
+            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::FrameSync,
+            pack_importer_source: "crates/openasr-core/src/models/xasr_zipformer/package_import.rs",
+            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            reference_dumper_source: None,
+        },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         // Was measured CPU-favored on the M1 host, but that measurement
@@ -1387,6 +1469,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: MOONSHINE_TOKENIZER_ID,
         decode_policy_id: MOONSHINE_DECODE_POLICY_ID,
         executor_component_id: MOONSHINE_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            supports_phrase_bias: true,
+            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
+            pack_importer_source: "crates/openasr-core/src/models/moonshine/package_import.rs",
+            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            reference_dumper_source: None,
+        },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
@@ -1423,6 +1512,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: DOLPHIN_TOKENIZER_ID,
         decode_policy_id: DOLPHIN_DECODE_POLICY_ID,
         executor_component_id: DOLPHIN_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            supports_phrase_bias: true,
+            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
+            pack_importer_source: "crates/openasr-core/src/models/dolphin/package_import.rs",
+            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            reference_dumper_source: None,
+        },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         // Auto prefers the accelerator: once the E-Branchformer encoder + CTC
@@ -1467,6 +1563,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: SENSEVOICE_TOKENIZER_ID,
         decode_policy_id: SENSEVOICE_DECODE_POLICY_ID,
         executor_component_id: SENSEVOICE_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            supports_phrase_bias: true,
+            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
+            pack_importer_source: "crates/openasr-core/src/models/sensevoice/package_import.rs",
+            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            reference_dumper_source: None,
+        },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
@@ -1506,6 +1609,15 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: FIRERED_AED_TOKENIZER_ID,
         decode_policy_id: FIRERED_AED_DECODE_POLICY_ID,
         executor_component_id: FIRERED_AED_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            supports_phrase_bias: false,
+            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
+            pack_importer_source: "crates/openasr-core/src/models/firered_aed/package_import.rs",
+            audit_form: OpenAsrAuditFormRequirement::Required {
+                relative_path: "docs/model-audits/firered-aed.md",
+            },
+            reference_dumper_source: Some("tooling/firered2-reference-dumper/dump_aed_encoder.py"),
+        },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
@@ -1549,6 +1661,15 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: FIRERED_LLM_TOKENIZER_ID,
         decode_policy_id: FIRERED_LLM_DECODE_POLICY_ID,
         executor_component_id: FIRERED_LLM_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            supports_phrase_bias: false,
+            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
+            pack_importer_source: "crates/openasr-core/src/models/firered_llm/package_import.rs",
+            audit_form: OpenAsrAuditFormRequirement::Required {
+                relative_path: "docs/model-audits/firered2-llm.md",
+            },
+            reference_dumper_source: Some("tooling/firered2-reference-dumper/dump_reference.py"),
+        },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
@@ -1590,6 +1711,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: MIMO_ASR_TOKENIZER_ID,
         decode_policy_id: MIMO_ASR_DECODE_POLICY_ID,
         executor_component_id: MIMO_ASR_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            supports_phrase_bias: false,
+            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
+            pack_importer_source: "tooling/mimo-asr/convert_mimo_asr.py",
+            audit_form: OpenAsrAuditFormRequirement::LegacyExempt,
+            reference_dumper_source: None,
+        },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
@@ -1629,6 +1757,15 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         tokenizer_id: MOSS_TD_TOKENIZER_ID,
         decode_policy_id: MOSS_TD_DECODE_POLICY_ID,
         executor_component_id: MOSS_TD_EXECUTOR_COMPONENT_ID,
+        integration: OpenAsrFamilyIntegrationDescriptor {
+            supports_phrase_bias: false,
+            streaming_partial_granularity: OpenAsrStreamingPartialGranularity::Buffered,
+            pack_importer_source: "crates/openasr-core/src/models/moss_transcribe_diarize/package_import.rs",
+            audit_form: OpenAsrAuditFormRequirement::Required {
+                relative_path: "docs/model-audits/moss-transcribe-diarize.md",
+            },
+            reference_dumper_source: Some("tooling/moss-reference-dumper/dump_golden.py"),
+        },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         // Auto is pinned OFF Metal for this family until its Metal-specific
@@ -1691,6 +1828,47 @@ mod tests {
         OpenAsrArchitectureRegistry::with_builtins()
             .validate_references()
             .expect("builtins must reference known components");
+    }
+
+    #[test]
+    fn native_family_integration_manifest_references_existing_tooling() {
+        let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repository root");
+        for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
+            assert!(
+                !descriptor.integration.pack_importer_source.is_empty(),
+                "native family '{}' must declare its pack importer source",
+                descriptor.model_family
+            );
+            assert!(
+                repository_root
+                    .join(descriptor.integration.pack_importer_source)
+                    .is_file(),
+                "native family '{}' pack importer source '{}' is missing",
+                descriptor.model_family,
+                descriptor.integration.pack_importer_source
+            );
+            if let Some(source) = descriptor.integration.reference_dumper_source {
+                assert!(
+                    repository_root.join(source).is_file(),
+                    "native family '{}' reference dumper source '{}' is missing",
+                    descriptor.model_family,
+                    source
+                );
+            }
+            if let OpenAsrAuditFormRequirement::Required { relative_path } =
+                descriptor.integration.audit_form
+            {
+                assert!(
+                    repository_root.join(relative_path).is_file(),
+                    "native family '{}' requires audit form '{}' but it is missing",
+                    descriptor.model_family,
+                    relative_path
+                );
+            }
+        }
     }
 
     /// Pins `self_diarizes` and `emits_punctuation` per builtin architecture --

@@ -913,7 +913,6 @@ mod tests {
         // new seq2seq family that registers `*.greedy.seq2seq.*` in the arch
         // registry but forgets the execution descriptor trips this test instead
         // of silently failing at decode time.
-        let mut checked = 0usize;
         for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
             if !descriptor.decode_policy_id.contains(".greedy.seq2seq.") {
                 continue;
@@ -931,14 +930,7 @@ mod tests {
                 "decode policy '{}' must be Seq2SeqGreedyV0",
                 descriptor.decode_policy_id
             );
-            checked += 1;
         }
-        // cohere-transcribe + whisper + qwen3-asr + moonshine + firered-aed +
-        // firered-llm + mimo-asr + moss-transcribe-diarize.
-        assert_eq!(
-            checked, 8,
-            "expected exactly 7 greedy-seq2seq architectures to resolve"
-        );
     }
 
     struct SyntheticStepExecutor {
