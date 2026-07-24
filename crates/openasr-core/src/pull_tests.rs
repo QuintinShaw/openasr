@@ -757,8 +757,8 @@ fn capability_pack_stays_pullable_and_importable_by_digest() {
     resolved.requested = "redimnet2-b6-cn:fp16".to_string();
     resolved.model_id = "redimnet2-b6-cn".to_string();
     resolved.display_name = "ReDimNet2-B6 Speaker Embedder (CN-enhanced)".to_string();
-    resolved.quant = "f32".to_string();
-    resolved.suffix = "f32".to_string();
+    resolved.quant = "fp16".to_string();
+    resolved.suffix = "fp16".to_string();
     resolved.pull = "redimnet2-b6-cn:fp16".to_string();
     resolved.filename = "redimnet2-b6-cn-fp16.oasr".to_string();
     resolved.url = "https://huggingface.co/OpenASR/redimnet2-b6-cn/resolve/0123456789abcdef0123456789abcdef01234567/redimnet2-b6-cn-fp16.oasr".to_string();
