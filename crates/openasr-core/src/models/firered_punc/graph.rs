@@ -26,7 +26,50 @@ use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 use super::config::{FIRERED_PUNC_LAYER_NORM_EPSILON, FireRedPuncExecutionMetadata};
 use super::weights::{FireRedPuncLayerWeights, FireRedPuncWeights, NamedTensor};
 
-const FIRERED_PUNC_GRAPH_CONTEXT_BYTES: usize = 256 * 1024 * 1024;
+/// Fixed weight-arena tensors: token / token-type / position embeddings, the
+/// post-embedding LayerNorm weight+bias and the classification-head
+/// weight+bias.
+const FIRERED_PUNC_FIXED_ARENA_TENSORS: usize = 7;
+/// Weight-arena tensors per BERT block, mirroring [`LayerArena`]: the q/k/v,
+/// output, ffn-up and ffn-down weight+bias pairs plus the attention and FFN
+/// LayerNorm weight+bias pairs.
+const FIRERED_PUNC_ARENA_TENSORS_PER_LAYER: usize = 16;
+
+/// The runner's graph config, right-sized from the BERT forward-graph node
+/// budget instead of the historical flat 256 MB. Each post-norm BERT block
+/// builds ~45-50 ggml ops (q/k/v linear projections, per-head
+/// reshape/permute/cont, scaled dot-product attention, output projection, two
+/// affine LayerNorms and the erf-GELU FFN); `layers * 64 + 512` keeps headroom
+/// over the per-layer count plus the fixed embed-sum/LayerNorm front and the
+/// classification head, and longer sequences grow tensor DIMENSIONS, not the
+/// op count. `ggml_init` always mallocs the full `mem_size` even with
+/// `no_alloc=true`, so the old 256 MB committed ~256 MB of metadata context
+/// that only ever holds bookkeeping for <3k tensors: resident-memory waste on
+/// the 16 GB target, for a graph that needs <1 MB (see
+/// [`GgmlCpuGraphConfig::metadata_context_bytes`]). Mirrors the qwen
+/// audio-encoder (`models/qwen/audio_encoder.rs`) and xasr_zipformer encoder
+/// (`models/xasr_zipformer/graph_config.rs`) sizing.
+fn firered_punc_graph_config(layers: usize) -> GgmlCpuGraphConfig {
+    let mut config = GgmlCpuGraphConfig::default();
+    config.graph_size = config.graph_size.max(layers * 64 + 512);
+    config.context_bytes = config
+        .context_bytes
+        .max(GgmlCpuGraphConfig::metadata_context_bytes(
+            config.graph_size,
+        ));
+    config
+}
+
+/// Exact byte capacity the weight arena's `no_alloc` metadata context needs
+/// for the architecture-bound tensor count: [`FIRERED_PUNC_FIXED_ARENA_TENSORS`]
+/// fixed tensors plus [`FIRERED_PUNC_ARENA_TENSORS_PER_LAYER`] per BERT block.
+/// Over-counting only sizes the (cheap) tensor-overhead context; the real
+/// weight bytes land in the backend buffer.
+fn firered_punc_weight_arena_context_bytes(layers: usize) -> usize {
+    let tensor_count = FIRERED_PUNC_FIXED_ARENA_TENSORS
+        .saturating_add(FIRERED_PUNC_ARENA_TENSORS_PER_LAYER.saturating_mul(layers));
+    GgmlCpuGraphConfig::metadata_context_bytes(tensor_count)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FireRedPuncGraphError {
@@ -121,12 +164,10 @@ impl FireRedPuncGraph {
         weights: &FireRedPuncWeights,
         metadata: FireRedPuncExecutionMetadata,
     ) -> Result<Self, FireRedPuncGraphError> {
-        let mut config = GgmlCpuGraphConfig::default();
-        config.context_bytes = FIRERED_PUNC_GRAPH_CONTEXT_BYTES;
-        config.graph_size = config.graph_size.max(metadata.layers * 64 + 512);
+        let config = firered_punc_graph_config(metadata.layers);
         let runner = GgmlCpuGraphRunner::new(config).map_err(bf("runner_init"))?;
         let mut arena = runner
-            .start_static_tensor_arena(FIRERED_PUNC_GRAPH_CONTEXT_BYTES)
+            .start_static_tensor_arena(firered_punc_weight_arena_context_bytes(metadata.layers))
             .map_err(bf("arena_init"))?;
 
         let d = metadata.d_model;
@@ -713,5 +754,32 @@ mod tests {
             graph.forward(&too_long),
             Err(FireRedPuncGraphError::SequenceTooLong { .. })
         ));
+    }
+
+    /// Regression guard for the right-sized metadata contexts (the historical
+    /// flat 256 MB over-reserved bookkeeping-only contexts; `ggml_init`
+    /// mallocs the full `mem_size` even with `no_alloc=true`). A
+    /// production-scale 24-block BERT stack is far above the 1-block fixture
+    /// and bounds any real FireRedPunc pack. Only touches
+    /// `context_bytes`/`graph_size` (thread-independent), so it is stable
+    /// against parallel-test env mutation.
+    #[test]
+    fn graph_context_is_right_sized_not_flat_256mb() {
+        let layers = 24;
+        let config = firered_punc_graph_config(layers);
+        assert!(config.graph_size >= layers * 64 + 512);
+        assert!(
+            config.context_bytes >= GgmlCpuGraphConfig::metadata_context_bytes(config.graph_size)
+        );
+        assert!(
+            config.context_bytes < 16 * 1024 * 1024,
+            "firered-punc runner metadata context regrew toward the old flat 256 MB: {}",
+            config.context_bytes
+        );
+        assert!(
+            firered_punc_weight_arena_context_bytes(layers) < 16 * 1024 * 1024,
+            "firered-punc weight-arena metadata context regrew toward the old flat 256 MB: {}",
+            firered_punc_weight_arena_context_bytes(layers)
+        );
     }
 }

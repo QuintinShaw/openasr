@@ -34,7 +34,29 @@ use super::tensor_names::{
 };
 
 const RMS_NORM_EPSILON: f32 = 1.0e-6;
-const GRAPH_CONTEXT_BYTES: usize = 256 * 1024 * 1024;
+
+/// The input-local runner's graph config, right-sized from the 6L
+/// transformer's forward-graph node budget instead of the historical flat
+/// 256 MB. Each Qwen2-shaped block builds ~35-45 ggml ops (RMSNorm, qkv
+/// projections + bias, per-head reshape/RoPE/permute/cont, scaled dot-product
+/// attention, output projection, SwiGLU FFN and two residuals); the default
+/// `graph_size` (4096) keeps >60x headroom over the 6-block graph, and longer
+/// audio grows tensor DIMENSIONS, not the op count.
+/// [`GgmlCpuGraphConfig::metadata_context_bytes`] sizes the `no_alloc`
+/// metadata context from that node budget: `ggml_init` always mallocs the
+/// full `mem_size` even with `no_alloc=true`, so the old 256 MB committed
+/// ~256 MB of metadata context for a graph that needs ~2 MB. Mirrors the qwen
+/// audio-encoder (`models/qwen/audio_encoder.rs`) and xasr_zipformer encoder
+/// (`models/xasr_zipformer/graph_config.rs`) sizing.
+fn mimo_input_local_graph_config() -> GgmlCpuGraphConfig {
+    let mut config = GgmlCpuGraphConfig::default();
+    config.context_bytes = config
+        .context_bytes
+        .max(GgmlCpuGraphConfig::metadata_context_bytes(
+            config.graph_size,
+        ));
+    config
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum MimoInputLocalError {
@@ -212,13 +234,7 @@ impl MimoInputLocalRuntime {
         runtime_path: &std::path::Path,
         metadata: MimoInlocalMetadata,
     ) -> Result<Self, MimoInputLocalError> {
-        let mut config = GgmlCpuGraphConfig::default();
-        config.context_bytes = config
-            .context_bytes
-            .max(GgmlCpuGraphConfig::metadata_context_bytes(
-                config.graph_size,
-            ))
-            .max(GRAPH_CONTEXT_BYTES);
+        let config = mimo_input_local_graph_config();
         let runner =
             GgmlCpuGraphRunner::new(config).map_err(|source| build_err("runner_init", source))?;
         let loaded_weights = runner
@@ -630,5 +646,23 @@ mod tests {
         let frame_count = 6usize;
         let group_size = 4usize;
         assert!(!frame_count.is_multiple_of(group_size));
+    }
+
+    /// Regression guard for the right-sized input-local metadata context (the
+    /// historical flat 256 MB over-reserved a bookkeeping-only context;
+    /// `ggml_init` mallocs the full `mem_size` even with `no_alloc=true`).
+    /// Only touches `context_bytes`/`graph_size` (thread-independent), so it
+    /// is stable against parallel-test env mutation.
+    #[test]
+    fn input_local_graph_context_is_right_sized_not_flat_256mb() {
+        let config = mimo_input_local_graph_config();
+        assert!(
+            config.context_bytes >= GgmlCpuGraphConfig::metadata_context_bytes(config.graph_size)
+        );
+        assert!(
+            config.context_bytes < 16 * 1024 * 1024,
+            "mimo input-local metadata context regrew toward the old flat 256 MB: {}",
+            config.context_bytes
+        );
     }
 }

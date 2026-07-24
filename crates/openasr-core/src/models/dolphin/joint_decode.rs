@@ -165,6 +165,33 @@ pub(crate) fn joint_decode(
 
 // --- CTC head projection ---------------------------------------------------
 
+/// Worst-case forward-graph node budget for the dolphin CTC head: the graph is
+/// one `mul_mat` + one bias `add` over `encoder_out` (a handful of nodes), so
+/// 2048 keeps >500x headroom and right-sizes the runner's `no_alloc` metadata
+/// context via [`GgmlCpuGraphConfig::metadata_context_bytes`] instead of the
+/// historical flat 256 MB. `ggml_init` always mallocs the full `mem_size`
+/// even with `no_alloc=true`, so the old 256 MB committed ~256 MB of metadata
+/// context for a graph that needs <0.1 MB. Mirrors the qwen audio-encoder
+/// (`models/qwen/audio_encoder.rs`) and xasr_zipformer encoder
+/// (`models/xasr_zipformer/graph_config.rs`) sizing.
+const DOLPHIN_CTC_HEAD_GRAPH_SIZE: usize = 2048;
+
+fn dolphin_ctc_head_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+    GgmlCpuGraphConfig {
+        context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(DOLPHIN_CTC_HEAD_GRAPH_SIZE),
+        graph_size: DOLPHIN_CTC_HEAD_GRAPH_SIZE,
+        n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
+            backend,
+            crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::Default,
+        ),
+        backend,
+        // See the matching comment in encoder_graph.rs: unconditionally
+        // enabling the gallocr scheduler only bounds memory footprint, never
+        // the CTC head's computed output.
+        use_scheduler: true,
+    }
+}
+
 /// `ctc.ctc_lo(encoder_out)` -> `log_softmax`, returned row-major `[frames, vocab]`
 /// (vocab innermost). The linear runs in the CPU ggml graph (like the encoder);
 /// the softmax is a cheap Rust pass.
@@ -184,19 +211,7 @@ fn compute_ctc_log_probs(
     };
     let bias = fetch(provider, "ctc.ctc_lo.bias", vocab)?;
 
-    let graph_config = GgmlCpuGraphConfig {
-        context_bytes: 256 * 1024 * 1024,
-        graph_size: 2048,
-        n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
-            backend,
-            crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::Default,
-        ),
-        backend,
-        // See the matching comment in encoder_graph.rs: unconditionally
-        // enabling the gallocr scheduler only bounds memory footprint, never
-        // the CTC head's computed output.
-        use_scheduler: true,
-    };
+    let graph_config = dolphin_ctc_head_graph_config(backend);
     let ggml = |stage: &'static str| move |source| DolphinJointDecodeError::Ggml { stage, source };
     let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml("runner_init"))?;
 
@@ -606,5 +621,25 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(detokenize_char_tokens(&[1, 2, 3, 4], &tokens), "学校");
+    }
+
+    /// Regression guard for the right-sized CTC-head metadata context (the
+    /// historical flat 256 MB over-reserved a bookkeeping-only context;
+    /// `ggml_init` mallocs the full `mem_size` even with `no_alloc=true`).
+    /// Only touches `context_bytes`/`graph_size` (thread-independent), so it
+    /// is stable against parallel-test env mutation.
+    #[test]
+    fn ctc_head_graph_context_is_right_sized_not_flat_256mb() {
+        let config = dolphin_ctc_head_graph_config(GgmlCpuGraphBackend::Cpu);
+        assert!(config.graph_size >= DOLPHIN_CTC_HEAD_GRAPH_SIZE);
+        assert!(
+            config.context_bytes
+                >= GgmlCpuGraphConfig::metadata_context_bytes(DOLPHIN_CTC_HEAD_GRAPH_SIZE)
+        );
+        assert!(
+            config.context_bytes < 16 * 1024 * 1024,
+            "dolphin CTC-head metadata context regrew toward the old flat 256 MB: {}",
+            config.context_bytes
+        );
     }
 }

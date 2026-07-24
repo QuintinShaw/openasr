@@ -12,7 +12,7 @@ use crate::models::graph_runtime_config::{
 /// tensor counts. The previous 2,000,000 over-reserved the cgraph object alone
 /// by ~79 MB and, paired with a hand-tuned 2 GiB context (see
 /// [`GgmlCpuGraphConfig::metadata_context_bytes`]), OOM'd CPU transcription.
-const FULL_ENCODER_GRAPH_SIZE: usize = 65_536;
+pub(super) const FULL_ENCODER_GRAPH_SIZE: usize = 65_536;
 
 /// Auto prefers the accelerator on the generic GPU lane (HIP/CUDA/Vulkan),
 /// and only falls back to CPU when no accelerator is present or the request

@@ -8924,9 +8924,21 @@ mod tests {
         let metadata = read_gguf_metadata(&pack).expect("metadata");
         let metadata = parse_xasr_zipformer_execution_metadata(&metadata).expect("metadata parse");
         let weights = load_xasr_encoder_weights(&reader, &metadata).expect("weights");
+        // Right-sized like the runtime path (see
+        // `xasr_zipformer_encoder_graph_config`): stack0 is a strict subset of
+        // the full encoder, so the full-encoder node budget covers it with >5x
+        // headroom. The old flat 256 MB over-reserved the `no_alloc` metadata
+        // context, which only holds tensor bookkeeping.
         let mut config = GgmlCpuGraphConfig::conservative_default();
-        config.context_bytes = 256 * 1024 * 1024;
-        config.graph_size = 262_144;
+        config.graph_size = config
+            .graph_size
+            .max(crate::models::xasr_zipformer::graph_config::FULL_ENCODER_GRAPH_SIZE);
+        config.context_bytes =
+            config
+                .context_bytes
+                .max(GgmlCpuGraphConfig::metadata_context_bytes(
+                    config.graph_size,
+                ));
         let graph = XasrZipformerEncoderGraph::new_ggml_cpu_stack0(metadata, weights, config)
             .expect("graph");
 
@@ -8958,9 +8970,20 @@ mod tests {
         let metadata = read_gguf_metadata(&pack).expect("metadata");
         let metadata = parse_xasr_zipformer_execution_metadata(&metadata).expect("metadata parse");
         let weights = load_xasr_encoder_weights(&reader, &metadata).expect("weights");
+        // Match the runtime path's right-sized config (see
+        // `xasr_zipformer_encoder_graph_config`); the old flat 2 GiB /
+        // 2,000,000-node values were the pre-fix over-reservation that OOM'd
+        // CPU transcription.
         let mut config = GgmlCpuGraphConfig::conservative_default();
-        config.context_bytes = 2 * 1024 * 1024 * 1024;
-        config.graph_size = 2_000_000;
+        config.graph_size = config
+            .graph_size
+            .max(crate::models::xasr_zipformer::graph_config::FULL_ENCODER_GRAPH_SIZE);
+        config.context_bytes =
+            config
+                .context_bytes
+                .max(GgmlCpuGraphConfig::metadata_context_bytes(
+                    config.graph_size,
+                ));
         let graph = XasrZipformerEncoderGraph::new_ggml_cpu_full_encoder(metadata, weights, config)
             .expect("graph");
 
@@ -9006,9 +9029,20 @@ mod tests {
         let metadata = parse_xasr_zipformer_execution_metadata(&metadata).expect("metadata parse");
         let total_layers = metadata.total_encoder_layers();
         let weights = load_xasr_encoder_weights(&reader, &metadata).expect("weights");
+        // Match the runtime path's right-sized config (see
+        // `xasr_zipformer_encoder_graph_config`); the old flat 2 GiB /
+        // 2,000,000-node values were the pre-fix over-reservation that OOM'd
+        // CPU transcription.
         let mut config = GgmlCpuGraphConfig::conservative_default();
-        config.context_bytes = 2 * 1024 * 1024 * 1024;
-        config.graph_size = 2_000_000;
+        config.graph_size = config
+            .graph_size
+            .max(crate::models::xasr_zipformer::graph_config::FULL_ENCODER_GRAPH_SIZE);
+        config.context_bytes =
+            config
+                .context_bytes
+                .max(GgmlCpuGraphConfig::metadata_context_bytes(
+                    config.graph_size,
+                ));
         let graph = XasrZipformerEncoderGraph::new_ggml_cpu_full_encoder(metadata, weights, config)
             .expect("graph");
         let features = XasrEncoderFeatureInput::new(61, 80, input).expect("features");
