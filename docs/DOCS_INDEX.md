@@ -54,6 +54,14 @@ no persistent voiceprint, identity-stays-on-client) live in
 | [Android Build](ANDROID_BUILD.md) | Android (aarch64) cross-compilation. |
 | [iOS / macOS SDK](SDK_IOS_MACOS.md) | `crates/openasr-ffi`'s C ABI and `OpenASR.xcframework`: build, C API, Swift bridging sketch, CPU-only v1 posture. |
 
+## Brand & distribution (repo root)
+
+| Doc | What it covers |
+| --- | --- |
+| [Trademarks](../TRADEMARKS.md) | OpenASR name, logo, and official app icon reservation; allowed "Powered by OpenASR"; no implied endorsement. |
+| [Branding](../BRANDING.md) | Practical checklist: independent product name, UI, store listing, and support for third-party apps. |
+| [xcframework distribution](../XCFRAMEWORK-DISTRIBUTION.md) | Shipping App Store / Mac apps that embed `OpenASR.xcframework` without passing as the official app. |
+
 ## Notes
 
 - The user-facing quantization path is import-time tier selection (`fp16` /

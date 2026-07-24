@@ -130,6 +130,14 @@ openasr pull whisper-small    # 安装一个试试
 
 ggml 推理后端为 MIT 许可。每个模型包的许可证以 registry 条目和 pack metadata 为准;可能包含 Apache-2.0、MIT、CC-BY、FunASR 或其他上游条款。这不是穷尽保证。致谢完整列表见 [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md)。
 
+## 商标与品牌
+
+OpenASR 名称、Logo 与官方 App 图标由项目方保留。Apache-2.0 覆盖代码，不授予商标权。第三方产品可以使用 **“Powered by OpenASR”** 作为次要署名，但不得以 OpenASR 作为主产品名，也不得暗示官方授权、认证或合作。官方应用仅由项目运营方的开发者账号发布。
+
+- [TRADEMARKS.md](TRADEMARKS.md) — 名称、标识与官方应用保留
+- [BRANDING.md](BRANDING.md) — 产品标识实务清单
+- [XCFRAMEWORK-DISTRIBUTION.md](XCFRAMEWORK-DISTRIBUTION.md) — 嵌入 SDK 的 iOS/macOS 应用分发说明
+
 ## 找到我们
 
 OpenASR 还在早期，「早鸟营」微信群是离我们最近的地方——聊用法、反馈问题、第一时间拿到新版本。

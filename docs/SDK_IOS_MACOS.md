@@ -56,8 +56,13 @@ until a real-device benchmark says otherwise; wiring up an iOS Metal build is
 unstarted, follow-up work.
 
 **License**: Apache-2.0, same as the rest of this open-core repository (see
-`LICENSE`, `NOTICE`). No additional restriction applies to the xcframework
-artifact or the generated header.
+`LICENSE`, `NOTICE`). No additional *copyright* restriction applies to the
+xcframework artifact or the generated header. The OpenASR **name, logo, and
+official app icons** are not licensed under Apache-2.0: third-party apps that
+embed this framework must ship under their own product identity and must not
+imply they are the official OpenASR app. See
+[XCFRAMEWORK-DISTRIBUTION.md](../XCFRAMEWORK-DISTRIBUTION.md),
+[TRADEMARKS.md](../TRADEMARKS.md), and [BRANDING.md](../BRANDING.md).
 
 ## Building
 

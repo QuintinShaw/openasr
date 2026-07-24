@@ -129,3 +129,11 @@ Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for build setup, b
 [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
 
 The ggml inference backend is MIT-licensed. Each model pack's license is defined by its registry entry and pack metadata; packs may use Apache-2.0, MIT, CC-BY, FunASR, or other upstream terms. This is not an exhaustive license guarantee. See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) for the projects and model authors OpenASR builds on.
+
+## Trademarks and branding
+
+The OpenASR name, logo, and official app icons are reserved. Apache-2.0 covers the code, not the brand. Third-party products may say **“Powered by OpenASR”** and must not use OpenASR as their primary product name or imply official endorsement. Official apps are published only by the project operators.
+
+- [TRADEMARKS.md](TRADEMARKS.md) — name, logo, and official-app reservation
+- [BRANDING.md](BRANDING.md) — practical product-identity checklist
+- [XCFRAMEWORK-DISTRIBUTION.md](XCFRAMEWORK-DISTRIBUTION.md) — shipping iOS/macOS apps that embed the SDK
