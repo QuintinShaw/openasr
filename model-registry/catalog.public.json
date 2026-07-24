@@ -947,7 +947,7 @@
           "perf": {
             "rtf_cpu": 0.905,
             "rtf_metal": 0.535,
-            "peak_rss_bytes": 8776024064,
+            "peak_rss_bytes": 9021292544,
             "jfk_wer_vs_fp16": 0.0
           }
         }
