@@ -424,16 +424,22 @@ mod parity_tests {
     use super::*;
     use crate::models::runtime_contract::ScalarMetadataView;
 
-    fn dev_pack_path() -> PathBuf {
-        PathBuf::from(
-            "/Volumes/QuintinDocument/openasr-dev/tmp-weights/fr2/out/firered2-llm-q8_0.oasr",
+    fn dev_pack_path() -> Option<PathBuf> {
+        crate::testing::external_test_fixture_path(
+            "OPENASR_FIRERED_LLM_PACK",
+            "FireRed2 LLM .oasr pack",
         )
+        .inspect_err(|skip| eprintln!("skipping: {skip}"))
+        .ok()
     }
 
-    fn dump_dir() -> PathBuf {
-        PathBuf::from(
-            "/private/tmp/claude-501/-Volumes-QuintinDocument-openasr-dev/08bbaa3c-ccc3-4b2d-af9e-1e3a449e3d8d/scratchpad/fr2-t5-parity",
+    fn dump_dir() -> Option<PathBuf> {
+        crate::testing::external_test_fixture_path(
+            "OPENASR_FIRERED_LLM_PARITY_DUMP_DIR",
+            "FireRed2 LLM parity output directory",
         )
+        .inspect_err(|skip| eprintln!("skipping: {skip}"))
+        .ok()
     }
 
     /// Deterministic pseudo-random f32 generator (xorshift64*, no external
@@ -563,12 +569,16 @@ mod parity_tests {
                 per-segment outputs to scratchpad/fr2-t5-parity for compare_parity.py to diff \
                 against an independent PyTorch reference -- see this module's parity_tests doc"]
     fn dump_parity_segments_for_python_reference_comparison() {
-        let pack_path = dev_pack_path();
+        let Some(pack_path) = dev_pack_path() else {
+            return;
+        };
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
             return;
         }
-        let dir = dump_dir();
+        let Some(dir) = dump_dir() else {
+            return;
+        };
 
         let gguf_metadata =
             crate::ggml_runtime::read_gguf_metadata(&pack_path).expect("read gguf metadata");
@@ -649,7 +659,9 @@ mod parity_tests {
     #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; construction-only \
                 smoke check for the zero-copy tensor-name wiring this module's history fixed"]
     fn probe_decoder_runtime_construction_against_real_pack() {
-        let pack_path = dev_pack_path();
+        let Some(pack_path) = dev_pack_path() else {
+            return;
+        };
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
             return;

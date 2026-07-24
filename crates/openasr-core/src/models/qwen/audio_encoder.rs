@@ -1380,8 +1380,16 @@ mod tests {
         use crate::ggml_runtime::GgufTensorDataReader;
         use crate::models::qwen::runtime_contract::Qwen3AsrExecutionMetadata;
 
-        let source_root =
-            PathBuf::from("/Volumes/QuintinDocument/hf-cache/qwen3-forced-aligner-0.6b");
+        let source_root = match crate::testing::external_test_fixture_path(
+            "OPENASR_QWEN_FORCED_ALIGNER_SOURCE",
+            "Qwen forced-aligner source checkpoint directory",
+        ) {
+            Ok(path) => path,
+            Err(skip) => {
+                eprintln!("skipping: {skip}");
+                return;
+            }
+        };
         let ref_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/forced-aligner-ref/fixtures");
         let mel_path = ref_dir.join("audio_mel_input.f32le");

@@ -18,11 +18,17 @@ use crate::ggml_runtime::GgmlCpuGraphBackend;
 use super::decoder_graph::{DolphinDecoderConfig, decode_prompt_logits};
 use super::encoder_graph::{DolphinEncoderConfig, encode};
 
-const FIXTURE_ROOT: &str =
-    "/Volumes/QuintinDocument/openasr-dev/openasr/tmp/publish/dolphin-cn-dialect-small";
-
-fn root() -> PathBuf {
-    PathBuf::from(FIXTURE_ROOT)
+fn root() -> Option<PathBuf> {
+    match crate::testing::external_test_fixture_path(
+        "OPENASR_DOLPHIN_PARITY_ROOT",
+        "Dolphin parity fixture directory",
+    ) {
+        Ok(path) => Some(path),
+        Err(skip) => {
+            eprintln!("skipping: {skip}");
+            None
+        }
+    }
 }
 
 // --- minimal safetensors reader (all tensors f32) --------------------------
@@ -167,7 +173,9 @@ fn relative_max_diff(actual: &[f32], expected: &[f32]) -> f32 {
 #[test]
 #[ignore = "requires local 866MB Dolphin weights under tmp/publish (not committed)"]
 fn dolphin_encoder_parity() {
-    let root = root();
+    let Some(root) = root() else {
+        return;
+    };
     let weights_path = root.join("weights/encoder.safetensors");
     if !weights_path.exists() {
         eprintln!("skip: {weights_path:?} not present");
@@ -276,7 +284,9 @@ const DECODER_PROMPT: [u32; 5] = [2, 5, 10, 4, 109];
 #[test]
 #[ignore = "requires local Dolphin full.safetensors + golden under tmp/publish (not committed)"]
 fn dolphin_decoder_parity() {
-    let root = root();
+    let Some(root) = root() else {
+        return;
+    };
     let weights_path = root.join("weights/full.safetensors");
     let encoder_out_path = root.join("golden/encoder_out.npy");
     let step0_path = root.join("golden/decoder_step0_logits.npy");
@@ -366,7 +376,9 @@ fn dolphin_decoder_parity() {
 fn dolphin_hotword_context_parity() {
     use super::hotword_context::{apply_hotword_deep_biasing, encode_hotword_context_embeddings};
 
-    let root = root();
+    let Some(root) = root() else {
+        return;
+    };
     let weights_path = root.join("weights/full.safetensors");
     let context_emb_path = root.join("golden/hotword_context_emb.npy");
     if !weights_path.exists() || !context_emb_path.exists() {

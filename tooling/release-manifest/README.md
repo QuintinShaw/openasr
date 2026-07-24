@@ -98,12 +98,12 @@ payload only ever names the canonical host).
 ## dl.openasr.org sync
 
 `b2_sync.py` -- uploads files to `core/v<version>/<filename>` in the SAME
-Backblaze B2 bucket / Cloudflare Worker `openasr-app`'s desktop installers
+Backblaze B2 bucket / Cloudflare Worker the desktop installers
 already publish to (`https://dl.openasr.org/desktop/...` there,
-`https://dl.openasr.org/core/...` here). It is a Python port of that repo's
-`apps/desktop/scripts/b2-s3-client.mjs` SigV4 signer (same env var names,
+`https://dl.openasr.org/core/...` here). It is a Python port of that desktop
+product's SigV4 signer (same env var names,
 same virtual-hosted-style request shape, same ETag-based immutability gate)
-plus `release-publish.mjs`'s upload-with-immutability-check logic --
+plus its upload-with-immutability-check logic --
 cross-validated against AWS's published SigV4 worked example in
 `b2_sync_test.py`, no network required to test.
 
@@ -154,9 +154,9 @@ is always a local, human-run step:
   maintainer's machine, with the B2 vars provided by `source
   ~/.openasr/b2-release.env` in that shell (the same credential file desktop
   releases use), not a repo secret and not a long-lived shell-profile export.
-- `openasr-app`'s own `release-desktop.yml` only runs this kind of publish
+- The desktop product's own release workflow only runs this kind of publish
   from a `workflow_dispatch` with an explicit `publish: true` input, gated by
-  repo secrets on the app repo -- i.e. even there, publishing to
+  repo secrets on that product repo -- i.e. even there, publishing to
   dl.openasr.org is a deliberate, per-run opt-in, not a side effect of every
   green build. Core follows the same posture, taken one step further: not
   even a gated dispatch, just a local script run after the maintainer has

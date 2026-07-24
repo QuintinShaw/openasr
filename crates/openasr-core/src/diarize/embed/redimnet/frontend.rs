@@ -259,10 +259,18 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
-    /// Spike scratch dir holding the reference `frontend_dump/*.npy`. Not
-    /// committed; the parity test is `#[ignore]` and skips if absent.
-    const FRONTEND_DUMP: &str =
-        "/Volumes/QuintinDocument/openasr-dev/tmp/redimnet2-spike/frontend_dump";
+    fn dump() -> PathBuf {
+        match crate::testing::external_test_fixture_path(
+            "OPENASR_REDIMNET_FRONTEND_DUMP",
+            "ReDimNet frontend parity fixture directory",
+        ) {
+            Ok(path) => path,
+            Err(skip) => {
+                eprintln!("skipping: {skip}");
+                PathBuf::new()
+            }
+        }
+    }
 
     fn load_npy_f32(path: &Path) -> (Vec<usize>, Vec<f32>) {
         let bytes = std::fs::read(path).expect("read npy");
@@ -324,10 +332,6 @@ mod tests {
             sum += d as f64;
         }
         (max, (sum / actual.len() as f64) as f32)
-    }
-
-    fn dump() -> PathBuf {
-        PathBuf::from(FRONTEND_DUMP)
     }
 
     #[test]

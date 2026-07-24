@@ -662,10 +662,17 @@ mod tests {
     /// fetch, so this stays `#[ignore]`d and skips silently when absent
     /// (matches firered-aed's own dev-pack test convention) rather than
     /// gating CI on a multi-GB private artifact.
-    fn dev_pack_path() -> PathBuf {
-        PathBuf::from(
-            "/Volumes/QuintinDocument/openasr-dev/tmp-weights/fr2/out/firered2-llm-q8_0.oasr",
-        )
+    fn dev_pack_path() -> Option<PathBuf> {
+        match crate::testing::external_test_fixture_path(
+            "OPENASR_FIRERED_LLM_PACK",
+            "FireRed2 LLM .oasr pack",
+        ) {
+            Ok(path) => Some(path),
+            Err(skip) => {
+                eprintln!("skipping: {skip}");
+                None
+            }
+        }
     }
 
     // Pinned to the real dev-pack decode. CPU is the deterministic reference
@@ -702,7 +709,8 @@ mod tests {
     }
 
     fn transcribe_with_dev_pack(wav_path: PathBuf) -> Option<(String, std::time::Duration, f32)> {
-        transcribe_with_pack(dev_pack_path(), wav_path, GgmlAsrBackendPreference::CpuOnly)
+        let pack_path = dev_pack_path()?;
+        transcribe_with_pack(pack_path, wav_path, GgmlAsrBackendPreference::CpuOnly)
     }
 
     fn transcribe_with_pack(
@@ -755,9 +763,16 @@ mod tests {
                 under tmp-weights/fr2/out; env-selected backend/quant, prints FR2_LLM_AB + peak RSS"]
     fn firered_llm_perf_ab() {
         let quant = std::env::var("OPENASR_FR2_AB_QUANT").unwrap_or_else(|_| "q4_k".to_string());
-        let pack_path = PathBuf::from(format!(
-            "/Volumes/QuintinDocument/openasr-dev/tmp-weights/fr2/out/firered2-llm-{quant}.oasr"
-        ));
+        let pack_path = match crate::testing::external_test_fixture_path(
+            "OPENASR_FR2_AB_PACK",
+            "FireRed2 LLM benchmark .oasr pack",
+        ) {
+            Ok(path) => path,
+            Err(skip) => {
+                eprintln!("skipping: {skip}");
+                return;
+            }
+        };
         let backend = match std::env::var("OPENASR_FR2_AB_BACKEND").as_deref() {
             Ok("cpu") => GgmlAsrBackendPreference::CpuOnly,
             Ok("metal") | Ok("gpu") => GgmlAsrBackendPreference::Accelerated,

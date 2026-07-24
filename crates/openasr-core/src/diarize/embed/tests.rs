@@ -230,14 +230,18 @@ fn wespeaker_oasr_roundtrip_matches_safetensors() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// Spike scratch assets (golden `.npy` embeddings + the f32 pack fixture), not
-/// committed; the parity test below is `#[ignore]` and skips if absent. See
-/// `redimnet::backbone::tests` for the staged per-op parity harness this
-/// reuses transitively -- this test instead exercises the *trait* entry point
-/// end to end (raw audio -> front end -> backbone -> L2-normalize), which
-/// none of the backbone-only tests cover (they feed a pre-dumped front-end
-/// tensor directly).
-const REDIMNET_SPIKE_ROOT: &str = "/Volumes/QuintinDocument/openasr-dev/tmp/redimnet2-spike";
+fn redimnet_spike_root() -> Option<std::path::PathBuf> {
+    match crate::testing::external_test_fixture_path(
+        "OPENASR_REDIMNET_SPIKE_ROOT",
+        "ReDimNet parity fixture directory",
+    ) {
+        Ok(path) => Some(path),
+        Err(skip) => {
+            eprintln!("skipping: {skip}");
+            None
+        }
+    }
+}
 
 /// Plain C-order f32 `.npy` loader (no fortran-order handling needed for the
 /// golden embedding dumps), matching the loader in `redimnet::backbone::tests`.
@@ -261,7 +265,10 @@ fn read_redimnet_golden_embedding(path: &std::path::Path) -> Vec<f32> {
 #[test]
 #[ignore = "requires local redimnet2-spike assets under tmp/ (not committed)"]
 fn redimnet_embedder_matches_python_reference_e2e_jfk() {
-    let pack = std::path::Path::new(REDIMNET_SPIKE_ROOT).join("redimnet2-b6-f32.oasr");
+    let Some(root) = redimnet_spike_root() else {
+        return;
+    };
+    let pack = root.join("redimnet2-b6-f32.oasr");
     if !pack.exists() {
         eprintln!("skip: {pack:?} not present");
         return;
@@ -281,11 +288,7 @@ fn redimnet_embedder_matches_python_reference_e2e_jfk() {
     let mine = embedder.embed(&samples, 16_000).expect("redimnet embed");
     assert_eq!(mine.dim(), 192);
 
-    let golden = read_redimnet_golden_embedding(
-        &std::path::Path::new(REDIMNET_SPIKE_ROOT)
-            .join("embeddings_b6")
-            .join("jfk.npy"),
-    );
+    let golden = read_redimnet_golden_embedding(&root.join("embeddings_b6").join("jfk.npy"));
     assert_eq!(mine.0.len(), golden.len());
     // Golden is the raw (pre-L2-normalize) reference embedding; cosine is
     // scale-invariant so comparing it against `mine`'s normalized vector is

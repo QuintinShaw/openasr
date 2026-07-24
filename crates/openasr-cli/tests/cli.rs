@@ -1,8 +1,8 @@
 use assert_cmd::Command;
 use openasr_core::api::backend::transcribe_with_mock_backend;
 use openasr_core::testing::{
-    TinyGgufFixtureSpec, write_local_dev_signed_catalog, write_reserved_oasr_container,
-    write_tiny_gguf_runtime_source,
+    TinyGgufFixtureSpec, external_test_fixture_path, write_local_dev_signed_catalog,
+    write_reserved_oasr_container, write_tiny_gguf_runtime_source,
 };
 use openasr_core::{ResponseFormat, TranscriptionRequest, render_transcription};
 use predicates::prelude::*;
@@ -680,10 +680,6 @@ fn transcribe_mock_formats_match_core_renderers() {
 // slicer picked 3 chunks here, whose seams show as the two small stray-token
 // artifacts in the golden ("我 我" and an extra "中") -- both present in the
 // real committed pack's output, not smoothed over.
-fn firered_llm_dev_pack_path() -> PathBuf {
-    PathBuf::from("/Volumes/QuintinDocument/openasr-dev/tmp-weights/fr2/out/firered2-llm-q8_0.oasr")
-}
-
 const FIRERED_LLM_GOLDEN_LONGFORM_EN_ZH_TEXT: &str = "and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗中 周末的时候我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country";
 
 #[test]
@@ -691,11 +687,14 @@ const FIRERED_LLM_GOLDEN_LONGFORM_EN_ZH_TEXT: &str = "and so my fellow americans
             longform-chunked CLI transcribe path on a ~69s fixture, OPENASR_GGML_BACKEND=cpu \
             (~30 minutes wall clock at this family's current CPU-decode RTF -- see the T5 report)"]
 fn firered_llm_golden_diff_longform_cli_transcribe_matches_reference_decode() {
-    let pack_path = firered_llm_dev_pack_path();
-    if !pack_path.exists() {
-        eprintln!("skipping: {} not present", pack_path.display());
-        return;
-    }
+    let pack_path =
+        match external_test_fixture_path("OPENASR_FIRERED_LLM_PACK", "FireRed2 LLM .oasr pack") {
+            Ok(path) => path,
+            Err(skip) => {
+                eprintln!("skipping: {skip}");
+                return;
+            }
+        };
     let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/longform_en_zh.wav")
         .canonicalize()
@@ -734,12 +733,6 @@ fn firered_llm_golden_diff_longform_cli_transcribe_matches_reference_decode() {
 // content). Pinned against `OPENASR_GGML_BACKEND=cpu` (Metal memory fit for
 // this family's ~8B combined weights on a 16GB unified-memory Mac is
 // unverified, see this module's e2e report).
-fn mimo_asr_dev_pack_path() -> PathBuf {
-    PathBuf::from(
-        "/Volumes/QuintinDocument/openasr-dev/tmp-weights/mimo/out/mimo-v2.5-asr-q8_0.oasr",
-    )
-}
-
 // The longform assembler joins retained, trimmed segment texts with one space.
 // The spaces inside this `concat!` are therefore golden bytes. The same
 // family's single-utterance EN->ZH golden
@@ -765,11 +758,14 @@ const GOLDEN_MIMO_LONGFORM_EN_ZH_TEXT: &str = concat!(
             (~38 minutes wall clock at this family's current CPU-decode RTF -- 3 chunk \
             decodes, see this test's doc comment)"]
 fn mimo_asr_golden_diff_longform_cli_transcribe_matches_reference_decode() {
-    let pack_path = mimo_asr_dev_pack_path();
-    if !pack_path.exists() {
-        eprintln!("skipping: {} not present", pack_path.display());
-        return;
-    }
+    let pack_path = match external_test_fixture_path("OPENASR_MIMO_ASR_PACK", "MiMo ASR .oasr pack")
+    {
+        Ok(path) => path,
+        Err(skip) => {
+            eprintln!("skipping: {skip}");
+            return;
+        }
+    };
     let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/longform_en_zh.wav")
         .canonicalize()
@@ -882,12 +878,6 @@ fn firered_aed_golden_diff_longform_cli_transcribe_matches_reference_decode() {
 // those tags (see the family's module doc comment). Pinned against
 // `OPENASR_GGML_BACKEND=cpu` (this family's Metal path has a known encoder
 // numerics defect, see the arch descriptor's `auto_gpu_policy` doc).
-fn moss_transcribe_diarize_dev_pack_path() -> PathBuf {
-    PathBuf::from(
-        "/Volumes/QuintinDocument/openasr-dev/tmp/moss-td/moss-transcribe-diarize-fp16.oasr",
-    )
-}
-
 const GOLDEN_MOSS_TRANSCRIBE_DIARIZE_LONGFORM_EN_ZH_TEXT: &str = concat!(
     "[0.27][S01]And so, my fellow Americans,[2.34][3.21][S01]ask not[4.44][5.31][S01]what your ",
     "country can do for you,[7.64][8.11][S01]ask what you can do for your country.",
@@ -907,11 +897,16 @@ const GOLDEN_MOSS_TRANSCRIBE_DIARIZE_LONGFORM_EN_ZH_TEXT: &str = concat!(
 #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack; runs the real \
             longform-chunked CLI transcribe path on a ~69s fixture, OPENASR_GGML_BACKEND=cpu"]
 fn moss_transcribe_diarize_golden_diff_longform_cli_transcribe_matches_reference_decode() {
-    let pack_path = moss_transcribe_diarize_dev_pack_path();
-    if !pack_path.exists() {
-        eprintln!("skipping: {} not present", pack_path.display());
-        return;
-    }
+    let pack_path = match external_test_fixture_path(
+        "OPENASR_MOSS_TRANSCRIBE_DIARIZE_PACK",
+        "MOSS Transcribe Diarize .oasr pack",
+    ) {
+        Ok(path) => path,
+        Err(skip) => {
+            eprintln!("skipping: {skip}");
+            return;
+        }
+    };
     let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/longform_en_zh.wav")
         .canonicalize()

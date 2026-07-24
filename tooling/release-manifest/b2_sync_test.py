@@ -21,7 +21,7 @@ from b2_sync import (
 
 # AWS's own published worked example for SigV4 header-based auth (GET Object,
 # examplebucket/test.txt) -- the same canonical cross-implementation vector
-# openasr-app's b2-s3-client.test.mjs pins for its JS SigV4 signer (this
+# desktop release client's SigV4 signer pins for its JS implementation (this
 # module is a Python port of that signer). Matching the identical published
 # Authorization header is real evidence the signing math is correct,
 # independent of both implementations and of B2 itself.

@@ -43,11 +43,11 @@ No terminal needed. Install the app, drop in an audio file, and get your transcr
 
 ## Why OpenASR
 
-**Private.** Your audio never leaves your machine. No uploads, no cloud processing, no telemetry. The engine either produces a real transcript or tells you why it can't — it never silently reaches for the internet.
+**Private.** In the default local mode, audio stays on your machine. Remote compute is available only when you explicitly pair and enable it; see [SECURITY.md](SECURITY.md#local-first-security-notes). No telemetry, no silent uploads, and no silent network fallback. The engine either produces a real transcript or tells you why it can't.
 
 **Broad.** 28 models across 13 families — Whisper, Qwen3-ASR, Parakeet, SenseVoice, FireRed, Dolphin, Moonshine, and more. Pick the one that fits your language and workload. All run through one binary on CPU and Apple Metal.
 
-**Open.** The engine is Apache-2.0. Models ship under their own permissive licenses. Every model download is verified against a signed catalog before it runs.
+**Open.** The engine is Apache-2.0. Each model pack ships under its own upstream license as recorded in the registry and pack metadata. Every model download is verified against a signed catalog before it runs.
 
 ---
 
@@ -128,4 +128,4 @@ Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for build setup, b
 
 [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
 
-The ggml inference backend is MIT-licensed. Model packs carry their own upstream licenses (MIT / Apache-2.0). See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) for the projects and model authors OpenASR builds on.
+The ggml inference backend is MIT-licensed. Each model pack's license is defined by its registry entry and pack metadata; packs may use Apache-2.0, MIT, CC-BY, FunASR, or other upstream terms. This is not an exhaustive license guarantee. See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) for the projects and model authors OpenASR builds on.

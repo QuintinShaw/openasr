@@ -10,9 +10,10 @@ run a shell / call a local HTTP API) at OpenASR. Two independent paths:
    HTTP (or want a long-lived local daemon instead of spawning a process per
    request).
 
-Both paths run entirely on-device: no telemetry, no cloud fallback, no
-implicit model download (see [SECURITY](../SECURITY.md) and the repo-root
-"Product principles").
+Both paths are local-first by default: no telemetry, no silent cloud fallback,
+no implicit model download (see [SECURITY](../SECURITY.md) and the repo-root
+"Product principles"). Remote compute is available only when explicitly paired
+and enabled.
 
 ## 1. Skill (CLI) path
 

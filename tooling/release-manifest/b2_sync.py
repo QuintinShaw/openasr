@@ -13,7 +13,7 @@
       dist/openasr-vendor-rocm-runtime-<sha12>.zip
 
 `sync` uploads each given file to `core/v<version>/<basename>` in the SAME B2
-bucket/Cloudflare-Worker setup `openasr-app`'s desktop installers already use
+bucket/Cloudflare-Worker setup used by the desktop installers already use
 (see that repo's `apps/desktop/scripts/release-publish.mjs` and
 `b2-s3-client.mjs`, which this script's SigV4 signer is a Python port of --
 `desktop/releases/v<version>/...` there, `core/v<version>/...` here).
@@ -232,7 +232,7 @@ class B2Client:
         endpoint_url = urlparse(credentials.endpoint)
         # Virtual-hosted-style (`https://<bucket>.<endpoint-host>/<key>`), NOT
         # path-style (`https://<endpoint-host>/<bucket>/<key>`) -- matches
-        # openasr-app's b2-s3-client.mjs `s3ObjectRequest`/`virtualHostedUrl`,
+        # desktop release client's `s3ObjectRequest`/`virtualHostedUrl`,
         # which this is a Python port of. The bucket is part of the signed
         # `host`, so getting this wrong produces a signature B2 rejects, not
         # just a wrong-looking URL.

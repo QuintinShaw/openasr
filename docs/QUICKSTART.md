@@ -1,8 +1,10 @@
 # Quickstart
 
 Get a real transcript on your own machine in three commands. OpenASR is
-local-first: native is the default backend, audio never leaves your machine, and
-there is no telemetry.
+local-first by default: native is the default backend, audio stays on your
+machine unless you explicitly pair and enable remote compute (see
+[SECURITY.md](../SECURITY.md#local-first-security-notes)), and there is no
+telemetry.
 
 > Building from source compiles the ggml backend, so clone recursively and have a
 > C/C++ toolchain available (`cmake`, a compiler, and on Linux `libasound2-dev`).

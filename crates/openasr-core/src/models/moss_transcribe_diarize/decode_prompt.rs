@@ -298,10 +298,17 @@ mod tests {
     /// for the tensor-parity half of this pack's provenance), NOT committed
     /// to the repo -- same dev-only-artifact convention as
     /// `mimo_asr::executor::tests::dev_pack_path`.
-    fn dev_pack_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(
-            "/Volumes/QuintinDocument/openasr-dev/tmp/moss-td/moss-transcribe-diarize-fp16.oasr",
-        )
+    fn dev_pack_path() -> Option<std::path::PathBuf> {
+        match crate::testing::external_test_fixture_path(
+            "OPENASR_MOSS_TRANSCRIBE_DIARIZE_PACK",
+            "MOSS Transcribe Diarize .oasr pack",
+        ) {
+            Ok(path) => Some(path),
+            Err(skip) => {
+                eprintln!("skipping: {skip}");
+                None
+            }
+        }
     }
 
     /// Regression test for the `models::gpt2_bpe` pretokenizer fix: builds
@@ -315,7 +322,9 @@ mod tests {
     /// `"[S"` token instead of separate `"["`/`"S"` tokens).
     #[test]
     fn builds_the_real_golden_jfk_prompt_token_for_token() {
-        let pack_path = dev_pack_path();
+        let Some(pack_path) = dev_pack_path() else {
+            return;
+        };
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
             return;

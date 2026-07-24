@@ -516,8 +516,16 @@ mod tests {
         use super::super::package_import::Qwen3AsrRuntimeQuantizationMode as ForcedAlignerQuantMode;
         use crate::api::audio_io::load_wav_16khz_mono_f32_v0;
 
-        let source_root =
-            PathBuf::from("/Volumes/QuintinDocument/hf-cache/qwen3-forced-aligner-0.6b");
+        let source_root = match crate::testing::external_test_fixture_path(
+            "OPENASR_QWEN_FORCED_ALIGNER_SOURCE",
+            "Qwen forced-aligner source checkpoint directory",
+        ) {
+            Ok(path) => path,
+            Err(skip) => {
+                eprintln!("skipping: {skip}");
+                return;
+            }
+        };
         let ref_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/forced-aligner-ref");
         let reference_output_path = ref_dir.join("reference_output.json");
