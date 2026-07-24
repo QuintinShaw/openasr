@@ -1436,9 +1436,18 @@ mod tests {
             !text.trim().is_empty(),
             "accelerated AISHELL-4 decode must emit a non-empty transcript"
         );
-        let golden_path = PathBuf::from(
-            "/Volumes/QuintinDocument/openasr-dev/tmp/moss-td/golden/aishell4_multispeaker_3min.json",
-        );
+        let Ok(golden_root) = crate::testing::external_test_fixture_path(
+            "OPENASR_MOSS_TRANSCRIBE_DIARIZE_GOLDEN",
+            "MOSS Transcribe Diarize development golden directory",
+        )
+        .inspect_err(|skip| eprintln!("skipping: {skip}")) else {
+            return;
+        };
+        let golden_path = golden_root.join("aishell4_multispeaker_3min.json");
+        if !golden_path.exists() {
+            eprintln!("skipping: {} not present", golden_path.display());
+            return;
+        }
         let golden: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&golden_path).expect("read AISHELL-4 development golden"),
         )
