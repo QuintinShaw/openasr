@@ -6889,6 +6889,92 @@ mod tests {
     }
 
     #[test]
+    fn set_rows_accepts_row_contiguous_permuted_source() {
+        const HEAD_DIM: usize = 2;
+        const HEADS: usize = 2;
+        const TOKENS: usize = 2;
+        const SEQUENCES: usize = 2;
+        const MAX_POSITIONS: usize = 4;
+
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner should initialize");
+        let mut graph = runner.start_graph();
+        let dst = graph
+            .new_tensor_4d_f32(HEAD_DIM, MAX_POSITIONS, HEADS, SEQUENCES, "dst")
+            .expect("dst should allocate");
+        let src_input = graph
+            .new_tensor_4d_f32(HEAD_DIM, HEADS, TOKENS, SEQUENCES, "src")
+            .expect("src should allocate");
+        let row_indices = graph
+            .new_tensor_4d_typed(TOKENS, 1, SEQUENCES, 1, ffi::GGML_TYPE_I32, "row_indices")
+            .expect("row indices should allocate");
+        graph.set_input(dst).expect("dst should be input");
+        graph.set_input(src_input).expect("src should be input");
+        graph
+            .set_input(row_indices)
+            .expect("row indices should be input");
+
+        let src_permuted = graph
+            .permute(src_input, 0, 2, 1, 3)
+            .expect("source permutation should build");
+        assert!(
+            !unsafe { ffi::ggml_is_contiguous(src_permuted.raw.as_ptr()) },
+            "[D,H,T,S] -> [D,T,H,S] must not be fully contiguous"
+        );
+        assert!(
+            unsafe { ffi::ggml_is_contiguous_rows(src_permuted.raw.as_ptr()) },
+            "[D,H,T,S] -> [D,T,H,S] must preserve row contiguity"
+        );
+        let output = graph
+            .set_rows(dst, src_permuted, row_indices)
+            .expect("set_rows should accept a row-contiguous permuted source");
+        graph.set_output(output).expect("output should be settable");
+
+        let src_values: Vec<f32> = (0..HEAD_DIM * HEADS * TOKENS * SEQUENCES)
+            .map(|index| index as f32 + 1.0)
+            .collect();
+        let dst_values = vec![0.0; HEAD_DIM * MAX_POSITIONS * HEADS * SEQUENCES];
+        let rows = [1_i32, 3, 0, 2];
+        graph
+            .set_f32_slice(dst, &dst_values, "dst")
+            .expect("dst upload should succeed");
+        graph
+            .set_f32_slice(src_input, &src_values, "src")
+            .expect("src upload should succeed");
+        graph
+            .set_i32_slice(row_indices, &rows, "row_indices")
+            .expect("row indices upload should succeed");
+        let output = graph
+            .compute_output_f32(output, dst_values.len())
+            .expect("set_rows should compute");
+
+        for sequence in 0..SEQUENCES {
+            for head in 0..HEADS {
+                for token in 0..TOKENS {
+                    let row = rows[sequence * TOKENS + token] as usize;
+                    for dim in 0..HEAD_DIM {
+                        let source_index =
+                            dim + HEAD_DIM * (head + HEADS * (token + TOKENS * sequence));
+                        let output_index =
+                            dim + HEAD_DIM * (row + MAX_POSITIONS * (head + HEADS * sequence));
+                        assert_eq!(output[output_index], src_values[source_index]);
+                    }
+                }
+                for row in 0..MAX_POSITIONS {
+                    if rows[sequence * TOKENS..(sequence + 1) * TOKENS].contains(&(row as i32)) {
+                        continue;
+                    }
+                    for dim in 0..HEAD_DIM {
+                        let output_index =
+                            dim + HEAD_DIM * (row + MAX_POSITIONS * (head + HEADS * sequence));
+                        assert_eq!(output[output_index], 0.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn batched_set_rows_multiple_query_rows_match_serial_planes() {
         fn compute_set_rows(
             n_seq: usize,
