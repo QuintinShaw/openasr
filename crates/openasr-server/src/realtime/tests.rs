@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, fs, num::NonZeroUsize, sync::OnceLock};
 
 use super::*;
-use crate::{ModelSessionAdmissionError, NativeExecutionSupervisor, PairingCredentialState};
+use crate::{NativeExecutionSupervisor, PairingCredentialState};
 
 fn test_distribution() -> DistributionContext {
     let temp = tempfile::tempdir().unwrap();
@@ -3285,37 +3285,55 @@ async fn finish_remembers_backend_error_seen_before_shutdown() {
 }
 
 #[tokio::test]
-async fn fallback_capacity_error_is_backend_not_ready_and_recoverable() {
+async fn fallback_capacity_rejection_is_backend_not_ready_and_recoverable() {
+    let temp = tempfile::tempdir().unwrap();
+    let model_id = "xasr-fallback-capacity";
+    let pack_path = temp.path().join("xasr-fallback-capacity.oasr");
+    write_xasr_streaming_fixture_pack(&pack_path, model_id);
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap()),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_path),
+    };
+    let occupied_slot = runtime
+        .acquire_native_execution()
+        .expect("fixture runtime must admit the occupied native session");
     let (event_sender, mut event_receiver) = mpsc::channel(8);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-    let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
-        "test_session",
-        "whisper-large-v3-turbo",
-        timestamp_now(),
-    ))
-    .unwrap();
-    controller
-        .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
-        .unwrap();
-    controller
-        .lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
-        .unwrap();
-    session.controller = Some(controller);
+    let mut session = WsSession::new(runtime, test_distribution(), event_sender);
+    let session_id = session.session_id.0.clone();
+    session.controller = Some(started_controller(&session_id, model_id));
+    session.spawn_backend_worker();
 
+    session
+        .queue_utterance(BufferedUtterance {
+            utterance_id: TranscriptUtteranceId("utt_fallback_capacity".to_string()),
+            start_ms: 0,
+            end_ms: 20,
+            frames: vec![frame(1, 0, 1000)],
+            reason: RealtimeUtteranceEndReason::VadStop,
+        })
+        .await
+        .expect("fallback job submission must succeed before backend admission");
+    assert_eq!(session.pending_backend_jobs, 1);
+
+    let result = tokio::time::timeout(Duration::from_secs(1), session.recv_backend_result())
+        .await
+        .expect("realtime worker must report the capacity rejection")
+        .expect("realtime worker result channel must remain open");
+    assert!(matches!(
+        result,
+        BackendResult::Error(ApiError::ModelSessionCapacity(_))
+    ));
     assert!(
-        session
-            .apply_backend_result(BackendResult::Error(ApiError::ModelSessionCapacity(
-                ModelSessionAdmissionError {
-                    model_identity: "native:whisper-large-v3-turbo@pack-a".to_string(),
-                    limit: NonZeroUsize::new(1).unwrap(),
-                },
-            )))
-            .await
-            .is_ok(),
+        session.apply_backend_result(result).await.is_ok(),
         "capacity exhaustion must not fail the realtime fallback session"
     );
+    assert_eq!(session.pending_backend_jobs, 0);
     assert!(!session.backend_failed);
     assert!(!session.backend_cancelled.load(Ordering::Relaxed));
+    assert!(!session.closed);
 
     let event = event_receiver
         .recv()
@@ -3330,6 +3348,7 @@ async fn fallback_capacity_error_is_backend_not_ready_and_recoverable() {
             ..
         })
     ));
+    drop(occupied_slot);
 }
 
 #[tokio::test]
@@ -3573,15 +3592,11 @@ fn hymt2_translation_worker_permit_lives_until_worker_exits() {
         .expect("translation worker must acquire its model slot");
     let (initialized_sender, initialized_receiver) = std::sync::mpsc::channel();
 
-    let translation = TranslationSession::spawn_thread_local(move || {
-        // This mirrors `load_hymt2_translation_session`: the permit is captured
-        // by the thread-local worker closure, not by the caller that spawned it.
-        let _model_session_permit = permit;
+    let translation = WsSession::spawn_admitted_hymt2_translation_worker(permit, move || {
         initialized_sender
             .send(())
             .expect("test must observe translation worker initialization");
         Ok(move |_request: TranslationRequest| {
-            let _permit = &_model_session_permit;
             Ok(TranslationWorkerOutput {
                 text: "translated".to_string(),
                 timings: openasr_core::TranslationTimings::default(),

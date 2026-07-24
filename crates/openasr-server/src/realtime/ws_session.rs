@@ -1336,8 +1336,7 @@ impl WsSession {
         model_session_permit: ModelSessionPermit,
     ) -> TranslationSession {
         let path = selection.path;
-        TranslationSession::spawn_thread_local(move || {
-            let _model_session_permit = model_session_permit;
+        Self::spawn_admitted_hymt2_translation_worker(model_session_permit, move || {
             let runtime =
                 Hymt2Runtime::from_path(path).map_err(|error| TranslationQueueError::Worker {
                     reason: format!(
@@ -1346,12 +1345,31 @@ impl WsSession {
                 })?;
             let mut cache = Hymt2TranslationSessionCache::default();
             Ok(move |request| {
-                let _permit = &_model_session_permit;
                 runtime
                     .translate_request_with_cache(&mut cache, &request)
                     .map_err(|error| TranslationQueueError::Worker {
                         reason: error.to_string(),
                     })
+            })
+        })
+    }
+
+    /// Owns a Hy-MT2 capacity permit on the dedicated translation worker until
+    /// that worker exits, including while its model initializer is running.
+    pub(in crate::realtime) fn spawn_admitted_hymt2_translation_worker<W>(
+        model_session_permit: ModelSessionPermit,
+        init_worker: impl FnOnce() -> Result<W, TranslationQueueError> + Send + 'static,
+    ) -> TranslationSession
+    where
+        W: FnMut(TranslationRequest) -> Result<TranslationWorkerOutput, TranslationQueueError>
+            + 'static,
+    {
+        TranslationSession::spawn_thread_local(move || {
+            let model_session_permit = model_session_permit;
+            let mut worker = init_worker()?;
+            Ok(move |request| {
+                let _permit = &model_session_permit;
+                worker(request)
             })
         })
     }
