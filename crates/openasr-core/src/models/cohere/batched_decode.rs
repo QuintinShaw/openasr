@@ -142,6 +142,24 @@ pub(crate) struct CohereServeBatchEngineKey {
     max_batch: usize,
 }
 
+/// Production engine-key composition. Kept free so tests exercise the same
+/// path as `Seq2SeqServeBatchFamily::engine_key` without building a full job.
+pub(crate) fn cohere_serve_batch_engine_key(
+    build_identity: crate::RuntimeBuildIdentity,
+    backend: GgmlCpuGraphBackend,
+    frame_count: usize,
+    hidden_size: usize,
+    max_batch: usize,
+) -> CohereServeBatchEngineKey {
+    CohereServeBatchEngineKey {
+        build_identity,
+        backend,
+        frame_count,
+        hidden_size,
+        max_batch,
+    }
+}
+
 /// The cohere serve-batch ZST family wiring (`Seq2SeqServeBatchFamily`) that
 /// drives the generic `OwnerThreadState` + generic `ServeBatchEngine`.
 struct CohereFamily;
@@ -265,13 +283,13 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
     const MAX_BATCH_LIMIT: usize = COHERE_SERVE_BATCH_MAX_BATCH_LIMIT;
 
     fn engine_key(job: &Self::Job, max_batch: usize) -> Self::EngineKey {
-        CohereServeBatchEngineKey {
-            build_identity: job.build_identity.clone(),
-            backend: job.backend,
-            frame_count: job.encoder_output.frame_count,
-            hidden_size: job.encoder_output.hidden_size,
+        cohere_serve_batch_engine_key(
+            job.build_identity.clone(),
+            job.backend,
+            job.encoder_output.frame_count,
+            job.encoder_output.hidden_size,
             max_batch,
-        }
+        )
     }
 
     fn engine_key_backend(key: &Self::EngineKey) -> GgmlCpuGraphBackend {
@@ -912,7 +930,7 @@ mod tests {
                 None,
                 "cohere:test",
                 "adapter=none",
-                crate::RuntimeBuildIdentity::provisional_content_id_for_path(runtime_path),
+                crate::pack_content_id_for_runtime_path(runtime_path),
             ),
             backend,
             uses_scheduler,
@@ -1629,32 +1647,54 @@ mod tests {
 
     #[test]
     fn cohere_engine_key_misses_same_path_content_replacement() {
-        let path = std::path::Path::new("/same/path.oasr");
-        let shape = |content_id: &str, generation: u64| CohereServeBatchEngineKey {
-            build_identity: crate::RuntimeBuildIdentity::new(
-                content_id,
-                "cohere:Gpu",
-                "adapter=none",
-                generation,
-            ),
-            backend: GgmlCpuGraphBackend::Gpu,
-            frame_count: 16,
-            hidden_size: 64,
-            max_batch: 4,
+        use crate::models::ggml_asr_executor::{
+            GgmlAsrExecutionOptions, serve_batch_build_identity_for_request,
         };
-        let key_a = shape("content-a", 1);
-        let key_b = shape("content-b", 1);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("same-path.oasr");
+        let options = GgmlAsrExecutionOptions::default();
+
+        std::fs::write(&path, b"cohere-pack-a").expect("write a");
+        let identity_a = serve_batch_build_identity_for_request(
+            &options,
+            "cohere",
+            GgmlCpuGraphBackend::Gpu,
+            &path,
+        );
+        let key_a = cohere_serve_batch_engine_key(identity_a, GgmlCpuGraphBackend::Gpu, 16, 64, 4);
+
+        std::fs::write(&path, b"cohere-pack-b-different-bytes").expect("write b");
+        let identity_b = serve_batch_build_identity_for_request(
+            &options,
+            "cohere",
+            GgmlCpuGraphBackend::Gpu,
+            &path,
+        );
+        let key_b =
+            cohere_serve_batch_engine_key(identity_b.clone(), GgmlCpuGraphBackend::Gpu, 16, 64, 4);
         assert_ne!(
             key_a, key_b,
-            "same path/route must miss when pack content id changes"
+            "production resolve+engine_key must miss on same-path content replacement"
         );
-        assert_ne!(
-            key_a,
-            shape("content-a", 2),
-            "idle unload generation must miss"
+
+        let before = crate::current_runtime_build_generation();
+        let _ = crate::bump_runtime_build_generation();
+        let identity_after = serve_batch_build_identity_for_request(
+            &options,
+            "cohere",
+            GgmlCpuGraphBackend::Gpu,
+            &path,
         );
-        // Ensure the production key builder also carries identity.
-        let _ = path;
+        let key_after =
+            cohere_serve_batch_engine_key(identity_after, GgmlCpuGraphBackend::Gpu, 16, 64, 4);
+        assert!(key_after.build_identity.generation > before);
+        assert_ne!(key_a, key_after);
+        assert_ne!(key_b, key_after);
+        assert_eq!(
+            key_after.build_identity.pack_content_id,
+            identity_b.pack_content_id
+        );
     }
 
     #[test]

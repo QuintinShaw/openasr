@@ -37,8 +37,6 @@ use crate::nn::decoder::reusable_decode_graph_supported;
 use crate::{GgmlAsrExecutionResult, Segment, Transcription};
 
 const QWEN_SERVE_BATCH_MAX_BATCH_LIMIT: usize = 8;
-#[cfg(test)]
-const QWEN_SERVE_BATCH_QUEUE_CAPACITY: usize = 4;
 const QWEN_SERVE_BATCH_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 const QWEN_SERVE_BATCH_REPLY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const QWEN_ROPE_THETA: f32 = 1_000_000.0;
@@ -2324,7 +2322,7 @@ mod tests {
                 None,
                 "qwen:test",
                 "adapter=none",
-                crate::RuntimeBuildIdentity::provisional_content_id_for_path(&fixture.runtime_path),
+                crate::pack_content_id_for_runtime_path(&fixture.runtime_path),
             ),
             backend: GgmlCpuGraphConfig::resolve_runtime_backend(),
             metadata: fixture.metadata,
@@ -2637,8 +2635,25 @@ mod tests {
                 .unwrap()
                 .expect("enabled");
             assert_eq!(config.max_batch, 4);
-            assert_eq!(config.queue_capacity, QWEN_SERVE_BATCH_QUEUE_CAPACITY);
+            // Queue capacity tracks the admission/policy source (here the env
+            // width), not a separate fixed valve.
+            assert_eq!(config.queue_capacity, 4);
         });
+    }
+
+    #[test]
+    fn qwen_policy_derives_width_and_queue_from_admission_limit() {
+        assert!(Qwen3AsrServeBatchConfig::from_policy(ServeBatchPolicy::serial()).is_none());
+        let cfg = Qwen3AsrServeBatchConfig::from_policy(ServeBatchPolicy {
+            max_native_sessions: 12,
+        })
+        .expect("enabled");
+        assert_eq!(cfg.max_batch, QWEN_SERVE_BATCH_MAX_BATCH_LIMIT);
+        assert_eq!(cfg.queue_capacity, 12);
+        assert_eq!(
+            cfg.collect_window,
+            crate::models::serve_batch_env::SERVE_BATCH_COLLECT_WINDOW
+        );
     }
 
     #[test]

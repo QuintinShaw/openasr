@@ -38,16 +38,14 @@ impl GgmlAsrBackendPreference {
 
 /// Stable cache/engine identity for reusable native runtime state.
 ///
-/// The pack resolver owns the content proof (`pack_content_id`). This crate
-/// never invents a file hash: until the verified pack-content coordinator lands
-/// (#38), callers may pass an explicit verified id, a test fake id, or the
-/// provisional `unverified:{path}` binding produced by
-/// [`RuntimeBuildIdentity::resolve_for_request`]. Path alone is never a cache
-/// key without the surrounding route/options/generation fields.
+/// `pack_content_id` is a content proof, never a bare path. Production resolves
+/// it from the installed-pack registry sha when available, otherwise from a
+/// full-file sha256 of the runtime pack bytes. The pack-content coordinator
+/// (#38) may later replace the binding source without changing this seam.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RuntimeBuildIdentity {
-    /// Immutable content identity from the verified pack resolver (or an
-    /// explicit provisional/fake binding while that resolver is unfinished).
+    /// Content identity: `sha256:<hex>` for real pack bytes, or an explicit
+    /// verified/fake id supplied by tests / future coordinator bindings.
     pub pack_content_id: String,
     /// Resolved execution route (family + backend lane) that owns the reusable
     /// graph shape.
@@ -93,15 +91,13 @@ impl RuntimeBuildIdentity {
     /// Builds the effective identity for one offline request.
     ///
     /// Prefer an explicit verified/fake content id from the request when present.
-    /// Otherwise bind a provisional `unverified:{canonical-path}` content id so
-    /// the engine key still carries route/options/generation and never collapses
-    /// to path-only equality. The eventual pack-content coordinator replaces the
-    /// content-id source without changing this seam.
+    /// Otherwise use the caller-supplied content id (production always passes a
+    /// content-derived id from [`pack_content_id_for_runtime_path`]).
     pub fn resolve_for_request(
         request_identity: Option<&RuntimeBuildIdentity>,
         route: impl Into<String>,
         options_fingerprint: impl Into<String>,
-        provisional_content_id: impl Into<String>,
+        content_id: impl Into<String>,
     ) -> Self {
         let route = route.into();
         let options_fingerprint = options_fingerprint.into();
@@ -113,7 +109,7 @@ impl RuntimeBuildIdentity {
                 generation: identity.generation,
             },
             None => Self {
-                pack_content_id: provisional_content_id.into(),
+                pack_content_id: content_id.into(),
                 route,
                 options_fingerprint,
                 generation: current_runtime_build_generation(),
@@ -121,12 +117,124 @@ impl RuntimeBuildIdentity {
         }
     }
 
-    pub fn provisional_content_id_for_path(path: &std::path::Path) -> String {
-        format!("unverified:{}", path.display())
+    /// Formats a content id from a lowercase hex sha256 digest.
+    pub fn content_id_from_sha256_hex(sha256_hex: &str) -> String {
+        format!("sha256:{sha256_hex}")
     }
 }
 
+/// Resolves a stable pack content id for `runtime_path`.
+///
+/// Preference order:
+/// 1. Installed-pack registry entry whose path matches (uses the pull-verified
+///    sha256 already on disk).
+/// 2. Full-file sha256 of the runtime pack bytes.
+///
+/// Path alone is never returned. Results are memoized by canonical path + size +
+/// mtime so repeated requests against an unchanged pack do not re-hash multi-GB
+/// weights; different bytes at the same path always miss the memo and re-hash.
+pub fn pack_content_id_for_runtime_path(runtime_path: &std::path::Path) -> String {
+    let canonical =
+        std::fs::canonicalize(runtime_path).unwrap_or_else(|_| runtime_path.to_path_buf());
+    if let Some(installed_sha) = installed_pack_sha256_for_path(&canonical) {
+        return RuntimeBuildIdentity::content_id_from_sha256_hex(&installed_sha);
+    }
+    match file_metadata_key(&canonical) {
+        Some(meta_key) => cached_or_hash_pack_content_id(&canonical, meta_key),
+        None => match sha256_hex_file(&canonical) {
+            Ok(hex) => RuntimeBuildIdentity::content_id_from_sha256_hex(&hex),
+            Err(_) => {
+                // Unreadable path: fail closed to a unique non-path content token
+                // that still cannot collide with a real sha256 content id.
+                format!(
+                    "unreadable:{}:{}",
+                    canonical.display(),
+                    current_runtime_build_generation()
+                )
+            }
+        },
+    }
+}
+
+fn installed_pack_sha256_for_path(canonical_path: &std::path::Path) -> Option<String> {
+    let home = crate::openasr_home().ok()?;
+    let packs = crate::list_installed_packs(home).ok()?;
+    packs.into_iter().find_map(|pack| {
+        let pack_path = std::fs::canonicalize(&pack.path).unwrap_or(pack.path);
+        (pack_path == canonical_path && !pack.sha256.is_empty()).then_some(pack.sha256)
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PackMetaKey {
+    len: u64,
+    modified_secs: u64,
+}
+
+fn file_metadata_key(path: &std::path::Path) -> Option<PackMetaKey> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified_secs = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(PackMetaKey {
+        len: meta.len(),
+        modified_secs,
+    })
+}
+
+fn cached_or_hash_pack_content_id(path: &std::path::Path, meta_key: PackMetaKey) -> String {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<std::path::PathBuf, (PackMetaKey, String)>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some((cached_meta, content_id)) = guard.get(path)
+        && *cached_meta == meta_key
+    {
+        return content_id.clone();
+    }
+
+    let content_id = match sha256_hex_file(path) {
+        Ok(hex) => RuntimeBuildIdentity::content_id_from_sha256_hex(&hex),
+        Err(_) => format!(
+            "unreadable:{}:{}",
+            path.display(),
+            current_runtime_build_generation()
+        ),
+    };
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(path.to_path_buf(), (meta_key, content_id.clone()));
+    }
+    content_id
+}
+
+fn sha256_hex_file(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 /// Builds the effective serve-batch / runtime-cache identity for one request.
+///
+/// Always binds a content-derived pack id (installed-pack sha or full-file
+/// sha256). Explicit request identities override the content id only when the
+/// caller already supplies a verified/fake binding.
 pub(crate) fn serve_batch_build_identity_for_request(
     options: &GgmlAsrExecutionOptions,
     family: &str,
@@ -141,7 +249,7 @@ pub(crate) fn serve_batch_build_identity_for_request(
         options.runtime_build_identity.as_ref(),
         format!("{family}:{backend:?}"),
         options_fingerprint,
-        RuntimeBuildIdentity::provisional_content_id_for_path(runtime_path),
+        pack_content_id_for_runtime_path(runtime_path),
     )
 }
 
@@ -775,33 +883,69 @@ mod tests {
     }
 
     #[test]
-    fn runtime_build_identity_resolve_prefers_verified_content_over_path_binding() {
+    fn runtime_build_identity_resolve_prefers_explicit_request_content_id() {
         let verified = RuntimeBuildIdentity::new("verified-content-a", "old", "old", 3);
         let resolved = RuntimeBuildIdentity::resolve_for_request(
             Some(&verified),
             "whisper:gpu",
             "adapter=none",
-            RuntimeBuildIdentity::provisional_content_id_for_path(std::path::Path::new(
-                "/same/path.oasr",
-            )),
+            "sha256:should-not-win",
         );
         assert_eq!(resolved.pack_content_id, "verified-content-a");
         assert_eq!(resolved.route, "whisper:gpu");
         assert_eq!(resolved.options_fingerprint, "adapter=none");
         assert_eq!(resolved.generation, 3);
+    }
 
-        let provisional = RuntimeBuildIdentity::resolve_for_request(
-            None,
-            "whisper:gpu",
-            "adapter=none",
-            RuntimeBuildIdentity::provisional_content_id_for_path(std::path::Path::new(
-                "/same/path.oasr",
-            )),
-        );
-        assert_eq!(provisional.pack_content_id, "unverified:/same/path.oasr");
+    #[test]
+    fn production_pack_content_id_misses_same_path_byte_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("same-path.oasr");
+        std::fs::write(&path, b"content-a-bytes").expect("write a");
+        let id_a = pack_content_id_for_runtime_path(&path);
+        std::fs::write(&path, b"content-b-bytes-different").expect("write b");
+        let id_b = pack_content_id_for_runtime_path(&path);
+        assert!(id_a.starts_with("sha256:"), "got {id_a}");
+        assert!(id_b.starts_with("sha256:"), "got {id_b}");
         assert_ne!(
-            RuntimeBuildIdentity::new("verified-content-b", "whisper:gpu", "adapter=none", 3),
-            RuntimeBuildIdentity::new("verified-content-a", "whisper:gpu", "adapter=none", 3),
+            id_a, id_b,
+            "same path with different pack bytes must not share content id"
+        );
+
+        let options = GgmlAsrExecutionOptions::default();
+        std::fs::write(&path, b"content-a-bytes").expect("rewrite a");
+        let identity_a = serve_batch_build_identity_for_request(
+            &options,
+            "whisper",
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            &path,
+        );
+        std::fs::write(&path, b"content-b-bytes-different").expect("rewrite b");
+        let identity_b = serve_batch_build_identity_for_request(
+            &options,
+            "whisper",
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            &path,
+        );
+        assert_eq!(identity_a.pack_content_id, id_a);
+        assert_eq!(identity_b.pack_content_id, id_b);
+        assert_ne!(identity_a.pack_content_id, identity_b.pack_content_id);
+        assert_eq!(identity_a.route, identity_b.route);
+
+        let before = current_runtime_build_generation();
+        let _ = bump_runtime_build_generation();
+        let identity_after_unload = serve_batch_build_identity_for_request(
+            &options,
+            "whisper",
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            &path,
+        );
+        assert!(identity_after_unload.generation > before);
+        assert_ne!(identity_after_unload.generation, identity_b.generation);
+        // Unchanged bytes keep the content id after unload; only generation moves.
+        assert_eq!(
+            identity_after_unload.pack_content_id,
+            identity_b.pack_content_id
         );
     }
 

@@ -1100,11 +1100,16 @@ where
     Ok(engine)
 }
 
-/// Removes every idle-owner registry reference. Once the last submitter drops
-/// its `Arc`, the sender disconnects; the owner finishes its current batch,
-/// drains deferred replies through the ordinary loop, then exits. Idle unload
-/// calls this only after native activity reaches zero, so it never abandons an
-/// admitted request or releases its server permit early.
+/// Drops registry references to every cached serve-batch engine for this family.
+///
+/// This does **not** join owner threads synchronously. Clearing the registry
+/// drops the last non-submitter `Arc`s; once in-flight submitters finish and
+/// drop their `Arc`s, the sync channel sender disconnects. The owner then
+/// finishes its current batch, drains deferred replies through the ordinary
+/// loop, and exits. Idle unload calls this only after native activity reaches
+/// zero, so it never abandons an admitted request or releases its server permit
+/// early. Callers also bump the process-wide runtime-build generation so the
+/// next request cannot reuse a drained owner's identity generation.
 pub(crate) fn shutdown_and_remove_serve_batch_engines<F: Seq2SeqServeBatchFamily>(
     registry: &OnceLock<Mutex<HashMap<F::EngineKey, Arc<ServeBatchEngine<F>>>>>,
 ) {

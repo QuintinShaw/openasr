@@ -1106,7 +1106,7 @@ mod tests {
                 None,
                 "whisper:test",
                 "adapter=none",
-                crate::RuntimeBuildIdentity::provisional_content_id_for_path(runtime_path),
+                crate::pack_content_id_for_runtime_path(runtime_path),
             ),
             backend,
             uses_scheduler,
