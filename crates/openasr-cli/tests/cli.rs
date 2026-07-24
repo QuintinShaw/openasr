@@ -740,41 +740,11 @@ fn mimo_asr_dev_pack_path() -> PathBuf {
     )
 }
 
-// The auto energy-VAD slicer picked 3 chunks for this ~69s fixture (same
-// chunk count firered-llm's own longform golden found for the identical
-// fixture). Each chunk decodes independently and, like every transcript from
-// this family, leads with the model's auto `<chinese>`/`<english>` language
-// marker -- which the runtime now strips per-utterance to match the reference
-// `mimo_audio.py::asr_sft` (see `strip_mimo_language_tags`), so no `<chinese>`
-// survives into the assembled longform text. All 5 source segments
-// (EN/ZH/EN/ZH/EN) are present, in order, with no dropped audio; the assembler
-// joins the (already tag-stripped, trimmed) chunk texts with a single space
-// (`longform::assembler` `.join(" ")`) only at the two chunk boundaries. The
-// first chunk covers both source clips 1 and 2 in one continuous decode
-// (English into Chinese with no assembler join in between), so the model's
-// own mid-utterance language switch -- "...your country. " + "今天..." --
-// carries a space, exactly like the single-utterance code-switch golden
-// (`mimo_asr::executor::tests::golden_diff_end_to_end_transcribe_en_zh_mixed_wav`'s
-// `GOLDEN_EN_ZH_MIXED_TEXT`, which asserts the identical "ask not. " + "今天"
-// spacing against the same pack). The real chunk seams are further in: the
-// first seam (inside clip 2's Chinese content) shows a single duplicated "我"
-// (the VAD overlap re-transcribing the boundary word), and the second seam
-// (between "正宗。" and "周末") surfaces the assembler's join space -- the
-// same class of seam artifact firered-llm's own longform golden documents.
-//
-// `concat!` keeps the literal robust to line wrapping: a trailing-`\`
-// continuation eats leading whitespace on the next line, which silently
-// dropped a significant space at the "我 我通常" seam in this const's first
-// (buggy) form.
-//
-// Confirmed byte-for-byte against a clean-window re-run of this test against
-// the real pack (asserted equal below). Refreshed to add the space after the
-// first "your country." -- the constant's original form predated the
-// decode-graph reuse correctness fix (persistent-arena batched prefill
-// replacing a serial one-token-at-a-time replay), which changed this
-// family's decode path and was never re-verified against this golden
-// afterward; the single-utterance golden above independently confirms a
-// space is the model's real behavior at this kind of language switch.
+// The longform assembler joins retained, trimmed segment texts with one space.
+// The spaces inside this `concat!` are therefore golden bytes. The same
+// family's single-utterance EN->ZH golden
+// (`mimo_asr::executor::tests::golden_diff_end_to_end_transcribe_en_zh_mixed_wav`)
+// also asserts the EN->ZH space.
 const GOLDEN_MIMO_LONGFORM_EN_ZH_TEXT: &str = concat!(
     "And so, my fellow Americans, ask not what your country can do for you. ",
     "Ask what you can do for your country. ",
