@@ -152,22 +152,12 @@ pub enum GgufTensorIndexReadError {
         source: std::str::Utf8Error,
     },
     #[error(
-        "gguf tensor '{tensor_name}' in '{path}' has invalid rank: rank={rank}, tensor_index={tensor_index}"
+        "gguf tensor '{tensor_name}' in '{path}' has a null dimension pointer: tensor_index={tensor_index}"
     )]
-    InvalidTensorRank {
+    NullTensorDimensions {
         path: PathBuf,
         tensor_name: String,
         tensor_index: i64,
-        rank: u32,
-    },
-    #[error(
-        "gguf tensor '{tensor_name}' in '{path}' rank does not fit usize: rank={rank}, tensor_index={tensor_index}"
-    )]
-    TensorRankOverflow {
-        path: PathBuf,
-        tensor_name: String,
-        tensor_index: i64,
-        rank: u32,
     },
     #[error(
         "gguf tensor '{tensor_name}' in '{path}' has negative dim: dim_index={dim_index}, value={value}"
@@ -305,39 +295,29 @@ pub fn read_gguf_tensor_index_from_runtime_source(
             })?;
         let name = name.to_string();
 
-        let rank = unsafe { ffi::gguf_get_tensor_n_dims(context.as_ptr(), tensor_index) };
-        if rank == 0 {
-            return Err(GgufTensorIndexReadError::InvalidTensorRank {
+        let dims_ptr = unsafe { ffi::gguf_get_tensor_ne(context.as_ptr(), tensor_index) };
+        if dims_ptr.is_null() {
+            return Err(GgufTensorIndexReadError::NullTensorDimensions {
                 path: path.to_path_buf(),
                 tensor_name: name.clone(),
                 tensor_index,
-                rank,
             });
         }
-        let rank_usize =
-            usize::try_from(rank).map_err(|_| GgufTensorIndexReadError::TensorRankOverflow {
-                path: path.to_path_buf(),
-                tensor_name: name.clone(),
-                tensor_index,
-                rank,
-            })?;
-        let mut dims = Vec::with_capacity(rank_usize);
-        for dim_index in 0..rank_usize {
-            let dim_index_c = i32::try_from(dim_index).map_err(|_| {
-                GgufTensorIndexReadError::TensorRankOverflow {
-                    path: path.to_path_buf(),
-                    tensor_name: name.clone(),
-                    tensor_index,
-                    rank,
-                }
-            })?;
-            let dim_value =
-                unsafe { ffi::gguf_get_tensor_dim(context.as_ptr(), tensor_index, dim_index_c) };
+        // Upstream returns a GGML_MAX_DIMS shape array and pads dimensions above
+        // the stored rank with one. Trim that padding so OpenASR keeps the
+        // canonical shape representation used by package validation.
+        let raw_dims = unsafe { std::slice::from_raw_parts(dims_ptr, ffi::GGML_MAX_DIMS) };
+        let rank = raw_dims
+            .iter()
+            .rposition(|&value| value != 1)
+            .map_or(1, |last_non_unit| last_non_unit + 1);
+        let mut dims = Vec::with_capacity(rank);
+        for (dim_index, &dim_value) in raw_dims[..rank].iter().enumerate() {
             if dim_value < 0 {
                 return Err(GgufTensorIndexReadError::NegativeTensorDimension {
                     path: path.to_path_buf(),
                     tensor_name: name.clone(),
-                    dim_index: dim_index_c,
+                    dim_index: dim_index as i32,
                     value: dim_value,
                 });
             }
