@@ -25,7 +25,7 @@
 //!   [`openasr_core::PullModelPackRequest`], which enforces https-only URLs,
 //!   streams a sha256 checked against the catalog-pinned digest, runs the GGUF /
 //!   runtime preflight, and installs atomically. [`openasr_install_local_pack`]
-//!   verifies a user-provided `.oasr`'s sha256/size against the signed catalog
+//!   installs a user-provided `.oasr` (catalog digest match when present; otherwise pack-intrinsic identity + runtime preflight)
 //!   before installing. The app never gets to hand over a URL or a hash -- only a
 //!   catalog reference (`model:quant`), so it cannot redirect the download or
 //!   bypass the digest check.
@@ -344,7 +344,7 @@ pub unsafe extern "C" fn openasr_pull_model(
 
 /// Verifies and installs a `.oasr` pack the app already has on disk (e.g. one
 /// side-loaded or copied into the app) without downloading it. The pack's
-/// sha256/size must match an entry in the verified `catalog`, or the call fails
+/// Prefer a unique public-catalog digest match; otherwise install from pack identity + preflight
 /// closed with [`OpenAsrStatus::PullFailed`] -- so a hand-supplied file cannot be
 /// installed as a model the catalog never vouched for.
 ///
