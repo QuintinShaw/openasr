@@ -1319,6 +1319,83 @@ fn validate_timestamp_granularities(values: &[String]) -> Result<(), ApiError> {
 
 // ── Backend execution ─────────────────────────────────────────────────────────
 
+/// Runs the native-runtime portion of a transcription after all audio-only
+/// preparation has completed. The caller owns the blocking task, while this
+/// helper keeps the permit scoped to the real native execution closure.
+fn run_admitted_native_transcription<R>(
+    model_session_permit: ModelSessionPermit,
+    decode: impl FnOnce() -> Result<R, TranscriptionRuntimeError>,
+) -> Result<R, TranscriptionRuntimeError> {
+    let _model_session_permit = model_session_permit;
+    decode()
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use std::{
+        num::NonZeroUsize,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn admitted_native_decode_retains_capacity_after_owner_is_dropped() {
+        let supervisor = NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap());
+        let model_identity = "native:test-decode-lifecycle";
+        let permit = supervisor
+            .try_acquire(model_identity)
+            .expect("first native decode must acquire the model slot");
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            run_admitted_native_transcription(permit, move || {
+                started_sender
+                    .send(())
+                    .expect("test must observe the native execution boundary");
+                release_receiver
+                    .recv()
+                    .expect("test must release the native decode");
+                Ok(())
+            })
+        });
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("native decode must reach the admitted execution boundary");
+        assert!(
+            supervisor.try_acquire(model_identity).is_err(),
+            "a second same-model request must be rejected while native execution runs"
+        );
+
+        // Dropping the async owner detaches `spawn_blocking`; it must not release
+        // the permit before the real native decode closure exits.
+        drop(task);
+        assert!(
+            supervisor.try_acquire(model_identity).is_err(),
+            "a detached native decode must retain its model slot"
+        );
+
+        release_sender
+            .send(())
+            .expect("release the detached native decode");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(permit) = supervisor.try_acquire(model_identity) {
+                drop(permit);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native model capacity must return after the decode exits"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
 pub(crate) async fn transcribe_with_runtime(
     runtime: ServerRuntime,
     request: TranscriptionRequest,
@@ -1347,34 +1424,43 @@ pub(crate) async fn transcribe_with_runtime(
             Ok(transcription)
         }
         BackendKind::Native => {
-            let model_session_permit = runtime.acquire_native_execution()?;
             tokio::task::spawn_blocking(move || {
-                // This permit is deliberately owned by the blocking task rather
-                // than its async caller. Dropping an HTTP/SSE future detaches a
-                // spawned blocking task, but must not admit a second heavy decode
-                // while the first one still owns model execution resources.
-                let _model_session_permit = model_session_permit;
-                // Marks this offline (file-transcription / realtime-per-utterance
-                // backend-job) decode as active for the whole synchronous run, so
-                // the idle_unload reaper never evicts the model runtime cache out
-                // from under it; dropped (any exit path) once the decode returns.
-                let _activity_guard = NativeActivityGuard::enter();
-                // Bind the pause/cancel control to this decode thread for the whole
-                // synchronous run so the long-form slice loop can observe it; the
-                // guard clears the binding on any exit. `None` (no control requested)
-                // leaves the decode byte-identical to before.
-                let _control_guard =
-                    control.map(openasr_core::install_active_transcription_control);
-                let model_pack_path = runtime.model_pack_path.clone().ok_or_else(|| {
-                    TranscriptionRuntimeError::Backend(
+                // Audio normalization may run an external converter or decode a
+                // full upload in process, but it does not touch a native model
+                // runtime. Keep it outside the per-model admission window so
+                // upload preparation cannot serialize an unrelated native session
+                // for the same model.
+                let prepared = prepare_audio_input(
+                    &request.input_path,
+                    &AudioPreparationOptions::new(runtime.backend)
+                        .with_ffmpeg_bin(runtime.ffmpeg_bin.clone())
+                        .with_ffmpeg_bin_explicit(runtime.ffmpeg_bin_explicit)
+                        .with_native_non_wav_conversion(true),
+                )
+                .map_err(ApiError::AudioPreparation)?;
+                let model_session_permit = runtime.acquire_native_execution()?;
+                run_admitted_native_transcription(model_session_permit, move || {
+                    // Marks this offline (file-transcription / realtime-per-utterance
+                    // backend-job) decode as active for the whole synchronous run, so
+                    // the idle_unload reaper never evicts the model runtime cache out
+                    // from under it; dropped (any exit path) once the decode returns.
+                    let _activity_guard = NativeActivityGuard::enter();
+                    // Bind the pause/cancel control to this decode thread for the whole
+                    // synchronous run so the long-form slice loop can observe it; the
+                    // guard clears the binding on any exit. `None` (no control requested)
+                    // leaves the decode byte-identical to before.
+                    let _control_guard =
+                        control.map(openasr_core::install_active_transcription_control);
+                    let model_pack_path = runtime.model_pack_path.clone().ok_or_else(|| {
+                        TranscriptionRuntimeError::Backend(
                         openasr_core::BackendError::NativeModelPackPathRejected {
                             reason:
                                 "native backend requires an explicit local .oasr runtime pack path"
                                     .to_string(),
                         },
                     )
-                })?;
-                let adapter =
+                    })?;
+                    let adapter =
                 native_runtime_model_adapter_for_path(&model_pack_path).ok_or_else(|| {
                     TranscriptionRuntimeError::Backend(
                         openasr_core::BackendError::NativeFailClosed {
@@ -1385,81 +1471,74 @@ pub(crate) async fn transcribe_with_runtime(
                         },
                     )
                 })?;
-                let prepared = prepare_audio_input(
-                    &request.input_path,
-                    &AudioPreparationOptions::new(runtime.backend)
-                        .with_ffmpeg_bin(runtime.ffmpeg_bin.clone())
-                        .with_ffmpeg_bin_explicit(runtime.ffmpeg_bin_explicit)
-                        .with_native_non_wav_conversion(true),
-                )
-                .map_err(TranscriptionRuntimeError::AudioPreparation)?;
-                let mut request = request;
-                request.input_path = prepared.path().to_path_buf();
-                let word_timestamps = request.word_timestamps;
-                let model_pack = NativeAsrModelPackRef::new(
-                    request.model_id.clone(),
-                    adapter.model_family(),
-                    model_pack_path,
-                );
-                let offline_request = NativeAsrOfflineRequest::new(request.input_path.clone())
-                    .with_options(
-                        NativeAsrRequestOptions::new()
-                            .with_language(request.language.clone())
-                            .with_prompt(request.prompt.clone())
-                            .with_phrase_bias(request.phrase_bias.clone())
-                            .with_inference_threads(request.inference_threads)
-                            .with_diarization(request.diarize)
-                            .with_word_timestamps(request.word_timestamps)
-                            .with_word_timestamps_refine(request.word_timestamps_refine),
+                    let mut request = request;
+                    request.input_path = prepared.path().to_path_buf();
+                    let word_timestamps = request.word_timestamps;
+                    let model_pack = NativeAsrModelPackRef::new(
+                        request.model_id.clone(),
+                        adapter.model_family(),
+                        model_pack_path,
+                    );
+                    let offline_request = NativeAsrOfflineRequest::new(request.input_path.clone())
+                        .with_options(
+                            NativeAsrRequestOptions::new()
+                                .with_language(request.language.clone())
+                                .with_prompt(request.prompt.clone())
+                                .with_phrase_bias(request.phrase_bias.clone())
+                                .with_inference_threads(request.inference_threads)
+                                .with_diarization(request.diarize)
+                                .with_word_timestamps(request.word_timestamps)
+                                .with_word_timestamps_refine(request.word_timestamps_refine),
+                        )
+                        .with_longform(request.longform.clone())
+                        .with_display_file_name(request.display_file_name.clone())
+                        .with_source(request.source)
+                        // The source audio's real format for the `stage=request_context`
+                        // log line -- `prepared.original()` is the pre-normalization
+                        // probe (WAV fmt chunk) or decode (other recognized formats)
+                        // result; `None` when this pipeline could not determine it
+                        // (unrecognized extension, or a format only the external
+                        // ffmpeg/afconvert fallback handles).
+                        .with_source_audio_format(
+                            prepared.original().sample_rate_hz,
+                            prepared.original().channels,
+                        )
+                        // Extension only, off the upload's own temp file (which
+                        // preserves the client's original extension via
+                        // `safe_extension_suffix` -- see `ingest_field` above); never
+                        // the client-supplied file name/stem itself.
+                        .with_source_container(prepared.original().extension.clone())
+                        // Lets the native backend decode straight from the in-process
+                        // symphonia decode's in-memory samples (uploads are almost
+                        // always a non-WAV/non-conformant container) instead of
+                        // re-reading `input_path` from disk -- see
+                        // `PreparedAudioInput::shared_samples`.
+                        .with_prepared_samples(prepared.shared_samples());
+                    let executor = NativeBackendExecutor;
+                    let mut transcription = NativeAsrExecutor::transcribe(
+                        &executor,
+                        &adapter,
+                        &model_pack,
+                        native_hardware_target_from_execution_target(request.execution_target),
+                        offline_request,
                     )
-                    .with_longform(request.longform.clone())
-                    .with_display_file_name(request.display_file_name.clone())
-                    .with_source(request.source)
-                    // The source audio's real format for the `stage=request_context`
-                    // log line -- `prepared.original()` is the pre-normalization
-                    // probe (WAV fmt chunk) or decode (other recognized formats)
-                    // result; `None` when this pipeline could not determine it
-                    // (unrecognized extension, or a format only the external
-                    // ffmpeg/afconvert fallback handles).
-                    .with_source_audio_format(
-                        prepared.original().sample_rate_hz,
-                        prepared.original().channels,
-                    )
-                    // Extension only, off the upload's own temp file (which
-                    // preserves the client's original extension via
-                    // `safe_extension_suffix` -- see `ingest_field` above); never
-                    // the client-supplied file name/stem itself.
-                    .with_source_container(prepared.original().extension.clone())
-                    // Lets the native backend decode straight from the in-process
-                    // symphonia decode's in-memory samples (uploads are almost
-                    // always a non-WAV/non-conformant container) instead of
-                    // re-reading `input_path` from disk -- see
-                    // `PreparedAudioInput::shared_samples`.
-                    .with_prepared_samples(prepared.shared_samples());
-                let executor = NativeBackendExecutor;
-                let mut transcription = NativeAsrExecutor::transcribe(
-                    &executor,
-                    &adapter,
-                    &model_pack,
-                    native_hardware_target_from_execution_target(request.execution_target),
-                    offline_request,
-                )
-                .map_err(native_asr_error_to_backend)
-                .map_err(TranscriptionRuntimeError::Backend)?;
-                // The decode above only returns `Ok` after the model runtime is
-                // built (or reused) and actually ran, so this is the resident
-                // signal `/health`'s `model_resident` field reads -- see
-                // `idle_activity::native_model_is_resident`.
-                crate::idle_activity::mark_native_model_warm();
-                if word_timestamps {
-                    add_segment_word_timestamps(&mut transcription);
-                }
-                drop(prepared);
-                Ok::<_, TranscriptionRuntimeError>(transcription)
+                    .map_err(native_asr_error_to_backend)
+                    .map_err(TranscriptionRuntimeError::Backend)?;
+                    // The decode above only returns `Ok` after the model runtime is
+                    // built (or reused) and actually ran, so this is the resident
+                    // signal `/health`'s `model_resident` field reads -- see
+                    // `idle_activity::native_model_is_resident`.
+                    crate::idle_activity::mark_native_model_warm();
+                    if word_timestamps {
+                        add_segment_word_timestamps(&mut transcription);
+                    }
+                    drop(prepared);
+                    Ok::<_, TranscriptionRuntimeError>(transcription)
+                })
+                .map_err(ApiError::from)
             })
             .await
             .map_err(ApiError::BackendJoin)?
-            .map_err(ApiError::from)
         }
     }
 }
@@ -1733,14 +1812,12 @@ mod native_runtime_tests {
 
 #[derive(Debug)]
 pub(crate) enum TranscriptionRuntimeError {
-    AudioPreparation(openasr_core::AudioPreparationError),
     Backend(openasr_core::BackendError),
 }
 
 impl From<TranscriptionRuntimeError> for ApiError {
     fn from(error: TranscriptionRuntimeError) -> Self {
         match error {
-            TranscriptionRuntimeError::AudioPreparation(error) => Self::AudioPreparation(error),
             TranscriptionRuntimeError::Backend(error) => Self::Backend(error),
         }
     }

@@ -2244,6 +2244,65 @@ async fn native_transcribe_stays_fail_closed_with_local_pack_only_validation() {
     assert!(rendered.contains("Could not transcribe audio"));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn native_audio_preparation_does_not_consume_model_capacity() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let pack_path = temp.path().join("native-preparation-capacity.oasr");
+    write_mock_gguf_runtime_source(&pack_path, Some("whisper-large-v3-turbo"));
+    let input_path = temp.path().join("blocked-preparation.mp3");
+    std::fs::write(&input_path, b"not an mp3 stream").unwrap();
+    let started_path = temp.path().join("preparation-started");
+    let release_path = temp.path().join("release-preparation");
+    let converter = temp.path().join("blocking-ffmpeg");
+    std::fs::write(
+        &converter,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\nexit 1\n",
+            started_path.display(),
+            release_path.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&converter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::new(std::num::NonZeroUsize::new(1).unwrap()),
+        ffmpeg_bin: Some(converter),
+        ffmpeg_bin_explicit: true,
+        model_pack_path: Some(pack_path),
+    };
+    let request_runtime = runtime.clone();
+    let request = TranscriptionRequest::new(input_path, "whisper-large-v3-turbo");
+    let runtime_handle = tokio::runtime::Handle::current();
+    let request_task = tokio::task::spawn_blocking(move || {
+        runtime_handle.block_on(transcribe_with_runtime(request_runtime, request, None))
+    });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    while !started_path.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "native audio preparation never reached the blocking converter"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let permit = runtime
+        .acquire_native_execution()
+        .expect("audio-only preparation must not consume native model capacity");
+    drop(permit);
+    std::fs::write(&release_path, b"release").unwrap();
+    let error = request_task
+        .await
+        .expect("preparation task must not panic")
+        .expect_err("blocking converter exits unsuccessfully");
+    assert!(matches!(error, ApiError::AudioPreparation(_)));
+}
+
 #[test]
 fn parse_segment_mode_accepts_energy_and_rejects_unknown() {
     assert_eq!(parse_segment_mode("energy").unwrap(), LongFormMode::Energy);
