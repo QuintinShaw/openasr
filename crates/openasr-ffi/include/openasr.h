@@ -657,11 +657,16 @@ enum OpenAsrStatus openasr_pull_model(const struct OpenAsrCatalog *catalog,
                                       char **out_installed_json);
 
 /**
- * Verifies and installs a `.oasr` pack the app already has on disk (e.g. one
- * side-loaded or copied into the app) without downloading it. The pack's
- * sha256/size must match an entry in the verified `catalog`, or the call fails
- * closed with [`OpenAsrStatus::PullFailed`] -- so a hand-supplied file cannot be
- * installed as a model the catalog never vouched for.
+ * Installs a `.oasr` pack the app already has on disk (side-loaded or copied)
+ * without downloading it.
+ *
+ * Resolution: if the file's sha256+size matches exactly one **public** catalog
+ * quant, that catalog identity is used; otherwise the pack is installed from
+ * pack/filename identity. In both cases the shared runtime preflight
+ * (GGUF structure + native pack contract) must pass, or the call fails closed
+ * with [`OpenAsrStatus::PullFailed`]. Uncatalogued packs are allowed for
+ * operator sideload (e.g. HF-published models not yet in the signed public
+ * catalog); integrity is the file digest + preflight, not catalog vouching.
  *
  * `oasr_path` is the local pack path; `home_dir` is the app's OpenASR home.
  * `progress_cb` (optional) reports the verify/install phases. `out_installed_json`,
