@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-24T10:20:50+00:00",
+  "generated_at": "2026-07-24T11:29:49+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -1645,7 +1645,7 @@
       "license_url": "https://github.com/PalabraAI/redimnet2/blob/main/LICENSE",
       "license_class": "permissive",
       "hf_repo": "OpenASR/redimnet2-b6-cn",
-      "hf_revision": "242cab1fa50bca641575ff3dc97b8c2a5d9b2a3e",
+      "hf_revision": "4c8deac5d2f81fabe4a16a2dcd6184c3e47c02dd",
       "public": true,
       "min_cli_version": "0.1.23",
       "recommended_quant": "fp16",
@@ -1669,44 +1669,12 @@
           "suffix": "fp16",
           "pull": "redimnet2-b6-cn:fp16",
           "filename": "redimnet2-b6-cn-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/redimnet2-b6-cn/resolve/242cab1fa50bca641575ff3dc97b8c2a5d9b2a3e/redimnet2-b6-cn-fp16.oasr",
-          "sha256": "b889eb50978957fcf5dae9dbcdb9aca7d3834bc72c3680c01e666b2d7e218727",
-          "size_bytes": 27775264,
+          "url": "https://huggingface.co/OpenASR/redimnet2-b6-cn/resolve/4c8deac5d2f81fabe4a16a2dcd6184c3e47c02dd/redimnet2-b6-cn-fp16.oasr",
+          "sha256": "ef408d57e9f41d3e430e5c6aa9483bacaebf9531cc224217d395d0cfb37cf6d1",
+          "size_bytes": 27775520,
           "recommended": true,
           "perf": {
             "rtf_cpu": 0.36455,
-            "rtf_metal": null,
-            "peak_rss_bytes": null,
-            "jfk_wer_vs_fp16": null
-          }
-        },
-        {
-          "quant": "q8_0",
-          "suffix": "q8",
-          "pull": "redimnet2-b6-cn:q8",
-          "filename": "redimnet2-b6-cn-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/redimnet2-b6-cn/resolve/242cab1fa50bca641575ff3dc97b8c2a5d9b2a3e/redimnet2-b6-cn-q8_0.oasr",
-          "sha256": "d489dede665dfbaaa7a35d38055dc3eb4df7d6bb8fc8cad625d8332d845c1db8",
-          "size_bytes": 26738464,
-          "recommended": false,
-          "perf": {
-            "rtf_cpu": 0.73789,
-            "rtf_metal": null,
-            "peak_rss_bytes": null,
-            "jfk_wer_vs_fp16": null
-          }
-        },
-        {
-          "quant": "f32",
-          "suffix": "f32",
-          "pull": "redimnet2-b6-cn:f32",
-          "filename": "redimnet2-b6-cn-f32.oasr",
-          "url": "https://huggingface.co/OpenASR/redimnet2-b6-cn/resolve/242cab1fa50bca641575ff3dc97b8c2a5d9b2a3e/redimnet2-b6-cn-f32.oasr",
-          "sha256": "34f38adb26892a04b9bd39a3abc3de0606c3e406c133c25e20579d8547917678",
-          "size_bytes": 50048672,
-          "recommended": false,
-          "perf": {
-            "rtf_cpu": 0.28644,
             "rtf_metal": null,
             "peak_rss_bytes": null,
             "jfk_wer_vs_fp16": null
