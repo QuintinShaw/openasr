@@ -1260,9 +1260,9 @@ fn allocate_fused_logits_head_tensors(
     let output_weight =
         match loaded.and_then(|context| context.tensor(spec.output_weight_tensor_name)) {
             Some(tensor) => LlmWeightHandle::Loaded(tensor),
-            None => LlmWeightHandle::Arena(arena.new_matmul_weight_2d_typed(
-                dims.d_model,
-                spec.vocab_size,
+            None => LlmWeightHandle::Arena(arena.new_tensor_2d_typed(
+                spec.output_weight_dims[0],
+                spec.output_weight_dims[1],
                 spec.output_weight_ggml_type,
                 "qwen_llm_fused_output_weight",
             )?),
@@ -2149,6 +2149,43 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         })
     }
 
+    /// Compute a fused device-side top-1 token from an already-materialized
+    /// decoder hidden row. This avoids allocating a separate full-vocabulary
+    /// logits executor after a resident prefill graph has populated its KV.
+    pub(crate) fn fused_logits_top1_from_hidden(
+        &mut self,
+        hidden: &[f32],
+    ) -> Result<Option<u32>, GgmlCpuGraphError> {
+        let Some(fused_logits_head) = self.fused_logits_head.as_ref() else {
+            return Ok(None);
+        };
+        if hidden.len() != self.dims.d_model {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder fused top1 hidden width mismatch",
+            });
+        }
+        let mut graph = self.runner.start_graph();
+        let hidden_tensor =
+            graph.new_tensor_2d_f32(self.dims.d_model, 1, "qwen_llm_fused_logits_hidden")?;
+        graph.set_input(hidden_tensor)?;
+        let top1 =
+            build_fused_logits_top1(&self.arena, fused_logits_head, &mut graph, hidden_tensor, 1)?;
+        graph.set_output(top1)?;
+        graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_fused_logits_hidden")?;
+        let token_id = graph
+            .compute_output_i32(top1, 1)?
+            .first()
+            .copied()
+            .ok_or(GgmlCpuGraphError::OutputByteSizeMismatch {
+                expected: std::mem::size_of::<i32>(),
+                actual: 0,
+            })
+            .and_then(|token_id| {
+                validate_fused_top1_token_id(token_id, fused_logits_head.vocab_size)
+            })?;
+        Ok(Some(token_id))
+    }
+
     /// Run an entire prompt prefix as one causal multi-query LLM graph. This is
     /// the prefill counterpart to `run_step`: K/V for all prompt rows are written
     /// by one `set_rows` call per layer, guarded by a `[kv, query, 1, 1]` causal
@@ -2210,6 +2247,83 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         )
     }
 
+    fn sequence_major_prefill_chunk(
+        sequence_major_hidden: &[f32],
+        token_count: usize,
+        n_seq: usize,
+        d_model: usize,
+        position_offset: usize,
+        chunk_tokens: usize,
+    ) -> Result<Vec<f32>, GgmlCpuGraphError> {
+        let chunk_end = position_offset.checked_add(chunk_tokens).ok_or(
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident prefill chunk position overflow",
+            },
+        )?;
+        if n_seq == 0 || chunk_tokens == 0 || chunk_end > token_count {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident prefill chunk span is invalid",
+            });
+        }
+        let per_sequence =
+            token_count
+                .checked_mul(d_model)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill sequence width overflow",
+                })?;
+        let expected =
+            per_sequence
+                .checked_mul(n_seq)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill hidden width overflow",
+                })?;
+        if sequence_major_hidden.len() != expected {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident prefill hidden width mismatch",
+            });
+        }
+        let chunk_width =
+            chunk_tokens
+                .checked_mul(d_model)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill chunk width overflow",
+                })?;
+        let mut chunk = Vec::with_capacity(chunk_width.checked_mul(n_seq).ok_or(
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident prefill chunk allocation overflow",
+            },
+        )?);
+        for sequence_index in 0..n_seq {
+            let sequence_start = sequence_index.checked_mul(per_sequence).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill sequence offset overflow",
+                },
+            )?;
+            let token_start = position_offset.checked_mul(d_model).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill token offset overflow",
+                },
+            )?;
+            let start = sequence_start.checked_add(token_start).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill chunk start overflow",
+                },
+            )?;
+            let end =
+                start
+                    .checked_add(chunk_width)
+                    .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder resident prefill chunk end overflow",
+                    })?;
+            chunk.extend_from_slice(sequence_major_hidden.get(start..end).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill chunk slice is out of bounds",
+                },
+            )?);
+        }
+        Ok(chunk)
+    }
+
     pub(crate) fn run_prefill_into_reused_batched(
         &mut self,
         sequence_major_hidden: &[f32],
@@ -2217,6 +2331,53 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         n_seq: usize,
         max_positions: usize,
         rope_theta: f32,
+    ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
+        const RESIDENT_PREFILL_MAX_QUERY_TOKENS: usize = 256;
+        if token_count == 0 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident prefill token count must be positive",
+            });
+        }
+        let mut final_step = None;
+        for position_offset in (0..token_count).step_by(RESIDENT_PREFILL_MAX_QUERY_TOKENS) {
+            let chunk_tokens =
+                (token_count - position_offset).min(RESIDENT_PREFILL_MAX_QUERY_TOKENS);
+            let chunk_hidden = Self::sequence_major_prefill_chunk(
+                sequence_major_hidden,
+                token_count,
+                n_seq,
+                self.dims.d_model,
+                position_offset,
+                chunk_tokens,
+            )?;
+            let is_final_chunk = position_offset.checked_add(chunk_tokens) == Some(token_count);
+            let step = self.run_prefill_chunk_into_reused_batched(
+                &chunk_hidden,
+                chunk_tokens,
+                n_seq,
+                position_offset,
+                max_positions,
+                rope_theta,
+                is_final_chunk,
+            )?;
+            if is_final_chunk {
+                final_step = Some(step);
+            }
+        }
+        final_step.ok_or(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "whole-decoder resident prefill produced no final chunk",
+        })
+    }
+
+    fn run_prefill_chunk_into_reused_batched(
+        &mut self,
+        sequence_major_hidden: &[f32],
+        token_count: usize,
+        n_seq: usize,
+        position_offset: usize,
+        max_positions: usize,
+        rope_theta: f32,
+        materialize_last_hidden: bool,
     ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
         let dims = self.dims;
         if token_count == 0 {
@@ -2229,7 +2390,12 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 reason: "whole-decoder resident prefill n_seq must be positive",
             });
         }
-        if max_positions < token_count {
+        let chunk_end = position_offset.checked_add(token_count).ok_or(
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident prefill position span overflow",
+            },
+        )?;
+        if max_positions < chunk_end {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "whole-decoder resident prefill max-position span is too small",
             });
@@ -2260,13 +2426,18 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         let mut positions = Vec::with_capacity(output_tokens);
         for _sequence_index in 0..n_seq {
             for token_position in 0..token_count {
-                row_indices_usize.push(token_position);
-                row_indices.push(i32::try_from(token_position).map_err(|_| {
+                let absolute_position = position_offset.checked_add(token_position).ok_or(
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder resident prefill position overflow",
+                    },
+                )?;
+                row_indices_usize.push(absolute_position);
+                row_indices.push(i32::try_from(absolute_position).map_err(|_| {
                     GgmlCpuGraphError::UnsupportedInputs {
                         reason: "whole-decoder resident prefill cache index exceeds ggml int boundary",
                     }
                 })?);
-                positions.push(i32::try_from(token_position).map_err(|_| {
+                positions.push(i32::try_from(absolute_position).map_err(|_| {
                     GgmlCpuGraphError::UnsupportedInputs {
                         reason: "whole-decoder resident prefill rope position exceeds ggml int boundary",
                     }
@@ -2335,7 +2506,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 |_step, source| source,
             )?;
             let state = stack.state;
-            let (output_state, output_len) = if n_seq == 1 {
+            let (output_state, output_len) = if materialize_last_hidden && n_seq == 1 {
                 let final_hidden_offset = token_count
                     .checked_sub(1)
                     .and_then(|position| position.checked_mul(dims.d_model))
@@ -2352,9 +2523,11 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 )?;
                 (final_hidden, dims.d_model)
             } else {
-                (state, expected_hidden)
+                let completion = graph.view_1d(state, 1, 0)?;
+                (completion, 1)
             };
             graph.set_output(output_state)?;
+            graph.prepare_outputs_for_upload(&[output_state])?;
             graph.set_f32_slice(
                 hidden_tensor,
                 sequence_major_hidden,
@@ -2392,8 +2565,12 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 compute_micros,
             })
         })();
+        let restore_result = reuse.builder().restore_prepared_graph_allocation();
         self.reuse = Some(reuse);
-        result
+        match result {
+            Ok(output) => restore_result.map(|()| output),
+            Err(error) => Err(error),
+        }
     }
 
     fn run_prefill_with_history(
@@ -4466,6 +4643,43 @@ mod tests {
     const QWEN_PREFILL_CHUNK_TOKENS_ENV: &str = "OPENASR_QWEN_PREFILL_CHUNK_TOKENS";
 
     #[test]
+    fn resident_prefill_chunk_preserves_each_sequence_token_span() {
+        const D_MODEL: usize = 2;
+        for n_seq in [2, 3] {
+            for token_count in [1, 255, 256, 257, 513] {
+                let values = (0..n_seq * token_count * D_MODEL)
+                    .map(|value| value as f32)
+                    .collect::<Vec<_>>();
+                for position_offset in (0..token_count).step_by(256) {
+                    let chunk_tokens = (token_count - position_offset).min(256);
+                    let actual =
+                        Qwen3AsrLlmWholeDecoderGraphExecutor::sequence_major_prefill_chunk(
+                            &values,
+                            token_count,
+                            n_seq,
+                            D_MODEL,
+                            position_offset,
+                            chunk_tokens,
+                        )
+                        .expect("valid sequence-major chunk");
+                    let expected = (0..n_seq)
+                        .flat_map(|sequence_index| {
+                            let start = (sequence_index * token_count + position_offset) * D_MODEL;
+                            values[start..start + chunk_tokens * D_MODEL]
+                                .iter()
+                                .copied()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual, expected,
+                        "n_seq={n_seq}, token_count={token_count}, offset={position_offset}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn qwen_llm_native_gqa_default_is_on_for_cpu_metal_off_for_gpu() {
         assert!(qwen_llm_native_gqa_default_for_backend(
             GgmlCpuGraphBackend::Cpu
@@ -4608,6 +4822,62 @@ mod tests {
         let token_id = validate_fused_top1_token_id(reversed_top1[0], spec.vocab_size)
             .expect("top1 should map to a valid token");
         assert_eq!(token_id, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "vocab-hidden fused logits handles should allocate")]
+    fn fused_logits_top1_rejects_vocab_hidden_output_layout() {
+        let config = GgmlCpuGraphConfig::default();
+        let mut runner =
+            GgmlCpuGraphRunner::new(config).expect("cpu graph runner should initialize");
+        let mut arena = runner
+            .start_static_tensor_arena(config.context_bytes)
+            .expect("static arena should allocate");
+        let dims = Qwen3AsrLlmDecodeDims {
+            d_model: 2,
+            q_width: 2,
+            k_width: 2,
+            v_width: 2,
+            head_dim: 2,
+            q_heads: 1,
+            kv_heads: 1,
+        };
+        // Physical [vocab, hidden] storage for the logical [hidden, vocab]
+        // projection used by the ordinary logits path.
+        let output_weight_bytes = [0.1_f32, 0.3, 0.3, 0.0, 0.0, 0.0]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let spec = Qwen3AsrLlmFusedLogitsHeadSpec {
+            d_model: 2,
+            vocab_size: 3,
+            rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
+            output_norm_weight: &[1.0, 1.0],
+            output_weight_tensor_name: "synthetic.output.weight",
+            output_weight_ggml_type: GGML_TYPE_F32,
+            output_weight_dims: &[3, 2],
+            output_weight_bytes: &output_weight_bytes,
+        };
+        let handles = allocate_fused_logits_head_tensors(&mut arena, None, dims, &spec)
+            .expect("vocab-hidden fused logits handles should allocate");
+        upload_fused_logits_head_weights(&mut arena, &handles, &spec)
+            .expect("vocab-hidden fused logits weights should upload");
+        let mut graph = runner.start_graph();
+        let state = graph
+            .new_tensor_2d_f32(2, 1, "synthetic_state")
+            .expect("state");
+        graph.set_input(state).expect("state input");
+        let top1 = build_fused_logits_top1(&arena, &handles, &mut graph, state, 1)
+            .expect("vocab-hidden fused top1 should build");
+        graph.set_output(top1).expect("top1 output");
+        graph
+            .set_f32_slice(state, &[1.0, 0.0], "synthetic_state")
+            .expect("state upload");
+        let reversed = graph.compute_output_i32(top1, 1).expect("top1 compute");
+        assert_eq!(
+            validate_fused_top1_token_id(reversed[0], spec.vocab_size).expect("top1 token"),
+            1
+        );
     }
 
     #[test]

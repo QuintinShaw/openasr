@@ -209,6 +209,16 @@ pub(crate) fn parse_moss_td_speaker_segments(
                 if let Some(previous) = last_anchor
                     && timestamp < previous
                 {
+                    // MOSS occasionally emits a corrected turn-start anchor
+                    // immediately after an initial anchor and before any text
+                    // (for example `[125.31][124.34][S01]`). It denotes the
+                    // same pending start, not a temporal reversal. Preserve
+                    // strict monotonicity once text has been attached.
+                    if buffer.trim().is_empty() && pending_start == Some(previous) {
+                        pending_start = Some(timestamp);
+                        last_anchor = Some(timestamp);
+                        continue;
+                    }
                     return Err(MossTdSpeakerSegmentParseError::TimeWentBackwards {
                         previous,
                         next: timestamp,
@@ -278,6 +288,24 @@ pub(crate) fn moss_td_segments_or_degrade(text: &str, audio_duration_seconds: f3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_an_adjacent_pending_start_correction() {
+        let segments = parse_moss_td_speaker_segments("[1.0][0.9][S01]hello[2.0]", 2.0)
+            .expect("adjacent corrected start should parse");
+        assert_eq!(segments[0].start, 0.9);
+        assert_eq!(segments[0].end, 2.0);
+    }
+
+    #[test]
+    fn rejects_a_backwards_anchor_after_text() {
+        let error = parse_moss_td_speaker_segments("[1.0][S01]hello[0.9]", 2.0)
+            .expect_err("text-attached backwards anchor must fail closed");
+        assert!(matches!(
+            error,
+            MossTdSpeakerSegmentParseError::TimeWentBackwards { .. }
+        ));
+    }
 
     #[test]
     fn empty_stream_yields_no_segments() {

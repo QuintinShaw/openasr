@@ -3863,6 +3863,23 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         Ok(())
     }
 
+    /// Rebind this prepared persistent graph after another graph temporarily
+    /// used the shared scheduler. Scheduler allocations are graph-specific, so
+    /// a persistent graph must become the active allocation again before its
+    /// next compute.
+    pub(crate) fn restore_prepared_graph_allocation(&mut self) -> Result<(), GgmlCpuGraphError> {
+        let (Some(scheduler), Some(graph)) = (self.scheduler, self.prepared_graph) else {
+            return Ok(());
+        };
+        unsafe { ffi::ggml_backend_sched_reset(scheduler.as_ptr()) };
+        let allocated =
+            unsafe { ffi::ggml_backend_sched_alloc_graph(scheduler.as_ptr(), graph.as_ptr()) };
+        if !allocated {
+            return Err(GgmlCpuGraphError::BackendSchedulerGraphAllocationFailed);
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_f16_bits_slice(
         &mut self,
         tensor: GgmlCpuTensor<'a>,
