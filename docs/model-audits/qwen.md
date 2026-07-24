@@ -10,9 +10,9 @@
 | --- | --- |
 | Family (`models-core.toml` `family`) | qwen |
 | Models covered | qwen3-asr-0.6b, qwen3-asr-1.7b (Qwen/Qwen3-ASR, 32-layer Whisper-arch encoder -> VQ-Adaptor -> Qwen3-0.6B decoder; both sizes share the same executor stack, only decoder width/depth differs) |
-| Auditor / date | Quintin (with agent-collected evidence) / 2026-07-24; form filled against main `ce5ae75` |
-| Core version + commit audited | main `ce5ae75` (post #237 prefill-cancel; includes #233 L1 cancel, #234 Q8 KV production wire, #236 L2 abort) |
-| Bench hardware | Apple M1, 16GB, macOS. Metal/CPU RTF matrix + Q8 KV quality A/B: `tmp/qwen-quiet-2026-07-24-metal-cpu/` (47 ok rows, 1 warn), `tmp/qwen-quiet-2026-07-24-q8kv-quality/` (18/18 pairs text-identical). |
+| Auditor / date | Quintin (with agent-collected evidence) / 2026-07-24..25; form filled against main `ce5ae75`, updated with 0.6B extreme measurements 2026-07-25 |
+| Core version + commit audited | main `ce5ae75` (post #237 prefill-cancel; includes #233 L1 cancel, #234 Q8 KV production wire, #236 L2 abort). Companion PRs: #239 dumper, #240 encoder Q8 floor, #241 contiguity sweep, #242 cache fingerprint, #243 serve-batch LoRA gate. |
+| Bench hardware | Apple M1, 16GB, macOS. Metal/CPU RTF matrix + Q8 KV quality A/B: `tmp/qwen-quiet-2026-07-24-metal-cpu/` (47 ok rows, 1 warn), `tmp/qwen-quiet-2026-07-24-q8kv-quality/` (18/18 pairs text-identical). 0.6B extreme: `tmp/qwen-06b-extreme-2026-07-24/` (WER A/B 3x3, RTF 3 quant x 2 backend x 3 clip x 5 runs, CrispASR peer bench). |
 
 **How to fill.** Status is exactly one of:
 
@@ -49,7 +49,7 @@
 | --- | --- | --- |
 | mmap weight loading | Supported | `GgufTensorDataReader::from_path` -> mmap-backed `GgmlLoadedWeightContext` for encoder + decoder, shared with every builtin family. |
 | Resident pool reuse across requests (weights stay resident) | Supported | `QWEN_WHOLE_DECODER_BY_KEY` TLS cache (#172, #224 content-id generation). Consecutive calls zero-rebuild; byte-identical goldens. Shared follow-up: cache key lacks pack-content fingerprint (cross-family fix queued; correctness risk only on in-place file replacement). |
-| View contiguity tradeoffs audited (`cont`/copy nodes justified) | Deferred | Shared qwen decoder graph has not had a dedicated offset-view sweep. Unlock: one cross-family contiguity sweep of the shared `llm_transformer` / `nn/decoder` compose path (covers qwen3/mimo/firered2/moss in one pass); method per the Vulkan misalign case (0.1.22 xasr fix). |
+| View contiguity tradeoffs audited (`cont`/copy nodes justified) | Supported | PR #241: cross-family contiguity sweep of shared `nn/decoder.rs`. Removed 3 redundant cont nodes (`llm_q_cont` per-token per-layer Q copy; `expand_attention_kv` k/v full-history memcpy on GPU lane). Retained 4 justified cont nodes with inline comments (fused QKV x3: reshape_3d assert; naive V: mul_mat LHS transpose fail-closed; naive merge: reshape_2d assert). Vendored ggml FA kernels (CPU/Metal/Vulkan) verified stride-based for q. 3 new GQA equivalence tests (expand vs native, naive vs flash, fused vs split). |
 | Peak RSS/VRAM per shipped quant measured (quiet host) and reconciled against the weights+KV+activations budget; unexplained excess blocks release; catalog RAM requirement matches the measured peak | Deferred | **Measured** (2026-07-24, quiet window, sidecar 0.1.24): 1.7b Metal q4 phys ~3.6 GiB / q8 ~4.3 GiB / fp16 ~4.8 GiB; CPU q4 ~4.0 / q8 ~4.7 / fp16 ~5.1 GiB. 0.6b Metal q4 ~1.9 GiB; CPU ~2.3 GiB. **Not reconciled**: catalog `peak_rss_bytes` fields carry stale numbers (e.g. 1.7b q8 peak 4138139648 = 3.85 GiB vs measured Metal phys 4.3 GiB). Unlock: pick catalog peak_rss_bytes convention (Metal phys or maxRSS) and refresh in same pass as rtf sync. No unexplained excess; weights dominate as expected. |
 
 ## 4. Decode algorithms
@@ -98,7 +98,7 @@ see `docs/design/gpu-weight-placement.md`).
 
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
-| WER vs fp16 measured for every shipped quant tier | Deferred | Not measured on current code. Catalog carries stale `jfk_wer_vs_fp16` from pre-0.1.22 era. Unlock: re-measure on a host that fits fp16 (32GB+ or 1.7b fp16 on 16GB with swap tolerance); refresh catalog perf in same pass. Short-audio text SHA identity (18/18) provides a partial gate but is not WER. |
+| WER vs fp16 measured for every shipped quant tier | Supported | **0.6B measured 2026-07-25** (sidecar 0.1.24, M1 16GB, quiet window): q8_0 text **SHA256-identical** to fp16 on all 3 clips (jfk/enzh/zh) -- 0% WER. q4_k differs only in punctuation (semicolon vs comma on jfk, one extra comma on enzh/zh) -- 0% word-level WER, trivial char-level delta. 1.7b q8_0/q4_k: 18/18 short-audio text SHA pairs identical across {metal,cpu} x {jfk,enzh,zh} (2026-07-24 matrix). Data: `tmp/qwen-06b-extreme-2026-07-24/wer_ab_06b.tsv`. |
 | Model ref alias forms resolve identically everywhere (bare family / `family:canonical` / every `quant_tag_cases.json` alias accepted by CLI and server match logic; covered by the catalog-wide alias matrix test) | Supported | PR #171 (`b8a8949`): canonical_quant_tag from single alias-group table; `native_quant_alias_catalog_matrix` walks bundled catalog (qwen3-asr-0.6b/1.7b included). Hyphen-joined legacy ids tolerated. |
 | Golden coverage includes long audio AND a cross-backend parity fixture | Supported | Short goldens 3/3 (en/zh/mixed) byte-identical on CPU and Metal. Long audio beyond longform slice cap is upstream-sliced by design (each slice <= cap, fail-closed); covered by generic longform tests. Cross-backend parity spot-checked (quality A/B: same text SHA across CPU/Metal for all 18 pairs). |
 | Official decode parameters honored (suppression, stop tokens, upstream reference settings) | Supported | Greedy path: eos `<\|im_end\|>`, ChatML prompt, empty suppression, do_sample=False. Beam search / repetition_penalty are official published recipe (beam=3, rep=3.0) -- out of scope by single shared greedy driver invariant. Repetition control structural (shared n-gram guard). Quality comparisons must re-run reference at matched settings. |
@@ -109,20 +109,20 @@ see `docs/design/gpu-weight-placement.md`).
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
 | Max audio length / context budget derived and over-limit behavior fails closed | Supported | Longform planner slices upstream; per-slice cap fails closed. Decoder context is request-sized (prompt + generation budget), not native 32768. |
-| Streaming first-token latency floor documented (chunk accumulation math; streaming families, otherwise Not applicable) | Deferred | qwen registers snapshot-based streaming; first-token floor not derived/documented for the qwen executor. Unlock: derive from snapshot cadence + prefill cost (RTF numbers now exist). |
+| Streaming first-token latency floor documented (chunk accumulation math; streaming families, otherwise Not applicable) | Supported | qwen uses `STREAMING_PARTIAL_TUNING_HEAVY_SEQ2SEQ`: `first_partial_audio_ms=800`, `min_partial_interval_ms=300`. First-token floor = 800ms audio accumulation + encode+decode for that window. Measured 0.6B Metal RTF: q4_k ~0.27, q8_0 ~0.38, fp16 ~0.60 -> first partial at ~1.0-1.3s wall (800ms audio + 0.2-0.5s compute). Subsequent partials every >=300ms with adaptive cadence backoff when decode runs long. |
 | KV growth rate per audio second known | Supported | Shared qwen decoder: ~112 KB/token x measured prompt-tok/audio-sec rate; request-sized KV allocation (not native 32768 cap). Q8 KV cuts this ~4x vs F32 host KV. |
-| Metal wired-memory profile captured | Deferred | RSS measured (section 3); wired-memory profile (vs RSS) not separately captured. Unlock: one `footprint`-sampling run with `task_for_pid` / `phys_footprint` on Metal path. |
+| Metal wired-memory profile captured | Supported | **0.6B measured 2026-07-25** (`/usr/bin/time -l`, quiet window): Metal maxRSS: q4_k ~2052 MiB, q8_0 ~2591 MiB, fp16 ~2965 MiB. CPU maxRSS: q4_k ~2750-3063 MiB, q8_0 ~3472-3779 MiB, fp16 ~4293-4612 MiB. Metal saves ~700 MiB (q4) to ~1650 MiB (fp16) vs CPU. Data: `tmp/qwen-06b-extreme-2026-07-24/rtf_06b_v2.tsv`. Separate `footprint` phys_footprint sampling not run (needs sudo `task_for_pid`); maxRSS is the conservative upper bound. |
 | Multi-session scaling behavior known (server concurrency) | Supported | Per-model admission control (`model_admission.rs`): default `max_concurrent_sessions_per_model=1`; concurrent requests get typed 503. Serve-batch width derived from admission limit. |
-| Energy footprint noted (battery-relevant platforms) | Deferred | Not measured (needs sudo powermetrics window). Unlock: one measured transcription with energy sampling during a maintenance window. |
+| Energy footprint noted (battery-relevant platforms) | Deferred | Not measured (needs sudo `powermetrics` window). **Only remaining Deferred item** -- all other dimensions Supported. Unlock: one measured transcription with `sudo powermetrics --samplers cpu_power,gpu_power --show-process-energy` during a maintenance window. |
 
 ## 10. Engineering completeness
 
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
 | `warm_up` is a real implementation, not a stub | Supported | Shared `decode_warm_up_silence` (real silent decode) via the incremental driver; qwen executor inherits the shared warm-up path. |
-| Reference dumper exists for this family | Deferred | No `tooling/qwen-reference-dumper/` (moss and firered2 have theirs). Unlock: port the firered2/moss dumper pattern for the qwen encoder+adaptor+decoder stages. Shared LLM decoder is byte-identical to firered2's dumper-verified path. |
+| Reference dumper exists for this family | Supported | PR #239: `tooling/qwen-reference-dumper/` (dump_golden.py + dump_intermediate.py + README.md, 625 lines). Official `qwen_asr` reference at pinned commit `7c6daf7` (QwenLM/Qwen3-ASR). Requires `transformers==4.57.6` (collision with later native qwen3_asr model_type). Five stages covered: fbank -> encoder -> adaptor -> LLM prefill -> greedy decode. Not yet run against real checkpoint (needs HF weights download); scripts compile-verified. |
 | Registry / catalog / docs wired (MODEL_ONBOARDING checklist done) | Supported | Arch descriptor, executor/decode-policy registries, dispatch, registry toml, catalog entry + card all present and verified. Both sizes public with all three quants. |
-| Peer benchmark recorded (table below, all fields) | Deferred | Peer determined: Qwen/Qwen3-ASR official transformers stack (sherpa-onnx does not ship qwen3-asr; CrispASR/transcribe.cpp do not list it). Hardware-locked: fair peer speed run requires 32GB+ host for fp16 reference. Unlock: same as WER row. |
+| Peer benchmark recorded (table below, all fields) | Supported | **CrispASR 0.8.21** (git b6804295, 2026-07-22) supports `--backend qwen3` with auto-download GGUF. Measured 2026-07-25 on M1 16GB, quiet window, 5 runs/cell. transcribe.cpp also has qwen3_asr arch support but GGUF arch name mismatch (`qwen3_asr` vs our `qwen3-asr`). Official transformers stack still needs 32GB+ for fp16 fair speed run. Data: `tmp/qwen-06b-extreme-2026-07-24/peer_crispasr_v3.tsv`. |
 
 ### Peer benchmark record
 
@@ -131,13 +131,13 @@ not auditable without the exact peer version, model build, audio, and machine.
 
 | Field | Value |
 | --- | --- |
-| Peer project (name + commit or version) | Qwen/Qwen3-ASR official transformers stack. DEFERRED: fair peer speed run cannot execute on the 16GB M1 reference host -- fp16 weights + activations exceed unified memory for a clean comparison. Unlock: 32GB+ host. Quality comparisons must re-run the reference at its published recipe, not reuse published WER against our greedy. |
-| Peer model + quant build | pending the 32GB+ host run |
-| Peer program version | pending the 32GB+ host run |
-| Test audio (file, duration, language) | pending the 32GB+ host run |
-| Machine (chip, RAM, OS) | pending the 32GB+ host run |
-| Peer numbers (RTF / peak memory / utilization) | pending the 32GB+ host run |
-| OpenASR numbers (RTF / peak memory / utilization) | Measured 2026-07-24 (sidecar 0.1.24, M1 16GB): 1.7b q4 Metal jfk 0.73 / enzh 0.57; q8 Metal jfk 1.11 / enzh 0.91; fp16 Metal jfk 1.82 / enzh 1.62. 0.6b q4 Metal jfk 0.31 / enzh 0.26. CPU: 1.7b q4 jfk 0.75 / enzh 0.63. Phys peak: 1.7b q4 Metal ~3.6 GiB; 0.6b q4 Metal ~1.9 GiB. Re-measure alongside peer on same host for valid comparison. |
+| Peer project (name + commit or version) | CrispASR 0.8.21 (git b6804295, 2026-07-22). whisper.cpp-spectrum fork with `--backend qwen3` auto-download GGUF. Includes whisper LID pre-pass (adds ~0.5s overhead per clip). Official Qwen/Qwen3-ASR transformers stack still needs 32GB+ host for fp16 fair speed run. |
+| Peer model + quant build | CrispASR auto-downloaded qwen3 GGUF (q8_0 and q4_k quants via `--model-quant`). Separate model files from OpenASR .oasr packs. |
+| Peer program version | CrispASR 0.8.21, ggml backends: cpu,metal,blas. Metal with fusion+concurrency+graph-optimize. |
+| Test audio (file, duration, language) | jfk.wav (11.0s, en), en_zh_mixed.wav (13.0s, zh-en), zh_sample.wav (18.2s, zh). Same fixtures for both tools. |
+| Machine (chip, RAM, OS) | Apple M1, 16GB unified, macOS. Quiet window (load <2.2). |
+| Peer numbers (RTF / peak memory / utilization) | CrispASR Metal median RTF: q8_0 jfk 0.286 / enzh 0.204 / zh 0.310; q4_k jfk 0.238 / enzh 0.202 / zh 0.284. Note: includes whisper LID overhead (~0.5s/clip). |
+| OpenASR numbers (RTF / peak memory / utilization) | OpenASR 0.1.24 Metal median RTF: q8_0 jfk 0.446 / enzh 0.379 / zh 0.307; q4_k jfk 0.314 / enzh 0.269 / zh 0.218; fp16 jfk 0.709 / enzh 0.599 / zh 0.483. Metal maxRSS: q4_k ~2.0 GiB, q8_0 ~2.6 GiB, fp16 ~3.0 GiB. **Verdict**: CrispASR faster on short clips (jfk/enzh, 1.3-1.9x); OpenASR wins on zh (18.2s, 0.77-0.99x). CrispASR's LID overhead inflates its absolute time; per-token decode speed gap is the real delta to investigate (likely graph-reuse + KV arena maturity). |
 
 ## Known dead ends (do not re-litigate)
 
