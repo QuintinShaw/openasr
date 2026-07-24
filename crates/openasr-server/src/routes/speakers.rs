@@ -1,4 +1,9 @@
 //! Operator-only speaker voice-match profile routes.
+//!
+//! Compatibility surface over Voice ID v2. List/create/rename/delete project
+//! onto the SQLite person store; reenroll stays rejected because multi-sample
+//! persons must add samples via `/v1/voice-id`. After v1 migration is DONE the
+//! legacy `voiceprints.json` file is never written.
 
 use serde::{Deserialize, Serialize};
 
@@ -32,23 +37,20 @@ pub(crate) struct RenameSpeakerRequest {
 pub(crate) async fn list_speakers(
     Extension(distribution): Extension<DistributionContext>,
 ) -> Result<Json<SpeakerListResponse>, ApiError> {
-    let path = speaker_store_path(&distribution)?;
-    let store =
-        openasr_core::diarize::enrollment::VoiceprintStore::load(&path).map_err(speaker_error)?;
-    let active = openasr_core::diarize::embed::shared_embedder_identity().cloned();
-    let data = store
-        .profiles
-        .iter()
-        .map(|profile| SpeakerProfileView {
-            id: profile.id.clone(),
-            name: profile.name.clone(),
-            created_at: profile.created_at.clone(),
-            sample_seconds: profile.sample_seconds,
-            compatible: active
-                .as_ref()
-                .is_some_and(|identity| profile.is_compatible_with(identity)),
-        })
-        .collect();
+    let store = open_voice_id_store(&distribution)?;
+    let active = active_space();
+    let persons = store
+        .list_persons(active.as_ref())
+        .map_err(voice_id_store_error)?;
+    let mut data = Vec::with_capacity(persons.len());
+    for person in persons {
+        let person_id = openasr_core::diarize::voice_id::PersonId::parse(&person.person_id)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        let public_id = store
+            .preferred_public_id(&person_id)
+            .map_err(voice_id_store_error)?;
+        data.push(person_to_view(&person, public_id));
+    }
     Ok(Json(SpeakerListResponse { data }))
 }
 
@@ -57,18 +59,45 @@ pub(crate) async fn create_speaker(
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<(StatusCode, Json<SpeakerProfileView>), ApiError> {
     let parsed = parse_speaker_enrollment_multipart(multipart, true).await?;
-    let path = speaker_store_path(&distribution)?;
-    let profile = openasr_core::diarize::enrollment::create_profile_from_wav_file(
-        parsed.wav_path.as_ref(),
-        parsed.name.expect("name is required for create"),
+    let pcm = load_enrollment_wav(parsed.wav_path.as_ref())?;
+    // Quality-gate before pack lookup so short/silent clips surface the more
+    // specific audio error even when the embedder pack is not installed.
+    openasr_core::diarize::voice_id::assess_enrollment_quality(&pcm)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let store = open_voice_id_store(&distribution)?;
+    let (embedder, identity) = active_embedder_and_identity()?;
+    let name = parsed.name.expect("name is required for create");
+    let person = openasr_core::diarize::voice_id::enroll_person_from_clips(
+        &store,
+        name,
+        openasr_core::diarize::voice_id::ConsentRecord {
+            granted_at: openasr_core::diarize::voice_id::timestamp_now(),
+            notice_version: "legacy-speakers-api-v1".into(),
+            capture_method: "speakers-api".into(),
+        },
+        vec![openasr_core::diarize::voice_id::EnrollmentClip {
+            samples: pcm,
+            capture_context: openasr_core::diarize::voice_id::CaptureContext {
+                device_class: "unknown".into(),
+                input_route: "speakers-api".into(),
+                environment_hint: None,
+                sample_label: Some("speakers-api enrollment".into()),
+            },
+        }],
+        embedder,
+        &identity,
         None,
     )
-    .map_err(enrollment_error)?;
-    let mut store =
-        openasr_core::diarize::enrollment::VoiceprintStore::load(&path).map_err(speaker_error)?;
-    store.add_profile(profile.clone());
-    store.save(&path).map_err(speaker_error)?;
-    Ok((StatusCode::CREATED, Json(profile_view(&profile, true))))
+    .map_err(voice_id_service_error)?;
+    let person_id = openasr_core::diarize::voice_id::PersonId::parse(&person.person_id)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let public_id = store
+        .preferred_public_id(&person_id)
+        .map_err(voice_id_store_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(person_to_view(&person, public_id)),
+    ))
 }
 
 pub(crate) async fn rename_speaker(
@@ -76,22 +105,35 @@ pub(crate) async fn rename_speaker(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<RenameSpeakerRequest>,
 ) -> Result<Json<SpeakerProfileView>, ApiError> {
-    let path = speaker_store_path(&distribution)?;
-    let profile =
-        openasr_core::diarize::enrollment::rename_profile_in_store(&path, &id, request.name)
-            .map_err(speaker_error)?;
-    Ok(Json(profile_view_with_active_compatibility(&profile)))
+    let store = open_voice_id_store(&distribution)?;
+    let person_id = store
+        .resolve_person_ref(&id)
+        .map_err(voice_id_store_error)?;
+    let person = store
+        .rename_person(&person_id, request.name, None)
+        .map_err(voice_id_store_error)?;
+    let public_id = store
+        .preferred_public_id(&person_id)
+        .map_err(voice_id_store_error)?;
+    Ok(Json(person_to_view(&person, public_id)))
 }
 
 pub(crate) async fn delete_speaker(
     Extension(distribution): Extension<DistributionContext>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<SpeakerDeleteResponse>, ApiError> {
-    let path = speaker_store_path(&distribution)?;
-    let removed = openasr_core::diarize::enrollment::delete_profile_from_store(&path, &id)
-        .map_err(speaker_error)?;
+    let store = open_voice_id_store(&distribution)?;
+    let person_id = store
+        .resolve_person_ref(&id)
+        .map_err(voice_id_store_error)?;
+    let public_id = store
+        .preferred_public_id(&person_id)
+        .map_err(voice_id_store_error)?;
+    store
+        .delete_person(&person_id, None, "speakers_api_delete")
+        .map_err(voice_id_store_error)?;
     Ok(Json(SpeakerDeleteResponse {
-        id: removed.id,
+        id: public_id,
         deleted: true,
     }))
 }
@@ -156,62 +198,97 @@ async fn parse_speaker_enrollment_multipart(
     Ok(ParsedSpeakerEnrollment { name, wav_path })
 }
 
-fn speaker_store_path(distribution: &DistributionContext) -> Result<PathBuf, ApiError> {
-    if let Ok(path) = std::env::var(openasr_core::diarize::enrollment::VOICEPRINT_STORE_ENV) {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
-    }
-    Ok(distribution
-        .openasr_home()?
-        .join("diarize")
-        .join("voiceprints.json"))
+fn open_voice_id_store(
+    distribution: &DistributionContext,
+) -> Result<openasr_core::diarize::voice_id::VoiceIdStore, ApiError> {
+    let home = distribution.openasr_home()?;
+    openasr_core::diarize::voice_id::open_store_with_v1_migration(home)
+        .map_err(|e| ApiError::JobStore(format!("voice-id store open/migration failed: {e}")))
 }
 
-fn profile_view_with_active_compatibility(
-    profile: &openasr_core::diarize::enrollment::SpeakerProfile,
-) -> SpeakerProfileView {
-    let compatible = openasr_core::diarize::embed::shared_embedder_identity()
-        .is_some_and(|identity| profile.is_compatible_with(identity));
-    profile_view(profile, compatible)
+fn active_space() -> Option<openasr_core::diarize::voice_id::EmbeddingSpace> {
+    let identity = openasr_core::diarize::embed::shared_embedder_identity()?;
+    let embedder = openasr_core::diarize::embed::shared_embedder()?;
+    Some(
+        openasr_core::diarize::voice_id::EmbeddingSpace::for_active_embedder(
+            identity,
+            embedder.calibration_profile(),
+        ),
+    )
 }
 
-fn profile_view(
-    profile: &openasr_core::diarize::enrollment::SpeakerProfile,
-    compatible: bool,
+fn active_embedder_and_identity() -> Result<
+    (
+        &'static dyn openasr_core::diarize::embed::SpeakerEmbedder,
+        openasr_core::diarize::embed::SpeakerEmbedderIdentity,
+    ),
+    ApiError,
+> {
+    let embedder = openasr_core::diarize::embed::shared_embedder().ok_or_else(|| {
+        ApiError::BadRequest(
+            "creating a voice id requires the active speaker-embedder pack; install the pack first"
+                .into(),
+        )
+    })?;
+    let identity = openasr_core::diarize::embed::shared_embedder_identity()
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::BadRequest(
+                "creating a voice id requires the active speaker-embedder pack; install the pack first"
+                    .into(),
+            )
+        })?;
+    Ok((embedder, identity))
+}
+
+fn load_enrollment_wav(path: &std::path::Path) -> Result<Vec<f32>, ApiError> {
+    openasr_core::load_native_wav_16khz_mono_f32_v0(
+        path,
+        "speaker enrollment",
+        path.to_str().unwrap_or("speaker enrollment input"),
+    )
+    .map_err(|e| ApiError::BadRequest(e.to_string()))
+}
+
+fn person_to_view(
+    person: &openasr_core::diarize::voice_id::PersonView,
+    public_id: String,
 ) -> SpeakerProfileView {
+    let sample_seconds = person
+        .samples
+        .iter()
+        .map(|sample| sample.quality.speech_seconds)
+        .sum::<f32>();
     SpeakerProfileView {
-        id: profile.id.clone(),
-        name: profile.name.clone(),
-        created_at: profile.created_at.clone(),
-        sample_seconds: profile.sample_seconds,
-        compatible,
+        id: public_id,
+        name: person.display_name.clone(),
+        created_at: person.created_at.clone(),
+        sample_seconds,
+        // Compatible with the active embedder when the person does not need
+        // reenrollment for the currently loaded matching space.
+        compatible: !person.needs_reenrollment,
     }
 }
 
-fn enrollment_error(error: openasr_core::diarize::enrollment::SpeakerEnrollmentError) -> ApiError {
-    use openasr_core::diarize::enrollment::SpeakerEnrollmentError;
+fn voice_id_store_error(error: openasr_core::diarize::voice_id::VoiceIdStoreError) -> ApiError {
+    use openasr_core::diarize::voice_id::VoiceIdStoreError;
     match error {
-        SpeakerEnrollmentError::Store(error) => speaker_error(error),
-        other => ApiError::BadRequest(other.to_string()),
-    }
-}
-
-fn speaker_error(error: openasr_core::diarize::enrollment::VoiceprintStoreError) -> ApiError {
-    use openasr_core::diarize::enrollment::VoiceprintStoreError;
-    match error {
-        VoiceprintStoreError::NotFound(message) => ApiError::NotFound(message),
-        VoiceprintStoreError::EmptyName
-        | VoiceprintStoreError::InvalidId(_)
-        | VoiceprintStoreError::InvalidMatchSimilarity
-        | VoiceprintStoreError::UnsupportedVersion { .. } => {
-            ApiError::BadRequest(error.to_string())
+        VoiceIdStoreError::NotFound(message) | VoiceIdStoreError::SampleNotFound(message) => {
+            ApiError::NotFound(message)
         }
-        VoiceprintStoreError::Read { .. }
-        | VoiceprintStoreError::Parse { .. }
-        | VoiceprintStoreError::CreateDir { .. }
-        | VoiceprintStoreError::Write { .. }
-        | VoiceprintStoreError::Serialize(_) => ApiError::JobStore(error.to_string()),
+        VoiceIdStoreError::RevisionConflict { .. } => ApiError::Conflict(error.to_string()),
+        VoiceIdStoreError::EmptyName
+        | VoiceIdStoreError::InvalidId(_)
+        | VoiceIdStoreError::NotActive(_)
+        | VoiceIdStoreError::Migration(_) => ApiError::BadRequest(error.to_string()),
+        other => ApiError::JobStore(other.to_string()),
+    }
+}
+
+fn voice_id_service_error(error: openasr_core::diarize::voice_id::VoiceIdServiceError) -> ApiError {
+    use openasr_core::diarize::voice_id::VoiceIdServiceError;
+    match error {
+        VoiceIdServiceError::Store(error) => voice_id_store_error(error),
+        other => ApiError::BadRequest(other.to_string()),
     }
 }

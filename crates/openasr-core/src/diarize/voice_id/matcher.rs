@@ -75,22 +75,42 @@ impl PersonMatcher {
         }
     }
 
-    /// Best person match under accept threshold + person-level margin.
+    /// Best person match under the matcher's default accept threshold + margin.
     ///
     /// Returns `None` (Unknown) when:
     /// - no candidates
     /// - best score < accept threshold
     /// - a runner-up person exists and margin is not met
     pub fn best_match(&self, query: &SpeakerEmbedding) -> Option<PersonMatch> {
+        self.best_match_with_gates(query, self.accept_threshold, self.margin, 0.0)
+    }
+
+    /// Best person match with caller-supplied gates (batch vs streaming anchors).
+    ///
+    /// `threshold_tolerance` lowers the accept floor (used by native streaming
+    /// once a person already owns a session anchor). Ranking stays per-person:
+    /// a person's own prototypes never become their runner-up.
+    pub fn best_match_with_gates(
+        &self,
+        query: &SpeakerEmbedding,
+        accept_threshold: f32,
+        margin: f32,
+        threshold_tolerance: f32,
+    ) -> Option<PersonMatch> {
         if !self.space.is_matchable() || query.dim() != self.space.dimension {
             return None;
         }
+
+        let accept_threshold = accept_threshold.clamp(0.0, 1.0);
+        let margin = margin.max(0.0);
+        let threshold_tolerance = threshold_tolerance.max(0.0);
+        let effective_threshold = (accept_threshold - threshold_tolerance).clamp(0.0, 1.0);
 
         let mut best: Option<PersonMatch> = None;
         let mut runner_up: Option<f32> = None;
 
         for person in &self.persons {
-            let Some(person_match) = self.score_person(person, query) else {
+            let Some(person_match) = self.score_person(person, query, accept_threshold) else {
                 continue;
             };
             match &best {
@@ -114,22 +134,40 @@ impl PersonMatcher {
         }
 
         let mut best = best?;
-        if best.score < self.accept_threshold {
+        if best.score < effective_threshold {
             return None;
         }
         if let Some(second) = runner_up {
             best.runner_up_score = Some(second);
-            if best.score - second < self.margin {
+            if best.score - second < margin {
                 return None;
             }
         }
         Some(best)
     }
 
+    /// Highest person score and the default accept threshold (debug / logging).
+    pub fn best_score_and_threshold(&self, query: &SpeakerEmbedding) -> Option<(f32, f32)> {
+        if !self.space.is_matchable() || query.dim() != self.space.dimension {
+            return None;
+        }
+        let mut best: Option<f32> = None;
+        for person in &self.persons {
+            let Some(person_match) = self.score_person(person, query, self.accept_threshold) else {
+                continue;
+            };
+            best = Some(best.map_or(person_match.score, |current| {
+                current.max(person_match.score)
+            }));
+        }
+        best.map(|score| (score, self.accept_threshold))
+    }
+
     fn score_person(
         &self,
         person: &MatcherPerson,
         query: &SpeakerEmbedding,
+        accept_threshold: f32,
     ) -> Option<PersonMatch> {
         let mut best: Option<(f32, &PersonPrototype)> = None;
         for prototype in &person.prototypes {
@@ -150,7 +188,7 @@ impl PersonMatcher {
             person_id: person.person_id.clone(),
             display_name: person.display_name.clone(),
             score,
-            threshold: self.accept_threshold,
+            threshold: accept_threshold,
             runner_up_score: None,
             matched_prototype_id: prototype.prototype_id.clone(),
             matched_sample_id: prototype.medoid_sample_id.clone(),

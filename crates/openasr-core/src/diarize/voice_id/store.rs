@@ -508,72 +508,79 @@ impl VoiceIdStore {
             .optional()?)
     }
 
+    /// Resolve a caller-supplied id that may be a v2 `person_*` id or a legacy
+    /// `vp_*` alias from the v1 JSON store.
+    pub fn resolve_person_ref(&self, raw: &str) -> Result<PersonId, VoiceIdStoreError> {
+        if let Ok(person_id) = PersonId::parse(raw) {
+            // Confirm the person still exists and is not deleted.
+            let _ = self.get_person(&person_id, None)?;
+            return Ok(person_id);
+        }
+        if let Some(person_id) = self.resolve_legacy_profile_id(raw)? {
+            return Ok(person_id);
+        }
+        Err(VoiceIdStoreError::NotFound(raw.to_string()))
+    }
+
+    /// Prefer a legacy alias when one exists so older clients keep seeing `vp_*`.
+    pub fn preferred_public_id(&self, person_id: &PersonId) -> Result<String, VoiceIdStoreError> {
+        let conn = self.connection()?;
+        let legacy = conn
+            .query_row(
+                "SELECT legacy_profile_id FROM legacy_profile_aliases
+                 WHERE person_id = ?1
+                 ORDER BY legacy_profile_id ASC
+                 LIMIT 1",
+                params![person_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(legacy.unwrap_or_else(|| person_id.as_str().to_string()))
+    }
+
     /// Low-level import helper used by migration: insert a fully built person
-    /// graph in one IMMEDIATE transaction.
+    /// graph in one IMMEDIATE transaction. Skips when `legacy_profile_id` is
+    /// already present so partial prior runs stay idempotent.
     pub fn import_person_graph(
         &self,
         person: &Person,
         samples: &[(EnrollmentSample, SampleEmbedding)],
         legacy_profile_id: Option<&str>,
-    ) -> Result<(), VoiceIdStoreError> {
+    ) -> Result<bool, VoiceIdStoreError> {
         let conn = self.connection()?;
         immediate_transaction(&conn, || {
+            import_person_graph_on_conn(&conn, person, samples, legacy_profile_id)
+        })
+    }
+
+    /// Import many migrated persons and advance the migration ledger in the
+    /// same IMMEDIATE transaction. Each entry is skipped when its legacy id is
+    /// already aliased, so a crash mid-import followed by retry cannot create
+    /// duplicate Alice persons.
+    pub fn import_migrated_profiles_atomic(
+        &self,
+        imports: &[(
+            Person,
+            Vec<(EnrollmentSample, SampleEmbedding)>,
+            String, /* legacy_profile_id */
+        )],
+        ledger_key: &str,
+        ledger_value: &str,
+    ) -> Result<usize, VoiceIdStoreError> {
+        let conn = self.connection()?;
+        immediate_transaction(&conn, || {
+            let mut imported = 0usize;
+            for (person, samples, legacy_id) in imports {
+                if import_person_graph_on_conn(&conn, person, samples, Some(legacy_id.as_str()))? {
+                    imported += 1;
+                }
+            }
             conn.execute(
-                "INSERT INTO persons(person_id, display_name, status, created_at, updated_at, revision, color_preference)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    person.person_id.as_str(),
-                    person.display_name,
-                    person.status.as_str(),
-                    person.created_at,
-                    person.updated_at,
-                    person.revision as i64,
-                    person.color_preference,
-                ],
+                "INSERT INTO voice_id_meta(key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![ledger_key, ledger_value],
             )?;
-            for (sample, embedding) in samples {
-                let consent_json = serde_json::to_string(&sample.consent)
-                    .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
-                let quality_json = serde_json::to_string(&sample.quality)
-                    .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
-                let context_json = serde_json::to_string(&sample.capture_context)
-                    .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
-                conn.execute(
-                    "INSERT INTO enrollment_samples(
-                        sample_id, person_id, created_at, consent_json, quality_json, context_json
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        sample.sample_id.as_str(),
-                        sample.person_id.as_str(),
-                        sample.created_at,
-                        consent_json,
-                        quality_json,
-                        context_json
-                    ],
-                )?;
-                upsert_space(&conn, &embedding.space)?;
-                let blob = embedding_to_blob(&embedding.embedding)?;
-                conn.execute(
-                    "INSERT INTO sample_embeddings(sample_id, space_id, embedding_blob, embedding_dim)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        sample.sample_id.as_str(),
-                        embedding.space.space_id,
-                        blob,
-                        embedding.embedding.dim() as i64
-                    ],
-                )?;
-            }
-            rebuild_prototypes_for_person(&conn, &person.person_id)?;
-            if let Some(legacy) = legacy_profile_id {
-                conn.execute(
-                    "INSERT OR REPLACE INTO legacy_profile_aliases(legacy_profile_id, person_id)
-                     VALUES (?1, ?2)",
-                    params![legacy, person.person_id.as_str()],
-                )?;
-            }
-            bump_global_revision(&conn)?;
-            Ok(())
+            Ok(imported)
         })
     }
 
@@ -991,21 +998,27 @@ fn load_sample_views(
             )?
             .query_map(params![sample_id], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
+        // needs_reenrollment is relative to the active matching space when one
+        // is supplied: a sample that is matchable in some other pack/space still
+        // needs reenrollment for the currently loaded embedder.
         let mut space_compatible = false;
         let mut needs_reenrollment = true;
         for space_json in spaces {
             let space: EmbeddingSpace = serde_json::from_str(&space_json)
                 .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
-            if space.is_matchable() {
-                needs_reenrollment = false;
-            }
-            if let Some(active) = active_space {
-                if space.is_comparable_to(active) {
-                    space_compatible = true;
-                    needs_reenrollment = false;
+            match active_space {
+                Some(active) => {
+                    if space.is_comparable_to(active) {
+                        space_compatible = true;
+                        needs_reenrollment = false;
+                    }
                 }
-            } else if space.is_matchable() {
-                space_compatible = true;
+                None => {
+                    if space.is_matchable() {
+                        space_compatible = true;
+                        needs_reenrollment = false;
+                    }
+                }
             }
         }
         out.push(SampleView {
@@ -1019,6 +1032,87 @@ fn load_sample_views(
         });
     }
     Ok(out)
+}
+
+/// Insert one migrated person graph on an open connection. Returns `false` when
+/// `legacy_profile_id` is already aliased (idempotent skip). Callers must hold
+/// an open IMMEDIATE transaction when batching with the migration ledger.
+fn import_person_graph_on_conn(
+    conn: &Connection,
+    person: &Person,
+    samples: &[(EnrollmentSample, SampleEmbedding)],
+    legacy_profile_id: Option<&str>,
+) -> Result<bool, VoiceIdStoreError> {
+    if let Some(legacy) = legacy_profile_id {
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM legacy_profile_aliases WHERE legacy_profile_id = ?1",
+                params![legacy],
+                |_row| Ok(1i32),
+            )
+            .optional()?
+            .is_some();
+        if exists {
+            return Ok(false);
+        }
+    }
+
+    conn.execute(
+        "INSERT INTO persons(person_id, display_name, status, created_at, updated_at, revision, color_preference)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            person.person_id.as_str(),
+            person.display_name,
+            person.status.as_str(),
+            person.created_at,
+            person.updated_at,
+            person.revision as i64,
+            person.color_preference,
+        ],
+    )?;
+    for (sample, embedding) in samples {
+        let consent_json = serde_json::to_string(&sample.consent)
+            .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
+        let quality_json = serde_json::to_string(&sample.quality)
+            .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
+        let context_json = serde_json::to_string(&sample.capture_context)
+            .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO enrollment_samples(
+                sample_id, person_id, created_at, consent_json, quality_json, context_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                sample.sample_id.as_str(),
+                sample.person_id.as_str(),
+                sample.created_at,
+                consent_json,
+                quality_json,
+                context_json
+            ],
+        )?;
+        upsert_space(conn, &embedding.space)?;
+        let blob = embedding_to_blob(&embedding.embedding)?;
+        conn.execute(
+            "INSERT INTO sample_embeddings(sample_id, space_id, embedding_blob, embedding_dim)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                sample.sample_id.as_str(),
+                embedding.space.space_id,
+                blob,
+                embedding.embedding.dim() as i64
+            ],
+        )?;
+    }
+    rebuild_prototypes_for_person(conn, &person.person_id)?;
+    if let Some(legacy) = legacy_profile_id {
+        conn.execute(
+            "INSERT INTO legacy_profile_aliases(legacy_profile_id, person_id)
+             VALUES (?1, ?2)",
+            params![legacy, person.person_id.as_str()],
+        )?;
+    }
+    bump_global_revision(conn)?;
+    Ok(true)
 }
 
 fn upsert_space(conn: &Connection, space: &EmbeddingSpace) -> Result<(), VoiceIdStoreError> {
@@ -1368,6 +1462,44 @@ mod tests {
             .unwrap()
             .with_scope(&CandidateScope::Explicit(vec![]));
         assert!(matcher.is_empty());
+    }
+
+    #[test]
+    fn needs_reenrollment_is_relative_to_active_space() {
+        let dir = tempdir().unwrap();
+        let store = VoiceIdStore::open(dir.path());
+        let space_a = test_space("sha256:space-a");
+        let space_b = test_space("sha256:space-b");
+        let person = store
+            .enroll_person(
+                "SpaceBound",
+                consent(),
+                vec![sample_input(&space_a, vec![1.0, 0.0])],
+                None,
+            )
+            .unwrap();
+
+        let with_a = store
+            .get_person(&PersonId::parse(&person.person_id).unwrap(), Some(&space_a))
+            .unwrap();
+        assert!(
+            !with_a.needs_reenrollment,
+            "matching active space must not require reenrollment"
+        );
+        assert!(with_a.samples.iter().all(|s| s.space_compatible));
+
+        let with_b = store
+            .get_person(&PersonId::parse(&person.person_id).unwrap(), Some(&space_b))
+            .unwrap();
+        assert!(
+            with_b.needs_reenrollment,
+            "incompatible active space must require reenrollment"
+        );
+        assert!(with_b.samples.iter().all(|s| !s.space_compatible));
+
+        let listed = store.list_persons(Some(&space_b)).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].needs_reenrollment);
     }
 
     #[test]

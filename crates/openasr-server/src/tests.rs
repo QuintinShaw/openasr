@@ -1437,6 +1437,22 @@ fn operator_only_paths_cover_history_config_and_model_mutations() {
     // (which requires already knowing the job id), so it stays operator-only
     // even though the underlying handler is a GET.
     assert!(is_operator_only_path(&Method::GET, "/v1/models/pulls"));
+    assert!(is_operator_only_path(&Method::GET, "/v1/speakers"));
+    assert!(is_operator_only_path(&Method::POST, "/v1/speakers"));
+    assert!(is_operator_only_path(
+        &Method::PATCH,
+        "/v1/speakers/vp_aaaaaaaaaaaaaaaa"
+    ));
+    assert!(is_operator_only_path(&Method::GET, "/v1/voice-id/persons"));
+    assert!(is_operator_only_path(&Method::POST, "/v1/voice-id/persons"));
+    assert!(is_operator_only_path(
+        &Method::PATCH,
+        "/v1/voice-id/persons/person_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ));
+    assert!(is_operator_only_path(
+        &Method::DELETE,
+        "/v1/voice-id/samples/sample_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ));
     // Open to paired compute clients:
     assert!(!is_operator_only_path(&Method::GET, "/v1/models/default"));
     assert!(!is_operator_only_path(&Method::GET, "/v1/models"));

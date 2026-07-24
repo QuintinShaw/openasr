@@ -9,11 +9,15 @@ use thiserror::Error;
 
 use super::domain::{CaptureContext, ConsentRecord, PersonView};
 use super::ids::{PersonId, SampleId};
+use super::matcher::PersonMatcher;
+use super::migrate::open_store_with_v1_migration;
 use super::quality::{QualityError, assess_enrollment_quality};
 use super::space::EmbeddingSpace;
 use super::store::{NewSampleInput, VoiceIdStore, VoiceIdStoreError};
 use crate::diarize::contract::SpeakerEmbedding;
-use crate::diarize::embed::{EmbedError, SpeakerEmbedder, SpeakerEmbedderIdentity};
+use crate::diarize::embed::{
+    EmbedError, SpeakerEmbedder, SpeakerEmbedderIdentity, shared_embedder, shared_embedder_identity,
+};
 
 #[derive(Debug, Error)]
 pub enum VoiceIdServiceError {
@@ -41,6 +45,44 @@ const MAX_INITIAL_SAMPLES: usize = 5;
 pub struct EnrollmentClip {
     pub samples: Vec<f32>,
     pub capture_context: CaptureContext,
+}
+
+/// Load the live Voice ID matcher for the active embedder pack.
+///
+/// Opens the v2 store (running v1 migration when needed). Returns an empty
+/// matcher when the embedder pack, home directory, or store is unavailable so
+/// batch/streaming paths stay fail-open toward anonymous labels rather than
+/// aborting transcription.
+pub fn load_person_matcher_for_active_embedder() -> PersonMatcher {
+    let Some(identity) = shared_embedder_identity() else {
+        return empty_person_matcher();
+    };
+    let Some(embedder) = shared_embedder() else {
+        return empty_person_matcher();
+    };
+    let calibration = embedder.calibration_profile();
+    let space = EmbeddingSpace::for_active_embedder(identity, calibration);
+    let threshold = calibration.voice_id_accept_threshold();
+    let margin = calibration.voice_id_margin();
+    let Ok(home) = crate::openasr_home() else {
+        return PersonMatcher::new(space, Vec::new(), threshold, margin);
+    };
+    let Ok(store) = open_store_with_v1_migration(home) else {
+        return PersonMatcher::new(space, Vec::new(), threshold, margin);
+    };
+    store
+        .matcher_for_space(&space, threshold, margin)
+        .unwrap_or_else(|_| PersonMatcher::new(space, Vec::new(), threshold, margin))
+}
+
+fn empty_person_matcher() -> PersonMatcher {
+    // Unmatchable placeholder space: best_match always returns None.
+    PersonMatcher::new(
+        EmbeddingSpace::legacy_unverifiable_v1(1, "none"),
+        Vec::new(),
+        1.0,
+        0.0,
+    )
 }
 
 /// Embed + quality-gate one clip. Does not touch the store.

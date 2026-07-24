@@ -14,7 +14,8 @@ use super::calibration::StreamingCalibrationProfile;
 use super::contract::{SpeakerEmbedding, SpeakerId};
 use super::debug::diarize_debug_enabled as debug_enabled;
 use super::embed::{SpeakerEmbedder, shared_embedder};
-use super::enrollment::{SpeakerDisplayAssignment, SpeakerProfileMatcher};
+use super::enrollment::SpeakerDisplayAssignment;
+use super::voice_id::{PersonMatcher, VoiceIdAssignment, load_person_matcher_for_active_embedder};
 
 /// Default cosine-similarity floor to reuse an existing speaker. Mirrors the
 /// legacy reuse floor. The active WeSpeaker calibration can override this in
@@ -460,7 +461,8 @@ impl SpeakerRegistry {
 pub struct StreamingDiarizer {
     embedder: &'static dyn SpeakerEmbedder,
     registry: SpeakerRegistry,
-    profiles: SpeakerProfileMatcher,
+    /// Voice ID v2 person matcher (live path). Empty when no pack / no persons.
+    persons: PersonMatcher,
     profile: StreamingCalibrationProfile,
     match_similarity: f32,
     min_samples: usize,
@@ -637,29 +639,38 @@ impl StreamingDiarizer {
     /// Build over the shared embedder, or `None` if the pack is unavailable.
     pub fn shared(sample_rate_hz: u32) -> Option<Self> {
         shared_embedder().map(|embedder| {
-            Self::with_embedder_and_profiles(
+            Self::with_embedder_and_persons(
                 embedder,
                 sample_rate_hz,
-                super::enrollment::load_compatible_profile_matcher_for_active_embedder(),
+                load_person_matcher_for_active_embedder(),
             )
         })
     }
 
     /// Build over a caller-supplied embedder (tests, alternative backends).
     pub fn with_embedder(embedder: &'static dyn SpeakerEmbedder, sample_rate_hz: u32) -> Self {
-        Self::with_embedder_and_profiles(embedder, sample_rate_hz, SpeakerProfileMatcher::default())
+        Self::with_embedder_and_persons(
+            embedder,
+            sample_rate_hz,
+            PersonMatcher::new(
+                super::voice_id::EmbeddingSpace::legacy_unverifiable_v1(1, "none"),
+                Vec::new(),
+                1.0,
+                0.0,
+            ),
+        )
     }
 
-    pub fn with_embedder_and_profiles(
+    pub fn with_embedder_and_persons(
         embedder: &'static dyn SpeakerEmbedder,
         sample_rate_hz: u32,
-        profiles: SpeakerProfileMatcher,
+        persons: PersonMatcher,
     ) -> Self {
         let profile = embedder.calibration_profile().streaming;
         Self {
             embedder,
             registry: SpeakerRegistry::default(),
-            profiles,
+            persons,
             profile,
             match_similarity: profile.match_similarity,
             min_samples: (MIN_UTTERANCE_S * sample_rate_hz as f32) as usize,
@@ -718,53 +729,53 @@ impl StreamingDiarizer {
             }
         };
         let profile_for_log = debug_enabled()
-            .then(|| {
-                self.profiles
-                    .best_similarity_and_threshold(&embedding, profile_anchor_similarity)
-            })
+            .then(|| self.persons.best_score_and_threshold(&embedding))
             .flatten();
-        let strict_profile_match = self.profiles.strong_unambiguous_match(
+        let strict_person_match = self.persons.best_match_with_gates(
             &embedding,
             profile_anchor_similarity,
             PROFILE_ANCHOR_MARGIN,
+            0.0,
         );
-        let profile_match = if strict_profile_match.is_some() {
-            strict_profile_match
+        let person_match = if strict_person_match.is_some() {
+            strict_person_match
         } else if matches!(path, StreamingDiarizePath::Native) {
-            self.profiles
-                .strong_unambiguous_match_with_tolerance(
+            self.persons
+                .best_match_with_gates(
                     &embedding,
                     profile_anchor_similarity,
                     PROFILE_ANCHOR_MARGIN,
                     PROFILE_ANCHOR_THRESHOLD_TOLERANCE,
                 )
-                .filter(|profile_match| self.registry.has_profile_anchor(&profile_match.profile_id))
+                .filter(|person_match| {
+                    self.registry
+                        .has_profile_anchor(person_match.person_id.as_str())
+                })
         } else {
             None
         };
-        let best_anonymous_similarity = profile_match
+        let best_anonymous_similarity = person_match
             .as_ref()
             .and_then(|_| self.registry.best_anonymous_match(&embedding))
             .map(|candidate| candidate.similarity);
-        let profile_beats_anonymous = profile_match
+        let person_beats_anonymous = person_match
             .as_ref()
-            .map(|profile_match| {
+            .map(|person_match| {
                 best_anonymous_similarity
                     .map(|anonymous_similarity| {
-                        profile_match.similarity
-                            >= anonymous_similarity + PROFILE_ANCHOR_ANONYMOUS_MARGIN
+                        person_match.score >= anonymous_similarity + PROFILE_ANCHOR_ANONYMOUS_MARGIN
                     })
                     .unwrap_or(true)
             })
             .unwrap_or(false);
-        if let Some(profile_match) = profile_match.filter(|_| profile_beats_anonymous) {
+        if let Some(person_match) = person_match.filter(|_| person_beats_anonymous) {
             let best_registry_similarity = self
                 .registry
                 .best_match(&embedding, true)
                 .map(|candidate| candidate.similarity);
             let Some(speaker_id) =
                 self.registry
-                    .assign_profile(&profile_match.profile_id, &embedding, quality)
+                    .assign_profile(person_match.person_id.as_str(), &embedding, quality)
             else {
                 log_debug(
                     path,
@@ -776,7 +787,9 @@ impl StreamingDiarizer {
                 );
                 return None;
             };
-            let assignment = SpeakerDisplayAssignment::from_match(speaker_id, profile_match);
+            let assignment = SpeakerDisplayAssignment::from_voice_id_assignment(
+                VoiceIdAssignment::from_person_match(speaker_id, &person_match, None),
+            );
             log_debug(
                 path,
                 quality,
@@ -884,8 +897,12 @@ fn log_change_debug(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diarize::calibration::REDIMNET_CALIBRATION_VERSION;
     use crate::diarize::embed::EmbedError;
-    use crate::diarize::enrollment::SpeakerProfile;
+    use crate::diarize::voice_id::{
+        EmbeddingSpace, MATCHER_POLICY_VERSION, MatcherPerson, PersonId, PersonPrototype,
+        PersonStatus, PrototypeId, PrototypeMember, REDIMNET_FRONTEND_VERSION, SampleId,
+    };
 
     fn emb(v: Vec<f32>) -> SpeakerEmbedding {
         SpeakerEmbedding::l2_normalized(v)
@@ -901,6 +918,19 @@ mod tests {
 
     fn test_streaming_profile() -> StreamingCalibrationProfile {
         super::super::calibration::WESPEAKER_CALIBRATION.streaming
+    }
+
+    fn test_space() -> EmbeddingSpace {
+        EmbeddingSpace::from_parts(
+            2,
+            "sha256:test",
+            "test",
+            "test",
+            "v1",
+            REDIMNET_FRONTEND_VERSION,
+            REDIMNET_CALIBRATION_VERSION,
+            MATCHER_POLICY_VERSION,
+        )
     }
 
     #[test]
@@ -1158,43 +1188,36 @@ mod tests {
     #[test]
     fn profile_anchor_gets_stable_session_speaker_before_anonymous_registry() {
         static EMBEDDER: SequenceEmbedder = SequenceEmbedder;
-        let matcher = SpeakerProfileMatcher::from_profiles(vec![profile(
-            "vp_aaaaaaaaaaaaaaaa",
-            "Alice",
-            vec![1.0, 0.0],
-        )]);
-        let mut diarizer =
-            StreamingDiarizer::with_embedder_and_profiles(&EMBEDDER, 16_000, matcher);
+        let (person_id, matcher) = person_matcher("Alice", vec![1.0, 0.0]);
+        let mut diarizer = StreamingDiarizer::with_embedder_and_persons(&EMBEDDER, 16_000, matcher);
 
         let first = diarizer
             .assign(&vec![0.1; 16_000 * 2], 16_000)
             .expect("profile anchor");
         assert_eq!(first.speaker, "Alice");
         assert_eq!(first.speaker_label, "SPEAKER_00");
-        assert_eq!(
-            first.speaker_profile_id,
-            Some("vp_aaaaaaaaaaaaaaaa".to_string())
-        );
+        assert_eq!(first.speaker_person_id.as_deref(), Some(person_id.as_str()));
+        assert_eq!(first.speaker_snapshot_label.as_deref(), Some("Alice"));
 
         let second = diarizer
             .assign(&vec![0.1; 16_000 * 2], 16_000)
             .expect("same profile anchor");
         assert_eq!(second.speaker, "Alice");
         assert_eq!(second.speaker_label, "SPEAKER_00");
+        assert_eq!(
+            second.speaker_person_id.as_deref(),
+            Some(person_id.as_str())
+        );
         assert_eq!(diarizer.registry().speaker_count(), 1);
     }
 
     #[test]
     fn native_profile_anchor_requires_strict_session_prior_for_tolerance() {
         static EMBEDDER: NativeProfileSequenceEmbedder = NativeProfileSequenceEmbedder;
-        let matcher = SpeakerProfileMatcher::from_profiles(vec![profile(
-            "vp_aaaaaaaaaaaaaaaa",
-            "Alice",
-            vec![1.0, 0.0],
-        )]);
+        let (person_id, matcher) = person_matcher("Alice", vec![1.0, 0.0]);
 
         let mut no_prior =
-            StreamingDiarizer::with_embedder_and_profiles(&EMBEDDER, 16_000, matcher.clone());
+            StreamingDiarizer::with_embedder_and_persons(&EMBEDDER, 16_000, matcher.clone());
         let anonymous = no_prior
             .assign_with_path(
                 &vec![-0.1; 16_000 * 3],
@@ -1203,18 +1226,17 @@ mod tests {
             )
             .expect("weak first chunk falls back to anonymous assignment");
         assert_eq!(anonymous.speaker, "SPEAKER_00");
-        assert_eq!(anonymous.speaker_profile_id, None);
+        assert_eq!(anonymous.speaker_person_id, None);
 
-        let mut native =
-            StreamingDiarizer::with_embedder_and_profiles(&EMBEDDER, 16_000, matcher.clone());
+        let mut native = StreamingDiarizer::with_embedder_and_persons(&EMBEDDER, 16_000, matcher);
         let strict = native
             .assign_with_path(&vec![0.1; 16_000 * 2], 16_000, StreamingDiarizePath::Native)
             .expect("strict native match creates the profile anchor");
         assert_eq!(strict.speaker, "Alice");
         assert_eq!(strict.speaker_label, "SPEAKER_00");
         assert_eq!(
-            strict.speaker_profile_id,
-            Some("vp_aaaaaaaaaaaaaaaa".to_string())
+            strict.speaker_person_id.as_deref(),
+            Some(person_id.as_str())
         );
 
         let tolerated = native
@@ -1227,21 +1249,16 @@ mod tests {
         assert_eq!(tolerated.speaker, "Alice");
         assert_eq!(tolerated.speaker_label, "SPEAKER_00");
         assert_eq!(
-            tolerated.speaker_profile_id,
-            Some("vp_aaaaaaaaaaaaaaaa".to_string())
+            tolerated.speaker_person_id.as_deref(),
+            Some(person_id.as_str())
         );
     }
 
     #[test]
     fn profile_anchor_does_not_capture_stronger_anonymous_centroid() {
         static EMBEDDER: UnitXEmbedder = UnitXEmbedder;
-        let matcher = SpeakerProfileMatcher::from_profiles(vec![profile(
-            "vp_aaaaaaaaaaaaaaaa",
-            "Alice",
-            vec![0.86, 0.51029414],
-        )]);
-        let mut diarizer =
-            StreamingDiarizer::with_embedder_and_profiles(&EMBEDDER, 16_000, matcher);
+        let (_person_id, matcher) = person_matcher("Alice", vec![0.86, 0.51029414]);
+        let mut diarizer = StreamingDiarizer::with_embedder_and_persons(&EMBEDDER, 16_000, matcher);
         let anonymous = diarizer
             .registry
             .assign_anonymous(
@@ -1260,14 +1277,18 @@ mod tests {
         assert_eq!(assignment.speaker_id, anonymous);
         assert_eq!(assignment.speaker, "SPEAKER_00");
         assert_eq!(assignment.speaker_label, "SPEAKER_00");
-        assert_eq!(assignment.speaker_profile_id, None);
+        assert_eq!(assignment.speaker_person_id, None);
         assert_eq!(diarizer.registry().speaker_count(), 1);
     }
 
     #[test]
     fn profile_owned_centroid_blocks_ambiguous_anonymous_spawn() {
         let mut reg = SpeakerRegistry::default();
-        reg.assign_profile("vp_aaaaaaaaaaaaaaaa", &emb(vec![1.0, 0.0]), quality(3.0));
+        reg.assign_profile(
+            "person_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &emb(vec![1.0, 0.0]),
+            quality(3.0),
+        );
         let ambiguous = reg.assign_anonymous(
             &emb(vec![0.55, 0.84]),
             quality(3.0),
@@ -1278,18 +1299,29 @@ mod tests {
         assert_eq!(reg.speaker_count(), 1);
     }
 
-    fn profile(id: &str, name: &str, embedding: Vec<f32>) -> SpeakerProfile {
-        SpeakerProfile {
-            id: id.to_string(),
-            name: name.to_string(),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-            sample_seconds: 5.0,
-            embedding_dim: embedding.len(),
-            pack_fingerprint: "sha256:test".to_string(),
-            match_similarity: 0.5,
-            embedding: SpeakerEmbedding::l2_normalized(embedding).0,
-        }
+    fn person_matcher(name: &str, embedding: Vec<f32>) -> (PersonId, PersonMatcher) {
+        let person_id = PersonId::generate();
+        let sample_id = SampleId::generate();
+        let space = test_space();
+        let person = MatcherPerson {
+            person_id: person_id.clone(),
+            display_name: name.to_string(),
+            status: PersonStatus::Active,
+            prototypes: vec![PersonPrototype {
+                prototype_id: PrototypeId::generate(),
+                person_id: person_id.clone(),
+                space: space.clone(),
+                medoid_sample_id: sample_id.clone(),
+                medoid_embedding: SpeakerEmbedding::l2_normalized(embedding.clone()),
+                policy_version: MATCHER_POLICY_VERSION.into(),
+                members: vec![PrototypeMember {
+                    sample_id: sample_id.clone(),
+                    quality_weight: 1.0,
+                }],
+            }],
+            member_embeddings: vec![(sample_id, SpeakerEmbedding::l2_normalized(embedding), 1.0)],
+        };
+        (person_id, PersonMatcher::new(space, vec![person], 0.5, 0.0))
     }
 
     struct SequenceEmbedder;

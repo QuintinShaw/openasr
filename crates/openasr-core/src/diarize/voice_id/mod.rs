@@ -31,11 +31,12 @@ pub use prototypes::{
     build_person_prototypes, score_prototype,
 };
 pub use quality::{
-    MIN_SAMPLE_SPEECH_SECONDS, QualityError, TARGET_SAMPLE_SPEECH_SECONDS, assess_enrollment_quality,
+    MIN_SAMPLE_SPEECH_SECONDS, QualityError, TARGET_SAMPLE_SPEECH_SECONDS,
+    assess_enrollment_quality,
 };
 pub use service::{
     EnrollmentClip, VoiceIdServiceError, add_sample_from_pcm, enroll_person_from_clips,
-    prepare_sample_from_pcm, prepare_sample_from_wav_file,
+    load_person_matcher_for_active_embedder, prepare_sample_from_pcm, prepare_sample_from_wav_file,
 };
 pub use space::{
     EmbeddingSpace, LEGACY_UNVERIFIABLE_V1_MARKER, MATCHER_POLICY_VERSION,

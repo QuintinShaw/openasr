@@ -2085,7 +2085,7 @@ async fn speaker_routes_require_operator_credentials_for_paired_devices() {
 async fn speaker_routes_list_rename_and_delete_profiles() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
-    let id = write_voiceprint_store(&home);
+    let legacy_id = write_voiceprint_store(&home);
     let app = openasr_server::app_with_runtime_and_distribution(
         openasr_server::ServerRuntime::default(),
         openasr_server::DistributionRuntime {
@@ -2108,9 +2108,11 @@ async fn speaker_routes_list_rename_and_delete_profiles() {
     assert_eq!(list.status(), StatusCode::OK);
     let body = to_bytes(list.into_body(), 1024 * 64).await.unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["data"][0]["id"], id);
+    // Migrated persons keep the legacy vp_* public id for compatibility.
+    assert_eq!(json["data"][0]["id"], legacy_id);
     assert_eq!(json["data"][0]["name"], "Alice");
     assert_eq!(json["data"][0]["sample_seconds"], 5.25);
+    // Legacy space is non-matchable against the active embedder.
     assert_eq!(json["data"][0]["compatible"], false);
 
     let renamed = app
@@ -2118,7 +2120,7 @@ async fn speaker_routes_list_rename_and_delete_profiles() {
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri(format!("/v1/speakers/{id}"))
+                .uri(format!("/v1/speakers/{legacy_id}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({ "name": "Alicia" }).to_string(),
@@ -2130,7 +2132,7 @@ async fn speaker_routes_list_rename_and_delete_profiles() {
     assert_eq!(renamed.status(), StatusCode::OK);
     let body = to_bytes(renamed.into_body(), 1024 * 64).await.unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["id"], id);
+    assert_eq!(json["id"], legacy_id);
     assert_eq!(json["name"], "Alicia");
 
     let deleted = app
@@ -2138,7 +2140,7 @@ async fn speaker_routes_list_rename_and_delete_profiles() {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/v1/speakers/{id}"))
+                .uri(format!("/v1/speakers/{legacy_id}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2147,7 +2149,7 @@ async fn speaker_routes_list_rename_and_delete_profiles() {
     assert_eq!(deleted.status(), StatusCode::OK);
     let body = to_bytes(deleted.into_body(), 1024 * 64).await.unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["id"], id);
+    assert_eq!(json["id"], legacy_id);
     assert_eq!(json["deleted"], true);
 
     let list = app
@@ -2272,6 +2274,122 @@ async fn speaker_reenroll_rejects_legacy_overwrite_path() {
         );
     })
     .await;
+}
+
+#[tokio::test]
+async fn voice_id_routes_require_operator_credentials_for_paired_devices() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+        openasr_server::ServerLaunchOptions {
+            auth: openasr_server::ServerAuth::pairing("admin-secret"),
+            ..Default::default()
+        },
+    );
+    let (_device_id, bearer_token) =
+        create_approved_pairing_credential(&app, "Remote Compute Mac").await;
+
+    let paired = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/voice-id/persons")
+                .header(header::AUTHORIZATION, format!("Bearer {bearer_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(paired.status(), StatusCode::FORBIDDEN);
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/voice-id/persons")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        missing.status() == StatusCode::UNAUTHORIZED || missing.status() == StatusCode::FORBIDDEN,
+        "unauthenticated voice-id access must be 401/403, got {}",
+        missing.status()
+    );
+
+    let operator = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/voice-id/persons")
+                .header(header::AUTHORIZATION, "Bearer admin-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(operator.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn voice_id_rename_revision_conflict_returns_409() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    // Seed a migrated person so rename has a target without needing the embedder pack.
+    let _legacy_id = write_voiceprint_store(&home);
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/voice-id/persons")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 1024 * 64).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let person_id = json["data"][0]["person_id"].as_str().unwrap().to_string();
+    let revision = json["data"][0]["revision"].as_u64().unwrap();
+
+    let conflict = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/persons/{person_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, format!("\"{}\"", revision + 99))
+                .body(Body::from(
+                    serde_json::json!({ "display_name": "Alicia" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let body = to_bytes(conflict.into_body(), 1024 * 64).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.to_ascii_lowercase().contains("revision")
+            || message.to_ascii_lowercase().contains("conflict"),
+        "unexpected conflict message: {message}"
+    );
 }
 
 #[test]
