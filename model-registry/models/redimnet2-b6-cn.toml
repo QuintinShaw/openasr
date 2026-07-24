@@ -1,0 +1,10 @@
+id = "redimnet2-b6-cn"
+default_variant = "published"
+display_name = "ReDimNet2-B6 Speaker Embedder (CN-enhanced) (OpenASR pack)"
+languages = ["en", "zh"]
+size = "embedder"
+license = "MIT"
+source = "Published OpenASR packs: https://huggingface.co/OpenASR/redimnet2-b6-cn"
+
+[variant]
+quantization = "fp16"

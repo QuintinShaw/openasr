@@ -31,7 +31,7 @@ TRANSLATION_TEMPLATE = TOOLING_ROOT / "template" / "TRANSLATION_CARD.md.tmpl"
 CAPABILITY_TEMPLATE = TOOLING_ROOT / "template" / "CAPABILITY_CARD.md.tmpl"
 # Diarization support packs render the diarize card: no ASR pipeline tags,
 # no transcribe quickstart.
-DIARIZE_FAMILIES = {"wespeaker", "pyannote-segmentation"}
+DIARIZE_FAMILIES = {"wespeaker", "pyannote-segmentation", "redimnet2"}
 # Translation models render the translation card: translation pipeline tag,
 # realtime-translation quickstart, no ASR bench columns.
 TRANSLATION_FAMILIES = {"hymt2"}
@@ -43,6 +43,7 @@ CAPABILITY_FAMILIES = {"qwen3-forced-aligner", "firered-punc"}
 # HF YAML pipeline tag per diarize/capability family (the prose card may override).
 DIARIZE_PIPELINE_TAG_BY_FAMILY = {
     "wespeaker": "feature-extraction",
+    "redimnet2": "feature-extraction",
     "pyannote-segmentation": "voice-activity-detection",
     "qwen3-forced-aligner": "automatic-speech-recognition",
     "firered-punc": "automatic-speech-recognition",

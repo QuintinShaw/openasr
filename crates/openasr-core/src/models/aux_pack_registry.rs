@@ -31,7 +31,7 @@ use crate::arch::GENERAL_ARCHITECTURE_KEY;
 /// exact wording `api::backend::native`'s tests assert on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuxPackKind {
-    /// Speaker embedder (WeSpeaker) / speaker segmenter (pyannote) diarization
+    /// Speaker embedder (WeSpeaker / ReDimNet2) / speaker segmenter (pyannote) diarization
     /// support packs.
     Diarization,
     /// Translation runtime packs (Hy-MT2).
@@ -80,6 +80,12 @@ fn validate_hymt2(path: &Path, _metadata: &GgufMetadata) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+fn validate_redimnet2(path: &Path, _metadata: &GgufMetadata) -> Result<(), String> {
+    crate::diarize::embed::RedimNet2Embedder::from_oasr(path)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 fn validate_firered_punc(_path: &Path, metadata: &GgufMetadata) -> Result<(), String> {
     crate::models::firered_punc::runtime_contract::parse_and_validate_firered_punc_metadata(
         metadata,
@@ -93,6 +99,11 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         architecture_id: crate::models::wespeaker::WESPEAKER_GGML_ARCHITECTURE_ID,
         kind: AuxPackKind::Diarization,
         validate: validate_wespeaker,
+    },
+    AuxPackDescriptor {
+        architecture_id: "redimnet2",
+        kind: AuxPackKind::Diarization,
+        validate: validate_redimnet2,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID,

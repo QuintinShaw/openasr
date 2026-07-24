@@ -600,7 +600,7 @@ fn catalog_non_translation_model_rejects_translation_metadata() {
 }
 
 #[test]
-fn speaker_diarization_required_pack_selects_wespeaker_embedder() {
+fn speaker_diarization_required_pack_prefers_redimnet_then_wespeaker() {
     let mut catalog = alias_contract_catalog();
     catalog.models.push(capability_pack_model(
         "wespeaker-voxceleb-resnet34-lm",
@@ -611,10 +611,19 @@ fn speaker_diarization_required_pack_selects_wespeaker_embedder() {
         CatalogCapabilityRole::SpeakerSegmenter,
     ));
 
-    let default_required = catalog
+    let wespeaker_only = catalog
         .speaker_diarization_required_embedder_pack()
-        .expect("WeSpeaker required pack");
-    assert_eq!(default_required.id, "wespeaker-voxceleb-resnet34-lm");
+        .expect("WeSpeaker fallback pack");
+    assert_eq!(wespeaker_only.id, "wespeaker-voxceleb-resnet34-lm");
+
+    catalog.models.push(capability_pack_model(
+        "redimnet2-b6-cn",
+        CatalogCapabilityRole::SpeakerEmbedder,
+    ));
+    let preferred = catalog
+        .speaker_diarization_required_embedder_pack()
+        .expect("ReDimNet2 preferred pack");
+    assert_eq!(preferred.id, "redimnet2-b6-cn");
 }
 
 #[test]

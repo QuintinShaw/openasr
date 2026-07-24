@@ -234,6 +234,7 @@ fn bundled_registry_ordering_is_deterministic() {
             "pyannote-segmentation-3.0",
             "qwen3-asr-1.7b",
             "qwen3-forced-aligner-0.6b",
+            "redimnet2-b6-cn",
             "sensevoice-small",
             "wespeaker-voxceleb-resnet34-lm",
             "whisper-base",
@@ -322,6 +323,7 @@ fn bundled_catalog_public_ids_match_current_signed_release_projection() {
             "pyannote-segmentation-3.0",
             "qwen3-asr-0.6b",
             "qwen3-asr-1.7b",
+            "redimnet2-b6-cn",
             "sensevoice-small",
             "wespeaker-voxceleb-resnet34-lm",
             "whisper-base",
@@ -404,6 +406,7 @@ fn bundled_catalog_declares_speaker_diarization_capability_packs() {
                 "pyannote-segmentation-3.0",
                 CatalogCapabilityRole::SpeakerSegmenter
             ),
+            ("redimnet2-b6-cn", CatalogCapabilityRole::SpeakerEmbedder),
             (
                 "wespeaker-voxceleb-resnet34-lm",
                 CatalogCapabilityRole::SpeakerEmbedder

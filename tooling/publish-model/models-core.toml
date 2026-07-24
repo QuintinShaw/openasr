@@ -380,6 +380,32 @@ upstream_release_date = "2022-07-24"
 feature = "speaker-diarization"
 role = "speaker-embedder"
 
+["redimnet2-b6-cn"]
+kind = "capability-pack"
+family = "redimnet2"
+hf_repo = "OpenASR/redimnet2-b6-cn"
+release_public = true
+size = "embedder"
+registry_id = "redimnet2-b6-cn"
+display_name = "ReDimNet2-B6 Speaker Embedder (CN-enhanced)"
+license_name = "MIT"
+license_source = "https://github.com/PalabraAI/redimnet2/blob/main/LICENSE"
+license_class = "permissive"
+languages = ["en", "zh"]
+quants = ["fp16", "q8_0", "f32"]
+recommended_quant = "fp16"
+upstream_release_date = "2026-03-04"
+# Runtime support landed after the v0.1.23 tag on main (embedder graph +
+# calibration + Voice ID v2). Current workspace version is still 0.1.23 and
+# carries the code, so the public floor matches the workspace package version.
+min_core_version = "0.1.23"
+min_cli_version = "0.1.23"
+
+["redimnet2-b6-cn".capability]
+feature = "speaker-diarization"
+role = "speaker-embedder"
+
+
 ["pyannote-segmentation-3.0"]
 kind = "capability-pack"
 family = "pyannote-segmentation"

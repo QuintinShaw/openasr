@@ -29,6 +29,7 @@ const HUGGING_FACE_BASE_URL: &str = crate::http::HUGGING_FACE_HOST;
 const CATALOG_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CATALOG_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 pub const CATALOG_FEATURE_SPEAKER_DIARIZATION: &str = "speaker-diarization";
+const CATALOG_SPEAKER_EMBEDDER_REDIMNET_ID: &str = "redimnet2-b6-cn";
 const CATALOG_SPEAKER_EMBEDDER_WESPEAKER_ID: &str = "wespeaker-voxceleb-resnet34-lm";
 /// Capability-pack feature key for the optional forced-alignment word-timestamp
 /// refinement tier (`--word-timestamps=aligned`). Mirrors
@@ -510,7 +511,13 @@ impl ModelCatalog {
     }
 
     pub fn speaker_diarization_required_embedder_pack(&self) -> Option<&CatalogModel> {
-        self.speaker_diarization_embedder_pack(CATALOG_SPEAKER_EMBEDDER_WESPEAKER_ID)
+        // Prefer ReDimNet2-B6 when the catalog carries it; fall back to the
+        // legacy WeSpeaker pack so older catalogs and offline installs keep
+        // resolving an embedder.
+        self.speaker_diarization_embedder_pack(CATALOG_SPEAKER_EMBEDDER_REDIMNET_ID)
+            .or_else(|| {
+                self.speaker_diarization_embedder_pack(CATALOG_SPEAKER_EMBEDDER_WESPEAKER_ID)
+            })
     }
 
     fn speaker_diarization_embedder_pack(&self, model_id: &str) -> Option<&CatalogModel> {

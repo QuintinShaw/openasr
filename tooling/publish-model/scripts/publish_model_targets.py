@@ -31,6 +31,7 @@ QWEN3_ASR_LEGACY_GENERAL_ARCHITECTURE = b"qwen3asr"
 XASR_ZIPFORMER_EXPECTED_GENERAL_ARCHITECTURE = b"xasr-zipformer-transducer"
 HYMT2_EXPECTED_GENERAL_ARCHITECTURE = b"hunyuan-dense"
 FIRERED_PUNC_EXPECTED_GENERAL_ARCHITECTURE = b"firered-punc"
+REDIMNET2_EXPECTED_GENERAL_ARCHITECTURE = b"redimnet2"
 HYMT2_REQUIRED_HEADER_MARKERS = (
     b"openasr.model.kind",
     b"translation-model",
@@ -63,6 +64,7 @@ RELEASE_LANE_MODELS = (
     "whisper-base.en",
     "whisper-small.en",
     "whisper-medium.en",
+    "redimnet2-b6-cn",
     "wespeaker-voxceleb-resnet34-lm",
     "pyannote-segmentation-3.0",
     "hymt2-1.8b",
@@ -111,6 +113,8 @@ def expected_general_architecture(model: str) -> bytes | None:
         return HYMT2_EXPECTED_GENERAL_ARCHITECTURE
     if model == "firered-punc":
         return FIRERED_PUNC_EXPECTED_GENERAL_ARCHITECTURE
+    if model == "redimnet2-b6-cn":
+        return REDIMNET2_EXPECTED_GENERAL_ARCHITECTURE
     return None
 
 

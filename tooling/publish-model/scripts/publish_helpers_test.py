@@ -22,6 +22,7 @@ EXPECTED_CAPABILITY_PACKS = {
     "firered-punc": "punctuation-restorer",
     "pyannote-segmentation-3.0": "speaker-segmenter",
     "qwen3-forced-aligner-0.6b": "forced-aligner",
+    "redimnet2-b6-cn": "speaker-embedder",
     "wespeaker-voxceleb-resnet34-lm": "speaker-embedder",
 }
 # Capability-pack feature per model: most existing packs serve
@@ -32,6 +33,7 @@ EXPECTED_CAPABILITY_FEATURES = {
     "firered-punc": "punctuation",
     "pyannote-segmentation-3.0": "speaker-diarization",
     "qwen3-forced-aligner-0.6b": "word-timestamps",
+    "redimnet2-b6-cn": "speaker-diarization",
     "wespeaker-voxceleb-resnet34-lm": "speaker-diarization",
 }
 EXPECTED_TRANSLATION_MODELS = {

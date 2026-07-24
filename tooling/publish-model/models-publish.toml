@@ -94,6 +94,15 @@ upstream_repo = "pyannote/wespeaker-voxceleb-resnet34-LM"
 source_revision = "837717ddb9ff5507820346191109dc79c958d614"
 needs_license_flags = false
 
+["redimnet2-b6-cn"]
+# External Python converter (tooling/redimnet2/convert_redimnet2.py); no openasr
+# model-pack import subcommand. publish.sh materializes prebuilt packs.
+import_subcommand = "import redimnet2"
+upstream_repo = "PalabraAI/redimnet2"
+source_revision = "2a8d15f65b1dfb5d73fede2f11ee42bcccca3035"
+needs_license_flags = false
+
+
 ["pyannote-segmentation-3.0"]
 import_subcommand = "import pyannote"
 upstream_repo = "onnx-community/pyannote-segmentation-3.0"
