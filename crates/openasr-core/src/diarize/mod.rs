@@ -18,7 +18,7 @@ pub fn vad_diarization_available() -> bool {
     embed::embedder_pack_installed()
 }
 
-// Pull-time contract validation for diarization support packs (WeSpeaker
+// Pull-time contract validation for diarization support packs (ReDimNet2-B6
 // speaker embedder, pyannote speaker segmenter) is dispatched through
 // `crate::models::aux_pack_registry`, alongside the other auxiliary (non-ASR)
 // families (translation, punctuation) -- one table instead of a per-family

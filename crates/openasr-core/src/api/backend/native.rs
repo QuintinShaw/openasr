@@ -668,7 +668,7 @@ fn native_phrase_bias_capability_for_adapter(
 
 /// Reason reported when neither a self-diarizing pack nor the model-agnostic
 /// VAD + active speaker-embedder path is installed.
-pub(crate) const NATIVE_DIARIZATION_UNAVAILABLE_REASON: &str = "Diarization needs the WeSpeaker speaker-embedder pack (wespeaker-voxceleb-resnet34-lm) or a self-diarizing model pack; install one or omit diarize=true.";
+pub(crate) const NATIVE_DIARIZATION_UNAVAILABLE_REASON: &str = "Diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn) or a self-diarizing model pack; install one or omit diarize=true.";
 
 /// Diarization capability for a runtime pack: supported when the model
 /// self-diarizes (e.g. the cohere token-stream) or the model-agnostic
@@ -1577,15 +1577,15 @@ mod tests {
     #[test]
     fn native_streaming_request_keeps_embedder_diarization_out_of_ggml_decode_options() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-wespeaker-only-streaming.gguf");
-        let spec = cohere_streaming_runtime_fixture_spec("cohere-wespeaker-only-streaming");
+        let runtime_path = temp.path().join("cohere-redimnet-only-streaming.gguf");
+        let spec = cohere_streaming_runtime_fixture_spec("cohere-redimnet-only-streaming");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
-        let wespeaker_pack = temp.path().join("wespeaker.oasr");
-        std::fs::write(&wespeaker_pack, b"GGUF\x00\x00\x00\x00").unwrap();
-        unsafe { std::env::set_var("OPENASR_WESPEAKER_PACK", &wespeaker_pack) };
+        let redimnet_pack = temp.path().join("redimnet.oasr");
+        std::fs::write(&redimnet_pack, b"GGUF\x00\x00\x00\x00").unwrap();
+        unsafe { std::env::set_var("OPENASR_REDIMNET_PACK", &redimnet_pack) };
 
         let realtime_capabilities = native_runtime_realtime_capabilities_for_path(&runtime_path);
-        unsafe { std::env::remove_var("OPENASR_WESPEAKER_PACK") };
+        unsafe { std::env::remove_var("OPENASR_REDIMNET_PACK") };
         let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
         let adapter_capabilities = adapter.capabilities();
         assert!(adapter_capabilities.supports_true_streaming);
@@ -2386,8 +2386,8 @@ mod tests {
         with_forced_cpu_backend_for_test(|| {
             let temp = tempfile::tempdir().unwrap();
             // Hermetic: the run-time gate probes the host's installed
-            // WeSpeaker pack, so pin the lookup to an empty home.
-            unsafe { std::env::remove_var("OPENASR_WESPEAKER_PACK") };
+            // ReDimNet2-B6 pack, so pin the lookup to an empty home.
+            unsafe { std::env::remove_var("OPENASR_REDIMNET_PACK") };
             unsafe { std::env::set_var("OPENASR_HOME", temp.path()) };
             let runtime_path = temp.path().join("cohere-runtime.gguf");
             let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
@@ -2409,13 +2409,16 @@ mod tests {
     #[test]
     fn pull_contract_validation_routes_diarize_packs_to_their_loader() {
         let temp = tempfile::tempdir().unwrap();
-        let pack_path = temp.path().join("wespeaker-stub.oasr");
+        // Diarization aux packs (ReDimNet2-B6 / pyannote) load a generic weight
+        // bag at pull-time and only fail closed on missing tensors at forward.
+        // What this gate must still prove: a pack declaring a diarization
+        // architecture is routed through the aux table and is NEVER rejected by
+        // ASR runtime adapter selection.
+        let pack_path = temp.path().join("redimnet-stub.oasr");
         let mut metadata = std::collections::BTreeMap::new();
         metadata.insert(
             "general.architecture".to_string(),
-            crate::ggml_runtime::GgufWriteValue::String(
-                crate::models::wespeaker::WESPEAKER_GGML_ARCHITECTURE_ID.to_string(),
-            ),
+            crate::ggml_runtime::GgufWriteValue::String("redimnet2".to_string()),
         );
         metadata.insert(
             "openasr.package.version".to_string(),
@@ -2429,18 +2432,36 @@ mod tests {
         }];
         crate::ggml_runtime::write_gguf_file_v0(&pack_path, &metadata, &tensors).unwrap();
 
-        // A diarization-architecture pack must be validated by its own loader
-        // (which rejects this stub for missing tensors), not by ASR runtime
-        // adapter selection (which would reject ALL diarize packs).
-        let error = validate_native_runtime_model_pack_contract(&pack_path)
-            .expect_err("stub wespeaker pack must fail its loader contract");
-        assert!(
-            error.contains("diarization pack validation failed"),
-            "got: {error}"
+        match validate_native_runtime_model_pack_contract(&pack_path) {
+            Ok(()) => {
+                // Aux loader accepted the stub weight bag -- routing still succeeded.
+            }
+            Err(error) => {
+                assert!(
+                    error.contains("diarization pack validation failed"),
+                    "got: {error}"
+                );
+                assert!(
+                    !error.contains("runtime adapter selection failed"),
+                    "got: {error}"
+                );
+            }
+        }
+
+        // Negative control: an unknown architecture still hits ASR selection.
+        let unknown_path = temp.path().join("unknown-stub.oasr");
+        let mut unknown_metadata = std::collections::BTreeMap::new();
+        unknown_metadata.insert(
+            "general.architecture".to_string(),
+            crate::ggml_runtime::GgufWriteValue::String("not-a-real-family".to_string()),
         );
+        crate::ggml_runtime::write_gguf_file_v0(&unknown_path, &unknown_metadata, &tensors)
+            .unwrap();
+        let unknown_error = validate_native_runtime_model_pack_contract(&unknown_path)
+            .expect_err("unknown architecture must fail ASR adapter selection");
         assert!(
-            !error.contains("runtime adapter selection failed"),
-            "got: {error}"
+            unknown_error.contains("runtime adapter selection failed"),
+            "got: {unknown_error}"
         );
     }
 
@@ -2591,8 +2612,8 @@ mod tests {
     fn native_runtime_capabilities_keep_base_cohere_diarization_unsupported() {
         let temp = tempfile::tempdir().unwrap();
         // Hermetic: the capability probe also consults the host's installed
-        // WeSpeaker pack, so pin the lookup to an empty home.
-        unsafe { std::env::remove_var("OPENASR_WESPEAKER_PACK") };
+        // ReDimNet2-B6 pack, so pin the lookup to an empty home.
+        unsafe { std::env::remove_var("OPENASR_REDIMNET_PACK") };
         unsafe { std::env::set_var("OPENASR_HOME", temp.path()) };
         let runtime_path = temp.path().join("cohere-runtime.gguf");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
@@ -2610,19 +2631,19 @@ mod tests {
     }
 
     #[test]
-    fn native_runtime_capabilities_enable_vad_diarization_when_wespeaker_pack_installed() {
+    fn native_runtime_capabilities_enable_vad_diarization_when_redimnet_pack_installed() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("cohere-runtime.gguf");
         let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
-        let wespeaker_pack = temp.path().join("wespeaker.oasr");
-        std::fs::write(&wespeaker_pack, b"GGUF\x00\x00\x00\x00").unwrap();
-        unsafe { std::env::set_var("OPENASR_WESPEAKER_PACK", &wespeaker_pack) };
+        let redimnet_pack = temp.path().join("redimnet.oasr");
+        std::fs::write(&redimnet_pack, b"GGUF\x00\x00\x00\x00").unwrap();
+        unsafe { std::env::set_var("OPENASR_REDIMNET_PACK", &redimnet_pack) };
 
         let capabilities = native_runtime_transcription_capabilities_for_path(&runtime_path);
-        unsafe { std::env::remove_var("OPENASR_WESPEAKER_PACK") };
+        unsafe { std::env::remove_var("OPENASR_REDIMNET_PACK") };
 
-        // The VAD + WeSpeaker path is model-agnostic: a pack with no
+        // The VAD + ReDimNet2-B6 path is model-agnostic: a pack with no
         // self-diarize metadata reports diarization supported once the embedder
         // pack is installed.
         assert!(capabilities.diarization.supported);

@@ -844,7 +844,7 @@ fn enroll_speaker(input: &Path, name: &str, match_similarity: Option<f32>) -> Re
         .map_err(|reason| anyhow::anyhow!("Could not open Voice ID store: {reason}."))?;
     let embedder = openasr_core::diarize::embed::shared_embedder().ok_or_else(|| {
         anyhow::anyhow!(
-            "Could not create speaker voice match: the active speaker-embedder pack is missing.\nInstall wespeaker-voxceleb-resnet34-lm (or the active embedder pack) first."
+            "Could not create speaker voice match: the active speaker-embedder pack is missing.\nInstall redimnet2-b6-cn first."
         )
     })?;
     let identity = openasr_core::diarize::embed::shared_embedder_identity()
@@ -1181,7 +1181,7 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
         options.diarize,
     )?;
     // Passing --word-timestamps=aligned is itself the consent to install the
-    // Qwen3-ForcedAligner-0.6B capability pack, mirroring --diarize's WeSpeaker
+    // Qwen3-ForcedAligner-0.6B capability pack, mirroring --diarize's ReDimNet2-B6
     // auto-install above; approximate (or omitted) never touches the network.
     ensure_cli_word_timestamps_pack_installed(
         prepared_run.backend_kind,

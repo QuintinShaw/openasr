@@ -71,6 +71,5 @@ pub(crate) mod text_prefix;
 pub(crate) mod thread_local_runtime_cache;
 pub(crate) mod tokenizer_component_registry;
 pub(crate) mod wav2vec2_ctc;
-pub(crate) mod wespeaker;
 pub mod whisper;
 pub(crate) mod xasr_zipformer;

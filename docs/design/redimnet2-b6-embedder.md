@@ -4,8 +4,8 @@ Design and bring-up plan for adding the **ReDimNet2-B6** speaker embedder
 (PalabraAI/redimnet2, MIT) as a ggml-graph model under `diarize/embed/`.
 B6 is a 12.46 M-param UNet-style "dimension reshaping" net that outputs a
 192-dim speaker embedding, with a Chinese-enhanced training mix (vb2+vox2+cnc2).
-It is a candidate replacement for the legacy pure-Rust WeSpeaker ResNet34
-(256-dim). Removing WeSpeaker is out of scope for this work and gated behind
+It is a candidate replacement for the retired pure-Rust WeSpeaker ResNet34
+(256-dim). WeSpeaker (retired) has been fully removed; only ReDimNet2-B6 remains. Historical note: removal was originally gated behind
 full B6 validation.
 
 Reference source is the upstream `redimnet2/` Python package (checkpoint
@@ -17,7 +17,7 @@ GitHub release digest). Spike anchors (specs, golden `.npy` dumps) live under
 
 ### 1. Delivery = GGUF `.oasr` pack + ggml graph (not pure-Rust forward)
 
-The existing WeSpeaker embedder runs a hand-written pure-Rust forward pass -- a
+The existing WeSpeaker (retired) embedder runs a hand-written pure-Rust forward pass -- a
 historical exception predating the ggml-only invariant. ReDimNet2 does **not**
 repeat that: it executes through a ggml `GgmlCpuGraphBuilder` graph, like every
 ASR family, fed from a `.oasr` GGUF pack.
@@ -42,16 +42,16 @@ verbatim into a graph tensor created with the same `ne` dims -- both sides agree
 on ggml memory order, so **no transpose is needed** (same as dolphin's conv
 weights: torch `(C_out,C_in,KH,KW)` -> ggml kernel `[KW,KH,C_in,C_out]`).
 
-This differs from the WeSpeaker/`import ln` diarize pack, which keeps *logical*
+This differs from the WeSpeaker (retired)/`import ln` diarize pack, which keeps *logical*
 (non-reversed) dims because its pure-Rust reader indexes logically. That path is
 untouched; ReDimNet2's pack is a distinct, ggml-native artifact.
 
-### 3. Front end: separate `RedimNetFrontend`, not the WeSpeaker `Fbank`
+### 3. Front end: separate `RedimNetFrontend`, not the WeSpeaker (retired) `Fbank`
 
-The B6 front end (`TFMelBanks`) is fundamentally different from the WeSpeaker
+The B6 front end (`TFMelBanks`) is fundamentally different from the WeSpeaker (retired)
 Kaldi fbank and shares nothing:
 
-| aspect            | WeSpeaker `Fbank`        | ReDimNet2 `TFMelBanks`               |
+| aspect            | WeSpeaker (retired) `Fbank`        | ReDimNet2 `TFMelBanks`               |
 |-------------------|--------------------------|--------------------------------------|
 | mel bins          | 80                       | **72**                               |
 | mel formula       | Kaldi `1127*ln(1+hz/700)`| **Slaney `2595*log10(1+hz/700)`**    |
@@ -86,10 +86,10 @@ linear. See "Backbone plan" below.
 ### 5. `SpeakerEmbedder` wiring deferred until the backbone is golden-clean
 
 The `SpeakerEmbedder` trait impl, runtime pack resolution, and a ReDimNet
-calibration profile (192-dim cosine space, distinct from `WESPEAKER_CALIBRATION`)
+calibration profile (192-dim cosine space, distinct from `the retired WeSpeaker calibration`)
 land **after** the backbone reproduces the golden embeddings. Wiring a
 half-built forward into the fail-closed diarize dispatch would risk fabricating
-embeddings. WeSpeaker remains the sole runtime embedder until then. The
+embeddings. ReDimNet2-B6 is now the sole runtime embedder. The
 `embedding_dim` (256 -> 192) and `pack_fingerprint` / embedding-space-version go
 through the existing `SpeakerEmbedderIdentity` mechanism at that point.
 

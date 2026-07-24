@@ -40,7 +40,7 @@ pub use service::{
 };
 pub use space::{
     EmbeddingSpace, LEGACY_UNVERIFIABLE_V1_MARKER, MATCHER_POLICY_VERSION,
-    REDIMNET_FRONTEND_VERSION, WESPEAKER_FRONTEND_VERSION,
+    REDIMNET_FRONTEND_VERSION,
 };
 pub use store::{
     NewSampleInput, VOICE_ID_DB_ENV, VOICE_ID_SCHEMA_VERSION, VoiceIdStore, VoiceIdStoreError,

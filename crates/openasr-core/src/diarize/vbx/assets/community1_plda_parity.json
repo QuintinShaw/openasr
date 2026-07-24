@@ -1,5 +1,5 @@
 {
-  "source": "WeSpeaker embedding of a held-out meeting clip (reference fixture)",
+  "source": "Speaker embedding of a held-out meeting clip (reference fixture)",
   "transform_npz": "community1 x-vector transform parameters",
   "plda_npz": "community1 PLDA parameters",
   "pyannote_vbx": "pyannote VBx reference implementation",

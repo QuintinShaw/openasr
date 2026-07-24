@@ -2,7 +2,7 @@
 //! diarization `.oasr` (GGUF-v0) pack.
 //!
 //! The raw-F32 passthrough conversion (dims = logical shape, no ggml reversal)
-//! lives in [`crate::models::diarize_pack_import`], shared with the WeSpeaker
+//! lives in [`crate::models::diarize_pack_import`], shared with the ReDimNet2-B6
 //! embedder; this module only supplies the pyannote pack metadata. The source
 //! safetensors is produced from the un-gated `onnx-community` ONNX mirror by
 //! `tooling/publish-model/scripts/pyannote_extract.py`. The runtime loader is

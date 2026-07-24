@@ -19,7 +19,7 @@ use crate::ggml_runtime::GgufWriteTensorType;
 /// is exactly this one alias their public `<Family>QuantizationMode` type
 /// straight to `PackQuant` (see `models::cohere::CohereRuntimeQuantizationMode`
 /// and friends); `Q3_K` is presently only reachable by `qwen`, and a family
-/// with a materially different scheme (e.g. wespeaker's single-rung `F32`)
+/// with a materially different scheme (e.g. redimnet's single-rung `F32`)
 /// keeps its own enum instead of aliasing here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[allow(non_camel_case_types)]

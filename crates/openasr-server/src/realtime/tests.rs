@@ -3513,9 +3513,9 @@ async fn native_streaming_configured_event_preserves_diarize_request() {
     let model_id = "qwen3-asr-0.6b";
     let pack_path = temp.path().join("qwen3-asr-0.6b.oasr");
     write_qwen_streaming_fixture_pack(&pack_path, model_id);
-    let wespeaker = temp.path().join("wespeaker.oasr");
-    std::fs::write(&wespeaker, b"GGUF\x00\x00\x00\x00").unwrap();
-    let _wespeaker = EnvVarGuard::set("OPENASR_WESPEAKER_PACK", &wespeaker);
+    let redimnet = temp.path().join("redimnet.oasr");
+    std::fs::write(&redimnet, b"GGUF\x00\x00\x00\x00").unwrap();
+    let _redimnet = EnvVarGuard::set("OPENASR_REDIMNET_PACK", &redimnet);
     let runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         native_execution: crate::NativeExecutionSupervisor::default(),
@@ -3572,8 +3572,8 @@ async fn session_start_rejects_diarize_without_embedder_pack() {
     let _env_lock = speaker_embedder_env_lock().await;
     let temp = tempfile::tempdir().unwrap();
     // Hermetic: realtime diarization availability probes the installed
-    // WeSpeaker pack, so pin the lookup to an empty home.
-    let _wespeaker = EnvVarGuard::unset("OPENASR_WESPEAKER_PACK");
+    // ReDimNet2-B6 pack, so pin the lookup to an empty home.
+    let _redimnet = EnvVarGuard::unset("OPENASR_REDIMNET_PACK");
     let _home = EnvVarGuard::set("OPENASR_HOME", temp.path());
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
@@ -4562,9 +4562,9 @@ async fn session_start_rejects_diarize_when_embedder_pack_fails_to_load() {
     let temp = tempfile::tempdir().unwrap();
     // A resolvable pack that is not loadable must reject the session instead
     // of silently degrading to anonymous transcripts.
-    let wespeaker = temp.path().join("wespeaker.oasr");
-    std::fs::write(&wespeaker, b"GGUF\x00\x00\x00\x00garbage").unwrap();
-    let _wespeaker = EnvVarGuard::set("OPENASR_WESPEAKER_PACK", &wespeaker);
+    let redimnet = temp.path().join("redimnet.oasr");
+    std::fs::write(&redimnet, b"GGUF\x00\x00\x00\x00garbage").unwrap();
+    let _redimnet = EnvVarGuard::set("OPENASR_REDIMNET_PACK", &redimnet);
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
 

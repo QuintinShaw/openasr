@@ -59,7 +59,7 @@ pub struct SpeakerTurn {
 }
 
 /// An L2-normalized speaker embedding. The dimension is model-dependent and read
-/// at runtime from the pack (WeSpeaker ResNet34 = 256).
+/// at runtime from the pack (ReDimNet2-B6 = 192).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpeakerEmbedding(pub Vec<f32>);
 

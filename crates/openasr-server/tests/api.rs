@@ -79,7 +79,7 @@ where
     let lock = ENV_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
     let _guard = lock.lock().await;
     let _home = EnvRestore::set("OPENASR_HOME", Some(home));
-    let _wespeaker = EnvRestore::set("OPENASR_WESPEAKER_PACK", None);
+    let _redimnet = EnvRestore::set("OPENASR_REDIMNET_PACK", None);
     future.await
 }
 
@@ -4490,9 +4490,9 @@ async fn transcriptions_with_native_backend_accepts_quant_alias_against_legacy_h
 #[tokio::test]
 async fn transcriptions_with_native_backend_and_diarize_returns_bad_request() {
     let temp = tempfile::tempdir().unwrap();
-    // Hermetic: diarization availability probes the installed WeSpeaker pack,
+    // Hermetic: diarization availability probes the installed ReDimNet2-B6 pack,
     // so pin the lookup to an empty home to keep the rejection deterministic.
-    unsafe { std::env::remove_var("OPENASR_WESPEAKER_PACK") };
+    unsafe { std::env::remove_var("OPENASR_REDIMNET_PACK") };
     unsafe { std::env::set_var("OPENASR_HOME", temp.path()) };
     let pack_root = temp.path().join("whisper-runtime.oasr");
     write_whisper_oasr_v1_fixture(&pack_root, "whisper-runtime");

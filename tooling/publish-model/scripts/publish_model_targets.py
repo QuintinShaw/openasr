@@ -65,7 +65,6 @@ RELEASE_LANE_MODELS = (
     "whisper-small.en",
     "whisper-medium.en",
     "redimnet2-b6-cn",
-    "wespeaker-voxceleb-resnet34-lm",
     "pyannote-segmentation-3.0",
     "hymt2-1.8b",
     "dolphin-cn-dialect-base",

@@ -1,7 +1,7 @@
 //! ReDimNet2-B6 speaker embedder (192-d), ggml-graph backend.
 //!
 //! This is the Chinese-enhanced ReDimNet2-B6 embedder from PalabraAI/redimnet2
-//! (MIT). Unlike the legacy pure-Rust WeSpeaker ResNet34 (`super::wespeaker`),
+//! (MIT). Unlike the legacy pure-Rust ReDimNet2-B6 ResNet34 (`super::redimnet`),
 //! ReDimNet2 executes through a **ggml graph** (ggml-only invariant) fed from a
 //! `.oasr` GGUF pack produced by `tooling/redimnet2/convert_redimnet2.py`.
 //!
@@ -18,9 +18,9 @@
 //!     (`OPENASR_REDIMNET_PACK` / installed-dir hint, `super::pack`), and a
 //!     dedicated calibration profile (`REDIMNET_CALIBRATION`).
 //!
-//! ReDimNet2 and WeSpeaker now coexist at runtime: `super::pack::shared_embedder`
-//! resolves ReDimNet2 first and only falls back to WeSpeaker when no ReDimNet2
-//! pack is installed. Removing WeSpeaker entirely is a later, separately
+//! ReDimNet2 and ReDimNet2-B6 now coexist at runtime: `super::pack::shared_embedder`
+//! resolves ReDimNet2 first and only falls back to ReDimNet2-B6 when no ReDimNet2
+//! pack is installed. Removing ReDimNet2-B6 entirely is a later, separately
 //! approved step (HANDOFF.md plan item 6) -- not attempted here. See
 //! `docs/design/redimnet2-b6-embedder.md` (backbone plan + golden anchors) and
 //! `HANDOFF.md` (remaining plan: catalog entry, shipping-quant pack).

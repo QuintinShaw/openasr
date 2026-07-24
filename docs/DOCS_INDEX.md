@@ -39,8 +39,7 @@ contributors -- crate relationships, the audio-to-transcript pipeline, and the
 
 | Doc | What it covers |
 | --- | --- |
-| [Diarization Pack Publishing](DIARIZATION_PACK_PUBLISHING.md) | How the WeSpeaker speaker-embedding and pyannote segmentation capability packs are built and published for the `--diarize` path. |
-| [WeSpeaker Embedder](WESPEAKER_EMBEDDER.md) | The pure-Rust WeSpeaker ResNet34 speaker-embedding forward pass used for diarization and speaker-change detection. |
+| [Diarization Pack Publishing](DIARIZATION_PACK_PUBLISHING.md) | How the ReDimNet2-B6 speaker-embedding and pyannote segmentation capability packs are built and published for the `--diarize` path. |
 | [VBx PLDA Resegmentation](VBX_PLDA_RESEGMENTATION.md) | The PLDA-mixture / HMM VBx resegmentation refinement for diarization. |
 
 The diarization privacy model and remote-mode trust contract (anonymous labels,

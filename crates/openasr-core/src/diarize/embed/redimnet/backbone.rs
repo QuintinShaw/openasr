@@ -946,7 +946,7 @@ impl RedimNet2Model {
     /// `[mel*frames+frame]` flat buffer, matching `RedimNetFrontend::forward`'s
     /// output layout verbatim) and returns the raw (pre-L2-normalize) 192-d
     /// embedding. Callers needing a normalized embedding (the `SpeakerEmbedder`
-    /// trait contract) normalize on top, same as `WeSpeakerEmbedder`.
+    /// trait contract) normalize on top, same as `ReDimNet2-B6Embedder`.
     pub(crate) fn forward(
         &self,
         feats: &[f32],

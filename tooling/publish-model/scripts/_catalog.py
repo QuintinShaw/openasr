@@ -394,7 +394,7 @@ def language_mode_for_model(entry: dict, languages: list[str]) -> dict:
     family (see module docstring on `LANGUAGE_MODE_BY_FAMILY`).
 
     Returns {} for any kind other than asr-model: translation models (hymt2)
-    and capability packs (wespeaker/pyannote-segmentation) are not
+    and capability packs (redimnet2/pyannote-segmentation) are not
     GgmlFamilyAdapterDescriptor ASR families in core and have no per-request
     source-language axis, so the field is omitted rather than guessed.
     """
@@ -514,7 +514,7 @@ def punctuation_for_model(entry: dict) -> dict:
     `PUNCTUATION_BY_FAMILY`).
 
     Returns {} for any kind other than asr-model: translation models (hymt2)
-    and capability packs (wespeaker/pyannote-segmentation) don't produce an ASR
+    and capability packs (redimnet2/pyannote-segmentation) don't produce an ASR
     transcript, so the field is omitted rather than guessed.
     """
     if entry.get("kind", DEFAULT_CATALOG_MODEL_KIND) != "asr-model":

@@ -3593,7 +3593,7 @@ mod tests {
     /// with a video playing in the middle (~5.8-13.9s), so verbose_json must
     /// show >=3 segments with >=2 distinct speakers in an A/B/A bookend shape.
     #[test]
-    #[ignore = "host-local: requires the X-ASR q8_0 pack, the wespeaker diarize pack, and tmp/diar-real-case-1781172161.wav"]
+    #[ignore = "host-local: requires the X-ASR q8_0 pack, the redimnet diarize pack, and tmp/diar-real-case-1781172161.wav"]
     fn real_recording_diarization_splits_monolithic_segment_into_speaker_turns() {
         let pack = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tmp/xasr-test/out/xasr-zh-en-onnx-q8_0.oasr");

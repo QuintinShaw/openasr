@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-24T09:48:57+00:00",
+  "generated_at": "2026-07-24T10:20:50+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -1653,10 +1653,10 @@
       "prose": {
         "tagline": "ReDimNet2-B6 speaker embedder for OpenASR diarization \u2014 192-d CN-enhanced embeddings, fully on-device",
         "overview": [
-          "ReDimNet2-B6 is PalabraAI's 12.5M-parameter speaker-embedding model from the\nReDimNet2 family, trained on a VoxBlink2 + VoxCeleb2 + CN-Celeb2 mix so English and\nChinese speakers share one embedding space. OpenASR packages the MIT-licensed\ncheckpoint as a local `.oasr` capability pack and runs it through a ggml graph\n(not a pure-Rust hand-written forward). When this pack is installed it becomes the\npreferred speaker-embedding stage for diarization; the legacy WeSpeaker pack remains\navailable as a fallback until a later quality gate retires it. Embeddings are 192-d\ncosine vectors with a ReDimNet-specific calibration profile, separate from WeSpeaker's\n256-d space."
+          "ReDimNet2-B6 is PalabraAI's 12.5M-parameter speaker-embedding model from the\nReDimNet2 family, trained on a VoxBlink2 + VoxCeleb2 + CN-Celeb2 mix so English and\nChinese speakers share one embedding space. OpenASR packages the MIT-licensed\ncheckpoint as a local `.oasr` capability pack and runs it through a ggml graph\n(not a pure-Rust hand-written forward). This is the only supported speaker-embedding\nstage for diarization and Voice ID: when the pack is missing, diarize/Voice ID\nrequests fail closed rather than falling back to another embedder. Embeddings are\n192-d cosine vectors with a ReDimNet-specific calibration profile."
         ],
         "highlights": [
-          "\ud83d\udde3\ufe0f **Preferred OpenASR speaker embedder** \u2014 when installed, diarization prefers this pack over WeSpeaker for anonymous speaker labels on any ASR family",
+          "\ud83d\udde3\ufe0f **OpenASR speaker embedder** \u2014 the only supported speaker-embedding pack for diarization and Voice ID; required for anonymous speaker labels on any ASR family",
           "\ud83e\uddec **192-dim ReDimNet2-B6** \u2014 PalabraAI's dimension-reshaping speaker net (12.5M params) with a Chinese-enhanced vb2+vox2+cnc2 training mix",
           "\ud83d\udd12 **Diarization, not identification** \u2014 anonymous session-relative labels; embeddings stay local and are discarded after the request unless you explicitly enroll a local profile",
           "\ud83c\udfaf **Parity-gated packaging** \u2014 ggml-graph forward pass matches the upstream Python reference at cosine \u2265 0.9999 on held-out fixtures",
@@ -1717,7 +1717,7 @@
         "zh-CN": {
           "tagline": "ReDimNet2-B6 \u8bf4\u8bdd\u4eba\u58f0\u7eb9\u6a21\u578b\uff0c\u670d\u52a1\u4e8e OpenASR \u8bf4\u8bdd\u4eba\u5206\u79bb \u2014 192 \u7ef4\u4e2d\u82f1\u589e\u5f3a\u58f0\u7eb9\uff0c\u5b8c\u5168\u672c\u5730\u8fd0\u884c",
           "highlights": [
-            "\ud83d\udde3\ufe0f **OpenASR \u4f18\u5148\u58f0\u7eb9\u6a21\u578b** \u2014 \u5b89\u88c5\u540e\u8bf4\u8bdd\u4eba\u5206\u79bb\u4f1a\u4f18\u5148\u4f7f\u7528\u672c\u5305\uff08\u800c\u975e WeSpeaker\uff09\u4e3a\u4efb\u610f\u8bed\u97f3\u6a21\u578b\u7684\u8f6c\u5199\u7ed3\u679c\u6807\u6ce8\u8bf4\u8bdd\u4eba",
+            "\ud83d\udde3\ufe0f **OpenASR \u58f0\u7eb9\u6a21\u578b** \u2014 \u8bf4\u8bdd\u4eba\u5206\u79bb\u4e0e Voice ID \u552f\u4e00\u652f\u6301\u7684\u58f0\u7eb9\u5305\uff1b\u7f3a\u5931\u65f6\u4f1a\u660e\u786e\u5931\u8d25\uff0c\u4e0d\u4f1a\u9759\u9ed8\u964d\u7ea7",
             "\ud83e\uddec **192 \u7ef4 ReDimNet2-B6** \u2014 \u6765\u81ea PalabraAI \u7684\u7ef4\u5ea6\u91cd\u5851\u58f0\u7eb9\u7f51\u7edc\uff08\u7ea6 12.5M \u53c2\u6570\uff09\uff0c\u7528\u542b vb2+vox2+cnc2 \u7684\u4e2d\u82f1\u6df7\u5408\u6570\u636e\u8bad\u7ec3",
             "\ud83d\udd12 **\u53ea\u5206\u79bb\u8bf4\u8bdd\u4eba\uff0c\u4e0d\u8bc6\u522b\u8eab\u4efd** \u2014 \u53ea\u7ed9\u533f\u540d\u7f16\u53f7\uff0c\u58f0\u7eb9\u6570\u636e\u7559\u5728\u672c\u5730\u4e14\u7528\u5b8c\u5373\u5220\uff0c\u9664\u975e\u4f60\u4e3b\u52a8\u6ce8\u518c\u672c\u5730\u6863\u6848",
             "\ud83c\udfaf **\u7cbe\u5ea6\u4e25\u683c\u6821\u9a8c** \u2014 ggml \u8ba1\u7b97\u56fe\u524d\u5411\u4e0e\u4e0a\u6e38 Python \u53c2\u8003\u5b9e\u73b0\u5728\u56fa\u5b9a\u6837\u672c\u4e0a\u7684\u4f59\u5f26\u76f8\u4f3c\u5ea6 \u2265 0.9999",
@@ -2308,11 +2308,11 @@
       "prose": {
         "tagline": "pyannote segmentation-3.0 \u2014 speaker-change and overlap aware speech segmentation for OpenASR diarization",
         "overview": [
-          "pyannote **segmentation-3.0** is the local speech-segmentation model from the pyannote speaker\ndiarization toolkit: a PyanNet (SincNet front-end + bidirectional LSTM) classifier over a 7-class\npowerset that labels every 10 s window with which of up to three speakers are active \u2014 including\noverlapped speech. OpenASR uses it as the optional segmentation stage of its model-agnostic\ndiarization pipeline: when this pack is installed, `--diarize` splits speech at speaker changes\ninstead of relying on coarse VAD slices, then the WeSpeaker embedder pack clusters the segments into\nanonymous speaker turns. Weights are extracted from the un-gated, MIT-licensed\n**onnx-community** ONNX mirror at a pinned revision and repackaged as a raw-f32 `.oasr` pack that\nruns in pure Rust \u2014 no Python at inference time."
+          "pyannote **segmentation-3.0** is the local speech-segmentation model from the pyannote speaker\ndiarization toolkit: a PyanNet (SincNet front-end + bidirectional LSTM) classifier over a 7-class\npowerset that labels every 10 s window with which of up to three speakers are active \u2014 including\noverlapped speech. OpenASR uses it as the optional segmentation stage of its model-agnostic\ndiarization pipeline: when this pack is installed, `--diarize` splits speech at speaker changes\ninstead of relying on coarse VAD slices, then the ReDimNet2-B6 embedder pack clusters the segments into\nanonymous speaker turns. Weights are extracted from the un-gated, MIT-licensed\n**onnx-community** ONNX mirror at a pinned revision and repackaged as a raw-f32 `.oasr` pack that\nruns in pure Rust \u2014 no Python at inference time."
         ],
         "highlights": [
           "\u2702\ufe0f **Speaker-change aware segmentation** \u2014 PyanNet (SincNet + BiLSTM) with a powerset head that detects up to 3 concurrent speakers, including overlapped speech",
-          "\ud83e\udd1d **Quality upgrade for `--diarize`** \u2014 installed alongside the WeSpeaker embedder pack, it replaces coarse VAD slices with fine speaker-turn boundaries",
+          "\ud83e\udd1d **Quality upgrade for `--diarize`** \u2014 installed alongside the ReDimNet2-B6 embedder pack, it replaces coarse VAD slices with fine speaker-turn boundaries",
           "\ud83d\udd12 **Diarization, not identification** \u2014 anonymous session-relative labels; nothing leaves the machine",
           "\ud83c\udfaf **Bit-exact packaging** \u2014 single raw-f32 build; the pure-Rust forward pass matches the upstream ONNX logits (max abs error ~7e-5)",
           "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
@@ -2341,7 +2341,7 @@
           "tagline": "pyannote segmentation-3.0 \u2014 \u80fd\u611f\u77e5\u8bf4\u8bdd\u4eba\u5207\u6362\u548c\u591a\u4eba\u91cd\u53e0\u7684\u8bed\u97f3\u5206\u5272\u6a21\u578b\uff0c\u4e3a OpenASR \u8bf4\u8bdd\u4eba\u5206\u79bb\u800c\u751f",
           "highlights": [
             "\u2702\ufe0f **\u611f\u77e5\u8bf4\u8bdd\u4eba\u5207\u6362\u7684\u5206\u5272** \u2014 \u6700\u591a\u53ef\u540c\u65f6\u68c0\u6d4b 3 \u4f4d\u8bf4\u8bdd\u4eba\uff0c\u5305\u62ec\u591a\u4eba\u91cd\u53e0\u8bf4\u8bdd\u7684\u573a\u666f",
-            "\ud83e\udd1d **\u63d0\u5347 `--diarize` \u5206\u79bb\u6548\u679c** \u2014 \u642d\u914d WeSpeaker \u58f0\u7eb9\u6a21\u578b\u4e00\u8d77\u5b89\u88c5\uff0c\u7528\u7cbe\u7ec6\u7684\u8bf4\u8bdd\u4eba\u5207\u6362\u8fb9\u754c\u66ff\u4ee3\u7c97\u7565\u7684\u8bed\u97f3\u7247\u6bb5\u5212\u5206",
+            "\ud83e\udd1d **\u63d0\u5347 `--diarize` \u5206\u79bb\u6548\u679c** \u2014 \u642d\u914d ReDimNet2-B6 \u58f0\u7eb9\u6a21\u578b\u4e00\u8d77\u5b89\u88c5\uff0c\u7528\u7cbe\u7ec6\u7684\u8bf4\u8bdd\u4eba\u5207\u6362\u8fb9\u754c\u66ff\u4ee3\u7c97\u7565\u7684\u8bed\u97f3\u7247\u6bb5\u5212\u5206",
             "\ud83d\udd12 **\u53ea\u5206\u79bb\u8bf4\u8bdd\u4eba\uff0c\u4e0d\u8bc6\u522b\u8eab\u4efd** \u2014 \u53ea\u7ed9\u533f\u540d\u7f16\u53f7\uff0c\u6240\u6709\u6570\u636e\u90fd\u7559\u5728\u4f60\u7684\u7535\u8111\u4e0a",
             "\ud83c\udfaf **\u7cbe\u5ea6\u4e25\u683c\u6821\u9a8c** \u2014 \u5355\u4e00 raw-f32 \u7248\u672c\uff0c\u7eaf Rust \u8ba1\u7b97\u4e0e\u4e0a\u6e38\u539f\u7248\u8f93\u51fa\u9ad8\u5ea6\u4e00\u81f4\uff08\u6700\u5927\u7edd\u5bf9\u8bef\u5dee ~7e-5\uff09",
             "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u8fd0\u884c\u65f6\u65e0\u9700 Python\uff0cCPU \u548c GPU \u90fd\u505a\u4e86\u6781\u81f4\u6027\u80fd\u4f18\u5316"
@@ -3525,77 +3525,6 @@
         }
       },
       "upstream_release_date": "2022-09-21"
-    },
-    {
-      "id": "wespeaker-voxceleb-resnet34-lm",
-      "kind": "capability-pack",
-      "capability": {
-        "feature": "speaker-diarization",
-        "role": "speaker-embedder"
-      },
-      "display_name": "WeSpeaker ResNet34 Speaker Embedder (VoxCeleb)",
-      "family": "wespeaker",
-      "aliases": [],
-      "pull_alias": null,
-      "size": "embedder",
-      "languages": [
-        "en",
-        "zh"
-      ],
-      "vendor": "pyannote",
-      "license": "CC-BY-4.0",
-      "license_url": "https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM",
-      "license_class": "permissive",
-      "hf_repo": "OpenASR/wespeaker-voxceleb-resnet34-lm",
-      "hf_revision": "0e81dc54b7d480eeb6d0e1fcdc4a94d863be5141",
-      "public": true,
-      "min_cli_version": "0.1.0",
-      "recommended_quant": "f32",
-      "pull_recommended": "wespeaker-voxceleb-resnet34-lm:f32",
-      "prose": {
-        "tagline": "WeSpeaker ResNet34 speaker embedder for OpenASR diarization \u2014 stronger speaker separation, fully on-device",
-        "overview": [
-          "WeSpeaker ResNet34 is the speaker-embedding model used by pyannote for VoxCeleb speaker\nrepresentations. OpenASR packages it as a local `.oasr` capability pack and uses it as the default\nspeaker-embedding stage for diarization: speech regions are embedded, clustered, and attributed\nback onto transcripts from any ASR model. The realtime speaker-change detector now uses this same\nWeSpeaker embedder, so diarization has one speaker-embedding space across batch and streaming paths."
-        ],
-        "highlights": [
-          "\ud83d\udde3\ufe0f **Default OpenASR speaker embedder** \u2014 install this pack and `--diarize` labels anonymous speakers for any ASR family",
-          "\ud83e\uddec **256-dim ResNet34 embeddings** \u2014 pyannote's WeSpeaker VoxCeleb model with temporal statistics pooling",
-          "\ud83d\udd12 **Diarization, not identification** \u2014 anonymous session-relative labels; embeddings stay local and are discarded after the request unless you explicitly enroll a local profile",
-          "\ud83c\udfaf **Parity-gated packaging** \u2014 single raw-f32 build; the Rust forward pass matches the upstream pyannote reference at cosine \u2265 0.9999",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference and share the same pull/install path as ASR models"
-        ]
-      },
-      "quants": [
-        {
-          "quant": "f32",
-          "suffix": "f32",
-          "pull": "wespeaker-voxceleb-resnet34-lm:f32",
-          "filename": "wespeaker-voxceleb-resnet34-lm-f32.oasr",
-          "url": "https://huggingface.co/OpenASR/wespeaker-voxceleb-resnet34-lm/resolve/0e81dc54b7d480eeb6d0e1fcdc4a94d863be5141/wespeaker-voxceleb-resnet34-lm-f32.oasr",
-          "sha256": "7f09e220267f7a97cece92ed14b1aaa8b7d9b41ea8968c8aff1282d3d7e70174",
-          "size_bytes": 26583936,
-          "recommended": true,
-          "perf": {
-            "rtf_cpu": 0.07293,
-            "rtf_metal": null,
-            "peak_rss_bytes": null,
-            "jfk_wer_vs_fp16": null
-          }
-        }
-      ],
-      "prose_locales": {
-        "zh-CN": {
-          "tagline": "WeSpeaker ResNet34 \u8bf4\u8bdd\u4eba\u58f0\u7eb9\u6a21\u578b\uff0c\u670d\u52a1\u4e8e OpenASR \u8bf4\u8bdd\u4eba\u5206\u79bb \u2014 \u66f4\u7cbe\u51c6\u5730\u533a\u5206\u4e0d\u540c\u8bf4\u8bdd\u4eba\uff0c\u5b8c\u5168\u672c\u5730\u8fd0\u884c",
-          "highlights": [
-            "\ud83d\udde3\ufe0f **OpenASR \u9ed8\u8ba4\u58f0\u7eb9\u6a21\u578b** \u2014 \u5b89\u88c5\u540e\u4f7f\u7528 `--diarize` \u5373\u53ef\u4e3a\u4efb\u610f\u8bed\u97f3\u6a21\u578b\u7684\u8f6c\u5199\u7ed3\u679c\u6807\u6ce8\u8bf4\u8bdd\u4eba",
-            "\ud83e\uddec **256 \u7ef4 ResNet34 \u58f0\u7eb9\u5411\u91cf** \u2014 \u6765\u81ea pyannote \u7684 WeSpeaker VoxCeleb \u6a21\u578b\uff0c\u7528\u7d27\u51d1\u7684\u58f0\u7eb9\u7279\u5f81\u7cbe\u51c6\u533a\u5206\u4e0d\u540c\u8bf4\u8bdd\u4eba",
-            "\ud83d\udd12 **\u53ea\u5206\u79bb\u8bf4\u8bdd\u4eba\uff0c\u4e0d\u8bc6\u522b\u8eab\u4efd** \u2014 \u53ea\u7ed9\u533f\u540d\u7f16\u53f7\uff0c\u58f0\u7eb9\u6570\u636e\u7559\u5728\u672c\u5730\u4e14\u7528\u5b8c\u5373\u5220\uff0c\u9664\u975e\u4f60\u4e3b\u52a8\u6ce8\u518c\u672c\u5730\u6863\u6848",
-            "\ud83c\udfaf **\u7cbe\u5ea6\u4e25\u683c\u6821\u9a8c** \u2014 \u5355\u4e00 raw-f32 \u7248\u672c\uff0c\u7eaf Rust \u8ba1\u7b97\u4e0e pyannote \u539f\u7248\u53c2\u8003\u5b9e\u73b0\u7684\u4f59\u5f26\u76f8\u4f3c\u5ea6 \u2265 0.9999",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u65e0\u9700 Python\uff0c\u4e0e\u8bed\u97f3\u8bc6\u522b\u6a21\u578b\u5171\u7528\u540c\u4e00\u5957\u4e0b\u8f7d\u548c\u5b89\u88c5\u6d41\u7a0b"
-          ]
-        }
-      },
-      "upstream_release_date": "2022-07-24"
     }
   ],
   "language_labels": {

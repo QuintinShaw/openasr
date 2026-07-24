@@ -7,7 +7,7 @@
 //! available, clustering also honors overlap cannot-link constraints.
 
 use super::calibration::{
-    ClusteringCalibrationProfile, ContextGapCalibrationProfile, WESPEAKER_CALIBRATION,
+    ClusteringCalibrationProfile, ContextGapCalibrationProfile, REDIMNET_CALIBRATION,
 };
 use super::contract::{DiarizeHint, SpeakerEmbedding, SpeakerId, TimeRange};
 use super::embed::SpeakerEmbedder;
@@ -15,13 +15,12 @@ use super::embed::SpeakerEmbedder;
 /// Default threshold on cosine **dissimilarity** (`1 - cos`): clusters merge
 /// while their average-linkage distance is below this.
 ///
-/// This is the WeSpeaker plain AHC threshold. Valid range is `[0, 2]`.
-pub const DEFAULT_MERGE_THRESHOLD: f32 = WESPEAKER_CALIBRATION.clustering.plain_merge_threshold;
+/// This is the ReDimNet2-B6 plain AHC threshold. Valid range is `[0, 2]`.
+pub const DEFAULT_MERGE_THRESHOLD: f32 = REDIMNET_CALIBRATION.clustering.plain_merge_threshold;
 /// Context-aware auto clustering can safely use a looser stop because overlap
 /// constraints prevent merging simultaneous speakers.
-pub const CONTEXT_AUTO_MERGE_THRESHOLD: f32 = WESPEAKER_CALIBRATION
-    .clustering
-    .context_auto_merge_threshold;
+pub const CONTEXT_AUTO_MERGE_THRESHOLD: f32 =
+    REDIMNET_CALIBRATION.clustering.context_auto_merge_threshold;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ClusterContext {
@@ -57,7 +56,7 @@ impl Default for AgglomerativeClusterer {
     fn default() -> Self {
         Self {
             threshold: DEFAULT_MERGE_THRESHOLD,
-            profile: WESPEAKER_CALIBRATION.clustering,
+            profile: REDIMNET_CALIBRATION.clustering,
         }
     }
 }

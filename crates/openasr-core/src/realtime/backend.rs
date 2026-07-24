@@ -274,7 +274,7 @@ pub fn realtime_diarization_capability(mode: RealtimeBackendMode) -> BackendFeat
                 BackendFeatureCapability::supported()
             } else {
                 BackendFeatureCapability::reject_request(
-                    "Realtime diarization needs the WeSpeaker speaker-embedder pack (wespeaker-voxceleb-resnet34-lm); install it or omit diarize=true.",
+                    "Realtime diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install it or omit diarize=true.",
                 )
             }
         }
@@ -285,7 +285,7 @@ pub fn realtime_diarization_capability(mode: RealtimeBackendMode) -> BackendFeat
 /// constructors overwrite it via [`realtime_diarization_capability`].
 const fn realtime_diarization_unprobed() -> BackendFeatureCapability {
     BackendFeatureCapability::reject_request(
-        "Realtime diarization needs the WeSpeaker speaker-embedder pack (wespeaker-voxceleb-resnet34-lm); install it or omit diarize=true.",
+        "Realtime diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install it or omit diarize=true.",
     )
 }
 
@@ -335,8 +335,8 @@ mod tests {
     #[test]
     fn realtime_diarization_capability_depends_on_mode_and_pack() {
         let temp = tempfile::tempdir().unwrap();
-        // Hermetic: the probe consults the installed WeSpeaker embedder pack.
-        unsafe { std::env::remove_var("OPENASR_WESPEAKER_PACK") };
+        // Hermetic: the probe consults the installed ReDimNet2-B6 embedder pack.
+        unsafe { std::env::remove_var("OPENASR_REDIMNET_PACK") };
         unsafe { std::env::set_var("OPENASR_HOME", temp.path()) };
 
         let fallback =
@@ -355,21 +355,19 @@ mod tests {
                 .is_some_and(|reason| reason.contains("speaker-embedder pack"))
         );
 
-        let install_dir = temp
-            .path()
-            .join("models/wespeaker-voxceleb-resnet34-lm/f32");
+        let install_dir = temp.path().join("models/redimnet2-b6-cn/fp16");
         std::fs::create_dir_all(&install_dir).unwrap();
-        let installed_pack = install_dir.join("wespeaker-voxceleb-resnet34-lm-f32.oasr");
+        let installed_pack = install_dir.join("redimnet2-b6-cn-fp16.oasr");
         std::fs::write(&installed_pack, b"GGUF\x00\x00\x00\x00").unwrap();
         let installed_meta = serde_json::json!({
-            "model_id": "wespeaker-voxceleb-resnet34-lm",
-            "display_name": "WeSpeaker ResNet34 Speaker Embedder (VoxCeleb)",
+            "model_id": "redimnet2-b6-cn",
+            "display_name": "ReDimNet2-B6 Speaker Embedder (CN-enhanced)",
             "quant": "f32",
             "suffix": "f32",
-            "pull": "wespeaker-voxceleb-resnet34-lm:f32",
-            "filename": "wespeaker-voxceleb-resnet34-lm-f32.oasr",
+            "pull": "redimnet2-b6-cn:f32",
+            "filename": "redimnet2-b6-cn-fp16.oasr",
             "path": installed_pack,
-            "url": "https://example.invalid/OpenASR/wespeaker-voxceleb-resnet34-lm/wespeaker-voxceleb-resnet34-lm-f32.oasr",
+            "url": "https://example.invalid/OpenASR/redimnet2-b6-cn/redimnet2-b6-cn-fp16.oasr",
             "hf_revision": "0123456789abcdef0123456789abcdef01234567",
             "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
             "size_bytes": 8,
@@ -386,9 +384,9 @@ mod tests {
         );
         assert!(realtime_diarization_capability(RealtimeBackendMode::TrueStreaming).supported);
 
-        let wespeaker = temp.path().join("wespeaker.oasr");
-        std::fs::write(&wespeaker, b"GGUF\x00\x00\x00\x00").unwrap();
-        unsafe { std::env::set_var("OPENASR_WESPEAKER_PACK", &wespeaker) };
+        let redimnet = temp.path().join("redimnet.oasr");
+        std::fs::write(&redimnet, b"GGUF\x00\x00\x00\x00").unwrap();
+        unsafe { std::env::set_var("OPENASR_REDIMNET_PACK", &redimnet) };
         assert!(
             realtime_diarization_capability(RealtimeBackendMode::FilePerUtteranceFallback)
                 .supported
@@ -396,7 +394,7 @@ mod tests {
         // True-streaming sessions retain a bounded copy of each utterance's
         // speech, so the pack is the only gate there as well.
         assert!(realtime_diarization_capability(RealtimeBackendMode::TrueStreaming).supported);
-        unsafe { std::env::remove_var("OPENASR_WESPEAKER_PACK") };
+        unsafe { std::env::remove_var("OPENASR_REDIMNET_PACK") };
     }
 
     #[test]

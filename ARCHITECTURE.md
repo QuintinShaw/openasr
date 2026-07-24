@@ -92,7 +92,7 @@ Adding or reading a family means understanding two directories under
   `models/wav2vec2_ctc/`,
   `models/moonshine/`, `models/dolphin/`, `models/sensevoice/`,
 `models/firered_aed/`, `models/xasr_zipformer/`, plus the
-  diarization capability packs `models/wespeaker/` and `models/pyannote/`) that
+  diarization capability packs under `diarize/embed/` and `models/pyannote/`) that
   assembles those blocks into a graph and owns family-specific tensor binding,
   frontend, decode, and local-source import.
 

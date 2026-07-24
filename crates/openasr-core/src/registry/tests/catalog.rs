@@ -331,7 +331,7 @@ fn catalog_parser_defaults_missing_kind_to_asr_model() {
 fn catalog_capability_packs_are_not_market_listed_but_are_feature_queryable() {
     let mut catalog = alias_contract_catalog();
     catalog.models.push(capability_pack_model(
-        "wespeaker-voxceleb-resnet34-lm",
+        "redimnet2-b6-cn",
         CatalogCapabilityRole::SpeakerEmbedder,
     ));
 
@@ -345,21 +345,21 @@ fn catalog_capability_packs_are_not_market_listed_but_are_feature_queryable() {
     let capability_pack = catalog
         .models
         .iter()
-        .find(|model| model.id == "wespeaker-voxceleb-resnet34-lm")
+        .find(|model| model.id == "redimnet2-b6-cn")
         .unwrap();
     assert!(asr_model.is_market_listed());
     assert!(!capability_pack.is_market_listed());
 
     let packs = catalog.capability_packs_for_feature(CATALOG_FEATURE_SPEAKER_DIARIZATION);
     assert_eq!(packs.len(), 1);
-    assert_eq!(packs[0].id, "wespeaker-voxceleb-resnet34-lm");
+    assert_eq!(packs[0].id, "redimnet2-b6-cn");
 }
 
 #[test]
 fn catalog_kind_matrix_controls_market_listing() {
     let mut catalog = alias_contract_catalog();
     catalog.models.push(capability_pack_model(
-        "wespeaker-voxceleb-resnet34-lm",
+        "redimnet2-b6-cn",
         CatalogCapabilityRole::SpeakerEmbedder,
     ));
     catalog.models.push(translation_model("hymt2-1.8b", true));
@@ -600,37 +600,41 @@ fn catalog_non_translation_model_rejects_translation_metadata() {
 }
 
 #[test]
-fn speaker_diarization_required_pack_prefers_redimnet_then_wespeaker() {
+fn speaker_diarization_required_pack_is_redimnet_only() {
     let mut catalog = alias_contract_catalog();
-    catalog.models.push(capability_pack_model(
-        "wespeaker-voxceleb-resnet34-lm",
-        CatalogCapabilityRole::SpeakerEmbedder,
-    ));
+    assert!(
+        catalog
+            .speaker_diarization_required_embedder_pack()
+            .is_none(),
+        "no embedder pack present"
+    );
+
     catalog.models.push(capability_pack_model(
         "pyannote-segmentation-3.0",
         CatalogCapabilityRole::SpeakerSegmenter,
     ));
-
-    let wespeaker_only = catalog
-        .speaker_diarization_required_embedder_pack()
-        .expect("WeSpeaker fallback pack");
-    assert_eq!(wespeaker_only.id, "wespeaker-voxceleb-resnet34-lm");
+    assert!(
+        catalog
+            .speaker_diarization_required_embedder_pack()
+            .is_none(),
+        "segmenter alone is not an embedder"
+    );
 
     catalog.models.push(capability_pack_model(
         "redimnet2-b6-cn",
         CatalogCapabilityRole::SpeakerEmbedder,
     ));
-    let preferred = catalog
+    let pack = catalog
         .speaker_diarization_required_embedder_pack()
-        .expect("ReDimNet2 preferred pack");
-    assert_eq!(preferred.id, "redimnet2-b6-cn");
+        .expect("ReDimNet2-B6 required pack");
+    assert_eq!(pack.id, "redimnet2-b6-cn");
 }
 
 #[test]
 fn word_timestamps_forced_aligner_pack_selects_the_aligner_capability_pack() {
     let mut catalog = alias_contract_catalog();
     catalog.models.push(capability_pack_model(
-        "wespeaker-voxceleb-resnet34-lm",
+        "redimnet2-b6-cn",
         CatalogCapabilityRole::SpeakerEmbedder,
     ));
     catalog.models.push(capability_pack_model_with_feature(
@@ -649,7 +653,7 @@ fn word_timestamps_forced_aligner_pack_selects_the_aligner_capability_pack() {
 fn word_timestamps_forced_aligner_pack_is_none_when_absent() {
     let mut catalog = alias_contract_catalog();
     catalog.models.push(capability_pack_model(
-        "wespeaker-voxceleb-resnet34-lm",
+        "redimnet2-b6-cn",
         CatalogCapabilityRole::SpeakerEmbedder,
     ));
 
@@ -702,10 +706,7 @@ fn punctuation_restorer_pack_ignores_staged_non_public_entries() {
 #[test]
 fn catalog_capability_pack_requires_capability_metadata() {
     let mut catalog = alias_contract_catalog();
-    let mut pack = capability_pack_model(
-        "wespeaker-voxceleb-resnet34-lm",
-        CatalogCapabilityRole::SpeakerEmbedder,
-    );
+    let mut pack = capability_pack_model("redimnet2-b6-cn", CatalogCapabilityRole::SpeakerEmbedder);
     pack.capability = None;
     catalog.models.push(pack);
 
@@ -1627,11 +1628,7 @@ fn embedded_catalog_language_mode_matches_core_language_mode_per_family() {
     // hymt2 (translation-model) and the diarization capability packs are not
     // GgmlFamilyAdapterDescriptor ASR families -- no source-language axis, so
     // the field is omitted rather than guessed.
-    for id in [
-        "hymt2-1.8b",
-        "pyannote-segmentation-3.0",
-        "wespeaker-voxceleb-resnet34-lm",
-    ] {
+    for id in ["hymt2-1.8b", "pyannote-segmentation-3.0", "redimnet2-b6-cn"] {
         let model = find(id);
         assert_eq!(model.language_mode, None, "{id} should omit language_mode");
         assert_eq!(
@@ -1712,11 +1709,7 @@ fn embedded_catalog_emits_punctuation_matches_family() {
 
     // hymt2 (translation-model) and the diarization capability packs have no
     // ASR transcript-punctuation axis, so the field is omitted rather than guessed.
-    for id in [
-        "hymt2-1.8b",
-        "pyannote-segmentation-3.0",
-        "wespeaker-voxceleb-resnet34-lm",
-    ] {
+    for id in ["hymt2-1.8b", "pyannote-segmentation-3.0", "redimnet2-b6-cn"] {
         assert_eq!(
             find(id).emits_punctuation,
             None,

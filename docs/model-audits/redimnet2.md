@@ -56,7 +56,7 @@ every consciously skipped optimization on the record.
 | mmap weight loading | Supported | GGUF `.oasr` load via `Weights::from_oasr` / ggml tensor reader (same path as other native packs). |
 | Resident pool reuse across requests (weights stay resident) | Supported | Process-wide `shared_embedder` OnceLock keeps the loaded embedder resident after first successful resolve (`diarize/embed/pack.rs`). |
 | View contiguity tradeoffs audited (`cont`/copy nodes justified) | Supported | Backbone bring-up fixed a real gallocr view-of-output corruption and a `to1d` vs plain-reshape pre-pool flatten mismatch; parity harness pins the correct shapes (`redimnet/backbone.rs`). |
-| Peak RSS/VRAM per shipped quant measured (quiet host) and reconciled against the weights+KV+activations budget; unexplained excess blocks release; catalog RAM requirement matches the measured peak | Deferred | Capability-pack catalog entries do not carry ASR peak-RSS fields today (wespeaker/pyannote pattern). Unlock: optional embedder RSS microbench if catalog grows a support-pack RAM column. |
+| Peak RSS/VRAM per shipped quant measured (quiet host) and reconciled against the weights+KV+activations budget; unexplained excess blocks release; catalog RAM requirement matches the measured peak | Deferred | Capability-pack catalog entries do not carry ASR peak-RSS fields today (legacy-wespeaker/pyannote pattern). Unlock: optional embedder RSS microbench if catalog grows a support-pack RAM column. |
 
 ## 4. Decode algorithms
 
@@ -128,7 +128,7 @@ see `docs/design/gpu-weight-placement.md`).
 | `warm_up` is a real implementation, not a stub | Not applicable | Aux embedder packs are not ASR executors with a `warm_up` hook; first `shared_embedder()` load is the warm path. |
 | Reference dumper exists for this family | Supported | Stage-1 spike dumpers under `tmp/redimnet2-spike/` (frontend + backbone stage tensors + final embeddings) plus `tooling/redimnet2/convert_redimnet2.py`. |
 | Registry / catalog / docs wired (MODEL_ONBOARDING checklist done) | Supported | `redimnet2-b6-cn` capability-pack entry, diarize card, ACKNOWLEDGMENTS credit, aux_pack_registry architecture id, pull-time validation. |
-| Peer benchmark recorded (table below, all fields) | Deferred | Quality gate for this pack is cosine parity vs the upstream Python reference, not an ASR RTF peer table. Unlock: optional same-host embed RTF vs WeSpeaker on a fixed segment set if product needs a speed claim. |
+| Peer benchmark recorded (table below, all fields) | Deferred | Quality gate for this pack is cosine parity vs the upstream Python reference, not an ASR RTF peer table. Unlock: optional same-host embed RTF vs legacy WeSpeaker on a fixed segment set if product needs a speed claim. |
 
 ### Peer benchmark record
 
@@ -156,5 +156,5 @@ dead). Add family-specific verdicts with the measurement behind each; write
 
 | Dead end | Verdict / evidence | Date |
 | --- | --- | --- |
-| Pure-Rust hand-written ReDimNet2 forward (WeSpeaker-style) | Rejected: family is ggml-graph by design (ggml-only invariant); converter emits ggml `ne` order packs | 2026-07 |
-| Deleting WeSpeaker in the same PR as ReDimNet2 publish | Rejected: coexistence with WeSpeaker fallback is required until a later quality gate retires it | 2026-07 |
+| Pure-Rust hand-written ReDimNet2 forward (legacy WeSpeaker-style) | Rejected: family is ggml-graph by design (ggml-only invariant); converter emits ggml `ne` order packs | 2026-07 |
+| Deleting legacy WeSpeaker in the same PR as ReDimNet2 publish | Superseded: legacy WeSpeaker was fully removed after ReDimNet2-B6 quality gate | 2026-07 |

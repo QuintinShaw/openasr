@@ -930,7 +930,7 @@ pub(super) fn ensure_cli_diarization_packs_installed(
         .speaker_diarization_required_embedder_pack()
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "Public catalog does not contain the WeSpeaker speaker-diarization embedder pack."
+                "Public catalog does not contain the ReDimNet2-B6 speaker-diarization embedder pack."
             )
         })?;
 
@@ -963,7 +963,7 @@ pub(super) fn ensure_word_timestamps_alignment_supported(
 }
 
 /// Passing `--word-timestamps=aligned` is itself the consent to install the
-/// Qwen3-ForcedAligner-0.6B capability pack, mirroring `--diarize`'s WeSpeaker
+/// Qwen3-ForcedAligner-0.6B capability pack, mirroring `--diarize`'s ReDimNet2-B6
 /// auto-install above -- `approximate` (or an omitted flag) never touches the
 /// network.
 pub(super) fn ensure_cli_word_timestamps_pack_installed(
@@ -1647,7 +1647,7 @@ mod tests {
         // Isolate the model-agnostic VAD + speaker-embedder probe from the host
         // machine's installed packs so the fail-closed expectations are hermetic.
         let _campplus_pack = EnvVarRestore::remove("OPENASR_CAMPPLUS_PACK");
-        let _wespeaker_pack = EnvVarRestore::remove("OPENASR_WESPEAKER_PACK");
+        let _redimnet_pack = EnvVarRestore::remove("OPENASR_REDIMNET_PACK");
         let _speaker_embedder = EnvVarRestore::remove("OPENASR_SPEAKER_EMBEDDER");
         let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
 
@@ -1670,16 +1670,16 @@ mod tests {
         assert!(error.contains("speaker-embedder pack"));
         assert!(error.contains(backend_name(BackendKind::Native)));
 
-        // Installing the WeSpeaker embedder pack enables the model-agnostic
+        // Installing the ReDimNet2-B6 embedder pack enables the model-agnostic
         // path for any native pack, and for the no-pack-path live preflight.
-        let wespeaker_pack = temp.path().join("wespeaker.oasr");
-        std::fs::write(&wespeaker_pack, b"GGUF\x00\x00\x00\x00").unwrap();
-        let _installed_wespeaker_pack =
-            EnvVarRestore::set_os("OPENASR_WESPEAKER_PACK", &wespeaker_pack);
+        let redimnet_pack = temp.path().join("redimnet.oasr");
+        std::fs::write(&redimnet_pack, b"GGUF\x00\x00\x00\x00").unwrap();
+        let _installed_redimnet_pack =
+            EnvVarRestore::set_os("OPENASR_REDIMNET_PACK", &redimnet_pack);
         ensure_diarization_supported(BackendKind::Native, Some(&base_runtime_path), true)
-            .expect("WeSpeaker pack should pass the CLI gate for any native pack");
+            .expect("ReDimNet2-B6 pack should pass the CLI gate for any native pack");
         ensure_diarization_supported(BackendKind::Native, None, true)
-            .expect("WeSpeaker pack should pass the CLI gate without a pack path");
+            .expect("ReDimNet2-B6 pack should pass the CLI gate without a pack path");
 
         let declared_runtime_path = temp.path().join("cohere-diarize.oasr");
         let declared_spec =

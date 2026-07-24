@@ -25,9 +25,10 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   byte-identical to offline). Official published packs with public product
   guarantees are still pending.
 - Speaker diarization is opt-in (`--diarize` / the API `diarize` flag). It uses
-  pure-Rust WeSpeaker speaker-embedding and pyannote segmentation capability packs
-  (pulled/installed on demand) to attribute anonymous `SPEAKER_NN` labels onto any
-  model's transcript; Cohere packs that declare
+  the ReDimNet2-B6 speaker-embedding pack and optional pyannote segmentation
+  capability packs (pulled/installed on demand) to attribute anonymous `SPEAKER_NN`
+  labels onto any model's transcript; without ReDimNet2-B6 installed, diarize fails
+  closed. Cohere packs that declare
   `openasr.features.diarization=cohere-token-stream-v1` can additionally emit
   inline speaker tokens. Without the required capability pack a diarize request
   fails closed rather than fabricating speaker labels. Labels are session-relative
@@ -65,7 +66,7 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   source audio through the Qwen3-ForcedAligner-0.6B capability pack and
   replaces each segment's word spans with the aligner's own output. Passing
   `=aligned` is the consent to install the pack (mirroring `--diarize`'s
-  WeSpeaker auto-install); the native backend never installs it silently
+  ReDimNet2-B6 auto-install); the native backend never installs it silently
   otherwise, and the server never auto-installs it at all (operator-gated pull
   only). It is native-backend-only, requires `--word-timestamps` semantics
   implicitly (word timestamps are always emitted for `aligned`), and does not

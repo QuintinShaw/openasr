@@ -9,7 +9,6 @@ use sha2::{Digest, Sha256};
 
 use crate::diarize::calibration::{
     REDIMNET_CALIBRATION, REDIMNET_CALIBRATION_VERSION, SpeakerCalibrationProfile,
-    WESPEAKER_CALIBRATION, WESPEAKER_CALIBRATION_VERSION,
 };
 use crate::diarize::embed::SpeakerEmbedderIdentity;
 
@@ -21,7 +20,6 @@ const REDIMNET_MODEL_VERSION: &str = "redimnet2-b6-cn-v1";
 pub const MATCHER_POLICY_VERSION: &str = "person-medoid-v1";
 
 /// Frontend identity labels. These are stable contracts, not human labels.
-pub const WESPEAKER_FRONTEND_VERSION: &str = "wespeaker-fbank-v1";
 pub const REDIMNET_FRONTEND_VERSION: &str = "redimnet-tfmel-v1";
 
 /// Marker used when a v1 profile is imported without full model/calibration
@@ -166,8 +164,8 @@ fn describe_embedder(
     &'static str,
     &'static str,
 ) {
-    // Calibration identity is structural: compare by the enrollment threshold
-    // pair that uniquely distinguishes the two shipped profiles today.
+    // Only ReDimNet2-B6 is a supported live embedder. Anything else still forms
+    // a space so fail-closed comparison works, but uses explicit unknown markers.
     let is_redimnet = calibration.enrollment_default_match_similarity
         == REDIMNET_CALIBRATION.enrollment_default_match_similarity
         && calibration.enrollment_match_margin == REDIMNET_CALIBRATION.enrollment_match_margin
@@ -180,20 +178,7 @@ fn describe_embedder(
             REDIMNET_FRONTEND_VERSION,
             REDIMNET_CALIBRATION_VERSION,
         )
-    } else if embedding_dim == 256
-        && calibration.enrollment_default_match_similarity
-            == WESPEAKER_CALIBRATION.enrollment_default_match_similarity
-    {
-        (
-            "wespeaker",
-            "wespeaker-voxceleb-resnet34-lm",
-            "wespeaker-v1",
-            WESPEAKER_FRONTEND_VERSION,
-            WESPEAKER_CALIBRATION_VERSION,
-        )
     } else {
-        // Unknown embedder: still form a space so fail-closed comparison works,
-        // but use explicit unknown markers rather than guessing a family.
         ("unknown", "unknown", "unknown", "unknown", "unknown")
     }
 }
@@ -246,17 +231,17 @@ mod tests {
 
     #[test]
     fn legacy_space_is_not_matchable() {
-        let legacy = EmbeddingSpace::legacy_unverifiable_v1(256, "sha256:old");
+        let legacy = EmbeddingSpace::legacy_unverifiable_v1(192, "sha256:old");
         assert!(legacy.legacy_unverifiable);
         assert!(!legacy.is_matchable());
         let modern = EmbeddingSpace::from_parts(
-            256,
+            192,
             "sha256:old",
-            "wespeaker",
-            "wespeaker-voxceleb-resnet34-lm",
-            "wespeaker-v1",
-            WESPEAKER_FRONTEND_VERSION,
-            WESPEAKER_CALIBRATION_VERSION,
+            "redimnet",
+            "redimnet2-b6",
+            "redimnet2-b6-cn-v1",
+            REDIMNET_FRONTEND_VERSION,
+            REDIMNET_CALIBRATION_VERSION,
             MATCHER_POLICY_VERSION,
         );
         assert!(!legacy.is_comparable_to(&modern));

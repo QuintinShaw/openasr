@@ -814,7 +814,7 @@ pub(crate) fn reject_unsupported_language(
 #[derive(Debug, Error)]
 pub enum BackendError {
     #[error(
-        "Diarization is not available for the {backend} backend in this setup.\nNative diarization needs the WeSpeaker speaker-embedder pack (wespeaker-voxceleb-resnet34-lm) or a self-diarizing model pack; install one, or omit --diarize / diarize=true."
+        "Diarization is not available for the {backend} backend in this setup.\nNative diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn) or a self-diarizing model pack; install one, or omit --diarize / diarize=true."
     )]
     DiarizationNotSupported { backend: &'static str },
     #[error(

@@ -16,7 +16,9 @@ class PublishModelTargetsTest(unittest.TestCase):
             "qwen3-asr-0.6b", ["fp16", "q8_0", "q4_k"], ["fp16", "q8_0", "q4_k"]
         )
         # Published diarization support packs keep their catalog-declared variants.
-        publish.validate_scope("wespeaker-voxceleb-resnet34-lm", ["f32"], ["f32"])
+        publish.validate_scope(
+            "redimnet2-b6-cn", ["fp16", "q8_0", "f32"], ["fp16", "q8_0", "f32"]
+        )
         publish.validate_scope("pyannote-segmentation-3.0", ["f32"], ["f32"])
 
         # Published support packs (moonshine, diarization, ...) are in the lane;
@@ -30,7 +32,7 @@ class PublishModelTargetsTest(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "must be exactly"):
             publish.validate_scope("qwen3-asr-0.6b", ["q8_0"], ["fp16", "q8_0", "q4_k"])
         with self.assertRaisesRegex(SystemExit, "must be exactly"):
-            publish.validate_scope("wespeaker-voxceleb-resnet34-lm", ["fp16"], ["f32"])
+            publish.validate_scope("redimnet2-b6-cn", ["fp16"], ["fp16", "q8_0", "f32"])
 
     def test_dry_run_builds_stage_without_writing_revision_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

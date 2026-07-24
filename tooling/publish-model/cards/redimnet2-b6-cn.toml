@@ -6,7 +6,7 @@ pipeline_tag = "feature-extraction"
 tagline = "ReDimNet2-B6 speaker embedder for OpenASR diarization — 192-d CN-enhanced embeddings, fully on-device"
 
 highlights = [
-  "🗣️ **Preferred OpenASR speaker embedder** — when installed, diarization prefers this pack over WeSpeaker for anonymous speaker labels on any ASR family",
+  "🗣️ **OpenASR speaker embedder** — the only supported speaker-embedding pack for diarization and Voice ID; required for anonymous speaker labels on any ASR family",
   "🧬 **192-dim ReDimNet2-B6** — PalabraAI's dimension-reshaping speaker net (12.5M params) with a Chinese-enhanced vb2+vox2+cnc2 training mix",
   "🔒 **Diarization, not identification** — anonymous session-relative labels; embeddings stay local and are discarded after the request unless you explicitly enroll a local profile",
   "🎯 **Parity-gated packaging** — ggml-graph forward pass matches the upstream Python reference at cosine ≥ 0.9999 on held-out fixtures",
@@ -18,11 +18,10 @@ ReDimNet2-B6 is PalabraAI's 12.5M-parameter speaker-embedding model from the
 ReDimNet2 family, trained on a VoxBlink2 + VoxCeleb2 + CN-Celeb2 mix so English and
 Chinese speakers share one embedding space. OpenASR packages the MIT-licensed
 checkpoint as a local `.oasr` capability pack and runs it through a ggml graph
-(not a pure-Rust hand-written forward). When this pack is installed it becomes the
-preferred speaker-embedding stage for diarization; the legacy WeSpeaker pack remains
-available as a fallback until a later quality gate retires it. Embeddings are 192-d
-cosine vectors with a ReDimNet-specific calibration profile, separate from WeSpeaker's
-256-d space.
+(not a pure-Rust hand-written forward). This is the only supported speaker-embedding
+stage for diarization and Voice ID: when the pack is missing, diarize/Voice ID
+requests fail closed rather than falling back to another embedder. Embeddings are
+192-d cosine vectors with a ReDimNet-specific calibration profile.
 """
 
 acknowledgement = """
@@ -39,11 +38,11 @@ being format conversion for local ggml-graph loading.
 tagline = "ReDimNet2-B6 说话人声纹模型，服务于 OpenASR 说话人分离 — 192 维中英增强声纹，完全本地运行"
 
 highlights = [
-  "🗣️ **OpenASR 优先声纹模型** — 安装后说话人分离会优先使用本包（而非 WeSpeaker）为任意语音模型的转写结果标注说话人",
+  "🗣️ **OpenASR 声纹模型** — 说话人分离与 Voice ID 唯一支持的声纹包；缺失时会明确失败，不会静默降级",
   "🧬 **192 维 ReDimNet2-B6** — 来自 PalabraAI 的维度重塑声纹网络（约 12.5M 参数），用含 vb2+vox2+cnc2 的中英混合数据训练",
   "🔒 **只分离说话人，不识别身份** — 只给匿名编号，声纹数据留在本地且用完即删，除非你主动注册本地档案",
   "🎯 **精度严格校验** — ggml 计算图前向与上游 Python 参考实现在固定样本上的余弦相似度 ≥ 0.9999",
   "🦀 **OpenASR 原生运行** — `.oasr` 格式无需 Python，与语音识别模型共用同一套下载和安装流程",
 ]
 
-source_sha256 = "308b60896b6f4259a921d6d2962ac36ddc347449e1ad43328ff3d12879ae16e0"
+source_sha256 = "b10d0b09639e22624457be6cd9bbe81a774d8eed3340880f67e533e462648a78"

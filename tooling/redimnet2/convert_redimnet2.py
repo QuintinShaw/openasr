@@ -9,7 +9,7 @@ UNet-style "dimension reshaping" speaker net that outputs a 192-d embedding.
 Design (see ``docs/design/redimnet2-b6-embedder.md``):
 
   * ReDimNet2 runs through a **ggml graph** (ggml-only invariant), unlike the
-    legacy pure-Rust WeSpeaker ResNet34. So this pack follows the standard ggml
+    former pure-Rust WeSpeaker ResNet34 (now removed). So this pack follows the standard ggml
     tensor convention: ``gguf.GGUFWriter`` stores dims in ggml ``ne`` order
     (torch shape reversed) and the flat payload in ggml memory order (ne0
     innermost). The Rust side reads each tensor's flat f32 via the existing
@@ -18,7 +18,7 @@ Design (see ``docs/design/redimnet2-b6-embedder.md``):
     agree on ggml memory order, so no transpose is needed.
   * The ``spec.*`` front-end buffers (DFT kernels, mel matrix, preemph filter)
     are **not** packed: the Rust ``RedimNetFrontend`` recomputes those
-    deterministic constants (matching the WeSpeaker ``Fbank`` convention). Only
+    deterministic constants (matching the historical WeSpeaker ``Fbank`` convention). Only
     the neural weights ship.
   * ``*.num_batches_tracked`` buffers are dropped (they are int64 counters, not
     weights).

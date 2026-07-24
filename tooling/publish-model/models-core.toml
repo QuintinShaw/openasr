@@ -360,26 +360,6 @@ min_core_version = "0.1.5"
 # catalog-declared variants. Speaker embedding/segmentation are
 # language-agnostic; `languages` lists the product's validated domains.
 
-["wespeaker-voxceleb-resnet34-lm"]
-kind = "capability-pack"
-family = "wespeaker"
-hf_repo = "OpenASR/wespeaker-voxceleb-resnet34-lm"
-release_public = true
-size = "embedder"
-registry_id = "wespeaker-voxceleb-resnet34-lm"
-display_name = "WeSpeaker ResNet34 Speaker Embedder (VoxCeleb)"
-license_name = "CC-BY-4.0"
-license_source = "https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM"
-license_class = "permissive"
-languages = ["en", "zh"]
-quants = ["f32"]
-recommended_quant = "f32"
-upstream_release_date = "2022-07-24"
-
-["wespeaker-voxceleb-resnet34-lm".capability]
-feature = "speaker-diarization"
-role = "speaker-embedder"
-
 ["redimnet2-b6-cn"]
 kind = "capability-pack"
 family = "redimnet2"
@@ -703,7 +683,7 @@ min_core_version = "0.1.17"
 min_cli_version = "0.1.17"
 
 # Qwen3-ForcedAligner-0.6B: a capability pack for the `word-timestamps`
-# feature (`--word-timestamps=aligned`), mirroring the wespeaker/pyannote
+# feature (`--word-timestamps=aligned`), mirroring the redimnet/pyannote
 # capability-pack entries above. Shares its thinker tensor layout with
 # qwen3-asr but is registered as its own family/architecture id
 # (`qwen3-forced-aligner`) since its NAR (single forward pass, argmax at

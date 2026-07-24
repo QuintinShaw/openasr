@@ -83,7 +83,7 @@ named person".
   user enrolled a primary user, the anonymous-to-`SPEAKER_ME` mapping happens on
   the client. The voiceprint never leaves the device, even in remote mode.
 - Bundled diarization weights are license-clean only (FireRedVAD Stream-VAD
-  Apache-2.0, pyannote-segmentation-3.0 MIT, WeSpeaker ResNet34 CC-BY-4.0 with
+  Apache-2.0, pyannote-segmentation-3.0 MIT, ReDimNet2-B6 MIT with
   attribution).
   Non-permissive models (e.g. NVIDIA Sortformer, CC-BY-NC) are never bundled and
   are reachable only through an explicit `openasr pull` with a license link-out.

@@ -1,7 +1,7 @@
 //! Offline PLDA diarization refinement.
 //!
 //! This module implements license-clean PLDA-based diarization refinement over
-//! OpenASR's own WeSpeaker embeddings. The dense resegmentation default is an
+//! OpenASR's own ReDimNet2-B6 embeddings. The dense resegmentation default is an
 //! honest PLDA mixture update, while a separate HMM VBx variant runs log-domain
 //! forward-backward over adjacent dense windows when explicitly selected. Both
 //! use the CC-BY-4.0 PLDA/LDA parameters distributed with the public
@@ -1225,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn vbx_gate_is_dense_wespeaker_context_only() {
+    fn vbx_gate_is_dense_redimnet_context_only() {
         let embedding = SpeakerEmbedding(vec![0.0; INPUT_DIM]);
         let context = ClusterContext {
             range: TimeRange::new(0.0, 1.0),

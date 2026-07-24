@@ -18,7 +18,7 @@ use super::enrollment::SpeakerDisplayAssignment;
 use super::voice_id::{PersonMatcher, VoiceIdAssignment, load_person_matcher_for_active_embedder};
 
 /// Default cosine-similarity floor to reuse an existing speaker. Mirrors the
-/// legacy reuse floor. The active WeSpeaker calibration can override this in
+/// legacy reuse floor. The active ReDimNet2-B6 calibration can override this in
 /// runtime constructors; this constant remains the conservative fallback.
 pub const DEFAULT_MATCH_SIMILARITY: f32 = 0.65;
 /// Shortest utterance (seconds at 16 kHz) worth embedding for diarization.
@@ -69,7 +69,7 @@ pub const MIN_DIARIZE_PEAK: f32 = 0.006;
 /// Window compared against recent speech for streaming speaker-change splits.
 pub const SPEAKER_CHANGE_REFERENCE_WINDOW_S: f32 = 2.5;
 /// Recent speech window used to detect that the in-flight utterance has changed
-/// speakers. WeSpeaker needs a few seconds to produce stable speaker-separation
+/// speakers. The embedder needs a few seconds to produce stable speaker-separation
 /// scores on this real mixed mic/video case.
 pub const SPEAKER_CHANGE_RECENT_WINDOW_S: f32 = 2.5;
 /// Re-check cadence for in-flight speaker changes.
@@ -371,7 +371,7 @@ impl SpeakerRegistry {
             }
             // Relaxed margin-based reuse for long, audible turns. Real
             // speaker-playback sessions (video narration over loudspeakers)
-            // push WeSpeaker same-speaker cosines well below the normal reuse
+            // push same-speaker cosines well below the normal reuse
             // floor, into the old spawn band, so the same voice fragmented
             // into several anonymous speakers. When the best anonymous
             // centroid still clearly outscores every other registry centroid,
@@ -457,7 +457,7 @@ impl SpeakerRegistry {
     }
 }
 
-/// Per-session streaming diarizer over the shared WeSpeaker embedder.
+/// Per-session streaming diarizer over the shared ReDimNet2-B6 embedder.
 pub struct StreamingDiarizer {
     embedder: &'static dyn SpeakerEmbedder,
     registry: SpeakerRegistry,
@@ -917,7 +917,21 @@ mod tests {
     }
 
     fn test_streaming_profile() -> StreamingCalibrationProfile {
-        super::super::calibration::WESPEAKER_CALIBRATION.streaming
+        // Frozen fixture profile for assignment-logic unit tests. Kept distinct
+        // from the production ReDimNet2-B6 streaming placeholders (still
+        // TODO-calibrated for realtime) so these tests pin the decision logic
+        // rather than unfinished product thresholds.
+        StreamingCalibrationProfile {
+            match_similarity: 0.57,
+            strong_existing_match_similarity: 0.65,
+            relaxed_match_similarity: 0.33,
+            relaxed_match_margin: 0.20,
+            relaxed_reuse_max_weight: 3.0,
+            new_speaker_max_existing_similarity: 0.44,
+            profile_anchor_similarity: 0.80,
+            native_profile_anchor_similarity: 0.50,
+            speaker_change_max_cosine: 0.42,
+        }
     }
 
     fn test_space() -> EmbeddingSpace {
@@ -1173,13 +1187,13 @@ mod tests {
     }
 
     #[test]
-    fn change_detector_uses_wespeaker_calibration() {
-        static WESPEAKER: WeSpeakerProfileEmbedder = WeSpeakerProfileEmbedder;
+    fn change_detector_uses_redimnet_calibration() {
+        static REDIMNET: RedimNetProfileEmbedder = RedimNetProfileEmbedder;
 
-        let detector = StreamingSpeakerChangeDetector::with_embedder(&WESPEAKER, 16_000);
+        let detector = StreamingSpeakerChangeDetector::with_embedder(&REDIMNET, 16_000);
         assert_eq!(
             detector.change_max_cosine,
-            super::super::calibration::WESPEAKER_CALIBRATION
+            super::super::calibration::REDIMNET_CALIBRATION
                 .streaming
                 .speaker_change_max_cosine
         );
@@ -1352,9 +1366,9 @@ mod tests {
         }
     }
 
-    struct WeSpeakerProfileEmbedder;
+    struct RedimNetProfileEmbedder;
 
-    impl SpeakerEmbedder for WeSpeakerProfileEmbedder {
+    impl SpeakerEmbedder for RedimNetProfileEmbedder {
         fn embed(&self, _samples: &[f32], _sr: u32) -> Result<SpeakerEmbedding, EmbedError> {
             Ok(emb(vec![1.0, 0.0]))
         }
@@ -1364,7 +1378,7 @@ mod tests {
         }
 
         fn calibration_profile(&self) -> super::super::calibration::SpeakerCalibrationProfile {
-            super::super::calibration::WESPEAKER_CALIBRATION
+            super::super::calibration::REDIMNET_CALIBRATION
         }
     }
 
@@ -1381,6 +1395,15 @@ mod tests {
 
         fn embedding_dim(&self) -> usize {
             2
+        }
+
+        fn calibration_profile(&self) -> super::super::calibration::SpeakerCalibrationProfile {
+            // Unit-test fixture: keep the historical native session-prior
+            // tolerance floor (0.50) that these embeddings were authored against.
+            // Production ReDimNet2 streaming placeholders remain separate.
+            let mut profile = super::super::calibration::REDIMNET_CALIBRATION;
+            profile.streaming = test_streaming_profile();
+            profile
         }
     }
 }

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-24T09:48:57+00:00",
+  "generated_at": "2026-07-24T10:20:50+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -80,13 +80,13 @@
       "prose": {
         "tagline": "State-of-the-art multilingual speech recognition across 52 languages & dialects",
         "overview": [
-          "Qwen3-ASR-1.7B is a multilingual automatic speech recognition model (~2B parameters,\n~1.7B active, BF16) from Alibaba's Qwen3-ASR family that transcribes speech while\nidentifying the spoken language across 30 languages, 22 Chinese dialects, and a range\nof regional English accents \u2014 and it holds up on hard audio including singing voice and\nsongs over background music. A single unified checkpoint serves both offline and\nreal-time streaming transcription, with word-level timestamps available via the\ncompanion Qwen3-ForcedAligner-0.6B; the Qwen team reports state-of-the-art quality among\nopen-source ASR models and accuracy competitive with commercial APIs. This OpenASR repo\nrepackages the original Qwen/Qwen3-ASR-1.7B weights as `.oasr` packs that run natively in\nthe OpenASR runtime with no Python at inference time. For most users the q8_0 build is the\nrecommended default \u2014 near-reference accuracy at roughly half the footprint \u2014 while q4_k\nsuits tight-memory deployments and fp16 is reserved for verification or maximum fidelity."
+          "Qwen3-ASR-1.7B is a multilingual automatic speech recognition model (~2B parameters,\n~1.7B active, BF16) from Alibaba's Qwen3-ASR family that transcribes speech while\nidentifying the spoken language across 30 languages, 22 Chinese dialects, and a range\nof regional English accents — and it holds up on hard audio including singing voice and\nsongs over background music. A single unified checkpoint serves both offline and\nreal-time streaming transcription, with word-level timestamps available via the\ncompanion Qwen3-ForcedAligner-0.6B; the Qwen team reports state-of-the-art quality among\nopen-source ASR models and accuracy competitive with commercial APIs. This OpenASR repo\nrepackages the original Qwen/Qwen3-ASR-1.7B weights as `.oasr` packs that run natively in\nthe OpenASR runtime with no Python at inference time. For most users the q8_0 build is the\nrecommended default — near-reference accuracy at roughly half the footprint — while q4_k\nsuits tight-memory deployments and fp16 is reserved for verification or maximum fidelity."
         ],
         "highlights": [
-          "\ud83c\udfc6 **SOTA among open-source ASR** \u2014 competitive with the strongest proprietary commercial APIs",
-          "\ud83c\udf0d **52 languages & dialects** \u2014 30 languages plus 22 Chinese dialects, with spoken-language identification",
-          "\ud83c\udfa7 **Robust on hard audio** \u2014 clean speech, singing voice, and songs over background music",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+          "🏆 **SOTA among open-source ASR** — competitive with the strongest proprietary commercial APIs",
+          "🌍 **52 languages & dialects** — 30 languages plus 22 Chinese dialects, with spoken-language identification",
+          "🎧 **Robust on hard audio** — clean speech, singing voice, and songs over background music",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
       "quants": [
@@ -145,12 +145,12 @@
       "recommended": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u8986\u76d6 52 \u79cd\u8bed\u8a00\u4e0e\u65b9\u8a00\uff0c\u5f00\u6e90\u8bed\u97f3\u8bc6\u522b\u4e2d\u7684\u9876\u5c16\u6c34\u51c6",
+          "tagline": "覆盖 52 种语言与方言，开源语音识别中的顶尖水准",
           "highlights": [
-            "\ud83c\udfc6 **\u5f00\u6e90\u8bed\u97f3\u8bc6\u522b\u7684\u5929\u82b1\u677f** \u2014 \u51c6\u786e\u7387\u53ef\u4e0e\u6700\u5f3a\u7684\u5546\u4e1a\u4ed8\u8d39\u63a5\u53e3\u4e00\u8f83\u9ad8\u4e0b",
-            "\ud83c\udf0d **52 \u79cd\u8bed\u8a00\u548c\u65b9\u8a00** \u2014 30 \u79cd\u8bed\u8a00\u52a0 22 \u79cd\u4e2d\u6587\u65b9\u8a00\uff0c\u81ea\u52a8\u8bc6\u522b\u5728\u8bf4\u54ea\u79cd\u8bed\u8a00",
-            "\ud83c\udfa7 **\u590d\u6742\u97f3\u9891\u4e5f\u80fd\u625b** \u2014 \u4e0d\u7ba1\u662f\u6e05\u6670\u4eba\u58f0\u3001\u5531\u6b4c\u8fd8\u662f\u5e26\u80cc\u666f\u97f3\u4e50\u7684\u6b4c\u66f2\uff0c\u90fd\u80fd\u7a33\u5b9a\u8bc6\u522b",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u8fd0\u884c\u65f6\u65e0\u9700 Python\uff0cCPU \u548c GPU \u90fd\u505a\u4e86\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+            "🏆 **开源语音识别的天花板** — 准确率可与最强的商业付费接口一较高下",
+            "🌍 **52 种语言和方言** — 30 种语言加 22 种中文方言，自动识别在说哪种语言",
+            "🎧 **复杂音频也能扛** — 不管是清晰人声、唱歌还是带背景音乐的歌曲，都能稳定识别",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，运行时无需 Python，CPU 和 GPU 都做了极致性能优化"
           ]
         }
       },
@@ -202,15 +202,15 @@
       "recommended_quant": "q8_0",
       "pull_recommended": "parakeet-tdt-0.6b-v3:q8",
       "prose": {
-        "tagline": "NVIDIA's multilingual speed flagship \u2014 25 European languages, TDT transducer with native word timestamps",
+        "tagline": "NVIDIA's multilingual speed flagship — 25 European languages, TDT transducer with native word timestamps",
         "overview": [
-          "Parakeet TDT 0.6B v3 is **NVIDIA's** 600M-parameter multilingual speech-recognition model, extending\nthe English-only v2 to **25 European languages** using the Granary multilingual corpus (~660k hours of\npseudo-labeled speech plus ~10k hours of human transcriptions). Architecturally it pairs a\n**FastConformer encoder** with a **Token-and-Duration Transducer (TDT)** decoder: each decode step\npredicts both the next token and how many 80 ms frames it occupies, then skips ahead by that duration \u2014\nwhich is what makes the family a speed benchmark for local transcription, and what gives it\nmodel-native word timestamps. The model auto-detects the spoken language, preserves punctuation and\ncapitalization, and is released under the permissive CC-BY-4.0 license. This OpenASR repo repackages\nthe weights as `.oasr` packs that run natively in the OpenASR runtime \u2014 no Python at inference time,\nall decoding local. The **q8_0** build is the recommended default; **q4_k** is the smallest build for\ntight-memory devices and **fp16** is for maximum fidelity or verification."
+          "Parakeet TDT 0.6B v3 is **NVIDIA's** 600M-parameter multilingual speech-recognition model, extending\nthe English-only v2 to **25 European languages** using the Granary multilingual corpus (~660k hours of\npseudo-labeled speech plus ~10k hours of human transcriptions). Architecturally it pairs a\n**FastConformer encoder** with a **Token-and-Duration Transducer (TDT)** decoder: each decode step\npredicts both the next token and how many 80 ms frames it occupies, then skips ahead by that duration —\nwhich is what makes the family a speed benchmark for local transcription, and what gives it\nmodel-native word timestamps. The model auto-detects the spoken language, preserves punctuation and\ncapitalization, and is released under the permissive CC-BY-4.0 license. This OpenASR repo repackages\nthe weights as `.oasr` packs that run natively in the OpenASR runtime — no Python at inference time,\nall decoding local. The **q8_0** build is the recommended default; **q4_k** is the smallest build for\ntight-memory devices and **fp16** is for maximum fidelity or verification."
         ],
         "highlights": [
-          "\ud83c\uddea\ud83c\uddfa **25 European languages** \u2014 one 0.6B checkpoint covers bg/hr/cs/da/nl/en/et/fi/fr/de/el/hu/it/lv/lt/mt/pl/pt/ro/sk/sl/es/sv/ru/uk, auto-detecting the spoken language with no prompting",
-          "\u26a1 **Built for throughput** \u2014 the Token-and-Duration Transducer (TDT) decoder predicts how many frames each token spans and skips ahead, cutting decode steps versus conventional transducers",
-          "\ud83d\udd51 **Native word timestamps** \u2014 the duration head is the model's own alignment output, so word-level timings come from the model rather than a uniform approximation",
-          "\u270d\ufe0f **Punctuation and capitalization** \u2014 trained on transcripts that preserve both (Granary + NeMo ASR Set 3.0; ~670k hours), so the raw decode reads like text"
+          "🇪🇺 **25 European languages** — one 0.6B checkpoint covers bg/hr/cs/da/nl/en/et/fi/fr/de/el/hu/it/lv/lt/mt/pl/pt/ro/sk/sl/es/sv/ru/uk, auto-detecting the spoken language with no prompting",
+          "⚡ **Built for throughput** — the Token-and-Duration Transducer (TDT) decoder predicts how many frames each token spans and skips ahead, cutting decode steps versus conventional transducers",
+          "🕑 **Native word timestamps** — the duration head is the model's own alignment output, so word-level timings come from the model rather than a uniform approximation",
+          "✍️ **Punctuation and capitalization** — trained on transcripts that preserve both (Granary + NeMo ASR Set 3.0; ~670k hours), so the raw decode reads like text"
         ]
       },
       "quants": [
@@ -269,12 +269,12 @@
       "recommended": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "NVIDIA \u591a\u8bed\u79cd\u901f\u5ea6\u65d7\u8230 \u2014 25 \u79cd\u6b27\u6d32\u8bed\u8a00\uff0c\u81ea\u5e26\u7cbe\u51c6\u8bcd\u7ea7\u65f6\u95f4\u6233",
+          "tagline": "NVIDIA 多语种速度旗舰 — 25 种欧洲语言，自带精准词级时间戳",
           "highlights": [
-            "\ud83c\uddea\ud83c\uddfa **25 \u79cd\u6b27\u6d32\u8bed\u8a00** \u2014 \u4e00\u4e2a 0.6B \u6a21\u578b\u8986\u76d6\u82f1\u3001\u6cd5\u3001\u5fb7\u3001\u897f\u3001\u610f\u3001\u4fc4\u3001\u4e4c\u514b\u5170\u7b49\u591a\u79cd\u6b27\u6d32\u8bed\u8a00\uff0c\u81ea\u52a8\u8bc6\u522b\u8bed\u79cd\uff0c\u65e0\u9700\u624b\u52a8\u8bbe\u7f6e",
-            "\u26a1 **\u4e13\u4e3a\u9ad8\u901f\u5904\u7406\u6253\u9020** \u2014 \u80fd\u9884\u6d4b\u6bcf\u6bb5\u8bed\u97f3\u7684\u6301\u7eed\u65f6\u95f4\u5e76\u667a\u80fd\u8df3\u8fc7\u5197\u4f59\u6b65\u9aa4\uff0c\u8f6c\u5199\u901f\u5ea6\u6bd4\u5e38\u89c4\u65b9\u6848\u5927\u5e45\u63d0\u5347",
-            "\ud83d\udd51 **\u539f\u751f\u8bcd\u7ea7\u65f6\u95f4\u6233** \u2014 \u6bcf\u4e2a\u8bcd\u7684\u65f6\u95f4\u4f4d\u7f6e\u7531\u6a21\u578b\u81ea\u8eab\u7cbe\u786e\u8ba1\u7b97\uff0c\u800c\u975e\u4e8b\u540e\u5747\u5300\u4f30\u7b97\uff0c\u5b9a\u4f4d\u66f4\u51c6",
-            "\u270d\ufe0f **\u81ea\u5e26\u6807\u70b9\u548c\u5927\u5c0f\u5199** \u2014 \u57fa\u4e8e\u7ea6 670k \u5c0f\u65f6\u4fdd\u7559\u6807\u70b9\u4e0e\u5927\u5c0f\u5199\u7684\u8bed\u6599\uff08Granary + NeMo ASR Set 3.0\uff09\u8bad\u7ec3\uff0c\u8f6c\u5199\u7ed3\u679c\u62ff\u6765\u5c31\u80fd\u8bfb"
+            "🇪🇺 **25 种欧洲语言** — 一个 0.6B 模型覆盖英、法、德、西、意、俄、乌克兰等多种欧洲语言，自动识别语种，无需手动设置",
+            "⚡ **专为高速处理打造** — 能预测每段语音的持续时间并智能跳过冗余步骤，转写速度比常规方案大幅提升",
+            "🕑 **原生词级时间戳** — 每个词的时间位置由模型自身精确计算，而非事后均匀估算，定位更准",
+            "✍️ **自带标点和大小写** — 基于约 670k 小时保留标点与大小写的语料（Granary + NeMo ASR Set 3.0）训练，转写结果拿来就能读"
           ]
         }
       },
@@ -329,16 +329,16 @@
       "recommended_quant": "q4_k",
       "pull_recommended": "firered-aed-l-v2:q4",
       "prose": {
-        "tagline": "FireRedTeam's Mandarin-first bilingual ASR \u2014 attention encoder-decoder tuned for state-of-the-art Chinese and dialect accuracy",
+        "tagline": "FireRedTeam's Mandarin-first bilingual ASR — attention encoder-decoder tuned for state-of-the-art Chinese and dialect accuracy",
         "overview": [
           "FireRedASR2-AED is the attention-based encoder-decoder member of **FireRedASR2**, the successor\nto FireRedTeam's open-source industrial-grade **FireRedASR** speech-recognition family, released\nas part of the **FireRedASR2S** all-in-one ASR system. It pairs a **Conformer encoder** with a\n**Transformer decoder** at 1.1B parameters -- architecturally byte-identical to the original\nFireRedASR-AED-L -- retrained on a larger token vocabulary. The FireRedASR2S technical report\n(arXiv:2603.10420, Table 2) reports **3.05% average Character Error Rate** across four public\nMandarin benchmarks (aishell1 at 0.57%), **11.67% average CER** across 19 public Chinese\ndialect/accent benchmarks, and **1.17% CER** on a singing-lyrics benchmark, outperforming\nDoubao-ASR and matching Qwen3-ASR on the paper's own comparison table. It is bilingual (Mandarin\nChinese and English, including code-switching). This OpenASR repo repackages the weights as\n`.oasr` packs that run natively in the OpenASR runtime -- no Python at inference time, all\ndecoding local. The **q4_k** build is the recommended default for everyday use; **q8_0** trades\nsome size for closer fp16 fidelity and **fp16** is for maximum fidelity or verification. Note:\nFireRedTeam also publishes a larger **FireRedASR2-LLM** (Encoder-Adapter-LLM, 2.89%/11.55% avg\nCER) variant that this repo does not distribute -- the numbers above are for this AED checkpoint\nonly, and should not be conflated with the original (v1) FireRedASR-AED-L's 3.18%/0.55% figures,\nwhich come from a different training run and benchmark protocol."
         ],
         "highlights": [
-          "\ud83e\udd47 **State-of-the-art Mandarin accuracy** \u2014 3.05% average CER across four public Mandarin benchmarks, with 0.57% CER on aishell1 (arXiv:2603.10420 Table 2)",
-          "\ud83d\udde3\ufe0f **Strong dialect coverage** \u2014 11.67% average CER across 19 public Chinese dialect/accent benchmarks, beating Doubao-ASR (15.39%) and matching Qwen3-ASR (11.85%) on the paper's own comparison table",
-          "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **Bilingual Mandarin + English** \u2014 one 1.1B checkpoint decodes both languages plus code-switching, no language flag needed",
-          "\ud83c\udfa4 **Singing-lyrics robustness** \u2014 the paper reports 1.17% CER on a singing-lyrics benchmark, alongside the speech-recognition numbers above",
-          "\ud83c\udfd7\ufe0f **Conformer encoder + Transformer decoder** \u2014 an attention-based encoder-decoder, architecturally identical to FireRedASR-AED-L, retrained on a larger vocabulary"
+          "🥇 **State-of-the-art Mandarin accuracy** — 3.05% average CER across four public Mandarin benchmarks, with 0.57% CER on aishell1 (arXiv:2603.10420 Table 2)",
+          "🗣️ **Strong dialect coverage** — 11.67% average CER across 19 public Chinese dialect/accent benchmarks, beating Doubao-ASR (15.39%) and matching Qwen3-ASR (11.85%) on the paper's own comparison table",
+          "🇨🇳🇬🇧 **Bilingual Mandarin + English** — one 1.1B checkpoint decodes both languages plus code-switching, no language flag needed",
+          "🎤 **Singing-lyrics robustness** — the paper reports 1.17% CER on a singing-lyrics benchmark, alongside the speech-recognition numbers above",
+          "🏗️ **Conformer encoder + Transformer decoder** — an attention-based encoder-decoder, architecturally identical to FireRedASR-AED-L, retrained on a larger vocabulary"
         ]
       },
       "quants": [
@@ -397,13 +397,13 @@
       "recommended": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "FireRedTeam \u51fa\u54c1\u7684\u4e2d\u6587\u4f18\u5148\u53cc\u8bed\u8bed\u97f3\u8bc6\u522b \u2014 \u4e2d\u6587\u548c\u65b9\u8a00\u51c6\u786e\u7387\u8fbe\u5230\u4e1a\u754c\u9876\u5c16\u6c34\u5e73",
+          "tagline": "FireRedTeam 出品的中文优先双语语音识别 — 中文和方言准确率达到业界顶尖水平",
           "highlights": [
-            "\ud83e\udd47 **\u4e2d\u6587\u8bc6\u522b\u51c6\u786e\u7387\u9876\u5c16** \u2014 \u5728\u56db\u4e2a\u516c\u5f00\u4e2d\u6587\u57fa\u51c6\u6d4b\u8bd5\u4e2d\u5e73\u5747\u5b57\u9519\u7387\u4ec5 3.05%\uff0caishell1 \u4e0a\u4f4e\u81f3 0.57%\uff08arXiv:2603.10420 \u8868 2\uff09",
-            "\ud83d\udde3\ufe0f **\u65b9\u8a00\u8986\u76d6\u5f3a** \u2014 \u5728 19 \u4e2a\u516c\u5f00\u4e2d\u6587\u65b9\u8a00\uff0f\u53e3\u97f3\u57fa\u51c6\u4e0a\u5e73\u5747\u5b57\u9519\u7387 11.67%\uff0c\u4f18\u4e8e Doubao-ASR\uff0815.39%\uff09\uff0c\u4e0e Qwen3-ASR\uff0811.85%\uff09\u4e0d\u76f8\u4e0a\u4e0b\uff08\u8bba\u6587\u5bf9\u6bd4\u8868\u6570\u636e\uff09",
-            "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **\u4e2d\u82f1\u53cc\u8bed\u4e00\u4e2a\u6a21\u578b** \u2014 1.1B \u53c2\u6570\u7684\u5355\u4e00\u6a21\u578b\u540c\u65f6\u641e\u5b9a\u4e2d\u6587\u548c\u82f1\u8bed\uff0c\u4e2d\u82f1\u6df7\u8bf4\u4e5f\u6ca1\u95ee\u9898\uff0c\u4e0d\u7528\u624b\u52a8\u6307\u5b9a\u8bed\u8a00",
-            "\ud83c\udfa4 **\u5531\u6b4c\u6b4c\u8bcd\u4e5f\u80fd\u8ba4** \u2014 \u5728\u6f14\u5531\u6b4c\u8bcd\u57fa\u51c6\u4e0a\u5b57\u9519\u7387\u4ec5 1.17%\uff0c\u8fde\u5531\u6b4c\u65f6\u7684\u6b4c\u8bcd\u4e5f\u80fd\u51c6\u786e\u8f6c\u5199",
-            "\ud83c\udfd7\ufe0f **\u7ecf\u5178\u7ed3\u6784\u518d\u5347\u7ea7** \u2014 \u4e0e FireRedASR-AED-L \u7ed3\u6784\u5b8c\u5168\u4e00\u81f4\uff0c\u5728\u66f4\u5927\u7684\u8bcd\u8868\u4e0a\u91cd\u65b0\u8bad\u7ec3"
+            "🥇 **中文识别准确率顶尖** — 在四个公开中文基准测试中平均字错率仅 3.05%，aishell1 上低至 0.57%（arXiv:2603.10420 表 2）",
+            "🗣️ **方言覆盖强** — 在 19 个公开中文方言／口音基准上平均字错率 11.67%，优于 Doubao-ASR（15.39%），与 Qwen3-ASR（11.85%）不相上下（论文对比表数据）",
+            "🇨🇳🇬🇧 **中英双语一个模型** — 1.1B 参数的单一模型同时搞定中文和英语，中英混说也没问题，不用手动指定语言",
+            "🎤 **唱歌歌词也能认** — 在演唱歌词基准上字错率仅 1.17%，连唱歌时的歌词也能准确转写",
+            "🏗️ **经典结构再升级** — 与 FireRedASR-AED-L 结构完全一致，在更大的词表上重新训练"
           ]
         }
       },
@@ -436,15 +436,15 @@
       "recommended_quant": "q8_0",
       "pull_recommended": "xasr-zh-en:q8",
       "prose": {
-        "tagline": "Bilingual Chinese + English streaming speech recognition \u2014 a compact icefall Zipformer2 transducer",
+        "tagline": "Bilingual Chinese + English streaming speech recognition — a compact icefall Zipformer2 transducer",
         "overview": [
-          "X-ASR-zh-en is a compact **bilingual (Chinese + English)** streaming speech-recognition model from\n**GilgameshWind**, built with the **icefall / k2** recipe as a cache-aware **Zipformer2 RNN-T\ntransducer** (a 6-stack, 19-layer Zipformer2 encoder, a stateless RNN-T decoder, and a tanh joiner\nover a 5000-token BPE vocabulary, ~0.16B parameters). The same checkpoint serves both low-latency\n**streaming** captions and full-file **offline** transcription, making it a good fit for on-device\nChinese/English dictation and real-time subtitles. This OpenASR repo repackages the weights as\n`.oasr` packs that run natively in the OpenASR runtime \u2014 no Python at inference time, all decoding\nlocal. The **q8_0** build is the recommended default (it matched the fp16 transcript bit-for-bit in\nOpenASR's verification); **q4_k** is the smallest build for tight-memory devices and **fp16** is for\nmaximum fidelity or verification."
+          "X-ASR-zh-en is a compact **bilingual (Chinese + English)** streaming speech-recognition model from\n**GilgameshWind**, built with the **icefall / k2** recipe as a cache-aware **Zipformer2 RNN-T\ntransducer** (a 6-stack, 19-layer Zipformer2 encoder, a stateless RNN-T decoder, and a tanh joiner\nover a 5000-token BPE vocabulary, ~0.16B parameters). The same checkpoint serves both low-latency\n**streaming** captions and full-file **offline** transcription, making it a good fit for on-device\nChinese/English dictation and real-time subtitles. This OpenASR repo repackages the weights as\n`.oasr` packs that run natively in the OpenASR runtime — no Python at inference time, all decoding\nlocal. The **q8_0** build is the recommended default (it matched the fp16 transcript bit-for-bit in\nOpenASR's verification); **q4_k** is the smallest build for tight-memory devices and **fp16** is for\nmaximum fidelity or verification."
         ],
         "highlights": [
-          "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **Chinese + English** \u2014 one bilingual checkpoint for zh/en speech, including code-switched audio",
-          "\u26a1 **Streaming-first, offline-capable** \u2014 a cache-aware streaming Zipformer2 transducer for low-latency captions that also runs full-file offline transcription",
-          "\ud83e\udeb6 **Compact ~0.16B** \u2014 a 6-stack Zipformer2 encoder + stateless RNN-T decoder + tanh joiner over a 5000-token BPE vocab, light enough for on-device CPU",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+          "🇨🇳🇬🇧 **Chinese + English** — one bilingual checkpoint for zh/en speech, including code-switched audio",
+          "⚡ **Streaming-first, offline-capable** — a cache-aware streaming Zipformer2 transducer for low-latency captions that also runs full-file offline transcription",
+          "🪶 **Compact ~0.16B** — a 6-stack Zipformer2 encoder + stateless RNN-T decoder + tanh joiner over a 5000-token BPE vocab, light enough for on-device CPU",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
       "quants": [
@@ -503,12 +503,12 @@
       "recommended": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u4e2d\u82f1 2 \u79cd\u8bed\u8a00\u6d41\u5f0f\u8bed\u97f3\u8bc6\u522b \u2014 \u8f7b\u91cf\u7d27\u51d1\uff0c\u8fb9\u8bf4\u8fb9\u8f6c",
+          "tagline": "中英 2 种语言流式语音识别 — 轻量紧凑，边说边转",
           "highlights": [
-            "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **\u4e2d\u6587 + \u82f1\u6587** \u2014 \u4e00\u4e2a\u6a21\u578b\u540c\u65f6\u641e\u5b9a\u4e2d\u82f1\u53cc\u8bed\uff0c\u5305\u62ec\u4e2d\u82f1\u6df7\u8bf4\u7684\u573a\u666f",
-            "\u26a1 **\u6d41\u5f0f\u4f18\u5148\uff0c\u517c\u987e\u79bb\u7ebf** \u2014 \u652f\u6301\u6d41\u5f0f\u548c\u79bb\u7ebf 2 \u79cd\u6a21\u5f0f\uff0c\u65e2\u80fd\u4f4e\u5ef6\u8fdf\u5b9e\u65f6\u5b57\u5e55\uff0c\u4e5f\u80fd\u6574\u6bb5\u79bb\u7ebf\u8f6c\u5199",
-            "\ud83e\udeb6 **\u8f7b\u91cf ~0.16B** \u2014 6 \u7ea7\u58f0\u5b66\u5206\u6790\uff0c\u8bcd\u8868\u4ec5 5000 \u8bcd\uff0c\u652f\u6301 2 \u79cd\u8bed\u8a00\uff0c\u6574\u4f53\u8db3\u591f\u5c0f\u5de7\uff0c\u666e\u901a\u7535\u8111 CPU \u5c31\u80fd\u6d41\u7545\u8fd0\u884c",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u8fd0\u884c\u65f6\u65e0\u9700 Python\uff0cCPU \u548c GPU \u90fd\u505a\u4e86\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+            "🇨🇳🇬🇧 **中文 + 英文** — 一个模型同时搞定中英双语，包括中英混说的场景",
+            "⚡ **流式优先，兼顾离线** — 支持流式和离线 2 种模式，既能低延迟实时字幕，也能整段离线转写",
+            "🪶 **轻量 ~0.16B** — 6 级声学分析，词表仅 5000 词，支持 2 种语言，整体足够小巧，普通电脑 CPU 就能流畅运行",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，运行时无需 Python，CPU 和 GPU 都做了极致性能优化"
           ]
         }
       },
@@ -554,14 +554,14 @@
       "prose": {
         "tagline": "Chinese multi-dialect speech recognition -- a WeNet E-Branchformer (CTC + attention) tuned for Sichuan and 22 regional dialects",
         "overview": [
-          "Dolphin CN-Dialect Small is a **Chinese multi-dialect** speech-recognition model from\n**DataoceanAI**, built on the **Dolphin / WeNet** recipe as an **E-Branchformer encoder +\nTransformer decoder** trained with a **joint CTC + attention** objective (the `small.cn`\ncheckpoint over a character vocabulary). It specializes in regional Mandarin \u2014 a standout\n**Sichuan (\u5ddd\u8bdd)** capability alongside 22 Chinese dialects such as Wu, Cantonese, Minnan and\nShanghainese \u2014 while keeping strong standard-Mandarin transcription (the card reports a large\nrelative gain on dialect recognition and a meaningful CER reduction over the base Dolphin).\nThis OpenASR repo repackages the weights as `.oasr` packs that run natively in the OpenASR\nruntime \u2014 no Python at inference, all decoding local. OpenASR decodes it with CTC beam search\nplus attention rescoring and verified the transcript bit-exact against a golden reference on a\nSichuan-dialect clip. It ships in **fp16** (maximum fidelity, recommended), **q8_0**, and **q4_k** builds.\n\n**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed\nwithout punctuation marks, so the decoder never predicts a punctuation token -- there is no\nsetting to enable it. Transcripts are plain, unpunctuated text by design."
+          "Dolphin CN-Dialect Small is a **Chinese multi-dialect** speech-recognition model from\n**DataoceanAI**, built on the **Dolphin / WeNet** recipe as an **E-Branchformer encoder +\nTransformer decoder** trained with a **joint CTC + attention** objective (the `small.cn`\ncheckpoint over a character vocabulary). It specializes in regional Mandarin — a standout\n**Sichuan (川话)** capability alongside 22 Chinese dialects such as Wu, Cantonese, Minnan and\nShanghainese — while keeping strong standard-Mandarin transcription (the card reports a large\nrelative gain on dialect recognition and a meaningful CER reduction over the base Dolphin).\nThis OpenASR repo repackages the weights as `.oasr` packs that run natively in the OpenASR\nruntime — no Python at inference, all decoding local. OpenASR decodes it with CTC beam search\nplus attention rescoring and verified the transcript bit-exact against a golden reference on a\nSichuan-dialect clip. It ships in **fp16** (maximum fidelity, recommended), **q8_0**, and **q4_k** builds.\n\n**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed\nwithout punctuation marks, so the decoder never predicts a punctuation token -- there is no\nsetting to enable it. Transcripts are plain, unpunctuated text by design."
         ],
         "highlights": [
-          "\ud83c\udc04 **22 Chinese dialects** \u2014 a WeNet E-Branchformer tuned for regional Mandarin, with a standout Sichuan (\u5ddd\u8bdd) strength across Wu, Cantonese, Minnan, Shanghainese and more",
-          "\ud83c\udfaf **Dialect-first accuracy** \u2014 a reported ~38% relative gain on dialect recognition and ~16% lower CER versus the base Dolphin, without giving up standard Mandarin",
-          "\ud83e\udde9 **Joint CTC + attention** \u2014 an E-Branchformer encoder with a Transformer decoder and CTC/attention rescoring that OpenASR runs bit-exact against its golden reference",
-          "\ud83d\udc2c **Chinese-focused, char-level** \u2014 a compact `small.cn` checkpoint over a character vocabulary, purpose-built for zh audio including heavy accents and code-mixed speech",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+          "🀄 **22 Chinese dialects** — a WeNet E-Branchformer tuned for regional Mandarin, with a standout Sichuan (川话) strength across Wu, Cantonese, Minnan, Shanghainese and more",
+          "🎯 **Dialect-first accuracy** — a reported ~38% relative gain on dialect recognition and ~16% lower CER versus the base Dolphin, without giving up standard Mandarin",
+          "🧩 **Joint CTC + attention** — an E-Branchformer encoder with a Transformer decoder and CTC/attention rescoring that OpenASR runs bit-exact against its golden reference",
+          "🐬 **Chinese-focused, char-level** — a compact `small.cn` checkpoint over a character vocabulary, purpose-built for zh audio including heavy accents and code-mixed speech",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
       "quants": [
@@ -621,13 +621,13 @@
       "recommended": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u4e2d\u6587\u591a\u65b9\u8a00\u8bed\u97f3\u8bc6\u522b \u2014 \u4e13\u4e3a\u56db\u5ddd\u8bdd\u53ca 22 \u79cd\u5730\u65b9\u65b9\u8a00\u6253\u9020",
+          "tagline": "中文多方言语音识别 — 专为四川话及 22 种地方方言打造",
           "highlights": [
-            "\ud83c\udc04 **22 \u79cd\u4e2d\u6587\u65b9\u8a00** \u2014 \u9488\u5bf9\u5404\u5730\u666e\u901a\u8bdd\u65b9\u8a00\u8c03\u4f18\uff0c\u56db\u5ddd\u8bdd\uff08\u5ddd\u8bdd\uff09\u8868\u73b0\u5c24\u4e3a\u7a81\u51fa\uff0c\u540c\u65f6\u8986\u76d6\u5434\u8bed\u3001\u7ca4\u8bed\u3001\u95fd\u5357\u8bed\u3001\u4e0a\u6d77\u8bdd\u7b49",
-            "\ud83c\udfaf **\u65b9\u8a00\u8bc6\u522b\u66f4\u51c6** \u2014 \u76f8\u6bd4\u57fa\u7840\u7248 Dolphin\uff0c\u65b9\u8a00\u8bc6\u522b\u51c6\u786e\u7387\u76f8\u5bf9\u63d0\u5347\u7ea6 38%\uff0c\u5b57\u9519\u7387\u964d\u4f4e\u7ea6 16%\uff0c\u540c\u65f6\u666e\u901a\u8bdd\u8bc6\u522b\u4e0d\u6253\u6298",
-            "\ud83e\udde9 **\u53cc\u8def\u4ea4\u53c9\u6821\u9a8c** \u2014 \u5185\u7f6e\u4e24\u5957\u8bc6\u522b\u673a\u5236\u4e92\u76f8\u6bd4\u5bf9\u7ed3\u679c\uff0cOpenASR \u4e0e\u6807\u51c6\u53c2\u8003\u9010\u6bd4\u7279\u9a8c\u8bc1\u4e00\u81f4",
-            "\ud83d\udc2c **\u4e2d\u6587\u4e3a\u4e3b\uff0c\u9010\u5b57\u8bc6\u522b** \u2014 \u7d27\u51d1\u7684 `small.cn` \u6a21\u578b\uff0c\u4e13\u4e3a\u4e2d\u6587\u97f3\u9891\u6253\u9020\uff0c\u91cd\u53e3\u97f3\u548c\u4e2d\u82f1\u6df7\u8bf4\u90fd\u80fd\u5e94\u5bf9",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u65e0\u9700\u5b89\u88c5 Python\uff0c\u5728 CPU \u548c GPU \u4e0a\u90fd\u6709\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+            "🀄 **22 种中文方言** — 针对各地普通话方言调优，四川话（川话）表现尤为突出，同时覆盖吴语、粤语、闽南语、上海话等",
+            "🎯 **方言识别更准** — 相比基础版 Dolphin，方言识别准确率相对提升约 38%，字错率降低约 16%，同时普通话识别不打折",
+            "🧩 **双路交叉校验** — 内置两套识别机制互相比对结果，OpenASR 与标准参考逐比特验证一致",
+            "🐬 **中文为主，逐字识别** — 紧凑的 `small.cn` 模型，专为中文音频打造，重口音和中英混说都能应对",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式无需安装 Python，在 CPU 和 GPU 上都有极致性能优化"
           ]
         }
       },
@@ -709,15 +709,15 @@
       "recommended_quant": "q8_0",
       "pull_recommended": "qwen3-asr-0.6b:q8",
       "prose": {
-        "tagline": "Multilingual speech recognition across 52 languages & dialects \u2014 the fast, lightweight Qwen3-ASR",
+        "tagline": "Multilingual speech recognition across 52 languages & dialects — the fast, lightweight Qwen3-ASR",
         "overview": [
-          "Qwen3-ASR-0.6B is the compact, efficiency-optimized member of Alibaba's **Qwen3-ASR** family,\nbuilt on the Qwen3-Omni audio-understanding foundation. It performs language identification and\nspeech recognition across **30 languages and 22 Chinese dialects** (52 in total), and stays robust\non challenging audio \u2014 clean speech, singing voice, and songs with background music. A single\nunified checkpoint handles both offline and real-time streaming transcription and can process long\naudio; the 0.6B size targets a strong accuracy-vs-efficiency trade-off (the Qwen team reports up to\n~2000\u00d7 throughput at high concurrency), making it the family's go-to for lightweight, high-throughput\ndeployments. This OpenASR repo repackages the original weights as `.oasr` packs that run natively in\nthe OpenASR runtime \u2014 no Python at inference time. The **q8_0** build is the recommended default\n(near-reference accuracy at roughly half the footprint); **q4_k** suits tight-memory devices and\n**fp16** is for verification or maximum fidelity. For word-level timestamps, pair it upstream with\nQwen3-ForcedAligner-0.6B."
+          "Qwen3-ASR-0.6B is the compact, efficiency-optimized member of Alibaba's **Qwen3-ASR** family,\nbuilt on the Qwen3-Omni audio-understanding foundation. It performs language identification and\nspeech recognition across **30 languages and 22 Chinese dialects** (52 in total), and stays robust\non challenging audio — clean speech, singing voice, and songs with background music. A single\nunified checkpoint handles both offline and real-time streaming transcription and can process long\naudio; the 0.6B size targets a strong accuracy-vs-efficiency trade-off (the Qwen team reports up to\n~2000× throughput at high concurrency), making it the family's go-to for lightweight, high-throughput\ndeployments. This OpenASR repo repackages the original weights as `.oasr` packs that run natively in\nthe OpenASR runtime — no Python at inference time. The **q8_0** build is the recommended default\n(near-reference accuracy at roughly half the footprint); **q4_k** suits tight-memory devices and\n**fp16** is for verification or maximum fidelity. For word-level timestamps, pair it upstream with\nQwen3-ForcedAligner-0.6B."
         ],
         "highlights": [
-          "\ud83c\udf0d **52 languages & dialects** \u2014 30 languages plus 22 Chinese dialects, with built-in spoken-language identification",
-          "\ud83c\udfa7 **Robust on hard audio** \u2014 clean speech, singing voice, and songs over background music",
-          "\u26a1 **Fast & light** \u2014 the efficiency-tuned member of the Qwen3-ASR family; one model for both offline and streaming",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+          "🌍 **52 languages & dialects** — 30 languages plus 22 Chinese dialects, with built-in spoken-language identification",
+          "🎧 **Robust on hard audio** — clean speech, singing voice, and songs over background music",
+          "⚡ **Fast & light** — the efficiency-tuned member of the Qwen3-ASR family; one model for both offline and streaming",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
       "quants": [
@@ -776,12 +776,12 @@
       "recommended": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u8986\u76d6 52 \u79cd\u8bed\u8a00\u4e0e\u65b9\u8a00\u7684\u591a\u8bed\u8a00\u8bed\u97f3\u8bc6\u522b \u2014 \u53c8\u5feb\u53c8\u8f7b\u7684 Qwen3-ASR",
+          "tagline": "覆盖 52 种语言与方言的多语言语音识别 — 又快又轻的 Qwen3-ASR",
           "highlights": [
-            "\ud83c\udf0d **52 \u79cd\u8bed\u8a00\u548c\u65b9\u8a00** \u2014 30 \u79cd\u8bed\u8a00\u52a0 22 \u79cd\u4e2d\u6587\u65b9\u8a00\uff0c\u5185\u7f6e\u8bed\u79cd\u81ea\u52a8\u8bc6\u522b",
-            "\ud83c\udfa7 **\u590d\u6742\u97f3\u9891\u4e5f\u80fd\u625b** \u2014 \u4e0d\u7ba1\u662f\u6e05\u6670\u4eba\u58f0\u3001\u5531\u6b4c\u8fd8\u662f\u5e26\u80cc\u666f\u97f3\u4e50\u7684\u6b4c\u66f2\uff0c\u90fd\u80fd\u7a33\u5b9a\u8bc6\u522b",
-            "\u26a1 **\u53c8\u5feb\u53c8\u8f7b** \u2014 Qwen3-ASR \u5bb6\u65cf\u91cc\u4e3b\u6253\u6548\u7387\u7684\u6210\u5458\uff0c\u4e00\u4e2a\u6a21\u578b\u540c\u65f6\u641e\u5b9a\u79bb\u7ebf\u548c\u6d41\u5f0f\u8f6c\u5199",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u8fd0\u884c\u65f6\u65e0\u9700 Python\uff0cCPU \u548c GPU \u90fd\u505a\u4e86\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+            "🌍 **52 种语言和方言** — 30 种语言加 22 种中文方言，内置语种自动识别",
+            "🎧 **复杂音频也能扛** — 不管是清晰人声、唱歌还是带背景音乐的歌曲，都能稳定识别",
+            "⚡ **又快又轻** — Qwen3-ASR 家族里主打效率的成员，一个模型同时搞定离线和流式转写",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，运行时无需 Python，CPU 和 GPU 都做了极致性能优化"
           ]
         }
       },
@@ -816,16 +816,16 @@
       "recommended_quant": "fp16",
       "pull_recommended": "sensevoice-small:fp16",
       "prose": {
-        "tagline": "Fast multilingual speech recognition from FunAudioLLM \u2014 non-autoregressive SenseVoice, tuned for Chinese, Cantonese, English, Japanese and Korean",
+        "tagline": "Fast multilingual speech recognition from FunAudioLLM — non-autoregressive SenseVoice, tuned for Chinese, Cantonese, English, Japanese and Korean",
         "overview": [
-          "SenseVoice Small is the compact member of **SenseVoice**, the speech understanding model family\nopen-sourced by **FunAudioLLM** (Alibaba). Trained on more than **400,000 hours** of speech, it\ndelivers high-precision transcription with automatic language detection for **Mandarin Chinese,\nCantonese, English, Japanese and Korean**, and the upstream card reports Chinese and Cantonese\naccuracy ahead of Whisper on open benchmarks such as AISHELL and WenetSpeech. Its\n**non-autoregressive end-to-end** architecture makes inference exceptionally fast \u2014 the upstream\nteam clocks about 70 ms for 10 seconds of audio, 15x faster than Whisper-Large. The upstream model\nalso carries speech emotion recognition and audio event detection; the OpenASR packs currently\nsurface plain transcription only (emotion/event tags are not yet exposed). This OpenASR repo\nrepackages the original weights as `.oasr` packs that run natively in the OpenASR runtime \u2014 no\nPython at inference time. The **fp16** build is the recommended default for maximum fidelity;\n**q8_0** halves the footprint at near-reference quality and **q4_k** suits tight-memory devices."
+          "SenseVoice Small is the compact member of **SenseVoice**, the speech understanding model family\nopen-sourced by **FunAudioLLM** (Alibaba). Trained on more than **400,000 hours** of speech, it\ndelivers high-precision transcription with automatic language detection for **Mandarin Chinese,\nCantonese, English, Japanese and Korean**, and the upstream card reports Chinese and Cantonese\naccuracy ahead of Whisper on open benchmarks such as AISHELL and WenetSpeech. Its\n**non-autoregressive end-to-end** architecture makes inference exceptionally fast — the upstream\nteam clocks about 70 ms for 10 seconds of audio, 15x faster than Whisper-Large. The upstream model\nalso carries speech emotion recognition and audio event detection; the OpenASR packs currently\nsurface plain transcription only (emotion/event tags are not yet exposed). This OpenASR repo\nrepackages the original weights as `.oasr` packs that run natively in the OpenASR runtime — no\nPython at inference time. The **fp16** build is the recommended default for maximum fidelity;\n**q8_0** halves the footprint at near-reference quality and **q4_k** suits tight-memory devices."
         ],
         "highlights": [
-          "\ud83c\udf0f **Multilingual, zh-first** \u2014 high-precision Mandarin, Cantonese, English, Japanese and Korean with automatic language detection",
-          "\u26a1 **Non-autoregressive speed** \u2014 an end-to-end architecture the upstream clocks at about 70 ms for 10 seconds of audio, 15 times faster than Whisper-Large",
-          "\ud83c\udc04 **Chinese benchmark strength** \u2014 trained on over 400,000 hours of speech; the upstream reports better Chinese and Cantonese accuracy than Whisper on AISHELL and WenetSpeech",
-          "\ud83e\udeb6 **Compact and local** \u2014 a small checkpoint that transcribes fully offline, from a 130 MB q4_k build up to full-fidelity fp16",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+          "🌏 **Multilingual, zh-first** — high-precision Mandarin, Cantonese, English, Japanese and Korean with automatic language detection",
+          "⚡ **Non-autoregressive speed** — an end-to-end architecture the upstream clocks at about 70 ms for 10 seconds of audio, 15 times faster than Whisper-Large",
+          "🀄 **Chinese benchmark strength** — trained on over 400,000 hours of speech; the upstream reports better Chinese and Cantonese accuracy than Whisper on AISHELL and WenetSpeech",
+          "🪶 **Compact and local** — a small checkpoint that transcribes fully offline, from a 130 MB q4_k build up to full-fidelity fp16",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
       "quants": [
@@ -883,13 +883,13 @@
       "sort_weight": 900,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "FunAudioLLM \u51fa\u54c1\u7684\u9ad8\u901f\u591a\u8bed\u8a00\u8bed\u97f3\u8bc6\u522b \u2014 SenseVoice\uff0c\u4e3a\u4e2d\u6587\u3001\u7ca4\u8bed\u3001\u82f1\u8bed\u3001\u65e5\u8bed\u3001\u97e9\u8bed\u7cbe\u5fc3\u8c03\u4f18",
+          "tagline": "FunAudioLLM 出品的高速多语言语音识别 — SenseVoice，为中文、粤语、英语、日语、韩语精心调优",
           "highlights": [
-            "\ud83c\udf0f **\u591a\u8bed\u8a00\uff0c\u4e2d\u6587\u4f18\u5148** \u2014 \u666e\u901a\u8bdd\u3001\u7ca4\u8bed\u3001\u82f1\u8bed\u3001\u65e5\u8bed\u3001\u97e9\u8bed\u9ad8\u7cbe\u5ea6\u8bc6\u522b\uff0c\u81ea\u52a8\u5224\u65ad\u8bed\u79cd",
-            "\u26a1 **\u6781\u901f\u8f6c\u5199** \u2014 \u636e\u5b98\u65b9\u5b9e\u6d4b\uff0c10 \u79d2\u97f3\u9891\u4ec5\u9700\u7ea6 70 \u6beb\u79d2\u5904\u7406\uff0c\u6bd4 Whisper-Large \u5feb 15 \u500d",
-            "\ud83c\udc04 **\u4e2d\u6587\u57fa\u51c6\u8868\u73b0\u7a81\u51fa** \u2014 \u8d85 400,000 \u5c0f\u65f6\u8bed\u97f3\u8bad\u7ec3\uff0c\u636e\u5b98\u65b9\u6d4b\u8bd5\u5728 AISHELL \u548c WenetSpeech \u4e0a\u4e2d\u6587\u3001\u7ca4\u8bed\u51c6\u786e\u7387\u4f18\u4e8e Whisper",
-            "\ud83e\udeb6 **\u5c0f\u5de7\u4e14\u5b8c\u5168\u79bb\u7ebf** \u2014 \u6700\u5c0f\u4ec5 130 MB \u7684 q4_k \u7248\u672c\uff0c\u4e5f\u6709\u5168\u7cbe\u5ea6 fp16 \u7248\u672c\u53ef\u9009\uff0c\u5168\u7a0b\u65e0\u9700\u8054\u7f51",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u8fd0\u884c\u65f6\u65e0\u9700 Python\uff0cCPU \u548c GPU \u90fd\u505a\u4e86\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+            "🌏 **多语言，中文优先** — 普通话、粤语、英语、日语、韩语高精度识别，自动判断语种",
+            "⚡ **极速转写** — 据官方实测，10 秒音频仅需约 70 毫秒处理，比 Whisper-Large 快 15 倍",
+            "🀄 **中文基准表现突出** — 超 400,000 小时语音训练，据官方测试在 AISHELL 和 WenetSpeech 上中文、粤语准确率优于 Whisper",
+            "🪶 **小巧且完全离线** — 最小仅 130 MB 的 q4_k 版本，也有全精度 fp16 版本可选，全程无需联网",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，运行时无需 Python，CPU 和 GPU 都做了极致性能优化"
           ]
         }
       },
@@ -922,16 +922,16 @@
       "recommended_quant": "q4_k",
       "pull_recommended": "firered2-llm:q4",
       "prose": {
-        "tagline": "FireRedTeam's LLM-backbone Mandarin-first bilingual ASR \u2014 8B+ parameters engineered for state-of-the-art Chinese and dialect accuracy",
+        "tagline": "FireRedTeam's LLM-backbone Mandarin-first bilingual ASR — 8B+ parameters engineered for state-of-the-art Chinese and dialect accuracy",
         "overview": [
           "FireRedASR2-LLM is the Encoder-Adapter-LLM member of **FireRedASR2**, the successor to\nFireRedTeam's open-source industrial-grade **FireRedASR** speech-recognition family, released as\npart of the **FireRedASR2S** all-in-one ASR system. At 8B+ parameters with an LLM-scale decoder\nbackbone, it is the bigger and more accurate sibling of the already-available\n**firered-aed-l-v2** (FireRedASR2-AED, a 1.1B-parameter attention encoder-decoder reporting\n3.05%/11.67% avg CER). The FireRedASR2S technical report (arXiv:2603.10420) and the upstream model\ncard both report **2.89% average Character Error Rate** across four public Mandarin benchmarks\nand **11.55% average CER** across 19 public Chinese dialect/accent benchmarks -- outperforming\nDoubao-ASR (3.69%/15.39%), Qwen3-ASR (3.76%/11.85%), and Fun-ASR (4.16%/12.76%) on the paper's own\ncomparison table. These numbers belong to FireRedASR2-LLM and should not be confused with the\nsmaller firered-aed-l-v2's 3.05%/11.67% figures. The model is bilingual (Mandarin Chinese and\nEnglish). This OpenASR pack distributes the q4_k quantization build, repackaged as an `.oasr`\npack that runs natively in the OpenASR runtime -- fully local, no Python at inference time, no\ncloud upload. Licensed under Apache-2.0, inherited from the upstream release."
         ],
         "highlights": [
-          "\ud83e\udd47 **Best-in-class Mandarin accuracy** \u2014 2.89% average CER across four public Mandarin benchmarks, outperforming Doubao-ASR (3.69%), Qwen3-ASR (3.76%), and Fun-ASR (4.16%) on the same comparison table (arXiv:2603.10420; FireRedTeam's FireRedASR2-LLM model card)",
-          "\ud83d\udde3\ufe0f **Leading dialect and accent coverage** \u2014 11.55% average CER across 19 public Chinese dialect/accent benchmarks, ahead of Doubao-ASR (15.39%) and Qwen3-ASR (11.85%) (arXiv:2603.10420; FireRedTeam's FireRedASR2-LLM model card)",
-          "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **Bilingual Mandarin + English** \u2014 one 8B+ parameter checkpoint handles both languages, as demonstrated in the upstream model card's bilingual examples (FireRedTeam's FireRedASR2-LLM model card)",
-          "\ud83e\udde0 **LLM-scale decoder backbone** \u2014 Encoder-Adapter-LLM architecture at 8B+ parameters, the bigger and more accurate sibling of the already-available firered-aed-l-v2 (1.1B AED, 3.05%/11.67% avg CER) (FireRedTeam's FireRedASR2-LLM model card)",
-          "\ud83d\udd12 **Fully local, q4_k build** \u2014 runs 100% on-device via OpenASR's .oasr runtime with no cloud upload, under the Apache-2.0 license inherited from upstream (FireRedTeam's FireRedASR2-LLM model card)"
+          "🥇 **Best-in-class Mandarin accuracy** — 2.89% average CER across four public Mandarin benchmarks, outperforming Doubao-ASR (3.69%), Qwen3-ASR (3.76%), and Fun-ASR (4.16%) on the same comparison table (arXiv:2603.10420; FireRedTeam's FireRedASR2-LLM model card)",
+          "🗣️ **Leading dialect and accent coverage** — 11.55% average CER across 19 public Chinese dialect/accent benchmarks, ahead of Doubao-ASR (15.39%) and Qwen3-ASR (11.85%) (arXiv:2603.10420; FireRedTeam's FireRedASR2-LLM model card)",
+          "🇨🇳🇬🇧 **Bilingual Mandarin + English** — one 8B+ parameter checkpoint handles both languages, as demonstrated in the upstream model card's bilingual examples (FireRedTeam's FireRedASR2-LLM model card)",
+          "🧠 **LLM-scale decoder backbone** — Encoder-Adapter-LLM architecture at 8B+ parameters, the bigger and more accurate sibling of the already-available firered-aed-l-v2 (1.1B AED, 3.05%/11.67% avg CER) (FireRedTeam's FireRedASR2-LLM model card)",
+          "🔒 **Fully local, q4_k build** — runs 100% on-device via OpenASR's .oasr runtime with no cloud upload, under the Apache-2.0 license inherited from upstream (FireRedTeam's FireRedASR2-LLM model card)"
         ]
       },
       "quants": [
@@ -956,13 +956,13 @@
       "sort_weight": 890,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "8B+ \u5927\u6a21\u578b\u52a0\u6301\u7684\u8bed\u97f3\u8bc6\u522b \u2014 \u666e\u901a\u8bdd\u548c\u65b9\u8a00\u90fd\u80fd\u7cbe\u51c6\u62ff\u634f",
+          "tagline": "8B+ 大模型加持的语音识别 — 普通话和方言都能精准拿捏",
           "highlights": [
-            "\ud83e\udd47 **\u666e\u901a\u8bdd\u5b57\u9519\u7387\u4f4e\u81f3 2.89%** \u2014 \u56db\u5927\u516c\u5f00\u8bc4\u6d4b\u5747\u503c\uff0c\u628a Doubao-ASR\uff083.69%\uff09\u3001Qwen3-ASR\uff083.76%\uff09\u548c Fun-ASR\uff084.16%\uff09\u7edf\u7edf\u7529\u5728\u8eab\u540e\uff08arXiv:2603.10420\uff1bFireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09",
-            "\ud83d\udde3\ufe0f **19 \u79cd\u65b9\u8a00\u53e3\u97f3\u901a\u901a\u62ff\u4e0b** \u2014 \u5e73\u5747\u5b57\u9519\u7387 11.55%\uff0cDoubao-ASR 15.39%\u3001Qwen3-ASR 11.85% \u90fd\u4e0d\u5728\u8bdd\u4e0b\uff08arXiv:2603.10420\uff1bFireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09",
-            "\ud83c\udde8\ud83c\uddf3\ud83c\uddec\ud83c\udde7 **\u4e2d\u82f1\u53cc\u8bed\u4e00\u628a\u6293** \u2014 \u4e00\u4e2a 8B+ \u53c2\u6570\u7684\u6a21\u578b\u540c\u65f6\u641e\u5b9a\u666e\u901a\u8bdd\u548c\u82f1\u8bed\uff0c\u4e0d\u7528\u5207\u6362\u3001\u4e0d\u7528\u4e0b\u4e24\u4efd\uff0c\u7701\u5fc3\u5230\u5bb6\uff08FireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09",
-            "\ud83e\udde0 **LLM \u7ea7\u522b\u7684\u5927\u6a21\u578b\u89e3\u7801\u9aa8\u67b6** \u2014 8B+ \u53c2\u6570 Encoder-Adapter-LLM \u67b6\u6784\uff0c\u662f\u5df2\u4e0a\u67b6\u7684 firered-aed-l-v2\uff081.1B AED\uff0c\u5747\u503c\u5b57\u9519\u7387 3.05%/11.67%\uff09\u7684\u5927\u53f7\u8fdb\u5316\u4f53\uff0c\u7cbe\u5ea6\u66f4\u4e0a\u4e00\u5c42\u697c\uff08FireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09",
-            "\ud83d\udd12 **100% \u672c\u5730\u8dd1\uff0c\u6570\u636e\u4e0d\u51fa\u95e8** \u2014 q4_k \u91cf\u5316 .oasr \u5305\uff0cOpenASR \u5f15\u64ce\u76f4\u63a5\u52a0\u8f7d\uff0cApache-2.0 \u5f00\u6e90\u534f\u8bae\u653e\u5fc3\u7528\uff08FireRedTeam FireRedASR2-LLM \u6a21\u578b\u5361\uff09"
+            "🥇 **普通话字错率低至 2.89%** — 四大公开评测均值，把 Doubao-ASR（3.69%）、Qwen3-ASR（3.76%）和 Fun-ASR（4.16%）统统甩在身后（arXiv:2603.10420；FireRedTeam FireRedASR2-LLM 模型卡）",
+            "🗣️ **19 种方言口音通通拿下** — 平均字错率 11.55%，Doubao-ASR 15.39%、Qwen3-ASR 11.85% 都不在话下（arXiv:2603.10420；FireRedTeam FireRedASR2-LLM 模型卡）",
+            "🇨🇳🇬🇧 **中英双语一把抓** — 一个 8B+ 参数的模型同时搞定普通话和英语，不用切换、不用下两份，省心到家（FireRedTeam FireRedASR2-LLM 模型卡）",
+            "🧠 **LLM 级别的大模型解码骨架** — 8B+ 参数 Encoder-Adapter-LLM 架构，是已上架的 firered-aed-l-v2（1.1B AED，均值字错率 3.05%/11.67%）的大号进化体，精度更上一层楼（FireRedTeam FireRedASR2-LLM 模型卡）",
+            "🔒 **100% 本地跑，数据不出门** — q4_k 量化 .oasr 包，OpenASR 引擎直接加载，Apache-2.0 开源协议放心用（FireRedTeam FireRedASR2-LLM 模型卡）"
           ]
         }
       },
@@ -996,17 +996,17 @@
       "recommended_quant": "q4_k",
       "pull_recommended": "mimo-v2.5-asr:q4",
       "prose": {
-        "tagline": "Xiaomi MiMo's end-to-end 8B speech model \u2014 state-of-the-art Mandarin, English, and Cantonese recognition, fully on-device",
+        "tagline": "Xiaomi MiMo's end-to-end 8B speech model — state-of-the-art Mandarin, English, and Cantonese recognition, fully on-device",
         "overview": [
           "MiMo-V2.5-ASR is a state-of-the-art end-to-end automatic speech recognition model developed by\nthe Xiaomi MiMo team. Audio first passes through the **MiMo-Audio-Tokenizer**, a 1.2B-parameter\ntransformer operating at 25 Hz that uses an eight-layer residual vector quantization (RVQ) stack\nto produce 200 discrete tokens per second; a patch encoder then aggregates four consecutive time\nsteps into a single patch, downsampling the sequence to a compact 6.25 Hz representation. The\ntokenizer was trained from scratch on a 10-million-hour corpus, jointly optimizing semantic and\nreconstruction objectives (huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer). Those tokens feed an\n**8B-parameter transformer decoder** with Flash Attention support, trained through large-scale\nmid-training, high-quality supervised fine-tuning, and a novel reinforcement-learning algorithm\n(huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR). On Xiaomi's published benchmarks the model achieves\n**2.52% CER on AiShell-2** and **2.41% on Fleurs-Zh** for Mandarin -- leading both FunASR-1.5 and\nSeed-ASR 2.0 -- alongside **5.73% average WER** across eight English Open ASR Leaderboard test\nsets with **1.45% on LibriSpeech-Clean**. For Cantonese, the model scores **3.28% CER on\nFleurs-Yue** and **7.21% CER** on a second Cantonese test set (Xiaomi's published MiMo-V2.5-ASR\nbenchmark results). It handles code-switched Mandarin-English speech without language tags,\ngenerates punctuation natively from prosody and semantics, and is designed for noisy,\nmulti-speaker, and overlapping-conversation scenarios. This OpenASR pack ships the **q4_k** build\nunder an **MIT** license inherited from the upstream model, running entirely on-device via the\n`.oasr` format -- no cloud upload, no Python at inference time. OpenASR's catalog entry supports\n**English, Cantonese, and Mandarin Chinese**; the base model's broader dialect training on Wu,\nHokkien, and Sichuanese provides additional architectural depth but those dialects are not\nshipped as supported languages in this pack."
         ],
         "highlights": [
-          "\ud83e\udd47 **State-of-the-art Mandarin accuracy** \u2014 2.52% CER on AiShell-2 and 2.41% on Fleurs-Zh, leading both FunASR-1.5 and Seed-ASR 2.0 on both benchmarks (Xiaomi's published MiMo-V2.5-ASR benchmark results)",
-          "\ud83c\uddec\ud83c\udde7 **Strong English recognition** \u2014 5.73% average WER across eight Open ASR Leaderboard test sets, including 1.45% WER on LibriSpeech-Clean (Xiaomi's published MiMo-V2.5-ASR benchmark results)",
-          "\ud83d\udde3\ufe0f **Cantonese and dialect depth** \u2014 3.28% CER on Fleurs-Yue for Cantonese; the underlying model is also trained on Wu, Hokkien, and Sichuanese dialects (Xiaomi's published MiMo-V2.5-ASR benchmark results; huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
-          "\ud83d\udd00 **Seamless Mandarin-English code-switching** \u2014 transcribes mixed-language speech with no language tags required (huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
-          "\u270d\ufe0f **Native punctuation from prosody** \u2014 generates punctuation directly from speech rhythm and semantics, delivering ready-to-use transcripts with no post-processing needed (huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
-          "\ud83c\udfd7\ufe0f **1.2B audio tokenizer + 8B decoder pipeline** \u2014 a residual vector quantization tokenizer trained on 10 million hours of audio compresses speech at 25 Hz into discrete tokens, fed into an 8B-parameter transformer decoder with Flash Attention support (huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer; huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)"
+          "🥇 **State-of-the-art Mandarin accuracy** — 2.52% CER on AiShell-2 and 2.41% on Fleurs-Zh, leading both FunASR-1.5 and Seed-ASR 2.0 on both benchmarks (Xiaomi's published MiMo-V2.5-ASR benchmark results)",
+          "🇬🇧 **Strong English recognition** — 5.73% average WER across eight Open ASR Leaderboard test sets, including 1.45% WER on LibriSpeech-Clean (Xiaomi's published MiMo-V2.5-ASR benchmark results)",
+          "🗣️ **Cantonese and dialect depth** — 3.28% CER on Fleurs-Yue for Cantonese; the underlying model is also trained on Wu, Hokkien, and Sichuanese dialects (Xiaomi's published MiMo-V2.5-ASR benchmark results; huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
+          "🔀 **Seamless Mandarin-English code-switching** — transcribes mixed-language speech with no language tags required (huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
+          "✍️ **Native punctuation from prosody** — generates punctuation directly from speech rhythm and semantics, delivering ready-to-use transcripts with no post-processing needed (huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)",
+          "🏗️ **1.2B audio tokenizer + 8B decoder pipeline** — a residual vector quantization tokenizer trained on 10 million hours of audio compresses speech at 25 Hz into discrete tokens, fed into an 8B-parameter transformer decoder with Flash Attention support (huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer; huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR)"
         ]
       },
       "quants": [
@@ -1031,14 +1031,14 @@
       "sort_weight": 888,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u5c0f\u7c73 MiMo 8B \u53c2\u6570\u8bed\u97f3\u5927\u6a21\u578b\u2014\u2014\u4e2d\u82f1\u7ca4\u4e09\u8bed\u79bb\u7ebf\u8bc6\u522b\uff0c\u5f00\u53e3\u5c31\u80fd\u8bb0",
+          "tagline": "小米 MiMo 8B 参数语音大模型——中英粤三语离线识别，开口就能记",
           "highlights": [
-            "\ud83e\udd47 **\u4e2d\u6587\u542c\u5199\u62c9\u6ee1** \u2014 AiShell-2 \u53ea\u6709 2.52% \u5b57\u9519\u7387\u3001Fleurs-Zh \u4ec5 2.41%\uff0c\u628a FunASR-1.5 \u548c Seed-ASR 2.0 \u90fd\u7529\u5728\u8eab\u540e\uff08\u5c0f\u7c73\u5b98\u65b9 MiMo-V2.5-ASR \u8bc4\u6d4b\uff09",
-            "\ud83c\uddec\ud83c\udde7 **\u82f1\u8bed\u540c\u6837\u80fd\u6253** \u2014 Open ASR Leaderboard \u516b\u9879\u5747\u5206 5.73% \u8bcd\u9519\u7387\uff0cLibriSpeech-Clean \u66f4\u662f\u4f4e\u5230 1.45%\uff08\u5c0f\u7c73\u5b98\u65b9 MiMo-V2.5-ASR \u8bc4\u6d4b\u6570\u636e\uff09",
-            "\ud83d\udde3\ufe0f **\u7ca4\u8bed\u5728\u7ebf** \u2014 Fleurs-Yue \u7ca4\u8bed\u5b57\u9519\u7387 3.28%\uff0c\u5e95\u5c42\u6a21\u578b\u8fd8\u7ec3\u8fc7\u5434\u8bed\u3001\u95fd\u5357\u8bed\u3001\u56db\u5ddd\u8bdd\uff08\u5c0f\u7c73\u5b98\u65b9 MiMo-V2.5-ASR \u8bc4\u6d4b\u6570\u636e\uff1bhuggingface.co/XiaomiMiMo/MiMo-V2.5-ASR\uff09",
-            "\ud83d\udd00 **\u4e2d\u82f1\u5939\u6742\u968f\u4fbf\u8bf4** \u2014 \u4f1a\u8bae\u3001\u65e5\u5e38\u5bf9\u8bdd\u81ea\u7531\u6df7\u7528\u4e2d\u82f1\u6587\uff0c\u4e0d\u7528\u9009\u8bed\u8a00\uff0c\u6a21\u578b\u81ea\u52a8\u5206\u6e05\u695a\uff08huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR\uff09",
-            "\u270d\ufe0f **\u6807\u70b9\u81ea\u5df1\u5c31\u5e26\u4e0a\u4e86** \u2014 \u6839\u636e\u4f60\u8bf4\u8bdd\u7684\u8bed\u6c14\u548c\u4e0a\u4e0b\u6587\u76f4\u63a5\u8f93\u51fa\u6807\u70b9\uff0c\u8f6c\u51fa\u6765\u5c31\u662f\u80fd\u7528\u7684\u6587\u672c\uff08huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR\uff09",
-            "\ud83c\udfd7\ufe0f **1.2B \u97f3\u9891\u7f16\u7801\u5668 + 8B \u89e3\u7801\u5668** \u2014 \u7f16\u7801\u5668\u62ff 10 \u767e\u4e07\u5c0f\u65f6\u7684\u6d77\u91cf\u97f3\u9891\u5582\u51fa\u6765\u7684\uff0c\u4ee5 25 Hz \u628a\u8bed\u97f3\u538b\u6210\u79bb\u6563 token\uff0c\u518d\u4ea4\u7ed9 8B \u53c2\u6570\u7684\u5927\u89e3\u7801\u5668\u641e\u5b9a\u8bc6\u522b\uff08huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer\uff1bhuggingface.co/XiaomiMiMo/MiMo-V2.5-ASR\uff09"
+            "🥇 **中文听写拉满** — AiShell-2 只有 2.52% 字错率、Fleurs-Zh 仅 2.41%，把 FunASR-1.5 和 Seed-ASR 2.0 都甩在身后（小米官方 MiMo-V2.5-ASR 评测）",
+            "🇬🇧 **英语同样能打** — Open ASR Leaderboard 八项均分 5.73% 词错率，LibriSpeech-Clean 更是低到 1.45%（小米官方 MiMo-V2.5-ASR 评测数据）",
+            "🗣️ **粤语在线** — Fleurs-Yue 粤语字错率 3.28%，底层模型还练过吴语、闽南语、四川话（小米官方 MiMo-V2.5-ASR 评测数据；huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR）",
+            "🔀 **中英夹杂随便说** — 会议、日常对话自由混用中英文，不用选语言，模型自动分清楚（huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR）",
+            "✍️ **标点自己就带上了** — 根据你说话的语气和上下文直接输出标点，转出来就是能用的文本（huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR）",
+            "🏗️ **1.2B 音频编码器 + 8B 解码器** — 编码器拿 10 百万小时的海量音频喂出来的，以 25 Hz 把语音压成离散 token，再交给 8B 参数的大解码器搞定识别（huggingface.co/XiaomiMiMo/MiMo-Audio-Tokenizer；huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR）"
           ]
         }
       },
@@ -1110,11 +1110,11 @@
           "Dolphin Base is the **140M \"base\" tier** of DataoceanAI's **multilingual** Dolphin speech-\nrecognition line, built on the same **Dolphin / ESPnet** recipe as the larger **Dolphin Small**:\nan **E-Branchformer encoder + Transformer decoder** trained with a **joint CTC + attention**\nobjective over a shared SentencePiece BPE vocabulary spanning the card's advertised 40 languages\n(South Asian, Southeast Asian, Central Asian/Turkic, and Chinese including Cantonese as `yue`),\nat roughly a third of the small tier's encoder/decoder width -- a smaller RAM/CPU footprint for\ndeployments where the small tier's accuracy headroom is not needed. Like `dolphin-small`, this\ncheckpoint collapses this product's own Chinese-dialect granularity into a single `zh` (the\ndedicated `dolphin-cn-dialect-small`/`-base` packs cover per-dialect prompting). This OpenASR\nrepo repackages the weights as `.oasr` packs that run natively in the OpenASR runtime -- no\nPython at inference, all decoding local. It ships in **fp16** (maximum fidelity) and **q8_0**\n(recommended) builds. **q4_k** is not offered for this pack (see verification notes below).\n\n**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed\nwithout punctuation marks, so the decoder never predicts a punctuation token -- there is no\nsetting to enable it. Transcripts are plain, unpunctuated text by design.\n\n**Verification notes:** local verification so far covers Mandarin (`zh`), sanity-checked against\nthe upstream architecture and bit-stable at fp16/q8_0. `q4_k` showed ~8.8% CER drift versus fp16\non the sanity clip and is therefore dropped from this pack's quants. dolphin-small's `q4_k` is\nclean at 0.0 drift and is unaffected."
         ],
         "highlights": [
-          "\ud83c\udf0f **40 languages, base tier** \u2014 the same multilingual E-Branchformer coverage as Dolphin Small (South Asian, Southeast Asian, Central Asian/Turkic, Chinese/Cantonese), at a fraction of the size",
-          "\ud83e\udeb6 **140M parameters** \u2014 roughly a third the width of the `small` checkpoint (512 vs 768 d_model, fewer layers), for tighter RAM and faster CPU decode when the small tier is overkill",
-          "\ud83e\udde9 **Joint CTC + attention** \u2014 the same E-Branchformer encoder + Transformer decoder recipe with CTC/attention rescoring, verified against a shape-derived runtime contract shared with the rest of the Dolphin family",
-          "\ud83d\udc2c **SentencePiece BPE vocab** \u2014 a shared subword vocabulary across all 40 languages (distinct from the cn-dialect family's fixed character vocab)",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+          "🌏 **40 languages, base tier** — the same multilingual E-Branchformer coverage as Dolphin Small (South Asian, Southeast Asian, Central Asian/Turkic, Chinese/Cantonese), at a fraction of the size",
+          "🪶 **140M parameters** — roughly a third the width of the `small` checkpoint (512 vs 768 d_model, fewer layers), for tighter RAM and faster CPU decode when the small tier is overkill",
+          "🧩 **Joint CTC + attention** — the same E-Branchformer encoder + Transformer decoder recipe with CTC/attention rescoring, verified against a shape-derived runtime contract shared with the rest of the Dolphin family",
+          "🐬 **SentencePiece BPE vocab** — a shared subword vocabulary across all 40 languages (distinct from the cn-dialect family's fixed character vocab)",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
       "quants": [
@@ -1156,13 +1156,13 @@
       "emits_punctuation": false,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u8986\u76d6 40 \u79cd\u8bed\u8a00\u7684\u591a\u8bed\u79cd\u8bed\u97f3\u8bc6\u522b\uff0c\u5165\u95e8\u6863 \u2014 \u4ec5 140M \u53c2\u6570\uff0c\u5c0f\u5de7\u7701\u8d44\u6e90",
+          "tagline": "覆盖 40 种语言的多语种语音识别，入门档 — 仅 140M 参数，小巧省资源",
           "highlights": [
-            "\ud83c\udf0f **40 \u79cd\u8bed\u8a00\uff0c\u5165\u95e8\u6863** \u2014 \u4e0e Dolphin Small \u8986\u76d6\u76f8\u540c\u7684\u8bed\u79cd\u8303\u56f4\uff08\u5357\u4e9a\u3001\u4e1c\u5357\u4e9a\u3001\u4e2d\u4e9a\uff0f\u7a81\u53a5\u8bed\u7cfb\u3001\u4e2d\u6587\uff0f\u7ca4\u8bed\uff09\uff0c\u4f46\u4f53\u79ef\u5c0f\u5f97\u591a",
-            "\ud83e\udeb6 **140M \u53c2\u6570** \u2014 \u4f53\u79ef\u7ea6\u4e3a `small` \u6863\u7684\u4e09\u5206\u4e4b\u4e00\uff08\u5185\u90e8\u5bbd\u5ea6 512 \u5bf9 768\uff09\uff0c\u5185\u5b58\u5360\u7528\u66f4\u4f4e\u3001CPU \u8f6c\u5199\u66f4\u5feb\uff0c\u8f7b\u91cf\u4efb\u52a1\u4e0d\u5fc5\u52a8\u7528\u5927\u6a21\u578b",
-            "\ud83e\udde9 **\u53cc\u8def\u4ea4\u53c9\u6821\u9a8c** \u2014 \u5185\u7f6e\u4e24\u5957\u8bc6\u522b\u673a\u5236\u4e92\u76f8\u6bd4\u5bf9\u7ed3\u679c\uff0c\u4e0e Dolphin \u5168\u7cfb\u5217\u5171\u4eab\u540c\u4e00\u5957\u8fd0\u884c\u9a8c\u8bc1\u6807\u51c6",
-            "\ud83d\udc2c **40 \u79cd\u8bed\u8a00\u5171\u4eab\u8bcd\u8868** \u2014 \u6240\u6709\u8bed\u79cd\u4f7f\u7528\u540c\u4e00\u5957\u8bcd\u8868\uff08\u4e0d\u540c\u4e8e\u4e2d\u6587\u65b9\u8a00\u7cfb\u5217\u7684\u9010\u5b57\u8bcd\u8868\uff09\uff0c\u5929\u7136\u9002\u5408\u591a\u8bed\u79cd\u6df7\u8bf4",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u65e0\u9700\u5b89\u88c5 Python\uff0c\u5728 CPU \u548c GPU \u4e0a\u90fd\u6709\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+            "🌏 **40 种语言，入门档** — 与 Dolphin Small 覆盖相同的语种范围（南亚、东南亚、中亚／突厥语系、中文／粤语），但体积小得多",
+            "🪶 **140M 参数** — 体积约为 `small` 档的三分之一（内部宽度 512 对 768），内存占用更低、CPU 转写更快，轻量任务不必动用大模型",
+            "🧩 **双路交叉校验** — 内置两套识别机制互相比对结果，与 Dolphin 全系列共享同一套运行验证标准",
+            "🐬 **40 种语言共享词表** — 所有语种使用同一套词表（不同于中文方言系列的逐字词表），天然适合多语种混说",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式无需安装 Python，在 CPU 和 GPU 上都有极致性能优化"
           ]
         }
       },
@@ -1206,14 +1206,14 @@
       "prose": {
         "tagline": "Chinese multi-dialect speech recognition, base tier -- a compact 140M WeNet E-Branchformer (CTC + attention) for Sichuan and 22 regional dialects",
         "overview": [
-          "Dolphin CN-Dialect Base is the **140M \"base\" tier** of DataoceanAI's **Chinese multi-dialect**\nspeech-recognition line, built on the same **Dolphin / WeNet** recipe as the larger\n**Dolphin CN-Dialect Small**: an **E-Branchformer encoder + Transformer decoder** trained with a\n**joint CTC + attention** objective over a mixed character/BPE vocabulary. It covers the same\n**Sichuan (\u5ddd\u8bdd)**-forward set of 22 Chinese dialects (Wu, Cantonese, Minnan, Shanghainese and\nmore) as its `small.cn` sibling, but at roughly a third of the encoder/decoder width (512 vs 768\nd_model, 6 vs 12 layers) -- a smaller RAM/CPU footprint for deployments where the small tier's\naccuracy headroom is not needed. Unlike `small.cn`, this `base.cn` checkpoint does not ship a\ntrained hotword deep-biasing module. This OpenASR repo repackages the weights as `.oasr` packs\nthat run natively in the OpenASR runtime -- no Python at inference, all decoding local. It ships\nin **fp16** (maximum fidelity, recommended), **q8_0**, and **q4_k** builds.\n\n**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed\nwithout punctuation marks, so the decoder never predicts a punctuation token -- there is no\nsetting to enable it. Transcripts are plain, unpunctuated text by design."
+          "Dolphin CN-Dialect Base is the **140M \"base\" tier** of DataoceanAI's **Chinese multi-dialect**\nspeech-recognition line, built on the same **Dolphin / WeNet** recipe as the larger\n**Dolphin CN-Dialect Small**: an **E-Branchformer encoder + Transformer decoder** trained with a\n**joint CTC + attention** objective over a mixed character/BPE vocabulary. It covers the same\n**Sichuan (川话)**-forward set of 22 Chinese dialects (Wu, Cantonese, Minnan, Shanghainese and\nmore) as its `small.cn` sibling, but at roughly a third of the encoder/decoder width (512 vs 768\nd_model, 6 vs 12 layers) -- a smaller RAM/CPU footprint for deployments where the small tier's\naccuracy headroom is not needed. Unlike `small.cn`, this `base.cn` checkpoint does not ship a\ntrained hotword deep-biasing module. This OpenASR repo repackages the weights as `.oasr` packs\nthat run natively in the OpenASR runtime -- no Python at inference, all decoding local. It ships\nin **fp16** (maximum fidelity, recommended), **q8_0**, and **q4_k** builds.\n\n**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed\nwithout punctuation marks, so the decoder never predicts a punctuation token -- there is no\nsetting to enable it. Transcripts are plain, unpunctuated text by design."
         ],
         "highlights": [
-          "\ud83c\udc04 **22 Chinese dialects, base tier** \u2014 the same WeNet E-Branchformer dialect coverage as Dolphin CN-Dialect Small (Sichuan/\u5ddd\u8bdd, Wu, Cantonese, Minnan, Shanghainese and more), at a fraction of the size",
-          "\ud83e\udeb6 **140M parameters** \u2014 roughly a third the width of the `small.cn` checkpoint (512 vs 768 d_model, 6 vs 12 layers), for tighter RAM and faster CPU decode when the small tier is overkill",
-          "\ud83e\udde9 **Joint CTC + attention** \u2014 the same E-Branchformer encoder + Transformer decoder recipe with CTC/attention rescoring, verified against a shape-derived runtime contract shared with the rest of the Dolphin family",
-          "\ud83d\udc2c **Chinese-focused, mixed char/BPE vocab** \u2014 a character vocabulary for Chinese with SentencePiece word-piece tokens for code-switched English, purpose-built for zh audio including heavy accents",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+          "🀄 **22 Chinese dialects, base tier** — the same WeNet E-Branchformer dialect coverage as Dolphin CN-Dialect Small (Sichuan/川话, Wu, Cantonese, Minnan, Shanghainese and more), at a fraction of the size",
+          "🪶 **140M parameters** — roughly a third the width of the `small.cn` checkpoint (512 vs 768 d_model, 6 vs 12 layers), for tighter RAM and faster CPU decode when the small tier is overkill",
+          "🧩 **Joint CTC + attention** — the same E-Branchformer encoder + Transformer decoder recipe with CTC/attention rescoring, verified against a shape-derived runtime contract shared with the rest of the Dolphin family",
+          "🐬 **Chinese-focused, mixed char/BPE vocab** — a character vocabulary for Chinese with SentencePiece word-piece tokens for code-switched English, purpose-built for zh audio including heavy accents",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
       "quants": [
@@ -1271,13 +1271,13 @@
       "emits_punctuation": false,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u4e2d\u6587\u591a\u65b9\u8a00\u8bed\u97f3\u8bc6\u522b\uff0c\u5165\u95e8\u6863 \u2014 \u4ec5 140M \u53c2\u6570\uff0c\u8986\u76d6\u56db\u5ddd\u8bdd\u53ca 22 \u79cd\u5730\u65b9\u65b9\u8a00",
+          "tagline": "中文多方言语音识别，入门档 — 仅 140M 参数，覆盖四川话及 22 种地方方言",
           "highlights": [
-            "\ud83c\udc04 **22 \u79cd\u4e2d\u6587\u65b9\u8a00\uff0c\u5165\u95e8\u6863** \u2014 \u4e0e Dolphin CN-Dialect Small \u8986\u76d6\u76f8\u540c\u7684\u65b9\u8a00\uff08\u56db\u5ddd\u8bdd\u3001\u5434\u8bed\u3001\u7ca4\u8bed\u3001\u95fd\u5357\u8bed\u3001\u4e0a\u6d77\u8bdd\u7b49\uff09\uff0c\u4f46\u4f53\u79ef\u5c0f\u5f97\u591a",
-            "\ud83e\udeb6 **140M \u53c2\u6570** \u2014 \u4f53\u79ef\u7ea6\u4e3a `small.cn` \u6863\u7684\u4e09\u5206\u4e4b\u4e00\uff08\u5185\u90e8\u5bbd\u5ea6 512 \u5bf9 768\uff0c6 \u5c42\u5bf9 12 \u5c42\uff09\uff0c\u66f4\u7701\u5185\u5b58\u3001CPU \u8f6c\u5199\u66f4\u5feb\uff0c\u8f7b\u91cf\u4efb\u52a1\u4e0d\u5fc5\u52a8\u7528\u5927\u6a21\u578b",
-            "\ud83e\udde9 **\u53cc\u8def\u4ea4\u53c9\u6821\u9a8c** \u2014 \u5185\u7f6e\u4e24\u5957\u8bc6\u522b\u673a\u5236\u4e92\u76f8\u6bd4\u5bf9\u7ed3\u679c\uff0c\u4e0e Dolphin \u5168\u7cfb\u5217\u5171\u4eab\u540c\u4e00\u5957\u8fd0\u884c\u9a8c\u8bc1\u6807\u51c6",
-            "\ud83d\udc2c **\u4e2d\u6587\u4e3a\u4e3b\u7684\u6df7\u5408\u8bcd\u8868** \u2014 \u4e2d\u6587\u6309\u5b57\u8bc6\u522b\uff0c\u4e2d\u82f1\u6df7\u8bf4\u65f6\u82f1\u6587\u6309\u8bcd\u5207\u5206\uff0c\u4e13\u4e3a\u4e2d\u6587\u97f3\u9891\u6253\u9020\uff0c\u91cd\u53e3\u97f3\u4e5f\u80fd\u5e94\u5bf9",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u65e0\u9700\u5b89\u88c5 Python\uff0c\u5728 CPU \u548c GPU \u4e0a\u90fd\u6709\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+            "🀄 **22 种中文方言，入门档** — 与 Dolphin CN-Dialect Small 覆盖相同的方言（四川话、吴语、粤语、闽南语、上海话等），但体积小得多",
+            "🪶 **140M 参数** — 体积约为 `small.cn` 档的三分之一（内部宽度 512 对 768，6 层对 12 层），更省内存、CPU 转写更快，轻量任务不必动用大模型",
+            "🧩 **双路交叉校验** — 内置两套识别机制互相比对结果，与 Dolphin 全系列共享同一套运行验证标准",
+            "🐬 **中文为主的混合词表** — 中文按字识别，中英混说时英文按词切分，专为中文音频打造，重口音也能应对",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式无需安装 Python，在 CPU 和 GPU 上都有极致性能优化"
           ]
         }
       },
@@ -1352,11 +1352,11 @@
           "Dolphin Small is the **372M \"small\" tier** of DataoceanAI's **multilingual** Dolphin speech-\nrecognition line, built on the **Dolphin / ESPnet** recipe as an **E-Branchformer encoder +\nTransformer decoder** trained with a **joint CTC + attention** objective over a shared\nSentencePiece BPE vocabulary. Unlike the dedicated `dolphin-cn-dialect-*` checkpoints (fixed\n`<zh>` language token, Chinese-only char vocab), this multilingual checkpoint varies **both**\nthe language and region prompt slots across the card's advertised 40 languages -- South Asian,\nSoutheast Asian, Central Asian/Turkic, and Chinese (including Cantonese, listed separately as\n`yue`) -- while collapsing this product's own Chinese-dialect granularity into a single `zh`\n(the dedicated `dolphin-cn-dialect-small`/`-base` packs cover per-dialect prompting; this\ncheckpoint does not). This OpenASR repo repackages the weights as `.oasr` packs that run natively\nin the OpenASR runtime -- no Python at inference, all decoding local. It ships in **fp16**\n(maximum fidelity), **q8_0** (recommended), and **q4_k** builds.\n\n**Note:** this model does not emit punctuation. Its upstream training corpus is transcribed\nwithout punctuation marks, so the decoder never predicts a punctuation token -- there is no\nsetting to enable it. Transcripts are plain, unpunctuated text by design.\n\n**Verification:** local testing covers Mandarin (`zh`), sanity-checked against the upstream\narchitecture and confirmed bit-stable across fp16/q8_0/q4_k quants."
         ],
         "highlights": [
-          "\ud83c\udf0f **40 languages, one checkpoint** \u2014 a WeNet/ESPnet E-Branchformer spanning South Asian (Hindi, Bengali, Urdu...), Southeast Asian (Vietnamese, Thai, Indonesian...), Central Asian/Turkic (Kazakh, Uzbek, Azerbaijani...), and Chinese/Cantonese speech, with per-utterance `<lang><region>` prompting",
-          "\ud83e\udde9 **Joint CTC + attention** \u2014 an E-Branchformer encoder with a Transformer decoder and CTC/attention rescoring, verified against a shape-derived runtime contract shared with the rest of the Dolphin family",
-          "\ud83d\udc2c **SentencePiece BPE vocab** \u2014 a shared subword vocabulary across all 40 languages (distinct from the cn-dialect family's fixed character vocab), suited to code-mixed and cross-lingual speech",
-          "\ud83e\udeb6 **372M parameters, `small` tier** \u2014 the larger of the two multilingual Dolphin sizes (paired with the more compact `dolphin-base`)",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+          "🌏 **40 languages, one checkpoint** — a WeNet/ESPnet E-Branchformer spanning South Asian (Hindi, Bengali, Urdu...), Southeast Asian (Vietnamese, Thai, Indonesian...), Central Asian/Turkic (Kazakh, Uzbek, Azerbaijani...), and Chinese/Cantonese speech, with per-utterance `<lang><region>` prompting",
+          "🧩 **Joint CTC + attention** — an E-Branchformer encoder with a Transformer decoder and CTC/attention rescoring, verified against a shape-derived runtime contract shared with the rest of the Dolphin family",
+          "🐬 **SentencePiece BPE vocab** — a shared subword vocabulary across all 40 languages (distinct from the cn-dialect family's fixed character vocab), suited to code-mixed and cross-lingual speech",
+          "🪶 **372M parameters, `small` tier** — the larger of the two multilingual Dolphin sizes (paired with the more compact `dolphin-base`)",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
       "quants": [
@@ -1414,13 +1414,13 @@
       "emits_punctuation": false,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u8986\u76d6 40 \u79cd\u8bed\u8a00\u7684\u591a\u8bed\u79cd\u8bed\u97f3\u8bc6\u522b \u2014 \u6db5\u76d6\u5357\u4e9a\u3001\u4e1c\u5357\u4e9a\u3001\u4e2d\u4e9a\u8bed\u8a00\u4e0e\u4e2d\u6587\u65b9\u8a00",
+          "tagline": "覆盖 40 种语言的多语种语音识别 — 涵盖南亚、东南亚、中亚语言与中文方言",
           "highlights": [
-            "\ud83c\udf0f **40 \u79cd\u8bed\u8a00\uff0c\u4e00\u4e2a\u6a21\u578b** \u2014 \u8986\u76d6\u5357\u4e9a\uff08\u5370\u5730\u8bed\u3001\u5b5f\u52a0\u62c9\u8bed\u3001\u4e4c\u5c14\u90fd\u8bed\u2026\u2026\uff09\u3001\u4e1c\u5357\u4e9a\uff08\u8d8a\u5357\u8bed\u3001\u6cf0\u8bed\u3001\u5370\u5c3c\u8bed\u2026\u2026\uff09\u3001\u4e2d\u4e9a\uff0f\u7a81\u53a5\u8bed\u7cfb\uff08\u54c8\u8428\u514b\u8bed\u3001\u4e4c\u5179\u522b\u514b\u8bed\u3001\u963f\u585e\u62dc\u7586\u8bed\u2026\u2026\uff09\u4e0e\u4e2d\u6587\uff0f\u7ca4\u8bed\uff0c\u652f\u6301\u6309 `<lang><region>` \u9010\u53e5\u6307\u5b9a\u8bed\u8a00",
-            "\ud83e\udde9 **\u53cc\u8def\u4ea4\u53c9\u6821\u9a8c** \u2014 \u5185\u7f6e\u4e24\u5957\u8bc6\u522b\u673a\u5236\u4e92\u76f8\u6bd4\u5bf9\u7ed3\u679c\uff0c\u4e0e Dolphin \u5168\u7cfb\u5217\u5171\u4eab\u540c\u4e00\u5957\u8fd0\u884c\u9a8c\u8bc1\u6807\u51c6",
-            "\ud83d\udc2c **40 \u79cd\u8bed\u8a00\u5171\u4eab\u8bcd\u8868** \u2014 \u6240\u6709\u8bed\u79cd\u4f7f\u7528\u540c\u4e00\u5957\u8bcd\u8868\uff08\u4e0d\u540c\u4e8e\u4e2d\u6587\u65b9\u8a00\u7cfb\u5217\u7684\u9010\u5b57\u8bcd\u8868\uff09\uff0c\u9002\u5408\u4e2d\u82f1\u6df7\u8bf4\u548c\u8de8\u8bed\u79cd\u573a\u666f",
-            "\ud83e\udeb6 **372M \u53c2\u6570\uff0c`small` \u6863** \u2014 \u591a\u8bed\u79cd Dolphin \u4e24\u6863\u4e2d\u8f83\u5927\u7684\u4e00\u6863\uff08\u4e0e\u66f4\u8f7b\u91cf\u7684 `dolphin-base` \u642d\u914d\u4f7f\u7528\uff09",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u65e0\u9700\u5b89\u88c5 Python\uff0c\u5728 CPU \u548c GPU \u4e0a\u90fd\u6709\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+            "🌏 **40 种语言，一个模型** — 覆盖南亚（印地语、孟加拉语、乌尔都语……）、东南亚（越南语、泰语、印尼语……）、中亚／突厥语系（哈萨克语、乌兹别克语、阿塞拜疆语……）与中文／粤语，支持按 `<lang><region>` 逐句指定语言",
+            "🧩 **双路交叉校验** — 内置两套识别机制互相比对结果，与 Dolphin 全系列共享同一套运行验证标准",
+            "🐬 **40 种语言共享词表** — 所有语种使用同一套词表（不同于中文方言系列的逐字词表），适合中英混说和跨语种场景",
+            "🪶 **372M 参数，`small` 档** — 多语种 Dolphin 两档中较大的一档（与更轻量的 `dolphin-base` 搭配使用）",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式无需安装 Python，在 CPU 和 GPU 上都有极致性能优化"
           ]
         }
       },
@@ -1450,16 +1450,16 @@
       "recommended_quant": "q4_k_m",
       "pull_recommended": "hymt2-1.8b:q4km",
       "prose": {
-        "tagline": "Hy-MT2 1.8B zh\u2192en translation for OpenASR realtime subtitles \u2014 clause-by-clause, fully on-device",
+        "tagline": "Hy-MT2 1.8B zh→en translation for OpenASR realtime subtitles — clause-by-clause, fully on-device",
         "overview": [
-          "Hy-MT2 1.8B is Tencent's compact many-to-many translation model from the Hunyuan-MT family.\nOpenASR packages the upstream Q4_K_M GGUF release as a local `.oasr` translation pack and uses it\nfor the experimental simultaneous-translation MVP: finalized and in-progress Chinese clauses from\nrealtime ASR are retranslated clause-by-clause into English, with provisional translations\nsuperseded as the source clause stabilizes. The MVP contract is zh\u2192en; the pack runs fully\non-device through OpenASR's pure-Rust GGML runtime with no Python at inference time."
+          "Hy-MT2 1.8B is Tencent's compact many-to-many translation model from the Hunyuan-MT family.\nOpenASR packages the upstream Q4_K_M GGUF release as a local `.oasr` translation pack and uses it\nfor the experimental simultaneous-translation MVP: finalized and in-progress Chinese clauses from\nrealtime ASR are retranslated clause-by-clause into English, with provisional translations\nsuperseded as the source clause stabilizes. The MVP contract is zh→en; the pack runs fully\non-device through OpenASR's pure-Rust GGML runtime with no Python at inference time."
         ],
         "highlights": [
-          "\ud83c\udf10 **Realtime zh\u2192en subtitle translation** \u2014 drives OpenASR's experimental clause-retranslation lane next to live Chinese ASR",
-          "\u26a1 **Hot-session clause latency in the hundreds of milliseconds** \u2014 prefix KV-cache reuse keeps warm per-clause retranslation fast on Apple Silicon CPU",
-          "\ud83d\udce6 **Byte-identical upstream weights** \u2014 the Q4_K_M GGUF tensor data is repackaged unmodified at a pinned revision; sha256 and provenance are embedded in the pack",
-          "\ud83e\uddfe **License + NOTICE embedded** \u2014 the upstream Apache-2.0 LICENSE.txt and the OpenASR modification NOTICE travel inside the pack metadata",
-          "\ud83c\udfaf **Parity-gated packaging** \u2014 greedy decode token IDs match llama.cpp on the same prompt before release"
+          "🌐 **Realtime zh→en subtitle translation** — drives OpenASR's experimental clause-retranslation lane next to live Chinese ASR",
+          "⚡ **Hot-session clause latency in the hundreds of milliseconds** — prefix KV-cache reuse keeps warm per-clause retranslation fast on Apple Silicon CPU",
+          "📦 **Byte-identical upstream weights** — the Q4_K_M GGUF tensor data is repackaged unmodified at a pinned revision; sha256 and provenance are embedded in the pack",
+          "🧾 **License + NOTICE embedded** — the upstream Apache-2.0 LICENSE.txt and the OpenASR modification NOTICE travel inside the pack metadata",
+          "🎯 **Parity-gated packaging** — greedy decode token IDs match llama.cpp on the same prompt before release"
         ]
       },
       "quants": [
@@ -1483,13 +1483,13 @@
       "experimental": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "Hy-MT2 1.8B \u4e2d\u8bd1\u82f1\u7ffb\u8bd1\u6a21\u578b \u2014 \u4e3a OpenASR \u5b9e\u65f6\u5b57\u5e55\u9010\u53e5\u7ffb\u8bd1\uff0c\u5b8c\u5168\u5728\u672c\u5730\u8fd0\u884c",
+          "tagline": "Hy-MT2 1.8B 中译英翻译模型 — 为 OpenASR 实时字幕逐句翻译，完全在本地运行",
           "highlights": [
-            "\ud83c\udf10 **\u5b9e\u65f6\u4e2d\u8bd1\u82f1\u5b57\u5e55\u7ffb\u8bd1** \u2014 \u9a71\u52a8 OpenASR \u7684\u5b9e\u9a8c\u6027\u9010\u53e5\u91cd\u8bd1\u529f\u80fd\uff0c\u4e0e\u5b9e\u65f6\u4e2d\u6587\u8bed\u97f3\u8bc6\u522b\u540c\u6b65\u8fd0\u884c",
-            "\u26a1 **\u70ed\u4f1a\u8bdd\u5ef6\u8fdf\u4ec5\u51e0\u767e\u6beb\u79d2** \u2014 \u4f1a\u8bdd\u9884\u70ed\u540e\u590d\u7528\u4e4b\u524d\u7684\u8ba1\u7b97\u7f13\u5b58\uff0c\u9010\u53e5\u91cd\u8bd1\u5728 Apple Silicon CPU \u4e0a\u98de\u5feb",
-            "\ud83d\udce6 **\u6a21\u578b\u6587\u4ef6\u4e0e\u539f\u7248\u4e00\u6a21\u4e00\u6837** \u2014 Q4_K_M GGUF \u683c\u5f0f\u7684\u6570\u636e\u5728\u56fa\u5b9a\u7248\u672c\u4e0b\u539f\u5c01\u4e0d\u52a8\u6253\u5305\uff0csha256 \u6821\u9a8c\u548c\u6765\u6e90\u4fe1\u606f\u90fd\u5185\u5d4c\u5176\u4e2d",
-            "\ud83e\uddfe **\u5185\u7f6e\u8bb8\u53ef\u8bc1\u4e0e\u58f0\u660e** \u2014 \u539f\u59cb Apache-2.0 LICENSE.txt \u548c OpenASR \u4fee\u6539\u58f0\u660e NOTICE \u90fd\u4fdd\u5b58\u5728\u5305\u4e2d",
-            "\ud83c\udfaf **\u4e00\u81f4\u6027\u6821\u9a8c\u540e\u53d1\u5e03** \u2014 \u53d1\u5e03\u524d\u786e\u8ba4\u6a21\u578b\u8f93\u51fa\u4e0e llama.cpp \u5728\u540c\u4e00\u8f93\u5165\u4e0b\u5b8c\u5168\u4e00\u81f4"
+            "🌐 **实时中译英字幕翻译** — 驱动 OpenASR 的实验性逐句重译功能，与实时中文语音识别同步运行",
+            "⚡ **热会话延迟仅几百毫秒** — 会话预热后复用之前的计算缓存，逐句重译在 Apple Silicon CPU 上飞快",
+            "📦 **模型文件与原版一模一样** — Q4_K_M GGUF 格式的数据在固定版本下原封不动打包，sha256 校验和来源信息都内嵌其中",
+            "🧾 **内置许可证与声明** — 原始 Apache-2.0 LICENSE.txt 和 OpenASR 修改声明 NOTICE 都保存在包中",
+            "🎯 **一致性校验后发布** — 发布前确认模型输出与 llama.cpp 在同一输入下完全一致"
           ]
         }
       },
@@ -1552,10 +1552,10 @@
           "Cohere Transcribe 03-2026 is Cohere and Cohere Labs' open release of a\n2B-parameter automatic speech recognition model. It is a dedicated audio-in,\ntext-out architecture with a Conformer-based acoustic encoder and a lightweight\nTransformer decoder, trained from scratch for transcription. The upstream model\ncard lists support for 14 languages across English, European, APAC, and MENA\ncoverage and reports Apache-2.0 licensing. This OpenASR repo repackages the\noriginal `CohereLabs/cohere-transcribe-03-2026` weights as `.oasr` packs that\nrun natively in the OpenASR runtime with no Python at inference time. For most\nusers the q8_0 build is the recommended default; q4_k is for tighter memory\nbudgets and fp16 is for verification or maximum fidelity."
         ],
         "highlights": [
-          "\ud83c\udf99\ufe0f **Dedicated ASR** \u2014 audio-in, text-out model built specifically for transcription",
-          "\ud83c\udf0d **14 languages** \u2014 covers English, major European languages, Arabic, Chinese, Japanese, Korean, and Vietnamese",
-          "\ud83e\uddf1 **Conformer encoder-decoder** \u2014 large acoustic encoder with a lightweight Transformer decoder",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+          "🎙️ **Dedicated ASR** — audio-in, text-out model built specifically for transcription",
+          "🌍 **14 languages** — covers English, major European languages, Arabic, Chinese, Japanese, Korean, and Vietnamese",
+          "🧱 **Conformer encoder-decoder** — large acoustic encoder with a lightweight Transformer decoder",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
         ]
       },
       "quants": [
@@ -1613,12 +1613,12 @@
       "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u4e13\u4e3a\u8bed\u97f3\u8f6c\u6587\u5b57\u6253\u9020\u7684 2B \u53c2\u6570\u6a21\u578b\uff0c\u652f\u6301 14 \u79cd\u8bed\u8a00",
+          "tagline": "专为语音转文字打造的 2B 参数模型，支持 14 种语言",
           "highlights": [
-            "\ud83c\udf99\ufe0f **\u4e13\u6ce8\u8bed\u97f3\u8f6c\u6587\u5b57** \u2014 \u53ea\u505a\u4e00\u4ef6\u4e8b\uff1a\u542c\u97f3\u9891\u3001\u51fa\u6587\u5b57\uff0c\u8f6c\u5199\u5c31\u662f\u5b83\u7684\u672c\u804c\u5de5\u4f5c",
-            "\ud83c\udf0d **\u652f\u6301 14 \u79cd\u8bed\u8a00** \u2014 \u8986\u76d6\u82f1\u8bed\u3001\u4e3b\u8981\u6b27\u6d32\u8bed\u8a00\u3001\u963f\u62c9\u4f2f\u8bed\u3001\u4e2d\u6587\u3001\u65e5\u8bed\u3001\u97e9\u8bed\u548c\u8d8a\u5357\u8bed",
-            "\ud83e\uddf1 **\u7cbe\u51c6\u542c\u97f3\uff0c\u8f7b\u91cf\u51fa\u5b57** \u2014 \u5927\u5bb9\u91cf\u6a21\u5757\u8d1f\u8d23\u7cbe\u7ec6\u6355\u6349\u8bed\u97f3\u7ec6\u8282\uff0c\u8f7b\u91cf\u6a21\u5757\u8d1f\u8d23\u5feb\u901f\u751f\u6210\u6587\u5b57",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u65e0\u9700\u5b89\u88c5 Python\uff0c\u4e13\u4e3a CPU \u548c Apple Silicon \u4f18\u5316"
+            "🎙️ **专注语音转文字** — 只做一件事：听音频、出文字，转写就是它的本职工作",
+            "🌍 **支持 14 种语言** — 覆盖英语、主要欧洲语言、阿拉伯语、中文、日语、韩语和越南语",
+            "🧱 **精准听音，轻量出字** — 大容量模块负责精细捕捉语音细节，轻量模块负责快速生成文字",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式无需安装 Python，专为 CPU 和 Apple Silicon 优化"
           ]
         }
       },
@@ -1651,16 +1651,16 @@
       "recommended_quant": "fp16",
       "pull_recommended": "redimnet2-b6-cn:fp16",
       "prose": {
-        "tagline": "ReDimNet2-B6 speaker embedder for OpenASR diarization \u2014 192-d CN-enhanced embeddings, fully on-device",
+        "tagline": "ReDimNet2-B6 speaker embedder for OpenASR diarization — 192-d CN-enhanced embeddings, fully on-device",
         "overview": [
-          "ReDimNet2-B6 is PalabraAI's 12.5M-parameter speaker-embedding model from the\nReDimNet2 family, trained on a VoxBlink2 + VoxCeleb2 + CN-Celeb2 mix so English and\nChinese speakers share one embedding space. OpenASR packages the MIT-licensed\ncheckpoint as a local `.oasr` capability pack and runs it through a ggml graph\n(not a pure-Rust hand-written forward). When this pack is installed it becomes the\npreferred speaker-embedding stage for diarization; the legacy WeSpeaker pack remains\navailable as a fallback until a later quality gate retires it. Embeddings are 192-d\ncosine vectors with a ReDimNet-specific calibration profile, separate from WeSpeaker's\n256-d space."
+          "ReDimNet2-B6 is PalabraAI's 12.5M-parameter speaker-embedding model from the\nReDimNet2 family, trained on a VoxBlink2 + VoxCeleb2 + CN-Celeb2 mix so English and\nChinese speakers share one embedding space. OpenASR packages the MIT-licensed\ncheckpoint as a local `.oasr` capability pack and runs it through a ggml graph\n(not a pure-Rust hand-written forward). This is the only supported speaker-embedding\nstage for diarization and Voice ID: when the pack is missing, diarize/Voice ID\nrequests fail closed rather than falling back to another embedder. Embeddings are\n192-d cosine vectors with a ReDimNet-specific calibration profile."
         ],
         "highlights": [
-          "\ud83d\udde3\ufe0f **Preferred OpenASR speaker embedder** \u2014 when installed, diarization prefers this pack over WeSpeaker for anonymous speaker labels on any ASR family",
-          "\ud83e\uddec **192-dim ReDimNet2-B6** \u2014 PalabraAI's dimension-reshaping speaker net (12.5M params) with a Chinese-enhanced vb2+vox2+cnc2 training mix",
-          "\ud83d\udd12 **Diarization, not identification** \u2014 anonymous session-relative labels; embeddings stay local and are discarded after the request unless you explicitly enroll a local profile",
-          "\ud83c\udfaf **Parity-gated packaging** \u2014 ggml-graph forward pass matches the upstream Python reference at cosine \u2265 0.9999 on held-out fixtures",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference and share the same pull/install path as ASR models"
+          "🗣️ **OpenASR speaker embedder** — the only supported speaker-embedding pack for diarization and Voice ID; required for anonymous speaker labels on any ASR family",
+          "🧬 **192-dim ReDimNet2-B6** — PalabraAI's dimension-reshaping speaker net (12.5M params) with a Chinese-enhanced vb2+vox2+cnc2 training mix",
+          "🔒 **Diarization, not identification** — anonymous session-relative labels; embeddings stay local and are discarded after the request unless you explicitly enroll a local profile",
+          "🎯 **Parity-gated packaging** — ggml-graph forward pass matches the upstream Python reference at cosine ≥ 0.9999 on held-out fixtures",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference and share the same pull/install path as ASR models"
         ]
       },
       "quants": [
@@ -1715,13 +1715,13 @@
       ],
       "prose_locales": {
         "zh-CN": {
-          "tagline": "ReDimNet2-B6 \u8bf4\u8bdd\u4eba\u58f0\u7eb9\u6a21\u578b\uff0c\u670d\u52a1\u4e8e OpenASR \u8bf4\u8bdd\u4eba\u5206\u79bb \u2014 192 \u7ef4\u4e2d\u82f1\u589e\u5f3a\u58f0\u7eb9\uff0c\u5b8c\u5168\u672c\u5730\u8fd0\u884c",
+          "tagline": "ReDimNet2-B6 说话人声纹模型，服务于 OpenASR 说话人分离 — 192 维中英增强声纹，完全本地运行",
           "highlights": [
-            "\ud83d\udde3\ufe0f **OpenASR \u4f18\u5148\u58f0\u7eb9\u6a21\u578b** \u2014 \u5b89\u88c5\u540e\u8bf4\u8bdd\u4eba\u5206\u79bb\u4f1a\u4f18\u5148\u4f7f\u7528\u672c\u5305\uff08\u800c\u975e WeSpeaker\uff09\u4e3a\u4efb\u610f\u8bed\u97f3\u6a21\u578b\u7684\u8f6c\u5199\u7ed3\u679c\u6807\u6ce8\u8bf4\u8bdd\u4eba",
-            "\ud83e\uddec **192 \u7ef4 ReDimNet2-B6** \u2014 \u6765\u81ea PalabraAI \u7684\u7ef4\u5ea6\u91cd\u5851\u58f0\u7eb9\u7f51\u7edc\uff08\u7ea6 12.5M \u53c2\u6570\uff09\uff0c\u7528\u542b vb2+vox2+cnc2 \u7684\u4e2d\u82f1\u6df7\u5408\u6570\u636e\u8bad\u7ec3",
-            "\ud83d\udd12 **\u53ea\u5206\u79bb\u8bf4\u8bdd\u4eba\uff0c\u4e0d\u8bc6\u522b\u8eab\u4efd** \u2014 \u53ea\u7ed9\u533f\u540d\u7f16\u53f7\uff0c\u58f0\u7eb9\u6570\u636e\u7559\u5728\u672c\u5730\u4e14\u7528\u5b8c\u5373\u5220\uff0c\u9664\u975e\u4f60\u4e3b\u52a8\u6ce8\u518c\u672c\u5730\u6863\u6848",
-            "\ud83c\udfaf **\u7cbe\u5ea6\u4e25\u683c\u6821\u9a8c** \u2014 ggml \u8ba1\u7b97\u56fe\u524d\u5411\u4e0e\u4e0a\u6e38 Python \u53c2\u8003\u5b9e\u73b0\u5728\u56fa\u5b9a\u6837\u672c\u4e0a\u7684\u4f59\u5f26\u76f8\u4f3c\u5ea6 \u2265 0.9999",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u65e0\u9700 Python\uff0c\u4e0e\u8bed\u97f3\u8bc6\u522b\u6a21\u578b\u5171\u7528\u540c\u4e00\u5957\u4e0b\u8f7d\u548c\u5b89\u88c5\u6d41\u7a0b"
+            "🗣️ **OpenASR 声纹模型** — 说话人分离与 Voice ID 唯一支持的声纹包；缺失时会明确失败，不会静默降级",
+            "🧬 **192 维 ReDimNet2-B6** — 来自 PalabraAI 的维度重塑声纹网络（约 12.5M 参数），用含 vb2+vox2+cnc2 的中英混合数据训练",
+            "🔒 **只分离说话人，不识别身份** — 只给匿名编号，声纹数据留在本地且用完即删，除非你主动注册本地档案",
+            "🎯 **精度严格校验** — ggml 计算图前向与上游 Python 参考实现在固定样本上的余弦相似度 ≥ 0.9999",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式无需 Python，与语音识别模型共用同一套下载和安装流程"
           ]
         }
       },
@@ -1756,14 +1756,14 @@
       "prose": {
         "tagline": "Chinese punctuation restoration for OpenASR -- a BERT token classifier that adds full-width marks to unpunctuated transcripts, fully on-device",
         "overview": [
-          "FireRedPunc is a **punctuation-prediction** model from **FireRedTeam**, part of the\nFireRedASR2S all-in-one ASR system. It adopts a BERT-style encoder initialized from\n`chinese-lert-base` (a 12-layer, 768-hidden, 12-head BERT) with a token-classification head\nthat predicts, for each subword, which of five classes follows it: none, or one of the four\nChinese full-width marks `\uff0c`, `\u3002`, `\uff1f`, `\uff01`. It is a text-in / labels-out post-processor,\nnot an ASR model -- no audio frontend, no autoregressive decode.\n\nIn OpenASR it is packaged as an optional **punctuation capability pack**: an unpunctuated\nfamily's finished transcript (e.g. Dolphin or FireRedASR2-AED) is passed through the classifier\nonce, and the predicted marks are re-inserted into the original characters. The stage is\nauto-gated on the ASR model's catalog `emits_punctuation == false` and only runs when this pack\nis installed, so punctuating families are never double-punctuated. Because the released label\nset is Chinese-only, the integration is Chinese-only by construction (the architecture cannot\nemit English half-width marks).\n\nThis OpenASR repo repackages the upstream weights as `.oasr` packs that run natively in the\nOpenASR runtime -- no Python at inference, all decoding local. It ships in **fp16**.\n\n**Not a standalone transcription model.** This pack cannot transcribe audio by itself; it is an\nopt-in post-process applied to an unpunctuated ASR model's output.\n\n**Verification:** local verification covers exact per-token label parity against the upstream\nPyTorch forward across a set of Chinese golden sentences (all four punctuation classes plus the\nno-mark class)."
+          "FireRedPunc is a **punctuation-prediction** model from **FireRedTeam**, part of the\nFireRedASR2S all-in-one ASR system. It adopts a BERT-style encoder initialized from\n`chinese-lert-base` (a 12-layer, 768-hidden, 12-head BERT) with a token-classification head\nthat predicts, for each subword, which of five classes follows it: none, or one of the four\nChinese full-width marks `，`, `。`, `？`, `！`. It is a text-in / labels-out post-processor,\nnot an ASR model -- no audio frontend, no autoregressive decode.\n\nIn OpenASR it is packaged as an optional **punctuation capability pack**: an unpunctuated\nfamily's finished transcript (e.g. Dolphin or FireRedASR2-AED) is passed through the classifier\nonce, and the predicted marks are re-inserted into the original characters. The stage is\nauto-gated on the ASR model's catalog `emits_punctuation == false` and only runs when this pack\nis installed, so punctuating families are never double-punctuated. Because the released label\nset is Chinese-only, the integration is Chinese-only by construction (the architecture cannot\nemit English half-width marks).\n\nThis OpenASR repo repackages the upstream weights as `.oasr` packs that run natively in the\nOpenASR runtime -- no Python at inference, all decoding local. It ships in **fp16**.\n\n**Not a standalone transcription model.** This pack cannot transcribe audio by itself; it is an\nopt-in post-process applied to an unpunctuated ASR model's output.\n\n**Verification:** local verification covers exact per-token label parity against the upstream\nPyTorch forward across a set of Chinese golden sentences (all four punctuation classes plus the\nno-mark class)."
         ],
         "highlights": [
-          "\ud83c\ude36 **Chinese punctuation restoration** -- restores full-width `\uff0c\u3002\uff1f\uff01` on an unpunctuated ASR transcript (e.g. Dolphin, FireRedASR2-AED) in a finalize-only post-processing pass",
-          "\ud83e\udde0 **BERT token classifier** -- a 12-layer `chinese-lert-base` encoder with a 5-class head predicting which of none/\uff0c\u3002\uff1f\uff01 follows each subword",
-          "\ud83c\udde8\ud83c\uddf3 **Chinese-only by construction** -- the released label set has no English half-width marks, so only Chinese text is punctuated",
-          "\ud83d\udd0c **Opt-in and auto-gated** -- runs only when the ASR model is unpunctuated and this pack is installed, so punctuating families are never double-punctuated",
-          "\ud83e\udd80 **Native in OpenASR** -- `.oasr` packs run with no Python at inference, all decoding local"
+          "🈶 **Chinese punctuation restoration** -- restores full-width `，。？！` on an unpunctuated ASR transcript (e.g. Dolphin, FireRedASR2-AED) in a finalize-only post-processing pass",
+          "🧠 **BERT token classifier** -- a 12-layer `chinese-lert-base` encoder with a 5-class head predicting which of none/，。？！ follows each subword",
+          "🇨🇳 **Chinese-only by construction** -- the released label set has no English half-width marks, so only Chinese text is punctuated",
+          "🔌 **Opt-in and auto-gated** -- runs only when the ASR model is unpunctuated and this pack is installed, so punctuating families are never double-punctuated",
+          "🦀 **Native in OpenASR** -- `.oasr` packs run with no Python at inference, all decoding local"
         ]
       },
       "quants": [
@@ -1786,13 +1786,13 @@
       ],
       "prose_locales": {
         "zh-CN": {
-          "tagline": "OpenASR \u7684\u4e2d\u6587\u6807\u70b9\u6062\u590d\u63d2\u4ef6 \u2014 \u81ea\u52a8\u4e3a\u65e0\u6807\u70b9\u7684\u8f6c\u5199\u7ed3\u679c\u8865\u4e0a\u5168\u89d2\u6807\u70b9\uff0c\u5b8c\u5168\u5728\u672c\u5730\u8fd0\u884c",
+          "tagline": "OpenASR 的中文标点恢复插件 — 自动为无标点的转写结果补上全角标点，完全在本地运行",
           "highlights": [
-            "\ud83c\ude36 **\u4e2d\u6587\u6807\u70b9\u6062\u590d** \u2014 \u5728\u8f6c\u5199\u7684\u6700\u540e\u4e00\u6b65\uff0c\u4e3a\u65e0\u6807\u70b9\u7684\u8bc6\u522b\u7ed3\u679c\uff08\u5982 Dolphin\u3001FireRedASR2-AED \u8f93\u51fa\uff09\u81ea\u52a8\u8865\u4e0a\u5168\u89d2 `\uff0c\u3002\uff1f\uff01`",
-            "\ud83e\udde0 **\u9010\u4f4d\u6807\u70b9\u9884\u6d4b** \u2014 \u57fa\u4e8e 12 \u5c42 `chinese-lert-base` \u6a21\u578b\uff0c\u5bf9\u6bcf\u4e2a\u4f4d\u7f6e\u5224\u65ad\u8be5\u63a5\u54ea\u79cd\u6807\u70b9\uff08\u65e0\u6807\u70b9\u3001\uff0c\u3001\u3002\u3001\uff1f\u3001\uff01\u5171 5 \u7c7b\uff09",
-            "\ud83c\udde8\ud83c\uddf3 **\u4ec5\u652f\u6301\u4e2d\u6587\u6807\u70b9** \u2014 \u6807\u7b7e\u96c6\u53ea\u5305\u542b\u4e2d\u6587\u5168\u89d2\u6807\u70b9\uff0c\u4e0d\u542b\u82f1\u6587\u534a\u89d2\u6807\u70b9\uff0c\u6240\u4ee5\u53ea\u4f1a\u7ed9\u4e2d\u6587\u6587\u672c\u52a0\u6807\u70b9",
-            "\ud83d\udd0c **\u6309\u9700\u542f\u7528\uff0c\u81ea\u52a8\u5224\u65ad** \u2014 \u53ea\u6709\u5f53\u8bed\u97f3\u6a21\u578b\u672c\u8eab\u4e0d\u5e26\u6807\u70b9\u3001\u4e14\u5df2\u5b89\u88c5\u6b64\u63d2\u4ef6\u65f6\u624d\u4f1a\u8fd0\u884c\uff0c\u7edd\u4e0d\u4f1a\u7ed9\u5df2\u6709\u6807\u70b9\u7684\u5185\u5bb9\u91cd\u590d\u52a0\u6807\u70b9",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u65e0\u9700\u5b89\u88c5 Python\uff0c\u6240\u6709\u5904\u7406\u90fd\u5728\u672c\u5730\u5b8c\u6210"
+            "🈶 **中文标点恢复** — 在转写的最后一步，为无标点的识别结果（如 Dolphin、FireRedASR2-AED 输出）自动补上全角 `，。？！`",
+            "🧠 **逐位标点预测** — 基于 12 层 `chinese-lert-base` 模型，对每个位置判断该接哪种标点（无标点、，、。、？、！共 5 类）",
+            "🇨🇳 **仅支持中文标点** — 标签集只包含中文全角标点，不含英文半角标点，所以只会给中文文本加标点",
+            "🔌 **按需启用，自动判断** — 只有当语音模型本身不带标点、且已安装此插件时才会运行，绝不会给已有标点的内容重复加标点",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式无需安装 Python，所有处理都在本地完成"
           ]
         }
       },
@@ -1831,11 +1831,11 @@
           "Qwen3-ForcedAligner-0.6B is a **word-level forced-alignment** model from **Qwen**, sharing its\naudio-encoder + LM `thinker` tensor layout byte-for-byte with **Qwen3-ASR** (same\n`Qwen3ASRForConditionalGeneration` architecture). The only structural difference is the final\nhead: instead of a tied vocabulary `lm_head`, it uses an independent `Linear(hidden_size,\n5000)` classification head over 80ms-wide timestamp bins. Given a transcript's text and its\nsource audio, it runs a single non-autoregressive forward pass and reads off word-boundary\ntimestamps at argmax `<timestamp>` positions -- refining a model family's own (typically\ndecode-time-approximate) per-word timestamps. This OpenASR repo repackages the weights as\n`.oasr` packs that run natively in the OpenASR runtime -- no Python at inference, all decoding\nlocal. It ships in **fp16** (maximum fidelity, recommended), **q8_0**, and **q4_k** builds.\n\n**Not a standalone transcription model.** This pack cannot transcribe audio by itself; it is an\nopt-in refinement step consumed via `openasr transcribe <audio> --model <asr-model>\n--word-timestamps=aligned`. The base model's own timestamps (`--word-timestamps` /\n`--word-timestamps=approximate`) remain the default -- nothing changes unless `aligned` is\nrequested explicitly.\n\n**Verification:** local verification covers a tensor-parity check against the real upstream\ncheckpoint -- every source safetensors tensor maps 1:1 to a destination tensor, plus the two\nsynthesized frontend tensors, across the fp16/q8_0/q4_k quants."
         ],
         "highlights": [
-          "\ud83c\udfaf **Refined word timestamps** \u2014 consumes a finished transcript's text plus the source audio and replaces a model family's own approximate per-word timestamps with aligner-refined spans (`--word-timestamps=aligned`)",
-          "\u26a1 **Non-autoregressive** \u2014 a single forward pass over interleaved audio/text with argmax at `<timestamp>` positions (5000 80ms-wide bins), not incremental greedy decoding, so it is not dispatched through the qwen3-asr runtime",
-          "\ud83e\udde9 **Shares its backbone with Qwen3-ASR** \u2014 the same audio-encoder + LM `thinker` tensor layout, byte-for-byte; only the final head differs (an independent 5000-way classification head instead of the tied vocabulary head)",
-          "\ud83d\udd0c **Opt-in only** \u2014 a model family's own decode-time timestamps remain the default; this pack is only consulted when a transcribe call explicitly asks for `aligned` timestamps, and may auto-install under the same CLI consent flow as `--diarize`",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+          "🎯 **Refined word timestamps** — consumes a finished transcript's text plus the source audio and replaces a model family's own approximate per-word timestamps with aligner-refined spans (`--word-timestamps=aligned`)",
+          "⚡ **Non-autoregressive** — a single forward pass over interleaved audio/text with argmax at `<timestamp>` positions (5000 80ms-wide bins), not incremental greedy decoding, so it is not dispatched through the qwen3-asr runtime",
+          "🧩 **Shares its backbone with Qwen3-ASR** — the same audio-encoder + LM `thinker` tensor layout, byte-for-byte; only the final head differs (an independent 5000-way classification head instead of the tied vocabulary head)",
+          "🔌 **Opt-in only** — a model family's own decode-time timestamps remain the default; this pack is only consulted when a transcribe call explicitly asks for `aligned` timestamps, and may auto-install under the same CLI consent flow as `--diarize`",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
       "quants": [
@@ -1890,13 +1890,13 @@
       ],
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u4e3a OpenASR \u8f6c\u5199\u7ed3\u679c\u63d0\u4f9b\u8bcd\u7ea7\u5f3a\u5236\u5bf9\u9f50 \u2014 \u975e\u81ea\u56de\u5f52\u7684 Qwen3 \u97f3\u9891+\u6587\u672c\u6a21\u578b\uff0c\u7528\u4e8e\u7cbe\u4fee\u9010\u8bcd\u65f6\u95f4\u6233",
+          "tagline": "为 OpenASR 转写结果提供词级强制对齐 — 非自回归的 Qwen3 音频+文本模型，用于精修逐词时间戳",
           "highlights": [
-            "\ud83c\udfaf **\u7cbe\u4fee\u8bcd\u7ea7\u65f6\u95f4\u6233** \u2014 \u8f93\u5165\u5df2\u5b8c\u6210\u7684\u8f6c\u5199\u6587\u672c\u4e0e\u539f\u59cb\u97f3\u9891\uff0c\u7528\u5bf9\u9f50\u6a21\u578b\u7cbe\u4fee\u540e\u7684\u65f6\u95f4\u8de8\u5ea6\u66ff\u6362\u6a21\u578b\u81ea\u8eab\u7684\u8fd1\u4f3c\u9010\u8bcd\u65f6\u95f4\u6233\uff08`--word-timestamps=aligned`\uff09",
-            "\u26a1 **\u975e\u81ea\u56de\u5f52** \u2014 \u5bf9\u4ea4\u9519\u7684\u97f3\u9891/\u6587\u672c\u505a\u5355\u6b21\u524d\u5411\u8ba1\u7b97\uff0c\u5728 `<timestamp>` \u4f4d\u7f6e\u53d6 argmax\uff085000 \u4e2a 80ms \u5bbd\u7684\u5206\u7bb1\uff09\uff0c\u4e0d\u662f\u9010\u6b65\u8d2a\u5fc3\u89e3\u7801\uff0c\u56e0\u6b64\u4e0d\u901a\u8fc7 qwen3-asr \u8fd0\u884c\u65f6\u6d3e\u53d1",
-            "\ud83e\udde9 **\u4e0e Qwen3-ASR \u5171\u4eab\u9aa8\u5e72** \u2014 \u97f3\u9891\u7f16\u7801\u5668 + LM \u7684 `thinker` \u5f20\u91cf\u5e03\u5c40\u9010\u4f4d\u76f8\u540c\uff0c\u4ec5\u672b\u7aef\u8f93\u51fa\u5934\u4e0d\u540c\uff08\u72ec\u7acb\u7684 5000 \u5206\u7c7b\u5934\uff0c\u800c\u975e\u5171\u4eab\u8bcd\u8868\u7684\u7ed1\u5b9a\u5934\uff09",
-            "\ud83d\udd0c **\u4ec5\u4e3a\u53ef\u9009\u9879** \u2014 \u6a21\u578b\u81ea\u8eab\u7684\u89e3\u7801\u65f6\u65f6\u95f4\u6233\u4ecd\u662f\u9ed8\u8ba4\u503c\uff1b\u53ea\u6709\u8f6c\u5199\u8c03\u7528\u663e\u5f0f\u8981\u6c42 `aligned` \u65f6\u95f4\u6233\u65f6\u624d\u4f1a\u7528\u5230\u672c\u6a21\u578b\u5305\uff0c\u4e14\u53ef\u4e0e `--diarize` \u4e00\u6837\u8d70\u540c\u4e00\u5957 CLI \u540c\u610f\u5b89\u88c5\u6d41\u7a0b",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u5305\u63a8\u7406\u9636\u6bb5\u65e0\u9700 Python\uff0c\u9488\u5bf9 CPU \u4e0e GPU \u7684\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+            "🎯 **精修词级时间戳** — 输入已完成的转写文本与原始音频，用对齐模型精修后的时间跨度替换模型自身的近似逐词时间戳（`--word-timestamps=aligned`）",
+            "⚡ **非自回归** — 对交错的音频/文本做单次前向计算，在 `<timestamp>` 位置取 argmax（5000 个 80ms 宽的分箱），不是逐步贪心解码，因此不通过 qwen3-asr 运行时派发",
+            "🧩 **与 Qwen3-ASR 共享骨干** — 音频编码器 + LM 的 `thinker` 张量布局逐位相同，仅末端输出头不同（独立的 5000 分类头，而非共享词表的绑定头）",
+            "🔌 **仅为可选项** — 模型自身的解码时时间戳仍是默认值；只有转写调用显式要求 `aligned` 时间戳时才会用到本模型包，且可与 `--diarize` 一样走同一套 CLI 同意安装流程",
+            "🦀 **OpenASR 原生运行** — `.oasr` 包推理阶段无需 Python，针对 CPU 与 GPU 的极致性能优化"
           ]
         }
       },
@@ -1929,14 +1929,14 @@
       "prose": {
         "tagline": "Tiny 27M-parameter English ASR built for real-time, on-device transcription",
         "overview": [
-          "Moonshine Tiny is the smallest model in Useful Sensors' **Moonshine** family \u2014 a 27M-parameter,\nsequence-to-sequence English speech-recognition model designed for **real-time, on-device\ntranscription** on hardware that is severely constrained in memory and compute. Trained on 200,000\nhours of audio, it transcribes English speech to text and, despite its size, reports greater accuracy\nthan existing ASR systems of comparable scale on standard benchmarks. It targets developers building\nlive transcription and voice-command experiences on low-cost devices. Like other autoregressive ASR\nmodels it can occasionally hallucinate or repeat on very short or clipped segments, so robust\nin-domain evaluation is recommended before deployment. This OpenASR repo repackages the original\nweights as `.oasr` packs that run natively in the OpenASR runtime \u2014 no Python at inference time. The\n**q8_0** build is the recommended default (near-reference accuracy at roughly a third of the\nfootprint); **fp16** is for verification or maximum fidelity."
+          "Moonshine Tiny is the smallest model in Useful Sensors' **Moonshine** family — a 27M-parameter,\nsequence-to-sequence English speech-recognition model designed for **real-time, on-device\ntranscription** on hardware that is severely constrained in memory and compute. Trained on 200,000\nhours of audio, it transcribes English speech to text and, despite its size, reports greater accuracy\nthan existing ASR systems of comparable scale on standard benchmarks. It targets developers building\nlive transcription and voice-command experiences on low-cost devices. Like other autoregressive ASR\nmodels it can occasionally hallucinate or repeat on very short or clipped segments, so robust\nin-domain evaluation is recommended before deployment. This OpenASR repo repackages the original\nweights as `.oasr` packs that run natively in the OpenASR runtime — no Python at inference time. The\n**q8_0** build is the recommended default (near-reference accuracy at roughly a third of the\nfootprint); **fp16** is for verification or maximum fidelity."
         ],
         "highlights": [
-          "\ud83e\udeb6 **Just 27M parameters** \u2014 the smallest Moonshine, sized for memory- and compute-constrained edge hardware",
-          "\u26a1 **Real-time on-device** \u2014 engineered by Useful Sensors for live transcription and voice commands on low-cost devices",
-          "\ud83c\udfaf **Accurate for its size** \u2014 beats similarly-sized ASR systems on standard English benchmarks (per the Moonshine paper)",
-          "\ud83d\udde3\ufe0f **English speech-to-text** \u2014 sequence-to-sequence ASR trained on 200K hours of audio",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+          "🪶 **Just 27M parameters** — the smallest Moonshine, sized for memory- and compute-constrained edge hardware",
+          "⚡ **Real-time on-device** — engineered by Useful Sensors for live transcription and voice commands on low-cost devices",
+          "🎯 **Accurate for its size** — beats similarly-sized ASR systems on standard English benchmarks (per the Moonshine paper)",
+          "🗣️ **English speech-to-text** — sequence-to-sequence ASR trained on 200K hours of audio",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
       "quants": [
@@ -1978,13 +1978,13 @@
       "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u8d85\u8f7b\u91cf 27M \u53c2\u6570\u82f1\u8bed\u8bed\u97f3\u8bc6\u522b\uff0c\u4e13\u4e3a\u5b9e\u65f6\u672c\u5730\u8f6c\u5199\u6253\u9020",
+          "tagline": "超轻量 27M 参数英语语音识别，专为实时本地转写打造",
           "highlights": [
-            "\ud83e\udeb6 **\u4ec5 27M \u53c2\u6570** \u2014 Moonshine \u7cfb\u5217\u4e2d\u6700\u5c0f\u7684\u6a21\u578b\uff0c\u5185\u5b58\u548c\u7b97\u529b\u5360\u7528\u6781\u4f4e\uff0c\u9002\u5408\u8d44\u6e90\u6709\u9650\u7684\u8bbe\u5907",
-            "\u26a1 **\u5b9e\u65f6\u672c\u5730\u8fd0\u884c** \u2014 \u7531 Useful Sensors \u6253\u9020\uff0c\u5728\u4f4e\u6210\u672c\u8bbe\u5907\u4e0a\u4e5f\u80fd\u6d41\u7545\u505a\u5b9e\u65f6\u8f6c\u5199\u548c\u8bed\u97f3\u6307\u4ee4",
-            "\ud83c\udfaf **\u5c0f\u8eab\u6750\u5927\u51c6\u5934** \u2014 \u5728\u6807\u51c6\u82f1\u8bed\u6d4b\u8bd5\u4e2d\u6253\u8d62\u4e86\u540c\u7b49\u4f53\u79ef\u7684\u8bed\u97f3\u8bc6\u522b\u6a21\u578b\uff08\u636e Moonshine \u8bba\u6587\uff09",
-            "\ud83d\udde3\ufe0f **\u82f1\u8bed\u8bed\u97f3\u8f6c\u6587\u5b57** \u2014 \u57fa\u4e8e 200K \u5c0f\u65f6\u97f3\u9891\u6570\u636e\u8bad\u7ec3\u800c\u6210",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u8fd0\u884c\u65f6\u65e0\u9700 Python\uff0cCPU \u548c GPU \u90fd\u505a\u4e86\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+            "🪶 **仅 27M 参数** — Moonshine 系列中最小的模型，内存和算力占用极低，适合资源有限的设备",
+            "⚡ **实时本地运行** — 由 Useful Sensors 打造，在低成本设备上也能流畅做实时转写和语音指令",
+            "🎯 **小身材大准头** — 在标准英语测试中打赢了同等体积的语音识别模型（据 Moonshine 论文）",
+            "🗣️ **英语语音转文字** — 基于 200K 小时音频数据训练而成",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，运行时无需 Python，CPU 和 GPU 都做了极致性能优化"
           ]
         }
       },
@@ -2117,10 +2117,10 @@
           "Whisper Large v3 Turbo is OpenAI's faster variant of Whisper large-v3: it keeps the same\nWhisper architecture and multilingual speech-recognition/translation interface, but reduces\nthe decoder depth from 32 layers to 4. The upstream card describes the result as much faster\nwith only a minor quality trade-off, while retaining Whisper's broad zero-shot behavior from\ntraining on more than five million hours of labeled audio. This OpenASR repo repackages the\noriginal `openai/whisper-large-v3-turbo` weights as `.oasr` packs that run natively in the\nOpenASR runtime with no Python at inference time. For most users the q8_0 build is the\nrecommended default; q4_k is for tighter memory budgets and fp16 is for verification or\nmaximum fidelity."
         ],
         "highlights": [
-          "\u26a1 **Turbo decoder** \u2014 prunes Whisper large-v3's decoder from 32 layers to 4 for much faster generation",
-          "\ud83c\udf0d **Multilingual ASR** \u2014 transcribes many languages and can translate speech to English",
-          "\ud83c\udf99\ufe0f **Zero-shot robustness** \u2014 inherits Whisper's large-scale weak-supervision training across noisy domains",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+          "⚡ **Turbo decoder** — prunes Whisper large-v3's decoder from 32 layers to 4 for much faster generation",
+          "🌍 **Multilingual ASR** — transcribes many languages and can translate speech to English",
+          "🎙️ **Zero-shot robustness** — inherits Whisper's large-scale weak-supervision training across noisy domains",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
       "quants": [
@@ -2177,12 +2177,12 @@
       "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "Whisper large-v3 \u7684\u63d0\u901f\u7cbe\u7b80\u7248\uff0c\u591a\u8bed\u8a00\u8bc6\u522b\u98de\u5feb",
+          "tagline": "Whisper large-v3 的提速精简版，多语言识别飞快",
           "highlights": [
-            "\u26a1 **Turbo \u63d0\u901f** \u2014 \u628a large-v3 \u5185\u90e8\u4ece 32 \u5c42\u7cbe\u7b80\u5230 4 \u5c42\uff0c\u8f6c\u5199\u901f\u5ea6\u5927\u5e45\u63d0\u5347",
-            "\ud83c\udf0d **\u591a\u8bed\u8a00\u8bc6\u522b** \u2014 \u80fd\u8f6c\u5199\u591a\u79cd\u8bed\u8a00\uff0c\u8fd8\u80fd\u628a\u8bed\u97f3\u76f4\u63a5\u7ffb\u8bd1\u6210\u82f1\u8bed",
-            "\ud83c\udf99\ufe0f **\u5929\u751f\u6297\u566a** \u2014 \u7ee7\u627f Whisper \u6d77\u91cf\u8bed\u97f3\u8bad\u7ec3\u7684\u5e95\u5b50\uff0c\u5608\u6742\u73af\u5883\u4e5f\u80fd\u7a33\u5b9a\u8bc6\u522b",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u65e0\u9700\u5b89\u88c5 Python\uff0c\u4e13\u4e3a CPU \u548c GPU \u6df1\u5ea6\u4f18\u5316"
+            "⚡ **Turbo 提速** — 把 large-v3 内部从 32 层精简到 4 层，转写速度大幅提升",
+            "🌍 **多语言识别** — 能转写多种语言，还能把语音直接翻译成英语",
+            "🎙️ **天生抗噪** — 继承 Whisper 海量语音训练的底子，嘈杂环境也能稳定识别",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，无需安装 Python，专为 CPU 和 GPU 深度优化"
           ]
         }
       },
@@ -2312,10 +2312,10 @@
           "Whisper Large v3 is OpenAI's 1.55B-parameter multilingual Whisper checkpoint, the most accurate\nmember of the family. It uses the standard Whisper encoder-decoder architecture for automatic\nspeech recognition and speech translation; v3 was trained on a larger and more diverse labelled\ncorpus and uses 128 mel-frequency bins, improving robustness across languages and conditions\nover earlier large checkpoints. This OpenASR repo repackages the original\n`openai/whisper-large-v3` weights as `.oasr` packs that run natively in the OpenASR runtime with\nno Python at inference time. For most users the q8_0 build is the recommended default; q4_k is\nfor tighter memory budgets and fp16 is for verification or maximum fidelity. For a faster\nlarge-grade option, see the distilled `whisper-large-v3-turbo`."
         ],
         "highlights": [
-          "\ud83c\udfa7 **Multilingual ASR** \u2014 transcribes a wide range of languages and can translate speech to English",
-          "\ud83c\udfc6 **1.55B parameters** \u2014 the full-size Whisper, OpenAI's highest-accuracy checkpoint",
-          "\ud83d\udd01 **v3 improvements** \u2014 trained on a larger, more diverse corpus with 128 mel bins for better robustness",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+          "🎧 **Multilingual ASR** — transcribes a wide range of languages and can translate speech to English",
+          "🏆 **1.55B parameters** — the full-size Whisper, OpenAI's highest-accuracy checkpoint",
+          "🔁 **v3 improvements** — trained on a larger, more diverse corpus with 128 mel bins for better robustness",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
         ]
       },
       "quants": [
@@ -2372,12 +2372,12 @@
       "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "OpenAI \u51c6\u786e\u7387\u6700\u9ad8\u7684 Whisper\uff0cv3 \u5b8c\u6574\u7248",
+          "tagline": "OpenAI 准确率最高的 Whisper，v3 完整版",
           "highlights": [
-            "\ud83c\udfa7 **\u591a\u8bed\u8a00\u8bc6\u522b** \u2014 \u652f\u6301\u8f6c\u5199\u591a\u79cd\u8bed\u8a00\uff0c\u8fd8\u80fd\u628a\u8bed\u97f3\u76f4\u63a5\u7ffb\u8bd1\u6210\u82f1\u8bed",
-            "\ud83c\udfc6 **1.55B \u53c2\u6570** \u2014 Whisper \u6ee1\u8840\u7248\uff0cOpenAI \u51fa\u54c1\u7684\u6700\u9ad8\u7cbe\u5ea6\u7248\u672c",
-            "\ud83d\udd01 **v3 \u7248\u672c\u5347\u7ea7** \u2014 \u8bad\u7ec3\u6570\u636e\u66f4\u5927\u66f4\u4e30\u5bcc\uff0c\u91c7\u7528 128 \u9891\u6bb5\u97f3\u9891\u5206\u6790\uff0c\u5404\u79cd\u573a\u666f\u4e0b\u90fd\u66f4\u7a33",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u65e0\u9700\u5b89\u88c5 Python\uff0c\u4e13\u4e3a CPU \u548c Apple Silicon \u4f18\u5316"
+            "🎧 **多语言识别** — 支持转写多种语言，还能把语音直接翻译成英语",
+            "🏆 **1.55B 参数** — Whisper 满血版，OpenAI 出品的最高精度版本",
+            "🔁 **v3 版本升级** — 训练数据更大更丰富，采用 128 频段音频分析，各种场景下都更稳",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，无需安装 Python，专为 CPU 和 Apple Silicon 优化"
           ]
         }
       },
@@ -2410,16 +2410,16 @@
       "recommended_quant": "f32",
       "pull_recommended": "pyannote-segmentation-3.0:f32",
       "prose": {
-        "tagline": "pyannote segmentation-3.0 \u2014 speaker-change and overlap aware speech segmentation for OpenASR diarization",
+        "tagline": "pyannote segmentation-3.0 — speaker-change and overlap aware speech segmentation for OpenASR diarization",
         "overview": [
-          "pyannote **segmentation-3.0** is the local speech-segmentation model from the pyannote speaker\ndiarization toolkit: a PyanNet (SincNet front-end + bidirectional LSTM) classifier over a 7-class\npowerset that labels every 10 s window with which of up to three speakers are active \u2014 including\noverlapped speech. OpenASR uses it as the optional segmentation stage of its model-agnostic\ndiarization pipeline: when this pack is installed, `--diarize` splits speech at speaker changes\ninstead of relying on coarse VAD slices, then the WeSpeaker embedder pack clusters the segments into\nanonymous speaker turns. Weights are extracted from the un-gated, MIT-licensed\n**onnx-community** ONNX mirror at a pinned revision and repackaged as a raw-f32 `.oasr` pack that\nruns in pure Rust \u2014 no Python at inference time."
+          "pyannote **segmentation-3.0** is the local speech-segmentation model from the pyannote speaker\ndiarization toolkit: a PyanNet (SincNet front-end + bidirectional LSTM) classifier over a 7-class\npowerset that labels every 10 s window with which of up to three speakers are active — including\noverlapped speech. OpenASR uses it as the optional segmentation stage of its model-agnostic\ndiarization pipeline: when this pack is installed, `--diarize` splits speech at speaker changes\ninstead of relying on coarse VAD slices, then the ReDimNet2-B6 embedder pack clusters the segments into\nanonymous speaker turns. Weights are extracted from the un-gated, MIT-licensed\n**onnx-community** ONNX mirror at a pinned revision and repackaged as a raw-f32 `.oasr` pack that\nruns in pure Rust — no Python at inference time."
         ],
         "highlights": [
-          "\u2702\ufe0f **Speaker-change aware segmentation** \u2014 PyanNet (SincNet + BiLSTM) with a powerset head that detects up to 3 concurrent speakers, including overlapped speech",
-          "\ud83e\udd1d **Quality upgrade for `--diarize`** \u2014 installed alongside the WeSpeaker embedder pack, it replaces coarse VAD slices with fine speaker-turn boundaries",
-          "\ud83d\udd12 **Diarization, not identification** \u2014 anonymous session-relative labels; nothing leaves the machine",
-          "\ud83c\udfaf **Bit-exact packaging** \u2014 single raw-f32 build; the pure-Rust forward pass matches the upstream ONNX logits (max abs error ~7e-5)",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
+          "✂️ **Speaker-change aware segmentation** — PyanNet (SincNet + BiLSTM) with a powerset head that detects up to 3 concurrent speakers, including overlapped speech",
+          "🤝 **Quality upgrade for `--diarize`** — installed alongside the ReDimNet2-B6 embedder pack, it replaces coarse VAD slices with fine speaker-turn boundaries",
+          "🔒 **Diarization, not identification** — anonymous session-relative labels; nothing leaves the machine",
+          "🎯 **Bit-exact packaging** — single raw-f32 build; the pure-Rust forward pass matches the upstream ONNX logits (max abs error ~7e-5)",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for peak performance on CPU & GPU"
         ]
       },
       "quants": [
@@ -2442,13 +2442,13 @@
       ],
       "prose_locales": {
         "zh-CN": {
-          "tagline": "pyannote segmentation-3.0 \u2014 \u80fd\u611f\u77e5\u8bf4\u8bdd\u4eba\u5207\u6362\u548c\u591a\u4eba\u91cd\u53e0\u7684\u8bed\u97f3\u5206\u5272\u6a21\u578b\uff0c\u4e3a OpenASR \u8bf4\u8bdd\u4eba\u5206\u79bb\u800c\u751f",
+          "tagline": "pyannote segmentation-3.0 — 能感知说话人切换和多人重叠的语音分割模型，为 OpenASR 说话人分离而生",
           "highlights": [
-            "\u2702\ufe0f **\u611f\u77e5\u8bf4\u8bdd\u4eba\u5207\u6362\u7684\u5206\u5272** \u2014 \u6700\u591a\u53ef\u540c\u65f6\u68c0\u6d4b 3 \u4f4d\u8bf4\u8bdd\u4eba\uff0c\u5305\u62ec\u591a\u4eba\u91cd\u53e0\u8bf4\u8bdd\u7684\u573a\u666f",
-            "\ud83e\udd1d **\u63d0\u5347 `--diarize` \u5206\u79bb\u6548\u679c** \u2014 \u642d\u914d WeSpeaker \u58f0\u7eb9\u6a21\u578b\u4e00\u8d77\u5b89\u88c5\uff0c\u7528\u7cbe\u7ec6\u7684\u8bf4\u8bdd\u4eba\u5207\u6362\u8fb9\u754c\u66ff\u4ee3\u7c97\u7565\u7684\u8bed\u97f3\u7247\u6bb5\u5212\u5206",
-            "\ud83d\udd12 **\u53ea\u5206\u79bb\u8bf4\u8bdd\u4eba\uff0c\u4e0d\u8bc6\u522b\u8eab\u4efd** \u2014 \u53ea\u7ed9\u533f\u540d\u7f16\u53f7\uff0c\u6240\u6709\u6570\u636e\u90fd\u7559\u5728\u4f60\u7684\u7535\u8111\u4e0a",
-            "\ud83c\udfaf **\u7cbe\u5ea6\u4e25\u683c\u6821\u9a8c** \u2014 \u5355\u4e00 raw-f32 \u7248\u672c\uff0c\u7eaf Rust \u8ba1\u7b97\u4e0e\u4e0a\u6e38\u539f\u7248\u8f93\u51fa\u9ad8\u5ea6\u4e00\u81f4\uff08\u6700\u5927\u7edd\u5bf9\u8bef\u5dee ~7e-5\uff09",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u8fd0\u884c\u65f6\u65e0\u9700 Python\uff0cCPU \u548c GPU \u90fd\u505a\u4e86\u6781\u81f4\u6027\u80fd\u4f18\u5316"
+            "✂️ **感知说话人切换的分割** — 最多可同时检测 3 位说话人，包括多人重叠说话的场景",
+            "🤝 **提升 `--diarize` 分离效果** — 搭配 ReDimNet2-B6 声纹模型一起安装，用精细的说话人切换边界替代粗略的语音片段划分",
+            "🔒 **只分离说话人，不识别身份** — 只给匿名编号，所有数据都留在你的电脑上",
+            "🎯 **精度严格校验** — 单一 raw-f32 版本，纯 Rust 计算与上游原版输出高度一致（最大绝对误差 ~7e-5）",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，运行时无需 Python，CPU 和 GPU 都做了极致性能优化"
           ]
         }
       },
@@ -2578,10 +2578,10 @@
           "Whisper Base is OpenAI's 74M-parameter multilingual Whisper checkpoint. It uses the standard\nWhisper encoder-decoder architecture for automatic speech recognition and speech translation,\ntrained with large-scale weak supervision on 680k hours of labelled speech. Base offers a\nmeaningful accuracy gain over tiny while staying small and fast enough for low-resource\ndevices. This OpenASR repo repackages the original `openai/whisper-base` weights as `.oasr`\npacks that run natively in the OpenASR runtime with no Python at inference time. For most users\nthe q8_0 build is the recommended default; q4_k is for tighter memory budgets and fp16 is for\nverification or maximum fidelity."
         ],
         "highlights": [
-          "\ud83c\udfa7 **Multilingual ASR** \u2014 transcribes many languages and can translate speech to English",
-          "\ud83e\udeb6 **74M parameters** \u2014 a small footprint with noticeably better accuracy than tiny",
-          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+          "🎧 **Multilingual ASR** — transcribes many languages and can translate speech to English",
+          "🪶 **74M parameters** — a small footprint with noticeably better accuracy than tiny",
+          "🌐 **Weak-supervision scale** — trained with Whisper's 680k-hour labelled speech corpus",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
         ]
       },
       "quants": [
@@ -2638,12 +2638,12 @@
       "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u5c0f\u5de7\u7684\u591a\u8bed\u8a00 Whisper\uff0c\u6bd4 tiny \u66f4\u51c6\u4e00\u6863",
+          "tagline": "小巧的多语言 Whisper，比 tiny 更准一档",
           "highlights": [
-            "\ud83c\udfa7 **\u591a\u8bed\u8a00\u8bc6\u522b** \u2014 \u80fd\u8f6c\u5199\u591a\u79cd\u8bed\u8a00\uff0c\u8fd8\u80fd\u628a\u8bed\u97f3\u76f4\u63a5\u7ffb\u8bd1\u6210\u82f1\u8bed",
-            "\ud83e\udeb6 **74M \u53c2\u6570** \u2014 \u4f53\u79ef\u5c0f\u5de7\uff0c\u51c6\u786e\u7387\u6bd4 tiny \u6709\u660e\u663e\u63d0\u5347",
-            "\ud83c\udf10 **\u6d77\u91cf\u8bed\u97f3\u8bad\u7ec3** \u2014 \u57fa\u4e8e Whisper 680k \u5c0f\u65f6\u8bed\u97f3\u6570\u636e\u8bad\u7ec3\uff0c\u5e95\u5b50\u624e\u5b9e",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u65e0\u9700\u5b89\u88c5 Python\uff0c\u4e13\u4e3a CPU \u548c Apple Silicon \u4f18\u5316"
+            "🎧 **多语言识别** — 能转写多种语言，还能把语音直接翻译成英语",
+            "🪶 **74M 参数** — 体积小巧，准确率比 tiny 有明显提升",
+            "🌐 **海量语音训练** — 基于 Whisper 680k 小时语音数据训练，底子扎实",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，无需安装 Python，专为 CPU 和 Apple Silicon 优化"
           ]
         }
       },
@@ -2676,10 +2676,10 @@
           "Whisper Base.en is OpenAI's 74M-parameter English-only Whisper checkpoint. It uses the standard\nWhisper encoder-decoder architecture for automatic speech recognition, trained with large-scale\nweak supervision on 680k hours of labelled speech. As an English-specialized model it tends to\noutperform the same-size multilingual Whisper on English audio, while staying small and fast.\nThis OpenASR repo repackages the original `openai/whisper-base.en` weights as `.oasr` packs that\nrun natively in the OpenASR runtime with no Python at inference time. For most users the q8_0\nbuild is the recommended default; q4_k is for tighter memory budgets and fp16 is for\nverification or maximum fidelity."
         ],
         "highlights": [
-          "\ud83c\uddec\ud83c\udde7 **English-only** \u2014 specialized for English, typically more accurate on English than the same-size multilingual model",
-          "\ud83e\udeb6 **74M parameters** \u2014 small and fast, a clear step up from tiny.en",
-          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+          "🇬🇧 **English-only** — specialized for English, typically more accurate on English than the same-size multilingual model",
+          "🪶 **74M parameters** — small and fast, a clear step up from tiny.en",
+          "🌐 **Weak-supervision scale** — trained with Whisper's 680k-hour labelled speech corpus",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
         ]
       },
       "quants": [
@@ -2737,12 +2737,12 @@
       "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u5c0f\u5de7\u7684\u7eaf\u82f1\u8bed Whisper\uff0c\u8f6c\u5199\u82f1\u8bed\u53c8\u5feb\u53c8\u597d",
+          "tagline": "小巧的纯英语 Whisper，转写英语又快又好",
           "highlights": [
-            "\ud83c\uddec\ud83c\udde7 **\u82f1\u8bed\u4e13\u7cbe** \u2014 \u53ea\u505a\u82f1\u8bed\u4e00\u4ef6\u4e8b\uff0c\u540c\u7b49\u4f53\u79ef\u4e0b\u6bd4\u591a\u8bed\u8a00\u7248\u8bc6\u522b\u82f1\u8bed\u901a\u5e38\u66f4\u51c6",
-            "\ud83e\udeb6 **74M \u53c2\u6570** \u2014 \u4f53\u79ef\u5c0f\u3001\u901f\u5ea6\u5feb\uff0c\u6bd4 tiny.en \u51c6\u786e\u7387\u660e\u663e\u66f4\u9ad8",
-            "\ud83c\udf10 **\u6d77\u91cf\u8bed\u97f3\u8bad\u7ec3** \u2014 \u57fa\u4e8e Whisper 680k \u5c0f\u65f6\u8bed\u97f3\u6570\u636e\u8bad\u7ec3\uff0c\u5e95\u5b50\u624e\u5b9e",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u65e0\u9700\u5b89\u88c5 Python\uff0c\u4e13\u4e3a CPU \u548c Apple Silicon \u4f18\u5316"
+            "🇬🇧 **英语专精** — 只做英语一件事，同等体积下比多语言版识别英语通常更准",
+            "🪶 **74M 参数** — 体积小、速度快，比 tiny.en 准确率明显更高",
+            "🌐 **海量语音训练** — 基于 Whisper 680k 小时语音数据训练，底子扎实",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，无需安装 Python，专为 CPU 和 Apple Silicon 优化"
           ]
         }
       },
@@ -2872,10 +2872,10 @@
           "Whisper Medium is OpenAI's 769M-parameter multilingual Whisper checkpoint. It uses the standard\nWhisper encoder-decoder architecture for automatic speech recognition and speech translation,\ntrained with large-scale weak supervision on 680k hours of labelled speech. Medium delivers\nmuch of the large model's accuracy at a smaller footprint, a strong choice when quality matters\nbut the largest checkpoint is too heavy. This OpenASR repo repackages the original\n`openai/whisper-medium` weights as `.oasr` packs that run natively in the OpenASR runtime with\nno Python at inference time. For most users the q8_0 build is the recommended default; q4_k is\nfor tighter memory budgets and fp16 is for verification or maximum fidelity."
         ],
         "highlights": [
-          "\ud83c\udfa7 **Multilingual ASR** \u2014 transcribes many languages and can translate speech to English",
-          "\ud83c\udfaf **769M parameters** \u2014 near-large accuracy with a more manageable footprint",
-          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+          "🎧 **Multilingual ASR** — transcribes many languages and can translate speech to English",
+          "🎯 **769M parameters** — near-large accuracy with a more manageable footprint",
+          "🌐 **Weak-supervision scale** — trained with Whisper's 680k-hour labelled speech corpus",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
         ]
       },
       "quants": [
@@ -2932,12 +2932,12 @@
       "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u9ad8\u7cbe\u5ea6\u591a\u8bed\u8a00 Whisper\uff0c769M \u53c2\u6570\u517c\u987e\u51c6\u786e\u548c\u4f53\u79ef",
+          "tagline": "高精度多语言 Whisper，769M 参数兼顾准确和体积",
           "highlights": [
-            "\ud83c\udfa7 **\u591a\u8bed\u8a00\u8bc6\u522b** \u2014 \u80fd\u8f6c\u5199\u591a\u79cd\u8bed\u8a00\uff0c\u8fd8\u80fd\u628a\u8bed\u97f3\u76f4\u63a5\u7ffb\u8bd1\u6210\u82f1\u8bed",
-            "\ud83c\udfaf **769M \u53c2\u6570** \u2014 \u51c6\u786e\u7387\u63a5\u8fd1 large \u7248\uff0c\u4f53\u79ef\u66f4\u597d\u638c\u63a7",
-            "\ud83c\udf10 **\u6d77\u91cf\u8bed\u97f3\u8bad\u7ec3** \u2014 \u57fa\u4e8e Whisper 680k \u5c0f\u65f6\u8bed\u97f3\u6570\u636e\u8bad\u7ec3\uff0c\u5e95\u5b50\u624e\u5b9e",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u65e0\u9700\u5b89\u88c5 Python\uff0c\u4e13\u4e3a CPU \u548c Apple Silicon \u4f18\u5316"
+            "🎧 **多语言识别** — 能转写多种语言，还能把语音直接翻译成英语",
+            "🎯 **769M 参数** — 准确率接近 large 版，体积更好掌控",
+            "🌐 **海量语音训练** — 基于 Whisper 680k 小时语音数据训练，底子扎实",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，无需安装 Python，专为 CPU 和 Apple Silicon 优化"
           ]
         }
       },
@@ -2970,10 +2970,10 @@
           "Whisper Medium.en is OpenAI's 769M-parameter English-only Whisper checkpoint. It uses the standard\nWhisper encoder-decoder architecture for automatic speech recognition, trained with large-scale\nweak supervision on 680k hours of labelled speech. As an English-specialized model it tends to\noutperform the same-size multilingual Whisper on English audio, delivering high English accuracy\nwithout the footprint of the largest checkpoints. This OpenASR repo repackages the original\n`openai/whisper-medium.en` weights as `.oasr` packs that run natively in the OpenASR runtime with\nno Python at inference time. For most users the q8_0 build is the recommended default; q4_k is\nfor tighter memory budgets and fp16 is for verification or maximum fidelity."
         ],
         "highlights": [
-          "\ud83c\uddec\ud83c\udde7 **English-only** \u2014 specialized for English, typically more accurate on English than the same-size multilingual model",
-          "\ud83c\udfaf **769M parameters** \u2014 near-large English accuracy with a more manageable footprint",
-          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+          "🇬🇧 **English-only** — specialized for English, typically more accurate on English than the same-size multilingual model",
+          "🎯 **769M parameters** — near-large English accuracy with a more manageable footprint",
+          "🌐 **Weak-supervision scale** — trained with Whisper's 680k-hour labelled speech corpus",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
         ]
       },
       "quants": [
@@ -3031,12 +3031,12 @@
       "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u7eaf\u82f1\u8bed\u9ad8\u7cbe\u5ea6 Whisper\uff0c769M \u53c2\u6570\u6070\u5230\u597d\u5904",
+          "tagline": "纯英语高精度 Whisper，769M 参数恰到好处",
           "highlights": [
-            "\ud83c\uddec\ud83c\udde7 **\u82f1\u8bed\u4e13\u7cbe** \u2014 \u53ea\u505a\u82f1\u8bed\uff0c\u540c\u4f53\u79ef\u4e0b\u6bd4\u591a\u8bed\u8a00\u7248\u8bc6\u522b\u82f1\u8bed\u901a\u5e38\u66f4\u51c6",
-            "\ud83c\udfaf **769M \u53c2\u6570** \u2014 \u82f1\u8bed\u51c6\u786e\u7387\u63a5\u8fd1 large \u7248\uff0c\u4f53\u79ef\u5c0f\u5f97\u591a\uff0c\u66f4\u7701\u8d44\u6e90",
-            "\ud83c\udf10 **\u6d77\u91cf\u8bed\u97f3\u8bad\u7ec3** \u2014 \u57fa\u4e8e Whisper 680k \u5c0f\u65f6\u8bed\u97f3\u6570\u636e\u8bad\u7ec3\uff0c\u5e95\u5b50\u624e\u5b9e",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u65e0\u9700\u5b89\u88c5 Python\uff0c\u4e13\u4e3a CPU \u548c Apple Silicon \u4f18\u5316"
+            "🇬🇧 **英语专精** — 只做英语，同体积下比多语言版识别英语通常更准",
+            "🎯 **769M 参数** — 英语准确率接近 large 版，体积小得多，更省资源",
+            "🌐 **海量语音训练** — 基于 Whisper 680k 小时语音数据训练，底子扎实",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，无需安装 Python，专为 CPU 和 Apple Silicon 优化"
           ]
         }
       },
@@ -3166,10 +3166,10 @@
           "Whisper Small is OpenAI's 244M-parameter multilingual Whisper checkpoint. It uses the\nstandard Whisper encoder-decoder architecture for automatic speech recognition and speech\ntranslation, trained with large-scale weak supervision on 680k hours of labelled speech.\nCompared with larger Whisper checkpoints, the small model is easier to run locally while\nretaining the broad zero-shot behavior that makes Whisper useful across noisy datasets and\ndomains. This OpenASR repo repackages the original `openai/whisper-small` weights as\n`.oasr` packs that run natively in the OpenASR runtime with no Python at inference time.\nFor most users the q8_0 build is the recommended default; q4_k is for tighter memory\nbudgets and fp16 is for verification or maximum fidelity."
         ],
         "highlights": [
-          "\ud83c\udfa7 **Multilingual ASR** \u2014 transcribes many languages and can translate speech to English",
-          "\ud83e\udde0 **244M parameters** \u2014 the small Whisper checkpoint balances accuracy, footprint, and speed",
-          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+          "🎧 **Multilingual ASR** — transcribes many languages and can translate speech to English",
+          "🧠 **244M parameters** — the small Whisper checkpoint balances accuracy, footprint, and speed",
+          "🌐 **Weak-supervision scale** — trained with Whisper's 680k-hour labelled speech corpus",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
         ]
       },
       "quants": [
@@ -3226,12 +3226,12 @@
       "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u5c0f\u5de7\u591a\u8bed\u8a00 Whisper\uff0c\u672c\u5730\u8f6c\u5199\u7684\u5747\u8861\u4e4b\u9009",
+          "tagline": "小巧多语言 Whisper，本地转写的均衡之选",
           "highlights": [
-            "\ud83c\udfa7 **\u591a\u8bed\u8a00\u8bc6\u522b** \u2014 \u80fd\u8f6c\u5199\u591a\u79cd\u8bed\u8a00\uff0c\u8fd8\u80fd\u628a\u8bed\u97f3\u76f4\u63a5\u7ffb\u8bd1\u6210\u82f1\u8bed",
-            "\ud83e\udde0 **244M \u53c2\u6570** \u2014 \u5728\u51c6\u786e\u7387\u3001\u4f53\u79ef\u548c\u901f\u5ea6\u4e4b\u95f4\u53d6\u5f97\u4e0d\u9519\u7684\u5e73\u8861",
-            "\ud83c\udf10 **\u6d77\u91cf\u8bed\u97f3\u8bad\u7ec3** \u2014 \u57fa\u4e8e Whisper 680k \u5c0f\u65f6\u8bed\u97f3\u6570\u636e\u8bad\u7ec3\uff0c\u5e95\u5b50\u624e\u5b9e",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u65e0\u9700\u5b89\u88c5 Python\uff0c\u4e13\u4e3a CPU \u548c Apple Silicon \u4f18\u5316"
+            "🎧 **多语言识别** — 能转写多种语言，还能把语音直接翻译成英语",
+            "🧠 **244M 参数** — 在准确率、体积和速度之间取得不错的平衡",
+            "🌐 **海量语音训练** — 基于 Whisper 680k 小时语音数据训练，底子扎实",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，无需安装 Python，专为 CPU 和 Apple Silicon 优化"
           ]
         }
       },
@@ -3264,10 +3264,10 @@
           "Whisper Small.en is OpenAI's 244M-parameter English-only Whisper checkpoint. It uses the standard\nWhisper encoder-decoder architecture for automatic speech recognition, trained with large-scale\nweak supervision on 680k hours of labelled speech. As an English-specialized model it tends to\noutperform the same-size multilingual Whisper on English audio, making it a strong default for\nEnglish-only workloads that want accuracy without a large footprint. This OpenASR repo\nrepackages the original `openai/whisper-small.en` weights as `.oasr` packs that run natively in\nthe OpenASR runtime with no Python at inference time. For most users the q8_0 build is the\nrecommended default; q4_k is for tighter memory budgets and fp16 is for verification or maximum\nfidelity."
         ],
         "highlights": [
-          "\ud83c\uddec\ud83c\udde7 **English-only** \u2014 specialized for English, typically more accurate on English than the same-size multilingual model",
-          "\ud83e\udde0 **244M parameters** \u2014 the small checkpoint balances English accuracy, footprint, and speed",
-          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+          "🇬🇧 **English-only** — specialized for English, typically more accurate on English than the same-size multilingual model",
+          "🧠 **244M parameters** — the small checkpoint balances English accuracy, footprint, and speed",
+          "🌐 **Weak-supervision scale** — trained with Whisper's 680k-hour labelled speech corpus",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
         ]
       },
       "quants": [
@@ -3325,12 +3325,12 @@
       "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "\u5747\u8861\u597d\u7528\u7684\u7eaf\u82f1\u8bed Whisper\uff0c\u9002\u5408\u672c\u5730\u7cbe\u51c6\u8f6c\u5199",
+          "tagline": "均衡好用的纯英语 Whisper，适合本地精准转写",
           "highlights": [
-            "\ud83c\uddec\ud83c\udde7 **\u82f1\u8bed\u4e13\u7cbe** \u2014 \u53ea\u505a\u82f1\u8bed\uff0c\u540c\u4f53\u79ef\u4e0b\u6bd4\u591a\u8bed\u8a00\u7248\u8bc6\u522b\u82f1\u8bed\u901a\u5e38\u66f4\u51c6",
-            "\ud83e\udde0 **244M \u53c2\u6570** \u2014 \u5728\u82f1\u8bed\u51c6\u786e\u7387\u3001\u4f53\u79ef\u548c\u901f\u5ea6\u4e4b\u95f4\u627e\u5230\u4e86\u597d\u7684\u5e73\u8861\u70b9",
-            "\ud83c\udf10 **\u6d77\u91cf\u8bed\u97f3\u8bad\u7ec3** \u2014 \u57fa\u4e8e Whisper 680k \u5c0f\u65f6\u8bed\u97f3\u6570\u636e\u8bad\u7ec3\uff0c\u5e95\u5b50\u624e\u5b9e",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u65e0\u9700\u5b89\u88c5 Python\uff0c\u4e13\u4e3a CPU \u548c Apple Silicon \u4f18\u5316"
+            "🇬🇧 **英语专精** — 只做英语，同体积下比多语言版识别英语通常更准",
+            "🧠 **244M 参数** — 在英语准确率、体积和速度之间找到了好的平衡点",
+            "🌐 **海量语音训练** — 基于 Whisper 680k 小时语音数据训练，底子扎实",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，无需安装 Python，专为 CPU 和 Apple Silicon 优化"
           ]
         }
       },
@@ -3460,10 +3460,10 @@
           "Whisper Tiny is OpenAI's 39M-parameter multilingual Whisper checkpoint, the smallest member of\nthe Whisper family. It uses the standard Whisper encoder-decoder architecture for automatic\nspeech recognition and speech translation, trained with large-scale weak supervision on 680k\nhours of labelled speech. The tiny model trades some accuracy for the lowest footprint and\nfastest inference, which suits low-resource devices and latency-sensitive use. This OpenASR\nrepo repackages the original `openai/whisper-tiny` weights as `.oasr` packs that run natively\nin the OpenASR runtime with no Python at inference time. For most users the q8_0 build is the\nrecommended default; q4_k is for the tightest memory budgets and fp16 is for verification or\nmaximum fidelity."
         ],
         "highlights": [
-          "\ud83c\udfa7 **Multilingual ASR** \u2014 transcribes many languages and can translate speech to English",
-          "\u26a1 **39M parameters** \u2014 the smallest Whisper checkpoint, the fastest and lightest to run",
-          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+          "🎧 **Multilingual ASR** — transcribes many languages and can translate speech to English",
+          "⚡ **39M parameters** — the smallest Whisper checkpoint, the fastest and lightest to run",
+          "🌐 **Weak-supervision scale** — trained with Whisper's 680k-hour labelled speech corpus",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
         ]
       },
       "quants": [
@@ -3520,12 +3520,12 @@
       "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "Whisper \u7cfb\u5217\u6700\u5c0f\u7684\u591a\u8bed\u8a00\u7248\uff0c\u672c\u5730\u8f6c\u5199\u6700\u8f7b\u5feb",
+          "tagline": "Whisper 系列最小的多语言版，本地转写最轻快",
           "highlights": [
-            "\ud83c\udfa7 **\u591a\u8bed\u8a00\u8bc6\u522b** \u2014 \u80fd\u8f6c\u5199\u591a\u79cd\u8bed\u8a00\uff0c\u8fd8\u80fd\u628a\u8bed\u97f3\u76f4\u63a5\u7ffb\u8bd1\u6210\u82f1\u8bed",
-            "\u26a1 **39M \u53c2\u6570** \u2014 Whisper \u5168\u7cfb\u5217\u6700\u5c0f\u7684\u7248\u672c\uff0c\u8dd1\u8d77\u6765\u6700\u5feb\u6700\u7701\u8d44\u6e90",
-            "\ud83c\udf10 **\u6d77\u91cf\u8bed\u97f3\u8bad\u7ec3** \u2014 \u57fa\u4e8e Whisper 680k \u5c0f\u65f6\u8bed\u97f3\u6570\u636e\u8bad\u7ec3\uff0c\u5e95\u5b50\u624e\u5b9e",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u65e0\u9700\u5b89\u88c5 Python\uff0c\u4e13\u4e3a CPU \u548c Apple Silicon \u4f18\u5316"
+            "🎧 **多语言识别** — 能转写多种语言，还能把语音直接翻译成英语",
+            "⚡ **39M 参数** — Whisper 全系列最小的版本，跑起来最快最省资源",
+            "🌐 **海量语音训练** — 基于 Whisper 680k 小时语音数据训练，底子扎实",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，无需安装 Python，专为 CPU 和 Apple Silicon 优化"
           ]
         }
       },
@@ -3558,10 +3558,10 @@
           "Whisper Tiny.en is OpenAI's 39M-parameter English-only Whisper checkpoint. It uses the standard\nWhisper encoder-decoder architecture for automatic speech recognition, trained with large-scale\nweak supervision on 680k hours of labelled speech. As an English-specialized model it tends to\noutperform the same-size multilingual Whisper on English audio, at the lowest footprint and\nfastest inference in the family. This OpenASR repo repackages the original `openai/whisper-tiny.en`\nweights as `.oasr` packs that run natively in the OpenASR runtime with no Python at inference\ntime. For most users the q8_0 build is the recommended default; q4_k is for the tightest memory\nbudgets and fp16 is for verification or maximum fidelity."
         ],
         "highlights": [
-          "\ud83c\uddec\ud83c\udde7 **English-only** \u2014 specialized for English, typically more accurate on English than the same-size multilingual model",
-          "\u26a1 **39M parameters** \u2014 the smallest, fastest, and lightest Whisper checkpoint",
-          "\ud83c\udf10 **Weak-supervision scale** \u2014 trained with Whisper's 680k-hour labelled speech corpus",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
+          "🇬🇧 **English-only** — specialized for English, typically more accurate on English than the same-size multilingual model",
+          "⚡ **39M parameters** — the smallest, fastest, and lightest Whisper checkpoint",
+          "🌐 **Weak-supervision scale** — trained with Whisper's 680k-hour labelled speech corpus",
+          "🦀 **Native in OpenASR** — `.oasr` packs run with no Python at inference, engineered for CPU and Apple Silicon"
         ]
       },
       "quants": [
@@ -3619,193 +3619,122 @@
       "emits_punctuation": true,
       "prose_locales": {
         "zh-CN": {
-          "tagline": "Whisper \u7cfb\u5217\u6700\u5c0f\u7684\u7eaf\u82f1\u8bed\u7248\uff0c\u82f1\u8bed\u8f6c\u5199\u98de\u5feb",
+          "tagline": "Whisper 系列最小的纯英语版，英语转写飞快",
           "highlights": [
-            "\ud83c\uddec\ud83c\udde7 **\u82f1\u8bed\u4e13\u7cbe** \u2014 \u53ea\u505a\u82f1\u8bed\uff0c\u540c\u4f53\u79ef\u4e0b\u6bd4\u591a\u8bed\u8a00\u7248\u8bc6\u522b\u82f1\u8bed\u901a\u5e38\u66f4\u51c6",
-            "\u26a1 **39M \u53c2\u6570** \u2014 Whisper \u5168\u7cfb\u5217\u6700\u5c0f\u3001\u6700\u5feb\u3001\u6700\u7701\u8d44\u6e90\u7684\u7248\u672c",
-            "\ud83c\udf10 **\u6d77\u91cf\u8bed\u97f3\u8bad\u7ec3** \u2014 \u57fa\u4e8e Whisper 680k \u5c0f\u65f6\u8bed\u97f3\u6570\u636e\u8bad\u7ec3\uff0c\u5e95\u5b50\u624e\u5b9e",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u5f00\u7bb1\u5373\u7528\uff0c\u65e0\u9700\u5b89\u88c5 Python\uff0c\u4e13\u4e3a CPU \u548c Apple Silicon \u4f18\u5316"
+            "🇬🇧 **英语专精** — 只做英语，同体积下比多语言版识别英语通常更准",
+            "⚡ **39M 参数** — Whisper 全系列最小、最快、最省资源的版本",
+            "🌐 **海量语音训练** — 基于 Whisper 680k 小时语音数据训练，底子扎实",
+            "🦀 **OpenASR 原生运行** — `.oasr` 格式开箱即用，无需安装 Python，专为 CPU 和 Apple Silicon 优化"
           ]
         }
       },
       "upstream_release_date": "2022-09-21"
-    },
-    {
-      "id": "wespeaker-voxceleb-resnet34-lm",
-      "kind": "capability-pack",
-      "capability": {
-        "feature": "speaker-diarization",
-        "role": "speaker-embedder"
-      },
-      "display_name": "WeSpeaker ResNet34 Speaker Embedder (VoxCeleb)",
-      "family": "wespeaker",
-      "aliases": [],
-      "pull_alias": null,
-      "size": "embedder",
-      "languages": [
-        "en",
-        "zh"
-      ],
-      "vendor": "pyannote",
-      "license": "CC-BY-4.0",
-      "license_url": "https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM",
-      "license_class": "permissive",
-      "hf_repo": "OpenASR/wespeaker-voxceleb-resnet34-lm",
-      "hf_revision": "0e81dc54b7d480eeb6d0e1fcdc4a94d863be5141",
-      "public": true,
-      "min_cli_version": "0.1.0",
-      "recommended_quant": "f32",
-      "pull_recommended": "wespeaker-voxceleb-resnet34-lm:f32",
-      "prose": {
-        "tagline": "WeSpeaker ResNet34 speaker embedder for OpenASR diarization \u2014 stronger speaker separation, fully on-device",
-        "overview": [
-          "WeSpeaker ResNet34 is the speaker-embedding model used by pyannote for VoxCeleb speaker\nrepresentations. OpenASR packages it as a local `.oasr` capability pack and uses it as the default\nspeaker-embedding stage for diarization: speech regions are embedded, clustered, and attributed\nback onto transcripts from any ASR model. The realtime speaker-change detector now uses this same\nWeSpeaker embedder, so diarization has one speaker-embedding space across batch and streaming paths."
-        ],
-        "highlights": [
-          "\ud83d\udde3\ufe0f **Default OpenASR speaker embedder** \u2014 install this pack and `--diarize` labels anonymous speakers for any ASR family",
-          "\ud83e\uddec **256-dim ResNet34 embeddings** \u2014 pyannote's WeSpeaker VoxCeleb model with temporal statistics pooling",
-          "\ud83d\udd12 **Diarization, not identification** \u2014 anonymous session-relative labels; embeddings stay local and are discarded after the request unless you explicitly enroll a local profile",
-          "\ud83c\udfaf **Parity-gated packaging** \u2014 single raw-f32 build; the Rust forward pass matches the upstream pyannote reference at cosine \u2265 0.9999",
-          "\ud83e\udd80 **Native in OpenASR** \u2014 `.oasr` packs run with no Python at inference and share the same pull/install path as ASR models"
-        ]
-      },
-      "quants": [
-        {
-          "quant": "f32",
-          "suffix": "f32",
-          "pull": "wespeaker-voxceleb-resnet34-lm:f32",
-          "filename": "wespeaker-voxceleb-resnet34-lm-f32.oasr",
-          "url": "https://huggingface.co/OpenASR/wespeaker-voxceleb-resnet34-lm/resolve/0e81dc54b7d480eeb6d0e1fcdc4a94d863be5141/wespeaker-voxceleb-resnet34-lm-f32.oasr",
-          "sha256": "7f09e220267f7a97cece92ed14b1aaa8b7d9b41ea8968c8aff1282d3d7e70174",
-          "size_bytes": 26583936,
-          "recommended": true,
-          "perf": {
-            "rtf_cpu": 0.07293,
-            "rtf_metal": null,
-            "peak_rss_bytes": null,
-            "jfk_wer_vs_fp16": null
-          }
-        }
-      ],
-      "prose_locales": {
-        "zh-CN": {
-          "tagline": "WeSpeaker ResNet34 \u8bf4\u8bdd\u4eba\u58f0\u7eb9\u6a21\u578b\uff0c\u670d\u52a1\u4e8e OpenASR \u8bf4\u8bdd\u4eba\u5206\u79bb \u2014 \u66f4\u7cbe\u51c6\u5730\u533a\u5206\u4e0d\u540c\u8bf4\u8bdd\u4eba\uff0c\u5b8c\u5168\u672c\u5730\u8fd0\u884c",
-          "highlights": [
-            "\ud83d\udde3\ufe0f **OpenASR \u9ed8\u8ba4\u58f0\u7eb9\u6a21\u578b** \u2014 \u5b89\u88c5\u540e\u4f7f\u7528 `--diarize` \u5373\u53ef\u4e3a\u4efb\u610f\u8bed\u97f3\u6a21\u578b\u7684\u8f6c\u5199\u7ed3\u679c\u6807\u6ce8\u8bf4\u8bdd\u4eba",
-            "\ud83e\uddec **256 \u7ef4 ResNet34 \u58f0\u7eb9\u5411\u91cf** \u2014 \u6765\u81ea pyannote \u7684 WeSpeaker VoxCeleb \u6a21\u578b\uff0c\u7528\u7d27\u51d1\u7684\u58f0\u7eb9\u7279\u5f81\u7cbe\u51c6\u533a\u5206\u4e0d\u540c\u8bf4\u8bdd\u4eba",
-            "\ud83d\udd12 **\u53ea\u5206\u79bb\u8bf4\u8bdd\u4eba\uff0c\u4e0d\u8bc6\u522b\u8eab\u4efd** \u2014 \u53ea\u7ed9\u533f\u540d\u7f16\u53f7\uff0c\u58f0\u7eb9\u6570\u636e\u7559\u5728\u672c\u5730\u4e14\u7528\u5b8c\u5373\u5220\uff0c\u9664\u975e\u4f60\u4e3b\u52a8\u6ce8\u518c\u672c\u5730\u6863\u6848",
-            "\ud83c\udfaf **\u7cbe\u5ea6\u4e25\u683c\u6821\u9a8c** \u2014 \u5355\u4e00 raw-f32 \u7248\u672c\uff0c\u7eaf Rust \u8ba1\u7b97\u4e0e pyannote \u539f\u7248\u53c2\u8003\u5b9e\u73b0\u7684\u4f59\u5f26\u76f8\u4f3c\u5ea6 \u2265 0.9999",
-            "\ud83e\udd80 **OpenASR \u539f\u751f\u8fd0\u884c** \u2014 `.oasr` \u683c\u5f0f\u65e0\u9700 Python\uff0c\u4e0e\u8bed\u97f3\u8bc6\u522b\u6a21\u578b\u5171\u7528\u540c\u4e00\u5957\u4e0b\u8f7d\u548c\u5b89\u88c5\u6d41\u7a0b"
-          ]
-        }
-      },
-      "upstream_release_date": "2022-07-24"
     }
   ],
   "language_labels": {
     "nan": {
       "en": "Min Nan Chinese",
-      "zh-CN": "\u95fd\u5357\u8bed"
+      "zh-CN": "闽南语"
     },
     "wuu": {
       "en": "Wu Chinese",
-      "zh-CN": "\u5434\u8bed"
+      "zh-CN": "吴语"
     },
     "yue": {
       "en": "Cantonese",
-      "zh-CN": "\u7ca4\u8bed"
+      "zh-CN": "粤语"
     },
     "zh": {
       "en": "Chinese",
-      "zh-CN": "\u4e2d\u6587"
+      "zh-CN": "中文"
     },
     "zh-anhui": {
       "en": "Chinese (Anhui)",
-      "zh-CN": "\u4e2d\u6587\uff08\u5b89\u5fbd\u8bdd\uff09"
+      "zh-CN": "中文（安徽话）"
     },
     "zh-dongbei": {
       "en": "Chinese (Northeastern)",
-      "zh-CN": "\u4e2d\u6587\uff08\u4e1c\u5317\u8bdd\uff09"
+      "zh-CN": "中文（东北话）"
     },
     "zh-fujian": {
       "en": "Chinese (Fujian)",
-      "zh-CN": "\u4e2d\u6587\uff08\u798f\u5efa\u8bdd\uff09"
+      "zh-CN": "中文（福建话）"
     },
     "zh-gansu": {
       "en": "Chinese (Gansu)",
-      "zh-CN": "\u4e2d\u6587\uff08\u7518\u8083\u8bdd\uff09"
+      "zh-CN": "中文（甘肃话）"
     },
     "zh-guangdong": {
       "en": "Chinese (Guangdong)",
-      "zh-CN": "\u4e2d\u6587\uff08\u5e7f\u4e1c\u8bdd\uff09"
+      "zh-CN": "中文（广东话）"
     },
     "zh-guizhou": {
       "en": "Chinese (Guizhou)",
-      "zh-CN": "\u4e2d\u6587\uff08\u8d35\u5dde\u8bdd\uff09"
+      "zh-CN": "中文（贵州话）"
     },
     "zh-hebei": {
       "en": "Chinese (Hebei)",
-      "zh-CN": "\u4e2d\u6587\uff08\u6cb3\u5317\u8bdd\uff09"
+      "zh-CN": "中文（河北话）"
     },
     "zh-henan": {
       "en": "Chinese (Henan)",
-      "zh-CN": "\u4e2d\u6587\uff08\u6cb3\u5357\u8bdd\uff09"
+      "zh-CN": "中文（河南话）"
     },
     "zh-hubei": {
       "en": "Chinese (Hubei)",
-      "zh-CN": "\u4e2d\u6587\uff08\u6e56\u5317\u8bdd\uff09"
+      "zh-CN": "中文（湖北话）"
     },
     "zh-hunan": {
       "en": "Chinese (Hunan)",
-      "zh-CN": "\u4e2d\u6587\uff08\u6e56\u5357\u8bdd\uff09"
+      "zh-CN": "中文（湖南话）"
     },
     "zh-jiangsu": {
       "en": "Chinese (Jiangsu)",
-      "zh-CN": "\u4e2d\u6587\uff08\u6c5f\u82cf\u8bdd\uff09"
+      "zh-CN": "中文（江苏话）"
     },
     "zh-jiangxi": {
       "en": "Chinese (Jiangxi)",
-      "zh-CN": "\u4e2d\u6587\uff08\u6c5f\u897f\u8bdd\uff09"
+      "zh-CN": "中文（江西话）"
     },
     "zh-ningxia": {
       "en": "Chinese (Ningxia)",
-      "zh-CN": "\u4e2d\u6587\uff08\u5b81\u590f\u8bdd\uff09"
+      "zh-CN": "中文（宁夏话）"
     },
     "zh-shaanxi": {
       "en": "Chinese (Shaanxi)",
-      "zh-CN": "\u4e2d\u6587\uff08\u9655\u897f\u8bdd\uff09"
+      "zh-CN": "中文（陕西话）"
     },
     "zh-shandong": {
       "en": "Chinese (Shandong)",
-      "zh-CN": "\u4e2d\u6587\uff08\u5c71\u4e1c\u8bdd\uff09"
+      "zh-CN": "中文（山东话）"
     },
     "zh-shanghai": {
       "en": "Chinese (Shanghainese)",
-      "zh-CN": "\u4e2d\u6587\uff08\u4e0a\u6d77\u8bdd\uff09"
+      "zh-CN": "中文（上海话）"
     },
     "zh-shanxi": {
       "en": "Chinese (Shanxi)",
-      "zh-CN": "\u4e2d\u6587\uff08\u5c71\u897f\u8bdd\uff09"
+      "zh-CN": "中文（山西话）"
     },
     "zh-sichuan": {
       "en": "Chinese (Sichuanese)",
-      "zh-CN": "\u4e2d\u6587\uff08\u56db\u5ddd\u8bdd\uff09"
+      "zh-CN": "中文（四川话）"
     },
     "zh-tianjin": {
       "en": "Chinese (Tianjin)",
-      "zh-CN": "\u4e2d\u6587\uff08\u5929\u6d25\u8bdd\uff09"
+      "zh-CN": "中文（天津话）"
     },
     "zh-tw": {
       "en": "Chinese (Taiwan)",
-      "zh-CN": "\u4e2d\u6587\uff08\u53f0\u6e7e\uff09"
+      "zh-CN": "中文（台湾）"
     },
     "zh-yunnan": {
       "en": "Chinese (Yunnan)",
-      "zh-CN": "\u4e2d\u6587\uff08\u4e91\u5357\u8bdd\uff09"
+      "zh-CN": "中文（云南话）"
     },
     "zh-zhejiang": {
       "en": "Chinese (Zhejiang)",
-      "zh-CN": "\u4e2d\u6587\uff08\u6d59\u6c5f\u8bdd\uff09"
+      "zh-CN": "中文（浙江话）"
     }
   }
 }

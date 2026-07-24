@@ -976,36 +976,6 @@ pub(crate) enum ImportCommand {
         #[arg(long, value_enum, default_value_t = ImportMoonshineQuantization::Fp16)]
         quantization: ImportMoonshineQuantization,
     },
-    /// Import a local WeSpeaker ResNet34 speaker-embedder safetensors into one diarization runtime pack (`.oasr`).
-    #[command(name = "wespeaker")]
-    Wespeaker {
-        /// Source WeSpeaker ResNet34 safetensors weight file.
-        source_safetensors: PathBuf,
-        /// Output path for one runtime pack file (`.oasr`).
-        output_root: PathBuf,
-        /// Model id written to pack metadata (openasr.model.id).
-        #[arg(long)]
-        package_id: String,
-        /// Source name written to openasr.source.name.
-        #[arg(long, default_value = "pyannote/wespeaker-voxceleb-resnet34-LM")]
-        source_name: String,
-        /// Source revision written to openasr.source.revision.
-        #[arg(long, default_value = "837717ddb9ff5507820346191109dc79c958d614")]
-        source_revision: String,
-        /// License name written to openasr.license.name. The pyannote/WeSpeaker
-        /// VoxCeleb weights are CC-BY-4.0.
-        #[arg(long, default_value = "CC-BY-4.0")]
-        license_name: String,
-        /// License/source URL written to openasr.license.source.
-        #[arg(
-            long,
-            default_value = "https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM"
-        )]
-        license_source: String,
-        /// Runtime tensor layout for learned conv/linear kernels. WeSpeaker is f32-only.
-        #[arg(long, value_enum, default_value_t = ImportWeSpeakerQuantization::F32)]
-        quantization: ImportWeSpeakerQuantization,
-    },
     /// Import a local pyannote segmentation-3.0 safetensors into one diarization runtime pack (`.oasr`).
     #[command(name = "pyannote")]
     Pyannote {
@@ -1135,9 +1105,4 @@ pub(crate) enum ImportMoonshineQuantization {
     Fp16,
     Q8_0,
     Q4_K,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum ImportWeSpeakerQuantization {
-    F32,
 }

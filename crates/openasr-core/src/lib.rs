@@ -267,10 +267,6 @@ pub use models::{
         Wav2Vec2CtcImportRequest, Wav2Vec2CtcImportResult, Wav2Vec2CtcQuantizationMode,
         convert_local_wav2vec2_ctc_source_to_runtime_pack,
     },
-    wespeaker::package_import::{
-        WeSpeakerImportRequest, WeSpeakerImportResult, WeSpeakerRuntimeQuantizationMode,
-        convert_local_wespeaker_source_to_runtime_pack,
-    },
     whisper::{
         WHISPER_MODEL_FAMILY, WhisperLocalSourceError, WhisperLocalSourceImportRequest,
         WhisperLocalSourceImportRuntimeResult, WhisperRuntimeQuantizationMode, WhisperTokenizer,

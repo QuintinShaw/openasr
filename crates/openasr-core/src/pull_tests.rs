@@ -428,7 +428,7 @@ fn capability_pack_catalog_for_resolved(resolved: &ResolvedCatalogPull) -> Model
         feature: CATALOG_FEATURE_SPEAKER_DIARIZATION.to_string(),
         role: CatalogCapabilityRole::SpeakerEmbedder,
     });
-    model.family = "wespeaker".to_string();
+    model.family = "redimnet2".to_string();
     model.size = "embedder".to_string();
     catalog
 }
@@ -754,26 +754,26 @@ fn install_catalog_model_pack_from_path_rejects_whisper_pack_missing_decoder_hea
 fn capability_pack_stays_pullable_and_importable_by_digest() {
     let bytes = tiny_pack_bytes();
     let mut resolved = resolved_for(&bytes);
-    resolved.requested = "wespeaker-voxceleb-resnet34-lm:f32".to_string();
-    resolved.model_id = "wespeaker-voxceleb-resnet34-lm".to_string();
-    resolved.display_name = "WeSpeaker ResNet34 Speaker Embedder (VoxCeleb)".to_string();
+    resolved.requested = "redimnet2-b6-cn:fp16".to_string();
+    resolved.model_id = "redimnet2-b6-cn".to_string();
+    resolved.display_name = "ReDimNet2-B6 Speaker Embedder (CN-enhanced)".to_string();
     resolved.quant = "f32".to_string();
     resolved.suffix = "f32".to_string();
-    resolved.pull = "wespeaker-voxceleb-resnet34-lm:f32".to_string();
-    resolved.filename = "wespeaker-voxceleb-resnet34-lm-f32.oasr".to_string();
-    resolved.url = "https://huggingface.co/OpenASR/wespeaker-voxceleb-resnet34-lm/resolve/0123456789abcdef0123456789abcdef01234567/wespeaker-voxceleb-resnet34-lm-f32.oasr".to_string();
+    resolved.pull = "redimnet2-b6-cn:fp16".to_string();
+    resolved.filename = "redimnet2-b6-cn-fp16.oasr".to_string();
+    resolved.url = "https://huggingface.co/OpenASR/redimnet2-b6-cn/resolve/0123456789abcdef0123456789abcdef01234567/redimnet2-b6-cn-fp16.oasr".to_string();
     let catalog = capability_pack_catalog_for_resolved(&resolved);
 
     let from_catalog = resolve_catalog_pull(
         &catalog,
         &CatalogPullRequest {
-            reference: "wespeaker-voxceleb-resnet34-lm:f32".to_string(),
+            reference: "redimnet2-b6-cn:fp16".to_string(),
             quant: None,
             size: None,
         },
     )
     .unwrap();
-    assert_eq!(from_catalog.pull, "wespeaker-voxceleb-resnet34-lm:f32");
+    assert_eq!(from_catalog.pull, "redimnet2-b6-cn:fp16");
 
     let pull_home = tempfile::tempdir().unwrap();
     let mut client = FakeClient::with_responses(vec![ResponseSpec {
@@ -788,17 +788,15 @@ fn capability_pack_stays_pullable_and_importable_by_digest() {
         |_| {},
     )
     .unwrap();
-    assert_eq!(pulled.pull, "wespeaker-voxceleb-resnet34-lm:f32");
+    assert_eq!(pulled.pull, "redimnet2-b6-cn:fp16");
 
     let import_home = tempfile::tempdir().unwrap();
-    let source_path = import_home
-        .path()
-        .join("wespeaker-voxceleb-resnet34-lm-f32.oasr");
+    let source_path = import_home.path().join("redimnet2-b6-cn-fp16.oasr");
     fs::write(&source_path, bytes).unwrap();
     let imported =
         install_catalog_model_pack_from_path(&catalog, &source_path, import_home.path(), |_| {})
             .unwrap();
-    assert_eq!(imported.pull, "wespeaker-voxceleb-resnet34-lm:f32");
+    assert_eq!(imported.pull, "redimnet2-b6-cn:fp16");
     assert_eq!(imported.source.as_deref(), Some("local"));
 }
 

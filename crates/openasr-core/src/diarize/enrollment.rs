@@ -22,13 +22,13 @@ use super::embed::{EmbedError, SpeakerEmbedder, SpeakerEmbedderIdentity, shared_
 /// CLI. The REST API accepts any non-empty display name.
 pub const DEFAULT_ENROLLED_NAME: &str = "SPEAKER_ME";
 /// Default cosine-similarity floor for matching a diarized speaker to a stored
-/// voice-match profile, in the legacy WeSpeaker cosine space. Kept as the
-/// WeSpeaker-specific constant it always was; the actual default applied at
-/// enrollment time is per-embedder (see
+/// voice-match profile in the ReDimNet2-B6 cosine space. Mirrors
+/// `REDIMNET_CALIBRATION.enrollment_default_match_similarity`. The actual
+/// default applied at enrollment time is still read from the active embedder's
+/// calibration profile (see
 /// `SpeakerCalibrationProfile::enrollment_default_match_similarity` and
-/// `create_profile_from_samples_with_embedder_and_seconds`), since ReDimNet2
-/// and WeSpeaker cosine spaces are not comparable.
-pub const DEFAULT_MATCH_SIMILARITY: f32 = 0.5;
+/// `create_profile_from_samples_with_embedder_and_seconds`).
+pub const DEFAULT_MATCH_SIMILARITY: f32 = 0.60;
 /// Version of the on-disk multi-profile voiceprint store.
 pub const VOICEPRINT_STORE_VERSION: u32 = 1;
 /// Store override. This is intentionally not the old single-profile env var.
@@ -129,7 +129,7 @@ pub enum SpeakerEnrollmentError {
     )]
     TooShortSpeech { required: f32, actual: f32 },
     #[error(
-        "creating a voice match profile requires the WeSpeaker speaker-embedder pack (wespeaker-voxceleb-resnet34-lm); install the pack first"
+        "creating a voice match profile requires the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install the pack first"
     )]
     EmbedderPackMissing,
     #[error("could not embed enrollment audio: {0}")]
@@ -403,7 +403,7 @@ impl SpeakerProfileMatcher {
     /// similarity by at least `margin`. `margin` should come from the active
     /// embedder's `SpeakerCalibrationProfile::enrollment_match_margin` so the
     /// gate is calibrated per cosine space (see that field's doc comment for
-    /// why WeSpeaker and ReDimNet2 use different values).
+    /// why calibration is embedder-specific).
     ///
     /// Ranking is per-identity, not per-profile (see
     /// `best_match_with_policy`): a person's own extra enrollment samples
@@ -841,8 +841,7 @@ fn validate_profile_id(id: &str) -> Result<(), VoiceprintStoreError> {
 /// The cosine-similarity floor applied to a newly enrolled `SpeakerProfile`
 /// when the caller does not supply an explicit `--match-similarity` override.
 /// Sourced from the active embedder's own calibration profile so ReDimNet2
-/// and WeSpeaker enrollments never share a threshold across their
-/// (non-comparable) cosine spaces.
+/// calibration remains embedder-specific.
 fn default_match_similarity_for(embedder: &dyn SpeakerEmbedder) -> f32 {
     embedder
         .calibration_profile()
@@ -958,18 +957,6 @@ mod tests {
         }
     }
 
-    /// Trait-default calibration (WeSpeaker), standing in for the real
-    /// `WeSpeakerEmbedder` without needing loaded weights.
-    struct StubWeSpeakerEmbedder;
-    impl SpeakerEmbedder for StubWeSpeakerEmbedder {
-        fn embed(&self, _samples: &[f32], _sr: u32) -> Result<SpeakerEmbedding, EmbedError> {
-            unimplemented!("not needed for calibration-default tests")
-        }
-        fn embedding_dim(&self) -> usize {
-            256
-        }
-    }
-
     /// Overrides `calibration_profile` the same way `RedimNet2Embedder` does,
     /// standing in for it without needing loaded weights.
     struct StubRedimNetEmbedder;
@@ -986,15 +973,11 @@ mod tests {
     }
 
     #[test]
-    fn default_match_similarity_is_embedder_specific() {
-        assert_eq!(
-            default_match_similarity_for(&StubWeSpeakerEmbedder),
-            DEFAULT_MATCH_SIMILARITY
-        );
+    fn default_match_similarity_follows_redimnet_calibration() {
         assert_eq!(default_match_similarity_for(&StubRedimNetEmbedder), 0.60);
-        assert_ne!(
-            default_match_similarity_for(&StubWeSpeakerEmbedder),
-            default_match_similarity_for(&StubRedimNetEmbedder)
+        assert_eq!(
+            default_match_similarity_for(&StubRedimNetEmbedder),
+            DEFAULT_MATCH_SIMILARITY
         );
     }
 
@@ -1464,17 +1447,13 @@ mod tests {
         );
     }
 
-    /// Regression pin: WeSpeaker's `enrollment_match_margin` is 0.0 (the
-    /// batch matcher's margin gate was hardcoded to 0.0 -- effectively off --
-    /// before this field existed), so wiring the margin gate through
-    /// `best_match_with_margin` must not change WeSpeaker's batch match
-    /// behavior at all versus the pre-existing `best_match`, including for
-    /// two different people near-tied against each other.
+    /// Regression pin: ReDimNet2-B6's product margin (0.15) rejects a near-tied
+    /// top1 when a second enrolled identity is within the margin band.
     #[test]
-    fn wespeaker_batch_match_behavior_is_unchanged_by_margin_gate() {
+    fn redimnet_margin_gate_rejects_near_tied_top1() {
         assert_eq!(
-            crate::diarize::calibration::WESPEAKER_CALIBRATION.enrollment_match_margin,
-            0.0
+            crate::diarize::calibration::REDIMNET_CALIBRATION.enrollment_match_margin,
+            0.15
         );
 
         let matcher = SpeakerProfileMatcher::from_profiles(vec![
@@ -1483,15 +1462,13 @@ mod tests {
         ]);
         let embedding = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
 
-        let before = matcher.best_match(&embedding);
         let after = matcher.best_match_with_margin(
             &embedding,
-            crate::diarize::calibration::WESPEAKER_CALIBRATION.enrollment_match_margin,
+            crate::diarize::calibration::REDIMNET_CALIBRATION.enrollment_match_margin,
         );
-        assert_eq!(before, after);
         assert!(
-            after.is_some(),
-            "wespeaker's 0.0 margin must not reject a near-tied top1"
+            after.is_none(),
+            "redimnet's 0.15 margin must reject a near-tied top1 against a second identity"
         );
     }
 
@@ -1507,27 +1484,27 @@ mod tests {
         );
     }
 
-    /// Pins the exact behavior a ReDimNet2-B6 cutover relies on: a voiceprint
-    /// registered under the legacy 256-dim WeSpeaker embedder must never be
-    /// silently reused once the active embedder resolves to the 192-dim
-    /// ReDimNet2 pack -- it needs explicit re-registration, not a dimension
-    /// mismatch crash or (worse) a wrong-space cosine comparison.
+    /// Pins fail-closed cross-space behavior: a voiceprint registered under a
+    /// foreign 256-dim embedding space must never be silently reused once the
+    /// active embedder resolves to the 192-dim ReDimNet2 pack -- it needs
+    /// explicit re-registration, not a dimension mismatch crash or (worse) a
+    /// wrong-space cosine comparison.
     #[test]
-    fn old_wespeaker_profile_is_incompatible_with_new_redimnet_embedder() {
-        let legacy_wespeaker_profile = profile(
+    fn foreign_dim_profile_is_incompatible_with_redimnet_embedder() {
+        let foreign_profile = profile(
             "vp_aaaaaaaaaaaaaaaa",
             256,
-            "sha256:wespeaker-resnet34-pack",
+            "sha256:foreign-embedder-pack",
             vec![0.1; 256],
         );
         let active_redimnet_identity = identity(192, "sha256:redimnet2-b6-pack");
 
         assert!(
-            !legacy_wespeaker_profile.is_compatible_with(&active_redimnet_identity),
-            "a 256-dim WeSpeaker profile must not be treated as compatible with a 192-dim ReDimNet2 identity"
+            !foreign_profile.is_compatible_with(&active_redimnet_identity),
+            "a 256-dim foreign profile must not be treated as compatible with a 192-dim ReDimNet2 identity"
         );
         assert_eq!(
-            legacy_wespeaker_profile.compatibility_status(&active_redimnet_identity),
+            foreign_profile.compatibility_status(&active_redimnet_identity),
             ProfileCompatibility::Incompatible {
                 reason: "embedding dimension mismatch: profile has 256, active embedder has 192"
                     .to_string()
@@ -1537,7 +1514,7 @@ mod tests {
         );
 
         let mut store = VoiceprintStore::default();
-        store.add_profile(legacy_wespeaker_profile);
+        store.add_profile(foreign_profile);
         assert!(
             store
                 .compatible_profiles(&active_redimnet_identity)

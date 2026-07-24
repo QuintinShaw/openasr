@@ -1,11 +1,8 @@
-//! WeSpeaker diarization calibration.
+//! ReDimNet2-B6 diarization calibration.
 //!
 //! Batch clustering and streaming registry gates stay in one profile so runtime
 //! code consumes calibrated thresholds without embedding model conditionals.
 
-/// Stable calibration identity for WeSpeaker's cosine space. Bump when any
-/// threshold that participates in Voice ID matching changes.
-pub const WESPEAKER_CALIBRATION_VERSION: &str = "wespeaker-cal-v1";
 /// Stable calibration identity for ReDimNet2-B6's cosine space.
 /// Bump when any threshold that participates in Voice ID matching changes.
 pub const REDIMNET_CALIBRATION_VERSION: &str = "redimnet2-b6-cal-v2";
@@ -51,8 +48,8 @@ pub(crate) struct ClusteringCalibrationProfile {
     /// Merge stop threshold for context-aware AHC when no denser-session or
     /// gap profile takes over.
     pub context_auto_merge_threshold: f32,
-    /// Embeddable-region count where WeSpeaker's dense meeting distribution is
-    /// safer with a tight similarity floor than with gap-based speaker count.
+    /// Embeddable-region count where the dense meeting distribution is safer
+    /// with a tight similarity floor than with gap-based speaker count.
     pub dense_context_min_embeddings: usize,
     /// Context-aware threshold used at or above `dense_context_min_embeddings`.
     pub dense_context_merge_threshold: f32,
@@ -74,9 +71,7 @@ pub(crate) struct StreamingCalibrationProfile {
     pub strong_existing_match_similarity: f32,
     /// Relaxed same-speaker reuse floor for long, audible utterances whose best
     /// anonymous centroid clearly outscores every other registry centroid (see
-    /// `relaxed_match_margin`). Calibrated against real speaker-playback
-    /// sessions where WeSpeaker same-speaker cosines sag to ~0.37..0.54 while
-    /// cross-speaker cosines stay at or below ~0.24.
+    /// `relaxed_match_margin`).
     pub relaxed_match_similarity: f32,
     /// Required lead of the best anonymous centroid over every other registry
     /// centroid (anonymous or profile-owned) before the relaxed floor applies.
@@ -96,43 +91,7 @@ pub(crate) struct StreamingCalibrationProfile {
     pub speaker_change_max_cosine: f32,
 }
 
-pub(crate) const WESPEAKER_CALIBRATION: SpeakerCalibrationProfile = SpeakerCalibrationProfile {
-    clustering: ClusteringCalibrationProfile {
-        plain_merge_threshold: 0.43,
-        context_auto_merge_threshold: 0.73,
-        dense_context_min_embeddings: 30,
-        dense_context_merge_threshold: 0.43,
-        context_gap: Some(ContextGapCalibrationProfile {
-            min_gap: 0.05,
-            max_speakers: 4,
-            fallback_speakers: 3,
-        }),
-    },
-    streaming: StreamingCalibrationProfile {
-        match_similarity: 0.57,
-        strong_existing_match_similarity: 0.65,
-        relaxed_match_similarity: 0.33,
-        relaxed_match_margin: 0.20,
-        relaxed_reuse_max_weight: 3.0,
-        new_speaker_max_existing_similarity: 0.44,
-        profile_anchor_similarity: 0.80,
-        native_profile_anchor_similarity: 0.50,
-        speaker_change_max_cosine: 0.42,
-    },
-    enrollment_default_match_similarity: 0.5,
-    // Not calibrated: this legacy WeSpeaker cosine space never had a
-    // top1-vs-top2 margin eval run against it, and the batch matcher's
-    // margin gate was hardcoded to 0.0 (effectively off) before this field
-    // existed. Keep it 0.0 so WeSpeaker's batch match behavior is unchanged
-    // by adding the gate; see `enrollment.rs`'s
-    // `wespeaker_batch_match_behavior_is_unchanged_by_margin_gate` regression
-    // test.
-    enrollment_match_margin: 0.0,
-};
-
-/// ReDimNet2-B6 calibration (192-dim cosine space), distinct from
-/// `WESPEAKER_CALIBRATION` -- the two embedders' cosine distributions are not
-/// comparable, so nothing here is copied from the WeSpeaker profile above.
+/// ReDimNet2-B6 calibration (192-dim cosine space).
 ///
 /// Product Voice ID enrollment-match defaults below come from the phase-1
 /// quality eval report (`tmp/voice-id-b6-eval/outputs/REPORT.md`, not checked
@@ -168,9 +127,7 @@ pub(crate) const REDIMNET_CALIBRATION: SpeakerCalibrationProfile = SpeakerCalibr
         plain_merge_threshold: 0.45,
         // Not independently measured -- no multi-speaker segmentation corpus
         // in the LibriSpeech eval to calibrate the context-assisted merge
-        // gate. Extrapolated by applying WeSpeaker's own
-        // context_auto_merge_threshold / plain_merge_threshold ratio
-        // (0.73 / 0.43 ~= 1.70) to the plain threshold above
+        // gate. Extrapolated as ~1.70x the plain threshold
         // (0.45 * 1.70 ~= 0.76). Needs a real multi-speaker meeting-style
         // corpus (e.g. AISHELL-4) before this can be called calibrated.
         context_auto_merge_threshold: 0.76,
@@ -187,12 +144,11 @@ pub(crate) const REDIMNET_CALIBRATION: SpeakerCalibrationProfile = SpeakerCalibr
     // Streaming (realtime registry consolidation) is out of scope for this
     // calibration pass: phase-1 only exercised batch-style enrollment/matching
     // trials, not the incremental same-turn-vs-new-turn decisions streaming
-    // makes. Values below stay the original conservative, fail-toward-"no
-    // match" placeholders (distinct from WeSpeaker's tuned numbers) until a
-    // dedicated streaming/Challenge Set pass calibrates them for real; this
-    // crate does not ship streaming support for ReDimNet2 yet. Do not treat
-    // the coincidental 0.60 streaming `match_similarity` placeholder as the
-    // same decision as the product batch enrollment default below.
+    // makes. Values below stay conservative, fail-toward-"no match"
+    // placeholders until a dedicated streaming/Challenge Set pass calibrates
+    // them for real. Do not treat the coincidental 0.60 streaming
+    // `match_similarity` placeholder as the same decision as the product batch
+    // enrollment default below.
     streaming: StreamingCalibrationProfile {
         // TODO(voice-id-eval): placeholder, needs streaming/Challenge Set calibration.
         match_similarity: 0.60,
@@ -216,8 +172,7 @@ pub(crate) const REDIMNET_CALIBRATION: SpeakerCalibrationProfile = SpeakerCalibr
     // Product Voice ID / batch enrollment default from phase-1 eval
     // (`tmp/voice-id-b6-eval/outputs/REPORT.md`): thr 0.60 lowers stranger
     // false-name risk vs the prior 0.55 default while keeping hit rate high
-    // on clean single-speaker audio. Embedder-specific -- not comparable to
-    // WeSpeaker's 0.5 historical default.
+    // on clean single-speaker audio.
     enrollment_default_match_similarity: 0.60,
     // Unchanged from the earlier margin-distribution cut and phase-1
     // recommendation: top1-vs-top2 margin 0.15 stays the "confident enough to
@@ -230,7 +185,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn redimnet_calibration_profile_is_pinned_and_distinct_from_wespeaker() {
+    fn redimnet_calibration_profile_is_pinned() {
         assert_eq!(REDIMNET_CALIBRATION.clustering.plain_merge_threshold, 0.45);
         assert_eq!(
             REDIMNET_CALIBRATION.clustering.context_auto_merge_threshold,
@@ -254,26 +209,6 @@ mod tests {
             0.60
         );
         assert_eq!(REDIMNET_CALIBRATION.enrollment_match_margin, 0.15);
-        assert_ne!(
-            REDIMNET_CALIBRATION.clustering.plain_merge_threshold,
-            WESPEAKER_CALIBRATION.clustering.plain_merge_threshold,
-            "redimnet calibration must not be copied verbatim from wespeaker's tuned values"
-        );
-        assert_ne!(
-            REDIMNET_CALIBRATION.streaming.match_similarity,
-            WESPEAKER_CALIBRATION.streaming.match_similarity,
-            "redimnet calibration must not be copied verbatim from wespeaker's tuned values"
-        );
-        assert_ne!(
-            REDIMNET_CALIBRATION.enrollment_default_match_similarity,
-            WESPEAKER_CALIBRATION.enrollment_default_match_similarity,
-            "redimnet calibration must not be copied verbatim from wespeaker's tuned values"
-        );
-        assert_ne!(
-            REDIMNET_CALIBRATION.enrollment_match_margin,
-            WESPEAKER_CALIBRATION.enrollment_match_margin,
-            "redimnet's measured margin gate must not be copied onto wespeaker's uncalibrated space"
-        );
     }
 
     /// Clustering thresholds stay on the older acoustic 0.55 cosine reference
@@ -294,7 +229,7 @@ mod tests {
             REDIMNET_CALIBRATION
                 .clustering
                 .dense_context_merge_threshold,
-            "dense-context merge threshold should match the plain threshold, as in WeSpeaker's profile"
+            "dense-context merge threshold should match the plain threshold"
         );
         assert!(
             REDIMNET_CALIBRATION.clustering.context_auto_merge_threshold
@@ -310,93 +245,12 @@ mod tests {
         );
     }
 
-    /// The per-embedder enrollment default must actually diverge: WeSpeaker
-    /// keeps its historical 0.5 default (`enrollment::DEFAULT_MATCH_SIMILARITY`)
-    /// while ReDimNet2 uses the phase-1 product floor of 0.60.
     #[test]
-    fn enrollment_default_match_similarity_is_embedder_specific() {
-        assert_eq!(
-            WESPEAKER_CALIBRATION.enrollment_default_match_similarity,
-            0.5
-        );
+    fn redimnet_enrollment_default_match_similarity_is_product_floor() {
         assert_eq!(
             REDIMNET_CALIBRATION.enrollment_default_match_similarity,
             0.60
         );
-        assert_ne!(
-            WESPEAKER_CALIBRATION.enrollment_default_match_similarity,
-            REDIMNET_CALIBRATION.enrollment_default_match_similarity
-        );
-    }
-
-    #[test]
-    fn wespeaker_calibration_profile_is_pinned() {
-        assert_eq!(WESPEAKER_CALIBRATION.clustering.plain_merge_threshold, 0.43);
-        assert_eq!(
-            WESPEAKER_CALIBRATION
-                .clustering
-                .context_auto_merge_threshold,
-            0.73
-        );
-        assert_eq!(
-            WESPEAKER_CALIBRATION
-                .clustering
-                .dense_context_min_embeddings,
-            30
-        );
-        assert_eq!(
-            WESPEAKER_CALIBRATION
-                .clustering
-                .dense_context_merge_threshold,
-            0.43
-        );
-        let gap = WESPEAKER_CALIBRATION
-            .clustering
-            .context_gap
-            .expect("WeSpeaker short-context gap profile");
-        assert_eq!(gap.min_gap, 0.05);
-        assert_eq!(gap.max_speakers, 4);
-        assert_eq!(gap.fallback_speakers, 3);
-        assert_eq!(WESPEAKER_CALIBRATION.streaming.match_similarity, 0.57);
-        assert_eq!(
-            WESPEAKER_CALIBRATION.streaming.relaxed_match_similarity,
-            0.33
-        );
-        assert_eq!(WESPEAKER_CALIBRATION.streaming.relaxed_match_margin, 0.20);
-        assert_eq!(
-            WESPEAKER_CALIBRATION.streaming.relaxed_reuse_max_weight,
-            3.0
-        );
-        assert_eq!(
-            WESPEAKER_CALIBRATION
-                .streaming
-                .strong_existing_match_similarity,
-            0.65
-        );
-        assert_eq!(
-            WESPEAKER_CALIBRATION
-                .streaming
-                .new_speaker_max_existing_similarity,
-            0.44
-        );
-        assert_eq!(
-            WESPEAKER_CALIBRATION.streaming.profile_anchor_similarity,
-            0.80
-        );
-        assert_eq!(
-            WESPEAKER_CALIBRATION
-                .streaming
-                .native_profile_anchor_similarity,
-            0.50
-        );
-        assert_eq!(
-            WESPEAKER_CALIBRATION.streaming.speaker_change_max_cosine,
-            0.42
-        );
-        assert_eq!(
-            WESPEAKER_CALIBRATION.enrollment_default_match_similarity,
-            0.5
-        );
-        assert_eq!(WESPEAKER_CALIBRATION.enrollment_match_margin, 0.0);
+        assert_eq!(REDIMNET_CALIBRATION.enrollment_match_margin, 0.15);
     }
 }

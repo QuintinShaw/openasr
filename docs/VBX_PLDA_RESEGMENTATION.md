@@ -27,7 +27,7 @@ or copied.
 
 The pass is intentionally conservative:
 
-- only 256-dimensional WeSpeaker embeddings are eligible;
+- only 192-dimensional ReDimNet2-B6 embeddings are eligible;
 - only context-rich, dense files with clear AHC oversegmentation enter the pass;
 - cannot-link constraints from simultaneous pyannote regions are preserved;
 - short files, the real-time path, and CAM++ fallback diarization keep the

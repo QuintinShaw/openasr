@@ -77,7 +77,7 @@ class ManifestPublicGateTest(unittest.TestCase):
 
     def test_build_catalog_model_emits_capability_pack_metadata(self) -> None:
         old_root = _manifest.REPO_ROOT
-        model = "wespeaker-voxceleb-resnet34-lm"
+        model = "redimnet2-b6-cn"
         try:
             with tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
@@ -86,29 +86,26 @@ class ManifestPublicGateTest(unittest.TestCase):
                 packs = work / "packs"
                 packs.mkdir(parents=True)
                 (work / "hf_revision.txt").write_text("c" * 40)
-                filename = f"{model}-f32.oasr"
-                (packs / f"{model}.f32.result.json").write_text(
-                    json.dumps(
-                        {
-                            "pack": str(packs / filename),
-                            "sha256": "a" * 64,
-                            "size_bytes": 1234,
-                        }
-                    )
-                )
-                (work / "metrics.json").write_text(
-                    json.dumps(
-                        {
-                            "quants": {
-                                "f32": {
-                                    "size_bytes": 1234,
-                                    "sha256": "a" * 64,
-                                    "rtf_cpu": 0.01,
-                                    "peak_rss_bytes": 128,
-                                }
+                metrics_quants = {}
+                for quant in ("fp16", "q8_0", "f32"):
+                    filename = f"{model}-{quant}.oasr"
+                    (packs / f"{model}.{quant}.result.json").write_text(
+                        json.dumps(
+                            {
+                                "pack": str(packs / filename),
+                                "sha256": "a" * 64,
+                                "size_bytes": 1234,
                             }
-                        }
+                        )
                     )
+                    metrics_quants[quant] = {
+                        "size_bytes": 1234,
+                        "sha256": "a" * 64,
+                        "rtf_cpu": 0.01,
+                        "peak_rss_bytes": 128,
+                    }
+                (work / "metrics.json").write_text(
+                    json.dumps({"quants": metrics_quants})
                 )
 
                 entry = _manifest.load_publish_catalog()[model]
@@ -121,7 +118,7 @@ class ManifestPublicGateTest(unittest.TestCase):
 
                 catalog_model = _manifest.build_catalog_model(model, entry, args)
 
-                self.assertEqual(catalog_model["id"], "wespeaker-voxceleb-resnet34-lm")
+                self.assertEqual(catalog_model["id"], "redimnet2-b6-cn")
                 self.assertEqual(catalog_model["kind"], "capability-pack")
                 self.assertEqual(
                     catalog_model["capability"],
@@ -133,7 +130,7 @@ class ManifestPublicGateTest(unittest.TestCase):
                 self.assertTrue(catalog_model["public"])
                 self.assertEqual(
                     catalog_model["pull_recommended"],
-                    "wespeaker-voxceleb-resnet34-lm:f32",
+                    "redimnet2-b6-cn:fp16",
                 )
         finally:
             _manifest.REPO_ROOT = old_root

@@ -323,7 +323,7 @@ class PunctuationForModelTest(unittest.TestCase):
         self.assertEqual(punctuation_for_model(entry), {})
 
     def test_capability_pack_is_omitted(self) -> None:
-        entry = {"kind": "capability-pack", "family": "wespeaker"}
+        entry = {"kind": "capability-pack", "family": "redimnet2"}
         self.assertEqual(punctuation_for_model(entry), {})
 
     def test_unknown_family_raises(self) -> None:
@@ -400,7 +400,7 @@ class LanguageLabelsWireTest(unittest.TestCase):
         self.assertEqual(REGISTERED_DIALECT_CODES, sorted(set(REGISTERED_DIALECT_CODES)))
 
     def test_capability_pack_is_omitted(self) -> None:
-        entry = {"kind": "capability-pack", "family": "wespeaker"}
+        entry = {"kind": "capability-pack", "family": "redimnet2"}
         self.assertEqual(language_mode_for_model(entry, ["en", "zh"]), {})
 
     def test_unknown_family_raises(self) -> None:

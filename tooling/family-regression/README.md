@@ -20,7 +20,7 @@ Modes:
   `OPENASR_GGML_BACKEND=cpu` -> compare against
   `goldens/<case>/golden*.txt`.
 - `diarize`: same, plus `--diarize`; use `--extra-pull` for the
-  pyannote-seg + wespeaker capability packs. The golden asserts the
+  pyannote-seg + redimnet2-b6-cn capability packs. The golden asserts the
   transcript only, not speaker labels.
 - `verify`: pull -> `openasr verify` ggml integrity probe, for packs with no
   batch transcribe path (e.g. the hymt2 translation model).

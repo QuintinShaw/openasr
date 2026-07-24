@@ -236,7 +236,6 @@ fn bundled_registry_ordering_is_deterministic() {
             "qwen3-forced-aligner-0.6b",
             "redimnet2-b6-cn",
             "sensevoice-small",
-            "wespeaker-voxceleb-resnet34-lm",
             "whisper-base",
             "whisper-base.en",
             "whisper-large-v3",
@@ -325,7 +324,6 @@ fn bundled_catalog_public_ids_match_current_signed_release_projection() {
             "qwen3-asr-1.7b",
             "redimnet2-b6-cn",
             "sensevoice-small",
-            "wespeaker-voxceleb-resnet34-lm",
             "whisper-base",
             "whisper-base.en",
             "whisper-large-v3",
@@ -407,10 +405,6 @@ fn bundled_catalog_declares_speaker_diarization_capability_packs() {
                 CatalogCapabilityRole::SpeakerSegmenter
             ),
             ("redimnet2-b6-cn", CatalogCapabilityRole::SpeakerEmbedder),
-            (
-                "wespeaker-voxceleb-resnet34-lm",
-                CatalogCapabilityRole::SpeakerEmbedder
-            ),
         ]
     );
     assert!(packs.iter().all(|model| !model.is_market_listed()));

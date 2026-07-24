@@ -88,12 +88,6 @@ upstream_repo = "FunAudioLLM/SenseVoiceSmall"
 source_revision = "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7"
 needs_license_flags = false
 
-["wespeaker-voxceleb-resnet34-lm"]
-import_subcommand = "import wespeaker"
-upstream_repo = "pyannote/wespeaker-voxceleb-resnet34-LM"
-source_revision = "837717ddb9ff5507820346191109dc79c958d614"
-needs_license_flags = false
-
 ["redimnet2-b6-cn"]
 # External Python converter (tooling/redimnet2/convert_redimnet2.py); no openasr
 # model-pack import subcommand. publish.sh materializes prebuilt packs.

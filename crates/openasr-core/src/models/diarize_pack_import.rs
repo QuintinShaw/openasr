@@ -1,5 +1,5 @@
 //! Shared safetensors → diarization `.oasr` (GGUF-v0) conversion for the
-//! speaker-diarization models (WeSpeaker embedder, pyannote segmenter).
+//! speaker-diarization models (ReDimNet2-B6 embedder, pyannote segmenter).
 //!
 //! By default tensors are stored as raw `F32` with the GGUF dims equal to the
 //! logical (safetensors) shape — **no** ggml dim reversal, because these weights
@@ -99,14 +99,14 @@ mod tests {
     fn diarize_pack_stores_f32_tensor() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source.safetensors");
-        let output = temp.path().join("wespeaker-f32.oasr");
+        let output = temp.path().join("aux-pack-f32.oasr");
         let values: Vec<f32> = (0..32).map(|i| ((i as f32) * 0.17).sin()).collect();
         write_tiny_safetensors(&source, "resnet.conv1.weight", &[32], &values);
 
         let mut metadata = BTreeMap::new();
         metadata.insert(
             "general.architecture".to_string(),
-            GgufWriteValue::String("wespeaker-resnet34".to_string()),
+            GgufWriteValue::String("redimnet2".to_string()),
         );
         let count = convert_diarize_safetensors_to_oasr(&source, &output, &metadata).unwrap();
         assert_eq!(count, 1);

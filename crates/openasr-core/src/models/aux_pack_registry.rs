@@ -8,13 +8,13 @@
 //! transcription architectures -- they have no audio frontend, tokenizer, or
 //! decode policy in that sense -- so forcing them into
 //! `OpenAsrArchitectureDescriptor` would model a shape they don't have (see
-//! `models::pyannote`/`models::wespeaker`'s module docs, which already say so
-//! explicitly). They still deserve **one** table instead of an ad hoc chain of
-//! `if let Some(...)` calls in `api::backend::native`, so this module is that
-//! table: one `general.architecture` value per aux family, matched by a single
-//! lookup, fail-closed (`None` when no aux entry matches, so the caller falls
-//! through to ASR adapter selection, which then fails closed on its own if the
-//! pack matches nothing at all).
+//! `models::pyannote` module docs, which already say so explicitly). They still
+//! deserve **one** table instead of an ad hoc chain of `if let Some(...)` calls
+//! in `api::backend::native`, so this module is that table: one
+//! `general.architecture` value per aux family, matched by a single lookup,
+//! fail-closed (`None` when no aux entry matches, so the caller falls through
+//! to ASR adapter selection, which then fails closed on its own if the pack
+//! matches nothing at all).
 //!
 //! [`aux_pack_architecture_ids_are_unique_and_disjoint_from_asr`] is the safety
 //! net a hand-rolled chain never had: it fails the test suite if a future aux
@@ -31,7 +31,7 @@ use crate::arch::GENERAL_ARCHITECTURE_KEY;
 /// exact wording `api::backend::native`'s tests assert on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuxPackKind {
-    /// Speaker embedder (WeSpeaker / ReDimNet2) / speaker segmenter (pyannote) diarization
+    /// Speaker embedder (ReDimNet2-B6) / speaker segmenter (pyannote) diarization
     /// support packs.
     Diarization,
     /// Translation runtime packs (Hy-MT2).
@@ -62,12 +62,6 @@ struct AuxPackDescriptor {
     validate: fn(&Path, &GgufMetadata) -> Result<(), String>,
 }
 
-fn validate_wespeaker(path: &Path, _metadata: &GgufMetadata) -> Result<(), String> {
-    crate::diarize::embed::WeSpeakerEmbedder::from_oasr(path)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
 fn validate_pyannote(path: &Path, _metadata: &GgufMetadata) -> Result<(), String> {
     crate::diarize::segment::PyannoteSegmenter::from_oasr(path)
         .map(|_| ())
@@ -95,11 +89,6 @@ fn validate_firered_punc(_path: &Path, metadata: &GgufMetadata) -> Result<(), St
 }
 
 const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
-    AuxPackDescriptor {
-        architecture_id: crate::models::wespeaker::WESPEAKER_GGML_ARCHITECTURE_ID,
-        kind: AuxPackKind::Diarization,
-        validate: validate_wespeaker,
-    },
     AuxPackDescriptor {
         architecture_id: "redimnet2",
         kind: AuxPackKind::Diarization,

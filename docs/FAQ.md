@@ -97,7 +97,7 @@ packs and public product guarantees are still pending — see
 ## Is diarization available?
 
 Yes, opt-in via `--diarize` (and the API `diarize` flag). It uses pure-Rust
-WeSpeaker speaker-embedding and pyannote segmentation capability packs (pulled or
+ReDimNet2-B6 speaker-embedding and pyannote segmentation capability packs (pulled or
 installed on demand) to attribute anonymous `SPEAKER_NN` labels onto any model's
 transcript; without the required capability pack the request fails closed rather
 than fabricating speakers.

@@ -3,7 +3,7 @@
 //! Reference: `redimnet2/layers/features_tf.py` from PalabraAI/redimnet2 (MIT),
 //! as configured by the B6 checkpoint `model_config.spec_params`
 //! (`do_preemph=true`, `norm_signal=true`, `feat_type="tf"`, `hop_length=160`,
-//! `F=72`). This is deliberately a *separate* front end from the WeSpeaker Kaldi
+//! `F=72`). This is deliberately a *separate* front end from the ReDimNet2-B6 Kaldi
 //! `Fbank` (`super::super::fbank`): the two differ in bin count (72 vs 80), mel
 //! formula (Slaney `2595*log10` vs Kaldi `1127*ln`), `f_max` (7600 vs 8000),
 //! signal scaling (per-utterance zero-mean/unit-std vs int16 full-scale), window
@@ -24,7 +24,7 @@
 //!
 //! All constants (Hamming window, cos/sin DFT kernels, Slaney mel matrix) are
 //! deterministic and recomputed here rather than baked into the pack, matching
-//! the WeSpeaker `Fbank` convention. Numeric parity against the reference is
+//! the ReDimNet2-B6 `Fbank` convention. Numeric parity against the reference is
 //! pinned by `tests::frontend_parity` (kernels/matrix and the four staged
 //! tensors) against `frontend_dump/*.npy`.
 

@@ -3,7 +3,7 @@
 //! word_timestamps_forced_aligner_pack`). Resolved from
 //! `OPENASR_FORCED_ALIGNER_PACK` or the standard
 //! `openasr_home()/models/*forced-aligner*/` location, mirroring
-//! `diarize::embed::pack`'s WeSpeaker resolution but built on the shared
+//! `diarize::embed::pack`'s ReDimNet2-B6 resolution but built on the shared
 //! `crate::capability_pack` resolver directly (this pack is not diarization).
 
 use std::path::PathBuf;

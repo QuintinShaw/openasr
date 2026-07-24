@@ -206,69 +206,12 @@ fn import_command(command: ImportCommand) -> Result<()> {
             &license_source,
             quantization,
         ),
-        ImportCommand::Wespeaker {
-            source_safetensors,
-            output_root,
-            package_id,
-            source_name,
-            source_revision,
-            license_name,
-            license_source,
-            quantization,
-        } => import_wespeaker_local_command(
-            &source_safetensors,
-            &output_root,
-            &package_id,
-            &source_name,
-            &source_revision,
-            &license_name,
-            &license_source,
-            quantization,
-        ),
         ImportCommand::Pyannote {
             source_safetensors,
             output_root,
             package_id,
         } => import_pyannote_local_command(&source_safetensors, &output_root, &package_id),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn import_wespeaker_local_command(
-    source_safetensors: &Path,
-    output_root: &Path,
-    package_id: &str,
-    source_name: &str,
-    source_revision: &str,
-    license_name: &str,
-    license_source: &str,
-    quantization: ImportWeSpeakerQuantization,
-) -> Result<()> {
-    let request = openasr_core::WeSpeakerImportRequest {
-        source_safetensors: source_safetensors.to_path_buf(),
-        output_root: output_root.to_path_buf(),
-        model_id: package_id.to_string(),
-        source_name: source_name.to_string(),
-        source_revision: source_revision.to_string(),
-        license_name: license_name.to_string(),
-        license_source: license_source.to_string(),
-        quantization: match quantization {
-            ImportWeSpeakerQuantization::F32 => openasr_core::WeSpeakerRuntimeQuantizationMode::F32,
-        },
-    };
-
-    ensure_ggml_package_output_suffix(output_root)?;
-    let result = openasr_core::convert_local_wespeaker_source_to_runtime_pack(&request)
-        .map_err(anyhow::Error::new)?;
-    println!(
-        "Imported WeSpeaker ResNet34 local source into diarization runtime pack:\n- source: {}\n- output: {}\n- tensor_count: {}\n- quantization: {:?}\n- license: {}",
-        source_safetensors.display(),
-        result.output_path.display(),
-        result.tensor_count,
-        quantization,
-        license_name
-    );
-    Ok(())
 }
 
 fn import_pyannote_local_command(
@@ -1252,7 +1195,7 @@ mod tests {
     #[test]
     fn transcription_capability_summary_keeps_base_cohere_diarization_unsupported() {
         let temp = tempfile::tempdir().unwrap();
-        let _wespeaker_pack = EnvVarRestore::remove("OPENASR_WESPEAKER_PACK");
+        let _redimnet_pack = EnvVarRestore::remove("OPENASR_REDIMNET_PACK");
         let _home = EnvVarRestore::set("OPENASR_HOME", temp.path().as_os_str());
         let runtime_path = temp.path().join("cohere-runtime.oasr");
         let spec = openasr_core::testing::TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(

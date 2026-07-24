@@ -23,7 +23,7 @@ EXPECTED_CAPABILITY_PACKS = {
     "pyannote-segmentation-3.0": "speaker-segmenter",
     "qwen3-forced-aligner-0.6b": "forced-aligner",
     "redimnet2-b6-cn": "speaker-embedder",
-    "wespeaker-voxceleb-resnet34-lm": "speaker-embedder",
+    "redimnet2-b6-cn": "speaker-embedder",
 }
 # Capability-pack feature per model: most existing packs serve
 # speaker-diarization, but qwen3-forced-aligner-0.6b serves the distinct
@@ -34,7 +34,7 @@ EXPECTED_CAPABILITY_FEATURES = {
     "pyannote-segmentation-3.0": "speaker-diarization",
     "qwen3-forced-aligner-0.6b": "word-timestamps",
     "redimnet2-b6-cn": "speaker-diarization",
-    "wespeaker-voxceleb-resnet34-lm": "speaker-diarization",
+    "redimnet2-b6-cn": "speaker-diarization",
 }
 EXPECTED_TRANSLATION_MODELS = {
     "hymt2-1.8b": (["zh"], ["en"]),
@@ -139,9 +139,9 @@ class PublishHelpersTest(unittest.TestCase):
             self.assertNotIn("kind", source[model], f"{model} should exercise the default kind")
 
     def test_missing_kind_defaults_to_asr_model_without_family_inference(self) -> None:
-        entry = {"family": "wespeaker"}
+        entry = {"family": "redimnet2"}
 
-        apply_catalog_series_defaults("synthetic-wespeaker", entry, {})
+        apply_catalog_series_defaults("synthetic-redimnet", entry, {})
 
         self.assertEqual(entry["kind"], DEFAULT_CATALOG_MODEL_KIND)
         self.assertNotIn("capability", entry)

@@ -2,7 +2,7 @@
 //!
 //! Tensors are flat row-major `Vec<f32>` with explicit shapes (time length is
 //! dynamic), mirroring the VAD forward pass. These are the load-bearing
-//! primitives for the WeSpeaker port: 2-D conv (ResNet head), inference
+//! primitives for the ReDimNet2-B6 port: 2-D conv (ResNet head), inference
 //! batch-norm (folded from running stats), and statistics pooling
 //! (mean + Bessel-corrected std).
 //!

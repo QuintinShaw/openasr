@@ -350,7 +350,7 @@ mod tests {
             models: vec![
                 catalog_model("moonshine-tiny", openasr_core::CatalogModelKind::AsrModel),
                 catalog_model(
-                    "wespeaker-voxceleb-resnet34-lm",
+                    "redimnet2-b6-cn",
                     openasr_core::CatalogModelKind::CapabilityPack,
                 ),
                 catalog_model(
@@ -363,7 +363,7 @@ mod tests {
         assert!(should_update_default_asr_model(&catalog, "moonshine-tiny"));
         assert!(!should_update_default_asr_model(
             &catalog,
-            "wespeaker-voxceleb-resnet34-lm"
+            "redimnet2-b6-cn"
         ));
         assert!(!should_update_default_asr_model(&catalog, "hymt2-1.8b"));
     }
@@ -378,7 +378,7 @@ mod tests {
             language_labels: std::collections::BTreeMap::new(),
             models: vec![
                 catalog_model(
-                    "wespeaker-voxceleb-resnet34-lm",
+                    "redimnet2-b6-cn",
                     openasr_core::CatalogModelKind::CapabilityPack,
                 ),
                 catalog_model(
@@ -389,12 +389,8 @@ mod tests {
         };
 
         assert_eq!(
-            non_default_asr_install_status(
-                &catalog,
-                "wespeaker-voxceleb-resnet34-lm",
-                "wespeaker-voxceleb-resnet34-lm:f32"
-            ),
-            "Installed capability pack wespeaker-voxceleb-resnet34-lm:f32; default ASR model was not changed."
+            non_default_asr_install_status(&catalog, "redimnet2-b6-cn", "redimnet2-b6-cn:fp16"),
+            "Installed capability pack redimnet2-b6-cn:fp16; default ASR model was not changed."
         );
         assert_eq!(
             non_default_asr_install_status(&catalog, "hymt2-1.8b", "hymt2-1.8b:q4km"),

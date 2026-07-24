@@ -122,7 +122,7 @@ The same core pull engine backs three surfaces:
 - Desktop: the Models page installs through the local daemon, never from the
   webview.
 
-Pulling a `capability-pack` (e.g. `wespeaker-voxceleb-resnet34-lm:f32`) or a
+Pulling a `capability-pack` (e.g. `redimnet2-b6-cn:fp16`) or a
 `translation-model` does not change the default ASR model. `openasr transcribe
 --diarize` and `live --diarize` are explicit consent for the
 CLI to install a missing required `speaker-diarization` capability pack before the

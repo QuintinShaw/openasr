@@ -1,6 +1,6 @@
 //! Generic resolution of an installed optional capability-pack file (a
 //! `.oasr`/`.safetensors` support model that augments a family's own decode
-//! path, e.g. the WeSpeaker speaker-embedder or the Qwen3-ForcedAligner
+//! path, e.g. the ReDimNet2-B6 speaker-embedder or the Qwen3-ForcedAligner
 //! word-timestamp refiner) from the resolved model-pack storage root (see
 //! `config::models_dir` -- honors an `OPENASR_MODELS_DIR`/`config.models_dir`
 //! override, defaulting to `openasr_home()/models/<dir>/`). Extracted from

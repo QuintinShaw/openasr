@@ -95,7 +95,7 @@ pub fn prefix() -> String {
 /// Always on -- not gated by an env var -- this is baseline daemon-log
 /// observability, not opt-in profiling (contrast with the existing
 /// `OPENASR_<FAMILY>_PROFILE`-gated fine-grained hooks such as
-/// `diarize::embed::wespeaker`'s `OPENASR_WESPEAKER_PROFILE`). Cheap: one
+/// `diarize::embed::redimnet`'s `OPENASR_REDIMNET_PROFILE`). Cheap: one
 /// `SystemTime`/`Instant` read plus one `eprintln!`; callers must still only
 /// call this at coarse boundaries (stage/request granularity), never inside a
 /// per-frame or per-token hot loop.
