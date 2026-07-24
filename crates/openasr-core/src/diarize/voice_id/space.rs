@@ -235,7 +235,7 @@ mod tests {
             "redimnet2-b6",
             "redimnet2-b6-cn-v1",
             REDIMNET_FRONTEND_VERSION,
-            "redimnet2-b6-cal-v2",
+            "redimnet2-b6-cal-v999",
             MATCHER_POLICY_VERSION,
         );
         assert_eq!(a.space_id, b.space_id);

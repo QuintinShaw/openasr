@@ -991,7 +991,7 @@ mod tests {
             default_match_similarity_for(&StubWeSpeakerEmbedder),
             DEFAULT_MATCH_SIMILARITY
         );
-        assert_eq!(default_match_similarity_for(&StubRedimNetEmbedder), 0.55);
+        assert_eq!(default_match_similarity_for(&StubRedimNetEmbedder), 0.60);
         assert_ne!(
             default_match_similarity_for(&StubWeSpeakerEmbedder),
             default_match_similarity_for(&StubRedimNetEmbedder)
