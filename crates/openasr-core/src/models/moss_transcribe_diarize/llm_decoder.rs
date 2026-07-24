@@ -171,14 +171,30 @@ impl MossTdDecoderRuntime {
         self.whole_decoder.release_session_scoped_buffers();
     }
 
-    pub(crate) fn new_kv_caches(&self) -> Vec<Qwen3AsrLayerKvCacheState> {
-        // Clamp the RoPE context limit (`max_positions`, up to 131072) down to
-        // the KV-cache preallocation cap: `Qwen3AsrLayerKvCacheState::new`
-        // eagerly allocates the full `max_positions` span on first write, so an
-        // uncapped 131072 reserves ~30 GB across the 28 layers (see
-        // `moss_td_kv_cache_positions`). This makes packs built before the cap
-        // (131072 baked into the GGUF) allocate the same ~1.9 GB as fresh ones.
-        let cache_positions = moss_td_kv_cache_positions(self.metadata.max_positions);
+    /// `capacity` should be the request-sized bound (prompt tokens + the
+    /// generation budget), NOT the checkpoint's native `max_positions`
+    /// (131072, a RoPE context ceiling -- see `moss_td_kv_cache_positions`'s
+    /// doc comment): `capacity` becomes the persistent Metal/GPU reuse
+    /// graph's fixed KV/mask/RoPE span (`run_prefill_auto_last_hidden`/
+    /// `run_step_auto` size it from this cache's `max_positions()`), and that
+    /// span is a per-token COMPUTE + device-resident-allocation cost there,
+    /// not just a host bound. Sizing it to the family-wide cap unconditionally
+    /// made every utterance -- including a short one needing a few hundred
+    /// positions -- pay a fixed 8192-wide attention span on every prefill
+    /// mask/decode step and a fixed ~1.9 GB device allocation regardless of
+    /// real audio length: measured 3.2-3.85x slower than the CPU backend, and
+    /// a several-minute clip's 28-layer x 8192-wide single-shot device
+    /// allocation exhausted Metal's working-set budget outright (OOM). This
+    /// still clamps to `moss_td_kv_cache_positions`'s family-wide ceiling, so
+    /// a request that genuinely needs more than that fails closed at the
+    /// cache's own bounds check instead of over-allocating. Mirrors
+    /// `firered_llm::llm_transformer`'s and `mimo_asr::llm_transformer`'s
+    /// identical `new_kv_caches(capacity)` sizing (which never had this
+    /// family-wide-cap step because their native `max_positions` was already
+    /// a sane KV-cache size), and `qwen::ggml_executor`'s own
+    /// `decode_prompt.token_ids.len().saturating_add(decode_config.max_generated_tokens)`.
+    pub(crate) fn new_kv_caches(&self, capacity: usize) -> Vec<Qwen3AsrLayerKvCacheState> {
+        let cache_positions = moss_td_kv_cache_positions(capacity);
         (0..self.metadata.n_layers)
             .map(|_| {
                 Qwen3AsrLayerKvCacheState::new(

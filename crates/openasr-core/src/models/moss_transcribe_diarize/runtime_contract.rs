@@ -47,22 +47,30 @@ pub(crate) const MOSS_TD_ADAPTOR_NORM_EPSILON: f32 = 1e-6;
 /// reserves ~30 GB of address space (28 layers x 2 x 131072 x 8 x 128 x 4 B).
 /// That reservation is lazy-zeroed and harmless on the CPU backend (only the
 /// touched prefix is resident), but the Metal backend physically wires the
-/// buffers and exhausts a 16 GB machine. Cap the preallocation at a pragmatic
-/// ASR context length -- 8192 mirrors qwen3-asr's own audio-encoder value -- so
-/// real utterances (audio tokens + prompt + generated tokens) stay comfortably
-/// under it while the reservation drops to ~1.9 GB. A sequence longer than the
-/// cap fails closed at the cache's own bounds check, never by over-allocating.
+/// buffers and exhausts a 16 GB machine. This is a ceiling on top of the
+/// request-sized capacity `llm_decoder::new_kv_caches` computes (prompt +
+/// generation-budget tokens for the utterance actually being decoded, mirroring
+/// `firered_llm`/`mimo_asr`'s identical sizing) -- NOT the value that capacity
+/// is unconditionally forced to. Sizing every request to this cap
+/// unconditionally previously made the fixed Metal/GPU reuse-graph KV/mask/
+/// RoPE span 8192-wide regardless of real utterance length (3.2-3.85x slower
+/// than the CPU backend on short audio) and made a several-minute clip's
+/// 28-layer x 8192-wide single-shot device allocation exhaust Metal's working
+/// set outright (OOM) even though the utterance's real demand was far below
+/// the cap. A request whose real demand exceeds this cap still fails closed at
+/// the cache's own bounds check, never by over-allocating.
 ///
 /// Lesson, recorded so it does not recur: `max_position_embeddings` is an
 /// attention/positional-encoding ceiling, not a working-set size; the two must
 /// not be conflated when sizing runtime buffers.
 pub(crate) const MOSS_TD_MAX_KV_CACHE_POSITIONS: usize = 8192;
 
-/// Clamp a decoder `max_positions` value (which may be the raw RoPE context
-/// limit) to the KV-cache preallocation cap. Both the runtime decoder
-/// (`llm_decoder::new_kv_caches`) and the pack importer
-/// (`package_import`) route through this so a pack built before the cap (with
-/// 131072 baked in) and a freshly built pack allocate identically.
+/// Clamp a KV-cache capacity (request-sized, or the raw RoPE context limit for
+/// the pack importer's own bookkeeping) to the family-wide preallocation cap.
+/// Both the runtime decoder (`llm_decoder::new_kv_caches`, called with the
+/// request-sized capacity) and the pack importer (`package_import`, called
+/// with the raw checkpoint `max_positions`) route through this so neither ever
+/// allocates past the cap.
 pub(crate) fn moss_td_kv_cache_positions(max_positions: usize) -> usize {
     max_positions.min(MOSS_TD_MAX_KV_CACHE_POSITIONS)
 }
