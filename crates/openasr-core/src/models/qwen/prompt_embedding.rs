@@ -40,10 +40,23 @@ pub(crate) enum Qwen3AsrPromptEmbeddingError {
     NonFiniteValues,
 }
 
+/// Splice the audio-encoder rows into the token-embedding buffer at the decode
+/// prompt's audio pad span, producing the combined prompt embeddings.
+///
+/// `token_rows` is consumed by value and spliced IN PLACE: every family
+/// executor (qwen / firered-llm / mimo / forced-aligner) gathers an owned
+/// token-row buffer it never touches again, so the historical `to_vec()`
+/// copy was a pure per-utterance `token_count x hidden` clone on the
+/// encoder-to-prefill critical path (and the result was cloned once more by
+/// `build_qwen3_llm_prefill_input`). Both buffers are row-major
+/// `[token|frame][hidden]`, so the audio span is contiguous on each side and
+/// the splice is a single span copy. All fail-closed validation (shape,
+/// checked span arithmetic, non-finite elements) runs unchanged before the
+/// copy.
 pub(crate) fn build_qwen3_prompt_embeddings_with_audio_splice(
     decode_prompt: &Qwen3AsrDecodePrompt,
     hidden_size: usize,
-    token_rows: &[f32],
+    mut token_rows: Vec<f32>,
     audio_rows: &[f32],
 ) -> Result<Qwen3AsrPromptEmbeddings, Qwen3AsrPromptEmbeddingError> {
     if hidden_size == 0 {
@@ -108,44 +121,31 @@ pub(crate) fn build_qwen3_prompt_embeddings_with_audio_splice(
         });
     }
 
-    let mut combined = token_rows.to_vec();
-    for frame_idx in 0..audio_frame_count {
-        let src_start = frame_idx.checked_mul(hidden_size).ok_or(
-            Qwen3AsrPromptEmbeddingError::InvalidAudioRowsShape {
-                audio_frame_count,
-                hidden_size,
-                values_len: audio_rows.len(),
-            },
-        )?;
-        let src_end = src_start.checked_add(hidden_size).ok_or(
-            Qwen3AsrPromptEmbeddingError::InvalidAudioRowsShape {
-                audio_frame_count,
-                hidden_size,
-                values_len: audio_rows.len(),
-            },
-        )?;
-        let dst_token_idx = pad_start + frame_idx;
-        let dst_start = dst_token_idx.checked_mul(hidden_size).ok_or(
-            Qwen3AsrPromptEmbeddingError::InvalidTokenRowsShape {
-                token_count,
-                hidden_size,
-                values_len: combined.len(),
-            },
-        )?;
-        let dst_end = dst_start.checked_add(hidden_size).ok_or(
-            Qwen3AsrPromptEmbeddingError::InvalidTokenRowsShape {
-                token_count,
-                hidden_size,
-                values_len: combined.len(),
-            },
-        )?;
-        combined[dst_start..dst_end].copy_from_slice(&audio_rows[src_start..src_end]);
-    }
+    // The audio span is contiguous on both sides (row-major [token][hidden]),
+    // and the checks above pin it inside both buffers:
+    // `expected_audio_values == audio_rows.len()` and `pad_end <= token_count`
+    // (so the dst span ends within `token_rows`). The checked offsets keep the
+    // overflow guard the per-frame loop used to carry.
+    let dst_start = pad_start.checked_mul(hidden_size).ok_or(
+        Qwen3AsrPromptEmbeddingError::InvalidAudioPadSpan {
+            audio_pad_start_index: pad_start,
+            audio_pad_count: audio_frame_count,
+            token_count,
+        },
+    )?;
+    let dst_end = dst_start.checked_add(expected_audio_values).ok_or(
+        Qwen3AsrPromptEmbeddingError::InvalidAudioPadSpan {
+            audio_pad_start_index: pad_start,
+            audio_pad_count: audio_frame_count,
+            token_count,
+        },
+    )?;
+    token_rows[dst_start..dst_end].copy_from_slice(&audio_rows[..expected_audio_values]);
 
     Ok(Qwen3AsrPromptEmbeddings {
         hidden_size,
         token_count,
-        token_major_values: combined,
+        token_major_values: token_rows,
     })
 }
 
@@ -172,7 +172,7 @@ mod tests {
             200.0, 201.0,
         ];
         let spliced =
-            build_qwen3_prompt_embeddings_with_audio_splice(&prompt, 2, &token_rows, &audio_rows)
+            build_qwen3_prompt_embeddings_with_audio_splice(&prompt, 2, token_rows, &audio_rows)
                 .expect("splice");
         assert_eq!(
             spliced.token_major_values,
@@ -193,7 +193,7 @@ mod tests {
             audio_pad_count: 2,
         };
         let error =
-            build_qwen3_prompt_embeddings_with_audio_splice(&prompt, 2, &[0.0; 8], &[0.0; 3])
+            build_qwen3_prompt_embeddings_with_audio_splice(&prompt, 2, vec![0.0; 8], &[0.0; 3])
                 .expect_err("audio shape mismatch must fail");
         assert!(matches!(
             error,

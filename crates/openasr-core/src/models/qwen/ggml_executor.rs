@@ -392,14 +392,14 @@ impl Qwen3AsrGgmlExecutor {
         let prompt_embeddings = build_qwen3_prompt_embeddings_with_audio_splice(
             &decode_prompt,
             token_embedding_table.d_model(),
-            &token_rows,
+            token_rows,
             &audio_embeddings.rows,
         )
         .map_err(map_prompt_embedding_error)?;
         qwen_decode_profile_log_opt("prompt_embedding_splice", prompt_embedding_started_at);
         let llm_prefill_started_at = qwen_decode_profile_start();
         let llm_prefill_input =
-            build_qwen3_llm_prefill_input(&prompt_embeddings).map_err(map_llm_prefill_error)?;
+            build_qwen3_llm_prefill_input(prompt_embeddings).map_err(map_llm_prefill_error)?;
         qwen_decode_profile_log_opt("llm_prefill_input", llm_prefill_started_at);
         if layer_attention_projections.is_empty() {
             return Err(Qwen3AsrGgmlExecutorError::RuntimeContractViolation {

@@ -444,7 +444,7 @@ impl FireRedLlmGgmlExecutor {
         let prompt_embeddings = build_qwen3_prompt_embeddings_with_audio_splice(
             &decode_prompt,
             decoder_metadata.d_model,
-            &token_rows,
+            token_rows,
             &speech_rows,
         )
         .map_err(|error| FireRedLlmExecutorError::PromptEmbeddingFailed {

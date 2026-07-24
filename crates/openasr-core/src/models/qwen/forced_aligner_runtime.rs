@@ -407,10 +407,10 @@ pub(crate) fn align_forced(
     let prompt_embeddings = build_qwen3_prompt_embeddings_with_audio_splice(
         &decode_prompt,
         assets.token_embedding_table.d_model(),
-        &token_rows,
+        token_rows,
         &audio_embeddings.rows,
     )?;
-    let prefill_input = build_qwen3_llm_prefill_input(&prompt_embeddings)?;
+    let prefill_input = build_qwen3_llm_prefill_input(prompt_embeddings)?;
 
     let mut whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
         &assets.layer_attention_projections,
@@ -429,7 +429,7 @@ pub(crate) fn align_forced(
             reason: error.to_string(),
         })?;
 
-    let hidden_size = prompt_embeddings.hidden_size;
+    let hidden_size = prefill_input.hidden_size;
     let expected_timestamp_positions = word_list.len() * 2;
     if timestamp_positions.len() != expected_timestamp_positions {
         return Err(
