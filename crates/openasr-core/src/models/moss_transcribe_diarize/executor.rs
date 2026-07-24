@@ -760,6 +760,15 @@ impl MossTdGgmlExecutor {
         // `text` itself is never rewritten either way.
         let segments =
             super::speaker_segments::moss_td_segments_or_degrade(&text, audio_duration_seconds);
+        // MOSS decoder tags are anonymous session turns only. Project them
+        // through the diarizer backend boundary so Voice ID cannot treat Sxx as
+        // Person evidence (no embedding channel here).
+        let diarization_output = super::speaker_segments::moss_td_diarization_output(&segments);
+        debug_assert!(
+            !diarization_output.supports_voice_id_matching(),
+            "MOSS-TD must never advertise Voice ID embedding evidence"
+        );
+        let _ = diarization_output;
         let transcription = Transcription {
             segments,
             text,

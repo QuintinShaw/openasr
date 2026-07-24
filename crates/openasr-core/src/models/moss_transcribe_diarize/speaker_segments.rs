@@ -169,6 +169,8 @@ fn plain_segment(speaker: String, start: f32, end: f32, text: String) -> Segment
         speaker: Some(speaker),
         speaker_label: None,
         speaker_profile_id: None,
+        speaker_person_id: None,
+        speaker_snapshot_label: None,
         words: Vec::new(),
     }
 }
@@ -280,9 +282,41 @@ pub(crate) fn moss_td_segments_or_degrade(text: &str, audio_duration_seconds: f3
             speaker: None,
             speaker_label: None,
             speaker_profile_id: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
             words: Vec::new(),
         }],
     }
+}
+
+/// Project MOSS-TD segments into the shared diarizer backend boundary.
+///
+/// MOSS decoder tags are session-local anonymous turns only. This never attaches
+/// embedding evidence, so Voice ID person matching cannot silently treat `S01`
+/// as a stable Person identity.
+pub(crate) fn moss_td_diarization_output(
+    segments: &[Segment],
+) -> crate::diarize::voice_id::DiarizationOutput {
+    use crate::diarize::contract::{SpeakerId, SpeakerTurn, TimeRange};
+    use crate::diarize::voice_id::DiarizationOutput;
+
+    let mut turns = Vec::new();
+    for segment in segments {
+        let Some(label) = segment.speaker.as_deref() else {
+            continue;
+        };
+        // SPEAKER_NN labels produced by this parser.
+        let number = label
+            .strip_prefix("SPEAKER_")
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(0);
+        turns.push(SpeakerTurn {
+            range: TimeRange::new(segment.start as f64, segment.end as f64),
+            speaker: SpeakerId(number),
+            overlap: false,
+        });
+    }
+    DiarizationOutput::moss_anonymous(turns)
 }
 
 #[cfg(test)]
@@ -434,6 +468,8 @@ mod tests {
                 speaker: None,
                 speaker_label: None,
                 speaker_profile_id: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
                 words: Vec::new(),
             }]
         );
@@ -460,6 +496,10 @@ mod tests {
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].speaker.as_deref(), Some("SPEAKER_01"));
         assert_eq!(segments[1].speaker.as_deref(), Some("SPEAKER_02"));
+        let output = moss_td_diarization_output(&segments);
+        assert!(!output.supports_voice_id_matching());
+        assert!(output.optional_embedding_evidence.is_none());
+        assert_eq!(output.anonymous_turns.len(), 2);
     }
 
     /// Documented inherent ambiguity (see the module doc's "Tags are ordinary

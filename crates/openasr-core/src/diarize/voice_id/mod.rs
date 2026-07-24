@@ -4,6 +4,7 @@
 //! prototypes, person-level margin matching, SQLite WAL storage, and conservative
 //! v1 JSON migration. Raw enrollment audio is never retained.
 
+mod backend;
 mod domain;
 mod ids;
 mod matcher;
@@ -14,6 +15,9 @@ mod service;
 mod space;
 mod store;
 
+pub use backend::{
+    DiarizationOutput, DiarizerBackendKind, EmbeddingEvidence, voice_id_evidence_from_output,
+};
 pub use domain::{
     CandidateScope, CaptureContext, ConsentRecord, EnrollmentSample, Person, PersonMatch,
     PersonPrototype, PersonStatus, PersonView, PrototypeMember, SampleEmbedding, SampleQuality,
