@@ -749,10 +749,18 @@ fn mimo_asr_dev_pack_path() -> PathBuf {
 // survives into the assembled longform text. All 5 source segments
 // (EN/ZH/EN/ZH/EN) are present, in order, with no dropped audio; the assembler
 // joins the (already tag-stripped, trimmed) chunk texts with a single space
-// (`longform::assembler` `.join(" ")`), so the two chunk seams surface as a
-// join space -- and the first seam additionally shows a single duplicated "我"
-// (the VAD overlap re-transcribing the boundary word), the same class of seam
-// artifact firered-llm's own longform golden documents.
+// (`longform::assembler` `.join(" ")`) only at the two chunk boundaries. The
+// first chunk covers both source clips 1 and 2 in one continuous decode
+// (English into Chinese with no assembler join in between), so the model's
+// own mid-utterance language switch -- "...your country. " + "今天..." --
+// carries a space, exactly like the single-utterance code-switch golden
+// (`mimo_asr::executor::tests::golden_diff_end_to_end_transcribe_en_zh_mixed_wav`'s
+// `GOLDEN_EN_ZH_MIXED_TEXT`, which asserts the identical "ask not. " + "今天"
+// spacing against the same pack). The real chunk seams are further in: the
+// first seam (inside clip 2's Chinese content) shows a single duplicated "我"
+// (the VAD overlap re-transcribing the boundary word), and the second seam
+// (between "正宗。" and "周末") surfaces the assembler's join space -- the
+// same class of seam artifact firered-llm's own longform golden documents.
 //
 // `concat!` keeps the literal robust to line wrapping: a trailing-`\`
 // continuation eats leading whitespace on the next line, which silently
@@ -760,10 +768,16 @@ fn mimo_asr_dev_pack_path() -> PathBuf {
 // (buggy) form.
 //
 // Confirmed byte-for-byte against a clean-window re-run of this test against
-// the real pack (asserted equal below).
+// the real pack (asserted equal below). Refreshed to add the space after the
+// first "your country." -- the constant's original form predated the
+// decode-graph reuse correctness fix (persistent-arena batched prefill
+// replacing a serial one-token-at-a-time replay), which changed this
+// family's decode path and was never re-verified against this golden
+// afterward; the single-utterance golden above independently confirms a
+// space is the model's real behavior at this kind of language switch.
 const GOLDEN_MIMO_LONGFORM_EN_ZH_TEXT: &str = concat!(
     "And so, my fellow Americans, ask not what your country can do for you. ",
-    "Ask what you can do for your country.",
+    "Ask what you can do for your country. ",
     "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，",
     "听说那里的麻婆豆腐特别正宗。周末的时候，我 我通常会读书或者看一部电影放松一下。",
     "And so, my fellow Americans, ask not what your country can do for you, ",
