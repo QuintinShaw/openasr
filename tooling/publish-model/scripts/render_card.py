@@ -65,6 +65,41 @@ def human_bytes(n: int | None) -> str:
     return f"{gb:.2f} GB" if gb >= 1 else f"{n / 1e6:.0f} MB"
 
 
+def pack_quant_note(quants: list[str]) -> str:
+    """Footnote under the diarize pack table, driven by the catalog quant set."""
+    if quants == ["f32"]:
+        return (
+            "<sub>Single raw-**f32** build: the pure-Rust forward pass consumes f32 directly and the\n"
+            "parity gates assert bit-exact outputs vs the upstream weights, so no integer\n"
+            "quantization is produced.</sub>"
+        )
+    if quants == ["fp16"]:
+        return (
+            "<sub>Single **fp16** build: projection weights ship as fp16; norms/biases and other\n"
+            "parity-sensitive tensors stay f32 inside the pack. No extra public quant tiers.</sub>"
+        )
+    labels = " · ".join(QUANT_METADATA[q].label for q in quants)
+    return f"<sub>Shipped quant tiers: **{labels}**.</sub>"
+
+
+def pack_storage_note(quants: list[str]) -> str:
+    """Body note under the importer snippet for diarize packs."""
+    if quants == ["f32"]:
+        return (
+            "The `.oasr` container is GGUF-backed; every tensor is stored as raw f32 so the\n"
+            "pack round-trips bit-identically against the source weights."
+        )
+    if quants == ["fp16"]:
+        return (
+            "The `.oasr` container is GGUF-backed; projection weights are stored as fp16 while\n"
+            "norms/biases and other parity-sensitive tensors remain f32."
+        )
+    return (
+        "The `.oasr` container is GGUF-backed; each shipped quant stores weights at the\n"
+        "requested precision while parity-sensitive tensors stay f32 where required."
+    )
+
+
 def rtf(v) -> str:
     return f"{v:.2f}×" if isinstance(v, (int, float)) else "n/a"
 
@@ -166,6 +201,8 @@ def main(argv: list[str]) -> int:
         "import_subcommand": catalog["import_subcommand"],
         "upstream_license_link": catalog["license_source"],
         "acknowledgement_block": ack,
+        "pack_quant_note": pack_quant_note(list(catalog["quants"])),
+        "pack_storage_note": pack_storage_note(list(catalog["quants"])),
     }
     for k, v in repl.items():
         text = text.replace("{{" + k + "}}", str(v))

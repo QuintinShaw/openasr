@@ -372,7 +372,7 @@ license_name = "MIT"
 license_source = "https://github.com/PalabraAI/redimnet2/blob/main/LICENSE"
 license_class = "permissive"
 languages = ["en", "zh"]
-quants = ["fp16", "q8_0", "f32"]
+quants = ["fp16"]
 recommended_quant = "fp16"
 upstream_release_date = "2026-03-04"
 # Runtime support landed after the v0.1.23 tag on main (embedder graph +

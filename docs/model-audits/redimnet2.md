@@ -9,7 +9,7 @@
 | Field | Value |
 | --- | --- |
 | Family (`models-core.toml` `family`) | redimnet2 |
-| Models covered | redimnet2-b6-cn (ReDimNet2-B6 CN-enhanced speaker embedder; fp16 / q8_0 / f32 capability pack) |
+| Models covered | redimnet2-b6-cn (ReDimNet2-B6 CN-enhanced speaker embedder; fp16-only capability pack) |
 | Auditor / date | Quintin / 2026-07-24 |
 | Core version + commit audited | main post-#220 (Voice ID v2) + #197 embedder graph + #199 calibration; workspace 0.1.23 on main after the v0.1.23 tag, carrying the runtime |
 | Bench hardware | Apple M1, 16GB, macOS (reference host). Embedder is a short-utterance support pack; ASR RTF/WER cells are Not applicable |
@@ -46,8 +46,8 @@ every consciously skipped optimization on the record.
 | --- | --- | --- |
 | KV cache quantization | Not applicable | No KV cache; embedding is a single feed-forward pass. |
 | Activation precision policy chosen deliberately (f32 vs f16) | Supported | Graph runs f32 activations; pack stores projection weights at the requested quant while norms/biases/ASTP/BN stay f32 (`tooling/redimnet2/convert_redimnet2.py` `is_force_f32`). |
-| Keep-quantized matmul (native Q blocks bound, no load-time dequant; RAM orders q4 < q8 < fp16) | Supported | q8_0 tensors stay quantized in the GGUF pack; runtime uses the ggml quantized matmul path. Shipped tiers: fp16 + q8_0 (+ f32 parity pack). |
-| Quant tiers complete (q4_k / q8_0 / fp16) | Deferred | fp16 + q8_0 (+ f32) ship; q4_k intentionally omitted for a 12.5M speaker net where cosine drift matters more than another size cut. Unlock: measure q4_k same/other-speaker cosine separation on LibriSpeech/AISHELL-4 and only add if separation holds. |
+| Keep-quantized matmul (native Q blocks bound, no load-time dequant; RAM orders q4 < q8 < fp16) | Supported | Converter and runtime still support quantized GGUF matmul paths; the shipped public tier is fp16-only (q8_0/f32 packs withdrawn from the catalog and HF repo). |
+| Quant tiers complete (q4_k / q8_0 / fp16) | Deferred | Public ship is fp16 only. q8_0/f32 were withdrawn (q8 slower and no meaningful size win on this 12.5M net; f32 is a parity/dev pack). q4_k intentionally omitted where cosine drift matters more than another size cut. Unlock: re-evaluate q8_0/q4_k only if same/other-speaker separation and size/speed justify a second public tier. |
 
 ## 3. Memory & data movement
 
@@ -105,7 +105,7 @@ see `docs/design/gpu-weight-placement.md`).
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
 | WER vs fp16 measured for every shipped quant tier | Not applicable | Not an ASR model; quality metric is embedding cosine / same-other speaker separation, not WER. |
-| Model ref alias forms resolve identically everywhere (bare family / `family:canonical` / every `quant_tag_cases.json` alias accepted by CLI and server match logic; covered by the catalog-wide alias matrix test) | Supported | Catalog id `redimnet2-b6-cn` with fp16/q8/f32 suffixes; capability-pack pull path shares the catalog-wide alias matrix. |
+| Model ref alias forms resolve identically everywhere (bare family / `family:canonical` / every `quant_tag_cases.json` alias accepted by CLI and server match logic; covered by the catalog-wide alias matrix test) | Supported | Catalog id `redimnet2-b6-cn` with the shipped fp16 suffix; capability-pack pull path shares the catalog-wide alias matrix. |
 | Golden coverage includes long audio AND a cross-backend parity fixture | Deferred | Short-utterance fixture parity is green (three samples). Long-audio is Not applicable to a segment embedder; cross-backend parity waits on a non-CPU backend (section 7). Unlock: add Metal/CUDA golden once those backends exist. |
 | Official decode parameters honored (suppression, stop tokens, upstream reference settings) | Not applicable | No decode parameters; frontend constants match the upstream TFMelBanks spec (`B6_FRONTEND_SPEC.md`). |
 | Long-audio degradation checked (repetition, drift, truncation) | Not applicable | Stateless per-segment embed; no growing transcript/KV state inside the pack. |
@@ -143,7 +143,7 @@ not auditable without the exact peer version, model build, audio, and machine.
 | Test audio (file, duration, language) | `fixtures/jfk.wav` + zh_sample + en_zh_mixed |
 | Machine (chip, RAM, OS) | Apple M1, 16GB, macOS |
 | Peer numbers (RTF / peak memory / utilization) | Not an RTF race; reference embeddings used for cosine parity |
-| OpenASR numbers (RTF / peak memory / utilization) | Cosine >= 0.9999 vs reference on the three fixtures (f32 pack); fp16/q8 publish packs built from the same converter |
+| OpenASR numbers (RTF / peak memory / utilization) | Cosine >= 0.9999 vs reference on the three fixtures (f32 parity path during bring-up); public ship is the fp16 pack from the same converter |
 
 ## Known dead ends (do not re-litigate)
 
