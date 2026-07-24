@@ -52,8 +52,8 @@ pub(crate) enum BuiltinGgmlExecutionDispatchError {
         "builtin streaming dispatch is missing partial granularity derived from the architecture integration descriptor for '{model_architecture}'"
     )]
     MissingStreamingGranularity { model_architecture: &'static str },
-    #[error("native family integration audit failed: {reason}")]
-    FamilyIntegrationIncomplete { reason: String },
+    #[error("native family runtime wiring validation failed: {reason}")]
+    FamilyWiringInvalid { reason: String },
     #[error("builtin architecture registry failed validation: {error:?}")]
     ArchitectureRegistryInvalid {
         error: OpenAsrArchitectureRegistryError,
@@ -66,11 +66,11 @@ pub(crate) fn build_builtin_ggml_execution_dispatch()
     registry.validate_references().map_err(|error| {
         BuiltinGgmlExecutionDispatchError::ArchitectureRegistryInvalid { error }
     })?;
-    // Touch the force-linked pack-import table so convert entries stay reachable
-    // from a non-test production path (half-wiring a deleted convert fails compile).
+    // Force-link pack-import convert entries and run the in-memory wiring gate.
+    // Never walks the source tree: release binaries have no docs/tooling checkout.
     let _pack_imports = crate::models::pack_import_surface::linked_core_pack_import_symbols();
-    crate::models::family_integration_audit::audit_builtin_native_family_integrations().map_err(
-        |error| BuiltinGgmlExecutionDispatchError::FamilyIntegrationIncomplete {
+    crate::models::family_integration_audit::validate_builtin_runtime_family_wiring().map_err(
+        |error| BuiltinGgmlExecutionDispatchError::FamilyWiringInvalid {
             reason: error.to_string(),
         },
     )?;
@@ -170,6 +170,13 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
     registry.validate_references().map_err(|error| {
         BuiltinGgmlExecutionDispatchError::ArchitectureRegistryInvalid { error }
     })?;
+    // Same in-memory gate as offline dispatch (force-link + registry wiring).
+    let _pack_imports = crate::models::pack_import_surface::linked_core_pack_import_symbols();
+    crate::models::family_integration_audit::validate_builtin_runtime_family_wiring().map_err(
+        |error| BuiltinGgmlExecutionDispatchError::FamilyWiringInvalid {
+            reason: error.to_string(),
+        },
+    )?;
 
     // Streaming executors remain family-implemented, but partial-result
     // granularity is derived from the architecture integration descriptor

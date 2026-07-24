@@ -1887,7 +1887,7 @@ mod tests {
 
     #[test]
     fn native_family_integration_audit_covers_builtins() {
-        crate::models::family_integration_audit::audit_builtin_native_family_integrations()
+        crate::models::family_integration_audit::source_tree_audit::audit_builtin_native_family_integrations()
             .expect("builtin native families must satisfy the integration audit");
     }
 
