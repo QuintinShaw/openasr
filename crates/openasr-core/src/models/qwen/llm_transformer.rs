@@ -2257,6 +2257,83 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         )
     }
 
+    fn sequence_major_prefill_chunk(
+        sequence_major_hidden: &[f32],
+        token_count: usize,
+        n_seq: usize,
+        d_model: usize,
+        position_offset: usize,
+        chunk_tokens: usize,
+    ) -> Result<Vec<f32>, GgmlCpuGraphError> {
+        let chunk_end = position_offset.checked_add(chunk_tokens).ok_or(
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident prefill chunk position overflow",
+            },
+        )?;
+        if n_seq == 0 || chunk_tokens == 0 || chunk_end > token_count {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident prefill chunk span is invalid",
+            });
+        }
+        let per_sequence =
+            token_count
+                .checked_mul(d_model)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill sequence width overflow",
+                })?;
+        let expected =
+            per_sequence
+                .checked_mul(n_seq)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill hidden width overflow",
+                })?;
+        if sequence_major_hidden.len() != expected {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident prefill hidden width mismatch",
+            });
+        }
+        let chunk_width =
+            chunk_tokens
+                .checked_mul(d_model)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill chunk width overflow",
+                })?;
+        let mut chunk = Vec::with_capacity(chunk_width.checked_mul(n_seq).ok_or(
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident prefill chunk allocation overflow",
+            },
+        )?);
+        for sequence_index in 0..n_seq {
+            let sequence_start = sequence_index.checked_mul(per_sequence).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill sequence offset overflow",
+                },
+            )?;
+            let token_start = position_offset.checked_mul(d_model).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill token offset overflow",
+                },
+            )?;
+            let start = sequence_start.checked_add(token_start).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill chunk start overflow",
+                },
+            )?;
+            let end =
+                start
+                    .checked_add(chunk_width)
+                    .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder resident prefill chunk end overflow",
+                    })?;
+            chunk.extend_from_slice(sequence_major_hidden.get(start..end).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill chunk slice is out of bounds",
+                },
+            )?);
+        }
+        Ok(chunk)
+    }
+
     pub(crate) fn run_prefill_into_reused_batched(
         &mut self,
         sequence_major_hidden: &[f32],
@@ -2271,42 +2348,29 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 reason: "whole-decoder resident prefill token count must be positive",
             });
         }
-        let hidden_per_token =
-            self.dims
-                .d_model
-                .checked_mul(n_seq)
-                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "whole-decoder resident prefill hidden width overflow",
-                })?;
         let mut final_step = None;
         for position_offset in (0..token_count).step_by(RESIDENT_PREFILL_MAX_QUERY_TOKENS) {
             let chunk_tokens =
                 (token_count - position_offset).min(RESIDENT_PREFILL_MAX_QUERY_TOKENS);
-            let chunk_start = position_offset.checked_mul(hidden_per_token).ok_or(
-                GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "whole-decoder resident prefill chunk offset overflow",
-                },
+            let chunk_hidden = Self::sequence_major_prefill_chunk(
+                sequence_major_hidden,
+                token_count,
+                n_seq,
+                self.dims.d_model,
+                position_offset,
+                chunk_tokens,
             )?;
-            let chunk_len = chunk_tokens.checked_mul(hidden_per_token).ok_or(
-                GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "whole-decoder resident prefill chunk width overflow",
-                },
-            )?;
-            let chunk_hidden = sequence_major_hidden
-                .get(chunk_start..chunk_start + chunk_len)
-                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "whole-decoder resident prefill chunk slice is out of bounds",
-                })?;
+            let is_final_chunk = position_offset.checked_add(chunk_tokens) == Some(token_count);
             let step = self.run_prefill_chunk_into_reused_batched(
-                chunk_hidden,
+                &chunk_hidden,
                 chunk_tokens,
                 n_seq,
                 position_offset,
                 max_positions,
                 rope_theta,
-                position_offset + chunk_tokens == token_count,
+                is_final_chunk,
             )?;
-            if position_offset + chunk_tokens == token_count {
+            if is_final_chunk {
                 final_step = Some(step);
             }
         }
@@ -4587,6 +4651,43 @@ mod tests {
     const QWEN_PREFILL_REAL_PACK_ENV: &str = "OPENASR_QWEN_PREFILL_REAL_PACK";
     const QWEN_PREFILL_TOKENS_ENV: &str = "OPENASR_QWEN_PREFILL_TOKENS";
     const QWEN_PREFILL_CHUNK_TOKENS_ENV: &str = "OPENASR_QWEN_PREFILL_CHUNK_TOKENS";
+
+    #[test]
+    fn resident_prefill_chunk_preserves_each_sequence_token_span() {
+        const D_MODEL: usize = 2;
+        for n_seq in [2, 3] {
+            for token_count in [1, 255, 256, 257, 513] {
+                let values = (0..n_seq * token_count * D_MODEL)
+                    .map(|value| value as f32)
+                    .collect::<Vec<_>>();
+                for position_offset in (0..token_count).step_by(256) {
+                    let chunk_tokens = (token_count - position_offset).min(256);
+                    let actual =
+                        Qwen3AsrLlmWholeDecoderGraphExecutor::sequence_major_prefill_chunk(
+                            &values,
+                            token_count,
+                            n_seq,
+                            D_MODEL,
+                            position_offset,
+                            chunk_tokens,
+                        )
+                        .expect("valid sequence-major chunk");
+                    let expected = (0..n_seq)
+                        .flat_map(|sequence_index| {
+                            let start = (sequence_index * token_count + position_offset) * D_MODEL;
+                            values[start..start + chunk_tokens * D_MODEL]
+                                .iter()
+                                .copied()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual, expected,
+                        "n_seq={n_seq}, token_count={token_count}, offset={position_offset}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn qwen_llm_native_gqa_default_is_on_for_cpu_metal_off_for_gpu() {
