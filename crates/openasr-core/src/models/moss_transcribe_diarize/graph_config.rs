@@ -12,9 +12,7 @@
 //! 3-min clips, so the descriptor is `AllBackends` (Auto may pick Metal on
 //! Apple Silicon). Keep this file wired to the descriptor policy so a future
 //! pin cannot silently drift from the encoder path.
-use crate::arch::{
-    MOSS_TD_GGML_ARCHITECTURE_ID, family_auto_gpu_policy_for_model_architecture,
-};
+use crate::arch::{MOSS_TD_GGML_ARCHITECTURE_ID, family_auto_gpu_policy_for_model_architecture};
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig};
 use crate::models::graph_runtime_config::{
     ModelMetalRuntimeOverrides, configure_model_runtime_graph_config_from_env,
