@@ -431,6 +431,7 @@ unsafe extern "C" {
     pub(crate) fn ggml_nelements(tensor: GgmlTensorRaw) -> i64;
     pub(crate) fn ggml_is_transposed(tensor: GgmlTensorRaw) -> bool;
     pub(crate) fn ggml_is_contiguous(tensor: GgmlTensorRaw) -> bool;
+    pub(crate) fn ggml_is_contiguous_rows(tensor: GgmlTensorRaw) -> bool;
     pub(crate) fn ggml_reshape_2d(
         ctx: GgmlContextRaw,
         a: GgmlTensorRaw,

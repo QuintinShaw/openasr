@@ -1630,15 +1630,6 @@ where
         (q_flash, k_new, v_new)
     } else {
         let q = graph
-            .cont(q)
-            .map_err(|source| map_err("llm_q_query_seq_cont", source))?;
-        let k = graph
-            .cont(k)
-            .map_err(|source| map_err("llm_k_query_seq_cont", source))?;
-        let v = graph
-            .cont(v)
-            .map_err(|source| map_err("llm_v_query_seq_cont", source))?;
-        let q = graph
             .reshape_4d(q, head_dim, config.q_heads, token_count, n_seq)
             .map_err(|source| map_err("llm_q_query_seq_reshape4d", source))?;
         let k = graph
@@ -1661,17 +1652,6 @@ where
     let q_flash = graph
         .cont(q_flash)
         .map_err(|source| map_err("llm_q_cont", source))?;
-    let (k_new, v_new) = if token_count == 1 {
-        (k_new, v_new)
-    } else {
-        let k_new = graph
-            .cont(k_new)
-            .map_err(|source| map_err("llm_k_set_rows_cont", source))?;
-        let v_new = graph
-            .cont(v_new)
-            .map_err(|source| map_err("llm_v_set_rows_cont", source))?;
-        (k_new, v_new)
-    };
     let k_full = graph
         .set_rows(kv.key_history, k_new, kv.row_indices)
         .map_err(|source| map_err("llm_k_set_rows", source))?;
