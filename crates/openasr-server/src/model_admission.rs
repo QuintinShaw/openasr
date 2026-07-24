@@ -203,6 +203,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn panic_unwinds_and_releases_its_permit() {
+        let admission = admission(1);
+        let panic_admission = admission.clone();
+        let result = std::thread::spawn(move || {
+            let _permit = panic_admission
+                .try_acquire("native:whisper-small@pack-a")
+                .unwrap();
+            panic!("test panic after model admission");
+        })
+        .join();
+
+        assert!(result.is_err());
+        assert!(admission.try_acquire("native:whisper-small@pack-a").is_ok());
+    }
+
     #[tokio::test]
     async fn aborted_owner_releases_its_permit() {
         let admission = admission(1);
