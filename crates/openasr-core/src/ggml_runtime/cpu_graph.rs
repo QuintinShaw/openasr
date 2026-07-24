@@ -959,6 +959,13 @@ pub enum GgmlCpuGraphError {
         "ggml_flash_attn_rel_pos is CPU-only; backend={backend:?} must keep the naive mul_mat + rel_shift fallback"
     )]
     FlashAttnRelPosCpuOnly { backend: GgmlCpuGraphBackend },
+    /// Cooperative cancel observed between multi-chunk graph computes (Rust
+    /// L1.2 prefill/encoder chunk boundaries). Distinct from a hard
+    /// `ComputeFailed` so callers can map it to
+    /// [`crate::BackendError::TranscriptionCanceled`]. Pause is intentionally
+    /// not handled here -- pause stays at the long-form slice boundary.
+    #[error("ggml graph compute canceled by transcription control")]
+    Canceled,
 }
 
 pub struct GgmlCpuGraphRunner {

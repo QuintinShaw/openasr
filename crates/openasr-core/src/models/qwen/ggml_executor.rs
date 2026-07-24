@@ -38,7 +38,9 @@ use crate::arch::shape_orchestrator::{
     LayerCountResolver, OpenAsrStageRole, StageBuildPlan, validate_stage_against_descriptor,
 };
 use crate::arch::{OpenAsrArchitectureRegistry, QWEN3_ASR_GGML_ARCHITECTURE_ID};
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, env_var_truthy};
+use crate::ggml_runtime::{
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, env_var_truthy,
+};
 use crate::models::decode_policy_component_registry::{
     BuiltinSeq2SeqDecodePolicyConfigInput, build_builtin_seq2seq_decode_policy_config,
     resolve_builtin_decode_policy,
@@ -963,9 +965,17 @@ impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor {
     > {
         if !self.consumed_prefill_step && input.step_index == 0 && input.generated_tokens.is_empty()
         {
+            // Preserve typed cancel from the prefill chunk loop so the shared
+            // greedy driver (and dispatch_error_to_backend) see Canceled, not a
+            // generic DecoderStepFailed.
             let logits = self.prefill_prompt_and_compute_last_logits().map_err(|error| {
-                crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::DecoderStepFailed {
-                    reason: error.to_string(),
+                match error {
+                    Qwen3AsrGreedyDecodeError::Canceled => {
+                        crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::Canceled
+                    }
+                    other => crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::DecoderStepFailed {
+                        reason: other.to_string(),
+                    },
                 }
             })?;
             self.consumed_prefill_step = true;
@@ -1022,6 +1032,27 @@ impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor {
     }
 }
 
+/// Poll the active transcription control at a host-cache prefill chunk
+/// boundary. Distinct from a graph/compute failure so cancel maps to
+/// [`crate::BackendError::TranscriptionCanceled`] end-to-end.
+fn ensure_prefill_chunk_not_canceled() -> Result<(), Qwen3AsrGreedyDecodeError> {
+    if crate::api::backend::current_transcription_control()
+        .is_some_and(|control| control.is_canceled())
+    {
+        return Err(Qwen3AsrGreedyDecodeError::Canceled);
+    }
+    Ok(())
+}
+
+fn map_prefill_graph_error(error: GgmlCpuGraphError) -> Qwen3AsrGreedyDecodeError {
+    match error {
+        GgmlCpuGraphError::Canceled => Qwen3AsrGreedyDecodeError::Canceled,
+        other => Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+            reason: other.to_string(),
+        },
+    }
+}
+
 impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
     fn prefill_prompt_and_compute_last_logits(
         &mut self,
@@ -1057,9 +1088,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
                 &self.layer_kv_caches,
                 1_000_000.0,
             )
-            .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                reason: error.to_string(),
-            })?
+            .map_err(map_prefill_graph_error)?
         {
             self.cache_prompt_tokens = token_count;
             qwen_decode_profile_log_opt("prefill_prompt_resident_bulk", resident_started_at);
@@ -1101,9 +1130,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
                 token_count,
                 1_000_000.0,
             )
-            .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                reason: error.to_string(),
-            })?;
+            .map_err(map_prefill_graph_error)?;
         qwen_decode_profile_log_prefill_chunk(0, token_count, profile_started_at);
         let result = self.write_prefill_step_outputs_and_compute_last_logits(token_count, step);
         qwen_decode_profile_log_opt("prefill_prompt_bulk_host", profile_started_at);
@@ -1130,9 +1157,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
                     token_count,
                     1_000_000.0,
                 )
-                .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                    reason: error.to_string(),
-                })?;
+                .map_err(map_prefill_graph_error)?;
             qwen_decode_profile_log_prefill_chunk(0, token_count, chunk_started_at);
             let result = self.write_prefill_step_outputs_and_compute_last_logits(token_count, step);
             qwen_decode_profile_log_opt("prefill_prompt_chunked", profile_started_at);
@@ -1143,6 +1168,8 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
         let mut position_offset = 0usize;
         let mut final_hidden = None;
         while position_offset < token_count {
+            // L1.2 cooperative cancel between host-cache prefill chunks.
+            ensure_prefill_chunk_not_canceled()?;
             let remaining = token_count - position_offset;
             let chunk_len = if require_even_chunks {
                 super::even_prefill_chunk_len(remaining, chunk_size)
@@ -1180,9 +1207,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
                     &self.layer_kv_caches,
                     1_000_000.0,
                 )
-                .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                    reason: error.to_string(),
-                })?;
+                .map_err(map_prefill_graph_error)?;
             qwen_decode_profile_log_prefill_chunk(position_offset, chunk_len, chunk_started_at);
             final_hidden =
                 Some(self.write_prefill_chunk_outputs(position_offset, chunk_len, step)?);
@@ -1890,6 +1915,80 @@ mod tests {
             "QWEN3_ASR_AB backend={backend_preference:?} audio={audio_duration_seconds:.2}s \
              elapsed={elapsed:?} RTF={rtf:.3} text={}",
             result.transcription.text
+        );
+    }
+
+    #[test]
+    fn prefill_chunk_cancel_poll_returns_typed_canceled() {
+        use std::sync::Arc;
+
+        use crate::api::backend::{TranscriptionControl, install_active_transcription_control};
+        use crate::ggml_runtime::GgmlCpuGraphError;
+
+        // No control installed: poll is a no-op.
+        assert!(super::ensure_prefill_chunk_not_canceled().is_ok());
+
+        let control = Arc::new(TranscriptionControl::new());
+        let _guard = install_active_transcription_control(Arc::clone(&control));
+        assert!(super::ensure_prefill_chunk_not_canceled().is_ok());
+        control.request_cancel();
+        assert_eq!(
+            super::ensure_prefill_chunk_not_canceled(),
+            Err(super::Qwen3AsrGreedyDecodeError::Canceled)
+        );
+        // Graph-level cancel maps to the same typed family error.
+        assert_eq!(
+            super::map_prefill_graph_error(GgmlCpuGraphError::Canceled),
+            super::Qwen3AsrGreedyDecodeError::Canceled
+        );
+        // Stable marker used by dispatch_error_to_backend.
+        assert!(
+            super::Qwen3AsrGreedyDecodeError::Canceled
+                .to_string()
+                .contains("canceled by transcription control")
+        );
+    }
+
+    #[test]
+    fn prefill_chunk_loop_harness_stops_between_chunks_on_cancel() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::api::backend::{TranscriptionControl, install_active_transcription_control};
+
+        // Lightweight stand-in for the host-cache chunk walk: each "chunk" is a
+        // pure counter bump with the same cancel poll the production loop uses.
+        // Cancel after the second chunk completes; the third poll must abort
+        // before another chunk runs.
+        let control = Arc::new(TranscriptionControl::new());
+        let _guard = install_active_transcription_control(Arc::clone(&control));
+        let chunks_run = AtomicUsize::new(0);
+        let token_count = 12usize;
+        let chunk_size = 4usize;
+        let mut position_offset = 0usize;
+        let mut canceled = false;
+        while position_offset < token_count {
+            if let Err(error) = super::ensure_prefill_chunk_not_canceled() {
+                assert_eq!(error, super::Qwen3AsrGreedyDecodeError::Canceled);
+                canceled = true;
+                break;
+            }
+            let chunk_len = (token_count - position_offset).min(chunk_size);
+            let seen = chunks_run.fetch_add(1, Ordering::SeqCst) + 1;
+            if seen == 2 {
+                control.request_cancel();
+            }
+            position_offset = position_offset.saturating_add(chunk_len);
+        }
+        assert!(canceled, "cancel must abort the harness loop");
+        assert_eq!(
+            chunks_run.load(Ordering::SeqCst),
+            2,
+            "exactly two chunks should run before the next boundary poll aborts"
+        );
+        assert!(
+            position_offset < token_count,
+            "cancel must leave residual tokens unprocessed"
         );
     }
 }

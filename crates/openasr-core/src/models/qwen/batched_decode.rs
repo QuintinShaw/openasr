@@ -101,6 +101,11 @@ pub(super) enum Qwen3AsrServeBatchError {
     OwnerFailed { reason: String },
     #[error("qwen serve batch decode failed: {reason}")]
     DecodeFailed { reason: String },
+    /// Cooperative cancel observed between prefill chunks. Display text carries
+    /// the stable "canceled by transcription control" marker so
+    /// `dispatch_error_to_backend` rewrites to `TranscriptionCanceled`.
+    #[error("qwen serve batch canceled by transcription control")]
+    Canceled,
 }
 
 impl Qwen3AsrServeBatchError {
@@ -114,6 +119,28 @@ impl Qwen3AsrServeBatchError {
             Self::OwnerDisconnected | Self::ReplyTimedOut => Some(false),
             _ => None,
         }
+    }
+}
+
+/// Poll the active transcription control at a serve-batch prefill chunk
+/// boundary. Typed `Canceled` keeps cancel off the generic decode-failed path.
+fn ensure_serve_batch_prefill_not_canceled() -> Result<(), Qwen3AsrServeBatchError> {
+    if crate::api::backend::current_transcription_control()
+        .is_some_and(|control| control.is_canceled())
+    {
+        return Err(Qwen3AsrServeBatchError::Canceled);
+    }
+    Ok(())
+}
+
+fn map_serve_batch_graph_error(
+    error: crate::ggml_runtime::GgmlCpuGraphError,
+) -> Qwen3AsrServeBatchError {
+    match error {
+        crate::ggml_runtime::GgmlCpuGraphError::Canceled => Qwen3AsrServeBatchError::Canceled,
+        other => Qwen3AsrServeBatchError::DecodeFailed {
+            reason: other.to_string(),
+        },
     }
 }
 
@@ -860,6 +887,8 @@ impl Qwen3AsrOwnerThreadState {
         let mut position_offset = 0usize;
         let mut final_hidden_by_sequence = vec![None; n_seq];
         while position_offset < token_count {
+            // L1.2 cooperative cancel between multi-query prefill chunks.
+            ensure_serve_batch_prefill_not_canceled()?;
             let remaining = token_count - position_offset;
             let chunk_len = if require_even_chunks {
                 super::even_prefill_chunk_len(remaining, chunk_size)
@@ -914,9 +943,7 @@ impl Qwen3AsrOwnerThreadState {
                         &layer_cache_refs,
                         QWEN_ROPE_THETA,
                     )
-                    .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
-                        reason: error.to_string(),
-                    })?
+                    .map_err(map_serve_batch_graph_error)?
             };
             for (sequence_index, &entry_index) in group.iter().enumerate() {
                 let final_hidden = entries[entry_index]
@@ -1557,9 +1584,7 @@ impl Qwen3AsrBatchSlot {
                     token_count,
                     QWEN_ROPE_THETA,
                 )
-                .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
-                    reason: error.to_string(),
-                })?;
+                .map_err(map_serve_batch_graph_error)?;
             return self.write_prefill_step_outputs(token_count, step);
         }
         let hidden_size = self.job.llm_prefill_input.hidden_size;
@@ -1567,6 +1592,8 @@ impl Qwen3AsrBatchSlot {
         let mut position_offset = 0usize;
         let mut final_hidden = None;
         while position_offset < token_count {
+            // L1.2 cooperative cancel between single-slot host-cache chunks.
+            ensure_serve_batch_prefill_not_canceled()?;
             let remaining = token_count - position_offset;
             let chunk_len = if require_even_chunks {
                 super::even_prefill_chunk_len(remaining, chunk_size)
@@ -1602,9 +1629,7 @@ impl Qwen3AsrBatchSlot {
                     &self.layer_kv_caches,
                     QWEN_ROPE_THETA,
                 )
-                .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
-                    reason: error.to_string(),
-                })?;
+                .map_err(map_serve_batch_graph_error)?;
             final_hidden =
                 Some(self.write_prefill_chunk_outputs(position_offset, chunk_len, step)?);
             position_offset = total_token_count;
@@ -1632,6 +1657,9 @@ impl Qwen3AsrBatchSlot {
         let token_count = self.job.llm_prefill_input.token_count;
         let mut final_hidden = None;
         for token_position in 0..token_count {
+            // Serial host-step prefill is the chunk-size-1 fallback; poll the
+            // same cancel boundary so cancel does not wait for the full prompt.
+            ensure_serve_batch_prefill_not_canceled()?;
             let hidden = self.prefill_prompt_hidden_at(token_position)?;
             let step = decoder
                 .run_step(
@@ -1640,9 +1668,7 @@ impl Qwen3AsrBatchSlot {
                     &self.layer_kv_caches,
                     QWEN_ROPE_THETA,
                 )
-                .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
-                    reason: error.to_string(),
-                })?;
+                .map_err(map_serve_batch_graph_error)?;
             for (layer_index, (projected_k, projected_v)) in step.layer_kv.iter().enumerate() {
                 self.layer_kv_caches[layer_index]
                     .write(token_position, projected_k, projected_v)
@@ -2749,5 +2775,70 @@ mod tests {
         assert_qwen_selected_backend_direct_for_real_pack_harness();
         let fixture = load_qwen_serve_batch_real_pack_fixture();
         assert_qwen_generated_host_kv_replay(&fixture);
+    }
+
+    #[test]
+    fn serve_batch_prefill_cancel_poll_returns_typed_canceled() {
+        use std::sync::Arc;
+
+        use crate::api::backend::{TranscriptionControl, install_active_transcription_control};
+        use crate::ggml_runtime::GgmlCpuGraphError;
+
+        assert!(super::ensure_serve_batch_prefill_not_canceled().is_ok());
+
+        let control = Arc::new(TranscriptionControl::new());
+        let _guard = install_active_transcription_control(Arc::clone(&control));
+        assert!(super::ensure_serve_batch_prefill_not_canceled().is_ok());
+        control.request_cancel();
+        assert!(matches!(
+            super::ensure_serve_batch_prefill_not_canceled(),
+            Err(Qwen3AsrServeBatchError::Canceled)
+        ));
+        assert!(matches!(
+            super::map_serve_batch_graph_error(GgmlCpuGraphError::Canceled),
+            Qwen3AsrServeBatchError::Canceled
+        ));
+        assert!(
+            Qwen3AsrServeBatchError::Canceled
+                .to_string()
+                .contains("canceled by transcription control")
+        );
+        // Cancel is not a transient serve-batch unavailable class.
+        assert_eq!(
+            Qwen3AsrServeBatchError::Canceled.unavailable_retryable(),
+            None
+        );
+    }
+
+    #[test]
+    fn serve_batch_prefill_chunk_loop_harness_stops_between_chunks_on_cancel() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::api::backend::{TranscriptionControl, install_active_transcription_control};
+
+        let control = Arc::new(TranscriptionControl::new());
+        let _guard = install_active_transcription_control(Arc::clone(&control));
+        let chunks_run = AtomicUsize::new(0);
+        let token_count = 10usize;
+        let chunk_size = 3usize;
+        let mut position_offset = 0usize;
+        let mut canceled = false;
+        while position_offset < token_count {
+            if let Err(error) = super::ensure_serve_batch_prefill_not_canceled() {
+                assert!(matches!(error, Qwen3AsrServeBatchError::Canceled));
+                canceled = true;
+                break;
+            }
+            let chunk_len = (token_count - position_offset).min(chunk_size);
+            let seen = chunks_run.fetch_add(1, Ordering::SeqCst) + 1;
+            if seen == 2 {
+                control.request_cancel();
+            }
+            position_offset = position_offset.saturating_add(chunk_len);
+        }
+        assert!(canceled);
+        assert_eq!(chunks_run.load(Ordering::SeqCst), 2);
+        assert!(position_offset < token_count);
     }
 }

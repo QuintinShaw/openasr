@@ -2395,6 +2395,14 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         }
         let mut final_step = None;
         for position_offset in (0..token_count).step_by(RESIDENT_PREFILL_MAX_QUERY_TOKENS) {
+            // L1.2 cooperative cancel: poll between resident prefill chunks so
+            // stop lands at a chunk boundary instead of waiting for the whole
+            // prompt bulk (or the long-form slice boundary). Pause stays L0-only.
+            if crate::api::backend::current_transcription_control()
+                .is_some_and(|control| control.is_canceled())
+            {
+                return Err(GgmlCpuGraphError::Canceled);
+            }
             let chunk_tokens =
                 (token_count - position_offset).min(RESIDENT_PREFILL_MAX_QUERY_TOKENS);
             let chunk_hidden = Self::sequence_major_prefill_chunk(
