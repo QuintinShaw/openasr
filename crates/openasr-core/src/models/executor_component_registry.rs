@@ -209,51 +209,24 @@ mod tests {
     }
 
     #[test]
-    fn builtin_executor_phrase_bias_expectations_cover_all_builtins() {
-        let expected_by_family = BTreeMap::from([
-            ("cohere-transcribe", true),
-            ("whisper", true),
-            (crate::QWEN3_ASR_MODEL_FAMILY, true),
-            ("parakeet-ctc", true),
-            ("parakeet-tdt", false),
-            ("wav2vec2-ctc", true),
-            (crate::MOONSHINE_MODEL_FAMILY, true),
-            (crate::arch::XASR_ZIPFORMER_MODEL_FAMILY, false),
-            (crate::arch::DOLPHIN_MODEL_FAMILY, true),
-            (crate::arch::SENSEVOICE_MODEL_FAMILY, true),
-            (crate::arch::FIRERED_AED_MODEL_FAMILY, false),
-            (crate::arch::FIRERED_LLM_MODEL_FAMILY, false),
-            (crate::arch::MIMO_ASR_MODEL_FAMILY, false),
-            (crate::arch::MOSS_TD_MODEL_FAMILY, false),
-        ]);
+    fn builtin_executor_phrase_bias_matches_architecture_manifest() {
         let executors =
             materialize_builtin_executors_by_model_architecture().expect("executor map");
-        let mut seen_families = std::collections::BTreeSet::new();
 
         for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
-            let expected = expected_by_family
-                .get(descriptor.model_family)
-                .copied()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing phrase-bias expectation for builtin family '{}'",
-                        descriptor.model_family
-                    )
-                });
             let executor = executors
                 .get(descriptor.model_architecture)
                 .unwrap_or_else(|| {
                     panic!(
-                        "missing materialized executor for builtin architecture '{}'",
-                        descriptor.model_architecture
+                        "missing materialized executor for builtin family '{}' ({})",
+                        descriptor.model_family, descriptor.model_architecture
                     )
                 });
-            seen_families.insert(descriptor.model_family);
 
             assert_eq!(
                 executor.supports_phrase_bias(),
-                expected,
-                "builtin family '{}' ({}) phrase-bias capability must come from its executor",
+                descriptor.integration.supports_phrase_bias,
+                "family '{}' ({}) executor phrase-bias capability disagrees with its architecture manifest",
                 descriptor.model_family,
                 descriptor.model_architecture
             );
@@ -261,18 +234,12 @@ mod tests {
                 builtin_executor_supports_phrase_bias_for_model_architecture(
                     descriptor.model_architecture
                 ),
-                Some(expected),
-                "builtin family '{}' ({}) registry lookup must report the explicit expectation",
+                Some(descriptor.integration.supports_phrase_bias),
+                "family '{}' ({}) registry lookup must expose the manifest capability",
                 descriptor.model_family,
                 descriptor.model_architecture
             );
         }
-
-        let expected_families = expected_by_family.keys().copied().collect();
-        assert_eq!(
-            seen_families, expected_families,
-            "phrase-bias expectation table must not contain stale builtin families"
-        );
     }
 
     // Phase 1 shared-executor regression coverage: qwen / cohere / whisper /

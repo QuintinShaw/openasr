@@ -4,7 +4,10 @@ use thiserror::Error;
 
 use crate::GgmlAsrExecutionDispatch;
 use crate::StreamingPartialGranularity;
-use crate::arch::{OpenAsrArchitectureRegistry, OpenAsrArchitectureRegistryError};
+use crate::arch::{
+    OpenAsrArchitectureRegistry, OpenAsrArchitectureRegistryError,
+    OpenAsrStreamingPartialGranularity,
+};
 
 use super::dolphin::executor::DolphinGgmlExecutor;
 use super::executor_component_registry::{
@@ -39,6 +42,13 @@ pub(crate) enum BuiltinGgmlExecutionDispatchError {
         "builtin streaming dispatch is missing a streaming executor for ASR architecture '{model_architecture}' (every registered family must declare one so realtime cadence stays descriptor-driven)"
     )]
     MissingStreamingExecutor { model_architecture: &'static str },
+    #[error(
+        "builtin streaming dispatch partial granularity disagrees with the architecture manifest for '{model_architecture}': expected {expected:?}"
+    )]
+    StreamingGranularityMismatch {
+        model_architecture: &'static str,
+        expected: OpenAsrStreamingPartialGranularity,
+    },
     #[error("builtin architecture registry failed validation: {error:?}")]
     ArchitectureRegistryInvalid {
         error: OpenAsrArchitectureRegistryError,
@@ -236,6 +246,22 @@ pub(crate) fn build_builtin_ggml_streaming_execution_dispatch()
             return Err(
                 BuiltinGgmlExecutionDispatchError::MissingStreamingExecutor {
                     model_architecture: descriptor.model_architecture,
+                },
+            );
+        }
+        let architecture = registry
+            .find_by_model_architecture(descriptor.model_architecture)
+            .expect("family registry is derived from architecture registry");
+        let is_frame_sync = dispatch.is_frame_sync_for(descriptor);
+        let manifest_declares_frame_sync = matches!(
+            architecture.integration.streaming_partial_granularity,
+            OpenAsrStreamingPartialGranularity::FrameSync
+        );
+        if is_frame_sync != manifest_declares_frame_sync {
+            return Err(
+                BuiltinGgmlExecutionDispatchError::StreamingGranularityMismatch {
+                    model_architecture: descriptor.model_architecture,
+                    expected: architecture.integration.streaming_partial_granularity,
                 },
             );
         }
@@ -451,10 +477,24 @@ mod tests {
             build_builtin_ggml_streaming_execution_dispatch().expect("builtin streaming dispatch");
         let family_registry =
             crate::models::ggml_family_registry::GgmlFamilyRegistry::with_builtin_adapters();
+        let architecture_registry = OpenAsrArchitectureRegistry::with_builtins();
         for descriptor in family_registry.descriptors() {
             assert!(
                 dispatch.has_streaming_executor_for(descriptor),
                 "family '{}' ({}) has no streaming executor",
+                descriptor.adapter_id,
+                descriptor.model_architecture,
+            );
+            let architecture = architecture_registry
+                .find_by_model_architecture(descriptor.model_architecture)
+                .expect("family registry is derived from architecture registry");
+            assert_eq!(
+                dispatch.is_frame_sync_for(descriptor),
+                matches!(
+                    architecture.integration.streaming_partial_granularity,
+                    OpenAsrStreamingPartialGranularity::FrameSync
+                ),
+                "family '{}' ({}) streaming partial granularity disagrees with its architecture manifest",
                 descriptor.adapter_id,
                 descriptor.model_architecture,
             );
