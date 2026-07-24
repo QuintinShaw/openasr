@@ -3420,7 +3420,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         )?;
         self.ensure_tensor_type(src, ffi::GGML_TYPE_F32, "ggml_set_rows src")?;
         self.ensure_tensor_type(row_indices, ffi::GGML_TYPE_I32, "ggml_set_rows indices")?;
-        self.ensure_tensor_contiguous(src, "ggml_set_rows src")?;
+        self.ensure_tensor_rowwise_contiguous(src, "ggml_set_rows src")?;
         self.ensure_tensor_contiguous(row_indices, "ggml_set_rows indices")?;
         self.ensure_set_rows_compatible(dst, src, row_indices)?;
         let raw = unsafe {
@@ -4571,6 +4571,22 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             });
         }
         Ok(())
+    }
+
+    fn ensure_tensor_rowwise_contiguous(
+        &self,
+        tensor: GgmlCpuTensor<'a>,
+        step: &'static str,
+    ) -> Result<(), GgmlCpuGraphError> {
+        if unsafe { ffi::ggml_is_contiguous_rows(tensor.raw.as_ptr()) } {
+            return Ok(());
+        }
+        Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: match step {
+                "ggml_set_rows src" => "ggml_set_rows src requires contiguous tensor rows",
+                _ => "operation requires contiguous tensor rows",
+            },
+        })
     }
 
     fn ensure_tensor_contiguous_rows(

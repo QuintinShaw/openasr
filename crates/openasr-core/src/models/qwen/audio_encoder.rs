@@ -432,12 +432,6 @@ fn encode_qwen3_audio_embeddings_with_graph<'a>(
         }
     })?;
     state = graph
-        .cont(state)
-        .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
-            step: "ggml_cont(audio_positional)",
-            source,
-        })?;
-    state = graph
         .reshape_2d(state, metadata.audio_d_model, chunked_mel.row_count)
         .map_err(|source| Qwen3AsrAudioEncoderError::GraphBuildFailed {
             step: "ggml_reshape_2d(audio_sequence)",

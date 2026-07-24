@@ -772,9 +772,6 @@ where
             .add(scores, mask)
             .map_err(|source| map_err("ggml_add(attn_mask)", source))?;
         let scores = graph
-            .cont(scores)
-            .map_err(|source| map_err("ggml_cont(attn_scores)", source))?;
-        let scores = graph
             .soft_max_ext(scores, None, scale, 0.0)
             .map_err(|source| map_err("ggml_soft_max_ext(attn_probs)", source))?;
         attention_context_from_probs(
