@@ -1709,6 +1709,7 @@ fn realtime_capabilities_for_native_runtime_come_from_model_pack() {
     write_mock_gguf_runtime_source(&pack_root, Some("whisper-large-v3-turbo"));
     let runtime = ServerRuntime {
         backend: BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
@@ -1761,6 +1762,7 @@ fn native_server_runtime_rejects_directory_runtime_source() {
     std::fs::create_dir_all(&pack_root).unwrap();
     let runtime = ServerRuntime {
         backend: BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
@@ -2195,6 +2197,7 @@ fn native_server_runtime_rejects_non_gguf_runtime_source_file() {
     std::fs::write(&pack_path, b"not a directory").unwrap();
     let runtime = ServerRuntime {
         backend: BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
@@ -2210,6 +2213,7 @@ fn native_server_runtime_rejects_directory_runtime_source_without_file_fallback(
     std::fs::create_dir_all(&pack_root).unwrap();
     let runtime = ServerRuntime {
         backend: BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
@@ -2227,12 +2231,13 @@ async fn native_transcribe_stays_fail_closed_with_local_pack_only_validation() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
     let runtime = ServerRuntime {
         backend: BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_root),
     };
     let request = TranscriptionRequest::new(sample_wav, "whisper-large-v3-turbo");
-    let error = transcribe_with_runtime(runtime, request, None, ModelSessionAdmission::default())
+    let error = transcribe_with_runtime(runtime, request, None)
         .await
         .unwrap_err();
     let rendered = error.to_string();

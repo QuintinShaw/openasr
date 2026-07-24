@@ -46,7 +46,7 @@ pub(crate) struct BackendSuccess {
 
 pub(crate) enum BackendResult {
     Final(BackendSuccess),
-    Error(String),
+    Error(ApiError),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -387,6 +387,7 @@ pub(crate) struct NativeStreamingDecodeWorker {
 }
 
 impl NativeStreamingDecodeWorker {
+    #[cfg(test)]
     pub(crate) async fn attach(
         key: NativeStreamingWorkerKey,
         session: Box<dyn NativeAsrSession>,
@@ -994,6 +995,11 @@ async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {
         // still serves `/health`; a bound pack arrives on a future restart.
         return;
     };
+    // Warmup is opportunistic. It must not queue behind an active request or
+    // allocate a second runtime; a real request owns the capacity slot first.
+    let Ok(model_session_permit) = runtime.acquire_native_execution() else {
+        return;
+    };
     let Some(adapter) = openasr_core::native_runtime_model_adapter_for_path(&model_pack_path)
     else {
         return;
@@ -1036,7 +1042,7 @@ async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {
     };
     let key =
         NativeStreamingWorkerKey::new(model_pack.root.clone(), hardware_target, inference_threads);
-    attach_and_run_boot_warmup(key, session).await;
+    attach_and_run_boot_warmup(key, session, Some(model_session_permit)).await;
 }
 
 /// The generic (session-agnostic) half of the boot warm-up: attach `session`
@@ -1050,8 +1056,11 @@ async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {
 pub(crate) async fn attach_and_run_boot_warmup(
     key: NativeStreamingWorkerKey,
     session: Box<dyn NativeAsrSession>,
+    model_session_permit: Option<ModelSessionPermit>,
 ) {
-    let Ok(mut worker) = NativeStreamingDecodeWorker::attach(key, session).await else {
+    let Ok(mut worker) =
+        NativeStreamingDecodeWorker::attach_admitted(key, session, model_session_permit).await
+    else {
         return;
     };
     let envelope = NativeStreamingCommandEnvelope {
@@ -1103,7 +1112,6 @@ impl RealtimeBackendWorkerKey {
 pub(crate) struct RealtimeBackendWorkItem {
     pub(crate) session_key: String,
     pub(crate) job: BackendJob,
-    pub(crate) model_admission: ModelSessionAdmission,
     pub(crate) result_sender: mpsc::Sender<BackendResult>,
     pub(crate) cancelled: Arc<AtomicBool>,
 }
@@ -1259,7 +1267,7 @@ pub(crate) fn launch_realtime_backend_work_item(
     tokio::spawn(async move {
         let cancelled = Arc::clone(&item.cancelled);
         let result_sender = item.result_sender.clone();
-        let result = run_realtime_backend_job(runtime, item.job, item.model_admission).await;
+        let result = run_realtime_backend_job(runtime, item.job).await;
         if !cancelled.load(Ordering::Relaxed) {
             let _ = result_sender.send(result).await;
         }
@@ -1269,11 +1277,7 @@ pub(crate) fn launch_realtime_backend_work_item(
     });
 }
 
-async fn run_realtime_backend_job(
-    runtime: ServerRuntime,
-    job: BackendJob,
-    model_admission: ModelSessionAdmission,
-) -> BackendResult {
+async fn run_realtime_backend_job(runtime: ServerRuntime, job: BackendJob) -> BackendResult {
     // Echo the requested language into the final realtime result; the core
     // Transcription carries no detected language, so the request value is the
     // only source. Capture it before job.language is moved into the builder.
@@ -1295,7 +1299,7 @@ async fn run_realtime_backend_job(
         .with_execution_target(job.execution_target)
         .with_word_timestamps(job.word_timestamps)
         .with_display_file_name(Some(job.display_name));
-    match transcribe_with_runtime(runtime, request, None, model_admission).await {
+    match transcribe_with_runtime(runtime, request, None).await {
         Ok(transcription) => {
             let words = realtime_words_from_transcription(&transcription);
             BackendResult::Final(BackendSuccess {
@@ -1308,8 +1312,6 @@ async fn run_realtime_backend_job(
                 words,
             })
         }
-        Err(error) => BackendResult::Error(format!(
-            "Could not transcribe completed realtime utterance: {error}"
-        )),
+        Err(error) => BackendResult::Error(error),
     }
 }

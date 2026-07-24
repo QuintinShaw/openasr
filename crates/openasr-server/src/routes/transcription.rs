@@ -29,30 +29,19 @@ pub(crate) async fn transcriptions(
     headers: HeaderMap,
     Extension(auth): Extension<ServerAuth>,
     Extension(distribution): Extension<DistributionContext>,
-    Extension(model_admission): Extension<ModelSessionAdmission>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Response, ApiError> {
     if query.stream.unwrap_or(false) {
         return crate::realtime::stream_transcription(
             runtime,
             distribution,
-            model_admission,
             multipart,
             !is_remote_compute_client_request(&headers, &auth),
         )
         .await;
     }
 
-    run_offline_transcription(
-        runtime,
-        headers,
-        auth,
-        distribution,
-        model_admission,
-        multipart,
-        None,
-    )
-    .await
+    run_offline_transcription(runtime, headers, auth, distribution, multipart, None).await
 }
 
 /// OpenAI-compatible `/v1/audio/translations`: always X->English translation.
@@ -64,7 +53,6 @@ pub(crate) async fn translations(
     headers: HeaderMap,
     Extension(auth): Extension<ServerAuth>,
     Extension(distribution): Extension<DistributionContext>,
-    Extension(model_admission): Extension<ModelSessionAdmission>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Response, ApiError> {
     run_offline_transcription(
@@ -72,7 +60,6 @@ pub(crate) async fn translations(
         headers,
         auth,
         distribution,
-        model_admission,
         multipart,
         Some(TranscriptionTask::Translate),
     )
@@ -256,7 +243,6 @@ async fn run_offline_transcription(
     headers: HeaderMap,
     auth: ServerAuth,
     distribution: DistributionContext,
-    model_admission: ModelSessionAdmission,
     multipart: Result<Multipart, MultipartRejection>,
     task_override: Option<TranscriptionTask>,
 ) -> Result<Response, ApiError> {
@@ -329,36 +315,30 @@ async fn run_offline_transcription(
         ActiveTranscriptionCleanup::new(distribution.clone(), id.clone(), Arc::clone(control))
     });
     let control_handle = control.as_ref().map(|(_, control)| Arc::clone(control));
-    let transcription = match transcribe_with_runtime(
-        runtime,
-        parsed.request,
-        control_handle.clone(),
-        model_admission,
-    )
-    .await
-    {
-        Ok(transcription) => {
-            if let Some(cleanup) = control_cleanup.as_mut() {
-                cleanup.disarm();
+    let transcription =
+        match transcribe_with_runtime(runtime, parsed.request, control_handle.clone()).await {
+            Ok(transcription) => {
+                if let Some(cleanup) = control_cleanup.as_mut() {
+                    cleanup.disarm();
+                }
+                transcription
             }
-            transcription
-        }
-        Err(error) => {
-            if let Some(cleanup) = control_cleanup.as_mut() {
-                cleanup.disarm();
+            Err(error) => {
+                if let Some(cleanup) = control_cleanup.as_mut() {
+                    cleanup.disarm();
+                }
+                // A cancel surfaces from core as a generic fail-closed error (the
+                // typed cancel is flattened through the NativeAsrError layer), so
+                // consult the control to report it honestly as a 409 canceled result
+                // rather than a 400 fail-closed refusal.
+                if control_handle.is_some_and(|control| control.is_canceled()) {
+                    return Err(ApiError::Backend(
+                        openasr_core::BackendError::TranscriptionCanceled,
+                    ));
+                }
+                return Err(error);
             }
-            // A cancel surfaces from core as a generic fail-closed error (the
-            // typed cancel is flattened through the NativeAsrError layer), so
-            // consult the control to report it honestly as a 409 canceled result
-            // rather than a 400 fail-closed refusal.
-            if control_handle.is_some_and(|control| control.is_canceled()) {
-                return Err(ApiError::Backend(
-                    openasr_core::BackendError::TranscriptionCanceled,
-                ));
-            }
-            return Err(error);
-        }
-    };
+        };
     let rendered = render_transcription(&transcription, parsed.response_format)
         .map_err(ApiError::Serialize)?;
     // History is a best-effort audit side-write: a successful transcription must
@@ -1343,7 +1323,6 @@ pub(crate) async fn transcribe_with_runtime(
     runtime: ServerRuntime,
     request: TranscriptionRequest,
     control: Option<Arc<openasr_core::TranscriptionControl>>,
-    model_admission: ModelSessionAdmission,
 ) -> Result<openasr_core::Transcription, ApiError> {
     match runtime.backend {
         BackendKind::Mock => {
@@ -1368,10 +1347,7 @@ pub(crate) async fn transcribe_with_runtime(
             Ok(transcription)
         }
         BackendKind::Native => {
-            let model_session_key = native_model_session_key(&runtime)?;
-            let model_session_permit = model_admission
-                .try_acquire(model_session_key)
-                .map_err(ApiError::ModelSessionCapacity)?;
+            let model_session_permit = runtime.acquire_native_execution()?;
             tokio::task::spawn_blocking(move || {
                 // This permit is deliberately owned by the blocking task rather
                 // than its async caller. Dropping an HTTP/SSE future detaches a

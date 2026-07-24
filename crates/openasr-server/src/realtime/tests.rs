@@ -346,7 +346,6 @@ fn work_item_for_test(session_key: &str, id: &str) -> RealtimeBackendWorkItem {
     RealtimeBackendWorkItem {
         session_key: session_key.to_string(),
         job: backend_job_for_test(id),
-        model_admission: crate::ModelSessionAdmission::default(),
         result_sender,
         cancelled: Arc::new(AtomicBool::new(false)),
     }
@@ -1985,7 +1984,7 @@ async fn boot_native_warmup_runs_in_background_without_blocking_a_concurrent_tas
     let key = test_native_streaming_worker_key("boot-warmup-nonblocking");
 
     let spawn_started = Instant::now();
-    let warmup_handle = tokio::spawn(attach_and_run_boot_warmup(key, session));
+    let warmup_handle = tokio::spawn(attach_and_run_boot_warmup(key, session, None));
     assert!(
         spawn_started.elapsed() < Duration::from_millis(100),
         "spawning the boot warm-up must not itself block"
@@ -2024,7 +2023,7 @@ async fn health_answers_immediately_while_boot_warmup_is_artificially_slow() {
     });
     let key = test_native_streaming_worker_key("health-vs-slow-warmup");
     let warmup_started = Instant::now();
-    let warmup_handle = tokio::spawn(attach_and_run_boot_warmup(key, session));
+    let warmup_handle = tokio::spawn(attach_and_run_boot_warmup(key, session, None));
 
     let app = crate::app_with_runtime(ServerRuntime::default());
     let response = tokio::time::timeout(
@@ -2073,7 +2072,7 @@ async fn boot_native_warmup_leaves_the_worker_thread_warm_for_the_next_real_atta
         warm_sleep: Duration::from_millis(50),
         warm_calls: Arc::clone(&warm_calls),
     });
-    attach_and_run_boot_warmup(key.clone(), boot_session).await;
+    attach_and_run_boot_warmup(key.clone(), boot_session, None).await;
     assert_eq!(warm_calls.load(Ordering::Acquire), 1);
 
     let (event_sender, _event_receiver) = mpsc::channel(8);
@@ -2643,6 +2642,7 @@ async fn native_realtime_server_smoke_with_real_qwen_pack() {
     let (event_sender, mut event_receiver) = mpsc::channel(512);
     let runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
@@ -3025,6 +3025,7 @@ async fn session_capabilities_event_reports_frame_sync_only_for_xasr_zipformer()
     write_xasr_streaming_fixture_pack(&xasr_path, "xasr-zipformer-capability-test");
     let xasr_runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(xasr_path),
@@ -3044,6 +3045,7 @@ async fn session_capabilities_event_reports_frame_sync_only_for_xasr_zipformer()
     write_qwen_streaming_fixture_pack(&qwen_path, "qwen-capability-test");
     let qwen_runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(qwen_path),
@@ -3152,7 +3154,11 @@ async fn finish_discards_later_backend_finals_after_backend_error() {
     let (result_sender, result_receiver) = mpsc::channel(2);
     session.backend_results = Some(result_receiver);
     result_sender
-        .send(BackendResult::Error("backend failed".to_string()))
+        .send(BackendResult::Error(ApiError::Backend(
+            openasr_core::BackendError::NativeFailClosed {
+                reason: "backend failed".to_string(),
+            },
+        )))
         .await
         .unwrap();
     result_sender
@@ -3204,7 +3210,11 @@ async fn finish_remembers_backend_error_seen_before_shutdown() {
 
     assert!(
         session
-            .apply_backend_result(BackendResult::Error("backend failed".to_string()))
+            .apply_backend_result(BackendResult::Error(ApiError::Backend(
+                openasr_core::BackendError::NativeFailClosed {
+                    reason: "backend failed".to_string(),
+                }
+            )))
             .await
             .is_err()
     );
@@ -3307,6 +3317,7 @@ async fn session_start_rejects_xasr_hotwords_from_active_native_capabilities() {
     write_xasr_streaming_fixture_pack(&pack_path, model_id);
     let runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
@@ -3349,6 +3360,7 @@ async fn session_start_accepts_hotwords_for_supporting_native_model() {
     write_moonshine_streaming_fixture_pack(&pack_path, model_id);
     let runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
@@ -3388,6 +3400,7 @@ async fn native_streaming_configured_event_preserves_diarize_request() {
     let _wespeaker = EnvVarGuard::set("OPENASR_WESPEAKER_PACK", &wespeaker);
     let runtime = ServerRuntime {
         backend: openasr_core::BackendKind::Native,
+        native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
         model_pack_path: Some(pack_path),
@@ -4731,13 +4744,8 @@ async fn remote_compute_websocket_session_does_not_record_server_history() {
         catalog_local_override: None,
     });
     let (event_sender, _event_receiver) = mpsc::channel(8);
-    let mut session = WsSession::new_with_history(
-        ServerRuntime::default(),
-        distribution,
-        crate::ModelSessionAdmission::default(),
-        event_sender,
-        false,
-    );
+    let mut session =
+        WsSession::new_with_history(ServerRuntime::default(), distribution, event_sender, false);
     let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
         "test_session",
         "whisper-large-v3-turbo",

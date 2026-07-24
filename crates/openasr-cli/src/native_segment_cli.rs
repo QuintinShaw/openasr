@@ -596,11 +596,13 @@ pub(super) async fn serve(
     // `idle_unload` lives on `Preferences`, on the same document already
     // loaded above as `config_document` -- no second read needed.
     launch_options.idle_unload_after = config_document.preferences.idle_unload.idle_threshold();
-    launch_options.max_concurrent_native_sessions_per_model = Some(max_native_sessions_per_model);
     openasr_server::serve_with_launch_options(
         addr,
         openasr_server::ServerRuntime {
             backend,
+            native_execution: openasr_server::NativeExecutionSupervisor::new(
+                max_native_sessions_per_model,
+            ),
             ffmpeg_bin,
             ffmpeg_bin_explicit,
             model_pack_path: model_source.model_pack_path,

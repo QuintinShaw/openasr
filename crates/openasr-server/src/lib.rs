@@ -4,9 +4,8 @@ mod realtime;
 mod routes;
 
 pub(crate) use idle_activity::{NativeActivityGuard, spawn_idle_unload_reaper};
-pub(crate) use model_admission::{
-    ModelSessionAdmission, ModelSessionAdmissionError, ModelSessionPermit,
-};
+pub use model_admission::NativeExecutionSupervisor;
+pub(crate) use model_admission::{ModelSessionAdmissionError, ModelSessionPermit};
 pub(crate) use routes::config::*;
 pub(crate) use routes::history::*;
 pub(crate) use routes::models_api::*;
@@ -24,7 +23,6 @@ use std::{
     fs,
     io::Write,
     net::SocketAddr,
-    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -131,11 +129,6 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
     let distribution = DistributionContext::new(distribution_runtime);
     distribution.ensure_restart_resumes_started();
     let auth = launch_options.auth.clone();
-    let model_admission = ModelSessionAdmission::new(
-        launch_options
-            .max_concurrent_native_sessions_per_model
-            .unwrap_or_else(|| NonZeroUsize::new(1).expect("one is non-zero")),
-    );
     let health_identity = ServerHealthIdentity::from_launch_options(launch_options);
     Router::new()
         .route("/health", get(health))
@@ -214,7 +207,6 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         ))
         .layer(Extension(auth))
         .layer(Extension(health_identity))
-        .layer(Extension(model_admission))
         .layer(Extension(distribution))
         .layer(DefaultBodyLimit::max(MAX_TRANSCRIPTION_UPLOAD_BYTES))
         .with_state(runtime)
@@ -758,9 +750,6 @@ pub struct ServerLaunchOptions {
     /// (the default, and what `never` resolves to) never spawns the reaper,
     /// matching every existing caller/test that does not set this.
     pub idle_unload_after: Option<Duration>,
-    /// Maximum concurrent native executions for one resolved runtime model.
-    /// `None` keeps the conservative default of one session per model.
-    pub max_concurrent_native_sessions_per_model: Option<NonZeroUsize>,
     /// Where to persist (and load back) the self-signed TLS private key +
     /// certificate across restarts -- see
     /// `load_or_generate_self_signed_tls_identity`. `None` keeps the
@@ -1176,6 +1165,9 @@ fn resolve_instance_token(launch_option: Option<String>) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerRuntime {
     pub backend: BackendKind,
+    /// Process-wide native execution supervisor shared by every server entry
+    /// point that can allocate or run a ggml model runtime.
+    pub native_execution: NativeExecutionSupervisor,
     pub ffmpeg_bin: Option<std::path::PathBuf>,
     /// Whether `ffmpeg_bin` came from an explicit operator choice (CLI flag,
     /// env var, or config) rather than PATH auto-discovery -- see
@@ -1189,6 +1181,7 @@ impl Default for ServerRuntime {
     fn default() -> Self {
         Self {
             backend: BackendKind::Mock,
+            native_execution: NativeExecutionSupervisor::default(),
             ffmpeg_bin: None,
             ffmpeg_bin_explicit: false,
             model_pack_path: None,
@@ -1197,6 +1190,15 @@ impl Default for ServerRuntime {
 }
 
 impl ServerRuntime {
+    /// Acquires the server-wide native execution permit for the validated
+    /// runtime pack. Every ggml ASR execution path enters through this method.
+    pub(crate) fn acquire_native_execution(&self) -> Result<ModelSessionPermit, ApiError> {
+        let model_identity = native_model_session_key(self)?;
+        self.native_execution
+            .try_acquire(model_identity)
+            .map_err(ApiError::ModelSessionCapacity)
+    }
+
     /// Validates the runtime is *safe to serve with*, not that a model is
     /// installed: no model bound at all (`model_pack_path: None`) is a normal
     /// state for a fresh install with zero pulled models, and the daemon must

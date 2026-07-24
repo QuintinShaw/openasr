@@ -46,6 +46,44 @@ pub(crate) struct ModelSessionPermit {
     permit: Option<OwnedSemaphorePermit>,
 }
 
+#[derive(Clone, Debug)]
+pub struct NativeExecutionSupervisor {
+    admission: ModelSessionAdmission,
+}
+
+impl PartialEq for NativeExecutionSupervisor {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_concurrent_sessions_per_model() == other.max_concurrent_sessions_per_model()
+    }
+}
+
+impl Eq for NativeExecutionSupervisor {}
+
+impl Default for NativeExecutionSupervisor {
+    fn default() -> Self {
+        Self::new(NonZeroUsize::new(1).expect("one is non-zero"))
+    }
+}
+
+impl NativeExecutionSupervisor {
+    pub fn new(max_concurrent_sessions_per_model: NonZeroUsize) -> Self {
+        Self {
+            admission: ModelSessionAdmission::new(max_concurrent_sessions_per_model),
+        }
+    }
+
+    pub(crate) fn try_acquire(
+        &self,
+        model_identity: impl Into<String>,
+    ) -> Result<ModelSessionPermit, ModelSessionAdmissionError> {
+        self.admission.try_acquire(model_identity)
+    }
+
+    pub fn max_concurrent_sessions_per_model(&self) -> NonZeroUsize {
+        self.admission.limit()
+    }
+}
+
 impl Default for ModelSessionAdmission {
     fn default() -> Self {
         Self::new(NonZeroUsize::new(1).expect("one is non-zero"))
@@ -98,6 +136,10 @@ impl ModelSessionAdmission {
     #[cfg(test)]
     fn active_slot_count(&self) -> usize {
         self.lock_state().slots.len()
+    }
+
+    fn limit(&self) -> NonZeroUsize {
+        self.lock_state().limit
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, ModelSessionAdmissionState> {

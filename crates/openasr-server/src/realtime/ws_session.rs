@@ -2,13 +2,12 @@
 //!
 //! Pure code-motion from `realtime.rs`; no behavior changes.
 
-use crate::ModelSessionPermit;
+use crate::{ModelSessionPermit, NativeExecutionSupervisor};
 
 use super::*;
 
 pub(crate) struct WsSession {
     pub(crate) runtime: ServerRuntime,
-    pub(crate) model_admission: ModelSessionAdmission,
     pub(crate) distribution: DistributionContext,
     pub(crate) session_id: RealtimeSessionId,
     /// The single connection-lifetime sequencer. Every envelope leaving this
@@ -626,19 +625,12 @@ impl WsSession {
         distribution: DistributionContext,
         event_sender: mpsc::Sender<RealtimeEventEnvelope>,
     ) -> Self {
-        Self::new_with_history(
-            runtime,
-            distribution,
-            ModelSessionAdmission::default(),
-            event_sender,
-            true,
-        )
+        Self::new_with_history(runtime, distribution, event_sender, true)
     }
 
     pub(crate) fn new_with_history(
         runtime: ServerRuntime,
         distribution: DistributionContext,
-        model_admission: ModelSessionAdmission,
         event_sender: mpsc::Sender<RealtimeEventEnvelope>,
         record_history: bool,
     ) -> Self {
@@ -647,7 +639,6 @@ impl WsSession {
         let session_id = next_session_id("rt_ws");
         Self {
             runtime,
-            model_admission,
             distribution,
             sequencer: RealtimeEventSequencer::new(session_id.clone()),
             emitted_event_ids: std::collections::HashMap::new(),
@@ -1009,14 +1000,20 @@ impl WsSession {
             &session,
             capabilities,
             self.distribution.clone(),
+            self.runtime.native_execution.clone(),
             test_translation_worker,
         )
         .await
         {
             Ok(result) => result,
-            Err(message) => {
-                self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
-                    .await?;
+            Err(error) => {
+                let recoverable = matches!(error, ApiError::ModelSessionCapacity(_));
+                self.emit_error(
+                    realtime_error_code_for_api_error(&error),
+                    &error.to_string(),
+                    recoverable,
+                )
+                .await?;
                 return Err(());
             }
         };
@@ -1210,8 +1207,9 @@ impl WsSession {
         session: &StartSession,
         capabilities: RealtimeBackendCapabilities,
         distribution: DistributionContext,
+        native_execution: NativeExecutionSupervisor,
         test_worker: Option<(TranslationWorkerHook, Option<TranslationWorkerInitHook>)>,
-    ) -> Result<(Option<RealtimeTranslationLane>, SessionTranslationSummary), String> {
+    ) -> Result<(Option<RealtimeTranslationLane>, SessionTranslationSummary), ApiError> {
         let Some(options) = session.translation.as_ref() else {
             return Ok((None, SessionTranslationSummary::disabled()));
         };
@@ -1224,9 +1222,9 @@ impl WsSession {
                 .translation
                 .reason
                 .unwrap_or(openasr_core::RealtimeTranslationCapability::REASON_PACK_MISSING);
-            return Err(format!(
+            return Err(ApiError::BadRequest(format!(
                 "Realtime translation was requested but is unavailable: {reason}."
-            ));
+            )));
         }
         let target_lang = options
             .target_lang
@@ -1235,41 +1233,45 @@ impl WsSession {
             .trim()
             .to_string();
         let Some(target_lang) = TargetLang::parse_mvp(&target_lang) else {
-            return Err(
+            return Err(ApiError::BadRequest(
                 "Realtime translation MVP only supports translation.target_lang=\"en\"."
                     .to_string(),
-            );
+            ));
         };
         let mode = options
             .mode
             .as_deref()
             .unwrap_or(openasr_core::RealtimeTranslationCapability::MODE_CLAUSE_RETRANSLATION);
         if mode != openasr_core::RealtimeTranslationCapability::MODE_CLAUSE_RETRANSLATION {
-            return Err(
+            return Err(ApiError::BadRequest(
                 "Realtime translation MVP only supports translation.mode=\"clause_retranslation\"."
                     .to_string(),
-            );
+            ));
         }
         if !session_language_is_chinese(session.language.as_deref()) {
-            return Err(
+            return Err(ApiError::BadRequest(
                 "Realtime translation MVP requires session.language=\"zh\" so zh->en is explicit."
                     .to_string(),
-            );
+            ));
         }
         if let Some(model) = options.model.as_deref()
             && !translation_model_ref_supported(model)
         {
-            return Err(format!(
+            return Err(ApiError::BadRequest(format!(
                 "Realtime translation MVP only supports translation.model=\"{}\" or \"hymt2-1.8b\".",
                 HYMT2_TRANSLATION_MODEL_ID
-            ));
+            )));
         }
 
         let model_id = HYMT2_TRANSLATION_MODEL_ID.to_string();
         let requested_model = options.model.clone();
-        let translation_session =
-            Self::build_translation_session(distribution, requested_model.as_deref(), test_worker)
-                .await?;
+        let translation_session = Self::build_translation_session(
+            distribution,
+            requested_model.as_deref(),
+            native_execution,
+            test_worker,
+        )
+        .await?;
         let summary = SessionTranslationSummary {
             enabled: true,
             target_lang: Some(target_lang.as_str().to_string()),
@@ -1300,8 +1302,9 @@ impl WsSession {
     async fn build_translation_session(
         distribution: DistributionContext,
         requested_model: Option<&str>,
+        native_execution: NativeExecutionSupervisor,
         test_worker: Option<(TranslationWorkerHook, Option<TranslationWorkerInitHook>)>,
-    ) -> Result<TranslationSession, String> {
+    ) -> Result<TranslationSession, ApiError> {
         if let Some((worker, init)) = test_worker {
             if let Some(init) = init {
                 return Ok(TranslationSession::spawn_thread_local(move || {
@@ -1312,8 +1315,15 @@ impl WsSession {
             return Ok(TranslationSession::spawn(move |request| worker(request)));
         }
 
-        let selection = resolve_translation_pack_selection(&distribution, requested_model)?;
-        Ok(Self::load_hymt2_translation_session(selection))
+        let selection = resolve_translation_pack_selection(&distribution, requested_model)
+            .map_err(ApiError::BadRequest)?;
+        let model_session_permit = native_execution
+            .try_acquire(format!("hymt2:{HYMT2_TRANSLATION_MODEL_ID}"))
+            .map_err(ApiError::ModelSessionCapacity)?;
+        Ok(Self::load_hymt2_translation_session(
+            selection,
+            model_session_permit,
+        ))
     }
 
     /// Spawns the Hy-MT2 translation worker with the (multi-second) model
@@ -1321,9 +1331,13 @@ impl WsSession {
     /// path. `session.start` is accepted immediately; readiness is announced
     /// via a `translation.status` event from `drain_translation_outputs`, and
     /// a load failure surfaces there as a session-fatal `error` event.
-    fn load_hymt2_translation_session(selection: TranslationPackSelection) -> TranslationSession {
+    fn load_hymt2_translation_session(
+        selection: TranslationPackSelection,
+        model_session_permit: ModelSessionPermit,
+    ) -> TranslationSession {
         let path = selection.path;
         TranslationSession::spawn_thread_local(move || {
+            let _model_session_permit = model_session_permit;
             let runtime =
                 Hymt2Runtime::from_path(path).map_err(|error| TranslationQueueError::Worker {
                     reason: format!(
@@ -1332,6 +1346,7 @@ impl WsSession {
                 })?;
             let mut cache = Hymt2TranslationSessionCache::default();
             Ok(move |request| {
+                let _permit = &_model_session_permit;
                 runtime
                     .translate_request_with_cache(&mut cache, &request)
                     .map_err(|error| TranslationQueueError::Worker {
@@ -1597,31 +1612,13 @@ impl WsSession {
             .await?;
             return Err(());
         };
-        let model_session_key = match native_model_session_key(&self.runtime) {
-            Ok(key) => key,
-            Err(error) => {
-                self.emit_error(
-                    RealtimeErrorCode::StartupConfigError,
-                    &error.to_string(),
-                    false,
-                )
-                .await?;
-                return Err(());
-            }
-        };
-        let model_session_permit = match self.model_admission.try_acquire(model_session_key) {
+        let model_session_permit = match self.runtime.acquire_native_execution() {
             Ok(permit) => permit,
             Err(error) => {
-                self.emit_error(
-                    RealtimeErrorCode::BackendNotReady,
-                    &format!(
-                        "Model '{}' is at its concurrent native session limit ({}). Retry when an existing session finishes, or increase --max-native-sessions-per-model if this host has enough memory.",
-                        error.model_identity,
-                        error.limit,
-                    ),
-                    true,
-                )
-                .await?;
+                let recoverable = matches!(error, ApiError::ModelSessionCapacity(_));
+                let code = realtime_error_code_for_api_error(&error);
+                self.emit_error(code, &error.to_string(), recoverable)
+                    .await?;
                 return Err(());
             }
         };
@@ -2878,7 +2875,6 @@ impl WsSession {
         let work_item = RealtimeBackendWorkItem {
             session_key: self.session_id.0.clone(),
             job,
-            model_admission: self.model_admission.clone(),
             result_sender,
             cancelled: Arc::clone(&self.backend_cancelled),
         };
@@ -2998,11 +2994,16 @@ impl WsSession {
                 }
                 Ok(())
             }
-            BackendResult::Error(message) => {
+            BackendResult::Error(error) => {
+                let recoverable = matches!(error, ApiError::ModelSessionCapacity(_));
+                let code = realtime_error_code_for_api_error(&error);
+                self.emit_error(code, &error.to_string(), recoverable)
+                    .await?;
+                if recoverable {
+                    return Ok(());
+                }
                 self.backend_failed = true;
                 self.cancel_backend_jobs();
-                self.emit_error(RealtimeErrorCode::BackendCrashed, &message, false)
-                    .await?;
                 Err(())
             }
         }
@@ -3051,14 +3052,21 @@ impl WsSession {
                     final_result @ BackendResult::Final(_) => {
                         self.apply_backend_result(final_result).await?
                     }
-                    BackendResult::Error(message) => {
+                    BackendResult::Error(error) => {
                         self.pending_backend_jobs = self.pending_backend_jobs.saturating_sub(1);
+                        let recoverable = matches!(error, ApiError::ModelSessionCapacity(_));
                         if !self.backend_failed {
-                            self.emit_error(RealtimeErrorCode::BackendCrashed, &message, false)
-                                .await?;
+                            self.emit_error(
+                                realtime_error_code_for_api_error(&error),
+                                &error.to_string(),
+                                recoverable,
+                            )
+                            .await?;
                         }
-                        self.backend_failed = true;
-                        self.cancel_backend_jobs();
+                        if !recoverable {
+                            self.backend_failed = true;
+                            self.cancel_backend_jobs();
+                        }
                     }
                 }
             } else {
