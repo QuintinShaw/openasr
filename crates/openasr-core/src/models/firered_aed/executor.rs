@@ -599,6 +599,120 @@ mod tests {
         );
     }
 
+    /// Dev-only stage-split microbenchmark for the streaming first-token
+    /// latency floor (`docs/model-audits/firered-aed.md` section 9, "Streaming
+    /// first-token latency floor"): splits a single-window transcribe of
+    /// `fixtures/jfk.wav` into the four stages a real snapshot-streaming
+    /// partial pays before it can show any text -- frontend (fbank+CMVN),
+    /// encoder forward, cross-KV cache populate, and the first decoder step
+    /// (prefill of `<sos>` through the cross-KV-primed decoder; this is what
+    /// `compute_step_logits` does before any autoregressive continuation) --
+    /// on both the CPU and Metal backends. Not a CI gate (wall-clock, no
+    /// committed pack): run manually in a quiet window with
+    /// `cargo test -p openasr-core --release stage_split_first_token_latency_microbenchmark -- --ignored --nocapture`
+    /// and read the stage timings off stderr.
+    #[test]
+    #[ignore = "requires the private dev-only firered-aed-l-fp16.oasr pack; dev-only perf microbenchmark, not a CI gate"]
+    fn stage_split_first_token_latency_microbenchmark() {
+        use crate::ggml_runtime::{RequestBackendPreference, install_request_backend_override};
+
+        let pack_path = dev_pack_path();
+        if !pack_path.exists() {
+            eprintln!("skipping: {} not present", pack_path.display());
+            return;
+        }
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            jfk_wav_path(),
+            "firered-aed first-token microbenchmark",
+            "firered-aed first-token microbenchmark",
+        )
+        .expect("load jfk.wav");
+
+        let request = GgmlAsrExecutionRequest {
+            runtime_source_path: pack_path.clone(),
+            runtime_source_preflight: None,
+            selected_family: firered_aed_runtime_descriptor_v1(),
+            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples.clone()),
+            request_options: Default::default(),
+            backend_preference: GgmlAsrBackendPreference::CpuOnly,
+        };
+        let preflight = request
+            .resolve_runtime_source_preflight()
+            .expect("resolve preflight");
+        let metadata =
+            parse_firered_aed_execution_metadata(&preflight.metadata).expect("parse metadata");
+        let reader =
+            build_runtime_tensor_reader_from_preflight(&preflight).expect("build tensor reader");
+        let feature_dim_shape = [metadata.feature_dim as u64];
+        let neg_mean = reader
+            .host_tensor_f32_copy_dequantized_by_name(CMVN_NEG_MEAN_TENSOR, &feature_dim_shape)
+            .expect("read cmvn neg_mean");
+        let inv_stddev = reader
+            .host_tensor_f32_copy_dequantized_by_name(CMVN_INV_STDDEV_TENSOR, &feature_dim_shape)
+            .expect("read cmvn inv_stddev");
+        let sos_token_id = metadata.sos_token_id;
+
+        for (label, backend_pref) in [
+            ("cpu", RequestBackendPreference::CpuOnly),
+            ("metal", RequestBackendPreference::Accelerated),
+        ] {
+            let _backend_guard = install_request_backend_override(Some(backend_pref));
+
+            let mut encoder_runtime: Option<FireRedEncoderGraphRuntime> = None;
+            let mut decoder_runtime: Option<FireRedDecoderGraphRuntime> = None;
+
+            for round in 1..=3u32 {
+                let phase = if round == 1 { "cold" } else { "warm" };
+
+                let frontend_start = std::time::Instant::now();
+                let frontend = FireRedFbankFrontend::new();
+                let mut features = frontend.compute(&samples).expect("frontend compute");
+                apply_cmvn(&mut features.data, features.n_mels, &neg_mean, &inv_stddev)
+                    .expect("apply cmvn");
+                let frontend_elapsed = frontend_start.elapsed();
+
+                let encoder_start = std::time::Instant::now();
+                let encoder = encoder_runtime.get_or_insert_with(|| {
+                    FireRedEncoderGraphRuntime::new(&pack_path, metadata)
+                        .expect("build encoder runtime")
+                });
+                let encoder_output = encoder
+                    .encode(&features.data, features.n_frames)
+                    .expect("encoder forward");
+                let encoder_elapsed = encoder_start.elapsed();
+
+                let decoder = decoder_runtime.get_or_insert_with(|| {
+                    FireRedDecoderGraphRuntime::new(&pack_path, metadata)
+                        .expect("build decoder runtime")
+                });
+
+                let cross_kv_start = std::time::Instant::now();
+                decoder
+                    .populate_cross_attention_cache(
+                        &encoder_output.rows,
+                        encoder_output.frame_count,
+                    )
+                    .expect("populate cross-attention cache");
+                let cross_kv_elapsed = cross_kv_start.elapsed();
+
+                let first_token_start = std::time::Instant::now();
+                decoder
+                    .compute_step_logits(&[sos_token_id])
+                    .expect("first decode step (prefill + first token logits)");
+                let first_token_elapsed = first_token_start.elapsed();
+
+                eprintln!(
+                    "firered-aed-ftl backend={label} round={round} phase={phase} \
+                     frontend_ms={:.3} encoder_ms={:.3} cross_kv_ms={:.3} first_token_ms={:.3}",
+                    frontend_elapsed.as_secs_f64() * 1000.0,
+                    encoder_elapsed.as_secs_f64() * 1000.0,
+                    cross_kv_elapsed.as_secs_f64() * 1000.0,
+                    first_token_elapsed.as_secs_f64() * 1000.0,
+                );
+            }
+        }
+    }
+
     /// Regression for a REJECTed earlier version of this fix that made this
     /// case fail closed: `segment_mode=off` (a real, user-reachable CLI/server
     /// path -- `native_segment_cli.rs`'s `NativeSegmentMode::Off` /
