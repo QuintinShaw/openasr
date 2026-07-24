@@ -377,9 +377,10 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     /// Silicon Metal specifically (a 29-frame chunk graph too small to
     /// amortize Metal's per-dispatch overhead) -- see
     /// `models::xasr_zipformer::graph_config::encoder_gpu_enabled` -- so it
-    /// was for a time the sole builtin `ExceptMetal`; moss-transcribe-diarize
-    /// later joined it (Metal encoder-numeric divergence + per-step wired-memory
-    /// blow-up, documented on that descriptor). That same audit also measured a
+    /// was for a time the sole builtin `ExceptMetal`. moss-transcribe-diarize
+    /// briefly shared that pin and has since returned to `AllBackends` after
+    /// the post-#212 quiet-window true-accelerated Metal win (see that
+    /// descriptor's `auto_gpu_policy` note). That same audit also measured a
     /// Metal slowdown for qwen and moonshine, but neither is gated: qwen's
     /// looks like a fixed size x quant platform trade-off rather than a code
     /// bug, and that read is left to a dedicated follow-up before being baked
@@ -1823,32 +1824,16 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         },
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
-        // Auto is pinned OFF Metal for this family until its Metal-specific
-        // defect is fixed (measured on an M1, CPU parity confirmed; its own
-        // follow-up, out of scope for this landing):
-        //   1. Encoder numeric divergence: the Whisper encoder's deep layers
-        //      decorrelate on Metal (final-layer cosine ~0.20 vs the fp32 CPU
-        //      reference, which matches), collapsing decoding to an empty
-        //      `[..][S01][..]` shell. CPU produces the correct transcript.
-        // A second defect that used to live here -- the per-token decode
-        // rebuilding the whole 28-layer ggml graph each step and exhausting
-        // Metal's wired working set -- is fixed: `llm_decoder`'s decode step
-        // already called the shared executor's `run_step_auto`, which reuses
-        // a persistent decode graph on Metal (`supports_graph_reuse`), but
-        // the KV-cache write-back after it unconditionally asserted a
-        // full per-layer K/V count, which the reuse path legitimately never
-        // produces (its K/V stays resident in the decode graph's own arena),
-        // so every Metal decode step failed closed on that mismatch before
-        // the reuse graph could actually amortize anything. `write_layer_kv`
-        // now treats an empty layer-KV slice as the reuse path's no-op
-        // contract instead of a count error (see its doc comment) --
-        // measured end-to-end on the real dev pack: decode now builds the
-        // reused graph once and revisits it every subsequent token instead of
-        // rebuilding, with no other per-step allocation growth.
-        // `ExceptMetal` only steers Auto to CPU; an explicit
-        // `execution_target=accelerated` still gets Metal (and the remaining
-        // encoder defect), by design. Revisit -> `AllBackends` once 1 lands.
-        auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
+        // Auto selects Metal/GPU when available. Correctness blockers that
+        // once justified ExceptMetal are closed (encoder divergence falsified;
+        // #180 decode graph reuse; #212 chunked resident prefill stops 3-min
+        // OOM). Post-#212 quiet-window A/B on M1 (true execution_target=
+        // accelerated, fp16): Metal RTF beats CPU on jfk/en_zh/aishell4
+        // (~0.22-0.48x CPU RTF) with lower RSS and no OOM -- see
+        // docs/model-audits/moss-transcribe-diarize.md section 6 and
+        // tmp/moss-quiet-2026-07-24/. Do not re-introduce ExceptMetal without
+        // a fresh quiet-window loss on true accelerated (not env-only hybrid).
+        auto_gpu_policy: AutoGpuPolicy::AllBackends,
         // The model is trained to emit `[S01]`/`[S02]`/... speaker labels
         // directly in its transcript text (see `decode_prompt`'s fixed
         // instruction), so this family diarizes itself -- there is no
@@ -2001,10 +1986,9 @@ mod tests {
             (FIRERED_AED_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
             (FIRERED_LLM_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
             (MIMO_ASR_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
-            // Pinned off Metal until the family's Metal encoder-numeric and
-            // wired-memory defects are fixed (see the descriptor's
-            // `auto_gpu_policy` note).
-            (MOSS_TD_GGML_ARCHITECTURE_ID, AutoGpuPolicy::ExceptMetal),
+            // Post-#212 quiet-window A/B: true accelerated Metal is faster
+            // than CPU; Auto may select Metal (see descriptor note).
+            (MOSS_TD_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
         let mut seen = std::collections::BTreeSet::new();

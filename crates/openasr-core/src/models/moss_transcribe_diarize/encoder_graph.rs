@@ -1012,7 +1012,7 @@ fn build_moss_encoder_resident_weights<'a>(
 mod parity_tests {
     //! CPU-vs-Metal numeric-divergence bisection for the "encoder decorrelates
     //! on Metal" defect (`arch/mod.rs`'s `MOSS_TD_GGML_ARCHITECTURE_ID`
-    //! `auto_gpu_policy: ExceptMetal` doc comment, defect 1 of 2). Dev-only:
+    //! historical ExceptMetal pin (now AllBackends); defect investigation notes). Dev-only:
     //! needs the real ~1.8 GB `moss-transcribe-diarize-fp16.oasr` pack (never
     //! committed) and a real Metal device, so every test here is `#[ignore]`d
     //! and points at the pack through an env var rather than a fixed path.
@@ -1178,7 +1178,7 @@ mod parity_tests {
         unsafe {
             std::env::set_var(GgmlCpuGraphConfig::BACKEND_ENV, env_value);
         }
-        // The family's `ExceptMetal` gate (`graph_config.rs`) downgrades an
+        // Under the historical ExceptMetal pin, graph_config downgraded an
         // Auto-resolved Metal -- including one steered by `BACKEND_ENV` above
         // -- to CPU, so env-var steering alone can never reach the Metal leg.
         // Install an explicit `Accelerated` request override for that leg:
@@ -1270,11 +1270,11 @@ mod parity_tests {
     }
 
     /// The actual regression gate this defect's fix must satisfy (see
-    /// `arch/mod.rs`'s `ExceptMetal` doc comment): once fixed, flip
+    /// `arch/mod.rs` auto_gpu_policy note): historically flip
     /// `auto_gpu_policy` back to `AllBackends` and un-ignore this test.
     ///
     /// Status: the Metal leg is now reachable (previously it silently
-    /// downgraded to CPU under the family's own `ExceptMetal` gate even when
+    /// was once downgraded to CPU under ExceptMetal even when
     /// driven via `BACKEND_ENV`, so it never actually ran on Metal -- fixed
     /// by installing an explicit `Accelerated` request override, see this
     /// module's `run_tapped_encoder`) and currently PASSES on this host: on
@@ -1324,7 +1324,7 @@ mod parity_tests {
         assert!(
             cosine > 0.999,
             "moss encoder_out cpu-vs-metal cosine too low: {cosine:.6} (see arch/mod.rs's \
-             ExceptMetal doc comment; run dump_cpu_vs_metal_layer_cosine_table for the per-layer \
+             auto_gpu_policy history; run dump_cpu_vs_metal_layer_cosine_table for the per-layer \
              breakdown)"
         );
     }

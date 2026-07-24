@@ -926,7 +926,7 @@ mod tests {
     /// `Accelerated` request installs in production (see
     /// `GgmlAsrBackendPreference::request_backend_override`'s doc and
     /// `graph_config.rs`'s note that an explicit request always wins over
-    /// the family's `ExceptMetal` Auto gate).
+    /// Auto Metal; family policy is AllBackends).
     fn transcribe_with_dev_pack_backend(
         wav_path: PathBuf,
         backend_preference: GgmlAsrBackendPreference,
@@ -1349,7 +1349,7 @@ mod tests {
     // Explicit `execution_target=accelerated` e2e smoke: an explicit
     // `Accelerated` request installs the same thread-local override
     // `graph_config.rs` documents as always winning over this family's
-    // `ExceptMetal` Auto gate, so the encoder graph builds on Metal instead
+    // AllBackends Auto / explicit accelerated, so the encoder graph builds on Metal instead
     // of being downgraded to CPU (the gate only ever pins what *Auto*
     // resolves to -- see `encoder_graph_config_honors_explicit_accelerated_
     // request` in `graph_config.rs`). Decode already runs on Metal under
