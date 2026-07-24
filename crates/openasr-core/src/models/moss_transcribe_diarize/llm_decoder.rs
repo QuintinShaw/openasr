@@ -107,6 +107,11 @@ pub(crate) struct MossTdDecoderRuntime {
     metadata: MossTdDecoderMetadata,
 }
 
+pub(crate) struct MossTdPrefillOutput {
+    pub(crate) logits: Vec<f32>,
+    pub(crate) greedy_token_hint: Option<u32>,
+}
+
 impl MossTdDecoderRuntime {
     pub(crate) fn new(
         runtime_path: &std::path::Path,
@@ -115,16 +120,6 @@ impl MossTdDecoderRuntime {
         let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(runtime_path)
             .map_err(map_tensor_read_error)?;
         let projections = load_moss_layer_projections(&reader, &metadata)?;
-        let whole_decoder =
-            Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
-                &projections,
-                Some(runtime_path),
-                MOSS_TD_RMS_NORM_EPSILON,
-                None,
-            )
-            .map_err(|error| MossTdDecoderError::GraphFailed {
-                reason: error.to_string(),
-            })?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
             metadata.d_model,
@@ -148,6 +143,20 @@ impl MossTdDecoderRuntime {
         .map_err(|error| MossTdDecoderError::TokenEmbeddingFailed {
             reason: error.to_string(),
         })?;
+        // Keep the output projection in the same static arena as the resident
+        // decoder graph. Metal can then return a device-side top-1 token for
+        // every post-prefill step instead of constructing a separate full-vocab
+        // logits graph per token.
+        let whole_decoder =
+            Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
+                &projections,
+                Some(runtime_path),
+                MOSS_TD_RMS_NORM_EPSILON,
+                logits_head.fused_top1_spec(),
+            )
+            .map_err(|error| MossTdDecoderError::GraphFailed {
+                reason: error.to_string(),
+            })?;
         Ok(Self {
             whole_decoder,
             logits_head,
@@ -171,30 +180,23 @@ impl MossTdDecoderRuntime {
         self.whole_decoder.release_session_scoped_buffers();
     }
 
-    /// `capacity` should be the request-sized bound (prompt tokens + the
-    /// generation budget), NOT the checkpoint's native `max_positions`
-    /// (131072, a RoPE context ceiling -- see `moss_td_kv_cache_positions`'s
-    /// doc comment): `capacity` becomes the persistent Metal/GPU reuse
-    /// graph's fixed KV/mask/RoPE span (`run_prefill_auto_last_hidden`/
-    /// `run_step_auto` size it from this cache's `max_positions()`), and that
-    /// span is a per-token COMPUTE + device-resident-allocation cost there,
-    /// not just a host bound. Sizing it to the family-wide cap unconditionally
-    /// made every utterance -- including a short one needing a few hundred
-    /// positions -- pay a fixed 8192-wide attention span on every prefill
-    /// mask/decode step and a fixed ~1.9 GB device allocation regardless of
-    /// real audio length: measured 3.2-3.85x slower than the CPU backend, and
-    /// a several-minute clip's 28-layer x 8192-wide single-shot device
-    /// allocation exhausted Metal's working-set budget outright (OOM). This
-    /// still clamps to `moss_td_kv_cache_positions`'s family-wide ceiling, so
-    /// a request that genuinely needs more than that fails closed at the
-    /// cache's own bounds check instead of over-allocating. Mirrors
+    /// `capacity` is the request-sized bound (prompt tokens + the generation
+    /// budget), NOT the checkpoint's native `max_positions` (131072, a RoPE
+    /// context ceiling -- see `moss_td_kv_cache_positions`'s doc comment).
+    /// It becomes the persistent Metal/GPU reuse graph's fixed KV/mask/RoPE
+    /// span (`run_prefill_auto_last_hidden`/`run_step_auto` size it from this
+    /// cache's `max_positions()`), so it is a per-token compute and
+    /// device-resident-allocation cost, not just a host bound. The executor
+    /// validates this complete request against the pack's capped metadata
+    /// ceiling before calling here. Keeping the metadata minimum here as
+    /// defense in depth preserves a pack whose declared context is smaller
+    /// than the family cap; it must never be silently expanded. Mirrors
     /// `firered_llm::llm_transformer`'s and `mimo_asr::llm_transformer`'s
-    /// identical `new_kv_caches(capacity)` sizing (which never had this
-    /// family-wide-cap step because their native `max_positions` was already
-    /// a sane KV-cache size), and `qwen::ggml_executor`'s own
+    /// request-sized `new_kv_caches(capacity)` sizing, and
+    /// `qwen::ggml_executor`'s own
     /// `decode_prompt.token_ids.len().saturating_add(decode_config.max_generated_tokens)`.
     pub(crate) fn new_kv_caches(&self, capacity: usize) -> Vec<Qwen3AsrLayerKvCacheState> {
-        let cache_positions = moss_td_kv_cache_positions(capacity);
+        let cache_positions = capacity.min(moss_td_kv_cache_positions(self.metadata.max_positions));
         (0..self.metadata.n_layers)
             .map(|_| {
                 Qwen3AsrLayerKvCacheState::new(
@@ -238,7 +240,7 @@ impl MossTdDecoderRuntime {
         &mut self,
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
-    ) -> Result<Vec<f32>, MossTdDecoderError> {
+    ) -> Result<MossTdPrefillOutput, MossTdDecoderError> {
         let token_count = prompt_embeddings.token_count;
         // On a backend with persistent decode-graph reuse (Metal/single-GPU),
         // seed the resident-KV arena in one batched compute instead of the bulk
@@ -260,12 +262,28 @@ impl MossTdDecoderRuntime {
                 reason: error.to_string(),
             })?
         {
-            return self
+            if let Some(token_id) = self
+                .whole_decoder
+                .fused_logits_top1_from_hidden(&final_hidden)
+                .map_err(|error| MossTdDecoderError::GraphFailed {
+                    reason: error.to_string(),
+                })?
+            {
+                return Ok(MossTdPrefillOutput {
+                    logits: Vec::new(),
+                    greedy_token_hint: Some(token_id),
+                });
+            }
+            let logits = self
                 .logits_head
                 .compute_logits_for_last_hidden(&final_hidden)
                 .map_err(|error| MossTdDecoderError::LogitsHeadFailed {
                     reason: error.to_string(),
-                });
+                })?;
+            return Ok(MossTdPrefillOutput {
+                logits,
+                greedy_token_hint: None,
+            });
         }
         let host_chunked = self
             .whole_decoder
@@ -286,11 +304,16 @@ impl MossTdDecoderRuntime {
                 })?;
             self.write_prefill_outputs(0, token_count, &step, layer_kv_caches)?
         };
-        self.logits_head
+        let logits = self
+            .logits_head
             .compute_logits_for_last_hidden(&final_hidden)
             .map_err(|error| MossTdDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
-            })
+            })?;
+        Ok(MossTdPrefillOutput {
+            logits,
+            greedy_token_hint: None,
+        })
     }
 
     /// Segmented prefill (see [`Self::prefill`]): feed the prompt to the decoder
@@ -384,6 +407,41 @@ impl MossTdDecoderRuntime {
             .map_err(|error| MossTdDecoderError::LogitsHeadFailed {
                 reason: error.to_string(),
             })
+    }
+
+    /// On the resident Metal/GPU reuse graph, return the decoder's device-side
+    /// argmax directly. MOSS's registered policy has no suppression or phrase
+    /// bias, so the shared greedy driver can safely consume this as a validated
+    /// `greedy_token_hint`; CPU and any non-reuse backend fall back to the full
+    /// host logits path above.
+    pub(crate) fn decode_step_reused_top1(
+        &mut self,
+        token_id: u32,
+        cache_position: usize,
+        layer_kv_caches: &[Qwen3AsrLayerKvCacheState],
+    ) -> Result<Option<u32>, MossTdDecoderError> {
+        if !self.whole_decoder.supports_graph_reuse() || !self.whole_decoder.supports_fused_top1() {
+            return Ok(None);
+        }
+        let max_positions = layer_kv_caches
+            .first()
+            .map(Qwen3AsrLayerKvCacheState::max_positions)
+            .ok_or_else(|| MossTdDecoderError::KvCacheFailed {
+                reason: "moss-transcribe-diarize decoder has no layer KV caches".to_string(),
+            })?;
+        let hidden = self.gather_token_embedding(token_id)?;
+        let step = self
+            .whole_decoder
+            .run_step_reused_batched_top1(
+                &hidden,
+                &[cache_position],
+                MOSS_TD_ROPE_THETA,
+                max_positions,
+            )
+            .map_err(|error| MossTdDecoderError::GraphFailed {
+                reason: error.to_string(),
+            })?;
+        Ok(Some(step.token_id))
     }
 
     fn write_prefill_outputs(

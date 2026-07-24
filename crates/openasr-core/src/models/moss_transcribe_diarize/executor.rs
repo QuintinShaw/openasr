@@ -58,7 +58,8 @@ use super::llm_decoder::MossTdDecoderRuntime;
 use super::prompt_embedding::build_moss_td_prompt_embeddings_with_audio_splice;
 use super::runtime_contract::{
     MOSS_TD_ADAPTOR_NORM_EPSILON, MossTdDecoderMetadata, moss_td_kv_cache_positions,
-    parse_adaptor_metadata, parse_decoder_metadata, parse_encoder_metadata,
+    moss_td_request_kv_cache_positions, parse_adaptor_metadata, parse_decoder_metadata,
+    parse_encoder_metadata,
 };
 use super::tokenizer::MossTdTokenizer;
 
@@ -72,12 +73,18 @@ const SAMPLE_RATE_HZ: usize = 16_000;
 /// `_compute_audio_token_length`'s `stride` (`processing_moss_transcribe_diarize.py`).
 const WHISPER_ENCODER_CONV_STRIDE: usize = 2;
 const HOP_LENGTH: usize = 160;
-/// Generous upper bound on generated tokens; greedy decode stops at
-/// `<|im_end|>` well before this in practice (the real checkpoint's own
-/// reference generation config used this exact cap -- verified against
-/// `tmp/moss-td/golden/*.json`'s `max_new_tokens`). Only the fail-closed
-/// backstop against a runaway (non-terminating) decode.
+/// Absolute fail-closed backstop for a non-terminating decode. The checkpoint's
+/// reference configuration uses this ceiling, but each request receives a much
+/// smaller audio-proportional budget below so its persistent Metal KV graph does
+/// not reserve the runaway allowance for ordinary speech.
 const MOSS_TD_MAX_GENERATED_TOKENS: usize = 4096;
+/// A conservative output allowance for timestamped MOSS transcripts. The
+/// three-minute AISHELL-4 golden emits 920 tokens (about 5.1 tokens/s); six
+/// tokens/s plus the fixed margin leaves headroom without reserving all 4096
+/// runaway tokens in every request's Metal reuse graph.
+const MOSS_TD_GENERATED_TOKENS_PER_AUDIO_SECOND: usize = 6;
+const MOSS_TD_MIN_GENERATED_TOKENS: usize = 128;
+const MOSS_TD_GENERATED_TOKEN_BUDGET_MARGIN: usize = 128;
 /// Audio tokens per second the adaptor emits (`audio_tokens_per_second` in
 /// `processing_moss_transcribe_diarize.py`, same value `decode_prompt`'s marker
 /// cadence uses). Only used to render the `AudioExceedsContext` limit as an
@@ -99,13 +106,18 @@ enum MossTdExecutorError {
     TokenizerBuildFailed { reason: String },
     #[error("moss-transcribe-diarize requires non-empty audio")]
     EmptyAudio,
+    #[error("moss-transcribe-diarize decode budget is unavailable: {reason}")]
+    DecodeBudgetUnavailable { reason: String },
     #[error(
-        "moss-transcribe-diarize audio is too long: its {prompt_tokens}-token audio prompt \
-         needs at least one free position within the {kv_capacity}-position decoder context \
-         (about {max_minutes:.0} min of audio); split the input into shorter files"
+        "moss-transcribe-diarize audio is too long: its {prompt_tokens}-token audio prompt plus \
+         the {generation_budget}-token decode budget needs {required_positions} positions within \
+         the {kv_capacity}-position decoder context (about {max_minutes:.0} min of audio); split \
+         the input into shorter files"
     )]
     AudioExceedsContext {
         prompt_tokens: usize,
+        generation_budget: usize,
+        required_positions: usize,
         kv_capacity: usize,
         max_minutes: f32,
     },
@@ -146,15 +158,15 @@ impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError> {
         if let Some(prompt_embeddings) = self.prompt_embeddings.take() {
             self.cache_prompt_tokens = prompt_embeddings.token_count;
-            let logits = self
+            let prefill = self
                 .decoder
                 .prefill(&prompt_embeddings, &mut self.layer_kv_caches)
                 .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: error.to_string(),
                 })?;
             return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits,
-                greedy_token_hint: None,
+                logits: prefill.logits,
+                greedy_token_hint: prefill.greedy_token_hint,
             });
         }
         let last_token = input.generated_tokens.last().copied().ok_or_else(|| {
@@ -170,6 +182,18 @@ impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
             .ok_or_else(|| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                 reason: "moss-transcribe-diarize decode cache position underflowed".to_string(),
             })?;
+        if let Some(token_id) = self
+            .decoder
+            .decode_step_reused_top1(last_token, cache_position, &self.layer_kv_caches)
+            .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
+                reason: error.to_string(),
+            })?
+        {
+            return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: Vec::new(),
+                greedy_token_hint: Some(token_id),
+            });
+        }
         let logits = self
             .decoder
             .decode_step(last_token, cache_position, &mut self.layer_kv_caches)
@@ -270,6 +294,28 @@ fn moss_td_aligned_frame_count(total_frames: usize, merge_size: usize) -> usize 
     (total_frames / merge_size) * merge_size
 }
 
+/// Derive the per-request decode budget from audio duration, preserving the
+/// checkpoint's 4096-token ceiling solely as a fail-closed runaway backstop.
+/// This is part of the request capacity: the Metal reuse graph must have room
+/// for the complete configured decode, but must not reserve the global ceiling
+/// for short and ordinary long utterances.
+fn moss_td_generated_token_budget(sample_count: usize) -> Result<usize, MossTdExecutorError> {
+    let audio_tokens = sample_count
+        .checked_mul(MOSS_TD_GENERATED_TOKENS_PER_AUDIO_SECOND)
+        .and_then(|value| value.checked_add(SAMPLE_RATE_HZ - 1))
+        .and_then(|value| value.checked_div(SAMPLE_RATE_HZ))
+        .ok_or_else(|| MossTdExecutorError::DecodeBudgetUnavailable {
+            reason: "audio-duration token budget overflowed".to_string(),
+        })?;
+    let desired = audio_tokens
+        .checked_add(MOSS_TD_GENERATED_TOKEN_BUDGET_MARGIN)
+        .ok_or_else(|| MossTdExecutorError::DecodeBudgetUnavailable {
+            reason: "audio-duration token budget margin overflowed".to_string(),
+        })?
+        .max(MOSS_TD_MIN_GENERATED_TOKENS);
+    Ok(desired.min(MOSS_TD_MAX_GENERATED_TOKENS))
+}
+
 /// Weight-free, always-on coverage for the executor's chunk/slice-planning
 /// arithmetic: pure integer math with no model pack involved, so (unlike the
 /// family's `golden_diff_*` end-to-end tests below, which need the private
@@ -353,6 +399,26 @@ mod moss_td_chunk_frame_math_tests {
         assert_eq!(moss_td_aligned_frame_count(3_803, MERGE_SIZE), 3_800);
         assert_eq!(moss_td_aligned_frame_count(3_800, MERGE_SIZE), 3_800);
     }
+
+    #[test]
+    fn decode_budget_scales_to_the_real_moss_golden_lengths() {
+        // The private-reference goldens emit 71 tokens for JFK (11s), 76 for
+        // the mixed clip (13s), and 920 for the three-minute AISHELL-4 clip.
+        // Every budget must retain headroom while avoiding a fixed 4096-token
+        // Metal reuse-graph reservation.
+        assert_eq!(
+            moss_td_generated_token_budget(11 * SAMPLE_RATE_HZ).expect("jfk budget"),
+            194
+        );
+        assert_eq!(
+            moss_td_generated_token_budget(13 * SAMPLE_RATE_HZ).expect("mixed budget"),
+            206
+        );
+        assert_eq!(
+            moss_td_generated_token_budget(180 * SAMPLE_RATE_HZ).expect("AISHELL-4 budget"),
+            1_208
+        );
+    }
 }
 
 /// Encodes every 30s chunk of `samples` against the cached, resident encoder
@@ -433,6 +499,8 @@ fn encode_moss_td_chunks_with_cached_runtime(
 fn run_moss_td_decoder_with_cached_runtime(
     runtime_path: &Path,
     decoder_metadata: MossTdDecoderMetadata,
+    request_kv_cache_positions: usize,
+    max_generated_tokens: usize,
     decode_prompt_token_ids: &[u32],
     audio_pad_positions: &[usize],
     audio_rows: &[f32],
@@ -489,15 +557,11 @@ fn run_moss_td_decoder_with_cached_runtime(
                 token_major_values: spliced.token_major_values,
             };
 
-            // Request-sized, not the checkpoint's native 131072-token RoPE
-            // context: see `MossTdDecoderRuntime::new_kv_caches`'s doc comment
-            // for why the fixed reuse-graph span this sizes must stay tight
-            // to what this utterance actually needs.
-            let layer_kv_caches = decoder.new_kv_caches(
-                spliced
-                    .token_count
-                    .saturating_add(MOSS_TD_MAX_GENERATED_TOKENS),
-            );
+            // Use the validated request capacity, not the checkpoint's
+            // 131072-token RoPE context, so the fixed Metal reuse-graph span
+            // remains proportional to this utterance and can serve the entire
+            // configured decode budget without a mid-decode bounds failure.
+            let layer_kv_caches = decoder.new_kv_caches(request_kv_cache_positions);
             let mut step_executor = MossTdGreedyStepExecutor {
                 decoder,
                 layer_kv_caches,
@@ -508,7 +572,7 @@ fn run_moss_td_decoder_with_cached_runtime(
                 initial_prompt_tokens: decode_prompt_token_ids.to_vec(),
                 eot_token_id: tokenizer.im_end_token_id,
                 vocab_size: decoder_metadata.vocab_size,
-                max_generated_tokens: MOSS_TD_MAX_GENERATED_TOKENS,
+                max_generated_tokens,
             };
             let result = run_builtin_seq2seq_decode_policy(
                 crate::arch::MOSS_TD_DECODE_POLICY_ID,
@@ -586,6 +650,7 @@ impl MossTdGgmlExecutor {
         if samples.is_empty() {
             return Err(MossTdExecutorError::EmptyAudio);
         }
+        let max_generated_tokens = moss_td_generated_token_budget(samples.len())?;
         let audio_duration_seconds = samples.len() as f32 / SAMPLE_RATE_HZ as f32;
 
         let reader = build_runtime_tensor_reader_from_preflight(&preflight).map_err(|error| {
@@ -643,25 +708,33 @@ impl MossTdGgmlExecutor {
                 }
             })?;
 
-        // Fail closed up front when the whole-audio prompt cannot fit the
-        // decoder's KV context. This family ingests the full audio in one
-        // decode (native longform slicing is disabled for it, see the
-        // decode-policy `SelfChunkingExecutorV1`), so a very long file grows
-        // the prompt until it exceeds the KV-cache capacity. `kv_capacity`
-        // positions (~one every 12.5 audio tokens/sec plus the fixed template
-        // and generated tokens) works out to roughly 7-10 minutes of audio;
-        // beyond that, fail with a clear message instead of a cryptic mid-
-        // decode KV-bounds error (or worse, silent truncation).
+        // Fail closed up front when the whole-audio prompt plus the configured
+        // decode budget cannot fit the decoder's KV context. This family
+        // ingests the full audio in one decode (native longform slicing is
+        // disabled for it, see the decode-policy `SelfChunkingExecutorV1`), so
+        // a very long file grows the prompt until it exceeds the KV-cache
+        // capacity. The request-sized cache must reserve every possible decode
+        // position; clamping an over-limit request would defer the failure to a
+        // cryptic KV write mid-generation.
         let kv_capacity = moss_td_kv_cache_positions(decoder_metadata.max_positions);
-        if decode_prompt.token_ids.len() >= kv_capacity {
-            let max_minutes =
-                (kv_capacity as f32 / AUDIO_TOKENS_PER_SECOND_FOR_LIMIT / 60.0).max(0.0);
-            return Err(MossTdExecutorError::AudioExceedsContext {
-                prompt_tokens: decode_prompt.token_ids.len(),
-                kv_capacity,
-                max_minutes,
-            });
-        }
+        let request_kv_cache_positions = moss_td_request_kv_cache_positions(
+            decoder_metadata.max_positions,
+            decode_prompt.token_ids.len(),
+            max_generated_tokens,
+        )
+        .ok_or_else(|| MossTdExecutorError::AudioExceedsContext {
+            prompt_tokens: decode_prompt.token_ids.len(),
+            generation_budget: max_generated_tokens,
+            required_positions: decode_prompt
+                .token_ids
+                .len()
+                .saturating_add(max_generated_tokens),
+            kv_capacity,
+            max_minutes: (kv_capacity.saturating_sub(max_generated_tokens) as f32
+                / AUDIO_TOKENS_PER_SECOND_FOR_LIMIT
+                / 60.0)
+                .max(0.0),
+        })?;
 
         // Routed through the resident, thread-local decoder-runtime cache
         // (mirrors `firered_aed::executor`'s cached decoder): the loaded
@@ -672,6 +745,8 @@ impl MossTdGgmlExecutor {
         let text = run_moss_td_decoder_with_cached_runtime(
             runtime_path,
             decoder_metadata,
+            request_kv_cache_positions,
+            max_generated_tokens,
             &decode_prompt.token_ids,
             &decode_prompt.audio_pad_positions,
             &audio_rows,
