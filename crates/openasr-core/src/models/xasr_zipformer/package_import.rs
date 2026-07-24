@@ -44,7 +44,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
-use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
+use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const SOURCE_TOKENS_TXT: &str = "tokens.txt";
@@ -370,7 +370,14 @@ fn quantized_tensor_type_for_xasr_tensor(
         return None;
     }
     let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization)
+    // The zipformer acoustic encoder is `encoder.*`; the chunk decoder
+    // (`decoder.embedding.weight`, `decoder.conv.weight`) is downstream.
+    let component = if name.starts_with("encoder.") {
+        QuantComponent::Encoder
+    } else {
+        QuantComponent::Decoder
+    };
+    classify_quant_tensor(ne0, quantization, component)
 }
 
 fn join_u32(values: &[u32]) -> String {

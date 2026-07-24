@@ -61,7 +61,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
-use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
+use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 
 const SOURCE_MODEL_SAFETENSORS: &str = "model.safetensors";
 const SOURCE_DICT_TXT: &str = "dict.txt";
@@ -704,6 +704,7 @@ fn quantized_tensor_type_for_firered_tensor(
     class: TensorClass,
     dims: &[u64],
     quantization: FireRedAedQuantizationMode,
+    component: QuantComponent,
 ) -> Option<GgufWriteTensorType> {
     if quantization == FireRedAedQuantizationMode::Fp16 {
         return None;
@@ -715,7 +716,18 @@ fn quantized_tensor_type_for_firered_tensor(
         return None;
     }
     let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization)
+    classify_quant_tensor(ne0, quantization, component)
+}
+
+/// Conformer encoder tensors map onto `enc.*` (`enc.blk.*`, `enc.subsample.*`,
+/// `enc.pos_enc.pe`); the Transformer decoder is `dec.*` (`dec.blk.*`,
+/// `dec.tok_emb`, `dec.out_proj`). The encoder carries the shared Q8_0 floor.
+fn firered_quant_component(target_name: &str) -> QuantComponent {
+    if target_name.starts_with("enc.") {
+        QuantComponent::Encoder
+    } else {
+        QuantComponent::Decoder
+    }
 }
 
 fn build_firered_runtime_tensors(
@@ -757,6 +769,7 @@ fn build_firered_runtime_tensors(
             class,
             &target_dims,
             quantization,
+            firered_quant_component(&target_name),
         ) {
             Some(qtype) => {
                 let values = decode_safetensors_payload_as_f32(&tensor.name, &tensor.dtype, data)?;
@@ -1010,7 +1023,8 @@ mod tests {
             quantized_tensor_type_for_firered_tensor(
                 Linear,
                 &[1280, 5120],
-                FireRedAedQuantizationMode::Q4_K
+                FireRedAedQuantizationMode::Q4_K,
+                QuantComponent::Decoder
             ),
             Some(GgufWriteTensorType::Q4_K)
         );
@@ -1018,7 +1032,8 @@ mod tests {
             quantized_tensor_type_for_firered_tensor(
                 PointwiseConvSqueeze,
                 &[1280, 5120],
-                FireRedAedQuantizationMode::Q8_0
+                FireRedAedQuantizationMode::Q8_0,
+                QuantComponent::Decoder
             ),
             Some(GgufWriteTensorType::Q8_0)
         );
@@ -1027,7 +1042,8 @@ mod tests {
             quantized_tensor_type_for_firered_tensor(
                 Linear,
                 &[1280, 5120],
-                FireRedAedQuantizationMode::Fp16
+                FireRedAedQuantizationMode::Fp16,
+                QuantComponent::Decoder
             ),
             None
         );
@@ -1035,7 +1051,8 @@ mod tests {
             quantized_tensor_type_for_firered_tensor(
                 ConvKernel,
                 &[33, 1, 2560],
-                FireRedAedQuantizationMode::Q4_K
+                FireRedAedQuantizationMode::Q4_K,
+                QuantComponent::Decoder
             ),
             None
         );
@@ -1043,7 +1060,8 @@ mod tests {
             quantized_tensor_type_for_firered_tensor(
                 F16Table,
                 &[1280, 7832, 1],
-                FireRedAedQuantizationMode::Q4_K
+                FireRedAedQuantizationMode::Q4_K,
+                QuantComponent::Decoder
             ),
             None
         );
@@ -1052,9 +1070,25 @@ mod tests {
             quantized_tensor_type_for_firered_tensor(
                 Linear,
                 &[100, 5120],
-                FireRedAedQuantizationMode::Q8_0
+                FireRedAedQuantizationMode::Q8_0,
+                QuantComponent::Decoder
             ),
             None
+        );
+    }
+
+    #[test]
+    fn encoder_linear_carries_a_q8_0_floor_in_a_q4_k_pack() {
+        // A 256-aligned encoder linear would take q4_k on the decoder side, but
+        // the shared encoder floor clamps it to q8_0.
+        assert_eq!(
+            quantized_tensor_type_for_firered_tensor(
+                Linear,
+                &[1280, 5120],
+                FireRedAedQuantizationMode::Q4_K,
+                QuantComponent::Encoder
+            ),
+            Some(GgufWriteTensorType::Q8_0)
         );
     }
 

@@ -44,6 +44,25 @@ impl PackQuant {
     }
 }
 
+/// Which side of a model a quantizable tensor lives on, used to apply the
+/// audio-encoder Q8_0 floor.
+///
+/// Sub-Q8 block quantization of *audio-encoder* weights is a behavioral cliff
+/// rather than a gradual WER loss: long-audio greedy decode collapses into
+/// repetition or empty output (e.g. the qwen3-asr 1.7b q4_k pack degrading to a
+/// "Today, today" text collapse). The audio encoder therefore carries a hard
+/// Q8_0 floor regardless of the requested rung, while decoder / LLM / CTC /
+/// joint / embedding / output-head tensors keep the full requested rung.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuantComponent {
+    /// Audio encoder / audio-tower weights: the acoustic feature extractor that
+    /// feeds the decoder, including any encoder->LLM projector.
+    Encoder,
+    /// Everything downstream of the encoder: text decoder / LLM layers, CTC /
+    /// joint heads, token embeddings, and output projections.
+    Decoder,
+}
+
 /// Shared 32/256-alignment + K-quant-rung selection tail.
 ///
 /// Callers first resolve their own family-specific tensor eligibility
@@ -52,14 +71,21 @@ impl PackQuant {
 /// decides, given an already-eligible rank-2 axis length, whether
 /// q8_0/q3_k/q4_k applies or the tensor falls back to `None` (its fp16-mode
 /// representation).
+///
+/// `component` carries the audio-encoder Q8_0 floor: an `Encoder` tensor never
+/// takes the Q3_K/Q4_K rungs and always lands on Q8_0 once 32-aligned, while a
+/// `Decoder` tensor keeps the full requested rung. Each family supplies the
+/// classification (it owns the tensor-naming knowledge); the floor policy itself
+/// lives here so every importer applies it identically.
 pub(crate) fn classify_quant_tensor(
     ne0: u64,
     quantization: PackQuant,
+    component: QuantComponent,
 ) -> Option<GgufWriteTensorType> {
     if !ne0.is_multiple_of(32_u64) {
         return None;
     }
-    if ne0.is_multiple_of(256_u64) {
+    if ne0.is_multiple_of(256_u64) && component == QuantComponent::Decoder {
         if quantization == PackQuant::Q3_K {
             return Some(GgufWriteTensorType::Q3_K);
         }
@@ -76,21 +102,30 @@ mod tests {
 
     #[test]
     fn unaligned_ne0_falls_back_to_fp16_representation() {
-        assert_eq!(classify_quant_tensor(31, PackQuant::Q8_0), None);
         assert_eq!(
-            classify_quant_tensor(32, PackQuant::Q8_0),
+            classify_quant_tensor(31, PackQuant::Q8_0, QuantComponent::Decoder),
+            None
+        );
+        assert_eq!(
+            classify_quant_tensor(32, PackQuant::Q8_0, QuantComponent::Decoder),
             Some(GgufWriteTensorType::Q8_0)
+        );
+        // Encoder alignment gating is unchanged: an unaligned encoder tensor
+        // still keeps its (higher-precision) fp16-mode representation.
+        assert_eq!(
+            classify_quant_tensor(31, PackQuant::Q4_K, QuantComponent::Encoder),
+            None
         );
     }
 
     #[test]
     fn q4_k_requires_256_alignment_else_falls_back_to_q8_0() {
         assert_eq!(
-            classify_quant_tensor(32, PackQuant::Q4_K),
+            classify_quant_tensor(32, PackQuant::Q4_K, QuantComponent::Decoder),
             Some(GgufWriteTensorType::Q8_0)
         );
         assert_eq!(
-            classify_quant_tensor(256, PackQuant::Q4_K),
+            classify_quant_tensor(256, PackQuant::Q4_K, QuantComponent::Decoder),
             Some(GgufWriteTensorType::Q4_K)
         );
     }
@@ -98,11 +133,47 @@ mod tests {
     #[test]
     fn q3_k_requires_256_alignment_else_falls_back_to_q8_0() {
         assert_eq!(
-            classify_quant_tensor(32, PackQuant::Q3_K),
+            classify_quant_tensor(32, PackQuant::Q3_K, QuantComponent::Decoder),
             Some(GgufWriteTensorType::Q8_0)
         );
         assert_eq!(
-            classify_quant_tensor(256, PackQuant::Q3_K),
+            classify_quant_tensor(256, PackQuant::Q3_K, QuantComponent::Decoder),
+            Some(GgufWriteTensorType::Q3_K)
+        );
+    }
+
+    #[test]
+    fn encoder_carries_a_q8_0_floor_below_the_requested_rung() {
+        // A 256-aligned encoder tensor would normally take the K-quant rungs,
+        // but the floor clamps it to Q8_0 so long-audio greedy decode never sees
+        // a sub-Q8 acoustic encoder.
+        assert_eq!(
+            classify_quant_tensor(256, PackQuant::Q4_K, QuantComponent::Encoder),
+            Some(GgufWriteTensorType::Q8_0)
+        );
+        assert_eq!(
+            classify_quant_tensor(256, PackQuant::Q3_K, QuantComponent::Encoder),
+            Some(GgufWriteTensorType::Q8_0)
+        );
+        // Q8_0 and 32-aligned (non-256) cases are unaffected by the floor.
+        assert_eq!(
+            classify_quant_tensor(256, PackQuant::Q8_0, QuantComponent::Encoder),
+            Some(GgufWriteTensorType::Q8_0)
+        );
+        assert_eq!(
+            classify_quant_tensor(32, PackQuant::Q4_K, QuantComponent::Encoder),
+            Some(GgufWriteTensorType::Q8_0)
+        );
+    }
+
+    #[test]
+    fn decoder_keeps_the_full_requested_rung() {
+        assert_eq!(
+            classify_quant_tensor(256, PackQuant::Q4_K, QuantComponent::Decoder),
+            Some(GgufWriteTensorType::Q4_K)
+        );
+        assert_eq!(
+            classify_quant_tensor(256, PackQuant::Q3_K, QuantComponent::Decoder),
             Some(GgufWriteTensorType::Q3_K)
         );
     }

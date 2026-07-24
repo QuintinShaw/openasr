@@ -40,7 +40,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
-use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
+use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 
 use crate::arch::{SENSEVOICE_GGML_ARCHITECTURE_ID, SENSEVOICE_MODEL_FAMILY};
 
@@ -594,7 +594,14 @@ fn quantized_tensor_type_for_sensevoice_tensor(
         return None;
     }
     let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization)
+    // The SAN-M encoder (`enc.blk.*`) and the two-pass encoder (`tp.blk.*`) are
+    // the acoustic front end; `ctc.head` / `embed.prompt` are downstream.
+    let component = if name.starts_with("enc.") || name.starts_with("tp.") {
+        QuantComponent::Encoder
+    } else {
+        QuantComponent::Decoder
+    };
+    classify_quant_tensor(ne0, quantization, component)
 }
 
 fn sensevoice_runtime_gguf_metadata(

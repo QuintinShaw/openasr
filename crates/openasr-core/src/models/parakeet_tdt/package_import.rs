@@ -34,7 +34,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
-use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
+use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 
 use super::runtime_contract::{
     PARAKEET_TDT_BLANK_TOKEN_ID_KEY, PARAKEET_TDT_CONV_KERNEL_KEY, PARAKEET_TDT_DURATIONS_KEY,
@@ -418,7 +418,15 @@ fn quantized_tensor_type_for_tensor(
         return None;
     }
     let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization)
+    // Only the conformer encoder linears (`enc.blk.*`) are F16Quantizable; the
+    // predictor (`dec.*`) and joint (`joint.*`) stay F16, so every tensor that
+    // reaches here is encoder and carries the floor.
+    let component = if name.starts_with("enc.") {
+        QuantComponent::Encoder
+    } else {
+        QuantComponent::Decoder
+    };
+    classify_quant_tensor(ne0, quantization, component)
 }
 
 fn parakeet_tdt_runtime_gguf_metadata(
@@ -560,6 +568,8 @@ mod tests {
         let up = remap_parakeet_tdt_tensor_name("encoder.layers.3.feed_forward1.linear1.weight")
             .expect("ff1 up");
         assert_eq!(up.storage, TensorStorage::F16Quantizable);
+        // Encoder linears are quantizable but carry the Q8_0 floor: a q4_k
+        // request clamps to q8_0 so the acoustic encoder never goes sub-Q8.
         assert_eq!(
             quantized_tensor_type_for_tensor(
                 &up.target_name,
@@ -567,7 +577,7 @@ mod tests {
                 up.storage,
                 ParakeetTdtQuantizationMode::Q4_K,
             ),
-            Some(GgufWriteTensorType::Q4_K)
+            Some(GgufWriteTensorType::Q8_0)
         );
         let head = remap_parakeet_tdt_tensor_name("joint.head.weight").expect("joint head");
         assert_eq!(head.storage, TensorStorage::F16);

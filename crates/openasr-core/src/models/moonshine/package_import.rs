@@ -24,7 +24,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, insert_metadata,
     insert_metadata_string_array as insert_string_array, insert_metadata_u32 as insert_u32,
 };
-use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
+use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 use crate::{read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source};
 
 const SOURCE_CONFIG_JSON: &str = "config.json";
@@ -413,7 +413,14 @@ fn quantized_tensor_type_for_moonshine_tensor(
     if name == "dec.emb.weight" {
         return Some(GgufWriteTensorType::Q8_0);
     }
-    classify_quant_tensor(ne0, quantization)
+    // The acoustic encoder is `enc.*`; `dec.*` (incl. the encoder cross-attention
+    // mapped to `dec.blk.{i}.cross_*`) is the decoder side.
+    let component = if name.starts_with("enc.") {
+        QuantComponent::Encoder
+    } else {
+        QuantComponent::Decoder
+    };
+    classify_quant_tensor(ne0, quantization, component)
 }
 
 #[derive(Debug, Clone)]

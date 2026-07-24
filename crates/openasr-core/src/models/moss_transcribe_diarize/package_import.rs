@@ -78,7 +78,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, OasrMetadataBuilder,
     TOKENIZER_GGML_MERGES_KEY, TOKENIZER_GGML_MODEL_KEY, TOKENIZER_GGML_TOKENS_KEY,
 };
-use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
+use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 
 use super::runtime_contract::moss_td_kv_cache_positions;
 use super::tensor_names::{
@@ -416,12 +416,25 @@ fn reversed_dims(shape: &[u64]) -> Vec<u64> {
 fn quantized_linear_tensor_type(
     dims: &[u64],
     quantization: MossTdQuantizationMode,
+    component: QuantComponent,
 ) -> Option<GgufWriteTensorType> {
     if quantization == MossTdQuantizationMode::Fp16 {
         return None;
     }
     let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization)
+    classify_quant_tensor(ne0, quantization, component)
+}
+
+/// The acoustic path is the whisper encoder (`moss.enc.*`) plus its
+/// encoder->LLM projector (`moss.adaptor.*`, the analogue of qwen's
+/// `audio.proj*`); both carry the shared Q8_0 floor. The `moss.llm.*` text
+/// decoder keeps the full requested rung.
+fn moss_quant_component(target_name: &str) -> QuantComponent {
+    if target_name.starts_with("moss.enc.") || target_name.starts_with("moss.adaptor.") {
+        QuantComponent::Encoder
+    } else {
+        QuantComponent::Decoder
+    }
 }
 
 fn maybe_quantized_linear_tensor(
@@ -431,7 +444,11 @@ fn maybe_quantized_linear_tensor(
     target_dims: Vec<u64>,
     quantization: MossTdQuantizationMode,
 ) -> Result<GgufWriteTensor, LocalSourceImportError> {
-    match quantized_linear_tensor_type(&target_dims, quantization) {
+    match quantized_linear_tensor_type(
+        &target_dims,
+        quantization,
+        moss_quant_component(target_name),
+    ) {
         Some(tensor_type) => {
             let values = decode_safetensors_payload_as_f32(&tensor.name, &tensor.dtype, data)?;
             let expected = tensor_element_count(&tensor.name, &target_dims)?;

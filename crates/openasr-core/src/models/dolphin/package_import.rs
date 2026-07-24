@@ -72,7 +72,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
-use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
+use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 use crate::nn::half::f32_to_f16_bits;
 
 // --- E-Branchformer / Transformer configuration -------------------------------
@@ -725,7 +725,14 @@ fn dolphin_quant_type_for_tensor(
     }
     // Reversed ne0 == the safetensors innermost (last) dim == `in`.
     let ne0 = *shape.last()?;
-    classify_quant_tensor(ne0, quantization)
+    // dolphin keeps WeNet source names: the acoustic encoder is `encoder.*`;
+    // `decoder.*` / `ctc.*` / `context_module.*` (hotword) are downstream.
+    let component = if name.starts_with("encoder.") {
+        QuantComponent::Encoder
+    } else {
+        QuantComponent::Decoder
+    };
+    classify_quant_tensor(ne0, quantization, component)
 }
 
 /// Build one runtime tensor. Quantizable rank-2 `.weight` matrices are block-
@@ -1048,11 +1055,12 @@ mod tests {
             ),
             Some(GgufWriteTensorType::Q8_0)
         );
-        // q4_k: in-dim 256-aligned -> Q4_K; only 32- (not 256-) aligned -> Q8_0.
+        // q4_k on a decoder tensor: in-dim 256-aligned -> Q4_K; only 32- (not
+        // 256-) aligned -> Q8_0.
         assert_eq!(
             dolphin_quant_type_for_tensor(
-                "encoder.encoders.0.feed_forward.w_2.weight",
-                &[768, 3072],
+                "decoder.output_layer.weight",
+                &[18173, 768],
                 DolphinQuantizationMode::Q4_K
             ),
             Some(GgufWriteTensorType::Q4_K)
@@ -1061,6 +1069,17 @@ mod tests {
             dolphin_quant_type_for_tensor(
                 "some.proj.weight",
                 &[10, 96],
+                DolphinQuantizationMode::Q4_K
+            ),
+            Some(GgufWriteTensorType::Q8_0)
+        );
+        // The audio encoder carries a Q8_0 floor: a 256-aligned encoder linear
+        // that would otherwise take q4_k clamps to q8_0 (sub-Q8 encoder weights
+        // collapse long-audio greedy decode).
+        assert_eq!(
+            dolphin_quant_type_for_tensor(
+                "encoder.encoders.0.feed_forward.w_2.weight",
+                &[768, 3072],
                 DolphinQuantizationMode::Q4_K
             ),
             Some(GgufWriteTensorType::Q8_0)

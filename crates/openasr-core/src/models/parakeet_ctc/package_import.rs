@@ -35,7 +35,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
-use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
+use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 
 use super::{PARAKEET_CTC_GGML_ARCHITECTURE_ID, PARAKEET_CTC_MODEL_FAMILY};
 
@@ -353,7 +353,14 @@ fn quantized_tensor_type_for_parakeet_tensor(
         return None;
     }
     let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization)
+    // Only the conformer encoder linears (`enc.blk.*`) are quantizable here
+    // (the subsampling prelude and CTC head are f32); they carry the floor.
+    let component = if name.starts_with("enc.") {
+        QuantComponent::Encoder
+    } else {
+        QuantComponent::Decoder
+    };
+    classify_quant_tensor(ne0, quantization, component)
 }
 
 fn parakeet_runtime_gguf_metadata(

@@ -83,7 +83,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
-use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
+use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 
 use super::tensor_names::{
     ADAPTER_LINEAR1_BIAS, ADAPTER_LINEAR1_WEIGHT, ADAPTER_LINEAR2_BIAS, ADAPTER_LINEAR2_WEIGHT,
@@ -592,7 +592,9 @@ fn quantized_tensor_type_for_encoder_adapter_tensor(
         return None;
     }
     let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization)
+    // This builder emits only the acoustic encoder + its adapter (the audio
+    // tower feeding the Qwen2 LLM), so every tensor here carries the floor.
+    classify_quant_tensor(ne0, quantization, QuantComponent::Encoder)
 }
 
 fn build_encoder_adapter_runtime_tensors(
@@ -925,7 +927,9 @@ fn quantized_tensor_type_for_qwen2(
         return None;
     }
     let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization)
+    // This builder emits only the Qwen2 text decoder/LLM, which keeps the full
+    // requested rung (the audio encoder floor does not apply here).
+    classify_quant_tensor(ne0, quantization, QuantComponent::Decoder)
 }
 
 fn build_llm_runtime_tensors(
@@ -1550,13 +1554,16 @@ mod tests {
 
     #[test]
     fn quantizes_only_linear_encoder_adapter_classes_with_aligned_ne0() {
+        // The encoder/adapter is the audio tower, so it carries the Q8_0 floor:
+        // a q4_k request on an aligned linear clamps to q8_0 (still quantized,
+        // just not sub-Q8).
         assert_eq!(
             quantized_tensor_type_for_encoder_adapter_tensor(
                 TensorClass::Linear,
                 &[1280, 5120],
                 FireRedLlmQuantizationMode::Q4_K
             ),
-            Some(GgufWriteTensorType::Q4_K)
+            Some(GgufWriteTensorType::Q8_0)
         );
         assert_eq!(
             quantized_tensor_type_for_encoder_adapter_tensor(

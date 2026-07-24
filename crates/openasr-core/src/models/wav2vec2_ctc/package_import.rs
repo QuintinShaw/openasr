@@ -32,7 +32,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1,
 };
-use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
+use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 use crate::nn::half::f32_to_f16_bits;
 use crate::nn::wav2vec2::fold_pos_conv_weight_norm;
 
@@ -564,7 +564,14 @@ fn quantized_tensor_type_for_wav2vec2_tensor(
         return None;
     }
     let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization)
+    // The wav2vec2 backbone is `enc.*` (feature projection, transformer layers,
+    // norm); `ctc.head` is the output projection. The encoder carries the floor.
+    let component = if name.starts_with("enc.") {
+        QuantComponent::Encoder
+    } else {
+        QuantComponent::Decoder
+    };
+    classify_quant_tensor(ne0, quantization, component)
 }
 
 fn wav2vec2_runtime_gguf_metadata(

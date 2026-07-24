@@ -25,7 +25,7 @@ use crate::models::{
         OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, insert_metadata,
         insert_metadata_string_array, insert_metadata_u32, insert_metadata_u32_array,
     },
-    pack_quant::{PackQuant, classify_quant_tensor},
+    pack_quant::{PackQuant, QuantComponent, classify_quant_tensor},
     whisper::WHISPER_MODEL_FAMILY,
 };
 use crate::nn::half::{f16_bits_slice_to_f32, f32_to_f16_bits};
@@ -206,12 +206,18 @@ fn quantization_tensor_type_for_whisper_tensor(
         return None;
     }
     let name = tensor.name.as_str();
-    if !is_whisper_encoder_linear_weight(name) && !is_whisper_decoder_linear_weight(name) {
+    let is_encoder = is_whisper_encoder_linear_weight(name);
+    if !is_encoder && !is_whisper_decoder_linear_weight(name) {
         return None;
     }
+    let component = if is_encoder {
+        QuantComponent::Encoder
+    } else {
+        QuantComponent::Decoder
+    };
     let dims = gguf_runtime_tensor_dims_from_source_tensor(tensor);
     let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization)
+    classify_quant_tensor(ne0, quantization, component)
 }
 
 fn gguf_quantized_tensor_from_safetensors(
@@ -1206,7 +1212,10 @@ mod tests {
     }
 
     #[test]
-    fn quantized_encoder_linear_import_q4_k_is_smaller_than_q8_0() {
+    fn quantized_encoder_linear_q4_k_request_is_floored_to_q8_0() {
+        // A q4_k pack must NOT push the audio encoder below q8_0: sub-Q8 encoder
+        // weights collapse long-audio greedy decode, so the q4_k request is
+        // floored to a byte-identical q8_0 payload.
         let tensor = SafetensorsTensorHeader {
             name: "model.encoder.layers.0.fc1.weight".to_string(),
             dtype: "F32".to_string(),
@@ -1232,9 +1241,42 @@ mod tests {
         .expect("q4_k tensor should import");
 
         assert_eq!(q8.tensor_type, GgufWriteTensorType::Q8_0);
+        assert_eq!(q4.tensor_type, GgufWriteTensorType::Q8_0);
+        assert_eq!(q4.data.len(), q8.data.len());
+        assert!(q8.data.len() < (256 * 2 * 2));
+    }
+
+    #[test]
+    fn quantized_decoder_linear_q4_k_is_smaller_than_q8_0() {
+        // The floor is encoder-only: a decoder linear still honors the q4_k rung
+        // and stays smaller than its q8_0 form.
+        let tensor = SafetensorsTensorHeader {
+            name: "model.decoder.layers.0.fc1.weight".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![2, 256],
+            data_offsets: [0, 2 * 256 * 4],
+        };
+        let data = (0..(2 * 256))
+            .map(|index| (index as f32) * 0.002 - 0.5)
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        let q8 = gguf_tensor_from_safetensors_tensor(
+            &tensor,
+            &data,
+            WhisperRuntimeQuantizationMode::Q8_0,
+        )
+        .expect("q8_0 tensor should import");
+        let q4 = gguf_tensor_from_safetensors_tensor(
+            &tensor,
+            &data,
+            WhisperRuntimeQuantizationMode::Q4_K,
+        )
+        .expect("q4_k tensor should import");
+
+        assert_eq!(q8.tensor_type, GgufWriteTensorType::Q8_0);
         assert_eq!(q4.tensor_type, GgufWriteTensorType::Q4_K);
         assert!(q4.data.len() < q8.data.len());
-        assert!(q8.data.len() < (256 * 2 * 2));
     }
 
     #[test]

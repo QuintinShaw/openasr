@@ -31,7 +31,7 @@ use crate::models::oasr_metadata::{
 pub(super) use crate::models::oasr_metadata::{
     insert_metadata, insert_metadata_string_array, insert_metadata_u32,
 };
-use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
+use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 use crate::models::runtime_tensor_contract_registry::validate_builtin_runtime_tensor_contract_for_architecture;
 use crate::models::{qwen::QWEN3_ASR_MODEL_FAMILY, qwen::runtime_contract};
 
@@ -771,7 +771,19 @@ fn quantized_tensor_type_for_qwen(
         return None;
     }
     let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization)
+    classify_quant_tensor(ne0, quantization, qwen_quant_component(name))
+}
+
+/// Encoder/audio-tower tensors map onto the `audio.*` runtime namespace
+/// (`audio.conv*`, `audio.proj*`, `audio.blk.*`, `audio.ln_post`); everything
+/// else (`blk.*` LLM layers, `token_embd`, `output*`) is the decoder side. The
+/// audio tower carries the shared Q8_0 floor (see `classify_quant_tensor`).
+fn qwen_quant_component(name: &str) -> QuantComponent {
+    if name.starts_with("audio.") {
+        QuantComponent::Encoder
+    } else {
+        QuantComponent::Decoder
+    }
 }
 
 fn f32_tensor(name: &str, dims: Vec<u64>, values: Vec<f32>) -> GgufWriteTensor {
@@ -873,7 +885,56 @@ fn slaney_mel_filterbank(
 
 #[cfg(test)]
 mod tests {
-    use super::should_reverse_qwen_tensor_dims;
+    use super::{quantized_tensor_type_for_qwen, should_reverse_qwen_tensor_dims};
+    use crate::ggml_runtime::GgufWriteTensorType;
+    use crate::models::pack_quant::PackQuant;
+
+    #[test]
+    fn audio_tower_weights_carry_a_q8_0_floor_in_a_q4_k_pack() {
+        // A 256-aligned audio-tower weight would otherwise take q4_k; the
+        // encoder floor clamps it to q8_0 so a sub-Q8 acoustic encoder can never
+        // drive long-audio greedy decode into a repetition loop.
+        for name in [
+            "audio.proj2.weight",
+            "audio.blk.7.attn_q.weight",
+            "audio.conv_out.weight",
+        ] {
+            assert_eq!(
+                quantized_tensor_type_for_qwen(name, &[2048, 896], false, PackQuant::Q4_K),
+                Some(GgufWriteTensorType::Q8_0),
+                "{name}"
+            );
+            assert_eq!(
+                quantized_tensor_type_for_qwen(name, &[2048, 896], false, PackQuant::Q3_K),
+                Some(GgufWriteTensorType::Q8_0),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_weights_keep_the_requested_q4_k_rung() {
+        // The floor must not touch the LLM/decoder side: a 256-aligned blk
+        // weight still quantizes to q4_k.
+        assert_eq!(
+            quantized_tensor_type_for_qwen(
+                "blk.0.attn_q.weight",
+                &[2048, 2048],
+                false,
+                PackQuant::Q4_K
+            ),
+            Some(GgufWriteTensorType::Q4_K)
+        );
+        assert_eq!(
+            quantized_tensor_type_for_qwen(
+                "blk.5.ffn_down.weight",
+                &[2048, 4096],
+                false,
+                PackQuant::Q4_K
+            ),
+            Some(GgufWriteTensorType::Q4_K)
+        );
+    }
 
     #[test]
     fn qwen_tensor_dim_orientation_matches_runtime_contract() {

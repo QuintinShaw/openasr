@@ -22,7 +22,7 @@ use crate::models::oasr_metadata::{
     OASR_METADATA_KEY_MODEL_ARCHITECTURE, OASR_METADATA_KEY_MODEL_FAMILY,
     OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1, OasrMetadataBuilder,
 };
-use crate::models::pack_quant::{PackQuant, classify_quant_tensor};
+use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 use crate::models::runtime_tensor_contract_registry::validate_builtin_runtime_tensor_contract_for_architecture;
 use crate::models::{cohere::COHERE_TRANSCRIBE_MODEL_FAMILY, cohere::runtime_contract};
 use crate::{read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source};
@@ -548,7 +548,18 @@ fn quantized_tensor_type_for_cohere_tensor(
         return None;
     }
     let ne0 = dims.first().copied()?;
-    classify_quant_tensor(ne0, quantization)
+    classify_quant_tensor(ne0, quantization, cohere_quant_component(name))
+}
+
+/// Encoder/audio-front-end tensors map onto the `enc.*` namespace (`enc.pre.*`,
+/// `enc.proj`, `enc.blk.*`); the transformer decoder is `dec.*`. The encoder
+/// carries the shared Q8_0 floor (see `classify_quant_tensor`).
+fn cohere_quant_component(name: &str) -> QuantComponent {
+    if name.starts_with("enc.") {
+        QuantComponent::Encoder
+    } else {
+        QuantComponent::Decoder
+    }
 }
 
 #[derive(Debug, Clone)]
