@@ -1,9 +1,9 @@
 //! Unit tests for the realtime module. Pure code-motion from `realtime.rs`.
 
-use std::{collections::BTreeMap, fs, sync::OnceLock};
+use std::{collections::BTreeMap, fs, num::NonZeroUsize, sync::OnceLock};
 
 use super::*;
-use crate::PairingCredentialState;
+use crate::{ModelSessionAdmissionError, NativeExecutionSupervisor, PairingCredentialState};
 
 fn test_distribution() -> DistributionContext {
     let temp = tempfile::tempdir().unwrap();
@@ -2008,6 +2008,40 @@ async fn boot_native_warmup_runs_in_background_without_blocking_a_concurrent_tas
 }
 
 #[tokio::test]
+async fn boot_native_warmup_skips_when_the_runtime_slot_is_occupied() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_path = temp.path().join("boot-warmup-capacity-skip.oasr");
+    write_xasr_streaming_fixture_pack(&pack_path, "boot-warmup-capacity-skip");
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap()),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_path),
+    };
+    let occupied_slot = runtime
+        .acquire_native_execution()
+        .expect("fixture runtime must admit the active native session");
+
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        warm_up_default_native_streaming_worker(runtime.clone()),
+    )
+    .await
+    .expect("boot warm-up must skip instead of waiting for a busy model slot");
+
+    assert!(
+        runtime.acquire_native_execution().is_err(),
+        "the only capacity slot must still belong to the active native session"
+    );
+    drop(occupied_slot);
+    assert!(
+        runtime.acquire_native_execution().is_ok(),
+        "skipped boot warm-up must not retain a capacity permit"
+    );
+}
+
+#[tokio::test]
 async fn health_answers_immediately_while_boot_warmup_is_artificially_slow() {
     use tower::ServiceExt;
 
@@ -3251,6 +3285,54 @@ async fn finish_remembers_backend_error_seen_before_shutdown() {
 }
 
 #[tokio::test]
+async fn fallback_capacity_error_is_backend_not_ready_and_recoverable() {
+    let (event_sender, mut event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
+        "test_session",
+        "whisper-large-v3-turbo",
+        timestamp_now(),
+    ))
+    .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+        .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
+        .unwrap();
+    session.controller = Some(controller);
+
+    assert!(
+        session
+            .apply_backend_result(BackendResult::Error(ApiError::ModelSessionCapacity(
+                ModelSessionAdmissionError {
+                    model_identity: "native:whisper-large-v3-turbo@pack-a".to_string(),
+                    limit: NonZeroUsize::new(1).unwrap(),
+                },
+            )))
+            .await
+            .is_ok(),
+        "capacity exhaustion must not fail the realtime fallback session"
+    );
+    assert!(!session.backend_failed);
+    assert!(!session.backend_cancelled.load(Ordering::Relaxed));
+
+    let event = event_receiver
+        .recv()
+        .await
+        .expect("capacity exhaustion must emit a realtime error event");
+    assert_eq!(event.event_type, "error");
+    assert!(matches!(
+        event.event,
+        RealtimeEvent::Error(RealtimeErrorEvent {
+            code: RealtimeErrorCode::BackendNotReady,
+            recoverable: true,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
 async fn finish_transport_closed_cancels_pending_backend_jobs_without_waiting() {
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
@@ -3479,6 +3561,55 @@ async fn session_start_rejects_diarize_without_embedder_pack() {
             assert!(message.contains("speaker-embedder pack"));
         }
         other => panic!("expected startup config error, got {other:?}"),
+    }
+}
+
+#[test]
+fn hymt2_translation_worker_permit_lives_until_worker_exits() {
+    let supervisor = NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap());
+    let model_identity = format!("hymt2:{HYMT2_TRANSLATION_MODEL_ID}");
+    let permit = supervisor
+        .try_acquire(model_identity.clone())
+        .expect("translation worker must acquire its model slot");
+    let (initialized_sender, initialized_receiver) = std::sync::mpsc::channel();
+
+    let translation = TranslationSession::spawn_thread_local(move || {
+        // This mirrors `load_hymt2_translation_session`: the permit is captured
+        // by the thread-local worker closure, not by the caller that spawned it.
+        let _model_session_permit = permit;
+        initialized_sender
+            .send(())
+            .expect("test must observe translation worker initialization");
+        Ok(move |_request: TranslationRequest| {
+            let _permit = &_model_session_permit;
+            Ok(TranslationWorkerOutput {
+                text: "translated".to_string(),
+                timings: openasr_core::TranslationTimings::default(),
+            })
+        })
+    });
+
+    initialized_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("translation worker must initialize");
+    assert!(
+        supervisor.try_acquire(model_identity.clone()).is_err(),
+        "the worker must retain its Hy-MT2 permit while it remains alive"
+    );
+
+    drop(translation);
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Ok(permit) = supervisor.try_acquire(model_identity.clone()) {
+            drop(permit);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker exit must release the Hy-MT2 permit"
+        );
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 

@@ -986,7 +986,7 @@ pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime) {
     });
 }
 
-async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {
+pub(crate) async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {
     if runtime.backend != openasr_core::BackendKind::Native {
         return;
     }
