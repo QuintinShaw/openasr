@@ -153,6 +153,17 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   code outside the advertised set reports `language: null` rather than a guess.
   SenseVoice also classifies emotion and audio events internally, but those
   tags are intentionally not exposed on the API surface yet.
+- Cooperative cancel of an in-flight offline transcription is layered: long-form
+  slice boundaries (L0), shared seq2seq greedy token / prefill chunk checks (L1),
+  and a ggml `abort_callback` on graph compute (L2). CPU graphs poll the callback
+  between nodes and can return a typed abort mid-graph. **Apple Metal mid-graph
+  cancel is not effective today**: ggml's production Metal path does not return
+  `GGML_STATUS_ABORTED` outside the capture/gputrace branch, so cancel on Metal
+  lands at the next Rust-level graph boundary (typically the next decode token
+  or encoder/prefill chunk). Discrete GPU backends that lack a
+  `ggml_backend_set_abort_callback` proc are a silent no-op at L2 and likewise
+  rely on L0/L1. Pause still only blocks at slice boundaries; it never arms the
+  ggml abort callback.
 
 ## What works now
 

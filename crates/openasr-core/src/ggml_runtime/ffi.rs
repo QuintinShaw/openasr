@@ -83,7 +83,17 @@ pub(crate) const GGML_BACKEND_DEVICE_TYPE_ACCEL: c_int = 3;
 pub(crate) const GGML_BACKEND_DEVICE_TYPE_META: c_int = 4;
 
 pub(crate) const GGML_STATUS_SUCCESS: c_int = 0;
+/// Mirrors `enum ggml_status` in ggml.h (`GGML_STATUS_ABORTED = 1`).
+/// Returned by CPU graph compute when the installed abort_callback returns true
+/// between nodes. Metal production graphs currently ignore abort mid-graph
+/// (see docs/KNOWN_LIMITATIONS.md); the status is still mapped so a future
+/// upstream Metal path surfaces as a typed cancel rather than ComputeFailed.
+pub(crate) const GGML_STATUS_ABORTED: c_int = 1;
 pub(crate) const GGML_BACKEND_BUFFER_USAGE_WEIGHTS: c_int = 1;
+
+/// ggml abort predicate: return true to abort the in-flight graph. Called from
+/// ggml worker threads -- must stay panic-free and lock-light.
+pub(crate) type GgmlAbortCallback = Option<unsafe extern "C" fn(data: *mut c_void) -> bool>;
 
 pub(crate) const GGML_TYPE_F32: c_int = 0;
 pub(crate) const GGML_TYPE_F16: c_int = 1;
@@ -276,6 +286,19 @@ unsafe extern "C" {
     pub(crate) fn ggml_backend_blas_init() -> GgmlBackendRaw;
     #[cfg(target_os = "macos")]
     pub(crate) fn ggml_backend_blas_set_n_threads(backend: GgmlBackendRaw, n_threads: c_int);
+    // Metal does not register `ggml_backend_set_abort_callback` on its
+    // get_proc_address table (only CPU does). Fall back to the direct symbol
+    // linked via static ggml-metal on Apple hosts. Mid-graph abort on the
+    // production Metal path is still a no-op upstream; wiring is intentional
+    // so flag=false graphs stay SUCCESS and a future Metal ABORTED path works.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ggml_backend_is_metal(backend: GgmlBackendRaw) -> bool;
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ggml_backend_metal_set_abort_callback(
+        backend: GgmlBackendRaw,
+        abort_callback: GgmlAbortCallback,
+        user_data: *mut c_void,
+    );
     pub(crate) fn ggml_init(params: GgmlInitParams) -> GgmlContextRaw;
     pub(crate) fn ggml_reset(ctx: GgmlContextRaw);
     pub(crate) fn ggml_free(ctx: GgmlContextRaw);

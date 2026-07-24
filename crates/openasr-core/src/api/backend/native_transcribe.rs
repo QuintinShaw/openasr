@@ -2236,12 +2236,18 @@ fn dispatch_error_to_backend(error: GgmlAsrExecutionError) -> BackendError {
     }
 }
 
-/// Stable substring shared by `Seq2SeqGreedyDecodeError::Canceled` and the
-/// family greedy bridges (`"... canceled by transcription control"`). Used as
-/// a belt-and-suspenders signal when the active control handle is no longer
-/// bound on this thread.
+/// Stable substrings shared by cooperative-cancel error paths.
+///
+/// Matches:
+/// - `Seq2SeqGreedyDecodeError::Canceled` / family greedy bridges
+///   (`"... canceled by transcription control"`)
+/// - `GgmlCpuGraphError::Aborted` (`"aborted by cancel request"`)
+///
+/// Used as a belt-and-suspenders signal when the active control handle is no
+/// longer bound on this thread.
 fn is_cooperative_cancel_reason(reason: &str) -> bool {
     reason.contains("canceled by transcription control")
+        || reason.contains("aborted by cancel request")
 }
 
 fn run_dispatch_once(

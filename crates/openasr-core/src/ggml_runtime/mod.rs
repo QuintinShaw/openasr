@@ -8,6 +8,7 @@ mod gguf_metadata;
 mod gguf_tensor_data;
 mod gguf_tensor_index;
 mod gguf_write;
+mod job_cancel;
 mod kv_element;
 mod package_probe;
 mod runtime_source;
@@ -56,6 +57,11 @@ pub use gguf_tensor_index::{
 pub(crate) use gguf_write::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
     write_gguf_file_v0,
+};
+#[cfg(test)]
+pub(crate) use job_cancel::{JobCancelSlotTestGuard, lock_job_cancel_slot_for_test};
+pub(crate) use job_cancel::{
+    job_cancel_requested, publish_job_cancel_flag, unpublish_job_cancel_flag_if_current,
 };
 pub(crate) use kv_element::GgmlKvElementType;
 #[cfg(test)]

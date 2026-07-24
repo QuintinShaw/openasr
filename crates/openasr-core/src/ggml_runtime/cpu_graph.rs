@@ -890,6 +890,13 @@ pub enum GgmlCpuGraphError {
     OutputByteSizeMismatch { expected: usize, actual: usize },
     #[error("ggml cpu graph compute failed with status={status}")]
     ComputeFailed { status: i32 },
+    /// Graph compute returned `GGML_STATUS_ABORTED` because the installed
+    /// abort_callback observed a job cancel. Distinct from [`Self::ComputeFailed`]
+    /// so callers map it to `BackendError::TranscriptionCanceled` rather than a
+    /// generic session failure. Stable substring `"aborted by cancel request"` is
+    /// recognized by the native dispatch rewrite path.
+    #[error("ggml graph compute aborted by cancel request")]
+    Aborted,
     #[error("ggml cpu graph backend scheduler initialization failed")]
     BackendSchedulerInitFailed,
     #[error("ggml cpu graph backend scheduler graph allocation failed")]
@@ -4169,9 +4176,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 ffi::ggml_backend_graph_compute(self.backend.as_ptr(), graph.as_ptr())
             }
         };
-        if status != ffi::GGML_STATUS_SUCCESS {
-            return Err(GgmlCpuGraphError::ComputeFailed { status });
-        }
+        map_compute_status(status)?;
 
         let mut results = Vec::with_capacity(outputs.len());
         for ((output, expected_len), output_nbytes) in outputs.iter().zip(output_nbytes) {
@@ -4265,9 +4270,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 ffi::ggml_backend_graph_compute(self.backend.as_ptr(), graph.as_ptr())
             }
         };
-        if status != ffi::GGML_STATUS_SUCCESS {
-            return Err(GgmlCpuGraphError::ComputeFailed { status });
-        }
+        map_compute_status(status)?;
 
         let mut f32_results = Vec::with_capacity(f32_outputs.len());
         for ((output, expected_len), output_nbytes) in f32_outputs.iter().zip(f32_output_nbytes) {
@@ -4324,9 +4327,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 ffi::ggml_backend_graph_compute(self.backend.as_ptr(), graph.as_ptr())
             }
         };
-        if status != ffi::GGML_STATUS_SUCCESS {
-            return Err(GgmlCpuGraphError::ComputeFailed { status });
-        }
+        map_compute_status(status)?;
         Ok(())
     }
 
@@ -4372,9 +4373,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 ffi::ggml_backend_graph_compute(self.backend.as_ptr(), graph.as_ptr())
             }
         };
-        if status != ffi::GGML_STATUS_SUCCESS {
-            return Err(GgmlCpuGraphError::ComputeFailed { status });
-        }
+        map_compute_status(status)?;
 
         let mut values = vec![0_i32; expected_len];
         unsafe {
@@ -5295,12 +5294,18 @@ impl GgmlBackendGuard {
         let raw = unsafe {
             ffi::ggml_backend_init_by_type(ffi::GGML_BACKEND_DEVICE_TYPE_CPU, std::ptr::null())
         };
-        NonNull::new(raw)
-            .map(|raw| Self {
-                raw,
-                free_on_drop: true,
-            })
-            .ok_or(GgmlCpuGraphError::CpuBackendUnavailable)
+        let raw = NonNull::new(raw).ok_or(GgmlCpuGraphError::CpuBackendUnavailable)?;
+        // Abort callback reads the job-scoped cancel atomic (not TLS). Safe to
+        // install once per backend lifetime -- including free_on_drop CPU.
+        backend_set_abort_callback(
+            raw,
+            Some(openasr_ggml_abort_trampoline),
+            std::ptr::null_mut(),
+        );
+        Ok(Self {
+            raw,
+            free_on_drop: true,
+        })
     }
 
     fn metal() -> Result<Self, GgmlCpuGraphError> {
@@ -5340,17 +5345,34 @@ impl GgmlBackendGuard {
     /// Return a thread-local cached backend of `key`, initializing it once via
     /// `init` on first use. The cached entry owns the backend for the thread's
     /// lifetime; handed-out guards never free it (`free_on_drop=false`).
+    ///
+    /// Abort callback is installed at first init and kept for the cache entry's
+    /// lifetime. The trampoline reads a job-scoped atomic that is disarmed when
+    /// the transcription control guard drops, so a cached backend never holds a
+    /// dangling cancel pointer across jobs.
     fn cached_backend(
         key: CachedBackendKey,
         init: impl FnOnce() -> Result<NonNull<c_void>, GgmlCpuGraphError>,
     ) -> Result<Self, GgmlCpuGraphError> {
         if let Some(raw) = Self::cached_backend_lookup(&key) {
+            // Re-arm on handout in case a future code path constructs a backend
+            // without going through init (defensive; first init already sets it).
+            backend_set_abort_callback(
+                raw,
+                Some(openasr_ggml_abort_trampoline),
+                std::ptr::null_mut(),
+            );
             return Ok(Self {
                 raw,
                 free_on_drop: false,
             });
         }
         let raw = init()?;
+        backend_set_abort_callback(
+            raw,
+            Some(openasr_ggml_abort_trampoline),
+            std::ptr::null_mut(),
+        );
         Self::cached_backend_insert(key, raw);
         Ok(Self {
             raw,
@@ -5393,6 +5415,11 @@ impl GgmlBackendGuard {
             let route = candidate.to_resolved_route();
             let key = CachedBackendKey::Route(route.cache_key());
             if let Some(raw) = Self::cached_backend_lookup(&key) {
+                backend_set_abort_callback(
+                    raw,
+                    Some(openasr_ggml_abort_trampoline),
+                    std::ptr::null_mut(),
+                );
                 return Ok(Self {
                     raw,
                     free_on_drop: false,
@@ -5400,6 +5427,11 @@ impl GgmlBackendGuard {
             }
             match Self::init_route_gpu_device(&devices, &route) {
                 Ok(raw) => {
+                    backend_set_abort_callback(
+                        raw,
+                        Some(openasr_ggml_abort_trampoline),
+                        std::ptr::null_mut(),
+                    );
                     Self::cached_backend_insert(key, raw);
                     return Ok(Self {
                         raw,
@@ -5434,6 +5466,11 @@ impl GgmlBackendGuard {
                 raw,
                 free_on_drop: true,
             };
+            backend_set_abort_callback(
+                backend.raw,
+                Some(openasr_ggml_abort_trampoline),
+                std::ptr::null_mut(),
+            );
             if let Some(n_threads) = n_threads {
                 let _ = backend.set_n_threads_if_supported(n_threads);
             }
@@ -5529,6 +5566,76 @@ impl GgmlBackendGuard {
 
     fn name(&self) -> String {
         backend_name(self.raw)
+    }
+}
+
+/// Map a ggml graph-compute status code into a typed graph error.
+///
+/// Centralized so every compute site agrees: SUCCESS stays Ok, ABORTED becomes
+/// the cancel-shaped [`GgmlCpuGraphError::Aborted`] (never a bare
+/// `ComputeFailed { status: 1 }`), and every other code stays ComputeFailed.
+fn map_compute_status(status: c_int) -> Result<(), GgmlCpuGraphError> {
+    if status == ffi::GGML_STATUS_SUCCESS {
+        Ok(())
+    } else if status == ffi::GGML_STATUS_ABORTED {
+        Err(GgmlCpuGraphError::Aborted)
+    } else {
+        Err(GgmlCpuGraphError::ComputeFailed { status })
+    }
+}
+
+/// ggml abort_callback trampoline. Returns true only when the currently
+/// published job cancel atomic is set. Pause is intentionally ignored (pause
+/// stays L0 slice-boundary only). Must not unwind across the FFI boundary.
+unsafe extern "C" fn openasr_ggml_abort_trampoline(_data: *mut c_void) -> bool {
+    std::panic::catch_unwind(super::job_cancel_requested).unwrap_or(false)
+}
+
+/// Install an abort_callback on `backend` via the registry proc-address table
+/// (`"ggml_backend_set_abort_callback"`) -- the same pattern as
+/// [`backend_set_n_threads`], required under `GGML_BACKEND_DL`. Missing proc is a
+/// silent no-op (discrete GPU vendors typically have none today).
+///
+/// On macOS, falls back to the direct `ggml_backend_metal_set_abort_callback`
+/// symbol when the registry proc is absent: Metal does not register the proc
+/// today. Production Metal mid-graph abort remains ineffective upstream; the
+/// callback is still installed so flag=false graphs stay SUCCESS and a future
+/// Metal ABORTED path maps correctly.
+fn backend_set_abort_callback(
+    backend: NonNull<c_void>,
+    cb: ffi::GgmlAbortCallback,
+    data: *mut c_void,
+) {
+    type SetAbortCallbackFn =
+        unsafe extern "C" fn(ffi::GgmlBackendRaw, ffi::GgmlAbortCallback, *mut c_void);
+    unsafe {
+        let device = ffi::ggml_backend_get_device(backend.as_ptr());
+        if !device.is_null() {
+            let reg = ffi::ggml_backend_dev_backend_reg(device);
+            if !reg.is_null() {
+                let proc = ffi::ggml_backend_reg_get_proc_address(
+                    reg,
+                    c"ggml_backend_set_abort_callback".as_ptr(),
+                );
+                if !proc.is_null() {
+                    let set_fn: SetAbortCallbackFn = std::mem::transmute(proc);
+                    set_fn(backend.as_ptr(), cb, data);
+                    return;
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Metal fallback: direct symbol (not registered on Metal's proc table).
+            // Must gate on is_metal -- the C entry point GGML_ASSERTs otherwise.
+            if ffi::ggml_backend_is_metal(backend.as_ptr()) {
+                ffi::ggml_backend_metal_set_abort_callback(backend.as_ptr(), cb, data);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (cb, data);
+        }
     }
 }
 
@@ -5953,6 +6060,53 @@ mod tests {
         let backend = super::GgmlBackendGuard::cpu().expect("cpu backend");
         assert!(super::backend_device_present(backend.raw));
         assert!(super::ensure_backend_device_present(backend.raw).is_ok());
+    }
+
+    #[test]
+    fn map_compute_status_success_aborted_and_other() {
+        assert!(super::map_compute_status(ffi::GGML_STATUS_SUCCESS).is_ok());
+        assert!(matches!(
+            super::map_compute_status(ffi::GGML_STATUS_ABORTED),
+            Err(GgmlCpuGraphError::Aborted)
+        ));
+        // Explicit status=1 must never collapse into a bare ComputeFailed after
+        // the L2 wiring -- ABORTED is the only code-1 mapping.
+        assert!(matches!(
+            super::map_compute_status(1),
+            Err(GgmlCpuGraphError::Aborted)
+        ));
+        assert!(matches!(
+            super::map_compute_status(-1),
+            Err(GgmlCpuGraphError::ComputeFailed { status: -1 })
+        ));
+        // Display carries the stable cancel marker used by dispatch rewrite.
+        let msg = GgmlCpuGraphError::Aborted.to_string();
+        assert!(
+            msg.contains("aborted by cancel request"),
+            "Aborted display must stay recognizable to is_cooperative_cancel_reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn cpu_backend_installs_abort_callback_without_forcing_abort() {
+        // Installing the trampoline with cancel=false must leave a trivial graph
+        // compute path as SUCCESS (Metal/CPU). No control installed =>
+        // job_cancel_requested is false => callback always returns false.
+        let _exclusive = crate::ggml_runtime::lock_job_cancel_slot_for_test();
+        let _ = crate::ggml_runtime::publish_job_cancel_flag(None);
+        let backend = super::GgmlBackendGuard::cpu().expect("cpu backend");
+        assert!(
+            !super::super::job_cancel_requested(),
+            "no-control path must keep abort trampoline idle"
+        );
+        // backend_set_abort_callback is already invoked by GgmlBackendGuard::cpu;
+        // re-arming is idempotent and must not panic / abort the process.
+        super::backend_set_abort_callback(
+            backend.raw,
+            Some(super::openasr_ggml_abort_trampoline),
+            std::ptr::null_mut(),
+        );
+        let _ = backend;
     }
 
     #[test]
