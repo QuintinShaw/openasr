@@ -831,7 +831,6 @@ struct Qwen3AsrLlmFusedLogitsHeadHandles {
     rms_norm_epsilon: f32,
     output_norm_weight: GgmlStaticTensor,
     output_weight: LlmWeightHandle,
-    output_weight_is_vocab_hidden: bool,
     argmax_reverse_indices: GgmlStaticTensor,
 }
 
@@ -1243,11 +1242,9 @@ fn allocate_fused_logits_head_tensors(
             reason: "fused logits head norm width mismatch",
         });
     }
-    let output_weight_is_vocab_hidden = spec.output_weight_dims == [spec.vocab_size, dims.d_model];
-    if spec.output_weight_dims != [dims.d_model, spec.vocab_size] && !output_weight_is_vocab_hidden
-    {
+    if spec.output_weight_dims != [dims.d_model, spec.vocab_size] {
         return Err(GgmlCpuGraphError::UnsupportedInputs {
-            reason: "fused logits head requires [hidden, vocab] or [vocab, hidden] output weight",
+            reason: "fused logits head requires direct [hidden, vocab] output weight",
         });
     }
     if !spec.rms_norm_epsilon.is_finite() || spec.rms_norm_epsilon <= 0.0 {
@@ -1276,7 +1273,6 @@ fn allocate_fused_logits_head_tensors(
         rms_norm_epsilon: spec.rms_norm_epsilon,
         output_norm_weight,
         output_weight,
-        output_weight_is_vocab_hidden,
         argmax_reverse_indices,
     })
 }
@@ -1320,13 +1316,7 @@ fn build_fused_logits_top1<'a>(
     }
     let normed = graph.rms_norm(state, logits_head.rms_norm_epsilon)?;
     let normed = graph.mul(normed, arena.graph_tensor(logits_head.output_norm_weight))?;
-    let output_weight = logits_head.output_weight.as_graph_tensor(arena);
-    let output_weight = if logits_head.output_weight_is_vocab_hidden {
-        graph.transpose(output_weight)?
-    } else {
-        output_weight
-    };
-    let logits = graph.mul_mat(output_weight, normed)?;
+    let logits = graph.mul_mat(logits_head.output_weight.as_graph_tensor(arena), normed)?;
     graph.top1_argmax_first_max_reversed(
         logits,
         arena.graph_tensor(logits_head.argmax_reverse_indices),
@@ -4832,6 +4822,62 @@ mod tests {
         let token_id = validate_fused_top1_token_id(reversed_top1[0], spec.vocab_size)
             .expect("top1 should map to a valid token");
         assert_eq!(token_id, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "vocab-hidden fused logits handles should allocate")]
+    fn fused_logits_top1_rejects_vocab_hidden_output_layout() {
+        let config = GgmlCpuGraphConfig::default();
+        let mut runner =
+            GgmlCpuGraphRunner::new(config).expect("cpu graph runner should initialize");
+        let mut arena = runner
+            .start_static_tensor_arena(config.context_bytes)
+            .expect("static arena should allocate");
+        let dims = Qwen3AsrLlmDecodeDims {
+            d_model: 2,
+            q_width: 2,
+            k_width: 2,
+            v_width: 2,
+            head_dim: 2,
+            q_heads: 1,
+            kv_heads: 1,
+        };
+        // Physical [vocab, hidden] storage for the logical [hidden, vocab]
+        // projection used by the ordinary logits path.
+        let output_weight_bytes = [0.1_f32, 0.3, 0.3, 0.0, 0.0, 0.0]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let spec = Qwen3AsrLlmFusedLogitsHeadSpec {
+            d_model: 2,
+            vocab_size: 3,
+            rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
+            output_norm_weight: &[1.0, 1.0],
+            output_weight_tensor_name: "synthetic.output.weight",
+            output_weight_ggml_type: GGML_TYPE_F32,
+            output_weight_dims: &[3, 2],
+            output_weight_bytes: &output_weight_bytes,
+        };
+        let handles = allocate_fused_logits_head_tensors(&mut arena, None, dims, &spec)
+            .expect("vocab-hidden fused logits handles should allocate");
+        upload_fused_logits_head_weights(&mut arena, &handles, &spec)
+            .expect("vocab-hidden fused logits weights should upload");
+        let mut graph = runner.start_graph();
+        let state = graph
+            .new_tensor_2d_f32(2, 1, "synthetic_state")
+            .expect("state");
+        graph.set_input(state).expect("state input");
+        let top1 = build_fused_logits_top1(&arena, &handles, &mut graph, state, 1)
+            .expect("vocab-hidden fused top1 should build");
+        graph.set_output(top1).expect("top1 output");
+        graph
+            .set_f32_slice(state, &[1.0, 0.0], "synthetic_state")
+            .expect("state upload");
+        let reversed = graph.compute_output_i32(top1, 1).expect("top1 compute");
+        assert_eq!(
+            validate_fused_top1_token_id(reversed[0], spec.vocab_size).expect("top1 token"),
+            1
+        );
     }
 
     #[test]

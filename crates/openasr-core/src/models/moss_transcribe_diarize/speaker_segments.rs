@@ -290,6 +290,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn accepts_an_adjacent_pending_start_correction() {
+        let segments = parse_moss_td_speaker_segments("[1.0][0.9][S01]hello[2.0]", 2.0)
+            .expect("adjacent corrected start should parse");
+        assert_eq!(segments[0].start, 0.9);
+        assert_eq!(segments[0].end, 2.0);
+    }
+
+    #[test]
+    fn rejects_a_backwards_anchor_after_text() {
+        let error = parse_moss_td_speaker_segments("[1.0][S01]hello[0.9]", 2.0)
+            .expect_err("text-attached backwards anchor must fail closed");
+        assert!(matches!(
+            error,
+            MossTdSpeakerSegmentParseError::TimeWentBackwards { .. }
+        ));
+    }
+
+    #[test]
     fn empty_stream_yields_no_segments() {
         assert_eq!(parse_moss_td_speaker_segments("", 5.0), Ok(Vec::new()));
     }

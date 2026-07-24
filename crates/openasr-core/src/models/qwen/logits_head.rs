@@ -347,9 +347,7 @@ fn load_direct_output_weight_payload(
     d_model: usize,
     vocab_size: usize,
 ) -> Result<Option<OwnedGgmlLogitsWeight>, Qwen3AsrLlmLogitsHeadError> {
-    let direct_layout =
-        dims == [d_model as u64, vocab_size as u64] || dims == [vocab_size as u64, d_model as u64];
-    if !direct_layout {
+    if dims != [d_model as u64, vocab_size as u64] {
         return Ok(None);
     }
     let payload = reader
