@@ -831,6 +831,7 @@ struct Qwen3AsrLlmFusedLogitsHeadHandles {
     rms_norm_epsilon: f32,
     output_norm_weight: GgmlStaticTensor,
     output_weight: LlmWeightHandle,
+    output_weight_is_vocab_hidden: bool,
     argmax_reverse_indices: GgmlStaticTensor,
 }
 
@@ -1242,9 +1243,11 @@ fn allocate_fused_logits_head_tensors(
             reason: "fused logits head norm width mismatch",
         });
     }
-    if spec.output_weight_dims != [dims.d_model, spec.vocab_size] {
+    let output_weight_is_vocab_hidden = spec.output_weight_dims == [spec.vocab_size, dims.d_model];
+    if spec.output_weight_dims != [dims.d_model, spec.vocab_size] && !output_weight_is_vocab_hidden
+    {
         return Err(GgmlCpuGraphError::UnsupportedInputs {
-            reason: "fused logits head requires direct [hidden, vocab] output weight",
+            reason: "fused logits head requires [hidden, vocab] or [vocab, hidden] output weight",
         });
     }
     if !spec.rms_norm_epsilon.is_finite() || spec.rms_norm_epsilon <= 0.0 {
@@ -1260,9 +1263,9 @@ fn allocate_fused_logits_head_tensors(
     let output_weight =
         match loaded.and_then(|context| context.tensor(spec.output_weight_tensor_name)) {
             Some(tensor) => LlmWeightHandle::Loaded(tensor),
-            None => LlmWeightHandle::Arena(arena.new_matmul_weight_2d_typed(
-                dims.d_model,
-                spec.vocab_size,
+            None => LlmWeightHandle::Arena(arena.new_tensor_2d_typed(
+                spec.output_weight_dims[0],
+                spec.output_weight_dims[1],
                 spec.output_weight_ggml_type,
                 "qwen_llm_fused_output_weight",
             )?),
@@ -1273,6 +1276,7 @@ fn allocate_fused_logits_head_tensors(
         rms_norm_epsilon: spec.rms_norm_epsilon,
         output_norm_weight,
         output_weight,
+        output_weight_is_vocab_hidden,
         argmax_reverse_indices,
     })
 }
@@ -1316,7 +1320,13 @@ fn build_fused_logits_top1<'a>(
     }
     let normed = graph.rms_norm(state, logits_head.rms_norm_epsilon)?;
     let normed = graph.mul(normed, arena.graph_tensor(logits_head.output_norm_weight))?;
-    let logits = graph.mul_mat(logits_head.output_weight.as_graph_tensor(arena), normed)?;
+    let output_weight = logits_head.output_weight.as_graph_tensor(arena);
+    let output_weight = if logits_head.output_weight_is_vocab_hidden {
+        graph.transpose(output_weight)?
+    } else {
+        output_weight
+    };
+    let logits = graph.mul_mat(output_weight, normed)?;
     graph.top1_argmax_first_max_reversed(
         logits,
         arena.graph_tensor(logits_head.argmax_reverse_indices),
@@ -2255,6 +2265,66 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         max_positions: usize,
         rope_theta: f32,
     ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
+        const RESIDENT_PREFILL_MAX_QUERY_TOKENS: usize = 256;
+        if token_count == 0 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident prefill token count must be positive",
+            });
+        }
+        let hidden_per_token =
+            self.dims
+                .d_model
+                .checked_mul(n_seq)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill hidden width overflow",
+                })?;
+        let mut final_step = None;
+        for position_offset in (0..token_count).step_by(RESIDENT_PREFILL_MAX_QUERY_TOKENS) {
+            let chunk_tokens =
+                (token_count - position_offset).min(RESIDENT_PREFILL_MAX_QUERY_TOKENS);
+            let chunk_start = position_offset.checked_mul(hidden_per_token).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill chunk offset overflow",
+                },
+            )?;
+            let chunk_len = chunk_tokens.checked_mul(hidden_per_token).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill chunk width overflow",
+                },
+            )?;
+            let chunk_hidden = sequence_major_hidden
+                .get(chunk_start..chunk_start + chunk_len)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "whole-decoder resident prefill chunk slice is out of bounds",
+                })?;
+            let step = self.run_prefill_chunk_into_reused_batched(
+                chunk_hidden,
+                chunk_tokens,
+                n_seq,
+                position_offset,
+                max_positions,
+                rope_theta,
+                position_offset + chunk_tokens == token_count,
+            )?;
+            if position_offset + chunk_tokens == token_count {
+                final_step = Some(step);
+            }
+        }
+        final_step.ok_or(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "whole-decoder resident prefill produced no final chunk",
+        })
+    }
+
+    fn run_prefill_chunk_into_reused_batched(
+        &mut self,
+        sequence_major_hidden: &[f32],
+        token_count: usize,
+        n_seq: usize,
+        position_offset: usize,
+        max_positions: usize,
+        rope_theta: f32,
+        materialize_last_hidden: bool,
+    ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
         let dims = self.dims;
         if token_count == 0 {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -2266,7 +2336,12 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 reason: "whole-decoder resident prefill n_seq must be positive",
             });
         }
-        if max_positions < token_count {
+        let chunk_end = position_offset.checked_add(token_count).ok_or(
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder resident prefill position span overflow",
+            },
+        )?;
+        if max_positions < chunk_end {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "whole-decoder resident prefill max-position span is too small",
             });
@@ -2297,13 +2372,18 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         let mut positions = Vec::with_capacity(output_tokens);
         for _sequence_index in 0..n_seq {
             for token_position in 0..token_count {
-                row_indices_usize.push(token_position);
-                row_indices.push(i32::try_from(token_position).map_err(|_| {
+                let absolute_position = position_offset.checked_add(token_position).ok_or(
+                    GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "whole-decoder resident prefill position overflow",
+                    },
+                )?;
+                row_indices_usize.push(absolute_position);
+                row_indices.push(i32::try_from(absolute_position).map_err(|_| {
                     GgmlCpuGraphError::UnsupportedInputs {
                         reason: "whole-decoder resident prefill cache index exceeds ggml int boundary",
                     }
                 })?);
-                positions.push(i32::try_from(token_position).map_err(|_| {
+                positions.push(i32::try_from(absolute_position).map_err(|_| {
                     GgmlCpuGraphError::UnsupportedInputs {
                         reason: "whole-decoder resident prefill rope position exceeds ggml int boundary",
                     }
@@ -2372,7 +2452,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 |_step, source| source,
             )?;
             let state = stack.state;
-            let (output_state, output_len) = if n_seq == 1 {
+            let (output_state, output_len) = if materialize_last_hidden && n_seq == 1 {
                 let final_hidden_offset = token_count
                     .checked_sub(1)
                     .and_then(|position| position.checked_mul(dims.d_model))
@@ -2389,9 +2469,11 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 )?;
                 (final_hidden, dims.d_model)
             } else {
-                (state, expected_hidden)
+                let completion = graph.view_1d(state, 1, 0)?;
+                (completion, 1)
             };
             graph.set_output(output_state)?;
+            graph.prepare_outputs_for_upload(&[output_state])?;
             graph.set_f32_slice(
                 hidden_tensor,
                 sequence_major_hidden,
@@ -2429,8 +2511,12 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 compute_micros,
             })
         })();
+        let restore_result = reuse.builder().restore_prepared_graph_allocation();
         self.reuse = Some(reuse);
-        result
+        match result {
+            Ok(output) => restore_result.map(|()| output),
+            Err(error) => Err(error),
+        }
     }
 
     fn run_prefill_with_history(

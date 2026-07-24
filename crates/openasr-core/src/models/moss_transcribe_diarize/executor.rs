@@ -1403,4 +1403,31 @@ mod tests {
             ACCELERATED_ANCHOR_TOLERANCE_SECS,
         );
     }
+
+    #[test]
+    #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack and the 3-minute AISHELL-4 fixture; drives an explicit accelerated request"]
+    fn accelerated_aishell4_three_minute_smoke_completes_with_structured_transcript() {
+        let Some((text, _, _)) = transcribe_with_dev_pack_backend(
+            dev_sample_path("aishell4_multispeaker_3min.wav"),
+            GgmlAsrBackendPreference::Accelerated,
+        ) else {
+            return;
+        };
+        assert!(
+            !text.trim().is_empty(),
+            "accelerated AISHELL-4 decode must emit a non-empty transcript"
+        );
+        let golden_path = PathBuf::from(
+            "/Volumes/QuintinDocument/openasr-dev/tmp/moss-td/golden/aishell4_multispeaker_3min.json",
+        );
+        let golden: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&golden_path).expect("read AISHELL-4 development golden"),
+        )
+        .expect("parse AISHELL-4 development golden");
+        assert_eq!(
+            text,
+            golden["text"].as_str().expect("AISHELL-4 golden text"),
+            "accelerated AISHELL-4 transcript must match the pinned reference text"
+        );
+    }
 }
