@@ -51,7 +51,22 @@ const QWEN3_AUDIO_CONV_STRIDE: usize = 2;
 const QWEN3_AUDIO_CONV_PADDING: usize = 1;
 const QWEN3_AUDIO_CONV_DILATION: usize = 1;
 const QWEN3_AUDIO_LAYER_NORM_EPSILON: f32 = 1.0e-5;
-const QWEN3_AUDIO_GRAPH_CONTEXT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Worst-case forward-graph node budget for the qwen3-asr audio encoder, used to
+/// right-size the runner's `no_alloc` metadata context (via
+/// [`GgmlCpuGraphConfig::metadata_context_bytes`]) instead of the historical flat
+/// 256 MB. The graph topology is architecture-bound, not sequence-length-bound:
+/// 18 layers x ~30 ops (flash) / ~39 ops (the naive fallback under
+/// `OPENASR_QWEN_GGML_DISABLE_AUDIO_ENCODER_FLASH_ATTN`) plus ~17 conv-front and
+/// ~8 post-processing nodes ~= 565-727 nodes regardless of audio length -- longer
+/// audio grows tensor DIMENSIONS, not the op count. 2048 keeps >2x headroom over
+/// the naive worst case. `ggml_init` always mallocs the full `mem_size` even with
+/// `no_alloc=true`, so the old 256 MB committed ~256 MB of metadata context that
+/// only ever holds bookkeeping for <1k tensors: resident-memory waste on the
+/// 16 GB target plus a cold-start runtime-init cost, for a graph that needs <1 MB.
+/// Mirrors the xasr_zipformer encoder sizing
+/// (`models/xasr_zipformer/graph_config.rs`).
+const QWEN3_AUDIO_ENCODER_GRAPH_SIZE: usize = 2048;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Qwen3AsrAudioEncoderOutput {
@@ -164,12 +179,31 @@ pub(crate) struct Qwen3AsrAudioEncoderRuntime {
     loaded: Option<GgmlLoadedWeightContext>,
 }
 
+/// The audio-encoder runner's graph config: the family `EncoderPrelude` tier (see
+/// `qwen_encoder_graph_config`) with the `no_alloc` metadata context right-sized
+/// from the encoder's forward-graph node count instead of the historical flat
+/// 256 MB. `ggml_init` always mallocs the full `mem_size` even with
+/// `no_alloc=true`, so sizing from [`QWEN3_AUDIO_ENCODER_GRAPH_SIZE`] (via
+/// [`GgmlCpuGraphConfig::metadata_context_bytes`]) drops the committed context
+/// from 256 MB to <1 MB without touching the graph the encoder builds. The
+/// `.max()` keeps the default floor and any larger override intact, mirroring
+/// `xasr_zipformer_encoder_graph_config_with_overrides`.
+fn qwen_audio_encoder_runtime_graph_config() -> GgmlCpuGraphConfig {
+    let mut config = qwen_encoder_graph_config();
+    config.graph_size = config.graph_size.max(QWEN3_AUDIO_ENCODER_GRAPH_SIZE);
+    config.context_bytes = config
+        .context_bytes
+        .max(GgmlCpuGraphConfig::metadata_context_bytes(
+            config.graph_size,
+        ));
+    config
+}
+
 impl Qwen3AsrAudioEncoderRuntime {
     pub(crate) fn new(runtime_path: Option<&Path>) -> Result<Self, Qwen3AsrAudioEncoderError> {
-        // See `qwen_encoder_graph_config` for the `EncoderPrelude` threading
-        // tier rationale.
-        let mut config = qwen_encoder_graph_config();
-        config.context_bytes = QWEN3_AUDIO_GRAPH_CONTEXT_BYTES;
+        // See `qwen_audio_encoder_runtime_graph_config` for the `EncoderPrelude`
+        // threading tier and the right-sized metadata-context rationale.
+        let config = qwen_audio_encoder_runtime_graph_config();
         let runner = GgmlCpuGraphRunner::new(config).map_err(|source| {
             Qwen3AsrAudioEncoderError::GraphBuildFailed {
                 step: "runner_init",
@@ -1358,6 +1392,33 @@ mod tests {
         assert_eq!(values.len(), 8 * 13);
         assert_eq!(values[0], 0.0);
         assert_eq!(values[4], 1.0);
+    }
+
+    /// Regression guard for the right-sized encoder metadata context (the
+    /// historical flat 256 MB over-reserved a context that only holds bookkeeping
+    /// for <1k tensors; `ggml_init` mallocs the full `mem_size` even with
+    /// `no_alloc=true`). The context must still cover the worst-case forward graph
+    /// (architecture-bound, see [`QWEN3_AUDIO_ENCODER_GRAPH_SIZE`]) while staying a
+    /// small fraction of the old 256 MB. Only touches `context_bytes`/`graph_size`
+    /// (thread-independent), so it is stable against parallel-test env mutation.
+    #[test]
+    fn encoder_graph_context_is_right_sized_not_flat_256mb() {
+        let config = qwen_audio_encoder_runtime_graph_config();
+
+        // Covers the worst-case forward graph (node budget + the metadata its
+        // tensors need)...
+        assert!(config.graph_size >= QWEN3_AUDIO_ENCODER_GRAPH_SIZE);
+        assert!(
+            config.context_bytes
+                >= GgmlCpuGraphConfig::metadata_context_bytes(QWEN3_AUDIO_ENCODER_GRAPH_SIZE)
+        );
+        // ...while staying a small fraction of the historical 256 MB (the precise
+        // value is <1 MB; bound generously so the guard is not brittle).
+        assert!(
+            config.context_bytes < 16 * 1024 * 1024,
+            "encoder metadata context regrew toward the old flat 256 MB: {}",
+            config.context_bytes
+        );
     }
 
     /// Stage 2 bisection gate: run the ggml audio encoder (24 layers/1024/16
