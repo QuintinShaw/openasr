@@ -28,7 +28,7 @@ use crate::nn::decoder::{
     allocate_zeroed_llm_resident_kv_arena, build_fixed_kv_attention_mask_bits,
     build_fixed_kv_attention_mask_bits_for_query_rows,
     build_fixed_kv_attention_mask_bits_for_sequences, compose_llm_decoder_layer_stack,
-    reusable_decode_graph_supported_for_runner,
+    resolve_production_llm_kv_cache_policy_from_env, reusable_decode_graph_supported_for_runner,
 };
 use crate::nn::half::f32_slice_to_f16_bits;
 
@@ -782,6 +782,23 @@ fn qwen_llm_resolve_use_native_gqa(backend: GgmlCpuGraphBackend) -> bool {
         std::env::var(QWEN3_LLM_NATIVE_GQA_ENV).ok().as_deref(),
         qwen_llm_native_gqa_default_for_backend(backend),
     )
+}
+
+/// Production KV-cache policy for every Qwen-shaped whole-decoder constructor
+/// (qwen / mimo / firered2 / moss / hymt2 / serve-batch).
+///
+/// Applies the shared phase-1 Q8 rules: CPU/Metal + native-GQA + flash geometry
+/// selects `Q8_0`; discrete GPU and incomplete geometry stay on Default.
+/// `OPENASR_QWEN_KV_CACHE_F32` opts back to host-F32 / resident-F16 for golden
+/// pins. Decode always uses flash; CPU/Metal prefill also always uses flash, so
+/// the construction-time flash flag is `true` for policy selection (discrete
+/// GPU is already rejected by backend support).
+pub(crate) fn resolve_qwen_family_production_kv_cache_policy(
+    backend: GgmlCpuGraphBackend,
+    head_dim: usize,
+) -> LlmKvCachePolicy {
+    let use_native_gqa = qwen_llm_resolve_use_native_gqa(backend);
+    resolve_production_llm_kv_cache_policy_from_env(backend, head_dim, use_native_gqa, true)
 }
 
 /// A decode-layer 2D projection weight: either an arena tensor (f32-uploaded) or
@@ -1681,7 +1698,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         for (tensor, values, name) in pending_lora_uploads {
             arena.set_f32_slice(tensor, &values, name)?;
         }
-        Ok(Self {
+        let mut executor = Self {
             reuse: None,
             loaded,
             runner,
@@ -1692,7 +1709,16 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             use_native_gqa,
             rms_norm_epsilon,
             kv_cache_spec: LlmKvCacheSpec::DEFAULT,
-        })
+        };
+        // Shared production policy for every family that builds this executor
+        // (qwen/mimo/firered2/moss/hymt2/serve-batch). Discrete GPU and the
+        // OPENASR_QWEN_KV_CACHE_F32 opt-out stay on Default.
+        let policy = resolve_qwen_family_production_kv_cache_policy(
+            executor.runner.backend_kind(),
+            executor.dims.head_dim,
+        );
+        executor.set_kv_cache_policy(policy)?;
+        Ok(executor)
     }
 
     pub(crate) fn layer_count(&self) -> usize {
@@ -1703,10 +1729,13 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         self.kv_cache_spec
     }
 
-    /// Internal execution option for phase-1 Q8 KV. Not a public env gate.
-    /// Validates geometry against the decoder head_dim; backend/GQA/flash checks
-    /// still happen when the graph is composed for a concrete backend path.
-    #[allow(dead_code)]
+    /// Set the host/resident KV element-type policy for this decoder.
+    ///
+    /// Production constructors already call this once via
+    /// [`resolve_qwen_family_production_kv_cache_policy`]. Remaining call sites
+    /// are explicit overrides (golden/parity harnesses that pin F32, or tests).
+    /// Validates geometry against the decoder `head_dim`; backend/GQA/flash
+    /// checks still happen when the graph is composed for a concrete path.
     pub(crate) fn set_kv_cache_policy(
         &mut self,
         policy: LlmKvCachePolicy,
@@ -5696,6 +5725,9 @@ mod tests {
             Qwen3AsrLlmWholeDecoderGraphExecutor::new(&projections, Some(&runtime_path))
                 .expect("qwen decoder");
         decoder
+            .set_kv_cache_policy(LlmKvCachePolicy::Default)
+            .expect("pin f32 KV for seed-only reset harness");
+        decoder
             .reset_reused_batched_seeded(&seeds_two, 1_000_000.0, token_count)
             .expect("seed-only reset n_seq=2");
         let reuse = decoder.reuse.as_ref().expect("reuse graph after n_seq=2");
@@ -5925,6 +5957,11 @@ mod tests {
         let mut decoder =
             Qwen3AsrLlmWholeDecoderGraphExecutor::new(projections, Some(runtime_path))
                 .expect("serial qwen decoder");
+        // Prefill parity compares against f32 host history rows. Pin Default so
+        // production Q8 does not silently break the manual harness.
+        decoder
+            .set_kv_cache_policy(LlmKvCachePolicy::Default)
+            .expect("pin f32 KV for prefill parity");
         let mut layer_kv_caches = (0..metadata.llm_layers)
             .map(|_| {
                 Qwen3AsrLayerKvCacheState::new(
@@ -5979,6 +6016,9 @@ mod tests {
             Qwen3AsrLlmWholeDecoderGraphExecutor::new(projections, Some(runtime_path))
                 .expect("prefill qwen decoder");
         decoder
+            .set_kv_cache_policy(LlmKvCachePolicy::Default)
+            .expect("pin f32 KV for prefill parity");
+        decoder
             .run_prefill(hidden, token_count, 1_000_000.0)
             .expect("qwen whole-prompt prefill")
     }
@@ -5995,6 +6035,9 @@ mod tests {
         let mut decoder =
             Qwen3AsrLlmWholeDecoderGraphExecutor::new(projections, Some(runtime_path))
                 .expect("chunked prefill qwen decoder");
+        decoder
+            .set_kv_cache_policy(LlmKvCachePolicy::Default)
+            .expect("pin f32 KV for prefill parity");
         let mut layer_kv_caches = (0..metadata.llm_layers)
             .map(|_| {
                 Qwen3AsrLayerKvCacheState::new(

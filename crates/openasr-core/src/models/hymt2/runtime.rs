@@ -252,14 +252,24 @@ impl Hymt2RuntimeSession {
         metadata: Hymt2ExecutionMetadata,
         max_positions: usize,
     ) -> Result<(), Hymt2RuntimeError> {
-        if self.layer_kv_caches.len() != metadata.layers {
+        let host = self.whole_decoder.kv_cache_spec().host;
+        if self.layer_kv_caches.len() != metadata.layers
+            || self
+                .layer_kv_caches
+                .iter()
+                .any(|cache| cache.element_type() != host)
+        {
             self.layer_kv_caches = (0..metadata.layers)
                 .map(|_| {
-                    Qwen3AsrLayerKvCacheState::new(
+                    Qwen3AsrLayerKvCacheState::new_with_element_type(
                         max_positions,
                         metadata.kv_heads,
                         metadata.head_dim,
+                        host,
                     )
+                    .unwrap_or_else(|reason| {
+                        panic!("shared LLM KV cache geometry rejected host type: {reason}")
+                    })
                 })
                 .collect();
             return Ok(());
@@ -754,13 +764,26 @@ impl Hymt2Runtime {
     }
 
     fn empty_layer_kv_caches(&self, max_positions: usize) -> Vec<Qwen3AsrLayerKvCacheState> {
+        // Match the production policy applied when the whole-decoder was built
+        // so host storage and graph history tensors stay element-type aligned.
+        let host = self
+            .session
+            .lock()
+            .expect("Hy-MT2 runtime session lock poisoned")
+            .whole_decoder
+            .kv_cache_spec()
+            .host;
         (0..self.metadata.layers)
             .map(|_| {
-                Qwen3AsrLayerKvCacheState::new(
+                Qwen3AsrLayerKvCacheState::new_with_element_type(
                     max_positions,
                     self.metadata.kv_heads,
                     self.metadata.head_dim,
+                    host,
                 )
+                .unwrap_or_else(|reason| {
+                    panic!("shared LLM KV cache geometry rejected host type: {reason}")
+                })
             })
             .collect()
     }

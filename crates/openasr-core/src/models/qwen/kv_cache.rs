@@ -81,6 +81,10 @@ pub(crate) struct Qwen3AsrLayerKvCacheHistory<'a> {
 }
 
 impl Qwen3AsrLayerKvCacheState {
+    /// Host-F32 convenience constructor for tests and F32-pinned harnesses.
+    /// Production whole-decoder paths use [`Self::new_with_element_type`] with
+    /// the resolved `kv_cache_spec().host` so Q8 and F32 stay aligned.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(max_positions: usize, kv_heads: usize, head_dim: usize) -> Self {
         Self::new_with_element_type(max_positions, kv_heads, head_dim, GgmlKvElementType::F32)
             .expect("f32 host KV geometry is always valid")

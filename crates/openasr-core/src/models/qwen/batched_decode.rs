@@ -13,12 +13,13 @@ use super::kv_cache::Qwen3AsrLayerKvCacheState;
 use super::llm_prefill::Qwen3AsrLlmPrefillInput;
 use super::llm_transformer::{
     Qwen3AsrLlmLayerAttentionProjection, Qwen3AsrLlmWholeDecoderGraphExecutor,
+    resolve_qwen_family_production_kv_cache_policy,
 };
 use super::logits_head::Qwen3AsrLlmLogitsHead;
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::token_embedding::Qwen3AsrTokenEmbeddingTable;
 use super::tokenizer::Qwen3AsrTokenizer;
-use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig};
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, apply_seq2seq_text_postprocess,
 };
@@ -1428,13 +1429,23 @@ impl Qwen3AsrBatchSlot {
                     .to_string(),
             });
         }
+        let host = resolve_qwen_family_production_kv_cache_policy(
+            GgmlCpuGraphConfig::resolve_runtime_backend(),
+            job.metadata.llm_head_dim,
+        )
+        .to_spec()
+        .host;
         let layer_kv_caches = (0..job.metadata.llm_layers)
             .map(|_| {
-                Qwen3AsrLayerKvCacheState::new(
+                Qwen3AsrLayerKvCacheState::new_with_element_type(
                     max_positions,
                     job.metadata.llm_kv_heads,
                     job.metadata.llm_head_dim,
+                    host,
                 )
+                .unwrap_or_else(|reason| {
+                    panic!("shared LLM KV cache geometry rejected host type: {reason}")
+                })
             })
             .collect();
         let stop_token_ids = build_seq2seq_greedy_stop_token_ids(&job.decode_config);
@@ -1466,13 +1477,21 @@ impl Qwen3AsrBatchSlot {
                 reason: "qwen serve batch dummy seed row width overflowed".to_string(),
             })?;
         let zero_row = vec![0.0_f32; row_width];
+        let host = resolve_qwen_family_production_kv_cache_policy(
+            GgmlCpuGraphConfig::resolve_runtime_backend(),
+            metadata.llm_head_dim,
+        )
+        .to_spec()
+        .host;
         let mut layers = Vec::with_capacity(metadata.llm_layers);
         for _ in 0..metadata.llm_layers {
-            let mut cache = Qwen3AsrLayerKvCacheState::new(
+            let mut cache = Qwen3AsrLayerKvCacheState::new_with_element_type(
                 max_positions,
                 metadata.llm_kv_heads,
                 metadata.llm_head_dim,
-            );
+                host,
+            )
+            .map_err(|reason| Qwen3AsrServeBatchError::DecodeFailed { reason })?;
             cache
                 .write(0, &zero_row, &zero_row)
                 .map_err(|reason| Qwen3AsrServeBatchError::DecodeFailed { reason })?;

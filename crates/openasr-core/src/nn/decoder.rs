@@ -50,21 +50,30 @@ pub(crate) fn reusable_decode_graph_supported_for_runner(runner: &GgmlCpuGraphRu
     reusable_decode_graph_supported(runner.backend_kind(), runner.uses_scheduler())
 }
 
+/// Opt-out for production Q8 KV on Qwen-shaped whole-decoder stacks.
+///
+/// When truthy (`1`/`true`/`yes`/`on`), keep host-F32 / resident-F16 even on
+/// CPU/Metal with native-GQA + flash. Intended for golden/parity pins and
+/// short-audio quality A/B before the default is left unconditional. Not a
+/// pack/catalog quant tag.
+pub(crate) const OPENASR_QWEN_KV_CACHE_F32_ENV: &str = "OPENASR_QWEN_KV_CACHE_F32";
+
 /// Internal execution policy for Qwen-family LLM KV caches.
 ///
-/// Not a public env gate and not a pack/catalog quant tag. Default preserves the
-/// existing host-F32 / resident-F16 byte path. `Q8_0` opts into the phase-1
-/// shared quantized path (CPU/Metal, native-GQA, flash-only).
+/// Not a pack/catalog quant tag. `Default` is host-F32 / resident-F16.
+/// `Q8_0` is the phase-1 shared quantized path (CPU/Metal, native-GQA,
+/// flash-only). Production selection lives in
+/// [`resolve_production_llm_kv_cache_policy`]; whole-decoder construction
+/// applies it via `Qwen3AsrLlmWholeDecoderGraphExecutor::set_kv_cache_policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[allow(dead_code)]
 pub(crate) enum LlmKvCachePolicy {
     #[default]
     Default,
     Q8_0,
 }
 
-#[allow(dead_code)]
 impl LlmKvCachePolicy {
+    #[allow(dead_code)] // unit-test + diagnostics label; production uses to_spec()
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
@@ -78,6 +87,60 @@ impl LlmKvCachePolicy {
             Self::Q8_0 => LlmKvCacheSpec::Q8_0,
         }
     }
+}
+
+/// Pure production policy selector for shared Qwen-shaped whole-decoder stacks.
+///
+/// Returns [`LlmKvCachePolicy::Q8_0`] only when phase-1 execution validation
+/// accepts the geometry (CPU/Metal + native-GQA + flash + head_dim) and the
+/// F32 opt-out raw value is not truthy. Discrete GPU and incomplete geometry
+/// stay on [`LlmKvCachePolicy::Default`] (fail closed, no silent broken Q8).
+///
+/// `force_f32_kv_raw` is the raw value of [`OPENASR_QWEN_KV_CACHE_F32_ENV`]
+/// (or an injected test string). Pass `None` when the env is unset.
+pub(crate) fn resolve_production_llm_kv_cache_policy(
+    backend: GgmlCpuGraphBackend,
+    head_dim: usize,
+    use_native_gqa: bool,
+    use_flash_attention: bool,
+    force_f32_kv_raw: Option<&str>,
+) -> LlmKvCachePolicy {
+    if matches!(
+        force_f32_kv_raw
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    ) {
+        return LlmKvCachePolicy::Default;
+    }
+    let candidate = LlmKvCachePolicy::Q8_0;
+    match candidate.to_spec().validate_execution(
+        backend,
+        head_dim,
+        use_native_gqa,
+        use_flash_attention,
+    ) {
+        Ok(()) => candidate,
+        Err(_) => LlmKvCachePolicy::Default,
+    }
+}
+
+/// Process-env wrapper around [`resolve_production_llm_kv_cache_policy`].
+pub(crate) fn resolve_production_llm_kv_cache_policy_from_env(
+    backend: GgmlCpuGraphBackend,
+    head_dim: usize,
+    use_native_gqa: bool,
+    use_flash_attention: bool,
+) -> LlmKvCachePolicy {
+    let force_f32 = std::env::var(OPENASR_QWEN_KV_CACHE_F32_ENV).ok();
+    resolve_production_llm_kv_cache_policy(
+        backend,
+        head_dim,
+        use_native_gqa,
+        use_flash_attention,
+        force_f32.as_deref(),
+    )
 }
 
 /// Shared host + resident KV element-type pair for all Qwen-shaped decoders.
@@ -3365,6 +3428,88 @@ mod tests {
             spec.validate_execution(GgmlCpuGraphBackend::Cpu, 40, true, true)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn resolve_production_llm_kv_cache_policy_matrix() {
+        // CPU/Metal + native-GQA + flash + valid head_dim => Q8.
+        assert_eq!(
+            resolve_production_llm_kv_cache_policy(GgmlCpuGraphBackend::Cpu, 128, true, true, None,),
+            LlmKvCachePolicy::Q8_0
+        );
+        assert_eq!(
+            resolve_production_llm_kv_cache_policy(
+                GgmlCpuGraphBackend::Metal,
+                64,
+                true,
+                true,
+                None,
+            ),
+            LlmKvCachePolicy::Q8_0
+        );
+
+        // Discrete GPU stays Default even with native-GQA + flash.
+        assert_eq!(
+            resolve_production_llm_kv_cache_policy(GgmlCpuGraphBackend::Gpu, 128, true, true, None,),
+            LlmKvCachePolicy::Default
+        );
+
+        // Missing native-GQA or flash => Default.
+        assert_eq!(
+            resolve_production_llm_kv_cache_policy(
+                GgmlCpuGraphBackend::Cpu,
+                128,
+                false,
+                true,
+                None,
+            ),
+            LlmKvCachePolicy::Default
+        );
+        assert_eq!(
+            resolve_production_llm_kv_cache_policy(
+                GgmlCpuGraphBackend::Metal,
+                128,
+                true,
+                false,
+                None,
+            ),
+            LlmKvCachePolicy::Default
+        );
+
+        // head_dim not divisible by q8_0 block size => Default.
+        assert_eq!(
+            resolve_production_llm_kv_cache_policy(GgmlCpuGraphBackend::Cpu, 40, true, true, None,),
+            LlmKvCachePolicy::Default
+        );
+
+        // F32 opt-out env (truthy forms) wins over an otherwise-eligible path.
+        for raw in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert_eq!(
+                resolve_production_llm_kv_cache_policy(
+                    GgmlCpuGraphBackend::Cpu,
+                    128,
+                    true,
+                    true,
+                    Some(raw),
+                ),
+                LlmKvCachePolicy::Default,
+                "force_f32 raw={raw:?}"
+            );
+        }
+        // Non-truthy / empty raw does not force F32.
+        for raw in [None, Some("0"), Some("false"), Some("off"), Some("maybe")] {
+            assert_eq!(
+                resolve_production_llm_kv_cache_policy(
+                    GgmlCpuGraphBackend::Cpu,
+                    128,
+                    true,
+                    true,
+                    raw,
+                ),
+                LlmKvCachePolicy::Q8_0,
+                "force_f32 raw={raw:?}"
+            );
+        }
     }
 
     #[test]
