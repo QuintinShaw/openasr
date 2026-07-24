@@ -209,6 +209,16 @@ pub(crate) fn parse_moss_td_speaker_segments(
                 if let Some(previous) = last_anchor
                     && timestamp < previous
                 {
+                    // MOSS occasionally emits a corrected turn-start anchor
+                    // immediately after an initial anchor and before any text
+                    // (for example `[125.31][124.34][S01]`). It denotes the
+                    // same pending start, not a temporal reversal. Preserve
+                    // strict monotonicity once text has been attached.
+                    if buffer.trim().is_empty() && pending_start == Some(previous) {
+                        pending_start = Some(timestamp);
+                        last_anchor = Some(timestamp);
+                        continue;
+                    }
                     return Err(MossTdSpeakerSegmentParseError::TimeWentBackwards {
                         previous,
                         next: timestamp,

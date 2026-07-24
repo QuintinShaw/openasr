@@ -893,7 +893,9 @@ mod tests {
         // numeric divergence -> empty-shell output, and a per-step wired-memory
         // blow-up -- see the `arch` descriptor's `auto_gpu_policy` note), so the
         // reference decode is CPU-only.
-        transcribe_with_dev_pack_backend(wav_path, GgmlAsrBackendPreference::CpuOnly)
+        transcribe_with_dev_pack_backend(wav_path, GgmlAsrBackendPreference::CpuOnly).map(
+            |(text, _, elapsed, audio_duration_seconds)| (text, elapsed, audio_duration_seconds),
+        )
     }
 
     /// Same dev-pack e2e path as [`transcribe_with_dev_pack`], but lets the
@@ -907,7 +909,7 @@ mod tests {
     fn transcribe_with_dev_pack_backend(
         wav_path: PathBuf,
         backend_preference: GgmlAsrBackendPreference,
-    ) -> Option<(String, std::time::Duration, f32)> {
+    ) -> Option<(String, Vec<Segment>, std::time::Duration, f32)> {
         let pack_path = dev_pack_path();
         if !pack_path.exists() {
             eprintln!("skipping: {} not present", pack_path.display());
@@ -947,7 +949,12 @@ mod tests {
         let started_at = Instant::now();
         let result = executor.execute(&request).expect("moss-td transcribe");
         let elapsed = started_at.elapsed();
-        Some((result.transcription.text, elapsed, audio_duration_seconds))
+        Some((
+            result.transcription.text,
+            result.transcription.segments,
+            elapsed,
+            audio_duration_seconds,
+        ))
     }
 
     /// Same dev-pack e2e path as [`transcribe_with_dev_pack`], but returns the
@@ -1340,7 +1347,7 @@ mod tests {
                 and tmp/moss-td/samples/*.wav; drives an explicit accelerated request \
                 (Metal encoder + Metal decode) and needs a Metal device"]
     fn golden_diff_end_to_end_transcribe_jfk_wav_accelerated() {
-        let Some((text, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
+        let Some((text, _, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
             dev_sample_path("jfk.wav"),
             GgmlAsrBackendPreference::Accelerated,
         ) else {
@@ -1387,7 +1394,7 @@ mod tests {
                 and tmp/moss-td/samples/*.wav; drives an explicit accelerated request \
                 (Metal encoder + Metal decode) and needs a Metal device"]
     fn golden_diff_end_to_end_transcribe_en_zh_mixed_wav_accelerated() {
-        let Some((text, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
+        let Some((text, _, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
             dev_sample_path("en_zh_mixed.wav"),
             GgmlAsrBackendPreference::Accelerated,
         ) else {
@@ -1407,7 +1414,7 @@ mod tests {
     #[test]
     #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack and the 3-minute AISHELL-4 fixture; drives an explicit accelerated request"]
     fn accelerated_aishell4_three_minute_smoke_completes_with_structured_transcript() {
-        let Some((text, _, _)) = transcribe_with_dev_pack_backend(
+        let Some((text, segments, _, _)) = transcribe_with_dev_pack_backend(
             dev_sample_path("aishell4_multispeaker_3min.wav"),
             GgmlAsrBackendPreference::Accelerated,
         ) else {
@@ -1428,6 +1435,30 @@ mod tests {
             text,
             golden["text"].as_str().expect("AISHELL-4 golden text"),
             "accelerated AISHELL-4 transcript must match the pinned reference text"
+        );
+        assert!(
+            !segments.is_empty(),
+            "AISHELL-4 must emit structured segments"
+        );
+        assert!(
+            segments.iter().all(|segment| {
+                segment.speaker.is_some()
+                    && segment.start.is_finite()
+                    && segment.end.is_finite()
+                    && segment.start <= segment.end
+                    && !segment.text.trim().is_empty()
+            }),
+            "AISHELL-4 segments must retain speaker labels and valid time ranges"
+        );
+        assert!(
+            segments
+                .windows(2)
+                .all(|pair| pair[0].start <= pair[1].start),
+            "AISHELL-4 segment starts must be ordered"
+        );
+        assert!(
+            parse_moss_td_speaker_segments(&text, 180.0).is_ok(),
+            "AISHELL-4 tagged transcript must parse without text-only degradation"
         );
     }
 }
