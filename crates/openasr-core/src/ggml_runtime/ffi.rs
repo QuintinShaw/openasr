@@ -415,6 +415,18 @@ unsafe extern "C" {
         max_bias: f32,
         logit_softcap: f32,
     ) -> GgmlTensorRaw;
+    /// OpenASR-local CPU fused Transformer-XL relative-position attention.
+    /// Non-CPU backends do not implement this op.
+    pub(crate) fn ggml_flash_attn_rel_pos(
+        ctx: GgmlContextRaw,
+        q_u: GgmlTensorRaw,
+        q_v: GgmlTensorRaw,
+        k: GgmlTensorRaw,
+        r: GgmlTensorRaw,
+        v: GgmlTensorRaw,
+        mask: GgmlTensorRaw,
+        scale: f32,
+    ) -> GgmlTensorRaw;
     pub(crate) fn ggml_can_repeat(a: GgmlTensorRaw, b: GgmlTensorRaw) -> bool;
     pub(crate) fn ggml_gelu(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     pub(crate) fn ggml_gelu_erf(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;

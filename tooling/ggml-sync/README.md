@@ -21,6 +21,10 @@ The current local patch stack (oldest first):
 4. Isolate that Metal pipeline cache under an `openasr/` cache subdir.
 5. Default Metal residency sets off unless the device exposes the tensor API
    (`GGML_METAL_RESIDENCY_ENABLE` / `GGML_METAL_NO_RESIDENCY` override).
+6. CPU-only fused Transformer-XL relative-position attention
+   (`GGML_OP_FLASH_ATTN_REL_POS` / `ggml_flash_attn_rel_pos`): content +
+   relative scores with online softmax, no T x T materialization. Non-CPU
+   backends leave the op unsupported.
 
 GGUF tensor shapes use upstream `gguf_get_tensor_ne`; do not restore local
 per-dimension accessors.

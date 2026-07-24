@@ -893,6 +893,10 @@ pub enum GgmlCpuGraphError {
         head_dim: usize,
         supported: &'static [usize],
     },
+    #[error(
+        "ggml_flash_attn_rel_pos is CPU-only; backend={backend:?} must keep the naive mul_mat + rel_shift fallback"
+    )]
+    FlashAttnRelPosCpuOnly { backend: GgmlCpuGraphBackend },
 }
 
 pub struct GgmlCpuGraphRunner {
@@ -2866,6 +2870,72 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             )
         };
         self.new_tensor_checked(raw, "ggml_flash_attn_ext")
+    }
+
+    /// CPU-only fused Transformer-XL relative-position attention
+    /// (`ggml_flash_attn_rel_pos`). Fails closed on non-CPU backends so callers
+    /// must keep the naive mul_mat + rel_shift path rather than claiming the
+    /// fused op is supported on Metal/GPU.
+    pub(crate) fn flash_attn_rel_pos(
+        &self,
+        q_u: GgmlCpuTensor<'a>,
+        q_v: GgmlCpuTensor<'a>,
+        k: GgmlCpuTensor<'a>,
+        r: GgmlCpuTensor<'a>,
+        v: GgmlCpuTensor<'a>,
+        mask: Option<GgmlCpuTensor<'a>>,
+        scale: f32,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_flash_attn_rel_pos")?;
+        if self.backend_kind != GgmlCpuGraphBackend::Cpu {
+            return Err(GgmlCpuGraphError::FlashAttnRelPosCpuOnly {
+                backend: self.backend_kind,
+            });
+        }
+        self.ensure_tensor_type(q_u, ffi::GGML_TYPE_F32, "ggml_flash_attn_rel_pos q_u")?;
+        self.ensure_tensor_type(q_v, ffi::GGML_TYPE_F32, "ggml_flash_attn_rel_pos q_v")?;
+        self.ensure_tensor_type(k, ffi::GGML_TYPE_F32, "ggml_flash_attn_rel_pos k")?;
+        self.ensure_tensor_type(r, ffi::GGML_TYPE_F32, "ggml_flash_attn_rel_pos r")?;
+        self.ensure_tensor_type(v, ffi::GGML_TYPE_F32, "ggml_flash_attn_rel_pos v")?;
+        self.ensure_tensor_contiguous_rows(q_u, "ggml_flash_attn_rel_pos q_u")?;
+        self.ensure_tensor_contiguous_rows(q_v, "ggml_flash_attn_rel_pos q_v")?;
+        self.ensure_tensor_contiguous_rows(k, "ggml_flash_attn_rel_pos k")?;
+        self.ensure_tensor_contiguous_rows(r, "ggml_flash_attn_rel_pos r")?;
+        self.ensure_tensor_contiguous_rows(v, "ggml_flash_attn_rel_pos v")?;
+        if !scale.is_finite() {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_flash_attn_rel_pos scale must be finite",
+            });
+        }
+        self.ensure_flash_attn_rel_pos_compatible(q_u, q_v, k, r, v)?;
+
+        let mask_raw = if let Some(mask) = mask {
+            self.ensure_tensor_type(mask, ffi::GGML_TYPE_F32, "ggml_flash_attn_rel_pos mask")?;
+            self.ensure_flash_attn_rel_pos_mask_compatible(q_u, k, mask)?;
+            mask.raw.as_ptr()
+        } else {
+            ptr::null_mut()
+        };
+
+        let raw = unsafe {
+            ffi::ggml_flash_attn_rel_pos(
+                self.context.as_ptr(),
+                q_u.raw.as_ptr(),
+                q_v.raw.as_ptr(),
+                k.raw.as_ptr(),
+                r.raw.as_ptr(),
+                v.raw.as_ptr(),
+                mask_raw,
+                scale,
+            )
+        };
+        self.new_tensor_checked(raw, "ggml_flash_attn_rel_pos")
+    }
+
+    /// Predicate used by shared relative-position attention wrappers: the fused
+    /// op is only emitted on the plain CPU backend.
+    pub(crate) fn supports_flash_attn_rel_pos(&self) -> bool {
+        self.backend_kind == GgmlCpuGraphBackend::Cpu
     }
 
     pub(crate) fn gelu(
@@ -4848,6 +4918,91 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         if q_shape[2] % mask_shape[2] != 0 || q_shape[3] % mask_shape[3] != 0 {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "ggml_flash_attn_ext mask batch dims are not broadcast-compatible",
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_flash_attn_rel_pos_compatible(
+        &self,
+        q_u: GgmlCpuTensor<'a>,
+        q_v: GgmlCpuTensor<'a>,
+        k: GgmlCpuTensor<'a>,
+        r: GgmlCpuTensor<'a>,
+        v: GgmlCpuTensor<'a>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_can_mul_mat(k, q_u)?;
+        self.ensure_can_mul_mat(r, q_v)?;
+
+        let q_u_shape = self.tensor_shape_4d(q_u)?;
+        let q_v_shape = self.tensor_shape_4d(q_v)?;
+        let k_shape = self.tensor_shape_4d(k)?;
+        let r_shape = self.tensor_shape_4d(r)?;
+        let v_shape = self.tensor_shape_4d(v)?;
+
+        if q_u_shape != q_v_shape {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_flash_attn_rel_pos q_u/q_v shapes must match",
+            });
+        }
+        if q_u_shape[0] != k_shape[0] || q_u_shape[0] != r_shape[0] {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_flash_attn_rel_pos head dims must match across q/k/r",
+            });
+        }
+        if k_shape[1] != v_shape[1] {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_flash_attn_rel_pos k/v sequence lengths must match",
+            });
+        }
+        if k_shape[2] != v_shape[2] || k_shape[2] != r_shape[2] {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_flash_attn_rel_pos k/v/r head counts must match",
+            });
+        }
+        if q_u_shape[3] != k_shape[3] || q_u_shape[3] != v_shape[3] || q_u_shape[3] != r_shape[3] {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_flash_attn_rel_pos batch dims must match",
+            });
+        }
+        if q_u_shape[2] % k_shape[2] != 0 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_flash_attn_rel_pos query heads must be a multiple of kv heads",
+            });
+        }
+        let nq = q_u_shape[1];
+        let nk = k_shape[1];
+        let expected_nr = nq
+            .checked_add(nk)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_flash_attn_rel_pos relative length overflow",
+            })?;
+        if r_shape[1] != expected_nr {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_flash_attn_rel_pos r length must equal Nq + Nk - 1",
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_flash_attn_rel_pos_mask_compatible(
+        &self,
+        q_u: GgmlCpuTensor<'a>,
+        k: GgmlCpuTensor<'a>,
+        mask: GgmlCpuTensor<'a>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        let q_shape = self.tensor_shape_4d(q_u)?;
+        let k_shape = self.tensor_shape_4d(k)?;
+        let mask_shape = self.tensor_shape_4d(mask)?;
+        if mask_shape[0] < k_shape[1] {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_flash_attn_rel_pos mask.ne0 must cover key sequence",
+            });
+        }
+        if q_shape[2] % mask_shape[2] != 0 || q_shape[3] % mask_shape[3] != 0 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_flash_attn_rel_pos mask batch dims are not broadcast-compatible",
             });
         }
         Ok(())
@@ -8035,6 +8190,27 @@ mod tests {
                 assert_eq!(supported, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS);
             }
             Err(err) => panic!("unexpected flash_attn_ext error: {err}"),
+        }
+    }
+
+    #[test]
+    fn flash_attn_rel_pos_rejects_non_cpu_backend_kind() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner should initialize");
+        let graph = runner.start_graph();
+        let mut metal_graph = graph;
+        metal_graph.backend_kind = GgmlCpuGraphBackend::Metal;
+        assert!(!metal_graph.supports_flash_attn_rel_pos());
+
+        let q = metal_graph
+            .new_tensor_3d_f32(4, 2, 1, "q")
+            .expect("q should allocate");
+        match metal_graph.flash_attn_rel_pos(q, q, q, q, q, None, 1.0) {
+            Ok(_) => panic!("flash_attn_rel_pos must reject non-CPU backends"),
+            Err(GgmlCpuGraphError::FlashAttnRelPosCpuOnly {
+                backend: GgmlCpuGraphBackend::Metal,
+            }) => {}
+            Err(err) => panic!("unexpected flash_attn_rel_pos error: {err}"),
         }
     }
 

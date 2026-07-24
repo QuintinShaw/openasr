@@ -16,7 +16,8 @@
 use crate::ggml_runtime::{GgmlCpuGraphBuilder, GgmlCpuGraphError, GgmlCpuTensor};
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
-    STANDARD_HEAD_PERMUTE_AXES, attention_context_from_probs,
+    RelativePositionAttentionInputs, RelativePositionAttentionSteps, STANDARD_HEAD_PERMUTE_AXES,
+    attention_context_from_probs, relative_position_attention_context,
     reshape_projection_to_attention_heads,
 };
 use crate::nn::ffn::{
@@ -284,42 +285,6 @@ where
         },
         map_err,
     )?;
-    let ac = graph
-        .mul_mat(
-            graph
-                .cont(k)
-                .map_err(|source| map_err("ggml_cont(attn_k)", source))?,
-            q_u,
-        )
-        .map_err(|source| map_err("ggml_mul_mat(attn_ac)", source))?;
-    let bd_raw = graph
-        .mul_mat(
-            graph
-                .cont(r)
-                .map_err(|source| map_err("ggml_cont(attn_r)", source))?,
-            q_v,
-        )
-        .map_err(|source| map_err("ggml_mul_mat(attn_bd_raw)", source))?;
-    let bd = graph
-        .view_3d(
-            bd_raw,
-            frame_count,
-            frame_count,
-            heads,
-            config.rel_shift_nb1,
-            config.rel_shift_nb2,
-            config.rel_shift_offset,
-        )
-        .map_err(|source| map_err("ggml_view_3d(relative_shift)", source))?;
-    let mut scores = graph
-        .add(ac, bd)
-        .map_err(|source| map_err("ggml_add(attn_scores)", source))?;
-    scores = graph
-        .scale(scores, 1.0 / (head_dim as f32).sqrt())
-        .map_err(|source| map_err("ggml_scale(attn_scores)", source))?;
-    let scores = graph
-        .soft_max(scores)
-        .map_err(|source| map_err("ggml_soft_max(attn_scores)", source))?;
     let v_heads = reshape_projection_to_attention_heads(
         graph,
         v,
@@ -333,11 +298,22 @@ where
         },
         map_err,
     )?;
-    let mut attn_out = attention_context_from_probs(
+    let mut attn_out = relative_position_attention_context(
         graph,
-        v_heads,
-        scores,
-        attention_layout,
+        RelativePositionAttentionInputs {
+            q_u,
+            q_v,
+            k,
+            r,
+            v: v_heads,
+            mask: None,
+            layout: attention_layout,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            rel_shift_nb1: config.rel_shift_nb1,
+            rel_shift_nb2: config.rel_shift_nb2,
+            rel_shift_offset: config.rel_shift_offset,
+        },
+        RelativePositionAttentionSteps::DEFAULT,
         AttentionValueMergeSteps {
             value_permute: "ggml_permute(attn_v_t)",
             value_cont: "ggml_cont(attn_v_t)",

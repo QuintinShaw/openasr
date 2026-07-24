@@ -30,8 +30,8 @@ use thiserror::Error;
 use crate::ggml_runtime::{GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext};
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
-    STANDARD_HEAD_PERMUTE_AXES, attention_context_from_probs,
-    reshape_projection_to_attention_heads,
+    RelativePositionAttentionInputs, RelativePositionAttentionSteps, STANDARD_HEAD_PERMUTE_AXES,
+    relative_position_attention_context, reshape_projection_to_attention_heads,
 };
 use crate::nn::conv::{
     Conv2dParams, ConvActivation, ConvBlockSteps, apply_conv_2d_bias_activation, reshape_bias_4d,
@@ -522,11 +522,10 @@ fn firered_conformer_block<'a>(
         },
         map_err,
     )?;
-    // No `ggml_cont` on `k_heads`/`r_heads`: both feed `mul_mat` as src0 (the
-    // `attn_ac`/`attn_bd_raw` score matmuls below), which only requires its src0
-    // contiguous on the first (head) dim -- already satisfied by the permuted
-    // reshape view, the same strided-src0 form `q_u`/`q_v` above already use. The
-    // extra materialization was pure copy work (~11.5 MB/layer transient).
+    // No `ggml_cont` on `k_heads`/`r_heads` for the naive path: both feed
+    // `mul_mat` as src0, which only requires its src0 contiguous on the first
+    // (head) dim -- already satisfied by the permuted reshape view. The fused
+    // CPU path cont's internally before `ggml_flash_attn_rel_pos`.
     let k_heads = reshape_projection_to_attention_heads(
         graph,
         k,
@@ -556,45 +555,8 @@ fn firered_conformer_block<'a>(
         },
         map_err,
     )?;
-    let ac = graph
-        .mul_mat(k_heads, q_u)
-        .map_err(|source| map_err("ggml_mul_mat(attn_ac)", source))?;
-    let bd_raw = graph
-        .mul_mat(r_heads, q_v)
-        .map_err(|source| map_err("ggml_mul_mat(attn_bd_raw)", source))?;
-    let element = std::mem::size_of::<f32>();
-    let rel_shift_nb1 = (2 * n_frames - 2) * element;
-    let rel_shift_nb2 = (2 * n_frames - 1) * n_frames * element;
-    let rel_shift_offset = (n_frames - 1) * element;
-    let bd = graph
-        .view_3d(
-            bd_raw,
-            n_frames,
-            n_frames,
-            heads,
-            rel_shift_nb1,
-            rel_shift_nb2,
-            rel_shift_offset,
-        )
-        .map_err(|source| map_err("ggml_view_3d(relative_shift)", source))?;
-    let mut scores = graph
-        .add(ac, bd)
-        .map_err(|source| map_err("ggml_add(attn_scores)", source))?;
-    scores = graph
-        .scale(scores, 1.0 / (head_dim as f32).sqrt())
-        .map_err(|source| map_err("ggml_scale(attn_scores)", source))?;
-    // Mask out context-pad key frames (upstream `src_mask`, applied identically
-    // to every layer): `[n_frames,1,1]` broadcasts over the query and head dims.
-    scores = graph
-        .add(scores, key_mask)
-        .map_err(|source| map_err("ggml_add(attn_key_mask)", source))?;
-    let scores = graph
-        .soft_max(scores)
-        .map_err(|source| map_err("ggml_soft_max(attn_scores)", source))?;
-    // No `ggml_cont` here: `attention_context_from_probs` immediately re-permutes
-    // this tensor (its own `value_permute` step) before the value_cont that
-    // materializes it, so the two permutes compose into one and only the final
-    // `ggml_cont` needs to run.
+    // No `ggml_cont` here for naive: `attention_context_from_probs` immediately
+    // re-permutes this tensor. Fused path cont's internally.
     let v_heads = reshape_projection_to_attention_heads(
         graph,
         v,
@@ -608,11 +570,26 @@ fn firered_conformer_block<'a>(
         },
         map_err,
     )?;
-    let mut attn_out = attention_context_from_probs(
+    let element = std::mem::size_of::<f32>();
+    let rel_shift_nb1 = (2 * n_frames - 2) * element;
+    let rel_shift_nb2 = (2 * n_frames - 1) * n_frames * element;
+    let rel_shift_offset = (n_frames - 1) * element;
+    let mut attn_out = relative_position_attention_context(
         graph,
-        v_heads,
-        scores,
-        attention_layout,
+        RelativePositionAttentionInputs {
+            q_u,
+            q_v,
+            k: k_heads,
+            r: r_heads,
+            v: v_heads,
+            mask: Some(key_mask),
+            layout: attention_layout,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            rel_shift_nb1,
+            rel_shift_nb2,
+            rel_shift_offset,
+        },
+        RelativePositionAttentionSteps::DEFAULT,
         AttentionValueMergeSteps {
             value_permute: "ggml_permute(attn_v_t)",
             value_cont: "ggml_cont(attn_v_t)",
@@ -1027,39 +1004,6 @@ fn firered_conformer_block_with_taps<'a>(
         },
         map_err,
     )?;
-    let ac = graph
-        .mul_mat(k_heads, q_u)
-        .map_err(|source| map_err("ggml_mul_mat(attn_ac)", source))?;
-    let bd_raw = graph
-        .mul_mat(r_heads, q_v)
-        .map_err(|source| map_err("ggml_mul_mat(attn_bd_raw)", source))?;
-    let element = std::mem::size_of::<f32>();
-    let rel_shift_nb1 = (2 * n_frames - 2) * element;
-    let rel_shift_nb2 = (2 * n_frames - 1) * n_frames * element;
-    let rel_shift_offset = (n_frames - 1) * element;
-    let bd = graph
-        .view_3d(
-            bd_raw,
-            n_frames,
-            n_frames,
-            heads,
-            rel_shift_nb1,
-            rel_shift_nb2,
-            rel_shift_offset,
-        )
-        .map_err(|source| map_err("ggml_view_3d(relative_shift)", source))?;
-    let mut scores = graph
-        .add(ac, bd)
-        .map_err(|source| map_err("ggml_add(attn_scores)", source))?;
-    scores = graph
-        .scale(scores, 1.0 / (head_dim as f32).sqrt())
-        .map_err(|source| map_err("ggml_scale(attn_scores)", source))?;
-    scores = graph
-        .add(scores, key_mask)
-        .map_err(|source| map_err("ggml_add(attn_key_mask)", source))?;
-    let scores = graph
-        .soft_max(scores)
-        .map_err(|source| map_err("ggml_soft_max(attn_scores)", source))?;
     let v_heads = reshape_projection_to_attention_heads(
         graph,
         v,
@@ -1073,11 +1017,26 @@ fn firered_conformer_block_with_taps<'a>(
         },
         map_err,
     )?;
-    let mut attn_out_proj = attention_context_from_probs(
+    let element = std::mem::size_of::<f32>();
+    let rel_shift_nb1 = (2 * n_frames - 2) * element;
+    let rel_shift_nb2 = (2 * n_frames - 1) * n_frames * element;
+    let rel_shift_offset = (n_frames - 1) * element;
+    let mut attn_out_proj = relative_position_attention_context(
         graph,
-        v_heads,
-        scores,
-        attention_layout,
+        RelativePositionAttentionInputs {
+            q_u,
+            q_v,
+            k: k_heads,
+            r: r_heads,
+            v: v_heads,
+            mask: Some(key_mask),
+            layout: attention_layout,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            rel_shift_nb1,
+            rel_shift_nb2,
+            rel_shift_offset,
+        },
+        RelativePositionAttentionSteps::DEFAULT,
         AttentionValueMergeSteps {
             value_permute: "ggml_permute(attn_v_t)",
             value_cont: "ggml_cont(attn_v_t)",
