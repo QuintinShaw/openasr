@@ -1553,6 +1553,12 @@ where
             )
             .map_err(|source| map_err("llm_qkv_v_view", source))?;
         if output_tokens > 1 {
+            // Required (prefill / batched decode only): the three slices share
+            // the interleaved [q|k|v] matmul output, so each view carries the
+            // full qkv_width row stride, while the downstream `reshape_3d`
+            // into heads asserts a contiguous source. The copy de-interleaves
+            // the projections. A single token row is inherently contiguous,
+            // so the decode case (output_tokens == 1) skips it.
             q = graph
                 .cont(q)
                 .map_err(|source| map_err("llm_qkv_q_cont", source))?;
@@ -1603,18 +1609,17 @@ where
     v_full = graph
         .repeat_4d(v_full, head_dim, total_tokens, q_per_kv_group, kv_heads)
         .map_err(|source| map_err("llm_gqa_v_repeat4d", source))?;
+    // `repeat_4d` allocates a contiguous destination and `reshape_3d` asserts
+    // (and preserves) contiguity, so the expanded K/V are already contiguous
+    // here. No trailing `cont`: it would memcpy the whole expanded history --
+    // once per K and once per V, per layer, per step on the manual-GQA lane --
+    // of byte-identical content.
     k_full = graph
         .reshape_3d(k_full, head_dim, total_tokens, q_heads)
         .map_err(|source| map_err("llm_gqa_k_reshape3d", source))?;
     v_full = graph
         .reshape_3d(v_full, head_dim, total_tokens, q_heads)
         .map_err(|source| map_err("llm_gqa_v_reshape3d", source))?;
-    k_full = graph
-        .cont(k_full)
-        .map_err(|source| map_err("llm_gqa_k_cont", source))?;
-    v_full = graph
-        .cont(v_full)
-        .map_err(|source| map_err("llm_gqa_v_cont", source))?;
     Ok((k_full, v_full))
 }
 
@@ -1812,9 +1817,13 @@ where
             .map_err(|source| map_err("llm_v_permute", source))?;
         (q_flash, k_new, v_new)
     };
-    let q_flash = graph
-        .cont(q_flash)
-        .map_err(|source| map_err("llm_q_cont", source))?;
+    // Deliberately no `cont(q_flash)`: the permuted Q keeps its innermost
+    // head_dim row packed and every backend's flash_attn_ext kernel addresses
+    // Q through nb strides (CPU/Metal/Vulkan), which is exactly the
+    // row-packed-but-strided layout `ensure_tensor_contiguous_rows` allows for
+    // FA q/k/v. The non-flash fallback only needs the same row-packed guarantee
+    // for its `mul_mat` RHS. Materializing Q here would copy q_width floats per
+    // layer per decoded token without changing any value the kernels read.
     let k_full = graph
         .set_rows(kv.key_history, k_new, kv.row_indices)
         .map_err(|source| map_err("llm_k_set_rows", source))?;
@@ -1956,6 +1965,9 @@ where
     let v_t = graph
         .transpose(v_full)
         .map_err(|source| map_err("llm_naive_attn_v_transpose", source))?;
+    // Required: this V is the `mul_mat` LHS, and a transposed LHS fails closed
+    // (the builder's `ensure_tensor_not_transposed` plus the CPU kernel's
+    // packed-innermost assert), so the transpose must be materialized.
     let v_t = graph
         .cont(v_t)
         .map_err(|source| map_err("llm_naive_attn_v_cont", source))?;
@@ -1965,6 +1977,8 @@ where
     let attended = graph
         .permute(attended, 0, 2, 1, 3)
         .map_err(|source| map_err("llm_naive_attn_merge_permute", source))?;
+    // Required: the caller feeds this to `reshape_2d`, which asserts a
+    // contiguous source, so the head merge must be materialized.
     graph
         .cont(attended)
         .map_err(|source| map_err("llm_naive_attn_merge_cont", source))
@@ -3338,6 +3352,423 @@ mod tests {
 
         assert_f32_slices_close(&batched[0..4], &serial0, 1.0e-4);
         assert_f32_slices_close(&batched[4..8], &serial1, 1.0e-4);
+    }
+
+    #[derive(Clone, Copy)]
+    struct GqaStackOptions {
+        use_native_gqa: bool,
+        use_flash_attention: bool,
+        use_fused_qkv: bool,
+    }
+
+    /// Single-layer GQA (q_heads=2, kv_heads=1) stack runner used to pin the
+    /// layout-sensitive attention paths: manual head expansion vs native GQA,
+    /// naive (unfused) attention vs flash, and fused-QKV slices vs split
+    /// projections. All three must compute the same numbers for the same
+    /// inputs, which is what keeps the contiguity sweep honest.
+    fn compute_gqa_llm_state(
+        token_count: usize,
+        n_seq: usize,
+        state_values: &[f32],
+        row_indices: &[i32],
+        positions: &[i32],
+        options: GqaStackOptions,
+    ) -> Vec<f32> {
+        const D_MODEL: usize = 4;
+        const HEAD_DIM: usize = 2;
+        const Q_HEADS: usize = 2;
+        const KV_HEADS: usize = 1;
+        const Q_WIDTH: usize = Q_HEADS * HEAD_DIM;
+        const KV_WIDTH: usize = KV_HEADS * HEAD_DIM;
+        const MAX_POSITIONS: usize = 3;
+
+        fn weight(elements: usize, seed: f32) -> Vec<f32> {
+            (0..elements)
+                .map(|index| ((index as f32 + 1.0) * 0.37 + seed).sin() * 0.5)
+                .collect()
+        }
+
+        let output_tokens = token_count.checked_mul(n_seq).expect("token count");
+        assert_eq!(state_values.len(), D_MODEL * output_tokens);
+        assert_eq!(row_indices.len(), output_tokens);
+        assert_eq!(positions.len(), output_tokens);
+
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner should initialize");
+        let mut graph = runner.start_graph();
+        let state = graph
+            .new_tensor_2d_f32(D_MODEL, output_tokens, "state")
+            .expect("state tensor");
+        let row_indices_tensor = graph
+            .new_tensor_4d_i32(token_count, 1, n_seq, 1, "row_indices")
+            .expect("row indices");
+        let positions_tensor = graph
+            .new_tensor_1d_i32(output_tokens, "positions")
+            .expect("positions");
+        let attention_mask = graph
+            .new_tensor_4d_f16(MAX_POSITIONS, token_count, 1, n_seq, "attention_mask")
+            .expect("attention mask");
+        let hidden_norm = graph
+            .new_tensor_1d_f32(D_MODEL, "hidden_norm")
+            .expect("hidden norm");
+        let head_norm = graph
+            .new_tensor_1d_f32(HEAD_DIM, "head_norm")
+            .expect("head norm");
+        // Weights follow the mul_mat convention: ne0 is the contraction
+        // (input) dimension, ne1 the output rows.
+        let qkv = options.use_fused_qkv.then(|| {
+            graph
+                .new_tensor_2d_f32(D_MODEL, Q_WIDTH + 2 * KV_WIDTH, "qkv")
+                .expect("qkv weight")
+        });
+        let q = graph
+            .new_tensor_2d_f32(D_MODEL, Q_WIDTH, "q")
+            .expect("q weight");
+        let k = graph
+            .new_tensor_2d_f32(D_MODEL, KV_WIDTH, "k")
+            .expect("k weight");
+        let v = graph
+            .new_tensor_2d_f32(D_MODEL, KV_WIDTH, "v")
+            .expect("v weight");
+        let output = graph
+            .new_tensor_2d_f32(Q_WIDTH, D_MODEL, "output")
+            .expect("output weight");
+        let ffn = graph
+            .new_tensor_2d_f32(D_MODEL, D_MODEL, "ffn")
+            .expect("ffn weight");
+        let mut inputs = vec![
+            state,
+            row_indices_tensor,
+            positions_tensor,
+            attention_mask,
+            hidden_norm,
+            head_norm,
+            q,
+            k,
+            v,
+            output,
+            ffn,
+        ];
+        if let Some(qkv) = qkv {
+            inputs.push(qkv);
+        }
+        for input in inputs {
+            graph
+                .set_input(input)
+                .expect("test input should be settable");
+        }
+
+        let stack = compose_llm_decoder_layer_stack(
+            &mut graph,
+            1,
+            LlmDecoderStackConfig {
+                d_model: D_MODEL,
+                head_dim: HEAD_DIM,
+                q_heads: Q_HEADS,
+                kv_heads: KV_HEADS,
+                q_width: Q_WIDTH,
+                k_width: KV_WIDTH,
+                v_width: KV_WIDTH,
+                token_count,
+                n_seq,
+                rms_norm_epsilon: 1.0e-6,
+                rope: GgmlRopeExtParams::qwen_neox(HEAD_DIM, MAX_POSITIONS, 10_000.0)
+                    .expect("rope params"),
+                use_native_gqa: options.use_native_gqa,
+                use_flash_attention: options.use_flash_attention,
+                kv_cache_spec: LlmKvCacheSpec::DEFAULT,
+            },
+            LlmDecoderStackInputs {
+                state,
+                row_indices: row_indices_tensor,
+                positions: positions_tensor,
+                attention_mask: Some(attention_mask),
+                kv_span: MAX_POSITIONS,
+                key_history_name: "key_history",
+                value_history_name: "value_history",
+            },
+            None,
+            |_layer_index| LlmLayerWeights {
+                attn_norm_weight: hidden_norm,
+                qkv_weight: qkv,
+                q_weight: q,
+                k_weight: k,
+                v_weight: v,
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
+                q_norm_weight: Some(head_norm),
+                k_norm_weight: Some(head_norm),
+                output_weight: output,
+                ffn_norm_weight: hidden_norm,
+                ffn_gate_weight: ffn,
+                ffn_up_weight: ffn,
+                ffn_down_weight: ffn,
+                q_lora: None,
+                k_lora: None,
+                v_lora: None,
+                output_lora: None,
+                ffn_gate_lora: None,
+                ffn_up_lora: None,
+                ffn_down_lora: None,
+            },
+            |_step, source| source,
+        )
+        .expect("GQA LLM stack should build");
+
+        graph.set_output(stack.state).expect("state output");
+
+        graph
+            .set_f32_slice(state, state_values, "state")
+            .expect("state upload");
+        graph
+            .set_i32_slice(row_indices_tensor, row_indices, "row_indices")
+            .expect("row-index upload");
+        graph
+            .set_i32_slice(positions_tensor, positions, "positions")
+            .expect("position upload");
+        let row_indices_usize: Vec<usize> = row_indices
+            .iter()
+            .map(|&row| usize::try_from(row).expect("non-negative row"))
+            .collect();
+        let mask_bits = build_fixed_kv_attention_mask_bits_for_query_rows(
+            MAX_POSITIONS,
+            token_count,
+            n_seq,
+            &row_indices_usize,
+        )
+        .expect("mask should build");
+        graph
+            .set_f16_bits_slice(attention_mask, &mask_bits, "attention_mask")
+            .expect("mask upload");
+        graph
+            .set_f32_slice(hidden_norm, &[1.0; D_MODEL], "hidden_norm")
+            .expect("hidden norm upload");
+        graph
+            .set_f32_slice(head_norm, &[1.0; HEAD_DIM], "head_norm")
+            .expect("head norm upload");
+        let q_weight = weight(Q_WIDTH * D_MODEL, 0.1);
+        let k_weight = weight(KV_WIDTH * D_MODEL, 0.2);
+        let v_weight = weight(KV_WIDTH * D_MODEL, 0.3);
+        if let Some(qkv) = qkv {
+            let mut qkv_weight = Vec::with_capacity((Q_WIDTH + 2 * KV_WIDTH) * D_MODEL);
+            qkv_weight.extend_from_slice(&q_weight);
+            qkv_weight.extend_from_slice(&k_weight);
+            qkv_weight.extend_from_slice(&v_weight);
+            graph
+                .set_f32_slice(qkv, &qkv_weight, "qkv")
+                .expect("qkv weight upload");
+        }
+        graph
+            .set_f32_slice(q, &q_weight, "q")
+            .expect("q weight upload");
+        graph
+            .set_f32_slice(k, &k_weight, "k")
+            .expect("k weight upload");
+        graph
+            .set_f32_slice(v, &v_weight, "v")
+            .expect("v weight upload");
+        graph
+            .set_f32_slice(output, &weight(D_MODEL * Q_WIDTH, 0.4), "output")
+            .expect("output weight upload");
+        graph
+            .set_f32_slice(ffn, &weight(D_MODEL * D_MODEL, 0.5), "ffn")
+            .expect("ffn weight upload");
+        for (key_history, value_history) in stack.kv_inputs {
+            let zero_history = vec![0.0_f32; HEAD_DIM * MAX_POSITIONS * KV_HEADS * n_seq];
+            graph
+                .set_f32_slice(key_history, &zero_history, "key_history")
+                .expect("key history upload");
+            graph
+                .set_f32_slice(value_history, &zero_history, "value_history")
+                .expect("value history upload");
+        }
+
+        let mut outputs = graph
+            .compute_outputs_f32(&[(stack.state, D_MODEL * output_tokens)])
+            .expect("GQA LLM stack should compute");
+        outputs.pop().expect("state output")
+    }
+
+    #[test]
+    fn llm_decoder_stack_manual_gqa_expand_matches_native_gqa() {
+        // Decode shape (single token): manual head expansion must reproduce
+        // native-GQA flash attention exactly, pinning the post-`repeat_4d`
+        // K/V layout the contiguity sweep relies on.
+        let state = [0.25, -0.75, 0.5, 1.25];
+        let native = compute_gqa_llm_state(
+            1,
+            1,
+            &state,
+            &[0],
+            &[0],
+            GqaStackOptions {
+                use_native_gqa: true,
+                use_flash_attention: true,
+                use_fused_qkv: false,
+            },
+        );
+        let expanded = compute_gqa_llm_state(
+            1,
+            1,
+            &state,
+            &[0],
+            &[0],
+            GqaStackOptions {
+                use_native_gqa: false,
+                use_flash_attention: true,
+                use_fused_qkv: false,
+            },
+        );
+        assert_f32_slices_close(&expanded, &native, 1.0e-4);
+
+        // Prefill shape (multiple tokens): same invariant with a multi-row
+        // expansion.
+        let state = [0.25, -0.75, 0.5, 1.25, 1.0, 0.125, -0.5, 0.75];
+        let native = compute_gqa_llm_state(
+            2,
+            1,
+            &state,
+            &[0, 1],
+            &[0, 1],
+            GqaStackOptions {
+                use_native_gqa: true,
+                use_flash_attention: true,
+                use_fused_qkv: false,
+            },
+        );
+        let expanded = compute_gqa_llm_state(
+            2,
+            1,
+            &state,
+            &[0, 1],
+            &[0, 1],
+            GqaStackOptions {
+                use_native_gqa: false,
+                use_flash_attention: true,
+                use_fused_qkv: false,
+            },
+        );
+        assert_f32_slices_close(&expanded, &native, 1.0e-4);
+    }
+
+    #[test]
+    fn llm_decoder_stack_naive_attention_matches_flash_attention() {
+        // The non-flash fallback consumes the permuted (non-contiguous) Q
+        // directly; it must agree with flash attention for the same inputs.
+        let state = [0.25, -0.75, 0.5, 1.25];
+        let flash = compute_gqa_llm_state(
+            1,
+            1,
+            &state,
+            &[0],
+            &[0],
+            GqaStackOptions {
+                use_native_gqa: true,
+                use_flash_attention: true,
+                use_fused_qkv: false,
+            },
+        );
+        let naive = compute_gqa_llm_state(
+            1,
+            1,
+            &state,
+            &[0],
+            &[0],
+            GqaStackOptions {
+                use_native_gqa: true,
+                use_flash_attention: false,
+                use_fused_qkv: false,
+            },
+        );
+        assert_f32_slices_close(&naive, &flash, 1.0e-4);
+
+        let state = [0.25, -0.75, 0.5, 1.25, 1.0, 0.125, -0.5, 0.75];
+        let flash = compute_gqa_llm_state(
+            2,
+            1,
+            &state,
+            &[0, 1],
+            &[0, 1],
+            GqaStackOptions {
+                use_native_gqa: true,
+                use_flash_attention: true,
+                use_fused_qkv: false,
+            },
+        );
+        let naive = compute_gqa_llm_state(
+            2,
+            1,
+            &state,
+            &[0, 1],
+            &[0, 1],
+            GqaStackOptions {
+                use_native_gqa: true,
+                use_flash_attention: false,
+                use_fused_qkv: false,
+            },
+        );
+        assert_f32_slices_close(&naive, &flash, 1.0e-4);
+    }
+
+    #[test]
+    fn llm_decoder_stack_fused_qkv_matches_split_projection() {
+        // The fused [q|k|v] slices are de-interleaved by contiguity copies
+        // during prefill; the result must match three separate projections.
+        let state = [0.25, -0.75, 0.5, 1.25];
+        let split = compute_gqa_llm_state(
+            1,
+            1,
+            &state,
+            &[0],
+            &[0],
+            GqaStackOptions {
+                use_native_gqa: true,
+                use_flash_attention: true,
+                use_fused_qkv: false,
+            },
+        );
+        let fused = compute_gqa_llm_state(
+            1,
+            1,
+            &state,
+            &[0],
+            &[0],
+            GqaStackOptions {
+                use_native_gqa: true,
+                use_flash_attention: true,
+                use_fused_qkv: true,
+            },
+        );
+        assert_f32_slices_close(&fused, &split, 1.0e-4);
+
+        // Prefill: exercises the fused-QKV contiguity copies (output_tokens>1).
+        let state = [0.25, -0.75, 0.5, 1.25, 1.0, 0.125, -0.5, 0.75];
+        let split = compute_gqa_llm_state(
+            2,
+            1,
+            &state,
+            &[0, 1],
+            &[0, 1],
+            GqaStackOptions {
+                use_native_gqa: true,
+                use_flash_attention: true,
+                use_fused_qkv: false,
+            },
+        );
+        let fused = compute_gqa_llm_state(
+            2,
+            1,
+            &state,
+            &[0, 1],
+            &[0, 1],
+            GqaStackOptions {
+                use_native_gqa: true,
+                use_flash_attention: true,
+                use_fused_qkv: true,
+            },
+        );
+        assert_f32_slices_close(&fused, &split, 1.0e-4);
     }
 
     #[test]
