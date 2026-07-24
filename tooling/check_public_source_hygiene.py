@@ -18,8 +18,10 @@ SCAN_PREFIXES = (
     "crates/",
     "tooling/",
     "docs/",
+    "scripts/",
     ".github/",
     "README.md",
+    "README.zh-CN.md",
     "SECURITY.md",
     "AGENTS.md",
     "CONTRIBUTING.md",
@@ -70,6 +72,7 @@ def tracked_source_files() -> list[Path]:
             continue
         if path.suffix and path.suffix not in TEXT_SUFFIXES and path.name not in {
             "README.md",
+            "README.zh-CN.md",
             "SECURITY.md",
             "AGENTS.md",
             "CONTRIBUTING.md",

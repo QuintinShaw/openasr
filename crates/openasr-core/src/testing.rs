@@ -1931,16 +1931,53 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn external_fixture_path_reports_missing_fixture() {
-        let path = PathBuf::from("definitely-not-an-openasr-fixture");
+    fn external_fixture_path_reports_unset_env() {
         assert_eq!(
-            external_test_fixture_path("OPENASR_TEST_MISSING_FIXTURE", "fixture"),
+            external_test_fixture_path("OPENASR_TEST_UNSET_FIXTURE", "fixture"),
             Err(ExternalTestFixtureError::Unset {
-                env_var: "OPENASR_TEST_MISSING_FIXTURE".to_string(),
+                env_var: "OPENASR_TEST_UNSET_FIXTURE".to_string(),
                 purpose: "fixture".to_string(),
             })
         );
-        assert!(!path.exists(), "test fixture name must remain absent");
+    }
+
+    #[test]
+    fn external_fixture_path_reports_missing_path() {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("external fixture env lock");
+        let env_var = "OPENASR_TEST_MISSING_FIXTURE_PATH";
+        let missing = PathBuf::from("definitely-not-an-openasr-fixture");
+        assert!(!missing.exists(), "test fixture path must remain absent");
+        let previous = std::env::var_os(env_var);
+        #[expect(unsafe_code, reason = "test-only process env override")]
+        unsafe {
+            std::env::set_var(env_var, &missing);
+        }
+        let result = external_test_fixture_path(env_var, "fixture");
+        match previous {
+            Some(value) => {
+                #[expect(unsafe_code, reason = "test-only process env restore")]
+                unsafe {
+                    std::env::set_var(env_var, value);
+                }
+            }
+            None => {
+                #[expect(unsafe_code, reason = "test-only process env restore")]
+                unsafe {
+                    std::env::remove_var(env_var);
+                }
+            }
+        }
+        assert_eq!(
+            result,
+            Err(ExternalTestFixtureError::Missing {
+                env_var: env_var.to_string(),
+                path: missing,
+            })
+        );
     }
 
     #[test]
