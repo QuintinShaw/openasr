@@ -1135,6 +1135,22 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a local moss-transcribe-diarize .oasr pack and jfk.wav; runs the CPU host-prefill path"]
+    fn voice_id_disabled_real_jfk_request_prefills_without_prior_host_history() {
+        // A server request with `diarize=false` reaches this native MOSS
+        // executor before any optional diarization or Voice ID post-processing.
+        // Keep this a real-pack smoke so an empty Q8_0 host KV prefix cannot
+        // regress into a cache-count error behind the HTTP boundary.
+        let Some((text, _, _)) = transcribe_with_dev_pack(dev_sample_path("jfk.wav")) else {
+            return;
+        };
+        assert!(
+            !text.trim().is_empty(),
+            "MOSS must return a transcript before optional Voice ID processing"
+        );
+    }
+
+    #[test]
     #[ignore = "requires the private dev-only moss-transcribe-diarize-fp16.oasr pack \
                 and tmp/moss-td/samples/*.wav; CPU-only (Metal path has known defects)"]
     fn golden_diff_end_to_end_transcribe_jfk_wav() {

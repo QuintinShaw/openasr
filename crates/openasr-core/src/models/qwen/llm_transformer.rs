@@ -2854,6 +2854,30 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             &row_indices_usize,
         )?;
         graph.set_f16_bits_slice(attention_mask, &mask_bits, "qwen_llm_prefill_self_mask")?;
+        // The first prefill has no host KV prefix. F32 history tensors get an
+        // explicit zero-filled staging vector in `qwen_prefill_history_inputs_for_layer`.
+        // Q8_0 must do the same rather than requiring a cache that only exists
+        // after the prefill output has been written. A zero q8_0 block (scale
+        // and quantized payload both zero) is the exact empty-history value.
+        let q8_empty_history = if matches!(self.kv_cache_spec.host, GgmlKvElementType::Q8_0)
+            && position_offset == 0
+        {
+            let row_nbytes = GgmlKvElementType::Q8_0
+                .row_nbytes(dims.head_dim)
+                .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "q8_0 host prefill empty history row size invalid",
+                })?;
+            let history_nbytes = row_nbytes
+                .checked_mul(dims.kv_heads)
+                .and_then(|bytes| bytes.checked_mul(total_token_count))
+                .and_then(|bytes| bytes.checked_mul(n_seq))
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "q8_0 host prefill empty history size overflow",
+                })?;
+            Some(vec![0_u8; history_nbytes])
+        } else {
+            None
+        };
         for (layer_index, (key_history, value_history)) in kv_inputs.into_iter().enumerate() {
             match self.kv_cache_spec.host {
                 GgmlKvElementType::F32 => {
@@ -2884,20 +2908,38 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                             reason: "q8_0 host prefill history upload currently supports n_seq=1",
                         });
                     }
-                    let cache = layer_caches_by_sequence[0].get(layer_index).ok_or(
-                        GgmlCpuGraphError::UnsupportedInputs {
-                            reason: "q8_0 host prefill history layer/cache count mismatch",
-                        },
-                    )?;
-                    cache.upload_history_prefix_to_fixed_span_graph(
-                        &mut graph,
-                        key_history,
-                        value_history,
-                        position_offset,
-                        total_token_count,
-                        "qwen_llm_prefill_key_history",
-                        "qwen_llm_prefill_value_history",
-                    )?;
+                    if position_offset == 0 {
+                        let empty_history = q8_empty_history.as_deref().ok_or(
+                            GgmlCpuGraphError::UnsupportedInputs {
+                                reason: "q8_0 host prefill empty history was not initialized",
+                            },
+                        )?;
+                        graph.set_bytes_slice(
+                            key_history,
+                            empty_history,
+                            "qwen_llm_prefill_key_history",
+                        )?;
+                        graph.set_bytes_slice(
+                            value_history,
+                            empty_history,
+                            "qwen_llm_prefill_value_history",
+                        )?;
+                    } else {
+                        let cache = layer_caches_by_sequence[0].get(layer_index).ok_or(
+                            GgmlCpuGraphError::UnsupportedInputs {
+                                reason: "q8_0 host prefill history layer/cache count mismatch",
+                            },
+                        )?;
+                        cache.upload_history_prefix_to_fixed_span_graph(
+                            &mut graph,
+                            key_history,
+                            value_history,
+                            position_offset,
+                            total_token_count,
+                            "qwen_llm_prefill_key_history",
+                            "qwen_llm_prefill_value_history",
+                        )?;
+                    }
                 }
                 GgmlKvElementType::F16 => {
                     return Err(GgmlCpuGraphError::UnsupportedInputs {
