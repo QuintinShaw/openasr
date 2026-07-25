@@ -129,6 +129,16 @@ pub(crate) fn admit_file(
     models_root: &Path,
     preflight: impl FnOnce(&Path) -> Result<(), crate::PullError>,
 ) -> Result<AdmittedContent, ContentStoreError> {
+    let source_metadata =
+        fs::symlink_metadata(source_path).map_err(|source| ContentStoreError::Io {
+            path: source_path.to_path_buf(),
+            source,
+        })?;
+    if source_metadata.file_type().is_symlink() {
+        return Err(ContentStoreError::SourceChanged {
+            path: source_path.to_path_buf(),
+        });
+    }
     let source = File::open(source_path).map_err(|source| ContentStoreError::Io {
         path: source_path.to_path_buf(),
         source,
@@ -226,15 +236,7 @@ pub(crate) fn admit_file(
                         source,
                     })?;
                 } else {
-                    fs::remove_file(&object).map_err(|source| ContentStoreError::Io {
-                        path: object.clone(),
-                        source,
-                    })?;
-                    fs::rename(&staging, &object).map_err(|source| ContentStoreError::Io {
-                        path: object.clone(),
-                        source,
-                    })?;
-                    atomic_file::sync_parent_dir_best_effort(&object);
+                    return Err(ContentStoreError::SourceChanged { path: object });
                 }
             }
             Err(_) => match fs::rename(&staging, &object) {
