@@ -751,6 +751,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    println!("cargo:rerun-if-env-changed=OPENASR_IOS_DEPLOYMENT_TARGET");
+    println!("cargo:rerun-if-env-changed=IPHONEOS_DEPLOYMENT_TARGET");
+    println!("cargo:rerun-if-env-changed=CMAKE_OSX_DEPLOYMENT_TARGET");
     println!("cargo:rerun-if-env-changed=OPENASR_GGML_BUILD_JOBS");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!(
@@ -1675,14 +1678,35 @@ fn macos_deployment_target() -> String {
 }
 
 fn ios_deployment_target() -> String {
-    let configured = env::var("IPHONEOS_DEPLOYMENT_TARGET").ok();
-    ios_deployment_target_from(configured.as_deref())
+    let canonical = env::var("OPENASR_IOS_DEPLOYMENT_TARGET").ok();
+    let legacy = env::var("IPHONEOS_DEPLOYMENT_TARGET").ok();
+    let cmake = env::var("CMAKE_OSX_DEPLOYMENT_TARGET").ok();
+
+    if let Some(canonical) = canonical.as_deref() {
+        let target = ios_deployment_target_from(Some(canonical));
+        for (name, configured) in [
+            ("IPHONEOS_DEPLOYMENT_TARGET", legacy.as_deref()),
+            ("CMAKE_OSX_DEPLOYMENT_TARGET", cmake.as_deref()),
+        ] {
+            if let Some(configured) = configured {
+                let normalized = ios_deployment_target_from(Some(configured));
+                assert_eq!(
+                    normalized, target,
+                    "{name}={configured:?} disagrees with OPENASR_IOS_DEPLOYMENT_TARGET={canonical:?}"
+                );
+            }
+        }
+        return target;
+    }
+
+    ios_deployment_target_from(legacy.as_deref().or(cmake.as_deref()))
 }
 
 fn ios_deployment_target_from(configured: Option<&str>) -> String {
-    // arm64-only device hardware (see is_ios above) already implies iOS 11+, but
-    // pin a newer floor to match the Rust std minimum for aarch64-apple-ios.
-    const MINIMUM: &str = "15.0";
+    // The iOS SDK contract is supplied by scripts/build-xcframework.sh through
+    // OPENASR_IOS_DEPLOYMENT_TARGET. Keep standalone cargo builds safe when that
+    // script environment is absent, and never accept an older object floor.
+    const MINIMUM: &str = "26.0";
     match configured {
         Some(value) if version_at_least(value, MINIMUM) => value.trim().to_string(),
         _ => MINIMUM.to_string(),
@@ -1987,16 +2011,18 @@ mod tests {
 
     #[test]
     fn ios_deployment_target_clamps_below_minimum_or_malformed_values() {
-        assert_eq!(ios_deployment_target_from(None), "15.0");
-        assert_eq!(ios_deployment_target_from(Some("12.0")), "15.0");
-        assert_eq!(ios_deployment_target_from(Some("14.x")), "15.0");
-        assert_eq!(ios_deployment_target_from(Some("")), "15.0");
+        assert_eq!(ios_deployment_target_from(None), "26.0");
+        assert_eq!(ios_deployment_target_from(Some("12.0")), "26.0");
+        assert_eq!(ios_deployment_target_from(Some("25.9")), "26.0");
+        assert_eq!(ios_deployment_target_from(Some("14.x")), "26.0");
+        assert_eq!(ios_deployment_target_from(Some("")), "26.0");
     }
 
     #[test]
     fn ios_deployment_target_keeps_valid_minimum_or_newer_values() {
-        assert_eq!(ios_deployment_target_from(Some("15.0")), "15.0");
-        assert_eq!(ios_deployment_target_from(Some("17.2")), "17.2");
+        assert_eq!(ios_deployment_target_from(Some("26.0")), "26.0");
+        assert_eq!(ios_deployment_target_from(Some("26.5")), "26.5");
+        assert_eq!(ios_deployment_target_from(Some("27.2")), "27.2");
     }
 
     #[test]
