@@ -1794,6 +1794,14 @@ fn into_vad_config_hangover_is_mode_conditional() {
     .into_vad_config(DEFAULT_FRAME_DURATION_MS);
     assert_eq!(pinned.speech_stop_ms, 123);
 
+    let disabled = ClientVadConfig {
+        enabled: Some(false),
+        engine: Some("energy".to_string()),
+        ..Default::default()
+    }
+    .into_vad_config(DEFAULT_FRAME_DURATION_MS);
+    assert_eq!(disabled.mode, VadMode::Disabled);
+
     match saved {
         Some(value) => unsafe { std::env::set_var("OPENASR_VAD", value) },
         None => unsafe { std::env::remove_var("OPENASR_VAD") },

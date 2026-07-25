@@ -1058,15 +1058,6 @@ impl WsSession {
         }
 
         let vad_config = session.vad.unwrap_or_default();
-        if vad_config.enabled == Some(false) {
-            self.emit_error(
-                RealtimeErrorCode::StartupConfigError,
-                "Realtime vad.enabled=false is not implemented in M48C; omit the field or use true.",
-                false,
-            )
-            .await?;
-            return Err(());
-        }
         let vad = vad_config.into_vad_config(self.frame_duration_ms);
         if let Err(error) = vad.validate() {
             self.emit_error(

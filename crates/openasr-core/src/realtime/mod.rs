@@ -50,6 +50,7 @@ pub use transcript::{
     TranscriptLifecycle, TranscriptLifecycleResult, TranscriptRevisionPolicy, TranscriptUpdate,
 };
 pub use vad::{
-    SpeechBoundaryEvent, VadConfig, VadConfigError, VadDecision, VadFrameDecision, VadMode,
-    VadState, VadStateMachine,
+    SpeechBoundaryEvent, StreamingVadEngine, StreamingVadEngineError, VadConfig, VadConfigError,
+    VadDecision, VadFrameDecision, VadMode, VadState, VadStateMachine,
+    default_streaming_vad_config, resolve_streaming_vad_mode,
 };

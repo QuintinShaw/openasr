@@ -38,6 +38,7 @@
 
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr;
@@ -239,7 +240,53 @@ pub struct OpenAsrStreamingConfig {
     pub partial_poll_interval_ms: u64,
 }
 
-/// Opaque handle to an in-process streaming transcription session over a local
+/// Wire value for neural FireRed endpointing in [`OpenAsrStreamingConfigV2`].
+pub const OPENASR_STREAMING_VAD_MODE_NEURAL: u32 = 0;
+/// Wire value for the explicit RMS energy fallback in [`OpenAsrStreamingConfigV2`].
+pub const OPENASR_STREAMING_VAD_MODE_ENERGY: u32 = 1;
+/// Wire value that bypasses endpointing in [`OpenAsrStreamingConfigV2`].
+pub const OPENASR_STREAMING_VAD_MODE_DISABLED: u32 = 2;
+
+/// Explicit endpointing mode vocabulary for [`OpenAsrStreamingConfigV2`]. The
+/// V2 struct carries its raw `u32` wire value so unknown C inputs can be
+/// rejected fail-closed before Rust materializes an enum with an invalid
+/// discriminant. Use the `OPENASR_STREAMING_VAD_MODE_*` constants in C/Swift.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAsrStreamingVadMode {
+    Neural = OPENASR_STREAMING_VAD_MODE_NEURAL,
+    Energy = OPENASR_STREAMING_VAD_MODE_ENERGY,
+    Disabled = OPENASR_STREAMING_VAD_MODE_DISABLED,
+}
+
+#[repr(C)]
+struct OpenAsrStreamingConfigV2Prefix {
+    version: u32,
+    size: usize,
+}
+
+/// Version number accepted by [`OpenAsrStreamingConfigV2`].
+pub const OPENASR_STREAMING_CONFIG_V2_VERSION: u32 = 1;
+
+/// Versioned, size-guarded streaming configuration. This is deliberately a new
+/// struct and a new open entry point: changing the legacy struct's layout would
+/// make older callers' allocations unsafe to read.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OpenAsrStreamingConfigV2 {
+    /// Set to [`OPENASR_STREAMING_CONFIG_V2_VERSION`].
+    pub version: u32,
+    /// Caller-provided allocation size in bytes. Must be at least
+    /// `size_of::<OpenAsrStreamingConfigV2>()` for this version.
+    pub size: usize,
+    pub partial_results: bool,
+    pub word_timestamps: bool,
+    pub vad_mode: u32,
+    pub language: *const c_char,
+    pub hardware_target: OpenAsrHardwareTarget,
+    pub inference_threads: u16,
+    pub partial_poll_interval_ms: u64,
+}
 /// `.oasr` pack. Created with [`openasr_streaming_session_open`], driven with
 /// [`openasr_streaming_feed`], and consumed by [`openasr_streaming_finish`]
 /// (which returns the final transcript and frees the session) or discarded with
@@ -629,21 +676,64 @@ pub unsafe extern "C" fn openasr_streaming_session_open(
             Ok(cfg) => cfg,
             Err(status) => return status,
         };
-        match StreamingSession::new(&path, cfg) {
-            Ok(session) => {
-                let handle = Box::new(OpenAsrStreamingSession { inner: session });
-                // SAFETY: checked non-null above.
-                unsafe {
-                    *out_session = Box::into_raw(handle);
-                }
-                OpenAsrStatus::Ok
-            }
-            Err(error) => {
-                set_last_error(format!("openasr_streaming_session_open: {error}"));
-                OpenAsrStatus::ModelLoadFailed
-            }
-        }
+        open_streaming_session(&path, cfg, out_session)
     })
+}
+
+/// Opens a streaming session using the size-guarded V2 configuration. V2 makes
+/// neural, energy, and disabled endpointing explicit; use the legacy
+/// [`openasr_streaming_session_open`] for source/binary compatibility with the
+/// original boolean config.
+///
+/// # Safety
+/// `config` must point to a readable V2 prefix containing `version` and `size`.
+/// Its advertised `size` must cover the full current V2 struct before this
+/// function reads any trailing field. `path` and `out_session` follow the same
+/// contract as [`openasr_streaming_session_open`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_streaming_session_open_v2(
+    path: *const c_char,
+    config: *const OpenAsrStreamingConfigV2,
+    out_session: *mut *mut OpenAsrStreamingSession,
+) -> OpenAsrStatus {
+    catch(OpenAsrStatus::ModelLoadFailed, || {
+        if out_session.is_null() {
+            set_last_error("openasr_streaming_session_open_v2: out_session must not be null");
+            return OpenAsrStatus::InvalidArgument;
+        }
+        unsafe {
+            *out_session = ptr::null_mut();
+        }
+        let path = match unsafe { c_str_to_path(path) } {
+            Ok(path) => path,
+            Err(status) => return status,
+        };
+        let cfg = match unsafe { streaming_config_from_c_v2(config) } {
+            Ok(cfg) => cfg,
+            Err(status) => return status,
+        };
+        open_streaming_session(&path, cfg, out_session)
+    })
+}
+
+fn open_streaming_session(
+    path: &std::path::Path,
+    cfg: StreamingConfig,
+    out_session: *mut *mut OpenAsrStreamingSession,
+) -> OpenAsrStatus {
+    match StreamingSession::new(path, cfg) {
+        Ok(session) => {
+            let handle = Box::new(OpenAsrStreamingSession { inner: session });
+            unsafe {
+                *out_session = Box::into_raw(handle);
+            }
+            OpenAsrStatus::Ok
+        }
+        Err(error) => {
+            set_last_error(format!("openasr_streaming_session_open: {error}"));
+            OpenAsrStatus::ModelLoadFailed
+        }
+    }
 }
 
 /// Feeds a chunk of 16 kHz mono `f32` PCM (any length, including zero) into an
@@ -1079,8 +1169,13 @@ unsafe fn streaming_config_from_c(
     let raw = unsafe { &*config };
     cfg.partial_results = raw.partial_results;
     cfg.word_timestamps = raw.word_timestamps;
-    // `StreamingConfig::default()` already enables VAD; only clear it when the
-    // caller opts out (whole stream treated as a single utterance).
+    // The legacy boolean now maps to the shared endpointing default. This is
+    // intentionally a behavioral alignment change: legacy callers that opted
+    // into VAD receive the same neural boundaries as server and Swift V2 users.
+    cfg.vad = Some(openasr_core::default_streaming_vad_config(
+        openasr_core::VadMode::ExternalProbability,
+        20,
+    ));
     if !raw.enable_vad {
         cfg.vad = None;
     }
@@ -1111,6 +1206,90 @@ unsafe fn streaming_config_from_c(
         cfg.partial_poll_interval_ms = raw.partial_poll_interval_ms;
     }
     Ok(cfg)
+}
+
+/// Parses the V2 config after validating that its advertised layout is safe to
+/// read. V2 is fail-closed: null, too-short, unknown-version, and unknown-mode
+/// configurations never fall back silently to another endpointing policy.
+///
+/// # Safety
+/// `config`, when non-null, must point to a readable prefix containing `version`
+/// and `size` (`u32` followed by `usize`).
+unsafe fn streaming_config_from_c_v2(
+    config: *const OpenAsrStreamingConfigV2,
+) -> Result<StreamingConfig, OpenAsrStatus> {
+    if config.is_null() {
+        set_last_error("openasr_streaming_session_open_v2: config must not be null");
+        return Err(OpenAsrStatus::InvalidArgument);
+    }
+    let prefix = unsafe { &*config.cast::<OpenAsrStreamingConfigV2Prefix>() };
+    let version = prefix.version;
+    let size = prefix.size;
+    if version != OPENASR_STREAMING_CONFIG_V2_VERSION {
+        set_last_error(format!(
+            "openasr_streaming_session_open_v2: unsupported config version {version}"
+        ));
+        return Err(OpenAsrStatus::InvalidArgument);
+    }
+    if size < mem::size_of::<OpenAsrStreamingConfigV2>() {
+        set_last_error(format!(
+            "openasr_streaming_session_open_v2: config size {size} is smaller than required {}",
+            mem::size_of::<OpenAsrStreamingConfigV2>()
+        ));
+        return Err(OpenAsrStatus::InvalidArgument);
+    }
+    let raw = unsafe { &*config };
+    let cfg = StreamingConfig {
+        partial_results: raw.partial_results,
+        word_timestamps: raw.word_timestamps,
+        vad: match raw.vad_mode {
+            OPENASR_STREAMING_VAD_MODE_NEURAL => Some(openasr_core::default_streaming_vad_config(
+                openasr_core::VadMode::ExternalProbability,
+                20,
+            )),
+            OPENASR_STREAMING_VAD_MODE_ENERGY => Some(openasr_core::default_streaming_vad_config(
+                openasr_core::VadMode::Energy,
+                20,
+            )),
+            OPENASR_STREAMING_VAD_MODE_DISABLED => None,
+            mode => {
+                set_last_error(format!(
+                    "openasr_streaming_session_open_v2: invalid VAD mode {mode}"
+                ));
+                return Err(OpenAsrStatus::InvalidArgument);
+            }
+        },
+        language: unsafe {
+            optional_utf8_string(raw.language, "openasr_streaming_session_open_v2")
+        }?,
+        hardware_target: raw.hardware_target.into(),
+        inference_threads: (raw.inference_threads != 0).then_some(raw.inference_threads),
+        partial_poll_interval_ms: if raw.partial_poll_interval_ms == 0 {
+            StreamingConfig::default().partial_poll_interval_ms
+        } else {
+            raw.partial_poll_interval_ms
+        },
+        ..StreamingConfig::default()
+    };
+    Ok(cfg)
+}
+
+unsafe fn optional_utf8_string(
+    value: *const c_char,
+    context: &str,
+) -> Result<Option<String>, OpenAsrStatus> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let c_str = unsafe { CStr::from_ptr(value) };
+    match c_str.to_str() {
+        Ok(text) if !text.is_empty() => Ok(Some(text.to_string())),
+        Ok(_) => Ok(None),
+        Err(error) => {
+            set_last_error(format!("{context}: language is not valid UTF-8: {error}"));
+            Err(OpenAsrStatus::InvalidArgument)
+        }
+    }
 }
 
 fn owned_streaming_event(event: StreamingEvent) -> OwnedStreamingEvent {
@@ -1560,7 +1739,10 @@ mod tests {
         let default = StreamingConfig::default();
         assert_eq!(cfg.partial_results, default.partial_results);
         assert_eq!(cfg.word_timestamps, default.word_timestamps);
-        assert!(cfg.vad.is_some());
+        assert_eq!(
+            cfg.vad.as_ref().map(|vad| vad.mode),
+            Some(openasr_core::VadMode::ExternalProbability)
+        );
         assert!(cfg.language.is_none());
     }
 
@@ -1585,6 +1767,95 @@ mod tests {
         assert_eq!(cfg.hardware_target, NativeAsrHardwareTarget::Cpu);
         assert_eq!(cfg.inference_threads, Some(4));
         assert_eq!(cfg.partial_poll_interval_ms, 250);
+    }
+
+    #[test]
+    fn streaming_config_v2_maps_all_vad_modes() {
+        for (mode, expected) in [
+            (
+                OPENASR_STREAMING_VAD_MODE_NEURAL,
+                Some(openasr_core::VadMode::ExternalProbability),
+            ),
+            (
+                OPENASR_STREAMING_VAD_MODE_ENERGY,
+                Some(openasr_core::VadMode::Energy),
+            ),
+            (OPENASR_STREAMING_VAD_MODE_DISABLED, None),
+        ] {
+            let raw = OpenAsrStreamingConfigV2 {
+                version: OPENASR_STREAMING_CONFIG_V2_VERSION,
+                size: mem::size_of::<OpenAsrStreamingConfigV2>(),
+                partial_results: true,
+                word_timestamps: false,
+                vad_mode: mode,
+                language: ptr::null(),
+                hardware_target: OpenAsrHardwareTarget::Auto,
+                inference_threads: 0,
+                partial_poll_interval_ms: 0,
+            };
+            // SAFETY: `raw` is a complete V2 config with an accurate size.
+            let cfg = unsafe { streaming_config_from_c_v2(&raw) }.unwrap();
+            assert_eq!(cfg.vad.as_ref().map(|vad| vad.mode), expected);
+        }
+    }
+
+    #[test]
+    fn legacy_enable_vad_true_maps_to_neural_default() {
+        let raw = OpenAsrStreamingConfig {
+            partial_results: true,
+            word_timestamps: false,
+            enable_vad: true,
+            language: ptr::null(),
+            hardware_target: OpenAsrHardwareTarget::Auto,
+            inference_threads: 0,
+            partial_poll_interval_ms: 0,
+        };
+        // SAFETY: `raw` is a valid legacy config.
+        let cfg = unsafe { streaming_config_from_c(&raw) }.unwrap();
+        let vad = cfg.vad.expect("legacy enable_vad=true enables endpointing");
+        assert_eq!(vad.mode, openasr_core::VadMode::ExternalProbability);
+        assert_eq!(
+            vad.speech_start_ms,
+            openasr_core::diarize::vad::DEFAULT_NEURAL_SPEECH_START_MS
+        );
+        assert_eq!(
+            vad.speech_stop_ms,
+            openasr_core::diarize::vad::SHORT_NEURAL_SPEECH_STOP_MS
+        );
+    }
+
+    #[test]
+    fn streaming_config_v2_rejects_unknown_version_short_size_and_mode() {
+        let mut raw = OpenAsrStreamingConfigV2 {
+            version: 99,
+            size: mem::size_of::<OpenAsrStreamingConfigV2>(),
+            partial_results: true,
+            word_timestamps: false,
+            vad_mode: 0,
+            language: ptr::null(),
+            hardware_target: OpenAsrHardwareTarget::Auto,
+            inference_threads: 0,
+            partial_poll_interval_ms: 0,
+        };
+        // SAFETY: `raw` is a complete struct; version is intentionally invalid.
+        assert!(matches!(
+            unsafe { streaming_config_from_c_v2(&raw) },
+            Err(OpenAsrStatus::InvalidArgument)
+        ));
+        raw.version = OPENASR_STREAMING_CONFIG_V2_VERSION;
+        raw.size = mem::size_of::<OpenAsrStreamingConfigV2>() - 1;
+        // SAFETY: `raw` is a complete struct; advertised size is intentionally invalid.
+        assert!(matches!(
+            unsafe { streaming_config_from_c_v2(&raw) },
+            Err(OpenAsrStatus::InvalidArgument)
+        ));
+        raw.size = mem::size_of::<OpenAsrStreamingConfigV2>();
+        raw.vad_mode = 77;
+        // SAFETY: `raw` is a complete config with an intentionally invalid mode.
+        assert!(matches!(
+            unsafe { streaming_config_from_c_v2(&raw) },
+            Err(OpenAsrStatus::InvalidArgument)
+        ));
     }
 
     /// End-to-end C-ABI roundtrip against a real `.oasr` pack: open a session,

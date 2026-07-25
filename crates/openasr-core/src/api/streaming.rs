@@ -32,8 +32,8 @@ use crate::{
     NativeAsrError, NativeAsrExecutor, NativeAsrHardwareTarget, NativeAsrModelAdapter,
     NativeAsrModelPackRef, NativeAsrRequestOptions, NativeAsrSession, NativeAsrSessionContext,
     NativeAsrStreamingSessionConfig, NativeBackendExecutor, RealtimeAudioFormat,
-    RealtimeAudioFrame, RealtimeEventEnvelope, Segment, Transcription, VadConfig, VadStateMachine,
-    native_runtime_model_adapter_for_path,
+    RealtimeAudioFrame, RealtimeEventEnvelope, Segment, StreamingVadEngine, Transcription,
+    VadConfig, VadMode, native_runtime_model_adapter_for_path,
 };
 
 /// The kind of a [`StreamingEvent`].
@@ -79,10 +79,11 @@ pub struct StreamingConfig {
     pub partial_results: bool,
     /// Attach per-word timings to events when the family supports them.
     pub word_timestamps: bool,
-    /// When `Some`, an energy VAD segments the stream into utterances and a
-    /// `Committed` event is emitted at each speech pause -- the shape a live
-    /// caption UI wants. When `None`, the whole stream is treated as a single
-    /// utterance and only finalized at [`StreamingSession::finish`].
+    /// When enabled, the shared VAD provider segments the stream into
+    /// utterances and emits a `Committed` event at each speech pause. The
+    /// default config uses the neural FireRed provider; `Energy` and `Disabled`
+    /// remain explicit choices. When `None`, the whole stream is one utterance
+    /// finalized only at [`StreamingSession::finish`].
     pub vad: Option<VadConfig>,
     /// Optional decode language hint passed through to the model.
     pub language: Option<String>,
@@ -106,7 +107,10 @@ impl Default for StreamingConfig {
         Self {
             partial_results: true,
             word_timestamps: false,
-            vad: Some(VadConfig::default()),
+            vad: Some(crate::default_streaming_vad_config(
+                crate::VadMode::ExternalProbability,
+                FRAME_DURATION_MS,
+            )),
             language: None,
             hardware_target: NativeAsrHardwareTarget::Auto,
             inference_threads: None,
@@ -142,7 +146,7 @@ struct TrackedSegment {
 /// An in-process streaming transcription session over a local `.oasr` pack.
 pub struct StreamingSession {
     session: Box<dyn NativeAsrSession>,
-    vad: Option<VadStateMachine>,
+    vad: Option<StreamingVadEngine>,
     /// Leftover f32 samples that did not fill a whole 20 ms frame yet.
     pending: Vec<f32>,
     audio_format: RealtimeAudioFormat,
@@ -210,18 +214,18 @@ impl StreamingSession {
         cfg: &StreamingConfig,
     ) -> Result<Self, NativeAsrError> {
         let vad = match &cfg.vad {
-            Some(vad_cfg) => {
+            Some(vad_cfg) if vad_cfg.mode != VadMode::Disabled => {
                 let vad_cfg = VadConfig {
                     frame_duration_ms: FRAME_DURATION_MS,
                     ..*vad_cfg
                 };
-                Some(VadStateMachine::new(vad_cfg).map_err(|error| {
+                Some(StreamingVadEngine::new(vad_cfg).map_err(|error| {
                     NativeAsrError::SessionFailed {
                         message: format!("invalid streaming VAD config: {error}"),
                     }
                 })?)
             }
-            None => None,
+            Some(_) | None => None,
         };
         let poll_interval_samples =
             ((cfg.partial_poll_interval_ms as usize) * (SAMPLE_RATE_HZ as usize) / 1_000)
@@ -287,7 +291,7 @@ impl StreamingSession {
         let boundaries = self
             .vad
             .as_mut()
-            .map(|vad| vad.process_energy_frame(&frame))
+            .map(|vad| vad.process_frame(&frame))
             .unwrap_or_default();
 
         // Push audio (advances the decode), then poll on a time cadence:

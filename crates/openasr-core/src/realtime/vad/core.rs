@@ -12,8 +12,12 @@ use super::events::TranscriptUtteranceId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VadMode {
+    /// Explicit RMS energy fallback.
     Energy,
+    /// Feed neural probabilities from the shared FireRed provider.
     ExternalProbability,
+    /// Bypass endpointing entirely; callers finalize only at stream finish.
+    Disabled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

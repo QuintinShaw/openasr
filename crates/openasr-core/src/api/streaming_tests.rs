@@ -267,7 +267,13 @@ fn partials_grow_then_final_no_vad() {
 
 #[test]
 fn vad_pause_emits_committed_segment() {
-    let cfg = StreamingConfig::default(); // VAD on by default
+    let cfg = StreamingConfig {
+        vad: Some(crate::default_streaming_vad_config(
+            crate::VadMode::Energy,
+            20,
+        )),
+        ..Default::default()
+    };
     let mut session = wrap(FakeStreamingSession::new("hello world"), &cfg);
 
     let mut committed = Vec::new();

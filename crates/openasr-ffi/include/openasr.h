@@ -10,6 +10,26 @@
 #include <stdlib.h>
 
 /**
+ * Wire value for neural FireRed endpointing in [`OpenAsrStreamingConfigV2`].
+ */
+#define OPENASR_STREAMING_VAD_MODE_NEURAL 0
+
+/**
+ * Wire value for the explicit RMS energy fallback in [`OpenAsrStreamingConfigV2`].
+ */
+#define OPENASR_STREAMING_VAD_MODE_ENERGY 1
+
+/**
+ * Wire value that bypasses endpointing in [`OpenAsrStreamingConfigV2`].
+ */
+#define OPENASR_STREAMING_VAD_MODE_DISABLED 2
+
+/**
+ * Version number accepted by [`OpenAsrStreamingConfigV2`].
+ */
+#define OPENASR_STREAMING_CONFIG_V2_VERSION 1
+
+/**
  * Status codes returned by every `openasr_*` call that can fail. `Ok` is
  * always `0`; every other variant means the requested handle/buffer was not
  * produced (or not mutated) and the caller should consult
@@ -192,7 +212,6 @@ typedef struct OpenAsrResult OpenAsrResult;
 typedef struct OpenAsrStreamingEvents OpenAsrStreamingEvents;
 
 /**
- * Opaque handle to an in-process streaming transcription session over a local
  * `.oasr` pack. Created with [`openasr_streaming_session_open`], driven with
  * [`openasr_streaming_feed`], and consumed by [`openasr_streaming_finish`]
  * (which returns the final transcript and frees the session) or discarded with
@@ -241,6 +260,30 @@ typedef struct OpenAsrStreamingConfig {
    */
   uint64_t partial_poll_interval_ms;
 } OpenAsrStreamingConfig;
+
+/**
+ * Versioned, size-guarded streaming configuration. This is deliberately a new
+ * struct and a new open entry point: changing the legacy struct's layout would
+ * make older callers' allocations unsafe to read.
+ */
+typedef struct OpenAsrStreamingConfigV2 {
+  /**
+   * Set to [`OPENASR_STREAMING_CONFIG_V2_VERSION`].
+   */
+  uint32_t version;
+  /**
+   * Caller-provided allocation size in bytes. Must be at least
+   * `size_of::<OpenAsrStreamingConfigV2>()` for this version.
+   */
+  uintptr_t size;
+  bool partial_results;
+  bool word_timestamps;
+  uint32_t vad_mode;
+  const char *language;
+  enum OpenAsrHardwareTarget hardware_target;
+  uint16_t inference_threads;
+  uint64_t partial_poll_interval_ms;
+} OpenAsrStreamingConfigV2;
 
 /**
  * Progress callback for a pull/install. Invoked synchronously on the calling
@@ -403,6 +446,22 @@ const char *openasr_result_segment_text(const struct OpenAsrResult *result, uint
 enum OpenAsrStatus openasr_streaming_session_open(const char *path,
                                                   const struct OpenAsrStreamingConfig *config,
                                                   struct OpenAsrStreamingSession **out_session);
+
+/**
+ * Opens a streaming session using the size-guarded V2 configuration. V2 makes
+ * neural, energy, and disabled endpointing explicit; use the legacy
+ * [`openasr_streaming_session_open`] for source/binary compatibility with the
+ * original boolean config.
+ *
+ * # Safety
+ * `config` must point to a readable V2 prefix containing `version` and `size`.
+ * Its advertised `size` must cover the full current V2 struct before this
+ * function reads any trailing field. `path` and `out_session` follow the same
+ * contract as [`openasr_streaming_session_open`].
+ */
+enum OpenAsrStatus openasr_streaming_session_open_v2(const char *path,
+                                                     const struct OpenAsrStreamingConfigV2 *config,
+                                                     struct OpenAsrStreamingSession **out_session);
 
 /**
  * Feeds a chunk of 16 kHz mono `f32` PCM (any length, including zero) into an

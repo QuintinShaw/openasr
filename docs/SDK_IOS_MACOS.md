@@ -175,8 +175,11 @@ the header for the full accessor set and ownership rules):
 // returns the final transcript as an OpenAsrResult (read with the same
 // openasr_result_* accessors as the batch path).
 OpenAsrStatus openasr_streaming_session_open(const char *path,
-                                             const OpenAsrStreamingConfig *config,  // NULL = defaults
+                                             const OpenAsrStreamingConfig *config,  // legacy; NULL = neural defaults
                                              OpenAsrStreamingSession **out_session);
+OpenAsrStatus openasr_streaming_session_open_v2(const char *path,
+                                                const OpenAsrStreamingConfigV2 *config,
+                                                OpenAsrStreamingSession **out_session);
 OpenAsrStatus openasr_streaming_feed(OpenAsrStreamingSession *session,
                                      const float *pcm, uintptr_t pcm_len_samples,  // 16 kHz mono f32
                                      OpenAsrStreamingEvents **out_events);
@@ -219,6 +222,55 @@ if (openasr_streaming_finish(session, &final) == OPEN_ASR_STATUS_OK) {   // cons
 }
 // session is already freed by finish(); on an error path use openasr_streaming_free(session) instead.
 ```
+
+### Streaming VAD configuration
+
+New Swift and C integrations should call `openasr_streaming_session_open_v2`.
+It accepts a versioned, size-checked `OpenAsrStreamingConfigV2`, allowing the
+core to extend the config without reading beyond an older caller's allocation.
+Set `version` to `OPENASR_STREAMING_CONFIG_V2_VERSION` (currently `1`) and
+`size` to `sizeof(OpenAsrStreamingConfigV2)` / Swift's
+`MemoryLayout<OpenAsrStreamingConfigV2>.size`. Any null config, unsupported
+version, too-small size, or unrecognized VAD mode is rejected with
+`OPEN_ASR_STATUS_INVALID_ARGUMENT`; it never silently falls back.
+
+`vad_mode` is a `uint32_t` wire value, not a C enum, so invalid values are safe
+to pass across the ABI and can be rejected before Rust interprets them. Use the
+header constants exactly:
+
+| Header constant | Value | Behavior |
+| --- | ---: | --- |
+| `OPENASR_STREAMING_VAD_MODE_NEURAL` | `0` | Default. Process-wide vendored FireRed model, per-session causal state, 100 ms start / 500 ms stop defaults. |
+| `OPENASR_STREAMING_VAD_MODE_ENERGY` | `1` | Explicit RMS fallback, 200 ms start / 600 ms stop defaults. |
+| `OPENASR_STREAMING_VAD_MODE_DISABLED` | `2` | No endpointing; the stream commits only when finished. |
+
+The legacy `openasr_streaming_session_open` and `OpenAsrStreamingConfig` keep
+their existing ABI layout. For compatibility, legacy `enable_vad=true` now
+means the shared neural default and `enable_vad=false` means disabled. Use V2
+for all new code so the requested policy remains explicit.
+
+Swift construction is a direct field mapping:
+
+```swift
+var config = OpenAsrStreamingConfigV2()
+config.version = UInt32(OPENASR_STREAMING_CONFIG_V2_VERSION)
+config.size = UInt(MemoryLayout<OpenAsrStreamingConfigV2>.size)
+config.partial_results = true
+config.word_timestamps = false
+config.vad_mode = UInt32(OPENASR_STREAMING_VAD_MODE_NEURAL)
+config.language = nil
+config.hardware_target = OPEN_ASR_HARDWARE_TARGET_AUTO
+config.inference_threads = 0
+config.partial_poll_interval_ms = 0
+var session: OpaquePointer?
+let status = modelPath.withCString {
+    openasr_streaming_session_open_v2($0, &config, &session)
+}
+```
+
+`openasr_streaming_session_open_v2` is therefore the iOS OpenASR Live/Dictate
+path: select `NEURAL` by default; Apple Speech is a separate app-side engine,
+not an OpenASR VAD fallback.
 
 ### Model market (catalog + pull / install / remove)
 

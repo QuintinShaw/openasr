@@ -737,53 +737,21 @@ struct ClientVadConfig {
 
 impl ClientVadConfig {
     fn into_vad_config(self, frame_duration_ms: u32) -> VadConfig {
-        // `enabled == Some(false)` is rejected earlier (start_session), so the
-        // disabled path does not exist here; reintroduce with a test if it lands.
-        let default = VadConfig::default();
-        let mode = resolve_realtime_vad_mode(self.engine.as_deref());
-        let energy_threshold = self.energy_threshold.unwrap_or(match mode {
-            VadMode::ExternalProbability => {
-                openasr_core::diarize::vad::DEFAULT_NEURAL_VAD_THRESHOLD
-            }
-            _ => default.energy_threshold,
-        });
-        // Debounce defaults are mode-conditional: neural sessions can start
-        // sooner and stop a little sooner than the RMS energy gate because the
-        // probability stream is less noisy. A client-supplied value wins
-        // regardless of mode.
-        let default_speech_start_ms = match mode {
-            VadMode::ExternalProbability => {
-                openasr_core::diarize::vad::DEFAULT_NEURAL_SPEECH_START_MS
-            }
-            _ => default.speech_start_ms,
+        let mode = if self.enabled == Some(false) {
+            VadMode::Disabled
+        } else {
+            openasr_core::resolve_streaming_vad_mode(self.engine.as_deref())
         };
-        let default_speech_stop_ms = match mode {
-            VadMode::ExternalProbability => openasr_core::diarize::vad::SHORT_NEURAL_SPEECH_STOP_MS,
-            _ => default.speech_stop_ms,
-        };
+        let default = openasr_core::default_streaming_vad_config(mode, frame_duration_ms);
         VadConfig {
-            frame_duration_ms,
-            speech_start_ms: self.speech_start_ms.unwrap_or(default_speech_start_ms),
-            speech_stop_ms: self.speech_stop_ms.unwrap_or(default_speech_stop_ms),
+            speech_start_ms: self.speech_start_ms.unwrap_or(default.speech_start_ms),
+            speech_stop_ms: self.speech_stop_ms.unwrap_or(default.speech_stop_ms),
             pre_roll_ms: self.pre_roll_ms.unwrap_or(default.pre_roll_ms),
             max_utterance_ms: self.max_utterance_ms.or(default.max_utterance_ms),
             no_speech_timeout_ms: self.no_speech_timeout_ms.or(default.no_speech_timeout_ms),
-            mode,
-            energy_threshold,
+            energy_threshold: self.energy_threshold.unwrap_or(default.energy_threshold),
+            ..default
         }
-    }
-}
-
-/// Resolve the realtime VAD mode: `OPENASR_VAD` wins, then the client's `engine`,
-/// else **default to the neural detector** (it is more accurate at endpointing and
-/// unlocks the shorter neural hangover; an explicit `energy`/`rms` opts out).
-/// Delegates to the shared `openasr-core` resolver so the server and CLI never
-/// diverge.
-fn resolve_realtime_vad_mode(engine: Option<&str>) -> VadMode {
-    if openasr_core::diarize::vad::realtime_vad_prefers_neural(engine) {
-        VadMode::ExternalProbability
-    } else {
-        VadMode::Energy
     }
 }
 

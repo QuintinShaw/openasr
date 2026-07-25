@@ -11,11 +11,9 @@ use super::{
     },
     transcript::{TranscriptLifecycle, TranscriptRevisionPolicy},
     vad::{
-        SpeechBoundaryEvent, VadConfig, VadConfigError, VadDecision, VadFrameDecision, VadMode,
-        VadStateMachine,
+        SpeechBoundaryEvent, StreamingVadEngine, StreamingVadEngineError, VadConfig, VadConfigError,
     },
 };
-use crate::diarize::vad::FireRedStreamingVad;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RealtimeSessionConfig {
@@ -55,7 +53,10 @@ impl RealtimeSessionConfig {
             session_id: RealtimeSessionId(session_id.into()),
             model_id: model_id.into(),
             audio_format: RealtimeAudioFormat::pcm16_mono_16khz(),
-            vad: VadConfig::default(),
+            vad: super::vad::default_streaming_vad_config(
+                super::vad::VadMode::ExternalProbability,
+                20,
+            ),
             buffer: RealtimeBufferConfig::default(),
             partial_results: true,
             word_timestamps: false,
@@ -100,11 +101,7 @@ pub struct RealtimeSessionController {
     config: RealtimeSessionConfig,
     state: RealtimeSessionState,
     sequencer: RealtimeEventSequencer,
-    pub vad: VadStateMachine,
-    /// Streaming Stream-VAD detector, present only when the configured VAD
-    /// mode is `ExternalProbability`. Feeds probabilities into `vad`; all
-    /// endpointing stays in the state machine.
-    neural_vad: Option<Box<FireRedStreamingVad>>,
+    pub vad: StreamingVadEngine,
     pub buffer: RealtimeBuffer,
     pub transcript: TranscriptLifecycle,
 }
@@ -164,9 +161,7 @@ impl RealtimeSessionController {
         if reset_runtime_state {
             self.buffer.reset();
             self.transcript.reset();
-            if let Some(neural) = self.neural_vad.as_mut() {
-                neural.reset();
-            }
+            self.vad.reset();
         }
         self.state = next_state;
         Ok(self.sequencer.next(
@@ -228,22 +223,9 @@ impl RealtimeSessionController {
         sequencer: RealtimeEventSequencer,
     ) -> Result<Self, RealtimeSessionError> {
         config.validate()?;
-        let neural_vad = if config.vad.mode == VadMode::ExternalProbability {
-            // Stream-VAD is the sole neural engine and is vendored
-            // (`include_bytes!`), so in practice this always loads (a build
-            // integrity problem otherwise). Still, fail closed with a typed
-            // error instead of panicking on the request path -- the server
-            // WS handler already surfaces `RealtimeSessionError` to the
-            // client as a startup error.
-            Some(Box::new(
-                FireRedStreamingVad::shared().ok_or(RealtimeSessionError::StreamVadUnavailable)?,
-            ))
-        } else {
-            None
-        };
+        let vad = StreamingVadEngine::new(config.vad)?;
         Ok(Self {
-            vad: VadStateMachine::new(config.vad)?,
-            neural_vad,
+            vad,
             buffer: RealtimeBuffer::new(config.buffer)?,
             transcript: TranscriptLifecycle::new(
                 TranscriptRevisionPolicy::ExplicitPostFinalRevision,
@@ -262,11 +244,9 @@ impl RealtimeSessionController {
         &self.config
     }
 
-    /// Process one audio frame through the configured VAD, returning any speech
-    /// boundary events. Neural mode (`ExternalProbability`) feeds the streaming
-    /// Stream-VAD probability into the state machine; every other mode uses the
-    /// energy gate. All endpointing/hysteresis lives in the state machine, not
-    /// here.
+    /// Process one audio frame through the shared endpointing provider. The
+    /// provider owns neural FireRed state, energy fallback, and disabled bypass
+    /// semantics so every streaming surface has identical boundaries.
     pub fn process_vad_frame(&mut self, frame: &RealtimeAudioFrame) -> Vec<SpeechBoundaryEvent> {
         self.process_vad_frame_with_speech(frame).0
     }
@@ -275,19 +255,7 @@ impl RealtimeSessionController {
         &mut self,
         frame: &RealtimeAudioFrame,
     ) -> (Vec<SpeechBoundaryEvent>, bool) {
-        if self.vad.config().mode == VadMode::ExternalProbability
-            && let Some(neural) = self.neural_vad.as_mut()
-        {
-            let probability = neural.accept_frame(frame.samples());
-            return self.vad.process_decision_with_speech(
-                frame,
-                VadFrameDecision {
-                    decision: VadDecision::Probability(probability),
-                    rms: None,
-                },
-            );
-        }
-        self.vad.process_energy_frame_with_speech(frame)
+        self.vad.process_frame_with_speech(frame)
     }
 
     pub fn session_created_event(
@@ -407,8 +375,6 @@ pub enum RealtimeSessionError {
         from: RealtimeSessionState,
         action: &'static str,
     },
-    #[error(
-        "Stream-VAD is unavailable: vendored weights failed to parse (build-integrity problem)."
-    )]
-    StreamVadUnavailable,
+    #[error("{0}")]
+    StreamingVad(#[from] StreamingVadEngineError),
 }
