@@ -207,8 +207,6 @@ pub struct VoiceIdAssignment {
     /// Frozen display name written into history. Always set when a Person match
     /// is accepted so deleted persons still render safely.
     pub speaker_snapshot_label: Option<String>,
-    /// Legacy v1 profile id when the match came through a migrated alias.
-    pub speaker_profile_id: Option<String>,
 }
 
 impl VoiceIdAssignment {
@@ -220,14 +218,12 @@ impl VoiceIdAssignment {
             speaker_label,
             speaker_person_id: None,
             speaker_snapshot_label: None,
-            speaker_profile_id: None,
         }
     }
 
     pub fn from_person_match(
         speaker_id: crate::diarize::contract::SpeakerId,
         person_match: &PersonMatch,
-        legacy_profile_id: Option<String>,
     ) -> Self {
         Self {
             speaker_id,
@@ -235,7 +231,6 @@ impl VoiceIdAssignment {
             speaker_label: speaker_id.label(),
             speaker_person_id: Some(person_match.person_id.as_str().to_string()),
             speaker_snapshot_label: Some(person_match.display_name.clone()),
-            speaker_profile_id: legacy_profile_id,
         }
     }
 }

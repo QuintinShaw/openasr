@@ -1876,8 +1876,7 @@ impl LivePipeline {
         let (speaker, speaker_label, speaker_person_id, speaker_snapshot_label) =
             speaker_assignment
                 .map(|assignment| {
-                    let matched = assignment.speaker_profile_id.is_some()
-                        || assignment.speaker_person_id.is_some();
+                    let matched = assignment.speaker_person_id.is_some();
                     let speaker_label = matched.then_some(assignment.speaker_label.clone());
                     let snapshot = assignment
                         .speaker_snapshot_label

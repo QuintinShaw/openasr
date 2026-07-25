@@ -1694,6 +1694,7 @@ fn native_asr_error_to_backend(error: NativeAsrError) -> openasr_core::BackendEr
 
 // ── Upload helpers ────────────────────────────────────────────────────────────
 
+#[cfg(test)]
 pub(crate) fn write_upload_temp_file(
     bytes: &[u8],
     suffix: &str,

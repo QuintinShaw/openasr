@@ -1,10 +1,28 @@
 //! Operator-only Voice ID v2 routes (`/v1/voice-id/*`).
 
+use std::io::Write;
+
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::*;
+
+// A Voice ID sample is intended to be a short 16 kHz mono WAV. Eight MiB
+// admits over four minutes of PCM16 while bounding a five-sample enrollment to
+// forty MiB on disk and O(chunk) memory during upload.
+const MAX_VOICE_ID_WAV_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize)]
+struct UploadedWavFingerprint {
+    sha256: String,
+    bytes: u64,
+}
+
+struct UploadedVoiceIdWav {
+    path: tempfile::TempPath,
+    fingerprint: UploadedWavFingerprint,
+}
 
 #[derive(Debug, Serialize)]
 pub(crate) struct PersonListResponse {
@@ -337,12 +355,14 @@ struct ParsedEnroll {
     consent: openasr_core::diarize::voice_id::ConsentRecord,
     color_preference: Option<String>,
     clips: Vec<openasr_core::diarize::voice_id::EnrollmentClip>,
+    wav_fingerprints: Vec<UploadedWavFingerprint>,
 }
 
 struct ParsedSample {
     consent: openasr_core::diarize::voice_id::ConsentRecord,
     capture_context: openasr_core::diarize::voice_id::CaptureContext,
     pcm: Vec<f32>,
+    wav_fingerprint: UploadedWavFingerprint,
 }
 
 async fn parse_enroll_multipart(
@@ -357,7 +377,7 @@ async fn parse_enroll_multipart(
     let mut input_route = "unknown".to_string();
     let mut environment_hint = None;
     let mut sample_labels: Vec<String> = Vec::new();
-    let mut wav_paths: Vec<tempfile::TempPath> = Vec::new();
+    let mut wavs: Vec<UploadedVoiceIdWav> = Vec::new();
 
     while let Some(field) = multipart.next_field().await.map_err(ApiError::Multipart)? {
         match field.name().unwrap_or_default() {
@@ -388,8 +408,7 @@ async fn parse_enroll_multipart(
                 sample_labels.push(field.text().await.map_err(ApiError::Multipart)?);
             }
             "wav" | "sample" | "samples" => {
-                let bytes = field.bytes().await.map_err(ApiError::Multipart)?;
-                wav_paths.push(write_upload_temp_file(&bytes, ".wav")?);
+                wavs.push(stream_voice_id_wav(field).await?);
             }
             _ => {
                 let _ = field.bytes().await.map_err(ApiError::Multipart)?;
@@ -401,24 +420,24 @@ async fn parse_enroll_multipart(
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .ok_or_else(|| ApiError::BadRequest("Missing required form field: display_name".into()))?;
-    if wav_paths.is_empty() {
+    if wavs.is_empty() {
         return Err(ApiError::BadRequest(
             "Missing required form field: wav (one or more enrollment samples)".into(),
         ));
     }
-    if wav_paths.len() > 5 {
+    if wavs.len() > 5 {
         return Err(ApiError::BadRequest(
             "Initial enrollment accepts at most 5 samples".into(),
         ));
     }
-    let sample_labels = resolve_initial_sample_labels(sample_labels, wav_paths.len())?;
+    let sample_labels = resolve_initial_sample_labels(sample_labels, wavs.len())?;
 
     // Prepare all clips first; any failure leaves zero DB writes.
-    let mut clips = Vec::with_capacity(wav_paths.len());
-    for (idx, path) in wav_paths.iter().enumerate() {
-        // Load via enrollment helper path (public) by reading bytes through
-        // the same WAV loader the core enrollment path uses.
-        let pcm = load_enrollment_wav(path.as_ref())?;
+    let mut clips = Vec::with_capacity(wavs.len());
+    let mut wav_fingerprints = Vec::with_capacity(wavs.len());
+    for (idx, wav) in wavs.iter().enumerate() {
+        let pcm = load_enrollment_wav(wav.path.as_ref())?;
+        wav_fingerprints.push(wav.fingerprint.clone());
         clips.push(openasr_core::diarize::voice_id::EnrollmentClip {
             samples: pcm,
             capture_context: openasr_core::diarize::voice_id::CaptureContext {
@@ -441,6 +460,7 @@ async fn parse_enroll_multipart(
         consent,
         color_preference,
         clips,
+        wav_fingerprints,
     })
 }
 
@@ -476,7 +496,7 @@ async fn parse_sample_multipart(
     let mut input_route = "unknown".to_string();
     let mut environment_hint = None;
     let mut sample_label = None;
-    let mut wav_path: Option<tempfile::TempPath> = None;
+    let mut wav: Option<UploadedVoiceIdWav> = None;
 
     while let Some(field) = multipart.next_field().await.map_err(ApiError::Multipart)? {
         match field.name().unwrap_or_default() {
@@ -499,20 +519,19 @@ async fn parse_sample_multipart(
                 sample_label = Some(field.text().await.map_err(ApiError::Multipart)?);
             }
             "wav" | "sample" => {
-                let bytes = field.bytes().await.map_err(ApiError::Multipart)?;
-                wav_path = Some(write_upload_temp_file(&bytes, ".wav")?);
+                wav = Some(stream_voice_id_wav(field).await?);
             }
             _ => {
                 let _ = field.bytes().await.map_err(ApiError::Multipart)?;
             }
         }
     }
-    let Some(wav_path) = wav_path else {
+    let Some(wav) = wav else {
         return Err(ApiError::BadRequest(
             "Missing required form field: wav".into(),
         ));
     };
-    let pcm = load_enrollment_wav(wav_path.as_ref())?;
+    let pcm = load_enrollment_wav(wav.path.as_ref())?;
     Ok(ParsedSample {
         consent: openasr_core::diarize::voice_id::ConsentRecord {
             granted_at: openasr_core::diarize::voice_id::timestamp_now(),
@@ -526,6 +545,36 @@ async fn parse_sample_multipart(
             sample_label,
         },
         pcm,
+        wav_fingerprint: wav.fingerprint,
+    })
+}
+
+async fn stream_voice_id_wav(mut field: Field<'_>) -> Result<UploadedVoiceIdWav, ApiError> {
+    let mut file = tempfile::Builder::new()
+        .prefix("openasr-voice-id-")
+        .suffix(".wav")
+        .tempfile()
+        .map_err(ApiError::TempFile)?;
+    let mut digest = Sha256::new();
+    let mut bytes = 0u64;
+    while let Some(chunk) = field.chunk().await.map_err(ApiError::Multipart)? {
+        bytes = bytes.saturating_add(chunk.len() as u64);
+        if bytes > MAX_VOICE_ID_WAV_BYTES {
+            return Err(ApiError::BadRequest(format!(
+                "Voice ID WAV exceeds the {} MiB upload limit",
+                MAX_VOICE_ID_WAV_BYTES / (1024 * 1024)
+            )));
+        }
+        digest.update(&chunk);
+        file.write_all(&chunk).map_err(ApiError::TempFile)?;
+    }
+    file.flush().map_err(ApiError::TempFile)?;
+    Ok(UploadedVoiceIdWav {
+        path: file.into_temp_path(),
+        fingerprint: UploadedWavFingerprint {
+            sha256: hex_digest(digest.finalize()),
+            bytes,
+        },
     })
 }
 
@@ -595,11 +644,14 @@ fn enroll_request_hash(parsed: &ParsedEnroll) -> String {
     let canonical = serde_json::json!({
         "operation": "enroll_person",
         "display_name": parsed.display_name.trim(),
-        "consent": parsed.consent,
+        // `granted_at` is deliberately omitted: it is server-generated on every
+        // receipt and therefore cannot be part of a stable retry identity.
+        "notice_version": parsed.consent.notice_version,
+        "capture_method": parsed.consent.capture_method,
         "color_preference": parsed.color_preference.as_deref().map(str::trim),
-        "clips": parsed.clips.iter().map(|clip| serde_json::json!({
+        "clips": parsed.clips.iter().zip(&parsed.wav_fingerprints).map(|(clip, wav)| serde_json::json!({
             "capture_context": clip.capture_context,
-            "pcm_bits": clip.samples.iter().map(|sample| sample.to_bits()).collect::<Vec<_>>(),
+            "wav": wav,
         })).collect::<Vec<_>>(),
     });
     canonical_json_hash(&canonical)
@@ -614,9 +666,12 @@ fn add_sample_request_hash(
         "operation": "add_sample",
         "person_id": person_id.as_str(),
         "expected_revision": expected_revision,
-        "consent": parsed.consent,
+        // As with enrollment, preserve the server timestamp in the stored
+        // consent record but exclude it from retry identity.
+        "notice_version": parsed.consent.notice_version,
+        "capture_method": parsed.consent.capture_method,
         "capture_context": parsed.capture_context,
-        "pcm_bits": parsed.pcm.iter().map(|sample| sample.to_bits()).collect::<Vec<_>>(),
+        "wav": parsed.wav_fingerprint,
     });
     canonical_json_hash(&canonical)
 }
@@ -628,11 +683,15 @@ fn canonical_json_hash(value: &serde_json::Value) -> String {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
+    hex_digest(Sha256::digest(bytes))
+}
+
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     use std::fmt::Write;
 
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
     }
     out
@@ -751,6 +810,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn idempotency_hash_ignores_server_consent_time_and_multipart_boundary() {
+        let wav = pcm16_wav();
+        let first = parse_enroll_with_wav("first-boundary", &wav).await;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let replay = parse_enroll_with_wav("second-boundary", &wav).await;
+
+        assert_ne!(first.consent.granted_at, replay.consent.granted_at);
+        assert_eq!(
+            super::enroll_request_hash(&first),
+            super::enroll_request_hash(&replay)
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_hash_changes_for_different_raw_wav_bytes() {
+        let mut changed = pcm16_wav();
+        *changed.last_mut().unwrap() = 1;
+        let first = parse_enroll_with_wav("first-boundary", &pcm16_wav()).await;
+        let second = parse_enroll_with_wav("second-boundary", &changed).await;
+        assert_ne!(
+            super::enroll_request_hash(&first),
+            super::enroll_request_hash(&second)
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_id_wav_upload_rejects_oversized_field_while_streaming() {
+        let boundary = "oversized-wav-boundary";
+        let mut body = Vec::new();
+        form_field(&mut body, boundary, "display_name", b"Alice");
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"wav\"; filename=\"oversized.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.resize(body.len() + super::MAX_VOICE_ID_WAV_BYTES as usize + 1, 0);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let request = Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let multipart = Multipart::from_request(request, &()).await;
+        let error = match parse_enroll_multipart(multipart).await {
+            Ok(_) => panic!("oversized Voice ID upload was accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            crate::ApiError::BadRequest(_) | crate::ApiError::Multipart(_)
+        ));
+    }
+
     async fn parse_enroll(sample_labels: &[&str]) -> super::ParsedEnroll {
         let boundary = "voice-id-test-boundary";
         let mut body = Vec::new();
@@ -769,6 +885,28 @@ mod tests {
             body.extend_from_slice(b"\r\n");
         }
         body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        let request = Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let multipart = Multipart::from_request(request, &()).await;
+        parse_enroll_multipart(multipart).await.unwrap()
+    }
+
+    async fn parse_enroll_with_wav(boundary: &str, wav: &[u8]) -> super::ParsedEnroll {
+        let mut body = Vec::new();
+        form_field(&mut body, boundary, "display_name", b"Alice");
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"wav\"; filename=\"voice.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(wav);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let request = Request::builder()
             .header(
                 header::CONTENT_TYPE,

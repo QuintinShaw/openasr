@@ -1560,7 +1560,6 @@ fn record_file_transcription_history_round_trips_structured_metadata() {
             text: "hello with speaker".to_string(),
             speaker: Some("Alice".to_string()),
             speaker_label: Some("SPEAKER_00".to_string()),
-            speaker_profile_id: Some("vp_aaaaaaaaaaaaaaaa".to_string()),
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),

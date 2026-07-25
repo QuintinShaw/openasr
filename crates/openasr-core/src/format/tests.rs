@@ -10,7 +10,6 @@ fn sample() -> Transcription {
             text: "hello world".to_string(),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -30,7 +29,6 @@ fn speaker_sample() -> Transcription {
                 text: "hello world".to_string(),
                 speaker: Some("SPEAKER_00".to_string()),
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -41,7 +39,6 @@ fn speaker_sample() -> Transcription {
                 text: "next line".to_string(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -62,7 +59,6 @@ fn matched_profile_sample() -> Transcription {
                 text: "hello world".to_string(),
                 speaker: Some("Alice".to_string()),
                 speaker_label: Some("SPEAKER_00".to_string()),
-                speaker_profile_id: Some("vp_aaaaaaaaaaaaaaaa".to_string()),
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -73,7 +69,6 @@ fn matched_profile_sample() -> Transcription {
                 text: "next line".to_string(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -93,7 +88,6 @@ fn word_sample() -> Transcription {
             text: "hello world".to_string(),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: vec![
@@ -164,13 +158,8 @@ fn renders_json_speaker_identity_only_when_present() {
 
     assert_eq!(parsed["segments"][0]["speaker"], "Alice");
     assert_eq!(parsed["segments"][0]["speaker_label"], "SPEAKER_00");
-    assert_eq!(
-        parsed["segments"][0]["speaker_profile_id"],
-        "vp_aaaaaaaaaaaaaaaa"
-    );
     assert!(parsed["segments"][1].get("speaker").is_none());
     assert!(parsed["segments"][1].get("speaker_label").is_none());
-    assert!(parsed["segments"][1].get("speaker_profile_id").is_none());
 }
 
 #[test]
@@ -218,7 +207,6 @@ fn renders_verbose_json_with_longform_metadata() {
             text: "hello world".to_string(),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -308,7 +296,6 @@ fn renders_markdown_coalesces_consecutive_same_speaker_cues() {
                 text: "one two".to_string(),
                 speaker: Some("SPEAKER_00".to_string()),
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -319,7 +306,6 @@ fn renders_markdown_coalesces_consecutive_same_speaker_cues() {
                 text: "three".to_string(),
                 speaker: Some("SPEAKER_00".to_string()),
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -330,7 +316,6 @@ fn renders_markdown_coalesces_consecutive_same_speaker_cues() {
                 text: "four".to_string(),
                 speaker: Some("SPEAKER_01".to_string()),
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),

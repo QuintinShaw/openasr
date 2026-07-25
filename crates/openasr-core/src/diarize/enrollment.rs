@@ -308,7 +308,6 @@ pub struct SpeakerDisplayAssignment {
     pub speaker_id: SpeakerId,
     pub speaker: String,
     pub speaker_label: String,
-    pub speaker_profile_id: Option<String>,
     /// Stable Voice ID person id when a v2 match was accepted.
     pub speaker_person_id: Option<String>,
     /// Display name frozen at assignment time for history.
@@ -322,7 +321,6 @@ impl SpeakerDisplayAssignment {
             speaker_id,
             speaker: speaker_label.clone(),
             speaker_label,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
         }
@@ -333,7 +331,6 @@ impl SpeakerDisplayAssignment {
             speaker_id,
             speaker: profile_match.name.clone(),
             speaker_label: speaker_id.label(),
-            speaker_profile_id: Some(profile_match.profile_id),
             speaker_person_id: None,
             speaker_snapshot_label: Some(profile_match.name),
         }
@@ -346,7 +343,6 @@ impl SpeakerDisplayAssignment {
             speaker_id: assignment.speaker_id,
             speaker: assignment.speaker,
             speaker_label: assignment.speaker_label,
-            speaker_profile_id: assignment.speaker_profile_id,
             speaker_person_id: assignment.speaker_person_id,
             speaker_snapshot_label: assignment.speaker_snapshot_label,
         }

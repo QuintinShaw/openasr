@@ -619,8 +619,6 @@ pub struct Segment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub speaker_profile_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_person_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_snapshot_label: Option<String>,
@@ -1264,7 +1262,6 @@ mod tests {
                 text: "hello world".to_string(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),

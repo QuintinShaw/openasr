@@ -2236,7 +2236,7 @@ impl WsSession {
         reason: &str,
     ) -> Result<(), ()> {
         let (speaker_label, speaker_person_id, speaker_snapshot_label) =
-            if assignment.speaker_profile_id.is_some() || assignment.speaker_person_id.is_some() {
+            if assignment.speaker_person_id.is_some() {
                 (
                     Some(assignment.speaker_label.clone()),
                     assignment.speaker_person_id.clone(),
@@ -2597,7 +2597,7 @@ impl WsSession {
                 ),
             };
             *speaker_slot = Some(assignment.speaker.clone());
-            if assignment.speaker_profile_id.is_some() || assignment.speaker_person_id.is_some() {
+            if assignment.speaker_person_id.is_some() {
                 *label_slot = Some(assignment.speaker_label);
                 *person_slot = assignment.speaker_person_id;
                 *snapshot_slot = assignment
@@ -3011,8 +3011,7 @@ impl WsSession {
                 let (speaker, speaker_label, speaker_person_id, speaker_snapshot_label) =
                     speaker_assignment
                         .map(|assignment| {
-                            let matched = assignment.speaker_profile_id.is_some()
-                                || assignment.speaker_person_id.is_some();
+                            let matched = assignment.speaker_person_id.is_some();
                             let speaker_label = matched.then_some(assignment.speaker_label.clone());
                             let snapshot = assignment
                                 .speaker_snapshot_label

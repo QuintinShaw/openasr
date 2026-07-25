@@ -199,7 +199,6 @@ impl GgmlAsrExecutor for XasrZipformerGgmlExecutor {
                 text: output.text.clone(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: output.words,

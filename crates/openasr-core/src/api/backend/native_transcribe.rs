@@ -1752,7 +1752,6 @@ fn compute_speaker_attribution(
                 let assignment = crate::diarize::voice_id::VoiceIdAssignment::from_person_match(
                     *speaker_id,
                     &person_match,
-                    None,
                 );
                 (
                     *speaker_id,
@@ -1766,11 +1765,10 @@ fn compute_speaker_attribution(
     if diarize_debug {
         for (speaker_id, assignment) in &identities {
             eprintln!(
-                "openasr_diarize_debug stage=batch identity speaker={} display={} person_id={} profile_id={}",
+                "openasr_diarize_debug stage=batch identity speaker={} display={} person_id={}",
                 speaker_id.label(),
                 assignment.speaker,
                 assignment.speaker_person_id.as_deref().unwrap_or("none"),
-                assignment.speaker_profile_id.as_deref().unwrap_or("none")
             );
         }
     }
@@ -2471,7 +2469,6 @@ fn normalize_transcription_segments(
             text: trimmed_text,
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -2508,7 +2505,6 @@ fn normalize_transcription_segments(
             text,
             speaker: segment.speaker,
             speaker_label: segment.speaker_label,
-            speaker_profile_id: segment.speaker_profile_id,
             speaker_person_id: segment.speaker_person_id,
             speaker_snapshot_label: segment.speaker_snapshot_label,
             words: segment.words,
@@ -2529,7 +2525,6 @@ fn normalize_transcription_segments(
             text: trimmed_text,
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -3654,7 +3649,6 @@ mod tests {
                         text: "a".to_string(),
                         speaker: None,
                         speaker_label: None,
-                        speaker_profile_id: None,
                         speaker_person_id: None,
                         speaker_snapshot_label: None,
                         words: Vec::new(),
@@ -3665,7 +3659,6 @@ mod tests {
                         text: "b".to_string(),
                         speaker: None,
                         speaker_label: None,
-                        speaker_profile_id: None,
                         speaker_person_id: None,
                         speaker_snapshot_label: None,
                         words: Vec::new(),
@@ -3693,7 +3686,6 @@ mod tests {
                     text: "long transcript".to_string(),
                     speaker: None,
                     speaker_label: None,
-                    speaker_profile_id: None,
                     speaker_person_id: None,
                     speaker_snapshot_label: None,
                     words: Vec::new(),
@@ -3719,7 +3711,6 @@ mod tests {
                     text: "near full".to_string(),
                     speaker: None,
                     speaker_label: None,
-                    speaker_profile_id: None,
                     speaker_person_id: None,
                     speaker_snapshot_label: None,
                     words: Vec::new(),
@@ -3909,7 +3900,6 @@ mod tests {
             text: text.to_string(),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: vec![WordTimestamp {
@@ -4039,7 +4029,6 @@ mod tests {
                 text: "hello world".to_string(),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),

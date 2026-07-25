@@ -788,7 +788,7 @@ impl StreamingDiarizer {
                 return None;
             };
             let assignment = SpeakerDisplayAssignment::from_voice_id_assignment(
-                VoiceIdAssignment::from_person_match(speaker_id, &person_match, None),
+                VoiceIdAssignment::from_person_match(speaker_id, &person_match),
             );
             log_debug(
                 path,
@@ -846,11 +846,8 @@ fn log_debug(
     let speaker_label = assignment
         .map(|assignment| assignment.speaker_label.as_str())
         .unwrap_or("None");
-    let speaker_profile_id = assignment
-        .and_then(|assignment| assignment.speaker_profile_id.as_deref())
-        .unwrap_or("None");
     eprintln!(
-        "openasr_diarize_debug path={} duration_s={:.3} rms={:.6} peak={:.6} best_registry_cosine={} profile_cosine={} profile_threshold={} decision={} speaker_label={} speaker_profile_id={}",
+        "openasr_diarize_debug path={} duration_s={:.3} rms={:.6} peak={:.6} best_registry_cosine={} profile_cosine={} profile_threshold={} decision={} speaker_label={}",
         path.as_str(),
         quality.duration_s,
         quality.rms,
@@ -859,8 +856,7 @@ fn log_debug(
         profile_similarity,
         profile_threshold,
         decision.as_str(),
-        speaker_label,
-        speaker_profile_id
+        speaker_label
     );
 }
 

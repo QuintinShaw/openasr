@@ -1839,7 +1839,6 @@ fn realtime_words_from_transcription_maps_seconds_to_milliseconds() {
             text: "hello world".to_string(),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: vec![
@@ -5179,7 +5178,6 @@ fn matched_assignment() -> openasr_core::diarize::enrollment::SpeakerDisplayAssi
         speaker_id: openasr_core::diarize::contract::SpeakerId(0),
         speaker: "Alice".to_string(),
         speaker_label: "SPEAKER_00".to_string(),
-        speaker_profile_id: Some("vp_aaaaaaaaaaaaaaaa".to_string()),
         speaker_person_id: None,
         speaker_snapshot_label: None,
     }
