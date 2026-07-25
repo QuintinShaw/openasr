@@ -407,12 +407,13 @@ fn flush_cohere_diarized_segment(
     if text.is_empty() {
         return Ok(());
     }
+    let speaker_label = speaker.clone();
     segments.push(Segment {
         start,
         end: end.max(start),
         text,
         speaker,
-        speaker_label: None,
+        speaker_label,
         speaker_person_id: None,
         speaker_snapshot_label: None,
         words: Vec::new(),

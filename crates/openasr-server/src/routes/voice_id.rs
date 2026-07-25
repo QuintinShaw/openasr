@@ -12,6 +12,9 @@ use crate::*;
 // admits over four minutes of PCM16 while bounding a five-sample enrollment to
 // forty MiB on disk and O(chunk) memory during upload.
 const MAX_VOICE_ID_WAV_BYTES: u64 = 8 * 1024 * 1024;
+/// Source-media enrollment accepts the same bounded temporary-upload model as
+/// transcription, but never persists the source after this request completes.
+const MAX_VOICE_ID_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 struct UploadedWavFingerprint {
@@ -22,6 +25,17 @@ struct UploadedWavFingerprint {
 struct UploadedVoiceIdWav {
     path: tempfile::TempPath,
     fingerprint: UploadedWavFingerprint,
+}
+
+struct UploadedVoiceIdSource {
+    path: tempfile::TempPath,
+    fingerprint: UploadedWavFingerprint,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SourceInterval {
+    start: f32,
+    end: f32,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,6 +175,106 @@ pub(crate) async fn enroll_person(
         headers.insert(header::ETAG, value);
     }
     Ok((StatusCode::CREATED, headers, Json(person)))
+}
+
+pub(crate) async fn enroll_person_from_source_audio(
+    Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
+    multipart: Result<Multipart, MultipartRejection>,
+) -> Result<
+    (
+        StatusCode,
+        HeaderMap,
+        Json<openasr_core::diarize::voice_id::PersonView>,
+    ),
+    ApiError,
+> {
+    let parsed = parse_source_enroll_multipart(multipart).await?;
+    let idempotency = idempotency_request(&headers, source_enroll_request_hash(&parsed))?;
+    let store = open_voice_id_store(&distribution)?;
+    let (embedder, identity) = active_embedder_and_identity()?;
+    let person = match idempotency {
+        Some(idempotency) => {
+            openasr_core::diarize::voice_id::enroll_person_from_clips_idempotent(
+                &store,
+                parsed.display_name,
+                parsed.consent,
+                vec![parsed.clip],
+                embedder,
+                &identity,
+                parsed.color_preference,
+                idempotency,
+            )
+            .map_err(voice_id_service_error)?
+            .person
+        }
+        None => openasr_core::diarize::voice_id::enroll_person_from_clips(
+            &store,
+            parsed.display_name,
+            parsed.consent,
+            vec![parsed.clip],
+            embedder,
+            &identity,
+            parsed.color_preference,
+        )
+        .map_err(voice_id_service_error)?,
+    };
+    let mut out_headers = HeaderMap::new();
+    out_headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{}\"", person.revision)).unwrap(),
+    );
+    Ok((StatusCode::CREATED, out_headers, Json(person)))
+}
+
+pub(crate) async fn add_sample_from_source_audio(
+    Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
+    AxumPath(person_id): AxumPath<String>,
+    multipart: Result<Multipart, MultipartRejection>,
+) -> Result<(HeaderMap, Json<openasr_core::diarize::voice_id::PersonView>), ApiError> {
+    let parsed = parse_source_sample_multipart(multipart).await?;
+    let id = openasr_core::diarize::voice_id::PersonId::parse(&person_id)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let expected = parse_if_match(&headers)?;
+    let idempotency =
+        idempotency_request(&headers, source_sample_request_hash(&id, expected, &parsed))?;
+    let (embedder, identity) = active_embedder_and_identity()?;
+    let store = open_voice_id_store(&distribution)?;
+    let person = match idempotency {
+        Some(idempotency) => {
+            openasr_core::diarize::voice_id::add_sample_from_pcm_idempotent(
+                &store,
+                &id,
+                expected,
+                parsed.consent,
+                &parsed.pcm,
+                parsed.capture_context,
+                embedder,
+                &identity,
+                idempotency,
+            )
+            .map_err(voice_id_service_error)?
+            .person
+        }
+        None => openasr_core::diarize::voice_id::add_sample_from_pcm(
+            &store,
+            &id,
+            expected,
+            parsed.consent,
+            &parsed.pcm,
+            parsed.capture_context,
+            embedder,
+            &identity,
+        )
+        .map_err(voice_id_service_error)?,
+    };
+    let mut out_headers = HeaderMap::new();
+    out_headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{}\"", person.revision)).unwrap(),
+    );
+    Ok((out_headers, Json(person)))
 }
 
 pub(crate) async fn patch_person(
@@ -363,6 +477,251 @@ struct ParsedSample {
     capture_context: openasr_core::diarize::voice_id::CaptureContext,
     pcm: Vec<f32>,
     wav_fingerprint: UploadedWavFingerprint,
+}
+
+struct ParsedSourceEnroll {
+    display_name: String,
+    consent: openasr_core::diarize::voice_id::ConsentRecord,
+    color_preference: Option<String>,
+    clip: openasr_core::diarize::voice_id::EnrollmentClip,
+    source_fingerprint: UploadedWavFingerprint,
+    intervals: Vec<SourceInterval>,
+}
+
+struct ParsedSourceSample {
+    consent: openasr_core::diarize::voice_id::ConsentRecord,
+    capture_context: openasr_core::diarize::voice_id::CaptureContext,
+    pcm: Vec<f32>,
+    source_fingerprint: UploadedWavFingerprint,
+    intervals: Vec<SourceInterval>,
+}
+
+async fn parse_source_enroll_multipart(
+    multipart: Result<Multipart, MultipartRejection>,
+) -> Result<ParsedSourceEnroll, ApiError> {
+    let (display_name, consent, color_preference, capture_context, source, intervals) =
+        parse_source_audio_multipart(multipart, true).await?;
+    let pcm = extract_source_intervals(&source, &intervals)?;
+    Ok(ParsedSourceEnroll {
+        display_name: display_name.ok_or_else(|| {
+            ApiError::BadRequest("Missing required form field: display_name".into())
+        })?,
+        consent,
+        color_preference,
+        clip: openasr_core::diarize::voice_id::EnrollmentClip {
+            samples: pcm,
+            capture_context,
+        },
+        source_fingerprint: source.fingerprint,
+        intervals,
+    })
+}
+
+async fn parse_source_sample_multipart(
+    multipart: Result<Multipart, MultipartRejection>,
+) -> Result<ParsedSourceSample, ApiError> {
+    let (_display_name, consent, _color_preference, capture_context, source, intervals) =
+        parse_source_audio_multipart(multipart, false).await?;
+    let pcm = extract_source_intervals(&source, &intervals)?;
+    Ok(ParsedSourceSample {
+        consent,
+        capture_context,
+        pcm,
+        source_fingerprint: source.fingerprint,
+        intervals,
+    })
+}
+
+async fn parse_source_audio_multipart(
+    multipart: Result<Multipart, MultipartRejection>,
+    needs_display_name: bool,
+) -> Result<
+    (
+        Option<String>,
+        openasr_core::diarize::voice_id::ConsentRecord,
+        Option<String>,
+        openasr_core::diarize::voice_id::CaptureContext,
+        UploadedVoiceIdSource,
+        Vec<SourceInterval>,
+    ),
+    ApiError,
+> {
+    let mut multipart = multipart.map_err(ApiError::MultipartRejection)?;
+    let mut display_name = None;
+    let mut notice_version = "voice-id-notice-v1".to_string();
+    let mut capture_method = "source_audio".to_string();
+    let mut color_preference = None;
+    let mut device_class = "unknown".to_string();
+    let mut input_route = "source_audio".to_string();
+    let mut environment_hint = None;
+    let mut sample_label = None;
+    let mut intervals = None;
+    let mut source = None;
+    while let Some(field) = multipart.next_field().await.map_err(ApiError::Multipart)? {
+        match field.name().unwrap_or_default() {
+            "display_name" | "name" => {
+                display_name = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(ApiError::Multipart)?
+                        .trim()
+                        .to_string(),
+                )
+            }
+            "notice_version" => notice_version = field.text().await.map_err(ApiError::Multipart)?,
+            "capture_method" => capture_method = field.text().await.map_err(ApiError::Multipart)?,
+            "color_preference" => {
+                color_preference = Some(field.text().await.map_err(ApiError::Multipart)?)
+            }
+            "device_class" => device_class = field.text().await.map_err(ApiError::Multipart)?,
+            "input_route" => input_route = field.text().await.map_err(ApiError::Multipart)?,
+            "environment_hint" => {
+                environment_hint = Some(field.text().await.map_err(ApiError::Multipart)?)
+            }
+            "sample_label" => sample_label = Some(field.text().await.map_err(ApiError::Multipart)?),
+            "intervals" => {
+                intervals = Some(
+                    serde_json::from_str::<Vec<SourceInterval>>(
+                        &field.text().await.map_err(ApiError::Multipart)?,
+                    )
+                    .map_err(|error| {
+                        ApiError::BadRequest(format!("Invalid intervals JSON: {error}"))
+                    })?,
+                )
+            }
+            "source_audio" => source = Some(stream_voice_id_source(field).await?),
+            _ => {
+                let _ = field.bytes().await.map_err(ApiError::Multipart)?;
+            }
+        }
+    }
+    let display_name = display_name.filter(|value| !value.is_empty());
+    if needs_display_name && display_name.is_none() {
+        return Err(ApiError::BadRequest(
+            "Missing required form field: display_name".into(),
+        ));
+    }
+    let source = source
+        .ok_or_else(|| ApiError::BadRequest("Missing required form field: source_audio".into()))?;
+    let intervals = intervals
+        .ok_or_else(|| ApiError::BadRequest("Missing required form field: intervals".into()))?;
+    Ok((
+        display_name,
+        openasr_core::diarize::voice_id::ConsentRecord {
+            granted_at: openasr_core::diarize::voice_id::timestamp_now(),
+            notice_version,
+            capture_method,
+        },
+        color_preference,
+        openasr_core::diarize::voice_id::CaptureContext {
+            device_class,
+            input_route,
+            environment_hint,
+            sample_label,
+        },
+        source,
+        intervals,
+    ))
+}
+
+fn extract_source_intervals(
+    source: &UploadedVoiceIdSource,
+    intervals: &[SourceInterval],
+) -> Result<Vec<f32>, ApiError> {
+    if intervals.is_empty() {
+        return Err(ApiError::BadRequest("intervals must not be empty".into()));
+    }
+    let source_path: &std::path::Path = source.path.as_ref();
+    let prepared = openasr_core::prepare_audio_input(
+        source_path,
+        &openasr_core::AudioPreparationOptions::new(openasr_core::BackendKind::Native),
+    )
+    .map_err(|error| ApiError::BadRequest(format!("Could not decode source_audio: {error}")))?;
+    let decoded = match prepared.samples() {
+        Some(samples) => samples.to_vec(),
+        None => openasr_core::load_native_wav_16khz_mono_f32_v0(
+            prepared.path(),
+            "voice-id source enrollment",
+            "source_audio",
+        )
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+    };
+    let duration = decoded.len() as f32 / 16_000.0;
+    let mut output = Vec::new();
+    let mut previous_end = 0.0_f32;
+    for interval in intervals {
+        if !interval.start.is_finite()
+            || !interval.end.is_finite()
+            || interval.start < 0.0
+            || interval.end <= interval.start
+            || interval.end > duration
+            || interval.start < previous_end
+        {
+            return Err(ApiError::BadRequest(
+                "intervals must be ordered, non-overlapping, and within source_audio duration"
+                    .into(),
+            ));
+        }
+        let start = (interval.start * 16_000.0).floor() as usize;
+        let end = (interval.end * 16_000.0).ceil() as usize;
+        let mut clip = decoded[start.min(decoded.len())..end.min(decoded.len())].to_vec();
+        apply_interval_fade(&mut clip);
+        output.extend(clip);
+        previous_end = interval.end;
+    }
+    Ok(output)
+}
+
+fn apply_interval_fade(samples: &mut [f32]) {
+    let fade = samples.len().min(160);
+    for index in 0..fade {
+        let gain = index as f32 / fade.max(1) as f32;
+        samples[index] *= gain;
+        let tail = samples.len() - 1 - index;
+        samples[tail] *= gain;
+    }
+}
+
+async fn stream_voice_id_source(mut field: Field<'_>) -> Result<UploadedVoiceIdSource, ApiError> {
+    let suffix = field
+        .file_name()
+        .and_then(source_extension_suffix)
+        .unwrap_or_default();
+    let mut file = tempfile::Builder::new()
+        .prefix("openasr-voice-id-source-")
+        .suffix(&suffix)
+        .tempfile()
+        .map_err(ApiError::TempFile)?;
+    let mut digest = Sha256::new();
+    let mut bytes = 0u64;
+    while let Some(chunk) = field.chunk().await.map_err(ApiError::Multipart)? {
+        bytes = bytes.saturating_add(chunk.len() as u64);
+        if bytes > MAX_VOICE_ID_SOURCE_BYTES {
+            return Err(ApiError::BadRequest(format!(
+                "Voice ID source_audio exceeds the {} MiB upload limit",
+                MAX_VOICE_ID_SOURCE_BYTES / (1024 * 1024)
+            )));
+        }
+        digest.update(&chunk);
+        file.write_all(&chunk).map_err(ApiError::TempFile)?;
+    }
+    file.flush().map_err(ApiError::TempFile)?;
+    Ok(UploadedVoiceIdSource {
+        path: file.into_temp_path(),
+        fingerprint: UploadedWavFingerprint {
+            sha256: hex_digest(digest.finalize()),
+            bytes,
+        },
+    })
+}
+
+fn source_extension_suffix(file_name: &str) -> Option<String> {
+    let extension = std::path::Path::new(file_name).extension()?.to_str()?;
+    extension
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric())
+        .then(|| format!(".{extension}"))
 }
 
 async fn parse_enroll_multipart(
@@ -578,7 +937,7 @@ async fn stream_voice_id_wav(mut field: Field<'_>) -> Result<UploadedVoiceIdWav,
     })
 }
 
-fn open_voice_id_store(
+pub(crate) fn open_voice_id_store(
     distribution: &DistributionContext,
 ) -> Result<openasr_core::diarize::voice_id::VoiceIdStore, ApiError> {
     let home = distribution.openasr_home()?;
@@ -586,7 +945,7 @@ fn open_voice_id_store(
         .map_err(|e| ApiError::JobStore(format!("voice-id store open/migration failed: {e}")))
 }
 
-fn active_space() -> Option<openasr_core::diarize::voice_id::EmbeddingSpace> {
+pub(crate) fn active_space() -> Option<openasr_core::diarize::voice_id::EmbeddingSpace> {
     let identity = openasr_core::diarize::embed::shared_embedder_identity()?;
     let embedder = openasr_core::diarize::embed::shared_embedder()?;
     Some(
@@ -676,6 +1035,36 @@ fn add_sample_request_hash(
     canonical_json_hash(&canonical)
 }
 
+fn source_enroll_request_hash(parsed: &ParsedSourceEnroll) -> String {
+    canonical_json_hash(&serde_json::json!({
+        "operation": "enroll_person_from_source_audio",
+        "display_name": parsed.display_name.trim(),
+        "notice_version": parsed.consent.notice_version,
+        "capture_method": parsed.consent.capture_method,
+        "color_preference": parsed.color_preference.as_deref().map(str::trim),
+        "capture_context": parsed.clip.capture_context,
+        "source": parsed.source_fingerprint,
+        "intervals": parsed.intervals,
+    }))
+}
+
+fn source_sample_request_hash(
+    person_id: &openasr_core::diarize::voice_id::PersonId,
+    expected_revision: Option<u64>,
+    parsed: &ParsedSourceSample,
+) -> String {
+    canonical_json_hash(&serde_json::json!({
+        "operation": "add_sample_from_source_audio",
+        "person_id": person_id.as_str(),
+        "expected_revision": expected_revision,
+        "notice_version": parsed.consent.notice_version,
+        "capture_method": parsed.consent.capture_method,
+        "capture_context": parsed.capture_context,
+        "source": parsed.source_fingerprint,
+        "intervals": parsed.intervals,
+    }))
+}
+
 fn canonical_json_hash(value: &serde_json::Value) -> String {
     // Only the digest crosses the HTTP/storage boundary; raw sample bytes are
     // dropped after embedding and are never stored in the idempotency ledger.
@@ -730,7 +1119,9 @@ fn load_enrollment_wav(path: &std::path::Path) -> Result<Vec<f32>, ApiError> {
     .map_err(|e| ApiError::BadRequest(e.to_string()))
 }
 
-fn voice_id_store_error(error: openasr_core::diarize::voice_id::VoiceIdStoreError) -> ApiError {
+pub(crate) fn voice_id_store_error(
+    error: openasr_core::diarize::voice_id::VoiceIdStoreError,
+) -> ApiError {
     use openasr_core::diarize::voice_id::VoiceIdStoreError;
     match error {
         VoiceIdStoreError::NotFound(message) | VoiceIdStoreError::SampleNotFound(message) => {
@@ -833,6 +1224,52 @@ mod tests {
         assert_ne!(
             super::enroll_request_hash(&first),
             super::enroll_request_hash(&second)
+        );
+    }
+
+    #[test]
+    fn source_audio_intervals_are_aggregated_and_validated() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&pcm16_wav()).unwrap();
+        let source = super::UploadedVoiceIdSource {
+            path: file.into_temp_path(),
+            fingerprint: super::UploadedWavFingerprint {
+                sha256: "test".into(),
+                bytes: 0,
+            },
+        };
+        let clips = super::extract_source_intervals(
+            &source,
+            &[
+                super::SourceInterval {
+                    start: 0.0,
+                    end: 0.25,
+                },
+                super::SourceInterval {
+                    start: 0.50,
+                    end: 0.75,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(clips.len(), 8_000);
+        assert!(
+            super::extract_source_intervals(
+                &source,
+                &[
+                    super::SourceInterval {
+                        start: 0.0,
+                        end: 0.5
+                    },
+                    super::SourceInterval {
+                        start: 0.4,
+                        end: 0.75
+                    },
+                ],
+            )
+            .is_err()
         );
     }
 

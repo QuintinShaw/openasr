@@ -5,6 +5,7 @@
 use axum::{
     Extension, Json,
     extract::{Path as AxumPath, Query},
+    http::{HeaderMap, HeaderValue, header},
     response::{IntoResponse, Response},
 };
 use openasr_core::config::{HistoryRetentionPolicy, load_config_document};
@@ -29,6 +30,18 @@ pub(crate) struct HistoryListQuery {
     pub(crate) limit: Option<usize>,
     #[serde(default)]
     pub(crate) offset: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct HistorySpeakerAssignmentsRequest {
+    pub(crate) assignments: Vec<HistorySpeakerAssignmentRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct HistorySpeakerAssignmentRequest {
+    pub(crate) speaker_label: String,
+    #[serde(default)]
+    pub(crate) person_id: Option<String>,
 }
 
 impl HistoryListQuery {
@@ -99,6 +112,99 @@ pub(crate) async fn history_get(
         .map_err(ApiError::History)?
         .ok_or_else(|| ApiError::NotFound(format!("History entry not found: {id}")))?;
     Ok(Json(detail).into_response())
+}
+
+pub(crate) async fn history_assign_speakers(
+    AxumPath(id): AxumPath<String>,
+    Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
+    Json(request): Json<HistorySpeakerAssignmentsRequest>,
+) -> Result<
+    (
+        HeaderMap,
+        Json<openasr_core::realtime::history::DaemonHistoryDetail>,
+    ),
+    ApiError,
+> {
+    let expected_revision = parse_required_quoted_if_match(&headers)?;
+    let voice_store = super::voice_id::open_voice_id_store(&distribution)?;
+    let mut assignments = Vec::with_capacity(request.assignments.len());
+    for assignment in request.assignments {
+        let speaker_label = assignment.speaker_label.trim().to_string();
+        if speaker_label.is_empty() {
+            return Err(ApiError::BadRequest(
+                "speaker_label must not be empty".into(),
+            ));
+        }
+        let resolved = match assignment.person_id {
+            None => openasr_core::realtime::history::DaemonHistorySpeakerAssignment::anonymous(
+                speaker_label,
+            ),
+            Some(raw_id) => {
+                let person_id = openasr_core::diarize::voice_id::PersonId::parse(&raw_id)
+                    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+                let person = voice_store
+                    .get_person(&person_id, super::voice_id::active_space().as_ref())
+                    .map_err(super::voice_id::voice_id_store_error)?;
+                if !person.status.allows_matching() {
+                    return Err(ApiError::BadRequest(format!(
+                        "Person '{}' is not active",
+                        person.person_id
+                    )));
+                }
+                openasr_core::realtime::history::DaemonHistorySpeakerAssignment {
+                    speaker_label,
+                    speaker: Some(person.display_name.clone()),
+                    person_id: Some(person.person_id),
+                    snapshot_label: Some(person.display_name),
+                }
+            }
+        };
+        assignments.push(resolved);
+    }
+    let home = distribution.openasr_home()?;
+    let detail = DaemonHistoryStore::open(&home)
+        .assign_speakers(&id, expected_revision, &assignments)
+        .map_err(history_assignment_error)?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{}\"", detail.entry.revision))
+            .expect("history revision is a valid HTTP header"),
+    );
+    Ok((response_headers, Json(detail)))
+}
+
+fn parse_required_quoted_if_match(headers: &HeaderMap) -> Result<u64, ApiError> {
+    let raw = headers
+        .get(header::IF_MATCH)
+        .ok_or_else(|| ApiError::BadRequest("If-Match is required".into()))?
+        .to_str()
+        .map_err(|_| ApiError::BadRequest("Invalid If-Match header".into()))?;
+    let Some(raw) = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return Err(ApiError::BadRequest(
+            "If-Match must be a quoted history revision".into(),
+        ));
+    };
+    raw.parse::<u64>()
+        .map_err(|_| ApiError::BadRequest("Invalid If-Match revision".into()))
+}
+
+fn history_assignment_error(
+    error: openasr_core::realtime::history::DaemonHistoryStoreError,
+) -> ApiError {
+    use openasr_core::realtime::history::DaemonHistoryStoreError;
+    match error {
+        DaemonHistoryStoreError::NotFound(message) => ApiError::NotFound(message),
+        DaemonHistoryStoreError::RevisionConflict { .. } => ApiError::Conflict(error.to_string()),
+        DaemonHistoryStoreError::InvalidId { .. }
+        | DaemonHistoryStoreError::InvalidSpeakerAssignment(_)
+        | DaemonHistoryStoreError::InvalidRecord { .. } => ApiError::BadRequest(error.to_string()),
+        other => ApiError::History(other),
+    }
 }
 
 pub(crate) async fn history_delete(

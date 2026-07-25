@@ -130,8 +130,9 @@ fn apply_speaker(
         segment.speaker_person_id = assignment.speaker_person_id.clone();
         segment.speaker_snapshot_label = assignment.speaker_snapshot_label.clone();
     } else {
-        segment.speaker = Some(speaker.label());
-        segment.speaker_label = None;
+        let speaker_label = speaker.label();
+        segment.speaker = Some(speaker_label.clone());
+        segment.speaker_label = Some(speaker_label);
         segment.speaker_person_id = None;
         segment.speaker_snapshot_label = None;
     }
@@ -476,9 +477,9 @@ mod tests {
         );
         assert_eq!(segs.len(), 3);
         assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_00"));
-        assert_eq!(segs[0].speaker_label, None);
+        assert_eq!(segs[0].speaker_label.as_deref(), Some("SPEAKER_00"));
         assert_eq!(segs[1].speaker.as_deref(), Some("SPEAKER_01"));
-        assert_eq!(segs[1].speaker_label, None);
+        assert_eq!(segs[1].speaker_label.as_deref(), Some("SPEAKER_01"));
         // straddling segment without words: 0.2s in spk0, 0.4s in spk1 ->
         // spk1 dominates, no split possible.
         assert_eq!(segs[2].speaker.as_deref(), Some("SPEAKER_01"));
@@ -509,7 +510,7 @@ mod tests {
         );
         let segs = assign_speakers(&turns, vec![seg(0.0, 1.5), seg(2.5, 4.0)], &identities);
         assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_00"));
-        assert_eq!(segs[0].speaker_label, None);
+        assert_eq!(segs[0].speaker_label.as_deref(), Some("SPEAKER_00"));
         assert_eq!(segs[1].speaker.as_deref(), Some("Alice"));
         assert_eq!(segs[1].speaker_label.as_deref(), Some("SPEAKER_01"));
     }
@@ -766,7 +767,7 @@ mod tests {
         assert_eq!(segs[0].speaker.as_deref(), Some("Alice"));
         assert_eq!(segs[0].speaker_label.as_deref(), Some("SPEAKER_00"));
         assert_eq!(segs[1].speaker.as_deref(), Some("SPEAKER_01"));
-        assert_eq!(segs[1].speaker_label, None);
+        assert_eq!(segs[1].speaker_label.as_deref(), Some("SPEAKER_01"));
     }
 
     fn rt_word(word: &str, start_ms: u64, end_ms: u64) -> crate::realtime::RealtimeTranscriptWord {

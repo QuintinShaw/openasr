@@ -1103,6 +1103,7 @@ fn run_native_transcription_impl(
         &runtime_preflight.metadata,
         selected_family.self_diarizes,
     );
+    let self_diarizer_mode = request.diarize && model_self_diarizes;
     let vad_diarization = request.diarize && !model_self_diarizes;
     if vad_diarization
         && (crate::diarize::embed::shared_embedder().is_none()
@@ -1158,6 +1159,10 @@ fn run_native_transcription_impl(
     } else {
         SpeakerAttribution::default()
     };
+    // The executor consumes its input buffer on the short-form path. Retain a
+    // copy only for self-diarizing matching, where post-decode label turns need
+    // their own acoustic evidence; ordinary transcriptions keep the zero-copy path.
+    let self_diarizer_audio = self_diarizer_mode.then(|| prepared_audio.clone());
 
     let dispatch = shared_native_ggml_execution_dispatch();
     let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
@@ -1215,7 +1220,7 @@ fn run_native_transcription_impl(
     // Only the self-diarizing in-executor path (e.g. cohere) consumes this flag.
     // The VAD + speaker-embedder post-hoc path runs separately, so gating here keeps the two
     // mechanisms mutually exclusive (no future double-apply).
-    request_options.diarize = request.diarize && model_self_diarizes;
+    request_options.diarize = self_diarizer_mode;
     let backend_preference = execution_target_backend_preference(request.execution_target)?;
     // Installed for the whole transcribe call: not consulted by the
     // provenance label or the longform multichunk-metal probe below (those
@@ -1544,6 +1549,8 @@ fn run_native_transcription_impl(
                     audio_duration_seconds,
                     Some(run_metadata),
                     &speaker_turns,
+                    self_diarizer_audio.as_deref().unwrap_or(&[]),
+                    self_diarizer_mode,
                     strip_forced_word_timestamps,
                     reported_language.clone(),
                 ));
@@ -1553,6 +1560,8 @@ fn run_native_transcription_impl(
                 audio_duration_seconds,
                 Some(run_metadata),
                 &speaker_turns,
+                self_diarizer_audio.as_deref().unwrap_or(&[]),
+                self_diarizer_mode,
                 strip_forced_word_timestamps,
                 reported_language.clone(),
             ));
@@ -1617,6 +1626,8 @@ fn run_native_transcription_impl(
         audio_duration_seconds,
         longform_metadata,
         &speaker_turns,
+        self_diarizer_audio.as_deref().unwrap_or(&[]),
+        self_diarizer_mode,
         strip_forced_word_timestamps,
         reported_language,
     ))
@@ -1639,20 +1650,23 @@ fn finalize_native_transcription(
     audio_duration_seconds: f32,
     longform_metadata: Option<TranscriptionLongFormMetadata>,
     speaker_turns: &SpeakerAttribution,
+    prepared_audio: &[f32],
+    model_self_diarizes: bool,
     strip_forced_word_timestamps: bool,
     reported_language: Option<String>,
 ) -> Transcription {
-    with_reported_language(
-        apply_speaker_turns(
-            with_longform_metadata(
-                normalize_transcription_segments(transcription, 0.0, audio_duration_seconds),
-                longform_metadata,
-            ),
-            speaker_turns,
-            strip_forced_word_timestamps,
+    let mut transcription = apply_speaker_turns(
+        with_longform_metadata(
+            normalize_transcription_segments(transcription, 0.0, audio_duration_seconds),
+            longform_metadata,
         ),
-        reported_language,
-    )
+        speaker_turns,
+        strip_forced_word_timestamps,
+    );
+    if model_self_diarizes {
+        apply_self_diarizer_voice_id_matches(&mut transcription, prepared_audio);
+    }
+    with_reported_language(transcription, reported_language)
 }
 
 /// Stamp the effective source language onto a finished transcription so every
@@ -1668,6 +1682,73 @@ fn with_reported_language(
     let executor_detected = transcription.language.take();
     transcription.language = language.or(executor_detected);
     transcription
+}
+
+/// Match self-diarizer turns against Voice ID without re-running speaker
+/// segmentation. A self-diarizer already owns the turn boundaries; we embed
+/// each of its bounded turns and average per stable label before matching.
+fn apply_self_diarizer_voice_id_matches(transcription: &mut Transcription, samples: &[f32]) {
+    use crate::diarize::embed::shared_embedder;
+
+    for segment in &mut transcription.segments {
+        if segment.speaker_label.is_none() {
+            segment.speaker_label = segment.speaker.clone();
+        }
+        if segment.speaker.is_none()
+            && let Some(label) = &segment.speaker_label
+        {
+            segment.speaker = Some(label.clone());
+        }
+    }
+    let Some(embedder) = shared_embedder() else {
+        return;
+    };
+    let mut centroids: BTreeMap<String, (Vec<f32>, usize)> = BTreeMap::new();
+    for segment in &transcription.segments {
+        let Some(label) = segment.speaker_label.as_ref() else {
+            continue;
+        };
+        let start = (segment.start.max(0.0) * 16_000.0).floor() as usize;
+        let end = (segment.end.max(segment.start).max(0.0) * 16_000.0).ceil() as usize;
+        let Some(clip) = samples.get(start.min(samples.len())..end.min(samples.len())) else {
+            continue;
+        };
+        if let Ok(embedding) = embedder.embed(clip, 16_000) {
+            let entry = centroids
+                .entry(label.clone())
+                .or_insert_with(|| (vec![0.0; embedding.dim()], 0));
+            if entry.0.len() != embedding.dim() {
+                continue;
+            }
+            for (sum, value) in entry.0.iter_mut().zip(embedding.0) {
+                *sum += value;
+            }
+            entry.1 += 1;
+        }
+    }
+    let matcher = crate::diarize::voice_id::load_person_matcher_for_active_embedder();
+    let matches: BTreeMap<_, _> = centroids
+        .into_iter()
+        .filter_map(|(label, (sum, count))| {
+            (count > 0).then(|| {
+                let centroid = crate::diarize::contract::SpeakerEmbedding::l2_normalized(sum);
+                matcher
+                    .best_match(&centroid)
+                    .map(|matched| (label, matched))
+            })?
+        })
+        .collect();
+    for segment in &mut transcription.segments {
+        let Some(label) = segment.speaker_label.as_deref() else {
+            continue;
+        };
+        let Some(person) = matches.get(label) else {
+            continue;
+        };
+        segment.speaker = Some(person.display_name.clone());
+        segment.speaker_person_id = Some(person.person_id.as_str().to_string());
+        segment.speaker_snapshot_label = Some(person.display_name.clone());
+    }
 }
 
 /// Speaker turns plus the optionally-matched enrolled primary-user identity.

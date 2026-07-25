@@ -44,7 +44,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{any, delete, get, patch, post},
+    routing::{any, delete, get, patch, post, put},
     serve::Listener,
 };
 use futures_util::stream;
@@ -140,12 +140,24 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         .route("/v1/history", get(history_list))
         .route("/v1/history/{id}", get(history_get).delete(history_delete))
         .route(
+            "/v1/history/{id}/speaker-assignments",
+            put(history_assign_speakers),
+        )
+        .route(
             "/v1/voice-id/persons",
             get(list_persons).post(enroll_person),
         )
         .route(
             "/v1/voice-id/persons/{person_id}",
             get(get_person).patch(patch_person).delete(delete_person),
+        )
+        .route(
+            "/v1/voice-id/persons/from-audio",
+            post(enroll_person_from_source_audio),
+        )
+        .route(
+            "/v1/voice-id/persons/{person_id}/samples/from-audio",
+            post(add_sample_from_source_audio),
         )
         .route("/v1/voice-id/persons/{person_id}/samples", post(add_sample))
         .route(

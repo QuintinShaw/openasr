@@ -3,6 +3,8 @@
 
 use std::{io::Write, path::Path, str::FromStr, sync::Arc};
 
+use axum::http::HeaderValue;
+
 use openasr_core::config::load_config_document;
 use openasr_core::realtime::history::{
     DaemonHistoryKind, DaemonHistoryProvenance, DaemonHistoryRecord, DaemonHistoryStore,
@@ -423,18 +425,24 @@ async fn run_offline_transcription(
     // not fail because the history store could not be written (e.g. a read-only
     // or misconfigured OPENASR_HOME). Log and continue; the realtime path already
     // treats history the same way.
-    if !is_remote_compute_client_request(&headers, &auth)
-        && let Err(error) = record_file_transcription_history(
+    let history_id = if !is_remote_compute_client_request(&headers, &auth) {
+        match record_file_transcription_history(
             &distribution,
             &history_request,
             &transcription,
             parsed.response_format,
-        )
-    {
-        eprintln!(
-            "openasr-server: could not record file transcription history (continuing): {error}"
-        );
-    }
+        ) {
+            Ok(entry) => entry.map(|entry| entry.id),
+            Err(error) => {
+                eprintln!(
+                    "openasr-server: could not record file transcription history (continuing): {error}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let content_type = match parsed.response_format {
         ResponseFormat::Json | ResponseFormat::VerboseJson => mime::APPLICATION_JSON.as_ref(),
@@ -444,7 +452,16 @@ async fn run_offline_transcription(
         | ResponseFormat::Markdown => mime::TEXT_PLAIN_UTF_8.as_ref(),
     };
 
-    Ok(([(header::CONTENT_TYPE, content_type)], rendered).into_response())
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    if let Some(history_id) = history_id {
+        response_headers.insert(
+            "x-openasr-history-id",
+            HeaderValue::from_str(&history_id)
+                .expect("generated history id is a valid HTTP header"),
+        );
+    }
+    Ok((response_headers, rendered).into_response())
 }
 
 // ── History / auth helpers ────────────────────────────────────────────────────
@@ -462,7 +479,7 @@ pub(crate) fn record_file_transcription_history(
     request: &TranscriptionRequest,
     transcription: &openasr_core::Transcription,
     output_format: ResponseFormat,
-) -> Result<(), ApiError> {
+) -> Result<Option<openasr_core::realtime::history::DaemonHistoryEntry>, ApiError> {
     let home = distribution.openasr_home()?;
     // History persistence is governed solely by the saved-history scope
     // (`history_retention`). `auto_save` controls transcript-file exports and
@@ -474,10 +491,10 @@ pub(crate) fn record_file_transcription_history(
         .history_retention
         .persists_new_entries()
     {
-        return Ok(());
+        return Ok(None);
     }
     let store = DaemonHistoryStore::open(&home);
-    store
+    let entry = store
         .record(DaemonHistoryRecord {
             kind: DaemonHistoryKind::File,
             model: request.model_id.clone(),
@@ -502,7 +519,7 @@ pub(crate) fn record_file_transcription_history(
     if let Err(error) = prune_history_store(&store, document.preferences.history_retention) {
         eprintln!("openasr-server: could not prune transcription history (continuing): {error}");
     }
-    Ok(())
+    Ok(Some(entry))
 }
 
 fn transcription_duration_seconds(transcription: &openasr_core::Transcription) -> Option<f32> {

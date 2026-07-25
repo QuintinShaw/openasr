@@ -72,7 +72,7 @@ static CONNECTION_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// replaying whatever a past write recorded.
 const ENTRY_COLUMNS: &str = "e.id, e.kind, e.model, e.created_at_unix_seconds, e.source_name, \
      e.duration_seconds, e.output_format, e.diarization_active, e.provenance, e.segments_json, \
-     e.preview";
+     e.preview, e.revision";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -140,6 +140,8 @@ pub struct DaemonHistoryEntry {
     pub provenance: Option<DaemonHistoryProvenance>,
     pub formats: Vec<String>,
     pub preview: String,
+    /// Optimistic-concurrency version for editable speaker assignments.
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -190,6 +192,28 @@ pub struct DaemonHistoryRecord {
     pub segments: Vec<Segment>,
 }
 
+/// A resolved assignment applied to every persisted segment sharing a stable
+/// anonymous `speaker_label`. The server resolves active Persons before this
+/// reaches history, keeping the history store independent from Voice ID data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonHistorySpeakerAssignment {
+    pub speaker_label: String,
+    pub speaker: Option<String>,
+    pub person_id: Option<String>,
+    pub snapshot_label: Option<String>,
+}
+
+impl DaemonHistorySpeakerAssignment {
+    pub fn anonymous(speaker_label: String) -> Self {
+        Self {
+            speaker_label,
+            speaker: None,
+            person_id: None,
+            snapshot_label: None,
+        }
+    }
+}
+
 /// Filter/pagination request for [`DaemonHistoryStore::query`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DaemonHistoryQuery {
@@ -220,6 +244,12 @@ pub enum DaemonHistoryStoreError {
     InvalidId { id: String, reason: &'static str },
     #[error("Invalid history record field '{field}': {reason}")]
     InvalidRecord { field: &'static str, reason: String },
+    #[error("History entry not found: {0}")]
+    NotFound(String),
+    #[error("History entry revision conflict: expected {expected}, current {actual}")]
+    RevisionConflict { expected: u64, actual: u64 },
+    #[error("Invalid speaker assignment: {0}")]
+    InvalidSpeakerAssignment(String),
     #[error("Could not create history directory '{path}': {source}")]
     CreateDir {
         path: PathBuf,
@@ -334,7 +364,7 @@ impl DaemonHistoryStore {
             params![id],
             |row| {
                 let entry = row_to_entry(row)?;
-                let text: String = row.get(11)?;
+                let text: String = row.get(12)?;
                 // segments_json lives at the same ordinal `row_to_entry` already
                 // read to derive `entry.formats`; re-read it here for the full
                 // segment payload. A NULL column (rows written before segments
@@ -353,6 +383,128 @@ impl DaemonHistoryStore {
         )
         .optional()
         .map_err(DaemonHistoryStoreError::Query)
+    }
+
+    /// Atomically changes person attribution for one or more stable anonymous
+    /// speaker labels. The transcript text, Person records, and samples stay
+    /// untouched; only the persisted segment projection and row revision move.
+    pub fn assign_speakers(
+        &self,
+        id: &str,
+        expected_revision: u64,
+        assignments: &[DaemonHistorySpeakerAssignment],
+    ) -> Result<DaemonHistoryDetail, DaemonHistoryStoreError> {
+        validate_history_id(id)?;
+        if assignments.is_empty() {
+            return Err(DaemonHistoryStoreError::InvalidSpeakerAssignment(
+                "assignments must not be empty".into(),
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for assignment in assignments {
+            if assignment.speaker_label.trim().is_empty() {
+                return Err(DaemonHistoryStoreError::InvalidSpeakerAssignment(
+                    "speaker_label must not be empty".into(),
+                ));
+            }
+            if !seen.insert(assignment.speaker_label.as_str()) {
+                return Err(DaemonHistoryStoreError::InvalidSpeakerAssignment(format!(
+                    "duplicate speaker_label '{}'",
+                    assignment.speaker_label
+                )));
+            }
+            let resolved = assignment.speaker.is_some()
+                && assignment.person_id.is_some()
+                && assignment.snapshot_label.is_some();
+            let anonymous = assignment.speaker.is_none()
+                && assignment.person_id.is_none()
+                && assignment.snapshot_label.is_none();
+            if !resolved && !anonymous {
+                return Err(DaemonHistoryStoreError::InvalidSpeakerAssignment(format!(
+                    "speaker_label '{}' has an incomplete Person assignment",
+                    assignment.speaker_label
+                )));
+            }
+        }
+
+        let mut conn = self.connection()?;
+        let tx = conn.transaction().map_err(DaemonHistoryStoreError::Query)?;
+        let row = tx
+            .query_row(
+                "SELECT text, segments_json, revision FROM history_entries WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(DaemonHistoryStoreError::Query)?
+            .ok_or_else(|| DaemonHistoryStoreError::NotFound(id.to_string()))?;
+        let (text, segments_json, revision) = row;
+        let actual_revision = revision.max(0) as u64;
+        if actual_revision != expected_revision {
+            return Err(DaemonHistoryStoreError::RevisionConflict {
+                expected: expected_revision,
+                actual: actual_revision,
+            });
+        }
+        let mut segments = parse_segments_json(segments_json);
+        let labels: std::collections::BTreeSet<_> = segments
+            .iter()
+            .filter_map(|segment| segment.speaker_label.as_deref())
+            .collect();
+        for assignment in assignments {
+            if !labels.contains(assignment.speaker_label.as_str()) {
+                return Err(DaemonHistoryStoreError::InvalidSpeakerAssignment(format!(
+                    "unknown speaker_label '{}'",
+                    assignment.speaker_label
+                )));
+            }
+        }
+        for segment in &mut segments {
+            let Some(label) = segment.speaker_label.as_deref() else {
+                continue;
+            };
+            let Some(assignment) = assignments
+                .iter()
+                .find(|assignment| assignment.speaker_label == label)
+            else {
+                continue;
+            };
+            match &assignment.speaker {
+                Some(speaker) => {
+                    segment.speaker = Some(speaker.clone());
+                    segment.speaker_person_id = assignment.person_id.clone();
+                    segment.speaker_snapshot_label = assignment.snapshot_label.clone();
+                }
+                None => {
+                    segment.speaker = Some(assignment.speaker_label.clone());
+                    segment.speaker_person_id = None;
+                    segment.speaker_snapshot_label = None;
+                }
+            }
+        }
+        let segments_json = serde_json::to_string(&segments).map_err(|error| {
+            DaemonHistoryStoreError::InvalidSpeakerAssignment(format!(
+                "segments cannot be serialized: {error}"
+            ))
+        })?;
+        let new_revision = actual_revision.saturating_add(1);
+        tx.execute(
+            "UPDATE history_entries SET segments_json = ?1, revision = ?2 WHERE id = ?3",
+            params![segments_json, new_revision as i64, id],
+        )
+        .map_err(DaemonHistoryStoreError::Query)?;
+        tx.commit().map_err(DaemonHistoryStoreError::Query)?;
+        let entry = self
+            .get(id)?
+            .ok_or_else(|| DaemonHistoryStoreError::NotFound(id.to_string()))?;
+        debug_assert_eq!(entry.text, text);
+        Ok(entry)
     }
 
     pub fn delete(&self, id: &str) -> Result<bool, DaemonHistoryStoreError> {
@@ -521,6 +673,7 @@ impl DaemonHistoryStore {
             provenance: record.provenance,
             formats,
             preview,
+            revision: 0,
         })
     }
 
@@ -607,7 +760,8 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             formats TEXT NOT NULL,
             preview TEXT NOT NULL,
             text TEXT NOT NULL,
-            segments_json TEXT
+            segments_json TEXT,
+            revision INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS history_entries_created_at_idx
             ON history_entries (created_at_unix_seconds DESC, id DESC);
@@ -618,24 +772,26 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             tokenize = 'trigram'
         );",
     )?;
-    ensure_segments_json_column(conn)
+    ensure_history_entry_columns(conn)
 }
 
-/// Additive migration for databases created before `segments_json` existed:
-/// `CREATE TABLE IF NOT EXISTS` never alters an existing table, so an older
-/// `history.db` keeps its columnless-of-`segments_json` shape until this adds
-/// the nullable column. Existing rows read back as `NULL` (no segments), which
-/// the query paths already treat as "text only". Idempotent: a fresh database
-/// already has the column from the `CREATE TABLE` above and skips the `ALTER`.
-fn ensure_segments_json_column(conn: &Connection) -> rusqlite::Result<()> {
-    let has_column = conn
-        .prepare("SELECT 1 FROM pragma_table_info('history_entries') WHERE name = 'segments_json'")?
-        .exists([])?;
-    if !has_column {
-        conn.execute(
-            "ALTER TABLE history_entries ADD COLUMN segments_json TEXT",
-            [],
-        )?;
+/// Additive, idempotent schema migration for history fields introduced after
+/// the initial SQLite store. Every ALTER is independently transactional in
+/// SQLite; the migration is safe to re-enter after an interrupted process.
+fn ensure_history_entry_columns(conn: &Connection) -> rusqlite::Result<()> {
+    for (column, definition) in [
+        ("segments_json", "TEXT"),
+        ("revision", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        let has_column = conn
+            .prepare("SELECT 1 FROM pragma_table_info('history_entries') WHERE name = ?1")?
+            .exists(params![column])?;
+        if !has_column {
+            conn.execute(
+                &format!("ALTER TABLE history_entries ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
     }
     Ok(())
 }
@@ -683,6 +839,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DaemonHistoryEntry>
             .and_then(DaemonHistoryProvenance::parse),
         formats: formats_for_content(has_segments),
         preview: row.get(10)?,
+        revision: row.get::<_, i64>(11)?.max(0) as u64,
     })
 }
 
@@ -982,6 +1139,7 @@ mod tests {
             provenance: Some(DaemonHistoryProvenance::Recorded),
             formats: vec!["text".to_string()],
             preview: "hello".to_string(),
+            revision: 0,
         };
         let detail = DaemonHistoryDetail {
             entry,
@@ -1435,6 +1593,67 @@ mod tests {
         let detail = store.get("hist-legacy-lie").unwrap().unwrap();
         assert_eq!(detail.entry.formats, honest_formats);
         assert!(detail.segments.is_empty());
+    }
+
+    #[test]
+    fn history_speaker_assignment_updates_only_segments_and_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let entry = store
+            .record(DaemonHistoryRecord {
+                kind: DaemonHistoryKind::File,
+                model: "whisper".into(),
+                source_name: None,
+                duration_seconds: Some(1.0),
+                output_format: Some(ResponseFormat::Json),
+                diarization_active: Some(true),
+                provenance: Some(DaemonHistoryProvenance::Recorded),
+                text: "hello".into(),
+                segments: vec![Segment {
+                    start: 0.0,
+                    end: 1.0,
+                    text: "hello".into(),
+                    speaker: Some("SPEAKER_00".into()),
+                    speaker_label: Some("SPEAKER_00".into()),
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
+                    words: Vec::new(),
+                }],
+            })
+            .unwrap();
+        let updated = store
+            .assign_speakers(
+                &entry.id,
+                entry.revision,
+                &[DaemonHistorySpeakerAssignment {
+                    speaker_label: "SPEAKER_00".into(),
+                    speaker: Some("Alice".into()),
+                    person_id: Some("person-test".into()),
+                    snapshot_label: Some("Alice".into()),
+                }],
+            )
+            .unwrap();
+        assert_eq!(updated.entry.revision, 1);
+        assert_eq!(updated.text, "hello");
+        assert_eq!(updated.segments[0].speaker.as_deref(), Some("Alice"));
+        assert_eq!(
+            updated.segments[0].speaker_label.as_deref(),
+            Some("SPEAKER_00")
+        );
+        assert_eq!(
+            updated.segments[0].speaker_person_id.as_deref(),
+            Some("person-test")
+        );
+        assert!(matches!(
+            store.assign_speakers(
+                &entry.id,
+                0,
+                &[DaemonHistorySpeakerAssignment::anonymous(
+                    "SPEAKER_00".into()
+                )]
+            ),
+            Err(DaemonHistoryStoreError::RevisionConflict { .. })
+        ));
     }
 
     // No test exercises `record()`'s "segments fail to serialize -> degrade to
