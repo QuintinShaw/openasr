@@ -25,7 +25,6 @@ pub(crate) struct PatchPersonRequest {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct PatchSampleRequest {
-    #[allow(dead_code)]
     pub sample_label: Option<String>,
 }
 
@@ -111,14 +110,15 @@ pub(crate) async fn patch_person(
     let id = openasr_core::diarize::voice_id::PersonId::parse(&person_id)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let expected = parse_if_match(&headers)?;
-    let Some(display_name) = request.display_name else {
-        return Err(ApiError::BadRequest(
-            "PATCH currently supports display_name only".into(),
-        ));
-    };
-    let _ = request.color_preference; // reserved for app presentation metadata
     let person = store
-        .rename_person(&id, display_name, expected)
+        .update_person_metadata(
+            &id,
+            expected,
+            openasr_core::diarize::voice_id::PersonMetadataUpdate {
+                display_name: request.display_name,
+                color_preference: request.color_preference.map(Some),
+            },
+        )
         .map_err(voice_id_store_error)?;
     let mut out_headers = HeaderMap::new();
     let etag = format!("\"{}\"", person.revision);
@@ -198,15 +198,27 @@ pub(crate) async fn delete_sample(
 }
 
 pub(crate) async fn patch_sample(
-    Extension(_distribution): Extension<DistributionContext>,
-    AxumPath(_sample_id): AxumPath<String>,
-    Json(_request): Json<PatchSampleRequest>,
-) -> Result<StatusCode, ApiError> {
-    // Sample label metadata edits land with a dedicated store method in a
-    // follow-up; reject rather than silently no-op.
-    Err(ApiError::BadRequest(
-        "sample metadata PATCH is not implemented in this build".into(),
-    ))
+    Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
+    AxumPath(sample_id): AxumPath<String>,
+    Json(request): Json<PatchSampleRequest>,
+) -> Result<(HeaderMap, Json<openasr_core::diarize::voice_id::PersonView>), ApiError> {
+    let store = open_voice_id_store(&distribution)?;
+    let id = openasr_core::diarize::voice_id::SampleId::parse(&sample_id)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let expected = parse_if_match(&headers)?;
+    let sample_label = request
+        .sample_label
+        .ok_or_else(|| ApiError::BadRequest("PATCH requires sample_label".into()))?;
+    let person = store
+        .rename_sample(&id, sample_label, expected)
+        .map_err(voice_id_store_error)?;
+    let mut out_headers = HeaderMap::new();
+    let etag = format!("\"{}\"", person.revision);
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        out_headers.insert(header::ETAG, value);
+    }
+    Ok((out_headers, Json(person)))
 }
 
 pub(crate) async fn revoke_consent(
@@ -265,6 +277,7 @@ async fn parse_enroll_multipart(
     let mut device_class = "unknown".to_string();
     let mut input_route = "unknown".to_string();
     let mut environment_hint = None;
+    let mut sample_labels: Vec<String> = Vec::new();
     let mut wav_paths: Vec<tempfile::TempPath> = Vec::new();
 
     while let Some(field) = multipart.next_field().await.map_err(ApiError::Multipart)? {
@@ -290,6 +303,11 @@ async fn parse_enroll_multipart(
             "environment_hint" => {
                 environment_hint = Some(field.text().await.map_err(ApiError::Multipart)?);
             }
+            // Repeat this field once per WAV to label every sample, or provide
+            // it once to label just the first sample.
+            "sample_label" => {
+                sample_labels.push(field.text().await.map_err(ApiError::Multipart)?);
+            }
             "wav" | "sample" | "samples" => {
                 let bytes = field.bytes().await.map_err(ApiError::Multipart)?;
                 wav_paths.push(write_upload_temp_file(&bytes, ".wav")?);
@@ -314,6 +332,7 @@ async fn parse_enroll_multipart(
             "Initial enrollment accepts at most 5 samples".into(),
         ));
     }
+    let sample_labels = resolve_initial_sample_labels(sample_labels, wav_paths.len())?;
 
     // Prepare all clips first; any failure leaves zero DB writes.
     let mut clips = Vec::with_capacity(wav_paths.len());
@@ -327,7 +346,7 @@ async fn parse_enroll_multipart(
                 device_class: device_class.clone(),
                 input_route: input_route.clone(),
                 environment_hint: environment_hint.clone(),
-                sample_label: Some(format!("enrollment-{}", idx + 1)),
+                sample_label: Some(sample_labels[idx].clone()),
             },
         });
     }
@@ -344,6 +363,28 @@ async fn parse_enroll_multipart(
         color_preference,
         clips,
     })
+}
+
+fn resolve_initial_sample_labels(
+    sample_labels: Vec<String>,
+    sample_count: usize,
+) -> Result<Vec<String>, ApiError> {
+    if sample_labels.len() > sample_count
+        || (sample_labels.len() > 1 && sample_labels.len() != sample_count)
+    {
+        return Err(ApiError::BadRequest(
+            "Provide one sample_label for the first sample, or one for every enrollment WAV".into(),
+        ));
+    }
+    let mut resolved = (1..=sample_count)
+        .map(|index| format!("enrollment-{index}"))
+        .collect::<Vec<_>>();
+    match sample_labels.as_slice() {
+        [] => {}
+        [first] => resolved[0] = first.clone(),
+        labels => resolved.clone_from_slice(labels),
+    }
+    Ok(resolved)
 }
 
 async fn parse_sample_multipart(
@@ -491,6 +532,10 @@ fn voice_id_store_error(error: openasr_core::diarize::voice_id::VoiceIdStoreErro
         }
         VoiceIdStoreError::RevisionConflict { .. } => ApiError::Conflict(error.to_string()),
         VoiceIdStoreError::EmptyName
+        | VoiceIdStoreError::EmptySampleLabel
+        | VoiceIdStoreError::LabelTooLong { .. }
+        | VoiceIdStoreError::InvalidColorPreference(_)
+        | VoiceIdStoreError::EmptyPersonMetadataUpdate
         | VoiceIdStoreError::InvalidId(_)
         | VoiceIdStoreError::NotActive(_)
         | VoiceIdStoreError::Migration(_) => ApiError::BadRequest(error.to_string()),
@@ -503,5 +548,115 @@ fn voice_id_service_error(error: openasr_core::diarize::voice_id::VoiceIdService
     match error {
         VoiceIdServiceError::Store(error) => voice_id_store_error(error),
         other => ApiError::BadRequest(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        extract::FromRequest,
+        http::{Request, header},
+    };
+
+    use super::{Multipart, parse_enroll_multipart, resolve_initial_sample_labels};
+
+    #[test]
+    fn initial_enrollment_sample_labels_preserve_client_values_and_fallbacks() {
+        assert_eq!(
+            resolve_initial_sample_labels(Vec::new(), 2).unwrap(),
+            vec!["enrollment-1", "enrollment-2"]
+        );
+        assert_eq!(
+            resolve_initial_sample_labels(vec!["First take".into()], 2).unwrap(),
+            vec!["First take", "enrollment-2"]
+        );
+        assert_eq!(
+            resolve_initial_sample_labels(vec!["Office".into(), "Car".into()], 2).unwrap(),
+            vec!["Office", "Car"]
+        );
+        assert!(resolve_initial_sample_labels(vec!["one".into(), "two".into()], 3).is_err());
+        assert!(resolve_initial_sample_labels(vec!["one".into(), "two".into()], 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn enrollment_multipart_assigns_first_and_per_sample_labels() {
+        let first = parse_enroll(&["First take"]).await;
+        assert_eq!(
+            first.clips[0].capture_context.sample_label.as_deref(),
+            Some("First take")
+        );
+        assert_eq!(
+            first.clips[1].capture_context.sample_label.as_deref(),
+            Some("enrollment-2")
+        );
+
+        let every = parse_enroll(&["Office", "Car"]).await;
+        assert_eq!(
+            every.clips[0].capture_context.sample_label.as_deref(),
+            Some("Office")
+        );
+        assert_eq!(
+            every.clips[1].capture_context.sample_label.as_deref(),
+            Some("Car")
+        );
+    }
+
+    async fn parse_enroll(sample_labels: &[&str]) -> super::ParsedEnroll {
+        let boundary = "voice-id-test-boundary";
+        let mut body = Vec::new();
+        form_field(&mut body, boundary, "display_name", b"Alice");
+        for sample_label in sample_labels {
+            form_field(&mut body, boundary, "sample_label", sample_label.as_bytes());
+        }
+        for name in ["first.wav", "second.wav"] {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"wav\"; filename=\"{name}\"\r\nContent-Type: audio/wav\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(&pcm16_wav());
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        let request = Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let multipart = Multipart::from_request(request, &()).await;
+        parse_enroll_multipart(multipart).await.unwrap()
+    }
+
+    fn form_field(body: &mut Vec<u8>, boundary: &str, name: &str, value: &[u8]) {
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(value);
+        body.extend_from_slice(b"\r\n");
+    }
+
+    fn pcm16_wav() -> Vec<u8> {
+        let samples = 16_000u32;
+        let data_bytes = samples * 2;
+        let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&16_000u32.to_le_bytes());
+        wav.extend_from_slice(&(16_000u32 * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        wav.resize(44 + data_bytes as usize, 0);
+        wav
     }
 }

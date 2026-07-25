@@ -13,6 +13,7 @@ use thiserror::Error;
 use super::domain::{
     CaptureContext, ConsentRecord, EnrollmentSample, Person, PersonPrototype, PersonStatus,
     PersonView, PrototypeMember, SampleEmbedding, SampleQuality, SampleView,
+    VOICE_ID_LABEL_MAX_CHARS, VoiceIdColor,
 };
 use super::ids::{IdError, PersonId, PrototypeId, SampleId};
 use super::matcher::{MatcherPerson, PersonMatcher};
@@ -49,6 +50,18 @@ pub enum VoiceIdStoreError {
     SampleNotFound(String),
     #[error("voice-id display name must not be empty")]
     EmptyName,
+    #[error("voice-id sample label must not be empty")]
+    EmptySampleLabel,
+    #[error("voice-id {field} must not exceed {max} characters (got {got})")]
+    LabelTooLong {
+        field: &'static str,
+        max: usize,
+        got: usize,
+    },
+    #[error("voice-id color preference is invalid: {0}")]
+    InvalidColorPreference(String),
+    #[error("voice-id person PATCH requires display_name or color_preference")]
+    EmptyPersonMetadataUpdate,
     #[error("voice-id revision conflict for {id}: expected {expected}, found {found}")]
     RevisionConflict {
         id: String,
@@ -69,6 +82,14 @@ pub enum VoiceIdStoreError {
 pub struct VoiceIdStore {
     root: PathBuf,
     db_path: PathBuf,
+}
+
+/// The editable person fields. `Some(None)` clears the color preference;
+/// `None` leaves that field unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct PersonMetadataUpdate {
+    pub display_name: Option<String>,
+    pub color_preference: Option<Option<String>>,
 }
 
 impl VoiceIdStore {
@@ -115,6 +136,7 @@ impl VoiceIdStore {
         for row in rows {
             let (person_id, display_name, status, created_at, updated_at, revision, color) = row?;
             let status = PersonStatus::parse(&status).unwrap_or(PersonStatus::Deleted);
+            let color = parse_color_preference(color)?;
             let samples = load_sample_views(&conn, &person_id, active_space)?;
             let needs_reenrollment = samples.iter().all(|s| s.needs_reenrollment)
                 || samples.is_empty()
@@ -161,6 +183,7 @@ impl VoiceIdStore {
             .optional()?
             .ok_or_else(|| VoiceIdStoreError::NotFound(person_id.as_str().to_string()))?;
         let status = PersonStatus::parse(&row.2).unwrap_or(PersonStatus::Deleted);
+        let color_preference = parse_color_preference(row.6)?;
         if status == PersonStatus::Deleted {
             return Err(VoiceIdStoreError::NotFound(person_id.as_str().to_string()));
         }
@@ -175,7 +198,7 @@ impl VoiceIdStore {
             revision: row.5,
             sample_count: samples.len(),
             needs_reenrollment,
-            color_preference: row.6,
+            color_preference,
             samples,
         })
     }
@@ -188,6 +211,11 @@ impl VoiceIdStore {
         color_preference: Option<String>,
     ) -> Result<PersonView, VoiceIdStoreError> {
         let display_name = normalize_name(display_name.into())?;
+        let color_preference = normalize_color_preference(color_preference)?;
+        let samples = samples
+            .into_iter()
+            .map(normalize_new_sample_input)
+            .collect::<Result<Vec<_>, _>>()?;
         if samples.is_empty() {
             return Err(VoiceIdStoreError::Migration(
                 "enrollment requires at least one accepted sample".into(),
@@ -204,7 +232,7 @@ impl VoiceIdStore {
                     person_id.as_str(),
                     display_name,
                     now,
-                    color_preference
+                    color_preference.map(VoiceIdColor::as_str)
                 ],
             )?;
             for sample in &samples {
@@ -224,6 +252,7 @@ impl VoiceIdStore {
         consent: ConsentRecord,
         sample: NewSampleInput,
     ) -> Result<PersonView, VoiceIdStoreError> {
+        let sample = normalize_new_sample_input(sample)?;
         let conn = self.connection()?;
         let space = sample.space.clone();
         immediate_transaction(&conn, || {
@@ -256,7 +285,32 @@ impl VoiceIdStore {
         display_name: impl Into<String>,
         expected_revision: Option<u64>,
     ) -> Result<PersonView, VoiceIdStoreError> {
-        let display_name = normalize_name(display_name.into())?;
+        self.update_person_metadata(
+            person_id,
+            expected_revision,
+            PersonMetadataUpdate {
+                display_name: Some(display_name.into()),
+                color_preference: None,
+            },
+        )
+    }
+
+    /// Atomically update editable person metadata under the owning person's
+    /// revision. Every successful call advances both revisions exactly once.
+    pub fn update_person_metadata(
+        &self,
+        person_id: &PersonId,
+        expected_revision: Option<u64>,
+        update: PersonMetadataUpdate,
+    ) -> Result<PersonView, VoiceIdStoreError> {
+        if update.display_name.is_none() && update.color_preference.is_none() {
+            return Err(VoiceIdStoreError::EmptyPersonMetadataUpdate);
+        }
+        let display_name = update.display_name.map(normalize_name).transpose()?;
+        let color_preference = update
+            .color_preference
+            .map(normalize_color_preference)
+            .transpose()?;
         let conn = self.connection()?;
         immediate_transaction(&conn, || {
             let (status, revision) = person_status_revision(&conn, person_id)?;
@@ -273,14 +327,80 @@ impl VoiceIdStore {
                 });
             }
             let now = timestamp_now();
-            conn.execute(
-                "UPDATE persons SET display_name = ?1, updated_at = ?2, revision = revision + 1 WHERE person_id = ?3",
-                params![display_name, now, person_id.as_str()],
-            )?;
+            match (display_name.as_deref(), color_preference.as_ref()) {
+                (Some(display_name), Some(color_preference)) => {
+                    conn.execute(
+                        "UPDATE persons SET display_name = ?1, color_preference = ?2, updated_at = ?3, revision = revision + 1 WHERE person_id = ?4",
+                        params![display_name, color_preference.map(VoiceIdColor::as_str), now, person_id.as_str()],
+                    )?;
+                }
+                (Some(display_name), None) => {
+                    conn.execute(
+                        "UPDATE persons SET display_name = ?1, updated_at = ?2, revision = revision + 1 WHERE person_id = ?3",
+                        params![display_name, now, person_id.as_str()],
+                    )?;
+                }
+                (None, Some(color_preference)) => {
+                    conn.execute(
+                        "UPDATE persons SET color_preference = ?1, updated_at = ?2, revision = revision + 1 WHERE person_id = ?3",
+                        params![color_preference.map(VoiceIdColor::as_str), now, person_id.as_str()],
+                    )?;
+                }
+                (None, None) => unreachable!("empty updates are rejected before the transaction"),
+            }
             bump_global_revision(&conn)?;
             Ok(())
         })?;
         self.get_person(person_id, None)
+    }
+
+    /// Update only the presentation label stored in the sample's capture
+    /// context. Embeddings, quality records, and prototypes are immutable.
+    pub fn rename_sample(
+        &self,
+        sample_id: &SampleId,
+        sample_label: impl Into<String>,
+        expected_person_revision: Option<u64>,
+    ) -> Result<PersonView, VoiceIdStoreError> {
+        let sample_label = normalize_sample_label(sample_label.into())?;
+        let conn = self.connection()?;
+        let person_id = immediate_transaction(&conn, || {
+            let (person_id_raw, context_json) = conn
+                .query_row(
+                    "SELECT person_id, context_json FROM enrollment_samples WHERE sample_id = ?1",
+                    params![sample_id.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| VoiceIdStoreError::SampleNotFound(sample_id.as_str().to_string()))?;
+            let person_id = PersonId::parse(person_id_raw)?;
+            let (status, revision) = person_status_revision(&conn, &person_id)?;
+            if status == PersonStatus::Deleted {
+                return Err(VoiceIdStoreError::NotFound(person_id.as_str().to_string()));
+            }
+            if let Some(expected) = expected_person_revision
+                && expected != revision
+            {
+                return Err(VoiceIdStoreError::RevisionConflict {
+                    id: person_id.as_str().to_string(),
+                    expected,
+                    found: revision,
+                });
+            }
+            let mut capture_context: CaptureContext = serde_json::from_str(&context_json)
+                .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
+            capture_context.sample_label = Some(sample_label.clone());
+            let context_json = serde_json::to_string(&capture_context)
+                .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
+            conn.execute(
+                "UPDATE enrollment_samples SET context_json = ?1 WHERE sample_id = ?2",
+                params![context_json, sample_id.as_str()],
+            )?;
+            touch_person(&conn, &person_id, &timestamp_now())?;
+            bump_global_revision(&conn)?;
+            Ok(person_id)
+        })?;
+        self.get_person(&person_id, None)
     }
 
     pub fn delete_sample(
@@ -1067,7 +1187,7 @@ fn import_person_graph_on_conn(
             person.created_at,
             person.updated_at,
             person.revision as i64,
-            person.color_preference,
+            person.color_preference.map(VoiceIdColor::as_str),
         ],
     )?;
     for (sample, embedding) in samples {
@@ -1193,12 +1313,61 @@ fn blob_to_embedding(blob: &[u8], dim: usize) -> Result<SpeakerEmbedding, VoiceI
 }
 
 fn normalize_name(name: String) -> Result<String, VoiceIdStoreError> {
-    let trimmed = name.trim().to_string();
+    normalize_label(name, "display name", VoiceIdStoreError::EmptyName)
+}
+
+fn normalize_sample_label(label: String) -> Result<String, VoiceIdStoreError> {
+    normalize_label(label, "sample label", VoiceIdStoreError::EmptySampleLabel)
+}
+
+fn normalize_label(
+    value: String,
+    field: &'static str,
+    empty_error: VoiceIdStoreError,
+) -> Result<String, VoiceIdStoreError> {
+    let trimmed = value.trim().to_string();
     if trimmed.is_empty() {
-        Err(VoiceIdStoreError::EmptyName)
-    } else {
-        Ok(trimmed)
+        return Err(empty_error);
     }
+    let got = trimmed.chars().count();
+    if got > VOICE_ID_LABEL_MAX_CHARS {
+        return Err(VoiceIdStoreError::LabelTooLong {
+            field,
+            max: VOICE_ID_LABEL_MAX_CHARS,
+            got,
+        });
+    }
+    Ok(trimmed)
+}
+
+fn normalize_color_preference(
+    color_preference: Option<String>,
+) -> Result<Option<VoiceIdColor>, VoiceIdStoreError> {
+    color_preference
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            VoiceIdColor::parse(&normalized).ok_or(VoiceIdStoreError::InvalidColorPreference(value))
+        })
+        .transpose()
+}
+
+fn parse_color_preference(
+    color_preference: Option<String>,
+) -> Result<Option<VoiceIdColor>, VoiceIdStoreError> {
+    color_preference
+        .map(|value| {
+            VoiceIdColor::parse(&value).ok_or(VoiceIdStoreError::InvalidColorPreference(value))
+        })
+        .transpose()
+}
+
+fn normalize_new_sample_input(
+    mut sample: NewSampleInput,
+) -> Result<NewSampleInput, VoiceIdStoreError> {
+    if let Some(sample_label) = sample.capture_context.sample_label.take() {
+        sample.capture_context.sample_label = Some(normalize_sample_label(sample_label)?);
+    }
+    Ok(sample)
 }
 
 pub fn timestamp_now() -> String {
@@ -1381,6 +1550,252 @@ mod tests {
         assert!(matches!(
             conflict,
             Err(VoiceIdStoreError::RevisionConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn person_metadata_update_is_atomic_validated_and_persistent() {
+        let dir = tempdir().unwrap();
+        let store = VoiceIdStore::open(dir.path());
+        let space = test_space("sha256:person-metadata");
+        let person = store
+            .enroll_person(
+                "Alice",
+                consent(),
+                vec![sample_input(&space, vec![1.0, 0.0])],
+                Some("blue".into()),
+            )
+            .unwrap();
+        assert_eq!(person.revision, 1);
+        assert_eq!(person.color_preference, Some(VoiceIdColor::Blue));
+
+        let color_only = store
+            .update_person_metadata(
+                &PersonId::parse(&person.person_id).unwrap(),
+                Some(person.revision),
+                PersonMetadataUpdate {
+                    display_name: None,
+                    color_preference: Some(Some(" purple ".into())),
+                },
+            )
+            .unwrap();
+        assert_eq!(color_only.display_name, "Alice");
+        assert_eq!(color_only.color_preference, Some(VoiceIdColor::Purple));
+        assert_eq!(color_only.revision, 2);
+        assert_eq!(
+            store.migration_state("global_revision").unwrap().as_deref(),
+            Some("2")
+        );
+
+        let name_only = store
+            .update_person_metadata(
+                &PersonId::parse(&person.person_id).unwrap(),
+                Some(color_only.revision),
+                PersonMetadataUpdate {
+                    display_name: Some(" Alicia ".into()),
+                    color_preference: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(name_only.display_name, "Alicia");
+        assert_eq!(name_only.color_preference, Some(VoiceIdColor::Purple));
+        assert_eq!(name_only.revision, 3);
+
+        let both = store
+            .update_person_metadata(
+                &PersonId::parse(&person.person_id).unwrap(),
+                Some(name_only.revision),
+                PersonMetadataUpdate {
+                    display_name: Some("Alice Example".into()),
+                    color_preference: Some(Some("green".into())),
+                },
+            )
+            .unwrap();
+        assert_eq!(both.display_name, "Alice Example");
+        assert_eq!(both.color_preference, Some(VoiceIdColor::Green));
+        assert_eq!(both.revision, 4);
+        assert_eq!(
+            store.migration_state("global_revision").unwrap().as_deref(),
+            Some("4")
+        );
+
+        let reopened = VoiceIdStore::open(dir.path());
+        let persisted = reopened
+            .get_person(&PersonId::parse(&person.person_id).unwrap(), None)
+            .unwrap();
+        assert_eq!(persisted.display_name, "Alice Example");
+        assert_eq!(persisted.color_preference, Some(VoiceIdColor::Green));
+        assert_eq!(persisted.revision, 4);
+
+        assert!(matches!(
+            store.update_person_metadata(
+                &PersonId::parse(&person.person_id).unwrap(),
+                Some(4),
+                PersonMetadataUpdate::default(),
+            ),
+            Err(VoiceIdStoreError::EmptyPersonMetadataUpdate)
+        ));
+        assert!(matches!(
+            store.update_person_metadata(
+                &PersonId::parse(&person.person_id).unwrap(),
+                Some(4),
+                PersonMetadataUpdate {
+                    display_name: None,
+                    color_preference: Some(Some("#123456".into())),
+                },
+            ),
+            Err(VoiceIdStoreError::InvalidColorPreference(_))
+        ));
+        assert!(matches!(
+            store.update_person_metadata(
+                &PersonId::parse(&person.person_id).unwrap(),
+                Some(4),
+                PersonMetadataUpdate {
+                    display_name: Some("   ".into()),
+                    color_preference: None,
+                },
+            ),
+            Err(VoiceIdStoreError::EmptyName)
+        ));
+        assert!(matches!(
+            store.update_person_metadata(
+                &PersonId::parse(&person.person_id).unwrap(),
+                Some(3),
+                PersonMetadataUpdate {
+                    display_name: Some("Stale".into()),
+                    color_preference: None,
+                },
+            ),
+            Err(VoiceIdStoreError::RevisionConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn sample_label_update_preserves_biometric_data_and_persists() {
+        let dir = tempdir().unwrap();
+        let store = VoiceIdStore::open(dir.path());
+        let space = test_space("sha256:sample-label");
+        let person = store
+            .enroll_person(
+                "Alice",
+                consent(),
+                vec![sample_input(&space, vec![1.0, 0.0])],
+                None,
+            )
+            .unwrap();
+        let sample = &person.samples[0];
+        let sample_id = SampleId::parse(&sample.sample_id).unwrap();
+        let before_quality = sample.quality.clone();
+        let conn = store.connection().unwrap();
+        let before_embedding: String = conn
+            .query_row(
+                "SELECT hex(embedding_blob) FROM sample_embeddings WHERE sample_id = ?1",
+                params![sample_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let before_prototype: String = conn
+            .query_row(
+                "SELECT hex(medoid_blob) FROM prototypes WHERE person_id = ?1",
+                params![person.person_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let renamed = store
+            .rename_sample(&sample_id, "  Meeting room  ", Some(person.revision))
+            .unwrap();
+        assert_eq!(renamed.revision, 2);
+        assert_eq!(
+            renamed.samples[0].sample_label.as_deref(),
+            Some("Meeting room")
+        );
+        assert_eq!(
+            renamed.samples[0].capture_context.sample_label.as_deref(),
+            Some("Meeting room")
+        );
+        assert_eq!(renamed.samples[0].quality, before_quality);
+        assert_eq!(
+            store.migration_state("global_revision").unwrap().as_deref(),
+            Some("2")
+        );
+
+        let after_embedding: String = conn
+            .query_row(
+                "SELECT hex(embedding_blob) FROM sample_embeddings WHERE sample_id = ?1",
+                params![sample_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let after_prototype: String = conn
+            .query_row(
+                "SELECT hex(medoid_blob) FROM prototypes WHERE person_id = ?1",
+                params![person.person_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_embedding, before_embedding);
+        assert_eq!(after_prototype, before_prototype);
+
+        let reopened = VoiceIdStore::open(dir.path());
+        let persisted = reopened
+            .get_person(&PersonId::parse(&person.person_id).unwrap(), None)
+            .unwrap();
+        assert_eq!(
+            persisted.samples[0].sample_label.as_deref(),
+            Some("Meeting room")
+        );
+        assert!(matches!(
+            store.rename_sample(&sample_id, "   ", Some(2)),
+            Err(VoiceIdStoreError::EmptySampleLabel)
+        ));
+        assert!(matches!(
+            store.rename_sample(&sample_id, "Stale", Some(1)),
+            Err(VoiceIdStoreError::RevisionConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn enrollment_preserves_client_sample_labels_and_validates_shared_limit() {
+        let dir = tempdir().unwrap();
+        let store = VoiceIdStore::open(dir.path());
+        let space = test_space("sha256:initial-labels");
+        let mut first = sample_input(&space, vec![1.0, 0.0]);
+        first.capture_context.sample_label = Some("  First take  ".into());
+        let mut second = sample_input(&space, vec![0.0, 1.0]);
+        second.capture_context.sample_label = Some("Second take".into());
+        let person = store
+            .enroll_person("Alice", consent(), vec![first, second], None)
+            .unwrap();
+        assert_eq!(
+            person.samples[0].sample_label.as_deref(),
+            Some("First take")
+        );
+        assert_eq!(
+            person.samples[1].sample_label.as_deref(),
+            Some("Second take")
+        );
+
+        let mut too_long = sample_input(&space, vec![1.0, 0.0]);
+        too_long.capture_context.sample_label = Some("x".repeat(VOICE_ID_LABEL_MAX_CHARS + 1));
+        assert!(matches!(
+            store.enroll_person("Alice", consent(), vec![too_long], None),
+            Err(VoiceIdStoreError::LabelTooLong {
+                field: "sample label",
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.enroll_person(
+                "x".repeat(VOICE_ID_LABEL_MAX_CHARS + 1),
+                consent(),
+                vec![sample_input(&space, vec![1.0, 0.0])],
+                None
+            ),
+            Err(VoiceIdStoreError::LabelTooLong {
+                field: "display name",
+                ..
+            })
         ));
     }
 

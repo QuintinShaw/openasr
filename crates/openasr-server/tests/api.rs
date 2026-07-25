@@ -2398,6 +2398,232 @@ async fn voice_id_rename_revision_conflict_returns_409() {
     );
 }
 
+#[tokio::test]
+async fn voice_id_person_patch_supports_atomic_name_and_color_edits() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    write_voiceprint_store(&home);
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/voice-id/persons")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list_body = to_bytes(list.into_body(), 1024 * 64).await.unwrap();
+    let list_json: Value = serde_json::from_slice(&list_body).unwrap();
+    let person_id = list_json["data"][0]["person_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let revision = list_json["data"][0]["revision"].as_u64().unwrap();
+
+    let color_only = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/persons/{person_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, format!("\"{revision}\""))
+                .body(Body::from(r#"{"color_preference":"purple"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(color_only.status(), StatusCode::OK);
+    assert_eq!(color_only.headers().get(header::ETAG).unwrap(), "\"2\"");
+    let color_body = to_bytes(color_only.into_body(), 1024 * 64).await.unwrap();
+    let color_json: Value = serde_json::from_slice(&color_body).unwrap();
+    assert_eq!(color_json["display_name"], "Alice");
+    assert_eq!(color_json["color_preference"], "purple");
+    assert_eq!(color_json["revision"], 2);
+
+    let name_only = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/persons/{person_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, "\"2\"")
+                .body(Body::from(r#"{"display_name":"Alicia"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(name_only.status(), StatusCode::OK);
+    let name_body = to_bytes(name_only.into_body(), 1024 * 64).await.unwrap();
+    let name_json: Value = serde_json::from_slice(&name_body).unwrap();
+    assert_eq!(name_json["display_name"], "Alicia");
+    assert_eq!(name_json["color_preference"], "purple");
+    assert_eq!(name_json["revision"], 3);
+
+    let both = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/persons/{person_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, "\"3\"")
+                .body(Body::from(
+                    r#"{"display_name":"Alice Example","color_preference":"green"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(both.status(), StatusCode::OK);
+    assert_eq!(both.headers().get(header::ETAG).unwrap(), "\"4\"");
+    let both_body = to_bytes(both.into_body(), 1024 * 64).await.unwrap();
+    let both_json: Value = serde_json::from_slice(&both_body).unwrap();
+    assert_eq!(both_json["display_name"], "Alice Example");
+    assert_eq!(both_json["color_preference"], "green");
+    assert_eq!(both_json["revision"], 4);
+    assert!(both_json["samples"].is_array());
+
+    for body in [
+        r#"{}"#,
+        r##"{"color_preference":"#12ab34"}"##,
+        r#"{"display_name":"   "}"#,
+    ] {
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/v1/voice-id/persons/{person_id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::IF_MATCH, "\"4\"")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let stale = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/persons/{person_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, "\"3\"")
+                .body(Body::from(r#"{"display_name":"Stale"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn voice_id_sample_patch_updates_only_label_with_owner_etag() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    write_voiceprint_store(&home);
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/voice-id/persons")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list_body = to_bytes(list.into_body(), 1024 * 64).await.unwrap();
+    let list_json: Value = serde_json::from_slice(&list_body).unwrap();
+    let person = &list_json["data"][0];
+    let revision = person["revision"].as_u64().unwrap();
+    let sample_id = person["samples"][0]["sample_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let quality = person["samples"][0]["quality"].clone();
+
+    let renamed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/samples/{sample_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, format!("\"{revision}\""))
+                .body(Body::from(r#"{"sample_label":"Desk microphone"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed.status(), StatusCode::OK);
+    assert_eq!(renamed.headers().get(header::ETAG).unwrap(), "\"2\"");
+    let renamed_body = to_bytes(renamed.into_body(), 1024 * 64).await.unwrap();
+    let renamed_json: Value = serde_json::from_slice(&renamed_body).unwrap();
+    assert_eq!(renamed_json["revision"], 2);
+    assert_eq!(
+        renamed_json["samples"][0]["sample_label"],
+        "Desk microphone"
+    );
+    assert_eq!(
+        renamed_json["samples"][0]["capture_context"]["sample_label"],
+        "Desk microphone"
+    );
+    assert_eq!(renamed_json["samples"][0]["quality"], quality);
+    assert!(renamed_json["samples"].is_array());
+
+    let blank = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/samples/{sample_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, "\"2\"")
+                .body(Body::from(r#"{"sample_label":"  "}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
+
+    let stale = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/samples/{sample_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, format!("\"{revision}\""))
+                .body(Body::from(r#"{"sample_label":"Stale"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+}
+
 #[test]
 fn native_server_runtime_with_no_model_pack_is_accepted_at_startup_validation() {
     // A native backend with no model pack bound (a fresh install with zero

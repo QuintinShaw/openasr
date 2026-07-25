@@ -21,7 +21,7 @@ pub use backend::{
 pub use domain::{
     CandidateScope, CaptureContext, ConsentRecord, EnrollmentSample, Person, PersonMatch,
     PersonPrototype, PersonStatus, PersonView, PrototypeMember, SampleEmbedding, SampleQuality,
-    SampleView, VoiceIdAssignment,
+    SampleView, VOICE_ID_LABEL_MAX_CHARS, VoiceIdAssignment, VoiceIdColor,
 };
 pub use ids::{IdError, PERSON_ID_PREFIX, PersonId, PrototypeId, SAMPLE_ID_PREFIX, SampleId};
 pub use matcher::{MatcherPerson, PersonMatcher};
@@ -43,6 +43,6 @@ pub use space::{
     REDIMNET_FRONTEND_VERSION,
 };
 pub use store::{
-    NewSampleInput, VOICE_ID_DB_ENV, VOICE_ID_SCHEMA_VERSION, VoiceIdStore, VoiceIdStoreError,
-    timestamp_now,
+    NewSampleInput, PersonMetadataUpdate, VOICE_ID_DB_ENV, VOICE_ID_SCHEMA_VERSION, VoiceIdStore,
+    VoiceIdStoreError, timestamp_now,
 };
