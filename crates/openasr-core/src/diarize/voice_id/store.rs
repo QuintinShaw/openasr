@@ -968,14 +968,14 @@ fn migrate_v2_to_v3_on_conn(conn: &Connection) -> rusqlite::Result<()> {
             )?;
         }
     }
-    #[cfg(test)]
-    if fail_migration_after_v2_step() {
-        return Err(rusqlite::Error::InvalidQuery);
-    }
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS enrollment_samples_person_ordinal_idx
          ON enrollment_samples(person_id, sample_ordinal)",
     )?;
+    #[cfg(test)]
+    if fail_migration_after_v2_step() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     Ok(())
 }
 
