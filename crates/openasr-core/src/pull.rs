@@ -639,12 +639,16 @@ fn admit_model_content_into_root(
     source_path: &Path,
     root: &Path,
 ) -> Result<content_store::AdmittedContent, PullError> {
-    content_store::admit_file(source_path, root, preflight_model_pack_for_install).map_err(
-        |error| match error {
-            content_store::ContentStoreError::Preflight(error) => *error,
-            other => PullError::ContentStore(other),
-        },
-    )
+    ensure_safe_directory_under_root(root, root)?;
+    ensure_safe_directory_under_root(root, &root.join("staging"))?;
+    ensure_safe_directory_under_root(root, &content_store::objects_root(root))?;
+    content_store::admit_file(source_path, root, |lease| {
+        preflight_model_pack_for_install(lease.path())
+    })
+    .map_err(|error| match error {
+        content_store::ContentStoreError::Preflight(error) => *error,
+        other => PullError::ContentStore(other),
+    })
 }
 
 fn install_model_pack_from_path_with_target(
@@ -696,6 +700,10 @@ fn install_admitted_model_pack(
     // visible, and evict it after -- a memory-reclaim step only: the new
     // object's content id misses every content-addressed cache on its own.
     let previous_pack_content_id = existing_pack_content_id_for_eviction(&paths.final_path);
+    // Keep the descriptor that was hashed and preflighted alive until its
+    // durable logical reference is visible; do not switch validation authority
+    // back to a display path during commit.
+    let _validated_lease = admitted.into_lease();
     let pack = write_installed_record(target, &paths)?;
     if let Some(old_content_id) = previous_pack_content_id {
         evict_resident_runtime_caches_for_content_id(&old_content_id);
@@ -894,6 +902,7 @@ pub fn list_installed_packs(home: impl AsRef<Path>) -> Result<Vec<InstalledPack>
     let home = home.as_ref();
     let root = models_root(home);
     let refs = root.join("refs");
+    ensure_safe_directory_under_root(&root, &refs)?;
     let mut packs = Vec::new();
     if let Ok(model_dirs) = fs::read_dir(&refs) {
         for model_dir in model_dirs {
@@ -901,6 +910,7 @@ pub fn list_installed_packs(home: impl AsRef<Path>) -> Result<Vec<InstalledPack>
                 path: refs.clone(),
                 source,
             })?;
+            reject_symlink(&model_dir.path())?;
             let Ok(entries) = fs::read_dir(model_dir.path()) else {
                 continue;
             };
@@ -909,6 +919,7 @@ pub fn list_installed_packs(home: impl AsRef<Path>) -> Result<Vec<InstalledPack>
                     path: model_dir.path(),
                     source,
                 })?;
+                reject_symlink(&entry.path())?;
                 let path = entry.path();
                 if path.extension().and_then(|value| value.to_str()) != Some("json") {
                     continue;
@@ -985,6 +996,26 @@ fn migrate_legacy_installed_records(
             if !installed_pack_matches_quant_dir(&legacy, &quant_dir.path()) {
                 continue;
             }
+            // A durable ref is the migration commit point. If a process died
+            // after publishing it but before removing the legacy record, never
+            // re-admit mutable legacy bytes: finish cleanup only.
+            let ref_path = root
+                .join("refs")
+                .join(&legacy.model_id)
+                .join(format!("{}.json", legacy.quant));
+            if ref_path.is_file() {
+                match fs::remove_file(&metadata_path) {
+                    Ok(()) => atomic_file::sync_parent_dir_best_effort(&metadata_path),
+                    Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(PullError::Io {
+                            path: metadata_path.clone(),
+                            source,
+                        });
+                    }
+                }
+                continue;
+            }
             let admitted = admit_model_content(&legacy.path, home)?;
             let mut target = PullTarget {
                 model_id: legacy.model_id.clone(),
@@ -1003,6 +1034,19 @@ fn migrate_legacy_installed_records(
             ensure_storage_dir_within_root(home, &paths)?;
             let _lock = PullLock::acquire(&paths.lock_path)?;
             let migrated = write_installed_record(&target, &paths)?;
+            // Ref publication is durable before legacy authority is revoked.
+            // If this removal is interrupted, the branch above recognizes the
+            // ref as committed and only completes removal on the next startup.
+            match fs::remove_file(&metadata_path) {
+                Ok(()) => atomic_file::sync_parent_dir_best_effort(&metadata_path),
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(PullError::Io {
+                        path: metadata_path.clone(),
+                        source,
+                    });
+                }
+            }
             packs.retain(|pack| pack.pull != migrated.pull);
             packs.push(migrated);
             target.sha256.clear();
@@ -1096,6 +1140,9 @@ pub fn remove_model_pack(
         .join("refs")
         .join(&pack.model_id)
         .join(format!("{}.json", pack.quant));
+    let ref_parent = ref_path.parent().expect("ref has parent");
+    ensure_safe_directory_under_root(&root, ref_parent)?;
+    reject_symlink(&ref_path)?;
     match fs::remove_file(&ref_path) {
         Ok(()) => {}
         Err(source) if source.kind() == io::ErrorKind::NotFound => {}
@@ -1110,7 +1157,7 @@ pub fn remove_model_pack(
     let still_referenced = list_installed_packs_without_gc(home)?
         .iter()
         .any(|candidate| candidate.sha256 == pack.sha256);
-    content_store::remove_object_if_unreferenced(&root, &pack.sha256, still_referenced);
+    content_store::remove_object_if_unreferenced(&root, &pack.sha256, still_referenced)?;
     let legacy_quant_dir = root.join(&pack.model_id).join(&pack.quant);
     let _ = fs::remove_dir(&legacy_quant_dir);
     let _ = fs::remove_dir(legacy_quant_dir.parent().expect("legacy quant has parent"));
@@ -1123,6 +1170,7 @@ pub fn remove_model_pack(
 fn list_installed_packs_without_gc(home: &Path) -> Result<Vec<InstalledPack>, PullError> {
     let root = models_root(home);
     let refs = root.join("refs");
+    ensure_safe_directory_under_root(&root, &refs)?;
     let mut packs = Vec::new();
     let Ok(model_dirs) = fs::read_dir(&refs) else {
         return Ok(packs);
@@ -1132,6 +1180,7 @@ fn list_installed_packs_without_gc(home: &Path) -> Result<Vec<InstalledPack>, Pu
             path: refs.clone(),
             source,
         })?;
+        reject_symlink(&model_dir.path())?;
         let Ok(entries) = fs::read_dir(model_dir.path()) else {
             continue;
         };
@@ -1140,6 +1189,7 @@ fn list_installed_packs_without_gc(home: &Path) -> Result<Vec<InstalledPack>, Pu
                 path: model_dir.path(),
                 source,
             })?;
+            reject_symlink(&entry.path())?;
             let path = entry.path();
             let Ok(contents) = fs::read_to_string(&path) else {
                 continue;
@@ -2861,21 +2911,67 @@ fn ensure_storage_dir_within_root(home: &Path, paths: &PullPaths) -> Result<(), 
         legacy_model_dir.as_path(),
         legacy_quant_dir.as_path(),
         paths.dir.as_path(),
-        paths.partial_path.parent().unwrap(),
-        paths.installed_meta_path.parent().unwrap(),
-        paths.lock_path.parent().unwrap(),
-        paths.final_path.parent().unwrap(),
+        paths.partial_path.parent().expect("partial has parent"),
+        paths.installed_meta_path.parent().expect("ref has parent"),
+        paths.lock_path.parent().expect("lock has parent"),
+        paths.final_path.parent().expect("object has parent"),
     ] {
-        reject_symlink(path)?;
-        fs::create_dir_all(path).map_err(|source| PullError::CreateDir {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        reject_symlink(path)?;
+        ensure_safe_directory_under_root(&root, path)?;
     }
     Ok(())
 }
 
+/// Create and walk storage one component at a time. A leaf-only symlink check
+/// is not sufficient: `refs`, `objects`, or a model ancestor can be swapped for
+/// a link after its child path is derived. Each existing component is rejected
+/// when it is a symlink, and each canonicalized component must remain beneath
+/// the canonical storage root.
+fn ensure_safe_directory_under_root(root: &Path, path: &Path) -> Result<(), PullError> {
+    if !path.starts_with(root) {
+        return Err(PullError::UnsafeStoragePath {
+            path: path.to_path_buf(),
+        });
+    }
+    fs::create_dir_all(root).map_err(|source| PullError::CreateDir {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    reject_symlink(root)?;
+    let canonical_root = fs::canonicalize(root).map_err(|source| PullError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| PullError::UnsafeStoragePath {
+            path: path.to_path_buf(),
+        })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(PullError::UnsafeStoragePath {
+                path: path.to_path_buf(),
+            });
+        };
+        current.push(component);
+        if current.exists() {
+            reject_symlink(&current)?;
+        } else {
+            fs::create_dir(&current).map_err(|source| PullError::CreateDir {
+                path: current.clone(),
+                source,
+            })?;
+        }
+        let canonical = fs::canonicalize(&current).map_err(|source| PullError::Io {
+            path: current.clone(),
+            source,
+        })?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(PullError::UnsafeStoragePath { path: current });
+        }
+    }
+    Ok(())
+}
 fn models_root_for_paths(paths: &PullPaths) -> PathBuf {
     paths
         .final_path

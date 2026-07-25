@@ -2044,32 +2044,32 @@ fn list_installed_packs_ignores_truncated_pack_with_record() {
 }
 
 #[test]
-fn pull_overwrites_truncated_pack_with_installed_record() {
+fn pull_rejects_truncated_immutable_object_without_replacing_it() {
     let bytes = tiny_pack_bytes();
     let resolved = resolved_for(&bytes);
     let temp = tempfile::tempdir().unwrap();
     let target = PullTarget::from_resolved(&resolved).unwrap();
     let paths = pull_paths(temp.path(), &target).unwrap();
     ensure_storage_dir_within_root(temp.path(), &paths).unwrap();
-    fs::write(&paths.final_path, &bytes[..bytes.len() - 1]).unwrap();
+    let corrupt = bytes[..bytes.len() - 1].to_vec();
+    fs::write(&paths.final_path, &corrupt).unwrap();
     write_installed_record(&target, &paths).unwrap();
     let mut client = FakeClient::with_responses(vec![ResponseSpec {
         status: 200,
-        body: bytes.clone(),
+        body: bytes,
     }]);
 
-    let installed = pull_model_pack_with_client(
+    let error = pull_model_pack_with_client(
         &resolved,
         temp.path(),
         &mut client,
         PullOptions::default(),
         |_| {},
     )
-    .unwrap();
+    .unwrap_err();
 
-    assert_eq!(client.ranges(), vec![None]);
-    assert_eq!(fs::read(installed.path).unwrap(), bytes);
-    assert_eq!(list_installed_packs(temp.path()).unwrap().len(), 1);
+    assert!(matches!(error, PullError::ContentStore(_)));
+    assert_eq!(fs::read(&paths.final_path).unwrap(), corrupt);
 }
 
 /// `config.json`'s `models_dir` field must be the single thing that decides
