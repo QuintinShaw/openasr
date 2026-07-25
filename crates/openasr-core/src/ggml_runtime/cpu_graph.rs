@@ -10,7 +10,7 @@ use std::{
     marker::PhantomData,
     path::Path,
     ptr::{self, NonNull},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -897,8 +897,12 @@ pub enum GgmlCpuGraphError {
     /// recognized by the native dispatch rewrite path.
     #[error("ggml graph compute aborted by cancel request")]
     Aborted,
+    #[error("ggml graph session was poisoned by an incomplete compute and must be rebuilt")]
+    GraphSessionPoisoned,
     #[error("ggml cpu graph backend scheduler initialization failed")]
     BackendSchedulerInitFailed,
+    #[error("ggml backend returned an invalid graph cancellation mode: mode={mode}")]
+    GraphCancellationContractFailed { mode: i32 },
     #[error("ggml cpu graph backend scheduler graph allocation failed")]
     BackendSchedulerGraphAllocationFailed,
     #[error("ggml cpu graph tensor index out of bounds: index={index}, len={len}")]
@@ -1109,6 +1113,11 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     frozen: bool,
     prepared_graph: Option<NonNull<c_void>>,
     side_effect_roots: Vec<NonNull<c_void>>,
+    /// A failed graph may already have committed `cpy`/`set_rows` nodes into
+    /// resident model state. Never execute or upload through that graph again:
+    /// its owner must drop it and rebuild a fresh session. Backend handles are
+    /// deliberately unaffected because they do not own those model tensors.
+    poisoned_after_failed_compute: bool,
     _runner_borrow: PhantomData<&'a mut GgmlCpuGraphRunner>,
 }
 
@@ -1128,6 +1137,14 @@ pub(crate) struct GgmlPersistentGraphSession {
 impl GgmlPersistentGraphSession {
     pub(crate) fn builder(&mut self) -> &mut GgmlCpuGraphBuilder<'static> {
         &mut self.builder
+    }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.builder.is_poisoned()
+    }
+
+    pub(crate) fn mark_poisoned_after_failed_compute(&mut self) {
+        self.builder.mark_poisoned_after_failed_compute();
     }
 }
 
@@ -1257,6 +1274,7 @@ impl GgmlCpuGraphRunner {
             frozen: false,
             prepared_graph: None,
             side_effect_roots: Vec::new(),
+            poisoned_after_failed_compute: false,
             _runner_borrow: PhantomData,
         }
     }
@@ -1317,6 +1335,7 @@ impl GgmlCpuGraphRunner {
             frozen: false,
             prepared_graph: None,
             side_effect_roots: Vec::new(),
+            poisoned_after_failed_compute: false,
             _runner_borrow: PhantomData,
         };
         Ok(GgmlPersistentGraphSession {
@@ -3990,6 +4009,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         &mut self,
         outputs: &[GgmlCpuTensor<'a>],
     ) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
         if self.prepared_graph.is_some() {
             return Ok(());
         }
@@ -4009,6 +4029,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     }
 
     pub(crate) fn prepare_side_effects_for_upload(&mut self) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
         if self.prepared_graph.is_some() {
             return Ok(());
         }
@@ -4037,6 +4058,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     /// a persistent graph must become the active allocation again before its
     /// next compute.
     pub(crate) fn restore_prepared_graph_allocation(&mut self) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
         let (Some(scheduler), Some(graph)) = (self.scheduler, self.prepared_graph) else {
             return Ok(());
         };
@@ -4138,6 +4160,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         &mut self,
         outputs: &[(GgmlCpuTensor<'a>, usize)],
     ) -> Result<Vec<Vec<f32>>, GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
         if outputs.is_empty() {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "at least one output tensor is required",
@@ -4173,17 +4196,13 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             self.build_forward_graph(&output_tensors)?
         };
 
-        let status = unsafe {
-            if let Some(scheduler) = self.scheduler {
-                if !graph_prepared {
-                    ffi::ggml_backend_sched_reset(scheduler.as_ptr());
-                }
-                ffi::ggml_backend_sched_graph_compute(scheduler.as_ptr(), graph.as_ptr())
-            } else {
-                ffi::ggml_backend_graph_compute(self.backend.as_ptr(), graph.as_ptr())
-            }
-        };
-        map_compute_status(status)?;
+        if let Some(scheduler) = self.scheduler
+            && !graph_prepared
+        {
+            unsafe { ffi::ggml_backend_sched_reset(scheduler.as_ptr()) };
+        }
+        let compute = compute_graph_with_current_job_cancel(self.backend, self.scheduler, graph);
+        self.finish_compute_result(compute)?;
 
         let mut results = Vec::with_capacity(outputs.len());
         for ((output, expected_len), output_nbytes) in outputs.iter().zip(output_nbytes) {
@@ -4206,6 +4225,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         f32_outputs: &[(GgmlCpuTensor<'a>, usize)],
         i32_outputs: &[(GgmlCpuTensor<'a>, usize)],
     ) -> Result<(Vec<Vec<f32>>, Vec<Vec<i32>>), GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
         if f32_outputs.is_empty() && i32_outputs.is_empty() {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "at least one output tensor is required",
@@ -4267,17 +4287,13 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             self.build_forward_graph(&output_tensors)?
         };
 
-        let status = unsafe {
-            if let Some(scheduler) = self.scheduler {
-                if !graph_prepared {
-                    ffi::ggml_backend_sched_reset(scheduler.as_ptr());
-                }
-                ffi::ggml_backend_sched_graph_compute(scheduler.as_ptr(), graph.as_ptr())
-            } else {
-                ffi::ggml_backend_graph_compute(self.backend.as_ptr(), graph.as_ptr())
-            }
-        };
-        map_compute_status(status)?;
+        if let Some(scheduler) = self.scheduler
+            && !graph_prepared
+        {
+            unsafe { ffi::ggml_backend_sched_reset(scheduler.as_ptr()) };
+        }
+        let compute = compute_graph_with_current_job_cancel(self.backend, self.scheduler, graph);
+        self.finish_compute_result(compute)?;
 
         let mut f32_results = Vec::with_capacity(f32_outputs.len());
         for ((output, expected_len), output_nbytes) in f32_outputs.iter().zip(f32_output_nbytes) {
@@ -4311,6 +4327,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     }
 
     pub(crate) fn compute_side_effects(&mut self) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
         if self.side_effect_roots.is_empty() {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "at least one side-effect root is required",
@@ -4324,17 +4341,13 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             self.build_forward_graph(&[])?
         };
 
-        let status = unsafe {
-            if let Some(scheduler) = self.scheduler {
-                if !graph_prepared {
-                    ffi::ggml_backend_sched_reset(scheduler.as_ptr());
-                }
-                ffi::ggml_backend_sched_graph_compute(scheduler.as_ptr(), graph.as_ptr())
-            } else {
-                ffi::ggml_backend_graph_compute(self.backend.as_ptr(), graph.as_ptr())
-            }
-        };
-        map_compute_status(status)?;
+        if let Some(scheduler) = self.scheduler
+            && !graph_prepared
+        {
+            unsafe { ffi::ggml_backend_sched_reset(scheduler.as_ptr()) };
+        }
+        let compute = compute_graph_with_current_job_cancel(self.backend, self.scheduler, graph);
+        self.finish_compute_result(compute)?;
         Ok(())
     }
 
@@ -4343,6 +4356,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         output: GgmlCpuTensor<'a>,
         expected_len: usize,
     ) -> Result<Vec<i32>, GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
         self.ensure_tensor_type(output, ffi::GGML_TYPE_I32, "compute_output_i32 output")?;
         let expected_nbytes = expected_len.checked_mul(I32_WIDTH_BYTES).ok_or(
             GgmlCpuGraphError::UnsupportedInputs {
@@ -4370,17 +4384,13 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             graph
         };
 
-        let status = unsafe {
-            if let Some(scheduler) = self.scheduler {
-                if !graph_prepared {
-                    ffi::ggml_backend_sched_reset(scheduler.as_ptr());
-                }
-                ffi::ggml_backend_sched_graph_compute(scheduler.as_ptr(), graph.as_ptr())
-            } else {
-                ffi::ggml_backend_graph_compute(self.backend.as_ptr(), graph.as_ptr())
-            }
-        };
-        map_compute_status(status)?;
+        if let Some(scheduler) = self.scheduler
+            && !graph_prepared
+        {
+            unsafe { ffi::ggml_backend_sched_reset(scheduler.as_ptr()) };
+        }
+        let compute = compute_graph_with_current_job_cancel(self.backend, self.scheduler, graph);
+        self.finish_compute_result(compute)?;
 
         let mut values = vec![0_i32; expected_len];
         unsafe {
@@ -4395,6 +4405,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     }
 
     fn ensure_backend_buffer(&mut self) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
         if self.frozen {
             return Ok(());
         }
@@ -4408,6 +4419,39 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         let buffer = GgmlBackendBufferGuard::allocate(self.context, self.backend)?;
         self.buffer = Some(buffer);
         Ok(())
+    }
+
+    fn ensure_not_poisoned(&self) -> Result<(), GgmlCpuGraphError> {
+        if self.poisoned_after_failed_compute {
+            Err(GgmlCpuGraphError::GraphSessionPoisoned)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn finish_compute_result(
+        &mut self,
+        result: Result<c_int, GgmlCpuGraphError>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        match result {
+            Ok(status) if status == ffi::GGML_STATUS_SUCCESS => Ok(()),
+            Ok(status) => {
+                self.poisoned_after_failed_compute = true;
+                map_compute_status(status)
+            }
+            Err(error) => {
+                self.poisoned_after_failed_compute = true;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned_after_failed_compute
+    }
+
+    pub(crate) fn mark_poisoned_after_failed_compute(&mut self) {
+        self.poisoned_after_failed_compute = true;
     }
 
     fn build_forward_graph(
@@ -4435,6 +4479,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     }
 
     fn ensure_can_extend_graph(&self, step: &'static str) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
         if self.frozen {
             return Err(GgmlCpuGraphError::GraphFrozenAfterAllocation { step });
         }
@@ -5292,6 +5337,56 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+/// Compute one graph under the current job's cancel flag. The cloned Arc owns
+/// the callback data for exactly this synchronous FFI call; neither the shared
+/// backend layer nor a cached backend retains the raw pointer after return.
+fn compute_graph_with_current_job_cancel(
+    backend: NonNull<c_void>,
+    scheduler: Option<NonNull<c_void>>,
+    graph: NonNull<c_void>,
+) -> Result<c_int, GgmlCpuGraphError> {
+    let Some(flag) = super::thread_job_cancel_flag() else {
+        return Ok(unsafe {
+            scheduler.map_or_else(
+                || ffi::ggml_backend_graph_compute(backend.as_ptr(), graph.as_ptr()),
+                |scheduler| {
+                    ffi::ggml_backend_sched_graph_compute(scheduler.as_ptr(), graph.as_ptr())
+                },
+            )
+        });
+    };
+
+    let mut mode = ffi::GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+    let callback = Some(openasr_ggml_abort_trampoline as unsafe extern "C" fn(*mut c_void) -> bool);
+    let data = Arc::as_ptr(&flag) as *mut c_void;
+    let status = unsafe {
+        if let Some(scheduler) = scheduler {
+            ffi::ggml_backend_sched_graph_compute_with_abort(
+                scheduler.as_ptr(),
+                graph.as_ptr(),
+                callback,
+                data,
+                &mut mode,
+            )
+        } else {
+            ffi::ggml_backend_graph_compute_with_abort(
+                backend.as_ptr(),
+                graph.as_ptr(),
+                callback,
+                data,
+                &mut mode,
+            )
+        }
+    };
+    if !matches!(
+        mode,
+        ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE | ffi::GGML_BACKEND_GRAPH_CANCEL_SEGMENTED
+    ) {
+        return Err(GgmlCpuGraphError::GraphCancellationContractFailed { mode });
+    }
+    Ok(status)
+}
+
 impl GgmlBackendGuard {
     fn cpu() -> Result<Self, GgmlCpuGraphError> {
         // Registry path, not ggml_backend_cpu_init: under GGML_BACKEND_DL the CPU
@@ -5302,9 +5397,6 @@ impl GgmlBackendGuard {
             ffi::ggml_backend_init_by_type(ffi::GGML_BACKEND_DEVICE_TYPE_CPU, std::ptr::null())
         };
         let raw = NonNull::new(raw).ok_or(GgmlCpuGraphError::CpuBackendUnavailable)?;
-        // Arm abort_callback only when this thread has a job cancel flag; otherwise
-        // clear it so the no-control path stays bit-identical to pre-L2.
-        arm_backend_abort_callback(raw);
         Ok(Self {
             raw,
             free_on_drop: true,
@@ -5349,25 +5441,20 @@ impl GgmlBackendGuard {
     /// `init` on first use. The cached entry owns the backend for the thread's
     /// lifetime; handed-out guards never free it (`free_on_drop=false`).
     ///
-    /// Abort callback is re-armed (or cleared) on every handout from this
-    /// thread's current per-job cancel flag. Install/Drop of the transcription
-    /// control guard also bulk-rearms the whole cache so a pooled worker never
-    /// keeps a previous job's data pointer across jobs.
+    /// The cached object retains no job pointer between compute calls. The
+    /// compute-scoped cancellation API carries the current job's flag on the
+    /// call stack, so reuse cannot inherit another job's cancellation.
     fn cached_backend(
         key: CachedBackendKey,
         init: impl FnOnce() -> Result<NonNull<c_void>, GgmlCpuGraphError>,
     ) -> Result<Self, GgmlCpuGraphError> {
         if let Some(raw) = Self::cached_backend_lookup(&key) {
-            // Re-arm or clear on handout so a backend created under a prior job
-            // (or none) matches the active job's cancel state before compute.
-            arm_backend_abort_callback(raw);
             return Ok(Self {
                 raw,
                 free_on_drop: false,
             });
         }
         let raw = init()?;
-        arm_backend_abort_callback(raw);
         Self::cached_backend_insert(key, raw);
         Ok(Self {
             raw,
@@ -5410,7 +5497,6 @@ impl GgmlBackendGuard {
             let route = candidate.to_resolved_route();
             let key = CachedBackendKey::Route(route.cache_key());
             if let Some(raw) = Self::cached_backend_lookup(&key) {
-                arm_backend_abort_callback(raw);
                 return Ok(Self {
                     raw,
                     free_on_drop: false,
@@ -5418,7 +5504,6 @@ impl GgmlBackendGuard {
             }
             match Self::init_route_gpu_device(&devices, &route) {
                 Ok(raw) => {
-                    arm_backend_abort_callback(raw);
                     Self::cached_backend_insert(key, raw);
                     return Ok(Self {
                         raw,
@@ -5453,7 +5538,6 @@ impl GgmlBackendGuard {
                 raw,
                 free_on_drop: true,
             };
-            arm_backend_abort_callback(backend.raw);
             if let Some(n_threads) = n_threads {
                 let _ = backend.set_n_threads_if_supported(n_threads);
             }
@@ -5568,91 +5652,12 @@ fn map_compute_status(status: c_int) -> Result<(), GgmlCpuGraphError> {
 }
 
 /// ggml abort_callback trampoline. `data` is `Arc::as_ptr` of the job's cancel
-/// [`AtomicBool`] (never null when installed -- see [`arm_backend_abort_callback`]).
+/// [`AtomicBool`] (never null for a compute-scoped cancellation call).
 /// Wait-free load; pause is intentionally ignored (pause stays L0 slice-boundary
 /// only). Body is panic-free (null-check + `AtomicBool::load`); no `catch_unwind`
 /// on the per-node CPU hot path.
 unsafe extern "C" fn openasr_ggml_abort_trampoline(data: *mut c_void) -> bool {
     super::cancel_flag_requested_from_data(data)
-}
-
-/// Arm or clear this backend's abort_callback from the thread's current job
-/// cancel flag.
-///
-/// - **Flag armed** (`thread_job_cancel_flag_data` non-null): install the
-///   trampoline with that pointer as callback data so ggml worker threads
-///   observe cancel wait-free.
-/// - **No control / disarmed** (null data): install a **null callback**. The
-///   no-control CLI/test path must stay bit-identical to pre-L2 (no per-node
-///   abort poll). Always-on trampolines that return false are not free and are
-///   not the no-control contract.
-fn arm_backend_abort_callback(backend: NonNull<c_void>) {
-    let data = super::thread_job_cancel_flag_data();
-    if data.is_null() {
-        backend_set_abort_callback(backend, None, std::ptr::null_mut());
-    } else {
-        backend_set_abort_callback(backend, Some(openasr_ggml_abort_trampoline), data);
-    }
-}
-
-/// Re-arm every backend cached on this worker thread with the current per-job
-/// cancel callback (or clear the callback after disarm). Called from
-/// transcription-control install/Drop so pooled threads never leave a previous
-/// job's data pointer installed on long-lived Metal/GPU cache entries.
-pub(crate) fn arm_thread_local_backends_abort_callback() {
-    THREAD_BACKEND_CACHE_BY_KIND.with(|cache| {
-        for cached in cache.borrow().values() {
-            arm_backend_abort_callback(cached.raw);
-        }
-    });
-}
-
-/// Install an abort_callback on `backend` via the registry proc-address table
-/// (`"ggml_backend_set_abort_callback"`) -- the same pattern as
-/// [`backend_set_n_threads`], required under `GGML_BACKEND_DL`. Missing proc is a
-/// silent no-op (discrete GPU vendors typically have none today).
-///
-/// On macOS, falls back to the direct `ggml_backend_metal_set_abort_callback`
-/// symbol when the registry proc is absent: Metal does not register the proc
-/// today. Production Metal mid-graph abort remains ineffective upstream; the
-/// callback is still installed so flag=false graphs stay SUCCESS and a future
-/// Metal ABORTED path maps correctly.
-fn backend_set_abort_callback(
-    backend: NonNull<c_void>,
-    cb: ffi::GgmlAbortCallback,
-    data: *mut c_void,
-) {
-    type SetAbortCallbackFn =
-        unsafe extern "C" fn(ffi::GgmlBackendRaw, ffi::GgmlAbortCallback, *mut c_void);
-    unsafe {
-        let device = ffi::ggml_backend_get_device(backend.as_ptr());
-        if !device.is_null() {
-            let reg = ffi::ggml_backend_dev_backend_reg(device);
-            if !reg.is_null() {
-                let proc = ffi::ggml_backend_reg_get_proc_address(
-                    reg,
-                    c"ggml_backend_set_abort_callback".as_ptr(),
-                );
-                if !proc.is_null() {
-                    let set_fn: SetAbortCallbackFn = std::mem::transmute(proc);
-                    set_fn(backend.as_ptr(), cb, data);
-                    return;
-                }
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // Metal fallback: direct symbol (not registered on Metal's proc table).
-            // Must gate on is_metal -- the C entry point GGML_ASSERTs otherwise.
-            if ffi::ggml_backend_is_metal(backend.as_ptr()) {
-                ffi::ggml_backend_metal_set_abort_callback(backend.as_ptr(), cb, data);
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (cb, data);
-        }
-    }
 }
 
 /// Set a backend's thread count via the registry proc-address table — the only
@@ -6104,20 +6109,25 @@ mod tests {
     }
 
     #[test]
-    fn cpu_backend_no_control_path_clears_abort_callback() {
-        // No control installed => abort data is null => arm must clear the
-        // callback (bit-identical to pre-L2), not install a always-false stub.
+    fn cpu_backend_no_control_path_uses_original_compute() {
+        // No control installed => production calls the original graph-compute
+        // API and never publishes callback data.
         assert!(
             crate::ggml_runtime::thread_job_cancel_flag_data().is_null(),
             "no-control path must keep abort data null"
         );
-        let backend = super::GgmlBackendGuard::cpu().expect("cpu backend");
-        super::arm_backend_abort_callback(backend.raw);
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner");
+        assert_eq!(
+            runner
+                .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+                .expect("callback-free compute"),
+            vec![4.0, 6.0]
+        );
         assert!(
             !crate::ggml_runtime::cancel_flag_requested_from_data(std::ptr::null_mut()),
             "null abort data must never request cancel"
         );
-        let _ = backend;
     }
 
     #[test]
@@ -6146,6 +6156,87 @@ mod tests {
         assert!(unsafe { super::openasr_ggml_abort_trampoline(data_b) });
     }
 
+    struct AbortAfterPolls {
+        polls: std::sync::atomic::AtomicUsize,
+        abort_after: usize,
+    }
+
+    unsafe extern "C" fn abort_after_polls(data: *mut std::ffi::c_void) -> bool {
+        // SAFETY: tests keep the probe alive for the synchronous FFI call.
+        let probe = unsafe { &*(data as *const AbortAfterPolls) };
+        probe
+            .polls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+            >= probe.abort_after
+    }
+
+    fn compute_add_chain_with_callback(
+        config: GgmlCpuGraphConfig,
+        node_count: usize,
+        callback: ffi::GgmlAbortCallback,
+        data: *mut std::ffi::c_void,
+    ) -> (i32, i32, Option<f32>) {
+        let mut runner = GgmlCpuGraphRunner::new(config).expect("graph runner");
+        let mut builder = runner.start_graph();
+        let input = builder.new_tensor_1d_f32(1, "input").expect("input");
+        let increment = builder
+            .new_tensor_1d_f32(1, "increment")
+            .expect("increment");
+        builder.set_input(input).expect("input flag");
+        builder.set_input(increment).expect("increment flag");
+        let mut output = input;
+        for _ in 0..node_count {
+            output = builder.add(output, increment).expect("add node");
+        }
+        builder.set_output(output).expect("output flag");
+        builder
+            .set_f32_slice(input, &[0.0], "input")
+            .expect("input upload");
+        builder
+            .set_f32_slice(increment, &[1.0], "increment")
+            .expect("increment upload");
+        builder.ensure_backend_buffer().expect("backend allocation");
+        let graph = builder
+            .build_forward_graph(&[output])
+            .expect("forward graph");
+        let mut mode = ffi::GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+        let status = unsafe {
+            if let Some(scheduler) = builder.scheduler {
+                ffi::ggml_backend_sched_graph_compute_with_abort(
+                    scheduler.as_ptr(),
+                    graph.as_ptr(),
+                    callback,
+                    data,
+                    &mut mode,
+                )
+            } else {
+                ffi::ggml_backend_graph_compute_with_abort(
+                    builder.backend.as_ptr(),
+                    graph.as_ptr(),
+                    callback,
+                    data,
+                    &mut mode,
+                )
+            }
+        };
+        let output = if status == ffi::GGML_STATUS_SUCCESS {
+            let mut value = 0.0_f32;
+            unsafe {
+                ffi::ggml_backend_tensor_get(
+                    output.raw.as_ptr(),
+                    (&mut value as *mut f32).cast(),
+                    0,
+                    std::mem::size_of::<f32>(),
+                );
+            }
+            Some(value)
+        } else {
+            None
+        };
+        (mode, status, output)
+    }
+
     #[test]
     fn graph_compute_with_cancel_flag_false_stays_finite() {
         use std::sync::Arc;
@@ -6156,7 +6247,7 @@ mod tests {
         // not been canceled; regressions here surface as non-finite logits.
         let flag = Arc::new(AtomicBool::new(false));
         let previous = crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&flag)));
-        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
             .expect("cpu graph runner should initialize");
         let output = runner
             .compute_add_f32(&[1.0, 2.5, -3.0, 8.0], &[4.0, -0.5, 7.0, 1.25])
@@ -6171,7 +6262,106 @@ mod tests {
             "compute must not flip the cancel flag"
         );
         assert!(crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&flag, previous));
-        crate::ggml_runtime::arm_thread_local_backends_abort_callback();
+    }
+
+    #[test]
+    fn cpu_compute_scoped_cancel_reports_native_mode() {
+        let probe = AbortAfterPolls {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            abort_after: usize::MAX,
+        };
+        let (mode, status, output) = compute_add_chain_with_callback(
+            GgmlCpuGraphConfig::conservative_default(),
+            4,
+            Some(abort_after_polls),
+            (&probe as *const AbortAfterPolls).cast_mut().cast(),
+        );
+        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
+        assert_eq!(output, Some(4.0));
+    }
+
+    #[test]
+    fn native_abort_can_commit_a_side_effect_before_poisoning_the_session() {
+        use std::sync::atomic::Ordering;
+
+        let config = GgmlCpuGraphConfig::conservative_default();
+        let mut runner = GgmlCpuGraphRunner::new(config).expect("cpu graph runner");
+        let mut session = runner
+            .start_persistent_graph_session(config.context_bytes)
+            .expect("persistent session");
+        let (target, graph_ptr, backend) = {
+            let graph = session.builder();
+            let source = graph.new_tensor_1d_f32(1, "source").expect("source");
+            let target = graph.new_tensor_1d_f32(1, "target").expect("target");
+            let increment = graph.new_tensor_1d_f32(1, "increment").expect("increment");
+            graph.set_input(source).expect("source input");
+            graph.set_input(increment).expect("increment input");
+            let write = graph.cpy(source, target).expect("side-effect copy");
+            graph.add_side_effect_root(write).expect("side-effect root");
+            let mut output = increment;
+            for _ in 0..8 {
+                output = graph.add(output, increment).expect("add node");
+            }
+            graph.set_output(output).expect("output root");
+            graph
+                .prepare_outputs_for_upload(&[output])
+                .expect("prepare graph");
+            graph
+                .set_f32_slice(source, &[7.0], "source")
+                .expect("source upload");
+            graph
+                .set_f32_slice(target, &[0.0], "target")
+                .expect("target upload");
+            graph
+                .set_f32_slice(increment, &[1.0], "increment")
+                .expect("increment upload");
+            (
+                target,
+                graph.prepared_graph.expect("prepared graph"),
+                graph.backend,
+            )
+        };
+
+        // Shared precheck is poll 1. CPU executes the first graph node (the
+        // side-effect copy), then its native per-node callback observes poll 2
+        // and aborts before the remaining independent add chain completes.
+        let probe = AbortAfterPolls {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            abort_after: 2,
+        };
+        let mut mode = ffi::GGML_BACKEND_GRAPH_CANCEL_DISABLED;
+        let status = unsafe {
+            ffi::ggml_backend_graph_compute_with_abort(
+                backend.as_ptr(),
+                graph_ptr.as_ptr(),
+                Some(abort_after_polls),
+                (&probe as *const AbortAfterPolls).cast_mut().cast(),
+                &mut mode,
+            )
+        };
+        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_NATIVE);
+        assert_eq!(status, ffi::GGML_STATUS_ABORTED);
+        assert_eq!(probe.polls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            session.builder().finish_compute_result(Ok(status)),
+            Err(GgmlCpuGraphError::Aborted)
+        ));
+        assert!(session.is_poisoned());
+
+        let mut committed = 0.0_f32;
+        unsafe {
+            ffi::ggml_backend_tensor_get(
+                target.raw.as_ptr(),
+                (&mut committed as *mut f32).cast(),
+                0,
+                std::mem::size_of::<f32>(),
+            );
+        }
+        assert_eq!(
+            committed, 7.0,
+            "the first side effect committed before abort"
+        );
     }
 
     #[test]
@@ -6183,7 +6373,7 @@ mod tests {
         // SUCCESS with garbage tensors and not a bare ComputeFailed.
         let flag = Arc::new(AtomicBool::new(true));
         let previous = crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&flag)));
-        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
             .expect("cpu graph runner should initialize");
         let err = runner
             .compute_add_f32(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0])
@@ -6193,7 +6383,300 @@ mod tests {
             "cancel=true must map to Aborted, got {err:?}"
         );
         assert!(crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&flag, previous));
-        crate::ggml_runtime::arm_thread_local_backends_abort_callback();
+    }
+
+    #[test]
+    fn scheduler_graph_compute_with_cancel_flag_true_returns_aborted() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let flag = Arc::new(AtomicBool::new(true));
+        let previous = crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&flag)));
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig {
+            use_scheduler: true,
+            ..GgmlCpuGraphConfig::conservative_default()
+        })
+        .expect("scheduler graph runner should initialize");
+        let err = runner
+            .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+            .expect_err("scheduler cancel=true must fail closed");
+        assert!(matches!(err, GgmlCpuGraphError::Aborted), "got {err:?}");
+        assert!(crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&flag, previous));
+    }
+
+    #[test]
+    fn aborted_persistent_graph_is_poisoned_until_owner_rebuilds_it() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let config = GgmlCpuGraphConfig::conservative_default();
+        let mut runner = GgmlCpuGraphRunner::new(config).expect("cpu graph runner");
+        let mut session = runner
+            .start_persistent_graph_session(config.context_bytes)
+            .expect("persistent session");
+        let (input, output) = {
+            let graph = session.builder();
+            let input = graph
+                .new_tensor_1d_f32(1, "persistent_input")
+                .expect("input");
+            let one = graph.new_tensor_1d_f32(1, "persistent_one").expect("one");
+            graph.set_input(input).expect("input flag");
+            graph.set_input(one).expect("one flag");
+            let output = graph.add(input, one).expect("add");
+            graph.set_output(output).expect("output flag");
+            graph
+                .prepare_outputs_for_upload(&[output])
+                .expect("prepare graph");
+            graph
+                .set_f32_slice(input, &[2.0], "persistent_input")
+                .expect("input upload");
+            graph
+                .set_f32_slice(one, &[1.0], "persistent_one")
+                .expect("one upload");
+            (input, output)
+        };
+
+        let canceled = Arc::new(AtomicBool::new(true));
+        let previous = crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&canceled)));
+        let error = session
+            .builder()
+            .compute_output_f32(output, 1)
+            .expect_err("cancel must abort persistent compute");
+        assert!(matches!(error, GgmlCpuGraphError::Aborted));
+        assert!(session.is_poisoned());
+        assert!(crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&canceled, previous));
+
+        // The old graph cannot accept another input or silently execute with
+        // potentially partial resident state after cancellation.
+        assert!(matches!(
+            session
+                .builder()
+                .set_f32_slice(input, &[3.0], "persistent_input"),
+            Err(GgmlCpuGraphError::GraphSessionPoisoned)
+        ));
+        assert!(matches!(
+            session.builder().compute_output_f32(output, 1),
+            Err(GgmlCpuGraphError::GraphSessionPoisoned)
+        ));
+
+        // Dropping the poisoned session and rebuilding is the reset contract;
+        // the backend handle itself remains reusable and computes normally.
+        drop(session);
+        let mut rebuilt = runner
+            .start_persistent_graph_session(config.context_bytes)
+            .expect("rebuilt persistent session");
+        let rebuilt_output = {
+            let graph = rebuilt.builder();
+            let lhs = graph.new_tensor_1d_f32(1, "rebuilt_lhs").expect("lhs");
+            let rhs = graph.new_tensor_1d_f32(1, "rebuilt_rhs").expect("rhs");
+            graph.set_input(lhs).expect("lhs flag");
+            graph.set_input(rhs).expect("rhs flag");
+            let output = graph.add(lhs, rhs).expect("add");
+            graph.set_output(output).expect("output flag");
+            graph
+                .prepare_outputs_for_upload(&[output])
+                .expect("prepare rebuilt graph");
+            graph
+                .set_f32_slice(lhs, &[2.0], "rebuilt_lhs")
+                .expect("lhs upload");
+            graph
+                .set_f32_slice(rhs, &[3.0], "rebuilt_rhs")
+                .expect("rhs upload");
+            graph
+                .compute_output_f32(output, 1)
+                .expect("rebuilt compute")
+        };
+        assert_eq!(rebuilt_output, vec![5.0]);
+    }
+
+    #[test]
+    fn cancellation_contract_error_also_poisons_persistent_graph() {
+        let config = GgmlCpuGraphConfig::conservative_default();
+        let mut runner = GgmlCpuGraphRunner::new(config).expect("cpu graph runner");
+        let mut session = runner
+            .start_persistent_graph_session(config.context_bytes)
+            .expect("persistent session");
+        let error = session
+            .builder()
+            .finish_compute_result(Err(GgmlCpuGraphError::GraphCancellationContractFailed {
+                mode: 99,
+            }))
+            .expect_err("compute helper errors must poison persistent state");
+        assert!(matches!(
+            error,
+            GgmlCpuGraphError::GraphCancellationContractFailed { mode: 99 }
+        ));
+        assert!(session.is_poisoned());
+    }
+
+    #[test]
+    fn parallel_graph_jobs_keep_cancel_isolated() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Barrier};
+
+        let barrier = Arc::new(Barrier::new(3));
+        let run = |canceled: bool, barrier: Arc<Barrier>| {
+            std::thread::spawn(move || {
+                let flag = Arc::new(AtomicBool::new(canceled));
+                let previous =
+                    crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&flag)));
+                let mut runner =
+                    GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+                        .expect("cpu graph runner");
+                barrier.wait();
+                let result = runner.compute_add_f32(&[1.0, 2.0], &[3.0, 4.0]);
+                assert!(
+                    crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&flag, previous)
+                );
+                result
+            })
+        };
+        let job_a = run(false, Arc::clone(&barrier));
+        let job_b = run(true, Arc::clone(&barrier));
+        barrier.wait();
+        assert_eq!(
+            job_a.join().expect("job A").expect("job A success"),
+            vec![4.0, 6.0]
+        );
+        assert!(matches!(
+            job_b.join().expect("job B"),
+            Err(GgmlCpuGraphError::Aborted)
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_graph_compute_with_cancel_flag_true_returns_aborted() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let flag = Arc::new(AtomicBool::new(true));
+        let previous = crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&flag)));
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig {
+            backend: GgmlCpuGraphBackend::Metal,
+            use_scheduler: false,
+            ..GgmlCpuGraphConfig::default()
+        })
+        .expect("metal graph runner should initialize");
+        let err = runner
+            .compute_add_f32(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0])
+            .expect_err("cancel=true must abort Metal graph compute");
+        assert!(
+            matches!(err, GgmlCpuGraphError::Aborted),
+            "Metal cancel=true must map to Aborted, got {err:?}"
+        );
+        assert!(crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&flag, previous));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_cancel_flips_at_a_mid_graph_checkpoint() {
+        use std::sync::atomic::Ordering;
+
+        let probe = AbortAfterPolls {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            abort_after: 2,
+        };
+        let (mode, status, output) = compute_add_chain_with_callback(
+            GgmlCpuGraphConfig {
+                backend: GgmlCpuGraphBackend::Metal,
+                use_scheduler: false,
+                ..GgmlCpuGraphConfig::default()
+            },
+            96,
+            Some(abort_after_polls),
+            (&probe as *const AbortAfterPolls).cast_mut().cast(),
+        );
+        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+        assert_eq!(status, ffi::GGML_STATUS_ABORTED);
+        assert_eq!(output, None);
+        assert_eq!(probe.polls.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_scheduler_cancel_flips_at_a_mid_graph_checkpoint() {
+        use std::sync::atomic::Ordering;
+
+        let probe = AbortAfterPolls {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            // Scheduler pre-allocation, post-allocation, split entry,
+            // post-input phase, and backend pre-start are polls 1..=5. Poll 6
+            // is after the first synchronized 32-node Metal graph view.
+            abort_after: 6,
+        };
+        let (mode, status, output) = compute_add_chain_with_callback(
+            GgmlCpuGraphConfig {
+                backend: GgmlCpuGraphBackend::Metal,
+                use_scheduler: true,
+                ..GgmlCpuGraphConfig::default()
+            },
+            96,
+            Some(abort_after_polls),
+            (&probe as *const AbortAfterPolls).cast_mut().cast(),
+        );
+        assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+        assert_eq!(status, ffi::GGML_STATUS_ABORTED);
+        assert_eq!(output, None);
+        assert_eq!(probe.polls.load(Ordering::SeqCst), 6);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_segmented_cancel_false_completes_all_graph_views() {
+        let probe = AbortAfterPolls {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            abort_after: usize::MAX,
+        };
+        for use_scheduler in [false, true] {
+            let (mode, status, output) = compute_add_chain_with_callback(
+                GgmlCpuGraphConfig {
+                    backend: GgmlCpuGraphBackend::Metal,
+                    use_scheduler,
+                    ..GgmlCpuGraphConfig::default()
+                },
+                96,
+                Some(abort_after_polls),
+                (&probe as *const AbortAfterPolls).cast_mut().cast(),
+            );
+            assert_eq!(mode, ffi::GGML_BACKEND_GRAPH_CANCEL_SEGMENTED);
+            assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
+            assert_eq!(output, Some(96.0));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cached_metal_backend_clears_cancel_between_jobs() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let config = GgmlCpuGraphConfig {
+            backend: GgmlCpuGraphBackend::Metal,
+            use_scheduler: false,
+            ..GgmlCpuGraphConfig::default()
+        };
+        let canceled = Arc::new(AtomicBool::new(true));
+        let previous = crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&canceled)));
+        let mut first = GgmlCpuGraphRunner::new(config).expect("first Metal runner");
+        let cached_backend = first.backend.raw;
+        assert!(matches!(
+            first.compute_add_f32(&[1.0], &[2.0]),
+            Err(GgmlCpuGraphError::Aborted)
+        ));
+        assert!(crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&canceled, previous));
+
+        let mut second = GgmlCpuGraphRunner::new(config).expect("second Metal runner");
+        assert_eq!(
+            second.backend.raw, cached_backend,
+            "Metal backend must be reused"
+        );
+        assert_eq!(
+            second
+                .compute_add_f32(&[3.0], &[4.0])
+                .expect("next job must not inherit sticky cancel"),
+            vec![7.0]
+        );
     }
 
     #[test]

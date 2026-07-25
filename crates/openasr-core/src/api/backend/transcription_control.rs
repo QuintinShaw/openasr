@@ -12,11 +12,11 @@
 //!
 //! ggml's CPU abort_callback may run on a worker-pool thread that does **not**
 //! share that TLS. Cancel therefore also dual-writes a heap
-//! [`Arc`]`<`[`AtomicBool`]`>` per job. On install, this thread's ggml backends
-//! are armed with that atomic as `abort_callback` data (`Arc::as_ptr`); the FFI
-//! trampoline wait-free-loads only that pointer (never a process-wide slot, never
-//! TLS). Parallel server jobs on different worker threads each hold distinct
-//! data pointers, so canceling job B cannot abort job A's CPU graph.
+//! [`Arc`]`<`[`AtomicBool`]`>` per job. Install publishes that flag on the owner
+//! thread; each ggml graph compute clones it and binds `Arc::as_ptr` only for the
+//! FFI call. The trampoline wait-free-loads that pointer (never a process-wide
+//! slot, never TLS). Parallel server jobs therefore hold distinct data pointers,
+//! so canceling job B cannot abort job A's graph.
 //!
 //! Scope is deliberately in-session: the control lives only for one in-flight
 //! transcription. Cross-request or cross-restart resume (which would need
@@ -57,7 +57,7 @@ pub struct TranscriptionControl {
     resumed_or_canceled: Condvar,
     /// Wait-free cancel bit dual-written by [`Self::request_cancel`]. Shared with
     /// the ggml abort_callback trampoline (which cannot use thread-locals) as the
-    /// backend callback `data` pointer armed by
+    /// compute-scoped callback `data` pointer published by
     /// [`install_active_transcription_control`]. Pause never touches this bit.
     cancel_flag: Arc<AtomicBool>,
 }
@@ -72,8 +72,8 @@ impl TranscriptionControl {
     }
 
     /// Request cancellation at the next cooperative checkpoint (slice boundary,
-    /// token step, or ggml CPU graph node). Idempotent. Wakes a paused worker so
-    /// it observes the cancel instead of staying blocked.
+    /// token step, native CPU node, or segmented GPU graph view). Idempotent.
+    /// Wakes a paused worker so it observes the cancel instead of staying blocked.
     pub fn request_cancel(&self) {
         // Atomic first so a concurrent ggml abort_callback poll observes cancel
         // even if it races the mutex write below.
@@ -85,7 +85,7 @@ impl TranscriptionControl {
 
     /// Request a pause at the next slice boundary. Idempotent, and a no-op once
     /// canceled (cancel wins and must not be masked by a late pause). Pause does
-    /// **not** arm the ggml abort_callback -- only cancel does.
+    /// **not** set the atomic observed by the ggml abort_callback.
     pub fn request_pause(&self) {
         let mut state = self.lock();
         if !state.cancel {
@@ -113,7 +113,7 @@ impl TranscriptionControl {
         state.pause && !state.cancel && !self.cancel_flag.load(Ordering::SeqCst)
     }
 
-    /// Heap cancel flag for per-job abort_callback data on this worker's backends.
+    /// Heap cancel flag for compute-scoped per-job abort_callback data.
     pub(crate) fn cancel_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.cancel_flag)
     }
@@ -186,8 +186,8 @@ thread_local! {
 /// RAII guard that binds a [`TranscriptionControl`] to the current thread for the
 /// duration of one native transcription and restores the previous binding on
 /// drop (normal return, early `?`, or panic), so a control never leaks into an
-/// unrelated later run on the same pooled worker thread. Also arms this thread's
-/// ggml backends with the job's cancel atomic as abort_callback data.
+/// unrelated later run on the same pooled worker thread. Graph compute reads
+/// the published job flag and owns the shorter backend callback lifetime.
 #[must_use = "the control binding is cleared when this guard is dropped"]
 pub struct ActiveTranscriptionControlGuard {
     previous: Option<Arc<TranscriptionControl>>,
@@ -200,15 +200,13 @@ impl Drop for ActiveTranscriptionControlGuard {
         CURRENT_TRANSCRIPTION_CONTROL.with(|cell| {
             *cell.borrow_mut() = self.previous.take();
         });
-        // Restore previous job cancel (nested) or clear, then re-arm backends so
-        // cached GPU/Metal entries never keep a dangling data pointer after the
-        // Arc below drops. Order matters: backends first see the restored/null
-        // pointer, then `published_flag` is released when this guard drops fields.
+        // Restore previous job cancel (nested) or clear. Graph compute owns a
+        // scoped Arc clone and the compute API retains no callback data, so
+        // cached runtimes never retain this guard's raw pointer.
         let _ = disarm_thread_job_cancel_flag_if_current(
             &self.published_flag,
             self.previous_job_cancel.take(),
         );
-        crate::ggml_runtime::arm_thread_local_backends_abort_callback();
     }
 }
 
@@ -217,19 +215,15 @@ impl Drop for ActiveTranscriptionControlGuard {
 /// restores the previous binding on drop. Install this at the top of the
 /// synchronous decode (e.g. inside the server's `spawn_blocking` closure).
 ///
-/// Also arms this worker thread's ggml backends with `control`'s cancel atomic
-/// as abort_callback data so ggml's abort_callback (which may run off this
-/// thread) observes the same cancel bit via a wait-free pointer load. Pause is
-/// never written to that atomic -- the abort trampoline only recognizes cancel.
+/// Also publishes `control`'s cancel atomic for compute-scoped callback binding,
+/// so ggml's abort_callback (which may run off this thread) observes the same
+/// cancel bit via a wait-free pointer load. Pause is never written to that
+/// atomic -- the abort trampoline only recognizes cancel.
 pub fn install_active_transcription_control(
     control: Arc<TranscriptionControl>,
 ) -> ActiveTranscriptionControlGuard {
     let published_flag = control.cancel_flag();
     let previous_job_cancel = arm_thread_job_cancel_flag(Some(Arc::clone(&published_flag)));
-    // Re-arm already-cached backends on this pooled worker with this job's flag
-    // pointer. Free-on-drop CPU backends created later pick up the same pointer
-    // at construction via thread_job_cancel_flag_data().
-    crate::ggml_runtime::arm_thread_local_backends_abort_callback();
     let previous = CURRENT_TRANSCRIPTION_CONTROL.with(|cell| cell.replace(Some(control)));
     ActiveTranscriptionControlGuard {
         previous,
@@ -343,7 +337,7 @@ mod tests {
             let data = thread_job_cancel_flag_data();
             assert!(
                 !data.is_null(),
-                "install must arm abort data on this thread"
+                "install must publish abort data on this thread"
             );
             assert!(
                 !cancel_flag_requested_from_data(data),
@@ -354,7 +348,7 @@ mod tests {
             control.request_pause();
             assert!(
                 !cancel_flag_requested_from_data(data),
-                "pause must not arm ggml abort_callback"
+                "pause must not trip ggml abort_callback"
             );
             control.request_cancel();
             assert!(
@@ -363,7 +357,7 @@ mod tests {
             );
             assert!(thread_job_cancel_requested());
         }
-        // After Drop, this thread's abort data is cleared (backends re-armed null).
+        // After Drop, this thread's published abort data is cleared.
         assert!(
             thread_job_cancel_flag_data().is_null(),
             "drop must disarm this thread's abort data"
@@ -376,7 +370,8 @@ mod tests {
     #[test]
     fn no_control_path_leaves_job_cancel_idle() {
         // Bit-identical CLI path: without install_active_transcription_control,
-        // abort callback data is null and backends clear the callback entirely.
+        // no abort callback data is published and callback-free compute uses the
+        // original backend API.
         assert!(thread_job_cancel_flag_data().is_null());
         assert!(!thread_job_cancel_requested());
         let orphan = TranscriptionControl::new();

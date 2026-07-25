@@ -2895,7 +2895,9 @@ pub(crate) fn run_whisper_decoder_reused_incremental_step_ggml_v0(
     let build_start = Instant::now();
     let needs_build = reuse
         .as_ref()
-        .map(|reuse| reuse.max_positions != max_positions || reuse.n_seq != 1)
+        .map(|reuse| {
+            reuse.is_poisoned() || reuse.max_positions != max_positions || reuse.n_seq != 1
+        })
         .unwrap_or(true);
     if needs_build {
         *reuse = Some(build_whisper_decoder_reusable_incremental_graph(
@@ -3118,7 +3120,9 @@ pub(crate) fn run_whisper_decoder_reused_batched_incremental_step_ggml_v0(
     let build_start = Instant::now();
     let needs_build = reuse
         .as_ref()
-        .map(|reuse| reuse.max_positions != max_positions || reuse.n_seq != n_seq)
+        .map(|reuse| {
+            reuse.is_poisoned() || reuse.max_positions != max_positions || reuse.n_seq != n_seq
+        })
         .unwrap_or(true);
     if needs_build {
         *reuse = Some(build_whisper_decoder_reusable_incremental_graph_with_n_seq(

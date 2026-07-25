@@ -2111,7 +2111,10 @@ impl XasrFullEncoderReusableGraph {
         // The prepared cgraph is frozen and the persistent context no longer grows
         // per chunk, so one session that matches the chunk geometry is reused for
         // the entire stream (no rebuild cap).
-        self.frames == frames && self.dim == dim && self.valid_left_context == valid_left_context
+        !self.session.is_poisoned()
+            && self.frames == frames
+            && self.dim == dim
+            && self.valid_left_context == valid_left_context
     }
 
     fn builder(&mut self) -> &mut GgmlCpuGraphBuilder<'static> {

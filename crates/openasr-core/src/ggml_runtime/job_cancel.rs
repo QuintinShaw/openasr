@@ -3,12 +3,13 @@
 //! ggml CPU may invoke abort_callback on a worker-pool thread that does not
 //! share the transcription owner thread's TLS. Cancel is therefore carried as
 //! a heap [`Arc`]`<`[`AtomicBool`]`>` **per job**, and the backend callback's
-//! `data` pointer is set to that atomic (`Arc::as_ptr`) for the duration of the
-//! job on the worker thread that owns the backends.
+//! `data` pointer is set to that atomic (`Arc::as_ptr`) for the duration of each
+//! graph compute on the worker thread that owns the backends.
 //!
 //! There is intentionally **no** process-wide publish slot: server multi-model
-//! parallel jobs each arm their own thread-local backends with their own flag
-//! pointer, so canceling job B cannot make job A's trampoline return true.
+//! parallel jobs each publish their own thread-local flag; a compute-scoped
+//! call binds only that flag to its backend(s), so canceling job B cannot make
+//! job A's trampoline return true.
 //!
 //! Lives under `ggml_runtime` (not `api::backend`) so the graph runner can read
 //! it without a crate-internal module cycle.
@@ -20,9 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 thread_local! {
     /// Cancel flag for the transcription currently running on this worker thread.
-    /// Used only to supply `abort_callback` data when backends are created or
-    /// re-armed on this thread. The trampoline itself never reads this TLS -- it
-    /// loads through the `data` pointer installed on the backend.
+    /// Used only to supply `abort_callback` data when graph compute begins on
+    /// this thread. The trampoline itself never reads this TLS -- it loads
+    /// through the `data` pointer passed to the synchronous compute call.
     static ACTIVE_JOB_CANCEL: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
 }
 
@@ -51,16 +52,8 @@ pub(crate) fn disarm_thread_job_cancel_flag_if_current(
     })
 }
 
-/// Raw `abort_callback` data pointer for backends on this thread: `Arc::as_ptr`
-/// of the armed job cancel atomic, or null when no control is installed.
-///
-/// Backend arm paths treat null as "clear the callback entirely" so the CLI /
-/// no-control path stays bit-identical to pre-L2 (no per-node abort poll).
-///
-/// SAFETY for consumers: the pointer remains valid while the corresponding
-/// [`Arc`] is held in this thread's slot and/or by the install guard that armed
-/// it. Callers must re-arm backends to null (or a still-live previous flag)
-/// before the last owning [`Arc`] drops.
+/// Test-only view of the current job flag's raw callback data pointer.
+#[cfg(test)]
 pub(crate) fn thread_job_cancel_flag_data() -> *mut c_void {
     ACTIVE_JOB_CANCEL.with(|cell| {
         cell.borrow()
@@ -70,19 +63,27 @@ pub(crate) fn thread_job_cancel_flag_data() -> *mut c_void {
     })
 }
 
+/// Clone the current job's cancel flag for a graph-compute-scoped backend
+/// call. The caller owns this clone for the whole synchronous FFI call, and the
+/// API retains no callback data, so a cached runner or scheduler cannot keep a
+/// pointer across jobs.
+pub(crate) fn thread_job_cancel_flag() -> Option<Arc<AtomicBool>> {
+    ACTIVE_JOB_CANCEL.with(|cell| cell.borrow().as_ref().map(Arc::clone))
+}
+
 /// Wait-free cancel check used by the ggml abort trampoline.
 ///
-/// `data` is either null (defensive; production installs a null *callback* when
-/// disarmed, so the trampoline is not invoked) or `Arc::as_ptr` of the job's
-/// [`AtomicBool`]. Pause never writes that atomic, so pause cannot trip abort.
+/// `data` is either null (defensive; callback-free production compute never
+/// invokes the trampoline) or `Arc::as_ptr` of the job's [`AtomicBool`]. Pause
+/// never writes that atomic, so pause cannot trip abort.
 /// Panic-free (null check + atomic load) for direct use from `extern "C"`.
 #[inline]
 pub(crate) fn cancel_flag_requested_from_data(data: *mut c_void) -> bool {
     if data.is_null() {
         return false;
     }
-    // SAFETY: install paths only pass Arc::as_ptr of a job AtomicBool kept alive
-    // for the full backend-callback arm window (guard + thread slot).
+    // SAFETY: production passes Arc::as_ptr of a job AtomicBool whose cloned Arc
+    // stays alive for the full synchronous backend-callback call.
     unsafe { (*(data as *const AtomicBool)).load(Ordering::SeqCst) }
 }
 
@@ -126,7 +127,8 @@ mod tests {
         assert!(thread_job_cancel_flag_data().is_null());
         // Stale data pointer would dangle after disarm+drop; only null is safe
         // once the Arc is gone. While `flag` still lives, the old data still
-        // reads true -- backends must be re-armed to null on disarm (cpu_graph).
+        // reads true. Production graph-compute calls retain no callback data, so
+        // no backend can retain this stale pointer after the Arc clone is gone.
         assert!(cancel_flag_requested_from_data(data));
         assert!(!thread_job_cancel_requested());
     }
@@ -150,8 +152,8 @@ mod tests {
 
     #[test]
     fn cancel_job_b_does_not_abort_job_a_via_distinct_data_pointers() {
-        // Structural guarantee: each job's backends hold that job's AtomicBool
-        // pointer as callback data. Cancel B must not make A's trampoline true.
+        // Structural guarantee: each job's compute call carries that job's
+        // AtomicBool pointer. Cancel B must not make A's trampoline true.
         let flag_a = Arc::new(AtomicBool::new(false));
         let flag_b = Arc::new(AtomicBool::new(false));
         let data_a = Arc::as_ptr(&flag_a) as *mut c_void;

@@ -1382,6 +1382,10 @@ impl Seq2SeqReusableDecodeGraph {
     pub(crate) fn builder(&mut self) -> &mut GgmlCpuGraphBuilder<'static> {
         self.session.builder()
     }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.session.is_poisoned()
+    }
 }
 
 /// Build-once/re-run LLM decode graph state. Field order is load-bearing:
@@ -1431,6 +1435,14 @@ impl LlmReusableDecodeGraph {
 
     pub(crate) fn builder(&mut self) -> &mut GgmlCpuGraphBuilder<'static> {
         self.session.builder()
+    }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.session.is_poisoned()
+    }
+
+    pub(crate) fn mark_poisoned_after_failed_compute(&mut self) {
+        self.session.mark_poisoned_after_failed_compute();
     }
 
     pub(crate) fn resident_kv_arena_mut(&mut self) -> &mut LlmResidentKvArena {

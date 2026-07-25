@@ -496,9 +496,10 @@ impl FireRedLlmGgmlExecutor {
         // process-resident allocation on the cached decoder.
         decoder.release_session_scoped_buffers();
         // Return the resident decoder to the cache for the next chunk /
-        // execute() regardless of decode outcome -- its weights + reuse graph
-        // stay valid either way (mirrors qwen's `store_cached_whole_decoder`
-        // call site). `step_executor` is not used again after this point, so
+        // execute() regardless of decode outcome. The release call above has
+        // already discarded graph/KV state poisoned by an incomplete compute;
+        // uploaded weights and the backend handle remain valid. `step_executor`
+        // is not used again after this point, so
         // its `&mut decoder` borrow ends here under NLL and `decoder` (owned
         // locally) is free to move into the cache.
         store_cached_decoder_runtime(decoder_cache_key, unload_generation, decoder);

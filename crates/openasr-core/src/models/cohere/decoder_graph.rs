@@ -1622,7 +1622,8 @@ impl CohereDecoderGraphRuntime {
             .reuse
             .as_ref()
             .map(|reuse| {
-                reuse.max_positions != self.metadata.decoder_max_context
+                reuse.is_poisoned()
+                    || reuse.max_positions != self.metadata.decoder_max_context
                     || reuse.n_seq != 1
                     || self.reuse_cross_frame_count != active_cross_frame_count
             })
@@ -1753,7 +1754,8 @@ impl CohereDecoderGraphRuntime {
             .reuse
             .as_ref()
             .map(|reuse| {
-                reuse.max_positions != self.metadata.decoder_max_context
+                reuse.is_poisoned()
+                    || reuse.max_positions != self.metadata.decoder_max_context
                     || reuse.n_seq != self.n_seq
                     || self.reuse_cross_frame_count != active_cross_frame_count
             })

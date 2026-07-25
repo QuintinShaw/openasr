@@ -155,15 +155,19 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   tags are intentionally not exposed on the API surface yet.
 - Cooperative cancel of an in-flight offline transcription is layered: long-form
   slice boundaries (L0), shared seq2seq greedy token / prefill chunk checks (L1),
-  and a ggml `abort_callback` on graph compute (L2). CPU graphs poll the callback
-  between nodes and can return a typed abort mid-graph. **Apple Metal mid-graph
-  cancel is not effective today**: ggml's production Metal path does not return
-  `GGML_STATUS_ABORTED` outside the capture/gputrace branch, so cancel on Metal
-  lands at the next Rust-level graph boundary (typically the next decode token
-  or encoder/prefill chunk). Discrete GPU backends that lack a
-  `ggml_backend_set_abort_callback` proc are a silent no-op at L2 and likewise
-  rely on L0/L1. Pause still only blocks at slice boundaries; it never arms the
-  ggml abort callback.
+  and a compute-scoped ggml abort contract (L2). CPU uses its native per-node
+  callback. Metal and source-enabled CUDA/HIP/Vulkan/SYCL builds use the shared
+  backend fallback: while cancel is armed, a graph is submitted in at most
+  32-node views, synchronized, then polled. A scheduler reports the weakest mode
+  among all of its backends and applies the same contract to every split, with
+  checks around scheduler input transfers as well, so a missing backend-specific
+  proc is never a silent no-op. One already-entered kernel, event wait, or copy
+  remains non-preemptible; the bound is a graph/scheduler checkpoint, not a
+  wall-clock deadline. A failed persistent compute poisons its model/session
+  graph and forces graph/KV rebuild before reuse; cached backend handles and
+  uploaded immutable weights are retained. See
+  [Graph cancellation contract](design/graph-cancellation.md).
+  Pause still only blocks at slice boundaries and never arms graph cancellation.
 
 ## What works now
 

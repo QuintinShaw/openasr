@@ -84,11 +84,13 @@ pub(crate) const GGML_BACKEND_DEVICE_TYPE_META: c_int = 4;
 
 pub(crate) const GGML_STATUS_SUCCESS: c_int = 0;
 /// Mirrors `enum ggml_status` in ggml.h (`GGML_STATUS_ABORTED = 1`).
-/// Returned by CPU graph compute when the installed abort_callback returns true
-/// between nodes. Metal production graphs currently ignore abort mid-graph
-/// (see docs/KNOWN_LIMITATIONS.md); the status is still mapped so a future
-/// upstream Metal path surfaces as a typed cancel rather than ComputeFailed.
+/// Returned when a native backend poll or a shared segmented-backend checkpoint
+/// observes its installed abort callback. Rust maps this status to the typed
+/// per-job cancellation path rather than a generic compute failure.
 pub(crate) const GGML_STATUS_ABORTED: c_int = 1;
+pub(crate) const GGML_BACKEND_GRAPH_CANCEL_DISABLED: c_int = 0;
+pub(crate) const GGML_BACKEND_GRAPH_CANCEL_NATIVE: c_int = 1;
+pub(crate) const GGML_BACKEND_GRAPH_CANCEL_SEGMENTED: c_int = 2;
 pub(crate) const GGML_BACKEND_BUFFER_USAGE_WEIGHTS: c_int = 1;
 
 /// ggml abort predicate: return true to abort the in-flight graph. Called from
@@ -177,6 +179,13 @@ unsafe extern "C" {
         backend: GgmlBackendRaw,
         cgraph: GgmlCgraphRaw,
     ) -> c_int;
+    pub(crate) fn ggml_backend_graph_compute_with_abort(
+        backend: GgmlBackendRaw,
+        cgraph: GgmlCgraphRaw,
+        abort_callback: GgmlAbortCallback,
+        abort_callback_data: *mut c_void,
+        cancel_mode: *mut c_int,
+    ) -> c_int;
     pub(crate) fn ggml_backend_sched_new(
         backends: *mut GgmlBackendRaw,
         bufts: *mut GgmlBackendBufferTypeRaw,
@@ -194,6 +203,13 @@ unsafe extern "C" {
     pub(crate) fn ggml_backend_sched_graph_compute(
         sched: GgmlBackendSchedRaw,
         cgraph: GgmlCgraphRaw,
+    ) -> c_int;
+    pub(crate) fn ggml_backend_sched_graph_compute_with_abort(
+        sched: GgmlBackendSchedRaw,
+        cgraph: GgmlCgraphRaw,
+        abort_callback: GgmlAbortCallback,
+        abort_callback_data: *mut c_void,
+        cancel_mode: *mut c_int,
     ) -> c_int;
     pub(crate) fn ggml_backend_tensor_set(
         tensor: GgmlTensorRaw,
@@ -286,19 +302,6 @@ unsafe extern "C" {
     pub(crate) fn ggml_backend_blas_init() -> GgmlBackendRaw;
     #[cfg(target_os = "macos")]
     pub(crate) fn ggml_backend_blas_set_n_threads(backend: GgmlBackendRaw, n_threads: c_int);
-    // Metal does not register `ggml_backend_set_abort_callback` on its
-    // get_proc_address table (only CPU does). Fall back to the direct symbol
-    // linked via static ggml-metal on Apple hosts. Mid-graph abort on the
-    // production Metal path is still a no-op upstream; wiring is intentional
-    // so flag=false graphs stay SUCCESS and a future Metal ABORTED path works.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn ggml_backend_is_metal(backend: GgmlBackendRaw) -> bool;
-    #[cfg(target_os = "macos")]
-    pub(crate) fn ggml_backend_metal_set_abort_callback(
-        backend: GgmlBackendRaw,
-        abort_callback: GgmlAbortCallback,
-        user_data: *mut c_void,
-    );
     pub(crate) fn ggml_init(params: GgmlInitParams) -> GgmlContextRaw;
     pub(crate) fn ggml_reset(ctx: GgmlContextRaw);
     pub(crate) fn ggml_free(ctx: GgmlContextRaw);

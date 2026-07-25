@@ -179,6 +179,19 @@ single-request vs batch and file vs realtime must stay expressed as
 parameters/paths through the one shared mechanism, not a forked
 implementation.
 
+All single-job ggml graph execution must use the shared compute-scoped
+cancellation contract described in [graph-cancellation.md](graph-cancellation.md).
+Do not add a model-family-specific backend callback or retain a job's callback
+pointer in a cached runtime. Algorithmic multi-graph boundaries (for example a
+prefill chunk loop) may add earlier typed checks, but do not replace L2 graph
+cancellation. A graph that can write resident KV or other session tensors must
+participate in the shared poison/rebuild contract: any incomplete compute makes
+that state ineligible for reuse. Do not treat a cached backend/device handle as
+model state -- keep the handle and immutable weights, but drop/rebuild the
+poisoned graph and its mutable session tensors. A serve-batch graph contains multiple jobs and therefore keeps
+per-member cancellation at batch/chunk boundaries; aborting that shared graph
+from one member's flag would incorrectly cancel healthy siblings.
+
 ## Reviewer checklist
 
 Copy this into the PR description and check off each line (or replace the box

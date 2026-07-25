@@ -887,7 +887,9 @@ impl MoonshineDecoderGraphRuntime {
             .reuse
             .as_ref()
             .map(|reuse| {
-                reuse.max_positions != self.metadata.decoder_max_context || reuse.n_seq != 1
+                reuse.is_poisoned()
+                    || reuse.max_positions != self.metadata.decoder_max_context
+                    || reuse.n_seq != 1
             })
             .unwrap_or(true);
         if needs_build {
@@ -995,7 +997,8 @@ impl MoonshineDecoderGraphRuntime {
             .reuse
             .as_ref()
             .map(|reuse| {
-                reuse.max_positions != self.metadata.decoder_max_context
+                reuse.is_poisoned()
+                    || reuse.max_positions != self.metadata.decoder_max_context
                     || reuse.n_seq != self.n_seq
             })
             .unwrap_or(true);

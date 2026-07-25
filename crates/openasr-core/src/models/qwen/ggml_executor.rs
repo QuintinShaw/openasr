@@ -635,7 +635,9 @@ impl Qwen3AsrGgmlExecutor {
         // process-resident allocation on the cached decoder.
         step_executor.whole_decoder.release_session_scoped_buffers();
         // Return the resident whole-decoder to the cache for the next chunk /
-        // execute(); its weights + reuse graph stay valid regardless of outcome.
+        // execute(). `release_session_scoped_buffers` above has already dropped
+        // any graph/KV state poisoned by an incomplete compute; uploaded weights
+        // and the stateless backend handle remain reusable.
         let store_decoder_started_at = qwen_decode_profile_start();
         store_cached_whole_decoder(
             decoder_cache_key,

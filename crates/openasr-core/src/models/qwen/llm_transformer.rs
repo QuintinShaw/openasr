@@ -1752,15 +1752,27 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         Ok(())
     }
 
-    /// Releases the CPU per-token grow-to-fit step buffer this decoder's
-    /// runner accumulated over the just-finished decode session/slice (see
-    /// `GgmlCpuGraphRunner::release_cpu_step_buffer_pool`). Callers that cache
+    /// Ends a decode session/slice: discards any reusable graph poisoned by an
+    /// incomplete compute, then releases the CPU per-token grow-to-fit step
+    /// buffer (see `GgmlCpuGraphRunner::release_cpu_step_buffer_pool`). Callers that cache
     /// this executor across sessions (qwen's `store_cached_whole_decoder`,
     /// mimo/firered2's decoder-runtime caches) MUST call this before storing
     /// it back so the buffer stays session-scoped instead of riding along
-    /// with the cached decoder indefinitely. A no-op on Metal/GPU or when no
-    /// CPU step ever ran.
+    /// with the cached decoder indefinitely. The buffer release is a no-op on
+    /// Metal/GPU or when no CPU step ever ran.
     pub(crate) fn release_session_scoped_buffers(&mut self) {
+        // A failed graph compute may have committed only a prefix of resident
+        // KV writes. All qwen-family cache owners call this before putting the
+        // whole decoder back (qwen, firered-llm, moss-td), so discard poisoned
+        // graph + KV state here while retaining stateless loaded weights and the
+        // cached backend/device handle.
+        if self
+            .reuse
+            .as_ref()
+            .is_some_and(LlmReusableDecodeGraph::is_poisoned)
+        {
+            self.reuse = None;
+        }
         self.runner.release_cpu_step_buffer_pool();
     }
 
@@ -1794,7 +1806,9 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     pub(crate) fn reused_graph_matches(&self, n_seq: usize, max_positions: usize) -> bool {
         self.reuse
             .as_ref()
-            .map(|reuse| reuse.n_seq == n_seq && reuse.max_positions == max_positions)
+            .map(|reuse| {
+                !reuse.is_poisoned() && reuse.n_seq == n_seq && reuse.max_positions == max_positions
+            })
             .unwrap_or(false)
     }
 
@@ -2629,6 +2643,12 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 compute_micros,
             })
         })();
+        if result.is_err() {
+            // This temporary prefill graph writes into `reuse`'s resident KV
+            // arena. Its own builder is ephemeral, so fail closed and propagate
+            // any incomplete result to the persistent owner before cache reuse.
+            reuse.mark_poisoned_after_failed_compute();
+        }
         let restore_result = reuse.builder().restore_prepared_graph_allocation();
         self.reuse = Some(reuse);
         match result {
@@ -2951,7 +2971,9 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         let needs_build = self
             .reuse
             .as_ref()
-            .map(|reuse| reuse.max_positions != max_positions || reuse.n_seq != n_seq)
+            .map(|reuse| {
+                reuse.is_poisoned() || reuse.max_positions != max_positions || reuse.n_seq != n_seq
+            })
             .unwrap_or(true);
         if needs_build {
             // n_ctx_orig is ignored (ext_factor=0); the rope position is supplied
@@ -3191,6 +3213,9 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             .ok_or(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "whole-decoder batched reuse graph is not initialized",
             })?;
+        if reuse.is_poisoned() {
+            return Err(GgmlCpuGraphError::GraphSessionPoisoned);
+        }
         if reuse.max_positions != max_positions {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "whole-decoder batched reuse max-position mismatch",
@@ -3226,6 +3251,9 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             .ok_or(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "whole-decoder batched reuse graph is not initialized",
             })?;
+        if reuse.is_poisoned() {
+            return Err(GgmlCpuGraphError::GraphSessionPoisoned);
+        }
         if reuse.max_positions != max_positions {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "whole-decoder batched reuse max-position mismatch",
@@ -3426,7 +3454,9 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         let needs_build = self
             .reuse
             .as_ref()
-            .map(|reuse| reuse.max_positions != max_positions || reuse.n_seq != n_seq)
+            .map(|reuse| {
+                reuse.is_poisoned() || reuse.max_positions != max_positions || reuse.n_seq != n_seq
+            })
             .unwrap_or(true)
             || seeded_layer_kv_by_sequence.is_some();
         if needs_build {
@@ -3539,7 +3569,10 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             .reuse
             .as_ref()
             .map(|reuse| {
-                reuse.max_positions != max_positions || reuse.n_seq != n_seq || reuse.top1.is_none()
+                reuse.is_poisoned()
+                    || reuse.max_positions != max_positions
+                    || reuse.n_seq != n_seq
+                    || reuse.top1.is_none()
             })
             .unwrap_or(true)
             || seeded_layer_kv_by_sequence.is_some();
