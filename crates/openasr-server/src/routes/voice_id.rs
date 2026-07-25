@@ -1,7 +1,7 @@
 //! Operator-only Voice ID v2 routes (`/v1/voice-id/*`).
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::*;
 
@@ -17,15 +17,41 @@ pub(crate) struct DeleteResponse {
     pub deleted: bool,
 }
 
+#[derive(Debug, Default)]
+pub(crate) enum PatchField<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<'de, T> Deserialize<'de> for PatchField<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct PatchPersonRequest {
-    pub display_name: Option<String>,
-    pub color_preference: Option<String>,
+    #[serde(default)]
+    pub display_name: PatchField<String>,
+    #[serde(default)]
+    pub color_preference: PatchField<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct PatchSampleRequest {
-    pub sample_label: Option<String>,
+    #[serde(default)]
+    pub sample_label: PatchField<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,13 +136,25 @@ pub(crate) async fn patch_person(
     let id = openasr_core::diarize::voice_id::PersonId::parse(&person_id)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let expected = parse_if_match(&headers)?;
+    let display_name = match request.display_name {
+        PatchField::Missing => None,
+        PatchField::Null => {
+            return Err(ApiError::BadRequest("display_name must be a string".into()));
+        }
+        PatchField::Value(display_name) => Some(display_name),
+    };
+    let color_preference = match request.color_preference {
+        PatchField::Missing => None,
+        PatchField::Null => Some(None),
+        PatchField::Value(color_preference) => Some(Some(color_preference)),
+    };
     let person = store
         .update_person_metadata(
             &id,
             expected,
             openasr_core::diarize::voice_id::PersonMetadataUpdate {
-                display_name: request.display_name,
-                color_preference: request.color_preference.map(Some),
+                display_name,
+                color_preference,
             },
         )
         .map_err(voice_id_store_error)?;
@@ -207,9 +245,12 @@ pub(crate) async fn patch_sample(
     let id = openasr_core::diarize::voice_id::SampleId::parse(&sample_id)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let expected = parse_if_match(&headers)?;
-    let sample_label = request
-        .sample_label
-        .ok_or_else(|| ApiError::BadRequest("PATCH requires sample_label".into()))?;
+    let sample_label = match request.sample_label {
+        PatchField::Value(sample_label) => sample_label,
+        PatchField::Missing | PatchField::Null => {
+            return Err(ApiError::BadRequest("PATCH requires sample_label".into()));
+        }
+    };
     let person = store
         .rename_sample(&id, sample_label, expected)
         .map_err(voice_id_store_error)?;

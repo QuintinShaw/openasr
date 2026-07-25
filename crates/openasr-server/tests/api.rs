@@ -2517,6 +2517,7 @@ async fn voice_id_person_patch_supports_atomic_name_and_color_edits() {
     }
 
     let stale = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -2529,6 +2530,43 @@ async fn voice_id_person_patch_supports_atomic_name_and_color_edits() {
         .await
         .unwrap();
     assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+    let cleared = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/persons/{person_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, "\"4\"")
+                .body(Body::from(r#"{"color_preference":null}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::OK);
+    assert_eq!(cleared.headers().get(header::ETAG).unwrap(), "\"5\"");
+    let cleared_body = to_bytes(cleared.into_body(), 1024 * 64).await.unwrap();
+    let cleared_json: Value = serde_json::from_slice(&cleared_body).unwrap();
+    assert!(cleared_json.get("color_preference").is_none());
+
+    let omitted = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/v1/voice-id/persons/{person_id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, "\"5\"")
+                .body(Body::from(r#"{"display_name":"Alice Final"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(omitted.status(), StatusCode::OK);
+    let omitted_body = to_bytes(omitted.into_body(), 1024 * 64).await.unwrap();
+    let omitted_json: Value = serde_json::from_slice(&omitted_body).unwrap();
+    assert_eq!(omitted_json["display_name"], "Alice Final");
+    assert!(omitted_json.get("color_preference").is_none());
 }
 
 #[tokio::test]

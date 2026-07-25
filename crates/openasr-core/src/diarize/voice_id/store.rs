@@ -24,7 +24,7 @@ use super::space::EmbeddingSpace;
 use crate::diarize::contract::SpeakerEmbedding;
 
 pub const VOICE_ID_DB_ENV: &str = "OPENASR_VOICE_ID_DB";
-pub const VOICE_ID_SCHEMA_VERSION: i32 = 1;
+pub const VOICE_ID_SCHEMA_VERSION: i32 = 3;
 
 static CONNECTION_SETUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -387,10 +387,16 @@ impl VoiceIdStore {
                     found: revision,
                 });
             }
-            let mut capture_context: CaptureContext = serde_json::from_str(&context_json)
+            let mut context: serde_json::Value = serde_json::from_str(&context_json)
                 .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
-            capture_context.sample_label = Some(sample_label.clone());
-            let context_json = serde_json::to_string(&capture_context)
+            let context = context.as_object_mut().ok_or_else(|| {
+                VoiceIdStoreError::Serialize("sample capture context must be a JSON object".into())
+            })?;
+            context.insert(
+                "sample_label".into(),
+                serde_json::Value::String(sample_label.clone()),
+            );
+            let context_json = serde_json::to_string(&context)
                 .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
             conn.execute(
                 "UPDATE enrollment_samples SET context_json = ?1 WHERE sample_id = ?2",
@@ -766,7 +772,7 @@ pub struct NewSampleInput {
 }
 
 fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
-    let user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let mut user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if user_version == 0 {
         conn.execute_batch(
             "
@@ -789,7 +795,8 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
                 created_at TEXT NOT NULL,
                 consent_json TEXT NOT NULL,
                 quality_json TEXT NOT NULL,
-                context_json TEXT NOT NULL
+                context_json TEXT NOT NULL,
+                sample_ordinal INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS embedding_spaces (
                 space_id TEXT PRIMARY KEY NOT NULL,
@@ -829,22 +836,145 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
                 revoked_or_deleted_at TEXT NOT NULL,
                 reason TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS legacy_person_color_preferences (
+                person_id TEXT PRIMARY KEY NOT NULL REFERENCES persons(person_id),
+                color_preference TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS enrollment_samples_person_idx
                 ON enrollment_samples(person_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS enrollment_samples_person_ordinal_idx
+                ON enrollment_samples(person_id, sample_ordinal);
             CREATE INDEX IF NOT EXISTS prototypes_person_space_idx
                 ON prototypes(person_id, space_id);
             ",
         )?;
         conn.pragma_update(None, "user_version", VOICE_ID_SCHEMA_VERSION)?;
         conn.execute(
-            "INSERT OR IGNORE INTO voice_id_meta(key, value) VALUES ('schema_version', ?1)",
+            "INSERT OR REPLACE INTO voice_id_meta(key, value) VALUES ('schema_version', ?1)",
             params![VOICE_ID_SCHEMA_VERSION.to_string()],
         )?;
-    } else if user_version != VOICE_ID_SCHEMA_VERSION {
-        // Future migrations land here. Unknown newer/older versions fail closed.
+        return Ok(());
+    }
+    if user_version == 1 {
+        migrate_v1_to_v2(conn)?;
+        user_version = 2;
+    }
+    if user_version == 2 {
+        migrate_v2_to_v3(conn)?;
+        user_version = 3;
+    }
+    if user_version != VOICE_ID_SCHEMA_VERSION {
+        // Unknown newer/older versions fail closed.
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(())
+}
+
+/// Voice ID v1 allowed arbitrary presentation strings. Upgrade valid token
+/// spellings in place; archive non-token values and clear the active preference
+/// so old records remain readable without expanding the new cross-client enum.
+fn migrate_v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS legacy_person_color_preferences (
+                person_id TEXT PRIMARY KEY NOT NULL REFERENCES persons(person_id),
+                color_preference TEXT NOT NULL
+            );",
+        )?;
+        let colors = conn
+            .prepare("SELECT person_id, color_preference FROM persons WHERE color_preference IS NOT NULL")?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (person_id, color) in colors {
+            if let Some(token) = VoiceIdColor::parse(&color.trim().to_ascii_lowercase()) {
+                conn.execute(
+                    "UPDATE persons SET color_preference = ?1 WHERE person_id = ?2",
+                    params![token.as_str(), person_id],
+                )?;
+            } else {
+                conn.execute(
+                    "INSERT OR REPLACE INTO legacy_person_color_preferences(person_id, color_preference)
+                     VALUES (?1, ?2)",
+                    params![person_id, color],
+                )?;
+                conn.execute(
+                    "UPDATE persons SET color_preference = NULL WHERE person_id = ?1",
+                    params![person_id],
+                )?;
+            }
+        }
+        conn.pragma_update(None, "user_version", 2)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO voice_id_meta(key, value) VALUES ('schema_version', '2')",
+            [],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT"),
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+/// Add a persisted per-person ordinal so API order is the request order rather
+/// than a tie-break on random sample IDs. Existing records receive a stable
+/// historical order based on their original SQLite insertion order.
+fn migrate_v2_to_v3(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        let has_ordinal = conn
+            .prepare("PRAGMA table_info(enrollment_samples)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "sample_ordinal");
+        if !has_ordinal {
+            conn.execute_batch(
+                "ALTER TABLE enrollment_samples
+                 ADD COLUMN sample_ordinal INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        let person_ids = conn
+            .prepare("SELECT person_id FROM persons")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for person_id in person_ids {
+            let sample_ids = conn
+                .prepare(
+                    "SELECT sample_id FROM enrollment_samples
+                     WHERE person_id = ?1 ORDER BY created_at ASC, rowid ASC",
+                )?
+                .query_map(params![person_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (ordinal, sample_id) in sample_ids.into_iter().enumerate() {
+                conn.execute(
+                    "UPDATE enrollment_samples SET sample_ordinal = ?1 WHERE sample_id = ?2",
+                    params![ordinal as i64, sample_id],
+                )?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS enrollment_samples_person_ordinal_idx
+             ON enrollment_samples(person_id, sample_ordinal)",
+        )?;
+        conn.pragma_update(None, "user_version", 3)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO voice_id_meta(key, value) VALUES ('schema_version', '3')",
+            [],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT"),
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 fn insert_sample(
@@ -860,16 +990,19 @@ fn insert_sample(
         .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
     let context_json = serde_json::to_string(&sample.capture_context)
         .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
+    let sample_ordinal = next_sample_ordinal(conn, person_id)?;
     conn.execute(
-        "INSERT INTO enrollment_samples(sample_id, person_id, created_at, consent_json, quality_json, context_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO enrollment_samples(
+            sample_id, person_id, created_at, consent_json, quality_json, context_json, sample_ordinal
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             sample.sample_id.as_str(),
             person_id.as_str(),
             now,
             consent_json,
             quality_json,
-            context_json
+            context_json,
+            sample_ordinal,
         ],
     )?;
     upsert_space(conn, &sample.space)?;
@@ -885,6 +1018,14 @@ fn insert_sample(
         ],
     )?;
     Ok(())
+}
+
+fn next_sample_ordinal(conn: &Connection, person_id: &PersonId) -> Result<i64, VoiceIdStoreError> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(sample_ordinal) + 1, 0) FROM enrollment_samples WHERE person_id = ?1",
+        params![person_id.as_str()],
+        |row| row.get(0),
+    )?)
 }
 
 fn purge_sample(conn: &Connection, sample_id: &SampleId) -> Result<(), VoiceIdStoreError> {
@@ -1093,7 +1234,7 @@ fn load_sample_views(
 ) -> Result<Vec<SampleView>, VoiceIdStoreError> {
     let mut stmt = conn.prepare(
         "SELECT sample_id, created_at, quality_json, context_json FROM enrollment_samples
-         WHERE person_id = ?1 ORDER BY created_at ASC, sample_id ASC",
+         WHERE person_id = ?1 ORDER BY sample_ordinal ASC, sample_id ASC",
     )?;
     let rows = stmt.query_map(params![person_id], |row| {
         Ok((
@@ -1190,7 +1331,7 @@ fn import_person_graph_on_conn(
             person.color_preference.map(VoiceIdColor::as_str),
         ],
     )?;
-    for (sample, embedding) in samples {
+    for (sample_ordinal, (sample, embedding)) in samples.iter().enumerate() {
         let consent_json = serde_json::to_string(&sample.consent)
             .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
         let quality_json = serde_json::to_string(&sample.quality)
@@ -1199,15 +1340,16 @@ fn import_person_graph_on_conn(
             .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
         conn.execute(
             "INSERT INTO enrollment_samples(
-                sample_id, person_id, created_at, consent_json, quality_json, context_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                sample_id, person_id, created_at, consent_json, quality_json, context_json, sample_ordinal
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 sample.sample_id.as_str(),
                 sample.person_id.as_str(),
                 sample.created_at,
                 consent_json,
                 quality_json,
-                context_json
+                context_json,
+                sample_ordinal as i64,
             ],
         )?;
         upsert_space(conn, &embedding.space)?;
@@ -1797,6 +1939,200 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn legacy_color_preferences_migrate_without_hiding_persons() {
+        let dir = tempdir().unwrap();
+        let store = VoiceIdStore::open(dir.path());
+        let space = test_space("sha256:legacy-colors");
+        let valid = store
+            .enroll_person(
+                "Valid legacy color",
+                consent(),
+                vec![sample_input(&space, vec![1.0, 0.0])],
+                None,
+            )
+            .unwrap();
+        let invalid = store
+            .enroll_person(
+                "Invalid legacy color",
+                consent(),
+                vec![sample_input(&space, vec![0.0, 1.0])],
+                None,
+            )
+            .unwrap();
+        let conn = store.connection().unwrap();
+        conn.execute(
+            "UPDATE persons SET color_preference = ' PURPLE ' WHERE person_id = ?1",
+            params![valid.person_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE persons SET color_preference = '#123456' WHERE person_id = ?1",
+            params![invalid.person_id],
+        )
+        .unwrap();
+        conn.execute_batch("DROP TABLE legacy_person_color_preferences; PRAGMA user_version = 1")
+            .unwrap();
+        drop(conn);
+
+        let reopened = VoiceIdStore::open(dir.path());
+        let listed = reopened.list_persons(None).unwrap();
+        assert_eq!(listed.len(), 2);
+        let valid_view = listed
+            .iter()
+            .find(|person| person.person_id == valid.person_id)
+            .unwrap();
+        assert_eq!(valid_view.color_preference, Some(VoiceIdColor::Purple));
+        let invalid_view = listed
+            .iter()
+            .find(|person| person.person_id == invalid.person_id)
+            .unwrap();
+        assert_eq!(invalid_view.color_preference, None);
+        let conn = reopened.connection().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT color_preference FROM legacy_person_color_preferences WHERE person_id = ?1",
+                params![invalid.person_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "#123456"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            VOICE_ID_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn v2_sample_records_migrate_to_stable_ordinals() {
+        let dir = tempdir().unwrap();
+        let store = VoiceIdStore::open(dir.path());
+        std::fs::create_dir_all(store.db_path().parent().unwrap()).unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE voice_id_meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
+            CREATE TABLE persons (
+                person_id TEXT PRIMARY KEY NOT NULL,
+                display_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                color_preference TEXT
+            );
+            CREATE TABLE enrollment_samples (
+                sample_id TEXT PRIMARY KEY NOT NULL,
+                person_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                consent_json TEXT NOT NULL,
+                quality_json TEXT NOT NULL,
+                context_json TEXT NOT NULL
+            );
+            PRAGMA user_version = 2;
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO persons VALUES ('person_legacy', 'Alice', 'active', 'now', 'now', 1, NULL)",
+            [],
+        )
+        .unwrap();
+        for sample_id in ["sample_first", "sample_second", "sample_third"] {
+            conn.execute(
+                "INSERT INTO enrollment_samples VALUES (?1, 'person_legacy', 'same-time', '{}', '{}', '{}')",
+                params![sample_id],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let conn = store.connection().unwrap();
+        let ids = conn
+            .prepare(
+                "SELECT sample_id FROM enrollment_samples
+                 WHERE person_id = 'person_legacy' ORDER BY sample_ordinal ASC",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(ids, vec!["sample_first", "sample_second", "sample_third"]);
+    }
+
+    #[test]
+    fn sample_label_update_preserves_unknown_capture_context_fields() {
+        let dir = tempdir().unwrap();
+        let store = VoiceIdStore::open(dir.path());
+        let space = test_space("sha256:future-context");
+        let person = store
+            .enroll_person(
+                "Alice",
+                consent(),
+                vec![sample_input(&space, vec![1.0, 0.0])],
+                None,
+            )
+            .unwrap();
+        let sample_id = SampleId::parse(&person.samples[0].sample_id).unwrap();
+        let conn = store.connection().unwrap();
+        conn.execute(
+            "UPDATE enrollment_samples SET context_json = ?1 WHERE sample_id = ?2",
+            params![
+                r#"{"device_class":"test","input_route":"mic","sample_label":"old","future_context":{"transport":"new-client"}}"#,
+                sample_id.as_str(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        store
+            .rename_sample(&sample_id, "Updated", Some(person.revision))
+            .unwrap();
+        let conn = store.connection().unwrap();
+        let context: serde_json::Value = conn
+            .query_row(
+                "SELECT context_json FROM enrollment_samples WHERE sample_id = ?1",
+                params![sample_id.as_str()],
+                |row| row.get(0),
+            )
+            .map(|raw: String| serde_json::from_str(&raw).unwrap())
+            .unwrap();
+        assert_eq!(context["sample_label"], "Updated");
+        assert_eq!(context["future_context"]["transport"], "new-client");
+    }
+
+    #[test]
+    fn enrollment_sample_order_follows_request_order_across_repeated_runs() {
+        let space = test_space("sha256:sample-order");
+        for _ in 0..20 {
+            let dir = tempdir().unwrap();
+            let store = VoiceIdStore::open(dir.path());
+            let mut samples = vec![
+                sample_input(&space, vec![1.0, 0.0]),
+                sample_input(&space, vec![0.0, 1.0]),
+                sample_input(&space, vec![0.7, 0.7]),
+            ];
+            for (index, sample) in samples.iter_mut().enumerate() {
+                sample.capture_context.sample_label = Some(format!("request-{}", index + 1));
+            }
+            let person = store
+                .enroll_person("Alice", consent(), samples, None)
+                .unwrap();
+            let labels = person
+                .samples
+                .iter()
+                .map(|sample| sample.sample_label.as_deref())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                labels,
+                vec![Some("request-1"), Some("request-2"), Some("request-3")]
+            );
+        }
     }
 
     #[test]
