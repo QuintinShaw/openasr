@@ -35,7 +35,8 @@ pub use quality::{
     assess_enrollment_quality,
 };
 pub use service::{
-    EnrollmentClip, VoiceIdServiceError, add_sample_from_pcm, enroll_person_from_clips,
+    EnrollmentClip, VoiceIdServiceError, add_sample_from_pcm, add_sample_from_pcm_idempotent,
+    enroll_person_from_clips, enroll_person_from_clips_idempotent,
     load_person_matcher_for_active_embedder, prepare_sample_from_pcm, prepare_sample_from_wav_file,
 };
 pub use space::{
@@ -43,6 +44,6 @@ pub use space::{
     REDIMNET_FRONTEND_VERSION,
 };
 pub use store::{
-    NewSampleInput, PersonMetadataUpdate, VOICE_ID_DB_ENV, VOICE_ID_SCHEMA_VERSION, VoiceIdStore,
-    VoiceIdStoreError, timestamp_now,
+    IdempotencyRequest, IdempotentPersonResult, NewSampleInput, PersonMetadataUpdate,
+    VOICE_ID_DB_ENV, VOICE_ID_SCHEMA_VERSION, VoiceIdStore, VoiceIdStoreError, timestamp_now,
 };

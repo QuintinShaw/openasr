@@ -2,6 +2,7 @@
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::*;
 
@@ -96,6 +97,7 @@ pub(crate) async fn get_person(
 
 pub(crate) async fn enroll_person(
     Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<
     (
@@ -106,18 +108,35 @@ pub(crate) async fn enroll_person(
     ApiError,
 > {
     let parsed = parse_enroll_multipart(multipart).await?;
+    let idempotency = idempotency_request(&headers, enroll_request_hash(&parsed))?;
     let store = open_voice_id_store(&distribution)?;
     let (embedder, identity) = active_embedder_and_identity()?;
-    let person = openasr_core::diarize::voice_id::enroll_person_from_clips(
-        &store,
-        parsed.display_name,
-        parsed.consent,
-        parsed.clips,
-        embedder,
-        &identity,
-        parsed.color_preference,
-    )
-    .map_err(voice_id_service_error)?;
+    let person = match idempotency {
+        Some(idempotency) => {
+            openasr_core::diarize::voice_id::enroll_person_from_clips_idempotent(
+                &store,
+                parsed.display_name,
+                parsed.consent,
+                parsed.clips,
+                embedder,
+                &identity,
+                parsed.color_preference,
+                idempotency,
+            )
+            .map_err(voice_id_service_error)?
+            .person
+        }
+        None => openasr_core::diarize::voice_id::enroll_person_from_clips(
+            &store,
+            parsed.display_name,
+            parsed.consent,
+            parsed.clips,
+            embedder,
+            &identity,
+            parsed.color_preference,
+        )
+        .map_err(voice_id_service_error)?,
+    };
     let mut headers = HeaderMap::new();
     let etag = format!("\"{}\"", person.revision);
     if let Ok(value) = HeaderValue::from_str(&etag) {
@@ -195,18 +214,37 @@ pub(crate) async fn add_sample(
     let id = openasr_core::diarize::voice_id::PersonId::parse(&person_id)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let expected = parse_if_match(&headers)?;
+    let idempotency =
+        idempotency_request(&headers, add_sample_request_hash(&id, expected, &parsed))?;
     let (embedder, identity) = active_embedder_and_identity()?;
-    let person = openasr_core::diarize::voice_id::add_sample_from_pcm(
-        &store,
-        &id,
-        expected,
-        parsed.consent,
-        &parsed.pcm,
-        parsed.capture_context,
-        embedder,
-        &identity,
-    )
-    .map_err(voice_id_service_error)?;
+    let person = match idempotency {
+        Some(idempotency) => {
+            openasr_core::diarize::voice_id::add_sample_from_pcm_idempotent(
+                &store,
+                &id,
+                expected,
+                parsed.consent,
+                &parsed.pcm,
+                parsed.capture_context,
+                embedder,
+                &identity,
+                idempotency,
+            )
+            .map_err(voice_id_service_error)?
+            .person
+        }
+        None => openasr_core::diarize::voice_id::add_sample_from_pcm(
+            &store,
+            &id,
+            expected,
+            parsed.consent,
+            &parsed.pcm,
+            parsed.capture_context,
+            embedder,
+            &identity,
+        )
+        .map_err(voice_id_service_error)?,
+    };
     let mut out_headers = HeaderMap::new();
     let etag = format!("\"{}\"", person.revision);
     if let Ok(value) = HeaderValue::from_str(&etag) {
@@ -532,6 +570,74 @@ fn active_embedder_and_identity() -> Result<
     Ok((embedder, identity))
 }
 
+fn idempotency_request(
+    headers: &HeaderMap,
+    request_hash: String,
+) -> Result<Option<openasr_core::diarize::voice_id::IdempotencyRequest>, ApiError> {
+    let Some(key) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let key = key
+        .to_str()
+        .map_err(|_| ApiError::BadRequest("Invalid Idempotency-Key header".into()))?;
+    if key.is_empty() || key.len() > 255 || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(ApiError::BadRequest(
+            "Idempotency-Key must contain 1-255 visible ASCII characters".into(),
+        ));
+    }
+    Ok(Some(openasr_core::diarize::voice_id::IdempotencyRequest {
+        key_hash: sha256_hex(key.as_bytes()),
+        request_hash,
+    }))
+}
+
+fn enroll_request_hash(parsed: &ParsedEnroll) -> String {
+    let canonical = serde_json::json!({
+        "operation": "enroll_person",
+        "display_name": parsed.display_name.trim(),
+        "consent": parsed.consent,
+        "color_preference": parsed.color_preference.as_deref().map(str::trim),
+        "clips": parsed.clips.iter().map(|clip| serde_json::json!({
+            "capture_context": clip.capture_context,
+            "pcm_bits": clip.samples.iter().map(|sample| sample.to_bits()).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    });
+    canonical_json_hash(&canonical)
+}
+
+fn add_sample_request_hash(
+    person_id: &openasr_core::diarize::voice_id::PersonId,
+    expected_revision: Option<u64>,
+    parsed: &ParsedSample,
+) -> String {
+    let canonical = serde_json::json!({
+        "operation": "add_sample",
+        "person_id": person_id.as_str(),
+        "expected_revision": expected_revision,
+        "consent": parsed.consent,
+        "capture_context": parsed.capture_context,
+        "pcm_bits": parsed.pcm.iter().map(|sample| sample.to_bits()).collect::<Vec<_>>(),
+    });
+    canonical_json_hash(&canonical)
+}
+
+fn canonical_json_hash(value: &serde_json::Value) -> String {
+    // Only the digest crosses the HTTP/storage boundary; raw sample bytes are
+    // dropped after embedding and are never stored in the idempotency ledger.
+    sha256_hex(&serde_json::to_vec(value).expect("voice-id request is serializable"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    out
+}
+
 fn parse_if_match(headers: &HeaderMap) -> Result<Option<u64>, ApiError> {
     let Some(value) = headers.get(header::IF_MATCH) else {
         return Ok(None);
@@ -571,7 +677,9 @@ fn voice_id_store_error(error: openasr_core::diarize::voice_id::VoiceIdStoreErro
         VoiceIdStoreError::NotFound(message) | VoiceIdStoreError::SampleNotFound(message) => {
             ApiError::NotFound(message)
         }
-        VoiceIdStoreError::RevisionConflict { .. } => ApiError::Conflict(error.to_string()),
+        VoiceIdStoreError::RevisionConflict { .. } | VoiceIdStoreError::IdempotencyConflict => {
+            ApiError::Conflict(error.to_string())
+        }
         VoiceIdStoreError::EmptyName
         | VoiceIdStoreError::EmptySampleLabel
         | VoiceIdStoreError::LabelTooLong { .. }

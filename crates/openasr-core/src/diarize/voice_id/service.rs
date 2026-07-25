@@ -151,6 +151,42 @@ pub fn enroll_person_from_clips(
     Ok(store.enroll_person(display_name, consent, prepared, color_preference)?)
 }
 
+pub fn enroll_person_from_clips_idempotent(
+    store: &VoiceIdStore,
+    display_name: impl Into<String>,
+    consent: ConsentRecord,
+    clips: Vec<EnrollmentClip>,
+    embedder: &dyn SpeakerEmbedder,
+    identity: &SpeakerEmbedderIdentity,
+    color_preference: Option<String>,
+    idempotency: super::store::IdempotencyRequest,
+) -> Result<super::store::IdempotentPersonResult, VoiceIdServiceError> {
+    let n = clips.len();
+    if !(MIN_INITIAL_SAMPLES..=MAX_INITIAL_SAMPLES).contains(&n) {
+        return Err(VoiceIdServiceError::InvalidSampleCount {
+            min: MIN_INITIAL_SAMPLES,
+            max: MAX_INITIAL_SAMPLES,
+            got: n,
+        });
+    }
+    let mut prepared = Vec::with_capacity(n);
+    for clip in clips {
+        prepared.push(prepare_sample_from_pcm(
+            &clip.samples,
+            clip.capture_context,
+            embedder,
+            identity,
+        )?);
+    }
+    Ok(store.enroll_person_idempotent(
+        display_name,
+        consent,
+        prepared,
+        color_preference,
+        idempotency,
+    )?)
+}
+
 pub fn add_sample_from_pcm(
     store: &VoiceIdStore,
     person_id: &PersonId,
@@ -163,6 +199,29 @@ pub fn add_sample_from_pcm(
 ) -> Result<PersonView, VoiceIdServiceError> {
     let prepared = prepare_sample_from_pcm(pcm, capture_context, embedder, identity)?;
     Ok(store.add_sample(person_id, expected_revision, consent, prepared)?)
+}
+
+pub fn add_sample_from_pcm_idempotent(
+    store: &VoiceIdStore,
+    person_id: &PersonId,
+    expected_revision: Option<u64>,
+    consent: ConsentRecord,
+    pcm: &[f32],
+    capture_context: CaptureContext,
+    embedder: &dyn SpeakerEmbedder,
+    identity: &SpeakerEmbedderIdentity,
+    idempotency: super::store::IdempotencyRequest,
+) -> Result<super::store::IdempotentPersonResult, VoiceIdServiceError> {
+    let prepared = prepare_sample_from_pcm(pcm, capture_context, embedder, identity)?;
+    Ok(
+        store.add_sample_idempotent(
+            person_id,
+            expected_revision,
+            consent,
+            prepared,
+            idempotency,
+        )?,
+    )
 }
 
 fn embed_enrollment(

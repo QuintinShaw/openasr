@@ -26,7 +26,9 @@ use super::space::EmbeddingSpace;
 use crate::diarize::contract::SpeakerEmbedding;
 
 pub const VOICE_ID_DB_ENV: &str = "OPENASR_VOICE_ID_DB";
-pub const VOICE_ID_SCHEMA_VERSION: i32 = 3;
+pub const VOICE_ID_SCHEMA_VERSION: i32 = 4;
+const IDEMPOTENCY_TTL_SECS: i64 = 24 * 60 * 60;
+const IDEMPOTENCY_MAX_RECORDS: i64 = 1024;
 
 static CONNECTION_SETUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -76,6 +78,10 @@ pub enum VoiceIdStoreError {
     InvalidId(#[from] IdError),
     #[error("voice-id serialization error: {0}")]
     Serialize(String),
+    #[error("voice-id idempotency key was reused with a different request")]
+    IdempotencyConflict,
+    #[error("voice-id idempotency record is invalid: {0}")]
+    IdempotencyRecord(String),
     #[error("voice-id migration failed: {0}")]
     Migration(String),
 }
@@ -92,6 +98,21 @@ pub struct VoiceIdStore {
 pub struct PersonMetadataUpdate {
     pub display_name: Option<String>,
     pub color_preference: Option<Option<String>>,
+}
+
+/// A privacy-preserving representation of an HTTP idempotency request. Both
+/// values are SHA-256 digests; neither the client key nor audio bytes are kept.
+#[derive(Debug, Clone)]
+pub struct IdempotencyRequest {
+    pub key_hash: String,
+    pub request_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct IdempotentPersonResult {
+    pub person: PersonView,
+    pub etag: String,
+    pub replayed: bool,
 }
 
 impl VoiceIdStore {
@@ -247,6 +268,60 @@ impl VoiceIdStore {
         self.get_person(&person_id, samples.first().map(|s| &s.space))
     }
 
+    /// Enroll once for an idempotency key. The person graph and replay record
+    /// commit together, so a response lost after commit is safe to retry.
+    pub fn enroll_person_idempotent(
+        &self,
+        display_name: impl Into<String>,
+        consent: ConsentRecord,
+        samples: Vec<NewSampleInput>,
+        color_preference: Option<String>,
+        idempotency: IdempotencyRequest,
+    ) -> Result<IdempotentPersonResult, VoiceIdStoreError> {
+        let display_name = normalize_name(display_name.into())?;
+        let color_preference = normalize_color_preference(color_preference)?;
+        let samples = samples
+            .into_iter()
+            .map(normalize_new_sample_input)
+            .collect::<Result<Vec<_>, _>>()?;
+        if samples.is_empty() {
+            return Err(VoiceIdStoreError::Migration(
+                "enrollment requires at least one accepted sample".into(),
+            ));
+        }
+        let space = samples[0].space.clone();
+        let conn = self.connection()?;
+        immediate_transaction(&conn, || {
+            if let Some(replay) = lookup_idempotency(&conn, "enroll_person", &idempotency)? {
+                return Ok(replay);
+            }
+            let person_id = PersonId::generate();
+            let now = timestamp_now();
+            conn.execute(
+                "INSERT INTO persons(person_id, display_name, status, created_at, updated_at, revision, color_preference)
+                 VALUES (?1, ?2, 'active', ?3, ?3, 1, ?4)",
+                params![
+                    person_id.as_str(),
+                    display_name,
+                    now,
+                    color_preference.map(VoiceIdColor::as_str)
+                ],
+            )?;
+            for sample in &samples {
+                insert_sample(&conn, &person_id, sample, &consent, &now)?;
+            }
+            rebuild_prototypes_for_person(&conn, &person_id)?;
+            bump_global_revision(&conn)?;
+            let person = get_person_on_conn(&conn, &person_id, Some(&space))?;
+            persist_idempotency(&conn, "enroll_person", &idempotency, &person)?;
+            Ok(IdempotentPersonResult {
+                etag: format!("\"{}\"", person.revision),
+                person,
+                replayed: false,
+            })
+        })
+    }
+
     pub fn add_sample(
         &self,
         person_id: &PersonId,
@@ -279,6 +354,52 @@ impl VoiceIdStore {
             Ok(())
         })?;
         self.get_person(person_id, Some(&space))
+    }
+
+    /// Add one sample once for an idempotency key. The expected person revision
+    /// remains part of the request fingerprint, preventing stale replays from
+    /// being silently applied to a later version of a person.
+    pub fn add_sample_idempotent(
+        &self,
+        person_id: &PersonId,
+        expected_revision: Option<u64>,
+        consent: ConsentRecord,
+        sample: NewSampleInput,
+        idempotency: IdempotencyRequest,
+    ) -> Result<IdempotentPersonResult, VoiceIdStoreError> {
+        let sample = normalize_new_sample_input(sample)?;
+        let space = sample.space.clone();
+        let conn = self.connection()?;
+        immediate_transaction(&conn, || {
+            if let Some(replay) = lookup_idempotency(&conn, "add_sample", &idempotency)? {
+                return Ok(replay);
+            }
+            let (status, revision) = person_status_revision(&conn, person_id)?;
+            if !status.allows_matching() {
+                return Err(VoiceIdStoreError::NotActive(person_id.as_str().to_string()));
+            }
+            if let Some(expected) = expected_revision
+                && expected != revision
+            {
+                return Err(VoiceIdStoreError::RevisionConflict {
+                    id: person_id.as_str().to_string(),
+                    expected,
+                    found: revision,
+                });
+            }
+            let now = timestamp_now();
+            insert_sample(&conn, person_id, &sample, &consent, &now)?;
+            rebuild_prototypes_for_person(&conn, person_id)?;
+            touch_person(&conn, person_id, &now)?;
+            bump_global_revision(&conn)?;
+            let person = get_person_on_conn(&conn, person_id, Some(&space))?;
+            persist_idempotency(&conn, "add_sample", &idempotency, &person)?;
+            Ok(IdempotentPersonResult {
+                etag: format!("\"{}\"", person.revision),
+                person,
+                replayed: false,
+            })
+        })
     }
 
     pub fn rename_person(
@@ -773,6 +894,130 @@ pub struct NewSampleInput {
     pub embedding: SpeakerEmbedding,
 }
 
+fn get_person_on_conn(
+    conn: &Connection,
+    person_id: &PersonId,
+    active_space: Option<&EmbeddingSpace>,
+) -> Result<PersonView, VoiceIdStoreError> {
+    let row = conn
+        .query_row(
+            "SELECT person_id, display_name, status, created_at, updated_at, revision, color_preference
+             FROM persons WHERE person_id = ?1",
+            params![person_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)? as u64,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| VoiceIdStoreError::NotFound(person_id.as_str().to_string()))?;
+    let status = PersonStatus::parse(&row.2).unwrap_or(PersonStatus::Deleted);
+    if status == PersonStatus::Deleted {
+        return Err(VoiceIdStoreError::NotFound(person_id.as_str().to_string()));
+    }
+    let samples = load_sample_views(conn, &row.0, active_space)?;
+    Ok(PersonView {
+        person_id: row.0,
+        display_name: row.1,
+        status,
+        created_at: row.3,
+        updated_at: row.4,
+        revision: row.5,
+        sample_count: samples.len(),
+        needs_reenrollment: samples.iter().all(|sample| sample.needs_reenrollment)
+            || samples.is_empty(),
+        color_preference: parse_color_preference(row.6)?,
+        samples,
+    })
+}
+
+fn lookup_idempotency(
+    conn: &Connection,
+    scope: &str,
+    request: &IdempotencyRequest,
+) -> Result<Option<IdempotentPersonResult>, VoiceIdStoreError> {
+    let now = unix_timestamp_secs();
+    conn.execute(
+        "DELETE FROM voice_id_idempotency WHERE expires_at <= ?1",
+        params![now],
+    )?;
+    let record = conn
+        .query_row(
+            "SELECT request_hash, response_json, etag FROM voice_id_idempotency
+             WHERE scope = ?1 AND key_hash = ?2",
+            params![scope, request.key_hash],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((request_hash, response_json, etag)) = record else {
+        return Ok(None);
+    };
+    if request_hash != request.request_hash {
+        return Err(VoiceIdStoreError::IdempotencyConflict);
+    }
+    let person = serde_json::from_str(&response_json)
+        .map_err(|error| VoiceIdStoreError::IdempotencyRecord(error.to_string()))?;
+    Ok(Some(IdempotentPersonResult {
+        person,
+        etag,
+        replayed: true,
+    }))
+}
+
+fn persist_idempotency(
+    conn: &Connection,
+    scope: &str,
+    request: &IdempotencyRequest,
+    person: &PersonView,
+) -> Result<(), VoiceIdStoreError> {
+    let now = unix_timestamp_secs();
+    let response_json = serde_json::to_string(person)
+        .map_err(|error| VoiceIdStoreError::Serialize(error.to_string()))?;
+    conn.execute(
+        "INSERT INTO voice_id_idempotency(
+             scope, key_hash, request_hash, response_json, etag, created_at, expires_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            scope,
+            request.key_hash,
+            request.request_hash,
+            response_json,
+            format!("\"{}\"", person.revision),
+            now,
+            now + IDEMPOTENCY_TTL_SECS,
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM voice_id_idempotency WHERE rowid IN (
+             SELECT rowid FROM voice_id_idempotency
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT -1 OFFSET ?1
+         )",
+        params![IDEMPOTENCY_MAX_RECORDS],
+    )?;
+    Ok(())
+}
+
+fn unix_timestamp_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     let user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if user_version == 0 {
@@ -842,6 +1087,18 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
                 person_id TEXT PRIMARY KEY NOT NULL REFERENCES persons(person_id),
                 color_preference TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS voice_id_idempotency (
+                scope TEXT NOT NULL,
+                key_hash TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                etag TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                PRIMARY KEY (scope, key_hash)
+            );
+            CREATE INDEX IF NOT EXISTS voice_id_idempotency_expires_idx
+                ON voice_id_idempotency(expires_at);
             CREATE INDEX IF NOT EXISTS enrollment_samples_person_idx
                 ON enrollment_samples(person_id);
             CREATE UNIQUE INDEX IF NOT EXISTS enrollment_samples_person_ordinal_idx
@@ -877,6 +1134,9 @@ fn migrate_schema_to_current(conn: &Connection, from_version: i32) -> rusqlite::
         }
         if from_version <= 2 {
             migrate_v2_to_v3_on_conn(conn)?;
+        }
+        if from_version <= 3 {
+            migrate_v3_to_v4_on_conn(conn)?;
         }
         conn.pragma_update(None, "user_version", VOICE_ID_SCHEMA_VERSION)?;
         conn.execute(
@@ -977,6 +1237,23 @@ fn migrate_v2_to_v3_on_conn(conn: &Connection) -> rusqlite::Result<()> {
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(())
+}
+
+fn migrate_v3_to_v4_on_conn(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS voice_id_idempotency (
+            scope TEXT NOT NULL,
+            key_hash TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            etag TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (scope, key_hash)
+        );
+        CREATE INDEX IF NOT EXISTS voice_id_idempotency_expires_idx
+            ON voice_id_idempotency(expires_at);",
+    )
 }
 
 #[cfg(test)]
@@ -1660,6 +1937,159 @@ mod tests {
         }
     }
 
+    fn idempotency(key: &str, request: &str) -> IdempotencyRequest {
+        IdempotencyRequest {
+            key_hash: key.into(),
+            request_hash: request.into(),
+        }
+    }
+
+    #[test]
+    fn idempotent_enrollment_replays_across_reopen_without_extra_revisions() {
+        let dir = tempdir().unwrap();
+        let space = test_space("sha256:idempotency");
+        let request = idempotency("key-hash", "request-hash");
+        let first = VoiceIdStore::open(dir.path())
+            .enroll_person_idempotent(
+                "Alice",
+                consent(),
+                vec![sample_input(&space, vec![1.0, 0.0])],
+                None,
+                request.clone(),
+            )
+            .unwrap();
+        let replay = VoiceIdStore::open(dir.path())
+            .enroll_person_idempotent(
+                "Alice",
+                consent(),
+                vec![sample_input(&space, vec![1.0, 0.0])],
+                None,
+                request,
+            )
+            .unwrap();
+
+        assert!(!first.replayed);
+        assert!(replay.replayed);
+        assert_eq!(first.person, replay.person);
+        assert_eq!(first.etag, replay.etag);
+        let store = VoiceIdStore::open(dir.path());
+        assert_eq!(store.list_persons(Some(&space)).unwrap().len(), 1);
+        assert_eq!(
+            store.migration_state("global_revision").unwrap().as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn idempotency_conflict_and_expiry_are_handled_in_the_mutation_transaction() {
+        let dir = tempdir().unwrap();
+        let store = VoiceIdStore::open(dir.path());
+        let space = test_space("sha256:idempotency-expiry");
+        store
+            .enroll_person_idempotent(
+                "Alice",
+                consent(),
+                vec![sample_input(&space, vec![1.0, 0.0])],
+                None,
+                idempotency("key-hash", "first-request"),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.enroll_person_idempotent(
+                "Bob",
+                consent(),
+                vec![sample_input(&space, vec![1.0, 0.0])],
+                None,
+                idempotency("key-hash", "different-request"),
+            ),
+            Err(VoiceIdStoreError::IdempotencyConflict)
+        ));
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.execute("UPDATE voice_id_idempotency SET expires_at = 0", [])
+            .unwrap();
+        store
+            .enroll_person_idempotent(
+                "Bob",
+                consent(),
+                vec![sample_input(&space, vec![1.0, 0.0])],
+                None,
+                idempotency("key-hash", "different-request"),
+            )
+            .unwrap();
+        assert_eq!(store.list_persons(Some(&space)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn idempotent_add_sample_replays_person_view_without_a_second_write() {
+        let dir = tempdir().unwrap();
+        let store = VoiceIdStore::open(dir.path());
+        let space = test_space("sha256:idempotency-add-sample");
+        let enrolled = store
+            .enroll_person(
+                "Alice",
+                consent(),
+                vec![sample_input(&space, vec![1.0, 0.0])],
+                None,
+            )
+            .unwrap();
+        let person_id = PersonId::parse(enrolled.person_id).unwrap();
+        let first = store
+            .add_sample_idempotent(
+                &person_id,
+                Some(enrolled.revision),
+                consent(),
+                sample_input(&space, vec![0.9, 0.1]),
+                idempotency("add-key", "add-request"),
+            )
+            .unwrap();
+        let replay = VoiceIdStore::open(dir.path())
+            .add_sample_idempotent(
+                &person_id,
+                Some(enrolled.revision),
+                consent(),
+                sample_input(&space, vec![0.9, 0.1]),
+                idempotency("add-key", "add-request"),
+            )
+            .unwrap();
+        assert_eq!(first.person.sample_count, 2);
+        assert_eq!(first.person, replay.person);
+        assert!(replay.replayed);
+        assert_eq!(
+            store.migration_state("global_revision").unwrap().as_deref(),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn concurrent_idempotent_enrollment_advances_global_revision_once() {
+        let dir = tempdir().unwrap();
+        let store = VoiceIdStore::open(dir.path());
+        let space = test_space("sha256:idempotency-concurrent");
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let store = store.clone();
+                let space = space.clone();
+                scope.spawn(move || {
+                    store
+                        .enroll_person_idempotent(
+                            "Alice",
+                            consent(),
+                            vec![sample_input(&space, vec![1.0, 0.0])],
+                            None,
+                            idempotency("concurrent-key", "concurrent-request"),
+                        )
+                        .unwrap();
+                });
+            }
+        });
+        assert_eq!(store.list_persons(Some(&space)).unwrap().len(), 1);
+        assert_eq!(
+            store.migration_state("global_revision").unwrap().as_deref(),
+            Some("1")
+        );
+    }
+
     #[test]
     fn enroll_match_rename_and_revision_conflict() {
         let dir = tempdir().unwrap();
@@ -2138,7 +2568,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "3"
+            VOICE_ID_SCHEMA_VERSION.to_string()
         );
         assert_eq!(
             migrated
@@ -2172,7 +2602,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "3"
+            VOICE_ID_SCHEMA_VERSION.to_string()
         );
     }
 
