@@ -1873,7 +1873,7 @@ impl LivePipeline {
         } else {
             self.pending_utterance_speakers.remove(&result.utterance_id)
         };
-        let (speaker, speaker_label, speaker_profile_id, speaker_person_id, speaker_snapshot_label) =
+        let (speaker, speaker_label, speaker_person_id, speaker_snapshot_label) =
             speaker_assignment
                 .map(|assignment| {
                     let matched = assignment.speaker_profile_id.is_some()
@@ -1886,12 +1886,11 @@ impl LivePipeline {
                     (
                         Some(assignment.speaker),
                         speaker_label,
-                        assignment.speaker_profile_id,
                         assignment.speaker_person_id,
                         snapshot,
                     )
                 })
-                .unwrap_or((None, None, None, None, None));
+                .unwrap_or((None, None, None, None));
         let update = TranscriptUpdate {
             utterance_id: result.utterance_id.clone(),
             segment_id: result.segment_id,
@@ -1902,7 +1901,6 @@ impl LivePipeline {
             language: None,
             speaker,
             speaker_label,
-            speaker_profile_id,
             speaker_person_id,
             speaker_snapshot_label,
             words: Vec::new(),
@@ -3025,7 +3023,6 @@ mod tests {
             language: Some("en".to_string()),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -3048,7 +3045,6 @@ mod tests {
             language: Some("en".to_string()),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -3070,7 +3066,6 @@ mod tests {
             language: Some("en".to_string()),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -3097,7 +3092,6 @@ mod tests {
             language: Some("en".to_string()),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -3141,7 +3135,6 @@ mod tests {
             language: Some("en".to_string()),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
             words: Vec::new(),
@@ -3186,7 +3179,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3285,7 +3277,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3332,7 +3323,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3376,7 +3366,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3423,7 +3412,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3467,7 +3455,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3512,7 +3499,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3567,7 +3553,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3615,7 +3600,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3680,7 +3664,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3733,7 +3716,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3795,7 +3777,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -3854,7 +3835,6 @@ mod tests {
                 language: Some("en".to_string()),
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),

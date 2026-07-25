@@ -13,10 +13,4 @@ speaker: string | null,
  * Stable anonymous session label (`SPEAKER_NN`) when `speaker` was replaced
  * by an enrolled voice-match display name.
  */
-speaker_label: string | null, 
-/**
- * Voice-match profile id (`vp_*`) when the utterance matched an enrolled
- * profile. This is not an authentication claim. Deprecated in favor of
- * `speaker_person_id`.
- */
-speaker_profile_id: string | null, speaker_person_id: string | null, speaker_snapshot_label: string | null, };
+speaker_label: string | null, speaker_person_id: string | null, speaker_snapshot_label: string | null, };

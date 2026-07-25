@@ -11,7 +11,6 @@ pub(crate) use routes::history::*;
 pub(crate) use routes::models_api::*;
 pub(crate) use routes::pairing::*;
 pub(crate) use routes::pull_jobs::*;
-pub(crate) use routes::speakers::*;
 pub(crate) use routes::transcription::*;
 pub(crate) use routes::translation::*;
 pub(crate) use routes::voice_id::*;
@@ -140,12 +139,6 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         .route("/v1/devices", get(devices))
         .route("/v1/history", get(history_list))
         .route("/v1/history/{id}", get(history_get).delete(history_delete))
-        .route("/v1/speakers", get(list_speakers).post(create_speaker))
-        .route(
-            "/v1/speakers/{id}",
-            patch(rename_speaker).delete(delete_speaker),
-        )
-        .route("/v1/speakers/{id}/reenroll", post(reenroll_speaker))
         .route(
             "/v1/voice-id/persons",
             get(list_persons).post(enroll_person),

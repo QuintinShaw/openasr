@@ -406,12 +406,6 @@ pub(crate) enum Command {
         #[command(flatten)]
         language_task: LanguageTaskCliOptions,
     },
-    /// Manage local voice-match profiles for diarization display names. This is
-    /// not authentication; only embeddings are stored.
-    Speaker {
-        #[command(subcommand)]
-        command: SpeakerCommand,
-    },
     /// Run the committed performance suite (RTF + peak RSS + WER) and gate
     /// against a baseline.
     BenchSuite {
@@ -650,23 +644,6 @@ pub(crate) enum ConfigCommand {
     Set { key: String, value: String },
     /// Remove one saved config value.
     Unset { key: String },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum SpeakerCommand {
-    /// Enroll a voice-match profile from a recording.
-    Enroll {
-        /// 16 kHz mono PCM16 WAV with at least five seconds of speech.
-        input: PathBuf,
-        /// Display name to use when this voice match wins.
-        #[arg(long, default_value = openasr_core::diarize::enrollment::DEFAULT_ENROLLED_NAME)]
-        name: String,
-        /// Cosine similarity (0-1) required for this voice match.
-        #[arg(long)]
-        match_similarity: Option<f32>,
-    },
-    /// Remove all local voice-match profiles.
-    Clear,
 }
 
 #[derive(Debug, Subcommand)]

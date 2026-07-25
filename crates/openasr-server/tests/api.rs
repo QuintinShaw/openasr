@@ -43,69 +43,6 @@ fn sample_wav_bytes() -> Vec<u8> {
     std::fs::read(path).unwrap()
 }
 
-struct EnvRestore {
-    key: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl EnvRestore {
-    fn set(key: &'static str, value: Option<&std::path::Path>) -> Self {
-        let restore = Self {
-            key,
-            previous: std::env::var_os(key),
-        };
-        match value {
-            Some(path) => unsafe { std::env::set_var(key, path) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-        restore
-    }
-}
-
-impl Drop for EnvRestore {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(value) => unsafe { std::env::set_var(self.key, value) },
-            None => unsafe { std::env::remove_var(self.key) },
-        }
-    }
-}
-
-async fn with_empty_openasr_home<T, F>(home: &std::path::Path, future: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    static ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    let lock = ENV_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
-    let _guard = lock.lock().await;
-    let _home = EnvRestore::set("OPENASR_HOME", Some(home));
-    let _redimnet = EnvRestore::set("OPENASR_REDIMNET_PACK", None);
-    future.await
-}
-
-fn pcm16_mono_wav_bytes(seconds: u32, sample_value: i16) -> Vec<u8> {
-    let sample_rate = 16_000u32;
-    let samples = sample_rate * seconds;
-    let data_bytes = samples * 2;
-    let mut out = Vec::with_capacity(44 + data_bytes as usize);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + data_bytes).to_le_bytes());
-    out.extend_from_slice(b"WAVEfmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&sample_rate.to_le_bytes());
-    out.extend_from_slice(&(sample_rate * 2).to_le_bytes());
-    out.extend_from_slice(&2u16.to_le_bytes());
-    out.extend_from_slice(&16u16.to_le_bytes());
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_bytes.to_le_bytes());
-    for _ in 0..samples {
-        out.extend_from_slice(&sample_value.to_le_bytes());
-    }
-    out
-}
-
 struct ServerInstanceTokenEnvRestore {
     previous: Option<std::ffi::OsString>,
 }
@@ -1983,37 +1920,6 @@ fn multipart_request(model: &str, file_name: &str, bytes: &[u8]) -> Request<Body
     multipart_request_with_diarize(model, file_name, bytes, false)
 }
 
-fn speaker_multipart_request(uri: &str, name: Option<&str>, wav_bytes: &[u8]) -> Request<Body> {
-    let boundary = "openasr-speaker-boundary";
-    let mut body = Vec::new();
-    if let Some(name) = name {
-        body.extend_from_slice(
-            format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\n{name}\r\n"
-            )
-            .as_bytes(),
-        );
-    }
-    body.extend_from_slice(
-        format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"wav\"; filename=\"speaker.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
-        )
-        .as_bytes(),
-    );
-    body.extend_from_slice(wav_bytes);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-
-    Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header(
-            header::CONTENT_TYPE,
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(Body::from(body))
-        .unwrap()
-}
-
 fn write_voiceprint_store(home: &std::path::Path) -> String {
     let id = "vp_aaaaaaaaaaaaaaaa".to_string();
     let profile = openasr_core::diarize::enrollment::SpeakerProfile {
@@ -2038,248 +1944,31 @@ fn write_voiceprint_store(home: &std::path::Path) -> String {
 }
 
 #[tokio::test]
-async fn speaker_routes_require_operator_credentials_for_paired_devices() {
-    let temp = tempfile::tempdir().unwrap();
-    let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
-        openasr_server::ServerRuntime::default(),
-        openasr_server::DistributionRuntime {
-            openasr_home: Some(temp.path().join("home")),
-            catalog_url: None,
-            catalog_local_override: None,
-        },
-        openasr_server::ServerLaunchOptions {
-            auth: openasr_server::ServerAuth::pairing("admin-secret"),
-            ..Default::default()
-        },
-    );
-    let (_device_id, bearer_token) =
-        create_approved_pairing_credential(&app, "Remote Compute Mac").await;
-
-    let paired = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/speakers")
-                .header(header::AUTHORIZATION, format!("Bearer {bearer_token}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(paired.status(), StatusCode::FORBIDDEN);
-
-    let operator = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/speakers")
-                .header(header::AUTHORIZATION, "Bearer admin-secret")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(operator.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn speaker_routes_list_rename_and_delete_profiles() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
-    let legacy_id = write_voiceprint_store(&home);
+async fn legacy_speaker_routes_are_not_registered() {
     let app = openasr_server::app_with_runtime_and_distribution(
         openasr_server::ServerRuntime::default(),
-        openasr_server::DistributionRuntime {
-            openasr_home: Some(home),
-            catalog_url: None,
-            catalog_local_override: None,
-        },
+        openasr_server::DistributionRuntime::default(),
     );
-
-    let list = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/speakers")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(list.status(), StatusCode::OK);
-    let body = to_bytes(list.into_body(), 1024 * 64).await.unwrap();
-    let json: Value = serde_json::from_slice(&body).unwrap();
-    // Migrated persons keep the legacy vp_* public id for compatibility.
-    assert_eq!(json["data"][0]["id"], legacy_id);
-    assert_eq!(json["data"][0]["name"], "Alice");
-    assert_eq!(json["data"][0]["sample_seconds"], 5.25);
-    // Legacy space is non-matchable against the active embedder.
-    assert_eq!(json["data"][0]["compatible"], false);
-
-    let renamed = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PATCH")
-                .uri(format!("/v1/speakers/{legacy_id}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({ "name": "Alicia" }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(renamed.status(), StatusCode::OK);
-    let body = to_bytes(renamed.into_body(), 1024 * 64).await.unwrap();
-    let json: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["id"], legacy_id);
-    assert_eq!(json["name"], "Alicia");
-
-    let deleted = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri(format!("/v1/speakers/{legacy_id}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(deleted.status(), StatusCode::OK);
-    let body = to_bytes(deleted.into_body(), 1024 * 64).await.unwrap();
-    let json: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["id"], legacy_id);
-    assert_eq!(json["deleted"], true);
-
-    let list = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/speakers")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = to_bytes(list.into_body(), 1024 * 64).await.unwrap();
-    let json: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["data"].as_array().unwrap().len(), 0);
-}
-
-#[tokio::test]
-async fn speaker_enrollment_routes_reject_short_silent_and_missing_pack() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
-    let app = openasr_server::app_with_runtime_and_distribution(
-        openasr_server::ServerRuntime::default(),
-        openasr_server::DistributionRuntime {
-            openasr_home: Some(home.clone()),
-            catalog_url: None,
-            catalog_local_override: None,
-        },
-    );
-
-    with_empty_openasr_home(&home, async {
-        let short = app
-            .clone()
-            .oneshot(speaker_multipart_request(
-                "/v1/speakers",
-                Some("Alice"),
-                &pcm16_mono_wav_bytes(4, 1_000),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(short.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(short.into_body(), 1024 * 64).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("too short")
-        );
-
-        let silent = app
-            .clone()
-            .oneshot(speaker_multipart_request(
-                "/v1/speakers",
-                Some("Alice"),
-                &pcm16_mono_wav_bytes(6, 0),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(silent.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(silent.into_body(), 1024 * 64).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("silent")
-        );
-
-        let missing_pack = app
-            .clone()
-            .oneshot(speaker_multipart_request(
-                "/v1/speakers",
-                Some("Alice"),
-                &pcm16_mono_wav_bytes(6, 1_000),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(missing_pack.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(missing_pack.into_body(), 1024 * 64).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("speaker-embedder pack")
-        );
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("redimnet2-b6-cn")
-        );
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn speaker_reenroll_rejects_legacy_overwrite_path() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
-    let id = write_voiceprint_store(&home);
-    let app = openasr_server::app_with_runtime_and_distribution(
-        openasr_server::ServerRuntime::default(),
-        openasr_server::DistributionRuntime {
-            openasr_home: Some(home.clone()),
-            catalog_url: None,
-            catalog_local_override: None,
-        },
-    );
-
-    with_empty_openasr_home(&home, async {
+    for (method, uri) in [
+        ("GET", "/v1/speakers"),
+        ("POST", "/v1/speakers"),
+        ("PATCH", "/v1/speakers/vp_aaaaaaaaaaaaaaaa"),
+        ("DELETE", "/v1/speakers/vp_aaaaaaaaaaaaaaaa"),
+        ("POST", "/v1/speakers/vp_aaaaaaaaaaaaaaaa/reenroll"),
+    ] {
         let response = app
-            .oneshot(speaker_multipart_request(
-                &format!("/v1/speakers/{id}/reenroll"),
-                None,
-                &pcm16_mono_wav_bytes(6, 1_000),
-            ))
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        let message = json["error"]["message"].as_str().unwrap();
-        assert!(
-            message.contains("reenroll is not supported")
-                || message.contains("/v1/voice-id/persons"),
-            "unexpected reenroll rejection message: {message}"
-        );
-    })
-    .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+    }
 }
 
 #[tokio::test]

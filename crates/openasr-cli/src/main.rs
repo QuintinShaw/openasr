@@ -237,7 +237,6 @@ async fn run() -> Result<()> {
             task: language_task.task,
             consent: consent::PullConsent::resolve(yes, offline),
         }),
-        Command::Speaker { command } => speaker_command(command),
         Command::Apikey { command } => apikey_command(command),
         Command::BenchSuite {
             config,
@@ -786,123 +785,6 @@ fn print_quant_preference_doctor(
         ),
         Err(_) => println!("Quant preference: {preference_label} (no installed pack)"),
     }
-}
-
-fn speaker_command(command: SpeakerCommand) -> Result<()> {
-    match command {
-        SpeakerCommand::Enroll {
-            input,
-            name,
-            match_similarity,
-        } => enroll_speaker(&input, &name, match_similarity),
-        SpeakerCommand::Clear => clear_speaker_profiles(),
-    }
-}
-
-fn clear_speaker_profiles() -> Result<()> {
-    let home = openasr_core::openasr_home()
-        .context("Could not determine the OpenASR home directory for the Voice ID store.")?;
-    let store = openasr_core::diarize::voice_id::open_store_with_v1_migration(&home)
-        .map_err(|reason| anyhow::anyhow!("Could not open Voice ID store: {reason}."))?;
-    let persons = store
-        .list_persons(None)
-        .map_err(|reason| anyhow::anyhow!("Could not list Voice ID persons: {reason}."))?;
-    if persons.is_empty() {
-        println!("No Voice ID persons to remove under {}.", home.display());
-        return Ok(());
-    }
-    let mut removed = 0usize;
-    for person in persons {
-        let person_id = openasr_core::diarize::voice_id::PersonId::parse(&person.person_id)
-            .map_err(|reason| anyhow::anyhow!("Invalid person id in store: {reason}."))?;
-        store
-            .delete_person(&person_id, None, "cli_speaker_clear")
-            .map_err(|reason| anyhow::anyhow!("Could not delete person: {reason}."))?;
-        removed += 1;
-    }
-    println!(
-        "Removed {removed} Voice ID person(s) under {}.",
-        home.display()
-    );
-    Ok(())
-}
-
-fn enroll_speaker(input: &Path, name: &str, match_similarity: Option<f32>) -> Result<()> {
-    if let Some(similarity) = match_similarity
-        && !(0.0..=1.0).contains(&similarity)
-    {
-        anyhow::bail!("--match-similarity must be between 0 and 1.");
-    }
-    if match_similarity.is_some() {
-        eprintln!(
-            "note: --match-similarity is ignored for Voice ID v2; matching uses the ReDimNet2-B6 embedder calibration."
-        );
-    }
-    let home = openasr_core::openasr_home()
-        .context("Could not determine the OpenASR home directory for the Voice ID store.")?;
-    let store = openasr_core::diarize::voice_id::open_store_with_v1_migration(&home)
-        .map_err(|reason| anyhow::anyhow!("Could not open Voice ID store: {reason}."))?;
-    let embedder = openasr_core::diarize::embed::shared_embedder().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Could not create speaker voice match: {}\nInstall {} first.",
-            openasr_core::diarize::embed::SPEAKER_EMBEDDER_PACK_LABEL,
-            openasr_core::diarize::embed::SPEAKER_EMBEDDER_PACK_ID,
-        )
-    })?;
-    let identity = openasr_core::diarize::embed::shared_embedder_identity()
-        .cloned()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Could not create speaker voice match: {} is missing.",
-                openasr_core::diarize::embed::SPEAKER_EMBEDDER_PACK_LABEL,
-            )
-        })?;
-    let pcm = openasr_core::load_native_wav_16khz_mono_f32_v0(
-        input,
-        "speaker enrollment",
-        input.to_str().unwrap_or("speaker enrollment input"),
-    )
-    .map_err(|reason| {
-        anyhow::anyhow!(
-            "Could not create speaker voice match: {reason}.\nEnrollment needs a 16 kHz mono WAV. Convert any audio first:\n  ffmpeg -i {} -ac 1 -ar 16000 -c:a pcm_s16le enroll.wav\nthen: openasr speaker enroll enroll.wav --name \"{name}\"",
-            input.display()
-        )
-    })?;
-    let person = openasr_core::diarize::voice_id::enroll_person_from_clips(
-        &store,
-        name,
-        openasr_core::diarize::voice_id::ConsentRecord {
-            granted_at: openasr_core::diarize::voice_id::timestamp_now(),
-            notice_version: "cli-speaker-enroll-v1".into(),
-            capture_method: "cli".into(),
-        },
-        vec![openasr_core::diarize::voice_id::EnrollmentClip {
-            samples: pcm,
-            capture_context: openasr_core::diarize::voice_id::CaptureContext {
-                device_class: "unknown".into(),
-                input_route: "cli".into(),
-                environment_hint: None,
-                sample_label: Some(input.display().to_string()),
-            },
-        }],
-        embedder,
-        &identity,
-        None,
-    )
-    .map_err(|reason| {
-        anyhow::anyhow!(
-            "Could not create speaker voice match: {reason}.\nEnrollment needs a 16 kHz mono WAV. Convert any audio first:\n  ffmpeg -i {} -ac 1 -ar 16000 -c:a pcm_s16le enroll.wav\nthen: openasr speaker enroll enroll.wav --name \"{name}\"",
-            input.display()
-        )
-    })?;
-    println!(
-        "Created Voice ID person '{}' ({}) from {}.\nSaved under {}. Diarized output can use this display name on the next session; run `openasr speaker clear` to remove local persons.",
-        person.display_name,
-        person.person_id,
-        input.display(),
-        home.display()
-    );
-    Ok(())
 }
 
 fn apikey_command(command: ApiKeyCommand) -> Result<()> {

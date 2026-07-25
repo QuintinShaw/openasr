@@ -601,7 +601,6 @@ impl NativeAsrSession for TestServerNativeSession {
                 language: None,
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
             },
@@ -626,7 +625,6 @@ impl NativeAsrSession for TestServerNativeSession {
                 language: None,
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
             },
@@ -867,7 +865,6 @@ impl NativeAsrSession for MultiFinalizeNativeSession {
                 language: None,
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
             },
@@ -894,7 +891,6 @@ impl NativeAsrSession for MultiFinalizeNativeSession {
                 language: None,
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
             },
@@ -3866,7 +3862,6 @@ fn transcript_partial_text(text: &str, revision: u64, end_ms: u64) -> RealtimeTr
         language: Some("zh".to_string()),
         speaker: None,
         speaker_label: None,
-        speaker_profile_id: None,
         speaker_person_id: None,
         speaker_snapshot_label: None,
     })
@@ -3885,7 +3880,6 @@ fn transcript_final_text(text: &str, revision: u64, end_ms: u64) -> RealtimeTran
         language: Some("zh".to_string()),
         speaker: None,
         speaker_label: None,
-        speaker_profile_id: None,
         speaker_person_id: None,
         speaker_snapshot_label: None,
     })
@@ -3906,7 +3900,6 @@ fn transcript_revision_text(text: &str, revision: u64, end_ms: u64) -> RealtimeT
         language: Some("zh".to_string()),
         speaker: None,
         speaker_label: None,
-        speaker_profile_id: None,
         speaker_person_id: None,
         speaker_snapshot_label: None,
     })
@@ -5145,7 +5138,6 @@ fn native_transcript_final_envelope_with_text(
             language: None,
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
         },
@@ -5182,18 +5174,6 @@ fn envelope_speaker_label(envelope: &RealtimeEventEnvelope) -> Option<String> {
     }
 }
 
-fn envelope_speaker_profile_id(envelope: &RealtimeEventEnvelope) -> Option<String> {
-    match &envelope.event {
-        RealtimeEvent::Transcript(RealtimeTranscriptEvent::Final(event)) => {
-            event.speaker_profile_id.clone()
-        }
-        RealtimeEvent::Transcript(RealtimeTranscriptEvent::Partial(event)) => {
-            event.speaker_profile_id.clone()
-        }
-        _ => None,
-    }
-}
-
 fn matched_assignment() -> openasr_core::diarize::enrollment::SpeakerDisplayAssignment {
     openasr_core::diarize::enrollment::SpeakerDisplayAssignment {
         speaker_id: openasr_core::diarize::contract::SpeakerId(0),
@@ -5212,7 +5192,7 @@ fn resolved_native_speaker_slot(
 }
 
 #[tokio::test]
-async fn fallback_backend_result_emits_matched_profile_identity() {
+async fn fallback_backend_result_omits_deprecated_profile_wire_field() {
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
     session.controller = Some(started_controller(
@@ -5244,9 +5224,11 @@ async fn fallback_backend_result_emits_matched_profile_identity() {
         envelope_speaker_label(&event),
         Some("SPEAKER_00".to_string())
     );
-    assert_eq!(
-        envelope_speaker_profile_id(&event),
-        Some("vp_aaaaaaaaaaaaaaaa".to_string())
+    assert!(
+        serde_json::to_value(&event)
+            .unwrap()
+            .get("speaker_profile_id")
+            .is_none()
     );
 }
 
@@ -5279,7 +5261,12 @@ async fn native_speaker_labels_bind_in_finalize_order() {
         .await;
     assert_eq!(envelope_speaker(&terminal), Some("SPEAKER_00".to_string()));
     assert_eq!(envelope_speaker_label(&terminal), None);
-    assert_eq!(envelope_speaker_profile_id(&terminal), None);
+    assert!(
+        serde_json::to_value(&terminal)
+            .unwrap()
+            .get("speaker_profile_id")
+            .is_none()
+    );
 
     // Later events of the bound utterance (post-final revisions) reuse it.
     let mut replay = native_transcript_final_envelope("utt_1", 3);
@@ -5432,7 +5419,7 @@ async fn native_split_slots_bind_interleaved_max_and_speaker_change_outcomes() {
 }
 
 #[tokio::test]
-async fn native_speaker_label_stamping_carries_matched_profile_identity() {
+async fn native_speaker_label_stamping_omits_deprecated_profile_wire_field() {
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
     session
@@ -5449,9 +5436,11 @@ async fn native_speaker_label_stamping_carries_matched_profile_identity() {
         envelope_speaker_label(&terminal),
         Some("SPEAKER_00".to_string())
     );
-    assert_eq!(
-        envelope_speaker_profile_id(&terminal),
-        Some("vp_aaaaaaaaaaaaaaaa".to_string())
+    assert!(
+        serde_json::to_value(&terminal)
+            .unwrap()
+            .get("speaker_profile_id")
+            .is_none()
     );
 }
 
@@ -5693,7 +5682,6 @@ fn native_final_envelope_with(
             language: None,
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
         },

@@ -59,7 +59,6 @@ impl FakeStreamingSession {
                 language: None,
                 speaker: None,
                 speaker_label: None,
-                speaker_profile_id: None,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
             },
@@ -80,7 +79,6 @@ impl FakeStreamingSession {
             language: Some("en".to_string()),
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
         }))

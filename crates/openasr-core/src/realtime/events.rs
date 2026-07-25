@@ -282,11 +282,6 @@ pub struct RealtimeTranscriptPartial {
     /// by an enrolled voice-match display name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
-    /// Voice-match profile id (`vp_*`) when the utterance matched an enrolled
-    /// profile. This is not an authentication claim. Deprecated in favor of
-    /// `speaker_person_id`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub speaker_profile_id: Option<String>,
     /// Stable Voice ID person id when a v2 match was accepted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_person_id: Option<String>,
@@ -318,11 +313,6 @@ pub struct RealtimeTranscriptFinal {
     /// by an enrolled voice-match display name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
-    /// Voice-match profile id (`vp_*`) when the utterance matched an enrolled
-    /// profile. This is not an authentication claim. Deprecated in favor of
-    /// `speaker_person_id`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub speaker_profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_person_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -355,11 +345,6 @@ pub struct RealtimeTranscriptRevision {
     /// by an enrolled voice-match display name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
-    /// Voice-match profile id (`vp_*`) when the utterance matched an enrolled
-    /// profile. This is not an authentication claim. Deprecated in favor of
-    /// `speaker_person_id`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub speaker_profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_person_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -626,7 +611,6 @@ mod tests {
                     language: None,
                     speaker: None,
                     speaker_label: None,
-                    speaker_profile_id: None,
                     speaker_person_id: None,
                     speaker_snapshot_label: None,
                 },
@@ -679,7 +663,6 @@ mod tests {
                     language: Some("en".to_string()),
                     speaker: None,
                     speaker_label: None,
-                    speaker_profile_id: None,
                     speaker_person_id: None,
                     speaker_snapshot_label: None,
                 },
@@ -791,7 +774,6 @@ mod tests {
             language: None,
             speaker: None,
             speaker_label: None,
-            speaker_profile_id: None,
             speaker_person_id: None,
             speaker_snapshot_label: None,
         };
