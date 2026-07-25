@@ -2073,6 +2073,15 @@ mod tests {
         );
         assert_eq!(
             conn.query_row(
+                "SELECT value FROM voice_id_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            conn.query_row(
                 "SELECT color_preference FROM persons WHERE person_id = 'person_legacy'",
                 [],
                 |row| row.get::<_, String>(0),
@@ -2124,6 +2133,16 @@ mod tests {
         assert_eq!(
             migrated
                 .query_row(
+                    "SELECT value FROM voice_id_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "3"
+        );
+        assert_eq!(
+            migrated
+                .query_row(
                     "SELECT color_preference FROM persons WHERE person_id = 'person_legacy'",
                     [],
                     |row| row.get::<_, Option<String>>(0),
@@ -2142,9 +2161,19 @@ mod tests {
             "#123456"
         );
         drop(migrated);
-        store
+        let reopened = store
             .connection()
             .expect("completed migrations are idempotent");
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT value FROM voice_id_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "3"
+        );
     }
 
     #[test]
