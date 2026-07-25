@@ -47,24 +47,46 @@ pub(crate) const MOSS_TD_ADAPTOR_NORM_EPSILON: f32 = 1e-6;
 /// reserves ~30 GB of address space (28 layers x 2 x 131072 x 8 x 128 x 4 B).
 /// That reservation is lazy-zeroed and harmless on the CPU backend (only the
 /// touched prefix is resident), but the Metal backend physically wires the
-/// buffers and exhausts a 16 GB machine. Cap the preallocation at a pragmatic
-/// ASR context length -- 8192 mirrors qwen3-asr's own audio-encoder value -- so
-/// real utterances (audio tokens + prompt + generated tokens) stay comfortably
-/// under it while the reservation drops to ~1.9 GB. A sequence longer than the
-/// cap fails closed at the cache's own bounds check, never by over-allocating.
+/// buffers and exhausts a 16 GB machine. This is a ceiling on top of the
+/// request-sized capacity `llm_decoder::new_kv_caches` computes (prompt +
+/// generation-budget tokens for the utterance actually being decoded, mirroring
+/// `firered_llm`/`mimo_asr`'s identical sizing) -- NOT the value that capacity
+/// is unconditionally forced to. Sizing every request to this cap
+/// unconditionally previously made the fixed Metal/GPU reuse-graph KV/mask/
+/// RoPE span 8192-wide regardless of real utterance length and made a
+/// several-minute clip's 28-layer x 8192-wide single-shot device allocation
+/// exhaust Metal's working set outright (OOM) even though the utterance's real
+/// demand was far below the cap. The executor validates the complete
+/// prompt-plus-generation request against this ceiling before constructing a
+/// decoder cache, so an over-limit request fails closed instead of allocating a
+/// cache that cannot serve its configured decode budget.
 ///
 /// Lesson, recorded so it does not recur: `max_position_embeddings` is an
 /// attention/positional-encoding ceiling, not a working-set size; the two must
 /// not be conflated when sizing runtime buffers.
 pub(crate) const MOSS_TD_MAX_KV_CACHE_POSITIONS: usize = 8192;
 
-/// Clamp a decoder `max_positions` value (which may be the raw RoPE context
-/// limit) to the KV-cache preallocation cap. Both the runtime decoder
-/// (`llm_decoder::new_kv_caches`) and the pack importer
-/// (`package_import`) route through this so a pack built before the cap (with
-/// 131072 baked in) and a freshly built pack allocate identically.
+/// Clamp a KV-cache capacity (request-sized, or the raw RoPE context limit for
+/// the pack importer's own bookkeeping) to the family-wide preallocation cap.
+/// Both the runtime decoder and the pack importer route their respective bounds
+/// through this, so neither ever allocates past the cap.
 pub(crate) fn moss_td_kv_cache_positions(max_positions: usize) -> usize {
     max_positions.min(MOSS_TD_MAX_KV_CACHE_POSITIONS)
+}
+
+/// Return the exact request-sized KV allocation when its complete decode budget
+/// fits both the imported pack's advertised ceiling and the family-wide cap.
+/// `None` is a fail-closed result: callers must reject the request before
+/// constructing a decoder cache, rather than clamp it and hit a KV bounds error
+/// partway through generation.
+pub(crate) fn moss_td_request_kv_cache_positions(
+    pack_max_positions: usize,
+    prompt_tokens: usize,
+    max_generated_tokens: usize,
+) -> Option<usize> {
+    let request_positions = prompt_tokens.checked_add(max_generated_tokens)?;
+    (request_positions <= moss_td_kv_cache_positions(pack_max_positions))
+        .then_some(request_positions)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,5 +328,28 @@ mod tests {
         assert_eq!(moss_td_kv_cache_positions(8_192), 8_192);
         // A short-enough value passes through untouched.
         assert_eq!(moss_td_kv_cache_positions(300), 300);
+    }
+
+    #[test]
+    fn request_kv_cache_capacity_respects_pack_ceiling_and_decode_budget() {
+        // A legacy pack retains its raw RoPE metadata, but a short request only
+        // allocates the prompt plus its configured generation budget.
+        assert_eq!(
+            moss_td_request_kv_cache_positions(131_072, 300, 4_096),
+            Some(4_396)
+        );
+        // A freshly imported pack advertises the same 8192-position ceiling.
+        assert_eq!(
+            moss_td_request_kv_cache_positions(8_192, 4_096, 4_096),
+            Some(8_192)
+        );
+        // Never let an imported lower ceiling be silently expanded.
+        assert_eq!(moss_td_request_kv_cache_positions(4_096, 1, 4_096), None);
+        // Arithmetic overflow is also fail-closed rather than saturating into
+        // an undersized cache.
+        assert_eq!(
+            moss_td_request_kv_cache_positions(8_192, usize::MAX, 1),
+            None
+        );
     }
 }

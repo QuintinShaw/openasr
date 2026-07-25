@@ -1031,12 +1031,13 @@ fn moss_td_runtime_gguf_metadata(
         .u32("moss_td.llm.n_kv_heads", text.num_key_value_heads as u32)
         .u32("moss_td.llm.head_dim", text.head_dim as u32)
         .u32("moss_td.llm.vocab_size", tokens.len() as u32)
-        // Write a pragmatic KV-cache capacity, NOT the raw RoPE context limit
-        // (`max_position_embeddings` = 131072). The runtime caps this again on
-        // load (`llm_decoder::new_kv_caches`), so this keeps freshly built packs
-        // self-describing with the same value the runtime will use, rather than
-        // baking in a 131072 that would (uncapped) reserve ~30 GB of KV cache.
-        // See `runtime_contract::moss_td_kv_cache_positions`.
+        // Write the capped decoder context ceiling, NOT the raw RoPE context
+        // limit (`max_position_embeddings` = 131072). At execution time the
+        // decoder further narrows this ceiling to each request's prompt plus
+        // generation budget, while preserving this imported value as the
+        // fail-closed upper bound. This avoids baking a 131072-position cache
+        // contract into fresh packs. See
+        // `runtime_contract::moss_td_request_kv_cache_positions`.
         .u32(
             "moss_td.llm.max_positions",
             moss_td_kv_cache_positions(text.max_position_embeddings) as u32,
@@ -1090,6 +1091,32 @@ mod tests {
             },
         };
         assert!(validate_moss_config(&config).is_ok());
+    }
+
+    #[test]
+    fn imported_metadata_keeps_the_capped_context_as_a_runtime_ceiling() {
+        let config = base_config_for_test();
+        let request = MossTdImportRequest {
+            source_root: PathBuf::from("/tmp/moss-source"),
+            output_root: PathBuf::from("/tmp/moss-pack.oasr"),
+            model_id: "moss-test".to_string(),
+            quantization: MossTdQuantizationMode::Fp16,
+        };
+        let metadata = moss_td_runtime_gguf_metadata(
+            &config,
+            &request,
+            &["token".to_string()],
+            &[],
+            MossTdAudioTokenIds {
+                start: 151_669,
+                end: 151_670,
+                pad: 151_671,
+            },
+        );
+        assert_eq!(
+            metadata.get("moss_td.llm.max_positions"),
+            Some(&GgufWriteValue::U32(8_192))
+        );
     }
 
     #[test]
