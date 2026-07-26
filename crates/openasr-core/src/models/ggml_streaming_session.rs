@@ -279,7 +279,7 @@ where
                     .inference_threads
                     .and_then(|value| u16::try_from(value).ok()),
             )
-            .with_diarization(request.configured_diarize)
+            .with_voice_id(request.configured_diarize)
             .with_partial_results(request.session_config.partial_results)
             .with_word_timestamps(request.session_config.word_timestamps);
         let native_session_config: NativeAsrStreamingSessionConfig =

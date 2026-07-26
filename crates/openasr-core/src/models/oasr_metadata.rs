@@ -8,10 +8,15 @@ pub const OASR_METADATA_KEY_MODEL_FAMILY: &str = "openasr.model.family";
 pub const OASR_METADATA_KEY_MODEL_ARCHITECTURE: &str = "openasr.model.architecture";
 pub const OASR_METADATA_KEY_AUDIO_FRONTEND: &str = "openasr.audio.frontend";
 pub const OASR_METADATA_KEY_DECODE_POLICY: &str = "openasr.decode.policy";
+/// Self-description written by an auxiliary diarization pack (the pyannote
+/// segmenter) so `openasr model inspect` can name what a pack is. NOT a
+/// capability judge: which ASR family carries speaker structure in its own
+/// decode is declared once on the arch descriptor
+/// (`arch::SpeakerSegmentationSource`), never re-derived from pack metadata --
+/// a published pack that predates any such key is still the same architecture.
 pub const OASR_METADATA_KEY_FEATURE_DIARIZATION: &str = "openasr.features.diarization";
 
 pub const OASR_PACKAGE_VERSION_V1: &str = "1";
-pub const OASR_FEATURE_DIARIZATION_COHERE_TOKEN_STREAM_V1: &str = "cohere-token-stream-v1";
 
 /// Shared `tokenizer.ggml.*` GGUF key names. Every builtin tokenizer family
 /// (cohere, hymt2, moonshine, whisper, qwen) reads/writes the same three keys

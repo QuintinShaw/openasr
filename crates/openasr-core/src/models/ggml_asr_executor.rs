@@ -189,7 +189,12 @@ pub struct GgmlAsrExecutionOptions {
     /// collection) and derives anchors post hoc from the generated tokens
     /// instead of the higher-fidelity cross-attention alignment.
     pub word_timestamps_forced_for_diarization: bool,
-    pub diarize: bool,
+    /// Whether this family's own decode should carry speaker structure. Set
+    /// only for a family whose `arch::SpeakerSegmentationSource` is
+    /// `InDecoder` and only when the request asked for Voice ID; the external
+    /// VAD + speaker-embedder path never sets it, which is what keeps the two
+    /// segmentation sources mutually exclusive.
+    pub in_decoder_speakers: bool,
     pub longform: Option<LongFormOptions>,
     pub longform_chunk_count_hint: Option<usize>,
     /// Set from the architecture descriptor when the arch signals that multi-chunk
@@ -240,7 +245,7 @@ impl GgmlAsrExecutionOptions {
             inference_threads: None,
             word_timestamps: false,
             word_timestamps_forced_for_diarization: false,
-            diarize: false,
+            in_decoder_speakers: false,
             longform,
             longform_chunk_count_hint: None,
             prefer_cpu_decoder_for_multichunk_metal: false,

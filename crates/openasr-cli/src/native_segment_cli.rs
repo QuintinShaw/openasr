@@ -164,7 +164,7 @@ fn batch_item_transcription_request(
                 .and_then(|name| name.to_str())
                 .map(str::to_string),
         )
-        .with_diarization(context.diarize)
+        .with_voice_id(context.diarize)
         .with_diarize_speakers(context.speakers)
         .with_prepared_samples(prepared.shared_samples())
 }
@@ -1710,15 +1710,17 @@ mod tests {
         assert!(error.contains("redimnet2-b6-cn"));
         assert!(error.contains(backend_name(BackendKind::Mock)));
 
-        let base_runtime_path = temp.path().join("cohere-base.oasr");
+        let base_runtime_path = temp.path().join("whisper-base.oasr");
         let base_spec =
-            openasr_core::testing::TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-base");
+            openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu(
+                "whisper-base",
+            );
         openasr_core::testing::write_tiny_gguf_runtime_source(&base_runtime_path, &base_spec)
             .unwrap();
 
         let error =
             ensure_diarization_supported(BackendKind::Native, Some(&base_runtime_path), true)
-                .expect_err("base native pack must keep diarization fail-closed")
+                .expect_err("a family with no speaker source of its own must fail closed")
                 .to_string();
         assert!(error.contains("speaker-embedder pack"));
         assert!(error.contains("redimnet2-b6-cn"));
@@ -1734,25 +1736,6 @@ mod tests {
             .expect("ReDimNet2-B6 pack should pass the CLI gate for any native pack");
         ensure_diarization_supported(BackendKind::Native, None, true)
             .expect("ReDimNet2-B6 pack should pass the CLI gate without a pack path");
-
-        let declared_runtime_path = temp.path().join("cohere-diarize.oasr");
-        let declared_spec =
-            openasr_core::testing::TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(
-                "cohere-diarize",
-            )
-            .with_metadata(
-                openasr_core::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_DIARIZATION,
-                openasr_core::models::oasr_metadata::OASR_FEATURE_DIARIZATION_COHERE_TOKEN_STREAM_V1,
-            )
-            .with_string_array_metadata("tokenizer.ggml.tokens", cohere_diarization_tokens());
-        openasr_core::testing::write_tiny_gguf_runtime_source(
-            &declared_runtime_path,
-            &declared_spec,
-        )
-        .unwrap();
-
-        ensure_diarization_supported(BackendKind::Native, Some(&declared_runtime_path), true)
-            .expect("declared Cohere diarization pack should pass the CLI gate");
     }
 
     #[test]
@@ -1804,42 +1787,6 @@ mod tests {
             Some(WordTimestampsMode::Aligned),
         )
         .expect("the mock backend never needs the native-only forced-aligner pack");
-    }
-
-    fn cohere_diarization_tokens() -> [&'static str; 31] {
-        [
-            "<|startofcontext|>",
-            "<|startoftranscript|>",
-            "<|emo:undefined|>",
-            "<|en|>",
-            "<|pnc|>",
-            "<|noitn|>",
-            "<|notimestamp|>",
-            "<|timestamp|>",
-            "<|nodiarize|>",
-            "<|diarize|>",
-            "<|endoftext|>",
-            "<|spltoken0|>",
-            "▁fixture11",
-            "▁fixture12",
-            "▁fixture13",
-            "▁fixture14",
-            "▁fixture15",
-            "▁fixture16",
-            "▁fixture17",
-            "▁fixture18",
-            "▁fixture19",
-            "▁fixture20",
-            "▁fixture21",
-            "▁fixture22",
-            "▁fixture23",
-            "▁fixture24",
-            "▁fixture25",
-            "▁fixture26",
-            "▁fixture27",
-            "▁fixture28",
-            "▁fixture29",
-        ]
     }
 
     #[test]

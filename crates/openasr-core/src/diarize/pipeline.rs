@@ -75,12 +75,29 @@ pub fn resolve_diarization_regions(samples: &[f32]) -> Option<Vec<DiarizationReg
 }
 
 /// Shortest speech segment (seconds) worth embedding; shorter regions give
-/// unreliable speaker embeddings and are skipped.
-const MIN_SEGMENT_S: f64 = 0.5;
+/// unreliable speaker embeddings and are skipped. Also the identity stage's
+/// floor for putting a *name* to a speaker (see
+/// `crate::diarize::voice_id::identity`): the same "too little voice to trust"
+/// judgement, applied to the same embedder.
+pub(crate) const MIN_EMBEDDING_EVIDENCE_SECONDS: f64 = 0.5;
+const MIN_SEGMENT_S: f64 = MIN_EMBEDDING_EVIDENCE_SECONDS;
 const MAX_EMBED_CHUNK_S: f64 = 5.0;
 
-/// The result of batch diarization: speaker turns plus each speaker's mean
-/// (L2-normalized) embedding centroid, used for optional enrollment matching.
+/// What an **external speaker segmentation source** produces: recording-local
+/// speaker turns plus each speaker's mean (L2-normalized) embedding centroid.
+///
+/// This is the seam a new external source plugs into. The VAD + speaker-embedder
+/// pass below produces one today; the pyannote segmenter will produce one too,
+/// and nothing downstream changes -- `native_transcribe` matches the centroids
+/// against Voice ID and `diarize::attribution` projects the turns onto
+/// transcript segments as `Segment::speaker_label`, which is the one
+/// recording-local speaker representation the rest of the engine consumes (a
+/// family that segments in its own decode writes the same field directly, see
+/// `arch::SpeakerSegmentationSource`).
+///
+/// `SpeakerId` is an arrival-order counter with no identity in it and no
+/// stability across recordings; the centroids are the only thing that may ever
+/// turn a turn into a named person.
 pub struct Diarization {
     pub turns: Vec<SpeakerTurn>,
     pub centroids: Vec<(SpeakerId, SpeakerEmbedding)>,

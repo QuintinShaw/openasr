@@ -34,7 +34,7 @@ impl NativeStreamingTranscriptEmitter {
         realtime_config.audio_format = session_config.audio_format;
         realtime_config.partial_results = options.partial_results && session_config.partial_results;
         realtime_config.word_timestamps = options.word_timestamps && session_config.word_timestamps;
-        realtime_config.diarize = options.diarize;
+        realtime_config.diarize = options.voice_id;
         realtime_config.trace_id = context.trace_id;
         realtime_config.request_id = context.request_id;
 

@@ -1174,17 +1174,16 @@ mod tests {
     }
 
     #[test]
-    fn transcription_capability_summary_derives_declared_cohere_diarization_pack() {
+    fn transcription_capability_summary_offers_voice_id_once_a_source_is_installed() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-diarize-runtime.oasr");
-        let spec = openasr_core::testing::TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(
-            "cohere-diarize-runtime-fixture",
-        )
-        .with_metadata(
-            openasr_core::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_DIARIZATION,
-            openasr_core::models::oasr_metadata::OASR_FEATURE_DIARIZATION_COHERE_TOKEN_STREAM_V1,
-        )
-        .with_string_array_metadata("tokenizer.ggml.tokens", cohere_diarization_tokens());
+        let _home = EnvVarRestore::set("OPENASR_HOME", temp.path().as_os_str());
+        let redimnet_pack = temp.path().join("redimnet.oasr");
+        std::fs::write(&redimnet_pack, b"GGUF\x00\x00\x00\x00").unwrap();
+        let _redimnet_pack = EnvVarRestore::set("OPENASR_REDIMNET_PACK", redimnet_pack.as_os_str());
+        let runtime_path = temp.path().join("whisper-runtime.oasr");
+        let spec = openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu(
+            "whisper-runtime-fixture",
+        );
         openasr_core::testing::write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
         let rendered = render_native_transcription_capability_summary(&runtime_path);
@@ -1193,54 +1192,18 @@ mod tests {
     }
 
     #[test]
-    fn transcription_capability_summary_keeps_base_cohere_diarization_unsupported() {
+    fn transcription_capability_summary_rejects_voice_id_without_a_source() {
         let temp = tempfile::tempdir().unwrap();
         let _redimnet_pack = EnvVarRestore::remove("OPENASR_REDIMNET_PACK");
         let _home = EnvVarRestore::set("OPENASR_HOME", temp.path().as_os_str());
-        let runtime_path = temp.path().join("cohere-runtime.oasr");
-        let spec = openasr_core::testing::TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(
-            "cohere-runtime-fixture",
+        let runtime_path = temp.path().join("whisper-runtime.oasr");
+        let spec = openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_non_streaming_cpu(
+            "whisper-runtime-fixture",
         );
         openasr_core::testing::write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
         let rendered = render_native_transcription_capability_summary(&runtime_path);
 
         assert!(rendered.contains("- diarization: supported=false, behavior=reject_request"));
-    }
-
-    fn cohere_diarization_tokens() -> [&'static str; 31] {
-        [
-            "<|startofcontext|>",
-            "<|startoftranscript|>",
-            "<|emo:undefined|>",
-            "<|en|>",
-            "<|pnc|>",
-            "<|noitn|>",
-            "<|notimestamp|>",
-            "<|timestamp|>",
-            "<|nodiarize|>",
-            "<|diarize|>",
-            "<|endoftext|>",
-            "<|spltoken0|>",
-            "▁fixture11",
-            "▁fixture12",
-            "▁fixture13",
-            "▁fixture14",
-            "▁fixture15",
-            "▁fixture16",
-            "▁fixture17",
-            "▁fixture18",
-            "▁fixture19",
-            "▁fixture20",
-            "▁fixture21",
-            "▁fixture22",
-            "▁fixture23",
-            "▁fixture24",
-            "▁fixture25",
-            "▁fixture26",
-            "▁fixture27",
-            "▁fixture28",
-            "▁fixture29",
-        ]
     }
 }

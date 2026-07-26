@@ -259,6 +259,45 @@ pub(crate) struct OpenAsrComponentDescriptor {
 /// consistency, and says so in its own comment).
 pub(crate) const DEFAULT_ENCODER_SAFE_CHUNK_SECONDS: f32 = 30.0;
 
+/// Where a family's speaker structure ("which turn belongs to which of the
+/// people speaking in this recording") comes from.
+///
+/// This is the *separation source* only. It says nothing about whether the
+/// user asked for speakers (that is the request-level Voice ID switch,
+/// `TranscriptionRequest::voice_id`) and nothing about identity (turning a
+/// recording-local turn label into a known person is the Voice ID matching
+/// stage in `crate::diarize::voice_id`, which runs on top of whichever source
+/// produced the turns). Keeping the three apart is what lets a self-segmenting
+/// family work without a speaker-embedder pack installed, and lets an
+/// embedder-equipped host name the speakers of a self-segmenting family.
+///
+/// The variants are mutually exclusive by construction: exactly one source
+/// produces the turns for a given transcription, so no second pass can
+/// overwrite the first's labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeakerSegmentationSource {
+    /// The family's own decode carries the speaker structure: cohere emits a
+    /// `<|spltoken0|>` control-token stream, moss-transcribe-diarize writes
+    /// inline `[t][Sxx]` markers as ordinary transcript characters. The family
+    /// normalizes its own markup into labeled [`crate::Segment`]s (parsing
+    /// stays under `models/<family>/`); the shared layer never sees the raw
+    /// markup.
+    InDecoder,
+    /// The family emits plain transcripts, so speaker structure has to come
+    /// from a separate segmenter over the same audio: today the model-agnostic
+    /// neural VAD + ReDimNet2-B6 speaker-embedder clustering path, and (next)
+    /// the pyannote segmenter, which plugs in at the same
+    /// `crate::diarize::pipeline::Diarization` boundary without any family
+    /// needing to change.
+    External,
+}
+
+impl SpeakerSegmentationSource {
+    pub fn is_in_decoder(self) -> bool {
+        matches!(self, Self::InDecoder)
+    }
+}
+
 /// How this architecture's encoder attends over time -- the single
 /// declaration of the encoder memory-scaling fact that longform safety caps
 /// consult (see `native_transcribe::apply_encoder_attention_span_longform_safety_policy`).
@@ -394,14 +433,11 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
     /// produced a `core.native.backend:metal` label on a gated-family Auto
     /// request that in fact ran entirely on CPU).
     pub auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
-    /// Whether this family's own decode loop can emit diarization tokens (the
-    /// cohere token-stream is the only builtin case today). The single
-    /// declaration of this architecture-level capability fact -- runtime
-    /// dispatch reads it via `GgmlFamilyAdapterDescriptor::self_diarizes`
-    /// rather than matching on `adapter_id` (see
-    /// `native_runtime_metadata_supports_diarization`, which still verifies
-    /// the specific pack actually carries the tokens before trusting this).
-    pub self_diarizes: bool,
+    /// Where this family's speaker structure comes from. The single
+    /// declaration of this architecture-level fact -- runtime dispatch reads
+    /// it via `GgmlFamilyAdapterDescriptor::speaker_segmentation` rather than
+    /// matching on `adapter_id`. See [`SpeakerSegmentationSource`].
+    pub speaker_segmentation: SpeakerSegmentationSource,
     /// Whether this family's transcripts include punctuation -- an
     /// architecture/training-corpus property, not a per-release editorial
     /// choice (e.g. Dolphin's training corpus has no punctuation to learn
@@ -467,7 +503,7 @@ impl OpenAsrArchitectureDescriptor {
             tokenizer_id: self.tokenizer_id,
             decode_policy_id: self.decode_policy_id,
             execution_capability: self.execution_capability,
-            self_diarizes: self.self_diarizes,
+            speaker_segmentation: self.speaker_segmentation,
         }
     }
 }
@@ -1172,7 +1208,16 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: true,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: true,
+        // The decoder does have a speaker-token mode (`<|diarize|>` ->
+        // `<|spltoken0|>` stream), but no published cohere pack can run it --
+        // enabling it needs re-converted, re-published packs. Declaring
+        // `External` is the honest state: cohere gets speakers from the
+        // model-agnostic segmentation path if one is installed, and reports
+        // the capability as unsupported if not, instead of advertising an
+        // in-decoder mode that would fail at decode time. Flip this (and
+        // restore `models::cohere::prompt`'s control-token switch) in the same
+        // change that ships packs carrying the tokens.
+        speaker_segmentation: SpeakerSegmentationSource::External,
         emits_punctuation: Some(true),
         hparam_schema: COHERE_TRANSCRIBE_HPARAM_SCHEMA,
         block_stack: Some(OpenAsrBlockStackDescriptor {
@@ -1222,7 +1267,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
         emits_punctuation: Some(true),
         hparam_schema: WHISPER_HPARAM_SCHEMA,
         // whisper remains the hand-written bit-level regression gate and is
@@ -1273,7 +1318,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // `ExceptMetal` once that follow-up lands (one-line change, the gate
         // machinery already exists).
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
         emits_punctuation: Some(true),
         hparam_schema: QWEN3_ASR_HPARAM_SCHEMA,
         block_stack: Some(OpenAsrBlockStackDescriptor {
@@ -1321,7 +1366,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
         // Character/BPE CTC: whether an imported checkpoint's vocab includes
         // punctuation depends on that specific checkpoint's training corpus,
         // not the architecture, so this cannot be stated as a fixed
@@ -1377,7 +1422,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
         // Verified on the imported pack: trained on transcripts that preserve
         // punctuation and capitalization (mirrors `_catalog.py`'s
         // `PUNCTUATION_BY_FAMILY["parakeet-tdt"]`).
@@ -1421,7 +1466,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
         // Character CTC: same BYO-checkpoint reasoning as parakeet-ctc above.
         emits_punctuation: None,
         hparam_schema: WAV2VEC2_CTC_HPARAM_SCHEMA,
@@ -1485,7 +1530,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // falls back to CPU on Metal specifically. An explicit `--backend
         // metal` request still gets Metal.
         auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
         emits_punctuation: Some(true),
         hparam_schema: XASR_ZIPFORMER_HPARAM_SCHEMA,
         // Zipformer2 uses multi-scale streaming cache topology plus RNN-T
@@ -1523,7 +1568,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
         emits_punctuation: Some(true),
         hparam_schema: MOONSHINE_HPARAM_SCHEMA,
         // Raw-waveform conv-stem + partial-RoPE seq2seq with a self-contained
@@ -1580,7 +1625,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // reproduce the golden transcript on the parity clip (CPU stays the
         // bit-exact reference gate).
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
         // DataoceanAI's cn-dialect-small training corpus is transcribed
         // without punctuation and the model has no punctuation-prediction
         // head/token to enable -- honestly unpunctuated, not "unknown".
@@ -1623,7 +1668,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
         emits_punctuation: Some(true),
         hparam_schema: SENSEVOICE_HPARAM_SCHEMA,
         // Non-autoregressive CTC: SAN-M/FSMN encoder + CTC head, no decoder
@@ -1672,7 +1717,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
         // The reference tokenizer's dict.txt has no punctuation/<space>
         // entries (char + SPM vocab trained on unpunctuated Mandarin ASR
         // corpora); verified on the golden-diff fixture transcript.
@@ -1725,7 +1770,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
         // Qwen2's ChatML decode is a plain transcription completion -- no
         // learned punctuation-suppression behavior has been characterized
         // for this family yet (unlike firered-aed's punctuation-free
@@ -1776,7 +1821,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
         prefer_cpu_decoder_for_multichunk_metal: false,
         auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        self_diarizes: false,
+        speaker_segmentation: SpeakerSegmentationSource::External,
         // No characterized punctuation behavior for this family yet (unlike
         // firered-aed's punctuation-free vocab) -- leave unclaimed rather
         // than assert an unverified capability.
@@ -1838,7 +1883,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // directly in its transcript text (see `decode_prompt`'s fixed
         // instruction), so this family diarizes itself -- there is no
         // separate diarization pass to compose.
-        self_diarizes: true,
+        speaker_segmentation: SpeakerSegmentationSource::InDecoder,
         // The fixed instruction asks for full punctuation-bearing prose
         // segments; no characterized counter-example has been observed yet,
         // but this has not been verified against enough real transcripts to
@@ -1876,42 +1921,102 @@ mod tests {
             .expect("builtin native families must satisfy the integration audit");
     }
 
-    /// Pins `self_diarizes` and `emits_punctuation` per builtin architecture --
-    /// the single Rust-side declaration of both capability-single-source facts
-    /// this test protects against silent drift. Cohere-transcribe is the only
-    /// builtin family that self-diarizes; `emits_punctuation` values mirror
+    /// Pins `speaker_segmentation` and `emits_punctuation` per builtin
+    /// architecture -- the single Rust-side declaration of both
+    /// capability-single-source facts this test protects against silent drift.
+    /// moss-transcribe-diarize is the only builtin family that segments
+    /// speakers in-decoder today (cohere's decoder has the mode but no
+    /// publishable pack, see its descriptor); `emits_punctuation` values mirror
     /// `tooling/publish-model/scripts/_catalog.py`'s `PUNCTUATION_BY_FAMILY`
     /// (`registry/tests/catalog.rs`'s `embedded_catalog_emits_punctuation_matches_family`
     /// cross-checks the shipped catalog against
     /// [`emits_punctuation_for_model_architecture`] so the two stay in lockstep).
     #[test]
-    fn builtin_architectures_declare_self_diarizes_and_emits_punctuation() {
-        let expected: &[(&str, bool, Option<bool>)] = &[
-            (COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, true, Some(true)),
-            (WHISPER_GGML_ARCHITECTURE_ID, false, Some(true)),
-            (QWEN3_ASR_GGML_ARCHITECTURE_ID, false, Some(true)),
-            (PARAKEET_CTC_GGML_ARCHITECTURE_ID, false, None),
-            (PARAKEET_TDT_GGML_ARCHITECTURE_ID, false, Some(true)),
-            (WAV2VEC2_CTC_GGML_ARCHITECTURE_ID, false, None),
-            (XASR_ZIPFORMER_GGML_ARCHITECTURE_ID, false, Some(true)),
-            (MOONSHINE_GGML_ARCHITECTURE_ID, false, Some(true)),
-            (DOLPHIN_GGML_ARCHITECTURE_ID, false, Some(false)),
-            (SENSEVOICE_GGML_ARCHITECTURE_ID, false, Some(true)),
-            (FIRERED_AED_GGML_ARCHITECTURE_ID, false, Some(false)),
-            (FIRERED_LLM_GGML_ARCHITECTURE_ID, false, None),
-            (MIMO_ASR_GGML_ARCHITECTURE_ID, false, None),
-            (MOSS_TD_GGML_ARCHITECTURE_ID, true, None),
+    fn builtin_architectures_declare_speaker_segmentation_and_emits_punctuation() {
+        let expected: &[(&str, SpeakerSegmentationSource, Option<bool>)] = &[
+            (
+                COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                WHISPER_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                QWEN3_ASR_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                PARAKEET_CTC_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                None,
+            ),
+            (
+                PARAKEET_TDT_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                None,
+            ),
+            (
+                XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                MOONSHINE_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                DOLPHIN_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(false),
+            ),
+            (
+                SENSEVOICE_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                FIRERED_AED_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                Some(false),
+            ),
+            (
+                FIRERED_LLM_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                None,
+            ),
+            (
+                MIMO_ASR_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::External,
+                None,
+            ),
+            (
+                MOSS_TD_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::InDecoder,
+                None,
+            ),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
         let mut seen = std::collections::BTreeSet::new();
 
-        for (model_architecture, self_diarizes, emits_punctuation) in expected.iter().copied() {
+        for (model_architecture, speaker_segmentation, emits_punctuation) in
+            expected.iter().copied()
+        {
             let descriptor = registry
                 .find_by_model_architecture(model_architecture)
                 .unwrap_or_else(|| panic!("missing builtin architecture '{model_architecture}'"));
             assert_eq!(
-                descriptor.self_diarizes, self_diarizes,
-                "'{model_architecture}' self_diarizes mismatch"
+                descriptor.speaker_segmentation, speaker_segmentation,
+                "'{model_architecture}' speaker_segmentation mismatch"
             );
             assert_eq!(
                 descriptor.emits_punctuation, emits_punctuation,

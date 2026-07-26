@@ -181,7 +181,7 @@ fn request_options_cover_current_offline_and_realtime_preferences() {
         .with_phrase_bias(Some(
             crate::PhraseBiasConfig::from_phrases([("OpenASR", 2.0)]).unwrap(),
         ))
-        .with_diarization(true)
+        .with_voice_id(true)
         .with_partial_results(true);
     let request =
         NativeAsrOfflineRequest::new("/tmp/openasr/input.wav").with_options(options.clone());
@@ -192,7 +192,7 @@ fn request_options_cover_current_offline_and_realtime_preferences() {
         options.phrase_bias.as_ref().unwrap().entries()[0].phrase(),
         "OpenASR"
     );
-    assert!(options.diarize);
+    assert!(options.voice_id);
     assert!(options.partial_results);
     assert!(request.input_path.ends_with("input.wav"));
     assert_eq!(request.options, options);

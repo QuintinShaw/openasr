@@ -1696,7 +1696,7 @@ impl WsSession {
             .with_prompt(self.prompt.clone())
             .with_phrase_bias(self.phrase_bias.clone())
             .with_inference_threads(self.inference_threads)
-            .with_diarization(diarize)
+            .with_voice_id(diarize)
             .with_partial_results(partial_results)
             .with_word_timestamps(word_timestamps);
         let session_config = NativeAsrStreamingSessionConfig::new()

@@ -9,7 +9,7 @@ use crate::NATIVE_RUNTIME_MODEL_ID_AUTO;
 use crate::api::audio_io::load_wav_16khz_mono_f32_v0;
 use crate::arch::{
     DEFAULT_ENCODER_SAFE_CHUNK_SECONDS, GENERAL_ARCHITECTURE_KEY, OpenAsrArchitectureRegistry,
-    emits_punctuation_for_model_architecture,
+    SpeakerSegmentationSource, emits_punctuation_for_model_architecture,
 };
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, install_request_backend_override, read_gguf_metadata,
@@ -1034,6 +1034,42 @@ fn assign_aligned_words_to_segments(segments: &mut [Segment], items: &[ForcedAli
     }
 }
 
+/// Which speaker segmentation source runs for one transcription: the resolved
+/// product of "did the user turn Voice ID on" and "where does this family's
+/// speaker structure come from". Exactly one source runs, which is what makes
+/// speaker labels single-writer -- the bug this type replaces was two derived
+/// booleans that could both be live, letting an external pass overwrite labels
+/// a family had already produced.
+///
+/// Identity is deliberately NOT part of this decision: matching
+/// recording-local turns to known people is one source-independent stage that
+/// runs afterwards (`diarize::voice_id`), so it composes with either source and
+/// its absence degrades the result instead of failing the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpeakerPlan {
+    /// Voice ID off. No speaker structure reaches the caller -- including for a
+    /// family that always writes its own markup, which strips it (see
+    /// `models::moss_transcribe_diarize`), so the transcript is
+    /// indistinguishable from one produced by a model that cannot separate
+    /// speakers at all.
+    Off,
+    /// The family's own decode carries the turns.
+    InDecoder,
+    /// A separate segmenter over the same audio produces the turns: today the
+    /// VAD + speaker-embedder clustering path.
+    External,
+}
+
+impl SpeakerPlan {
+    fn resolve(voice_id: bool, source: SpeakerSegmentationSource) -> Self {
+        match (voice_id, source) {
+            (false, _) => Self::Off,
+            (true, SpeakerSegmentationSource::InDecoder) => Self::InDecoder,
+            (true, SpeakerSegmentationSource::External) => Self::External,
+        }
+    }
+}
+
 fn run_native_transcription_impl(
     mut request: TranscriptionRequest,
 ) -> Result<Transcription, BackendError> {
@@ -1097,33 +1133,32 @@ fn run_native_transcription_impl(
         ),
         request.phrase_bias.as_ref(),
     )?;
-    // Diarization is supported when the model self-diarizes (e.g. cohere) or the
-    // model-agnostic neural VAD + ReDimNet2-B6 pack is available.
-    let model_self_diarizes = super::native_runtime_metadata_supports_diarization(
-        &runtime_preflight.metadata,
-        selected_family.self_diarizes,
-    );
-    let self_diarizer_mode = request.diarize && model_self_diarizes;
-    let vad_diarization = request.diarize && !model_self_diarizes;
-    if vad_diarization
+    // Resolve the one segmentation source for this request. Exactly one runs:
+    // the family's own decode, or the external VAD + speaker-embedder pass --
+    // never both, so nothing can overwrite the other's labels downstream.
+    let speaker_plan = SpeakerPlan::resolve(request.voice_id, selected_family.speaker_segmentation);
+    if speaker_plan == SpeakerPlan::External
         && (crate::diarize::embed::shared_embedder().is_none()
             || crate::diarize::vad::FireRedStreamVadProvider::shared().is_none())
     {
         // Fail closed up front rather than silently returning a speaker-less
-        // transcript when the embedder or VAD model is unavailable.
+        // transcript: this family has no speaker structure of its own, so with
+        // no embedder or VAD model there is no source at all. (An in-decoder
+        // family never reaches this branch -- it degrades to recording-local
+        // turns instead of refusing the request.)
         return Err(BackendError::DiarizationNotSupported { backend: "native" });
     }
     if request.diarize_speakers.is_some() {
         // Fail closed instead of silently ignoring the clustering hint: it
-        // needs diarization on, and only the VAD + speaker-embedder path clusters.
-        if !request.diarize {
+        // needs Voice ID on, and only the external clustering path clusters.
+        if !request.voice_id {
             return Err(BackendError::DiarizeSpeakersRequiresDiarization);
         }
-        if model_self_diarizes {
+        if speaker_plan == SpeakerPlan::InDecoder {
             return Err(BackendError::RequestOptionUnsupportedByModel {
                 adapter: selected_family.adapter_id,
                 option: "speakers hint",
-                reason: "The model diarizes in-decoder; the exact-speaker-count hint only applies to the VAD + speaker-embedder clustering path.",
+                reason: "The model separates speakers in-decoder; the exact-speaker-count hint only applies to the VAD + speaker-embedder clustering path.",
             });
         }
     }
@@ -1150,7 +1185,7 @@ fn run_native_transcription_impl(
 
     // Compute speaker turns up front (independent of the transcript) so they can
     // be attributed onto whichever transcription path runs below.
-    let speaker_turns = if vad_diarization {
+    let speaker_turns = if speaker_plan == SpeakerPlan::External {
         let hint = match request.diarize_speakers {
             Some(speakers) => crate::diarize::contract::DiarizeHint::NumSpeakers(speakers),
             None => crate::diarize::contract::DiarizeHint::Auto,
@@ -1160,9 +1195,11 @@ fn run_native_transcription_impl(
         SpeakerAttribution::default()
     };
     // The executor consumes its input buffer on the short-form path. Retain a
-    // copy only for self-diarizing matching, where post-decode label turns need
-    // their own acoustic evidence; ordinary transcriptions keep the zero-copy path.
-    let self_diarizer_audio = self_diarizer_mode.then(|| prepared_audio.clone());
+    // copy only for the in-decoder plan, whose recording-local turns need their
+    // own acoustic evidence before they can be matched to known people;
+    // ordinary transcriptions keep the zero-copy path.
+    let in_decoder_turn_audio =
+        (speaker_plan == SpeakerPlan::InDecoder).then(|| prepared_audio.clone());
 
     let dispatch = shared_native_ggml_execution_dispatch();
     let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
@@ -1209,18 +1246,20 @@ fn run_native_transcription_impl(
     // proportional splitting when a segment exceeds the caps.
     let is_whisper_family = selected_family.adapter_id == crate::arch::WHISPER_GGML_ADAPTER_ID;
     let force_word_timestamps_for_segmentation = !is_whisper_family && !request.word_timestamps;
+    let external_speakers = speaker_plan == SpeakerPlan::External;
     request_options.word_timestamps =
-        request.word_timestamps || vad_diarization || force_word_timestamps_for_segmentation;
+        request.word_timestamps || external_speakers || force_word_timestamps_for_segmentation;
     let strip_forced_word_timestamps =
-        (vad_diarization || force_word_timestamps_for_segmentation) && !request.word_timestamps;
+        (external_speakers || force_word_timestamps_for_segmentation) && !request.word_timestamps;
     request_options.word_timestamps_forced_for_diarization = strip_forced_word_timestamps;
     // OADP Phase 0: the request-level adapter path rides the execution options
     // down to the family executor (env stays the server-side fallback).
     request_options.adapter_path = request.adapter_path.clone();
-    // Only the self-diarizing in-executor path (e.g. cohere) consumes this flag.
-    // The VAD + speaker-embedder post-hoc path runs separately, so gating here keeps the two
-    // mechanisms mutually exclusive (no future double-apply).
-    request_options.diarize = self_diarizer_mode;
+    // Only the in-decoder path consumes this flag; the external
+    // VAD + speaker-embedder pass runs separately. `SpeakerPlan` already made
+    // the two mutually exclusive, and this is where that decision reaches the
+    // family executor.
+    request_options.in_decoder_speakers = speaker_plan == SpeakerPlan::InDecoder;
     let backend_preference = execution_target_backend_preference(request.execution_target)?;
     // Installed for the whole transcribe call: not consulted by the
     // provenance label or the longform multichunk-metal probe below (those
@@ -1549,8 +1588,8 @@ fn run_native_transcription_impl(
                     audio_duration_seconds,
                     Some(run_metadata),
                     &speaker_turns,
-                    self_diarizer_audio.as_deref().unwrap_or(&[]),
-                    self_diarizer_mode,
+                    in_decoder_turn_audio.as_deref().unwrap_or(&[]),
+                    speaker_plan,
                     strip_forced_word_timestamps,
                     reported_language.clone(),
                 ));
@@ -1560,8 +1599,8 @@ fn run_native_transcription_impl(
                 audio_duration_seconds,
                 Some(run_metadata),
                 &speaker_turns,
-                self_diarizer_audio.as_deref().unwrap_or(&[]),
-                self_diarizer_mode,
+                in_decoder_turn_audio.as_deref().unwrap_or(&[]),
+                speaker_plan,
                 strip_forced_word_timestamps,
                 reported_language.clone(),
             ));
@@ -1626,8 +1665,8 @@ fn run_native_transcription_impl(
         audio_duration_seconds,
         longform_metadata,
         &speaker_turns,
-        self_diarizer_audio.as_deref().unwrap_or(&[]),
-        self_diarizer_mode,
+        in_decoder_turn_audio.as_deref().unwrap_or(&[]),
+        speaker_plan,
         strip_forced_word_timestamps,
         reported_language,
     ))
@@ -1651,7 +1690,7 @@ fn finalize_native_transcription(
     longform_metadata: Option<TranscriptionLongFormMetadata>,
     speaker_turns: &SpeakerAttribution,
     prepared_audio: &[f32],
-    model_self_diarizes: bool,
+    speaker_plan: SpeakerPlan,
     strip_forced_word_timestamps: bool,
     reported_language: Option<String>,
 ) -> Transcription {
@@ -1663,8 +1702,16 @@ fn finalize_native_transcription(
         speaker_turns,
         strip_forced_word_timestamps,
     );
-    if model_self_diarizes {
-        apply_self_diarizer_voice_id_matches(&mut transcription, prepared_audio);
+    if speaker_plan == SpeakerPlan::InDecoder {
+        // The family already produced normalized, recording-local turns; the
+        // only thing left is the source-independent identity stage. It is a
+        // no-op without an installed speaker embedder, which is exactly the
+        // "can separate but cannot name" degrade an in-decoder family gets on
+        // a host with no embedder pack.
+        crate::diarize::voice_id::name_speakers_from_labeled_segments(
+            &mut transcription.segments,
+            prepared_audio,
+        );
     }
     with_reported_language(transcription, reported_language)
 }
@@ -1682,73 +1729,6 @@ fn with_reported_language(
     let executor_detected = transcription.language.take();
     transcription.language = language.or(executor_detected);
     transcription
-}
-
-/// Match self-diarizer turns against Voice ID without re-running speaker
-/// segmentation. A self-diarizer already owns the turn boundaries; we embed
-/// each of its bounded turns and average per stable label before matching.
-fn apply_self_diarizer_voice_id_matches(transcription: &mut Transcription, samples: &[f32]) {
-    use crate::diarize::embed::shared_embedder;
-
-    for segment in &mut transcription.segments {
-        if segment.speaker_label.is_none() {
-            segment.speaker_label = segment.speaker.clone();
-        }
-        if segment.speaker.is_none()
-            && let Some(label) = &segment.speaker_label
-        {
-            segment.speaker = Some(label.clone());
-        }
-    }
-    let Some(embedder) = shared_embedder() else {
-        return;
-    };
-    let mut centroids: BTreeMap<String, (Vec<f32>, usize)> = BTreeMap::new();
-    for segment in &transcription.segments {
-        let Some(label) = segment.speaker_label.as_ref() else {
-            continue;
-        };
-        let start = (segment.start.max(0.0) * 16_000.0).floor() as usize;
-        let end = (segment.end.max(segment.start).max(0.0) * 16_000.0).ceil() as usize;
-        let Some(clip) = samples.get(start.min(samples.len())..end.min(samples.len())) else {
-            continue;
-        };
-        if let Ok(embedding) = embedder.embed(clip, 16_000) {
-            let entry = centroids
-                .entry(label.clone())
-                .or_insert_with(|| (vec![0.0; embedding.dim()], 0));
-            if entry.0.len() != embedding.dim() {
-                continue;
-            }
-            for (sum, value) in entry.0.iter_mut().zip(embedding.0) {
-                *sum += value;
-            }
-            entry.1 += 1;
-        }
-    }
-    let matcher = crate::diarize::voice_id::load_person_matcher_for_active_embedder();
-    let matches: BTreeMap<_, _> = centroids
-        .into_iter()
-        .filter_map(|(label, (sum, count))| {
-            (count > 0).then(|| {
-                let centroid = crate::diarize::contract::SpeakerEmbedding::l2_normalized(sum);
-                matcher
-                    .best_match(&centroid)
-                    .map(|matched| (label, matched))
-            })?
-        })
-        .collect();
-    for segment in &mut transcription.segments {
-        let Some(label) = segment.speaker_label.as_deref() else {
-            continue;
-        };
-        let Some(person) = matches.get(label) else {
-            continue;
-        };
-        segment.speaker = Some(person.display_name.clone());
-        segment.speaker_person_id = Some(person.person_id.as_str().to_string());
-        segment.speaker_snapshot_label = Some(person.display_name.clone());
-    }
 }
 
 /// Speaker turns plus the optionally-matched enrolled primary-user identity.
@@ -2708,6 +2688,88 @@ mod tests {
         Arc::new(crate::RequestExecutionContext::uncancellable(
             "test fixture",
         ))
+    }
+
+    /// The full user-intent x family-capability matrix, pinned because every
+    /// downstream decision (which source runs, whether an embedder is
+    /// required, whether the decoder is asked for speaker structure, whether
+    /// word anchors are forced on) reads this one value. The load-bearing rows
+    /// are the two `Off` ones: Voice ID off means no speaker structure even for
+    /// a family whose decode always writes some.
+    #[test]
+    fn speaker_plan_picks_exactly_one_source_per_request() {
+        use SpeakerSegmentationSource::{External, InDecoder};
+
+        assert_eq!(SpeakerPlan::resolve(false, InDecoder), SpeakerPlan::Off);
+        assert_eq!(SpeakerPlan::resolve(false, External), SpeakerPlan::Off);
+        assert_eq!(
+            SpeakerPlan::resolve(true, InDecoder),
+            SpeakerPlan::InDecoder
+        );
+        assert_eq!(SpeakerPlan::resolve(true, External), SpeakerPlan::External);
+    }
+
+    /// End of the chain for a moss-shaped decode: the family descriptor picks
+    /// the source, the plan turns the Voice ID switch into a decision, and the
+    /// family's own normalizer honors it. With Voice ID off the transcript
+    /// carries no trace of the markers the fixed decode prompt makes the model
+    /// write; with it on, the same decode yields recording-local turns at the
+    /// shared boundary. Uses the real reference-decode shape pinned by this
+    /// family's golden fixtures, so a change to either the descriptor or the
+    /// normalizer breaks it.
+    #[test]
+    fn a_moss_shaped_decode_honors_the_voice_id_switch_end_to_end() {
+        use crate::models::moss_transcribe_diarize::speaker_segments::normalize_moss_td_decode;
+
+        let descriptor = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID)
+            .expect("moss-transcribe-diarize is a builtin architecture");
+        assert_eq!(
+            descriptor.speaker_segmentation,
+            SpeakerSegmentationSource::InDecoder
+        );
+        let decoded = concat!(
+            "[0.28][S01] And so, my fellow Americans,[2.32][3.22][S02] ask not what your ",
+            "country can do for you,[7.71][8.12][S01] ask what you can do for your country.[10.59]",
+        );
+
+        let off = SpeakerPlan::resolve(false, descriptor.speaker_segmentation);
+        assert_eq!(off, SpeakerPlan::Off);
+        let normalized = normalize_moss_td_decode(decoded, 10.59, off == SpeakerPlan::InDecoder);
+        assert!(
+            !normalized.text.contains('['),
+            "Voice ID off must not leak markup: {:?}",
+            normalized.text
+        );
+        assert_eq!(
+            normalized.text,
+            "And so, my fellow Americans, ask not what your country can do for you, \
+             ask what you can do for your country."
+        );
+        for segment in &normalized.segments {
+            assert!(!segment.text.contains("[S"));
+            assert!(segment.speaker.is_none());
+            assert!(segment.speaker_label.is_none());
+        }
+
+        let on = SpeakerPlan::resolve(true, descriptor.speaker_segmentation);
+        assert_eq!(on, SpeakerPlan::InDecoder);
+        let normalized = normalize_moss_td_decode(decoded, 10.59, on == SpeakerPlan::InDecoder);
+        assert!(!normalized.text.contains('['));
+        let labels: Vec<_> = normalized
+            .segments
+            .iter()
+            .map(|segment| segment.speaker_label.as_deref())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![Some("SPEAKER_01"), Some("SPEAKER_02"), Some("SPEAKER_01")]
+        );
+        // Recording-local labels only: nothing here is a person yet. Naming
+        // them is the separate identity stage, and it needs embeddings.
+        for segment in &normalized.segments {
+            assert!(segment.speaker_person_id.is_none());
+        }
     }
 
     #[test]
@@ -3837,7 +3899,7 @@ mod tests {
             "xasr-zh-en",
         )
         .with_model_pack_path(Some(pack))
-        .with_diarization(true);
+        .with_voice_id(true);
         let transcription =
             run_native_transcription(request).expect("diarized transcription must succeed");
 

@@ -507,7 +507,7 @@ pub(crate) fn record_file_transcription_history(
             }),
             duration_seconds: transcription_duration_seconds(transcription),
             output_format: Some(output_format),
-            diarization_active: Some(request.diarize),
+            diarization_active: Some(request.voice_id),
             provenance: Some(DaemonHistoryProvenance::Recorded),
             // Persist the per-segment timing so exports can rebuild SRT/VTT/JSON
             // later; the store derives the advertised `formats` from these so we
@@ -870,7 +870,7 @@ impl TranscriptionRequestBuilder {
             .with_word_timestamps(word_timestamps)
             .with_word_timestamps_refine(word_timestamps_refine)
             .with_display_file_name(file_name)
-            .with_diarization(diarize)
+            .with_voice_id(diarize)
             .with_diarize_speakers(speakers)
             .with_punctuation(punctuate);
 
@@ -1586,7 +1586,7 @@ pub(crate) async fn transcribe_with_runtime(
                                 .with_prompt(request.prompt.clone())
                                 .with_phrase_bias(request.phrase_bias.clone())
                                 .with_inference_threads(request.inference_threads)
-                                .with_diarization(request.diarize)
+                                .with_voice_id(request.voice_id)
                                 .with_word_timestamps(request.word_timestamps)
                                 .with_word_timestamps_refine(request.word_timestamps_refine),
                         )
