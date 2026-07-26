@@ -144,6 +144,7 @@ fn first_step_logits(
         &prepared.decoder_weights,
         prepared.metadata,
         encoder_output.frame_count,
+        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         true,
         Some(runtime_path),
         adapter,
@@ -235,6 +236,7 @@ fn lora_cross_value_precompute_delta_matches_host_math_and_scales_linearly() {
             &prepared.decoder_weights,
             metadata,
             encoder_output.frame_count,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
             true,
             Some(&pack),
             adapter,
@@ -379,6 +381,7 @@ fn encoder_rows(
         prepared.metadata,
         Some(runtime_path),
         adapter,
+        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
     )
     .expect("encoder runtime");
     runtime.encode(features).expect("encoder output").rows

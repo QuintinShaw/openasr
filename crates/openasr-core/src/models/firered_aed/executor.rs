@@ -54,7 +54,6 @@ use super::encoder_graph::{
     FireRedEncoderGraphRuntime, FireRedEncoderOutput, predicted_encoder_time_frames,
 };
 use super::frontend::{FireRedFbankFrontend, apply_cmvn};
-use super::graph_config::{firered_decoder_graph_config, firered_encoder_graph_config};
 use super::runtime_contract::{FireRedAedExecutionMetadata, parse_firered_aed_execution_metadata};
 use super::tokenizer::FireRedTokenizer;
 
@@ -91,16 +90,14 @@ fn encode_with_cached_runtime(
     metadata: FireRedAedExecutionMetadata,
     cmvn_features: &[f32],
     n_frames: usize,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<FireRedEncoderOutput, super::encoder_graph::FireRedEncoderError> {
-    let key = (
-        runtime_cache_path_identity(runtime_path),
-        firered_encoder_graph_config().backend,
-    );
+    let key = (runtime_cache_path_identity(runtime_path), backend);
     with_thread_local_cached_mut_by_key(
         &FIRERED_AED_ENCODER_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || FireRedEncoderGraphRuntime::new(runtime_path, metadata),
+        || FireRedEncoderGraphRuntime::new(runtime_path, metadata, backend),
         |runtime| runtime.encode(cmvn_features, n_frames),
     )
 }
@@ -112,19 +109,17 @@ fn decode_with_cached_runtime(
     encoder_frame_count: usize,
     decode_text: impl Fn(&[u32]) -> Result<String, String>,
     control: &Arc<crate::api::backend::TranscriptionControl>,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<
     super::decoder_graph::FireRedAedGreedyDecodeOutput,
     super::decoder_graph::FireRedDecoderError,
 > {
-    let key = (
-        runtime_cache_path_identity(runtime_path),
-        firered_decoder_graph_config().backend,
-    );
+    let key = (runtime_cache_path_identity(runtime_path), backend);
     with_thread_local_cached_mut_by_key(
         &FIRERED_AED_DECODER_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || FireRedDecoderGraphRuntime::new(runtime_path, metadata),
+        || FireRedDecoderGraphRuntime::new(runtime_path, metadata, backend),
         |runtime| {
             run_firered_aed_decoder_greedy_with_runtime(
                 runtime,
@@ -272,11 +267,17 @@ impl FireRedAedGgmlExecutor {
         }
 
         let runtime_path = preflight.runtime_source.path();
-        let encoder_output =
-            encode_with_cached_runtime(runtime_path, metadata, &features.data, features.n_frames)
-                .map_err(|error| FireRedAedExecutorError::EncoderFailed {
-                reason: error.to_string(),
-            })?;
+        let backend = request.resolved_runtime.backend();
+        let encoder_output = encode_with_cached_runtime(
+            runtime_path,
+            metadata,
+            &features.data,
+            features.n_frames,
+            backend,
+        )
+        .map_err(|error| FireRedAedExecutorError::EncoderFailed {
+            reason: error.to_string(),
+        })?;
 
         let decode = decode_with_cached_runtime(
             runtime_path,
@@ -285,6 +286,7 @@ impl FireRedAedGgmlExecutor {
             encoder_output.frame_count,
             |ids| tokenizer.decode(ids).map_err(|error| error.to_string()),
             &request.execution_context.control,
+            backend,
         )
         .map_err(|error| FireRedAedExecutorError::DecoderFailed {
             reason: error.to_string(),

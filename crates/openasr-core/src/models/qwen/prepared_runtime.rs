@@ -48,6 +48,7 @@ pub(crate) enum Qwen3AsrPreparedRuntimeError {
 
 pub(crate) fn build_qwen_prepared_runtime(
     preflight: &GgmlAsrRuntimeSourcePreflight,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<Qwen3AsrPreparedRuntime, Qwen3AsrPreparedRuntimeError> {
     let components = build_builtin_runtime_component_bootstrap(
         QWEN3_ASR_GGML_ARCHITECTURE_ID,
@@ -55,11 +56,12 @@ pub(crate) fn build_qwen_prepared_runtime(
         BuiltinTokenizerMaterializationMode::Optional,
     )
     .map_err(map_runtime_component_bootstrap_error)?;
-    build_qwen_prepared_runtime_from_components(components)
+    build_qwen_prepared_runtime_from_components(components, backend)
 }
 
 pub(crate) fn build_qwen_prepared_runtime_from_components(
     components: BuiltinRuntimeComponentBootstrap,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<Qwen3AsrPreparedRuntime, Qwen3AsrPreparedRuntimeError> {
     let runtime_metadata = components.metadata;
     let metadata = runtime_metadata
@@ -78,6 +80,7 @@ pub(crate) fn build_qwen_prepared_runtime_from_components(
             QWEN3_ASR_GGML_ARCHITECTURE_ID,
             &tensor_reader,
             runtime_metadata,
+            backend,
         )
         .map_err(map_runtime_weight_component_error)?
         .into_qwen3_asr()

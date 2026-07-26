@@ -127,9 +127,17 @@ enum GgmlCpuGraphCpuAcceleratorPolicy {
     Blas,
 }
 
+/// Tuning-only default: fixed CPU backend, conservative context/graph-size
+/// constants, no scheduler. Deliberately NOT `runtime_default()` -- a
+/// `Default` impl is the kind of door a family can reach for without meaning
+/// to resolve anything, so it must never silently answer "what backend should
+/// this request use" (that TLS-backed resolution is exactly the anti-pattern
+/// this contract exists to remove: see `ResolvedFamilyRuntimeInput`). Callers
+/// that need a real resolved backend must say so explicitly, e.g. via
+/// `GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend)`.
 impl Default for GgmlCpuGraphConfig {
     fn default() -> Self {
-        Self::runtime_default()
+        Self::conservative_default()
     }
 }
 

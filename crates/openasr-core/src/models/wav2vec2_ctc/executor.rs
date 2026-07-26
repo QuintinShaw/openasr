@@ -36,7 +36,6 @@ use crate::{NativeAsrSession, WAV2VEC2_CTC_GGML_ADAPTER_ID};
 use super::encoder_graph::Wav2Vec2CtcEncoderGraph;
 use super::encoder_weights::{Wav2Vec2EncoderWeights, load_wav2vec2_ctc_encoder_weights};
 use super::frontend::Wav2Vec2Frontend;
-use super::graph_config::wav2vec2_ctc_encoder_graph_config;
 use super::runtime_contract::{
     Wav2Vec2CtcExecutionMetadata, parse_wav2vec2_ctc_execution_metadata,
 };
@@ -94,6 +93,7 @@ pub(crate) fn transcribe_wav2vec2_ctc_pcm(
     pack_path: &std::path::Path,
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<Wav2Vec2CtcTranscription, String> {
     let metadata =
         parse_wav2vec2_ctc_execution_metadata(gguf_metadata).map_err(|e| e.to_string())?;
@@ -105,7 +105,7 @@ pub(crate) fn transcribe_wav2vec2_ctc_pcm(
     let weights =
         load_wav2vec2_ctc_encoder_weights(reader, &metadata).map_err(|e| e.to_string())?;
     validate_wav2vec2_block_stack(metadata, &weights)?;
-    let mut graph = Wav2Vec2CtcEncoderGraph::new(&weights, metadata, Some(pack_path))
+    let mut graph = Wav2Vec2CtcEncoderGraph::new(&weights, metadata, Some(pack_path), backend)
         .map_err(|e| e.to_string())?;
     let output = graph.encode(&audio.samples).map_err(|e| e.to_string())?;
     decode_wav2vec2_output(
@@ -122,14 +122,14 @@ fn transcribe_wav2vec2_ctc_pcm_cached(
     pack_path: &Path,
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<Wav2Vec2CtcTranscription, String> {
-    let backend = wav2vec2_ctc_encoder_graph_config().backend;
     let key = (runtime_cache_path_identity(pack_path), backend);
     with_thread_local_cached_mut_by_key(
         &WAV2VEC2_CTC_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_wav2vec2_prepared_runtime(pack_path),
+        || build_wav2vec2_prepared_runtime(pack_path, backend),
         |runtime| runtime.transcribe(samples, phrase_bias, word_timestamps),
     )
 }
@@ -138,19 +138,22 @@ fn decode_wav2vec2_ctc_pcm_cached(
     samples: &[f32],
     pack_path: &Path,
     phrase_bias: Option<&PhraseBiasConfig>,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<CtcGreedyDecodeResult, String> {
-    let backend = wav2vec2_ctc_encoder_graph_config().backend;
     let key = (runtime_cache_path_identity(pack_path), backend);
     with_thread_local_cached_mut_by_key(
         &WAV2VEC2_CTC_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_wav2vec2_prepared_runtime(pack_path),
+        || build_wav2vec2_prepared_runtime(pack_path, backend),
         |runtime| runtime.decode_result(samples, phrase_bias),
     )
 }
 
-fn build_wav2vec2_prepared_runtime(pack_path: &Path) -> Result<Wav2Vec2CtcPreparedRuntime, String> {
+fn build_wav2vec2_prepared_runtime(
+    pack_path: &Path,
+    backend: GgmlCpuGraphBackend,
+) -> Result<Wav2Vec2CtcPreparedRuntime, String> {
     let reader = GgufTensorDataReader::from_path(pack_path).map_err(|e| e.to_string())?;
     let gguf_metadata =
         crate::ggml_runtime::read_gguf_metadata(pack_path).map_err(|e| e.to_string())?;
@@ -160,7 +163,7 @@ fn build_wav2vec2_prepared_runtime(pack_path: &Path) -> Result<Wav2Vec2CtcPrepar
     let weights =
         load_wav2vec2_ctc_encoder_weights(&reader, &metadata).map_err(|e| e.to_string())?;
     validate_wav2vec2_block_stack(metadata, &weights)?;
-    let graph = Wav2Vec2CtcEncoderGraph::new(&weights, metadata, Some(pack_path))
+    let graph = Wav2Vec2CtcEncoderGraph::new(&weights, metadata, Some(pack_path), backend)
         .map_err(|e| e.to_string())?;
     Ok(Wav2Vec2CtcPreparedRuntime { tokenizer, graph })
 }
@@ -300,6 +303,7 @@ impl Wav2Vec2CtcGgmlExecutor {
             &request.prepared_audio.samples_f32,
             &request.runtime_source_path,
             request.request_options.phrase_bias.as_ref(),
+            request.resolved_runtime.backend(),
         )
         .map_err(fail)
     }
@@ -338,6 +342,7 @@ impl GgmlAsrExecutor for Wav2Vec2CtcGgmlExecutor {
             &request.runtime_source_path,
             request.request_options.phrase_bias.as_ref(),
             request.request_options.word_timestamps,
+            request.resolved_runtime.backend(),
         )
         .map_err(fail)?;
         let duration = request.prepared_audio.samples_f32.len() as f32 / 16_000.0_f32;
@@ -500,10 +505,17 @@ mod tests {
         let samples = read_wav_mono_16k(&clip).expect("wav");
         let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
         let metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
-        let hypothesis =
-            transcribe_wav2vec2_ctc_pcm(&reader, &metadata, &samples, &pack, None, false)
-                .expect("decode")
-                .text;
+        let hypothesis = transcribe_wav2vec2_ctc_pcm(
+            &reader,
+            &metadata,
+            &samples,
+            &pack,
+            None,
+            false,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("decode")
+        .text;
         let wer = wer(reference, &hypothesis);
         eprintln!("{pack_rel}: hypothesis {hypothesis:?}\nWER = {wer:.3}");
         assert!(
@@ -546,10 +558,17 @@ mod tests {
         let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
         let metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
 
-        let hypothesis =
-            transcribe_wav2vec2_ctc_pcm(&reader, &metadata, &samples, &pack, None, false)
-                .expect("decode")
-                .text;
+        let hypothesis = transcribe_wav2vec2_ctc_pcm(
+            &reader,
+            &metadata,
+            &samples,
+            &pack,
+            None,
+            false,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("decode")
+        .text;
         let wer = wer(reference, &hypothesis);
         eprintln!("wav2vec2-ctc hypothesis: {hypothesis:?}\nWER = {wer:.3}");
         assert!(

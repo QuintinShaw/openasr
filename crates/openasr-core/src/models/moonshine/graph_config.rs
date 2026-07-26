@@ -13,10 +13,11 @@ const OPENASR_MOONSHINE_ENABLE_DECODER_GPU: &str = "OPENASR_MOONSHINE_ENABLE_DEC
 /// which the encoder and decoder now set independently (see
 /// [`moonshine_encoder_graph_config`] / [`moonshine_decoder_graph_config`]).
 fn moonshine_runtime_graph_config_with_scheduler_default(
+    backend: GgmlCpuGraphBackend,
     default_use_scheduler_when_unset: Option<bool>,
 ) -> GgmlCpuGraphConfig {
     configure_model_runtime_graph_config_from_env(
-        GgmlCpuGraphConfig::default(),
+        GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend),
         ModelMetalRuntimeOverrides {
             default_use_scheduler_when_unset,
             default_n_threads_when_unset: Some(1),
@@ -24,13 +25,13 @@ fn moonshine_runtime_graph_config_with_scheduler_default(
     )
 }
 
-pub(crate) fn moonshine_encoder_graph_config() -> GgmlCpuGraphConfig {
+pub(crate) fn moonshine_encoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     // The encoder keeps the scheduler on for Metal: multi-backend liveness
     // allocation (`prepare_outputs_for_upload`'s gallocr) is how the encoder
     // forward graph gets built today, and it has not been re-verified to run
     // correctly with the scheduler off. Only the decoder's `use_scheduler`
     // default changed (see `moonshine_decoder_graph_config`).
-    let mut config = moonshine_runtime_graph_config_with_scheduler_default(Some(true));
+    let mut config = moonshine_runtime_graph_config_with_scheduler_default(backend, Some(true));
     config.graph_size = config.graph_size.max(16_384);
     if config.backend.is_gpu_class() && !encoder_gpu_enabled(config.backend) {
         config.backend = GgmlCpuGraphBackend::Cpu;
@@ -60,8 +61,11 @@ pub(crate) fn moonshine_encoder_graph_config() -> GgmlCpuGraphConfig {
 /// This is a pure backend/scheduling choice: output must stay byte-identical
 /// (verified via the moonshine golden test), since it does not change which
 /// arithmetic runs, only whether the graph is rebuilt per token.
-pub(crate) fn moonshine_decoder_graph_config(prefer_cpu_backend: bool) -> GgmlCpuGraphConfig {
-    let mut config = moonshine_runtime_graph_config_with_scheduler_default(None);
+pub(crate) fn moonshine_decoder_graph_config(
+    backend: GgmlCpuGraphBackend,
+    prefer_cpu_backend: bool,
+) -> GgmlCpuGraphConfig {
+    let mut config = moonshine_runtime_graph_config_with_scheduler_default(backend, None);
     if config.backend.is_gpu_class() && (!decoder_gpu_enabled(config.backend) || prefer_cpu_backend)
     {
         config.backend = GgmlCpuGraphBackend::Cpu;

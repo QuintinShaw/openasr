@@ -70,8 +70,9 @@ impl ParakeetTdtEncoderGraph {
         weights: &ParakeetTdtEncoderWeights,
         metadata: ParakeetTdtExecutionMetadata,
         runtime_path: Option<&Path>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, ParakeetTdtEncoderError> {
-        let config = parakeet_tdt_encoder_graph_config();
+        let config = parakeet_tdt_encoder_graph_config(backend);
         let (core, (enc_proj_weight, enc_proj_bias)) = FastConformerEncoderCore::build(
             config,
             PARAKEET_TDT_ENCODER_GRAPH_CONTEXT_BYTES,
@@ -212,8 +213,13 @@ mod tests {
         let metadata = parse_parakeet_tdt_execution_metadata(&gguf_metadata).expect("metadata");
         let weights = load_parakeet_tdt_encoder_weights(&reader, &metadata).expect("weights");
 
-        let mut graph =
-            ParakeetTdtEncoderGraph::new(&weights, metadata, Some(path.as_path())).expect("graph");
+        let mut graph = ParakeetTdtEncoderGraph::new(
+            &weights,
+            metadata,
+            Some(path.as_path()),
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("graph");
         let n_frames = 128usize;
         let mel = ParakeetTdtMelFeatures {
             data: (0..metadata.n_mels * n_frames)

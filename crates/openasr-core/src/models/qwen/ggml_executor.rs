@@ -267,6 +267,7 @@ impl Qwen3AsrGgmlExecutor {
             .with_qwen3_asr_runtime_for_preflight(
                 request.selected_family.model_architecture,
                 preflight.as_ref(),
+                request.resolved_runtime.backend(),
                 map_prepared_runtime_registry_error,
                 qwen_runtime_cache_slot_unavailable,
                 || Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
@@ -831,7 +832,7 @@ impl Qwen3AsrGgmlExecutor {
         model_architecture: &str,
         preflight: &GgmlAsrRuntimeSourcePreflight,
     ) -> Result<Qwen3AsrPreparedRuntime, Qwen3AsrGgmlExecutorError> {
-        build_builtin_prepared_runtime(model_architecture, preflight)
+        build_builtin_prepared_runtime(model_architecture, preflight, GgmlCpuGraphBackend::Cpu)
             .map_err(map_prepared_runtime_registry_error)?
             .into_qwen3_asr()
             .ok_or_else(|| Qwen3AsrGgmlExecutorError::RuntimeContractViolation {

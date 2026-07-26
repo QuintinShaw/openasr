@@ -38,7 +38,6 @@ use crate::{NativeAsrSession, PARAKEET_CTC_GGML_ADAPTER_ID};
 use super::encoder_graph::ParakeetCtcEncoderGraph;
 use super::encoder_weights::{ParakeetEncoderWeights, load_parakeet_ctc_encoder_weights};
 use super::frontend::ParakeetFrontend;
-use super::graph_config::parakeet_ctc_encoder_graph_config;
 use super::runtime_contract::{
     ParakeetCtcExecutionMetadata, parse_parakeet_ctc_execution_metadata,
 };
@@ -98,6 +97,7 @@ pub(crate) fn transcribe_parakeet_ctc_pcm(
     pack_path: &std::path::Path,
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<ParakeetCtcTranscription, String> {
     let metadata =
         parse_parakeet_ctc_execution_metadata(gguf_metadata).map_err(|e| e.to_string())?;
@@ -109,7 +109,7 @@ pub(crate) fn transcribe_parakeet_ctc_pcm(
     let weights =
         load_parakeet_ctc_encoder_weights(reader, &metadata).map_err(|e| e.to_string())?;
     validate_parakeet_block_stack(metadata, &weights)?;
-    let mut graph = ParakeetCtcEncoderGraph::new(&weights, metadata, Some(pack_path))
+    let mut graph = ParakeetCtcEncoderGraph::new(&weights, metadata, Some(pack_path), backend)
         .map_err(|e| e.to_string())?;
     let output = graph.encode(&features).map_err(|e| e.to_string())?;
     decode_parakeet_output(
@@ -126,14 +126,14 @@ fn transcribe_parakeet_ctc_pcm_cached(
     pack_path: &Path,
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<ParakeetCtcTranscription, String> {
-    let backend = parakeet_ctc_encoder_graph_config().backend;
     let key = (runtime_cache_path_identity(pack_path), backend);
     with_thread_local_cached_mut_by_key(
         &PARAKEET_CTC_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_parakeet_prepared_runtime(pack_path),
+        || build_parakeet_prepared_runtime(pack_path, backend),
         |runtime| runtime.transcribe(samples, phrase_bias, word_timestamps),
     )
 }
@@ -142,19 +142,22 @@ fn decode_parakeet_ctc_pcm_cached(
     samples: &[f32],
     pack_path: &Path,
     phrase_bias: Option<&PhraseBiasConfig>,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<CtcGreedyDecodeResult, String> {
-    let backend = parakeet_ctc_encoder_graph_config().backend;
     let key = (runtime_cache_path_identity(pack_path), backend);
     with_thread_local_cached_mut_by_key(
         &PARAKEET_CTC_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_parakeet_prepared_runtime(pack_path),
+        || build_parakeet_prepared_runtime(pack_path, backend),
         |runtime| runtime.decode_result(samples, phrase_bias),
     )
 }
 
-fn build_parakeet_prepared_runtime(pack_path: &Path) -> Result<ParakeetCtcPreparedRuntime, String> {
+fn build_parakeet_prepared_runtime(
+    pack_path: &Path,
+    backend: GgmlCpuGraphBackend,
+) -> Result<ParakeetCtcPreparedRuntime, String> {
     let reader = GgufTensorDataReader::from_path(pack_path).map_err(|e| e.to_string())?;
     let gguf_metadata =
         crate::ggml_runtime::read_gguf_metadata(pack_path).map_err(|e| e.to_string())?;
@@ -164,7 +167,7 @@ fn build_parakeet_prepared_runtime(pack_path: &Path) -> Result<ParakeetCtcPrepar
     let weights =
         load_parakeet_ctc_encoder_weights(&reader, &metadata).map_err(|e| e.to_string())?;
     validate_parakeet_block_stack(metadata, &weights)?;
-    let graph = ParakeetCtcEncoderGraph::new(&weights, metadata, Some(pack_path))
+    let graph = ParakeetCtcEncoderGraph::new(&weights, metadata, Some(pack_path), backend)
         .map_err(|e| e.to_string())?;
     Ok(ParakeetCtcPreparedRuntime {
         metadata,
@@ -308,6 +311,7 @@ impl ParakeetCtcGgmlExecutor {
             &request.prepared_audio.samples_f32,
             &request.runtime_source_path,
             request.request_options.phrase_bias.as_ref(),
+            request.resolved_runtime.backend(),
         )
         .map_err(fail)
     }
@@ -346,6 +350,7 @@ impl GgmlAsrExecutor for ParakeetCtcGgmlExecutor {
             &request.runtime_source_path,
             request.request_options.phrase_bias.as_ref(),
             request.request_options.word_timestamps,
+            request.resolved_runtime.backend(),
         )
         .map_err(fail)?;
         let duration = request.prepared_audio.samples_f32.len() as f32 / 16_000.0_f32;
@@ -502,10 +507,17 @@ mod tests {
         let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
         let metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
 
-        let hypothesis =
-            transcribe_parakeet_ctc_pcm(&reader, &metadata, &samples, &pack, None, false)
-                .expect("decode")
-                .text;
+        let hypothesis = transcribe_parakeet_ctc_pcm(
+            &reader,
+            &metadata,
+            &samples,
+            &pack,
+            None,
+            false,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("decode")
+        .text;
         let wer = wer(reference, &hypothesis);
         eprintln!("parakeet-ctc hypothesis: {hypothesis:?}\nWER = {wer:.3}");
         // parakeet-ctc-0.6b is LibriSpeech-clean; the full pipeline (NeMo frontend

@@ -214,6 +214,7 @@ impl Seq2SeqServeRuntime for CohereDecoderGraphRuntime {
             job.metadata,
             job.encoder_output.frame_count,
             job.encoder_output.hidden_size,
+            job.backend,
             job.prefer_cpu_backend,
         )
         .map_err(map_decoder_error)
@@ -225,6 +226,7 @@ impl Seq2SeqServeRuntime for CohereDecoderGraphRuntime {
             job.metadata,
             job.encoder_output.frame_count,
             job.encoder_output.hidden_size,
+            job.backend,
             job.prefer_cpu_backend,
             n_seq,
         )
@@ -979,8 +981,9 @@ mod tests {
         encoder_frame_count: usize,
         strict_logit_parity: bool,
     ) {
+        let backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
         let runtime_config =
-            super::super::graph_config::cohere_decoder_graph_config(prefer_cpu_backend);
+            super::super::graph_config::cohere_decoder_graph_config(backend, prefer_cpu_backend);
         assert!(
             prefer_cpu_backend || !runtime_config.use_scheduler,
             "cohere static batch fixture validates the direct graph lane, got scheduler-backed {:?}",
@@ -1010,6 +1013,7 @@ mod tests {
             metadata,
             encoder_output_0.frame_count,
             encoder_output_0.hidden_size,
+            backend,
             prefer_cpu_backend,
         )
         .expect("serial runtime 0");
@@ -1025,6 +1029,7 @@ mod tests {
             metadata,
             encoder_output_1.frame_count,
             encoder_output_1.hidden_size,
+            backend,
             prefer_cpu_backend,
         )
         .expect("serial runtime 1");
@@ -1040,6 +1045,7 @@ mod tests {
             metadata,
             encoder_output_0.frame_count,
             encoder_output_0.hidden_size,
+            backend,
             prefer_cpu_backend,
             2,
         )
@@ -1110,8 +1116,10 @@ mod tests {
         prefer_cpu_backend: bool,
         encoder_frame_count: usize,
     ) {
-        let runtime_config =
-            super::super::graph_config::cohere_decoder_graph_config(prefer_cpu_backend);
+        let runtime_config = super::super::graph_config::cohere_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            prefer_cpu_backend,
+        );
         assert!(
             prefer_cpu_backend || !runtime_config.use_scheduler,
             "cohere refill fixture validates the direct graph lane, got scheduler-backed {:?}",
@@ -1216,7 +1224,10 @@ mod tests {
     fn cohere_owner_thread_refills_free_static_slot_cpu_batch() {
         with_forced_cpu_backend_for_test(|| {
             let (_temp, runtime_path, preflight) = write_runtime_ready_preflight();
-            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(true);
+            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(
+                crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                true,
+            );
             let metadata =
                 super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
                     &preflight.metadata,
@@ -1305,7 +1316,10 @@ mod tests {
     fn cohere_owner_thread_refills_padded_bucket_slot_cpu_batch() {
         with_forced_cpu_backend_for_test(|| {
             let (_temp, runtime_path, preflight) = write_runtime_ready_preflight();
-            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(true);
+            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(
+                crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                true,
+            );
             let metadata =
                 super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
                     &preflight.metadata,
@@ -1401,7 +1415,10 @@ mod tests {
     fn cohere_owner_thread_coalesces_multiple_refill_slots_cpu_batch() {
         with_forced_cpu_backend_for_test(|| {
             let (_temp, runtime_path, preflight) = write_runtime_ready_preflight();
-            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(true);
+            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(
+                crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                true,
+            );
             let metadata =
                 super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
                     &preflight.metadata,
@@ -1504,7 +1521,10 @@ mod tests {
     fn cohere_owner_thread_rebuckets_full_static_bucket_cpu_batch() {
         with_forced_cpu_backend_for_test(|| {
             let (_temp, runtime_path, preflight) = write_runtime_ready_preflight();
-            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(true);
+            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(
+                crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                true,
+            );
             let metadata =
                 super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
                     &preflight.metadata,
@@ -1602,7 +1622,10 @@ mod tests {
     fn cohere_owner_thread_shrinks_tail_static_bucket_cpu_batch() {
         with_forced_cpu_backend_for_test(|| {
             let (_temp, runtime_path, preflight) = write_runtime_ready_preflight();
-            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(true);
+            let runtime_config = super::super::graph_config::cohere_decoder_graph_config(
+                crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                true,
+            );
             let metadata =
                 super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
                     &preflight.metadata,

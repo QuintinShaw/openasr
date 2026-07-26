@@ -77,7 +77,9 @@ fn resolve_streaming_final_punctuator(
         return None;
     }
     let pack_path = resolve_firered_punc_pack_path()?;
-    let runtime = SendableFireRedPuncRuntime::from_pack(&pack_path).ok()?;
+    let runtime =
+        SendableFireRedPuncRuntime::from_pack(&pack_path, request.resolved_runtime.backend())
+            .ok()?;
     Some(Box::new(move |text| runtime.punctuate(text)))
 }
 

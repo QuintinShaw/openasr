@@ -1155,8 +1155,8 @@ mod parity_tests {
             load_moss_encoder_weights_from_reader(&reader, config).expect("load encoder weights");
 
         // Route through the same `moss_td_encoder_graph_config()` the real
-        // executor uses (not a bare `GgmlCpuGraphConfig::default()` with only
-        // `.backend` overwritten): `configure_model_runtime_graph_config`
+        // executor uses (not a bare tuning-only config with only `.backend`
+        // overwritten after the fact): `configure_model_runtime_graph_config`
         // only forces `n_threads=1`/`use_scheduler=true` when the config's
         // backend is ALREADY `Metal` at build time (see
         // `models/graph_runtime_config.rs`), so overwriting `.backend` on an

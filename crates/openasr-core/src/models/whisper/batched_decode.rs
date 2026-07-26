@@ -203,8 +203,7 @@ fn whisper_serve_batch_vram_slot_bytes(job: &WhisperServeBatchJob) -> usize {
 
 impl WhisperServeDecoderRuntime {
     fn new(job: &WhisperServeBatchJob, n_seq: usize) -> Result<Self, WhisperServeBatchError> {
-        let mut graph_config = whisper_decoder_graph_config();
-        graph_config.backend = job.backend;
+        let mut graph_config = whisper_decoder_graph_config(job.backend);
         graph_config.use_scheduler = job.uses_scheduler;
         let plan = build_whisper_decoder_graph_plan(
             WhisperDecoderGraphMetadata {
@@ -1460,7 +1459,9 @@ mod tests {
             });
         let preflight = read_runtime_source_preflight(&runtime_path);
         let (execution, tokenizer, decoder_weights) = load_real_pack_decoder_components(&preflight);
-        let runtime_config = super::super::graph_config::whisper_decoder_graph_config();
+        let runtime_config = super::super::graph_config::whisper_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "whisper static batch fixture validates direct graph execution, got scheduler-backed {:?}",
@@ -1557,7 +1558,9 @@ mod tests {
             });
         let preflight = read_runtime_source_preflight(&runtime_path);
         let (execution, tokenizer, decoder_weights) = load_real_pack_decoder_components(&preflight);
-        let runtime_config = super::super::graph_config::whisper_decoder_graph_config();
+        let runtime_config = super::super::graph_config::whisper_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "whisper refill fixture validates direct graph execution, got scheduler-backed {:?}",
@@ -1627,7 +1630,9 @@ mod tests {
             });
         let preflight = read_runtime_source_preflight(&runtime_path);
         let (execution, tokenizer, decoder_weights) = load_real_pack_decoder_components(&preflight);
-        let runtime_config = super::super::graph_config::whisper_decoder_graph_config();
+        let runtime_config = super::super::graph_config::whisper_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "whisper rebucket fixture validates direct graph execution, got scheduler-backed {:?}",
@@ -1706,7 +1711,9 @@ mod tests {
             });
         let preflight = read_runtime_source_preflight(&runtime_path);
         let (execution, tokenizer, decoder_weights) = load_real_pack_decoder_components(&preflight);
-        let runtime_config = super::super::graph_config::whisper_decoder_graph_config();
+        let runtime_config = super::super::graph_config::whisper_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "whisper shrink fixture validates direct graph execution, got scheduler-backed {:?}",

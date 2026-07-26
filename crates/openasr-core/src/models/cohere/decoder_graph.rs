@@ -3,8 +3,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlStaticTensor,
-    GgmlStaticTensorArena,
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
+    GgmlStaticTensor, GgmlStaticTensorArena,
 };
 use crate::{Segment, Transcription};
 
@@ -652,6 +652,7 @@ impl CohereDecoderGraphRuntime {
         metadata: CohereTranscribeExecutionMetadata,
         cross_frame_count: usize,
         cross_hidden_size: usize,
+        backend: GgmlCpuGraphBackend,
         prefer_cpu_backend: bool,
     ) -> Result<Self, CohereDecoderGraphError> {
         Self::new_with_n_seq(
@@ -659,6 +660,7 @@ impl CohereDecoderGraphRuntime {
             metadata,
             cross_frame_count,
             cross_hidden_size,
+            backend,
             prefer_cpu_backend,
             1,
         )
@@ -669,6 +671,7 @@ impl CohereDecoderGraphRuntime {
         metadata: CohereTranscribeExecutionMetadata,
         cross_frame_count: usize,
         cross_hidden_size: usize,
+        backend: GgmlCpuGraphBackend,
         prefer_cpu_backend: bool,
         n_seq: usize,
     ) -> Result<Self, CohereDecoderGraphError> {
@@ -696,7 +699,7 @@ impl CohereDecoderGraphRuntime {
             cross_frame_count
         };
 
-        let mut config = cohere_decoder_graph_config(prefer_cpu_backend);
+        let mut config = cohere_decoder_graph_config(backend, prefer_cpu_backend);
         config.graph_size = config.graph_size.max(COHERE_DECODER_GRAPH_SIZE_FLOOR);
         config.context_bytes =
             config
@@ -3577,6 +3580,7 @@ mod tests {
                 metadata,
                 encoder_output.frame_count,
                 encoder_output.hidden_size,
+                GgmlCpuGraphBackend::Cpu,
                 false,
             )
             .expect("decoder runtime");
@@ -3620,6 +3624,7 @@ mod tests {
                 metadata,
                 small_encoder_output.frame_count,
                 small_encoder_output.hidden_size,
+                GgmlCpuGraphBackend::Cpu,
                 false,
             )
             .expect("decoder runtime");
@@ -3712,6 +3717,7 @@ mod tests {
                 metadata,
                 encoder_output.frame_count,
                 encoder_output.hidden_size,
+                GgmlCpuGraphBackend::Cpu,
                 false,
                 2,
             )
@@ -3784,6 +3790,7 @@ mod tests {
                 metadata,
                 encoder_output_0.frame_count,
                 encoder_output_0.hidden_size,
+                GgmlCpuGraphBackend::Cpu,
                 false,
             )
             .expect("serial runtime 0");
@@ -3799,6 +3806,7 @@ mod tests {
                 metadata,
                 encoder_output_1.frame_count,
                 encoder_output_1.hidden_size,
+                GgmlCpuGraphBackend::Cpu,
                 false,
             )
             .expect("serial runtime 1");
@@ -3814,6 +3822,7 @@ mod tests {
                 metadata,
                 encoder_output_0.frame_count,
                 encoder_output_0.hidden_size,
+                GgmlCpuGraphBackend::Cpu,
                 false,
                 2,
             )
@@ -3875,6 +3884,7 @@ mod tests {
                 metadata,
                 encoder_output.frame_count,
                 encoder_output.hidden_size,
+                GgmlCpuGraphBackend::Cpu,
                 false,
             )
             .expect("decoder runtime");
@@ -3932,6 +3942,7 @@ mod tests {
                 metadata,
                 encoder_output.frame_count,
                 encoder_output.hidden_size,
+                GgmlCpuGraphBackend::Cpu,
                 false,
             )
             .expect("incremental runtime");
@@ -3952,6 +3963,7 @@ mod tests {
                 metadata,
                 encoder_output.frame_count,
                 encoder_output.hidden_size,
+                GgmlCpuGraphBackend::Cpu,
                 false,
             )
             .expect("full runtime");

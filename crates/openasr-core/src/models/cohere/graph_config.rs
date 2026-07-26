@@ -11,9 +11,9 @@ const OPENASR_COHERE_ENABLE_DECODER_METAL: &str = "OPENASR_COHERE_ENABLE_DECODER
 const OPENASR_COHERE_ENABLE_ENCODER_GPU: &str = "OPENASR_COHERE_ENABLE_ENCODER_GPU";
 const OPENASR_COHERE_ENABLE_DECODER_GPU: &str = "OPENASR_COHERE_ENABLE_DECODER_GPU";
 
-pub(crate) fn cohere_runtime_graph_config() -> GgmlCpuGraphConfig {
+pub(crate) fn cohere_runtime_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     configure_model_runtime_graph_config_from_env(
-        GgmlCpuGraphConfig::default(),
+        GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend),
         ModelMetalRuntimeOverrides {
             default_use_scheduler_when_unset: Some(true),
             default_n_threads_when_unset: Some(1),
@@ -21,8 +21,11 @@ pub(crate) fn cohere_runtime_graph_config() -> GgmlCpuGraphConfig {
     )
 }
 
-pub(crate) fn cohere_decoder_graph_config(prefer_cpu_backend: bool) -> GgmlCpuGraphConfig {
-    let mut config = cohere_runtime_graph_config();
+pub(crate) fn cohere_decoder_graph_config(
+    backend: GgmlCpuGraphBackend,
+    prefer_cpu_backend: bool,
+) -> GgmlCpuGraphConfig {
+    let mut config = cohere_runtime_graph_config(backend);
     if config.backend.is_gpu_class()
         && (!cohere_decoder_gpu_enabled(config.backend) || prefer_cpu_backend)
     {
@@ -38,9 +41,9 @@ pub(crate) fn cohere_decoder_graph_config(prefer_cpu_backend: bool) -> GgmlCpuGr
     config
 }
 
-pub(crate) fn cohere_encoder_graph_config() -> GgmlCpuGraphConfig {
+pub(crate) fn cohere_encoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     cohere_encoder_graph_config_with_overrides(
-        cohere_runtime_graph_config(),
+        cohere_runtime_graph_config(backend),
         cohere_encoder_gpu_enabled,
         has_explicit_thread_override(),
     )
@@ -182,11 +185,9 @@ mod tests {
 
     #[test]
     fn decoder_can_prefer_cpu_backend_for_longform_policy() {
-        let config = cohere_decoder_graph_config(true);
-        if matches!(
-            cohere_runtime_graph_config().backend,
-            GgmlCpuGraphBackend::Metal
-        ) {
+        let generic_backend = GgmlCpuGraphConfig::runtime_default().backend;
+        let config = cohere_decoder_graph_config(generic_backend, true);
+        if matches!(generic_backend, GgmlCpuGraphBackend::Metal) {
             assert!(matches!(config.backend, GgmlCpuGraphBackend::Cpu));
             assert!(!config.use_scheduler);
         }

@@ -144,8 +144,9 @@ pub(crate) fn encode_cohere_transcribe_audio_embeddings_from_weights(
     weights: &CohereTranscribeEncoderWeights,
     metadata: CohereTranscribeExecutionMetadata,
     mel_features: &CohereTranscribeMelFeatures,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<CohereTranscribeEncoderOutput, CohereTranscribeEncoderError> {
-    let mut runtime = CohereTranscribeEncoderGraphRuntime::new(weights, metadata, None)?;
+    let mut runtime = CohereTranscribeEncoderGraphRuntime::new(weights, metadata, None, backend)?;
     runtime.encode(mel_features)
 }
 
@@ -154,10 +155,11 @@ impl CohereTranscribeEncoderGraphRuntime {
         weights: &CohereTranscribeEncoderWeights,
         metadata: CohereTranscribeExecutionMetadata,
         runtime_path: Option<&Path>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, CohereTranscribeEncoderError> {
         let build_debug = std::env::var_os(COHERE_DEBUG_ENCODER_BUILD_ENV).is_some();
         let runner_start = Instant::now();
-        let mut config = cohere_encoder_graph_config();
+        let mut config = cohere_encoder_graph_config(backend);
         // `no_alloc` metadata context: covers both the encoder's own forward
         // graph AND the arena's weight tensors (see
         // `GgmlStaticTensorArena` -- real tensor bytes land in a separately
@@ -1927,9 +1929,13 @@ mod tests {
             )
             .expect("weights");
 
-        let output =
-            encode_cohere_transcribe_audio_embeddings_from_weights(&weights, metadata, &features)
-                .expect("encoder");
+        let output = encode_cohere_transcribe_audio_embeddings_from_weights(
+            &weights,
+            metadata,
+            &features,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("encoder");
 
         assert!(output.frame_count > 0);
         assert_eq!(output.hidden_size, metadata.decoder_d_model);

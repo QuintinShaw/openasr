@@ -1301,6 +1301,7 @@ impl WhisperDecoderExecutionTensorCache {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn materialize_cross_attention_cache(
         &mut self,
         source: &dyn WhisperDecoderTensorSource,
@@ -1309,6 +1310,7 @@ impl WhisperDecoderExecutionTensorCache {
         hidden: usize,
         encoder_frames: usize,
         cache_misses: &mut usize,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<WhisperDecoderCrossAttentionCache, WhisperDecoderGraphExecutionError> {
         if let Some(cache) = self.cross_attention.get(&layer.layer_idx) {
             return Ok(cache.clone());
@@ -1323,6 +1325,7 @@ impl WhisperDecoderExecutionTensorCache {
             &layer.cross_attn_k,
             None,
             "decoder_cross_attn_k_cache",
+            backend,
         )?;
         let value = materialize_linear_projection_output_ggml(
             self,
@@ -1332,6 +1335,7 @@ impl WhisperDecoderExecutionTensorCache {
             &layer.cross_attn_v.projection,
             Some(&layer.cross_attn_v.bias),
             "decoder_cross_attn_v_cache",
+            backend,
         )?;
 
         let expected = hidden.checked_mul(encoder_frames).ok_or_else(|| {
@@ -1478,7 +1482,7 @@ impl WhisperDecoderPersistentWeightCache {
         }
         let persistent_build_start = Instant::now();
         let mut arena = runner
-            .start_static_tensor_arena(GgmlCpuGraphConfig::default().context_bytes)
+            .start_static_tensor_arena(GgmlCpuGraphConfig::conservative_default().context_bytes)
             .map_err(
                 |error| WhisperDecoderGraphExecutionError::GraphExecutionFailed {
                     reason: format!(
@@ -2370,11 +2374,14 @@ pub(crate) fn run_whisper_decoder_greedy_step_with_cache_ggml_v0(
     config: WhisperDecoderGraphExecutionConfig,
     tensor_cache: &mut WhisperDecoderExecutionTensorCache,
 ) -> Result<WhisperDecoderGraphExecutionOutput, WhisperDecoderGraphExecutionError> {
-    let mut runner = GgmlCpuGraphRunner::new(whisper_decoder_graph_config()).map_err(|error| {
-        WhisperDecoderGraphExecutionError::GraphExecutionFailed {
+    let mut runner = GgmlCpuGraphRunner::new(whisper_decoder_graph_config(
+        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+    ))
+    .map_err(
+        |error| WhisperDecoderGraphExecutionError::GraphExecutionFailed {
             reason: format!("could not initialize ggml cpu graph runner: {error}"),
-        }
-    })?;
+        },
+    )?;
     run_whisper_decoder_greedy_step_with_cache_and_runner_ggml_v0(
         &mut runner,
         None,
@@ -2433,6 +2440,11 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
     let graph_total_start = Instant::now();
     validate_decoder_execution_config(plan, config)?;
     validate_decoder_tokens(plan, token_label, decoder_tokens, position_offset)?;
+    // The runner passed in already carries the request's resolved backend
+    // (baked in at construction, see `build_whisper_decoder_persistent_static_session`);
+    // read it back here rather than re-deriving it, so the one-shot cross-
+    // attention cache graph this function builds below always matches.
+    let backend = runner.backend_kind();
     let prefix_len = decoder_tokens.len();
     let hidden = plan.input_shape.hidden_size;
     let encoder_frames = plan.input_shape.encoder_frames;
@@ -2673,6 +2685,7 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
                     hidden,
                     encoder_frames,
                     &mut cross_cache_misses,
+                    backend,
                 )?)
             };
             let cross_attention = apply_decoder_cross_attention(
@@ -5222,6 +5235,7 @@ fn apply_linear_with_bias<'a>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn materialize_linear_projection_output_ggml(
     tensor_cache: &mut WhisperDecoderExecutionTensorCache,
     source: &dyn WhisperDecoderTensorSource,
@@ -5230,14 +5244,16 @@ fn materialize_linear_projection_output_ggml(
     projection: &WhisperDecoderLinearProjectionPlan,
     bias: Option<&WhisperDecoderGraphTensorRef>,
     label_prefix: &'static str,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<Arc<[f32]>, WhisperDecoderGraphExecutionError> {
-    let mut runner = GgmlCpuGraphRunner::new(whisper_decoder_graph_config()).map_err(|error| {
-        WhisperDecoderGraphExecutionError::GraphExecutionFailed {
-            reason: format!(
-                "could not initialize ggml cpu graph runner for {label_prefix}: {error}"
-            ),
-        }
-    })?;
+    let mut runner =
+        GgmlCpuGraphRunner::new(whisper_decoder_graph_config(backend)).map_err(|error| {
+            WhisperDecoderGraphExecutionError::GraphExecutionFailed {
+                reason: format!(
+                    "could not initialize ggml cpu graph runner for {label_prefix}: {error}"
+                ),
+            }
+        })?;
     materialize_linear_projection_output_with_runner_ggml(
         &mut runner,
         tensor_cache,

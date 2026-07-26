@@ -189,6 +189,7 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
             &job.prepared_runtime.decoder_weights,
             job.prepared_runtime.metadata,
             job.encoder_output.frame_count,
+            job.backend,
             false,
             Some(job.runtime_cache_path.as_path()),
             None,
@@ -201,6 +202,7 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
             &job.prepared_runtime.decoder_weights,
             job.prepared_runtime.metadata,
             job.encoder_output.frame_count,
+            job.backend,
             false,
             Some(job.runtime_cache_path.as_path()),
             n_seq,
@@ -936,7 +938,10 @@ mod tests {
         let metadata = prepared_runtime.metadata;
         let encoder_output_0 = sample_encoder_output(metadata, 0.0, 32);
         let encoder_output_1 = sample_encoder_output(metadata, 0.25, 32);
-        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(false);
+        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            false,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "moonshine static batch fixture validates direct graph execution, got scheduler-backed {:?}",
@@ -1002,7 +1007,10 @@ mod tests {
                 .expect("prepared runtime"),
         );
         let metadata = prepared_runtime.metadata;
-        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(false);
+        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            false,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "throughput benchmark validates direct graph execution, got scheduler-backed {:?}",
@@ -1141,7 +1149,10 @@ mod tests {
                 .expect("prepared runtime"),
         );
         let metadata = prepared_runtime.metadata;
-        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(false);
+        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            false,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "moonshine refill fixture validates direct graph execution, got scheduler-backed {:?}",
@@ -1228,7 +1239,10 @@ mod tests {
                 .expect("prepared runtime"),
         );
         let metadata = prepared_runtime.metadata;
-        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(false);
+        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            false,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "moonshine rebucket fixture validates direct graph execution, got scheduler-backed {:?}",
@@ -1324,7 +1338,10 @@ mod tests {
                 .expect("prepared runtime"),
         );
         let metadata = prepared_runtime.metadata;
-        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(false);
+        let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            false,
+        );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
             "moonshine shrink fixture validates direct graph execution, got scheduler-backed {:?}",

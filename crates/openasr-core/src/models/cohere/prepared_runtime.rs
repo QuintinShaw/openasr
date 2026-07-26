@@ -63,6 +63,7 @@ pub(crate) enum CoherePreparedRuntimeError {
 
 pub(crate) fn build_cohere_prepared_runtime(
     preflight: &GgmlAsrRuntimeSourcePreflight,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<CoherePreparedRuntime, CoherePreparedRuntimeError> {
     let components = build_builtin_runtime_component_bootstrap(
         COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
@@ -70,11 +71,12 @@ pub(crate) fn build_cohere_prepared_runtime(
         BuiltinTokenizerMaterializationMode::Required,
     )
     .map_err(map_runtime_component_bootstrap_error)?;
-    build_cohere_prepared_runtime_from_components(components)
+    build_cohere_prepared_runtime_from_components(components, backend)
 }
 
 pub(crate) fn build_cohere_prepared_runtime_from_components(
     components: BuiltinRuntimeComponentBootstrap,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<CoherePreparedRuntime, CoherePreparedRuntimeError> {
     let debug_timings = std::env::var_os("OPENASR_COHERE_DEBUG_TIMINGS").is_some();
     let runtime_metadata = components.metadata;
@@ -110,6 +112,7 @@ pub(crate) fn build_cohere_prepared_runtime_from_components(
         COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
         &tensor_reader,
         runtime_metadata,
+        backend,
     )
     .map_err(map_runtime_weight_component_error)?
     .into_cohere_transcribe()
@@ -212,7 +215,11 @@ mod tests {
     #[test]
     fn builds_runtime_ready_assets_from_preflight() {
         let (_runtime_path, preflight) = write_runtime_ready_preflight();
-        let runtime = build_cohere_prepared_runtime(&preflight).expect("prepared runtime");
+        let runtime = build_cohere_prepared_runtime(
+            &preflight,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("prepared runtime");
 
         assert_eq!(runtime.metadata.encoder_layers, 2);
         assert_eq!(runtime.frontend_plan.n_mels, 32);
@@ -229,7 +236,11 @@ mod tests {
     #[test]
     fn prepared_runtime_builds_default_decode_prompt() {
         let (_runtime_path, preflight) = write_runtime_ready_preflight();
-        let runtime = build_cohere_prepared_runtime(&preflight).expect("prepared runtime");
+        let runtime = build_cohere_prepared_runtime(
+            &preflight,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("prepared runtime");
         let prompt = runtime
             .decode_prompt(Some("en"), &GgmlAsrExecutionOptions::default())
             .expect("prompt");
@@ -258,8 +269,11 @@ mod tests {
             tensor_index: Arc::new(tensor_index),
         };
 
-        let error = build_cohere_prepared_runtime(&preflight)
-            .expect_err("invalid runtime must fail closed");
+        let error = build_cohere_prepared_runtime(
+            &preflight,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect_err("invalid runtime must fail closed");
         assert!(matches!(
             error,
             CoherePreparedRuntimeError::RuntimeContractViolation { .. }

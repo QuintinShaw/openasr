@@ -125,18 +125,20 @@ impl MoonshineGgmlExecutor {
         )
         .map_err(map_frontend_error)?;
 
+        let backend = request.resolved_runtime.backend();
         let encoder_output = encode_with_cached_runtime(
             preflight.runtime_source.path(),
             &prepared_runtime,
             &features,
             adapter_ref,
+            backend,
         )
         .map_err(map_encoder_error)?;
 
         let audio_duration = audio_duration_seconds(&request.prepared_audio);
         let serve_batch_config =
             MoonshineServeBatchConfig::from_server_policy(request.request_options.serve_batch);
-        let decoder_config = moonshine_decoder_graph_config(false);
+        let decoder_config = moonshine_decoder_graph_config(backend, false);
         let can_use_serve_batch = can_use_moonshine_serve_batch(
             skip_serve_batch,
             adapter.is_some(),
@@ -195,6 +197,7 @@ impl MoonshineGgmlExecutor {
                     prepared_runtime.metadata,
                     &encoder_output,
                     request.request_options.phrase_bias.as_ref(),
+                    backend,
                     false,
                     Some(preflight.runtime_source.path()),
                     request.request_options.word_timestamps,
@@ -261,8 +264,9 @@ fn encode_with_cached_runtime(
     prepared_runtime: &MoonshinePreparedRuntime,
     features: &super::frontend::MoonshineWaveformFeatures,
     adapter: Option<&MoonshineLoraAdapter>,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<MoonshineEncoderOutput, MoonshineEncoderError> {
-    let encoder_backend = moonshine_encoder_graph_config().backend;
+    let encoder_backend = moonshine_encoder_graph_config(backend).backend;
     let key = (
         runtime_cache_path_identity(runtime_path),
         encoder_backend,
@@ -278,6 +282,7 @@ fn encode_with_cached_runtime(
                 prepared_runtime.metadata,
                 Some(runtime_path),
                 adapter,
+                backend,
             )
         },
         |runtime| runtime.encode(features),

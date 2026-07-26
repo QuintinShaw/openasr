@@ -78,8 +78,9 @@ impl ParakeetCtcEncoderGraph {
         weights: &ParakeetEncoderWeights,
         metadata: ParakeetCtcExecutionMetadata,
         runtime_path: Option<&Path>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, ParakeetEncoderError> {
-        let config = parakeet_ctc_encoder_graph_config();
+        let config = parakeet_ctc_encoder_graph_config(backend);
         // CTC head: `ctc.head.weight` is f16 `[1, d_model, vocab]` on disk (the
         // packer's reversed-dims convention) -- bound zero-copy + reshaped to
         // `[d_model, vocab]` for the head matmul in `encode`. Its bias stays
@@ -228,8 +229,13 @@ mod tests {
         let metadata = parse_parakeet_ctc_execution_metadata(&gguf_metadata).expect("metadata");
         let weights = load_parakeet_ctc_encoder_weights(&reader, &metadata).expect("weights");
 
-        let mut graph =
-            ParakeetCtcEncoderGraph::new(&weights, metadata, Some(path.as_path())).expect("graph");
+        let mut graph = ParakeetCtcEncoderGraph::new(
+            &weights,
+            metadata,
+            Some(path.as_path()),
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("graph");
         let n_frames = 128usize;
         let mel = ParakeetMelFeatures {
             data: (0..metadata.n_mels * n_frames)

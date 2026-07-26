@@ -63,6 +63,7 @@ impl WhisperEncoderPreludeRunner for TestPreludeRunner {
         _encoder_weights: &WhisperEncoderWeightBundle,
         plan: &WhisperEncoderPreludePlan,
         mel_input: &WhisperMelFeatureInput,
+        _backend: GgmlCpuGraphBackend,
     ) -> Result<WhisperEncoderPreludeSeamResult, WhisperGgmlExecutorError> {
         self.called.store(true, Ordering::SeqCst);
         match &self.outcome {
@@ -105,6 +106,7 @@ impl WhisperEncoderGraphRunner for TestEncoderGraphRunner {
         _encoder_weights: &WhisperEncoderWeightBundle,
         plan: &WhisperEncoderGraphPlan,
         encoder_hidden_input_f32: &[f32],
+        _backend: GgmlCpuGraphBackend,
     ) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError> {
         self.called.store(true, Ordering::SeqCst);
         assert_eq!(
@@ -673,6 +675,7 @@ fn golden_diff_prepared_audio_real_mel_and_real_encoder_compute_reach_decoder_fa
         &prelude_plan,
         &mel_input,
         &WhisperCpuEncoderPreludeComputeRunnerV0,
+        GgmlCpuGraphBackend::Cpu,
     )
     .expect("run prelude seam");
     let smoke_shape = tiny_whisper_encoder_smoke_shape_for_default_fixture();

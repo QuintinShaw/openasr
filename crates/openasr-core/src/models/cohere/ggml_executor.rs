@@ -157,6 +157,7 @@ impl CohereTranscribeGgmlExecutor {
             .with_cohere_transcribe_runtime_for_preflight(
                 request.selected_family.model_architecture,
                 preflight.as_ref(),
+                request.resolved_runtime.backend(),
                 map_prepared_runtime_registry_error,
                 cohere_runtime_cache_slot_unavailable,
                 || CohereTranscribeGgmlExecutorError::PreparedRuntimeFailed {
@@ -275,9 +276,13 @@ impl CohereTranscribeGgmlExecutor {
             }
         })?;
         let encoder_start = debug_timing_start();
-        let encoder_output =
-            encode_with_cached_cohere_encoder_runtime(runtime_path, prepared_runtime, features)
-                .map_err(map_encoder_error)?;
+        let encoder_output = encode_with_cached_cohere_encoder_runtime(
+            runtime_path,
+            prepared_runtime,
+            features,
+            request.resolved_runtime.backend(),
+        )
+        .map_err(map_encoder_error)?;
         emit_cohere_debug_timing_if_enabled(
             "encoder",
             encoder_start,
@@ -294,7 +299,8 @@ impl CohereTranscribeGgmlExecutor {
         let audio_duration = audio_duration_seconds(&request.prepared_audio);
         let serve_batch_config =
             CohereServeBatchConfig::from_server_policy(request.request_options.serve_batch);
-        let decoder_config = cohere_decoder_graph_config(prefer_cpu_decoder);
+        let decoder_config =
+            cohere_decoder_graph_config(request.resolved_runtime.backend(), prefer_cpu_decoder);
         let can_use_serve_batch = !skip_serve_batch
             && decoder_config.backend.is_gpu_class()
             && !decoder_config.use_scheduler;
@@ -363,6 +369,7 @@ impl CohereTranscribeGgmlExecutor {
                 eos_token_id,
                 &encoder_output,
                 request.request_options.phrase_bias.as_ref(),
+                request.resolved_runtime.backend(),
                 prefer_cpu_decoder,
                 request.request_options.word_timestamps,
                 audio_duration,
@@ -426,8 +433,9 @@ fn encode_with_cached_cohere_encoder_runtime(
     runtime_path: &Path,
     prepared_runtime: &CoherePreparedRuntime,
     features: &CohereTranscribeMelFeatures,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<super::encoder_graph::CohereTranscribeEncoderOutput, CohereTranscribeEncoderError> {
-    let encoder_backend = cohere_encoder_graph_config().backend;
+    let encoder_backend = cohere_encoder_graph_config(backend).backend;
     let key = (runtime_cache_path_identity(runtime_path), encoder_backend);
     with_thread_local_cached_mut_by_key(
         &COHERE_ENCODER_RUNTIME_BY_KEY,
@@ -438,6 +446,7 @@ fn encode_with_cached_cohere_encoder_runtime(
                 &prepared_runtime.encoder_weights,
                 prepared_runtime.metadata,
                 Some(runtime_path),
+                backend,
             )
         },
         |runtime| runtime.encode(features),
@@ -454,12 +463,13 @@ fn decode_with_cached_cohere_decoder_runtime(
     eos_token_id: u32,
     encoder_output: &super::encoder_graph::CohereTranscribeEncoderOutput,
     phrase_bias: Option<&crate::PhraseBiasConfig>,
+    backend: GgmlCpuGraphBackend,
     prefer_cpu_backend: bool,
     word_timestamps: bool,
     audio_duration_seconds: f32,
     control: &Arc<crate::TranscriptionControl>,
 ) -> Result<super::decoder_graph::CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
-    let decoder_backend = cohere_decoder_graph_config(prefer_cpu_backend).backend;
+    let decoder_backend = cohere_decoder_graph_config(backend, prefer_cpu_backend).backend;
     let key = (runtime_cache_path_identity(runtime_path), decoder_backend);
     with_thread_local_cached_mut_by_key(
         &COHERE_DECODER_RUNTIME_BY_KEY,
@@ -471,6 +481,7 @@ fn decode_with_cached_cohere_decoder_runtime(
                 metadata,
                 encoder_output.frame_count,
                 encoder_output.hidden_size,
+                backend,
                 prefer_cpu_backend,
             )
         },
@@ -975,6 +986,7 @@ mod tests {
             .prepared_runtime_for_preflight(
                 request.selected_family.model_architecture,
                 &preflight,
+                request.resolved_runtime.backend(),
                 map_prepared_runtime_registry_error,
                 cohere_runtime_cache_slot_unavailable,
             )
@@ -984,6 +996,7 @@ mod tests {
             .prepared_runtime_for_preflight(
                 request.selected_family.model_architecture,
                 &preflight,
+                request.resolved_runtime.backend(),
                 map_prepared_runtime_registry_error,
                 cohere_runtime_cache_slot_unavailable,
             )
@@ -1032,6 +1045,7 @@ mod tests {
                 .prepared_runtime_for_preflight(
                     request.selected_family.model_architecture,
                     &preflight,
+                    request.resolved_runtime.backend(),
                     map_prepared_runtime_registry_error,
                     cohere_runtime_cache_slot_unavailable,
                 )
@@ -1051,6 +1065,7 @@ mod tests {
                 .prepared_runtime_for_preflight(
                     request.selected_family.model_architecture,
                     &preflight,
+                    request.resolved_runtime.backend(),
                     map_prepared_runtime_registry_error,
                     cohere_runtime_cache_slot_unavailable,
                 )

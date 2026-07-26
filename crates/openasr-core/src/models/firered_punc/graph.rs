@@ -49,8 +49,11 @@ const FIRERED_PUNC_ARENA_TENSORS_PER_LAYER: usize = 16;
 /// [`GgmlCpuGraphConfig::metadata_context_bytes`]). Mirrors the qwen
 /// audio-encoder (`models/qwen/audio_encoder.rs`) and xasr_zipformer encoder
 /// (`models/xasr_zipformer/graph_config.rs`) sizing.
-fn firered_punc_graph_config(layers: usize) -> GgmlCpuGraphConfig {
-    let mut config = GgmlCpuGraphConfig::default();
+fn firered_punc_graph_config(
+    layers: usize,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+) -> GgmlCpuGraphConfig {
+    let mut config = GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend);
     config.graph_size = config.graph_size.max(layers * 64 + 512);
     config.context_bytes = config
         .context_bytes
@@ -163,8 +166,9 @@ impl FireRedPuncGraph {
     pub(crate) fn new(
         weights: &FireRedPuncWeights,
         metadata: FireRedPuncExecutionMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedPuncGraphError> {
-        let config = firered_punc_graph_config(metadata.layers);
+        let config = firered_punc_graph_config(metadata.layers, backend);
         let runner = GgmlCpuGraphRunner::new(config).map_err(bf("runner_init"))?;
         let mut arena = runner
             .start_static_tensor_arena(firered_punc_weight_arena_context_bytes(metadata.layers))
@@ -716,7 +720,12 @@ mod tests {
     fn synthetic_forward_matches_hand_computed_argmax() {
         let metadata = tiny_metadata();
         let weights = tiny_weights();
-        let mut graph = FireRedPuncGraph::new(&weights, metadata).expect("build graph");
+        let mut graph = FireRedPuncGraph::new(
+            &weights,
+            metadata,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("build graph");
         // Token 1 embeds to a positive dim-0 (-> label 1); token 0 to zero
         // (-> label-2 baseline).
         let logits = graph.forward(&[1, 0]).expect("forward");
@@ -734,7 +743,12 @@ mod tests {
     fn synthetic_forward_is_deterministic() {
         let metadata = tiny_metadata();
         let weights = tiny_weights();
-        let mut graph = FireRedPuncGraph::new(&weights, metadata).expect("build graph");
+        let mut graph = FireRedPuncGraph::new(
+            &weights,
+            metadata,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("build graph");
         let a = graph.forward(&[1, 0, 2]).expect("forward a");
         let b = graph.forward(&[1, 0, 2]).expect("forward b");
         assert_eq!(a, b, "same input -> same logits");
@@ -744,7 +758,12 @@ mod tests {
     fn empty_and_overlong_inputs_fail_closed() {
         let metadata = tiny_metadata();
         let weights = tiny_weights();
-        let mut graph = FireRedPuncGraph::new(&weights, metadata).expect("build graph");
+        let mut graph = FireRedPuncGraph::new(
+            &weights,
+            metadata,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("build graph");
         assert!(matches!(
             graph.forward(&[]),
             Err(FireRedPuncGraphError::EmptyInput)
@@ -766,7 +785,8 @@ mod tests {
     #[test]
     fn graph_context_is_right_sized_not_flat_256mb() {
         let layers = 24;
-        let config = firered_punc_graph_config(layers);
+        let config =
+            firered_punc_graph_config(layers, crate::ggml_runtime::GgmlCpuGraphBackend::Cpu);
         assert!(config.graph_size >= layers * 64 + 512);
         assert!(
             config.context_bytes >= GgmlCpuGraphConfig::metadata_context_bytes(config.graph_size)

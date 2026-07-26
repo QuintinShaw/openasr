@@ -109,8 +109,9 @@ impl FireRedEncoderGraphRuntime {
     pub(crate) fn new(
         runtime_path: &Path,
         metadata: FireRedAedExecutionMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedEncoderError> {
-        let runner = GgmlCpuGraphRunner::new(firered_encoder_graph_config())
+        let runner = GgmlCpuGraphRunner::new(firered_encoder_graph_config(backend))
             .map_err(|source| map_err("runner_init", source))?;
         let loaded = runner
             .load_gguf_weight_context(runtime_path)
@@ -1732,8 +1733,12 @@ mod parity_tests {
             .expect("read inv_stddev");
         apply_cmvn(&mut fbank.data, fbank.n_mels, &neg_mean, &inv_stddev).expect("apply cmvn");
 
-        let mut runtime =
-            FireRedEncoderGraphRuntime::new(&pack_path, metadata).expect("build encoder runtime");
+        let mut runtime = FireRedEncoderGraphRuntime::new(
+            &pack_path,
+            metadata,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("build encoder runtime");
         let output = runtime.encode(&fbank.data, fbank.n_frames).expect("encode");
 
         eprintln!(
@@ -1827,8 +1832,10 @@ mod parity_tests {
             .ok()
             .and_then(|value| value.parse::<usize>().ok());
 
-        let mut runner =
-            GgmlCpuGraphRunner::new(firered_encoder_graph_config()).expect("build runner");
+        let mut runner = GgmlCpuGraphRunner::new(firered_encoder_graph_config(
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        ))
+        .expect("build runner");
         let loaded = runner
             .load_gguf_weight_context(&pack_path)
             .expect("load gguf weight context");

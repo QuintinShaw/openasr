@@ -127,8 +127,9 @@ impl MimoAudiotokEncoderRuntime {
     pub(crate) fn new(
         runtime_path: &Path,
         metadata: MimoAudiotokMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MimoAudiotokEncoderError> {
-        let mut config = GgmlCpuGraphConfig::default();
+        let mut config = GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend);
         config.context_bytes = config
             .context_bytes
             .max(GgmlCpuGraphConfig::metadata_context_bytes(

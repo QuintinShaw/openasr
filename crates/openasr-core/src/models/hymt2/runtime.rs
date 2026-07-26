@@ -7,8 +7,8 @@ use thiserror::Error;
 
 use crate::arch::HYMT2_DECODE_POLICY_ID;
 use crate::ggml_runtime::{
-    GgmlCpuGraphError, GgufMetadataReadError, GgufTensorDataReadError, GgufTensorDataReader,
-    GgufTensorIndexReadError,
+    GgmlCpuGraphBackend, GgmlCpuGraphError, GgufMetadataReadError, GgufTensorDataReadError,
+    GgufTensorDataReader, GgufTensorIndexReadError,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
@@ -288,7 +288,10 @@ impl Hymt2RuntimeSession {
 }
 
 impl Hymt2Runtime {
-    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, Hymt2RuntimeError> {
+    pub fn from_path(
+        path: impl AsRef<Path>,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, Hymt2RuntimeError> {
         let runtime_source = validate_ggml_runtime_source_path(path.as_ref())
             .map_err(|source| Hymt2RuntimeError::RuntimeSourcePath { source })?;
         let metadata = read_gguf_metadata_from_runtime_source(&runtime_source)
@@ -318,11 +321,11 @@ impl Hymt2Runtime {
                 },
             )?;
         // hymt2 is not (yet) wired into the shared `GgmlAsrExecutionRequest`
-        // dispatch, so there is no upstream resolved backend to inherit here
-        // -- resolve fresh, exactly like the main request-construction sites
-        // do (this family's own architecture is not registered, so this
-        // simply follows the generic runtime default).
-        let backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
+        // dispatch, so there is no `resolved_runtime` to inherit here -- the
+        // resolved backend is instead a required, explicit parameter on this
+        // constructor, resolved by the caller (the realtime translation
+        // session) exactly like every other family's request-construction
+        // site, never re-derived internally.
         let logits_head = load_qwen3_llm_logits_head_from_reader_with_output_tensor(
             &reader,
             qwen_metadata,
@@ -2324,7 +2327,11 @@ mod tests {
     fn hymt2_real_pack_hot_session_reports_perf() {
         let runtime_path = hymt2_real_pack_path();
         let load_started = std::time::Instant::now();
-        let runtime = Hymt2Runtime::from_path(&runtime_path).expect("load Hy-MT2 runtime");
+        let runtime = Hymt2Runtime::from_path(
+            &runtime_path,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        )
+        .expect("load Hy-MT2 runtime");
         let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
         eprintln!("hymt2 cold model load_ms={load_ms:.2}");
         let source_clause = hymt2_real_pack_perf_source_clause("我们需要保持流式路径很快。");
@@ -2354,7 +2361,11 @@ mod tests {
         let lines_path = std::env::var("OPENASR_HYMT2_EVAL_LINES")
             .expect("set OPENASR_HYMT2_EVAL_LINES to a UTF-8 file with one source clause per line");
         let raw = std::fs::read_to_string(&lines_path).expect("read eval lines file");
-        let runtime = Hymt2Runtime::from_path(&runtime_path).expect("load Hy-MT2 runtime");
+        let runtime = Hymt2Runtime::from_path(
+            &runtime_path,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        )
+        .expect("load Hy-MT2 runtime");
         let mut cache = Hymt2TranslationSessionCache::default();
         let mut context: Vec<(String, String)> = Vec::new();
         let mut total_ms = 0.0_f64;
@@ -2427,7 +2438,11 @@ mod tests {
     #[ignore = "manual real-pack replay: set OPENASR_HYMT2_REAL_PACK or keep a local tmp/hymt2-local copy"]
     fn hymt2_prefix_cache_replay_reuses_prefill_and_matches_uncached_outputs() {
         let runtime_path = hymt2_real_pack_path();
-        let runtime = Hymt2Runtime::from_path(&runtime_path).expect("load Hy-MT2 runtime");
+        let runtime = Hymt2Runtime::from_path(
+            &runtime_path,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        )
+        .expect("load Hy-MT2 runtime");
         let mut cache = Hymt2TranslationSessionCache::default();
         let sequence = [
             "我们需要保持",
@@ -2500,7 +2515,11 @@ mod tests {
     #[ignore = "manual real-pack latency harness: set OPENASR_HYMT2_REAL_PACK; prints hot per-clause translate p50/p90"]
     fn hymt2_real_pack_hot_clause_latency_distribution() {
         let runtime_path = hymt2_real_pack_path();
-        let runtime = Hymt2Runtime::from_path(&runtime_path).expect("load Hy-MT2 runtime");
+        let runtime = Hymt2Runtime::from_path(
+            &runtime_path,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        )
+        .expect("load Hy-MT2 runtime");
         let mut cache = Hymt2TranslationSessionCache::default();
         // Realistic clause-retranslation traffic: each clause grows in steps
         // (provisional retranslations) and ends with its stable form, capped
@@ -2583,7 +2602,11 @@ mod tests {
 
     fn run_hymt2_real_pack_decode(source_clause: &str) -> Hymt2RealPackDecodeReport {
         let runtime_path = hymt2_real_pack_path();
-        let runtime = Hymt2Runtime::from_path(&runtime_path).expect("load Hy-MT2 runtime");
+        let runtime = Hymt2Runtime::from_path(
+            &runtime_path,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        )
+        .expect("load Hy-MT2 runtime");
         run_hymt2_real_pack_decode_with_runtime(&runtime_path, &runtime, source_clause)
     }
 

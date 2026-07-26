@@ -6,9 +6,11 @@ use crate::models::graph_runtime_config::{
 
 const OPENASR_PARAKEET_CTC_ENABLE_ENCODER_GPU: &str = "OPENASR_PARAKEET_CTC_ENABLE_ENCODER_GPU";
 
-pub(crate) fn parakeet_ctc_encoder_graph_config() -> GgmlCpuGraphConfig {
+pub(crate) fn parakeet_ctc_encoder_graph_config(
+    backend: GgmlCpuGraphBackend,
+) -> GgmlCpuGraphConfig {
     let mut config = configure_model_runtime_graph_config_from_env(
-        GgmlCpuGraphConfig::default(),
+        GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend),
         ModelMetalRuntimeOverrides {
             default_use_scheduler_when_unset: None,
             default_n_threads_when_unset: None,

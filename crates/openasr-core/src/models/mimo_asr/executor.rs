@@ -261,12 +261,14 @@ impl MimoAsrGgmlExecutor {
             })?;
 
         let runtime_path = preflight.runtime_source.path();
-        let mut encoder_runtime =
-            MimoAudiotokEncoderRuntime::new(runtime_path, audiotok_metadata.clone()).map_err(
-                |error| MimoAsrExecutorError::EncoderFailed {
-                    reason: error.to_string(),
-                },
-            )?;
+        let mut encoder_runtime = MimoAudiotokEncoderRuntime::new(
+            runtime_path,
+            audiotok_metadata.clone(),
+            request.resolved_runtime.backend(),
+        )
+        .map_err(|error| MimoAsrExecutorError::EncoderFailed {
+            reason: error.to_string(),
+        })?;
         let encoder_output = encoder_runtime.encode(&mel_features).map_err(|error| {
             MimoAsrExecutorError::EncoderFailed {
                 reason: error.to_string(),
@@ -324,10 +326,14 @@ impl MimoAsrGgmlExecutor {
         })?;
         let summed = sum_speech_embeddings(&tables, &codes);
 
-        let mut inlocal_runtime = MimoInputLocalRuntime::new(runtime_path, inlocal_metadata)
-            .map_err(|error| MimoAsrExecutorError::InputLocalFailed {
-                reason: error.to_string(),
-            })?;
+        let mut inlocal_runtime = MimoInputLocalRuntime::new(
+            runtime_path,
+            inlocal_metadata,
+            request.resolved_runtime.backend(),
+        )
+        .map_err(|error| MimoAsrExecutorError::InputLocalFailed {
+            reason: error.to_string(),
+        })?;
         let speech_rows = inlocal_runtime
             .run(&summed, usable_frames, llm_metadata.d_model)
             .map_err(|error| MimoAsrExecutorError::InputLocalFailed {

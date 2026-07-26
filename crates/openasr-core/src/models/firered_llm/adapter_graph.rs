@@ -111,8 +111,11 @@ pub(crate) struct FireRedLlmAdapterGraphRuntime {
 }
 
 impl FireRedLlmAdapterGraphRuntime {
-    pub(crate) fn new(runtime_path: &Path) -> Result<Self, FireRedLlmAdapterError> {
-        let runner = GgmlCpuGraphRunner::new(firered_encoder_graph_config())
+    pub(crate) fn new(
+        runtime_path: &Path,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<Self, FireRedLlmAdapterError> {
+        let runner = GgmlCpuGraphRunner::new(firered_encoder_graph_config(backend))
             .map_err(|source| map_err("runner_init", source))?;
         let loaded = runner
             .load_gguf_weight_context(runtime_path)
@@ -378,8 +381,12 @@ mod tests {
         apply_cmvn(&mut features.data, features.n_mels, &neg_mean, &inv_stddev)
             .expect("apply cmvn");
 
-        let mut encoder_runtime = FireRedEncoderGraphRuntime::new(&pack_path, encoder_metadata)
-            .expect("build encoder runtime");
+        let mut encoder_runtime = FireRedEncoderGraphRuntime::new(
+            &pack_path,
+            encoder_metadata,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("build encoder runtime");
         let encoder_output = encoder_runtime
             .encode(&features.data, features.n_frames)
             .expect("encode");
@@ -393,8 +400,11 @@ mod tests {
             adapter_metadata.llm_dim,
         );
 
-        let mut adapter_runtime =
-            FireRedLlmAdapterGraphRuntime::new(&pack_path).expect("build adapter runtime");
+        let mut adapter_runtime = FireRedLlmAdapterGraphRuntime::new(
+            &pack_path,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("build adapter runtime");
         let (ggml_rows, ggml_frame_count) = adapter_runtime
             .run(
                 &encoder_output.rows,

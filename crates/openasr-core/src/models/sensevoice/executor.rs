@@ -105,6 +105,7 @@ pub(crate) struct SenseVoiceTranscription {
 
 fn build_sensevoice_prepared_runtime(
     pack_path: &Path,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<SenseVoicePreparedRuntime, String> {
     let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(pack_path)
         .map_err(|e| e.to_string())?;
@@ -118,7 +119,7 @@ fn build_sensevoice_prepared_runtime(
     let prompt_embed = weights.prompt_embed.values.clone();
     let cmvn_neg_mean = weights.cmvn_neg_mean.values.clone();
     let cmvn_inv_stddev = weights.cmvn_inv_stddev.values.clone();
-    let graph = SenseVoiceEncoderGraph::new(&weights, metadata, Some(pack_path))
+    let graph = SenseVoiceEncoderGraph::new(&weights, metadata, Some(pack_path), backend)
         .map_err(|e| e.to_string())?;
     Ok(SenseVoicePreparedRuntime {
         metadata,
@@ -259,14 +260,14 @@ fn decode_sensevoice_pcm_cached(
     pack_path: &Path,
     language: Option<&str>,
     phrase_bias: Option<&PhraseBiasConfig>,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<CtcGreedyDecodeResult, String> {
-    let backend = super::graph_config::sensevoice_encoder_graph_config().backend;
     let key = (runtime_cache_path_identity(pack_path), backend);
     with_thread_local_cached_mut_by_key(
         &SENSEVOICE_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_sensevoice_prepared_runtime(pack_path),
+        || build_sensevoice_prepared_runtime(pack_path, backend),
         |runtime| runtime.decode_result(samples, language, phrase_bias),
     )
 }
@@ -276,14 +277,14 @@ fn transcribe_sensevoice_pcm_cached(
     pack_path: &Path,
     language: Option<&str>,
     phrase_bias: Option<&PhraseBiasConfig>,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<SenseVoiceTranscription, String> {
-    let backend = super::graph_config::sensevoice_encoder_graph_config().backend;
     let key = (runtime_cache_path_identity(pack_path), backend);
     with_thread_local_cached_mut_by_key(
         &SENSEVOICE_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_sensevoice_prepared_runtime(pack_path),
+        || build_sensevoice_prepared_runtime(pack_path, backend),
         |runtime| runtime.transcribe(samples, language, phrase_bias),
     )
 }
@@ -310,6 +311,7 @@ impl SenseVoiceGgmlExecutor {
             &request.runtime_source_path,
             request.request_options.language.as_deref(),
             request.request_options.phrase_bias.as_ref(),
+            request.resolved_runtime.backend(),
         )
         .map(strip_tags_in_result)
         .map_err(fail)
@@ -347,6 +349,7 @@ impl GgmlAsrExecutor for SenseVoiceGgmlExecutor {
             &request.runtime_source_path,
             request.request_options.language.as_deref(),
             request.request_options.phrase_bias.as_ref(),
+            request.resolved_runtime.backend(),
         )
         .map_err(fail)?;
         let duration = request.prepared_audio.samples_f32.len() as f32 / 16_000.0_f32;
@@ -473,9 +476,10 @@ mod tests {
             panic!("no data chunk in {name}");
         };
 
+        let backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
         let zh = read_wav("zh.wav");
-        let zh_out =
-            transcribe_sensevoice_pcm_cached(&zh, &pack, Some("zh"), None).expect("zh transcribe");
+        let zh_out = transcribe_sensevoice_pcm_cached(&zh, &pack, Some("zh"), None, backend)
+            .expect("zh transcribe");
         eprintln!(
             "sensevoice zh: {:?} (lang {:?})",
             zh_out.text, zh_out.language
@@ -499,8 +503,8 @@ mod tests {
         assert_eq!(zh_out.language.as_deref(), Some("zh"));
 
         let en = read_wav("en.wav");
-        let en_out =
-            transcribe_sensevoice_pcm_cached(&en, &pack, Some("en"), None).expect("en transcribe");
+        let en_out = transcribe_sensevoice_pcm_cached(&en, &pack, Some("en"), None, backend)
+            .expect("en transcribe");
         eprintln!(
             "sensevoice en: {:?} (lang {:?})",
             en_out.text, en_out.language
@@ -525,8 +529,8 @@ mod tests {
         }
 
         // auto (LID): zh clip must detect zh.
-        let auto_out =
-            transcribe_sensevoice_pcm_cached(&zh, &pack, None, None).expect("auto transcribe");
+        let auto_out = transcribe_sensevoice_pcm_cached(&zh, &pack, None, None, backend)
+            .expect("auto transcribe");
         eprintln!(
             "sensevoice auto: {:?} (lang {:?})",
             auto_out.text, auto_out.language
@@ -562,12 +566,16 @@ mod tests {
             i += 8 + size + (size & 1);
         }
         let duration = samples.len() as f32 / 16_000.0;
-        // Warm (load + first decode), then measure steady-state decodes.
-        transcribe_sensevoice_pcm_cached(&samples, &pack, Some("en"), None).expect("warm");
+        // Warm (load + first decode), then measure steady-state decodes. Reads
+        // `OPENASR_GGML_BACKEND` (see the doc comment above) so this probe can
+        // report either the CPU or the Metal figure.
+        let backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
+        transcribe_sensevoice_pcm_cached(&samples, &pack, Some("en"), None, backend).expect("warm");
         let runs = 3;
         let start = std::time::Instant::now();
         for _ in 0..runs {
-            transcribe_sensevoice_pcm_cached(&samples, &pack, Some("en"), None).expect("run");
+            transcribe_sensevoice_pcm_cached(&samples, &pack, Some("en"), None, backend)
+                .expect("run");
         }
         let per_run = start.elapsed().as_secs_f32() / runs as f32;
         eprintln!(

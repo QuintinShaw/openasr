@@ -95,6 +95,7 @@ pub(crate) fn run_moonshine_decoder_short_form(
     metadata: MoonshineExecutionMetadata,
     encoder_output: &MoonshineEncoderOutput,
     phrase_bias: Option<&PhraseBiasConfig>,
+    backend: GgmlCpuGraphBackend,
     prefer_cpu_backend: bool,
     runtime_path: Option<&Path>,
     word_timestamps: bool,
@@ -106,6 +107,7 @@ pub(crate) fn run_moonshine_decoder_short_form(
         let key = moonshine_decoder_runtime_cache_key(
             runtime_path,
             encoder_output.frame_count,
+            backend,
             prefer_cpu_backend,
             adapter,
         );
@@ -118,6 +120,7 @@ pub(crate) fn run_moonshine_decoder_short_form(
                     decoder_weights,
                     metadata,
                     encoder_output.frame_count,
+                    backend,
                     prefer_cpu_backend,
                     Some(runtime_path),
                     adapter,
@@ -142,6 +145,7 @@ pub(crate) fn run_moonshine_decoder_short_form(
         decoder_weights,
         metadata,
         encoder_output.frame_count,
+        backend,
         prefer_cpu_backend,
         runtime_path,
         adapter,
@@ -161,12 +165,13 @@ pub(crate) fn run_moonshine_decoder_short_form(
 fn moonshine_decoder_runtime_cache_key(
     runtime_path: &Path,
     cross_frame_count: usize,
+    backend: GgmlCpuGraphBackend,
     prefer_cpu_backend: bool,
     adapter: Option<&MoonshineLoraAdapter>,
 ) -> MoonshineDecoderRuntimeCacheKey {
     (
         runtime_cache_path_identity(runtime_path),
-        moonshine_decoder_graph_config(prefer_cpu_backend).backend,
+        moonshine_decoder_graph_config(backend, prefer_cpu_backend).backend,
         cross_frame_count,
         moonshine_adapter_cache_fingerprint(adapter),
     )
@@ -500,10 +505,12 @@ impl MoonshineDecoderGraphRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         decoder_weights: &MoonshineDecoderWeights,
         metadata: MoonshineExecutionMetadata,
         cross_frame_count: usize,
+        backend: GgmlCpuGraphBackend,
         prefer_cpu_backend: bool,
         runtime_path: Option<&Path>,
         adapter: Option<&MoonshineLoraAdapter>,
@@ -512,6 +519,7 @@ impl MoonshineDecoderGraphRuntime {
             decoder_weights,
             metadata,
             cross_frame_count,
+            backend,
             prefer_cpu_backend,
             runtime_path,
             1,
@@ -524,6 +532,7 @@ impl MoonshineDecoderGraphRuntime {
         decoder_weights: &MoonshineDecoderWeights,
         metadata: MoonshineExecutionMetadata,
         cross_frame_count: usize,
+        backend: GgmlCpuGraphBackend,
         prefer_cpu_backend: bool,
         runtime_path: Option<&Path>,
         n_seq: usize,
@@ -549,7 +558,7 @@ impl MoonshineDecoderGraphRuntime {
             });
         }
 
-        let mut config = moonshine_decoder_graph_config(prefer_cpu_backend);
+        let mut config = moonshine_decoder_graph_config(backend, prefer_cpu_backend);
         config.graph_size = config.graph_size.max(MOONSHINE_DECODER_GRAPH_SIZE_FLOOR);
         config.context_bytes =
             config
@@ -2774,6 +2783,7 @@ mod tests {
             &prepared.decoder_weights,
             metadata,
             encoder_output_0.frame_count,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             false,
             Some(runtime_path.as_path()),
             None,
@@ -2790,6 +2800,7 @@ mod tests {
             &prepared.decoder_weights,
             metadata,
             encoder_output_1.frame_count,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             false,
             Some(runtime_path.as_path()),
             None,
@@ -2806,6 +2817,7 @@ mod tests {
             &prepared.decoder_weights,
             metadata,
             encoder_output_0.frame_count,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             false,
             Some(runtime_path.as_path()),
             2,
@@ -2852,6 +2864,7 @@ mod tests {
             &prepared.decoder_weights,
             metadata,
             encoder_output_0.frame_count,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             false,
             Some(runtime_path.as_path()),
             None,
@@ -2873,6 +2886,7 @@ mod tests {
             &prepared.decoder_weights,
             metadata,
             encoder_output_1.frame_count,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             false,
             Some(runtime_path.as_path()),
             None,
@@ -2894,6 +2908,7 @@ mod tests {
             &prepared.decoder_weights,
             metadata,
             encoder_output_0.frame_count,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
             false,
             Some(runtime_path.as_path()),
             2,

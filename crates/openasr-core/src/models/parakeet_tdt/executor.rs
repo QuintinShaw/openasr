@@ -25,7 +25,6 @@ use super::encoder_weights::{
     load_parakeet_tdt_encoder_weights, load_parakeet_tdt_joint_weights,
     load_parakeet_tdt_predictor_weights,
 };
-use super::graph_config::parakeet_tdt_encoder_graph_config;
 use super::greedy::{ParakeetTdtJoint, tdt_greedy_decode};
 use super::predictor::ParakeetTdtPredictor;
 use super::runtime_contract::{
@@ -58,6 +57,7 @@ pub(crate) struct ParakeetTdtTranscription {
 
 fn build_parakeet_tdt_prepared_runtime(
     runtime_source: &GgmlRuntimeSource,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<ParakeetTdtPreparedRuntime, String> {
     // `from_runtime_source` reads tensor data from `runtime_source`'s
     // already-open mapping -- this used to reopen `pack_path` a second time
@@ -72,8 +72,9 @@ fn build_parakeet_tdt_prepared_runtime(
     let tokenizer = ParakeetTdtTokenizer::from_metadata(&gguf_metadata)?;
     let weights =
         load_parakeet_tdt_encoder_weights(&reader, &metadata).map_err(|e| e.to_string())?;
-    let graph = ParakeetTdtEncoderGraph::new(&weights, metadata, Some(runtime_source.path()))
-        .map_err(|e| e.to_string())?;
+    let graph =
+        ParakeetTdtEncoderGraph::new(&weights, metadata, Some(runtime_source.path()), backend)
+            .map_err(|e| e.to_string())?;
     let predictor_weights =
         load_parakeet_tdt_predictor_weights(&reader, &metadata).map_err(|e| e.to_string())?;
     let predictor =
@@ -145,14 +146,14 @@ pub(crate) fn transcribe_parakeet_tdt_pcm_cached(
     samples: &[f32],
     runtime_source: &GgmlRuntimeSource,
     word_timestamps: bool,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<ParakeetTdtTranscription, String> {
-    let backend = parakeet_tdt_encoder_graph_config().backend;
     let key = (runtime_cache_path_identity(runtime_source.path()), backend);
     with_thread_local_cached_mut_by_key(
         &PARAKEET_TDT_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_parakeet_tdt_prepared_runtime(runtime_source),
+        || build_parakeet_tdt_prepared_runtime(runtime_source, backend),
         |runtime| runtime.transcribe(samples, word_timestamps),
     )
 }
@@ -197,6 +198,7 @@ impl GgmlAsrExecutor for ParakeetTdtGgmlExecutor {
             &request.prepared_audio.samples_f32,
             &preflight.runtime_source,
             request.request_options.word_timestamps,
+            request.resolved_runtime.backend(),
         )
         .map_err(fail)?;
         let duration = request.prepared_audio.samples_f32.len() as f32 / 16_000.0_f32;
@@ -297,8 +299,13 @@ mod tests {
         let samples = read_wav_mono_16k(&clip).expect("wav");
         let runtime_source =
             crate::validate_ggml_runtime_source_path(&pack).expect("validate runtime source");
-        let output = transcribe_parakeet_tdt_pcm_cached(&samples, &runtime_source, true)
-            .expect("transcribe");
+        let output = transcribe_parakeet_tdt_pcm_cached(
+            &samples,
+            &runtime_source,
+            true,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("transcribe");
         eprintln!("parakeet-tdt hypothesis: {:?}", output.text);
         eprintln!("parakeet-tdt words: {:?}", output.words);
         let lowered = output.text.to_lowercase();

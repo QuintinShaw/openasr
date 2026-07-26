@@ -804,6 +804,21 @@ fn run_native_transcription_fallible(
     let language_hint = request.language.clone();
     let model_pack_path = request.model_pack_path.clone();
     let punctuate = request.punctuate;
+    // Captured before the move below: the punctuation post-process is a
+    // separate pack from the main ASR family (never carries a
+    // `GgmlAsrExecutionRequest`/`resolved_runtime`), so it resolves its own
+    // backend explicitly here from this request's own execution target,
+    // rather than reaching for the implicit generic default.
+    let punctuation_backend = execution_target_backend_preference(request.execution_target)
+        .ok()
+        .map(|preference| {
+            crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                preference.request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            )
+            .backend()
+        })
+        .unwrap_or(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu);
     // Coarse per-request stage timing: "inference" spans model resolution +
     // audio prep (see the `audio_prep` stage logged inside `_impl` around the
     // WAV load) + decode/longform-assembly, i.e. the whole
@@ -820,8 +835,12 @@ fn run_native_transcription_fallible(
         inference_started.elapsed(),
     );
     let postprocess_started = Instant::now();
-    let transcription =
-        apply_punctuation_stage_if_applicable(transcription, model_pack_path.as_deref(), punctuate);
+    let transcription = apply_punctuation_stage_if_applicable(
+        transcription,
+        model_pack_path.as_deref(),
+        punctuate,
+        punctuation_backend,
+    );
     let result = if refine {
         publish_align_progress(execution_context.request_id.as_deref());
         refine_transcription_word_timestamps_with_forced_aligner(
@@ -873,6 +892,7 @@ fn apply_punctuation_stage_if_applicable(
     transcription: Transcription,
     model_pack_path: Option<&Path>,
     punctuate: bool,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Transcription {
     if !should_run_punctuation_stage(punctuate, model_emits_punctuation(model_pack_path)) {
         return transcription;
@@ -880,7 +900,7 @@ fn apply_punctuation_stage_if_applicable(
     let Some(punc_pack_path) = resolve_firered_punc_pack_path() else {
         return transcription;
     };
-    let Ok(runtime) = FireRedPuncRuntime::from_pack(&punc_pack_path) else {
+    let Ok(runtime) = FireRedPuncRuntime::from_pack(&punc_pack_path, backend) else {
         return transcription;
     };
     punctuate_transcription_segments(transcription, &runtime)
@@ -4027,11 +4047,21 @@ mod tests {
             longform: None,
             language: None,
         };
-        let unchanged = apply_punctuation_stage_if_applicable(transcription.clone(), None, true);
+        let unchanged = apply_punctuation_stage_if_applicable(
+            transcription.clone(),
+            None,
+            true,
+            GgmlCpuGraphBackend::Cpu,
+        );
         assert_eq!(unchanged, transcription);
 
         // Explicit opt-out short-circuits before any pack resolution too.
-        let unchanged = apply_punctuation_stage_if_applicable(transcription.clone(), None, false);
+        let unchanged = apply_punctuation_stage_if_applicable(
+            transcription.clone(),
+            None,
+            false,
+            GgmlCpuGraphBackend::Cpu,
+        );
         assert_eq!(unchanged, transcription);
     }
 

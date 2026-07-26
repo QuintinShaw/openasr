@@ -56,7 +56,10 @@ pub(crate) struct FireRedPuncRuntime {
 }
 
 impl FireRedPuncRuntime {
-    pub(crate) fn from_pack(path: &Path) -> Result<Self, FireRedPuncRuntimeError> {
+    pub(crate) fn from_pack(
+        path: &Path,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<Self, FireRedPuncRuntimeError> {
         let reader = GgufTensorDataReader::from_path(path)
             .map_err(|error| FireRedPuncRuntimeError::Read(error.to_string()))?;
         let gguf = read_gguf_metadata(path)
@@ -70,7 +73,7 @@ impl FireRedPuncRuntime {
             .map_err(|error| FireRedPuncRuntimeError::Tokenizer(error.to_string()))?;
         let weights = load_firered_punc_weights(&reader, &metadata)
             .map_err(|error| FireRedPuncRuntimeError::Weights(error.to_string()))?;
-        let graph = FireRedPuncGraph::new(&weights, metadata)?;
+        let graph = FireRedPuncGraph::new(&weights, metadata, backend)?;
         Ok(Self {
             metadata,
             tokenizer,
@@ -110,8 +113,11 @@ pub(crate) struct SendableFireRedPuncRuntime(FireRedPuncRuntime);
 unsafe impl Send for SendableFireRedPuncRuntime {}
 
 impl SendableFireRedPuncRuntime {
-    pub(crate) fn from_pack(path: &Path) -> Result<Self, FireRedPuncRuntimeError> {
-        FireRedPuncRuntime::from_pack(path).map(Self)
+    pub(crate) fn from_pack(
+        path: &Path,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<Self, FireRedPuncRuntimeError> {
+        FireRedPuncRuntime::from_pack(path, backend).map(Self)
     }
 
     /// See [`FireRedPuncRuntime::punctuate`] (including its per-segment Han
@@ -187,7 +193,11 @@ mod tests {
         let Some(path) = std::env::var_os("OPENASR_FIRERED_PUNC_REAL_PACK") else {
             return;
         };
-        let runtime = FireRedPuncRuntime::from_pack(Path::new(&path)).expect("load real pack");
+        let runtime = FireRedPuncRuntime::from_pack(
+            Path::new(&path),
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        )
+        .expect("load real pack");
         let out = runtime.punctuate("你好世界").expect("punctuate");
         assert_eq!(out, "你好世界。", "upstream README golden");
 
@@ -216,7 +226,11 @@ mod tests {
         ) else {
             return;
         };
-        let runtime = FireRedPuncRuntime::from_pack(Path::new(&pack)).expect("load real pack");
+        let runtime = FireRedPuncRuntime::from_pack(
+            Path::new(&pack),
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        )
+        .expect("load real pack");
         let text = std::fs::read_to_string(Path::new(&json)).expect("read golden json");
         let entries: serde_json::Value = serde_json::from_str(&text).expect("parse golden json");
         let entries = entries.as_array().expect("golden json is a list");

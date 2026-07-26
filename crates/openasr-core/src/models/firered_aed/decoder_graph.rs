@@ -280,9 +280,10 @@ impl FireRedDecoderGraphRuntime {
     pub(crate) fn new(
         runtime_path: &Path,
         metadata: FireRedAedExecutionMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedDecoderError> {
         let cross_capacity_frames = firered_decoder_cross_capacity_frames(&metadata);
-        let runner = GgmlCpuGraphRunner::new(firered_decoder_graph_config())
+        let runner = GgmlCpuGraphRunner::new(firered_decoder_graph_config(backend))
             .map_err(|source| map_err("runner_init", source))?;
         let loaded = runner
             .load_gguf_weight_context(runtime_path)

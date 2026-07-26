@@ -39,9 +39,9 @@ const OPENASR_FIRERED_ENABLE_DECODER_METAL: &str = "OPENASR_FIRERED_ENABLE_DECOD
 const OPENASR_FIRERED_ENABLE_ENCODER_GPU: &str = "OPENASR_FIRERED_ENABLE_ENCODER_GPU";
 const OPENASR_FIRERED_ENABLE_DECODER_GPU: &str = "OPENASR_FIRERED_ENABLE_DECODER_GPU";
 
-pub(crate) fn firered_runtime_graph_config() -> GgmlCpuGraphConfig {
+pub(crate) fn firered_runtime_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     configure_model_runtime_graph_config_from_env(
-        GgmlCpuGraphConfig::default(),
+        GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend),
         ModelMetalRuntimeOverrides {
             default_use_scheduler_when_unset: Some(true),
             default_n_threads_when_unset: Some(1),
@@ -49,12 +49,12 @@ pub(crate) fn firered_runtime_graph_config() -> GgmlCpuGraphConfig {
     )
 }
 
-pub(crate) fn firered_encoder_graph_config() -> GgmlCpuGraphConfig {
+pub(crate) fn firered_encoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     // `no_alloc` metadata context sized from the actual node count (see
     // `GgmlCpuGraphConfig::metadata_context_bytes`); previously a flat
     // hardcoded 512 MiB per cached encoder runtime (see the thread-local
     // cache in `executor.rs`).
-    let mut config = firered_runtime_graph_config();
+    let mut config = firered_runtime_graph_config(backend);
     config.graph_size = config.graph_size.max(FIRERED_ENCODER_GRAPH_SIZE);
     config.context_bytes = config
         .context_bytes
@@ -74,11 +74,11 @@ pub(crate) fn firered_encoder_graph_config() -> GgmlCpuGraphConfig {
     config
 }
 
-pub(crate) fn firered_decoder_graph_config() -> GgmlCpuGraphConfig {
+pub(crate) fn firered_decoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     // See the matching comment in `firered_encoder_graph_config`: this is a
     // `no_alloc` metadata pool sized from the actual node count, not the real
     // tensor bytes (those live in the arena's own backend buffer).
-    let mut config = firered_runtime_graph_config();
+    let mut config = firered_runtime_graph_config(backend);
     config.graph_size = config.graph_size.max(FIRERED_DECODER_GRAPH_SIZE);
     config.context_bytes = config
         .context_bytes
@@ -142,11 +142,17 @@ mod tests {
 
     #[test]
     fn encoder_graph_size_floor_is_preserved() {
-        assert!(firered_encoder_graph_config().graph_size >= FIRERED_ENCODER_GRAPH_SIZE);
+        assert!(
+            firered_encoder_graph_config(GgmlCpuGraphBackend::Cpu).graph_size
+                >= FIRERED_ENCODER_GRAPH_SIZE
+        );
     }
 
     #[test]
     fn decoder_graph_size_floor_is_preserved() {
-        assert!(firered_decoder_graph_config().graph_size >= FIRERED_DECODER_GRAPH_SIZE);
+        assert!(
+            firered_decoder_graph_config(GgmlCpuGraphBackend::Cpu).graph_size
+                >= FIRERED_DECODER_GRAPH_SIZE
+        );
     }
 }

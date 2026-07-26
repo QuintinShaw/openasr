@@ -173,8 +173,9 @@ impl SenseVoiceEncoderGraph {
         weights: &SenseVoiceEncoderWeights,
         metadata: SenseVoiceExecutionMetadata,
         runtime_path: Option<&Path>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, SenseVoiceEncoderError> {
-        let mut config = sensevoice_encoder_graph_config();
+        let mut config = sensevoice_encoder_graph_config(backend);
         config.context_bytes = SENSEVOICE_ENCODER_GRAPH_CONTEXT_BYTES;
         let total_layers = weights.enc_layers.len() + weights.tp_layers.len();
         config.graph_size = config.graph_size.max(total_layers * 128 + 2048);
@@ -575,8 +576,13 @@ mod tests {
             build_sensevoice_encoder_input(&prompt, &lfr, dim, metadata.d_model).expect("input");
         assert_eq!(input.n_frames, ref_logits.len() / metadata.vocab_size);
 
-        let mut graph =
-            SenseVoiceEncoderGraph::new(&weights, metadata, Some(pack.as_path())).expect("graph");
+        let mut graph = SenseVoiceEncoderGraph::new(
+            &weights,
+            metadata,
+            Some(pack.as_path()),
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("graph");
         let out = graph.encode(&input).expect("encode");
         assert_eq!(out.logits.len(), ref_logits.len());
 

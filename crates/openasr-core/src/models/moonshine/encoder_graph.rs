@@ -164,8 +164,9 @@ impl MoonshineEncoderGraphRuntime {
         metadata: MoonshineExecutionMetadata,
         runtime_path: Option<&Path>,
         adapter: Option<&MoonshineLoraAdapter>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MoonshineEncoderError> {
-        let mut config = moonshine_encoder_graph_config();
+        let mut config = moonshine_encoder_graph_config(backend);
         // `no_alloc` metadata context: covers both the encoder's own forward
         // graph AND the arena's weight tensors (see `GgmlStaticTensorArena`
         // -- real tensor bytes land in a separately sized backend buffer,

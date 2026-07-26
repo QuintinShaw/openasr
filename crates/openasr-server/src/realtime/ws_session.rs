@@ -1349,12 +1349,19 @@ impl WsSession {
     ) -> TranslationSession {
         let path = selection.path;
         Self::spawn_admitted_hymt2_translation_worker(model_session_permit, move || {
-            let runtime =
-                Hymt2Runtime::from_path(path).map_err(|error| TranslationQueueError::Worker {
+            // Hy-MT2 is not wired into the shared ASR request dispatch (this
+            // is a translation session, not a transcription request), so
+            // there is no `resolved_runtime` to inherit -- resolve explicitly
+            // here, once, at session cold-load, the same way every ASR
+            // request-construction site does.
+            let backend = openasr_core::GgmlCpuGraphConfig::runtime_default().backend;
+            let runtime = Hymt2Runtime::from_path(path, backend).map_err(|error| {
+                TranslationQueueError::Worker {
                     reason: format!(
                         "Realtime translation Hy-MT2 runtime could not be loaded: {error}"
                     ),
-                })?;
+                }
+            })?;
             let mut cache = Hymt2TranslationSessionCache::default();
             Ok(move |request| {
                 runtime

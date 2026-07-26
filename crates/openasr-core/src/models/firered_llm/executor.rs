@@ -337,8 +337,12 @@ impl FireRedLlmGgmlExecutor {
         )?;
 
         let runtime_path = preflight.runtime_source.path();
-        let mut encoder_runtime = FireRedEncoderGraphRuntime::new(runtime_path, encoder_metadata)
-            .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
+        let mut encoder_runtime = FireRedEncoderGraphRuntime::new(
+            runtime_path,
+            encoder_metadata,
+            request.resolved_runtime.backend(),
+        )
+        .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
             reason: error.to_string(),
         })?;
         let encoder_output = encoder_runtime
@@ -349,11 +353,10 @@ impl FireRedLlmGgmlExecutor {
 
         let adapter_profile_started_at = std::time::Instant::now();
         let mut adapter_runtime =
-            FireRedLlmAdapterGraphRuntime::new(runtime_path).map_err(|error| {
-                FireRedLlmExecutorError::AdapterGraphFailed {
+            FireRedLlmAdapterGraphRuntime::new(runtime_path, request.resolved_runtime.backend())
+                .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
                     reason: error.to_string(),
-                }
-            })?;
+                })?;
         let (speech_rows, speech_frame_count) = adapter_runtime
             .run(
                 &encoder_output.rows,

@@ -192,8 +192,9 @@ impl Wav2Vec2CtcEncoderGraph {
         weights: &Wav2Vec2EncoderWeights,
         metadata: Wav2Vec2CtcExecutionMetadata,
         runtime_path: Option<&Path>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, Wav2Vec2EncoderError> {
-        let mut config = wav2vec2_ctc_encoder_graph_config();
+        let mut config = wav2vec2_ctc_encoder_graph_config(backend);
         config.context_bytes = WAV2VEC2_ENCODER_GRAPH_CONTEXT_BYTES;
         // Larger variants (e.g. hubert-xlarge, ~48 transformer layers vs large's
         // 24) build more graph nodes than the default 4096-node cap, tripping
