@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use super::graph_allocation::Qwen3AsrGraphAllocationFailure;
 use super::graph_config::qwen_runtime_graph_config;
 use super::kv_cache::Qwen3AsrLayerKvCacheState;
 use super::llm_prefill::Qwen3AsrLlmPrefillInput;
@@ -123,6 +124,15 @@ pub(super) enum Qwen3AsrServeBatchError {
         stage: &'static str,
         requested_bytes: usize,
     },
+    #[error(
+        "qwen serve batch host allocation failed at {stage} (requested_bytes={requested_bytes})"
+    )]
+    HostAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
+    #[error("qwen serve batch compute buffer allocation failed (backend: {backend})")]
+    BackendBufferAllocationFailed { backend: String },
     /// Cooperative cancel observed between prefill chunks. Display text carries
     /// the stable "canceled by transcription control" marker so
     /// `dispatch_error_to_backend` rewrites to `TranscriptionCanceled`.
@@ -163,50 +173,110 @@ fn ensure_serve_batch_prefill_not_canceled(
 fn map_serve_batch_graph_error(error: GgmlCpuGraphError) -> Qwen3AsrServeBatchError {
     match error {
         GgmlCpuGraphError::Canceled => Qwen3AsrServeBatchError::Canceled,
-        GgmlCpuGraphError::ContextAllocationFailed {
+        error => Qwen3AsrGraphAllocationFailure::from_graph_error(&error)
+            .map(map_graph_allocation_failure_to_serve_batch)
+            .unwrap_or_else(|| Qwen3AsrServeBatchError::DecodeFailed {
+                reason: error.to_string(),
+            }),
+    }
+}
+
+fn map_graph_allocation_failure_to_serve_batch(
+    error: Qwen3AsrGraphAllocationFailure,
+) -> Qwen3AsrServeBatchError {
+    match error {
+        Qwen3AsrGraphAllocationFailure::Context {
             stage,
             requested_bytes,
         } => Qwen3AsrServeBatchError::ContextAllocationFailed {
             stage,
             requested_bytes,
         },
-        other => Qwen3AsrServeBatchError::DecodeFailed {
-            reason: other.to_string(),
+        Qwen3AsrGraphAllocationFailure::Host {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrServeBatchError::HostAllocationFailed {
+            stage,
+            requested_bytes,
         },
+        Qwen3AsrGraphAllocationFailure::BackendBuffer { backend } => {
+            Qwen3AsrServeBatchError::BackendBufferAllocationFailed { backend }
+        }
     }
 }
 
 fn map_serve_batch_logits_head_error(error: Qwen3AsrLlmLogitsHeadError) -> Qwen3AsrServeBatchError {
-    if let Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed { source } = &error
-        && let GgmlCpuGraphError::ContextAllocationFailed {
+    match &error {
+        Qwen3AsrLlmLogitsHeadError::HostAllocationFailed {
             stage,
             requested_bytes,
-        } = source
-    {
-        return Qwen3AsrServeBatchError::ContextAllocationFailed {
+        } => Qwen3AsrServeBatchError::HostAllocationFailed {
             stage,
             requested_bytes: *requested_bytes,
-        };
-    }
-
-    Qwen3AsrServeBatchError::DecodeFailed {
-        reason: error.to_string(),
+        },
+        Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed { source } => {
+            Qwen3AsrGraphAllocationFailure::from_graph_error(source)
+                .map(map_graph_allocation_failure_to_serve_batch)
+                .unwrap_or_else(|| Qwen3AsrServeBatchError::DecodeFailed {
+                    reason: error.to_string(),
+                })
+        }
+        _ => Qwen3AsrServeBatchError::DecodeFailed {
+            reason: error.to_string(),
+        },
     }
 }
 
 fn map_serve_batch_decoder_init_error(error: GgmlCpuGraphError) -> Qwen3AsrServeBatchError {
+    Qwen3AsrGraphAllocationFailure::from_graph_error(&error)
+        .map(map_graph_allocation_failure_to_serve_batch)
+        .unwrap_or_else(|| Qwen3AsrServeBatchError::OwnerFailed {
+            reason: format!("qwen whole-decoder init failed: {error}"),
+        })
+}
+
+fn clone_terminal_serve_batch_error(
+    error: &Qwen3AsrServeBatchError,
+) -> Option<Qwen3AsrServeBatchError> {
     match error {
-        GgmlCpuGraphError::ContextAllocationFailed {
+        Qwen3AsrServeBatchError::ContextAllocationFailed {
             stage,
             requested_bytes,
-        } => Qwen3AsrServeBatchError::ContextAllocationFailed {
+        } => Some(Qwen3AsrServeBatchError::ContextAllocationFailed {
+            stage,
+            requested_bytes: *requested_bytes,
+        }),
+        Qwen3AsrServeBatchError::HostAllocationFailed {
             stage,
             requested_bytes,
-        },
-        other => Qwen3AsrServeBatchError::OwnerFailed {
-            reason: format!("qwen whole-decoder init failed: {other}"),
-        },
+        } => Some(Qwen3AsrServeBatchError::HostAllocationFailed {
+            stage,
+            requested_bytes: *requested_bytes,
+        }),
+        Qwen3AsrServeBatchError::BackendBufferAllocationFailed { backend } => {
+            Some(Qwen3AsrServeBatchError::BackendBufferAllocationFailed {
+                backend: backend.clone(),
+            })
+        }
+        Qwen3AsrServeBatchError::Canceled => Some(Qwen3AsrServeBatchError::Canceled),
+        _ => None,
     }
+}
+
+fn owner_failure_for_fanout(error: &Qwen3AsrServeBatchError) -> Qwen3AsrServeBatchError {
+    clone_terminal_serve_batch_error(error).unwrap_or_else(|| {
+        Qwen3AsrServeBatchError::OwnerFailed {
+            reason: error.to_string(),
+        }
+    })
+}
+
+fn decode_failure_for_fanout(error: &Qwen3AsrServeBatchError) -> Qwen3AsrServeBatchError {
+    clone_terminal_serve_batch_error(error).unwrap_or_else(|| {
+        Qwen3AsrServeBatchError::DecodeFailed {
+            reason: error.to_string(),
+        }
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -534,26 +604,8 @@ impl Qwen3AsrOwnerThreadState {
         let decoder = match decoder_result {
             Ok(decoder) => decoder,
             Err(error) => {
-                let reason = error.to_string();
-                let context_allocation = match error {
-                    Qwen3AsrServeBatchError::ContextAllocationFailed {
-                        stage,
-                        requested_bytes,
-                    } => Some((stage, requested_bytes)),
-                    _ => None,
-                };
                 for active in slots.into_iter().flatten() {
-                    let error = match context_allocation {
-                        Some((stage, requested_bytes)) => {
-                            Qwen3AsrServeBatchError::ContextAllocationFailed {
-                                stage,
-                                requested_bytes,
-                            }
-                        }
-                        None => Qwen3AsrServeBatchError::OwnerFailed {
-                            reason: reason.clone(),
-                        },
-                    };
+                    let error = owner_failure_for_fanout(&error);
                     let _ = active.reply.send(Err(error));
                 }
                 return deferred;
@@ -1479,19 +1531,7 @@ impl Qwen3AsrOwnerThreadState {
         error: Qwen3AsrServeBatchError,
     ) {
         for active in slots.iter_mut().filter_map(Option::take) {
-            let error = match &error {
-                Qwen3AsrServeBatchError::ContextAllocationFailed {
-                    stage,
-                    requested_bytes,
-                } => Qwen3AsrServeBatchError::ContextAllocationFailed {
-                    stage,
-                    requested_bytes: *requested_bytes,
-                },
-                _ => Qwen3AsrServeBatchError::DecodeFailed {
-                    reason: error.to_string(),
-                },
-            };
-            let _ = active.reply.send(Err(error));
+            let _ = active.reply.send(Err(decode_failure_for_fanout(&error)));
         }
     }
 
@@ -2982,6 +3022,81 @@ mod tests {
             Qwen3AsrServeBatchError::Canceled.unavailable_retryable(),
             None
         );
+    }
+
+    #[test]
+    fn serve_batch_runtime_allocation_failures_stay_typed_through_owner_fanout() {
+        assert!(matches!(
+            super::map_serve_batch_graph_error(GgmlCpuGraphError::HostAllocationFailed {
+                stage: "qwen-serve-batch-step-host",
+                requested_bytes: 268_435_456,
+            }),
+            Qwen3AsrServeBatchError::HostAllocationFailed {
+                stage: "qwen-serve-batch-step-host",
+                requested_bytes: 268_435_456,
+            }
+        ));
+        assert!(matches!(
+            super::map_serve_batch_graph_error(GgmlCpuGraphError::BackendBufferAllocationFailed {
+                backend: "Metal".to_string(),
+            }),
+            Qwen3AsrServeBatchError::BackendBufferAllocationFailed { backend }
+                if backend == "Metal"
+        ));
+        assert!(matches!(
+            super::map_serve_batch_logits_head_error(
+                Qwen3AsrLlmLogitsHeadError::HostAllocationFailed {
+                    stage: "qwen-serve-batch-logits-host",
+                    requested_bytes: 607_744,
+                }
+            ),
+            Qwen3AsrServeBatchError::HostAllocationFailed {
+                stage: "qwen-serve-batch-logits-host",
+                requested_bytes: 607_744,
+            }
+        ));
+        assert!(matches!(
+            super::map_serve_batch_logits_head_error(Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
+                source: GgmlCpuGraphError::BackendBufferAllocationFailed {
+                    backend: "Metal".to_string(),
+                },
+            }),
+            Qwen3AsrServeBatchError::BackendBufferAllocationFailed { backend }
+                if backend == "Metal"
+        ));
+        assert!(matches!(
+            super::map_serve_batch_decoder_init_error(
+                GgmlCpuGraphError::BackendBufferAllocationFailed {
+                    backend: "Metal".to_string(),
+                },
+            ),
+            Qwen3AsrServeBatchError::BackendBufferAllocationFailed { backend }
+                if backend == "Metal"
+        ));
+
+        let host = Qwen3AsrServeBatchError::HostAllocationFailed {
+            stage: "qwen-serve-batch-owner-host",
+            requested_bytes: 16_384,
+        };
+        assert!(matches!(
+            super::owner_failure_for_fanout(&host),
+            Qwen3AsrServeBatchError::HostAllocationFailed {
+                stage: "qwen-serve-batch-owner-host",
+                requested_bytes: 16_384,
+            }
+        ));
+        let backend = Qwen3AsrServeBatchError::BackendBufferAllocationFailed {
+            backend: "Metal".to_string(),
+        };
+        assert!(matches!(
+            super::decode_failure_for_fanout(&backend),
+            Qwen3AsrServeBatchError::BackendBufferAllocationFailed { backend }
+                if backend == "Metal"
+        ));
+        assert!(matches!(
+            super::decode_failure_for_fanout(&Qwen3AsrServeBatchError::Canceled),
+            Qwen3AsrServeBatchError::Canceled
+        ));
     }
 
     #[test]

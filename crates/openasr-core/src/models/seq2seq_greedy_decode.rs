@@ -255,6 +255,22 @@ pub(crate) enum Seq2SeqGreedyDecodeError {
         /// prefix keep its word confidence instead of discarding real scores.
         generated_probabilities: Vec<f32>,
     },
+    #[error(
+        "seq2seq greedy decode ggml context allocation failed at {stage} (requested_bytes={requested_bytes})"
+    )]
+    ContextAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
+    #[error(
+        "seq2seq greedy decode host allocation failed at {stage} (requested_bytes={requested_bytes})"
+    )]
+    HostAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
+    #[error("seq2seq greedy decode compute buffer allocation failed (backend: {backend})")]
+    BackendBufferAllocationFailed { backend: String },
     #[error("seq2seq greedy decode decoder step failed: {reason}")]
     DecoderStepFailed { reason: String },
     #[error("seq2seq greedy decode tokenizer decode failed: {reason}")]

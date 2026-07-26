@@ -4957,10 +4957,14 @@ mod tests {
 
     #[test]
     fn dispatch_preserves_typed_host_allocation_failure_without_display_recovery() {
-        let error = dispatch_error_to_backend(GgmlAsrExecutionError::HostAllocationFailed {
-            stage: "token-row-gather",
-            requested_bytes: 16_384,
-        });
+        let execution_context = uncancellable_execution_context_for_test();
+        let error = dispatch_error_to_backend(
+            GgmlAsrExecutionError::HostAllocationFailed {
+                stage: "token-row-gather",
+                requested_bytes: 16_384,
+            },
+            &execution_context,
+        );
         assert!(matches!(
             error,
             BackendError::HostAllocationFailed {

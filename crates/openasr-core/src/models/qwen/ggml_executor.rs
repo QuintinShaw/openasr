@@ -10,15 +10,18 @@ use super::audio_encoder::{
     Qwen3AsrAudioEncoderError, Qwen3AsrAudioEncoderRuntime, Qwen3AsrAudioEncoderWeights,
 };
 use super::batched_decode::{
-    Qwen3AsrServeBatchConfig, Qwen3AsrServeBatchJob, shutdown_qwen_serve_batch_engines,
-    submit_qwen_serve_batch_job,
+    Qwen3AsrServeBatchConfig, Qwen3AsrServeBatchError, Qwen3AsrServeBatchJob,
+    shutdown_qwen_serve_batch_engines, submit_qwen_serve_batch_job,
 };
 use super::decode_prompt::{Qwen3AsrDecodePromptError, build_qwen3_decode_prompt};
 use super::frontend::{
     Qwen3AsrMelFeatures, Qwen3AsrMelFrontendError, Qwen3AsrMelFrontendPlan,
     qwen3_mel_features_from_prepared_audio,
 };
-use super::greedy_decode::{Qwen3AsrGreedyDecodeError, run_qwen3_greedy_decode_loop};
+use super::graph_allocation::Qwen3AsrGraphAllocationFailure;
+use super::greedy_decode::{
+    Qwen3AsrGreedyDecodeError, map_qwen_error_to_shared, run_qwen3_greedy_decode_loop,
+};
 use super::kv_cache::Qwen3AsrLayerKvCacheState;
 use super::llm_prefill::{Qwen3AsrLlmPrefillInputError, build_qwen3_llm_prefill_input};
 use super::llm_transformer::{
@@ -542,24 +545,7 @@ impl Qwen3AsrGgmlExecutor {
                     execution_context: Arc::clone(&request.execution_context),
                 },
             )
-            .map_err(|error| match error {
-                super::batched_decode::Qwen3AsrServeBatchError::ContextAllocationFailed {
-                    stage,
-                    requested_bytes,
-                } => Qwen3AsrGgmlExecutorError::ContextAllocationFailed {
-                    stage,
-                    requested_bytes,
-                },
-                error => match error.unavailable_retryable() {
-                    Some(retryable) => Qwen3AsrGgmlExecutorError::ServeBatchUnavailable {
-                        reason: error.to_string(),
-                        retryable,
-                    },
-                    None => Qwen3AsrGgmlExecutorError::GreedyDecodeFailed {
-                        reason: error.to_string(),
-                    },
-                },
-            });
+            .map_err(map_serve_batch_submit_error);
             qwen_decode_profile_log_opt("serve_batch_submit", serve_batch_started_at);
             return result;
         }
@@ -730,11 +716,7 @@ impl Qwen3AsrGgmlExecutor {
                     reason: Qwen3AsrGreedyDecodeError::Canceled.to_string(),
                 });
             }
-            Err(error) => {
-                return Err(Qwen3AsrGgmlExecutorError::GreedyDecodeFailed {
-                    reason: error.to_string(),
-                });
-            }
+            Err(error) => return Err(map_greedy_decode_error(error)),
         };
         qwen_decode_profile_log_opt("decode_text_postprocess", postprocess_started_at);
         let audio_duration_seconds = audio_duration_seconds(&request.prepared_audio);
@@ -1004,27 +986,150 @@ fn map_whole_decoder_init_error(error: GgmlCpuGraphError) -> Qwen3AsrGgmlExecuto
 }
 
 fn qwen_graph_allocation_failure(error: &GgmlCpuGraphError) -> Option<Qwen3AsrGgmlExecutorError> {
+    Qwen3AsrGraphAllocationFailure::from_graph_error(error)
+        .map(map_graph_allocation_failure_to_executor)
+}
+
+fn map_graph_allocation_failure_to_executor(
+    error: Qwen3AsrGraphAllocationFailure,
+) -> Qwen3AsrGgmlExecutorError {
     match error {
-        GgmlCpuGraphError::ContextAllocationFailed {
+        Qwen3AsrGraphAllocationFailure::Context {
             stage,
             requested_bytes,
-        } => Some(Qwen3AsrGgmlExecutorError::ContextAllocationFailed {
-            stage,
-            requested_bytes: *requested_bytes,
-        }),
-        GgmlCpuGraphError::HostAllocationFailed {
+        } => Qwen3AsrGgmlExecutorError::ContextAllocationFailed {
             stage,
             requested_bytes,
-        } => Some(Qwen3AsrGgmlExecutorError::HostAllocationFailed {
+        },
+        Qwen3AsrGraphAllocationFailure::Host {
             stage,
-            requested_bytes: *requested_bytes,
-        }),
-        GgmlCpuGraphError::BackendBufferAllocationFailed { backend } => {
-            Some(Qwen3AsrGgmlExecutorError::BackendBufferAllocationFailed {
-                backend: backend.clone(),
-            })
+            requested_bytes,
+        } => Qwen3AsrGgmlExecutorError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        Qwen3AsrGraphAllocationFailure::BackendBuffer { backend } => {
+            Qwen3AsrGgmlExecutorError::BackendBufferAllocationFailed { backend }
         }
-        _ => None,
+    }
+}
+
+fn map_graph_allocation_failure_to_greedy(
+    error: Qwen3AsrGraphAllocationFailure,
+) -> Qwen3AsrGreedyDecodeError {
+    match error {
+        Qwen3AsrGraphAllocationFailure::Context {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrGreedyDecodeError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        Qwen3AsrGraphAllocationFailure::Host {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrGreedyDecodeError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        Qwen3AsrGraphAllocationFailure::BackendBuffer { backend } => {
+            Qwen3AsrGreedyDecodeError::BackendBufferAllocationFailed { backend }
+        }
+    }
+}
+
+fn map_greedy_decode_error(error: Qwen3AsrGreedyDecodeError) -> Qwen3AsrGgmlExecutorError {
+    match error {
+        Qwen3AsrGreedyDecodeError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrGgmlExecutorError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        Qwen3AsrGreedyDecodeError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrGgmlExecutorError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        Qwen3AsrGreedyDecodeError::BackendBufferAllocationFailed { backend } => {
+            Qwen3AsrGgmlExecutorError::BackendBufferAllocationFailed { backend }
+        }
+        error => Qwen3AsrGgmlExecutorError::GreedyDecodeFailed {
+            reason: error.to_string(),
+        },
+    }
+}
+
+fn map_serve_batch_submit_error(error: Qwen3AsrServeBatchError) -> Qwen3AsrGgmlExecutorError {
+    match error {
+        Qwen3AsrServeBatchError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrGgmlExecutorError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        Qwen3AsrServeBatchError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrGgmlExecutorError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        Qwen3AsrServeBatchError::BackendBufferAllocationFailed { backend } => {
+            Qwen3AsrGgmlExecutorError::BackendBufferAllocationFailed { backend }
+        }
+        error => match error.unavailable_retryable() {
+            Some(retryable) => Qwen3AsrGgmlExecutorError::ServeBatchUnavailable {
+                reason: error.to_string(),
+                retryable,
+            },
+            None => Qwen3AsrGgmlExecutorError::GreedyDecodeFailed {
+                reason: error.to_string(),
+            },
+        },
+    }
+}
+
+fn map_greedy_logits_head_error(error: Qwen3AsrLlmLogitsHeadError) -> Qwen3AsrGreedyDecodeError {
+    match &error {
+        Qwen3AsrLlmLogitsHeadError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrGreedyDecodeError::HostAllocationFailed {
+            stage,
+            requested_bytes: *requested_bytes,
+        },
+        Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed { source } => {
+            Qwen3AsrGraphAllocationFailure::from_graph_error(source)
+                .map(map_graph_allocation_failure_to_greedy)
+                .unwrap_or_else(|| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                    reason: error.to_string(),
+                })
+        }
+        _ => Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+            reason: error.to_string(),
+        },
+    }
+}
+
+fn map_greedy_token_embedding_error(
+    error: Qwen3AsrTokenEmbeddingError,
+) -> Qwen3AsrGreedyDecodeError {
+    match error {
+        Qwen3AsrTokenEmbeddingError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrGreedyDecodeError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        error => Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+            reason: error.to_string(),
+        },
     }
 }
 
@@ -1148,16 +1253,9 @@ impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor {
             // Preserve typed cancel from the prefill chunk loop so the shared
             // greedy driver (and dispatch_error_to_backend) see Canceled, not a
             // generic DecoderStepFailed.
-            let logits = self.prefill_prompt_and_compute_last_logits().map_err(|error| {
-                match error {
-                    Qwen3AsrGreedyDecodeError::Canceled => {
-                        crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::Canceled
-                    }
-                    other => crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::DecoderStepFailed {
-                        reason: other.to_string(),
-                    },
-                }
-            })?;
+            let logits = self
+                .prefill_prompt_and_compute_last_logits()
+                .map_err(map_qwen_error_to_shared)?;
             self.consumed_prefill_step = true;
             return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
                 logits,
@@ -1184,27 +1282,16 @@ impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor {
             })?;
         let mut hidden = self
             .gather_last_generated_token_hidden(input.generated_tokens)
-            .map_err(|error| {
-                crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::DecoderStepFailed {
-                    reason: error.to_string(),
-                }
-            })?;
+            .map_err(map_qwen_error_to_shared)?;
         hidden = self
             .run_llm_layers_with_kv(hidden, cache_position)
-            .map_err(|error| {
-                crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::DecoderStepFailed {
-                    reason: error.to_string(),
-                }
-            })?;
+            .map_err(map_qwen_error_to_shared)?;
 
         let logits = self
             .logits_head
             .compute_logits_for_last_hidden(&hidden)
-            .map_err(|error| {
-                crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::DecoderStepFailed {
-                    reason: error.to_string(),
-                }
-            })?;
+            .map_err(map_greedy_logits_head_error)
+            .map_err(map_qwen_error_to_shared)?;
         Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
             logits,
             greedy_token_hint: None,
@@ -1228,9 +1315,11 @@ fn ensure_prefill_chunk_not_canceled(
 fn map_prefill_graph_error(error: GgmlCpuGraphError) -> Qwen3AsrGreedyDecodeError {
     match error {
         GgmlCpuGraphError::Canceled => Qwen3AsrGreedyDecodeError::Canceled,
-        other => Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-            reason: other.to_string(),
-        },
+        error => Qwen3AsrGraphAllocationFailure::from_graph_error(&error)
+            .map(map_graph_allocation_failure_to_greedy)
+            .unwrap_or_else(|| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
+                reason: error.to_string(),
+            }),
     }
 }
 
@@ -1277,9 +1366,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
             let result = self
                 .logits_head
                 .compute_logits_for_last_hidden(&final_hidden)
-                .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                    reason: error.to_string(),
-                });
+                .map_err(map_greedy_logits_head_error);
             qwen_decode_profile_log_opt("prefill_prompt_total", profile_started_at);
             return result;
         }
@@ -1403,9 +1490,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
                     reason: "qwen3-asr prefill produced no final hidden state".to_string(),
                 }
             })?)
-            .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                reason: error.to_string(),
-            });
+            .map_err(map_greedy_logits_head_error);
         qwen_decode_profile_log_opt("prefill_prompt_chunked", profile_started_at);
         result
     }
@@ -1419,9 +1504,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
         self.cache_prompt_tokens = token_count;
         self.logits_head
             .compute_logits_for_last_hidden(&final_hidden)
-            .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                reason: error.to_string(),
-            })
+            .map_err(map_greedy_logits_head_error)
     }
 
     fn write_prefill_chunk_outputs(
@@ -1533,9 +1616,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
         let step = self
             .whole_decoder
             .run_step_auto(&hidden, cache_position, &self.layer_kv_caches, 1_000_000.0)
-            .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                reason: error.to_string(),
-            })?;
+            .map_err(map_prefill_graph_error)?;
         for (layer_index, (projected_k, projected_v)) in step.layer_kv.iter().enumerate() {
             self.layer_kv_caches[layer_index]
                 .write(cache_position, projected_k, projected_v)
@@ -1565,9 +1646,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
         })?;
         self.token_embedding_table
             .gather_rows(&[last_token])
-            .map_err(|error| Qwen3AsrGreedyDecodeError::DecoderStepFailed {
-                reason: error.to_string(),
-            })
+            .map_err(map_greedy_token_embedding_error)
     }
 }
 
@@ -1788,6 +1867,84 @@ mod tests {
             GgmlAsrExecutionError::ContextAllocationFailed {
                 stage: "pool",
                 requested_bytes: 805_306_368,
+            }
+        );
+    }
+
+    #[test]
+    fn qwen_runtime_graph_allocation_failures_remain_typed_for_direct_and_streaming_decode() {
+        // `map_prefill_graph_error` is shared by direct/streaming prefill and
+        // the per-token `run_step_auto` path. Verify each allocation class
+        // reaches the public ggml execution boundary without string recovery.
+        let context = map_prefill_graph_error(GgmlCpuGraphError::ContextAllocationFailed {
+            stage: "qwen-prefill-pool",
+            requested_bytes: 805_306_368,
+        });
+        assert_eq!(
+            qwen_execute_error_to_ggml(map_greedy_decode_error(context), QWEN3_ASR_GGML_ADAPTER_ID,),
+            GgmlAsrExecutionError::ContextAllocationFailed {
+                stage: "qwen-prefill-pool",
+                requested_bytes: 805_306_368,
+            }
+        );
+
+        let host = map_prefill_graph_error(GgmlCpuGraphError::HostAllocationFailed {
+            stage: "qwen-token-step-host",
+            requested_bytes: 607_744,
+        });
+        assert_eq!(
+            qwen_execute_error_to_ggml(map_greedy_decode_error(host), QWEN3_ASR_GGML_ADAPTER_ID,),
+            GgmlAsrExecutionError::HostAllocationFailed {
+                stage: "qwen-token-step-host",
+                requested_bytes: 607_744,
+            }
+        );
+
+        let backend = map_prefill_graph_error(GgmlCpuGraphError::BackendBufferAllocationFailed {
+            backend: "Metal".to_string(),
+        });
+        assert_eq!(
+            qwen_execute_error_to_ggml(map_greedy_decode_error(backend), QWEN3_ASR_GGML_ADAPTER_ID,),
+            GgmlAsrExecutionError::BackendBufferAllocationFailed {
+                backend: "Metal".to_string(),
+            }
+        );
+
+        let logits_backend =
+            map_greedy_logits_head_error(Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
+                source: GgmlCpuGraphError::BackendBufferAllocationFailed {
+                    backend: "Metal".to_string(),
+                },
+            });
+        assert!(matches!(
+            logits_backend,
+            Qwen3AsrGreedyDecodeError::BackendBufferAllocationFailed { backend }
+                if backend == "Metal"
+        ));
+    }
+
+    #[test]
+    fn qwen_serve_batch_submit_elevates_host_and_backend_buffer_allocation_failures() {
+        let host = map_serve_batch_submit_error(Qwen3AsrServeBatchError::HostAllocationFailed {
+            stage: "qwen-serve-batch-host",
+            requested_bytes: 268_435_456,
+        });
+        assert_eq!(
+            qwen_execute_error_to_ggml(host, QWEN3_ASR_GGML_ADAPTER_ID),
+            GgmlAsrExecutionError::HostAllocationFailed {
+                stage: "qwen-serve-batch-host",
+                requested_bytes: 268_435_456,
+            }
+        );
+
+        let backend =
+            map_serve_batch_submit_error(Qwen3AsrServeBatchError::BackendBufferAllocationFailed {
+                backend: "Metal".to_string(),
+            });
+        assert_eq!(
+            qwen_execute_error_to_ggml(backend, QWEN3_ASR_GGML_ADAPTER_ID),
+            GgmlAsrExecutionError::BackendBufferAllocationFailed {
+                backend: "Metal".to_string(),
             }
         );
     }

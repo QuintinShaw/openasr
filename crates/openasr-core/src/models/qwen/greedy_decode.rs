@@ -59,6 +59,22 @@ pub(crate) enum Qwen3AsrGreedyDecodeError {
         /// Parallel to `generated_tokens` (see the shared variant).
         generated_probabilities: Vec<f32>,
     },
+    #[error(
+        "qwen3-asr greedy decode ggml context allocation failed at {stage} (requested_bytes={requested_bytes})"
+    )]
+    ContextAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
+    #[error(
+        "qwen3-asr greedy decode host allocation failed at {stage} (requested_bytes={requested_bytes})"
+    )]
+    HostAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
+    #[error("qwen3-asr greedy decode compute buffer allocation failed (backend: {backend})")]
+    BackendBufferAllocationFailed { backend: String },
     #[error("qwen3-asr greedy decode decoder step failed: {reason}")]
     DecoderStepFailed { reason: String },
     #[error("qwen3-asr greedy decode tokenizer decode failed: {reason}")]
@@ -95,7 +111,9 @@ pub(crate) fn run_qwen3_greedy_decode_loop(
     })
 }
 
-fn map_qwen_error_to_shared(error: Qwen3AsrGreedyDecodeError) -> Seq2SeqGreedyDecodeError {
+pub(super) fn map_qwen_error_to_shared(
+    error: Qwen3AsrGreedyDecodeError,
+) -> Seq2SeqGreedyDecodeError {
     match error {
         Qwen3AsrGreedyDecodeError::EmptyInitialPrompt => {
             Seq2SeqGreedyDecodeError::EmptyInitialPrompt
@@ -137,6 +155,23 @@ fn map_qwen_error_to_shared(error: Qwen3AsrGreedyDecodeError) -> Seq2SeqGreedyDe
             generated_tokens,
             generated_probabilities,
         },
+        Qwen3AsrGreedyDecodeError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Seq2SeqGreedyDecodeError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        Qwen3AsrGreedyDecodeError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Seq2SeqGreedyDecodeError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        Qwen3AsrGreedyDecodeError::BackendBufferAllocationFailed { backend } => {
+            Seq2SeqGreedyDecodeError::BackendBufferAllocationFailed { backend }
+        }
         Qwen3AsrGreedyDecodeError::DecoderStepFailed { reason } => {
             Seq2SeqGreedyDecodeError::DecoderStepFailed { reason }
         }
@@ -189,6 +224,23 @@ fn map_shared_error(error: Seq2SeqGreedyDecodeError) -> Qwen3AsrGreedyDecodeErro
             generated_tokens,
             generated_probabilities,
         },
+        Seq2SeqGreedyDecodeError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrGreedyDecodeError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        Seq2SeqGreedyDecodeError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrGreedyDecodeError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        Seq2SeqGreedyDecodeError::BackendBufferAllocationFailed { backend } => {
+            Qwen3AsrGreedyDecodeError::BackendBufferAllocationFailed { backend }
+        }
         Seq2SeqGreedyDecodeError::DecoderStepFailed { reason } => {
             Qwen3AsrGreedyDecodeError::DecoderStepFailed { reason }
         }
@@ -215,6 +267,30 @@ mod tests {
     use crate::models::seq2seq_greedy_decode::{
         Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
     };
+
+    #[test]
+    fn graph_allocation_failures_round_trip_through_shared_greedy_driver() {
+        let cases = [
+            Qwen3AsrGreedyDecodeError::ContextAllocationFailed {
+                stage: "qwen-prefill-pool",
+                requested_bytes: 805_306_368,
+            },
+            Qwen3AsrGreedyDecodeError::HostAllocationFailed {
+                stage: "qwen-token-indices",
+                requested_bytes: 607_744,
+            },
+            Qwen3AsrGreedyDecodeError::BackendBufferAllocationFailed {
+                backend: "Metal".to_string(),
+            },
+        ];
+
+        for error in cases {
+            assert_eq!(
+                map_shared_error(map_qwen_error_to_shared(error.clone())),
+                error
+            );
+        }
+    }
 
     struct SyntheticStepExecutor {
         vocab_size: usize,

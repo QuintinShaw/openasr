@@ -7,6 +7,7 @@ pub(crate) mod forced_aligner_pack;
 mod forced_aligner_runtime;
 mod frontend;
 mod ggml_executor;
+mod graph_allocation;
 mod graph_config;
 mod greedy_decode;
 mod kv_cache;

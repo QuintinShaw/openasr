@@ -191,6 +191,27 @@ fn map_shared_error(error: Seq2SeqGreedyDecodeError) -> CohereTranscribeGreedyDe
             generated_tokens,
             generated_probabilities,
         },
+        Seq2SeqGreedyDecodeError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        } => CohereTranscribeGreedyDecodeError::DecoderStepFailed {
+            reason: format!(
+                "seq2seq ggml context allocation failed at {stage} (requested_bytes={requested_bytes})"
+            ),
+        },
+        Seq2SeqGreedyDecodeError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => CohereTranscribeGreedyDecodeError::DecoderStepFailed {
+            reason: format!(
+                "seq2seq host allocation failed at {stage} (requested_bytes={requested_bytes})"
+            ),
+        },
+        Seq2SeqGreedyDecodeError::BackendBufferAllocationFailed { backend } => {
+            CohereTranscribeGreedyDecodeError::DecoderStepFailed {
+                reason: format!("seq2seq compute buffer allocation failed (backend: {backend})"),
+            }
+        }
         Seq2SeqGreedyDecodeError::DecoderStepFailed { reason } => {
             CohereTranscribeGreedyDecodeError::DecoderStepFailed { reason }
         }
