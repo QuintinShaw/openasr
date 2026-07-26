@@ -1,4 +1,5 @@
 mod assembler;
+mod audibility;
 mod options;
 mod slicing;
 mod timeline;
