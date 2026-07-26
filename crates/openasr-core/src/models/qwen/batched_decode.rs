@@ -2105,9 +2105,7 @@ mod tests {
         load_qwen3_token_embedding_table_from_reader,
     };
     use crate::models::serve_batch_env::OPENASR_SERVE_BATCH_ENV;
-    use crate::testing::{
-        TinyGgufFixtureSpec, with_forced_cpu_backend_for_test, write_tiny_gguf_runtime_source,
-    };
+    use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
     use crate::{read_gguf_metadata_from_runtime_source, validate_ggml_runtime_source_path};
     use std::{collections::BTreeMap, ffi::OsString};
 
@@ -2154,30 +2152,10 @@ mod tests {
     }
 
     fn with_serve_batch_env<T>(value: Option<&str>, run: impl FnOnce() -> T) -> T {
-        crate::models::serve_batch_env::with_serve_batch_env_lock(|| {
-            let previous = std::env::var_os(OPENASR_SERVE_BATCH_ENV);
-            set_serve_batch_env(value.map(OsString::from));
-            let result = run();
-            set_serve_batch_env(previous);
-            result
-        })
-    }
-
-    fn set_serve_batch_env(value: Option<OsString>) {
-        match value {
-            Some(value) => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::set_var(OPENASR_SERVE_BATCH_ENV, value);
-                }
-            }
-            None => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::remove_var(OPENASR_SERVE_BATCH_ENV);
-                }
-            }
-        }
+        crate::test_process_env::with_test_process_env(
+            [(OPENASR_SERVE_BATCH_ENV, value.map(OsString::from))],
+            run,
+        )
     }
 
     fn tiny_metadata() -> Qwen3AsrExecutionMetadata {
@@ -2329,29 +2307,20 @@ mod tests {
     }
 
     fn with_qwen_direct_cpu_backend_for_test<T>(run: impl FnOnce() -> T) -> T {
-        with_forced_cpu_backend_for_test(|| {
-            let previous = std::env::var_os(GgmlCpuGraphConfig::USE_SCHEDULER_ENV);
-            #[expect(unsafe_code, reason = "test-only process env override")]
-            unsafe {
-                std::env::set_var(GgmlCpuGraphConfig::USE_SCHEDULER_ENV, "0");
-            }
-            let result = run();
-            match previous {
-                Some(value) => {
-                    #[expect(unsafe_code, reason = "test-only process env restore")]
-                    unsafe {
-                        std::env::set_var(GgmlCpuGraphConfig::USE_SCHEDULER_ENV, value);
-                    }
-                }
-                None => {
-                    #[expect(unsafe_code, reason = "test-only process env restore")]
-                    unsafe {
-                        std::env::remove_var(GgmlCpuGraphConfig::USE_SCHEDULER_ENV);
-                    }
-                }
-            }
-            result
-        })
+        // Flattened into one multi-key override rather than nesting
+        // `with_forced_cpu_backend_for_test` inside a second env guard: the
+        // process env lock is not reentrant, so two nested guards on the same
+        // thread would self-deadlock on the second `lock()` call.
+        crate::test_process_env::with_test_process_env(
+            [
+                ("OPENASR_GGML_BACKEND", Some(OsString::from("cpu"))),
+                (
+                    GgmlCpuGraphConfig::USE_SCHEDULER_ENV,
+                    Some(OsString::from("0")),
+                ),
+            ],
+            run,
+        )
     }
 
     fn qwen_real_pack_prefill_input(

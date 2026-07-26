@@ -335,60 +335,71 @@ mod tests {
     #[test]
     fn realtime_diarization_capability_depends_on_mode_and_pack() {
         let temp = tempfile::tempdir().unwrap();
-        // Hermetic: the probe consults the installed ReDimNet2-B6 embedder pack.
-        unsafe { std::env::remove_var("OPENASR_REDIMNET_PACK") };
-        unsafe { std::env::set_var("OPENASR_HOME", temp.path()) };
+        {
+            // Hermetic: the probe consults the installed ReDimNet2-B6 embedder pack.
+            // Scoped so this guard drops (and releases the lock) before the
+            // second guard below is created; the process env lock is not
+            // reentrant, so two live guards on the same thread would
+            // self-deadlock on the second `lock()` call.
+            let _env = crate::test_process_env::TestProcessEnvGuard::new([
+                ("OPENASR_REDIMNET_PACK", None),
+                ("OPENASR_HOME", Some(temp.path().as_os_str().to_os_string())),
+            ]);
 
-        let fallback =
-            realtime_diarization_capability(RealtimeBackendMode::FilePerUtteranceFallback);
-        assert!(!fallback.supported);
-        assert!(
-            fallback
-                .reason
-                .is_some_and(|reason| reason.contains("speaker-embedder pack")
-                    && reason.contains("redimnet2-b6-cn"))
-        );
-        let streaming = realtime_diarization_capability(RealtimeBackendMode::TrueStreaming);
-        assert!(!streaming.supported);
-        assert!(
-            streaming
-                .reason
-                .is_some_and(|reason| reason.contains("speaker-embedder pack")
-                    && reason.contains("redimnet2-b6-cn"))
-        );
+            let fallback =
+                realtime_diarization_capability(RealtimeBackendMode::FilePerUtteranceFallback);
+            assert!(!fallback.supported);
+            assert!(
+                fallback
+                    .reason
+                    .is_some_and(|reason| reason.contains("speaker-embedder pack")
+                        && reason.contains("redimnet2-b6-cn"))
+            );
+            let streaming = realtime_diarization_capability(RealtimeBackendMode::TrueStreaming);
+            assert!(!streaming.supported);
+            assert!(
+                streaming
+                    .reason
+                    .is_some_and(|reason| reason.contains("speaker-embedder pack")
+                        && reason.contains("redimnet2-b6-cn"))
+            );
 
-        let install_dir = temp.path().join("models/redimnet2-b6-cn/fp16");
-        std::fs::create_dir_all(&install_dir).unwrap();
-        let installed_pack = install_dir.join("redimnet2-b6-cn-fp16.oasr");
-        std::fs::write(&installed_pack, b"GGUF\x00\x00\x00\x00").unwrap();
-        let installed_meta = serde_json::json!({
-            "model_id": "redimnet2-b6-cn",
-            "display_name": "ReDimNet2-B6 Speaker Embedder (CN-enhanced)",
-            "quant": "f32",
-            "suffix": "f32",
-            "pull": "redimnet2-b6-cn:f32",
-            "filename": "redimnet2-b6-cn-fp16.oasr",
-            "path": installed_pack,
-            "url": "https://example.invalid/OpenASR/redimnet2-b6-cn/redimnet2-b6-cn-fp16.oasr",
-            "hf_revision": "0123456789abcdef0123456789abcdef01234567",
-            "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-            "size_bytes": 8,
-            "installed_at_unix_seconds": 1
-        });
-        std::fs::write(
-            install_dir.join("installed.json"),
-            format!("{installed_meta}\n"),
-        )
-        .unwrap();
-        assert!(
-            realtime_diarization_capability(RealtimeBackendMode::FilePerUtteranceFallback)
-                .supported
-        );
-        assert!(realtime_diarization_capability(RealtimeBackendMode::TrueStreaming).supported);
+            let install_dir = temp.path().join("models/redimnet2-b6-cn/fp16");
+            std::fs::create_dir_all(&install_dir).unwrap();
+            let installed_pack = install_dir.join("redimnet2-b6-cn-fp16.oasr");
+            std::fs::write(&installed_pack, b"GGUF\x00\x00\x00\x00").unwrap();
+            let installed_meta = serde_json::json!({
+                "model_id": "redimnet2-b6-cn",
+                "display_name": "ReDimNet2-B6 Speaker Embedder (CN-enhanced)",
+                "quant": "f32",
+                "suffix": "f32",
+                "pull": "redimnet2-b6-cn:f32",
+                "filename": "redimnet2-b6-cn-fp16.oasr",
+                "path": installed_pack,
+                "url": "https://example.invalid/OpenASR/redimnet2-b6-cn/redimnet2-b6-cn-fp16.oasr",
+                "hf_revision": "0123456789abcdef0123456789abcdef01234567",
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "size_bytes": 8,
+                "installed_at_unix_seconds": 1
+            });
+            std::fs::write(
+                install_dir.join("installed.json"),
+                format!("{installed_meta}\n"),
+            )
+            .unwrap();
+            assert!(
+                realtime_diarization_capability(RealtimeBackendMode::FilePerUtteranceFallback)
+                    .supported
+            );
+            assert!(realtime_diarization_capability(RealtimeBackendMode::TrueStreaming).supported);
+        }
 
         let redimnet = temp.path().join("redimnet.oasr");
         std::fs::write(&redimnet, b"GGUF\x00\x00\x00\x00").unwrap();
-        unsafe { std::env::set_var("OPENASR_REDIMNET_PACK", &redimnet) };
+        let _redimnet_env = crate::test_process_env::TestProcessEnvGuard::new([
+            ("OPENASR_HOME", Some(temp.path().as_os_str().to_os_string())),
+            ("OPENASR_REDIMNET_PACK", Some(redimnet.into_os_string())),
+        ]);
         assert!(
             realtime_diarization_capability(RealtimeBackendMode::FilePerUtteranceFallback)
                 .supported
@@ -396,7 +407,6 @@ mod tests {
         // True-streaming sessions retain a bounded copy of each utterance's
         // speech, so the pack is the only gate there as well.
         assert!(realtime_diarization_capability(RealtimeBackendMode::TrueStreaming).supported);
-        unsafe { std::env::remove_var("OPENASR_REDIMNET_PACK") };
     }
 
     #[test]

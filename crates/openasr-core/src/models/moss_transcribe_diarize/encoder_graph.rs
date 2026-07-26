@@ -1172,12 +1172,10 @@ mod parity_tests {
             GgmlCpuGraphBackend::Metal => "metal",
             GgmlCpuGraphBackend::Gpu => "gpu",
         };
-        // SAFETY: this harness is documented `--test-threads=1`-only (see the
-        // `#[ignore]` messages on its two callers), so no concurrent test
-        // observes this process-global env var mid-mutation.
-        unsafe {
-            std::env::set_var(GgmlCpuGraphConfig::BACKEND_ENV, env_value);
-        }
+        let _backend_env = crate::test_process_env::TestProcessEnvGuard::new([(
+            GgmlCpuGraphConfig::BACKEND_ENV,
+            Some(env_value.into()),
+        )]);
         // Under the historical ExceptMetal pin, graph_config downgraded an
         // Auto-resolved Metal -- including one steered by `BACKEND_ENV` above
         // -- to CPU, so env-var steering alone can never reach the Metal leg.
@@ -1193,9 +1191,6 @@ mod parity_tests {
         });
         let mut graph_config =
             crate::models::moss_transcribe_diarize::graph_config::moss_td_encoder_graph_config();
-        unsafe {
-            std::env::remove_var(GgmlCpuGraphConfig::BACKEND_ENV);
-        }
         assert_eq!(
             graph_config.backend,
             backend,

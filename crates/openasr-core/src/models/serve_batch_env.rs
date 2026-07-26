@@ -574,16 +574,6 @@ fn bytes_to_mib(bytes: usize) -> usize {
 }
 
 #[cfg(test)]
-pub(crate) fn with_serve_batch_env_lock<T>(run: impl FnOnce() -> T) -> T {
-    use std::sync::{Mutex, OnceLock};
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let lock = ENV_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock.lock().expect("serve batch env lock");
-    run()
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
@@ -698,48 +688,21 @@ mod tests {
         vram_reserve_mb: Option<&str>,
         run: impl FnOnce() -> T,
     ) -> T {
-        with_serve_batch_env_lock(|| {
-            let previous_batch = std::env::var_os(OPENASR_SERVE_BATCH_ENV);
-            let previous_collect_ms = std::env::var_os(OPENASR_SERVE_BATCH_COLLECT_MS_ENV);
-            let previous_trace = std::env::var_os(OPENASR_SERVE_BATCH_TRACE_ENV);
-            let previous_vram_reserve = std::env::var_os(OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_ENV);
-            set_env(OPENASR_SERVE_BATCH_ENV, batch.map(OsString::from));
-            set_env(
-                OPENASR_SERVE_BATCH_COLLECT_MS_ENV,
-                collect_ms.map(OsString::from),
-            );
-            set_env(OPENASR_SERVE_BATCH_TRACE_ENV, trace.map(OsString::from));
-            set_env(
-                OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_ENV,
-                vram_reserve_mb.map(OsString::from),
-            );
-            let result = run();
-            set_env(OPENASR_SERVE_BATCH_ENV, previous_batch);
-            set_env(OPENASR_SERVE_BATCH_COLLECT_MS_ENV, previous_collect_ms);
-            set_env(OPENASR_SERVE_BATCH_TRACE_ENV, previous_trace);
-            set_env(
-                OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_ENV,
-                previous_vram_reserve,
-            );
-            result
-        })
-    }
-
-    fn set_env(env: &'static str, value: Option<OsString>) {
-        match value {
-            Some(value) => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::set_var(env, value);
-                }
-            }
-            None => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::remove_var(env);
-                }
-            }
-        }
+        crate::test_process_env::with_test_process_env(
+            [
+                (OPENASR_SERVE_BATCH_ENV, batch.map(OsString::from)),
+                (
+                    OPENASR_SERVE_BATCH_COLLECT_MS_ENV,
+                    collect_ms.map(OsString::from),
+                ),
+                (OPENASR_SERVE_BATCH_TRACE_ENV, trace.map(OsString::from)),
+                (
+                    OPENASR_SERVE_BATCH_VRAM_RESERVE_MB_ENV,
+                    vram_reserve_mb.map(OsString::from),
+                ),
+            ],
+            run,
+        )
     }
 
     #[test]

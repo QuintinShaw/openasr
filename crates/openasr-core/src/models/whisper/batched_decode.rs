@@ -892,30 +892,10 @@ mod tests {
     const WHISPER_SERVE_BATCH_REAL_PACK_ENV: &str = "OPENASR_WHISPER_SERVE_BATCH_REAL_PACK";
 
     fn with_serve_batch_env<T>(value: Option<&str>, run: impl FnOnce() -> T) -> T {
-        crate::models::serve_batch_env::with_serve_batch_env_lock(|| {
-            let previous = std::env::var_os(OPENASR_SERVE_BATCH_ENV);
-            set_serve_batch_env(value.map(OsString::from));
-            let result = run();
-            set_serve_batch_env(previous);
-            result
-        })
-    }
-
-    fn set_serve_batch_env(value: Option<OsString>) {
-        match value {
-            Some(value) => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::set_var(OPENASR_SERVE_BATCH_ENV, value);
-                }
-            }
-            None => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::remove_var(OPENASR_SERVE_BATCH_ENV);
-                }
-            }
-        }
+        crate::test_process_env::with_test_process_env(
+            [(OPENASR_SERVE_BATCH_ENV, value.map(OsString::from))],
+            run,
+        )
     }
 
     /// Test-only serial decode driver: runs the family serial path against a
@@ -929,47 +909,20 @@ mod tests {
         WhisperFamily::decode_serial(serial_runtime, job)
     }
 
-    struct TestEnvGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl TestEnvGuard {
-        fn set(key: &'static str, value: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            #[expect(unsafe_code, reason = "test-only process env override")]
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for TestEnvGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(previous) => {
-                    #[expect(unsafe_code, reason = "test-only process env restore")]
-                    unsafe {
-                        std::env::set_var(self.key, previous);
-                    }
-                }
-                None => {
-                    #[expect(unsafe_code, reason = "test-only process env restore")]
-                    unsafe {
-                        std::env::remove_var(self.key);
-                    }
-                }
-            }
-        }
-    }
-
     fn with_whisper_decoder_flash_disabled_for_test<T>(run: impl FnOnce() -> T) -> T {
-        let _self_flash =
-            TestEnvGuard::set("OPENASR_WHISPER_GGML_DISABLE_DECODER_SELF_FLASH_ATTN", "1");
-        let _cross_flash =
-            TestEnvGuard::set("OPENASR_WHISPER_GGML_DISABLE_DECODER_CROSS_FLASH_ATTN", "1");
-        run()
+        crate::test_process_env::with_test_process_env(
+            [
+                (
+                    "OPENASR_WHISPER_GGML_DISABLE_DECODER_SELF_FLASH_ATTN",
+                    Some(OsString::from("1")),
+                ),
+                (
+                    "OPENASR_WHISPER_GGML_DISABLE_DECODER_CROSS_FLASH_ATTN",
+                    Some(OsString::from("1")),
+                ),
+            ],
+            run,
+        )
     }
 
     fn read_runtime_source_preflight(runtime_path: &Path) -> GgmlAsrRuntimeSourcePreflight {

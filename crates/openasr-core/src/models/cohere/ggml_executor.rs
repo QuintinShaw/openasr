@@ -776,7 +776,7 @@ mod tests {
 
     use super::*;
     use crate::api::backend::{NativeBackend, TranscriptionBackend};
-    use crate::models::serve_batch_env::{OPENASR_SERVE_BATCH_ENV, with_serve_batch_env_lock};
+    use crate::models::serve_batch_env::OPENASR_SERVE_BATCH_ENV;
     use crate::testing::{
         TinyGgufFixtureSpec, with_forced_cpu_backend_for_test, write_tiny_gguf_runtime_source,
     };
@@ -810,33 +810,6 @@ mod tests {
         }
     }
 
-    fn with_serve_batch_env<T>(value: Option<&str>, run: impl FnOnce() -> T) -> T {
-        with_serve_batch_env_lock(|| {
-            let previous = std::env::var_os(OPENASR_SERVE_BATCH_ENV);
-            set_serve_batch_env(value.map(OsString::from));
-            let result = run();
-            set_serve_batch_env(previous);
-            result
-        })
-    }
-
-    fn set_serve_batch_env(value: Option<OsString>) {
-        match value {
-            Some(value) => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::set_var(OPENASR_SERVE_BATCH_ENV, value);
-                }
-            }
-            None => {
-                #[expect(unsafe_code, reason = "test-only process env override")]
-                unsafe {
-                    std::env::remove_var(OPENASR_SERVE_BATCH_ENV);
-                }
-            }
-        }
-    }
-
     #[test]
     fn cohere_executor_reaches_decode_boundary_with_runtime_ready_fixture() {
         with_forced_cpu_backend_for_test(|| {
@@ -856,8 +829,16 @@ mod tests {
 
     #[test]
     fn cohere_executor_serve_batch_env_keeps_cpu_path_available() {
-        with_forced_cpu_backend_for_test(|| {
-            with_serve_batch_env(Some("2"), || {
+        // Flattened into one multi-key override rather than nesting
+        // `with_forced_cpu_backend_for_test` inside `with_serve_batch_env`:
+        // the process env lock is not reentrant, so two nested guards on the
+        // same thread would self-deadlock on the second `lock()` call.
+        crate::test_process_env::with_test_process_env(
+            [
+                ("OPENASR_GGML_BACKEND", Some(OsString::from("cpu"))),
+                (OPENASR_SERVE_BATCH_ENV, Some(OsString::from("2"))),
+            ],
+            || {
                 let temp = tempfile::tempdir().expect("tempdir");
                 let runtime_path = temp.path().join("cohere-runtime.gguf");
                 let spec =
@@ -871,8 +852,8 @@ mod tests {
                 assert!(
                     result.transcription.text.is_ascii() || !result.transcription.text.is_empty()
                 );
-            });
-        });
+            },
+        );
     }
 
     #[test]

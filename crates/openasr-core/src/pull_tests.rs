@@ -2121,13 +2121,13 @@ fn config_models_dir_redirects_pull_and_list() {
 
     // OPENASR_MODELS_DIR env still wins over the config field.
     let env_redirected = tempfile::tempdir().unwrap();
-    // SAFETY: test-only, single-threaded env mutation guarded by serial test
-    // execution within this process is not guaranteed by cargo test, but this
-    // matches the existing `OPENASR_HOME`-mutating tests elsewhere in this
-    // file/crate that accept the same caveat.
-    unsafe { std::env::set_var(crate::config::OPENASR_MODELS_DIR_ENV, env_redirected.path()) };
-    let env_resolved = list_installed_packs(home.path()).unwrap();
-    unsafe { std::env::remove_var(crate::config::OPENASR_MODELS_DIR_ENV) };
+    let env_resolved = crate::test_process_env::with_test_process_env(
+        [(
+            crate::config::OPENASR_MODELS_DIR_ENV,
+            Some(env_redirected.path().as_os_str().to_os_string()),
+        )],
+        || list_installed_packs(home.path()).unwrap(),
+    );
     assert!(
         env_resolved.is_empty(),
         "OPENASR_MODELS_DIR must take priority over config.models_dir"
