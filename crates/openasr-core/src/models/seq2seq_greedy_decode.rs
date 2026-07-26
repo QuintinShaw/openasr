@@ -68,13 +68,52 @@ pub(crate) fn report_token_step_progress(step_index: usize, max_generated_tokens
 /// the field failures while keeping the per-step tail scan tiny.
 pub(crate) const MAX_REPEAT_NGRAM: usize = 8;
 
-/// Consecutive identical cycles that mark a greedy loop as degenerate. Kept
-/// deliberately high so legitimate human repetition never trips it: Mandarin
-/// "好好好" (3 identical single-token chars) or an emphatic "no no no" is only
-/// 3 cycles, so a threshold of 4 leaves normal speech untouched while still
-/// catching the degenerate loops (a phrase repeated 5+ times). Set to 0 to
-/// disable the guard entirely (fail-safe).
+/// Consecutive identical cycles that mark a multi-token phrase loop as
+/// degenerate. This is the shape the original field degeneration took (a ~5
+/// token CJK phrase emitted back to back), and legitimate speech essentially
+/// never repeats a 3+ token phrase four times running, so it keeps the
+/// original bound. Short cycles get more room - see
+/// [`default_max_consecutive_ngram_repeats`].
 pub(crate) const MAX_CONSECUTIVE_NGRAM_REPEATS: usize = 4;
+
+/// Consecutive identical cycles that mark a greedy loop as degenerate, as a
+/// function of the cycle length `ngram_len`. Returning 0 for a length disables
+/// the guard for that length (fail-safe).
+///
+/// WHY THIS IS TIERED, AND WHY RAISING A BOUND IS SAFE - read this before
+/// tightening any number here:
+///
+/// A true degenerate loop is *unbounded*: greedy argmax has no escape, so it
+/// repeats until the token cap. Legitimate human repetition is *bounded* - the
+/// speaker stops. The guard truncates a tripped run back to a single
+/// occurrence (`keep_len = len - (repeats - 1) * ngram_len`, where `repeats` is
+/// the count actually observed, not the threshold), so on an unbounded loop the
+/// emitted transcript is byte-identical whether the bound is 4 or 8; raising it
+/// only delays the trip by `ngram_len * delta` decode steps. The only sequences
+/// a higher bound changes are those that stop repeating on their own between
+/// the old and the new bound, which by definition are not degenerate loops.
+///
+/// The risk is therefore sharply asymmetric. Tripping late on a real loop costs
+/// a few tokens of wasted compute and nothing in the output. Tripping early on
+/// real speech ends the decode outright and abandons every remaining second of
+/// the audio - on four Mandarin meeting sessions the flat bound of 4 cost 18.1
+/// points of diarization Miss, the single largest error source, by cutting
+/// "对对对对" / "嗯嗯嗯嗯" backchannel. Surviving transcripts showed "对对对"
+/// eight times at exactly three cycles and never at four: a censored
+/// distribution, clipped precisely at the bound rather than by how people
+/// speak.
+///
+/// Hence single-token stutters and two-token cycles - where Mandarin
+/// backchannel, laughter and emphatic agreement routinely run four to six
+/// cycles - get room, while longer phrases keep the original bound.
+pub(crate) fn default_max_consecutive_ngram_repeats(ngram_len: usize) -> usize {
+    match ngram_len {
+        0 => 0,
+        1 => 8,
+        2 => 6,
+        _ => MAX_CONSECUTIVE_NGRAM_REPEATS,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Seq2SeqGreedyDecodeConfig {
@@ -337,7 +376,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
         if let Some(loop_hit) = detect_degenerate_ngram_repeat(
             &generated,
             MAX_REPEAT_NGRAM,
-            MAX_CONSECUTIVE_NGRAM_REPEATS,
+            default_max_consecutive_ngram_repeats,
         ) {
             eprintln!(
                 "openasr_seq2seq_greedy_decode stage=greedy_decode event=degenerate_ngram_repeat status=tripped step_index={step_index} ngram_len={} repeats={} kept_tokens={} dropped_tokens={}",
@@ -527,13 +566,19 @@ pub(crate) struct DegenerateNgramRepeat {
 pub(crate) fn detect_degenerate_ngram_repeat(
     tokens: &[u32],
     max_ngram: usize,
-    max_consecutive_repeats: usize,
+    max_consecutive_repeats: fn(usize) -> usize,
 ) -> Option<DegenerateNgramRepeat> {
-    if max_ngram == 0 || max_consecutive_repeats == 0 {
+    if max_ngram == 0 {
         return None;
     }
     let len = tokens.len();
     for n in 1..=max_ngram {
+        // Per-length bound: a length whose bound is 0 has the guard disabled
+        // (fail-safe), and is skipped rather than tripping on every tail.
+        let max_consecutive_repeats = max_consecutive_repeats(n);
+        if max_consecutive_repeats == 0 {
+            continue;
+        }
         // Not enough tail yet to hold the required number of cycles.
         if len < n.saturating_mul(max_consecutive_repeats) {
             continue;
@@ -700,7 +745,7 @@ mod tests {
         let mut step_executor = SyntheticStepExecutor {
             vocab_size: 16,
             // Never reaches the stop token: stutters until the guard trips.
-            sequence: vec![5, 5, 5, 5, 5, 5],
+            sequence: vec![5; default_max_consecutive_ngram_repeats(1)],
             logits_calls: 0,
         };
         let token_decoder = SyntheticTokenDecoder {
@@ -711,7 +756,7 @@ mod tests {
             eot_token_id: 7,
             stop_token_ids: Vec::new(),
             vocab_size: 16,
-            max_generated_tokens: 6,
+            max_generated_tokens: default_max_consecutive_ngram_repeats(1),
             suppress_first_step_token_ids: Vec::new(),
             suppress_token_ids: Vec::new(),
             phrase_biases: Vec::new(),
@@ -1301,17 +1346,20 @@ mod tests {
 
     #[test]
     fn degenerate_repeat_guard_leaves_non_repeating_tail_untouched() {
-        assert_eq!(detect_degenerate_ngram_repeat(&[1, 2, 3, 4, 5], 8, 4), None);
+        assert_eq!(
+            detect_degenerate_ngram_repeat(&[1, 2, 3, 4, 5], 8, |_| 4),
+            None
+        );
     }
 
     #[test]
     fn degenerate_repeat_guard_leaves_a_few_cycles_untouched() {
         // Two or three cycles are legitimate human repetition, not a loop.
-        assert_eq!(detect_degenerate_ngram_repeat(&[7, 7], 8, 4), None);
-        assert_eq!(detect_degenerate_ngram_repeat(&[7, 7, 7], 8, 4), None);
+        assert_eq!(detect_degenerate_ngram_repeat(&[7, 7], 8, |_| 4), None);
+        assert_eq!(detect_degenerate_ngram_repeat(&[7, 7, 7], 8, |_| 4), None);
         // Multi-token phrase repeated three times ("好好好"-style emphasis).
         assert_eq!(
-            detect_degenerate_ngram_repeat(&[1, 2, 1, 2, 1, 2], 8, 4),
+            detect_degenerate_ngram_repeat(&[1, 2, 1, 2, 1, 2], 8, |_| 4),
             None
         );
     }
@@ -1320,7 +1368,7 @@ mod tests {
     fn degenerate_repeat_guard_catches_single_token_stutter() {
         // n = 1: "gugugu" - the same token id four times in a row.
         assert_eq!(
-            detect_degenerate_ngram_repeat(&[5, 5, 5, 5], 8, 4),
+            detect_degenerate_ngram_repeat(&[5, 5, 5, 5], 8, |_| 4),
             Some(DegenerateNgramRepeat {
                 keep_len: 1,
                 ngram_len: 1,
@@ -1329,7 +1377,7 @@ mod tests {
         );
         // Extra copies past the threshold still truncate to one occurrence.
         assert_eq!(
-            detect_degenerate_ngram_repeat(&[9, 5, 5, 5, 5, 5], 8, 4),
+            detect_degenerate_ngram_repeat(&[9, 5, 5, 5, 5, 5], 8, |_| 4),
             Some(DegenerateNgramRepeat {
                 keep_len: 2,
                 ngram_len: 1,
@@ -1344,7 +1392,7 @@ mod tests {
         // ["感","觉","的"] x5 -> keep one occurrence (first 3 tokens).
         let tokens = [11, 12, 13, 11, 12, 13, 11, 12, 13, 11, 12, 13, 11, 12, 13];
         assert_eq!(
-            detect_degenerate_ngram_repeat(&tokens, 8, 4),
+            detect_degenerate_ngram_repeat(&tokens, 8, |_| 4),
             Some(DegenerateNgramRepeat {
                 keep_len: 3,
                 ngram_len: 3,
@@ -1364,7 +1412,7 @@ mod tests {
             x4.extend_from_slice(&phrase);
         }
         assert_eq!(
-            detect_degenerate_ngram_repeat(&x4, 8, 4),
+            detect_degenerate_ngram_repeat(&x4, 8, |_| 4),
             Some(DegenerateNgramRepeat {
                 keep_len: 5,
                 ngram_len: 5,
@@ -1375,7 +1423,7 @@ mod tests {
         for _ in 0..2 {
             x2.extend_from_slice(&phrase);
         }
-        assert_eq!(detect_degenerate_ngram_repeat(&x2, 8, 4), None);
+        assert_eq!(detect_degenerate_ngram_repeat(&x2, 8, |_| 4), None);
     }
 
     #[test]
@@ -1388,7 +1436,7 @@ mod tests {
                 tokens.extend_from_slice(&ngram);
             }
             assert_eq!(
-                detect_degenerate_ngram_repeat(&tokens, 8, 4),
+                detect_degenerate_ngram_repeat(&tokens, 8, |_| 4),
                 Some(DegenerateNgramRepeat {
                     keep_len: n,
                     ngram_len: n,
@@ -1403,14 +1451,128 @@ mod tests {
     fn degenerate_repeat_guard_resets_on_interleaved_tail() {
         // A near-loop that is broken by a fresh token at the tail must not trip.
         let tokens = [1, 2, 1, 2, 1, 2, 1, 2, 9];
-        assert_eq!(detect_degenerate_ngram_repeat(&tokens, 8, 4), None);
+        assert_eq!(detect_degenerate_ngram_repeat(&tokens, 8, |_| 4), None);
+    }
+
+    /// The tier boundaries themselves: one below each length's bound must not
+    /// trip, exactly at it must. Pins the numbers the production policy ships
+    /// so a silent edit to one tier fails here.
+    #[test]
+    fn degenerate_repeat_guard_tiers_bound_each_cycle_length() {
+        for (ngram_len, bound) in [(1usize, 8usize), (2, 6), (3, 4), (5, 4)] {
+            let ngram: Vec<u32> = (0..ngram_len as u32).map(|i| i + 100).collect();
+            let repeat = |times: usize| -> Vec<u32> {
+                std::iter::repeat_n(ngram.as_slice(), times)
+                    .flatten()
+                    .copied()
+                    .collect()
+            };
+
+            let just_under = repeat(bound - 1);
+            assert_eq!(
+                detect_degenerate_ngram_repeat(
+                    &just_under,
+                    MAX_REPEAT_NGRAM,
+                    default_max_consecutive_ngram_repeats,
+                ),
+                None,
+                "n={ngram_len}: {} cycles is one under the bound and must survive",
+                bound - 1
+            );
+
+            let at_bound = repeat(bound);
+            let hit = detect_degenerate_ngram_repeat(
+                &at_bound,
+                MAX_REPEAT_NGRAM,
+                default_max_consecutive_ngram_repeats,
+            )
+            .unwrap_or_else(|| panic!("n={ngram_len}: {bound} cycles must trip"));
+            assert_eq!(hit.ngram_len, ngram_len);
+            assert_eq!(hit.repeats, bound);
+            assert_eq!(hit.keep_len, ngram_len, "must keep exactly one cycle");
+        }
+    }
+
+    /// Mandarin backchannel is what the flat bound of 4 was cutting: four to
+    /// seven identical single-token chars ("对对对对", "嗯嗯嗯嗯") is speech,
+    /// not a loop, and must reach the transcript intact.
+    #[test]
+    fn degenerate_repeat_guard_leaves_mandarin_backchannel_untouched() {
+        for cycles in 3..=7usize {
+            let tokens = vec![42u32; cycles];
+            assert_eq!(
+                detect_degenerate_ngram_repeat(
+                    &tokens,
+                    MAX_REPEAT_NGRAM,
+                    default_max_consecutive_ngram_repeats,
+                ),
+                None,
+                "{cycles} consecutive identical chars is human repetition"
+            );
+        }
+        // A two-token cycle ("好的好的好的好的", "哈哈" x5) likewise.
+        for cycles in 3..=5usize {
+            let tokens: Vec<u32> = std::iter::repeat_n([7u32, 8u32].as_slice(), cycles)
+                .flatten()
+                .copied()
+                .collect();
+            assert_eq!(
+                detect_degenerate_ngram_repeat(
+                    &tokens,
+                    MAX_REPEAT_NGRAM,
+                    default_max_consecutive_ngram_repeats,
+                ),
+                None,
+                "{cycles} two-token cycles is human repetition"
+            );
+        }
+    }
+
+    /// The safety argument the tiering rests on, made executable: an unbounded
+    /// loop (what a real degenerate decode produces, since greedy argmax never
+    /// escapes it) is truncated to the SAME prefix under the relaxed bound as
+    /// under the original flat 4. Raising a bound cannot let a real loop
+    /// through - it only delays the trip. If this ever fails, the relaxation
+    /// is no longer free and the tiering must be revisited.
+    #[test]
+    fn relaxing_the_bound_keeps_the_same_prefix_on_an_unbounded_loop() {
+        for ngram_len in 1..=MAX_REPEAT_NGRAM {
+            let prefix: Vec<u32> = (0..7u32).collect();
+            let ngram: Vec<u32> = (0..ngram_len as u32).map(|i| i + 100).collect();
+            // Far past every bound, the way a real greedy loop runs to the cap.
+            let mut tokens = prefix.clone();
+            for _ in 0..64 {
+                tokens.extend_from_slice(&ngram);
+            }
+
+            let strict = detect_degenerate_ngram_repeat(&tokens, MAX_REPEAT_NGRAM, |_| 4)
+                .expect("flat bound of 4 trips on an unbounded loop");
+            let tiered = detect_degenerate_ngram_repeat(
+                &tokens,
+                MAX_REPEAT_NGRAM,
+                default_max_consecutive_ngram_repeats,
+            )
+            .expect("tiered bound trips on an unbounded loop");
+
+            assert_eq!(
+                &tokens[..strict.keep_len],
+                &tokens[..tiered.keep_len],
+                "n={ngram_len}: relaxed bound must keep a byte-identical prefix"
+            );
+        }
     }
 
     #[test]
     fn degenerate_repeat_guard_is_disabled_when_threshold_is_zero() {
         // Fail-safe: either bound at 0 disables the guard entirely.
-        assert_eq!(detect_degenerate_ngram_repeat(&[5, 5, 5, 5, 5], 8, 0), None);
-        assert_eq!(detect_degenerate_ngram_repeat(&[5, 5, 5, 5, 5], 0, 4), None);
+        assert_eq!(
+            detect_degenerate_ngram_repeat(&[5, 5, 5, 5, 5], 8, |_| 0),
+            None
+        );
+        assert_eq!(
+            detect_degenerate_ngram_repeat(&[5, 5, 5, 5, 5], 0, |_| 4),
+            None
+        );
     }
 
     #[test]
@@ -1453,8 +1615,14 @@ mod tests {
         assert_eq!(output.generated_tokens, vec![5]);
         assert_eq!(output.generated_probabilities.len(), 1);
         assert_eq!(output.text, "gu");
-        // Tripped at the 4th identical token (steps 0..=3), so no further steps.
-        assert_eq!(step_executor.logits_calls, 4);
+        // Tripped at the single-token cycle bound from the shared policy, so
+        // no further steps. Asserting the policy value rather than a literal
+        // keeps this test about "the driver stops at the bound", not about
+        // what the bound currently is.
+        assert_eq!(
+            step_executor.logits_calls,
+            default_max_consecutive_ngram_repeats(1)
+        );
     }
 
     /// Step executor that emits a non-stop token every call and records how many

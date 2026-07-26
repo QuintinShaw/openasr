@@ -2020,6 +2020,18 @@ fn resolve_native_longform_policy_for_backend(
         }
     };
     let mut provenance = Vec::new();
+    if !matches!(options.mode, LongFormMode::Off)
+        && scoped_slice_recording_fits_one_decode(
+            model_architecture,
+            audio_duration_seconds,
+            requested,
+        )
+    {
+        options.mode = LongFormMode::Off;
+        provenance.push(format!(
+            "core.native.longform.policy:scoped-slices-integral,audio_seconds={audio_duration_seconds:.3}"
+        ));
+    }
     if !matches!(options.mode, LongFormMode::Off) {
         apply_scoped_slice_longform_window_policy(
             model_architecture,
@@ -2032,6 +2044,37 @@ fn resolve_native_longform_policy_for_backend(
         options,
         provenance,
     }
+}
+
+/// Whether this recording is short enough for a
+/// [`OpenAsrLongformSliceShape::ScopedSlices`] family to decode it whole, in
+/// which case slicing is skipped entirely.
+///
+/// For such a family slicing is a degradation rather than the normal path: the
+/// in-decoder speaker numbering restarts at every seam, so cross-slice identity
+/// has to be re-established from voice evidence alone, and the cut-point search
+/// can clip speech. The family's `integral_seconds` is exactly how much audio
+/// its decoder context can serve in one prompt, so anything at or under it is
+/// decoded whole and only longer recordings fall back to slices.
+///
+/// An explicitly requested [`crate::LongFormOptions`] is honored as-is: a
+/// caller that asked for specific slicing gets it, and this only decides the
+/// automatic policy.
+fn scoped_slice_recording_fits_one_decode(
+    model_architecture: &str,
+    audio_duration_seconds: f32,
+    requested: Option<&crate::LongFormOptions>,
+) -> bool {
+    if requested.is_some() {
+        return false;
+    }
+    let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
+        integral_seconds, ..
+    } = crate::arch::longform_slice_shape_for_model_architecture(model_architecture)
+    else {
+        return false;
+    };
+    audio_duration_seconds <= integral_seconds
 }
 
 /// Installs the slice window an
@@ -2063,6 +2106,7 @@ fn apply_scoped_slice_longform_window_policy(
     let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
         target_seconds,
         max_seconds,
+        ..
     } = crate::arch::longform_slice_shape_for_model_architecture(model_architecture)
     else {
         return;
@@ -3584,6 +3628,72 @@ mod tests {
         assert_eq!(resolution.options.mode, LongFormMode::Auto);
     }
 
+    /// A `ScopedSlices` family decodes a recording whole whenever its context
+    /// can serve it, and only slices past that point. Slicing costs identity
+    /// (every seam restarts the in-decoder speaker numbering) and can clip
+    /// speech at cut points, so it must be the fallback, not the default: a
+    /// recording inside `integral_seconds` has to come back with longform off,
+    /// however long it is relative to the generic 30s auto-trigger.
+    #[test]
+    fn scoped_slice_family_decodes_a_recording_that_fits_its_context_whole() {
+        let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
+            integral_seconds,
+            target_seconds,
+            ..
+        } = crate::arch::longform_slice_shape_for_model_architecture(
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+        )
+        else {
+            panic!("moss-transcribe-diarize must declare ScopedSlices");
+        };
+
+        // Well past the generic auto-trigger and past a single slice window,
+        // but still inside what one prompt can serve.
+        for audio_seconds in [
+            DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS + 1.0,
+            target_seconds + 1.0,
+            integral_seconds,
+        ] {
+            let resolution = resolve_native_longform_policy_for_backend(
+                None,
+                audio_seconds,
+                crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+                GgmlCpuGraphBackend::Cpu,
+            );
+            assert_eq!(
+                resolution.options.mode,
+                LongFormMode::Off,
+                "{audio_seconds}s fits one decode and must not be sliced"
+            );
+        }
+
+        // Just past it, slicing takes over rather than failing the request.
+        let resolution = resolve_native_longform_policy_for_backend(
+            None,
+            integral_seconds + 1.0,
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(resolution.options.mode, LongFormMode::Auto);
+        assert_eq!(resolution.options.chunk_seconds, target_seconds);
+    }
+
+    /// The integral path is an *automatic* policy decision. A caller that
+    /// explicitly asked for longform options still gets them, so an explicit
+    /// request is never silently overridden into a whole-recording decode its
+    /// context may not survive.
+    #[test]
+    fn an_explicit_longform_request_still_slices_inside_the_integral_window() {
+        let requested = crate::LongFormOptions::default();
+        let resolution = resolve_native_longform_policy_for_backend(
+            Some(&requested),
+            120.0,
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(resolution.options.mode, requested.mode);
+    }
+
     /// A `ScopedSlices` family gets its declared decoder-context window in
     /// place of the shared 30s default -- widened, not clamped -- plus the two
     /// options that shape implies (no padding bias on in-decoder timestamps,
@@ -3593,6 +3703,7 @@ mod tests {
         let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
             target_seconds,
             max_seconds,
+            ..
         } = crate::arch::longform_slice_shape_for_model_architecture(
             crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
         )
@@ -3816,9 +3927,13 @@ mod tests {
     #[test]
     fn encoder_attention_span_caps_every_builtin_architecture_on_the_production_path() {
         for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
+            // Long enough to be past every family's integral window, so the
+            // slicing policy actually runs for `ScopedSlices` families too --
+            // a shorter recording legitimately resolves to longform off for
+            // them, which would say nothing about the encoder caps under test.
             let resolution = resolve_native_longform_policy_for_backend(
                 None,
-                120.0,
+                600.0,
                 descriptor.model_architecture,
                 GgmlCpuGraphBackend::Cpu,
             );
