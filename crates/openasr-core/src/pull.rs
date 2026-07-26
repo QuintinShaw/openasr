@@ -574,20 +574,6 @@ pub fn install_model_pack_from_path(
     install_model_pack_from_path_with_target(&target, source_path, home, progress)
 }
 
-/// Install a local `.oasr` pack into `OPENASR_HOME`.
-///
-/// Resolution order (fail-closed on ambiguity / invalid packs, not on "missing
-/// from public catalog"):
-/// 1. If the file's sha256+size matches exactly one **public** catalog quant,
-///    reuse that catalog identity (same as a network pull of that quant).
-/// 2. Otherwise treat the file as an operator-supplied pack: identity comes
-///    from pack metadata / filename, integrity is the file's own digest, and
-///    [`preflight_model_pack_for_install`] still gates structural + runtime
-///    contract validity before commit.
-///
-/// This keeps marketplace pulls catalog-bound while allowing local import of
-/// packs that are published on HF but not yet in the signed public catalog
-/// (or private/dev builds).
 pub fn install_catalog_model_pack_from_path(
     catalog: &ModelCatalog,
     source_path: impl AsRef<Path>,
@@ -602,14 +588,8 @@ pub fn install_catalog_model_pack_from_path(
         });
     }
     let (size_bytes, sha256) = file_size_and_sha256(source_path)?;
-    match resolve_catalog_pull_by_file_digest(catalog, size_bytes, &sha256)? {
-        Some(resolved) => install_model_pack_from_path(&resolved, source_path, home, progress),
-        None => {
-            let target = pull_target_from_local_oasr_pack(source_path, size_bytes, &sha256)?
-                .with_source("local");
-            install_model_pack_from_path_with_target(&target, source_path, home, progress)
-        }
-    }
+    let resolved = resolve_catalog_pull_by_file_digest(catalog, size_bytes, &sha256)?;
+    install_model_pack_from_path(&resolved, source_path, home, progress)
 }
 
 fn install_model_pack_from_path_with_target(
@@ -636,15 +616,11 @@ fn install_model_pack_from_path_with_target(
     verify_partial_and_install(target, &paths, None, &|| false, progress)
 }
 
-/// Look up a public catalog quant by content digest.
-///
-/// Returns `Ok(None)` when no public entry matches (caller may fall back to
-/// pack-intrinsic identity). Returns `Err` only on ambiguous multi-match.
 fn resolve_catalog_pull_by_file_digest(
     catalog: &ModelCatalog,
     size_bytes: u64,
     sha256: &str,
-) -> Result<Option<ResolvedCatalogPull>, PullError> {
+) -> Result<ResolvedCatalogPull, PullError> {
     let matches = catalog
         .models
         .iter()
@@ -659,156 +635,17 @@ fn resolve_catalog_pull_by_file_digest(
         .collect::<Vec<_>>();
 
     match matches.as_slice() {
-        [resolved] => Ok(Some(resolved.clone())),
-        [] => Ok(None),
+        [resolved] => Ok(resolved.clone()),
+        [] => Err(PullError::InvalidTarget {
+            field: "sha256",
+            reason: "local OASR pack sha256/size is not present in the signed model catalog"
+                .to_string(),
+        }),
         _ => Err(PullError::InvalidTarget {
             field: "sha256",
             reason: "local OASR pack sha256/size matches multiple catalog entries".to_string(),
         }),
     }
-}
-
-/// Build a store identity for a local `.oasr` that is not (yet) in the signed
-/// public catalog. Prefers GGUF `openasr.model.id` / `openasr.quantization`,
-/// then filename stem tokens; always binds sha256/size to the file on disk.
-fn pull_target_from_local_oasr_pack(
-    source_path: &Path,
-    size_bytes: u64,
-    sha256: &str,
-) -> Result<PullTarget, PullError> {
-    if size_bytes == 0 {
-        return Err(PullError::InvalidTarget {
-            field: "size_bytes",
-            reason: "local OASR pack is empty".to_string(),
-        });
-    }
-    validate_sha256("sha256", sha256).map_err(|reason| PullError::InvalidTarget {
-        field: "sha256",
-        reason,
-    })?;
-
-    let filename = source_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty() && !name.contains('/') && !name.contains('\\'))
-        .ok_or_else(|| PullError::InvalidTarget {
-            field: "path",
-            reason: "local OASR pack path must end with a plain .oasr basename".to_string(),
-        })?
-        .to_string();
-
-    let identity = crate::probe_ggml_package_model_identity(source_path);
-    if let Some(error) = identity.metadata_read_error.as_deref() {
-        return Err(PullError::GgufPreflight {
-            path: source_path.to_path_buf(),
-            reason: error.to_string(),
-        });
-    }
-
-    let metadata_model_id = identity
-        .model_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let stem = source_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    let (mut model_id, mut quant_hint) = match metadata_model_id {
-        Some(raw) => match parse_model_ref(raw) {
-            Ok(parsed) => (parsed.family, parsed.tag),
-            Err(_) => (raw.to_string(), None),
-        },
-        None => match stem {
-            Some(raw) => match parse_model_ref(raw) {
-                Ok(parsed) => (parsed.family, parsed.tag),
-                Err(_) => (raw.to_string(), None),
-            },
-            None => {
-                return Err(PullError::InvalidTarget {
-                    field: "path",
-                    reason: "could not derive model id from pack metadata or filename".to_string(),
-                });
-            }
-        },
-    };
-
-    // Filename `family-q8_0.oasr` when metadata only carries the family.
-    if quant_hint.is_none()
-        && let Some(stem) = stem
-        && let Some((family, quant_token)) = split_family_and_trailing_quant_token(stem)
-        && (model_id == family || model_id == stem)
-    {
-        model_id = family;
-        quant_hint = Some(quant_token);
-    }
-
-    let quant_from_metadata = crate::read_gguf_metadata(source_path)
-        .ok()
-        .and_then(|metadata| {
-            metadata
-                .get_string("openasr.quantization")
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        });
-
-    let quant_raw = quant_from_metadata
-        .or(quant_hint)
-        .unwrap_or_else(|| "unknown".to_string());
-    let quant = canonical_quant_tag(&quant_raw).to_string();
-    let suffix = catalog_style_pull_suffix_for_quant(&quant).to_string();
-    let pull = format!("{model_id}:{suffix}");
-    let display_name = model_id.clone();
-
-    // Local-only identity: no network URL / revision. Download paths never use
-    // this target; install only copies + verifies digest + runtime preflight.
-    Ok(PullTarget {
-        model_id,
-        display_name,
-        quant,
-        suffix,
-        pull,
-        filename,
-        url: String::new(),
-        hf_revision: "local".to_string(),
-        sha256: sha256.to_string(),
-        size_bytes,
-        source: None,
-    })
-}
-
-/// Pull-grammar suffix for a canonical quant (matches publish-model QUANT_METADATA).
-fn catalog_style_pull_suffix_for_quant(quant: &str) -> &str {
-    match canonical_quant_tag(quant) {
-        "q8_0" => "q8",
-        "q4_k" => "q4",
-        "q4_k_m" => "q4km",
-        "q3_k" => "q3",
-        other => other,
-    }
-}
-
-/// Split `family-q8_0` / `family-fp16` stems into (family, quant_token).
-fn split_family_and_trailing_quant_token(stem: &str) -> Option<(String, String)> {
-    let (family, token) = stem.rsplit_once('-')?;
-    if family.is_empty() || token.is_empty() {
-        return None;
-    }
-    let canonical = canonical_quant_tag(token);
-    // Accept only recognized quant spellings (alias table + known canons).
-    let recognized = matches!(
-        canonical,
-        "fp16" | "f32" | "q8_0" | "q4_k" | "q4_k_m" | "q3_k"
-    ) || matches!(
-        token,
-        "q8" | "q4" | "q4km" | "q3" | "q4_k_m" | "q8_0" | "q4_k" | "q3_k"
-    );
-    if !recognized {
-        return None;
-    }
-    Some((family.to_string(), token.to_string()))
 }
 
 fn resolved_catalog_pull_from_quant(
