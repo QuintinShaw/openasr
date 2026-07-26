@@ -260,8 +260,9 @@ impl MossEncoderRuntime {
     pub(crate) fn new(
         runtime_path: &Path,
         config: MossEncoderConfig,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MossEncoderError> {
-        let graph_config = super::graph_config::moss_td_encoder_graph_config();
+        let graph_config = super::graph_config::moss_td_encoder_graph_config(backend);
         let runner = GgmlCpuGraphRunner::new(graph_config)
             .map_err(|source| map_graph_error("runner_init", source))?;
         let loaded = runner.load_gguf_weight_context(runtime_path).ok();
@@ -1183,21 +1184,25 @@ mod parity_tests {
         // the documented production path the gate always honors (an explicit
         // per-request preference wins over any Auto-mode gate), i.e. exactly
         // what an `execution_target=accelerated` request runs in production.
-        let _accelerated_override = (backend == GgmlCpuGraphBackend::Metal).then(|| {
-            crate::ggml_runtime::install_request_backend_override(Some(
-                crate::ggml_runtime::RequestBackendPreference::Accelerated,
-            ))
+        let explicit_preference = (backend == GgmlCpuGraphBackend::Metal)
+            .then_some(crate::ggml_runtime::RequestBackendPreference::Accelerated);
+        let _accelerated_override = explicit_preference.clone().map(|preference| {
+            crate::ggml_runtime::install_request_backend_override(Some(preference))
         });
-        // Bypasses the dispatch, so the resolved input `moss_td_encoder_graph_config`
-        // now requires must be installed here, using the same policy the
+        // Bypasses the dispatch, so `moss_td_encoder_graph_config` must be
+        // given an explicit resolved backend here, using the same policy the
         // shared dispatch would have looked up for this architecture.
-        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input(
+        let resolved_backend = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            explicit_preference,
             crate::arch::family_auto_gpu_policy_for_model_architecture(
                 crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
             ),
-        );
+        )
+        .backend();
         let mut graph_config =
-            crate::models::moss_transcribe_diarize::graph_config::moss_td_encoder_graph_config();
+            crate::models::moss_transcribe_diarize::graph_config::moss_td_encoder_graph_config(
+                resolved_backend,
+            );
         assert_eq!(
             graph_config.backend,
             backend,

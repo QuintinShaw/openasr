@@ -1,4 +1,4 @@
-use crate::ggml_runtime::{GgmlCpuGraphConfig, GgmlCpuGraphThreadingWorkload};
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphThreadingWorkload};
 #[cfg(test)]
 use crate::models::graph_runtime_config::configure_model_runtime_graph_config;
 use crate::models::graph_runtime_config::{
@@ -19,8 +19,7 @@ use crate::models::graph_runtime_config::{
 /// `AutoGpuPolicy::ExceptMetal` here and in its `arch::mod` descriptor is a
 /// one-line change (the `AutoGpuPolicy` gate machinery already exists, see
 /// `xasr_zipformer::graph_config::encoder_gpu_enabled` for the pattern).
-pub(crate) fn qwen_runtime_graph_config() -> GgmlCpuGraphConfig {
-    let backend = crate::ggml_runtime::resolved_family_runtime_input().backend();
+pub(crate) fn qwen_runtime_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     configure_model_runtime_graph_config_from_env(
         GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend),
         ModelMetalRuntimeOverrides {
@@ -38,8 +37,8 @@ pub(crate) fn qwen_runtime_graph_config() -> GgmlCpuGraphConfig {
 /// the precedent this mirrors). Unlike the decode path below, there is no
 /// per-token reuse here: one call per chunk, so maximizing threads for that
 /// one call is a clear win, not a per-step overhead trade-off.
-pub(crate) fn qwen_encoder_graph_config() -> GgmlCpuGraphConfig {
-    let mut config = qwen_runtime_graph_config();
+pub(crate) fn qwen_encoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+    let mut config = qwen_runtime_graph_config(backend);
     if !has_explicit_thread_override() {
         config.n_threads = GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
             config.backend,
@@ -64,8 +63,8 @@ pub(crate) fn qwen_encoder_graph_config() -> GgmlCpuGraphConfig {
 /// whole-decoder executor through
 /// `Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head`,
 /// so they inherit this tier automatically.
-pub(crate) fn qwen_decoder_graph_config() -> GgmlCpuGraphConfig {
-    let mut config = qwen_runtime_graph_config();
+pub(crate) fn qwen_decoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+    let mut config = qwen_runtime_graph_config(backend);
     if !has_explicit_thread_override() {
         config.n_threads = GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
             config.backend,
@@ -95,7 +94,6 @@ fn qwen_runtime_graph_config_with_overrides(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ggml_runtime::GgmlCpuGraphBackend;
 
     #[test]
     fn defaults_qwen_metal_threads_to_one_without_explicit_override() {

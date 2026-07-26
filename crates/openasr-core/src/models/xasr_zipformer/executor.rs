@@ -86,11 +86,13 @@ pub(crate) fn transcribe_xasr_zipformer_pcm(
     samples: &[f32],
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<XasrZipformerTranscription, String> {
     if phrase_bias.is_some() {
         return Err("xasr-zipformer phrase bias is not supported".to_string());
     }
-    let mut runtime = XasrZipformerPreparedRuntime::from_reader_metadata(reader, gguf_metadata)?;
+    let mut runtime =
+        XasrZipformerPreparedRuntime::from_reader_metadata(reader, gguf_metadata, backend)?;
     let result = runtime.transcribe(samples)?;
     transcription_from_decode(
         &runtime,
@@ -105,17 +107,18 @@ fn transcribe_xasr_zipformer_pcm_cached(
     pack_path: &Path,
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<XasrZipformerTranscription, String> {
     if phrase_bias.is_some() {
         return Err("xasr-zipformer phrase bias is not supported".to_string());
     }
-    let backend = xasr_zipformer_encoder_graph_config().backend;
+    let backend = xasr_zipformer_encoder_graph_config(backend).backend;
     let key = (runtime_cache_path_identity(pack_path), backend);
     with_thread_local_cached_mut_by_key(
         &XASR_ZIPFORMER_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || XasrZipformerPreparedRuntime::load(pack_path),
+        || XasrZipformerPreparedRuntime::load(pack_path, backend),
         |runtime| {
             let result = runtime.transcribe(samples)?;
             transcription_from_decode(
@@ -180,6 +183,7 @@ impl GgmlAsrExecutor for XasrZipformerGgmlExecutor {
             &request.runtime_source_path,
             request.request_options.phrase_bias.as_ref(),
             request.request_options.word_timestamps,
+            request.resolved_runtime.backend(),
         )
         .map_err(fail)?;
         let duration = pcm_duration_seconds(&request.prepared_audio.samples_f32);
@@ -251,7 +255,11 @@ impl GgmlAsrStreamingExecutor for XasrZipformerGgmlExecutor {
         let _backend_guard = crate::ggml_runtime::install_request_backend_override(
             request.backend_preference.request_backend_override(),
         );
-        let runtime = checkout_prepared_runtime(&request.runtime_source_path).map_err(fail)?;
+        let runtime = checkout_prepared_runtime(
+            &request.runtime_source_path,
+            request.resolved_runtime.backend(),
+        )
+        .map_err(fail)?;
         let session_suffix = &request.session_context.session_id.0;
         let decoder = XasrIncrementalDecoder::new(
             request,
@@ -294,8 +302,11 @@ mod tests {
 
     #[test]
     fn missing_pack_fails_before_executor_work() {
-        let error = XasrZipformerPreparedRuntime::load(Path::new("/tmp/missing-xasr.oasr"))
-            .expect_err("missing pack should fail");
+        let error = XasrZipformerPreparedRuntime::load(
+            Path::new("/tmp/missing-xasr.oasr"),
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect_err("missing pack should fail");
         assert!(!error.trim().is_empty());
     }
 
@@ -321,8 +332,15 @@ mod tests {
         let duration_seconds = samples.len() as f32 / 16_000.0;
         let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
         let metadata = read_gguf_metadata(&pack).expect("metadata");
-        let output = transcribe_xasr_zipformer_pcm(&reader, &metadata, &samples, None, true)
-            .expect("xasr word timestamps");
+        let output = transcribe_xasr_zipformer_pcm(
+            &reader,
+            &metadata,
+            &samples,
+            None,
+            true,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("xasr word timestamps");
 
         assert!(!output.words.is_empty(), "real speech must yield words");
         let mut previous_start = 0.0_f32;
@@ -367,8 +385,15 @@ mod tests {
         let samples = (0..16_000)
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin() * 0.05)
             .collect::<Vec<_>>();
-        let output = transcribe_xasr_zipformer_pcm(&reader, &metadata, &samples, None, true)
-            .expect("xasr executor smoke");
+        let output = transcribe_xasr_zipformer_pcm(
+            &reader,
+            &metadata,
+            &samples,
+            None,
+            true,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("xasr executor smoke");
         assert!(output.text.is_char_boundary(output.text.len()));
     }
 }

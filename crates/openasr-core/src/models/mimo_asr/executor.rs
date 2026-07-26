@@ -342,12 +342,14 @@ impl MimoAsrGgmlExecutor {
                 }
             })?;
 
-        let mut decoder =
-            MimoLlmDecoderRuntime::new(runtime_path, llm_metadata).map_err(|error| {
-                MimoAsrExecutorError::DecoderFailed {
-                    reason: error.to_string(),
-                }
-            })?;
+        let mut decoder = MimoLlmDecoderRuntime::new(
+            runtime_path,
+            llm_metadata,
+            request.resolved_runtime.backend(),
+        )
+        .map_err(|error| MimoAsrExecutorError::DecoderFailed {
+            reason: error.to_string(),
+        })?;
         let mut token_rows =
             Vec::with_capacity(decode_prompt.token_ids.len() * llm_metadata.d_model);
         for &token_id in &decode_prompt.token_ids {
@@ -626,6 +628,10 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
             execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
                 "test fixture",
             )),

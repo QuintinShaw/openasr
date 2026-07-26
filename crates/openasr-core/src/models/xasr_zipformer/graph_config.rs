@@ -39,11 +39,12 @@ pub(super) const FULL_ENCODER_GRAPH_SIZE: usize = 65_536;
 /// choice only ever changes which backend Auto picks, never correctness:
 /// output stays byte-identical between CPU and Metal.
 ///
-pub(crate) fn xasr_zipformer_encoder_graph_config() -> GgmlCpuGraphConfig {
-    // Resolved once by the shared dispatch (via `install_resolved_family_runtime_input`,
-    // using this architecture's `auto_gpu_policy = ExceptMetal`), so the base
-    // config below already reflects the gate -- no separate re-check needed.
-    let backend = crate::ggml_runtime::resolved_family_runtime_input().backend();
+pub(crate) fn xasr_zipformer_encoder_graph_config(
+    backend: GgmlCpuGraphBackend,
+) -> GgmlCpuGraphConfig {
+    // `backend` is resolved by whoever built this request (this
+    // architecture's `auto_gpu_policy = ExceptMetal`), so the base config
+    // below already reflects the gate -- no separate re-check needed.
     xasr_zipformer_encoder_graph_config_with_overrides(
         configure_model_runtime_graph_config_from_env(
             GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend),

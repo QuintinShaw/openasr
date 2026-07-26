@@ -252,13 +252,12 @@ impl GgmlCpuGraphConfig {
     }
 
     /// Same defaults as [`Self::runtime_default`]/[`Self::gated_runtime_default`]
-    /// but for an already-resolved backend, i.e. the value the shared dispatch
-    /// installed via [`install_resolved_family_runtime_input`] for this
-    /// request. This is the entry point family graph-config code must use --
-    /// it never re-derives the backend from the override/env itself, so every
-    /// graph-config call site within one decode observes the identical value
-    /// dispatch resolved once, instead of each site independently re-reading
-    /// the thread-local override.
+    /// but for an already-resolved backend, i.e. the value carried on a
+    /// request's [`ResolvedFamilyRuntimeInput`] field. This is the entry
+    /// point family graph-config code must use -- it never re-derives the
+    /// backend from the override/env itself, so every graph-config call site
+    /// within one decode observes the identical value the request was built
+    /// with, instead of each site independently re-deriving it.
     pub fn runtime_default_for_resolved_backend(backend: GgmlCpuGraphBackend) -> Self {
         Self::runtime_default_for_backend(backend)
     }
@@ -343,15 +342,31 @@ impl GgmlCpuGraphConfig {
         (n_threads > 0 && c_int::try_from(n_threads).is_ok()).then_some(n_threads)
     }
 
-    /// Narrowed to this module: every caller outside `ggml_runtime` (the
-    /// shared dispatch entry points in `models::ggml_asr_executor`, the
-    /// top-level `api::backend::native_transcribe` orchestration, and their
-    /// tests) must go through [`install_resolved_family_runtime_input`] /
-    /// [`resolved_family_runtime_input`] instead of calling this directly --
-    /// that is what makes "a family resolves its own backend" a compile
-    /// error rather than a convention.
+    /// Narrowed to this module: every caller outside `ggml_runtime` must go
+    /// through [`ResolvedFamilyRuntimeInput::resolve`] (a request's own
+    /// `backend_preference` field, not this thread-local read) instead of
+    /// calling this directly -- that is what makes "a family resolves its
+    /// own backend" a compile error rather than a convention. This
+    /// TLS-reading form still backs other pre-existing, unrelated
+    /// thread-local consumers (the longform multichunk-metal probe, a
+    /// family's own post-hoc RAM-fit override check, and this module's own
+    /// tests).
     pub(in crate::ggml_runtime) fn resolve_runtime_backend() -> GgmlCpuGraphBackend {
-        match request_backend_override() {
+        Self::resolve_backend_for_preference(request_backend_override())
+    }
+
+    /// Pure, thread-local-free counterpart of [`Self::resolve_runtime_backend`]:
+    /// resolves from an explicit preference value handed in by the caller
+    /// instead of reading the thread-local override. This is what
+    /// [`ResolvedFamilyRuntimeInput::resolve`] uses to compute a request's
+    /// resolved backend directly from its own `backend_preference` field --
+    /// installing a value into a thread-local and immediately reading it
+    /// back out is not "explicit", it is the propagate-by-global pattern
+    /// this whole type exists to remove.
+    pub(in crate::ggml_runtime) fn resolve_backend_for_preference(
+        preference: Option<RequestBackendPreference>,
+    ) -> GgmlCpuGraphBackend {
+        match preference {
             Some(RequestBackendPreference::CpuOnly) => GgmlCpuGraphBackend::Cpu,
             Some(RequestBackendPreference::Accelerated) => Self::default_gpu_backend(),
             Some(RequestBackendPreference::Exact(route)) => match route.provider {
@@ -399,17 +414,29 @@ impl GgmlCpuGraphConfig {
     ///
     /// Narrowed to this module for the same reason as
     /// [`Self::resolve_runtime_backend`]: outside callers use
-    /// [`install_resolved_family_runtime_input`] /
-    /// [`resolved_family_runtime_input`], which resolve through this
-    /// function exactly once per request and hand the result down as an
-    /// explicit value instead of letting every call site re-derive it.
+    /// [`ResolvedFamilyRuntimeInput::resolve`], which resolves through the
+    /// pure [`Self::resolve_family_backend_for_preference`] from a request's
+    /// own `backend_preference` field exactly once and hands the result down
+    /// as an explicit value, instead of every call site independently
+    /// installing into and reading back out of the thread-local override.
     pub(in crate::ggml_runtime) fn resolve_family_runtime_backend(
         policy: AutoGpuPolicy,
     ) -> GgmlCpuGraphBackend {
-        if request_backend_override().is_some() {
-            return Self::resolve_runtime_backend();
+        Self::resolve_family_backend_for_preference(request_backend_override(), policy)
+    }
+
+    /// Pure, thread-local-free counterpart of
+    /// [`Self::resolve_family_runtime_backend`]: takes the explicit
+    /// preference instead of reading it from the thread-local override. This
+    /// is the function [`ResolvedFamilyRuntimeInput::resolve`] calls.
+    pub(in crate::ggml_runtime) fn resolve_family_backend_for_preference(
+        preference: Option<RequestBackendPreference>,
+        policy: AutoGpuPolicy,
+    ) -> GgmlCpuGraphBackend {
+        if preference.is_some() {
+            return Self::resolve_backend_for_preference(preference);
         }
-        let resolved = Self::resolve_runtime_backend();
+        let resolved = Self::resolve_backend_for_preference(None);
         let gate_to_cpu = match policy {
             AutoGpuPolicy::AllBackends => false,
             AutoGpuPolicy::Never => resolved.is_gpu_class(),
@@ -434,105 +461,46 @@ impl GgmlCpuGraphConfig {
     }
 }
 
-/// Shared-dispatch-resolved, request-scoped execution input handed down to
-/// family code.
-///
-/// Computed exactly once per request (see
-/// [`install_resolved_family_runtime_input`]) from the family's declared
-/// [`AutoGpuPolicy`], so every graph-build call site within one decode
-/// observes the identical backend instead of each site independently
-/// re-deriving it from the thread-local override + env -- the mechanism that
-/// let Qwen and firered-llm's ungated call sites drift from what a gated
-/// family's own resolver would have picked (contract 4's defect A).
+/// Resolved, request-scoped execution input handed down to family code as an
+/// explicit value -- a required field on the work object that reaches family
+/// code (`GgmlAsrExecutionRequest`, `GgmlAsrStreamingSessionRequest`, and the
+/// serve-batch job types), never a thread-local. Computed once, from the
+/// family's declared [`AutoGpuPolicy`] and the request's own
+/// `backend_preference` field (see [`Self::resolve`]), so every graph-build
+/// call site reads the identical value from the object it was already given
+/// -- including across an OS-thread boundary (materialize on the submitting
+/// thread, carry the value itself into the work item; never re-derive on the
+/// worker thread) -- instead of each site independently re-deriving it from
+/// a thread-local override that only ever worked on the installing thread
+/// (contract 4's defect A).
 ///
 /// Deliberately a struct, not a bare [`GgmlCpuGraphBackend`]: a later
-/// contract needs to thread the resolved content identity / already-open
-/// runtime source down the same channel, and that only requires adding a
-/// field here -- not another signature change at every one of the call
-/// sites migrated onto this type.
+/// contract extends this with the resolved content identity / already-open
+/// runtime source, which only requires adding a field here -- not another
+/// signature change at every call site already carrying this type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedFamilyRuntimeInput {
     backend: GgmlCpuGraphBackend,
 }
 
 impl ResolvedFamilyRuntimeInput {
-    /// The backend the shared dispatch resolved for this request, already
-    /// passed through the family's own [`AutoGpuPolicy`] gate.
+    /// Resolves a family's backend from its declared [`AutoGpuPolicy`] and an
+    /// explicit request-backend preference -- never from a thread-local
+    /// read. Callers convert their own preference value (e.g.
+    /// `GgmlAsrBackendPreference::request_backend_override()`) and pass it
+    /// straight in; this never installs anything, so there is no global
+    /// state for a thread boundary to lose.
+    pub fn resolve(preference: Option<RequestBackendPreference>, policy: AutoGpuPolicy) -> Self {
+        Self {
+            backend: GgmlCpuGraphConfig::resolve_family_backend_for_preference(preference, policy),
+        }
+    }
+
+    /// The backend resolved for this request, already passed through the
+    /// family's own [`AutoGpuPolicy`] gate.
     pub fn backend(self) -> GgmlCpuGraphBackend {
         self.backend
     }
-}
-
-thread_local! {
-    static RESOLVED_FAMILY_RUNTIME_INPUT: RefCell<Option<ResolvedFamilyRuntimeInput>> =
-        const { RefCell::new(None) };
-}
-
-#[must_use = "the resolved runtime input is uninstalled when the guard drops"]
-pub struct ResolvedFamilyRuntimeInputGuard {
-    previous: Option<ResolvedFamilyRuntimeInput>,
-}
-
-impl Drop for ResolvedFamilyRuntimeInputGuard {
-    fn drop(&mut self) {
-        RESOLVED_FAMILY_RUNTIME_INPUT.with(|cell| {
-            *cell.borrow_mut() = self.previous.take();
-        });
-    }
-}
-
-/// Sole entry point for resolving a family's backend from its declared
-/// [`AutoGpuPolicy`]: resolves `policy` against the current request's
-/// backend override/env exactly once and installs the result for the
-/// duration of the returned guard. Callable only from within
-/// `ggml_runtime` (where the actual resolvers live) and from the shared
-/// dispatch entry points that call back into it
-/// (`models::ggml_asr_executor::GgmlAsrExecutionDispatch::execute` /
-/// `::start_streaming_session`, the two shared streaming drivers, and
-/// `api::backend::native_transcribe`'s top-level request orchestration) --
-/// everywhere else in `models::*` reads the already-resolved value via
-/// [`resolved_family_runtime_input`] instead.
-pub fn install_resolved_family_runtime_input(
-    policy: AutoGpuPolicy,
-) -> ResolvedFamilyRuntimeInputGuard {
-    let resolved = ResolvedFamilyRuntimeInput {
-        backend: GgmlCpuGraphConfig::resolve_family_runtime_backend(policy),
-    };
-    let previous = RESOLVED_FAMILY_RUNTIME_INPUT.with(|cell| cell.replace(Some(resolved)));
-    ResolvedFamilyRuntimeInputGuard { previous }
-}
-
-/// Reads the resolved runtime input the shared dispatch installed for the
-/// current request. Panics if called with none installed: every production
-/// path that runs family decode logic installs one first (see
-/// [`install_resolved_family_runtime_input`]'s doc comment for the full
-/// list), so an uninstalled read here is a wiring bug to fail loudly on, not
-/// a condition family code should silently work around.
-pub fn resolved_family_runtime_input() -> ResolvedFamilyRuntimeInput {
-    RESOLVED_FAMILY_RUNTIME_INPUT
-        .with(|cell| *cell.borrow())
-        .unwrap_or_else(|| {
-            panic!(
-                "resolved_family_runtime_input() called with no resolved runtime input \
-                 installed -- the shared dispatch entry point must call \
-                 install_resolved_family_runtime_input before invoking family code"
-            )
-        })
-}
-
-/// Test-only installer that skips the [`AutoGpuPolicy`] gate entirely,
-/// planting an exact backend value. Lets tests (including ones outside this
-/// module simulating "the shared dispatch already resolved to backend X",
-/// e.g. the streaming drivers' override-propagation tests) assert on a
-/// host-independent outcome without depending on which policy would have
-/// produced it.
-#[cfg(test)]
-pub(crate) fn install_resolved_family_runtime_input_for_test(
-    backend: GgmlCpuGraphBackend,
-) -> ResolvedFamilyRuntimeInputGuard {
-    let resolved = ResolvedFamilyRuntimeInput { backend };
-    let previous = RESOLVED_FAMILY_RUNTIME_INPUT.with(|cell| cell.replace(Some(resolved)));
-    ResolvedFamilyRuntimeInputGuard { previous }
 }
 
 impl GgmlCpuGraphConfig {

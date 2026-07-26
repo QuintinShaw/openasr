@@ -228,12 +228,14 @@ impl Qwen3AsrLlmLogitsHead {
 pub(crate) fn load_qwen3_llm_logits_head_from_reader(
     reader: &GgufTensorDataReader,
     metadata: Qwen3AsrExecutionMetadata,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError> {
     load_qwen3_llm_logits_head_from_reader_with_output_tensor(
         reader,
         metadata,
         OUTPUT_WEIGHT_TENSOR_NAME,
         DEFAULT_RMS_NORM_EPSILON,
+        backend,
     )
 }
 
@@ -242,6 +244,7 @@ pub(crate) fn load_qwen3_llm_logits_head_from_reader_with_output_tensor(
     metadata: Qwen3AsrExecutionMetadata,
     output_weight_tensor_name: &'static str,
     rms_norm_epsilon: f32,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError> {
     load_llm_logits_head_from_reader_with_tensor_names(
         reader,
@@ -250,6 +253,7 @@ pub(crate) fn load_qwen3_llm_logits_head_from_reader_with_output_tensor(
         OUTPUT_NORM_WEIGHT_TENSOR_NAME,
         output_weight_tensor_name,
         rms_norm_epsilon,
+        backend,
     )
 }
 
@@ -267,6 +271,7 @@ pub(crate) fn load_llm_logits_head_from_reader_with_tensor_names(
     output_norm_weight_tensor_name: &'static str,
     output_weight_tensor_name: &'static str,
     rms_norm_epsilon: f32,
+    backend: GgmlCpuGraphBackend,
 ) -> Result<Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError> {
     if !rms_norm_epsilon.is_finite() || rms_norm_epsilon <= 0.0 {
         return Err(Qwen3AsrLlmLogitsHeadError::InvalidTensorShape {
@@ -299,7 +304,7 @@ pub(crate) fn load_llm_logits_head_from_reader_with_tensor_names(
     if output_norm_weight.iter().any(|value| !value.is_finite()) {
         return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
     }
-    let raw_output_weight = if logits_head_ggml_enabled() {
+    let raw_output_weight = if logits_head_ggml_enabled(backend) {
         load_direct_output_weight_payload(
             reader,
             output_weight_tensor_name,
@@ -335,7 +340,7 @@ pub(crate) fn load_llm_logits_head_from_reader_with_tensor_names(
         ggml_executor_cache_key: raw_output_weight.as_ref().map(|_| {
             (
                 runtime_cache_path_identity(reader.tensor_index().path()),
-                qwen_runtime_graph_config().backend,
+                qwen_runtime_graph_config(backend).backend,
             )
         }),
         ggml_output_weight: raw_output_weight,
@@ -403,6 +408,7 @@ fn with_thread_local_logits_head_executor<R>(
     output_weight: &OwnedGgmlLogitsWeight,
     use_executor: impl FnOnce(&mut Qwen3AsrLlmLogitsHeadGraphExecutor) -> Result<R, GgmlCpuGraphError>,
 ) -> Result<R, GgmlCpuGraphError> {
+    let backend = cache_key.1;
     with_thread_local_cached_mut_by_key(
         &QWEN_LLM_LOGITS_HEAD_EXECUTOR_BY_KEY,
         cache_key,
@@ -414,6 +420,7 @@ fn with_thread_local_logits_head_executor<R>(
                 rms_norm_epsilon,
                 output_norm_weight,
                 output_weight,
+                backend,
             )
         },
         use_executor,
@@ -436,6 +443,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         rms_norm_epsilon: f32,
         output_norm_weight: &[f32],
         output_weight: &OwnedGgmlLogitsWeight,
+        backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GgmlCpuGraphError> {
         if !rms_norm_epsilon.is_finite() || rms_norm_epsilon <= 0.0 {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -462,7 +470,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         // count, so this takes the `Decoder` tier from
         // `qwen_decoder_graph_config` on its own merits (there is no
         // separate firered-aed logits-head module to mirror here).
-        let mut config = qwen_decoder_graph_config();
+        let mut config = qwen_decoder_graph_config(backend);
         config.context_bytes = QWEN3_LLM_LOGITS_GRAPH_CONTEXT_BYTES;
         let runner = GgmlCpuGraphRunner::new(config)?;
         let mut arena = runner.start_static_tensor_arena(config.context_bytes)?;
@@ -647,17 +655,17 @@ fn render_shape(shape: &[u64]) -> String {
     format!("[{parts}]")
 }
 
-fn logits_head_ggml_enabled() -> bool {
+fn logits_head_ggml_enabled(backend: GgmlCpuGraphBackend) -> bool {
     parse_env_flag(
         std::env::var(OPENASR_QWEN3_LLM_LOGITS_GGML_ENV)
             .ok()
             .as_deref(),
-        logits_head_ggml_default_enabled(),
+        logits_head_ggml_default_enabled(backend),
     )
 }
 
-fn logits_head_ggml_default_enabled() -> bool {
-    logits_head_ggml_default_enabled_for_backend(qwen_runtime_graph_config().backend)
+fn logits_head_ggml_default_enabled(backend: GgmlCpuGraphBackend) -> bool {
+    logits_head_ggml_default_enabled_for_backend(qwen_runtime_graph_config(backend).backend)
 }
 
 fn logits_head_ggml_default_enabled_for_backend(backend: GgmlCpuGraphBackend) -> bool {
@@ -852,9 +860,6 @@ mod tests {
 
     #[test]
     fn ggml_logits_head_executor_cache_reuses_same_key_without_rebuilding() {
-        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input_for_test(
-            GgmlCpuGraphBackend::Cpu,
-        );
         let key = ggml_logits_head_test_cache_key(9_000_001);
         let first = ggml_logits_head_with_cache_key(key.clone(), vec![1.0, 1.0]);
         first
@@ -874,9 +879,6 @@ mod tests {
 
     #[test]
     fn ggml_logits_head_executor_cache_evicts_beyond_capacity() {
-        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input_for_test(
-            GgmlCpuGraphBackend::Cpu,
-        );
         let base_id = 9_100_000;
         for offset in 0..(DEFAULT_RUNTIME_CACHE_CAPACITY + 3) {
             let key = ggml_logits_head_test_cache_key(base_id + offset);

@@ -57,18 +57,16 @@ where
         .session_config
         .partial_floor_ms(tuning.min_partial_interval_ms());
 
-    // Every family plugged into this shared driver gets its backend resolved
-    // through the same gate, driven by its own descriptor -- no per-family
-    // opt-in code needed.
-    let auto_gpu_policy = crate::arch::family_auto_gpu_policy_for_model_architecture(
-        request.selected_family.model_architecture,
-    );
     let runtime_source_path = request.runtime_source_path.clone();
     let runtime_source_preflight = request.runtime_source_preflight.clone();
     let selected_family = request.selected_family.clone();
     let request_options = request.request_options.clone();
     let inference_threads = request_options.inference_threads;
     let backend_preference = request.backend_preference;
+    // Resolved once for the whole session (this is a `Copy` value carried on
+    // the session request, not a thread-local): every per-frame request this
+    // driver builds for the life of the session copies it in directly.
+    let resolved_runtime = request.resolved_runtime;
     let make_request = move |audio: &GgmlAsrPreparedAudio| GgmlAsrExecutionRequest {
         runtime_source_path: runtime_source_path.clone(),
         runtime_source_preflight: runtime_source_preflight.clone(),
@@ -76,6 +74,7 @@ where
         prepared_audio: audio.clone(),
         request_options: request_options.clone(),
         backend_preference,
+        resolved_runtime,
         // Per-frame streaming partials/finals have no client-visible
         // transcription id and no cancel/pause control surface today (a live
         // session ends by the caller dropping it, not by canceling a
@@ -92,19 +91,15 @@ where
     let partial_executor = executor.clone();
     let partial_transcribe = Box::new(move |audio: &GgmlAsrPreparedAudio| {
         let _thread_override = install_request_inference_threads_override(inference_threads);
-        // Same as the seq2seq incremental driver: this closure calls the
-        // per-family decode fn directly instead of going through
-        // GgmlAsrExecutionDispatch::execute, so the request's
+        // This closure calls the per-family decode fn directly instead of
+        // going through GgmlAsrExecutionDispatch::execute, so the request's
         // backend_preference must be installed here or an explicit
         // CpuOnly/Accelerated choice is silently dropped for streaming
-        // partials.
+        // partials by the few remaining thread-local readers unrelated to
+        // this driver's own resolved backend (already carried on
+        // `make_request`'s `resolved_runtime` field above).
         let _backend_override =
             install_request_backend_override(backend_preference.request_backend_override());
-        // Same reasoning: resolve and install this family's backend here too,
-        // so `resolved_family_runtime_input()` is populated for the decode
-        // call below exactly as `GgmlAsrExecutionDispatch::execute` would.
-        let _resolved_backend =
-            crate::ggml_runtime::install_resolved_family_runtime_input(auto_gpu_policy);
         partial_decode(&partial_executor, &make_request(audio))
     });
 
@@ -121,6 +116,7 @@ where
         prepared_audio: audio.clone(),
         request_options: request_options.clone(),
         backend_preference,
+        resolved_runtime,
         // Same reasoning as the partial-decode request above: no
         // execution-context field on this request type yet, and a live
         // session ends by the caller dropping it rather than canceling a
@@ -135,8 +131,6 @@ where
         let _thread_override = install_request_inference_threads_override(inference_threads);
         let _backend_override =
             install_request_backend_override(backend_preference.request_backend_override());
-        let _resolved_backend =
-            crate::ggml_runtime::install_resolved_family_runtime_input(auto_gpu_policy);
         final_decode(&final_executor, &make_final_request(audio)).map(|result| result.transcription)
     });
 
@@ -460,6 +454,12 @@ mod tests {
         fn session_request(
             backend_preference: crate::GgmlAsrBackendPreference,
         ) -> GgmlAsrStreamingSessionRequest {
+            let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                backend_preference.request_backend_override(),
+                crate::arch::family_auto_gpu_policy_for_model_architecture(
+                    crate::wav2vec2_ctc_runtime_descriptor_v1().model_architecture,
+                ),
+            );
             GgmlAsrStreamingSessionRequest {
                 runtime_source_path: PathBuf::from("/tmp/openasr-missing-runtime.gguf"),
                 runtime_source_preflight: None,
@@ -467,6 +467,7 @@ mod tests {
                 request_options: crate::GgmlAsrExecutionOptions::default(),
                 configured_diarize: false,
                 backend_preference,
+                resolved_runtime,
                 session_context: crate::NativeAsrSessionContext::new(
                     "rt_ctc_backend_override_test",
                 ),
@@ -479,9 +480,9 @@ mod tests {
         // Drives one warm-up partial decode through the real
         // `build_ctc_streaming_driver` closure and records what the decode
         // fn observed via the thread-local override, plus what
-        // `resolved_family_runtime_input()` reports at that instant -- the
-        // same channel the driver itself installs from the request's
-        // architecture-declared `AutoGpuPolicy`.
+        // `_request.resolved_runtime` reports at that instant -- the same
+        // field the driver itself copies from the session request, resolved
+        // from the request's architecture-declared `AutoGpuPolicy`.
         fn observed_backend_during_partial_decode(
             backend_preference: crate::GgmlAsrBackendPreference,
         ) -> (Option<RequestBackendPreference>, GgmlCpuGraphBackend) {
@@ -499,7 +500,7 @@ mod tests {
                 move |_executor: &(), _request: &GgmlAsrExecutionRequest| {
                     *observed_for_decode.lock().unwrap() = Some((
                         crate::ggml_runtime::request_backend_override(),
-                        crate::ggml_runtime::resolved_family_runtime_input().backend(),
+                        _request.resolved_runtime.backend(),
                     ));
                     Ok(ctc_result("", 0))
                 },

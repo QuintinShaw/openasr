@@ -87,6 +87,10 @@ fn build_request(pack: &Path, descriptor_id: &str) -> GgmlAsrStreamingSessionReq
         request_options: GgmlAsrExecutionOptions::default(),
         configured_diarize: false,
         backend_preference: GgmlAsrBackendPreference::CpuOnly,
+        resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        ),
         session_context: NativeAsrSessionContext::new("rt_finalize_bench"),
         session_config: NativeAsrStreamingSessionConfig::new()
             .with_partial_results(true)

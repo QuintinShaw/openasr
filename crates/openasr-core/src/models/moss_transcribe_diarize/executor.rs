@@ -440,10 +440,11 @@ fn encode_moss_td_chunks_with_cached_runtime(
     encoder_config: MossEncoderConfig,
     merge_size: usize,
     samples: &[f32],
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<(Vec<f32>, usize), MossTdExecutorError> {
     let key = (
         runtime_cache_path_identity(runtime_path),
-        moss_td_encoder_graph_config().backend,
+        moss_td_encoder_graph_config(backend).backend,
     );
     // Upstream `_compute_audio_token_length`'s stride: hop_length * the
     // Whisper conv stem's 2x stride * audio_merge_size.
@@ -455,7 +456,7 @@ fn encode_moss_td_chunks_with_cached_runtime(
         || {
             #[cfg(test)]
             MOSS_TD_ENCODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
-            MossEncoderRuntime::new(runtime_path, encoder_config).map_err(|error| {
+            MossEncoderRuntime::new(runtime_path, encoder_config, backend).map_err(|error| {
                 MossTdExecutorError::EncoderFailed {
                     reason: format!("could not initialize encoder runtime: {error}"),
                 }
@@ -514,10 +515,11 @@ fn run_moss_td_decoder_with_cached_runtime(
     audio_rows: &[f32],
     tokenizer: &MossTdTokenizer,
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<String, MossTdExecutorError> {
     let key = (
         runtime_cache_path_identity(runtime_path),
-        moss_td_runtime_graph_config().backend,
+        moss_td_runtime_graph_config(backend).backend,
     );
     with_thread_local_cached_mut_by_key(
         &MOSS_TD_DECODER_RUNTIME_BY_KEY,
@@ -526,7 +528,7 @@ fn run_moss_td_decoder_with_cached_runtime(
         || {
             #[cfg(test)]
             MOSS_TD_DECODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
-            MossTdDecoderRuntime::new(runtime_path, decoder_metadata).map_err(|error| {
+            MossTdDecoderRuntime::new(runtime_path, decoder_metadata, backend).map_err(|error| {
                 MossTdExecutorError::DecoderFailed {
                     reason: error.to_string(),
                 }
@@ -697,6 +699,7 @@ impl MossTdGgmlExecutor {
             encoder_config,
             adaptor_metadata.merge_size,
             samples,
+            request.resolved_runtime.backend(),
         )?;
         let aligned_frames = moss_td_aligned_frame_count(total_frames, adaptor_metadata.merge_size);
         concatenated_rows.truncate(aligned_frames * encoder_metadata.d_model);
@@ -763,6 +766,7 @@ impl MossTdGgmlExecutor {
             &audio_rows,
             &tokenizer,
             &request.execution_context.control,
+            request.resolved_runtime.backend(),
         )?;
         // Parse the model's own inline `[start][end][SNN]` markup into real
         // speaker segments, degrading fail-closed to the single speaker-less
@@ -960,11 +964,8 @@ mod tests {
         // thread-local override on drop at the end of this function.
         let _backend_override_guard =
             install_request_backend_override(backend_preference.request_backend_override());
-        // Same reasoning as the backend override above: the resolved input
-        // `moss_td_runtime_graph_config`/`moss_td_encoder_graph_config` now
-        // require must be installed here too, using this architecture's own
-        // declared policy.
-        let _resolved_guard = crate::ggml_runtime::install_resolved_family_runtime_input(
+        let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            backend_preference.request_backend_override(),
             crate::arch::family_auto_gpu_policy_for_model_architecture(
                 crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
             ),
@@ -985,6 +986,7 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference,
+            resolved_runtime,
             execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
                 "test fixture",
             )),
@@ -1020,7 +1022,8 @@ mod tests {
         let _backend_override_guard = install_request_backend_override(
             GgmlAsrBackendPreference::CpuOnly.request_backend_override(),
         );
-        let _resolved_guard = crate::ggml_runtime::install_resolved_family_runtime_input(
+        let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            GgmlAsrBackendPreference::CpuOnly.request_backend_override(),
             crate::arch::family_auto_gpu_policy_for_model_architecture(
                 crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
             ),
@@ -1038,6 +1041,7 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime,
             execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
                 "test fixture",
             )),

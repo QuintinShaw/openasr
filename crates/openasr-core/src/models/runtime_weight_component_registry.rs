@@ -150,8 +150,17 @@ pub(crate) fn materialize_builtin_runtime_weight_components(
                         reason: error.to_string(),
                     },
                 )?;
-            let logits_head =
-                load_qwen3_llm_logits_head_from_reader(reader, metadata).map_err(|error| {
+            // Weight materialization here is cached per (architecture, pack)
+            // and reused across every request regardless of that request's
+            // own resolved backend (the actual per-request graph executor
+            // lookup happens later, keyed separately) -- so there is no
+            // single request's `resolved_runtime` to thread through this
+            // shared, backend-agnostic weight cache. Resolve the same
+            // generic default a request with no explicit preference would
+            // get, matching this path's pre-existing behavior.
+            let backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
+            let logits_head = load_qwen3_llm_logits_head_from_reader(reader, metadata, backend)
+                .map_err(|error| {
                     BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
                         component: "qwen3-asr.logits-head",
                         reason: error.to_string(),

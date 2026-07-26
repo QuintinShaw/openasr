@@ -237,6 +237,12 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
             &options,
             self.model_self_diarizes(),
         );
+        let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            backend_preference.request_backend_override(),
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                self.descriptor.model_architecture,
+            ),
+        );
         let request = GgmlAsrStreamingSessionRequest {
             runtime_source_path: model_pack.root.clone(),
             runtime_source_preflight: None,
@@ -244,6 +250,7 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
             request_options,
             configured_diarize: options.diarize,
             backend_preference,
+            resolved_runtime,
             session_context: context,
             session_config: session_config.into(),
         };

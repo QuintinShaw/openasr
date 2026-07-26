@@ -95,6 +95,7 @@ impl MimoLlmDecoderRuntime {
     pub(crate) fn new(
         runtime_path: &std::path::Path,
         metadata: MimoLlmMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MimoLlmDecoderError> {
         let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(runtime_path).map_err(
             |error| MimoLlmDecoderError::TensorReadFailed {
@@ -108,6 +109,7 @@ impl MimoLlmDecoderRuntime {
                 Some(runtime_path),
                 metadata.rms_norm_epsilon,
                 None,
+                backend,
             )
             .map_err(|error| MimoLlmDecoderError::GraphFailed {
                 reason: error.to_string(),
@@ -119,6 +121,7 @@ impl MimoLlmDecoderRuntime {
             OUTPUT_NORM_WEIGHT,
             OUTPUT_WEIGHT,
             metadata.rms_norm_epsilon,
+            backend,
         )
         .map_err(|error| MimoLlmDecoderError::LogitsHeadFailed {
             reason: error.to_string(),

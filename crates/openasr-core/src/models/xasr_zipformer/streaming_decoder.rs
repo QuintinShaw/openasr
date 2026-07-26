@@ -262,7 +262,7 @@ mod tests {
     #[test]
     #[ignore = "host-local: requires the X-ASR q8_0 pack under tmp/xasr-test/out"]
     fn xasr_accelerated_request_engages_gpu_and_matches_cpu_text() {
-        use crate::ggml_runtime::{RequestBackendPreference, install_request_backend_override};
+        use crate::ggml_runtime::{RequestBackendPreference, ResolvedFamilyRuntimeInput};
 
         let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tmp/xasr-test/out/xasr-zh-en-onnx-q8_0.oasr");
@@ -283,33 +283,45 @@ mod tests {
         let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
         let metadata = read_gguf_metadata(&pack).expect("metadata");
 
-        // The encoder gate keys off the request override: CpuOnly/absent must
-        // build a CPU config, Accelerated must keep the GPU-class backend.
+        // The encoder gate keys off the explicit request preference: CpuOnly
+        // must resolve a CPU config, Accelerated must keep the GPU-class
+        // backend.
+        let policy = crate::arch::family_auto_gpu_policy_for_model_architecture(
+            crate::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+        );
         let (cpu_text, cpu_elapsed) = {
-            let _guard = install_request_backend_override(Some(RequestBackendPreference::CpuOnly));
+            let resolved = ResolvedFamilyRuntimeInput::resolve(
+                Some(RequestBackendPreference::CpuOnly),
+                policy,
+            )
+            .backend();
             assert_eq!(
-                super::super::graph_config::xasr_zipformer_encoder_graph_config().backend,
+                super::super::graph_config::xasr_zipformer_encoder_graph_config(resolved).backend,
                 crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
             );
             let started = std::time::Instant::now();
-            let text = transcribe_xasr_zipformer_pcm(&reader, &metadata, &samples, None, false)
-                .expect("cpu xasr")
-                .text;
+            let text =
+                transcribe_xasr_zipformer_pcm(&reader, &metadata, &samples, None, false, resolved)
+                    .expect("cpu xasr")
+                    .text;
             (text, started.elapsed())
         };
 
         let (gpu_text, gpu_elapsed) = {
-            let _guard =
-                install_request_backend_override(Some(RequestBackendPreference::Accelerated));
-            let backend = super::super::graph_config::xasr_zipformer_encoder_graph_config().backend;
+            let resolved = ResolvedFamilyRuntimeInput::resolve(
+                Some(RequestBackendPreference::Accelerated),
+                policy,
+            )
+            .backend();
             assert!(
-                backend.is_gpu_class(),
-                "accelerated request must keep the GPU-class backend, got {backend:?}"
+                resolved.is_gpu_class(),
+                "accelerated request must keep the GPU-class backend, got {resolved:?}"
             );
             let started = std::time::Instant::now();
-            let text = transcribe_xasr_zipformer_pcm(&reader, &metadata, &samples, None, false)
-                .expect("gpu xasr")
-                .text;
+            let text =
+                transcribe_xasr_zipformer_pcm(&reader, &metadata, &samples, None, false, resolved)
+                    .expect("gpu xasr")
+                    .text;
             (text, started.elapsed())
         };
 
@@ -341,9 +353,22 @@ mod tests {
         .expect("sample wav should load");
         let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
         let metadata = read_gguf_metadata(&pack).expect("metadata");
-        let batch = transcribe_xasr_zipformer_pcm(&reader, &metadata, &samples, None, false)
-            .expect("batch xasr")
-            .text;
+        let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+            ),
+        );
+        let batch = transcribe_xasr_zipformer_pcm(
+            &reader,
+            &metadata,
+            &samples,
+            None,
+            false,
+            resolved_runtime.backend(),
+        )
+        .expect("batch xasr")
+        .text;
         let request = GgmlAsrStreamingSessionRequest {
             runtime_source_path: pack,
             runtime_source_preflight: None,
@@ -351,6 +376,7 @@ mod tests {
             request_options: crate::GgmlAsrExecutionOptions::default(),
             configured_diarize: false,
             backend_preference: crate::GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime,
             session_context: crate::NativeAsrSessionContext::new("rt_xasr_streaming_match"),
             session_config: crate::NativeAsrStreamingSessionConfig::new()
                 .with_partial_results(true)
@@ -360,8 +386,11 @@ mod tests {
             &request,
             crate::arch::XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID,
             crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
-            super::super::runtime::checkout_prepared_runtime(&request.runtime_source_path)
-                .expect("streaming runtime"),
+            super::super::runtime::checkout_prepared_runtime(
+                &request.runtime_source_path,
+                resolved_runtime.backend(),
+            )
+            .expect("streaming runtime"),
         );
         let mut streaming = String::new();
         for chunk in samples.chunks(320) {
@@ -409,6 +438,10 @@ mod tests {
             request_options: crate::GgmlAsrExecutionOptions::default(),
             configured_diarize: false,
             backend_preference: crate::GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                (crate::GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
             session_context: crate::NativeAsrSessionContext::new("rt_xasr_streaming_warmup"),
             session_config: crate::NativeAsrStreamingSessionConfig::new()
                 .with_partial_results(true)
@@ -427,9 +460,11 @@ mod tests {
         }
         let mut request = xasr_streaming_request();
         request.runtime_source_path = pack;
-        let runtime =
-            super::super::runtime::checkout_prepared_runtime(&request.runtime_source_path)
-                .expect("streaming runtime");
+        let runtime = super::super::runtime::checkout_prepared_runtime(
+            &request.runtime_source_path,
+            request.resolved_runtime.backend(),
+        )
+        .expect("streaming runtime");
         let mut decoder = XasrIncrementalDecoder::new(
             &request,
             crate::arch::XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID,
@@ -507,9 +542,11 @@ mod tests {
         request.runtime_source_path = pack;
 
         let transcribe = |warm_up: bool| -> String {
-            let runtime =
-                super::super::runtime::checkout_prepared_runtime(&request.runtime_source_path)
-                    .expect("streaming runtime");
+            let runtime = super::super::runtime::checkout_prepared_runtime(
+                &request.runtime_source_path,
+                request.resolved_runtime.backend(),
+            )
+            .expect("streaming runtime");
             let mut decoder = XasrIncrementalDecoder::new(
                 &request,
                 crate::arch::XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID,

@@ -25,14 +25,11 @@ pub use backend::{
 pub(crate) use backend::{
     accelerated_device_rank, ensure_backends_loaded, preferred_accelerated_device,
 };
-#[cfg(test)]
-pub(crate) use cpu_graph::install_resolved_family_runtime_input_for_test;
 pub use cpu_graph::{
     AutoGpuPolicy, GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, RequestBackendOverrideGuard,
-    RequestBackendPreference, ResolvedFamilyRuntimeInput, ResolvedFamilyRuntimeInputGuard,
-    install_request_backend_override, install_resolved_family_runtime_input,
-    request_backend_override, resolve_request_execution_route, resolved_family_runtime_input,
+    RequestBackendPreference, ResolvedFamilyRuntimeInput, install_request_backend_override,
+    request_backend_override, resolve_request_execution_route,
 };
 pub(crate) use cpu_graph::{
     GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,

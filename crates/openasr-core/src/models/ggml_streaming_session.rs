@@ -708,6 +708,10 @@ mod tests {
             request_options: GgmlAsrExecutionOptions::default(),
             configured_diarize: false,
             backend_preference: GgmlAsrBackendPreference::Auto,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                (GgmlAsrBackendPreference::Auto).request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
             session_context: crate::NativeAsrSessionContext::new("rt_ggml_transcript_session"),
             session_config: crate::NativeAsrStreamingSessionConfig::new()
                 .with_partial_results(partial_results)

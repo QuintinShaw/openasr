@@ -611,8 +611,10 @@ pub(crate) mod source_tree_audit {
                 _request: &GgmlAsrExecutionRequest,
             ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
                 // Proves the resolved-input channel is populated without
-                // this executor ever calling a backend resolver itself.
-                let _backend = crate::ggml_runtime::resolved_family_runtime_input().backend();
+                // this executor ever calling a backend resolver itself: it
+                // reads the request's own required field, filled in by
+                // whoever built the request.
+                let _backend = _request.resolved_runtime.backend();
                 Ok(GgmlAsrExecutionResult {
                     transcription: crate::Transcription {
                         text: "ok".to_string(),
@@ -634,6 +636,10 @@ pub(crate) mod source_tree_audit {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::Auto,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                (GgmlAsrBackendPreference::Auto).request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
             execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
                 "test fixture",
             )),

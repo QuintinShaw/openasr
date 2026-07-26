@@ -1197,23 +1197,32 @@ fn run_native_transcription_impl(
     // mechanisms mutually exclusive (no future double-apply).
     request_options.diarize = request.diarize && model_self_diarizes;
     let backend_preference = execution_target_backend_preference(request.execution_target)?;
-    // Installed for the whole transcribe call: the longform policy probes and
-    // the provenance backend label below resolve through
-    // resolve_runtime_backend(), which consults this override.
+    // Installed for the whole transcribe call: not consulted by the
+    // provenance label or the longform multichunk-metal probe below (those
+    // resolve from the explicit `backend_preference` value directly, via
+    // `resolved_runtime_for_request` a few lines down), but still the
+    // pre-existing, unrelated per-request-override channel some family
+    // internals legitimately read mid-decode (e.g. firered_llm's RAM-fit
+    // override check, `graph_runtime_config`'s `gpu_stage_enabled_for_backend`).
     let _backend_guard =
         install_request_backend_override(backend_preference.request_backend_override());
     // This family's Auto-mode GPU capability, so the provenance backend label
     // below resolves through the same family-aware gate the family's own
-    // executor used (see `native_runtime_backend_label`'s doc comment).
+    // executor used.
     let auto_gpu_policy = crate::arch::family_auto_gpu_policy_for_model_architecture(
         selected_family.model_architecture,
     );
-    // Resolved once for the whole call: everything below (the longform
-    // multichunk-metal probe, the provenance label, and eventually the
-    // family executor via `GgmlAsrExecutionDispatch::execute`) reads this
-    // single value instead of each independently re-deriving it.
-    let _resolved_family_guard =
-        crate::ggml_runtime::install_resolved_family_runtime_input(auto_gpu_policy);
+    // Resolved once here, from the explicit `backend_preference` value above
+    // (never a thread-local read), for everything in this function that
+    // needs it before dispatch runs: the longform multichunk-metal probe and
+    // the provenance label. `run_dispatch_once` below resolves its own copy
+    // the same way, from its own (possibly GPU-fallback-adjusted)
+    // `backend_preference` parameter -- see its doc comment for why this
+    // can't just be threaded down as the same precomputed value.
+    let resolved_runtime_for_request = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+        backend_preference.request_backend_override(),
+        auto_gpu_policy,
+    );
     // Per-request diagnostics line (source/model/quant/backend/audio shape) --
     // logged once here, after model resolution and audio prep have both
     // succeeded and the backend label is resolvable, and before decode
@@ -1224,7 +1233,7 @@ fn run_native_transcription_impl(
         request.source,
         requested_model_id,
         &quant_tag_for_log(requested_model_id, runtime_source.path()),
-        native_runtime_backend_label(auto_gpu_policy),
+        native_runtime_backend_label(resolved_runtime_for_request.backend()),
         audio_duration_seconds,
         request.source_container.as_deref(),
         request.source_sample_rate_hz,
@@ -1254,7 +1263,7 @@ fn run_native_transcription_impl(
         let multichunk_on_metal = arch_prefers_cpu_decoder
             && plan_stats.chunk_count > 1
             && matches!(
-                crate::ggml_runtime::resolved_family_runtime_input().backend(),
+                resolved_runtime_for_request.backend(),
                 GgmlCpuGraphBackend::Metal
             );
         if multichunk_on_metal {
@@ -1284,7 +1293,7 @@ fn run_native_transcription_impl(
                     slice_kind_summary,
                     timeline_kind,
                     &longform_provenance,
-                    auto_gpu_policy,
+                    resolved_runtime_for_request.backend(),
                 )),
                 language: reported_language.clone(),
             });
@@ -1497,7 +1506,7 @@ fn run_native_transcription_impl(
                 slice_kind_summary,
                 timeline_kind,
                 &longform_provenance,
-                auto_gpu_policy,
+                resolved_runtime_for_request.backend(),
             );
             if !ran_any_slice && suppressed_slice_count > 0 {
                 let fallback_options = request_options.clone();
@@ -1536,7 +1545,7 @@ fn run_native_transcription_impl(
             slice_kind_summary,
             timeline_kind,
             &longform_provenance,
-            auto_gpu_policy,
+            resolved_runtime_for_request.backend(),
         ));
     }
 
@@ -2247,6 +2256,14 @@ fn is_cooperative_cancel_reason(reason: &str) -> bool {
         || reason.contains("aborted by cancel request")
 }
 
+/// Resolves its own [`crate::ggml_runtime::ResolvedFamilyRuntimeInput`] from
+/// `backend_preference`/`selected_family` rather than accepting one as a
+/// parameter: the GPU-allocation-failure fallback
+/// (`run_dispatch_once_with_progress_and_gpu_fallback`) retries a slice with
+/// a *different* `backend_preference` (forced `CpuOnly`), so a value
+/// precomputed once at the top of `transcribe_native` would be stale for
+/// that retry -- recomputing here from the parameter actually in effect for
+/// this attempt is what makes each attempt's resolved backend correct.
 fn run_dispatch_once(
     dispatch: &GgmlAsrExecutionDispatch,
     runtime_preflight: &GgmlAsrRuntimeSourcePreflight,
@@ -2256,6 +2273,12 @@ fn run_dispatch_once(
     backend_preference: GgmlAsrBackendPreference,
     execution_context: &Arc<crate::RequestExecutionContext>,
 ) -> Result<GgmlAsrExecutionResult, BackendError> {
+    let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+        backend_preference.request_backend_override(),
+        crate::arch::family_auto_gpu_policy_for_model_architecture(
+            selected_family.model_architecture,
+        ),
+    );
     let execution_request = GgmlAsrExecutionRequest {
         runtime_source_path: runtime_preflight.runtime_source.path().to_path_buf(),
         runtime_source_preflight: Some(runtime_preflight.clone()),
@@ -2263,6 +2286,7 @@ fn run_dispatch_once(
         prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
         request_options,
         backend_preference,
+        resolved_runtime,
         execution_context: Arc::clone(execution_context),
     };
     let _thread_override = install_request_inference_threads_override(
@@ -2338,7 +2362,7 @@ fn build_longform_metadata(
     slice_kind_summary: &'static str,
     timeline_kind: &'static str,
     extra_provenance: &[String],
-    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
+    resolved_backend: GgmlCpuGraphBackend,
 ) -> TranscriptionLongFormMetadata {
     let mode = match options.mode {
         LongFormMode::Off => "off",
@@ -2353,7 +2377,7 @@ fn build_longform_metadata(
         format!("core.longform.timeline:{timeline_kind}"),
         format!(
             "core.native.backend:{}",
-            native_runtime_backend_label(auto_gpu_policy)
+            native_runtime_backend_label(resolved_backend)
         ),
         "core.longform.assembler".to_string(),
         "core.native.ggml".to_string(),
@@ -2540,22 +2564,16 @@ fn prefers_cpu_decoder_for_multichunk_metal(model_architecture: &str) -> bool {
         .is_some_and(|descriptor| descriptor.prefer_cpu_decoder_for_multichunk_metal)
 }
 
-/// The `core.native.backend` provenance label always resolves through the
-/// same family-aware gate the family's own executor used
-/// (`GgmlCpuGraphConfig::resolve_family_runtime_backend`), keyed by this
-/// family's `auto_gpu_policy` capability declaration. It must never call
-/// `GgmlCpuGraphConfig::resolve_runtime_backend()` directly for this purpose:
-/// that generic resolver reports what Auto would pick for a family with no
-/// gate, which drifts from reality for any family whose policy pins (or
-/// platform-scopes) Auto away from a backend -- exactly the bug that
-/// produced a `core.native.backend:metal` label on a dolphin Auto request
-/// that in fact ran entirely on CPU (before dolphin's own gate flipped to
-/// GPU-enabled).
-fn native_runtime_backend_label(
-    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
-) -> &'static str {
-    let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input(auto_gpu_policy);
-    match crate::ggml_runtime::resolved_family_runtime_input().backend() {
+/// The `core.native.backend` provenance label. Callers must pass the
+/// family-resolved backend (`ResolvedFamilyRuntimeInput::resolve`, keyed by
+/// this family's `auto_gpu_policy` capability declaration) -- never the
+/// generic ungated resolution, which drifts from reality for any family
+/// whose policy pins (or platform-scopes) Auto away from a backend, exactly
+/// the bug that produced a `core.native.backend:metal` label on a dolphin
+/// Auto request that in fact ran entirely on CPU (before dolphin's own gate
+/// flipped to GPU-enabled).
+fn native_runtime_backend_label(backend: GgmlCpuGraphBackend) -> &'static str {
+    match backend {
         GgmlCpuGraphBackend::Cpu => "cpu",
         GgmlCpuGraphBackend::Metal => "metal",
         GgmlCpuGraphBackend::Gpu => "gpu",
@@ -2647,12 +2665,28 @@ mod tests {
     #[test]
     fn native_runtime_backend_label_reflects_family_auto_gate_not_generic_resolver() {
         use crate::ggml_runtime::{
-            AutoGpuPolicy, RequestBackendPreference, install_request_backend_override,
+            AutoGpuPolicy, RequestBackendPreference, ResolvedFamilyRuntimeInput,
+            install_request_backend_override, request_backend_override,
+        };
+
+        // `native_runtime_backend_label` itself takes an already-resolved
+        // backend (per contract 4: resolution happens once, in
+        // `ResolvedFamilyRuntimeInput::resolve`, not inside the label
+        // formatter). This helper reproduces exactly that resolution step
+        // from the still-live `request_backend_override()` TLS (the
+        // pre-existing, unrelated per-request-override mechanism this test
+        // exercises via `install_request_backend_override` below) plus a
+        // family's `AutoGpuPolicy` gate, mirroring what the real call site
+        // in `transcribe_native` does.
+        let label_for = |policy: AutoGpuPolicy| {
+            native_runtime_backend_label(
+                ResolvedFamilyRuntimeInput::resolve(request_backend_override(), policy).backend(),
+            )
         };
 
         // Auto, family gate fully disabled (`Never` shape): must report
         // "cpu" regardless of what the generic resolver would pick.
-        assert_eq!(native_runtime_backend_label(AutoGpuPolicy::Never), "cpu");
+        assert_eq!(label_for(AutoGpuPolicy::Never), "cpu");
 
         // Auto, family gate enabled (`AllBackends` shape, every builtin
         // family but the three `ExceptMetal` ones): reports exactly what the
@@ -2662,15 +2696,12 @@ mod tests {
             GgmlCpuGraphBackend::Metal => "metal",
             GgmlCpuGraphBackend::Gpu => "gpu",
         };
-        assert_eq!(
-            native_runtime_backend_label(AutoGpuPolicy::AllBackends),
-            generic_auto_label
-        );
+        assert_eq!(label_for(AutoGpuPolicy::AllBackends), generic_auto_label);
 
         // `ExceptMetal`: reports "cpu" if and only if the generic resolver
         // would have picked Metal specifically; never touches a resolved
         // Cpu or generic Gpu (CUDA/HIP/Vulkan) pick.
-        let except_metal_label = native_runtime_backend_label(AutoGpuPolicy::ExceptMetal);
+        let except_metal_label = label_for(AutoGpuPolicy::ExceptMetal);
         if generic_auto_label == "metal" {
             assert_eq!(except_metal_label, "cpu");
         } else {
@@ -2683,16 +2714,10 @@ mod tests {
         {
             let _guard =
                 install_request_backend_override(Some(RequestBackendPreference::Accelerated));
-            let label = native_runtime_backend_label(AutoGpuPolicy::Never);
+            let label = label_for(AutoGpuPolicy::Never);
             assert!(label == "metal" || label == "gpu", "got {label}");
-            assert_eq!(
-                label,
-                native_runtime_backend_label(AutoGpuPolicy::AllBackends)
-            );
-            assert_eq!(
-                label,
-                native_runtime_backend_label(AutoGpuPolicy::ExceptMetal)
-            );
+            assert_eq!(label, label_for(AutoGpuPolicy::AllBackends));
+            assert_eq!(label, label_for(AutoGpuPolicy::ExceptMetal));
         }
     }
 

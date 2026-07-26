@@ -108,18 +108,15 @@ pub fn external_test_fixture_path(
 
 #[cfg(test)]
 pub(crate) fn with_forced_cpu_backend_for_test<T>(run: impl FnOnce() -> T) -> T {
+    // Tests using this helper call a family's `execute()` directly, bypassing
+    // `GgmlAsrExecutionDispatch::execute`. They build their own request with
+    // an explicit `resolved_runtime` field, so this helper only needs to
+    // force the env-based fallback that `ResolvedFamilyRuntimeInput::resolve`
+    // consults when a request is built (inside `run`) with a `None`
+    // preference -- it does not install anything into shared/global state.
     crate::test_process_env::with_test_process_env(
         [("OPENASR_GGML_BACKEND", Some("cpu".into()))],
-        || {
-            // Tests using this helper call a family's `execute()` directly,
-            // bypassing `GgmlAsrExecutionDispatch::execute`, so the resolved
-            // input family graph-config code now reads must be installed
-            // here explicitly.
-            let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input_for_test(
-                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-            );
-            run()
-        },
+        run,
     )
 }
 

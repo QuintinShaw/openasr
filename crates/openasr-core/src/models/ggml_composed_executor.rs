@@ -125,6 +125,10 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
             execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
                 "test fixture",
             )),

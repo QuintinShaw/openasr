@@ -4,7 +4,7 @@ use std::time::Instant;
 use thiserror::Error;
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
     GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, env_var_truthy,
 };
 use crate::nn::conv::{
@@ -188,8 +188,8 @@ pub(crate) struct Qwen3AsrAudioEncoderRuntime {
 /// from 256 MB to <1 MB without touching the graph the encoder builds. The
 /// `.max()` keeps the default floor and any larger override intact, mirroring
 /// `xasr_zipformer_encoder_graph_config_with_overrides`.
-fn qwen_audio_encoder_runtime_graph_config() -> GgmlCpuGraphConfig {
-    let mut config = qwen_encoder_graph_config();
+fn qwen_audio_encoder_runtime_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+    let mut config = qwen_encoder_graph_config(backend);
     config.graph_size = config.graph_size.max(QWEN3_AUDIO_ENCODER_GRAPH_SIZE);
     config.context_bytes = config
         .context_bytes
@@ -200,10 +200,13 @@ fn qwen_audio_encoder_runtime_graph_config() -> GgmlCpuGraphConfig {
 }
 
 impl Qwen3AsrAudioEncoderRuntime {
-    pub(crate) fn new(runtime_path: Option<&Path>) -> Result<Self, Qwen3AsrAudioEncoderError> {
+    pub(crate) fn new(
+        runtime_path: Option<&Path>,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, Qwen3AsrAudioEncoderError> {
         // See `qwen_audio_encoder_runtime_graph_config` for the `EncoderPrelude`
         // threading tier and the right-sized metadata-context rationale.
-        let config = qwen_audio_encoder_runtime_graph_config();
+        let config = qwen_audio_encoder_runtime_graph_config(backend);
         let runner = GgmlCpuGraphRunner::new(config).map_err(|source| {
             Qwen3AsrAudioEncoderError::GraphBuildFailed {
                 step: "runner_init",
@@ -1403,10 +1406,7 @@ mod tests {
     /// (thread-independent), so it is stable against parallel-test env mutation.
     #[test]
     fn encoder_graph_context_is_right_sized_not_flat_256mb() {
-        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input_for_test(
-            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-        );
-        let config = qwen_audio_encoder_runtime_graph_config();
+        let config = qwen_audio_encoder_runtime_graph_config(GgmlCpuGraphBackend::Cpu);
 
         // Covers the worst-case forward graph (node budget + the metadata its
         // tensors need)...
@@ -1525,7 +1525,9 @@ mod tests {
             data: mel_values,
         };
 
-        let mut runtime = Qwen3AsrAudioEncoderRuntime::new(Some(&pack_path)).expect("runtime");
+        let mut runtime =
+            Qwen3AsrAudioEncoderRuntime::new(Some(&pack_path), GgmlCpuGraphBackend::Cpu)
+                .expect("runtime");
         let output = runtime
             .encode(&weights, metadata, &mel_features)
             .expect("encode");
@@ -1623,7 +1625,9 @@ mod tests {
             data,
         };
 
-        let mut runtime = Qwen3AsrAudioEncoderRuntime::new(Some(&pack_path)).expect("runtime");
+        let mut runtime =
+            Qwen3AsrAudioEncoderRuntime::new(Some(&pack_path), GgmlCpuGraphBackend::Cpu)
+                .expect("runtime");
         let output = runtime
             .encode(&weights, metadata, &mel_features)
             .expect("encode near the chunk cap");

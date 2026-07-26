@@ -233,6 +233,7 @@ impl Hymt2RuntimeSession {
         runtime_source_path: &Path,
         metadata: Hymt2ExecutionMetadata,
         fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, GgmlCpuGraphError> {
         let whole_decoder =
             Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
@@ -240,6 +241,7 @@ impl Hymt2RuntimeSession {
                 Some(runtime_source_path),
                 metadata.rms_norm_epsilon,
                 fused_logits_head,
+                backend,
             )?;
         Ok(Self {
             whole_decoder,
@@ -315,11 +317,18 @@ impl Hymt2Runtime {
                     reason: error.to_string(),
                 },
             )?;
+        // hymt2 is not (yet) wired into the shared `GgmlAsrExecutionRequest`
+        // dispatch, so there is no upstream resolved backend to inherit here
+        // -- resolve fresh, exactly like the main request-construction sites
+        // do (this family's own architecture is not registered, so this
+        // simply follows the generic runtime default).
+        let backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
         let logits_head = load_qwen3_llm_logits_head_from_reader_with_output_tensor(
             &reader,
             qwen_metadata,
             TOKEN_EMBD_WEIGHT,
             hymt2_metadata.rms_norm_epsilon,
+            backend,
         )
         .map_err(|error| Hymt2RuntimeError::WeightMaterialization {
             reason: error.to_string(),
@@ -346,6 +355,7 @@ impl Hymt2Runtime {
             runtime_source.path(),
             hymt2_metadata,
             logits_head.fused_top1_spec(),
+            backend,
         )
         .map_err(|source| Hymt2RuntimeError::Graph { source })?;
         if hymt2_profile_enabled() {

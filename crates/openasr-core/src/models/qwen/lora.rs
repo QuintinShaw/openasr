@@ -153,19 +153,14 @@ mod tests {
                 ..Default::default()
             },
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                GgmlAsrBackendPreference::CpuOnly.request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
             execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
                 "test fixture",
             )),
         };
-        // Bypasses the dispatch, so the request-level backend preference and
-        // the resolved input `decode_with_runtime_assets` requires must both
-        // be installed here (dispatch normally does both).
-        let _backend_guard = crate::ggml_runtime::install_request_backend_override(
-            request.backend_preference.request_backend_override(),
-        );
-        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input(
-            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-        );
         match executor.execute(&request) {
             Ok(result) => Ok(result.transcription.text.trim().to_string()),
             Err(GgmlAsrExecutionError::ExecutorFailed { reason, .. })
@@ -331,19 +326,14 @@ mod tests {
                 ..Default::default()
             },
             backend_preference: backend,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                backend.request_backend_override(),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
             execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
                 "test fixture",
             )),
         };
-        // Bypasses the dispatch, so the request-level backend preference and
-        // the resolved input `decode_with_runtime_assets` requires must both
-        // be installed here (dispatch normally does both).
-        let _backend_guard = crate::ggml_runtime::install_request_backend_override(
-            request.backend_preference.request_backend_override(),
-        );
-        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input(
-            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-        );
         match executor.execute(&request) {
             Ok(result) => Ok(result.transcription.text.trim().to_string()),
             Err(GgmlAsrExecutionError::ExecutorFailed { reason, .. })

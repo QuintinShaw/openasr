@@ -310,6 +310,7 @@ pub(crate) struct Qwen3ForcedAlignerPreparedAssets {
 
 pub(crate) fn load_forced_aligner_prepared_assets(
     pack_path: &std::path::Path,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<Qwen3ForcedAlignerPreparedAssets, Qwen3ForcedAlignerRuntimeError> {
     let gguf_metadata = crate::ggml_runtime::read_gguf_metadata(pack_path).map_err(|error| {
         Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
@@ -345,6 +346,7 @@ pub(crate) fn load_forced_aligner_prepared_assets(
         classify_metadata,
         OUTPUT_WEIGHT,
         DEFAULT_RMS_NORM_EPSILON,
+        backend,
     )?;
     let layer_attention_projections =
         load_qwen3_llm_attention_projections_from_reader(&reader, embedding_metadata)?;
@@ -371,6 +373,7 @@ pub(crate) fn align_forced(
     audio_samples_16khz_mono: &[f32],
     text: &str,
     language: &str,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
     let word_list = word_list_for_language(text, language)?;
 
@@ -380,11 +383,12 @@ pub(crate) fn align_forced(
     let prepared_audio = GgmlAsrPreparedAudio::mono_16khz(audio_samples_16khz_mono.to_vec());
     let mel_features = qwen3_mel_features_from_prepared_audio(&prepared_audio, &mel_plan)?;
 
-    let mut audio_runtime = Qwen3AsrAudioEncoderRuntime::new(Some(pack_path)).map_err(|error| {
-        Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
-            reason: format!("audio encoder runtime init failed: {error}"),
-        }
-    })?;
+    let mut audio_runtime =
+        Qwen3AsrAudioEncoderRuntime::new(Some(pack_path), backend).map_err(|error| {
+            Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+                reason: format!("audio encoder runtime init failed: {error}"),
+            }
+        })?;
     let audio_embeddings = audio_runtime
         .encode(
             &assets.audio_encoder_weights,
@@ -415,6 +419,7 @@ pub(crate) fn align_forced(
     let mut whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
         &assets.layer_attention_projections,
         Some(pack_path),
+        backend,
     )
     .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
         reason: error.to_string(),
@@ -489,8 +494,27 @@ pub(crate) fn refine_word_timestamps_with_forced_aligner(
     text: &str,
     language: &str,
 ) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
-    let assets = load_forced_aligner_prepared_assets(pack_path)?;
-    align_forced(pack_path, &assets, audio_samples_16khz_mono, text, language)
+    // This tier runs its own one-shot decode against a separate,
+    // independently-resolved pack (not the main transcription request's
+    // runtime_source), so there is no upstream `resolved_runtime` to inherit
+    // -- resolve fresh here, through this family's own (`AllBackends`)
+    // policy, exactly like the main request-construction sites do.
+    let backend = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+        None,
+        crate::arch::family_auto_gpu_policy_for_model_architecture(
+            crate::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+        ),
+    )
+    .backend();
+    let assets = load_forced_aligner_prepared_assets(pack_path, backend)?;
+    align_forced(
+        pack_path,
+        &assets,
+        audio_samples_16khz_mono,
+        text,
+        language,
+        backend,
+    )
 }
 
 #[cfg(test)]
@@ -557,7 +581,11 @@ mod tests {
         convert_local_qwen_forced_aligner_source_to_runtime_pack(&request)
             .expect("forced-aligner conversion must succeed");
 
-        let assets = load_forced_aligner_prepared_assets(&pack_path).expect("prepared assets");
+        let assets = load_forced_aligner_prepared_assets(
+            &pack_path,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        )
+        .expect("prepared assets");
 
         let reference_json: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&reference_output_path).expect("read reference_output.json"),
@@ -594,8 +622,15 @@ mod tests {
             )
             .expect("load wav");
 
-            let items = align_forced(&pack_path, &assets, &samples, case.text, case.language)
-                .expect("align_forced");
+            let items = align_forced(
+                &pack_path,
+                &assets,
+                &samples,
+                case.text,
+                case.language,
+                crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            )
+            .expect("align_forced");
 
             let reference_items = reference_json[case.key]["items"]
                 .as_array()

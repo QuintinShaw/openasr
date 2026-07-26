@@ -116,6 +116,7 @@ impl MossTdDecoderRuntime {
     pub(crate) fn new(
         runtime_path: &std::path::Path,
         metadata: MossTdDecoderMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MossTdDecoderError> {
         let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(runtime_path)
             .map_err(map_tensor_read_error)?;
@@ -130,6 +131,7 @@ impl MossTdDecoderRuntime {
             // pack (see `package_import`).
             LLM_TOKEN_EMBD_WEIGHT,
             MOSS_TD_RMS_NORM_EPSILON,
+            backend,
         )
         .map_err(|error| MossTdDecoderError::LogitsHeadFailed {
             reason: error.to_string(),
@@ -153,6 +155,7 @@ impl MossTdDecoderRuntime {
                 Some(runtime_path),
                 MOSS_TD_RMS_NORM_EPSILON,
                 logits_head.fused_top1_spec(),
+                backend,
             )
             .map_err(|error| MossTdDecoderError::GraphFailed {
                 reason: error.to_string(),

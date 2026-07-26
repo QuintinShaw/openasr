@@ -183,8 +183,11 @@ impl Drop for PooledRuntime {
     }
 }
 
-pub(super) fn checkout_prepared_runtime(pack_path: &Path) -> Result<PooledRuntime, String> {
-    let backend = xasr_zipformer_encoder_graph_config().backend;
+pub(super) fn checkout_prepared_runtime(
+    pack_path: &Path,
+    resolved_backend: GgmlCpuGraphBackend,
+) -> Result<PooledRuntime, String> {
+    let backend = xasr_zipformer_encoder_graph_config(resolved_backend).backend;
     let key = (runtime_cache_path_identity(pack_path), backend);
     if let Some(runtime) = runtime_pool()
         .lock()
@@ -198,7 +201,7 @@ pub(super) fn checkout_prepared_runtime(pack_path: &Path) -> Result<PooledRuntim
         });
     }
 
-    let runtime = XasrZipformerPreparedRuntime::load(pack_path)?;
+    let runtime = XasrZipformerPreparedRuntime::load(pack_path, resolved_backend)?;
     Ok(PooledRuntime {
         key,
         runtime: Some(SendableRuntime(runtime)),
@@ -227,12 +230,12 @@ pub(super) fn clear_idle_runtime_pool() {
 }
 
 impl XasrZipformerPreparedRuntime {
-    pub(super) fn load(pack_path: &Path) -> Result<Self, String> {
+    pub(super) fn load(pack_path: &Path, backend: GgmlCpuGraphBackend) -> Result<Self, String> {
         let profile = xasr_profile_start();
         let reader = GgufTensorDataReader::from_path(pack_path).map_err(|e| e.to_string())?;
         let gguf_metadata =
             crate::ggml_runtime::read_gguf_metadata(pack_path).map_err(|e| e.to_string())?;
-        let runtime = Self::from_reader_metadata(&reader, &gguf_metadata)?;
+        let runtime = Self::from_reader_metadata(&reader, &gguf_metadata, backend)?;
         xasr_profile_log(
             "runtime_load",
             profile,
@@ -244,6 +247,7 @@ impl XasrZipformerPreparedRuntime {
     pub(super) fn from_reader_metadata(
         reader: &GgufTensorDataReader,
         gguf_metadata: &GgufMetadata,
+        backend: GgmlCpuGraphBackend,
     ) -> Result<Self, String> {
         let metadata =
             parse_xasr_zipformer_execution_metadata(gguf_metadata).map_err(|e| e.to_string())?;
@@ -257,7 +261,7 @@ impl XasrZipformerPreparedRuntime {
         let encoder = XasrZipformerEncoderGraph::new_ggml_cpu_full_encoder(
             metadata.clone(),
             encoder_weights,
-            xasr_zipformer_encoder_graph_config(),
+            xasr_zipformer_encoder_graph_config(backend),
         )
         .map_err(|e| e.to_string())?;
         Ok(Self {
@@ -617,9 +621,10 @@ mod tests {
             return;
         };
 
+        let resolved_backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
         let key = (
             runtime_cache_path_identity(&pack),
-            xasr_zipformer_encoder_graph_config().backend,
+            xasr_zipformer_encoder_graph_config(resolved_backend).backend,
         );
 
         // Start from a known-empty pool for this key so pre-existing state
@@ -634,7 +639,8 @@ mod tests {
             );
         }
 
-        let runtime = checkout_prepared_runtime(&pack).expect("first checkout must build");
+        let runtime =
+            checkout_prepared_runtime(&pack, resolved_backend).expect("first checkout must build");
         drop(runtime);
         {
             let pool = runtime_pool().lock().expect("runtime pool lock poisoned");
@@ -660,8 +666,8 @@ mod tests {
         // (now-empty) pool and build fresh, exactly like a cold start -- and
         // the rebuilt runtime must still be fully functional, not some
         // half-initialized leftover.
-        let mut rebuilt =
-            checkout_prepared_runtime(&pack).expect("checkout after clear must rebuild");
+        let mut rebuilt = checkout_prepared_runtime(&pack, resolved_backend)
+            .expect("checkout after clear must rebuild");
         let samples = (0..16_000)
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin() * 0.05)
             .collect::<Vec<_>>();

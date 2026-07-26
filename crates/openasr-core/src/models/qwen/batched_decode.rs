@@ -253,7 +253,10 @@ impl Qwen3AsrServeBatchConfig {
             });
         }
         let backend = job.backend;
-        if !reusable_decode_graph_supported(backend, qwen_runtime_graph_config().use_scheduler) {
+        if !reusable_decode_graph_supported(
+            backend,
+            qwen_runtime_graph_config(backend).use_scheduler,
+        ) {
             return Err(Qwen3AsrServeBatchError::UnsupportedBackend { backend });
         }
         let max_batch = serve_batch_vram_capped_max_batch(
@@ -1435,6 +1438,7 @@ impl Qwen3AsrOwnerThreadState {
                 Qwen3AsrLlmWholeDecoderGraphExecutor::new(
                     slot.job.layer_attention_projections.as_slice(),
                     Some(slot.job.runtime_source_path.as_path()),
+                    slot.job.backend,
                 )
                 .map_err(|error| Qwen3AsrServeBatchError::OwnerFailed {
                     reason: format!("qwen whole-decoder init failed: {error}"),
@@ -2231,8 +2235,12 @@ mod tests {
             GgufTensorDataReader::from_path(runtime_source.path()).expect("qwen tensor reader");
         let token_embedding_table = load_qwen3_token_embedding_table_from_reader(&reader, metadata)
             .expect("qwen token embeddings");
-        let logits_head =
-            load_qwen3_llm_logits_head_from_reader(&reader, metadata).expect("qwen logits head");
+        let logits_head = load_qwen3_llm_logits_head_from_reader(
+            &reader,
+            metadata,
+            GgmlCpuGraphConfig::runtime_default().backend,
+        )
+        .expect("qwen logits head");
         let layer_attention_projections = Arc::new(
             load_qwen3_llm_attention_projections_from_reader(&reader, metadata)
                 .expect("qwen llm layers"),
@@ -2346,15 +2354,7 @@ mod tests {
                     Some(OsString::from("0")),
                 ),
             ],
-            || {
-                // Bypasses the dispatch, so the resolved input
-                // `qwen_runtime_graph_config` now requires must be installed
-                // here explicitly.
-                let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input_for_test(
-                    GgmlCpuGraphBackend::Cpu,
-                );
-                run()
-            },
+            run,
         )
     }
 
@@ -2431,13 +2431,15 @@ mod tests {
     }
 
     fn assert_qwen_selected_backend_direct_for_real_pack_harness() {
-        // Manual harness: not run through the dispatch, so install the
-        // resolved input `qwen_runtime_graph_config` now requires, using
-        // qwen's own (AllBackends) declared policy.
-        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input(
+        // Manual harness: not run through the dispatch, so resolve the
+        // backend directly here, using qwen's own (AllBackends) declared
+        // policy with no request-level override.
+        let backend = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            None,
             crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-        );
-        let runtime_config = qwen_runtime_graph_config();
+        )
+        .backend();
+        let runtime_config = qwen_runtime_graph_config(backend);
         assert!(
             runtime_config.backend.is_gpu_class() && !runtime_config.use_scheduler,
             "qwen owner rebucket/shrink real-pack harness validates the direct GPU reusable graph, got backend={:?} use_scheduler={}",
@@ -2476,6 +2478,7 @@ mod tests {
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
             Some(fixture.runtime_path.as_path()),
+            GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
         let mut slots = vec![
@@ -2535,6 +2538,7 @@ mod tests {
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
             Some(fixture.runtime_path.as_path()),
+            GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
         let mut slots = vec![
@@ -2581,6 +2585,7 @@ mod tests {
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
             Some(fixture.runtime_path.as_path()),
+            GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
         let mut slots = vec![
@@ -2647,6 +2652,7 @@ mod tests {
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
             Some(fixture.runtime_path.as_path()),
+            GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
         let mut slot =

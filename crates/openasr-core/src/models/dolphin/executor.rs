@@ -607,10 +607,10 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
             }
         }
 
-        // Resolved once by the shared dispatch (via
-        // `install_resolved_family_runtime_input`, using this architecture's
-        // `auto_gpu_policy = AllBackends`) before this executor ran.
-        let backend = crate::ggml_runtime::resolved_family_runtime_input().backend();
+        // Resolved once by whoever built this request (this architecture's
+        // `auto_gpu_policy = AllBackends`), carried as an explicit field --
+        // never re-derived from a thread-local here.
+        let backend = request.resolved_runtime.backend();
         let reader = GgufTensorDataReader::from_runtime_source(&preflight.runtime_source)
             .map_err(|error| fail(format!("dolphin pack tensor reader failed: {error}")))?;
         // Reuse dequantized weights across requests (pool keyed by pack path); the
