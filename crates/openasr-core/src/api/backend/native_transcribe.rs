@@ -2594,9 +2594,23 @@ mod tests {
     // manipulate the real process-global progress statics (that is the point --
     // they are the only way to observe the slot's owner-token behavior end to
     // end), so they must not run concurrently with each other or one test's
-    // writes bleed into another's assertions. `cargo test` / `cargo nextest`
-    // run test functions across threads within one process, so serialize with
-    // a lock rather than relying on scheduling luck.
+    // writes bleed into another's assertions.
+    //
+    // What actually makes them deterministic is the runner: `cargo nextest`
+    // (what CI runs, and the runner AGENTS.md mandates) executes every test in
+    // its own process, so the statics are naturally per-test. This lock only
+    // covers plain `cargo test`, where the whole crate shares one process --
+    // and only partially, because it can serialize this module's tests against
+    // each other but not against every other test in the crate that drives a
+    // decode and publishes into the same slot through its own
+    // `NativeProgressGuard`. Under plain `cargo test` these assertions can
+    // therefore still lose to an unrelated test; run them under nextest, or
+    // filtered to this module, to get a meaningful result.
+    //
+    // The reason any of this is needed is the slot itself: it carries an owner
+    // *generation* but no request identity, so two concurrent transcriptions
+    // cannot be told apart. Once progress is request-scoped end to end, delete
+    // this lock -- there is no shared slot left to serialize.
     static PROGRESS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
