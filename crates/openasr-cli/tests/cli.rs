@@ -872,25 +872,30 @@ fn firered_aed_golden_diff_longform_cli_transcribe_matches_reference_decode() {
 // `whisper` itself -- unlike the other three families' longform goldens, this
 // fixture's assembled transcript shows no chunk-seam artifacts (no duplicated
 // word, no missing inter-token space): each of the three encoder passes ends
-// on a clean sentence boundary for this particular fixture. The family's own
-// `[start][Sxx]text[end]` tagged output (self_diarizes = true) comes through
-// unmodified in the assembled text -- core does not parse or restructure
-// those tags (see the family's module doc comment). Pinned against
-// `OPENASR_GGML_BACKEND=cpu` (this family's Metal path has a known encoder
-// numerics defect, see the arch descriptor's `auto_gpu_policy` doc).
+// on a clean sentence boundary for this particular fixture.
+//
+// This run does not pass `--diarize`, so it pins the Voice-ID-off contract:
+// the family's fixed decode prompt still makes the model write its
+// `[start][Sxx]text[end]` markers, and the transcript that reaches the user
+// carries none of them -- byte-for-byte what a family that cannot separate
+// speakers would have produced (see
+// `models::moss_transcribe_diarize::speaker_segments`). The decoded words
+// themselves are the same tokens the tagged reference decode produced; only
+// the markup is gone, and the per-turn split shows up as the ordinary
+// inter-segment space the longform assembler joins segments with. Pinned
+// against `OPENASR_GGML_BACKEND=cpu` (this family's Metal path has a known
+// encoder numerics defect, see the arch descriptor's `auto_gpu_policy` doc).
 const GOLDEN_MOSS_TRANSCRIBE_DIARIZE_LONGFORM_EN_ZH_TEXT: &str = concat!(
-    "[0.27][S01]And so, my fellow Americans,[2.34][3.21][S01]ask not[4.44][5.31][S01]what your ",
-    "country can do for you,[7.64][8.11][S01]ask what you can do for your country.",
-    "[10.54][10.94][S02]今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的",
-    "川菜馆吃饭，听说那里的麻婆豆腐特别正宗。周末的时候，我通常会读书或者看一部电影放松一下。",
-    "[29.14][29.41][S01]And so, my fellow Americans,[31.54][32.34][S01]ask not",
-    "[33.64][34.44][S01]what your country can do for you,[36.84][37.24][S01]ask what you can ",
+    "And so, my fellow Americans, ask not what your country can do for you, ask what you can ",
+    "do for your country. ",
+    "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的",
+    "川菜馆吃饭，听说那里的麻婆豆腐特别正宗。周末的时候，我通常会读书或者看一部电影放松一下。 ",
+    "And so, my fellow Americans, ask not what your country can do for you, ask what you can ",
+    "do for your country. ",
+    "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的",
+    "川菜馆吃饭，听说那里的麻婆豆腐特别正宗。周末的时候，我通常会读书或者看一部电影放松一下。 ",
+    "And so, my fellow Americans, ask not what your country can do for you, ask what you can ",
     "do for your country.",
-    "[39.74][40.11][S02]今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的",
-    "川菜馆吃饭，听说那里的麻婆豆腐特别正宗。周末的时候，我通常会读书或者看一部电影放松一下。",
-    "[58.34][58.61][S01]And so, my fellow Americans,[60.64][61.54][S01]ask not",
-    "[62.84][63.64][S01]what your country can do for you,[66.04][66.44][S01]ask what you can ",
-    "do for your country.[68.94]",
 );
 
 #[test]

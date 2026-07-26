@@ -1194,7 +1194,7 @@ fn build_whisper_carry_prompt_token_ids_keeps_last_longform_tail() {
         inference_threads: None,
         word_timestamps: false,
         word_timestamps_forced_for_diarization: false,
-        diarize: false,
+        in_decoder_speakers: false,
         longform: Some(crate::LongFormOptions::default()),
         longform_chunk_count_hint: None,
         prefer_cpu_decoder_for_multichunk_metal: false,

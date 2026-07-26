@@ -26,9 +26,6 @@ use crate::models::ggml_family_registry::{
     QWEN3_ASR_GGML_ARCHITECTURE_ID, WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
     WHISPER_GGML_ARCHITECTURE_ID, XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
 };
-use crate::models::oasr_metadata::{
-    OASR_FEATURE_DIARIZATION_COHERE_TOKEN_STREAM_V1, OASR_METADATA_KEY_FEATURE_DIARIZATION,
-};
 use crate::models::runtime_selection_metadata::selection_metadata_from_gguf;
 use crate::models::runtime_tensor_contract_registry::validate_builtin_runtime_tensor_contract_for_architecture;
 use crate::realtime::RealtimeBackendCapabilities;
@@ -91,10 +88,7 @@ impl NativeRuntimeModelAdapter {
                 tensor_index,
             ))
             .with_timestamps(true)
-            .with_diarization(native_runtime_metadata_supports_diarization(
-                metadata,
-                descriptor.self_diarizes,
-            ))
+            .with_in_decoder_speakers(descriptor.speaker_segmentation.is_in_decoder())
             .with_quantized_models(true)
             .with_hardware_acceleration(true);
         let language_mode = crate::models::language::resolve_language_mode(
@@ -108,8 +102,11 @@ impl NativeRuntimeModelAdapter {
         }
     }
 
-    fn model_self_diarizes(&self) -> bool {
-        self.capabilities.supports_diarization
+    /// Whether this model's own decode carries the speaker structure. Read
+    /// from the family descriptor (the single declaration); never re-derived
+    /// from pack metadata or an `adapter_id` string match.
+    fn segments_speakers_in_decoder(&self) -> bool {
+        self.descriptor.speaker_segmentation.is_in_decoder()
     }
 
     pub(crate) fn language_mode(&self) -> crate::models::language::LanguageMode {
@@ -235,7 +232,7 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
         let backend_preference = native_ggml_backend_preference_from_hardware_target(target)?;
         let request_options = native_streaming_request_options_from_session_options(
             &options,
-            self.model_self_diarizes(),
+            self.segments_speakers_in_decoder(),
         );
         let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
             backend_preference.request_backend_override(),
@@ -248,7 +245,7 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
             runtime_source_preflight: None,
             selected_family: self.descriptor.clone(),
             request_options,
-            configured_diarize: options.diarize,
+            configured_diarize: options.voice_id,
             backend_preference,
             resolved_runtime,
             session_context: context,
@@ -262,7 +259,7 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
 
 fn native_streaming_request_options_from_session_options(
     options: &NativeAsrRequestOptions,
-    model_self_diarizes: bool,
+    segments_speakers_in_decoder: bool,
 ) -> GgmlAsrExecutionOptions {
     let mut request_options = GgmlAsrExecutionOptions::from_transcription_request_with_phrase_bias(
         options.language.clone(),
@@ -273,12 +270,14 @@ fn native_streaming_request_options_from_session_options(
     request_options.task = options.task.unwrap_or_default();
     request_options.inference_threads = options.inference_threads.map(usize::from);
     request_options.word_timestamps = options.word_timestamps;
-    // `NativeAsrRequestOptions::diarize` is the accepted session-level request:
-    // realtime uses it to emit `session.configured` and run the external
-    // VAD + speaker-embedder diarizer. GGML consumes this flag only for
-    // model-native self-diarization, so do not forward post-hoc diarization into decoder
-    // prompt construction.
-    request_options.diarize = options.diarize && model_self_diarizes;
+    // `NativeAsrRequestOptions::voice_id` is the accepted session-level user
+    // intent: realtime uses it to emit `session.configured` and to run the
+    // external VAD + speaker-embedder diarizer. The decode-side option means
+    // something narrower -- "this family's own decode should carry speaker
+    // structure" -- so it is set only for an in-decoder family. Forwarding the
+    // external path's intent here would be the double-apply the
+    // one-source-only rule forbids.
+    request_options.in_decoder_speakers = options.voice_id && segments_speakers_in_decoder;
     request_options
 }
 
@@ -572,7 +571,7 @@ fn native_offline_request_to_transcription_request(
         .with_execution_target(Some(execution_target))
         .with_word_timestamps(request.options.word_timestamps)
         .with_word_timestamps_refine(request.options.word_timestamps_refine)
-        .with_diarization(request.options.diarize)
+        .with_voice_id(request.options.voice_id)
         .with_longform(request.longform)
         .with_display_file_name(request.display_file_name)
         .with_source(request.source)
@@ -677,19 +676,37 @@ fn native_phrase_bias_capability_for_adapter(
     }
 }
 
-/// Reason reported when neither a self-diarizing pack nor the model-agnostic
-/// VAD + ReDimNet2-B6 (`redimnet2-b6-cn`) path is installed.
-pub(crate) const NATIVE_DIARIZATION_UNAVAILABLE_REASON: &str = "Diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn) or a self-diarizing model pack; install one or omit diarize=true.";
+/// Reason reported when the model does not segment speakers in-decoder and the
+/// model-agnostic VAD + ReDimNet2-B6 (`redimnet2-b6-cn`) path is not installed
+/// either, i.e. no speaker segmentation source exists for this request.
+pub(crate) const NATIVE_DIARIZATION_UNAVAILABLE_REASON: &str = "This model does not separate speakers itself, so diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install it, pick a model that separates speakers itself, or omit diarize=true.";
 
-/// Diarization capability for a runtime pack: supported when the model
-/// self-diarizes (e.g. the cohere token-stream) or the model-agnostic
-/// VAD + ReDimNet2-B6 path is installed for this process.
+/// Voice ID capability for a runtime pack: supported when a speaker
+/// segmentation source exists at all -- either the family segments in-decoder,
+/// or the model-agnostic VAD + ReDimNet2-B6 path is installed for this
+/// process. Deliberately not gated on the speaker embedder for an in-decoder
+/// family: without one the turns simply stay recording-local instead of being
+/// matched to known people, which is a degraded result, not an unavailable
+/// feature.
 fn native_diarization_capability_for_adapter(
     adapter: Option<&NativeRuntimeModelAdapter>,
 ) -> BackendFeatureCapability {
-    if native_runtime_adapter_supports_diarization(adapter)
-        || crate::diarize::vad_diarization_available()
-    {
+    native_diarization_capability(
+        native_runtime_adapter_segments_speakers_in_decoder(adapter),
+        crate::diarize::vad_diarization_available(),
+    )
+}
+
+/// The rule itself, separated from the two live lookups it consults: one
+/// speaker segmentation source is enough. Kept as a pure function so the
+/// in-decoder row is assertable -- the host-installed-pack half is an ambient
+/// filesystem probe, and no tiny-GGUF fixture can stand in for an in-decoder
+/// family's pack.
+fn native_diarization_capability(
+    segments_speakers_in_decoder: bool,
+    embedder_pack_installed: bool,
+) -> BackendFeatureCapability {
+    if segments_speakers_in_decoder || embedder_pack_installed {
         BackendFeatureCapability::supported()
     } else {
         BackendFeatureCapability::reject_request(NATIVE_DIARIZATION_UNAVAILABLE_REASON)
@@ -1026,34 +1043,10 @@ pub fn validate_native_runtime_model_pack_contract(path: &Path) -> Result<(), St
 /// have written, not that the file is corrupt.
 const RUNTIME_CONTRACT_OUTDATED_PACK_HINT: &str = "this pack was likely produced by an outdated or incompatible conversion pipeline; re-convert or re-pull the model pack";
 
-fn native_runtime_adapter_supports_diarization(
+fn native_runtime_adapter_segments_speakers_in_decoder(
     adapter: Option<&NativeRuntimeModelAdapter>,
 ) -> bool {
-    adapter.is_some_and(|adapter| adapter.capabilities().supports_diarization)
-}
-
-/// Diarization support for a runtime pack: the family must be capable of
-/// self-diarizing (`GgmlFamilyAdapterDescriptor::self_diarizes`, declared once
-/// on the arch descriptor -- see `arch::OpenAsrArchitectureDescriptor::self_diarizes`)
-/// AND the specific pack must carry the runtime metadata/tokens a real
-/// self-diarizing decode needs. The family-level fact is descriptor-driven so
-/// no call site re-derives "which family self-diarizes" from an `adapter_id`
-/// string match; only the per-pack verification stays here.
-pub(crate) fn native_runtime_metadata_supports_diarization(
-    metadata: &crate::GgufMetadata,
-    self_diarizes: bool,
-) -> bool {
-    self_diarizes
-        && metadata
-            .get_string(OASR_METADATA_KEY_FEATURE_DIARIZATION)
-            .is_some_and(|value| value.trim() == OASR_FEATURE_DIARIZATION_COHERE_TOKEN_STREAM_V1)
-        && metadata
-            .get_string_array("tokenizer.ggml.tokens")
-            .is_some_and(|tokens| {
-                tokens.iter().any(|token| token == "<|diarize|>")
-                    && tokens.iter().any(|token| token == "<|timestamp|>")
-                    && tokens.iter().any(|token| token == "<|spltoken0|>")
-            })
+    adapter.is_some_and(|adapter| adapter.capabilities().supports_in_decoder_speakers)
 }
 
 #[cfg(test)]
@@ -1536,28 +1529,7 @@ mod tests {
     fn native_runtime_model_adapter_selects_descriptor_and_capabilities_from_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_path = temp.path().join("cohere-runtime.gguf");
-        let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture")
-            .with_metadata(
-                crate::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_DIARIZATION,
-                crate::models::oasr_metadata::OASR_FEATURE_DIARIZATION_COHERE_TOKEN_STREAM_V1,
-            )
-            .with_string_array_metadata(
-                "tokenizer.ggml.tokens",
-                [
-                    "<|startofcontext|>",
-                    "<|startoftranscript|>",
-                    "<|emo:undefined|>",
-                    "<|en|>",
-                    "<|pnc|>",
-                    "<|noitn|>",
-                    "<|notimestamp|>",
-                    "<|timestamp|>",
-                    "<|nodiarize|>",
-                    "<|diarize|>",
-                    "<|endoftext|>",
-                    "<|spltoken0|>",
-                ],
-            );
+        let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
         let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
@@ -1571,7 +1543,10 @@ mod tests {
         assert!(capabilities.is_native_adapter());
         assert!(capabilities.supports_phrase_bias);
         assert!(capabilities.supports_timestamps);
-        assert!(capabilities.supports_diarization);
+        // Family-level fact, read from the arch descriptor. Deliberately NOT
+        // re-derived from per-pack metadata -- what a family's decode can do is
+        // a property of the architecture, not of a pack's declarations.
+        assert!(!capabilities.supports_in_decoder_speakers);
         assert!(capabilities.supports_quantized_models);
         assert!(capabilities.supports_hardware_acceleration);
         // Realtime cadence is registry-driven: cohere-transcribe registers a
@@ -1584,11 +1559,87 @@ mod tests {
         );
     }
 
+    /// The per-family segmentation source is what the runtime reads, and it
+    /// comes from the arch descriptor rather than from anything a pack
+    /// declares -- pinned here at both ends: the registry fact for every
+    /// builtin family, and the capability a resolved pack reports for the ones
+    /// a tiny fixture can build.
     #[test]
-    fn native_streaming_request_keeps_embedder_diarization_out_of_ggml_decode_options() {
+    fn in_decoder_speaker_capability_is_family_level_not_pack_declared() {
+        // moss-transcribe-diarize is the only builtin family that carries
+        // speaker structure in its own decode today; every other family takes
+        // it from an external source (cohere's decoder has the mode but no
+        // publishable pack -- see its arch descriptor).
+        let registry = crate::arch::OpenAsrArchitectureRegistry::with_builtins();
+        for descriptor in registry.descriptors() {
+            let expected =
+                descriptor.model_architecture == crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID;
+            assert_eq!(
+                descriptor.speaker_segmentation.is_in_decoder(),
+                expected,
+                "'{}' speaker segmentation source mismatch",
+                descriptor.model_architecture
+            );
+        }
+
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-redimnet-only-streaming.gguf");
-        let spec = cohere_streaming_runtime_fixture_spec("cohere-redimnet-only-streaming");
+        let cases: [(&str, fn(&str) -> TinyGgufFixtureSpec); 3] = [
+            ("cohere", cohere_streaming_runtime_fixture_spec),
+            ("whisper", whisper_streaming_runtime_fixture_spec),
+            ("qwen", qwen_streaming_runtime_fixture_spec),
+        ];
+        for (name, build_spec) in cases {
+            let runtime_path = temp.path().join(format!("{name}-segmentation.gguf"));
+            write_tiny_gguf_runtime_source(&runtime_path, &build_spec(name)).unwrap();
+            let adapter = native_runtime_model_adapter_for_path(&runtime_path)
+                .unwrap_or_else(|| panic!("{name} fixture must resolve an adapter"));
+            assert!(
+                !adapter.segments_speakers_in_decoder(),
+                "'{name}' takes its speaker structure from an external source"
+            );
+            assert_eq!(
+                adapter.capabilities().supports_in_decoder_speakers,
+                adapter.segments_speakers_in_decoder(),
+                "'{name}' capability must mirror the descriptor"
+            );
+        }
+    }
+
+    /// Voice ID is offered when *any* speaker segmentation source exists. The
+    /// row that matters is the first one: a family that separates speakers in
+    /// its own decode offers Voice ID on a host with no speaker-embedder pack,
+    /// because the missing embedder costs it only the ability to put names to
+    /// the voices. (Asserted on the pure rule: no tiny-GGUF fixture can build
+    /// an in-decoder family's pack today, so a pack-level test could not cover
+    /// this row at all.)
+    #[test]
+    fn voice_id_is_offered_when_any_speaker_source_exists() {
+        for (segments_in_decoder, embedder_installed, expected) in [
+            (true, false, true),
+            (true, true, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            let capability = native_diarization_capability(segments_in_decoder, embedder_installed);
+            assert_eq!(
+                capability.supported, expected,
+                "in_decoder={segments_in_decoder} embedder={embedder_installed}"
+            );
+            if !expected {
+                assert!(
+                    capability
+                        .reason
+                        .is_some_and(|reason| reason.contains("redimnet2-b6-cn"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_streaming_request_keeps_external_speakers_out_of_ggml_decode_options() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_path = temp.path().join("whisper-redimnet-only-streaming.gguf");
+        let spec = whisper_streaming_runtime_fixture_spec("whisper-redimnet-only-streaming");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
         let redimnet_pack = temp.path().join("redimnet.oasr");
         std::fs::write(&redimnet_pack, b"GGUF\x00\x00\x00\x00").unwrap();
@@ -1600,33 +1651,34 @@ mod tests {
             || native_runtime_realtime_capabilities_for_path(&runtime_path),
         );
         let adapter = native_runtime_model_adapter_for_path(&runtime_path).unwrap();
-        let adapter_capabilities = adapter.capabilities();
-        assert!(adapter_capabilities.supports_true_streaming);
+        assert!(adapter.capabilities().supports_true_streaming);
         assert!(
             realtime_capabilities.diarization.supported,
-            "active embedder pack presence should accept the session-level diarize request"
+            "an installed embedder pack accepts the session-level Voice ID request"
         );
         assert!(
-            !adapter.model_self_diarizes(),
-            "fixture has no self-diarize metadata/tokens"
+            !adapter.segments_speakers_in_decoder(),
+            "whisper takes its speaker structure from the external source"
         );
 
         let session_options = NativeAsrRequestOptions::new()
-            .with_diarization(true)
+            .with_voice_id(true)
             .with_partial_results(true)
             .with_word_timestamps(true);
         let request_options = native_streaming_request_options_from_session_options(
             &session_options,
-            adapter.model_self_diarizes(),
+            adapter.segments_speakers_in_decoder(),
         );
 
         assert!(
-            !request_options.diarize,
-            "embedder realtime diarization must not switch GGML into self-diarize decode mode"
+            !request_options.in_decoder_speakers,
+            "the external speaker source must not also switch the decoder into in-decoder mode"
         );
         assert!(request_options.word_timestamps);
         assert!(
-            native_streaming_request_options_from_session_options(&session_options, true).diarize
+            native_streaming_request_options_from_session_options(&session_options, true)
+                .in_decoder_speakers,
+            "an in-decoder family does ask its own decode for speaker structure"
         );
     }
 
@@ -2148,7 +2200,7 @@ mod tests {
                     .with_prompt(Some("domain prompt".to_string()))
                     .with_phrase_bias(Some(phrase_bias.clone()))
                     .with_inference_threads(Some(6))
-                    .with_diarization(true)
+                    .with_voice_id(true)
                     .with_word_timestamps(true),
             )
             .with_longform(Some(longform.clone()))
@@ -2175,7 +2227,7 @@ mod tests {
             Some(ExecutionTarget::Accelerated)
         );
         assert!(converted.word_timestamps);
-        assert!(converted.diarize);
+        assert!(converted.voice_id);
         assert_eq!(converted.longform, Some(longform));
         assert_eq!(converted.display_file_name.as_deref(), Some("meeting.wav"));
     }
@@ -2395,7 +2447,7 @@ mod tests {
     }
 
     #[test]
-    fn native_backend_rejects_diarization_requests() {
+    fn native_backend_rejects_voice_id_when_no_speaker_source_exists() {
         // Flattened into one multi-key override instead of nesting
         // `with_forced_cpu_backend_for_test` inside a second env guard: the
         // process env lock is not reentrant, so two nested guards on the same
@@ -2410,16 +2462,15 @@ mod tests {
             || {
                 // Hermetic: the run-time gate probes the host's installed
                 // ReDimNet2-B6 pack, so pin the lookup to an empty home.
-                let runtime_path = temp.path().join("cohere-runtime.gguf");
-                let spec =
-                    TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
+                let runtime_path = temp.path().join("whisper-runtime.gguf");
+                let spec = whisper_streaming_runtime_fixture_spec("whisper-runtime-fixture");
                 write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
                 let backend = NativeBackend;
                 let request =
-                    TranscriptionRequest::new(sample_wav_fixture_path(), "cohere-runtime-fixture")
+                    TranscriptionRequest::new(sample_wav_fixture_path(), "whisper-runtime-fixture")
                         .with_model_pack_path(Some(runtime_path))
-                        .with_diarization(true);
+                        .with_voice_id(true);
 
                 let error = backend.transcribe(request).unwrap_err().to_string();
 
@@ -2578,62 +2629,7 @@ mod tests {
     }
 
     #[test]
-    fn native_runtime_capabilities_enable_declared_cohere_diarization_pack() {
-        let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-diarize-runtime.gguf");
-        let spec =
-            TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-diarize-runtime-fixture")
-                .with_metadata(
-                    crate::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_DIARIZATION,
-                    crate::models::oasr_metadata::OASR_FEATURE_DIARIZATION_COHERE_TOKEN_STREAM_V1,
-                )
-                .with_string_array_metadata(
-                    "tokenizer.ggml.tokens",
-                    [
-                        "<|startofcontext|>",
-                        "<|startoftranscript|>",
-                        "<|emo:undefined|>",
-                        "<|en|>",
-                        "<|pnc|>",
-                        "<|noitn|>",
-                        "<|notimestamp|>",
-                        "<|timestamp|>",
-                        "<|nodiarize|>",
-                        "<|diarize|>",
-                        "<|endoftext|>",
-                        "<|spltoken0|>",
-                        "▁fixture11",
-                        "▁fixture12",
-                        "▁fixture13",
-                        "▁fixture14",
-                        "▁fixture15",
-                        "▁fixture16",
-                        "▁fixture17",
-                        "▁fixture18",
-                        "▁fixture19",
-                        "▁fixture20",
-                        "▁fixture21",
-                        "▁fixture22",
-                        "▁fixture23",
-                        "▁fixture24",
-                        "▁fixture25",
-                        "▁fixture26",
-                        "▁fixture27",
-                        "▁fixture28",
-                        "▁fixture29",
-                        "▁fixture30",
-                        "▁fixture31",
-                    ],
-                );
-        write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
-
-        let capabilities = native_runtime_transcription_capabilities_for_path(&runtime_path);
-
-        assert!(capabilities.diarization.supported);
-    }
-
-    #[test]
-    fn native_runtime_capabilities_keep_base_cohere_diarization_unsupported() {
+    fn native_runtime_capabilities_reject_voice_id_for_an_external_family_with_no_embedder() {
         let temp = tempfile::tempdir().unwrap();
         // Hermetic: the capability probe also consults the host's installed
         // ReDimNet2-B6 pack, so pin the lookup to an empty home.
@@ -2641,8 +2637,8 @@ mod tests {
             ("OPENASR_REDIMNET_PACK", None),
             ("OPENASR_HOME", Some(temp.path().as_os_str().to_os_string())),
         ]);
-        let runtime_path = temp.path().join("cohere-runtime.gguf");
-        let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
+        let runtime_path = temp.path().join("whisper-runtime.gguf");
+        let spec = whisper_streaming_runtime_fixture_spec("whisper-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
 
         let capabilities = native_runtime_transcription_capabilities_for_path(&runtime_path);
@@ -2660,8 +2656,8 @@ mod tests {
     #[test]
     fn native_runtime_capabilities_enable_vad_diarization_when_redimnet_pack_installed() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_path = temp.path().join("cohere-runtime.gguf");
-        let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-runtime-fixture");
+        let runtime_path = temp.path().join("whisper-runtime.gguf");
+        let spec = whisper_streaming_runtime_fixture_spec("whisper-runtime-fixture");
         write_tiny_gguf_runtime_source(&runtime_path, &spec).unwrap();
         let redimnet_pack = temp.path().join("redimnet.oasr");
         std::fs::write(&redimnet_pack, b"GGUF\x00\x00\x00\x00").unwrap();
@@ -2673,9 +2669,9 @@ mod tests {
             || native_runtime_transcription_capabilities_for_path(&runtime_path),
         );
 
-        // The VAD + ReDimNet2-B6 path is model-agnostic: a pack with no
-        // self-diarize metadata reports diarization supported once the embedder
-        // pack is installed.
+        // The VAD + ReDimNet2-B6 path is model-agnostic: a family that takes
+        // its speaker structure from an external source reports Voice ID
+        // supported once the embedder pack is installed.
         assert!(capabilities.diarization.supported);
     }
 

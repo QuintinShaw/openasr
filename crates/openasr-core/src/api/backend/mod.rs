@@ -371,7 +371,17 @@ pub struct TranscriptionRequest {
     pub word_timestamps_refine: bool,
     pub longform: Option<LongFormOptions>,
     pub display_file_name: Option<String>,
-    pub diarize: bool,
+    /// The single user-facing Voice ID switch: "tell me who is speaking".
+    ///
+    /// One user intent, deliberately not one mechanism. Which speaker
+    /// segmentation source runs is decided from the resolved model's
+    /// `arch::SpeakerSegmentationSource` (in-decoder markup vs the external
+    /// VAD + speaker-embedder path), and whether the resulting
+    /// recording-local turns can be matched to known people additionally
+    /// depends on an installed speaker embedder. A model that segments
+    /// speakers in-decoder therefore honors this switch with no embedder
+    /// installed at all -- it just cannot name anyone.
+    pub voice_id: bool,
     /// Exact speaker count to force during diarization clustering (the
     /// `DiarizeHint::NumSpeakers` hint); `None` lets the threshold decide.
     pub diarize_speakers: Option<u8>,
@@ -446,7 +456,7 @@ impl TranscriptionRequest {
             word_timestamps_refine: false,
             longform: None,
             display_file_name: None,
-            diarize: false,
+            voice_id: false,
             diarize_speakers: None,
             punctuate: true,
             source: RequestSource::default(),
@@ -575,8 +585,8 @@ impl TranscriptionRequest {
         self
     }
 
-    pub fn with_diarization(mut self, diarize: bool) -> Self {
-        self.diarize = diarize;
+    pub fn with_voice_id(mut self, voice_id: bool) -> Self {
+        self.voice_id = voice_id;
         self
     }
 
@@ -706,7 +716,7 @@ pub(crate) fn reject_unsupported_diarization(
     request: &TranscriptionRequest,
     backend: &'static str,
 ) -> Result<(), BackendError> {
-    if request.diarize {
+    if request.voice_id {
         return Err(BackendError::DiarizationNotSupported { backend });
     }
 
@@ -836,7 +846,7 @@ pub(crate) fn reject_unsupported_language(
 #[derive(Debug, Error)]
 pub enum BackendError {
     #[error(
-        "Diarization is not available for the {backend} backend in this setup.\nNative diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn) or a self-diarizing model pack; install one, or omit --diarize / diarize=true."
+        "Diarization is not available for the {backend} backend in this setup.\nThis model does not separate speakers itself, so it needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install it, pick a model that separates speakers itself, or omit --diarize / diarize=true."
     )]
     DiarizationNotSupported { backend: &'static str },
     #[error(

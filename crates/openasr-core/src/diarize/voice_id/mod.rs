@@ -4,8 +4,8 @@
 //! prototypes, person-level margin matching, and SQLite WAL storage. Raw
 //! enrollment audio is never retained.
 
-mod backend;
 mod domain;
+mod identity;
 mod ids;
 mod matcher;
 mod prototypes;
@@ -14,13 +14,13 @@ mod service;
 mod space;
 mod store;
 
-pub use backend::{
-    DiarizationOutput, DiarizerBackendKind, EmbeddingEvidence, voice_id_evidence_from_output,
-};
 pub use domain::{
     CandidateScope, CaptureContext, ConsentRecord, EnrollmentSample, Person, PersonMatch,
     PersonPrototype, PersonStatus, PersonView, PrototypeMember, SampleEmbedding, SampleQuality,
     SampleView, VOICE_ID_LABEL_MAX_CHARS, VoiceIdAssignment, VoiceIdColor,
+};
+pub use identity::{
+    SpeakerScope, name_speakers_across_scopes, name_speakers_from_labeled_segments,
 };
 pub use ids::{IdError, PERSON_ID_PREFIX, PersonId, PrototypeId, SAMPLE_ID_PREFIX, SampleId};
 pub use matcher::{MatcherPerson, PersonMatcher};

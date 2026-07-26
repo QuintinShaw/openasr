@@ -3,9 +3,14 @@ use crate::GgmlAsrExecutionOptions;
 use super::tokenizer::CohereTranscribeTokenizer;
 use thiserror::Error;
 
-const COHERE_DIARIZE_TOKEN: &str = "<|diarize|>";
+// This family declares `arch::SpeakerSegmentationSource::External`: its
+// decoder does have a `<|diarize|>` / `<|spltoken0|>` speaker-token mode, but
+// no published cohere pack can run it (the packs would have to be re-converted
+// and re-published for it), so the runtime never asks for it and reports the
+// capability as unsupported rather than half-promising it. The prompt
+// therefore pins the plain-transcript control tokens unconditionally; when the
+// in-decoder mode is actually enabled, this is where the switch comes back.
 const COHERE_NO_DIARIZE_TOKEN: &str = "<|nodiarize|>";
-const COHERE_TIMESTAMP_TOKEN: &str = "<|timestamp|>";
 const COHERE_NO_TIMESTAMP_TOKEN: &str = "<|notimestamp|>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,10 +21,6 @@ pub(crate) struct CohereTranscribeDecodePrompt {
 
 #[derive(Debug, Error)]
 pub(crate) enum CohereTranscribeDecodePromptError {
-    #[error(
-        "cohere decode prompt requires token '{token}' for diarization but the tokenizer does not contain it"
-    )]
-    MissingRequiredControlToken { token: &'static str },
     #[error(
         "cohere decode prompt requested language '{language}' but the tokenizer has no '<|{language}|>' token"
     )]
@@ -56,17 +57,6 @@ pub(crate) fn build_cohere_transcribe_decode_prompt(
     } else {
         "<|pnc|>"
     };
-    let diarization_token = if options.diarize {
-        COHERE_DIARIZE_TOKEN
-    } else {
-        COHERE_NO_DIARIZE_TOKEN
-    };
-    let timestamp_token = if options.diarize {
-        COHERE_TIMESTAMP_TOKEN
-    } else {
-        COHERE_NO_TIMESTAMP_TOKEN
-    };
-
     for token in [
         "<|startofcontext|>",
         "<|startoftranscript|>",
@@ -75,23 +65,11 @@ pub(crate) fn build_cohere_transcribe_decode_prompt(
         language_token.as_str(),
         punctuation_token,
         "<|noitn|>",
-        timestamp_token,
-        diarization_token,
+        COHERE_NO_TIMESTAMP_TOKEN,
+        COHERE_NO_DIARIZE_TOKEN,
     ] {
         if let Some(token_id) = tokenizer.token_id_by_content(token) {
             token_ids.push(token_id);
-        } else if options.diarize && token == COHERE_TIMESTAMP_TOKEN {
-            return Err(
-                CohereTranscribeDecodePromptError::MissingRequiredControlToken {
-                    token: COHERE_TIMESTAMP_TOKEN,
-                },
-            );
-        } else if options.diarize && token == COHERE_DIARIZE_TOKEN {
-            return Err(
-                CohereTranscribeDecodePromptError::MissingRequiredControlToken {
-                    token: COHERE_DIARIZE_TOKEN,
-                },
-            );
         }
     }
 
@@ -149,53 +127,30 @@ mod tests {
         assert_eq!(prompt.eos_token_id, Some(10));
     }
 
+    /// The plain-transcript control tokens are unconditional: asking for
+    /// in-decoder speakers must not change this family's prompt, because it
+    /// does not offer that mode (see the constants' comment above).
     #[test]
-    fn builds_diarization_prompt_when_requested() {
+    fn asking_for_in_decoder_speakers_does_not_change_the_prompt() {
         let tokenizer = tokenizer();
-        let options = GgmlAsrExecutionOptions {
-            diarize: true,
-            ..GgmlAsrExecutionOptions::default()
-        };
-        let prompt = build_cohere_transcribe_decode_prompt(&tokenizer, 13764, Some("en"), &options)
-            .expect("prompt");
-        assert_eq!(prompt.token_ids, vec![0, 1, 2, 3, 3, 4, 5, 7, 9]);
-        assert_eq!(prompt.eos_token_id, Some(10));
-    }
-
-    #[test]
-    fn rejects_diarization_prompt_when_required_token_is_missing() {
-        let tokenizer = CohereTranscribeTokenizer::from_gguf_metadata(&{
-            let mut values = BTreeMap::new();
-            values.insert(
-                "tokenizer.ggml.model".to_string(),
-                GgufMetadataValue::String("llama".to_string()),
-            );
-            values.insert(
-                "tokenizer.ggml.tokens".to_string(),
-                GgufMetadataValue::StringArray(vec![
-                    "<|startofcontext|>".to_string(),
-                    "<|startoftranscript|>".to_string(),
-                    "<|emo:undefined|>".to_string(),
-                    "<|en|>".to_string(),
-                    "<|pnc|>".to_string(),
-                    "<|noitn|>".to_string(),
-                    "<|notimestamp|>".to_string(),
-                    "<|timestamp|>".to_string(),
-                    "<|nodiarize|>".to_string(),
-                    "<|endoftext|>".to_string(),
-                ]),
-            );
-            GgufMetadata::from_values_for_test(values)
-        })
-        .expect("tokenizer");
-        let options = GgmlAsrExecutionOptions {
-            diarize: true,
-            ..GgmlAsrExecutionOptions::default()
-        };
-        let error = build_cohere_transcribe_decode_prompt(&tokenizer, 13764, Some("en"), &options)
-            .expect_err("missing diarization token must fail closed")
-            .to_string();
-        assert!(error.contains("<|diarize|>"), "{error}");
+        let plain = build_cohere_transcribe_decode_prompt(
+            &tokenizer,
+            13764,
+            Some("en"),
+            &GgmlAsrExecutionOptions::default(),
+        )
+        .expect("prompt");
+        let requested = build_cohere_transcribe_decode_prompt(
+            &tokenizer,
+            13764,
+            Some("en"),
+            &GgmlAsrExecutionOptions {
+                in_decoder_speakers: true,
+                ..GgmlAsrExecutionOptions::default()
+            },
+        )
+        .expect("prompt");
+        assert_eq!(plain.token_ids, requested.token_ids);
     }
 
     #[test]

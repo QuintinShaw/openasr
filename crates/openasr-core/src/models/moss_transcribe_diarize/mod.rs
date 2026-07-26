@@ -37,7 +37,7 @@ mod llm_decoder;
 pub(crate) mod package_import;
 mod prompt_embedding;
 pub(crate) mod runtime_contract;
-mod speaker_segments;
+pub(crate) mod speaker_segments;
 pub(crate) mod tensor_names;
 mod tokenizer;
 

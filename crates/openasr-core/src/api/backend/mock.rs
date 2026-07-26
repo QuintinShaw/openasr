@@ -77,7 +77,7 @@ mod tests {
     fn mock_backend_rejects_diarization_without_fake_speakers() {
         let backend = MockBackend;
         let request =
-            TranscriptionRequest::new("fixtures/jfk.wav", "whisper-tiny").with_diarization(true);
+            TranscriptionRequest::new("fixtures/jfk.wav", "whisper-tiny").with_voice_id(true);
 
         let error = backend.transcribe(request).unwrap_err().to_string();
 

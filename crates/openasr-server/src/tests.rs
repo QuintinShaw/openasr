@@ -1551,7 +1551,7 @@ fn record_file_transcription_history_round_trips_structured_metadata() {
     .unwrap();
     let request = TranscriptionRequest::new(temp.path().join("sample.wav"), "qwen3-asr-0.6b:q8")
         .with_display_file_name(Some("sample.wav".to_string()))
-        .with_diarization(true);
+        .with_voice_id(true);
     let transcription = Transcription {
         text: "hello with speaker".to_string(),
         segments: vec![openasr_core::Segment {

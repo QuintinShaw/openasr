@@ -58,7 +58,13 @@ pub struct NativeAsrCapabilities {
     /// streaming, even though that also reports `supports_partials`.
     pub supports_frame_sync_partials: bool,
     pub supports_timestamps: bool,
-    pub supports_diarization: bool,
+    /// Whether the model's own decode carries speaker structure
+    /// (`arch::SpeakerSegmentationSource::InDecoder`). NOT "speakers are
+    /// available for this request": an `External`-segmentation family gets
+    /// speakers from the installed VAD + speaker-embedder path instead, which
+    /// is a live host fact rather than a model fact and is therefore resolved
+    /// at the reporting site, not cached here.
+    pub supports_in_decoder_speakers: bool,
     pub supports_phrase_bias: bool,
     pub supports_quantized_models: bool,
     pub supports_hardware_acceleration: bool,
@@ -77,7 +83,7 @@ impl NativeAsrCapabilities {
             supports_partials: false,
             supports_frame_sync_partials: false,
             supports_timestamps: false,
-            supports_diarization: false,
+            supports_in_decoder_speakers: false,
             supports_phrase_bias: false,
             supports_quantized_models: false,
             supports_hardware_acceleration: false,
@@ -132,8 +138,8 @@ impl NativeAsrCapabilities {
         self
     }
 
-    pub const fn with_diarization(mut self, supported: bool) -> Self {
-        self.supports_diarization = supported;
+    pub const fn with_in_decoder_speakers(mut self, supported: bool) -> Self {
+        self.supports_in_decoder_speakers = supported;
         self
     }
 
@@ -222,7 +228,12 @@ pub struct NativeAsrRequestOptions {
     pub prompt: Option<String>,
     pub phrase_bias: Option<PhraseBiasConfig>,
     pub inference_threads: Option<u16>,
-    pub diarize: bool,
+    /// The single user-facing Voice ID switch: "tell me who is speaking".
+    /// One intent, deliberately not split per mechanism -- which segmentation
+    /// source runs is decided from the resolved model's
+    /// `arch::SpeakerSegmentationSource`, and whether the turns can be matched
+    /// to known people additionally depends on an installed speaker embedder.
+    pub voice_id: bool,
     pub partial_results: bool,
     pub word_timestamps: bool,
     /// Opt-in `--word-timestamps=aligned` / `word_aligned` refinement tier;
@@ -261,8 +272,8 @@ impl NativeAsrRequestOptions {
         self
     }
 
-    pub fn with_diarization(mut self, diarize: bool) -> Self {
-        self.diarize = diarize;
+    pub fn with_voice_id(mut self, voice_id: bool) -> Self {
+        self.voice_id = voice_id;
         self
     }
 

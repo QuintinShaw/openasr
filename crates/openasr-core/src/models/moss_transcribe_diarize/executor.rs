@@ -767,26 +767,21 @@ impl MossTdGgmlExecutor {
             &request.execution_context.control,
             request.resolved_runtime.backend(),
         )?;
-        // Parse the model's own inline `[start][end][SNN]` markup into real
-        // speaker segments, degrading fail-closed to the single speaker-less
-        // segment carrying the untouched raw text when the tag stream is
-        // malformed or empty (see `speaker_segments`'s module doc for the
-        // grammar, the fail-closed policy, and the degrade shape's tests).
-        // `text` itself is never rewritten either way.
-        let segments =
-            super::speaker_segments::moss_td_segments_or_degrade(&text, audio_duration_seconds);
-        // MOSS decoder tags are anonymous session turns only. Project them
-        // through the diarizer backend boundary so Voice ID cannot treat Sxx as
-        // Person evidence (no embedding channel here).
-        let diarization_output = super::speaker_segments::moss_td_diarization_output(&segments);
-        debug_assert!(
-            !diarization_output.supports_voice_id_matching(),
-            "MOSS-TD must never advertise Voice ID embedding evidence"
+        // Normalize the model's own inline `[start][end][SNN]` markup into the
+        // engine's shared segment representation. The decode prompt is fixed,
+        // so the markers are written whether or not the request asked for
+        // speakers: stripping them from the transcript is this layer's job, and
+        // `in_decoder_speakers` decides only whether the recording-local
+        // `SPEAKER_NN` labels survive. See `speaker_segments`'s module doc for
+        // the grammar, the fail-closed policy, and the degrade shape.
+        let normalized = super::speaker_segments::normalize_moss_td_decode(
+            &text,
+            audio_duration_seconds,
+            request.request_options.in_decoder_speakers,
         );
-        let _ = diarization_output;
         let transcription = Transcription {
-            segments,
-            text,
+            segments: normalized.segments,
+            text: normalized.text,
             longform: None,
             language: None,
         };
@@ -897,6 +892,17 @@ mod tests {
         }
     }
 
+    // The `GOLDEN_*_TEXT` constants below are the raw *reference decode* -- the
+    // tagged string the model itself produces, compared against the HF fp32
+    // reference. They are deliberately NOT what the executor returns: the
+    // family's inline markup is an internal transport for speaker structure and
+    // is normalized away before anything else sees it (see
+    // `speaker_segments`'s module doc), so the executor's flat text is the
+    // markup-free projection of these, obtained through the same normalizer.
+    // Keeping the goldens in reference form is what lets a decode regression
+    // (different words, shifted anchors, a lost speaker change) still show up
+    // here instead of being hidden by the stripping.
+    //
     // Pinned to the real dev-pack CPU decode (backend forced to CPU below).
     // The encoder binds its 2D projection weights zero-copy as native f16 and
     // runs flash attention (see `encoder_graph`), so this decode path is f16
@@ -923,6 +929,17 @@ mod tests {
         "[0.27][S01]And so, my fellow Americans,[2.32][3.21][S01]ask not.",
         "[4.44][4.96][S02]今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去伊加新[12.88]",
     );
+
+    /// The flat transcript a caller receives for a given reference decode: the
+    /// same words with the family's markup normalized away.
+    fn normalized_golden_text(reference_decode: &str, audio_duration_seconds: f32) -> String {
+        super::super::speaker_segments::normalize_moss_td_decode(
+            reference_decode,
+            audio_duration_seconds,
+            true,
+        )
+        .text
+    }
 
     fn transcribe_with_dev_pack(wav_path: PathBuf) -> Option<(String, std::time::Duration, f32)> {
         // Force CPU. This family's Metal path has two open defects (encoder
@@ -983,7 +1000,13 @@ mod tests {
             runtime_source_preflight: None,
             selected_family: moss_transcribe_diarize_runtime_descriptor_v1(),
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
-            request_options: Default::default(),
+            // The goldens pin the reference decode including its speaker
+            // structure, so ask for it -- with Voice ID off the normalizer
+            // drops the labels by design (see `speaker_segments`).
+            request_options: crate::models::ggml_asr_executor::GgmlAsrExecutionOptions {
+                in_decoder_speakers: true,
+                ..Default::default()
+            },
             backend_preference,
             resolved_runtime,
             execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
@@ -1038,7 +1061,10 @@ mod tests {
             runtime_source_preflight: None,
             selected_family: moss_transcribe_diarize_runtime_descriptor_v1(),
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
-            request_options: Default::default(),
+            request_options: crate::models::ggml_asr_executor::GgmlAsrExecutionOptions {
+                in_decoder_speakers: true,
+                ..Default::default()
+            },
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
             resolved_runtime,
             execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
@@ -1050,46 +1076,13 @@ mod tests {
         Some(result.transcription.segments)
     }
 
-    /// Splits a moss-td transcript into (a) its "skeleton" -- every literal
-    /// character with each numeric time-anchor token's digits blanked out to
-    /// `[]` (leaving non-numeric bracketed tokens like `[S01]` untouched) --
-    /// and (b) the anchors' parsed float values in order. Used by
-    /// [`assert_transcript_matches_golden_within_anchor_tolerance`] to split
-    /// "does the text/structure match" from "do the anchors match" into two
-    /// independently-checked layers.
-    fn parse_transcript_skeleton_and_anchors(text: &str) -> (String, Vec<f32>) {
-        let mut skeleton = String::with_capacity(text.len());
-        let mut anchors = Vec::new();
-        let mut rest = text;
-        while let Some(open_rel) = rest.find('[') {
-            skeleton.push_str(&rest[..open_rel]);
-            let after_open = &rest[open_rel + 1..];
-            let Some(close_rel) = after_open.find(']') else {
-                // Unterminated '[': copy the rest verbatim and stop.
-                skeleton.push_str(&rest[open_rel..]);
-                rest = "";
-                break;
-            };
-            let inner = &after_open[..close_rel];
-            if let Ok(value) = inner.trim().parse::<f32>() {
-                anchors.push(value);
-                skeleton.push_str("[]");
-            } else {
-                skeleton.push('[');
-                skeleton.push_str(inner);
-                skeleton.push(']');
-            }
-            rest = &after_open[close_rel + 1..];
-        }
-        skeleton.push_str(rest);
-        (skeleton, anchors)
-    }
-
-    /// Two-layer transcript comparison for the accelerated e2e smoke tests:
-    /// (1) text, punctuation, speaker labels, and anchor count/order must
-    /// match the CPU golden byte-for-byte (asserted via the anchor-blanked
-    /// "skeleton"); (2) each numeric time-anchor's value only needs to be
-    /// within `tolerance_secs` of the golden's, not bit-identical.
+    /// Two-layer comparison for the accelerated e2e smoke tests, run over the
+    /// normalized segments rather than the raw tagged string (the family's
+    /// markup never leaves its normalizer, see `speaker_segments`): (1) the
+    /// segment count, each segment's text/punctuation, and each segment's
+    /// speaker label must match the CPU golden's exactly; (2) each segment's
+    /// start/end -- the family's time anchors, in normalized form -- only needs
+    /// to be within `tolerance_secs` of the golden's, not bit-identical.
     ///
     /// Rationale for tolerating (2) rather than requiring (1)'s strictness
     /// there too: this repo's own firered-aed encoder parity investigation
@@ -1104,33 +1097,43 @@ mod tests {
     /// divergence on `en_zh_mixed.wav` lands the accelerated run on the same
     /// values as the HF fp32 reference (see that test's comment) -- i.e.
     /// both sides are plausible fp32 outcomes, not a defect on either one.
-    fn assert_transcript_matches_golden_within_anchor_tolerance(
-        actual: &str,
-        golden: &str,
+    fn assert_segments_match_golden_within_anchor_tolerance(
+        actual: &[Segment],
+        golden_reference_decode: &str,
+        audio_duration_seconds: f32,
         tolerance_secs: f32,
     ) {
-        let (actual_skeleton, actual_anchors) = parse_transcript_skeleton_and_anchors(actual);
-        let (golden_skeleton, golden_anchors) = parse_transcript_skeleton_and_anchors(golden);
+        let golden = super::super::speaker_segments::parse_moss_td_speaker_segments(
+            golden_reference_decode,
+            audio_duration_seconds,
+        )
+        .expect("the golden reference decode parses");
         assert_eq!(
-            actual_skeleton, golden_skeleton,
-            "transcript text/punctuation/speaker-labels/anchor-count-and-order diverged from \
-             the CPU golden (strict layer -- anchor *values* are compared separately with \
-             tolerance, this only checks everything else)"
+            actual.len(),
+            golden.len(),
+            "segment count diverged from the CPU golden"
         );
-        assert_eq!(
-            actual_anchors.len(),
-            golden_anchors.len(),
-            "anchor count mismatch (should already have failed the skeleton check above)"
-        );
-        for (idx, (actual_anchor, golden_anchor)) in
-            actual_anchors.iter().zip(golden_anchors.iter()).enumerate()
-        {
-            let diff = (actual_anchor - golden_anchor).abs();
-            assert!(
-                diff <= tolerance_secs,
-                "anchor[{idx}] exceeds tolerance: actual={actual_anchor} golden={golden_anchor} \
-                 diff={diff:.4}s (tolerance={tolerance_secs}s)"
+        for (index, (actual_segment, golden_segment)) in actual.iter().zip(&golden).enumerate() {
+            assert_eq!(
+                actual_segment.text, golden_segment.text,
+                "segment[{index}] text/punctuation diverged from the CPU golden (strict layer -- \
+                 times are compared separately with tolerance)"
             );
+            assert_eq!(
+                actual_segment.speaker, golden_segment.speaker,
+                "segment[{index}] speaker label diverged from the CPU golden"
+            );
+            for (edge, actual_time, golden_time) in [
+                ("start", actual_segment.start, golden_segment.start),
+                ("end", actual_segment.end, golden_segment.end),
+            ] {
+                let diff = (actual_time - golden_time).abs();
+                assert!(
+                    diff <= tolerance_secs,
+                    "segment[{index}].{edge} exceeds tolerance: actual={actual_time} \
+                     golden={golden_time} diff={diff:.4}s (tolerance={tolerance_secs}s)"
+                );
+            }
         }
     }
 
@@ -1163,7 +1166,7 @@ mod tests {
             "moss-td e2e [jfk.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
-        assert_eq!(text, GOLDEN_JFK_TEXT);
+        assert_eq!(text, normalized_golden_text(GOLDEN_JFK_TEXT, 10.59));
     }
 
     /// Pins the resident-runtime cache's two contracts introduced by this
@@ -1181,7 +1184,7 @@ mod tests {
         let Some((first_text, _, _)) = transcribe_with_dev_pack(dev_sample_path("jfk.wav")) else {
             return;
         };
-        assert_eq!(first_text, GOLDEN_JFK_TEXT);
+        assert_eq!(first_text, normalized_golden_text(GOLDEN_JFK_TEXT, 10.59));
         let (encoder_builds, decoder_builds) = moss_td_runtime_build_counts_for_test();
         assert_eq!(
             encoder_builds, 1,
@@ -1223,7 +1226,7 @@ mod tests {
             "moss-td e2e [en_zh_mixed.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
-        assert_eq!(text, GOLDEN_EN_ZH_MIXED_TEXT);
+        assert_eq!(text, normalized_golden_text(GOLDEN_EN_ZH_MIXED_TEXT, 12.88));
     }
 
     #[test]
@@ -1388,7 +1391,7 @@ mod tests {
     }
 
     /// Time anchors are floating-point-derived (see
-    /// `assert_transcript_matches_golden_within_anchor_tolerance`'s doc
+    /// `assert_segments_match_golden_within_anchor_tolerance`'s doc
     /// comment for why exact cross-backend anchor equality is not the
     /// right bar); 0.03s covers the largest measured CPU-vs-accelerated
     /// anchor divergence on these clips (0.02s on `en_zh_mixed.wav`,
@@ -1408,9 +1411,9 @@ mod tests {
     // fixed its reuse-path graph so Metal decode reuses its graph), so this
     // is the full accelerated-request path: Metal encoder + Metal decode,
     // diffed against the same CPU golden the two tests above pin, via
-    // `assert_transcript_matches_golden_within_anchor_tolerance` (strict on
-    // text/punctuation/speaker-labels/anchor-count-and-order, tolerant only
-    // on each anchor's numeric value).
+    // `assert_segments_match_golden_within_anchor_tolerance` (strict on
+    // segment count, text/punctuation and speaker labels, tolerant only on
+    // each segment's start/end time).
     //
     // jfk.wav: byte-for-byte identical to the CPU golden, anchors included
     // (diff = 0.0 on every anchor).
@@ -1419,7 +1422,7 @@ mod tests {
                 and tmp/moss-td/samples/*.wav; drives an explicit accelerated request \
                 (Metal encoder + Metal decode) and needs a Metal device"]
     fn golden_diff_end_to_end_transcribe_jfk_wav_accelerated() {
-        let Some((text, _, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
+        let Some((_, segments, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
             dev_sample_path("jfk.wav"),
             GgmlAsrBackendPreference::Accelerated,
         ) else {
@@ -1429,9 +1432,10 @@ mod tests {
             "moss-td e2e accelerated [jfk.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
-        assert_transcript_matches_golden_within_anchor_tolerance(
-            &text,
+        assert_segments_match_golden_within_anchor_tolerance(
+            &segments,
             GOLDEN_JFK_TEXT,
+            10.59,
             ACCELERATED_ANCHOR_TOLERANCE_SECS,
         );
     }
@@ -1450,7 +1454,7 @@ mod tests {
     // time-anchor tokens ([2.34] vs [2.32], [4.94] vs [4.96], both a 0.02s
     // shift) -- every word, punctuation mark, speaker label, and the other
     // two anchors are identical, so the strict skeleton layer of
-    // `assert_transcript_matches_golden_within_anchor_tolerance` passes and
+    // `assert_segments_match_golden_within_anchor_tolerance` passes and
     // only the anchor-tolerance layer is exercised here. Notably,
     // [2.34]/[4.94] are the same values the top-of-file
     // `golden_diff_end_to_end_transcribe_en_zh_mixed_wav` comment records
@@ -1466,7 +1470,7 @@ mod tests {
                 and tmp/moss-td/samples/*.wav; drives an explicit accelerated request \
                 (Metal encoder + Metal decode) and needs a Metal device"]
     fn golden_diff_end_to_end_transcribe_en_zh_mixed_wav_accelerated() {
-        let Some((text, _, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
+        let Some((_, segments, elapsed, audio_duration_seconds)) = transcribe_with_dev_pack_backend(
             dev_sample_path("en_zh_mixed.wav"),
             GgmlAsrBackendPreference::Accelerated,
         ) else {
@@ -1476,9 +1480,10 @@ mod tests {
             "moss-td e2e accelerated [en_zh_mixed.wav]: rtf={:.3} elapsed={elapsed:?} audio_duration={audio_duration_seconds:.2}s",
             elapsed.as_secs_f32() / audio_duration_seconds.max(0.001)
         );
-        assert_transcript_matches_golden_within_anchor_tolerance(
-            &text,
+        assert_segments_match_golden_within_anchor_tolerance(
+            &segments,
             GOLDEN_EN_ZH_MIXED_TEXT,
+            12.88,
             ACCELERATED_ANCHOR_TOLERANCE_SECS,
         );
     }
@@ -1512,9 +1517,14 @@ mod tests {
             &std::fs::read(&golden_path).expect("read AISHELL-4 development golden"),
         )
         .expect("parse AISHELL-4 development golden");
+        // The pinned reference text is the raw tagged decode; what a caller
+        // gets is its markup-free projection (see `speaker_segments`).
         assert_eq!(
             text,
-            golden["text"].as_str().expect("AISHELL-4 golden text"),
+            normalized_golden_text(
+                golden["text"].as_str().expect("AISHELL-4 golden text"),
+                180.0
+            ),
             "accelerated AISHELL-4 transcript must match the pinned reference text"
         );
         assert!(
@@ -1538,8 +1548,8 @@ mod tests {
             "AISHELL-4 segment starts must be ordered"
         );
         assert!(
-            parse_moss_td_speaker_segments(&text, 180.0).is_ok(),
-            "AISHELL-4 tagged transcript must parse without text-only degradation"
+            !text.contains("[S"),
+            "the family's speaker markup must never reach the caller"
         );
     }
 }

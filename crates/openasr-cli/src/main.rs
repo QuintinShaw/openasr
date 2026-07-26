@@ -1185,7 +1185,7 @@ fn transcribe(options: TranscribeCommandOptions<'_>) -> Result<()> {
             None
         })
         .with_phrase_bias(phrase_bias)
-        .with_diarization(options.diarize)
+        .with_voice_id(options.diarize)
         .with_diarize_speakers(options.speakers)
         .with_punctuation(options.punctuate)
         .with_word_timestamps(options.word_timestamps_mode.is_some())
