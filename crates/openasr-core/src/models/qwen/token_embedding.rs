@@ -242,6 +242,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::GgufTensorDataReader;
+    use crate::ggml_runtime::{
+        GgufWriteTensor, GgufWriteTensorType, quantize_f32_to_ggml_tensor_data, write_gguf_file_v0,
+    };
     use crate::nn::half::f16_bits_to_f32;
     use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
 
@@ -276,6 +279,28 @@ mod tests {
         let mut kv = BTreeMap::new();
         kv.insert("general.architecture".to_string(), "qwen3-asr".to_string());
         TinyGgufFixtureSpec::new(kv)
+    }
+
+    fn write_q4_k_token_embedding_fixture(path: &Path, dims: [u64; 2], values: Vec<f32>) {
+        let data = quantize_f32_to_ggml_tensor_data(GgufWriteTensorType::Q4_K, &dims, &values)
+            .expect("quantize a real q4_k fixture payload");
+        write_gguf_file_v0(
+            path,
+            &BTreeMap::new(),
+            &[GgufWriteTensor {
+                name: TOKEN_EMBEDDING_TENSOR_NAME.to_string(),
+                dims: dims.to_vec(),
+                tensor_type: GgufWriteTensorType::Q4_K,
+                data,
+            }],
+        )
+        .expect("write a real q4_k GGUF fixture");
+    }
+
+    fn q4_k_fixture_values(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|index| ((index % 37) as f32 - 18.0) * 0.0625)
+            .collect()
     }
 
     #[test]
@@ -412,5 +437,89 @@ mod tests {
             f16_bits_to_f32(raw_bits[26]),
         ];
         assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn token_embedding_q4_k_rows_gather_only_requested_mmap_rows() {
+        // q4_k's real ggml superblock has a 256-wide first dimension. This
+        // goes through the production ggml quantizer and GGUF writer rather
+        // than a zero-filled synthetic byte fixture, so the lazy row path is
+        // checked against actual q4_k scale/min/bit decoding.
+        let d_model = 256;
+        let vocab_size = 3;
+        let dims = [d_model as u64, vocab_size as u64];
+        let values = q4_k_fixture_values(d_model * vocab_size);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_path = temp.path().join("qwen-token-embd-q4-k-rows.gguf");
+        write_q4_k_token_embedding_fixture(&runtime_path, dims, values);
+
+        let reader = GgufTensorDataReader::from_path(&runtime_path).expect("reader");
+        let table = load_token_embedding_table_from_reader_with_tensor_name(
+            &reader,
+            TOKEN_EMBEDDING_TENSOR_NAME,
+            d_model,
+            vocab_size,
+        )
+        .expect("load mmap-backed q4_k rows");
+        assert!(matches!(
+            table.storage,
+            TokenEmbeddingStorage::Mmap {
+                layout: TokenEmbeddingLayout::TokenRows,
+                ..
+            }
+        ));
+
+        let gathered = table.gather_rows(&[0, 2]).expect("gather requested rows");
+        let dequantized = reader
+            .host_tensor_f32_copy_dequantized_by_name(TOKEN_EMBEDDING_TENSOR_NAME, &dims)
+            .expect("reference q4_k dequantization");
+        assert_eq!(&gathered[..d_model], &dequantized[..d_model]);
+        assert_eq!(&gathered[d_model..], &dequantized[d_model * 2..d_model * 3]);
+    }
+
+    #[test]
+    fn token_embedding_q4_k_columns_gather_only_requested_mmap_columns() {
+        // In the legacy [vocab, hidden] orientation, q4_k's block-aligned
+        // first dimension is vocab. Each logical token column therefore reads
+        // one value from every independently q4_k-quantized hidden row.
+        let d_model = 3;
+        let vocab_size = 256;
+        let dims = [vocab_size as u64, d_model as u64];
+        let values = q4_k_fixture_values(d_model * vocab_size);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_path = temp.path().join("qwen-token-embd-q4-k-columns.gguf");
+        write_q4_k_token_embedding_fixture(&runtime_path, dims, values);
+
+        let reader = GgufTensorDataReader::from_path(&runtime_path).expect("reader");
+        let table = load_token_embedding_table_from_reader_with_tensor_name(
+            &reader,
+            TOKEN_EMBEDDING_TENSOR_NAME,
+            d_model,
+            vocab_size,
+        )
+        .expect("load mmap-backed q4_k columns");
+        assert!(matches!(
+            table.storage,
+            TokenEmbeddingStorage::Mmap {
+                layout: TokenEmbeddingLayout::TokenColumns,
+                ..
+            }
+        ));
+
+        let gathered = table
+            .gather_rows(&[2, 255])
+            .expect("gather requested columns");
+        let dequantized = reader
+            .host_tensor_f32_copy_dequantized_by_name(TOKEN_EMBEDDING_TENSOR_NAME, &dims)
+            .expect("reference q4_k dequantization");
+        let expected = vec![
+            dequantized[2],
+            dequantized[vocab_size + 2],
+            dequantized[vocab_size * 2 + 2],
+            dequantized[255],
+            dequantized[vocab_size + 255],
+            dequantized[vocab_size * 2 + 255],
+        ];
+        assert_eq!(gathered, expected);
     }
 }
