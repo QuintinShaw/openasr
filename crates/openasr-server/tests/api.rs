@@ -2041,27 +2041,49 @@ fn multipart_request(model: &str, file_name: &str, bytes: &[u8]) -> Request<Body
     multipart_request_with_diarize(model, file_name, bytes, false)
 }
 
-fn write_voiceprint_store(home: &std::path::Path) -> String {
-    let id = "vp_aaaaaaaaaaaaaaaa".to_string();
-    let profile = openasr_core::diarize::enrollment::SpeakerProfile {
-        id: id.clone(),
-        name: "Alice".to_string(),
-        created_at: "2026-06-11T00:00:00.000Z".to_string(),
-        updated_at: "2026-06-11T00:00:00.000Z".to_string(),
-        sample_seconds: 5.25,
-        embedding_dim: 2,
-        pack_fingerprint: "sha256:test".to_string(),
-        match_similarity: 0.5,
-        embedding: vec![1.0, 0.0],
+/// Seeds a single Voice ID person directly through `VoiceIdStore::enroll_person`
+/// -- the only enrollment path left post-migration-removal. Tests that just
+/// need *a* person to exercise PATCH/list/rename semantics call this instead
+/// of routing through HTTP enrollment (which requires a real embedder pack).
+fn seed_voice_id_person(home: &std::path::Path) -> (String, u64) {
+    let space = openasr_core::diarize::voice_id::EmbeddingSpace::from_parts(
+        2,
+        "sha256:test",
+        "test",
+        "test",
+        "v1",
+        openasr_core::diarize::voice_id::REDIMNET_FRONTEND_VERSION,
+        openasr_core::diarize::calibration::REDIMNET_CALIBRATION_VERSION,
+        openasr_core::diarize::voice_id::MATCHER_POLICY_VERSION,
+    );
+    let sample = openasr_core::diarize::voice_id::NewSampleInput {
+        sample_id: openasr_core::diarize::voice_id::SampleId::generate(),
+        capture_context: openasr_core::diarize::voice_id::CaptureContext {
+            device_class: "test".to_string(),
+            input_route: "mic".to_string(),
+            environment_hint: None,
+            sample_label: Some("clip".to_string()),
+        },
+        quality: openasr_core::diarize::voice_id::SampleQuality {
+            speech_seconds: 5.25,
+            snr_estimate: 20.0,
+            clipping_ratio: 0.0,
+            vad_coverage: 0.8,
+            accepted_reason: "test".to_string(),
+        },
+        space,
+        embedding: openasr_core::diarize::contract::SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]),
     };
-    let store = openasr_core::diarize::enrollment::VoiceprintStore {
-        version: openasr_core::diarize::enrollment::VOICEPRINT_STORE_VERSION,
-        profiles: vec![profile],
+    let consent = openasr_core::diarize::voice_id::ConsentRecord {
+        granted_at: openasr_core::diarize::voice_id::timestamp_now(),
+        notice_version: "voice-id-notice-v1".to_string(),
+        capture_method: "test".to_string(),
     };
-    store
-        .save(&home.join("diarize").join("voiceprints.json"))
+    let store = openasr_core::diarize::voice_id::VoiceIdStore::open_checked(home).unwrap();
+    let person = store
+        .enroll_person("Alice", consent, vec![sample], None)
         .unwrap();
-    id
+    (person.person_id, person.revision)
 }
 
 #[tokio::test]
@@ -2156,8 +2178,9 @@ async fn voice_id_routes_require_operator_credentials_for_paired_devices() {
 async fn voice_id_rename_revision_conflict_returns_409() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
-    // Seed a migrated person so rename has a target without needing the embedder pack.
-    let _legacy_id = write_voiceprint_store(&home);
+    // Seed a person directly via the store so rename has a target without
+    // needing the embedder pack.
+    let (person_id, revision) = seed_voice_id_person(&home);
     let app = openasr_server::app_with_runtime_and_distribution(
         openasr_server::ServerRuntime::default(),
         openasr_server::DistributionRuntime {
@@ -2166,22 +2189,6 @@ async fn voice_id_rename_revision_conflict_returns_409() {
             catalog_local_override: None,
         },
     );
-
-    let list = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/voice-id/persons")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(list.status(), StatusCode::OK);
-    let body = to_bytes(list.into_body(), 1024 * 64).await.unwrap();
-    let json: Value = serde_json::from_slice(&body).unwrap();
-    let person_id = json["data"][0]["person_id"].as_str().unwrap().to_string();
-    let revision = json["data"][0]["revision"].as_u64().unwrap();
 
     let conflict = app
         .oneshot(
@@ -2212,7 +2219,7 @@ async fn voice_id_rename_revision_conflict_returns_409() {
 async fn voice_id_person_patch_supports_atomic_name_and_color_edits() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
-    write_voiceprint_store(&home);
+    let (person_id, revision) = seed_voice_id_person(&home);
     let app = openasr_server::app_with_runtime_and_distribution(
         openasr_server::ServerRuntime::default(),
         openasr_server::DistributionRuntime {
@@ -2221,24 +2228,6 @@ async fn voice_id_person_patch_supports_atomic_name_and_color_edits() {
             catalog_local_override: None,
         },
     );
-
-    let list = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/voice-id/persons")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let list_body = to_bytes(list.into_body(), 1024 * 64).await.unwrap();
-    let list_json: Value = serde_json::from_slice(&list_body).unwrap();
-    let person_id = list_json["data"][0]["person_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let revision = list_json["data"][0]["revision"].as_u64().unwrap();
 
     let color_only = app
         .clone()
@@ -2383,7 +2372,7 @@ async fn voice_id_person_patch_supports_atomic_name_and_color_edits() {
 async fn voice_id_sample_patch_updates_only_label_with_owner_etag() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
-    write_voiceprint_store(&home);
+    seed_voice_id_person(&home);
     let app = openasr_server::app_with_runtime_and_distribution(
         openasr_server::ServerRuntime::default(),
         openasr_server::DistributionRuntime {
@@ -2393,6 +2382,9 @@ async fn voice_id_sample_patch_updates_only_label_with_owner_etag() {
         },
     );
 
+    // The sample-level PATCH tested here needs the sample_id/quality fields,
+    // which seed_voice_id_person's direct return doesn't carry, so fetch them
+    // through the same list endpoint the server exposes to real clients.
     let list = app
         .clone()
         .oneshot(

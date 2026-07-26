@@ -33,9 +33,9 @@ pub const API_KEY_TOKEN_PREFIX: &str = "oasr_sk_";
 pub const API_KEY_ID_PREFIX: &str = "key_";
 /// Random key material length in bytes (before hex-encoding).
 const API_KEY_TOKEN_RANDOM_BYTES: usize = 32;
-/// Env var override for the store path, mirroring
-/// `diarize::enrollment::VOICEPRINT_STORE_ENV`, so tests do not touch a real
-/// `OPENASR_HOME`.
+/// Env var override for the store path, mirroring the pattern used by other
+/// per-home stores (e.g. `diarize::voice_id::VOICE_ID_DB_ENV`), so tests do
+/// not touch a real `OPENASR_HOME`.
 pub const API_KEY_STORE_ENV: &str = "OPENASR_API_KEYS_PATH";
 
 static API_KEY_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
