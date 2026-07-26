@@ -1,11 +1,17 @@
-//! Read-only discovery for every supported on-disk model-store layout.
+//! Read-only discovery of the on-disk model store.
 //!
-//! Installed packs used to be recorded only as
-//! `<models>/<model>/<quant>/installed.json`. Desktop distributions now store
-//! the same metadata in `<models>/refs/<model>/<quant>.json` and put bytes in
-//! `<models>/objects/sha256/<digest>/content`. This module is the single
-//! authority that makes both layouts visible to CLI, server, and runtime
-//! selection. It deliberately never rewrites either layout.
+//! An installed pack is a ref at `<models>/refs/<model>/<quant>.json` naming an
+//! immutable object at `<models>/objects/sha256/<digest>/content`. This module
+//! is the single authority that makes them visible to CLI, server, and runtime
+//! selection, and it never writes.
+//!
+//! Packs used to be recorded instead as `<models>/<model>/<quant>/installed.json`
+//! beside their `.oasr`. That layout is no longer *read*: it is converted once,
+//! at process start, by `pull::migrate_legacy_model_store`, which still uses
+//! [`validate_legacy_record`] here to decide what is eligible. Keeping two
+//! readable layouts would mean two code paths, doubled test surface, and a
+//! precedence rule whose only job is to be wrong eventually -- and, as shipped,
+//! it let a converted store keep a full duplicate of every pack forever.
 
 use std::{
     collections::HashSet,
@@ -29,10 +35,9 @@ pub struct InstalledModelDiagnostic {
 
 /// Immutable snapshot of model packs visible from an OpenASR home.
 ///
-/// Content-addressed refs are authoritative when the same model/quant also
-/// exists in the legacy per-quant directory. The snapshot is intentionally
-/// rebuilt per request: model pull/import/delete operations may happen in a
-/// different process, and caching would otherwise return stale availability.
+/// The snapshot is intentionally rebuilt per request: model pull/import/delete
+/// operations may happen in a different process, and caching would otherwise
+/// return stale availability.
 #[derive(Debug, Default)]
 pub struct InstalledModelStore {
     packs: Vec<InstalledPack>,
@@ -46,9 +51,7 @@ impl InstalledModelStore {
         let mut store = Self::default();
         let mut variants = HashSet::new();
 
-        // New refs win over legacy records for the same canonical variant.
         store.read_content_addressed(&root, &mut variants)?;
-        store.read_legacy(&root, &mut variants)?;
         store.packs.sort_by(|left, right| {
             (&left.model_id, canonical_quant_tag(&left.quant), &left.pull).cmp(&(
                 &right.model_id,
@@ -119,73 +122,20 @@ impl InstalledModelStore {
                         continue;
                     }
                 };
-                let pack = match serde_json::from_str::<InstalledPack>(&contents) {
+                let mut pack = match serde_json::from_str::<InstalledPack>(&contents) {
                     Ok(pack) => pack,
                     Err(error) => {
                         self.diagnose(ref_path, format!("invalid model ref JSON: {error}"));
                         continue;
                     }
                 };
-                if let Err(reason) = validate_content_addressed_ref(root, model_id, quant, &pack) {
+                if let Err(reason) =
+                    validate_content_addressed_ref(root, model_id, quant, &mut pack)
+                {
                     self.diagnose(ref_path, reason);
                     continue;
                 }
 
-                let key = variant_key(&pack);
-                if variants.insert(key) {
-                    self.packs.push(pack);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn read_legacy(
-        &mut self,
-        root: &Path,
-        variants: &mut HashSet<(String, String)>,
-    ) -> Result<(), PullError> {
-        for model_dir in read_dir_entries_or_empty(root)? {
-            let model_path = model_dir.path();
-            // `refs`, `objects`, and transient installer directories are not
-            // legacy model IDs. Ignore them rather than interpreting contents.
-            if matches!(file_name(&model_path), Some("refs" | "objects" | "staging")) {
-                continue;
-            }
-            if !is_real_directory(&model_path) {
-                continue;
-            }
-            for quant_dir in read_dir_entries_or_empty(&model_path)? {
-                let quant_path = quant_dir.path();
-                if !is_real_directory(&quant_path) {
-                    continue;
-                }
-                let path = quant_path.join("installed.json");
-                if !path.exists() {
-                    continue;
-                }
-                if !is_real_file(&path) {
-                    self.diagnose(path, "legacy installed record is not a regular file");
-                    continue;
-                }
-                let contents = match fs::read_to_string(&path) {
-                    Ok(contents) => contents,
-                    Err(error) => {
-                        self.diagnose(path, error.to_string());
-                        continue;
-                    }
-                };
-                let pack = match serde_json::from_str::<InstalledPack>(&contents) {
-                    Ok(pack) => pack,
-                    Err(error) => {
-                        self.diagnose(path, format!("invalid legacy installed JSON: {error}"));
-                        continue;
-                    }
-                };
-                if let Err(reason) = validate_legacy_record(&pack, &quant_path) {
-                    self.diagnose(path, reason);
-                    continue;
-                }
                 let key = variant_key(&pack);
                 if variants.insert(key) {
                     self.packs.push(pack);
@@ -250,11 +200,21 @@ fn variant_key(pack: &InstalledPack) -> (String, String) {
     )
 }
 
+/// Validate one ref and bind it to the object its own digest names.
+///
+/// `pack.path` as stored is **not** an input to this decision. An object's
+/// location is fully determined by the current models root plus the digest, so
+/// the recorded absolute path is redundant -- and actively wrong the moment the
+/// user moves their model storage somewhere else, which the desktop's
+/// "change storage location" does by relocating files without rewriting refs.
+/// Recomputing rather than comparing is also strictly safer than the equality
+/// check it replaces: a ref that names some other file cannot mislead a reader
+/// that never reads the field.
 fn validate_content_addressed_ref(
     root: &Path,
     expected_model_id: &str,
     expected_quant: &str,
-    pack: &InstalledPack,
+    pack: &mut InstalledPack,
 ) -> Result<(), String> {
     validate_safe_relative_path("model id", &pack.model_id)?;
     validate_safe_relative_path("quant", &pack.quant)?;
@@ -270,14 +230,6 @@ fn validate_content_addressed_ref(
         return Err("quant does not match its ref filename".to_string());
     }
 
-    let expected_path = root
-        .join("objects")
-        .join("sha256")
-        .join(&pack.sha256)
-        .join("content");
-    if pack.path != expected_path {
-        return Err("ref path does not name its content-addressed object".to_string());
-    }
     if !real_path_under(
         root,
         Path::new("objects/sha256")
@@ -289,11 +241,17 @@ fn validate_content_addressed_ref(
                 .to_string(),
         );
     }
-    let metadata = fs::symlink_metadata(&pack.path)
+    let object_path = root
+        .join("objects")
+        .join("sha256")
+        .join(&pack.sha256)
+        .join("content");
+    let metadata = fs::symlink_metadata(&object_path)
         .map_err(|error| format!("could not stat content-addressed object: {error}"))?;
     if metadata.len() != pack.size_bytes {
         return Err("content-addressed object size does not match ref".to_string());
     }
+    pack.path = object_path;
     Ok(())
 }
 
@@ -468,6 +426,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_layout_is_not_a_discovery_source() {
+        // The reader knows exactly one layout. An unconverted legacy tree is
+        // invisible here by design; `migrate_legacy_model_store` is what makes
+        // it visible, and it runs at startup.
+        let home = TempDir::new().unwrap();
+        let legacy_path = write_legacy_pack(home.path(), "xasr-zh-en", "q4_k");
+        assert!(legacy_path.is_file());
+
+        let store = InstalledModelStore::read(home.path()).unwrap();
+        assert!(store.packs().is_empty());
+        // Not an error either: an unconverted tree is a pending migration, not a
+        // corrupt store.
+        assert!(store.diagnostics().is_empty());
+    }
+
+    #[test]
     fn default_resolution_uses_content_addressed_q4_alias() {
         let home = TempDir::new().unwrap();
         write_ref(
@@ -501,11 +475,11 @@ mod tests {
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             7,
         );
-        let escaped = home.path().join("outside");
-        fs::write(&escaped, b"outside").unwrap();
+        // A digest that is not a digest: the ref can never name an object, so it
+        // is unusable no matter what else it says.
         let mut record: serde_json::Value =
             serde_json::from_slice(&fs::read(&bad).unwrap()).unwrap();
-        record["path"] = serde_json::Value::String(escaped.display().to_string());
+        record["sha256"] = serde_json::Value::String("not-a-sha256".to_string());
         fs::write(&bad, serde_json::to_string(&record).unwrap()).unwrap();
         write_ref(
             home.path(),
@@ -519,6 +493,33 @@ mod tests {
         assert_eq!(store.packs().len(), 1);
         assert_eq!(store.packs()[0].model_id, "good-model");
         assert_eq!(store.diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn a_refs_recorded_path_is_never_an_authority() {
+        // The object's location is derived from the models root and the digest.
+        // A stale path (the desktop relocates storage without rewriting refs) or
+        // a crafted one must both resolve to the same real object.
+        let home = TempDir::new().unwrap();
+        let digest = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let ref_path = write_ref(home.path(), "good-model", "q8_0", digest, 7);
+        let escaped = home.path().join("outside");
+        fs::write(&escaped, b"outside").unwrap();
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ref_path).unwrap()).unwrap();
+        record["path"] = serde_json::Value::String(escaped.display().to_string());
+        fs::write(&ref_path, serde_json::to_string(&record).unwrap()).unwrap();
+
+        let store = InstalledModelStore::read(home.path()).unwrap();
+        assert_eq!(store.packs().len(), 1);
+        assert_eq!(
+            store.packs()[0].path,
+            home.path()
+                .join("models/objects/sha256")
+                .join(digest)
+                .join("content")
+        );
+        assert!(store.diagnostics().is_empty());
     }
 
     #[cfg(unix)]

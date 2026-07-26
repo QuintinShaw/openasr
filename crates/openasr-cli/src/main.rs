@@ -126,8 +126,77 @@ async fn main() {
     }
 }
 
+/// Whether this command resolves, lists, or writes installed model packs.
+///
+/// Only these need the store converted first. Keeping the list explicit avoids
+/// paying a directory scan (and, on a first upgrade, a full verification pass)
+/// in commands like `config` or the manifest-signing helpers that never look at
+/// installed models.
+fn command_reads_the_model_store(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::List
+            | Command::Pull { .. }
+            | Command::Rm { .. }
+            | Command::Doctor
+            | Command::Show { .. }
+            | Command::ModelPack { .. }
+            | Command::Transcribe { .. }
+            | Command::BenchSuite { .. }
+            | Command::Live { .. }
+            | Command::Serve { .. }
+    )
+}
+
+/// Convert a pre-content-store model directory once, before any command reads
+/// it.
+///
+/// The store has exactly one readable layout, so this is what makes an upgrading
+/// user's packs visible at all. It is idempotent and costs a directory scan once
+/// converted, so running it ahead of every command is cheaper than teaching each
+/// command that touches models to remember.
+///
+/// Never fatal. A record that cannot be converted keeps its bytes on disk
+/// untouched; the only consequence is that it is not listed, and staying silent
+/// about that is what would make it look like data loss.
+fn migrate_model_store_once() {
+    let Ok(home) = openasr_home() else {
+        return;
+    };
+    let report = match openasr_core::migrate_model_store_at_startup(&home) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("warning: could not convert the model store: {error}");
+            return;
+        }
+    };
+    if !report.migrated.is_empty() {
+        eprintln!(
+            "Converted {} model pack(s) to content-addressed storage.",
+            report.migrated.len()
+        );
+    }
+    if report.reclaimed_bytes > 0 {
+        eprintln!(
+            "Reclaimed {} bytes of superseded model copies.",
+            report.reclaimed_bytes
+        );
+    }
+    for failure in &report.failures {
+        eprintln!(
+            "warning: '{}' could not be converted and is not listed: {}",
+            failure.path.display(),
+            failure.reason
+        );
+    }
+}
+
 async fn run() -> Result<()> {
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    if command_reads_the_model_store(&command) {
+        migrate_model_store_once();
+    }
+    match command {
         Command::List => pull_cli::list_installed(),
         Command::Search { query } => search_models(query.as_deref()),
         Command::Pull {

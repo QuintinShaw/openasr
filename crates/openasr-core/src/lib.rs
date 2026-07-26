@@ -39,6 +39,7 @@ pub mod installed_model_store;
 pub(crate) mod launch_pack;
 pub(crate) mod longform;
 pub(crate) mod metrics;
+pub mod model_store_gc;
 pub mod models;
 mod nn;
 pub(crate) mod output;
@@ -177,6 +178,10 @@ pub use longform::{
     SegmentTimeDomain, SliceTranscript, TimelineAnchor, TimelineMap, TranscriptAssembler,
     plan_longform_slices,
 };
+pub use model_store_gc::{
+    ModelStoreEntry, ModelStoreGcReport, ModelStoreRefVerification, ModelStoreUsage,
+    ModelStoreVerification, collect_model_store_garbage, model_store_usage, verify_model_store,
+};
 pub use models::{
     cohere::COHERE_TRANSCRIBE_MODEL_FAMILY,
     cohere::{
@@ -284,10 +289,11 @@ pub use models::{
 };
 pub use output::{OutputWriteError, atomic_write_text};
 pub use pull::{
-    BackendFileFormat, DefaultPackPointer, InstalledBackend, InstalledPack, PullError,
-    PullModelPackRequest, PullProgress, available_disk_space_bytes, default_pack_pointer_path,
-    install_backend_pack, install_catalog_model_pack_from_path, install_model_pack_from_path,
-    list_installed_packs, migrate_legacy_installed_records, open_installed_content_lease,
+    BackendFileFormat, DefaultPackPointer, InstalledBackend, InstalledPack, LegacyMigrationFailure,
+    LegacyMigrationReport, PullError, PullModelPackRequest, PullProgress,
+    available_disk_space_bytes, default_pack_pointer_path, install_backend_pack,
+    install_catalog_model_pack_from_path, install_model_pack_from_path, list_installed_packs,
+    migrate_legacy_model_store, migrate_model_store_at_startup, open_installed_content_lease,
     persist_default_pack_pointer, pull_model_pack, read_default_pack_pointer, remove_model_pack,
     resolve_installed_pack_path, resolve_installed_pack_reference,
     resolve_installed_pack_reference_with_catalog,

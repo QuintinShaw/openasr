@@ -186,39 +186,36 @@ mod tests {
         }
     }
 
-    /// Aligns `find_installed_hymt2_translation_pack` with the trust
-    /// boundary `list_installed_packs` already enforces: an `installed.json`
-    /// record whose declared `path` does not resolve to
-    /// `<quant_dir>/<filename>` must be rejected outright, not trusted just
-    /// because the path happens to exist and isn't a symlink. The
-    /// hand-rolled directory scan this replaced only checked the latter, so
-    /// a record like this would previously have been accepted.
+    /// Aligns `find_installed_hymt2_translation_pack` with the trust boundary
+    /// `list_installed_packs` already enforces: a ref's recorded `path` is never
+    /// followed. Resolution derives the object from the models root and the
+    /// ref's own digest, so a record pointing at some other real, non-symlink
+    /// file resolves to nothing when that digest has no object. The hand-rolled
+    /// directory scan this replaced trusted the recorded path, so a record like
+    /// this would previously have been accepted.
     #[test]
-    fn rejects_installed_record_whose_declared_path_escapes_its_quant_dir() {
+    fn does_not_follow_an_installed_record_whose_declared_path_escapes_the_object_store() {
         let home = tempfile::tempdir().unwrap();
-        let quant_dir = home
+        let ref_path = home
             .path()
             .join("models")
+            .join("refs")
             .join(HYMT2_TRANSLATION_MODEL_ID)
-            .join("q4_k_m");
-        fs::create_dir_all(&quant_dir).unwrap();
+            .join("q4_k_m.json");
+        fs::create_dir_all(ref_path.parent().unwrap()).unwrap();
 
-        // A real, non-symlink file elsewhere under `home` -- the crafted
-        // record points `path` at this instead of `quant_dir/model.oasr`.
+        // A real, non-symlink file elsewhere under `home` -- the crafted record
+        // points `path` at this instead of at its own object.
         let escaped_path = home.path().join("escaped.oasr");
         fs::write(&escaped_path, b"not a real pack, just needs to exist").unwrap();
 
         let pack = stub_installed_pack(escaped_path, "model.oasr");
-        fs::write(
-            quant_dir.join("installed.json"),
-            serde_json::to_string(&pack).unwrap(),
-        )
-        .unwrap();
+        fs::write(&ref_path, serde_json::to_string(&pack).unwrap()).unwrap();
 
         assert!(
             find_installed_hymt2_translation_pack(home.path(), None).is_none(),
-            "an installed.json record whose declared path escapes its own quant \
-             directory must be rejected, not silently trusted"
+            "a ref's declared path must never be followed to a file outside the \
+             object store"
         );
     }
 }
