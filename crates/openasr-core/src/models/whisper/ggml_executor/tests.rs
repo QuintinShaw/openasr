@@ -300,10 +300,8 @@ fn golden_diff_tiny_imported_decoder_graph_executes_one_step() {
     let tensor_index = load_whisper_tensor_index(&runtime_source).expect("load tensor index");
     let tensor_binding =
         bind_whisper_required_tensors(&tensor_index, &execution).expect("bind tensors");
-    let tensor_reader = GgufTensorDataReader::from_tensor_index_shared(Arc::clone(
-        &tensor_binding.weights.tensor_index,
-    ))
-    .expect("create tensor reader");
+    let tensor_reader =
+        GgufTensorDataReader::from_runtime_source(&runtime_source).expect("create tensor reader");
     let decoder_weights =
         build_decoder_weight_seam(&tensor_reader, &tensor_binding.weights.bindings)
             .expect("materialize decoder weights");
@@ -650,8 +648,8 @@ fn golden_diff_prepared_audio_real_mel_and_real_encoder_compute_reach_decoder_fa
     let tensor_index = load_whisper_tensor_index(&runtime_source).expect("load tensor index");
     let tensor_binding =
         bind_whisper_required_tensors(&tensor_index, &execution).expect("bind tensors");
-    let encoder_weights =
-        materialize_whisper_encoder_weights(&tensor_binding).expect("materialize encoder");
+    let encoder_weights = materialize_whisper_encoder_weights(&runtime_source, &tensor_binding)
+        .expect("materialize encoder");
     let mel_input = prepare_mel_feature_input_seam(&mel_provider, &execution, &prepared_audio)
         .expect("real frontend mel preparation");
     assert!(

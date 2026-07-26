@@ -1,5 +1,4 @@
 use std::{
-    fs::{self, File},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,9 +10,8 @@ use crate::nn::half::f16_bits_slice_to_f32;
 
 use super::{
     GgmlRuntimeSource, GgmlRuntimeSourcePathError, GgufMetadataReadError, GgufTensorIndex,
-    GgufTensorIndexReadError, GgufTensorMetadata, ffi, read_gguf_metadata,
-    read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source,
-    validate_ggml_runtime_source_path,
+    GgufTensorIndexReadError, GgufTensorMetadata, ffi, read_gguf_metadata_from_runtime_source,
+    read_gguf_tensor_index_from_runtime_source, validate_ggml_runtime_source_path,
 };
 
 const GGUF_DEFAULT_ALIGNMENT_BYTES: u64 = 32;
@@ -55,26 +53,6 @@ impl GgufTensorDataReader {
             tensor_data_alignment_bytes,
             runtime_source.backing_mmap(),
         )
-    }
-
-    pub fn from_tensor_index(
-        tensor_index: GgufTensorIndex,
-    ) -> Result<Self, GgufTensorDataReadError> {
-        Self::from_tensor_index_shared(Arc::new(tensor_index))
-    }
-
-    /// Builds a reader from a tensor index alone (no [`GgmlRuntimeSource`] at
-    /// hand). This re-opens `tensor_index.path()` to map the tensor data, so
-    /// it does **not** get the same-open-handle guarantee
-    /// [`Self::from_runtime_source`] provides -- prefer that constructor
-    /// whenever a `GgmlRuntimeSource` is already available.
-    pub fn from_tensor_index_shared(
-        tensor_index: Arc<GgufTensorIndex>,
-    ) -> Result<Self, GgufTensorDataReadError> {
-        let metadata = read_gguf_metadata(tensor_index.path())?;
-        let tensor_data_alignment_bytes =
-            parse_tensor_alignment(tensor_index.path(), metadata.get_u32("general.alignment"))?;
-        Self::from_tensor_index_and_alignment(tensor_index, tensor_data_alignment_bytes)
     }
 
     pub fn tensor_index(&self) -> &GgufTensorIndex {
@@ -193,57 +171,8 @@ impl GgufTensorDataReader {
         self.weight_tensor_payload_from_host(payload)
     }
 
-    /// Opens `tensor_index.path()` fresh and maps it. Only used by the
-    /// path-reopening constructors ([`Self::from_tensor_index_shared`] via
-    /// [`Self::from_path`] / [`Self::from_tensor_index`]); see
-    /// [`Self::from_runtime_source`] for the TOCTOU-safe path that reuses an
-    /// already-open mapping instead.
-    fn from_tensor_index_and_alignment(
-        tensor_index: Arc<GgufTensorIndex>,
-        tensor_data_alignment_bytes: u64,
-    ) -> Result<Self, GgufTensorDataReadError> {
-        let file = File::open(tensor_index.path()).map_err(|source| {
-            GgufTensorDataReadError::OpenFile {
-                path: tensor_index.path().to_path_buf(),
-                source,
-            }
-        })?;
-        let mmap =
-            unsafe { Mmap::map(&file) }.map_err(|source| GgufTensorDataReadError::MapFile {
-                path: tensor_index.path().to_path_buf(),
-                source,
-            })?;
-
-        let mapped_len = u64::try_from(mmap.len()).map_err(|_| {
-            GgufTensorDataReadError::MappedLengthPlatformOverflow {
-                path: tensor_index.path().to_path_buf(),
-                length: mmap.len(),
-            }
-        })?;
-        let file_size = fs::metadata(tensor_index.path())
-            .map_err(|source| GgufTensorDataReadError::SourceMetadata {
-                path: tensor_index.path().to_path_buf(),
-                source,
-            })?
-            .len();
-        if mapped_len != file_size {
-            return Err(GgufTensorDataReadError::MappedLengthMismatch {
-                path: tensor_index.path().to_path_buf(),
-                mapped_len,
-                file_size,
-            });
-        }
-
-        Self::from_tensor_index_alignment_and_mmap(
-            tensor_index,
-            tensor_data_alignment_bytes,
-            Arc::new(mmap),
-        )
-    }
-
-    /// Builds the reader from an already-open mapping (either freshly opened
-    /// by [`Self::from_tensor_index_and_alignment`], or shared from a
-    /// [`GgmlRuntimeSource`] by [`Self::from_runtime_source`]). No file I/O
+    /// Builds the reader from an already-open mapping shared from a
+    /// [`GgmlRuntimeSource`] by [`Self::from_runtime_source`]. No file I/O
     /// happens here -- this only validates alignment and stores the mapping.
     fn from_tensor_index_alignment_and_mmap(
         tensor_index: Arc<GgufTensorIndex>,

@@ -122,11 +122,10 @@ pub(crate) fn unreadable_content_id(path: &Path) -> String {
 ///
 /// This is the fix for a reopen TOCTOU that used to exist between building a
 /// [`super::GgufTensorIndex`] (path-based) and mapping tensor *data*
-/// (previously a fresh `File::open` of the same path in
-/// `GgufTensorDataReader::from_tensor_index_and_alignment`): metadata, the
-/// tensor index, and the mapped weight bytes could come from different file
-/// generations if the pack was replaced between the two opens. Holding the
-/// open mapping here and threading it through
+/// (previously a fresh, separate `File::open` of the same path): metadata,
+/// the tensor index, and the mapped weight bytes could come from different
+/// file generations if the pack was replaced between the two opens. Holding
+/// the open mapping here and threading it through
 /// [`super::GgufTensorDataReader::from_runtime_source`] means the bytes a
 /// caller hashes for identity are the exact same bytes later read for
 /// weights -- there is no second open to race against.

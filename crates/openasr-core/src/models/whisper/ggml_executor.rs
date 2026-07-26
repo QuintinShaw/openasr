@@ -4140,12 +4140,11 @@ fn bind_whisper_required_tensors(
 
 #[cfg(test)]
 fn materialize_whisper_encoder_weights(
+    runtime_source: &GgmlRuntimeSource,
     tensor_binding: &WhisperGgmlTensorBinding,
 ) -> Result<WhisperEncoderWeightBundle, WhisperGgmlExecutorError> {
-    let reader = GgufTensorDataReader::from_tensor_index_shared(Arc::clone(
-        &tensor_binding.weights.tensor_index,
-    ))
-    .map_err(map_tensor_materialization_error)?;
+    let reader = GgufTensorDataReader::from_runtime_source(runtime_source)
+        .map_err(map_tensor_materialization_error)?;
     materialize_whisper_encoder_weights_from_reader(tensor_binding, &reader)
 }
 
