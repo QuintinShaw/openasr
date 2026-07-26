@@ -6,7 +6,7 @@ use std::{
 use memmap2::Mmap;
 use thiserror::Error;
 
-use crate::nn::half::f16_bits_slice_to_f32;
+use crate::nn::half::f16_bits_to_f32;
 
 use super::{
     GgmlRuntimeSource, GgmlRuntimeSourcePathError, GgufMetadataReadError, GgufTensorIndex,
@@ -99,7 +99,14 @@ impl GgufTensorDataReader {
         tensor_name: &str,
     ) -> Result<Vec<u8>, GgufTensorDataReadError> {
         let payload = self.host_tensor_bytes_by_name(tensor_name)?;
-        Ok(payload.bytes.to_vec())
+        let mut bytes = try_allocate_zeroed(
+            payload.metadata,
+            self.tensor_index.path(),
+            payload.bytes.len(),
+            0_u8,
+        )?;
+        bytes.copy_from_slice(payload.bytes);
+        Ok(bytes)
     }
 
     pub fn host_tensor_f32_copy_by_name(
@@ -277,19 +284,25 @@ impl GgufTensorDataReader {
             }
         })?;
 
+        let mut values = try_allocate_zeroed(
+            payload.metadata,
+            self.tensor_index.path(),
+            num_elements_usize,
+            0.0_f32,
+        )?;
         if cfg!(target_endian = "little") {
             // GGUF tensor data is little-endian; mmap offsets are normally alignment padded.
             let (prefix, aligned, suffix) = unsafe { payload.bytes.align_to::<f32>() };
             if prefix.is_empty() && suffix.is_empty() && aligned.len() == num_elements_usize {
-                return Ok(aligned.to_vec());
+                values.copy_from_slice(aligned);
+                return Ok(values);
             }
         }
 
-        Ok(payload
-            .bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect())
+        for (value, chunk) in values.iter_mut().zip(payload.bytes.chunks_exact(4)) {
+            *value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        Ok(values)
     }
 
     fn host_tensor_f16_bits_copy_from_payload(
@@ -310,19 +323,25 @@ impl GgufTensorDataReader {
             }
         })?;
 
+        let mut values = try_allocate_zeroed(
+            payload.metadata,
+            self.tensor_index.path(),
+            num_elements_usize,
+            0_u16,
+        )?;
         if cfg!(target_endian = "little") {
             // F16 is stored as raw little-endian bits; keep it lossless.
             let (prefix, aligned, suffix) = unsafe { payload.bytes.align_to::<u16>() };
             if prefix.is_empty() && suffix.is_empty() && aligned.len() == num_elements_usize {
-                return Ok(aligned.to_vec());
+                values.copy_from_slice(aligned);
+                return Ok(values);
             }
         }
 
-        Ok(payload
-            .bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect())
+        for (value, chunk) in values.iter_mut().zip(payload.bytes.chunks_exact(2)) {
+            *value = u16::from_le_bytes([chunk[0], chunk[1]]);
+        }
+        Ok(values)
     }
 
     fn host_tensor_f32_copy_dequantized_from_payload(
@@ -334,9 +353,17 @@ impl GgufTensorDataReader {
         match payload.metadata.ggml_type {
             GGML_TYPE_F32 => self.host_tensor_f32_copy_from_payload(payload, expected_shape),
             GGML_TYPE_F16 => {
-                let values =
-                    self.host_tensor_f16_bits_copy_from_payload(payload, expected_shape)?;
-                Ok(f16_bits_slice_to_f32(&values))
+                let bits = self.host_tensor_f16_bits_copy_from_payload(payload, expected_shape)?;
+                let mut values = try_allocate_zeroed(
+                    payload.metadata,
+                    self.tensor_index.path(),
+                    bits.len(),
+                    0.0_f32,
+                )?;
+                for (value, bits) in values.iter_mut().zip(bits) {
+                    *value = f16_bits_to_f32(bits);
+                }
+                Ok(values)
             }
             _ => self.host_tensor_quantized_dequantize_to_f32_from_payload(payload),
         }
@@ -467,7 +494,12 @@ impl GgufTensorDataReader {
                 dim_value: ne0,
             }
         })?;
-        let mut values = vec![0.0_f32; num_elements_usize];
+        let mut values = try_allocate_zeroed(
+            payload.metadata,
+            self.tensor_index.path(),
+            num_elements_usize,
+            0.0_f32,
+        )?;
         for row_idx in 0..rows_usize {
             let src_offset = row_idx * row_size;
             let src_ptr = payload.bytes[src_offset..]
@@ -606,6 +638,7 @@ impl GgufTensorDataReader {
             dims: borrowed.dims.clone(),
             num_elements: borrowed.num_elements,
             element_type: borrowed.element_type,
+            path: self.tensor_index.path().to_path_buf(),
             mmap: Arc::clone(&self.mmap),
             start: payload.start,
             len: borrowed.bytes.len(),
@@ -652,6 +685,7 @@ pub struct GgufOwnedWeightTensorPayload {
     pub dims: Vec<usize>,
     pub num_elements: usize,
     pub element_type: GgufWeightTensorElementType,
+    path: PathBuf,
     mmap: Arc<Mmap>,
     start: usize,
     len: usize,
@@ -660,6 +694,315 @@ pub struct GgufOwnedWeightTensorPayload {
 impl GgufOwnedWeightTensorPayload {
     pub fn bytes(&self) -> &[u8] {
         &self.mmap[self.start..self.start + self.len]
+    }
+
+    /// Dequantizes one contiguous GGUF row (dimension 0) into a caller-owned
+    /// buffer. Keeping the destination with the caller makes token embedding
+    /// lookup proportional to the requested tokens, instead of materializing
+    /// an entire vocab x hidden table on the host heap.
+    pub fn dequantize_row_to_f32(
+        &self,
+        row_index: usize,
+        output: &mut [f32],
+    ) -> Result<(), GgufTensorDataReadError> {
+        let row_width = self.row_width()?;
+        let row_count = self.row_count(row_width)?;
+        if row_index >= row_count {
+            return Err(GgufTensorDataReadError::TensorRowOutOfBounds {
+                path: self.path.clone(),
+                tensor_name: self.metadata.name.clone(),
+                row_index,
+                row_count,
+            });
+        }
+        if output.len() != row_width {
+            return Err(GgufTensorDataReadError::TensorRowOutputLengthMismatch {
+                path: self.path.clone(),
+                tensor_name: self.metadata.name.clone(),
+                expected_elements: row_width,
+                actual_elements: output.len(),
+            });
+        }
+
+        match self.element_type {
+            GgufWeightTensorElementType::F32 => {
+                let bytes = self.row_bytes(
+                    row_index,
+                    row_width
+                        .checked_mul(4)
+                        .ok_or_else(|| self.storage_width_overflow(row_width, 4))?,
+                )?;
+                for (value, chunk) in output.iter_mut().zip(bytes.chunks_exact(4)) {
+                    *value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+            }
+            GgufWeightTensorElementType::F16 => {
+                let bytes = self.row_bytes(
+                    row_index,
+                    row_width
+                        .checked_mul(2)
+                        .ok_or_else(|| self.storage_width_overflow(row_width, 2))?,
+                )?;
+                for (value, chunk) in output.iter_mut().zip(bytes.chunks_exact(2)) {
+                    *value = f16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+                }
+            }
+            GgufWeightTensorElementType::RawGgml { ggml_type } => {
+                let row_width_i64 = i64::try_from(row_width).map_err(|_| {
+                    GgufTensorDataReadError::TensorDimPlatformOverflow {
+                        path: self.path.clone(),
+                        tensor_name: self.metadata.name.clone(),
+                        dim_index: 0,
+                        dim_value: self.metadata.dims[0],
+                    }
+                })?;
+                let block_size = self.quantized_block_size(ggml_type)?;
+                if !row_width.is_multiple_of(block_size) {
+                    return Err(
+                        GgufTensorDataReadError::QuantizedTensorRowWidthNotBlockAligned {
+                            path: self.path.clone(),
+                            tensor_name: self.metadata.name.clone(),
+                            ggml_type,
+                            type_name: self.metadata.type_name.clone(),
+                            block_size: block_size as u64,
+                            ne0: self.metadata.dims[0],
+                        },
+                    );
+                }
+                let row_size = unsafe { ffi::ggml_row_size(ggml_type, row_width_i64) };
+                let bytes = self.row_bytes(row_index, row_size)?;
+                let to_float = self.quantized_to_float(ggml_type)?;
+                unsafe {
+                    to_float(
+                        bytes.as_ptr().cast::<std::ffi::c_void>(),
+                        output.as_mut_ptr(),
+                        row_width_i64,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads one logical column without retaining a full transposed f32 copy.
+    /// GGUF's first dimension is contiguous, so this is the compatibility path
+    /// for legacy `[vocab, hidden]` token tables.
+    pub fn dequantize_column_to_f32(
+        &self,
+        column_index: usize,
+        output: &mut [f32],
+    ) -> Result<(), GgufTensorDataReadError> {
+        let row_width = self.row_width()?;
+        let row_count = self.row_count(row_width)?;
+        if column_index >= row_width {
+            return Err(GgufTensorDataReadError::TensorRowOutOfBounds {
+                path: self.path.clone(),
+                tensor_name: self.metadata.name.clone(),
+                row_index: column_index,
+                row_count: row_width,
+            });
+        }
+        if output.len() != row_count {
+            return Err(GgufTensorDataReadError::TensorRowOutputLengthMismatch {
+                path: self.path.clone(),
+                tensor_name: self.metadata.name.clone(),
+                expected_elements: row_count,
+                actual_elements: output.len(),
+            });
+        }
+
+        match self.element_type {
+            GgufWeightTensorElementType::F32 => {
+                for (row_index, value) in output.iter_mut().enumerate() {
+                    let offset = row_index
+                        .checked_mul(row_width)
+                        .and_then(|offset| offset.checked_add(column_index))
+                        .and_then(|offset| offset.checked_mul(4))
+                        .ok_or_else(|| self.storage_width_overflow(self.num_elements, 4))?;
+                    let bytes = self.element_bytes(offset, 4)?;
+                    *value = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                }
+            }
+            GgufWeightTensorElementType::F16 => {
+                for (row_index, value) in output.iter_mut().enumerate() {
+                    let offset = row_index
+                        .checked_mul(row_width)
+                        .and_then(|offset| offset.checked_add(column_index))
+                        .and_then(|offset| offset.checked_mul(2))
+                        .ok_or_else(|| self.storage_width_overflow(self.num_elements, 2))?;
+                    let bytes = self.element_bytes(offset, 2)?;
+                    *value = f16_bits_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
+                }
+            }
+            GgufWeightTensorElementType::RawGgml { ggml_type } => {
+                let row_width_i64 = i64::try_from(row_width).map_err(|_| {
+                    GgufTensorDataReadError::TensorDimPlatformOverflow {
+                        path: self.path.clone(),
+                        tensor_name: self.metadata.name.clone(),
+                        dim_index: 0,
+                        dim_value: self.metadata.dims[0],
+                    }
+                })?;
+                let block_size = self.quantized_block_size(ggml_type)?;
+                if !row_width.is_multiple_of(block_size) {
+                    return Err(
+                        GgufTensorDataReadError::QuantizedTensorRowWidthNotBlockAligned {
+                            path: self.path.clone(),
+                            tensor_name: self.metadata.name.clone(),
+                            ggml_type,
+                            type_name: self.metadata.type_name.clone(),
+                            block_size: block_size as u64,
+                            ne0: self.metadata.dims[0],
+                        },
+                    );
+                }
+                let row_size = unsafe { ffi::ggml_row_size(ggml_type, row_width_i64) };
+                let block_bytes = unsafe { ffi::ggml_type_size(ggml_type) };
+                let block_index = column_index / block_size;
+                let block_offset = block_index
+                    .checked_mul(block_bytes)
+                    .ok_or_else(|| self.storage_width_overflow(block_index, block_bytes))?;
+                let block_value = column_index % block_size;
+                let block_size_i64 = i64::try_from(block_size).map_err(|_| {
+                    GgufTensorDataReadError::TensorDimPlatformOverflow {
+                        path: self.path.clone(),
+                        tensor_name: self.metadata.name.clone(),
+                        dim_index: 0,
+                        dim_value: self.metadata.dims[0],
+                    }
+                })?;
+                let mut scratch =
+                    try_allocate_zeroed(&self.metadata, &self.path, block_size, 0.0_f32)?;
+                let to_float = self.quantized_to_float(ggml_type)?;
+                for (row_index, value) in output.iter_mut().enumerate() {
+                    let row = self.row_bytes(row_index, row_size)?;
+                    let block = row
+                        .get(block_offset..block_offset + block_bytes)
+                        .ok_or_else(|| GgufTensorDataReadError::TensorPayloadLengthMismatch {
+                            path: self.path.clone(),
+                            tensor_name: self.metadata.name.clone(),
+                            expected_bytes: u64::try_from(block_offset + block_bytes)
+                                .unwrap_or(u64::MAX),
+                            actual_bytes: u64::try_from(row.len()).unwrap_or(u64::MAX),
+                        })?;
+                    unsafe {
+                        to_float(
+                            block.as_ptr().cast::<std::ffi::c_void>(),
+                            scratch.as_mut_ptr(),
+                            block_size_i64,
+                        );
+                    }
+                    *value = scratch[block_value];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn row_width(&self) -> Result<usize, GgufTensorDataReadError> {
+        self.dims.first().copied().ok_or_else(|| {
+            GgufTensorDataReadError::TensorRankUnsupportedForWeightMaterialization {
+                path: self.path.clone(),
+                tensor_name: self.metadata.name.clone(),
+                rank: 0,
+                max_supported_rank: GGUF_MAX_WEIGHT_TENSOR_RANK,
+            }
+        })
+    }
+
+    fn row_count(&self, row_width: usize) -> Result<usize, GgufTensorDataReadError> {
+        self.num_elements.checked_div(row_width).ok_or_else(|| {
+            GgufTensorDataReadError::TensorElementCountOverflow {
+                path: self.path.clone(),
+                tensor_name: self.metadata.name.clone(),
+                dims: self.metadata.dims.clone(),
+            }
+        })
+    }
+
+    fn row_bytes(
+        &self,
+        row_index: usize,
+        row_size: usize,
+    ) -> Result<&[u8], GgufTensorDataReadError> {
+        let start = row_index
+            .checked_mul(row_size)
+            .ok_or_else(|| self.storage_width_overflow(row_index, row_size))?;
+        self.element_bytes(start, row_size)
+    }
+
+    fn element_bytes(&self, start: usize, len: usize) -> Result<&[u8], GgufTensorDataReadError> {
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| self.storage_width_overflow(start, len))?;
+        self.bytes().get(start..end).ok_or_else(|| {
+            GgufTensorDataReadError::TensorPayloadLengthMismatch {
+                path: self.path.clone(),
+                tensor_name: self.metadata.name.clone(),
+                expected_bytes: u64::try_from(end).unwrap_or(u64::MAX),
+                actual_bytes: u64::try_from(self.len).unwrap_or(u64::MAX),
+            }
+        })
+    }
+
+    fn quantized_block_size(&self, ggml_type: i32) -> Result<usize, GgufTensorDataReadError> {
+        let block_size = unsafe { ffi::ggml_blck_size(ggml_type) };
+        if block_size <= 0 {
+            return Err(
+                GgufTensorDataReadError::TensorTypeUnsupportedForWeightMaterialization {
+                    path: self.path.clone(),
+                    tensor_name: self.metadata.name.clone(),
+                    ggml_type,
+                    type_name: self.metadata.type_name.clone(),
+                },
+            );
+        }
+        usize::try_from(block_size).map_err(|_| {
+            GgufTensorDataReadError::TensorDimPlatformOverflow {
+                path: self.path.clone(),
+                tensor_name: self.metadata.name.clone(),
+                dim_index: 0,
+                dim_value: self.metadata.dims[0],
+            }
+        })
+    }
+
+    fn quantized_to_float(
+        &self,
+        ggml_type: i32,
+    ) -> Result<ffi::GgmlToFloatFn, GgufTensorDataReadError> {
+        let traits_ptr = unsafe { ffi::ggml_get_type_traits(ggml_type) };
+        if traits_ptr.is_null() {
+            return Err(
+                GgufTensorDataReadError::TensorTypeUnsupportedForWeightMaterialization {
+                    path: self.path.clone(),
+                    tensor_name: self.metadata.name.clone(),
+                    ggml_type,
+                    type_name: self.metadata.type_name.clone(),
+                },
+            );
+        }
+        unsafe { (*traits_ptr).to_float }.ok_or_else(|| {
+            GgufTensorDataReadError::TensorTypeUnsupportedForWeightMaterialization {
+                path: self.path.clone(),
+                tensor_name: self.metadata.name.clone(),
+                ggml_type,
+                type_name: self.metadata.type_name.clone(),
+            }
+        })
+    }
+
+    fn storage_width_overflow(
+        &self,
+        num_elements: usize,
+        element_size_bytes: usize,
+    ) -> GgufTensorDataReadError {
+        GgufTensorDataReadError::TensorStorageWidthOverflow {
+            path: self.path.clone(),
+            tensor_name: self.metadata.name.clone(),
+            num_elements: u64::try_from(num_elements).unwrap_or(u64::MAX),
+            element_size_bytes: u64::try_from(element_size_bytes).unwrap_or(u64::MAX),
+        }
     }
 }
 
@@ -900,6 +1243,62 @@ pub enum GgufTensorDataReadError {
         expected_bytes: u64,
         actual_bytes: u64,
     },
+    #[error(
+        "gguf tensor '{tensor_name}' host allocation failed in '{path}': requested_bytes={requested_bytes}"
+    )]
+    TensorAllocationFailed {
+        path: PathBuf,
+        tensor_name: String,
+        requested_bytes: usize,
+    },
+    #[error(
+        "gguf tensor '{tensor_name}' row index {row_index} is out of bounds in '{path}': row_count={row_count}"
+    )]
+    TensorRowOutOfBounds {
+        path: PathBuf,
+        tensor_name: String,
+        row_index: usize,
+        row_count: usize,
+    },
+    #[error(
+        "gguf tensor '{tensor_name}' row output length mismatch in '{path}': expected_elements={expected_elements}, actual_elements={actual_elements}"
+    )]
+    TensorRowOutputLengthMismatch {
+        path: PathBuf,
+        tensor_name: String,
+        expected_elements: usize,
+        actual_elements: usize,
+    },
+}
+
+/// Allocates a host vector without letting Rust's infallible collection helpers
+/// turn an exhausted iOS process into `rust_oom -> abort`. All materialization
+/// paths in this reader go through this helper so callers can preserve a typed
+/// allocation failure up to the FFI boundary.
+fn try_allocate_zeroed<T: Clone>(
+    tensor: &GgufTensorMetadata,
+    path: &Path,
+    len: usize,
+    zero: T,
+) -> Result<Vec<T>, GgufTensorDataReadError> {
+    let requested_bytes = len.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+        GgufTensorDataReadError::TensorStorageWidthOverflow {
+            path: path.to_path_buf(),
+            tensor_name: tensor.name.clone(),
+            num_elements: u64::try_from(len).unwrap_or(u64::MAX),
+            element_size_bytes: u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX),
+        }
+    })?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|_| GgufTensorDataReadError::TensorAllocationFailed {
+            path: path.to_path_buf(),
+            tensor_name: tensor.name.clone(),
+            requested_bytes,
+        })?;
+    values.resize(len, zero);
+    Ok(values)
 }
 
 fn parse_tensor_alignment(
@@ -1281,6 +1680,43 @@ mod tests {
             }
         );
         assert_eq!(payload.bytes, q8_row.as_slice());
+    }
+
+    #[test]
+    fn owned_quantized_payload_reads_only_requested_rows_or_columns() {
+        let file = NamedTempFile::new().expect("temp file");
+        // Q8_0 uses one 34-byte block for each 32-value row. Two rows make
+        // the column assertion exercise the path used by legacy
+        // `[vocab, hidden]` token tables: one target block is decoded for
+        // each hidden row, without a full f32 transpose.
+        let q8_rows = vec![0_u8; 68];
+        write_fixture(
+            file.path(),
+            32,
+            &[TensorFixture {
+                name: "llm.q8.rows",
+                dims: vec![32, 2],
+                ggml_type: GGML_TYPE_Q8_0,
+                payload: q8_rows,
+                offset_override: None,
+            }],
+        );
+
+        let reader = GgufTensorDataReader::from_path(file.path()).expect("create tensor reader");
+        let payload = reader
+            .owned_weight_tensor_payload_by_name("llm.q8.rows")
+            .expect("own mmap-backed q8 payload");
+        let mut row = vec![f32::NAN; 32];
+        payload
+            .dequantize_row_to_f32(1, &mut row)
+            .expect("read one q8 row");
+        assert_eq!(row, vec![0.0; 32]);
+
+        let mut column = vec![f32::NAN; 2];
+        payload
+            .dequantize_column_to_f32(7, &mut column)
+            .expect("read one q8 column");
+        assert_eq!(column, vec![0.0; 2]);
     }
 
     #[test]

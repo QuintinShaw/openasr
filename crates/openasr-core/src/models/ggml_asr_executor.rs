@@ -463,6 +463,11 @@ pub enum GgmlAsrExecutionError {
         stage: &'static str,
         requested_bytes: usize,
     },
+    #[error("ggml host allocation failed at {stage} (requested_bytes={requested_bytes})")]
+    HostAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
     /// OADP Phase 0: an adapter is active (request `--adapter` or the
     /// server-side `OPENASR_ADAPTER` env var) but the selected family has no
     /// dynamic adapter support. Fail-closed: an adapter the user asked for is

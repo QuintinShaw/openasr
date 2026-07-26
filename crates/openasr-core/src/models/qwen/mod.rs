@@ -47,7 +47,7 @@ pub(crate) use llm_transformer::{
     load_qwen3_llm_attention_projections_from_reader_with_materialized_qkv,
 };
 pub(crate) use logits_head::{
-    Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead,
+    Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError,
     load_llm_logits_head_from_reader_with_tensor_names, load_qwen3_llm_logits_head_from_reader,
     load_qwen3_llm_logits_head_from_reader_with_output_tensor,
 };
@@ -64,7 +64,8 @@ pub(crate) use prompt_embedding::{
     Qwen3AsrPromptEmbeddings, build_qwen3_prompt_embeddings_with_audio_splice,
 };
 pub(crate) use token_embedding::{
-    Qwen3AsrTokenEmbeddingTable, load_qwen3_token_embedding_table_from_reader,
+    Qwen3AsrTokenEmbeddingError, Qwen3AsrTokenEmbeddingTable,
+    load_qwen3_token_embedding_table_from_reader,
     load_token_embedding_table_from_reader_with_tensor_name,
 };
 pub(crate) use tokenizer::Qwen3AsrTokenizer;

@@ -978,6 +978,11 @@ pub enum BackendError {
         stage: &'static str,
         requested_bytes: usize,
     },
+    #[error("Native ASR host allocation failed at {stage} (requested_bytes={requested_bytes}).")]
+    HostAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
     #[error("Native ASR execution device was not found: {detail}")]
     ExecutionDeviceNotFound { detail: String },
     #[error("Native ASR execution device is not exactly addressable: {detail}")]

@@ -780,7 +780,8 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
         {
             FailureCategory::Alloc
         }
-        BackendError::ContextAllocationFailed { .. } => FailureCategory::Alloc,
+        BackendError::ContextAllocationFailed { .. }
+        | BackendError::HostAllocationFailed { .. } => FailureCategory::Alloc,
         BackendError::NativeFailClosed { .. }
         | BackendError::WordTimestampAlignmentFailed { .. } => FailureCategory::Decode,
     }
@@ -2601,6 +2602,13 @@ fn dispatch_error_to_backend(
             stage,
             requested_bytes,
         } => BackendError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        GgmlAsrExecutionError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => BackendError::HostAllocationFailed {
             stage,
             requested_bytes,
         },
@@ -4931,6 +4939,25 @@ mod tests {
             BackendError::ContextAllocationFailed {
                 stage: "pool",
                 requested_bytes: 805_306_368,
+            }
+        ));
+        assert_eq!(
+            classify_backend_error_for_failure_log(&error),
+            FailureCategory::Alloc
+        );
+    }
+
+    #[test]
+    fn dispatch_preserves_typed_host_allocation_failure_without_display_recovery() {
+        let error = dispatch_error_to_backend(GgmlAsrExecutionError::HostAllocationFailed {
+            stage: "token-row-gather",
+            requested_bytes: 16_384,
+        });
+        assert!(matches!(
+            error,
+            BackendError::HostAllocationFailed {
+                stage: "token-row-gather",
+                requested_bytes: 16_384,
             }
         ));
         assert_eq!(

@@ -20,9 +20,9 @@ use super::cohere::{
 };
 use super::qwen::{
     Qwen3AsrAudioEncoderWeights, Qwen3AsrLlmLayerAttentionProjection, Qwen3AsrLlmLogitsHead,
-    Qwen3AsrTokenEmbeddingTable, load_qwen3_audio_encoder_weights_from_reader,
-    load_qwen3_llm_attention_projections_from_reader, load_qwen3_llm_logits_head_from_reader,
-    load_qwen3_token_embedding_table_from_reader,
+    Qwen3AsrLlmLogitsHeadError, Qwen3AsrTokenEmbeddingError, Qwen3AsrTokenEmbeddingTable,
+    load_qwen3_audio_encoder_weights_from_reader, load_qwen3_llm_attention_projections_from_reader,
+    load_qwen3_llm_logits_head_from_reader, load_qwen3_token_embedding_table_from_reader,
 };
 use super::runtime_tensor_contract_registry::RuntimeTensorContractMetadata;
 
@@ -100,6 +100,14 @@ pub(crate) enum BuiltinRuntimeWeightComponentRegistryError {
         component: &'static str,
         reason: String,
     },
+    #[error(
+        "builtin runtime weights host allocation failed for '{component}' at {stage}: requested_bytes={requested_bytes}"
+    )]
+    MaterializationHostAllocationFailed {
+        component: &'static str,
+        stage: &'static str,
+        requested_bytes: usize,
+    },
 }
 
 pub(crate) fn materialize_builtin_runtime_weight_components(
@@ -146,12 +154,8 @@ pub(crate) fn materialize_builtin_runtime_weight_components(
                     },
                 )?;
             let token_embedding_table =
-                load_qwen3_token_embedding_table_from_reader(reader, metadata).map_err(
-                    |error| BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
-                        component: "qwen3-asr.token-embedding",
-                        reason: error.to_string(),
-                    },
-                )?;
+                load_qwen3_token_embedding_table_from_reader(reader, metadata)
+                    .map_err(qwen_token_embedding_materialization_error)?;
             // Weight materialization here is cached per (architecture, pack)
             // and reused across every request regardless of which request's
             // resolved backend triggered the (first, cold) build -- so
@@ -160,12 +164,7 @@ pub(crate) fn materialize_builtin_runtime_weight_components(
             // that request's own `resolved_runtime`, never re-derived here.
             let logits_head =
                 load_qwen3_llm_logits_head_from_reader(reader, runtime_source, metadata, backend)
-                    .map_err(|error| {
-                    BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
-                        component: "qwen3-asr.logits-head",
-                        reason: error.to_string(),
-                    }
-                })?;
+                    .map_err(qwen_logits_head_materialization_error)?;
             let layer_attention_projections =
                 load_qwen3_llm_attention_projections_from_reader(reader, metadata).map_err(
                     |error| BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
@@ -197,6 +196,44 @@ pub(crate) fn materialize_builtin_runtime_weight_components(
                 model_architecture: model_architecture.to_string(),
             },
         ),
+    }
+}
+
+fn qwen_token_embedding_materialization_error(
+    error: Qwen3AsrTokenEmbeddingError,
+) -> BuiltinRuntimeWeightComponentRegistryError {
+    match error {
+        Qwen3AsrTokenEmbeddingError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => BuiltinRuntimeWeightComponentRegistryError::MaterializationHostAllocationFailed {
+            component: "qwen3-asr.token-embedding",
+            stage,
+            requested_bytes,
+        },
+        error => BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
+            component: "qwen3-asr.token-embedding",
+            reason: error.to_string(),
+        },
+    }
+}
+
+fn qwen_logits_head_materialization_error(
+    error: Qwen3AsrLlmLogitsHeadError,
+) -> BuiltinRuntimeWeightComponentRegistryError {
+    match error {
+        Qwen3AsrLlmLogitsHeadError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => BuiltinRuntimeWeightComponentRegistryError::MaterializationHostAllocationFailed {
+            component: "qwen3-asr.logits-head",
+            stage,
+            requested_bytes,
+        },
+        error => BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
+            component: "qwen3-asr.logits-head",
+            reason: error.to_string(),
+        },
     }
 }
 

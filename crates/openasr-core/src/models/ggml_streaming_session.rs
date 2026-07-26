@@ -398,11 +398,27 @@ where
     }
 
     fn driver_error_to_native(&self, error: GgmlAsrExecutionError) -> NativeAsrError {
-        NativeAsrError::SessionFailed {
-            message: format!(
-                "native ggml streaming driver '{}' failed for adapter '{}': {error}",
-                self.executor_id, self.adapter_id
-            ),
+        match error {
+            GgmlAsrExecutionError::ContextAllocationFailed {
+                stage,
+                requested_bytes,
+            } => NativeAsrError::ContextAllocationFailed {
+                stage,
+                requested_bytes,
+            },
+            GgmlAsrExecutionError::HostAllocationFailed {
+                stage,
+                requested_bytes,
+            } => NativeAsrError::HostAllocationFailed {
+                stage,
+                requested_bytes,
+            },
+            error => NativeAsrError::SessionFailed {
+                message: format!(
+                    "native ggml streaming driver '{}' failed for adapter '{}': {error}",
+                    self.executor_id, self.adapter_id
+                ),
+            },
         }
     }
 

@@ -203,6 +203,13 @@ enum Qwen3AsrGgmlExecutorError {
         stage: &'static str,
         requested_bytes: usize,
     },
+    #[error(
+        "qwen3-asr ggml executor host allocation failed at {stage} (requested_bytes={requested_bytes})"
+    )]
+    HostAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
     #[error("qwen3-asr runtime contract check failed: {reason}")]
     RuntimeContractViolation { reason: String },
     #[error("qwen3-asr runtime metadata read failed: {reason}")]
@@ -963,6 +970,18 @@ fn map_audio_encoder_error(error: Qwen3AsrAudioEncoderError) -> Qwen3AsrGgmlExec
 }
 
 fn map_logits_head_error(error: Qwen3AsrLlmLogitsHeadError) -> Qwen3AsrGgmlExecutorError {
+    let error = match error {
+        Qwen3AsrLlmLogitsHeadError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => {
+            return Qwen3AsrGgmlExecutorError::HostAllocationFailed {
+                stage,
+                requested_bytes,
+            };
+        }
+        error => error,
+    };
     if let Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed { source } = &error
         && let Some(mapped) = qwen_context_allocation_failure(source)
     {
@@ -996,13 +1015,29 @@ fn qwen_context_allocation_failure(error: &GgmlCpuGraphError) -> Option<Qwen3Asr
 }
 
 fn map_token_embedding_error(error: Qwen3AsrTokenEmbeddingError) -> Qwen3AsrGgmlExecutorError {
-    Qwen3AsrGgmlExecutorError::TokenEmbeddingPrefillFailed {
-        reason: error.to_string(),
+    match error {
+        Qwen3AsrTokenEmbeddingError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrGgmlExecutorError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        error => Qwen3AsrGgmlExecutorError::TokenEmbeddingPrefillFailed {
+            reason: error.to_string(),
+        },
     }
 }
 
 fn map_prepared_runtime_error(error: Qwen3AsrPreparedRuntimeError) -> Qwen3AsrGgmlExecutorError {
     match error {
+        Qwen3AsrPreparedRuntimeError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrGgmlExecutorError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        },
         Qwen3AsrPreparedRuntimeError::RuntimeContractViolation { reason } => {
             Qwen3AsrGgmlExecutorError::RuntimeContractViolation { reason }
         }
@@ -1570,6 +1605,13 @@ fn qwen_execute_error_to_ggml(
             stage,
             requested_bytes,
         },
+        Qwen3AsrGgmlExecutorError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => GgmlAsrExecutionError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        },
         Qwen3AsrGgmlExecutorError::ServeBatchUnavailable { reason, retryable } => {
             GgmlAsrExecutionError::ServeBatchUnavailable { reason, retryable }
         }
@@ -1713,6 +1755,34 @@ mod tests {
                 requested_bytes: 805_306_368,
             }
         );
+    }
+
+    #[test]
+    fn qwen_host_allocation_failure_remains_typed_through_executor_boundary() {
+        let mapped = map_token_embedding_error(Qwen3AsrTokenEmbeddingError::HostAllocationFailed {
+            stage: "token-row-gather",
+            requested_bytes: 16_384,
+        });
+        assert_eq!(
+            qwen_execute_error_to_ggml(mapped, QWEN3_ASR_GGML_ADAPTER_ID),
+            GgmlAsrExecutionError::HostAllocationFailed {
+                stage: "token-row-gather",
+                requested_bytes: 16_384,
+            }
+        );
+
+        let from_prepared =
+            map_prepared_runtime_error(Qwen3AsrPreparedRuntimeError::HostAllocationFailed {
+                stage: "gguf-token-embedding-read",
+                requested_bytes: 622_329_856,
+            });
+        assert!(matches!(
+            from_prepared,
+            Qwen3AsrGgmlExecutorError::HostAllocationFailed {
+                stage: "gguf-token-embedding-read",
+                requested_bytes: 622_329_856,
+            }
+        ));
     }
 
     fn qwen_metadata_with_llm_layers(llm_layers: usize) -> BTreeMap<String, String> {

@@ -1105,14 +1105,16 @@ pub extern "C" fn openasr_last_error_message() -> *const c_char {
 
 fn native_error_status(_error: &NativeAsrError, fallback: OpenAsrStatus) -> OpenAsrStatus {
     match _error {
-        NativeAsrError::ContextAllocationFailed { .. } => OpenAsrStatus::OutOfMemory,
+        NativeAsrError::ContextAllocationFailed { .. }
+        | NativeAsrError::HostAllocationFailed { .. } => OpenAsrStatus::OutOfMemory,
         _ => fallback,
     }
 }
 
 fn backend_error_status(_error: &BackendError, fallback: OpenAsrStatus) -> OpenAsrStatus {
     match _error {
-        BackendError::ContextAllocationFailed { .. } => OpenAsrStatus::OutOfMemory,
+        BackendError::ContextAllocationFailed { .. }
+        | BackendError::HostAllocationFailed { .. } => OpenAsrStatus::OutOfMemory,
         _ => fallback,
     }
 }
@@ -1410,12 +1412,22 @@ mod tests {
     }
 
     #[test]
-    fn native_error_status_only_maps_the_typed_context_allocation_failure() {
+    fn native_error_status_only_maps_typed_allocation_failures() {
         assert_eq!(
             native_error_status(
                 &NativeAsrError::ContextAllocationFailed {
                     stage: "pool",
                     requested_bytes: 805_306_368,
+                },
+                OpenAsrStatus::TranscribeFailed,
+            ),
+            OpenAsrStatus::OutOfMemory
+        );
+        assert_eq!(
+            native_error_status(
+                &NativeAsrError::HostAllocationFailed {
+                    stage: "token-row-gather",
+                    requested_bytes: 16_384,
                 },
                 OpenAsrStatus::TranscribeFailed,
             ),
@@ -1436,6 +1448,16 @@ mod tests {
                 &BackendError::ContextAllocationFailed {
                     stage: "pool",
                     requested_bytes: 805_306_368,
+                },
+                OpenAsrStatus::TranscribeFailed,
+            ),
+            OpenAsrStatus::OutOfMemory
+        );
+        assert_eq!(
+            backend_error_status(
+                &BackendError::HostAllocationFailed {
+                    stage: "token-row-gather",
+                    requested_bytes: 16_384,
                 },
                 OpenAsrStatus::TranscribeFailed,
             ),

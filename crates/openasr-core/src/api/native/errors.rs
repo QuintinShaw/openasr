@@ -35,6 +35,11 @@ pub enum NativeAsrError {
         stage: &'static str,
         requested_bytes: usize,
     },
+    #[error("Native ASR host allocation failed at {stage} (requested_bytes={requested_bytes}).")]
+    HostAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
     #[error("Native ASR session is closed.")]
     SessionClosed,
     #[error("Native ASR session failed: {message}.")]

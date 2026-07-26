@@ -5,7 +5,8 @@ use thiserror::Error;
 use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlStaticTensor,
-    GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader, env_toggle_with_raw,
+    GgmlStaticTensorArena, GgufOwnedWeightTensorPayload, GgufTensorDataReadError,
+    GgufTensorDataReader, env_toggle_with_raw,
 };
 use crate::models::thread_local_runtime_cache::{
     BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
@@ -67,6 +68,21 @@ pub(crate) enum Qwen3AsrLlmLogitsHeadError {
     NonFiniteInputs,
     #[error("qwen3-asr llm logits head fallback values are unavailable")]
     OutputWeightValuesUnavailable,
+    #[error(
+        "qwen3-asr llm logits head tensor '{tensor_name}' uses unsupported shape {shape}: {reason}"
+    )]
+    DirectMmapWeightRequired {
+        tensor_name: &'static str,
+        shape: String,
+        reason: &'static str,
+    },
+    #[error(
+        "qwen3-asr llm logits head host allocation failed at {stage}: requested_bytes={requested_bytes}"
+    )]
+    HostAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
     #[error("qwen3-asr llm logits head internal allocation overflowed")]
     AllocationOverflow,
     #[error(
@@ -82,9 +98,7 @@ pub(crate) enum Qwen3AsrLlmLogitsHeadError {
 
 #[derive(Debug, Clone)]
 struct OwnedGgmlLogitsWeight {
-    ggml_type: i32,
-    dims: Vec<usize>,
-    bytes: Vec<u8>,
+    payload: GgufOwnedWeightTensorPayload,
 }
 
 pub(crate) struct Qwen3AsrLlmFusedLogitsHeadSpec<'a> {
@@ -107,9 +121,9 @@ impl Qwen3AsrLlmLogitsHead {
             rms_norm_epsilon: self.rms_norm_epsilon,
             output_norm_weight: &self.output_norm_weight,
             output_weight_tensor_name: self.output_weight_tensor_name,
-            output_weight_ggml_type: output_weight.ggml_type,
-            output_weight_dims: &output_weight.dims,
-            output_weight_bytes: &output_weight.bytes,
+            output_weight_ggml_type: output_weight.payload.element_type.ggml_type(),
+            output_weight_dims: &output_weight.payload.dims,
+            output_weight_bytes: output_weight.payload.bytes(),
         })
     }
 
@@ -148,7 +162,7 @@ impl Qwen3AsrLlmLogitsHead {
             .output_weight_values
             .as_ref()
             .ok_or(Qwen3AsrLlmLogitsHeadError::OutputWeightValuesUnavailable)?;
-        let mut logits = vec![0.0_f32; self.vocab_size];
+        let mut logits = try_allocate_f32(self.vocab_size, "qwen3-asr-logits-host-output")?;
         match self.output_weight_layout {
             OutputWeightLayout::HiddenVocab => {
                 for (hidden_idx, hidden_value) in normed.iter().copied().enumerate() {
@@ -336,46 +350,40 @@ pub(crate) fn load_llm_logits_head_from_reader_with_tensor_names(
     if output_norm_weight.iter().any(|value| !value.is_finite()) {
         return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
     }
-    let raw_output_weight = if logits_head_ggml_enabled(backend) {
-        load_direct_output_weight_payload(
-            reader,
-            output_weight_tensor_name,
-            &output_weight_dims,
-            d_model,
-            vocab_size,
-        )?
-    } else {
-        None
-    };
-    let output_weight_values = if raw_output_weight.is_some() {
-        None
-    } else {
-        let values = reader
-            .host_tensor_f32_copy_dequantized_by_name(
-                output_weight_tensor_name,
-                &output_weight_dims,
-            )
-            .map_err(map_tensor_read_error)?;
-        if values.iter().any(|value| !value.is_finite()) {
-            return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
-        }
-        Some(values)
-    };
+    if output_weight_layout != OutputWeightLayout::VocabHidden {
+        return Err(Qwen3AsrLlmLogitsHeadError::DirectMmapWeightRequired {
+            tensor_name: output_weight_tensor_name,
+            shape: render_shape(&output_weight_dims),
+            reason: "only canonical [hidden, vocab] GGUF layout can run without host materialization",
+        });
+    }
+    if !logits_head_ggml_enabled(backend) {
+        return Err(Qwen3AsrLlmLogitsHeadError::DirectMmapWeightRequired {
+            tensor_name: output_weight_tensor_name,
+            shape: render_shape(&output_weight_dims),
+            reason: "the mmap-backed ggml logits path is required to avoid a full host copy",
+        });
+    }
+    let raw_output_weight = load_direct_output_weight_payload(
+        reader,
+        output_weight_tensor_name,
+        &output_weight_dims,
+        d_model,
+        vocab_size,
+    )?;
     Ok(Qwen3AsrLlmLogitsHead {
         d_model,
         vocab_size,
         rms_norm_epsilon,
         output_norm_weight,
         output_weight_tensor_name,
-        output_weight_values,
+        output_weight_values: None,
         output_weight_layout,
-        ggml_executor_cache_key: raw_output_weight.as_ref().map(|_| {
-            (
-                PackContentKey::for_runtime_source(runtime_source),
-                qwen_runtime_graph_config(backend).backend,
-            )
-        }),
-        ggml_output_weight: raw_output_weight,
+        ggml_executor_cache_key: Some((
+            PackContentKey::for_runtime_source(runtime_source),
+            qwen_runtime_graph_config(backend).backend,
+        )),
+        ggml_output_weight: Some(raw_output_weight),
     })
 }
 
@@ -385,21 +393,25 @@ fn load_direct_output_weight_payload(
     dims: &[u64],
     d_model: usize,
     vocab_size: usize,
-) -> Result<Option<OwnedGgmlLogitsWeight>, Qwen3AsrLlmLogitsHeadError> {
+) -> Result<OwnedGgmlLogitsWeight, Qwen3AsrLlmLogitsHeadError> {
     if dims != [d_model as u64, vocab_size as u64] {
-        return Ok(None);
+        return Err(Qwen3AsrLlmLogitsHeadError::DirectMmapWeightRequired {
+            tensor_name: output_weight_tensor_name,
+            shape: render_shape(dims),
+            reason: "only canonical [hidden, vocab] GGUF layout is supported",
+        });
     }
     let payload = reader
-        .weight_tensor_payload_by_name(output_weight_tensor_name)
+        .owned_weight_tensor_payload_by_name(output_weight_tensor_name)
         .map_err(map_tensor_read_error)?;
     if payload.dims.as_slice() != [d_model, vocab_size] {
-        return Ok(None);
+        return Err(Qwen3AsrLlmLogitsHeadError::DirectMmapWeightRequired {
+            tensor_name: output_weight_tensor_name,
+            shape: format!("{:?}", payload.dims),
+            reason: "owned GGUF payload shape changed while loading",
+        });
     }
-    Ok(Some(OwnedGgmlLogitsWeight {
-        ggml_type: payload.element_type.ggml_type(),
-        dims: payload.dims,
-        bytes: payload.bytes.to_vec(),
-    }))
+    Ok(OwnedGgmlLogitsWeight { payload })
 }
 
 struct Qwen3AsrLlmLogitsHeadGraphExecutor {
@@ -487,7 +499,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
                 reason: "logits head norm weight width mismatch",
             });
         }
-        if output_weight.dims.as_slice() != [d_model, vocab_size] {
+        if output_weight.payload.dims.as_slice() != [d_model, vocab_size] {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "logits head output weight shape mismatch",
             });
@@ -510,7 +522,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         let weight = arena.new_matmul_weight_2d_typed(
             d_model,
             vocab_size,
-            output_weight.ggml_type,
+            output_weight.payload.element_type.ggml_type(),
             "qwen_llm_logits_output_weight",
         )?;
         let argmax_reverse_indices =
@@ -522,7 +534,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         )?;
         arena.set_bytes_slice(
             weight,
-            &output_weight.bytes,
+            output_weight.payload.bytes(),
             "qwen_llm_logits_output_weight",
         )?;
         arena.set_i32_slice(
@@ -665,16 +677,42 @@ fn rms_norm_with_weight(
         ss += value * value;
     }
     let inv_rms = (ss / hidden.len() as f32 + epsilon).sqrt().recip();
-    let mut out = vec![0.0_f32; hidden.len()];
+    let mut out = try_allocate_f32(hidden.len(), "qwen3-asr-rms-norm-output")?;
     for idx in 0..hidden.len() {
         out[idx] = hidden[idx] * inv_rms * weight[idx];
     }
     Ok(out)
 }
 
+fn try_allocate_f32(
+    len: usize,
+    stage: &'static str,
+) -> Result<Vec<f32>, Qwen3AsrLlmLogitsHeadError> {
+    let requested_bytes = len
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or(Qwen3AsrLlmLogitsHeadError::AllocationOverflow)?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|_| {
+        Qwen3AsrLlmLogitsHeadError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        }
+    })?;
+    values.resize(len, 0.0);
+    Ok(values)
+}
+
 fn map_tensor_read_error(error: GgufTensorDataReadError) -> Qwen3AsrLlmLogitsHeadError {
-    Qwen3AsrLlmLogitsHeadError::TensorReadFailed {
-        reason: error.to_string(),
+    match error {
+        GgufTensorDataReadError::TensorAllocationFailed {
+            requested_bytes, ..
+        } => Qwen3AsrLlmLogitsHeadError::HostAllocationFailed {
+            stage: "gguf-logits-head-read",
+            requested_bytes,
+        },
+        error => Qwen3AsrLlmLogitsHeadError::TensorReadFailed {
+            reason: error.to_string(),
+        },
     }
 }
 
@@ -735,7 +773,11 @@ fn resolve_output_weight_layout(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::GgufTensorDataReader;
+    use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
 
     #[test]
     fn logits_head_hidden_vocab_layout_matches_manual_matmul() {
@@ -843,18 +885,71 @@ mod tests {
         assert_send_sync::<Qwen3AsrLlmLogitsHead>();
     }
 
+    #[test]
+    fn canonical_direct_logits_weight_clone_reuses_the_same_mmap_payload() {
+        let fixture = tempfile::NamedTempFile::new().expect("temporary GGUF fixture");
+        let spec = TinyGgufFixtureSpec::new(BTreeMap::new())
+            .with_tensor_names([OUTPUT_WEIGHT_TENSOR_NAME.to_string()])
+            .with_tensor_shape(OUTPUT_WEIGHT_TENSOR_NAME, [2_u64, 3_u64]);
+        write_tiny_gguf_runtime_source(fixture.path(), &spec).expect("write GGUF fixture");
+        let reader = GgufTensorDataReader::from_path(fixture.path()).expect("read GGUF fixture");
+
+        let weight =
+            load_direct_output_weight_payload(&reader, OUTPUT_WEIGHT_TENSOR_NAME, &[2, 3], 2, 3)
+                .expect("canonical direct mmap weight");
+        let cloned = weight.clone();
+        assert_eq!(
+            weight.payload.bytes().as_ptr(),
+            cloned.payload.bytes().as_ptr(),
+            "prepared-runtime clones must share the mmap-backed logits matrix"
+        );
+    }
+
+    #[test]
+    fn transposed_logits_weight_fails_closed_instead_of_full_host_materialization() {
+        let fixture = tempfile::NamedTempFile::new().expect("temporary GGUF fixture");
+        let spec = TinyGgufFixtureSpec::new(BTreeMap::new())
+            .with_tensor_names([
+                OUTPUT_NORM_WEIGHT_TENSOR_NAME.to_string(),
+                OUTPUT_WEIGHT_TENSOR_NAME.to_string(),
+            ])
+            .with_tensor_shape(OUTPUT_NORM_WEIGHT_TENSOR_NAME, [2_u64])
+            .with_tensor_shape(OUTPUT_WEIGHT_TENSOR_NAME, [3_u64, 2_u64]);
+        write_tiny_gguf_runtime_source(fixture.path(), &spec).expect("write GGUF fixture");
+        let reader = GgufTensorDataReader::from_path(fixture.path()).expect("read GGUF fixture");
+        let runtime_source = crate::validate_ggml_runtime_source_path(fixture.path())
+            .expect("validate runtime source");
+
+        let error = load_llm_logits_head_from_reader_with_tensor_names(
+            &reader,
+            &runtime_source,
+            2,
+            3,
+            OUTPUT_NORM_WEIGHT_TENSOR_NAME,
+            OUTPUT_WEIGHT_TENSOR_NAME,
+            DEFAULT_RMS_NORM_EPSILON,
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect_err("transposed logits must not allocate a full f32 host matrix");
+        assert!(matches!(
+            error,
+            Qwen3AsrLlmLogitsHeadError::DirectMmapWeightRequired { .. }
+        ));
+    }
+
     fn ggml_logits_head_with_cache_key(
         cache_key: QwenLogitsHeadExecutorCacheKey,
         output_norm_weight: Vec<f32>,
     ) -> Qwen3AsrLlmLogitsHead {
-        // A valid rank-2 [d_model x vocab_size] f32 weight for d_model=2,
-        // vocab_size=3, matching the fused-logits fixture in
-        // `llm_transformer::tests::fused_logits_top1_selects_first_token_on_equal_logit_tie`.
-        let output_weight_values: [f32; 6] = [
-            0.1, 0.0, //
-            0.3, 0.0, //
-            0.3, 0.0,
-        ];
+        let fixture = tempfile::NamedTempFile::new().expect("temporary GGUF fixture");
+        let spec = TinyGgufFixtureSpec::new(BTreeMap::new())
+            .with_tensor_names([OUTPUT_WEIGHT_TENSOR_NAME.to_string()])
+            .with_tensor_shape(OUTPUT_WEIGHT_TENSOR_NAME, [2_u64, 3_u64]);
+        write_tiny_gguf_runtime_source(fixture.path(), &spec).expect("write GGUF fixture");
+        let reader = GgufTensorDataReader::from_path(fixture.path()).expect("read GGUF fixture");
+        let payload = reader
+            .owned_weight_tensor_payload_by_name(OUTPUT_WEIGHT_TENSOR_NAME)
+            .expect("own mmap-backed output weight");
         Qwen3AsrLlmLogitsHead {
             d_model: 2,
             vocab_size: 3,
@@ -863,14 +958,7 @@ mod tests {
             output_weight_tensor_name: OUTPUT_WEIGHT_TENSOR_NAME,
             output_weight_values: None,
             output_weight_layout: OutputWeightLayout::HiddenVocab,
-            ggml_output_weight: Some(OwnedGgmlLogitsWeight {
-                ggml_type: crate::ggml_runtime::GGML_TYPE_F32,
-                dims: vec![2, 3],
-                bytes: output_weight_values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect(),
-            }),
+            ggml_output_weight: Some(OwnedGgmlLogitsWeight { payload }),
             ggml_executor_cache_key: Some(cache_key),
         }
     }

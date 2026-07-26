@@ -44,6 +44,13 @@ pub(crate) enum Qwen3AsrPreparedRuntimeError {
     LlmLogitsHeadFailed { reason: String },
     #[error("qwen3-asr llm transformer decode step failed: {reason}")]
     LlmTransformerDecodeStepFailed { reason: String },
+    #[error(
+        "qwen3-asr runtime host allocation failed at {stage}: requested_bytes={requested_bytes}"
+    )]
+    HostAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
 }
 
 pub(crate) fn build_qwen_prepared_runtime(
@@ -107,6 +114,14 @@ fn map_runtime_weight_component_error(
     error: BuiltinRuntimeWeightComponentRegistryError,
 ) -> Qwen3AsrPreparedRuntimeError {
     match error {
+        BuiltinRuntimeWeightComponentRegistryError::MaterializationHostAllocationFailed {
+            stage,
+            requested_bytes,
+            ..
+        } => Qwen3AsrPreparedRuntimeError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        },
         BuiltinRuntimeWeightComponentRegistryError::MaterializationFailed {
             component: "qwen3-asr.audio-encoder-weights",
             reason,
@@ -165,5 +180,23 @@ mod tests {
     fn qwen_prepared_runtime_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Qwen3AsrPreparedRuntime>();
+    }
+
+    #[test]
+    fn prepared_runtime_preserves_typed_weight_materialization_allocation_failure() {
+        let error = map_runtime_weight_component_error(
+            BuiltinRuntimeWeightComponentRegistryError::MaterializationHostAllocationFailed {
+                component: "qwen3-asr.token-embedding",
+                stage: "gguf-token-embedding-read",
+                requested_bytes: 622_329_856,
+            },
+        );
+        assert!(matches!(
+            error,
+            Qwen3AsrPreparedRuntimeError::HostAllocationFailed {
+                stage: "gguf-token-embedding-read",
+                requested_bytes: 622_329_856,
+            }
+        ));
     }
 }

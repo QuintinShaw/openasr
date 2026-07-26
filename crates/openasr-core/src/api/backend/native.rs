@@ -532,6 +532,13 @@ fn native_ggml_streaming_error_to_asr(
             stage,
             requested_bytes,
         },
+        GgmlAsrExecutionError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => NativeAsrError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        },
         other => {
             if let Some(route_error) =
                 crate::device::execution_route::ExecutionRouteError::from_embedded_message(
@@ -594,6 +601,13 @@ fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {
             stage,
             requested_bytes,
         } => NativeAsrError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        BackendError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => NativeAsrError::HostAllocationFailed {
             stage,
             requested_bytes,
         },
@@ -1549,6 +1563,36 @@ mod tests {
             NativeAsrError::ContextAllocationFailed {
                 stage: "pool",
                 requested_bytes: 805_306_368,
+            }
+        );
+    }
+
+    #[test]
+    fn typed_host_allocation_failure_survives_native_offline_and_streaming_boundaries() {
+        let backend = BackendError::HostAllocationFailed {
+            stage: "token-row-gather",
+            requested_bytes: 16_384,
+        };
+        assert_eq!(
+            native_backend_error_to_asr(backend),
+            NativeAsrError::HostAllocationFailed {
+                stage: "token-row-gather",
+                requested_bytes: 16_384,
+            }
+        );
+
+        let stream = native_ggml_streaming_error_to_asr(
+            "qwen3-asr",
+            GgmlAsrExecutionError::HostAllocationFailed {
+                stage: "token-row-gather",
+                requested_bytes: 16_384,
+            },
+        );
+        assert_eq!(
+            stream,
+            NativeAsrError::HostAllocationFailed {
+                stage: "token-row-gather",
+                requested_bytes: 16_384,
             }
         );
     }
