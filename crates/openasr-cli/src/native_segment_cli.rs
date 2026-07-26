@@ -1395,6 +1395,60 @@ mod tests {
         run()
     }
 
+    #[test]
+    fn serve_auto_binds_default_from_content_addressed_ref() {
+        use sha2::Digest as _;
+
+        with_env_lock(|| {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+            let _home = EnvVarRestore::set_os("OPENASR_HOME", home);
+            let config = OpenAsrConfig {
+                default_model: Some("moonshine-tiny".to_string()),
+                ..Default::default()
+            };
+            openasr_core::save_config(home, &config).unwrap();
+
+            let source = home.join("fixture-source.oasr");
+            let spec =
+                openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(
+                    "moonshine-tiny",
+                );
+            openasr_core::testing::write_tiny_gguf_runtime_source(&source, &spec).unwrap();
+            let bytes = std::fs::read(&source).unwrap();
+            std::fs::remove_file(&source).unwrap();
+            let sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+            let object = home
+                .join("models/objects/sha256")
+                .join(&sha256)
+                .join("content");
+            std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+            std::fs::write(&object, &bytes).unwrap();
+            let reference = home.join("models/refs/moonshine-tiny/q8_0.json");
+            std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+            let pack = openasr_core::InstalledPack {
+                model_id: "moonshine-tiny".to_string(),
+                display_name: "Moonshine Tiny".to_string(),
+                quant: "q8_0".to_string(),
+                suffix: "q8".to_string(),
+                pull: "moonshine-tiny:q8".to_string(),
+                filename: "moonshine-tiny-q8_0.oasr".to_string(),
+                path: object.clone(),
+                url: "https://example.invalid/moonshine-tiny-q8_0.oasr".to_string(),
+                hf_revision: "test".to_string(),
+                sha256,
+                size_bytes: bytes.len() as u64,
+                installed_at_unix_seconds: 1,
+                source: None,
+            };
+            std::fs::write(reference, serde_json::to_vec(&pack).unwrap()).unwrap();
+
+            let resolved =
+                resolve_serve_model_source(None, BackendKind::Native, None, &config).unwrap();
+            assert_eq!(resolved.model_pack_path, Some(object));
+        });
+    }
+
     // Locks the three-tier priority `selected_model_ref` must keep: an explicit
     // `--model` always wins, then the persisted `config.default_model`, and only
     // with neither does the CLI fall back to `DEFAULT_MODEL_ID` -- the

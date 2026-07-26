@@ -78,6 +78,42 @@ fn with_server_instance_token_env<T>(value: Option<&str>, run: impl FnOnce() -> 
     run()
 }
 
+fn write_content_addressed_moonshine_ref(home: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(home).unwrap();
+    let staging = home.join("fixture-source.oasr");
+    let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer("moonshine-tiny");
+    write_tiny_gguf_runtime_source(&staging, &spec).expect("write content-addressed fixture");
+    let bytes = std::fs::read(&staging).unwrap();
+    std::fs::remove_file(&staging).unwrap();
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let object = home
+        .join("models/objects/sha256")
+        .join(&sha256)
+        .join("content");
+    std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+    std::fs::write(&object, &bytes).unwrap();
+
+    let reference = home.join("models/refs/moonshine-tiny/q8_0.json");
+    std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+    let pack = openasr_core::InstalledPack {
+        model_id: "moonshine-tiny".to_string(),
+        display_name: "Moonshine Tiny".to_string(),
+        quant: "q8_0".to_string(),
+        suffix: "q8".to_string(),
+        pull: "moonshine-tiny:q8".to_string(),
+        filename: "moonshine-tiny-q8_0.oasr".to_string(),
+        path: object.clone(),
+        url: "https://example.invalid/moonshine-tiny-q8_0.oasr".to_string(),
+        hf_revision: "test".to_string(),
+        sha256,
+        size_bytes: bytes.len() as u64,
+        installed_at_unix_seconds: 1,
+        source: None,
+    };
+    std::fs::write(reference, serde_json::to_vec_pretty(&pack).unwrap()).unwrap();
+    object
+}
+
 fn write_mock_gguf_runtime_source(path: &std::path::Path, metadata_model_id: Option<&str>) {
     let spec = metadata_model_id.map_or_else(
         || TinyGgufFixtureSpec::new(Default::default()),
@@ -1504,6 +1540,91 @@ async fn pull_request_catalog_url_body_field_is_ignored() {
     let completed = wait_for_terminal_job(app, started["job_id"].as_str().unwrap()).await;
     assert_eq!(completed["state"], "completed");
     assert_eq!(completed["pull"], "moonshine-tiny:q8");
+}
+
+#[tokio::test]
+async fn content_addressed_refs_drive_local_and_default_model_endpoints() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let object = write_content_addressed_moonshine_ref(&home);
+    std::fs::write(
+        home.join("config.json"),
+        r#"{"default_model":"moonshine-tiny"}"#,
+    )
+    .unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let response = app
+        .clone()
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/local")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let local: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 64).await.unwrap()).unwrap();
+    assert_eq!(local["data"][0]["pull"], "moonshine-tiny:q8");
+    assert_eq!(local["data"][0]["path"], object.display().to_string());
+    assert_eq!(local["data"][0]["is_default"], true);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/default")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let default: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 64).await.unwrap()).unwrap();
+    assert_eq!(default["default_model_status"], "installed");
+    assert_eq!(default["default_pull"], "moonshine-tiny:q8");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/models/moonshine-tiny:q8")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        object.exists(),
+        "shared content object must not be deleted with its ref"
+    );
+    assert!(!home.join("models/refs/moonshine-tiny/q8_0.json").exists());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/local")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let local: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 64).await.unwrap()).unwrap();
+    assert!(local["data"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

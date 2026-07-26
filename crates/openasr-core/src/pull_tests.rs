@@ -2024,9 +2024,11 @@ fn list_installed_packs_rejects_corrupt_installed_record() {
     fs::write(&paths.final_path, &bytes).unwrap();
     fs::write(&paths.installed_meta_path, b"{").unwrap();
 
-    let error = list_installed_packs(temp.path()).unwrap_err();
+    let store = crate::InstalledModelStore::read(temp.path()).unwrap();
 
-    assert!(matches!(error, PullError::ParseMeta { .. }));
+    assert!(store.packs().is_empty());
+    assert_eq!(store.diagnostics().len(), 1);
+    assert_eq!(store.diagnostics()[0].path, paths.installed_meta_path);
 }
 
 #[test]

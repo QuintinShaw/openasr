@@ -819,48 +819,28 @@ fn resolved_catalog_pull_from_quant(
 }
 
 pub fn list_installed_packs(home: impl AsRef<Path>) -> Result<Vec<InstalledPack>, PullError> {
-    let root = models_root(home.as_ref());
-    let mut packs = Vec::new();
-    let Ok(model_dirs) = fs::read_dir(&root) else {
-        return Ok(packs);
-    };
-    for model_dir in model_dirs {
-        let model_dir = model_dir.map_err(|source| PullError::Io {
-            path: root.clone(),
-            source,
-        })?;
-        let Ok(quant_dirs) = fs::read_dir(model_dir.path()) else {
-            continue;
-        };
-        for quant_dir in quant_dirs {
-            let quant_dir = quant_dir.map_err(|source| PullError::Io {
-                path: model_dir.path(),
-                source,
-            })?;
-            let path = quant_dir.path().join("installed.json");
-            if !path.exists() {
-                continue;
-            }
-            let contents = fs::read_to_string(&path).map_err(|source| PullError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            let pack: InstalledPack =
-                serde_json::from_str(&contents).map_err(|source| PullError::ParseMeta {
-                    path: path.clone(),
-                    source,
-                })?;
-            if installed_pack_matches_quant_dir(&pack, &quant_dir.path()) {
-                packs.push(pack);
-            }
-        }
-    }
-    packs.sort_by(|left, right| left.pull.cmp(&right.pull));
-    Ok(packs)
+    crate::InstalledModelStore::read(home.as_ref()).map(crate::InstalledModelStore::into_packs)
 }
 
 pub fn default_pack_pointer_path(home: impl AsRef<Path>) -> PathBuf {
     home.as_ref().join("default.json")
+}
+
+fn content_addressed_ref_path(home: &Path, pack: &InstalledPack) -> Option<PathBuf> {
+    let root = models_root(home);
+    let object_path = root
+        .join("objects")
+        .join("sha256")
+        .join(&pack.sha256)
+        .join("content");
+    if pack.path != object_path {
+        return None;
+    }
+    let ref_path = root
+        .join("refs")
+        .join(&pack.model_id)
+        .join(format!("{}.json", pack.quant));
+    ref_path.is_file().then_some(ref_path)
 }
 
 pub fn read_default_pack_pointer(
@@ -896,41 +876,6 @@ pub fn persist_default_pack_pointer(
         .map_err(|source| PullError::Io { path, source })
 }
 
-fn installed_pack_matches_quant_dir(pack: &InstalledPack, quant_dir: &Path) -> bool {
-    if validate_safe_relative_path("model id", &pack.model_id).is_err()
-        || validate_safe_relative_path("quant", &pack.quant).is_err()
-        || validate_safe_relative_path("filename", &pack.filename).is_err()
-        || pack.filename.contains('/')
-        || pack.filename.contains('\\')
-        || !has_openasr_runtime_pack_extension(&pack.filename)
-    {
-        return false;
-    }
-    let Some(model_dir) = quant_dir.parent() else {
-        return false;
-    };
-    let Some(model_dir_name) = model_dir.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let Some(quant_dir_name) = quant_dir.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    if model_dir_name != pack.model_id || quant_dir_name != pack.quant {
-        return false;
-    }
-    if pack.path != quant_dir.join(&pack.filename) {
-        return false;
-    }
-    let Ok(metadata) = fs::symlink_metadata(&pack.path) else {
-        return false;
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return false;
-    }
-    metadata.len() == pack.size_bytes
-        && validate_native_runtime_model_pack_contract(&pack.path).is_ok()
-}
-
 pub fn remove_model_pack(
     home: impl AsRef<Path>,
     reference: &str,
@@ -938,6 +883,19 @@ pub fn remove_model_pack(
     let Some(pack) = find_installed_pack(home.as_ref(), reference)? else {
         return Ok(None);
     };
+    if let Some(ref_path) = content_addressed_ref_path(home.as_ref(), &pack) {
+        // Content objects are immutable and may be referenced by another
+        // model/quant. Removing a model deletes only its ref; object collection
+        // is deliberately separate from model management.
+        fs::remove_file(&ref_path).map_err(|source| PullError::Io {
+            path: ref_path.clone(),
+            source,
+        })?;
+        if let Some(model_dir) = ref_path.parent() {
+            let _ = fs::remove_dir(model_dir);
+        }
+        return Ok(Some(pack));
+    }
     if let Some(quant_dir) = pack.path.parent() {
         fs::remove_dir_all(quant_dir).map_err(|source| PullError::Io {
             path: quant_dir.to_path_buf(),

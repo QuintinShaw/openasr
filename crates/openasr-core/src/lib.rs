@@ -34,6 +34,7 @@ pub mod ggml_runtime;
 pub(crate) mod home;
 pub(crate) mod host;
 pub(crate) mod hotword;
+pub mod installed_model_store;
 pub(crate) mod launch_pack;
 pub(crate) mod longform;
 pub(crate) mod metrics;
@@ -162,6 +163,7 @@ pub use hotword::{
     MAX_PHRASE_BIAS_PHRASE_CHARS, MAX_PHRASE_BIAS_TOTAL_CHARS, PhraseBiasConfig, PhraseBiasEntry,
     PhraseBiasError,
 };
+pub use installed_model_store::{InstalledModelDiagnostic, InstalledModelStore};
 pub use launch_pack::{
     LaunchPackError, LaunchPackNotice, LaunchPackRequest, LaunchPackSelection,
     LaunchSelectionReason, QuantPreference, installed_packs_for_model, resolve_launch_pack,
