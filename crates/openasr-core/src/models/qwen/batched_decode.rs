@@ -15,11 +15,11 @@ use super::llm_transformer::{
     Qwen3AsrLlmLayerAttentionProjection, Qwen3AsrLlmWholeDecoderGraphExecutor,
     resolve_qwen_family_production_kv_cache_policy,
 };
-use super::logits_head::Qwen3AsrLlmLogitsHead;
+use super::logits_head::{Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError};
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::token_embedding::Qwen3AsrTokenEmbeddingTable;
 use super::tokenizer::Qwen3AsrTokenizer;
-use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphError};
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, apply_seq2seq_text_postprocess,
 };
@@ -116,6 +116,13 @@ pub(super) enum Qwen3AsrServeBatchError {
     OwnerFailed { reason: String },
     #[error("qwen serve batch decode failed: {reason}")]
     DecodeFailed { reason: String },
+    #[error(
+        "qwen serve batch ggml context allocation failed at {stage} (requested_bytes={requested_bytes})"
+    )]
+    ContextAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
     /// Cooperative cancel observed between prefill chunks. Display text carries
     /// the stable "canceled by transcription control" marker so
     /// `dispatch_error_to_backend` rewrites to `TranscriptionCanceled`.
@@ -153,13 +160,51 @@ fn ensure_serve_batch_prefill_not_canceled(
     Ok(())
 }
 
-fn map_serve_batch_graph_error(
-    error: crate::ggml_runtime::GgmlCpuGraphError,
-) -> Qwen3AsrServeBatchError {
+fn map_serve_batch_graph_error(error: GgmlCpuGraphError) -> Qwen3AsrServeBatchError {
     match error {
-        crate::ggml_runtime::GgmlCpuGraphError::Canceled => Qwen3AsrServeBatchError::Canceled,
+        GgmlCpuGraphError::Canceled => Qwen3AsrServeBatchError::Canceled,
+        GgmlCpuGraphError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrServeBatchError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        },
         other => Qwen3AsrServeBatchError::DecodeFailed {
             reason: other.to_string(),
+        },
+    }
+}
+
+fn map_serve_batch_logits_head_error(error: Qwen3AsrLlmLogitsHeadError) -> Qwen3AsrServeBatchError {
+    if let Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed { source } = &error
+        && let GgmlCpuGraphError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        } = source
+    {
+        return Qwen3AsrServeBatchError::ContextAllocationFailed {
+            stage,
+            requested_bytes: *requested_bytes,
+        };
+    }
+
+    Qwen3AsrServeBatchError::DecodeFailed {
+        reason: error.to_string(),
+    }
+}
+
+fn map_serve_batch_decoder_init_error(error: GgmlCpuGraphError) -> Qwen3AsrServeBatchError {
+    match error {
+        GgmlCpuGraphError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Qwen3AsrServeBatchError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        other => Qwen3AsrServeBatchError::OwnerFailed {
+            reason: format!("qwen whole-decoder init failed: {other}"),
         },
     }
 }
@@ -490,10 +535,26 @@ impl Qwen3AsrOwnerThreadState {
             Ok(decoder) => decoder,
             Err(error) => {
                 let reason = error.to_string();
+                let context_allocation = match error {
+                    Qwen3AsrServeBatchError::ContextAllocationFailed {
+                        stage,
+                        requested_bytes,
+                    } => Some((stage, requested_bytes)),
+                    _ => None,
+                };
                 for active in slots.into_iter().flatten() {
-                    let _ = active.reply.send(Err(Qwen3AsrServeBatchError::OwnerFailed {
-                        reason: reason.clone(),
-                    }));
+                    let error = match context_allocation {
+                        Some((stage, requested_bytes)) => {
+                            Qwen3AsrServeBatchError::ContextAllocationFailed {
+                                stage,
+                                requested_bytes,
+                            }
+                        }
+                        None => Qwen3AsrServeBatchError::OwnerFailed {
+                            reason: reason.clone(),
+                        },
+                    };
+                    let _ = active.reply.send(Err(error));
                 }
                 return deferred;
             }
@@ -725,12 +786,7 @@ impl Qwen3AsrOwnerThreadState {
                     step
                 }
                 Err(error) => {
-                    Self::fail_all_slots(
-                        &mut slots,
-                        Qwen3AsrServeBatchError::DecodeFailed {
-                            reason: error.to_string(),
-                        },
-                    );
+                    Self::fail_all_slots(&mut slots, map_serve_batch_graph_error(error));
                     break;
                 }
             };
@@ -760,9 +816,7 @@ impl Qwen3AsrOwnerThreadState {
                         .job
                         .logits_head
                         .compute_logits_for_last_hidden(hidden_for_slot)
-                        .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
-                            reason: error.to_string(),
-                        })?;
+                        .map_err(map_serve_batch_logits_head_error)?;
                     active.slot.select_next_token_from_logits(logits)
                 })();
                 match scatter_result {
@@ -1014,9 +1068,7 @@ impl Qwen3AsrOwnerThreadState {
                 .job
                 .logits_head
                 .compute_logits_for_last_hidden(&final_hidden)
-                .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
-                    reason: error.to_string(),
-                })?;
+                .map_err(map_serve_batch_logits_head_error)?;
             entries[entry_index].slot.cache_prompt_tokens = token_count;
             entries[entry_index].slot.prefill_logits = Some(logits);
             let logits = entries[entry_index]
@@ -1351,9 +1403,7 @@ impl Qwen3AsrOwnerThreadState {
             .collect::<Result<Vec<_>, _>>()?;
         decoder
             .reset_reused_batched_seeded(&seed_layers, QWEN_ROPE_THETA, max_positions)
-            .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
-                reason: error.to_string(),
-            })
+            .map_err(map_serve_batch_graph_error)
     }
 
     fn pop_refill_candidate(
@@ -1419,9 +1469,7 @@ impl Qwen3AsrOwnerThreadState {
         if graph_initialized
             && let Err(error) = decoder.zero_reused_batched_slot(slot_index, max_positions)
         {
-            result = Err(Qwen3AsrServeBatchError::DecodeFailed {
-                reason: error.to_string(),
-            });
+            result = Err(map_serve_batch_graph_error(error));
         }
         let _ = reply.send(result);
     }
@@ -1430,13 +1478,20 @@ impl Qwen3AsrOwnerThreadState {
         slots: &mut [Option<Qwen3AsrActiveBatchSlot>],
         error: Qwen3AsrServeBatchError,
     ) {
-        let reason = error.to_string();
         for active in slots.iter_mut().filter_map(Option::take) {
-            let _ = active
-                .reply
-                .send(Err(Qwen3AsrServeBatchError::DecodeFailed {
-                    reason: reason.clone(),
-                }));
+            let error = match &error {
+                Qwen3AsrServeBatchError::ContextAllocationFailed {
+                    stage,
+                    requested_bytes,
+                } => Qwen3AsrServeBatchError::ContextAllocationFailed {
+                    stage,
+                    requested_bytes: *requested_bytes,
+                },
+                _ => Qwen3AsrServeBatchError::DecodeFailed {
+                    reason: error.to_string(),
+                },
+            };
+            let _ = active.reply.send(Err(error));
         }
     }
 
@@ -1451,9 +1506,7 @@ impl Qwen3AsrOwnerThreadState {
                     Some(&slot.job.runtime_source),
                     slot.job.backend,
                 )
-                .map_err(|error| Qwen3AsrServeBatchError::OwnerFailed {
-                    reason: format!("qwen whole-decoder init failed: {error}"),
-                })?,
+                .map_err(map_serve_batch_decoder_init_error)?,
             );
         }
         self.decoder
@@ -1498,6 +1551,12 @@ impl Qwen3AsrBatchSlot {
                     .to_string(),
             });
         }
+        // The logits head owns its own lazy graph runner. Warm it on the
+        // owner thread before any batch decode path flattens errors, so a
+        // first context/pool allocation failure stays typed for the caller.
+        job.logits_head
+            .warm_ggml_executor()
+            .map_err(map_serve_batch_logits_head_error)?;
         // `job.backend` was materialized on the submitting thread (see
         // `Qwen3AsrServeBatchJob::backend`'s doc comment); this constructor
         // may run on a different worker thread with no request-backend
@@ -1691,9 +1750,7 @@ impl Qwen3AsrBatchSlot {
                     reason: "qwen serve batch prefill produced no hidden state".to_string(),
                 }
             })?)
-            .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
-                reason: error.to_string(),
-            })?;
+            .map_err(map_serve_batch_logits_head_error)?;
         self.prefill_logits = Some(logits);
         Ok(())
     }
@@ -1733,9 +1790,7 @@ impl Qwen3AsrBatchSlot {
                     reason: "qwen serve batch prefill produced no hidden state".to_string(),
                 }
             })?)
-            .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
-                reason: error.to_string(),
-            })?;
+            .map_err(map_serve_batch_logits_head_error)?;
         self.prefill_logits = Some(logits);
         Ok(())
     }
@@ -1751,9 +1806,7 @@ impl Qwen3AsrBatchSlot {
             .job
             .logits_head
             .compute_logits_for_last_hidden(&final_hidden)
-            .map_err(|error| Qwen3AsrServeBatchError::DecodeFailed {
-                reason: error.to_string(),
-            })?;
+            .map_err(map_serve_batch_logits_head_error)?;
         self.prefill_logits = Some(logits);
         Ok(())
     }
@@ -2176,6 +2229,14 @@ mod tests {
         assert_eq!(
             Qwen3AsrServeBatchError::OwnerFailed {
                 reason: "boom".to_string()
+            }
+            .unavailable_retryable(),
+            None
+        );
+        assert_eq!(
+            Qwen3AsrServeBatchError::ContextAllocationFailed {
+                stage: "pool",
+                requested_bytes: 805_306_368,
             }
             .unavailable_retryable(),
             None
@@ -2859,6 +2920,57 @@ mod tests {
         assert!(matches!(
             super::map_serve_batch_graph_error(GgmlCpuGraphError::Canceled),
             Qwen3AsrServeBatchError::Canceled
+        ));
+        assert!(matches!(
+            super::map_serve_batch_graph_error(GgmlCpuGraphError::ContextAllocationFailed {
+                stage: "pool",
+                requested_bytes: 805_306_368,
+            }),
+            Qwen3AsrServeBatchError::ContextAllocationFailed {
+                stage: "pool",
+                requested_bytes: 805_306_368,
+            }
+        ));
+        assert!(matches!(
+            super::map_serve_batch_logits_head_error(Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
+                source: GgmlCpuGraphError::ContextAllocationFailed {
+                    stage: "logits-head-pool",
+                    requested_bytes: 268_435_456,
+                },
+            },),
+            Qwen3AsrServeBatchError::ContextAllocationFailed {
+                stage: "logits-head-pool",
+                requested_bytes: 268_435_456,
+            }
+        ));
+        let logits_non_oom =
+            super::map_serve_batch_logits_head_error(Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
+                source: GgmlCpuGraphError::ContextInvalidLayout {
+                    stage: "logits-head-pool",
+                    requested_bytes: 268_435_456,
+                },
+            });
+        let Qwen3AsrServeBatchError::DecodeFailed { reason } = logits_non_oom else {
+            panic!("non-OOM logits-head error must remain DecodeFailed");
+        };
+        assert!(reason.contains("qwen3-asr llm logits head ggml graph failed"));
+        assert!(reason.contains("ggml context layout is invalid"));
+        assert!(matches!(
+            super::map_serve_batch_decoder_init_error(GgmlCpuGraphError::ContextAllocationFailed {
+                stage: "serve-batch-owner-pool",
+                requested_bytes: 536_870_912,
+            }),
+            Qwen3AsrServeBatchError::ContextAllocationFailed {
+                stage: "serve-batch-owner-pool",
+                requested_bytes: 536_870_912,
+            }
+        ));
+        assert!(matches!(
+            super::map_serve_batch_decoder_init_error(GgmlCpuGraphError::ContextInvalidLayout {
+                stage: "serve-batch-owner-pool",
+                requested_bytes: 536_870_912,
+            }),
+            Qwen3AsrServeBatchError::OwnerFailed { .. }
         ));
         assert!(
             Qwen3AsrServeBatchError::Canceled

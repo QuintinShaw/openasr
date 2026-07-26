@@ -525,6 +525,13 @@ fn native_ggml_streaming_error_to_asr(
         GgmlAsrExecutionError::ExecutionRoute(error) => {
             NativeAsrError::from_execution_route_error(error)
         }
+        GgmlAsrExecutionError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        } => NativeAsrError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        },
         other => {
             if let Some(route_error) =
                 crate::device::execution_route::ExecutionRouteError::from_embedded_message(
@@ -582,8 +589,17 @@ fn native_offline_request_to_transcription_request(
 }
 
 fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {
-    NativeAsrError::SessionFailed {
-        message: error.to_string(),
+    match error {
+        BackendError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        } => NativeAsrError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        },
+        other => NativeAsrError::SessionFailed {
+            message: other.to_string(),
+        },
     }
 }
 
@@ -1505,6 +1521,36 @@ mod tests {
         let _generation_guard =
             crate::models::thread_local_runtime_cache::unload_generation_test_lock();
         unload_idle_native_model_runtime_caches();
+    }
+
+    #[test]
+    fn typed_context_allocation_failure_survives_native_offline_and_streaming_boundaries() {
+        let backend = BackendError::ContextAllocationFailed {
+            stage: "pool",
+            requested_bytes: 805_306_368,
+        };
+        assert_eq!(
+            native_backend_error_to_asr(backend),
+            NativeAsrError::ContextAllocationFailed {
+                stage: "pool",
+                requested_bytes: 805_306_368,
+            }
+        );
+
+        let stream = native_ggml_streaming_error_to_asr(
+            "qwen3-asr",
+            GgmlAsrExecutionError::ContextAllocationFailed {
+                stage: "pool",
+                requested_bytes: 805_306_368,
+            },
+        );
+        assert_eq!(
+            stream,
+            NativeAsrError::ContextAllocationFailed {
+                stage: "pool",
+                requested_bytes: 805_306_368,
+            }
+        );
     }
 
     #[test]

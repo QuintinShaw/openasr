@@ -44,9 +44,10 @@ use std::path::PathBuf;
 use std::ptr;
 
 use openasr_core::{
-    NATIVE_RUNTIME_MODEL_ID_AUTO, NativeAsrHardwareTarget, NativeBackend, StreamingConfig,
-    StreamingEvent, StreamingEventKind, StreamingSession, Transcription, TranscriptionBackend,
-    TranscriptionRequest, validate_local_native_model_pack_path,
+    BackendError, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeAsrError, NativeAsrHardwareTarget,
+    NativeBackend, StreamingConfig, StreamingEvent, StreamingEventKind, StreamingSession,
+    Transcription, TranscriptionBackend, TranscriptionRequest,
+    validate_local_native_model_pack_path,
 };
 
 /// Model-market C ABI: fetch/verify the signed catalog, pull (download +
@@ -416,6 +417,10 @@ fn ffi_transcription_request(staging_path: PathBuf, pack_path: PathBuf) -> Trans
 /// buffer. Read the result with the `openasr_result_*` accessors, then free it
 /// with [`openasr_result_free`].
 ///
+/// A typed native ggml context/pool allocation failure returns
+/// [`OpenAsrStatus::OutOfMemory`] and leaves `out_result` null; it is distinct
+/// from [`OpenAsrStatus::TranscribeFailed`].
+///
 /// # Safety
 /// `model` must be a live handle from [`openasr_model_open`]. `pcm` must
 /// point to at least `pcm_len_samples` samples of the given `format` (4 bytes
@@ -504,22 +509,30 @@ pub unsafe extern "C" fn openasr_transcribe_pcm(
 
         let request = ffi_transcription_request(staging_path, model_ref.pack_path.clone());
 
-        match NativeBackend.transcribe(request) {
-            Ok(transcription) => {
-                let result = Box::new(build_result(transcription, with_segments));
-                // SAFETY: checked non-null above.
-                unsafe {
-                    *out_result = Box::into_raw(result);
-                }
-                OpenAsrStatus::Ok
-            }
-            Err(error) => {
-                let status = native_error_status(&error.to_string());
-                set_last_error(format!("openasr_transcribe_pcm: {error}"));
-                status
-            }
-        }
+        finish_transcribe_pcm(NativeBackend.transcribe(request), with_segments, out_result)
     })
+}
+
+fn finish_transcribe_pcm(
+    transcription: Result<Transcription, BackendError>,
+    with_segments: bool,
+    out_result: *mut *mut OpenAsrResult,
+) -> OpenAsrStatus {
+    match transcription {
+        Ok(transcription) => {
+            let result = Box::new(build_result(transcription, with_segments));
+            // SAFETY: checked non-null above.
+            unsafe {
+                *out_result = Box::into_raw(result);
+            }
+            OpenAsrStatus::Ok
+        }
+        Err(error) => {
+            let status = backend_error_status(&error, OpenAsrStatus::TranscribeFailed);
+            set_last_error(format!("openasr_transcribe_pcm: {error}"));
+            status
+        }
+    }
 }
 
 /// Frees a result returned by [`openasr_transcribe_pcm`]. Null is accepted
@@ -647,6 +660,8 @@ pub unsafe extern "C" fn openasr_result_segment_text(
 /// closed -- with [`OpenAsrStatus::ModelLoadFailed`] and no handle written --
 /// if the path is missing, not UTF-8, or not a pack a native model family
 /// recognizes / can stream. Never touches the network.
+/// A typed native ggml context/pool allocation failure instead returns
+/// [`OpenAsrStatus::OutOfMemory`] and leaves `out_session` null.
 ///
 /// Pass a null `config` to use the engine defaults; otherwise `config` is read
 /// (and its `language`, if non-null, borrowed) only for the duration of this
@@ -693,7 +708,9 @@ pub unsafe extern "C" fn openasr_streaming_session_open(
 /// `config` must point to a readable V2 prefix containing `version` and `size`.
 /// Its advertised `size` must cover the full current V2 struct before this
 /// function reads any trailing field. `path` and `out_session` follow the same
-/// contract as [`openasr_streaming_session_open`].
+/// contract as [`openasr_streaming_session_open`], including its
+/// [`OpenAsrStatus::OutOfMemory`] result for a typed native ggml context/pool
+/// allocation failure.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn openasr_streaming_session_open_v2(
     path: *const c_char,
@@ -725,7 +742,14 @@ fn open_streaming_session(
     cfg: StreamingConfig,
     out_session: *mut *mut OpenAsrStreamingSession,
 ) -> OpenAsrStatus {
-    match StreamingSession::new(path, cfg) {
+    finish_open_streaming_session(StreamingSession::new(path, cfg), out_session)
+}
+
+fn finish_open_streaming_session(
+    session: Result<StreamingSession, NativeAsrError>,
+    out_session: *mut *mut OpenAsrStreamingSession,
+) -> OpenAsrStatus {
+    match session {
         Ok(session) => {
             let handle = Box::new(OpenAsrStreamingSession { inner: session });
             unsafe {
@@ -735,7 +759,7 @@ fn open_streaming_session(
         }
         Err(error) => {
             set_last_error(format!("openasr_streaming_session_open: {error}"));
-            OpenAsrStatus::ModelLoadFailed
+            native_error_status(&error, OpenAsrStatus::ModelLoadFailed)
         }
     }
 }
@@ -747,6 +771,8 @@ fn open_streaming_session(
 /// an empty (non-null) event batch. Read the batch with the
 /// `openasr_streaming_event_*` accessors, then free it with
 /// [`openasr_streaming_events_free`].
+/// A typed native ggml context/pool allocation failure returns
+/// [`OpenAsrStatus::OutOfMemory`] and leaves `out_events` null.
 ///
 /// # Safety
 /// `session` must be a live handle from [`openasr_streaming_session_open`] (not
@@ -788,24 +814,31 @@ pub unsafe extern "C" fn openasr_streaming_feed(
         // SAFETY: `session` was checked non-null above and, per the safety
         // contract, is a live handle from `openasr_streaming_session_open`.
         let session_ref = unsafe { &mut *session };
-        match session_ref.inner.feed(samples) {
-            Ok(events) => {
-                let batch = Box::new(OpenAsrStreamingEvents {
-                    events: events.into_iter().map(owned_streaming_event).collect(),
-                });
-                // SAFETY: checked non-null above.
-                unsafe {
-                    *out_events = Box::into_raw(batch);
-                }
-                OpenAsrStatus::Ok
-            }
-            Err(error) => {
-                let status = native_error_status(&error.to_string());
-                set_last_error(format!("openasr_streaming_feed: {error}"));
-                status
-            }
-        }
+        finish_streaming_feed(session_ref.inner.feed(samples), out_events)
     })
+}
+
+fn finish_streaming_feed(
+    events: Result<Vec<StreamingEvent>, NativeAsrError>,
+    out_events: *mut *mut OpenAsrStreamingEvents,
+) -> OpenAsrStatus {
+    match events {
+        Ok(events) => {
+            let batch = Box::new(OpenAsrStreamingEvents {
+                events: events.into_iter().map(owned_streaming_event).collect(),
+            });
+            // SAFETY: checked non-null above.
+            unsafe {
+                *out_events = Box::into_raw(batch);
+            }
+            OpenAsrStatus::Ok
+        }
+        Err(error) => {
+            let status = native_error_status(&error, OpenAsrStatus::TranscribeFailed);
+            set_last_error(format!("openasr_streaming_feed: {error}"));
+            status
+        }
+    }
 }
 
 /// Finishes a streaming session: drains any buffered tail audio, finalizes the
@@ -814,6 +847,8 @@ pub unsafe extern "C" fn openasr_streaming_feed(
 /// whether it succeeds or fails, the handle is freed and must not be reused or
 /// passed to [`openasr_streaming_free`]. Read the result with the
 /// `openasr_result_*` accessors and free it with [`openasr_result_free`].
+/// A typed native ggml context/pool allocation failure returns
+/// [`OpenAsrStatus::OutOfMemory`] and leaves `out_result` null.
 ///
 /// # Safety
 /// `session` must be a live handle from [`openasr_streaming_session_open`] that
@@ -842,22 +877,29 @@ pub unsafe extern "C" fn openasr_streaming_finish(
         // `finish` consumes the session, so ownership is taken back here and the
         // box is dropped exactly once regardless of the decode outcome.
         let handle = unsafe { Box::from_raw(session) };
-        match handle.inner.finish() {
-            Ok(transcription) => {
-                let result = Box::new(build_result(transcription, true));
-                // SAFETY: checked non-null above.
-                unsafe {
-                    *out_result = Box::into_raw(result);
-                }
-                OpenAsrStatus::Ok
-            }
-            Err(error) => {
-                let status = native_error_status(&error.to_string());
-                set_last_error(format!("openasr_streaming_finish: {error}"));
-                status
-            }
-        }
+        finish_streaming_finish(handle.inner.finish(), out_result)
     })
+}
+
+fn finish_streaming_finish(
+    transcription: Result<Transcription, NativeAsrError>,
+    out_result: *mut *mut OpenAsrResult,
+) -> OpenAsrStatus {
+    match transcription {
+        Ok(transcription) => {
+            let result = Box::new(build_result(transcription, true));
+            // SAFETY: checked non-null above.
+            unsafe {
+                *out_result = Box::into_raw(result);
+            }
+            OpenAsrStatus::Ok
+        }
+        Err(error) => {
+            let status = native_error_status(&error, OpenAsrStatus::TranscribeFailed);
+            set_last_error(format!("openasr_streaming_finish: {error}"));
+            status
+        }
+    }
 }
 
 /// Frees a streaming session without finishing it (aborts the stream). Null is
@@ -1061,11 +1103,17 @@ pub extern "C" fn openasr_last_error_message() -> *const c_char {
     })
 }
 
-fn native_error_status(message: &str) -> OpenAsrStatus {
-    if message.contains("ggml context allocation failed at ") {
-        OpenAsrStatus::OutOfMemory
-    } else {
-        OpenAsrStatus::TranscribeFailed
+fn native_error_status(_error: &NativeAsrError, fallback: OpenAsrStatus) -> OpenAsrStatus {
+    match _error {
+        NativeAsrError::ContextAllocationFailed { .. } => OpenAsrStatus::OutOfMemory,
+        _ => fallback,
+    }
+}
+
+fn backend_error_status(_error: &BackendError, fallback: OpenAsrStatus) -> OpenAsrStatus {
+    match _error {
+        BackendError::ContextAllocationFailed { .. } => OpenAsrStatus::OutOfMemory,
+        _ => fallback,
     }
 }
 
@@ -1362,17 +1410,125 @@ mod tests {
     }
 
     #[test]
-    fn native_error_status_preserves_existing_failure_and_maps_typed_oom() {
+    fn native_error_status_only_maps_the_typed_context_allocation_failure() {
         assert_eq!(
             native_error_status(
-                "qwen init: ggml context allocation failed at pool (requested_bytes=805306368)"
+                &NativeAsrError::ContextAllocationFailed {
+                    stage: "pool",
+                    requested_bytes: 805_306_368,
+                },
+                OpenAsrStatus::TranscribeFailed,
             ),
             OpenAsrStatus::OutOfMemory
         );
         assert_eq!(
-            native_error_status("qwen init: graph construction failed"),
+            native_error_status(
+                &NativeAsrError::SessionFailed {
+                    message: "model path contains ggml context allocation failed at pool"
+                        .to_string(),
+                },
+                OpenAsrStatus::TranscribeFailed,
+            ),
             OpenAsrStatus::TranscribeFailed
         );
+        assert_eq!(
+            backend_error_status(
+                &BackendError::ContextAllocationFailed {
+                    stage: "pool",
+                    requested_bytes: 805_306_368,
+                },
+                OpenAsrStatus::TranscribeFailed,
+            ),
+            OpenAsrStatus::OutOfMemory
+        );
+        assert_eq!(
+            backend_error_status(
+                &BackendError::NativeFailClosed {
+                    reason: "model path contains ggml context allocation failed at pool"
+                        .to_string(),
+                },
+                OpenAsrStatus::TranscribeFailed,
+            ),
+            OpenAsrStatus::TranscribeFailed
+        );
+    }
+
+    #[test]
+    fn batch_transcription_preserves_typed_context_allocation_failure() {
+        let mut out_result = ptr::null_mut();
+        let status = finish_transcribe_pcm(
+            Err(BackendError::ContextAllocationFailed {
+                stage: "batch-pool",
+                requested_bytes: 805_306_368,
+            }),
+            true,
+            &mut out_result,
+        );
+
+        assert_eq!(status, OpenAsrStatus::OutOfMemory);
+        assert!(out_result.is_null());
+        assert!(last_error().contains("batch-pool"));
+
+        let marker_status = finish_transcribe_pcm(
+            Err(BackendError::NativeFailClosed {
+                reason: "model path /tmp/ggml context allocation failed at pool.oasr".to_string(),
+            }),
+            true,
+            &mut out_result,
+        );
+        assert_eq!(marker_status, OpenAsrStatus::TranscribeFailed);
+    }
+
+    #[test]
+    fn streaming_open_preserves_typed_context_allocation_failure() {
+        let mut out_session = ptr::null_mut();
+
+        let status = finish_open_streaming_session(
+            Err(NativeAsrError::ContextAllocationFailed {
+                stage: "streaming-pool",
+                requested_bytes: 805_306_368,
+            }),
+            &mut out_session,
+        );
+
+        assert_eq!(status, OpenAsrStatus::OutOfMemory);
+        assert!(out_session.is_null());
+        assert!(last_error().contains("streaming-pool"));
+    }
+
+    #[test]
+    fn streaming_feed_and_finish_preserve_typed_context_allocation_failure() {
+        let mut out_events = ptr::null_mut();
+        let feed_status = finish_streaming_feed(
+            Err(NativeAsrError::ContextAllocationFailed {
+                stage: "streaming-feed-pool",
+                requested_bytes: 805_306_368,
+            }),
+            &mut out_events,
+        );
+        assert_eq!(feed_status, OpenAsrStatus::OutOfMemory);
+        assert!(out_events.is_null());
+        assert!(last_error().contains("streaming-feed-pool"));
+
+        let mut out_result = ptr::null_mut();
+        let finish_status = finish_streaming_finish(
+            Err(NativeAsrError::ContextAllocationFailed {
+                stage: "streaming-finish-pool",
+                requested_bytes: 805_306_368,
+            }),
+            &mut out_result,
+        );
+        assert_eq!(finish_status, OpenAsrStatus::OutOfMemory);
+        assert!(out_result.is_null());
+        assert!(last_error().contains("streaming-finish-pool"));
+
+        let old_marker_status = finish_streaming_feed(
+            Err(NativeAsrError::SessionFailed {
+                message: "model path /tmp/ggml context allocation failed at pool.oasr".to_string(),
+            }),
+            &mut out_events,
+        );
+        assert_eq!(old_marker_status, OpenAsrStatus::TranscribeFailed);
     }
 
     // Regression guard for the FFI entry point: the request built from a

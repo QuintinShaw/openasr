@@ -73,8 +73,11 @@ pub(crate) enum Qwen3AsrLlmLogitsHeadError {
         "qwen3-asr llm logits head top-1 token id {token_id} is outside vocab size {vocab_size}"
     )]
     InvalidTop1Token { token_id: i32, vocab_size: usize },
-    #[error("qwen3-asr llm logits head ggml graph failed: {reason}")]
-    GgmlGraphFailed { reason: String },
+    #[error("qwen3-asr llm logits head ggml graph failed: {source}")]
+    GgmlGraphFailed {
+        #[source]
+        source: GgmlCpuGraphError,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -137,9 +140,7 @@ impl Qwen3AsrLlmLogitsHead {
                 output_weight,
                 |executor| executor.compute(hidden),
             )
-            .map_err(|source| Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
-                reason: source.to_string(),
-            });
+            .map_err(Self::ggml_graph_failed);
         }
 
         let normed = rms_norm_with_weight(hidden, &self.output_norm_weight, self.rms_norm_epsilon)?;
@@ -207,9 +208,7 @@ impl Qwen3AsrLlmLogitsHead {
                 output_weight,
                 |executor| executor.compute_top1(hidden),
             )
-            .map_err(|source| Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
-                reason: source.to_string(),
-            })?;
+            .map_err(Self::ggml_graph_failed)?;
             return validate_top1_token_id(token_id, self.vocab_size);
         }
 
@@ -223,6 +222,33 @@ impl Qwen3AsrLlmLogitsHead {
             }
         }
         u32::try_from(best_index).map_err(|_| Qwen3AsrLlmLogitsHeadError::AllocationOverflow)
+    }
+
+    /// Initializes the per-thread ggml logits-head cache before the decode
+    /// loop crosses its string-only generic error boundary. The decode calls
+    /// share this same cache entry rather than constructing a second runner.
+    pub(crate) fn warm_ggml_executor(&self) -> Result<(), Qwen3AsrLlmLogitsHeadError> {
+        let (Some(cache_key), Some(output_weight)) = (
+            self.ggml_executor_cache_key.as_ref(),
+            self.ggml_output_weight.as_ref(),
+        ) else {
+            return Ok(());
+        };
+
+        with_thread_local_logits_head_executor(
+            cache_key.clone(),
+            self.d_model,
+            self.vocab_size,
+            self.rms_norm_epsilon,
+            &self.output_norm_weight,
+            output_weight,
+            |_| Ok(()),
+        )
+        .map_err(Self::ggml_graph_failed)
+    }
+
+    fn ggml_graph_failed(source: GgmlCpuGraphError) -> Qwen3AsrLlmLogitsHeadError {
+        Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed { source }
     }
 }
 

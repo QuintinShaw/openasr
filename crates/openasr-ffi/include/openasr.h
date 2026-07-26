@@ -352,6 +352,10 @@ void openasr_model_close(struct OpenAsrModel *model);
  * buffer. Read the result with the `openasr_result_*` accessors, then free it
  * with [`openasr_result_free`].
  *
+ * A typed native ggml context/pool allocation failure returns
+ * [`OpenAsrStatus::OutOfMemory`] and leaves `out_result` null; it is distinct
+ * from [`OpenAsrStatus::TranscribeFailed`].
+ *
  * # Safety
  * `model` must be a live handle from [`openasr_model_open`]. `pcm` must
  * point to at least `pcm_len_samples` samples of the given `format` (4 bytes
@@ -437,6 +441,8 @@ const char *openasr_result_segment_text(const struct OpenAsrResult *result, uint
  * closed -- with [`OpenAsrStatus::ModelLoadFailed`] and no handle written --
  * if the path is missing, not UTF-8, or not a pack a native model family
  * recognizes / can stream. Never touches the network.
+ * A typed native ggml context/pool allocation failure instead returns
+ * [`OpenAsrStatus::OutOfMemory`] and leaves `out_session` null.
  *
  * Pass a null `config` to use the engine defaults; otherwise `config` is read
  * (and its `language`, if non-null, borrowed) only for the duration of this
@@ -462,7 +468,9 @@ enum OpenAsrStatus openasr_streaming_session_open(const char *path,
  * `config` must point to a readable V2 prefix containing `version` and `size`.
  * Its advertised `size` must cover the full current V2 struct before this
  * function reads any trailing field. `path` and `out_session` follow the same
- * contract as [`openasr_streaming_session_open`].
+ * contract as [`openasr_streaming_session_open`], including its
+ * [`OpenAsrStatus::OutOfMemory`] result for a typed native ggml context/pool
+ * allocation failure.
  */
 enum OpenAsrStatus openasr_streaming_session_open_v2(const char *path,
                                                      const struct OpenAsrStreamingConfigV2 *config,
@@ -476,6 +484,8 @@ enum OpenAsrStatus openasr_streaming_session_open_v2(const char *path,
  * an empty (non-null) event batch. Read the batch with the
  * `openasr_streaming_event_*` accessors, then free it with
  * [`openasr_streaming_events_free`].
+ * A typed native ggml context/pool allocation failure returns
+ * [`OpenAsrStatus::OutOfMemory`] and leaves `out_events` null.
  *
  * # Safety
  * `session` must be a live handle from [`openasr_streaming_session_open`] (not
@@ -495,6 +505,8 @@ enum OpenAsrStatus openasr_streaming_feed(struct OpenAsrStreamingSession *sessio
  * whether it succeeds or fails, the handle is freed and must not be reused or
  * passed to [`openasr_streaming_free`]. Read the result with the
  * `openasr_result_*` accessors and free it with [`openasr_result_free`].
+ * A typed native ggml context/pool allocation failure returns
+ * [`OpenAsrStatus::OutOfMemory`] and leaves `out_result` null.
  *
  * # Safety
  * `session` must be a live handle from [`openasr_streaming_session_open`] that

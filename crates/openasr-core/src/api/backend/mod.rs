@@ -971,6 +971,13 @@ pub enum BackendError {
         "Native ASR Core transcription stayed fail-closed after local runtime source validation/dispatch: {reason}\nNo partial transcript was emitted."
     )]
     NativeFailClosed { reason: String },
+    #[error(
+        "Native ASR ggml context allocation failed at {stage} (requested_bytes={requested_bytes})."
+    )]
+    ContextAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
     #[error("Native ASR execution device was not found: {detail}")]
     ExecutionDeviceNotFound { detail: String },
     #[error("Native ASR execution device is not exactly addressable: {detail}")]

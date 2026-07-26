@@ -780,6 +780,7 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
         {
             FailureCategory::Alloc
         }
+        BackendError::ContextAllocationFailed { .. } => FailureCategory::Alloc,
         BackendError::NativeFailClosed { .. }
         | BackendError::WordTimestampAlignmentFailed { .. } => FailureCategory::Decode,
     }
@@ -2596,6 +2597,13 @@ fn dispatch_error_to_backend(
         GgmlAsrExecutionError::ExecutionRoute(error) => {
             BackendError::from_execution_route_error(error)
         }
+        GgmlAsrExecutionError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        } => BackendError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        },
         other => {
             // Family executors historically stringify `GgmlCpuGraphError` into
             // `ExecutorFailed.reason`. Recover the typed route failure when the
@@ -4905,6 +4913,29 @@ mod tests {
             gpu_buffer_allocation_failure_backend(&other_variant),
             None,
             "only NativeFailClosed carries a classifiable ggml-graph reason"
+        );
+    }
+
+    #[test]
+    fn dispatch_preserves_typed_context_allocation_failure_without_display_recovery() {
+        let execution_context = uncancellable_execution_context_for_test();
+        let error = dispatch_error_to_backend(
+            GgmlAsrExecutionError::ContextAllocationFailed {
+                stage: "pool",
+                requested_bytes: 805_306_368,
+            },
+            &execution_context,
+        );
+        assert!(matches!(
+            error,
+            BackendError::ContextAllocationFailed {
+                stage: "pool",
+                requested_bytes: 805_306_368,
+            }
+        ));
+        assert_eq!(
+            classify_backend_error_for_failure_log(&error),
+            FailureCategory::Alloc
         );
     }
 

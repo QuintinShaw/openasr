@@ -28,6 +28,13 @@ pub enum NativeAsrError {
     ExecutionDeviceNotAddressable { detail: String },
     #[error("Native ASR execution device failed to initialize: {detail}.")]
     ExecutionDeviceInitFailed { detail: String },
+    #[error(
+        "Native ASR ggml context allocation failed at {stage} (requested_bytes={requested_bytes})."
+    )]
+    ContextAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
     #[error("Native ASR session is closed.")]
     SessionClosed,
     #[error("Native ASR session failed: {message}.")]

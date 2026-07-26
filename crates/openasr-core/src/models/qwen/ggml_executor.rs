@@ -24,6 +24,7 @@ use super::llm_prefill::{Qwen3AsrLlmPrefillInputError, build_qwen3_llm_prefill_i
 use super::llm_transformer::{
     Qwen3AsrLlmLayerAttentionProjection, Qwen3AsrLlmWholeDecoderGraphExecutor,
 };
+use super::logits_head::Qwen3AsrLlmLogitsHeadError;
 use super::lora::{qwen_adapter_cache_fingerprint, resolve_qwen_lora_adapter};
 use super::prepared_runtime::{Qwen3AsrPreparedRuntime, Qwen3AsrPreparedRuntimeError};
 use super::prompt_embedding::{
@@ -194,6 +195,13 @@ enum Qwen3AsrGgmlExecutorError {
     AdapterMismatch {
         expected: &'static str,
         found: String,
+    },
+    #[error(
+        "qwen3-asr ggml context allocation failed at {stage} (requested_bytes={requested_bytes})"
+    )]
+    ContextAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
     },
     #[error("qwen3-asr runtime contract check failed: {reason}")]
     RuntimeContractViolation { reason: String },
@@ -525,13 +533,22 @@ impl Qwen3AsrGgmlExecutor {
                     execution_context: Arc::clone(&request.execution_context),
                 },
             )
-            .map_err(|error| match error.unavailable_retryable() {
-                Some(retryable) => Qwen3AsrGgmlExecutorError::ServeBatchUnavailable {
-                    reason: error.to_string(),
-                    retryable,
+            .map_err(|error| match error {
+                super::batched_decode::Qwen3AsrServeBatchError::ContextAllocationFailed {
+                    stage,
+                    requested_bytes,
+                } => Qwen3AsrGgmlExecutorError::ContextAllocationFailed {
+                    stage,
+                    requested_bytes,
                 },
-                None => Qwen3AsrGgmlExecutorError::GreedyDecodeFailed {
-                    reason: error.to_string(),
+                error => match error.unavailable_retryable() {
+                    Some(retryable) => Qwen3AsrGgmlExecutorError::ServeBatchUnavailable {
+                        reason: error.to_string(),
+                        retryable,
+                    },
+                    None => Qwen3AsrGgmlExecutorError::GreedyDecodeFailed {
+                        reason: error.to_string(),
+                    },
                 },
             });
             qwen_decode_profile_log_opt("serve_batch_submit", serve_batch_started_at);
@@ -557,6 +574,11 @@ impl Qwen3AsrGgmlExecutor {
                 reason: format!("qwen3-asr lora adapter rejected: {error}"),
             },
         )?;
+        let logits_head_started_at = qwen_decode_profile_start();
+        logits_head
+            .warm_ggml_executor()
+            .map_err(map_logits_head_error)?;
+        qwen_decode_profile_log_opt("logits_head_cache_init", logits_head_started_at);
         let adapter_fingerprint = qwen_adapter_cache_fingerprint(adapter.as_deref());
         let decoder_cache_key: WholeDecoderCacheKey =
             (runtime_cache_identity, backend, adapter_fingerprint);
@@ -581,11 +603,7 @@ impl Qwen3AsrGgmlExecutor {
                     adapter.as_deref(),
                     backend,
                 )
-                .map_err(|error| {
-                    Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
-                        reason: format!("qwen3-asr whole-decoder graph init failed: {error}"),
-                    }
-                })?;
+                .map_err(map_whole_decoder_init_error)?;
                 qwen_decode_profile_log_opt(
                     "whole_decoder_cache_miss_init",
                     whole_decoder_started_at,
@@ -933,8 +951,47 @@ fn map_mel_frontend_error(error: Qwen3AsrMelFrontendError) -> Qwen3AsrGgmlExecut
 }
 
 fn map_audio_encoder_error(error: Qwen3AsrAudioEncoderError) -> Qwen3AsrGgmlExecutorError {
+    if let Qwen3AsrAudioEncoderError::GraphBuildFailed { source, .. } = &error
+        && let Some(mapped) = qwen_context_allocation_failure(source)
+    {
+        return mapped;
+    }
+
     Qwen3AsrGgmlExecutorError::AudioEncoderFailed {
         reason: error.to_string(),
+    }
+}
+
+fn map_logits_head_error(error: Qwen3AsrLlmLogitsHeadError) -> Qwen3AsrGgmlExecutorError {
+    if let Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed { source } = &error
+        && let Some(mapped) = qwen_context_allocation_failure(source)
+    {
+        return mapped;
+    }
+
+    Qwen3AsrGgmlExecutorError::LlmLogitsHeadFailed {
+        reason: error.to_string(),
+    }
+}
+
+fn map_whole_decoder_init_error(error: GgmlCpuGraphError) -> Qwen3AsrGgmlExecutorError {
+    qwen_context_allocation_failure(&error).unwrap_or_else(|| {
+        Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
+            reason: format!("qwen3-asr whole-decoder graph init failed: {error}"),
+        }
+    })
+}
+
+fn qwen_context_allocation_failure(error: &GgmlCpuGraphError) -> Option<Qwen3AsrGgmlExecutorError> {
+    match error {
+        GgmlCpuGraphError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Some(Qwen3AsrGgmlExecutorError::ContextAllocationFailed {
+            stage,
+            requested_bytes: *requested_bytes,
+        }),
+        _ => None,
     }
 }
 
@@ -1506,6 +1563,13 @@ fn qwen_execute_error_to_ggml(
     adapter_id: &'static str,
 ) -> GgmlAsrExecutionError {
     match error {
+        Qwen3AsrGgmlExecutorError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        } => GgmlAsrExecutionError::ContextAllocationFailed {
+            stage,
+            requested_bytes,
+        },
         Qwen3AsrGgmlExecutorError::ServeBatchUnavailable { reason, retryable } => {
             GgmlAsrExecutionError::ServeBatchUnavailable { reason, retryable }
         }
@@ -1567,6 +1631,89 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn qwen_initial_graph_allocation_failure_remains_typed_through_executor_boundary() {
+        let source = GgmlCpuGraphError::ContextAllocationFailed {
+            stage: "pool",
+            requested_bytes: 805_306_368,
+        };
+        assert!(matches!(
+            map_audio_encoder_error(Qwen3AsrAudioEncoderError::GraphBuildFailed {
+                step: "runner_init",
+                source,
+            }),
+            Qwen3AsrGgmlExecutorError::ContextAllocationFailed {
+                stage: "pool",
+                requested_bytes: 805_306_368,
+            }
+        ));
+        let audio_non_oom = map_audio_encoder_error(Qwen3AsrAudioEncoderError::GraphBuildFailed {
+            step: "runner_init",
+            source: GgmlCpuGraphError::ContextInvalidLayout {
+                stage: "audio-pool",
+                requested_bytes: 268_435_456,
+            },
+        });
+        let Qwen3AsrGgmlExecutorError::AudioEncoderFailed { reason } = audio_non_oom else {
+            panic!("non-OOM audio encoder error must remain AudioEncoderFailed");
+        };
+        assert!(reason.contains("runner_init"));
+        assert!(reason.contains("ggml context layout is invalid"));
+        assert!(matches!(
+            map_logits_head_error(Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
+                source: GgmlCpuGraphError::ContextAllocationFailed {
+                    stage: "logits-head-pool",
+                    requested_bytes: 268_435_456,
+                },
+            }),
+            Qwen3AsrGgmlExecutorError::ContextAllocationFailed {
+                stage: "logits-head-pool",
+                requested_bytes: 268_435_456,
+            }
+        ));
+        let logits_non_oom = map_logits_head_error(Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
+            source: GgmlCpuGraphError::ContextInvalidLayout {
+                stage: "logits-head-pool",
+                requested_bytes: 268_435_456,
+            },
+        });
+        let Qwen3AsrGgmlExecutorError::LlmLogitsHeadFailed { reason } = logits_non_oom else {
+            panic!("non-OOM logits-head error must remain LlmLogitsHeadFailed");
+        };
+        assert!(reason.contains("qwen3-asr llm logits head ggml graph failed"));
+        assert!(reason.contains("ggml context layout is invalid"));
+        assert!(matches!(
+            map_whole_decoder_init_error(GgmlCpuGraphError::ContextAllocationFailed {
+                stage: "whole-decoder-pool",
+                requested_bytes: 536_870_912,
+            }),
+            Qwen3AsrGgmlExecutorError::ContextAllocationFailed {
+                stage: "whole-decoder-pool",
+                requested_bytes: 536_870_912,
+            }
+        ));
+        assert!(matches!(
+            map_whole_decoder_init_error(GgmlCpuGraphError::ContextInvalidLayout {
+                stage: "whole-decoder-pool",
+                requested_bytes: 536_870_912,
+            }),
+            Qwen3AsrGgmlExecutorError::RuntimeContractViolation { .. }
+        ));
+        assert_eq!(
+            qwen_execute_error_to_ggml(
+                Qwen3AsrGgmlExecutorError::ContextAllocationFailed {
+                    stage: "pool",
+                    requested_bytes: 805_306_368,
+                },
+                QWEN3_ASR_GGML_ADAPTER_ID,
+            ),
+            GgmlAsrExecutionError::ContextAllocationFailed {
+                stage: "pool",
+                requested_bytes: 805_306_368,
+            }
+        );
+    }
 
     fn qwen_metadata_with_llm_layers(llm_layers: usize) -> BTreeMap<String, String> {
         let mut metadata = BTreeMap::new();

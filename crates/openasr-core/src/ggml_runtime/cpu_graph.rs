@@ -955,6 +955,11 @@ pub enum GgmlCpuGraphError {
         stage: &'static str,
         requested_bytes: usize,
     },
+    #[error("ggml context layout is invalid at {stage} (requested_bytes={requested_bytes})")]
+    ContextInvalidLayout {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
     #[error("ggml cpu graph context initialization failed (bytes={context_bytes})")]
     ContextInitFailed { context_bytes: usize },
     #[error("ggml cpu backend is unavailable")]
@@ -5442,11 +5447,14 @@ impl GgmlContextGuard {
             GgmlContextAllocationError::AllocationFailed {
                 stage,
                 requested_bytes,
-            }
-            | GgmlContextAllocationError::InvalidLayout {
+            } => GgmlCpuGraphError::ContextAllocationFailed {
                 stage,
                 requested_bytes,
-            } => GgmlCpuGraphError::ContextAllocationFailed {
+            },
+            GgmlContextAllocationError::InvalidLayout {
+                stage,
+                requested_bytes,
+            } => GgmlCpuGraphError::ContextInvalidLayout {
                 stage,
                 requested_bytes,
             },
