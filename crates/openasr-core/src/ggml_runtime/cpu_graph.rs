@@ -6205,14 +6205,15 @@ impl GgmlBackendSchedulerGuard {
         let context_storage = AlignedAllocation::new_with_allocator(
             "backend_scheduler_context",
             context_bytes,
-            |layout| allocate(layout),
+            &mut allocate,
         )
         .map_err(map_storage_error)?;
-        let pool_storage =
-            AlignedAllocation::new_with_allocator("backend_scheduler_pool", pool_bytes, |layout| {
-                allocate(layout)
-            })
-            .map_err(map_storage_error)?;
+        let pool_storage = AlignedAllocation::new_with_allocator(
+            "backend_scheduler_pool",
+            pool_bytes,
+            &mut allocate,
+        )
+        .map_err(map_storage_error)?;
         let raw = unsafe {
             ffi::ggml_backend_sched_try_new(
                 backends.as_mut_ptr(),
