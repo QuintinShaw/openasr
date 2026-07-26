@@ -448,6 +448,13 @@ impl GgmlCpuGraphConfig {
             return Self::resolve_backend_for_preference(preference);
         }
         let resolved = Self::resolve_backend_for_preference(None);
+        Self::apply_auto_gpu_policy(resolved, policy)
+    }
+
+    fn apply_auto_gpu_policy(
+        resolved: GgmlCpuGraphBackend,
+        policy: AutoGpuPolicy,
+    ) -> GgmlCpuGraphBackend {
         let gate_to_cpu = match policy {
             AutoGpuPolicy::AllBackends => false,
             AutoGpuPolicy::Never => resolved.is_gpu_class(),
@@ -552,14 +559,15 @@ impl GgmlCpuGraphConfig {
         Self::default_gpu_backend_for_target()
     }
 
-    #[cfg(target_os = "macos")]
     fn default_gpu_backend_for_target() -> GgmlCpuGraphBackend {
-        GgmlCpuGraphBackend::Metal
+        Self::default_gpu_backend_for_target_os(std::env::consts::OS)
     }
 
-    #[cfg(not(target_os = "macos"))]
-    fn default_gpu_backend_for_target() -> GgmlCpuGraphBackend {
-        GgmlCpuGraphBackend::Gpu
+    fn default_gpu_backend_for_target_os(target_os: &str) -> GgmlCpuGraphBackend {
+        match target_os {
+            "macos" | "ios" => GgmlCpuGraphBackend::Metal,
+            _ => GgmlCpuGraphBackend::Gpu,
+        }
     }
 
     pub fn resolve_runtime_scheduler_usage() -> bool {
@@ -7470,6 +7478,16 @@ mod tests {
                 GgmlCpuGraphBackend::Cpu
             );
         }
+    }
+
+    #[test]
+    fn ios_default_gpu_backend_is_metal_and_respects_except_metal() {
+        let backend = GgmlCpuGraphConfig::default_gpu_backend_for_target_os("ios");
+        assert_eq!(backend, GgmlCpuGraphBackend::Metal);
+        assert_eq!(
+            GgmlCpuGraphConfig::apply_auto_gpu_policy(backend, AutoGpuPolicy::ExceptMetal),
+            GgmlCpuGraphBackend::Cpu
+        );
     }
 
     #[test]
