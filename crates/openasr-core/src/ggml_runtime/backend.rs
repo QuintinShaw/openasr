@@ -5,7 +5,7 @@ use std::{
 
 use thiserror::Error;
 
-use super::ffi;
+use super::{GgmlCallerOwnedContext, ffi};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GgmlRuntimeInfo {
@@ -213,26 +213,19 @@ pub(crate) fn device_supports_matmul_for_type(
     const K: i64 = 256;
     const M: i64 = 32;
     const N: i64 = 8;
-    let params = ffi::GgmlInitParams {
-        mem_size: 16 * 1024,
-        mem_buffer: ptr::null_mut(),
-        no_alloc: true,
+    let Ok(context) = GgmlCallerOwnedContext::new(16 * 1024) else {
+        return false;
     };
     unsafe {
-        let ctx = ffi::ggml_init(params);
-        if ctx.is_null() {
-            return false;
-        }
+        let ctx = context.raw().as_ptr();
         let weight = ffi::ggml_new_tensor_2d(ctx, weight_ggml_type, K, M);
         let activation = ffi::ggml_new_tensor_2d(ctx, ffi::GGML_TYPE_F32, K, N);
-        let supported = if weight.is_null() || activation.is_null() {
+        if weight.is_null() || activation.is_null() {
             false
         } else {
             let op = ffi::ggml_mul_mat(ctx, weight, activation);
             !op.is_null() && ffi::ggml_backend_dev_supports_op(device.as_ptr(), op)
-        };
-        ffi::ggml_free(ctx);
-        supported
+        }
     }
 }
 

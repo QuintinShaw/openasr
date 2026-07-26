@@ -1,5 +1,6 @@
 mod arena_weight_pipeline;
 mod backend;
+mod context;
 mod cpu_graph;
 mod env_flags;
 mod ffi;
@@ -26,6 +27,7 @@ pub use backend::{
 pub(crate) use backend::{
     accelerated_device_rank, ensure_backends_loaded, preferred_accelerated_device,
 };
+pub(crate) use context::{GgmlCallerOwnedContext, GgmlContextAllocationError};
 pub use cpu_graph::{
     AutoGpuPolicy, GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, RequestBackendOverrideGuard,

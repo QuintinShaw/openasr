@@ -127,6 +127,9 @@ pub enum OpenAsrStatus {
     /// A pull was stopped because the caller's cancel callback returned true.
     /// Any partial download is cleaned up; nothing is installed.
     PullCanceled = 8,
+    /// A caller-owned ggml context allocation failed. The error message carries
+    /// the allocation stage and requested byte count for recovery diagnostics.
+    OutOfMemory = 9,
 }
 
 /// PCM sample encoding accepted by [`openasr_transcribe_pcm`].
@@ -511,8 +514,9 @@ pub unsafe extern "C" fn openasr_transcribe_pcm(
                 OpenAsrStatus::Ok
             }
             Err(error) => {
+                let status = native_error_status(&error.to_string());
                 set_last_error(format!("openasr_transcribe_pcm: {error}"));
-                OpenAsrStatus::TranscribeFailed
+                status
             }
         }
     })
@@ -796,8 +800,9 @@ pub unsafe extern "C" fn openasr_streaming_feed(
                 OpenAsrStatus::Ok
             }
             Err(error) => {
+                let status = native_error_status(&error.to_string());
                 set_last_error(format!("openasr_streaming_feed: {error}"));
-                OpenAsrStatus::TranscribeFailed
+                status
             }
         }
     })
@@ -847,8 +852,9 @@ pub unsafe extern "C" fn openasr_streaming_finish(
                 OpenAsrStatus::Ok
             }
             Err(error) => {
+                let status = native_error_status(&error.to_string());
                 set_last_error(format!("openasr_streaming_finish: {error}"));
-                OpenAsrStatus::TranscribeFailed
+                status
             }
         }
     })
@@ -1053,6 +1059,14 @@ pub extern "C" fn openasr_last_error_message() -> *const c_char {
             .map(|message| message.as_ptr())
             .unwrap_or(ptr::null())
     })
+}
+
+fn native_error_status(message: &str) -> OpenAsrStatus {
+    if message.contains("ggml context allocation failed at ") {
+        OpenAsrStatus::OutOfMemory
+    } else {
+        OpenAsrStatus::TranscribeFailed
+    }
 }
 
 /// Runs `body`, catching any panic and converting it to `panic_status` plus a
@@ -1345,6 +1359,20 @@ mod tests {
         unsafe { CStr::from_ptr(ptr) }
             .to_string_lossy()
             .into_owned()
+    }
+
+    #[test]
+    fn native_error_status_preserves_existing_failure_and_maps_typed_oom() {
+        assert_eq!(
+            native_error_status(
+                "qwen init: ggml context allocation failed at pool (requested_bytes=805306368)"
+            ),
+            OpenAsrStatus::OutOfMemory
+        );
+        assert_eq!(
+            native_error_status("qwen init: graph construction failed"),
+            OpenAsrStatus::TranscribeFailed
+        );
     }
 
     // Regression guard for the FFI entry point: the request built from a

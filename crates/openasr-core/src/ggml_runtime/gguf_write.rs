@@ -3,12 +3,12 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{CString, c_void},
     path::{Path, PathBuf},
-    ptr::{self, null},
+    ptr::null,
 };
 
 use thiserror::Error;
 
-use super::ffi;
+use super::{GgmlCallerOwnedContext, GgmlContextAllocationError, ffi};
 
 /// Build provenance recorded on every pack this codebase writes: the open-core
 /// git commit whose quantization policy produced the pack's tensors.
@@ -185,6 +185,11 @@ pub(crate) enum GgufWriteError {
     },
     #[error("ggml context allocation size overflow for {tensor_count} tensor definitions")]
     GgmlContextSizeOverflow { tensor_count: usize },
+    #[error("ggml context allocation failed at {stage} (requested_bytes={requested_bytes})")]
+    GgmlContextAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
     #[error(
         "ggml context initialization failed for {tensor_count} tensor definitions using {mem_size} bytes"
     )]
@@ -592,7 +597,7 @@ impl Drop for GgufContextGuard {
 }
 
 struct GgmlContextGuard {
-    raw: ffi::GgmlContextRaw,
+    storage: GgmlCallerOwnedContext,
 }
 
 impl GgmlContextGuard {
@@ -601,34 +606,30 @@ impl GgmlContextGuard {
             .checked_mul(4096)
             .and_then(|size| size.checked_add(1 << 20))
             .ok_or(GgufWriteError::GgmlContextSizeOverflow { tensor_count })?;
-        let raw = unsafe {
-            ffi::ggml_init(ffi::GgmlInitParams {
-                mem_size,
-                mem_buffer: ptr::null_mut(),
-                no_alloc: true,
-            })
-        };
-        if raw.is_null() {
-            return Err(GgufWriteError::GgmlContextInitFailed {
-                tensor_count,
-                mem_size,
-            });
-        }
-        Ok(Self { raw })
+        let storage = GgmlCallerOwnedContext::new(mem_size).map_err(|error| match error {
+            GgmlContextAllocationError::AllocationFailed {
+                stage,
+                requested_bytes,
+            }
+            | GgmlContextAllocationError::InvalidLayout {
+                stage,
+                requested_bytes,
+            } => GgufWriteError::GgmlContextAllocationFailed {
+                stage,
+                requested_bytes,
+            },
+            GgmlContextAllocationError::InitializationFailed { .. } => {
+                GgufWriteError::GgmlContextInitFailed {
+                    tensor_count,
+                    mem_size,
+                }
+            }
+        })?;
+        Ok(Self { storage })
     }
 
     fn as_ptr(&self) -> ffi::GgmlContextRaw {
-        self.raw
-    }
-}
-
-impl Drop for GgmlContextGuard {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe {
-                ffi::ggml_free(self.raw);
-            }
-        }
+        self.storage.raw().as_ptr()
     }
 }
 

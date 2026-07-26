@@ -87,6 +87,11 @@ typedef enum OpenAsrStatus {
    * Any partial download is cleaned up; nothing is installed.
    */
   OPEN_ASR_STATUS_PULL_CANCELED = 8,
+  /**
+   * A caller-owned ggml context allocation failed. The error message carries
+   * the allocation stage and requested byte count for recovery diagnostics.
+   */
+  OPEN_ASR_STATUS_OUT_OF_MEMORY = 9,
 } OpenAsrStatus;
 
 /**

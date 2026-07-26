@@ -310,7 +310,12 @@ unsafe extern "C" {
     pub(crate) fn ggml_backend_blas_init() -> GgmlBackendRaw;
     #[cfg(target_os = "macos")]
     pub(crate) fn ggml_backend_blas_set_n_threads(backend: GgmlBackendRaw, n_threads: c_int);
-    pub(crate) fn ggml_init(params: GgmlInitParams) -> GgmlContextRaw;
+    pub(crate) fn ggml_try_init(
+        params: GgmlInitParams,
+        context_buffer: *mut c_void,
+        context_buffer_size: usize,
+    ) -> GgmlContextRaw;
+    pub(crate) fn ggml_context_size() -> usize;
     pub(crate) fn ggml_reset(ctx: GgmlContextRaw);
     pub(crate) fn ggml_free(ctx: GgmlContextRaw);
     pub(crate) fn ggml_blck_size(type_: c_int) -> i64;

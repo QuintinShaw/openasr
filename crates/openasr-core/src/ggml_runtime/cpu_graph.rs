@@ -19,8 +19,9 @@ use thiserror::Error;
 
 use super::ffi;
 use super::{
-    GgmlBackendKind, GgmlRuntimeError, GgmlRuntimeSource, GgufTensorDataReader,
-    GgufWeightTensorPayload, ensure_backends_loaded, ggml_available_devices,
+    GgmlBackendKind, GgmlCallerOwnedContext, GgmlContextAllocationError, GgmlRuntimeError,
+    GgmlRuntimeSource, GgufTensorDataReader, GgufWeightTensorPayload, ensure_backends_loaded,
+    ggml_available_devices,
 };
 use crate::device::execution_route::{
     ExecutionProvider, ExecutionRouteCacheKey, ExecutionRouteError, ExecutionRouteRequest,
@@ -949,6 +950,11 @@ pub enum GgmlCpuGraphError {
     InvalidThreadCount,
     #[error("ggml cpu graph thread count exceeds ggml int boundary: n_threads={n_threads}")]
     ThreadCountOutOfRange { n_threads: usize },
+    #[error("ggml context allocation failed at {stage} (requested_bytes={requested_bytes})")]
+    ContextAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
     #[error("ggml cpu graph context initialization failed (bytes={context_bytes})")]
     ContextInitFailed { context_bytes: usize },
     #[error("ggml cpu backend is unavailable")]
@@ -5427,30 +5433,45 @@ fn checked_dim_to_i64(value: usize) -> Result<i64, GgmlCpuGraphError> {
 
 struct GgmlContextGuard {
     raw: NonNull<c_void>,
+    storage: Option<GgmlCallerOwnedContext>,
 }
 
 impl GgmlContextGuard {
     fn new(context_bytes: usize) -> Result<Self, GgmlCpuGraphError> {
-        let raw = unsafe {
-            ffi::ggml_init(ffi::GgmlInitParams {
-                mem_size: context_bytes,
-                mem_buffer: ptr::null_mut(),
-                no_alloc: true,
-            })
-        };
-        NonNull::new(raw)
-            .map(|raw| Self { raw })
-            .ok_or(GgmlCpuGraphError::ContextInitFailed { context_bytes })
+        let storage = GgmlCallerOwnedContext::new(context_bytes).map_err(|error| match error {
+            GgmlContextAllocationError::AllocationFailed {
+                stage,
+                requested_bytes,
+            }
+            | GgmlContextAllocationError::InvalidLayout {
+                stage,
+                requested_bytes,
+            } => GgmlCpuGraphError::ContextAllocationFailed {
+                stage,
+                requested_bytes,
+            },
+            GgmlContextAllocationError::InitializationFailed { requested_bytes } => {
+                GgmlCpuGraphError::ContextInitFailed {
+                    context_bytes: requested_bytes,
+                }
+            }
+        })?;
+        Ok(Self {
+            raw: storage.raw(),
+            storage: Some(storage),
+        })
     }
 
     fn from_raw(raw: NonNull<c_void>) -> Self {
-        Self { raw }
+        Self { raw, storage: None }
     }
 }
 
 impl Drop for GgmlContextGuard {
     fn drop(&mut self) {
-        unsafe { ffi::ggml_free(self.raw.as_ptr()) };
+        if self.storage.is_none() {
+            unsafe { ffi::ggml_free(self.raw.as_ptr()) };
+        }
     }
 }
 
