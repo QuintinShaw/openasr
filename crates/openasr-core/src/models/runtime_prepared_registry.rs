@@ -64,6 +64,21 @@ pub(crate) enum BuiltinPreparedRuntimeRegistryError {
     },
 }
 
+/// The resolved-input identity a builtin prepared-runtime lookup is keyed
+/// and built from: which architecture, which already-preflighted runtime
+/// source, and which backend this request resolved to. Grouped into one
+/// value (rather than three parallel arguments) because they always travel
+/// together from the executor's `request` down through the cache lookup to
+/// the actual build call -- and because contract 4b adds the already-open
+/// runtime source's content identity to this exact same trio, which becomes
+/// a new field here instead of yet another positional parameter.
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedRuntimeLookup<'a> {
+    pub(crate) model_architecture: &'a str,
+    pub(crate) preflight: &'a GgmlAsrRuntimeSourcePreflight,
+    pub(crate) backend: GgmlCpuGraphBackend,
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct BuiltinPreparedRuntimeCache {
     runtimes_by_path: PreparedRuntimeCache<BuiltinPreparedRuntime>,
@@ -72,9 +87,7 @@ pub(crate) struct BuiltinPreparedRuntimeCache {
 impl BuiltinPreparedRuntimeCache {
     pub(crate) fn prepared_runtime_for_preflight<E, B, P>(
         &self,
-        model_architecture: &str,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
-        backend: GgmlCpuGraphBackend,
+        lookup: PreparedRuntimeLookup<'_>,
         map_build_error: B,
         map_poisoned_lock: P,
     ) -> Result<Arc<BuiltinPreparedRuntime>, E>
@@ -83,21 +96,15 @@ impl BuiltinPreparedRuntimeCache {
         P: Fn() -> E,
     {
         self.runtimes_by_path.get_or_try_insert_with(
-            &preflight.runtime_source,
-            || {
-                build_builtin_prepared_runtime(model_architecture, preflight, backend)
-                    .map_err(map_build_error)
-            },
+            &lookup.preflight.runtime_source,
+            || build_builtin_prepared_runtime(lookup).map_err(map_build_error),
             map_poisoned_lock,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn with_typed_runtime_for_preflight<T, E, B, P, M, U, R>(
         &self,
-        model_architecture: &str,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
-        backend: GgmlCpuGraphBackend,
+        lookup: PreparedRuntimeLookup<'_>,
         map_build_error: B,
         map_poisoned_lock: P,
         project: fn(&BuiltinPreparedRuntime) -> Option<&T>,
@@ -110,23 +117,15 @@ impl BuiltinPreparedRuntimeCache {
         M: FnOnce() -> E,
         U: FnOnce(&T) -> Result<R, E>,
     {
-        let prepared_runtime = self.prepared_runtime_for_preflight(
-            model_architecture,
-            preflight,
-            backend,
-            map_build_error,
-            map_poisoned_lock,
-        )?;
+        let prepared_runtime =
+            self.prepared_runtime_for_preflight(lookup, map_build_error, map_poisoned_lock)?;
         let prepared_runtime = project(prepared_runtime.as_ref()).ok_or_else(map_wrong_variant)?;
         use_runtime(prepared_runtime)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_cohere_transcribe_runtime_for_preflight<E, B, P, M, U, R>(
         &self,
-        model_architecture: &str,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
-        backend: GgmlCpuGraphBackend,
+        lookup: PreparedRuntimeLookup<'_>,
         map_build_error: B,
         map_poisoned_lock: P,
         map_wrong_variant: M,
@@ -139,9 +138,7 @@ impl BuiltinPreparedRuntimeCache {
         U: FnOnce(&CoherePreparedRuntime) -> Result<R, E>,
     {
         self.with_typed_runtime_for_preflight(
-            model_architecture,
-            preflight,
-            backend,
+            lookup,
             map_build_error,
             map_poisoned_lock,
             BuiltinPreparedRuntime::as_cohere_transcribe,
@@ -150,12 +147,9 @@ impl BuiltinPreparedRuntimeCache {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_qwen3_asr_runtime_for_preflight<E, B, P, M, U, R>(
         &self,
-        model_architecture: &str,
-        preflight: &GgmlAsrRuntimeSourcePreflight,
-        backend: GgmlCpuGraphBackend,
+        lookup: PreparedRuntimeLookup<'_>,
         map_build_error: B,
         map_poisoned_lock: P,
         map_wrong_variant: M,
@@ -168,9 +162,7 @@ impl BuiltinPreparedRuntimeCache {
         U: FnOnce(&Qwen3AsrPreparedRuntime) -> Result<R, E>,
     {
         self.with_typed_runtime_for_preflight(
-            model_architecture,
-            preflight,
-            backend,
+            lookup,
             map_build_error,
             map_poisoned_lock,
             BuiltinPreparedRuntime::as_qwen3_asr,
@@ -195,23 +187,23 @@ impl BuiltinPreparedRuntimeCache {
 }
 
 pub(crate) fn build_builtin_prepared_runtime(
-    model_architecture: &str,
-    preflight: &GgmlAsrRuntimeSourcePreflight,
-    backend: GgmlCpuGraphBackend,
+    lookup: PreparedRuntimeLookup<'_>,
 ) -> Result<BuiltinPreparedRuntime, BuiltinPreparedRuntimeRegistryError> {
-    match model_architecture {
+    match lookup.model_architecture {
         crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID => {
-            build_cohere_prepared_runtime(preflight, backend)
+            build_cohere_prepared_runtime(lookup.preflight, lookup.backend)
                 .map(BuiltinPreparedRuntime::CohereTranscribe)
                 .map_err(
                     |source| BuiltinPreparedRuntimeRegistryError::CohereTranscribeBuild { source },
                 )
         }
-        crate::QWEN3_ASR_GGML_ARCHITECTURE_ID => build_qwen_prepared_runtime(preflight, backend)
-            .map(BuiltinPreparedRuntime::Qwen3Asr)
-            .map_err(|source| BuiltinPreparedRuntimeRegistryError::Qwen3AsrBuild { source }),
+        crate::QWEN3_ASR_GGML_ARCHITECTURE_ID => {
+            build_qwen_prepared_runtime(lookup.preflight, lookup.backend)
+                .map(BuiltinPreparedRuntime::Qwen3Asr)
+                .map_err(|source| BuiltinPreparedRuntimeRegistryError::Qwen3AsrBuild { source })
+        }
         _ => Err(BuiltinPreparedRuntimeRegistryError::UnknownArchitecture {
-            model_architecture: model_architecture.to_string(),
+            model_architecture: lookup.model_architecture.to_string(),
         }),
     }
 }
@@ -252,9 +244,12 @@ mod tests {
     fn fails_closed_on_unknown_architecture() {
         let (_runtime_path, preflight) = write_cohere_preflight();
 
-        let error =
-            build_builtin_prepared_runtime("unknown-arch", &preflight, GgmlCpuGraphBackend::Cpu)
-                .expect_err("unknown builtin arch must fail closed");
+        let error = build_builtin_prepared_runtime(PreparedRuntimeLookup {
+            model_architecture: "unknown-arch",
+            preflight: &preflight,
+            backend: GgmlCpuGraphBackend::Cpu,
+        })
+        .expect_err("unknown builtin arch must fail closed");
         assert!(matches!(
             error,
             BuiltinPreparedRuntimeRegistryError::UnknownArchitecture { model_architecture }
@@ -267,11 +262,14 @@ mod tests {
         let (_runtime_path, preflight) = write_cohere_preflight();
         let cache = BuiltinPreparedRuntimeCache::default();
 
+        let lookup = PreparedRuntimeLookup {
+            model_architecture: crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+            preflight: &preflight,
+            backend: GgmlCpuGraphBackend::Cpu,
+        };
         let runtime_a = cache
             .prepared_runtime_for_preflight(
-                crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-                &preflight,
-                GgmlCpuGraphBackend::Cpu,
+                lookup,
                 |error| error,
                 || BuiltinPreparedRuntimeRegistryError::UnknownArchitecture {
                     model_architecture: "poisoned".to_string(),
@@ -280,9 +278,7 @@ mod tests {
             .expect("runtime a");
         let runtime_b = cache
             .prepared_runtime_for_preflight(
-                crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-                &preflight,
-                GgmlCpuGraphBackend::Cpu,
+                lookup,
                 |error| error,
                 || BuiltinPreparedRuntimeRegistryError::UnknownArchitecture {
                     model_architecture: "poisoned".to_string(),
@@ -304,12 +300,15 @@ mod tests {
         // again -- exactly the documented idle_unload contract.
         let (_runtime_path, preflight) = write_cohere_preflight();
         let cache = BuiltinPreparedRuntimeCache::default();
+        let lookup = PreparedRuntimeLookup {
+            model_architecture: crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+            preflight: &preflight,
+            backend: GgmlCpuGraphBackend::Cpu,
+        };
         let build = |cache: &BuiltinPreparedRuntimeCache| {
             cache
                 .prepared_runtime_for_preflight(
-                    crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-                    &preflight,
-                    GgmlCpuGraphBackend::Cpu,
+                    lookup,
                     |error| error,
                     || BuiltinPreparedRuntimeRegistryError::UnknownArchitecture {
                         model_architecture: "poisoned".to_string(),
@@ -340,9 +339,11 @@ mod tests {
 
         let error = cache
             .with_qwen3_asr_runtime_for_preflight(
-                crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-                &preflight,
-                GgmlCpuGraphBackend::Cpu,
+                PreparedRuntimeLookup {
+                    model_architecture: crate::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                    preflight: &preflight,
+                    backend: GgmlCpuGraphBackend::Cpu,
+                },
                 |error: BuiltinPreparedRuntimeRegistryError| error.to_string(),
                 || "poisoned".to_string(),
                 || "wrong-variant".to_string(),

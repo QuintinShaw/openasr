@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::decoder_graph::MoonshineDecoderGraphRuntime;
+use super::decoder_graph::{MoonshineDecoderGraphRuntime, MoonshineDecoderRuntimeInput};
 use super::encoder_graph::MoonshineEncoderOutput;
 use super::lora::{MoonshineLoraAdapter, MoonshineLoraTarget, moonshine_lora_adapter_for_test};
 use super::prepared_runtime::{MoonshinePreparedRuntime, build_moonshine_prepared_runtime};
@@ -141,10 +141,12 @@ fn first_step_logits(
     adapter: Option<&MoonshineLoraAdapter>,
 ) -> Vec<f32> {
     let mut runtime = MoonshineDecoderGraphRuntime::new(
-        &prepared.decoder_weights,
-        prepared.metadata,
-        encoder_output.frame_count,
-        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        MoonshineDecoderRuntimeInput {
+            decoder_weights: &prepared.decoder_weights,
+            metadata: prepared.metadata,
+            cross_frame_count: encoder_output.frame_count,
+            backend: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        },
         true,
         Some(runtime_path),
         adapter,
@@ -233,10 +235,12 @@ fn lora_cross_value_precompute_delta_matches_host_math_and_scales_linearly() {
 
     let cross_value_rows = |adapter: Option<&MoonshineLoraAdapter>| {
         let mut runtime = MoonshineDecoderGraphRuntime::new(
-            &prepared.decoder_weights,
-            metadata,
-            encoder_output.frame_count,
-            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            MoonshineDecoderRuntimeInput {
+                decoder_weights: &prepared.decoder_weights,
+                metadata,
+                cross_frame_count: encoder_output.frame_count,
+                backend: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            },
             true,
             Some(&pack),
             adapter,

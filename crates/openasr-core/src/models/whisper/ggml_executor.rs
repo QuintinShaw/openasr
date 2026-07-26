@@ -453,17 +453,27 @@ trait WhisperEncoderPreludeRunner: Send + Sync {
     ) -> Result<WhisperEncoderPreludeSeamResult, WhisperGgmlExecutorError>;
 }
 
+/// The resolved input one encoder graph compute call runs against: which
+/// pack, which architecture metadata, which materialized weights, the
+/// planned graph shape, the prelude's hidden-state output, and the backend
+/// this request resolved to. Grouped because they always travel together
+/// from `execute_whisper_with_prepared_runtime` through the seam and into
+/// the runner, and shared verbatim between [`WhisperEncoderGraphRunner::run_encoder_graph`]
+/// and [`run_encoder_graph_seam`], which have identical shapes.
+struct WhisperEncoderGraphInput<'a> {
+    runtime_source: &'a GgmlRuntimeSource,
+    execution: &'a WhisperGgmlExecutionMetadata,
+    encoder_weights: &'a WhisperEncoderWeightBundle,
+    plan: &'a WhisperEncoderGraphPlan,
+    encoder_hidden_input_f32: &'a [f32],
+    backend: GgmlCpuGraphBackend,
+}
+
 trait WhisperEncoderGraphRunner: Send + Sync {
     fn runner_id(&self) -> &'static str;
-    #[allow(clippy::too_many_arguments)]
     fn run_encoder_graph(
         &self,
-        _runtime_source: &GgmlRuntimeSource,
-        execution: &WhisperGgmlExecutionMetadata,
-        encoder_weights: &WhisperEncoderWeightBundle,
-        plan: &WhisperEncoderGraphPlan,
-        encoder_hidden_input_f32: &[f32],
-        backend: GgmlCpuGraphBackend,
+        input: WhisperEncoderGraphInput<'_>,
     ) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError>;
 }
 
@@ -854,32 +864,27 @@ impl WhisperEncoderGraphRunner for WhisperCpuEncoderGraphComputeRunnerV0 {
 
     fn run_encoder_graph(
         &self,
-        runtime_source: &GgmlRuntimeSource,
-        execution: &WhisperGgmlExecutionMetadata,
-        encoder_weights: &WhisperEncoderWeightBundle,
-        plan: &WhisperEncoderGraphPlan,
-        encoder_hidden_input_f32: &[f32],
-        backend: GgmlCpuGraphBackend,
+        input: WhisperEncoderGraphInput<'_>,
     ) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError> {
-        let graph_config = whisper_encoder_graph_config(backend);
+        let graph_config = whisper_encoder_graph_config(input.backend);
         let mut session = take_or_build_whisper_encoder_persistent_static_session(
-            runtime_source,
-            execution,
-            encoder_weights,
-            plan,
+            input.runtime_source,
+            input.execution,
+            input.encoder_weights,
+            input.plan,
             graph_config,
         )?;
         let result = run_encoder_graph_with_runner(
             self.runner_id(),
             graph_config,
-            execution,
-            encoder_weights,
-            plan,
-            encoder_hidden_input_f32,
+            input.execution,
+            input.encoder_weights,
+            input.plan,
+            input.encoder_hidden_input_f32,
             &mut session.runner,
             session.resident_weights.as_ref(),
         );
-        store_whisper_encoder_persistent_static_session(runtime_source.path(), session);
+        store_whisper_encoder_persistent_static_session(input.runtime_source.path(), session);
         result
     }
 }
@@ -3764,13 +3769,15 @@ fn execute_whisper_with_prepared_runtime(
     if let Some(serve_batch_config) = serve_batch_config.filter(|_| can_use_serve_batch) {
         let encoder_result = trace.run_stage("encoder_run", || {
             run_encoder_graph_seam(
-                runtime_source,
-                &runtime.execution,
-                &runtime.encoder_weights,
-                &encoder_plan,
-                prelude_hidden_output,
+                WhisperEncoderGraphInput {
+                    runtime_source,
+                    execution: &runtime.execution,
+                    encoder_weights: &runtime.encoder_weights,
+                    plan: &encoder_plan,
+                    encoder_hidden_input_f32: prelude_hidden_output,
+                    backend: resolved_backend,
+                },
                 encoder_graph_runner,
-                resolved_backend,
             )
         })?;
         let WhisperEncoderGraphSeamResult::GraphExecuted {
@@ -3874,13 +3881,15 @@ fn execute_whisper_with_prepared_runtime(
                 let encoder_handle = parallel_scope.spawn(move || {
                     encoder_trace.run_stage("encoder_run", || {
                         run_encoder_graph_seam(
-                            runtime_source_ref,
-                            execution_ref,
-                            encoder_weights_ref,
-                            encoder_plan_ref,
-                            prelude_hidden_output,
+                            WhisperEncoderGraphInput {
+                                runtime_source: runtime_source_ref,
+                                execution: execution_ref,
+                                encoder_weights: encoder_weights_ref,
+                                plan: encoder_plan_ref,
+                                encoder_hidden_input_f32: prelude_hidden_output,
+                                backend: resolved_backend,
+                            },
                             encoder_graph_runner,
-                            resolved_backend,
                         )
                     })
                 });
@@ -3949,13 +3958,15 @@ fn execute_whisper_with_prepared_runtime(
         } else {
             let encoder_result = trace.run_stage("encoder_run", || {
                 run_encoder_graph_seam(
-                    runtime_source,
-                    &runtime.execution,
-                    &runtime.encoder_weights,
-                    &encoder_plan,
-                    prelude_hidden_output,
+                    WhisperEncoderGraphInput {
+                        runtime_source,
+                        execution: &runtime.execution,
+                        encoder_weights: &runtime.encoder_weights,
+                        plan: &encoder_plan,
+                        encoder_hidden_input_f32: prelude_hidden_output,
+                        backend: resolved_backend,
+                    },
                     encoder_graph_runner,
-                    resolved_backend,
                 )
             })?;
             let mut decoder_persistent_cache_populated = false;
@@ -4177,24 +4188,11 @@ fn run_encoder_prelude_seam(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_encoder_graph_seam(
-    runtime_source: &GgmlRuntimeSource,
-    execution: &WhisperGgmlExecutionMetadata,
-    encoder_weights: &WhisperEncoderWeightBundle,
-    encoder_plan: &WhisperEncoderGraphPlan,
-    encoder_hidden_input_f32: &[f32],
+    input: WhisperEncoderGraphInput<'_>,
     encoder_graph_runner: &dyn WhisperEncoderGraphRunner,
-    backend: GgmlCpuGraphBackend,
 ) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError> {
-    encoder_graph_runner.run_encoder_graph(
-        runtime_source,
-        execution,
-        encoder_weights,
-        encoder_plan,
-        encoder_hidden_input_f32,
-        backend,
-    )
+    encoder_graph_runner.run_encoder_graph(input)
 }
 
 fn build_encoder_graph_binding_seam(

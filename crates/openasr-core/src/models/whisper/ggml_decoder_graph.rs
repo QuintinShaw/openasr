@@ -1002,6 +1002,29 @@ struct PersistentCrossAttentionProjectionTask {
     value_target: GgmlStaticTensor,
 }
 
+/// The encoder-side graph input a decoder's cross-attention cache is built
+/// from: the encoder hidden state, its shape, and the resolved backend to
+/// build the one-shot K/V projection graphs with. Grouped because they
+/// always travel together into [`WhisperDecoderExecutionTensorCache::materialize_cross_attention_cache`]
+/// from a single call site.
+struct WhisperCrossAttentionCacheInput {
+    encoder_hidden: Arc<[f32]>,
+    hidden: usize,
+    encoder_frames: usize,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+}
+
+/// One linear-projection call's input: the values to project (a slice of the
+/// encoder-side graph input above), how many columns they span, and the
+/// resolved backend to build the one-shot graph with. Shared by both K and V
+/// calls out of [`WhisperCrossAttentionCacheInput`], and by
+/// [`materialize_linear_projection_output_ggml`] generally.
+struct WhisperCrossProjectionInput {
+    values: Arc<[f32]>,
+    columns: usize,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+}
+
 #[derive(Debug, Clone)]
 struct WhisperDecoderCrossAttentionCache {
     key: Arc<[u16]>,
@@ -1301,16 +1324,12 @@ impl WhisperDecoderExecutionTensorCache {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn materialize_cross_attention_cache(
         &mut self,
         source: &dyn WhisperDecoderTensorSource,
         layer: &WhisperDecoderLayerPlan,
-        encoder_hidden: Arc<[f32]>,
-        hidden: usize,
-        encoder_frames: usize,
+        input: WhisperCrossAttentionCacheInput,
         cache_misses: &mut usize,
-        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<WhisperDecoderCrossAttentionCache, WhisperDecoderGraphExecutionError> {
         if let Some(cache) = self.cross_attention.get(&layer.layer_idx) {
             return Ok(cache.clone());
@@ -1320,29 +1339,34 @@ impl WhisperDecoderExecutionTensorCache {
         let key = materialize_linear_projection_output_ggml(
             self,
             source,
-            Arc::clone(&encoder_hidden),
-            encoder_frames,
+            WhisperCrossProjectionInput {
+                values: Arc::clone(&input.encoder_hidden),
+                columns: input.encoder_frames,
+                backend: input.backend,
+            },
             &layer.cross_attn_k,
             None,
             "decoder_cross_attn_k_cache",
-            backend,
         )?;
         let value = materialize_linear_projection_output_ggml(
             self,
             source,
-            encoder_hidden,
-            encoder_frames,
+            WhisperCrossProjectionInput {
+                values: input.encoder_hidden,
+                columns: input.encoder_frames,
+                backend: input.backend,
+            },
             &layer.cross_attn_v.projection,
             Some(&layer.cross_attn_v.bias),
             "decoder_cross_attn_v_cache",
-            backend,
         )?;
 
-        let expected = hidden.checked_mul(encoder_frames).ok_or_else(|| {
-            WhisperDecoderGraphExecutionError::InvalidInput {
+        let expected = input
+            .hidden
+            .checked_mul(input.encoder_frames)
+            .ok_or_else(|| WhisperDecoderGraphExecutionError::InvalidInput {
                 reason: "cross-attention cache shape overflows usize".to_string(),
-            }
-        })?;
+            })?;
         if key.len() != expected || value.len() != expected {
             return Err(WhisperDecoderGraphExecutionError::GraphExecutionFailed {
                 reason: format!(
@@ -2681,11 +2705,13 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
                 Some(tensor_cache.materialize_cross_attention_cache(
                     source,
                     layer,
-                    Arc::clone(encoder_hidden),
-                    hidden,
-                    encoder_frames,
+                    WhisperCrossAttentionCacheInput {
+                        encoder_hidden: Arc::clone(encoder_hidden),
+                        hidden,
+                        encoder_frames,
+                        backend,
+                    },
                     &mut cross_cache_misses,
-                    backend,
                 )?)
             };
             let cross_attention = apply_decoder_cross_attention(
@@ -5235,19 +5261,16 @@ fn apply_linear_with_bias<'a>(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn materialize_linear_projection_output_ggml(
     tensor_cache: &mut WhisperDecoderExecutionTensorCache,
     source: &dyn WhisperDecoderTensorSource,
-    input_values: Arc<[f32]>,
-    input_columns: usize,
+    input: WhisperCrossProjectionInput,
     projection: &WhisperDecoderLinearProjectionPlan,
     bias: Option<&WhisperDecoderGraphTensorRef>,
     label_prefix: &'static str,
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<Arc<[f32]>, WhisperDecoderGraphExecutionError> {
     let mut runner =
-        GgmlCpuGraphRunner::new(whisper_decoder_graph_config(backend)).map_err(|error| {
+        GgmlCpuGraphRunner::new(whisper_decoder_graph_config(input.backend)).map_err(|error| {
             WhisperDecoderGraphExecutionError::GraphExecutionFailed {
                 reason: format!(
                     "could not initialize ggml cpu graph runner for {label_prefix}: {error}"
@@ -5258,8 +5281,8 @@ fn materialize_linear_projection_output_ggml(
         &mut runner,
         tensor_cache,
         source,
-        input_values,
-        input_columns,
+        input.values,
+        input.columns,
         projection,
         bias,
         label_prefix,

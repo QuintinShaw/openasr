@@ -117,10 +117,12 @@ pub(crate) fn run_moonshine_decoder_short_form(
             DEFAULT_RUNTIME_CACHE_CAPACITY,
             || {
                 MoonshineDecoderGraphRuntime::new(
-                    decoder_weights,
-                    metadata,
-                    encoder_output.frame_count,
-                    backend,
+                    MoonshineDecoderRuntimeInput {
+                        decoder_weights,
+                        metadata,
+                        cross_frame_count: encoder_output.frame_count,
+                        backend,
+                    },
                     prefer_cpu_backend,
                     Some(runtime_path),
                     adapter,
@@ -142,10 +144,12 @@ pub(crate) fn run_moonshine_decoder_short_form(
     }
 
     let mut runtime = MoonshineDecoderGraphRuntime::new(
-        decoder_weights,
-        metadata,
-        encoder_output.frame_count,
-        backend,
+        MoonshineDecoderRuntimeInput {
+            decoder_weights,
+            metadata,
+            cross_frame_count: encoder_output.frame_count,
+            backend,
+        },
         prefer_cpu_backend,
         runtime_path,
         adapter,
@@ -440,6 +444,20 @@ pub(crate) struct MoonshineDecoderGraphRuntime {
     n_seq: usize,
 }
 
+/// The resolved-input identity a decoder runtime is built from: the weights
+/// and metadata it decodes, the encoder frame count its cross-KV cache is
+/// sized against, and the backend this request resolved to. Grouped because
+/// they always travel together into [`MoonshineDecoderGraphRuntime::new`]
+/// from a single call site, and because contract 4b adds the runtime
+/// source's content identity to this same trio as a new field rather than
+/// another positional parameter.
+pub(crate) struct MoonshineDecoderRuntimeInput<'a> {
+    pub(crate) decoder_weights: &'a MoonshineDecoderWeights,
+    pub(crate) metadata: MoonshineExecutionMetadata,
+    pub(crate) cross_frame_count: usize,
+    pub(crate) backend: GgmlCpuGraphBackend,
+}
+
 struct MoonshineDecoderStepExecutor<'a> {
     runtime: &'a mut MoonshineDecoderGraphRuntime,
 }
@@ -505,21 +523,17 @@ impl MoonshineDecoderGraphRuntime {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        decoder_weights: &MoonshineDecoderWeights,
-        metadata: MoonshineExecutionMetadata,
-        cross_frame_count: usize,
-        backend: GgmlCpuGraphBackend,
+        input: MoonshineDecoderRuntimeInput<'_>,
         prefer_cpu_backend: bool,
         runtime_path: Option<&Path>,
         adapter: Option<&MoonshineLoraAdapter>,
     ) -> Result<Self, MoonshineDecoderGraphError> {
         Self::new_with_n_seq(
-            decoder_weights,
-            metadata,
-            cross_frame_count,
-            backend,
+            input.decoder_weights,
+            input.metadata,
+            input.cross_frame_count,
+            input.backend,
             prefer_cpu_backend,
             runtime_path,
             1,
@@ -2780,10 +2794,12 @@ mod tests {
         let encoder_output_1 = sample_encoder_output(metadata, 0.25, 32);
 
         let mut serial_runtime_0 = MoonshineDecoderGraphRuntime::new(
-            &prepared.decoder_weights,
-            metadata,
-            encoder_output_0.frame_count,
-            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            MoonshineDecoderRuntimeInput {
+                decoder_weights: &prepared.decoder_weights,
+                metadata,
+                cross_frame_count: encoder_output_0.frame_count,
+                backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            },
             false,
             Some(runtime_path.as_path()),
             None,
@@ -2797,10 +2813,12 @@ mod tests {
             .expect("serial logits 0");
 
         let mut serial_runtime_1 = MoonshineDecoderGraphRuntime::new(
-            &prepared.decoder_weights,
-            metadata,
-            encoder_output_1.frame_count,
-            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            MoonshineDecoderRuntimeInput {
+                decoder_weights: &prepared.decoder_weights,
+                metadata,
+                cross_frame_count: encoder_output_1.frame_count,
+                backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            },
             false,
             Some(runtime_path.as_path()),
             None,
@@ -2861,10 +2879,12 @@ mod tests {
         let followup = metadata.bos_token_id;
 
         let mut serial_runtime_0 = MoonshineDecoderGraphRuntime::new(
-            &prepared.decoder_weights,
-            metadata,
-            encoder_output_0.frame_count,
-            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            MoonshineDecoderRuntimeInput {
+                decoder_weights: &prepared.decoder_weights,
+                metadata,
+                cross_frame_count: encoder_output_0.frame_count,
+                backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            },
             false,
             Some(runtime_path.as_path()),
             None,
@@ -2883,10 +2903,12 @@ mod tests {
             .expect("serial followup logits 0");
 
         let mut serial_runtime_1 = MoonshineDecoderGraphRuntime::new(
-            &prepared.decoder_weights,
-            metadata,
-            encoder_output_1.frame_count,
-            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            MoonshineDecoderRuntimeInput {
+                decoder_weights: &prepared.decoder_weights,
+                metadata,
+                cross_frame_count: encoder_output_1.frame_count,
+                backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            },
             false,
             Some(runtime_path.as_path()),
             None,

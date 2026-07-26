@@ -48,7 +48,7 @@ use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SEQ2SEQ, build_seq2seq_streaming_session,
 };
 use crate::models::runtime_prepared_registry::{
-    BuiltinPreparedRuntimeCache, BuiltinPreparedRuntimeRegistryError,
+    BuiltinPreparedRuntimeCache, BuiltinPreparedRuntimeRegistryError, PreparedRuntimeLookup,
 };
 use crate::models::thread_local_runtime_cache::{
     BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
@@ -155,9 +155,11 @@ impl CohereTranscribeGgmlExecutor {
         let prepared_runtime_start = debug_timing_start();
         self.runtime_cache_by_path
             .with_cohere_transcribe_runtime_for_preflight(
-                request.selected_family.model_architecture,
-                preflight.as_ref(),
-                request.resolved_runtime.backend(),
+                PreparedRuntimeLookup {
+                    model_architecture: request.selected_family.model_architecture,
+                    preflight: preflight.as_ref(),
+                    backend: request.resolved_runtime.backend(),
+                },
                 map_prepared_runtime_registry_error,
                 cohere_runtime_cache_slot_unavailable,
                 || CohereTranscribeGgmlExecutorError::PreparedRuntimeFailed {
@@ -984,9 +986,11 @@ mod tests {
         let runtime_a = executor
             .runtime_cache_by_path
             .prepared_runtime_for_preflight(
-                request.selected_family.model_architecture,
-                &preflight,
-                request.resolved_runtime.backend(),
+                PreparedRuntimeLookup {
+                    model_architecture: request.selected_family.model_architecture,
+                    preflight: &preflight,
+                    backend: request.resolved_runtime.backend(),
+                },
                 map_prepared_runtime_registry_error,
                 cohere_runtime_cache_slot_unavailable,
             )
@@ -994,9 +998,11 @@ mod tests {
         let runtime_b = executor
             .runtime_cache_by_path
             .prepared_runtime_for_preflight(
-                request.selected_family.model_architecture,
-                &preflight,
-                request.resolved_runtime.backend(),
+                PreparedRuntimeLookup {
+                    model_architecture: request.selected_family.model_architecture,
+                    preflight: &preflight,
+                    backend: request.resolved_runtime.backend(),
+                },
                 map_prepared_runtime_registry_error,
                 cohere_runtime_cache_slot_unavailable,
             )
@@ -1043,9 +1049,11 @@ mod tests {
             let runtime_via_offline_style_lookup = shared
                 .runtime_cache_by_path
                 .prepared_runtime_for_preflight(
-                    request.selected_family.model_architecture,
-                    &preflight,
-                    request.resolved_runtime.backend(),
+                    PreparedRuntimeLookup {
+                        model_architecture: request.selected_family.model_architecture,
+                        preflight: &preflight,
+                        backend: request.resolved_runtime.backend(),
+                    },
                     map_prepared_runtime_registry_error,
                     cohere_runtime_cache_slot_unavailable,
                 )
@@ -1063,9 +1071,11 @@ mod tests {
             let runtime_after_streaming_entry = shared
                 .runtime_cache_by_path
                 .prepared_runtime_for_preflight(
-                    request.selected_family.model_architecture,
-                    &preflight,
-                    request.resolved_runtime.backend(),
+                    PreparedRuntimeLookup {
+                        model_architecture: request.selected_family.model_architecture,
+                        preflight: &preflight,
+                        backend: request.resolved_runtime.backend(),
+                    },
                     map_prepared_runtime_registry_error,
                     cohere_runtime_cache_slot_unavailable,
                 )

@@ -101,13 +101,10 @@ impl WhisperEncoderGraphRunner for TestEncoderGraphRunner {
 
     fn run_encoder_graph(
         &self,
-        _runtime_source: &GgmlRuntimeSource,
-        _execution: &WhisperGgmlExecutionMetadata,
-        _encoder_weights: &WhisperEncoderWeightBundle,
-        plan: &WhisperEncoderGraphPlan,
-        encoder_hidden_input_f32: &[f32],
-        _backend: GgmlCpuGraphBackend,
+        input: WhisperEncoderGraphInput<'_>,
     ) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError> {
+        let plan = input.plan;
+        let encoder_hidden_input_f32 = input.encoder_hidden_input_f32;
         self.called.store(true, Ordering::SeqCst);
         assert_eq!(
             encoder_hidden_input_f32.len(),

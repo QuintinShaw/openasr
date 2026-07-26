@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use thiserror::Error;
 
-use super::decoder_graph::{MoonshineDecodeOutput, MoonshineDecoderGraphRuntime};
+use super::decoder_graph::{
+    MoonshineDecodeOutput, MoonshineDecoderGraphRuntime, MoonshineDecoderRuntimeInput,
+};
 use super::encoder_graph::MoonshineEncoderOutput;
 use super::prepared_runtime::MoonshinePreparedRuntime;
 use super::runtime_contract::MoonshineExecutionMetadata;
@@ -186,10 +188,12 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
         // forces the direct decode path when OPENASR_ADAPTER is active), so
         // worker runtimes are always adapter-free.
         MoonshineDecoderGraphRuntime::new(
-            &job.prepared_runtime.decoder_weights,
-            job.prepared_runtime.metadata,
-            job.encoder_output.frame_count,
-            job.backend,
+            MoonshineDecoderRuntimeInput {
+                decoder_weights: &job.prepared_runtime.decoder_weights,
+                metadata: job.prepared_runtime.metadata,
+                cross_frame_count: job.encoder_output.frame_count,
+                backend: job.backend,
+            },
             false,
             Some(job.runtime_cache_path.as_path()),
             None,
