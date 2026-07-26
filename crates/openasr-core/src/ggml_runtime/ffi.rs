@@ -82,12 +82,20 @@ pub(crate) const GGML_BACKEND_DEVICE_TYPE_IGPU: c_int = 2;
 pub(crate) const GGML_BACKEND_DEVICE_TYPE_ACCEL: c_int = 3;
 pub(crate) const GGML_BACKEND_DEVICE_TYPE_META: c_int = 4;
 
+pub(crate) const GGML_STATUS_ALLOC_FAILED: c_int = -2;
+pub(crate) const GGML_STATUS_FAILED: c_int = -1;
 pub(crate) const GGML_STATUS_SUCCESS: c_int = 0;
-/// Mirrors `enum ggml_status` in ggml.h (`GGML_STATUS_ABORTED = 1`).
-/// Returned when a native backend poll or a shared segmented-backend checkpoint
-/// observes its installed abort callback. Rust maps this status to the typed
-/// per-job cancellation path rather than a generic compute failure.
+/// Mirrors `enum ggml_status` in ggml.h. `ggml_backend_graph_compute` and
+/// `ggml_backend_sched_graph_compute` return the merged submit + completion
+/// status, so this is the single terminal outcome for a compute call -- no
+/// separate synchronize step is needed to observe a completion-phase failure.
+/// `GGML_STATUS_ABORTED` is the cooperative cancellation result; Rust maps it
+/// to the typed per-job cancellation path rather than a generic compute
+/// failure. All other non-success values below are terminal failures.
 pub(crate) const GGML_STATUS_ABORTED: c_int = 1;
+pub(crate) const GGML_STATUS_EXECUTION_FAILED: c_int = 2;
+pub(crate) const GGML_STATUS_DEVICE_LOST: c_int = 3;
+pub(crate) const GGML_STATUS_BACKEND_POISONED: c_int = 4;
 pub(crate) const GGML_BACKEND_GRAPH_CANCEL_DISABLED: c_int = 0;
 pub(crate) const GGML_BACKEND_GRAPH_CANCEL_NATIVE: c_int = 1;
 pub(crate) const GGML_BACKEND_GRAPH_CANCEL_SEGMENTED: c_int = 2;
@@ -216,13 +224,13 @@ unsafe extern "C" {
         data: *const c_void,
         offset: usize,
         size: usize,
-    );
+    ) -> c_int;
     pub(crate) fn ggml_backend_tensor_get(
         tensor: GgmlTensorRaw,
         data: *mut c_void,
         offset: usize,
         size: usize,
-    );
+    ) -> c_int;
     pub(crate) fn ggml_backend_tensor_alloc(
         buffer: GgmlBackendBufferRaw,
         tensor: GgmlTensorRaw,
