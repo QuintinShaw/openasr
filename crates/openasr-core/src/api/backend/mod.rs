@@ -10,13 +10,11 @@ mod native;
 mod request_context;
 
 pub use mock::transcribe_with_mock_backend;
-pub(crate) use native::current_transcription_control;
 pub use native::{
-    ActiveTranscriptionControlGuard, NativeBackend, NativeBackendExecutor,
-    NativeRuntimeModelAdapter, NativeRuntimeModelIdSource, NativeRuntimeModelIdentity,
-    NativeRuntimeModelIdentityError, NativeTranscriptionPhase, NativeTranscriptionProgress,
-    RequestExecutionContext, SliceBoundaryControl, TranscriptionControl,
-    describe_native_runtime_model_mismatch, install_active_transcription_control,
+    GgmlAbortCallbackGuard, NativeBackend, NativeBackendExecutor, NativeRuntimeModelAdapter,
+    NativeRuntimeModelIdSource, NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
+    NativeTranscriptionPhase, NativeTranscriptionProgress, RequestExecutionContext,
+    SliceBoundaryControl, TranscriptionControl, describe_native_runtime_model_mismatch,
     native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
     native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,
@@ -420,11 +418,11 @@ pub struct TranscriptionRequest {
     /// request without going through `prepare_audio_input` at all.
     pub prepared_samples: Option<Arc<Vec<f32>>>,
     /// Cancel/pause/resume control and request id for this decode, carried
-    /// explicitly rather than through a thread-local -- see
-    /// [`crate::RequestExecutionContext`]. Defaults to a detached context in
-    /// [`Self::new`]; the server sets a real one via
-    /// [`Self::with_execution_context`] when the client registered a
-    /// transcription id.
+    /// explicitly rather than through the (removed) thread-local
+    /// transcription control -- see [`crate::RequestExecutionContext`].
+    /// Defaults to a detached context in [`Self::new`]; the server sets a
+    /// real one via [`Self::with_execution_context`] when the client
+    /// registered a transcription id.
     pub execution_context: Arc<crate::RequestExecutionContext>,
 }
 

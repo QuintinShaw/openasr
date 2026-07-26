@@ -1,28 +1,28 @@
-//! In-session pause / resume / cancel control for a running native file
+//! In-session pause / resume / cancel control for a running native
 //! transcription.
 //!
-//! Mirrors the pull-job control model (an `Arc` of shared control flags held by
-//! both the request handler and the worker), but the signal reaches the deep
-//! long-form decode loop through a thread-local install guard -- the same trick
-//! [`super::native_transcribe::native_transcription_progress`] uses to avoid
-//! threading a handle through the whole executor API surface. The native decode
-//! runs synchronously on one thread (the server's `spawn_blocking` worker or the
-//! CLI's calling thread), so a thread-local is enough for the slice loop to find
-//! its control.
+//! Mirrors the pull-job control model: an `Arc` of shared control flags held
+//! by both the request handler and the worker. The signal reaches the deep
+//! long-form decode loop, the shared greedy driver, and every family's
+//! serve-batch owner through an explicit [`crate::RequestExecutionContext`]
+//! carried on the request/job itself -- never a thread-local. A decode that
+//! ends up running on a thread other than the one that submitted the request
+//! (a serve-batch owner, a realtime worker) still observes the same `Arc`.
 //!
-//! ggml's CPU abort_callback may run on a worker-pool thread that does **not**
-//! share that TLS. Cancel therefore also dual-writes a heap
-//! [`Arc`]`<`[`AtomicBool`]`>` per job. Install publishes that flag on the owner
-//! thread; each ggml graph compute clones it and binds `Arc::as_ptr` only for the
-//! FFI call. The trampoline wait-free-loads that pointer (never a process-wide
-//! slot, never TLS). Parallel server jobs therefore hold distinct data pointers,
-//! so canceling job B cannot abort job A's graph.
+//! ggml's CPU abort_callback runs inside the FFI call itself and can only see
+//! a raw `void*` data pointer, not this crate's types, so cancel additionally
+//! dual-writes a heap [`Arc`]`<`[`AtomicBool`]`>` per job.
+//! [`TranscriptionControl::arm_for_native_decode`] publishes that flag as the
+//! current thread's abort-callback data for the duration of one synchronous
+//! native decode; each ggml graph compute clones it and binds `Arc::as_ptr`
+//! only for the FFI call. The trampoline wait-free-loads that pointer (never a
+//! process-wide slot, never TLS). Parallel server jobs therefore hold distinct
+//! data pointers, so canceling job B cannot abort job A's graph.
 //!
 //! Scope is deliberately in-session: the control lives only for one in-flight
 //! transcription. Cross-request or cross-restart resume (which would need
 //! persisted partial decode state) is out of scope.
 
-use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -48,8 +48,9 @@ struct ControlState {
 /// The server registers one of these per in-flight file transcription (keyed by
 /// a client-supplied job id) so its pause/resume/cancel HTTP handlers can flip
 /// the flags while the blocking decode runs on a `spawn_blocking` worker. The
-/// worker reads the same handle at each long-form slice boundary via
-/// [`current_transcription_control`]. Cancel wins over pause.
+/// worker reads the same handle -- carried explicitly on the request/job via
+/// [`crate::RequestExecutionContext`], never a thread-local -- at each
+/// long-form slice boundary. Cancel wins over pause.
 pub struct TranscriptionControl {
     state: Mutex<ControlState>,
     // Signaled on resume or cancel so a worker blocked at a paused slice
@@ -58,7 +59,7 @@ pub struct TranscriptionControl {
     /// Wait-free cancel bit dual-written by [`Self::request_cancel`]. Shared with
     /// the ggml abort_callback trampoline (which cannot use thread-locals) as the
     /// compute-scoped callback `data` pointer published by
-    /// [`install_active_transcription_control`]. Pause never touches this bit.
+    /// [`Self::arm_for_native_decode`]. Pause never touches this bit.
     cancel_flag: Arc<AtomicBool>,
 }
 
@@ -171,71 +172,6 @@ impl std::fmt::Debug for TranscriptionControl {
             .field("pause", &pause)
             .finish()
     }
-}
-
-thread_local! {
-    // The control bound to the run currently executing on *this* thread, set by
-    // `install_active_transcription_control` and read by the long-form decode
-    // loop. Native transcription runs synchronously on a single thread, so this
-    // is enough to attribute the slice-boundary checks to the right control
-    // without threading a handle through the executor API.
-    static CURRENT_TRANSCRIPTION_CONTROL: RefCell<Option<Arc<TranscriptionControl>>> =
-        const { RefCell::new(None) };
-}
-
-/// RAII guard that binds a [`TranscriptionControl`] to the current thread for the
-/// duration of one native transcription and restores the previous binding on
-/// drop (normal return, early `?`, or panic), so a control never leaks into an
-/// unrelated later run on the same pooled worker thread. Graph compute reads
-/// the published job flag and owns the shorter backend callback lifetime.
-#[must_use = "the control binding is cleared when this guard is dropped"]
-pub struct ActiveTranscriptionControlGuard {
-    previous: Option<Arc<TranscriptionControl>>,
-    previous_job_cancel: Option<Arc<AtomicBool>>,
-    published_flag: Arc<AtomicBool>,
-}
-
-impl Drop for ActiveTranscriptionControlGuard {
-    fn drop(&mut self) {
-        CURRENT_TRANSCRIPTION_CONTROL.with(|cell| {
-            *cell.borrow_mut() = self.previous.take();
-        });
-        // Restore previous job cancel (nested) or clear. Graph compute owns a
-        // scoped Arc clone and the compute API retains no callback data, so
-        // cached runtimes never retain this guard's raw pointer.
-        let _ = disarm_thread_job_cancel_flag_if_current(
-            &self.published_flag,
-            self.previous_job_cancel.take(),
-        );
-    }
-}
-
-/// Bind `control` to the current thread so the in-flight native transcription's
-/// long-form slice loop observes pause/cancel requests. Returns a guard that
-/// restores the previous binding on drop. Install this at the top of the
-/// synchronous decode (e.g. inside the server's `spawn_blocking` closure).
-///
-/// Also publishes `control`'s cancel atomic for compute-scoped callback binding,
-/// so ggml's abort_callback (which may run off this thread) observes the same
-/// cancel bit via a wait-free pointer load. Pause is never written to that
-/// atomic -- the abort trampoline only recognizes cancel.
-pub fn install_active_transcription_control(
-    control: Arc<TranscriptionControl>,
-) -> ActiveTranscriptionControlGuard {
-    let published_flag = control.cancel_flag();
-    let previous_job_cancel = arm_thread_job_cancel_flag(Some(Arc::clone(&published_flag)));
-    let previous = CURRENT_TRANSCRIPTION_CONTROL.with(|cell| cell.replace(Some(control)));
-    ActiveTranscriptionControlGuard {
-        previous,
-        previous_job_cancel,
-        published_flag,
-    }
-}
-
-/// The control bound to the current thread, if any. Read by the long-form decode
-/// loop at each slice boundary.
-pub(crate) fn current_transcription_control() -> Option<Arc<TranscriptionControl>> {
-    CURRENT_TRANSCRIPTION_CONTROL.with(|cell| cell.borrow().clone())
 }
 
 /// RAII guard that publishes a [`TranscriptionControl`]'s cancel flag as the
@@ -363,27 +299,12 @@ mod tests {
     }
 
     #[test]
-    fn install_guard_binds_and_clears_thread_local() {
-        assert!(current_transcription_control().is_none());
-        let control = Arc::new(TranscriptionControl::new());
-        {
-            let _guard = install_active_transcription_control(Arc::clone(&control));
-            let bound = current_transcription_control().expect("control bound while guard alive");
-            assert!(Arc::ptr_eq(&bound, &control));
-        }
-        assert!(
-            current_transcription_control().is_none(),
-            "control binding must clear when the guard drops"
-        );
-    }
-
-    #[test]
     fn cancel_atomic_visible_to_job_abort_data_without_slice_wait() {
         // L2: ggml abort_callback reads the per-job heap atomic via callback data,
         // not TLS and not the slice Condvar path.
         let control = Arc::new(TranscriptionControl::new());
         {
-            let _guard = install_active_transcription_control(Arc::clone(&control));
+            let _guard = control.arm_for_native_decode();
             let data = thread_job_cancel_flag_data();
             assert!(
                 !data.is_null(),
@@ -419,8 +340,8 @@ mod tests {
 
     #[test]
     fn no_control_path_leaves_job_cancel_idle() {
-        // Bit-identical CLI path: without install_active_transcription_control,
-        // no abort callback data is published and callback-free compute uses the
+        // Bit-identical CLI path: without `arm_for_native_decode`, no abort
+        // callback data is published and callback-free compute uses the
         // original backend API.
         assert!(thread_job_cancel_flag_data().is_null());
         assert!(!thread_job_cancel_requested());
@@ -446,7 +367,7 @@ mod tests {
             let control_a = Arc::clone(&control_a);
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
-                let _guard = install_active_transcription_control(control_a);
+                let _guard = control_a.arm_for_native_decode();
                 let data = thread_job_cancel_flag_data();
                 barrier.wait();
                 barrier.wait();
@@ -461,7 +382,7 @@ mod tests {
             let control_b = Arc::clone(&control_b);
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
-                let _guard = install_active_transcription_control(Arc::clone(&control_b));
+                let _guard = control_b.arm_for_native_decode();
                 let data = thread_job_cancel_flag_data();
                 barrier.wait();
                 control_b.request_cancel();

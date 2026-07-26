@@ -58,13 +58,8 @@ pub use native_transcribe::{
 };
 pub use request_execution_context::RequestExecutionContext;
 pub use transcription_control::{
-    ActiveTranscriptionControlGuard, GgmlAbortCallbackGuard, SliceBoundaryControl,
-    TranscriptionControl, install_active_transcription_control,
+    GgmlAbortCallbackGuard, SliceBoundaryControl, TranscriptionControl,
 };
-// Used by the shared seq2seq greedy driver (L1 cooperative cancel) and any other
-// crate-internal decode loop that must observe in-flight cancel without a
-// threaded handle. Not part of the public API surface.
-pub(crate) use transcription_control::current_transcription_control;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NativeBackend;
@@ -576,6 +571,7 @@ fn native_offline_request_to_transcription_request(
         .with_source_audio_format(request.source_sample_rate_hz, request.source_channels)
         .with_source_container(request.source_container)
         .with_prepared_samples(request.prepared_samples)
+        .with_execution_context(request.execution_context)
 }
 
 fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {
