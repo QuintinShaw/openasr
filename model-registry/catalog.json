@@ -1631,7 +1631,7 @@
         "feature": "speaker-diarization",
         "role": "speaker-embedder"
       },
-      "display_name": "ReDimNet2-B6 Speaker Embedder (CN-enhanced)",
+      "display_name": "ReDimNet2-B6 Speaker Embedder",
       "family": "redimnet2",
       "aliases": [],
       "pull_alias": null,

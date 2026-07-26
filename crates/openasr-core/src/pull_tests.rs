@@ -761,7 +761,7 @@ fn capability_pack_stays_pullable_and_importable_by_digest() {
     let mut resolved = resolved_for(&bytes);
     resolved.requested = "redimnet2-b6-cn:fp16".to_string();
     resolved.model_id = "redimnet2-b6-cn".to_string();
-    resolved.display_name = "ReDimNet2-B6 Speaker Embedder (CN-enhanced)".to_string();
+    resolved.display_name = "ReDimNet2-B6 Speaker Embedder".to_string();
     resolved.quant = "fp16".to_string();
     resolved.suffix = "fp16".to_string();
     resolved.pull = "redimnet2-b6-cn:fp16".to_string();

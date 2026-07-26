@@ -370,7 +370,7 @@ mod tests {
             std::fs::write(&installed_pack, b"GGUF\x00\x00\x00\x00").unwrap();
             let installed_meta = serde_json::json!({
                 "model_id": "redimnet2-b6-cn",
-                "display_name": "ReDimNet2-B6 Speaker Embedder (CN-enhanced)",
+                "display_name": "ReDimNet2-B6 Speaker Embedder",
                 "quant": "f32",
                 "suffix": "f32",
                 "pull": "redimnet2-b6-cn:f32",

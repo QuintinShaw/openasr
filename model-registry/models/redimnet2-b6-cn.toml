@@ -1,6 +1,6 @@
 id = "redimnet2-b6-cn"
 default_variant = "published"
-display_name = "ReDimNet2-B6 Speaker Embedder (CN-enhanced) (OpenASR pack)"
+display_name = "ReDimNet2-B6 Speaker Embedder (OpenASR pack)"
 languages = ["en", "zh"]
 size = "embedder"
 license = "MIT"
