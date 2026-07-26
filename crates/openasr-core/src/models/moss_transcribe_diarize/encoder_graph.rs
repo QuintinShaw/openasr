@@ -1163,8 +1163,8 @@ mod parity_tests {
         // thread/scheduler pairing under a Metal backend tag -- not the real
         // production Metal path. Driving backend selection through the
         // `OPENASR_GGML_BACKEND` env var before the config is built (exactly
-        // how `resolve_runtime_backend` is meant to be steered) is the only
-        // way to get the correctly-paired settings for each backend. Safe
+        // how the generic runtime-default resolver is meant to be steered) is
+        // the only way to get the correctly-paired settings for each backend. Safe
         // here only because this manual harness runs single-threaded
         // (`--test-threads=1`, enforced by the `#[ignore]` message).
         let env_value = match backend {
@@ -1180,8 +1180,7 @@ mod parity_tests {
         // Auto-resolved Metal -- including one steered by `BACKEND_ENV` above
         // -- to CPU, so env-var steering alone can never reach the Metal leg.
         // Install an explicit `Accelerated` request override for that leg:
-        // the documented production path the gate always honors
-        // (`resolve_family_runtime_backend` doc comment -- an explicit
+        // the documented production path the gate always honors (an explicit
         // per-request preference wins over any Auto-mode gate), i.e. exactly
         // what an `execution_target=accelerated` request runs in production.
         let _accelerated_override = (backend == GgmlCpuGraphBackend::Metal).then(|| {
@@ -1189,6 +1188,14 @@ mod parity_tests {
                 crate::ggml_runtime::RequestBackendPreference::Accelerated,
             ))
         });
+        // Bypasses the dispatch, so the resolved input `moss_td_encoder_graph_config`
+        // now requires must be installed here, using the same policy the
+        // shared dispatch would have looked up for this architecture.
+        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input(
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+            ),
+        );
         let mut graph_config =
             crate::models::moss_transcribe_diarize::graph_config::moss_td_encoder_graph_config();
         assert_eq!(

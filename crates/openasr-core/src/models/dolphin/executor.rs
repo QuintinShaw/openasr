@@ -21,8 +21,8 @@ use crate::PhraseBiasConfig;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::DOLPHIN_GGML_ADAPTER_ID;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgufMetadata, GgufOwnedWeightTensorPayload,
-    GgufTensorDataReadError, GgufTensorDataReader, GgufWeightTensorElementType,
+    GgmlCpuGraphBackend, GgufMetadata, GgufOwnedWeightTensorPayload, GgufTensorDataReadError,
+    GgufTensorDataReader, GgufWeightTensorElementType,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionRequest, GgmlAsrExecutionResult, GgmlAsrExecutor,
@@ -208,33 +208,6 @@ pub(crate) struct DolphinPipelineOutput {
     /// Normalized recognition code the decode prefix selected (`zh`, `zh-sichuan`,
     /// ...), surfaced so the executor reports the language it actually decoded.
     pub resolved_language: String,
-}
-
-/// Resolve the ggml backend for a Dolphin request. Auto prefers the
-/// accelerator: on a GPU-capable host (Metal on Apple Silicon) the Auto default
-/// resolves to that accelerator, and only fails closed to the golden,
-/// parity-validated CPU path when no accelerator is present. An explicit
-/// `--execution-target cpu` always wins (the gate only ever pins Auto, never
-/// overrides an explicit preference).
-///
-/// Perf note (AB-measured on M1, warm best-of-N, isolated host; see the
-/// `encoder_graph`/`joint_decode` static-arena change): with the E-Branchformer
-/// encoder + CTC head weights resident in a WEIGHTS-usage arena, the ggml
-/// scheduler offloads the whole encoder to Metal (previously it pinned the
-/// ~1348-op encoder to the CPU, a net GPU loss). Metal then beats CPU on both a
-/// 3 s and an 18 s clip (RTF 0.126 vs 0.174, and 0.081 vs 0.103) and reproduces
-/// the golden transcript. CPU stays the bit-exact parity reference, so it
-/// remains the honest fallback where no accelerator exists.
-///
-/// Delegates to the shared `resolve_family_runtime_backend` gate (declared via
-/// this architecture's `auto_gpu_policy = AllBackends`, see `arch::mod` /
-/// `BUILTIN_ARCHITECTURE_DESCRIPTORS`) rather than hand-rolling the override
-/// check, so any provenance label resolving through the same gate can never
-/// drift from what this function actually decided.
-fn dolphin_runtime_backend() -> GgmlCpuGraphBackend {
-    GgmlCpuGraphConfig::resolve_family_runtime_backend(
-        crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-    )
 }
 
 /// Runtime weights for one pack, shared behind an `Arc` so the process-level pool
@@ -634,7 +607,10 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
             }
         }
 
-        let backend = dolphin_runtime_backend();
+        // Resolved once by the shared dispatch (via
+        // `install_resolved_family_runtime_input`, using this architecture's
+        // `auto_gpu_policy = AllBackends`) before this executor ran.
+        let backend = crate::ggml_runtime::resolved_family_runtime_input().backend();
         let reader = GgufTensorDataReader::from_runtime_source(&preflight.runtime_source)
             .map_err(|error| fail(format!("dolphin pack tensor reader failed: {error}")))?;
         // Reuse dequantized weights across requests (pool keyed by pack path); the

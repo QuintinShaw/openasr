@@ -960,6 +960,15 @@ mod tests {
         // thread-local override on drop at the end of this function.
         let _backend_override_guard =
             install_request_backend_override(backend_preference.request_backend_override());
+        // Same reasoning as the backend override above: the resolved input
+        // `moss_td_runtime_graph_config`/`moss_td_encoder_graph_config` now
+        // require must be installed here too, using this architecture's own
+        // declared policy.
+        let _resolved_guard = crate::ggml_runtime::install_resolved_family_runtime_input(
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+            ),
+        );
 
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
             wav_path,
@@ -1010,6 +1019,11 @@ mod tests {
         }
         let _backend_override_guard = install_request_backend_override(
             GgmlAsrBackendPreference::CpuOnly.request_backend_override(),
+        );
+        let _resolved_guard = crate::ggml_runtime::install_resolved_family_runtime_input(
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+            ),
         );
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
             wav_path,

@@ -32,7 +32,7 @@ use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::FIRERED_LLM_DECODE_POLICY_ID;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendOverrideGuard, RequestBackendPreference,
+    GgmlCpuGraphBackend, RequestBackendOverrideGuard, RequestBackendPreference,
     install_request_backend_override, request_backend_override,
 };
 use crate::models::decode_policy_component_registry::{
@@ -390,12 +390,19 @@ impl FireRedLlmGgmlExecutor {
         // unaffected.
         let _decoder_backend_override =
             resolve_decoder_backend_override(runtime_path, request.backend_preference);
-        // Resolved AFTER installing the override guard, so the cache key
-        // reflects the backend the decoder actually builds on (matches
-        // qwen's `WholeDecoderCacheKey` ordering).
+        // Re-resolve now that the decoder-specific RAM-fit override (if any)
+        // is installed, so every remaining call site in this decode -- the
+        // cache key, the backend label below, and the decoder's own graph
+        // construction -- observes the same final value instead of the
+        // pre-override snapshot the shared dispatch installed at entry.
+        let _resolved_decoder_backend = crate::ggml_runtime::install_resolved_family_runtime_input(
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
+            ),
+        );
         let decoder_cache_key: FireRedLlmDecoderCacheKey = (
             runtime_cache_path_identity(runtime_path),
-            GgmlCpuGraphConfig::resolve_runtime_backend(),
+            crate::ggml_runtime::resolved_family_runtime_input().backend(),
         );
         // Sampled before the cache take and reused for the store-back below:
         // if the idle-unload reaper bumps the generation while this decode is
@@ -589,7 +596,14 @@ fn resolve_decoder_backend_override(
             ) {
                 return None;
             }
-            if !GgmlCpuGraphConfig::resolve_runtime_backend().is_gpu_class() {
+            // Reads what the shared dispatch already resolved at entry
+            // (firered-llm's policy is `AllBackends`, so this is the same
+            // value the generic resolver would give); the RAM-fit override
+            // below is a further, family-specific narrowing on top of it.
+            if !crate::ggml_runtime::resolved_family_runtime_input()
+                .backend()
+                .is_gpu_class()
+            {
                 return None;
             }
             // Unknown RAM -> trust the default rather than force CPU.
@@ -754,6 +768,17 @@ mod tests {
                 "test fixture",
             )),
         };
+        // Bypasses the dispatch, so the request-level backend preference and
+        // the resolved input the decoder-backend RAM-fit check reads must
+        // both be installed here (dispatch normally does both).
+        let _backend_guard = crate::ggml_runtime::install_request_backend_override(
+            request.backend_preference.request_backend_override(),
+        );
+        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input(
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
+            ),
+        );
 
         let executor = FireRedLlmGgmlExecutor;
         let started_at = Instant::now();
