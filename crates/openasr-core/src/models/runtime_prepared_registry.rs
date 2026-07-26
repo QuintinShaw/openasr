@@ -69,9 +69,9 @@ pub(crate) enum BuiltinPreparedRuntimeRegistryError {
 /// source, and which backend this request resolved to. Grouped into one
 /// value (rather than three parallel arguments) because they always travel
 /// together from the executor's `request` down through the cache lookup to
-/// the actual build call -- and because contract 4b adds the already-open
-/// runtime source's content identity to this exact same trio, which becomes
-/// a new field here instead of yet another positional parameter.
+/// the actual build call, and because a future field (the already-open
+/// runtime source's content identity) can land in this same struct instead
+/// of yet another positional parameter.
 #[derive(Clone, Copy)]
 pub(crate) struct PreparedRuntimeLookup<'a> {
     pub(crate) model_architecture: &'a str,

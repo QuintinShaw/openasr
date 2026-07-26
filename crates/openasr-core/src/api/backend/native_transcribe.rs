@@ -2690,9 +2690,9 @@ mod tests {
         };
 
         // `native_runtime_backend_label` itself takes an already-resolved
-        // backend (per contract 4: resolution happens once, in
+        // backend: resolution happens once, in
         // `ResolvedFamilyRuntimeInput::resolve`, not inside the label
-        // formatter). This helper reproduces exactly that resolution step
+        // formatter. This helper reproduces exactly that resolution step
         // from the still-live `request_backend_override()` TLS (the
         // pre-existing, unrelated per-request-override mechanism this test
         // exercises via `install_request_backend_override` below) plus a

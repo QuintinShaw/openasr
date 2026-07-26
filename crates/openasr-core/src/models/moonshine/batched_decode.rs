@@ -77,9 +77,9 @@ pub(crate) struct MoonshineServeBatchJob {
     /// thread's preflight resolved. Cloning it is a refcount bump on its
     /// `Arc<Mmap>`, not a reopen -- the worker thread that actually builds
     /// the decoder runtime binds resident weights from this same mapping
-    /// instead of a fresh `File::open`/`load_gguf_weight_context` by path
-    /// (contract 4's defect C: identity and weight bytes must come from one
-    /// open, even across this thread boundary).
+    /// instead of a fresh `File::open`/`load_gguf_weight_context` by path,
+    /// so identity and weight bytes come from one open even across this
+    /// thread boundary.
     pub runtime_source: crate::GgmlRuntimeSource,
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,

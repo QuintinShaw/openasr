@@ -149,8 +149,8 @@ pub(crate) fn validate_runtime_family_wiring(
             });
         }
 
-        // Contract 4: a new family's minimal accession surface is descriptor
-        // + tensor contract (see this module's doc comment and
+        // A new family's minimal accession surface is descriptor + tensor
+        // contract (see this module's doc comment and
         // `models::runtime_tensor_contract_registry`); nothing here checks
         // decode policy resolves without one, so fail closed on an empty id
         // instead of letting a half-declared family silently run without a
@@ -548,9 +548,9 @@ pub(crate) mod source_tree_audit {
         };
     }
 
-    /// Contract 4's validation core: a brand-new family needs only a
-    /// descriptor + tensor contract to (a) pass the startup wiring gate and
-    /// (b) run a request end to end through the shared dispatch, with an
+    /// A brand-new family needs only a descriptor + tensor contract to (a)
+    /// pass the startup wiring gate and (b) run a request end to end
+    /// through the shared dispatch, with an
     /// executor that writes zero cancel-checkpoint or backend-resolution
     /// code of its own. This is the executable proof that "new family = data
     /// (descriptor) + a thin executor", not "new family = re-derive every

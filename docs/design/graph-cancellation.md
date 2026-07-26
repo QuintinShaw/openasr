@@ -88,8 +88,9 @@ explicitly and remove canceled members at typed prefill-chunk/token boundaries
 
 OpenASR invokes `ggml_backend_graph_compute` and scheduler graph compute; it
 does not invoke ggml's opaque backend graph-plan compute API. The latter cannot
-be segmented after plan creation and is outside this contract. OpenASR helpers
-named “graph plan” build ordinary `ggml_cgraph` values and are covered.
+be segmented after plan creation and is outside the cancellation contract
+described above. OpenASR helpers named “graph plan” build ordinary
+`ggml_cgraph` values and are covered.
 
 ## Regression evidence
 

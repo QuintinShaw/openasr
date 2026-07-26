@@ -889,8 +889,8 @@ mod tests {
         });
     }
 
-    /// Contract 4 defect C regression: the family encoder/decoder TLS
-    /// runtime caches now key on the already-open source's content id
+    /// The family encoder/decoder TLS runtime caches key on the
+    /// already-open source's content id
     /// ([`PackContentKey::for_runtime_source`]) instead of a second,
     /// weaker path-based identity. Structural proof (build counters, not
     /// timing -- see `moss_transcribe_diarize::executor`'s precedent):

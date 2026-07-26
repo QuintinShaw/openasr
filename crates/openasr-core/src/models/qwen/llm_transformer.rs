@@ -1570,7 +1570,8 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     /// the same already-open, already-validated source the caller's tensor
     /// reader was built from -- the zero-copy resident-weight bind below
     /// shares that one open mapping instead of a second `File::open` of the
-    /// pack (contract 4's defect C).
+    /// pack, so identity and weight bytes cannot come from different file
+    /// generations.
     pub(crate) fn new_with_adapter(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
         runtime_source: Option<&GgmlRuntimeSource>,

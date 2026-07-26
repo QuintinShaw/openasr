@@ -62,7 +62,7 @@ impl FireRedPuncRuntime {
     ) -> Result<Self, FireRedPuncRuntimeError> {
         // Open once: metadata and tensor data must come from the same
         // mapping, not two independent `File::open`s of `path` racing a
-        // concurrent replacement (contract 4's defect C).
+        // concurrent replacement.
         let runtime_source = crate::validate_ggml_runtime_source_path(path)
             .map_err(|error| FireRedPuncRuntimeError::Read(error.to_string()))?;
         let reader = GgufTensorDataReader::from_runtime_source(&runtime_source)

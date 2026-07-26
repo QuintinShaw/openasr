@@ -879,9 +879,9 @@ mod tests {
             .expect("second compute must reuse the cached executor, not rebuild from bad input");
     }
 
-    /// Contract 4 defect C regression, second family: unlike the fixture
-    /// above (which stands in for the content id with a fixed `test:` token),
-    /// this test derives the cache key the way production actually does --
+    /// Unlike the fixture above (which stands in for the content id with a
+    /// fixed `test:` token), this test derives the cache key the way
+    /// production actually does --
     /// [`PackContentKey::for_runtime_source`] from a real, already-open,
     /// already-validated [`crate::GgmlRuntimeSource`] -- and proves the two
     /// behaviors that make it a correctness-preserving replacement for the

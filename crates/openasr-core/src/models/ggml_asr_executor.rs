@@ -1528,14 +1528,14 @@ mod tests {
         ));
     }
 
-    /// Contract 4, defect A, regression 1: a single `execute()` call must
-    /// resolve this family's backend exactly once and hand every graph-build
-    /// call site the SAME value -- not let some sites read a gated
-    /// resolution and others an ungated one. The observable seam is the
-    /// request's own `resolved_runtime` field (not a global/thread-local
-    /// getter): a fake executor reads `_request.resolved_runtime.backend()`
-    /// at multiple simulated call sites (mirroring how a real family reads
-    /// it once per cache key / graph config) and records every read.
+    /// A single `execute()` call must resolve this family's backend exactly
+    /// once and hand every graph-build call site the SAME value -- not let
+    /// some sites read a gated resolution and others an ungated one. The
+    /// observable seam is the request's own `resolved_runtime` field (not a
+    /// global/thread-local getter): a fake executor reads
+    /// `_request.resolved_runtime.backend()` at multiple simulated call
+    /// sites (mirroring how a real family reads it once per cache key /
+    /// graph config) and records every read.
     ///
     /// The request is built on one OS thread and executed on a second,
     /// distinct OS thread -- the case a thread-local channel gets wrong
@@ -1632,9 +1632,9 @@ mod tests {
         );
     }
 
-    /// Contract 4, defect A, regression 2: a family whose descriptor declares
-    /// a gated `AutoGpuPolicy` (xasr-zipformer's real `ExceptMetal`) must
-    /// never observe a backend the gate forbids, even though the shared
+    /// A family whose descriptor declares a gated `AutoGpuPolicy`
+    /// (xasr-zipformer's real `ExceptMetal`) must never observe a backend
+    /// the gate forbids, even though the shared
     /// dispatch is the one doing the resolving now, not the family itself.
     /// Uses a fake executor substituted for the real xasr-zipformer one so
     /// the assertion is purely about dispatch's resolution, independent of

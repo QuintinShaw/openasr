@@ -1855,8 +1855,8 @@ mod tests {
     fn serve_still_works_without_the_desktop_sidecar_flags() {
         // Both flags are optional launch details for interactive/manual use
         // (e.g. `openasr serve` from a terminal); they must stay optional so
-        // this contract test only pins their *presence and shape*, not that
-        // every caller supplies them.
+        // this test only pins their *presence and shape*, not that every
+        // caller supplies them.
         let cli = Cli::try_parse_from(["openasr", "serve"])
             .expect("serve must remain usable without the desktop-only flags");
 

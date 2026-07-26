@@ -220,17 +220,14 @@ mod tests {
         assert!(matches!(config.backend, GgmlCpuGraphBackend::Gpu));
     }
 
-    /// Contract 4, defect A, closing regression: a family's own graph-config
-    /// path must return the backend the caller explicitly resolved and
-    /// passed in -- never silently prefer a thread-local override installed
-    /// behind its back. Before this fix, `whisper_runtime_graph_config` (and
-    /// every other family's equivalent) built its base config from
-    /// `GgmlCpuGraphConfig::default()`, which read this exact TLS internally;
-    /// a family could therefore observe a *different* backend than the one
-    /// the shared dispatch resolved into the request, reintroducing defect A
-    /// under a different name. Installing a `CpuOnly` override and then
-    /// passing `Metal` explicitly pins that this can never happen again: the
-    /// explicit parameter must win, full stop.
+    /// A family's own graph-config path must return the backend the caller
+    /// explicitly resolved and passed in -- never silently prefer a
+    /// thread-local override installed behind its back. Building the base
+    /// config from `GgmlCpuGraphConfig::default()` would read that TLS
+    /// internally, so a family could observe a *different* backend than the
+    /// one the shared dispatch resolved into the request. Installing a
+    /// `CpuOnly` override and then passing `Metal` explicitly pins that this
+    /// can never happen: the explicit parameter must win, full stop.
     #[test]
     fn family_graph_config_ignores_a_stale_tls_override_and_uses_the_explicit_backend() {
         let _guard = crate::ggml_runtime::install_request_backend_override(Some(

@@ -594,8 +594,8 @@ mod tests {
         );
     }
 
-    /// Required contract 3 regression: identity and bytes come from the same
-    /// open handle. Holds a `GgmlRuntimeSource` open, replaces the file at
+    /// Identity and bytes must come from the same open handle. Holds a
+    /// `GgmlRuntimeSource` open, replaces the file at
     /// its path via a rename (the same swap-the-directory-entry pattern
     /// `pull` uses), and proves the held source's mapped bytes and
     /// `content_id()` are both unchanged -- while a *fresh* resolution of the
@@ -647,8 +647,8 @@ mod tests {
         );
     }
 
-    /// Contract 4 defect C performance guardrail: the whole point of family
-    /// TLS caches switching to [`GgmlRuntimeSource::content_id`] (via
+    /// Performance guardrail: the whole point of family TLS caches switching
+    /// to [`GgmlRuntimeSource::content_id`] (via
     /// `models::runtime_cache_coordinator::PackContentKey::for_runtime_source`)
     /// instead of a from-scratch path-based fingerprint is that repeated
     /// admissions of the *same unchanged* pack must not pay a full-file

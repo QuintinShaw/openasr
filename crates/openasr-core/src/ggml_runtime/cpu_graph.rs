@@ -131,9 +131,11 @@ enum GgmlCpuGraphCpuAcceleratorPolicy {
 /// constants, no scheduler. Deliberately NOT `runtime_default()` -- a
 /// `Default` impl is the kind of door a family can reach for without meaning
 /// to resolve anything, so it must never silently answer "what backend should
-/// this request use" (that TLS-backed resolution is exactly the anti-pattern
-/// this contract exists to remove: see `ResolvedFamilyRuntimeInput`). Callers
-/// that need a real resolved backend must say so explicitly, e.g. via
+/// this request use". Backend resolution belongs to
+/// `ResolvedFamilyRuntimeInput`, computed once from the family's declared
+/// policy and the request; a `Default` impl must not become a second,
+/// thread-local path to that answer. Callers that need a real resolved
+/// backend must say so explicitly, e.g. via
 /// `GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend)`.
 impl Default for GgmlCpuGraphConfig {
     fn default() -> Self {
@@ -479,13 +481,12 @@ impl GgmlCpuGraphConfig {
 /// -- including across an OS-thread boundary (materialize on the submitting
 /// thread, carry the value itself into the work item; never re-derive on the
 /// worker thread) -- instead of each site independently re-deriving it from
-/// a thread-local override that only ever worked on the installing thread
-/// (contract 4's defect A).
+/// a thread-local override that only ever worked on the installing thread.
 ///
-/// Deliberately a struct, not a bare [`GgmlCpuGraphBackend`]: a later
-/// contract extends this with the resolved content identity / already-open
-/// runtime source, which only requires adding a field here -- not another
-/// signature change at every call site already carrying this type.
+/// Deliberately a struct, not a bare [`GgmlCpuGraphBackend`]: it is expected
+/// to grow a resolved content identity / already-open runtime source
+/// alongside the backend, which only requires adding a field here -- not
+/// another signature change at every call site already carrying this type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedFamilyRuntimeInput {
     backend: GgmlCpuGraphBackend,
@@ -1368,10 +1369,10 @@ impl GgmlCpuGraphRunner {
     /// fresh `File::open` of `source.path()`. This is what keeps the runtime
     /// cache key (built from `source.content_id()`, see
     /// `models::runtime_cache_coordinator::PackContentKey`) and the weight
-    /// bytes actually bound into the graph provably from the same open handle
-    /// (contract 4's defect C): a caller that already validated/opened a
-    /// `GgmlRuntimeSource` for this request must pass that same source here
-    /// instead of re-deriving one from a path.
+    /// bytes actually bound into the graph provably from the same open
+    /// handle: a caller that already validated/opened a `GgmlRuntimeSource`
+    /// for this request must pass that same source here instead of
+    /// re-deriving one from a path.
     pub(crate) fn load_gguf_weight_context(
         &self,
         source: &GgmlRuntimeSource,

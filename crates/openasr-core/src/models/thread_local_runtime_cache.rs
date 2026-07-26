@@ -15,9 +15,8 @@ pub(crate) fn canonical_runtime_cache_path(path: &Path) -> PathBuf {
 // handing back a runtime built from the old bytes, and deriving it from a
 // source already open for this request (rather than re-deriving from a path)
 // is what keeps the cache key and the weight bytes actually loaded provably
-// the same open (contract 4's defect C). `canonical_runtime_cache_path` stays
-// for callers that need the path itself (e.g. the path a serve-batch owner
-// loads from), not a key.
+// the same open. `canonical_runtime_cache_path` stays for callers that need
+// the path itself (e.g. the path a serve-batch owner loads from), not a key.
 pub(crate) use crate::models::runtime_cache_coordinator::PackContentKey;
 
 // Idle-unload generation is the unified runtime-cache coordinator epoch.

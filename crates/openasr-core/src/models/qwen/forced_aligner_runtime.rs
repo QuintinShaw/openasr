@@ -515,7 +515,8 @@ pub(crate) fn refine_word_timestamps_with_forced_aligner(
     // above already promises "loads the pack fresh... at most once per
     // `transcribe` call" -- sharing one `GgmlRuntimeSource` between them
     // (instead of each independently opening `pack_path`) is what actually
-    // keeps that promise (contract 4's defect C).
+    // keeps that promise: two independent opens of the same path could race
+    // a pack replacement and see different file generations.
     let runtime_source = crate::validate_ggml_runtime_source_path(pack_path).map_err(|error| {
         Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
             key: "<runtime source>",
