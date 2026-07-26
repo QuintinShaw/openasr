@@ -374,7 +374,7 @@ fn looks_like_remote_path(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{fs, path::Path, time::Instant};
 
     use tempfile::{NamedTempFile, tempdir};
 
@@ -645,6 +645,67 @@ mod tests {
             fresh.content_id(),
             held_id_before,
             "a fresh resolution of the replaced path must yield a different id"
+        );
+    }
+
+    /// Contract 4 defect C performance guardrail: the whole point of family
+    /// TLS caches switching to [`GgmlRuntimeSource::content_id`] (via
+    /// `models::runtime_cache_coordinator::PackContentKey::for_runtime_source`)
+    /// instead of a from-scratch path-based fingerprint is that repeated
+    /// admissions of the *same unchanged* pack must not pay a full-file
+    /// SHA-256 every time -- `resolve_content_id`'s process-wide memo, keyed
+    /// by [`StrongFileIdentity`], must short-circuit every open after the
+    /// first. This is a timing proof (the memo itself is a private
+    /// process-wide static with no counter seam to instrument), so the
+    /// bound is deliberately generous: many independent warm opens together
+    /// must stay cheaper than a single additional cold hash of the same
+    /// file, which is only possible if the warm opens are not each redoing
+    /// the full-file digest.
+    #[test]
+    fn content_id_memo_keeps_repeated_admissions_of_an_unchanged_pack_cheap() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("warm-path-pack.gguf");
+        // 32 MiB: large enough that a full SHA-256 pass is measurable
+        // (single-digit-plus milliseconds on any reasonable host), so a
+        // memo failure (re-hashing on every open) would make the warm loop
+        // below obviously, not marginally, slower than one cold hash.
+        let mut bytes = vec![0_u8; 32 * 1024 * 1024];
+        bytes[..4].copy_from_slice(b"GGUF");
+        for (index, byte) in bytes.iter_mut().enumerate().skip(4) {
+            *byte = (index % 251) as u8;
+        }
+        fs::write(&path, &bytes).expect("write warm-path fixture");
+
+        // Cold: first open of this file, first call to `content_id()` --
+        // pays the one real full-file hash.
+        let cold_start = Instant::now();
+        let cold_source = validate_ggml_runtime_source_path(&path).expect("cold open");
+        let cold_id = cold_source.content_id().to_string();
+        let cold_elapsed = cold_start.elapsed();
+        assert!(cold_id.starts_with("sha256:"), "got {cold_id}");
+
+        // Warm: many independent fresh opens of the SAME unchanged file --
+        // each is a real `File::open`/`mmap` (never reused across
+        // iterations) but must hit the `StrongFileIdentity`-keyed memo on
+        // `content_id()` instead of re-hashing 32 MiB again.
+        const WARM_ITERATIONS: u32 = 20;
+        let warm_start = Instant::now();
+        for _ in 0..WARM_ITERATIONS {
+            let warm_source = validate_ggml_runtime_source_path(&path).expect("warm open");
+            let warm_id = warm_source.content_id();
+            assert_eq!(
+                warm_id, cold_id,
+                "unchanged bytes must keep the same content id"
+            );
+        }
+        let warm_elapsed = warm_start.elapsed();
+
+        assert!(
+            warm_elapsed < cold_elapsed,
+            "{WARM_ITERATIONS} warm (memoized) admissions of an unchanged pack took \
+             {warm_elapsed:?}, which is not cheaper than the {cold_elapsed:?} single cold \
+             full-file hash it should have avoided paying {WARM_ITERATIONS} more times over -- \
+             the content-id memo appears to be re-hashing on every open"
         );
     }
 
