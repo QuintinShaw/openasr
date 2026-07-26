@@ -189,7 +189,6 @@ pub(super) fn submit_cohere_serve_batch_job(
 }
 
 pub(super) fn shutdown_cohere_serve_batch_engines() {
-    let _ = crate::models::runtime_cache_coordinator::bump_serve_batch_owner_shutdown_generation();
     shutdown_and_remove_serve_batch_engines(&COHERE_SERVE_BATCH_ENGINES);
 }
 
@@ -1742,22 +1741,20 @@ mod tests {
             "production resolve+engine_key must miss on same-path content replacement"
         );
 
-        let before = crate::current_runtime_build_generation();
-        let _ = crate::bump_runtime_build_generation();
-        let identity_after = serve_batch_build_identity_for_request(
+        // Re-resolving against the unchanged (post-rewrite) bytes must land on
+        // the exact same key as `key_b` -- there is no generation/epoch left
+        // to make an otherwise-identical identity spuriously rebuild.
+        let identity_again = serve_batch_build_identity_for_request(
             &options,
             "cohere",
             GgmlCpuGraphBackend::Gpu,
             &path,
         );
-        let key_after =
-            cohere_serve_batch_engine_key(identity_after, GgmlCpuGraphBackend::Gpu, 16, 64, 4);
-        assert!(key_after.build_identity.generation > before);
-        assert_ne!(key_a, key_after);
-        assert_ne!(key_b, key_after);
+        let key_again =
+            cohere_serve_batch_engine_key(identity_again, GgmlCpuGraphBackend::Gpu, 16, 64, 4);
         assert_eq!(
-            key_after.build_identity.pack_content_id,
-            identity_b.pack_content_id
+            key_again, key_b,
+            "unchanged bytes must resolve to the exact same engine key, not a fresh one"
         );
     }
 

@@ -162,7 +162,6 @@ pub(super) fn submit_moonshine_serve_batch_job(
 }
 
 pub(super) fn shutdown_moonshine_serve_batch_engines() {
-    let _ = crate::models::runtime_cache_coordinator::bump_serve_batch_owner_shutdown_generation();
     shutdown_and_remove_serve_batch_engines(&MOONSHINE_SERVE_BATCH_ENGINES);
 }
 

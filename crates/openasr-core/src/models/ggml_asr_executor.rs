@@ -39,10 +39,19 @@ impl GgmlAsrBackendPreference {
 
 /// Stable cache/engine identity for reusable native runtime state.
 ///
-/// `pack_content_id` is a content proof, never a bare path. Production resolves
-/// it from the installed-pack registry sha when available, otherwise from a
-/// full-file sha256 of the runtime pack bytes via
-/// [`crate::models::runtime_cache_coordinator`].
+/// `pack_content_id` is a content proof, never a bare path, and is the
+/// *entire* identity: two `RuntimeBuildIdentity` values with the same
+/// content id, route, and options fingerprint are always interchangeable.
+/// There is deliberately no invalidation generation/epoch here -- baking a
+/// shared process-wide counter into this identity was an audited bug (one
+/// idle unload / serve-batch owner shutdown / pack replace anywhere in the
+/// process invalidated every resident identity, not just the one that
+/// actually changed; see `runtime_cache_coordinator`'s module doc comment).
+/// A pack replace already changes `pack_content_id` on its own; idle unload
+/// and serve-batch owner shutdown now evict their own registries/caches
+/// explicitly (see each family's `unload_idle_state` /
+/// `shutdown_*_serve_batch_engines`) instead of relying on this identity
+/// going stale.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RuntimeBuildIdentity {
     /// Content identity: `sha256:<hex>` for real pack bytes, or an explicit
@@ -54,29 +63,20 @@ pub struct RuntimeBuildIdentity {
     /// Adapter/options fingerprint that changes the lowered graph without
     /// changing pack bytes (for example an active `.oadp` adapter path).
     pub options_fingerprint: String,
-    /// Invalidation generation from the runtime cache coordinator. Idle unload,
-    /// serve-batch owner shutdown, and pack replace bump this even when pack
-    /// bytes and route are unchanged.
-    pub generation: u64,
 }
 
-pub use crate::models::runtime_cache_coordinator::{
-    bump_runtime_build_generation, current_runtime_build_generation,
-    pack_content_id_for_runtime_path,
-};
+pub use crate::models::runtime_cache_coordinator::pack_content_id_for_runtime_path;
 
 impl RuntimeBuildIdentity {
     pub fn new(
         pack_content_id: impl Into<String>,
         route: impl Into<String>,
         options_fingerprint: impl Into<String>,
-        generation: u64,
     ) -> Self {
         Self {
             pack_content_id: pack_content_id.into(),
             route: route.into(),
             options_fingerprint: options_fingerprint.into(),
-            generation,
         }
     }
 
@@ -98,13 +98,11 @@ impl RuntimeBuildIdentity {
                 pack_content_id: identity.pack_content_id.clone(),
                 route,
                 options_fingerprint,
-                generation: identity.generation,
             },
             None => Self {
                 pack_content_id: content_id.into(),
                 route,
                 options_fingerprint,
-                generation: current_runtime_build_generation(),
             },
         }
     }
@@ -140,7 +138,7 @@ pub(crate) fn serve_batch_build_identity_for_request(
 
 /// Supplies a verified runtime identity to cache-owning execution components.
 /// The pack resolver owns the content proof; consumers only carry it through
-/// keys and invalidate on a generation change.
+/// keys and invalidate when the content id itself changes.
 pub trait RuntimeBuildIdentitySource {
     fn runtime_build_identity(&self) -> Option<RuntimeBuildIdentity>;
 }
@@ -774,30 +772,29 @@ mod tests {
     fn runtime_build_identity_separates_same_route_content_replacements() {
         let route = "whisper:metal:base";
         let options = "adapter=none";
-        let first = RuntimeBuildIdentity::new("verified-content-a", route, options, 7);
-        let replacement = RuntimeBuildIdentity::new("verified-content-b", route, options, 7);
+        let first = RuntimeBuildIdentity::new("verified-content-a", route, options);
+        let replacement = RuntimeBuildIdentity::new("verified-content-b", route, options);
         assert_ne!(
             first, replacement,
             "same path/route must not reuse replacement content"
         );
         assert_ne!(
             first,
-            RuntimeBuildIdentity::new("verified-content-a", route, options, 8),
-            "invalidation generation must rebuild the engine"
-        );
-        assert_ne!(
-            first,
-            RuntimeBuildIdentity::new("verified-content-a", route, "adapter=/tmp/a.oadp", 7),
+            RuntimeBuildIdentity::new("verified-content-a", route, "adapter=/tmp/a.oadp"),
             "adapter/options fingerprint must rebuild the engine"
         );
-        let before = current_runtime_build_generation();
-        let after = bump_runtime_build_generation();
-        assert!(after > before);
+        // Same content id/route/options must always compare equal -- there is
+        // no generation/epoch field left to make an otherwise-identical
+        // identity spuriously distinct (that was the audited bug).
+        assert_eq!(
+            first,
+            RuntimeBuildIdentity::new("verified-content-a", route, options)
+        );
     }
 
     #[test]
     fn runtime_build_identity_resolve_prefers_explicit_request_content_id() {
-        let verified = RuntimeBuildIdentity::new("verified-content-a", "old", "old", 3);
+        let verified = RuntimeBuildIdentity::new("verified-content-a", "old", "old");
         let resolved = RuntimeBuildIdentity::resolve_for_request(
             Some(&verified),
             "whisper:gpu",
@@ -807,7 +804,6 @@ mod tests {
         assert_eq!(resolved.pack_content_id, "verified-content-a");
         assert_eq!(resolved.route, "whisper:gpu");
         assert_eq!(resolved.options_fingerprint, "adapter=none");
-        assert_eq!(resolved.generation, 3);
     }
 
     #[test]
@@ -845,21 +841,15 @@ mod tests {
         assert_ne!(identity_a.pack_content_id, identity_b.pack_content_id);
         assert_eq!(identity_a.route, identity_b.route);
 
-        let before = current_runtime_build_generation();
-        let _ = bump_runtime_build_generation();
-        let identity_after_unload = serve_batch_build_identity_for_request(
+        // Re-resolving against unchanged (post-rewrite) bytes must return an
+        // identity equal to `identity_b` -- nothing left to bump spuriously.
+        let identity_again = serve_batch_build_identity_for_request(
             &options,
             "whisper",
             crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
             &path,
         );
-        assert!(identity_after_unload.generation > before);
-        assert_ne!(identity_after_unload.generation, identity_b.generation);
-        // Unchanged bytes keep the content id after unload; only generation moves.
-        assert_eq!(
-            identity_after_unload.pack_content_id,
-            identity_b.pack_content_id
-        );
+        assert_eq!(identity_again, identity_b);
     }
 
     /// Structural proof that `execution_context` is required, not optional:

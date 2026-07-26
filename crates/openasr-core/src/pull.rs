@@ -2480,6 +2480,14 @@ fn verify_partial_and_install(
         return Err(error);
     }
     cancel_before_commit(target, paths, should_cancel)?;
+    // Resolve the pack about to be overwritten (if any) *before* removing it,
+    // so its content id is still hashable from the old bytes. New bytes at
+    // this path naturally resolve to a different content id and miss every
+    // content-addressed runtime cache on their own -- no invalidation needed
+    // for that. This id is purely so the *old*, now-unreachable identity's
+    // resident state can be evicted promptly after install to release memory,
+    // rather than waiting for the next idle unload.
+    let previous_pack_content_id = existing_pack_content_id_for_eviction(&paths.final_path);
     remove_existing_final_pack(paths)?;
     fs::rename(&paths.partial_path, &paths.final_path).map_err(|source| PullError::Io {
         path: paths.final_path.clone(),
@@ -2493,14 +2501,50 @@ fn verify_partial_and_install(
     // it up here too so it cannot outlive the `.partial` file it describes.
     let _ = fs::remove_file(&paths.partial_segments_meta_path);
     let pack = write_installed_record(target, paths)?;
-    // Same-path pack replace must miss every resident runtime cache. Content ids
-    // already diverge when bytes change; bumping the unified epoch also drops
-    // TLS / process-pool entries that were keyed before the install completed.
-    let _ = crate::models::runtime_cache_coordinator::invalidate_after_pack_install_or_replace();
+    if let Some(old_content_id) = previous_pack_content_id {
+        evict_resident_runtime_caches_for_content_id(&old_content_id);
+    }
     progress(PullProgress::Installed {
         path: pack.path.clone(),
     });
     Ok(pack)
+}
+
+/// Resolves the content id of whatever pack currently sits at `final_path`,
+/// if any -- called before it is overwritten by an install/replace. Returns
+/// `None` when there is nothing there yet (first install) or the existing
+/// file cannot be hashed (nothing meaningful to evict either way).
+fn existing_pack_content_id_for_eviction(final_path: &std::path::Path) -> Option<String> {
+    if !final_path.exists() {
+        return None;
+    }
+    let content_id =
+        crate::models::runtime_cache_coordinator::pack_content_id_for_runtime_path(final_path);
+    crate::models::runtime_cache_coordinator::is_cacheable_pack_content_id(&content_id)
+        .then_some(content_id)
+}
+
+/// Evicts `pack_content_id`'s resident state from every process-wide runtime
+/// cache that could hold it, without touching any other content identity.
+///
+/// This is a memory-reclaim step, not a correctness requirement: every one of
+/// these caches is already content-addressed, so a request against the newly
+/// installed bytes at this path naturally misses (a different content id) and
+/// rebuilds on its own even if this eviction never ran. Called unconditionally
+/// across every builtin family -- a `HashMap` removal for a content id that
+/// family never cached is just a no-op lookup miss, so this does not need to
+/// know which architecture the replaced pack belonged to.
+fn evict_resident_runtime_caches_for_content_id(pack_content_id: &str) {
+    use crate::models::executor_component_registry::{
+        shared_cohere_transcribe_executor, shared_moonshine_executor, shared_qwen3_asr_executor,
+        shared_whisper_executor,
+    };
+
+    shared_whisper_executor().evict_prepared_runtime_content_id(pack_content_id);
+    shared_moonshine_executor().evict_prepared_runtime_content_id(pack_content_id);
+    shared_cohere_transcribe_executor().evict_prepared_runtime_content_id(pack_content_id);
+    shared_qwen3_asr_executor().evict_prepared_runtime_content_id(pack_content_id);
+    crate::models::dolphin::executor::evict_dolphin_pool_entry_for_content_id(pack_content_id);
 }
 
 fn remove_existing_final_pack(paths: &PullPaths) -> Result<(), PullError> {

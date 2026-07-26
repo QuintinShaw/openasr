@@ -277,21 +277,24 @@ impl super::runtime_contract::DolphinPositionTableSource for DolphinRuntimeWeigh
     }
 }
 
-/// Process-level pool of runtime weights keyed by pack content id + coordinator
-/// epoch. Building the pool (dequantizing the f32 vectors + mmapping the native
+/// Process-level pool of runtime weights keyed by pack content id alone.
+/// Building the pool (dequantizing the f32 vectors + mmapping the native
 /// weight blocks) costs ~0.4 s (18% of the single-utterance wall on M1); caching
 /// it lets warm calls skip the reload and reuse the same immutable table,
 /// mirroring the xasr process runtime pool.
 ///
-/// Content-addressed (never bare path): same-path byte replacement must miss
-/// without waiting for idle unload. Epoch is part of the key so an idle-unload
-/// generation bump alone also misses, even if a stale entry somehow lingered.
-/// Native payloads carry the shared pack mmap and the f32 vectors are
+/// Content-addressed (never bare path): same-path byte replacement resolves a
+/// different content id and misses on its own -- no generation/epoch is
+/// mixed into this key (removed; see `runtime_cache_coordinator`'s module doc
+/// comment for why that was an audited bug). Idle unload drops the whole pool
+/// via [`clear_dolphin_weights_pool`]; a pull install/replace evicts just the
+/// old content id via [`evict_dolphin_pool_entry_for_content_id`]. Native
+/// payloads carry the shared pack mmap and the f32 vectors are
 /// backend-independent, so CPU and Metal runs share one entry.
 static DOLPHIN_WEIGHTS_POOL: OnceLock<
     Mutex<
         HashMap<
-            crate::models::runtime_cache_coordinator::PackContentEpochKey,
+            crate::models::runtime_cache_coordinator::PackContentKey,
             Arc<DolphinRuntimeWeights>,
         >,
     >,
@@ -308,6 +311,20 @@ pub(crate) fn clear_dolphin_weights_pool() {
     }
 }
 
+/// Evicts exactly the pooled weight table for `pack_content_id`, leaving
+/// every other resident content identity untouched. Called by `pull`'s
+/// post-install handling with the *old* content id after a pack
+/// install/replace -- the new bytes already resolve to a different content
+/// id and miss on their own, so this only reclaims the now-orphaned old
+/// entry's memory.
+pub(crate) fn evict_dolphin_pool_entry_for_content_id(pack_content_id: &str) {
+    if let Some(pool) = DOLPHIN_WEIGHTS_POOL.get()
+        && let Ok(mut guard) = pool.lock()
+    {
+        guard.retain(|key, _| key.pack_content_id != pack_content_id);
+    }
+}
+
 /// Fetch the pack's runtime weights from the pool, building them (via the
 /// already-resolved `reader`) and caching on a miss. The build runs outside the
 /// pool lock so concurrent first callers for distinct packs don't serialize.
@@ -318,9 +335,9 @@ pub(crate) fn cached_dolphin_runtime_weights(
     runtime_path: &Path,
     reader: &GgufTensorDataReader,
 ) -> Result<Arc<DolphinRuntimeWeights>, String> {
-    use crate::models::runtime_cache_coordinator::PackContentEpochKey;
+    use crate::models::runtime_cache_coordinator::PackContentKey;
 
-    let cache_key = PackContentEpochKey::try_for_runtime_path(runtime_path);
+    let cache_key = PackContentKey::try_for_runtime_path(runtime_path);
     if let Some(ref key) = cache_key {
         let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
         if let Some(weights) = pool.lock().expect("dolphin weights pool lock").get(key) {
@@ -736,9 +753,7 @@ mod tests {
         DolphinImportRequest, DolphinQuantizationMode,
         convert_local_dolphin_wenet_source_to_runtime_pack,
     };
-    use crate::models::runtime_cache_coordinator::{
-        PackContentEpochKey, bump_runtime_build_generation, pack_content_id_for_runtime_path,
-    };
+    use crate::models::runtime_cache_coordinator::PackContentKey;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -750,7 +765,7 @@ mod tests {
             .unwrap_or(0)
     }
 
-    fn dolphin_pool_contains(key: &PackContentEpochKey) -> bool {
+    fn dolphin_pool_contains(key: &PackContentKey) -> bool {
         DOLPHIN_WEIGHTS_POOL
             .get()
             .and_then(|pool| pool.lock().ok().map(|guard| guard.contains_key(key)))
@@ -767,9 +782,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("same-path.oasr");
         std::fs::write(&path, b"dolphin-content-a").expect("write a");
-        let key_a = PackContentEpochKey::try_for_runtime_path(&path).expect("cacheable a");
+        let key_a = PackContentKey::try_for_runtime_path(&path).expect("cacheable a");
         std::fs::write(&path, b"dolphin-content-b-different").expect("write b");
-        let key_b = PackContentEpochKey::try_for_runtime_path(&path).expect("cacheable b");
+        let key_b = PackContentKey::try_for_runtime_path(&path).expect("cacheable b");
         assert_ne!(key_a.pack_content_id, key_b.pack_content_id);
         assert_ne!(key_a, key_b);
 
@@ -785,15 +800,47 @@ mod tests {
         clear_dolphin_weights_pool();
         assert_eq!(dolphin_pool_len(), 0);
         assert!(!dolphin_pool_contains(&key_a));
+    }
 
-        // Epoch bump alone changes the key even for unchanged bytes.
-        std::fs::write(&path, b"dolphin-content-stable").expect("write stable");
-        let before = PackContentEpochKey::try_for_runtime_path(&path).expect("before");
-        let _ = bump_runtime_build_generation();
-        let after = PackContentEpochKey::try_for_runtime_path(&path).expect("after");
-        assert_eq!(before.pack_content_id, after.pack_content_id);
-        assert_ne!(before.generation, after.generation);
-        let _ = pack_content_id_for_runtime_path(&path);
+    /// No global invalidation: evicting one pack's content id (the pull
+    /// install/replace path) must not disturb a *different*, unrelated
+    /// pack's resident entry. This is the direct regression test for the
+    /// audited bug -- a single shared-epoch bump used to invalidate every
+    /// resident content identity in the process at once.
+    #[test]
+    fn evicting_one_content_id_leaves_a_different_pack_resident() {
+        clear_dolphin_weights_pool();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path_one = dir.path().join("pack-one.oasr");
+        let path_two = dir.path().join("pack-two.oasr");
+        std::fs::write(&path_one, b"dolphin-pack-one-bytes").expect("write pack one");
+        std::fs::write(&path_two, b"dolphin-pack-two-different-bytes").expect("write pack two");
+
+        let key_one = PackContentKey::try_for_runtime_path(&path_one).expect("cacheable one");
+        let key_two = PackContentKey::try_for_runtime_path(&path_two).expect("cacheable two");
+        assert_ne!(key_one, key_two);
+
+        let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let mut guard = pool.lock().expect("lock");
+            guard.insert(key_one.clone(), Arc::new(DolphinRuntimeWeights::default()));
+            guard.insert(key_two.clone(), Arc::new(DolphinRuntimeWeights::default()));
+        }
+        assert!(dolphin_pool_contains(&key_one));
+        assert!(dolphin_pool_contains(&key_two));
+
+        // The invalidation action: evict pack one's content id only (what
+        // `pull` does with the old content id after an install/replace).
+        evict_dolphin_pool_entry_for_content_id(&key_one.pack_content_id);
+
+        assert!(
+            !dolphin_pool_contains(&key_one),
+            "the evicted content id must be gone"
+        );
+        assert!(
+            dolphin_pool_contains(&key_two),
+            "a healthy, unrelated content id must remain resident"
+        );
     }
 
     #[test]
@@ -802,7 +849,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("pool.oasr");
         std::fs::write(&path, b"dolphin-pool-seed").expect("write");
-        let key = PackContentEpochKey::try_for_runtime_path(&path).expect("cacheable");
+        let key = PackContentKey::try_for_runtime_path(&path).expect("cacheable");
         let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
         pool.lock()
             .expect("lock")

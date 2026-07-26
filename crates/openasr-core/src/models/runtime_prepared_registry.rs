@@ -172,6 +172,14 @@ impl BuiltinPreparedRuntimeCache {
     pub(crate) fn clear(&self) {
         self.runtimes_by_path.clear();
     }
+
+    /// Evicts exactly the cached prepared runtime for `pack_content_id`; see
+    /// `PreparedRuntimeCache::evict_content_id`. Used after a pull
+    /// install/replace to release the *old* content id's now-unreachable
+    /// resident state without touching any other cached identity.
+    pub(crate) fn evict_content_id(&self, pack_content_id: &str) {
+        self.runtimes_by_path.evict_content_id(pack_content_id);
+    }
 }
 
 pub(crate) fn build_builtin_prepared_runtime(

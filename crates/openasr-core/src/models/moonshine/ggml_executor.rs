@@ -229,6 +229,14 @@ impl MoonshineGgmlExecutor {
             },
         )
     }
+
+    /// Evicts exactly `pack_content_id`'s cached prepared runtime, releasing
+    /// resident state left over from a since-replaced pack without touching
+    /// any other content identity. Called by `pull`'s post-install handling
+    /// via [`crate::models::executor_component_registry::shared_moonshine_executor`].
+    pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
+        self.runtime_cache_by_path.evict_content_id(pack_content_id);
+    }
 }
 
 /// Decide whether the moonshine decode may go through the shared serve-batch
