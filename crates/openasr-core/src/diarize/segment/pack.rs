@@ -1,7 +1,8 @@
 //! Runtime resolution of the pulled pyannote segmentation pack.
 //!
 //! Resolved by the shared [`crate::diarize::pack`] resolver from
-//! `OPENASR_PYANNOTE_PACK` or `openasr_home()/models/pyannote*/`, loaded once into
+//! `OPENASR_PYANNOTE_PACK` or the installed pack whose model id contains
+//! `pyannote`, loaded once into
 //! a process-wide segmenter. Absence is graceful (callers fall back to
 //! VAD-segment diarization). The pack payload is a GGUF `.oasr` pack (the
 //! catalog/pull format); a raw `.safetensors` is still accepted as the dev fast
