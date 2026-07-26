@@ -20,6 +20,7 @@ use crate::{
     CatalogPullRequest, CatalogQuant, ModelCatalog, OPENASR_RUNTIME_PACK_EXTENSION,
     ResolvedCatalogBackendPull, ResolvedCatalogPull, atomic_file, canonical_quant_tag,
     catalog_series::family_aliases_match,
+    content_store,
     download_source::{self, DownloadSource},
     has_openasr_runtime_pack_extension, http, parse_model_ref, resolve_catalog_pull,
     safety::{validate_safe_relative_path, validate_sha256},
@@ -291,6 +292,8 @@ pub enum PullError {
     Canceled { reference: String },
     #[error("Model pack pull was paused: {reference}")]
     Paused { reference: String },
+    #[error(transparent)]
+    ContentStore(#[from] content_store::ContentStoreError),
 }
 
 #[derive(Clone, Debug)]
@@ -587,9 +590,37 @@ pub fn install_catalog_model_pack_from_path(
             reason: format!("local imports must use .{OPENASR_RUNTIME_PACK_EXTENSION} model packs"),
         });
     }
+    // Fail-closed admission control: a local pack is only installable when its
+    // sha256/size matches exactly one quant of the signed public catalog. The
+    // digest computed here is not trusted as the final authority -- the content
+    // store re-hashes the bytes it actually copies and
+    // `install_admitted_model_pack` rejects any drift against this target.
     let (size_bytes, sha256) = file_size_and_sha256(source_path)?;
     let resolved = resolve_catalog_pull_by_file_digest(catalog, size_bytes, &sha256)?;
     install_model_pack_from_path(&resolved, source_path, home, progress)
+}
+
+fn admit_model_content(
+    source_path: &Path,
+    home: &Path,
+) -> Result<content_store::AdmittedContent, PullError> {
+    admit_model_content_into_root(source_path, &models_root(home))
+}
+
+fn admit_model_content_into_root(
+    source_path: &Path,
+    root: &Path,
+) -> Result<content_store::AdmittedContent, PullError> {
+    ensure_safe_directory_under_root(root, root)?;
+    ensure_safe_directory_under_root(root, &root.join("staging"))?;
+    ensure_safe_directory_under_root(root, &content_store::objects_root(root))?;
+    content_store::admit_file(source_path, root, |lease| {
+        preflight_model_pack_for_install(lease.path())
+    })
+    .map_err(|error| match error {
+        content_store::ContentStoreError::Preflight(error) => *error,
+        other => PullError::ContentStore(other),
+    })
 }
 
 fn install_model_pack_from_path_with_target(
@@ -598,9 +629,9 @@ fn install_model_pack_from_path_with_target(
     home: impl AsRef<Path>,
     progress: impl FnMut(PullProgress),
 ) -> Result<InstalledPack, PullError> {
+    // Reject an unusable target before copying potentially gigabytes of pack.
     let paths = pull_paths(home.as_ref(), target)?;
     ensure_storage_dir_within_root(home.as_ref(), &paths)?;
-    let _lock = PullLock::acquire(&paths.lock_path)?;
     let source_path = source_path.as_ref();
     if !has_openasr_runtime_pack_extension(source_path) {
         return Err(PullError::InvalidTarget {
@@ -609,11 +640,53 @@ fn install_model_pack_from_path_with_target(
         });
     }
 
-    fs::copy(source_path, &paths.partial_path).map_err(|source| PullError::Io {
-        path: paths.partial_path.clone(),
-        source,
-    })?;
-    verify_partial_and_install(target, &paths, None, &|| false, progress)
+    // Admission needs no exclusion: the staging name is process-unique and an
+    // object is keyed by its own digest. The pull lock is taken once, by
+    // `install_admitted_model_pack`, around publishing the ref.
+    let admitted = admit_model_content(source_path, home.as_ref())?;
+    install_admitted_model_pack(target, home.as_ref(), admitted, progress)
+}
+
+fn install_admitted_model_pack(
+    target: &PullTarget,
+    home: &Path,
+    admitted: content_store::AdmittedContent,
+    mut progress: impl FnMut(PullProgress),
+) -> Result<InstalledPack, PullError> {
+    if admitted.size_bytes != target.size_bytes {
+        return Err(PullError::SizeMismatch {
+            path: admitted.object_path,
+            expected: target.size_bytes,
+            actual: admitted.size_bytes,
+        });
+    }
+    if admitted.digest != target.sha256 {
+        return Err(PullError::ShaMismatch {
+            path: admitted.object_path,
+            expected: target.sha256.clone(),
+            actual: admitted.digest,
+        });
+    }
+    let paths = pull_paths(home, target)?;
+    ensure_storage_dir_within_root(home, &paths)?;
+    let _lock = PullLock::acquire(&paths.lock_path)?;
+    // The ref about to be rewritten may still name an older object whose
+    // runtime state is resident. Resolve that identity before the new ref is
+    // visible, and evict it after -- a memory-reclaim step only: the new
+    // object's content id misses every content-addressed cache on its own.
+    let previous_pack_content_id = existing_pack_content_id_for_eviction(&paths.final_path);
+    // Keep the descriptor that was hashed and preflighted alive until its
+    // durable logical reference is visible; do not switch validation authority
+    // back to a display path during commit.
+    let _validated_lease = admitted.into_lease();
+    let pack = write_installed_record(target, &paths)?;
+    if let Some(old_content_id) = previous_pack_content_id {
+        evict_resident_runtime_caches_for_content_id(&old_content_id);
+    }
+    progress(PullProgress::Installed {
+        path: pack.path.clone(),
+    });
+    Ok(pack)
 }
 
 fn resolve_catalog_pull_by_file_digest(
@@ -656,7 +729,110 @@ fn resolved_catalog_pull_from_quant(
 }
 
 pub fn list_installed_packs(home: impl AsRef<Path>) -> Result<Vec<InstalledPack>, PullError> {
+    // `InstalledModelStore` is the single reader for both on-disk layouts, and
+    // it never rewrites either one: listing installed models must not mutate the
+    // store. Converting the legacy layout is the separate, explicit
+    // `migrate_legacy_installed_records` operation.
     crate::InstalledModelStore::read(home.as_ref()).map(crate::InstalledModelStore::into_packs)
+}
+
+/// Re-admit every `<models>/<model>/<quant>/installed.json` record into the
+/// content store, so the immutable object becomes the only thing a later read
+/// can select. Records that fail legacy validation are left untouched for the
+/// reader to report.
+///
+/// This is an explicit maintenance operation. It is deliberately not run from
+/// `list_installed_packs`: it copies every legacy pack's bytes and revokes the
+/// legacy record, which a read path must not do as a side effect.
+pub fn migrate_legacy_installed_records(home: &Path) -> Result<(), PullError> {
+    let root = models_root(home);
+    let Ok(model_dirs) = fs::read_dir(&root) else {
+        return Ok(());
+    };
+    for model_dir in model_dirs {
+        let model_dir = model_dir.map_err(|source| PullError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        if matches!(
+            model_dir.file_name().to_str(),
+            Some("objects" | "refs" | "staging" | "locks")
+        ) {
+            continue;
+        }
+        let Ok(quant_dirs) = fs::read_dir(model_dir.path()) else {
+            continue;
+        };
+        for quant_dir in quant_dirs {
+            let quant_dir = quant_dir.map_err(|source| PullError::Io {
+                path: model_dir.path(),
+                source,
+            })?;
+            let metadata_path = quant_dir.path().join("installed.json");
+            let Ok(contents) = fs::read_to_string(&metadata_path) else {
+                continue;
+            };
+            let Ok(legacy) = serde_json::from_str::<InstalledPack>(&contents) else {
+                continue;
+            };
+            if crate::installed_model_store::validate_legacy_record(&legacy, &quant_dir.path())
+                .is_err()
+            {
+                continue;
+            }
+            // A durable ref is the migration commit point. If a process died
+            // after publishing it but before removing the legacy record, never
+            // re-admit mutable legacy bytes: finish cleanup only.
+            let ref_path = root
+                .join("refs")
+                .join(&legacy.model_id)
+                .join(format!("{}.json", legacy.quant));
+            if ref_path.is_file() {
+                remove_legacy_installed_record(&metadata_path)?;
+                continue;
+            }
+            let admitted = admit_model_content(&legacy.path, home)?;
+            let target = PullTarget {
+                model_id: legacy.model_id.clone(),
+                display_name: legacy.display_name.clone(),
+                quant: legacy.quant.clone(),
+                suffix: legacy.suffix.clone(),
+                pull: legacy.pull.clone(),
+                filename: legacy.filename.clone(),
+                url: legacy.url.clone(),
+                hf_revision: legacy.hf_revision.clone(),
+                sha256: admitted.digest.clone(),
+                size_bytes: admitted.size_bytes,
+                source: legacy.source.clone(),
+            };
+            let paths = pull_paths(home, &target)?;
+            ensure_storage_dir_within_root(home, &paths)?;
+            let _lock = PullLock::acquire(&paths.lock_path)?;
+            // Keep the admitted descriptor alive until the ref that names it is
+            // durable, so the object cannot be collected mid-migration.
+            let _validated_lease = admitted.into_lease();
+            write_installed_record(&target, &paths)?;
+            // Ref publication is durable before legacy authority is revoked.
+            // If this removal is interrupted, the branch above recognizes the
+            // ref as committed and only completes removal on the next startup.
+            remove_legacy_installed_record(&metadata_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_legacy_installed_record(metadata_path: &Path) -> Result<(), PullError> {
+    match fs::remove_file(metadata_path) {
+        Ok(()) => atomic_file::sync_parent_dir_best_effort(metadata_path),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(PullError::Io {
+                path: metadata_path.to_path_buf(),
+                source,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn default_pack_pointer_path(home: impl AsRef<Path>) -> PathBuf {
@@ -717,22 +893,46 @@ pub fn remove_model_pack(
     home: impl AsRef<Path>,
     reference: &str,
 ) -> Result<Option<InstalledPack>, PullError> {
-    let Some(pack) = find_installed_pack(home.as_ref(), reference)? else {
+    let home = home.as_ref();
+    let Some(pack) = find_installed_pack(home, reference)? else {
         return Ok(None);
     };
-    if let Some(ref_path) = content_addressed_ref_path(home.as_ref(), &pack) {
+    if let Some(ref_path) = content_addressed_ref_path(home, &pack) {
         // Content objects are immutable and may be referenced by another
-        // model/quant. Removing a model deletes only its ref; object collection
-        // is deliberately separate from model management.
-        fs::remove_file(&ref_path).map_err(|source| PullError::Io {
-            path: ref_path.clone(),
-            source,
-        })?;
-        if let Some(model_dir) = ref_path.parent() {
-            let _ = fs::remove_dir(model_dir);
+        // model/quant. Removing a model deletes its ref first, and only then
+        // collects the object once no surviving ref names the same digest.
+        let root = models_root(home);
+        let ref_parent = ref_path.parent().expect("ref has parent");
+        ensure_safe_directory_under_root(&root, ref_parent)?;
+        reject_symlink(&ref_path)?;
+        match fs::remove_file(&ref_path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(PullError::Io {
+                    path: ref_path,
+                    source,
+                });
+            }
         }
+        atomic_file::sync_parent_dir_best_effort(&ref_path);
+        let _ = fs::remove_dir(ref_parent);
+        // Installs still create the legacy `<models>/<model>/<quant>/` skeleton;
+        // prune it here while it is empty so uninstall leaves nothing behind.
+        let legacy_quant_dir = root.join(&pack.model_id).join(&pack.quant);
+        let _ = fs::remove_dir(&legacy_quant_dir);
+        let _ = fs::remove_dir(legacy_quant_dir.parent().expect("legacy quant has parent"));
+        let still_referenced = list_installed_packs_without_gc(home)?
+            .iter()
+            .any(|candidate| candidate.sha256 == pack.sha256);
+        content_store::remove_object_if_unreferenced(&root, &pack.sha256, still_referenced)?;
+        evict_resident_runtime_caches_for_content_id(
+            &crate::models::runtime_cache_coordinator::content_id_from_sha256_hex(&pack.sha256),
+        );
         return Ok(Some(pack));
     }
+    // Legacy per-quant layout: the pack file lives inside its own directory, so
+    // the whole directory is the unit of removal.
     if let Some(quant_dir) = pack.path.parent() {
         fs::remove_dir_all(quant_dir).map_err(|source| PullError::Io {
             path: quant_dir.to_path_buf(),
@@ -761,7 +961,31 @@ pub fn remove_model_pack(
             }
         }
     }
+    evict_resident_runtime_caches_for_content_id(
+        &crate::models::runtime_cache_coordinator::content_id_from_sha256_hex(&pack.sha256),
+    );
     Ok(Some(pack))
+}
+
+/// Packs still visible on disk, read without the legacy migration that
+/// `list_installed_packs` performs. Object collection must never re-admit bytes
+/// as a side effect of counting the refs that survive a removal.
+fn list_installed_packs_without_gc(home: &Path) -> Result<Vec<InstalledPack>, PullError> {
+    crate::InstalledModelStore::read(home).map(crate::InstalledModelStore::into_packs)
+}
+
+pub fn open_installed_content_lease(
+    home: impl AsRef<Path>,
+    reference: &str,
+) -> Result<Option<crate::ContentLease>, PullError> {
+    let home = home.as_ref();
+    let Some(pack) = find_installed_pack(home, reference)? else {
+        return Ok(None);
+    };
+    Ok(Some(content_store::open_lease(
+        &models_root(home),
+        &pack.sha256,
+    )?))
 }
 
 pub fn resolve_installed_pack_path(
@@ -2275,20 +2499,27 @@ fn verify_partial_and_install(
         return Err(error);
     }
     cancel_before_commit(target, paths, should_cancel)?;
-    // Resolve the pack about to be overwritten (if any) *before* removing it,
-    // so its content id is still hashable from the old bytes. New bytes at
-    // this path naturally resolve to a different content id and miss every
-    // content-addressed runtime cache on their own -- no invalidation needed
-    // for that. This id is purely so the *old*, now-unreachable identity's
-    // resident state can be evicted promptly after install to release memory,
-    // rather than waiting for the next idle unload.
+    // Resolve the pack this install supersedes (if any) *before* the reference
+    // moves, so its content id is still hashable from the old bytes. The new
+    // bytes land in a different immutable object and so resolve to a different
+    // content id, missing every content-addressed runtime cache on their own --
+    // no invalidation needed for that. This id is purely so the *old*, now
+    // unreferenced identity's resident state can be evicted promptly after
+    // install to release memory, rather than waiting for the next idle unload.
     let previous_pack_content_id = existing_pack_content_id_for_eviction(&paths.final_path);
-    remove_existing_final_pack(paths)?;
-    fs::rename(&paths.partial_path, &paths.final_path).map_err(|source| PullError::Io {
-        path: paths.final_path.clone(),
-        source,
-    })?;
-    atomic_file::sync_parent_dir_best_effort(&paths.final_path);
+    // The verified staging file is copied into an immutable content-addressed
+    // object before the logical reference becomes visible. Existing objects are
+    // never replaced, which removes the Windows same-path mmap failure mode.
+    let admitted =
+        admit_model_content_into_root(&paths.partial_path, &models_root_for_paths(paths))?;
+    if admitted.digest != target.sha256 || admitted.size_bytes != target.size_bytes {
+        return Err(PullError::ShaMismatch {
+            path: admitted.object_path,
+            expected: target.sha256.clone(),
+            actual: admitted.digest,
+        });
+    }
+    let _ = fs::remove_file(&paths.partial_path);
     let _ = fs::remove_file(&paths.partial_meta_path);
     // A resume can switch from the chunked/parallel path (which persists
     // `partial_segments_meta_path`) to this single-stream success path once
@@ -2342,48 +2573,6 @@ fn evict_resident_runtime_caches_for_content_id(pack_content_id: &str) {
     shared_cohere_transcribe_executor().evict_prepared_runtime_content_id(pack_content_id);
     shared_qwen3_asr_executor().evict_prepared_runtime_content_id(pack_content_id);
     crate::models::dolphin::executor::evict_dolphin_pool_entry_for_content_id(pack_content_id);
-}
-
-fn remove_existing_final_pack(paths: &PullPaths) -> Result<(), PullError> {
-    match fs::remove_file(&paths.final_path) {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-        // On Windows, deleting a model that is currently mmap'd for inference
-        // fails instead of succeeding lazily (as POSIX unlink does). Surface a
-        // clear "model in use" message so re-pulling a changed version tells the
-        // user to close OpenASR, rather than leaking a raw OS error code.
-        Err(source) if is_file_in_use_error(&source) => Err(PullError::ModelInUse {
-            path: paths.final_path.clone(),
-            source,
-        }),
-        Err(source) => Err(PullError::Io {
-            path: paths.final_path.clone(),
-            source,
-        }),
-    }
-}
-
-/// True when an I/O error means the file cannot be replaced because it is still
-/// open or memory-mapped by this or another process.
-///
-/// On Windows, replacing a model that is currently mmap'd for inference fails
-/// with ERROR_USER_MAPPED_FILE (1224) or, for an open handle, with
-/// ERROR_SHARING_VIOLATION (32). POSIX has no equivalent: `unlink`/`rename`
-/// succeed even while a file is mapped (the inode lives until the last handle
-/// closes), so this failure mode is Windows-only.
-#[cfg(windows)]
-fn is_file_in_use_error(source: &io::Error) -> bool {
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-    const ERROR_USER_MAPPED_FILE: i32 = 1224;
-    matches!(
-        source.raw_os_error(),
-        Some(ERROR_SHARING_VIOLATION | ERROR_USER_MAPPED_FILE)
-    )
-}
-
-#[cfg(not(windows))]
-fn is_file_in_use_error(_source: &io::Error) -> bool {
-    false
 }
 
 fn cancel_before_commit(
@@ -2471,35 +2660,96 @@ fn write_installed_record(
 
 fn ensure_storage_dir_within_root(home: &Path, paths: &PullPaths) -> Result<(), PullError> {
     let root = models_root(home);
-    let Some(model_dir) = paths.dir.parent() else {
-        return Err(PullError::UnsafeStoragePath {
-            path: paths.dir.clone(),
-        });
-    };
-    for path in [&root, model_dir, paths.dir.as_path()] {
-        reject_symlink(path)?;
-    }
-    fs::create_dir_all(&paths.dir).map_err(|source| PullError::CreateDir {
-        path: paths.dir.clone(),
-        source,
-    })?;
-    for path in [&root, model_dir, paths.dir.as_path()] {
-        reject_symlink(path)?;
-    }
-    let canonical_root = root.canonicalize().map_err(|source| PullError::Io {
-        path: root.clone(),
-        source,
-    })?;
-    let canonical_dir = paths.dir.canonicalize().map_err(|source| PullError::Io {
-        path: paths.dir.clone(),
-        source,
-    })?;
-    if !canonical_dir.starts_with(&canonical_root) {
-        return Err(PullError::UnsafeStoragePath {
-            path: paths.dir.clone(),
-        });
+    let legacy_model_dir = root.join(
+        paths
+            .installed_meta_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap_or_default(),
+    );
+    let legacy_quant_dir = legacy_model_dir.join(
+        paths
+            .installed_meta_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default(),
+    );
+    for path in [
+        &root,
+        legacy_model_dir.as_path(),
+        legacy_quant_dir.as_path(),
+        paths.dir.as_path(),
+        paths.partial_path.parent().expect("partial has parent"),
+        paths.installed_meta_path.parent().expect("ref has parent"),
+        paths.lock_path.parent().expect("lock has parent"),
+        paths.final_path.parent().expect("object has parent"),
+    ] {
+        ensure_safe_directory_under_root(&root, path)?;
     }
     Ok(())
+}
+
+/// Create and walk storage one component at a time. A leaf-only symlink check
+/// is not sufficient: `refs`, `objects`, or a model ancestor can be swapped for
+/// a link after its child path is derived. Each existing component is rejected
+/// when it is a symlink, and each canonicalized component must remain beneath
+/// the canonical storage root.
+fn ensure_safe_directory_under_root(root: &Path, path: &Path) -> Result<(), PullError> {
+    if !path.starts_with(root) {
+        return Err(PullError::UnsafeStoragePath {
+            path: path.to_path_buf(),
+        });
+    }
+    fs::create_dir_all(root).map_err(|source| PullError::CreateDir {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    reject_symlink(root)?;
+    let canonical_root = fs::canonicalize(root).map_err(|source| PullError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| PullError::UnsafeStoragePath {
+            path: path.to_path_buf(),
+        })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(PullError::UnsafeStoragePath {
+                path: path.to_path_buf(),
+            });
+        };
+        current.push(component);
+        if current.exists() {
+            reject_symlink(&current)?;
+        } else {
+            fs::create_dir(&current).map_err(|source| PullError::CreateDir {
+                path: current.clone(),
+                source,
+            })?;
+        }
+        let canonical = fs::canonicalize(&current).map_err(|source| PullError::Io {
+            path: current.clone(),
+            source,
+        })?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(PullError::UnsafeStoragePath { path: current });
+        }
+    }
+    Ok(())
+}
+/// Recover the models root from already-derived paths. `dir` is the staging
+/// directory (`<models>/staging`), which stays one level below the root
+/// regardless of how deep the object layout nests.
+fn models_root_for_paths(paths: &PullPaths) -> PathBuf {
+    paths
+        .dir
+        .parent()
+        .expect("staging layout has models root")
+        .to_path_buf()
 }
 
 fn reject_symlink(path: &Path) -> Result<(), PullError> {
@@ -2533,14 +2783,23 @@ fn pull_paths(home: &Path, target: &PullTarget) -> Result<PullPaths, PullError> 
             reason,
         }
     })?;
-    let dir = models_root(home).join(&target.model_id).join(&target.quant);
-    let final_path = dir.join(&target.filename);
+    let root = models_root(home);
+    let dir = root.join("staging");
+    let staging_dir = dir.clone();
+    let final_path = content_store::object_path(&root, &target.sha256)?;
+    let ref_dir = root.join("refs").join(&target.model_id);
     Ok(PullPaths {
-        partial_path: dir.join(format!("{}.partial", target.filename)),
-        partial_meta_path: dir.join(format!("{}.partial.meta.json", target.filename)),
-        partial_segments_meta_path: dir.join(format!("{}.partial.segments.json", target.filename)),
-        installed_meta_path: dir.join("installed.json"),
-        lock_path: dir.join(format!("{}.lock", target.filename)),
+        partial_path: staging_dir.join(format!("{}-{}.partial", target.sha256, target.filename)),
+        partial_meta_path: staging_dir.join(format!(
+            "{}-{}.partial.meta.json",
+            target.sha256, target.filename
+        )),
+        partial_segments_meta_path: dir.join(format!(
+            "{}-{}.partial.segments.json",
+            target.sha256, target.filename
+        )),
+        installed_meta_path: ref_dir.join(format!("{}.json", target.quant)),
+        lock_path: dir.join(format!("{}-{}.lock", target.model_id, target.quant)),
         dir,
         final_path,
     })

@@ -25,6 +25,7 @@ pub(crate) mod batch;
 pub(crate) mod benchmark;
 pub(crate) mod capability_pack;
 pub mod config;
+pub(crate) mod content_store;
 pub mod default_selection;
 pub mod device;
 pub mod diarize;
@@ -121,6 +122,7 @@ pub use config::{
     config_path, load_config, load_config_document, models_dir, resolve_models_dir, save_config,
     save_config_document, save_default_model_selection,
 };
+pub use content_store::{ContentLease, ContentStoreError};
 pub use device::capabilities::{
     ApplePlatformHints, CpuArchitectureFamily, CpuCapabilities, HardwareCapabilities,
     HardwareFallbackPolicy, HardwareProvider, ProviderAvailability, ProviderAvailabilityState,
@@ -285,8 +287,9 @@ pub use pull::{
     BackendFileFormat, DefaultPackPointer, InstalledBackend, InstalledPack, PullError,
     PullModelPackRequest, PullProgress, available_disk_space_bytes, default_pack_pointer_path,
     install_backend_pack, install_catalog_model_pack_from_path, install_model_pack_from_path,
-    list_installed_packs, persist_default_pack_pointer, pull_model_pack, read_default_pack_pointer,
-    remove_model_pack, resolve_installed_pack_path, resolve_installed_pack_reference,
+    list_installed_packs, migrate_legacy_installed_records, open_installed_content_lease,
+    persist_default_pack_pointer, pull_model_pack, read_default_pack_pointer, remove_model_pack,
+    resolve_installed_pack_path, resolve_installed_pack_reference,
     resolve_installed_pack_reference_with_catalog,
 };
 pub use realtime::{

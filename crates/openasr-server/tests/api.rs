@@ -318,6 +318,23 @@ async fn create_approved_pairing_credential(app: &Router, device_name: &str) -> 
     (device_id, bearer_token)
 }
 
+/// Installed packs are immutable content-addressed objects:
+/// `<models>/objects/sha256/<digest>/content`.
+fn assert_installed_content_object(installed_path: &str) {
+    let path = std::path::Path::new(installed_path);
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("content"),
+        "installed pack must be a content-addressed object: {installed_path}"
+    );
+    assert!(
+        path.parent()
+            .and_then(std::path::Path::parent)
+            .is_some_and(|root| root.ends_with("objects/sha256")),
+        "installed pack must live under objects/sha256: {installed_path}"
+    );
+}
+
 fn write_complete_moonshine_partial(home: &std::path::Path, source_pack: &std::path::Path) -> u64 {
     let bytes = std::fs::read(source_pack).unwrap();
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
@@ -325,10 +342,14 @@ fn write_complete_moonshine_partial(home: &std::path::Path, source_pack: &std::p
     let url = format!(
         "https://huggingface.co/OpenASR/moonshine-tiny/resolve/{revision}/moonshine-tiny-q8_0.oasr"
     );
-    let model_dir = home.join("models").join("moonshine-tiny").join("q8_0");
-    std::fs::create_dir_all(&model_dir).unwrap();
-    let partial_path = model_dir.join("moonshine-tiny-q8_0.oasr.partial");
-    let partial_meta_path = model_dir.join("moonshine-tiny-q8_0.oasr.partial.meta.json");
+    // In-flight downloads live in the shared staging directory, keyed by the
+    // digest they are downloading, not in a per-model/quant directory.
+    let staging_dir = home.join("models").join("staging");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    let partial_path = staging_dir.join(format!("{sha256}-moonshine-tiny-q8_0.oasr.partial"));
+    let partial_meta_path = staging_dir.join(format!(
+        "{sha256}-moonshine-tiny-q8_0.oasr.partial.meta.json"
+    ));
     std::fs::write(&partial_path, &bytes).unwrap();
     std::fs::write(
         &partial_meta_path,
@@ -1248,12 +1269,7 @@ async fn pull_job_from_local_pack_installs_streams_and_deletes() {
     let completed = wait_for_terminal_job(app.clone(), job_id).await;
     assert_eq!(completed["state"], "completed");
     assert_eq!(completed["pull"], "moonshine-tiny:q8");
-    assert!(
-        completed["installed_path"]
-            .as_str()
-            .unwrap()
-            .ends_with(".oasr")
-    );
+    assert_installed_content_object(completed["installed_path"].as_str().unwrap());
 
     let response = app
         .clone()
@@ -1608,8 +1624,8 @@ async fn content_addressed_refs_drive_local_and_default_model_endpoints() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
-        object.exists(),
-        "shared content object must not be deleted with its ref"
+        !object.exists(),
+        "the last ref naming an object collects it; nothing else referenced this digest"
     );
     assert!(!home.join("models/refs/moonshine-tiny/q8_0.json").exists());
 
@@ -1867,12 +1883,7 @@ async fn interrupted_pull_job_resumes_after_app_recreation() {
     let completed = wait_for_terminal_job(app.clone(), "pull-restart-resume").await;
     assert_eq!(completed["state"], "completed");
     assert_eq!(completed["pull"], "moonshine-tiny:q8");
-    assert!(
-        completed["installed_path"]
-            .as_str()
-            .unwrap()
-            .ends_with("moonshine-tiny-q8_0.oasr")
-    );
+    assert_installed_content_object(completed["installed_path"].as_str().unwrap());
 
     let response = app
         .oneshot(
@@ -1917,12 +1928,7 @@ async fn interrupted_pull_job_resume_uses_persisted_resolved_spec_not_mutable_ca
         "0123456789abcdef0123456789abcdef01234567"
     );
     assert_eq!(completed["resolved"]["size_bytes"], bytes_total);
-    assert!(
-        completed["installed_path"]
-            .as_str()
-            .unwrap()
-            .ends_with("moonshine-tiny-q8_0.oasr")
-    );
+    assert_installed_content_object(completed["installed_path"].as_str().unwrap());
 }
 
 #[tokio::test]
@@ -1949,12 +1955,7 @@ async fn interrupted_local_source_pull_job_resumes_from_persisted_source_path_af
 
     assert_eq!(completed["state"], "completed");
     assert_eq!(completed["source_path"], source_pack.to_str().unwrap());
-    assert!(
-        completed["installed_path"]
-            .as_str()
-            .unwrap()
-            .ends_with("moonshine-tiny-q8_0.oasr")
-    );
+    assert_installed_content_object(completed["installed_path"].as_str().unwrap());
 }
 
 #[tokio::test]
