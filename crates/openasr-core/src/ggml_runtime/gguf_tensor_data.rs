@@ -34,6 +34,15 @@ impl GgufTensorDataReader {
         Self::from_runtime_source(&runtime_source)
     }
 
+    /// Builds a reader from an already-validated [`GgmlRuntimeSource`].
+    ///
+    /// This is the TOCTOU-safe entry point: tensor data is read from
+    /// `runtime_source`'s own open mapping (`backing_mmap()`), the exact
+    /// bytes the tensor index's offsets were already checked against, instead
+    /// of a fresh `File::open` of `runtime_source.path()`. A pack replaced at
+    /// that path between the two opens used to be able to hand back a
+    /// tensor-data mapping from a different file generation than the index
+    /// it was paired with; sharing the mapping makes that impossible.
     pub fn from_runtime_source(
         runtime_source: &GgmlRuntimeSource,
     ) -> Result<Self, GgufTensorDataReadError> {
@@ -41,7 +50,11 @@ impl GgufTensorDataReader {
         let metadata = read_gguf_metadata_from_runtime_source(runtime_source)?;
         let tensor_data_alignment_bytes =
             parse_tensor_alignment(runtime_source.path(), metadata.get_u32("general.alignment"))?;
-        Self::from_tensor_index_and_alignment(Arc::new(tensor_index), tensor_data_alignment_bytes)
+        Self::from_tensor_index_alignment_and_mmap(
+            Arc::new(tensor_index),
+            tensor_data_alignment_bytes,
+            runtime_source.backing_mmap(),
+        )
     }
 
     pub fn from_tensor_index(
@@ -50,6 +63,11 @@ impl GgufTensorDataReader {
         Self::from_tensor_index_shared(Arc::new(tensor_index))
     }
 
+    /// Builds a reader from a tensor index alone (no [`GgmlRuntimeSource`] at
+    /// hand). This re-opens `tensor_index.path()` to map the tensor data, so
+    /// it does **not** get the same-open-handle guarantee
+    /// [`Self::from_runtime_source`] provides -- prefer that constructor
+    /// whenever a `GgmlRuntimeSource` is already available.
     pub fn from_tensor_index_shared(
         tensor_index: Arc<GgufTensorIndex>,
     ) -> Result<Self, GgufTensorDataReadError> {
@@ -175,19 +193,15 @@ impl GgufTensorDataReader {
         self.weight_tensor_payload_from_host(payload)
     }
 
+    /// Opens `tensor_index.path()` fresh and maps it. Only used by the
+    /// path-reopening constructors ([`Self::from_tensor_index_shared`] via
+    /// [`Self::from_path`] / [`Self::from_tensor_index`]); see
+    /// [`Self::from_runtime_source`] for the TOCTOU-safe path that reuses an
+    /// already-open mapping instead.
     fn from_tensor_index_and_alignment(
         tensor_index: Arc<GgufTensorIndex>,
         tensor_data_alignment_bytes: u64,
     ) -> Result<Self, GgufTensorDataReadError> {
-        if tensor_data_alignment_bytes == 0
-            || !tensor_data_alignment_bytes.is_multiple_of(GGUF_MIN_ALIGNMENT_BYTES)
-        {
-            return Err(GgufTensorDataReadError::InvalidTensorDataAlignment {
-                path: tensor_index.path().to_path_buf(),
-                alignment: tensor_data_alignment_bytes,
-            });
-        }
-
         let file = File::open(tensor_index.path()).map_err(|source| {
             GgufTensorDataReadError::OpenFile {
                 path: tensor_index.path().to_path_buf(),
@@ -220,10 +234,35 @@ impl GgufTensorDataReader {
             });
         }
 
+        Self::from_tensor_index_alignment_and_mmap(
+            tensor_index,
+            tensor_data_alignment_bytes,
+            Arc::new(mmap),
+        )
+    }
+
+    /// Builds the reader from an already-open mapping (either freshly opened
+    /// by [`Self::from_tensor_index_and_alignment`], or shared from a
+    /// [`GgmlRuntimeSource`] by [`Self::from_runtime_source`]). No file I/O
+    /// happens here -- this only validates alignment and stores the mapping.
+    fn from_tensor_index_alignment_and_mmap(
+        tensor_index: Arc<GgufTensorIndex>,
+        tensor_data_alignment_bytes: u64,
+        mmap: Arc<Mmap>,
+    ) -> Result<Self, GgufTensorDataReadError> {
+        if tensor_data_alignment_bytes == 0
+            || !tensor_data_alignment_bytes.is_multiple_of(GGUF_MIN_ALIGNMENT_BYTES)
+        {
+            return Err(GgufTensorDataReadError::InvalidTensorDataAlignment {
+                path: tensor_index.path().to_path_buf(),
+                alignment: tensor_data_alignment_bytes,
+            });
+        }
+
         Ok(Self {
             tensor_index,
             tensor_data_alignment_bytes,
-            mmap: Arc::new(mmap),
+            mmap,
         })
     }
 

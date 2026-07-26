@@ -1,17 +1,96 @@
 use std::{
-    fs,
+    fs::{self, File},
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
 };
 
+use memmap2::Mmap;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{GgmlPackageFormat, GgmlPackageProbe, GgmlPackageProbeError, probe_ggml_package_path};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A validated ggml runtime source: the file has been opened and mapped
+/// exactly once. Its content id (full-file sha256) is derived from that same
+/// mapping, lazily, the first time a caller actually asks for one.
+///
+/// This is the fix for a reopen TOCTOU that used to exist between building a
+/// [`super::GgufTensorIndex`] (path-based) and mapping tensor *data*
+/// (previously a fresh `File::open` of the same path in
+/// `GgufTensorDataReader::from_tensor_index_and_alignment`): metadata, the
+/// tensor index, and the mapped weight bytes could come from different file
+/// generations if the pack was replaced between the two opens. Holding the
+/// open mapping here and threading it through
+/// [`super::GgufTensorDataReader::from_runtime_source`] means the bytes a
+/// caller hashes for identity are the exact same bytes later read for
+/// weights -- there is no second open to race against.
+///
+/// `content_id` is deliberately **not** computed at validation time: this
+/// constructor sits on the per-request admission path (see
+/// `validate_local_native_runtime_source`), and hashing a multi-GB pack on
+/// every request is the exact per-request full-file-sha256 cost the runtime
+/// cache coordinator's warm path is designed to avoid. Only a caller that
+/// actually calls [`GgmlRuntimeSource::content_id`] pays the one-time hash;
+/// callers that only need [`GgmlRuntimeSource::path`] / [`GgmlRuntimeSource::package_probe`]
+/// (the common case) never do.
+///
+/// `path()` is downgraded to an admission / diagnostics / GC / fixture-lookup
+/// helper: it must never be re-derived into a content identity by a caller
+/// that already holds a `GgmlRuntimeSource` (use [`GgmlRuntimeSource::content_id`]
+/// instead).
 pub struct GgmlRuntimeSource {
     path: PathBuf,
     package_probe: GgmlPackageProbe,
+    mmap: Arc<Mmap>,
+    /// `sha256:<hex>` of the full mapped file. Computed once, lazily, from
+    /// `mmap` -- never by re-opening `path`.
+    content_id: OnceLock<String>,
 }
+
+impl Clone for GgmlRuntimeSource {
+    fn clone(&self) -> Self {
+        let content_id = OnceLock::new();
+        if let Some(existing) = self.content_id.get() {
+            // Best-effort: propagate an already-computed id so cloning a
+            // source that already paid the hash cost does not force the
+            // clone to pay it again. Losing a race here just means the clone
+            // lazily recomputes (same answer, same bytes) instead of reusing
+            // the value -- never a correctness issue.
+            let _ = content_id.set(existing.clone());
+        }
+        Self {
+            path: self.path.clone(),
+            package_probe: self.package_probe.clone(),
+            mmap: Arc::clone(&self.mmap),
+            content_id,
+        }
+    }
+}
+
+impl std::fmt::Debug for GgmlRuntimeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GgmlRuntimeSource")
+            .field("path", &self.path)
+            .field("package_probe", &self.package_probe)
+            .field("content_id", &self.content_id.get())
+            .field("mmap_len", &self.mmap.len())
+            .finish()
+    }
+}
+
+// Equality is defined on admission identity (path + probe), not on the
+// mapping or the lazily-computed content id: `Mmap` has no `PartialEq`, and
+// forcing the hash just to compare two sources would defeat the whole point
+// of making it lazy. Nothing in this crate compares `GgmlRuntimeSource` for
+// content equality; callers that need a content proof use `content_id()`
+// directly.
+impl PartialEq for GgmlRuntimeSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.package_probe == other.package_probe
+    }
+}
+
+impl Eq for GgmlRuntimeSource {}
 
 impl GgmlRuntimeSource {
     pub fn path(&self) -> &Path {
@@ -20,6 +99,24 @@ impl GgmlRuntimeSource {
 
     pub fn package_probe(&self) -> &GgmlPackageProbe {
         &self.package_probe
+    }
+
+    /// `sha256:<hex>` content id of the full mapped file. Computed on first
+    /// call from the mapping this source already holds open (never a fresh
+    /// `File::open` of `path`), then cached on this instance. This is the
+    /// identity authority for this source -- prefer it over re-deriving an id
+    /// from [`GgmlRuntimeSource::path`].
+    pub fn content_id(&self) -> &str {
+        self.content_id
+            .get_or_init(|| format!("sha256:{:x}", Sha256::digest(&self.mmap[..])))
+    }
+
+    /// The open mapping backing this source. Sharing this `Arc` (rather than
+    /// re-opening `path()`) is what lets metadata / tensor-index / weight
+    /// readers agree on exactly the bytes this source's `content_id` was
+    /// computed from.
+    pub(crate) fn backing_mmap(&self) -> Arc<Mmap> {
+        Arc::clone(&self.mmap)
     }
 }
 
@@ -43,6 +140,18 @@ pub enum GgmlRuntimeSourcePathError {
     ReservedOpenAsrContainer { path: PathBuf },
     #[error(transparent)]
     Probe(#[from] GgmlPackageProbeError),
+    #[error("could not open ggml runtime source '{path}' for content identity: {source}")]
+    OpenFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not map ggml runtime source '{path}' for content identity: {source}")]
+    MapFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Validate a path as a loadable ggml runtime source.
@@ -89,9 +198,28 @@ pub fn validate_ggml_runtime_source_path(
         });
     }
 
+    // Open and map once. Every later reader of this source (metadata,
+    // tensor-index cross-checks, tensor data, and a lazily-computed
+    // `content_id`) shares this `Arc<Mmap>` instead of re-opening `path` --
+    // that is what makes `content_id()` an honest proof of the bytes a caller
+    // actually reads, not just of whatever happened to be at `path` at
+    // validation time. Mapping is a cheap `mmap(2)` (no read); the expensive
+    // full-file hash only happens if/when `content_id()` is called.
+    let file = File::open(path).map_err(|source| GgmlRuntimeSourcePathError::OpenFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mmap =
+        unsafe { Mmap::map(&file) }.map_err(|source| GgmlRuntimeSourcePathError::MapFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
     Ok(GgmlRuntimeSource {
         path: path.to_path_buf(),
         package_probe,
+        mmap: Arc::new(mmap),
+        content_id: OnceLock::new(),
     })
 }
 
