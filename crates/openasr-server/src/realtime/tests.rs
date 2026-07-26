@@ -415,6 +415,20 @@ async fn cancel_backend_jobs_cancels_the_execution_context_shared_by_a_queued_wo
 /// is the same one a live disconnect after permit acquisition would hit.
 #[tokio::test]
 async fn realtime_backend_job_canceled_before_dispatch_releases_capacity_promptly() {
+    // GGML_METAL_DEVICES=0 keeps this test's process from ever registering a
+    // Metal device. `resolve_execution_route_for_target` (used below via
+    // `transcribe_with_runtime`, purely for model-admission bookkeeping --
+    // its resolved route never reaches decode dispatch, see
+    // `admission_identity_for_route`) unconditionally enumerates every ggml
+    // backend device regardless of the request's own execution target, and
+    // the *first* such enumeration in a process is what pays ggml's one-time
+    // Metal device + shader-library init -- the actual cost behind this
+    // test's old wall-clock flakiness, not this test's own (CPU-only, tiny
+    // one-layer fixture) decode. Safe to leave latched for the rest of this
+    // process: nextest gives every test its own process, so this can never
+    // leak into another test.
+    let _metal_devices_off = EnvVarGuard::set("GGML_METAL_DEVICES", "0");
+
     let temp = tempfile::tempdir().unwrap();
     let pack_path = temp.path().join("realtime-cancel-releases-capacity.oasr");
     let spec = openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(
@@ -431,10 +445,12 @@ async fn realtime_backend_job_canceled_before_dispatch_releases_capacity_promptl
         model_pack_path: Some(pack_path),
     };
 
-    // One second of a real (non-silent) tone rather than jfk.wav: keeps the
-    // encoder pass this test still exercises (cancellation is only checked
-    // starting at the greedy decode loop, so the encoder always runs first)
-    // short and this test fast.
+    // One second of a real (non-silent) tone rather than jfk.wav: keeps input
+    // audio non-trivial without adding meaningful latency -- with the tiny
+    // one-layer fixture pack pinned to CPU-only, the mel+encoder pass and the
+    // decode loop's first cooperative-cancel checkpoint both run in low
+    // single-digit milliseconds, so clip length is not what makes this test
+    // fast.
     let samples: Vec<i16> = (0..16_000)
         .map(|index| {
             let t = index as f32 / 16_000.0;
@@ -456,7 +472,11 @@ async fn realtime_backend_job_canceled_before_dispatch_releases_capacity_promptl
         prompt: None,
         phrase_bias: None,
         inference_threads: None,
-        execution_target: None,
+        // Explicit CPU target for the decode dispatch itself, on top of the
+        // `_metal_devices_off` guard above (which keeps Metal out of the
+        // admission-route enumeration): belt-and-suspenders so this test
+        // never depends on GPU/CPU auto-selection.
+        execution_target: Some(openasr_core::ExecutionTarget::Cpu),
         word_timestamps: false,
         display_name: "realtime-cancel-test.wav".to_string(),
         temp_wav,
@@ -480,7 +500,7 @@ async fn realtime_backend_job_canceled_before_dispatch_releases_capacity_promptl
 
     launch_realtime_backend_work_item(runtime.clone(), worker_sender, work_item);
 
-    let result = tokio::time::timeout(Duration::from_secs(10), result_receiver.recv())
+    let result = tokio::time::timeout(Duration::from_secs(2), result_receiver.recv())
         .await
         .expect("canceled realtime job must exit well before a real decode would finish")
         .expect("result channel must receive exactly one result");
