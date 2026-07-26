@@ -979,6 +979,181 @@ mod tests {
     }
 
     #[test]
+    fn cohere_cached_runtime_survives_a_rename_based_pack_replacement_at_its_path() {
+        with_forced_cpu_backend_for_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join("cohere-runtime-replace.gguf");
+            let staging_old = temp.path().join("cohere-runtime-replace-old.gguf");
+            let staging_new = temp.path().join("cohere-runtime-replace-new.gguf");
+
+            let spec_old =
+                TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-fixture-replace-old");
+            let spec_new =
+                TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-fixture-replace-new");
+            write_tiny_gguf_runtime_source(&staging_old, &spec_old).expect("write old fixture");
+            write_tiny_gguf_runtime_source(&staging_new, &spec_new).expect("write new fixture");
+            std::fs::rename(&staging_old, &path).expect("place initial pack at path");
+
+            // Open (and hold) the source before the pack at `path` is ever
+            // replaced -- the same shape a caller with an already-cached
+            // runtime built from this exact mapping would be in.
+            let old_runtime_source =
+                crate::validate_ggml_runtime_source_path(&path).expect("open old source");
+            let old_content_id = old_runtime_source.content_id().to_string();
+            let old_preflight = crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source(&old_runtime_source)
+                .expect("build preflight from held old source");
+
+            let executor = CohereTranscribeGgmlExecutor::default();
+
+            // Build the cache entry keyed on the OLD content id by handing
+            // the request an explicit preflight built from the held source,
+            // instead of letting it re-resolve `path` itself.
+            let mut request = runtime_ready_request(path.clone());
+            request.runtime_source_preflight = Some(old_preflight.clone());
+            executor
+                .execute(&request)
+                .expect("first execute against old pack via held preflight");
+            assert_eq!(cohere_runtime_build_counts_for_test(), (1, 1));
+
+            // Replace the pack at `path` via a RENAME, not an in-place
+            // `fs::write` -- an in-place write can mutate pages a live
+            // `MAP_SHARED` mapping observes and would not prove that an
+            // already-held mapping is untouched by a path-level replacement.
+            std::fs::rename(&staging_new, &path).expect("replace pack via rename");
+
+            // The already-held old runtime source keeps reading its own,
+            // untouched mapping: its content id must not change, and reusing
+            // it (the request's `runtime_source_path` still equals the held
+            // preflight's path, so the resolver accepts it without
+            // re-opening) must still hit the OLD content id's cache entry.
+            assert_eq!(
+                old_runtime_source.content_id(),
+                old_content_id,
+                "an already-open mapping's content id must not change just because the path \
+                 it was opened from was later replaced"
+            );
+            let mut old_request = runtime_ready_request(path.clone());
+            old_request.runtime_source_preflight = Some(old_preflight);
+            executor
+                .execute(&old_request)
+                .expect("second execute reusing the held old preflight after replacement");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (1, 1),
+                "an already-held runtime source must keep serving from -- and hitting the cache \
+                 entry for -- its own mapping after the path it was opened from is replaced"
+            );
+
+            // A FRESH resolution of the same (now-replaced) path observes
+            // the new bytes, gets a different content id, and is a genuine
+            // cache miss that rebuilds -- without disturbing the old content
+            // id's entry (the build count only grows by one, it is not
+            // reset).
+            let fresh_source =
+                crate::validate_ggml_runtime_source_path(&path).expect("open replaced source");
+            assert_ne!(
+                fresh_source.content_id(),
+                old_content_id,
+                "the replaced pack must produce a different content id than the original"
+            );
+            let fresh_request = runtime_ready_request(path);
+            executor
+                .execute(&fresh_request)
+                .expect("execute against freshly-resolved replaced pack");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (2, 2),
+                "resolving the replaced path fresh must observe the new content and rebuild \
+                 exactly once, on top of (not instead of) the old content id's cached entry"
+            );
+        });
+    }
+
+    #[test]
+    fn cohere_lru_eviction_targets_the_least_recently_used_pack_and_spares_siblings() {
+        with_forced_cpu_backend_for_test(|| {
+            assert_eq!(
+                DEFAULT_RUNTIME_CACHE_CAPACITY, 4,
+                "this test drives exactly capacity + 1 distinct packs; update the pack count \
+                 alongside this constant if it ever changes"
+            );
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let paths: Vec<PathBuf> = (1..=5)
+                .map(|index| {
+                    let path = temp.path().join(format!("cohere-evict-{index}.gguf"));
+                    let spec = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(format!(
+                        "cohere-fixture-evict-{index}"
+                    ));
+                    write_tiny_gguf_runtime_source(&path, &spec).expect("write fixture");
+                    path
+                })
+                .collect();
+
+            let executor = CohereTranscribeGgmlExecutor::default();
+
+            // Fill the capacity-4 cache with packs 1..4, oldest first.
+            for path in &paths[0..4] {
+                executor
+                    .execute(&runtime_ready_request(path.clone()))
+                    .expect("fill cache execute");
+            }
+            assert_eq!(cohere_runtime_build_counts_for_test(), (4, 4));
+
+            // Pack 5 is the 5th distinct content id: it must evict pack 1,
+            // the least recently used entry (never touched since its
+            // initial insert), and build its own runtimes.
+            executor
+                .execute(&runtime_ready_request(paths[4].clone()))
+                .expect("fifth pack execute");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (5, 5),
+                "the fifth distinct pack must build (it cannot fit alongside the other four \
+                 without an eviction)"
+            );
+
+            // The three siblings that were never evicted must still hit.
+            for path in &paths[1..4] {
+                executor
+                    .execute(&runtime_ready_request(path.clone()))
+                    .expect("surviving sibling execute");
+            }
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (5, 5),
+                "packs 2-4 must remain cache hits -- evicting pack 1 for pack 5 must not \
+                 collaterally evict or rebuild a healthy sibling"
+            );
+
+            // Pack 1, the evicted entry, must be a genuine miss and rebuild.
+            executor
+                .execute(&runtime_ready_request(paths[0].clone()))
+                .expect("re-request evicted pack");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (6, 6),
+                "re-requesting the evicted pack must rebuild it, proving eviction actually \
+                 dropped its cache entry rather than merely reordering it"
+            );
+
+            // Packs 2-4 must still be unaffected by pack 1's return (which
+            // evicts pack 5, now the least recently used).
+            for path in &paths[1..4] {
+                executor
+                    .execute(&runtime_ready_request(path.clone()))
+                    .expect("surviving sibling execute after evicted pack returns");
+            }
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (6, 6),
+                "packs 2-4 must remain cache hits after the previously-evicted pack 1 rebuilds \
+                 and takes a slot back"
+            );
+        });
+    }
+
+    #[test]
     fn cohere_executor_serve_batch_env_keeps_cpu_path_available() {
         // Flattened into one multi-key override rather than nesting
         // `with_forced_cpu_backend_for_test` inside `with_serve_batch_env`:
