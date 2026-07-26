@@ -7,18 +7,24 @@
 //! only valid inside the **scope** it was computed in -- one decode unit. A
 //! source numbers speakers in arrival order within its own scope, so scope A's
 //! `SPEAKER_01` and scope B's `SPEAKER_01` are two unrelated labels that happen
-//! to collide. Today one transcription is one scope; serve-batch will cut one
-//! transcription into several slices decoded independently, and each slice will
-//! be its own scope. Nothing else about this stage changes when that lands,
-//! which is the point of making scope explicit ([`SpeakerScope`]) instead of
-//! assuming a single continuous decode.
+//! to collide. A whole-recording decode is one scope; a recording cut into
+//! longform slices that an in-decoder-diarizing family decoded independently
+//! (`arch::OpenAsrLongformSliceShape::ScopedSlices`) is one scope per slice.
+//! Nothing about this stage depends on which of those produced its input, which
+//! is the point of making scope explicit ([`SpeakerScope`]).
 //!
 //! Stitching scopes back together -- deciding that A's `SPEAKER_01` and B's
 //! `SPEAKER_02` are one person -- is therefore not an optional nicety layered on
 //! top of transcription; it is what makes the speaker labels of a multi-scope
 //! transcript mean anything at all, and it can only be done from voice
 //! evidence. That is this module's job, and it is why it works from embeddings
-//! and never from labels: a label is a counter, not an identity.
+//! and never from labels: a label is a counter, not an identity. It happens in
+//! two steps that must stay in this order: every scope's labels are first split
+//! apart unconditionally ([`disambiguate_labels_across_scopes`]), then only
+//! acoustic agreement puts any of them back together
+//! ([`stitch_labels_across_scopes`], and enrolled-person matching further
+//! down). Nothing in between is allowed to treat a shared number as a shared
+//! person.
 //!
 //! # Erring toward anonymous
 //!
@@ -95,7 +101,7 @@ pub fn name_speakers_across_scopes(scopes: &mut [SpeakerScope<'_>]) {
     // disambiguation pass above -- so evidence from two scopes is never pooled
     // into one centroid unless a caller genuinely produced one scope.
     let mut evidence: BTreeMap<String, LabelEvidence> = BTreeMap::new();
-    for scope in scopes.iter() {
+    for (scope_index, scope) in scopes.iter().enumerate() {
         for segment in scope.segments.iter() {
             let Some(label) = segment.speaker_label.as_ref() else {
                 continue;
@@ -108,11 +114,39 @@ pub fn name_speakers_across_scopes(scopes: &mut [SpeakerScope<'_>]) {
             };
             let entry = evidence
                 .entry(label.clone())
-                .or_insert_with(|| LabelEvidence::new(embedding.dim()));
+                .or_insert_with(|| LabelEvidence::new(embedding.dim(), scope_index));
             entry.accumulate(
                 &embedding,
                 clip.len() as f64 / EMBEDDER_SAMPLE_RATE_HZ as f64,
             );
+        }
+    }
+
+    // Put the scopes back together: labels from different scopes whose voices
+    // match become one speaker again. Without this, disambiguation's deliberate
+    // over-split is the final answer and every scope seam reads as a fresh cast
+    // of speakers.
+    if scopes.len() > 1 {
+        let stitched = stitch_labels_across_scopes(
+            &evidence,
+            &crate::diarize::clustering::AgglomerativeClusterer::for_embedder(embedder),
+        );
+        if !stitched.is_empty() {
+            evidence = pool_evidence_by_canonical_label(evidence, &stitched);
+            for scope in scopes.iter_mut() {
+                for segment in scope.segments.iter_mut() {
+                    let Some(label) = segment.speaker_label.as_deref() else {
+                        continue;
+                    };
+                    let Some(canonical) = stitched.get(label) else {
+                        continue;
+                    };
+                    if segment.speaker.as_deref() == segment.speaker_label.as_deref() {
+                        segment.speaker = Some(canonical.clone());
+                    }
+                    segment.speaker_label = Some(canonical.clone());
+                }
+            }
         }
     }
 
@@ -153,14 +187,29 @@ pub fn name_speakers_from_labeled_segments(segments: &mut [Segment], samples: &[
 struct LabelEvidence {
     sum: Vec<f32>,
     seconds: f64,
+    /// Which scope this label belongs to. Two labels sharing a scope were told
+    /// apart by that scope's own segmenter and must never be stitched back
+    /// together (see [`stitch_labels_across_scopes`]).
+    scope_index: usize,
 }
 
 impl LabelEvidence {
-    fn new(dim: usize) -> Self {
+    fn new(dim: usize, scope_index: usize) -> Self {
         Self {
             sum: vec![0.0; dim],
             seconds: 0.0,
+            scope_index,
         }
+    }
+
+    fn absorb(&mut self, other: &LabelEvidence) {
+        if self.sum.len() != other.sum.len() {
+            return;
+        }
+        for (sum, value) in self.sum.iter_mut().zip(&other.sum) {
+            *sum += value;
+        }
+        self.seconds += other.seconds;
     }
 
     fn accumulate(&mut self, embedding: &SpeakerEmbedding, seconds: f64) {
@@ -176,10 +225,104 @@ impl LabelEvidence {
     /// The label's mean embedding, or `None` when too little audio backs it to
     /// risk putting a name to it (see the module doc's "Erring toward
     /// anonymous").
-    fn centroid(self) -> Option<SpeakerEmbedding> {
+    fn centroid(&self) -> Option<SpeakerEmbedding> {
         (self.seconds >= MIN_EMBEDDING_EVIDENCE_SECONDS)
-            .then(|| SpeakerEmbedding::l2_normalized(self.sum))
+            .then(|| SpeakerEmbedding::l2_normalized(self.sum.clone()))
     }
+}
+
+/// Decide which scope-local labels are the same voice, and return the rename
+/// map that collapses each such group onto one canonical label.
+///
+/// This is the "only from voice evidence" half of the scope contract. The
+/// numbering collision is resolved by splitting before this runs
+/// ([`disambiguate_labels_across_scopes`]); this is the only thing allowed to
+/// put labels back together, and it has exactly two rules on top of the
+/// clustering itself:
+///
+/// - **A label with too little audio to embed reliably is never stitched.**
+///   Same floor as naming ([`LabelEvidence::centroid`]): a speaker who says two
+///   words in one slice stays their own speaker rather than being attached to
+///   whoever they happened to sound closest to. Over-counting is the
+///   recoverable mistake; fusing two people is not.
+/// - **Two labels from the same scope are never merged.** That scope's own
+///   segmenter already asserted they are different speakers, and it had the
+///   full turn structure of that decode unit to say so; a centroid comparison
+///   is not better evidence than that. Encoded as a cannot-link by giving every
+///   label in a scope the same synthetic time range, which is precisely the
+///   constraint `AgglomerativeClusterer::cluster_with_context` already applies
+///   for simultaneous speech (two labels that overlap in time cannot be one
+///   voice) -- same rule, reused rather than re-implemented.
+///
+/// The merge stop itself is the embedder's own calibrated plain AHC threshold,
+/// the same one the external diarization path clusters segments with, so
+/// stitching is no looser than the clustering that produced the labels.
+fn stitch_labels_across_scopes(
+    evidence: &BTreeMap<String, LabelEvidence>,
+    clusterer: &crate::diarize::clustering::AgglomerativeClusterer,
+) -> BTreeMap<String, String> {
+    use crate::diarize::clustering::{ClusterContext, SpeakerClusterer};
+    use crate::diarize::contract::{DiarizeHint, TimeRange};
+
+    let mut labels: Vec<&str> = Vec::new();
+    let mut centroids: Vec<SpeakerEmbedding> = Vec::new();
+    let mut context: Vec<ClusterContext> = Vec::new();
+    for (label, entry) in evidence {
+        let Some(centroid) = entry.centroid() else {
+            continue;
+        };
+        labels.push(label.as_str());
+        centroids.push(centroid);
+        // One unit-wide range per scope: same scope -> ranges overlap ->
+        // cannot-link; different scopes -> disjoint -> free to merge.
+        let start = entry.scope_index as f64;
+        context.push(ClusterContext {
+            range: TimeRange::new(start, start + 1.0),
+            local_speaker: None,
+            overlap: false,
+        });
+    }
+    if labels.len() < 2 {
+        return BTreeMap::new();
+    }
+    let assignments = clusterer.cluster_with_context(&centroids, &context, DiarizeHint::Auto);
+    if assignments.len() != labels.len() {
+        return BTreeMap::new();
+    }
+    // Canonical label per cluster: the first member in label order, so the
+    // rename is deterministic and never invents a label that no scope produced.
+    let mut canonical: BTreeMap<u32, &str> = BTreeMap::new();
+    for (label, speaker) in labels.iter().zip(&assignments) {
+        canonical.entry(speaker.0).or_insert(label);
+    }
+    labels
+        .iter()
+        .zip(&assignments)
+        .filter_map(|(label, speaker)| {
+            let target = canonical.get(&speaker.0)?;
+            (target != label).then(|| ((*label).to_string(), (*target).to_string()))
+        })
+        .collect()
+}
+
+/// Re-pool per-label evidence onto the canonical labels [`stitch_labels_across_scopes`]
+/// chose, so person matching below sees one centroid per stitched speaker
+/// rather than matching each scope's fragment on its own.
+fn pool_evidence_by_canonical_label(
+    evidence: BTreeMap<String, LabelEvidence>,
+    stitched: &BTreeMap<String, String>,
+) -> BTreeMap<String, LabelEvidence> {
+    let mut pooled: BTreeMap<String, LabelEvidence> = BTreeMap::new();
+    for (label, entry) in evidence {
+        let canonical = stitched.get(&label).cloned().unwrap_or(label);
+        match pooled.get_mut(&canonical) {
+            Some(existing) => existing.absorb(&entry),
+            None => {
+                pooled.insert(canonical, entry);
+            }
+        }
+    }
+    pooled
 }
 
 /// Keep the displayed speaker and the stable scope-local label in sync before
@@ -331,18 +474,156 @@ mod tests {
         }
     }
 
+    fn evidence_entry(scope_index: usize, values: Vec<f32>, seconds: f64) -> LabelEvidence {
+        let mut entry = LabelEvidence::new(values.len(), scope_index);
+        entry.accumulate(&SpeakerEmbedding::l2_normalized(values), seconds);
+        entry
+    }
+
+    fn stitch(entries: &[(&str, LabelEvidence)]) -> BTreeMap<String, String> {
+        let evidence: BTreeMap<String, LabelEvidence> = entries
+            .iter()
+            .map(|(label, entry)| {
+                (
+                    (*label).to_string(),
+                    LabelEvidence {
+                        sum: entry.sum.clone(),
+                        seconds: entry.seconds,
+                        scope_index: entry.scope_index,
+                    },
+                )
+            })
+            .collect();
+        stitch_labels_across_scopes(
+            &evidence,
+            &crate::diarize::clustering::AgglomerativeClusterer::default(),
+        )
+    }
+
+    /// The stitch side of the serve-batch contract: two scopes decoded the same
+    /// voice under their own numbering, and the acoustic evidence is what puts
+    /// them back together.
+    #[test]
+    fn scopes_are_stitched_back_together_by_matching_voices() {
+        let seconds = MIN_EMBEDDING_EVIDENCE_SECONDS * 4.0;
+        let stitched = stitch(&[
+            (
+                "SPEAKER_00",
+                evidence_entry(0, vec![1.0, 0.0, 0.0], seconds),
+            ),
+            (
+                "SPEAKER_01",
+                evidence_entry(0, vec![0.0, 1.0, 0.0], seconds),
+            ),
+            (
+                "SPEAKER_02",
+                evidence_entry(1, vec![0.99, 0.1, 0.0], seconds),
+            ),
+        ]);
+        // The second scope's speaker is the first scope's SPEAKER_00 voice.
+        assert_eq!(
+            stitched.get("SPEAKER_02").map(String::as_str),
+            Some("SPEAKER_00")
+        );
+        // The two genuinely different voices are left alone.
+        assert!(!stitched.contains_key("SPEAKER_00"));
+        assert!(!stitched.contains_key("SPEAKER_01"));
+    }
+
+    /// Two speakers the *same* scope's segmenter told apart are never fused,
+    /// even when their centroids are close enough that a plain threshold would
+    /// merge them: that scope saw the whole turn structure and its verdict
+    /// outranks a centroid comparison.
+    #[test]
+    fn labels_from_one_scope_are_never_stitched_to_each_other() {
+        let seconds = MIN_EMBEDDING_EVIDENCE_SECONDS * 4.0;
+        let stitched = stitch(&[
+            (
+                "SPEAKER_00",
+                evidence_entry(0, vec![1.0, 0.0, 0.0], seconds),
+            ),
+            (
+                "SPEAKER_01",
+                evidence_entry(0, vec![1.0, 0.01, 0.0], seconds),
+            ),
+        ]);
+        assert!(stitched.is_empty(), "{stitched:?}");
+    }
+
+    /// Voices that do not match stay separate speakers rather than being
+    /// collapsed onto whichever label they were nearest to.
+    #[test]
+    fn different_voices_in_different_scopes_stay_separate() {
+        let seconds = MIN_EMBEDDING_EVIDENCE_SECONDS * 4.0;
+        let stitched = stitch(&[
+            (
+                "SPEAKER_00",
+                evidence_entry(0, vec![1.0, 0.0, 0.0], seconds),
+            ),
+            (
+                "SPEAKER_01",
+                evidence_entry(1, vec![0.0, 1.0, 0.0], seconds),
+            ),
+        ]);
+        assert!(stitched.is_empty(), "{stitched:?}");
+    }
+
+    /// Too little audio to embed reliably is too little audio to stitch on:
+    /// such a label keeps its own scope-local identity (over-counting) rather
+    /// than being attached to the nearest centroid (fusing two people).
+    #[test]
+    fn a_label_with_thin_evidence_is_not_stitched() {
+        let stitched = stitch(&[
+            (
+                "SPEAKER_00",
+                evidence_entry(0, vec![1.0, 0.0, 0.0], MIN_EMBEDDING_EVIDENCE_SECONDS * 4.0),
+            ),
+            (
+                "SPEAKER_01",
+                evidence_entry(1, vec![1.0, 0.0, 0.0], MIN_EMBEDDING_EVIDENCE_SECONDS / 2.0),
+            ),
+        ]);
+        assert!(stitched.is_empty(), "{stitched:?}");
+    }
+
+    /// Pooling follows the stitch so person matching sees one centroid per
+    /// stitched speaker, with the audio evidence of every scope it spans.
+    #[test]
+    fn stitched_labels_pool_their_evidence() {
+        let seconds = MIN_EMBEDDING_EVIDENCE_SECONDS * 4.0;
+        let evidence: BTreeMap<String, LabelEvidence> = [
+            (
+                "SPEAKER_00".to_string(),
+                evidence_entry(0, vec![1.0, 0.0], seconds),
+            ),
+            (
+                "SPEAKER_01".to_string(),
+                evidence_entry(1, vec![1.0, 0.0], seconds),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let stitched: BTreeMap<String, String> =
+            [("SPEAKER_01".to_string(), "SPEAKER_00".to_string())]
+                .into_iter()
+                .collect();
+        let pooled = pool_evidence_by_canonical_label(evidence, &stitched);
+        assert_eq!(pooled.len(), 1);
+        assert_eq!(pooled["SPEAKER_00"].seconds, seconds * 2.0);
+    }
+
     /// Evidence too short to embed reliably yields no centroid at all, so such
     /// a label can never be handed to the matcher.
     #[test]
     fn thin_evidence_is_not_worth_a_name() {
-        let mut evidence = LabelEvidence::new(2);
+        let mut evidence = LabelEvidence::new(2, 0);
         evidence.accumulate(
             &SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]),
             MIN_EMBEDDING_EVIDENCE_SECONDS / 2.0,
         );
         assert!(evidence.centroid().is_none());
 
-        let mut evidence = LabelEvidence::new(2);
+        let mut evidence = LabelEvidence::new(2, 0);
         evidence.accumulate(
             &SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]),
             MIN_EMBEDDING_EVIDENCE_SECONDS,
