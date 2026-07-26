@@ -194,13 +194,18 @@ unsafe extern "C" {
         abort_callback_data: *mut c_void,
         cancel_mode: *mut c_int,
     ) -> c_int;
-    pub(crate) fn ggml_backend_sched_new(
+    pub(crate) fn ggml_backend_sched_context_buffer_size(graph_size: usize) -> usize;
+    pub(crate) fn ggml_backend_sched_try_new(
         backends: *mut GgmlBackendRaw,
         bufts: *mut GgmlBackendBufferTypeRaw,
         n_backends: c_int,
         graph_size: usize,
         parallel: bool,
         op_offload: bool,
+        context_buffer: *mut c_void,
+        context_buffer_size: usize,
+        context_storage: *mut c_void,
+        context_storage_size: usize,
     ) -> GgmlBackendSchedRaw;
     pub(crate) fn ggml_backend_sched_free(sched: GgmlBackendSchedRaw);
     pub(crate) fn ggml_backend_sched_reset(sched: GgmlBackendSchedRaw);

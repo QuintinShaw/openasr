@@ -35,13 +35,13 @@ pub enum GgmlContextAllocationError {
 }
 
 #[derive(Debug)]
-struct AlignedAllocation {
+pub(crate) struct AlignedAllocation {
     ptr: NonNull<u8>,
     layout: Layout,
 }
 
 impl AlignedAllocation {
-    fn new_with_allocator(
+    pub(crate) fn new_with_allocator(
         stage: &'static str,
         requested_bytes: usize,
         allocate: impl FnOnce(Layout) -> *mut u8,
@@ -61,7 +61,7 @@ impl AlignedAllocation {
         Ok(Self { ptr, layout })
     }
 
-    fn as_mut_ptr(&self) -> *mut c_void {
+    pub(crate) fn as_mut_ptr(&self) -> *mut c_void {
         self.ptr.as_ptr().cast()
     }
 }

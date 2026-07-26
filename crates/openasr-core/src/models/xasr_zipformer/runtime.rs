@@ -7,12 +7,16 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::GgmlRuntimeSource;
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufMetadata, GgufTensorDataReader};
+use crate::ggml_runtime::{
+    GgmlCpuGraphBackend, GgmlCpuGraphError, GgufMetadata, GgufTensorDataReader,
+};
+use crate::models::ggml_asr_executor::GgmlAsrExecutionError;
 use crate::models::thread_local_runtime_cache::PackContentKey;
 
 use super::decoder::XasrDecoder;
 use super::encoder_graph::{
-    XasrEncoderChunkState, XasrEncoderFeatureInput, XasrZipformerEncoderGraph,
+    XasrEncoderChunkState, XasrEncoderFeatureInput, XasrEncoderGraphError,
+    XasrZipformerEncoderGraph,
 };
 use super::encoder_weights::load_xasr_encoder_weights;
 use super::frontend::{XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES, XasrFbankFeatures, XasrFbankFrontend};
@@ -32,11 +36,73 @@ const XASR_PROFILE_ENV: &str = "OPENASR_XASR_PROFILE";
 const MAX_IDLE_RUNTIMES_PER_KEY: usize = 2;
 
 /// Pool key: pack content id + the backend the runtime's prepared encoder
-/// graph was built for. CPU and Metal runtimes must never conflate -- a
-/// checkout for an accelerated session must not receive a CPU-frozen runtime
-/// (or vice versa). The content id ([`PackContentKey::for_runtime_source`])
-/// keeps an in-place pack replacement at the same path from checking out a
-/// runtime built from the old bytes.
+#[derive(Debug)]
+pub(super) enum XasrChunkDecodeError {
+    Encoder(XasrEncoderGraphError),
+    Other(String),
+}
+
+impl std::fmt::Display for XasrChunkDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encoder(error) => error.fmt(formatter),
+            Self::Other(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for XasrChunkDecodeError {}
+
+impl From<String> for XasrChunkDecodeError {
+    fn from(reason: String) -> Self {
+        Self::Other(reason)
+    }
+}
+
+impl XasrChunkDecodeError {
+    pub(super) fn into_execution_error(
+        self,
+        executor_id: &'static str,
+        adapter_id: &'static str,
+    ) -> GgmlAsrExecutionError {
+        if let Self::Encoder(XasrEncoderGraphError::Ggml { source, .. }) = &self {
+            match source {
+                GgmlCpuGraphError::ContextAllocationFailed {
+                    stage,
+                    requested_bytes,
+                } => {
+                    return GgmlAsrExecutionError::ContextAllocationFailed {
+                        stage,
+                        requested_bytes: *requested_bytes,
+                    };
+                }
+                GgmlCpuGraphError::HostAllocationFailed {
+                    stage,
+                    requested_bytes,
+                } => {
+                    return GgmlAsrExecutionError::HostAllocationFailed {
+                        stage,
+                        requested_bytes: *requested_bytes,
+                    };
+                }
+                GgmlCpuGraphError::BackendBufferAllocationFailed { backend } => {
+                    return GgmlAsrExecutionError::BackendBufferAllocationFailed {
+                        backend: backend.clone(),
+                    };
+                }
+                _ => {}
+            }
+        }
+        GgmlAsrExecutionError::executor_failed(executor_id, adapter_id, self.to_string())
+    }
+}
+
+/// Pool key: pack content id + the
+/// backend the runtime's prepared encoder graph was built for. CPU and Metal
+/// runtimes must never conflate -- a checkout for an accelerated session must
+/// not receive a CPU-frozen runtime (or vice versa). The content id
+/// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack replacement at the
+/// same path from checking out a runtime built from the old bytes.
 type RuntimePoolKey = (PackContentKey, GgmlCpuGraphBackend);
 type RuntimePool = HashMap<RuntimePoolKey, Vec<SendableRuntime>>;
 
@@ -307,7 +373,8 @@ impl XasrZipformerPreparedRuntime {
         );
 
         let mut state = self.new_decode_state();
-        self.decode_available_chunks(&mut state, &features, true)?;
+        self.decode_available_chunks(&mut state, &features, true)
+            .map_err(|error| error.to_string())?;
         let text = self.decode_text(state.emitted_token_ids())?;
         xasr_profile_log(
             "decode_total",
@@ -359,7 +426,7 @@ impl XasrZipformerPreparedRuntime {
         state: &mut XasrChunkedDecodeState,
         features: &XasrFbankFeatures,
         final_flush: bool,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, XasrChunkDecodeError> {
         let chunk_hop = self.metadata.decode_chunk_len;
         let chunk_input_frames = chunk_hop
             .checked_add(XASR_ZIPFORMER_STREAMING_WARMUP_FRAMES)
@@ -406,7 +473,7 @@ impl XasrZipformerPreparedRuntime {
             let chunk = self
                 .encoder
                 .encode_streaming_chunk_from_features(&input, state.encoder_state.as_ref())
-                .map_err(|e| e.to_string())?;
+                .map_err(XasrChunkDecodeError::Encoder)?;
             xasr_profile_log(
                 "encoder_chunk",
                 chunk_profile,
@@ -693,6 +760,26 @@ mod tests {
         let rows = feature_chunk_rows(&features, 1, 2, 4).expect("chunk rows");
 
         assert_eq!(rows, vec![3.0, 4.0, 5.0, 6.0, 5.0, 6.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn scheduler_pool_failure_stays_typed_for_streaming_boundary() {
+        let error = XasrChunkDecodeError::Encoder(XasrEncoderGraphError::Ggml {
+            stage: "full_encoder_runner_init",
+            source: GgmlCpuGraphError::HostAllocationFailed {
+                stage: "backend_scheduler_pool",
+                requested_bytes: 1_323_848_192,
+            },
+        })
+        .into_execution_error("xasr.streaming", "xasr");
+
+        assert!(matches!(
+            error,
+            GgmlAsrExecutionError::HostAllocationFailed {
+                stage: "backend_scheduler_pool",
+                requested_bytes: 1_323_848_192,
+            }
+        ));
     }
 
     #[test]

@@ -27,7 +27,7 @@ pub use backend::{
 pub(crate) use backend::{
     accelerated_device_rank, ensure_backends_loaded, preferred_accelerated_device,
 };
-pub(crate) use context::{GgmlCallerOwnedContext, GgmlContextAllocationError};
+pub(crate) use context::{AlignedAllocation, GgmlCallerOwnedContext, GgmlContextAllocationError};
 pub use cpu_graph::{
     AutoGpuPolicy, GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, RequestBackendOverrideGuard,

@@ -4,6 +4,7 @@
 //! numeric drift.
 
 use std::{
+    alloc::{Layout, alloc},
     cell::RefCell,
     collections::{HashMap, HashSet},
     ffi::{CStr, CString, c_int, c_void},
@@ -19,9 +20,9 @@ use thiserror::Error;
 
 use super::ffi;
 use super::{
-    GgmlBackendKind, GgmlCallerOwnedContext, GgmlContextAllocationError, GgmlRuntimeError,
-    GgmlRuntimeSource, GgufTensorDataReader, GgufWeightTensorPayload, ensure_backends_loaded,
-    ggml_available_devices,
+    AlignedAllocation, GgmlBackendKind, GgmlCallerOwnedContext, GgmlContextAllocationError,
+    GgmlRuntimeError, GgmlRuntimeSource, GgufTensorDataReader, GgufWeightTensorPayload,
+    ensure_backends_loaded, ggml_available_devices,
 };
 use crate::device::execution_route::{
     ExecutionProvider, ExecutionRouteCacheKey, ExecutionRouteError, ExecutionRouteRequest,
@@ -5515,8 +5516,11 @@ struct GgmlCachedBackendGuard {
     raw: NonNull<c_void>,
 }
 
+#[derive(Debug)]
 struct GgmlBackendSchedulerGuard {
     raw: NonNull<c_void>,
+    _context_storage: AlignedAllocation,
+    _pool_storage: AlignedAllocation,
 }
 
 /// GPU-class backends are expensive to initialize (device enumeration + driver
@@ -6157,22 +6161,78 @@ impl GgmlBackendSchedulerGuard {
         backends: &mut [ffi::GgmlBackendRaw],
         graph_size: usize,
     ) -> Result<Self, GgmlCpuGraphError> {
+        Self::new_with_allocator(backends, graph_size, |layout| unsafe { alloc(layout) })
+    }
+
+    fn new_with_allocator(
+        backends: &mut [ffi::GgmlBackendRaw],
+        graph_size: usize,
+        mut allocate: impl FnMut(Layout) -> *mut u8,
+    ) -> Result<Self, GgmlCpuGraphError> {
         let n_backends =
             c_int::try_from(backends.len()).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
                 reason: "backend scheduler backend count exceeds ggml int boundary",
             })?;
+        let context_bytes = unsafe { ffi::ggml_context_size() };
+        let pool_bytes = unsafe { ffi::ggml_backend_sched_context_buffer_size(graph_size) };
+        if pool_bytes == 0 {
+            return Err(GgmlCpuGraphError::ContextInvalidLayout {
+                stage: "backend_scheduler_pool",
+                requested_bytes: graph_size,
+            });
+        }
+        let map_storage_error = |error| match error {
+            GgmlContextAllocationError::AllocationFailed {
+                stage,
+                requested_bytes,
+            } => GgmlCpuGraphError::HostAllocationFailed {
+                stage,
+                requested_bytes,
+            },
+            GgmlContextAllocationError::InvalidLayout {
+                stage,
+                requested_bytes,
+            } => GgmlCpuGraphError::ContextInvalidLayout {
+                stage,
+                requested_bytes,
+            },
+            GgmlContextAllocationError::InitializationFailed { requested_bytes } => {
+                GgmlCpuGraphError::ContextInitFailed {
+                    context_bytes: requested_bytes,
+                }
+            }
+        };
+        let context_storage = AlignedAllocation::new_with_allocator(
+            "backend_scheduler_context",
+            context_bytes,
+            |layout| allocate(layout),
+        )
+        .map_err(map_storage_error)?;
+        let pool_storage =
+            AlignedAllocation::new_with_allocator("backend_scheduler_pool", pool_bytes, |layout| {
+                allocate(layout)
+            })
+            .map_err(map_storage_error)?;
         let raw = unsafe {
-            ffi::ggml_backend_sched_new(
+            ffi::ggml_backend_sched_try_new(
                 backends.as_mut_ptr(),
                 ptr::null_mut(),
                 n_backends,
                 graph_size,
                 false,
                 true,
+                pool_storage.as_mut_ptr(),
+                pool_bytes,
+                context_storage.as_mut_ptr(),
+                context_bytes,
             )
         };
         NonNull::new(raw)
-            .map(|raw| Self { raw })
+            .map(|raw| Self {
+                raw,
+                _context_storage: context_storage,
+                _pool_storage: pool_storage,
+            })
             .ok_or(GgmlCpuGraphError::BackendSchedulerInitFailed)
     }
 }
@@ -6378,16 +6438,20 @@ unsafe fn write_tensor_data(
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::alloc;
+    use std::ffi::c_void;
+    use std::ptr::{self, NonNull};
+
     use crate::ggml_runtime::{
         GgufTensorMetadata, GgufWeightTensorElementType, GgufWeightTensorPayload, ffi,
     };
     use crate::nn::half::f32_to_f16_bits as f32_to_f16_bits_for_test;
 
     use super::{
-        AutoGpuPolicy, GPU_PROBE_NEGATIVE_TTL, GgmlCpuBinaryOp, GgmlCpuGraphBackend,
-        GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy, GgmlCpuGraphError,
-        GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlRopeExtParams, GpuProbeCache,
-        GpuProbeOutcome, GpuProbeState, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
+        AutoGpuPolicy, GPU_PROBE_NEGATIVE_TTL, GgmlBackendSchedulerGuard, GgmlCpuBinaryOp,
+        GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy,
+        GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlRopeExtParams,
+        GpuProbeCache, GpuProbeOutcome, GpuProbeState, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
         flash_attn_ext_head_dim_supported_on_backend, gpu_probe_failed_log_message,
         gpu_probe_log_message, runtime_gpu_is_available,
     };
@@ -6932,6 +6996,34 @@ mod tests {
             .expect_err("scheduler cancel=true must fail closed");
         assert!(matches!(err, GgmlCpuGraphError::Aborted), "got {err:?}");
         assert!(crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&flag, previous));
+    }
+
+    #[test]
+    fn scheduler_pool_failure_is_typed_without_attempting_real_oom() {
+        let graph_size = 65_536;
+        let requested_bytes = unsafe { ffi::ggml_backend_sched_context_buffer_size(graph_size) };
+        assert!(requested_bytes > 1024 * 1024 * 1024);
+
+        let mut backends = [NonNull::<u8>::dangling().as_ptr().cast::<c_void>()];
+        let mut calls = 0;
+        let error =
+            GgmlBackendSchedulerGuard::new_with_allocator(&mut backends, graph_size, |layout| {
+                calls += 1;
+                if calls == 1 {
+                    unsafe { alloc(layout) }
+                } else {
+                    ptr::null_mut()
+                }
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            GgmlCpuGraphError::HostAllocationFailed {
+                stage: "backend_scheduler_pool",
+                requested_bytes,
+            }
+        );
     }
 
     #[test]

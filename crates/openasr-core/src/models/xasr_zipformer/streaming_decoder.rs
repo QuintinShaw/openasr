@@ -139,9 +139,7 @@ impl XasrIncrementalDecoder {
         let new_tokens = self
             .runtime
             .decode_available_chunks(&mut self.decode_state, &self.features, final_flush)
-            .map_err(|error| {
-                GgmlAsrExecutionError::executor_failed(executor_id, adapter_id, error)
-            })?;
+            .map_err(|error| error.into_execution_error(executor_id, adapter_id))?;
         self.drain_consumed_prefix();
         if new_tokens == 0 {
             return Ok(String::new());
