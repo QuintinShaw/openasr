@@ -2,8 +2,8 @@
 //! joint encoder projection) -> host TDT greedy decode -> detokenize.
 
 use std::cell::RefCell;
-use std::path::Path;
 
+use crate::GgmlRuntimeSource;
 use crate::api::backend::WordTimestamp;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::ggml_asr_executor::{
@@ -57,18 +57,22 @@ pub(crate) struct ParakeetTdtTranscription {
 }
 
 fn build_parakeet_tdt_prepared_runtime(
-    pack_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
 ) -> Result<ParakeetTdtPreparedRuntime, String> {
-    let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(pack_path)
+    // `from_runtime_source` reads tensor data from `runtime_source`'s
+    // already-open mapping -- this used to reopen `pack_path` a second time
+    // via `from_path`, racing the earlier preflight open that produced
+    // `runtime_source`.
+    let reader = crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(runtime_source)
         .map_err(|e| e.to_string())?;
-    let gguf_metadata =
-        crate::ggml_runtime::read_gguf_metadata(pack_path).map_err(|e| e.to_string())?;
+    let gguf_metadata = crate::ggml_runtime::read_gguf_metadata_from_runtime_source(runtime_source)
+        .map_err(|e| e.to_string())?;
     let metadata =
         parse_parakeet_tdt_execution_metadata(&gguf_metadata).map_err(|e| e.to_string())?;
     let tokenizer = ParakeetTdtTokenizer::from_metadata(&gguf_metadata)?;
     let weights =
         load_parakeet_tdt_encoder_weights(&reader, &metadata).map_err(|e| e.to_string())?;
-    let graph = ParakeetTdtEncoderGraph::new(&weights, metadata, Some(pack_path))
+    let graph = ParakeetTdtEncoderGraph::new(&weights, metadata, Some(runtime_source.path()))
         .map_err(|e| e.to_string())?;
     let predictor_weights =
         load_parakeet_tdt_predictor_weights(&reader, &metadata).map_err(|e| e.to_string())?;
@@ -139,16 +143,16 @@ impl ParakeetTdtPreparedRuntime {
 /// old bytes.
 pub(crate) fn transcribe_parakeet_tdt_pcm_cached(
     samples: &[f32],
-    pack_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     word_timestamps: bool,
 ) -> Result<ParakeetTdtTranscription, String> {
     let backend = parakeet_tdt_encoder_graph_config().backend;
-    let key = (runtime_cache_path_identity(pack_path), backend);
+    let key = (runtime_cache_path_identity(runtime_source.path()), backend);
     with_thread_local_cached_mut_by_key(
         &PARAKEET_TDT_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_parakeet_tdt_prepared_runtime(pack_path),
+        || build_parakeet_tdt_prepared_runtime(runtime_source),
         |runtime| runtime.transcribe(samples, word_timestamps),
     )
 }
@@ -183,13 +187,15 @@ impl GgmlAsrExecutor for ParakeetTdtGgmlExecutor {
             reason,
         };
         // Fail-closed: validate the runtime source path before touching the
-        // pack (Gate-0 preflight), then run the cached prepared-runtime path.
-        request
+        // pack (Gate-0 preflight), then run the cached prepared-runtime path
+        // against that same already-open source -- not a fresh reopen by
+        // path, which would race this preflight's own open.
+        let preflight = request
             .resolve_runtime_source_preflight()
             .map_err(|error| fail(error.to_string()))?;
         let output = transcribe_parakeet_tdt_pcm_cached(
             &request.prepared_audio.samples_f32,
-            &request.runtime_source_path,
+            &preflight.runtime_source,
             request.request_options.word_timestamps,
         )
         .map_err(fail)?;
@@ -289,7 +295,10 @@ mod tests {
             return;
         }
         let samples = read_wav_mono_16k(&clip).expect("wav");
-        let output = transcribe_parakeet_tdt_pcm_cached(&samples, &pack, true).expect("transcribe");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("validate runtime source");
+        let output = transcribe_parakeet_tdt_pcm_cached(&samples, &runtime_source, true)
+            .expect("transcribe");
         eprintln!("parakeet-tdt hypothesis: {:?}", output.text);
         eprintln!("parakeet-tdt words: {:?}", output.words);
         let lowered = output.text.to_lowercase();

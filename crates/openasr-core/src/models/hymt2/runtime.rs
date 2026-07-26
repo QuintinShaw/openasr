@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -300,7 +300,13 @@ impl Hymt2Runtime {
 
         let tokenizer = Hymt2Tokenizer::from_gguf_metadata(&metadata)
             .map_err(|source| Hymt2RuntimeError::Tokenizer { source })?;
-        let reader = GgufTensorDataReader::from_tensor_index_shared(Arc::new(tensor_index))
+        // `from_runtime_source` (not `from_tensor_index_shared`) so tensor
+        // data reads from `runtime_source`'s already-open mapping instead of
+        // re-opening its path -- `runtime_source` was already validated and
+        // opened above (`tensor_index` was only needed for the tensor
+        // contract check above; the reader re-derives its own equivalent
+        // index from the same open mapping).
+        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source)
             .map_err(|source| Hymt2RuntimeError::TensorReader { source })?;
         let qwen_metadata = hymt2_metadata.qwen_llm_metadata();
         let token_embedding_table =

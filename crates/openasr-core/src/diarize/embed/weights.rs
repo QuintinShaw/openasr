@@ -134,8 +134,15 @@ impl Weights {
     /// or read. Quantized tensors are dequantized here into that same logical
     /// f32 order.
     pub(crate) fn from_oasr(path: &Path) -> Result<Self, WeightsError> {
-        let reader =
-            GgufTensorDataReader::from_path(path).map_err(|e| WeightsError::Gguf(e.to_string()))?;
+        // Explicit validate + `from_runtime_source` (equivalent to
+        // `from_path`, which does exactly this internally) so the open
+        // mapping identity/bytes contract is visible at this call site too;
+        // this loader is the sole opener of this pack (no earlier admission
+        // step to reuse), so there is no reopen race here either way.
+        let runtime_source = crate::ggml_runtime::validate_ggml_runtime_source_path(path)
+            .map_err(|e| WeightsError::Gguf(e.to_string()))?;
+        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source)
+            .map_err(|e| WeightsError::Gguf(e.to_string()))?;
         let mut tensors = BTreeMap::new();
         for metadata in reader.tensor_index().tensors() {
             let shape: Vec<usize> = metadata
