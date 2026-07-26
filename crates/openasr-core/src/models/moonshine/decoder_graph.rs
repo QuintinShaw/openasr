@@ -447,9 +447,7 @@ pub(crate) struct MoonshineDecoderGraphRuntime {
 /// and metadata it decodes, the encoder frame count its cross-KV cache is
 /// sized against, and the backend this request resolved to. Grouped because
 /// they always travel together into [`MoonshineDecoderGraphRuntime::new`]
-/// from a single call site, and because a future field (the runtime
-/// source's content identity) can land in this same trio rather than
-/// another positional parameter.
+/// from a single call site.
 pub(crate) struct MoonshineDecoderRuntimeInput<'a> {
     pub(crate) decoder_weights: &'a MoonshineDecoderWeights,
     pub(crate) metadata: MoonshineExecutionMetadata,
