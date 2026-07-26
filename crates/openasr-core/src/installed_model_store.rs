@@ -318,7 +318,9 @@ fn real_path_under(root: &Path, relative: PathBuf) -> bool {
     false
 }
 
-fn validate_legacy_record(pack: &InstalledPack, quant_dir: &Path) -> Result<(), String> {
+/// Shared with the pull path's legacy-record migration: only a record that this
+/// reader would accept is eligible to be re-admitted into the content store.
+pub(crate) fn validate_legacy_record(pack: &InstalledPack, quant_dir: &Path) -> Result<(), String> {
     validate_safe_relative_path("model id", &pack.model_id)?;
     validate_safe_relative_path("quant", &pack.quant)?;
     validate_safe_relative_path("filename", &pack.filename)?;
