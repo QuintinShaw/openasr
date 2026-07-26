@@ -113,6 +113,7 @@ mod tests {
                     language: None,
                 },
                 carry_context: None,
+                decode_truncated_at_seconds: None,
             })
         }
     }

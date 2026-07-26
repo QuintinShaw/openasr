@@ -421,6 +421,7 @@ impl CohereTranscribeGgmlExecutor {
                 prompt_text: None,
                 prompt_token_ids: Some(prompt_token_ids),
             }),
+            decode_truncated_at_seconds: None,
         })
     }
 

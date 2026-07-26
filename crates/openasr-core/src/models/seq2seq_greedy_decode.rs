@@ -112,12 +112,45 @@ pub(crate) struct Seq2SeqGreedyStepSelection {
     pub probability: f32,
 }
 
+/// Why a greedy decode stopped.
+///
+/// The two are not interchangeable and a family must be able to tell them
+/// apart: one means the model said it was finished, the other means the driver
+/// cut it off and everything the audio contained past that point is simply
+/// missing from the transcript. Reporting the second as the first is what lets
+/// a family's end-of-stream handling (which assumes "no more text" means "no
+/// more speech") stretch its last segment over audio the decode never saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Seq2SeqGreedyDecodeStopReason {
+    /// The model emitted its own stop token. The transcript is as complete as
+    /// this model can make it.
+    StopToken,
+    /// The degenerate-repeat guard ended the decode and dropped the looping
+    /// tail. The transcript covers the audio only up to wherever the loop
+    /// began; the rest was never transcribed.
+    DegenerateRepeatGuard,
+    /// The generation budget ran out before any stop token. The driver itself
+    /// fails closed on this (`EotNotReachedBeforeMaxTokens`); a family that
+    /// deliberately salvages the generated prefix instead of erroring builds
+    /// its result with this reason, so "we kept a partial" stays visible rather
+    /// than being laundered into a normal completion.
+    BudgetExhausted,
+}
+
+impl Seq2SeqGreedyDecodeStopReason {
+    /// Whether the transcript stops short of the audio it was given.
+    pub fn is_truncated(self) -> bool {
+        !matches!(self, Self::StopToken)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Seq2SeqGreedyDecodeResult {
     pub generated_tokens: Vec<u32>,
     /// Per-token softmax probability, parallel to `generated_tokens`.
     pub generated_probabilities: Vec<f32>,
     pub text: String,
+    pub stop_reason: Seq2SeqGreedyDecodeStopReason,
 }
 
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -225,6 +258,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_with_adapter_v0<E>(
         generated_tokens: output.generated_tokens,
         generated_probabilities: output.generated_probabilities,
         text: normalize_text(output.text),
+        stop_reason: output.stop_reason,
     })
 }
 
@@ -260,7 +294,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
     let stop_token_ids = build_seq2seq_greedy_stop_token_ids(config);
     let mut generated = Vec::new();
     let mut generated_probabilities = Vec::new();
-    let mut reached_eot = false;
+    let mut stop_reason: Option<Seq2SeqGreedyDecodeStopReason> = None;
 
     for step_index in 0..config.max_generated_tokens {
         // L1 cooperative cancel: poll the request's control before each
@@ -288,7 +322,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
         trace_token(step_index, selection.token_id, selection.reached_eot);
         report_token_step_progress(step_index, config.max_generated_tokens);
         if selection.reached_eot {
-            reached_eot = true;
+            stop_reason = Some(Seq2SeqGreedyDecodeStopReason::StopToken);
             break;
         }
         generated.push(selection.token_id);
@@ -314,24 +348,28 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
             );
             generated.truncate(loop_hit.keep_len);
             generated_probabilities.truncate(loop_hit.keep_len);
-            reached_eot = true;
+            // Reported as its own stop reason, never as a stop token: the
+            // decode ends here, but the audio past the loop was never
+            // transcribed and callers must be able to see that.
+            stop_reason = Some(Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard);
             break;
         }
     }
 
-    if !reached_eot {
+    let Some(stop_reason) = stop_reason else {
         return Err(Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {
             max_generated_tokens: config.max_generated_tokens,
             generated_tokens: generated,
             generated_probabilities,
         });
-    }
+    };
 
     let text = token_decoder.decode_text_token_ids(&generated)?;
     Ok(Seq2SeqGreedyDecodeResult {
         generated_tokens: generated,
         generated_probabilities,
         text,
+        stop_reason,
     })
 }
 
@@ -649,6 +687,53 @@ mod tests {
         assert_eq!(output.generated_tokens, vec![1, 2]);
         assert_eq!(output.text, "hello");
         assert_eq!(step_executor.logits_calls, 3);
+        assert_eq!(output.stop_reason, Seq2SeqGreedyDecodeStopReason::StopToken);
+        assert!(!output.stop_reason.is_truncated());
+    }
+
+    /// A decode the guard cut short must not report itself as a normal
+    /// completion. Families use this to decide what an unterminated tail means:
+    /// mistaking "we stopped it" for "the model finished" is what lets a family
+    /// stretch its final segment across audio the decode never transcribed.
+    #[test]
+    fn a_guard_stopped_decode_reports_truncation_not_a_stop_token() {
+        let mut step_executor = SyntheticStepExecutor {
+            vocab_size: 16,
+            // Never reaches the stop token: stutters until the guard trips.
+            sequence: vec![5, 5, 5, 5, 5, 5],
+            logits_calls: 0,
+        };
+        let token_decoder = SyntheticTokenDecoder {
+            table: BTreeMap::from([(5, "gu")]),
+        };
+        let config = Seq2SeqGreedyDecodeConfig {
+            initial_prompt_tokens: vec![42],
+            eot_token_id: 7,
+            stop_token_ids: Vec::new(),
+            vocab_size: 16,
+            max_generated_tokens: 6,
+            suppress_first_step_token_ids: Vec::new(),
+            suppress_token_ids: Vec::new(),
+            phrase_biases: Vec::new(),
+        };
+        let mut no_token_trace = |_: usize, _: u32, _: bool| {};
+        let mut no_topk_trace = |_: usize, _: &[f32]| {};
+
+        let output = run_seq2seq_greedy_decode_loop_v0(
+            &config,
+            &mut step_executor,
+            &token_decoder,
+            &mut no_token_trace,
+            &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            output.stop_reason,
+            Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard
+        );
+        assert!(output.stop_reason.is_truncated());
     }
 
     #[test]

@@ -18,7 +18,8 @@ use crate::models::decode_policy_component_registry::{
 };
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
-    Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyTokenDecoder,
+    Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
+    Seq2SeqGreedyDecodeStopReason, Seq2SeqGreedyTokenDecoder,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::thread_local_runtime_cache::{
@@ -239,6 +240,7 @@ fn run_moonshine_decoder_short_form_with_runtime(
                 })?,
             generated_tokens,
             generated_probabilities,
+            stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
         },
         // Preserve the stable cancel marker so native/server boundaries can
         // rewrite to `BackendError::TranscriptionCanceled`.
