@@ -649,9 +649,23 @@ pub(crate) enum ConfigCommand {
 #[derive(Debug, Subcommand)]
 pub(crate) enum ModelPackCommand {
     /// Build a local runtime pack (`.oasr`) from model source weights.
+    ///
+    /// Boxed: `ImportCommand` carries every family's import arguments and dwarfs
+    /// the store-maintenance variants beside it.
     Import {
         #[command(subcommand)]
-        command: ImportCommand,
+        command: Box<ImportCommand>,
+    },
+    /// Re-hash every installed pack and report any that is missing or corrupt.
+    Verify,
+    /// Show where model-pack storage space has gone and how much is reclaimable.
+    Usage,
+    /// Reclaim abandoned model-pack storage (unreferenced content and dead
+    /// installer scratch files). Installed models are never touched.
+    Gc {
+        /// Report what would be reclaimed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

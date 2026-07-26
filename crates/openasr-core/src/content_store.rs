@@ -1,3 +1,38 @@
+//! The immutable object half of the model store: `<models>/objects/sha256/`.
+//!
+//! An object is written once, named by the SHA-256 of its own bytes, and never
+//! modified. Refs under `<models>/refs/` point at objects; this module owns
+//! everything about the objects themselves.
+//!
+//! # Integrity chain
+//!
+//! Content addressing rests on "the path is the checksum". Three things keep
+//! that true, and they are meant to be read together -- weakening any one of
+//! them shifts load onto the others:
+//!
+//! 1. **The digest is established once, on the bytes actually written.**
+//!    [`admit_file`] hashes its own private staging copy while holding the sole
+//!    descriptor to it, and the caller's preflight runs against that same
+//!    descriptor. A source file mutated mid-admission cannot change what was
+//!    admitted. Above this module, install additionally checks the digest
+//!    against the signed catalog before anything is admitted at all.
+//! 2. **The object is sealed read-only once it lands** ([`seal_object`]).
+//!    This is what makes step 1's answer keep holding: the bytes behind a digest
+//!    cannot be edited in place afterwards, so a later reader does not have to
+//!    re-derive what is already known. **If this seal is ever removed, the
+//!    per-load check in [`open_declared_lease`] is no longer sufficient and the
+//!    load path has to go back to re-hashing.**
+//! 3. **Full verification stays available and is used where it decides
+//!    something.** [`open_verified_lease`] re-hashes, and every caller that
+//!    would otherwise destroy or skip another copy of the content uses it;
+//!    `openasr model-pack verify` re-hashes the whole store on demand.
+//!
+//! What deliberately does *not* happen is re-hashing on every load. Reading a
+//! multi-gigabyte pack again on each model switch costs real startup latency,
+//! and the only thing it would catch is someone who defeated the seal by hand
+//! inside their own home directory -- who could equally rewrite the ref beside
+//! it. [`open_declared_lease`] therefore checks structure and length only.
+
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -125,8 +160,78 @@ impl AdmittedContent {
     }
 }
 
+/// Every in-flight write lands here first, one level *beside* `objects/` rather
+/// than inside it. Keeping transient bytes out of the content namespace is what
+/// lets garbage collection treat `objects/sha256/*` as "digest names only", with
+/// no special-casing of transaction prefixes.
+pub(crate) const STAGING_DIR_NAME: &str = "staging";
+
+/// Prefix for the private staging file one `admit_file` call owns end to end.
+///
+/// The name carries the creating pid because that admission is *not* resumable:
+/// nothing but the process that started it can ever finish it, so once that pid
+/// is gone the bytes are unconditionally garbage. Download partials share this
+/// directory but are deliberately resumable across processes, hence the distinct
+/// prefix -- collection must be able to tell the two apart by name alone.
+pub(crate) const ADMIT_STAGING_PREFIX: &str = "admit-";
+pub(crate) const ADMIT_STAGING_SUFFIX: &str = ".tmp";
+
+/// Owning pid of an `admit_file` staging entry, or `None` for anything else in
+/// the staging directory (download partials, locks, foreign files).
+pub(crate) fn admit_staging_owner_pid(file_name: &str) -> Option<u32> {
+    file_name
+        .strip_prefix(ADMIT_STAGING_PREFIX)?
+        .strip_suffix(ADMIT_STAGING_SUFFIX)?
+        .split_once('-')
+        .and_then(|(pid, _nonce)| pid.parse::<u32>().ok())
+}
+
 pub(crate) fn objects_root(models_root: &Path) -> PathBuf {
     models_root.join("objects").join("sha256")
+}
+
+/// Make a landed object read-only.
+///
+/// Content addressing rests entirely on "the path is the checksum". An
+/// accidental in-place rewrite would break that premise *silently*: every later
+/// dedup, ref, and size check would keep trusting a digest the bytes no longer
+/// have. Sealing costs one `chmod` and removes the whole class.
+///
+/// Removal is unaffected on Unix (unlink is governed by the parent directory),
+/// and `unseal_object_for_removal` clears the bit where it is not.
+fn seal_object(path: &Path) -> Result<(), ContentStoreError> {
+    let mut permissions = fs::metadata(path)
+        .map_err(|source| ContentStoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o444);
+    }
+    #[cfg(not(unix))]
+    {
+        permissions.set_readonly(true);
+    }
+    fs::set_permissions(path, permissions).map_err(|source| ContentStoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Windows refuses to unlink a read-only file, so collection has to clear the
+/// bit first. On Unix this is a no-op: the seal never blocked unlink there.
+fn unseal_object_for_removal(path: &Path) {
+    #[cfg(not(unix))]
+    if let Ok(metadata) = fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(path, permissions);
+    }
+    #[cfg(unix)]
+    let _ = path;
 }
 
 /// Layout of one immutable object: `<models>/objects/sha256/<digest>/content`.
@@ -138,21 +243,75 @@ pub(crate) fn object_path(models_root: &Path, digest: &str) -> Result<PathBuf, C
     Ok(objects_root(models_root).join(digest).join("content"))
 }
 
-/// Open, map, and hash exactly one immutable object descriptor.
-pub(crate) fn open_lease(
+/// Open and map one immutable object, re-hashing its bytes.
+///
+/// Use this wherever the answer authorizes destroying or skipping some *other*
+/// copy of the same content -- adopting an existing object instead of the bytes
+/// just staged, dropping a legacy pack because an object already holds it, or an
+/// explicit `verify`. In those places the digest is a claim being tested, and
+/// paying a full read is the entire point.
+///
+/// For simply loading an installed pack use [`open_declared_lease`]: re-reading
+/// a gigabyte on every model switch buys nothing the admission-time check and
+/// the read-only seal have not already established.
+pub(crate) fn open_verified_lease(
     models_root: &Path,
     digest: &str,
 ) -> Result<ContentLease, ContentStoreError> {
+    let (path, lease) = open_object(models_root, digest)?;
+    if lease.sha256() != digest {
+        return Err(ContentStoreError::SourceChanged { path });
+    }
+    Ok(lease)
+}
+
+/// Open and map one immutable object for use, checking only that it is the
+/// regular file of the expected length that its ref describes.
+///
+/// `size_bytes` comes from the ref, which is the store's own record of what it
+/// admitted. The digest is *not* recomputed here on purpose -- see the module
+/// documentation's integrity chain for what stands behind it.
+pub(crate) fn open_declared_lease(
+    models_root: &Path,
+    digest: &str,
+    size_bytes: u64,
+) -> Result<ContentLease, ContentStoreError> {
+    let (path, lease) = open_object(models_root, digest)?;
+    if lease.bytes().len() as u64 != size_bytes {
+        return Err(ContentStoreError::SourceChanged { path });
+    }
+    Ok(lease)
+}
+
+/// Shared open+map, with the structural checks both entry points need.
+///
+/// The regular-file check is made against the *descriptor*, not the path, so a
+/// pathname swapped between the open and the check cannot change what was
+/// actually mapped.
+fn open_object(
+    models_root: &Path,
+    digest: &str,
+) -> Result<(PathBuf, ContentLease), ContentStoreError> {
     let path = object_path(models_root, digest)?;
     let file = File::open(&path).map_err(|source| ContentStoreError::Io {
         path: path.clone(),
         source,
     })?;
-    let lease = ContentLease::from_file(digest.to_string(), path.clone(), file)?;
-    if lease.sha256() != digest {
-        return Err(ContentStoreError::SourceChanged { path });
+    let metadata = file.metadata().map_err(|source| ContentStoreError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(ContentStoreError::Io {
+            path: path.clone(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "content-addressed object is not a regular file",
+            ),
+        });
     }
-    Ok(lease)
+    let lease = ContentLease::from_file(digest.to_string(), path.clone(), file)?;
+    Ok((path, lease))
 }
 
 /// Copy one opened source descriptor into a private staging file, fsync it,
@@ -191,12 +350,15 @@ pub(crate) fn admit_file(
         });
     }
 
-    let staging_dir = models_root.join("staging");
+    let staging_dir = models_root.join(STAGING_DIR_NAME);
     fs::create_dir_all(&staging_dir).map_err(|source| ContentStoreError::Io {
         path: staging_dir.clone(),
         source,
     })?;
-    let staging = staging_dir.join(format!("{}.partial", unique_suffix()));
+    let staging = staging_dir.join(format!(
+        "{ADMIT_STAGING_PREFIX}{}{ADMIT_STAGING_SUFFIX}",
+        unique_suffix()
+    ));
     let result = (|| {
         // Read+write keeps the sole staging descriptor open through copy, sync,
         // mapping, hashing, and preflight. There is no pathname reopen in that chain.
@@ -273,16 +435,20 @@ pub(crate) fn admit_file(
         let lease = match fs::hard_link(&staging, &object) {
             Ok(()) => {
                 atomic_file::sync_parent_dir_best_effort(&object);
+                // Drop the staging name before sealing: it shares the inode with
+                // the object, and a read-only staging entry is needlessly awkward
+                // to unlink on the platforms that enforce the bit.
                 fs::remove_file(&staging).map_err(|source| ContentStoreError::Io {
                     path: staging.clone(),
                     source,
                 })?;
+                seal_object(&object)?;
                 lease.with_path(object.clone())
             }
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
                 // A digest name is not evidence. Revalidate the existing object's
                 // descriptor and contract before reusing it; never replace it.
-                let existing = open_lease(models_root, &digest)?;
+                let existing = open_verified_lease(models_root, &digest)?;
                 if existing.bytes().len() as u64 != size || existing.sha256() != digest {
                     return Err(ContentStoreError::ObjectCollision { path: object });
                 }
@@ -297,10 +463,11 @@ pub(crate) fn admit_file(
             Err(_) => match fs::rename(&staging, &object) {
                 Ok(()) => {
                     atomic_file::sync_parent_dir_best_effort(&object);
+                    seal_object(&object)?;
                     lease.with_path(object.clone())
                 }
                 Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-                    let existing = open_lease(models_root, &digest)?;
+                    let existing = open_verified_lease(models_root, &digest)?;
                     if existing.bytes().len() as u64 != size || existing.sha256() != digest {
                         return Err(ContentStoreError::ObjectCollision { path: object });
                     }
@@ -339,21 +506,118 @@ pub(crate) fn remove_object_if_unreferenced(
     referenced: bool,
 ) -> Result<(), ContentStoreError> {
     if !referenced {
-        let path = object_path(models_root, digest)?;
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                atomic_file::sync_parent_dir_best_effort(&path);
-                // The per-digest directory only ever holds `content`; drop it
-                // once empty so a collected object leaves nothing behind.
-                if let Some(parent) = path.parent() {
-                    let _ = fs::remove_dir(parent);
-                }
-            }
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(ContentStoreError::Io { path, source }),
-        }
+        remove_object(models_root, digest)?;
     }
     Ok(())
+}
+
+/// Unlink one object and its per-digest directory. Returns the bytes reclaimed,
+/// or `0` when the object was already gone.
+pub(crate) fn remove_object(models_root: &Path, digest: &str) -> Result<u64, ContentStoreError> {
+    let path = object_path(models_root, digest)?;
+    let size = fs::symlink_metadata(&path).map(|metadata| metadata.len());
+    unseal_object_for_removal(&path);
+    match fs::remove_file(&path) {
+        Ok(()) => {
+            atomic_file::sync_parent_dir_best_effort(&path);
+            // The per-digest directory only ever holds `content`; drop it
+            // once empty so a collected object leaves nothing behind.
+            if let Some(parent) = path.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+            Ok(size.unwrap_or(0))
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(source) => Err(ContentStoreError::Io { path, source }),
+    }
+}
+
+/// One object present under `objects/sha256/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredObject {
+    pub digest: String,
+    pub size_bytes: u64,
+    /// Last modification of the object's own directory entry, used as the
+    /// "how long has this been here" clock for orphan grace.
+    pub modified: Option<std::time::SystemTime>,
+}
+
+/// Enumerate every well-formed object in the store.
+///
+/// A directory whose name is not a valid digest, or that holds no readable
+/// `content`, is skipped rather than reported: collection must never act on a
+/// path it could not positively identify as an object.
+pub(crate) fn stored_objects(models_root: &Path) -> Result<Vec<StoredObject>, ContentStoreError> {
+    let root = objects_root(models_root);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(ContentStoreError::Io { path: root, source }),
+    };
+    let mut objects = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| ContentStoreError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        let Some(digest) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if validate_digest(&digest).is_err() {
+            continue;
+        }
+        let content = entry.path().join("content");
+        let Ok(metadata) = fs::symlink_metadata(&content) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            continue;
+        }
+        objects.push(StoredObject {
+            digest,
+            size_bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+        });
+    }
+    objects.sort_by(|left, right| left.digest.cmp(&right.digest));
+    Ok(objects)
+}
+
+/// Land an already-durable file as an object by renaming it into place.
+///
+/// This is the migration path: within one filesystem a rename moves no bytes, so
+/// converting a legacy pack costs a verification pass and nothing else. The
+/// caller has already hashed `source_path` and is responsible for it being a
+/// regular file it owns. Returns `false` when the object already existed, in
+/// which case `source_path` is left for the caller to drop.
+pub(crate) fn link_file_as_object(
+    source_path: &Path,
+    models_root: &Path,
+    digest: &str,
+) -> Result<bool, ContentStoreError> {
+    let object = object_path(models_root, digest)?;
+    let parent = object.parent().expect("object path has parent");
+    fs::create_dir_all(parent).map_err(|source| ContentStoreError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    if fs::symlink_metadata(&object).is_ok() {
+        return Ok(false);
+    }
+    match fs::rename(source_path, &object) {
+        Ok(()) => {
+            atomic_file::sync_parent_dir_best_effort(&object);
+            seal_object(&object)?;
+            Ok(true)
+        }
+        // A models root spanning devices (or a legacy tree the user moved onto
+        // another volume) cannot be renamed across; the caller falls back to a
+        // copying admission.
+        Err(source) => Err(ContentStoreError::Io {
+            path: object,
+            source,
+        }),
+    }
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -414,6 +678,22 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), b"GGUF-replacement-pack");
     }
 
+    /// Overwrite a sealed object the way a bug or a stray tool would have to:
+    /// by defeating the seal first. Tests that simulate corruption must not
+    /// silently depend on objects being writable.
+    fn force_overwrite_object(path: &Path, bytes: &[u8]) {
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o644);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn corrupt_existing_digest_object_is_never_replaced() {
         let temp = tempfile::tempdir().unwrap();
@@ -421,10 +701,197 @@ mod tests {
         fs::write(&source, b"GGUF-original-pack").unwrap();
         let root = temp.path().join("models");
         let first = admit_file(&source, &root, |_| Ok(())).unwrap();
-        fs::write(&first.object_path, b"corrupt").unwrap();
+        force_overwrite_object(&first.object_path, b"corrupt");
 
         let error = admit_file(&source, &root, |_| Ok(())).unwrap_err();
         assert!(matches!(error, ContentStoreError::SourceChanged { .. }));
         assert_eq!(fs::read(first.object_path).unwrap(), b"corrupt");
+    }
+
+    #[test]
+    fn admitted_object_is_sealed_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.oasr");
+        fs::write(&source, b"GGUF-sealed-pack").unwrap();
+        let root = temp.path().join("models");
+
+        let admitted = admit_file(&source, &root, |_| Ok(())).unwrap();
+        let permissions = fs::metadata(&admitted.object_path).unwrap().permissions();
+        assert!(permissions.readonly(), "landed object must be read-only");
+        assert!(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&admitted.object_path)
+                .is_err(),
+            "a sealed object must reject being reopened for writing"
+        );
+        // Reading the pack -- the only thing production does with an object --
+        // keeps working through the seal.
+        assert_eq!(
+            fs::read(&admitted.object_path).unwrap(),
+            b"GGUF-sealed-pack"
+        );
+    }
+
+    #[test]
+    fn sealed_object_is_still_collectable() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.oasr");
+        fs::write(&source, b"GGUF-collectable-pack").unwrap();
+        let root = temp.path().join("models");
+        let admitted = admit_file(&source, &root, |_| Ok(())).unwrap();
+        let digest = admitted.digest.clone();
+        let object_path = admitted.object_path.clone();
+        drop(admitted);
+
+        let freed = remove_object(&root, &digest).unwrap();
+        assert_eq!(freed, b"GGUF-collectable-pack".len() as u64);
+        assert!(!object_path.exists());
+        // The per-digest directory goes with it.
+        assert!(!object_path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn admit_staging_names_carry_their_owning_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.oasr");
+        fs::write(&source, b"GGUF-staged-pack").unwrap();
+        let root = temp.path().join("models");
+
+        // Observed mid-admission: this is the only moment the staging entry and
+        // the (still absent) object coexist.
+        let observed = std::cell::RefCell::new(Vec::new());
+        let objects_during = std::cell::Cell::new(usize::MAX);
+        admit_file(&source, &root, |_| {
+            for entry in fs::read_dir(root.join(STAGING_DIR_NAME)).unwrap() {
+                observed.borrow_mut().push(entry.unwrap().path());
+            }
+            objects_during.set(
+                fs::read_dir(objects_root(&root))
+                    .map(Iterator::count)
+                    .unwrap_or(0),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let staged = observed.into_inner();
+        assert_eq!(staged.len(), 1, "one admission stages exactly one file");
+        let name = staged[0].file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            admit_staging_owner_pid(name),
+            Some(std::process::id()),
+            "staging name must name the process that can finish it: {name}"
+        );
+        // In-flight bytes never sit inside the content namespace, so collection
+        // can treat every name under `objects/sha256/` as a digest.
+        assert!(!staged[0].starts_with(objects_root(&root)));
+        assert_eq!(
+            objects_during.get(),
+            0,
+            "no object may exist while its content is still staging"
+        );
+    }
+
+    #[test]
+    fn stored_objects_lists_only_valid_digest_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.oasr");
+        fs::write(&source, b"GGUF-listed-pack").unwrap();
+        let root = temp.path().join("models");
+        let admitted = admit_file(&source, &root, |_| Ok(())).unwrap();
+
+        // Junk that a GC must positively refuse to identify as an object.
+        fs::create_dir_all(objects_root(&root).join("not-a-digest")).unwrap();
+        fs::create_dir_all(objects_root(&root).join("a".repeat(64))).unwrap();
+
+        let objects = stored_objects(&root).unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].digest, admitted.digest);
+        assert_eq!(objects[0].size_bytes, b"GGUF-listed-pack".len() as u64);
+    }
+
+    #[test]
+    fn link_file_as_object_moves_bytes_and_seals_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("models");
+        let legacy = temp.path().join("legacy.oasr");
+        fs::write(&legacy, b"GGUF-renamed-pack").unwrap();
+        let digest = sha256_bytes(b"GGUF-renamed-pack");
+
+        assert!(link_file_as_object(&legacy, &root, &digest).unwrap());
+        assert!(!legacy.exists(), "rename must not leave the source behind");
+        let object = object_path(&root, &digest).unwrap();
+        assert_eq!(fs::read(&object).unwrap(), b"GGUF-renamed-pack");
+        assert!(fs::metadata(&object).unwrap().permissions().readonly());
+
+        // A second landing of the same digest is a no-op that keeps the source.
+        let again = temp.path().join("again.oasr");
+        fs::write(&again, b"GGUF-renamed-pack").unwrap();
+        assert!(!link_file_as_object(&again, &root, &digest).unwrap());
+        assert!(again.exists());
+    }
+
+    /// The load path must not re-derive what admission already established.
+    ///
+    /// Asserted by corrupting a sealed object's bytes *without* changing its
+    /// length: a loader that re-hashes would reject this, and one that only
+    /// checks structure and length accepts it. Pinning the accepting behaviour
+    /// is what keeps a gigabyte-scale re-read from creeping back into every
+    /// model switch.
+    #[test]
+    fn declared_lease_does_not_rehash_the_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.oasr");
+        fs::write(&source, b"GGUF-load-path-pack").unwrap();
+        let root = temp.path().join("models");
+        let admitted = admit_file(&source, &root, |_| Ok(())).unwrap();
+        let digest = admitted.digest.clone();
+        let size = admitted.size_bytes;
+        let object = admitted.object_path.clone();
+        drop(admitted);
+
+        force_overwrite_object(&object, b"GGUF-load-path-XXXX");
+        assert_eq!(fs::metadata(&object).unwrap().len(), size);
+
+        let lease = open_declared_lease(&root, &digest, size).unwrap();
+        assert_eq!(lease.bytes(), b"GGUF-load-path-XXXX");
+
+        // The verifying variant is the one that still catches it, and
+        // `verify_model_store` is built on exactly that.
+        assert!(matches!(
+            open_verified_lease(&root, &digest).unwrap_err(),
+            ContentStoreError::SourceChanged { .. }
+        ));
+    }
+
+    #[test]
+    fn declared_lease_rejects_an_object_of_the_wrong_length() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.oasr");
+        fs::write(&source, b"GGUF-length-checked-pack").unwrap();
+        let root = temp.path().join("models");
+        let admitted = admit_file(&source, &root, |_| Ok(())).unwrap();
+        let digest = admitted.digest.clone();
+        let size = admitted.size_bytes;
+        let object = admitted.object_path.clone();
+        drop(admitted);
+
+        // Truncation is the failure a cheap check must still catch: a partially
+        // written or clipped object would otherwise be mapped and parsed.
+        force_overwrite_object(&object, b"short");
+        assert!(matches!(
+            open_declared_lease(&root, &digest, size).unwrap_err(),
+            ContentStoreError::SourceChanged { .. }
+        ));
+    }
+
+    #[test]
+    fn both_lease_variants_reject_a_missing_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("models");
+        let digest = sha256_bytes(b"never-admitted");
+        assert!(open_declared_lease(&root, &digest, 14).is_err());
+        assert!(open_verified_lease(&root, &digest).is_err());
     }
 }

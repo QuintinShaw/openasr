@@ -729,25 +729,74 @@ fn resolved_catalog_pull_from_quant(
 }
 
 pub fn list_installed_packs(home: impl AsRef<Path>) -> Result<Vec<InstalledPack>, PullError> {
-    // `InstalledModelStore` is the single reader for both on-disk layouts, and
-    // it never rewrites either one: listing installed models must not mutate the
-    // store. Converting the legacy layout is the separate, explicit
-    // `migrate_legacy_installed_records` operation.
+    // `InstalledModelStore` reads exactly one layout and never writes. Converting
+    // a legacy store is the separate, explicit `migrate_legacy_model_store`
+    // operation, which startup runs once -- a read path must not move gigabytes
+    // as a side effect, and an I/O failure there must not be able to empty a
+    // listing that would otherwise have succeeded.
     crate::InstalledModelStore::read(home.as_ref()).map(crate::InstalledModelStore::into_packs)
 }
 
-/// Re-admit every `<models>/<model>/<quant>/installed.json` record into the
-/// content store, so the immutable object becomes the only thing a later read
-/// can select. Records that fail legacy validation are left untouched for the
-/// reader to report.
+/// Bring the model store up to date once per process start.
 ///
-/// This is an explicit maintenance operation. It is deliberately not run from
-/// `list_installed_packs`: it copies every legacy pack's bytes and revokes the
-/// legacy record, which a read path must not do as a side effect.
-pub fn migrate_legacy_installed_records(home: &Path) -> Result<(), PullError> {
+/// Callers own reporting: this returns the report rather than logging, so the
+/// CLI, the server, and the desktop sidecar each surface migration failures in
+/// their own voice. A failed record keeps its legacy bytes on disk untouched, so
+/// the worst case is a pack that is temporarily not listed and loudly reported
+/// -- never a pack that is gone.
+pub fn migrate_model_store_at_startup(
+    home: impl AsRef<Path>,
+) -> Result<LegacyMigrationReport, PullError> {
+    migrate_legacy_model_store(home.as_ref())
+}
+
+/// One legacy record that could not be converted. The bytes behind it are
+/// always left untouched, so a failure costs visibility, never data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyMigrationFailure {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+/// Outcome of one [`migrate_legacy_model_store`] pass.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LegacyMigrationReport {
+    /// `<id>:<quant>` references now served from the content store.
+    pub migrated: Vec<String>,
+    /// Bytes released by dropping legacy copies whose content is already an
+    /// object. This is the duplicate-copy leak the old converter left behind.
+    pub reclaimed_bytes: u64,
+    pub failures: Vec<LegacyMigrationFailure>,
+}
+
+impl LegacyMigrationReport {
+    pub fn is_empty(&self) -> bool {
+        self.migrated.is_empty() && self.reclaimed_bytes == 0 && self.failures.is_empty()
+    }
+}
+
+/// Convert every `<models>/<model>/<quant>/installed.json` record into the
+/// content-addressed layout, in place, and drop the legacy copy afterwards.
+///
+/// Runs once per process start ([`crate::migrate_model_store_at_startup`]) and
+/// is idempotent: on a converted store it is a directory scan that finds
+/// nothing. Three properties make it safe to run unattended:
+///
+/// * **In place.** Every path derives from [`models_root`], so a user who
+///   redirected storage with `OPENASR_MODELS_DIR` or `config.models_dir` gets
+///   the conversion inside *their* directory. Nothing is ever relocated.
+/// * **Content before ref.** Bytes become a durable object before any ref names
+///   them, and the legacy record is revoked only after the ref is durable. A
+///   crash at any point leaves at worst an unreferenced object (collectable)
+///   and never a ref pointing at nothing.
+/// * **Move, do not copy.** Landing is a rename, so within one filesystem no
+///   pack bytes are copied; only the verification pass reads them. A models
+///   root that spans devices falls back to a copying admission.
+pub fn migrate_legacy_model_store(home: &Path) -> Result<LegacyMigrationReport, PullError> {
     let root = models_root(home);
+    let mut report = LegacyMigrationReport::default();
     let Ok(model_dirs) = fs::read_dir(&root) else {
-        return Ok(());
+        return Ok(report);
     };
     for model_dir in model_dirs {
         let model_dir = model_dir.map_err(|source| PullError::Io {
@@ -768,71 +817,192 @@ pub fn migrate_legacy_installed_records(home: &Path) -> Result<(), PullError> {
                 path: model_dir.path(),
                 source,
             })?;
-            let metadata_path = quant_dir.path().join("installed.json");
+            let quant_path = quant_dir.path();
+            let metadata_path = quant_path.join("installed.json");
             let Ok(contents) = fs::read_to_string(&metadata_path) else {
                 continue;
             };
             let Ok(legacy) = serde_json::from_str::<InstalledPack>(&contents) else {
                 continue;
             };
-            if crate::installed_model_store::validate_legacy_record(&legacy, &quant_dir.path())
-                .is_err()
+            if let Err(reason) =
+                crate::installed_model_store::validate_legacy_record(&legacy, &quant_path)
             {
+                report.failures.push(LegacyMigrationFailure {
+                    path: metadata_path,
+                    reason,
+                });
                 continue;
             }
-            // A durable ref is the migration commit point. If a process died
-            // after publishing it but before removing the legacy record, never
-            // re-admit mutable legacy bytes: finish cleanup only.
-            let ref_path = root
-                .join("refs")
-                .join(&legacy.model_id)
-                .join(format!("{}.json", legacy.quant));
-            if ref_path.is_file() {
-                remove_legacy_installed_record(&metadata_path)?;
-                continue;
+            match migrate_one_legacy_record(home, &root, &legacy, &quant_path) {
+                Ok(outcome) => {
+                    report.reclaimed_bytes += outcome.reclaimed_bytes;
+                    if outcome.published_ref {
+                        report.migrated.push(legacy.pull.clone());
+                    }
+                }
+                Err(error) => report.failures.push(LegacyMigrationFailure {
+                    path: metadata_path,
+                    reason: error.to_string(),
+                }),
             }
-            let admitted = admit_model_content(&legacy.path, home)?;
-            let target = PullTarget {
-                model_id: legacy.model_id.clone(),
-                display_name: legacy.display_name.clone(),
-                quant: legacy.quant.clone(),
-                suffix: legacy.suffix.clone(),
-                pull: legacy.pull.clone(),
-                filename: legacy.filename.clone(),
-                url: legacy.url.clone(),
-                hf_revision: legacy.hf_revision.clone(),
-                sha256: admitted.digest.clone(),
-                size_bytes: admitted.size_bytes,
-                source: legacy.source.clone(),
-            };
-            let paths = pull_paths(home, &target)?;
-            ensure_storage_dir_within_root(home, &paths)?;
-            let _lock = PullLock::acquire(&paths.lock_path)?;
-            // Keep the admitted descriptor alive until the ref that names it is
-            // durable, so the object cannot be collected mid-migration.
-            let _validated_lease = admitted.into_lease();
-            write_installed_record(&target, &paths)?;
-            // Ref publication is durable before legacy authority is revoked.
-            // If this removal is interrupted, the branch above recognizes the
-            // ref as committed and only completes removal on the next startup.
-            remove_legacy_installed_record(&metadata_path)?;
         }
     }
-    Ok(())
+    report.migrated.sort();
+    Ok(report)
 }
 
-fn remove_legacy_installed_record(metadata_path: &Path) -> Result<(), PullError> {
-    match fs::remove_file(metadata_path) {
-        Ok(()) => atomic_file::sync_parent_dir_best_effort(metadata_path),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+struct LegacyRecordOutcome {
+    published_ref: bool,
+    reclaimed_bytes: u64,
+}
+
+fn migrate_one_legacy_record(
+    home: &Path,
+    root: &Path,
+    legacy: &InstalledPack,
+    quant_path: &Path,
+) -> Result<LegacyRecordOutcome, PullError> {
+    let ref_path = root
+        .join("refs")
+        .join(&legacy.model_id)
+        .join(format!("{}.json", legacy.quant));
+    // A durable ref is the migration commit point. If a previous run died after
+    // publishing it, the legacy tree is pure duplication: finish the cleanup
+    // rather than re-admitting mutable legacy bytes. Leaving it is exactly the
+    // leak that made a converted store carry two copies of every pack.
+    if ref_path.is_file() {
+        return Ok(LegacyRecordOutcome {
+            published_ref: false,
+            reclaimed_bytes: discard_legacy_quant_dir(root, quant_path)?,
+        });
+    }
+
+    // Verify before moving: a pack that cannot pass install preflight must never
+    // reach the content namespace, and rejecting it here leaves it in place for
+    // the operator to inspect.
+    preflight_model_pack_for_install(&legacy.path)?;
+    // The digest is recomputed rather than taken from `installed.json`. Content
+    // addressing's whole premise is that the path equals the checksum; seeding
+    // an object from an unverified metadata field would let one stale record
+    // mislabel a blob permanently, and after sealing nothing would ever recheck
+    // it. Within a filesystem this hash is the only O(n) cost of the migration.
+    let (size_bytes, digest) = file_size_and_sha256(&legacy.path)?;
+
+    let target = PullTarget {
+        model_id: legacy.model_id.clone(),
+        display_name: legacy.display_name.clone(),
+        quant: legacy.quant.clone(),
+        suffix: legacy.suffix.clone(),
+        pull: legacy.pull.clone(),
+        filename: legacy.filename.clone(),
+        url: legacy.url.clone(),
+        hf_revision: legacy.hf_revision.clone(),
+        sha256: digest.clone(),
+        size_bytes,
+        source: legacy.source.clone(),
+    };
+    let paths = pull_paths(home, &target)?;
+    ensure_storage_dir_within_root(home, &paths)?;
+    ensure_safe_directory_under_root(root, &content_store::objects_root(root))?;
+    let _lock = PullLock::acquire(&paths.lock_path)?;
+    // Re-check under the lock: a concurrent install of the same variant may have
+    // published the ref while this record was being hashed.
+    if ref_path.is_file() {
+        return Ok(LegacyRecordOutcome {
+            published_ref: false,
+            reclaimed_bytes: discard_legacy_quant_dir(root, quant_path)?,
+        });
+    }
+
+    let mut reclaimed_bytes = 0;
+    match content_store::link_file_as_object(&legacy.path, root, &digest) {
+        // Bytes moved with no copy; the legacy name is already gone.
+        Ok(true) => {}
+        // The same content is already an object, so the legacy file is a pure
+        // duplicate. Revalidating the existing object is what makes dropping
+        // these bytes safe.
+        Ok(false) => {
+            content_store::open_verified_lease(root, &digest)?;
+            reclaimed_bytes += remove_file_reporting_size(&legacy.path)?;
+        }
+        // Cross-device (or any other rename refusal): fall back to copying the
+        // pack in through the normal admission path, then drop the original.
+        Err(_) => {
+            let admitted = admit_model_content(&legacy.path, home)?;
+            if admitted.digest != digest {
+                return Err(PullError::ShaMismatch {
+                    path: legacy.path.clone(),
+                    expected: digest,
+                    actual: admitted.digest,
+                });
+            }
+            reclaimed_bytes += remove_file_reporting_size(&legacy.path)?;
+        }
+    }
+
+    // Content is durable before the ref that names it exists.
+    write_installed_record(&target, &paths)?;
+    reclaimed_bytes += discard_legacy_quant_dir(root, quant_path)?;
+    Ok(LegacyRecordOutcome {
+        published_ref: true,
+        reclaimed_bytes,
+    })
+}
+
+fn remove_file_reporting_size(path: &Path) -> Result<u64, PullError> {
+    let size = fs::symlink_metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    match fs::remove_file(path) {
+        Ok(()) => {
+            atomic_file::sync_parent_dir_best_effort(path);
+            Ok(size)
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(source) => Err(PullError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Drop a fully superseded `<models>/<model>/<quant>/` tree and report the bytes
+/// it was holding. Only reached once the content-addressed ref for the same
+/// variant is durable, so nothing here is the last copy of anything.
+fn discard_legacy_quant_dir(root: &Path, quant_path: &Path) -> Result<u64, PullError> {
+    ensure_safe_directory_under_root(root, quant_path)?;
+    let mut reclaimed = 0;
+    if let Ok(entries) = fs::read_dir(quant_path) {
+        for entry in entries.flatten() {
+            reclaimed += entry
+                .metadata()
+                .map(|metadata| {
+                    if metadata.is_file() {
+                        metadata.len()
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0);
+        }
+    }
+    match fs::remove_dir_all(quant_path) {
+        Ok(()) => atomic_file::sync_parent_dir_best_effort(quant_path),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(source) => {
             return Err(PullError::Io {
-                path: metadata_path.to_path_buf(),
+                path: quant_path.to_path_buf(),
                 source,
             });
         }
     }
-    Ok(())
+    if let Some(model_dir) = quant_path.parent() {
+        // Only ever removes an already-empty directory, so a sibling quant that
+        // has not migrated yet is never touched.
+        let _ = fs::remove_dir(model_dir);
+    }
+    Ok(reclaimed)
 }
 
 pub fn default_pack_pointer_path(home: impl AsRef<Path>) -> PathBuf {
@@ -974,6 +1144,13 @@ fn list_installed_packs_without_gc(home: &Path) -> Result<Vec<InstalledPack>, Pu
     crate::InstalledModelStore::read(home).map(crate::InstalledModelStore::into_packs)
 }
 
+/// Open an installed pack for use.
+///
+/// This is the hot path -- every model load and every desktop model switch comes
+/// through here -- so it does not re-hash the object. The digest was established
+/// when the pack was admitted and the object has been read-only since; see
+/// `content_store`'s integrity chain. Use `verify_model_store` to re-check
+/// digests on demand.
 pub fn open_installed_content_lease(
     home: impl AsRef<Path>,
     reference: &str,
@@ -982,9 +1159,10 @@ pub fn open_installed_content_lease(
     let Some(pack) = find_installed_pack(home, reference)? else {
         return Ok(None);
     };
-    Ok(Some(content_store::open_lease(
+    Ok(Some(content_store::open_declared_lease(
         &models_root(home),
         &pack.sha256,
+        pack.size_bytes,
     )?))
 }
 
@@ -3470,7 +3648,6 @@ fn lock_is_stale(path: &Path) -> bool {
         .is_ok_and(|elapsed| elapsed > LOCK_STALE_AFTER)
 }
 
-#[cfg(unix)]
 fn lock_owner_is_gone(path: &Path) -> bool {
     let Ok(contents) = fs::read_to_string(path) else {
         return false;
@@ -3478,8 +3655,22 @@ fn lock_owner_is_gone(path: &Path) -> bool {
     let Some(pid) = contents
         .lines()
         .find_map(|line| line.strip_prefix("pid="))
-        .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+        .and_then(|value| value.trim().parse::<u32>().ok())
     else {
+        return false;
+    };
+    process_is_gone(pid)
+}
+
+/// Whether `pid` has certainly exited. Shared by stale-lock recovery and by
+/// model-store garbage collection, which uses it to decide that a staging entry
+/// no process can still finish is unconditionally garbage.
+///
+/// Always answers "still alive" when liveness cannot be established, so every
+/// caller fails toward keeping state rather than deleting it.
+#[cfg(unix)]
+pub(crate) fn process_is_gone(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };
     if pid <= 0 {
@@ -3493,7 +3684,7 @@ fn lock_owner_is_gone(path: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn lock_owner_is_gone(path: &Path) -> bool {
+pub(crate) fn process_is_gone(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -3503,16 +3694,6 @@ fn lock_owner_is_gone(path: &Path) -> bool {
     // its "exit code". Any other value means it has terminated.
     const STILL_ACTIVE: u32 = 259;
 
-    let Ok(contents) = fs::read_to_string(path) else {
-        return false;
-    };
-    let Some(pid) = contents
-        .lines()
-        .find_map(|line| line.strip_prefix("pid="))
-        .and_then(|value| value.trim().parse::<u32>().ok())
-    else {
-        return false;
-    };
     if pid == 0 {
         return false;
     }
@@ -3535,13 +3716,13 @@ fn lock_owner_is_gone(path: &Path) -> bool {
         let mut exit_code: u32 = 0;
         let queried = GetExitCodeProcess(handle, &mut exit_code);
         CloseHandle(handle);
-        // queried == 0 → status unreadable; be conservative and treat as live.
+        // queried == 0 -> status unreadable; be conservative and treat as live.
         queried != 0 && exit_code != STILL_ACTIVE
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn lock_owner_is_gone(_path: &Path) -> bool {
+pub(crate) fn process_is_gone(_pid: u32) -> bool {
     false
 }
 

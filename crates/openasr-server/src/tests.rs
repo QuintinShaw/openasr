@@ -332,15 +332,22 @@ fn write_valid_installed_pack_for_test(
     suffix: &str,
 ) -> InstalledPack {
     let filename = format!("{model_id}-{quant}.oasr");
-    let path = home
-        .join("models")
-        .join(model_id)
-        .join(quant)
-        .join(&filename);
-    let parent = path.parent().expect("installed pack parent").to_path_buf();
-    fs::create_dir_all(&parent).expect("create installed pack parent");
-    write_mock_gguf_runtime_source(&path, Some(model_id));
-    let bytes = fs::read(&path).expect("read installed pack fixture");
+    let models = home.join("models");
+
+    // Build the pack bytes somewhere disposable, then publish them the way the
+    // store holds a model: an immutable object named by its digest, plus a ref.
+    let scratch = models.join("fixture-source");
+    fs::create_dir_all(&scratch).expect("create fixture dir");
+    let staged = scratch.join(&filename);
+    write_mock_gguf_runtime_source(&staged, Some(model_id));
+    let bytes = fs::read(&staged).expect("read installed pack fixture");
+    fs::remove_dir_all(&scratch).expect("drop fixture staging dir");
+
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let path = models.join("objects/sha256").join(&sha256).join("content");
+    fs::create_dir_all(path.parent().expect("object parent")).expect("create object dir");
+    fs::write(&path, &bytes).expect("write object");
+
     let pack = InstalledPack {
         model_id: model_id.to_string(),
         display_name: model_id.to_string(),
@@ -351,16 +358,21 @@ fn write_valid_installed_pack_for_test(
         path,
         url: format!("https://example.test/{model_id}-{quant}.oasr"),
         hf_revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
-        sha256: format!("{:x}", Sha256::digest(&bytes)),
+        sha256,
         size_bytes: bytes.len() as u64,
         installed_at_unix_seconds: 1,
         source: None,
     };
+    let ref_path = models
+        .join("refs")
+        .join(model_id)
+        .join(format!("{quant}.json"));
+    fs::create_dir_all(ref_path.parent().expect("ref parent")).expect("create ref dir");
     fs::write(
-        parent.join("installed.json"),
+        &ref_path,
         serde_json::to_string_pretty(&pack).expect("serialize installed pack"),
     )
-    .expect("write installed pack metadata");
+    .expect("write model ref");
     pack
 }
 
