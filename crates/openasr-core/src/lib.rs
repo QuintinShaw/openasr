@@ -48,6 +48,8 @@ pub(crate) mod remote_compute;
 pub(crate) mod safety;
 pub mod stage_timing;
 mod tensor;
+#[cfg(test)]
+mod test_process_env;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub(crate) mod translation;
