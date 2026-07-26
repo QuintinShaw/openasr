@@ -45,16 +45,23 @@ impl LongFormVadProvider for EnergyLongFormVadProvider {
         // detected as speech and never reached the decoder (see the long-form
         // code-switch investigation). Cap the gate at the module's existing
         // "definitely not silence" floor -- `energy_silence_threshold_db`
-        // (-38 dBFS default), the same line `estimate_elision_penalty`,
-        // `estimate_gap_edge_penalty`, `choose_forced_cut`, and
-        // `subdivide_processed_spans_silence_aware` in `slicing.rs` already use to
-        // decide a span is non-silent -- rather than a second, independently
-        // tuned constant. This keeps one shared definition of "silence" across
-        // the whole longform pipeline and, on the repro numbers above, is low
-        // enough (-38 < -34.6) that the dropped English tail passes the gate.
-        // VAD/energy slicing is a performance optimization, not a content
-        // filter: a frame louder than the shared silence floor must never be
-        // gated out purely because something else in the clip was louder still.
+        // (-38 dBFS default), the same line `choose_forced_cut` and
+        // `subdivide_processed_spans_silence_aware` in `slicing.rs` use to pick
+        // a cut point -- rather than a second, independently tuned constant.
+        // On the repro numbers above it is low enough (-38 < -34.6) that the
+        // dropped English tail passes the gate. VAD/energy slicing is a
+        // performance optimization, not a content filter: a frame louder than
+        // the shared silence floor must never be gated out purely because
+        // something else in the clip was louder still.
+        //
+        // This threshold is a *decision* input: it is what this gate elides
+        // by. Nothing that later validates the resulting plan for lost content
+        // may measure against it -- see `longform::audibility` for why that
+        // closed loop is a bug and not a tuning question. The cap above is
+        // also why a recording that is quiet overall gets no protection from
+        // it: the relative term wins, the gate lands just under this
+        // recording's own speech, and real speech is elided. That is the case
+        // the audibility reference exists to catch.
         let absolute_floor = 10.0_f32.powf(options.energy_silence_threshold_db / 20.0);
         let gate = relative_gate.min(absolute_floor);
         let min_speech_frames = duration_ms_to_frames(

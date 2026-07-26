@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use super::audibility::{AUDIBILITY_CRITERION_LABEL, AudibilityReference, linear_to_dbfs};
 use super::options::{LongFormMode, LongFormOptions};
 use super::timeline::{TimelineAnchor, TimelineMap};
 use super::vad::EnergyLongFormVadProvider;
@@ -164,7 +165,7 @@ pub fn plan_longform_slices(
     // deliberate non-goal this round, to avoid growing the surface client
     // bindings have to track) so a dropped-audio regression is observable in
     // `daemon.log` instead of only showing up as missing transcript text.
-    log_dropped_audible_regions(samples, sample_rate_hz, options, &layout);
+    log_dropped_audible_regions(samples, sample_rate_hz, &layout);
     if layout.processed_audio.is_none() {
         if let Some(materialization_plan) = layout.packed_audio_plan.take() {
             layout.processed_audio = Some(materialize_packed_audio(samples, &materialization_plan));
@@ -377,7 +378,7 @@ fn plan_auto_slices(
 
     prune_dominated_vad_candidates(&mut candidates);
     let mut selection_provenance =
-        enforce_coverage_dominance(&mut candidates, samples, sample_rate_hz, options);
+        enforce_coverage_dominance(&mut candidates, samples, sample_rate_hz);
     selection_provenance.extend(apply_marginal_packed_penalties(
         &mut candidates,
         total_samples,
@@ -916,8 +917,10 @@ fn build_auto_plan_candidate(
     );
     let short_slice_penalty = estimate_short_slice_penalty(&layout.slices, sample_rate_hz, options);
     let boundary_penalty = estimate_boundary_penalty(samples, &layout, sample_rate_hz, options);
-    let elision_penalty = estimate_elision_penalty(samples, &layout, sample_rate_hz, options);
-    let gap_edge_penalty = estimate_gap_edge_penalty(samples, &layout, sample_rate_hz, options);
+    let audibility = layout_audibility_reference(samples, sample_rate_hz, &layout);
+    let elision_penalty = estimate_elision_penalty(samples, &layout, &audibility);
+    let gap_edge_penalty =
+        estimate_gap_edge_penalty(samples, &layout, sample_rate_hz, options, &audibility);
     let seam_penalty = estimate_seam_penalty(&layout, sample_rate_hz, options);
     let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz).max(1) as u128;
     let per_chunk_overhead =
@@ -1007,43 +1010,6 @@ fn prune_dominated_vad_candidates(candidates: &mut Vec<AutoPlanCandidate>) {
     });
 }
 
-/// Window size for the audible-content scan below. Deliberately much coarser
-/// than the VAD's own 20ms analysis frame (`vad::DEFAULT_FRAME_MS`) -- this
-/// scan exists to catch a burst of real speech that a *whole-region* average
-/// (like `estimate_elision_penalty`'s) would dilute into apparent silence,
-/// not to re-derive frame-level VAD. 0.5s is short enough to isolate a few
-/// words of speech from surrounding silence, long enough to stay cheap and to
-/// avoid tripping on a single loud click or breath.
-const COVERAGE_DOMINANCE_SCAN_WINDOW_SECONDS: f32 = 0.5;
-
-/// Scans `[start, end)` in fixed windows and returns the first window whose
-/// RMS exceeds `threshold_linear`, if any. Windowed rather than a single
-/// average over the whole range so a short loud passage inside an otherwise
-/// quiet dropped region is still caught (see `COVERAGE_DOMINANCE_SCAN_WINDOW_SECONDS`).
-fn find_audible_window(
-    samples: &[f32],
-    start: usize,
-    end: usize,
-    window_samples: usize,
-    threshold_linear: f32,
-) -> Option<(usize, usize, f32)> {
-    let start = start.min(samples.len());
-    let end = end.min(samples.len());
-    if end <= start || window_samples == 0 {
-        return None;
-    }
-    let mut cursor = start;
-    while cursor < end {
-        let window_end = (cursor + window_samples).min(end);
-        let window_rms = rms(&samples[cursor..window_end]);
-        if window_rms > threshold_linear {
-            return Some((cursor, window_end, window_rms));
-        }
-        cursor = window_end;
-    }
-    None
-}
-
 /// The elided (dropped) original-sample-space regions for a candidate's
 /// layout: before the first kept span, between kept spans, and after the
 /// last one for a packed layout; the analogous gaps between (and around) the
@@ -1104,39 +1070,71 @@ fn candidate_kept_and_dropped_ranges(
     (merged, dropped)
 }
 
-/// True if this candidate's plan drops (elides, or in the identity-layout
-/// case simply never slices) a region whose windowed RMS exceeds the
-/// absolute silence floor -- i.e. audio a conservative reading would call
-/// "possibly speech".
+/// The audibility reference for one layout: built from the audio and from
+/// what the layout keeps, never from `options.energy_silence_threshold_db`.
+///
+/// This function is the boundary between the two classes of level judgement
+/// in this module (see `audibility`'s module docs). Everything that asks
+/// "*may* this plan throw this audio away" goes through here; only the code
+/// that decides what to keep and where to cut -- `vad.rs`'s gate and
+/// `choose_forced_cut`'s split search -- reads the configured silence
+/// threshold. Wiring this function to that threshold recreates the closed
+/// loop it exists to break.
+fn layout_audibility_reference(
+    samples: &[f32],
+    sample_rate_hz: u32,
+    layout: &LongFormPlanningLayout,
+) -> AudibilityReference {
+    let (kept, _) = candidate_kept_and_dropped_ranges(layout, samples.len());
+    AudibilityReference::for_plan(samples, sample_rate_hz, &kept)
+}
+
+/// What a candidate throws away, when any of it reads as audible. Carried
+/// (rather than a bare bool) so the disqualification provenance can say how
+/// much was dropped and on what evidence -- a plan that silently loses half a
+/// meeting is exactly the failure a bare "disqualified" line cannot explain.
+struct AudibleDrop {
+    dropped_total_seconds: f32,
+    window_start_seconds: f32,
+    window_end_seconds: f32,
+    peak_dbfs: f32,
+    threshold_dbfs: f32,
+}
+
+/// `Some` if this candidate's plan drops (elides, or in the identity-layout
+/// case simply never slices) a region whose windowed RMS is close enough to
+/// this recording's own speech level to be possible speech.
 fn candidate_drops_audible_content(
     candidate: &AutoPlanCandidate,
     samples: &[f32],
     sample_rate_hz: u32,
-    options: &LongFormOptions,
-) -> bool {
+) -> Option<AudibleDrop> {
     if samples.is_empty() {
-        return false;
+        return None;
     }
-    let silence_threshold_linear = 10.0_f32.powf(options.energy_silence_threshold_db / 20.0);
-    let window_samples =
-        seconds_to_samples(COVERAGE_DOMINANCE_SCAN_WINDOW_SECONDS, sample_rate_hz).max(1);
+    let reference = layout_audibility_reference(samples, sample_rate_hz, &candidate.layout);
     let (_, dropped) = candidate_kept_and_dropped_ranges(&candidate.layout, samples.len());
-    dropped.iter().any(|(start, end)| {
-        find_audible_window(
-            samples,
-            *start,
-            *end,
-            window_samples,
-            silence_threshold_linear,
-        )
-        .is_some()
+    let to_seconds = |value: usize| value as f32 / sample_rate_hz as f32;
+    let (window_start, window_end, window_rms) = dropped
+        .iter()
+        .find_map(|(start, end)| reference.find_audible_window(samples, *start, *end))?;
+    Some(AudibleDrop {
+        dropped_total_seconds: dropped
+            .iter()
+            .map(|(start, end)| to_seconds(end.saturating_sub(*start)))
+            .sum(),
+        window_start_seconds: to_seconds(window_start),
+        window_end_seconds: to_seconds(window_end),
+        peak_dbfs: linear_to_dbfs(window_rms),
+        threshold_dbfs: reference.threshold_dbfs(),
     })
 }
 
 /// Transparent-fallback backstop for item 4 of the long-form code-switch fix:
 /// scans the *final, already-selected* layout (any mode -- `Off`, `Fixed`,
 /// `Energy`, `Vad`, or `Auto`'s winning candidate) for any elided region that
-/// still exceeds the absolute silence floor, and logs it to the daemon log
+/// still reads as audible against the plan-independent
+/// [`AudibilityReference`], and logs it to the daemon log
 /// via `stage_timing::log_event` (never the verbose-JSON response body, see
 /// the call site's comment). For `Auto` this is expected to never fire --
 /// `enforce_coverage_dominance` already disqualifies any candidate with an
@@ -1146,38 +1144,58 @@ fn candidate_drops_audible_content(
 fn log_dropped_audible_regions(
     samples: &[f32],
     sample_rate_hz: u32,
-    options: &LongFormOptions,
     layout: &LongFormPlanningLayout,
 ) {
     if samples.is_empty() {
         return;
     }
-    let silence_threshold_linear = 10.0_f32.powf(options.energy_silence_threshold_db / 20.0);
-    let window_samples =
-        seconds_to_samples(COVERAGE_DOMINANCE_SCAN_WINDOW_SECONDS, sample_rate_hz).max(1);
     let (_, dropped) = candidate_kept_and_dropped_ranges(layout, samples.len());
+    let to_seconds = |value: usize| value as f32 / sample_rate_hz as f32;
+    let dropped_total_seconds: f32 = dropped
+        .iter()
+        .map(|(start, end)| to_seconds(end.saturating_sub(*start)))
+        .sum();
+    if dropped_total_seconds <= 0.0 {
+        return;
+    }
+    let reference = layout_audibility_reference(samples, sample_rate_hz, layout);
+    // Log the elision summary whether or not any of it reads as audible: the
+    // amount dropped and the criterion that cleared it are exactly what a
+    // "the transcript is missing half the meeting" report needs, and a plan
+    // that drops a lot of audio the guard called silence is the shape worth
+    // seeing before it becomes a bug report.
+    crate::stage_timing::log_event(
+        "core.longform.elided_audio",
+        format!(
+            "dropped_total_s={dropped_total_seconds:.2} regions={} \
+             audio_s={:.2} criterion={AUDIBILITY_CRITERION_LABEL} \
+             speech_level_dbfs={:.1} audible_threshold_dbfs={:.1}",
+            dropped.len(),
+            to_seconds(samples.len()),
+            reference.speech_level_dbfs(),
+            reference.threshold_dbfs(),
+        ),
+    );
     for (start, end) in dropped {
-        let Some((window_start, window_end, window_rms)) = find_audible_window(
-            samples,
-            start,
-            end,
-            window_samples,
-            silence_threshold_linear,
-        ) else {
+        let Some((window_start, window_end, window_rms)) =
+            reference.find_audible_window(samples, start, end)
+        else {
             continue;
         };
-        let start_seconds = start as f32 / sample_rate_hz as f32;
-        let end_seconds = end as f32 / sample_rate_hz as f32;
-        let window_start_seconds = window_start as f32 / sample_rate_hz as f32;
-        let window_end_seconds = window_end as f32 / sample_rate_hz as f32;
-        let peak_dbfs = 20.0 * window_rms.max(f32::MIN_POSITIVE).log10();
+        let start_seconds = to_seconds(start);
+        let end_seconds = to_seconds(end);
+        let window_start_seconds = to_seconds(window_start);
+        let window_end_seconds = to_seconds(window_end);
+        let peak_dbfs = linear_to_dbfs(window_rms);
         crate::stage_timing::log_event(
             "core.longform.dropped_audible_region",
             format!(
                 "start_s={start_seconds:.2} end_s={end_seconds:.2} \
                  audible_window_s={window_start_seconds:.2}-{window_end_seconds:.2} \
                  peak_dbfs={peak_dbfs:.1} \
-                 reason=elided_by_slicing_plan_above_absolute_silence_floor",
+                 audible_threshold_dbfs={:.1} criterion={AUDIBILITY_CRITERION_LABEL} \
+                 reason=elided_by_slicing_plan_near_recording_speech_level",
+                reference.threshold_dbfs(),
             ),
         );
     }
@@ -1185,7 +1203,17 @@ fn log_dropped_audible_regions(
 
 /// Coverage-dominance guard: "processed fewer samples" must never beat
 /// "covers significantly more" unless the part only the larger plan keeps is,
-/// by the conservative windowed-RMS standard above, genuine silence. Rather
+/// by the recording-relative standard above, genuine silence.
+///
+/// The standard is deliberately *not* the energy VAD's own silence floor.
+/// It was, and that made the guard a closed loop -- the energy-packed
+/// candidate elides exactly what falls under that floor, so the guard read
+/// its own input back and cleared every energy-packed candidate by
+/// construction, while neural-VAD candidates (deciding by a different
+/// quantity) were the only ones it could ever disqualify. On a far-field
+/// meeting whose speech runs -44..-50 dBFS, entirely below the -38 dBFS
+/// floor, that is how a 360s recording lost 168s of content to a plan this
+/// guard had approved. See `audibility`'s module docs. Rather
 /// than trying to tune `estimate_elision_penalty`'s score contribution high
 /// enough to always overcome every other term in `build_auto_plan_candidate`
 /// (short/boundary/gap-edge/seam/chunk-count penalties, stability bias, and
@@ -1202,19 +1230,16 @@ fn enforce_coverage_dominance(
     candidates: &mut Vec<AutoPlanCandidate>,
     samples: &[f32],
     sample_rate_hz: u32,
-    options: &LongFormOptions,
 ) -> Vec<String> {
     let mut provenance = Vec::new();
     if candidates.len() < 2 {
         return provenance;
     }
-    let drops: Vec<bool> = candidates
+    let drops: Vec<Option<AudibleDrop>> = candidates
         .iter()
-        .map(|candidate| {
-            candidate_drops_audible_content(candidate, samples, sample_rate_hz, options)
-        })
+        .map(|candidate| candidate_drops_audible_content(candidate, samples, sample_rate_hz))
         .collect();
-    if drops.iter().all(|drops_audio| *drops_audio) {
+    if drops.iter().all(|drop| drop.is_some()) {
         // Every candidate drops something audible (should not happen given
         // the always-present full-coverage energy-identity candidate); keep
         // all of them rather than disqualify every option.
@@ -1222,15 +1247,20 @@ fn enforce_coverage_dominance(
     }
     let mut index = 0usize;
     candidates.retain(|candidate| {
-        let disqualify = drops[index];
-        if disqualify {
+        let drop = drops[index].as_ref();
+        if let Some(drop) = drop {
             provenance.push(format!(
-                "core.longform.auto.disqualified:{}:coverage_dominance:drops_audible_content_above_absolute_silence_floor",
+                "core.longform.auto.disqualified:{}:coverage_dominance:drops_audible_content_near_recording_speech_level:dropped_total_s={:.2}:audible_window_s={:.2}-{:.2}:peak_dbfs={:.1}:audible_threshold_dbfs={:.1}",
                 auto_candidate_label(candidate),
+                drop.dropped_total_seconds,
+                drop.window_start_seconds,
+                drop.window_end_seconds,
+                drop.peak_dbfs,
+                drop.threshold_dbfs,
             ));
         }
         index += 1;
-        !disqualify
+        drop.is_none()
     });
     provenance
 }
@@ -1830,8 +1860,10 @@ fn estimate_boundary_penalty(
         .sum()
 }
 
-/// Charges a candidate for any elided (dropped) audio whose RMS exceeds the
-/// absolute silence floor -- an interior gap between two kept spans, but also
+/// Charges a candidate for any elided (dropped) audio that reads as audible
+/// against the plan's [`AudibilityReference`] (a *validation* judgement, so
+/// it must not use the VAD's own silence floor -- see
+/// `layout_audibility_reference`) -- an interior gap between two kept spans, but also
 /// the audio elided before the first kept span and after the last one. The
 /// head/tail cases used to be free: a packed plan that simply truncated the
 /// front or back of the recording never paid for it, so a plan that dropped a
@@ -1844,8 +1876,7 @@ fn estimate_boundary_penalty(
 fn estimate_elision_penalty(
     samples: &[f32],
     layout: &LongFormPlanningLayout,
-    _sample_rate_hz: u32,
-    options: &LongFormOptions,
+    reference: &AudibilityReference,
 ) -> usize {
     let Some(plan) = layout.packed_audio_plan.as_ref() else {
         return 0;
@@ -1853,7 +1884,6 @@ fn estimate_elision_penalty(
     if samples.is_empty() || plan.spans.is_empty() {
         return 0;
     }
-    let silence_threshold_linear = 10.0_f32.powf(options.energy_silence_threshold_db / 20.0);
     let elided_region_penalty = |gap_start: usize, gap_end: usize| -> usize {
         let gap_start = gap_start.min(samples.len());
         let gap_end = gap_end.min(samples.len());
@@ -1861,12 +1891,11 @@ fn estimate_elision_penalty(
             return 0;
         }
         let gap_rms = rms(&samples[gap_start..gap_end]);
-        if gap_rms <= silence_threshold_linear {
+        if !reference.is_audible(gap_rms) {
             return 0;
         }
         let gap_len = gap_end.saturating_sub(gap_start);
-        let excess_ratio = (gap_rms / silence_threshold_linear).max(1.0) - 1.0;
-        (excess_ratio * gap_len as f32).round() as usize
+        (reference.excess_ratio(gap_rms) * gap_len as f32).round() as usize
     };
     let head_penalty = elided_region_penalty(0, plan.spans[0].start_sample);
     let tail_penalty =
@@ -1881,11 +1910,16 @@ fn estimate_elision_penalty(
         .saturating_add(interior_penalty)
 }
 
+/// Charges a candidate for cutting a kept span at a moment where the audio on
+/// the other side of the seam is still live -- also a *validation* judgement,
+/// measured against the plan-independent [`AudibilityReference`] rather than
+/// the VAD's own silence floor (see `layout_audibility_reference`).
 fn estimate_gap_edge_penalty(
     samples: &[f32],
     layout: &LongFormPlanningLayout,
     sample_rate_hz: u32,
     options: &LongFormOptions,
+    reference: &AudibilityReference,
 ) -> usize {
     let Some(plan) = layout.packed_audio_plan.as_ref() else {
         return 0;
@@ -1893,7 +1927,6 @@ fn estimate_gap_edge_penalty(
     if plan.spans.len() < 2 || samples.is_empty() {
         return 0;
     }
-    let silence_threshold_linear = 10.0_f32.powf(options.energy_silence_threshold_db / 20.0);
     let edge_window = seconds_to_samples(0.15, sample_rate_hz).max(1);
     let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz).max(1);
     let per_edge_scale = (chunk_samples / 16).max(edge_window);
@@ -1912,10 +1945,8 @@ fn estimate_gap_edge_penalty(
             if left_end <= gap_start || gap_end <= right_start {
                 return 0usize;
             }
-            let left_rms = rms(&samples[gap_start..left_end]);
-            let right_rms = rms(&samples[right_start..gap_end]);
-            let left_excess = (left_rms / silence_threshold_linear).max(1.0) - 1.0;
-            let right_excess = (right_rms / silence_threshold_linear).max(1.0) - 1.0;
+            let left_excess = reference.excess_ratio(rms(&samples[gap_start..left_end]));
+            let right_excess = reference.excess_ratio(rms(&samples[right_start..gap_end]));
             ((left_excess + right_excess) * per_edge_scale as f32).round() as usize
         })
         .sum()
@@ -2043,7 +2074,7 @@ fn first_low_energy_split(
     None
 }
 
-fn rms(samples: &[f32]) -> f32 {
+pub(super) fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
@@ -2055,7 +2086,7 @@ fn rms(samples: &[f32]) -> f32 {
     (sum / samples.len() as f64).sqrt() as f32
 }
 
-fn seconds_to_samples(seconds: f32, sample_rate_hz: u32) -> usize {
+pub(super) fn seconds_to_samples(seconds: f32, sample_rate_hz: u32) -> usize {
     ((seconds.max(0.0)) * sample_rate_hz as f32).round() as usize
 }
 
@@ -2103,6 +2134,31 @@ mod tests {
             }
             Ok(spans)
         }
+    }
+
+    /// Test shims for the two penalty estimators: the audibility reference is
+    /// derived from the same samples and layout the penalty is measured on,
+    /// exactly as `build_auto_plan_candidate` does it.
+    fn elision_penalty_of(samples: &[f32], layout: &LongFormPlanningLayout) -> usize {
+        estimate_elision_penalty(
+            samples,
+            layout,
+            &layout_audibility_reference(samples, 16_000, layout),
+        )
+    }
+
+    fn gap_edge_penalty_of(
+        samples: &[f32],
+        layout: &LongFormPlanningLayout,
+        options: &LongFormOptions,
+    ) -> usize {
+        estimate_gap_edge_penalty(
+            samples,
+            layout,
+            16_000,
+            options,
+            &layout_audibility_reference(samples, 16_000, layout),
+        )
     }
 
     fn tone(samples: usize) -> Vec<f32> {
@@ -3128,10 +3184,6 @@ mod tests {
 
     #[test]
     fn elision_penalty_only_charges_non_silent_removed_gaps() {
-        let mut options = options_with_mode(LongFormMode::Auto);
-        options.chunk_seconds = 30.0;
-        options.padding_seconds = 0.0;
-
         let mut silent_gap_samples = tone(16_000 * 4);
         silent_gap_samples.extend(vec![0.0; 16_000 * 2]);
         silent_gap_samples.extend(tone(16_000 * 4));
@@ -3168,10 +3220,8 @@ mod tests {
             selection_provenance: Vec::new(),
         };
 
-        let silent_penalty =
-            estimate_elision_penalty(&silent_gap_samples, &packed_layout, 16_000, &options);
-        let loud_penalty =
-            estimate_elision_penalty(&loud_gap_samples, &packed_layout, 16_000, &options);
+        let silent_penalty = elision_penalty_of(&silent_gap_samples, &packed_layout);
+        let loud_penalty = elision_penalty_of(&loud_gap_samples, &packed_layout);
         assert_eq!(silent_penalty, 0);
         assert!(loud_penalty > 0, "{loud_penalty}");
     }
@@ -3182,10 +3232,6 @@ mod tests {
     /// as an equivalent interior gap when the truncated part is non-silent.
     #[test]
     fn elision_penalty_charges_head_and_tail_truncation_like_an_interior_gap() {
-        let mut options = options_with_mode(LongFormMode::Auto);
-        options.chunk_seconds = 30.0;
-        options.padding_seconds = 0.0;
-
         // Kept span covers only the middle third; loud audio is truncated
         // both before the first span and after the last one.
         let mut truncated_both_ends_samples = tone(16_000 * 2);
@@ -3219,18 +3265,10 @@ mod tests {
         truncated_silent_ends_samples.extend(tone(16_000 * 4));
         truncated_silent_ends_samples.extend(vec![0.0_f32; 16_000 * 2]);
 
-        let single_span_penalty = estimate_elision_penalty(
-            &truncated_both_ends_samples,
-            &truncated_both_ends_layout,
-            16_000,
-            &options,
-        );
-        let silent_ends_penalty = estimate_elision_penalty(
-            &truncated_silent_ends_samples,
-            &truncated_both_ends_layout,
-            16_000,
-            &options,
-        );
+        let single_span_penalty =
+            elision_penalty_of(&truncated_both_ends_samples, &truncated_both_ends_layout);
+        let silent_ends_penalty =
+            elision_penalty_of(&truncated_silent_ends_samples, &truncated_both_ends_layout);
         assert!(
             single_span_penalty > 0,
             "loud head/tail truncation must be penalized: {single_span_penalty}"
@@ -3271,12 +3309,8 @@ mod tests {
             timeline: TimelineMap::identity(),
             selection_provenance: Vec::new(),
         };
-        let interior_gap_penalty = estimate_elision_penalty(
-            &truncated_both_ends_samples,
-            &interior_gap_layout,
-            16_000,
-            &options,
-        );
+        let interior_gap_penalty =
+            elision_penalty_of(&truncated_both_ends_samples, &interior_gap_layout);
         assert_eq!(
             single_span_penalty, interior_gap_penalty,
             "head+tail truncation of the same loud audio must cost the same as an interior gap"
@@ -3329,10 +3363,8 @@ mod tests {
             selection_provenance: Vec::new(),
         };
 
-        let quiet_penalty =
-            estimate_gap_edge_penalty(&quiet_edge_gap_samples, &packed_layout, 16_000, &options);
-        let loud_penalty =
-            estimate_gap_edge_penalty(&loud_edge_gap_samples, &packed_layout, 16_000, &options);
+        let quiet_penalty = gap_edge_penalty_of(&quiet_edge_gap_samples, &packed_layout, &options);
+        let loud_penalty = gap_edge_penalty_of(&loud_edge_gap_samples, &packed_layout, &options);
         assert_eq!(quiet_penalty, 0);
         assert!(loud_penalty > 0, "{loud_penalty}");
     }
@@ -3894,6 +3926,163 @@ mod tests {
                 .content_end_sample,
             total_samples,
             "auto-selected plan must still cover the full clip"
+        );
+    }
+
+    /// Deterministic stand-in for a far-field meeting recording: a loud talker
+    /// near the mic for the first 6s of each minute, a long stretch of quiet
+    /// talkers around -50 dBFS, then a genuinely silent tail. The quiet
+    /// talkers sit *below* the pipeline's absolute silence floor
+    /// (`energy_silence_threshold_db`, -38 dBFS), which is the level profile
+    /// of the real 360s meeting that lost 47% of itself to a packed plan.
+    fn far_field_speech_below_the_vad_silence_floor(total_seconds: f32) -> Vec<f32> {
+        const SAMPLE_RATE: usize = 16_000;
+        const BLOCK_SECONDS: usize = 60;
+        const LOUD_SECONDS: usize = 6;
+        const QUIET_SECONDS: usize = 49;
+        const LOUD_AMPLITUDE: f32 = 0.07;
+        const QUIET_AMPLITUDE: f32 = 0.0056;
+        const SILENCE_AMPLITUDE: f32 = 0.0001;
+
+        let total_samples = (total_seconds * SAMPLE_RATE as f32) as usize;
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        (0..total_samples)
+            .map(|index| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let noise = (state >> 40) as f32 / 8_388_608.0 - 1.0;
+                let offset = (index / SAMPLE_RATE) % BLOCK_SECONDS;
+                let amplitude = if offset < LOUD_SECONDS {
+                    LOUD_AMPLITUDE
+                } else if offset < LOUD_SECONDS + QUIET_SECONDS {
+                    QUIET_AMPLITUDE
+                } else {
+                    SILENCE_AMPLITUDE
+                };
+                noise * amplitude
+            })
+            .collect()
+    }
+
+    /// The *old* audible-content test, spelled out here rather than called:
+    /// scan a dropped range against the VAD's own absolute silence floor.
+    /// Kept as a local definition on purpose -- it is the criterion the guard
+    /// must never go back to, so the test owns it and no future "unify the
+    /// constants" edit can quietly reconnect the production guard to it.
+    fn drops_anything_above_the_vad_silence_floor(
+        samples: &[f32],
+        dropped: &[(usize, usize)],
+        options: &LongFormOptions,
+    ) -> bool {
+        let floor_linear = 10.0_f32.powf(options.energy_silence_threshold_db / 20.0);
+        let window_samples = 16_000 / 2;
+        dropped.iter().any(|(start, end)| {
+            let mut cursor = *start;
+            while cursor < *end {
+                let window_end = (cursor + window_samples).min(*end);
+                if rms(&samples[cursor..window_end]) > floor_linear {
+                    return true;
+                }
+                cursor = window_end;
+            }
+            false
+        })
+    }
+
+    /// The invariant the coverage guard exists for, asserted from both sides.
+    ///
+    /// The energy VAD elides what falls under `energy_silence_threshold_db`,
+    /// so a guard that measures "audible" against that same floor reads its
+    /// own input back and can never disagree with it -- a closed loop, not a
+    /// mis-tuned constant. This test pins both halves: the legacy floor is
+    /// blind to everything this packed candidate throws away (so if someone
+    /// re-derives the guard from `energy_silence_threshold_db`, the first
+    /// assertion's counterfactual stops holding and the third fails), while
+    /// the plan-independent audibility reference sees it and the planner ends
+    /// up on a full-coverage layout.
+    #[test]
+    fn coverage_guard_is_independent_of_the_vad_silence_floor() {
+        let samples = far_field_speech_below_the_vad_silence_floor(360.0);
+        let mut options = options_with_mode(LongFormMode::Auto);
+        options.chunk_seconds = 30.0;
+
+        let packed_layout = plan_packed_energy_layout(&samples, 16_000, &options)
+            .expect("energy VAD must produce a packed candidate for this profile");
+        let (_, dropped) = candidate_kept_and_dropped_ranges(&packed_layout, samples.len());
+        let dropped_seconds: f32 = dropped
+            .iter()
+            .map(|(start, end)| end.saturating_sub(*start) as f32 / 16_000.0)
+            .sum();
+        assert!(
+            dropped_seconds > 60.0,
+            "fixture must exercise a large elision, got {dropped_seconds:.1}s"
+        );
+        assert!(
+            !drops_anything_above_the_vad_silence_floor(&samples, &dropped, &options),
+            "the VAD's own floor cannot see the {dropped_seconds:.1}s it elided -- \
+             that closed loop is what this guard must not depend on"
+        );
+
+        let candidate = build_auto_plan_candidate(
+            AudioSliceKind::Energy,
+            packed_layout,
+            &samples,
+            samples.len(),
+            16_000,
+            &options,
+        );
+        let drop = candidate_drops_audible_content(&candidate, &samples, 16_000)
+            .expect("the audibility reference must see sub-floor speech being dropped");
+        assert!(
+            drop.peak_dbfs < options.energy_silence_threshold_db,
+            "the flagged window ({:.1} dBFS) must be one the VAD floor would have cleared",
+            drop.peak_dbfs
+        );
+
+        let plan = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        assert!(
+            plan.processed_audio.is_none(),
+            "auto must fall back to a full-coverage layout: {:?}",
+            plan.stats.provenance
+        );
+        assert!(
+            plan.stats.provenance.iter().any(|line| line
+                .contains("core.longform.auto.disqualified:energy-packed:coverage_dominance")),
+            "the disqualification must be visible in provenance: {:?}",
+            plan.stats.provenance
+        );
+    }
+
+    /// The other side of the guard: a normally levelled recording whose pauses
+    /// really are room tone must still get the packed layout. The guard is a
+    /// content-loss backstop, not a ban on eliding silence -- if this starts
+    /// failing, the audibility margin has been tightened into a blanket "never
+    /// pack" and the compute saving is gone.
+    #[test]
+    fn packed_layout_survives_when_the_elided_gaps_are_real_room_tone() {
+        const SPEECH_SECONDS: usize = 20;
+        const GAP_SECONDS: usize = 25;
+        let mut samples = Vec::new();
+        for block in 0..4 {
+            samples.extend(scaled_tone(16_000 * SPEECH_SECONDS, 1.0));
+            let mut state = 0x9e37_79b9_7f4a_7c15_u64 ^ (block as u64);
+            samples.extend((0..16_000 * GAP_SECONDS).map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                // ~-72 dBFS room tone: far under the speech, and far under
+                // the audibility reference derived from it.
+                ((state >> 40) as f32 / 8_388_608.0 - 1.0) * 0.0004
+            }));
+        }
+        let mut options = options_with_mode(LongFormMode::Auto);
+        options.chunk_seconds = 30.0;
+        let plan = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        assert!(
+            plan.processed_audio.is_some(),
+            "true room-tone gaps must still be packed out: {:?}",
+            plan.stats.provenance
         );
     }
 }

@@ -2114,13 +2114,17 @@ fn scoped_slice_recording_fits_one_decode(
 /// well under the pipeline's -38 dBFS `energy_silence_threshold_db`) had 47% of
 /// its 360s elided, and the surviving turns were blanketed over the gaps
 /// (one 5-character turn spanning 30.7s across two other speakers' lost
-/// content). `enforce_coverage_dominance` cannot catch that case: the energy
-/// VAD elides what falls under that same silence floor, so the guard's
-/// "is any dropped window audible" test reads its own input back and always
-/// says no. Rather than depend on that guard being level-calibrated for every
-/// recording, this shape takes the planner that cannot elide at all -- the
-/// energy planner slices contiguously from the first sample to the last and
-/// only chooses *where* to cut (see `plan_energy_slices_contiguous`).
+/// content). `enforce_coverage_dominance` could not catch that case at the
+/// time: it measured "audible" against the same floor the energy VAD elides
+/// by, so the guard read its own input back and always said no. That closed
+/// loop has since been broken -- the guard now judges against a
+/// recording-relative reference (`longform::audibility`) and does disqualify
+/// this shape -- but the pin stays, because it is not a level question here:
+/// splicing away the pauses is wrong for a family whose job is to tell
+/// speakers apart from continuous acoustic context, at any level. This shape
+/// takes the planner that cannot elide at all -- the energy planner slices
+/// contiguously from the first sample to the last and only chooses *where* to
+/// cut (see `plan_energy_slices_contiguous`).
 fn apply_scoped_slice_longform_window_policy(
     model_architecture: &str,
     options: &mut crate::LongFormOptions,
@@ -2578,6 +2582,12 @@ fn execution_target_backend_preference(
     }
 }
 
+/// Whole-slice RMS against an absolute dBFS line. The one caller is the
+/// opt-in `suppress_silent_slices` skip (default off), which is a *decision*
+/// use of `energy_silence_threshold_db` -- it chooses not to decode a slice.
+/// It is deliberately not the standard any plan validation measures against;
+/// see `longform::audibility` for why judging an elision by the same line
+/// that produced it is a closed loop.
 fn is_effectively_silent(samples: &[f32], threshold_db: f32) -> bool {
     if samples.is_empty() {
         return true;
@@ -3765,8 +3775,11 @@ mod tests {
     /// at the top of each minute, then a long stretch of quiet talkers around
     /// -45 dBFS, then a genuinely silent tail. This is the level profile that
     /// made the auto planner elide 47% of a real 360s recording -- the energy
-    /// VAD reads sub-floor speech as silence, and `enforce_coverage_dominance`
-    /// reads the same floor back and agrees it was safe to drop.
+    /// VAD read sub-floor speech as silence, and the coverage guard read the
+    /// same floor back and agreed it was safe to drop. The guard no longer
+    /// depends on that floor (see `longform::audibility`), so `Auto` keeps
+    /// this profile whole too; the pin below is the structural guarantee that
+    /// a scoped-slice family never sees an elided plan regardless.
     fn quiet_speech_under_the_silence_floor(total_seconds: f32) -> Vec<f32> {
         const SAMPLE_RATE: usize = 16_000;
         const BLOCK_SECONDS: usize = 60;
@@ -3815,10 +3828,10 @@ mod tests {
 
     /// The invariant behind the scoped-slice mode pin: a `ScopedSlices` family
     /// never gets a plan that elides audio, so no assembled segment can span
-    /// content the decoder was never given. The `Auto` counterfactual on the
-    /// same samples is asserted too -- without the pin this recording loses a
-    /// large fraction of itself to the packed layout, so the test would still
-    /// pass on a broken build if it only checked the resolved plan.
+    /// content the decoder was never given. Asserted on both level profiles,
+    /// plus the `Auto` counterfactual on the packable one -- `Auto` really
+    /// does elide there, so the test cannot pass on a build where the pin was
+    /// deleted.
     #[test]
     fn scoped_slice_family_never_gets_a_plan_that_elides_audio() {
         let samples = quiet_speech_under_the_silence_floor(360.0);
@@ -3839,17 +3852,57 @@ mod tests {
             plan.slices
         );
 
+        // Counterfactual: `Auto` is free to elide, and on audio whose pauses
+        // really are room tone it does. Without this half the test would pass
+        // on a build where the mode pin was deleted and `Auto` merely happened
+        // to keep the first fixture whole.
+        let packable = loud_speech_with_room_tone_gaps(360.0);
         let auto_options = crate::LongFormOptions {
             mode: LongFormMode::Auto,
             ..resolution.options.clone()
         };
-        let auto_plan = plan_longform_slices(&samples, 16_000, &auto_options, None)
+        let auto_plan = plan_longform_slices(&packable, 16_000, &auto_options, None)
             .expect("auto options must plan");
         assert!(
             !slice_plan_covers_every_sample(&auto_plan),
-            "the Auto planner is expected to elide this level profile; if it no longer does, \
+            "the Auto planner is expected to elide true room-tone gaps; if it no longer does, \
              this test has stopped proving that the mode pin is what protects coverage"
         );
+        let pinned_plan = plan_longform_slices(&packable, 16_000, &resolution.options, None)
+            .expect("scoped-slice options must plan");
+        assert!(
+            slice_plan_covers_every_sample(&pinned_plan),
+            "the pinned scoped-slice planner must cover the same audio `Auto` elides"
+        );
+    }
+
+    /// The other level profile a scoped-slice family must survive: normally
+    /// levelled speech separated by genuine room tone, which the auto planner
+    /// legitimately packs out. Speech blocks are 20s, gaps 25s.
+    fn loud_speech_with_room_tone_gaps(total_seconds: f32) -> Vec<f32> {
+        const SAMPLE_RATE: usize = 16_000;
+        const BLOCK_SECONDS: usize = 45;
+        const SPEECH_SECONDS: usize = 20;
+        const SPEECH_AMPLITUDE: f32 = 0.2;
+        const ROOM_TONE_AMPLITUDE: f32 = 0.0004;
+
+        let total_samples = (total_seconds * SAMPLE_RATE as f32) as usize;
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        (0..total_samples)
+            .map(|index| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let noise = (state >> 40) as f32 / 8_388_608.0 - 1.0;
+                let offset = (index / SAMPLE_RATE) % BLOCK_SECONDS;
+                let amplitude = if offset < SPEECH_SECONDS {
+                    SPEECH_AMPLITUDE
+                } else {
+                    ROOM_TONE_AMPLITUDE
+                };
+                noise * amplitude
+            })
+            .collect()
     }
 
     /// A `SharedWindow` family is untouched by the scoped-slice rule.

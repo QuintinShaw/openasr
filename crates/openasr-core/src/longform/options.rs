@@ -52,6 +52,17 @@ pub struct LongFormOptions {
     pub min_chunk_seconds: f32,
     pub max_chunk_seconds: f32,
     pub padding_seconds: f32,
+    /// Absolute "definitely not silence" floor, in dBFS.
+    ///
+    /// This is a **decision** knob and nothing else: it caps the energy VAD's
+    /// gate (`vad.rs`) and picks silence-aware cut points
+    /// (`slicing::choose_forced_cut`), i.e. it is part of what the pipeline
+    /// elides *by*. Code that afterwards checks a plan for lost content must
+    /// never measure against it -- doing so is a closed loop that can only
+    /// ever agree with the elision it is auditing, which is exactly how a
+    /// far-field meeting lost 47% of itself while every guard reported clean.
+    /// See `longform::audibility` for the independent reference validation
+    /// uses instead, and do not "unify" the two.
     pub energy_silence_threshold_db: f32,
     pub energy_split_search_seconds: f32,
     pub suppress_silent_slices: bool,
