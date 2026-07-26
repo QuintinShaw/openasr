@@ -959,7 +959,7 @@ fn map_mel_frontend_error(error: Qwen3AsrMelFrontendError) -> Qwen3AsrGgmlExecut
 
 fn map_audio_encoder_error(error: Qwen3AsrAudioEncoderError) -> Qwen3AsrGgmlExecutorError {
     if let Qwen3AsrAudioEncoderError::GraphBuildFailed { source, .. } = &error
-        && let Some(mapped) = qwen_context_allocation_failure(source)
+        && let Some(mapped) = qwen_graph_allocation_failure(source)
     {
         return mapped;
     }
@@ -983,7 +983,7 @@ fn map_logits_head_error(error: Qwen3AsrLlmLogitsHeadError) -> Qwen3AsrGgmlExecu
         error => error,
     };
     if let Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed { source } = &error
-        && let Some(mapped) = qwen_context_allocation_failure(source)
+        && let Some(mapped) = qwen_graph_allocation_failure(source)
     {
         return mapped;
     }
@@ -994,19 +994,26 @@ fn map_logits_head_error(error: Qwen3AsrLlmLogitsHeadError) -> Qwen3AsrGgmlExecu
 }
 
 fn map_whole_decoder_init_error(error: GgmlCpuGraphError) -> Qwen3AsrGgmlExecutorError {
-    qwen_context_allocation_failure(&error).unwrap_or_else(|| {
+    qwen_graph_allocation_failure(&error).unwrap_or_else(|| {
         Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
             reason: format!("qwen3-asr whole-decoder graph init failed: {error}"),
         }
     })
 }
 
-fn qwen_context_allocation_failure(error: &GgmlCpuGraphError) -> Option<Qwen3AsrGgmlExecutorError> {
+fn qwen_graph_allocation_failure(error: &GgmlCpuGraphError) -> Option<Qwen3AsrGgmlExecutorError> {
     match error {
         GgmlCpuGraphError::ContextAllocationFailed {
             stage,
             requested_bytes,
         } => Some(Qwen3AsrGgmlExecutorError::ContextAllocationFailed {
+            stage,
+            requested_bytes: *requested_bytes,
+        }),
+        GgmlCpuGraphError::HostAllocationFailed {
+            stage,
+            requested_bytes,
+        } => Some(Qwen3AsrGgmlExecutorError::HostAllocationFailed {
             stage,
             requested_bytes: *requested_bytes,
         }),
@@ -1781,6 +1788,31 @@ mod tests {
             Qwen3AsrGgmlExecutorError::HostAllocationFailed {
                 stage: "gguf-token-embedding-read",
                 requested_bytes: 622_329_856,
+            }
+        ));
+
+        let logits = map_logits_head_error(Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
+            source: GgmlCpuGraphError::HostAllocationFailed {
+                stage: "qwen-llm-logits-argmax-reverse-indices",
+                requested_bytes: 607_744,
+            },
+        });
+        assert_eq!(
+            qwen_execute_error_to_ggml(logits, QWEN3_ASR_GGML_ADAPTER_ID),
+            GgmlAsrExecutionError::HostAllocationFailed {
+                stage: "qwen-llm-logits-argmax-reverse-indices",
+                requested_bytes: 607_744,
+            }
+        );
+
+        assert!(matches!(
+            map_whole_decoder_init_error(GgmlCpuGraphError::HostAllocationFailed {
+                stage: "qwen-llm-fused-argmax-reverse-indices",
+                requested_bytes: 607_744,
+            }),
+            Qwen3AsrGgmlExecutorError::HostAllocationFailed {
+                stage: "qwen-llm-fused-argmax-reverse-indices",
+                requested_bytes: 607_744,
             }
         ));
     }

@@ -955,6 +955,11 @@ pub enum GgmlCpuGraphError {
         stage: &'static str,
         requested_bytes: usize,
     },
+    #[error("ggml cpu graph host allocation failed at {stage} (requested_bytes={requested_bytes})")]
+    HostAllocationFailed {
+        stage: &'static str,
+        requested_bytes: usize,
+    },
     #[error("ggml context layout is invalid at {stage} (requested_bytes={requested_bytes})")]
     ContextInvalidLayout {
         stage: &'static str,

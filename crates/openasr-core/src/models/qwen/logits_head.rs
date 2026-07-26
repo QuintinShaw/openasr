@@ -614,14 +614,28 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
 pub(crate) fn first_max_argmax_reverse_indices(
     vocab_size: usize,
 ) -> Result<Vec<i32>, GgmlCpuGraphError> {
-    (0..vocab_size)
-        .rev()
-        .map(|index| {
-            i32::try_from(index).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-                reason: "first-max argmax vocab index exceeds ggml int boundary",
-            })
-        })
-        .collect()
+    if vocab_size > 0 && i32::try_from(vocab_size - 1).is_err() {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "first-max argmax vocab index exceeds ggml int boundary",
+        });
+    }
+    let requested_bytes = vocab_size.checked_mul(std::mem::size_of::<i32>()).ok_or(
+        GgmlCpuGraphError::UnsupportedInputs {
+            reason: "first-max argmax reverse-index allocation size overflows",
+        },
+    )?;
+    let mut indices = Vec::new();
+    indices
+        .try_reserve_exact(vocab_size)
+        .map_err(|_| GgmlCpuGraphError::HostAllocationFailed {
+            stage: "qwen-llm-logits-argmax-reverse-indices",
+            requested_bytes,
+        })?;
+    for index in (0..vocab_size).rev() {
+        // The checked bound above makes this cast exact.
+        indices.push(index as i32);
+    }
+    Ok(indices)
 }
 
 pub(crate) fn first_max_token_id_from_reversed_argmax(
@@ -821,6 +835,23 @@ mod tests {
         assert!(matches!(
             error,
             Qwen3AsrLlmLogitsHeadError::InvalidHiddenStateShape { .. }
+        ));
+    }
+
+    #[test]
+    fn first_max_argmax_reverse_indices_are_reversed_without_collect_allocation() {
+        assert_eq!(
+            first_max_argmax_reverse_indices(4).expect("small vocab should fit"),
+            vec![3, 2, 1, 0]
+        );
+
+        let error = first_max_argmax_reverse_indices(i32::MAX as usize + 2)
+            .expect_err("vocab values beyond ggml i32 indices must fail before allocation");
+        assert!(matches!(
+            error,
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "first-max argmax vocab index exceeds ggml int boundary"
+            }
         ));
     }
 
