@@ -10,9 +10,9 @@ use crate::ggml_runtime::{
     ggml_available_devices,
 };
 use crate::models::seq2seq_greedy_decode::{
-    MAX_CONSECUTIVE_NGRAM_REPEATS, MAX_REPEAT_NGRAM, Seq2SeqGreedyDecodeConfig,
-    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepLogitsOutput, detect_degenerate_ngram_repeat,
-    select_seq2seq_greedy_step_token,
+    MAX_REPEAT_NGRAM, Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError,
+    Seq2SeqGreedyDecodeStepLogitsOutput, default_max_consecutive_ngram_repeats,
+    detect_degenerate_ngram_repeat, select_seq2seq_greedy_step_token,
 };
 
 /// Server-owned batch execution policy carried with an offline native request.
@@ -257,7 +257,7 @@ pub(crate) fn serve_batch_select_and_apply_greedy_step(
             if let Some(loop_hit) = detect_degenerate_ngram_repeat(
                 generated_tokens,
                 MAX_REPEAT_NGRAM,
-                MAX_CONSECUTIVE_NGRAM_REPEATS,
+                default_max_consecutive_ngram_repeats,
             ) {
                 generated_tokens.truncate(loop_hit.keep_len);
                 generated_probabilities.truncate(loop_hit.keep_len);
@@ -648,8 +648,12 @@ mod tests {
         assert!(done, "guard must finish the slot");
         assert_eq!(generated_tokens, vec![5]);
         assert_eq!(generated_probabilities.len(), 1);
-        // Tripped at the 4th identical token (steps 0..=3), so no further steps.
-        assert_eq!(steps, 4);
+        // Tripped at the single-token cycle bound from
+        // `default_max_consecutive_ngram_repeats` (steps 0..=7), so no further
+        // steps. Asserting the shared policy's number rather than a literal is
+        // the point: the batched path must move with the serial one, never
+        // carry its own bound.
+        assert_eq!(steps, default_max_consecutive_ngram_repeats(1));
     }
 
     #[test]

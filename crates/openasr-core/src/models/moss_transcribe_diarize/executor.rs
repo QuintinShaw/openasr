@@ -40,8 +40,9 @@ use crate::models::incremental_streaming_driver::{
 use crate::models::qwen::{Qwen3AsrLayerKvCacheState, Qwen3AsrPromptEmbeddings};
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 use crate::models::seq2seq_greedy_decode::{
-    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
-    Seq2SeqGreedyDecodeStepLogitsOutput,
+    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
+    Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
+    Seq2SeqGreedyDecodeStopReason,
 };
 use crate::models::thread_local_runtime_cache::{
     BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
@@ -401,6 +402,7 @@ mod moss_td_chunk_frame_math_tests {
     #[test]
     fn the_declared_slice_window_fits_the_decoder_context_with_its_decode_budget() {
         let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
+            integral_seconds,
             target_seconds,
             max_seconds,
         } = crate::arch::longform_slice_shape_for_model_architecture(
@@ -412,13 +414,67 @@ mod moss_td_chunk_frame_math_tests {
         let kv_capacity =
             crate::models::moss_transcribe_diarize::runtime_contract::MOSS_TD_MAX_KV_CACHE_POSITIONS;
 
-        for window_seconds in [target_seconds, max_seconds] {
+        for window_seconds in [target_seconds, max_seconds, integral_seconds] {
             let required = prompt_tokens_for(window_seconds) + budget_for(window_seconds);
             assert!(
                 required <= kv_capacity,
                 "{window_seconds}s slice needs {required} positions, capacity is {kv_capacity}"
             );
         }
+    }
+
+    /// `integral_seconds` is derived, not chosen: it must be the LARGEST
+    /// 30s-chunk-aligned window whose prompt plus a budget covering the densest
+    /// measured demand still fits the decoder context. Checking only that the
+    /// declared value fits would pass for any smaller number too, and a value
+    /// set too low silently sends recordings the decoder can serve whole down
+    /// the lossy slicing path -- so this also asserts the next window up does
+    /// NOT fit, pinning the number from both sides.
+    #[test]
+    fn the_integral_window_is_the_largest_one_the_context_can_serve() {
+        let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
+            integral_seconds, ..
+        } = crate::arch::longform_slice_shape_for_model_architecture(
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+        )
+        else {
+            panic!("moss-transcribe-diarize must declare ScopedSlices");
+        };
+        let kv_capacity =
+            crate::models::moss_transcribe_diarize::runtime_contract::MOSS_TD_MAX_KV_CACHE_POSITIONS;
+        // The densest demand this family has actually been measured against;
+        // the same figure the per-second allowance doc comment cites.
+        const DENSEST_MEASURED_TOKENS_PER_SECOND: f32 = 12.7;
+        // One encoder chunk. A window is only meaningful in whole chunks: a
+        // partial chunk still costs a full one's audio tokens.
+        const CHUNK_SECONDS: f32 = 30.0;
+
+        let required_positions = |window_seconds: f32| -> usize {
+            let needed = (window_seconds * DENSEST_MEASURED_TOKENS_PER_SECOND).ceil() as usize;
+            prompt_tokens_for(window_seconds) + needed.min(MOSS_TD_MAX_GENERATED_TOKENS)
+        };
+
+        assert!(
+            required_positions(integral_seconds) <= kv_capacity,
+            "{integral_seconds}s needs {} positions, capacity is {kv_capacity}",
+            required_positions(integral_seconds)
+        );
+        let next_window = integral_seconds + CHUNK_SECONDS;
+        assert!(
+            required_positions(next_window) > kv_capacity,
+            "{next_window}s also fits ({} positions <= {kv_capacity}), so integral_seconds is \
+             set below what this context can serve",
+            required_positions(next_window)
+        );
+        // The budget actually granted at that window must cover the same
+        // demand: the context clamp inside `moss_td_generated_token_budget` is
+        // what a real request is held to, not the requirement above.
+        assert!(
+            budget_for(integral_seconds) as f32
+                >= integral_seconds * DENSEST_MEASURED_TOKENS_PER_SECOND,
+            "granted budget {} at {integral_seconds}s does not cover the densest measured demand",
+            budget_for(integral_seconds)
+        );
     }
 
     /// A slice-length request reaches the runaway backstop, so the per-second
@@ -748,9 +804,41 @@ fn run_moss_td_decoder_with_cached_runtime(
             // leaves a session-scoped allocation riding along on the cached
             // runtime.
             step_executor.decoder.release_session_scoped_buffers();
-            let result = result.map_err(|error| MossTdExecutorError::GreedyDecodeFailed {
-                reason: error.to_string(),
-            })?;
+            let result = match result {
+                Ok(result) => result,
+                // Budget exhausted before `<|im_end|>`: keep the generated
+                // prefix instead of failing the whole request closed, matching
+                // firered-aed's handling of the same driver error. A partial
+                // transcript is a real answer for the audio it covers, and
+                // `truncated` below keeps it labelled as one -- the segment
+                // assembler will not stretch the last segment over the audio
+                // the decode never reached. Discarding it instead returns
+                // nothing at all for a recording the model largely transcribed,
+                // which is strictly worse for the same underlying shortfall.
+                Err(Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {
+                    generated_tokens,
+                    ..
+                }) => {
+                    let text = tokenizer.decode_text_token_ids(&generated_tokens).map_err(
+                        |error| MossTdExecutorError::GreedyDecodeFailed {
+                            reason: format!(
+                                "tokenizer decode of the budget-exhausted prefix failed: {error}"
+                            ),
+                        },
+                    )?;
+                    Seq2SeqGreedyDecodeResult {
+                        text,
+                        generated_tokens,
+                        generated_probabilities: Vec::new(),
+                        stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
+                    }
+                }
+                Err(error) => {
+                    return Err(MossTdExecutorError::GreedyDecodeFailed {
+                        reason: error.to_string(),
+                    });
+                }
+            };
             Ok(MossTdDecodeOutput {
                 text: result.text.trim().to_string(),
                 truncated: result.stop_reason.is_truncated(),

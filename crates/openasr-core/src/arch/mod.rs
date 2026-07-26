@@ -329,7 +329,22 @@ pub(crate) enum OpenAsrLongformSliceShape {
     /// slicer aims for and `max_seconds` the ceiling it may stretch a slice to
     /// when no cut point is available earlier; both must leave room for the
     /// family's decode budget inside its context.
+    ///
+    /// `integral_seconds` is the longest recording this family can fold into a
+    /// SINGLE prompt and still be granted a decode budget that covers its
+    /// densest measured demand. Up to it, slicing is not applied at all.
+    /// Slicing is a degradation, not the normal path: every seam restarts the
+    /// in-decoder speaker numbering and forces cross-slice identity to be
+    /// re-established from voice evidence alone, and the shared slicer's
+    /// cut-point search can clip speech. Measured on Mandarin meeting audio,
+    /// decoding whole beat slice-and-stitch by a wide margin, so the family
+    /// takes the integral path whenever its context can honestly serve it and
+    /// falls back to `target_seconds` slices only past that point. It is a
+    /// derived quantity, not a tuning knob: it must equal the largest window
+    /// whose prompt plus required budget still fits the decoder's KV capacity,
+    /// and the owning family pins it against that arithmetic in a test.
     ScopedSlices {
+        integral_seconds: f32,
         target_seconds: f32,
         max_seconds: f32,
     },
@@ -1971,7 +1986,15 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         // slices is a place cross-slice identity has to be re-established from
         // voice evidence alone. 180s is the target because it leaves the
         // stretch room to 240s for finding a real pause to cut on.
+        // `integral_seconds` = 300s: the longest single-prompt request whose
+        // audio prompt (~512 fixed instruction / marker tokens + 375 audio
+        // tokens per 30s encoder chunk) still leaves a budget covering the
+        // densest measured demand (12.7 tokens/s) inside the 8192-position
+        // decoder context. 330s does not fit, so 300s is the ceiling, not a
+        // preference. Pinned against that arithmetic by
+        // `the_integral_window_is_the_largest_one_the_context_can_serve`.
         longform_slice_shape: OpenAsrLongformSliceShape::ScopedSlices {
+            integral_seconds: 300.0,
             target_seconds: 180.0,
             max_seconds: 240.0,
         },
@@ -2156,6 +2179,7 @@ mod tests {
                 descriptor.model_architecture
             );
             if let OpenAsrLongformSliceShape::ScopedSlices {
+                integral_seconds,
                 target_seconds,
                 max_seconds,
             } = descriptor.longform_slice_shape
@@ -2168,6 +2192,21 @@ mod tests {
                 assert!(
                     max_seconds >= target_seconds,
                     "'{}' max_seconds must not be tighter than target_seconds",
+                    descriptor.model_architecture
+                );
+                assert!(
+                    integral_seconds.is_finite() && integral_seconds > 0.0,
+                    "'{}' integral_seconds must be positive and finite",
+                    descriptor.model_architecture
+                );
+                // A recording the family would decode whole must never be
+                // shorter than one it would cut into pieces: that ordering is
+                // what makes slicing the fallback rather than a second path
+                // running in parallel with the integral one.
+                assert!(
+                    integral_seconds >= max_seconds,
+                    "'{}' integral_seconds must not be under max_seconds, or slicing would \
+                     trigger on recordings the decoder can already serve whole",
                     descriptor.model_architecture
                 );
             }
