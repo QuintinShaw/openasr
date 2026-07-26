@@ -1,13 +1,11 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::models::runtime_cache_coordinator::{
-    is_cacheable_pack_content_id, pack_content_id_for_runtime_path,
-};
+use crate::GgmlRuntimeSource;
+use crate::models::runtime_cache_coordinator::is_cacheable_pack_content_id;
 use crate::stage_timing;
 
 // One slot per pack content id. Path alone is never a key -- same-path byte
@@ -73,9 +71,15 @@ impl<T> Default for PreparedRuntimeCache<T> {
 }
 
 impl<T> PreparedRuntimeCache<T> {
+    /// `runtime_source` must be the already-open, already-validated source
+    /// for the pack being built -- never re-derive a fresh source from a
+    /// path just to call this. Its `content_id()` (fd-derived, memoized) is
+    /// the cache key; `build` still receives whatever the caller closed over
+    /// (typically the same source) to actually materialize the runtime, so
+    /// identity and bytes are provably read from one open handle.
     pub(crate) fn get_or_try_insert_with<E, F, M>(
         &self,
-        runtime_path: &Path,
+        runtime_source: &GgmlRuntimeSource,
         build: F,
         map_poisoned_lock: M,
     ) -> Result<Arc<T>, E>
@@ -83,14 +87,15 @@ impl<T> PreparedRuntimeCache<T> {
         F: FnOnce() -> Result<T, E>,
         M: Fn() -> E,
     {
-        let pack_content_id = pack_content_id_for_runtime_path(runtime_path);
-        if !is_cacheable_pack_content_id(&pack_content_id) {
+        let pack_content_id = runtime_source.content_id();
+        if !is_cacheable_pack_content_id(pack_content_id) {
             // Fail closed on insert: unreadable / non-cacheable content ids never
             // enter the shared map. Still honor the caller's request with a
             // one-shot uncached build so a transient unreadable path does not
             // wedge the request path behind a permanent "unreadable" slot.
-            return Self::build_once_uncached(runtime_path, build, map_poisoned_lock);
+            return Self::build_once_uncached(runtime_source.path(), build, map_poisoned_lock);
         }
+        let pack_content_id = pack_content_id.to_string();
 
         // Step 1: fetch (or create) this content id's slot. The outer map lock is
         // only ever held for this cheap lookup/insert -- never across a build
@@ -148,7 +153,7 @@ impl<T> PreparedRuntimeCache<T> {
                     "model_pack_load",
                     format_args!(
                         "path={} duration_ms={:.3}",
-                        runtime_path.display(),
+                        runtime_source.path().display(),
                         load_started.elapsed().as_secs_f64() * 1000.0
                     ),
                 );
@@ -163,7 +168,7 @@ impl<T> PreparedRuntimeCache<T> {
                     "model_pack_load_panicked",
                     format_args!(
                         "path={} duration_ms={:.3} message={}",
-                        runtime_path.display(),
+                        runtime_source.path().display(),
                         load_started.elapsed().as_secs_f64() * 1000.0,
                         describe_panic_payload(panic_payload.as_ref())
                     ),
@@ -174,7 +179,7 @@ impl<T> PreparedRuntimeCache<T> {
     }
 
     fn build_once_uncached<E, F, M>(
-        runtime_path: &Path,
+        runtime_path: &std::path::Path,
         build: F,
         map_poisoned_lock: M,
     ) -> Result<Arc<T>, E>
@@ -267,10 +272,22 @@ mod tests {
         value: usize,
     }
 
-    fn write_pack(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> PathBuf {
+    /// Writes a minimal valid GGUF-magic fixture (`get_or_try_insert_with`
+    /// now takes a `GgmlRuntimeSource`, which only ever admits GGUF-magic
+    /// files) and returns its path.
+    fn write_pack(dir: &tempfile::TempDir, name: &str, payload: &[u8]) -> PathBuf {
         let path = dir.path().join(name);
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(payload);
         std::fs::write(&path, bytes).expect("write pack");
         path
+    }
+
+    /// Every real caller of `get_or_try_insert_with` already holds a
+    /// `GgmlRuntimeSource` (from a preflight); tests simulate that by
+    /// validating fresh, exactly like a new request would.
+    fn source_for(path: &std::path::Path) -> GgmlRuntimeSource {
+        crate::validate_ggml_runtime_source_path(path).expect("validate runtime source")
     }
 
     #[test]
@@ -281,14 +298,14 @@ mod tests {
 
         let runtime_a = cache
             .get_or_try_insert_with(
-                &path,
+                &source_for(&path),
                 || Ok::<_, &'static str>(StubRuntime { value: 7 }),
                 || "poisoned",
             )
             .expect("runtime a");
         let runtime_b = cache
             .get_or_try_insert_with(
-                &path,
+                &source_for(&path),
                 || Ok::<_, &'static str>(StubRuntime { value: 9 }),
                 || "poisoned",
             )
@@ -302,15 +319,14 @@ mod tests {
     #[test]
     fn reuses_cached_runtime_for_canonical_equivalent_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let runtime_path = temp.path().join("runtime.gguf");
-        std::fs::write(&runtime_path, b"GGUF-bytes").expect("write runtime");
+        let runtime_path = write_pack(&temp, "runtime.gguf", b"canonical-bytes");
         let dotted_path = temp.path().join(".").join("runtime.gguf");
         let cache = PreparedRuntimeCache::<StubRuntime>::default();
         let build_count = Cell::new(0usize);
 
         let runtime_a = cache
             .get_or_try_insert_with(
-                &dotted_path,
+                &source_for(&dotted_path),
                 || {
                     build_count.set(build_count.get() + 1);
                     Ok::<_, &'static str>(StubRuntime { value: 7 })
@@ -320,7 +336,7 @@ mod tests {
             .expect("runtime a");
         let runtime_b = cache
             .get_or_try_insert_with(
-                &runtime_path,
+                &source_for(&runtime_path),
                 || {
                     build_count.set(build_count.get() + 1);
                     Ok::<_, &'static str>(StubRuntime { value: 9 })
@@ -343,7 +359,7 @@ mod tests {
 
         let runtime_a = cache
             .get_or_try_insert_with(
-                &path,
+                &source_for(&path),
                 || {
                     build_count.set(build_count.get() + 1);
                     Ok::<_, &'static str>(StubRuntime { value: 1 })
@@ -354,10 +370,10 @@ mod tests {
         assert_eq!(build_count.get(), 1);
         assert_eq!(cache.len_for_test(), 1);
 
-        std::fs::write(&path, b"content-b-bytes-different").expect("replace bytes");
+        write_pack(&dir, "same-path.oasr", b"content-b-bytes-different");
         let runtime_b = cache
             .get_or_try_insert_with(
-                &path,
+                &source_for(&path),
                 || {
                     build_count.set(build_count.get() + 1);
                     Ok::<_, &'static str>(StubRuntime { value: 2 })
@@ -378,8 +394,10 @@ mod tests {
         assert!(cache.len_for_test() >= 1);
     }
 
-    /// Same bytes, two lookups: exactly one build (the warm-path hit), no
-    /// generation/epoch anywhere in this cache to force a spurious rebuild.
+    /// Same bytes, two lookups (each with its own freshly-validated source,
+    /// exactly like two separate requests): exactly one build (the
+    /// warm-path hit), no generation/epoch anywhere in this cache to force a
+    /// spurious rebuild.
     #[test]
     fn same_content_id_hits_across_repeated_lookups() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -389,7 +407,7 @@ mod tests {
 
         let runtime_a = cache
             .get_or_try_insert_with(
-                &path,
+                &source_for(&path),
                 || {
                     build_count.set(build_count.get() + 1);
                     Ok::<_, &'static str>(StubRuntime { value: 1 })
@@ -399,7 +417,7 @@ mod tests {
             .expect("runtime a");
         let runtime_b = cache
             .get_or_try_insert_with(
-                &path,
+                &source_for(&path),
                 || {
                     build_count.set(build_count.get() + 1);
                     Ok::<_, &'static str>(StubRuntime { value: 2 })
@@ -436,25 +454,25 @@ mod tests {
         };
 
         let runtime_a = cache
-            .get_or_try_insert_with(&path_a, || build(1), || "poisoned")
+            .get_or_try_insert_with(&source_for(&path_a), || build(1), || "poisoned")
             .expect("runtime a");
         let runtime_b = cache
-            .get_or_try_insert_with(&path_b, || build(2), || "poisoned")
+            .get_or_try_insert_with(&source_for(&path_b), || build(2), || "poisoned")
             .expect("runtime b");
         assert_eq!(build_count.get(), 2);
         assert_eq!(cache.len_for_test(), 2);
 
-        let content_id_a = pack_content_id_for_runtime_path(&path_a);
+        let content_id_a = source_for(&path_a).content_id().to_string();
         cache.evict_content_id(&content_id_a);
         assert_eq!(cache.len_for_test(), 1, "only pack a's slot must be gone");
 
         // Pack a rebuilds (its slot was evicted); pack b is untouched --
         // still the exact same Arc, zero extra builds.
         let runtime_a_rebuilt = cache
-            .get_or_try_insert_with(&path_a, || build(3), || "poisoned")
+            .get_or_try_insert_with(&source_for(&path_a), || build(3), || "poisoned")
             .expect("runtime a rebuilt");
         let runtime_b_again = cache
-            .get_or_try_insert_with(&path_b, || build(4), || "poisoned")
+            .get_or_try_insert_with(&source_for(&path_b), || build(4), || "poisoned")
             .expect("runtime b again");
 
         assert_eq!(build_count.get(), 3, "only the evicted pack rebuilds");
@@ -463,40 +481,6 @@ mod tests {
             Arc::ptr_eq(&runtime_b, &runtime_b_again),
             "the untouched pack must still be the same cached Arc"
         );
-    }
-
-    #[test]
-    fn unreadable_pack_is_not_inserted() {
-        let cache = PreparedRuntimeCache::<StubRuntime>::default();
-        let missing = Path::new("/tmp/openasr-definitely-missing-prepared-runtime.oasr");
-        let build_count = Cell::new(0usize);
-
-        let runtime_a = cache
-            .get_or_try_insert_with(
-                missing,
-                || {
-                    build_count.set(build_count.get() + 1);
-                    Ok::<_, &'static str>(StubRuntime { value: 3 })
-                },
-                || "poisoned",
-            )
-            .expect("one-shot a");
-        let runtime_b = cache
-            .get_or_try_insert_with(
-                missing,
-                || {
-                    build_count.set(build_count.get() + 1);
-                    Ok::<_, &'static str>(StubRuntime { value: 4 })
-                },
-                || "poisoned",
-            )
-            .expect("one-shot b");
-
-        assert_eq!(build_count.get(), 2, "unreadable must not cache");
-        assert!(!Arc::ptr_eq(&runtime_a, &runtime_b));
-        assert_eq!(cache.len_for_test(), 0);
-        assert_eq!(runtime_a.value, 3);
-        assert_eq!(runtime_b.value, 4);
     }
 
     #[test]
@@ -512,14 +496,14 @@ mod tests {
         };
 
         let runtime_a = cache
-            .get_or_try_insert_with(&path, || build(7), || "poisoned")
+            .get_or_try_insert_with(&source_for(&path), || build(7), || "poisoned")
             .expect("runtime a");
         assert_eq!(build_count.get(), 1);
 
         cache.clear();
 
         let runtime_b = cache
-            .get_or_try_insert_with(&path, || build(9), || "poisoned")
+            .get_or_try_insert_with(&source_for(&path), || build(9), || "poisoned")
             .expect("runtime b");
 
         assert_eq!(build_count.get(), 2, "clear must force a rebuild");
@@ -551,10 +535,11 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             let path = path.clone();
             thread::spawn(move || {
+                let source = source_for(&path);
                 barrier.wait();
                 cache
                     .get_or_try_insert_with(
-                        &path,
+                        &source,
                         || {
                             build_count.fetch_add(1, Ordering::SeqCst);
                             thread::sleep(std::time::Duration::from_millis(30));
@@ -590,7 +575,7 @@ mod tests {
         let previous_hook = panic::take_hook();
         panic::set_hook(Box::new(|_| {}));
         let first_result = cache.get_or_try_insert_with(
-            &path,
+            &source_for(&path),
             || -> Result<StubRuntime, &'static str> { panic!("simulated build panic") },
             || "poisoned",
         );
@@ -605,7 +590,7 @@ mod tests {
 
         let second_result = cache
             .get_or_try_insert_with(
-                &path,
+                &source_for(&path),
                 || Ok::<_, &'static str>(StubRuntime { value: 42 }),
                 || "poisoned",
             )
@@ -634,9 +619,10 @@ mod tests {
             let barrier = Arc::clone(&builder_in_build);
             let path = path.clone();
             thread::spawn(move || {
+                let source = source_for(&path);
                 cache
                     .get_or_try_insert_with(
-                        &path,
+                        &source,
                         || {
                             build_count.fetch_add(1, Ordering::SeqCst);
                             barrier.wait();
@@ -659,7 +645,7 @@ mod tests {
 
         let rebuilt_runtime = cache
             .get_or_try_insert_with(
-                &path,
+                &source_for(&path),
                 || {
                     build_count.fetch_add(1, Ordering::SeqCst);
                     Ok::<_, &'static str>(StubRuntime { value: 2 })

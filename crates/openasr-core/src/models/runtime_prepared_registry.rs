@@ -80,7 +80,7 @@ impl BuiltinPreparedRuntimeCache {
         P: Fn() -> E,
     {
         self.runtimes_by_path.get_or_try_insert_with(
-            preflight.runtime_source.path(),
+            &preflight.runtime_source,
             || {
                 build_builtin_prepared_runtime(model_architecture, preflight)
                     .map_err(map_build_error)

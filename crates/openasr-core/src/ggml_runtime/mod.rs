@@ -75,3 +75,4 @@ pub use package_probe::{
 pub use runtime_source::{
     GgmlRuntimeSource, GgmlRuntimeSourcePathError, validate_ggml_runtime_source_path,
 };
+pub(crate) use runtime_source::{StrongFileIdentity, resolve_content_id, unreadable_content_id};

@@ -3026,9 +3026,8 @@ impl WhisperGgmlExecutor {
         &self,
         preflight: &crate::GgmlAsrRuntimeSourcePreflight,
     ) -> Result<Arc<WhisperPreparedRuntime>, WhisperGgmlExecutorError> {
-        let runtime_path = preflight.runtime_source.path();
         self.runtime_cache_by_path.get_or_try_insert_with(
-            runtime_path,
+            &preflight.runtime_source,
             || {
                 build_whisper_prepared_runtime(
                     &preflight.runtime_source,
@@ -3218,10 +3217,11 @@ fn build_whisper_prepared_runtime(
     let execution =
         validate_whisper_execution_metadata(metadata).map_err(map_metadata_contract_error)?;
     let tensor_binding = bind_whisper_required_tensors(tensor_index, &execution)?;
-    let tensor_reader = GgufTensorDataReader::from_tensor_index_shared(Arc::clone(
-        &tensor_binding.weights.tensor_index,
-    ))
-    .map_err(map_tensor_materialization_error)?;
+    // `from_runtime_source` (not `from_tensor_index_shared`) so tensor data
+    // reads from `runtime_source`'s already-open mapping instead of
+    // re-opening `tensor_index`'s path -- the TOCTOU this contract closes.
+    let tensor_reader = GgufTensorDataReader::from_runtime_source(runtime_source)
+        .map_err(map_tensor_materialization_error)?;
     let mut encoder_weights =
         materialize_whisper_encoder_weights_from_reader(&tensor_binding, &tensor_reader)?;
     prepare_encoder_runtime_weight_payloads(&mut encoder_weights)?;
@@ -3797,7 +3797,7 @@ fn execute_whisper_with_prepared_runtime(
                         request_options,
                         "whisper",
                         decoder_graph_config.backend,
-                        runtime_source.path(),
+                        runtime_source,
                     ),
                 backend: decoder_graph_config.backend,
                 uses_scheduler: decoder_graph_config.use_scheduler,

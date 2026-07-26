@@ -164,7 +164,7 @@ impl MoonshineGgmlExecutor {
                             &request.request_options,
                             "moonshine",
                             decoder_config.backend,
-                            preflight.runtime_source.path(),
+                            &preflight.runtime_source,
                         ),
                     backend: decoder_config.backend,
                     uses_scheduler: decoder_config.use_scheduler,
@@ -216,7 +216,7 @@ impl MoonshineGgmlExecutor {
         preflight: &GgmlAsrRuntimeSourcePreflight,
     ) -> Result<Arc<MoonshinePreparedRuntime>, MoonshineGgmlExecutorError> {
         self.runtime_cache_by_path.get_or_try_insert_with(
-            preflight.runtime_source.path(),
+            &preflight.runtime_source,
             || build_moonshine_prepared_runtime(preflight).map_err(map_prepared_runtime_error),
             // Covers both a genuinely poisoned slot mutex and a build attempt
             // that panicked and was caught (mutex stays unpoisoned, slot

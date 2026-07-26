@@ -14,7 +14,6 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::NativeAsrSession;
@@ -329,15 +328,20 @@ pub(crate) fn evict_dolphin_pool_entry_for_content_id(pack_content_id: &str) {
 /// already-resolved `reader`) and caching on a miss. The build runs outside the
 /// pool lock so concurrent first callers for distinct packs don't serialize.
 ///
+/// `runtime_source` must be the same already-open source `reader` was built
+/// from (`GgufTensorDataReader::from_runtime_source`) -- its `content_id()`
+/// is the cache key, derived from the same handle the weights are read from,
+/// never a fresh re-derivation from a path.
+///
 /// When the pack cannot be content-hashed, the build still runs once but is
 /// **not** inserted -- path-only keys are a hard NO-GO.
 pub(crate) fn cached_dolphin_runtime_weights(
-    runtime_path: &Path,
+    runtime_source: &crate::GgmlRuntimeSource,
     reader: &GgufTensorDataReader,
 ) -> Result<Arc<DolphinRuntimeWeights>, String> {
     use crate::models::runtime_cache_coordinator::PackContentKey;
 
-    let cache_key = PackContentKey::try_for_runtime_path(runtime_path);
+    let cache_key = PackContentKey::try_for_runtime_source(runtime_source);
     if let Some(ref key) = cache_key {
         let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
         if let Some(weights) = pool.lock().expect("dolphin weights pool lock").get(key) {
@@ -636,7 +640,7 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
         // Reuse dequantized weights across requests (pool keyed by pack path); the
         // ~0.4 s reload+dequant is paid once, later requests are compute-only.
         let weights =
-            cached_dolphin_runtime_weights(&request.runtime_source_path, &reader).map_err(fail)?;
+            cached_dolphin_runtime_weights(&preflight.runtime_source, &reader).map_err(fail)?;
         // Thread the request language into the decode prefix builder; an
         // unsupported code / missing region token fails closed here (typed).
         let output = run_dolphin_pipeline(
@@ -772,6 +776,20 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Writes a minimal valid GGUF-magic fixture: `PackContentKey` now only
+    /// resolves from an already-open `GgmlRuntimeSource`, which only ever
+    /// admits GGUF-magic files.
+    fn write_gguf_fixture(path: &Path, payload: &[u8]) {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(payload);
+        std::fs::write(path, bytes).expect("write fixture");
+    }
+
+    fn key_for(path: &Path) -> PackContentKey {
+        let source = crate::validate_ggml_runtime_source_path(path).expect("validate source");
+        PackContentKey::try_for_runtime_source(&source).expect("cacheable")
+    }
+
     /// Same-path A/B content swap must not hit the previous weight table. Uses a
     /// minimal GGUF so the pool insert path is exercised without a full Dolphin
     /// checkpoint (load may fail on missing tensors; we only need the content-key
@@ -781,10 +799,10 @@ mod tests {
         clear_dolphin_weights_pool();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("same-path.oasr");
-        std::fs::write(&path, b"dolphin-content-a").expect("write a");
-        let key_a = PackContentKey::try_for_runtime_path(&path).expect("cacheable a");
-        std::fs::write(&path, b"dolphin-content-b-different").expect("write b");
-        let key_b = PackContentKey::try_for_runtime_path(&path).expect("cacheable b");
+        write_gguf_fixture(&path, b"dolphin-content-a");
+        let key_a = key_for(&path);
+        write_gguf_fixture(&path, b"dolphin-content-b-different");
+        let key_b = key_for(&path);
         assert_ne!(key_a.pack_content_id, key_b.pack_content_id);
         assert_ne!(key_a, key_b);
 
@@ -813,11 +831,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path_one = dir.path().join("pack-one.oasr");
         let path_two = dir.path().join("pack-two.oasr");
-        std::fs::write(&path_one, b"dolphin-pack-one-bytes").expect("write pack one");
-        std::fs::write(&path_two, b"dolphin-pack-two-different-bytes").expect("write pack two");
+        write_gguf_fixture(&path_one, b"dolphin-pack-one-bytes");
+        write_gguf_fixture(&path_two, b"dolphin-pack-two-different-bytes");
 
-        let key_one = PackContentKey::try_for_runtime_path(&path_one).expect("cacheable one");
-        let key_two = PackContentKey::try_for_runtime_path(&path_two).expect("cacheable two");
+        let key_one = key_for(&path_one);
+        let key_two = key_for(&path_two);
         assert_ne!(key_one, key_two);
 
         let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
@@ -848,8 +866,8 @@ mod tests {
         clear_dolphin_weights_pool();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("pool.oasr");
-        std::fs::write(&path, b"dolphin-pool-seed").expect("write");
-        let key = PackContentKey::try_for_runtime_path(&path).expect("cacheable");
+        write_gguf_fixture(&path, b"dolphin-pool-seed");
+        let key = key_for(&path);
         let pool = DOLPHIN_WEIGHTS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
         pool.lock()
             .expect("lock")

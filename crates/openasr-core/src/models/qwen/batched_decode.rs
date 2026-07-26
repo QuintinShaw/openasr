@@ -2367,7 +2367,9 @@ mod tests {
                 None,
                 "qwen:test",
                 "adapter=none",
-                crate::pack_content_id_for_runtime_path(&fixture.runtime_path),
+                crate::validate_ggml_runtime_source_path(&fixture.runtime_path)
+                    .expect("valid runtime source path")
+                    .content_id(),
             ),
             backend: GgmlCpuGraphConfig::resolve_runtime_backend(),
             metadata: fixture.metadata,

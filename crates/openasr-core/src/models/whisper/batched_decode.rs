@@ -1091,7 +1091,9 @@ mod tests {
                 None,
                 "whisper:test",
                 "adapter=none",
-                crate::pack_content_id_for_runtime_path(runtime_path),
+                crate::validate_ggml_runtime_source_path(runtime_path)
+                    .expect("valid runtime source path")
+                    .content_id(),
             ),
             backend,
             uses_scheduler,

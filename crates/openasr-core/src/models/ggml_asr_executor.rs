@@ -65,8 +65,6 @@ pub struct RuntimeBuildIdentity {
     pub options_fingerprint: String,
 }
 
-pub use crate::models::runtime_cache_coordinator::pack_content_id_for_runtime_path;
-
 impl RuntimeBuildIdentity {
     pub fn new(
         pack_content_id: impl Into<String>,
@@ -84,7 +82,7 @@ impl RuntimeBuildIdentity {
     ///
     /// Prefer an explicit verified/fake content id from the request when present.
     /// Otherwise use the caller-supplied content id (production always passes a
-    /// content-derived id from [`pack_content_id_for_runtime_path`]).
+    /// content-derived id from [`crate::GgmlRuntimeSource::content_id`]).
     pub fn resolve_for_request(
         request_identity: Option<&RuntimeBuildIdentity>,
         route: impl Into<String>,
@@ -115,14 +113,16 @@ impl RuntimeBuildIdentity {
 
 /// Builds the effective serve-batch / runtime-cache identity for one request.
 ///
-/// Always binds a content-derived pack id (installed-pack sha or full-file
-/// sha256). Explicit request identities override the content id only when the
-/// caller already supplies a verified/fake binding.
+/// Always binds a content-derived pack id, taken from `runtime_source`'s
+/// already-open handle (`GgmlRuntimeSource::content_id`) -- never re-derived
+/// from a bare path, which would reopen a file this request already has open
+/// and admitted. Explicit request identities override the content id only
+/// when the caller already supplies a verified/fake binding.
 pub(crate) fn serve_batch_build_identity_for_request(
     options: &GgmlAsrExecutionOptions,
     family: &str,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-    runtime_path: &std::path::Path,
+    runtime_source: &GgmlRuntimeSource,
 ) -> RuntimeBuildIdentity {
     let options_fingerprint = match options.adapter_path.as_ref() {
         Some(path) => format!("adapter={}", path.display()),
@@ -132,7 +132,7 @@ pub(crate) fn serve_batch_build_identity_for_request(
         options.runtime_build_identity.as_ref(),
         format!("{family}:{backend:?}"),
         options_fingerprint,
-        pack_content_id_for_runtime_path(runtime_path),
+        runtime_source.content_id(),
     )
 }
 
@@ -809,11 +809,23 @@ mod tests {
     #[test]
     fn production_pack_content_id_misses_same_path_byte_replacement() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("same-path.oasr");
-        std::fs::write(&path, b"content-a-bytes").expect("write a");
-        let id_a = pack_content_id_for_runtime_path(&path);
-        std::fs::write(&path, b"content-b-bytes-different").expect("write b");
-        let id_b = pack_content_id_for_runtime_path(&path);
+        let path = dir.path().join("same-path.gguf");
+        let write = |payload: &[u8]| {
+            let mut bytes = b"GGUF".to_vec();
+            bytes.extend_from_slice(payload);
+            std::fs::write(&path, bytes).expect("write pack");
+        };
+        let source_content_id = |path: &std::path::Path| -> String {
+            crate::validate_ggml_runtime_source_path(path)
+                .expect("validate runtime source")
+                .content_id()
+                .to_string()
+        };
+
+        write(b"content-a-bytes");
+        let id_a = source_content_id(&path);
+        write(b"content-b-bytes-different");
+        let id_b = source_content_id(&path);
         assert!(id_a.starts_with("sha256:"), "got {id_a}");
         assert!(id_b.starts_with("sha256:"), "got {id_b}");
         assert_ne!(
@@ -822,32 +834,33 @@ mod tests {
         );
 
         let options = GgmlAsrExecutionOptions::default();
-        std::fs::write(&path, b"content-a-bytes").expect("rewrite a");
+        write(b"content-a-bytes");
         let identity_a = serve_batch_build_identity_for_request(
             &options,
             "whisper",
             crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
-            &path,
+            &crate::validate_ggml_runtime_source_path(&path).expect("validate a"),
         );
-        std::fs::write(&path, b"content-b-bytes-different").expect("rewrite b");
+        write(b"content-b-bytes-different");
         let identity_b = serve_batch_build_identity_for_request(
             &options,
             "whisper",
             crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
-            &path,
+            &crate::validate_ggml_runtime_source_path(&path).expect("validate b"),
         );
         assert_eq!(identity_a.pack_content_id, id_a);
         assert_eq!(identity_b.pack_content_id, id_b);
         assert_ne!(identity_a.pack_content_id, identity_b.pack_content_id);
         assert_eq!(identity_a.route, identity_b.route);
 
-        // Re-resolving against unchanged (post-rewrite) bytes must return an
-        // identity equal to `identity_b` -- nothing left to bump spuriously.
+        // Re-resolving (a fresh source, exactly like a new request) against
+        // unchanged (post-rewrite) bytes must return an identity equal to
+        // `identity_b` -- nothing left to bump spuriously.
         let identity_again = serve_batch_build_identity_for_request(
             &options,
             "whisper",
             crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
-            &path,
+            &crate::validate_ggml_runtime_source_path(&path).expect("validate again"),
         );
         assert_eq!(identity_again, identity_b);
     }

@@ -2519,7 +2519,9 @@ fn existing_pack_content_id_for_eviction(final_path: &std::path::Path) -> Option
         return None;
     }
     let content_id =
-        crate::models::runtime_cache_coordinator::pack_content_id_for_runtime_path(final_path);
+        crate::models::runtime_cache_coordinator::pack_content_id_for_path_before_replace(
+            final_path,
+        );
     crate::models::runtime_cache_coordinator::is_cacheable_pack_content_id(&content_id)
         .then_some(content_id)
 }

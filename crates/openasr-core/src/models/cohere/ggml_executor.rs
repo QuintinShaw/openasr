@@ -25,6 +25,7 @@ use super::frontend::{
 use super::graph_config::{cohere_decoder_graph_config, cohere_encoder_graph_config};
 use super::prepared_runtime::{CoherePreparedRuntime, CoherePreparedRuntimeError};
 use crate::COHERE_TRANSCRIBE_GGML_ADAPTER_ID;
+use crate::GgmlRuntimeSource;
 use crate::NativeAsrSession;
 use crate::arch::block_stack::{OpenAsrBlockKind, OpenAsrOrchestrationShape};
 use crate::arch::hparams::{
@@ -186,7 +187,7 @@ impl CohereTranscribeGgmlExecutor {
                     );
                     emit_cohere_debug_feature_preview_if_enabled(&features);
                     self.decode_with_prepared_runtime(
-                        preflight.runtime_source.path(),
+                        &preflight.runtime_source,
                         request,
                         prepared_runtime,
                         &features,
@@ -199,12 +200,13 @@ impl CohereTranscribeGgmlExecutor {
     #[allow(clippy::too_many_arguments)]
     fn decode_with_prepared_runtime(
         &self,
-        runtime_path: &Path,
+        runtime_source: &GgmlRuntimeSource,
         request: &GgmlAsrExecutionRequest,
         prepared_runtime: &CoherePreparedRuntime,
         features: &CohereTranscribeMelFeatures,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, CohereTranscribeGgmlExecutorError> {
+        let runtime_path = runtime_source.path();
         // Make the block-stack descriptor load-bearing (P4 S5e/S5f): fail closed
         // unless the conformer-encoder + seq2seq-decoder stacks this runtime
         // materialized agree with the cohere descriptor's declared shape / block
@@ -319,7 +321,7 @@ impl CohereTranscribeGgmlExecutor {
                             &request.request_options,
                             "cohere",
                             decoder_config.backend,
-                            runtime_path,
+                            runtime_source,
                         ),
                     backend: decoder_config.backend,
                     uses_scheduler: decoder_config.use_scheduler,

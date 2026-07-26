@@ -942,7 +942,9 @@ mod tests {
                 None,
                 "cohere:test",
                 "adapter=none",
-                crate::pack_content_id_for_runtime_path(runtime_path),
+                crate::validate_ggml_runtime_source_path(runtime_path)
+                    .expect("valid runtime source path")
+                    .content_id(),
             ),
             backend,
             uses_scheduler,
@@ -1715,24 +1717,31 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("same-path.oasr");
+        let path = dir.path().join("same-path.gguf");
         let options = GgmlAsrExecutionOptions::default();
+        let write = |payload: &[u8]| {
+            let mut bytes = b"GGUF".to_vec();
+            bytes.extend_from_slice(payload);
+            std::fs::write(&path, bytes).expect("write pack");
+        };
+        let source_for =
+            || crate::validate_ggml_runtime_source_path(&path).expect("validate runtime source");
 
-        std::fs::write(&path, b"cohere-pack-a").expect("write a");
+        write(b"cohere-pack-a");
         let identity_a = serve_batch_build_identity_for_request(
             &options,
             "cohere",
             GgmlCpuGraphBackend::Gpu,
-            &path,
+            &source_for(),
         );
         let key_a = cohere_serve_batch_engine_key(identity_a, GgmlCpuGraphBackend::Gpu, 16, 64, 4);
 
-        std::fs::write(&path, b"cohere-pack-b-different-bytes").expect("write b");
+        write(b"cohere-pack-b-different-bytes");
         let identity_b = serve_batch_build_identity_for_request(
             &options,
             "cohere",
             GgmlCpuGraphBackend::Gpu,
-            &path,
+            &source_for(),
         );
         let key_b =
             cohere_serve_batch_engine_key(identity_b.clone(), GgmlCpuGraphBackend::Gpu, 16, 64, 4);
@@ -1748,7 +1757,7 @@ mod tests {
             &options,
             "cohere",
             GgmlCpuGraphBackend::Gpu,
-            &path,
+            &source_for(),
         );
         let key_again =
             cohere_serve_batch_engine_key(identity_again, GgmlCpuGraphBackend::Gpu, 16, 64, 4);

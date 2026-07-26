@@ -71,6 +71,7 @@ use crate::{
 use super::runtime_contract::parse_qwen3_execution_metadata;
 #[cfg(test)]
 use crate::GgmlAsrRuntimeSourcePreflight;
+use crate::GgmlRuntimeSource;
 #[cfg(test)]
 use crate::models::runtime_prepared_registry::build_builtin_prepared_runtime;
 
@@ -276,7 +277,12 @@ impl Qwen3AsrGgmlExecutor {
                     ),
                 },
                 |prepared_runtime| {
-                    self.execute_with_prepared_runtime(request, prepared_runtime, skip_serve_batch)
+                    self.execute_with_prepared_runtime(
+                        request,
+                        &preflight.runtime_source,
+                        prepared_runtime,
+                        skip_serve_batch,
+                    )
                 },
             );
         qwen_decode_profile_log_opt("prepared_runtime_and_execute", prepared_runtime_started_at);
@@ -287,11 +293,13 @@ impl Qwen3AsrGgmlExecutor {
     fn execute_with_prepared_runtime(
         &self,
         request: &GgmlAsrExecutionRequest,
+        runtime_source: &GgmlRuntimeSource,
         prepared_runtime: &Qwen3AsrPreparedRuntime,
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, Qwen3AsrGgmlExecutorError> {
         self.execute_with_runtime_assets(
             request,
+            runtime_source,
             prepared_runtime.metadata,
             prepared_runtime.tokenizer.as_ref(),
             &prepared_runtime.mel_frontend_plan,
@@ -307,6 +315,7 @@ impl Qwen3AsrGgmlExecutor {
     fn execute_with_runtime_assets(
         &self,
         request: &GgmlAsrExecutionRequest,
+        runtime_source: &GgmlRuntimeSource,
         metadata: Qwen3AsrExecutionMetadata,
         tokenizer: Option<&Qwen3AsrTokenizer>,
         mel_frontend_plan: &Qwen3AsrMelFrontendPlan,
@@ -327,6 +336,7 @@ impl Qwen3AsrGgmlExecutor {
         qwen_decode_profile_log_opt("mel_frontend", mel_started_at);
         let result = self.decode_with_runtime_assets(
             request,
+            runtime_source,
             metadata,
             tokenizer,
             token_embedding_table,
@@ -344,6 +354,7 @@ impl Qwen3AsrGgmlExecutor {
     fn decode_with_runtime_assets(
         &self,
         request: &GgmlAsrExecutionRequest,
+        runtime_source: &GgmlRuntimeSource,
         metadata: Qwen3AsrExecutionMetadata,
         tokenizer: Option<&Qwen3AsrTokenizer>,
         token_embedding_table: super::token_embedding::Qwen3AsrTokenEmbeddingTable,
@@ -488,7 +499,7 @@ impl Qwen3AsrGgmlExecutor {
                             &request.request_options,
                             "qwen",
                             GgmlCpuGraphConfig::resolve_runtime_backend(),
-                            &request.runtime_source_path,
+                            runtime_source,
                         ),
                     backend: GgmlCpuGraphConfig::resolve_runtime_backend(),
                     metadata,
