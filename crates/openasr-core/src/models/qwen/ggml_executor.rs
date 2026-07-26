@@ -1638,7 +1638,9 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0; 160]),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         }
     }
 
@@ -1941,7 +1943,9 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference,
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
 
         let executor = Qwen3AsrGgmlExecutor::default();

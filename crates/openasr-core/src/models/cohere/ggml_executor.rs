@@ -810,7 +810,9 @@ mod tests {
             ),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         }
     }
 
@@ -1168,7 +1170,9 @@ mod tests {
                 prepared_audio: GgmlAsrPreparedAudio::mono_16khz(zh_samples),
                 request_options: Default::default(),
                 backend_preference: GgmlAsrBackendPreference::CpuOnly,
-                execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
+                execution_context: std::sync::Arc::new(
+                    crate::RequestExecutionContext::uncancellable("test fixture"),
+                ),
             };
             // Content/language mismatch (zh_sample.wav vs cohere's English-first
             // prompt) is irrelevant here -- only decode-succeeds + cache-slot

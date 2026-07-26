@@ -153,7 +153,9 @@ mod tests {
                 ..Default::default()
             },
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
         match executor.execute(&request) {
             Ok(result) => Ok(result.transcription.text.trim().to_string()),
@@ -320,7 +322,9 @@ mod tests {
                 ..Default::default()
             },
             backend_preference: backend,
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
         match executor.execute(&request) {
             Ok(result) => Ok(result.transcription.text.trim().to_string()),

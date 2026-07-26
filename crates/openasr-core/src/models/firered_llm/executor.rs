@@ -750,7 +750,9 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference,
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
 
         let executor = FireRedLlmGgmlExecutor;

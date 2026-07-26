@@ -2258,7 +2258,9 @@ async fn native_transcribe_stays_fail_closed_with_local_pack_only_validation() {
     let error = transcribe_with_runtime(
         runtime,
         request,
-        std::sync::Arc::new(openasr_core::RequestExecutionContext::detached()),
+        std::sync::Arc::new(openasr_core::RequestExecutionContext::uncancellable(
+            "test fixture",
+        )),
     )
     .await
     .unwrap_err();
@@ -2307,7 +2309,9 @@ async fn native_audio_preparation_does_not_consume_model_capacity() {
         transcribe_with_runtime(
             request_runtime,
             request,
-            std::sync::Arc::new(openasr_core::RequestExecutionContext::detached()),
+            std::sync::Arc::new(openasr_core::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         )
         .await
     });

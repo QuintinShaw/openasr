@@ -283,7 +283,7 @@ pub struct GgmlAsrExecutionRequest {
     /// Cancel/pause/resume control and request id for this decode, carried
     /// explicitly rather than through the (removed) thread-local
     /// transcription control. Required: a caller with nothing to cancel
-    /// still passes `RequestExecutionContext::detached()`.
+    /// still passes `RequestExecutionContext::uncancellable(reason)`.
     pub execution_context: Arc<RequestExecutionContext>,
 }
 
@@ -889,7 +889,9 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference,
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         }
     }
 

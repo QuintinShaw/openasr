@@ -420,8 +420,8 @@ pub struct TranscriptionRequest {
     /// Cancel/pause/resume control and request id for this decode, carried
     /// explicitly rather than through the (removed) thread-local
     /// transcription control -- see [`crate::RequestExecutionContext`].
-    /// Defaults to a detached context in [`Self::new`]; the server sets a
-    /// real one via [`Self::with_execution_context`] when the client
+    /// Defaults to an uncancellable context in [`Self::new`]; the server
+    /// sets a real one via [`Self::with_execution_context`] when the client
     /// registered a transcription id.
     pub execution_context: Arc<crate::RequestExecutionContext>,
 }
@@ -452,13 +452,16 @@ impl TranscriptionRequest {
             source_channels: None,
             source_container: None,
             prepared_samples: None,
-            execution_context: Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
+                "TranscriptionRequest::new()'s pre-opt-in default; a caller needing \
+                 cancellation attaches a real context via with_execution_context",
+            )),
         }
     }
 
     /// Attaches the explicit cancel/pause/resume context for this request.
     /// Callers with nothing to cancel (CLI single-shot transcribe) can leave
-    /// [`Self::new`]'s detached default in place.
+    /// [`Self::new`]'s uncancellable default in place.
     pub fn with_execution_context(
         mut self,
         execution_context: Arc<crate::RequestExecutionContext>,

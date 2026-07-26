@@ -1106,7 +1106,9 @@ mod tests {
             word_timestamps: false,
             audio_duration_seconds: 1.0,
             carry_prompt_seed_token_ids: None,
-            execution_context: Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         }
     }
 

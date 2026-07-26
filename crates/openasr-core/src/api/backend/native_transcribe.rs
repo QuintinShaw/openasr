@@ -2604,8 +2604,10 @@ mod tests {
     use crate::GgmlAsrExecutor;
     use std::sync::Mutex;
 
-    fn detached_execution_context() -> Arc<crate::RequestExecutionContext> {
-        Arc::new(crate::RequestExecutionContext::detached())
+    fn uncancellable_execution_context_for_test() -> Arc<crate::RequestExecutionContext> {
+        Arc::new(crate::RequestExecutionContext::uncancellable(
+            "test fixture",
+        ))
     }
 
     // The tests in this module that exercise `native_transcription_progress`
@@ -4198,7 +4200,7 @@ mod tests {
             vec![0.0; 1_000],
             GgmlAsrExecutionOptions::default(),
             GgmlAsrBackendPreference::Auto,
-            &detached_execution_context(),
+            &uncancellable_execution_context_for_test(),
             &mut decode_progress,
             1_000,
             "index=1",
@@ -4240,7 +4242,7 @@ mod tests {
             vec![0.0; 1_000],
             GgmlAsrExecutionOptions::default(),
             GgmlAsrBackendPreference::Auto,
-            &detached_execution_context(),
+            &uncancellable_execution_context_for_test(),
             &mut decode_progress,
             1_000,
             "index=1",
@@ -4305,7 +4307,7 @@ mod tests {
             vec![0.0; 1_000],
             GgmlAsrExecutionOptions::default(),
             GgmlAsrBackendPreference::CpuOnly,
-            &detached_execution_context(),
+            &uncancellable_execution_context_for_test(),
             &mut decode_progress,
             1_000,
             "index=1",
@@ -4343,7 +4345,7 @@ mod tests {
                 vec![0.0; 1_000],
                 GgmlAsrExecutionOptions::default(),
                 GgmlAsrBackendPreference::Auto,
-                &detached_execution_context(),
+                &uncancellable_execution_context_for_test(),
                 &mut decode_progress,
                 1_000,
                 &format!("index={slice_index}"),

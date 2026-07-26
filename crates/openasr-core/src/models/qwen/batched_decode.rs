@@ -2393,7 +2393,9 @@ mod tests {
             text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
             word_timestamps: false,
             audio_duration_seconds: 1.0,
-            execution_context: Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         }
     }
 
@@ -2782,7 +2784,7 @@ mod tests {
         use crate::RequestExecutionContext;
         use crate::ggml_runtime::GgmlCpuGraphError;
 
-        let context = RequestExecutionContext::detached();
+        let context = RequestExecutionContext::uncancellable("test fixture");
         assert!(super::ensure_serve_batch_prefill_not_canceled(&context).is_ok());
         context.control.request_cancel();
         assert!(matches!(
@@ -2811,7 +2813,7 @@ mod tests {
 
         use crate::RequestExecutionContext;
 
-        let context = RequestExecutionContext::detached();
+        let context = RequestExecutionContext::uncancellable("test fixture");
         let chunks_run = AtomicUsize::new(0);
         let token_count = 10usize;
         let chunk_size = 3usize;

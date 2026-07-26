@@ -197,9 +197,13 @@ pub(crate) async fn stream_transcription(
         // One-shot SSE transcription has no existing disconnect-tracking
         // structure to source a real cancel control from (unlike the
         // WebSocket realtime session's `backend_control` / the file-upload
-        // route's client-registered transcription id) -- a detached context
-        // is a real, well-formed one that simply has no other holder.
-        let execution_context = Arc::new(openasr_core::RequestExecutionContext::detached());
+        // route's client-registered transcription id) -- an uncancellable
+        // context is a real, well-formed one that simply has no other
+        // holder.
+        let execution_context = Arc::new(openasr_core::RequestExecutionContext::uncancellable(
+            "one-shot SSE file-transcription response path has no client-disconnect \
+             signal to observe yet",
+        ));
         match transcribe_with_runtime(runtime, request, execution_context).await {
             Ok(transcription) => {
                 let end_ms = transcription_end_ms(&transcription);

@@ -324,13 +324,15 @@ async fn run_offline_transcription(
     });
     // Explicit per-request context threaded all the way to the decode
     // dispatch -- never a thread-local. A client that never registered a
-    // transcription id still gets a concrete (detached) context: there is no
-    // "no context" code path below this point.
+    // transcription id still gets a concrete (uncancellable) context: there
+    // is no "no context" code path below this point.
     let execution_context = Arc::new(match &control {
         Some((id, control)) => {
             openasr_core::RequestExecutionContext::new(Some(id.clone()), Arc::clone(control))
         }
-        None => openasr_core::RequestExecutionContext::detached(),
+        None => openasr_core::RequestExecutionContext::uncancellable(
+            "client never registered a transcription id for this request, so it has no cancel source",
+        ),
     });
     let transcription = match transcribe_with_runtime(
         runtime,

@@ -20,8 +20,10 @@
 //! the generic seq2seq serve-batch `Envelope`, each family's serve-batch job,
 //! and [`crate::realtime::RealtimeBackendWorkItem`]. A caller with nothing to
 //! cancel (a CLI single-shot transcribe, an internal test) still constructs a
-//! concrete context via [`RequestExecutionContext::detached`] rather than
-//! omitting one -- there is no "no context" code path in production.
+//! concrete context via [`RequestExecutionContext::uncancellable`] rather
+//! than omitting one -- there is no "no context" code path in production.
+//! `uncancellable` takes a `reason` argument (never a no-argument escape
+//! hatch) -- see its doc comment for why.
 
 use std::sync::Arc;
 
@@ -66,11 +68,57 @@ impl RequestExecutionContext {
 
     /// A context with no external owner: nothing can ever cancel or pause
     /// it. For call paths that have no request id or control to carry (CLI
-    /// single-shot transcribe, internal tests) but still need a concrete,
-    /// well-formed context to satisfy the required-field contract -- this is
-    /// not a "no context" escape hatch, it is a real, valid context whose
-    /// control simply has no other holder.
-    pub fn detached() -> Self {
+    /// single-shot transcribe, a public request builder's pre-opt-in
+    /// default, an internal test) but still need a concrete, well-formed
+    /// context to satisfy the required-field contract -- this is not a "no
+    /// context" escape hatch, it is a real, valid context whose control
+    /// simply has no other holder.
+    ///
+    /// `reason` must name, in the caller's own words, *why* this particular
+    /// call site has no cancel surface -- never a placeholder like `"n/a"`.
+    /// There is deliberately no no-argument form: every opt-out reads inline
+    /// at its call site instead of being silently inherited by whoever next
+    /// copies the line, and the full list of opt-outs is one
+    /// `rg -n 'RequestExecutionContext::uncancellable'` away from being a
+    /// reviewable, shrinkable list rather than something discovered by
+    /// accident.
+    ///
+    /// `reason` is a `&'static str`, not a closed enum: the real reasons are
+    /// heterogeneous prose ("no request id was ever registered", "this
+    /// streaming request type carries no context field yet", "a public
+    /// builder's value before a caller opts in") that do not cluster into a
+    /// small, stable taxonomy. Closing them into an enum would either force
+    /// awkward buckets or grow its own `Other(&'static str)` variant --
+    /// ceremony without adding any enforcement an inline string doesn't
+    /// already give a reviewer. `reason` is not stored on the context
+    /// (nothing at runtime consults it -- `control` alone determines
+    /// cancellation behavior either way); it is a compile-time/code-review
+    /// aid only, so it costs this frequently-cloned struct nothing.
+    ///
+    /// As of this writing exactly two classes of *production* call site are
+    /// real gaps -- each needs product work, not a context-plumbing change,
+    /// to close:
+    ///   - `openasr-server`'s one-shot SSE file-transcription response path
+    ///     has no client-disconnect signal to observe yet (closing it needs
+    ///     a disconnect hook on that stream).
+    ///   - `ctc_streaming_driver.rs` / `incremental_streaming_driver.rs`'s
+    ///     per-frame streaming partial/final requests carry no
+    ///     execution-context field of their own yet, unlike the offline
+    ///     request path (closing it needs those streaming request types to
+    ///     grow the field and thread it from the session's own cancel
+    ///     source).
+    ///
+    /// Every other production call site opts out because the caller
+    /// genuinely has no request id / control to carry (never registered one)
+    /// or is a public request builder's value before a caller opts in via
+    /// `with_execution_context` -- those are not gaps, they are correctly
+    /// detached.
+    pub fn uncancellable(reason: &'static str) -> Self {
+        debug_assert!(
+            !reason.trim().is_empty(),
+            "RequestExecutionContext::uncancellable() requires a real reason, not a placeholder"
+        );
+        let _ = reason;
         Self {
             request_id: None,
             control: Arc::new(TranscriptionControl::new()),
@@ -83,19 +131,13 @@ impl RequestExecutionContext {
     }
 }
 
-impl Default for RequestExecutionContext {
-    fn default() -> Self {
-        Self::detached()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn detached_context_has_no_request_id_and_never_reports_canceled() {
-        let context = RequestExecutionContext::detached();
+    fn uncancellable_context_has_no_request_id_and_never_reports_canceled() {
+        let context = RequestExecutionContext::uncancellable("test fixture");
         assert!(context.request_id.is_none());
         assert!(!context.is_canceled());
     }

@@ -877,7 +877,9 @@ mod tests {
             decode_config,
             word_timestamps: false,
             audio_duration_seconds: 1.0,
-            execution_context: Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         }
     }
 
@@ -1045,7 +1047,9 @@ mod tests {
                 decode_config,
                 word_timestamps: false,
                 audio_duration_seconds: 1.0,
-                execution_context: Arc::new(crate::RequestExecutionContext::detached()),
+                execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
+                    "test fixture",
+                )),
             }
         };
         let build_slots = |n_seq: usize| -> Vec<MoonshineBatchSlot> {

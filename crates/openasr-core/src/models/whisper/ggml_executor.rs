@@ -4028,7 +4028,9 @@ fn execute_whisper_ggml_non_streaming_cpu(
         decoder_runner,
         false,
         false,
-        &std::sync::Arc::new(crate::RequestExecutionContext::detached()),
+        &std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+            "test-only non-streaming CPU decode helper",
+        )),
     )
     .map(|output| output.text)
 }

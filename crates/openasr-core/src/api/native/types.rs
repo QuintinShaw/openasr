@@ -330,7 +330,10 @@ impl NativeAsrOfflineRequest {
             source_channels: None,
             source_container: None,
             prepared_samples: None,
-            execution_context: Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
+                "NativeAsrOfflineRequest::new()'s pre-opt-in default; a caller needing \
+                 cancellation attaches a real context via with_execution_context",
+            )),
         }
     }
 

@@ -965,7 +965,9 @@ mod tests {
             word_timestamps: false,
             audio_duration_seconds: 1.0,
             prefer_cpu_backend,
-            execution_context: Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         }
     }
 

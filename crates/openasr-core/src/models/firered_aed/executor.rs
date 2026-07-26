@@ -416,7 +416,9 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
 
         let executor = FireRedAedGgmlExecutor;
@@ -471,7 +473,9 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples.clone()),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
         let executor = FireRedAedGgmlExecutor;
 
@@ -527,7 +531,9 @@ mod tests {
                 prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
                 request_options: Default::default(),
                 backend_preference: GgmlAsrBackendPreference::CpuOnly,
-                execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
+                execution_context: std::sync::Arc::new(
+                    crate::RequestExecutionContext::uncancellable("test fixture"),
+                ),
             }
         };
         let executor = FireRedAedGgmlExecutor;
@@ -599,7 +605,9 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
         let executor = FireRedAedGgmlExecutor;
         let error = executor
@@ -656,7 +664,9 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
         };
         let executor = FireRedAedGgmlExecutor;
         let result = executor

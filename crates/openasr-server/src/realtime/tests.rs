@@ -363,7 +363,9 @@ fn work_item_for_test(session_key: &str, id: &str) -> RealtimeBackendWorkItem {
         job: backend_job_for_test(id),
         result_sender,
         cancelled: Arc::new(AtomicBool::new(false)),
-        execution_context: Arc::new(openasr_core::RequestExecutionContext::detached()),
+        execution_context: Arc::new(openasr_core::RequestExecutionContext::uncancellable(
+            "test fixture",
+        )),
     }
 }
 
