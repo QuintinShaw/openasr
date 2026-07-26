@@ -329,10 +329,6 @@ mod tests {
 
         {
             let _guard = install_request_backend_override(Some(RequestBackendPreference::CpuOnly));
-            assert_eq!(
-                GgmlCpuGraphConfig::resolve_runtime_backend(),
-                GgmlCpuGraphBackend::Cpu
-            );
             let config = configure_model_runtime_graph_config_from_env(
                 GgmlCpuGraphConfig::runtime_default(),
                 ModelMetalRuntimeOverrides::default(),
@@ -344,10 +340,11 @@ mod tests {
         {
             let _guard =
                 install_request_backend_override(Some(RequestBackendPreference::Accelerated));
-            assert_eq!(
-                GgmlCpuGraphConfig::resolve_runtime_backend(),
-                GgmlCpuGraphBackend::Metal
+            let config = configure_model_runtime_graph_config_from_env(
+                GgmlCpuGraphConfig::runtime_default(),
+                ModelMetalRuntimeOverrides::default(),
             );
+            assert_eq!(config.backend, GgmlCpuGraphBackend::Metal);
         }
     }
 

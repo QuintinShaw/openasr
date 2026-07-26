@@ -2025,7 +2025,8 @@ mod tests {
     fn except_metal_family_gates_only_apple_silicon_metal() {
         use crate::ggml_runtime::{
             GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference,
-            install_request_backend_override,
+            install_request_backend_override, install_resolved_family_runtime_input,
+            resolved_family_runtime_input,
         };
 
         let model_architecture = XASR_ZIPFORMER_GGML_ARCHITECTURE_ID;
@@ -2034,8 +2035,11 @@ mod tests {
 
         // Auto: gated to CPU only if the generic resolver would have picked
         // Metal specifically.
-        let resolved = GgmlCpuGraphConfig::resolve_runtime_backend();
-        let gated = GgmlCpuGraphConfig::resolve_family_runtime_backend(policy);
+        let resolved = GgmlCpuGraphConfig::runtime_default().backend;
+        let gated = {
+            let _resolved = install_resolved_family_runtime_input(policy);
+            resolved_family_runtime_input().backend()
+        };
         if matches!(resolved, GgmlCpuGraphBackend::Metal) {
             assert_eq!(gated, GgmlCpuGraphBackend::Cpu);
         } else {
@@ -2047,18 +2051,17 @@ mod tests {
         {
             let _guard =
                 install_request_backend_override(Some(RequestBackendPreference::Accelerated));
-            let expected = GgmlCpuGraphConfig::resolve_runtime_backend();
-            assert_eq!(
-                GgmlCpuGraphConfig::resolve_family_runtime_backend(policy),
-                expected
-            );
+            let expected = GgmlCpuGraphConfig::runtime_default().backend;
+            let _resolved = install_resolved_family_runtime_input(policy);
+            assert_eq!(resolved_family_runtime_input().backend(), expected);
         }
 
         // An explicit CPU-only request always wins too.
         {
             let _guard = install_request_backend_override(Some(RequestBackendPreference::CpuOnly));
+            let _resolved = install_resolved_family_runtime_input(policy);
             assert_eq!(
-                GgmlCpuGraphConfig::resolve_family_runtime_backend(policy),
+                resolved_family_runtime_input().backend(),
                 GgmlCpuGraphBackend::Cpu
             );
         }

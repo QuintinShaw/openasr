@@ -1208,6 +1208,12 @@ fn run_native_transcription_impl(
     let auto_gpu_policy = crate::arch::family_auto_gpu_policy_for_model_architecture(
         selected_family.model_architecture,
     );
+    // Resolved once for the whole call: everything below (the longform
+    // multichunk-metal probe, the provenance label, and eventually the
+    // family executor via `GgmlAsrExecutionDispatch::execute`) reads this
+    // single value instead of each independently re-deriving it.
+    let _resolved_family_guard =
+        crate::ggml_runtime::install_resolved_family_runtime_input(auto_gpu_policy);
     // Per-request diagnostics line (source/model/quant/backend/audio shape) --
     // logged once here, after model resolution and audio prep have both
     // succeeded and the backend label is resolvable, and before decode
@@ -1248,7 +1254,7 @@ fn run_native_transcription_impl(
         let multichunk_on_metal = arch_prefers_cpu_decoder
             && plan_stats.chunk_count > 1
             && matches!(
-                GgmlCpuGraphConfig::resolve_runtime_backend(),
+                crate::ggml_runtime::resolved_family_runtime_input().backend(),
                 GgmlCpuGraphBackend::Metal
             );
         if multichunk_on_metal {
@@ -1816,7 +1822,7 @@ fn resolve_native_longform_policy(
         requested,
         audio_duration_seconds,
         model_architecture,
-        GgmlCpuGraphConfig::resolve_runtime_backend(),
+        GgmlCpuGraphConfig::runtime_default().backend,
     )
 }
 
@@ -2548,7 +2554,8 @@ fn prefers_cpu_decoder_for_multichunk_metal(model_architecture: &str) -> bool {
 fn native_runtime_backend_label(
     auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
 ) -> &'static str {
-    match GgmlCpuGraphConfig::resolve_family_runtime_backend(auto_gpu_policy) {
+    let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input(auto_gpu_policy);
+    match crate::ggml_runtime::resolved_family_runtime_input().backend() {
         GgmlCpuGraphBackend::Cpu => "cpu",
         GgmlCpuGraphBackend::Metal => "metal",
         GgmlCpuGraphBackend::Gpu => "gpu",
@@ -2650,7 +2657,7 @@ mod tests {
         // Auto, family gate enabled (`AllBackends` shape, every builtin
         // family but the three `ExceptMetal` ones): reports exactly what the
         // generic resolver picks -- unchanged behavior.
-        let generic_auto_label = match GgmlCpuGraphConfig::resolve_runtime_backend() {
+        let generic_auto_label = match GgmlCpuGraphConfig::runtime_default().backend {
             GgmlCpuGraphBackend::Cpu => "cpu",
             GgmlCpuGraphBackend::Metal => "metal",
             GgmlCpuGraphBackend::Gpu => "gpu",

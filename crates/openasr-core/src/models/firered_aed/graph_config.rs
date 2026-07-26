@@ -7,8 +7,8 @@
 //! (CPU vs Metal transcripts match byte-for-byte on real packs), so this
 //! mirrors the cohere/moonshine template -- dynamic backend resolution via
 //! [`configure_model_runtime_graph_config_from_env`] (Metal auto-selected
-//! through `GgmlCpuGraphConfig::resolve_runtime_backend()`), with an explicit
-//! per-stage opt-out that falls back to CPU.
+//! through the generic runtime-default resolver), with an explicit per-stage
+//! opt-out that falls back to CPU.
 //!
 //! Note this is narrower than it may read: firered-aed's own executor never
 //! batches *multiple* longform slices into one graph call the way cohere's
