@@ -57,6 +57,12 @@ where
         .session_config
         .partial_floor_ms(tuning.min_partial_interval_ms());
 
+    // Every family plugged into this shared driver gets its backend resolved
+    // through the same gate, driven by its own descriptor -- no per-family
+    // opt-in code needed.
+    let auto_gpu_policy = crate::arch::family_auto_gpu_policy_for_model_architecture(
+        request.selected_family.model_architecture,
+    );
     let runtime_source_path = request.runtime_source_path.clone();
     let runtime_source_preflight = request.runtime_source_preflight.clone();
     let selected_family = request.selected_family.clone();
@@ -94,6 +100,11 @@ where
         // partials.
         let _backend_override =
             install_request_backend_override(backend_preference.request_backend_override());
+        // Same reasoning: resolve and install this family's backend here too,
+        // so `resolved_family_runtime_input()` is populated for the decode
+        // call below exactly as `GgmlAsrExecutionDispatch::execute` would.
+        let _resolved_backend =
+            crate::ggml_runtime::install_resolved_family_runtime_input(auto_gpu_policy);
         partial_decode(&partial_executor, &make_request(audio))
     });
 
@@ -124,6 +135,8 @@ where
         let _thread_override = install_request_inference_threads_override(inference_threads);
         let _backend_override =
             install_request_backend_override(backend_preference.request_backend_override());
+        let _resolved_backend =
+            crate::ggml_runtime::install_resolved_family_runtime_input(auto_gpu_policy);
         final_decode(&final_executor, &make_final_request(audio)).map(|result| result.transcription)
     });
 
@@ -433,13 +446,14 @@ mod tests {
     /// in `incremental_streaming_driver.rs`: `build_ctc_streaming_driver`'s
     /// `partial_transcribe`/`final_transcribe` closures call the family's
     /// decode fns directly, not through `GgmlAsrExecutionDispatch::execute`,
-    /// so they must install `request.backend_preference` themselves or an
-    /// explicit choice is silently dropped for CTC (parakeet/wav2vec2)
-    /// streaming.
+    /// so they must install `request.backend_preference` -- and now also the
+    /// resolved family runtime input -- themselves, or an explicit choice
+    /// (or the family's own `AutoGpuPolicy` gate) is silently dropped for
+    /// CTC (parakeet/wav2vec2) streaming.
     #[test]
     fn ctc_streaming_closures_install_request_backend_override() {
         use crate::ggml_runtime::{
-            AutoGpuPolicy, GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference,
+            GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBackendPreference,
         };
         use std::path::PathBuf;
 
@@ -464,9 +478,10 @@ mod tests {
 
         // Drives one warm-up partial decode through the real
         // `build_ctc_streaming_driver` closure and records what the decode
-        // fn observed via the thread-local override, plus what a gated
-        // family's `resolve_family_runtime_backend` would resolve to at that
-        // instant.
+        // fn observed via the thread-local override, plus what
+        // `resolved_family_runtime_input()` reports at that instant -- the
+        // same channel the driver itself installs from the request's
+        // architecture-declared `AutoGpuPolicy`.
         fn observed_backend_during_partial_decode(
             backend_preference: crate::GgmlAsrBackendPreference,
         ) -> (Option<RequestBackendPreference>, GgmlCpuGraphBackend) {
@@ -484,7 +499,7 @@ mod tests {
                 move |_executor: &(), _request: &GgmlAsrExecutionRequest| {
                     *observed_for_decode.lock().unwrap() = Some((
                         crate::ggml_runtime::request_backend_override(),
-                        GgmlCpuGraphConfig::resolve_family_runtime_backend(AutoGpuPolicy::Never),
+                        crate::ggml_runtime::resolved_family_runtime_input().backend(),
                     ));
                     Ok(ctc_result("", 0))
                 },
@@ -508,15 +523,21 @@ mod tests {
                 .expect("partial decode closure should have run")
         }
 
-        // Auto: no override installed, so a gated family stays pinned to CPU.
+        // Auto: no override installed. wav2vec2-ctc's policy is `AllBackends`
+        // (a no-op gate), so the resolved input must match the generic
+        // Auto-mode resolution exactly -- host-independent equality, not a
+        // fixed value, since this dev machine's own GPU availability decides
+        // what "generic Auto" picks.
+        let expected_auto_backend = GgmlCpuGraphConfig::runtime_default().backend;
         let (auto_override, auto_backend) =
             observed_backend_during_partial_decode(crate::GgmlAsrBackendPreference::Auto);
         assert_eq!(auto_override, None);
-        assert_eq!(auto_backend, GgmlCpuGraphBackend::Cpu);
+        assert_eq!(auto_backend, expected_auto_backend);
 
         // Explicit Accelerated: the partial_transcribe closure must install
-        // the override itself, so a gated family's resolver sees Accelerated
-        // instead of silently falling back to CPU.
+        // the override itself, so the resolved input reflects Accelerated
+        // instead of silently falling back to whatever Auto would have
+        // picked.
         let (accel_override, accel_backend) =
             observed_backend_during_partial_decode(crate::GgmlAsrBackendPreference::Accelerated);
         assert_eq!(accel_override, Some(RequestBackendPreference::Accelerated));
