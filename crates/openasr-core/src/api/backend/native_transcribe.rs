@@ -2090,14 +2090,37 @@ fn scoped_slice_recording_fits_one_decode(
 /// may narrow this further; they only ever clamp downward, so the effective
 /// window stays the min of every applicable rule.
 ///
-/// Two shared options are also pinned for this shape, both consequences of
+/// Three shared options are also pinned for this shape, all consequences of
 /// "the slice audio *is* the decode unit":
 /// - lead-in/lead-out padding is dropped, because such a family timestamps
 ///   relative to the buffer it was handed while the assembler maps slice-
 ///   relative times from `content_start_sample`; any padding is a straight
 ///   bias on every timestamp in the slice;
 /// - prompt carry is disabled, because the decode prompt is a fixed
-///   fine-tuned instruction, not a free-text context window.
+///   fine-tuned instruction, not a free-text context window;
+/// - the slicing mode is pinned to the contiguous, full-coverage
+///   [`LongFormMode::Energy`] planner, because `Auto` may elect a *packed*
+///   layout that splices the recording's speech spans together and elides
+///   everything its energy VAD read as silence. See below.
+///
+/// The packed layout is a legitimate optimization for a family that decodes a
+/// slice as plain speech-to-text, but it is structurally wrong here on two
+/// counts. It hands the decoder audio that does not exist -- turns spliced
+/// end-to-end across a seam of a few zero samples -- while this family's whole
+/// job is to tell speakers apart from continuous acoustic context, pauses
+/// included. And its timeline map collapses each elided region to a seam, so a
+/// segment whose two ends straddle one is stretched across audio the decoder
+/// never saw: a real Mandarin meeting recording (speech peaking near -44 dBFS,
+/// well under the pipeline's -38 dBFS `energy_silence_threshold_db`) had 47% of
+/// its 360s elided, and the surviving turns were blanketed over the gaps
+/// (one 5-character turn spanning 30.7s across two other speakers' lost
+/// content). `enforce_coverage_dominance` cannot catch that case: the energy
+/// VAD elides what falls under that same silence floor, so the guard's
+/// "is any dropped window audible" test reads its own input back and always
+/// says no. Rather than depend on that guard being level-calibrated for every
+/// recording, this shape takes the planner that cannot elide at all -- the
+/// energy planner slices contiguously from the first sample to the last and
+/// only chooses *where* to cut (see `plan_energy_slices_contiguous`).
 fn apply_scoped_slice_longform_window_policy(
     model_architecture: &str,
     options: &mut crate::LongFormOptions,
@@ -2111,13 +2134,14 @@ fn apply_scoped_slice_longform_window_policy(
     else {
         return;
     };
+    options.mode = LongFormMode::Energy;
     options.chunk_seconds = target_seconds;
     options.max_chunk_seconds = max_seconds.max(target_seconds);
     options.min_chunk_seconds = options.min_chunk_seconds.min(target_seconds);
     options.padding_seconds = 0.0;
     options.carry_prompt_across_slices = false;
     provenance.push(format!(
-        "core.native.longform.policy:scoped-slices,target_seconds={target_seconds},max_seconds={max_seconds}"
+        "core.native.longform.policy:scoped-slices,mode=energy,target_seconds={target_seconds},max_seconds={max_seconds}"
     ));
 }
 
@@ -3674,7 +3698,7 @@ mod tests {
             crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
             GgmlCpuGraphBackend::Cpu,
         );
-        assert_eq!(resolution.options.mode, LongFormMode::Auto);
+        assert_eq!(resolution.options.mode, LongFormMode::Energy);
         assert_eq!(resolution.options.chunk_seconds, target_seconds);
     }
 
@@ -3691,12 +3715,14 @@ mod tests {
             crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
             GgmlCpuGraphBackend::Cpu,
         );
-        assert_eq!(resolution.options.mode, requested.mode);
+        assert!(!matches!(requested.mode, LongFormMode::Off));
+        assert!(!matches!(resolution.options.mode, LongFormMode::Off));
     }
 
     /// A `ScopedSlices` family gets its declared decoder-context window in
-    /// place of the shared 30s default -- widened, not clamped -- plus the two
-    /// options that shape implies (no padding bias on in-decoder timestamps,
+    /// place of the shared 30s default -- widened, not clamped -- plus the
+    /// three options that shape implies (a contiguous full-coverage planner
+    /// that cannot elide audio, no padding bias on in-decoder timestamps, and
     /// no free-text prompt carry across a fixed fine-tuned instruction).
     #[test]
     fn scoped_slice_family_gets_its_declared_window_instead_of_the_shared_default() {
@@ -3718,7 +3744,7 @@ mod tests {
             crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
             GgmlCpuGraphBackend::Cpu,
         );
-        assert_eq!(resolution.options.mode, LongFormMode::Auto);
+        assert_eq!(resolution.options.mode, LongFormMode::Energy);
         assert_eq!(resolution.options.chunk_seconds, target_seconds);
         assert_eq!(resolution.options.max_chunk_seconds, max_seconds);
         assert_eq!(resolution.options.padding_seconds, 0.0);
@@ -3731,6 +3757,99 @@ mod tests {
             LongformPromptCarryMode::Disabled,
         );
         resolution.options.validate().expect("resolved options");
+    }
+
+    /// Deterministic stand-in for a far-field meeting recording where most of
+    /// the speech sits *below* the pipeline's absolute silence floor
+    /// (`energy_silence_threshold_db`, -38 dBFS): a loud talker near the mic
+    /// at the top of each minute, then a long stretch of quiet talkers around
+    /// -45 dBFS, then a genuinely silent tail. This is the level profile that
+    /// made the auto planner elide 47% of a real 360s recording -- the energy
+    /// VAD reads sub-floor speech as silence, and `enforce_coverage_dominance`
+    /// reads the same floor back and agrees it was safe to drop.
+    fn quiet_speech_under_the_silence_floor(total_seconds: f32) -> Vec<f32> {
+        const SAMPLE_RATE: usize = 16_000;
+        const BLOCK_SECONDS: usize = 60;
+        const LOUD_SECONDS: usize = 6;
+        const QUIET_SECONDS: usize = 49;
+        const LOUD_AMPLITUDE: f32 = 0.07;
+        const QUIET_AMPLITUDE: f32 = 0.0056;
+        const SILENCE_AMPLITUDE: f32 = 0.0001;
+
+        let total_samples = (total_seconds * SAMPLE_RATE as f32) as usize;
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        (0..total_samples)
+            .map(|index| {
+                // xorshift64: a deterministic broadband carrier, so the test
+                // depends on the level profile rather than on any waveform.
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let noise = (state >> 40) as f32 / 8_388_608.0 - 1.0;
+                let offset = (index / SAMPLE_RATE) % BLOCK_SECONDS;
+                let amplitude = if offset < LOUD_SECONDS {
+                    LOUD_AMPLITUDE
+                } else if offset < LOUD_SECONDS + QUIET_SECONDS {
+                    QUIET_AMPLITUDE
+                } else {
+                    SILENCE_AMPLITUDE
+                };
+                noise * amplitude
+            })
+            .collect()
+    }
+
+    fn slice_plan_covers_every_sample(plan: &crate::longform::LongFormSlicePlan) -> bool {
+        if plan.processed_audio.is_some() {
+            return false;
+        }
+        let mut covered_to = 0usize;
+        for slice in &plan.slices {
+            if slice.content_start_sample > covered_to {
+                return false;
+            }
+            covered_to = covered_to.max(slice.content_end_sample);
+        }
+        covered_to >= plan.total_samples
+    }
+
+    /// The invariant behind the scoped-slice mode pin: a `ScopedSlices` family
+    /// never gets a plan that elides audio, so no assembled segment can span
+    /// content the decoder was never given. The `Auto` counterfactual on the
+    /// same samples is asserted too -- without the pin this recording loses a
+    /// large fraction of itself to the packed layout, so the test would still
+    /// pass on a broken build if it only checked the resolved plan.
+    #[test]
+    fn scoped_slice_family_never_gets_a_plan_that_elides_audio() {
+        let samples = quiet_speech_under_the_silence_floor(360.0);
+        let resolution = resolve_native_longform_policy_for_backend(
+            None,
+            samples.len() as f32 / 16_000.0,
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(resolution.options.mode, LongFormMode::Energy);
+
+        let plan = plan_longform_slices(&samples, 16_000, &resolution.options, None)
+            .expect("scoped-slice options must plan");
+        assert!(plan.slices.len() > 1, "360s must slice at the 180s target");
+        assert!(
+            slice_plan_covers_every_sample(&plan),
+            "scoped slices must cover every sample on an identity timeline, got {:?}",
+            plan.slices
+        );
+
+        let auto_options = crate::LongFormOptions {
+            mode: LongFormMode::Auto,
+            ..resolution.options.clone()
+        };
+        let auto_plan = plan_longform_slices(&samples, 16_000, &auto_options, None)
+            .expect("auto options must plan");
+        assert!(
+            !slice_plan_covers_every_sample(&auto_plan),
+            "the Auto planner is expected to elide this level profile; if it no longer does, \
+             this test has stopped proving that the mode pin is what protects coverage"
+        );
     }
 
     /// A `SharedWindow` family is untouched by the scoped-slice rule.
