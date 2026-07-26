@@ -26,8 +26,8 @@ pub enum GgmlAsrBackendPreference {
 }
 
 impl GgmlAsrBackendPreference {
-    /// The thread-local override `resolve_runtime_backend` consults; `Auto`
-    /// installs nothing (env/global default decides).
+    /// The thread-local override the shared dispatch's backend resolution
+    /// consults; `Auto` installs nothing (env/global default decides).
     pub(crate) fn request_backend_override(self) -> Option<RequestBackendPreference> {
         match self {
             Self::CpuOnly => Some(RequestBackendPreference::CpuOnly),
@@ -267,15 +267,17 @@ pub struct GgmlAsrExecutionRequest {
     /// Carried on the request but never read directly by an executor's
     /// `execute()` -- backend resolution goes through the thread-local
     /// override (`ggml_runtime::{install_request_backend_override,
-    /// request_backend_override}`), which `resolve_runtime_backend` /
-    /// `resolve_family_runtime_backend` consult. Any code path that builds a
-    /// request and drives a decode call WITHOUT going through
-    /// `GgmlAsrExecutionDispatch::execute` (which installs the override at
-    /// the top of that function) MUST call
+    /// request_backend_override}`) and the resolved family runtime input
+    /// (`ggml_runtime::{install_resolved_family_runtime_input,
+    /// resolved_family_runtime_input}`) the shared dispatch installs from it.
+    /// Any code path that builds a request and drives a decode call WITHOUT
+    /// going through `GgmlAsrExecutionDispatch::execute` (which installs both
+    /// at the top of that function) MUST call
     /// `install_request_backend_override(backend_preference.request_backend_override())`
-    /// itself before decoding, or this field is silently inert and an
-    /// explicit CpuOnly/Accelerated choice never reaches the resolver -- see
-    /// the streaming closures in `incremental_streaming_driver.rs` and
+    /// and `install_resolved_family_runtime_input` itself before decoding, or
+    /// this field is silently inert and an explicit CpuOnly/Accelerated
+    /// choice never reaches the resolved backend -- see the streaming
+    /// closures in `incremental_streaming_driver.rs` and
     /// `ctc_streaming_driver.rs` for the pattern.
     pub backend_preference: GgmlAsrBackendPreference,
     /// Cancel/pause/resume control and request id for this decode, carried
@@ -627,6 +629,17 @@ impl GgmlAsrExecutionDispatch {
         // snapshots): the override is what makes execution_target truthful.
         let _backend_guard =
             install_request_backend_override(request.backend_preference.request_backend_override());
+        // Resolve this family's backend exactly once, through its own
+        // declared `AutoGpuPolicy`, and hand it down as the explicit
+        // `resolved_family_runtime_input()` value every graph-build call
+        // site in the executor below reads -- instead of each site
+        // re-deriving it (and risking an ungated read drifting from a gated
+        // one within the same request).
+        let _resolved_family_guard = crate::ggml_runtime::install_resolved_family_runtime_input(
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                request.selected_family.model_architecture,
+            ),
+        );
 
         if let Some(executor) = self
             .executors_by_adapter_id
@@ -656,6 +669,17 @@ impl GgmlAsrExecutionDispatch {
             &request.selected_family,
             request.request_options.adapter_path.as_deref(),
         )?;
+        // Same reasoning as `execute` above: resolved once here for any
+        // synchronous graph-config work a family's session setup does (e.g.
+        // a fail-fast runtime load), and re-resolved per decode call by the
+        // shared streaming drivers themselves (see
+        // `build_streaming_driver`/`build_ctc_streaming_driver`) since a
+        // live session's decode closures run long after this call returns.
+        let _resolved_family_guard = crate::ggml_runtime::install_resolved_family_runtime_input(
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                request.selected_family.model_architecture,
+            ),
+        );
         if let Some(executor) = self
             .streaming_executors_by_adapter_id
             .get(request.selected_family.adapter_id)
@@ -1499,5 +1523,167 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Contract 4, defect A, regression 1: a single `execute()` call must
+    /// resolve this family's backend exactly once and hand every graph-build
+    /// call site the SAME value -- not let some sites read a gated
+    /// resolution and others an ungated one. The observable seam is a fake
+    /// executor that reads `resolved_family_runtime_input()` at multiple
+    /// simulated call sites (mirroring how a real family reads it once per
+    /// cache key / graph config) and records every read; the assertions
+    /// compare those recordings to each other and to an independent generic
+    /// resolution, not to source code.
+    #[test]
+    fn dispatch_resolves_family_backend_once_and_consistently_across_call_sites() {
+        use crate::ggml_runtime::GgmlCpuGraphBackend;
+        use std::sync::Mutex;
+
+        struct RecordingExecutor {
+            observed: Arc<Mutex<Vec<GgmlCpuGraphBackend>>>,
+        }
+        impl GgmlAsrExecutor for RecordingExecutor {
+            fn executor_id(&self) -> &'static str {
+                "resolved-backend-consistency-stub"
+            }
+
+            fn supports_phrase_bias(&self) -> bool {
+                false
+            }
+
+            fn execute(
+                &self,
+                _request: &GgmlAsrExecutionRequest,
+            ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+                // Three independent reads, standing in for three real
+                // call sites within one family decode (e.g. an audio-encoder
+                // cache key, a decoder cache key, and a graph-config
+                // builder) -- all inside the SAME `execute()` call.
+                let mut observed = self.observed.lock().unwrap();
+                for _ in 0..3 {
+                    observed.push(crate::ggml_runtime::resolved_family_runtime_input().backend());
+                }
+                Ok(GgmlAsrExecutionResult {
+                    transcription: Transcription {
+                        text: "ok".to_string(),
+                        segments: Vec::new(),
+                        longform: None,
+                        language: None,
+                    },
+                    carry_context: None,
+                })
+            }
+        }
+
+        // Whisper's policy is `AllBackends` (a no-op gate), so the resolved
+        // value must equal the independent generic resolution exactly --
+        // host-independent equality, not a fixed backend.
+        let expected = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = GgmlAsrExecutionDispatch::default().with_whisper_non_streaming_cpu(
+            Arc::new(RecordingExecutor {
+                observed: Arc::clone(&observed),
+            }),
+        );
+        dispatch
+            .execute(&whisper_request(GgmlAsrBackendPreference::Auto))
+            .expect("recording executor always succeeds");
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 3, "all three call sites must have run");
+        assert!(
+            observed.iter().all(|backend| *backend == observed[0]),
+            "every call site within one request must observe the identical resolved backend, got {observed:?}"
+        );
+        assert_eq!(
+            observed[0], expected,
+            "resolved backend must match the family's (AllBackends) generic resolution"
+        );
+    }
+
+    /// Contract 4, defect A, regression 2: a family whose descriptor declares
+    /// a gated `AutoGpuPolicy` (xasr-zipformer's real `ExceptMetal`) must
+    /// never observe a backend the gate forbids, even though the shared
+    /// dispatch is the one doing the resolving now, not the family itself.
+    /// Uses a fake executor substituted for the real xasr-zipformer one so
+    /// the assertion is purely about dispatch's resolution, independent of
+    /// xasr-zipformer's own graph-building code.
+    #[test]
+    fn dispatch_honors_gated_family_auto_policy_for_registered_architecture() {
+        use crate::ggml_runtime::GgmlCpuGraphBackend;
+        use std::sync::Mutex;
+
+        struct RecordingExecutor {
+            observed: Arc<Mutex<Option<GgmlCpuGraphBackend>>>,
+        }
+        impl GgmlAsrExecutor for RecordingExecutor {
+            fn executor_id(&self) -> &'static str {
+                "gated-policy-stub"
+            }
+
+            fn supports_phrase_bias(&self) -> bool {
+                false
+            }
+
+            fn execute(
+                &self,
+                _request: &GgmlAsrExecutionRequest,
+            ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+                *self.observed.lock().unwrap() =
+                    Some(crate::ggml_runtime::resolved_family_runtime_input().backend());
+                Ok(GgmlAsrExecutionResult {
+                    transcription: Transcription {
+                        text: "ok".to_string(),
+                        segments: Vec::new(),
+                        longform: None,
+                        language: None,
+                    },
+                    carry_context: None,
+                })
+            }
+        }
+
+        let descriptor = crate::xasr_zipformer_runtime_descriptor_v1();
+        assert_eq!(
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                descriptor.model_architecture
+            ),
+            crate::ggml_runtime::AutoGpuPolicy::ExceptMetal,
+            "this regression only pins something if xasr-zipformer stays ExceptMetal"
+        );
+
+        let generic_auto = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
+        let observed = Arc::new(Mutex::new(None));
+        let dispatch = GgmlAsrExecutionDispatch::default().with_executor_for_adapter(
+            descriptor.adapter_id,
+            Arc::new(RecordingExecutor {
+                observed: Arc::clone(&observed),
+            }),
+        );
+        let request = GgmlAsrExecutionRequest {
+            runtime_source_path: PathBuf::from("fixtures/xasr-zipformer.gguf"),
+            runtime_source_preflight: None,
+            selected_family: descriptor,
+            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
+            request_options: GgmlAsrExecutionOptions::default(),
+            backend_preference: GgmlAsrBackendPreference::Auto,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
+        };
+        dispatch
+            .execute(&request)
+            .expect("recording executor always succeeds");
+
+        let observed = observed.lock().unwrap().expect("executor must have run");
+        // The gate never lets Auto pick Metal specifically for this family --
+        // this is the exact defect-A shape: an ungated read here would have
+        // reported whatever the generic resolver picked, including Metal.
+        assert_ne!(observed, GgmlCpuGraphBackend::Metal);
+        if generic_auto == GgmlCpuGraphBackend::Metal {
+            assert_eq!(observed, GgmlCpuGraphBackend::Cpu);
+        } else {
+            assert_eq!(observed, generic_auto);
+        }
     }
 }
