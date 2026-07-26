@@ -288,10 +288,10 @@ pub fn read_lora_adapter_pack(path: impl AsRef<Path>) -> Result<LoraAdapterPack,
 
     let manifest = parse_manifest(path, &metadata)?;
 
-    // `from_runtime_source` (not `from_tensor_index`) so tensor data reads
-    // from `runtime_source`'s already-open mapping -- the same mapping
-    // `metadata` above was read from -- instead of a second, independent
-    // open of `path` (contract 4's defect C on the LoRA adapter path).
+    // Tensor data must come from `runtime_source`'s already-open mapping, the
+    // same one `metadata` above was read from. A second, independent open of
+    // `path` would let an adapter pack replaced in between pair a manifest
+    // with bytes from a different file generation.
     let reader = GgufTensorDataReader::from_runtime_source(&runtime_source).map_err(|error| {
         AdapterPackError::Unreadable {
             path: path.to_path_buf(),

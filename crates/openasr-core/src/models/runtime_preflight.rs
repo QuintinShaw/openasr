@@ -65,11 +65,10 @@ pub(crate) fn load_runtime_source_metadata_and_tensor_index_from_source(
 pub(crate) fn build_runtime_tensor_reader_from_preflight(
     preflight: &GgmlAsrRuntimeSourcePreflight,
 ) -> Result<GgufTensorDataReader, RuntimeSourceTensorReaderError> {
-    // `from_runtime_source` reads tensor data from `preflight.runtime_source`'s
-    // already-open mapping -- the same open the preflight's `metadata` and
-    // `tensor_index` were themselves derived from -- instead of
-    // `from_tensor_index_shared` re-opening `tensor_index.path()` a second
-    // time (contract 4's defect C).
+    // Tensor data comes from `preflight.runtime_source`'s already-open
+    // mapping, the same open the preflight's `metadata` and `tensor_index`
+    // were derived from. Re-opening the path here would let a pack replaced in
+    // between pair an index with bytes from a different file generation.
     GgufTensorDataReader::from_runtime_source(&preflight.runtime_source).map_err(|source| {
         RuntimeSourceTensorReaderError::Build {
             runtime_source_path: preflight.runtime_source.path().to_path_buf(),

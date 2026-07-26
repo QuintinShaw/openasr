@@ -305,12 +305,11 @@ impl Hymt2Runtime {
 
         let tokenizer = Hymt2Tokenizer::from_gguf_metadata(&metadata)
             .map_err(|source| Hymt2RuntimeError::Tokenizer { source })?;
-        // `from_runtime_source` (not `from_tensor_index_shared`) so tensor
-        // data reads from `runtime_source`'s already-open mapping instead of
-        // re-opening its path -- `runtime_source` was already validated and
-        // opened above (`tensor_index` was only needed for the tensor
-        // contract check above; the reader re-derives its own equivalent
-        // index from the same open mapping).
+        // Tensor data must come from `runtime_source`'s already-open mapping
+        // rather than a fresh open of its path. `tensor_index` above was only
+        // needed for the tensor-contract check; the reader re-derives an
+        // equivalent index from that same mapping, so the index and the bytes
+        // it describes cannot come from different file generations.
         let reader = GgufTensorDataReader::from_runtime_source(&runtime_source)
             .map_err(|source| Hymt2RuntimeError::TensorReader { source })?;
         let qwen_metadata = hymt2_metadata.qwen_llm_metadata();

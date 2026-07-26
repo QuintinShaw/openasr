@@ -3228,9 +3228,10 @@ fn build_whisper_prepared_runtime(
     let execution =
         validate_whisper_execution_metadata(metadata).map_err(map_metadata_contract_error)?;
     let tensor_binding = bind_whisper_required_tensors(tensor_index, &execution)?;
-    // `from_runtime_source` (not `from_tensor_index_shared`) so tensor data
-    // reads from `runtime_source`'s already-open mapping instead of
-    // re-opening `tensor_index`'s path -- the TOCTOU this contract closes.
+    // Tensor data must come from `runtime_source`'s already-open mapping, the
+    // same one `tensor_index` was derived from. Re-deriving it from the path
+    // would let a pack replaced in between pair an index with bytes from a
+    // different file generation.
     let tensor_reader = GgufTensorDataReader::from_runtime_source(runtime_source)
         .map_err(map_tensor_materialization_error)?;
     let mut encoder_weights =
