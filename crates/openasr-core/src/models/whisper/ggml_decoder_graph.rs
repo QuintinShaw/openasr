@@ -6,13 +6,13 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    path::Path,
     sync::Arc,
     time::Instant,
 };
 
 use thiserror::Error;
 
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlStaticTensor,
@@ -1477,7 +1477,7 @@ impl WhisperDecoderPersistentWeightCache {
         source: &dyn WhisperDecoderTensorSource,
         tensor_cache: &mut WhisperDecoderExecutionTensorCache,
         self_kv_max_positions: usize,
-        runtime_path: Option<&Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
     ) -> Result<Self, WhisperDecoderGraphExecutionError> {
         Self::build_static_stage_with_n_seq(
             runner,
@@ -1485,7 +1485,7 @@ impl WhisperDecoderPersistentWeightCache {
             source,
             tensor_cache,
             self_kv_max_positions,
-            runtime_path,
+            runtime_source,
             1,
         )
     }
@@ -1496,7 +1496,7 @@ impl WhisperDecoderPersistentWeightCache {
         source: &dyn WhisperDecoderTensorSource,
         tensor_cache: &mut WhisperDecoderExecutionTensorCache,
         self_kv_max_positions: usize,
-        runtime_path: Option<&Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
         n_seq: usize,
     ) -> Result<Self, WhisperDecoderGraphExecutionError> {
         if n_seq == 0 {
@@ -1520,7 +1520,7 @@ impl WhisperDecoderPersistentWeightCache {
         // are referenced directly by the cross-attention precompute task, so they
         // must remain arena-resident.
         let loaded_weights =
-            runtime_path.and_then(|path| runner.load_gguf_weight_context(path).ok());
+            runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
         let cross_kv_excluded_keys: HashSet<LocalLinearWeightCacheKey> = plan
             .layers
             .iter()

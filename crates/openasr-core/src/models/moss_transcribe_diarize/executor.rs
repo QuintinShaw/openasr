@@ -20,7 +20,6 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::path::Path;
 
 use thiserror::Error;
 
@@ -45,8 +44,8 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
-    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
+    with_thread_local_cached_mut_by_key,
 };
 use crate::models::whisper::whisper_log_mel_spectrogram_16khz_mono_v0;
 
@@ -221,12 +220,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
 /// pack, re-read every encoder tensor off disk, and re-uploaded every decoder
 /// layer's weights, on every single call (including every chunk of the same
 /// longform request).
-/// Keyed by (pack path identity: canonical path + content fingerprint,
-/// backend); the content fingerprint ([`runtime_cache_path_identity`]) keeps
-/// an in-place pack replacement at the same path from reusing a runtime whose
-/// mmapped weights came from the old bytes.
-type MossTdEncoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
-type MossTdDecoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+/// Keyed by (pack content id, backend); the content id
+/// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
+/// replacement at the same path from reusing a runtime whose mmapped weights
+/// came from the old bytes.
+type MossTdEncoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+type MossTdDecoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
 
 thread_local! {
     static MOSS_TD_ENCODER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<MossTdEncoderRuntimeCacheKey, MossEncoderRuntime>> =
@@ -436,14 +435,14 @@ mod moss_td_chunk_frame_math_tests {
 /// [`MossEncoderRuntime`] (and re-reading every encoder tensor from disk) on
 /// every call.
 fn encode_moss_td_chunks_with_cached_runtime(
-    runtime_path: &Path,
+    runtime_source: &crate::GgmlRuntimeSource,
     encoder_config: MossEncoderConfig,
     merge_size: usize,
     samples: &[f32],
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<(Vec<f32>, usize), MossTdExecutorError> {
     let key = (
-        runtime_cache_path_identity(runtime_path),
+        PackContentKey::for_runtime_source(runtime_source),
         moss_td_encoder_graph_config(backend).backend,
     );
     // Upstream `_compute_audio_token_length`'s stride: hop_length * the
@@ -456,7 +455,7 @@ fn encode_moss_td_chunks_with_cached_runtime(
         || {
             #[cfg(test)]
             MOSS_TD_ENCODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
-            MossEncoderRuntime::new(runtime_path, encoder_config, backend).map_err(|error| {
+            MossEncoderRuntime::new(runtime_source, encoder_config, backend).map_err(|error| {
                 MossTdExecutorError::EncoderFailed {
                     reason: format!("could not initialize encoder runtime: {error}"),
                 }
@@ -506,7 +505,7 @@ fn encode_moss_td_chunks_with_cached_runtime(
 /// its own between calls, so no cache-reset step is needed before reuse.
 #[allow(clippy::too_many_arguments)]
 fn run_moss_td_decoder_with_cached_runtime(
-    runtime_path: &Path,
+    runtime_source: &crate::GgmlRuntimeSource,
     decoder_metadata: MossTdDecoderMetadata,
     request_kv_cache_positions: usize,
     max_generated_tokens: usize,
@@ -518,7 +517,7 @@ fn run_moss_td_decoder_with_cached_runtime(
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<String, MossTdExecutorError> {
     let key = (
-        runtime_cache_path_identity(runtime_path),
+        PackContentKey::for_runtime_source(runtime_source),
         moss_td_runtime_graph_config(backend).backend,
     );
     with_thread_local_cached_mut_by_key(
@@ -528,7 +527,7 @@ fn run_moss_td_decoder_with_cached_runtime(
         || {
             #[cfg(test)]
             MOSS_TD_DECODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
-            MossTdDecoderRuntime::new(runtime_path, decoder_metadata, backend).map_err(|error| {
+            MossTdDecoderRuntime::new(runtime_source, decoder_metadata, backend).map_err(|error| {
                 MossTdExecutorError::DecoderFailed {
                     reason: error.to_string(),
                 }
@@ -695,7 +694,7 @@ impl MossTdGgmlExecutor {
         // this pack+backend instead of being rebuilt from scratch on every
         // `execute()`.
         let (mut concatenated_rows, total_frames) = encode_moss_td_chunks_with_cached_runtime(
-            preflight.runtime_source.path(),
+            &preflight.runtime_source,
             encoder_config,
             adaptor_metadata.merge_size,
             samples,
@@ -755,9 +754,9 @@ impl MossTdGgmlExecutor {
         // decoder weights + reuse-graph machinery stay resident across calls
         // to this pack+backend, while the KV cache for this one utterance is
         // still allocated fresh inside the helper.
-        let runtime_path = preflight.runtime_source.path();
+        let runtime_source = &preflight.runtime_source;
         let text = run_moss_td_decoder_with_cached_runtime(
-            runtime_path,
+            runtime_source,
             decoder_metadata,
             request_kv_cache_positions,
             max_generated_tokens,

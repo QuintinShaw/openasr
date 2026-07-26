@@ -22,10 +22,9 @@
 
 #![allow(dead_code)]
 
-use std::path::Path;
-
 use thiserror::Error;
 
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
     GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena,
@@ -278,7 +277,7 @@ fn build_firered_decoder_arena_state(
 
 impl FireRedDecoderGraphRuntime {
     pub(crate) fn new(
-        runtime_path: &Path,
+        runtime_source: &GgmlRuntimeSource,
         metadata: FireRedAedExecutionMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedDecoderError> {
@@ -286,7 +285,7 @@ impl FireRedDecoderGraphRuntime {
         let runner = GgmlCpuGraphRunner::new(firered_decoder_graph_config(backend))
             .map_err(|source| map_err("runner_init", source))?;
         let loaded = runner
-            .load_gguf_weight_context(runtime_path)
+            .load_gguf_weight_context(runtime_source)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
         let weights = FireRedDecoderWeights::load(&loaded, metadata.decoder_n_layers)?;
         let arena_state =

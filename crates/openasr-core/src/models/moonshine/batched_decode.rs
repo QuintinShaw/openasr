@@ -73,6 +73,14 @@ impl MoonshineServeBatchConfigFromPolicy for MoonshineServeBatchConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct MoonshineServeBatchJob {
     pub runtime_cache_path: PathBuf,
+    /// The same already-open, already-validated source the submitting
+    /// thread's preflight resolved. Cloning it is a refcount bump on its
+    /// `Arc<Mmap>`, not a reopen -- the worker thread that actually builds
+    /// the decoder runtime binds resident weights from this same mapping
+    /// instead of a fresh `File::open`/`load_gguf_weight_context` by path
+    /// (contract 4's defect C: identity and weight bytes must come from one
+    /// open, even across this thread boundary).
+    pub runtime_source: crate::GgmlRuntimeSource,
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub uses_scheduler: bool,
@@ -195,7 +203,7 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
                 backend: job.backend,
             },
             false,
-            Some(job.runtime_cache_path.as_path()),
+            Some(&job.runtime_source),
             None,
         )
         .map_err(map_decoder_error)
@@ -208,7 +216,7 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
             job.encoder_output.frame_count,
             job.backend,
             false,
-            Some(job.runtime_cache_path.as_path()),
+            Some(&job.runtime_source),
             n_seq,
             None,
         )
@@ -867,16 +875,17 @@ mod tests {
             suppress_token_ids: Vec::new(),
             phrase_biases: Vec::new(),
         };
+        let runtime_source = crate::validate_ggml_runtime_source_path(runtime_path)
+            .expect("valid runtime source path");
         MoonshineServeBatchJob {
             runtime_cache_path: runtime_path.to_path_buf(),
             build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
                 None,
                 "moonshine:test",
                 "adapter=none",
-                crate::validate_ggml_runtime_source_path(runtime_path)
-                    .expect("valid runtime source path")
-                    .content_id(),
+                runtime_source.content_id(),
             ),
+            runtime_source,
             backend,
             uses_scheduler,
             prepared_runtime,
@@ -1045,16 +1054,17 @@ mod tests {
                 suppress_token_ids: vec![metadata.eos_token_id],
                 phrase_biases: Vec::new(),
             };
+            let runtime_source = crate::validate_ggml_runtime_source_path(&runtime_path)
+                .expect("valid runtime source path");
             MoonshineServeBatchJob {
                 runtime_cache_path: runtime_path.to_path_buf(),
                 build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
                     None,
                     "moonshine:test",
                     "adapter=none",
-                    crate::validate_ggml_runtime_source_path(&runtime_path)
-                        .expect("valid runtime source path")
-                        .content_id(),
+                    runtime_source.content_id(),
                 ),
+                runtime_source,
                 backend: runtime_config.backend,
                 uses_scheduler: runtime_config.use_scheduler,
                 prepared_runtime: Arc::clone(&prepared_runtime),

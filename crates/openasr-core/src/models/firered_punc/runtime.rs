@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::path::Path;
 
-use crate::ggml_runtime::{GgufTensorDataReader, read_gguf_metadata};
+use crate::ggml_runtime::{GgufTensorDataReader, read_gguf_metadata_from_runtime_source};
 use crate::punctuation::{
     PunctuationClassifier, PunctuationError, PunctuationRestoreConfig, restore_punctuation,
 };
@@ -60,9 +60,14 @@ impl FireRedPuncRuntime {
         path: &Path,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedPuncRuntimeError> {
-        let reader = GgufTensorDataReader::from_path(path)
+        // Open once: metadata and tensor data must come from the same
+        // mapping, not two independent `File::open`s of `path` racing a
+        // concurrent replacement (contract 4's defect C).
+        let runtime_source = crate::validate_ggml_runtime_source_path(path)
             .map_err(|error| FireRedPuncRuntimeError::Read(error.to_string()))?;
-        let gguf = read_gguf_metadata(path)
+        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source)
+            .map_err(|error| FireRedPuncRuntimeError::Read(error.to_string()))?;
+        let gguf = read_gguf_metadata_from_runtime_source(&runtime_source)
             .map_err(|error| FireRedPuncRuntimeError::Read(error.to_string()))?;
         let metadata = parse_and_validate_firered_punc_metadata(&gguf)
             .map_err(|error| FireRedPuncRuntimeError::Metadata(error.to_string()))?;

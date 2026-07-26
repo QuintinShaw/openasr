@@ -11,10 +11,9 @@
 //! `GGUF_MANIFEST.md`'s `mimo.tok.encoder.skip_layer_id` /
 //! `mimo.tok.conv{1,2}.stride` doc comments and P2.0 findings SS2).
 
-use std::path::Path;
-
 use thiserror::Error;
 
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GGML_TYPE_F16, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
     GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlStaticTensor,
@@ -125,7 +124,7 @@ pub(crate) struct MimoAudiotokEncoderRuntime {
 
 impl MimoAudiotokEncoderRuntime {
     pub(crate) fn new(
-        runtime_path: &Path,
+        runtime_source: &GgmlRuntimeSource,
         metadata: MimoAudiotokMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MimoAudiotokEncoderError> {
@@ -141,18 +140,21 @@ impl MimoAudiotokEncoderRuntime {
         // Zero-copy binding for the big 2-D attn/ffn matmul weights (mmap'd,
         // native f16 -- no host f32 duplicate).
         let loaded_weights = runner
-            .load_gguf_weight_context(runtime_path)
+            .load_gguf_weight_context(runtime_source)
             .map_err(|error| MimoAudiotokEncoderError::GraphExecutionFailed {
                 reason: format!("load_gguf_weight_context: {error}"),
             })?;
         // Plain host reader for the small arena-resident tensors (norms,
         // biases, conv kernels) -- `GgmlLoadedWeightContext` only exposes
-        // zero-copy graph bindings, not host f32 copies.
-        let reader = GgufTensorDataReader::from_path(runtime_path).map_err(|error| {
-            MimoAudiotokEncoderError::GraphExecutionFailed {
-                reason: format!("GgufTensorDataReader::from_path: {error}"),
-            }
-        })?;
+        // zero-copy graph bindings, not host f32 copies. Shares
+        // `runtime_source`'s already-open mapping with the resident-weight
+        // load above instead of a second `File::open` of the same pack.
+        let reader =
+            GgufTensorDataReader::from_runtime_source(runtime_source).map_err(|error| {
+                MimoAudiotokEncoderError::GraphExecutionFailed {
+                    reason: format!("GgufTensorDataReader::from_runtime_source: {error}"),
+                }
+            })?;
         let mut arena = runner
             .start_static_tensor_arena(config.context_bytes)
             .map_err(|source| build_err("static_tensor_arena", source))?;

@@ -5,8 +5,8 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::path::Path;
 
+use crate::GgmlRuntimeSource;
 use crate::PhraseBiasConfig;
 use crate::WAV2VEC2_CTC_DECODE_POLICY_ID;
 use crate::api::backend::WordTimestamp;
@@ -15,7 +15,9 @@ use crate::arch::shape_orchestrator::{
     LayerCountResolver, OpenAsrStageRole, StageBuildPlan, validate_stage_against_descriptor,
 };
 use crate::arch::{OpenAsrArchitectureRegistry, WAV2VEC2_CTC_GGML_ARCHITECTURE_ID};
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufMetadata, GgufTensorDataReader};
+use crate::ggml_runtime::{
+    GgmlCpuGraphBackend, GgufMetadata, GgufTensorDataReader, read_gguf_metadata_from_runtime_source,
+};
 use crate::models::ctc_greedy_decode::{CtcGreedyDecodeError, CtcGreedyDecodeResult};
 use crate::models::ctc_streaming_driver::build_ctc_streaming_driver;
 use crate::models::decode_policy_component_registry::{
@@ -28,8 +30,8 @@ use crate::models::ggml_asr_executor::{
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
-    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
+    with_thread_local_cached_mut_by_key,
 };
 use crate::{NativeAsrSession, WAV2VEC2_CTC_GGML_ADAPTER_ID};
 
@@ -41,7 +43,7 @@ use super::runtime_contract::{
 };
 use super::tokenizer::Wav2Vec2Tokenizer;
 
-type Wav2Vec2RuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+type Wav2Vec2RuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
 
 thread_local! {
     static WAV2VEC2_CTC_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<Wav2Vec2RuntimeCacheKey, Wav2Vec2CtcPreparedRuntime>> =
@@ -83,14 +85,14 @@ pub(crate) struct Wav2Vec2CtcTranscription {
     pub words: Vec<WordTimestamp>,
 }
 
-/// Transcribe 16 kHz mono f32 PCM through the wav2vec2-ctc pipeline. `pack_path`
-/// is the on-disk runtime pack the encoder memory-maps to bind 2-D linears
-/// zero-copy.
+/// Transcribe 16 kHz mono f32 PCM through the wav2vec2-ctc pipeline.
+/// `runtime_source` is the same already-open pack `reader` was built from;
+/// the encoder binds 2-D linears zero-copy from its mapping.
 pub(crate) fn transcribe_wav2vec2_ctc_pcm(
     reader: &GgufTensorDataReader,
     gguf_metadata: &GgufMetadata,
     samples: &[f32],
-    pack_path: &std::path::Path,
+    runtime_source: &GgmlRuntimeSource,
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
@@ -105,7 +107,7 @@ pub(crate) fn transcribe_wav2vec2_ctc_pcm(
     let weights =
         load_wav2vec2_ctc_encoder_weights(reader, &metadata).map_err(|e| e.to_string())?;
     validate_wav2vec2_block_stack(metadata, &weights)?;
-    let mut graph = Wav2Vec2CtcEncoderGraph::new(&weights, metadata, Some(pack_path), backend)
+    let mut graph = Wav2Vec2CtcEncoderGraph::new(&weights, metadata, Some(runtime_source), backend)
         .map_err(|e| e.to_string())?;
     let output = graph.encode(&audio.samples).map_err(|e| e.to_string())?;
     decode_wav2vec2_output(
@@ -119,51 +121,52 @@ pub(crate) fn transcribe_wav2vec2_ctc_pcm(
 
 fn transcribe_wav2vec2_ctc_pcm_cached(
     samples: &[f32],
-    pack_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
 ) -> Result<Wav2Vec2CtcTranscription, String> {
-    let key = (runtime_cache_path_identity(pack_path), backend);
+    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
     with_thread_local_cached_mut_by_key(
         &WAV2VEC2_CTC_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_wav2vec2_prepared_runtime(pack_path, backend),
+        || build_wav2vec2_prepared_runtime(runtime_source, backend),
         |runtime| runtime.transcribe(samples, phrase_bias, word_timestamps),
     )
 }
 
 fn decode_wav2vec2_ctc_pcm_cached(
     samples: &[f32],
-    pack_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     phrase_bias: Option<&PhraseBiasConfig>,
     backend: GgmlCpuGraphBackend,
 ) -> Result<CtcGreedyDecodeResult, String> {
-    let key = (runtime_cache_path_identity(pack_path), backend);
+    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
     with_thread_local_cached_mut_by_key(
         &WAV2VEC2_CTC_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || build_wav2vec2_prepared_runtime(pack_path, backend),
+        || build_wav2vec2_prepared_runtime(runtime_source, backend),
         |runtime| runtime.decode_result(samples, phrase_bias),
     )
 }
 
 fn build_wav2vec2_prepared_runtime(
-    pack_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     backend: GgmlCpuGraphBackend,
 ) -> Result<Wav2Vec2CtcPreparedRuntime, String> {
-    let reader = GgufTensorDataReader::from_path(pack_path).map_err(|e| e.to_string())?;
+    let reader =
+        GgufTensorDataReader::from_runtime_source(runtime_source).map_err(|e| e.to_string())?;
     let gguf_metadata =
-        crate::ggml_runtime::read_gguf_metadata(pack_path).map_err(|e| e.to_string())?;
+        read_gguf_metadata_from_runtime_source(runtime_source).map_err(|e| e.to_string())?;
     let metadata =
         parse_wav2vec2_ctc_execution_metadata(&gguf_metadata).map_err(|e| e.to_string())?;
     let tokenizer = Wav2Vec2Tokenizer::from_metadata(&gguf_metadata)?;
     let weights =
         load_wav2vec2_ctc_encoder_weights(&reader, &metadata).map_err(|e| e.to_string())?;
     validate_wav2vec2_block_stack(metadata, &weights)?;
-    let graph = Wav2Vec2CtcEncoderGraph::new(&weights, metadata, Some(pack_path), backend)
+    let graph = Wav2Vec2CtcEncoderGraph::new(&weights, metadata, Some(runtime_source), backend)
         .map_err(|e| e.to_string())?;
     Ok(Wav2Vec2CtcPreparedRuntime { tokenizer, graph })
 }
@@ -296,12 +299,12 @@ impl Wav2Vec2CtcGgmlExecutor {
             adapter_id: request.selected_family.adapter_id,
             reason,
         };
-        request
+        let preflight = request
             .resolve_runtime_source_preflight()
             .map_err(|error| fail(error.to_string()))?;
         decode_wav2vec2_ctc_pcm_cached(
             &request.prepared_audio.samples_f32,
-            &request.runtime_source_path,
+            &preflight.runtime_source,
             request.request_options.phrase_bias.as_ref(),
             request.resolved_runtime.backend(),
         )
@@ -334,12 +337,12 @@ impl GgmlAsrExecutor for Wav2Vec2CtcGgmlExecutor {
         };
         // Fail-closed: validate the runtime source path before touching the pack
         // (Gate-0 preflight), then run the cached prepared-runtime path.
-        request
+        let preflight = request
             .resolve_runtime_source_preflight()
             .map_err(|error| fail(error.to_string()))?;
         let output = transcribe_wav2vec2_ctc_pcm_cached(
             &request.prepared_audio.samples_f32,
-            &request.runtime_source_path,
+            &preflight.runtime_source,
             request.request_options.phrase_bias.as_ref(),
             request.request_options.word_timestamps,
             request.resolved_runtime.backend(),
@@ -503,13 +506,15 @@ mod tests {
         let reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS \
                          DIVORCE CASE THE ANGRIER HE GREW";
         let samples = read_wav_mono_16k(&clip).expect("wav");
-        let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source).expect("reader");
         let metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
         let hypothesis = transcribe_wav2vec2_ctc_pcm(
             &reader,
             &metadata,
             &samples,
-            &pack,
+            &runtime_source,
             None,
             false,
             GgmlCpuGraphBackend::Cpu,
@@ -555,14 +560,16 @@ mod tests {
         let reference = "FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS \
                          DIVORCE CASE THE ANGRIER HE GREW";
         let samples = read_wav_mono_16k(&clip).expect("wav");
-        let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source).expect("reader");
         let metadata = crate::ggml_runtime::read_gguf_metadata(&pack).expect("metadata");
 
         let hypothesis = transcribe_wav2vec2_ctc_pcm(
             &reader,
             &metadata,
             &samples,
-            &pack,
+            &runtime_source,
             None,
             false,
             GgmlCpuGraphBackend::Cpu,

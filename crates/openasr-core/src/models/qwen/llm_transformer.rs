@@ -7,6 +7,7 @@ use std::fmt;
 
 use thiserror::Error;
 
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlKvElementType,
     GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError,
@@ -1512,12 +1513,12 @@ impl fmt::Debug for Qwen3AsrLlmWholeDecoderGraphExecutor {
 impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     pub(crate) fn new(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
-        runtime_path: Option<&std::path::Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GgmlCpuGraphError> {
         Self::new_with_rms_norm_epsilon_and_fused_logits_head(
             projections,
-            runtime_path,
+            runtime_source,
             DEFAULT_RMS_NORM_EPSILON,
             None,
             backend,
@@ -1528,13 +1529,13 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     /// graph.  Uses [`DEFAULT_RMS_NORM_EPSILON`] and no fused logits head.
     pub(crate) fn new_with_lora(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
-        runtime_path: Option<&std::path::Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
         adapter: Option<&QwenLoraAdapter>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GgmlCpuGraphError> {
         Self::new_with_adapter(
             projections,
-            runtime_path,
+            runtime_source,
             DEFAULT_RMS_NORM_EPSILON,
             None,
             adapter,
@@ -1544,14 +1545,14 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
 
     pub(crate) fn new_with_rms_norm_epsilon_and_fused_logits_head(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
-        runtime_path: Option<&std::path::Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
         rms_norm_epsilon: f32,
         fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, GgmlCpuGraphError> {
         Self::new_with_adapter(
             projections,
-            runtime_path,
+            runtime_source,
             rms_norm_epsilon,
             fused_logits_head,
             None,
@@ -1565,10 +1566,14 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     ///
     /// `backend` is this family's already-resolved backend (see
     /// `GgmlAsrExecutionRequest::resolved_runtime`'s doc comment) -- the
-    /// caller's explicit value, never re-derived here.
+    /// caller's explicit value, never re-derived here. `runtime_source` is
+    /// the same already-open, already-validated source the caller's tensor
+    /// reader was built from -- the zero-copy resident-weight bind below
+    /// shares that one open mapping instead of a second `File::open` of the
+    /// pack (contract 4's defect C).
     pub(crate) fn new_with_adapter(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
-        runtime_path: Option<&std::path::Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
         rms_norm_epsilon: f32,
         fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
         adapter: Option<&QwenLoraAdapter>,
@@ -1600,7 +1605,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         // goals 7+8: bind output/gate/up/down zero-copy from the mmap'd pack
         // (native q8/f16) instead of copying them into the arena. The context is
         // owned by this executor (drops after `reuse`, before `runner`).
-        let loaded = runtime_path.and_then(|path| runner.load_gguf_weight_context(path).ok());
+        let loaded = runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
         let mut arena = runner.start_static_tensor_arena(config.context_bytes)?;
         let mut layers = Vec::with_capacity(projections.len());
         let mut fused_qkvs = Vec::with_capacity(projections.len());
@@ -5769,14 +5774,14 @@ mod tests {
             GgufTensorDataReader::from_path(runtime_source.path()).expect("qwen tensor reader");
         let projections = load_qwen3_llm_attention_projections_from_reader(&reader, metadata)
             .expect("llm layers");
-        let serial = run_qwen_serial_prefill(&projections, &runtime_path, metadata, &hidden);
+        let serial = run_qwen_serial_prefill(&projections, &runtime_source, metadata, &hidden);
         let seeds_two: [&[Qwen3AsrLayerKvCacheState]; 2] =
             [&serial.layer_kv_caches, &serial.layer_kv_caches];
         let seeds_one: [&[Qwen3AsrLayerKvCacheState]; 1] = [&serial.layer_kv_caches];
 
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             &projections,
-            Some(&runtime_path),
+            Some(&runtime_source),
             GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
@@ -5907,17 +5912,17 @@ mod tests {
         let projections = load_qwen3_llm_attention_projections_from_reader(&reader, metadata)
             .expect("llm layers");
 
-        let serial = run_qwen_serial_prefill(&projections, &runtime_path, metadata, &hidden);
+        let serial = run_qwen_serial_prefill(&projections, &runtime_source, metadata, &hidden);
         let mut selected_chunk_size = None;
         let prefill = match mode {
             Qwen3AsrPrefillParityMode::Whole => {
-                run_qwen_whole_prefill(&projections, &runtime_path, token_count, &hidden)
+                run_qwen_whole_prefill(&projections, &runtime_source, token_count, &hidden)
             }
             Qwen3AsrPrefillParityMode::Chunked { chunk_size } => {
                 selected_chunk_size = Some(chunk_size);
                 run_qwen_chunked_prefill(
                     &projections,
-                    &runtime_path,
+                    &runtime_source,
                     metadata,
                     token_count,
                     chunk_size,
@@ -5926,12 +5931,12 @@ mod tests {
             }
             Qwen3AsrPrefillParityMode::Policy => {
                 let chunk_size =
-                    qwen_policy_prefill_chunk_size(&projections, &runtime_path, token_count)
+                    qwen_policy_prefill_chunk_size(&projections, &runtime_source, token_count)
                         .expect("qwen policy should return a chunk size for native GQA");
                 selected_chunk_size = Some(chunk_size);
                 run_qwen_chunked_prefill(
                     &projections,
-                    &runtime_path,
+                    &runtime_source,
                     metadata,
                     token_count,
                     chunk_size,
@@ -6002,7 +6007,7 @@ mod tests {
 
     fn run_qwen_serial_prefill(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
-        runtime_path: &std::path::Path,
+        runtime_source: &crate::GgmlRuntimeSource,
         metadata: Qwen3AsrExecutionMetadata,
         hidden: &[f32],
     ) -> Qwen3AsrSerialPrefillOutput {
@@ -6012,7 +6017,7 @@ mod tests {
             .expect("hidden token count");
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             projections,
-            Some(runtime_path),
+            Some(runtime_source),
             GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("serial qwen decoder");
@@ -6067,13 +6072,13 @@ mod tests {
 
     fn run_qwen_whole_prefill(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
-        runtime_path: &std::path::Path,
+        runtime_source: &crate::GgmlRuntimeSource,
         token_count: usize,
         hidden: &[f32],
     ) -> Qwen3AsrLlmWholeStepOutput {
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             projections,
-            Some(runtime_path),
+            Some(runtime_source),
             GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("prefill qwen decoder");
@@ -6087,7 +6092,7 @@ mod tests {
 
     fn run_qwen_chunked_prefill(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
-        runtime_path: &std::path::Path,
+        runtime_source: &crate::GgmlRuntimeSource,
         metadata: Qwen3AsrExecutionMetadata,
         token_count: usize,
         chunk_size: usize,
@@ -6096,7 +6101,7 @@ mod tests {
         assert!(chunk_size > 0, "chunk size must be positive");
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             projections,
-            Some(runtime_path),
+            Some(runtime_source),
             GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("chunked prefill qwen decoder");
@@ -6177,12 +6182,12 @@ mod tests {
 
     fn qwen_policy_prefill_chunk_size(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
-        runtime_path: &std::path::Path,
+        runtime_source: &crate::GgmlRuntimeSource,
         token_count: usize,
     ) -> Option<usize> {
         let decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             projections,
-            Some(runtime_path),
+            Some(runtime_source),
             GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("policy qwen decoder");

@@ -2,8 +2,11 @@
 //! stateless RNN-T greedy decode.
 
 use std::cell::RefCell;
+
+#[cfg(test)]
 use std::path::Path;
 
+use crate::GgmlRuntimeSource;
 use crate::NativeAsrSession;
 use crate::PhraseBiasConfig;
 use crate::api::backend::{Segment, Transcription, WordTimestamp};
@@ -15,8 +18,8 @@ use crate::models::ggml_asr_executor::{
 };
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
-    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
+    with_thread_local_cached_mut_by_key,
 };
 
 use super::frontend::{XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES, XASR_SAMPLE_RATE_HZ};
@@ -26,11 +29,11 @@ use super::runtime::{
 };
 use super::streaming_decoder::XasrIncrementalDecoder;
 
-/// (pack path identity: canonical path + content fingerprint, backend). The
-/// content fingerprint ([`runtime_cache_path_identity`]) keeps an in-place
-/// pack replacement at the same path from reusing a runtime built from the
-/// old bytes.
-type XasrRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+/// (pack content id, backend). The content id
+/// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
+/// replacement at the same path from reusing a runtime built from the old
+/// bytes.
+type XasrRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
 
 thread_local! {
     static XASR_ZIPFORMER_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<XasrRuntimeCacheKey, XasrZipformerPreparedRuntime>> =
@@ -104,7 +107,7 @@ pub(crate) fn transcribe_xasr_zipformer_pcm(
 
 fn transcribe_xasr_zipformer_pcm_cached(
     samples: &[f32],
-    pack_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
@@ -113,12 +116,12 @@ fn transcribe_xasr_zipformer_pcm_cached(
         return Err("xasr-zipformer phrase bias is not supported".to_string());
     }
     let backend = xasr_zipformer_encoder_graph_config(backend).backend;
-    let key = (runtime_cache_path_identity(pack_path), backend);
+    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
     with_thread_local_cached_mut_by_key(
         &XASR_ZIPFORMER_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || XasrZipformerPreparedRuntime::load(pack_path, backend),
+        || XasrZipformerPreparedRuntime::load(runtime_source, backend),
         |runtime| {
             let result = runtime.transcribe(samples)?;
             transcription_from_decode(
@@ -175,12 +178,12 @@ impl GgmlAsrExecutor for XasrZipformerGgmlExecutor {
                 reason,
             )
         };
-        request
+        let preflight = request
             .resolve_runtime_source_preflight()
             .map_err(|error| fail(error.to_string()))?;
         let output = transcribe_xasr_zipformer_pcm_cached(
             &request.prepared_audio.samples_f32,
-            &request.runtime_source_path,
+            &preflight.runtime_source,
             request.request_options.phrase_bias.as_ref(),
             request.request_options.word_timestamps,
             request.resolved_runtime.backend(),
@@ -246,7 +249,7 @@ impl GgmlAsrStreamingExecutor for XasrZipformerGgmlExecutor {
             reject_xasr_phrase_bias(&request.selected_family)?;
         }
 
-        request
+        let preflight = request
             .resolve_runtime_source_preflight()
             .map_err(|error| fail(error.to_string()))?;
         // The pool key and the prepared encoder graph bake the backend at
@@ -256,7 +259,7 @@ impl GgmlAsrStreamingExecutor for XasrZipformerGgmlExecutor {
             request.backend_preference.request_backend_override(),
         );
         let runtime = checkout_prepared_runtime(
-            &request.runtime_source_path,
+            &preflight.runtime_source,
             request.resolved_runtime.backend(),
         )
         .map_err(fail)?;
@@ -302,12 +305,12 @@ mod tests {
 
     #[test]
     fn missing_pack_fails_before_executor_work() {
-        let error = XasrZipformerPreparedRuntime::load(
-            Path::new("/tmp/missing-xasr.oasr"),
-            GgmlCpuGraphBackend::Cpu,
-        )
-        .expect_err("missing pack should fail");
-        assert!(!error.trim().is_empty());
+        // `load` now takes an already-validated `GgmlRuntimeSource`; a
+        // missing pack must fail closed at that earlier validation step
+        // (never inside `load` itself, which no longer touches a bare path).
+        let error = crate::validate_ggml_runtime_source_path(Path::new("/tmp/missing-xasr.oasr"))
+            .expect_err("missing pack should fail");
+        assert!(!error.to_string().trim().is_empty());
     }
 
     #[test]

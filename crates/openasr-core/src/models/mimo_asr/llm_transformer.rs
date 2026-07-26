@@ -93,20 +93,19 @@ pub(crate) struct MimoLlmDecoderRuntime {
 
 impl MimoLlmDecoderRuntime {
     pub(crate) fn new(
-        runtime_path: &std::path::Path,
+        runtime_source: &crate::GgmlRuntimeSource,
         metadata: MimoLlmMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MimoLlmDecoderError> {
-        let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(runtime_path).map_err(
-            |error| MimoLlmDecoderError::TensorReadFailed {
+        let reader = crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(runtime_source)
+            .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
                 reason: error.to_string(),
-            },
-        )?;
+            })?;
         let projections = load_layer_projections(&reader, &metadata)?;
         let whole_decoder =
             Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
                 &projections,
-                Some(runtime_path),
+                Some(runtime_source),
                 metadata.rms_norm_epsilon,
                 None,
                 backend,
@@ -116,6 +115,7 @@ impl MimoLlmDecoderRuntime {
             })?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
+            runtime_source,
             metadata.d_model,
             metadata.vocab_size,
             OUTPUT_NORM_WEIGHT,

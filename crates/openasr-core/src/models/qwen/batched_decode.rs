@@ -58,8 +58,15 @@ pub(super) struct Qwen3AsrServeBatchConfig {
 
 #[derive(Debug, Clone)]
 pub(super) struct Qwen3AsrServeBatchJob {
-    pub runtime_source_path: PathBuf,
     pub runtime_cache_path: PathBuf,
+    /// The same already-open, already-validated source the submitting
+    /// thread's preflight resolved. Cloning it is a refcount bump on its
+    /// `Arc<Mmap>`, not a reopen -- the owner thread that actually builds the
+    /// whole-decoder graph binds resident weights from this same mapping
+    /// instead of a fresh `File::open`/`load_gguf_weight_context` by path
+    /// (contract 4's defect C: identity and weight bytes must come from one
+    /// open, even across this thread boundary).
+    pub runtime_source: crate::GgmlRuntimeSource,
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub metadata: Qwen3AsrExecutionMetadata,
@@ -1437,7 +1444,7 @@ impl Qwen3AsrOwnerThreadState {
             self.decoder = Some(
                 Qwen3AsrLlmWholeDecoderGraphExecutor::new(
                     slot.job.layer_attention_projections.as_slice(),
-                    Some(slot.job.runtime_source_path.as_path()),
+                    Some(&slot.job.runtime_source),
                     slot.job.backend,
                 )
                 .map_err(|error| Qwen3AsrServeBatchError::OwnerFailed {
@@ -2175,6 +2182,7 @@ mod tests {
 
     struct Qwen3AsrServeBatchFixture {
         runtime_path: PathBuf,
+        runtime_source: crate::GgmlRuntimeSource,
         metadata: Qwen3AsrExecutionMetadata,
         token_embedding_table: Qwen3AsrTokenEmbeddingTable,
         logits_head: Qwen3AsrLlmLogitsHead,
@@ -2232,11 +2240,12 @@ mod tests {
             .expect("read qwen runtime metadata");
         let metadata = parse_qwen3_execution_metadata(&metadata).expect("parse qwen metadata");
         let reader =
-            GgufTensorDataReader::from_path(runtime_source.path()).expect("qwen tensor reader");
+            GgufTensorDataReader::from_runtime_source(&runtime_source).expect("qwen tensor reader");
         let token_embedding_table = load_qwen3_token_embedding_table_from_reader(&reader, metadata)
             .expect("qwen token embeddings");
         let logits_head = load_qwen3_llm_logits_head_from_reader(
             &reader,
+            &runtime_source,
             metadata,
             GgmlCpuGraphConfig::runtime_default().backend,
         )
@@ -2262,6 +2271,7 @@ mod tests {
         }
         Qwen3AsrServeBatchFixture {
             runtime_path,
+            runtime_source,
             metadata,
             token_embedding_table,
             logits_head,
@@ -2378,17 +2388,17 @@ mod tests {
         fixture: &Qwen3AsrServeBatchFixture,
         max_generated_tokens: usize,
     ) -> Qwen3AsrServeBatchJob {
+        let runtime_source = crate::validate_ggml_runtime_source_path(&fixture.runtime_path)
+            .expect("valid runtime source path");
         Qwen3AsrServeBatchJob {
-            runtime_source_path: fixture.runtime_path.clone(),
             runtime_cache_path: fixture.runtime_path.clone(),
             build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
                 None,
                 "qwen:test",
                 "adapter=none",
-                crate::validate_ggml_runtime_source_path(&fixture.runtime_path)
-                    .expect("valid runtime source path")
-                    .content_id(),
+                runtime_source.content_id(),
             ),
+            runtime_source,
             backend: GgmlCpuGraphConfig::runtime_default().backend,
             metadata: fixture.metadata,
             tokenizer: None,
@@ -2477,7 +2487,7 @@ mod tests {
         let max_positions = fixture.prompt_tokens.len() + 4;
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
-            Some(fixture.runtime_path.as_path()),
+            Some(&fixture.runtime_source),
             GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
@@ -2537,7 +2547,7 @@ mod tests {
         let max_positions = fixture.prompt_tokens.len() + 4;
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
-            Some(fixture.runtime_path.as_path()),
+            Some(&fixture.runtime_source),
             GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
@@ -2584,7 +2594,7 @@ mod tests {
         let mut max_positions = initial_max_positions;
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
-            Some(fixture.runtime_path.as_path()),
+            Some(&fixture.runtime_source),
             GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");
@@ -2651,7 +2661,7 @@ mod tests {
         let max_positions = fixture.prompt_tokens.len() + 4;
         let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             fixture.layer_attention_projections.as_slice(),
-            Some(fixture.runtime_path.as_path()),
+            Some(&fixture.runtime_source),
             GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("qwen decoder");

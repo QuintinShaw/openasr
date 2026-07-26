@@ -15,8 +15,8 @@ use crate::models::incremental_streaming_driver::{
 };
 use crate::models::parakeet_ctc::frontend::ParakeetFrontend;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
-    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
+    with_thread_local_cached_mut_by_key,
 };
 use crate::{NativeAsrSession, PARAKEET_TDT_GGML_ADAPTER_ID};
 
@@ -32,7 +32,7 @@ use super::runtime_contract::{
 };
 use super::tokenizer::ParakeetTdtTokenizer;
 
-type ParakeetTdtRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+type ParakeetTdtRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
 
 thread_local! {
     static PARAKEET_TDT_RUNTIME_BY_KEY: RefCell<BoundedRuntimeCache<ParakeetTdtRuntimeCacheKey, ParakeetTdtPreparedRuntime>> =
@@ -72,9 +72,8 @@ fn build_parakeet_tdt_prepared_runtime(
     let tokenizer = ParakeetTdtTokenizer::from_metadata(&gguf_metadata)?;
     let weights =
         load_parakeet_tdt_encoder_weights(&reader, &metadata).map_err(|e| e.to_string())?;
-    let graph =
-        ParakeetTdtEncoderGraph::new(&weights, metadata, Some(runtime_source.path()), backend)
-            .map_err(|e| e.to_string())?;
+    let graph = ParakeetTdtEncoderGraph::new(&weights, metadata, Some(runtime_source), backend)
+        .map_err(|e| e.to_string())?;
     let predictor_weights =
         load_parakeet_tdt_predictor_weights(&reader, &metadata).map_err(|e| e.to_string())?;
     let predictor =
@@ -138,17 +137,17 @@ impl ParakeetTdtPreparedRuntime {
 }
 
 /// Transcribe 16 kHz mono f32 PCM through a cached prepared runtime keyed by
-/// `(pack path identity: canonical path + content fingerprint, backend)`. The
-/// content fingerprint ([`runtime_cache_path_identity`]) keeps an in-place
-/// pack replacement at the same path from reusing a runtime built from the
-/// old bytes.
+/// `(pack content id, backend)`. The content id
+/// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
+/// replacement at the same path from reusing a runtime built from the old
+/// bytes.
 pub(crate) fn transcribe_parakeet_tdt_pcm_cached(
     samples: &[f32],
     runtime_source: &GgmlRuntimeSource,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
 ) -> Result<ParakeetTdtTranscription, String> {
-    let key = (runtime_cache_path_identity(runtime_source.path()), backend);
+    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
     with_thread_local_cached_mut_by_key(
         &PARAKEET_TDT_RUNTIME_BY_KEY,
         key,

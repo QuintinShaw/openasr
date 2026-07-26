@@ -1,12 +1,11 @@
 use std::cell::RefCell;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use thiserror::Error;
 
 #[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::batched_decode::{
     CohereServeBatchConfig, CohereServeBatchConfigFromPolicy, CohereServeBatchJob,
@@ -51,8 +50,8 @@ use crate::models::runtime_prepared_registry::{
     BuiltinPreparedRuntimeCache, BuiltinPreparedRuntimeRegistryError, PreparedRuntimeLookup,
 };
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
-    canonical_runtime_cache_path, runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
+    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
 };
 
 const COHERE_EXECUTOR_ID: &str = "cohere-transcribe-ggml-executor-v1";
@@ -68,11 +67,11 @@ thread_local! {
         RefCell::new(BoundedRuntimeCache::new());
 }
 
-type CohereEncoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
-/// (pack path identity: canonical path + content fingerprint, backend). The
-/// content fingerprint ([`runtime_cache_path_identity`]) keeps an in-place
-/// pack replacement at the same path from reusing a runtime built from the
-/// old bytes. Used to be `(path, backend, frame_count,
+type CohereEncoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+/// (pack content id, backend). The content id
+/// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
+/// replacement at the same path from reusing a runtime built from the old
+/// bytes. Used to be `(path, backend, frame_count,
 /// hidden_size)`: the decoder's cross-KV cache is now allocated ONCE per pack
 /// at this architecture's chunk-cap capacity (see
 /// `CohereDecoderGraphRuntime::new` / `cohere_decoder_cross_capacity_frames`),
@@ -80,7 +79,27 @@ type CohereEncoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBacke
 /// is reusable across every VAD/longform chunk regardless of its actual frame
 /// count. `hidden_size` was always redundant too -- it is a pack-constant
 /// (`metadata.decoder_d_model`), never a per-utterance value.
-type CohereDecoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+type CohereDecoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend);
+
+// Test-only build counters, incremented from inside the two caches' `build`
+// closures below -- lets a same-thread test pin "a second call against the
+// same pack content id reuses the cached runtime" as a structural fact
+// (build count stays put across two calls) rather than inferring cache-hit
+// behavior from wall-clock timing. Mirrors
+// `moss_transcribe_diarize::executor`'s `MOSS_TD_ENCODER_RUNTIME_BUILD_COUNT`.
+#[cfg(test)]
+thread_local! {
+    static COHERE_ENCODER_RUNTIME_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COHERE_DECODER_RUNTIME_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn cohere_runtime_build_counts_for_test() -> (usize, usize) {
+    (
+        COHERE_ENCODER_RUNTIME_BUILD_COUNT.with(std::cell::Cell::get),
+        COHERE_DECODER_RUNTIME_BUILD_COUNT.with(std::cell::Cell::get),
+    )
+}
 
 #[derive(Debug, Error)]
 enum CohereTranscribeGgmlExecutorError {
@@ -279,7 +298,7 @@ impl CohereTranscribeGgmlExecutor {
         })?;
         let encoder_start = debug_timing_start();
         let encoder_output = encode_with_cached_cohere_encoder_runtime(
-            runtime_path,
+            runtime_source,
             prepared_runtime,
             features,
             request.resolved_runtime.backend(),
@@ -363,7 +382,7 @@ impl CohereTranscribeGgmlExecutor {
             })?
         } else {
             decode_with_cached_cohere_decoder_runtime(
-                runtime_path,
+                runtime_source,
                 &prepared_runtime.decoder_weights,
                 &prepared_runtime.tokenizer,
                 prepared_runtime.metadata,
@@ -432,22 +451,27 @@ fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudio) -> f32 {
 }
 
 fn encode_with_cached_cohere_encoder_runtime(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     prepared_runtime: &CoherePreparedRuntime,
     features: &CohereTranscribeMelFeatures,
     backend: GgmlCpuGraphBackend,
 ) -> Result<super::encoder_graph::CohereTranscribeEncoderOutput, CohereTranscribeEncoderError> {
     let encoder_backend = cohere_encoder_graph_config(backend).backend;
-    let key = (runtime_cache_path_identity(runtime_path), encoder_backend);
+    let key = (
+        PackContentKey::for_runtime_source(runtime_source),
+        encoder_backend,
+    );
     with_thread_local_cached_mut_by_key(
         &COHERE_ENCODER_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
         || {
+            #[cfg(test)]
+            COHERE_ENCODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
             CohereTranscribeEncoderGraphRuntime::new(
                 &prepared_runtime.encoder_weights,
                 prepared_runtime.metadata,
-                Some(runtime_path),
+                Some(runtime_source),
                 backend,
             )
         },
@@ -457,7 +481,7 @@ fn encode_with_cached_cohere_encoder_runtime(
 
 #[allow(clippy::too_many_arguments)]
 fn decode_with_cached_cohere_decoder_runtime(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     decoder_weights: &super::decoder_weights::CohereTranscribeDecoderWeights,
     tokenizer: &super::tokenizer::CohereTranscribeTokenizer,
     metadata: super::runtime_contract::CohereTranscribeExecutionMetadata,
@@ -472,12 +496,17 @@ fn decode_with_cached_cohere_decoder_runtime(
     control: &Arc<crate::TranscriptionControl>,
 ) -> Result<super::decoder_graph::CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
     let decoder_backend = cohere_decoder_graph_config(backend, prefer_cpu_backend).backend;
-    let key = (runtime_cache_path_identity(runtime_path), decoder_backend);
+    let key = (
+        PackContentKey::for_runtime_source(runtime_source),
+        decoder_backend,
+    );
     with_thread_local_cached_mut_by_key(
         &COHERE_DECODER_RUNTIME_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
         || {
+            #[cfg(test)]
+            COHERE_DECODER_RUNTIME_BUILD_COUNT.with(|count| count.set(count.get() + 1));
             CohereDecoderGraphRuntime::new(
                 decoder_weights,
                 metadata,
@@ -857,6 +886,95 @@ mod tests {
                 .expect("executor should produce a best-effort transcription");
             assert!(result.transcription.text.is_ascii() || !result.transcription.text.is_empty());
             assert!(result.transcription.segments.is_empty());
+        });
+    }
+
+    /// Contract 4 defect C regression: the family encoder/decoder TLS
+    /// runtime caches now key on the already-open source's content id
+    /// ([`PackContentKey::for_runtime_source`]) instead of a second,
+    /// weaker path-based identity. Structural proof (build counters, not
+    /// timing -- see `moss_transcribe_diarize::executor`'s precedent):
+    ///
+    /// 1. A second `execute()` against the *same unchanged bytes* (even
+    ///    through a fresh `execute()` call, which re-validates and reopens
+    ///    the path into a brand new [`GgmlRuntimeSource`] instance every
+    ///    time -- exactly like two independent production requests) must
+    ///    hit the cached encoder/decoder runtimes, not rebuild them: the
+    ///    content id survives across independent opens of the same bytes.
+    /// 2. Two DIFFERENT packs (distinct `model_id`, hence distinct content
+    ///    and distinct content ids) are each cached under their own key:
+    ///    building/using one pack's runtime must not evict or rebuild the
+    ///    other's -- the healthy sibling keeps hitting its own cache slot.
+    #[test]
+    fn cohere_encoder_and_decoder_caches_key_on_content_id_across_independent_opens() {
+        with_forced_cpu_backend_for_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path_a = temp.path().join("cohere-runtime-a.gguf");
+            let path_b = temp.path().join("cohere-runtime-b.gguf");
+            let spec_a = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-fixture-a");
+            let spec_b = TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-fixture-b");
+            write_tiny_gguf_runtime_source(&path_a, &spec_a).expect("write fixture a");
+            write_tiny_gguf_runtime_source(&path_b, &spec_b).expect("write fixture b");
+
+            let executor = CohereTranscribeGgmlExecutor::default();
+
+            // First execute() against pack A builds both caches once.
+            executor
+                .execute(&runtime_ready_request(path_a.clone()))
+                .expect("pack a first execute");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (1, 1),
+                "first execute against pack a must build the encoder and decoder runtimes exactly once"
+            );
+
+            // A second execute() against the SAME path -- a fresh
+            // `GgmlRuntimeSource` open every time (no cached preflight on
+            // the request) -- must still hit both caches: content id, not
+            // source-instance identity, is what the key carries.
+            executor
+                .execute(&runtime_ready_request(path_a.clone()))
+                .expect("pack a second execute");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (1, 1),
+                "a second execute against unchanged pack-a bytes must reuse the cached runtimes, \
+                 not rebuild them, even though the request opened a brand new GgmlRuntimeSource"
+            );
+
+            // Pack B is a genuinely different pack (different content id).
+            // Building its runtimes must not disturb pack A's cached slot.
+            executor
+                .execute(&runtime_ready_request(path_b.clone()))
+                .expect("pack b first execute");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (2, 2),
+                "pack b's first execute must build its own runtimes (a distinct content id), \
+                 on top of pack a's already-cached ones"
+            );
+
+            // Pack A must still be a cache hit: pack B's distinct key never
+            // evicted or clobbered pack A's healthy, resident sibling entry.
+            executor
+                .execute(&runtime_ready_request(path_a))
+                .expect("pack a third execute");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (2, 2),
+                "pack a must remain a cache hit after pack b was built -- a healthy sibling \
+                 pack must never be evicted or rebuilt by an unrelated pack's cache activity"
+            );
+
+            // And pack B must likewise still be resident.
+            executor
+                .execute(&runtime_ready_request(path_b))
+                .expect("pack b second execute");
+            assert_eq!(
+                cohere_runtime_build_counts_for_test(),
+                (2, 2),
+                "pack b must remain a cache hit on its own subsequent execute"
+            );
         });
     }
 

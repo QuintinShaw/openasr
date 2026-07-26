@@ -230,7 +230,7 @@ pub enum Hymt2RuntimeError {
 impl Hymt2RuntimeSession {
     fn new(
         projections: &[Qwen3AsrLlmLayerAttentionProjection],
-        runtime_source_path: &Path,
+        runtime_source: &crate::GgmlRuntimeSource,
         metadata: Hymt2ExecutionMetadata,
         fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
@@ -238,7 +238,7 @@ impl Hymt2RuntimeSession {
         let whole_decoder =
             Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
                 projections,
-                Some(runtime_source_path),
+                Some(runtime_source),
                 metadata.rms_norm_epsilon,
                 fused_logits_head,
                 backend,
@@ -328,6 +328,7 @@ impl Hymt2Runtime {
         // site, never re-derived internally.
         let logits_head = load_qwen3_llm_logits_head_from_reader_with_output_tensor(
             &reader,
+            &runtime_source,
             qwen_metadata,
             TOKEN_EMBD_WEIGHT,
             hymt2_metadata.rms_norm_epsilon,
@@ -355,7 +356,7 @@ impl Hymt2Runtime {
         }
         let session = Hymt2RuntimeSession::new(
             &layer_attention_projections,
-            runtime_source.path(),
+            &runtime_source,
             hymt2_metadata,
             logits_head.fused_top1_spec(),
             backend,

@@ -20,7 +20,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,8 +37,7 @@ use crate::models::incremental_streaming_driver::{
 use crate::models::prepared_runtime_cache::PreparedRuntimeCache;
 use crate::models::runtime_contract::MetadataContractError;
 use crate::models::thread_local_runtime_cache::{
-    RuntimeCachePathIdentity, UnloadGenerationGated, canonical_runtime_cache_path,
-    runtime_cache_path_identity,
+    PackContentKey, UnloadGenerationGated, canonical_runtime_cache_path,
 };
 use crate::models::tokenizer_component_registry::materialize_builtin_tokenizer_for_architecture;
 use crate::nn::attn::{
@@ -321,12 +319,12 @@ struct WhisperDecoderPersistentStaticSession {
     plan: WhisperDecoderGraphPlan,
 }
 
-/// (pack path identity: canonical path + content fingerprint, backend). The
-/// content fingerprint ([`runtime_cache_path_identity`]) keeps an in-place
-/// pack replacement at the same path from reusing a persistent session whose
+/// (pack content id, backend). The content id
+/// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
+/// replacement at the same path from reusing a persistent session whose
 /// resident weights came from the old bytes.
-type WhisperEncoderPersistentSessionKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
-type WhisperDecoderPersistentSessionKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+type WhisperEncoderPersistentSessionKey = (PackContentKey, GgmlCpuGraphBackend);
+type WhisperDecoderPersistentSessionKey = (PackContentKey, GgmlCpuGraphBackend);
 
 thread_local! {
     // Gated on the idle-unload generation: these sessions pin the resident
@@ -884,7 +882,7 @@ impl WhisperEncoderGraphRunner for WhisperCpuEncoderGraphComputeRunnerV0 {
             &mut session.runner,
             session.resident_weights.as_ref(),
         );
-        store_whisper_encoder_persistent_static_session(input.runtime_source.path(), session);
+        store_whisper_encoder_persistent_static_session(input.runtime_source, session);
         result
     }
 }
@@ -2075,14 +2073,15 @@ fn build_encoder_resident_weight_cache<'weights>(
     source_tensors: &HashMap<&str, &'weights WhisperMaterializedTensor>,
     encoder_weights: &'weights WhisperEncoderWeightBundle,
     plan: &WhisperEncoderGraphPlan,
-    runtime_path: Option<&Path>,
+    runtime_source: Option<&GgmlRuntimeSource>,
 ) -> Result<WhisperEncoderResidentWeightCache, WhisperGgmlExecutorError> {
     let mut arena = runner
         .start_static_tensor_arena(context_bytes)
         .map_err(|error| map_encoder_graph_error("ggml_static_tensor_arena", error))?;
     // Bind large quantized linear weights zero-copy to the mmap'd pack (no host
     // copy, no arena upload). Falls back to the arena path when unavailable.
-    let loaded_weights = runtime_path.and_then(|path| runner.load_gguf_weight_context(path).ok());
+    let loaded_weights =
+        runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
     let mut tensors_by_name = HashMap::with_capacity(source_tensors.len());
     let mut loaded_tensors_by_name = HashMap::new();
     let mut uploads: Vec<WhisperEncoderResidentWeightUpload<'weights>> = Vec::new();
@@ -3399,24 +3398,24 @@ fn build_whisper_carry_prompt_seed_token_ids(
 }
 
 fn take_whisper_encoder_persistent_static_session(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     backend: GgmlCpuGraphBackend,
 ) -> Option<WhisperEncoderPersistentStaticSession> {
     WHISPER_ENCODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
         sessions
             .borrow_mut()
             .synced()
-            .remove(&(runtime_cache_path_identity(runtime_path), backend))
+            .remove(&(PackContentKey::for_runtime_source(runtime_source), backend))
     })
 }
 
 fn store_whisper_encoder_persistent_static_session(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     session: WhisperEncoderPersistentStaticSession,
 ) {
     WHISPER_ENCODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
         let key = (
-            runtime_cache_path_identity(runtime_path),
+            PackContentKey::for_runtime_source(runtime_source),
             session.graph_config.backend,
         );
         sessions.borrow_mut().synced().insert(key, session);
@@ -3457,7 +3456,7 @@ fn build_whisper_encoder_persistent_static_session(
             &encoder_tensor_index,
             encoder_weights,
             plan,
-            Some(runtime_source.path()),
+            Some(runtime_source),
         )?;
         emit_encoder_resident_weight_trace(
             cache.upload_stats.count,
@@ -3484,9 +3483,8 @@ fn take_or_build_whisper_encoder_persistent_static_session(
     plan: &WhisperEncoderGraphPlan,
     graph_config: GgmlCpuGraphConfig,
 ) -> Result<WhisperEncoderPersistentStaticSession, WhisperGgmlExecutorError> {
-    let runtime_path = runtime_source.path();
     if let Some(session) =
-        take_whisper_encoder_persistent_static_session(runtime_path, graph_config.backend)
+        take_whisper_encoder_persistent_static_session(runtime_source, graph_config.backend)
         && encoder_persistent_session_matches_runtime(&session, execution, plan, graph_config)
     {
         emit_encoder_resident_weight_cache_reuse_trace();
@@ -3563,7 +3561,7 @@ fn build_whisper_decoder_persistent_static_session(
                 &runtime.decoder_weights.tensor_source,
                 &mut persistent_weight_tensor_cache,
                 runtime.execution.max_target_positions,
-                Some(runtime_source.path()),
+                Some(runtime_source),
             )
         })
         .map_err(
@@ -3588,10 +3586,9 @@ fn take_or_build_whisper_decoder_persistent_static_session(
     trace: &WhisperGgmlTrace,
     backend: GgmlCpuGraphBackend,
 ) -> Result<WhisperDecoderPersistentStaticSession, WhisperGgmlExecutorError> {
-    let runtime_path = runtime_source.path();
     let graph_config = whisper_decoder_graph_config(backend);
     let key = (
-        runtime_cache_path_identity(runtime_path),
+        PackContentKey::for_runtime_source(runtime_source),
         graph_config.backend,
     );
     WHISPER_DECODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
@@ -3626,14 +3623,14 @@ fn take_or_build_whisper_decoder_persistent_static_session(
 }
 
 fn store_whisper_decoder_persistent_static_session(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     session: WhisperDecoderPersistentStaticSession,
 ) {
     WHISPER_DECODER_PERSISTENT_SESSION_BY_KEY.with(|sessions| {
         let mut sessions = sessions.borrow_mut();
         let sessions = sessions.synced();
         let key = (
-            runtime_cache_path_identity(runtime_path),
+            PackContentKey::for_runtime_source(runtime_source),
             session.graph_config.backend,
         );
         let pool = sessions.entry(key).or_default();
@@ -3812,6 +3809,7 @@ fn execute_whisper_with_prepared_runtime(
             serve_batch_config,
             WhisperServeBatchJob {
                 runtime_cache_path: canonical_runtime_cache_path(runtime_source.path()),
+                runtime_source: runtime_source.clone(),
                 build_identity:
                     crate::models::ggml_asr_executor::serve_batch_build_identity_for_request(
                         request_options,
@@ -4029,10 +4027,7 @@ fn execute_whisper_with_prepared_runtime(
         &execution_context.control,
     );
     if allow_persistent_session_reuse {
-        store_whisper_decoder_persistent_static_session(
-            runtime_source.path(),
-            decoder_persistent_static,
-        );
+        store_whisper_decoder_persistent_static_session(runtime_source, decoder_persistent_static);
     }
     decode_result
 }

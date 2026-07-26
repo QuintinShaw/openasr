@@ -119,17 +119,17 @@ pub(crate) struct FireRedLlmDecoderRuntime {
 
 impl FireRedLlmDecoderRuntime {
     pub(crate) fn new(
-        runtime_path: &std::path::Path,
+        runtime_source: &crate::GgmlRuntimeSource,
         metadata: FireRedLlmDecoderMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedLlmDecoderError> {
-        let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(runtime_path)
+        let reader = crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(runtime_source)
             .map_err(map_tensor_read_error)?;
         let projections = load_qwen2_layer_projections(&reader, &metadata)?;
         let whole_decoder =
             Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
                 &projections,
-                Some(runtime_path),
+                Some(runtime_source),
                 FIRERED_LLM_RMS_NORM_EPSILON,
                 None,
                 backend,
@@ -139,6 +139,7 @@ impl FireRedLlmDecoderRuntime {
             })?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
+            runtime_source,
             metadata.d_model,
             metadata.vocab_size,
             LLM_OUTPUT_NORM_WEIGHT,
@@ -537,7 +538,7 @@ mod parity_tests {
     /// block.
     fn dump_one_block_segment(
         reader: &crate::ggml_runtime::GgufTensorDataReader,
-        pack_path: &Path,
+        runtime_source: &crate::GgmlRuntimeSource,
         metadata: &FireRedLlmDecoderMetadata,
         layer_index: usize,
         segment_name: &str,
@@ -551,7 +552,7 @@ mod parity_tests {
         let projection = load_one_layer_projection(reader, metadata, layer_index);
         let mut executor = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
             &[projection],
-            Some(pack_path),
+            Some(runtime_source),
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
         .unwrap_or_else(|error| panic!("{segment_name} single-layer executor: {error}"));
@@ -614,8 +615,11 @@ mod parity_tests {
             }),
         );
 
-        let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(&pack_path)
-            .expect("open gguf tensor reader");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
+        let reader =
+            crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(&runtime_source)
+                .expect("open gguf tensor reader");
 
         // --- Segment: embedding gather ---
         let token_embedding = load_token_embedding_table_from_reader_with_tensor_name(
@@ -637,11 +641,25 @@ mod parity_tests {
         write_f32_dump(&dir, "embedding_output", &embedding_rows);
 
         // --- Segments: block 0 (first), block 13 (14th), block 27 (last) ---
-        dump_one_block_segment(&reader, &pack_path, &decoder_metadata, 0, "block0", &dir);
-        dump_one_block_segment(&reader, &pack_path, &decoder_metadata, 13, "block13", &dir);
         dump_one_block_segment(
             &reader,
-            &pack_path,
+            &runtime_source,
+            &decoder_metadata,
+            0,
+            "block0",
+            &dir,
+        );
+        dump_one_block_segment(
+            &reader,
+            &runtime_source,
+            &decoder_metadata,
+            13,
+            "block13",
+            &dir,
+        );
+        dump_one_block_segment(
+            &reader,
+            &runtime_source,
             &decoder_metadata,
             decoder_metadata.n_layers - 1,
             "block27",
@@ -651,6 +669,7 @@ mod parity_tests {
         // --- Segment: final_norm -> lm_head (fused; the only exposed API) ---
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
+            &runtime_source,
             decoder_metadata.d_model,
             decoder_metadata.vocab_size,
             LLM_OUTPUT_NORM_WEIGHT,
@@ -685,8 +704,10 @@ mod parity_tests {
         let decoder_metadata =
             super::super::runtime_contract::parse_firered_llm_decoder_metadata(&metadata)
                 .expect("parse decoder metadata");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
         FireRedLlmDecoderRuntime::new(
-            &pack_path,
+            &runtime_source,
             decoder_metadata,
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
         )

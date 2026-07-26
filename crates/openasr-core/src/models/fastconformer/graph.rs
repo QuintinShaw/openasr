@@ -11,8 +11,7 @@
 //! `set_*_slice` call freezes further `new_tensor_*` allocation) stays
 //! intact across the family-specific tail tensors too.
 
-use std::path::Path;
-
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     ArenaAllocError, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedWeightContext, GgmlStaticTensor,
@@ -354,7 +353,7 @@ impl FastConformerEncoderCore {
     pub(crate) fn build<E, T>(
         mut graph_config: GgmlCpuGraphConfig,
         context_bytes: usize,
-        runtime_path: Option<&Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
         subsampling: &[NamedTensor],
         layers: &[FastConformerLayerWeights],
         declare_tail: impl FnOnce(
@@ -380,7 +379,7 @@ impl FastConformerEncoderCore {
         // dequantize-to-host, no arena upload). Fails closed below if the
         // load failed but a bindable weight's host payload was dropped.
         let loaded_weights =
-            runtime_path.and_then(|path| runner.load_gguf_weight_context(path).ok());
+            runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(context_bytes)

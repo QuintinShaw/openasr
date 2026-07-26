@@ -23,10 +23,12 @@
 
 #![allow(dead_code)]
 
+#[cfg(test)]
 use std::path::Path;
 
 use thiserror::Error;
 
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext};
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
@@ -107,14 +109,14 @@ pub(crate) struct FireRedEncoderGraphRuntime {
 
 impl FireRedEncoderGraphRuntime {
     pub(crate) fn new(
-        runtime_path: &Path,
+        runtime_source: &GgmlRuntimeSource,
         metadata: FireRedAedExecutionMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedEncoderError> {
         let runner = GgmlCpuGraphRunner::new(firered_encoder_graph_config(backend))
             .map_err(|source| map_err("runner_init", source))?;
         let loaded = runner
-            .load_gguf_weight_context(runtime_path)
+            .load_gguf_weight_context(runtime_source)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
         let weights = FireRedEncoderWeights::load(&loaded, metadata.encoder_n_layers)?;
         Ok(Self {
@@ -1723,7 +1725,10 @@ mod parity_tests {
         let frontend = FireRedFbankFrontend::new();
         let mut fbank = frontend.compute(&samples).expect("compute fbank");
 
-        let reader = GgufTensorDataReader::from_path(&pack_path).expect("open tensor reader");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
+        let reader =
+            GgufTensorDataReader::from_runtime_source(&runtime_source).expect("open tensor reader");
         let feature_dim = [metadata.feature_dim as u64];
         let neg_mean = reader
             .host_tensor_f32_copy_by_name("frontend.cmvn.neg_mean", &feature_dim)
@@ -1734,7 +1739,7 @@ mod parity_tests {
         apply_cmvn(&mut fbank.data, fbank.n_mels, &neg_mean, &inv_stddev).expect("apply cmvn");
 
         let mut runtime = FireRedEncoderGraphRuntime::new(
-            &pack_path,
+            &runtime_source,
             metadata,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
@@ -1818,7 +1823,10 @@ mod parity_tests {
         let frontend = FireRedFbankFrontend::new();
         let mut fbank = frontend.compute(&samples).expect("compute fbank");
 
-        let reader = GgufTensorDataReader::from_path(&pack_path).expect("open tensor reader");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
+        let reader =
+            GgufTensorDataReader::from_runtime_source(&runtime_source).expect("open tensor reader");
         let feature_dim = [metadata.feature_dim as u64];
         let neg_mean = reader
             .host_tensor_f32_copy_by_name("frontend.cmvn.neg_mean", &feature_dim)
@@ -1837,7 +1845,7 @@ mod parity_tests {
         ))
         .expect("build runner");
         let loaded = runner
-            .load_gguf_weight_context(&pack_path)
+            .load_gguf_weight_context(&runtime_source)
             .expect("load gguf weight context");
         let weights =
             FireRedEncoderWeights::load(&loaded, metadata.encoder_n_layers).expect("load weights");

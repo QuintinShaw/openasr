@@ -55,8 +55,8 @@ use crate::models::seq2seq_greedy_decode::{
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
-    current_unload_generation, runtime_cache_path_identity, take_generation_tagged,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
+    canonical_runtime_cache_path, current_unload_generation, take_generation_tagged,
     with_thread_local_cached_mut_by_key,
 };
 use crate::{
@@ -82,13 +82,14 @@ use crate::models::runtime_prepared_registry::build_builtin_prepared_runtime;
 /// GPU-run in the same process does not reuse a backend-mismatched decoder,
 /// and a run with an adapter does not reuse a graph built without one
 /// (correctness: the LoRA tensors are baked into the arena at construction
-/// time). The path identity is the canonical path PLUS the pack content
-/// fingerprint ([`runtime_cache_path_identity`]): an in-place `.oasr`
-/// replacement at the same path fingerprints differently, so the next lookup
-/// misses and rebuilds instead of reusing a decoder whose device-uploaded
-/// weights came from the old bytes.
-type WholeDecoderCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend, String);
-type AudioEncoderCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+/// time). The key's pack identity is the content id
+/// ([`PackContentKey::for_runtime_source`]) of the same already-open source
+/// the request preflight resolved: an in-place `.oasr` replacement at the
+/// same path resolves to a different id, so the next lookup misses and
+/// rebuilds instead of reusing a decoder whose device-uploaded weights came
+/// from the old bytes.
+type WholeDecoderCacheKey = (PackContentKey, GgmlCpuGraphBackend, String);
+type AudioEncoderCacheKey = (PackContentKey, GgmlCpuGraphBackend);
 
 thread_local! {
     // Kept as a plain `HashMap` (not the shared bounded LRU): keyed by
@@ -127,7 +128,7 @@ fn store_cached_whole_decoder(
 
 fn encode_qwen_audio_embeddings_cached(
     key: AudioEncoderCacheKey,
-    runtime_source_path: &std::path::Path,
+    runtime_source: &GgmlRuntimeSource,
     audio_encoder_weights: &Qwen3AsrAudioEncoderWeights,
     metadata: Qwen3AsrExecutionMetadata,
     mel_features: &Qwen3AsrMelFeatures,
@@ -137,7 +138,7 @@ fn encode_qwen_audio_embeddings_cached(
         &QWEN_AUDIO_ENCODER_BY_KEY,
         key,
         DEFAULT_RUNTIME_CACHE_CAPACITY,
-        || Qwen3AsrAudioEncoderRuntime::new(Some(runtime_source_path), backend),
+        || Qwen3AsrAudioEncoderRuntime::new(Some(runtime_source), backend),
         |runtime| runtime.encode(audio_encoder_weights, metadata, mel_features),
     )
 }
@@ -372,18 +373,19 @@ impl Qwen3AsrGgmlExecutor {
         // local instead of each independently re-deriving it from a
         // thread-local override + env.
         let backend = request.resolved_runtime.backend();
-        // Canonical path + pack content fingerprint: both cache keys below
-        // carry the fingerprint so an in-place pack replacement misses.
-        let runtime_cache_identity = runtime_cache_path_identity(&request.runtime_source_path);
+        // Pack content id (from the already-open `runtime_source`, not a
+        // re-derivation from `request.runtime_source_path`): both cache keys
+        // below carry it so an in-place pack replacement misses.
+        let runtime_cache_identity = PackContentKey::for_runtime_source(runtime_source);
         // The serve-batch owner loads the pack itself; it needs the path, not
-        // the fingerprint.
-        let runtime_cache_path = runtime_cache_identity.path.clone();
+        // the content id.
+        let runtime_cache_path = canonical_runtime_cache_path(runtime_source.path());
         let audio_encoder_cache_key: AudioEncoderCacheKey =
             (runtime_cache_identity.clone(), backend);
         let audio_encoder_started_at = qwen_decode_profile_start();
         let audio_embeddings = encode_qwen_audio_embeddings_cached(
             audio_encoder_cache_key,
-            &request.runtime_source_path,
+            runtime_source,
             audio_encoder_weights,
             metadata,
             mel_features,
@@ -497,8 +499,8 @@ impl Qwen3AsrGgmlExecutor {
             let result = submit_qwen_serve_batch_job(
                 serve_batch_config,
                 Qwen3AsrServeBatchJob {
-                    runtime_source_path: request.runtime_source_path.clone(),
                     runtime_cache_path,
+                    runtime_source: runtime_source.clone(),
                     build_identity:
                         crate::models::ggml_asr_executor::serve_batch_build_identity_for_request(
                             &request.request_options,
@@ -575,7 +577,7 @@ impl Qwen3AsrGgmlExecutor {
             None => {
                 let decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_lora(
                     &layer_attention_projections,
-                    Some(request.runtime_source_path.as_path()),
+                    Some(runtime_source),
                     adapter.as_deref(),
                     backend,
                 )

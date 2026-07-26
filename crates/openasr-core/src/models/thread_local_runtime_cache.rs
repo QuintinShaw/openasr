@@ -8,15 +8,17 @@ pub(crate) fn canonical_runtime_cache_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-// Runtime cache keys must be built from [`runtime_cache_path_identity`]
-// (canonical path + pack content fingerprint), never from the canonical path
-// alone: the fingerprint is what makes an in-place `.oasr` replacement at the
-// same path miss and rebuild instead of handing back a runtime built from the
-// old bytes. `canonical_runtime_cache_path` stays for callers that need the
-// path itself (e.g. the path a serve-batch owner loads from), not a key.
-pub(crate) use crate::models::runtime_cache_coordinator::{
-    RuntimeCachePathIdentity, runtime_cache_path_identity,
-};
+// Runtime cache keys must be built from [`PackContentKey::for_runtime_source`]
+// (an already-open, already-validated `GgmlRuntimeSource`'s content id),
+// never from the canonical path alone: the content id is what makes an
+// in-place `.oasr` replacement at the same path miss and rebuild instead of
+// handing back a runtime built from the old bytes, and deriving it from a
+// source already open for this request (rather than re-deriving from a path)
+// is what keeps the cache key and the weight bytes actually loaded provably
+// the same open (contract 4's defect C). `canonical_runtime_cache_path` stays
+// for callers that need the path itself (e.g. the path a serve-batch owner
+// loads from), not a key.
+pub(crate) use crate::models::runtime_cache_coordinator::PackContentKey;
 
 // Idle-unload generation is the unified runtime-cache coordinator epoch.
 // Historical dual counters (`RUNTIME_CACHE_UNLOAD_GENERATION` here and
@@ -309,22 +311,23 @@ mod tests {
     }
 
     #[test]
-    fn fingerprinted_identity_key_misses_after_in_place_replacement_and_hits_when_unchanged() {
+    fn content_id_key_misses_after_in_place_replacement_and_hits_when_unchanged() {
         let _generation_guard = unload_generation_test_lock();
         thread_local! {
-            static FINGERPRINT_CACHE: RefCell<
-                BoundedRuntimeCache<(RuntimeCachePathIdentity, usize), Vec<usize>>,
+            static CONTENT_ID_CACHE: RefCell<
+                BoundedRuntimeCache<(PackContentKey, usize), Vec<usize>>,
             > = RefCell::new(BoundedRuntimeCache::new());
         }
         let dir = tempfile::tempdir().expect("tempdir");
-        let pack = dir.path().join("pack.oasr");
-        std::fs::write(&pack, b"pack-content-v1").expect("write v1");
+        let pack = dir.path().join("pack.gguf");
+        std::fs::write(&pack, b"GGUFpack-content-v1").expect("write v1");
         let builds = std::cell::Cell::new(0_usize);
 
         let access = |pack: &Path| {
-            let key = (runtime_cache_path_identity(pack), 0_usize);
+            let source = crate::validate_ggml_runtime_source_path(pack).expect("validate source");
+            let key = (PackContentKey::for_runtime_source(&source), 0_usize);
             with_thread_local_cached_mut_by_key(
-                &FINGERPRINT_CACHE,
+                &CONTENT_ID_CACHE,
                 key,
                 DEFAULT_RUNTIME_CACHE_CAPACITY,
                 || {
@@ -339,7 +342,7 @@ mod tests {
         access(&pack).expect("second access reuses");
         assert_eq!(builds.get(), 1, "unchanged pack must stay a cache hit");
 
-        std::fs::write(&pack, b"pack-content-v2-different").expect("write v2");
+        std::fs::write(&pack, b"GGUFpack-content-v2-different").expect("write v2");
         access(&pack).expect("access after replacement rebuilds");
         assert_eq!(
             builds.get(),

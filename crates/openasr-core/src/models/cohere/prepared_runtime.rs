@@ -71,11 +71,12 @@ pub(crate) fn build_cohere_prepared_runtime(
         BuiltinTokenizerMaterializationMode::Required,
     )
     .map_err(map_runtime_component_bootstrap_error)?;
-    build_cohere_prepared_runtime_from_components(components, backend)
+    build_cohere_prepared_runtime_from_components(components, &preflight.runtime_source, backend)
 }
 
 pub(crate) fn build_cohere_prepared_runtime_from_components(
     components: BuiltinRuntimeComponentBootstrap,
+    runtime_source: &crate::GgmlRuntimeSource,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<CoherePreparedRuntime, CoherePreparedRuntimeError> {
     let debug_timings = std::env::var_os("OPENASR_COHERE_DEBUG_TIMINGS").is_some();
@@ -111,6 +112,7 @@ pub(crate) fn build_cohere_prepared_runtime_from_components(
     let (encoder_weights, decoder_weights) = materialize_builtin_runtime_weight_components(
         COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
         &tensor_reader,
+        runtime_source,
         runtime_metadata,
         backend,
     )

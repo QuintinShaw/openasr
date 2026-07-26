@@ -136,7 +136,7 @@ fn constant_fill_adapter(
 
 fn first_step_logits(
     prepared: &MoonshinePreparedRuntime,
-    runtime_path: &Path,
+    runtime_source: &crate::GgmlRuntimeSource,
     encoder_output: &MoonshineEncoderOutput,
     adapter: Option<&MoonshineLoraAdapter>,
 ) -> Vec<f32> {
@@ -148,7 +148,7 @@ fn first_step_logits(
             backend: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         },
         true,
-        Some(runtime_path),
+        Some(runtime_source),
         adapter,
     )
     .expect("decoder runtime");
@@ -183,7 +183,7 @@ fn zero_lora_keeps_decoder_logits_value_exact() {
     let prepared = build_moonshine_prepared_runtime(&preflight).expect("prepared runtime");
     let encoder_output = synthetic_encoder_output(prepared.metadata, 32);
 
-    let baseline = first_step_logits(&prepared, &pack, &encoder_output, None);
+    let baseline = first_step_logits(&prepared, &preflight.runtime_source, &encoder_output, None);
 
     // Zero adapter: A nonzero (so A@x is a real intermediate), B all zeros.
     let zero_adapter = constant_fill_adapter(
@@ -195,7 +195,12 @@ fn zero_lora_keeps_decoder_logits_value_exact() {
         0.05,
         0.0,
     );
-    let with_zero = first_step_logits(&prepared, &pack, &encoder_output, Some(&zero_adapter));
+    let with_zero = first_step_logits(
+        &prepared,
+        &preflight.runtime_source,
+        &encoder_output,
+        Some(&zero_adapter),
+    );
 
     assert_eq!(baseline.len(), with_zero.len());
     for (index, (base, zero)) in baseline.iter().zip(&with_zero).enumerate() {
@@ -242,7 +247,7 @@ fn lora_cross_value_precompute_delta_matches_host_math_and_scales_linearly() {
                 backend: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
             },
             true,
-            Some(&pack),
+            Some(&preflight.runtime_source),
             adapter,
         )
         .expect("decoder runtime");
@@ -303,7 +308,7 @@ fn lora_encoder_target_changes_encoder_output() {
     let prepared = build_moonshine_prepared_runtime(&preflight).expect("prepared runtime");
     let features = synthetic_waveform(8_000);
 
-    let baseline = encoder_rows(&prepared, &pack, &features, None);
+    let baseline = encoder_rows(&prepared, &preflight.runtime_source, &features, None);
     let adapter = constant_fill_adapter(
         &preflight,
         "test:enc-effect",
@@ -313,7 +318,12 @@ fn lora_encoder_target_changes_encoder_output() {
         0.02,
         0.05,
     );
-    let adapted = encoder_rows(&prepared, &pack, &features, Some(&adapter));
+    let adapted = encoder_rows(
+        &prepared,
+        &preflight.runtime_source,
+        &features,
+        Some(&adapter),
+    );
 
     let norm = |values: &[f32]| values.iter().map(|v| v * v).sum::<f32>().sqrt();
     let delta: Vec<f32> = adapted
@@ -340,7 +350,7 @@ fn lora_cross_v_target_changes_decoder_logits() {
     let prepared = build_moonshine_prepared_runtime(&preflight).expect("prepared runtime");
     let encoder_output = synthetic_encoder_output(prepared.metadata, 32);
 
-    let baseline = first_step_logits(&prepared, &pack, &encoder_output, None);
+    let baseline = first_step_logits(&prepared, &preflight.runtime_source, &encoder_output, None);
     let adapter = constant_fill_adapter(
         &preflight,
         "test:cross-v-effect",
@@ -350,7 +360,12 @@ fn lora_cross_v_target_changes_decoder_logits() {
         0.02,
         1.0e-3,
     );
-    let with_adapter = first_step_logits(&prepared, &pack, &encoder_output, Some(&adapter));
+    let with_adapter = first_step_logits(
+        &prepared,
+        &preflight.runtime_source,
+        &encoder_output,
+        Some(&adapter),
+    );
 
     let norm = |values: &[f32]| values.iter().map(|v| v * v).sum::<f32>().sqrt();
     let delta: Vec<f32> = with_adapter
@@ -376,14 +391,14 @@ fn synthetic_waveform(sample_count: usize) -> super::frontend::MoonshineWaveform
 
 fn encoder_rows(
     prepared: &MoonshinePreparedRuntime,
-    runtime_path: &Path,
+    runtime_source: &crate::GgmlRuntimeSource,
     features: &super::frontend::MoonshineWaveformFeatures,
     adapter: Option<&MoonshineLoraAdapter>,
 ) -> Vec<f32> {
     let mut runtime = super::encoder_graph::MoonshineEncoderGraphRuntime::new(
         &prepared.encoder_weights,
         prepared.metadata,
-        Some(runtime_path),
+        Some(runtime_source),
         adapter,
         crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
     )

@@ -351,7 +351,9 @@ mod tests {
             "xasr streaming parity test",
         )
         .expect("sample wav should load");
-        let reader = GgufTensorDataReader::from_path(&pack).expect("reader");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let reader = GgufTensorDataReader::from_runtime_source(&runtime_source).expect("reader");
         let metadata = read_gguf_metadata(&pack).expect("metadata");
         let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
             Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
@@ -387,7 +389,7 @@ mod tests {
             crate::arch::XASR_ZIPFORMER_STREAMING_EXECUTOR_COMPONENT_ID,
             crate::XASR_ZIPFORMER_GGML_ADAPTER_ID,
             super::super::runtime::checkout_prepared_runtime(
-                &request.runtime_source_path,
+                &runtime_source,
                 resolved_runtime.backend(),
             )
             .expect("streaming runtime"),
@@ -458,10 +460,12 @@ mod tests {
             eprintln!("skipping: xasr q8_0 pack absent at {}", pack.display());
             return;
         }
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
         let mut request = xasr_streaming_request();
         request.runtime_source_path = pack;
         let runtime = super::super::runtime::checkout_prepared_runtime(
-            &request.runtime_source_path,
+            &runtime_source,
             request.resolved_runtime.backend(),
         )
         .expect("streaming runtime");
@@ -538,12 +542,14 @@ mod tests {
         )
         .expect("sample wav should load");
 
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
         let mut request = xasr_streaming_request();
         request.runtime_source_path = pack;
 
         let transcribe = |warm_up: bool| -> String {
             let runtime = super::super::runtime::checkout_prepared_runtime(
-                &request.runtime_source_path,
+                &runtime_source,
                 request.resolved_runtime.backend(),
             )
             .expect("streaming runtime");

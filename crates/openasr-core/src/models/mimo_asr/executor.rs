@@ -260,9 +260,9 @@ impl MimoAsrGgmlExecutor {
                 }
             })?;
 
-        let runtime_path = preflight.runtime_source.path();
+        let runtime_source = &preflight.runtime_source;
         let mut encoder_runtime = MimoAudiotokEncoderRuntime::new(
-            runtime_path,
+            runtime_source,
             audiotok_metadata.clone(),
             request.resolved_runtime.backend(),
         )
@@ -327,7 +327,7 @@ impl MimoAsrGgmlExecutor {
         let summed = sum_speech_embeddings(&tables, &codes);
 
         let mut inlocal_runtime = MimoInputLocalRuntime::new(
-            runtime_path,
+            runtime_source,
             inlocal_metadata,
             request.resolved_runtime.backend(),
         )
@@ -349,7 +349,7 @@ impl MimoAsrGgmlExecutor {
             })?;
 
         let mut decoder = MimoLlmDecoderRuntime::new(
-            runtime_path,
+            runtime_source,
             llm_metadata,
             request.resolved_runtime.backend(),
         )

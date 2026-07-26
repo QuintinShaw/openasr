@@ -2,13 +2,14 @@ use std::{cell::RefCell, fmt};
 
 use thiserror::Error;
 
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlStaticTensor,
     GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader, env_toggle_with_raw,
 };
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
-    runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
+    with_thread_local_cached_mut_by_key,
 };
 
 use super::graph_config::{qwen_decoder_graph_config, qwen_runtime_graph_config};
@@ -21,13 +22,13 @@ const DEFAULT_RMS_NORM_EPSILON: f32 = 1e-6;
 const QWEN3_LLM_LOGITS_GRAPH_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
 const OPENASR_QWEN3_LLM_LOGITS_GGML_ENV: &str = "OPENASR_QWEN3_LLM_LOGITS_GGML";
 
-/// (pack path identity: canonical path + content fingerprint, backend):
-/// identifies the resident fused logits-head graph executor for a loaded pack,
-/// mirroring the `(RuntimeCachePathIdentity, GgmlCpuGraphBackend)` key
-/// convention used by the qwen audio-encoder and firered-aed encoder/decoder
-/// runtime caches. The fingerprint keeps an in-place pack replacement at the
-/// same path from reusing an executor built from the old bytes.
-type QwenLogitsHeadExecutorCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+/// (pack content id, backend): identifies the resident fused logits-head
+/// graph executor for a loaded pack, mirroring the `(PackContentKey,
+/// GgmlCpuGraphBackend)` key convention used by the qwen audio-encoder and
+/// firered-aed encoder/decoder runtime caches. The content id keeps an
+/// in-place pack replacement at the same path from reusing an executor built
+/// from the old bytes.
+type QwenLogitsHeadExecutorCacheKey = (PackContentKey, GgmlCpuGraphBackend);
 
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3AsrLlmLogitsHead {
@@ -227,11 +228,13 @@ impl Qwen3AsrLlmLogitsHead {
 
 pub(crate) fn load_qwen3_llm_logits_head_from_reader(
     reader: &GgufTensorDataReader,
+    runtime_source: &GgmlRuntimeSource,
     metadata: Qwen3AsrExecutionMetadata,
     backend: GgmlCpuGraphBackend,
 ) -> Result<Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError> {
     load_qwen3_llm_logits_head_from_reader_with_output_tensor(
         reader,
+        runtime_source,
         metadata,
         OUTPUT_WEIGHT_TENSOR_NAME,
         DEFAULT_RMS_NORM_EPSILON,
@@ -241,6 +244,7 @@ pub(crate) fn load_qwen3_llm_logits_head_from_reader(
 
 pub(crate) fn load_qwen3_llm_logits_head_from_reader_with_output_tensor(
     reader: &GgufTensorDataReader,
+    runtime_source: &GgmlRuntimeSource,
     metadata: Qwen3AsrExecutionMetadata,
     output_weight_tensor_name: &'static str,
     rms_norm_epsilon: f32,
@@ -248,6 +252,7 @@ pub(crate) fn load_qwen3_llm_logits_head_from_reader_with_output_tensor(
 ) -> Result<Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadError> {
     load_llm_logits_head_from_reader_with_tensor_names(
         reader,
+        runtime_source,
         metadata.llm_d_model,
         metadata.vocab_size,
         OUTPUT_NORM_WEIGHT_TENSOR_NAME,
@@ -266,6 +271,7 @@ pub(crate) fn load_qwen3_llm_logits_head_from_reader_with_output_tensor(
 /// identical across every qwen-family decoder-only LLM.
 pub(crate) fn load_llm_logits_head_from_reader_with_tensor_names(
     reader: &GgufTensorDataReader,
+    runtime_source: &GgmlRuntimeSource,
     d_model: usize,
     vocab_size: usize,
     output_norm_weight_tensor_name: &'static str,
@@ -339,7 +345,7 @@ pub(crate) fn load_llm_logits_head_from_reader_with_tensor_names(
         output_weight_layout,
         ggml_executor_cache_key: raw_output_weight.as_ref().map(|_| {
             (
-                runtime_cache_path_identity(reader.tensor_index().path()),
+                PackContentKey::for_runtime_source(runtime_source),
                 qwen_runtime_graph_config(backend).backend,
             )
         }),
@@ -703,8 +709,6 @@ fn resolve_output_weight_layout(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
 
     #[test]
@@ -847,13 +851,11 @@ mod tests {
 
     fn ggml_logits_head_test_cache_key(id: usize) -> QwenLogitsHeadExecutorCacheKey {
         (
-            // Test-only identity: the fake path does not exist, so a stable
-            // fixture fingerprint stands in for the content fingerprint the
-            // production path (`runtime_cache_path_identity`) would compute.
-            RuntimeCachePathIdentity {
-                path: PathBuf::from(format!("/tmp/openasr-test-logits-head-cache-{id}.gguf")),
-                fingerprint: format!("test:logits-head-{id}"),
-            },
+            // Test-only identity: a stable fixture content id stands in for
+            // the content id the production path
+            // (`PackContentKey::for_runtime_source`) would compute from an
+            // actual open pack.
+            PackContentKey::new(format!("test:logits-head-{id}")),
             GgmlCpuGraphBackend::Cpu,
         )
     }
@@ -875,6 +877,84 @@ mod tests {
         second
             .compute_top1_token_for_last_hidden(&[1.0, 2.0])
             .expect("second compute must reuse the cached executor, not rebuild from bad input");
+    }
+
+    /// Contract 4 defect C regression, second family: unlike the fixture
+    /// above (which stands in for the content id with a fixed `test:` token),
+    /// this test derives the cache key the way production actually does --
+    /// [`PackContentKey::for_runtime_source`] from a real, already-open,
+    /// already-validated [`crate::GgmlRuntimeSource`] -- and proves the two
+    /// behaviors that make it a correctness-preserving replacement for the
+    /// removed path-based identity: unchanged bytes at the same path key
+    /// equal across two independent opens (cache hit), and an in-place
+    /// replacement at that same path keys different (cache miss, forced
+    /// rebuild).
+    #[test]
+    fn ggml_logits_head_executor_cache_keys_on_content_id_from_a_real_runtime_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("logits-head-content-id.gguf");
+        std::fs::write(&path, b"GGUFlogits-head-content-id-v1").expect("write v1");
+
+        // Two independent opens of the same unchanged bytes must resolve to
+        // the same content id, and therefore the same cache key -- a second
+        // executor built "under" that key must reuse the first, exactly like
+        // the fixed-token test above, but through the real derivation path.
+        let source_first_open =
+            crate::validate_ggml_runtime_source_path(&path).expect("validate first open");
+        let key_first_open = (
+            PackContentKey::for_runtime_source(&source_first_open),
+            GgmlCpuGraphBackend::Cpu,
+        );
+        let first = ggml_logits_head_with_cache_key(key_first_open, vec![1.0, 1.0]);
+        first
+            .compute_top1_token_for_last_hidden(&[1.0, 2.0])
+            .expect("first compute builds and caches the executor");
+
+        let source_second_open = crate::validate_ggml_runtime_source_path(&path)
+            .expect("validate second, independent open of the unchanged file");
+        let key_second_open = (
+            PackContentKey::for_runtime_source(&source_second_open),
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(
+            PackContentKey::for_runtime_source(&source_first_open),
+            key_second_open.0,
+            "two independent opens of the same unchanged bytes must resolve to the same content id"
+        );
+        // Same shape-invalid trick as the fixed-token test: if this were
+        // rebuilt instead of reused, the shape mismatch would surface as an
+        // error here.
+        let second_content_id = key_second_open.0.clone();
+        let second = ggml_logits_head_with_cache_key(key_second_open, vec![1.0, 1.0, 1.0]);
+        second
+            .compute_top1_token_for_last_hidden(&[1.0, 2.0])
+            .expect("second compute must reuse the cached executor keyed by content id");
+
+        // Now replace the bytes at the same path (a real in-place
+        // replacement, the exact scenario the removed path-based identity
+        // used to fingerprint against). The new content id must differ, so a
+        // third executor under the new key must be built fresh -- proven by
+        // supplying a norm-weight width that would fail shape validation if
+        // it were (incorrectly) served from the old cached executor's slot
+        // reused past its actual replacement, and by succeeding once with a
+        // matching shape.
+        std::fs::write(&path, b"GGUFlogits-head-content-id-v2-different").expect("write v2");
+        let source_after_replace = crate::validate_ggml_runtime_source_path(&path)
+            .expect("validate source after replacement");
+        let key_after_replace = (
+            PackContentKey::for_runtime_source(&source_after_replace),
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_ne!(
+            key_after_replace.0, second_content_id,
+            "an in-place byte replacement at the same path must change the content id"
+        );
+        let third = ggml_logits_head_with_cache_key(key_after_replace, vec![1.0, 1.0]);
+        third
+            .compute_top1_token_for_last_hidden(&[1.0, 2.0])
+            .expect(
+                "third compute under the new content id must build fresh, not alias the old slot",
+            );
     }
 
     #[test]

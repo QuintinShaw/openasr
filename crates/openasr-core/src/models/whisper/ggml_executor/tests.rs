@@ -1322,11 +1322,14 @@ fn decoder_quantized_tensor_with_empty_bytes_fails_closed() {
 fn encoder_persistent_session_cache_is_backend_scoped() {
     let temp = tempfile::tempdir().expect("tempdir");
     let runtime_path = temp.path().join("whisper-backend-scope.gguf");
-    // The pack file must exist: cache keys carry the pack content
-    // fingerprint, and an unreadable pack fails closed (a session stored
-    // under it must never be handed back out), so store + take only observe
-    // the same key against a readable path.
-    std::fs::write(&runtime_path, b"whisper-backend-scope-fixture").expect("write fixture pack");
+    // The pack file must exist and carry valid GGUF magic: the cache key is
+    // now the already-open source's content id, and building a
+    // `GgmlRuntimeSource` requires a real magic-bearing file, so store + take
+    // only observe the same key against a validated source.
+    std::fs::write(&runtime_path, b"GGUFwhisper-backend-scope-fixture")
+        .expect("write fixture pack");
+    let runtime_source =
+        crate::validate_ggml_runtime_source_path(&runtime_path).expect("runtime source");
     let cpu_config = GgmlCpuGraphConfig::conservative_default();
     let session = WhisperEncoderPersistentStaticSession {
         runner: GgmlCpuGraphRunner::new(cpu_config).expect("runner"),
@@ -1336,15 +1339,15 @@ fn encoder_persistent_session_cache_is_backend_scoped() {
         encoder_hidden_size: 4,
     };
 
-    store_whisper_encoder_persistent_static_session(&runtime_path, session);
+    store_whisper_encoder_persistent_static_session(&runtime_source, session);
 
     assert!(
-        take_whisper_encoder_persistent_static_session(&runtime_path, GgmlCpuGraphBackend::Gpu)
+        take_whisper_encoder_persistent_static_session(&runtime_source, GgmlCpuGraphBackend::Gpu)
             .is_none(),
         "a GPU request must not steal a CPU encoder session"
     );
     let session =
-        take_whisper_encoder_persistent_static_session(&runtime_path, GgmlCpuGraphBackend::Cpu)
+        take_whisper_encoder_persistent_static_session(&runtime_source, GgmlCpuGraphBackend::Cpu)
             .expect("CPU session should remain cached under the CPU key");
     assert_eq!(session.graph_config.backend, GgmlCpuGraphBackend::Cpu);
 }

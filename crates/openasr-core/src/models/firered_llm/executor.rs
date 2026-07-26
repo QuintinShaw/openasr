@@ -59,8 +59,7 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
 use crate::models::thread_local_runtime_cache::{
-    RuntimeCachePathIdentity, current_unload_generation, runtime_cache_path_identity,
-    take_generation_tagged,
+    PackContentKey, current_unload_generation, take_generation_tagged,
 };
 
 use super::adapter_graph::FireRedLlmAdapterGraphRuntime;
@@ -79,13 +78,14 @@ use super::tokenizer::FireRedLlmTokenizer;
 /// `execute()` call against the same pack on the same backend. Without this,
 /// every request paid a full decoder-runtime rebuild (~1.8-2.0s measured,
 /// `docs/model-audits/firered2-llm.md` SS3) purely to re-derive state that
-/// does not change between requests. Keyed by (pack path, backend): unlike
-/// qwen this family has no LoRA/adapter input, so the key omits qwen's third
-/// (adapter fingerprint) component. The path half is a
-/// [`RuntimeCachePathIdentity`] (canonical path + pack content fingerprint):
-/// an in-place `.oasr` replacement at the same path fingerprints differently,
-/// so the next lookup misses and rebuilds instead of reusing a decoder whose
-/// device-uploaded weights came from the old bytes.
+/// does not change between requests. Keyed by (pack content id, backend):
+/// unlike qwen this family has no LoRA/adapter input, so the key omits qwen's
+/// third (adapter fingerprint) component. The pack half is a
+/// [`PackContentKey`] built from the same already-open source the request
+/// preflight resolved: an in-place `.oasr` replacement at the same path
+/// resolves to a different id, so the next lookup misses and rebuilds instead
+/// of reusing a decoder whose device-uploaded weights came from the old
+/// bytes.
 ///
 /// This reuses the same session/model split transcribe.cpp uses for its own
 /// Qwen-family LLM decoder (`references/transcribe.cpp@b6a6acad`,
@@ -106,7 +106,7 @@ use super::tokenizer::FireRedLlmTokenizer;
 /// decoder built before the last unload instead of handing it back out --
 /// this is how the resident 8B decoder becomes evictable under memory
 /// pressure without a bespoke eviction policy.
-type FireRedLlmDecoderCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+type FireRedLlmDecoderCacheKey = (PackContentKey, GgmlCpuGraphBackend);
 
 thread_local! {
     static FIRERED_LLM_DECODER_BY_KEY: RefCell<HashMap<FireRedLlmDecoderCacheKey, (u64, FireRedLlmDecoderRuntime)>> =
@@ -336,9 +336,10 @@ impl FireRedLlmGgmlExecutor {
             },
         )?;
 
-        let runtime_path = preflight.runtime_source.path();
+        let runtime_source = &preflight.runtime_source;
+        let runtime_path = runtime_source.path();
         let mut encoder_runtime = FireRedEncoderGraphRuntime::new(
-            runtime_path,
+            runtime_source,
             encoder_metadata,
             request.resolved_runtime.backend(),
         )
@@ -353,7 +354,7 @@ impl FireRedLlmGgmlExecutor {
 
         let adapter_profile_started_at = std::time::Instant::now();
         let mut adapter_runtime =
-            FireRedLlmAdapterGraphRuntime::new(runtime_path, request.resolved_runtime.backend())
+            FireRedLlmAdapterGraphRuntime::new(runtime_source, request.resolved_runtime.backend())
                 .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
                     reason: error.to_string(),
                 })?;
@@ -399,8 +400,10 @@ impl FireRedLlmGgmlExecutor {
             request.backend_preference,
             request.resolved_runtime,
         );
-        let decoder_cache_key: FireRedLlmDecoderCacheKey =
-            (runtime_cache_path_identity(runtime_path), decoder_backend);
+        let decoder_cache_key: FireRedLlmDecoderCacheKey = (
+            PackContentKey::for_runtime_source(runtime_source),
+            decoder_backend,
+        );
         // Sampled before the cache take and reused for the store-back below:
         // if the idle-unload reaper bumps the generation while this decode is
         // in flight, the decoder goes back tagged with the pre-unload
@@ -419,11 +422,14 @@ impl FireRedLlmGgmlExecutor {
                 decoder
             }
             None => {
-                let decoder =
-                    FireRedLlmDecoderRuntime::new(runtime_path, decoder_metadata, decoder_backend)
-                        .map_err(|error| FireRedLlmExecutorError::DecoderFailed {
-                            reason: error.to_string(),
-                        })?;
+                let decoder = FireRedLlmDecoderRuntime::new(
+                    runtime_source,
+                    decoder_metadata,
+                    decoder_backend,
+                )
+                .map_err(|error| FireRedLlmExecutorError::DecoderFailed {
+                    reason: error.to_string(),
+                })?;
                 if firered_llm_profile_enabled {
                     eprintln!("OPENASR_FIRERED_LLM_PROFILE stage=decoder_cache_miss_init");
                 }

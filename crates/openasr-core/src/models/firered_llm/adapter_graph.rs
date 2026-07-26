@@ -29,17 +29,17 @@
 //! `GgmlLoadedTensor::as_graph_tensor`, matching every other projection in
 //! this crate (e.g. `firered_aed::encoder_graph`'s conformer projections).
 //!
-//! Runs on its own small [`GgmlCpuGraphRunner`] + [`GgmlLoadedWeightContext`]
-//! (a second small mmap of the same `.oasr` GGUF the encoder already opened --
-//! cheap, page-cache-backed), reusing the encoder's exact backend/thread
-//! policy ([`firered_encoder_graph_config`]) since the adapter is the very
-//! next stage in the same pipeline and should follow the same Auto-Metal/CPU
+//! Runs on its own small [`GgmlCpuGraphRunner`] + [`GgmlLoadedWeightContext`],
+//! loaded from the same already-open [`crate::GgmlRuntimeSource`] the encoder
+//! stage was built from (no second `File::open`/mmap of the `.oasr` GGUF),
+//! reusing the encoder's exact backend/thread policy
+//! ([`firered_encoder_graph_config`]) since the adapter is the very next
+//! stage in the same pipeline and should follow the same Auto-Metal/CPU
 //! choice the encoder made.
-
-use std::path::Path;
 
 use thiserror::Error;
 
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedTensor, GgmlLoadedWeightContext,
 };
@@ -112,13 +112,13 @@ pub(crate) struct FireRedLlmAdapterGraphRuntime {
 
 impl FireRedLlmAdapterGraphRuntime {
     pub(crate) fn new(
-        runtime_path: &Path,
+        runtime_source: &GgmlRuntimeSource,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, FireRedLlmAdapterError> {
         let runner = GgmlCpuGraphRunner::new(firered_encoder_graph_config(backend))
             .map_err(|source| map_err("runner_init", source))?;
         let loaded = runner
-            .load_gguf_weight_context(runtime_path)
+            .load_gguf_weight_context(runtime_source)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
         let linear1_weight = tensor(&loaded, ADAPTER_LINEAR1_WEIGHT)?;
         let linear1_bias = tensor(&loaded, ADAPTER_LINEAR1_BIAS)?;
@@ -365,7 +365,10 @@ mod tests {
         )
         .expect("load jfk.wav");
 
-        let reader = GgufTensorDataReader::from_path(&pack_path).expect("open tensor reader");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
+        let reader =
+            GgufTensorDataReader::from_runtime_source(&runtime_source).expect("open tensor reader");
         let feature_dim_shape = [encoder_metadata.feature_dim as u64];
         let neg_mean = reader
             .host_tensor_f32_copy_dequantized_by_name("frontend.cmvn.neg_mean", &feature_dim_shape)
@@ -382,7 +385,7 @@ mod tests {
             .expect("apply cmvn");
 
         let mut encoder_runtime = FireRedEncoderGraphRuntime::new(
-            &pack_path,
+            &runtime_source,
             encoder_metadata,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
@@ -401,7 +404,7 @@ mod tests {
         );
 
         let mut adapter_runtime = FireRedLlmAdapterGraphRuntime::new(
-            &pack_path,
+            &runtime_source,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         )
         .expect("build adapter runtime");

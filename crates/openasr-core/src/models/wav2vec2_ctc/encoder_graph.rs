@@ -9,8 +9,7 @@
 
 #![allow(dead_code)]
 
-use std::path::Path;
-
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     ArenaAllocError, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedWeightContext,
     GgmlStaticTensor, GgmlStaticTensorArena, WeightSlot,
@@ -191,7 +190,7 @@ impl Wav2Vec2CtcEncoderGraph {
     pub(crate) fn new(
         weights: &Wav2Vec2EncoderWeights,
         metadata: Wav2Vec2CtcExecutionMetadata,
-        runtime_path: Option<&Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, Wav2Vec2EncoderError> {
         let mut config = wav2vec2_ctc_encoder_graph_config(backend);
@@ -210,7 +209,7 @@ impl Wav2Vec2CtcEncoderGraph {
             }
         })?;
         let loaded_weights =
-            runtime_path.and_then(|path| runner.load_gguf_weight_context(path).ok());
+            runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
         let loaded = loaded_weights.as_ref();
         let mut arena = runner
             .start_static_tensor_arena(WAV2VEC2_ENCODER_GRAPH_CONTEXT_BYTES)

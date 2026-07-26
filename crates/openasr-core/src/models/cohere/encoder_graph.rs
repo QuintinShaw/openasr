@@ -1,8 +1,8 @@
-use std::path::Path;
 use std::time::Instant;
 
 use thiserror::Error;
 
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedTensor,
     GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena,
@@ -154,7 +154,7 @@ impl CohereTranscribeEncoderGraphRuntime {
     pub(crate) fn new(
         weights: &CohereTranscribeEncoderWeights,
         metadata: CohereTranscribeExecutionMetadata,
-        runtime_path: Option<&Path>,
+        runtime_source: Option<&GgmlRuntimeSource>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, CohereTranscribeEncoderError> {
         let build_debug = std::env::var_os(COHERE_DEBUG_ENCODER_BUILD_ENV).is_some();
@@ -179,7 +179,7 @@ impl CohereTranscribeEncoderGraphRuntime {
         })?;
         let runner_ms = runner_start.elapsed().as_secs_f64() * 1000.0;
         let loaded_weights =
-            runtime_path.and_then(|path| runner.load_gguf_weight_context(path).ok());
+            runtime_source.and_then(|source| runner.load_gguf_weight_context(source).ok());
         let arena_start = Instant::now();
         let mut arena = runner
             .start_static_tensor_arena(config.context_bytes)

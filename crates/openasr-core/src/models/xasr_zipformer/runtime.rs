@@ -1,16 +1,14 @@
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use std::path::Path;
 
 #[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufMetadata, GgufTensorDataReader};
-use crate::models::thread_local_runtime_cache::{
-    RuntimeCachePathIdentity, runtime_cache_path_identity,
-};
+use crate::models::thread_local_runtime_cache::PackContentKey;
 
 use super::decoder::XasrDecoder;
 use super::encoder_graph::{
@@ -33,13 +31,13 @@ const XASR_ZIPFORMER_STREAMING_WARMUP_FRAMES: usize = 13;
 const XASR_PROFILE_ENV: &str = "OPENASR_XASR_PROFILE";
 const MAX_IDLE_RUNTIMES_PER_KEY: usize = 2;
 
-/// Pool key: pack path identity (canonical path + content fingerprint) + the
-/// backend the runtime's prepared encoder graph was built for. CPU and Metal
-/// runtimes must never conflate -- a checkout for an accelerated session must
-/// not receive a CPU-frozen runtime (or vice versa). The content fingerprint
-/// ([`runtime_cache_path_identity`]) keeps an in-place pack replacement at the
-/// same path from checking out a runtime built from the old bytes.
-type RuntimePoolKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend);
+/// Pool key: pack content id + the backend the runtime's prepared encoder
+/// graph was built for. CPU and Metal runtimes must never conflate -- a
+/// checkout for an accelerated session must not receive a CPU-frozen runtime
+/// (or vice versa). The content id ([`PackContentKey::for_runtime_source`])
+/// keeps an in-place pack replacement at the same path from checking out a
+/// runtime built from the old bytes.
+type RuntimePoolKey = (PackContentKey, GgmlCpuGraphBackend);
 type RuntimePool = HashMap<RuntimePoolKey, Vec<SendableRuntime>>;
 
 static XASR_PROCESS_RUNTIME_POOL: OnceLock<Mutex<RuntimePool>> = OnceLock::new();
@@ -184,11 +182,11 @@ impl Drop for PooledRuntime {
 }
 
 pub(super) fn checkout_prepared_runtime(
-    pack_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     resolved_backend: GgmlCpuGraphBackend,
 ) -> Result<PooledRuntime, String> {
     let backend = xasr_zipformer_encoder_graph_config(resolved_backend).backend;
-    let key = (runtime_cache_path_identity(pack_path), backend);
+    let key = (PackContentKey::for_runtime_source(runtime_source), backend);
     if let Some(runtime) = runtime_pool()
         .lock()
         .map_err(|_| "xasr runtime pool lock poisoned".to_string())?
@@ -201,7 +199,7 @@ pub(super) fn checkout_prepared_runtime(
         });
     }
 
-    let runtime = XasrZipformerPreparedRuntime::load(pack_path, resolved_backend)?;
+    let runtime = XasrZipformerPreparedRuntime::load(runtime_source, resolved_backend)?;
     Ok(PooledRuntime {
         key,
         runtime: Some(SendableRuntime(runtime)),
@@ -230,16 +228,21 @@ pub(super) fn clear_idle_runtime_pool() {
 }
 
 impl XasrZipformerPreparedRuntime {
-    pub(super) fn load(pack_path: &Path, backend: GgmlCpuGraphBackend) -> Result<Self, String> {
+    pub(super) fn load(
+        runtime_source: &GgmlRuntimeSource,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, String> {
         let profile = xasr_profile_start();
-        let reader = GgufTensorDataReader::from_path(pack_path).map_err(|e| e.to_string())?;
+        let reader =
+            GgufTensorDataReader::from_runtime_source(runtime_source).map_err(|e| e.to_string())?;
         let gguf_metadata =
-            crate::ggml_runtime::read_gguf_metadata(pack_path).map_err(|e| e.to_string())?;
+            crate::ggml_runtime::read_gguf_metadata_from_runtime_source(runtime_source)
+                .map_err(|e| e.to_string())?;
         let runtime = Self::from_reader_metadata(&reader, &gguf_metadata, backend)?;
         xasr_profile_log(
             "runtime_load",
             profile,
-            format_args!("pack={}", pack_path.display()),
+            format_args!("pack={}", runtime_source.path().display()),
         );
         Ok(runtime)
     }
@@ -622,8 +625,10 @@ mod tests {
         };
 
         let resolved_backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
         let key = (
-            runtime_cache_path_identity(&pack),
+            PackContentKey::for_runtime_source(&runtime_source),
             xasr_zipformer_encoder_graph_config(resolved_backend).backend,
         );
 
@@ -639,8 +644,8 @@ mod tests {
             );
         }
 
-        let runtime =
-            checkout_prepared_runtime(&pack, resolved_backend).expect("first checkout must build");
+        let runtime = checkout_prepared_runtime(&runtime_source, resolved_backend)
+            .expect("first checkout must build");
         drop(runtime);
         {
             let pool = runtime_pool().lock().expect("runtime pool lock poisoned");
@@ -666,7 +671,7 @@ mod tests {
         // (now-empty) pool and build fresh, exactly like a cold start -- and
         // the rebuilt runtime must still be fully functional, not some
         // half-initialized leftover.
-        let mut rebuilt = checkout_prepared_runtime(&pack, resolved_backend)
+        let mut rebuilt = checkout_prepared_runtime(&runtime_source, resolved_backend)
             .expect("checkout after clear must rebuild");
         let samples = (0..16_000)
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin() * 0.05)

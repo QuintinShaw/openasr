@@ -19,8 +19,8 @@ use thiserror::Error;
 
 use super::ffi;
 use super::{
-    GgmlBackendKind, GgmlRuntimeError, GgufTensorDataReader, GgufWeightTensorPayload,
-    ensure_backends_loaded, ggml_available_devices,
+    GgmlBackendKind, GgmlRuntimeError, GgmlRuntimeSource, GgufTensorDataReader,
+    GgufWeightTensorPayload, ensure_backends_loaded, ggml_available_devices,
 };
 use crate::device::execution_route::{
     ExecutionProvider, ExecutionRouteCacheKey, ExecutionRouteError, ExecutionRouteRequest,
@@ -1364,12 +1364,20 @@ impl GgmlCpuGraphRunner {
         self.scheduler.is_some()
     }
 
+    /// Loads GGUF weights from `source`'s own already-open mapping -- never a
+    /// fresh `File::open` of `source.path()`. This is what keeps the runtime
+    /// cache key (built from `source.content_id()`, see
+    /// `models::runtime_cache_coordinator::PackContentKey`) and the weight
+    /// bytes actually bound into the graph provably from the same open handle
+    /// (contract 4's defect C): a caller that already validated/opened a
+    /// `GgmlRuntimeSource` for this request must pass that same source here
+    /// instead of re-deriving one from a path.
     pub(crate) fn load_gguf_weight_context(
         &self,
-        path: &Path,
+        source: &GgmlRuntimeSource,
     ) -> Result<GgmlLoadedWeightContext, GgmlCpuGraphError> {
-        GgmlLoadedWeightContext::from_path_with_backend(
-            path,
+        GgmlLoadedWeightContext::from_runtime_source_with_backend(
+            source,
             self.backend.raw,
             self.backend_kind.is_gpu_class() && self.scheduler.is_none(),
         )
@@ -1514,11 +1522,22 @@ impl GgmlLoadedWeightContext {
         self.tensors.get(name).copied()
     }
 
-    fn from_path_with_backend(
-        path: &Path,
+    /// Builds a loaded weight context from `source`'s own already-open
+    /// mapping. The ggml/gguf metadata skeleton (`gguf_init_from_file`) still
+    /// reads `source.path()` directly -- that ggml-side C call only parses
+    /// tensor shapes/types (`no_alloc: true`, no weight bytes), a separate,
+    /// narrower concern from the tensor *data* read below, which is what this
+    /// contract requires to share `source`'s open handle. The weight bytes
+    /// bound into the graph, and therefore the only bytes actually executed,
+    /// come from [`GgufTensorDataReader::from_runtime_source`] -- the same
+    /// mapping the caller's runtime cache key was built from, never a second
+    /// `File::open` of `source.path()`.
+    fn from_runtime_source_with_backend(
+        source: &GgmlRuntimeSource,
         backend: NonNull<c_void>,
         require_direct_backend_matmul_support: bool,
     ) -> Result<Self, GgmlCpuGraphError> {
+        let path = source.path();
         let path_cstring = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
             GgmlCpuGraphError::LoadedWeightContextFailed {
                 reason: format!("path contains interior NUL bytes: {}", path.display()),
@@ -1552,7 +1571,7 @@ impl GgmlLoadedWeightContext {
         if require_direct_backend_matmul_support {
             validate_direct_backend_matmul_weight_support(context.raw, backend, path)?;
         }
-        let reader = GgufTensorDataReader::from_path(path).map_err(|error| {
+        let reader = GgufTensorDataReader::from_runtime_source(source).map_err(|error| {
             GgmlCpuGraphError::LoadedWeightContextFailed {
                 reason: error.to_string(),
             }
@@ -7837,10 +7856,12 @@ mod tests {
         }];
         write_gguf_file_v0(&pack, &BTreeMap::new(), &tensors).expect("write tiny gguf");
 
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
             .expect("cpu graph runner should initialize");
         let loaded = runner
-            .load_gguf_weight_context(&pack)
+            .load_gguf_weight_context(&runtime_source)
             .expect("load zero-copy weight context");
         let weight = loaded
             .tensor("loaded.weight")

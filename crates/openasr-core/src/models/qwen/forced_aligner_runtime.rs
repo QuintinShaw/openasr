@@ -14,7 +14,11 @@
 
 use thiserror::Error;
 
-use crate::ggml_runtime::{GgufMetadata, GgufTensorDataReadError, GgufTensorDataReader};
+use crate::GgmlRuntimeSource;
+use crate::ggml_runtime::{
+    GgufMetadata, GgufTensorDataReadError, GgufTensorDataReader,
+    read_gguf_metadata_from_runtime_source,
+};
 use crate::models::gpt2_bpe::{build_merge_rank, build_token_to_id, encode_prompt_text};
 
 use super::audio_encoder::{
@@ -309,15 +313,16 @@ pub(crate) struct Qwen3ForcedAlignerPreparedAssets {
 }
 
 pub(crate) fn load_forced_aligner_prepared_assets(
-    pack_path: &std::path::Path,
+    runtime_source: &GgmlRuntimeSource,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<Qwen3ForcedAlignerPreparedAssets, Qwen3ForcedAlignerRuntimeError> {
-    let gguf_metadata = crate::ggml_runtime::read_gguf_metadata(pack_path).map_err(|error| {
-        Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
-            key: "<gguf>",
-            reason: error.to_string(),
-        }
-    })?;
+    let gguf_metadata =
+        read_gguf_metadata_from_runtime_source(runtime_source).map_err(|error| {
+            Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+                key: "<gguf>",
+                reason: error.to_string(),
+            }
+        })?;
     let metadata = parse_forced_aligner_runtime_metadata(&gguf_metadata)?;
 
     let tokens = gguf_metadata
@@ -333,7 +338,7 @@ pub(crate) fn load_forced_aligner_prepared_assets(
     let token_to_id = build_token_to_id(tokens, "Qwen3-ForcedAligner")?;
     let merge_rank = build_merge_rank(merges);
 
-    let reader = GgufTensorDataReader::from_path(pack_path)?;
+    let reader = GgufTensorDataReader::from_runtime_source(runtime_source)?;
     let embedding_metadata = metadata.as_embedding_execution_metadata();
     let classify_metadata = metadata.as_classify_execution_metadata();
 
@@ -343,6 +348,7 @@ pub(crate) fn load_forced_aligner_prepared_assets(
         load_qwen3_token_embedding_table_from_reader(&reader, embedding_metadata)?;
     let logits_head = load_qwen3_llm_logits_head_from_reader_with_output_tensor(
         &reader,
+        runtime_source,
         classify_metadata,
         OUTPUT_WEIGHT,
         DEFAULT_RMS_NORM_EPSILON,
@@ -368,7 +374,7 @@ pub(crate) fn load_forced_aligner_prepared_assets(
 /// forward pass, one row per prompt token) -> classify-head argmax at every
 /// `<timestamp>` position -> `fix_timestamp` LIS repair -> per-word spans.
 pub(crate) fn align_forced(
-    pack_path: &std::path::Path,
+    runtime_source: &GgmlRuntimeSource,
     assets: &Qwen3ForcedAlignerPreparedAssets,
     audio_samples_16khz_mono: &[f32],
     text: &str,
@@ -377,17 +383,15 @@ pub(crate) fn align_forced(
 ) -> Result<Vec<ForcedAlignItem>, Qwen3ForcedAlignerRuntimeError> {
     let word_list = word_list_for_language(text, language)?;
 
-    let reader = GgufTensorDataReader::from_path(pack_path)?;
+    let reader = GgufTensorDataReader::from_runtime_source(runtime_source)?;
     let embedding_metadata = assets.metadata.as_embedding_execution_metadata();
     let mel_plan = load_qwen3_mel_frontend_plan_from_reader(&reader, embedding_metadata)?;
     let prepared_audio = GgmlAsrPreparedAudio::mono_16khz(audio_samples_16khz_mono.to_vec());
     let mel_features = qwen3_mel_features_from_prepared_audio(&prepared_audio, &mel_plan)?;
 
-    let mut audio_runtime =
-        Qwen3AsrAudioEncoderRuntime::new(Some(pack_path), backend).map_err(|error| {
-            Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
-                reason: format!("audio encoder runtime init failed: {error}"),
-            }
+    let mut audio_runtime = Qwen3AsrAudioEncoderRuntime::new(Some(runtime_source), backend)
+        .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+            reason: format!("audio encoder runtime init failed: {error}"),
         })?;
     let audio_embeddings = audio_runtime
         .encode(
@@ -418,7 +422,7 @@ pub(crate) fn align_forced(
 
     let mut whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
         &assets.layer_attention_projections,
-        Some(pack_path),
+        Some(runtime_source),
         backend,
     )
     .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
@@ -506,9 +510,21 @@ pub(crate) fn refine_word_timestamps_with_forced_aligner(
         ),
     )
     .backend();
-    let assets = load_forced_aligner_prepared_assets(pack_path, backend)?;
+    // Open once: `load_forced_aligner_prepared_assets` and `align_forced`
+    // both need this pack's tensor data, and this tier's own doc comment
+    // above already promises "loads the pack fresh... at most once per
+    // `transcribe` call" -- sharing one `GgmlRuntimeSource` between them
+    // (instead of each independently opening `pack_path`) is what actually
+    // keeps that promise (contract 4's defect C).
+    let runtime_source = crate::validate_ggml_runtime_source_path(pack_path).map_err(|error| {
+        Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+            key: "<runtime source>",
+            reason: error.to_string(),
+        }
+    })?;
+    let assets = load_forced_aligner_prepared_assets(&runtime_source, backend)?;
     align_forced(
-        pack_path,
+        &runtime_source,
         &assets,
         audio_samples_16khz_mono,
         text,
@@ -581,8 +597,10 @@ mod tests {
         convert_local_qwen_forced_aligner_source_to_runtime_pack(&request)
             .expect("forced-aligner conversion must succeed");
 
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
         let assets = load_forced_aligner_prepared_assets(
-            &pack_path,
+            &runtime_source,
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("prepared assets");
@@ -623,7 +641,7 @@ mod tests {
             .expect("load wav");
 
             let items = align_forced(
-                &pack_path,
+                &runtime_source,
                 &assets,
                 &samples,
                 case.text,

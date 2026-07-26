@@ -114,15 +114,16 @@ pub(crate) struct MossTdPrefillOutput {
 
 impl MossTdDecoderRuntime {
     pub(crate) fn new(
-        runtime_path: &std::path::Path,
+        runtime_source: &crate::GgmlRuntimeSource,
         metadata: MossTdDecoderMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MossTdDecoderError> {
-        let reader = crate::ggml_runtime::GgufTensorDataReader::from_path(runtime_path)
+        let reader = crate::ggml_runtime::GgufTensorDataReader::from_runtime_source(runtime_source)
             .map_err(map_tensor_read_error)?;
         let projections = load_moss_layer_projections(&reader, &metadata)?;
         let logits_head = load_llm_logits_head_from_reader_with_tensor_names(
             &reader,
+            runtime_source,
             metadata.d_model,
             metadata.vocab_size,
             LLM_OUTPUT_NORM_WEIGHT,
@@ -152,7 +153,7 @@ impl MossTdDecoderRuntime {
         let whole_decoder =
             Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_rms_norm_epsilon_and_fused_logits_head(
                 &projections,
-                Some(runtime_path),
+                Some(runtime_source),
                 MOSS_TD_RMS_NORM_EPSILON,
                 logits_head.fused_top1_spec(),
                 backend,

@@ -1,6 +1,7 @@
 use std::cell::RefCell;
-use std::path::Path;
 use std::sync::Arc;
+
+use crate::GgmlRuntimeSource;
 
 use thiserror::Error;
 
@@ -35,8 +36,8 @@ use crate::models::incremental_streaming_driver::{
 };
 use crate::models::prepared_runtime_cache::PreparedRuntimeCache;
 use crate::models::thread_local_runtime_cache::{
-    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, RuntimeCachePathIdentity,
-    canonical_runtime_cache_path, runtime_cache_path_identity, with_thread_local_cached_mut_by_key,
+    BoundedRuntimeCache, DEFAULT_RUNTIME_CACHE_CAPACITY, PackContentKey,
+    canonical_runtime_cache_path, with_thread_local_cached_mut_by_key,
 };
 
 const MOONSHINE_EXECUTOR_ID: &str = "moonshine-ggml-executor-v1";
@@ -47,14 +48,13 @@ thread_local! {
         RefCell::new(BoundedRuntimeCache::new());
 }
 
-/// (pack path identity: canonical path + content fingerprint, backend,
-/// adapter fingerprint). The content fingerprint
-/// ([`runtime_cache_path_identity`]) keeps an in-place pack replacement at the
-/// same path from reusing a runtime built from the old bytes. The adapter
-/// fingerprint MUST stay in this key -- prepared encoder graphs embed the
-/// adapter tensors, so reuse keyed only on the base pack would be a
-/// correctness bug.
-type MoonshineEncoderRuntimeCacheKey = (RuntimeCachePathIdentity, GgmlCpuGraphBackend, String);
+/// (pack content id, backend, adapter fingerprint). The content id
+/// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
+/// replacement at the same path from reusing a runtime built from the old
+/// bytes. The adapter fingerprint MUST stay in this key -- prepared encoder
+/// graphs embed the adapter tensors, so reuse keyed only on the base pack
+/// would be a correctness bug.
+type MoonshineEncoderRuntimeCacheKey = (PackContentKey, GgmlCpuGraphBackend, String);
 
 #[derive(Debug, Error)]
 enum MoonshineGgmlExecutorError {
@@ -127,7 +127,7 @@ impl MoonshineGgmlExecutor {
 
         let backend = request.resolved_runtime.backend();
         let encoder_output = encode_with_cached_runtime(
-            preflight.runtime_source.path(),
+            &preflight.runtime_source,
             &prepared_runtime,
             &features,
             adapter_ref,
@@ -161,6 +161,7 @@ impl MoonshineGgmlExecutor {
                     runtime_cache_path: canonical_runtime_cache_path(
                         preflight.runtime_source.path(),
                     ),
+                    runtime_source: preflight.runtime_source.clone(),
                     build_identity:
                         crate::models::ggml_asr_executor::serve_batch_build_identity_for_request(
                             &request.request_options,
@@ -199,7 +200,7 @@ impl MoonshineGgmlExecutor {
                     request.request_options.phrase_bias.as_ref(),
                     backend,
                     false,
-                    Some(preflight.runtime_source.path()),
+                    Some(&preflight.runtime_source),
                     request.request_options.word_timestamps,
                     audio_duration,
                     adapter_ref,
@@ -260,7 +261,7 @@ fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudio) -> f32 {
 }
 
 fn encode_with_cached_runtime(
-    runtime_path: &Path,
+    runtime_source: &GgmlRuntimeSource,
     prepared_runtime: &MoonshinePreparedRuntime,
     features: &super::frontend::MoonshineWaveformFeatures,
     adapter: Option<&MoonshineLoraAdapter>,
@@ -268,7 +269,7 @@ fn encode_with_cached_runtime(
 ) -> Result<MoonshineEncoderOutput, MoonshineEncoderError> {
     let encoder_backend = moonshine_encoder_graph_config(backend).backend;
     let key = (
-        runtime_cache_path_identity(runtime_path),
+        PackContentKey::for_runtime_source(runtime_source),
         encoder_backend,
         moonshine_adapter_cache_fingerprint(adapter),
     );
@@ -280,7 +281,7 @@ fn encode_with_cached_runtime(
             MoonshineEncoderGraphRuntime::new(
                 &prepared_runtime.encoder_weights,
                 prepared_runtime.metadata,
-                Some(runtime_path),
+                Some(runtime_source),
                 adapter,
                 backend,
             )

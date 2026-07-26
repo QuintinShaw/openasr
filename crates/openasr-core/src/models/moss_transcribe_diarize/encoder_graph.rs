@@ -32,10 +32,12 @@
 //! all-zero, but genuinely re-uploaded per call for op-order clarity)
 //! attention mask stay real graph inputs.
 
+#[cfg(test)]
 use std::path::Path;
 
 use thiserror::Error;
 
+use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext,
     GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader,
@@ -258,15 +260,17 @@ pub(crate) struct MossEncoderRuntime {
 
 impl MossEncoderRuntime {
     pub(crate) fn new(
-        runtime_path: &Path,
+        runtime_source: &GgmlRuntimeSource,
         config: MossEncoderConfig,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, MossEncoderError> {
         let graph_config = super::graph_config::moss_td_encoder_graph_config(backend);
         let runner = GgmlCpuGraphRunner::new(graph_config)
             .map_err(|source| map_graph_error("runner_init", source))?;
-        let loaded = runner.load_gguf_weight_context(runtime_path).ok();
-        let reader = GgufTensorDataReader::from_path(runtime_path)?;
+        let loaded = runner.load_gguf_weight_context(runtime_source).ok();
+        // Shares `runtime_source`'s already-open mapping with the
+        // resident-weight load above instead of a second `File::open`.
+        let reader = GgufTensorDataReader::from_runtime_source(runtime_source)?;
         let weights = load_moss_encoder_weights_from_reader(&reader, config)?;
         Ok(Self {
             runner,
@@ -1150,7 +1154,10 @@ mod parity_tests {
             whisper_log_mel_spectrogram_16khz_mono_v0(chunk, config.n_mels, MEL_TARGET_FRAMES)
                 .expect("compute mel");
 
-        let reader = GgufTensorDataReader::from_path(&pack_path).expect("open tensor reader");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
+        let reader =
+            GgufTensorDataReader::from_runtime_source(&runtime_source).expect("open tensor reader");
         let weights =
             load_moss_encoder_weights_from_reader(&reader, config).expect("load encoder weights");
 
@@ -1219,7 +1226,7 @@ mod parity_tests {
 
         let mut runner = GgmlCpuGraphRunner::new(graph_config).expect("build graph runner");
         let loaded = runner
-            .load_gguf_weight_context(&pack_path)
+            .load_gguf_weight_context(&runtime_source)
             .expect("load gguf weight context");
 
         encode_with_layer_taps(
