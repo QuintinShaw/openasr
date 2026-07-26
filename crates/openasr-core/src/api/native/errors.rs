@@ -40,6 +40,8 @@ pub enum NativeAsrError {
         stage: &'static str,
         requested_bytes: usize,
     },
+    #[error("Native ASR ggml compute buffer allocation failed (backend: {backend}).")]
+    BackendBufferAllocationFailed { backend: String },
     #[error("Native ASR session is closed.")]
     SessionClosed,
     #[error("Native ASR session failed: {message}.")]

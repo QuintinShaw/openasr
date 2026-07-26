@@ -539,6 +539,9 @@ fn native_ggml_streaming_error_to_asr(
             stage,
             requested_bytes,
         },
+        GgmlAsrExecutionError::BackendBufferAllocationFailed { backend } => {
+            NativeAsrError::BackendBufferAllocationFailed { backend }
+        }
         other => {
             if let Some(route_error) =
                 crate::device::execution_route::ExecutionRouteError::from_embedded_message(
@@ -611,6 +614,9 @@ fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {
             stage,
             requested_bytes,
         },
+        BackendError::BackendBufferAllocationFailed { backend } => {
+            NativeAsrError::BackendBufferAllocationFailed { backend }
+        }
         other => NativeAsrError::SessionFailed {
             message: other.to_string(),
         },

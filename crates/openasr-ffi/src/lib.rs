@@ -1106,7 +1106,8 @@ pub extern "C" fn openasr_last_error_message() -> *const c_char {
 fn native_error_status(_error: &NativeAsrError, fallback: OpenAsrStatus) -> OpenAsrStatus {
     match _error {
         NativeAsrError::ContextAllocationFailed { .. }
-        | NativeAsrError::HostAllocationFailed { .. } => OpenAsrStatus::OutOfMemory,
+        | NativeAsrError::HostAllocationFailed { .. }
+        | NativeAsrError::BackendBufferAllocationFailed { .. } => OpenAsrStatus::OutOfMemory,
         _ => fallback,
     }
 }
@@ -1114,7 +1115,8 @@ fn native_error_status(_error: &NativeAsrError, fallback: OpenAsrStatus) -> Open
 fn backend_error_status(_error: &BackendError, fallback: OpenAsrStatus) -> OpenAsrStatus {
     match _error {
         BackendError::ContextAllocationFailed { .. }
-        | BackendError::HostAllocationFailed { .. } => OpenAsrStatus::OutOfMemory,
+        | BackendError::HostAllocationFailed { .. }
+        | BackendError::BackendBufferAllocationFailed { .. } => OpenAsrStatus::OutOfMemory,
         _ => fallback,
     }
 }
@@ -1464,6 +1466,24 @@ mod tests {
             OpenAsrStatus::OutOfMemory
         );
         assert_eq!(
+            native_error_status(
+                &NativeAsrError::BackendBufferAllocationFailed {
+                    backend: "Metal".to_string(),
+                },
+                OpenAsrStatus::TranscribeFailed,
+            ),
+            OpenAsrStatus::OutOfMemory
+        );
+        assert_eq!(
+            backend_error_status(
+                &BackendError::BackendBufferAllocationFailed {
+                    backend: "Metal".to_string(),
+                },
+                OpenAsrStatus::TranscribeFailed,
+            ),
+            OpenAsrStatus::OutOfMemory
+        );
+        assert_eq!(
             backend_error_status(
                 &BackendError::NativeFailClosed {
                     reason: "model path contains ggml context allocation failed at pool"
@@ -1499,6 +1519,33 @@ mod tests {
             &mut out_result,
         );
         assert_eq!(marker_status, OpenAsrStatus::TranscribeFailed);
+    }
+
+    #[test]
+    fn batch_transcription_preserves_typed_host_and_backend_buffer_allocation_failures() {
+        let mut out_result = ptr::null_mut();
+        let host_status = finish_transcribe_pcm(
+            Err(BackendError::HostAllocationFailed {
+                stage: "ffi-pcm-copy",
+                requested_bytes: 64 * 1024,
+            }),
+            true,
+            &mut out_result,
+        );
+        assert_eq!(host_status, OpenAsrStatus::OutOfMemory);
+        assert!(out_result.is_null());
+        assert!(last_error().contains("ffi-pcm-copy"));
+
+        let backend_status = finish_transcribe_pcm(
+            Err(BackendError::BackendBufferAllocationFailed {
+                backend: "Metal".to_string(),
+            }),
+            true,
+            &mut out_result,
+        );
+        assert_eq!(backend_status, OpenAsrStatus::OutOfMemory);
+        assert!(out_result.is_null());
+        assert!(last_error().contains("Metal"));
     }
 
     #[test]

@@ -468,6 +468,8 @@ pub enum GgmlAsrExecutionError {
         stage: &'static str,
         requested_bytes: usize,
     },
+    #[error("ggml compute buffer allocation failed (backend: {backend})")]
+    BackendBufferAllocationFailed { backend: String },
     /// OADP Phase 0: an adapter is active (request `--adapter` or the
     /// server-side `OPENASR_ADAPTER` env var) but the selected family has no
     /// dynamic adapter support. Fail-closed: an adapter the user asked for is

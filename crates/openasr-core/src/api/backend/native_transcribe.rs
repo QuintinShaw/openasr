@@ -529,9 +529,10 @@ impl SliceGpuFallback {
     }
 }
 
-/// Recognizes `GgmlCpuGraphError::BackendBufferAllocationFailed`'s Display
-/// text after it has been flattened into a `BackendError::NativeFailClosed`
-/// reason string, and extracts the backend name it names.
+/// Recognizes typed `BackendBufferAllocationFailed` values and the legacy
+/// `GgmlCpuGraphError::BackendBufferAllocationFailed` Display text after it
+/// has been flattened into a `BackendError::NativeFailClosed` reason string,
+/// then extracts the backend name it names.
 ///
 /// This matches on message text rather than downcasting a preserved error
 /// source chain because most model families already flatten their internal
@@ -548,6 +549,9 @@ impl SliceGpuFallback {
 /// in `ggml_runtime::cpu_graph`), not an external dependency, so it is stable
 /// under our own control.
 fn gpu_buffer_allocation_failure_backend(error: &BackendError) -> Option<&str> {
+    if let BackendError::BackendBufferAllocationFailed { backend } = error {
+        return Some(backend);
+    }
     let BackendError::NativeFailClosed { reason } = error else {
         return None;
     };
@@ -781,7 +785,8 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
             FailureCategory::Alloc
         }
         BackendError::ContextAllocationFailed { .. }
-        | BackendError::HostAllocationFailed { .. } => FailureCategory::Alloc,
+        | BackendError::HostAllocationFailed { .. }
+        | BackendError::BackendBufferAllocationFailed { .. } => FailureCategory::Alloc,
         BackendError::NativeFailClosed { .. }
         | BackendError::WordTimestampAlignmentFailed { .. } => FailureCategory::Decode,
     }
@@ -2612,6 +2617,9 @@ fn dispatch_error_to_backend(
             stage,
             requested_bytes,
         },
+        GgmlAsrExecutionError::BackendBufferAllocationFailed { backend } => {
+            BackendError::BackendBufferAllocationFailed { backend }
+        }
         other => {
             // Family executors historically stringify `GgmlCpuGraphError` into
             // `ExecutorFailed.reason`. Recover the typed route failure when the
@@ -4960,6 +4968,30 @@ mod tests {
                 requested_bytes: 16_384,
             }
         ));
+        assert_eq!(
+            classify_backend_error_for_failure_log(&error),
+            FailureCategory::Alloc
+        );
+    }
+
+    #[test]
+    fn dispatch_preserves_typed_backend_buffer_allocation_failure() {
+        let execution_context = uncancellable_execution_context_for_test();
+        let error = dispatch_error_to_backend(
+            GgmlAsrExecutionError::BackendBufferAllocationFailed {
+                backend: "Metal".to_string(),
+            },
+            &execution_context,
+        );
+        assert!(matches!(
+            error,
+            BackendError::BackendBufferAllocationFailed { ref backend } if backend == "Metal"
+        ));
+        assert_eq!(
+            gpu_buffer_allocation_failure_backend(&error),
+            Some("Metal"),
+            "typed backend-buffer OOM must remain eligible for accelerated-to-CPU fallback"
+        );
         assert_eq!(
             classify_backend_error_for_failure_log(&error),
             FailureCategory::Alloc

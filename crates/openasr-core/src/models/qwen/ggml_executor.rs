@@ -210,6 +210,8 @@ enum Qwen3AsrGgmlExecutorError {
         stage: &'static str,
         requested_bytes: usize,
     },
+    #[error("qwen3-asr ggml compute buffer allocation failed (backend: {backend})")]
+    BackendBufferAllocationFailed { backend: String },
     #[error("qwen3-asr runtime contract check failed: {reason}")]
     RuntimeContractViolation { reason: String },
     #[error("qwen3-asr runtime metadata read failed: {reason}")]
@@ -1017,6 +1019,11 @@ fn qwen_graph_allocation_failure(error: &GgmlCpuGraphError) -> Option<Qwen3AsrGg
             stage,
             requested_bytes: *requested_bytes,
         }),
+        GgmlCpuGraphError::BackendBufferAllocationFailed { backend } => {
+            Some(Qwen3AsrGgmlExecutorError::BackendBufferAllocationFailed {
+                backend: backend.clone(),
+            })
+        }
         _ => None,
     }
 }
@@ -1619,6 +1626,9 @@ fn qwen_execute_error_to_ggml(
             stage,
             requested_bytes,
         },
+        Qwen3AsrGgmlExecutorError::BackendBufferAllocationFailed { backend } => {
+            GgmlAsrExecutionError::BackendBufferAllocationFailed { backend }
+        }
         Qwen3AsrGgmlExecutorError::ServeBatchUnavailable { reason, retryable } => {
             GgmlAsrExecutionError::ServeBatchUnavailable { reason, retryable }
         }
@@ -1748,6 +1758,24 @@ mod tests {
                 requested_bytes: 536_870_912,
             }),
             Qwen3AsrGgmlExecutorError::RuntimeContractViolation { .. }
+        ));
+        let logits_backend = map_logits_head_error(Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
+            source: GgmlCpuGraphError::BackendBufferAllocationFailed {
+                backend: "Metal".to_string(),
+            },
+        });
+        assert_eq!(
+            qwen_execute_error_to_ggml(logits_backend, QWEN3_ASR_GGML_ADAPTER_ID),
+            GgmlAsrExecutionError::BackendBufferAllocationFailed {
+                backend: "Metal".to_string(),
+            }
+        );
+        assert!(matches!(
+            map_whole_decoder_init_error(GgmlCpuGraphError::BackendBufferAllocationFailed {
+                backend: "Metal".to_string(),
+            }),
+            Qwen3AsrGgmlExecutorError::BackendBufferAllocationFailed { backend }
+                if backend == "Metal"
         ));
         assert_eq!(
             qwen_execute_error_to_ggml(
