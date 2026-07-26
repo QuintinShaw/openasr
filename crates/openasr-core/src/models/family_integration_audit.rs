@@ -34,6 +34,8 @@ const PRE_AUDIT_FAMILIES_EMBEDDED: &str = include_str!(concat!(
 pub(crate) enum FamilyIntegrationAuditError {
     #[error("native family '{model_family}' has empty catalog_family_id")]
     EmptyCatalogFamilyId { model_family: String },
+    #[error("native family '{model_family}' has empty runtime_tensor_contract_id")]
+    EmptyRuntimeTensorContractId { model_family: String },
     #[error(
         "native family '{model_family}' shared-decode driver {expected:?} is not registered for policy '{decode_policy_id}': {reason}"
     )]
@@ -143,6 +145,18 @@ pub(crate) fn validate_runtime_family_wiring(
     for descriptor in architectures {
         if descriptor.integration.catalog_family_id.is_empty() {
             return Err(FamilyIntegrationAuditError::EmptyCatalogFamilyId {
+                model_family: descriptor.model_family.to_string(),
+            });
+        }
+
+        // Contract 4: a new family's minimal accession surface is descriptor
+        // + tensor contract (see this module's doc comment and
+        // `models::runtime_tensor_contract_registry`); nothing here checks
+        // decode policy resolves without one, so fail closed on an empty id
+        // instead of letting a half-declared family silently run without a
+        // validated tensor contract.
+        if descriptor.runtime_tensor_contract_id.is_empty() {
+            return Err(FamilyIntegrationAuditError::EmptyRuntimeTensorContractId {
                 model_family: descriptor.model_family.to_string(),
             });
         }
@@ -376,6 +390,25 @@ pub(crate) mod source_tree_audit {
     }
 
     #[test]
+    fn half_wired_empty_runtime_tensor_contract_id_fails() {
+        let mut descriptor = base_descriptor();
+        descriptor.model_family = "synthetic-half-wired";
+        descriptor.integration.catalog_family_id = "synthetic-half-wired";
+        descriptor.runtime_tensor_contract_id = "";
+
+        let error = validate_runtime_family_wiring(
+            &[descriptor],
+            &resolve_builtin_decode_policy,
+            &linked_core_pack_import_symbols(),
+        )
+        .expect_err("empty runtime_tensor_contract_id must fail closed");
+        assert!(matches!(
+            error,
+            FamilyIntegrationAuditError::EmptyRuntimeTensorContractId { .. }
+        ));
+    }
+
+    #[test]
     fn half_wired_shared_seq2seq_without_decode_policy_fails() {
         let mut descriptor = base_descriptor();
         descriptor.model_family = "synthetic-half-wired";
@@ -513,6 +546,102 @@ pub(crate) mod source_tree_audit {
             encoder_attention_span: OpenAsrEncoderAttentionSpan::FixedWindow,
             ..base_descriptor()
         };
+    }
+
+    /// Contract 4's validation core: a brand-new family needs only a
+    /// descriptor + tensor contract to (a) pass the startup wiring gate and
+    /// (b) run a request end to end through the shared dispatch, with an
+    /// executor that writes zero cancel-checkpoint or backend-resolution
+    /// code of its own. This is the executable proof that "new family = data
+    /// (descriptor) + a thin executor", not "new family = re-derive every
+    /// piece of shared plumbing".
+    #[test]
+    fn minimal_fake_family_passes_wiring_and_runs_through_dispatch_with_no_extra_code() {
+        use crate::models::ggml_asr_executor::{
+            GgmlAsrBackendPreference, GgmlAsrExecutionDispatch, GgmlAsrExecutionError,
+            GgmlAsrExecutionOptions, GgmlAsrExecutionRequest, GgmlAsrExecutionResult,
+            GgmlAsrExecutor, GgmlAsrPreparedAudio,
+        };
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        const FAKE_ADAPTER_ID: &str = "ggml-family-synthetic-fake-family-v1";
+
+        let mut descriptor = base_descriptor();
+        descriptor.model_family = "synthetic-fake-family";
+        descriptor.model_architecture = "synthetic-fake-family-arch-v1";
+        descriptor.adapter_id = FAKE_ADAPTER_ID;
+        descriptor.integration.catalog_family_id = "synthetic-fake-family";
+        descriptor.runtime_tensor_contract_id = "synthetic-fake-family.runtime-tensors.v1";
+        // Reuses whisper's already-registered shared decode policy and
+        // pack-import symbol rather than declaring new ones: the point of
+        // this test is the backend/cancel plumbing a family no longer has to
+        // write, not authoring a full new decode policy.
+        descriptor.integration.shared_decode_driver =
+            OpenAsrSharedDecodeDriver::SharedSeq2SeqGreedy;
+        descriptor.decode_policy_id = crate::WHISPER_DECODE_POLICY_ID;
+        descriptor.integration.pack_import = OpenAsrPackImportSurface::CoreConvert {
+            symbol: "convert_local_whisper_hf_source_to_runtime_pack",
+        };
+
+        // (a) Startup wiring gate: descriptor + tensor contract alone pass.
+        validate_runtime_family_wiring(
+            &[descriptor],
+            &resolve_builtin_decode_policy,
+            &linked_core_pack_import_symbols(),
+        )
+        .expect("a descriptor declaring only its tensor contract + shared decode policy must pass");
+
+        // (b) Dispatch: a minimal executor with NO cancel-checkpoint and NO
+        // backend-resolution code of its own -- it only reads the value the
+        // shared dispatch already resolved, proving that channel needs no
+        // per-family opt-in.
+        struct MinimalFakeExecutor;
+        impl GgmlAsrExecutor for MinimalFakeExecutor {
+            fn executor_id(&self) -> &'static str {
+                "synthetic-fake-family-executor-v1"
+            }
+
+            fn supports_phrase_bias(&self) -> bool {
+                false
+            }
+
+            fn execute(
+                &self,
+                _request: &GgmlAsrExecutionRequest,
+            ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+                // Proves the resolved-input channel is populated without
+                // this executor ever calling a backend resolver itself.
+                let _backend = crate::ggml_runtime::resolved_family_runtime_input().backend();
+                Ok(GgmlAsrExecutionResult {
+                    transcription: crate::Transcription {
+                        text: "ok".to_string(),
+                        segments: Vec::new(),
+                        longform: None,
+                        language: None,
+                    },
+                    carry_context: None,
+                })
+            }
+        }
+
+        let dispatch = GgmlAsrExecutionDispatch::default()
+            .with_executor_for_adapter(FAKE_ADAPTER_ID, Arc::new(MinimalFakeExecutor));
+        let request = GgmlAsrExecutionRequest {
+            runtime_source_path: PathBuf::from("fixtures/synthetic-fake-family.gguf"),
+            runtime_source_preflight: None,
+            selected_family: descriptor.ggml_family_adapter_descriptor(),
+            prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
+            request_options: GgmlAsrExecutionOptions::default(),
+            backend_preference: GgmlAsrBackendPreference::Auto,
+            execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
+                "test fixture",
+            )),
+        };
+        let result = dispatch
+            .execute(&request)
+            .expect("minimal executor must run end to end through the shared dispatch");
+        assert_eq!(result.transcription.text, "ok");
     }
 
     fn base_descriptor() -> OpenAsrArchitectureDescriptor {
