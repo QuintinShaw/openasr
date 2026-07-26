@@ -1,6 +1,6 @@
 id = "moss-transcribe-diarize"
 default_variant = "published"
-display_name = "MOSS-Transcribe-Diarize"
+display_name = "MOSS-Transcribe-Diarize (OpenASR pack)"
 languages = ["de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "th", "tl", "tr", "ur", "vi", "zh"]
 size = "0.9b"
 license = "Apache-2.0"

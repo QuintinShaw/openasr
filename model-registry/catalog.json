@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-24T11:29:49+00:00",
+  "generated_at": "2026-07-26T08:56:23+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -1043,6 +1043,121 @@
         }
       },
       "min_core_version": "0.1.17"
+    },
+    {
+      "id": "moss-transcribe-diarize",
+      "kind": "asr-model",
+      "display_name": "MOSS-Transcribe-Diarize",
+      "family": "moss-transcribe-diarize",
+      "aliases": [
+        "moss",
+        "moss-td"
+      ],
+      "pull_alias": "moss-transcribe-diarize",
+      "size": "0.9b",
+      "languages": [
+        "de",
+        "en",
+        "es",
+        "fr",
+        "it",
+        "ja",
+        "ko",
+        "pt",
+        "ru",
+        "th",
+        "tl",
+        "tr",
+        "ur",
+        "vi",
+        "zh"
+      ],
+      "vendor": "OpenMOSS-Team",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/blob/main/LICENSE",
+      "license_class": "permissive",
+      "hf_repo": "OpenASR/moss-transcribe-diarize",
+      "hf_revision": "f119b6c8d381bef7d6c9b66f40fef56999339de2",
+      "public": true,
+      "min_cli_version": "0.1.24",
+      "recommended_quant": "q8_0",
+      "pull_recommended": "moss-transcribe-diarize:q8",
+      "prose": {
+        "tagline": "Joint transcription and speaker diarization in a single 0.9B-parameter model \u2014 know who said what, and when",
+        "overview": [
+          "MOSS-Transcribe-Diarize is a 0.9B-parameter joint speech-recognition and speaker-diarization\nmodel from the OpenMOSS team. Its architecture pairs a Whisper-Medium-scale audio encoder with a\nlightweight MLP/LayerNorm adapter feeding into a Qwen3-0.6B-scale decoder, enabling the model to\ntranscribe speech and attribute each segment to its speaker with start/end timestamps in a single\nforward pass. Language coverage centers on Chinese and English, with support for 15 additional\nlanguages. OpenASR distributes this model in three quantization tiers -- fp16, q8_0, and q4_k --\npackaged in the native `.oasr` runtime format for CPU-based local inference."
+        ],
+        "highlights": [
+          "\ud83c\udfaf **Transcription + speaker identification in one pass** \u2014 a single inference run produces both the transcript and per-speaker timestamps, no separate pipeline needed",
+          "\ud83d\udcca **Verified accuracy: 2.52% CER (Chinese), 2.23% WER (English)** \u2014 benchmarked by OpenASR on frozen evaluation datasets, not upstream-reported numbers",
+          "\ud83c\udf10 **Chinese and English first, 15+ additional languages** \u2014 optimized for Mandarin and English with broad multilingual coverage built in",
+          "\ud83d\udce6 **Three quantization tiers: fp16 / q8_0 / q4_k** \u2014 delivered in OpenASR's native .oasr format for CPU inference, choose the precision-to-size tradeoff that fits your hardware"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "fp16",
+          "suffix": "fp16",
+          "pull": "moss-transcribe-diarize:fp16",
+          "filename": "moss-transcribe-diarize-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/moss-transcribe-diarize/resolve/f119b6c8d381bef7d6c9b66f40fef56999339de2/moss-transcribe-diarize-fp16.oasr",
+          "sha256": "648fe154f4dc536d3b11b3561a0bd92fc54be5031da71150f32e451503ff8891",
+          "size_bytes": 1823128992,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.8018181818181819,
+            "rtf_metal": 0.499,
+            "peak_rss_bytes": 5870862336,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "moss-transcribe-diarize:q8",
+          "filename": "moss-transcribe-diarize-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/moss-transcribe-diarize/resolve/f119b6c8d381bef7d6c9b66f40fef56999339de2/moss-transcribe-diarize-q8_0.oasr",
+          "sha256": "137f8283052fced1192af6aa80c3bf984b37d3b19c82803a63f57025b76626ee",
+          "size_bytes": 1122221472,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.6518181818181819,
+            "rtf_metal": null,
+            "peak_rss_bytes": 5699993600,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "moss-transcribe-diarize:q4",
+          "filename": "moss-transcribe-diarize-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/moss-transcribe-diarize/resolve/f119b6c8d381bef7d6c9b66f40fef56999339de2/moss-transcribe-diarize-q4_k.oasr",
+          "sha256": "ee1bba86fe9e8ade88b6c3b30d05d3eb5a6320a9009cdba11af8974df422a8c5",
+          "size_bytes": 748404128,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.7145454545454546,
+            "rtf_metal": null,
+            "peak_rss_bytes": 5130764288,
+            "jfk_wer_vs_fp16": 0.0
+          }
+        }
+      ],
+      "language_mode": "detect_implicit",
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "\u8f6c\u5199\u6587\u5b57\u7684\u540c\u65f6\u81ea\u52a8\u5206\u6e05\u662f\u8c01\u5728\u8bf4\u8bdd\u2014\u20140.9B \u53c2\u6570\uff0c\u4e00\u6b21\u63a8\u7406\u5168\u641e\u5b9a",
+          "highlights": [
+            "\ud83c\udfaf **\u8f6c\u5199\u548c\u533a\u5206\u8bb2\u8bdd\u4eba\u4e00\u6b65\u5230\u4f4d** \u2014 \u8dd1\u4e00\u6b21\u5c31\u80fd\u540c\u65f6\u51fa\u6587\u5b57\u3001\u6807\u51fa\u662f\u8c01\u5728\u8bf4\u8bdd\u4ee5\u53ca\u6bcf\u6bb5\u8bdd\u7684\u8d77\u6b62\u65f6\u95f4\uff0c\u4e0d\u9700\u8981\u62fc\u63a5\u591a\u4e2a\u5de5\u5177",
+            "\ud83d\udcca **\u5b9e\u6d4b\u7cbe\u5ea6\uff1a\u4e2d\u6587\u5b57\u9519\u7387 2.52%\uff0c\u82f1\u6587\u8bcd\u9519\u7387 2.23%** \u2014 \u7531 OpenASR \u5728\u56fa\u5b9a\u8bc4\u6d4b\u96c6\u4e0a\u5b9e\u6d4b\uff0c\u4e0d\u662f\u4e0a\u6e38\u81ea\u62a5\u6570\u636e",
+            "\ud83c\udf10 **\u4e2d\u82f1\u6587\u4e3a\u4e3b\uff0c\u53e6\u5916\u8986\u76d6 15 \u79cd\u8bed\u8a00** \u2014 \u9488\u5bf9\u666e\u901a\u8bdd\u548c\u82f1\u6587\u505a\u4e86\u91cd\u70b9\u4f18\u5316\uff0c\u540c\u65f6\u5185\u7f6e\u591a\u8bed\u8a00\u652f\u6301",
+            "\ud83d\udce6 **fp16 / q8_0 / q4_k \u4e09\u6863\u91cf\u5316\u53ef\u9009** \u2014 \u4f7f\u7528 OpenASR \u539f\u751f .oasr \u683c\u5f0f\uff0cCPU \u672c\u5730\u63a8\u7406\uff0c\u6309\u81ea\u5df1\u7684\u786c\u4ef6\u6761\u4ef6\u9009\u62e9\u7cbe\u5ea6\u548c\u4f53\u79ef\u7684\u5e73\u8861\u70b9"
+          ]
+        }
+      },
+      "upstream_release_date": "2026-07-09",
+      "min_core_version": "0.1.24"
     },
     {
       "id": "dolphin-base",

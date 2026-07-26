@@ -800,4 +800,9 @@ languages = [
 quants = ["fp16", "q8_0", "q4_k"]
 recommended_quant = "q8_0"
 upstream_release_date = "2026-07-09"
+# min_cli_version mirrors min_core_version, the same way qwen3-asr-1.7b pins
+# its floor: a public catalog entry must not claim compatibility with a CLI
+# older than the core runtime the pack needs, and leaving this unset would
+# regress it to the 0.1.0 catalog default.
 min_core_version = "0.1.24"
+min_cli_version = "0.1.24"
