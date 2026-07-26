@@ -45,6 +45,8 @@ mod native_model_id;
 mod native_path;
 #[path = "native_transcribe.rs"]
 mod native_transcribe;
+#[path = "request_execution_context.rs"]
+mod request_execution_context;
 #[path = "transcription_control.rs"]
 mod transcription_control;
 pub use native_model_id::{
@@ -54,9 +56,10 @@ pub use native_transcribe::{
     NativeTranscriptionPhase, NativeTranscriptionProgress, describe_native_runtime_model_mismatch,
     native_runtime_model_refs_match, native_transcription_progress,
 };
+pub use request_execution_context::RequestExecutionContext;
 pub use transcription_control::{
-    ActiveTranscriptionControlGuard, SliceBoundaryControl, TranscriptionControl,
-    install_active_transcription_control,
+    ActiveTranscriptionControlGuard, GgmlAbortCallbackGuard, SliceBoundaryControl,
+    TranscriptionControl, install_active_transcription_control,
 };
 // Used by the shared seq2seq greedy driver (L1 cooperative cancel) and any other
 // crate-internal decode loop that must observe in-flight cancel without a

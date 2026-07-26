@@ -311,6 +311,11 @@ pub struct NativeAsrOfflineRequest {
     /// [`crate::TranscriptionRequest::prepared_samples`], which this carries
     /// through to via `native_offline_request_to_transcription_request`.
     pub prepared_samples: Option<Arc<Vec<f32>>>,
+    /// Cancel/pause/resume control and request id for this decode -- same
+    /// "explicit, never TLS" contract as
+    /// [`crate::TranscriptionRequest::execution_context`], which this carries
+    /// through to via `native_offline_request_to_transcription_request`.
+    pub execution_context: Arc<crate::RequestExecutionContext>,
 }
 
 impl NativeAsrOfflineRequest {
@@ -325,6 +330,7 @@ impl NativeAsrOfflineRequest {
             source_channels: None,
             source_container: None,
             prepared_samples: None,
+            execution_context: Arc::new(crate::RequestExecutionContext::detached()),
         }
     }
 
@@ -332,6 +338,15 @@ impl NativeAsrOfflineRequest {
     /// `input_path` from disk -- see the field's doc comment.
     pub fn with_prepared_samples(mut self, prepared_samples: Option<Arc<Vec<f32>>>) -> Self {
         self.prepared_samples = prepared_samples;
+        self
+    }
+
+    /// Attaches the explicit cancel/pause/resume context for this request.
+    pub fn with_execution_context(
+        mut self,
+        execution_context: Arc<crate::RequestExecutionContext>,
+    ) -> Self {
+        self.execution_context = execution_context;
         self
     }
 

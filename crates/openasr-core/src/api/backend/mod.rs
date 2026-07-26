@@ -15,9 +15,10 @@ pub use native::{
     ActiveTranscriptionControlGuard, NativeBackend, NativeBackendExecutor,
     NativeRuntimeModelAdapter, NativeRuntimeModelIdSource, NativeRuntimeModelIdentity,
     NativeRuntimeModelIdentityError, NativeTranscriptionPhase, NativeTranscriptionProgress,
-    SliceBoundaryControl, TranscriptionControl, describe_native_runtime_model_mismatch,
-    install_active_transcription_control, native_runtime_model_adapter_for_path,
-    native_runtime_model_refs_match, native_runtime_realtime_capabilities_for_path,
+    RequestExecutionContext, SliceBoundaryControl, TranscriptionControl,
+    describe_native_runtime_model_mismatch, install_active_transcription_control,
+    native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
+    native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,
     resolve_local_native_runtime_model_identity, unload_idle_native_model_runtime_caches,
     validate_local_native_model_pack_path, validate_native_runtime_model_pack_contract,
@@ -418,6 +419,13 @@ pub struct TranscriptionRequest {
     /// ffmpeg/afconvert conversion paths, and for any caller that built this
     /// request without going through `prepare_audio_input` at all.
     pub prepared_samples: Option<Arc<Vec<f32>>>,
+    /// Cancel/pause/resume control and request id for this decode, carried
+    /// explicitly rather than through a thread-local -- see
+    /// [`crate::RequestExecutionContext`]. Defaults to a detached context in
+    /// [`Self::new`]; the server sets a real one via
+    /// [`Self::with_execution_context`] when the client registered a
+    /// transcription id.
+    pub execution_context: Arc<crate::RequestExecutionContext>,
 }
 
 impl TranscriptionRequest {
@@ -446,7 +454,19 @@ impl TranscriptionRequest {
             source_channels: None,
             source_container: None,
             prepared_samples: None,
+            execution_context: Arc::new(crate::RequestExecutionContext::detached()),
         }
+    }
+
+    /// Attaches the explicit cancel/pause/resume context for this request.
+    /// Callers with nothing to cancel (CLI single-shot transcribe) can leave
+    /// [`Self::new`]'s detached default in place.
+    pub fn with_execution_context(
+        mut self,
+        execution_context: Arc<crate::RequestExecutionContext>,
+    ) -> Self {
+        self.execution_context = execution_context;
+        self
     }
 
     /// Attaches in-memory samples so the native backend can skip re-reading

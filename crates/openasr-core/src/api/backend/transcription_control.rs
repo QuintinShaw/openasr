@@ -238,6 +238,56 @@ pub(crate) fn current_transcription_control() -> Option<Arc<TranscriptionControl
     CURRENT_TRANSCRIPTION_CONTROL.with(|cell| cell.borrow().clone())
 }
 
+/// RAII guard that publishes a [`TranscriptionControl`]'s cancel flag as the
+/// current thread's ggml abort-callback data for the duration of one
+/// synchronous native decode, and restores the previous publication (if any)
+/// on drop (normal return, early `?`, or panic) -- so a job's callback data
+/// never leaks into an unrelated later run on the same pooled worker thread.
+/// Graph compute reads the published flag and owns the shorter backend
+/// callback lifetime; the control itself travels as ordinary data on the
+/// request/job (see [`crate::RequestExecutionContext`]), never through this
+/// guard or any thread-local.
+#[must_use = "the abort-callback publication is cleared when this guard is dropped"]
+pub struct GgmlAbortCallbackGuard {
+    previous_job_cancel: Option<Arc<AtomicBool>>,
+    published_flag: Arc<AtomicBool>,
+}
+
+impl Drop for GgmlAbortCallbackGuard {
+    fn drop(&mut self) {
+        // Restore previous job cancel (nested) or clear. Graph compute owns a
+        // scoped Arc clone and the compute API retains no callback data, so
+        // cached runtimes never retain this guard's raw pointer.
+        let _ = disarm_thread_job_cancel_flag_if_current(
+            &self.published_flag,
+            self.previous_job_cancel.take(),
+        );
+    }
+}
+
+impl TranscriptionControl {
+    /// Publishes this control's cancel atomic as the current thread's ggml
+    /// abort-callback data for the returned guard's lifetime, so a ggml
+    /// graph compute (which can only see a raw `void*` data pointer, not this
+    /// crate's types) can observe a mid-compute cancel. Pause is never
+    /// written to that atomic -- the abort trampoline only recognizes cancel.
+    ///
+    /// Call once at the top of a synchronous native decode this control is
+    /// tracking (e.g. the server's `spawn_blocking` closure) -- not from a
+    /// serve-batch owner thread that services many jobs in a loop, which has
+    /// no single "this thread's decode" to publish for the whole loop and
+    /// instead relies on the job-carried context at each safe boundary
+    /// between graph calls.
+    pub fn arm_for_native_decode(self: &Arc<Self>) -> GgmlAbortCallbackGuard {
+        let published_flag = self.cancel_flag();
+        let previous_job_cancel = arm_thread_job_cancel_flag(Some(Arc::clone(&published_flag)));
+        GgmlAbortCallbackGuard {
+            previous_job_cancel,
+            published_flag,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
