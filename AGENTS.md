@@ -102,12 +102,11 @@ cargo test -p openasr-core bundled_catalog_signature_verifies_committed_catalog_
 **`cargo nextest` is required, not a preference.** It runs every test in its own
 process; plain `cargo test` runs a whole crate in one process. Several tests assert
 against deliberately process-global state -- the native-activity tracker in
-`openasr-server`, the native-transcription progress slot and the runtime-cache
-epoch in `openasr-core` -- and those assertions only hold under per-test process
-isolation. Under plain `cargo test` they fail non-deterministically, and one such
-panic used to poison a shared test mutex and cascade into unrelated failures. A
-`cargo test` run is therefore not evidence about this workspace; do not report it
-as a passing gate.
+`openasr-server` and the runtime-cache epoch in `openasr-core` -- and those
+assertions only hold under per-test process isolation. Under plain `cargo test`
+they fail non-deterministically, and one such panic used to poison a shared test
+mutex and cascade into unrelated failures. A `cargo test` run is therefore not
+evidence about this workspace; do not report it as a passing gate.
 
 Keep claims tied to executed checks — do not assert performance/quality wins the
 harness has not produced.

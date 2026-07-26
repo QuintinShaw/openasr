@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
 
@@ -65,19 +65,17 @@ const CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS: f32 = DEFAULT_ENCODER_SAF
 const COHERE_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
 static NATIVE_GGML_EXECUTION_DISPATCH: OnceLock<GgmlAsrExecutionDispatch> = OnceLock::new();
 
-// Phase-aware progress for the in-flight native file transcription, published as
-// a single global slot. The local desktop daemon transcribes one file at a time,
-// so one slot is enough to drive the UI progress bar. The server's native path
-// has no concurrency gate, though (each request's native transcription runs on
-// its own `spawn_blocking` thread; see `routes/transcription.rs`), so more than
-// one `run_native_transcription` can be in flight at once against this one slot.
-// An owner generation (`PROGRESS_OWNER` / `NativeProgressGuard::generation`)
-// keeps a second, unrelated run from clobbering the first: only the run that is
-// actually reporting progress ever claims the slot, and only that run clears it
-// on exit. A run whose guard is created but that fails before its first
-// `publish_progress` call (e.g. model resolution errors out) never claims the
-// slot and so never clears someone else's in-progress run out from under it --
-// see `NativeProgressGuard` and `publish_progress` below.
+// Phase-aware progress for the in-flight native file transcription, keyed by
+// transcription id in a bounded per-request registry. The server's native
+// path has no concurrency gate (each request's native transcription runs on
+// its own `spawn_blocking` thread; see `routes/transcription.rs`), so more
+// than one `run_native_transcription` can be in flight at once -- each one's
+// `RequestExecutionContext::request_id` (see that type; every dispatch
+// surface already carries one) scopes its progress to its own registry entry
+// rather than fighting over one shared slot. A request with no id (a
+// detached/uncancellable context: CLI single-shot, an internal caller that
+// never registered one) has nowhere honest to publish to and simply does not
+// publish -- see `publish_progress` below.
 // Progress is a monotonic overall fraction (0..=1) plus a coarse phase label, so
 // the UI advances smoothly across decode -> assemble -> forced-align refine
 // instead of stalling once the last slice decodes. The old bare slice counter
@@ -89,31 +87,71 @@ static NATIVE_GGML_EXECUTION_DISPATCH: OnceLock<GgmlAsrExecutionDispatch> = Once
 // the decode phase (see `run_dispatch_once_with_progress`, `SliceProgressWindow`),
 // closing the gap where short audio used to report nothing at all and fall
 // back entirely on a time-based estimate (issue: short-audio progress bar).
-use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
-static PROGRESS_ACTIVE: AtomicBool = AtomicBool::new(false);
-static PROGRESS_PHASE: AtomicU8 = AtomicU8::new(0);
-static PROGRESS_FRACTION_BITS: AtomicU32 = AtomicU32::new(0);
+/// Bound on the number of transcription ids the progress registry tracks at
+/// once. Ordinary operation never approaches this: each id's entry is
+/// inserted by `publish_progress`'s first call for that id and removed again
+/// by that request's [`ProgressRegistryHandle`] on `Drop` (completion, error,
+/// or panic unwind), so the registry only ever holds *currently in-flight*
+/// native transcriptions. The bound is a safety net against unbounded growth
+/// if that invariant is ever violated (e.g. a future caller that leaks a
+/// handle); rather than grow forever, the registry evicts its
+/// longest-resident entry to make room -- the one most likely to be a leak,
+/// not a genuinely long-running decode that keeps re-publishing (and so keeps
+/// getting re-found, not evicted, by the lookup in `publish`).
+const PROGRESS_REGISTRY_CAPACITY: usize = 64;
 
-// Owner generation of the progress slot: 0 means unclaimed. A non-zero value
-// names the `NativeProgressGuard` generation currently allowed to publish to
-// (and clear) the slot -- see `claim_or_check_progress_owner`.
-static PROGRESS_OWNER: AtomicU64 = AtomicU64::new(0);
-// Monotonically increasing counter, one draw per `NativeProgressGuard`, so
-// concurrent runs never collide on the same generation number. Starts
-// handing out generation 1 (0 is reserved for "unclaimed").
-static PROGRESS_GENERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-thread_local! {
-    // The generation of the run currently executing on *this* thread, set by
-    // `NativeProgressGuard::new()` and read by the `publish_*` helpers so they
-    // don't need an extra parameter threaded through the whole decode/longform
-    // call stack. Native transcription runs synchronously on a single thread
-    // (the server's `spawn_blocking` worker, or the CLI's calling thread), so
-    // this is enough to attribute a `publish_progress` call to its guard.
-    static CURRENT_PROGRESS_GENERATION: Cell<u64> = const { Cell::new(0) };
+/// Per-id progress storage backing [`native_transcription_progress_for_id`]
+/// and the legacy [`native_transcription_progress`]. An insertion-ordered
+/// `Vec` rather than a `HashMap`: `PROGRESS_REGISTRY_CAPACITY` keeps this
+/// small, a linear scan by id is fast enough at that size, and a `Vec` gives
+/// the FIFO eviction order in `publish` for free (index 0 is always the
+/// longest-resident surviving entry).
+struct ProgressRegistry {
+    entries: Vec<(String, NativeTranscriptionProgress)>,
 }
+
+impl ProgressRegistry {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn get(&self, id: &str) -> Option<NativeTranscriptionProgress> {
+        self.entries
+            .iter()
+            .find(|(entry_id, _)| entry_id == id)
+            .map(|(_, progress)| *progress)
+    }
+
+    /// Raise `id`'s stored fraction monotonically (a later phase or a
+    /// further-along report never moves the bar backward) and update its
+    /// phase. Creates a fresh entry -- starting exactly at `fraction`, never
+    /// maxed against anything -- if `id` has none yet, whether because this
+    /// is genuinely its first report or because a previous entry under the
+    /// same id was already removed (finished) or evicted.
+    fn publish(&mut self, id: &str, phase: NativeTranscriptionPhase, fraction: f32) {
+        if let Some((_, progress)) = self.entries.iter_mut().find(|(entry_id, _)| entry_id == id) {
+            progress.phase = phase;
+            progress.fraction = progress.fraction.max(fraction);
+            return;
+        }
+        if self.entries.len() >= PROGRESS_REGISTRY_CAPACITY {
+            self.entries.remove(0);
+        }
+        self.entries.push((
+            id.to_string(),
+            NativeTranscriptionProgress { phase, fraction },
+        ));
+    }
+
+    fn remove(&mut self, id: &str) {
+        self.entries.retain(|(entry_id, _)| entry_id != id);
+    }
+}
+
+static PROGRESS_REGISTRY: Mutex<ProgressRegistry> = Mutex::new(ProgressRegistry::new());
 
 // Heuristic phase ceilings the monotonic overall fraction climbs to at each phase
 // boundary -- not measured timings. Decode (autoregressive, per-slice) dominates;
@@ -139,22 +177,6 @@ pub enum NativeTranscriptionPhase {
 }
 
 impl NativeTranscriptionPhase {
-    fn to_tag(self) -> u8 {
-        match self {
-            NativeTranscriptionPhase::Decode => 0,
-            NativeTranscriptionPhase::Assemble => 1,
-            NativeTranscriptionPhase::Align => 2,
-        }
-    }
-
-    fn from_tag(tag: u8) -> Self {
-        match tag {
-            1 => NativeTranscriptionPhase::Assemble,
-            2 => NativeTranscriptionPhase::Align,
-            _ => NativeTranscriptionPhase::Decode,
-        }
-    }
-
     /// Stable lowercase label for the wire contract and the optional UI phase text.
     pub fn label(self) -> &'static str {
         match self {
@@ -173,115 +195,84 @@ pub struct NativeTranscriptionProgress {
     pub fraction: f32,
 }
 
-/// Progress of the in-flight native transcription run, or `None` when no run
-/// is active. Every decode call -- long-form multi-slice, forced-align
+/// Progress of the in-flight native transcription with this `id`, or `None`
+/// when no such run is currently active (finished, canceled, or never
+/// existed). Every decode call -- long-form multi-slice, forced-align
 /// refine, and the short single-pass / single-slice path (a "whole file is
 /// one slice" `DecodeProgress`, see `run_dispatch_once_with_progress`) --
-/// reports through this slot; `None` means nothing is decoding right now, not
-/// that the in-flight run is short. Only a decode that fails before its first
-/// report (e.g. model resolution) leaves no signal, and the caller falls back
-/// to a time-based estimate for the gap.
-pub fn native_transcription_progress() -> Option<NativeTranscriptionProgress> {
-    if !PROGRESS_ACTIVE.load(Ordering::Acquire) {
-        return None;
-    }
-    let fraction = f32::from_bits(PROGRESS_FRACTION_BITS.load(Ordering::Relaxed));
-    let phase = NativeTranscriptionPhase::from_tag(PROGRESS_PHASE.load(Ordering::Relaxed));
-    Some(NativeTranscriptionProgress { phase, fraction })
+/// reports through this registry entry. Only a decode that fails before its
+/// first report (e.g. model resolution) leaves no signal, and the caller
+/// falls back to a time-based estimate for the gap.
+pub fn native_transcription_progress_for_id(id: &str) -> Option<NativeTranscriptionProgress> {
+    PROGRESS_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(id)
 }
 
-/// Outcome of checking/claiming the progress slot's ownership for a generation.
-enum ProgressOwnership {
-    /// This generation already owns the slot; fold the report into the
-    /// existing monotonic max.
-    Owned,
-    /// The slot was unclaimed and this generation just claimed it. The
-    /// reported fraction is a fresh run's starting point, not a continuation,
-    /// so it must be written directly rather than maxed against whatever a
-    /// previous (already-cleared) owner left behind.
-    JustAcquired,
-    /// A different, still-live generation owns the slot; this generation must
-    /// not touch it.
-    Blocked,
+/// Legacy (pre-multi-request) id-less progress read, kept for HTTP clients
+/// that predate transcription-id-scoped progress. Because the server places
+/// no concurrency gate on native transcription, more than one run can be in
+/// flight at once; unlike the old single global slot, this says so
+/// explicitly rather than silently picking one owner to report as "the"
+/// progress -- see `native_transcription_progress_for_id` for the id-scoped
+/// read every other caller should prefer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LegacyNativeTranscriptionProgress {
+    /// No native transcription is currently in flight.
+    Idle,
+    /// Exactly one native transcription is in flight: its progress.
+    Single(NativeTranscriptionProgress),
+    /// More than one native transcription is in flight; there is no honest
+    /// single answer for an id-less caller.
+    Ambiguous { active_count: usize },
 }
 
-/// Check whether `generation` owns the global progress slot, claiming it from
-/// the unclaimed (`0`) state if possible. Never takes the slot away from a
-/// different non-zero owner -- that owner is a live run and must not be
-/// clobbered by a second, unrelated run sharing this single global slot (the
-/// server has no concurrency gate on native transcription).
-fn claim_or_check_progress_owner(generation: u64) -> ProgressOwnership {
-    let owner = PROGRESS_OWNER.load(Ordering::Acquire);
-    if owner == generation {
-        return ProgressOwnership::Owned;
-    }
-    if owner != 0 {
-        return ProgressOwnership::Blocked;
-    }
-    match PROGRESS_OWNER.compare_exchange(0, generation, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => ProgressOwnership::JustAcquired,
-        Err(observed) if observed == generation => ProgressOwnership::Owned,
-        Err(_) => ProgressOwnership::Blocked,
+pub fn native_transcription_progress() -> LegacyNativeTranscriptionProgress {
+    let registry = PROGRESS_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match registry.entries.as_slice() {
+        [] => LegacyNativeTranscriptionProgress::Idle,
+        [(_, progress)] => LegacyNativeTranscriptionProgress::Single(*progress),
+        entries => LegacyNativeTranscriptionProgress::Ambiguous {
+            active_count: entries.len(),
+        },
     }
 }
 
-/// Publish `phase` and raise the overall fraction monotonically (a later phase or a
-/// further-along slice never moves the bar backward). Activates the slot on the
-/// first report of a run. A no-op if a different, still-live run's generation
-/// currently owns the slot: a second run sharing this one global slot must never
-/// clobber another in-flight run's progress (see `NativeProgressGuard`).
-fn publish_progress(phase: NativeTranscriptionPhase, fraction: f32) {
-    let generation = CURRENT_PROGRESS_GENERATION.with(Cell::get);
+/// Publish `phase` and raise `id`'s overall fraction monotonically (a later
+/// phase or a further-along report never moves that id's bar backward). A
+/// no-op for `id: None` -- a detached/uncancellable request has no
+/// transcription id to scope its progress to, so it simply never publishes
+/// rather than falling back to some shared slot a second, unrelated request
+/// could misread as its own.
+fn publish_progress(id: Option<&str>, phase: NativeTranscriptionPhase, fraction: f32) {
+    let Some(id) = id else {
+        return;
+    };
     let clamped = fraction.clamp(0.0, 1.0);
-    match claim_or_check_progress_owner(generation) {
-        ProgressOwnership::Blocked => {}
-        ProgressOwnership::JustAcquired => {
-            // Fresh start for this run: write directly instead of maxing
-            // against a stale value a previous (now-cleared) owner left.
-            PROGRESS_PHASE.store(phase.to_tag(), Ordering::Relaxed);
-            PROGRESS_FRACTION_BITS.store(clamped.to_bits(), Ordering::Relaxed);
-            // Release so a reader that observes `active` (Acquire) also sees the phase and
-            // fraction written above.
-            PROGRESS_ACTIVE.store(true, Ordering::Release);
-        }
-        ProgressOwnership::Owned => {
-            PROGRESS_PHASE.store(phase.to_tag(), Ordering::Relaxed);
-            // Monotonic max on the f32 bits via a CAS loop: only ever raise the fraction.
-            let mut current = PROGRESS_FRACTION_BITS.load(Ordering::Relaxed);
-            loop {
-                let next = f32::from_bits(current).max(clamped);
-                match PROGRESS_FRACTION_BITS.compare_exchange_weak(
-                    current,
-                    next.to_bits(),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(observed) => current = observed,
-                }
-            }
-            // Release so a reader that observes `active` (Acquire) also sees the phase and
-            // fraction written above.
-            PROGRESS_ACTIVE.store(true, Ordering::Release);
-        }
-    }
+    PROGRESS_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .publish(id, phase, clamped);
 }
 
-/// Enter the assembly/merge phase, raising the bar to that phase's ceiling.
-fn publish_assemble_progress(with_align: bool) {
+/// Enter the assembly/merge phase, raising `id`'s bar to that phase's ceiling.
+fn publish_assemble_progress(id: Option<&str>, with_align: bool) {
     let ceil = if with_align {
         ASSEMBLE_CEIL_WITH_ALIGN
     } else {
         ASSEMBLE_CEIL_NO_ALIGN
     };
-    publish_progress(NativeTranscriptionPhase::Assemble, ceil);
+    publish_progress(id, NativeTranscriptionPhase::Assemble, ceil);
 }
 
-/// Enter the forced-align refine phase, raising the bar to the align ceiling. The
+/// Enter the forced-align refine phase, raising `id`'s bar to the align ceiling. The
 /// refine is a single opaque forward pass, so the bar holds here (with the "align"
-/// phase label explaining the pause) until the run completes and the slot clears.
-fn publish_align_progress() {
-    publish_progress(NativeTranscriptionPhase::Align, ALIGN_CEIL);
+/// phase label explaining the pause) until the run completes and its entry is removed.
+fn publish_align_progress(id: Option<&str>) {
+    publish_progress(id, NativeTranscriptionPhase::Align, ALIGN_CEIL);
 }
 
 /// Decode-phase progress for the multi-slice long-form path. Each slice is weighted
@@ -289,20 +280,22 @@ fn publish_align_progress() {
 /// time -- which scales with audio duration -- rather than slice number, which makes
 /// variable-length VAD slices advance the bar unevenly.
 struct DecodeProgress {
+    id: Option<String>,
     total_samples: u64,
     decoded_samples: u64,
     decode_ceil: f32,
 }
 
 impl DecodeProgress {
-    fn begin(total_samples: u64, with_align: bool) -> Self {
+    fn begin(id: Option<String>, total_samples: u64, with_align: bool) -> Self {
         let decode_ceil = if with_align {
             DECODE_CEIL_WITH_ALIGN
         } else {
             DECODE_CEIL_NO_ALIGN
         };
-        publish_progress(NativeTranscriptionPhase::Decode, 0.0);
+        publish_progress(id.as_deref(), NativeTranscriptionPhase::Decode, 0.0);
         Self {
+            id,
             total_samples,
             decoded_samples: 0,
             decode_ceil,
@@ -318,7 +311,11 @@ impl DecodeProgress {
         } else {
             (self.decoded_samples as f32 / self.total_samples as f32).clamp(0.0, 1.0)
         };
-        publish_progress(NativeTranscriptionPhase::Decode, self.decode_ceil * ratio);
+        publish_progress(
+            self.id.as_deref(),
+            NativeTranscriptionPhase::Decode,
+            self.decode_ceil * ratio,
+        );
     }
 
     /// The [start, start+span) sub-range of the overall decode-phase fraction
@@ -420,11 +417,13 @@ fn run_dispatch_once_with_progress(
     slice_samples: u64,
 ) -> Result<GgmlAsrExecutionResult, BackendError> {
     let window = decode_progress.slice_progress_window(slice_samples);
+    let id = execution_context.request_id.clone();
     let _token_progress_guard =
         crate::models::seq2seq_greedy_decode::install_token_step_progress_sink(
             move |step_index, max_generated_tokens| {
                 if should_publish_token_step(step_index) {
                     publish_progress(
+                        id.as_deref(),
                         NativeTranscriptionPhase::Decode,
                         token_step_fraction(window, step_index, max_generated_tokens),
                     );
@@ -667,68 +666,36 @@ fn run_dispatch_once_with_progress_and_gpu_fallback(
     }
 }
 
-/// RAII reset for the global progress slot: clears it on normal completion, an early
-/// `?` return, or a panic, so a stale fraction never leaks into the next run. Created
-/// once per `run_native_transcription` so its lifetime spans decode, assembly, and
-/// the forced-align refine.
+/// RAII cleanup for one native transcription's progress-registry entry:
+/// removes it on normal completion, an early `?` return, or a panic, so a
+/// finished run's progress is never read as still in-flight. Created once per
+/// `run_native_transcription` so its lifetime spans decode, assembly, and the
+/// forced-align refine.
 ///
-/// Holds a unique `generation` so this guard only clears the slot in `Drop` if it
-/// is still the recognized owner (see `PROGRESS_OWNER` / `claim_or_check_progress_owner`).
-/// The server has no concurrency gate on native transcription, so a second,
-/// unrelated `run_native_transcription` can start and finish while a first one is
-/// still decoding; without this check the second run's guard would unconditionally
-/// clear the slot on both construction and drop and blank out the first run's
-/// progress mid-flight. A run that never calls `publish_progress` at all (it fails
-/// before reaching its first decode call, e.g. model resolution) never claims the
-/// slot, so it can never steal or clear another run's ownership.
-struct NativeProgressGuard {
-    generation: u64,
+/// A request with no transcription id (`id: None` -- a detached/uncancellable
+/// context: the client never registered one, or an internal/test caller used
+/// `RequestExecutionContext::uncancellable`) never had a registry entry to
+/// begin with (`publish_progress` never writes one for a `None` id), so
+/// `Drop` here is a no-op for those requests.
+struct ProgressRegistryHandle {
+    id: Option<String>,
 }
 
-impl NativeProgressGuard {
-    fn new() -> Self {
-        // `fetch_add` returns the pre-increment value, so the first guard gets
-        // generation 1 -- 0 stays reserved for "unclaimed".
-        let generation = PROGRESS_GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-        CURRENT_PROGRESS_GENERATION.with(|cell| cell.set(generation));
-        Self { generation }
+impl ProgressRegistryHandle {
+    fn new(id: Option<String>) -> Self {
+        Self { id }
     }
 }
 
-impl Drop for NativeProgressGuard {
+impl Drop for ProgressRegistryHandle {
     fn drop(&mut self) {
-        // Only clear this thread's attribution if it still names this guard's
-        // run (defensive against any future nested-guard usage on one thread).
-        CURRENT_PROGRESS_GENERATION.with(|cell| {
-            if cell.get() == self.generation {
-                cell.set(0);
-            }
-        });
-        // Only clear the shared slot if this generation is still the recognized
-        // owner -- i.e. this run actually published progress and no one else has
-        // claimed the slot since. A run that never published (never became
-        // owner) leaves the slot untouched, so it can't blank out a different,
-        // still-live run sharing this global slot.
-        //
-        // Order matters: reset the display atomics *before* releasing
-        // ownership (storing 0), not after. While `PROGRESS_OWNER` still reads
-        // this generation, `claim_or_check_progress_owner` blocks every other
-        // generation from claiming or publishing, so nothing can race the
-        // reset below. Releasing ownership first (e.g. via a plain
-        // compare-and-clear) would leave a window where a new run claims the
-        // slot and publishes its own fresh fraction, only for this drop's
-        // trailing `clear_progress_slot()` to immediately blank it back out.
-        if PROGRESS_OWNER.load(Ordering::Acquire) == self.generation {
-            clear_progress_slot();
-            PROGRESS_OWNER.store(0, Ordering::Release);
+        if let Some(id) = &self.id {
+            PROGRESS_REGISTRY
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(id);
         }
     }
-}
-
-fn clear_progress_slot() {
-    PROGRESS_ACTIVE.store(false, Ordering::Release);
-    PROGRESS_FRACTION_BITS.store(0, Ordering::Relaxed);
-    PROGRESS_PHASE.store(0, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -816,11 +783,15 @@ fn run_native_transcription_fallible(
     if refine && !request.word_timestamps {
         return Err(BackendError::WordTimestampAlignmentRequiresWordTimestamps);
     }
+    // Captured before `request` is moved into `run_native_transcription_impl`
+    // below: `publish_align_progress` after that call still needs this
+    // request's transcription id.
+    let execution_context = Arc::clone(&request.execution_context);
     // Spans the whole run (decode + assembly inside impl, then the punctuation
-    // and forced-align post-processes below) so the progress slot is cleared
-    // on every exit and the align phase advances the same monotonic bar
-    // rather than running uncounted.
-    let _progress = NativeProgressGuard::new();
+    // and forced-align post-processes below) so this request's progress-registry
+    // entry is removed on every exit and the align phase advances the same
+    // monotonic bar rather than running uncounted.
+    let _progress = ProgressRegistryHandle::new(execution_context.request_id.clone());
     let input_path = request.input_path.clone();
     // Only clone the in-memory samples' `Arc` when the (opt-in, uncommon)
     // forced-aligner refine stage will actually need to re-read them after
@@ -852,7 +823,7 @@ fn run_native_transcription_fallible(
     let transcription =
         apply_punctuation_stage_if_applicable(transcription, model_pack_path.as_deref(), punctuate);
     let result = if refine {
-        publish_align_progress();
+        publish_align_progress(execution_context.request_id.as_deref());
         refine_transcription_word_timestamps_with_forced_aligner(
             transcription,
             &input_path,
@@ -1328,15 +1299,20 @@ fn run_native_transcription_impl(
             // Publish per-slice decode progress for the UI, weighted by each
             // slice's audio samples so the bar tracks decode time rather than slice
             // number. The forced-align refine (if any) continues the same monotonic
-            // bar from the outer wrapper; the run-scoped guard clears the slot on
-            // any exit. `word_timestamps_refine` reserves headroom for that phase.
+            // bar from the outer wrapper; the run-scoped handle removes this
+            // request's registry entry on any exit. `word_timestamps_refine`
+            // reserves headroom for that phase.
             let with_align = request.word_timestamps_refine;
             let total_decode_samples: u64 = plan
                 .slices
                 .iter()
                 .map(|slice| slice.duration_samples() as u64)
                 .sum();
-            let mut decode_progress = DecodeProgress::begin(total_decode_samples, with_align);
+            let mut decode_progress = DecodeProgress::begin(
+                execution_context.request_id.clone(),
+                total_decode_samples,
+                with_align,
+            );
             // In-session pause/cancel control for this in-flight transcription,
             // carried explicitly on `request.execution_context` (never a
             // thread-local). Checked at each slice boundary (L0): a cancel
@@ -1467,7 +1443,7 @@ fn run_native_transcription_impl(
             }
             // Decode done; the merge/resegment tail below runs uncounted otherwise,
             // which is where the bar used to sit frozen at the last slice count.
-            publish_assemble_progress(with_align);
+            publish_assemble_progress(execution_context.request_id.as_deref(), with_align);
             // Issue #158: surface any per-slice GPU-allocation-failure fallback in
             // the run's existing provenance channel (mirrors the
             // `cohere-metal-multichunk-prefer-cpu-decoder` tag above for a similar
@@ -1567,8 +1543,11 @@ fn run_native_transcription_impl(
     // all, forcing the UI onto a pure time estimate that had no way to know
     // decode had actually finished (issue: short-audio progress bar).
     let single_pass_total_samples = prepared_audio.len() as u64;
-    let mut single_pass_decode_progress =
-        DecodeProgress::begin(single_pass_total_samples, request.word_timestamps_refine);
+    let mut single_pass_decode_progress = DecodeProgress::begin(
+        execution_context.request_id.clone(),
+        single_pass_total_samples,
+        request.word_timestamps_refine,
+    );
     // Issue #158: a fresh, one-shot tracker -- a single-pass request has
     // exactly one dispatch attempt, so the streak-limit skip path can never
     // trip here, but the same GPU-allocation-failure retry still applies
@@ -2610,29 +2589,6 @@ mod tests {
         ))
     }
 
-    // The tests in this module that exercise `native_transcription_progress`
-    // manipulate the real process-global progress statics (that is the point --
-    // they are the only way to observe the slot's owner-token behavior end to
-    // end), so they must not run concurrently with each other or one test's
-    // writes bleed into another's assertions.
-    //
-    // What actually makes them deterministic is the runner: `cargo nextest`
-    // (what CI runs, and the runner AGENTS.md mandates) executes every test in
-    // its own process, so the statics are naturally per-test. This lock only
-    // covers plain `cargo test`, where the whole crate shares one process --
-    // and only partially, because it can serialize this module's tests against
-    // each other but not against every other test in the crate that drives a
-    // decode and publishes into the same slot through its own
-    // `NativeProgressGuard`. Under plain `cargo test` these assertions can
-    // therefore still lose to an unrelated test; run them under nextest, or
-    // filtered to this module, to get a meaningful result.
-    //
-    // The reason any of this is needed is the slot itself: it carries an owner
-    // *generation* but no request identity, so two concurrent transcriptions
-    // cannot be told apart. Once progress is request-scoped end to end, delete
-    // this lock -- there is no shared slot left to serialize.
-    static PROGRESS_TEST_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn family_auto_gpu_policy_lookup_matches_dolphin_and_xasr_gates() {
         use crate::ggml_runtime::AutoGpuPolicy;
@@ -2735,155 +2691,239 @@ mod tests {
 
     #[test]
     fn native_progress_is_monotonic_across_phases_and_clears() {
-        let _serialize = PROGRESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // No run active -> None.
-        assert_eq!(native_transcription_progress(), None);
+        let id = "monotonic-phases";
+        // No run active for this id -> None.
+        assert_eq!(native_transcription_progress_for_id(id), None);
         {
-            let _guard = NativeProgressGuard::new();
+            let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
             // Decode phase, weighted by sample share; a run that will forced-align
             // reserves headroom above the decode ceiling.
-            let mut decode = DecodeProgress::begin(1000, true);
-            let start = native_transcription_progress().expect("run is active");
+            let mut decode = DecodeProgress::begin(Some(id.to_string()), 1000, true);
+            let start = native_transcription_progress_for_id(id).expect("run is active");
             assert_eq!(start.phase, NativeTranscriptionPhase::Decode);
             assert_eq!(start.fraction, 0.0);
 
             decode.complete_slice(400);
-            let mid = native_transcription_progress().unwrap();
+            let mid = native_transcription_progress_for_id(id).unwrap();
             assert_eq!(mid.phase, NativeTranscriptionPhase::Decode);
             assert!(mid.fraction >= start.fraction);
             assert!((mid.fraction - DECODE_CEIL_WITH_ALIGN * 0.4).abs() < 1e-6);
 
             decode.complete_slice(600);
-            let decoded = native_transcription_progress().unwrap();
+            let decoded = native_transcription_progress_for_id(id).unwrap();
             assert!(decoded.fraction >= mid.fraction);
             // All samples decoded -> exactly the decode ceiling.
             assert!((decoded.fraction - DECODE_CEIL_WITH_ALIGN).abs() < 1e-6);
 
-            publish_assemble_progress(true);
-            let assembled = native_transcription_progress().unwrap();
+            publish_assemble_progress(Some(id), true);
+            let assembled = native_transcription_progress_for_id(id).unwrap();
             assert_eq!(assembled.phase, NativeTranscriptionPhase::Assemble);
             assert!(assembled.fraction >= decoded.fraction);
             assert!((assembled.fraction - ASSEMBLE_CEIL_WITH_ALIGN).abs() < 1e-6);
 
-            publish_align_progress();
-            let aligning = native_transcription_progress().unwrap();
+            publish_align_progress(Some(id));
+            let aligning = native_transcription_progress_for_id(id).unwrap();
             assert_eq!(aligning.phase, NativeTranscriptionPhase::Align);
             assert!(aligning.fraction >= assembled.fraction);
             assert!(aligning.fraction <= 1.0);
 
             // A late lower report (e.g. an out-of-order slice) never moves the bar
             // backward; only the phase label follows the latest report.
-            publish_progress(NativeTranscriptionPhase::Decode, 0.1);
-            let after = native_transcription_progress().unwrap();
+            publish_progress(Some(id), NativeTranscriptionPhase::Decode, 0.1);
+            let after = native_transcription_progress_for_id(id).unwrap();
             assert_eq!(after.fraction, aligning.fraction);
         }
-        // Guard dropped (completion / early return / panic) -> slot cleared.
-        assert_eq!(native_transcription_progress(), None);
+        // Handle dropped (completion / early return / panic) -> entry removed.
+        assert_eq!(native_transcription_progress_for_id(id), None);
     }
 
-    /// Regression for the owner-token fix: the server has no concurrency gate
-    /// on native transcription, so a run that never calls `publish_progress`
-    /// (e.g. it fails before its first decode call) can start and finish
-    /// entirely while a longer, still-decoding run owns the global progress
-    /// slot. Before this fix, `NativeProgressGuard::new()`/`Drop`
-    /// unconditionally cleared the slot, so the second run's guard blanked
-    /// out the first run's progress out from under it even though the second
-    /// run never reported anything. This test uses a real background thread
-    /// for the long run (a distinct generation lives in a distinct thread's
-    /// `CURRENT_PROGRESS_GENERATION`) so the second run's guard, created on
-    /// the test's own thread, is a genuinely different, concurrently-live
-    /// generation -- not just a second guard in the same call stack.
+    /// Requirement: two concurrent native transcriptions -- the server places
+    /// no concurrency gate on native sessions -- must each get independent,
+    /// monotonic progress keyed by their own transcription id, and must not
+    /// see any of the other's reports. Also covers the id-scoped analogue of
+    /// the old owner-clobber regression: A finishing (its registry entry
+    /// removed) must never affect B's still-active, still-readable progress,
+    /// and reading B afterward must never show a spurious idle gap.
     #[test]
-    fn native_progress_concurrent_short_run_does_not_clobber_owner() {
-        use std::sync::mpsc;
-        use std::thread;
+    fn native_progress_two_concurrent_requests_stay_independent_and_a_finishing_does_not_affect_b()
+    {
+        let id_a = "concurrent-a";
+        let id_b = "concurrent-b";
+        assert_eq!(native_transcription_progress_for_id(id_a), None);
+        assert_eq!(native_transcription_progress_for_id(id_b), None);
 
-        let _serialize = PROGRESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(native_transcription_progress(), None);
+        let handle_a = ProgressRegistryHandle::new(Some(id_a.to_string()));
+        let handle_b = ProgressRegistryHandle::new(Some(id_b.to_string()));
 
-        // The long run claims the slot and reports partial progress, then
-        // blocks (parked on `resume_rx`) until told to finish, standing in
-        // for a still-decoding long file.
-        let (resume_tx, resume_rx) = mpsc::channel::<()>();
-        let (owner_ready_tx, owner_ready_rx) = mpsc::channel::<()>();
-        let long_run = thread::spawn(move || {
-            let _long_guard = NativeProgressGuard::new();
-            publish_progress(NativeTranscriptionPhase::Decode, 0.4);
-            owner_ready_tx.send(()).expect("test thread still waiting");
-            resume_rx.recv().expect("test thread must signal resume");
-        });
+        publish_progress(Some(id_a), NativeTranscriptionPhase::Decode, 0.4);
+        publish_progress(Some(id_b), NativeTranscriptionPhase::Align, 0.92);
 
-        owner_ready_rx
-            .recv()
-            .expect("long run must publish before signaling");
-        let owned = native_transcription_progress().expect("long run owns the slot");
-        assert_eq!(owned.phase, NativeTranscriptionPhase::Decode);
-        assert!((owned.fraction - 0.4).abs() < 1e-6);
+        let progress_a = native_transcription_progress_for_id(id_a).expect("A is active");
+        let progress_b = native_transcription_progress_for_id(id_b).expect("B is active");
+        assert_eq!(progress_a.phase, NativeTranscriptionPhase::Decode);
+        assert!((progress_a.fraction - 0.4).abs() < 1e-6);
+        assert_eq!(progress_b.phase, NativeTranscriptionPhase::Align);
+        assert!((progress_b.fraction - 0.92).abs() < 1e-6);
 
-        // A second, unrelated run starts and finishes on this thread without
-        // ever publishing progress (e.g. it fails before its first decode
-        // call). Its guard must not touch the long run's ownership at all.
-        {
-            let _short_guard = NativeProgressGuard::new();
-        }
+        // A further report on A alone must not move B.
+        publish_progress(Some(id_a), NativeTranscriptionPhase::Decode, 0.5);
+        let progress_b_after_a_advances = native_transcription_progress_for_id(id_b).unwrap();
+        assert_eq!(progress_b_after_a_advances, progress_b);
 
-        let still_owned =
-            native_transcription_progress().expect("short run must not clear the long run");
-        assert_eq!(still_owned, owned);
+        // A finishes: its own entry is gone, but B is untouched and still reads
+        // its exact last-known progress -- no momentary idle in between.
+        drop(handle_a);
+        assert_eq!(native_transcription_progress_for_id(id_a), None);
+        let progress_b_after_a_finishes =
+            native_transcription_progress_for_id(id_b).expect("B must survive A finishing");
+        assert_eq!(progress_b_after_a_finishes, progress_b);
 
-        // Only once the long run itself drops its guard does the slot clear.
-        resume_tx
-            .send(())
-            .expect("long run still waiting to resume");
-        long_run.join().expect("long run thread must not panic");
-        assert_eq!(native_transcription_progress(), None);
+        drop(handle_b);
+        assert_eq!(native_transcription_progress_for_id(id_b), None);
     }
 
-    /// Sequential (non-overlapping) runs on the owner-token slot: the second
-    /// run's first report must reset the bar to its own starting point rather
-    /// than being maxed against whatever the first run left behind, and each
-    /// run's `Drop` must clear the slot for the next one.
+    /// Requirement: a request with no transcription id (a detached/uncancellable
+    /// `RequestExecutionContext` -- the client never registered one, or an
+    /// internal caller like a CLI single-shot transcribe) must never write a
+    /// readable progress entry anywhere. There is no shared slot left for it
+    /// to fall back to publishing into.
+    #[test]
+    fn native_progress_detached_request_never_publishes() {
+        let _handle = ProgressRegistryHandle::new(None);
+        let mut decode = DecodeProgress::begin(None, 1000, false);
+        decode.complete_slice(500);
+        publish_assemble_progress(None, false);
+        publish_align_progress(None);
+        publish_progress(None, NativeTranscriptionPhase::Decode, 0.5);
+
+        assert_eq!(
+            native_transcription_progress_for_id("native-progress-detached-request-probe"),
+            None
+        );
+    }
+
+    /// Sequential (non-overlapping) runs sharing the same transcription id:
+    /// the second run's first report must reset the bar to its own starting
+    /// point rather than being maxed against whatever the first run left
+    /// behind, and each run's handle `Drop` must remove its entry before the
+    /// next one starts.
     #[test]
     fn native_progress_sequential_runs_reset_start_and_clear() {
-        let _serialize = PROGRESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(native_transcription_progress(), None);
+        let id = "sequential-runs";
+        assert_eq!(native_transcription_progress_for_id(id), None);
 
         {
-            let _run1 = NativeProgressGuard::new();
-            publish_progress(NativeTranscriptionPhase::Decode, 0.1);
-            publish_progress(NativeTranscriptionPhase::Decode, 0.9);
-            let run1_progress = native_transcription_progress().unwrap();
+            let _run1 = ProgressRegistryHandle::new(Some(id.to_string()));
+            publish_progress(Some(id), NativeTranscriptionPhase::Decode, 0.1);
+            publish_progress(Some(id), NativeTranscriptionPhase::Decode, 0.9);
+            let run1_progress = native_transcription_progress_for_id(id).unwrap();
             assert!((run1_progress.fraction - 0.9).abs() < 1e-6);
         }
-        // run1's guard dropped -> cleared before run2 starts.
-        assert_eq!(native_transcription_progress(), None);
+        // run1's handle dropped -> its entry removed before run2 starts.
+        assert_eq!(native_transcription_progress_for_id(id), None);
 
         {
-            let _run2 = NativeProgressGuard::new();
+            let _run2 = ProgressRegistryHandle::new(Some(id.to_string()));
             // run2's first report is lower than run1's last fraction; it must
             // become the new starting point, not be maxed against 0.9.
-            publish_progress(NativeTranscriptionPhase::Decode, 0.2);
-            let run2_start = native_transcription_progress().unwrap();
+            publish_progress(Some(id), NativeTranscriptionPhase::Decode, 0.2);
+            let run2_start = native_transcription_progress_for_id(id).unwrap();
             assert_eq!(run2_start.phase, NativeTranscriptionPhase::Decode);
             assert!((run2_start.fraction - 0.2).abs() < 1e-6);
 
             // Within run2 the monotonic max still holds.
-            publish_progress(NativeTranscriptionPhase::Decode, 0.05);
-            let run2_after_lower = native_transcription_progress().unwrap();
+            publish_progress(Some(id), NativeTranscriptionPhase::Decode, 0.05);
+            let run2_after_lower = native_transcription_progress_for_id(id).unwrap();
             assert_eq!(run2_after_lower.fraction, run2_start.fraction);
 
-            publish_progress(NativeTranscriptionPhase::Assemble, 0.6);
-            let run2_assembled = native_transcription_progress().unwrap();
+            publish_progress(Some(id), NativeTranscriptionPhase::Assemble, 0.6);
+            let run2_assembled = native_transcription_progress_for_id(id).unwrap();
             assert_eq!(run2_assembled.phase, NativeTranscriptionPhase::Assemble);
             assert!((run2_assembled.fraction - 0.6).abs() < 1e-6);
         }
-        assert_eq!(native_transcription_progress(), None);
+        assert_eq!(native_transcription_progress_for_id(id), None);
+    }
+
+    /// The registry never grows past `PROGRESS_REGISTRY_CAPACITY`: once full,
+    /// publishing a new id evicts the longest-resident entry (index 0 of the
+    /// insertion-ordered backing `Vec`) to make room, rather than growing
+    /// unboundedly. This asserts the aggregate registry state directly, so
+    /// (like every other test in this crate that inspects a workspace-shared
+    /// resource) it depends on per-test process isolation -- see AGENTS.md's
+    /// `cargo nextest` requirement.
+    #[test]
+    fn native_progress_registry_evicts_the_oldest_entry_once_capacity_is_exceeded() {
+        let ids: Vec<String> = (0..=PROGRESS_REGISTRY_CAPACITY)
+            .map(|index| format!("capacity-probe-{index}"))
+            .collect();
+        for id in &ids {
+            publish_progress(Some(id), NativeTranscriptionPhase::Decode, 0.1);
+        }
+
+        {
+            let registry = PROGRESS_REGISTRY
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(registry.entries.len(), PROGRESS_REGISTRY_CAPACITY);
+        }
+        // The very first id inserted was evicted to make room for the last one...
+        assert_eq!(native_transcription_progress_for_id(&ids[0]), None);
+        // ...while every id inserted after it survived.
+        for id in &ids[1..] {
+            assert!(
+                native_transcription_progress_for_id(id).is_some(),
+                "expected {id} to still be tracked"
+            );
+        }
+
+        // Leave the registry as this test found it, rather than leaking
+        // `PROGRESS_REGISTRY_CAPACITY` entries into whichever test runs next
+        // in this process.
+        let mut registry = PROGRESS_REGISTRY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for id in &ids[1..] {
+            registry.remove(id);
+        }
+    }
+
+    #[test]
+    fn native_transcription_progress_legacy_reports_idle_with_no_active_runs() {
+        assert_eq!(
+            native_transcription_progress(),
+            LegacyNativeTranscriptionProgress::Idle
+        );
+    }
+
+    #[test]
+    fn native_transcription_progress_legacy_reports_the_single_active_run() {
+        let id = "legacy-single-active";
+        let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
+        publish_progress(Some(id), NativeTranscriptionPhase::Decode, 0.33);
+        assert_eq!(
+            native_transcription_progress(),
+            LegacyNativeTranscriptionProgress::Single(NativeTranscriptionProgress {
+                phase: NativeTranscriptionPhase::Decode,
+                fraction: 0.33,
+            })
+        );
+    }
+
+    /// Requirement: with more than one active run, the legacy id-less
+    /// endpoint must say so explicitly rather than picking one owner to
+    /// impersonate "the" global progress.
+    #[test]
+    fn native_transcription_progress_legacy_is_ambiguous_with_more_than_one_active_run() {
+        let id_a = "legacy-ambiguous-a";
+        let id_b = "legacy-ambiguous-b";
+        let _handle_a = ProgressRegistryHandle::new(Some(id_a.to_string()));
+        let _handle_b = ProgressRegistryHandle::new(Some(id_b.to_string()));
+        publish_progress(Some(id_a), NativeTranscriptionPhase::Decode, 0.1);
+        publish_progress(Some(id_b), NativeTranscriptionPhase::Decode, 0.2);
+        assert_eq!(
+            native_transcription_progress(),
+            LegacyNativeTranscriptionProgress::Ambiguous { active_count: 2 }
+        );
     }
 
     #[test]
@@ -2965,17 +3005,12 @@ mod tests {
 
     #[test]
     fn slice_progress_window_places_slices_back_to_back_within_the_decode_ceiling() {
-        // `DecodeProgress::begin`/`complete_slice` call `publish_progress`,
-        // which writes the real process-global slot, so this needs the same
-        // lock + guard discipline as the other progress-slot tests above
-        // (see `PROGRESS_TEST_LOCK`'s doc comment) even though the assertions
-        // below only look at the pure `SliceProgressWindow` values.
-        let _serialize = PROGRESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _guard = NativeProgressGuard::new();
-
-        let mut decode = DecodeProgress::begin(1000, false);
+        // `DecodeProgress::begin`/`complete_slice` publish into this id's own
+        // registry entry, so -- unlike the old global-slot design -- a unique
+        // id here needs no lock or guard to stay isolated from every other
+        // test.
+        let mut decode =
+            DecodeProgress::begin(Some("slice-window-back-to-back".to_string()), 1000, false);
         let first = decode.slice_progress_window(400);
         assert!((first.start_fraction - 0.0).abs() < 1e-6);
         assert!((first.span_fraction - DECODE_CEIL_NO_ALIGN * 0.4).abs() < 1e-6);
@@ -2992,18 +3027,12 @@ mod tests {
 
     #[test]
     fn slice_progress_window_is_the_full_decode_ceiling_for_a_single_slice_run() {
-        // Same rationale as the test above: `DecodeProgress::begin` writes
-        // the real global slot, so it needs the lock + guard.
-        let _serialize = PROGRESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _guard = NativeProgressGuard::new();
-
         // The short single-pass / single-slice path treats the whole file as
         // one slice: its window must span the entire decode phase exactly
         // like the long-form path's last slice does, not some smaller
         // fixed share -- this is what makes the two paths share one signal.
-        let decode = DecodeProgress::begin(1000, true);
+        let decode =
+            DecodeProgress::begin(Some("slice-window-single-slice".to_string()), 1000, true);
         let window = decode.slice_progress_window(1000);
         assert!((window.start_fraction - 0.0).abs() < 1e-6);
         assert!((window.span_fraction - DECODE_CEIL_WITH_ALIGN).abs() < 1e-6);
@@ -3031,13 +3060,11 @@ mod tests {
     /// `run_dispatch_once_with_progress` installs around a real decode.
     #[test]
     fn token_step_progress_sink_reports_monotonically_inside_its_window() {
-        let _serialize = PROGRESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(native_transcription_progress(), None);
+        let id = "token-step-sink-window";
+        assert_eq!(native_transcription_progress_for_id(id), None);
 
         {
-            let _guard = NativeProgressGuard::new();
+            let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
             let window = SliceProgressWindow {
                 start_fraction: 0.0,
                 span_fraction: DECODE_CEIL_NO_ALIGN,
@@ -3047,6 +3074,7 @@ mod tests {
                     move |step_index, max_generated_tokens| {
                         if should_publish_token_step(step_index) {
                             publish_progress(
+                                Some(id),
                                 NativeTranscriptionPhase::Decode,
                                 token_step_fraction(window, step_index, max_generated_tokens),
                             );
@@ -3058,27 +3086,30 @@ mod tests {
             for step_index in 0..40 {
                 crate::models::seq2seq_greedy_decode::report_token_step_progress(step_index, 40);
                 let progress =
-                    native_transcription_progress().expect("sink published at least once");
+                    native_transcription_progress_for_id(id).expect("sink published at least once");
                 assert!(progress.fraction >= previous);
                 assert!(progress.fraction <= window.start_fraction + window.span_fraction);
                 previous = progress.fraction;
             }
         }
-        // Both guards dropped (sink first, then the run guard) -> slot cleared.
-        assert_eq!(native_transcription_progress(), None);
+        // Both guards dropped (sink first, then the registry handle) -> entry removed.
+        assert_eq!(native_transcription_progress_for_id(id), None);
     }
 
     /// Real-decode regression for the short-audio / single-pass progress gap
     /// this change fixes: before it, `run_native_transcription` on audio
     /// under the longform trigger (`fixtures/jfk.wav`, ~11s) never called
-    /// `publish_progress` at all -- `native_transcription_progress()` stayed
-    /// `None` for the whole decode, and the UI fell back to a pure time
-    /// estimate with no relationship to real progress (see the recon this
-    /// change is based on). Runs a real firered-aed decode on a background
-    /// thread while polling the progress slot from this thread, and requires
-    /// at least one snapshot strictly between 0 and the decode ceiling --
-    /// proof of a genuine intermediate signal, not just an initial 0.0
-    /// immediately followed by the ceiling.
+    /// `publish_progress` at all -- its progress stayed unreadable for the
+    /// whole decode, and the UI fell back to a pure time estimate with no
+    /// relationship to real progress (see the recon this change is based
+    /// on). Runs a real firered-aed decode on a background thread while
+    /// polling this request's id-scoped progress from this thread, and
+    /// requires at least one snapshot strictly between 0 and the decode
+    /// ceiling -- proof of a genuine intermediate signal, not just an initial
+    /// 0.0 immediately followed by the ceiling. Attaches a real
+    /// transcription id via `with_execution_context` (unlike
+    /// `TranscriptionRequest::new`'s uncancellable default) since a detached
+    /// request never publishes at all under the id-scoped registry.
     #[test]
     #[ignore = "host-local: requires tmp/firered-aed-l-v2-q4_k.oasr (a real firered-aed pack)"]
     fn real_decode_short_audio_reports_intermediate_token_level_progress() {
@@ -3090,15 +3121,18 @@ mod tests {
         }
         let wav = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
 
-        let _serialize = PROGRESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(native_transcription_progress(), None);
+        let id = "real-decode-short-audio";
+        assert_eq!(native_transcription_progress_for_id(id), None);
 
         let pack = pack.canonicalize().expect("pack path must canonicalize");
         let wav = wav.canonicalize().expect("wav path must canonicalize");
+        let execution_context = Arc::new(crate::RequestExecutionContext::new(
+            Some(id.to_string()),
+            Arc::new(crate::TranscriptionControl::new()),
+        ));
         let request = TranscriptionRequest::new(wav, NATIVE_RUNTIME_MODEL_ID_AUTO)
-            .with_model_pack_path(Some(pack));
+            .with_model_pack_path(Some(pack))
+            .with_execution_context(execution_context);
 
         let decode_thread = std::thread::spawn(move || run_native_transcription(request));
 
@@ -3106,11 +3140,11 @@ mod tests {
         let mut previous_fraction = 0.0_f32;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !decode_thread.is_finished() && std::time::Instant::now() < deadline {
-            if let Some(progress) = native_transcription_progress() {
+            if let Some(progress) = native_transcription_progress_for_id(id) {
                 assert_eq!(progress.phase, NativeTranscriptionPhase::Decode);
                 // Monotonic even across raw polling (no lock held across
-                // reads, but the CAS inside `publish_progress` guarantees a
-                // reader never observes a regression).
+                // reads, but the registry's own lock guarantees a reader
+                // never observes a regression).
                 assert!(progress.fraction >= previous_fraction);
                 previous_fraction = progress.fraction;
                 if progress.fraction > 0.0 && progress.fraction < DECODE_CEIL_NO_ALIGN {
@@ -3135,7 +3169,7 @@ mod tests {
              short-audio decode must report continuous token-level progress, not stay silent \
              until completion"
         );
-        assert_eq!(native_transcription_progress(), None);
+        assert_eq!(native_transcription_progress_for_id(id), None);
     }
 
     #[test]
@@ -4190,7 +4224,7 @@ mod tests {
             "compute buffer allocation failed (backend: Vulkan0)",
         ));
         let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor.clone());
-        let mut decode_progress = DecodeProgress::begin(1_000, false);
+        let mut decode_progress = DecodeProgress::begin(None, 1_000, false);
         let mut tracker = GpuAllocationFallbackTracker::default();
 
         let (result, fallback) = run_dispatch_once_with_progress_and_gpu_fallback(
@@ -4232,7 +4266,7 @@ mod tests {
             calls: Mutex::new(0),
         });
         let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor.clone());
-        let mut decode_progress = DecodeProgress::begin(1_000, false);
+        let mut decode_progress = DecodeProgress::begin(None, 1_000, false);
         let mut tracker = GpuAllocationFallbackTracker::default();
 
         let error = run_dispatch_once_with_progress_and_gpu_fallback(
@@ -4297,7 +4331,7 @@ mod tests {
         });
         let (dispatch, preflight, family) =
             gpu_fallback_test_fixture(dir.path(), cpu_executor.clone());
-        let mut decode_progress = DecodeProgress::begin(1_000, false);
+        let mut decode_progress = DecodeProgress::begin(None, 1_000, false);
         let mut tracker = GpuAllocationFallbackTracker::default();
 
         let error = run_dispatch_once_with_progress_and_gpu_fallback(
@@ -4334,7 +4368,7 @@ mod tests {
             "compute buffer allocation failed (backend: Vulkan0)",
         ));
         let (dispatch, preflight, family) = gpu_fallback_test_fixture(dir.path(), executor.clone());
-        let mut decode_progress = DecodeProgress::begin(3_000, false);
+        let mut decode_progress = DecodeProgress::begin(None, 3_000, false);
         let mut tracker = GpuAllocationFallbackTracker::default();
 
         for slice_index in 1..=3 {

@@ -207,6 +207,10 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
             get(transcription_progress),
         )
         .route(
+            "/v1/audio/transcriptions/{id}/progress",
+            get(transcription_progress_by_id),
+        )
+        .route(
             "/v1/audio/transcriptions/{id}/cancel",
             post(cancel_transcription_job),
         )

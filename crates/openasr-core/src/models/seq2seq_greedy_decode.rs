@@ -16,10 +16,11 @@ thread_local! {
     // moonshine, firered-aed, hymt2 each have their own error-mapping
     // boilerplate around that single call): installing/removing the sink
     // here keeps every family wrapper untouched. Native transcription runs
-    // the decode loop synchronously on the calling thread (see
-    // `CURRENT_PROGRESS_GENERATION` in `native_transcribe.rs` for the same
-    // assumption), so a thread-local is enough to attribute callbacks to the
-    // run that installed them.
+    // the decode loop synchronously on the calling thread, so a thread-local
+    // is enough to attribute callbacks to the run that installed them; the
+    // sink closure itself carries that run's transcription id (see
+    // `run_dispatch_once_with_progress` in `native_transcribe.rs`) to publish
+    // into that id's own progress-registry entry.
     static TOKEN_STEP_PROGRESS_SINK: RefCell<Option<Box<dyn FnMut(usize, usize)>>> =
         const { RefCell::new(None) };
 }
