@@ -890,6 +890,20 @@ pub enum GgmlCpuGraphError {
     OutputByteSizeMismatch { expected: usize, actual: usize },
     #[error("ggml cpu graph compute failed with status={status}")]
     ComputeFailed { status: i32 },
+    #[error("ggml cpu graph allocation failed")]
+    AllocationFailed,
+    #[error("ggml cpu graph execution failed")]
+    ExecutionFailed,
+    /// The backend device itself is gone (e.g. a Metal/GPU device removed
+    /// mid-compute). Terminal and never retried against the same handle.
+    #[error("ggml cpu graph device was lost")]
+    DeviceLost,
+    /// The backend entered an unrecoverable internal state. Same no-retry
+    /// contract as [`Self::DeviceLost`].
+    #[error("ggml cpu graph backend is poisoned")]
+    BackendPoisoned,
+    #[error("ggml cpu graph returned unknown status={status}")]
+    UnknownComputeStatus { status: i32 },
     /// Graph compute returned `GGML_STATUS_ABORTED` because the installed
     /// abort_callback observed a job cancel. Distinct from [`Self::ComputeFailed`]
     /// so callers map it to `BackendError::TranscriptionCanceled` rather than a
@@ -1986,14 +2000,15 @@ impl GgmlStaticTensorArena {
             });
         }
         let mut values = vec![0_u16; expected_len];
-        unsafe {
-            ffi::ggml_backend_tensor_get(
+        let status = unsafe {
+            read_tensor_bytes(
                 tensor.raw.as_ptr(),
                 values.as_mut_ptr().cast::<c_void>(),
                 0,
                 expected_nbytes,
-            );
-        }
+            )
+        };
+        map_compute_status(status)?;
         Ok(values)
     }
 
@@ -2031,7 +2046,7 @@ impl GgmlStaticTensorArena {
                 payload.bytes.as_ptr().cast::<c_void>(),
                 0,
                 actual_nbytes,
-            );
+            )?;
         }
         Ok(())
     }
@@ -2121,7 +2136,7 @@ impl GgmlStaticTensorArena {
             });
         }
         unsafe {
-            write_tensor_data(tensor.raw, data_ptr, offset, expected_nbytes);
+            write_tensor_data(tensor.raw, data_ptr, offset, expected_nbytes)?;
         }
         Ok(())
     }
@@ -2361,7 +2376,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 payload.bytes.as_ptr().cast::<c_void>(),
                 0,
                 actual_nbytes,
-            );
+            )?;
         }
         Ok(())
     }
@@ -3923,7 +3938,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 (&value as *const f32).cast::<c_void>(),
                 offset,
                 F32_WIDTH_BYTES,
-            );
+            )?;
         }
         Ok(())
     }
@@ -3946,14 +3961,15 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     reason: "tensor byte offset overflow",
                 })?;
         let mut value = 0.0f32;
-        unsafe {
-            ffi::ggml_backend_tensor_get(
+        let status = unsafe {
+            read_tensor_bytes(
                 tensor.raw.as_ptr(),
                 (&mut value as *mut f32).cast::<c_void>(),
                 offset,
                 F32_WIDTH_BYTES,
-            );
-        }
+            )
+        };
+        map_compute_status(status)?;
         Ok(value)
     }
 
@@ -4207,14 +4223,15 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         let mut results = Vec::with_capacity(outputs.len());
         for ((output, expected_len), output_nbytes) in outputs.iter().zip(output_nbytes) {
             let mut values = vec![0.0f32; *expected_len];
-            unsafe {
-                ffi::ggml_backend_tensor_get(
+            let status = unsafe {
+                read_tensor_bytes(
                     output.raw.as_ptr(),
                     values.as_mut_ptr().cast::<c_void>(),
                     0,
                     output_nbytes,
-                );
-            }
+                )
+            };
+            map_compute_status(status)?;
             results.push(values);
         }
         Ok(results)
@@ -4298,28 +4315,30 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         let mut f32_results = Vec::with_capacity(f32_outputs.len());
         for ((output, expected_len), output_nbytes) in f32_outputs.iter().zip(f32_output_nbytes) {
             let mut values = vec![0.0f32; *expected_len];
-            unsafe {
-                ffi::ggml_backend_tensor_get(
+            let status = unsafe {
+                read_tensor_bytes(
                     output.raw.as_ptr(),
                     values.as_mut_ptr().cast::<c_void>(),
                     0,
                     output_nbytes,
-                );
-            }
+                )
+            };
+            map_compute_status(status)?;
             f32_results.push(values);
         }
 
         let mut i32_results = Vec::with_capacity(i32_outputs.len());
         for ((output, expected_len), output_nbytes) in i32_outputs.iter().zip(i32_output_nbytes) {
             let mut values = vec![0_i32; *expected_len];
-            unsafe {
-                ffi::ggml_backend_tensor_get(
+            let status = unsafe {
+                read_tensor_bytes(
                     output.raw.as_ptr(),
                     values.as_mut_ptr().cast::<c_void>(),
                     0,
                     output_nbytes,
-                );
-            }
+                )
+            };
+            map_compute_status(status)?;
             i32_results.push(values);
         }
 
@@ -4393,14 +4412,15 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.finish_compute_result(compute)?;
 
         let mut values = vec![0_i32; expected_len];
-        unsafe {
-            ffi::ggml_backend_tensor_get(
+        let status = unsafe {
+            read_tensor_bytes(
                 output.raw.as_ptr(),
                 values.as_mut_ptr().cast::<c_void>(),
                 0,
                 output_nbytes,
-            );
-        }
+            )
+        };
+        map_compute_status(status)?;
         Ok(values)
     }
 
@@ -4525,7 +4545,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         }
         self.ensure_tensor_contiguous(tensor, "tensor_upload")?;
         unsafe {
-            write_tensor_data(tensor.raw, data_ptr, offset_nbytes, expected_nbytes);
+            write_tensor_data(tensor.raw, data_ptr, offset_nbytes, expected_nbytes)?;
         }
         Ok(())
     }
@@ -5337,6 +5357,54 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only seam: when set, the next `compute_graph_with_current_job_cancel`
+    /// call returns this status instead of calling the real ggml FFI, so tests
+    /// can inject a terminal completion status (e.g. `DeviceLost`) without a
+    /// real faulty device. Cleared after one use.
+    static TEST_GRAPH_COMPUTE_STATUS_OVERRIDE: RefCell<Option<c_int>> = const { RefCell::new(None) };
+    /// Test-only seam: counts every tensor readback (`ggml_backend_tensor_get`)
+    /// issued through [`read_tensor_bytes`], so tests can assert that a
+    /// terminal graph-compute failure produced zero readbacks.
+    static TEST_TENSOR_READBACK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_test_graph_compute_status_override() -> Option<c_int> {
+    TEST_GRAPH_COMPUTE_STATUS_OVERRIDE.with(|cell| cell.borrow_mut().take())
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_graph_compute_status_override(status: c_int) {
+    TEST_GRAPH_COMPUTE_STATUS_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(status));
+}
+
+#[cfg(test)]
+pub(crate) fn test_tensor_readback_count() -> usize {
+    TEST_TENSOR_READBACK_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_tensor_readback_count() {
+    TEST_TENSOR_READBACK_COUNT.with(|count| count.set(0));
+}
+
+/// Thin wrapper around `ggml_backend_tensor_get` used by every production
+/// readback call site, so the terminal-failure regression tests can observe
+/// how many actual tensor reads happen (must be zero after a poisoned graph
+/// compute -- see `finish_compute_result`/`ensure_not_poisoned`).
+unsafe fn read_tensor_bytes(
+    tensor: *mut c_void,
+    data: *mut c_void,
+    offset: usize,
+    size: usize,
+) -> c_int {
+    #[cfg(test)]
+    TEST_TENSOR_READBACK_COUNT.with(|count| count.set(count.get() + 1));
+    unsafe { ffi::ggml_backend_tensor_get(tensor, data, offset, size) }
+}
+
 /// Compute one graph under the current job's cancel flag. The cloned Arc owns
 /// the callback data for exactly this synchronous FFI call; neither the shared
 /// backend layer nor a cached backend retains the raw pointer after return.
@@ -5345,6 +5413,14 @@ fn compute_graph_with_current_job_cancel(
     scheduler: Option<NonNull<c_void>>,
     graph: NonNull<c_void>,
 ) -> Result<c_int, GgmlCpuGraphError> {
+    #[cfg(test)]
+    if let Some(status) = take_test_graph_compute_status_override() {
+        // Simulates the new ggml contract where `ggml_backend_*graph_compute`
+        // already reports the merged submit+completion status: the "submit"
+        // itself (this call) returns Ok, carrying a terminal status value
+        // instead of a separate later completion signal.
+        return Ok(status);
+    }
     let Some(flag) = super::thread_job_cancel_flag() else {
         return Ok(unsafe {
             scheduler.map_or_else(
@@ -5636,18 +5712,27 @@ impl GgmlBackendGuard {
     }
 }
 
-/// Map a ggml graph-compute status code into a typed graph error.
+/// Map a ggml graph-compute or tensor-transfer status code into a typed
+/// graph error.
 ///
-/// Centralized so every compute site agrees: SUCCESS stays Ok, ABORTED becomes
-/// the cancel-shaped [`GgmlCpuGraphError::Aborted`] (never a bare
-/// `ComputeFailed { status: 1 }`), and every other code stays ComputeFailed.
+/// Centralized so every call site agrees on the vendored ggml enum: SUCCESS
+/// stays Ok, ABORTED becomes the cancel-shaped [`GgmlCpuGraphError::Aborted`]
+/// (never a bare `ComputeFailed`), the validation/type/shape errors this
+/// module raises directly never route through here, and each other known
+/// `ggml_status` value gets its own typed variant so callers can tell
+/// validation-shaped failures apart from device/backend-shaped ones. An
+/// unrecognized status fails closed as [`GgmlCpuGraphError::UnknownComputeStatus`]
+/// rather than being silently treated as a known terminal state.
 fn map_compute_status(status: c_int) -> Result<(), GgmlCpuGraphError> {
-    if status == ffi::GGML_STATUS_SUCCESS {
-        Ok(())
-    } else if status == ffi::GGML_STATUS_ABORTED {
-        Err(GgmlCpuGraphError::Aborted)
-    } else {
-        Err(GgmlCpuGraphError::ComputeFailed { status })
+    match status {
+        ffi::GGML_STATUS_SUCCESS => Ok(()),
+        ffi::GGML_STATUS_ABORTED => Err(GgmlCpuGraphError::Aborted),
+        ffi::GGML_STATUS_ALLOC_FAILED => Err(GgmlCpuGraphError::AllocationFailed),
+        ffi::GGML_STATUS_FAILED => Err(GgmlCpuGraphError::ComputeFailed { status }),
+        ffi::GGML_STATUS_EXECUTION_FAILED => Err(GgmlCpuGraphError::ExecutionFailed),
+        ffi::GGML_STATUS_DEVICE_LOST => Err(GgmlCpuGraphError::DeviceLost),
+        ffi::GGML_STATUS_BACKEND_POISONED => Err(GgmlCpuGraphError::BackendPoisoned),
+        status => Err(GgmlCpuGraphError::UnknownComputeStatus { status }),
     }
 }
 
@@ -6032,7 +6117,7 @@ unsafe fn write_tensor_data(
     data_ptr: *const c_void,
     offset: usize,
     actual_nbytes: usize,
-) {
+) -> Result<(), GgmlCpuGraphError> {
     let layout = unsafe { *(tensor.as_ptr() as *const ffi::GgmlTensorLayoutPrefix) };
     if !layout.buffer.is_null() && unsafe { ffi::ggml_backend_buffer_is_host(layout.buffer) } {
         let dst = unsafe { ffi::ggml_get_data(tensor.as_ptr()) };
@@ -6044,10 +6129,12 @@ unsafe fn write_tensor_data(
                     actual_nbytes,
                 );
             }
-            return;
+            return Ok(());
         }
     }
-    unsafe { ffi::ggml_backend_tensor_set(tensor.as_ptr(), data_ptr, offset, actual_nbytes) };
+    let status =
+        unsafe { ffi::ggml_backend_tensor_set(tensor.as_ptr(), data_ptr, offset, actual_nbytes) };
+    map_compute_status(status)
 }
 
 #[cfg(test)]
@@ -6097,7 +6184,27 @@ mod tests {
             Err(GgmlCpuGraphError::Aborted)
         ));
         assert!(matches!(
-            super::map_compute_status(-1),
+            super::map_compute_status(ffi::GGML_STATUS_ALLOC_FAILED),
+            Err(GgmlCpuGraphError::AllocationFailed)
+        ));
+        assert!(matches!(
+            super::map_compute_status(ffi::GGML_STATUS_EXECUTION_FAILED),
+            Err(GgmlCpuGraphError::ExecutionFailed)
+        ));
+        assert!(matches!(
+            super::map_compute_status(ffi::GGML_STATUS_DEVICE_LOST),
+            Err(GgmlCpuGraphError::DeviceLost)
+        ));
+        assert!(matches!(
+            super::map_compute_status(ffi::GGML_STATUS_BACKEND_POISONED),
+            Err(GgmlCpuGraphError::BackendPoisoned)
+        ));
+        assert!(matches!(
+            super::map_compute_status(99),
+            Err(GgmlCpuGraphError::UnknownComputeStatus { status: 99 })
+        ));
+        assert!(matches!(
+            super::map_compute_status(ffi::GGML_STATUS_FAILED),
             Err(GgmlCpuGraphError::ComputeFailed { status: -1 })
         ));
         // Display carries the stable cancel marker used by dispatch rewrite.
