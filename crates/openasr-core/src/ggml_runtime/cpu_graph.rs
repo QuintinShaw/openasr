@@ -5,7 +5,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{CStr, CString, c_int, c_void},
     marker::PhantomData,
     path::Path,
@@ -4449,6 +4449,15 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         }
     }
 
+    /// Maps the raw compute outcome to a typed result and updates poison
+    /// state. Every non-success outcome poisons *this* session/graph (the
+    /// existing `poisoned_after_failed_compute` contract -- never reuse a
+    /// handle that may have partially executed). `DeviceLost` and
+    /// `BackendPoisoned` additionally poison the backend itself, stickily,
+    /// across every future session on this thread (see
+    /// `mark_backend_poisoned_sticky`): those two statuses mean the backend
+    /// handle is not just mid-failure but permanently unusable, which is a
+    /// strictly larger blast radius than a bad graph/session.
     fn finish_compute_result(
         &mut self,
         result: Result<c_int, GgmlCpuGraphError>,
@@ -4457,7 +4466,14 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             Ok(status) if status == ffi::GGML_STATUS_SUCCESS => Ok(()),
             Ok(status) => {
                 self.poisoned_after_failed_compute = true;
-                map_compute_status(status)
+                let mapped = map_compute_status(status);
+                if matches!(
+                    mapped,
+                    Err(GgmlCpuGraphError::DeviceLost | GgmlCpuGraphError::BackendPoisoned)
+                ) {
+                    mark_backend_poisoned_sticky(self.backend);
+                }
+                mapped
             }
             Err(error) => {
                 self.poisoned_after_failed_compute = true;
@@ -5355,6 +5371,51 @@ enum CachedBackendKey {
 thread_local! {
     static THREAD_BACKEND_CACHE_BY_KIND: RefCell<HashMap<CachedBackendKey, GgmlCachedBackendGuard>> =
         RefCell::new(HashMap::new());
+    /// Raw addresses of backend handles that returned `GGML_STATUS_DEVICE_LOST`
+    /// or `GGML_STATUS_BACKEND_POISONED` from a graph compute on this thread.
+    /// Stored as `usize` (never dereferenced) purely for pointer-identity
+    /// comparison -- see `mark_backend_poisoned_sticky`.
+    static THREAD_POISONED_BACKEND_ADDRS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+}
+
+/// Sticky, thread-scoped poison for a backend handle that reported
+/// `DeviceLost` or `BackendPoisoned`. Distinct from the per-session
+/// `poisoned_after_failed_compute` flag: a session/graph is scoped to one
+/// caller's build, but a *cached* GPU/Metal backend (`THREAD_BACKEND_CACHE_BY_KIND`)
+/// is handed out to every future caller on this thread, so a device-fatal
+/// status must additionally evict it from that cache and remember its address
+/// as poisoned -- otherwise the next unrelated caller would transparently get
+/// the same broken handle back.
+///
+/// The evicted cache entry is deliberately leaked (`mem::forget`), never
+/// freed: calling `ggml_backend_free` on a backend that just reported its
+/// device is lost or its internal state is corrupt is not assumed to be safe.
+fn mark_backend_poisoned_sticky(raw: NonNull<c_void>) {
+    let addr = raw.as_ptr() as usize;
+    THREAD_POISONED_BACKEND_ADDRS.with(|poisoned| {
+        poisoned.borrow_mut().insert(addr);
+    });
+    THREAD_BACKEND_CACHE_BY_KIND.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let stale_keys: Vec<CachedBackendKey> = cache
+            .iter()
+            .filter(|(_, guard)| guard.raw.as_ptr() as usize == addr)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale_keys {
+            if let Some(guard) = cache.remove(&key) {
+                std::mem::forget(guard);
+            }
+        }
+    });
+}
+
+/// True if `raw` was previously reported `DeviceLost`/`BackendPoisoned` on
+/// this thread. Used defensively by the cache lookup path so a poisoned
+/// address can never be handed out again even if something re-inserts it.
+fn is_backend_poisoned(raw: NonNull<c_void>) -> bool {
+    let addr = raw.as_ptr() as usize;
+    THREAD_POISONED_BACKEND_ADDRS.with(|poisoned| poisoned.borrow().contains(&addr))
 }
 
 #[cfg(test)]
@@ -5538,8 +5599,17 @@ impl GgmlBackendGuard {
         })
     }
 
+    /// Defensively re-checks `is_backend_poisoned` on every lookup (not just at
+    /// the point of poisoning) so a poisoned handle can never be handed out,
+    /// even if some future insert path forgets to consult the poison set.
     fn cached_backend_lookup(key: &CachedBackendKey) -> Option<NonNull<c_void>> {
-        THREAD_BACKEND_CACHE_BY_KIND.with(|cache| cache.borrow().get(key).map(|g| g.raw))
+        let raw =
+            THREAD_BACKEND_CACHE_BY_KIND.with(|cache| cache.borrow().get(key).map(|g| g.raw))?;
+        if is_backend_poisoned(raw) {
+            mark_backend_poisoned_sticky(raw);
+            return None;
+        }
+        Some(raw)
     }
 
     fn cached_backend_insert(key: CachedBackendKey, raw: NonNull<c_void>) {
@@ -6212,6 +6282,190 @@ mod tests {
         assert!(
             msg.contains("aborted by cancel request"),
             "Aborted display must stay recognizable to is_cooperative_cancel_reason: {msg}"
+        );
+    }
+
+    /// The regression this task exists for: with the new vendored ggml
+    /// contract, `ggml_backend_*graph_compute` already reports the merged
+    /// submit+completion status in its own return value -- there is no
+    /// separate later "completion" call whose failure could be missed. This
+    /// injects that terminal status via the test-only override seam (no real
+    /// faulty device needed) and proves two things about the *same* compute
+    /// call that observed it:
+    ///   1. it returns the typed terminal error itself, not a delayed error on
+    ///      some later call (the override is consumed exactly once);
+    ///   2. no tensor readback happens afterward -- `finish_compute_result`'s
+    ///      `?` must short-circuit before any `read_tensor_bytes` call.
+    #[test]
+    fn terminal_compute_status_fails_the_originating_call_with_zero_readback() {
+        super::reset_test_tensor_readback_count();
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner");
+
+        super::install_test_graph_compute_status_override(ffi::GGML_STATUS_EXECUTION_FAILED);
+        let err = runner
+            .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+            .expect_err("submit-ok/completion-failed status must fail this call");
+        assert!(
+            matches!(err, GgmlCpuGraphError::ExecutionFailed),
+            "got {err:?}"
+        );
+        assert_eq!(
+            super::test_tensor_readback_count(),
+            0,
+            "a terminal compute status must never reach tensor readback"
+        );
+
+        // The override is one-shot: a fresh call on a fresh runner (this
+        // session is now poisoned, see below) with no override installed
+        // must compute normally, proving the failure was tied to that one
+        // call and not some sticky per-process state.
+        let mut clean_runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner");
+        assert_eq!(
+            clean_runner
+                .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+                .expect("no override installed -> real compute succeeds"),
+            vec![4.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn execution_failed_and_alloc_failed_poison_session_but_not_backend() {
+        // ExecutionFailed/AllocFailed are graph/session-scoped: the current
+        // builder must refuse further use, but the backend handle itself
+        // (which owns no model-tensor state) must stay usable for a fresh
+        // session -- unlike DeviceLost/BackendPoisoned below.
+        for status in [
+            ffi::GGML_STATUS_EXECUTION_FAILED,
+            ffi::GGML_STATUS_ALLOC_FAILED,
+        ] {
+            let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+                .expect("cpu graph runner");
+            let backend_raw = runner.start_graph().backend;
+
+            super::install_test_graph_compute_status_override(status);
+            runner
+                .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+                .expect_err("injected terminal status must fail the call");
+
+            assert!(
+                !super::is_backend_poisoned(backend_raw),
+                "status={status} must not sticky-poison the backend"
+            );
+            // A second call against the same runner without a fresh session
+            // (start_graph rebuilds a new builder each time, so this proves
+            // the backend itself, not just one builder instance, stayed
+            // usable) succeeds normally.
+            assert_eq!(
+                runner
+                    .compute_add_f32(&[5.0, 6.0], &[1.0, 1.0])
+                    .expect("backend must remain usable after a session-scoped failure"),
+                vec![6.0, 7.0]
+            );
+        }
+    }
+
+    #[test]
+    fn device_lost_and_backend_poisoned_sticky_poison_the_backend() {
+        // Runners are kept alive for the whole test (not dropped between
+        // iterations): a dropped CPU backend is freed, and a freed address
+        // could in principle be reused by the allocator for the next
+        // iteration's fresh backend, which would make that new, healthy
+        // backend spuriously look "poisoned" via stale address reuse.
+        let mut runners = Vec::new();
+        for status in [
+            ffi::GGML_STATUS_DEVICE_LOST,
+            ffi::GGML_STATUS_BACKEND_POISONED,
+        ] {
+            let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+                .expect("cpu graph runner");
+            let backend_raw = runner.start_graph().backend;
+            assert!(!super::is_backend_poisoned(backend_raw));
+
+            super::install_test_graph_compute_status_override(status);
+            runner
+                .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+                .expect_err("injected terminal status must fail the call");
+
+            assert!(
+                super::is_backend_poisoned(backend_raw),
+                "status={status} must sticky-poison the backend"
+            );
+            runners.push(runner);
+        }
+    }
+
+    #[test]
+    fn aborted_status_does_not_sticky_poison_the_backend() {
+        // Aborted keeps its existing cooperative-cancellation contract (the
+        // caller's session is still poisoned via `poisoned_after_failed_compute`,
+        // covered by `aborted_persistent_graph_is_poisoned_until_owner_rebuilds_it`
+        // below) but must never be conflated with a device-fatal status at the
+        // backend level.
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner");
+        let backend_raw = runner.start_graph().backend;
+
+        super::install_test_graph_compute_status_override(ffi::GGML_STATUS_ABORTED);
+        let err = runner
+            .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+            .expect_err("aborted status must still fail the call");
+        assert!(matches!(err, GgmlCpuGraphError::Aborted), "got {err:?}");
+        assert!(!super::is_backend_poisoned(backend_raw));
+    }
+
+    #[test]
+    fn validation_errors_never_poison_the_session() {
+        // Output byte-size mismatch is a caller-programming-error path that
+        // never reaches `compute_graph_with_current_job_cancel` at all, so it
+        // must never flip `poisoned_after_failed_compute`.
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner");
+        let mut graph = runner.start_graph();
+        let lhs = graph.new_tensor_1d_f32(2, "lhs").expect("lhs tensor");
+        graph.set_input(lhs).expect("lhs input");
+        graph
+            .set_f32_slice(lhs, &[1.0, 2.0], "lhs")
+            .expect("lhs upload");
+        let err = graph
+            .compute_output_f32(lhs, 999)
+            .expect_err("expected_len mismatch must fail validation, not compute");
+        assert!(
+            matches!(err, GgmlCpuGraphError::OutputByteSizeMismatch { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            !graph.is_poisoned(),
+            "a validation-shaped error must never poison the session"
+        );
+    }
+
+    /// Pure unit test of the sticky-poison bookkeeping itself, independent of
+    /// any real backend or compute call: `mark_backend_poisoned_sticky` must
+    /// (a) evict a matching cache entry and (b) remember the address so a
+    /// later lookup can never hand it out again. The address is a synthetic
+    /// non-null sentinel that is never dereferenced -- `CachedBackendKey`/
+    /// `GgmlCachedBackendGuard` bookkeeping only ever compares pointer
+    /// identity via `as usize`, so this is safe without a live backend.
+    #[test]
+    fn sticky_backend_poison_evicts_cached_entry_and_blocks_future_lookup() {
+        let sentinel = std::ptr::NonNull::new(0x10 as *mut std::ffi::c_void)
+            .expect("non-null sentinel address");
+        super::GgmlBackendGuard::cached_backend_insert(super::CachedBackendKey::Metal, sentinel);
+        assert!(
+            super::GgmlBackendGuard::cached_backend_lookup(&super::CachedBackendKey::Metal)
+                .is_some(),
+            "precondition: cache must contain the seeded entry before poisoning"
+        );
+
+        super::mark_backend_poisoned_sticky(sentinel);
+
+        assert!(super::is_backend_poisoned(sentinel));
+        assert!(
+            super::GgmlBackendGuard::cached_backend_lookup(&super::CachedBackendKey::Metal)
+                .is_none(),
+            "a poisoned address must never be handed out again"
         );
     }
 
