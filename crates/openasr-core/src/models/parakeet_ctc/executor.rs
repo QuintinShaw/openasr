@@ -379,6 +379,7 @@ impl GgmlAsrExecutor for ParakeetCtcGgmlExecutor {
                 language: None,
             },
             carry_context: None,
+            decode_truncated_at_seconds: None,
         })
     }
 }

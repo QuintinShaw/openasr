@@ -657,6 +657,7 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
                 language: Some(output.resolved_language),
             },
             carry_context: None,
+            decode_truncated_at_seconds: None,
         })
     }
 

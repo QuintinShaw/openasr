@@ -36,6 +36,7 @@ use crate::models::decode_token_history::context_window_budget;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
     Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
+    Seq2SeqGreedyDecodeStopReason,
 };
 use crate::nn::decoder::{
     CrossKvHandle, SelfKvHandle, Seq2SeqLayerConfig, Seq2SeqLayerWeights,
@@ -865,6 +866,7 @@ pub(crate) fn run_firered_aed_decoder_greedy_with_runtime(
                 text,
                 generated_tokens,
                 generated_probabilities: Vec::new(),
+                stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
             }
         }
         // Preserve the stable cancel marker so native/server boundaries can

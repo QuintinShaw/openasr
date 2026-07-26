@@ -1408,6 +1408,10 @@ fn run_native_transcription_impl(
             // `GpuAllocationFallbackTracker` / `run_dispatch_once_with_progress_and_gpu_fallback`).
             let mut gpu_fallback_tracker = GpuAllocationFallbackTracker::default();
             let mut degraded_slice_fallbacks: Vec<(usize, SliceGpuFallback)> = Vec::new();
+            // Slices whose decode stopped short of their own audio, as
+            // `index@seconds` (seconds are slice-relative, matching what the
+            // executor reported).
+            let mut truncated_slices: Vec<String> = Vec::new();
             for slice in plan.slices {
                 if execution_context.control.wait_at_slice_boundary()
                     == super::transcription_control::SliceBoundaryControl::Canceled
@@ -1487,12 +1491,22 @@ fn run_native_transcription_impl(
                     ),
                 );
                 // Destructure instead of `result.clone().into_transcription()`:
-                // both fields are consumed below and nothing needs `result`
+                // the fields are consumed below and nothing needs `result`
                 // as a whole afterwards, so there is nothing left to clone.
                 let GgmlAsrExecutionResult {
                     transcription,
                     carry_context,
+                    decode_truncated_at_seconds,
                 } = result;
+                if let Some(truncated_at) = decode_truncated_at_seconds {
+                    // A slice whose decode gave up partway is a degraded
+                    // result, not a normal one: the audio after this point is
+                    // absent from the transcript. Surfaced in the same
+                    // provenance channel as the other "this run did not behave
+                    // like the naive default" facts rather than left as a log
+                    // line the caller never sees.
+                    truncated_slices.push(format!("{slice_index}@{truncated_at:.2}s"));
+                }
                 ran_any_slice = true;
                 match carry_prompt_mode {
                     LongformPromptCarryMode::Disabled => {}
@@ -1556,6 +1570,12 @@ fn run_native_transcription_impl(
                         skipped_indices.join(";")
                     ));
                 }
+            }
+            if !truncated_slices.is_empty() {
+                longform_provenance.push(format!(
+                    "core.native.decode.truncated:slices={}",
+                    truncated_slices.join(";")
+                ));
             }
             let (assembled, assemble_stats) = assembler.into_parts();
             let run_metadata = build_longform_metadata(
@@ -2719,7 +2739,9 @@ mod tests {
     /// normalizer breaks it.
     #[test]
     fn a_moss_shaped_decode_honors_the_voice_id_switch_end_to_end() {
-        use crate::models::moss_transcribe_diarize::speaker_segments::normalize_moss_td_decode;
+        use crate::models::moss_transcribe_diarize::speaker_segments::{
+            MossTdDecodeExtent, normalize_moss_td_decode,
+        };
 
         let descriptor = OpenAsrArchitectureRegistry::with_builtins()
             .find_by_model_architecture(crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID)
@@ -2735,7 +2757,11 @@ mod tests {
 
         let off = SpeakerPlan::resolve(false, descriptor.speaker_segmentation);
         assert_eq!(off, SpeakerPlan::Off);
-        let normalized = normalize_moss_td_decode(decoded, 10.59, off == SpeakerPlan::InDecoder);
+        let normalized = normalize_moss_td_decode(
+            decoded,
+            MossTdDecodeExtent::complete(10.59),
+            off == SpeakerPlan::InDecoder,
+        );
         assert!(
             !normalized.text.contains('['),
             "Voice ID off must not leak markup: {:?}",
@@ -2754,7 +2780,11 @@ mod tests {
 
         let on = SpeakerPlan::resolve(true, descriptor.speaker_segmentation);
         assert_eq!(on, SpeakerPlan::InDecoder);
-        let normalized = normalize_moss_td_decode(decoded, 10.59, on == SpeakerPlan::InDecoder);
+        let normalized = normalize_moss_td_decode(
+            decoded,
+            MossTdDecodeExtent::complete(10.59),
+            on == SpeakerPlan::InDecoder,
+        );
         assert!(!normalized.text.contains('['));
         let labels: Vec<_> = normalized
             .segments
@@ -4342,6 +4372,7 @@ mod tests {
                         language: None,
                     },
                     carry_context: None,
+                    decode_truncated_at_seconds: None,
                 });
             }
             Err(GgmlAsrExecutionError::ExecutorFailed {

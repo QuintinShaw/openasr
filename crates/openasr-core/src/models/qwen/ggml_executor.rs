@@ -746,6 +746,7 @@ impl Qwen3AsrGgmlExecutor {
                 language: None,
             },
             carry_context: None,
+            decode_truncated_at_seconds: None,
         });
         qwen_decode_profile_log_opt("decode_with_runtime_assets_total", profile_started_at);
         result

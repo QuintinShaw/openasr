@@ -438,6 +438,7 @@ impl MimoAsrGgmlExecutor {
         Ok(GgmlAsrExecutionResult {
             transcription,
             carry_context: None,
+            decode_truncated_at_seconds: None,
         })
     }
 }

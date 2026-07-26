@@ -1677,6 +1677,7 @@ mod tests {
                     Ok(GgmlAsrExecutionResult {
                         transcription: transcription(""),
                         carry_context: None,
+                        decode_truncated_at_seconds: None,
                     })
                 },
             );

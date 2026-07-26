@@ -60,6 +60,7 @@ use super::runtime_contract::{
     moss_td_request_kv_cache_positions, parse_adaptor_metadata, parse_decoder_metadata,
     parse_encoder_metadata,
 };
+use super::speaker_segments::MossTdDecodeExtent;
 use super::tokenizer::MossTdTokenizer;
 
 /// `WhisperFeatureExtractor`'s `chunk_length=30` @ 16kHz (`preprocessor_config.json`,
@@ -493,6 +494,14 @@ fn encode_moss_td_chunks_with_cached_runtime(
     )
 }
 
+/// One decode's text plus whether the driver stopped it short of the audio.
+/// The flag is what keeps `speaker_segments` from closing a cut-short decode's
+/// final segment at the end of the clip (see [`MossTdDecodeExtent`]).
+struct MossTdDecodeOutput {
+    text: String,
+    truncated: bool,
+}
+
 /// Runs the ChatML+audio-splice prompt embedding through the cached, resident
 /// decoder runtime for this pack+backend: prefill, then the shared greedy
 /// decode driver through to `<|im_end|>` (or the fail-closed token budget),
@@ -515,7 +524,7 @@ fn run_moss_td_decoder_with_cached_runtime(
     tokenizer: &MossTdTokenizer,
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-) -> Result<String, MossTdExecutorError> {
+) -> Result<MossTdDecodeOutput, MossTdExecutorError> {
     let key = (
         PackContentKey::for_runtime_source(runtime_source),
         moss_td_runtime_graph_config(backend).backend,
@@ -614,7 +623,10 @@ fn run_moss_td_decoder_with_cached_runtime(
             let result = result.map_err(|error| MossTdExecutorError::GreedyDecodeFailed {
                 reason: error.to_string(),
             })?;
-            Ok(result.text.trim().to_string())
+            Ok(MossTdDecodeOutput {
+                text: result.text.trim().to_string(),
+                truncated: result.stop_reason.is_truncated(),
+            })
         },
     )
 }
@@ -755,7 +767,7 @@ impl MossTdGgmlExecutor {
         // to this pack+backend, while the KV cache for this one utterance is
         // still allocated fresh inside the helper.
         let runtime_source = &preflight.runtime_source;
-        let text = run_moss_td_decoder_with_cached_runtime(
+        let decoded = run_moss_td_decoder_with_cached_runtime(
             runtime_source,
             decoder_metadata,
             request_kv_cache_positions,
@@ -775,10 +787,14 @@ impl MossTdGgmlExecutor {
         // `SPEAKER_NN` labels survive. See `speaker_segments`'s module doc for
         // the grammar, the fail-closed policy, and the degrade shape.
         let normalized = super::speaker_segments::normalize_moss_td_decode(
-            &text,
-            audio_duration_seconds,
+            &decoded.text,
+            MossTdDecodeExtent {
+                audio_duration_seconds,
+                truncated: decoded.truncated,
+            },
             request.request_options.in_decoder_speakers,
         );
+        let decode_truncated_at_seconds = normalized.truncated_at_seconds;
         let transcription = Transcription {
             segments: normalized.segments,
             text: normalized.text,
@@ -788,6 +804,7 @@ impl MossTdGgmlExecutor {
         Ok(GgmlAsrExecutionResult {
             transcription,
             carry_context: None,
+            decode_truncated_at_seconds,
         })
     }
 }
@@ -935,7 +952,7 @@ mod tests {
     fn normalized_golden_text(reference_decode: &str, audio_duration_seconds: f32) -> String {
         super::super::speaker_segments::normalize_moss_td_decode(
             reference_decode,
-            audio_duration_seconds,
+            MossTdDecodeExtent::complete(audio_duration_seconds),
             true,
         )
         .text
@@ -1105,7 +1122,7 @@ mod tests {
     ) {
         let golden = super::super::speaker_segments::parse_moss_td_speaker_segments(
             golden_reference_decode,
-            audio_duration_seconds,
+            MossTdDecodeExtent::complete(audio_duration_seconds),
         )
         .expect("the golden reference decode parses");
         assert_eq!(
@@ -1241,8 +1258,9 @@ mod tests {
         // `GOLDEN_JFK_TEXT`) -- this asserts the executor's real dev-pack
         // decode round-trips through `speaker_segments` into that same
         // structure, not just that the flat string matches.
-        let expected = parse_moss_td_speaker_segments(GOLDEN_JFK_TEXT, 10.59)
-            .expect("golden text itself must parse");
+        let expected =
+            parse_moss_td_speaker_segments(GOLDEN_JFK_TEXT, MossTdDecodeExtent::complete(10.59))
+                .expect("golden text itself must parse");
         assert_eq!(segments, expected);
     }
 
@@ -1254,8 +1272,11 @@ mod tests {
         else {
             return;
         };
-        let expected = parse_moss_td_speaker_segments(GOLDEN_EN_ZH_MIXED_TEXT, 12.88)
-            .expect("golden text itself must parse");
+        let expected = parse_moss_td_speaker_segments(
+            GOLDEN_EN_ZH_MIXED_TEXT,
+            MossTdDecodeExtent::complete(12.88),
+        )
+        .expect("golden text itself must parse");
         assert_eq!(segments, expected);
     }
 
@@ -1267,7 +1288,9 @@ mod tests {
     /// is split) shows up as a diff here even without the private pack.
     #[test]
     fn snapshot_jfk_and_en_zh_mixed_golden_speaker_segments() {
-        let jfk = parse_moss_td_speaker_segments(GOLDEN_JFK_TEXT, 10.59).expect("jfk parses");
+        let jfk =
+            parse_moss_td_speaker_segments(GOLDEN_JFK_TEXT, MossTdDecodeExtent::complete(10.59))
+                .expect("jfk parses");
         let jfk_snapshot: Vec<(&str, f32, f32, &str)> = jfk
             .iter()
             .map(|segment| {
@@ -1298,8 +1321,11 @@ mod tests {
             ]
         );
 
-        let en_zh_mixed =
-            parse_moss_td_speaker_segments(GOLDEN_EN_ZH_MIXED_TEXT, 12.88).expect("parses");
+        let en_zh_mixed = parse_moss_td_speaker_segments(
+            GOLDEN_EN_ZH_MIXED_TEXT,
+            MossTdDecodeExtent::complete(12.88),
+        )
+        .expect("parses");
         let en_zh_mixed_snapshot: Vec<(&str, f32, f32, &str)> = en_zh_mixed
             .iter()
             .map(|segment| {
@@ -1346,8 +1372,11 @@ mod tests {
 
     #[test]
     fn synthetic_multi_chunk_duration_transcript_parses_into_structured_segments() {
-        let segments = parse_moss_td_speaker_segments(SYNTHETIC_MULTI_CHUNK_TEXT, 110.75)
-            .expect("synthetic multi-chunk transcript parses");
+        let segments = parse_moss_td_speaker_segments(
+            SYNTHETIC_MULTI_CHUNK_TEXT,
+            MossTdDecodeExtent::complete(110.75),
+        )
+        .expect("synthetic multi-chunk transcript parses");
         let snapshot: Vec<(&str, f32, f32, &str)> = segments
             .iter()
             .map(|segment| {

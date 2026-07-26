@@ -405,6 +405,17 @@ impl GgmlAsrStreamingSessionRequest {
 pub struct GgmlAsrExecutionResult {
     pub transcription: Transcription,
     pub carry_context: Option<GgmlAsrCarryContext>,
+    /// Set when this decode stopped short of the audio it was given: the point
+    /// (in this decode's own seconds, i.e. relative to the buffer handed to the
+    /// executor) past which the transcript says nothing about the audio.
+    ///
+    /// A truncated decode is otherwise indistinguishable from a complete one --
+    /// same shape, same success status -- so without this the caller cannot
+    /// tell a transcript that covers its audio from one that gave up partway.
+    /// The longform loop stamps it into the run's provenance so it survives to
+    /// the API boundary, and it is the signal a slice-level retry or degrade
+    /// would key on. `None` means the decode ended on its own terms.
+    pub decode_truncated_at_seconds: Option<f32>,
 }
 
 impl GgmlAsrExecutionResult {
@@ -1023,6 +1034,7 @@ mod tests {
                         language: None,
                     },
                     carry_context: None,
+                    decode_truncated_at_seconds: None,
                 })
             }
         }
@@ -1059,6 +1071,7 @@ mod tests {
                         language: None,
                     },
                     carry_context: None,
+                    decode_truncated_at_seconds: None,
                 })
             }
         }
@@ -1120,6 +1133,7 @@ mod tests {
                         language: None,
                     },
                     carry_context: None,
+                    decode_truncated_at_seconds: None,
                 })
             }
         }
@@ -1204,6 +1218,7 @@ mod tests {
                         language: None,
                     },
                     carry_context: None,
+                    decode_truncated_at_seconds: None,
                 })
             }
         }
@@ -1585,6 +1600,7 @@ mod tests {
                         language: None,
                     },
                     carry_context: None,
+                    decode_truncated_at_seconds: None,
                 })
             }
         }
@@ -1674,6 +1690,7 @@ mod tests {
                         language: None,
                     },
                     carry_context: None,
+                    decode_truncated_at_seconds: None,
                 })
             }
         }

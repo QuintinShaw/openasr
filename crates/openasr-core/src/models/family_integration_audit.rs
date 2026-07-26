@@ -623,6 +623,7 @@ pub(crate) mod source_tree_audit {
                         language: None,
                     },
                     carry_context: None,
+                    decode_truncated_at_seconds: None,
                 })
             }
         }

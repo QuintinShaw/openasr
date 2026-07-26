@@ -377,6 +377,7 @@ impl GgmlAsrExecutor for SenseVoiceGgmlExecutor {
                 language: output.language,
             },
             carry_context: None,
+            decode_truncated_at_seconds: None,
         })
     }
 }
