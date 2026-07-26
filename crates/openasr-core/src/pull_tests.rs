@@ -1996,6 +1996,104 @@ fn pull_cancel_before_rename_removes_partial_without_installing() {
 }
 
 #[test]
+fn migration_rehydrates_legacy_path_after_ios_container_migration() {
+    let temp = tempfile::tempdir().unwrap();
+    let old_home = temp.path().join("Data-Container-UUID-A");
+    let current_home = temp.path().join("Data-Container-UUID-B");
+    let old_models_dir = old_home.join("models");
+    let (old_absolute_path, bytes) =
+        write_legacy_install(&old_home, &old_models_dir, "moonshine-tiny", "q8_0", None);
+    fs::create_dir_all(&current_home).unwrap();
+    fs::rename(&old_models_dir, current_home.join("models"))
+        .expect("preserve models directory contents into the new container root");
+    assert!(
+        !old_absolute_path.exists(),
+        "fixture must leave the serialized old path unreachable"
+    );
+
+    let current_pack_path = current_home
+        .join("models")
+        .join("moonshine-tiny")
+        .join("q8_0")
+        .join("moonshine-tiny-q8_0.oasr");
+    let installed_record_path = current_pack_path.parent().unwrap().join("installed.json");
+    let record_before = fs::read(&installed_record_path).unwrap();
+    assert!(
+        String::from_utf8_lossy(&record_before)
+            .contains(old_absolute_path.to_string_lossy().as_ref()),
+        "the copied installed.json must still contain the stale UUID-A absolute path"
+    );
+
+    let report = migrate_model_store_at_startup(&current_home)
+        .expect("startup migration must rehydrate the moved legacy record");
+    assert_eq!(report.migrated, vec!["moonshine-tiny:q8".to_string()]);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+
+    let packs = list_installed_packs(&current_home).expect("migrated pack must be listed");
+    assert_eq!(packs.len(), 1);
+    assert_eq!(
+        packs[0].path,
+        object_path_for(&current_home.join("models"), &sha256_hex(&bytes))
+    );
+    assert_eq!(packs[0].pull, "moonshine-tiny:q8");
+    assert!(
+        !installed_record_path.exists(),
+        "successful migration must retire the stale absolute-path record"
+    );
+}
+
+#[test]
+fn list_installed_packs_rejects_escape_filename_even_with_a_valid_external_stale_path() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let target = PullTarget::from_resolved(&resolved).unwrap();
+    let paths = pull_paths(temp.path(), &target).unwrap();
+    ensure_storage_dir_within_root(temp.path(), &paths).unwrap();
+    fs::write(&paths.final_path, &bytes).unwrap();
+    let external_path = temp.path().join("external").join("escape.oasr");
+    fs::create_dir_all(external_path.parent().unwrap()).unwrap();
+    fs::write(&external_path, &bytes).unwrap();
+
+    let mut forged = write_installed_record(&target, &paths).unwrap();
+    forged.filename = "../escape.oasr".to_string();
+    forged.path = external_path.clone();
+    let json = serde_json::to_string_pretty(&forged).unwrap();
+    fs::write(&paths.installed_meta_path, format!("{json}\n")).unwrap();
+
+    assert!(list_installed_packs(temp.path()).unwrap().is_empty());
+    assert_eq!(fs::read(&external_path).unwrap(), bytes);
+}
+
+#[cfg(unix)]
+#[test]
+fn list_installed_packs_rejects_symlinked_pack_even_with_a_valid_record() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: bytes.clone(),
+    }]);
+    let installed = pull_model_pack_with_client(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::default(),
+        |_| {},
+    )
+    .unwrap();
+    let external_path = temp.path().join("external").join(&resolved.filename);
+    fs::create_dir_all(external_path.parent().unwrap()).unwrap();
+    fs::write(&external_path, &bytes).unwrap();
+    fs::remove_file(&installed.path).unwrap();
+    symlink(&external_path, &installed.path).unwrap();
+
+    assert!(list_installed_packs(temp.path()).unwrap().is_empty());
+    assert_eq!(fs::read(&external_path).unwrap(), bytes);
+}
+
+#[test]
 fn list_installed_packs_ignores_orphaned_pack_without_record() {
     let bytes = tiny_pack_bytes();
     let resolved = resolved_for(&bytes);

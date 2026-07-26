@@ -805,10 +805,12 @@ pub fn migrate_legacy_model_store(home: &Path) -> Result<LegacyMigrationReport, 
             path: root.clone(),
             source,
         })?;
+        let model_dir_path = model_dir.path();
         if matches!(
             model_dir.file_name().to_str(),
             Some("objects" | "refs" | "staging" | "locks")
-        ) {
+        ) || !is_trusted_installed_pack_directory(&model_dir_path)
+        {
             continue;
         }
         let Ok(quant_dirs) = fs::read_dir(model_dir.path()) else {
@@ -820,11 +822,28 @@ pub fn migrate_legacy_model_store(home: &Path) -> Result<LegacyMigrationReport, 
                 source,
             })?;
             let quant_path = quant_dir.path();
+            if !is_trusted_installed_pack_directory(&quant_path) {
+                continue;
+            }
             let metadata_path = quant_path.join("installed.json");
+            let Ok(metadata) = fs::symlink_metadata(&metadata_path) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
             let Ok(contents) = fs::read_to_string(&metadata_path) else {
                 continue;
             };
             let Ok(legacy) = serde_json::from_str::<InstalledPack>(&contents) else {
+                continue;
+            };
+            let Some(legacy) = rehydrate_installed_pack_from_quant_dir(legacy, &quant_path) else {
+                report.failures.push(LegacyMigrationFailure {
+                    path: metadata_path,
+                    reason: "legacy installed record does not match its storage directory"
+                        .to_string(),
+                });
                 continue;
             };
             if let Err(reason) =
@@ -1059,6 +1078,57 @@ pub fn persist_default_pack_pointer(
         })?;
     atomic_file::write_file_atomically(&path, format!("{contents}\n").as_bytes())
         .map_err(|source| PullError::Io { path, source })
+}
+
+/// The installed record's absolute `path` is a cache, not an authority: iOS
+/// app upgrades can move the Data Container UUID while preserving all files
+/// under `models/`. Rebuild the candidate from the directory we are currently
+/// scanning, then validate it before returning a path to callers. In
+/// particular, never inspect `pack.path` here -- it may be stale or hostile.
+fn rehydrate_installed_pack_from_quant_dir(
+    mut pack: InstalledPack,
+    quant_dir: &Path,
+) -> Option<InstalledPack> {
+    if validate_safe_relative_path("model id", &pack.model_id).is_err()
+        || validate_safe_relative_path("quant", &pack.quant).is_err()
+        || validate_safe_relative_path("filename", &pack.filename).is_err()
+        || pack.filename.contains('/')
+        || pack.filename.contains('\\')
+        || !has_openasr_runtime_pack_extension(&pack.filename)
+    {
+        return None;
+    }
+    let model_dir = quant_dir.parent()?;
+    let model_dir_name = model_dir.file_name().and_then(|name| name.to_str())?;
+    let quant_dir_name = quant_dir.file_name().and_then(|name| name.to_str())?;
+    if validate_safe_relative_path("model storage directory", model_dir_name).is_err()
+        || validate_safe_relative_path("quant storage directory", quant_dir_name).is_err()
+        || model_dir_name != pack.model_id
+        || quant_dir_name != pack.quant
+    {
+        return None;
+    }
+    let path = quant_dir.join(&pack.filename);
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return None;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    if metadata.len() != pack.size_bytes
+        || validate_native_runtime_model_pack_contract(&path).is_err()
+    {
+        return None;
+    }
+    pack.path = path;
+    Some(pack)
+}
+
+fn is_trusted_installed_pack_directory(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    !metadata.file_type().is_symlink() && metadata.is_dir()
 }
 
 pub fn remove_model_pack(
