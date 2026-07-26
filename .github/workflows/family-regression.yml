@@ -99,11 +99,14 @@ jobs:
           # failing closed on the pull step until that flip -- matches
           # dolphin's own staged-then-flipped onboarding history.
           - { name: firered, ref: "firered-aed-l-v2:q4", mode: transcribe, strategy: exact }
-          # Diarization capability packs (pyannote-seg + wespeaker) are
-          # exercised end to end through --diarize on the whisper-tiny pack;
-          # the golden asserts the transcript, not speaker labels.
+          # Speaker separation is exercised end to end through --diarize on the
+          # whisper-tiny pack; the golden asserts the transcript, not speaker
+          # labels. Only the ReDimNet2-B6 embedder is pulled: it is the single
+          # supported speaker-embedding pack (see requiredDiarizationModels /
+          # registry.rs), and the retired WeSpeaker id this row used to pull no
+          # longer exists in the catalog at all, so that pull failed closed.
           - { name: diarize, ref: "whisper-tiny:q4", mode: diarize, strategy: exact,
-              args: "--extra-pull pyannote-segmentation-3.0:f32 --extra-pull wespeaker-voxceleb-resnet34-lm:f32" }
+              args: "--extra-pull redimnet2-b6-cn:fp16" }
           # hymt2 is a translation model with no batch transcribe CLI path;
           # cover the real pull + pack integrity chain only.
           - { name: hymt2, ref: "hymt2-1.8b:q4km", mode: verify, strategy: exact }

@@ -2235,19 +2235,11 @@ impl WsSession {
         assignment: &openasr_core::diarize::enrollment::SpeakerDisplayAssignment,
         reason: &str,
     ) -> Result<(), ()> {
-        let (speaker_label, speaker_person_id, speaker_snapshot_label) =
-            if assignment.speaker_person_id.is_some() {
-                (
-                    Some(assignment.speaker_label.clone()),
-                    assignment.speaker_person_id.clone(),
-                    assignment
-                        .speaker_snapshot_label
-                        .clone()
-                        .or_else(|| Some(assignment.speaker.clone())),
-                )
-            } else {
-                (None, None, None)
-            };
+        let speaker_label = assignment
+            .is_display_name_match()
+            .then(|| assignment.speaker_label.clone());
+        let speaker_person_id = assignment.speaker_person_id.clone();
+        let speaker_snapshot_label = assignment.speaker_snapshot_label.clone();
         let revision = RealtimeTranscriptRevision {
             utterance_id: record.utterance_id,
             segment_id: record.segment_id,
@@ -2597,13 +2589,11 @@ impl WsSession {
                 ),
             };
             *speaker_slot = Some(assignment.speaker.clone());
-            if assignment.speaker_person_id.is_some() {
-                *label_slot = Some(assignment.speaker_label);
-                *person_slot = assignment.speaker_person_id;
-                *snapshot_slot = assignment
-                    .speaker_snapshot_label
-                    .or(Some(assignment.speaker));
+            if assignment.is_display_name_match() {
+                *label_slot = Some(assignment.speaker_label.clone());
             }
+            *person_slot = assignment.speaker_person_id;
+            *snapshot_slot = assignment.speaker_snapshot_label;
         }
         consumed_queued_label
     }
@@ -3011,17 +3001,14 @@ impl WsSession {
                 let (speaker, speaker_label, speaker_person_id, speaker_snapshot_label) =
                     speaker_assignment
                         .map(|assignment| {
-                            let matched = assignment.speaker_person_id.is_some();
-                            let speaker_label = matched.then_some(assignment.speaker_label.clone());
-                            let snapshot = assignment
-                                .speaker_snapshot_label
-                                .clone()
-                                .or_else(|| matched.then_some(assignment.speaker.clone()));
+                            let speaker_label = assignment
+                                .is_display_name_match()
+                                .then(|| assignment.speaker_label.clone());
                             (
                                 Some(assignment.speaker),
                                 speaker_label,
                                 assignment.speaker_person_id,
-                                snapshot,
+                                assignment.speaker_snapshot_label,
                             )
                         })
                         .unwrap_or((None, None, None, None));
