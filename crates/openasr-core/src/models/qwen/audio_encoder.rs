@@ -1403,6 +1403,9 @@ mod tests {
     /// (thread-independent), so it is stable against parallel-test env mutation.
     #[test]
     fn encoder_graph_context_is_right_sized_not_flat_256mb() {
+        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input_for_test(
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        );
         let config = qwen_audio_encoder_runtime_graph_config();
 
         // Covers the worst-case forward graph (node budget + the metadata its

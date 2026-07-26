@@ -5973,7 +5973,7 @@ mod tests {
         }
 
         Qwen3AsrPrefillParityReport {
-            backend: GgmlCpuGraphConfig::resolve_runtime_backend(),
+            backend: GgmlCpuGraphConfig::runtime_default().backend,
             token_count,
             chunk_size: selected_chunk_size,
             hidden: hidden_stats,

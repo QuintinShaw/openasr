@@ -852,6 +852,9 @@ mod tests {
 
     #[test]
     fn ggml_logits_head_executor_cache_reuses_same_key_without_rebuilding() {
+        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input_for_test(
+            GgmlCpuGraphBackend::Cpu,
+        );
         let key = ggml_logits_head_test_cache_key(9_000_001);
         let first = ggml_logits_head_with_cache_key(key.clone(), vec![1.0, 1.0]);
         first
@@ -871,6 +874,9 @@ mod tests {
 
     #[test]
     fn ggml_logits_head_executor_cache_evicts_beyond_capacity() {
+        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input_for_test(
+            GgmlCpuGraphBackend::Cpu,
+        );
         let base_id = 9_100_000;
         for offset in 0..(DEFAULT_RUNTIME_CACHE_CAPACITY + 3) {
             let key = ggml_logits_head_test_cache_key(base_id + offset);

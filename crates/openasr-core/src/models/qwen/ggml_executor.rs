@@ -37,9 +37,7 @@ use crate::arch::shape_orchestrator::{
     LayerCountResolver, OpenAsrStageRole, StageBuildPlan, validate_stage_against_descriptor,
 };
 use crate::arch::{OpenAsrArchitectureRegistry, QWEN3_ASR_GGML_ARCHITECTURE_ID};
-use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, env_var_truthy,
-};
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphError, env_var_truthy};
 use crate::models::decode_policy_component_registry::{
     BuiltinSeq2SeqDecodePolicyConfigInput, build_builtin_seq2seq_decode_policy_config,
     resolve_builtin_decode_policy,
@@ -365,16 +363,20 @@ impl Qwen3AsrGgmlExecutor {
         skip_serve_batch: bool,
     ) -> Result<GgmlAsrExecutionResult, Qwen3AsrGgmlExecutorError> {
         let profile_started_at = qwen_decode_profile_start();
+        // Resolved once for the whole decode: the shared dispatch already
+        // installed this via `install_resolved_family_runtime_input` before
+        // calling into this executor, so every cache key / job field below
+        // reads the same value instead of each independently re-deriving it
+        // from the thread-local override + env.
+        let backend = crate::ggml_runtime::resolved_family_runtime_input().backend();
         // Canonical path + pack content fingerprint: both cache keys below
         // carry the fingerprint so an in-place pack replacement misses.
         let runtime_cache_identity = runtime_cache_path_identity(&request.runtime_source_path);
         // The serve-batch owner loads the pack itself; it needs the path, not
         // the fingerprint.
         let runtime_cache_path = runtime_cache_identity.path.clone();
-        let audio_encoder_cache_key: AudioEncoderCacheKey = (
-            runtime_cache_identity.clone(),
-            GgmlCpuGraphConfig::resolve_runtime_backend(),
-        );
+        let audio_encoder_cache_key: AudioEncoderCacheKey =
+            (runtime_cache_identity.clone(), backend);
         let audio_encoder_started_at = qwen_decode_profile_start();
         let audio_embeddings = encode_qwen_audio_embeddings_cached(
             audio_encoder_cache_key,
@@ -498,10 +500,10 @@ impl Qwen3AsrGgmlExecutor {
                         crate::models::ggml_asr_executor::serve_batch_build_identity_for_request(
                             &request.request_options,
                             "qwen",
-                            GgmlCpuGraphConfig::resolve_runtime_backend(),
+                            backend,
                             runtime_source,
                         ),
-                    backend: GgmlCpuGraphConfig::resolve_runtime_backend(),
+                    backend,
                     metadata,
                     tokenizer: tokenizer.cloned(),
                     token_embedding_table,
@@ -551,11 +553,8 @@ impl Qwen3AsrGgmlExecutor {
             },
         )?;
         let adapter_fingerprint = qwen_adapter_cache_fingerprint(adapter.as_deref());
-        let decoder_cache_key: WholeDecoderCacheKey = (
-            runtime_cache_identity,
-            GgmlCpuGraphConfig::resolve_runtime_backend(),
-            adapter_fingerprint,
-        );
+        let decoder_cache_key: WholeDecoderCacheKey =
+            (runtime_cache_identity, backend, adapter_fingerprint);
         let whole_decoder_started_at = qwen_decode_profile_start();
         // Sampled before the cache take and reused for the store-back below:
         // if the idle-unload reaper bumps the generation while this decode is
@@ -1825,6 +1824,11 @@ mod tests {
 
     #[test]
     fn qwen_prepared_runtime_builder_accepts_deeper_layer_fixtures() {
+        // Bypasses the dispatch, so the resolved input the encoder graph
+        // config now requires must be installed here explicitly.
+        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input_for_test(
+            GgmlCpuGraphBackend::Cpu,
+        );
         let executor = Qwen3AsrGgmlExecutor::default();
         for llm_layers in 3..=9 {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -1849,6 +1853,11 @@ mod tests {
 
     #[test]
     fn qwen_prepared_runtime_drops_zero_copy_audio_projection_payloads() {
+        // Bypasses the dispatch, so the resolved input the encoder graph
+        // config now requires must be installed here explicitly.
+        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input_for_test(
+            GgmlCpuGraphBackend::Cpu,
+        );
         let temp = tempfile::tempdir().expect("tempdir");
         let runtime_path = temp.path().join("qwen3-asr-0.6b-q4_k.gguf");
         let fixture_spec = qwen_tensor_ready_fixture_spec();
@@ -1896,6 +1905,11 @@ mod tests {
         request.request_options.prompt = Some("test".to_string());
 
         let executor = Qwen3AsrGgmlExecutor::default();
+        // Bypasses the dispatch, so this must install the resolved input
+        // `decode_with_runtime_assets` now requires itself.
+        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input_for_test(
+            GgmlCpuGraphBackend::Cpu,
+        );
         let error = executor
             .execute(&request)
             .expect_err("non-empty prompt must fail closed");
@@ -1967,6 +1981,15 @@ mod tests {
             )),
         };
 
+        // Bypasses the dispatch, so the request-level backend preference and
+        // the resolved input `decode_with_runtime_assets` requires must both
+        // be installed here (dispatch normally does both).
+        let _backend_guard = crate::ggml_runtime::install_request_backend_override(
+            backend_preference.request_backend_override(),
+        );
+        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input(
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
         let executor = Qwen3AsrGgmlExecutor::default();
         let started_at = std::time::Instant::now();
         let result = executor.execute(&request).expect("qwen3-asr transcribe");

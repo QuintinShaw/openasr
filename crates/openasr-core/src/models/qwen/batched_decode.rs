@@ -19,7 +19,7 @@ use super::logits_head::Qwen3AsrLlmLogitsHead;
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::token_embedding::Qwen3AsrTokenEmbeddingTable;
 use super::tokenizer::Qwen3AsrTokenizer;
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig};
+use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, apply_seq2seq_text_postprocess,
 };
@@ -788,9 +788,12 @@ impl Qwen3AsrOwnerThreadState {
         slots: &[Option<Qwen3AsrActiveBatchSlot>],
         max_positions: usize,
     ) -> Result<Vec<Option<Vec<Qwen3AsrLayerKvCacheState>>>, Qwen3AsrServeBatchError> {
-        let template = slots
+        let (template, backend) = slots
             .iter()
-            .find_map(|slot| slot.as_ref().map(|active| &active.slot.job.metadata))
+            .find_map(|slot| {
+                slot.as_ref()
+                    .map(|active| (active.slot.job.metadata, active.slot.job.backend))
+            })
             .ok_or_else(|| Qwen3AsrServeBatchError::OwnerFailed {
                 reason: "qwen serve batch cannot build dummy seed without an active slot"
                     .to_string(),
@@ -801,7 +804,8 @@ impl Qwen3AsrOwnerThreadState {
                 if slot.is_some() {
                     Ok(None)
                 } else {
-                    Qwen3AsrBatchSlot::zero_seed_layer_kv_caches(*template, max_positions).map(Some)
+                    Qwen3AsrBatchSlot::zero_seed_layer_kv_caches(template, backend, max_positions)
+                        .map(Some)
                 }
             })
             .collect()
@@ -1479,12 +1483,15 @@ impl Qwen3AsrBatchSlot {
                     .to_string(),
             });
         }
-        let host = resolve_qwen_family_production_kv_cache_policy(
-            GgmlCpuGraphConfig::resolve_runtime_backend(),
-            job.metadata.llm_head_dim,
-        )
-        .to_spec()
-        .host;
+        // `job.backend` was materialized on the submitting thread (see
+        // `Qwen3AsrServeBatchJob::backend`'s doc comment); this constructor
+        // may run on a different worker thread with no request-backend
+        // override installed, so re-resolving here would silently diverge
+        // from the backend the submitter actually decided on.
+        let host =
+            resolve_qwen_family_production_kv_cache_policy(job.backend, job.metadata.llm_head_dim)
+                .to_spec()
+                .host;
         let layer_kv_caches = (0..job.metadata.llm_layers)
             .map(|_| {
                 Qwen3AsrLayerKvCacheState::new_with_element_type(
@@ -1511,8 +1518,14 @@ impl Qwen3AsrBatchSlot {
         })
     }
 
+    /// `backend` must come from an active slot's own `job.backend` (already
+    /// materialized on that job's submitting thread) -- this constructor may
+    /// run on a worker thread with no request-backend override installed, so
+    /// re-resolving here would silently diverge from what the batch is
+    /// actually decoding on.
     fn zero_seed_layer_kv_caches(
         metadata: Qwen3AsrExecutionMetadata,
+        backend: GgmlCpuGraphBackend,
         max_positions: usize,
     ) -> Result<Vec<Qwen3AsrLayerKvCacheState>, Qwen3AsrServeBatchError> {
         if metadata.llm_layers == 0 {
@@ -1527,12 +1540,9 @@ impl Qwen3AsrBatchSlot {
                 reason: "qwen serve batch dummy seed row width overflowed".to_string(),
             })?;
         let zero_row = vec![0.0_f32; row_width];
-        let host = resolve_qwen_family_production_kv_cache_policy(
-            GgmlCpuGraphConfig::resolve_runtime_backend(),
-            metadata.llm_head_dim,
-        )
-        .to_spec()
-        .host;
+        let host = resolve_qwen_family_production_kv_cache_policy(backend, metadata.llm_head_dim)
+            .to_spec()
+            .host;
         let mut layers = Vec::with_capacity(metadata.llm_layers);
         for _ in 0..metadata.llm_layers {
             let mut cache = Qwen3AsrLayerKvCacheState::new_with_element_type(
@@ -2336,7 +2346,15 @@ mod tests {
                     Some(OsString::from("0")),
                 ),
             ],
-            run,
+            || {
+                // Bypasses the dispatch, so the resolved input
+                // `qwen_runtime_graph_config` now requires must be installed
+                // here explicitly.
+                let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input_for_test(
+                    GgmlCpuGraphBackend::Cpu,
+                );
+                run()
+            },
         )
     }
 
@@ -2371,7 +2389,7 @@ mod tests {
                     .expect("valid runtime source path")
                     .content_id(),
             ),
-            backend: GgmlCpuGraphConfig::resolve_runtime_backend(),
+            backend: GgmlCpuGraphConfig::runtime_default().backend,
             metadata: fixture.metadata,
             tokenizer: None,
             token_embedding_table: fixture.token_embedding_table.clone(),
@@ -2413,6 +2431,12 @@ mod tests {
     }
 
     fn assert_qwen_selected_backend_direct_for_real_pack_harness() {
+        // Manual harness: not run through the dispatch, so install the
+        // resolved input `qwen_runtime_graph_config` now requires, using
+        // qwen's own (AllBackends) declared policy.
+        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input(
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
         let runtime_config = qwen_runtime_graph_config();
         assert!(
             runtime_config.backend.is_gpu_class() && !runtime_config.use_scheduler,
@@ -2649,8 +2673,12 @@ mod tests {
 
     #[test]
     fn qwen_dummy_seed_layers_initialize_zero_prefix_for_padded_slots() {
-        let layers =
-            Qwen3AsrBatchSlot::zero_seed_layer_kv_caches(tiny_metadata(), 8).expect("dummy seed");
+        let layers = Qwen3AsrBatchSlot::zero_seed_layer_kv_caches(
+            tiny_metadata(),
+            GgmlCpuGraphBackend::Cpu,
+            8,
+        )
+        .expect("dummy seed");
         assert_eq!(layers.len(), 2);
         for layer in layers {
             let snapshot = layer.snapshot_written().expect("snapshot");

@@ -20,8 +20,9 @@ use crate::models::graph_runtime_config::{
 /// one-line change (the `AutoGpuPolicy` gate machinery already exists, see
 /// `xasr_zipformer::graph_config::encoder_gpu_enabled` for the pattern).
 pub(crate) fn qwen_runtime_graph_config() -> GgmlCpuGraphConfig {
+    let backend = crate::ggml_runtime::resolved_family_runtime_input().backend();
     configure_model_runtime_graph_config_from_env(
-        GgmlCpuGraphConfig::default(),
+        GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend),
         ModelMetalRuntimeOverrides {
             default_use_scheduler_when_unset: None,
             default_n_threads_when_unset: Some(1),

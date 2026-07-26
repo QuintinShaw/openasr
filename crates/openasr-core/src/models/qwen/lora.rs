@@ -157,6 +157,15 @@ mod tests {
                 "test fixture",
             )),
         };
+        // Bypasses the dispatch, so the request-level backend preference and
+        // the resolved input `decode_with_runtime_assets` requires must both
+        // be installed here (dispatch normally does both).
+        let _backend_guard = crate::ggml_runtime::install_request_backend_override(
+            request.backend_preference.request_backend_override(),
+        );
+        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input(
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
         match executor.execute(&request) {
             Ok(result) => Ok(result.transcription.text.trim().to_string()),
             Err(GgmlAsrExecutionError::ExecutorFailed { reason, .. })
@@ -326,6 +335,15 @@ mod tests {
                 "test fixture",
             )),
         };
+        // Bypasses the dispatch, so the request-level backend preference and
+        // the resolved input `decode_with_runtime_assets` requires must both
+        // be installed here (dispatch normally does both).
+        let _backend_guard = crate::ggml_runtime::install_request_backend_override(
+            request.backend_preference.request_backend_override(),
+        );
+        let _resolved = crate::ggml_runtime::install_resolved_family_runtime_input(
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
         match executor.execute(&request) {
             Ok(result) => Ok(result.transcription.text.trim().to_string()),
             Err(GgmlAsrExecutionError::ExecutorFailed { reason, .. })
