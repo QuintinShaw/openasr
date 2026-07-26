@@ -143,6 +143,11 @@ pub enum OpenAsrPcmFormat {
     S16 = 1,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PcmCopyError {
+    HostAllocationFailed { requested_bytes: usize },
+}
+
 /// Opaque handle to a validated local `.oasr` model pack path. Obtained from
 /// [`openasr_model_open`], released with [`openasr_model_close`].
 ///
@@ -468,17 +473,25 @@ pub unsafe extern "C" fn openasr_transcribe_pcm(
         // `pcm_len_samples` samples of `format`; both arms read exactly that
         // many elements of the matching type and copy them out before this
         // function returns.
-        let samples_f32: Vec<f32> = unsafe {
+        let samples_f32 = unsafe {
             match format {
-                OpenAsrPcmFormat::F32 => {
-                    std::slice::from_raw_parts(pcm as *const f32, pcm_len_samples).to_vec()
-                }
-                OpenAsrPcmFormat::S16 => {
-                    std::slice::from_raw_parts(pcm as *const i16, pcm_len_samples)
-                        .iter()
-                        .map(|sample| f32::from(*sample) / f32::from(i16::MAX))
-                        .collect()
-                }
+                OpenAsrPcmFormat::F32 => copy_f32_pcm(std::slice::from_raw_parts(
+                    pcm as *const f32,
+                    pcm_len_samples,
+                )),
+                OpenAsrPcmFormat::S16 => s16_pcm_to_f32(std::slice::from_raw_parts(
+                    pcm as *const i16,
+                    pcm_len_samples,
+                )),
+            }
+        };
+        let samples_f32 = match samples_f32 {
+            Ok(samples) => samples,
+            Err(PcmCopyError::HostAllocationFailed { requested_bytes }) => {
+                set_last_error(format!(
+                    "openasr_transcribe_pcm: host allocation failed while copying PCM (requested_bytes={requested_bytes})"
+                ));
+                return OpenAsrStatus::OutOfMemory;
             }
         };
 
@@ -533,6 +546,37 @@ fn finish_transcribe_pcm(
             status
         }
     }
+}
+
+fn copy_f32_pcm(samples: &[f32]) -> Result<Vec<f32>, PcmCopyError> {
+    let mut copied = allocate_pcm_f32_buffer(samples.len())?;
+    copied.extend_from_slice(samples);
+    Ok(copied)
+}
+
+fn s16_pcm_to_f32(samples: &[i16]) -> Result<Vec<f32>, PcmCopyError> {
+    let mut converted = allocate_pcm_f32_buffer(samples.len())?;
+    for sample in samples {
+        converted.push(f32::from(*sample) / f32::from(i16::MAX));
+    }
+    Ok(converted)
+}
+
+fn allocate_pcm_f32_buffer(sample_count: usize) -> Result<Vec<f32>, PcmCopyError> {
+    allocate_pcm_f32_buffer_with_reserve(sample_count, |samples, capacity| {
+        samples.try_reserve_exact(capacity)
+    })
+}
+
+fn allocate_pcm_f32_buffer_with_reserve<E>(
+    sample_count: usize,
+    reserve: impl FnOnce(&mut Vec<f32>, usize) -> Result<(), E>,
+) -> Result<Vec<f32>, PcmCopyError> {
+    let requested_bytes = sample_count.saturating_mul(mem::size_of::<f32>());
+    let mut samples = Vec::new();
+    reserve(&mut samples, sample_count)
+        .map_err(|_| PcmCopyError::HostAllocationFailed { requested_bytes })?;
+    Ok(samples)
 }
 
 /// Frees a result returned by [`openasr_transcribe_pcm`]. Null is accepted
@@ -1546,6 +1590,27 @@ mod tests {
         assert_eq!(backend_status, OpenAsrStatus::OutOfMemory);
         assert!(out_result.is_null());
         assert!(last_error().contains("Metal"));
+    }
+
+    #[test]
+    fn batch_pcm_copy_uses_fallible_reserve_for_both_input_formats() {
+        assert_eq!(
+            copy_f32_pcm(&[0.25, -0.5]).expect("small f32 PCM copy"),
+            vec![0.25, -0.5]
+        );
+        assert_eq!(
+            s16_pcm_to_f32(&[0, i16::MAX, -i16::MAX]).expect("small s16 PCM conversion"),
+            vec![0.0, 1.0, -1.0]
+        );
+
+        let error = allocate_pcm_f32_buffer_with_reserve(16, |_, _| Err(()))
+            .expect_err("injected reservation failure must stay typed");
+        assert_eq!(
+            error,
+            PcmCopyError::HostAllocationFailed {
+                requested_bytes: 64
+            }
+        );
     }
 
     #[test]
