@@ -1,7 +1,7 @@
 //! Runtime resolution of the speaker-embedder weight pack.
 //!
-//! Only ReDimNet2-B6 is supported (`OPENASR_REDIMNET_PACK` / installed-dir hint
-//! `redimnet`, 192-d, ggml graph). When the pack is absent, resolution returns
+//! Only ReDimNet2-B6 is supported (`OPENASR_REDIMNET_PACK` / installed model-id
+//! hint `redimnet`, 192-d, ggml graph). When the pack is absent, resolution returns
 //! `None` and callers fail closed with a clear "install redimnet2-b6-cn" error
 //! rather than falling back to any other embedder.
 
@@ -14,7 +14,7 @@ use super::SpeakerEmbedder;
 static SHARED_EMBEDDER: OnceLock<SharedEmbedderState> = OnceLock::new();
 
 const REDIMNET_PACK_ENV: &str = "OPENASR_REDIMNET_PACK";
-const REDIMNET_INSTALLED_DIR_HINT: &str = "redimnet";
+const REDIMNET_INSTALLED_MODEL_ID_HINT: &str = "redimnet";
 
 /// Catalog / pull id of the only supported speaker-embedder pack.
 pub const SPEAKER_EMBEDDER_PACK_ID: &str = "redimnet2-b6-cn";
@@ -56,7 +56,7 @@ struct SharedEmbedderState {
 }
 
 fn redimnet_pack_path() -> Option<PathBuf> {
-    crate::diarize::pack::resolve_pack(REDIMNET_PACK_ENV, REDIMNET_INSTALLED_DIR_HINT)
+    crate::diarize::pack::resolve_pack(REDIMNET_PACK_ENV, REDIMNET_INSTALLED_MODEL_ID_HINT)
 }
 
 /// Whether the ReDimNet2-B6 embedder pack is resolvable right now (env override
@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn redimnet_pack_env_name_is_stable() {
         assert_eq!(REDIMNET_PACK_ENV, "OPENASR_REDIMNET_PACK");
-        assert_eq!(REDIMNET_INSTALLED_DIR_HINT, "redimnet");
+        assert_eq!(REDIMNET_INSTALLED_MODEL_ID_HINT, "redimnet");
     }
 
     #[test]

@@ -4,26 +4,33 @@ use std::path::Path;
 use super::*;
 use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
 use crate::{OpenAsrConfigDocument, config_path};
+use sha2::Digest;
 
-/// Writes an `installed.json` plus a real backing pack file for `model_id`/
-/// `quant`. `list_installed_packs` re-validates every on-disk pack on each
-/// lookup (`installed_pack_matches_quant_dir` in pull.rs checks the file
-/// exists, its size matches `size_bytes`, and it passes
-/// `validate_native_runtime_model_pack_contract`) -- a bare `installed.json`
-/// with no backing file is silently dropped, not "installed". Mirror the
-/// graph-complete whisper fixture `openasr-server`'s tests use for the same
-/// reason (the bare non-graph spec omits required whisper runtime keys and
-/// fails contract validation).
+/// Installs `model_id`/`quant` the way the store actually holds it: an immutable
+/// object plus the ref that names it.
+///
+/// The ref is re-validated on every lookup (`InstalledModelStore` checks the
+/// object exists, is a regular file, and matches the recorded size), so a ref
+/// with no backing object is silently dropped rather than "installed". The
+/// backing bytes use the graph-complete whisper fixture because installs enforce
+/// `validate_native_runtime_model_pack_contract`, which the bare non-graph spec
+/// fails.
 fn write_installed_pack(home: &Path, model_id: &str, quant: &str, suffix: &str) -> InstalledPack {
     let filename = format!("{model_id}-{quant}.oasr");
-    let dir = home.join("models").join(model_id).join(quant);
-    fs::create_dir_all(&dir).expect("create installed pack dir");
-    let path = dir.join(&filename);
+    let models = home.join("models");
+
+    let staged = models.join("fixture-source").join(&filename);
+    fs::create_dir_all(staged.parent().expect("staged parent")).expect("create fixture dir");
     let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(model_id);
-    write_tiny_gguf_runtime_source(&path, &spec).expect("write tiny gguf runtime source");
-    let size_bytes = fs::metadata(&path)
-        .expect("stat installed pack fixture")
-        .len();
+    write_tiny_gguf_runtime_source(&staged, &spec).expect("write tiny gguf runtime source");
+    let bytes = fs::read(&staged).expect("read fixture pack");
+    fs::remove_dir_all(models.join("fixture-source")).expect("drop fixture staging dir");
+
+    let sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let path = models.join("objects/sha256").join(&sha256).join("content");
+    fs::create_dir_all(path.parent().expect("object parent")).expect("create object dir");
+    fs::write(&path, &bytes).expect("write object");
+
     let pack = InstalledPack {
         model_id: model_id.to_string(),
         display_name: model_id.to_string(),
@@ -34,16 +41,21 @@ fn write_installed_pack(home: &Path, model_id: &str, quant: &str, suffix: &str) 
         path,
         url: format!("https://example.test/{model_id}-{quant}.oasr"),
         hf_revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
-        sha256: "a".repeat(64),
-        size_bytes,
+        sha256,
+        size_bytes: bytes.len() as u64,
         installed_at_unix_seconds: 1,
         source: None,
     };
+    let ref_path = models
+        .join("refs")
+        .join(model_id)
+        .join(format!("{quant}.json"));
+    fs::create_dir_all(ref_path.parent().expect("ref parent")).expect("create ref dir");
     fs::write(
-        dir.join("installed.json"),
+        &ref_path,
         serde_json::to_string_pretty(&pack).expect("serialize installed pack"),
     )
-    .expect("write installed pack metadata");
+    .expect("write model ref");
     pack
 }
 

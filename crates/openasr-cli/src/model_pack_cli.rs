@@ -3,8 +3,137 @@ use std::collections::BTreeMap;
 
 pub(super) fn model_pack_command(command: ModelPackCommand) -> Result<()> {
     match command {
-        ModelPackCommand::Import { command } => import_command(command),
+        ModelPackCommand::Import { command } => import_command(*command),
+        ModelPackCommand::Verify => verify_model_store_command(),
+        ModelPackCommand::Usage => model_store_usage_command(),
+        ModelPackCommand::Gc { dry_run } => model_store_gc_command(dry_run),
     }
+}
+
+/// Render a byte count the way the rest of the CLI's size output reads.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn verify_model_store_command() -> Result<()> {
+    let home = openasr_home()?;
+    let verification = openasr_core::verify_model_store(&home)?;
+    if verification.checked.is_empty() {
+        println!(
+            "No models installed in {}",
+            verification.models_dir.display()
+        );
+        return Ok(());
+    }
+    for check in &verification.checked {
+        match &check.failure {
+            None => println!("ok\t{}\t{}", check.pull, check.digest),
+            Some(reason) => println!("FAIL\t{}\t{}\t{reason}", check.pull, check.digest),
+        }
+    }
+    let failed = verification.failures().count();
+    if failed > 0 {
+        // Fail closed: a corrupt or missing object is a real fault, and a zero
+        // exit here would let a script conclude the store is healthy.
+        bail!(
+            "{failed} of {} installed pack(s) failed verification",
+            verification.checked.len()
+        );
+    }
+    println!(
+        "{} pack(s) verified in {}",
+        verification.checked.len(),
+        verification.models_dir.display()
+    );
+    Ok(())
+}
+
+fn model_store_usage_command() -> Result<()> {
+    let home = openasr_home()?;
+    let usage = openasr_core::model_store_usage(&home)?;
+    println!("Storage root: {}", usage.models_dir.display());
+    for entry in &usage.entries {
+        println!("{}\t{}", entry.pull, human_bytes(entry.size_bytes));
+    }
+    println!(
+        "Installed content: {} in {} object(s)",
+        human_bytes(usage.objects_total_bytes),
+        usage.objects_count
+    );
+    if usage.orphan_object_count > 0 {
+        println!(
+            "Unreferenced content: {} in {} object(s)",
+            human_bytes(usage.orphan_object_bytes),
+            usage.orphan_object_count
+        );
+    }
+    if usage.dead_staging_count > 0 {
+        println!(
+            "Abandoned installer scratch: {} in {} file(s)",
+            human_bytes(usage.dead_staging_bytes),
+            usage.dead_staging_count
+        );
+    }
+    if usage.legacy_copy_count > 0 {
+        println!(
+            "Not yet converted: {} in {} legacy install(s)",
+            human_bytes(usage.legacy_copy_bytes),
+            usage.legacy_copy_count
+        );
+    }
+    println!("Reclaimable now: {}", human_bytes(usage.reclaimable_bytes));
+    if let Some(reason) = &usage.collection_withheld {
+        println!("Collection currently withheld: {reason}");
+    }
+    Ok(())
+}
+
+fn model_store_gc_command(dry_run: bool) -> Result<()> {
+    let home = openasr_home()?;
+    if dry_run {
+        let usage = openasr_core::model_store_usage(&home)?;
+        println!(
+            "Would reclaim {} ({} unreferenced object(s), {} abandoned scratch file(s))",
+            human_bytes(usage.reclaimable_bytes),
+            usage.orphan_object_count,
+            usage.dead_staging_count
+        );
+        if let Some(reason) = usage.collection_withheld {
+            println!("Collection currently withheld: {reason}");
+        }
+        return Ok(());
+    }
+    let report = openasr_core::collect_model_store_garbage(&home)?;
+    for digest in &report.removed_objects {
+        println!("removed object\t{digest}");
+    }
+    for path in &report.removed_staging {
+        println!("removed scratch\t{}", path.display());
+    }
+    println!("Reclaimed {}", human_bytes(report.freed_bytes));
+    if report.retained_young_orphans > 0 {
+        // Not a failure: the grace period is what keeps collection from racing
+        // an install whose content has landed but whose ref has not.
+        println!(
+            "Kept {} recently written unreferenced object(s); retry later to reclaim them",
+            report.retained_young_orphans
+        );
+    }
+    if let Some(reason) = report.collection_withheld {
+        println!("Content collection skipped: {reason}");
+    }
+    Ok(())
 }
 
 fn import_command(command: ImportCommand) -> Result<()> {
