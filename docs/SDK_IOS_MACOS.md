@@ -244,7 +244,7 @@ OpenAsrStatus openasr_pull_model(const OpenAsrCatalog *catalog,
                                  OpenAsrPullCancelCallback cancel_cb, void *cancel_user_data,
                                  char **out_installed_json);   // free with openasr_string_free
 
-// Install a .oasr already on disk (catalog digest match when present; else pack identity + preflight).
+// Verify + install a .oasr the app already has on disk (sha256/size must match catalog).
 OpenAsrStatus openasr_install_local_pack(const OpenAsrCatalog *catalog, const char *oasr_path,
                                          const char *home_dir,
                                          OpenAsrPullProgressCallback progress_cb, void *progress_user_data,

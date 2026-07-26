@@ -652,31 +652,26 @@ fn pull_installs_valid_pack_and_writes_record() {
 }
 
 #[test]
-fn install_catalog_model_pack_from_path_accepts_uncatalogued_pack_via_filename_identity() {
-    // Pack bytes that do not match any public catalog digest must still install
-    // when the .oasr passes runtime preflight. Identity comes from the pack /
-    // filename (here `moonshine-tiny-q8_0.oasr` -> model moonshine-tiny, quant q8_0).
+fn install_catalog_model_pack_from_path_requires_signed_catalog_digest_match() {
     let bytes = tiny_pack_bytes();
     let mut resolved = resolved_for(&bytes);
     resolved.sha256 = "b".repeat(64);
-    resolved.size_bytes = bytes.len() as u64 + 1;
     let catalog = catalog_for_resolved(&resolved);
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("moonshine-tiny-q8_0.oasr");
-    fs::write(&source_path, &bytes).unwrap();
+    fs::write(&source_path, bytes).unwrap();
 
-    let installed =
-        install_catalog_model_pack_from_path(&catalog, &source_path, temp.path(), |_| {}).unwrap();
+    let error = install_catalog_model_pack_from_path(&catalog, &source_path, temp.path(), |_| {})
+        .unwrap_err();
 
-    assert_eq!(installed.model_id, "moonshine-tiny");
-    assert_eq!(canonical_quant_tag(&installed.quant), "q8_0");
-    assert_eq!(installed.pull, "moonshine-tiny:q8");
-    assert_eq!(installed.source.as_deref(), Some("local"));
-    assert_eq!(installed.url, "");
-    assert_eq!(installed.hf_revision, "local");
-    assert_eq!(installed.sha256, sha256_hex(&bytes));
-    assert_eq!(installed.size_bytes, bytes.len() as u64);
-    assert_eq!(list_installed_packs(temp.path()).unwrap().len(), 1);
+    assert!(matches!(
+        error,
+        PullError::InvalidTarget {
+            field: "sha256",
+            ..
+        }
+    ));
+    assert!(list_installed_packs(temp.path()).unwrap().is_empty());
 }
 
 #[test]
