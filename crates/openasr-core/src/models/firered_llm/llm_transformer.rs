@@ -242,6 +242,7 @@ impl FireRedLlmDecoderRuntime {
         &mut self,
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+        control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     ) -> Result<Vec<f32>, FireRedLlmDecoderError> {
         let token_count = prompt_embeddings.token_count;
         if let Some(final_hidden) = self
@@ -251,6 +252,7 @@ impl FireRedLlmDecoderRuntime {
                 token_count,
                 layer_kv_caches,
                 FIRERED_LLM_ROPE_THETA,
+                control,
             )
             .map_err(|error| FireRedLlmDecoderError::GraphFailed {
                 reason: error.to_string(),

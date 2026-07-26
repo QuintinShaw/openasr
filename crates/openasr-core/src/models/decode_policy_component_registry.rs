@@ -410,6 +410,7 @@ pub(crate) fn resolve_builtin_decode_policy(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_builtin_seq2seq_decode_policy<E>(
     decode_policy_id: &str,
     config_input: &BuiltinSeq2SeqDecodePolicyConfigInput,
@@ -420,6 +421,7 @@ pub(crate) fn run_builtin_seq2seq_decode_policy<E>(
     map_token_decoder_error_to_shared: fn(E) -> Seq2SeqGreedyDecodeError,
     map_shared_error_to_family: fn(Seq2SeqGreedyDecodeError) -> E,
     map_registry_error: fn(BuiltinDecodePolicyComponentRegistryError) -> E,
+    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<Seq2SeqGreedyDecodeResult, E> {
     let descriptor = resolve_builtin_decode_policy(decode_policy_id).map_err(map_registry_error)?;
     let config = build_builtin_seq2seq_decode_policy_config(
@@ -454,6 +456,7 @@ pub(crate) fn run_builtin_seq2seq_decode_policy<E>(
                 &normalize_text,
                 &mut trace_token,
                 &mut on_topk,
+                control,
             )
         }
         // Fail closed: a CTC policy must never route through the seq2seq loop.
@@ -1121,6 +1124,7 @@ mod tests {
             |error| Seq2SeqGreedyDecodeError::TokenizerDecodeFailed { reason: error },
             |error| error.to_string(),
             |error| error.to_string(),
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect("decode policy dispatch");
 
@@ -1165,6 +1169,7 @@ mod tests {
             |error| Seq2SeqGreedyDecodeError::TokenizerDecodeFailed { reason: error },
             |error| error.to_string(),
             |error| error.to_string(),
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect("decode policy dispatch");
 
@@ -1214,6 +1219,7 @@ mod tests {
             |error| Seq2SeqGreedyDecodeError::TokenizerDecodeFailed { reason: error },
             |error| error.to_string(),
             |error| error.to_string(),
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect("decode policy dispatch");
 

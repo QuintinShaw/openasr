@@ -559,6 +559,11 @@ impl Hymt2Runtime {
                 &parts.prompt_tokens,
                 self.metadata.vocab_size,
                 max_output_tokens,
+                // Subtitle-clause translation has no client-visible request id
+                // or cancel surface today (unlike file transcription) -- a
+                // detached control is a real, well-formed one that simply has
+                // no other holder.
+                &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
             )?;
             let decode = decode_started_at.elapsed();
             (first_step_logits, generated_tokens, text, prefill, decode)
@@ -694,6 +699,7 @@ impl Hymt2Runtime {
             &prompt_tokens,
             self.metadata.vocab_size,
             max_output_tokens,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )?;
         let decode = decode_started_at.elapsed();
         let generated_token_count = generated_tokens.len();
@@ -979,6 +985,10 @@ impl Hymt2GreedyStepper<'_> {
                         1,
                         max_positions,
                         self.metadata.rope_freq_base,
+                        // Subtitle-clause translation has no client-visible
+                        // request id or cancel surface today -- see
+                        // `run_hymt2_shared_greedy_decode`'s callers.
+                        &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
                     )
                     .map_err(|source| Hymt2RuntimeError::Graph { source })?;
                 hymt2_profile_log_step("prefill_resident_full", None, token_count, &step);
@@ -1722,6 +1732,7 @@ fn map_registry_error_to_hymt2(
 /// degenerate-loop guard. Reaching `max_output_tokens` before a stop token is
 /// hymt2's expected truncation outcome, so the driver's no-EOT error is
 /// degraded to the generated prefix here instead of failing the clause.
+#[allow(clippy::too_many_arguments)]
 fn run_hymt2_shared_greedy_decode(
     first_step_logits: Vec<f32>,
     next_token_id: &mut dyn FnMut(&[u32]) -> Result<u32, Hymt2RuntimeError>,
@@ -1729,6 +1740,7 @@ fn run_hymt2_shared_greedy_decode(
     prompt_tokens: &[u32],
     vocab_size: usize,
     max_output_tokens: usize,
+    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<(Vec<u32>, String), Hymt2RuntimeError> {
     let mut step_executor = Hymt2SharedGreedyStepExecutor {
         pending_first_step_logits: Some(first_step_logits),
@@ -1755,6 +1767,7 @@ fn run_hymt2_shared_greedy_decode(
         map_hymt2_family_error_to_shared,
         map_shared_error_to_hymt2,
         map_registry_error_to_hymt2,
+        control,
     ) {
         Ok(result) => Ok((result.generated_tokens, result.text)),
         Err(Hymt2SharedDecodeError::Truncated { generated_tokens }) => {
@@ -2000,6 +2013,7 @@ mod tests {
             &[42, 43],
             SHARED_DECODE_TEST_VOCAB,
             8,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect("shared decode");
 
@@ -2019,6 +2033,7 @@ mod tests {
             &[42],
             SHARED_DECODE_TEST_VOCAB,
             8,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect("shared decode");
 
@@ -2041,6 +2056,7 @@ mod tests {
             &[42],
             SHARED_DECODE_TEST_VOCAB,
             3,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect("shared decode");
 
@@ -2061,6 +2077,7 @@ mod tests {
             &[42],
             SHARED_DECODE_TEST_VOCAB,
             10,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect("shared decode");
 
@@ -2082,6 +2099,7 @@ mod tests {
             &[42],
             SHARED_DECODE_TEST_VOCAB,
             8,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect_err("step failure must surface");
 

@@ -199,6 +199,11 @@ where
             prepared_audio: audio.clone(),
             request_options,
             backend_preference,
+            // Per-frame streaming partials/finals have no client-visible
+            // transcription id and no cancel/pause control surface today -- a
+            // detached context is a real, well-formed context that simply has
+            // no other holder, not an omitted one.
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
         }
     };
 

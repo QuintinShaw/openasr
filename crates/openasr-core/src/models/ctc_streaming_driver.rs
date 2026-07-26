@@ -70,6 +70,12 @@ where
         prepared_audio: audio.clone(),
         request_options: request_options.clone(),
         backend_preference,
+        // Per-frame streaming partials/finals have no client-visible
+        // transcription id and no cancel/pause control surface today (a live
+        // session ends by the caller dropping it, not by canceling a
+        // transcription id) -- a detached context is a real, well-formed
+        // context that simply has no other holder, not an omitted one.
+        execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
     };
 
     let partial_executor = executor.clone();
@@ -99,6 +105,7 @@ where
         prepared_audio: audio.clone(),
         request_options: request_options.clone(),
         backend_preference,
+        execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
     };
     let final_transcribe = Box::new(move |audio: &GgmlAsrPreparedAudio| {
         let _thread_override = install_request_inference_threads_override(inference_threads);

@@ -72,13 +72,13 @@ pub(super) struct Qwen3AsrServeBatchJob {
     pub text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind,
     pub word_timestamps: bool,
     pub audio_duration_seconds: f32,
-    /// Submit-thread capture of the active transcription control.
-    ///
-    /// Serve-batch prefill runs on the owner thread, which never installs the
-    /// request's thread-local control. The submit path snapshots
-    /// `current_transcription_control()` into this field so chunk-boundary
-    /// polls observe the same `Arc` the HTTP cancel handler flips.
-    pub control: Option<Arc<crate::TranscriptionControl>>,
+    /// Explicit cancel/pause/resume context for this job -- never a
+    /// thread-local. Serve-batch prefill runs on the owner thread, which is
+    /// not the thread that submitted the request, so this `Arc` (captured at
+    /// submit time and carried on the job itself) is the only way
+    /// chunk-boundary polls can observe the same cancel flag the HTTP cancel
+    /// handler flips. See [`crate::RequestExecutionContext`].
+    pub execution_context: Arc<crate::RequestExecutionContext>,
 }
 
 #[derive(Debug, Error)]
@@ -129,16 +129,17 @@ impl Qwen3AsrServeBatchError {
     }
 }
 
-/// Poll a job-carried transcription control at a serve-batch prefill chunk
+/// Poll a job-carried execution context at a serve-batch prefill chunk
 /// boundary. Typed `Canceled` keeps cancel off the generic decode-failed path.
 ///
-/// Must read the `Arc` snapped into [`Qwen3AsrServeBatchJob::control`] at
-/// submit time -- the owner thread has no thread-local install, so
-/// `current_transcription_control()` is always `None` here in production.
+/// Must read the `Arc` snapped into [`Qwen3AsrServeBatchJob::execution_context`]
+/// at submit time -- the owner thread never installs a thread-local for the
+/// submitting request, so this explicit context is the only production
+/// signal.
 fn ensure_serve_batch_prefill_not_canceled(
-    control: Option<&Arc<crate::TranscriptionControl>>,
+    context: &crate::RequestExecutionContext,
 ) -> Result<(), Qwen3AsrServeBatchError> {
-    if control.is_some_and(|control| control.is_canceled()) {
+    if context.is_canceled() {
         return Err(Qwen3AsrServeBatchError::Canceled);
     }
     Ok(())
@@ -909,7 +910,7 @@ impl Qwen3AsrOwnerThreadState {
             // aborts the shared chunk (existing all-or-nothing group model).
             for &entry_index in group {
                 ensure_serve_batch_prefill_not_canceled(
-                    entries[entry_index].slot.job.control.as_ref(),
+                    &entries[entry_index].slot.job.execution_context,
                 )?;
             }
             let remaining = token_count - position_offset;
@@ -1616,7 +1617,7 @@ impl Qwen3AsrBatchSlot {
         let mut final_hidden = None;
         while position_offset < token_count {
             // L1.2 cooperative cancel between single-slot host-cache chunks.
-            ensure_serve_batch_prefill_not_canceled(self.job.control.as_ref())?;
+            ensure_serve_batch_prefill_not_canceled(&self.job.execution_context)?;
             let remaining = token_count - position_offset;
             let chunk_len = if require_even_chunks {
                 super::even_prefill_chunk_len(remaining, chunk_size)
@@ -1682,7 +1683,7 @@ impl Qwen3AsrBatchSlot {
         for token_position in 0..token_count {
             // Serial host-step prefill is the chunk-size-1 fallback; poll the
             // same cancel boundary so cancel does not wait for the full prompt.
-            ensure_serve_batch_prefill_not_canceled(self.job.control.as_ref())?;
+            ensure_serve_batch_prefill_not_canceled(&self.job.execution_context)?;
             let hidden = self.prefill_prompt_hidden_at(token_position)?;
             let step = decoder
                 .run_step(
@@ -2140,6 +2141,23 @@ mod tests {
             None
         );
     }
+    /// Structural proof that `Qwen3AsrServeBatchJob::execution_context` is
+    /// required, not optional: this only compiles because the field's type
+    /// is the concrete `Arc<RequestExecutionContext>`. Never called; exists
+    /// purely so `cargo check`/`clippy` re-verify the contract on every
+    /// build -- this is exactly the shape Qwen converged *to* (it used to be
+    /// `control: Option<Arc<TranscriptionControl>>`).
+    #[allow(dead_code)]
+    fn require_concrete_execution_context(_: Arc<crate::RequestExecutionContext>) {}
+
+    #[allow(dead_code)]
+    fn assert_qwen_serve_batch_job_requires_execution_context(job: Qwen3AsrServeBatchJob) {
+        let Qwen3AsrServeBatchJob {
+            execution_context, ..
+        } = job;
+        require_concrete_execution_context(execution_context);
+    }
+
     const QWEN_PREFILL_REAL_PACK_ENV: &str = "OPENASR_QWEN_PREFILL_REAL_PACK";
 
     struct Qwen3AsrServeBatchFixture {
@@ -2375,7 +2393,7 @@ mod tests {
             text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
             word_timestamps: false,
             audio_duration_seconds: 1.0,
-            control: None,
+            execution_context: Arc::new(crate::RequestExecutionContext::detached()),
         }
     }
 
@@ -2761,18 +2779,14 @@ mod tests {
 
     #[test]
     fn serve_batch_prefill_cancel_poll_returns_typed_canceled() {
-        use std::sync::Arc;
-
-        use crate::api::backend::TranscriptionControl;
+        use crate::RequestExecutionContext;
         use crate::ggml_runtime::GgmlCpuGraphError;
 
-        assert!(super::ensure_serve_batch_prefill_not_canceled(None).is_ok());
-
-        let control = Arc::new(TranscriptionControl::new());
-        assert!(super::ensure_serve_batch_prefill_not_canceled(Some(&control)).is_ok());
-        control.request_cancel();
+        let context = RequestExecutionContext::detached();
+        assert!(super::ensure_serve_batch_prefill_not_canceled(&context).is_ok());
+        context.control.request_cancel();
         assert!(matches!(
-            super::ensure_serve_batch_prefill_not_canceled(Some(&control)),
+            super::ensure_serve_batch_prefill_not_canceled(&context),
             Err(Qwen3AsrServeBatchError::Canceled)
         ));
         assert!(matches!(
@@ -2793,19 +2807,18 @@ mod tests {
 
     #[test]
     fn serve_batch_prefill_chunk_loop_harness_stops_between_chunks_on_cancel() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use crate::api::backend::TranscriptionControl;
+        use crate::RequestExecutionContext;
 
-        let control = Arc::new(TranscriptionControl::new());
+        let context = RequestExecutionContext::detached();
         let chunks_run = AtomicUsize::new(0);
         let token_count = 10usize;
         let chunk_size = 3usize;
         let mut position_offset = 0usize;
         let mut canceled = false;
         while position_offset < token_count {
-            if let Err(error) = super::ensure_serve_batch_prefill_not_canceled(Some(&control)) {
+            if let Err(error) = super::ensure_serve_batch_prefill_not_canceled(&context) {
                 assert!(matches!(error, Qwen3AsrServeBatchError::Canceled));
                 canceled = true;
                 break;
@@ -2813,7 +2826,7 @@ mod tests {
             let chunk_len = (token_count - position_offset).min(chunk_size);
             let seen = chunks_run.fetch_add(1, Ordering::SeqCst) + 1;
             if seen == 2 {
-                control.request_cancel();
+                context.control.request_cancel();
             }
             position_offset = position_offset.saturating_add(chunk_len);
         }
@@ -2822,56 +2835,39 @@ mod tests {
         assert!(position_offset < token_count);
     }
 
-    /// Production cancel must travel via the job-carried Arc: the owner thread
-    /// never installs the submitter's thread-local TranscriptionControl.
+    /// Production cancel must travel via the job-carried `Arc`: the owner
+    /// thread never installs anything for the submitting request -- the
+    /// execution context is captured once at submit time and carried
+    /// explicitly on the job, so a cancel flipped from any thread (the HTTP
+    /// handler's thread here) is visible the moment the owner thread reads
+    /// the same `Arc`.
     #[test]
     fn serve_batch_job_control_cancel_visible_on_owner_thread() {
         use std::sync::Arc;
         use std::thread;
 
-        use crate::api::backend::{
-            TranscriptionControl, current_transcription_control,
-            install_active_transcription_control,
-        };
+        use crate::RequestExecutionContext;
+        use crate::api::backend::TranscriptionControl;
 
         let control = Arc::new(TranscriptionControl::new());
-        // Submit-side snapshot while the request worker has TLS installed.
-        let job_control = {
-            let _guard = install_active_transcription_control(Arc::clone(&control));
-            current_transcription_control()
-        };
-        assert!(
-            job_control.is_some(),
-            "submit must capture the active control Arc"
-        );
-        // Guard dropped: submit thread TLS is cleared, matching real request end.
-        assert!(
-            current_transcription_control().is_none(),
-            "TLS must not be the production cancel path for the owner"
-        );
+        let job_context = Arc::new(RequestExecutionContext::new(
+            Some("job-1".to_string()),
+            Arc::clone(&control),
+        ));
+
+        // Submit-side handler cancels from its own thread.
         control.request_cancel();
 
-        // Owner thread: no TLS install; only the job-carried Arc is readable.
+        // Owner thread: no thread-local install of any kind; only the
+        // job-carried `Arc<RequestExecutionContext>` is readable.
+        let owner_context = Arc::clone(&job_context);
         let owner = thread::spawn(move || {
             assert!(
-                current_transcription_control().is_none(),
-                "owner thread must not see submit-thread TLS"
-            );
-            // TLS-only poll (the rejected pattern) stays green even after cancel.
-            assert!(
-                super::ensure_serve_batch_prefill_not_canceled(
-                    current_transcription_control().as_ref()
-                )
-                .is_ok(),
-                "TLS poll on owner is a false-green path"
-            );
-            // Job-carried Arc observes the cancel flipped on the other thread.
-            assert!(
                 matches!(
-                    super::ensure_serve_batch_prefill_not_canceled(job_control.as_ref()),
+                    super::ensure_serve_batch_prefill_not_canceled(&owner_context),
                     Err(Qwen3AsrServeBatchError::Canceled)
                 ),
-                "job-carried control must surface cancel across threads"
+                "job-carried execution context must surface cancel across threads"
             );
         });
         owner.join().expect("owner thread");

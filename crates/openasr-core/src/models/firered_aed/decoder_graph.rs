@@ -817,6 +817,7 @@ pub(crate) fn run_firered_aed_decoder_greedy_with_runtime(
     encoder_rows: &[f32],
     encoder_frame_count: usize,
     decode_text: impl Fn(&[u32]) -> Result<String, String>,
+    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<FireRedAedGreedyDecodeOutput, FireRedDecoderError> {
     runtime.populate_cross_attention_cache(encoder_rows, encoder_frame_count)?;
 
@@ -846,6 +847,7 @@ pub(crate) fn run_firered_aed_decoder_greedy_with_runtime(
         |error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
             reason: error.to_string(),
         },
+        control,
     ) {
         Ok(output) => output,
         // Budget exhausted before `<eos>`: keep the generated prefix and

@@ -245,6 +245,7 @@ impl MossTdDecoderRuntime {
         &mut self,
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+        control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     ) -> Result<MossTdPrefillOutput, MossTdDecoderError> {
         let token_count = prompt_embeddings.token_count;
         // On a backend with persistent decode-graph reuse (Metal/single-GPU),
@@ -262,6 +263,7 @@ impl MossTdDecoderRuntime {
                 token_count,
                 layer_kv_caches,
                 MOSS_TD_ROPE_THETA,
+                control,
             )
             .map_err(|error| MossTdDecoderError::GraphFailed {
                 reason: error.to_string(),

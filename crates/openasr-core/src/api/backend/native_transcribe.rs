@@ -415,6 +415,7 @@ fn run_dispatch_once_with_progress(
     chunk: Vec<f32>,
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
+    execution_context: &Arc<crate::RequestExecutionContext>,
     decode_progress: &mut DecodeProgress,
     slice_samples: u64,
 ) -> Result<GgmlAsrExecutionResult, BackendError> {
@@ -437,6 +438,7 @@ fn run_dispatch_once_with_progress(
         chunk,
         request_options,
         backend_preference,
+        execution_context,
     )?;
     decode_progress.complete_slice(slice_samples);
     Ok(result)
@@ -577,6 +579,7 @@ fn run_dispatch_once_with_progress_and_gpu_fallback(
     chunk: Vec<f32>,
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
+    execution_context: &Arc<crate::RequestExecutionContext>,
     decode_progress: &mut DecodeProgress,
     slice_samples: u64,
     slice_label: &str,
@@ -599,6 +602,7 @@ fn run_dispatch_once_with_progress_and_gpu_fallback(
             chunk,
             request_options,
             effective_preference,
+            execution_context,
             decode_progress,
             slice_samples,
         )?;
@@ -613,6 +617,7 @@ fn run_dispatch_once_with_progress_and_gpu_fallback(
         chunk.clone(),
         request_options.clone(),
         effective_preference,
+        execution_context,
         decode_progress,
         slice_samples,
     ) {
@@ -652,6 +657,7 @@ fn run_dispatch_once_with_progress_and_gpu_fallback(
                 chunk,
                 request_options,
                 GgmlAsrBackendPreference::CpuOnly,
+                execution_context,
                 decode_progress,
                 slice_samples,
             )?;
@@ -1040,6 +1046,10 @@ fn assign_aligned_words_to_segments(segments: &mut [Segment], items: &[ForcedAli
 fn run_native_transcription_impl(
     mut request: TranscriptionRequest,
 ) -> Result<Transcription, BackendError> {
+    // Captured up front and threaded explicitly through the dispatch calls
+    // below (never a thread-local): every cooperative cancel checkpoint in
+    // this function and the shared decode driver reads this same `Arc`.
+    let execution_context = Arc::clone(&request.execution_context);
     // Taken up front (before `requested_model_id` below borrows `request` for
     // the rest of this function): leaves `request.prepared_samples` as
     // `None` and hands `resolve_prepared_audio_samples` the only `Arc`
@@ -1328,16 +1338,15 @@ fn run_native_transcription_impl(
                 .sum();
             let mut decode_progress = DecodeProgress::begin(total_decode_samples, with_align);
             // In-session pause/cancel control for this in-flight transcription,
-            // bound to this decode thread by the caller (see
-            // `install_active_transcription_control`). Checked at each slice
-            // boundary (L0): a cancel unwinds cleanly with `TranscriptionCanceled`
-            // (dropping the assembler and progress guard), and a pause blocks the
-            // worker here until resume or cancel. The shared seq2seq greedy driver
-            // also polls cancel at each token step (L1) so cancel does not wait
-            // for the end of a long slice. Absent (CLI / no control registered)
-            // leaves the decode byte-identical to before.
-            let transcription_control =
-                super::transcription_control::current_transcription_control();
+            // carried explicitly on `request.execution_context` (never a
+            // thread-local). Checked at each slice boundary (L0): a cancel
+            // unwinds cleanly with `TranscriptionCanceled` (dropping the
+            // assembler and progress guard), and a pause blocks the worker here
+            // until resume or cancel. The shared seq2seq greedy driver also
+            // polls cancel at each token step (L1) so cancel does not wait for
+            // the end of a long slice. A detached context (CLI / no control
+            // registered) never trips either check, leaving the decode
+            // byte-identical to before.
             let mut slice_index = 0usize;
             // Issue #158: per-slice GPU-class compute-buffer allocation
             // fallback state, persisted across the whole slice loop (see
@@ -1345,9 +1354,8 @@ fn run_native_transcription_impl(
             let mut gpu_fallback_tracker = GpuAllocationFallbackTracker::default();
             let mut degraded_slice_fallbacks: Vec<(usize, SliceGpuFallback)> = Vec::new();
             for slice in plan.slices {
-                if let Some(control) = &transcription_control
-                    && control.wait_at_slice_boundary()
-                        == super::transcription_control::SliceBoundaryControl::Canceled
+                if execution_context.control.wait_at_slice_boundary()
+                    == super::transcription_control::SliceBoundaryControl::Canceled
                 {
                     return Err(BackendError::TranscriptionCanceled);
                 }
@@ -1402,6 +1410,7 @@ fn run_native_transcription_impl(
                         chunk,
                         slice_options,
                         backend_preference,
+                        &execution_context,
                         &mut decode_progress,
                         slice_samples,
                         &format!("index={slice_index}"),
@@ -1517,6 +1526,7 @@ fn run_native_transcription_impl(
                     prepared_audio.clone(),
                     fallback_options,
                     backend_preference,
+                    &execution_context,
                 )?;
                 return Ok(finalize_native_transcription(
                     fallback.into_transcription(),
@@ -1572,6 +1582,7 @@ fn run_native_transcription_impl(
         prepared_audio,
         request_options,
         backend_preference,
+        &execution_context,
         &mut single_pass_decode_progress,
         single_pass_total_samples,
         "single-pass",
@@ -2192,17 +2203,18 @@ fn map_family_selection_error(error: GgmlFamilyRegistrySelectionError) -> Backen
     }
 }
 
-fn dispatch_error_to_backend(error: GgmlAsrExecutionError) -> BackendError {
+fn dispatch_error_to_backend(
+    error: GgmlAsrExecutionError,
+    execution_context: &crate::RequestExecutionContext,
+) -> BackendError {
     // L1 cooperative cancel (token-loop) and L0 slice cancel both leave the
     // active control flagged. Prefer the typed cancel surface over a generic
     // fail-closed reason so CLI/native and server agree on
     // `BackendError::TranscriptionCanceled` (HTTP 409). Also recognize the
-    // stable cancel marker embedded in family executor reason strings in case
-    // the thread-local control was already cleared by an outer guard.
-    if super::transcription_control::current_transcription_control()
-        .is_some_and(|control| control.is_canceled())
-        || is_cooperative_cancel_reason(&error.to_string())
-    {
+    // stable cancel marker embedded in family executor reason strings as a
+    // belt-and-suspenders signal for a decode path that stringified a
+    // `Canceled` variant before it reached here.
+    if execution_context.is_canceled() || is_cooperative_cancel_reason(&error.to_string()) {
         return BackendError::TranscriptionCanceled;
     }
     match error {
@@ -2257,6 +2269,7 @@ fn run_dispatch_once(
     samples: Vec<f32>,
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
+    execution_context: &Arc<crate::RequestExecutionContext>,
 ) -> Result<GgmlAsrExecutionResult, BackendError> {
     let execution_request = GgmlAsrExecutionRequest {
         runtime_source_path: runtime_preflight.runtime_source.path().to_path_buf(),
@@ -2265,13 +2278,14 @@ fn run_dispatch_once(
         prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
         request_options,
         backend_preference,
+        execution_context: Arc::clone(execution_context),
     };
     let _thread_override = install_request_inference_threads_override(
         execution_request.request_options.inference_threads,
     );
     let result = dispatch
         .execute(&execution_request)
-        .map_err(dispatch_error_to_backend)?;
+        .map_err(|error| dispatch_error_to_backend(error, execution_context))?;
     Ok(result)
 }
 
@@ -2589,6 +2603,10 @@ mod tests {
     use super::*;
     use crate::GgmlAsrExecutor;
     use std::sync::Mutex;
+
+    fn detached_execution_context() -> Arc<crate::RequestExecutionContext> {
+        Arc::new(crate::RequestExecutionContext::detached())
+    }
 
     // The tests in this module that exercise `native_transcription_progress`
     // manipulate the real process-global progress statics (that is the point --
@@ -4180,6 +4198,7 @@ mod tests {
             vec![0.0; 1_000],
             GgmlAsrExecutionOptions::default(),
             GgmlAsrBackendPreference::Auto,
+            &detached_execution_context(),
             &mut decode_progress,
             1_000,
             "index=1",
@@ -4221,6 +4240,7 @@ mod tests {
             vec![0.0; 1_000],
             GgmlAsrExecutionOptions::default(),
             GgmlAsrBackendPreference::Auto,
+            &detached_execution_context(),
             &mut decode_progress,
             1_000,
             "index=1",
@@ -4285,6 +4305,7 @@ mod tests {
             vec![0.0; 1_000],
             GgmlAsrExecutionOptions::default(),
             GgmlAsrBackendPreference::CpuOnly,
+            &detached_execution_context(),
             &mut decode_progress,
             1_000,
             "index=1",
@@ -4322,6 +4343,7 @@ mod tests {
                 vec![0.0; 1_000],
                 GgmlAsrExecutionOptions::default(),
                 GgmlAsrBackendPreference::Auto,
+                &detached_execution_context(),
                 &mut decode_progress,
                 1_000,
                 &format!("index={slice_index}"),

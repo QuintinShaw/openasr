@@ -149,6 +149,9 @@ struct MossTdGreedyStepExecutor<'a> {
     layer_kv_caches: Vec<Qwen3AsrLayerKvCacheState>,
     prompt_embeddings: Option<Qwen3AsrPromptEmbeddings>,
     cache_prompt_tokens: usize,
+    /// Explicit cancel/pause/resume control for this decode -- never a
+    /// thread-local. See [`crate::RequestExecutionContext`].
+    control: std::sync::Arc<crate::api::backend::TranscriptionControl>,
 }
 
 impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
@@ -160,7 +163,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for MossTdGreedyStepExecutor<'_> {
             self.cache_prompt_tokens = prompt_embeddings.token_count;
             let prefill = self
                 .decoder
-                .prefill(&prompt_embeddings, &mut self.layer_kv_caches)
+                .prefill(&prompt_embeddings, &mut self.layer_kv_caches, &self.control)
                 .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: error.to_string(),
                 })?;
@@ -500,6 +503,7 @@ fn encode_moss_td_chunks_with_cached_runtime(
 /// (`MossTdDecoderRuntime::new_kv_caches`) -- unlike firered-aed's decoder,
 /// this family's `MossTdDecoderRuntime` carries no cross-request KV state of
 /// its own between calls, so no cache-reset step is needed before reuse.
+#[allow(clippy::too_many_arguments)]
 fn run_moss_td_decoder_with_cached_runtime(
     runtime_path: &Path,
     decoder_metadata: MossTdDecoderMetadata,
@@ -509,6 +513,7 @@ fn run_moss_td_decoder_with_cached_runtime(
     audio_pad_positions: &[usize],
     audio_rows: &[f32],
     tokenizer: &MossTdTokenizer,
+    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<String, MossTdExecutorError> {
     let key = (
         runtime_cache_path_identity(runtime_path),
@@ -571,6 +576,7 @@ fn run_moss_td_decoder_with_cached_runtime(
                 layer_kv_caches,
                 prompt_embeddings: Some(prompt_embeddings),
                 cache_prompt_tokens: 0,
+                control: std::sync::Arc::clone(control),
             };
             let config = BuiltinSeq2SeqDecodePolicyConfigInput {
                 initial_prompt_tokens: decode_prompt_token_ids.to_vec(),
@@ -594,6 +600,7 @@ fn run_moss_td_decoder_with_cached_runtime(
                 |error: Seq2SeqGreedyDecodeError| error,
                 |error: Seq2SeqGreedyDecodeError| error,
                 map_registry_error,
+                control,
             );
             // Release this request's per-token grow-to-fit host buffer before
             // the runtime goes back into the cache (mirrors qwen3-asr's
@@ -755,6 +762,7 @@ impl MossTdGgmlExecutor {
             &decode_prompt.audio_pad_positions,
             &audio_rows,
             &tokenizer,
+            &request.execution_context.control,
         )?;
         // Parse the model's own inline `[start][end][SNN]` markup into real
         // speaker segments, degrading fail-closed to the single speaker-less
@@ -968,6 +976,7 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
         };
 
         let executor = MossTdGgmlExecutor;
@@ -1013,6 +1022,7 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
         };
         let executor = MossTdGgmlExecutor;
         let result = executor.execute(&request).expect("moss-td transcribe");

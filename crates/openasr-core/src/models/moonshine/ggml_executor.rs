@@ -176,6 +176,7 @@ impl MoonshineGgmlExecutor {
                     decode_config,
                     word_timestamps: request.request_options.word_timestamps,
                     audio_duration_seconds: audio_duration,
+                    execution_context: Arc::clone(&request.execution_context),
                 },
             )
             .map_err(|error| match error.unavailable_retryable() {
@@ -199,6 +200,7 @@ impl MoonshineGgmlExecutor {
                     request.request_options.word_timestamps,
                     audio_duration,
                     adapter_ref,
+                    &request.execution_context.control,
                 )
                 .map_err(map_decoder_error)?
             };

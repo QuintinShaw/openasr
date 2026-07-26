@@ -166,6 +166,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     audio_duration_seconds: f32,
+    control: &Arc<crate::TranscriptionControl>,
 ) -> Result<CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
     let mut step_executor =
         CohereDecoderGraphStepExecutor::from_runtime(decoder_runtime, encoder_output)?;
@@ -190,6 +191,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
         phrase_bias,
         &mut step_executor,
         &decode_text_token_ids,
+        control,
     ) {
         Ok(output) => output,
         Err(CohereTranscribeGreedyDecodeError::EotNotReachedBeforeMaxTokens {

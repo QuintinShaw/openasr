@@ -26,6 +26,7 @@
 
 use std::cell::RefCell;
 use std::path::Path;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -110,6 +111,7 @@ fn decode_with_cached_runtime(
     encoder_rows: &[f32],
     encoder_frame_count: usize,
     decode_text: impl Fn(&[u32]) -> Result<String, String>,
+    control: &Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<
     super::decoder_graph::FireRedAedGreedyDecodeOutput,
     super::decoder_graph::FireRedDecoderError,
@@ -130,6 +132,7 @@ fn decode_with_cached_runtime(
                 encoder_rows,
                 encoder_frame_count,
                 &decode_text,
+                control,
             )
         },
     )
@@ -281,6 +284,7 @@ impl FireRedAedGgmlExecutor {
             &encoder_output.rows,
             encoder_output.frame_count,
             |ids| tokenizer.decode(ids).map_err(|error| error.to_string()),
+            &request.execution_context.control,
         )
         .map_err(|error| FireRedAedExecutorError::DecoderFailed {
             reason: error.to_string(),
@@ -412,6 +416,7 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
         };
 
         let executor = FireRedAedGgmlExecutor;
@@ -466,6 +471,7 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples.clone()),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
         };
         let executor = FireRedAedGgmlExecutor;
 
@@ -521,6 +527,7 @@ mod tests {
                 prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
                 request_options: Default::default(),
                 backend_preference: GgmlAsrBackendPreference::CpuOnly,
+                execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
             }
         };
         let executor = FireRedAedGgmlExecutor;
@@ -592,6 +599,7 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
         };
         let executor = FireRedAedGgmlExecutor;
         let error = executor
@@ -648,6 +656,7 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
         };
         let executor = FireRedAedGgmlExecutor;
         let result = executor

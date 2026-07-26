@@ -23,8 +23,8 @@ use crate::models::seq2seq_greedy_decode::{
 #[cfg(test)]
 use crate::models::seq2seq_serve_batch::{Envelope, OwnerThreadState};
 use crate::models::seq2seq_serve_batch::{
-    Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig, ServeBatchEngine,
-    serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
+    SERVE_BATCH_CANCEL_REASON, Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig,
+    ServeBatchEngine, serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
@@ -88,6 +88,9 @@ pub(crate) struct CohereServeBatchJob {
     pub word_timestamps: bool,
     pub audio_duration_seconds: f32,
     pub prefer_cpu_backend: bool,
+    /// Explicit cancel/pause/resume context for this job -- never a
+    /// thread-local. See [`crate::RequestExecutionContext`].
+    pub execution_context: Arc<crate::RequestExecutionContext>,
 }
 
 #[derive(Debug, Error)]
@@ -377,6 +380,15 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
             if slot.done {
                 break;
             }
+            // Cooperative cancel at each token step, mirroring the shared
+            // greedy driver's L1 check: this serial path bypasses that driver
+            // (a hand-rolled loop ported verbatim, same as whisper's), so it
+            // needs its own check against the job's own context.
+            if slot.job.execution_context.control.is_canceled() {
+                return Err(CohereServeBatchError::DecodeFailed {
+                    reason: SERVE_BATCH_CANCEL_REASON.to_string(),
+                });
+            }
             let prefix = slot
                 .job
                 .decode_config
@@ -399,6 +411,10 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
 
     fn owner_failed(reason: String) -> Self::Error {
         CohereServeBatchError::OwnerFailed { reason }
+    }
+
+    fn job_execution_context(job: &Self::Job) -> &Arc<crate::RequestExecutionContext> {
+        &job.execution_context
     }
 
     #[cfg(test)]
@@ -871,6 +887,21 @@ mod tests {
         assert_eq!(argmax(left), argmax(right));
     }
 
+    /// Structural proof that `CohereServeBatchJob::execution_context` is
+    /// required, not optional: this only compiles because the field's type
+    /// is the concrete `Arc<RequestExecutionContext>`. Never called; exists
+    /// purely so `cargo check`/`clippy` re-verify the contract on every build.
+    #[allow(dead_code)]
+    fn require_concrete_execution_context(_: Arc<crate::RequestExecutionContext>) {}
+
+    #[allow(dead_code)]
+    fn assert_cohere_serve_batch_job_requires_execution_context(job: CohereServeBatchJob) {
+        let CohereServeBatchJob {
+            execution_context, ..
+        } = job;
+        require_concrete_execution_context(execution_context);
+    }
+
     fn batch_job(
         runtime_path: &Path,
         backend: GgmlCpuGraphBackend,
@@ -934,6 +965,7 @@ mod tests {
             word_timestamps: false,
             audio_duration_seconds: 1.0,
             prefer_cpu_backend,
+            execution_context: Arc::new(crate::RequestExecutionContext::detached()),
         }
     }
 
@@ -1114,7 +1146,15 @@ mod tests {
                 max_generated_tokens,
             );
             let (reply, reply_rx) = mpsc::channel();
-            (CohereServeBatchEnvelope { job, reply }, reply_rx)
+            let context = Arc::clone(&job.execution_context);
+            (
+                CohereServeBatchEnvelope {
+                    job,
+                    context,
+                    reply,
+                },
+                reply_rx,
+            )
         };
 
         let (initial_fast, initial_fast_rx) = envelope(0.0, 1);
@@ -1205,7 +1245,15 @@ mod tests {
                     max_generated_tokens,
                 );
                 let (reply, reply_rx) = mpsc::channel();
-                (CohereServeBatchEnvelope { job, reply }, reply_rx)
+                let context = Arc::clone(&job.execution_context);
+                (
+                    CohereServeBatchEnvelope {
+                        job,
+                        context,
+                        reply,
+                    },
+                    reply_rx,
+                )
             };
 
             let (initial_fast, initial_fast_rx) = envelope(0.0, 1);
@@ -1286,7 +1334,15 @@ mod tests {
                     max_generated_tokens,
                 );
                 let (reply, reply_rx) = mpsc::channel();
-                (CohereServeBatchEnvelope { job, reply }, reply_rx)
+                let context = Arc::clone(&job.execution_context);
+                (
+                    CohereServeBatchEnvelope {
+                        job,
+                        context,
+                        reply,
+                    },
+                    reply_rx,
+                )
             };
 
             let (initial_fast, initial_fast_rx) = envelope(0.0, 1);
@@ -1374,7 +1430,15 @@ mod tests {
                     max_generated_tokens,
                 );
                 let (reply, reply_rx) = mpsc::channel();
-                (CohereServeBatchEnvelope { job, reply }, reply_rx)
+                let context = Arc::clone(&job.execution_context);
+                (
+                    CohereServeBatchEnvelope {
+                        job,
+                        context,
+                        reply,
+                    },
+                    reply_rx,
+                )
             };
 
             let (initial_fast_a, initial_fast_a_rx) = envelope(0.0, 1);
@@ -1469,7 +1533,15 @@ mod tests {
                     max_generated_tokens,
                 );
                 let (reply, reply_rx) = mpsc::channel();
-                (CohereServeBatchEnvelope { job, reply }, reply_rx)
+                let context = Arc::clone(&job.execution_context);
+                (
+                    CohereServeBatchEnvelope {
+                        job,
+                        context,
+                        reply,
+                    },
+                    reply_rx,
+                )
             };
 
             let (initial_long_a, initial_long_a_rx) = envelope(0.0, 3);
@@ -1559,7 +1631,15 @@ mod tests {
                     max_generated_tokens,
                 );
                 let (reply, reply_rx) = mpsc::channel();
-                (CohereServeBatchEnvelope { job, reply }, reply_rx)
+                let context = Arc::clone(&job.execution_context);
+                (
+                    CohereServeBatchEnvelope {
+                        job,
+                        context,
+                        reply,
+                    },
+                    reply_rx,
+                )
             };
 
             let (initial_fast_a, initial_fast_a_rx) = envelope(0.0, 1);

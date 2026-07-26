@@ -501,9 +501,10 @@ impl Qwen3AsrGgmlExecutor {
                     text_postprocess_kind: decode_policy.seq2seq_text_postprocess_kind,
                     word_timestamps: request.request_options.word_timestamps,
                     audio_duration_seconds: audio_duration_seconds(&request.prepared_audio),
-                    // Owner-thread prefill cannot see this thread's TLS control;
-                    // snapshot the Arc so chunk-boundary polls observe cancel.
-                    control: crate::api::backend::current_transcription_control(),
+                    // Owner-thread prefill cannot see this thread's binding;
+                    // carry the same explicit `Arc` so chunk-boundary polls
+                    // observe cancel regardless of which thread runs them.
+                    execution_context: Arc::clone(&request.execution_context),
                 },
             )
             .map_err(|error| match error.unavailable_retryable() {
@@ -605,6 +606,7 @@ impl Qwen3AsrGgmlExecutor {
             whole_decoder,
             cache_prompt_tokens: 1,
             consumed_prefill_step: false,
+            control: Arc::clone(&request.execution_context.control),
         };
         let decode_text_token_ids = |token_ids: &[u32]| {
             if let Some(tokenizer) = tokenizer {
@@ -627,6 +629,7 @@ impl Qwen3AsrGgmlExecutor {
             request.request_options.phrase_bias.as_ref(),
             &mut step_executor,
             &decode_text_token_ids,
+            &request.execution_context.control,
         );
         qwen_decode_profile_log_opt("greedy_decode_loop", greedy_decode_started_at);
         // Session/slice is done: release the CPU per-token grow-to-fit step
@@ -981,6 +984,9 @@ struct Qwen3AsrPrefillOnlyGreedyStepExecutor {
     whole_decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
     cache_prompt_tokens: usize,
     consumed_prefill_step: bool,
+    /// Explicit cancel/pause/resume control for this decode -- never a
+    /// thread-local. See [`crate::RequestExecutionContext`].
+    control: Arc<crate::api::backend::TranscriptionControl>,
 }
 
 impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor {
@@ -1060,13 +1066,14 @@ impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor {
     }
 }
 
-/// Poll the active transcription control at a host-cache prefill chunk
+/// Poll the request's explicit control at a host-cache prefill chunk
 /// boundary. Distinct from a graph/compute failure so cancel maps to
-/// [`crate::BackendError::TranscriptionCanceled`] end-to-end.
-fn ensure_prefill_chunk_not_canceled() -> Result<(), Qwen3AsrGreedyDecodeError> {
-    if crate::api::backend::current_transcription_control()
-        .is_some_and(|control| control.is_canceled())
-    {
+/// [`crate::BackendError::TranscriptionCanceled`] end-to-end. Never a
+/// thread-local -- see [`crate::RequestExecutionContext`].
+fn ensure_prefill_chunk_not_canceled(
+    control: &Arc<crate::api::backend::TranscriptionControl>,
+) -> Result<(), Qwen3AsrGreedyDecodeError> {
+    if control.is_canceled() {
         return Err(Qwen3AsrGreedyDecodeError::Canceled);
     }
     Ok(())
@@ -1115,6 +1122,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
                 token_count,
                 &self.layer_kv_caches,
                 1_000_000.0,
+                &self.control,
             )
             .map_err(map_prefill_graph_error)?
         {
@@ -1197,7 +1205,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor {
         let mut final_hidden = None;
         while position_offset < token_count {
             // L1.2 cooperative cancel between host-cache prefill chunks.
-            ensure_prefill_chunk_not_canceled()?;
+            ensure_prefill_chunk_not_canceled(&self.control)?;
             let remaining = token_count - position_offset;
             let chunk_len = if require_even_chunks {
                 super::even_prefill_chunk_len(remaining, chunk_size)
@@ -1630,6 +1638,7 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0; 160]),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
         }
     }
 
@@ -1932,6 +1941,7 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
         };
 
         let executor = Qwen3AsrGgmlExecutor::default();
@@ -1950,18 +1960,14 @@ mod tests {
     fn prefill_chunk_cancel_poll_returns_typed_canceled() {
         use std::sync::Arc;
 
-        use crate::api::backend::{TranscriptionControl, install_active_transcription_control};
+        use crate::api::backend::TranscriptionControl;
         use crate::ggml_runtime::GgmlCpuGraphError;
 
-        // No control installed: poll is a no-op.
-        assert!(super::ensure_prefill_chunk_not_canceled().is_ok());
-
         let control = Arc::new(TranscriptionControl::new());
-        let _guard = install_active_transcription_control(Arc::clone(&control));
-        assert!(super::ensure_prefill_chunk_not_canceled().is_ok());
+        assert!(super::ensure_prefill_chunk_not_canceled(&control).is_ok());
         control.request_cancel();
         assert_eq!(
-            super::ensure_prefill_chunk_not_canceled(),
+            super::ensure_prefill_chunk_not_canceled(&control),
             Err(super::Qwen3AsrGreedyDecodeError::Canceled)
         );
         // Graph-level cancel maps to the same typed family error.
@@ -1982,21 +1988,20 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use crate::api::backend::{TranscriptionControl, install_active_transcription_control};
+        use crate::api::backend::TranscriptionControl;
 
         // Lightweight stand-in for the host-cache chunk walk: each "chunk" is a
         // pure counter bump with the same cancel poll the production loop uses.
         // Cancel after the second chunk completes; the third poll must abort
         // before another chunk runs.
         let control = Arc::new(TranscriptionControl::new());
-        let _guard = install_active_transcription_control(Arc::clone(&control));
         let chunks_run = AtomicUsize::new(0);
         let token_count = 12usize;
         let chunk_size = 4usize;
         let mut position_offset = 0usize;
         let mut canceled = false;
         while position_offset < token_count {
-            if let Err(error) = super::ensure_prefill_chunk_not_canceled() {
+            if let Err(error) = super::ensure_prefill_chunk_not_canceled(&control) {
                 assert_eq!(error, super::Qwen3AsrGreedyDecodeError::Canceled);
                 canceled = true;
                 break;

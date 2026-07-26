@@ -188,6 +188,7 @@ impl MimoLlmDecoderRuntime {
         &mut self,
         prompt_embeddings: &Qwen3AsrPromptEmbeddings,
         layer_kv_caches: &mut [Qwen3AsrLayerKvCacheState],
+        control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     ) -> Result<Vec<f32>, MimoLlmDecoderError> {
         let token_count = prompt_embeddings.token_count;
         if let Some(final_hidden) = self
@@ -197,6 +198,7 @@ impl MimoLlmDecoderRuntime {
                 token_count,
                 layer_kv_caches,
                 self.metadata.rope_theta,
+                control,
             )
             .map_err(|error| MimoLlmDecoderError::GraphFailed {
                 reason: error.to_string(),

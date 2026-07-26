@@ -68,6 +68,7 @@ pub(crate) fn run_cohere_transcribe_greedy_decode_loop(
     phrase_bias: Option<&PhraseBiasConfig>,
     step_executor: &mut dyn Seq2SeqGreedyDecodeStepExecutor,
     decode_text_token_ids: &dyn Fn(&[u32]) -> Result<String, CohereTranscribeGreedyDecodeError>,
+    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<CohereTranscribeGreedyDecodeResult, CohereTranscribeGreedyDecodeError> {
     let output = run_builtin_seq2seq_decode_policy(
         crate::COHERE_TRANSCRIBE_DECODE_POLICY_ID,
@@ -79,6 +80,7 @@ pub(crate) fn run_cohere_transcribe_greedy_decode_loop(
         map_cohere_error_to_shared,
         map_shared_error,
         map_registry_error,
+        control,
     )?;
     Ok(CohereTranscribeGreedyDecodeResult {
         generated_tokens: output.generated_tokens,
@@ -281,6 +283,7 @@ mod tests {
             None,
             &mut step_executor,
             &decode_text_token_ids,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .unwrap();
 
@@ -322,6 +325,7 @@ mod tests {
             None,
             &mut step_executor,
             &decode_text_token_ids,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect_err("no EOT should fail closed");
 

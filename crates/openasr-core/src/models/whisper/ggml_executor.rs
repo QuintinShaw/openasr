@@ -3121,6 +3121,7 @@ impl WhisperGgmlExecutor {
                 self.decoder_runner.as_ref(),
                 true,
                 skip_serve_batch,
+                &request.execution_context,
             )
         } else {
             let runtime = build_whisper_prepared_runtime(
@@ -3142,6 +3143,7 @@ impl WhisperGgmlExecutor {
                     self.decoder_runner.as_ref(),
                     false,
                     skip_serve_batch,
+                    &request.execution_context,
                 )
             })
         }
@@ -3629,6 +3631,7 @@ fn store_whisper_decoder_persistent_static_session(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_whisper_with_prepared_runtime(
     adapter: &GgmlFamilyAdapterDescriptor,
     runtime_source: &GgmlRuntimeSource,
@@ -3641,6 +3644,7 @@ fn execute_whisper_with_prepared_runtime(
     decoder_runner: &dyn WhisperDecoderLoopRunner,
     allow_persistent_session_reuse: bool,
     skip_serve_batch: bool,
+    execution_context: &std::sync::Arc<crate::RequestExecutionContext>,
 ) -> Result<WhisperExecutionOutput, WhisperGgmlExecutorError> {
     let trace = WhisperGgmlTrace::from_env();
     if adapter.adapter_id != WHISPER_GGML_ADAPTER_ID {
@@ -3802,6 +3806,7 @@ fn execute_whisper_with_prepared_runtime(
                     &runtime.tokenizer,
                     request_options,
                 )?,
+                execution_context: std::sync::Arc::clone(execution_context),
             },
         )
         .map_err(|error| match error.unavailable_retryable() {
@@ -3985,6 +3990,7 @@ fn execute_whisper_with_prepared_runtime(
         decoder_persistent_cache_populated,
         decoder_runner,
         &trace,
+        &execution_context.control,
     );
     if allow_persistent_session_reuse {
         store_whisper_decoder_persistent_static_session(
@@ -4022,6 +4028,7 @@ fn execute_whisper_ggml_non_streaming_cpu(
         decoder_runner,
         false,
         false,
+        &std::sync::Arc::new(crate::RequestExecutionContext::detached()),
     )
     .map(|output| output.text)
 }
@@ -5037,6 +5044,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for WhisperGreedyDecodeStepRunnerAdapter<'_
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_whisper_decode_loop(
     runtime_source: &GgmlRuntimeSource,
     execution: &WhisperGgmlExecutionMetadata,
@@ -5050,6 +5058,7 @@ fn run_whisper_decode_loop(
     decoder_persistent_cache_populated: bool,
     decoder_runner: &dyn WhisperDecoderLoopRunner,
     trace: &WhisperGgmlTrace,
+    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<WhisperExecutionOutput, WhisperGgmlExecutorError> {
     let prelude_summary = match prelude_result {
         WhisperEncoderPreludeSeamResult::GraphExecuted {
@@ -5255,6 +5264,7 @@ fn run_whisper_decode_loop(
         request_options.phrase_bias.as_ref(),
         &mut step_runner,
         &decode_text_token_ids,
+        control,
     ) {
         Ok(decode) => {
             decode_loop_span.finish_with_extra(

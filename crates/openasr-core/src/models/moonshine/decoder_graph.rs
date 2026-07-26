@@ -100,6 +100,7 @@ pub(crate) fn run_moonshine_decoder_short_form(
     word_timestamps: bool,
     audio_duration_seconds: f32,
     adapter: Option<&MoonshineLoraAdapter>,
+    control: &Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<MoonshineDecodeOutput, MoonshineDecoderGraphError> {
     if let Some(runtime_path) = runtime_path {
         let key = moonshine_decoder_runtime_cache_key(
@@ -131,6 +132,7 @@ pub(crate) fn run_moonshine_decoder_short_form(
                     phrase_bias,
                     word_timestamps,
                     audio_duration_seconds,
+                    control,
                 )
             },
         );
@@ -152,6 +154,7 @@ pub(crate) fn run_moonshine_decoder_short_form(
         phrase_bias,
         word_timestamps,
         audio_duration_seconds,
+        control,
     )
 }
 
@@ -178,6 +181,7 @@ fn run_moonshine_decoder_short_form_with_runtime(
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     audio_duration_seconds: f32,
+    control: &Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<MoonshineDecodeOutput, MoonshineDecoderGraphError> {
     runtime.populate_cross_attention_cache(encoder_output)?;
     let mut step_executor = MoonshineDecoderStepExecutor { runtime };
@@ -212,6 +216,7 @@ fn run_moonshine_decoder_short_form_with_runtime(
         |error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
             reason: error.to_string(),
         },
+        control,
     ) {
         Ok(output) => output,
         Err(Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {

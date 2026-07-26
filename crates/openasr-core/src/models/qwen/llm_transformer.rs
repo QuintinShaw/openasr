@@ -2066,6 +2066,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         token_count: usize,
         layer_caches: &[Qwen3AsrLayerKvCacheState],
         rope_theta: f32,
+        control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     ) -> Result<Option<Vec<f32>>, GgmlCpuGraphError> {
         let Some(max_positions) = layer_caches
             .first()
@@ -2080,6 +2081,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             1,
             max_positions,
             rope_theta,
+            control,
         )?;
         Ok(Some(step.hidden))
     }
@@ -2400,6 +2402,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         n_seq: usize,
         max_positions: usize,
         rope_theta: f32,
+        control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
         const RESIDENT_PREFILL_MAX_QUERY_TOKENS: usize = 256;
         if token_count == 0 {
@@ -2412,9 +2415,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             // L1.2 cooperative cancel: poll between resident prefill chunks so
             // stop lands at a chunk boundary instead of waiting for the whole
             // prompt bulk (or the long-form slice boundary). Pause stays L0-only.
-            if crate::api::backend::current_transcription_control()
-                .is_some_and(|control| control.is_canceled())
-            {
+            if control.is_canceled() {
                 return Err(GgmlCpuGraphError::Canceled);
             }
             let chunk_tokens =

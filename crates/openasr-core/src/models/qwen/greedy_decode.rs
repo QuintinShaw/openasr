@@ -68,6 +68,7 @@ pub(crate) fn run_qwen3_greedy_decode_loop(
     phrase_bias: Option<&PhraseBiasConfig>,
     step_executor: &mut dyn Seq2SeqGreedyDecodeStepExecutor,
     decode_text_token_ids: &dyn Fn(&[u32]) -> Result<String, Qwen3AsrGreedyDecodeError>,
+    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<Qwen3AsrGreedyDecodeResult, Qwen3AsrGreedyDecodeError> {
     let output = run_builtin_seq2seq_decode_policy(
         crate::QWEN3_ASR_DECODE_POLICY_ID,
@@ -79,6 +80,7 @@ pub(crate) fn run_qwen3_greedy_decode_loop(
         map_qwen_error_to_shared,
         map_shared_error,
         map_registry_error,
+        control,
     )?;
     Ok(Qwen3AsrGreedyDecodeResult {
         generated_tokens: output.generated_tokens,
@@ -294,6 +296,7 @@ mod tests {
             None,
             &mut step_executor,
             &decode_text_token_ids,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .unwrap();
 
@@ -337,6 +340,7 @@ mod tests {
             None,
             &mut step_executor,
             &decode_text_token_ids,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .unwrap();
 
@@ -375,6 +379,7 @@ mod tests {
             None,
             &mut step_executor,
             &decode_text_token_ids,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect_err("no EOT should fail closed");
         assert!(matches!(

@@ -1,13 +1,12 @@
 use std::cell::RefCell;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use thiserror::Error;
 
 #[cfg(test)]
 use std::path::PathBuf;
-#[cfg(test)]
-use std::sync::Arc;
 
 use super::batched_decode::{
     CohereServeBatchConfig, CohereServeBatchConfigFromPolicy, CohereServeBatchJob,
@@ -340,6 +339,7 @@ impl CohereTranscribeGgmlExecutor {
                     word_timestamps: request.request_options.word_timestamps,
                     audio_duration_seconds: audio_duration,
                     prefer_cpu_backend: prefer_cpu_decoder,
+                    execution_context: Arc::clone(&request.execution_context),
                 },
             )
             .map_err(|error| match error.unavailable_retryable() {
@@ -364,6 +364,7 @@ impl CohereTranscribeGgmlExecutor {
                 prefer_cpu_decoder,
                 request.request_options.word_timestamps,
                 audio_duration,
+                &request.execution_context.control,
             )
             .map_err(map_decoder_error)?
         };
@@ -446,6 +447,7 @@ fn decode_with_cached_cohere_decoder_runtime(
     prefer_cpu_backend: bool,
     word_timestamps: bool,
     audio_duration_seconds: f32,
+    control: &Arc<crate::TranscriptionControl>,
 ) -> Result<super::decoder_graph::CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
     let decoder_backend = cohere_decoder_graph_config(prefer_cpu_backend).backend;
     let key = (runtime_cache_path_identity(runtime_path), decoder_backend);
@@ -473,6 +475,7 @@ fn decode_with_cached_cohere_decoder_runtime(
                 phrase_bias,
                 word_timestamps,
                 audio_duration_seconds,
+                control,
             )
         },
     )
@@ -807,6 +810,7 @@ mod tests {
             ),
             request_options: Default::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
         }
     }
 
@@ -1164,6 +1168,7 @@ mod tests {
                 prepared_audio: GgmlAsrPreparedAudio::mono_16khz(zh_samples),
                 request_options: Default::default(),
                 backend_preference: GgmlAsrBackendPreference::CpuOnly,
+                execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
             };
             // Content/language mismatch (zh_sample.wav vs cohere's English-first
             // prompt) is irrelevant here -- only decode-succeeds + cache-slot

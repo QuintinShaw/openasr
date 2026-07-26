@@ -35,8 +35,8 @@ use crate::models::seq2seq_greedy_decode::{
 #[cfg(test)]
 use crate::models::seq2seq_serve_batch::{Envelope, OwnerThreadState};
 use crate::models::seq2seq_serve_batch::{
-    Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig, ServeBatchEngine,
-    serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
+    SERVE_BATCH_CANCEL_REASON, Seq2SeqServeBatchFamily, Seq2SeqServeRuntime, ServeBatchConfig,
+    ServeBatchEngine, serve_batch_engine_for_key, shutdown_and_remove_serve_batch_engines,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
@@ -89,6 +89,9 @@ pub(crate) struct WhisperServeBatchJob {
     pub word_timestamps: bool,
     pub audio_duration_seconds: f32,
     pub carry_prompt_seed_token_ids: Option<Vec<u32>>,
+    /// Explicit cancel/pause/resume context for this job -- never a
+    /// thread-local. See [`crate::RequestExecutionContext`].
+    pub execution_context: std::sync::Arc<crate::RequestExecutionContext>,
 }
 
 #[derive(Debug, Error)]
@@ -540,6 +543,15 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
             if slot.done {
                 break;
             }
+            // Cooperative cancel at each token step, mirroring the shared
+            // greedy driver's L1 check: this serial path bypasses that driver
+            // (see the module-level note on the ported-verbatim loop below),
+            // so it needs its own check against the job's own context.
+            if slot.job.execution_context.control.is_canceled() {
+                return Err(WhisperServeBatchError::DecodeFailed {
+                    reason: SERVE_BATCH_CANCEL_REASON.to_string(),
+                });
+            }
             let token_id = *slot.generated_tokens.last().ok_or_else(|| {
                 WhisperServeBatchError::DecodeFailed {
                     reason: "whisper serve batch generated token history is empty".to_string(),
@@ -567,6 +579,10 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
 
     fn owner_failed(reason: String) -> Self::Error {
         WhisperServeBatchError::OwnerFailed { reason }
+    }
+
+    fn job_execution_context(job: &Self::Job) -> &Arc<crate::RequestExecutionContext> {
+        &job.execution_context
     }
 
     #[cfg(test)]
@@ -996,6 +1012,21 @@ mod tests {
         (frame_count, hidden_size, rows)
     }
 
+    /// Structural proof that `WhisperServeBatchJob::execution_context` is
+    /// required, not optional: this only compiles because the field's type
+    /// is the concrete `Arc<RequestExecutionContext>`. Never called; exists
+    /// purely so `cargo check`/`clippy` re-verify the contract on every build.
+    #[allow(dead_code)]
+    fn require_concrete_execution_context(_: Arc<crate::RequestExecutionContext>) {}
+
+    #[allow(dead_code)]
+    fn assert_whisper_serve_batch_job_requires_execution_context(job: WhisperServeBatchJob) {
+        let WhisperServeBatchJob {
+            execution_context, ..
+        } = job;
+        require_concrete_execution_context(execution_context);
+    }
+
     fn real_pack_batch_job(
         runtime_path: &Path,
         backend: GgmlCpuGraphBackend,
@@ -1075,6 +1106,7 @@ mod tests {
             word_timestamps: false,
             audio_duration_seconds: 1.0,
             carry_prompt_seed_token_ids: None,
+            execution_context: Arc::new(crate::RequestExecutionContext::detached()),
         }
     }
 
@@ -1457,17 +1489,20 @@ mod tests {
         });
         let envelope_for_phase = |encoder_phase: f32| {
             let (reply, reply_rx) = mpsc::channel();
+            let job = real_pack_batch_job(
+                &runtime_path,
+                runtime_config.backend,
+                runtime_config.use_scheduler,
+                execution.clone(),
+                decoder_weights.clone(),
+                tokenizer.clone(),
+                encoder_phase,
+            );
+            let context = Arc::clone(&job.execution_context);
             (
                 WhisperServeBatchEnvelope {
-                    job: real_pack_batch_job(
-                        &runtime_path,
-                        runtime_config.backend,
-                        runtime_config.use_scheduler,
-                        execution.clone(),
-                        decoder_weights.clone(),
-                        tokenizer.clone(),
-                        encoder_phase,
-                    ),
+                    job,
+                    context,
                     reply,
                 },
                 reply_rx,
@@ -1538,7 +1573,15 @@ mod tests {
                 max_generated_tokens,
             );
             let (reply, reply_rx) = mpsc::channel();
-            (WhisperServeBatchEnvelope { job, reply }, reply_rx)
+            let context = Arc::clone(&job.execution_context);
+            (
+                WhisperServeBatchEnvelope {
+                    job,
+                    context,
+                    reply,
+                },
+                reply_rx,
+            )
         };
 
         let (initial_fast, initial_fast_rx) = envelope(0.0, 1);
@@ -1600,7 +1643,15 @@ mod tests {
                 max_generated_tokens,
             );
             let (reply, reply_rx) = mpsc::channel();
-            (WhisperServeBatchEnvelope { job, reply }, reply_rx)
+            let context = Arc::clone(&job.execution_context);
+            (
+                WhisperServeBatchEnvelope {
+                    job,
+                    context,
+                    reply,
+                },
+                reply_rx,
+            )
         };
 
         let (initial_long_a, initial_long_a_rx) = envelope(0.0, 3);
@@ -1671,7 +1722,15 @@ mod tests {
                 max_generated_tokens,
             );
             let (reply, reply_rx) = mpsc::channel();
-            (WhisperServeBatchEnvelope { job, reply }, reply_rx)
+            let context = Arc::clone(&job.execution_context);
+            (
+                WhisperServeBatchEnvelope {
+                    job,
+                    context,
+                    reply,
+                },
+                reply_rx,
+            )
         };
 
         let (initial_fast_a, initial_fast_a_rx) = envelope(0.0, 1);

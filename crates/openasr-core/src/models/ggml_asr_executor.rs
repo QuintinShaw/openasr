@@ -11,7 +11,8 @@ use crate::models::runtime_preflight::{
 use crate::{
     GgmlExecutionCapability, GgmlFamilyAdapterDescriptor, GgmlRuntimeSource, GgufMetadata,
     GgufTensorIndex, LongFormOptions, NativeAsrBackpressurePolicy, NativeAsrSession,
-    PhraseBiasConfig, RealtimeAudioFormat, Transcription, TranscriptionTask,
+    PhraseBiasConfig, RealtimeAudioFormat, RequestExecutionContext, Transcription,
+    TranscriptionTask,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +280,11 @@ pub struct GgmlAsrExecutionRequest {
     /// the streaming closures in `incremental_streaming_driver.rs` and
     /// `ctc_streaming_driver.rs` for the pattern.
     pub backend_preference: GgmlAsrBackendPreference,
+    /// Cancel/pause/resume control and request id for this decode, carried
+    /// explicitly rather than through the (removed) thread-local
+    /// transcription control. Required: a caller with nothing to cancel
+    /// still passes `RequestExecutionContext::detached()`.
+    pub execution_context: Arc<RequestExecutionContext>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -856,6 +862,25 @@ mod tests {
         );
     }
 
+    /// Structural proof that `execution_context` is required, not optional:
+    /// this compiles only because the field's type is the concrete
+    /// `Arc<RequestExecutionContext>`, not `Option<Arc<RequestExecutionContext>>`
+    /// -- an `Option` field would fail to type-check against
+    /// `require_concrete_execution_context`'s parameter. Never called; exists
+    /// purely so `cargo check`/`clippy` re-verify the contract on every build.
+    #[allow(dead_code)]
+    fn require_concrete_execution_context(_: std::sync::Arc<crate::RequestExecutionContext>) {}
+
+    #[allow(dead_code)]
+    fn assert_ggml_asr_execution_request_requires_execution_context(
+        request: GgmlAsrExecutionRequest,
+    ) {
+        let GgmlAsrExecutionRequest {
+            execution_context, ..
+        } = request;
+        require_concrete_execution_context(execution_context);
+    }
+
     fn whisper_request(backend_preference: GgmlAsrBackendPreference) -> GgmlAsrExecutionRequest {
         GgmlAsrExecutionRequest {
             runtime_source_path: PathBuf::from("fixtures/whisper.gguf"),
@@ -864,6 +889,7 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
             request_options: GgmlAsrExecutionOptions::default(),
             backend_preference,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
         }
     }
 

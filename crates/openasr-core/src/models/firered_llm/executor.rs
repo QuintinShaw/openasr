@@ -23,6 +23,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -205,6 +206,9 @@ struct FireRedLlmGreedyStepExecutor<'a> {
     layer_kv_caches: Vec<Qwen3AsrLayerKvCacheState>,
     prompt_embeddings: Option<crate::models::qwen::Qwen3AsrPromptEmbeddings>,
     cache_prompt_tokens: usize,
+    /// Explicit cancel/pause/resume control for this decode -- never a
+    /// thread-local. See [`crate::RequestExecutionContext`].
+    control: Arc<crate::api::backend::TranscriptionControl>,
 }
 
 impl Seq2SeqGreedyDecodeStepExecutor for FireRedLlmGreedyStepExecutor<'_> {
@@ -216,7 +220,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for FireRedLlmGreedyStepExecutor<'_> {
             self.cache_prompt_tokens = prompt_embeddings.token_count;
             let logits = self
                 .decoder
-                .prefill(&prompt_embeddings, &mut self.layer_kv_caches)
+                .prefill(&prompt_embeddings, &mut self.layer_kv_caches, &self.control)
                 .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
                     reason: error.to_string(),
                 })?;
@@ -466,6 +470,7 @@ impl FireRedLlmGgmlExecutor {
             layer_kv_caches,
             prompt_embeddings: Some(prompt_embeddings),
             cache_prompt_tokens: 0,
+            control: Arc::clone(&request.execution_context.control),
         };
         let config = BuiltinSeq2SeqDecodePolicyConfigInput {
             initial_prompt_tokens: decode_prompt.token_ids.clone(),
@@ -489,6 +494,7 @@ impl FireRedLlmGgmlExecutor {
             |error: Seq2SeqGreedyDecodeError| error,
             |error: Seq2SeqGreedyDecodeError| error,
             map_registry_error,
+            &request.execution_context.control,
         );
         // Session/slice is done: release the CPU per-token grow-to-fit step
         // buffer before the decoder goes back into the cross-chunk cache, so
@@ -744,6 +750,7 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(samples),
             request_options: Default::default(),
             backend_preference,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
         };
 
         let executor = FireRedLlmGgmlExecutor;

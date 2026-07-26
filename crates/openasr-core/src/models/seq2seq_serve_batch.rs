@@ -129,6 +129,10 @@ pub(crate) trait Seq2SeqServeBatchFamily: Sized + 'static {
     fn decode_failed(reason: String) -> Self::Error; // map_decoder_error / inline DecodeFailed
     fn owner_failed(reason: String) -> Self::Error;
 
+    /// The explicit cancel/pause/resume context this job was submitted with.
+    /// Never read through a thread-local -- see [`crate::RequestExecutionContext`].
+    fn job_execution_context(job: &Self::Job) -> &Arc<crate::RequestExecutionContext>;
+
     // Engine/registry/config error constructors (Wave B). Each family binds these
     // to its existing `*ServeBatchError` variant constructors; no new error enum.
     #[cfg(test)]
@@ -142,17 +146,29 @@ pub(crate) trait Seq2SeqServeBatchFamily: Sized + 'static {
     fn reply_timed_out() -> Self::Error;
 }
 
-/// A queued serve-batch request: the family job plus the reply channel the
-/// owner thread sends the decode result back through.
+/// The stable cancel marker embedded in a canceled slot's `DecodeFailed`
+/// reason string. Matches the marker every other decode-cancel surface in
+/// this crate uses (see `native_transcribe::is_cooperative_cancel_reason`)
+/// so a canceled serve-batch slot's error still rewrites to
+/// `BackendError::TranscriptionCanceled` at the native dispatch boundary.
+pub(crate) const SERVE_BATCH_CANCEL_REASON: &str =
+    "seq2seq serve batch slot canceled by transcription control";
+
+/// A queued serve-batch request: the family job, its explicit execution
+/// context (request id + cancel/pause/resume control -- never a
+/// thread-local), and the reply channel the owner thread sends the decode
+/// result back through.
 pub(crate) struct Envelope<F: Seq2SeqServeBatchFamily> {
     pub job: F::Job,
+    pub context: Arc<crate::RequestExecutionContext>,
     pub reply: mpsc::Sender<Result<F::Output, F::Error>>,
 }
 
 /// A slot currently occupying a batch lane, pairing the family slot state with
-/// the reply channel that owns its result.
+/// its execution context and the reply channel that owns its result.
 struct ActiveBatchSlot<F: Seq2SeqServeBatchFamily> {
     slot: F::Slot,
+    context: Arc<crate::RequestExecutionContext>,
     reply: mpsc::Sender<Result<F::Output, F::Error>>,
 }
 
@@ -161,6 +177,7 @@ struct ActiveBatchSlot<F: Seq2SeqServeBatchFamily> {
 struct PendingRefillSlot<F: Seq2SeqServeBatchFamily> {
     slot_index: usize,
     slot: F::Slot,
+    context: Arc<crate::RequestExecutionContext>,
     reply: mpsc::Sender<Result<F::Output, F::Error>>,
 }
 
@@ -188,7 +205,7 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
     ) -> VecDeque<Envelope<F>> {
         if batch.len() <= 1 {
             for envelope in batch {
-                let Envelope { job, reply } = envelope;
+                let Envelope { job, reply, .. } = envelope;
                 let result = self.decode_serial_job(job);
                 let _ = reply.send(result);
             }
@@ -210,32 +227,50 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
             return deferred;
         }
 
-        let mut replies = Vec::with_capacity(batch.len());
+        let mut contexts_and_replies = Vec::with_capacity(batch.len());
         let mut slots = Vec::with_capacity(batch.len());
         for envelope in batch {
-            replies.push(envelope.reply);
-            match F::slot_new(envelope.job) {
+            let Envelope {
+                job,
+                context,
+                reply,
+            } = envelope;
+            contexts_and_replies.push((context, reply));
+            match F::slot_new(job) {
                 Ok(slot) => slots.push(slot),
                 Err(error) => {
-                    let _ = replies
+                    let (_, reply) = contexts_and_replies
                         .pop()
-                        .expect("reply pushed before slot build")
-                        .send(Err(error));
+                        .expect("context/reply pushed before slot build");
+                    let _ = reply.send(Err(error));
                 }
             }
         }
         let mut slots = slots
             .into_iter()
-            .zip(replies)
-            .map(|(slot, reply)| Some(ActiveBatchSlot::<F> { slot, reply }))
+            .zip(contexts_and_replies)
+            .map(|(slot, (context, reply))| {
+                Some(ActiveBatchSlot::<F> {
+                    slot,
+                    context,
+                    reply,
+                })
+            })
             .collect::<Vec<_>>();
         if slots.is_empty() {
+            return deferred;
+        }
+        // A slot canceled before this batch even started decoding (submitted
+        // already-canceled, or canceled while queued waiting to be drained)
+        // must never enter the shared prefill below.
+        Self::finish_canceled_active_slots(&mut slots);
+        if !slots.iter().any(Option::is_some) {
             return deferred;
         }
         let active_count = slots.iter().filter(|slot| slot.is_some()).count();
         if active_count <= 1 {
             for active in slots.into_iter().flatten() {
-                let ActiveBatchSlot { slot, reply } = active;
+                let ActiveBatchSlot { slot, reply, .. } = active;
                 let result = self.decode_serial_job(F::slot_job(&slot).clone());
                 let _ = reply.send(result);
             }
@@ -292,8 +327,17 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
                 }
             }
         }
+        // Safe boundary right after the initial prefill: a slot canceled
+        // while that prefill ran is pulled out here, before it can be
+        // admitted into the per-step batched loop below.
+        Self::finish_canceled_active_slots(&mut slots);
 
         loop {
+            // Safe boundary at the top of every iteration, before refill,
+            // rebucket, shrink, or the next batched token-step compute: a
+            // canceled slot is finished here and only here -- the shared
+            // runtime and every healthy sibling slot continue unaffected.
+            Self::finish_canceled_active_slots(&mut slots);
             Self::finish_maxed_active_slots(&mut slots);
             if let Some(first_job) = Self::first_active_job(&slots) {
                 let runtime = match self.batched_runtime_for(first_job, slots.len()) {
@@ -412,9 +456,20 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
             else {
                 break;
             };
-            let Envelope { job, reply } = envelope;
+            let Envelope {
+                job,
+                context,
+                reply,
+            } = envelope;
+            // Already-canceled before it ever occupied a lane: reply canceled
+            // now rather than spending a prefill on a request no one is
+            // waiting on.
+            if context.is_canceled() {
+                let _ = reply.send(Err(F::decode_failed(SERVE_BATCH_CANCEL_REASON.to_string())));
+                continue;
+            }
             match F::slot_new(job) {
-                Ok(slot) => pending.push((slot, reply)),
+                Ok(slot) => pending.push((slot, context, reply)),
                 Err(error) => {
                     let _ = reply.send(Err(error));
                 }
@@ -429,9 +484,10 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
         })?;
         let bucket_width = serve_batch_bucket_width(target_active, max_batch);
         if bucket_width <= slots.len() {
-            for (slot, reply) in pending.into_iter().rev() {
+            for (slot, context, reply) in pending.into_iter().rev() {
                 deferred.push_front(Envelope {
                     job: F::slot_job(&slot).clone(),
+                    context,
                     reply,
                 });
             }
@@ -439,8 +495,12 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
         }
 
         let previous_width = slots.len();
-        for (slot, reply) in pending {
-            slots.push(Some(ActiveBatchSlot::<F> { slot, reply }));
+        for (slot, context, reply) in pending {
+            slots.push(Some(ActiveBatchSlot::<F> {
+                slot,
+                context,
+                reply,
+            }));
         }
         if bucket_width > slots.len() {
             slots.resize_with(bucket_width, || None);
@@ -619,7 +679,19 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
                 else {
                     break;
                 };
-                let Envelope { job, reply } = envelope;
+                let Envelope {
+                    job,
+                    context,
+                    reply,
+                } = envelope;
+                // Already-canceled before it ever occupied a lane: reply
+                // canceled now rather than spending a prefill on a request no
+                // one is waiting on.
+                if context.is_canceled() {
+                    let _ =
+                        reply.send(Err(F::decode_failed(SERVE_BATCH_CANCEL_REASON.to_string())));
+                    continue;
+                }
                 let slot = match F::slot_new(job) {
                     Ok(slot) => slot,
                     Err(error) => {
@@ -636,6 +708,7 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
                 pending_refills.push(PendingRefillSlot::<F> {
                     slot_index,
                     slot,
+                    context,
                     reply,
                 });
                 break;
@@ -658,13 +731,18 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
             let PendingRefillSlot {
                 slot_index,
                 slot,
+                context,
                 reply,
             } = pending;
             if F::slot_done(&slot) {
                 let _ = reply.send(F::slot_finish(slot));
                 continue;
             }
-            slots[slot_index] = Some(ActiveBatchSlot::<F> { slot, reply });
+            slots[slot_index] = Some(ActiveBatchSlot::<F> {
+                slot,
+                context,
+                reply,
+            });
             if trace_batches {
                 eprintln!(
                     "openasr {} serve batch: refilled slot {slot_index}",
@@ -836,8 +914,30 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
         let Some(active) = slots[slot_index].take() else {
             return;
         };
-        let ActiveBatchSlot { slot, reply } = active;
+        let ActiveBatchSlot { slot, reply, .. } = active;
         let _ = reply.send(F::slot_finish(slot));
+    }
+
+    /// Per-slot cancel check for the safe boundaries between batched graph
+    /// calls (initial prefill, each token step, refill, rebucket, shrink).
+    /// Finishes exactly the slots whose own execution context has an active
+    /// cancel request with a `DecodeFailed(SERVE_BATCH_CANCEL_REASON)` reply
+    /// -- every healthy sibling slot is left untouched and the shared
+    /// batched runtime is never aborted. Canceling one request must never
+    /// fail the whole batch.
+    fn finish_canceled_active_slots(slots: &mut [Option<ActiveBatchSlot<F>>]) {
+        for slot_index in 0..slots.len() {
+            let is_canceled = slots[slot_index]
+                .as_ref()
+                .is_some_and(|active| active.context.is_canceled());
+            if is_canceled {
+                Self::fail_active_slot(
+                    slots,
+                    slot_index,
+                    F::decode_failed(SERVE_BATCH_CANCEL_REASON.to_string()),
+                );
+            }
+        }
     }
 
     fn fail_active_slot(
@@ -1030,10 +1130,15 @@ impl<F: Seq2SeqServeBatchFamily> ServeBatchEngine<F> {
     }
 
     pub(crate) fn submit(&self, job: F::Job) -> Result<F::Output, F::Error> {
+        let context = Arc::clone(F::job_execution_context(&job));
         let (reply, reply_rx) = mpsc::channel();
         serve_batch_submit_with_timeout(
             &self.sender,
-            Envelope { job, reply },
+            Envelope {
+                job,
+                context,
+                reply,
+            },
             reply_rx,
             self.config.send_timeout,
             self.config.reply_timeout,
@@ -1118,5 +1223,381 @@ pub(crate) fn shutdown_and_remove_serve_batch_engines<F: Seq2SeqServeBatchFamily
     };
     if let Ok(mut engines) = registry.lock() {
         engines.clear();
+    }
+}
+
+/// Shared-layer slot isolation tests.
+///
+/// `cohere` / `moonshine` / `whisper` are all wired onto the exact
+/// `OwnerThreadState::run_batch` / `decode_continuous_batch` code in this
+/// module (see the module doc comment), so a fake, ggml-free family here
+/// exercises the real per-slot cancellation logic those three families share
+/// -- one test proves it for all of them instead of three near-identical
+/// copies each needing a real model pack.
+#[cfg(test)]
+mod slot_isolation_tests {
+    use super::*;
+    use crate::RequestExecutionContext;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use thiserror::Error;
+
+    #[derive(Debug, Error, PartialEq, Eq)]
+    enum FakeError {
+        #[error("fake decode failed: {0}")]
+        DecodeFailed(String),
+        #[error("fake owner failed: {0}")]
+        OwnerFailed(String),
+        #[error("fake unsupported backend")]
+        UnsupportedBackend,
+        #[error("fake registry poisoned")]
+        RegistryPoisoned,
+        #[error("fake thread spawn failed: {0}")]
+        ThreadSpawnFailed(String),
+        #[error("fake queue full")]
+        QueueFull,
+        #[error("fake owner disconnected")]
+        OwnerDisconnected,
+        #[error("fake reply timed out")]
+        ReplyTimedOut,
+        #[error("fake invalid enabled batch: {0}")]
+        InvalidEnabledBatch(usize),
+    }
+
+    /// A job that always generates `max_tokens` tokens (no real vocabulary or
+    /// logits -- `slot_select_next_token` below ignores the logits content
+    /// entirely and just counts steps), carrying the same explicit execution
+    /// context every real family job now requires.
+    #[derive(Clone)]
+    struct FakeJob {
+        id: u32,
+        max_tokens: usize,
+        execution_context: Arc<RequestExecutionContext>,
+        /// Set only on the job that becomes the *first* active slot (the one
+        /// `build_batched` is constructed from): fires `request_cancel` on
+        /// that same job's own context after this many
+        /// `compute_reused_batched_step_logits` calls, simulating an
+        /// independent HTTP thread canceling this request concurrently while
+        /// the owner is mid-batch.
+        self_cancel_after_step: Option<usize>,
+    }
+
+    struct FakeSlot {
+        job: FakeJob,
+        generated: Vec<u32>,
+    }
+
+    /// No real tensors: `compute_*_logits` return a correctly-sized dummy
+    /// buffer (the owner validates its length against `vocab_size * n_seq`),
+    /// and `slot_select_next_token` ignores its content -- decode progress is
+    /// just a step counter. `build_count` proves the shared "graph" is built
+    /// once and never rebuilt/aborted because a sibling slot was canceled.
+    struct FakeRuntime {
+        step_calls: usize,
+        cancel_hook: Option<(usize, Arc<RequestExecutionContext>)>,
+    }
+
+    static FAKE_VOCAB_SIZE: usize = 4;
+    static FAKE_RUNTIME_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    impl Seq2SeqServeRuntime for FakeRuntime {
+        type Job = FakeJob;
+        type Error = FakeError;
+
+        fn build_serial(_job: &Self::Job) -> Result<Self, Self::Error> {
+            FAKE_RUNTIME_BUILD_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Self {
+                step_calls: 0,
+                cancel_hook: None,
+            })
+        }
+
+        fn build_batched(job: &Self::Job, _n_seq: usize) -> Result<Self, Self::Error> {
+            FAKE_RUNTIME_BUILD_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+            let cancel_hook = job
+                .self_cancel_after_step
+                .map(|after_step| (after_step, Arc::clone(&job.execution_context)));
+            Ok(Self {
+                step_calls: 0,
+                cancel_hook,
+            })
+        }
+
+        fn populate_cross_attention_cache_serial(
+            &mut self,
+            _job: &Self::Job,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn populate_cross_attention_cache_slot(
+            &mut self,
+            _slot_index: usize,
+            _job: &Self::Job,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn compute_batched_prefill_logits(
+            &mut self,
+            _prompt_tokens: &[u32],
+        ) -> Result<Vec<f32>, Self::Error> {
+            Ok(vec![0.0; FAKE_VOCAB_SIZE * 2])
+        }
+
+        fn compute_reused_batched_step_logits(
+            &mut self,
+            _token_ids: &[u32],
+            _positions: &[usize],
+            _totals: &[usize],
+        ) -> Result<Vec<f32>, Self::Error> {
+            self.step_calls += 1;
+            if let Some((after_step, context)) = &self.cancel_hook
+                && self.step_calls == *after_step
+            {
+                context.control.request_cancel();
+            }
+            Ok(vec![0.0; FAKE_VOCAB_SIZE * 2])
+        }
+    }
+
+    struct FakeFamily;
+
+    impl Seq2SeqServeBatchFamily for FakeFamily {
+        type Runtime = FakeRuntime;
+        type Job = FakeJob;
+        type Slot = FakeSlot;
+        type Output = u32;
+        type Error = FakeError;
+        type EngineKey = u32;
+
+        const THREAD_NAME_PREFIX: &'static str = "fake";
+        const MAX_BATCH_LIMIT: usize = 8;
+
+        fn engine_key(job: &Self::Job, _max_batch: usize) -> Self::EngineKey {
+            job.id
+        }
+
+        fn engine_key_backend(_key: &Self::EngineKey) -> GgmlCpuGraphBackend {
+            GgmlCpuGraphBackend::Cpu
+        }
+
+        fn can_batch_with(_a: &Self::Job, _b: &Self::Job) -> bool {
+            true
+        }
+
+        fn vram_slot_bytes(_job: &Self::Job) -> usize {
+            0
+        }
+
+        fn backend(_job: &Self::Job) -> GgmlCpuGraphBackend {
+            GgmlCpuGraphBackend::Cpu
+        }
+
+        fn uses_scheduler(_job: &Self::Job) -> bool {
+            false
+        }
+
+        fn initial_prompt_tokens(_job: &Self::Job) -> &[u32] {
+            &[0]
+        }
+
+        fn vocab_size(_job: &Self::Job) -> usize {
+            FAKE_VOCAB_SIZE
+        }
+
+        fn max_generated_tokens(job: &Self::Job) -> usize {
+            job.max_tokens
+        }
+
+        fn decoder_max_context(_job: &Self::Job) -> usize {
+            64
+        }
+
+        fn slot_new(job: Self::Job) -> Result<Self::Slot, Self::Error> {
+            Ok(FakeSlot {
+                job,
+                generated: Vec::new(),
+            })
+        }
+
+        fn slot_job(slot: &Self::Slot) -> &Self::Job {
+            &slot.job
+        }
+
+        fn slot_generated(slot: &Self::Slot) -> &[u32] {
+            &slot.generated
+        }
+
+        fn slot_done(slot: &Self::Slot) -> bool {
+            slot.generated.len() >= slot.job.max_tokens
+        }
+
+        fn slot_select_next_token(
+            slot: &mut Self::Slot,
+            _logits: Vec<f32>,
+        ) -> Result<(), Self::Error> {
+            slot.generated.push(slot.generated.len() as u32);
+            Ok(())
+        }
+
+        fn slot_finish(slot: Self::Slot) -> Result<Self::Output, Self::Error> {
+            Ok(slot.job.id)
+        }
+
+        fn decode_serial(
+            serial_runtime: &mut Option<Self::Runtime>,
+            job: Self::Job,
+        ) -> Result<Self::Output, Self::Error> {
+            if serial_runtime.is_none() {
+                *serial_runtime = Some(FakeRuntime::build_serial(&job)?);
+            }
+            let mut slot = FakeSlot {
+                job,
+                generated: Vec::new(),
+            };
+            while !FakeFamily::slot_done(&slot) {
+                FakeFamily::slot_select_next_token(&mut slot, Vec::new())?;
+            }
+            FakeFamily::slot_finish(slot)
+        }
+
+        fn decode_failed(reason: String) -> Self::Error {
+            FakeError::DecodeFailed(reason)
+        }
+
+        fn owner_failed(reason: String) -> Self::Error {
+            FakeError::OwnerFailed(reason)
+        }
+
+        fn job_execution_context(job: &Self::Job) -> &Arc<RequestExecutionContext> {
+            &job.execution_context
+        }
+
+        #[cfg(test)]
+        fn invalid_test_env(_env: &'static str, _raw: String, _max: usize) -> Self::Error {
+            FakeError::InvalidEnabledBatch(0)
+        }
+
+        fn invalid_enabled_batch(max_batch: usize) -> Self::Error {
+            FakeError::InvalidEnabledBatch(max_batch)
+        }
+
+        fn unsupported_backend(_backend: GgmlCpuGraphBackend) -> Self::Error {
+            FakeError::UnsupportedBackend
+        }
+
+        fn registry_poisoned() -> Self::Error {
+            FakeError::RegistryPoisoned
+        }
+
+        fn thread_spawn_failed(reason: String) -> Self::Error {
+            FakeError::ThreadSpawnFailed(reason)
+        }
+
+        fn queue_full() -> Self::Error {
+            FakeError::QueueFull
+        }
+
+        fn owner_disconnected() -> Self::Error {
+            FakeError::OwnerDisconnected
+        }
+
+        fn reply_timed_out() -> Self::Error {
+            FakeError::ReplyTimedOut
+        }
+    }
+
+    /// Capacity 2, two requests (A, B) land in the same batched owner. A is
+    /// canceled mid-batch (simulating an independent HTTP thread flipping its
+    /// context while the owner is between token-step graph calls); B must
+    /// finish normally and the shared "graph" (`FakeRuntime`) must be built
+    /// exactly once -- proving the cancellation of A never tore down or
+    /// rebuilt the runtime B is still using.
+    #[test]
+    fn canceling_one_slot_finishes_only_that_slot_and_leaves_the_sibling_and_shared_runtime_alone()
+    {
+        FAKE_RUNTIME_BUILD_COUNT.store(0, AtomicOrdering::SeqCst);
+
+        let context_a = Arc::new(RequestExecutionContext::new(
+            Some("job-a".to_string()),
+            Arc::new(crate::TranscriptionControl::new()),
+        ));
+        let context_b = Arc::new(RequestExecutionContext::new(
+            Some("job-b".to_string()),
+            Arc::new(crate::TranscriptionControl::new()),
+        ));
+
+        let job_a = FakeJob {
+            id: 1,
+            max_tokens: 4,
+            execution_context: Arc::clone(&context_a),
+            // A becomes the first active slot (batch order), so its own
+            // cancel fires from inside the fake "graph" after the first
+            // post-prefill step -- well before its own 4-token budget and
+            // before B's.
+            self_cancel_after_step: Some(1),
+        };
+        let job_b = FakeJob {
+            id: 2,
+            max_tokens: 4,
+            execution_context: Arc::clone(&context_b),
+            self_cancel_after_step: None,
+        };
+
+        let (reply_a, reply_a_rx) = mpsc::channel();
+        let (reply_b, reply_b_rx) = mpsc::channel();
+        let batch = vec![
+            Envelope {
+                job: job_a,
+                context: context_a,
+                reply: reply_a,
+            },
+            Envelope {
+                job: job_b,
+                context: context_b,
+                reply: reply_b,
+            },
+        ];
+
+        let (_receiver_keepalive, receiver) = mpsc::channel();
+        let mut state = OwnerThreadState::<FakeFamily>::new();
+        let deferred = state.run_batch(batch, &receiver, 2, false);
+        assert!(deferred.is_empty());
+
+        let result_a = reply_a_rx
+            .recv()
+            .expect("A's reply channel must receive a result");
+        assert!(
+            matches!(result_a, Err(FakeError::DecodeFailed(ref reason)) if reason.contains("canceled by transcription control")),
+            "canceled slot A must fail with the stable cancel marker, got {result_a:?}"
+        );
+
+        let result_b = reply_b_rx
+            .recv()
+            .expect("B's reply channel must receive a result");
+        assert_eq!(
+            result_b,
+            Ok(2),
+            "healthy sibling B must finish normally despite A's cancellation"
+        );
+
+        assert_eq!(
+            FAKE_RUNTIME_BUILD_COUNT.load(AtomicOrdering::SeqCst),
+            1,
+            "canceling A must not rebuild or abort the shared batched runtime B still uses"
+        );
+    }
+
+    /// Structural proof that the generic `Envelope`'s `context` is required,
+    /// not optional: this only compiles because the field's type is the
+    /// concrete `Arc<RequestExecutionContext>`. Never called; exists purely
+    /// so `cargo check`/`clippy` re-verify the contract on every build.
+    #[allow(dead_code)]
+    fn require_concrete_execution_context(_: Arc<RequestExecutionContext>) {}
+
+    #[allow(dead_code)]
+    fn assert_envelope_requires_execution_context(envelope: Envelope<FakeFamily>) {
+        let Envelope { context, .. } = envelope;
+        require_concrete_execution_context(context);
     }
 }

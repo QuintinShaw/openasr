@@ -70,6 +70,7 @@ pub(crate) fn run_whisper_greedy_decode_loop(
     phrase_bias: Option<&PhraseBiasConfig>,
     step_executor: &mut dyn Seq2SeqGreedyDecodeStepExecutor,
     decode_text_token_ids: &dyn Fn(&[u32]) -> Result<String, WhisperGreedyDecodeError>,
+    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
 ) -> Result<WhisperGreedyDecodeResult, WhisperGreedyDecodeError> {
     let shared = run_builtin_seq2seq_decode_policy(
         crate::WHISPER_DECODE_POLICY_ID,
@@ -81,6 +82,7 @@ pub(crate) fn run_whisper_greedy_decode_loop(
         map_whisper_error_to_shared,
         map_shared_error,
         map_registry_error,
+        control,
     )?;
     Ok(WhisperGreedyDecodeResult {
         generated_tokens: shared.generated_tokens,
@@ -311,6 +313,7 @@ mod tests {
             None,
             &mut step_executor,
             &decode_text_token_ids,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .unwrap();
 
@@ -354,6 +357,7 @@ mod tests {
             None,
             &mut step_executor,
             &decode_text_token_ids,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
         )
         .expect_err("no EOT should fail closed");
 

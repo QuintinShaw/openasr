@@ -263,6 +263,7 @@ mod tests {
             prepared_audio: GgmlAsrPreparedAudio::mono_16khz(vec![0.0, 0.1]),
             request_options: crate::GgmlAsrExecutionOptions::default(),
             backend_preference: GgmlAsrBackendPreference::CpuOnly,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::detached()),
         }
     }
 
