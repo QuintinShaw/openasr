@@ -44,9 +44,9 @@ use std::path::PathBuf;
 use std::ptr;
 
 use openasr_core::{
-    BackendError, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeAsrError, NativeAsrHardwareTarget,
-    NativeBackend, StreamingConfig, StreamingEvent, StreamingEventKind, StreamingSession,
-    Transcription, TranscriptionBackend, TranscriptionRequest,
+    BackendError, ExecutionTarget, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeAsrError,
+    NativeAsrHardwareTarget, NativeBackend, StreamingConfig, StreamingEvent, StreamingEventKind,
+    StreamingSession, Transcription, TranscriptionBackend, TranscriptionRequest,
     validate_local_native_model_pack_path,
 };
 
@@ -174,11 +174,10 @@ pub struct OpenAsrResult {
     segments: Vec<OwnedSegment>,
 }
 
-/// Hardware target for a streaming session's decode, mirroring
+/// Hardware target for batch or streaming decode, mirroring
 /// [`openasr_core::NativeAsrHardwareTarget`]. `Auto` lets the runtime choose;
-/// on iOS/macOS only `Auto`, `Cpu`, `Accelerated`, and `AppleSilicon` are
-/// meaningful (the SDK is CPU-only today -- see `docs/SDK_IOS_MACOS.md`), but
-/// the full set is mapped so the contract does not silently drop a value.
+/// platform-specific accelerated targets are mapped to the core's generic
+/// accelerated route and still fail closed when that route is unavailable.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAsrHardwareTarget {
@@ -205,6 +204,32 @@ impl From<OpenAsrHardwareTarget> for NativeAsrHardwareTarget {
             OpenAsrHardwareTarget::IntelGpu => NativeAsrHardwareTarget::IntelGpu,
         }
     }
+}
+
+#[repr(C)]
+struct OpenAsrTranscribePcmConfigV2Prefix {
+    version: u32,
+    size: usize,
+}
+
+/// Version number accepted by [`OpenAsrTranscribePcmConfigV2`].
+pub const OPENASR_TRANSCRIBE_PCM_CONFIG_V2_VERSION: u32 = 1;
+
+/// Versioned, size-guarded configuration for [`openasr_transcribe_pcm_v2`].
+/// This is a separate struct and entry point so the legacy batch ABI remains
+/// unchanged. `hardware_target` carries an [`OpenAsrHardwareTarget`] wire
+/// value as a raw `u32`, allowing unknown values to be rejected before Rust
+/// materializes an enum with an invalid discriminant.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OpenAsrTranscribePcmConfigV2 {
+    /// Set to [`OPENASR_TRANSCRIBE_PCM_CONFIG_V2_VERSION`].
+    pub version: u32,
+    /// Caller-provided allocation size in bytes. Must be at least
+    /// `size_of::<OpenAsrTranscribePcmConfigV2>()` for this version.
+    pub size: usize,
+    /// Raw [`OpenAsrHardwareTarget`] value for this request only.
+    pub hardware_target: u32,
 }
 
 /// The kind of an incremental streaming transcript event, mirroring
@@ -400,17 +425,91 @@ pub unsafe extern "C" fn openasr_model_close(model: *mut OpenAsrModel) {
     });
 }
 
-/// Builds the [`TranscriptionRequest`] for one `openasr_transcribe_pcm` call.
-/// Split out from that function so the `RequestSource` wiring is
-/// unit-testable without a real model pack (this never touches the
-/// filesystem or a backend).
-fn ffi_transcription_request(staging_path: PathBuf, pack_path: PathBuf) -> TranscriptionRequest {
+fn batch_execution_target_from_wire(
+    hardware_target: u32,
+    context: &str,
+) -> Result<ExecutionTarget, OpenAsrStatus> {
+    let target = match hardware_target {
+        value if value == OpenAsrHardwareTarget::Auto as u32 => ExecutionTarget::Auto,
+        value
+            if value == OpenAsrHardwareTarget::Cpu as u32
+                || value == OpenAsrHardwareTarget::IntelCpu as u32 =>
+        {
+            ExecutionTarget::Cpu
+        }
+        value
+            if value == OpenAsrHardwareTarget::Accelerated as u32
+                || value == OpenAsrHardwareTarget::AppleSilicon as u32
+                || value == OpenAsrHardwareTarget::NvidiaCuda as u32
+                || value == OpenAsrHardwareTarget::AmdGpu as u32
+                || value == OpenAsrHardwareTarget::IntelGpu as u32 =>
+        {
+            ExecutionTarget::Accelerated
+        }
+        value => {
+            set_last_error(format!(
+                "{context}: unsupported hardware target value {value}"
+            ));
+            return Err(OpenAsrStatus::InvalidArgument);
+        }
+    };
+    Ok(target)
+}
+
+/// Parses the V2 batch config after validating that its advertised layout is
+/// safe to read. The raw hardware wire value is checked before it becomes a
+/// Rust enum, so unknown values fail closed without invoking undefined
+/// behavior at the ABI boundary.
+///
+/// # Safety
+/// `config`, when non-null, must point to a readable prefix containing
+/// `version` and `size` (`u32` followed by `usize`).
+unsafe fn transcribe_pcm_config_from_c_v2(
+    config: *const OpenAsrTranscribePcmConfigV2,
+) -> Result<ExecutionTarget, OpenAsrStatus> {
+    const CONTEXT: &str = "openasr_transcribe_pcm_v2";
+    if config.is_null() {
+        set_last_error(format!("{CONTEXT}: config must not be null"));
+        return Err(OpenAsrStatus::InvalidArgument);
+    }
+    // SAFETY: caller contract requires a readable prefix at `config`.
+    let prefix = unsafe { &*config.cast::<OpenAsrTranscribePcmConfigV2Prefix>() };
+    if prefix.version != OPENASR_TRANSCRIBE_PCM_CONFIG_V2_VERSION {
+        set_last_error(format!(
+            "{CONTEXT}: unsupported config version {}",
+            prefix.version
+        ));
+        return Err(OpenAsrStatus::InvalidArgument);
+    }
+    if prefix.size < mem::size_of::<OpenAsrTranscribePcmConfigV2>() {
+        set_last_error(format!(
+            "{CONTEXT}: config size {} is smaller than required {}",
+            prefix.size,
+            mem::size_of::<OpenAsrTranscribePcmConfigV2>()
+        ));
+        return Err(OpenAsrStatus::InvalidArgument);
+    }
+    // SAFETY: the advertised size covers the complete V2 layout.
+    let raw = unsafe { &*config };
+    batch_execution_target_from_wire(raw.hardware_target, CONTEXT)
+}
+
+/// Builds the [`TranscriptionRequest`] for one batch PCM call. Split out so
+/// request-scoped execution routing and diagnostic source wiring are
+/// unit-testable without a real model pack (this never touches the filesystem
+/// or a backend).
+fn ffi_transcription_request(
+    staging_path: PathBuf,
+    pack_path: PathBuf,
+    execution_target: Option<ExecutionTarget>,
+) -> TranscriptionRequest {
     TranscriptionRequest::new(staging_path, NATIVE_RUNTIME_MODEL_ID_AUTO)
         // The C ABI carries no field distinguishing which host feature called
         // in, so every embedder logs this one label -- see
         // `RequestSource::Ffi`'s doc comment.
         .with_source(openasr_core::RequestSource::Ffi)
         .with_model_pack_path(Some(pack_path))
+        .with_execution_target(execution_target)
         .with_word_timestamps(false)
 }
 
@@ -441,94 +540,193 @@ pub unsafe extern "C" fn openasr_transcribe_pcm(
     with_segments: bool,
     out_result: *mut *mut OpenAsrResult,
 ) -> OpenAsrStatus {
+    catch(OpenAsrStatus::TranscribeFailed, || unsafe {
+        transcribe_pcm_impl(
+            model,
+            pcm,
+            pcm_len_samples,
+            format,
+            sample_rate_hz,
+            with_segments,
+            None,
+            "openasr_transcribe_pcm",
+            out_result,
+        )
+    })
+}
+
+/// Transcribes one whole in-memory PCM buffer with an explicit, request-scoped
+/// hardware target. The legacy [`openasr_transcribe_pcm`] symbol and behavior
+/// remain unchanged; this V2 entry point adds only the versioned config before
+/// `out_result`.
+///
+/// `config` is required. Unknown versions, undersized layouts, and unknown
+/// hardware values return [`OpenAsrStatus::InvalidArgument`] and leave
+/// `out_result` null. `Auto`, `Cpu`, `Accelerated`, and `AppleSilicon` map to
+/// the matching core execution policy; an explicitly accelerated route fails
+/// closed if the device is unavailable. Allocation failures still return
+/// [`OpenAsrStatus::OutOfMemory`].
+///
+/// # Safety
+/// The legacy arguments follow [`openasr_transcribe_pcm`]'s safety contract.
+/// `config` must point to a readable prefix containing `version` and `size`;
+/// when its advertised size is sufficient, it must point to a complete
+/// [`OpenAsrTranscribePcmConfigV2`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openasr_transcribe_pcm_v2(
+    model: *mut OpenAsrModel,
+    pcm: *const c_void,
+    pcm_len_samples: usize,
+    format: OpenAsrPcmFormat,
+    sample_rate_hz: u32,
+    with_segments: bool,
+    config: *const OpenAsrTranscribePcmConfigV2,
+    out_result: *mut *mut OpenAsrResult,
+) -> OpenAsrStatus {
     catch(OpenAsrStatus::TranscribeFailed, || {
         if out_result.is_null() {
-            set_last_error("openasr_transcribe_pcm: out_result must not be null");
+            set_last_error("openasr_transcribe_pcm_v2: out_result must not be null");
             return OpenAsrStatus::InvalidArgument;
         }
         // SAFETY: caller contract requires `out_result` to be a valid pointer.
         unsafe {
             *out_result = ptr::null_mut();
         }
-        if model.is_null() {
-            set_last_error("openasr_transcribe_pcm: model handle must not be null");
-            return OpenAsrStatus::InvalidArgument;
-        }
-        if pcm.is_null() && pcm_len_samples > 0 {
-            set_last_error("openasr_transcribe_pcm: pcm must not be null when non-empty");
-            return OpenAsrStatus::InvalidArgument;
-        }
-        if sample_rate_hz != 16_000 {
-            set_last_error(format!(
-                "openasr_transcribe_pcm: only 16000 Hz mono PCM is supported in v1, got {sample_rate_hz} Hz"
-            ));
-            return OpenAsrStatus::InvalidArgument;
-        }
-        if pcm_len_samples == 0 {
-            set_last_error("openasr_transcribe_pcm: pcm_len_samples must be > 0");
-            return OpenAsrStatus::InvalidArgument;
-        }
-
-        // SAFETY: caller contract guarantees `pcm` points at
-        // `pcm_len_samples` samples of `format`; both arms read exactly that
-        // many elements of the matching type and copy them out before this
-        // function returns.
-        let samples_f32 = unsafe {
-            match format {
-                OpenAsrPcmFormat::F32 => copy_f32_pcm(std::slice::from_raw_parts(
-                    pcm as *const f32,
-                    pcm_len_samples,
-                )),
-                OpenAsrPcmFormat::S16 => s16_pcm_to_f32(std::slice::from_raw_parts(
-                    pcm as *const i16,
-                    pcm_len_samples,
-                )),
-            }
+        let execution_target = match unsafe { transcribe_pcm_config_from_c_v2(config) } {
+            Ok(target) => target,
+            Err(status) => return status,
         };
-        let samples_f32 = match samples_f32 {
-            Ok(samples) => samples,
-            Err(PcmCopyError::HostAllocationFailed { requested_bytes }) => {
-                set_last_error(format!(
-                    "openasr_transcribe_pcm: host allocation failed while copying PCM (requested_bytes={requested_bytes})"
-                ));
-                return OpenAsrStatus::OutOfMemory;
-            }
-        };
-
-        // SAFETY: `model` was checked non-null above and, per the function's
-        // safety contract, is a live handle from `openasr_model_open`.
-        let model_ref = unsafe { &*model };
-
-        let staging = match tempfile::Builder::new()
-            .prefix("openasr-ffi-")
-            .suffix(".wav")
-            .tempfile()
-        {
-            Ok(file) => file,
-            Err(error) => {
-                set_last_error(format!(
-                    "openasr_transcribe_pcm: could not create staging file: {error}"
-                ));
-                return OpenAsrStatus::IoError;
-            }
-        };
-        let staging_path = staging.path().to_path_buf();
-        if let Err(error) = write_wav_16khz_mono_f32(&staging_path, &samples_f32) {
-            set_last_error(format!(
-                "openasr_transcribe_pcm: could not stage PCM as WAV: {error}"
-            ));
-            return OpenAsrStatus::IoError;
+        unsafe {
+            transcribe_pcm_impl(
+                model,
+                pcm,
+                pcm_len_samples,
+                format,
+                sample_rate_hz,
+                with_segments,
+                Some(execution_target),
+                "openasr_transcribe_pcm_v2",
+                out_result,
+            )
         }
-
-        let request = ffi_transcription_request(staging_path, model_ref.pack_path.clone());
-
-        finish_transcribe_pcm(NativeBackend.transcribe(request), with_segments, out_result)
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+unsafe fn transcribe_pcm_impl(
+    model: *mut OpenAsrModel,
+    pcm: *const c_void,
+    pcm_len_samples: usize,
+    format: OpenAsrPcmFormat,
+    sample_rate_hz: u32,
+    with_segments: bool,
+    execution_target: Option<ExecutionTarget>,
+    context: &str,
+    out_result: *mut *mut OpenAsrResult,
+) -> OpenAsrStatus {
+    if out_result.is_null() {
+        set_last_error(format!("{context}: out_result must not be null"));
+        return OpenAsrStatus::InvalidArgument;
+    }
+    // SAFETY: caller contract requires `out_result` to be a valid pointer.
+    unsafe {
+        *out_result = ptr::null_mut();
+    }
+    if model.is_null() {
+        set_last_error(format!("{context}: model handle must not be null"));
+        return OpenAsrStatus::InvalidArgument;
+    }
+    if pcm.is_null() && pcm_len_samples > 0 {
+        set_last_error(format!("{context}: pcm must not be null when non-empty"));
+        return OpenAsrStatus::InvalidArgument;
+    }
+    if sample_rate_hz != 16_000 {
+        set_last_error(format!(
+            "{context}: only 16000 Hz mono PCM is supported, got {sample_rate_hz} Hz"
+        ));
+        return OpenAsrStatus::InvalidArgument;
+    }
+    if pcm_len_samples == 0 {
+        set_last_error(format!("{context}: pcm_len_samples must be > 0"));
+        return OpenAsrStatus::InvalidArgument;
+    }
+
+    // SAFETY: caller contract guarantees `pcm` points at
+    // `pcm_len_samples` samples of `format`; both arms read exactly that
+    // many elements of the matching type and copy them out before this
+    // function returns.
+    let samples_f32 = unsafe {
+        match format {
+            OpenAsrPcmFormat::F32 => copy_f32_pcm(std::slice::from_raw_parts(
+                pcm as *const f32,
+                pcm_len_samples,
+            )),
+            OpenAsrPcmFormat::S16 => s16_pcm_to_f32(std::slice::from_raw_parts(
+                pcm as *const i16,
+                pcm_len_samples,
+            )),
+        }
+    };
+    let samples_f32 = match samples_f32 {
+        Ok(samples) => samples,
+        Err(PcmCopyError::HostAllocationFailed { requested_bytes }) => {
+            set_last_error(format!(
+                "{context}: host allocation failed while copying PCM (requested_bytes={requested_bytes})"
+            ));
+            return OpenAsrStatus::OutOfMemory;
+        }
+    };
+
+    // SAFETY: `model` was checked non-null above and, per the function's
+    // safety contract, is a live handle from `openasr_model_open`.
+    let model_ref = unsafe { &*model };
+
+    let staging = match tempfile::Builder::new()
+        .prefix("openasr-ffi-")
+        .suffix(".wav")
+        .tempfile()
+    {
+        Ok(file) => file,
+        Err(error) => {
+            set_last_error(format!("{context}: could not create staging file: {error}"));
+            return OpenAsrStatus::IoError;
+        }
+    };
+    let staging_path = staging.path().to_path_buf();
+    if let Err(error) = write_wav_16khz_mono_f32(&staging_path, &samples_f32) {
+        set_last_error(format!("{context}: could not stage PCM as WAV: {error}"));
+        return OpenAsrStatus::IoError;
+    }
+
+    let request =
+        ffi_transcription_request(staging_path, model_ref.pack_path.clone(), execution_target);
+
+    finish_transcribe_pcm_with_context(
+        NativeBackend.transcribe(request),
+        with_segments,
+        context,
+        out_result,
+    )
+}
+
+#[cfg(test)]
 fn finish_transcribe_pcm(
     transcription: Result<Transcription, BackendError>,
     with_segments: bool,
+    out_result: *mut *mut OpenAsrResult,
+) -> OpenAsrStatus {
+    finish_transcribe_pcm_with_context(
+        transcription,
+        with_segments,
+        "openasr_transcribe_pcm",
+        out_result,
+    )
+}
+
+fn finish_transcribe_pcm_with_context(
+    transcription: Result<Transcription, BackendError>,
+    with_segments: bool,
+    context: &str,
     out_result: *mut *mut OpenAsrResult,
 ) -> OpenAsrStatus {
     match transcription {
@@ -542,7 +740,7 @@ fn finish_transcribe_pcm(
         }
         Err(error) => {
             let status = backend_error_status(&error, OpenAsrStatus::TranscribeFailed);
-            set_last_error(format!("openasr_transcribe_pcm: {error}"));
+            set_last_error(format!("{context}: {error}"));
             status
         }
     }
@@ -1675,8 +1873,100 @@ mod tests {
         let request = ffi_transcription_request(
             PathBuf::from("/tmp/openasr-ffi-staging.wav"),
             PathBuf::from("/nonexistent/model.oasr"),
+            None,
         );
         assert_eq!(request.source, openasr_core::RequestSource::Ffi);
+        assert_eq!(request.execution_target, None);
+    }
+
+    #[test]
+    fn batch_hardware_wire_values_map_to_request_scoped_execution_targets() {
+        for (wire, expected) in [
+            (OpenAsrHardwareTarget::Auto as u32, ExecutionTarget::Auto),
+            (OpenAsrHardwareTarget::Cpu as u32, ExecutionTarget::Cpu),
+            (
+                OpenAsrHardwareTarget::Accelerated as u32,
+                ExecutionTarget::Accelerated,
+            ),
+            (
+                OpenAsrHardwareTarget::AppleSilicon as u32,
+                ExecutionTarget::Accelerated,
+            ),
+        ] {
+            let target = batch_execution_target_from_wire(wire, "test")
+                .expect("known hardware target must map");
+            let request = ffi_transcription_request(
+                PathBuf::from("/tmp/openasr-ffi-staging.wav"),
+                PathBuf::from("/nonexistent/model.oasr"),
+                Some(target),
+            );
+            assert_eq!(request.execution_target, Some(expected));
+        }
+    }
+
+    #[test]
+    fn batch_config_v2_rejects_null_unknown_version_short_size_and_unknown_target() {
+        // SAFETY: null is the documented invalid config case under test.
+        assert_eq!(
+            unsafe { transcribe_pcm_config_from_c_v2(ptr::null()) },
+            Err(OpenAsrStatus::InvalidArgument)
+        );
+
+        let mut raw = OpenAsrTranscribePcmConfigV2 {
+            version: 99,
+            size: mem::size_of::<OpenAsrTranscribePcmConfigV2>(),
+            hardware_target: OpenAsrHardwareTarget::Auto as u32,
+        };
+        // SAFETY: `raw` is readable; its version is intentionally unsupported.
+        assert_eq!(
+            unsafe { transcribe_pcm_config_from_c_v2(&raw) },
+            Err(OpenAsrStatus::InvalidArgument)
+        );
+
+        raw.version = OPENASR_TRANSCRIBE_PCM_CONFIG_V2_VERSION;
+        raw.size = mem::size_of::<OpenAsrTranscribePcmConfigV2>() - 1;
+        // SAFETY: `raw` is complete; its advertised size is intentionally short.
+        assert_eq!(
+            unsafe { transcribe_pcm_config_from_c_v2(&raw) },
+            Err(OpenAsrStatus::InvalidArgument)
+        );
+
+        raw.size = mem::size_of::<OpenAsrTranscribePcmConfigV2>();
+        raw.hardware_target = u32::MAX;
+        // SAFETY: `raw` is complete; its hardware value is intentionally unknown.
+        assert_eq!(
+            unsafe { transcribe_pcm_config_from_c_v2(&raw) },
+            Err(OpenAsrStatus::InvalidArgument)
+        );
+        assert!(last_error().contains("unsupported hardware target"));
+    }
+
+    #[test]
+    fn transcribe_pcm_v2_invalid_config_nulls_result_before_other_arguments() {
+        let mut out_result = ptr::dangling_mut::<OpenAsrResult>();
+        // SAFETY: all pointers are either null or a valid out slot. The V2
+        // entry point must reject the null config before inspecting model/PCM.
+        let status = unsafe {
+            openasr_transcribe_pcm_v2(
+                ptr::null_mut(),
+                ptr::null(),
+                0,
+                OpenAsrPcmFormat::F32,
+                16_000,
+                false,
+                ptr::null(),
+                &mut out_result,
+            )
+        };
+        assert_eq!(status, OpenAsrStatus::InvalidArgument);
+        assert!(out_result.is_null());
+        assert!(last_error().contains("config must not be null"));
+    }
+
+    #[test]
+    fn allocation_and_cancel_status_discriminants_remain_stable() {
+        assert_eq!(OpenAsrStatus::PullCanceled as u32, 8);
+        assert_eq!(OpenAsrStatus::OutOfMemory as u32, 9);
     }
 
     #[test]

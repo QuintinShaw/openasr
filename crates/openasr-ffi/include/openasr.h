@@ -10,6 +10,11 @@
 #include <stdlib.h>
 
 /**
+ * Version number accepted by [`OpenAsrTranscribePcmConfigV2`].
+ */
+#define OPENASR_TRANSCRIBE_PCM_CONFIG_V2_VERSION 1
+
+/**
  * Wire value for neural FireRed endpointing in [`OpenAsrStreamingConfigV2`].
  */
 #define OPENASR_STREAMING_VAD_MODE_NEURAL 0
@@ -109,11 +114,10 @@ typedef enum OpenAsrPcmFormat {
 } OpenAsrPcmFormat;
 
 /**
- * Hardware target for a streaming session's decode, mirroring
+ * Hardware target for batch or streaming decode, mirroring
  * [`openasr_core::NativeAsrHardwareTarget`]. `Auto` lets the runtime choose;
- * on iOS/macOS only `Auto`, `Cpu`, `Accelerated`, and `AppleSilicon` are
- * meaningful (the SDK is CPU-only today -- see `docs/SDK_IOS_MACOS.md`), but
- * the full set is mapped so the contract does not silently drop a value.
+ * platform-specific accelerated targets are mapped to the core's generic
+ * accelerated route and still fail closed when that route is unavailable.
  */
 typedef enum OpenAsrHardwareTarget {
   OPEN_ASR_HARDWARE_TARGET_AUTO = 0,
@@ -223,6 +227,29 @@ typedef struct OpenAsrStreamingEvents OpenAsrStreamingEvents;
  * [`openasr_streaming_free`].
  */
 typedef struct OpenAsrStreamingSession OpenAsrStreamingSession;
+
+/**
+ * Versioned, size-guarded configuration for [`openasr_transcribe_pcm_v2`].
+ * This is a separate struct and entry point so the legacy batch ABI remains
+ * unchanged. `hardware_target` carries an [`OpenAsrHardwareTarget`] wire
+ * value as a raw `u32`, allowing unknown values to be rejected before Rust
+ * materializes an enum with an invalid discriminant.
+ */
+typedef struct OpenAsrTranscribePcmConfigV2 {
+  /**
+   * Set to [`OPENASR_TRANSCRIBE_PCM_CONFIG_V2_VERSION`].
+   */
+  uint32_t version;
+  /**
+   * Caller-provided allocation size in bytes. Must be at least
+   * `size_of::<OpenAsrTranscribePcmConfigV2>()` for this version.
+   */
+  uintptr_t size;
+  /**
+   * Raw [`OpenAsrHardwareTarget`] value for this request only.
+   */
+  uint32_t hardware_target;
+} OpenAsrTranscribePcmConfigV2;
 
 /**
  * Configuration for [`openasr_streaming_session_open`]. Pass a null pointer to
@@ -369,6 +396,34 @@ enum OpenAsrStatus openasr_transcribe_pcm(struct OpenAsrModel *model,
                                           uint32_t sample_rate_hz,
                                           bool with_segments,
                                           struct OpenAsrResult **out_result);
+
+/**
+ * Transcribes one whole in-memory PCM buffer with an explicit, request-scoped
+ * hardware target. The legacy [`openasr_transcribe_pcm`] symbol and behavior
+ * remain unchanged; this V2 entry point adds only the versioned config before
+ * `out_result`.
+ *
+ * `config` is required. Unknown versions, undersized layouts, and unknown
+ * hardware values return [`OpenAsrStatus::InvalidArgument`] and leave
+ * `out_result` null. `Auto`, `Cpu`, `Accelerated`, and `AppleSilicon` map to
+ * the matching core execution policy; an explicitly accelerated route fails
+ * closed if the device is unavailable. Allocation failures still return
+ * [`OpenAsrStatus::OutOfMemory`].
+ *
+ * # Safety
+ * The legacy arguments follow [`openasr_transcribe_pcm`]'s safety contract.
+ * `config` must point to a readable prefix containing `version` and `size`;
+ * when its advertised size is sufficient, it must point to a complete
+ * [`OpenAsrTranscribePcmConfigV2`].
+ */
+enum OpenAsrStatus openasr_transcribe_pcm_v2(struct OpenAsrModel *model,
+                                             const void *pcm,
+                                             uintptr_t pcm_len_samples,
+                                             enum OpenAsrPcmFormat format,
+                                             uint32_t sample_rate_hz,
+                                             bool with_segments,
+                                             const struct OpenAsrTranscribePcmConfigV2 *config,
+                                             struct OpenAsrResult **out_result);
 
 /**
  * Frees a result returned by [`openasr_transcribe_pcm`]. Null is accepted
