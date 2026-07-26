@@ -341,6 +341,21 @@ fn backend_job_for_test(id: &str) -> BackendJob {
     }
 }
 
+/// Structural proof that `RealtimeBackendWorkItem::execution_context` is
+/// required, not optional: this only compiles because the field's type is
+/// the concrete `Arc<RequestExecutionContext>`. Never called; exists purely
+/// so `cargo check`/`clippy` re-verify the contract on every build.
+#[allow(dead_code)]
+fn require_concrete_execution_context(_: Arc<openasr_core::RequestExecutionContext>) {}
+
+#[allow(dead_code)]
+fn assert_realtime_backend_work_item_requires_execution_context(item: RealtimeBackendWorkItem) {
+    let RealtimeBackendWorkItem {
+        execution_context, ..
+    } = item;
+    require_concrete_execution_context(execution_context);
+}
+
 fn work_item_for_test(session_key: &str, id: &str) -> RealtimeBackendWorkItem {
     let (result_sender, _result_receiver) = mpsc::channel(4);
     RealtimeBackendWorkItem {
@@ -348,7 +363,152 @@ fn work_item_for_test(session_key: &str, id: &str) -> RealtimeBackendWorkItem {
         job: backend_job_for_test(id),
         result_sender,
         cancelled: Arc::new(AtomicBool::new(false)),
+        execution_context: Arc::new(openasr_core::RequestExecutionContext::detached()),
     }
+}
+
+/// `cancel_backend_jobs` must flip the same `Arc<TranscriptionControl>` a
+/// queued `RealtimeBackendWorkItem`'s execution context carries -- otherwise
+/// a session-level cancel (transport closed, backend failure, session finish)
+/// would never reach a decode a worker already picked up, and it would run to
+/// its natural end regardless of the cancel. Builds the work item the exact
+/// way `queue_utterance` does (same `backend_control` clone), without needing
+/// the full audio-buffering path that method requires.
+#[tokio::test]
+async fn cancel_backend_jobs_cancels_the_execution_context_shared_by_a_queued_work_item() {
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+
+    let (result_sender, _result_receiver) = mpsc::channel(4);
+    let work_item = RealtimeBackendWorkItem {
+        session_key: session.session_id.0.clone(),
+        job: backend_job_for_test("cancel-wiring"),
+        result_sender,
+        cancelled: Arc::clone(&session.backend_cancelled),
+        execution_context: Arc::new(openasr_core::RequestExecutionContext::new(
+            None,
+            Arc::clone(&session.backend_control),
+        )),
+    };
+    assert!(!work_item.execution_context.is_canceled());
+    assert!(!work_item.cancelled.load(Ordering::Relaxed));
+
+    session.cancel_backend_jobs();
+
+    assert!(
+        work_item.execution_context.is_canceled(),
+        "session cancel must flip the control the work item's context shares"
+    );
+    assert!(work_item.cancelled.load(Ordering::Relaxed));
+}
+
+/// A realtime backend job that is already canceled by the time its
+/// `spawn_blocking` decode closure runs must exit at its first cooperative
+/// checkpoint (the shared greedy driver's pre-step check) instead of running
+/// the encoder+decoder to completion, and the model-capacity permit
+/// `run_admitted_native_transcription` held for the decode must already be
+/// free by the time the result is observable -- proving a canceled realtime
+/// job can never pin a model slot for its natural decode duration. Cancels
+/// before dispatch (rather than racing a real mid-decode disconnect) so the
+/// test is deterministic: the causal chain exercised (permit acquired ->
+/// decode runs -> cancellation observed -> decode exits -> permit released)
+/// is the same one a live disconnect after permit acquisition would hit.
+#[tokio::test]
+async fn realtime_backend_job_canceled_before_dispatch_releases_capacity_promptly() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_path = temp.path().join("realtime-cancel-releases-capacity.oasr");
+    let spec = openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(
+        "whisper-cancel-fixture",
+    );
+    openasr_core::testing::write_tiny_gguf_runtime_source(&pack_path, &spec)
+        .expect("write whisper fixture pack");
+
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap()),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_path),
+    };
+
+    // One second of a real (non-silent) tone rather than jfk.wav: keeps the
+    // encoder pass this test still exercises (cancellation is only checked
+    // starting at the greedy decode loop, so the encoder always runs first)
+    // short and this test fast.
+    let samples: Vec<i16> = (0..16_000)
+        .map(|index| {
+            let t = index as f32 / 16_000.0;
+            ((t * 440.0 * std::f32::consts::TAU).sin() * 4000.0) as i16
+        })
+        .collect();
+    let mut temp_wav = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+    write_pcm16_mono_16khz_wav(temp_wav.as_file_mut(), &samples).unwrap();
+    temp_wav.as_file_mut().flush().unwrap();
+
+    let job = BackendJob {
+        utterance_id: TranscriptUtteranceId("utt_cancel".to_string()),
+        start_ms: 0,
+        end_ms: 1_000,
+        segment_id: TranscriptSegmentId("seg_cancel".to_string()),
+        model_id: "whisper-cancel-fixture".to_string(),
+        language: None,
+        task: None,
+        prompt: None,
+        phrase_bias: None,
+        inference_threads: None,
+        execution_target: None,
+        word_timestamps: false,
+        display_name: "realtime-cancel-test.wav".to_string(),
+        temp_wav,
+    };
+
+    let execution_context = Arc::new(openasr_core::RequestExecutionContext::new(
+        Some("realtime-cancel-test".to_string()),
+        Arc::new(openasr_core::TranscriptionControl::new()),
+    ));
+    execution_context.control.request_cancel();
+
+    let (result_sender, mut result_receiver) = mpsc::channel(1);
+    let (worker_sender, _worker_receiver) = mpsc::channel(1);
+    let work_item = RealtimeBackendWorkItem {
+        session_key: "realtime-cancel-test-session".to_string(),
+        job,
+        result_sender,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        execution_context,
+    };
+
+    launch_realtime_backend_work_item(runtime.clone(), worker_sender, work_item);
+
+    let result = tokio::time::timeout(Duration::from_secs(10), result_receiver.recv())
+        .await
+        .expect("canceled realtime job must exit well before a real decode would finish")
+        .expect("result channel must receive exactly one result");
+
+    match &result {
+        BackendResult::Error(error) => {
+            assert!(
+                error.to_string().contains("cancel")
+                    || error.to_string().to_ascii_lowercase().contains("canceled"),
+                "canceled job must fail with a cancellation-shaped error, got: {error}"
+            );
+        }
+        BackendResult::Final(success) => {
+            panic!(
+                "a job canceled before dispatch must not produce a final transcript: {:?}",
+                success.text
+            );
+        }
+    }
+
+    // The permit `run_admitted_native_transcription` held for the decode is
+    // released before `transcribe_with_runtime`'s future resolves, which is
+    // strictly before this result became observable above -- so this must
+    // already succeed, not merely "eventually".
+    assert!(
+        runtime.acquire_native_execution(None).is_ok(),
+        "the model-capacity permit must already be free once the canceled job's result is observed"
+    );
 }
 
 fn started_controller(session_id: &str, model_id: &str) -> RealtimeSessionController {

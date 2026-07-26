@@ -40,6 +40,13 @@ pub(crate) struct WsSession {
     pub(crate) backend_results: Option<mpsc::Receiver<BackendResult>>,
     pub(crate) backend_result_sender: Option<mpsc::Sender<BackendResult>>,
     pub(crate) backend_cancelled: Arc<AtomicBool>,
+    /// Explicit cancel/pause/resume control shared by every backend work item
+    /// this session submits -- never a thread-local. `cancel_backend_jobs`
+    /// flips this (alongside `backend_cancelled`) so an in-flight decode a
+    /// worker already picked up actually stops at its next cooperative
+    /// checkpoint, instead of only suppressing the result after it finishes
+    /// on its own. See [`openasr_core::RequestExecutionContext`].
+    pub(crate) backend_control: Arc<openasr_core::TranscriptionControl>,
     pub(crate) pending_backend_jobs: usize,
     pub(crate) audio_frames: mpsc::Sender<RealtimeAudioFrame>,
     pub(crate) audio_frame_receiver: mpsc::Receiver<RealtimeAudioFrame>,
@@ -659,6 +666,7 @@ impl WsSession {
             backend_results: None,
             backend_result_sender: None,
             backend_cancelled: Arc::new(AtomicBool::new(false)),
+            backend_control: Arc::new(openasr_core::TranscriptionControl::new()),
             pending_backend_jobs: 0,
             audio_frames,
             audio_frame_receiver,
@@ -2940,6 +2948,10 @@ impl WsSession {
             job,
             result_sender,
             cancelled: Arc::clone(&self.backend_cancelled),
+            execution_context: Arc::new(openasr_core::RequestExecutionContext::new(
+                None,
+                Arc::clone(&self.backend_control),
+            )),
         };
         if sender
             .try_send(RealtimeBackendWorkerMessage::Job(work_item))
@@ -3301,6 +3313,9 @@ impl WsSession {
 
     pub(crate) fn cancel_backend_jobs(&mut self) {
         self.backend_cancelled.store(true, Ordering::Relaxed);
+        // Actually stop an in-flight decode a worker already picked up, not
+        // just suppress its result once it finishes on its own.
+        self.backend_control.request_cancel();
         self.backend_jobs.take();
         self.backend_result_sender.take();
         self.pending_backend_jobs = 0;

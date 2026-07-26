@@ -1144,6 +1144,11 @@ pub(crate) struct RealtimeBackendWorkItem {
     pub(crate) job: BackendJob,
     pub(crate) result_sender: mpsc::Sender<BackendResult>,
     pub(crate) cancelled: Arc<AtomicBool>,
+    /// Explicit cancel/pause/resume context for this job's decode -- never a
+    /// thread-local. Required (not `Option`): a work item with nothing to
+    /// cancel still carries a real, detached context. See
+    /// [`openasr_core::RequestExecutionContext`].
+    pub(crate) execution_context: Arc<openasr_core::RequestExecutionContext>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -1297,7 +1302,7 @@ pub(crate) fn launch_realtime_backend_work_item(
     tokio::spawn(async move {
         let cancelled = Arc::clone(&item.cancelled);
         let result_sender = item.result_sender.clone();
-        let result = run_realtime_backend_job(runtime, item.job).await;
+        let result = run_realtime_backend_job(runtime, item.job, item.execution_context).await;
         if !cancelled.load(Ordering::Relaxed) {
             let _ = result_sender.send(result).await;
         }
@@ -1307,7 +1312,11 @@ pub(crate) fn launch_realtime_backend_work_item(
     });
 }
 
-async fn run_realtime_backend_job(runtime: ServerRuntime, job: BackendJob) -> BackendResult {
+async fn run_realtime_backend_job(
+    runtime: ServerRuntime,
+    job: BackendJob,
+    execution_context: Arc<openasr_core::RequestExecutionContext>,
+) -> BackendResult {
     // Echo the requested language into the final realtime result; the core
     // Transcription carries no detected language, so the request value is the
     // only source. Capture it before job.language is moved into the builder.
@@ -1329,7 +1338,7 @@ async fn run_realtime_backend_job(runtime: ServerRuntime, job: BackendJob) -> Ba
         .with_execution_target(job.execution_target)
         .with_word_timestamps(job.word_timestamps)
         .with_display_file_name(Some(job.display_name));
-    match transcribe_with_runtime(runtime, request, None).await {
+    match transcribe_with_runtime(runtime, request, execution_context).await {
         Ok(transcription) => {
             let words = realtime_words_from_transcription(&transcription);
             BackendResult::Final(BackendSuccess {

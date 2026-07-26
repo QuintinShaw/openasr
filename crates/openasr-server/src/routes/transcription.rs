@@ -322,31 +322,45 @@ async fn run_offline_transcription(
     let mut control_cleanup = control.as_ref().map(|(id, control)| {
         ActiveTranscriptionCleanup::new(distribution.clone(), id.clone(), Arc::clone(control))
     });
-    let control_handle = control.as_ref().map(|(_, control)| Arc::clone(control));
-    let transcription =
-        match transcribe_with_runtime(runtime, parsed.request, control_handle.clone()).await {
-            Ok(transcription) => {
-                if let Some(cleanup) = control_cleanup.as_mut() {
-                    cleanup.disarm();
-                }
-                transcription
+    // Explicit per-request context threaded all the way to the decode
+    // dispatch -- never a thread-local. A client that never registered a
+    // transcription id still gets a concrete (detached) context: there is no
+    // "no context" code path below this point.
+    let execution_context = Arc::new(match &control {
+        Some((id, control)) => {
+            openasr_core::RequestExecutionContext::new(Some(id.clone()), Arc::clone(control))
+        }
+        None => openasr_core::RequestExecutionContext::detached(),
+    });
+    let transcription = match transcribe_with_runtime(
+        runtime,
+        parsed.request,
+        Arc::clone(&execution_context),
+    )
+    .await
+    {
+        Ok(transcription) => {
+            if let Some(cleanup) = control_cleanup.as_mut() {
+                cleanup.disarm();
             }
-            Err(error) => {
-                if let Some(cleanup) = control_cleanup.as_mut() {
-                    cleanup.disarm();
-                }
-                // A cancel surfaces from core as a generic fail-closed error (the
-                // typed cancel is flattened through the NativeAsrError layer), so
-                // consult the control to report it honestly as a 409 canceled result
-                // rather than a 400 fail-closed refusal.
-                if control_handle.is_some_and(|control| control.is_canceled()) {
-                    return Err(ApiError::Backend(
-                        openasr_core::BackendError::TranscriptionCanceled,
-                    ));
-                }
-                return Err(error);
+            transcription
+        }
+        Err(error) => {
+            if let Some(cleanup) = control_cleanup.as_mut() {
+                cleanup.disarm();
             }
-        };
+            // A cancel surfaces from core as a generic fail-closed error (the
+            // typed cancel is flattened through the NativeAsrError layer), so
+            // consult the control to report it honestly as a 409 canceled result
+            // rather than a 400 fail-closed refusal.
+            if execution_context.is_canceled() {
+                return Err(ApiError::Backend(
+                    openasr_core::BackendError::TranscriptionCanceled,
+                ));
+            }
+            return Err(error);
+        }
+    };
     let rendered = render_transcription(&transcription, parsed.response_format)
         .map_err(ApiError::Serialize)?;
     // History is a best-effort audit side-write: a successful transcription must
@@ -1407,14 +1421,14 @@ mod admission_tests {
 pub(crate) async fn transcribe_with_runtime(
     runtime: ServerRuntime,
     request: TranscriptionRequest,
-    control: Option<Arc<openasr_core::TranscriptionControl>>,
+    execution_context: Arc<openasr_core::RequestExecutionContext>,
 ) -> Result<openasr_core::Transcription, ApiError> {
     match runtime.backend {
         BackendKind::Mock => {
             // The mock backend runs a single opaque decode with no slice loop, so
-            // there is no boundary to observe a pause/cancel; the control (if any)
-            // is simply not installed here.
-            let _ = &control;
+            // there is no boundary to observe a pause/cancel; the context (if
+            // any real control was registered) is simply not consulted here.
+            let _ = &execution_context;
             let prepared = prepare_audio_input(
                 &request.input_path,
                 &AudioPreparationOptions::new(runtime.backend),
@@ -1456,12 +1470,14 @@ pub(crate) async fn transcribe_with_runtime(
                     // the idle_unload reaper never evicts the model runtime cache out
                     // from under it; dropped (any exit path) once the decode returns.
                     let _activity_guard = NativeActivityGuard::enter();
-                    // Bind the pause/cancel control to this decode thread for the whole
-                    // synchronous run so the long-form slice loop can observe it; the
-                    // guard clears the binding on any exit. `None` (no control requested)
-                    // leaves the decode byte-identical to before.
-                    let _control_guard =
-                        control.map(openasr_core::install_active_transcription_control);
+                    // Publishes the request's cancel atomic as this thread's
+                    // ggml abort-callback data for the whole synchronous
+                    // decode below, so a mid-graph-compute cancel can
+                    // actually abort (not just stop at the next slice/token
+                    // boundary). The control itself already travels
+                    // explicitly via `execution_context` -- this only arms
+                    // the FFI trampoline, which can't see that context.
+                    let _abort_callback_guard = execution_context.control.arm_for_native_decode();
                     let model_pack_path = runtime.model_pack_path.clone().ok_or_else(|| {
                         TranscriptionRuntimeError::Backend(
                         openasr_core::BackendError::NativeModelPackPathRejected {
@@ -1524,7 +1540,10 @@ pub(crate) async fn transcribe_with_runtime(
                         // always a non-WAV/non-conformant container) instead of
                         // re-reading `input_path` from disk -- see
                         // `PreparedAudioInput::shared_samples`.
-                        .with_prepared_samples(prepared.shared_samples());
+                        .with_prepared_samples(prepared.shared_samples())
+                        // Explicit cancel/pause/resume context for the whole
+                        // synchronous decode call below -- never a thread-local.
+                        .with_execution_context(Arc::clone(&execution_context));
                     let executor = NativeBackendExecutor;
                     let mut transcription = NativeAsrExecutor::transcribe(
                         &executor,

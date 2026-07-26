@@ -2255,9 +2255,13 @@ async fn native_transcribe_stays_fail_closed_with_local_pack_only_validation() {
         model_pack_path: Some(pack_root),
     };
     let request = TranscriptionRequest::new(sample_wav, "whisper-large-v3-turbo");
-    let error = transcribe_with_runtime(runtime, request, None)
-        .await
-        .unwrap_err();
+    let error = transcribe_with_runtime(
+        runtime,
+        request,
+        std::sync::Arc::new(openasr_core::RequestExecutionContext::detached()),
+    )
+    .await
+    .unwrap_err();
     let rendered = error.to_string();
     assert!(rendered.contains("Could not transcribe audio"));
 }
@@ -2299,8 +2303,14 @@ async fn native_audio_preparation_does_not_consume_model_capacity() {
     // `block_on` here starves the blocking pool under a full nextest run
     // (the native path already uses `spawn_blocking` for preparation), so the
     // converter never starts within the wait window.
-    let request_task =
-        tokio::spawn(async move { transcribe_with_runtime(request_runtime, request, None).await });
+    let request_task = tokio::spawn(async move {
+        transcribe_with_runtime(
+            request_runtime,
+            request,
+            std::sync::Arc::new(openasr_core::RequestExecutionContext::detached()),
+        )
+        .await
+    });
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while !started_path.exists() {
