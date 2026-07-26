@@ -1412,6 +1412,14 @@ fn run_native_transcription_impl(
             // `index@seconds` (seconds are slice-relative, matching what the
             // executor reported).
             let mut truncated_slices: Vec<String> = Vec::new();
+            // Original-timeline start of every slice that actually decoded,
+            // collected only for an in-decoder-diarizing family: each such
+            // slice numbered its speakers from one on its own, so these are
+            // the seams between independent speaker scopes (see
+            // `speaker_scopes_by_start`). A family whose speakers come from the
+            // one whole-recording external pass has a single scope and leaves
+            // this empty.
+            let mut speaker_scope_starts: Vec<f32> = Vec::new();
             for slice in plan.slices {
                 if execution_context.control.wait_at_slice_boundary()
                     == super::transcription_control::SliceBoundaryControl::Canceled
@@ -1527,6 +1535,11 @@ fn run_native_transcription_impl(
                         }
                     }
                 }
+                if speaker_plan == SpeakerPlan::InDecoder {
+                    speaker_scope_starts.push(plan.timeline.map_processed_to_original_seconds(
+                        slice.content_start_sample as f32 / 16_000.0,
+                    ));
+                }
                 assembler.push_slice_result(SliceTranscript {
                     slice,
                     text: transcription.text,
@@ -1610,6 +1623,7 @@ fn run_native_transcription_impl(
                     &speaker_turns,
                     in_decoder_turn_audio.as_deref().unwrap_or(&[]),
                     speaker_plan,
+                    &[],
                     strip_forced_word_timestamps,
                     reported_language.clone(),
                 ));
@@ -1621,6 +1635,7 @@ fn run_native_transcription_impl(
                 &speaker_turns,
                 in_decoder_turn_audio.as_deref().unwrap_or(&[]),
                 speaker_plan,
+                &speaker_scope_starts,
                 strip_forced_word_timestamps,
                 reported_language.clone(),
             ));
@@ -1687,6 +1702,7 @@ fn run_native_transcription_impl(
         &speaker_turns,
         in_decoder_turn_audio.as_deref().unwrap_or(&[]),
         speaker_plan,
+        &[],
         strip_forced_word_timestamps,
         reported_language,
     ))
@@ -1711,6 +1727,7 @@ fn finalize_native_transcription(
     speaker_turns: &SpeakerAttribution,
     prepared_audio: &[f32],
     speaker_plan: SpeakerPlan,
+    speaker_scope_starts: &[f32],
     strip_forced_word_timestamps: bool,
     reported_language: Option<String>,
 ) -> Transcription {
@@ -1723,17 +1740,69 @@ fn finalize_native_transcription(
         strip_forced_word_timestamps,
     );
     if speaker_plan == SpeakerPlan::InDecoder {
-        // The family already produced normalized, recording-local turns; the
-        // only thing left is the source-independent identity stage. It is a
-        // no-op without an installed speaker embedder, which is exactly the
-        // "can separate but cannot name" degrade an in-decoder family gets on
-        // a host with no embedder pack.
-        crate::diarize::voice_id::name_speakers_from_labeled_segments(
+        // The family already produced turns, but only *within* each decode
+        // unit: a sliced run numbered its speakers from one per slice, so the
+        // labels only mean something relative to the scope that produced them.
+        // The source-independent identity stage is what relates the scopes,
+        // and it is a no-op without an installed speaker embedder -- which is
+        // exactly the "can separate but cannot name" degrade an in-decoder
+        // family gets on a host with no embedder pack (with more than one
+        // scope it then keeps them apart rather than guessing they match).
+        let mut scopes = speaker_scopes_by_start(
             &mut transcription.segments,
+            speaker_scope_starts,
             prepared_audio,
         );
+        crate::diarize::voice_id::name_speakers_across_scopes(&mut scopes);
     }
     with_reported_language(transcription, reported_language)
+}
+
+/// Cut time-ordered segments into the decode scopes they came from.
+///
+/// `scope_starts` holds the original-timeline start of each independently
+/// decoded slice, in order; fewer than two means the whole transcription is one
+/// scope. A segment belongs to the last scope that started at or before its
+/// midpoint, and scope assignment is forced non-decreasing so every scope is a
+/// contiguous run even if a boundary-straddling segment's midpoint lands on the
+/// wrong side. The midpoint (not the start) is the anchor because the
+/// assembler's overlap trim can leave a kept segment reaching slightly back
+/// into the previous slice's committed span.
+///
+/// Every scope shares the whole recording as its `samples`: segment times are
+/// already mapped to the original timeline by the assembler, so they index
+/// straight into it. Scope identity here is about *label provenance*, not about
+/// which audio a scope may look at.
+fn speaker_scopes_by_start<'a>(
+    segments: &'a mut [Segment],
+    scope_starts: &[f32],
+    samples: &'a [f32],
+) -> Vec<crate::diarize::voice_id::SpeakerScope<'a>> {
+    if scope_starts.len() < 2 {
+        return vec![crate::diarize::voice_id::SpeakerScope { segments, samples }];
+    }
+    let mut lengths = vec![0usize; scope_starts.len()];
+    let mut current = 0usize;
+    for segment in segments.iter() {
+        let midpoint = (segment.start + segment.end.max(segment.start)) / 2.0;
+        let matched = scope_starts
+            .iter()
+            .rposition(|start| *start <= midpoint)
+            .unwrap_or(0);
+        current = current.max(matched);
+        lengths[current] += 1;
+    }
+    let mut scopes = Vec::with_capacity(scope_starts.len());
+    let mut rest = segments;
+    for length in lengths {
+        let (head, tail) = rest.split_at_mut(length);
+        rest = tail;
+        scopes.push(crate::diarize::voice_id::SpeakerScope {
+            segments: head,
+            samples,
+        });
+    }
+    scopes
 }
 
 /// Stamp the effective source language onto a finished transcription so every
@@ -1951,20 +2020,12 @@ fn resolve_native_longform_policy_for_backend(
         }
     };
     let mut provenance = Vec::new();
-    // A self-chunking family (its dedicated executor ingests the full audio in
-    // one decode with globally continuous time anchors) must never be sliced by
-    // the native longform slicer -- per-window decoding would restart its time
-    // anchors at zero. Force Off even for an explicit longform request, since
-    // the executor never consults longform options.
-    if architecture_executor_consumes_full_audio(model_architecture)
-        && !matches!(options.mode, LongFormMode::Off)
-    {
-        provenance.push(format!(
-            "native longform disabled: '{model_architecture}' executor consumes the full audio in one decode"
-        ));
-        options.mode = LongFormMode::Off;
-    }
     if !matches!(options.mode, LongFormMode::Off) {
+        apply_scoped_slice_longform_window_policy(
+            model_architecture,
+            &mut options,
+            &mut provenance,
+        );
         apply_longform_safety_policy(model_architecture, &mut options, &mut provenance);
     }
     NativeLongformPolicyResolution {
@@ -1973,17 +2034,47 @@ fn resolve_native_longform_policy_for_backend(
     }
 }
 
-/// True when the architecture's dedicated executor ingests arbitrarily long
-/// audio in a single decode (its own internal window chunking), so the shared
-/// native longform slicer must stay off. Driven by the decode-policy descriptor
-/// (`BuiltinDecodePolicyLongformProfile::SelfChunkingExecutorV1`) so the fact
-/// lives with the family's other decode semantics, not as a magic string here.
-fn architecture_executor_consumes_full_audio(model_architecture: &str) -> bool {
-    resolve_builtin_decode_policy_for_architecture(model_architecture)
-        .map(|policy| {
-            policy.longform_profile == BuiltinDecodePolicyLongformProfile::SelfChunkingExecutorV1
-        })
-        .unwrap_or(false)
+/// Installs the slice window an
+/// [`OpenAsrLongformSliceShape::ScopedSlices`] family declares.
+///
+/// Unlike the safety caps below this is not a clamp in one direction: the
+/// declared window is the family's decoder-context fact, so it replaces the
+/// shared default whether that default was wider or (as with the 30s generic
+/// target) much narrower. A family that folds a whole slice into one
+/// autoregressive prompt gets *worse*, not safer, when handed thirty-second
+/// windows -- the prompt overhead is paid per slice and its in-decoder speaker
+/// numbering restarts at every seam. The safety caps still run afterwards and
+/// may narrow this further; they only ever clamp downward, so the effective
+/// window stays the min of every applicable rule.
+///
+/// Two shared options are also pinned for this shape, both consequences of
+/// "the slice audio *is* the decode unit":
+/// - lead-in/lead-out padding is dropped, because such a family timestamps
+///   relative to the buffer it was handed while the assembler maps slice-
+///   relative times from `content_start_sample`; any padding is a straight
+///   bias on every timestamp in the slice;
+/// - prompt carry is disabled, because the decode prompt is a fixed
+///   fine-tuned instruction, not a free-text context window.
+fn apply_scoped_slice_longform_window_policy(
+    model_architecture: &str,
+    options: &mut crate::LongFormOptions,
+    provenance: &mut Vec<String>,
+) {
+    let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
+        target_seconds,
+        max_seconds,
+    } = crate::arch::longform_slice_shape_for_model_architecture(model_architecture)
+    else {
+        return;
+    };
+    options.chunk_seconds = target_seconds;
+    options.max_chunk_seconds = max_seconds.max(target_seconds);
+    options.min_chunk_seconds = options.min_chunk_seconds.min(target_seconds);
+    options.padding_seconds = 0.0;
+    options.carry_prompt_across_slices = false;
+    provenance.push(format!(
+        "core.native.longform.policy:scoped-slices,target_seconds={target_seconds},max_seconds={max_seconds}"
+    ));
 }
 
 /// Applies every family-specific longform safety cap for `model_architecture`.
@@ -3493,30 +3584,57 @@ mod tests {
         assert_eq!(resolution.options.mode, LongFormMode::Auto);
     }
 
+    /// A `ScopedSlices` family gets its declared decoder-context window in
+    /// place of the shared 30s default -- widened, not clamped -- plus the two
+    /// options that shape implies (no padding bias on in-decoder timestamps,
+    /// no free-text prompt carry across a fixed fine-tuned instruction).
     #[test]
-    fn self_chunking_family_forces_longform_off_even_for_long_audio() {
-        // moss-transcribe-diarize ingests the full audio in one decode
-        // (`SelfChunkingExecutorV1`); the native slicer must stay off so its
-        // global time anchors are not restarted per VAD window.
-        let implicit = resolve_native_longform_policy_for_backend(
+    fn scoped_slice_family_gets_its_declared_window_instead_of_the_shared_default() {
+        let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
+            target_seconds,
+            max_seconds,
+        } = crate::arch::longform_slice_shape_for_model_architecture(
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+        )
+        else {
+            panic!("moss-transcribe-diarize must declare ScopedSlices");
+        };
+        assert!(target_seconds > crate::LongFormOptions::default().chunk_seconds);
+
+        let resolution = resolve_native_longform_policy_for_backend(
             None,
-            180.0,
+            600.0,
             crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
             GgmlCpuGraphBackend::Cpu,
         );
-        assert_eq!(implicit.options.mode, LongFormMode::Off);
-        // Even an explicit longform request is overridden (the executor never
-        // consults longform options).
-        let explicit = resolve_native_longform_policy_for_backend(
-            Some(&crate::LongFormOptions {
-                mode: LongFormMode::Energy,
-                ..crate::LongFormOptions::default()
-            }),
-            180.0,
-            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+        assert_eq!(resolution.options.mode, LongFormMode::Auto);
+        assert_eq!(resolution.options.chunk_seconds, target_seconds);
+        assert_eq!(resolution.options.max_chunk_seconds, max_seconds);
+        assert_eq!(resolution.options.padding_seconds, 0.0);
+        assert!(!resolution.options.carry_prompt_across_slices);
+        assert_eq!(
+            longform_prompt_carry_mode(
+                &resolution.options,
+                crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID
+            ),
+            LongformPromptCarryMode::Disabled,
+        );
+        resolution.options.validate().expect("resolved options");
+    }
+
+    /// A `SharedWindow` family is untouched by the scoped-slice rule.
+    #[test]
+    fn shared_window_family_keeps_the_generic_longform_window() {
+        let defaults = crate::LongFormOptions::default();
+        let resolution = resolve_native_longform_policy_for_backend(
+            None,
+            600.0,
+            crate::QWEN3_ASR_GGML_ARCHITECTURE_ID,
             GgmlCpuGraphBackend::Cpu,
         );
-        assert_eq!(explicit.options.mode, LongFormMode::Off);
+        assert_eq!(resolution.options.chunk_seconds, defaults.chunk_seconds);
+        assert_eq!(resolution.options.padding_seconds, defaults.padding_seconds);
+        assert!(resolution.options.carry_prompt_across_slices);
     }
 
     #[test]
@@ -3686,7 +3804,8 @@ mod tests {
     /// (issue #68): a `GlobalQuadratic` encoder must never be handed a
     /// longform chunk longer than its declared safe ceiling, while
     /// `FixedWindow` (whisper) and `LocalChunked` (zipformer) architectures
-    /// need no additional cap and keep the unmodified 120s default. All nine
+    /// need no additional cap and keep whatever window their own slice shape
+    /// asked for (the shared 120s default unless the family declares one). All nine
     /// `GlobalQuadratic` builtins (including firered-aed/cohere-transcribe/
     /// moonshine, which also carry the decode-side `ConservativeSeq2SeqV1`
     /// cap) declare `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`, so this asserts
@@ -3724,9 +3843,20 @@ mod tests {
                     );
                 }
                 None => {
+                    // No encoder cap applies, so the window is whatever the
+                    // family's own slice shape asked for: its declared
+                    // decoder-context window, or the shared default when it
+                    // declares none.
+                    let expected = match descriptor.longform_slice_shape {
+                        crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
+                            max_seconds,
+                            ..
+                        } => max_seconds,
+                        crate::arch::OpenAsrLongformSliceShape::SharedWindow => 120.0,
+                    };
                     assert_eq!(
-                        resolution.options.max_chunk_seconds, 120.0,
-                        "'{}' (FixedWindow/LocalChunked) must keep the unmodified default",
+                        resolution.options.max_chunk_seconds, expected,
+                        "'{}' (FixedWindow/LocalChunked) must keep its declared window",
                         descriptor.model_architecture
                     );
                 }
@@ -4082,6 +4212,63 @@ mod tests {
                 confidence: Some(0.9),
             }],
         }
+    }
+
+    /// A single decode unit stays one scope, so its source's own numbering is
+    /// authoritative and nothing gets renumbered.
+    #[test]
+    fn fewer_than_two_scope_starts_is_one_scope() {
+        let mut segments = vec![segment(0.0, 1.0, "a"), segment(1.0, 2.0, "b")];
+        let scopes = speaker_scopes_by_start(&mut segments, &[], &[]);
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].segments.len(), 2);
+
+        let mut segments = vec![segment(0.0, 1.0, "a")];
+        let scopes = speaker_scopes_by_start(&mut segments, &[0.0], &[]);
+        assert_eq!(scopes.len(), 1);
+    }
+
+    /// Each slice's segments land in that slice's scope, and every scope is a
+    /// contiguous run so no segment can be assigned to two scopes.
+    #[test]
+    fn segments_are_cut_into_the_scope_that_decoded_them() {
+        let mut segments = vec![
+            segment(0.0, 10.0, "a"),
+            segment(10.0, 20.0, "b"),
+            segment(180.5, 190.0, "c"),
+            segment(360.0, 370.0, "d"),
+        ];
+        let scopes = speaker_scopes_by_start(&mut segments, &[0.0, 180.0, 360.0], &[]);
+        let sizes: Vec<usize> = scopes.iter().map(|scope| scope.segments.len()).collect();
+        assert_eq!(sizes, vec![2, 1, 1]);
+    }
+
+    /// A segment kept from a slice's overlap re-read can start marginally
+    /// before its own slice began. Scope assignment is forced non-decreasing so
+    /// such a segment cannot fall back into the previous scope and split that
+    /// scope's run in two.
+    #[test]
+    fn scope_assignment_never_moves_backwards() {
+        let mut segments = vec![
+            segment(0.0, 10.0, "a"),
+            segment(181.0, 190.0, "b"),
+            segment(179.0, 181.0, "c"),
+            segment(360.0, 370.0, "d"),
+        ];
+        let scopes = speaker_scopes_by_start(&mut segments, &[0.0, 180.0, 360.0], &[]);
+        let sizes: Vec<usize> = scopes.iter().map(|scope| scope.segments.len()).collect();
+        assert_eq!(sizes, vec![1, 2, 1]);
+        assert_eq!(scopes[1].segments[1].text, "c");
+    }
+
+    /// Every scope must be represented even when a slice produced no surviving
+    /// segments, so scope indices keep lining up with the slices that decoded.
+    #[test]
+    fn a_scope_with_no_surviving_segments_is_still_a_scope() {
+        let mut segments = vec![segment(0.0, 10.0, "a"), segment(360.0, 370.0, "d")];
+        let scopes = speaker_scopes_by_start(&mut segments, &[0.0, 180.0, 360.0], &[]);
+        let sizes: Vec<usize> = scopes.iter().map(|scope| scope.segments.len()).collect();
+        assert_eq!(sizes, vec![1, 0, 1]);
     }
 
     fn item(text: &str, start_time_s: f64, end_time_s: f64) -> ForcedAlignItem {

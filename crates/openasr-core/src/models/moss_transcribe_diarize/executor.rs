@@ -78,11 +78,25 @@ const HOP_LENGTH: usize = 160;
 /// smaller audio-proportional budget below so its persistent Metal KV graph does
 /// not reserve the runaway allowance for ordinary speech.
 const MOSS_TD_MAX_GENERATED_TOKENS: usize = 4096;
-/// A conservative output allowance for timestamped MOSS transcripts. The
-/// three-minute AISHELL-4 golden emits 920 tokens (about 5.1 tokens/s); six
-/// tokens/s plus the fixed margin leaves headroom without reserving all 4096
-/// runaway tokens in every request's Metal reuse graph.
-const MOSS_TD_GENERATED_TOKENS_PER_AUDIO_SECOND: usize = 6;
+/// Output allowance for timestamped MOSS transcripts, per second of audio.
+///
+/// Deliberately far above average demand, because under-budgeting does not
+/// degrade gracefully: the decode never emits a stop token, so the request
+/// fails and the caller gets nothing at all for that audio. Observed demand
+/// spans a wide range -- the three-minute AISHELL-4 golden emits 920 tokens
+/// (~5.1 tokens/s), while dense overlapping Mandarin meeting audio (AliMeeting
+/// `R8001_M8004`, `R8007_M8010`) exhausted a 12 tokens/s allowance on a 180s
+/// slice, so it needs upwards of 12.7. A rate cannot be fitted to that spread
+/// by observation alone; 23 is instead the rate at which a slice-length
+/// request reaches the runaway backstop (`MOSS_TD_MAX_GENERATED_TOKENS`), the
+/// most this family will ever let one decode generate. Past that point the
+/// per-second allowance is no longer what binds, and the answer to denser
+/// audio is a shorter slice, not a larger number here.
+///
+/// Being this generous costs nothing on short clips, where the budget is still
+/// proportional, so a ten-second request does not size its persistent Metal
+/// reuse graph for a transcript that cannot exist.
+const MOSS_TD_GENERATED_TOKENS_PER_AUDIO_SECOND: usize = 23;
 const MOSS_TD_MIN_GENERATED_TOKENS: usize = 128;
 const MOSS_TD_GENERATED_TOKEN_BUDGET_MARGIN: usize = 128;
 /// Audio tokens per second the adaptor emits (`audio_tokens_per_second` in
@@ -301,12 +315,22 @@ fn moss_td_aligned_frame_count(total_frames: usize, merge_size: usize) -> usize 
     (total_frames / merge_size) * merge_size
 }
 
-/// Derive the per-request decode budget from audio duration, preserving the
-/// checkpoint's 4096-token ceiling solely as a fail-closed runaway backstop.
-/// This is part of the request capacity: the Metal reuse graph must have room
-/// for the complete configured decode, but must not reserve the global ceiling
-/// for short and ordinary long utterances.
-fn moss_td_generated_token_budget(sample_count: usize) -> Result<usize, MossTdExecutorError> {
+/// Derive this request's decode budget: audio-proportional, clamped by both
+/// the checkpoint's 4096-token runaway backstop and whatever decoder context
+/// this request's own prompt left unused.
+///
+/// The context clamp is what makes the generous rate above safe to state. The
+/// KV cache is allocated for exactly `prompt + budget` and the executor
+/// rejects a request whose total does not fit, so an allowance the context
+/// cannot serve is not a bigger budget -- it is a refused request. Clamping
+/// here makes the budget "as much as this context can still serve, up to the
+/// backstop": the largest honest answer available, and never a promise the
+/// cache cannot keep.
+fn moss_td_generated_token_budget(
+    sample_count: usize,
+    prompt_tokens: usize,
+    kv_capacity: usize,
+) -> Result<usize, MossTdExecutorError> {
     let audio_tokens = sample_count
         .checked_mul(MOSS_TD_GENERATED_TOKENS_PER_AUDIO_SECOND)
         .and_then(|value| value.checked_add(SAMPLE_RATE_HZ - 1))
@@ -314,13 +338,17 @@ fn moss_td_generated_token_budget(sample_count: usize) -> Result<usize, MossTdEx
         .ok_or_else(|| MossTdExecutorError::DecodeBudgetUnavailable {
             reason: "audio-duration token budget overflowed".to_string(),
         })?;
-    let desired = audio_tokens
+    let proportional = audio_tokens
         .checked_add(MOSS_TD_GENERATED_TOKEN_BUDGET_MARGIN)
         .ok_or_else(|| MossTdExecutorError::DecodeBudgetUnavailable {
             reason: "audio-duration token budget margin overflowed".to_string(),
         })?
         .max(MOSS_TD_MIN_GENERATED_TOKENS);
-    Ok(desired.min(MOSS_TD_MAX_GENERATED_TOKENS))
+    let remaining_context = kv_capacity.saturating_sub(prompt_tokens);
+    Ok(proportional
+        .min(MOSS_TD_MAX_GENERATED_TOKENS)
+        .min(remaining_context)
+        .max(MOSS_TD_MIN_GENERATED_TOKENS))
 }
 
 /// Weight-free, always-on coverage for the executor's chunk/slice-planning
@@ -340,6 +368,108 @@ mod moss_td_chunk_frame_math_tests {
     const MERGE_SIZE: usize = 4;
     const MAX_SOURCE_POSITIONS: usize = 1500;
     const TOKEN_STRIDE: usize = HOP_LENGTH * WHISPER_ENCODER_CONV_STRIDE * MERGE_SIZE;
+
+    /// Prompt tokens a request of `window_seconds` audio costs. The fixed
+    /// instruction / audio-marker wrapper is measured from a real decode (a
+    /// 600s request reported a 7926-token prompt against 20 encoder chunks x
+    /// 375 audio tokens), rounded up so every check below stays conservative.
+    const PROMPT_OVERHEAD_TOKENS: usize = 512;
+
+    fn prompt_tokens_for(window_seconds: f32) -> usize {
+        let samples = (window_seconds * SAMPLE_RATE_HZ as f32) as usize;
+        let chunks = samples.div_ceil(CHUNK_SAMPLES);
+        PROMPT_OVERHEAD_TOKENS + chunks * moss_td_chunk_token_length(CHUNK_SAMPLES, TOKEN_STRIDE)
+    }
+
+    fn budget_for(window_seconds: f32) -> usize {
+        let samples = (window_seconds * SAMPLE_RATE_HZ as f32) as usize;
+        moss_td_generated_token_budget(
+            samples,
+            prompt_tokens_for(window_seconds),
+            crate::models::moss_transcribe_diarize::runtime_contract::MOSS_TD_MAX_KV_CACHE_POSITIONS,
+        )
+        .expect("budget")
+    }
+
+    /// The whole point of the declared slice window: at the family's maximum
+    /// slice length, the audio prompt plus this call's generation budget must
+    /// still fit inside the decoder's KV context, or the executor fails the
+    /// request closed instead of decoding it. Pins the arithmetic that ties
+    /// `OpenAsrLongformSliceShape::ScopedSlices` on the moss architecture
+    /// descriptor to the budget rule -- the two are a pair, and widening the
+    /// window alone silently eats the headroom.
+    #[test]
+    fn the_declared_slice_window_fits_the_decoder_context_with_its_decode_budget() {
+        let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
+            target_seconds,
+            max_seconds,
+        } = crate::arch::longform_slice_shape_for_model_architecture(
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+        )
+        else {
+            panic!("moss-transcribe-diarize must declare ScopedSlices");
+        };
+        let kv_capacity =
+            crate::models::moss_transcribe_diarize::runtime_contract::MOSS_TD_MAX_KV_CACHE_POSITIONS;
+
+        for window_seconds in [target_seconds, max_seconds] {
+            let required = prompt_tokens_for(window_seconds) + budget_for(window_seconds);
+            assert!(
+                required <= kv_capacity,
+                "{window_seconds}s slice needs {required} positions, capacity is {kv_capacity}"
+            );
+        }
+    }
+
+    /// A slice-length request reaches the runaway backstop, so the per-second
+    /// allowance stops being what limits it and denser audio has to be answered
+    /// with a shorter slice rather than a bigger constant. Dense meeting audio
+    /// exhausted a 12 tokens/s allowance on a 180s slice, so the rate has to
+    /// clear well past that.
+    #[test]
+    fn a_slice_length_request_reaches_the_runaway_backstop() {
+        const DENSEST_MEASURED_TOKENS_PER_SECOND: f32 = 12.7;
+        for window_seconds in [180.0_f32, 240.0] {
+            let budget = budget_for(window_seconds);
+            assert!(
+                budget as f32 >= window_seconds * DENSEST_MEASURED_TOKENS_PER_SECOND,
+                "{window_seconds}s budget {budget} does not clear the densest measured demand"
+            );
+            assert_eq!(
+                budget, MOSS_TD_MAX_GENERATED_TOKENS,
+                "{window_seconds}s slice must reach the backstop"
+            );
+        }
+    }
+
+    /// A short clip keeps a small, audio-proportional budget: reserving the
+    /// full backstop for ten seconds of speech would size its persistent Metal
+    /// reuse graph for a transcript that cannot exist.
+    #[test]
+    fn a_short_clip_keeps_a_small_proportional_budget() {
+        let budget = budget_for(11.0);
+        assert!(
+            budget < MOSS_TD_MAX_GENERATED_TOKENS / 4,
+            "an 11s clip must not reserve the runaway backstop, got {budget}"
+        );
+        assert!(budget >= MOSS_TD_MIN_GENERATED_TOKENS);
+    }
+
+    /// The budget never outruns the context: a prompt that has already eaten
+    /// most of the decoder leaves only what is left, so the executor's
+    /// fail-closed capacity check cannot be handed an impossible request.
+    #[test]
+    fn the_budget_never_exceeds_the_context_the_prompt_left() {
+        let kv_capacity = 4_096;
+        let prompt_tokens = 4_000;
+        let budget =
+            moss_td_generated_token_budget(600 * SAMPLE_RATE_HZ, prompt_tokens, kv_capacity)
+                .expect("budget");
+        assert!(
+            prompt_tokens + budget <= kv_capacity.max(prompt_tokens + MOSS_TD_MIN_GENERATED_TOKENS),
+            "budget {budget} on top of prompt {prompt_tokens} overruns capacity {kv_capacity}"
+        );
+    }
 
     #[test]
     fn token_stride_matches_the_real_checkpoints_merge_size() {
@@ -411,20 +541,18 @@ mod moss_td_chunk_frame_math_tests {
     fn decode_budget_scales_to_the_real_moss_golden_lengths() {
         // The private-reference goldens emit 71 tokens for JFK (11s), 76 for
         // the mixed clip (13s), and 920 for the three-minute AISHELL-4 clip.
-        // Every budget must retain headroom while avoiding a fixed 4096-token
-        // Metal reuse-graph reservation.
-        assert_eq!(
-            moss_td_generated_token_budget(11 * SAMPLE_RATE_HZ).expect("jfk budget"),
-            194
-        );
-        assert_eq!(
-            moss_td_generated_token_budget(13 * SAMPLE_RATE_HZ).expect("mixed budget"),
-            206
-        );
-        assert_eq!(
-            moss_td_generated_token_budget(180 * SAMPLE_RATE_HZ).expect("AISHELL-4 budget"),
-            1_208
-        );
+        // The two short clips stay on the proportional floor (no fixed
+        // 4096-token Metal reuse-graph reservation for a few seconds of
+        // speech); the three-minute one is slice-length and claims the
+        // backstop.
+        assert_eq!(budget_for(11.0), 381);
+        assert_eq!(budget_for(13.0), 427);
+        assert_eq!(budget_for(180.0), MOSS_TD_MAX_GENERATED_TOKENS);
+        // Every one of them still clears the golden's real token count with
+        // room to spare.
+        for (window_seconds, golden_tokens) in [(11.0_f32, 71), (13.0, 76), (180.0, 920)] {
+            assert!(budget_for(window_seconds) > golden_tokens);
+        }
     }
 }
 
@@ -674,7 +802,11 @@ impl MossTdGgmlExecutor {
         if samples.is_empty() {
             return Err(MossTdExecutorError::EmptyAudio);
         }
-        let max_generated_tokens = moss_td_generated_token_budget(samples.len())?;
+        // Derived from THIS call's buffer, never from a request-level "whole
+        // recording" duration. Under longform slicing that buffer is one slice,
+        // and this value is what `speaker_segments` clamps a truncated decode's
+        // final segment to -- so a slice that ends without a stop token can only
+        // ever blanket the rest of its own slice, not the rest of the recording.
         let audio_duration_seconds = samples.len() as f32 / SAMPLE_RATE_HZ as f32;
 
         let reader = build_runtime_tensor_reader_from_preflight(&preflight).map_err(|error| {
@@ -733,15 +865,22 @@ impl MossTdGgmlExecutor {
                 }
             })?;
 
-        // Fail closed up front when the whole-audio prompt plus the configured
-        // decode budget cannot fit the decoder's KV context. This family
-        // ingests the full audio in one decode (native longform slicing is
-        // disabled for it, see the decode-policy `SelfChunkingExecutorV1`), so
-        // a very long file grows the prompt until it exceeds the KV-cache
-        // capacity. The request-sized cache must reserve every possible decode
+        // Fail closed up front when this call's prompt plus the configured
+        // decode budget cannot fit the decoder's KV context. The shared native
+        // slicer keeps ordinary requests well inside it (the family declares
+        // its own slice window via `OpenAsrLongformSliceShape::ScopedSlices`),
+        // so this is the backstop for a caller that bypasses longform slicing
+        // entirely. The request-sized cache must reserve every possible decode
         // position; clamping an over-limit request would defer the failure to a
         // cryptic KV write mid-generation.
         let kv_capacity = moss_td_kv_cache_positions(decoder_metadata.max_positions);
+        // Sized once the prompt is known, so the budget can claim the decoder
+        // context the prompt did not need (see `moss_td_generated_token_budget`).
+        let max_generated_tokens = moss_td_generated_token_budget(
+            samples.len(),
+            decode_prompt.token_ids.len(),
+            kv_capacity,
+        )?;
         let request_kv_cache_positions = moss_td_request_kv_cache_positions(
             decoder_metadata.max_positions,
             decode_prompt.token_ids.len(),
