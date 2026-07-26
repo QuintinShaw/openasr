@@ -350,7 +350,7 @@ impl GgmlCpuGraphConfig {
     /// [`resolved_family_runtime_input`] instead of calling this directly --
     /// that is what makes "a family resolves its own backend" a compile
     /// error rather than a convention.
-    pub fn resolve_runtime_backend() -> GgmlCpuGraphBackend {
+    pub(in crate::ggml_runtime) fn resolve_runtime_backend() -> GgmlCpuGraphBackend {
         match request_backend_override() {
             Some(RequestBackendPreference::CpuOnly) => GgmlCpuGraphBackend::Cpu,
             Some(RequestBackendPreference::Accelerated) => Self::default_gpu_backend(),
@@ -403,7 +403,9 @@ impl GgmlCpuGraphConfig {
     /// [`resolved_family_runtime_input`], which resolve through this
     /// function exactly once per request and hand the result down as an
     /// explicit value instead of letting every call site re-derive it.
-    pub fn resolve_family_runtime_backend(policy: AutoGpuPolicy) -> GgmlCpuGraphBackend {
+    pub(in crate::ggml_runtime) fn resolve_family_runtime_backend(
+        policy: AutoGpuPolicy,
+    ) -> GgmlCpuGraphBackend {
         if request_backend_override().is_some() {
             return Self::resolve_runtime_backend();
         }
