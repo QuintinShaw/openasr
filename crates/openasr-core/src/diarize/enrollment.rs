@@ -53,31 +53,6 @@ pub fn voiceprint_store_path() -> Option<PathBuf> {
         })
 }
 
-/// After Voice ID v2 migration completes, the legacy JSON file is no longer a
-/// writable source of truth. Detect the sibling SQLite ledger state so callers
-/// fail closed instead of resurrecting a parallel store.
-fn voiceprint_json_write_blocked(path: &Path) -> bool {
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    let db_path = std::env::var("OPENASR_VOICE_ID_DB")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| parent.join("voice-id.db"));
-    if !db_path.is_file() {
-        return false;
-    }
-    let Ok(conn) = rusqlite::Connection::open(&db_path) else {
-        return false;
-    };
-    let state: Result<String, _> = conn.query_row(
-        "SELECT value FROM voice_id_meta WHERE key = 'v1_json_migration'",
-        [],
-        |row| row.get(0),
-    );
-    matches!(state, Ok(value) if value == "done" || value == "json_pending_delete")
-}
-
 #[derive(Debug, Error)]
 pub enum VoiceprintStoreError {
     #[error("unsupported voiceprint store version {found}; expected {expected}")]
@@ -112,10 +87,6 @@ pub enum VoiceprintStoreError {
     InvalidId(String),
     #[error("speaker profile match similarity must be between 0 and 1")]
     InvalidMatchSimilarity,
-    #[error(
-        "voiceprints.json is read-only after Voice ID v2 migration; enroll via the Voice ID store (/v1/voice-id or `openasr speaker`)"
-    )]
-    MigratedReadOnly,
 }
 
 #[derive(Debug, Error)]
@@ -186,9 +157,6 @@ impl VoiceprintStore {
 
     pub fn save(&self, path: &Path) -> Result<(), VoiceprintStoreError> {
         self.validate_version()?;
-        if voiceprint_json_write_blocked(path) {
-            return Err(VoiceprintStoreError::MigratedReadOnly);
-        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| VoiceprintStoreError::CreateDir {
                 path: parent.to_path_buf(),

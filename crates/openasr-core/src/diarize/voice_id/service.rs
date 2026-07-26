@@ -10,7 +10,6 @@ use thiserror::Error;
 use super::domain::{CaptureContext, ConsentRecord, PersonView};
 use super::ids::{PersonId, SampleId};
 use super::matcher::PersonMatcher;
-use super::migrate::open_store_with_v1_migration;
 use super::quality::{QualityError, assess_enrollment_quality};
 use super::space::EmbeddingSpace;
 use super::store::{NewSampleInput, VoiceIdStore, VoiceIdStoreError};
@@ -33,8 +32,6 @@ pub enum VoiceIdServiceError {
     Embed(#[from] EmbedError),
     #[error("initial enrollment requires between {min} and {max} samples, got {got}")]
     InvalidSampleCount { min: usize, max: usize, got: usize },
-    #[error("{0}")]
-    Migration(String),
 }
 
 const MIN_INITIAL_SAMPLES: usize = 1;
@@ -47,10 +44,9 @@ pub struct EnrollmentClip {
 
 /// Load the live Voice ID matcher for the active embedder pack.
 ///
-/// Opens the v2 store (running v1 migration when needed). Returns an empty
-/// matcher when the embedder pack, home directory, or store is unavailable so
-/// batch/streaming paths stay fail-open toward anonymous labels rather than
-/// aborting transcription.
+/// Opens the Voice ID store. Returns an empty matcher when the embedder pack,
+/// home directory, or store is unavailable so batch/streaming paths stay
+/// fail-open toward anonymous labels rather than aborting transcription.
 pub fn load_person_matcher_for_active_embedder() -> PersonMatcher {
     let Some(identity) = shared_embedder_identity() else {
         return empty_person_matcher();
@@ -65,7 +61,7 @@ pub fn load_person_matcher_for_active_embedder() -> PersonMatcher {
     let Ok(home) = crate::openasr_home() else {
         return PersonMatcher::new(space, Vec::new(), threshold, margin);
     };
-    let Ok(store) = open_store_with_v1_migration(home) else {
+    let Ok(store) = VoiceIdStore::open_checked(home) else {
         return PersonMatcher::new(space, Vec::new(), threshold, margin);
     };
     store

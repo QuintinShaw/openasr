@@ -3,8 +3,6 @@
 //! Path: `$OPENASR_HOME/diarize/voice-id.db` (override with `OPENASR_VOICE_ID_DB`).
 //! Mutations run under `BEGIN IMMEDIATE`. Raw audio is never stored.
 
-#[cfg(test)]
-use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,9 +11,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 use super::domain::{
-    CaptureContext, ConsentRecord, EnrollmentSample, Person, PersonPrototype, PersonStatus,
-    PersonView, PrototypeMember, SampleEmbedding, SampleQuality, SampleView,
-    VOICE_ID_LABEL_MAX_CHARS, VoiceIdColor,
+    CaptureContext, ConsentRecord, PersonPrototype, PersonStatus, PersonView, PrototypeMember,
+    SampleQuality, SampleView, VOICE_ID_LABEL_MAX_CHARS, VoiceIdColor,
 };
 use super::ids::{IdError, PersonId, PrototypeId, SampleId};
 use super::matcher::{MatcherPerson, PersonMatcher};
@@ -26,7 +23,7 @@ use super::space::EmbeddingSpace;
 use crate::diarize::contract::SpeakerEmbedding;
 
 pub const VOICE_ID_DB_ENV: &str = "OPENASR_VOICE_ID_DB";
-pub const VOICE_ID_SCHEMA_VERSION: i32 = 4;
+pub const VOICE_ID_SCHEMA_VERSION: i32 = 1;
 const IDEMPOTENCY_TTL_SECS: i64 = 24 * 60 * 60;
 const IDEMPOTENCY_MAX_RECORDS: i64 = 1024;
 
@@ -82,8 +79,10 @@ pub enum VoiceIdStoreError {
     IdempotencyConflict,
     #[error("voice-id idempotency record is invalid: {0}")]
     IdempotencyRecord(String),
-    #[error("voice-id migration failed: {0}")]
-    Migration(String),
+    #[error("voice-id database schema {found} is unreleased schema; reset required")]
+    UnreleasedSchema { found: i32 },
+    #[error("voice-id enrollment failed: {0}")]
+    InvalidEnrollment(String),
 }
 
 #[derive(Debug, Clone)]
@@ -126,7 +125,16 @@ impl VoiceIdStore {
 
     pub fn open_default() -> Result<Self, VoiceIdStoreError> {
         let home = crate::openasr_home().map_err(|_| VoiceIdStoreError::HomeUnavailable)?;
-        Ok(Self::open(home))
+        Self::open_checked(home)
+    }
+
+    /// Opens a fresh v1 schema or verifies that an existing database is v1.
+    /// Development schemas were never released, so they are rejected rather
+    /// than migrated or deleted.
+    pub fn open_checked(openasr_home: impl AsRef<Path>) -> Result<Self, VoiceIdStoreError> {
+        let store = Self::open(openasr_home);
+        let _ = store.connection()?;
+        Ok(store)
     }
 
     pub fn db_path(&self) -> &Path {
@@ -240,7 +248,7 @@ impl VoiceIdStore {
             .map(normalize_new_sample_input)
             .collect::<Result<Vec<_>, _>>()?;
         if samples.is_empty() {
-            return Err(VoiceIdStoreError::Migration(
+            return Err(VoiceIdStoreError::InvalidEnrollment(
                 "enrollment requires at least one accepted sample".into(),
             ));
         }
@@ -285,7 +293,7 @@ impl VoiceIdStore {
             .map(normalize_new_sample_input)
             .collect::<Result<Vec<_>, _>>()?;
         if samples.is_empty() {
-            return Err(VoiceIdStoreError::Migration(
+            return Err(VoiceIdStoreError::InvalidEnrollment(
                 "enrollment requires at least one accepted sample".into(),
             ));
         }
@@ -643,36 +651,6 @@ impl VoiceIdStore {
         })
     }
 
-    pub fn resolve_legacy_profile_id(
-        &self,
-        legacy_profile_id: &str,
-    ) -> Result<Option<PersonId>, VoiceIdStoreError> {
-        let conn = self.connection()?;
-        let person_id = conn
-            .query_row(
-                "SELECT person_id FROM legacy_profile_aliases WHERE legacy_profile_id = ?1",
-                params![legacy_profile_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        Ok(person_id.map(PersonId::parse).transpose()?)
-    }
-
-    pub fn insert_legacy_alias(
-        &self,
-        legacy_profile_id: &str,
-        person_id: &PersonId,
-    ) -> Result<(), VoiceIdStoreError> {
-        let conn = self.connection()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO legacy_profile_aliases(legacy_profile_id, person_id)
-             VALUES (?1, ?2)",
-            params![legacy_profile_id, person_id.as_str()],
-        )?;
-        Ok(())
-    }
-
-    /// Build a matcher for the active embedding space and optional candidate scope.
     pub fn matcher_for_space(
         &self,
         space: &EmbeddingSpace,
@@ -732,21 +710,11 @@ impl VoiceIdStore {
             "includes_embeddings": false,
             "persons": persons,
         }))
-        .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))
+        .map_err(|error| VoiceIdStoreError::Serialize(error.to_string()))
     }
 
-    /// Mark migration ledger state. Used by the v1 JSON importer.
-    pub fn set_migration_state(&self, key: &str, value: &str) -> Result<(), VoiceIdStoreError> {
-        let conn = self.connection()?;
-        conn.execute(
-            "INSERT INTO voice_id_meta(key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
-        Ok(())
-    }
-
-    pub fn migration_state(&self, key: &str) -> Result<Option<String>, VoiceIdStoreError> {
+    /// Returns internal metadata used for the global mutation revision.
+    pub fn metadata_value(&self, key: &str) -> Result<Option<String>, VoiceIdStoreError> {
         let conn = self.connection()?;
         Ok(conn
             .query_row(
@@ -757,80 +725,15 @@ impl VoiceIdStore {
             .optional()?)
     }
 
-    /// Resolve a caller-supplied id that may be a v2 `person_*` id or a legacy
-    /// `vp_*` alias from the v1 JSON store.
     pub fn resolve_person_ref(&self, raw: &str) -> Result<PersonId, VoiceIdStoreError> {
-        if let Ok(person_id) = PersonId::parse(raw) {
-            // Confirm the person still exists and is not deleted.
-            let _ = self.get_person(&person_id, None)?;
-            return Ok(person_id);
-        }
-        if let Some(person_id) = self.resolve_legacy_profile_id(raw)? {
-            return Ok(person_id);
-        }
-        Err(VoiceIdStoreError::NotFound(raw.to_string()))
+        let person_id = PersonId::parse(raw)?;
+        let _ = self.get_person(&person_id, None)?;
+        Ok(person_id)
     }
 
-    /// Prefer a legacy alias when one exists so older clients keep seeing `vp_*`.
     pub fn preferred_public_id(&self, person_id: &PersonId) -> Result<String, VoiceIdStoreError> {
-        let conn = self.connection()?;
-        let legacy = conn
-            .query_row(
-                "SELECT legacy_profile_id FROM legacy_profile_aliases
-                 WHERE person_id = ?1
-                 ORDER BY legacy_profile_id ASC
-                 LIMIT 1",
-                params![person_id.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        Ok(legacy.unwrap_or_else(|| person_id.as_str().to_string()))
-    }
-
-    /// Low-level import helper used by migration: insert a fully built person
-    /// graph in one IMMEDIATE transaction. Skips when `legacy_profile_id` is
-    /// already present so partial prior runs stay idempotent.
-    pub fn import_person_graph(
-        &self,
-        person: &Person,
-        samples: &[(EnrollmentSample, SampleEmbedding)],
-        legacy_profile_id: Option<&str>,
-    ) -> Result<bool, VoiceIdStoreError> {
-        let conn = self.connection()?;
-        immediate_transaction(&conn, || {
-            import_person_graph_on_conn(&conn, person, samples, legacy_profile_id)
-        })
-    }
-
-    /// Import many migrated persons and advance the migration ledger in the
-    /// same IMMEDIATE transaction. Each entry is skipped when its legacy id is
-    /// already aliased, so a crash mid-import followed by retry cannot create
-    /// duplicate Alice persons.
-    pub fn import_migrated_profiles_atomic(
-        &self,
-        imports: &[(
-            Person,
-            Vec<(EnrollmentSample, SampleEmbedding)>,
-            String, /* legacy_profile_id */
-        )],
-        ledger_key: &str,
-        ledger_value: &str,
-    ) -> Result<usize, VoiceIdStoreError> {
-        let conn = self.connection()?;
-        immediate_transaction(&conn, || {
-            let mut imported = 0usize;
-            for (person, samples, legacy_id) in imports {
-                if import_person_graph_on_conn(&conn, person, samples, Some(legacy_id.as_str()))? {
-                    imported += 1;
-                }
-            }
-            conn.execute(
-                "INSERT INTO voice_id_meta(key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![ledger_key, ledger_value],
-            )?;
-            Ok(imported)
-        })
+        let _ = self.get_person(person_id, None)?;
+        Ok(person_id.as_str().to_string())
     }
 
     fn connection(&self) -> Result<Connection, VoiceIdStoreError> {
@@ -871,10 +774,7 @@ impl VoiceIdStore {
                 path: self.db_path.clone(),
                 source,
             })?;
-        ensure_schema(&conn).map_err(|source| VoiceIdStoreError::OpenDatabase {
-            path: self.db_path.clone(),
-            source,
-        })?;
+        ensure_schema(&conn)?;
         set_owner_only_file_permissions(&self.db_path);
         // Best-effort protect WAL/SHM siblings.
         let wal = PathBuf::from(format!("{}-wal", self.db_path.display()));
@@ -1018,16 +918,16 @@ fn unix_timestamp_secs() -> i64 {
         .as_secs() as i64
 }
 
-fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+fn ensure_schema(conn: &Connection) -> Result<(), VoiceIdStoreError> {
     let user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if user_version == 0 {
         conn.execute_batch(
             "
-            CREATE TABLE IF NOT EXISTS voice_id_meta (
+            CREATE TABLE voice_id_meta (
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS persons (
+            CREATE TABLE persons (
                 person_id TEXT PRIMARY KEY NOT NULL,
                 display_name TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -1036,7 +936,7 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
                 revision INTEGER NOT NULL,
                 color_preference TEXT
             );
-            CREATE TABLE IF NOT EXISTS enrollment_samples (
+            CREATE TABLE enrollment_samples (
                 sample_id TEXT PRIMARY KEY NOT NULL,
                 person_id TEXT NOT NULL REFERENCES persons(person_id),
                 created_at TEXT NOT NULL,
@@ -1045,21 +945,21 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
                 context_json TEXT NOT NULL,
                 sample_ordinal INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS embedding_spaces (
+            CREATE TABLE embedding_spaces (
                 space_id TEXT PRIMARY KEY NOT NULL,
                 canonical_json TEXT NOT NULL,
                 dimension INTEGER NOT NULL,
                 pack_fingerprint TEXT NOT NULL,
                 legacy_unverifiable INTEGER NOT NULL DEFAULT 0
             );
-            CREATE TABLE IF NOT EXISTS sample_embeddings (
+            CREATE TABLE sample_embeddings (
                 sample_id TEXT NOT NULL REFERENCES enrollment_samples(sample_id) ON DELETE CASCADE,
                 space_id TEXT NOT NULL REFERENCES embedding_spaces(space_id),
                 embedding_blob BLOB NOT NULL,
                 embedding_dim INTEGER NOT NULL,
                 PRIMARY KEY (sample_id, space_id)
             );
-            CREATE TABLE IF NOT EXISTS prototypes (
+            CREATE TABLE prototypes (
                 prototype_id TEXT PRIMARY KEY NOT NULL,
                 person_id TEXT NOT NULL REFERENCES persons(person_id),
                 space_id TEXT NOT NULL REFERENCES embedding_spaces(space_id),
@@ -1068,26 +968,18 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
                 medoid_blob BLOB NOT NULL,
                 medoid_dim INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS prototype_members (
+            CREATE TABLE prototype_members (
                 prototype_id TEXT NOT NULL REFERENCES prototypes(prototype_id) ON DELETE CASCADE,
                 sample_id TEXT NOT NULL,
                 quality_weight REAL NOT NULL,
                 PRIMARY KEY (prototype_id, sample_id)
             );
-            CREATE TABLE IF NOT EXISTS legacy_profile_aliases (
-                legacy_profile_id TEXT PRIMARY KEY NOT NULL,
-                person_id TEXT NOT NULL REFERENCES persons(person_id)
-            );
-            CREATE TABLE IF NOT EXISTS person_tombstones (
+            CREATE TABLE person_tombstones (
                 person_id TEXT PRIMARY KEY NOT NULL,
                 revoked_or_deleted_at TEXT NOT NULL,
                 reason TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS legacy_person_color_preferences (
-                person_id TEXT PRIMARY KEY NOT NULL REFERENCES persons(person_id),
-                color_preference TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS voice_id_idempotency (
+            CREATE TABLE voice_id_idempotency (
                 scope TEXT NOT NULL,
                 key_hash TEXT NOT NULL,
                 request_hash TEXT NOT NULL,
@@ -1097,173 +989,73 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
                 expires_at INTEGER NOT NULL,
                 PRIMARY KEY (scope, key_hash)
             );
-            CREATE INDEX IF NOT EXISTS voice_id_idempotency_expires_idx
+            CREATE INDEX voice_id_idempotency_expires_idx
                 ON voice_id_idempotency(expires_at);
-            CREATE INDEX IF NOT EXISTS enrollment_samples_person_idx
+            CREATE INDEX enrollment_samples_person_idx
                 ON enrollment_samples(person_id);
-            CREATE UNIQUE INDEX IF NOT EXISTS enrollment_samples_person_ordinal_idx
+            CREATE UNIQUE INDEX enrollment_samples_person_ordinal_idx
                 ON enrollment_samples(person_id, sample_ordinal);
-            CREATE INDEX IF NOT EXISTS prototypes_person_space_idx
+            CREATE INDEX prototypes_person_space_idx
                 ON prototypes(person_id, space_id);
             ",
         )?;
         conn.pragma_update(None, "user_version", VOICE_ID_SCHEMA_VERSION)?;
         conn.execute(
-            "INSERT OR REPLACE INTO voice_id_meta(key, value) VALUES ('schema_version', ?1)",
+            "INSERT INTO voice_id_meta(key, value) VALUES ('schema_version', ?1)",
             params![VOICE_ID_SCHEMA_VERSION.to_string()],
         )?;
         return Ok(());
     }
-    if user_version == VOICE_ID_SCHEMA_VERSION {
-        return Ok(());
-    }
-    if !(1..VOICE_ID_SCHEMA_VERSION).contains(&user_version) {
-        // Unknown newer/older versions fail closed.
-        return Err(rusqlite::Error::InvalidQuery);
-    }
-    migrate_schema_to_current(conn, user_version)
-}
-
-/// Upgrade all intermediate versions in one IMMEDIATE transaction. Individual
-/// migration steps never commit or publish an intermediate schema version.
-fn migrate_schema_to_current(conn: &Connection, from_version: i32) -> rusqlite::Result<()> {
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let result = (|| {
-        if from_version == 1 {
-            migrate_v1_to_v2_on_conn(conn)?;
-        }
-        if from_version <= 2 {
-            migrate_v2_to_v3_on_conn(conn)?;
-        }
-        if from_version <= 3 {
-            migrate_v3_to_v4_on_conn(conn)?;
-        }
-        conn.pragma_update(None, "user_version", VOICE_ID_SCHEMA_VERSION)?;
-        conn.execute(
-            "INSERT OR REPLACE INTO voice_id_meta(key, value) VALUES ('schema_version', ?1)",
-            params![VOICE_ID_SCHEMA_VERSION.to_string()],
-        )?;
-        Ok(())
-    })();
-    match result {
-        Ok(()) => conn.execute_batch("COMMIT"),
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(error)
-        }
-    }
-}
-
-/// Voice ID v1 allowed arbitrary presentation strings. Upgrade valid token
-/// spellings in place; archive non-token values and clear the active preference
-/// so old records remain readable without expanding the new cross-client enum.
-fn migrate_v1_to_v2_on_conn(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS legacy_person_color_preferences (
-            person_id TEXT PRIMARY KEY NOT NULL REFERENCES persons(person_id),
-            color_preference TEXT NOT NULL
-        );",
-    )?;
-    let colors = conn
-        .prepare(
-            "SELECT person_id, color_preference FROM persons WHERE color_preference IS NOT NULL",
-        )?
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    for (person_id, color) in colors {
-        if let Some(token) = VoiceIdColor::parse(&color.trim().to_ascii_lowercase()) {
-            conn.execute(
-                "UPDATE persons SET color_preference = ?1 WHERE person_id = ?2",
-                params![token.as_str(), person_id],
-            )?;
-        } else {
-            conn.execute(
-                "INSERT OR REPLACE INTO legacy_person_color_preferences(person_id, color_preference)
-                 VALUES (?1, ?2)",
-                params![person_id, color],
-            )?;
-            conn.execute(
-                "UPDATE persons SET color_preference = NULL WHERE person_id = ?1",
-                params![person_id],
-            )?;
-        }
+    if user_version != VOICE_ID_SCHEMA_VERSION || !schema_is_current(conn)? {
+        return Err(VoiceIdStoreError::UnreleasedSchema {
+            found: user_version,
+        });
     }
     Ok(())
 }
 
-/// Add a persisted per-person ordinal so API order is the request order rather
-/// than a tie-break on random sample IDs. Existing records receive a stable
-/// historical order based on their original SQLite insertion order.
-fn migrate_v2_to_v3_on_conn(conn: &Connection) -> rusqlite::Result<()> {
-    let has_ordinal = conn
+fn schema_is_current(conn: &Connection) -> Result<bool, VoiceIdStoreError> {
+    const TABLES: &[&str] = &[
+        "voice_id_meta",
+        "persons",
+        "enrollment_samples",
+        "embedding_spaces",
+        "sample_embeddings",
+        "prototypes",
+        "prototype_members",
+        "person_tombstones",
+        "voice_id_idempotency",
+    ];
+    for table in TABLES {
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(false);
+        }
+    }
+    let sample_ordinal_exists = conn
         .prepare("PRAGMA table_info(enrollment_samples)")?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?
         .iter()
         .any(|column| column == "sample_ordinal");
-    if !has_ordinal {
-        conn.execute_batch(
-            "ALTER TABLE enrollment_samples
-             ADD COLUMN sample_ordinal INTEGER NOT NULL DEFAULT 0",
-        )?;
+    if !sample_ordinal_exists {
+        return Ok(false);
     }
-    let person_ids = conn
-        .prepare("SELECT person_id FROM persons")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    for person_id in person_ids {
-        let sample_ids = conn
-            .prepare(
-                "SELECT sample_id FROM enrollment_samples
-                 WHERE person_id = ?1 ORDER BY created_at ASC, rowid ASC",
-            )?
-            .query_map(params![person_id], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (ordinal, sample_id) in sample_ids.into_iter().enumerate() {
-            conn.execute(
-                "UPDATE enrollment_samples SET sample_ordinal = ?1 WHERE sample_id = ?2",
-                params![ordinal as i64, sample_id],
-            )?;
-        }
-    }
-    conn.execute_batch(
-        "CREATE UNIQUE INDEX IF NOT EXISTS enrollment_samples_person_ordinal_idx
-         ON enrollment_samples(person_id, sample_ordinal)",
-    )?;
-    #[cfg(test)]
-    if fail_migration_after_v2_step() {
-        return Err(rusqlite::Error::InvalidQuery);
-    }
-    Ok(())
-}
-
-fn migrate_v3_to_v4_on_conn(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS voice_id_idempotency (
-            scope TEXT NOT NULL,
-            key_hash TEXT NOT NULL,
-            request_hash TEXT NOT NULL,
-            response_json TEXT NOT NULL,
-            etag TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL,
-            PRIMARY KEY (scope, key_hash)
-        );
-        CREATE INDEX IF NOT EXISTS voice_id_idempotency_expires_idx
-            ON voice_id_idempotency(expires_at);",
-    )
-}
-
-#[cfg(test)]
-thread_local! {
-    static FAIL_MIGRATION_AFTER_V2_STEP: Cell<bool> = const { Cell::new(false) };
-}
-
-#[cfg(test)]
-fn fail_migration_after_v2_step() -> bool {
-    FAIL_MIGRATION_AFTER_V2_STEP.with(|fail| fail.replace(false))
+    let schema_version = conn
+        .query_row(
+            "SELECT value FROM voice_id_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(schema_version.as_deref() == Some("1"))
 }
 
 fn insert_sample(
@@ -1584,88 +1376,6 @@ fn load_sample_views(
     Ok(out)
 }
 
-/// Insert one migrated person graph on an open connection. Returns `false` when
-/// `legacy_profile_id` is already aliased (idempotent skip). Callers must hold
-/// an open IMMEDIATE transaction when batching with the migration ledger.
-fn import_person_graph_on_conn(
-    conn: &Connection,
-    person: &Person,
-    samples: &[(EnrollmentSample, SampleEmbedding)],
-    legacy_profile_id: Option<&str>,
-) -> Result<bool, VoiceIdStoreError> {
-    if let Some(legacy) = legacy_profile_id {
-        let exists = conn
-            .query_row(
-                "SELECT 1 FROM legacy_profile_aliases WHERE legacy_profile_id = ?1",
-                params![legacy],
-                |_row| Ok(1i32),
-            )
-            .optional()?
-            .is_some();
-        if exists {
-            return Ok(false);
-        }
-    }
-
-    conn.execute(
-        "INSERT INTO persons(person_id, display_name, status, created_at, updated_at, revision, color_preference)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            person.person_id.as_str(),
-            person.display_name,
-            person.status.as_str(),
-            person.created_at,
-            person.updated_at,
-            person.revision as i64,
-            person.color_preference.map(VoiceIdColor::as_str),
-        ],
-    )?;
-    for (sample_ordinal, (sample, embedding)) in samples.iter().enumerate() {
-        let consent_json = serde_json::to_string(&sample.consent)
-            .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
-        let quality_json = serde_json::to_string(&sample.quality)
-            .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
-        let context_json = serde_json::to_string(&sample.capture_context)
-            .map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
-        conn.execute(
-            "INSERT INTO enrollment_samples(
-                sample_id, person_id, created_at, consent_json, quality_json, context_json, sample_ordinal
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                sample.sample_id.as_str(),
-                sample.person_id.as_str(),
-                sample.created_at,
-                consent_json,
-                quality_json,
-                context_json,
-                sample_ordinal as i64,
-            ],
-        )?;
-        upsert_space(conn, &embedding.space)?;
-        let blob = embedding_to_blob(&embedding.embedding)?;
-        conn.execute(
-            "INSERT INTO sample_embeddings(sample_id, space_id, embedding_blob, embedding_dim)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                sample.sample_id.as_str(),
-                embedding.space.space_id,
-                blob,
-                embedding.embedding.dim() as i64
-            ],
-        )?;
-    }
-    rebuild_prototypes_for_person(conn, &person.person_id)?;
-    if let Some(legacy) = legacy_profile_id {
-        conn.execute(
-            "INSERT INTO legacy_profile_aliases(legacy_profile_id, person_id)
-             VALUES (?1, ?2)",
-            params![legacy, person.person_id.as_str()],
-        )?;
-    }
-    bump_global_revision(conn)?;
-    Ok(true)
-}
-
 fn upsert_space(conn: &Connection, space: &EmbeddingSpace) -> Result<(), VoiceIdStoreError> {
     let json =
         serde_json::to_string(space).map_err(|e| VoiceIdStoreError::Serialize(e.to_string()))?;
@@ -1945,6 +1655,92 @@ mod tests {
     }
 
     #[test]
+    fn fresh_database_is_complete_v1_schema() {
+        let dir = tempdir().unwrap();
+        let store = VoiceIdStore::open_checked(dir.path()).unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        let user_version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, VOICE_ID_SCHEMA_VERSION);
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM voice_id_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "1"
+        );
+        for table in [
+            "persons",
+            "enrollment_samples",
+            "embedding_spaces",
+            "sample_embeddings",
+            "prototypes",
+            "prototype_members",
+            "person_tombstones",
+            "voice_id_idempotency",
+        ] {
+            assert!(
+                conn.query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+            );
+        }
+        let sample_columns = conn
+            .prepare("PRAGMA table_info(enrollment_samples)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            sample_columns
+                .iter()
+                .any(|column| column == "sample_ordinal")
+        );
+        assert!(conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'voice_id_idempotency_expires_idx'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn unreleased_schema_is_rejected_without_resetting_database() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("diarize/voice-id.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE development_data(value TEXT); PRAGMA user_version = 4;")
+            .unwrap();
+        drop(conn);
+
+        let error = VoiceIdStore::open_checked(dir.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            VoiceIdStoreError::UnreleasedSchema { found: 4 }
+        ));
+        let conn = Connection::open(path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM development_data", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn idempotent_enrollment_replays_across_reopen_without_extra_revisions() {
         let dir = tempdir().unwrap();
         let space = test_space("sha256:idempotency");
@@ -1975,7 +1771,7 @@ mod tests {
         let store = VoiceIdStore::open(dir.path());
         assert_eq!(store.list_persons(Some(&space)).unwrap().len(), 1);
         assert_eq!(
-            store.migration_state("global_revision").unwrap().as_deref(),
+            store.metadata_value("global_revision").unwrap().as_deref(),
             Some("1")
         );
     }
@@ -2056,7 +1852,7 @@ mod tests {
         assert_eq!(first.person, replay.person);
         assert!(replay.replayed);
         assert_eq!(
-            store.migration_state("global_revision").unwrap().as_deref(),
+            store.metadata_value("global_revision").unwrap().as_deref(),
             Some("2")
         );
     }
@@ -2085,7 +1881,7 @@ mod tests {
         });
         assert_eq!(store.list_persons(Some(&space)).unwrap().len(), 1);
         assert_eq!(
-            store.migration_state("global_revision").unwrap().as_deref(),
+            store.metadata_value("global_revision").unwrap().as_deref(),
             Some("1")
         );
     }
@@ -2167,7 +1963,7 @@ mod tests {
         assert_eq!(color_only.color_preference, Some(VoiceIdColor::Purple));
         assert_eq!(color_only.revision, 2);
         assert_eq!(
-            store.migration_state("global_revision").unwrap().as_deref(),
+            store.metadata_value("global_revision").unwrap().as_deref(),
             Some("2")
         );
 
@@ -2199,7 +1995,7 @@ mod tests {
         assert_eq!(both.color_preference, Some(VoiceIdColor::Green));
         assert_eq!(both.revision, 4);
         assert_eq!(
-            store.migration_state("global_revision").unwrap().as_deref(),
+            store.metadata_value("global_revision").unwrap().as_deref(),
             Some("4")
         );
 
@@ -2300,7 +2096,7 @@ mod tests {
         );
         assert_eq!(renamed.samples[0].quality, before_quality);
         assert_eq!(
-            store.migration_state("global_revision").unwrap().as_deref(),
+            store.metadata_value("global_revision").unwrap().as_deref(),
             Some("2")
         );
 
@@ -2381,287 +2177,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn legacy_color_preferences_migrate_without_hiding_persons() {
-        let dir = tempdir().unwrap();
-        let store = VoiceIdStore::open(dir.path());
-        let space = test_space("sha256:legacy-colors");
-        let valid = store
-            .enroll_person(
-                "Valid legacy color",
-                consent(),
-                vec![sample_input(&space, vec![1.0, 0.0])],
-                None,
-            )
-            .unwrap();
-        let invalid = store
-            .enroll_person(
-                "Invalid legacy color",
-                consent(),
-                vec![sample_input(&space, vec![0.0, 1.0])],
-                None,
-            )
-            .unwrap();
-        let conn = store.connection().unwrap();
-        conn.execute(
-            "UPDATE persons SET color_preference = ' PURPLE ' WHERE person_id = ?1",
-            params![valid.person_id],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE persons SET color_preference = '#123456' WHERE person_id = ?1",
-            params![invalid.person_id],
-        )
-        .unwrap();
-        conn.execute_batch("DROP TABLE legacy_person_color_preferences; PRAGMA user_version = 1")
-            .unwrap();
-        drop(conn);
-
-        let reopened = VoiceIdStore::open(dir.path());
-        let listed = reopened.list_persons(None).unwrap();
-        assert_eq!(listed.len(), 2);
-        let valid_view = listed
-            .iter()
-            .find(|person| person.person_id == valid.person_id)
-            .unwrap();
-        assert_eq!(valid_view.color_preference, Some(VoiceIdColor::Purple));
-        let invalid_view = listed
-            .iter()
-            .find(|person| person.person_id == invalid.person_id)
-            .unwrap();
-        assert_eq!(invalid_view.color_preference, None);
-        let conn = reopened.connection().unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT color_preference FROM legacy_person_color_preferences WHERE person_id = ?1",
-                params![invalid.person_id],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-            "#123456"
-        );
-        assert_eq!(
-            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
-                .unwrap(),
-            VOICE_ID_SCHEMA_VERSION
-        );
-    }
-
-    #[test]
-    fn v1_to_current_migration_rolls_back_every_step_on_failure() {
-        let dir = tempdir().unwrap();
-        let store = VoiceIdStore::open(dir.path());
-        std::fs::create_dir_all(store.db_path().parent().unwrap()).unwrap();
-        let conn = Connection::open(store.db_path()).unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE voice_id_meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
-            INSERT INTO voice_id_meta(key, value) VALUES ('schema_version', '1');
-            CREATE TABLE persons (
-                person_id TEXT PRIMARY KEY NOT NULL,
-                display_name TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                color_preference TEXT
-            );
-            CREATE TABLE enrollment_samples (
-                sample_id TEXT PRIMARY KEY NOT NULL,
-                person_id TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                consent_json TEXT NOT NULL,
-                quality_json TEXT NOT NULL,
-                context_json TEXT NOT NULL
-            );
-            PRAGMA user_version = 1;
-            ",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO persons VALUES ('person_legacy', 'Alice', 'active', 'now', 'now', 1, '#123456')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO enrollment_samples VALUES ('sample_legacy', 'person_legacy', 'now', '{}', '{}', '{}')",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-
-        FAIL_MIGRATION_AFTER_V2_STEP.with(|fail| fail.set(true));
-        assert!(store.connection().is_err());
-
-        let conn = Connection::open(store.db_path()).unwrap();
-        assert_eq!(
-            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT value FROM voice_id_meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-            "1"
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT color_preference FROM persons WHERE person_id = 'person_legacy'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-            "#123456"
-        );
-        let tables = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(
-            !tables
-                .iter()
-                .any(|name| name == "legacy_person_color_preferences")
-        );
-        let columns = conn
-            .prepare("PRAGMA table_info(enrollment_samples)")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(!columns.iter().any(|column| column == "sample_ordinal"));
-        let indexes = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(
-            !indexes
-                .iter()
-                .any(|name| name == "enrollment_samples_person_ordinal_idx")
-        );
-        drop(conn);
-
-        let migrated = store.connection().unwrap();
-        assert_eq!(
-            migrated
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
-                .unwrap(),
-            VOICE_ID_SCHEMA_VERSION
-        );
-        assert_eq!(
-            migrated
-                .query_row(
-                    "SELECT value FROM voice_id_meta WHERE key = 'schema_version'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            VOICE_ID_SCHEMA_VERSION.to_string()
-        );
-        assert_eq!(
-            migrated
-                .query_row(
-                    "SELECT color_preference FROM persons WHERE person_id = 'person_legacy'",
-                    [],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            migrated
-                .query_row(
-                    "SELECT color_preference FROM legacy_person_color_preferences WHERE person_id = 'person_legacy'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            "#123456"
-        );
-        drop(migrated);
-        let reopened = store
-            .connection()
-            .expect("completed migrations are idempotent");
-        assert_eq!(
-            reopened
-                .query_row(
-                    "SELECT value FROM voice_id_meta WHERE key = 'schema_version'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            VOICE_ID_SCHEMA_VERSION.to_string()
-        );
-    }
-
-    #[test]
-    fn v2_sample_records_migrate_to_stable_ordinals() {
-        let dir = tempdir().unwrap();
-        let store = VoiceIdStore::open(dir.path());
-        std::fs::create_dir_all(store.db_path().parent().unwrap()).unwrap();
-        let conn = Connection::open(store.db_path()).unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE voice_id_meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
-            CREATE TABLE persons (
-                person_id TEXT PRIMARY KEY NOT NULL,
-                display_name TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                color_preference TEXT
-            );
-            CREATE TABLE enrollment_samples (
-                sample_id TEXT PRIMARY KEY NOT NULL,
-                person_id TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                consent_json TEXT NOT NULL,
-                quality_json TEXT NOT NULL,
-                context_json TEXT NOT NULL
-            );
-            PRAGMA user_version = 2;
-            ",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO persons VALUES ('person_legacy', 'Alice', 'active', 'now', 'now', 1, NULL)",
-            [],
-        )
-        .unwrap();
-        for sample_id in ["sample_first", "sample_second", "sample_third"] {
-            conn.execute(
-                "INSERT INTO enrollment_samples VALUES (?1, 'person_legacy', 'same-time', '{}', '{}', '{}')",
-                params![sample_id],
-            )
-            .unwrap();
-        }
-        drop(conn);
-
-        let conn = store.connection().unwrap();
-        let ids = conn
-            .prepare(
-                "SELECT sample_id FROM enrollment_samples
-                 WHERE person_id = 'person_legacy' ORDER BY sample_ordinal ASC",
-            )
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(ids, vec!["sample_first", "sample_second", "sample_third"]);
     }
 
     #[test]

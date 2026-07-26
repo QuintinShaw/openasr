@@ -941,8 +941,8 @@ pub(crate) fn open_voice_id_store(
     distribution: &DistributionContext,
 ) -> Result<openasr_core::diarize::voice_id::VoiceIdStore, ApiError> {
     let home = distribution.openasr_home()?;
-    openasr_core::diarize::voice_id::open_store_with_v1_migration(home)
-        .map_err(|e| ApiError::JobStore(format!("voice-id store open/migration failed: {e}")))
+    openasr_core::diarize::voice_id::VoiceIdStore::open_checked(home)
+        .map_err(|e| ApiError::JobStore(format!("voice-id store open failed: {e}")))
 }
 
 pub(crate) fn active_space() -> Option<openasr_core::diarize::voice_id::EmbeddingSpace> {
@@ -1103,7 +1103,7 @@ fn parse_if_match(headers: &HeaderMap) -> Result<Option<u64>, ApiError> {
 
 fn global_revision_etag(store: &openasr_core::diarize::voice_id::VoiceIdStore) -> String {
     let rev = store
-        .migration_state("global_revision")
+        .metadata_value("global_revision")
         .ok()
         .flatten()
         .unwrap_or_else(|| "0".into());
@@ -1137,7 +1137,7 @@ pub(crate) fn voice_id_store_error(
         | VoiceIdStoreError::EmptyPersonMetadataUpdate
         | VoiceIdStoreError::InvalidId(_)
         | VoiceIdStoreError::NotActive(_)
-        | VoiceIdStoreError::Migration(_) => ApiError::BadRequest(error.to_string()),
+        | VoiceIdStoreError::InvalidEnrollment(_) => ApiError::BadRequest(error.to_string()),
         other => ApiError::JobStore(other.to_string()),
     }
 }
