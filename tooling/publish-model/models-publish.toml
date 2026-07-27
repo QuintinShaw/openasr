@@ -345,7 +345,17 @@ import_subcommand = "import firered-llm"
 upstream_repo = "FireRedTeam/FireRedASR2-LLM"
 source_revision = "main"
 needs_license_flags = false
-required_download_files = ["asr_encoder.pth.tar", "model.pth.tar", "cmvn.ark", "Qwen2-7B-Instruct/config.json", "Qwen2-7B-Instruct/model.safetensors.index.json"]
+# The nested Qwen2-7B-Instruct base weights (sharded) plus its tokenizer
+# triplet are consumed by firered_llm_merge_lora.py and the importer's
+# tokenizer bake; list them so a partial base download fails here, not
+# mid-merge.
+required_download_files = [
+    "asr_encoder.pth.tar", "model.pth.tar", "cmvn.ark",
+    "Qwen2-7B-Instruct/config.json", "Qwen2-7B-Instruct/model.safetensors.index.json",
+    "Qwen2-7B-Instruct/model*.safetensors",
+    "Qwen2-7B-Instruct/vocab.json", "Qwen2-7B-Instruct/merges.txt",
+    "Qwen2-7B-Instruct/tokenizer_config.json",
+]
 prep_scripts = [
     "python3 tooling/publish-model/scripts/pt_to_safetensors.py --pt {src}/asr_encoder.pth.tar --out {src}/model.safetensors",
     "python3 tooling/publish-model/scripts/firered_llm_cmvn_ark_to_txt.py --ark {src}/cmvn.ark --out {src}/cmvn.txt",
@@ -367,7 +377,7 @@ upstream_repo = "XiaomiMiMo/MiMo-V2.5-ASR"
 source_revision = "main"
 needs_license_flags = false
 extra_sources = ["XiaomiMiMo/MiMo-Audio-Tokenizer@main:tokenizer-src"]
-required_download_files = ["config.json", "model.safetensors.index.json", "tokenizer-src/model.safetensors"]
+required_download_files = ["config.json", "model.safetensors.index.json", "model*.safetensors", "tokenizer-src/model.safetensors"]
 external_converter = "python3 tooling/mimo-asr/convert_mimo_asr.py --main-dir {src} --tokenizer {src}/tokenizer-src/model.safetensors --out-dir {packs_dir} --package-id {registry_id} --quant {quant}"
 
 # Qwen3-ForcedAligner-0.6B: shares its thinker (audio encoder + LM) tensor
@@ -407,10 +417,21 @@ import_command = "model-pack import firered-punc {src}/model.safetensors {src}/c
 # in moss_transcribe_diarize::package_import). Like the CTC families it takes
 # only --package-id + --quantization; the importer bakes license metadata from
 # the source checkpoint itself (needs_license_flags = false).
+# The gate lists every file the importer reads: the sharded weights
+# (index + shard glob -- an index without its shards is a stripped
+# download, not a source) and the Qwen-style BPE triplet. No prep stage,
+# so the download gate mirrors the source gate.
 ["moss-transcribe-diarize"]
 import_subcommand = "import moss"
 upstream_repo = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
 source_revision = "main"
 needs_license_flags = false
-required_source_files = ["config.json", "model.safetensors.index.json"]
+required_download_files = [
+    "config.json", "vocab.json", "merges.txt", "tokenizer.json",
+    "model.safetensors.index.json", "model*.safetensors",
+]
+required_source_files = [
+    "config.json", "vocab.json", "merges.txt", "tokenizer.json",
+    "model.safetensors.index.json", "model*.safetensors",
+]
 import_command = "model-pack import moss {src} {out} --package-id {registry_id} --quantization {quant}"
