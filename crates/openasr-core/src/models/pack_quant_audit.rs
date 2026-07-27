@@ -1,0 +1,731 @@
+//! Quantization-strategy self-check for `.oasr` packs: replay the current
+//! tensor-quantization policy against a pack's own tensor index and fail
+//! closed when an audio-encoder tensor sits below the Q8_0 safety floor (or
+//! any tensor exceeds the tier the pack claims).
+//!
+//! This is the structural lesson of the q4_k over-quantization incident:
+//! sub-Q8 block quantization of the acoustic encoder is a behavioral cliff
+//! (long-audio greedy decode collapses into repetition or empty output), and
+//! nothing in a pack used to answer "was this built under the policy that
+//! floors the encoder at Q8_0?". The audit works on the GGUF header alone --
+//! metadata + tensor names/dims/types, all in a file's first few megabytes --
+//! so it also runs against published, remotely-hosted, read-only packs via an
+//! HTTP `Range` prefix fetch, with no source weights and no inference.
+//!
+//! The encoder/decoder split mirrors each family's importer classification
+//! (`QuantComponent` at import time) but keyed on the RUNTIME tensor names
+//! written into the pack and on the pack's `openasr.model.architecture`
+//! metadata, so the check needs no source checkout. The floor itself is the
+//! same policy [`crate::models::pack_quant::classify_quant_tensor`] enforces
+//! at build time; a pack that violates it was built by code predating the
+//! floor (or by a regression), and must not ship.
+
+use std::borrow::Cow;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use thiserror::Error;
+
+use crate::ggml_runtime::gguf_header::{GgufHeaderError, GgufHeaderView, parse_gguf_header};
+use crate::models::pack_quant::PackQuant;
+
+// --- ggml type ids (stable ggml ABI wire values) ---------------------------
+
+pub const GGML_TYPE_F32: u32 = 0;
+pub const GGML_TYPE_F16: u32 = 1;
+pub const GGML_TYPE_Q4_0: u32 = 2;
+pub const GGML_TYPE_Q4_1: u32 = 3;
+pub const GGML_TYPE_Q5_0: u32 = 6;
+pub const GGML_TYPE_Q5_1: u32 = 7;
+pub const GGML_TYPE_Q8_0: u32 = 8;
+pub const GGML_TYPE_Q8_1: u32 = 9;
+pub const GGML_TYPE_Q2_K: u32 = 10;
+pub const GGML_TYPE_Q3_K: u32 = 11;
+pub const GGML_TYPE_Q4_K: u32 = 12;
+pub const GGML_TYPE_Q5_K: u32 = 13;
+pub const GGML_TYPE_Q6_K: u32 = 14;
+pub const GGML_TYPE_Q8_K: u32 = 15;
+pub const GGML_TYPE_IQ2_XXS: u32 = 16;
+pub const GGML_TYPE_IQ2_XS: u32 = 17;
+pub const GGML_TYPE_IQ3_XXS: u32 = 18;
+pub const GGML_TYPE_IQ1_S: u32 = 19;
+pub const GGML_TYPE_IQ4_NL: u32 = 20;
+pub const GGML_TYPE_IQ3_S: u32 = 21;
+pub const GGML_TYPE_IQ2_S: u32 = 22;
+pub const GGML_TYPE_IQ4_XS: u32 = 23;
+pub const GGML_TYPE_I8: u32 = 24;
+pub const GGML_TYPE_I16: u32 = 25;
+pub const GGML_TYPE_I32: u32 = 26;
+pub const GGML_TYPE_I64: u32 = 27;
+pub const GGML_TYPE_F64: u32 = 28;
+pub const GGML_TYPE_IQ1_M: u32 = 29;
+pub const GGML_TYPE_BF16: u32 = 30;
+
+/// Human-readable ggml type name for diagnostics.
+pub fn ggml_type_name(ggml_type: u32) -> Cow<'static, str> {
+    match ggml_type {
+        GGML_TYPE_F32 => "f32".into(),
+        GGML_TYPE_F16 => "f16".into(),
+        GGML_TYPE_Q4_0 => "q4_0".into(),
+        GGML_TYPE_Q4_1 => "q4_1".into(),
+        GGML_TYPE_Q5_0 => "q5_0".into(),
+        GGML_TYPE_Q5_1 => "q5_1".into(),
+        GGML_TYPE_Q8_0 => "q8_0".into(),
+        GGML_TYPE_Q8_1 => "q8_1".into(),
+        GGML_TYPE_Q2_K => "q2_k".into(),
+        GGML_TYPE_Q3_K => "q3_k".into(),
+        GGML_TYPE_Q4_K => "q4_k".into(),
+        GGML_TYPE_Q5_K => "q5_k".into(),
+        GGML_TYPE_Q6_K => "q6_k".into(),
+        GGML_TYPE_Q8_K => "q8_k".into(),
+        GGML_TYPE_IQ2_XXS => "iq2_xxs".into(),
+        GGML_TYPE_IQ2_XS => "iq2_xs".into(),
+        GGML_TYPE_IQ3_XXS => "iq3_xxs".into(),
+        GGML_TYPE_IQ1_S => "iq1_s".into(),
+        GGML_TYPE_IQ4_NL => "iq4_nl".into(),
+        GGML_TYPE_IQ3_S => "iq3_s".into(),
+        GGML_TYPE_IQ2_S => "iq2_s".into(),
+        GGML_TYPE_IQ4_XS => "iq4_xs".into(),
+        GGML_TYPE_I8 => "i8".into(),
+        GGML_TYPE_I16 => "i16".into(),
+        GGML_TYPE_I32 => "i32".into(),
+        GGML_TYPE_I64 => "i64".into(),
+        GGML_TYPE_F64 => "f64".into(),
+        GGML_TYPE_IQ1_M => "iq1_m".into(),
+        GGML_TYPE_BF16 => "bf16".into(),
+        other => format!("ggml-type-{other}").into(),
+    }
+}
+
+/// True for block-quantized storage (the lossy Q*/IQ* ggml types). F16/F32/
+/// BF16/F64 are higher-precision float storage and integer arrays (I8..I64)
+/// are non-neural data; neither is a block quant. An UNKNOWN type id is
+/// treated as a block quant so the audit fails closed on types it cannot
+/// account for rather than waving them through.
+pub fn is_block_quant_type(ggml_type: u32) -> bool {
+    !matches!(
+        ggml_type,
+        GGML_TYPE_F32
+            | GGML_TYPE_F16
+            | GGML_TYPE_F64
+            | GGML_TYPE_BF16
+            | GGML_TYPE_I8
+            | GGML_TYPE_I16
+            | GGML_TYPE_I32
+            | GGML_TYPE_I64
+    )
+}
+
+/// True when the type satisfies the audio-encoder Q8_0 floor: Q8_0/Q8_1/Q8_K
+/// (or any non-block storage, checked by the caller). Anything below -- the
+/// Q2..Q6 and IQ* rungs -- is the behavioral cliff the floor exists to
+/// prevent.
+pub fn meets_encoder_q8_floor(ggml_type: u32) -> bool {
+    matches!(ggml_type, GGML_TYPE_Q8_0 | GGML_TYPE_Q8_1 | GGML_TYPE_Q8_K)
+}
+
+/// The block-quant rungs a declared pack tier may contain, mirroring
+/// [`crate::models::pack_quant::classify_quant_tensor`]: a tier is a CEILING
+/// (the importer never selects a rung above the request), with Q8_0 always
+/// available as the alignment-fallback / encoder-floor rung. `Fp16` writes no
+/// block quants at all.
+fn declared_tier_allows(declared: PackQuant, ggml_type: u32) -> bool {
+    match declared {
+        PackQuant::Fp16 => false,
+        PackQuant::Q8_0 => matches!(ggml_type, GGML_TYPE_Q8_0 | GGML_TYPE_Q8_1 | GGML_TYPE_Q8_K),
+        PackQuant::Q3_K => matches!(
+            ggml_type,
+            GGML_TYPE_Q8_0 | GGML_TYPE_Q8_1 | GGML_TYPE_Q8_K | GGML_TYPE_Q3_K
+        ),
+        PackQuant::Q4_K => matches!(
+            ggml_type,
+            GGML_TYPE_Q8_0 | GGML_TYPE_Q8_1 | GGML_TYPE_Q8_K | GGML_TYPE_Q4_K
+        ),
+    }
+}
+
+// --- per-architecture audio-encoder tensor rules ---------------------------
+
+/// Which tensors of a pack are audio-encoder weights for the Q8_0 floor,
+/// keyed on the RUNTIME tensor names written into the pack. Mirrors each
+/// family importer's `QuantComponent::Encoder` classification at build time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioEncoderTensors {
+    /// Encoder tensors are the rank-2 weights under these name prefixes.
+    NamePrefixes(&'static [&'static str]),
+    /// The whole pack is the acoustic path (e.g. firered-llm's encoder +
+    /// adapter pack): every block-quant tensor carries the floor.
+    EntirePack,
+    /// No audio encoder in the ASR-floor sense (translation / punctuation /
+    /// segmentation packs): the floor is vacuous.
+    NoAudioEncoder,
+}
+
+// The architecture ids are the stable wire values written into each pack's
+// `openasr.model.architecture` / `general.architecture` metadata (see
+// crate::arch and each family's package_import). "hunyuan-dense" is literal
+// because hymt2 keeps its constant module-private; it is the GGUF
+// general.architecture Tencent's upstream GGUF uses and this repo repacks.
+use AudioEncoderTensors as Rule;
+
+/// The encoder rule for a pack architecture, or `None` when the architecture
+/// is unknown to this table. `None` is NOT "no encoder" -- it is "cannot
+/// verify", and the audit fails closed when such a pack contains any
+/// block-quant tensor at all.
+pub fn audio_encoder_tensors_for_architecture(architecture: &str) -> Option<AudioEncoderTensors> {
+    let rule = match architecture {
+        crate::arch::WHISPER_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["model.encoder."]),
+        crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["audio."]),
+        crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID => {
+            Rule::NamePrefixes(&["audio."])
+        }
+        crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["encoder."]),
+        crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["enc.", "tp."]),
+        crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["enc."]),
+        crate::arch::MOONSHINE_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["enc."]),
+        crate::arch::PARAKEET_CTC_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["enc."]),
+        crate::arch::PARAKEET_TDT_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["enc."]),
+        crate::arch::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["enc."]),
+        crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["encoder."]),
+        crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["enc."]),
+        // The firered-llm pack carries ONLY the acoustic encoder + its
+        // encoder->LLM adapter (the Qwen2 LLM is the same builder's output
+        // too, imported as encoder-classified tensors end to end): every
+        // block-quant tensor in the pack carries the floor.
+        crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID => Rule::EntirePack,
+        crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID => {
+            Rule::NamePrefixes(&["moss.enc.", "moss.adaptor."])
+        }
+        // Translation / punctuation / segmentation packs have no acoustic
+        // encoder in the ASR-floor sense.
+        "hunyuan-dense" => Rule::NoAudioEncoder,
+        crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID => Rule::NoAudioEncoder,
+        crate::models::firered_punc::config::FIRERED_PUNC_ARCHITECTURE_VALUE => {
+            Rule::NoAudioEncoder
+        }
+        _ => return None,
+    };
+    Some(rule)
+}
+
+// --- audit ------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantFloorViolationKind {
+    /// An audio-encoder tensor is block-quantized below Q8_0: the behavioral
+    /// cliff the shared floor exists to prevent.
+    EncoderBelowQ8Floor,
+    /// A tensor's block quant exceeds the rung the pack's declared tier can
+    /// produce (the pack is mislabeled, or was built outside its tier).
+    ExceedsDeclaredTier,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuantFloorViolation {
+    pub tensor: String,
+    pub dims: Vec<u64>,
+    pub ggml_type: u32,
+    pub kind: QuantFloorViolationKind,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QuantFloorReport {
+    /// The pack's `openasr.model.architecture` (falling back to
+    /// `general.architecture`), when present.
+    pub architecture: Option<String>,
+    /// Build provenance (`openasr.build.commit`): the open-core commit whose
+    /// quantization policy wrote the pack, when the builder recorded it.
+    pub build_commit: Option<String>,
+    pub tensor_count: u64,
+    /// Block-quantized tensors in the pack.
+    pub block_quant_tensors: usize,
+    /// Block-quantized tensors classified as audio encoder.
+    pub encoder_block_quant_tensors: usize,
+    pub violations: Vec<QuantFloorViolation>,
+}
+
+impl QuantFloorReport {
+    pub fn passed(&self) -> bool {
+        self.violations.is_empty()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum QuantFloorAuditError {
+    #[error(transparent)]
+    Header(#[from] GgufHeaderError),
+    #[error("could not read pack '{path}': {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not fetch pack header from '{url}': {reason}")]
+    RemoteFetch { url: String, reason: String },
+    #[error(
+        "cannot verify the audio-encoder quant floor: architecture '{architecture}' has no encoder tensor rule but the pack contains {block_quant_tensors} block-quantized tensor(s); add a rule to pack_quant_audit before shipping"
+    )]
+    UnrecognizedArchitecture {
+        architecture: String,
+        block_quant_tensors: usize,
+    },
+}
+
+fn pack_architecture(view: &GgufHeaderView) -> Option<String> {
+    view.metadata_string(crate::models::oasr_metadata::OASR_METADATA_KEY_MODEL_ARCHITECTURE)
+        .or_else(|| view.metadata_string("general.architecture"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn is_encoder_tensor(rule: AudioEncoderTensors, name: &str) -> bool {
+    match rule {
+        Rule::EntirePack => true,
+        Rule::NoAudioEncoder => false,
+        Rule::NamePrefixes(prefixes) => prefixes.iter().any(|prefix| name.starts_with(prefix)),
+    }
+}
+
+/// Replay the current quantization policy against a parsed pack header.
+///
+/// Two independent invariants, both fail-closed:
+/// 1. FLOOR -- no audio-encoder tensor may be a sub-Q8 block quant, for ANY
+///    tier (the floor applies at every rung; see `classify_quant_tensor`).
+/// 2. CEILING -- when `declared` names the tier the pack claims, no tensor
+///    may carry a block quant that tier cannot produce.
+///
+/// A pack whose architecture has no encoder rule passes only if it contains
+/// no block-quant tensors at all; otherwise verification is impossible and
+/// the audit errors out rather than silently waving it through.
+pub fn audit_quant_floor(
+    view: &GgufHeaderView,
+    declared: Option<PackQuant>,
+) -> Result<QuantFloorReport, QuantFloorAuditError> {
+    let architecture = pack_architecture(view);
+    let rule = architecture
+        .as_deref()
+        .and_then(audio_encoder_tensors_for_architecture);
+
+    let mut report = QuantFloorReport {
+        build_commit: view
+            .metadata_string(crate::models::oasr_metadata::OASR_METADATA_KEY_BUILD_COMMIT)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        architecture,
+        tensor_count: view.tensor_count,
+        ..QuantFloorReport::default()
+    };
+
+    for tensor in &view.tensors {
+        if !is_block_quant_type(tensor.ggml_type) {
+            continue;
+        }
+        report.block_quant_tensors += 1;
+
+        let encoder = match rule {
+            Some(rule) => is_encoder_tensor(rule, &tensor.name),
+            None => false,
+        };
+        if encoder {
+            report.encoder_block_quant_tensors += 1;
+        }
+
+        if encoder && !meets_encoder_q8_floor(tensor.ggml_type) {
+            report.violations.push(QuantFloorViolation {
+                tensor: tensor.name.clone(),
+                dims: tensor.dims.clone(),
+                ggml_type: tensor.ggml_type,
+                kind: QuantFloorViolationKind::EncoderBelowQ8Floor,
+            });
+        }
+        if let Some(declared) = declared
+            && !declared_tier_allows(declared, tensor.ggml_type)
+        {
+            report.violations.push(QuantFloorViolation {
+                tensor: tensor.name.clone(),
+                dims: tensor.dims.clone(),
+                ggml_type: tensor.ggml_type,
+                kind: QuantFloorViolationKind::ExceedsDeclaredTier,
+            });
+        }
+    }
+
+    if rule.is_none() && report.block_quant_tensors > 0 {
+        return Err(QuantFloorAuditError::UnrecognizedArchitecture {
+            architecture: report
+                .architecture
+                .clone()
+                .unwrap_or_else(|| "<missing>".to_string()),
+            block_quant_tensors: report.block_quant_tensors,
+        });
+    }
+
+    Ok(report)
+}
+
+/// Parse a complete GGUF header out of a growable byte source: parse the
+/// window, and while it reports Truncated, ask the source for more bytes.
+/// `read_prefix(len)` must return the file/URL's first `len` bytes (or all
+/// remaining bytes when the object is shorter).
+fn parse_header_with_growing_window(
+    mut read_prefix: impl FnMut(usize) -> Result<Vec<u8>, QuantFloorAuditError>,
+    initial_window: usize,
+    max_window: usize,
+) -> Result<GgufHeaderView, QuantFloorAuditError> {
+    let mut window = initial_window.max(64 * 1024);
+    loop {
+        let bytes = read_prefix(window)?;
+        match parse_gguf_header(&bytes) {
+            Ok(view) => return Ok(view),
+            Err(GgufHeaderError::Truncated { .. }) if window < max_window => {
+                // The header is larger than the window; quadruple it, capped.
+                window = (window.saturating_mul(4)).min(max_window);
+                if bytes.len() < window && bytes.len() < max_window {
+                    // The source is shorter than the requested window yet the
+                    // header did not complete: the object itself is malformed
+                    // or shorter than its own header claims. Surface the
+                    // truncation verbatim on the next (final) parse.
+                    window = max_window;
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+const LOCAL_INITIAL_WINDOW: usize = 8 * 1024 * 1024;
+const LOCAL_MAX_WINDOW: usize = 128 * 1024 * 1024;
+
+/// Audit a pack on local disk, reading only its header prefix (never the
+/// tensor data), growing the read window if an unusually large header needs
+/// it.
+pub fn audit_local_pack_quant_floor(
+    path: impl AsRef<Path>,
+    declared: Option<PackQuant>,
+) -> Result<QuantFloorReport, QuantFloorAuditError> {
+    let path = path.as_ref().to_path_buf();
+    let view = parse_header_with_growing_window(
+        |len| {
+            let mut file =
+                std::fs::File::open(&path).map_err(|source| QuantFloorAuditError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+            let mut buffer = vec![0u8; len];
+            let mut filled = 0usize;
+            while filled < buffer.len() {
+                match file.read(&mut buffer[filled..]) {
+                    Ok(0) => break,
+                    Ok(count) => filled += count,
+                    Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(source) => {
+                        return Err(QuantFloorAuditError::Io {
+                            path: path.clone(),
+                            source,
+                        });
+                    }
+                }
+            }
+            buffer.truncate(filled);
+            Ok(buffer)
+        },
+        LOCAL_INITIAL_WINDOW,
+        LOCAL_MAX_WINDOW,
+    )?;
+    audit_quant_floor(&view, declared)
+}
+
+/// Fetch the leading `len` bytes of a remote pack with an HTTP `Range`
+/// request (read-only; the server sees one ranged GET, no download).
+fn fetch_remote_prefix(url: &str, len: usize) -> Result<Vec<u8>, QuantFloorAuditError> {
+    use std::time::Duration;
+
+    let client = crate::http::blocking_client(Duration::from_secs(30), Duration::from_secs(600))
+        .map_err(|error| QuantFloorAuditError::RemoteFetch {
+            url: url.to_string(),
+            reason: crate::http::error_message(&error),
+        })?;
+    let response = client
+        .get(url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", len - 1))
+        .send()
+        .map_err(|error| QuantFloorAuditError::RemoteFetch {
+            url: url.to_string(),
+            reason: crate::http::error_message(&error),
+        })?;
+    let status = response.status();
+    if status != reqwest::StatusCode::PARTIAL_CONTENT && status != reqwest::StatusCode::OK {
+        return Err(QuantFloorAuditError::RemoteFetch {
+            url: url.to_string(),
+            reason: format!("unexpected HTTP status {status}"),
+        });
+    }
+    let bytes = response
+        .bytes()
+        .map_err(|error| QuantFloorAuditError::RemoteFetch {
+            url: url.to_string(),
+            reason: crate::http::error_message(&error),
+        })?;
+    Ok(bytes.to_vec())
+}
+
+const REMOTE_INITIAL_WINDOW: usize = 8 * 1024 * 1024;
+const REMOTE_MAX_WINDOW: usize = 64 * 1024 * 1024;
+
+/// Audit a published pack over HTTP(S), fetching only the header prefix via
+/// `Range` requests -- no source weights, no full download. Designed as the
+/// whole-catalog periodic health check: point it at each catalog entry's
+/// resolve URL.
+pub fn audit_remote_pack_quant_floor(
+    url: &str,
+    declared: Option<PackQuant>,
+) -> Result<QuantFloorReport, QuantFloorAuditError> {
+    let view = parse_header_with_growing_window(
+        |len| fetch_remote_prefix(url, len),
+        REMOTE_INITIAL_WINDOW,
+        REMOTE_MAX_WINDOW,
+    )?;
+    audit_quant_floor(&view, declared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AudioEncoderTensors, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
+        GGML_TYPE_Q8_0, QuantFloorAuditError, QuantFloorViolationKind,
+        audio_encoder_tensors_for_architecture, audit_quant_floor, ggml_type_name,
+        is_block_quant_type, meets_encoder_q8_floor,
+    };
+    use crate::ggml_runtime::gguf_header::{GgufHeaderTensor, GgufHeaderView};
+    use crate::models::pack_quant::PackQuant;
+    use std::collections::BTreeMap;
+
+    fn view_with(architecture: Option<&str>, tensors: Vec<GgufHeaderTensor>) -> GgufHeaderView {
+        let mut string_metadata = BTreeMap::new();
+        if let Some(architecture) = architecture {
+            string_metadata.insert(
+                "openasr.model.architecture".to_string(),
+                architecture.to_string(),
+            );
+        }
+        let tensor_count = tensors.len() as u64;
+        GgufHeaderView {
+            version: 3,
+            tensor_count,
+            string_metadata,
+            tensors,
+            header_len: 0,
+        }
+    }
+
+    fn tensor(name: &str, ggml_type: u32) -> GgufHeaderTensor {
+        GgufHeaderTensor {
+            name: name.to_string(),
+            dims: vec![256, 256],
+            ggml_type,
+            data_offset: 0,
+        }
+    }
+
+    const QWEN_ARCH: &str = crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID;
+
+    #[test]
+    fn type_classification_covers_the_ggml_abi() {
+        assert!(!is_block_quant_type(GGML_TYPE_F32));
+        assert!(!is_block_quant_type(GGML_TYPE_F16));
+        assert!(is_block_quant_type(GGML_TYPE_Q8_0));
+        assert!(is_block_quant_type(GGML_TYPE_Q4_K));
+        // Unknown ids fail closed as block quants.
+        assert!(is_block_quant_type(999));
+        assert!(meets_encoder_q8_floor(GGML_TYPE_Q8_0));
+        assert!(!meets_encoder_q8_floor(GGML_TYPE_Q6_K));
+        assert!(!meets_encoder_q8_floor(GGML_TYPE_F16));
+        assert_eq!(ggml_type_name(GGML_TYPE_Q4_K), "q4_k");
+        assert_eq!(ggml_type_name(999), "ggml-type-999");
+    }
+
+    #[test]
+    fn every_shipped_architecture_has_an_encoder_rule() {
+        // The full set of architectures the importers write today; a new
+        // builtin family must add its rule here before its packs can ship.
+        for arch in [
+            crate::arch::WHISPER_GGML_ARCHITECTURE_ID,
+            crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
+            crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID,
+            crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID,
+            crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+            crate::arch::MOONSHINE_GGML_ARCHITECTURE_ID,
+            crate::arch::PARAKEET_CTC_GGML_ARCHITECTURE_ID,
+            crate::arch::PARAKEET_TDT_GGML_ARCHITECTURE_ID,
+            crate::arch::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
+            crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
+            crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+            crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
+            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
+            crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID,
+            "hunyuan-dense",
+            crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID,
+            crate::models::firered_punc::config::FIRERED_PUNC_ARCHITECTURE_VALUE,
+        ] {
+            // mimo-asr is converted by an external tool with a fixed F32/F16
+            // audio tower (no block quants); it intentionally has no rule yet
+            // and the audit fails closed the day it gains block quants.
+            if arch == crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID {
+                assert_eq!(audio_encoder_tensors_for_architecture(arch), None);
+                continue;
+            }
+            assert_ne!(
+                audio_encoder_tensors_for_architecture(arch),
+                None,
+                "architecture '{arch}' has no encoder rule"
+            );
+        }
+        assert_eq!(
+            audio_encoder_tensors_for_architecture(QWEN_ARCH),
+            Some(AudioEncoderTensors::NamePrefixes(&["audio."]))
+        );
+        assert_eq!(audio_encoder_tensors_for_architecture("not-a-family"), None);
+    }
+
+    #[test]
+    fn sub_q8_encoder_tensor_fails_the_floor() {
+        let view = view_with(
+            Some(QWEN_ARCH),
+            vec![
+                tensor("audio.blk.0.attn_q.weight", GGML_TYPE_Q4_K),
+                tensor("blk.0.ffn_gate.weight", GGML_TYPE_Q4_K),
+                tensor("token_embd.weight", GGML_TYPE_Q8_0),
+            ],
+        );
+        let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
+        assert_eq!(report.block_quant_tensors, 3);
+        assert_eq!(report.encoder_block_quant_tensors, 1);
+        assert_eq!(report.violations.len(), 1);
+        assert_eq!(report.violations[0].tensor, "audio.blk.0.attn_q.weight");
+        assert_eq!(
+            report.violations[0].kind,
+            QuantFloorViolationKind::EncoderBelowQ8Floor
+        );
+    }
+
+    #[test]
+    fn q8_floored_pack_passes_under_q4_k() {
+        // The post-floor shape: encoder at Q8_0, decoder at the requested rung.
+        let view = view_with(
+            Some(QWEN_ARCH),
+            vec![
+                tensor("audio.blk.0.attn_q.weight", GGML_TYPE_Q8_0),
+                tensor("audio.proj.weight", GGML_TYPE_Q8_0),
+                tensor("blk.0.ffn_gate.weight", GGML_TYPE_Q4_K),
+                tensor("output.weight", GGML_TYPE_F16),
+            ],
+        );
+        let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
+        assert!(report.passed(), "violations: {:?}", report.violations);
+        assert_eq!(report.encoder_block_quant_tensors, 2);
+    }
+
+    #[test]
+    fn declared_tier_ceiling_catches_mislabeled_packs() {
+        // Claims q8_0 but carries a Q4_K decoder tensor: impossible under the
+        // q8_0 tier (a ceiling violation, distinct from the encoder floor).
+        let view = view_with(
+            Some(QWEN_ARCH),
+            vec![
+                tensor("audio.blk.0.attn_q.weight", GGML_TYPE_Q8_0),
+                tensor("blk.0.ffn_gate.weight", GGML_TYPE_Q4_K),
+            ],
+        );
+        let report = audit_quant_floor(&view, Some(PackQuant::Q8_0)).expect("auditable");
+        assert_eq!(report.violations.len(), 1);
+        assert_eq!(report.violations[0].tensor, "blk.0.ffn_gate.weight");
+        assert_eq!(
+            report.violations[0].kind,
+            QuantFloorViolationKind::ExceedsDeclaredTier
+        );
+    }
+
+    #[test]
+    fn unknown_architecture_with_block_quants_fails_closed() {
+        let view = view_with(
+            Some("brand-new-family"),
+            vec![tensor("blk.0.ffn_gate.weight", GGML_TYPE_Q4_K)],
+        );
+        let error = audit_quant_floor(&view, Some(PackQuant::Q4_K))
+            .expect_err("must fail closed without an encoder rule");
+        assert!(matches!(
+            error,
+            QuantFloorAuditError::UnrecognizedArchitecture { .. }
+        ));
+    }
+
+    #[test]
+    fn unknown_architecture_without_block_quants_passes_vacuously() {
+        let view = view_with(
+            Some("brand-new-family"),
+            vec![tensor("some.weight", GGML_TYPE_F16)],
+        );
+        let report = audit_quant_floor(&view, None).expect("auditable");
+        assert!(report.passed());
+        assert_eq!(report.block_quant_tensors, 0);
+    }
+
+    #[test]
+    fn translation_pack_decoder_quants_are_not_encoder_floor_violations() {
+        let view = view_with(
+            Some("hunyuan-dense"),
+            vec![tensor("blk.0.ffn_gate.weight", GGML_TYPE_Q4_K)],
+        );
+        let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
+        assert!(report.passed());
+        assert_eq!(report.encoder_block_quant_tensors, 0);
+    }
+
+    #[test]
+    fn entire_pack_rule_floors_every_tensor() {
+        let view = view_with(
+            Some(crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID),
+            vec![
+                tensor("enc.blk.0.attn.weight", GGML_TYPE_Q8_0),
+                tensor("adapter.mlp.weight", GGML_TYPE_Q6_K),
+            ],
+        );
+        let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
+        // The adapter tensor is still acoustic path: a sub-Q8 rung anywhere in
+        // this pack violates BOTH the encoder floor and the declared q4_k
+        // ceiling (Q6_K is outside its rung set), so it counts twice.
+        assert_eq!(report.violations.len(), 2);
+        assert!(
+            report
+                .violations
+                .iter()
+                .all(|violation| violation.tensor == "adapter.mlp.weight")
+        );
+        let kinds: Vec<_> = report.violations.iter().map(|v| v.kind).collect();
+        assert!(kinds.contains(&QuantFloorViolationKind::EncoderBelowQ8Floor));
+        assert!(kinds.contains(&QuantFloorViolationKind::ExceedsDeclaredTier));
+    }
+
+    #[test]
+    fn whisper_encoder_prefix_is_model_encoder() {
+        let view = view_with(
+            Some(crate::arch::WHISPER_GGML_ARCHITECTURE_ID),
+            vec![
+                tensor(
+                    "model.encoder.layers.0.self_attn.q_proj.weight",
+                    GGML_TYPE_Q4_K,
+                ),
+                tensor(
+                    "model.decoder.layers.0.self_attn.q_proj.weight",
+                    GGML_TYPE_Q4_K,
+                ),
+            ],
+        );
+        let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.violations[0].tensor.starts_with("model.encoder."));
+    }
+}

@@ -39,6 +39,7 @@ pub(crate) mod moss_transcribe_diarize;
 pub mod oasr_metadata;
 pub(crate) mod pack_import_surface;
 pub mod pack_quant;
+pub mod pack_quant_audit;
 pub(crate) mod parakeet_ctc;
 pub mod parakeet_tdt;
 pub(crate) mod phrase_bias_decode;

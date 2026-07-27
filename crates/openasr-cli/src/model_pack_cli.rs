@@ -5,6 +5,7 @@ pub(super) fn model_pack_command(command: ModelPackCommand) -> Result<()> {
     match command {
         ModelPackCommand::Import { command } => import_command(*command),
         ModelPackCommand::Verify => verify_model_store_command(),
+        ModelPackCommand::AuditQuant { target, quant } => audit_pack_quant_command(&target, quant),
         ModelPackCommand::Usage => model_store_usage_command(),
         ModelPackCommand::Gc { dry_run } => model_store_gc_command(dry_run),
     }
@@ -903,8 +904,109 @@ pub(super) fn validate_model_pack_path_command(path: &Path) -> Result<()> {
         "Validated local ggml model package {}.",
         package_path.display()
     );
+    // Quantization-strategy self-check: replay the current policy (the
+    // audio-encoder Q8_0 floor, plus the declared-tier ceiling when the
+    // filename names a tier) against the pack's own tensor index. Header-only,
+    // no inference -- a pack that fails its own audit never passes `verify`.
+    let declared = pack_tier_from_pack_filename(&package_path);
+    let audit = openasr_core::models::pack_quant_audit::audit_local_pack_quant_floor(
+        &package_path,
+        declared,
+    )
+    .map_err(anyhow::Error::new)?;
+    print_quant_floor_report(&audit);
+    fail_closed_on_quant_floor_violations(&audit, &package_path.display().to_string())?;
     println!("No downloads or inference were performed.");
     Ok(())
+}
+
+pub(super) fn audit_pack_quant_command(target: &str, quant: Option<AuditQuantTier>) -> Result<()> {
+    let declared = quant.map(AuditQuantTier::to_pack_quant);
+    let audit = if target.starts_with("http://") || target.starts_with("https://") {
+        println!(
+            "Fetching the pack's GGUF header via HTTP Range (read-only prefix, no full download)..."
+        );
+        openasr_core::models::pack_quant_audit::audit_remote_pack_quant_floor(target, declared)
+            .map_err(anyhow::Error::new)?
+    } else {
+        let package_path = validate_local_ggml_package_cli_path(Path::new(target))?;
+        openasr_core::models::pack_quant_audit::audit_local_pack_quant_floor(
+            &package_path,
+            declared,
+        )
+        .map_err(anyhow::Error::new)?
+    };
+    print_quant_floor_report(&audit);
+    fail_closed_on_quant_floor_violations(&audit, target)?;
+    println!("No downloads beyond the header prefix or inference were performed.");
+    Ok(())
+}
+
+fn fail_closed_on_quant_floor_violations(
+    audit: &openasr_core::models::pack_quant_audit::QuantFloorReport,
+    target: &str,
+) -> Result<()> {
+    if audit.passed() {
+        return Ok(());
+    }
+    bail!(
+        "Quantization-strategy audit FAILED for '{target}': {} violation(s) -- \
+         an audio-encoder tensor below the Q8_0 floor (long-audio decode collapses) \
+         or a tensor outside the pack's declared tier. Rebuild the pack with the \
+         current importer policy.",
+        audit.violations.len()
+    )
+}
+
+fn print_quant_floor_report(audit: &openasr_core::models::pack_quant_audit::QuantFloorReport) {
+    use openasr_core::models::pack_quant_audit::ggml_type_name;
+    println!(
+        "Quantization-strategy audit: architecture={} build_commit={} tensors={} block_quant_tensors={} encoder_block_quant_tensors={}",
+        audit
+            .architecture
+            .clone()
+            .unwrap_or_else(|| "<missing>".to_string()),
+        audit
+            .build_commit
+            .clone()
+            .unwrap_or_else(|| "<not recorded>".to_string()),
+        audit.tensor_count,
+        audit.block_quant_tensors,
+        audit.encoder_block_quant_tensors,
+    );
+    for violation in &audit.violations {
+        let kind = match violation.kind {
+            openasr_core::models::pack_quant_audit::QuantFloorViolationKind::EncoderBelowQ8Floor => {
+                "audio encoder below the Q8_0 floor"
+            }
+            openasr_core::models::pack_quant_audit::QuantFloorViolationKind::ExceedsDeclaredTier => {
+                "exceeds the declared tier"
+            }
+        };
+        println!(
+            "- VIOLATION: tensor '{}' {:?} type {} ({kind})",
+            violation.tensor,
+            violation.dims,
+            ggml_type_name(violation.ggml_type),
+        );
+    }
+}
+
+/// The quant tier a pack's own filename claims (`<model>-<tier>.oasr`), for
+/// the audit's declared-tier ceiling. `None` when the name carries no known
+/// tier suffix -- the encoder floor still applies unconditionally.
+fn pack_tier_from_pack_filename(
+    path: &Path,
+) -> Option<openasr_core::models::pack_quant::PackQuant> {
+    use openasr_core::models::pack_quant::PackQuant;
+    let stem = path.file_stem()?.to_str()?;
+    match stem.rsplit_once('-')?.1 {
+        "fp16" => Some(PackQuant::Fp16),
+        "q8_0" => Some(PackQuant::Q8_0),
+        "q3_k" => Some(PackQuant::Q3_K),
+        "q4_k" => Some(PackQuant::Q4_K),
+        _ => None,
+    }
 }
 
 pub(super) fn inspect_model_pack_path_command(path: &Path) -> Result<()> {
@@ -984,6 +1086,7 @@ fn render_openasr_runtime_metadata_values(
         openasr_core::models::oasr_metadata::OASR_METADATA_KEY_AUDIO_FRONTEND,
         openasr_core::models::oasr_metadata::OASR_METADATA_KEY_DECODE_POLICY,
         openasr_core::models::oasr_metadata::OASR_METADATA_KEY_FEATURE_DIARIZATION,
+        openasr_core::models::oasr_metadata::OASR_METADATA_KEY_BUILD_COMMIT,
     ];
     keys.iter()
         .map(|key| {

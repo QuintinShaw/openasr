@@ -658,6 +658,20 @@ pub(crate) enum ModelPackCommand {
     },
     /// Re-hash every installed pack and report any that is missing or corrupt.
     Verify,
+    /// Audit a pack's tensor quantization against the current policy: the
+    /// audio-encoder Q8_0 floor (unconditional) plus, when `--quant` names the
+    /// tier the pack claims, the declared-tier ceiling. Reads only the GGUF
+    /// header, so it also works on published, remotely-hosted packs via an
+    /// HTTP `Range` prefix fetch -- no source weights, no download, no
+    /// inference.
+    #[command(name = "audit-quant")]
+    AuditQuant {
+        /// Local `.oasr` pack path, or an http(s) URL of a published pack file.
+        target: String,
+        /// The quant tier the pack claims (enables the ceiling check).
+        #[arg(long, value_enum)]
+        quant: Option<AuditQuantTier>,
+    },
     /// Show where model-pack storage space has gone and how much is reclaimable.
     Usage,
     /// Reclaim abandoned model-pack storage (unreferenced content and dead
@@ -667,6 +681,29 @@ pub(crate) enum ModelPackCommand {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// The quant tier a pack claims, for `model-pack audit-quant --quant`.
+/// Mirrors `openasr_core::models::pack_quant::PackQuant`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[allow(non_camel_case_types)]
+pub(crate) enum AuditQuantTier {
+    Fp16,
+    Q8_0,
+    Q3_K,
+    Q4_K,
+}
+
+impl AuditQuantTier {
+    pub(crate) fn to_pack_quant(self) -> openasr_core::models::pack_quant::PackQuant {
+        use openasr_core::models::pack_quant::PackQuant;
+        match self {
+            Self::Fp16 => PackQuant::Fp16,
+            Self::Q8_0 => PackQuant::Q8_0,
+            Self::Q3_K => PackQuant::Q3_K,
+            Self::Q4_K => PackQuant::Q4_K,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]

@@ -2295,3 +2295,143 @@ fn verify_backends_manifest_rejects_a_signature_bound_to_a_different_url() {
             "did not verify against the production trust root",
         ));
 }
+
+// --- model-pack audit-quant (quantization-strategy self-check) -------------
+
+fn gguf_put_string(bytes: &mut Vec<u8>, value: &str) {
+    bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(value.as_bytes());
+}
+
+/// Hand-assembled GGUF v3 pack: one `general.architecture` KV plus the given
+/// rank-1 tensors (name, raw ggml type id, data bytes). The audit surface is
+/// header-only, so the data section only needs to exist and be aligned.
+fn write_audit_quant_pack(
+    path: &std::path::Path,
+    architecture: &str,
+    tensors: &[(&str, u32, Vec<u8>)],
+) {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    bytes.extend_from_slice(&3_u32.to_le_bytes());
+    bytes.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&1_u64.to_le_bytes()); // kv_count
+
+    gguf_put_string(&mut bytes, "general.architecture");
+    bytes.extend_from_slice(&8_u32.to_le_bytes()); // string value type
+    gguf_put_string(&mut bytes, architecture);
+
+    let mut data_offset = 0_u64;
+    for (name, ggml_type, data) in tensors {
+        gguf_put_string(&mut bytes, name);
+        bytes.extend_from_slice(&1_u32.to_le_bytes()); // rank
+        bytes.extend_from_slice(&(data.len() as u64).to_le_bytes()); // dim[0]
+        bytes.extend_from_slice(ggml_type);
+        bytes.extend_from_slice(&data_offset.to_le_bytes());
+        data_offset += data.len() as u64;
+    }
+    while bytes.len() % 32 != 0 {
+        bytes.push(0);
+    }
+    for (_, _, data) in tensors {
+        bytes.extend_from_slice(data);
+    }
+    std::fs::write(path, bytes).expect("write audit pack fixture");
+}
+
+#[test]
+fn audit_quant_accepts_a_clean_pack() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pack = temp.path().join("probe-clean.oasr");
+    // qwen3-asr encoder tensor at f32: no block quant anywhere, floor holds
+    // vacuously, and the fp16 ceiling allows float storage.
+    write_audit_quant_pack(
+        &pack,
+        "qwen3-asr-encoder-decoder",
+        &[("audio.blk.0.attn_q.weight", 0, vec![0u8; 128])],
+    );
+
+    openasr()
+        .args([
+            "model-pack",
+            "audit-quant",
+            &pack.display().to_string(),
+            "--quant",
+            "fp16",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Quantization-strategy audit"))
+        .stdout(predicate::str::contains(
+            "architecture=qwen3-asr-encoder-decoder",
+        ));
+}
+
+#[test]
+fn audit_quant_fails_closed_on_sub_q8_encoder() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pack = temp.path().join("probe-bad-encoder.oasr");
+    // A Q4_0 (ggml type 2) audio-encoder tensor: below the Q8_0 floor.
+    write_audit_quant_pack(
+        &pack,
+        "qwen3-asr-encoder-decoder",
+        &[(
+            "audio.blk.0.attn_q.weight",
+            2,
+            vec![0u8; 18], // one q4_0 block: 2-byte scale + 16 nibble bytes
+        )],
+    );
+
+    openasr()
+        .args(["model-pack", "audit-quant", &pack.display().to_string()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("audit FAILED"))
+        .stderr(predicate::str::contains(
+            "audio encoder below the Q8_0 floor",
+        ));
+}
+
+#[test]
+fn audit_quant_fails_closed_on_declared_tier_ceiling() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pack = temp.path().join("probe-bad-tier.oasr");
+    // Decoder-side Q4_0 under a claimed q8_0 tier: the encoder floor does not
+    // fire (blk.* is decoder), but the ceiling must.
+    write_audit_quant_pack(
+        &pack,
+        "qwen3-asr-encoder-decoder",
+        &[("blk.0.ffn_gate.weight", 2, vec![0u8; 18])],
+    );
+
+    openasr()
+        .args([
+            "model-pack",
+            "audit-quant",
+            &pack.display().to_string(),
+            "--quant",
+            "q8-0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("audit FAILED"))
+        .stderr(predicate::str::contains("exceeds the declared tier"));
+}
+
+#[test]
+fn verify_runs_the_quant_audit_and_fails_closed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pack = temp.path().join("probe-verify-q4_k.oasr");
+    // Filename claims q4_k; encoder tensor is Q4_0 -- `verify` must not pass.
+    write_audit_quant_pack(
+        &pack,
+        "qwen3-asr-encoder-decoder",
+        &[("audio.blk.0.attn_q.weight", 2, vec![0u8; 18])],
+    );
+
+    openasr()
+        .args(["verify", &pack.display().to_string()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("audit FAILED"));
+}
