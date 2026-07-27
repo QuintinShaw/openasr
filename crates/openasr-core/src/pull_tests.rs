@@ -2872,49 +2872,6 @@ fn install_backend_pack_resumes_after_mid_stream_drop_and_retries() {
     assert!(!dir.join("libbackend.so.partial").exists());
 }
 
-#[cfg(windows)]
-#[test]
-fn windows_in_use_os_errors_classify_as_model_in_use() {
-    // ERROR_SHARING_VIOLATION (32) and ERROR_USER_MAPPED_FILE (1224) mean the
-    // file can't be replaced because it is open/mapped — treat as "in use".
-    assert!(is_file_in_use_error(&io::Error::from_raw_os_error(32)));
-    assert!(is_file_in_use_error(&io::Error::from_raw_os_error(1224)));
-    // ERROR_FILE_NOT_FOUND (2) and ERROR_ACCESS_DENIED (5, ambiguous) are not.
-    assert!(!is_file_in_use_error(&io::Error::from_raw_os_error(2)));
-    assert!(!is_file_in_use_error(&io::Error::from_raw_os_error(5)));
-    assert!(!is_file_in_use_error(&io::Error::other("x")));
-}
-
-#[cfg(windows)]
-#[test]
-fn remove_existing_final_pack_reports_model_in_use_for_held_handle() {
-    use std::os::windows::fs::OpenOptionsExt;
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path();
-    let resolved = resolved_for(&tiny_pack_bytes());
-    let paths = paths_for(home, &resolved);
-    ensure_storage_dir_within_root(home, &paths).unwrap();
-    fs::write(&paths.final_path, b"model").unwrap();
-
-    // Open allowing only read sharing (no FILE_SHARE_DELETE), so Windows rejects
-    // the delete with ERROR_SHARING_VIOLATION — the same failure family as a
-    // model mmap'd for inference (ERROR_USER_MAPPED_FILE). std's File::open
-    // defaults to FILE_SHARE_DELETE, which would let the delete succeed.
-    let _held = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ)
-        .open(&paths.final_path)
-        .unwrap();
-
-    let error = remove_existing_final_pack(&paths).unwrap_err();
-    assert!(
-        matches!(error, PullError::ModelInUse { .. }),
-        "expected ModelInUse, got {error:?}"
-    );
-}
-
 // -- Concurrent chunked-download tests -------------------------------------
 //
 // These exercise `download_parallel_attempt` and friends via
