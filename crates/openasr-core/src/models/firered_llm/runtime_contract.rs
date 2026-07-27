@@ -315,6 +315,30 @@ mod tests {
         assert_eq!(parsed.head_dim, 64);
     }
 
+    /// Capacity regression anchor: the shared KV byte derivation on this
+    /// family's real-checkpoint Qwen2 decoder geometry (28 layers, 4 KV
+    /// heads, head_dim 128 -- the fixture values above), split by storage
+    /// copy. Runs the derivation golden for every `Derived` family, not just
+    /// the one that consumes an integral window today.
+    #[test]
+    fn kv_bytes_per_position_matches_the_reference_decoder_geometry() {
+        use crate::capacity::{KvGeometry, kv_bytes_per_position};
+        use crate::nn::decoder::LlmKvCacheSpec;
+
+        let geometry = KvGeometry {
+            n_layers: 28,
+            kv_heads: 4,
+            head_dim: 128,
+        };
+        // 28 layers * 2 (K+V) * 4 kv-heads = 224 rows per position.
+        let default = kv_bytes_per_position(&geometry, LlmKvCacheSpec::DEFAULT).expect("default");
+        assert_eq!(default.host, 224 * 512); // f32 rows
+        assert_eq!(default.resident, 224 * 256); // f16 rows
+        let q8_0 = kv_bytes_per_position(&geometry, LlmKvCacheSpec::Q8_0).expect("q8_0");
+        assert_eq!(q8_0.host, 224 * 136); // 128 / 32 * 34 B q8_0 rows
+        assert_eq!(q8_0.resident, 224 * 136);
+    }
+
     #[test]
     fn parses_adapter_metadata_matching_t2_dump() {
         let parsed = parse_firered_llm_adapter_metadata(&full_metadata()).expect("parse");

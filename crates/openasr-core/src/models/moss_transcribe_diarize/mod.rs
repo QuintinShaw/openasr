@@ -29,6 +29,7 @@
 //! public).
 
 mod adaptor_graph;
+pub(crate) mod capacity;
 mod decode_prompt;
 mod encoder_graph;
 pub(crate) mod executor;

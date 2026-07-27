@@ -36,9 +36,13 @@ use super::tokenizer::MossTdTokenizer;
 /// (`enable_time_marker: true`) -- not per-pack metadata, verified against the
 /// real checkpoint's `processor_config.json` rather than assumed. Not
 /// user-configurable: the LLM decoder was fine-tuned against this exact anchor
-/// cadence.
-const AUDIO_TOKENS_PER_SECOND: f32 = 12.5;
-const TIME_MARKER_EVERY_SECONDS: u32 = 5;
+/// cadence. `pub(crate)` because the capacity derivation shares both facts
+/// (it counts the marker track's digit tokens and drives its marker cadence
+/// from the same numbers -- see `super::capacity`); 12.5 is itself the
+/// capacity frontend registry's derived rate for this family's frontend id,
+/// pinned equal there.
+pub(crate) const AUDIO_TOKENS_PER_SECOND: f32 = 12.5;
+pub(crate) const TIME_MARKER_EVERY_SECONDS: u32 = 5;
 
 /// Upstream's hard-coded ChatML system turn (`processing_moss_transcribe_diarize.py`
 /// has no system-prompt parameter; this is the literal text baked into every

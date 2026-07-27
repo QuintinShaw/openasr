@@ -24,6 +24,7 @@ pub mod backend_manifest;
 pub(crate) mod batch;
 pub(crate) mod benchmark;
 pub(crate) mod capability_pack;
+pub(crate) mod capacity;
 pub mod config;
 pub(crate) mod content_store;
 pub mod default_selection;

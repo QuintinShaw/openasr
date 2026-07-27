@@ -643,6 +643,31 @@ mod tests {
         assert_eq!(parsed.llm_d_model, 2048);
     }
 
+    /// Capacity regression anchor: the shared KV byte derivation on this
+    /// family's real-checkpoint LLM geometry (28 layers, 8 KV heads,
+    /// head_dim 128 -- the fixture values above), split by storage copy.
+    /// Runs the derivation golden for every `Derived` family, not just the
+    /// one that consumes an integral window today.
+    #[test]
+    fn kv_bytes_per_position_matches_the_reference_decoder_geometry() {
+        use crate::capacity::{KvGeometry, kv_bytes_per_position};
+        use crate::nn::decoder::LlmKvCacheSpec;
+
+        let geometry = KvGeometry {
+            n_layers: 28,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        // 28 layers * 2 (K+V) * 8 kv-heads = 448 rows per position.
+        let default = kv_bytes_per_position(&geometry, LlmKvCacheSpec::DEFAULT).expect("default");
+        assert_eq!(default.host, 448 * 512); // 224 KiB -- host f32 copy only
+        assert_eq!(default.resident, 448 * 256); // 112 KiB -- resident f16 copy
+        assert_eq!(default.total(), 448 * 768); // 336 KiB -- the real DEFAULT cost
+        let q8_0 = kv_bytes_per_position(&geometry, LlmKvCacheSpec::Q8_0).expect("q8_0");
+        assert_eq!(q8_0.host, 448 * 136); // 128 / 32 * 34 B q8_0 rows
+        assert_eq!(q8_0.resident, 448 * 136);
+    }
+
     #[test]
     fn qwen3_metadata_accepts_expanded_query_projection_heads() {
         let mut metadata = metadata();

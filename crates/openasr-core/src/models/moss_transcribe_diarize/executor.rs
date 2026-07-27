@@ -65,20 +65,26 @@ use super::speaker_segments::MossTdDecodeExtent;
 use super::tokenizer::MossTdTokenizer;
 
 /// `WhisperFeatureExtractor`'s `chunk_length=30` @ 16kHz (`preprocessor_config.json`,
-/// verified against the real checkpoint).
-const CHUNK_SAMPLES: usize = 480_000;
+/// verified against the real checkpoint). `pub(crate)` because the capacity
+/// derivation shares the chunk quantum (see `super::capacity`).
+pub(crate) const CHUNK_SAMPLES: usize = 480_000;
 const MEL_TARGET_FRAMES: usize = 3000;
-const SAMPLE_RATE_HZ: usize = 16_000;
+/// `pub(crate)` for the same reason: the capacity frontend registry states
+/// the same architectural facts and is pinned equal to these constants.
+pub(crate) const SAMPLE_RATE_HZ: usize = 16_000;
 /// `WhisperFeatureExtractor.hop_length` (160) * the Whisper conv stem's 2x
 /// stride * `audio_merge_size` -- upstream's
 /// `_compute_audio_token_length`'s `stride` (`processing_moss_transcribe_diarize.py`).
-const WHISPER_ENCODER_CONV_STRIDE: usize = 2;
-const HOP_LENGTH: usize = 160;
+pub(crate) const WHISPER_ENCODER_CONV_STRIDE: usize = 2;
+pub(crate) const HOP_LENGTH: usize = 160;
 /// Absolute fail-closed backstop for a non-terminating decode. The checkpoint's
 /// reference configuration uses this ceiling, but each request receives a much
 /// smaller audio-proportional budget below so its persistent Metal KV graph does
-/// not reserve the runaway allowance for ordinary speech.
-const MOSS_TD_MAX_GENERATED_TOKENS: usize = 4096;
+/// not reserve the runaway allowance for ordinary speech. `pub(crate)` because
+/// the capacity derivation takes it as a first-class input (the integral
+/// window's required generation is clamped to this backstop -- see
+/// `super::capacity`).
+pub(crate) const MOSS_TD_MAX_GENERATED_TOKENS: usize = 4096;
 /// Output allowance for timestamped MOSS transcripts, per second of audio.
 ///
 /// Deliberately far above average demand, because under-budgeting does not
@@ -103,8 +109,10 @@ const MOSS_TD_GENERATED_TOKEN_BUDGET_MARGIN: usize = 128;
 /// Audio tokens per second the adaptor emits (`audio_tokens_per_second` in
 /// `processing_moss_transcribe_diarize.py`, same value `decode_prompt`'s marker
 /// cadence uses). Only used to render the `AudioExceedsContext` limit as an
-/// approximate minutes figure; not part of any decode math.
-const AUDIO_TOKENS_PER_SECOND_FOR_LIMIT: f32 = 12.5;
+/// approximate minutes figure; not part of any decode math. `pub(crate)` so
+/// `super::capacity`'s drift guard can pin it equal to the capacity frontend
+/// registry's derived rate (three copies of one fact, one pinned number).
+pub(crate) const AUDIO_TOKENS_PER_SECOND_FOR_LIMIT: f32 = 12.5;
 
 #[derive(Debug, Error)]
 enum MossTdExecutorError {
@@ -288,7 +296,7 @@ fn moss_td_runtime_build_counts_for_test() -> (usize, usize) {
 /// (same artifact-policy constraint every other builtin family's CI golden
 /// coverage works around -- see e.g. firered-aed's weight-free frontend
 /// golden).
-fn moss_td_chunk_token_length(chunk_samples: usize, token_stride: usize) -> usize {
+pub(crate) fn moss_td_chunk_token_length(chunk_samples: usize, token_stride: usize) -> usize {
     (chunk_samples - 1) / token_stride.max(1) + 1
 }
 
@@ -370,16 +378,35 @@ mod moss_td_chunk_frame_math_tests {
     const MAX_SOURCE_POSITIONS: usize = 1500;
     const TOKEN_STRIDE: usize = HOP_LENGTH * WHISPER_ENCODER_CONV_STRIDE * MERGE_SIZE;
 
-    /// Prompt tokens a request of `window_seconds` audio costs. The fixed
-    /// instruction / audio-marker wrapper is measured from a real decode (a
-    /// 600s request reported a 7926-token prompt against 20 encoder chunks x
-    /// 375 audio tokens), rounded up so every check below stays conservative.
-    const PROMPT_OVERHEAD_TOKENS: usize = 512;
-
+    /// Prompt tokens a request of `window_seconds` audio costs, computed by
+    /// the SAME shared capacity arithmetic the family's integral-window
+    /// derivation uses (`super::capacity::moss_td_integral_window_derivation`,
+    /// fed the real checkpoint's geometry): the honest fixed wrapper (86
+    /// tokens, measured token-for-token against the real golden prompt) +
+    /// 375 audio tokens per full 30s encoder chunk + the time-marker digit
+    /// tokens derived from the duration. The flat 512-token overhead that
+    /// used to live here was only conservatively correct by accident; the
+    /// single-sourced model is exact for the fixed term and grows the marker
+    /// term the flat number never modeled.
     fn prompt_tokens_for(window_seconds: f32) -> usize {
+        derivation().prompt_tokens_for_chunks(chunks_for(window_seconds))
+    }
+
+    /// Whole encoder chunks a `window_seconds` request occupies (a partial
+    /// chunk still costs a full one's audio tokens).
+    fn chunks_for(window_seconds: f32) -> usize {
         let samples = (window_seconds * SAMPLE_RATE_HZ as f32) as usize;
-        let chunks = samples.div_ceil(CHUNK_SAMPLES);
-        PROMPT_OVERHEAD_TOKENS + chunks * moss_td_chunk_token_length(CHUNK_SAMPLES, TOKEN_STRIDE)
+        samples.div_ceil(CHUNK_SAMPLES)
+    }
+
+    /// The shared derivation inputs for the real shipped pack geometry --
+    /// the regression anchors in `super::capacity` pin its derived integral
+    /// window equal to the descriptor's declared `integral_seconds`.
+    fn derivation() -> crate::capacity::IntegralWindowDerivation {
+        crate::models::moss_transcribe_diarize::capacity::moss_td_integral_window_derivation(
+            &crate::models::moss_transcribe_diarize::capacity::shipped_pack_decoder_fixture(),
+            MERGE_SIZE,
+        )
     }
 
     fn budget_for(window_seconds: f32) -> usize {
@@ -429,9 +456,15 @@ mod moss_td_chunk_frame_math_tests {
     /// declared value fits would pass for any smaller number too, and a value
     /// set too low silently sends recordings the decoder can serve whole down
     /// the lossy slicing path -- so this also asserts the next window up does
-    /// NOT fit, pinning the number from both sides.
+    /// NOT fit, pinning the number from both sides. The required-position
+    /// arithmetic is the shared capacity derivation's (Phase 0: the declared
+    /// constant and the derived value are pinned to the SAME arithmetic --
+    /// `super::capacity::tests::derived_integral_window_equals_the_declared_constant`
+    /// asserts the derivation lands on exactly this declared value).
     #[test]
     fn the_integral_window_is_the_largest_one_the_context_can_serve() {
+        use crate::models::moss_transcribe_diarize::capacity::MOSS_TD_DENSEST_MEASURED_TOKENS_PER_SECOND;
+
         let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
             integral_seconds, ..
         } = crate::arch::longform_slice_shape_for_model_architecture(
@@ -440,18 +473,14 @@ mod moss_td_chunk_frame_math_tests {
         else {
             panic!("moss-transcribe-diarize must declare ScopedSlices");
         };
-        let kv_capacity =
-            crate::models::moss_transcribe_diarize::runtime_contract::MOSS_TD_MAX_KV_CACHE_POSITIONS;
-        // The densest demand this family has actually been measured against;
-        // the same figure the per-second allowance doc comment cites.
-        const DENSEST_MEASURED_TOKENS_PER_SECOND: f32 = 12.7;
+        let derivation = derivation();
+        let kv_capacity = derivation.kv_position_ceiling;
         // One encoder chunk. A window is only meaningful in whole chunks: a
         // partial chunk still costs a full one's audio tokens.
         const CHUNK_SECONDS: f32 = 30.0;
 
-        let required_positions = |window_seconds: f32| -> usize {
-            let needed = (window_seconds * DENSEST_MEASURED_TOKENS_PER_SECOND).ceil() as usize;
-            prompt_tokens_for(window_seconds) + needed.min(MOSS_TD_MAX_GENERATED_TOKENS)
+        let required_positions = |window_seconds: f32| {
+            derivation.required_positions_for_chunks(chunks_for(window_seconds))
         };
 
         assert!(
@@ -471,7 +500,7 @@ mod moss_td_chunk_frame_math_tests {
         // what a real request is held to, not the requirement above.
         assert!(
             budget_for(integral_seconds) as f32
-                >= integral_seconds * DENSEST_MEASURED_TOKENS_PER_SECOND,
+                >= integral_seconds * MOSS_TD_DENSEST_MEASURED_TOKENS_PER_SECOND,
             "granted budget {} at {integral_seconds}s does not cover the densest measured demand",
             budget_for(integral_seconds)
         );
@@ -484,11 +513,12 @@ mod moss_td_chunk_frame_math_tests {
     /// clear well past that.
     #[test]
     fn a_slice_length_request_reaches_the_runaway_backstop() {
-        const DENSEST_MEASURED_TOKENS_PER_SECOND: f32 = 12.7;
+        use crate::models::moss_transcribe_diarize::capacity::MOSS_TD_DENSEST_MEASURED_TOKENS_PER_SECOND;
+
         for window_seconds in [180.0_f32, 240.0] {
             let budget = budget_for(window_seconds);
             assert!(
-                budget as f32 >= window_seconds * DENSEST_MEASURED_TOKENS_PER_SECOND,
+                budget as f32 >= window_seconds * MOSS_TD_DENSEST_MEASURED_TOKENS_PER_SECOND,
                 "{window_seconds}s budget {budget} does not clear the densest measured demand"
             );
             assert_eq!(

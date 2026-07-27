@@ -41,15 +41,32 @@ pub(crate) const MOSS_TD_ADAPTOR_NORM_EPSILON: f32 = 1e-6;
 /// KV-cache preallocation cap for this family's Qwen3 decoder.
 ///
 /// The checkpoint's `text_config.max_position_embeddings` is 131072 -- the
-/// decoder's *RoPE context limit*, NOT a sane KV-cache capacity. But
-/// `Qwen3AsrLayerKvCacheState` eagerly allocates `max_positions * n_kv_heads *
-/// head_dim` f32 for K and V on first write, so feeding 131072 straight through
-/// reserves ~30 GB of address space (28 layers x 2 x 131072 x 8 x 128 x 4 B).
-/// That reservation is lazy-zeroed and harmless on the CPU backend (only the
-/// touched prefix is resident), but the Metal backend physically wires the
-/// buffers and exhausts a 16 GB machine. This is a ceiling on top of the
-/// request-sized capacity `llm_decoder::new_kv_caches` computes (prompt +
-/// generation-budget tokens for the utterance actually being decoded, mirroring
+/// decoder's *RoPE context limit*, NOT a sane KV-cache capacity. But a decode
+/// allocates TWO KV copies per position -- the host f32 copy
+/// (`Qwen3AsrLayerKvCacheState`, eager on first write) and the device-resident
+/// copy (`allocate_zeroed_llm_resident_kv_arena`) -- each shaped 28 layers x
+/// 2 (K+V) x 8 kv-heads x 128 head_dim = 448 rows per position, so feeding
+/// 131072 straight through reserves:
+///
+/// - host f32 copy: 131072 positions x 448 rows x 128 values x 4 B = 28 GiB
+///   (the old "~30 GB" estimate counted this copy ALONE -- 30.06 decimal GB
+///   -- and under-counted the policy by the resident half)
+/// - resident f16 copy: 131072 x 448 rows x 128 values x 2 B = 14 GiB
+/// - worst-case `DEFAULT` policy total: 336 KiB/position, 42 GiB
+///
+/// The host reservation is lazy-zeroed and harmless on the CPU backend (only
+/// the touched prefix is resident), but the Metal backend physically wires
+/// the resident buffers and exhausts a 16 GB machine many times over. Bytes
+/// per position is not even a pack constant: the runtime may resolve the
+/// `Q8_0` policy (both copies q8_0, 136 B per 128-value row, 119 KiB/position
+/// total) or fall back to `DEFAULT` (discrete GPU, no native GQA, no flash
+/// attention, wrong head_dim, or `OPENASR_QWEN_KV_CACHE_F32=1`), so static
+/// reasoning must take the worst-case DEFAULT figure -- `crate::capacity`
+/// pins both policies' numbers.
+///
+/// This is a ceiling on top of the request-sized capacity
+/// `llm_decoder::new_kv_caches` computes (prompt + generation-budget tokens
+/// for the utterance actually being decoded, mirroring
 /// `firered_llm`/`mimo_asr`'s identical sizing) -- NOT the value that capacity
 /// is unconditionally forced to. Sizing every request to this cap
 /// unconditionally previously made the fixed Metal/GPU reuse-graph KV/mask/
@@ -59,11 +76,18 @@ pub(crate) const MOSS_TD_ADAPTOR_NORM_EPSILON: f32 = 1e-6;
 /// demand was far below the cap. The executor validates the complete
 /// prompt-plus-generation request against this ceiling before constructing a
 /// decoder cache, so an over-limit request fails closed instead of allocating a
-/// cache that cannot serve its configured decode budget.
+/// cache that cannot serve its configured decode budget. At the cap, the
+/// worst-case DEFAULT total is 8192 x 336 KiB = 2.625 GiB, which fits this
+/// repo's 8 GiB min-spec memory budget under every policy -- the fit is a
+/// pinned regression anchor in `crate::models::moss_transcribe_diarize::capacity`,
+/// and the cap itself stays a DECLARED constant on purpose: deriving it at
+/// runtime from a min-spec rationale would take worst-case bytes/position and
+/// could silently tighten the shipped number.
 ///
 /// Lesson, recorded so it does not recur: `max_position_embeddings` is an
 /// attention/positional-encoding ceiling, not a working-set size; the two must
-/// not be conflated when sizing runtime buffers.
+/// not be conflated when sizing runtime buffers -- and KV byte figures are
+/// always computed for BOTH copies (host + resident), never one.
 pub(crate) const MOSS_TD_MAX_KV_CACHE_POSITIONS: usize = 8192;
 
 /// Clamp a KV-cache capacity (request-sized, or the raw RoPE context limit for
@@ -320,7 +344,9 @@ mod tests {
     #[test]
     fn kv_cache_positions_caps_the_rope_context_limit() {
         // A pack with the raw RoPE ceiling (131072) baked in clamps down to the
-        // pragmatic cap, so the KV cache preallocates ~1.9 GB, not ~30 GB.
+        // pragmatic cap: worst case (the DEFAULT policy's two copies) the KV
+        // cache preallocates 8192 x 336 KiB = 2.625 GiB, not the raw ceiling's
+        // ~42 GiB (28 GiB host + 14 GiB resident).
         assert_eq!(
             moss_td_kv_cache_positions(131_072),
             MOSS_TD_MAX_KV_CACHE_POSITIONS

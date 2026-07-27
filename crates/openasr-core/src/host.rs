@@ -5,6 +5,29 @@
 
 use crate::registry::CatalogQuantRecommendationProfile;
 
+/// The smallest total physical RAM this repo treats as a supported target
+/// (8 GiB). Sizing claims that must hold on every supported machine reason
+/// from this floor, never from the probing machine's own RAM -- see
+/// `crate::capacity`'s regression anchors, which assert the moss family's
+/// worst-case 8192-position KV footprint fits this floor's budget under every
+/// runtime KV policy. Phase 0's only consumers are those anchors (the
+/// admission-side clamp that reads it in production lands with Phase 1).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const MIN_SPEC_TOTAL_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The single fraction of TOTAL physical RAM this repo budgets for one
+/// resident model (KV caches, weights, activations): three quarters, mirroring
+/// the desktop install picker. Every memory-derived decision reasons from
+/// `total` (deterministic per machine), never from `available` (fluctuates
+/// with whatever else is running -- see `host_available_memory_bytes`'s doc):
+/// a decision that depended on free RAM would come out differently with a
+/// browser open.
+pub(crate) fn host_memory_budget_bytes(total_memory_bytes: u64) -> u64 {
+    // Integer order matters and is load-bearing for parity with the desktop
+    // picker's arithmetic: quarter first, then triple.
+    total_memory_bytes / 4 * 3
+}
+
 /// Best-effort total physical RAM of the host in bytes, used to pick a
 /// device-recommended quant at pull time. Returns `None` on platforms without a
 /// probe (callers then fall back to the catalog's static recommended quant).
@@ -61,7 +84,7 @@ pub fn host_total_memory_bytes() -> Option<u64> {
 /// makes `recommend_catalog_quant` fall back to the catalog default.
 pub fn host_quant_recommendation_profile() -> CatalogQuantRecommendationProfile {
     CatalogQuantRecommendationProfile {
-        memory_budget_bytes: host_total_memory_bytes().map(|total| total / 4 * 3),
+        memory_budget_bytes: host_total_memory_bytes().map(host_memory_budget_bytes),
     }
 }
 

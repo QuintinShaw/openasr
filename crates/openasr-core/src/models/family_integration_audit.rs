@@ -102,6 +102,13 @@ pub(crate) enum FamilyIntegrationAuditError {
         catalog_family_id: String,
         relative_path: String,
     },
+    #[error(
+        "native family '{model_family}' declares a derived capacity model but frontend id '{audio_frontend_id}' has no capacity-frontend registry row"
+    )]
+    CapacityFrontendUnregistered {
+        model_family: String,
+        audio_frontend_id: String,
+    },
 }
 
 /// Parse the embedded pre-audit family list (compile-time text, no disk I/O).
@@ -158,6 +165,22 @@ pub(crate) fn validate_runtime_family_wiring(
         if descriptor.runtime_tensor_contract_id.is_empty() {
             return Err(FamilyIntegrationAuditError::EmptyRuntimeTensorContractId {
                 model_family: descriptor.model_family.to_string(),
+            });
+        }
+
+        // A family that declares its capacity DERIVED promises derivation
+        // reads its frontend facts from the capacity registry -- fail closed
+        // on a frontend id with no row rather than let derivation silently
+        // fall back to prose constants (the documented failure mode the
+        // registry exists to replace).
+        if matches!(
+            descriptor.capacity_model,
+            crate::capacity::CapacityModelDeclaration::Derived(_)
+        ) && crate::capacity::frontend_capacity_basis(descriptor.audio_frontend_id).is_none()
+        {
+            return Err(FamilyIntegrationAuditError::CapacityFrontendUnregistered {
+                model_family: descriptor.model_family.to_string(),
+                audio_frontend_id: descriptor.audio_frontend_id.to_string(),
             });
         }
 
@@ -474,6 +497,32 @@ pub(crate) mod source_tree_audit {
         assert!(matches!(
             error,
             FamilyIntegrationAuditError::EmptyRuntimeTensorContractId { .. }
+        ));
+    }
+
+    #[test]
+    fn derived_capacity_model_without_registered_frontend_fails() {
+        let mut descriptor = base_descriptor();
+        descriptor.model_family = "synthetic-half-wired";
+        descriptor.integration.catalog_family_id = "synthetic-half-wired";
+        // Whisper's frontend id has no capacity-registry row (whisper is
+        // BoundedElsewhere, never Derived): declaring Derived on top of it
+        // must fail closed.
+        descriptor.capacity_model = crate::capacity::CapacityModelDeclaration::Derived(
+            crate::capacity::CapacityModelDescriptor {
+                audio_bound: crate::capacity::CapacityAudioBound::DecoderContext,
+            },
+        );
+
+        let error = validate_runtime_family_wiring(
+            &[descriptor],
+            &resolve_builtin_decode_policy,
+            &linked_core_pack_import_symbols(),
+        )
+        .expect_err("Derived capacity model with an unregistered frontend id must fail closed");
+        assert!(matches!(
+            error,
+            FamilyIntegrationAuditError::CapacityFrontendUnregistered { .. }
         ));
     }
 
