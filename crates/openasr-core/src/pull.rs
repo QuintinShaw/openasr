@@ -294,6 +294,8 @@ pub enum PullError {
     Paused { reference: String },
     #[error(transparent)]
     ContentStore(#[from] content_store::ContentStoreError),
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
 }
 
 #[derive(Clone, Debug)]

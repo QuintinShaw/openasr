@@ -379,7 +379,9 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
             .map_err(map_decoder_error)?;
         let mut slot = CohereBatchSlot::new(job)?;
         loop {
-            if slot.generated_tokens.len() >= slot.job.decode_config.max_generated_tokens {
+            if slot.stop_reason.is_none()
+                && slot.generated_tokens.len() >= slot.job.decode_config.max_generated_tokens
+            {
                 slot.stop_reason = Some(Seq2SeqGreedyDecodeStopReason::BudgetExhausted);
             }
             if slot.is_done() {
@@ -730,7 +732,9 @@ mod tests {
 
         loop {
             for slot in slots.iter_mut().filter(|slot| !slot.is_done()) {
-                if slot.generated_tokens.len() >= slot.job.decode_config.max_generated_tokens {
+                if slot.stop_reason.is_none()
+                    && slot.generated_tokens.len() >= slot.job.decode_config.max_generated_tokens
+                {
                     slot.stop_reason = Some(Seq2SeqGreedyDecodeStopReason::BudgetExhausted);
                 }
             }

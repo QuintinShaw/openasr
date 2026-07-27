@@ -547,7 +547,9 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
         slot.select_next_token_from_logits(logits)?;
 
         loop {
-            if slot.generated_tokens.len() >= slot.job.decode_config.max_generated_tokens {
+            if slot.stop_reason.is_none()
+                && slot.generated_tokens.len() >= slot.job.decode_config.max_generated_tokens
+            {
                 slot.stop_reason = Some(Seq2SeqGreedyDecodeStopReason::BudgetExhausted);
             }
             if slot.is_done() {

@@ -106,7 +106,7 @@ impl ModelStoreGcReport {
 
 /// Report on the model store without changing anything.
 pub fn model_store_usage(home: &Path) -> Result<ModelStoreUsage, PullError> {
-    let root = models_root(home);
+    let root = models_root(home)?;
     let mut usage = ModelStoreUsage {
         models_dir: root.clone(),
         ..ModelStoreUsage::default()
@@ -169,7 +169,7 @@ pub fn model_store_usage(home: &Path) -> Result<ModelStoreUsage, PullError> {
 /// root set cannot be trusted or another process may be mid-install; the reason
 /// is reported rather than silently swallowed.
 pub fn collect_model_store_garbage(home: &Path) -> Result<ModelStoreGcReport, PullError> {
-    let root = models_root(home);
+    let root = models_root(home)?;
     let mut report = ModelStoreGcReport::default();
 
     for entry in dead_staging_entries(&root)? {
@@ -243,7 +243,7 @@ impl ModelStoreVerification {
 /// thing that turns "the path is the checksum" back into a checked claim after
 /// hardware faults, restores from backup, or a bug that defeated the seal.
 pub fn verify_model_store(home: &Path) -> Result<ModelStoreVerification, PullError> {
-    let root = models_root(home);
+    let root = models_root(home)?;
     let mut verification = ModelStoreVerification {
         models_dir: root.clone(),
         ..ModelStoreVerification::default()
@@ -292,28 +292,48 @@ struct RootSet {
 fn referenced_digests(home: &Path, root: &Path) -> Result<RootSet, PullError> {
     let mut set = RootSet::default();
     let refs_root = root.join("refs");
-    if let Ok(model_dirs) = fs::read_dir(&refs_root) {
-        for model_dir in model_dirs.flatten() {
-            let Ok(ref_files) = fs::read_dir(model_dir.path()) else {
-                set.unreadable.push(model_dir.path());
-                continue;
-            };
-            for ref_file in ref_files.flatten() {
-                let path = ref_file.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("json") {
+    match fs::read_dir(&refs_root) {
+        Ok(model_dirs) => {
+            for model_dir in model_dirs {
+                let Ok(model_dir) = model_dir else {
+                    // A per-entry read failure (e.g. the OS raced a delete) is
+                    // as much a hole in the root set as an unreadable ref file.
+                    set.unreadable.push(refs_root.clone());
                     continue;
-                }
-                match fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|contents| serde_json::from_str::<InstalledPack>(&contents).ok())
-                {
-                    Some(pack) => {
-                        set.digests.insert(pack.sha256);
+                };
+                let Ok(ref_files) = fs::read_dir(model_dir.path()) else {
+                    set.unreadable.push(model_dir.path());
+                    continue;
+                };
+                for ref_file in ref_files {
+                    let Ok(ref_file) = ref_file else {
+                        set.unreadable.push(model_dir.path());
+                        continue;
+                    };
+                    let path = ref_file.path();
+                    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                        continue;
                     }
-                    None => set.unreadable.push(path),
+                    match fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|contents| serde_json::from_str::<InstalledPack>(&contents).ok())
+                    {
+                        Some(pack) => {
+                            set.digests.insert(pack.sha256);
+                        }
+                        None => set.unreadable.push(path),
+                    }
                 }
             }
         }
+        // No refs/ directory at all is a legitimate empty store (a fresh
+        // install before anything has ever landed).
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // Any other error -- permission denied, I/O failure -- means the root
+        // set cannot be trusted. Recording it as unreadable, not silently
+        // treating the store as empty, is what makes `collection_block_reason`
+        // withhold collection instead of authorizing it against a blind spot.
+        Err(_) => set.unreadable.push(refs_root.clone()),
     }
 
     // The default pointer names a pack independently of the refs tree; treat it
@@ -337,8 +357,20 @@ fn referenced_digests(home: &Path, root: &Path) -> Result<RootSet, PullError> {
 fn installed_refs(root: &Path) -> Result<Vec<InstalledPack>, PullError> {
     let mut packs = Vec::new();
     let refs_root = root.join("refs");
-    let Ok(model_dirs) = fs::read_dir(&refs_root) else {
-        return Ok(packs);
+    let model_dirs = match fs::read_dir(&refs_root) {
+        Ok(model_dirs) => model_dirs,
+        // No refs/ directory at all is a legitimate empty store.
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(packs),
+        // Any other error must surface as a failure, not report an empty
+        // store: usage/verify accounting would otherwise silently show zero
+        // installed packs while the directory it could not read still holds
+        // the real answer.
+        Err(source) => {
+            return Err(PullError::Io {
+                path: refs_root,
+                source,
+            });
+        }
     };
     for model_dir in model_dirs.flatten() {
         let Ok(ref_files) = fs::read_dir(model_dir.path()) else {
@@ -510,9 +542,13 @@ fn is_past_grace(modified: Option<SystemTime>, now: SystemTime) -> bool {
         .is_ok_and(|age| age >= ORPHAN_OBJECT_GRACE)
 }
 
-fn models_root(home: &Path) -> PathBuf {
-    let config = crate::config::load_config(home).unwrap_or_default();
-    crate::config::models_dir(home, &config)
+fn models_root(home: &Path) -> Result<PathBuf, PullError> {
+    // A corrupt config.json must fail closed here, not fall back to the
+    // default `<home>/models` -- these callers run destructive commands (GC,
+    // verify), and silently acting against the wrong directory because the
+    // real one could not be resolved is worse than refusing to run.
+    let config = crate::config::load_config(home)?;
+    Ok(crate::config::models_dir(home, &config))
 }
 
 #[cfg(test)]

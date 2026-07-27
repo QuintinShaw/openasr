@@ -14,7 +14,7 @@ fn digest_of(bytes: &[u8]) -> String {
 }
 
 fn models_dir_of(home: &Path) -> PathBuf {
-    models_root(home)
+    models_root(home).unwrap()
 }
 
 fn set_writable(path: &Path) {
@@ -216,6 +216,43 @@ fn unreadable_ref_withholds_object_collection() {
     let reason = report.collection_withheld.expect("withheld with a reason");
     assert!(reason.contains("root set"), "{reason}");
     assert!(object_content_path(home.path(), &digest).is_file());
+}
+
+#[test]
+#[cfg(unix)]
+fn unreadable_refs_root_withholds_object_collection() {
+    let home = TempDir::new().unwrap();
+    let live_digest = write_object(home.path(), b"a-pack-a-live-ref-points-at");
+    age_object(home.path(), &live_digest, ORPHAN_OBJECT_GRACE * 10);
+    write_ref(home.path(), "live-model", "q8_0", &live_digest, 27);
+
+    // Make refs/ itself unreadable, leaving the ref file perfectly intact.
+    // Listing the directory now fails outright, which used to be
+    // indistinguishable from "no refs/ directory exists" and collected the
+    // live object out from under an intact ref.
+    let refs_root = models_dir_of(home.path()).join("refs");
+    let mut permissions = fs::metadata(&refs_root).unwrap().permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&refs_root, permissions).unwrap();
+
+    let report = collect_model_store_garbage(home.path());
+
+    // Restore before asserting so the TempDir can clean up regardless of the
+    // assertion outcome.
+    let mut permissions = fs::metadata(&refs_root).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&refs_root, permissions).unwrap();
+
+    let report = report.unwrap();
+    assert!(
+        report.collection_withheld.is_some(),
+        "an unreadable refs root must withhold collection"
+    );
+    assert!(
+        report.removed_objects.is_empty(),
+        "collection deleted a referenced object because refs/ could not be listed"
+    );
+    assert!(object_content_path(home.path(), &live_digest).is_file());
 }
 
 #[test]
@@ -662,4 +699,28 @@ fn a_ref_naming_a_foreign_file_is_never_followed() {
     );
     assert_ne!(store.packs()[0].path, outside);
     assert_eq!(fs::read(&store.packs()[0].path).unwrap(), bytes);
+}
+
+/// A `config.json` that fails to parse must not be treated as "no config,
+/// use the default `<home>/models`" -- these commands are destructive (GC)
+/// or security-relevant (verify), and silently acting against the wrong
+/// directory because the real one could not be resolved is worse than
+/// refusing to run.
+#[test]
+fn corrupt_config_fails_gc_closed_instead_of_falling_back_to_default_dir() {
+    let home = TempDir::new().unwrap();
+    fs::write(crate::config::config_path(home.path()), b"{ not json").unwrap();
+
+    let error = collect_model_store_garbage(home.path()).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("config.json") || message.contains("config"),
+        "{message}"
+    );
+
+    let error = model_store_usage(home.path()).unwrap_err();
+    assert!(!error.to_string().is_empty());
+
+    let error = verify_model_store(home.path()).unwrap_err();
+    assert!(!error.to_string().is_empty());
 }

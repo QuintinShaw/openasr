@@ -1840,6 +1840,18 @@ fn finalize_native_transcription(
     // engine, on every exit path: the per-decode results this run consumed are
     // gone by now, so this is the last point at which "the transcript is short"
     // is still knowable.
+    //
+    // This is an overwrite, not a merge, so it silently clobbers anything a
+    // caller already set on `transcription.truncated_decodes` before handing
+    // it here. Every call site is expected to pass that field in empty and
+    // supply the real list via the `truncated_decodes` parameter instead --
+    // catch a caller that drifts from that contract before it loses truncation
+    // visibility outright.
+    debug_assert!(
+        transcription.truncated_decodes.is_empty(),
+        "finalize_native_transcription overwrites truncated_decodes; \
+         the incoming transcription must not already carry any"
+    );
     transcription.truncated_decodes = truncated_decodes;
     with_reported_language(transcription, reported_language)
 }
