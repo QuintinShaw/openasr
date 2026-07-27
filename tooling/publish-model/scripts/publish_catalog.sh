@@ -254,6 +254,13 @@ log "refreshing committed public projection: $COMMITTED_PUBLIC_CATALOG (+ signat
 cp "$PUBLIC_CATALOG" "$COMMITTED_PUBLIC_CATALOG"
 cp "$PUBLIC_MANIFEST" "$COMMITTED_PUBLIC_MANIFEST"
 
+# Self-verify the committed state binds before declaring it commit-ready:
+# catalog hashes, epoch, canonical identity, ed25519 signatures (both
+# manifests) and the public projection. Same gate CI + the pre-commit hook
+# run, so a failure here can never be masked by a later step.
+log "verifying committed catalog consistency"
+python3 "$SCRIPT_DIR/check_catalog_consistency.py"
+
 write_summary "1"
 
 log "signed full + public catalog at epoch $CATALOG_EPOCH ($PUBLIC_COUNT public model(s))"

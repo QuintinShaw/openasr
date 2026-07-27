@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Pre-commit guard for the catalog trust boundary: when a commit touches the
+# model registry (or this gate itself), prove the catalog JSONs still bind to
+# their signed manifests BEFORE the commit lands -- the failure class where a
+# regenerated catalog.json goes un-re-signed and nothing notices until the
+# (much later) Rust signature tests. Pure-stdlib Python; runs in seconds.
+#
+# Install with: scripts/install-git-hooks.sh
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+if git diff --cached --name-only | grep -qE '^(model-registry/|tooling/publish-model/scripts/check_catalog_consistency\.py)'; then
+  python3 "$REPO_ROOT/tooling/publish-model/scripts/check_catalog_consistency.py" >&2
+fi
