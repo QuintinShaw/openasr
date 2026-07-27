@@ -2326,7 +2326,7 @@ fn write_audit_quant_pack(
         gguf_put_string(&mut bytes, name);
         bytes.extend_from_slice(&1_u32.to_le_bytes()); // rank
         bytes.extend_from_slice(&(data.len() as u64).to_le_bytes()); // dim[0]
-        bytes.extend_from_slice(ggml_type);
+        bytes.extend_from_slice(&ggml_type.to_le_bytes());
         bytes.extend_from_slice(&data_offset.to_le_bytes());
         data_offset += data.len() as u64;
     }
@@ -2387,7 +2387,7 @@ fn audit_quant_fails_closed_on_sub_q8_encoder() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("audit FAILED"))
-        .stderr(predicate::str::contains(
+        .stdout(predicate::str::contains(
             "audio encoder below the Q8_0 floor",
         ));
 }
@@ -2415,7 +2415,7 @@ fn audit_quant_fails_closed_on_declared_tier_ceiling() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("audit FAILED"))
-        .stderr(predicate::str::contains("exceeds the declared tier"));
+        .stdout(predicate::str::contains("exceeds the declared tier"));
 }
 
 #[test]
