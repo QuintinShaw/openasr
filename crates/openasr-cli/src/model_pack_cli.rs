@@ -341,6 +341,33 @@ fn import_command(command: ImportCommand) -> Result<()> {
             output_root,
             package_id,
         } => import_pyannote_local_command(&source_safetensors, &output_root, &package_id),
+        ImportCommand::QwenForcedAligner {
+            source_root,
+            output_root,
+            package_id,
+            package_variant,
+            source_name,
+            source_revision,
+            license_name,
+            license_source,
+            quantization,
+        } => import_qwen_forced_aligner_local_command(
+            &source_root,
+            &output_root,
+            &package_id,
+            package_variant.as_deref(),
+            &source_name,
+            &source_revision,
+            &license_name,
+            &license_source,
+            quantization,
+        ),
+        ImportCommand::Moss {
+            source_root,
+            output_root,
+            package_id,
+            quantization,
+        } => import_moss_local_command(&source_root, &output_root, &package_id, quantization),
     }
 }
 
@@ -846,6 +873,82 @@ fn import_qwen_local_command(
         result.output_path.display(),
         result.model_id,
         result.tensor_count
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn import_qwen_forced_aligner_local_command(
+    source_root: &Path,
+    output_root: &Path,
+    package_id: &str,
+    package_variant: Option<&str>,
+    source_name: &str,
+    source_revision: &str,
+    license_name: &str,
+    license_source: &str,
+    quantization: ImportQwen3AsrQuantization,
+) -> Result<()> {
+    let request = Qwen3ForcedAlignerLocalSourceImportRequest {
+        source_root: source_root.to_path_buf(),
+        output_root: output_root.to_path_buf(),
+        package_id: package_id.to_string(),
+        package_variant: package_variant.map(ToOwned::to_owned),
+        source_name: source_name.to_string(),
+        source_revision: source_revision.to_string(),
+        license_name: license_name.to_string(),
+        license_source: license_source.to_string(),
+        quantization: match quantization {
+            ImportQwen3AsrQuantization::Fp16 => openasr_core::Qwen3AsrRuntimeQuantizationMode::Fp16,
+            ImportQwen3AsrQuantization::Q8_0 => openasr_core::Qwen3AsrRuntimeQuantizationMode::Q8_0,
+            ImportQwen3AsrQuantization::Q3_K => openasr_core::Qwen3AsrRuntimeQuantizationMode::Q3_K,
+            ImportQwen3AsrQuantization::Q4_K => openasr_core::Qwen3AsrRuntimeQuantizationMode::Q4_K,
+        },
+    };
+
+    ensure_ggml_package_output_suffix(output_root)?;
+    let result = convert_local_qwen_forced_aligner_source_to_runtime_pack(&request)
+        .map_err(anyhow::Error::new)?;
+    println!(
+        "Imported Qwen3-ForcedAligner local source into runtime pack:\n- source: {}\n- output: {}\n- model.id: {}\n- tensor_count: {}",
+        source_root.display(),
+        result.output_path.display(),
+        result.model_id,
+        result.tensor_count
+    );
+    Ok(())
+}
+
+fn import_moss_local_command(
+    source_root: &Path,
+    output_root: &Path,
+    package_id: &str,
+    quantization: ImportMossQuantization,
+) -> Result<()> {
+    use openasr_core::models::pack_quant::PackQuant;
+
+    let request = MossTdImportRequest {
+        source_root: source_root.to_path_buf(),
+        output_root: output_root.to_path_buf(),
+        model_id: package_id.to_string(),
+        quantization: match quantization {
+            ImportMossQuantization::Fp16 => PackQuant::Fp16,
+            ImportMossQuantization::Q8_0 => PackQuant::Q8_0,
+            ImportMossQuantization::Q3_K => PackQuant::Q3_K,
+            ImportMossQuantization::Q4_K => PackQuant::Q4_K,
+        },
+    };
+
+    ensure_ggml_package_output_suffix(output_root)?;
+    let result = convert_local_moss_transcribe_diarize_source_to_runtime_pack(&request)
+        .map_err(anyhow::Error::new)?;
+    println!(
+        "Imported MOSS-Transcribe-Diarize local source into runtime pack:\n- source: {}\n- output: {}\n- model.id: {}\n- tensor_count: {}\n- vocab_size: {}",
+        source_root.display(),
+        result.output_path.display(),
+        package_id,
+        result.tensor_count,
+        result.vocab_size
     );
     Ok(())
 }

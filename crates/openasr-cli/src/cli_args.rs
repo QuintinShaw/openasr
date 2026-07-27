@@ -1015,6 +1015,53 @@ pub(crate) enum ImportCommand {
         #[arg(long)]
         package_id: String,
     },
+    /// Import one local Qwen3-ForcedAligner HF-style source directory into one runtime pack file (`.oasr`).
+    ///
+    /// Shares its thinker (audio encoder + LM) tensor layout byte-for-byte
+    /// with qwen3-asr; only the final head differs (an independent
+    /// timestamp-bin classification head instead of the tied lm_head).
+    #[command(name = "qwen-forced-aligner")]
+    QwenForcedAligner {
+        /// Source directory containing config.json, tokenizer artifacts, and one or more *.safetensors files.
+        source_root: PathBuf,
+        /// Output path for one runtime pack file (`.oasr`).
+        output_root: PathBuf,
+        /// Model id written to pack metadata (openasr.model.id).
+        #[arg(long)]
+        package_id: String,
+        /// Optional package variant written to manifest.package.variant.
+        #[arg(long)]
+        package_variant: Option<String>,
+        /// Source name written to provenance.source_name.
+        #[arg(long, default_value = "Qwen/Qwen3-ForcedAligner-0.6B")]
+        source_name: String,
+        /// Source revision written to provenance.source_revision.
+        #[arg(long)]
+        source_revision: String,
+        /// License name written to manifest.license.name.
+        #[arg(long, default_value = "Apache-2.0")]
+        license_name: String,
+        /// License source URL/path written to manifest.license.source.
+        #[arg(long)]
+        license_source: String,
+        /// Runtime tensor quantization for GGUF-backed `.oasr` output.
+        #[arg(long, value_enum, default_value_t = ImportQwen3AsrQuantization::Fp16)]
+        quantization: ImportQwen3AsrQuantization,
+    },
+    /// Import one local MOSS-Transcribe-Diarize HF-style source directory into one runtime pack file (`.oasr`).
+    #[command(name = "moss")]
+    Moss {
+        /// Source directory containing config.json, safetensors shard(s), vocab.json, merges.txt, and tokenizer.json.
+        source_root: PathBuf,
+        /// Output path for one runtime pack file (`.oasr`).
+        output_root: PathBuf,
+        /// Model id written to pack metadata (openasr.model.id).
+        #[arg(long)]
+        package_id: String,
+        /// Runtime tensor quantization for GGUF-backed `.oasr` output.
+        #[arg(long, value_enum, default_value_t = ImportMossQuantization::Fp16)]
+        quantization: ImportMossQuantization,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1099,14 +1146,14 @@ pub(crate) enum ImportFireredPuncQuantization {
     Q4_K,
 }
 
-/// Which decode-prefix scheme the checkpoint's vocab uses. Defaults to
-/// `cn-dialect` (the existing `small.cn`/`cn-dialect-base` checkpoints, fixed
-/// `<zh>` language token) so every already-scripted import call keeps working
-/// unchanged; the multilingual checkpoints (`dolphin-small`/`dolphin-base`)
-/// pass `--language-scheme multilingual`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+/// Which decode-prefix scheme the checkpoint's vocab uses. The argument is
+/// required at the CLI layer: picking the wrong scheme silently produces a
+/// pack that decodes garbage language tokens (the q4_k-era incident), so the
+/// caller must state it explicitly. `cn-dialect` matches the `small.cn` /
+/// `cn-dialect-base` checkpoints (fixed `<zh>` language token); `multilingual`
+/// matches `dolphin-small` / `dolphin-base`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum ImportDolphinLanguageScheme {
-    #[default]
     CnDialect,
     Multilingual,
 }
@@ -1132,5 +1179,14 @@ pub(crate) enum ImportWav2Vec2Quantization {
 pub(crate) enum ImportMoonshineQuantization {
     Fp16,
     Q8_0,
+    Q4_K,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[allow(non_camel_case_types)]
+pub(crate) enum ImportMossQuantization {
+    Fp16,
+    Q8_0,
+    Q3_K,
     Q4_K,
 }

@@ -374,16 +374,17 @@ external_converter = "python3 tooling/mimo-asr/convert_mimo_asr.py --main-dir {s
 # layout byte-for-byte with qwen3-asr (see
 # crates/openasr-core/src/models/qwen/forced_aligner_import.rs); only the
 # final head differs (independent classify_num=5000 timestamp-bin head vs
-# tied lm_head). The crate-internal importer exists; the public
-# `model-pack import` subcommand wiring lands with the NAR decode policy.
-# Until then convert.sh fails closed ("no import recipe") rather than
-# resurrecting the removed one-off publish driver.
+# tied lm_head). Imported via the public `openasr model-pack import
+# qwen-forced-aligner` subcommand (same request shape as qwen). The CLI
+# defaults for source-name/license-name are stated explicitly anyway: the
+# pipeline never relies on argument defaults.
 ["qwen3-forced-aligner-0.6b"]
-import_subcommand = "not yet a public model-pack import subcommand"
+import_subcommand = "import qwen-forced-aligner"
 upstream_repo = "Qwen/Qwen3-ForcedAligner-0.6B"
 source_revision = "main"
 needs_license_flags = false
 required_source_files = ["config.json", "model.safetensors"]
+import_command = "model-pack import qwen-forced-aligner {src} {out} --package-id {registry_id} --quantization {quant} --source-name Qwen/Qwen3-ForcedAligner-0.6B --source-revision main --license-name Apache-2.0 --license-source https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B/blob/main/LICENSE"
 
 # FireRedPunc punctuation capability pack. Imported via the public
 # `openasr model-pack import firered-punc` subcommand from the upstream
@@ -401,13 +402,15 @@ prep_scripts = [
 required_source_files = ["model.safetensors", "chinese-lert-base/vocab.txt"]
 import_command = "model-pack import firered-punc {src}/model.safetensors {src}/chinese-lert-base/vocab.txt {out} --package-id {registry_id}"
 
-# MOSS-Transcribe-Diarize: the crate-internal importer
-# (moss_transcribe_diarize::package_import) exists but has no CLI entry point
-# yet. Until the public subcommand lands, convert.sh fails closed ("no import
-# recipe") instead of pretending a pipeline path exists.
+# MOSS-Transcribe-Diarize: imported via the public `openasr model-pack import
+# moss` subcommand (convert_local_moss_transcribe_diarize_source_to_runtime_pack
+# in moss_transcribe_diarize::package_import). Like the CTC families it takes
+# only --package-id + --quantization; the importer bakes license metadata from
+# the source checkpoint itself (needs_license_flags = false).
 ["moss-transcribe-diarize"]
-import_subcommand = "not yet a public model-pack import subcommand"
+import_subcommand = "import moss"
 upstream_repo = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
 source_revision = "main"
 needs_license_flags = false
 required_source_files = ["config.json", "model.safetensors.index.json"]
+import_command = "model-pack import moss {src} {out} --package-id {registry_id} --quantization {quant}"
