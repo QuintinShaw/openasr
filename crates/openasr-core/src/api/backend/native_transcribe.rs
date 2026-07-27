@@ -762,6 +762,7 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
         | BackendError::NativeModelPackPathRejected { .. }
         | BackendError::NativeModelSelectionMismatch { .. } => FailureCategory::ModelResolve,
         BackendError::DiarizationNotSupported { .. }
+        | BackendError::VoiceIdIdentityFailed(_)
         | BackendError::DiarizeSpeakersRequiresDiarization
         | BackendError::PhraseBiasNotSupported { .. }
         | BackendError::AdapterNotSupported { .. }
@@ -1649,7 +1650,7 @@ fn run_native_transcription_impl(
                     })
                     .into_iter()
                     .collect();
-                return Ok(finalize_native_transcription(
+                return finalize_native_transcription(
                     fallback.into_transcription(),
                     audio_duration_seconds,
                     Some(run_metadata),
@@ -1660,9 +1661,9 @@ fn run_native_transcription_impl(
                     strip_forced_word_timestamps,
                     reported_language.clone(),
                     fallback_truncated_decodes,
-                ));
+                );
             }
-            return Ok(finalize_native_transcription(
+            return finalize_native_transcription(
                 assembled,
                 audio_duration_seconds,
                 Some(run_metadata),
@@ -1673,7 +1674,7 @@ fn run_native_transcription_impl(
                 strip_forced_word_timestamps,
                 reported_language.clone(),
                 truncated_decodes,
-            ));
+            );
         }
         longform_metadata = Some(build_longform_metadata(
             &longform_options,
@@ -1745,7 +1746,7 @@ fn run_native_transcription_impl(
             truncation,
         });
     }
-    Ok(finalize_native_transcription(
+    finalize_native_transcription(
         transcription.into_transcription(),
         audio_duration_seconds,
         longform_metadata,
@@ -1756,7 +1757,7 @@ fn run_native_transcription_impl(
         strip_forced_word_timestamps,
         reported_language,
         truncated_decodes,
-    ))
+    )
 }
 
 /// Render one truncated slice for the `core.native.decode.truncated`
@@ -1811,7 +1812,7 @@ fn finalize_native_transcription(
     strip_forced_word_timestamps: bool,
     reported_language: Option<String>,
     truncated_decodes: Vec<TruncatedDecode>,
-) -> Transcription {
+) -> Result<Transcription, BackendError> {
     let mut transcription = apply_speaker_turns(
         with_longform_metadata(
             normalize_transcription_segments(transcription, 0.0, audio_duration_seconds),
@@ -1825,16 +1826,15 @@ fn finalize_native_transcription(
         // unit: a sliced run numbered its speakers from one per slice, so the
         // labels only mean something relative to the scope that produced them.
         // The source-independent identity stage is what relates the scopes,
-        // and it is a no-op without an installed speaker embedder -- which is
-        // exactly the "can separate but cannot name" degrade an in-decoder
-        // family gets on a host with no embedder pack (with more than one
-        // scope it then keeps them apart rather than guessing they match).
+        // and fails closed (rather than silently degrading) when it had
+        // stitching or naming work to do and no embedder to do it with -- see
+        // `voice_id::name_speakers_across_scopes`.
         let mut scopes = speaker_scopes_by_start(
             &mut transcription.segments,
             speaker_scope_starts,
             prepared_audio,
         );
-        crate::diarize::voice_id::name_speakers_across_scopes(&mut scopes);
+        crate::diarize::voice_id::name_speakers_across_scopes(&mut scopes)?;
     }
     // Stamped after the body is assembled and before the transcript leaves the
     // engine, on every exit path: the per-decode results this run consumed are
@@ -1853,7 +1853,7 @@ fn finalize_native_transcription(
          the incoming transcription must not already carry any"
     );
     transcription.truncated_decodes = truncated_decodes;
-    with_reported_language(transcription, reported_language)
+    Ok(with_reported_language(transcription, reported_language))
 }
 
 /// Cut time-ordered segments into the decode scopes they came from.

@@ -52,9 +52,26 @@
 
 use std::collections::BTreeMap;
 
+use thiserror::Error;
+
 use super::evidence::{self, JudgedWindows, MIN_PURITY_VERDICT_WINDOWS, WINDOW_SECONDS};
 use crate::Segment;
 use crate::diarize::contract::{SpeakerEmbedding, TimeRange};
+
+/// This stage's one fail-closed case.
+///
+/// Every other gate in this module (naming evidence, purity verdict) is
+/// one-sided toward anonymous per the module docs above: refusing costs a
+/// name, never a wrong one, so a refusal is silent. A missing embedder is
+/// different in kind. It is not a judgement this stage made about the
+/// evidence; it is the evidence-gathering machinery itself being unavailable,
+/// and whether that is safe to paper over depends on what the caller stood to
+/// lose -- see [`name_speakers_across_scopes`] for exactly when it fires.
+#[derive(Debug, Error)]
+pub enum SpeakerIdentityError {
+    #[error("{}", crate::diarize::embed::VOICE_ID_NAMING_EMBEDDER_MISSING_REASON)]
+    EmbedderPackMissing,
+}
 
 /// Audio sample rate the speaker embedder is fed at; the transcription
 /// pipeline resamples to this before decode, so segment times index directly
@@ -161,17 +178,55 @@ pub struct SpeakerScope<'a> {
 /// when there is more than one scope (see [`SpeakerScope`]: two scopes'
 /// identical numbering must never read as one speaker just because no evidence
 /// was available to tell them apart).
-pub fn name_speakers_across_scopes(scopes: &mut [SpeakerScope<'_>]) {
+///
+/// # When a missing embedder is an error, and when it is not
+///
+/// Without an embedder this stage cannot do either of its two jobs: it cannot
+/// stitch scopes back together, and it cannot match a label to an enrolled
+/// person. Whether that is safe to swallow depends on whether either job had
+/// anything to do:
+///
+/// - **Single scope, nobody enrolled.** Neither job exists -- there is nothing
+///   to stitch (one scope) and nothing to match against (empty library). This
+///   is the ordinary "Voice ID is on but unused" state, and it must keep
+///   succeeding: refusing it would turn plain anonymous multi-speaker
+///   transcription into a hard failure over a pack that has nothing to do.
+/// - **Multiple scopes, or somebody enrolled.** At least one job would have
+///   run and silently did not: a longform recording's later slices would stay
+///   artificially separated from its earlier ones, or an enrolled person's
+///   segments would stay anonymous with no signal to the caller that
+///   anything went wrong. That is the exact silent-degrade this stage exists
+///   to not do, so it fails closed with [`SpeakerIdentityError::EmbedderPackMissing`]
+///   instead.
+pub fn name_speakers_across_scopes(
+    scopes: &mut [SpeakerScope<'_>],
+) -> Result<(), SpeakerIdentityError> {
+    name_speakers_across_scopes_with(crate::diarize::embed::shared_embedder(), scopes)
+}
+
+/// [`name_speakers_across_scopes`] with the embedder passed explicitly.
+///
+/// The public entry point resolves the process-wide shared embedder; this
+/// seam exists so tests exercise both sides of the missing-embedder contract
+/// deterministically instead of inheriting whatever packs the host machine
+/// happens to have installed.
+fn name_speakers_across_scopes_with(
+    embedder: Option<&'static dyn crate::diarize::embed::SpeakerEmbedder>,
+    scopes: &mut [SpeakerScope<'_>],
+) -> Result<(), SpeakerIdentityError> {
     for scope in scopes.iter_mut() {
         normalize_local_labels(scope.segments);
     }
     if scopes.len() > 1 {
         disambiguate_labels_across_scopes(scopes);
     }
-    let Some(embedder) = crate::diarize::embed::shared_embedder() else {
-        // No embedder: separation stands, naming does not. Labels stay
-        // anonymous rather than guessed at.
-        return;
+    let Some(embedder) = embedder else {
+        if scopes.len() > 1 || super::person_library_is_non_empty() {
+            return Err(SpeakerIdentityError::EmbedderPackMissing);
+        }
+        // No embedder, nobody enrolled, one scope: separation stands, naming
+        // was never going to do anything here regardless of the embedder.
+        return Ok(());
     };
 
     // Keyed by the label as it now reads, which is scope-unique after the
@@ -257,13 +312,17 @@ pub fn name_speakers_across_scopes(scopes: &mut [SpeakerScope<'_>]) {
             segment.speaker_snapshot_label = Some(person.display_name.clone());
         }
     }
+    Ok(())
 }
 
 /// Single-scope convenience for the one caller that has a single decode unit
 /// (every offline transcription today). Same semantics as
 /// [`name_speakers_across_scopes`] with one scope.
-pub fn name_speakers_from_labeled_segments(segments: &mut [Segment], samples: &[f32]) {
-    name_speakers_across_scopes(&mut [SpeakerScope { segments, samples }]);
+pub fn name_speakers_from_labeled_segments(
+    segments: &mut [Segment],
+    samples: &[f32],
+) -> Result<(), SpeakerIdentityError> {
+    name_speakers_across_scopes(&mut [SpeakerScope { segments, samples }])
 }
 
 /// What a label's voice amounts to: the windows that survived main-cluster
@@ -524,7 +583,7 @@ mod tests {
             labeled(0.0, 1.0, Some("SPEAKER_01")),
             labeled(1.0, 2.0, None),
         ];
-        name_speakers_from_labeled_segments(&mut segments, &[]);
+        name_speakers_from_labeled_segments(&mut segments, &[]).unwrap();
 
         assert_eq!(segments[0].speaker.as_deref(), Some("SPEAKER_01"));
         assert_eq!(segments[0].speaker_label.as_deref(), Some("SPEAKER_01"));
@@ -537,7 +596,7 @@ mod tests {
     fn a_label_only_segment_gets_its_display_speaker_filled_in() {
         let mut segments = vec![labeled(0.0, 1.0, None)];
         segments[0].speaker_label = Some("SPEAKER_03".to_string());
-        name_speakers_from_labeled_segments(&mut segments, &[]);
+        name_speakers_from_labeled_segments(&mut segments, &[]).unwrap();
         assert_eq!(segments[0].speaker.as_deref(), Some("SPEAKER_03"));
     }
 
@@ -550,15 +609,19 @@ mod tests {
             labeled(0.0, 1.0, Some("SPEAKER_01")),
             labeled(1.0, 2.0, Some("SPEAKER_05")),
         ];
-        name_speakers_from_labeled_segments(&mut segments, &[]);
+        name_speakers_from_labeled_segments(&mut segments, &[]).unwrap();
         assert_eq!(segments[0].speaker_label.as_deref(), Some("SPEAKER_01"));
         assert_eq!(segments[1].speaker_label.as_deref(), Some("SPEAKER_05"));
     }
 
     /// The serve-batch contract: two independently decoded scopes both start
-    /// numbering at one, and those two `SPEAKER_01`s are unrelated. With no
-    /// voice evidence to relate them they must come out as distinct speakers,
-    /// never silently merged into one.
+    /// numbering at one, and those two `SPEAKER_01`s are unrelated. Splitting
+    /// them apart is disambiguation's job and happens unconditionally, before
+    /// this stage even looks for an embedder -- so the split survives even on
+    /// the fail-closed path this test runs on (no embedder pack in this test
+    /// process, and multiple scopes is exactly the condition that now errors
+    /// rather than silently skipping stitching; see
+    /// [`SpeakerIdentityError::EmbedderPackMissing`]).
     #[test]
     fn identical_labels_in_two_scopes_are_never_merged_without_evidence() {
         let mut first = vec![
@@ -569,21 +632,30 @@ mod tests {
             labeled(0.0, 1.0, Some("SPEAKER_01")),
             labeled(1.0, 2.0, Some("SPEAKER_01")),
         ];
-        name_speakers_across_scopes(&mut [
-            SpeakerScope {
-                segments: &mut first,
-                samples: &[],
-            },
-            SpeakerScope {
-                segments: &mut second,
-                samples: &[],
-            },
-        ]);
+        let result = name_speakers_across_scopes_with(
+            None,
+            &mut [
+                SpeakerScope {
+                    segments: &mut first,
+                    samples: &[],
+                },
+                SpeakerScope {
+                    segments: &mut second,
+                    samples: &[],
+                },
+            ],
+        );
+        assert!(
+            matches!(result, Err(SpeakerIdentityError::EmbedderPackMissing)),
+            "multi-scope naming without an embedder must fail closed, not silently skip stitching"
+        );
 
         let label = |segment: &Segment| segment.speaker_label.clone().unwrap();
         // Within a scope, one label stays one speaker.
         assert_eq!(label(&second[0]), label(&second[1]));
-        // Across scopes, colliding labels are split apart.
+        // Across scopes, colliding labels are split apart. Disambiguation ran
+        // before the embedder check and its mutation is not rolled back by
+        // the later error.
         assert_ne!(label(&first[0]), label(&second[0]));
         assert_ne!(label(&first[1]), label(&second[0]));
         // The rendered speaker follows the label, and no identity was invented.
@@ -591,6 +663,23 @@ mod tests {
             assert_eq!(segment.speaker, segment.speaker_label);
             assert!(segment.speaker_person_id.is_none());
         }
+    }
+
+    /// The other half of the fail-closed gate: a single scope with nobody
+    /// enrolled is a legitimate no-op even with no embedder, because neither
+    /// of this stage's jobs (stitching, naming) had anything to do. This is
+    /// the common "Voice ID on, unused" state and must keep succeeding.
+    #[test]
+    fn single_scope_empty_library_without_embedder_is_not_an_error() {
+        let mut segments = vec![labeled(0.0, 1.0, Some("SPEAKER_01"))];
+        let result = name_speakers_across_scopes_with(
+            None,
+            &mut [SpeakerScope {
+                segments: &mut segments,
+                samples: &[],
+            }],
+        );
+        assert!(result.is_ok());
     }
 
     /// A talkative label: comfortably over every gate.

@@ -920,6 +920,8 @@ pub enum BackendError {
         "Diarization is not available for the {backend} backend in this setup.\nThis model does not separate speakers itself, so it needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install it, pick a model that separates speakers itself, or omit --diarize / diarize=true."
     )]
     DiarizationNotSupported { backend: &'static str },
+    #[error(transparent)]
+    VoiceIdIdentityFailed(#[from] crate::diarize::voice_id::SpeakerIdentityError),
     #[error(
         "The speakers hint requires diarize=true.\nThe request was rejected instead of silently ignoring speakers."
     )]

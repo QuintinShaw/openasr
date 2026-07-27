@@ -69,6 +69,33 @@ pub fn load_person_matcher_for_active_embedder() -> PersonMatcher {
         .unwrap_or_else(|_| PersonMatcher::new(space, Vec::new(), threshold, margin))
 }
 
+/// Whether any enrolled (non-deleted) person exists, independent of the
+/// active embedder's space.
+///
+/// The naming stage (`identity::name_speakers_across_scopes`) uses this to
+/// decide whether a missing embedder is a legitimate no-op (nobody enrolled,
+/// so there is nothing naming could have attached) or a real degrade that
+/// must fail closed (a person is enrolled and would silently go unmatched).
+/// Deliberately not gated on the embedder identity the way
+/// [`load_person_matcher_for_active_embedder`] is -- the question here is
+/// "does a library exist at all", not "can today's embedder match against
+/// it" -- and any failure to open the home directory or store degrades to
+/// "empty", the same fail-open-toward-anonymous convention that function
+/// uses, since an unreadable store means Voice ID could not have been used to
+/// enroll anyone in the first place.
+pub fn person_library_is_non_empty() -> bool {
+    let Ok(home) = crate::openasr_home() else {
+        return false;
+    };
+    let Ok(store) = VoiceIdStore::open_checked(home) else {
+        return false;
+    };
+    store
+        .list_persons(None)
+        .map(|persons| !persons.is_empty())
+        .unwrap_or(false)
+}
+
 fn empty_person_matcher() -> PersonMatcher {
     // Unmatchable placeholder space: best_match always returns None.
     PersonMatcher::new(

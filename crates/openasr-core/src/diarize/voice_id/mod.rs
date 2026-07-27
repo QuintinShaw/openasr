@@ -21,7 +21,8 @@ pub use domain::{
     SampleView, VOICE_ID_LABEL_MAX_CHARS, VoiceIdAssignment, VoiceIdColor,
 };
 pub use identity::{
-    SpeakerScope, name_speakers_across_scopes, name_speakers_from_labeled_segments,
+    SpeakerIdentityError, SpeakerScope, name_speakers_across_scopes,
+    name_speakers_from_labeled_segments,
 };
 pub use ids::{IdError, PERSON_ID_PREFIX, PersonId, PrototypeId, SAMPLE_ID_PREFIX, SampleId};
 pub use matcher::{MatcherPerson, PersonMatcher};
@@ -36,7 +37,8 @@ pub use quality::{
 pub use service::{
     EnrollmentClip, VoiceIdServiceError, add_sample_from_pcm, add_sample_from_pcm_idempotent,
     enroll_person_from_clips, enroll_person_from_clips_idempotent,
-    load_person_matcher_for_active_embedder, prepare_sample_from_pcm, prepare_sample_from_wav_file,
+    load_person_matcher_for_active_embedder, person_library_is_non_empty, prepare_sample_from_pcm,
+    prepare_sample_from_wav_file,
 };
 pub use space::{
     EmbeddingSpace, LEGACY_UNVERIFIABLE_V1_MARKER, MATCHER_POLICY_VERSION,

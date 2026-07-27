@@ -16,8 +16,9 @@ mod tests;
 pub use pack::{
     DIARIZATION_EMBEDDER_LOAD_FAILED_REASON, REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON,
     SPEAKER_EMBEDDER_PACK_ID, SPEAKER_EMBEDDER_PACK_LABEL, SpeakerEmbedderIdentity,
-    VOICE_ID_EMBEDDER_PACK_MISSING_REASON, VOICE_MATCH_EMBEDDER_PACK_MISSING_REASON,
-    embedder_pack_installed, shared_embedder, shared_embedder_identity,
+    VOICE_ID_EMBEDDER_PACK_MISSING_REASON, VOICE_ID_NAMING_EMBEDDER_MISSING_REASON,
+    VOICE_MATCH_EMBEDDER_PACK_MISSING_REASON, embedder_pack_installed, shared_embedder,
+    shared_embedder_identity,
 };
 
 use thiserror::Error;

@@ -36,6 +36,15 @@ pub const DIARIZATION_EMBEDDER_LOAD_FAILED_REASON: &str = "Diarization was reque
 /// Fail-closed reason when realtime diarize is requested without the pack.
 pub const REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON: &str = "Realtime diarization needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn); install it or omit diarize=true.";
 
+/// Fail-closed reason when the source-independent identity stage
+/// (`diarize::voice_id::name_speakers_across_scopes`) cannot relate speaker
+/// labels to known people because the embedder is unavailable, and skipping
+/// silently would hide a real degrade: an enrolled person going unmatched, or
+/// two in-decoder scopes staying artificially separate. See that function's
+/// doc comment for exactly when this fires versus when the same absence is a
+/// legitimate no-op.
+pub const VOICE_ID_NAMING_EMBEDDER_MISSING_REASON: &str = "Voice ID needs the ReDimNet2-B6 speaker-embedder pack (redimnet2-b6-cn) to identify speakers, but it is missing or could not be loaded. Reinstall the pack, or turn off Voice ID.";
+
 /// Human-readable label for ReDimNet2-B6's embedding space (documentation /
 /// audit metadata only). The actual runtime compatibility gate is the pack's
 /// content fingerprint (`SpeakerEmbedderIdentity::pack_fingerprint`, a sha256
@@ -144,6 +153,7 @@ mod tests {
             VOICE_MATCH_EMBEDDER_PACK_MISSING_REASON,
             DIARIZATION_EMBEDDER_LOAD_FAILED_REASON,
             REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON,
+            VOICE_ID_NAMING_EMBEDDER_MISSING_REASON,
             SPEAKER_EMBEDDER_PACK_LABEL,
         ] {
             assert!(
