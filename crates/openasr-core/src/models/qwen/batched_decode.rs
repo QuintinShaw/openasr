@@ -24,7 +24,8 @@ use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, apply_seq2seq_text_postprocess,
 };
 use crate::models::seq2seq_greedy_decode::{
-    Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, build_seq2seq_greedy_stop_token_ids,
+    Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStopReason,
+    build_seq2seq_greedy_stop_token_ids,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
@@ -210,7 +211,10 @@ struct Qwen3AsrBatchSlot {
     generated_probabilities: Vec<f32>,
     cache_prompt_tokens: usize,
     prefill_logits: Option<Vec<f32>>,
-    done: bool,
+    /// How this slot's decode ended, `None` while it is still running.
+    /// Mirrors the single-utterance driver so a guard-truncated slot is
+    /// distinguishable from one that reached its stop token.
+    stop_reason: Option<Seq2SeqGreedyDecodeStopReason>,
 }
 
 impl Qwen3AsrServeBatchConfig {
@@ -513,7 +517,7 @@ impl Qwen3AsrOwnerThreadState {
         for slot_index in 0..slots.len() {
             if slots[slot_index]
                 .as_ref()
-                .map(|active| active.slot.done)
+                .map(|active| active.slot.is_done())
                 .unwrap_or(false)
             {
                 Self::finish_slot(&mut slots, slot_index, decoder, max_positions, false);
@@ -765,7 +769,7 @@ impl Qwen3AsrOwnerThreadState {
                     Ok(()) => {
                         if slots[slot_index]
                             .as_ref()
-                            .map(|active| active.slot.done)
+                            .map(|active| active.slot.is_done())
                             .unwrap_or(false)
                         {
                             Self::finish_slot(
@@ -1102,7 +1106,7 @@ impl Qwen3AsrOwnerThreadState {
                 }));
                 continue;
             }
-            if slot.done {
+            if slot.is_done() {
                 let _ = reply.send(slot.finish());
                 continue;
             }
@@ -1214,7 +1218,7 @@ impl Qwen3AsrOwnerThreadState {
                 }));
                 continue;
             }
-            if slot.done {
+            if slot.is_done() {
                 let _ = reply.send(slot.finish());
                 continue;
             }
@@ -1525,7 +1529,7 @@ impl Qwen3AsrBatchSlot {
             generated_probabilities: Vec::new(),
             cache_prompt_tokens: 0,
             prefill_logits: None,
-            done: false,
+            stop_reason: None,
         })
     }
 
@@ -2034,6 +2038,13 @@ impl Qwen3AsrBatchSlot {
             })
     }
 
+    /// Whether this slot's decode has ended, for any reason. Callers that
+    /// need to know WHY (a guard cut vs a real stop token) read
+    /// `stop_reason` directly.
+    fn is_done(&self) -> bool {
+        self.stop_reason.is_some()
+    }
+
     fn select_next_token_from_logits(
         &mut self,
         logits: Vec<f32>,
@@ -2042,7 +2053,7 @@ impl Qwen3AsrBatchSlot {
             &self.job.decode_config,
             &mut self.generated_tokens,
             &mut self.generated_probabilities,
-            &mut self.done,
+            &mut self.stop_reason,
             self.stop_token_ids.as_slice(),
             logits,
         )
@@ -2052,6 +2063,12 @@ impl Qwen3AsrBatchSlot {
     }
 
     fn finish(self) -> Result<GgmlAsrExecutionResult, Qwen3AsrServeBatchError> {
+        // A slot that never ran a step (admitted then drained) has no stop
+        // reason; treat that as a normal completion rather than inventing a
+        // truncation the decode never reported.
+        let slot_stop_reason = self
+            .stop_reason
+            .unwrap_or(Seq2SeqGreedyDecodeStopReason::StopToken);
         let raw_text = self.decode_text_token_ids(&self.generated_tokens)?;
         let text = apply_seq2seq_text_postprocess(self.job.text_postprocess_kind, &raw_text)
             .trim()
@@ -2087,13 +2104,16 @@ impl Qwen3AsrBatchSlot {
         };
         Ok(GgmlAsrExecutionResult {
             transcription: Transcription {
+                truncated_decodes: Vec::new(),
                 text,
                 segments,
                 longform: None,
                 language: None,
             },
             carry_context: None,
-            decode_truncated_at_seconds: None,
+            // Same reasoning as the single-utterance executor: no
+            // intra-decode timestamps, so no honest second to anchor to.
+            decode_truncation: slot_stop_reason.into_decode_truncation(None),
         })
     }
 

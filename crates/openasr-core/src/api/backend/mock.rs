@@ -28,6 +28,7 @@ impl TranscriptionBackend for MockBackend {
         );
 
         Ok(Transcription {
+            truncated_decodes: Vec::new(),
             text: text.clone(),
             segments: vec![Segment {
                 start: 0.0,

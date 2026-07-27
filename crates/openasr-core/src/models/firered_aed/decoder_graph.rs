@@ -798,6 +798,9 @@ fn position_ids_i32_with_offset(
 pub(crate) struct FireRedAedGreedyDecodeOutput {
     pub text: String,
     pub generated_tokens: Vec<u32>,
+    /// How the shared driver ended this decode, carried to the executor so a
+    /// cut-short transcript is not returned as a complete one.
+    pub stop_reason: Seq2SeqGreedyDecodeStopReason,
 }
 
 /// Run the full attention-based greedy decode for one utterance against an
@@ -885,5 +888,6 @@ pub(crate) fn run_firered_aed_decoder_greedy_with_runtime(
     Ok(FireRedAedGreedyDecodeOutput {
         text: decode.text,
         generated_tokens: decode.generated_tokens,
+        stop_reason: decode.stop_reason,
     })
 }

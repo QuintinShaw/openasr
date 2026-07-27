@@ -421,6 +421,7 @@ impl MimoAsrGgmlExecutor {
 
         let text = strip_mimo_language_tags(&result.text);
         let transcription = Transcription {
+            truncated_decodes: Vec::new(),
             segments: vec![Segment {
                 start: 0.0,
                 end: audio_duration_seconds.max(0.0),
@@ -438,7 +439,10 @@ impl MimoAsrGgmlExecutor {
         Ok(GgmlAsrExecutionResult {
             transcription,
             carry_context: None,
-            decode_truncated_at_seconds: None,
+            // No intra-decode timestamps -- the single segment spans the whole
+            // buffer -- so the cut point has no honest second to name. See
+            // `DecodeTruncation::transcript_covers_up_to_seconds`.
+            decode_truncation: result.stop_reason.into_decode_truncation(None),
         })
     }
 }

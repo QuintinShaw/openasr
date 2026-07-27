@@ -678,12 +678,13 @@ fn encode_moss_td_chunks_with_cached_runtime(
     )
 }
 
-/// One decode's text plus whether the driver stopped it short of the audio.
-/// The flag is what keeps `speaker_segments` from closing a cut-short decode's
-/// final segment at the end of the clip (see [`MossTdDecodeExtent`]).
+/// One decode's text plus how the shared driver ended it. The stop reason is
+/// what keeps `speaker_segments` from closing a cut-short decode's final
+/// segment at the end of the clip (see [`MossTdDecodeExtent`]) and what the
+/// executor lifts into the transcript's truncation signal.
 struct MossTdDecodeOutput {
     text: String,
-    truncated: bool,
+    stop_reason: Seq2SeqGreedyDecodeStopReason,
 }
 
 /// Runs the ChatML+audio-splice prompt embedding through the cached, resident
@@ -841,7 +842,7 @@ fn run_moss_td_decoder_with_cached_runtime(
             };
             Ok(MossTdDecodeOutput {
                 text: result.text.trim().to_string(),
-                truncated: result.stop_reason.is_truncated(),
+                stop_reason: result.stop_reason,
             })
         },
     )
@@ -1017,12 +1018,18 @@ impl MossTdGgmlExecutor {
             &decoded.text,
             MossTdDecodeExtent {
                 audio_duration_seconds,
-                truncated: decoded.truncated,
+                truncated: decoded.stop_reason.is_truncated(),
             },
             request.request_options.in_decoder_speakers,
         );
-        let decode_truncated_at_seconds = normalized.truncated_at_seconds;
+        // moss-td is the one family with decoder-emitted timestamps, so it can
+        // name the point the transcript stops describing the audio instead of
+        // only reporting that it does.
+        let decode_truncation = decoded
+            .stop_reason
+            .into_decode_truncation(normalized.truncated_at_seconds);
         let transcription = Transcription {
+            truncated_decodes: Vec::new(),
             segments: normalized.segments,
             text: normalized.text,
             longform: None,
@@ -1031,7 +1038,7 @@ impl MossTdGgmlExecutor {
         Ok(GgmlAsrExecutionResult {
             transcription,
             carry_context: None,
-            decode_truncated_at_seconds,
+            decode_truncation,
         })
     }
 }

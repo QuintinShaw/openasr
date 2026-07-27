@@ -1,8 +1,12 @@
 use super::*;
-use crate::api::backend::{Segment, Transcription, TranscriptionLongFormMetadata, WordTimestamp};
+use crate::api::backend::{
+    DecodeTruncation, DecodeTruncationReason, Segment, Transcription,
+    TranscriptionLongFormMetadata, TruncatedDecode, WordTimestamp,
+};
 
 fn sample() -> Transcription {
     Transcription {
+        truncated_decodes: Vec::new(),
         text: "hello world".to_string(),
         segments: vec![Segment {
             start: 0.0,
@@ -21,6 +25,7 @@ fn sample() -> Transcription {
 
 fn speaker_sample() -> Transcription {
     Transcription {
+        truncated_decodes: Vec::new(),
         text: "hello world\nnext line".to_string(),
         segments: vec![
             Segment {
@@ -51,6 +56,7 @@ fn speaker_sample() -> Transcription {
 
 fn matched_profile_sample() -> Transcription {
     Transcription {
+        truncated_decodes: Vec::new(),
         text: "hello world\nnext line".to_string(),
         segments: vec![
             Segment {
@@ -81,6 +87,7 @@ fn matched_profile_sample() -> Transcription {
 
 fn word_sample() -> Transcription {
     Transcription {
+        truncated_decodes: Vec::new(),
         text: "hello world".to_string(),
         segments: vec![Segment {
             start: 0.0,
@@ -200,6 +207,7 @@ fn renders_json_with_word_timestamps_when_present() {
 #[test]
 fn renders_verbose_json_with_longform_metadata() {
     let transcription = Transcription {
+        truncated_decodes: Vec::new(),
         text: "hello world".to_string(),
         segments: vec![Segment {
             start: 0.0,
@@ -288,6 +296,7 @@ fn renders_markdown_coalesces_consecutive_same_speaker_cues() {
     // Markdown groups consecutive same-speaker cues into one paragraph while a
     // speaker change still starts a new one.
     let transcription = Transcription {
+        truncated_decodes: Vec::new(),
         text: "one two three four".to_string(),
         segments: vec![
             Segment {
@@ -328,4 +337,73 @@ fn renders_markdown_coalesces_consecutive_same_speaker_cues() {
         render_transcription(&transcription, ResponseFormat::Markdown).unwrap(),
         "# Transcript\n\nSPEAKER_00: one two three\n\nSPEAKER_01: four\n"
     );
+}
+
+/// The json and verbose_json renderers must both surface a truncated decode.
+///
+/// This is the last hop of the truncation signal: everything upstream can be
+/// correct and the user still gets a silently short transcript if the
+/// serializer drops the field. Asserted on the plain `json` format too, not
+/// only `verbose_json` -- "this is not all of your audio" is not an opt-in
+/// diagnostic.
+#[test]
+fn json_formats_report_a_truncated_decode() {
+    let mut transcription = sample();
+    transcription.truncated_decodes = vec![
+        TruncatedDecode {
+            slice_index: Some(3),
+            truncation: DecodeTruncation {
+                reason: DecodeTruncationReason::DegenerateRepeatGuard,
+                transcript_covers_up_to_seconds: Some(12.5),
+            },
+        },
+        TruncatedDecode {
+            slice_index: None,
+            truncation: DecodeTruncation {
+                reason: DecodeTruncationReason::BudgetExhausted,
+                transcript_covers_up_to_seconds: None,
+            },
+        },
+    ];
+
+    for format in [ResponseFormat::Json, ResponseFormat::VerboseJson] {
+        let rendered = render_transcription(&transcription, format).expect("render");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid json");
+        let truncated = parsed
+            .get("truncated")
+            .and_then(|value| value.as_array())
+            .unwrap_or_else(|| panic!("{format} must carry a truncated array"));
+        assert_eq!(truncated.len(), 2, "{format}");
+        assert_eq!(truncated[0]["slice"], 3, "{format}");
+        assert_eq!(
+            truncated[0]["reason"], "degenerate-repeat-guard",
+            "{format}"
+        );
+        assert_eq!(truncated[0]["covers_up_to_seconds"], 12.5, "{format}");
+        // A single-pass decode has no slice, and a family without intra-decode
+        // timestamps has no anchor: both are omitted rather than filled with a
+        // placeholder a consumer would read as real.
+        assert!(truncated[1].get("slice").is_none(), "{format}");
+        assert_eq!(truncated[1]["reason"], "budget-exhausted", "{format}");
+        assert!(
+            truncated[1].get("covers_up_to_seconds").is_none(),
+            "{format}"
+        );
+    }
+}
+
+/// A transcript that ended on its own stop token must serialize byte-identically
+/// to before this field existed: the healthy path stays untouched, so no
+/// existing consumer sees a new key until something actually went wrong.
+#[test]
+fn json_formats_omit_truncation_on_a_complete_transcript() {
+    let transcription = sample();
+    assert!(!transcription.is_truncated());
+    for format in [ResponseFormat::Json, ResponseFormat::VerboseJson] {
+        let rendered = render_transcription(&transcription, format).expect("render");
+        assert!(
+            !rendered.contains("truncated"),
+            "{format} must not mention truncation on a complete transcript: {rendered}"
+        );
+    }
 }

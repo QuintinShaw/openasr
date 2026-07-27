@@ -2,6 +2,7 @@ use std::cell::RefCell;
 
 use thiserror::Error;
 
+use crate::api::backend::{DecodeTruncation, DecodeTruncationReason};
 use crate::models::phrase_bias_decode::{TokenPhraseBias, apply_phrase_bias_to_logits};
 
 thread_local! {
@@ -180,6 +181,32 @@ impl Seq2SeqGreedyDecodeStopReason {
     /// Whether the transcript stops short of the audio it was given.
     pub fn is_truncated(self) -> bool {
         !matches!(self, Self::StopToken)
+    }
+
+    /// Lift this stop reason into the API-boundary truncation signal that
+    /// [`crate::api::backend::Transcription`] carries, or `None` when the
+    /// decode ended on its own terms.
+    ///
+    /// Every family funnels through this one mapping so no family re-derives
+    /// "does this reason mean the caller lost audio" -- getting that wrong in
+    /// one family is what produced a silently short transcript with a success
+    /// status. `transcript_covers_up_to_seconds` is the family's own time
+    /// anchor: pass `None` unless the family emits real intra-decode
+    /// timestamps (see the field's doc for why a whole-buffer span is not an
+    /// acceptable substitute).
+    pub(crate) fn into_decode_truncation(
+        self,
+        transcript_covers_up_to_seconds: Option<f32>,
+    ) -> Option<DecodeTruncation> {
+        let reason = match self {
+            Self::StopToken => return None,
+            Self::DegenerateRepeatGuard => DecodeTruncationReason::DegenerateRepeatGuard,
+            Self::BudgetExhausted => DecodeTruncationReason::BudgetExhausted,
+        };
+        Some(DecodeTruncation {
+            reason,
+            transcript_covers_up_to_seconds,
+        })
     }
 }
 

@@ -25,7 +25,7 @@ use crate::models::decode_policy_component_registry::{
 use crate::models::decode_token_history::context_window_budget;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
-    Seq2SeqGreedyDecodeStepLogitsOutput,
+    Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::nn::decoder::{
@@ -70,6 +70,9 @@ pub(crate) struct CohereCrossAttentionCache {
 pub(crate) struct CohereDecoderGraphDecodeOutput {
     pub transcription: Transcription,
     pub generated_tokens: Vec<u32>,
+    /// How the shared driver ended this decode, carried through to the
+    /// executor so a cut-short transcript is not returned as a complete one.
+    pub stop_reason: Seq2SeqGreedyDecodeStopReason,
 }
 
 #[derive(Debug, Error)]
@@ -206,6 +209,8 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
             })?,
             generated_tokens,
             generated_probabilities,
+            // Salvaging the prefix is not the same as completing the decode.
+            stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
         },
         Err(error) => {
             return Err(CohereDecoderGraphError::InvalidInput {
@@ -238,6 +243,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
                 .collect::<Vec<_>>()
                 .join(" ");
             Transcription {
+                truncated_decodes: Vec::new(),
                 text,
                 segments,
                 longform: None,
@@ -257,6 +263,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
     Ok(CohereDecoderGraphDecodeOutput {
         transcription,
         generated_tokens: decode.generated_tokens,
+        stop_reason: decode.stop_reason,
     })
 }
 
@@ -307,6 +314,7 @@ fn cohere_plain_transcription_from_generated_tokens(
         }]
     };
     Ok(Transcription {
+        truncated_decodes: Vec::new(),
         text,
         segments,
         longform: None,
