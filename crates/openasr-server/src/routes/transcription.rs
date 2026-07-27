@@ -475,34 +475,121 @@ async fn run_offline_transcription(
     Ok((response_headers, rendered).into_response())
 }
 
+/// Cap on how many truncated-decode entries the `x-openasr-truncated` header
+/// spells out. A ~6KB header per entry on a long, degraded transcript can
+/// produce ~180 entries and blow past common reverse-proxy header-size
+/// defaults (e.g. nginx's `proxy_buffer_size`); the full list is always
+/// available in the JSON body, so the header only needs to say "here's a
+/// sample, and how many more there are."
+const TRUNCATED_HEADER_ENTRY_LIMIT: usize = 8;
+
 /// Summarize a transcript's truncated decodes for the `x-openasr-truncated`
 /// response header as `<slice>:<reason>[@<seconds>s]` entries joined by `;`,
 /// where `<slice>` is the 1-based long-form slice index or `single-pass`.
 /// `None` when the transcript covers its audio, so the header is absent on a
 /// healthy response.
+///
+/// Bounded to [`TRUNCATED_HEADER_ENTRY_LIMIT`] entries; beyond that, a
+/// trailing `+<n> more` entry replaces the rest so the header stays a fixed,
+/// small size regardless of how many slices degraded. The full, unbounded
+/// list is always in the JSON body.
 fn truncated_decodes_header_value(transcription: &openasr_core::Transcription) -> Option<String> {
     if transcription.truncated_decodes.is_empty() {
         return None;
     }
-    Some(
-        transcription
-            .truncated_decodes
-            .iter()
-            .map(|truncated| {
-                let slice = match truncated.slice_index {
-                    Some(index) => index.to_string(),
-                    None => "single-pass".to_string(),
-                };
-                let anchor = truncated
-                    .truncation
-                    .transcript_covers_up_to_seconds
-                    .map(|seconds| format!("@{seconds:.2}s"))
-                    .unwrap_or_default();
-                format!("{slice}:{}{anchor}", truncated.truncation.reason.as_str())
-            })
-            .collect::<Vec<_>>()
-            .join(";"),
-    )
+    let total = transcription.truncated_decodes.len();
+    let mut entries: Vec<String> = transcription
+        .truncated_decodes
+        .iter()
+        .take(TRUNCATED_HEADER_ENTRY_LIMIT)
+        .map(|truncated| {
+            let slice = match truncated.slice_index {
+                Some(index) => index.to_string(),
+                None => "single-pass".to_string(),
+            };
+            let anchor = truncated
+                .truncation
+                .transcript_covers_up_to_seconds
+                .map(|seconds| format!("@{seconds:.2}s"))
+                .unwrap_or_default();
+            format!("{slice}:{}{anchor}", truncated.truncation.reason.as_str())
+        })
+        .collect();
+    let remaining = total.saturating_sub(TRUNCATED_HEADER_ENTRY_LIMIT);
+    if remaining > 0 {
+        entries.push(format!("+{remaining} more"));
+    }
+    Some(entries.join(";"))
+}
+
+#[cfg(test)]
+mod truncated_header_tests {
+    use openasr_core::{DecodeTruncation, DecodeTruncationReason, Transcription, TruncatedDecode};
+
+    use super::{TRUNCATED_HEADER_ENTRY_LIMIT, truncated_decodes_header_value};
+
+    fn transcription_with_truncations(count: usize) -> Transcription {
+        Transcription {
+            text: String::new(),
+            segments: Vec::new(),
+            longform: None,
+            language: None,
+            truncated_decodes: (0..count)
+                .map(|index| TruncatedDecode {
+                    slice_index: Some(index + 1),
+                    truncation: DecodeTruncation {
+                        reason: DecodeTruncationReason::BudgetExhausted,
+                        transcript_covers_up_to_seconds: Some(index as f32),
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn no_truncations_omits_the_header() {
+        assert_eq!(
+            truncated_decodes_header_value(&transcription_with_truncations(0)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_handful_of_truncations_lists_every_one() {
+        let transcription = transcription_with_truncations(3);
+        let value = truncated_decodes_header_value(&transcription).unwrap();
+        assert_eq!(value.split(';').count(), 3);
+        assert!(!value.contains("more"));
+    }
+
+    /// A long, degraded transcript can produce on the order of 180 truncated
+    /// slices (~6KB spelled out in full), which is well past a typical
+    /// reverse-proxy header-size default. The header must stay bounded: a
+    /// fixed prefix plus a machine-parseable "how many more" suffix, with the
+    /// complete list left to the JSON body.
+    #[test]
+    fn many_truncations_bound_the_header_to_a_fixed_prefix() {
+        let total = 181;
+        let transcription = transcription_with_truncations(total);
+        let value = truncated_decodes_header_value(&transcription).unwrap();
+
+        assert!(
+            value.len() < 512,
+            "header must stay bounded regardless of slice count, got {} bytes: {value}",
+            value.len()
+        );
+
+        let entries: Vec<&str> = value.split(';').collect();
+        assert_eq!(entries.len(), TRUNCATED_HEADER_ENTRY_LIMIT + 1);
+
+        for entry in &entries[..TRUNCATED_HEADER_ENTRY_LIMIT] {
+            assert!(!entry.contains("more"), "{entry}");
+        }
+
+        let overflow_marker = entries[TRUNCATED_HEADER_ENTRY_LIMIT];
+        let expected_remaining = total - TRUNCATED_HEADER_ENTRY_LIMIT;
+        assert_eq!(overflow_marker, format!("+{expected_remaining} more"));
+    }
 }
 
 // ── History / auth helpers ────────────────────────────────────────────────────
