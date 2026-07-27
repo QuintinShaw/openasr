@@ -47,10 +47,11 @@ pub const VOICE_ID_NAMING_EMBEDDER_MISSING_REASON: &str = "Voice ID needs the Re
 
 /// Human-readable label for ReDimNet2-B6's embedding space (documentation /
 /// audit metadata only). The actual runtime compatibility gate is the pack's
-/// content fingerprint (`SpeakerEmbedderIdentity::pack_fingerprint`, a sha256
-/// of the `.oasr` file) plus `embedding_dim`, not this string -- a re-export
-/// or repack of the same checkpoint keeps the same fingerprint and stays
-/// compatible even if this label changes.
+/// content fingerprint (`SpeakerEmbedderIdentity::pack_fingerprint`, the
+/// sha256 of the `.oasr` file -- for an installed pack, its content-addressed
+/// object digest, which is the same value) plus `embedding_dim`, not this
+/// string -- a re-export or repack of the same checkpoint keeps the same
+/// fingerprint and stays compatible even if this label changes.
 pub(crate) const REDIMNET_EMBEDDING_SPACE_VERSION: &str = "redimnet2-b6-cn-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,11 +114,28 @@ fn load_embedder_state(path: &Path) -> Option<SharedEmbedderState> {
     Some(SharedEmbedderState { embedder, identity })
 }
 
+/// Content fingerprint of the embedder pack: `sha256:<hex>`.
+///
+/// An installed pack is a sealed content-addressed object, so its fingerprint
+/// is read straight from the object path without re-reading the weights --
+/// the same trust the model load path takes (see `content_store`'s integrity
+/// chain: hashed once at admission, sealed read-only since, `model-pack
+/// verify` re-proves on demand). The value is identical to what hashing the
+/// bytes returns, so enrollments fingerprinted either way interoperate.
+/// Anything the seal gate declines -- an env-override pack, an unsealed
+/// object -- is hashed the slow way: those are arbitrary user paths with no
+/// digest to trust.
 fn pack_fingerprint(path: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
 
     let mut file = std::fs::File::open(path).ok()?;
+    if let Some(digest) = crate::content_store::trusted_object_digest(
+        path,
+        file.metadata().ok()?.permissions().readonly(),
+    ) {
+        return Some(format!("sha256:{digest}"));
+    }
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {

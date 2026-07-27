@@ -429,6 +429,46 @@ fn verify_passes_on_an_intact_store_and_names_a_corrupt_object() {
     assert_eq!(verification.failures().count(), 1);
 }
 
+/// Verify is how a store that lost its seals earns the fast path back: an
+/// intact object whose permission bits a backup restore stripped must be
+/// re-sealed once it passes, while an object that fails verification is
+/// left exactly as found -- never sealed on top of corrupt bytes.
+#[test]
+fn verify_reseals_intact_objects_but_not_failed_ones() {
+    let home = TempDir::new().unwrap();
+    let bytes = b"reseal-me-pack-bytes";
+    let digest = write_object(home.path(), bytes);
+    write_ref(
+        home.path(),
+        "xasr-zh-en",
+        "q8_0",
+        &digest,
+        bytes.len() as u64,
+    );
+
+    // Bytes intact, seal lost.
+    let object = object_content_path(home.path(), &digest);
+    set_writable(&object);
+    assert!(!fs::metadata(&object).unwrap().permissions().readonly());
+
+    assert!(verify_model_store(home.path()).unwrap().is_ok());
+    assert!(
+        fs::metadata(&object).unwrap().permissions().readonly(),
+        "an object that passes verification must come back sealed"
+    );
+
+    // Corrupt it and verify again: the failure must be reported and the
+    // object must not be re-sealed.
+    set_writable(&object);
+    fs::write(&object, b"reseal-me-pack-byteX").unwrap();
+    let verification = verify_model_store(home.path()).unwrap();
+    assert_eq!(verification.failures().count(), 1);
+    assert!(
+        !fs::metadata(&object).unwrap().permissions().readonly(),
+        "a failed object must not be sealed on top of corrupt bytes"
+    );
+}
+
 #[test]
 fn verify_reports_a_ref_whose_object_is_missing() {
     let home = TempDir::new().unwrap();

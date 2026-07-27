@@ -80,12 +80,20 @@ pub fn is_cacheable_pack_content_id(pack_content_id: &str) -> bool {
 ///
 /// Shares [`resolve_content_id`]'s memo with `GgmlRuntimeSource::content_id`,
 /// so hashing a path once through either entry point warms the other's
-/// lookup too.
+/// lookup too. A sealed content-addressed object never hashes through either:
+/// like `GgmlRuntimeSource::content_id`, this answers such a path from the
+/// digest it names (see `content_store::trusted_object_digest`), so
+/// re-installing an object that already exists costs no read of its bytes.
 pub(crate) fn pack_content_id_for_path_before_replace(path: &Path) -> String {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let Ok(metadata) = std::fs::metadata(&canonical) else {
         return unreadable_content_id(&canonical);
     };
+    if let Some(digest) =
+        crate::content_store::trusted_object_digest(&canonical, metadata.permissions().readonly())
+    {
+        return content_id_from_sha256_hex(digest);
+    }
     let Some(identity) = StrongFileIdentity::of(&metadata) else {
         return unreadable_content_id(&canonical);
     };
@@ -143,9 +151,10 @@ impl PackContentKey {
 }
 
 /// Opens and hashes `path` directly (no mmap, no identity memo) -- the
-/// unavoidable cold-path I/O behind [`pack_content_id_for_path_before_replace`].
-/// `GgmlRuntimeSource::content_id` never calls this: it hashes the mapping it
-/// already holds open instead.
+/// cold-path I/O behind [`pack_content_id_for_path_before_replace`] for bytes
+/// the seal gate declines (sealed objects answer from their path digest and
+/// never get here). `GgmlRuntimeSource::content_id` never calls this: it
+/// hashes the mapping it already holds open instead.
 fn sha256_hex_file(path: &Path) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -282,5 +291,60 @@ mod tests {
         assert!(!is_cacheable_pack_content_id("unreadable:/tmp/x:0"));
         assert!(!is_cacheable_pack_content_id("/tmp/x.oasr"));
         assert!(!is_cacheable_pack_content_id(""));
+    }
+
+    fn set_mode(path: &Path, read_only: bool) {
+        let mut permissions = std::fs::metadata(path).expect("stat fixture").permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(if read_only { 0o444 } else { 0o644 });
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(read_only);
+        std::fs::set_permissions(path, permissions).expect("set fixture mode");
+    }
+
+    /// The pre-replace snapshot shares the seal-gated trust of
+    /// `GgmlRuntimeSource::content_id`: a sealed object answers from the
+    /// digest in its path without a read -- pinned here with bytes that do
+    /// not hash to that digest, so only a trust (never a hash) can return it.
+    #[test]
+    fn path_before_replace_trusts_a_sealed_object_without_hashing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let named_digest = "ef".repeat(32);
+        let bytes = b"pre-replace-snapshot-trust-fixture";
+        let object = dir
+            .path()
+            .join("models")
+            .join("objects")
+            .join("sha256")
+            .join(&named_digest)
+            .join("content");
+        std::fs::create_dir_all(object.parent().expect("object path has parent"))
+            .expect("create digest dir");
+        std::fs::write(&object, bytes).expect("write fixture");
+        set_mode(&object, true);
+        assert_ne!(
+            sha256_hex_file(&object).expect("hash fixture"),
+            named_digest,
+            "the fixture must not accidentally hash to the named digest"
+        );
+
+        assert_eq!(
+            pack_content_id_for_path_before_replace(&object),
+            format!("sha256:{named_digest}")
+        );
+
+        // The same object unsealed goes back through a full hash.
+        set_mode(&object, false);
+        assert_eq!(
+            pack_content_id_for_path_before_replace(&object),
+            format!("sha256:{}", sha256_hex_file(&object).expect("hash fixture"))
+        );
+        assert_ne!(
+            pack_content_id_for_path_before_replace(&object),
+            format!("sha256:{named_digest}")
+        );
     }
 }

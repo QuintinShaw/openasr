@@ -62,11 +62,16 @@ impl StrongFileIdentity {
 }
 
 /// Process-wide memo: canonical path -> (strong identity at last hash,
-/// `sha256:<hex>` digest). Shared by every strong-identity content id
-/// resolver in the crate -- a `GgmlRuntimeSource`'s fd-derived identity and
+/// `sha256:<hex>` digest). Shared by every *hashing* content id resolver in
+/// the crate -- a `GgmlRuntimeSource`'s fd-derived identity and
 /// `models::runtime_cache_coordinator`'s narrow path-based pre-replace
 /// snapshot both go through [`resolve_content_id`] -- so hashing a path once
 /// through either warms the other's lookup too.
+///
+/// Sealed content-addressed objects never arrive here: both entry points
+/// answer those from the digest in the path via
+/// `content_store::trusted_object_digest` before any hashing is considered.
+/// This memo is the slow path for everything the seal gate declines.
 fn content_id_memo() -> &'static Mutex<HashMap<PathBuf, (StrongFileIdentity, String)>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, (StrongFileIdentity, String)>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -130,14 +135,35 @@ pub(crate) fn unreadable_content_id(path: &Path) -> String {
 /// caller hashes for identity are the exact same bytes later read for
 /// weights -- there is no second open to race against.
 ///
-/// `content_id` is deliberately **not** computed at validation time: this
-/// constructor sits on the per-request admission path (see
-/// `validate_local_native_runtime_source`), and hashing a multi-GB pack on
-/// every request is the exact per-request full-file-sha256 cost the runtime
-/// cache coordinator's warm path is designed to avoid. Only a caller that
-/// actually calls [`GgmlRuntimeSource::content_id`] pays the one-time hash;
-/// callers that only need [`GgmlRuntimeSource::path`] / [`GgmlRuntimeSource::package_probe`]
-/// (the common case) never do.
+/// # Content identity: hot/cold split
+///
+/// [`GgmlRuntimeSource::content_id`] resolves in two tiers:
+///
+/// * **Trusted (no hashing).** When the source's path has the content store's
+///   object layout (`.../objects/sha256/<digest>/content`) and the file was
+///   read-only at open time, the digest is taken straight from the path via
+///   `content_store::trusted_object_digest`. That trust is not a shortcut
+///   around integrity -- it rests on `content_store`'s integrity chain: the
+///   digest was established once over the bytes actually written (and checked
+///   against the signed catalog above the store), the object has been sealed
+///   read-only since, and `openasr model-pack verify` can re-prove the claim
+///   on demand. Re-hashing a multi-gigabyte pack on every process start to
+///   re-derive what admission already established is the exact per-request
+///   full-file-sha256 cost this split exists to remove.
+/// * **Hashed (lazy, memoized).** Any other path -- a user-supplied pack, an
+///   unsealed object, a dev fixture -- hashes the mapping this source already
+///   holds open, once, and memoizes the result by [`StrongFileIdentity`]
+///   through [`resolve_content_id`]. A seal lost to a permissions-stripping
+///   backup restore therefore degrades gracefully: hashing slow path until
+///   `verify` re-seals, never a wrong id.
+///
+/// The id is deliberately **not** computed at validation time on the hashed
+/// tier: this constructor sits on the per-request admission path (see
+/// `validate_local_native_runtime_source`), and only a caller that actually
+/// calls [`GgmlRuntimeSource::content_id`] ever pays anything -- callers that
+/// only need [`GgmlRuntimeSource::path`] / [`GgmlRuntimeSource::package_probe`]
+/// (the common case) never do. The trusted tier costs a path-shape check and
+/// nothing else.
 ///
 /// `path()` is downgraded to an admission / diagnostics / GC / fixture-lookup
 /// helper: it must never be re-derived into a content identity by a caller
@@ -149,11 +175,18 @@ pub struct GgmlRuntimeSource {
     mmap: Arc<Mmap>,
     /// Captured from `file.metadata()` (an `fstat` on the fd this source
     /// opened) at validation time -- never from a later `stat` on `path`.
-    /// This is the identity [`GgmlRuntimeSource::content_id`] memoizes
-    /// against, so the digest it returns is provably a digest of exactly the
-    /// bytes in `mmap`, not of whatever happens to be at `path` right now.
+    /// This is the identity the hashed tier of
+    /// [`GgmlRuntimeSource::content_id`] memoizes against, so the digest it
+    /// returns is provably a digest of exactly the bytes in `mmap`, not of
+    /// whatever happens to be at `path` right now.
     stat_identity: StrongFileIdentity,
-    /// `sha256:<hex>` of the full mapped file. Computed once, lazily, from
+    /// The seal observed on the same fd at open time: the file was read-only.
+    /// Gates the trusted tier of [`GgmlRuntimeSource::content_id`] -- a
+    /// content-addressed object answers with the digest in its path only
+    /// while this holds; anything writable is hashed instead.
+    opened_read_only: bool,
+    /// `sha256:<hex>` content id of the full mapped file. Computed once,
+    /// lazily, either trusted from the object path (no I/O) or hashed from
     /// `mmap` -- never by re-opening `path`.
     content_id: OnceLock<String>,
 }
@@ -174,6 +207,7 @@ impl Clone for GgmlRuntimeSource {
             package_probe: self.package_probe.clone(),
             mmap: Arc::clone(&self.mmap),
             stat_identity: self.stat_identity,
+            opened_read_only: self.opened_read_only,
             content_id,
         }
     }
@@ -185,6 +219,7 @@ impl std::fmt::Debug for GgmlRuntimeSource {
             .field("path", &self.path)
             .field("package_probe", &self.package_probe)
             .field("content_id", &self.content_id.get())
+            .field("opened_read_only", &self.opened_read_only)
             .field("mmap_len", &self.mmap.len())
             .finish()
     }
@@ -213,17 +248,35 @@ impl GgmlRuntimeSource {
         &self.package_probe
     }
 
-    /// `sha256:<hex>` content id of the full mapped file. Computed on first
-    /// call from the mapping this source already holds open (never a fresh
-    /// `File::open` of `path`), then cached on this instance. This is the
+    /// `sha256:<hex>` content id of the full mapped file. This is the
     /// identity authority for this source -- prefer it over re-deriving an id
-    /// from [`GgmlRuntimeSource::path`].
+    /// from [`GgmlRuntimeSource::path`]. Computed once, lazily, then cached
+    /// on this instance; see the type-level "Content identity" docs for the
+    /// two tiers.
     ///
-    /// The warm path (memo hit against `stat_identity`) never touches `mmap`
-    /// at all; only a genuine cold miss hashes it, and that hash happens
-    /// exactly once per `StrongFileIdentity` per process, not once per call.
+    /// **Trusted tier (installed objects, no hashing):** a source opened
+    /// read-only at the content store's object layout answers with the digest
+    /// its own path names. Content addressing's premise is that the path *is*
+    /// the checksum, and for a sealed object that premise was proven once at
+    /// admission and pinned in place by the read-only seal ever since -- so
+    /// the digest is not being assumed here, it is being read off a verified,
+    /// immutable fact. This is the same trust `open_declared_lease` takes on
+    /// the load path; full re-verification remains `model-pack verify`'s job.
+    ///
+    /// **Hashed tier (everything else, at most once per process):** any
+    /// source the trusted gate declines -- a non-object path, or an object
+    /// whose seal was lost -- hashes the mapping this source already holds
+    /// open (never a fresh `File::open` of `path`), memoized by
+    /// `stat_identity`. A memo hit never touches `mmap` at all; a genuine
+    /// cold miss hashes exactly once per `StrongFileIdentity` per process,
+    /// not once per call.
     pub fn content_id(&self) -> &str {
         self.content_id.get_or_init(|| {
+            if let Some(digest) =
+                crate::content_store::trusted_object_digest(&self.path, self.opened_read_only)
+            {
+                return format!("sha256:{digest}");
+            }
             resolve_content_id(&self.path, self.stat_identity, || {
                 Some(format!("{:x}", Sha256::digest(&self.mmap[..])))
             })
@@ -346,6 +399,10 @@ pub fn validate_ggml_runtime_source_path(
             path: path.to_path_buf(),
         }
     })?;
+    // The content store's seal, observed on the same fd: content-addressed
+    // objects are admitted read-only, so this is what lets `content_id()`
+    // trust the digest in an object's path instead of re-hashing its bytes.
+    let opened_read_only = fd_metadata.permissions().readonly();
     let mmap =
         unsafe { Mmap::map(&file) }.map_err(|source| GgmlRuntimeSourcePathError::MapFile {
             path: path.to_path_buf(),
@@ -357,6 +414,7 @@ pub fn validate_ggml_runtime_source_path(
         package_probe,
         mmap: Arc::new(mmap),
         stat_identity,
+        opened_read_only,
         content_id: OnceLock::new(),
     })
 }
@@ -373,8 +431,13 @@ fn looks_like_remote_path(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, time::Instant};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::Instant,
+    };
 
+    use sha2::{Digest, Sha256};
     use tempfile::{NamedTempFile, tempdir};
 
     use super::{
@@ -717,5 +780,113 @@ mod tests {
             GgmlRuntimeSourcePathError::PathDoesNotExist { .. } => {}
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    fn write_object_at_layout(root: &Path, digest: &str, bytes: &[u8]) -> PathBuf {
+        let object = root
+            .join("models")
+            .join("objects")
+            .join("sha256")
+            .join(digest)
+            .join("content");
+        fs::create_dir_all(object.parent().expect("object path has parent"))
+            .expect("create digest dir");
+        write_magic_file(&object, bytes);
+        object
+    }
+
+    fn set_mode(path: &Path, read_only: bool) {
+        let mut permissions = fs::metadata(path).expect("stat fixture").permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(if read_only { 0o444 } else { 0o644 });
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(read_only);
+        fs::set_permissions(path, permissions).expect("set fixture mode");
+    }
+
+    /// The trusted tier, pinned by construction: an object whose bytes do
+    /// *not* hash to the digest its path names can only resolve to that path
+    /// digest if identity was taken from the path without hashing. This is
+    /// the runtime-cache analogue of content_store's
+    /// `declared_lease_does_not_rehash_the_object` -- it is what keeps a
+    /// gigabyte-scale re-read from creeping back into every model load.
+    #[test]
+    fn sealed_content_addressed_object_content_id_trusts_the_path_digest() {
+        let dir = tempdir().expect("tempdir");
+        // A digest that is structurally valid but cannot be the hash of the
+        // fixture bytes, so any hashing resolution would disagree with it.
+        let named_digest = "ab".repeat(32);
+        let bytes = b"GGUFtrusted-path-digest-fixture";
+        let object = write_object_at_layout(dir.path(), &named_digest, bytes);
+        set_mode(&object, true);
+        assert_ne!(
+            format!("{:x}", Sha256::digest(bytes)),
+            named_digest,
+            "the fixture must not accidentally hash to the named digest"
+        );
+
+        let source = validate_ggml_runtime_source_path(&object).expect("validate object");
+        assert_eq!(source.content_id(), format!("sha256:{named_digest}"));
+
+        set_mode(&object, false); // let the temp dir clean up on all platforms
+    }
+
+    /// The fail-closed half of the trusted tier: the same mismatched object,
+    /// unsealed, must go back through a full hash and resolve to the digest
+    /// of its actual bytes -- never the one its path claims.
+    #[test]
+    fn unsealed_content_addressed_object_content_id_falls_back_to_hashing() {
+        let dir = tempdir().expect("tempdir");
+        let named_digest = "cd".repeat(32);
+        let bytes = b"GGUFunsealed-fallback-fixture";
+        let object = write_object_at_layout(dir.path(), &named_digest, bytes);
+        set_mode(&object, false);
+
+        let source = validate_ggml_runtime_source_path(&object).expect("validate object");
+        assert_eq!(
+            source.content_id(),
+            format!("sha256:{:x}", Sha256::digest(bytes)),
+            "an unsealed object must be hashed, not trusted"
+        );
+        assert_ne!(source.content_id(), format!("sha256:{named_digest}"));
+    }
+
+    /// A genuinely admitted object (hashed and sealed by the content store
+    /// itself) resolves to exactly the store's own digest -- the identity
+    /// `pull`'s cache eviction derives from the installed ref without
+    /// hashing, so both sides of a model install must key the runtime caches
+    /// identically. Defeating the seal afterwards must flip the next open
+    /// back onto the hashing tier and expose the changed bytes.
+    #[test]
+    fn admitted_object_content_id_agrees_with_the_store_and_degrades_on_seal_loss() {
+        let dir = tempdir().expect("tempdir");
+        let source_file = dir.path().join("source.oasr");
+        write_magic_file(&source_file, b"GGUFadmitted-identity-fixture");
+        let models = dir.path().join("models");
+
+        let admitted = crate::content_store::admit_file(&source_file, &models, |_| Ok(()))
+            .expect("admit fixture");
+        let object = admitted.object_path.clone();
+        let digest = admitted.digest.clone();
+
+        let source = validate_ggml_runtime_source_path(&object).expect("validate object");
+        assert_eq!(source.content_id(), format!("sha256:{digest}"));
+
+        // Defeat the seal and rewrite the bytes in place: the next open is no
+        // longer sealed, so trust is withdrawn and the hash speaks.
+        set_mode(&object, false);
+        write_magic_file(&object, b"GGUFadmitted-identity-XXXXXXX");
+        let tampered = validate_ggml_runtime_source_path(&object).expect("validate tampered");
+        assert_eq!(
+            tampered.content_id(),
+            format!(
+                "sha256:{:x}",
+                Sha256::digest(b"GGUFadmitted-identity-XXXXXXX")
+            )
+        );
+        assert_ne!(tampered.content_id(), format!("sha256:{digest}"));
     }
 }

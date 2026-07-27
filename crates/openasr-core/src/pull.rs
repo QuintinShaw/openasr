@@ -2718,8 +2718,11 @@ fn verify_partial_and_install(
 
 /// Resolves the content id of whatever pack currently sits at `final_path`,
 /// if any -- called before it is overwritten by an install/replace. Returns
-/// `None` when there is nothing there yet (first install) or the existing
-/// file cannot be hashed (nothing meaningful to evict either way).
+/// `None` when there is nothing there yet (first install) or no identity can
+/// be resolved (nothing meaningful to evict either way). `final_path` is
+/// always a content-addressed object path, so a sealed existing object
+/// answers from the digest in its path and a re-install of an already
+/// installed pack pays no read of its bytes.
 fn existing_pack_content_id_for_eviction(final_path: &std::path::Path) -> Option<String> {
     if !final_path.exists() {
         return None;

@@ -242,6 +242,13 @@ impl ModelStoreVerification {
 /// are hashed once at admission and then only on demand, so this command is the
 /// thing that turns "the path is the checksum" back into a checked claim after
 /// hardware faults, restores from backup, or a bug that defeated the seal.
+///
+/// An object that passes is re-sealed read-only afterwards. That closes the
+/// loop with the seal-gated hot paths (declared leases and path-trusted
+/// content ids): a store whose seals were stripped -- a backup restore without
+/// permission bits, a stray chmod -- runs on the hashing slow path until this
+/// command both proves the bytes and restores the invariant they trust. A
+/// failed object is left exactly as found.
 pub fn verify_model_store(home: &Path) -> Result<ModelStoreVerification, PullError> {
     let root = models_root(home)?;
     let mut verification = ModelStoreVerification {
@@ -255,13 +262,26 @@ pub fn verify_model_store(home: &Path) -> Result<ModelStoreVerification, PullErr
         // the digest in its own path, which is exactly the invariant under test.
         // This is the one place that deliberately pays a full read per pack.
         let failure = match content_store::open_verified_lease(&root, &pack.sha256) {
-            Ok(lease) => (lease.bytes().len() as u64 != pack.size_bytes).then(|| {
-                format!(
-                    "object is {} bytes, ref records {}",
-                    lease.bytes().len(),
-                    pack.size_bytes
-                )
-            }),
+            Ok(lease) => {
+                let failure = (lease.bytes().len() as u64 != pack.size_bytes).then(|| {
+                    format!(
+                        "object is {} bytes, ref records {}",
+                        lease.bytes().len(),
+                        pack.size_bytes
+                    )
+                });
+                if failure.is_none() {
+                    // Verified intact: restore the seal if it was lost. Best
+                    // effort on purpose -- the report above is this command's
+                    // authority, and a chmod failure only means this object
+                    // stays on the hash-verifying slow path (safe, never
+                    // wrong). Never seal an object that failed verification.
+                    if let Ok(path) = content_store::object_path(&root, &pack.sha256) {
+                        let _ = content_store::seal_object(&path);
+                    }
+                }
+                failure
+            }
             Err(error) => Some(error.to_string()),
         };
         verification.checked.push(ModelStoreRefVerification {
