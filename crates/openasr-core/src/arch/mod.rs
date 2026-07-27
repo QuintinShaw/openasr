@@ -233,9 +233,9 @@ pub(crate) struct OpenAsrComponentDescriptor {
     pub id: &'static str,
 }
 
-/// Default `GlobalQuadratic` safe chunk-length ceiling (issue #68) -- the
-/// value every new `GlobalQuadratic` builtin architecture should declare
-/// unless the upstream model publishes a different explicit recommendation.
+/// Default chunk length long-form slicing aims for: how long a slice we
+/// *want*, as a transcription-quality choice.
+///
 /// This is not an arbitrary number: it is where the major encoder families
 /// this repo has surveyed independently converge --
 ///
@@ -249,14 +249,52 @@ pub(crate) struct OpenAsrComponentDescriptor {
 ///   padded/truncated to 30s.
 /// - Cohere's own longform reference decoder uses a 30s sliding window.
 ///
-/// A new `GlobalQuadratic` architecture should use this default. Only
-/// override `max_safe_chunk_seconds` with a different value when the
-/// upstream model card states an explicit, different recommended chunk
-/// length -- and cite that source in a comment next to the override (see
-/// firered-aed's descriptor entry below, whose upstream guidance --
-/// 60s-warn/200s-error -- is wider than this default; it still uses this
-/// default rather than the wider figure, for RAM margin and cross-family
-/// consistency, and says so in its own comment).
+/// **This is a decision knob, and the evidence above supports nothing else.**
+/// Six model cards agreeing on a good chunk length says how these encoders
+/// were trained and where they transcribe well. It says nothing about how
+/// much RAM their activations need, which is a property of the host, not of
+/// the corpus anyone trained on. See
+/// [`DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`] for the separate memory ceiling
+/// that used to borrow this citation, and do not re-unify them.
+pub(crate) const DEFAULT_ENCODER_CHUNK_SECONDS: f32 = 30.0;
+
+/// Default `GlobalQuadratic` **memory** ceiling (issue #68) -- the longest
+/// chunk a global-quadratic encoder may be handed before its attention
+/// activations are a risk on commodity RAM. Every new `GlobalQuadratic`
+/// builtin should declare this unless the upstream model publishes a
+/// different explicit recommendation (see firered-aed's descriptor below,
+/// whose upstream guidance -- 60s-warn/200s-error -- is wider; it still uses
+/// this default, and says so in its own comment).
+///
+/// # Why this is not [`DEFAULT_ENCODER_CHUNK_SECONDS`]
+///
+/// It was, and that is a role confusion, not a coincidence worth preserving.
+/// The two answer different questions -- "how long a slice transcribes well"
+/// versus "how long a slice fits in memory" -- with different units of
+/// evidence: the first is settled by model cards, the second by activation
+/// footprint against the host's available RAM. Sharing one symbol had two
+/// concrete costs. The clamp's `chunk_seconds` arm became unreachable on the
+/// default path (the value being clamped *was* the ceiling), so the ceiling
+/// was never actually exercised as a ceiling. And the arm that does fire --
+/// `max_chunk_seconds`, 120s by default -- silently collapsed the slicer's
+/// entire elasticity band onto 30s, taking away its room to hunt for a real
+/// pause, on the authority of a memory argument that was never made.
+///
+/// **INVARIANT: this must never be defined as, or derived from,
+/// [`DEFAULT_ENCODER_CHUNK_SECONDS`].** A quality convention cannot certify a
+/// memory bound.
+///
+/// # Why the value is still 30.0
+///
+/// Honestly: because no better figure has been established yet, and 30s is
+/// the conservative direction. The defensible derivation is from the
+/// architecture itself -- `GlobalQuadratic` activation grows as
+/// `frames^2 x heads x layers x dtype_width` per attention layer, so the safe
+/// frame count follows from the host's available RAM -- but that needs a
+/// measured per-family peak-activation coefficient, which this repo does not
+/// have. Until it does, the number stays put; what changed is that it now has
+/// its own name and its own justification to fail, instead of borrowing one
+/// that never applied.
 pub(crate) const DEFAULT_ENCODER_SAFE_CHUNK_SECONDS: f32 = 30.0;
 
 /// Where a family's speaker structure ("which turn belongs to which of the
