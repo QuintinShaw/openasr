@@ -99,11 +99,23 @@ impl GgufHeaderView {
 struct Window<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Declared tensor count from the header; 0 until that field parses.
+    tensor_count: u64,
+    /// Tensor entries fully parsed so far. Together with `tensor_count` this
+    /// is the progress a [`GgufHeaderError::Truncated`] reports, so every
+    /// window-exhaustion path (KV table included) gives the caller the same
+    /// widen-and-retry signal with accurate progress.
+    parsed_tensors: u64,
 }
 
 impl<'a> Window<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
+        Self {
+            bytes,
+            pos: 0,
+            tensor_count: 0,
+            parsed_tensors: 0,
+        }
     }
 
     fn take(&mut self, count: usize) -> Result<&'a [u8], ()> {
@@ -168,14 +180,16 @@ impl<'a> Window<'a> {
         })
     }
 
-    /// The error to surface when the window ends mid-structure: a Truncated
-    /// carrying the tensor-table progress when known, else an opaque
-    /// truncation via InvalidEncoding. Kept tiny on purpose -- callers
-    /// translate the outer `Err(())` from the KV/tensor loops into the precise
-    /// Truncated variant with the real counts.
+    /// The single error for "the window ends mid-structure", on ANY path
+    /// (magic, counts, KV key/value, tensor entry). Callers widen their byte
+    /// range and retry on Truncated; misclassifying a mid-KV truncation as
+    /// InvalidEncoding used to make the growing-window audit give up instead
+    /// of fetching a larger prefix. Genuine framing errors (bad type tags,
+    /// non-UTF-8 strings, out-of-range ranks) stay InvalidEncoding.
     fn truncated(&self) -> GgufHeaderError {
-        GgufHeaderError::InvalidEncoding {
-            reason: "byte window ends inside the header".to_string(),
+        GgufHeaderError::Truncated {
+            parsed_tensors: self.parsed_tensors,
+            tensor_count: self.tensor_count,
         }
     }
 
@@ -258,40 +272,26 @@ pub fn parse_gguf_header(bytes: &[u8]) -> Result<GgufHeaderView, GgufHeaderError
 
     let magic: [u8; 4] = window
         .take(4)
-        .map_err(|()| GgufHeaderError::Truncated {
-            parsed_tensors: 0,
-            tensor_count: 0,
-        })?
+        .map_err(|()| window.truncated())?
         .try_into()
         .unwrap();
     if magic != GGUF_MAGIC {
         return Err(GgufHeaderError::BadMagic { magic });
     }
 
-    let version = window.u32().map_err(|()| GgufHeaderError::Truncated {
-        parsed_tensors: 0,
-        tensor_count: 0,
-    })?;
+    let version = window.u32().map_err(|()| window.truncated())?;
     if version != 2 && version != 3 {
         return Err(GgufHeaderError::UnsupportedVersion { version });
     }
 
-    let tensor_count = window.u64().map_err(|()| GgufHeaderError::Truncated {
-        parsed_tensors: 0,
-        tensor_count: 0,
-    })?;
-    let kv_count = window.u64().map_err(|()| GgufHeaderError::Truncated {
-        parsed_tensors: 0,
-        tensor_count,
-    })?;
+    let tensor_count = window.u64().map_err(|()| window.truncated())?;
+    window.tensor_count = tensor_count;
+    let kv_count = window.u64().map_err(|()| window.truncated())?;
 
     let mut string_metadata = BTreeMap::new();
     for _ in 0..kv_count {
         let key = window.gguf_string()?;
-        let value_type = window.u32().map_err(|()| GgufHeaderError::Truncated {
-            parsed_tensors: 0,
-            tensor_count,
-        })?;
+        let value_type = window.u32().map_err(|()| window.truncated())?;
         if let Some(value) = window.skip_value(value_type)? {
             string_metadata.insert(key, value);
         }
@@ -299,20 +299,8 @@ pub fn parse_gguf_header(bytes: &[u8]) -> Result<GgufHeaderView, GgufHeaderError
 
     let mut tensors = Vec::new();
     for _ in 0..tensor_count {
-        let name = match window.gguf_string() {
-            Ok(name) => name,
-            Err(_) => {
-                return Err(GgufHeaderError::Truncated {
-                    parsed_tensors: tensors.len() as u64,
-                    tensor_count,
-                });
-            }
-        };
-        let truncated_here = || GgufHeaderError::Truncated {
-            parsed_tensors: tensors.len() as u64,
-            tensor_count,
-        };
-        let rank = window.u32().map_err(|()| truncated_here())?;
+        let name = window.gguf_string()?;
+        let rank = window.u32().map_err(|()| window.truncated())?;
         if !(1..=4).contains(&rank) {
             return Err(GgufHeaderError::InvalidEncoding {
                 reason: format!("tensor '{name}' has unsupported rank {rank}"),
@@ -320,16 +308,17 @@ pub fn parse_gguf_header(bytes: &[u8]) -> Result<GgufHeaderView, GgufHeaderError
         }
         let mut dims = Vec::with_capacity(rank as usize);
         for _ in 0..rank {
-            dims.push(window.u64().map_err(|()| truncated_here())?);
+            dims.push(window.u64().map_err(|()| window.truncated())?);
         }
-        let ggml_type = window.u32().map_err(|()| truncated_here())?;
-        let data_offset = window.u64().map_err(|()| truncated_here())?;
+        let ggml_type = window.u32().map_err(|()| window.truncated())?;
+        let data_offset = window.u64().map_err(|()| window.truncated())?;
         tensors.push(GgufHeaderTensor {
             name,
             dims,
             ggml_type,
             data_offset,
         });
+        window.parsed_tensors = tensors.len() as u64;
     }
 
     Ok(GgufHeaderView {
@@ -427,6 +416,29 @@ mod tests {
                 tensor_count: 2,
             }
         );
+    }
+
+    #[test]
+    fn kv_table_truncation_is_truncated_not_invalid_encoding() {
+        // Fixture layout (byte ranges): preamble [0,24); KV1 key string
+        // [32,52), value string [64,89); KV2 value string [132,133); KV3 u32
+        // value [162,166); KV table ends at 166; tensors [166,292).
+        let full = fixture_header();
+        let expected = GgufHeaderError::Truncated {
+            parsed_tensors: 0,
+            tensor_count: 2,
+        };
+
+        // The old code mapped mid-KV window exhaustion to InvalidEncoding,
+        // so the growing-window audit gave up with an error instead of
+        // fetching a wider prefix and retrying. Each cut below lands inside
+        // a different KV-table structure: a key string, a string value
+        // (skip_value -> gguf_string), and a fixed-width scalar value
+        // (skip_value's u32 arm).
+        for cut in [40usize, 130, 164] {
+            let error = parse_gguf_header(&full[..cut]).expect_err("must report truncation");
+            assert_eq!(error, expected, "cut at {cut}");
+        }
     }
 
     #[test]
