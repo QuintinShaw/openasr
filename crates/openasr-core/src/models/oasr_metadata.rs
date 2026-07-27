@@ -3,6 +3,11 @@ use std::collections::BTreeMap;
 use crate::NativeAsrError;
 use crate::ggml_runtime::{GgufMetadata, GgufWriteValue};
 
+// Build provenance lives at the single GGUF write choke point (ggml_runtime::
+// gguf_write), not in this per-family metadata module; re-exported here so
+// every `openasr.*` pack-metadata key is discoverable in one place.
+pub use crate::ggml_runtime::{BUILD_COMMIT_ENV, OASR_METADATA_KEY_BUILD_COMMIT};
+
 pub const OASR_METADATA_KEY_PACKAGE_VERSION: &str = "openasr.package.version";
 pub const OASR_METADATA_KEY_MODEL_FAMILY: &str = "openasr.model.family";
 pub const OASR_METADATA_KEY_MODEL_ARCHITECTURE: &str = "openasr.model.architecture";

@@ -4,6 +4,7 @@ mod cpu_graph;
 mod env_flags;
 mod ffi;
 mod gguf_c_parser_sandbox;
+pub mod gguf_header;
 mod gguf_metadata;
 mod gguf_tensor_data;
 mod gguf_tensor_index;
@@ -54,6 +55,7 @@ pub use gguf_tensor_index::{
     GgufTensorIndex, GgufTensorIndexReadError, GgufTensorMetadata, read_gguf_tensor_index,
     read_gguf_tensor_index_from_runtime_source,
 };
+pub use gguf_write::{BUILD_COMMIT_ENV, OASR_METADATA_KEY_BUILD_COMMIT};
 pub(crate) use gguf_write::{
     GgufWriteTensor, GgufWriteTensorType, GgufWriteValue, quantize_f32_to_ggml_tensor_data,
     write_gguf_file_v0,

@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     ffi::{CString, c_void},
     path::{Path, PathBuf},
@@ -8,6 +9,59 @@ use std::{
 use thiserror::Error;
 
 use super::ffi;
+
+/// Build provenance recorded on every pack this codebase writes: the open-core
+/// git commit whose quantization policy produced the pack's tensors.
+///
+/// Answering "which code version built this pack" used to require guessing
+/// from file mtimes -- which once led to validating new code against stale
+/// artifacts and reaching a completely backwards conclusion about a quant
+/// tier's quality ceiling. The publish pipeline (`convert.sh`) always exports
+/// [`BUILD_COMMIT_ENV`] from `git rev-parse HEAD`; when the variable is set,
+/// [`write_gguf_file_v0`] merges this key into the pack's GGUF metadata at the
+/// single write choke point, so every family's importer records it identically
+/// without per-family wiring. Unset (a plain library build, a test fixture)
+/// means the key is simply absent -- provenance is opt-in, but a SET value
+/// must be a well-formed 40-hex commit or the write fails closed.
+pub const OASR_METADATA_KEY_BUILD_COMMIT: &str = "openasr.build.commit";
+
+/// Environment variable carrying the build commit for
+/// [`OASR_METADATA_KEY_BUILD_COMMIT`]. Set by the publishing pipeline.
+pub const BUILD_COMMIT_ENV: &str = "OPENASR_BUILD_COMMIT";
+
+fn is_commit_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The build-provenance metadata to merge into an outgoing pack, read from
+/// [`BUILD_COMMIT_ENV`]. `None` when the variable is unset/empty (no
+/// provenance claimed); an error when it IS set but malformed -- a builder
+/// that claims provenance must claim it correctly.
+fn build_provenance_from_env() -> Result<Option<(String, GgufWriteValue)>, GgufWriteError> {
+    match std::env::var(BUILD_COMMIT_ENV) {
+        Ok(raw) => {
+            let commit = raw.trim().to_ascii_lowercase();
+            if commit.is_empty() {
+                return Ok(None);
+            }
+            if !is_commit_sha(&commit) {
+                return Err(GgufWriteError::InvalidBuildProvenance {
+                    reason: format!(
+                        "{BUILD_COMMIT_ENV} must be a 40-hex git commit sha, got {raw:?}"
+                    ),
+                });
+            }
+            Ok(Some((
+                OASR_METADATA_KEY_BUILD_COMMIT.to_string(),
+                GgufWriteValue::String(commit),
+            )))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(GgufWriteError::InvalidBuildProvenance {
+            reason: format!("{BUILD_COMMIT_ENV} is not valid unicode"),
+        }),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GgufWriteValue {
@@ -65,6 +119,8 @@ pub(crate) struct GgufWriteTensor {
 pub(crate) enum GgufWriteError {
     #[error("gguf output path already exists: {path}")]
     OutputExists { path: PathBuf },
+    #[error("gguf build provenance is invalid: {reason}")]
+    InvalidBuildProvenance { reason: String },
     #[error("gguf output path cannot be represented as C string: {path}")]
     PathContainsNul { path: String },
     #[error("gguf string field '{field}' cannot contain NUL bytes")]
@@ -157,7 +213,19 @@ pub(crate) fn write_gguf_file_v0(
             path: path.to_path_buf(),
         });
     }
-    validate_metadata(metadata)?;
+    // Merge build provenance (when the pipeline claims it) at the single write
+    // choke point, so every pack this codebase emits can answer "which commit
+    // built me" without per-importer wiring.
+    let provenance = build_provenance_from_env()?;
+    let metadata: Cow<'_, BTreeMap<String, GgufWriteValue>> = match provenance {
+        Some((key, value)) => {
+            let mut merged = metadata.clone();
+            merged.insert(key, value);
+            Cow::Owned(merged)
+        }
+        None => Cow::Borrowed(metadata),
+    };
+    validate_metadata(&metadata)?;
     validate_tensors(tensors)?;
 
     let path_cstring = path_to_cstring(path)?;
@@ -165,7 +233,7 @@ pub(crate) fn write_gguf_file_v0(
         .ok_or(GgufWriteError::GgufContextInitFailed)?;
     let ggml_context = GgmlContextGuard::init_for_tensor_defs(tensors.len())?;
 
-    for (key, value) in metadata {
+    for (key, value) in metadata.iter() {
         set_metadata_value(gguf_context.as_ptr(), key, value)?;
     }
     for tensor in tensors {
@@ -561,5 +629,128 @@ impl Drop for GgmlContextGuard {
                 ffi::ggml_free(self.raw);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::{
+        BUILD_COMMIT_ENV, GgufWriteError, GgufWriteTensor, GgufWriteTensorType, GgufWriteValue,
+        OASR_METADATA_KEY_BUILD_COMMIT, write_gguf_file_v0,
+    };
+    use crate::ggml_runtime::read_gguf_metadata;
+    use crate::test_process_env::with_test_process_env;
+
+    fn fixture_pack(dir: &std::path::Path) -> (std::path::PathBuf, Vec<GgufWriteTensor>) {
+        let path = dir.join("provenance.oasr");
+        let tensors = vec![GgufWriteTensor {
+            name: "probe.weight".to_string(),
+            dims: vec![1],
+            tensor_type: GgufWriteTensorType::F32,
+            data: 1.0_f32.to_le_bytes().to_vec(),
+        }];
+        (path, tensors)
+    }
+
+    const TEST_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn build_commit_env_is_merged_into_pack_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, tensors) = fixture_pack(dir.path());
+        let metadata = std::collections::BTreeMap::new();
+
+        with_test_process_env(
+            [(BUILD_COMMIT_ENV, Some(OsString::from(TEST_COMMIT)))],
+            || {
+                write_gguf_file_v0(&path, &metadata, &tensors).expect("write pack");
+            },
+        );
+
+        let read = read_gguf_metadata(&path).expect("read pack metadata");
+        assert_eq!(
+            read.get_string(OASR_METADATA_KEY_BUILD_COMMIT),
+            Some(TEST_COMMIT)
+        );
+    }
+
+    #[test]
+    fn absent_build_commit_env_writes_no_provenance_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, tensors) = fixture_pack(dir.path());
+        let metadata = std::collections::BTreeMap::new();
+
+        with_test_process_env([(BUILD_COMMIT_ENV, None)], || {
+            write_gguf_file_v0(&path, &metadata, &tensors).expect("write pack");
+        });
+
+        let read = read_gguf_metadata(&path).expect("read pack metadata");
+        assert_eq!(read.get_string(OASR_METADATA_KEY_BUILD_COMMIT), None);
+    }
+
+    #[test]
+    fn malformed_build_commit_env_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, tensors) = fixture_pack(dir.path());
+        let metadata = std::collections::BTreeMap::new();
+
+        for invalid in ["not-a-sha", "0123456789abcdef", &"a".repeat(41)] {
+            let path = path.with_file_name(format!("provenance-{}.oasr", invalid.len()));
+            let invalid = invalid.to_string();
+            let error =
+                with_test_process_env([(BUILD_COMMIT_ENV, Some(OsString::from(&invalid)))], || {
+                    write_gguf_file_v0(&path, &metadata, &tensors).expect_err("must fail closed")
+                });
+            assert!(
+                matches!(error, GgufWriteError::InvalidBuildProvenance { .. }),
+                "unexpected error for {invalid:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn uppercase_build_commit_is_normalized_to_lowercase() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, tensors) = fixture_pack(dir.path());
+        let metadata = std::collections::BTreeMap::new();
+        let upper = TEST_COMMIT.to_ascii_uppercase();
+
+        with_test_process_env([(BUILD_COMMIT_ENV, Some(OsString::from(&upper)))], || {
+            write_gguf_file_v0(&path, &metadata, &tensors).expect("write pack");
+        });
+
+        let read = read_gguf_metadata(&path).expect("read pack metadata");
+        assert_eq!(
+            read.get_string(OASR_METADATA_KEY_BUILD_COMMIT),
+            Some(TEST_COMMIT)
+        );
+    }
+
+    #[test]
+    fn build_commit_never_clobbers_caller_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, tensors) = fixture_pack(dir.path());
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            "openasr.package.version".to_string(),
+            GgufWriteValue::String("1".to_string()),
+        );
+
+        with_test_process_env(
+            [(BUILD_COMMIT_ENV, Some(OsString::from(TEST_COMMIT)))],
+            || {
+                write_gguf_file_v0(&path, &metadata, &tensors).expect("write pack");
+            },
+        );
+
+        let read = read_gguf_metadata(&path).expect("read pack metadata");
+        assert_eq!(read.get_string("openasr.package.version"), Some("1"));
+        assert_eq!(
+            read.get_string(OASR_METADATA_KEY_BUILD_COMMIT),
+            Some(TEST_COMMIT)
+        );
+        assert_eq!(metadata.len(), 1, "caller metadata map must not be mutated");
     }
 }

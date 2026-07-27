@@ -24,6 +24,14 @@ SUBCMD="$(cat_field "$MODEL" import_subcommand)"
 REGISTRY_ID="$(cat_field "$MODEL" registry_id)"
 BIN="$(openasr_bin)"
 
+# Build provenance, fail-closed: the pipeline always runs from a repo checkout,
+# so record the exact commit whose quantization policy built this pack into the
+# pack's own GGUF metadata (openasr.build.commit). The writer rejects anything
+# that is not a 40-hex sha; a checkout without a resolvable HEAD cannot build.
+BUILD_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)" \
+  || die "cannot resolve git HEAD for build provenance; the publish lane requires a committed checkout"
+export OPENASR_BUILD_COMMIT="$BUILD_COMMIT"
+
 # Two CLI arg shapes: the CTC families (parakeet/wav2vec2) take only
 # --package-id + --quantization; the rest also accept source/license metadata.
 args=("$SRC" "$OUT" --package-id "$REGISTRY_ID" --quantization "$TOKEN")
