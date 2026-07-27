@@ -196,6 +196,17 @@ pub fn audio_encoder_tensors_for_architecture(architecture: &str) -> Option<Audi
         crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID => {
             Rule::NamePrefixes(&["moss.enc.", "moss.adaptor."])
         }
+        // MiMo's external converter quantizes ONLY the Qwen2 backbone; the
+        // whole audio side (tokenizer encoder, input-local layers, speech
+        // embeddings) stays f16/f32 for encode fidelity. The rule pins that:
+        // a future converter that block-quantizes the acoustic path fails
+        // the floor instead of shipping a decode cliff.
+        crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&[
+            "audiotok.",
+            "inlocal.",
+            "speech_embd.",
+            "speech_group_proj.",
+        ]),
         // Translation / punctuation / segmentation packs have no acoustic
         // encoder in the ASR-floor sense.
         "hunyuan-dense" => Rule::NoAudioEncoder,
@@ -570,13 +581,6 @@ mod tests {
             crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID,
             crate::models::firered_punc::config::FIRERED_PUNC_ARCHITECTURE_VALUE,
         ] {
-            // mimo-asr is converted by an external tool with a fixed F32/F16
-            // audio tower (no block quants); it intentionally has no rule yet
-            // and the audit fails closed the day it gains block quants.
-            if arch == crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID {
-                assert_eq!(audio_encoder_tensors_for_architecture(arch), None);
-                continue;
-            }
             assert_ne!(
                 audio_encoder_tensors_for_architecture(arch),
                 None,
