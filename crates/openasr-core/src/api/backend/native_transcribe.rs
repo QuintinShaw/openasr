@@ -8,7 +8,7 @@ use std::{
 use crate::NATIVE_RUNTIME_MODEL_ID_AUTO;
 use crate::api::audio_io::load_wav_16khz_mono_f32_v0;
 use crate::arch::{
-    DEFAULT_ENCODER_SAFE_CHUNK_SECONDS, GENERAL_ARCHITECTURE_KEY, OpenAsrArchitectureRegistry,
+    DEFAULT_ENCODER_CHUNK_SECONDS, GENERAL_ARCHITECTURE_KEY, OpenAsrArchitectureRegistry,
     SpeakerSegmentationSource, emits_punctuation_for_model_architecture,
 };
 use crate::ggml_runtime::{
@@ -54,14 +54,22 @@ const DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS: f32 = 30.0;
 /// first found, predating the structural fix (the shared greedy-decode
 /// driver's degenerate-loop guard, which is the actual anti-repetition
 /// mechanism and stays in place regardless of chunk length). That 10s value
-/// has since been surveyed against the same industry evidence backing
-/// `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS` (Whisper/Moonshine/NeMo/FunASR/
+/// has since been surveyed against the industry evidence backing
+/// `DEFAULT_ENCODER_CHUNK_SECONDS` (Whisper/Moonshine/NeMo/FunASR/
 /// Dolphin/Cohere all converge near 30s) and found to have no independent
 /// justification, so it is unified with that default: the previous name
 /// (`COHERE_LONGFORM_MAX_CHUNK_SECONDS`) was also misleading on both counts
 /// (not 10s anymore, and not cohere-only -- moonshine and firered-aed carry
 /// the same profile).
-const CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS: f32 = DEFAULT_ENCODER_SAFE_CHUNK_SECONDS;
+///
+/// It follows the *quality* default rather than
+/// `arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS` because that is the evidence it
+/// actually rests on: this cap exists to keep decode well inside the regime
+/// these families transcribe reliably in, not to bound encoder memory. The
+/// memory ceiling applies separately and independently
+/// (`apply_encoder_attention_span_longform_safety_policy`); a family carrying
+/// both gets whichever is tighter.
+const CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS: f32 = DEFAULT_ENCODER_CHUNK_SECONDS;
 const COHERE_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
 static NATIVE_GGML_EXECUTION_DISPATCH: OnceLock<GgmlAsrExecutionDispatch> = OnceLock::new();
 
@@ -2257,6 +2265,23 @@ fn apply_encoder_attention_span_longform_safety_policy(
     let Some(max_safe_chunk_seconds) = descriptor.longform_max_safe_chunk_seconds() else {
         return;
     };
+    if clamp_longform_chunks_to_encoder_memory_ceiling(options, max_safe_chunk_seconds) {
+        provenance.push(format!(
+            "core.native.longform.policy:encoder-attention-span-chunk-cap={max_safe_chunk_seconds}"
+        ));
+    }
+}
+
+/// The clamp itself, split out from the registry lookup so it can be exercised
+/// against a ceiling that differs from `LongFormOptions`' default chunk
+/// length. That the two can differ is the whole point of the split described
+/// on `arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`: this function must narrow
+/// toward whatever memory ceiling it is given, never toward the chunk length
+/// the slicer happens to prefer. Returns whether anything moved.
+fn clamp_longform_chunks_to_encoder_memory_ceiling(
+    options: &mut crate::LongFormOptions,
+    max_safe_chunk_seconds: f32,
+) -> bool {
     let mut changed = false;
     if options.chunk_seconds > max_safe_chunk_seconds {
         options.chunk_seconds = max_safe_chunk_seconds;
@@ -2278,11 +2303,7 @@ fn apply_encoder_attention_span_longform_safety_policy(
         options.min_chunk_seconds = options.chunk_seconds;
         changed = true;
     }
-    if changed {
-        provenance.push(format!(
-            "core.native.longform.policy:encoder-attention-span-chunk-cap={max_safe_chunk_seconds}"
-        ));
-    }
+    changed
 }
 
 fn combined_longform_provenance(policy: &[String], plan: &[String]) -> Vec<String> {
@@ -2871,6 +2892,7 @@ fn quant_tag_for_log(requested_model_id: &str, runtime_pack_path: &Path) -> Stri
 mod tests {
     use super::*;
     use crate::GgmlAsrExecutor;
+    use crate::arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS;
     use std::sync::Mutex;
 
     fn uncancellable_execution_context_for_test() -> Arc<crate::RequestExecutionContext> {
@@ -4081,6 +4103,55 @@ mod tests {
         );
         assert_eq!(wrong.options.max_chunk_seconds, 120.0);
         assert!(wrong.provenance.is_empty());
+    }
+
+    /// The encoder memory ceiling has to be able to say something the default
+    /// chunk length does not, and the only way to prove that is to give it a
+    /// ceiling the two do not share.
+    ///
+    /// Under the old arrangement they were one symbol, so the clamp had no
+    /// independent content: its `chunk_seconds` arm could not fire (the value
+    /// under test *was* the ceiling), and the arm that did fire flattened the
+    /// slicer's 30-120s search band onto the default. Both arms are asserted,
+    /// with the old shared value restated as a local literal rather than
+    /// imported -- reading a production constant here would let a later edit
+    /// quietly turn this into a comparison of a number with itself.
+    #[test]
+    fn the_encoder_memory_ceiling_clamps_to_itself_not_to_the_default_chunk_length() {
+        /// What both roles held when they were one symbol.
+        const OLD_SHARED_VALUE: f32 = 30.0;
+        let defaults = crate::LongFormOptions::default();
+
+        // A host that can afford more than the default chunk length keeps the
+        // band the slicer needs in order to cut on a real pause.
+        let mut roomy = defaults.clone();
+        assert!(clamp_longform_chunks_to_encoder_memory_ceiling(
+            &mut roomy, 90.0
+        ));
+        assert_eq!(roomy.chunk_seconds, defaults.chunk_seconds);
+        assert_eq!(roomy.max_chunk_seconds, 90.0);
+        assert_eq!(roomy.min_chunk_seconds, defaults.min_chunk_seconds);
+
+        // Counterfactual: with the ceiling pinned to the default chunk length,
+        // the band collapses onto it and `chunk_seconds` is never touched --
+        // the clamp reports "capped" without any memory claim behind it.
+        let mut shared = defaults.clone();
+        assert!(clamp_longform_chunks_to_encoder_memory_ceiling(
+            &mut shared,
+            OLD_SHARED_VALUE
+        ));
+        assert_eq!(shared.chunk_seconds, defaults.chunk_seconds);
+        assert_eq!(shared.max_chunk_seconds, OLD_SHARED_VALUE);
+
+        // A host that can afford less does reach the arm the shared value made
+        // unreachable.
+        let mut tight = defaults.clone();
+        assert!(clamp_longform_chunks_to_encoder_memory_ceiling(
+            &mut tight, 12.0
+        ));
+        assert_eq!(tight.chunk_seconds, 12.0);
+        assert_eq!(tight.max_chunk_seconds, 12.0);
+        assert!(tight.chunk_seconds < defaults.chunk_seconds);
     }
 
     /// Data-driven production-path coverage over every builtin architecture

@@ -43,15 +43,21 @@ so a new architecture cannot compile without it:
 - Full self-attention over the whole encoder input (the common case for a
   Conformer/Transformer/E-Branchformer/RoPE encoder) is `GlobalQuadratic`.
   Use `arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS` (30s) for
-  `max_safe_chunk_seconds` -- the value every major encoder family this repo
-  has surveyed converges on (Whisper's fixed window, Moonshine's own "<30s"
+  `max_safe_chunk_seconds`. This is the **memory** ceiling -- the longest
+  chunk this architecture may be handed before its attention activations are
+  a risk on commodity RAM -- and it is deliberately a different constant from
+  `arch::DEFAULT_ENCODER_CHUNK_SECONDS`, the default chunk length long-form
+  slicing aims for. They hold the same number today, but for unrelated
+  reasons: the chunk length is where every major encoder family this repo has
+  surveyed converges (Whisper's fixed window, Moonshine's own "<30s"
   guidance, NeMo/Parakeet's 20-30s guidance, FunASR's 30000ms default,
   Dolphin's 30s training/eval padding, Cohere's 30s reference sliding
-  window). **Only** override it with a different `max_safe_chunk_seconds`
-  when the upstream model card states an explicit, different recommended
-  chunk length, and cite that source in a comment next to the override (see
-  `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`'s own doc comment for the citation
-  format).
+  window), which is a transcription-quality argument and cannot certify a
+  memory bound. Do not collapse the two; see
+  `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`'s doc comment. **Only** override
+  `max_safe_chunk_seconds` when the upstream model card states an explicit,
+  different recommended chunk length, and cite that source in a comment next
+  to the override.
 - An architecture-fixed attention window (like Whisper's 30s log-mel frame)
   is `FixedWindow`.
 - A local/chunked streaming encoder with a bounded per-chunk cache (like

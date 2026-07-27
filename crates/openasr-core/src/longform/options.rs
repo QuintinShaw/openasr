@@ -77,7 +77,12 @@ impl Default for LongFormOptions {
     fn default() -> Self {
         Self {
             mode: LongFormMode::Auto,
-            chunk_seconds: 30.0,
+            // The quality default, deliberately not the encoder memory
+            // ceiling (`arch::DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`): the two
+            // happen to hold the same number today, and unifying them is how
+            // the ceiling stopped being able to express a memory fact. See
+            // that constant.
+            chunk_seconds: crate::arch::DEFAULT_ENCODER_CHUNK_SECONDS,
             overlap_seconds: 0.5,
             min_chunk_seconds: 1.0,
             max_chunk_seconds: 120.0,
