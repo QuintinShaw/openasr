@@ -2069,6 +2069,92 @@ fn pull_rejects_truncated_immutable_object_without_replacing_it() {
     assert_eq!(fs::read(&paths.final_path).unwrap(), corrupt);
 }
 
+/// Land bytes at the object path a pull would download to, sealed or not,
+/// exactly the two states `installed_matches` must tell apart.
+fn seed_final_object(paths: &PullPaths, bytes: &[u8], read_only: bool) {
+    if let Some(parent) = paths.final_path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(&paths.final_path, bytes).unwrap();
+    let mut permissions = fs::metadata(&paths.final_path).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(if read_only { 0o444 } else { 0o644 });
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(read_only);
+    fs::set_permissions(&paths.final_path, permissions).unwrap();
+}
+
+/// The download-skip verdict for a sealed object must be answered from the
+/// path and a stat alone. Pinned by construction: an object whose bytes do
+/// *not* hash to the catalog digest can only match if the digest was read
+/// off the path, never recomputed.
+#[test]
+fn installed_matches_trusts_a_sealed_object_without_rehashing() {
+    let bytes = tiny_pack_bytes();
+    let mut resolved = resolved_for(&bytes);
+    resolved.sha256 = "ab".repeat(32);
+    assert_ne!(
+        sha256_hex(&bytes),
+        resolved.sha256,
+        "the fixture must not accidentally hash to the named digest"
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let target = PullTarget::from_resolved(&resolved).unwrap();
+    let paths = pull_paths(temp.path(), &target).unwrap();
+    seed_final_object(&paths, &bytes, true);
+
+    assert!(installed_matches(&target, &paths).unwrap());
+}
+
+/// The fail-closed half: the seal gone, the same mismatched object goes back
+/// through a full hash, and because nothing pins its bytes to the catalog
+/// digest it must not match.
+#[test]
+fn installed_matches_unsealed_object_falls_back_to_hashing() {
+    let bytes = tiny_pack_bytes();
+    let mut resolved = resolved_for(&bytes);
+    resolved.sha256 = "cd".repeat(32);
+    let temp = tempfile::tempdir().unwrap();
+    let target = PullTarget::from_resolved(&resolved).unwrap();
+    let paths = pull_paths(temp.path(), &target).unwrap();
+    seed_final_object(&paths, &bytes, false);
+
+    assert!(!installed_matches(&target, &paths).unwrap());
+}
+
+/// The fallback still accepts: an unsealed object whose bytes really do hash
+/// to the catalog digest (a store whose seals a backup restore stripped)
+/// matches through the hashing path and skips the download.
+#[test]
+fn installed_matches_unsealed_object_still_matches_on_honest_hash() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let target = PullTarget::from_resolved(&resolved).unwrap();
+    let paths = pull_paths(temp.path(), &target).unwrap();
+    seed_final_object(&paths, &bytes, false);
+
+    assert!(installed_matches(&target, &paths).unwrap());
+}
+
+/// Size is the O(1) first gate: a mismatch is rejected on the stat alone,
+/// before either the path digest or a hash is consulted.
+#[test]
+fn installed_matches_rejects_a_size_mismatch_on_the_stat_alone() {
+    let bytes = tiny_pack_bytes();
+    let mut resolved = resolved_for(&bytes);
+    resolved.size_bytes += 1;
+    let temp = tempfile::tempdir().unwrap();
+    let target = PullTarget::from_resolved(&resolved).unwrap();
+    let paths = pull_paths(temp.path(), &target).unwrap();
+    seed_final_object(&paths, &bytes, true);
+
+    assert!(!installed_matches(&target, &paths).unwrap());
+}
+
 /// `config.json`'s `models_dir` field must be the single thing that decides
 /// where a pack lands and where `list_installed_packs` looks for it -- a
 /// redirected home must land the pack entirely outside `<home>/models` and

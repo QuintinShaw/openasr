@@ -2772,16 +2772,43 @@ fn cancel_before_commit(
     Ok(())
 }
 
+/// Whether the object this target would download is already in the store,
+/// and is exactly the bytes the catalog names.
+///
+/// `final_path` is built from `target.sha256` itself, so a *sealed* object
+/// found there has its digest pinned by the path and its immutability pinned
+/// by the seal (see `content_store`'s integrity chain): the match is a stat
+/// for the size plus the seal-gated path digest, with no read of the bytes.
+/// Re-pulling an installed gigabyte pack must not cost a gigabyte of hash.
+/// Anything the gate declines -- a lost seal, a layout the parser does not
+/// recognise -- falls back to hashing the whole file, the only way to prove
+/// identity for bytes nothing has pinned.
+///
+/// Either way the container contract is still probed before the object
+/// stands in for a download: skipping the download on the strength of a
+/// digest must not skip proving the pack is actually loadable.
 fn installed_matches(target: &PullTarget, paths: &PullPaths) -> Result<bool, PullError> {
-    if !paths.final_path.exists() {
+    let Ok(metadata) = fs::metadata(&paths.final_path) else {
+        return Ok(false);
+    };
+    if metadata.len() != target.size_bytes {
         return Ok(false);
     }
-    let (size, sha) = file_size_and_sha256(&paths.final_path)?;
-    if size == target.size_bytes && sha == target.sha256 {
-        preflight_gguf_package_contract(&paths.final_path)?;
-        return Ok(true);
+    let matched = match content_store::trusted_object_digest(
+        &paths.final_path,
+        metadata.permissions().readonly(),
+    ) {
+        Some(digest) => digest == target.sha256,
+        None => {
+            let (size, sha) = file_size_and_sha256(&paths.final_path)?;
+            size == target.size_bytes && sha == target.sha256
+        }
+    };
+    if !matched {
+        return Ok(false);
     }
-    Ok(false)
+    preflight_gguf_package_contract(&paths.final_path)?;
+    Ok(true)
 }
 
 fn prepare_partial_for_resume(target: &PullTarget, paths: &PullPaths) -> Result<u64, PullError> {
