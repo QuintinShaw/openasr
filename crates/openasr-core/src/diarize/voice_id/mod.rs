@@ -5,6 +5,7 @@
 //! enrollment audio is never retained.
 
 mod domain;
+mod evidence;
 mod identity;
 mod ids;
 mod matcher;
