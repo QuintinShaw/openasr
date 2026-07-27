@@ -89,6 +89,14 @@ pub(crate) fn pack_content_id_for_path_before_replace(path: &Path) -> String {
     let Ok(metadata) = std::fs::metadata(&canonical) else {
         return unreadable_content_id(&canonical);
     };
+    // The seal here comes from a path stat, not an open descriptor --
+    // `trusted_object_digest`'s contract prefers fd-derived metadata. This
+    // call site may keep the weaker form because its verdict only ever
+    // decides a cache eviction: a stat/open race can at worst evict too
+    // little or too much, never key a runtime build by the wrong content.
+    // A new caller that feeds a runtime build must not copy this shape --
+    // open the file first and take the seal from its fd, as
+    // `GgmlRuntimeSource` does.
     if let Some(digest) =
         crate::content_store::trusted_object_digest(&canonical, metadata.permissions().readonly())
     {

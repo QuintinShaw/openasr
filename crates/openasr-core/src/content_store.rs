@@ -340,6 +340,19 @@ pub(crate) fn object_digest_from_path(path: &Path) -> Option<&str> {
 /// buggy tool, flips every consumer of this function back onto a full hash --
 /// which both verifies the bytes and (via `verify`) re-seals them.
 ///
+/// On mounts where permission bits carry no real signal -- some SMB/exFAT
+/// setups report every file as writable, others every file as read-only --
+/// the gate degrades in whichever direction the mount lies, and neither
+/// direction breaks safety. Nothing reads as sealed and every consumer falls
+/// back to the hashing path it had before this gate existed; or everything
+/// reads as sealed and the trust is still sound, because an object's
+/// correctness never came from the permission bit -- admission hashed the
+/// bytes before the object existed at all, and only two writers can create
+/// one (see the module docs). Exploiting a mount that lies about
+/// *writability* still takes local write access, which the threat model
+/// already excludes; bit rot under such a mount is exactly what `verify`
+/// re-hashes for.
+///
 /// `sealed` must describe the file `path` actually refers to -- take it from
 /// an already-open descriptor's metadata where one exists, so a path swapped
 /// between stat and open cannot change which file the seal verdict applies to.
