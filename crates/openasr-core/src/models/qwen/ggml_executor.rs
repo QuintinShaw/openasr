@@ -51,7 +51,7 @@ use crate::models::runtime_prepared_registry::{
 };
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
-    Seq2SeqGreedyDecodeStepLogitsOutput,
+    Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::thread_local_runtime_cache::{
@@ -669,11 +669,12 @@ impl Qwen3AsrGgmlExecutor {
         // partial cannot kill a live streaming session. The FINAL re-decodes the
         // whole buffer the same way, so it stays consistent with offline `execute()`.
         let postprocess_started_at = qwen_decode_profile_start();
-        let (text, generated_tokens, generated_probabilities) = match decode_result {
+        let (text, generated_tokens, generated_probabilities, stop_reason) = match decode_result {
             Ok(output) => (
                 output.text.trim().to_string(),
                 output.generated_tokens,
                 output.generated_probabilities,
+                output.stop_reason,
             ),
             Err(Qwen3AsrGreedyDecodeError::EotNotReachedBeforeMaxTokens {
                 generated_tokens,
@@ -686,7 +687,14 @@ impl Qwen3AsrGgmlExecutor {
                     })?
                     .trim()
                     .to_string();
-                (text, generated_tokens, generated_probabilities)
+                (
+                    text,
+                    generated_tokens,
+                    generated_probabilities,
+                    // Salvaging the prefix is not the same as completing the
+                    // decode; keep the shortfall on the record.
+                    Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
+                )
             }
             // Preserve typed cancel identity through the stringified executor
             // boundary via the stable "canceled by transcription control" marker.
@@ -740,13 +748,17 @@ impl Qwen3AsrGgmlExecutor {
         };
         let result = Ok(GgmlAsrExecutionResult {
             transcription: Transcription {
+                truncated_decodes: Vec::new(),
                 text,
                 segments,
                 longform: None,
                 language: None,
             },
             carry_context: None,
-            decode_truncated_at_seconds: None,
+            // qwen3-asr emits no intra-decode timestamps -- its one segment
+            // spans the whole buffer -- so there is no honest second to anchor
+            // the cut to. See `DecodeTruncation::transcript_covers_up_to_seconds`.
+            decode_truncation: stop_reason.into_decode_truncation(None),
         });
         qwen_decode_profile_log_opt("decode_with_runtime_assets_total", profile_started_at);
         result

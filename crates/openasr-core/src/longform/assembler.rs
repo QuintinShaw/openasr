@@ -145,6 +145,7 @@ impl TranscriptAssembler {
             .join(" ");
         (
             Transcription {
+                truncated_decodes: Vec::new(),
                 text,
                 segments: self.segments,
                 longform: None,

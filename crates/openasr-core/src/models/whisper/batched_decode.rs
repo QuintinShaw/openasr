@@ -30,7 +30,8 @@ use crate::models::decode_policy_component_registry::{
 };
 use crate::models::decode_token_history::build_longform_token_history_carry;
 use crate::models::seq2seq_greedy_decode::{
-    Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, build_seq2seq_greedy_stop_token_ids,
+    Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStopReason,
+    build_seq2seq_greedy_stop_token_ids,
 };
 #[cfg(test)]
 use crate::models::seq2seq_serve_batch::{Envelope, OwnerThreadState};
@@ -181,7 +182,10 @@ pub(crate) struct WhisperBatchSlot {
     generated_tokens: Vec<u32>,
     /// Per-token softmax probability, parallel to `generated_tokens`.
     generated_probabilities: Vec<f32>,
-    done: bool,
+    /// How this slot's decode ended, `None` while it is still running.
+    /// Mirrors the single-utterance driver so a guard-truncated slot is
+    /// distinguishable from one that reached its stop token.
+    stop_reason: Option<Seq2SeqGreedyDecodeStopReason>,
 }
 
 pub(super) fn submit_whisper_serve_batch_job(
@@ -501,7 +505,7 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
     }
 
     fn slot_done(slot: &Self::Slot) -> bool {
-        slot.done
+        slot.is_done()
     }
 
     fn slot_select_next_token(slot: &mut Self::Slot, logits: Vec<f32>) -> Result<(), Self::Error> {
@@ -544,9 +548,9 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
 
         loop {
             if slot.generated_tokens.len() >= slot.job.decode_config.max_generated_tokens {
-                slot.done = true;
+                slot.stop_reason = Some(Seq2SeqGreedyDecodeStopReason::BudgetExhausted);
             }
-            if slot.done {
+            if slot.is_done() {
                 break;
             }
             // Cooperative cancel at each token step, mirroring the shared
@@ -702,8 +706,15 @@ impl WhisperBatchSlot {
             stop_token_ids,
             generated_tokens: Vec::new(),
             generated_probabilities: Vec::new(),
-            done: false,
+            stop_reason: None,
         })
+    }
+
+    /// Whether this slot's decode has ended, for any reason. Callers that
+    /// need to know WHY (a guard cut vs a real stop token) read
+    /// `stop_reason` directly.
+    fn is_done(&self) -> bool {
+        self.stop_reason.is_some()
     }
 
     fn select_next_token_from_logits(
@@ -714,7 +725,7 @@ impl WhisperBatchSlot {
             &self.job.decode_config,
             &mut self.generated_tokens,
             &mut self.generated_probabilities,
-            &mut self.done,
+            &mut self.stop_reason,
             self.stop_token_ids.as_slice(),
             logits,
         )
@@ -726,6 +737,7 @@ impl WhisperBatchSlot {
             job,
             generated_tokens,
             generated_probabilities,
+            stop_reason,
             ..
         } = self;
         finish_whisper_serve_batch_output(
@@ -735,6 +747,7 @@ impl WhisperBatchSlot {
             job.word_timestamps,
             job.audio_duration_seconds,
             job.carry_prompt_seed_token_ids,
+            stop_reason.unwrap_or(Seq2SeqGreedyDecodeStopReason::StopToken),
         )
     }
 }
@@ -746,6 +759,7 @@ fn finish_whisper_serve_batch_output(
     word_timestamps: bool,
     audio_duration_seconds: f32,
     carry_prompt_seed_token_ids: Option<Vec<u32>>,
+    stop_reason: Seq2SeqGreedyDecodeStopReason,
 ) -> Result<WhisperExecutionOutput, WhisperServeBatchError> {
     let text = tokenizer
         .decode_text_token_ids(&generated_tokens)
@@ -803,6 +817,7 @@ fn finish_whisper_serve_batch_output(
         // The batched decode path does not run language ID yet; an `auto` request
         // falls back to the unset-language decode, exactly as before.
         detected_language: None,
+        stop_reason,
     })
 }
 
@@ -1319,6 +1334,7 @@ mod tests {
             false,
             2.0,
             None,
+            Seq2SeqGreedyDecodeStopReason::StopToken,
         )
         .expect("finish without words");
         assert!(without_words.segments.is_empty());
@@ -1330,6 +1346,7 @@ mod tests {
             true,
             2.0,
             None,
+            Seq2SeqGreedyDecodeStopReason::StopToken,
         )
         .expect("finish with words");
         assert_eq!(with_words.text, "hello");
@@ -1352,6 +1369,7 @@ mod tests {
             false,
             2.0,
             Some((1..=40).collect()),
+            Seq2SeqGreedyDecodeStopReason::StopToken,
         )
         .expect("finish with carry tokens");
 

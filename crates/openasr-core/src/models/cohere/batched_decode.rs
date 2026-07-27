@@ -18,7 +18,8 @@ use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, apply_seq2seq_text_postprocess,
 };
 use crate::models::seq2seq_greedy_decode::{
-    Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, build_seq2seq_greedy_stop_token_ids,
+    Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStopReason,
+    build_seq2seq_greedy_stop_token_ids,
 };
 #[cfg(test)]
 use crate::models::seq2seq_serve_batch::{Envelope, OwnerThreadState};
@@ -176,7 +177,10 @@ pub(crate) struct CohereBatchSlot {
     generated_tokens: Vec<u32>,
     /// Per-token softmax probability, parallel to `generated_tokens`.
     generated_probabilities: Vec<f32>,
-    done: bool,
+    /// How this slot's decode ended, `None` while it is still running.
+    /// Mirrors the single-utterance driver so a guard-truncated slot is
+    /// distinguishable from one that reached its stop token.
+    stop_reason: Option<Seq2SeqGreedyDecodeStopReason>,
 }
 
 pub(super) fn submit_cohere_serve_batch_job(
@@ -345,7 +349,7 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
     }
 
     fn slot_done(slot: &Self::Slot) -> bool {
-        slot.done
+        slot.is_done()
     }
 
     fn slot_select_next_token(slot: &mut Self::Slot, logits: Vec<f32>) -> Result<(), Self::Error> {
@@ -376,9 +380,9 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
         let mut slot = CohereBatchSlot::new(job)?;
         loop {
             if slot.generated_tokens.len() >= slot.job.decode_config.max_generated_tokens {
-                slot.done = true;
+                slot.stop_reason = Some(Seq2SeqGreedyDecodeStopReason::BudgetExhausted);
             }
-            if slot.done {
+            if slot.is_done() {
                 break;
             }
             // Cooperative cancel at each token step, mirroring the shared
@@ -486,8 +490,15 @@ impl CohereBatchSlot {
             stop_token_ids,
             generated_tokens: Vec::new(),
             generated_probabilities: Vec::new(),
-            done: false,
+            stop_reason: None,
         })
+    }
+
+    /// Whether this slot's decode has ended, for any reason. Callers that
+    /// need to know WHY (a guard cut vs a real stop token) read
+    /// `stop_reason` directly.
+    fn is_done(&self) -> bool {
+        self.stop_reason.is_some()
     }
 
     fn select_next_token_from_logits(
@@ -498,7 +509,7 @@ impl CohereBatchSlot {
             &self.job.decode_config,
             &mut self.generated_tokens,
             &mut self.generated_probabilities,
-            &mut self.done,
+            &mut self.stop_reason,
             self.stop_token_ids.as_slice(),
             logits,
         )
@@ -506,6 +517,9 @@ impl CohereBatchSlot {
     }
 
     fn finish(self) -> Result<CohereDecoderGraphDecodeOutput, CohereServeBatchError> {
+        let slot_stop_reason = self
+            .stop_reason
+            .unwrap_or(Seq2SeqGreedyDecodeStopReason::StopToken);
         let raw_text = self
             .job
             .tokenizer
@@ -552,12 +566,14 @@ impl CohereBatchSlot {
         };
         Ok(CohereDecoderGraphDecodeOutput {
             transcription: Transcription {
+                truncated_decodes: Vec::new(),
                 text,
                 segments,
                 longform: None,
                 language: None,
             },
             generated_tokens: self.generated_tokens,
+            stop_reason: slot_stop_reason,
         })
     }
 }
@@ -713,19 +729,19 @@ mod tests {
         scatter_and_select(slots, &logits)?;
 
         loop {
-            for slot in slots.iter_mut().filter(|slot| !slot.done) {
+            for slot in slots.iter_mut().filter(|slot| !slot.is_done()) {
                 if slot.generated_tokens.len() >= slot.job.decode_config.max_generated_tokens {
-                    slot.done = true;
+                    slot.stop_reason = Some(Seq2SeqGreedyDecodeStopReason::BudgetExhausted);
                 }
             }
-            if slots.iter().all(|slot| slot.done) {
+            if slots.iter().all(|slot| slot.is_done()) {
                 break;
             }
             let mut token_ids = Vec::with_capacity(n_seq);
             let mut positions = Vec::with_capacity(n_seq);
             let mut totals = Vec::with_capacity(n_seq);
             for slot in slots.iter() {
-                if slot.done {
+                if slot.is_done() {
                     token_ids.push(0);
                     positions.push(0);
                     totals.push(1);
@@ -781,7 +797,7 @@ mod tests {
             });
         }
         for (slot_index, slot) in slots.iter_mut().enumerate() {
-            if slot.done {
+            if slot.is_done() {
                 continue;
             }
             let start = slot_index.checked_mul(vocab_size).ok_or_else(|| {

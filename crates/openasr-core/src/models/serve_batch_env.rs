@@ -11,8 +11,9 @@ use crate::ggml_runtime::{
 };
 use crate::models::seq2seq_greedy_decode::{
     MAX_REPEAT_NGRAM, Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError,
-    Seq2SeqGreedyDecodeStepLogitsOutput, default_max_consecutive_ngram_repeats,
-    detect_degenerate_ngram_repeat, select_seq2seq_greedy_step_token,
+    Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
+    default_max_consecutive_ngram_repeats, detect_degenerate_ngram_repeat,
+    select_seq2seq_greedy_step_token,
 };
 
 /// Server-owned batch execution policy carried with an offline native request.
@@ -242,12 +243,14 @@ pub(crate) fn serve_batch_select_and_apply_greedy_step(
     decode_config: &Seq2SeqGreedyDecodeConfig,
     generated_tokens: &mut Vec<u32>,
     generated_probabilities: &mut Vec<f32>,
-    done: &mut bool,
+    stop_reason: &mut Option<Seq2SeqGreedyDecodeStopReason>,
     stop_token_ids: &[u32],
     logits: Vec<f32>,
 ) -> Result<(), Seq2SeqGreedyDecodeError> {
     match serve_batch_select_greedy_step(decode_config, generated_tokens, stop_token_ids, logits)? {
-        ServeBatchStepOutcome::ReachedEot => *done = true,
+        ServeBatchStepOutcome::ReachedEot => {
+            *stop_reason = Some(Seq2SeqGreedyDecodeStopReason::StopToken)
+        }
         ServeBatchStepOutcome::Token {
             token_id,
             probability,
@@ -259,9 +262,21 @@ pub(crate) fn serve_batch_select_and_apply_greedy_step(
                 MAX_REPEAT_NGRAM,
                 default_max_consecutive_ngram_repeats,
             ) {
+                eprintln!(
+                    "openasr_serve_batch_greedy_decode stage=greedy_decode event=degenerate_ngram_repeat status=tripped ngram_len={} repeats={} kept_tokens={} dropped_tokens={}",
+                    loop_hit.ngram_len,
+                    loop_hit.repeats,
+                    loop_hit.keep_len,
+                    generated_tokens.len().saturating_sub(loop_hit.keep_len),
+                );
                 generated_tokens.truncate(loop_hit.keep_len);
                 generated_probabilities.truncate(loop_hit.keep_len);
-                *done = true;
+                // A slot the guard cut short is NOT a slot that finished: the
+                // batched path reports the same distinction as the
+                // single-utterance driver so both reach the caller identically
+                // (this used to collapse into the same `done` flag as a real
+                // stop token).
+                *stop_reason = Some(Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard);
             }
         }
     }
@@ -629,14 +644,14 @@ mod tests {
         let stop_token_ids = [config.eot_token_id];
         let mut generated_tokens = Vec::new();
         let mut generated_probabilities = Vec::new();
-        let mut done = false;
+        let mut stop_reason = None;
         let mut steps = 0usize;
-        while !done && steps < 10 {
+        while stop_reason.is_none() && steps < 10 {
             serve_batch_select_and_apply_greedy_step(
                 &config,
                 &mut generated_tokens,
                 &mut generated_probabilities,
-                &mut done,
+                &mut stop_reason,
                 &stop_token_ids,
                 one_hot_logits(config.vocab_size, 5),
             )
@@ -644,8 +659,13 @@ mod tests {
             steps += 1;
         }
 
-        // Same outcome as the single-path guard test: truncated to one occurrence.
-        assert!(done, "guard must finish the slot");
+        // Same outcome as the single-path guard test: truncated to one
+        // occurrence, and reported as a guard cut rather than a stop token so
+        // the batched path stays distinguishable from a real completion.
+        assert_eq!(
+            stop_reason,
+            Some(Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard)
+        );
         assert_eq!(generated_tokens, vec![5]);
         assert_eq!(generated_probabilities.len(), 1);
         // Tripped at the single-token cycle bound from

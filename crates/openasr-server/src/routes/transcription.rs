@@ -461,7 +461,48 @@ async fn run_offline_transcription(
                 .expect("generated history id is a valid HTTP header"),
         );
     }
+    // `json` / `verbose_json` carry the truncation structurally; `text`, `srt`,
+    // `vtt` and `markdown` have nowhere to put it, and a client cannot be asked
+    // to guess. The header is set for every format so one check works
+    // regardless of what the client asked for.
+    if let Some(value) = truncated_decodes_header_value(&transcription) {
+        response_headers.insert(
+            "x-openasr-truncated",
+            HeaderValue::from_str(&value)
+                .expect("truncation summary is ASCII and valid as a header"),
+        );
+    }
     Ok((response_headers, rendered).into_response())
+}
+
+/// Summarize a transcript's truncated decodes for the `x-openasr-truncated`
+/// response header as `<slice>:<reason>[@<seconds>s]` entries joined by `;`,
+/// where `<slice>` is the 1-based long-form slice index or `single-pass`.
+/// `None` when the transcript covers its audio, so the header is absent on a
+/// healthy response.
+fn truncated_decodes_header_value(transcription: &openasr_core::Transcription) -> Option<String> {
+    if transcription.truncated_decodes.is_empty() {
+        return None;
+    }
+    Some(
+        transcription
+            .truncated_decodes
+            .iter()
+            .map(|truncated| {
+                let slice = match truncated.slice_index {
+                    Some(index) => index.to_string(),
+                    None => "single-pass".to_string(),
+                };
+                let anchor = truncated
+                    .truncation
+                    .transcript_covers_up_to_seconds
+                    .map(|seconds| format!("@{seconds:.2}s"))
+                    .unwrap_or_default();
+                format!("{slice}:{}{anchor}", truncated.truncation.reason.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
 }
 
 // ── History / auth helpers ────────────────────────────────────────────────────

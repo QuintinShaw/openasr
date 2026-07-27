@@ -415,6 +415,7 @@ mod tests {
 
     fn transcription(segments: Vec<Segment>) -> Transcription {
         Transcription {
+            truncated_decodes: Vec::new(),
             text: segments
                 .iter()
                 .map(|s| s.text.trim())

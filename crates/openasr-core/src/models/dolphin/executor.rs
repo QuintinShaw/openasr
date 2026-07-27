@@ -648,6 +648,7 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
         };
         Ok(GgmlAsrExecutionResult {
             transcription: Transcription {
+                truncated_decodes: Vec::new(),
                 text: output.text,
                 segments,
                 longform: None,
@@ -657,7 +658,7 @@ impl GgmlAsrExecutor for DolphinGgmlExecutor {
                 language: Some(output.resolved_language),
             },
             carry_context: None,
-            decode_truncated_at_seconds: None,
+            decode_truncation: None,
         })
     }
 
