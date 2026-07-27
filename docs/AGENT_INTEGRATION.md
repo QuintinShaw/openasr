@@ -161,6 +161,29 @@ form field) is rejected with an actionable 400: SSE streaming is the
 OpenASR realtime protocol behind the `?stream=true` query parameter, not
 OpenAI `transcript.text.*` events.
 
+### Incomplete transcripts
+
+A decode can end before it has described all of its audio -- the shared
+degenerate-repeat guard cuts off a model that started looping, or the token
+budget runs out before the model finishes. The request still succeeds; the
+transcript is simply short. Both JSON formats therefore carry a top-level
+`truncated` array (absent when the transcript covers its audio), and every
+format sets the `x-openasr-truncated` response header:
+
+```json
+"truncated": [
+  { "slice": 3, "reason": "degenerate-repeat-guard", "covers_up_to_seconds": 12.5 }
+]
+```
+
+`reason` is `degenerate-repeat-guard` or `budget-exhausted`. `slice` is the
+1-based long-form slice and is absent for a single-pass decode.
+`covers_up_to_seconds` is absent for families that emit no intra-decode
+timestamps -- there is no honest value, and the clip length would read as
+"nothing was lost". Treat the presence of an entry, not its anchor, as the
+signal. The CLI prints the same fact as a `warning:` line on stderr, so it
+is visible for `text`/`srt`/`vtt`/`markdown` output too.
+
 The full parameter-by-parameter matrix lives in the Skill's
 [`references/http-api.md`](../skills/openasr/references/http-api.md); the
 root [README](../README.md#local-http-api) documents the request-field

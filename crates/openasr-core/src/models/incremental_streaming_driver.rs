@@ -917,6 +917,7 @@ mod tests {
 
     fn transcription(text: &str) -> Transcription {
         Transcription {
+            truncated_decodes: Vec::new(),
             text: text.to_string(),
             segments: vec![Segment {
                 start: 0.0,
@@ -935,6 +936,7 @@ mod tests {
 
     fn text_only_transcription(text: &str) -> Transcription {
         Transcription {
+            truncated_decodes: Vec::new(),
             text: text.to_string(),
             segments: Vec::new(),
             longform: None,
@@ -1019,6 +1021,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         Transcription {
+            truncated_decodes: Vec::new(),
             text: text.clone(),
             segments: vec![Segment {
                 start: 0.0,
@@ -1677,7 +1680,7 @@ mod tests {
                     Ok(GgmlAsrExecutionResult {
                         transcription: transcription(""),
                         carry_context: None,
-                        decode_truncated_at_seconds: None,
+                        decode_truncation: None,
                     })
                 },
             );

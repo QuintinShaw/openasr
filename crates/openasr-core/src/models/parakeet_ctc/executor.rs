@@ -373,13 +373,14 @@ impl GgmlAsrExecutor for ParakeetCtcGgmlExecutor {
         };
         Ok(GgmlAsrExecutionResult {
             transcription: Transcription {
+                truncated_decodes: Vec::new(),
                 text: output.text,
                 segments,
                 longform: None,
                 language: None,
             },
             carry_context: None,
-            decode_truncated_at_seconds: None,
+            decode_truncation: None,
         })
     }
 }

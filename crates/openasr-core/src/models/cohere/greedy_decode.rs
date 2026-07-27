@@ -6,7 +6,7 @@ use crate::models::decode_policy_component_registry::{
     run_builtin_seq2seq_decode_policy,
 };
 use crate::models::seq2seq_greedy_decode::{
-    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor,
+    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStopReason,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -15,6 +15,11 @@ pub(crate) struct CohereTranscribeGreedyDecodeResult {
     /// Per-token softmax probability, parallel to `generated_tokens`.
     pub generated_probabilities: Vec<f32>,
     pub text: String,
+    /// How the shared driver ended this decode. Carried out of the wrapper
+    /// so the executor can tell "the model finished" from "we cut it off",
+    /// which is the difference between a transcript that covers its audio and
+    /// one that silently stops partway.
+    pub stop_reason: Seq2SeqGreedyDecodeStopReason,
 }
 
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -86,6 +91,7 @@ pub(crate) fn run_cohere_transcribe_greedy_decode_loop(
         generated_tokens: output.generated_tokens,
         generated_probabilities: output.generated_probabilities,
         text: output.text,
+        stop_reason: output.stop_reason,
     })
 }
 
@@ -333,5 +339,88 @@ mod tests {
             error,
             CohereTranscribeGreedyDecodeError::EotNotReachedBeforeMaxTokens { .. }
         ));
+    }
+
+    /// The family wrapper must carry the driver's stop reason out, both when
+    /// the model finished on its own and when the degenerate-repeat guard cut
+    /// the decode short. Dropping it here is what leaves the executor unable to
+    /// tell a complete transcript from a truncated one -- a difference the
+    /// caller never sees, because both come back as a successful decode with
+    /// less text.
+    #[test]
+    fn cohere_transcribe_wrapper_carries_the_driver_stop_reason() {
+        use crate::models::seq2seq_greedy_decode::default_max_consecutive_ngram_repeats;
+
+        let token_table = BTreeMap::from([(1, "a"), (5, "gu")]);
+        let decode_text_token_ids = |token_ids: &[u32]| {
+            let mut out = String::new();
+            for token_id in token_ids {
+                let Some(piece) = token_table.get(token_id) else {
+                    return Err(CohereTranscribeGreedyDecodeError::TokenizerDecodeFailed {
+                        reason: format!("token {token_id} missing from synthetic decoder table"),
+                    });
+                };
+                out.push_str(piece);
+            }
+            Ok(out)
+        };
+
+        // Normal completion: the model emits its own stop token.
+        let mut complete_executor = SyntheticStepExecutor {
+            vocab_size: 16,
+            sequence: vec![1, 7],
+            logits_calls: 0,
+        };
+        let complete = run_cohere_transcribe_greedy_decode_loop(
+            &BuiltinSeq2SeqDecodePolicyConfigInput {
+                initial_prompt_tokens: vec![42],
+                eot_token_id: 7,
+                vocab_size: 16,
+                max_generated_tokens: 8,
+            },
+            &(),
+            None,
+            &mut complete_executor,
+            &decode_text_token_ids,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+        )
+        .expect("stop-token decode succeeds");
+        assert_eq!(
+            complete.stop_reason,
+            Seq2SeqGreedyDecodeStopReason::StopToken
+        );
+        assert!(
+            !complete.stop_reason.is_truncated(),
+            "a stop-token decode must not be reported as truncated"
+        );
+
+        // Degenerate loop: the guard ends the decode, and that must NOT be
+        // laundered into a stop token.
+        let stutter_len = default_max_consecutive_ngram_repeats(1);
+        let mut looping_executor = SyntheticStepExecutor {
+            vocab_size: 16,
+            sequence: vec![5; stutter_len],
+            logits_calls: 0,
+        };
+        let looped = run_cohere_transcribe_greedy_decode_loop(
+            &BuiltinSeq2SeqDecodePolicyConfigInput {
+                initial_prompt_tokens: vec![42],
+                eot_token_id: 7,
+                vocab_size: 16,
+                max_generated_tokens: stutter_len,
+            },
+            &(),
+            None,
+            &mut looping_executor,
+            &decode_text_token_ids,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+        )
+        .expect("guard-stopped decode still returns the kept prefix");
+        assert_eq!(
+            looped.stop_reason,
+            Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard
+        );
+        assert!(looped.stop_reason.is_truncated());
+        assert_eq!(looped.generated_tokens, vec![5]);
     }
 }

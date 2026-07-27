@@ -1832,6 +1832,7 @@ fn backend_result_timeout_parses_override_and_falls_back_to_default() {
 #[test]
 fn realtime_words_from_transcription_maps_seconds_to_milliseconds() {
     let transcription = Transcription {
+        truncated_decodes: Vec::new(),
         text: "hello world".to_string(),
         segments: vec![openasr_core::Segment {
             start: 0.0,

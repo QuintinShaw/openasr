@@ -70,6 +70,9 @@ thread_local! {
 pub(crate) struct MoonshineDecodeOutput {
     pub transcription: Transcription,
     pub generated_tokens: Vec<u32>,
+    /// How the shared driver ended this decode, carried to the executor so a
+    /// cut-short transcript is not returned as a complete one.
+    pub stop_reason: Seq2SeqGreedyDecodeStopReason,
 }
 
 #[derive(Debug, Error)]
@@ -289,12 +292,14 @@ fn run_moonshine_decoder_short_form_with_runtime(
 
     Ok(MoonshineDecodeOutput {
         transcription: Transcription {
+            truncated_decodes: Vec::new(),
             text,
             segments,
             longform: None,
             language: None,
         },
         generated_tokens: decode.generated_tokens,
+        stop_reason: decode.stop_reason,
     })
 }
 

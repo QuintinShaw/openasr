@@ -1,11 +1,19 @@
 use serde::Serialize;
 
-use crate::api::backend::{Transcription, TranscriptionLongFormMetadata};
+use crate::api::backend::{Transcription, TranscriptionLongFormMetadata, TruncatedDecode};
 
 #[derive(Serialize)]
 pub(super) struct JsonTranscription<'a> {
     text: &'a str,
     segments: Vec<JsonSegment<'a>>,
+    /// Decodes behind this transcript that stopped before covering their audio.
+    ///
+    /// Present in the plain `json` format, not only `verbose_json`: "this text
+    /// is not all of the recording" is not a diagnostic detail a caller can be
+    /// asked to opt into. Omitted entirely on a complete transcript, so an
+    /// existing consumer sees no change until something actually went wrong.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    truncated: Vec<JsonTruncatedDecode>,
 }
 
 #[derive(Serialize)]
@@ -26,6 +34,36 @@ pub(super) struct VerboseJsonTranscription<'a> {
     words: Vec<JsonWord<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     longform: Option<VerboseLongFormMetadata<'a>>,
+    /// See [`JsonTranscription::truncated`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    truncated: Vec<JsonTruncatedDecode>,
+}
+
+#[derive(Serialize)]
+struct JsonTruncatedDecode {
+    /// 1-based long-form slice index; absent for a single-pass decode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slice: Option<usize>,
+    /// `degenerate-repeat-guard` or `budget-exhausted`.
+    reason: &'static str,
+    /// Second, within the decode's own audio, up to which the transcript still
+    /// describes it. Absent when the family emits no intra-decode timestamps:
+    /// there is no honest value, and the clip length would read as "nothing was
+    /// lost".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covers_up_to_seconds: Option<f32>,
+}
+
+fn json_truncated_decodes(transcription: &Transcription) -> Vec<JsonTruncatedDecode> {
+    transcription
+        .truncated_decodes
+        .iter()
+        .map(|truncated: &TruncatedDecode| JsonTruncatedDecode {
+            slice: truncated.slice_index,
+            reason: truncated.truncation.reason.as_str(),
+            covers_up_to_seconds: truncated.truncation.transcript_covers_up_to_seconds,
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -122,6 +160,7 @@ impl<'a> From<&'a Transcription> for JsonTranscription<'a> {
         Self {
             text: &transcription.text,
             segments: json_segments(transcription, false),
+            truncated: json_truncated_decodes(transcription),
         }
     }
 }
@@ -141,6 +180,7 @@ impl<'a> From<&'a Transcription> for VerboseJsonTranscription<'a> {
                 .longform
                 .as_ref()
                 .map(verbose_longform_metadata),
+            truncated: json_truncated_decodes(transcription),
         }
     }
 }

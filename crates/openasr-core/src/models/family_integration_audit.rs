@@ -368,6 +368,75 @@ pub(crate) mod source_tree_audit {
         Ok(())
     }
 
+    /// Every family that reaches the shared greedy driver must lift the
+    /// driver's stop reason into the transcript's truncation signal.
+    ///
+    /// The driver reports a guard cut and an exhausted budget as distinct stop
+    /// reasons precisely so a caller can see that the transcript stops short of
+    /// the audio -- but the reason dies inside the family unless the family
+    /// forwards it. That failure is invisible: the request succeeds, the shape
+    /// is normal, there is just less text. This check fails closed on a family
+    /// that routes through the driver and never calls
+    /// `into_decode_truncation`, the same way the decode-policy resolution test
+    /// fails closed on a half-connected driver.
+    #[test]
+    fn every_shared_greedy_family_forwards_the_driver_stop_reason() {
+        // hymt2 is a translation runtime, not an ASR family: it produces
+        // subtitle text from text, never a `Transcription` over audio, and is
+        // absent from the architecture registry's SharedSeq2SeqGreedy set. It
+        // has no transcript for a truncation signal to ride on, so the contract
+        // this test enforces does not apply to it.
+        const NON_TRANSCRIPT_FAMILY_DIRECTORIES: &[&str] = &["hymt2"];
+
+        let models_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/models");
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&models_dir).expect("models dir is readable") {
+            let entry = entry.expect("models dir entry");
+            if !entry.file_type().expect("entry file type").is_dir() {
+                continue;
+            }
+            let directory = entry.path();
+            let name = directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("family directory name")
+                .to_string();
+            let sources: Vec<String> = std::fs::read_dir(&directory)
+                .expect("family dir is readable")
+                .filter_map(|file| file.ok())
+                .map(|file| file.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(|path| std::fs::read_to_string(path).ok())
+                .collect();
+            // Match the call, turbofished or not, and never the `use` line:
+            // `run_builtin_seq2seq_decode_policy(` alone silently skipped the
+            // families that spell the call `...::<Seq2SeqGreedyDecodeError>(`.
+            let reaches_shared_driver = sources.iter().any(|source| {
+                source.contains("run_builtin_seq2seq_decode_policy(")
+                    || source.contains("run_builtin_seq2seq_decode_policy::<")
+            });
+            if !reaches_shared_driver || NON_TRANSCRIPT_FAMILY_DIRECTORIES.contains(&name.as_str())
+            {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                sources
+                    .iter()
+                    .any(|source| source.contains("into_decode_truncation(")),
+                "family '{name}' routes through the shared greedy driver but never lifts its \
+                 stop reason into a truncation signal: a guard-cut transcript would be returned \
+                 as a complete one"
+            );
+        }
+        // Guards the walk itself: a rename that stops matching the driver call
+        // would otherwise make this test vacuously pass.
+        assert_eq!(
+            checked, 8,
+            "expected the 8 SharedSeq2SeqGreedy ASR families to be found by this walk"
+        );
+    }
+
     #[test]
     fn builtin_native_family_integrations_pass() {
         audit_builtin_native_family_integrations().expect("builtins must be fully wired");
@@ -617,13 +686,14 @@ pub(crate) mod source_tree_audit {
                 let _backend = _request.resolved_runtime.backend();
                 Ok(GgmlAsrExecutionResult {
                     transcription: crate::Transcription {
+                        truncated_decodes: Vec::new(),
                         text: "ok".to_string(),
                         segments: Vec::new(),
                         longform: None,
                         language: None,
                     },
                     carry_context: None,
-                    decode_truncated_at_seconds: None,
+                    decode_truncation: None,
                 })
             }
         }
