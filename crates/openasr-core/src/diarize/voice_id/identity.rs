@@ -52,15 +52,16 @@
 
 use std::collections::BTreeMap;
 
+use super::evidence::{self, JudgedWindows, MIN_PURITY_VERDICT_WINDOWS, WINDOW_SECONDS};
 use crate::Segment;
-use crate::diarize::contract::SpeakerEmbedding;
+use crate::diarize::contract::{SpeakerEmbedding, TimeRange};
 
 /// Audio sample rate the speaker embedder is fed at; the transcription
 /// pipeline resamples to this before decode, so segment times index directly
 /// into a scope's samples at this rate.
 const EMBEDDER_SAMPLE_RATE_HZ: usize = 16_000;
 
-/// # The invariant these two constants exist to enforce
+/// # The invariant this constant exists to enforce
 ///
 /// This stage *validates* someone else's output: a segmenter decided which
 /// turns exist and how finely to cut them, and this stage then decides whether
@@ -86,27 +87,28 @@ const EMBEDDER_SAMPLE_RATE_HZ: usize = 16_000;
 /// # What replaces it
 ///
 /// How much voice backs a label, counted in a way that does not assume any
-/// particular segment granularity: only segments individually long enough to
-/// produce a stable embedding count, and enough of them must accumulate.
+/// particular segment granularity. Half of that is now structural rather than
+/// a constant: the embedding unit is a fixed
+/// [`WINDOW_SECONDS`](evidence::WINDOW_SECONDS) window, so "was this unit long
+/// enough to embed stably" cannot be false, and a segment too short to hold one
+/// contributes nothing by construction (see [`evidence`]). A previous
+/// `MIN_RELIABLE_EMBEDDING_SECONDS = 1.0` said the same thing about segments
+/// and is gone with them -- the window is twice as long and, unlike a segment,
+/// is guaranteed to be.
 ///
 /// Total duration alone is the wrong measure, and the corpus shows why: a
 /// label made of twenty sub-second "mm"s and a label with one continuous turn
 /// can carry the same number of seconds while being worlds apart as evidence.
 /// AISHELL-4 `L_R003S01C02` speaker `003-F` is exactly that -- 5.18s spread
 /// over eight fragments of 0.39-0.93s, every one of them too short for a
-/// trustworthy embedding, and a plain 3s total would have named her.
+/// trustworthy embedding, and a plain 3s total would have named her. Under
+/// windowing she yields no window at all.
 ///
-/// Shortest single segment whose embedding is stable enough to be evidence for
-/// naming. Corroborated by the streaming path, which independently arrived at
-/// the same figure for the same question
-/// (`diarize::streaming::MIN_CENTROID_UPDATE_DURATION_S`: "centroids are
-/// updated only from embeddings with enough speech context to be stable").
-/// The corpus surface is flat here: anything in 0.75-1.5s rejects exactly the
-/// same ten labels.
-const MIN_RELIABLE_EMBEDDING_SECONDS: f64 = 1.0;
-
-/// How much of that reliable voice a label needs before this stage will match
-/// it against enrolled people at all.
+/// # This constant
+///
+/// How much voice a label needs before this stage will match it against
+/// enrolled people at all, measured over the audio the surviving main-cluster
+/// windows actually cover -- distinct audio, since consecutive windows overlap.
 ///
 /// Naming a real person cannot be cheaper than inventing an anonymous one, and
 /// the streaming path already requires 2.5s before it will create even an
@@ -116,13 +118,24 @@ const MIN_RELIABLE_EMBEDDING_SECONDS: f64 = 1.0;
 /// seconds are 0, 0, 1.08, 1.29, 1.29, 1.32, 1.43, 1.70, 1.84, 1.98 | 4.28,
 /// 4.84, 5.93, 9.40, ... -- **nothing at all lands between 2.0 and 4.3**, so
 /// any threshold in 2.0-4.0 rejects the same ten walk-on speakers and keeps
-/// the same thirty-five real participants. Every genuine meeting participant
-/// clears it by 1.4x or more, most by two orders of magnitude.
+/// the same thirty-five real participants.
 ///
 /// This is deliberately one-sided, per this module's "erring toward
 /// anonymous": the cost of rejecting is one familiar voice left as
 /// "Speaker 2", the cost of accepting is a transcript that confidently
 /// attributes a stranger's words to someone the user knows.
+///
+/// # Its relationship to the window count gate
+///
+/// Naming also requires [`MIN_PURITY_VERDICT_WINDOWS`] surviving windows, and
+/// the two are **nested, not competing**: both are one-sided toward anonymous,
+/// so they can only ever refuse together. At today's geometry the window count
+/// is the binding one -- five windows span at least 6.0s of distinct audio
+/// however they are arranged, twice this floor -- and it is a statement about
+/// the *purity verdict* being computable at all, not about quantity of voice.
+/// This constant is the quantity statement, in the unit that stays meaningful
+/// if the window geometry is ever retuned. Neither may be restated in terms of
+/// the other, for the same reason the section above gives.
 const MIN_NAMING_EVIDENCE_SECONDS: f64 = 3.0;
 
 /// One decode unit's labeled segments together with the audio they refer to.
@@ -166,22 +179,28 @@ pub fn name_speakers_across_scopes(scopes: &mut [SpeakerScope<'_>]) {
     // into one centroid unless a caller genuinely produced one scope.
     let mut evidence: BTreeMap<String, LabelEvidence> = BTreeMap::new();
     for (scope_index, scope) in scopes.iter().enumerate() {
-        for segment in scope.segments.iter() {
-            let Some(label) = segment.speaker_label.as_ref() else {
+        for (label, windows) in evidence::plan_label_windows(scope.segments) {
+            let mut embeddings = Vec::with_capacity(windows.len());
+            let mut spans = Vec::with_capacity(windows.len());
+            for window in windows {
+                let Some(clip) = window_clip(&window, scope.samples) else {
+                    continue;
+                };
+                let Ok(embedding) = embedder.embed(clip, EMBEDDER_SAMPLE_RATE_HZ as u32) else {
+                    continue;
+                };
+                embeddings.push(embedding);
+                spans.push(window);
+            }
+            if embeddings.is_empty() {
                 continue;
-            };
-            let Some(clip) = segment_clip(segment, scope.samples) else {
-                continue;
-            };
-            let Ok(embedding) = embedder.embed(clip, EMBEDDER_SAMPLE_RATE_HZ as u32) else {
-                continue;
-            };
-            let entry = evidence
-                .entry(label.clone())
-                .or_insert_with(|| LabelEvidence::new(embedding.dim(), scope_index));
-            entry.accumulate(
-                &embedding,
-                clip.len() as f64 / EMBEDDER_SAMPLE_RATE_HZ as f64,
+            }
+            evidence.insert(
+                label,
+                LabelEvidence::from_windows(
+                    evidence::judge_windows(&embeddings, &spans),
+                    scope_index,
+                ),
             );
         }
     }
@@ -247,16 +266,19 @@ pub fn name_speakers_from_labeled_segments(segments: &mut [Segment], samples: &[
     name_speakers_across_scopes(&mut [SpeakerScope { segments, samples }]);
 }
 
-/// Summed embeddings plus how much audio backed them, per label.
+/// What a label's voice amounts to: the windows that survived main-cluster
+/// filtering, plus the verdict on whether they came from one person.
 struct LabelEvidence {
-    sum: Vec<f32>,
-    seconds: f64,
-    /// Of `seconds`, the part contributed by segments that were individually
-    /// at least [`MIN_RELIABLE_EMBEDDING_SECONDS`] long. This is the quantity
-    /// both gates below judge by, and the reason they do not care how finely
-    /// the segmenter cut: a run of sub-second fragments adds to `seconds` and
-    /// contributes nothing here.
-    reliable_seconds: f64,
+    /// Main-cluster window embeddings. Every centroid below is their mean, and
+    /// nothing else is ever averaged in -- the filtering happens once, here,
+    /// and is not conditional on `single_voice`.
+    kept: Vec<SpeakerEmbedding>,
+    /// Distinct audio the kept windows cover.
+    kept_seconds: f64,
+    /// Whether the windows split into two clusters far enough apart to be two
+    /// people. Naming requires this; stitching deliberately does not (see
+    /// [`stitch_labels_across_scopes`]).
+    single_voice: bool,
     /// Which scope this label belongs to. Two labels sharing a scope were told
     /// apart by that scope's own segmenter and must never be stitched back
     /// together (see [`stitch_labels_across_scopes`]).
@@ -264,61 +286,58 @@ struct LabelEvidence {
 }
 
 impl LabelEvidence {
-    fn new(dim: usize, scope_index: usize) -> Self {
+    fn from_windows(judged: JudgedWindows, scope_index: usize) -> Self {
         Self {
-            sum: vec![0.0; dim],
-            seconds: 0.0,
-            reliable_seconds: 0.0,
+            kept: judged.kept,
+            kept_seconds: judged.kept_seconds,
+            single_voice: judged.single_voice,
             scope_index,
         }
     }
 
+    /// Merge another label's evidence after stitching decided they are one
+    /// person.
+    ///
+    /// The already-filtered windows are concatenated rather than re-judged.
+    /// Re-running the purity split across scopes would be asking a different
+    /// question than the one it can answer: the same person recorded in two
+    /// scopes can legitimately split into two clusters by channel or distance,
+    /// and stitching has already ruled on identity using the whole-label
+    /// centroids. Each part keeps the verdict its own scope earned, and the
+    /// merged label is single-voice only if every part was.
     fn absorb(&mut self, other: &LabelEvidence) {
-        if self.sum.len() != other.sum.len() {
-            return;
-        }
-        for (sum, value) in self.sum.iter_mut().zip(&other.sum) {
-            *sum += value;
-        }
-        self.seconds += other.seconds;
-        self.reliable_seconds += other.reliable_seconds;
-    }
-
-    fn accumulate(&mut self, embedding: &SpeakerEmbedding, seconds: f64) {
-        if self.sum.len() != embedding.dim() {
-            return;
-        }
-        for (sum, value) in self.sum.iter_mut().zip(&embedding.0) {
-            *sum += value;
-        }
-        self.seconds += seconds;
-        if seconds >= MIN_RELIABLE_EMBEDDING_SECONDS {
-            self.reliable_seconds += seconds;
-        }
+        self.kept.extend(other.kept.iter().cloned());
+        self.kept_seconds += other.kept_seconds;
+        self.single_voice &= other.single_voice;
     }
 
     /// The label's mean embedding for *stitching* -- deciding that two scopes'
     /// labels are the same voice.
     ///
-    /// The bar is only that some single segment was long enough to embed
-    /// stably at all: stitching's failure mode is fusing two people, and the
-    /// alternative to stitching (leaving the label as its own speaker) is the
-    /// recoverable direction, so this gate does not need naming's margin.
+    /// Any surviving window is enough: stitching's failure mode is fusing two
+    /// people, and the alternative to stitching (leaving the label as its own
+    /// speaker) is the recoverable direction, so this gate does not need
+    /// naming's margin. It notably does **not** require `single_voice` -- a
+    /// label the verdict rejected still has a main-cluster centroid that is
+    /// clean enough to place, and refusing to stitch it would fragment one
+    /// person across scopes for a reason that only concerns naming.
     fn centroid_for_stitching(&self) -> Option<SpeakerEmbedding> {
-        (self.reliable_seconds >= MIN_RELIABLE_EMBEDDING_SECONDS)
-            .then(|| SpeakerEmbedding::l2_normalized(self.sum.clone()))
+        evidence::centroid(self.kept.iter())
     }
 
     /// The label's mean embedding for *naming* -- attaching an enrolled
     /// person's display name.
     ///
     /// Strictly stricter than [`Self::centroid_for_stitching`], because the
-    /// failure mode is strictly worse: a user who reads a name believes it.
-    /// See [`MIN_NAMING_EVIDENCE_SECONDS`] for why this is measured in
-    /// reliable seconds rather than in segments or in raw duration.
+    /// failure mode is strictly worse: a user who reads a name believes it. All
+    /// three conditions point the same way (see [`MIN_NAMING_EVIDENCE_SECONDS`]
+    /// on why the last two are not one gate stated twice).
     fn centroid_for_naming(&self) -> Option<SpeakerEmbedding> {
-        (self.reliable_seconds >= MIN_NAMING_EVIDENCE_SECONDS)
-            .then(|| SpeakerEmbedding::l2_normalized(self.sum.clone()))
+        (self.single_voice
+            && self.kept.len() >= MIN_PURITY_VERDICT_WINDOWS
+            && self.kept_seconds >= MIN_NAMING_EVIDENCE_SECONDS)
+            .then(|| evidence::centroid(self.kept.iter()))
+            .flatten()
     }
 }
 
@@ -333,10 +352,11 @@ impl LabelEvidence {
 ///
 /// - **A label with too little audio to embed reliably is never stitched**
 ///   ([`LabelEvidence::centroid_for_stitching`]): a speaker who says two words
-///   in one slice stays their own speaker rather than being attached to
-///   whoever they happened to sound closest to. Over-counting is the
-///   recoverable mistake; fusing two people is not. This is a lower bar than
-///   naming, deliberately -- see [`MIN_NAMING_EVIDENCE_SECONDS`].
+///   in one slice produces no window at all, so stays their own speaker rather
+///   than being attached to whoever they happened to sound closest to.
+///   Over-counting is the recoverable mistake; fusing two people is not. This
+///   is a lower bar than naming, deliberately -- see
+///   [`MIN_NAMING_EVIDENCE_SECONDS`].
 /// - **Two labels from the same scope are never merged.** That scope's own
 ///   segmenter already asserted they are different speakers, and it had the
 ///   full turn structure of that decode unit to say so; a centroid comparison
@@ -464,11 +484,18 @@ fn disambiguate_labels_across_scopes(scopes: &mut [SpeakerScope<'_>]) {
     }
 }
 
-fn segment_clip<'a>(segment: &Segment, samples: &'a [f32]) -> Option<&'a [f32]> {
-    let rate = EMBEDDER_SAMPLE_RATE_HZ as f32;
-    let start = (segment.start.max(0.0) * rate).floor() as usize;
-    let end = (segment.end.max(segment.start).max(0.0) * rate).ceil() as usize;
-    samples.get(start.min(samples.len())..end.min(samples.len()))
+/// The samples one window names, or `None` if the scope's audio does not
+/// contain the whole window.
+///
+/// Whole or nothing, on purpose: the point of a fixed unit is that every
+/// embedding is backed by the same amount of audio, and a truncated tail window
+/// would quietly reintroduce the variable-length unit this stage exists to get
+/// rid of.
+fn window_clip<'a>(window: &TimeRange, samples: &'a [f32]) -> Option<&'a [f32]> {
+    let rate = EMBEDDER_SAMPLE_RATE_HZ as f64;
+    let start = (window.start_s.max(0.0) * rate).round() as usize;
+    let length = (WINDOW_SECONDS * rate).round() as usize;
+    samples.get(start..start.checked_add(length)?)
 }
 
 #[cfg(test)]
@@ -566,15 +593,23 @@ mod tests {
         }
     }
 
-    /// One turn's worth of continuous speech, comfortably over every gate.
-    const PLENTY_OF_EVIDENCE_SECONDS: f64 = 8.0;
-    /// One short utterance: enough to embed, nowhere near enough to name.
-    const A_SINGLE_FRAGMENT_SECONDS: f64 = 0.25;
+    /// A talkative label: comfortably over every gate.
+    const PLENTY_OF_WINDOWS: usize = 8;
+    /// One short utterance: too short to hold a single window.
+    const NOT_EVEN_ONE_WINDOW: usize = 0;
 
-    fn evidence_entry(scope_index: usize, values: Vec<f32>, seconds: f64) -> LabelEvidence {
-        let mut entry = LabelEvidence::new(values.len(), scope_index);
-        entry.accumulate(&SpeakerEmbedding::l2_normalized(values), seconds);
-        entry
+    fn evidence_entry(scope_index: usize, values: Vec<f32>, windows: usize) -> LabelEvidence {
+        let voice = SpeakerEmbedding::l2_normalized(values);
+        LabelEvidence {
+            kept: vec![voice; windows],
+            kept_seconds: if windows == 0 {
+                0.0
+            } else {
+                WINDOW_SECONDS + (windows - 1) as f64 * evidence::WINDOW_STEP_SECONDS
+            },
+            single_voice: true,
+            scope_index,
+        }
     }
 
     fn stitch(entries: &[(&str, LabelEvidence)]) -> BTreeMap<String, String> {
@@ -584,9 +619,9 @@ mod tests {
                 (
                     (*label).to_string(),
                     LabelEvidence {
-                        sum: entry.sum.clone(),
-                        seconds: entry.seconds,
-                        reliable_seconds: entry.reliable_seconds,
+                        kept: entry.kept.clone(),
+                        kept_seconds: entry.kept_seconds,
+                        single_voice: entry.single_voice,
                         scope_index: entry.scope_index,
                     },
                 )
@@ -603,19 +638,19 @@ mod tests {
     /// them back together.
     #[test]
     fn scopes_are_stitched_back_together_by_matching_voices() {
-        let seconds = PLENTY_OF_EVIDENCE_SECONDS;
+        let windows = PLENTY_OF_WINDOWS;
         let stitched = stitch(&[
             (
                 "SPEAKER_00",
-                evidence_entry(0, vec![1.0, 0.0, 0.0], seconds),
+                evidence_entry(0, vec![1.0, 0.0, 0.0], windows),
             ),
             (
                 "SPEAKER_01",
-                evidence_entry(0, vec![0.0, 1.0, 0.0], seconds),
+                evidence_entry(0, vec![0.0, 1.0, 0.0], windows),
             ),
             (
                 "SPEAKER_02",
-                evidence_entry(1, vec![0.99, 0.1, 0.0], seconds),
+                evidence_entry(1, vec![0.99, 0.1, 0.0], windows),
             ),
         ]);
         // The second scope's speaker is the first scope's SPEAKER_00 voice.
@@ -634,15 +669,15 @@ mod tests {
     /// outranks a centroid comparison.
     #[test]
     fn labels_from_one_scope_are_never_stitched_to_each_other() {
-        let seconds = PLENTY_OF_EVIDENCE_SECONDS;
+        let windows = PLENTY_OF_WINDOWS;
         let stitched = stitch(&[
             (
                 "SPEAKER_00",
-                evidence_entry(0, vec![1.0, 0.0, 0.0], seconds),
+                evidence_entry(0, vec![1.0, 0.0, 0.0], windows),
             ),
             (
                 "SPEAKER_01",
-                evidence_entry(0, vec![1.0, 0.01, 0.0], seconds),
+                evidence_entry(0, vec![1.0, 0.01, 0.0], windows),
             ),
         ]);
         assert!(stitched.is_empty(), "{stitched:?}");
@@ -652,15 +687,15 @@ mod tests {
     /// collapsed onto whichever label they were nearest to.
     #[test]
     fn different_voices_in_different_scopes_stay_separate() {
-        let seconds = PLENTY_OF_EVIDENCE_SECONDS;
+        let windows = PLENTY_OF_WINDOWS;
         let stitched = stitch(&[
             (
                 "SPEAKER_00",
-                evidence_entry(0, vec![1.0, 0.0, 0.0], seconds),
+                evidence_entry(0, vec![1.0, 0.0, 0.0], windows),
             ),
             (
                 "SPEAKER_01",
-                evidence_entry(1, vec![0.0, 1.0, 0.0], seconds),
+                evidence_entry(1, vec![0.0, 1.0, 0.0], windows),
             ),
         ]);
         assert!(stitched.is_empty(), "{stitched:?}");
@@ -674,11 +709,11 @@ mod tests {
         let stitched = stitch(&[
             (
                 "SPEAKER_00",
-                evidence_entry(0, vec![1.0, 0.0, 0.0], PLENTY_OF_EVIDENCE_SECONDS),
+                evidence_entry(0, vec![1.0, 0.0, 0.0], PLENTY_OF_WINDOWS),
             ),
             (
                 "SPEAKER_01",
-                evidence_entry(1, vec![1.0, 0.0, 0.0], A_SINGLE_FRAGMENT_SECONDS),
+                evidence_entry(1, vec![1.0, 0.0, 0.0], NOT_EVEN_ONE_WINDOW),
             ),
         ]);
         assert!(stitched.is_empty(), "{stitched:?}");
@@ -688,15 +723,15 @@ mod tests {
     /// stitched speaker, with the audio evidence of every scope it spans.
     #[test]
     fn stitched_labels_pool_their_evidence() {
-        let seconds = PLENTY_OF_EVIDENCE_SECONDS;
+        let windows = PLENTY_OF_WINDOWS;
         let evidence: BTreeMap<String, LabelEvidence> = [
             (
                 "SPEAKER_00".to_string(),
-                evidence_entry(0, vec![1.0, 0.0], seconds),
+                evidence_entry(0, vec![1.0, 0.0], windows),
             ),
             (
                 "SPEAKER_01".to_string(),
-                evidence_entry(1, vec![1.0, 0.0], seconds),
+                evidence_entry(1, vec![1.0, 0.0], windows),
             ),
         ]
         .into_iter()
@@ -707,29 +742,49 @@ mod tests {
                 .collect();
         let pooled = pool_evidence_by_canonical_label(evidence, &stitched);
         assert_eq!(pooled.len(), 1);
-        assert_eq!(pooled["SPEAKER_00"].seconds, seconds * 2.0);
+        assert_eq!(pooled["SPEAKER_00"].kept.len(), windows * 2);
     }
 
-    /// Evidence too short to embed reliably yields no centroid at all, so such
-    /// a label can never be stitched onto another scope's label nor handed to
-    /// the matcher.
+    /// A label too short to hold a single window yields no centroid at all, so
+    /// it can never be stitched onto another scope's label nor handed to the
+    /// matcher.
     #[test]
     fn thin_evidence_is_not_worth_a_name() {
-        let mut evidence = LabelEvidence::new(2, 0);
-        evidence.accumulate(
-            &SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]),
-            A_SINGLE_FRAGMENT_SECONDS,
-        );
-        assert!(evidence.centroid_for_stitching().is_none());
-        assert!(evidence.centroid_for_naming().is_none());
+        let thin = evidence_entry(0, vec![1.0, 0.0], NOT_EVEN_ONE_WINDOW);
+        assert!(thin.centroid_for_stitching().is_none());
+        assert!(thin.centroid_for_naming().is_none());
 
-        let mut evidence = LabelEvidence::new(2, 0);
-        evidence.accumulate(
-            &SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]),
-            PLENTY_OF_EVIDENCE_SECONDS,
-        );
-        assert!(evidence.centroid_for_stitching().is_some());
-        assert!(evidence.centroid_for_naming().is_some());
+        let plenty = evidence_entry(0, vec![1.0, 0.0], PLENTY_OF_WINDOWS);
+        assert!(plenty.centroid_for_stitching().is_some());
+        assert!(plenty.centroid_for_naming().is_some());
+    }
+
+    /// Stitching is the recoverable direction, so it does not wait on the
+    /// purity verdict: a label the verdict rejected still has a main-cluster
+    /// centroid worth placing, and refusing to place it would scatter one
+    /// person across scope seams for a reason that only concerns naming.
+    #[test]
+    fn a_label_the_purity_verdict_rejected_can_still_be_stitched() {
+        let mut mixed = evidence_entry(0, vec![1.0, 0.0], PLENTY_OF_WINDOWS);
+        mixed.single_voice = false;
+        assert!(mixed.centroid_for_stitching().is_some());
+        assert!(mixed.centroid_for_naming().is_none());
+    }
+
+    /// Both naming gates have to be able to say no on their own.
+    #[test]
+    fn naming_needs_enough_windows_and_enough_distinct_audio() {
+        let mut short_of_windows =
+            evidence_entry(0, vec![1.0, 0.0], MIN_PURITY_VERDICT_WINDOWS - 1);
+        assert!(short_of_windows.centroid_for_naming().is_none());
+        // Even with the seconds gate satisfied outright.
+        short_of_windows.kept_seconds = 60.0;
+        assert!(short_of_windows.centroid_for_naming().is_none());
+
+        let mut short_of_audio = evidence_entry(0, vec![1.0, 0.0], MIN_PURITY_VERDICT_WINDOWS);
+        assert!(short_of_audio.centroid_for_naming().is_some());
+        short_of_audio.kept_seconds = MIN_NAMING_EVIDENCE_SECONDS - 0.1;
+        assert!(short_of_audio.centroid_for_naming().is_none());
     }
 
     /// The naming gate has to be able to say no, and the only way to prove
@@ -742,50 +797,64 @@ mod tests {
     /// literal rather than imported, on purpose -- if it read a production
     /// constant, moving that constant would silently turn this half of the
     /// test into a tautology and the proof would evaporate.
+    ///
+    /// Under windowing the disagreement is structural: the smallest segment the
+    /// segmenter can emit is shorter than one window plus its trim, so it
+    /// contributes no evidence at all no matter how many of them a label has.
     #[test]
     fn the_naming_gate_is_independent_of_the_segmenters_minimum_segment_length() {
         /// `pipeline::MIN_SEGMENT_S` as it stood when this test was written.
         /// Deliberately a copy: this test pins the *shape* of the old rule,
         /// not today's value of it.
         const SEGMENTER_MIN_SEGMENT_SECONDS: f64 = 0.5;
-        let voice = SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]);
+
+        fn label_windows(durations: &[f64]) -> usize {
+            // Spread the turns far apart so nothing overlaps and the count is
+            // purely a function of each turn's own length.
+            let mut segments = Vec::new();
+            let mut cursor = 0.0f32;
+            for duration in durations {
+                segments.push(labeled(
+                    cursor,
+                    cursor + *duration as f32,
+                    Some("SPEAKER_00"),
+                ));
+                cursor += *duration as f32 + 100.0;
+            }
+            for segment in &mut segments {
+                segment.speaker_label = segment.speaker.clone();
+            }
+            evidence::plan_label_windows(&segments)
+                .get("SPEAKER_00")
+                .map_or(0, Vec::len)
+        }
 
         // AISHELL-4 L_R003S01C02 speaker 003-F: eight fragments across ten
         // minutes, 5.18s in total, longest 0.93s. A real person, but not one
         // this recording gives enough voice to put a name to.
         let fragments = [0.88, 0.93, 0.86, 0.60, 0.60, 0.52, 0.39, 0.40];
-        let mut walk_on = LabelEvidence::new(2, 0);
-        for seconds in fragments {
-            walk_on.accumulate(&voice, seconds);
-        }
         assert!(
-            walk_on.seconds >= SEGMENTER_MIN_SEGMENT_SECONDS,
+            fragments.iter().sum::<f64>() >= SEGMENTER_MIN_SEGMENT_SECONDS,
             "the old gate named this speaker; if it no longer would, this test \
              has stopped proving anything"
         );
-        assert!(
-            walk_on.centroid_for_naming().is_none(),
+        assert_eq!(
+            label_windows(&fragments),
+            0,
             "eight sub-second fragments are not evidence for a person's name"
         );
 
         // The structural half: the smallest label the segmenter can possibly
         // emit already cleared the old gate, so it was incapable of rejecting
         // anything at all -- no value of that constant would have fixed it.
-        let mut smallest_possible = LabelEvidence::new(2, 0);
-        smallest_possible.accumulate(&voice, SEGMENTER_MIN_SEGMENT_SECONDS);
-        assert!(
-            smallest_possible.seconds >= SEGMENTER_MIN_SEGMENT_SECONDS,
-            "the old gate read its own input back"
-        );
-        assert!(smallest_possible.centroid_for_naming().is_none());
+        // It cannot clear this one, at any repetition count.
+        assert_eq!(label_windows(&[SEGMENTER_MIN_SEGMENT_SECONDS]), 0);
+        assert_eq!(label_windows(&[SEGMENTER_MIN_SEGMENT_SECONDS; 40]), 0);
 
         // And the gate is not simply closed: a real participant clears it.
         // AISHELL-4 L_R003S02C02 speaker 007-M, the thinnest genuine
         // participant in the evaluation corpus (37.78s over seven turns).
-        let mut participant = LabelEvidence::new(2, 0);
-        for seconds in [1.31, 6.04, 4.66, 1.86, 6.65, 13.85, 3.42] {
-            participant.accumulate(&voice, seconds);
-        }
-        assert!(participant.centroid_for_naming().is_some());
+        let participant = [1.31, 6.04, 4.66, 1.86, 6.65, 13.85, 3.42];
+        assert!(label_windows(&participant) >= MIN_PURITY_VERDICT_WINDOWS);
     }
 }
