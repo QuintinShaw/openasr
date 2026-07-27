@@ -163,9 +163,9 @@ pub enum AudioEncoderTensors {
 
 // The architecture ids are the stable wire values written into each pack's
 // `openasr.model.architecture` / `general.architecture` metadata (see
-// crate::arch and each family's package_import). "hunyuan-dense" is literal
-// because hymt2 keeps its constant module-private; it is the GGUF
-// general.architecture Tencent's upstream GGUF uses and this repo repacks.
+// crate::arch and each family's package_import). Every arm keys on the
+// family's own constant -- no string literals -- so a renamed architecture
+// id moves the audit table with it at compile time.
 use AudioEncoderTensors as Rule;
 
 /// The encoder rule for a pack architecture, or `None` when the architecture
@@ -209,7 +209,7 @@ pub fn audio_encoder_tensors_for_architecture(architecture: &str) -> Option<Audi
         ]),
         // Translation / punctuation / segmentation packs have no acoustic
         // encoder in the ASR-floor sense.
-        "hunyuan-dense" => Rule::NoAudioEncoder,
+        crate::models::hymt2::config::HUNYUAN_DENSE_ARCHITECTURE_VALUE => Rule::NoAudioEncoder,
         crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID => Rule::NoAudioEncoder,
         crate::models::firered_punc::config::FIRERED_PUNC_ARCHITECTURE_VALUE => {
             Rule::NoAudioEncoder
@@ -467,19 +467,33 @@ fn fetch_remote_prefix(url: &str, len: usize) -> Result<Vec<u8>, QuantFloorAudit
             reason: crate::http::error_message(&error),
         })?;
     let status = response.status();
-    if status != reqwest::StatusCode::PARTIAL_CONTENT && status != reqwest::StatusCode::OK {
+    // Require a genuine partial response. A server that ignores the Range
+    // header answers 200 OK and starts streaming the ENTIRE pack body --
+    // buffering a multi-GB model to audit its first megabytes is precisely
+    // what prefix fetching exists to avoid, so fail closed instead of
+    // reading. Published-pack CDNs honor ranges; anything else is not an
+    // auditable endpoint.
+    if status != reqwest::StatusCode::PARTIAL_CONTENT {
         return Err(QuantFloorAuditError::RemoteFetch {
             url: url.to_string(),
-            reason: format!("unexpected HTTP status {status}"),
+            reason: format!(
+                "expected HTTP 206 Partial Content for the Range request, got {status}; \
+                 the endpoint must honor byte ranges for a prefix-only audit"
+            ),
         });
     }
-    let bytes = response
-        .bytes()
+    // Defense in depth: never read past the requested prefix, even if a
+    // server over-delivers on its Content-Range.
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    response
+        .take(len as u64)
+        .read_to_end(&mut bytes)
         .map_err(|error| QuantFloorAuditError::RemoteFetch {
             url: url.to_string(),
-            reason: crate::http::error_message(&error),
+            reason: error.to_string(),
         })?;
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 const REMOTE_INITIAL_WINDOW: usize = 8 * 1024 * 1024;
@@ -577,7 +591,7 @@ mod tests {
             crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
             crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
             crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID,
-            "hunyuan-dense",
+            crate::models::hymt2::config::HUNYUAN_DENSE_ARCHITECTURE_VALUE,
             crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID,
             crate::models::firered_punc::config::FIRERED_PUNC_ARCHITECTURE_VALUE,
         ] {
@@ -680,7 +694,7 @@ mod tests {
     #[test]
     fn translation_pack_decoder_quants_are_not_encoder_floor_violations() {
         let view = view_with(
-            Some("hunyuan-dense"),
+            Some(crate::models::hymt2::config::HUNYUAN_DENSE_ARCHITECTURE_VALUE),
             vec![tensor("blk.0.ffn_gate.weight", GGML_TYPE_Q4_K)],
         );
         let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
@@ -731,5 +745,61 @@ mod tests {
         let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
         assert_eq!(report.violations.len(), 1);
         assert!(report.violations[0].tensor.starts_with("model.encoder."));
+    }
+
+    /// A one-shot raw HTTP server: reply to the first request with the
+    /// prepared bytes, then close. Lets the prefix-fetch contract tests pin
+    /// exact status-line behavior without a framework.
+    fn spawn_raw_http_server(raw_response: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let url = format!("http://{}/pack.oasr", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = vec![0u8; 4096];
+                let _ = stream.read(&mut request); // request headers; content irrelevant
+                let _ = stream.write_all(&raw_response);
+            }
+        });
+        url
+    }
+
+    fn raw_response(status_line: &str, body: &[u8]) -> Vec<u8> {
+        let mut raw = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(body);
+        raw
+    }
+
+    #[test]
+    fn remote_prefix_fetch_rejects_a_full_body_response() {
+        // A server that ignores the Range header answers 200 and streams the
+        // whole (multi-GB) pack. The fetch must fail closed rather than
+        // buffer it.
+        let url = spawn_raw_http_server(raw_response(
+            "200 OK",
+            b"the entire pack body would follow this header",
+        ));
+        let error = super::fetch_remote_prefix(&url, 8).expect_err("must fail closed on 200");
+        match error {
+            QuantFloorAuditError::RemoteFetch { reason, .. } => {
+                assert!(reason.contains("206"), "reason was: {reason}");
+            }
+            other => panic!("expected RemoteFetch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_prefix_fetch_caps_the_read_at_the_requested_prefix() {
+        // A 206 that over-delivers on Content-Range still yields exactly the
+        // requested prefix.
+        let url = spawn_raw_http_server(raw_response("206 Partial Content", b"0123456789abcdef"));
+        let bytes = super::fetch_remote_prefix(&url, 8).expect("206 prefix fetch");
+        assert_eq!(bytes, b"01234567");
     }
 }
