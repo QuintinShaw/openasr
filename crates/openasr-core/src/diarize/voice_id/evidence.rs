@@ -82,10 +82,23 @@ pub(super) const WINDOW_STEP_SECONDS: f64 = 1.0;
 
 /// Cut off each end of a segment before windowing.
 ///
-/// Segment boundaries are exactly where a segmenter's error lives; the first
-/// and last quarter second of a "turn" are the most likely to belong to
-/// somebody else.
-pub(super) const SEGMENT_EDGE_TRIM_SECONDS: f64 = 0.25;
+/// Segment boundaries are exactly where a segmenter's error lives; in this
+/// pipeline a segment already *is* one speaker turn (`plan_label_windows`
+/// takes each label's segments as given, one per turn), so this is a
+/// turn-edge trim in effect and the seconds right after a turn starts and
+/// right before it ends are the most likely to actually belong to whoever
+/// spoke before or after.
+///
+/// 0.5s replaces a prior 0.25s. Splitting three real recordings' windows by
+/// distance to the nearest turn boundary showed a quarter second was not
+/// enough: turn-first windows scored 61% worse and turn-last windows 52% /
+/// 23% worse (by minimum cross-speaker distance) than interior windows of the
+/// same label, consistently across all three sessions and both speakers,
+/// while RMS-vs-distance correlation across those same windows was near
+/// zero. The damage is positional, not a matter of quiet or unusual audio
+/// near a boundary -- which a purity/RMS filter cannot fix and only a wider
+/// trim can.
+pub(super) const SEGMENT_EDGE_TRIM_SECONDS: f64 = 0.5;
 
 /// Hard cap on how many windows one label ever contributes.
 ///
@@ -371,22 +384,23 @@ mod tests {
     fn windows_are_fixed_length_and_step_by_half() {
         let planned = plan_label_windows(&[segment(0.0, 5.5, "SPEAKER_00")]);
         let windows = &planned["SPEAKER_00"];
-        // Trimming leaves 0.25..5.25, which fits windows at 0.25 .. 3.25.
-        assert_eq!(windows.len(), 4);
-        assert!((windows[0].start_s - 0.25).abs() < 1e-9);
+        // A lone segment is a turn of one, trimmed on both ends: 0.5..5.0,
+        // which fits windows at 0.5, 1.5, 2.5.
+        assert_eq!(windows.len(), 3);
+        assert!((windows[0].start_s - 0.5).abs() < 1e-9);
         for window in windows {
             assert!((window.duration_s() - WINDOW_SECONDS).abs() < 1e-9);
         }
         assert!((windows[1].start_s - windows[0].start_s - WINDOW_STEP_SECONDS).abs() < 1e-9);
     }
 
-    /// The trim is not decoration: a segment only 2.4s long has no window at
+    /// The trim is not decoration: a segment only 2.9s long has no window at
     /// all once its edges -- where the segmenter's error lives -- are dropped.
     #[test]
     fn a_segment_shorter_than_a_trimmed_window_yields_nothing() {
-        assert!(plan_label_windows(&[segment(0.0, 2.4, "SPEAKER_00")]).is_empty());
+        assert!(plan_label_windows(&[segment(0.0, 2.9, "SPEAKER_00")]).is_empty());
         assert_eq!(
-            plan_label_windows(&[segment(0.0, 2.5, "SPEAKER_00")])["SPEAKER_00"].len(),
+            plan_label_windows(&[segment(0.0, 3.0, "SPEAKER_00")])["SPEAKER_00"].len(),
             1
         );
     }
