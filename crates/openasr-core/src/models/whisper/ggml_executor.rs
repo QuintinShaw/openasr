@@ -134,7 +134,7 @@ use crate::models::decode_token_history::{
 };
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
-    Seq2SeqGreedyDecodeStepLogitsOutput,
+    Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
 };
 use crate::models::seq2seq_word_timestamps::{
     Seq2SeqTokenTime, seq2seq_word_timestamps_from_generated_tokens,
@@ -301,6 +301,9 @@ pub(super) struct WhisperExecutionOutput {
     /// for English-only packs, explicit-language requests, or when detection
     /// failed (fail-open).
     pub(super) detected_language: Option<String>,
+    /// How the shared driver ended this decode, so a cut-short window is not
+    /// handed back as a completed one.
+    pub(super) stop_reason: Seq2SeqGreedyDecodeStopReason,
 }
 
 struct WhisperEncoderPersistentStaticSession {
@@ -3176,8 +3179,10 @@ impl WhisperGgmlExecutor {
             },
         })?;
 
+        let stop_reason = output.stop_reason;
         Ok(GgmlAsrExecutionResult {
             transcription: Transcription {
+                truncated_decodes: Vec::new(),
                 text: output.text,
                 segments: output.segments,
                 longform: None,
@@ -3189,7 +3194,10 @@ impl WhisperGgmlExecutor {
                     prompt_token_ids: Some(prompt_token_ids),
                 }
             }),
-            decode_truncated_at_seconds: None,
+            // This executor emits one whole-window span rather than per-utterance
+            // timestamps, so there is no honest second to anchor the cut to; see
+            // `DecodeTruncation::transcript_covers_up_to_seconds`.
+            decode_truncation: stop_reason.into_decode_truncation(None),
         })
     }
 }
@@ -5358,6 +5366,9 @@ fn run_whisper_decode_loop(
                 text,
                 generated_tokens,
                 generated_probabilities,
+                // Salvaging the prefix is not the same as completing the
+                // decode; the trace tag above says so and so must the result.
+                stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
             }
         }
         Err(error) => {
@@ -5426,6 +5437,7 @@ fn run_whisper_decode_loop(
         segments,
         carry_prompt_token_ids,
         detected_language,
+        stop_reason: decode.stop_reason,
     })
 }
 

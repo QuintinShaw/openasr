@@ -644,6 +644,61 @@ pub struct TranscriptionLongFormMetadata {
     pub provenance: Vec<String>,
 }
 
+/// Why a decode stopped before it had described all the audio it was given.
+///
+/// Both values mean the same thing to a consumer -- the transcript is short --
+/// but they are not the same defect, and collapsing them hides which one
+/// happened. A guard trip is a model/quantization failure on this audio; an
+/// exhausted budget is a configuration shortfall. Only the second is fixable by
+/// raising a limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeTruncationReason {
+    /// The shared degenerate-repeat guard ended the decode and dropped the
+    /// looping tail. Everything after the point the loop started was never
+    /// transcribed.
+    DegenerateRepeatGuard,
+    /// The generation budget ran out before the model emitted a stop token.
+    /// The family kept the generated prefix instead of failing the request.
+    BudgetExhausted,
+}
+
+impl DecodeTruncationReason {
+    /// Stable machine-readable tag, used in the serialized transcript and in
+    /// the longform provenance strings so both channels name the same thing.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DegenerateRepeatGuard => "degenerate-repeat-guard",
+            Self::BudgetExhausted => "budget-exhausted",
+        }
+    }
+}
+
+/// One decode that stopped short of its own audio.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeTruncation {
+    pub reason: DecodeTruncationReason,
+    /// Point, in this decode's own seconds (relative to the buffer handed to
+    /// the executor), up to which the transcript still describes the audio.
+    ///
+    /// `None` is the honest answer for a family that emits no intra-decode
+    /// timestamps: its transcript is one span over the whole buffer, so the
+    /// only number available is the buffer length -- which would read as
+    /// "nothing was lost" and is exactly the claim a truncated decode cannot
+    /// make. Presence of the truncation is the load-bearing signal; the
+    /// anchor is an extra a timestamped family can supply.
+    pub transcript_covers_up_to_seconds: Option<f32>,
+}
+
+/// A truncated decode as seen from the finished transcript, tagged with which
+/// decode unit produced it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TruncatedDecode {
+    /// 1-based longform slice index; `None` when the whole request decoded in
+    /// a single pass.
+    pub slice_index: Option<usize>,
+    pub truncation: DecodeTruncation,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transcription {
     pub text: String,
@@ -653,6 +708,22 @@ pub struct Transcription {
     /// auto-detected language (or the explicit `--language`); `None` for families
     /// that do not report a language.
     pub language: Option<String>,
+    /// Decodes behind this transcript that stopped before describing all of
+    /// their audio. Empty is the normal case and means every decode ended on
+    /// its own stop token.
+    ///
+    /// This lives on the transcript rather than on the long-form metadata
+    /// because it is a property of the text itself, and because long-form
+    /// metadata is absent exactly where truncation is easiest to hit
+    /// unnoticed: a short recording that decodes in a single pass.
+    pub truncated_decodes: Vec<TruncatedDecode>,
+}
+
+impl Transcription {
+    /// Whether any decode behind this transcript stopped short of its audio.
+    pub fn is_truncated(&self) -> bool {
+        !self.truncated_decodes.is_empty()
+    }
 }
 
 pub fn add_segment_word_timestamps(transcription: &mut Transcription) {
@@ -1265,6 +1336,7 @@ mod tests {
     #[test]
     fn segment_word_timestamps_are_distributed_within_segment_bounds() {
         let mut transcription = Transcription {
+            truncated_decodes: Vec::new(),
             text: "hello world".to_string(),
             segments: vec![Segment {
                 start: 1.0,

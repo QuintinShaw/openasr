@@ -212,7 +212,10 @@ impl MoonshineGgmlExecutor {
         Ok(GgmlAsrExecutionResult {
             transcription: decode.transcription,
             carry_context: None,
-            decode_truncated_at_seconds: None,
+            // No intra-decode timestamps -- the single segment spans the whole
+            // buffer -- so the cut point has no honest second to name. See
+            // `DecodeTruncation::transcript_covers_up_to_seconds`.
+            decode_truncation: decode.stop_reason.into_decode_truncation(None),
         })
     }
 

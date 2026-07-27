@@ -415,13 +415,18 @@ impl CohereTranscribeGgmlExecutor {
         );
         let carry_prompt_token_ids =
             build_cohere_carry_prompt_token_ids(&request.request_options, &decode.generated_tokens);
+        // cohere-transcribe's diarized mode emits inline speaker turns but no
+        // audio timestamps the decode could be anchored to, and its plain mode
+        // is a single whole-buffer span -- so the cut point has no honest
+        // second to name. See `DecodeTruncation::transcript_covers_up_to_seconds`.
+        let decode_truncation = decode.stop_reason.into_decode_truncation(None);
         Ok(GgmlAsrExecutionResult {
             transcription: decode.transcription,
             carry_context: carry_prompt_token_ids.map(|prompt_token_ids| GgmlAsrCarryContext {
                 prompt_text: None,
                 prompt_token_ids: Some(prompt_token_ids),
             }),
-            decode_truncated_at_seconds: None,
+            decode_truncation,
         })
     }
 

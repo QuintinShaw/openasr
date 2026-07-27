@@ -1324,6 +1324,7 @@ mod tests {
     fn result_accessors_fail_closed_on_out_of_range_index() {
         let result = Box::new(build_result(
             Transcription {
+                truncated_decodes: Vec::new(),
                 text: "hello".to_string(),
                 segments: Vec::new(),
                 longform: None,
@@ -1346,6 +1347,7 @@ mod tests {
     #[test]
     fn build_result_exposes_text_language_and_segments() {
         let transcription = Transcription {
+            truncated_decodes: Vec::new(),
             text: "hello world".to_string(),
             segments: vec![openasr_core::Segment {
                 start: 0.0,

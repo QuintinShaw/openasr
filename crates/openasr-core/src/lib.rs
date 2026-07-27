@@ -58,12 +58,13 @@ pub mod testing;
 pub(crate) mod translation;
 
 pub use api::backend::{
-    BackendError, BackendKind, ExecutionTarget, FailureCategory, GgmlAbortCallbackGuard,
-    NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend, NativeBackendExecutor, NativeRuntimeModelAdapter,
-    NativeRuntimeModelIdSource, NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
-    RequestExecutionContext, RequestSource, Segment, SliceBoundaryControl, Transcription,
-    TranscriptionBackend, TranscriptionControl, TranscriptionRequest, TranscriptionTask,
-    WordTimestamp, add_segment_word_timestamps, describe_native_runtime_model_mismatch,
+    BackendError, BackendKind, DecodeTruncation, DecodeTruncationReason, ExecutionTarget,
+    FailureCategory, GgmlAbortCallbackGuard, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend,
+    NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
+    NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, RequestExecutionContext,
+    RequestSource, Segment, SliceBoundaryControl, Transcription, TranscriptionBackend,
+    TranscriptionControl, TranscriptionRequest, TranscriptionTask, TruncatedDecode, WordTimestamp,
+    add_segment_word_timestamps, describe_native_runtime_model_mismatch,
     format_failure_context_line, format_request_context_line,
     native_adapter_supports_source_language_hint, native_runtime_model_adapter_for_path,
     native_runtime_model_refs_match, native_runtime_realtime_capabilities_for_path,

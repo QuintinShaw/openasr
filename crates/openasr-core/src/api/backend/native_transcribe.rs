@@ -38,7 +38,7 @@ use crate::api::backend::{FailureCategory, log_failure_context, log_request_cont
 use super::{BackendError, Transcription, TranscriptionRequest};
 use crate::Segment;
 use crate::WordTimestamp;
-use crate::api::backend::TranscriptionLongFormMetadata;
+use crate::api::backend::{DecodeTruncation, TranscriptionLongFormMetadata, TruncatedDecode};
 use crate::models::firered_punc::pack::resolve_firered_punc_pack_path;
 use crate::models::firered_punc::runtime::FireRedPuncRuntime;
 use crate::models::qwen::{
@@ -1312,6 +1312,12 @@ fn run_native_transcription_impl(
         request.source_channels,
     );
     let mut longform_metadata: Option<TranscriptionLongFormMetadata> = None;
+    // Decodes that stopped short of their own audio, for every exit path of
+    // this function. Declared out here rather than inside the long-form block
+    // because the single-pass path can truncate too -- and that is the case
+    // with no long-form metadata to hide the fact in, which is exactly how a
+    // short recording used to come back silently cut with a success status.
+    let mut truncated_decodes: Vec<TruncatedDecode> = Vec::new();
     if run_longform {
         let (vad_provider, vad_engine_label) = resolve_longform_vad_provider(&longform_options)?;
         let plan = plan_longform_slices(
@@ -1355,6 +1361,7 @@ fn run_native_transcription_impl(
         };
         if plan.slices.is_empty() {
             return Ok(Transcription {
+                truncated_decodes: Vec::new(),
                 text: String::new(),
                 segments: Vec::new(),
                 longform: Some(build_longform_metadata(
@@ -1416,9 +1423,9 @@ fn run_native_transcription_impl(
             // `GpuAllocationFallbackTracker` / `run_dispatch_once_with_progress_and_gpu_fallback`).
             let mut gpu_fallback_tracker = GpuAllocationFallbackTracker::default();
             let mut degraded_slice_fallbacks: Vec<(usize, SliceGpuFallback)> = Vec::new();
-            // Slices whose decode stopped short of their own audio, as
-            // `index@seconds` (seconds are slice-relative, matching what the
-            // executor reported).
+            // Slices whose decode stopped short of their own audio, rendered
+            // for the provenance string channel (see
+            // `format_truncated_slice_provenance`).
             let mut truncated_slices: Vec<String> = Vec::new();
             // Original-timeline start of every slice that actually decoded,
             // collected only for an in-decoder-diarizing family: each such
@@ -1512,16 +1519,23 @@ fn run_native_transcription_impl(
                 let GgmlAsrExecutionResult {
                     transcription,
                     carry_context,
-                    decode_truncated_at_seconds,
+                    decode_truncation,
                 } = result;
-                if let Some(truncated_at) = decode_truncated_at_seconds {
+                if let Some(truncation) = decode_truncation {
                     // A slice whose decode gave up partway is a degraded
                     // result, not a normal one: the audio after this point is
-                    // absent from the transcript. Surfaced in the same
-                    // provenance channel as the other "this run did not behave
-                    // like the naive default" facts rather than left as a log
-                    // line the caller never sees.
-                    truncated_slices.push(format!("{slice_index}@{truncated_at:.2}s"));
+                    // absent from the transcript. Carried structurally on the
+                    // returned transcript (so every output format can see it)
+                    // AND summarized in the same provenance channel as the
+                    // other "this run did not behave like the naive default"
+                    // facts, rather than left as a log line the caller never
+                    // sees.
+                    truncated_slices
+                        .push(format_truncated_slice_provenance(slice_index, &truncation));
+                    truncated_decodes.push(TruncatedDecode {
+                        slice_index: Some(slice_index),
+                        truncation,
+                    });
                 }
                 ran_any_slice = true;
                 match carry_prompt_mode {
@@ -1624,6 +1638,17 @@ fn run_native_transcription_impl(
                     backend_preference,
                     &execution_context,
                 )?;
+                // This whole-file fallback replaces the slice results entirely,
+                // so its own truncation is the only one that describes the
+                // transcript being returned.
+                let fallback_truncated_decodes = fallback
+                    .decode_truncation
+                    .map(|truncation| TruncatedDecode {
+                        slice_index: None,
+                        truncation,
+                    })
+                    .into_iter()
+                    .collect();
                 return Ok(finalize_native_transcription(
                     fallback.into_transcription(),
                     audio_duration_seconds,
@@ -1634,6 +1659,7 @@ fn run_native_transcription_impl(
                     &[],
                     strip_forced_word_timestamps,
                     reported_language.clone(),
+                    fallback_truncated_decodes,
                 ));
             }
             return Ok(finalize_native_transcription(
@@ -1646,6 +1672,7 @@ fn run_native_transcription_impl(
                 &speaker_scope_starts,
                 strip_forced_word_timestamps,
                 reported_language.clone(),
+                truncated_decodes,
             ));
         }
         longform_metadata = Some(build_longform_metadata(
@@ -1703,6 +1730,21 @@ fn run_native_transcription_impl(
             metadata.provenance.push(tag.to_string());
         }
     }
+    if let Some(truncation) = transcription.decode_truncation {
+        // Unlike the GPU-fallback tag above, this one is NOT dependent on
+        // long-form metadata existing: it rides on the transcript itself, so a
+        // plain short-audio decode that the guard cut short still reports it.
+        if let Some(metadata) = longform_metadata.as_mut() {
+            metadata.provenance.push(format!(
+                "core.native.decode.truncated:slices={}",
+                format_truncated_slice_provenance_for_single_pass(&truncation)
+            ));
+        }
+        truncated_decodes.push(TruncatedDecode {
+            slice_index: None,
+            truncation,
+        });
+    }
     Ok(finalize_native_transcription(
         transcription.into_transcription(),
         audio_duration_seconds,
@@ -1713,7 +1755,37 @@ fn run_native_transcription_impl(
         &[],
         strip_forced_word_timestamps,
         reported_language,
+        truncated_decodes,
     ))
+}
+
+/// Render one truncated slice for the `core.native.decode.truncated`
+/// provenance string: `<index>@<seconds>s:<reason>`, or `<index>@?:<reason>`
+/// when the family emits no intra-decode timestamps to anchor it (see
+/// [`DecodeTruncation::transcript_covers_up_to_seconds`]). Reporting `?` keeps
+/// the missing anchor legible instead of substituting the clip length, which
+/// would read as "nothing was lost".
+fn format_truncated_slice_provenance(slice_index: usize, truncation: &DecodeTruncation) -> String {
+    format!(
+        "{slice_index}@{}:{}",
+        format_truncation_anchor(truncation),
+        truncation.reason.as_str()
+    )
+}
+
+fn format_truncated_slice_provenance_for_single_pass(truncation: &DecodeTruncation) -> String {
+    format!(
+        "single-pass@{}:{}",
+        format_truncation_anchor(truncation),
+        truncation.reason.as_str()
+    )
+}
+
+fn format_truncation_anchor(truncation: &DecodeTruncation) -> String {
+    truncation
+        .transcript_covers_up_to_seconds
+        .map(|seconds| format!("{seconds:.2}s"))
+        .unwrap_or_else(|| "?".to_string())
 }
 
 /// Finalize a decoded transcription for return from
@@ -1738,6 +1810,7 @@ fn finalize_native_transcription(
     speaker_scope_starts: &[f32],
     strip_forced_word_timestamps: bool,
     reported_language: Option<String>,
+    truncated_decodes: Vec<TruncatedDecode>,
 ) -> Transcription {
     let mut transcription = apply_speaker_turns(
         with_longform_metadata(
@@ -1763,6 +1836,11 @@ fn finalize_native_transcription(
         );
         crate::diarize::voice_id::name_speakers_across_scopes(&mut scopes);
     }
+    // Stamped after the body is assembled and before the transcript leaves the
+    // engine, on every exit path: the per-decode results this run consumed are
+    // gone by now, so this is the last point at which "the transcript is short"
+    // is still knowable.
+    transcription.truncated_decodes = truncated_decodes;
     with_reported_language(transcription, reported_language)
 }
 
@@ -4284,6 +4362,7 @@ mod tests {
     fn normalize_synthesizes_single_segment_when_model_returns_none() {
         let transcription = normalize_transcription_segments(
             Transcription {
+                truncated_decodes: Vec::new(),
                 text: "hello world".to_string(),
                 segments: Vec::new(),
                 longform: None,
@@ -4302,6 +4381,7 @@ mod tests {
     fn normalize_keeps_segment_timestamps_monotonic() {
         let transcription = normalize_transcription_segments(
             Transcription {
+                truncated_decodes: Vec::new(),
                 text: "a b".to_string(),
                 segments: vec![
                     Segment {
@@ -4340,6 +4420,7 @@ mod tests {
     fn normalize_expands_single_short_segment_to_audio_duration() {
         let transcription = normalize_transcription_segments(
             Transcription {
+                truncated_decodes: Vec::new(),
                 text: "long transcript".to_string(),
                 segments: vec![Segment {
                     start: 0.0,
@@ -4365,6 +4446,7 @@ mod tests {
     fn normalize_keeps_single_segment_when_end_is_already_near_duration() {
         let transcription = normalize_transcription_segments(
             Transcription {
+                truncated_decodes: Vec::new(),
                 text: "near full".to_string(),
                 segments: vec![Segment {
                     start: 0.0,
@@ -4740,6 +4822,7 @@ mod tests {
         // the stage never runs, regardless of the FireRedPunc pack's install
         // state on this machine -- fail-closed, never fabricated punctuation.
         let transcription = Transcription {
+            truncated_decodes: Vec::new(),
             text: "hello world".to_string(),
             segments: vec![Segment {
                 start: 0.0,
@@ -4911,13 +4994,14 @@ mod tests {
             ) {
                 return Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
+                        truncated_decodes: Vec::new(),
                         text: "ok-on-cpu".to_string(),
                         segments: Vec::new(),
                         longform: None,
                         language: None,
                     },
                     carry_context: None,
-                    decode_truncated_at_seconds: None,
+                    decode_truncation: None,
                 });
             }
             Err(GgmlAsrExecutionError::ExecutorFailed {

@@ -1201,6 +1201,7 @@ pub(super) fn write_rendered_formats(
     output: Option<&Path>,
     force_dir: bool,
 ) -> Result<Vec<PathBuf>> {
+    warn_about_truncated_decodes(transcription);
     if formats.len() <= 1 && !force_dir {
         let format = formats.first().copied().unwrap_or(ResponseFormat::Text);
         let rendered = render_transcription(transcription, format)
@@ -1236,6 +1237,40 @@ pub(super) fn write_rendered_formats(
         written.push(path);
     }
     Ok(written)
+}
+
+/// Tell the user, on stderr, when the transcript they are about to receive
+/// does not cover all of the audio.
+///
+/// `json` / `verbose_json` carry this structurally, but `text`, `srt`, `vtt`
+/// and `markdown` have nowhere to put it -- and those are the formats a person
+/// reads directly. Without this line a decode the guard cut short is
+/// indistinguishable from a short recording: same exit code, same shape, just
+/// less text. Stderr keeps stdout byte-identical for anything piping the
+/// transcript onward.
+fn warn_about_truncated_decodes(transcription: &openasr_core::Transcription) {
+    if transcription.truncated_decodes.is_empty() {
+        return;
+    }
+    for truncated in &transcription.truncated_decodes {
+        let where_ = match truncated.slice_index {
+            Some(index) => format!("slice {index}"),
+            None => "this recording".to_string(),
+        };
+        let covered = match truncated.truncation.transcript_covers_up_to_seconds {
+            Some(seconds) => format!(" The transcript covers it only up to {seconds:.2}s."),
+            None => String::new(),
+        };
+        let cause = match truncated.truncation.reason {
+            openasr_core::DecodeTruncationReason::DegenerateRepeatGuard => {
+                "the model started repeating itself and decoding was stopped"
+            }
+            openasr_core::DecodeTruncationReason::BudgetExhausted => {
+                "the decode ran out of its token budget before the model finished"
+            }
+        };
+        eprintln!("warning: the transcript is incomplete for {where_}: {cause}.{covered}");
+    }
 }
 
 pub(super) fn write_rendered_output(rendered: &str, output: Option<&Path>) -> Result<()> {
