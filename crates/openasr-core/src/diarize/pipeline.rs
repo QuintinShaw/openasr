@@ -74,13 +74,20 @@ pub fn resolve_diarization_regions(samples: &[f32]) -> Option<Vec<DiarizationReg
     )
 }
 
-/// Shortest speech segment (seconds) worth embedding; shorter regions give
-/// unreliable speaker embeddings and are skipped. Also the identity stage's
-/// floor for putting a *name* to a speaker (see
-/// `crate::diarize::voice_id::identity`): the same "too little voice to trust"
-/// judgement, applied to the same embedder.
-pub(crate) const MIN_EMBEDDING_EVIDENCE_SECONDS: f64 = 0.5;
-const MIN_SEGMENT_S: f64 = MIN_EMBEDDING_EVIDENCE_SECONDS;
+/// Shortest speech region (seconds) this segmenter will hand to the embedder;
+/// shorter regions are dropped.
+///
+/// **This is a decision knob and nothing else**: it selects what the segmenter
+/// produces. It is deliberately private, because the one thing it must never
+/// become is the standard some later stage *validates* that output against.
+/// It used to be: the identity stage's "is there enough voice here to risk
+/// putting a person's name on it" gate read this same number back, and since
+/// every region reaching that stage is at least this long by construction, the
+/// gate could not reject anything -- a safety gate that says yes to its own
+/// input. See `crate::diarize::voice_id::identity`'s
+/// `MIN_NAMING_EVIDENCE_SECONDS` for the independent judgement that replaced
+/// it, and do not re-export this constant to reunify them.
+const MIN_SEGMENT_S: f64 = 0.5;
 const MAX_EMBED_CHUNK_S: f64 = 5.0;
 
 /// What an **external speaker segmentation source** produces: recording-local
