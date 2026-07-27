@@ -163,6 +163,70 @@ mod tests {
         assert_eq!(REDIMNET_INSTALLED_MODEL_ID_HINT, "redimnet");
     }
 
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn write_object_at_layout(root: &Path, digest: &str, bytes: &[u8], read_only: bool) -> PathBuf {
+        let object = root
+            .join("models")
+            .join("objects")
+            .join("sha256")
+            .join(digest)
+            .join("content");
+        std::fs::create_dir_all(object.parent().expect("object path has parent"))
+            .expect("create digest dir");
+        std::fs::write(&object, bytes).expect("write fixture");
+        let mut permissions = std::fs::metadata(&object)
+            .expect("stat fixture")
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(if read_only { 0o444 } else { 0o644 });
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(read_only);
+        std::fs::set_permissions(&object, permissions).expect("set fixture mode");
+        object
+    }
+
+    /// The trusted half, pinned by construction: bytes that do not hash to
+    /// the digest their path names can only fingerprint to that path digest
+    /// if it was read, not recomputed.
+    #[test]
+    fn pack_fingerprint_trusts_a_sealed_object_without_hashing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let named_digest = "ab".repeat(32);
+        let bytes = b"embedder-fingerprint-trust-fixture";
+        assert_ne!(
+            sha256_hex(bytes),
+            named_digest,
+            "the fixture must not accidentally hash to the named digest"
+        );
+        let object = write_object_at_layout(dir.path(), &named_digest, bytes, true);
+
+        assert_eq!(
+            pack_fingerprint(&object),
+            Some(format!("sha256:{named_digest}"))
+        );
+    }
+
+    /// The fail-closed half as its own pin: an unsealed object's fingerprint
+    /// is the hash of its bytes and never the digest its path claims.
+    #[test]
+    fn pack_fingerprint_unsealed_object_falls_back_to_hashing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let named_digest = "ef".repeat(32);
+        let bytes = b"embedder-fingerprint-fallback-fixture";
+        let object = write_object_at_layout(dir.path(), &named_digest, bytes, false);
+
+        let fingerprint = pack_fingerprint(&object).expect("fingerprint");
+        assert_eq!(fingerprint, format!("sha256:{}", sha256_hex(bytes)));
+        assert_ne!(fingerprint, format!("sha256:{named_digest}"));
+    }
+
     #[test]
     fn missing_embedder_reasons_name_redimnet2_b6_cn() {
         assert_eq!(SPEAKER_EMBEDDER_PACK_ID, "redimnet2-b6-cn");
