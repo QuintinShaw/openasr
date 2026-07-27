@@ -42,6 +42,20 @@ class PublishFlowTest(unittest.TestCase):
         path.chmod(0o755)
         return path
 
+    def deriving_fake(self, step: str, body: str) -> Path:
+        """A stage fake that logs like fake_command and then runs `body`,
+        which derives the step's output files from its input files -- so a
+        changed input byte propagates into the recorded checkpoint the same
+        way the real stage's rewritten artifact would."""
+        path = self.bin_dir / f"derive-{step}"
+        path.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"printf 'COMMAND:{step}\\n' >> \"$OPENASR_FAKE_PUBLISH_LOG\"\n" + body
+        )
+        path.chmod(0o755)
+        return path
+
     def run_publish(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [str(SCRIPT), *args],
@@ -100,9 +114,11 @@ class PublishFlowTest(unittest.TestCase):
 
     def test_pack_byte_change_invalidates_materialize_checkpoint(self) -> None:
         # The incident this locks: a pack gets rebuilt (quantization-policy
-        # fix) but the materialize checkpoint still "matches", so the stale
-        # sidecar ships. Checkpoints are content-addressed over declared
-        # outputs -- pack bytes change, the step re-runs.
+        # fix) but the checkpoint still "matches", so the stale artifact
+        # ships. Checkpoints bind the bytes each step consumes and produces,
+        # so changed pack bytes re-run the steps that touch them (here
+        # materialize, which reads packs, and the upload, which reads packs
+        # and sidecars).
         result = self.run_publish()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.commands()[0], "materialize")
@@ -111,12 +127,12 @@ class PublishFlowTest(unittest.TestCase):
         packs.mkdir(parents=True, exist_ok=True)
         pack = packs / "qwen3-asr-0.6b-q8_0.oasr"
 
-        # A new output appears the checkpoint never recorded: re-run.
+        # A new input appears the checkpoint never recorded: re-run.
         self.log.write_text("")
         pack.write_bytes(b"pack v1")
         appeared = self.run_publish()
         self.assertEqual(appeared.returncode, 0, appeared.stderr)
-        self.assertEqual(self.commands()[0], "materialize")
+        self.assertEqual(self.commands(), ["materialize", "target"])
 
         # Steady state: nothing changed, everything skips.
         self.log.write_text("")
@@ -130,7 +146,97 @@ class PublishFlowTest(unittest.TestCase):
         pack.write_bytes(b"pack v2 -- rebuilt under the fixed policy")
         rebuilt = self.run_publish()
         self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
-        self.assertEqual(self.commands()[0], "materialize")
+        self.assertEqual(self.commands(), ["materialize", "target"])
+
+    def test_pack_rebuild_reruns_every_downstream_step(self) -> None:
+        # The release-phase residue of the incident class: run the full flow,
+        # rebuild one pack in place, and every downstream step -- upload,
+        # registry card, catalog manifest, catalog signing -- must re-run
+        # instead of skipping and leaving the stale sha published. Each fake
+        # stage derives its output from the bytes it consumes, mirroring the
+        # real flow's data dependencies, so the assertion covers the whole
+        # transitive invalidation chain, not just the first step.
+        registry_root = self.root / "registry"
+        (registry_root / "models").mkdir(parents=True)
+        self.env["OPENASR_PUBLISH_REGISTRY_ROOT"] = str(registry_root)
+        self.env["OPENASR_PUBLISH_MATERIALIZE_CMD"] = str(
+            self.deriving_fake(
+                "materialize",
+                'for pack in "$OPENASR_PUBLISH_WORK_ROOT"/packs/*.oasr; do\n'
+                '  [[ -f "$pack" ]] || continue\n'
+                '  base="$(basename "$pack" .oasr)"\n'
+                '  cat "$pack" > "$OPENASR_PUBLISH_WORK_ROOT/packs/${base%-*}.${base##*-}.result.json"\n'
+                "done\n",
+            )
+        )
+        self.env["OPENASR_PUBLISH_TARGET_CMD"] = str(
+            self.deriving_fake(
+                "target",
+                'cat "$OPENASR_PUBLISH_WORK_ROOT"/packs/*.result.json'
+                ' > "$OPENASR_PUBLISH_WORK_ROOT/hf_revision.txt"\n'
+                'printf \'test/repo\\n\' > "$OPENASR_PUBLISH_WORK_ROOT/hf_repo.txt"\n',
+            )
+        )
+        # Mirrors the real _registry.py: the card derives from the resolved
+        # repo + catalog sources only -- it carries no pack sha, so a pack
+        # rebuild legitimately leaves it unchanged.
+        self.env["OPENASR_PUBLISH_REGISTRY_CMD"] = str(
+            self.deriving_fake(
+                "registry",
+                'cat "$OPENASR_PUBLISH_WORK_ROOT/hf_repo.txt"'
+                ' > "$OPENASR_PUBLISH_REGISTRY_ROOT/models/qwen3-asr-0.6b.toml"\n',
+            )
+        )
+        self.env["OPENASR_PUBLISH_MANIFEST_CMD"] = str(
+            self.deriving_fake(
+                "manifest",
+                'cat "$OPENASR_PUBLISH_REGISTRY_ROOT/models/qwen3-asr-0.6b.toml"'
+                ' "$OPENASR_PUBLISH_WORK_ROOT"/packs/*.result.json'
+                ' > "$OPENASR_PUBLISH_REGISTRY_ROOT/catalog.json"\n',
+            )
+        )
+        self.env["OPENASR_PUBLISH_CATALOG_CMD"] = str(
+            self.deriving_fake(
+                "catalog",
+                'for out in catalog.signature.json catalog.public.json'
+                " catalog.public.signature.json; do\n"
+                '  cat "$OPENASR_PUBLISH_REGISTRY_ROOT/catalog.json"'
+                ' > "$OPENASR_PUBLISH_REGISTRY_ROOT/$out"\n'
+                "done\n",
+            )
+        )
+
+        packs = self.work_root / "packs"
+        packs.mkdir(parents=True, exist_ok=True)
+        pack = packs / "qwen3-asr-0.6b-q8_0.oasr"
+        pack.write_bytes(b"pack v1")
+
+        first = self.run_publish("--quant", "q8_0", "--public")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(
+            self.commands(), ["materialize", "target", "registry", "manifest", "catalog"]
+        )
+        signed = registry_root / "catalog.public.signature.json"
+        self.assertIn(b"pack v1", signed.read_bytes())
+
+        # Steady state: nothing changed, everything skips.
+        self.log.write_text("")
+        steady = self.run_publish("--quant", "q8_0", "--public")
+        self.assertEqual(steady.returncode, 0, steady.stderr)
+        self.assertEqual(self.commands(), [])
+
+        # Rebuild the pack in place: every step whose consumed bytes changed
+        # must re-run, and the signed public manifest must end up bound to
+        # the new bytes. Registry legitimately skips -- its card carries no
+        # pack sha, so its inputs (resolved repo + catalog sources) are
+        # unchanged; the sha lives in catalog.json, which manifest rebuilds
+        # from the sidecar bytes it consumes.
+        self.log.write_text("")
+        pack.write_bytes(b"pack v2 -- rebuilt under the fixed policy")
+        rebuilt = self.run_publish("--quant", "q8_0", "--public")
+        self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
+        self.assertEqual(self.commands(), ["materialize", "target", "manifest", "catalog"])
+        self.assertIn(b"pack v2", signed.read_bytes())
 
     def test_dry_run_stops_before_registry_manifest_and_catalog(self) -> None:
         result = self.run_publish("--dry-run")
