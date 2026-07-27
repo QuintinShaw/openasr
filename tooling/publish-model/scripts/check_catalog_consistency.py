@@ -20,7 +20,8 @@ and belongs in CI and the pre-commit hook:
      PRODUCTION-signed; a dev-key manifest in model-registry/ is itself an
      incident (sign_local_catalog.sh's output is a never-commit preview).
   5. PROJECTION -- catalog.public.json is exactly the public:true subset of
-     catalog.json (byte-equal model objects, matching header fields), so the
+     catalog.json (canonically serialized byte-equal model objects -- sorted
+     keys, minimal separators -- plus matching header fields), so the
      embedded/served catalog cannot silently drift from the source.
 
 Usage:
@@ -324,6 +325,38 @@ def check_epoch_file(*, registry_dir: Path, manifests: list[Path]) -> None:
             )
 
 
+def canonical_json_bytes(value: object) -> bytes:
+    """Canonical serialization for byte comparison: sorted keys, minimal
+    separators. Two catalog entries compare byte-equal iff they carry the
+    same content -- on-disk indentation/key order never matters, but a
+    dropped/changed/added field always flips a byte."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def models_by_id(catalog_doc: object, label: str, *, require_public: bool) -> dict:
+    """Index a catalog's models[] by id, failing closed (named GateFailure,
+    never KeyError) on any malformed entry: a projection entry without an id
+    is exactly the kind of corruption this gate must name, not traceback."""
+    if not isinstance(catalog_doc, dict):
+        raise GateFailure(f"{label}: catalog is not a JSON object")
+    models = catalog_doc.get("models")
+    if not isinstance(models, list):
+        raise GateFailure(f"{label}: catalog 'models' must be a list")
+    by_id: dict = {}
+    for index, model in enumerate(models):
+        if not isinstance(model, dict):
+            raise GateFailure(f"{label}: models[{index}] is not a JSON object")
+        model_id = model.get("id")
+        if not isinstance(model_id, str) or not model_id:
+            raise GateFailure(f"{label}: models[{index}] has no string 'id' field")
+        if require_public and model.get("public") is not True:
+            continue
+        if model_id in by_id:
+            raise GateFailure(f"{label}: duplicate model id {model_id!r}")
+        by_id[model_id] = model
+    return by_id
+
+
 def check_public_projection(*, registry_dir: Path) -> None:
     """Check 5: catalog.public.json is exactly catalog.json's public:true subset."""
     full = json.loads((registry_dir / "catalog.json").read_text(encoding="utf-8"))
@@ -341,16 +374,10 @@ def check_public_projection(*, registry_dir: Path) -> None:
             "rerun publish_catalog.sh"
         )
 
-    full_public_models = {
-        model["id"]: model
-        for model in full.get("models", [])
-        if isinstance(model, dict) and model.get("public") is True
-    }
-    projected_models = {
-        model["id"]: model
-        for model in public.get("models", [])
-        if isinstance(model, dict)
-    }
+    full_public_models = models_by_id(full, "catalog.json", require_public=True)
+    projected_models = models_by_id(
+        public, "catalog.public.json", require_public=False
+    )
     if set(projected_models) != set(full_public_models):
         missing = sorted(set(full_public_models) - set(projected_models))
         extra = sorted(set(projected_models) - set(full_public_models))
@@ -359,10 +386,11 @@ def check_public_projection(*, registry_dir: Path) -> None:
             f"public:true set (missing={missing}, extra={extra}); rerun publish_catalog.sh"
         )
     for model_id, full_model in sorted(full_public_models.items()):
-        if projected_models[model_id] != full_model:
+        projected = projected_models[model_id]
+        if canonical_json_bytes(projected) != canonical_json_bytes(full_model):
             raise GateFailure(
-                f"public projection model {model_id!r} differs byte-for-byte from "
-                "its full-catalog entry; rerun publish_catalog.sh"
+                f"public projection model {model_id!r} differs (canonical byte "
+                "comparison) from its full-catalog entry; rerun publish_catalog.sh"
             )
 
 

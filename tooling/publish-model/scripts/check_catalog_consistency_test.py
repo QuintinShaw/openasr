@@ -14,6 +14,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+import _catalog  # noqa: E402
 from _pathlib_helpers import repo_root  # noqa: E402
 from check_catalog_consistency import (  # noqa: E402
     CANONICAL_CATALOG_URL,
@@ -21,7 +22,9 @@ from check_catalog_consistency import (  # noqa: E402
     LOCAL_DEV_PUBLIC_KEY_HEX,
     PRODUCTION_KEY_ID,
     PRODUCTION_PUBLIC_KEY_HEX,
+    GateFailure,
     catalog_signing_payload,
+    check_public_projection,
     ed25519_public_key,
     ed25519_sign,
     ed25519_verify,
@@ -196,12 +199,78 @@ class CommittedRegistryGateTest(unittest.TestCase):
             shutil.rmtree(registry)
 
 
+    def test_projection_entry_without_id_fails_closed(self) -> None:
+        # A projected model that lost its id must surface a named gate
+        # failure, not a KeyError traceback.
+        registry = copy_registry()
+        try:
+            public_path = registry / "catalog.public.json"
+            public = json.loads(public_path.read_text(encoding="utf-8"))
+            del public["models"][0]["id"]
+            public_path.write_text(json.dumps(public, indent=2) + "\n", encoding="utf-8")
+            failures = run_gate(registry_dir=registry, allow_dev_key=False)
+            self.assertTrue(
+                any("has no string 'id' field" in failure for failure in failures),
+                failures,
+            )
+        finally:
+            shutil.rmtree(registry)
+
+    def test_projection_comparison_is_canonical_bytes(self) -> None:
+        registry = copy_registry()
+        try:
+            public_path = registry / "catalog.public.json"
+            public = json.loads(public_path.read_text(encoding="utf-8"))
+
+            # Key order and indentation are NOT content: the same objects
+            # re-serialized with sorted keys and different indent must still
+            # pass (canonical byte comparison, not raw-text comparison).
+            public_path.write_text(
+                json.dumps(public, indent=4, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            check_public_projection(registry_dir=registry)
+
+            # A changed field IS content: caught byte-precisely.
+            public["models"][0]["display_name"] = "tampered"
+            public_path.write_text(
+                json.dumps(public, indent=2) + "\n", encoding="utf-8"
+            )
+            with self.assertRaises(GateFailure) as caught:
+                check_public_projection(registry_dir=registry)
+            self.assertIn("canonical byte comparison", str(caught.exception))
+        finally:
+            shutil.rmtree(registry)
+
+
 class TrustRootDriftTest(unittest.TestCase):
     """The Python gate's hardcoded trust roots must equal catalog_security.rs.
 
     The gate deliberately avoids a cargo dependency (it runs pre-commit), so
     the constants are duplicated; this test is the drift lock.
     """
+
+    def test_canonical_catalog_url_matches_every_authoring_site(self) -> None:
+        # The canonical URL is authored in three places that must never
+        # drift: the gate's identity check, the catalog generator's constant
+        # (baked into catalog.json, which the signer then binds into both
+        # manifests), and the committed artifacts themselves.
+        committed_catalog = json.loads((REGISTRY / "catalog.json").read_text(encoding="utf-8"))
+        sources = {
+            "gate constant": CANONICAL_CATALOG_URL,
+            "_catalog.CATALOG_URL": _catalog.CATALOG_URL,
+            "catalog.json": committed_catalog["catalog_url"],
+            "catalog.signature.json": json.loads(
+                (REGISTRY / "catalog.signature.json").read_text(encoding="utf-8")
+            )["catalog_url"],
+            "catalog.public.signature.json": json.loads(
+                (REGISTRY / "catalog.public.signature.json").read_text(encoding="utf-8")
+            )["catalog_url"],
+        }
+        self.assertEqual(
+            len(set(sources.values())),
+            1,
+            f"canonical catalog URL drifted across sources: {sources}",
+        )
 
     def test_public_keys_and_key_ids_match_rust_source(self) -> None:
         source = RUST_SECURITY.read_text(encoding="utf-8")
