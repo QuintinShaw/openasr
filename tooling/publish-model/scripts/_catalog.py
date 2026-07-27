@@ -8,6 +8,7 @@ field lookups and quant-token mapping so the catalog is parsed in one place
 
 Usage:
   _catalog.py field   <model> <key>     # print one catalog value (lists -> space-joined)
+  _catalog.py field-lines <model> <key> # print a list-valued key one item per line (empty if absent)
   _catalog.py quants  <model>           # print the quant ids, one per line
   _catalog.py token   <quant_id>        # internal quant id -> CLI --quantization token
   _catalog.py suffix  <quant_id>        # internal quant id -> pull-grammar suffix (fp16/q8/q4)
@@ -986,6 +987,17 @@ def main(argv: list[str]) -> int:
             print(" ".join(val))
         else:
             print(val)
+    elif cmd == "field-lines":
+        # One list item per line (empty output when the key is absent): the
+        # shell uses mapfile over lists whose items carry spaces (prep
+        # scripts, import command templates), where `field`'s space-join
+        # would corrupt the entries.
+        val = entry(argv[1]).get(argv[2])
+        if val is None:
+            return 0
+        if not isinstance(val, list) or not all(isinstance(item, str) for item in val):
+            sys.exit(f"key '{argv[2]}' for model '{argv[1]}' is not a string list")
+        print("\n".join(val))
     elif cmd == "quants":
         print("\n".join(entry(argv[1])["quants"]))
     elif cmd == "token":

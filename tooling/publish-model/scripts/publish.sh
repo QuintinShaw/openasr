@@ -123,11 +123,46 @@ print(hashlib.sha256(payload).hexdigest())
 PY
 }
 
+# Content-addressed checkpoints: a step's checkpoint binds BOTH the command
+# inputs (step + argv) AND the bytes of its declared outputs. The old
+# input-only checkpoint was blind to artifact bytes -- rebuild a pack and the
+# dependent step still "matched" and skipped, silently shipping the stale
+# artifact (the materialize-vs-rebuilt-pack bug). A schema_version 1
+# checkpoint carries no outputs_sha256, so a step that declares outputs treats
+# it as a miss and re-runs once; steps without outputs behave exactly as
+# before.
+fingerprint_outputs() {
+  python3 - "$1" <<'PY'
+from __future__ import annotations
+
+import glob
+import hashlib
+import os
+import sys
+
+digests = {}
+for pattern in sys.argv[1].split():
+    for path in glob.glob(pattern):
+        if os.path.isfile(path):
+            digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(chunk)
+            digests[path] = digest.hexdigest()
+import json
+
+print(json.dumps(digests, sort_keys=True))
+PY
+}
+
 checkpoint_matches() {
   local file="$1"
   local input_sha="$2"
+  local outputs_glob="$3"
   [[ -f "$file" ]] || return 1
-  python3 - "$file" "$input_sha" <<'PY'
+  local current_fingerprint
+  current_fingerprint="$(fingerprint_outputs "$outputs_glob")"
+  python3 - "$file" "$input_sha" "$current_fingerprint" <<'PY'
 from __future__ import annotations
 
 import json
@@ -136,11 +171,15 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 expected = sys.argv[2]
+current_outputs = json.loads(sys.argv[3])
 try:
     data = json.loads(path.read_text(encoding="utf-8"))
 except Exception:
     raise SystemExit(1)
-raise SystemExit(0 if data.get("input_sha256") == expected else 1)
+if data.get("input_sha256") != expected:
+    raise SystemExit(1)
+recorded_outputs = data.get("outputs_sha256") or {}
+raise SystemExit(0 if recorded_outputs == current_outputs else 1)
 PY
 }
 
@@ -148,8 +187,11 @@ write_checkpoint() {
   local file="$1"
   local step="$2"
   local input_sha="$3"
-  shift 3
-  python3 - "$file" "$step" "$input_sha" "$@" <<'PY'
+  local outputs_glob="$4"
+  shift 4
+  local outputs_fingerprint
+  outputs_fingerprint="$(fingerprint_outputs "$outputs_glob")"
+  python3 - "$file" "$step" "$input_sha" "$outputs_fingerprint" "$@" <<'PY'
 from __future__ import annotations
 
 import json
@@ -159,10 +201,11 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 data = {
-    "schema_version": 1,
+    "schema_version": 2,
     "step": sys.argv[2],
     "input_sha256": sys.argv[3],
-    "command": sys.argv[4:],
+    "outputs_sha256": json.loads(sys.argv[4]),
+    "command": sys.argv[5:],
     "completed_at": datetime.now(timezone.utc).isoformat(),
 }
 path.parent.mkdir(parents=True, exist_ok=True)
@@ -170,10 +213,17 @@ path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf
 PY
 }
 
+# run_step <name> <override-var> [--outputs "<glob> [<glob>...]"] -- <cmd...>
 run_step() {
   local step="$1"
   local override_var="$2"
   shift 2
+  local outputs_glob=""
+  if [[ "${1:-}" == "--outputs" ]]; then
+    outputs_glob="${2:?--outputs requires a glob list}"
+    shift 2
+  fi
+  [[ "${1:-}" == "--" ]] && shift
   local -a command=("$@")
   local override="${!override_var:-}"
   if [[ -n "$override" ]]; then
@@ -182,13 +232,13 @@ run_step() {
   local input_sha
   input_sha="$(hash_args "$step" "${command[@]}")"
   local checkpoint="$CHECKPOINT_DIR/$step.done.json"
-  if [[ "$FORCE" != "1" ]] && checkpoint_matches "$checkpoint" "$input_sha"; then
+  if [[ "$FORCE" != "1" ]] && checkpoint_matches "$checkpoint" "$input_sha" "$outputs_glob"; then
     log "skip $step (checkpoint)"
     return 0
   fi
   log "run $step"
   "${command[@]}"
-  write_checkpoint "$checkpoint" "$step" "$input_sha" "${command[@]}"
+  write_checkpoint "$checkpoint" "$step" "$input_sha" "$outputs_glob" "${command[@]}"
 }
 
 quant_args=()
@@ -196,9 +246,16 @@ for quant in "${QUANTS[@]}"; do
   quant_args+=(--quant "$quant")
 done
 
+# Outputs bind the packs AND their sidecars: rebuild a pack (e.g. after a
+# quantization-policy fix) and its bytes change, so the checkpoint no longer
+# matches and materialize re-runs instead of silently keeping the stale
+# sidecar. This is the fix for the "--reset-checkpoints required by hand"
+# workaround the q4_k incident forced.
 run_step \
   materialize_results \
   OPENASR_PUBLISH_MATERIALIZE_CMD \
+  --outputs "$WORK_ROOT/packs/$MODEL-*.oasr $WORK_ROOT/packs/$MODEL.*.result.json" \
+  -- \
   python3 "$SCRIPT_DIR/materialize_result_sidecars.py" "$MODEL" "${quant_args[@]}"
 
 for target in "${TARGETS[@]}"; do

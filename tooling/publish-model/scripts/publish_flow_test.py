@@ -98,6 +98,40 @@ class PublishFlowTest(unittest.TestCase):
             ["materialize", "target", "registry", "manifest", "catalog"],
         )
 
+    def test_pack_byte_change_invalidates_materialize_checkpoint(self) -> None:
+        # The incident this locks: a pack gets rebuilt (quantization-policy
+        # fix) but the materialize checkpoint still "matches", so the stale
+        # sidecar ships. Checkpoints are content-addressed over declared
+        # outputs -- pack bytes change, the step re-runs.
+        result = self.run_publish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.commands()[0], "materialize")
+
+        packs = self.work_root / "packs"
+        packs.mkdir(parents=True, exist_ok=True)
+        pack = packs / "qwen3-asr-0.6b-q8_0.oasr"
+
+        # A new output appears the checkpoint never recorded: re-run.
+        self.log.write_text("")
+        pack.write_bytes(b"pack v1")
+        appeared = self.run_publish()
+        self.assertEqual(appeared.returncode, 0, appeared.stderr)
+        self.assertEqual(self.commands()[0], "materialize")
+
+        # Steady state: nothing changed, everything skips.
+        self.log.write_text("")
+        steady = self.run_publish()
+        self.assertEqual(steady.returncode, 0, steady.stderr)
+        self.assertEqual(self.commands(), [])
+        self.assertIn("skip materialize_results", steady.stderr)
+
+        # The pack is rebuilt in place (same name, new bytes): re-run.
+        self.log.write_text("")
+        pack.write_bytes(b"pack v2 -- rebuilt under the fixed policy")
+        rebuilt = self.run_publish()
+        self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
+        self.assertEqual(self.commands()[0], "materialize")
+
     def test_dry_run_stops_before_registry_manifest_and_catalog(self) -> None:
         result = self.run_publish("--dry-run")
 

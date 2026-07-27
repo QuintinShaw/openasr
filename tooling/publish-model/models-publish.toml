@@ -2,81 +2,171 @@
 #
 # These fields drive the internal build/publish lane and are intentionally kept
 # separate from consumer-facing registry/catalog fields in models-core.toml.
+#
+# Pipeline fields consumed by download.sh / prep.sh / convert.sh (all optional;
+# absence means the generic path):
+#
+#   download_includes        fetch ONLY these patterns from upstream_repo
+#                            (repos shipping redundant weight formats --
+#                            whisper-large-v3 ships the same model 4x over).
+#   download_excludes        extra patterns on top of the harness defaults.
+#   extra_sources            "repo@rev:subdir" lines: auxiliary upstream repos
+#                            staged under the model's src dir.
+#   required_download_files  globs that must exist right after the download.
+#   prep_scripts             ordered command templates run by prep.sh between
+#                            download and convert; placeholders {src} {work}
+#                            {model} {packs_dir} {registry_id} {quant}.
+#   required_source_files    globs that must exist before import (after prep).
+#   import_command           full `model-pack ...` invocation template for
+#                            families whose CLI shape differs from the generic
+#                            `import <subcommand> <src> <out>` default.
+#   external_converter       command template for families converted outside
+#                            `openasr model-pack import` entirely; must produce
+#                            the pack at {out}.
+#
+# The required_* gates are fail-closed by design: an upstream that changes its
+# file layout, an exclude rule that strips the only checkpoint, or a tokenless
+# fetch of a private repo that lands a 29-byte error page all fail HERE with
+# the gap named, instead of masquerading as a successful stage.
 
 ["qwen3-asr-1.7b"]
 import_subcommand = "import qwen"
 upstream_repo = "Qwen/Qwen3-ASR-1.7B"
 source_revision = "main"
 needs_license_flags = true
+required_source_files = ["config.json", "tokenizer_config.json", "model.safetensors.index.json", "model-*.safetensors"]
 
 ["qwen3-asr-0.6b"]
 import_subcommand = "import qwen"
 upstream_repo = "Qwen/Qwen3-ASR-0.6B"
 source_revision = "main"
 needs_license_flags = true
+required_source_files = ["config.json", "tokenizer_config.json", "model.safetensors"]
 
 ["moonshine-tiny"]
 import_subcommand = "import moonshine"
 upstream_repo = "UsefulSensors/moonshine-tiny"
 source_revision = "main"
 needs_license_flags = true
+required_source_files = ["config.json", "tokenizer.json", "model.safetensors"]
 
 ["cohere-transcribe-03-2026"]
 import_subcommand = "import cohere"
 upstream_repo = "CohereLabs/cohere-transcribe-03-2026"
 source_revision = "d263bc2fa85c492529a6f6c38f07ce5a79adbf31"
 needs_license_flags = true
+required_source_files = ["config.json", "tokenizer.json", "model.safetensors"]
 
+# The large-v3 repos ship the same model FOUR times over (fp16 safetensors,
+# sharded fp32 safetensors, pytorch_model.bin, sharded fp32 bins); the importer
+# reads only model.safetensors. Fetch exactly the transformer-format files and
+# nothing else -- the unbounded fetch used to drag ~10GB of redundant fp32.
 ["whisper-large-v3-turbo"]
 import_subcommand = "import whisper"
 upstream_repo = "openai/whisper-large-v3-turbo"
 source_revision = "41f01f3fe87f28c78e2fbf8b568835947dd65ed9"
 needs_license_flags = true
+download_includes = [
+    "config.json", "generation_config.json", "model.safetensors",
+    "tokenizer.json", "tokenizer_config.json", "merges.txt", "vocab.json",
+    "normalizer.json", "added_tokens.json", "special_tokens_map.json",
+    "preprocessor_config.json",
+]
+required_source_files = ["config.json", "model.safetensors", "tokenizer.json"]
 
 ["whisper-small"]
 import_subcommand = "import whisper"
 upstream_repo = "openai/whisper-small"
 source_revision = "973afd24965f72e36ca33b3055d56a652f456b4d"
 needs_license_flags = true
+download_excludes = ["pytorch_model.bin", "*.pt"]
+required_source_files = ["config.json", "model.safetensors", "tokenizer.json"]
 
+# The importer consumes model.safetensors produced from streaming_exp/
+# pretrained.pt by pt_to_safetensors.py (the ONNX deployment exports fold the
+# encoder into opaque onnx::MatMul_* initializers; the .pt keeps clean
+# icefall names). The repo also ships a large demo.mov and deployment trees
+# the pipeline never touches.
 ["xasr-zh-en"]
 import_subcommand = "import xasr-zipformer"
 upstream_repo = "GilgameshWind/X-ASR-zh-en"
 source_revision = "main"
 needs_license_flags = false
+download_excludes = ["applications/*", "deployment/*", "demo/*", "figure/*", "*.mov", "*.dmg"]
+required_download_files = ["streaming_exp/pretrained.pt"]
+prep_scripts = [
+    "python3 tooling/publish-model/scripts/pt_to_safetensors.py --pt {src}/streaming_exp/pretrained.pt --out {src}/model.safetensors",
+]
+required_source_files = ["model.safetensors"]
 
 # Dolphin WeNet -> .oasr converter. The importer takes a local
 # full.safetensors + units.txt and emits fp16/q8_0/q4_k packs; it does not accept
 # license flags (needs_license_flags = false, like xasr-zipformer).
+#
+# The cn-dialect checkpoints bake global_cmvn into the state dict, so
+# pt_to_safetensors.py alone produces an import-ready full.safetensors. The
+# decode-prefix scheme is the fixed-<zh> cn-dialect builder: the CLI's
+# --language-scheme is REQUIRED (no default), so the recipe states it.
 ["dolphin-cn-dialect-small"]
 import_subcommand = "import dolphin"
 upstream_repo = "DataoceanAI1/dolphi-cn-dialect-small"
 source_revision = "main"
 needs_license_flags = false
+required_download_files = ["small.cn.pt", "units.txt"]
+prep_scripts = [
+    "python3 tooling/publish-model/scripts/pt_to_safetensors.py --pt {src}/small.cn.pt --out {src}/full.safetensors",
+]
+required_source_files = ["full.safetensors", "units.txt"]
+import_command = "model-pack import dolphin {src} {out} --package-id {registry_id} --quantization {quant} --language-scheme cn-dialect"
 
 ["dolphin-cn-dialect-base"]
 import_subcommand = "import dolphin"
 upstream_repo = "DataoceanAI/dolphin-cn-dialect-base"
 source_revision = "main"
 needs_license_flags = false
+required_download_files = ["base.cn.pt", "units.txt"]
+prep_scripts = [
+    "python3 tooling/publish-model/scripts/pt_to_safetensors.py --pt {src}/base.cn.pt --out {src}/full.safetensors",
+]
+required_source_files = ["full.safetensors", "units.txt"]
+import_command = "model-pack import dolphin {src} {out} --package-id {registry_id} --quantization {quant} --language-scheme cn-dialect"
 
 # Dolphin multilingual (small/base) -> .oasr converter: same "import dolphin"
 # subcommand, but the source ships a SentencePiece bpe.model + config.yaml
 # instead of the cn-dialect family's raw units.txt-only char vocab (the
 # importer's units.txt is still the id-ordered token list either way; only the
 # detokenize join differs at runtime, keyed off the pack's own
-# `dolphin.tokenizer.model` metadata).
+# `dolphin.tokenizer.model` metadata). The global_cmvn tensors are NOT baked
+# into these checkpoints: dolphin_fold_espnet_cmvn.py derives them from the
+# ESPnet feats_stats.npz accumulators and appends them to full.safetensors.
+# Scheme is per-code <lang>+<region> multilingual (NOT the cn-dialect default
+# the CLI once silently applied -- the bug that built dolphin-small with the
+# wrong decode prefix).
 ["dolphin-small"]
 import_subcommand = "import dolphin"
 upstream_repo = "DataoceanAI/dolphin-small"
 source_revision = "main"
 needs_license_flags = false
+required_download_files = ["small.pt", "units.txt", "bpe.model", "config.yaml", "feats_stats.npz"]
+prep_scripts = [
+    "python3 tooling/publish-model/scripts/pt_to_safetensors.py --pt {src}/small.pt --out {src}/full.safetensors",
+    "python3 tooling/publish-model/scripts/dolphin_fold_espnet_cmvn.py --safetensors {src}/full.safetensors --feats-stats {src}/feats_stats.npz",
+]
+required_source_files = ["full.safetensors", "units.txt", "bpe.model"]
+import_command = "model-pack import dolphin {src} {out} --package-id {registry_id} --quantization {quant} --language-scheme multilingual"
 
 ["dolphin-base"]
 import_subcommand = "import dolphin"
 upstream_repo = "DataoceanAI/dolphin-base"
 source_revision = "main"
 needs_license_flags = false
+required_download_files = ["base.pt", "units.txt", "bpe.model", "config.yaml", "feats_stats.npz"]
+prep_scripts = [
+    "python3 tooling/publish-model/scripts/pt_to_safetensors.py --pt {src}/base.pt --out {src}/full.safetensors",
+    "python3 tooling/publish-model/scripts/dolphin_fold_espnet_cmvn.py --safetensors {src}/full.safetensors --feats-stats {src}/feats_stats.npz",
+]
+required_source_files = ["full.safetensors", "units.txt", "bpe.model"]
+import_command = "model-pack import dolphin {src} {out} --package-id {registry_id} --quantization {quant} --language-scheme multilingual"
 
 # SenseVoiceSmall FunASR -> .oasr converter. The importer takes model.safetensors
 # (from pt_to_safetensors.py) + am.mvn + config.yaml + the SentencePiece bpe
@@ -87,77 +177,123 @@ import_subcommand = "import sensevoice"
 upstream_repo = "FunAudioLLM/SenseVoiceSmall"
 source_revision = "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7"
 needs_license_flags = false
+download_excludes = ["example/*", "image/*"]
+required_download_files = ["model.pt", "am.mvn", "config.yaml", "chn_jpn_yue_eng_ko_spectok.bpe.model"]
+prep_scripts = [
+    "python3 tooling/publish-model/scripts/pt_to_safetensors.py --pt {src}/model.pt --out {src}/model.safetensors",
+]
+required_source_files = ["model.safetensors", "am.mvn", "config.yaml", "chn_jpn_yue_eng_ko_spectok.bpe.model"]
 
+# ReDimNet2-B6 speaker embedder: converted by tooling/redimnet2/
+# convert_redimnet2.py (a ggml-graph pack writer, no model-pack import
+# subcommand). The upstream repo is PRIVATE -- download.sh fails closed
+# without a token, and required_download_files rejects error-page "downloads".
 ["redimnet2-b6-cn"]
-# External Python converter (tooling/redimnet2/convert_redimnet2.py); no openasr
-# model-pack import subcommand. publish.sh materializes prebuilt packs.
-import_subcommand = "import redimnet2"
+import_subcommand = "external: tooling/redimnet2/convert_redimnet2.py"
 upstream_repo = "PalabraAI/redimnet2"
 source_revision = "2a8d15f65b1dfb5d73fede2f11ee42bcccca3035"
 needs_license_flags = false
+required_download_files = ["b6-vb2+vox2+cnc2_v0-lm.pt"]
+external_converter = "python3 tooling/redimnet2/convert_redimnet2.py --in {src}/b6-vb2+vox2+cnc2_v0-lm.pt --out {out} --quant {quant}"
 
-
+# pyannote segmentation: the ONNX export is the source of truth;
+# pyannote_extract.py normalizes it to pyannote_seg.safetensors for the
+# `import pyannote` subcommand.
 ["pyannote-segmentation-3.0"]
 import_subcommand = "import pyannote"
 upstream_repo = "onnx-community/pyannote-segmentation-3.0"
 source_revision = "733a93b6473d019a773298e08cefa686894b1854"
 needs_license_flags = false
+download_includes = ["model.onnx"]
+required_download_files = ["model.onnx"]
+prep_scripts = [
+    "python3 tooling/publish-model/scripts/pyannote_extract.py --onnx {src}/model.onnx --out {src}/pyannote_seg.safetensors",
+]
+required_source_files = ["pyannote_seg.safetensors"]
+import_command = "model-pack import pyannote {src}/pyannote_seg.safetensors {out} --package-id {registry_id}"
 
+# Hy-MT2 repackaging: fixed-revision upstream GGUF -> .oasr, tensors preserved
+# byte-for-byte; only openasr.* metadata + license/notice are spliced in.
+# Fetch exactly the pinned Q4_K_M GGUF + LICENSE.txt (the repo also ships Q6_K
+# and Q8_0 variants the pipeline never uses).
 ["hymt2-1.8b"]
-# Planned PR2 importer: direct fixed-revision GGUF -> .oasr repackaging.
 import_subcommand = "import hymt2-gguf"
 upstream_repo = "tencent/Hy-MT2-1.8B-GGUF"
 source_revision = "1cd5208700acedef4ef93019b6cfc148b8522d45"
 source_filename = "Hy-MT2-1.8B-Q4_K_M.gguf"
 needs_license_flags = true
+download_includes = ["Hy-MT2-1.8B-Q4_K_M.gguf", "LICENSE.txt"]
+required_download_files = ["Hy-MT2-1.8B-Q4_K_M.gguf", "LICENSE.txt"]
+import_command = "model-pack import hymt2-gguf {src}/Hy-MT2-1.8B-Q4_K_M.gguf {out} --package-id {registry_id} --license-file {src}/LICENSE.txt --notice-file tooling/publish-model/notices/hymt2-1.8b/NOTICE.openasr.txt"
 
 ["whisper-tiny"]
 import_subcommand = "import whisper"
 upstream_repo = "openai/whisper-tiny"
 source_revision = "169d4a4341b33bc18d8881c4b69c2e104e1cc0af"
 needs_license_flags = true
+download_excludes = ["pytorch_model.bin", "*.pt"]
+required_source_files = ["config.json", "model.safetensors", "tokenizer.json"]
 
 ["whisper-base"]
 import_subcommand = "import whisper"
 upstream_repo = "openai/whisper-base"
 source_revision = "e37978b90ca9030d5170a5c07aadb050351a65bb"
 needs_license_flags = true
+download_excludes = ["pytorch_model.bin", "*.pt"]
+required_source_files = ["config.json", "model.safetensors", "tokenizer.json"]
 
 ["whisper-medium"]
 import_subcommand = "import whisper"
 upstream_repo = "openai/whisper-medium"
 source_revision = "abdf7c39ab9d0397620ccaea8974cc764cd0953e"
 needs_license_flags = true
+download_excludes = ["pytorch_model.bin", "*.pt"]
+required_source_files = ["config.json", "model.safetensors", "tokenizer.json"]
 
 ["whisper-large-v3"]
 import_subcommand = "import whisper"
 upstream_repo = "openai/whisper-large-v3"
 source_revision = "06f233fe06e710322aca913c1bc4249a0d71fce1"
 needs_license_flags = true
+download_includes = [
+    "config.json", "generation_config.json", "model.safetensors",
+    "tokenizer.json", "tokenizer_config.json", "merges.txt", "vocab.json",
+    "normalizer.json", "added_tokens.json", "special_tokens_map.json",
+    "preprocessor_config.json",
+]
+required_source_files = ["config.json", "model.safetensors", "tokenizer.json"]
 
 ["whisper-tiny.en"]
 import_subcommand = "import whisper"
 upstream_repo = "openai/whisper-tiny.en"
 source_revision = "87c7102498dcde7456f24cfd30239ca606ed9063"
 needs_license_flags = true
+download_excludes = ["pytorch_model.bin", "*.pt"]
+required_source_files = ["config.json", "model.safetensors", "tokenizer.json"]
 
 ["whisper-base.en"]
 import_subcommand = "import whisper"
 upstream_repo = "openai/whisper-base.en"
 source_revision = "911407f4214e0e1d82085af863093ec0b66f9cd6"
 needs_license_flags = true
+download_excludes = ["pytorch_model.bin", "*.pt"]
+required_source_files = ["config.json", "model.safetensors", "tokenizer.json"]
 
 ["whisper-small.en"]
 import_subcommand = "import whisper"
 upstream_repo = "openai/whisper-small.en"
 source_revision = "e8727524f962ee844a7319d92be39ac1bd25655a"
 needs_license_flags = true
+download_excludes = ["pytorch_model.bin", "*.pt"]
+required_source_files = ["config.json", "model.safetensors", "tokenizer.json"]
 
 ["whisper-medium.en"]
 import_subcommand = "import whisper"
 upstream_repo = "openai/whisper-medium.en"
 source_revision = "2e98eb6279edf5095af0c8dedb36bdec0acd172b"
 needs_license_flags = true
+download_excludes = ["pytorch_model.bin", "*.pt"]
+required_source_files = ["config.json", "model.safetensors", "tokenizer.json"]
 
 # Parakeet TDT HF (transformers-format) -> .oasr converter. The importer takes
 # config.json + tokenizer.json + model.safetensors; license fields live in
@@ -167,70 +303,87 @@ import_subcommand = "import parakeet-tdt"
 upstream_repo = "nvidia/parakeet-tdt-0.6b-v3"
 source_revision = "7c35754d166cca382ad1e53e68b01e7c575f3a1d"
 needs_license_flags = false
+required_source_files = ["config.json", "tokenizer.json", "model.safetensors"]
 
 # FireRedASR2-AED: same Conformer-encoder + Transformer-decoder importer as
 # v1 (architecture is byte-identical per upstream source diff); only the
 # vocab (7832 -> 8667 tokens) and a new post-hoc CTC branch
 # (`ctc.ctc_lo.{weight,bias}`, dropped at import -- no timestamp feature in
-# this family yet) changed. Takes model.safetensors (from
-# pt_to_safetensors.py) + dict.txt + cmvn.txt; license fields live in
-# models-core.toml (needs_license_flags = false, like dolphin/sensevoice/
-# xasr-zipformer). Only v2 ships -- v1 (FireRedASR-AED-L) was superseded
-# before its catalog entry ever went public.
+# this family yet) changed. Upstream ships model.pth.tar + a Kaldi-binary
+# cmvn.ark; prep normalizes both (pt_to_safetensors.py, then
+# firered_llm_cmvn_ark_to_txt.py which the firered_aed importer's
+# parse_kaldi_cmvn_stats reuses). License fields live in models-core.toml
+# (needs_license_flags = false, like dolphin/sensevoice/xasr-zipformer).
+# Only v2 ships -- v1 (FireRedASR-AED-L) was superseded before its catalog
+# entry ever went public.
 ["firered-aed-l-v2"]
 import_subcommand = "import firered-aed"
 upstream_repo = "FireRedTeam/FireRedASR2-AED"
 source_revision = "2304afed56eacfee6256dee5937ed22ffa0b64ec"
 needs_license_flags = false
+required_download_files = ["model.pth.tar", "dict.txt", "cmvn.ark"]
+prep_scripts = [
+    "python3 tooling/publish-model/scripts/pt_to_safetensors.py --pt {src}/model.pth.tar --out {src}/model.safetensors",
+    "python3 tooling/publish-model/scripts/firered_llm_cmvn_ark_to_txt.py --ark {src}/cmvn.ark --out {src}/cmvn.txt",
+]
+required_source_files = ["model.safetensors", "dict.txt", "cmvn.txt"]
 
 # FireRedASR2-LLM: imported via the public `openasr model-pack import
 # firered-llm` subcommand (import_firered_llm_local_command in
-# model_pack_cli.rs), from a LoRA-merged Qwen2-7B-Instruct safetensors
-# (firered_llm_merge_lora.py) + cmvn.txt (firered_llm_cmvn_ark_to_txt.py) + the
-# conformer encoder safetensors. Like the firered-aed/dolphin importers it bakes
-# license metadata from models-core rather than taking CLI license flags
-# (needs_license_flags = false). source_revision left at the branch tip:
-# upstream FireRedASR2-LLM publishes no pinned release tag, mirroring how
-# qwen3-forced-aligner tracks "main".
+# model_pack_cli.rs), from three inputs: the conformer encoder + adapter
+# safetensors (pt_to_safetensors.py over asr_encoder.pth.tar) with cmvn.txt
+# (firered_llm_cmvn_ark_to_txt.py over cmvn.ark) in the staged source dir,
+# the LoRA-merged Qwen2-7B-Instruct safetensors (firered_llm_merge_lora.py
+# merging model.pth.tar's PEFT adapters into the nested Qwen2-7B-Instruct
+# base weights the same repo ships), and the Qwen2 metadata dir. Like the
+# firered-aed/dolphin importers it bakes license metadata from models-core
+# rather than taking CLI license flags (needs_license_flags = false).
+# source_revision left at the branch tip: upstream FireRedASR2-LLM publishes
+# no pinned release tag, mirroring how qwen3-forced-aligner tracks "main".
 ["firered2-llm"]
 import_subcommand = "import firered-llm"
 upstream_repo = "FireRedTeam/FireRedASR2-LLM"
 source_revision = "main"
 needs_license_flags = false
+required_download_files = ["asr_encoder.pth.tar", "model.pth.tar", "cmvn.ark", "Qwen2-7B-Instruct/config.json", "Qwen2-7B-Instruct/model.safetensors.index.json"]
+prep_scripts = [
+    "python3 tooling/publish-model/scripts/pt_to_safetensors.py --pt {src}/asr_encoder.pth.tar --out {src}/model.safetensors",
+    "python3 tooling/publish-model/scripts/firered_llm_cmvn_ark_to_txt.py --ark {src}/cmvn.ark --out {src}/cmvn.txt",
+    "python3 tooling/publish-model/scripts/pt_to_safetensors.py --pt {src}/model.pth.tar --out {work}/firered2_lora.safetensors",
+    "python3 tooling/publish-model/scripts/firered_llm_merge_lora.py --lora-safetensors {work}/firered2_lora.safetensors --qwen2-dir {src}/Qwen2-7B-Instruct --out {work}/qwen2_merged.safetensors",
+]
+required_source_files = ["model.safetensors", "cmvn.txt"]
+import_command = "model-pack import firered-llm {src} {work}/qwen2_merged.safetensors {src}/Qwen2-7B-Instruct {out} --package-id {registry_id} --quantization {quant}"
 
-# MiMo-V2.5-ASR: NOT wired to a public `openasr model-pack import` subcommand.
-# It is converted by the standalone tooling/mimo-asr/convert_mimo_asr.py script
-# (two source repos: XiaomiMiMo/MiMo-V2.5-ASR main model + the
-# XiaomiMiMo/MiMo-Audio-Tokenizer encoder), same "converted outside publish.sh's
-# import step" situation as qwen3-forced-aligner-0.6b. The publish pipeline
-# therefore cannot run its import step for this model; the pack's result sidecar
-# (sha256/size) is instead recorded via materialize_result_sidecars.py against
-# the already-built .oasr, and metrics.json is materialized from the recorded
-# bench run -- both feeding _manifest.py exactly as an imported model's would.
-# import_subcommand is descriptive only (render_card.py's card prose is the sole
-# consumer); no publish helper executes it. upstream_repo names the main model
-# (its owner becomes the catalog `vendor`); the audio-tokenizer repo is a
-# build-time dependency of the converter, not a separate publish target.
+# MiMo-V2.5-ASR: converted by tooling/mimo-asr/convert_mimo_asr.py (two source
+# repos: XiaomiMiMo/MiMo-V2.5-ASR main model + the XiaomiMiMo/MiMo-Audio-
+# Tokenizer encoder, staged via extra_sources). The converter writes
+# {packs_dir}/{package_id}-{quant}.oasr, exactly the pipeline's pack_file
+# convention, so the generic result-sidecar flow applies unchanged.
+# import_subcommand stays descriptive for render_card.py's card prose.
 ["mimo-v2.5-asr"]
-import_subcommand = "convert via tooling/mimo-asr/convert_mimo_asr.py (no model-pack import subcommand)"
+import_subcommand = "external: tooling/mimo-asr/convert_mimo_asr.py"
 upstream_repo = "XiaomiMiMo/MiMo-V2.5-ASR"
 source_revision = "main"
 needs_license_flags = false
+extra_sources = ["XiaomiMiMo/MiMo-Audio-Tokenizer@main:tokenizer-src"]
+required_download_files = ["config.json", "model.safetensors.index.json", "tokenizer-src/model.safetensors"]
+external_converter = "python3 tooling/mimo-asr/convert_mimo_asr.py --main-dir {src} --tokenizer {src}/tokenizer-src/model.safetensors --out-dir {packs_dir} --package-id {registry_id} --quant {quant}"
 
 # Qwen3-ForcedAligner-0.6B: shares its thinker (audio encoder + LM) tensor
 # layout byte-for-byte with qwen3-asr (see
 # crates/openasr-core/src/models/qwen/forced_aligner_import.rs); only the
 # final head differs (independent classify_num=5000 timestamp-bin head vs
-# tied lm_head). Not yet wired to a public `openasr model-pack import`
-# subcommand (family/CLI wiring for the NAR decode policy is a separate
-# stage; see the importer's module doc comment). The pack was built with a
-# one-off publish driver (since removed post-upload); re-packing would need
-# a new driver against `convert_local_qwen_forced_aligner_source_to_runtime_pack`.
+# tied lm_head). The crate-internal importer exists; the public
+# `model-pack import` subcommand wiring lands with the NAR decode policy.
+# Until then convert.sh fails closed ("no import recipe") rather than
+# resurrecting the removed one-off publish driver.
 ["qwen3-forced-aligner-0.6b"]
 import_subcommand = "not yet a public model-pack import subcommand"
 upstream_repo = "Qwen/Qwen3-ForcedAligner-0.6B"
 source_revision = "main"
 needs_license_flags = false
+required_source_files = ["config.json", "model.safetensors"]
 
 # FireRedPunc punctuation capability pack. Imported via the public
 # `openasr model-pack import firered-punc` subcommand from the upstream
@@ -241,13 +394,20 @@ import_subcommand = "import firered-punc"
 upstream_repo = "FireRedTeam/FireRedPunc"
 source_revision = "e448fd967f44182a1c323cc30f5d89f2400c28da"
 needs_license_flags = false
+required_download_files = ["model.pth.tar", "chinese-lert-base/vocab.txt"]
+prep_scripts = [
+    "python3 tooling/publish-model/scripts/pt_to_safetensors.py --pt {src}/model.pth.tar --out {src}/model.safetensors",
+]
+required_source_files = ["model.safetensors", "chinese-lert-base/vocab.txt"]
+import_command = "model-pack import firered-punc {src}/model.safetensors {src}/chinese-lert-base/vocab.txt {out} --package-id {registry_id}"
 
-# MOSS-Transcribe-Diarize: not yet wired to a public `openasr model-pack
-# import` subcommand (the crate-internal importer
-# `moss_transcribe_diarize::package_import` exists but has no CLI entry
-# point yet, same pre-CLI-wiring stage qwen3-forced-aligner-0.6b was at).
+# MOSS-Transcribe-Diarize: the crate-internal importer
+# (moss_transcribe_diarize::package_import) exists but has no CLI entry point
+# yet. Until the public subcommand lands, convert.sh fails closed ("no import
+# recipe") instead of pretending a pipeline path exists.
 ["moss-transcribe-diarize"]
 import_subcommand = "not yet a public model-pack import subcommand"
 upstream_repo = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
 source_revision = "main"
 needs_license_flags = false
+required_source_files = ["config.json", "model.safetensors.index.json"]

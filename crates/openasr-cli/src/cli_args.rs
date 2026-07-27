@@ -842,8 +842,8 @@ pub(crate) enum ImportCommand {
         /// Runtime tensor quantization for GGUF-backed `.oasr` output (context_module/CMVN/mel filterbank always stay f32).
         #[arg(long, value_enum, default_value_t = ImportDolphinQuantization::Fp16)]
         quantization: ImportDolphinQuantization,
-        /// Decode-prefix scheme the checkpoint's vocab uses: `cn-dialect` (fixed `<zh>` language token, small.cn/cn-dialect-base) or `multilingual` (per-code `<lang>` + `<region>`, dolphin-small/dolphin-base).
-        #[arg(long, value_enum, default_value_t = ImportDolphinLanguageScheme::CnDialect)]
+        /// Decode-prefix scheme the checkpoint's vocab uses: `cn-dialect` (fixed `<zh>` language token, small.cn/cn-dialect-base) or `multilingual` (per-code `<lang>` + `<region>`, dolphin-small/dolphin-base). REQUIRED: there is no default -- a missing scheme once silently built a multilingual checkpoint with the cn-dialect prefix.
+        #[arg(long, value_enum)]
         language_scheme: ImportDolphinLanguageScheme,
     },
     /// Import one local SenseVoiceSmall (FunASR SAN-M/CTC) source directory into one runtime pack file (`.oasr`).
