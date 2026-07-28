@@ -372,13 +372,22 @@ fn quantized_tensor_type_for_xasr_tensor(
     let ne0 = dims.first().copied()?;
     // The zipformer acoustic encoder is `encoder.*`; the chunk decoder
     // (`decoder.embedding.weight`, `decoder.conv.weight`) is downstream.
-    let component = if name.starts_with("encoder.") {
+    let component = if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
         QuantComponent::Encoder
     } else {
         QuantComponent::Decoder
     };
     classify_quant_tensor(ne0, quantization, component)
 }
+
+/// Runtime tensor name prefix for the xasr-zipformer acoustic encoder
+/// (`encoder.*`). Shared with `models::pack_quant_audit`'s encoder-floor
+/// rule -- the single source of truth for "which xasr-zipformer tensors are
+/// audio-encoder".
+pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["encoder."];
 
 fn join_u32(values: &[u32]) -> String {
     values

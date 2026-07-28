@@ -16,6 +16,7 @@ mod weights;
 pub const MOONSHINE_MODEL_FAMILY: &str = "moonshine";
 
 pub(crate) use ggml_executor::MoonshineGgmlExecutor;
+pub(crate) use package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES;
 pub use package_import::{
     MoonshineLocalSourceError, MoonshineLocalSourceImportRequest,
     MoonshineLocalSourceImportRuntimeResult, MoonshineRuntimeQuantizationMode,

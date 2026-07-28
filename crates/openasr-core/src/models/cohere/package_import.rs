@@ -551,11 +551,18 @@ fn quantized_tensor_type_for_cohere_tensor(
     classify_quant_tensor(ne0, quantization, cohere_quant_component(name))
 }
 
-/// Encoder/audio-front-end tensors map onto the `enc.*` namespace (`enc.pre.*`,
-/// `enc.proj`, `enc.blk.*`); the transformer decoder is `dec.*`. The encoder
-/// carries the shared Q8_0 floor (see `classify_quant_tensor`).
+/// Runtime tensor name prefixes for the cohere-transcribe audio front end
+/// (`enc.pre.*`, `enc.proj`, `enc.blk.*`); the transformer decoder is `dec.*`.
+/// Shared with `models::pack_quant_audit`'s encoder-floor rule -- the single
+/// source of truth for "which cohere-transcribe tensors are audio-encoder".
+pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc."];
+
+/// The encoder carries the shared Q8_0 floor (see `classify_quant_tensor`).
 fn cohere_quant_component(name: &str) -> QuantComponent {
-    if name.starts_with("enc.") {
+    if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
         QuantComponent::Encoder
     } else {
         QuantComponent::Decoder

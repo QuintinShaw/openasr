@@ -596,13 +596,22 @@ fn quantized_tensor_type_for_sensevoice_tensor(
     let ne0 = dims.first().copied()?;
     // The SAN-M encoder (`enc.blk.*`) and the two-pass encoder (`tp.blk.*`) are
     // the acoustic front end; `ctc.head` / `embed.prompt` are downstream.
-    let component = if name.starts_with("enc.") || name.starts_with("tp.") {
+    let component = if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
         QuantComponent::Encoder
     } else {
         QuantComponent::Decoder
     };
     classify_quant_tensor(ne0, quantization, component)
 }
+
+/// Runtime tensor name prefixes for the SenseVoice SAN-M encoder (`enc.*`)
+/// and two-pass encoder (`tp.*`). Shared with `models::pack_quant_audit`'s
+/// encoder-floor rule -- the single source of truth for "which SenseVoice
+/// tensors are audio-encoder".
+pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc.", "tp."];
 
 fn sensevoice_runtime_gguf_metadata(
     hparams: &SenseVoiceDerivedHparams,

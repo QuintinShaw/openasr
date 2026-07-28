@@ -425,12 +425,19 @@ fn quantized_linear_tensor_type(
     classify_quant_tensor(ne0, quantization, component)
 }
 
-/// The acoustic path is the whisper encoder (`moss.enc.*`) plus its
-/// encoder->LLM projector (`moss.adaptor.*`, the analogue of qwen's
-/// `audio.proj*`); both carry the shared Q8_0 floor. The `moss.llm.*` text
-/// decoder keeps the full requested rung.
+/// Runtime tensor name prefixes for the moss acoustic path: the whisper
+/// encoder (`moss.enc.*`) plus its encoder->LLM projector (`moss.adaptor.*`,
+/// the analogue of qwen's `audio.proj*`); both carry the shared Q8_0 floor.
+/// The `moss.llm.*` text decoder keeps the full requested rung. Shared with
+/// `models::pack_quant_audit`'s encoder-floor rule -- the single source of
+/// truth for "which moss tensors are audio-encoder".
+pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["moss.enc.", "moss.adaptor."];
+
 fn moss_quant_component(target_name: &str) -> QuantComponent {
-    if target_name.starts_with("moss.enc.") || target_name.starts_with("moss.adaptor.") {
+    if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+        .iter()
+        .any(|prefix| target_name.starts_with(prefix))
+    {
         QuantComponent::Encoder
     } else {
         QuantComponent::Decoder

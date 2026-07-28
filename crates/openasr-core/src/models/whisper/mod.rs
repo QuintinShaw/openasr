@@ -21,6 +21,7 @@ mod tokenizer;
 pub use frontend::whisper_log_mel_spectrogram_16khz_mono_v0;
 pub(crate) use ggml_executor::WhisperGgmlExecutor;
 pub use local_source::WhisperLocalSourceError;
+pub(crate) use package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES;
 pub use package_import::{
     WhisperLocalSourceImportRequest, WhisperLocalSourceImportRuntimeResult,
     WhisperRuntimeQuantizationMode, convert_local_whisper_hf_source_to_runtime_pack,

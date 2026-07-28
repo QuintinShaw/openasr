@@ -82,6 +82,14 @@ pub(crate) fn classify_quant_tensor(
     quantization: PackQuant,
     component: QuantComponent,
 ) -> Option<GgufWriteTensorType> {
+    // Every real call site already guards this (checked ahead of the family's
+    // own eligibility test), but the guard belongs on the policy itself: a
+    // caller-less consumer (e.g. the quant-floor audit deriving a declared
+    // tier's producible rungs) must get `None` for `Fp16`, not silently fall
+    // through to the block-quant arms below.
+    if quantization == PackQuant::Fp16 {
+        return None;
+    }
     if !ne0.is_multiple_of(32_u64) {
         return None;
     }
@@ -99,6 +107,18 @@ pub(crate) fn classify_quant_tensor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fp16_tier_never_produces_a_block_quant() {
+        assert_eq!(
+            classify_quant_tensor(256, PackQuant::Fp16, QuantComponent::Decoder),
+            None
+        );
+        assert_eq!(
+            classify_quant_tensor(256, PackQuant::Fp16, QuantComponent::Encoder),
+            None
+        );
+    }
 
     #[test]
     fn unaligned_ne0_falls_back_to_fp16_representation() {

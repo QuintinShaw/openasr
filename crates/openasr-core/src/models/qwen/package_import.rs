@@ -774,12 +774,24 @@ fn quantized_tensor_type_for_qwen(
     classify_quant_tensor(ne0, quantization, qwen_quant_component(name))
 }
 
-/// Encoder/audio-tower tensors map onto the `audio.*` runtime namespace
-/// (`audio.conv*`, `audio.proj*`, `audio.blk.*`, `audio.ln_post`); everything
+/// Runtime tensor name prefixes for the qwen3 audio tower (`audio.conv*`,
+/// `audio.proj*`, `audio.blk.*`, `audio.ln_post`). Shared with
+/// `models::pack_quant_audit`'s encoder-floor rule for both
+/// `QWEN3_ASR_GGML_ARCHITECTURE_ID` and
+/// `QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID` (the forced-aligner shares this
+/// importer's audio tower) -- the single source of truth for "which qwen3
+/// tensors are audio-encoder", so the audit can never drift from what this
+/// importer actually classifies as `QuantComponent::Encoder`.
+pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["audio."];
+
+/// Everything under the audio-tower namespace is the encoder side; everything
 /// else (`blk.*` LLM layers, `token_embd`, `output*`) is the decoder side. The
 /// audio tower carries the shared Q8_0 floor (see `classify_quant_tensor`).
 fn qwen_quant_component(name: &str) -> QuantComponent {
-    if name.starts_with("audio.") {
+    if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
         QuantComponent::Encoder
     } else {
         QuantComponent::Decoder

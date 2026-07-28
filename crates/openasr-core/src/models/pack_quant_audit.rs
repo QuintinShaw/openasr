@@ -12,13 +12,21 @@
 //! so it also runs against published, remotely-hosted, read-only packs via an
 //! HTTP `Range` prefix fetch, with no source weights and no inference.
 //!
-//! The encoder/decoder split mirrors each family's importer classification
-//! (`QuantComponent` at import time) but keyed on the RUNTIME tensor names
-//! written into the pack and on the pack's `openasr.model.architecture`
-//! metadata, so the check needs no source checkout. The floor itself is the
-//! same policy [`crate::models::pack_quant::classify_quant_tensor`] enforces
-//! at build time; a pack that violates it was built by code predating the
-//! floor (or by a regression), and must not ship.
+//! The encoder/decoder split is keyed on the RUNTIME tensor names written
+//! into the pack and on the pack's `openasr.model.architecture` metadata, so
+//! the check needs no source checkout -- but it is NOT a hand-copied guess at
+//! each family's importer classification. `audio_encoder_tensors_for_architecture`
+//! below references each family's own `AUDIO_ENCODER_TENSOR_NAME_PREFIXES`
+//! constant (declared beside that family's `QuantComponent` classification in
+//! its `package_import` module), so the two can never drift apart silently:
+//! a renamed encoder namespace moves both call sites at once, and a family
+//! with no such constant simply does not compile. The tier-ceiling check
+//! (`declared_tier_allows`) is likewise derived by calling the shared policy
+//! function directly (see below) instead of re-deriving its per-tier rung
+//! table by hand. The floor policy itself is
+//! [`crate::models::pack_quant::classify_quant_tensor`]; a pack that violates
+//! it was built by code predating the floor (or by a regression), and must
+//! not ship.
 
 use std::borrow::Cow;
 use std::io::Read;
@@ -26,8 +34,9 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::ggml_runtime::GgufWriteTensorType;
 use crate::ggml_runtime::gguf_header::{GgufHeaderError, GgufHeaderView, parse_gguf_header};
-use crate::models::pack_quant::PackQuant;
+use crate::models::pack_quant::{PackQuant, QuantComponent, classify_quant_tensor};
 
 // --- ggml type ids (stable ggml ABI wire values) ---------------------------
 
@@ -116,45 +125,74 @@ pub fn is_block_quant_type(ggml_type: u32) -> bool {
     )
 }
 
-/// True when the type satisfies the audio-encoder Q8_0 floor: Q8_0/Q8_1/Q8_K
-/// (or any non-block storage, checked by the caller). Anything below -- the
-/// Q2..Q6 and IQ* rungs -- is the behavioral cliff the floor exists to
-/// prevent.
-pub fn meets_encoder_q8_floor(ggml_type: u32) -> bool {
-    matches!(ggml_type, GGML_TYPE_Q8_0 | GGML_TYPE_Q8_1 | GGML_TYPE_Q8_K)
+/// The wire ggml type ids that satisfy a given writer tensor type's *safety*
+/// class, for the audit's purposes. Q8_0-class output accepts ANY 8-bit
+/// block-quant rung (Q8_0/Q8_1/Q8_K): the audit also reads packs this repo's
+/// own writer never produced (published packs, future writers), so it accepts
+/// any rung at the writer's precision class rather than demanding the exact
+/// ggml type `classify_quant_tensor` happens to emit today. Each K-quant rung
+/// above Q8 has no such sibling -- it maps onto exactly its own wire id.
+fn wire_types_equivalent_to(tensor_type: GgufWriteTensorType) -> &'static [u32] {
+    match tensor_type {
+        GgufWriteTensorType::Q8_0 => &[GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q8_K],
+        GgufWriteTensorType::Q3_K => &[GGML_TYPE_Q3_K],
+        GgufWriteTensorType::Q4_K => &[GGML_TYPE_Q4_K],
+        GgufWriteTensorType::Q5_K => &[GGML_TYPE_Q5_K],
+        GgufWriteTensorType::Q6_K => &[GGML_TYPE_Q6_K],
+        // `classify_quant_tensor` never returns these for a block-quantized
+        // tensor (F32/F16 are its "keep the fp16-mode representation" `None`
+        // case, not a `Some` block-quant type); listed for exhaustiveness.
+        GgufWriteTensorType::F32 | GgufWriteTensorType::F16 => &[],
+    }
 }
 
-/// The block-quant rungs a declared pack tier may contain, mirroring
-/// [`crate::models::pack_quant::classify_quant_tensor`]: a tier is a CEILING
-/// (the importer never selects a rung above the request), with Q8_0 always
-/// available as the alignment-fallback / encoder-floor rung. `Fp16` writes no
-/// block quants at all.
+/// True when the type satisfies the audio-encoder Q8_0 floor. Anything below
+/// -- the Q2..Q6 and IQ* rungs -- is the behavioral cliff the floor exists to
+/// prevent.
+pub fn meets_encoder_q8_floor(ggml_type: u32) -> bool {
+    wire_types_equivalent_to(GgufWriteTensorType::Q8_0).contains(&ggml_type)
+}
+
+/// Representative `ne0` values covering both alignment classes
+/// `classify_quant_tensor` branches on: 32-aligned-but-not-256 (falls back to
+/// the Q8_0 alignment rung) and 256-aligned (unlocks a tier's own K-quant
+/// rung, for `Decoder`).
+const REPRESENTATIVE_NE0_VALUES: [u64; 2] = [32, 256];
+const QUANT_COMPONENTS: [QuantComponent; 2] = [QuantComponent::Encoder, QuantComponent::Decoder];
+
+/// The block-quant rungs a declared pack tier may contain, DERIVED from
+/// [`crate::models::pack_quant::classify_quant_tensor`] -- the same policy
+/// function every importer's build-time quantization calls -- rather than a
+/// hand-copied per-tier table. `classify_quant_tensor` returns `None` for
+/// every `(ne0, component)` sample under `PackQuant::Fp16`, so the `Fp16`
+/// ceiling falls out of the same loop as an empty set (no block quants
+/// allowed) with no special-casing needed here.
 fn declared_tier_allows(declared: PackQuant, ggml_type: u32) -> bool {
-    match declared {
-        PackQuant::Fp16 => false,
-        PackQuant::Q8_0 => matches!(ggml_type, GGML_TYPE_Q8_0 | GGML_TYPE_Q8_1 | GGML_TYPE_Q8_K),
-        PackQuant::Q3_K => matches!(
-            ggml_type,
-            GGML_TYPE_Q8_0 | GGML_TYPE_Q8_1 | GGML_TYPE_Q8_K | GGML_TYPE_Q3_K
-        ),
-        PackQuant::Q4_K => matches!(
-            ggml_type,
-            GGML_TYPE_Q8_0 | GGML_TYPE_Q8_1 | GGML_TYPE_Q8_K | GGML_TYPE_Q4_K
-        ),
-    }
+    REPRESENTATIVE_NE0_VALUES.iter().any(|&ne0| {
+        QUANT_COMPONENTS.iter().any(|&component| {
+            classify_quant_tensor(ne0, declared, component).is_some_and(|tensor_type| {
+                wire_types_equivalent_to(tensor_type).contains(&ggml_type)
+            })
+        })
+    })
 }
 
 // --- per-architecture audio-encoder tensor rules ---------------------------
 
 /// Which tensors of a pack are audio-encoder weights for the Q8_0 floor,
-/// keyed on the RUNTIME tensor names written into the pack. Mirrors each
-/// family importer's `QuantComponent::Encoder` classification at build time.
+/// keyed on the RUNTIME tensor names written into the pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioEncoderTensors {
     /// Encoder tensors are the rank-2 weights under these name prefixes.
+    /// Sourced from each family's own `AUDIO_ENCODER_TENSOR_NAME_PREFIXES`
+    /// constant (declared beside that family's `QuantComponent`
+    /// classification in its `package_import` module) -- never a literal
+    /// re-typed here -- so the audit can never silently drift from what the
+    /// importer actually classifies as `QuantComponent::Encoder`.
     NamePrefixes(&'static [&'static str]),
-    /// The whole pack is the acoustic path (e.g. firered-llm's encoder +
-    /// adapter pack): every block-quant tensor carries the floor.
+    /// The whole pack is the acoustic path (e.g. redimnet2's speaker
+    /// embedder, which has no separate decoder): every block-quant tensor
+    /// carries the floor.
     EntirePack,
     /// No audio encoder in the ASR-floor sense (translation / punctuation /
     /// segmentation packs): the floor is vacuous.
@@ -172,41 +210,87 @@ use AudioEncoderTensors as Rule;
 /// is unknown to this table. `None` is NOT "no encoder" -- it is "cannot
 /// verify", and the audit fails closed when such a pack contains any
 /// block-quant tensor at all.
+///
+/// Coverage over every shipped architecture (ASR decode families from
+/// `crate::arch::OpenAsrArchitectureRegistry` plus the auxiliary families
+/// from `crate::models::aux_pack_registry`) is enforced by
+/// `every_shipped_architecture_has_an_encoder_rule` below, derived from those
+/// two registries rather than a hand-counted literal list.
 pub fn audio_encoder_tensors_for_architecture(architecture: &str) -> Option<AudioEncoderTensors> {
     let rule = match architecture {
-        crate::arch::WHISPER_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["model.encoder."]),
-        crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["audio."]),
+        crate::arch::WHISPER_GGML_ARCHITECTURE_ID => {
+            Rule::NamePrefixes(crate::models::whisper::AUDIO_ENCODER_TENSOR_NAME_PREFIXES)
+        }
+        crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID => {
+            Rule::NamePrefixes(crate::models::qwen::AUDIO_ENCODER_TENSOR_NAME_PREFIXES)
+        }
         crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID => {
-            Rule::NamePrefixes(&["audio."])
+            Rule::NamePrefixes(crate::models::qwen::AUDIO_ENCODER_TENSOR_NAME_PREFIXES)
         }
-        crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["encoder."]),
-        crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["enc.", "tp."]),
-        crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["enc."]),
-        crate::arch::MOONSHINE_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["enc."]),
-        crate::arch::PARAKEET_CTC_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["enc."]),
-        crate::arch::PARAKEET_TDT_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["enc."]),
-        crate::arch::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["enc."]),
-        crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["encoder."]),
-        crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&["enc."]),
-        // The firered-llm pack carries ONLY the acoustic encoder + its
-        // encoder->LLM adapter (the Qwen2 LLM is the same builder's output
-        // too, imported as encoder-classified tensors end to end): every
-        // block-quant tensor in the pack carries the floor.
-        crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID => Rule::EntirePack,
-        crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID => {
-            Rule::NamePrefixes(&["moss.enc.", "moss.adaptor."])
+        crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID => {
+            Rule::NamePrefixes(crate::models::dolphin::package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES)
         }
+        crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(
+            crate::models::sensevoice::package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        ),
+        crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID => {
+            Rule::NamePrefixes(crate::models::cohere::AUDIO_ENCODER_TENSOR_NAME_PREFIXES)
+        }
+        crate::arch::MOONSHINE_GGML_ARCHITECTURE_ID => {
+            Rule::NamePrefixes(crate::models::moonshine::AUDIO_ENCODER_TENSOR_NAME_PREFIXES)
+        }
+        crate::arch::PARAKEET_CTC_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(
+            crate::models::parakeet_ctc::package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        ),
+        crate::arch::PARAKEET_TDT_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(
+            crate::models::parakeet_tdt::package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        ),
+        crate::arch::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(
+            crate::models::wav2vec2_ctc::package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        ),
+        crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(
+            crate::models::xasr_zipformer::package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        ),
+        crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(
+            crate::models::firered_aed::package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        ),
+        // firered-llm combines TWO independently quantized halves into one
+        // pack: the conformer encoder + encoder->LLM adapter (always floored
+        // to Q8_0) and the separately-imported Qwen2 LLM backbone (`llm.*`,
+        // which legitimately keeps the full requested rung, e.g. Q4_K). An
+        // earlier `EntirePack` rule here incorrectly floored the `llm.*`
+        // tensors too; `firered_llm::AUDIO_ENCODER_TENSOR_NAME_PREFIXES`
+        // covers only the encoder/adapter half, reconciled against the real
+        // importer in
+        // `firered_llm::package_import::audio_encoder_tensor_name_prefixes_match_the_encoder_adapter_half_only`.
+        crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(
+            crate::models::firered_llm::package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        ),
+        crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(
+            crate::models::moss_transcribe_diarize::package_import::AUDIO_ENCODER_TENSOR_NAME_PREFIXES,
+        ),
         // MiMo's external converter quantizes ONLY the Qwen2 backbone; the
         // whole audio side (tokenizer encoder, input-local layers, speech
-        // embeddings) stays f16/f32 for encode fidelity. The rule pins that:
-        // a future converter that block-quantizes the acoustic path fails
-        // the floor instead of shipping a decode cliff.
+        // embeddings) stays f16/f32 for encode fidelity. Unlike the families
+        // above, MiMo has no in-repo Rust importer to source a shared
+        // constant from (see `models::mimo_asr`'s module docs), so this list
+        // is declared here directly: a future converter that block-quantizes
+        // the acoustic path fails the floor instead of shipping a decode
+        // cliff.
         crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID => Rule::NamePrefixes(&[
             "audiotok.",
             "inlocal.",
             "speech_embd.",
             "speech_group_proj.",
         ]),
+        // ReDimNet2-B6 (speaker embedder): ships F32-only today (see
+        // `models::diarize_pack_import`, which has no `PackQuant` tier at
+        // all), so no real pack should ever carry a block-quant tensor here.
+        // `EntirePack` gives the right answer if it ever gains a quant tier:
+        // the whole checkpoint is one acoustic-similarity backbone with no
+        // separate decoder, so any block-quant tensor it does produce
+        // correctly carries the Q8_0 floor.
+        crate::models::aux_pack_registry::REDIMNET2_GGML_ARCHITECTURE_ID => Rule::EntirePack,
         // Translation / punctuation / segmentation packs have no acoustic
         // encoder in the ASR-floor sense.
         crate::models::hymt2::config::HUNYUAN_DENSE_ARCHITECTURE_VALUE => Rule::NoAudioEncoder,
@@ -518,10 +602,10 @@ pub fn audit_remote_pack_quant_floor(
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioEncoderTensors, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
-        GGML_TYPE_Q8_0, QuantFloorAuditError, QuantFloorViolationKind,
-        audio_encoder_tensors_for_architecture, audit_quant_floor, ggml_type_name,
-        is_block_quant_type, meets_encoder_q8_floor,
+        AudioEncoderTensors, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
+        GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q8_K, QuantFloorAuditError,
+        QuantFloorViolationKind, audio_encoder_tensors_for_architecture, audit_quant_floor,
+        declared_tier_allows, ggml_type_name, is_block_quant_type, meets_encoder_q8_floor,
     };
     use crate::ggml_runtime::gguf_header::{GgufHeaderTensor, GgufHeaderView};
     use crate::models::pack_quant::PackQuant;
@@ -571,41 +655,115 @@ mod tests {
         assert_eq!(ggml_type_name(999), "ggml-type-999");
     }
 
+    /// Pins `declared_tier_allows`'s derived rungs against the same
+    /// expectations the old hand-written per-tier table encoded, so the
+    /// switch to deriving from `classify_quant_tensor` is a proven
+    /// behavior-preserving refactor, not just a structural one.
     #[test]
-    fn every_shipped_architecture_has_an_encoder_rule() {
-        // The full set of architectures the importers write today; a new
-        // builtin family must add its rule here before its packs can ship.
-        for arch in [
-            crate::arch::WHISPER_GGML_ARCHITECTURE_ID,
-            crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
-            crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
-            crate::arch::DOLPHIN_GGML_ARCHITECTURE_ID,
-            crate::arch::SENSEVOICE_GGML_ARCHITECTURE_ID,
-            crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
-            crate::arch::MOONSHINE_GGML_ARCHITECTURE_ID,
-            crate::arch::PARAKEET_CTC_GGML_ARCHITECTURE_ID,
-            crate::arch::PARAKEET_TDT_GGML_ARCHITECTURE_ID,
-            crate::arch::WAV2VEC2_CTC_GGML_ARCHITECTURE_ID,
-            crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID,
-            crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
-            crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID,
-            crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID,
-            crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID,
-            crate::models::hymt2::config::HUNYUAN_DENSE_ARCHITECTURE_VALUE,
-            crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID,
-            crate::models::firered_punc::config::FIRERED_PUNC_ARCHITECTURE_VALUE,
+    fn declared_tier_allows_matches_the_pre_derivation_rung_table() {
+        // fp16: no block quant is ever allowed.
+        for ggml_type in [
+            GGML_TYPE_Q8_0,
+            GGML_TYPE_Q8_1,
+            GGML_TYPE_Q8_K,
+            GGML_TYPE_Q3_K,
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_Q6_K,
         ] {
-            assert_ne!(
-                audio_encoder_tensors_for_architecture(arch),
-                None,
-                "architecture '{arch}' has no encoder rule"
+            assert!(!declared_tier_allows(PackQuant::Fp16, ggml_type));
+        }
+        // q8_0: only the 8-bit safety class.
+        for ggml_type in [GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q8_K] {
+            assert!(declared_tier_allows(PackQuant::Q8_0, ggml_type));
+        }
+        for ggml_type in [GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K] {
+            assert!(!declared_tier_allows(PackQuant::Q8_0, ggml_type));
+        }
+        // q3_k: the 8-bit safety class plus its own rung.
+        for ggml_type in [
+            GGML_TYPE_Q8_0,
+            GGML_TYPE_Q8_1,
+            GGML_TYPE_Q8_K,
+            GGML_TYPE_Q3_K,
+        ] {
+            assert!(declared_tier_allows(PackQuant::Q3_K, ggml_type));
+        }
+        assert!(!declared_tier_allows(PackQuant::Q3_K, GGML_TYPE_Q4_K));
+        assert!(!declared_tier_allows(PackQuant::Q3_K, GGML_TYPE_Q6_K));
+        // q4_k: the 8-bit safety class plus its own rung.
+        for ggml_type in [
+            GGML_TYPE_Q8_0,
+            GGML_TYPE_Q8_1,
+            GGML_TYPE_Q8_K,
+            GGML_TYPE_Q4_K,
+        ] {
+            assert!(declared_tier_allows(PackQuant::Q4_K, ggml_type));
+        }
+        assert!(!declared_tier_allows(PackQuant::Q4_K, GGML_TYPE_Q3_K));
+        assert!(!declared_tier_allows(PackQuant::Q4_K, GGML_TYPE_Q6_K));
+    }
+
+    /// Assert every architecture in `architectures` has a quant-floor
+    /// encoder rule, panicking with the offending id otherwise. Factored out
+    /// so `coverage_check_fails_closed_on_an_unruled_architecture` can prove
+    /// this mechanism is not vacuous without needing to register a throwaway
+    /// architecture in the real builtin/aux registries.
+    fn assert_every_architecture_has_an_encoder_rule(
+        architectures: impl Iterator<Item = &'static str>,
+    ) {
+        for architecture in architectures {
+            assert!(
+                audio_encoder_tensors_for_architecture(architecture).is_some(),
+                "architecture '{architecture}' has no quant-floor encoder rule; add one to \
+                 pack_quant_audit::audio_encoder_tensors_for_architecture before shipping"
             );
         }
+    }
+
+    /// Coverage over every shipped architecture, DERIVED from the two
+    /// registries that between them enumerate every builtin family: ASR
+    /// decode architectures (`OpenAsrArchitectureRegistry::with_builtins`)
+    /// and auxiliary non-ASR families (`aux_pack_registry::aux_pack_architecture_ids`,
+    /// diarization/translation/punctuation/forced-alignment). Unlike a
+    /// hand-counted literal list, adding a new builtin family to either
+    /// registry without adding its quant-floor rule here makes this test red
+    /// -- see `coverage_check_fails_closed_on_an_unruled_architecture` for
+    /// the proof that the mechanism actually fires.
+    #[test]
+    fn every_shipped_architecture_has_an_encoder_rule() {
+        let asr_registry = crate::arch::OpenAsrArchitectureRegistry::with_builtins();
+        assert_every_architecture_has_an_encoder_rule(
+            asr_registry
+                .descriptors()
+                .iter()
+                .map(|descriptor| descriptor.model_architecture),
+        );
+        assert_every_architecture_has_an_encoder_rule(
+            crate::models::aux_pack_registry::aux_pack_architecture_ids(),
+        );
+
         assert_eq!(
             audio_encoder_tensors_for_architecture(QWEN_ARCH),
             Some(AudioEncoderTensors::NamePrefixes(&["audio."]))
         );
         assert_eq!(audio_encoder_tensors_for_architecture("not-a-family"), None);
+    }
+
+    /// Proves `assert_every_architecture_has_an_encoder_rule` is not vacuous:
+    /// an architecture id with no entry in `audio_encoder_tensors_for_architecture`
+    /// makes the check panic. This is the permanent stand-in for "add a new
+    /// builtin family without filling in its quant-floor rule" -- adding a
+    /// throwaway descriptor to the real `BUILTIN_ARCHITECTURE_DESCRIPTORS` /
+    /// `AUX_PACK_DESCRIPTORS` tables would also need to satisfy those
+    /// registries' own unrelated exhaustiveness checks (capacity model,
+    /// decode policy, tensor contract, ...), so this test isolates just the
+    /// mechanism this change adds.
+    #[test]
+    #[should_panic(expected = "has no quant-floor encoder rule")]
+    fn coverage_check_fails_closed_on_an_unruled_architecture() {
+        assert_every_architecture_has_an_encoder_rule(
+            ["definitely-not-a-real-architecture-id"].into_iter(),
+        );
     }
 
     #[test]
@@ -704,15 +862,18 @@ mod tests {
 
     #[test]
     fn entire_pack_rule_floors_every_tensor() {
+        // redimnet2 (speaker embedder): a single acoustic backbone with no
+        // decoder side, so EVERY block-quant tensor is encoder regardless of
+        // name.
         let view = view_with(
-            Some(crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID),
+            Some(crate::models::aux_pack_registry::REDIMNET2_GGML_ARCHITECTURE_ID),
             vec![
-                tensor("enc.blk.0.attn.weight", GGML_TYPE_Q8_0),
-                tensor("adapter.mlp.weight", GGML_TYPE_Q6_K),
+                tensor("resnet.tdnn.0.weight", GGML_TYPE_Q8_0),
+                tensor("resnet.pool.weight", GGML_TYPE_Q6_K),
             ],
         );
         let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
-        // The adapter tensor is still acoustic path: a sub-Q8 rung anywhere in
+        // The pool tensor is still acoustic path: a sub-Q8 rung anywhere in
         // this pack violates BOTH the encoder floor and the declared q4_k
         // ceiling (Q6_K is outside its rung set), so it counts twice.
         assert_eq!(report.violations.len(), 2);
@@ -720,11 +881,49 @@ mod tests {
             report
                 .violations
                 .iter()
-                .all(|violation| violation.tensor == "adapter.mlp.weight")
+                .all(|violation| violation.tensor == "resnet.pool.weight")
         );
         let kinds: Vec<_> = report.violations.iter().map(|v| v.kind).collect();
         assert!(kinds.contains(&QuantFloorViolationKind::EncoderBelowQ8Floor));
         assert!(kinds.contains(&QuantFloorViolationKind::ExceedsDeclaredTier));
+    }
+
+    /// The bug this change fixes: firered-llm's `llm.*` Qwen2 decoder tensors
+    /// keep the full requested rung and must NOT be floored, even though an
+    /// earlier hand-written `EntirePack` rule treated the whole pack
+    /// (including `llm.*`) as encoder. This is the real shape of the
+    /// published `firered2-llm-q4_k.oasr` pack: `enc.*`/`adapter.*` at Q8_0,
+    /// `llm.*` at Q4_K.
+    #[test]
+    fn firered_llm_decoder_tensors_keep_the_declared_tier_and_are_not_floored() {
+        let view = view_with(
+            Some(crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID),
+            vec![
+                tensor("enc.blk.0.attn.q.weight", GGML_TYPE_Q8_0),
+                tensor("adapter.linear1.weight", GGML_TYPE_Q8_0),
+                tensor("llm.blk.0.attn_q.weight", GGML_TYPE_Q4_K),
+                tensor("llm.lm_head.weight", GGML_TYPE_Q4_K),
+            ],
+        );
+        let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
+        assert!(report.passed(), "violations: {:?}", report.violations);
+        assert_eq!(report.block_quant_tensors, 4);
+        // Only the two encoder/adapter tensors are floor-relevant; the two
+        // `llm.*` Q4_K tensors must not be counted as encoder.
+        assert_eq!(report.encoder_block_quant_tensors, 2);
+    }
+
+    /// A regression pin for the specific bug: an `EntirePack`-style rule
+    /// would flag this `llm.*` Q4_K tensor as `EncoderBelowQ8Floor`.
+    #[test]
+    fn firered_llm_llm_prefix_is_never_classified_as_encoder() {
+        let view = view_with(
+            Some(crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID),
+            vec![tensor("llm.blk.3.ffn_gate.weight", GGML_TYPE_Q4_K)],
+        );
+        let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
+        assert!(report.passed(), "violations: {:?}", report.violations);
+        assert_eq!(report.encoder_block_quant_tensors, 0);
     }
 
     #[test]

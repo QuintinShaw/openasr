@@ -719,11 +719,22 @@ fn quantized_tensor_type_for_firered_tensor(
     classify_quant_tensor(ne0, quantization, component)
 }
 
-/// Conformer encoder tensors map onto `enc.*` (`enc.blk.*`, `enc.subsample.*`,
-/// `enc.pos_enc.pe`); the Transformer decoder is `dec.*` (`dec.blk.*`,
-/// `dec.tok_emb`, `dec.out_proj`). The encoder carries the shared Q8_0 floor.
+/// Runtime tensor name prefix for the firered-aed conformer encoder (`enc.*`:
+/// `enc.blk.*`, `enc.subsample.*`, `enc.pos_enc.pe`); the Transformer decoder
+/// is `dec.*` (`dec.blk.*`, `dec.tok_emb`, `dec.out_proj`). Shared with
+/// `models::pack_quant_audit`'s encoder-floor rule -- the single source of
+/// truth for "which firered-aed tensors are audio-encoder". Also reused by
+/// `models::firered_llm` (see that module's `AUDIO_ENCODER_TENSOR_NAME_PREFIXES`),
+/// which imports the byte-identical conformer encoder under the same `enc.*`
+/// naming.
+pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc."];
+
+/// The encoder carries the shared Q8_0 floor.
 fn firered_quant_component(target_name: &str) -> QuantComponent {
-    if target_name.starts_with("enc.") {
+    if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+        .iter()
+        .any(|prefix| target_name.starts_with(prefix))
+    {
         QuantComponent::Encoder
     } else {
         QuantComponent::Decoder

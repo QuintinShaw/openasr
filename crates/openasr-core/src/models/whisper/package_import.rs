@@ -267,6 +267,19 @@ fn gguf_runtime_tensor_dims_from_source_tensor(tensor: &SafetensorsTensorHeader)
     tensor.shape.clone()
 }
 
+/// Runtime tensor namespace prefix for the whisper audio encoder. Broader
+/// than [`is_whisper_encoder_linear_weight`] on purpose: that function also
+/// gates *quantization eligibility* (rank-2 `.weight`, specific projections),
+/// but the audit's question is "is this tensor part of the audio encoder at
+/// all" -- e.g. `model.encoder.conv1.weight` is encoder but not
+/// linear-eligible today. Keeping the audit rule at the namespace level means
+/// it stays correct even if a future change block-quantizes a
+/// currently-untouched encoder tensor; `whisper_encoder_linear_weights_stay_within_the_audit_namespace`
+/// below pins the containment the other way (every linear-eligible name is
+/// also inside this namespace). Shared with `models::pack_quant_audit`'s
+/// encoder-floor rule.
+pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["model.encoder."];
+
 fn is_whisper_encoder_linear_weight(name: &str) -> bool {
     name.starts_with("model.encoder.layers.")
         && matches!(
@@ -1184,6 +1197,58 @@ mod tests {
             u16::from_le_bytes([gguf_tensor.data[0], gguf_tensor.data[1]]),
             0x3c00
         );
+    }
+
+    /// `AUDIO_ENCODER_TENSOR_NAME_PREFIXES` (consumed by
+    /// `models::pack_quant_audit`) is deliberately broader than
+    /// `is_whisper_encoder_linear_weight` (see that constant's doc comment):
+    /// every name the eligibility check accepts must fall inside the audit
+    /// namespace, so the two can never silently diverge on the direction that
+    /// matters (a linear-quantizable encoder tensor escaping the floor).
+    #[test]
+    fn whisper_encoder_linear_weights_stay_within_the_audit_namespace() {
+        let is_audit_encoder_name = |name: &str| {
+            AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        };
+        for name in [
+            "model.encoder.layers.0.self_attn.q_proj.weight",
+            "model.encoder.layers.0.self_attn.k_proj.weight",
+            "model.encoder.layers.0.self_attn.v_proj.weight",
+            "model.encoder.layers.0.self_attn.out_proj.weight",
+            "model.encoder.layers.5.fc1.weight",
+            "model.encoder.layers.5.fc2.weight",
+            // Non-linear encoder tensors the eligibility check never touches
+            // today must still be caught by the broader namespace rule.
+            "model.encoder.conv1.weight",
+            "model.encoder.conv2.weight",
+            "model.encoder.embed_positions.weight",
+        ] {
+            assert!(
+                is_audit_encoder_name(name),
+                "'{name}' must be inside the audit's audio-encoder namespace"
+            );
+        }
+        assert!(is_whisper_encoder_linear_weight(
+            "model.encoder.layers.0.self_attn.q_proj.weight"
+        ));
+        assert!(is_audit_encoder_name(
+            "model.encoder.layers.0.self_attn.q_proj.weight"
+        ));
+        // Decoder names (incl. the cross-attention "encoder_attn" tensors,
+        // which read FROM the encoder but live in the decoder stack) must
+        // stay outside the namespace.
+        for name in [
+            "model.decoder.layers.0.self_attn.q_proj.weight",
+            "model.decoder.layers.0.encoder_attn.q_proj.weight",
+            "model.decoder.output_projection.weight",
+        ] {
+            assert!(
+                !is_audit_encoder_name(name),
+                "'{name}' must NOT be inside the audio-encoder namespace"
+            );
+        }
     }
 
     #[test]

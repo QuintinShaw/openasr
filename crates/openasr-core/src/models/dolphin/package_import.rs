@@ -727,13 +727,22 @@ fn dolphin_quant_type_for_tensor(
     let ne0 = *shape.last()?;
     // dolphin keeps WeNet source names: the acoustic encoder is `encoder.*`;
     // `decoder.*` / `ctc.*` / `context_module.*` (hotword) are downstream.
-    let component = if name.starts_with("encoder.") {
+    let component = if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
         QuantComponent::Encoder
     } else {
         QuantComponent::Decoder
     };
     classify_quant_tensor(ne0, quantization, component)
 }
+
+/// Runtime tensor name prefix for the dolphin (WeNet E-Branchformer) acoustic
+/// encoder (`encoder.*`). Shared with `models::pack_quant_audit`'s
+/// encoder-floor rule -- the single source of truth for "which dolphin
+/// tensors are audio-encoder".
+pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["encoder."];
 
 /// Build one runtime tensor. Quantizable rank-2 `.weight` matrices are block-
 /// quantized with **reversed dims** (ne0 = the contiguous `in` axis); the runtime

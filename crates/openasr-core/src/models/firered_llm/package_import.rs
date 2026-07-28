@@ -597,6 +597,25 @@ fn quantized_tensor_type_for_encoder_adapter_tensor(
     classify_quant_tensor(ne0, quantization, QuantComponent::Encoder)
 }
 
+/// Runtime tensor name prefixes for the two halves this importer combines
+/// into one pack: `map_firered_encoder_tensor_name` targets `enc.*` (shared
+/// with `models::firered_aed`, the byte-identical conformer encoder) and
+/// `map_adapter_tensor_name` targets `adapter.*`
+/// (`ADAPTER_LINEAR{1,2}_{WEIGHT,BIAS}` in `tensor_names`). Both halves come
+/// from `build_encoder_adapter_runtime_tensors` and always carry the Q8_0
+/// floor (`quantized_tensor_type_for_encoder_adapter_tensor` above always
+/// classifies `QuantComponent::Encoder`). The `llm.*` tensors from the
+/// separate `build_llm_runtime_tensors` half (`remap_qwen2_tensor_name` /
+/// `qwen2_llm_layer_tensor_names`) are the Qwen2 text decoder, classified
+/// `QuantComponent::Decoder` and NOT covered by this list -- they keep the
+/// full requested rung, so a pack's `.oasr` legitimately mixes Q8_0
+/// encoder/adapter tensors with e.g. Q4_K `llm.*` tensors. Shared with
+/// `models::pack_quant_audit`'s encoder-floor rule -- the single source of
+/// truth for "which firered-llm tensors are audio-encoder" (this replaces an
+/// earlier `EntirePack` audit rule that incorrectly floored every `llm.*`
+/// tensor too; see `firered_llm_prefixes_exclude_the_llm_decoder_half` below).
+pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc.", "adapter."];
+
 fn build_encoder_adapter_runtime_tensors(
     safetensors: &SafetensorsFile,
     quantization: FireRedLlmQuantizationMode,
@@ -1534,6 +1553,74 @@ mod tests {
             remap_qwen2_tensor_name("model.layers.0.self_attn.q_norm.weight").unwrap(),
             None
         );
+    }
+
+    /// Reconciles `AUDIO_ENCODER_TENSOR_NAME_PREFIXES` (consumed by
+    /// `models::pack_quant_audit`) against what the two real builders in this
+    /// file actually produce: every encoder/adapter target name must match a
+    /// declared prefix, and every Qwen2 LLM target name must NOT -- the
+    /// invariant an earlier `EntirePack` audit rule got wrong (it floored
+    /// `llm.*` tensors too, which this importer legitimately quantizes to the
+    /// full requested rung via `QuantComponent::Decoder`).
+    #[test]
+    fn audio_encoder_tensor_name_prefixes_match_the_encoder_adapter_half_only() {
+        let is_encoder_name = |name: &str| {
+            AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        };
+
+        // Encoder half: every branch of `map_firered_encoder_tensor_name`.
+        for source_name in [
+            "encoder.input_preprocessor.conv.0.weight",
+            "encoder.input_preprocessor.out.weight",
+            "encoder.positional_encoding.pe",
+            "encoder.layer_stack.0.mhsa.w_qs.weight",
+            "encoder.layer_stack.15.ffn2.net.4.weight",
+        ] {
+            let (target_name, _) = map_firered_encoder_tensor_name(source_name)
+                .unwrap_or_else(|| panic!("expected a mapping for '{source_name}'"));
+            assert!(
+                is_encoder_name(&target_name),
+                "encoder target '{target_name}' (from '{source_name}') must match an \
+                 audio-encoder prefix"
+            );
+        }
+
+        // Adapter half: every branch of `map_adapter_tensor_name`.
+        for source_name in [
+            "encoder_projector.linear1.weight",
+            "encoder_projector.linear1.bias",
+            "encoder_projector.linear2.weight",
+            "encoder_projector.linear2.bias",
+        ] {
+            let (target_name, _) = map_adapter_tensor_name(source_name)
+                .unwrap_or_else(|| panic!("expected a mapping for '{source_name}'"));
+            assert!(
+                is_encoder_name(&target_name),
+                "adapter target '{target_name}' (from '{source_name}') must match an \
+                 audio-encoder prefix"
+            );
+        }
+
+        // Qwen2 LLM half: every branch of `remap_qwen2_tensor_name` must NOT
+        // match -- these tensors carry the full requested rung, not the floor.
+        for source_name in [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+        ] {
+            let target_name = remap_qwen2_tensor_name(source_name)
+                .unwrap()
+                .unwrap_or_else(|| panic!("expected a mapping for '{source_name}'"));
+            assert!(
+                !is_encoder_name(&target_name),
+                "llm target '{target_name}' (from '{source_name}') must NOT match an \
+                 audio-encoder prefix -- it keeps the full requested quant rung"
+            );
+        }
     }
 
     #[test]

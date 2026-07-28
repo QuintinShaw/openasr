@@ -415,13 +415,21 @@ fn quantized_tensor_type_for_moonshine_tensor(
     }
     // The acoustic encoder is `enc.*`; `dec.*` (incl. the encoder cross-attention
     // mapped to `dec.blk.{i}.cross_*`) is the decoder side.
-    let component = if name.starts_with("enc.") {
+    let component = if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
         QuantComponent::Encoder
     } else {
         QuantComponent::Decoder
     };
     classify_quant_tensor(ne0, quantization, component)
 }
+
+/// Runtime tensor name prefix for the moonshine acoustic encoder (`enc.*`).
+/// Shared with `models::pack_quant_audit`'s encoder-floor rule -- the single
+/// source of truth for "which moonshine tensors are audio-encoder".
+pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc."];
 
 #[derive(Debug, Clone)]
 struct MoonshineMetadataFields {

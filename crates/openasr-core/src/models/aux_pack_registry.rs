@@ -96,9 +96,17 @@ fn validate_forced_aligner(_path: &Path, metadata: &GgufMetadata) -> Result<(), 
         .map_err(|error| error.to_string())
 }
 
+/// `general.architecture` value ReDimNet2-B6 speaker-embedder packs carry.
+/// No dedicated `models::redimnet2` module owns this constant (the model
+/// forward pass lives in `crate::diarize::embed::redimnet`, and packaging is
+/// the family-agnostic `models::diarize_pack_import`), so this aux registry
+/// -- the only production reader of the string -- is its home. Referenced by
+/// `models::pack_quant_audit` too, so both stay in sync.
+pub(crate) const REDIMNET2_GGML_ARCHITECTURE_ID: &str = "redimnet2";
+
 const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
     AuxPackDescriptor {
-        architecture_id: "redimnet2",
+        architecture_id: REDIMNET2_GGML_ARCHITECTURE_ID,
         kind: AuxPackKind::Diarization,
         validate: validate_redimnet2,
     },
@@ -123,6 +131,18 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         validate: validate_forced_aligner,
     },
 ];
+
+/// Every aux family's `general.architecture` id. Lets a caller that needs the
+/// full non-ASR family list (e.g. `models::pack_quant_audit`'s quant-floor
+/// coverage test) enumerate it without depending on `AuxPackKind` or
+/// `validate_aux_runtime_pack_contract`'s metadata-driven dispatch.
+/// Test-only today (no non-test caller needs the full list yet).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn aux_pack_architecture_ids() -> impl Iterator<Item = &'static str> {
+    AUX_PACK_DESCRIPTORS
+        .iter()
+        .map(|descriptor| descriptor.architecture_id)
+}
 
 /// Pull-time contract dispatch for auxiliary (non-ASR) runtime packs.
 ///

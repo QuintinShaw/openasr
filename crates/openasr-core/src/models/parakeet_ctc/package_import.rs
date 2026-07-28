@@ -355,13 +355,22 @@ fn quantized_tensor_type_for_parakeet_tensor(
     let ne0 = dims.first().copied()?;
     // Only the conformer encoder linears (`enc.blk.*`) are quantizable here
     // (the subsampling prelude and CTC head are f32); they carry the floor.
-    let component = if name.starts_with("enc.") {
+    let component = if AUDIO_ENCODER_TENSOR_NAME_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
         QuantComponent::Encoder
     } else {
         QuantComponent::Decoder
     };
     classify_quant_tensor(ne0, quantization, component)
 }
+
+/// Runtime tensor name prefix for the parakeet-ctc conformer encoder
+/// (`enc.*`). Shared with `models::pack_quant_audit`'s encoder-floor rule --
+/// the single source of truth for "which parakeet-ctc tensors are
+/// audio-encoder".
+pub(crate) const AUDIO_ENCODER_TENSOR_NAME_PREFIXES: &[&str] = &["enc."];
 
 fn parakeet_runtime_gguf_metadata(
     config: &ParakeetConfigJson,
