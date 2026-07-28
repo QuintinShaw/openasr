@@ -68,10 +68,12 @@ impl StrongFileIdentity {
 /// snapshot both go through [`resolve_content_id`] -- so hashing a path once
 /// through either warms the other's lookup too.
 ///
-/// Sealed content-addressed objects never arrive here: both entry points
-/// answer those from the digest in the path via
-/// `content_store::trusted_object_digest` before any hashing is considered.
-/// This memo is the slow path for everything the seal gate declines.
+/// Sealed content-addressed objects anchored under the resolved model store
+/// never arrive here: both entry points answer those from the digest in the
+/// path via `content_store::trusted_object_digest` before any hashing is
+/// considered. This memo is the slow path for everything that gate declines
+/// -- including an object-shaped path outside the store, which the anchor
+/// check routes here rather than trusting.
 fn content_id_memo() -> &'static Mutex<HashMap<PathBuf, (StrongFileIdentity, String)>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, (StrongFileIdentity, String)>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -140,18 +142,26 @@ pub(crate) fn unreadable_content_id(path: &Path) -> String {
 /// [`GgmlRuntimeSource::content_id`] resolves in two tiers:
 ///
 /// * **Trusted (no hashing).** When the source's path has the content store's
-///   object layout (`.../objects/sha256/<digest>/content`) and the file was
-///   read-only at open time, the digest is taken straight from the path via
+///   object layout (`.../objects/sha256/<digest>/content`), falls under this
+///   process's own resolved model-store root
+///   (`content_store::default_models_root`), and the file was read-only at
+///   open time, the digest is taken straight from the path via
 ///   `content_store::trusted_object_digest`. That trust is not a shortcut
 ///   around integrity -- it rests on `content_store`'s integrity chain: the
 ///   digest was established once over the bytes actually written (and checked
 ///   against the signed catalog above the store), the object has been sealed
 ///   read-only since, and `openasr model-pack verify` can re-prove the claim
-///   on demand. Re-hashing a multi-gigabyte pack on every process start to
-///   re-derive what admission already established is the exact per-request
+///   on demand. The models-root anchor is what stops the shape alone from
+///   being enough: a file elsewhere on disk laid out to look like an object
+///   (a user-supplied pack, a dev fixture, an extracted archive) was never
+///   admitted by this store and must not be trusted just because it parses.
+///   Re-hashing a multi-gigabyte pack on every process start to re-derive
+///   what admission already established is the exact per-request
 ///   full-file-sha256 cost this split exists to remove.
 /// * **Hashed (lazy, memoized).** Any other path -- a user-supplied pack, an
-///   unsealed object, a dev fixture -- hashes the mapping this source already
+///   unsealed object, a dev fixture, an object-shaped path outside the
+///   resolved model store, or a process with no resolvable
+///   `default_models_root` at all -- hashes the mapping this source already
 ///   holds open, once, and memoizes the result by [`StrongFileIdentity`]
 ///   through [`resolve_content_id`]. A seal lost to a permissions-stripping
 ///   backup restore therefore degrades gracefully: hashing slow path until
@@ -255,25 +265,35 @@ impl GgmlRuntimeSource {
     /// two tiers.
     ///
     /// **Trusted tier (installed objects, no hashing):** a source opened
-    /// read-only at the content store's object layout answers with the digest
-    /// its own path names. Content addressing's premise is that the path *is*
-    /// the checksum, and for a sealed object that premise was proven once at
-    /// admission and pinned in place by the read-only seal ever since -- so
-    /// the digest is not being assumed here, it is being read off a verified,
-    /// immutable fact. This is the same trust `open_declared_lease` takes on
-    /// the load path; full re-verification remains `model-pack verify`'s job.
+    /// read-only at the content store's object layout, under this process's
+    /// own resolved model-store root, answers with the digest its own path
+    /// names. Content addressing's premise is that the path *is* the
+    /// checksum, and for a sealed object *inside the store this process
+    /// resolves* that premise was proven once at admission and pinned in
+    /// place by the read-only seal ever since -- so the digest is not being
+    /// assumed here, it is being read off a verified, immutable fact. The
+    /// models-root anchor (`content_store::default_models_root`) is what
+    /// keeps a same-shaped path outside that store -- which was never
+    /// admitted or hashed by anything -- from being trusted just because it
+    /// parses. This is the same trust `open_declared_lease` takes on the load
+    /// path; full re-verification remains `model-pack verify`'s job.
     ///
     /// **Hashed tier (everything else, at most once per process):** any
-    /// source the trusted gate declines -- a non-object path, or an object
-    /// whose seal was lost -- hashes the mapping this source already holds
-    /// open (never a fresh `File::open` of `path`), memoized by
-    /// `stat_identity`. A memo hit never touches `mmap` at all; a genuine
-    /// cold miss hashes exactly once per `StrongFileIdentity` per process,
-    /// not once per call.
+    /// source the trusted gate declines -- a non-object path, an object
+    /// outside the resolved model store, an object whose seal was lost, or a
+    /// process with no resolvable model-store root at all -- hashes the
+    /// mapping this source already holds open (never a fresh `File::open` of
+    /// `path`), memoized by `stat_identity`. A memo hit never touches `mmap`
+    /// at all; a genuine cold miss hashes exactly once per `StrongFileIdentity`
+    /// per process, not once per call.
     pub fn content_id(&self) -> &str {
         self.content_id.get_or_init(|| {
-            if let Some(digest) =
-                crate::content_store::trusted_object_digest(&self.path, self.opened_read_only)
+            if let Some(models_root) = crate::content_store::default_models_root()
+                && let Some(digest) = crate::content_store::trusted_object_digest(
+                    &self.path,
+                    self.opened_read_only,
+                    &models_root,
+                )
             {
                 return format!("sha256:{digest}");
             }
@@ -813,9 +833,16 @@ mod tests {
     /// the runtime-cache analogue of content_store's
     /// `declared_lease_does_not_rehash_the_object` -- it is what keeps a
     /// gigabyte-scale re-read from creeping back into every model load.
+    ///
+    /// `content_id()` anchors trust to `content_store::default_models_root()`,
+    /// so this test points `OPENASR_HOME` at the fixture's own tempdir --
+    /// nextest's per-test process isolation makes this safe (see AGENTS.md's
+    /// note on why nextest, not `cargo test`, is required for this
+    /// workspace).
     #[test]
     fn sealed_content_addressed_object_content_id_trusts_the_path_digest() {
         let dir = tempdir().expect("tempdir");
+        unsafe { std::env::set_var("OPENASR_HOME", dir.path()) };
         // A digest that is structurally valid but cannot be the hash of the
         // fixture bytes, so any hashing resolution would disagree with it.
         let named_digest = "ab".repeat(32);
@@ -863,6 +890,7 @@ mod tests {
     #[test]
     fn admitted_object_content_id_agrees_with_the_store_and_degrades_on_seal_loss() {
         let dir = tempdir().expect("tempdir");
+        unsafe { std::env::set_var("OPENASR_HOME", dir.path()) };
         let source_file = dir.path().join("source.oasr");
         write_magic_file(&source_file, b"GGUFadmitted-identity-fixture");
         let models = dir.path().join("models");
@@ -888,5 +916,36 @@ mod tests {
             )
         );
         assert_ne!(tampered.content_id(), format!("sha256:{digest}"));
+    }
+
+    /// The same adversarial shape `content_store`'s own regression test pins,
+    /// exercised through the primary production entry point: a same-shaped,
+    /// sealed, read-only path outside `OPENASR_HOME`'s resolved model store
+    /// must never be trusted, even though a models root does resolve.
+    #[test]
+    fn content_id_rejects_a_same_shaped_object_outside_the_models_root() {
+        let dir = tempdir().expect("tempdir");
+        unsafe { std::env::set_var("OPENASR_HOME", dir.path()) };
+        let attacker_digest = "99".repeat(32);
+        let bytes = b"GGUFattacker-controlled-bytes";
+        let object = dir
+            .path()
+            .join("totally-unrelated")
+            .join("objects")
+            .join("sha256")
+            .join(&attacker_digest)
+            .join("content");
+        fs::create_dir_all(object.parent().expect("object path has parent"))
+            .expect("create digest dir");
+        write_magic_file(&object, bytes);
+        set_mode(&object, true);
+
+        let source = validate_ggml_runtime_source_path(&object).expect("validate object");
+        assert_eq!(
+            source.content_id(),
+            format!("sha256:{:x}", Sha256::digest(bytes)),
+            "a same-shaped sealed path outside the models root must be hashed, not trusted"
+        );
+        assert_ne!(source.content_id(), format!("sha256:{attacker_digest}"));
     }
 }

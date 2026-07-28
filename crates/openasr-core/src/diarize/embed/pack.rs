@@ -116,24 +116,28 @@ fn load_embedder_state(path: &Path) -> Option<SharedEmbedderState> {
 
 /// Content fingerprint of the embedder pack: `sha256:<hex>`.
 ///
-/// An installed pack is a sealed content-addressed object, so its fingerprint
-/// is read straight from the object path without re-reading the weights --
-/// the same trust the model load path takes (see `content_store`'s integrity
-/// chain: hashed once at admission, sealed read-only since, `model-pack
-/// verify` re-proves on demand). The value is identical to what hashing the
-/// bytes returns, so enrollments fingerprinted either way interoperate.
-/// Anything the seal gate declines -- an env-override pack, an unsealed
-/// object -- is hashed the slow way: those are arbitrary user paths with no
-/// digest to trust.
+/// An installed pack is a sealed content-addressed object *under this
+/// process's own model store root*, so its fingerprint is read straight from
+/// the object path without re-reading the weights -- the same trust the model
+/// load path takes (see `content_store`'s integrity chain: hashed once at
+/// admission, sealed read-only since, `model-pack verify` re-proves on
+/// demand, and `content_store::trusted_object_digest`'s `models_root` anchor,
+/// which is what tells a real installed object apart from a same-shaped path
+/// elsewhere on disk). The value is identical to what hashing the bytes
+/// returns, so enrollments fingerprinted either way interoperate. Anything
+/// the gate declines -- an env-override pack, an unsealed object, or a path
+/// outside the resolved model store -- is hashed the slow way: those are
+/// arbitrary paths with no digest to trust.
 fn pack_fingerprint(path: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
 
     let mut file = std::fs::File::open(path).ok()?;
-    if let Some(digest) = crate::content_store::trusted_object_digest(
-        path,
-        file.metadata().ok()?.permissions().readonly(),
-    ) {
+    let sealed = file.metadata().ok()?.permissions().readonly();
+    if let Some(models_root) = crate::content_store::default_models_root()
+        && let Some(digest) =
+            crate::content_store::trusted_object_digest(path, sealed, &models_root)
+    {
         return Some(format!("sha256:{digest}"));
     }
     let mut hasher = Sha256::new();
@@ -194,10 +198,15 @@ mod tests {
 
     /// The trusted half, pinned by construction: bytes that do not hash to
     /// the digest their path names can only fingerprint to that path digest
-    /// if it was read, not recomputed.
+    /// if it was read, not recomputed. `pack_fingerprint` anchors trust to
+    /// `default_models_root()`, so this test points `OPENASR_HOME` at the
+    /// fixture's own tempdir -- nextest's per-test process isolation makes
+    /// this safe (see AGENTS.md's note on why nextest, not `cargo test`, is
+    /// required for this workspace).
     #[test]
     fn pack_fingerprint_trusts_a_sealed_object_without_hashing() {
         let dir = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("OPENASR_HOME", dir.path()) };
         let named_digest = "ab".repeat(32);
         let bytes = b"embedder-fingerprint-trust-fixture";
         assert_ne!(
@@ -218,6 +227,7 @@ mod tests {
     #[test]
     fn pack_fingerprint_unsealed_object_falls_back_to_hashing() {
         let dir = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("OPENASR_HOME", dir.path()) };
         let named_digest = "ef".repeat(32);
         let bytes = b"embedder-fingerprint-fallback-fixture";
         let object = write_object_at_layout(dir.path(), &named_digest, bytes, false);
@@ -225,6 +235,43 @@ mod tests {
         let fingerprint = pack_fingerprint(&object).expect("fingerprint");
         assert_eq!(fingerprint, format!("sha256:{}", sha256_hex(bytes)));
         assert_ne!(fingerprint, format!("sha256:{named_digest}"));
+    }
+
+    /// The same adversarial shape pinned in `content_store`'s own tests: a
+    /// same-shaped sealed path that is not under the resolved model store
+    /// root must never be trusted, even though `OPENASR_HOME` is set and
+    /// resolvable.
+    #[test]
+    fn pack_fingerprint_rejects_a_same_shaped_path_outside_the_models_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("OPENASR_HOME", dir.path()) };
+        let attacker_digest = "99".repeat(32);
+        let bytes = b"attacker-controlled-bytes";
+        let object = dir
+            .path()
+            .join("totally-unrelated")
+            .join("objects")
+            .join("sha256")
+            .join(&attacker_digest)
+            .join("content");
+        std::fs::create_dir_all(object.parent().expect("object path has parent"))
+            .expect("create digest dir");
+        std::fs::write(&object, bytes).expect("write fixture");
+        let mut permissions = std::fs::metadata(&object)
+            .expect("stat fixture")
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o444);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&object, permissions).expect("set fixture mode");
+
+        let fingerprint = pack_fingerprint(&object).expect("fingerprint");
+        assert_eq!(fingerprint, format!("sha256:{}", sha256_hex(bytes)));
+        assert_ne!(fingerprint, format!("sha256:{attacker_digest}"));
     }
 
     #[test]

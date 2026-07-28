@@ -78,17 +78,32 @@ pub fn is_cacheable_pack_content_id(pack_content_id: &str) -> bool {
 /// key a cache or build a runtime, you should already be holding a
 /// `GgmlRuntimeSource`; use its `content_id()`.
 ///
+/// `models_root` must be the caller's own models-store root -- `pull` passes
+/// the same root it resolved `path` under (see `models_root_for_paths`),
+/// never a value guessed from `path` itself. It is what lets the trust below
+/// tell "this is really the object our own store admitted" apart from "this
+/// merely has the object layout's shape" (see `content_store::trusted_object_digest`).
+///
 /// Shares [`resolve_content_id`]'s memo with `GgmlRuntimeSource::content_id`,
 /// so hashing a path once through either entry point warms the other's
-/// lookup too. A sealed content-addressed object never hashes through either:
-/// like `GgmlRuntimeSource::content_id`, this answers such a path from the
-/// digest it names (see `content_store::trusted_object_digest`), so
-/// re-installing an object that already exists costs no read of its bytes.
-pub(crate) fn pack_content_id_for_path_before_replace(path: &Path) -> String {
+/// lookup too. A sealed content-addressed object *under `models_root`* never
+/// hashes through either: like `GgmlRuntimeSource::content_id`, this answers
+/// such a path from the digest it names, so re-installing an object that
+/// already exists costs no read of its bytes.
+pub(crate) fn pack_content_id_for_path_before_replace(path: &Path, models_root: &Path) -> String {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let Ok(metadata) = std::fs::metadata(&canonical) else {
         return unreadable_content_id(&canonical);
     };
+    // `models_root` is canonicalized the same way `path` just was: on
+    // platforms where a models root can sit under a symlinked directory
+    // (macOS's `/var` -> `/private/var`, in particular under `$TMPDIR`),
+    // comparing a canonicalized object path against a non-canonicalized root
+    // would spuriously miss the anchor and silently fall back to hashing.
+    // Canonicalizing both sides the same way keeps the comparison meaningful
+    // without weakening it.
+    let canonical_root =
+        std::fs::canonicalize(models_root).unwrap_or_else(|_| models_root.to_path_buf());
     // The seal here comes from a path stat, not an open descriptor --
     // `trusted_object_digest`'s contract prefers fd-derived metadata. This
     // call site may keep the weaker form because its verdict only ever
@@ -97,9 +112,11 @@ pub(crate) fn pack_content_id_for_path_before_replace(path: &Path) -> String {
     // A new caller that feeds a runtime build must not copy this shape --
     // open the file first and take the seal from its fd, as
     // `GgmlRuntimeSource` does.
-    if let Some(digest) =
-        crate::content_store::trusted_object_digest(&canonical, metadata.permissions().readonly())
-    {
+    if let Some(digest) = crate::content_store::trusted_object_digest(
+        &canonical,
+        metadata.permissions().readonly(),
+        &canonical_root,
+    ) {
         return content_id_from_sha256_hex(digest);
     }
     let Some(identity) = StrongFileIdentity::of(&metadata) else {
@@ -196,9 +213,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("same-path.oasr");
         std::fs::write(&path, b"content-a-bytes").expect("write a");
-        let id_a = pack_content_id_for_path_before_replace(&path);
+        let id_a = pack_content_id_for_path_before_replace(&path, dir.path());
         std::fs::write(&path, b"content-b-bytes-different").expect("write b");
-        let id_b = pack_content_id_for_path_before_replace(&path);
+        let id_b = pack_content_id_for_path_before_replace(&path, dir.path());
         assert!(id_a.starts_with("sha256:"), "got {id_a}");
         assert!(id_b.starts_with("sha256:"), "got {id_b}");
         assert_ne!(id_a, id_b);
@@ -209,7 +226,7 @@ mod tests {
     #[test]
     fn unreadable_path_before_replace_is_not_cacheable() {
         let missing = PathBuf::from("/tmp/openasr-definitely-missing-runtime-pack.oasr");
-        let id = pack_content_id_for_path_before_replace(&missing);
+        let id = pack_content_id_for_path_before_replace(&missing, Path::new("/tmp"));
         assert!(
             id.starts_with("unreadable:"),
             "unreadable path must fail closed, got {id}"
@@ -240,7 +257,7 @@ mod tests {
 
         let source = crate::validate_ggml_runtime_source_path(&path).expect("validate source");
         let via_source = source.content_id().to_string();
-        let via_path_snapshot = pack_content_id_for_path_before_replace(&path);
+        let via_path_snapshot = pack_content_id_for_path_before_replace(&path, dir.path());
         assert_eq!(
             via_source, via_path_snapshot,
             "both entry points must resolve to the same content id for the same bytes"
@@ -339,20 +356,53 @@ mod tests {
             "the fixture must not accidentally hash to the named digest"
         );
 
+        let models_root = dir.path().join("models");
         assert_eq!(
-            pack_content_id_for_path_before_replace(&object),
+            pack_content_id_for_path_before_replace(&object, &models_root),
             format!("sha256:{named_digest}")
         );
 
         // The same object unsealed goes back through a full hash.
         set_mode(&object, false);
         assert_eq!(
-            pack_content_id_for_path_before_replace(&object),
+            pack_content_id_for_path_before_replace(&object, &models_root),
             format!("sha256:{}", sha256_hex_file(&object).expect("hash fixture"))
         );
         assert_ne!(
-            pack_content_id_for_path_before_replace(&object),
+            pack_content_id_for_path_before_replace(&object, &models_root),
             format!("sha256:{named_digest}")
+        );
+    }
+
+    /// The same adversarial shape `content_store`'s own regression test pins,
+    /// exercised through this pre-replace resolver: a same-shaped sealed path
+    /// outside the caller's own models root must never be trusted.
+    #[test]
+    fn path_before_replace_rejects_a_same_shaped_path_outside_the_models_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let attacker_digest = "99".repeat(32);
+        let bytes = b"attacker-controlled-bytes";
+        let object = dir
+            .path()
+            .join("totally-unrelated")
+            .join("objects")
+            .join("sha256")
+            .join(&attacker_digest)
+            .join("content");
+        std::fs::create_dir_all(object.parent().expect("object path has parent"))
+            .expect("create digest dir");
+        std::fs::write(&object, bytes).expect("write fixture");
+        set_mode(&object, true);
+
+        let models_root = dir.path().join("models");
+        assert_eq!(
+            pack_content_id_for_path_before_replace(&object, &models_root),
+            format!("sha256:{}", sha256_hex_file(&object).expect("hash fixture")),
+            "a same-shaped sealed path outside the models root must be hashed, not trusted"
+        );
+        assert_ne!(
+            pack_content_id_for_path_before_replace(&object, &models_root),
+            format!("sha256:{attacker_digest}")
         );
     }
 }

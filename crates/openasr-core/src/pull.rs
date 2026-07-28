@@ -676,7 +676,7 @@ fn install_admitted_model_pack(
     // runtime state is resident. Resolve that identity before the new ref is
     // visible, and evict it after -- a memory-reclaim step only: the new
     // object's content id misses every content-addressed cache on its own.
-    let previous_pack_content_id = existing_pack_content_id_for_eviction(&paths.final_path);
+    let previous_pack_content_id = existing_pack_content_id_for_eviction(&paths);
     // Keep the descriptor that was hashed and preflighted alive until its
     // durable logical reference is visible; do not switch validation authority
     // back to a display path during commit.
@@ -2686,7 +2686,7 @@ fn verify_partial_and_install(
     // no invalidation needed for that. This id is purely so the *old*, now
     // unreferenced identity's resident state can be evicted promptly after
     // install to release memory, rather than waiting for the next idle unload.
-    let previous_pack_content_id = existing_pack_content_id_for_eviction(&paths.final_path);
+    let previous_pack_content_id = existing_pack_content_id_for_eviction(paths);
     // The verified staging file is copied into an immutable content-addressed
     // object before the logical reference becomes visible. Existing objects are
     // never replaced, which removes the Windows same-path mmap failure mode.
@@ -2716,20 +2716,21 @@ fn verify_partial_and_install(
     Ok(pack)
 }
 
-/// Resolves the content id of whatever pack currently sits at `final_path`,
+/// Resolves the content id of whatever pack currently sits at `paths.final_path`,
 /// if any -- called before it is overwritten by an install/replace. Returns
 /// `None` when there is nothing there yet (first install) or no identity can
 /// be resolved (nothing meaningful to evict either way). `final_path` is
-/// always a content-addressed object path, so a sealed existing object
-/// answers from the digest in its path and a re-install of an already
-/// installed pack pays no read of its bytes.
-fn existing_pack_content_id_for_eviction(final_path: &std::path::Path) -> Option<String> {
-    if !final_path.exists() {
+/// always a content-addressed object path *under this pull's own models
+/// root*, so a sealed existing object answers from the digest in its path and
+/// a re-install of an already installed pack pays no read of its bytes.
+fn existing_pack_content_id_for_eviction(paths: &PullPaths) -> Option<String> {
+    if !paths.final_path.exists() {
         return None;
     }
     let content_id =
         crate::models::runtime_cache_coordinator::pack_content_id_for_path_before_replace(
-            final_path,
+            &paths.final_path,
+            &models_root_for_paths(paths),
         );
     crate::models::runtime_cache_coordinator::is_cacheable_pack_content_id(&content_id)
         .then_some(content_id)
@@ -2775,14 +2776,16 @@ fn cancel_before_commit(
 /// Whether the object this target would download is already in the store,
 /// and is exactly the bytes the catalog names.
 ///
-/// `final_path` is built from `target.sha256` itself, so a *sealed* object
-/// found there has its digest pinned by the path and its immutability pinned
-/// by the seal (see `content_store`'s integrity chain): the match is a stat
-/// for the size plus the seal-gated path digest, with no read of the bytes.
-/// Re-pulling an installed gigabyte pack must not cost a gigabyte of hash.
-/// Anything the gate declines -- a lost seal, a layout the parser does not
-/// recognise -- falls back to hashing the whole file, the only way to prove
-/// identity for bytes nothing has pinned.
+/// `final_path` is built from `target.sha256` under this pull's own models
+/// root, so a *sealed* object found there has its digest pinned by the path,
+/// its immutability pinned by the seal, and its provenance pinned by the
+/// anchor (see `content_store`'s integrity chain and
+/// `trusted_object_digest`'s `models_root` parameter): the match is a stat
+/// for the size plus the seal-gated, anchor-gated path digest, with no read
+/// of the bytes. Re-pulling an installed gigabyte pack must not cost a
+/// gigabyte of hash. Anything the gate declines -- a lost seal, a layout the
+/// parser does not recognise -- falls back to hashing the whole file, the
+/// only way to prove identity for bytes nothing has pinned.
 ///
 /// Either way the container contract is still probed before the object
 /// stands in for a download: skipping the download on the strength of a
@@ -2797,6 +2800,7 @@ fn installed_matches(target: &PullTarget, paths: &PullPaths) -> Result<bool, Pul
     let matched = match content_store::trusted_object_digest(
         &paths.final_path,
         metadata.permissions().readonly(),
+        &models_root_for_paths(paths),
     ) {
         Some(digest) => digest == target.sha256,
         None => {
