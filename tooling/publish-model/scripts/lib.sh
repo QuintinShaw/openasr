@@ -39,27 +39,19 @@ cat_quants() { python3 "$CATALOG_PY" quants "$1"; }
 quant_token(){ python3 "$CATALOG_PY" token "$1"; }    # q8_0 -> q8-0
 quant_suffix(){ python3 "$CATALOG_PY" suffix "$1"; }  # q8_0 -> q8
 
-# Fail-closed completeness guard: every glob pattern must match at least one
-# existing file under the given dir. This is the wall between "a stage
-# returned rc=0" and "the files the next stage needs actually exist" -- the
-# class of bug where an exclude rule strips the only checkpoint (or a
-# tokenless fetch lands a 29-byte error page) while the exit code says fine.
+# Fail-closed completeness + integrity guard: every glob pattern must match at
+# least one existing file under the given dir, AND every matched file must
+# clear a size-category floor and not look like a captured HTTP error page.
+# This is the wall between "a stage returned rc=0" and "the files the next
+# stage needs actually exist and are real" -- the class of bug where an
+# exclude rule strips the only checkpoint, or a tokenless fetch of a private
+# repo lands a small error page at the expected filename while the exit code
+# still says fine (see _require_files.py for the categorization and the
+# 2026-07 incident that motivated it).
 require_files() {
   local dir="$1"; shift
   [[ $# -gt 0 ]] || return 0
-  python3 - "$dir" "$@" <<'PY'
-import glob
-import os
-import sys
-
-root, patterns = sys.argv[1], sys.argv[2:]
-missing = [pattern for pattern in patterns if not glob.glob(os.path.join(root, pattern))]
-if missing:
-    sys.stderr.write(
-        "required source file(s) missing under %s: %s\n" % (root, ", ".join(missing))
-    )
-    sys.exit(1)
-PY
+  python3 "$PUB_DIR/_require_files.py" "$dir" "$@"
 }
 
 # retry <attempts> <cmd...>: run a command until it succeeds with exponential
