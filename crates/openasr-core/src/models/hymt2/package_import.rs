@@ -20,7 +20,9 @@ use std::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::config::{HYMT2_EXPECTED_LAYERS, HYMT2_EXPECTED_VOCAB_SIZE};
+use super::config::{
+    HUNYUAN_DENSE_ARCHITECTURE_VALUE, HYMT2_EXPECTED_LAYERS, HYMT2_EXPECTED_VOCAB_SIZE,
+};
 use crate::models::oasr_metadata::{OASR_METADATA_KEY_PACKAGE_VERSION, OASR_PACKAGE_VERSION_V1};
 
 /// Pinned upstream base (safetensors) repository for provenance metadata.
@@ -48,7 +50,6 @@ const HYMT2_EXPECTED_TOKENIZER_PRE: &str = "hunyuan-dense";
 const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
 const GENERAL_FILE_TYPE_KEY: &str = "general.file_type";
 const GENERAL_ALIGNMENT_KEY: &str = "general.alignment";
-const HUNYUAN_DENSE_ARCHITECTURE: &str = "hunyuan-dense";
 const OPENASR_KEY_PREFIX: &str = "openasr.";
 
 const GGUF_TYPE_UINT8: u32 = 0;
@@ -454,7 +455,7 @@ impl SourceMetadataValidator {
         require_value(
             GENERAL_ARCHITECTURE_KEY,
             self.architecture.as_deref(),
-            HUNYUAN_DENSE_ARCHITECTURE,
+            HUNYUAN_DENSE_ARCHITECTURE_VALUE,
         )?;
         require_value(
             "tokenizer.ggml.model",
@@ -751,7 +752,7 @@ mod tests {
     impl Default for SyntheticOverrides {
         fn default() -> Self {
             Self {
-                architecture: HUNYUAN_DENSE_ARCHITECTURE,
+                architecture: HUNYUAN_DENSE_ARCHITECTURE_VALUE,
                 file_type: HYMT2_EXPECTED_GENERAL_FILE_TYPE,
                 block_count: HYMT2_EXPECTED_LAYERS as u32,
                 token_count: HYMT2_EXPECTED_VOCAB_SIZE,
