@@ -26,7 +26,10 @@ impl PullReporter {
     pub(crate) fn on(&mut self, event: PullProgress) {
         match event {
             PullProgress::UsingInstalled { path } => {
-                eprintln!("Already installed: {}", path.display());
+                eprintln!(
+                    "Already installed: {} (run `openasr model-pack verify` to check installed packs for on-disk corruption)",
+                    path.display()
+                );
             }
             PullProgress::DownloadStarted {
                 bytes_total,
