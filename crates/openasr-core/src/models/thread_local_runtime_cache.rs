@@ -71,6 +71,13 @@ pub(crate) fn take_generation_tagged<K: Eq + Hash, V>(
 /// backend)`, so a VAD/longform run stays on ONE cache slot regardless of how
 /// many distinct chunk lengths it produces; this cap remains as a general
 /// safety bound for any caller (or future family) that still varies its key.
+/// Mobile embeds run all native inference on one owner thread and have a much
+/// tighter memory ceiling. Keep only the active pack/backend runtime there so
+/// switching CPU/Metal or replacing a pack cannot retain several giant graph
+/// arenas. Desktop/server retain the small multi-model LRU for throughput.
+#[cfg(target_os = "ios")]
+pub(crate) const DEFAULT_RUNTIME_CACHE_CAPACITY: usize = 1;
+#[cfg(not(target_os = "ios"))]
 pub(crate) const DEFAULT_RUNTIME_CACHE_CAPACITY: usize = 4;
 
 /// A small bounded LRU cache: at most `max_entries` `(key, value)` pairs are
