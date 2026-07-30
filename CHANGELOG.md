@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - CLI: `openasr model-pack import moss` and `openasr model-pack import qwen-forced-aligner` build runtime packs (`.oasr`) for those two families from local source weights, alongside the existing family importers.
 - CLI: `openasr model-pack audit-quant <path|url>` audits one pack's tensor quantization against the current policy (the audio-encoder Q8_0 floor, plus the declared-tier ceiling when `--quant` is given) from the GGUF header alone -- no download, no inference -- and works against a local file or an http(s) URL via a range-fetched header prefix.
 - GGUF packs now carry a `openasr.build.commit` metadata key recording the open-core commit they were built from; `openasr show` renders it for a local pack.
+- Audio input: bare ADTS `.aac` (what WeChat and many other recorders/voice-memo apps emit, as opposed to an `.m4a`/`.mp4` container), `.m4b` (audiobook), `.aiff`/`.aif`/`.aifc`, and `.caf` now decode in-process, with no external converter needed; `.wma` and `.amr` are now recognized and routed through the existing external ffmpeg/afconvert conversion path (neither has an in-process decoder). Previously all seven of these were rejected outright as an unsupported extension.
 
 ### Changed
 

@@ -1,12 +1,13 @@
 //! In-process audio decoding via symphonia (pure Rust, no external process),
 //! plus bundled-libopus decoding for Opus.
 //!
-//! This is the default decode path for `prepare_audio_input`: m4a/AAC-LC/ALAC
-//! (isomp4, including the `.qta` QuickTime container), mp3, flac, ogg (vorbis
-//! or opus), mkv/webm (vorbis or opus track), and non-conformant wav all
-//! decode here without shelling out to ffmpeg or afconvert. Anything this
-//! module cannot decode (HE-AAC, Opus multistream >2ch, corrupt files,
-//! containers/codecs outside the enabled symphonia features) reports
+//! This is the default decode path for `prepare_audio_input`: m4a/m4b/AAC-LC/
+//! ALAC (isomp4, including the `.qta` QuickTime container), bare ADTS `.aac`,
+//! aiff, caf, mp3, flac, ogg (vorbis or opus), mkv/webm (vorbis or opus
+//! track), and non-conformant wav all decode here without shelling out to
+//! ffmpeg or afconvert. Anything this module cannot decode (HE-AAC, Opus
+//! multistream >2ch, wma/amr -- no symphonia demuxer for either -- corrupt
+//! files, containers/codecs outside the enabled symphonia features) reports
 //! [`SymphoniaOutcome::Unsupported`] (never a hard error) so the caller falls
 //! back to the existing external converter chain.
 //!

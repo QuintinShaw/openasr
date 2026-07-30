@@ -421,6 +421,128 @@ fn symphonia_decodes_m4a_alac_in_process() {
     assert_prepared_16k_mono_audio(&prepared);
 }
 
+/// Bare ADTS `.aac` (no m4a/mp4 container) -- what WeChat and many other
+/// recorders/voice-memo apps actually emit, as opposed to `.m4a`. Symphonia's
+/// `AdtsReader` (registered by the already-enabled `aac` feature) demuxes
+/// this directly; no new feature or dependency needed.
+#[test]
+fn symphonia_decodes_bare_adts_aac_in_process() {
+    let prepared = prepare_native_conversion(&crate_fixture("tone_mono.aac"))
+        .expect("bare ADTS .aac should decode via the in-process symphonia path");
+    assert_prepared_16k_mono_audio(&prepared);
+}
+
+/// `.m4b` (audiobook) is the same ISO/MP4 container as `.m4a`/`.mp4` under a
+/// different extension -- symphonia's `isomp4` reader already lists it
+/// (`IsoMp4Reader::query`), so this only needed the extension added to
+/// `RECOGNIZED_EXTENSIONS`, no code or dependency change.
+#[test]
+fn symphonia_decodes_m4b_audiobook_container_in_process() {
+    let prepared = prepare_native_conversion(&crate_fixture("tone_mono.m4b"))
+        .expect(".m4b (isomp4 container) should decode via the in-process symphonia path");
+    assert_prepared_16k_mono_audio(&prepared);
+}
+
+/// AIFF (PCM), decoded by symphonia's `aiff` feature -- which reuses the
+/// already-vendored `symphonia-format-riff` crate (the same one that reads
+/// `.wav`), so enabling it added no new dependency.
+#[test]
+fn symphonia_decodes_aiff_in_process() {
+    let prepared = prepare_native_conversion(&crate_fixture("tone_mono.aiff"))
+        .expect("aiff should decode via the in-process symphonia path");
+    assert_prepared_16k_mono_audio(&prepared);
+}
+
+/// Apple's Core Audio Format, decoded by symphonia's `caf` feature
+/// (`symphonia-format-caf`, pulled in new for this).
+#[test]
+fn symphonia_decodes_caf_in_process() {
+    let prepared = prepare_native_conversion(&crate_fixture("tone_mono.caf"))
+        .expect("caf should decode via the in-process symphonia path");
+    assert_prepared_16k_mono_audio(&prepared);
+}
+
+/// Windows Media Audio: symphonia has no ASF/WMA demuxer at all, so a real
+/// `.wma` upload must fall through to the external ffmpeg/afconvert
+/// conversion chain (same shape as HE-AAC) rather than being rejected
+/// upfront as an unrecognized extension.
+#[test]
+#[cfg(target_os = "macos")]
+fn wma_falls_back_to_afconvert_or_succeeds_without_symphonia_support() {
+    // `tone_mono.wma` is a real ffmpeg-encoded (wmav2) file; afconvert cannot
+    // decode WMA, so without ffmpeg configured this must land on a typed
+    // conversion failure -- proof the extension reached the external-converter
+    // step instead of a bare "unsupported extension" rejection.
+    let error = prepare_native_conversion(&crate_fixture("tone_mono.wma")).unwrap_err();
+    assert!(
+        matches!(&error, AudioPreparationError::ConversionFailed { tool, .. } if tool == "afconvert"),
+        "a real .wma file must reach (and fail inside) the external converter, not be \
+         rejected as an unrecognized extension: {error}"
+    );
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn wma_reaches_missing_ffmpeg_without_symphonia_support() {
+    let error = prepare_native_conversion(&crate_fixture("tone_mono.wma")).unwrap_err();
+    assert!(
+        matches!(error, AudioPreparationError::MissingFfmpeg { .. }),
+        "a real .wma file must reach the ffmpeg-required path, not be rejected as an \
+         unrecognized extension: {error}"
+    );
+}
+
+/// Beyond routing, this proves ffmpeg genuinely decodes the format when it is
+/// configured: `tone_mono.wma` is a real ffmpeg-encoded (wmav2) file, and this
+/// workspace's ffmpeg links a WMA decoder, so the external conversion must
+/// fully succeed, not merely be attempted.
+#[test]
+fn wma_converts_successfully_when_ffmpeg_is_available() {
+    let ffmpeg_available = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !ffmpeg_available {
+        eprintln!("ffmpeg not on PATH; skipping the .wma external-conversion test");
+        return;
+    }
+    let options = AudioPreparationOptions::new(BackendKind::Native)
+        .with_native_non_wav_conversion(true)
+        .with_ffmpeg_bin(Some(PathBuf::from("ffmpeg")))
+        .with_ffmpeg_bin_explicit(true);
+
+    let prepared = prepare_audio_input(crate_fixture("tone_mono.wma"), &options)
+        .expect("a real .wma file must convert via the external ffmpeg fallback");
+    assert_prepared_16k_mono_audio(&prepared);
+}
+
+/// AMR (mono voice codec, common on older phones and some IM voice
+/// messages): like WMA, symphonia has no demuxer for it at all, so this only
+/// ever reaches ffmpeg. `tone.amr` is a real, decodable AMR-NB bitstream
+/// (silent content -- there is no local AMR encoder to synthesize a tone
+/// with -- but real frames a real decoder accepts), and this workspace's
+/// ffmpeg build genuinely links an AMR-NB decoder, so this asserts the full
+/// external conversion actually succeeds when ffmpeg is configured.
+#[test]
+fn amr_converts_successfully_when_ffmpeg_is_available() {
+    let ffmpeg_available = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !ffmpeg_available {
+        eprintln!("ffmpeg not on PATH; skipping the .amr external-conversion test");
+        return;
+    }
+    let options = AudioPreparationOptions::new(BackendKind::Native)
+        .with_native_non_wav_conversion(true)
+        .with_ffmpeg_bin(Some(PathBuf::from("ffmpeg")))
+        .with_ffmpeg_bin_explicit(true);
+
+    let prepared = prepare_audio_input(crate_fixture("tone.amr"), &options)
+        .expect("a real, decodable .amr file must convert via the external ffmpeg fallback");
+    assert_prepared_16k_mono_audio(&prepared);
+}
+
 #[test]
 #[cfg(target_os = "macos")]
 fn malformed_webm_falls_back_to_typed_error_instead_of_panicking() {
@@ -523,6 +645,29 @@ fn opus_extension_is_recognized() {
     assert_eq!(info.extension.as_deref(), Some("opus"));
     assert!(info.recognized_extension);
     assert!(info.issues.is_empty());
+}
+
+/// Horizontal coverage for every extension added alongside `.aac`: each must
+/// be recognized at the probe stage regardless of whether decoding it is an
+/// in-process symphonia path (`aac`/`m4b`/`aiff`/`aif`/`aifc`/`caf`) or an
+/// external ffmpeg-only fallback (`wma`/`amr`) -- see `RECOGNIZED_EXTENSIONS`'s
+/// doc comment in `audio/types.rs` for which is which.
+#[test]
+fn newly_supported_extensions_are_all_recognized_at_the_probe_stage() {
+    for extension in ["aac", "m4b", "aiff", "aif", "aifc", "caf", "wma", "amr"] {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join(format!("voice.{extension}"));
+        fs::write(&input, b"not real audio bytes").unwrap();
+
+        let info = probe_audio_input(&input).unwrap();
+
+        assert_eq!(info.extension.as_deref(), Some(extension));
+        assert!(
+            info.recognized_extension,
+            "{extension} should be recognized"
+        );
+        assert!(info.issues.is_empty());
+    }
 }
 
 /// Writes a copy of the `tone.opus` fixture cut off mid-stream (60%) and

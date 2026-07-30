@@ -8,19 +8,34 @@ use crate::BackendKind;
 // `qta` is macOS QuickTime Player's audio recording extension -- a MOV
 // container (ffmpeg's `mov,mp4,m4a,3gp,3g2,mj2` demuxer probes and decodes it
 // like any other MOV/M4A file, no special handling needed beyond recognizing
-// the extension).
+// the extension). `m4b` (audiobook) is the same ISO/MP4 container under a
+// different extension -- symphonia's `isomp4` reader already lists it as a
+// recognized extension alongside `mp4`/`m4a` (see
+// `symphonia_format_isomp4::demuxer::IsoMp4Reader::query`), so no extra
+// feature or code is needed beyond listing it here. `aac` is a bare ADTS
+// stream (WeChat and many other recorders/voice-memo apps emit this, not an
+// m4a/mp4 container) -- decoded by the `AdtsReader` the already-enabled
+// symphonia `aac` feature registers. `aiff`/`aif`/`aifc` and `caf` are Apple's
+// two other common PCM/compressed containers, decoded in-process by the
+// symphonia `aiff`/`caf` features (both enabled in the workspace `Cargo.toml`
+// alongside the format's already-enabled codecs -- pcm/aac/alac/flac/mp3).
 //
 // Every extension here is *reachable*, not necessarily decodable in-process:
 // `webm` in particular is a container, not a codec. Opus -- the most common
 // codec inside `.opus`/`.ogg`/`.webm` audio -- decodes in-process through the
 // bundled libopus (see `audio/opus_decode`); anything the in-process path
-// still cannot handle (HE-AAC, Opus multistream >2ch, ...) falls through to
-// the external ffmpeg/afconvert conversion chain in `prepare.rs` -- with
-// ffmpeg on PATH it still transcribes; without it, the error names the
-// detected codec instead of pretending the file is corrupt (see
-// `symphonia_decode::probe_codec_label` and `prepare::codec_note`).
+// still cannot handle (HE-AAC, Opus multistream >2ch, `wma`, `amr`, ...)
+// falls through to the external ffmpeg/afconvert conversion chain in
+// `prepare.rs` -- with ffmpeg on PATH it still transcribes; without it, the
+// error names the detected codec instead of pretending the file is corrupt
+// (see `symphonia_decode::probe_codec_label` and `prepare::codec_note`).
+// `wma`/`amr` are listed here even though symphonia has no ASF/AMR demuxer at
+// all (unlike HE-AAC, which symphonia's `isomp4`/`aac` *can* at least name):
+// ffmpeg decodes both, so this only changes whether that fallback is ever
+// attempted, not whether every upload of one succeeds.
 pub(crate) const RECOGNIZED_EXTENSIONS: &[&str] = &[
-    "wav", "mp3", "mp4", "m4a", "webm", "flac", "ogg", "opus", "qta",
+    "wav", "mp3", "mp4", "m4a", "m4b", "webm", "flac", "ogg", "opus", "qta", "aac", "aiff", "aif",
+    "aifc", "caf", "wma", "amr",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
