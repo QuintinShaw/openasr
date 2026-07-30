@@ -136,10 +136,14 @@ pub(crate) fn prepare_external_input(
 }
 
 fn wav_is_already_conformant(path: &std::path::Path) -> bool {
+    // `probe_wav_pcm_shape` parses the `fmt ` chunk through the same
+    // `api::audio_io::parse_wav_fmt` the downstream WAV reader uses (WAVE_FORMAT_EXTENSIBLE
+    // included), so this admission check can never classify a file's format
+    // differently than the reader that actually consumes it after passthrough.
     matches!(
         decode::probe_wav_pcm_shape(path),
         Ok(Some(fmt)) if fmt.channels == 1
-            && fmt.sample_rate == 16_000
+            && fmt.sample_rate_hz == 16_000
             && matches!((fmt.audio_format, fmt.bits_per_sample), (1, 16) | (3, 32))
     )
 }

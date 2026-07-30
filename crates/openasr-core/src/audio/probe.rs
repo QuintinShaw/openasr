@@ -52,7 +52,7 @@ fn wav_source_format_if_supported(
         return (None, None);
     }
     match decode::probe_wav_pcm_shape(path) {
-        Ok(Some(fmt)) => (Some(fmt.sample_rate), Some(fmt.channels)),
+        Ok(Some(fmt)) => (Some(fmt.sample_rate_hz), Some(fmt.channels)),
         _ => (None, None),
     }
 }

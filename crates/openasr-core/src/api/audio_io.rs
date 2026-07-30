@@ -57,15 +57,25 @@ fn parse_wav_16khz_mono_f32(bytes: &[u8], input_label: &str) -> Result<Vec<f32>,
     }
 }
 
+/// Parsed `fmt ` chunk shape, shared with `audio::decode`'s cheap
+/// already-conformant probe so the two never disagree on what counts as a
+/// recognized WAV format (see `parse_wav_fmt`'s WAVE_FORMAT_EXTENSIBLE
+/// unwrap doc comment for why that used to matter).
 #[derive(Debug, Clone, Copy)]
-struct WavFormat {
-    audio_format: u16,
-    channels: u16,
-    sample_rate_hz: u32,
-    bits_per_sample: u16,
+pub(crate) struct WavFormat {
+    pub(crate) audio_format: u16,
+    pub(crate) channels: u16,
+    pub(crate) sample_rate_hz: u32,
+    pub(crate) bits_per_sample: u16,
 }
 
-fn parse_wav_fmt(bytes: &[u8]) -> Result<WavFormat, NativeAsrError> {
+/// Parses a WAV `fmt ` chunk's raw content (no chunk id/length header). This
+/// is the single source of truth for "what audio_format/subformat does this
+/// fmt chunk describe" -- `audio::decode::probe_wav_pcm_shape` (used by
+/// `audio::prepare::wav_is_already_conformant` to decide passthrough vs.
+/// decode) calls this same function so the passthrough admission check and
+/// the actual WAV reader can never classify a file's format differently.
+pub(crate) fn parse_wav_fmt(bytes: &[u8]) -> Result<WavFormat, NativeAsrError> {
     if bytes.len() < 16 {
         return Err(wav_error("fmt chunk is shorter than 16 bytes"));
     }

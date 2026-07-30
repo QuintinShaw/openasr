@@ -4,6 +4,12 @@ use std::{
     path::Path,
 };
 
+/// Reuse `api::audio_io`'s `fmt`-chunk parser (which unwraps
+/// WAVE_FORMAT_EXTENSIBLE's real subformat out of the SubFormat GUID) so this
+/// probe and the downstream WAV reader agree on what "conformant" means --
+/// see `parse_wav_fmt`'s doc comment.
+use crate::api::audio_io::WavFormat as WavFmt;
+
 pub(crate) fn probe_wav_duration_inner(path: &Path) -> std::io::Result<Option<f64>> {
     let mut file = File::open(path)?;
     probe_wav_duration_from_file(&mut file)
@@ -27,12 +33,12 @@ fn probe_wav_duration_from_file(file: &mut File) -> std::io::Result<Option<f64>>
     if fmt.audio_format != 1 && fmt.audio_format != 3 {
         return Ok(None);
     }
-    if fmt.sample_rate == 0 || fmt.channels == 0 || fmt.bits_per_sample == 0 {
+    if fmt.sample_rate_hz == 0 || fmt.channels == 0 || fmt.bits_per_sample == 0 {
         return Ok(None);
     }
 
     let bytes_per_second =
-        fmt.sample_rate as f64 * fmt.channels as f64 * (fmt.bits_per_sample as f64 / 8.0);
+        fmt.sample_rate_hz as f64 * fmt.channels as f64 * (fmt.bits_per_sample as f64 / 8.0);
     if bytes_per_second <= 0.0 {
         return Ok(None);
     }
@@ -78,7 +84,7 @@ fn read_wav_fmt_and_data_size(file: &mut File) -> std::io::Result<Option<(WavFmt
                 if chunk_size % 2 == 1 {
                     file.seek(SeekFrom::Current(1))?;
                 }
-                fmt = parse_wav_fmt(&bytes);
+                fmt = crate::api::audio_io::parse_wav_fmt(&bytes).ok();
             }
             b"data" => {
                 data_size = Some(chunk_size);
@@ -100,27 +106,6 @@ fn read_wav_fmt_and_data_size(file: &mut File) -> std::io::Result<Option<(WavFmt
     })
 }
 
-fn parse_wav_fmt(bytes: &[u8]) -> Option<WavFmt> {
-    if bytes.len() < 16 {
-        return None;
-    }
-
-    Some(WavFmt {
-        audio_format: u16::from_le_bytes(bytes[0..2].try_into().ok()?),
-        channels: u16::from_le_bytes(bytes[2..4].try_into().ok()?),
-        sample_rate: u32::from_le_bytes(bytes[4..8].try_into().ok()?),
-        bits_per_sample: u16::from_le_bytes(bytes[14..16].try_into().ok()?),
-    })
-}
-
 fn padded_chunk_size(size: u32) -> u64 {
     u64::from(size) + u64::from(size % 2)
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct WavFmt {
-    pub(crate) audio_format: u16,
-    pub(crate) channels: u16,
-    pub(crate) sample_rate: u32,
-    pub(crate) bits_per_sample: u16,
 }

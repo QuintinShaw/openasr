@@ -162,6 +162,112 @@ fn native_pcm16_mono_16khz_wav_passes_through() {
     assert!(!prepared.is_converted());
 }
 
+/// Regression guard for the WAVE_FORMAT_EXTENSIBLE admission mismatch: before
+/// this fix, `wav_is_already_conformant` parsed the `fmt ` chunk's top-level
+/// `audio_format` field directly (never unwrapping 0xFFFE), so *every*
+/// extensible wav -- including the canonical, cbSize=22, full-GUID shape
+/// macOS `afconvert -f WAVE` always emits -- was misclassified as
+/// non-conformant and pushed through symphonia's stricter extensible parser
+/// instead of the cheap passthrough this already-conformant file qualifies
+/// for. `prepare_native_conversion` (not the bare `BackendKind::Native`
+/// options the other passthrough tests above use) is required to actually
+/// exercise `wav_is_already_conformant`: without
+/// `with_native_non_wav_conversion(true)` the native backend passes every wav
+/// through unconditionally, never reaching this check at all.
+#[test]
+fn wave_format_extensible_conformant_wav_passes_through_without_symphonia() {
+    let temp = tempfile::tempdir().unwrap();
+    let wav = temp.path().join("extensible.wav");
+    fs::write(&wav, extensible_pcm16_mono_16k_wav(40, 22, 8)).unwrap();
+
+    let prepared = prepare_native_conversion(&wav)
+        .expect("an already-conformant WAVE_FORMAT_EXTENSIBLE wav must decode");
+
+    assert_eq!(prepared.path(), wav.as_path());
+    assert!(
+        !prepared.is_converted(),
+        "an already-conformant extensible wav must pass through, not go through symphonia"
+    );
+}
+
+/// Same admission check, but for the shorter/non-canonical extensible shapes
+/// real hardware recorders and conferencing systems emit: a `fmt ` chunk
+/// shorter than symphonia's own extensible parser requires (which needs the
+/// full 40-byte chunk, cbSize exactly 22, and the complete 16-byte SubFormat
+/// GUID matched against the standard PCM GUID) but long enough (>= 26 bytes)
+/// for `api::audio_io::parse_wav_fmt`'s lenient unwrap -- first two SubFormat
+/// GUID bytes only -- to read the real PCM tag. Before this fix these were
+/// misclassified as non-conformant, reached symphonia's stricter parser, and
+/// (with no `fmt`/GUID match) fell through to the external ffmpeg/afconvert
+/// chain -- a silent behavior change from passthrough to hard failure on
+/// hosts without ffmpeg configured.
+#[test]
+fn wave_format_extensible_short_fmt_chunk_passes_through_without_symphonia() {
+    let temp = tempfile::tempdir().unwrap();
+    let wav = temp.path().join("extensible_short.wav");
+    // 26-byte fmt content: the 16 fixed fields, a non-canonical cbSize (8,
+    // not symphonia's required 22), and only the first two SubFormat GUID
+    // bytes (the PCM tag) -- no channel mask, no full GUID.
+    fs::write(&wav, extensible_pcm16_mono_16k_wav(26, 8, 8)).unwrap();
+
+    let prepared = prepare_native_conversion(&wav)
+        .expect("a short-fmt-chunk WAVE_FORMAT_EXTENSIBLE wav must decode");
+
+    assert_eq!(prepared.path(), wav.as_path());
+    assert!(
+        !prepared.is_converted(),
+        "a short-fmt-chunk extensible wav must pass through, not go through symphonia"
+    );
+}
+
+/// Builds a WAVE_FORMAT_EXTENSIBLE 16 kHz mono PCM16 wav with an explicit
+/// `fmt` chunk content length and `cbSize` value, to cover both the
+/// canonical (40-byte, cbSize=22) shape and shorter, non-canonical shapes.
+/// Only the PCM SubFormat GUID's first two bytes are ever written (the part
+/// `api::audio_io::parse_wav_fmt` actually reads); any GUID bytes past
+/// `fmt_content_len` are simply absent, matching a real short fmt chunk
+/// rather than a truncated-but-intended-full one.
+fn extensible_pcm16_mono_16k_wav(fmt_content_len: usize, cb_size: u16, frames: u32) -> Vec<u8> {
+    assert!(
+        fmt_content_len >= 26,
+        "fixture must be long enough for the SubFormat GUID's leading PCM tag"
+    );
+    let data_size = frames * 2;
+    let mut fmt_content = Vec::with_capacity(fmt_content_len);
+    fmt_content.extend_from_slice(&0xFFFE_u16.to_le_bytes()); // audio_format (extensible)
+    fmt_content.extend_from_slice(&1_u16.to_le_bytes()); // channels
+    fmt_content.extend_from_slice(&16_000_u32.to_le_bytes()); // sample rate
+    fmt_content.extend_from_slice(&32_000_u32.to_le_bytes()); // byte rate
+    fmt_content.extend_from_slice(&2_u16.to_le_bytes()); // block align
+    fmt_content.extend_from_slice(&16_u16.to_le_bytes()); // bits per sample
+    fmt_content.extend_from_slice(&cb_size.to_le_bytes()); // cbSize
+    while fmt_content.len() < fmt_content_len {
+        // First two SubFormat GUID bytes are the PCM tag (0x0001 LE); the
+        // rest of this padding (channel mask + remaining GUID bytes) is
+        // irrelevant to `parse_wav_fmt`'s lenient check.
+        if fmt_content.len() == 24 {
+            fmt_content.extend_from_slice(&1_u16.to_le_bytes());
+        } else {
+            fmt_content.push(0);
+        }
+    }
+    fmt_content.truncate(fmt_content_len);
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(4 + 8 + fmt_content_len as u32 + 8 + data_size).to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&(fmt_content_len as u32).to_le_bytes());
+    bytes.extend_from_slice(&fmt_content);
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_size.to_le_bytes());
+    for index in 0..frames {
+        bytes.extend_from_slice(&(index as i16).to_le_bytes());
+    }
+    bytes
+}
+
 #[test]
 fn native_float_wav_passthrough_without_ffmpeg() {
     let temp = tempfile::tempdir().unwrap();
