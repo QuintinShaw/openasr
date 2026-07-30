@@ -73,4 +73,16 @@ abandoned_worker_count: number,
  * `docs/CATALOG_COMPATIBILITY.md`. Additive: absent in the pre-0.1.16
  * contract.
  */
-catalog_degraded: string | null, };
+catalog_degraded: string | null, 
+/**
+ * Seconds of net speech Voice ID enrollment requires before it accepts a
+ * sample (`openasr_core::diarize::voice_id::MIN_SAMPLE_SPEECH_SECONDS`).
+ * A build constant, not per-request state, but this is the one contract
+ * every client already polls at startup, and it is the single source of
+ * truth for a number a UI would otherwise have to hand-copy (see that
+ * constant's own doc for why registration budgets a margin over
+ * recognition's shorter continuous-speech floor). Additive: absent in
+ * the pre-0.1.25 contract, in which case a client should keep whatever
+ * figure it last shipped with rather than treat the daemon as degraded.
+ */
+voice_id_min_enrollment_speech_seconds: number, };

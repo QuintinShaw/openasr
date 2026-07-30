@@ -8,7 +8,17 @@ use thiserror::Error;
 use super::domain::SampleQuality;
 
 /// Minimum accepted speech for a single enrollment sample.
-pub const MIN_SAMPLE_SPEECH_SECONDS: f32 = 5.0;
+///
+/// Set to leave a margin over recognition's own floor,
+/// `identity::MIN_CONTINUOUS_SPEECH_SECONDS_FOR_NAMING` (8.0s after the V3
+/// main-cluster reclaim change) -- registering with exactly as much speech as
+/// recognition later requires is a promise that breaks on the very next
+/// retry: real speech is never as clean as an enrollment prompt's read-aloud
+/// passage, so recognition's own evidence is consistently thinner than
+/// enrollment's for the same nominal seconds. 10.0 (was 5.0, from before that
+/// floor existed at all) is the smallest round number clearing 8.0 with room
+/// to spare rather than by a hair.
+pub const MIN_SAMPLE_SPEECH_SECONDS: f32 = 10.0;
 /// Soft target used when scoring quality weight (does not reject).
 pub const TARGET_SAMPLE_SPEECH_SECONDS: f32 = 12.0;
 const SAMPLE_RATE_HZ: usize = 16_000;
@@ -133,7 +143,7 @@ mod tests {
 
     #[test]
     fn accepts_clean_speech_like_audio() {
-        let q = assess_enrollment_quality(&tone(8.0, 0.2)).unwrap();
+        let q = assess_enrollment_quality(&tone(11.0, 0.2)).unwrap();
         assert!(q.speech_seconds >= MIN_SAMPLE_SPEECH_SECONDS);
         assert!(q.weight() > 0.2);
     }
@@ -148,11 +158,17 @@ mod tests {
             assess_enrollment_quality(&tone(2.0, 0.2)),
             Err(QualityError::TooShortSpeech { .. })
         ));
+        // Just under the floor, not merely short outright -- pins the 10.0
+        // boundary itself rather than only the "obviously too short" case.
+        assert!(matches!(
+            assess_enrollment_quality(&tone(MIN_SAMPLE_SPEECH_SECONDS - 0.5, 0.2)),
+            Err(QualityError::TooShortSpeech { .. })
+        ));
     }
 
     #[test]
     fn rejects_heavy_clipping() {
-        let mut samples = tone(8.0, 1.0);
+        let mut samples = tone(11.0, 1.0);
         for s in &mut samples {
             *s = s.signum();
         }

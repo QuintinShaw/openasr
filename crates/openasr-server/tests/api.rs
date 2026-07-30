@@ -2727,11 +2727,12 @@ async fn health_returns_identity_json_without_instance_token() {
     );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        10,
+        11,
         "status/server_version/pid/instance_token/model_installed/model_resident \
          plus the 0.1.14 additive native_active_count/idle_seconds, the 0.1.15 \
-         additive abandoned_worker_count debug field, and the 0.1.16 additive \
-         catalog_degraded field"
+         additive abandoned_worker_count debug field, the 0.1.16 additive \
+         catalog_degraded field, and the 0.1.25 additive \
+         voice_id_min_enrollment_speech_seconds field"
     );
 }
 
@@ -2766,11 +2767,12 @@ async fn health_echoes_launch_instance_token_without_env() {
     );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        10,
+        11,
         "status/server_version/pid/instance_token/model_installed/model_resident \
          plus the 0.1.14 additive native_active_count/idle_seconds, the 0.1.15 \
-         additive abandoned_worker_count debug field, and the 0.1.16 additive \
-         catalog_degraded field"
+         additive abandoned_worker_count debug field, the 0.1.16 additive \
+         catalog_degraded field, and the 0.1.25 additive \
+         voice_id_min_enrollment_speech_seconds field"
     );
 }
 
@@ -2807,11 +2809,12 @@ async fn health_prefers_env_instance_token_over_launch_option() {
     );
     assert_eq!(
         parsed.as_object().expect("health response object").len(),
-        10,
+        11,
         "status/server_version/pid/instance_token/model_installed/model_resident \
          plus the 0.1.14 additive native_active_count/idle_seconds, the 0.1.15 \
-         additive abandoned_worker_count debug field, and the 0.1.16 additive \
-         catalog_degraded field"
+         additive abandoned_worker_count debug field, the 0.1.16 additive \
+         catalog_degraded field, and the 0.1.25 additive \
+         voice_id_min_enrollment_speech_seconds field"
     );
 }
 
