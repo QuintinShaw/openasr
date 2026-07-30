@@ -75,13 +75,20 @@ named person".
 - Labels are anonymous and session-relative (`SPEAKER_00/01`, ...). Speaker
   embeddings are used only within a session and are not persisted as a
   cross-file identity.
-- The only identity feature is an optional, off-by-default enrolled primary user:
-  a single on-device centroid that relabels one cluster `SPEAKER_ME`. It is never
-  transmitted.
+- Identity is opt-in and stays on the device. Two optional, off-by-default
+  features build on the anonymous labels: a single enrolled primary user (an
+  on-device centroid that relabels one cluster `SPEAKER_ME`), and Voice ID
+  (enrolled voiceprints for one or more named people, used to keep a person's
+  label consistent across turns and files). Enrolled voiceprints and their
+  samples are persisted only in a local SQLite database under
+  `$OPENASR_HOME/diarize/` -- never committed, uploaded, or attached to
+  transcription output. All Voice ID reads and writes go through the
+  operator-only HTTP surface (`/v1/voice-id/*`, gated by `is_operator_only_path`),
+  so a paired remote-compute client can never read or write the voiceprint store.
 - Remote-compute contract: the server runs VAD/diarization/ASR and returns only
-  anonymous labels. It never receives or stores the enrolled voiceprint; if the
-  user enrolled a primary user, the anonymous-to-`SPEAKER_ME` mapping happens on
-  the client. The voiceprint never leaves the device, even in remote mode.
+  anonymous labels. It never receives or stores an enrolled voiceprint; the
+  anonymous-to-identity mapping (`SPEAKER_ME` or a named Voice ID person) happens
+  on the client. The voiceprint never leaves the device, even in remote mode.
 - Bundled diarization weights are license-clean only (FireRedVAD Stream-VAD
   Apache-2.0, pyannote-segmentation-3.0 MIT, ReDimNet2-B6 MIT with
   attribution).
