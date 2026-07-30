@@ -81,6 +81,21 @@ fn sample_wav_fixture_path() -> PathBuf {
         .expect("sample wav fixture path must exist")
 }
 
+/// A genuinely decodable 16 kHz mono PCM16 wav (a copy of the `jfk.wav`
+/// fixture) -- unlike `temp_input_wav` above (deliberately invalid bytes),
+/// for tests where audio preparation must actually succeed so a *different*
+/// validation further down the pipeline (model-id mismatch, here) is what
+/// gets exercised, instead of an audio-decode error masking it.
+fn valid_temp_input_wav() -> tempfile::NamedTempFile {
+    let file = tempfile::Builder::new()
+        .prefix("openasr-test-")
+        .suffix(".wav")
+        .tempfile()
+        .expect("temporary wav");
+    std::fs::copy(sample_wav_fixture_path(), file.path()).expect("copy sample wav fixture");
+    file
+}
+
 fn expected_mock_rendered_transcription(
     model: &str,
     file_name: &str,
@@ -1048,7 +1063,10 @@ fn transcribe_native_fails_closed_when_fixture_lacks_tokenizer_kv() {
 
 #[test]
 fn transcribe_native_rejects_model_id_mismatch_with_local_runtime_source() {
-    let input = temp_input_wav();
+    // Model-id mismatch is checked after audio preparation succeeds, so this
+    // needs audio that actually decodes, not the deliberately-invalid
+    // `temp_input_wav` placeholder other tests use.
+    let input = valid_temp_input_wav();
     let temp = tempfile::tempdir().unwrap();
     let pack_root = temp.path().join("whisper-runtime.oasr");
     write_whisper_oasr_v1_fixture(&pack_root, "whisper-runtime");

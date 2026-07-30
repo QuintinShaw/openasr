@@ -34,28 +34,20 @@ pub(crate) fn prepare_external_input(
     if is_wav && wav_is_already_conformant(&info.path) {
         // Already matches the 16 kHz mono PCM16/float32 shape the rest of the
         // pipeline expects: pass it through untouched (cheap, and preserves
-        // today's behavior for already-conformant recordings).
+        // today's behavior for already-conformant recordings). This is the
+        // *only* passthrough in this function -- every other wav (non-
+        // conformant sample rate/channels, or a codec this build cannot
+        // decode) falls through to the same decode-or-convert-or-fail path a
+        // non-wav input would, below. A wav symphonia cannot parse used to be
+        // handed back byte-for-byte untouched here, which silently produced
+        // audio the rest of the pipeline does not actually understand and
+        // then failed downstream with a generic "expected 16 kHz mono PCM"
+        // error that pointed at the wrong knob (sample rate) when the real
+        // problem was an unsupported codec (e.g. mu-law/A-law/ADPCM from a
+        // dictaphone or conferencing system, or -- before the `adpcm`
+        // symphonia feature below -- MS/IMA ADPCM specifically).
         return Ok(passthrough(info));
     }
-    if is_wav && !options.ffmpeg_bin_explicit {
-        // Non-conformant (other sample rate, stereo, ...) and no explicit
-        // ffmpeg was requested: decode via the same in-process symphonia path
-        // as the other formats below.
-        if let SymphoniaAttempt::Prepared(prepared) = try_symphonia_prepare(&info)? {
-            return Ok(prepared);
-        }
-        // Symphonia could not parse this as a wav at all (corrupt/foreign
-        // bytes with a `.wav` extension, or -- per the trust-boundary
-        // invariant in AGENTS.md -- a third-party demuxer panic on malformed
-        // bytes that `try_symphonia_prepare` already caught and downgraded):
-        // preserve today's leniency and pass the original bytes through
-        // untouched rather than hard-failing here -- downstream rejects it
-        // with a precise WAV-format error if it truly isn't valid input.
-        return Ok(passthrough(info));
-    }
-    // A non-conformant wav with an *explicit* ffmpeg configured falls through
-    // to the general external-tool conversion below instead of returning here,
-    // so the user's stated intent is actually honored for wav too.
 
     if !is_wav && !info.recognized_extension {
         let description = info
@@ -70,17 +62,21 @@ pub(crate) fn prepare_external_input(
         });
     }
 
-    // In-process decode is the default main path for every other recognized
-    // format (m4a/AAC-LC/ALAC, mp4, qta, mp3, flac, ogg vorbis/opus, mkv/webm
-    // vorbis/opus). It only ever falls through (never a hard error) when the
-    // container/codec is not supported (e.g. HE-AAC, Opus multistream >2ch),
-    // the file is malformed, or -- a third-party demuxer bug on adversarial
-    // input -- the underlying symphonia call panicked (caught and downgraded
-    // by `try_symphonia_prepare`, per the panic-free trust-boundary invariant
-    // in AGENTS.md); in all three cases control falls through to the external
-    // ffmpeg/afconvert chain below exactly as before. An explicitly
-    // configured ffmpeg binary is an escape hatch that always wins, so it is
-    // checked first.
+    // In-process decode is the default main path for every recognized format,
+    // wav included: non-conformant wav (other sample rate/channels, or a
+    // codec the enabled symphonia features decode -- MS/IMA ADPCM, A-law,
+    // mu-law), plus m4a/AAC-LC/ALAC, mp4, qta, mp3, flac, ogg vorbis/opus,
+    // mkv/webm vorbis/opus. It only ever falls through (never a hard error)
+    // when the container/codec is not supported (e.g. HE-AAC, Opus
+    // multistream >2ch), the file is malformed, or -- a third-party demuxer
+    // bug on adversarial input -- the underlying symphonia call panicked
+    // (caught and downgraded by `try_symphonia_prepare`, per the panic-free
+    // trust-boundary invariant in AGENTS.md); in all such cases control falls
+    // through to the external ffmpeg/afconvert chain below -- the same chain
+    // a non-wav input in this situation has always used, so a wav this build
+    // cannot decode is no longer special-cased into a silent passthrough. An
+    // explicitly configured ffmpeg binary is an escape hatch that always wins
+    // (for wav too), so it is checked first.
     let diagnostic = if !options.ffmpeg_bin_explicit {
         match try_symphonia_prepare(&info)? {
             SymphoniaAttempt::Prepared(prepared) => return Ok(prepared),
@@ -346,7 +342,22 @@ fn resolve_conversion_tool(
 /// probe yet deliberately falls back (see `is_unsupported_aac_extension`),
 /// which is exactly what the "supports AAC-LC ... but not AAC in-process"
 /// sentence then tells the user.
-const IN_PROCESS_CODECS: &str = "AAC-LC, ALAC, FLAC, MP3, Opus, PCM/WAV, and Vorbis";
+const IN_PROCESS_CODECS: &str =
+    "AAC-LC, ALAC, ADPCM (MS/IMA), A-law/mu-law, FLAC, MP3, Opus, PCM/WAV, and Vorbis";
+
+/// wav codec labels this build actually decodes in-process (mirrors the
+/// `IN_PROCESS_CODECS` ADPCM/A-law/mu-law entries). A `Diagnostic::Codec`
+/// carrying one of these can only reach `codec_note`/`missing_converter_hint`
+/// two ways: the explicit-ffmpeg escape hatch skipped the in-process attempt
+/// outright, or this particular file failed to decode despite the codec
+/// being supported in general (a corrupt/truncated stream, an unusual block
+/// alignment, ...) -- either way the codec itself is not unsupported, so
+/// these get the same "handles X, but this file/path didn't" wording as the
+/// pre-existing Opus special case below instead of the generic
+/// "supports ... but not X in-process" arm.
+fn is_in_process_wav_codec(label: &str) -> bool {
+    matches!(label, "MS ADPCM" | "IMA ADPCM" | "A-law PCM" | "mu-law PCM")
+}
 
 fn codec_note(diagnostic: &Diagnostic) -> String {
     match diagnostic {
@@ -358,6 +369,9 @@ fn codec_note(diagnostic: &Diagnostic) -> String {
         Diagnostic::Codec(label) if label == "Opus" => {
             "\nDetected audio codec: Opus. OpenASR's built-in decoder handles mono/stereo Opus, but this file could not be decoded in-process (it may use more than 2 channels, or the stream may be corrupt).".to_string()
         }
+        Diagnostic::Codec(label) if is_in_process_wav_codec(label) => format!(
+            "\nDetected audio codec: {label}. OpenASR's built-in decoder handles {label} in-process, but this file was not decoded that way (an explicit ffmpeg binary may be configured, which always takes over instead, or the stream itself may be corrupt or truncated)."
+        ),
         Diagnostic::Codec(label) => format!(
             "\nDetected audio codec: {label}. OpenASR's built-in decoder supports {IN_PROCESS_CODECS}, but not {label} in-process."
         ),
@@ -370,12 +384,16 @@ fn codec_note(diagnostic: &Diagnostic) -> String {
 
 fn missing_converter_hint(diagnostic: &Diagnostic) -> String {
     let codec_phrase = match diagnostic {
-        // See `codec_note`'s matching arm: a fallback carrying the "Opus"
-        // label is a file the built-in Opus decoder cannot handle, not a
-        // generally unsupported format.
+        // See `codec_note`'s matching arms: a fallback carrying the "Opus"
+        // or an in-process wav codec label is a file the built-in decoder
+        // did not decode this time around, not a generally unsupported
+        // format.
         Diagnostic::Codec(label) if label == "Opus" => {
             "this Opus file (it may use more than 2 channels, or the stream may be corrupt)".to_string()
         }
+        Diagnostic::Codec(label) if is_in_process_wav_codec(label) => format!(
+            "this {label} file (an explicit ffmpeg binary may be configured, which always takes over instead, or the stream itself may be corrupt or truncated)"
+        ),
         Diagnostic::Codec(label) => format!("this format ({label})"),
         Diagnostic::ParserPanicked => {
             "this file (its container looks malformed or corrupted, or hits an edge case the bundled parser doesn't handle)".to_string()

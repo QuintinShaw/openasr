@@ -52,11 +52,13 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # decodes are enabled, to keep the dependency tree and release binary small
 # (see crates/openasr-core/src/audio/symphonia_decode.rs). `aiff` reuses the
 # already-vendored symphonia-format-riff crate (also the wav reader) so it
-# adds no new dependency; `caf` pulls in symphonia-format-caf. Symphonia has
-# never shipped an Opus decoder (still true as of 0.6.0): its ogg/mkv
-# demuxers still surface Opus packets, which are decoded in-process by the
-# bundled libopus below (see crates/openasr-core/src/audio/opus_decode.rs).
-symphonia = { version = "0.5.4", default-features = false, features = ["isomp4", "aac", "mp3", "flac", "ogg", "vorbis", "wav", "pcm", "mkv", "alac", "aiff", "caf"] }
+# adds no new dependency; `caf` pulls in symphonia-format-caf; `adpcm` lets
+# the wav reader decode MS-ADPCM/IMA-ADPCM wav (common dictaphone/conferencing
+# output) in-process instead of shelling out to an external converter.
+# Symphonia has never shipped an Opus decoder (still true as of 0.6.0): its
+# ogg/mkv demuxers still surface Opus packets, which are decoded in-process by
+# the bundled libopus below (see crates/openasr-core/src/audio/opus_decode.rs).
+symphonia = { version = "0.5.4", default-features = false, features = ["isomp4", "aac", "mp3", "flac", "ogg", "vorbis", "wav", "pcm", "mkv", "alac", "aiff", "caf", "adpcm"] }
 # Opus packet decoding for the in-process audio path (see audio/opus_decode.rs
 # in openasr-core). libopus itself (BSD-3-Clause) is not vendored into this
 # repository: libopus_sys carries the libopus source inside its crates.io

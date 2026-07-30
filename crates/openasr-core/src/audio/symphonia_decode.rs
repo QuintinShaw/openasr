@@ -4,9 +4,11 @@
 //! This is the default decode path for `prepare_audio_input`: m4a/m4b/AAC-LC/
 //! ALAC (isomp4, including the `.qta` QuickTime container), bare ADTS `.aac`,
 //! aiff, caf, mp3, flac, ogg (vorbis or opus), mkv/webm (vorbis or opus
-//! track), and non-conformant wav all decode here without shelling out to
-//! ffmpeg or afconvert. Anything this module cannot decode (HE-AAC, Opus
-//! multistream >2ch, wma/amr -- no symphonia demuxer for either -- corrupt
+//! track), and non-conformant wav (including MS/IMA ADPCM, A-law, and mu-law
+//! wav -- common outputs of dictaphones, old recording software, and
+//! conferencing systems) all decode here without shelling out to ffmpeg or
+//! afconvert. Anything this module cannot decode (HE-AAC, Opus multistream
+//! larger than 2ch, wma/amr -- no symphonia demuxer for either -- corrupt
 //! files, containers/codecs outside the enabled symphonia features) reports
 //! [`SymphoniaOutcome::Unsupported`] (never a hard error) so the caller falls
 //! back to the existing external converter chain.
@@ -42,8 +44,9 @@ use rubato::{FftFixedIn, Resampler};
 use symphonia::core::{
     audio::{AudioBufferRef, Signal},
     codecs::{
-        CODEC_TYPE_AAC, CODEC_TYPE_ALAC, CODEC_TYPE_FLAC, CODEC_TYPE_MP3, CODEC_TYPE_NULL,
-        CODEC_TYPE_OPUS, CODEC_TYPE_VORBIS, CodecType, DecoderOptions,
+        CODEC_TYPE_AAC, CODEC_TYPE_ADPCM_IMA_WAV, CODEC_TYPE_ADPCM_MS, CODEC_TYPE_ALAC,
+        CODEC_TYPE_FLAC, CODEC_TYPE_MP3, CODEC_TYPE_NULL, CODEC_TYPE_OPUS, CODEC_TYPE_PCM_ALAW,
+        CODEC_TYPE_PCM_MULAW, CODEC_TYPE_VORBIS, CodecType, DecoderOptions,
     },
     errors::Error as SymphoniaError,
     formats::{FormatOptions, FormatReader},
@@ -201,7 +204,14 @@ fn probe_codec_label_inner(path: &Path, extension: Option<&str>) -> Option<Strin
 }
 
 /// Human-readable name for the codecs symphonia's format registry can
-/// identify, whether or not this build links a decoder for them.
+/// identify, whether or not this build links a decoder for them. The
+/// wav-specific entries here (ADPCM, A-law, mu-law) matter even though this
+/// build's `pcm`/`adpcm` symphonia features already decode all of them
+/// in-process (see `decode_to_mono_f32` below): the explicit-ffmpeg escape
+/// hatch (`options.ffmpeg_bin_explicit`) skips that in-process attempt
+/// entirely and only ever names the codec via [`probe_codec_label`], so a
+/// diagnostic naming these tags is the only way a user configuring a broken
+/// or wrong ffmpeg binary learns *which* codec it failed to convert.
 fn codec_type_label(codec: CodecType) -> String {
     match codec {
         CODEC_TYPE_OPUS => "Opus".to_string(),
@@ -210,6 +220,10 @@ fn codec_type_label(codec: CodecType) -> String {
         CODEC_TYPE_MP3 => "MP3".to_string(),
         CODEC_TYPE_FLAC => "FLAC".to_string(),
         CODEC_TYPE_ALAC => "ALAC".to_string(),
+        CODEC_TYPE_ADPCM_MS => "MS ADPCM".to_string(),
+        CODEC_TYPE_ADPCM_IMA_WAV => "IMA ADPCM".to_string(),
+        CODEC_TYPE_PCM_ALAW => "A-law PCM".to_string(),
+        CODEC_TYPE_PCM_MULAW => "mu-law PCM".to_string(),
         other => format!("codec {other}"),
     }
 }
@@ -534,6 +548,23 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    /// The wav demuxer identifies the MS-ADPCM format tag (`WAVE_FORMAT_ADPCM`
+    /// 0x0002) on its own merits, independent of whether the `adpcm`
+    /// symphonia feature links a decoder for it -- this is what lets
+    /// `prepare::codec_note`/`missing_converter_hint` name the actual codec
+    /// in an error instead of a generic "unsupported format" message (#159:
+    /// dictaphone/conferencing-system wav uploads are commonly MS/IMA ADPCM).
+    #[test]
+    fn probe_codec_label_identifies_ms_adpcm_wav() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone_mono_adpcm_ms.wav");
+
+        assert!(matches!(
+            probe_codec_label(&fixture, Some("wav")),
+            ProbeOutcome::Codec(label) if label == "MS ADPCM"
+        ));
+    }
 
     #[test]
     fn resample_preserves_frame_count_ratio() {

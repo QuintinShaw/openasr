@@ -321,11 +321,11 @@ fn symphonia_in_memory_decode_never_writes_a_temp_wav_to_disk() {
     assert!(prepared.is_converted());
 }
 
-/// `tests/fixtures/*.{m4a,mp3,flac,ogg,opus,webm,qta}` are all synthesized,
-/// not recorded audio, so they can be regenerated if a fixture is lost or a
-/// new one is needed. Recipe (from a 0.5s 440 Hz mono/stereo sine `source.wav`
-/// generated via `ffmpeg -f lavfi -i "sine=frequency=440:duration=0.5" -ar
-/// 16000 -ac <1|2> source.wav`):
+/// `tests/fixtures/*.{m4a,mp3,flac,ogg,opus,webm,qta,wav}` are all
+/// synthesized, not recorded audio, so they can be regenerated if a fixture
+/// is lost or a new one is needed. Recipe (from a 0.5s 440 Hz mono/stereo
+/// sine `source.wav` generated via `ffmpeg -f lavfi -i
+/// "sine=frequency=440:duration=0.5" -ar 16000 -ac <1|2> source.wav`):
 ///
 /// ```text
 /// ffmpeg -i source.wav -c:a alac tone_mono_alac.m4a
@@ -333,6 +333,7 @@ fn symphonia_in_memory_decode_never_writes_a_temp_wav_to_disk() {
 /// ffmpeg -i source.wav -c:a libopus tone_mono_opus.webm
 /// ffmpeg -i source.wav -c:a libopus tone_opus.ogg
 /// ffmpeg -i source.wav -c:a libopus tone.opus
+/// ffmpeg -i source.wav -c:a adpcm_ms tone_mono_adpcm_ms.wav
 /// ```
 ///
 /// `malformed_vint_zero.webm` is not synthesized audio at all -- see
@@ -604,6 +605,60 @@ fn symphonia_decodes_and_resamples_non_conformant_wav() {
 }
 
 #[test]
+fn symphonia_decodes_ms_adpcm_wav_in_process() {
+    // MS-ADPCM (WAVE_FORMAT_ADPCM 0x0002) is a common output of dictaphones,
+    // older recording software, and conferencing systems (see #159); the
+    // `wav` demuxer identifies this format tag regardless of build features,
+    // but only the `adpcm` symphonia feature links a decoder for it. With
+    // that feature enabled this decodes entirely in-process, the same as any
+    // other non-conformant wav, instead of the old behavior of silently
+    // passing the undecoded ADPCM bytes straight through.
+    let prepared = prepare_native_conversion(&crate_fixture("tone_mono_adpcm_ms.wav"))
+        .expect("MS-ADPCM wav should decode via the in-process symphonia adpcm path");
+    assert_prepared_16k_mono_audio(&prepared);
+}
+
+/// Regression guard for the structural asymmetry this change fixes: a `.wav`
+/// symphonia cannot parse at all (corrupt/garbage bytes, not merely an
+/// unsupported-but-identifiable codec) used to be handed back byte-for-byte
+/// untouched (`prepare_external_input`'s old wav-only leniency), which
+/// silently produced "prepared" audio the rest of the pipeline cannot
+/// actually use and only failed much later with a generic, misleading
+/// "expected 16 kHz mono PCM" error. It must fail closed here instead, going
+/// through the exact same external-converter fallback (and failing there)
+/// that any other undecodable input already used -- proving passthrough is
+/// now reachable only for an already-conformant wav.
+#[test]
+#[cfg(target_os = "macos")]
+fn garbage_bytes_wav_fails_closed_instead_of_passing_through() {
+    let temp = tempfile::tempdir().unwrap();
+    let wav = temp.path().join("garbage.wav");
+    fs::write(&wav, garbage_bytes()).unwrap();
+
+    let error = prepare_native_conversion(&wav).unwrap_err();
+
+    assert!(
+        matches!(&error, AudioPreparationError::ConversionFailed { tool, .. } if tool == "afconvert"),
+        "garbage-byte wav must fail closed through the external converter, not pass through: {error}"
+    );
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn garbage_bytes_wav_fails_closed_instead_of_passing_through() {
+    let temp = tempfile::tempdir().unwrap();
+    let wav = temp.path().join("garbage.wav");
+    fs::write(&wav, garbage_bytes()).unwrap();
+
+    let error = prepare_native_conversion(&wav).unwrap_err();
+
+    assert!(
+        matches!(&error, AudioPreparationError::MissingFfmpeg { .. }),
+        "garbage-byte wav must fail closed with a typed error, not pass through: {error}"
+    );
+}
+
+#[test]
 #[cfg(target_os = "macos")]
 fn he_aac_falls_back_to_afconvert_when_symphonia_cannot_decode_it() {
     // HE-AAC (SBR) is outside what the enabled symphonia `aac` feature can
@@ -829,6 +884,36 @@ fn explicit_ffmpeg_bin_skips_symphonia_even_for_a_decodable_format() {
         error,
         AudioPreparationError::ConversionSpawn { tool, .. } if tool == "ffmpeg"
     ));
+}
+
+/// The explicit-ffmpeg escape hatch skips the in-process decode attempt
+/// entirely (see the test above), so if the configured "ffmpeg" then fails to
+/// convert a wav codec this build *does* decode in-process (MS-ADPCM here),
+/// the resulting error must still name the detected codec instead of a bare,
+/// unhelpful tool failure -- this is the whole point of
+/// `symphonia_decode::probe_codec_label` / `Diagnostic::Codec`. `/usr/bin/
+/// false` stands in for a real-but-broken ffmpeg binary: it exists (so this
+/// reaches `ConversionFailed`, not a spawn error) and always exits non-zero
+/// regardless of its arguments.
+#[test]
+#[cfg(unix)]
+fn explicit_ffmpeg_bin_failure_reports_the_detected_codec_in_the_error() {
+    let options = AudioPreparationOptions::new(BackendKind::Native)
+        .with_native_non_wav_conversion(true)
+        .with_ffmpeg_bin(Some(PathBuf::from("/usr/bin/false")))
+        .with_ffmpeg_bin_explicit(true);
+
+    let error = prepare_audio_input(crate_fixture("tone_mono_adpcm_ms.wav"), &options).unwrap_err();
+
+    let message = error.to_string();
+    assert!(matches!(
+        error,
+        AudioPreparationError::ConversionFailed { .. }
+    ));
+    assert!(
+        message.contains("MS ADPCM"),
+        "the error should name the detected codec: {message}"
+    );
 }
 
 fn write_test_wav(path: &Path, sample_rate: u32, channels: u16, bits_per_sample: u16, frames: u32) {
