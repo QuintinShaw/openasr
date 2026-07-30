@@ -45,6 +45,7 @@ pub(crate) use llm_transformer::{
     even_prefill_chunk_len, load_qwen_family_llm_layer_attention_projection_generic,
     load_qwen3_llm_attention_projections_from_reader,
     load_qwen3_llm_attention_projections_from_reader_with_materialized_qkv,
+    resolve_qwen_family_production_kv_cache_policy,
 };
 pub(crate) use logits_head::{
     Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead,

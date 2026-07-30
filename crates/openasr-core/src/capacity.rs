@@ -525,6 +525,20 @@ impl HostMemoryCapacityRejection {
 /// request that would actually fit (the one outcome invariant 1 forbids) or
 /// small enough not to matter, so the 25% of total memory the 75% budget
 /// already sets aside is left to cover it instead of a second guessed number.
+///
+/// Assumes unified memory: `needed_bytes` sums KV cache and pack bytes as if
+/// both draw from the same host RAM pool the mmap'd pack resides in and the
+/// budget bounds. On a host with a discrete GPU, resident decoder state can
+/// instead live in VRAM (a separate budget this function does not see) while
+/// the mmap'd pack's pages stay reclaimable host-side, so this arithmetic is
+/// conservative-to-a-fault there rather than wrong in the unsafe direction --
+/// but it has not been exercised against a discrete-GPU host yet (moss-
+/// transcribe-diarize, the only family wired to this check so far, stays
+/// small enough that it does not matter in practice). Before wiring a family
+/// that runs meaningfully large on a discrete GPU (e.g. qwen3-asr at fp16,
+/// ~4.7 GiB), this needs device-aware accounting: a separate VRAM budget for
+/// resident state, and the pack's on-disk bytes should not be charged against
+/// host RAM at their full mmap size once they are known to be reclaimable.
 pub(crate) fn evaluate_host_memory_admission(
     geometry: &KvGeometry,
     spec: LlmKvCacheSpec,
@@ -751,12 +765,13 @@ mod tests {
         assert_eq!(derive_integral_seconds(&derivation), Some(300.0));
     }
 
-    /// The #159 shape: a multi-gigabyte pack on a host whose budget cannot
-    /// possibly hold it, independent of how many KV positions the request
-    /// needs -- the pack bytes alone (qwen3-asr-1.7b's real shipped fp16
-    /// size) already exceed a 1 GiB host's 75% budget. Reproduces the
-    /// scenario with an injected test-constructed budget rather than a real
-    /// 16 GiB machine.
+    /// The pack-alone-does-not-fit shape: a multi-gigabyte pack on a host
+    /// whose budget cannot possibly hold it, independent of how many KV
+    /// positions the request needs -- the pack bytes alone (qwen3-asr-1.7b's
+    /// real shipped fp16 size, used here only as a realistic oversized-pack
+    /// figure; this admission check does not run for qwen3-asr yet) already
+    /// exceed a 1 GiB host's 75% budget. Reproduces the scenario with an
+    /// injected test-constructed budget rather than a real 16 GiB machine.
     #[test]
     fn host_memory_admission_rejects_a_pack_that_plainly_does_not_fit_a_tiny_host() {
         let geometry = moss_geometry();

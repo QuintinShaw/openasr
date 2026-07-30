@@ -775,9 +775,9 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
         | BackendError::ExecutionDeviceInitFailed { .. } => FailureCategory::UnsupportedCapability,
         BackendError::TranscriptionCanceled => FailureCategory::Canceled,
         BackendError::ServeBatchUnavailable { .. } => FailureCategory::Transient,
-        // A pre-emptive admission rejection of the same failure class the
-        // raw ggml allocation error represents (issue #159), just caught
-        // before the graph build instead of during it.
+        // A pre-emptive admission rejection of the same failure class a raw
+        // ggml allocation error represents, just caught before the graph
+        // build instead of during it.
         BackendError::NativeInsufficientHostMemory { .. } => FailureCategory::Alloc,
         BackendError::NativeFailClosed { .. }
             if gpu_buffer_allocation_failure_backend(error).is_some() =>
@@ -1196,6 +1196,47 @@ fn run_native_transcription_impl(
         audio_prep_started.elapsed(),
     );
 
+    // Reject before any decode graph gets built -- and before
+    // `compute_speaker_attribution` below, which loads the speaker-embedder
+    // model and runs VAD + embedding + clustering over the whole recording,
+    // itself a significant memory user -- if this request's decoder KV
+    // footprint plainly does not fit this host's memory budget (a pack whose
+    // KV cache plus weights exceed the host memory budget, surfacing
+    // otherwise as an opaque "ggml cpu graph backend buffer allocation
+    // failed" instead of an actionable error). `audio_duration_seconds` only
+    // needs the decoded sample count, so this can run as soon as
+    // `prepared_audio` exists, ahead of every other per-request pass. Shared
+    // by CLI and server -- both funnel through this function -- and runs
+    // before `resolve_native_longform_policy` / dispatch, i.e. before the
+    // real graph build, not in the server route layer (which the CLI never
+    // goes through). Currently only wired for moss-transcribe-diarize; other
+    // native families fall through to "allow" until their frontend audio-
+    // token rate is derived (see `moss_native_capacity_admission_facts`).
+    let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
+    // The backend this request will actually dispatch on, resolved the same
+    // way `resolved_runtime_for_request` further down resolves it (explicit
+    // request preference + this family's Auto-mode GPU gate) -- admission
+    // needs the real backend because the KV-cache element-type policy
+    // (`resolve_qwen_family_production_kv_cache_policy`) depends on it, and
+    // guessing would risk exactly the false rejection this check must not
+    // produce. Recomputed here rather than threaded down from below: at this
+    // point nothing has installed the request's backend override yet, and
+    // this resolution is pure (no side effect) and cheap enough to redo.
+    let admission_backend = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+        execution_target_backend_preference(request.execution_target)?.request_backend_override(),
+        crate::arch::family_auto_gpu_policy_for_model_architecture(
+            selected_family.model_architecture,
+        ),
+    )
+    .backend();
+    enforce_native_host_memory_admission(
+        selected_family.model_architecture,
+        &runtime_preflight.metadata,
+        runtime_source.path(),
+        audio_duration_seconds,
+        admission_backend,
+    )?;
+
     // Compute speaker turns up front (independent of the transcript) so they can
     // be attributed onto whichever transcription path runs below.
     let speaker_turns = if speaker_plan == SpeakerPlan::External {
@@ -1215,21 +1256,6 @@ fn run_native_transcription_impl(
         (speaker_plan == SpeakerPlan::InDecoder).then(|| prepared_audio.clone());
 
     let dispatch = shared_native_ggml_execution_dispatch();
-    let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
-    // Reject before any decode graph gets built if this request's decoder KV
-    // footprint plainly does not fit this host's memory budget (issue #159:
-    // a large pack on a small-RAM machine surfacing as an opaque
-    // "ggml cpu graph backend buffer allocation failed" instead of an
-    // actionable error). Shared by CLI and server -- both funnel through this
-    // function -- and runs before `resolve_native_longform_policy` /
-    // dispatch, i.e. before the real graph build, not in the server route
-    // layer (which the CLI never goes through).
-    enforce_native_host_memory_admission(
-        selected_family.model_architecture,
-        &runtime_preflight.metadata,
-        runtime_source.path(),
-        audio_duration_seconds,
-    )?;
     let longform_resolution = resolve_native_longform_policy(
         request.longform.as_ref(),
         audio_duration_seconds,
@@ -2137,6 +2163,7 @@ fn apply_speaker_turns(
 fn moss_native_capacity_admission_facts(
     metadata: &crate::ggml_runtime::GgufMetadata,
     audio_duration_seconds: f32,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Option<(
     crate::capacity::KvGeometry,
     crate::nn::decoder::LlmKvCacheSpec,
@@ -2176,24 +2203,35 @@ fn moss_native_capacity_admission_facts(
     }
     let required_positions = derivation.required_positions_for_chunks(chunks as usize);
     let geometry = crate::models::moss_transcribe_diarize::capacity::moss_td_kv_geometry(&decoder);
-    // This family's whole-decoder never opts into the Q8_0 KV policy (only
-    // qwen3-asr's own executor calls `resolve_production_llm_kv_cache_policy`);
-    // moss's `Qwen3AsrLlmWholeDecoderGraphExecutor` construction never calls
-    // `set_kv_cache_policy`, so it always runs at
-    // `LlmKvCacheSpec::DEFAULT` -- the family's actual runtime fact, not a
-    // worst-case guess.
-    Some((
-        geometry,
-        crate::nn::decoder::LlmKvCacheSpec::DEFAULT,
-        required_positions,
-    ))
+    // Every Qwen-shaped whole-decoder constructor -- including moss's, via
+    // `Qwen3AsrLlmWholeDecoderGraphExecutor::new_with_adapter` -- calls
+    // `set_kv_cache_policy(resolve_qwen_family_production_kv_cache_policy(backend,
+    // head_dim))` unconditionally at construction time (see that function).
+    // Reading the same resolver here, from the same backend and head_dim the
+    // real executor will use, keeps admission's spec identical to the spec
+    // that actually gets allocated: on CPU/Metal with native GQA and this
+    // family's head_dim (128) that resolves to `Q8_0` (119 KiB/position), not
+    // `DEFAULT` (336 KiB/position). Hard-coding `DEFAULT` here previously
+    // overstated the real footprint by ~2.8x, which does not make admission
+    // safer -- it makes it wrong in the false-reject direction this module's
+    // own invariant forbids (refuse only when certain the request will not
+    // fit).
+    let spec = crate::models::qwen::resolve_qwen_family_production_kv_cache_policy(
+        backend,
+        geometry.head_dim,
+    )
+    .to_spec();
+    Some((geometry, spec, required_positions))
 }
 
 /// Reject this request before building its decode graph if its decoder KV
-/// footprint plainly does not fit this host's memory budget (issue #159's
-/// root cause class: a large pack on a small-RAM machine surfacing as an
-/// opaque `ggml cpu graph backend buffer allocation failed` instead of an
-/// actionable error). Fails OPEN whenever the answer is uncertain rather than
+/// footprint plainly does not fit this host's memory budget -- a pack whose
+/// KV cache plus weights exceed the host memory budget, the root cause class
+/// behind an opaque `ggml cpu graph backend buffer allocation failed` instead
+/// of an actionable error. Only wired for moss-transcribe-diarize today (see
+/// `moss_native_capacity_admission_facts`); qwen3-asr and the other native
+/// families are left unchecked until their frontend audio-token rate is
+/// derived. Fails OPEN whenever the answer is uncertain rather than
 /// definite -- an unresolvable family, unprobeable host RAM, or an unreadable
 /// pack file all fall through to "allow" (`crate::capacity`'s invariant:
 /// refuse only when certain it will not fit; the worst case is then no worse
@@ -2203,12 +2241,13 @@ fn enforce_native_host_memory_admission(
     metadata: &crate::ggml_runtime::GgufMetadata,
     pack_path: &Path,
     audio_duration_seconds: f32,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<(), BackendError> {
     if model_architecture != crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID {
         return Ok(());
     }
     let Some((geometry, spec, required_positions)) =
-        moss_native_capacity_admission_facts(metadata, audio_duration_seconds)
+        moss_native_capacity_admission_facts(metadata, audio_duration_seconds, backend)
     else {
         return Ok(());
     };
@@ -3222,15 +3261,20 @@ mod tests {
     /// reproduces the same required-positions arithmetic
     /// `moss_transcribe_diarize::capacity`'s own regression anchors pin,
     /// clamped at the family's machine-independent 300s integral window
-    /// however long the recording actually is (issue #159's shape needs the
-    /// worst case a single decode ever spans, not the whole file's length).
+    /// however long the recording actually is (admission needs the worst
+    /// case a single decode ever spans, not the whole file's length). The
+    /// resolved spec must equal what the real executor would allocate --
+    /// CPU + native GQA + head_dim 128 resolves to `Q8_0`
+    /// (`resolve_qwen_family_production_kv_cache_policy`'s own matrix pins
+    /// this), not the conservative `DEFAULT` a hard-coded guess would use.
     #[test]
     fn moss_capacity_admission_facts_match_the_pinned_derivation() {
         let metadata = moss_shipped_pack_metadata_for_test();
+        let backend = crate::ggml_runtime::GgmlCpuGraphBackend::Cpu;
 
         // A short recording costs far fewer positions than the ceiling.
         let (short_geometry, short_spec, short_positions) =
-            moss_native_capacity_admission_facts(&metadata, 11.04)
+            moss_native_capacity_admission_facts(&metadata, 11.04, backend)
                 .expect("shipped-shaped metadata must derive admission facts");
         assert_eq!(
             short_geometry,
@@ -3240,7 +3284,7 @@ mod tests {
                 head_dim: 128,
             }
         );
-        assert_eq!(short_spec, crate::nn::decoder::LlmKvCacheSpec::DEFAULT);
+        assert_eq!(short_spec, crate::nn::decoder::LlmKvCacheSpec::Q8_0);
         // Cross-check against the same derivation function, called directly
         // on the fixture the capacity module's own regression anchors use --
         // not a hand-computed magic number.
@@ -3255,10 +3299,110 @@ mod tests {
         // chunks -> 7806 positions, the same number
         // `required_positions_walks_the_moss_window_from_both_sides` pins in
         // `crate::capacity`'s own tests) rather than judged by its full length.
-        let (_, _, long_positions) = moss_native_capacity_admission_facts(&metadata, 3600.0)
-            .expect("shipped-shaped metadata must derive admission facts");
+        let (_, _, long_positions) =
+            moss_native_capacity_admission_facts(&metadata, 3600.0, backend)
+                .expect("shipped-shaped metadata must derive admission facts");
         assert_eq!(long_positions, 7806);
         assert!(short_positions < long_positions);
+    }
+
+    /// A discrete GPU backend must stay on `DEFAULT`: phase-1 Q8_0 KV is
+    /// CPU/Metal-only (`LlmKvCacheSpec::validate_execution`), so admission on
+    /// a `Gpu`-backed request must reason about the larger DEFAULT footprint,
+    /// not silently inherit Q8_0's smaller one.
+    #[test]
+    fn moss_capacity_admission_facts_stay_default_on_discrete_gpu_backend() {
+        let metadata = moss_shipped_pack_metadata_for_test();
+        let (_, spec, _) = moss_native_capacity_admission_facts(
+            &metadata,
+            11.04,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+        )
+        .expect("shipped-shaped metadata must derive admission facts");
+        assert_eq!(spec, crate::nn::decoder::LlmKvCacheSpec::DEFAULT);
+    }
+
+    /// The false-reject regression this fix closes: at the real Q8_0 spec a
+    /// mid-size host budget admits the shipped pack; the pre-fix hard-coded
+    /// `DEFAULT` spec (2.82x the KV bytes) would have rejected the identical
+    /// request on the identical host.
+    #[test]
+    fn enforce_native_host_memory_admission_does_not_false_reject_moss_at_q8_0() {
+        let metadata = moss_shipped_pack_metadata_for_test();
+        // 3600s clamps to the 300s integral window -> 7806 positions (pinned
+        // by `moss_capacity_admission_facts_match_the_pinned_derivation`).
+        // Derive both specs' facts from the same production dispatch real
+        // requests go through, at the two backends that produce each spec,
+        // rather than hand-typing geometry/positions here.
+        let (geometry, q8_spec, required_positions) = moss_native_capacity_admission_facts(
+            &metadata,
+            3600.0,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("shipped-shaped metadata must derive admission facts");
+        let (_, default_spec, default_positions) = moss_native_capacity_admission_facts(
+            &metadata,
+            3600.0,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+        )
+        .expect("shipped-shaped metadata must derive admission facts");
+        assert_eq!(q8_spec, crate::nn::decoder::LlmKvCacheSpec::Q8_0);
+        assert_eq!(default_spec, crate::nn::decoder::LlmKvCacheSpec::DEFAULT);
+        assert_eq!(required_positions, default_positions);
+        // At Q8_0 (119 KiB/pos) this is ~0.91 GiB of KV; at DEFAULT
+        // (336 KiB/pos) it would be ~2.57 GiB -- enough of a gap that a
+        // mid-size host can fall on either side of the accept/reject line
+        // depending on which spec admission reasons from.
+        let q8_kv_bytes = crate::capacity::kv_bytes_per_position(&geometry, q8_spec)
+            .expect("valid q8_0 geometry")
+            .total()
+            * required_positions as u64;
+        let default_kv_bytes = crate::capacity::kv_bytes_per_position(&geometry, default_spec)
+            .expect("valid default geometry")
+            .total()
+            * required_positions as u64;
+        assert!(
+            default_kv_bytes > q8_kv_bytes * 2,
+            "fixture should reproduce the ~2.82x overstatement, got default={default_kv_bytes} q8_0={q8_kv_bytes}"
+        );
+        // moss-transcribe-diarize.oasr fp16 pack, real shipped size.
+        let pack_bytes_on_disk: u64 = 1_700_000_000;
+        // Sized so Q8_0's needed_bytes fits the 75% budget but DEFAULT's
+        // would not: budget must clear pack+q8 but fall short of pack+default.
+        let host_total_memory_bytes: u64 =
+            ((pack_bytes_on_disk + q8_kv_bytes + default_kv_bytes) / 2 * 4) / 3;
+        let budget_bytes = crate::host::host_memory_budget_bytes(host_total_memory_bytes);
+        assert!(
+            budget_bytes > pack_bytes_on_disk + q8_kv_bytes,
+            "fixture host must admit the real (Q8_0) footprint"
+        );
+        assert!(
+            budget_bytes < pack_bytes_on_disk + default_kv_bytes,
+            "fixture host must not admit the overstated (DEFAULT) footprint"
+        );
+
+        assert!(
+            crate::capacity::evaluate_host_memory_admission(
+                &geometry,
+                crate::nn::decoder::LlmKvCacheSpec::Q8_0,
+                required_positions,
+                pack_bytes_on_disk,
+                host_total_memory_bytes,
+            )
+            .is_ok(),
+            "the real Q8_0 footprint must be admitted"
+        );
+        assert!(
+            crate::capacity::evaluate_host_memory_admission(
+                &geometry,
+                crate::nn::decoder::LlmKvCacheSpec::DEFAULT,
+                required_positions,
+                pack_bytes_on_disk,
+                host_total_memory_bytes,
+            )
+            .is_err(),
+            "the overstated DEFAULT footprint would have been falsely rejected on this host"
+        );
     }
 
     /// A family this round has not wired (its frontend audio-token rate is
@@ -3274,6 +3418,7 @@ mod tests {
                 &metadata,
                 Path::new("/nonexistent/does-not-matter.oasr"),
                 3600.0,
+                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
             )
             .is_ok(),
             "an unwired family must be allowed through unconditionally, not guessed at"
