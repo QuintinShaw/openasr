@@ -84,18 +84,26 @@
 //! populations not overlapping at 0.30, and that is measured, not assumed.
 //! Across the AliMeeting acceptance sessions and the ladder recordings this
 //! stage was validated on: labels confirmed single-voice by ground truth split
-//! at 0.055-0.253 whenever the split is what the verdict actually turns on
-//! (second cluster at or above [`MIXED_MIN_SECOND_CLUSTER_FRACTION`]); every
-//! label confirmed to genuinely contain two people splits no closer than
-//! 0.420. 0.30 sits in the gap with room on both sides -- about 0.05 below the
-//! highest confirmed-single split seen and 0.12 above the lowest
-//! confirmed-mixed one -- so reclaiming below it cannot let a real second
-//! speaker's windows back into a centroid. Reclaiming buys back exactly the
-//! windows a genuinely single voice was losing to an over-eager cut, at zero
-//! measured cost to the stitching distances the whole scheme exists to
-//! protect: three acceptance sessions' minimum different-speaker centroid
-//! distance held at 0.562 / 0.440 unchanged and rose from 0.471 to 0.481 on
-//! the third.
+//! at 0.055-0.253 whenever the split is what the *verdict* actually turns on
+//! (second cluster at or above [`MIXED_MIN_SECOND_CLUSTER_FRACTION`] **and**
+//! at or above [`MIN_PURITY_VERDICT_WINDOWS`], since [`is_single_voice`]
+//! short-circuits to single-voice below that window count regardless of
+//! distance); every such label confirmed to genuinely contain two people
+//! splits no closer than 0.400 (`R8007_M8010` `SPEAKER_02#0`: 3 windows,
+//! 60.5% ground-truth purity, split 0.400). 0.30 sits in the gap with room on
+//! both sides -- about 0.05 below the highest confirmed-single split seen and
+//! 0.10 above the lowest confirmed-mixed one -- so reclaiming below it cannot
+//! let a real second speaker's windows back into a centroid. That margin is
+//! narrower than it looks from the verdict population alone: [`main_cluster`]
+//! (unlike the verdict) has no window-count floor, so it applies the same
+//! reclaim decision to small groups the verdict population above excludes --
+//! it is only the specific 0.400 split landing above [`MIXED_MIN_SPLIT_DISTANCE`]
+//! that keeps this one from being wrongly reclaimed today, not a structural
+//! exclusion. Reclaiming buys back exactly the windows a genuinely single
+//! voice was losing to an over-eager cut, at zero measured cost to the
+//! stitching distances the whole scheme exists to protect: three acceptance
+//! sessions' minimum different-speaker centroid distance held at 0.562 /
+//! 0.440 unchanged and rose from 0.471 to 0.481 on the third.
 //!
 //! A single-voice label whose split happens to land *above* 0.30 -- which
 //! happens; `R8001_M8004` `SPEAKER_00#0` is 95% one speaker and still splits
@@ -421,10 +429,19 @@ struct TwoClusterSplit {
     main: Vec<usize>,
     /// Smaller cluster's member indices, in window order.
     second: Vec<usize>,
-    /// Cosine distance between the two clusters' centroids. `None` only if a
-    /// centroid could not be computed at all (an embedding-dimension
-    /// mismatch); not expected in practice, and treated as "not proven safe"
-    /// by both consumers rather than panicking on it.
+    /// Cosine distance between the two clusters' centroids. `None` only when
+    /// [`centroid`] returns `None` for one of the two clusters, which in
+    /// practice means that cluster's *first* embedding has dimension 0:
+    /// `centroid` seeds its running sum from the first embedding's dimension
+    /// and only `continue`s (still returning `Some`) on a later embedding
+    /// whose dimension does not match, so an ordinary dimension mismatch
+    /// never produces `None` here. Not expected in practice. The two
+    /// consumers do not treat it uniformly as "not proven safe": in
+    /// [`main_cluster`], `distance.is_some_and(...)` is `false` on `None`, so
+    /// it falls through to discarding the minority cluster -- the
+    /// conservative reading. In [`is_single_voice`], `let Some(distance) =
+    /// split.distance else { return true; }` reports single-voice on `None`
+    /// -- the permissive reading, same as a distance under the gate.
     distance: Option<f32>,
 }
 
