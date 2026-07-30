@@ -1953,7 +1953,11 @@ const MAX_PRESERVED_EXTENSION_LEN: usize = 8;
 /// charset (or an upload with no extension at all) still loses its suffix --
 /// and the resulting "no extension" report is accurate for those, unlike the
 /// whitelist-driven version this replaces.
-fn safe_extension_suffix(file_name: &str) -> Option<String> {
+///
+/// `pub(crate)` so `voice_id.rs`'s `stream_voice_id_source` shares this same
+/// length-safe, case-normalized suffix derivation for its `source_audio`
+/// uploads instead of keeping a second, weaker copy.
+pub(crate) fn safe_extension_suffix(file_name: &str) -> Option<String> {
     let extension = std::path::Path::new(file_name)
         .file_name()
         .map(std::path::Path::new)
