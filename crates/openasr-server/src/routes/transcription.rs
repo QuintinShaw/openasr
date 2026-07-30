@@ -1745,7 +1745,16 @@ pub(crate) async fn transcribe_with_runtime(
                         .with_prepared_samples(prepared.shared_samples())
                         // Explicit cancel/pause/resume context for the whole
                         // synchronous decode call below -- never a thread-local.
-                        .with_execution_context(Arc::clone(&execution_context));
+                        .with_execution_context(Arc::clone(&execution_context))
+                        // The operator's per-model admission width set above
+                        // (`serve_batch_max_native_sessions` from
+                        // `max_concurrent_sessions_per_model`); without carrying it
+                        // through the offline round-trip the rebuilt request would
+                        // default to a serial width of 1 and serve-batch would never
+                        // engage on the server transcription path.
+                        .with_serve_batch_max_native_sessions(
+                            request.serve_batch_max_native_sessions,
+                        );
                     let executor = NativeBackendExecutor;
                     let mut transcription = NativeAsrExecutor::transcribe(
                         &executor,

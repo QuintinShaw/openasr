@@ -327,6 +327,15 @@ pub struct NativeAsrOfflineRequest {
     /// [`crate::TranscriptionRequest::execution_context`], which this carries
     /// through to via `native_offline_request_to_transcription_request`.
     pub execution_context: Arc<crate::RequestExecutionContext>,
+    /// The operator's per-model native-session admission width (the server's
+    /// `--max-native-sessions-per-model`), carried through to
+    /// [`crate::TranscriptionRequest::serve_batch_max_native_sessions`] via
+    /// `native_offline_request_to_transcription_request` so the concurrent
+    /// serve-batch decode policy survives this offline round-trip. Without it
+    /// the rebuilt request defaults to `None`, `native_transcribe` reads a
+    /// serial width of 1, and serve-batch never engages on the server path.
+    /// `None` leaves the consumer at its serial default.
+    pub serve_batch_max_native_sessions: Option<usize>,
 }
 
 impl NativeAsrOfflineRequest {
@@ -345,6 +354,7 @@ impl NativeAsrOfflineRequest {
                 "NativeAsrOfflineRequest::new()'s pre-opt-in default; a caller needing \
                  cancellation attaches a real context via with_execution_context",
             )),
+            serve_batch_max_native_sessions: None,
         }
     }
 
@@ -361,6 +371,17 @@ impl NativeAsrOfflineRequest {
         execution_context: Arc<crate::RequestExecutionContext>,
     ) -> Self {
         self.execution_context = execution_context;
+        self
+    }
+
+    /// Carries the server's per-model native-session admission width so the
+    /// serve-batch concurrent-decode policy survives the offline round-trip --
+    /// see the field's doc comment.
+    pub fn with_serve_batch_max_native_sessions(
+        mut self,
+        max_native_sessions: Option<usize>,
+    ) -> Self {
+        self.serve_batch_max_native_sessions = max_native_sessions;
         self
     }
 

@@ -579,6 +579,7 @@ fn native_offline_request_to_transcription_request(
         .with_source_container(request.source_container)
         .with_prepared_samples(request.prepared_samples)
         .with_execution_context(request.execution_context)
+        .with_serve_batch_max_native_sessions(request.serve_batch_max_native_sessions)
 }
 
 fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {
@@ -1068,6 +1069,36 @@ mod tests {
             .join("../../fixtures/jfk.wav")
             .canonicalize()
             .expect("sample wav fixture path must exist")
+    }
+
+    #[test]
+    fn offline_round_trip_preserves_serve_batch_max_native_sessions() {
+        // The server sets `serve_batch_max_native_sessions` from its per-model
+        // admission width, then hands the request to `NativeBackendExecutor`,
+        // which rebuilds it through
+        // `native_offline_request_to_transcription_request`. If that rebuild
+        // drops the field, `native_transcribe` reads a serial width of 1 and
+        // serve-batch never engages on the server transcription path -- a gap
+        // the real-pack parity lane misses because it drives the batch kernel
+        // directly via a test hook, bypassing this offline round-trip.
+        let pack =
+            NativeAsrModelPackRef::new("moonshine-tiny", "moonshine", PathBuf::from("/tmp/pack"));
+        let rebuilt = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav"))
+                .with_serve_batch_max_native_sessions(Some(4)),
+        );
+        assert_eq!(rebuilt.serve_batch_max_native_sessions, Some(4));
+
+        // No admission width still round-trips to `None`, leaving the
+        // consumer's serial fallback (width 1) unchanged.
+        let rebuilt_default = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")),
+        );
+        assert_eq!(rebuilt_default.serve_batch_max_native_sessions, None);
     }
 
     fn write_mono_pcm16_wav(path: &Path, sample_rate_hz: u32, frames: u32) {
