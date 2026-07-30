@@ -1521,7 +1521,25 @@ fn cuda_gpu_targets_from_raw(raw: Option<&str>) -> String {
     raw.map(str::trim)
         .filter(|value| !value.is_empty())
         .map(normalize_cuda_gpu_targets)
-        .unwrap_or_else(|| "80;86;89;90".to_string())
+        .unwrap_or_else(|| {
+            // Default CUDA arch list for a released binary: sm_75 through sm_90.
+            // Floor is 75 (Turing: RTX 20xx, GTX 16xx, T4, 2080 Ti), not 70
+            // (Volta) or lower, because CUDA 13 removed device-code generation
+            // for Volta/Pascal/Maxwell outright -- those need a CUDA 12
+            // toolchain, which is a separate build leg (tracked, not this one).
+            // 75 itself is deprecated-but-still-buildable on CUDA 13.2: nvcc
+            // warns, but still emits working sm_75 SASS and PTX. No explicit
+            // `-real`/`-virtual` suffix means CMake emits both device code and
+            // PTX for every listed number, so this default also carries
+            // 75-virtual PTX that the CUDA driver JITs forward to any newer,
+            // unlisted architecture at load time -- the same forward-compat
+            // mechanism vendored ggml's own (non-native) CMakeLists.txt default
+            // relies on. Upper bound stops at 90 (Hopper): 120 (Blackwell)
+            // needs CUDA 12.8+ and a CMake new enough for the `f`/`a` suffix
+            // regex, which this default does not assume. Override with
+            // OPENASR_CUDA_GPU_TARGETS for a narrower/wider/newer set.
+            "75;80;86;89;90".to_string()
+        })
 }
 
 fn normalize_cuda_gpu_targets(raw: &str) -> String {
@@ -1867,9 +1885,9 @@ mod tests {
     }
 
     #[test]
-    fn cuda_targets_default_to_common_cloud_arches() {
-        assert_eq!(cuda_gpu_targets_from_raw(None), "80;86;89;90");
-        assert_eq!(cuda_gpu_targets_from_raw(Some("   ")), "80;86;89;90");
+    fn cuda_targets_default_to_common_cloud_and_consumer_arches() {
+        assert_eq!(cuda_gpu_targets_from_raw(None), "75;80;86;89;90");
+        assert_eq!(cuda_gpu_targets_from_raw(Some("   ")), "75;80;86;89;90");
     }
 
     #[test]
@@ -1877,6 +1895,36 @@ mod tests {
         assert_eq!(
             cuda_gpu_targets_from_raw(Some("sm_80,86; SM_89 90")),
             "80;86;89;90"
+        );
+    }
+
+    #[test]
+    fn cuda_default_targets_are_not_narrower_than_vendored_ggml_default() {
+        // Regression guard for the class of bug in #255/#196: OpenASR's own
+        // default CUDA arch list silently excluded sm_75 (Turing), so a
+        // released CUDA binary hit "no kernel image available" on every
+        // 2080 Ti / T4 / RTX 20xx / GTX 16xx card. Cross-check against
+        // vendored ggml's own (non-native) CMakeLists.txt default, which is
+        // the actual upstream source of truth this default is trying to
+        // track: if a future ggml bump drops or narrows its own sm_75 floor,
+        // this test's first assertion fails and flags that our comment/
+        // reasoning in `cuda_gpu_targets_from_raw` needs re-deriving; if
+        // OpenASR's own default regresses below that floor, the second
+        // assertion fails instead.
+        let vendored_ggml_cmake =
+            include_str!("third_party/openasr-ggml/src/ggml-cuda/CMakeLists.txt");
+        assert!(
+            vendored_ggml_cmake.contains("75-virtual"),
+            "vendored ggml CMakeLists.txt no longer defaults to sm_75; re-check \
+             whether OpenASR's own CUDA_GPU_TARGETS floor of 75 is still \
+             upstream-aligned before changing it"
+        );
+        assert!(
+            cuda_gpu_targets_from_raw(None)
+                .split(';')
+                .any(|arch| arch == "75"),
+            "OpenASR's default CUDA arch list narrowed below upstream ggml's \
+             own sm_75 floor"
         );
     }
 
