@@ -104,6 +104,29 @@ installed on demand) to attribute anonymous `SPEAKER_NN` labels onto any model's
 transcript; without the required ReDimNet2-B6 pack the request fails closed rather
 than fabricating speakers.
 
+Cross-file speaker identity -- naming the same person consistently across
+separate recordings, rather than a fresh `SPEAKER_NN` number each time -- is a
+separate, opt-in system called Voice ID, exposed through the operator-only
+`/v1/voice-id/*` API (`crates/openasr-server/src/routes/voice_id.rs`): person
+and sample CRUD, consent revoke, and metadata export. Enrolling a person
+requires at least 10 seconds of clean speech per registered sample
+(`MIN_SAMPLE_SPEECH_SECONDS`,
+`crates/openasr-core/src/diarize/voice_id/quality.rs`); once a person is
+enrolled, automatically naming an anonymous `SPEAKER_NN` label to that person
+during diarization additionally needs at least 8 continuous seconds of that
+person speaking uninterrupted in one turn to clear naming's evidence gate
+(`MIN_CONTINUOUS_SPEECH_SECONDS_FOR_NAMING`,
+`crates/openasr-core/src/diarize/voice_id/identity.rs`). A speaker who is not
+enrolled, or whose evidence falls short of that gate, simply keeps a
+session-relative `SPEAKER_NN` number -- Voice ID never fabricates an identity
+match.
+
+OpenASR does not perform source/audio separation (isolating vocals from
+background music or noise, the way Demucs or similar stem-splitting tools do).
+Diarization and Voice ID only label, and optionally name, existing speech
+segments within a single mixed audio stream; there is no implementation of, or
+plan for, stem separation.
+
 ## Does the server keep the model resident in RAM forever?
 
 No. By default the daemon releases the bound model's resident runtime (mmap,

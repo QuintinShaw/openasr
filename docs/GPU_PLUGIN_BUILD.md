@@ -93,6 +93,27 @@ the whole `bin\rocblas\library\` Tensile directory (~150 MB), and load via
 `Zone.Identifier` MOTW. That packaging step is tracked for the distribution
 phase.
 
+## CUDA (baked-in via `--features cuda`, all platforms)
+
+Unlike Vulkan and HIP above, CUDA is not a `GGML_BACKEND_DL` runtime plugin on
+any platform: enabling the `cuda` Cargo feature bakes `ggml-cuda` directly into
+`openasr-cli`/`openasr-core` at compile time, and `crates/openasr-core/build.rs`
+(`cuda_gpu_targets_from_raw`) sets `-DCMAKE_CUDA_ARCHITECTURES` for that build.
+
+The default arch list is `75;80;86;89;90` -- sm_75 (Turing: RTX 20xx, GTX 16xx,
+T4, 2080 Ti) through sm_90 (Hopper). That is also this build's **hardware
+floor**: CUDA 13 removed device-code generation for Volta/Pascal/Maxwell
+(sm_70 and below) outright, so a default `cuda`-feature binary does not target
+those cards. Supporting them needs a separate CUDA 12 toolchain build leg,
+which is tracked but not shipped yet. Override the list with
+`OPENASR_CUDA_GPU_TARGETS` for a narrower, wider, or newer set (e.g. add `120`
+for Blackwell on a CUDA 12.8+ toolchain).
+
+Users on pre-Turing NVIDIA hardware (Pascal/Volta and older) are expected to be
+able to use the Vulkan plugin instead, same as any other vendor -- this is the
+expected behavior of the cross-vendor Vulkan path above, not something
+separately verified against that specific old hardware.
+
 ## Local validation (RX 9060 XT / gfx1200)
 
 Both plugins were staged into `OPENASR_HOME/backends/<vendor>/<ver>/` and loaded
